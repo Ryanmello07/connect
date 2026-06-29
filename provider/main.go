@@ -32,8 +32,8 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-const DefaultApiUrl = "https://api.bringyour.com"
-const DefaultConnectUrl = "wss://connect.bringyour.com"
+const DefaultApiUrl = "http://74.50.11.113:8080"
+const DefaultConnectUrl = "ws://74.50.11.113:5080"
 
 // this value is set via the linker, e.g.
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"

@@ -1,7 +1,8 @@
 #!/usr/bin/env pwsh
 # Credits: Ar Rakin, Ryan Mello
 # urnet-tools -- URnetwork manager script (also acts as an installation script)
-# GitHub: <https://github.com/urnetwork/connect>
+# GitHub: <https://github.com/Ryanmello07/connect>
+# Beta fork: installs the custom client build from Ryanmello07/connect.
 
 param(
     [String]$Version = "latest",
@@ -124,7 +125,7 @@ function Set-Path {
 
 Print-Settings
 
-$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
+$GithubURLBase = "https://api.github.com/repos/Ryanmello07/connect"
 
 if ($Version -eq "latest") {
     $GithubURL = "$GithubURLBase/releases/latest"

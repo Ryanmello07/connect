@@ -1,7 +1,8 @@
 #!/bin/sh
 # Credits: Ar Rakin, Ryan Mello
 # urnet-tools -- URnetwork manager script (also acts as an installation script)
-# GitHub: <https://github.com/urnetwork/connect>
+# GitHub: <https://github.com/Ryanmello07/connect>
+# Beta fork: installs the custom client build from Ryanmello07/connect.
 
 me="$0"
 script_rundir="$(pwd)"
@@ -105,7 +106,7 @@ arch="$(get_arch)"
 has_systemd=0
 update_timer_oncalendar=daily
 
-api_base="https://api.github.com/repos/urnetwork/connect"
+api_base="https://api.github.com/repos/Ryanmello07/connect"
 
 install_path="$HOME/.local/share/urnetwork-provider"
 version_file="$install_path/.version"
