@@ -66,17 +66,20 @@ The default URLs are:
 Usage:
     provider auth ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--api_url=<api_url>]
+    	[--by-jwt=<by_jwt>]
     	[--max-memory=<mem>]
     	[-v...]
     provider provide [--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+        [--by-jwt=<by_jwt>]
         [--max-memory=<mem>]
         [-v...]
     provider auth-provide ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--port=<port>]
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
+        [--by-jwt=<by_jwt>]
         [--max-memory=<mem>]
         [-v...]
     provider proxy auth add [<key>] <proxy_user> <proxy_password> [-f]
@@ -93,6 +96,8 @@ Options:
                                      By default, existing values will not be overwritten.
     --api_url=<api_url>              Specify a custom API URL to use.
     --connect_url=<connect_url>      Specify a custom connect URL to use.
+    --by-jwt=<by_jwt>                Authenticate with a dashboard JWT directly,
+                                     skipping the interactive login/auth code flow.
     --user_auth=<user_auth>	         Login with a username.
     --password=<password>            Login with a password. If --user_auth is used, you will be prompted for your
     				                 password anyways, if you don't specify it using this option.
@@ -186,7 +191,9 @@ func auth(opts docopt.Opts) {
 	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
 
 	var byJwt string
-	if userAuth, err := opts.String("--user_auth"); err == nil {
+	if byJwtOpt, err := opts.String("--by-jwt"); err == nil && byJwtOpt != "" {
+		byJwt = strings.TrimSpace(byJwtOpt)
+	} else if userAuth, err := opts.String("--user_auth"); err == nil {
 		// user_auth and password
 
 		var password string
@@ -289,6 +296,11 @@ func provide(opts docopt.Opts) {
 		connectUrl = DefaultConnectUrl
 	}
 
+	var byJwt string
+	if byJwtOpt, err := opts.String("--by-jwt"); err == nil {
+		byJwt = strings.TrimSpace(byJwtOpt)
+	}
+
 	maxMemoryHumanReadable, err := opts.String("--max-memory")
 	var maxMemory connect.ByteCount
 	if err == nil {
@@ -366,7 +378,7 @@ func provide(opts docopt.Opts) {
 
 		byClientJwt, clientId, err := func() (string, connect.Id, error) {
 			for {
-				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
+				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts, byJwt)
 				if err == nil {
 					return byClientJwt, clientId, nil
 				}
@@ -618,25 +630,27 @@ func writeProviderTlsCertAndKey(certPem, keyPem []byte) error {
 	return os.WriteFile(p, out, 0600)
 }
 
-func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id, returnErr error) {
+func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts, byJwt string) (byClientJwt string, clientId connect.Id, returnErr error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic(err)
 	}
 	jwtPath := filepath.Join(home, ".urnetwork", "jwt")
 
-	if _, err := os.Stat(jwtPath); errors.Is(err, os.ErrNotExist) {
-		// jwt does not exist
-		returnErr = fmt.Errorf("Jwt does not exist at %s", jwtPath)
-		return
-	}
+	if byJwt == "" {
+		if _, err := os.Stat(jwtPath); errors.Is(err, os.ErrNotExist) {
+			// jwt does not exist
+			returnErr = fmt.Errorf("Jwt does not exist at %s", jwtPath)
+			return
+		}
 
-	byJwtBytes, err := os.ReadFile(jwtPath)
-	if err != nil {
-		returnErr = err
-		return
+		byJwtBytes, err := os.ReadFile(jwtPath)
+		if err != nil {
+			returnErr = err
+			return
+		}
+		byJwt = strings.TrimSpace(string(byJwtBytes))
 	}
-	byJwt := strings.TrimSpace(string(byJwtBytes))
 
 	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
 
