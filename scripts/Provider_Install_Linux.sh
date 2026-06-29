@@ -626,7 +626,7 @@ do_install ()
     if [ -z "$script" ]; then
         pr_err "Script path is '%s', cannot operate on it" "$0"
 
-        if ! script="$(network_fetch https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/Provider_Install_Linux.sh)"; then
+        if ! script="$(network_fetch https://raw.githubusercontent.com/Ryanmello07/connect/refs/heads/main/scripts/Provider_Install_Linux.sh)"; then
             pr_err "Failed to fetch script contents"
             exit 1
         fi
