@@ -22,11 +22,15 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
+      - name: Set version
+        id: version
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Build provider
         working-directory: provider
         run: make all
         env:
-          WARP_VERSION: beta-custom-server-${{ github.sha }}
+          WARP_VERSION: beta-custom-server-${{ steps.version.outputs.short_sha }}
 
       - name: Upload provider artifact
         uses: actions/upload-artifact@v4
@@ -46,6 +50,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: provider.tar.gz
+
+      - name: Update rolling tag
+        run: |
+          git tag -f beta-custom-server-latest
+          git push -f origin beta-custom-server-latest
 
       - name: Create or update beta release
         uses: softprops/action-gh-release@v2
