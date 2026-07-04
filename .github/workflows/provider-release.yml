@@ -17,6 +17,14 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          path: connect
+
+      - name: Check out glog dependency
+        uses: actions/checkout@v4
+        with:
+          repository: urnetwork/glog
+          path: glog
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -25,10 +33,11 @@ jobs:
 
       - name: Set version
         id: version
+        working-directory: connect
         run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build provider
-        working-directory: provider
+        working-directory: connect/provider
         run: make all
         env:
           WARP_VERSION: beta-custom-server-${{ steps.version.outputs.short_sha }}
@@ -37,7 +46,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: provider.tar.gz
-          path: provider/build/provider.tar.gz
+          path: connect/provider/build/provider.tar.gz
           if-no-files-found: error
 
   release:
