@@ -28,6 +28,8 @@ See [community-provider-warp-example/anyhost](community-provider-warp-example/an
 
 ## Pre-built binaries
 
+Beta builds for the `beta/custom-server` branch are published automatically to the [beta-custom-server-latest release](https://github.com/Ryanmello07/connect/releases/tag/beta-custom-server-latest).
+
 Currently we do not sign the provider binaries on the [releases page](https://github.com/urnetwork/build/releases). You will need to add a signing exemption for various platforms, to allow the binary to be run.
 
 **macOS**
