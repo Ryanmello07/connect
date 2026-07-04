@@ -1,0 +1,64 @@
+name: Provider Beta Release
+
+on:
+  push:
+    branches:
+      - beta/custom-server
+    paths:
+      - 'provider/**'
+      - 'go.mod'
+      - 'go.sum'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build provider
+        working-directory: provider
+        run: make all
+        env:
+          WARP_VERSION: beta-custom-server-${{ github.sha }}
+
+      - name: Upload provider artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider.tar.gz
+          path: provider/build/provider.tar.gz
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download provider artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: provider.tar.gz
+
+      - name: Create or update beta release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta-custom-server-latest
+          name: beta-custom-server-latest
+          body: |
+            Rolling beta release for the `beta/custom-server` branch.
+
+            - Commit: ${{ github.sha }}
+            - Timestamp: ${{ github.event.head_commit.timestamp }}
+          prerelease: true
+          files: provider.tar.gz
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
