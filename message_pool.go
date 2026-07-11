@@ -38,7 +38,9 @@ const debugTags = false
 const MessagePoolMetaByteCount = 12
 const MessagePoolFlagShared = uint8(0x01)
 
-var InitialMessagePoolByteCount = mib(1)
+// InitialMessagePoolByteCount is the initial total free-list byte budget,
+// split evenly across the pool size classes (see ResizeMessagePools)
+var InitialMessagePoolByteCount = mib(2)
 
 type messagePool struct {
 	size         int
@@ -114,9 +116,12 @@ func (self *messagePool) Put(poolMessage []byte) {
 }
 
 var orderedMessagePools = sync.OnceValue(func() []*messagePool {
-	pools := []*messagePool{
-		newMessagePool(2048, int(InitialMessagePoolByteCount/ByteCount(2048))),
-		newMessagePool(4096, int(InitialMessagePoolByteCount/ByteCount(4096))),
+	// the byte budget is split evenly across the size classes (see ResizeMessagePools)
+	poolSizes := []int{2048, 4096}
+	poolByteCount := InitialMessagePoolByteCount / ByteCount(len(poolSizes))
+	pools := []*messagePool{}
+	for _, poolSize := range poolSizes {
+		pools = append(pools, newMessagePool(poolSize, int(poolByteCount/ByteCount(poolSize))))
 	}
 
 	go HandleError(func() {
@@ -162,9 +167,15 @@ func poolStats(pools []*messagePool) {
 	}
 }
 
+// ResizeMessagePools bounds the free lists to retain at most `maxByteCount`
+// total bytes across all size classes. The budget is split evenly by bytes
+// across the classes, so smaller classes retain proportionally more buffers.
+// Buffers in use are unaffected; this only bounds what the free lists retain.
 func ResizeMessagePools(maxByteCount ByteCount) {
-	for _, pool := range orderedMessagePools() {
-		pool.Resize(int(maxByteCount / ByteCount(pool.size)))
+	pools := orderedMessagePools()
+	poolByteCount := maxByteCount / ByteCount(len(pools))
+	for _, pool := range pools {
+		pool.Resize(int(poolByteCount / ByteCount(pool.size)))
 	}
 }
 
@@ -287,14 +298,19 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 	for j := 0; j < len(orderedMessagePools); j += 1 {
 		for i < len(b) {
 			n, err := r.Read(b[i:])
-			if n == 0 {
-				return b[:i], nil
+			if n > 0 {
+				i += n
 			}
 			if err != nil {
+				if err == io.EOF {
+					return b[:i], nil
+				}
 				MessagePoolReturn(b)
 				return nil, err
 			}
-			i += n
+			if n == 0 {
+				return b[:i], nil
+			}
 		}
 
 		if len(orderedMessagePools) <= j+1 {
@@ -312,13 +328,21 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 	defer MessagePoolReturn(b)
 	for {
 		n, err := r.Read(b)
+		if n > 0 {
+			out = append(out, b[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF {
+				return out, nil
+			}
+			// Preserve the historical contract that (non-EOF) errors yield a nil buffer
+			// (callers do not expect to MessagePoolReturn on the error path).
+			// We still consumed the bytes (preventing reader desync on streams).
+			return nil, err
+		}
 		if n == 0 {
 			return out, nil
 		}
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b[:n]...)
 	}
 }
 

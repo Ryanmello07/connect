@@ -110,7 +110,7 @@ func ReceiveSignalsFromClient(client *Client, receiver SignalReceiver) func() {
 }
 
 // ReceiveFunction
-func (self *clientSignalReceiver) Receive(source TransferPath, frames []*protocol.Frame, provideMode protocol.ProvideMode) {
+func (self *clientSignalReceiver) Receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	for _, frame := range frames {
 		self.handleControlFrame(source, frame)
 	}
@@ -373,7 +373,8 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// FIXME
 		// SendBufferSize: mib(1),
 
-		ReceiveBufferSize:   mib(4),
+		// sctp receive buffer per peer connection, so scaled by the memory budget
+		ReceiveBufferSize:   MemoryScaledByteCount(mib(4), mib(1)),
 		ReceiveMtu:          kib(4),
 		DisconnectedTimeout: 30 * time.Second,
 		FailedTimeout:       30 * time.Second,
