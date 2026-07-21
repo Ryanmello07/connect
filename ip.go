@@ -17,8 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
-
 	// "google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
@@ -61,30 +59,56 @@ type UserNatClient interface {
 	SetLocalSecurityBypass(localSecurityBypass bool)
 }
 
+// the per flow channel depths dominate the nat's per flow memory (three
+// channels per flow at ~8-88 bytes per slot of backing array), so the
+// defaults are scaled by the memory budget. udp tolerates drops, so its
+// queues are short; tcp depth must cover the max window in mtu packets so a
+// full window burst is never dropped (the nat implements no retransmit
+// toward the socket).
+const defaultUdpFlowBufferSize = 256
+const defaultTcpFlowBufferSize = 1024
+
 func DefaultUdpBufferSettings() *UdpBufferSettings {
-	return DefaultUdpBufferSettingsWithBufferSize(defaultIpBufferSize)
+	return DefaultUdpBufferSettingsWithBufferSize(MemoryScaledCount(defaultUdpFlowBufferSize, 32))
 }
 
 func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
+	globalLimit := 0
+	if 0 < MemoryBudget() {
+		globalLimit = MemoryScaledCount(2048, 256)
+	}
 	return &UdpBufferSettings{
-		ReadTimeout:         300 * time.Second,
-		WriteTimeout:        15 * time.Second,
-		IdleTimeout:         300 * time.Second,
+		ReadTimeout:  300 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		// short idle reap, standard for udp nats: single round trip flows
+		// (dns, quic probes) dominate udp flow counts, and each idle flow
+		// pins its channels, read buffer, and goroutines until reaped
+		IdleTimeout:         60 * time.Second,
 		Mtu:                 DefaultMtu,
 		ReadBufferByteCount: DefaultMtu,
 		SequenceBufferSize:  bufferSize,
 		WriteBatchSize:      64,
 		UserLimit:           0,
-		MaxWindowSize:       uint32(mib(1)),
-		ConnectSettings:     *DefaultConnectSettings(),
+		// A process with an explicit memory budget is a constrained device and
+		// gets a scaled hard cap. Unbudgeted server/provider callers are not
+		// silently assigned the phone cap; provider entry points select their
+		// explicit profile below.
+		GlobalLimit:     globalLimit,
+		MaxWindowSize:   uint32(MemoryScaledByteCount(mib(1), kib(256))),
+		ConnectSettings: *DefaultConnectSettings(),
 	}
 }
 
 func DefaultTcpBufferSettings() *TcpBufferSettings {
-	return DefaultTcpBufferSettingsWithBufferSize(defaultIpBufferSize)
+	return DefaultTcpBufferSettingsWithBufferSize(MemoryScaledCount(defaultTcpFlowBufferSize, 192))
 }
 
 func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
+	minWindowSize := uint32(kib(64))
+	globalLimit := 0
+	if 0 < MemoryBudget() {
+		globalLimit = MemoryScaledCount(512, 64)
+	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
 		ReadTimeout:        300 * time.Second,
@@ -94,27 +118,87 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		SequenceBufferSize: bufferSize,
 		Mtu:                DefaultMtu,
 		// large socket reads are split into mtu-sized data packets by `DataPackets`
-		ReadBufferByteCount: int(kib(64)),
+		ReadBufferByteCount: int(MemoryScaledByteCount(kib(64), kib(16))),
 		WriteBatchSize:      64,
-		MinWindowSize:       uint32(kib(64)),
-		MaxWindowSize:       uint32(mib(1)),
+		MinWindowSize:       minWindowSize,
+		MaxWindowSize:       scaledPow2WindowSize(uint32(mib(1)), minWindowSize, uint32(kib(128))),
 		UserLimit:           0,
-		ConnectSettings:     *DefaultConnectSettings(),
+		// See the UDP profile above. In particular, an unbudgeted provider
+		// must not inherit a 512-flow phone cap and reset established users.
+		GlobalLimit:        globalLimit,
+		EnableOrphanRst:    true,
+		OrphanRstPerSecond: 256,
+		ConnectSettings:    *DefaultConnectSettings(),
 	}
 	return tcpBufferSettings
 }
 
-func DefaultLocalUserNatSettings() *LocalUserNatSettings {
-	return DefaultLocalUserNatSettingsWithBufferSize(defaultIpBufferSize)
+// scaledPow2WindowSize scales `maxWindowSize` by the memory budget with a
+// floor of `floorWindowSize`, rounded down to a power of 2 multiple of
+// `minWindowSize` to preserve the `MaxWindowSize` contract (the window
+// doubling ladder must land exactly on the max)
+func scaledPow2WindowSize(maxWindowSize uint32, minWindowSize uint32, floorWindowSize uint32) uint32 {
+	scaledWindowSize := uint32(MemoryScaledByteCount(ByteCount(maxWindowSize), ByteCount(floorWindowSize)))
+	windowSize := minWindowSize
+	for windowSize*2 <= scaledWindowSize {
+		windowSize *= 2
+	}
+	return windowSize
 }
 
+func DefaultLocalUserNatSettings() *LocalUserNatSettings {
+	return &LocalUserNatSettings{
+		// scaled by the memory budget: slots on the dispatch channel pin
+		// in-flight pool buffers under backpressure
+		SequenceBufferSize: MemoryScaledCount(defaultIpBufferSize, 256),
+		SendShardCount:     1,
+		// BufferTimeout:      15 * time.Second,
+		UdpBufferSettings: DefaultUdpBufferSettings(),
+		TcpBufferSettings: DefaultTcpBufferSettings(),
+	}
+}
+
+// providerUdpIdleTimeout is the udp idle reap for an unbudgeted
+// provider/egress. The general 60s udp idle (tuned for constrained devices,
+// where single round trip flows dominate and each idle flow pins memory) is
+// too aggressive for an egress provider: long-lived plain-udp sessions
+// (wireguard, voip, games) legitimately go quiet for minutes, and reaping
+// their NAT bindings breaks the flow for the user. 300s is the historical
+// provider default from before the idle reap was shortened.
+const providerUdpIdleTimeout = 300 * time.Second
+
+// DefaultProviderLocalUserNatSettings is the explicit provider/egress profile.
+// A process that installed a memory budget is a constrained device and gets
+// the scaled per-source/aggregate caps. An unbudgeted desktop/server provider
+// preserves the historical unlimited flow counts: silently assigning it the
+// phone's 512-TCP cap resets established provider traffic under ordinary
+// server-scale load. Keeping this choice here makes provider policy explicit
+// without changing every generic LocalUserNat caller.
+func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
+	settings := DefaultLocalUserNatSettings()
+	if MemoryBudget() <= 0 {
+		// unbudgeted: keep the unlimited flow counts and give plain-udp NAT
+		// bindings the provider-tuned idle instead of the general short reap
+		settings.UdpBufferSettings.IdleTimeout = providerUdpIdleTimeout
+		return settings
+	}
+	settings.UdpBufferSettings.UserLimit = MemoryScaledCount(512, 64)
+	settings.UdpBufferSettings.GlobalLimit = MemoryScaledCount(2048, 256)
+	settings.TcpBufferSettings.UserLimit = MemoryScaledCount(256, 32)
+	settings.TcpBufferSettings.GlobalLimit = MemoryScaledCount(512, 64)
+	return settings
+}
+
+// DefaultLocalUserNatSettingsWithBufferSize applies `bufferSize` verbatim to
+// the nat dispatch channel and every per flow channel (no memory budget
+// scaling of the depths; callers that pass an explicit size own the depth
+// choice). The window and read buffer defaults still scale.
 func DefaultLocalUserNatSettingsWithBufferSize(bufferSize int) *LocalUserNatSettings {
 	return &LocalUserNatSettings{
 		SequenceBufferSize: bufferSize,
 		SendShardCount:     1,
-		// BufferTimeout:      15 * time.Second,
-		UdpBufferSettings: DefaultUdpBufferSettingsWithBufferSize(bufferSize),
-		TcpBufferSettings: DefaultTcpBufferSettingsWithBufferSize(bufferSize),
+		UdpBufferSettings:  DefaultUdpBufferSettingsWithBufferSize(bufferSize),
+		TcpBufferSettings:  DefaultTcpBufferSettingsWithBufferSize(bufferSize),
 	}
 }
 
@@ -642,7 +726,12 @@ type UdpBufferSettings struct {
 	WriteBatchSize int
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
-	UserLimit     int
+	UserLimit int
+	// the number of open sockets across all users (per address family
+	// buffer), an aggregate flow state and fd ceiling for hosts with a hard
+	// process memory budget. uses the same lru cleanup as `UserLimit`.
+	// 0 (the default) is no limit.
+	GlobalLimit   int
 	MaxWindowSize uint32
 
 	ConnectSettings
@@ -985,8 +1074,8 @@ func (self *UdpBuffer[BufferId]) udpSend(
 
 		if 0 < self.udpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
-			if sourceSequences := self.sourceSequences[source]; self.udpBufferSettings.UserLimit < len(sourceSequences) {
-				applyLruUserLimit(maps.Values(sourceSequences), self.udpBufferSettings.UserLimit, func(sequence *UdpSequence) bool {
+			if sourceSequences := self.sourceSequences[source]; self.udpBufferSettings.UserLimit <= len(sourceSequences) {
+				applyLruMapLimit(sourceSequences, self.udpBufferSettings.UserLimit-1, func(bufferId BufferId, sequence *UdpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]udp limit source %s->%s\n",
@@ -997,6 +1086,27 @@ func (self *UdpBuffer[BufferId]) udpSend(
 							),
 						)
 					}
+					self.removeSequenceWithLock(bufferId, sequence)
+					return true
+				})
+			}
+		}
+		if 0 < self.udpBufferSettings.GlobalLimit {
+			// limit the total connections across all sources, an aggregate
+			// flow state and fd ceiling
+			if self.udpBufferSettings.GlobalLimit <= len(self.sequences) {
+				applyLruMapLimit(self.sequences, self.udpBufferSettings.GlobalLimit-1, func(bufferId BufferId, sequence *UdpSequence) bool {
+					if self.log.V(1).Enabled() {
+						self.log.Infof(
+							"[lnr]udp limit global %s->%s\n",
+							sequence.source,
+							net.JoinHostPort(
+								sequence.destinationIp.String(),
+								strconv.Itoa(int(sequence.destinationPort)),
+							),
+						)
+					}
+					self.removeSequenceWithLock(bufferId, sequence)
 					return true
 				})
 			}
@@ -1063,6 +1173,23 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		// sequence closed
 		return initSequence(sequence).send(sendItem, timeout)
 	}
+}
+
+// removeSequenceWithLock removes a UDP sequence from both indexes before
+// canceling it. The sequence goroutine's deferred cleanup is identity-checked,
+// so eager removal is safe and makes the configured cap exact under bursts.
+// The caller holds mutex.
+func (self *UdpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, sequence *UdpSequence) {
+	if self.sequences[bufferId] != sequence {
+		return
+	}
+	delete(self.sequences, bufferId)
+	sourceSequences := self.sourceSequences[sequence.source]
+	delete(sourceSequences, bufferId)
+	if len(sourceSequences) == 0 {
+		delete(self.sourceSequences, sequence.source)
+	}
+	sequence.Cancel()
 }
 
 type UdpSequence struct {
@@ -1642,6 +1769,21 @@ type TcpBufferSettings struct {
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
 	UserLimit int
+	// the number of open sockets across all users (per address family
+	// buffer), an aggregate flow state and fd ceiling for hosts with a hard
+	// process memory budget. uses the same lru cleanup as `UserLimit`.
+	// 0 (the default) is no limit.
+	GlobalLimit int
+	// EnableOrphanRst replies with a RST to a non-SYN packet that matches no
+	// sequence (PROXYDRAIN1.md §3.5). Without it a source whose flow state
+	// was lost here (e.g. the source client restarted with a fresh identity,
+	// orphaning its provider-side flows) retransmits into silence and the
+	// application hangs to its own timeout; the RST makes it reconnect
+	// immediately. Rate limited by `OrphanRstPerSecond`.
+	EnableOrphanRst bool
+	// OrphanRstPerSecond bounds orphan RST generation per buffer (an abuse
+	// valve: orphan packets are attacker-influenceable). <= 0 is unlimited.
+	OrphanRstPerSecond int
 
 	ConnectSettings
 }
@@ -1716,6 +1858,10 @@ type TcpBuffer[BufferId comparable] struct {
 
 	sequences       map[BufferId]*TcpSequence
 	sourceSequences map[TransferPath]map[BufferId]*TcpSequence
+
+	// orphan rst rate limiting (guarded by mutex; see EnableOrphanRst)
+	orphanRstWindowStart time.Time
+	orphanRstWindowCount int
 }
 
 func newTcpBuffer[BufferId comparable](
@@ -1733,6 +1879,25 @@ func newTcpBuffer[BufferId comparable](
 	}
 }
 
+// allowOrphanRstWithLock applies the orphan rst rate limit. The caller must
+// hold `mutex`.
+func (self *TcpBuffer[BufferId]) allowOrphanRstWithLock() bool {
+	limit := self.tcpBufferSettings.OrphanRstPerSecond
+	if limit <= 0 {
+		return true
+	}
+	now := time.Now()
+	if 1*time.Second <= now.Sub(self.orphanRstWindowStart) {
+		self.orphanRstWindowStart = now
+		self.orphanRstWindowCount = 0
+	}
+	if limit <= self.orphanRstWindowCount {
+		return false
+	}
+	self.orphanRstWindowCount += 1
+	return true
+}
+
 func (self *TcpBuffer[BufferId]) tcpSend(
 	bufferId BufferId,
 	source TransferPath,
@@ -1742,6 +1907,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	timeout time.Duration,
 	ipPacket []byte,
 ) (bool, error) {
+	var orphanRst []byte
+	var orphanSourceIp net.IP
+	var orphanDestinationIp net.IP
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -1763,7 +1931,22 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		}
 
 		if !tcp.syn {
-			// drop the packet; only create a new sequence on SYN
+			// drop the packet; only create a new sequence on SYN.
+			// Reply with a RST so the source fails fast instead of
+			// retransmitting into silence (PROXYDRAIN1.md §3.5) — sent
+			// outside the lock, below. Never reset a reset.
+			if self.tcpBufferSettings.EnableOrphanRst && !tcp.rst && self.allowOrphanRstWithLock() {
+				orphanRst = tcpRstForOrphan(ipVersion, tcp)
+				// parseIpv4/parseIpv6 return views into ipPacket, which is
+				// returned below before the callback runs. Preserve the path
+				// independently of that pooled backing. Use one allocation for
+				// both address slices.
+				ipBacking := make(net.IP, len(tcp.sourceIp)+len(tcp.destinationIp))
+				sourceIpByteCount := copy(ipBacking, tcp.sourceIp)
+				copy(ipBacking[sourceIpByteCount:], tcp.destinationIp)
+				orphanSourceIp = ipBacking[:sourceIpByteCount:sourceIpByteCount]
+				orphanDestinationIp = ipBacking[sourceIpByteCount:]
+			}
 			MessagePoolReturn(ipPacket)
 			if self.log.V(2).Enabled() {
 				self.log.Infof("[lnr]tcp drop no syn (%s)\n", tcp.flagsString())
@@ -1783,8 +1966,8 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		// }
 		if 0 < self.tcpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
-			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit < len(sourceSequences) {
-				applyLruUserLimit(maps.Values(sourceSequences), self.tcpBufferSettings.UserLimit, func(sequence *TcpSequence) bool {
+			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit <= len(sourceSequences) {
+				applyLruMapLimit(sourceSequences, self.tcpBufferSettings.UserLimit-1, func(bufferId BufferId, sequence *TcpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]tcp limit source %s->%s\n",
@@ -1795,6 +1978,27 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 							),
 						)
 					}
+					self.removeSequenceWithLock(bufferId, sequence)
+					return true
+				})
+			}
+		}
+		if 0 < self.tcpBufferSettings.GlobalLimit {
+			// limit the total connections across all sources, an aggregate
+			// flow state and fd ceiling
+			if self.tcpBufferSettings.GlobalLimit <= len(self.sequences) {
+				applyLruMapLimit(self.sequences, self.tcpBufferSettings.GlobalLimit-1, func(bufferId BufferId, sequence *TcpSequence) bool {
+					if self.log.V(1).Enabled() {
+						self.log.Infof(
+							"[lnr]tcp limit global %s->%s\n",
+							sequence.source,
+							net.JoinHostPort(
+								sequence.destinationIp.String(),
+								strconv.Itoa(int(sequence.destinationPort)),
+							),
+						)
+					}
+					self.removeSequenceWithLock(bufferId, sequence)
 					return true
 				})
 			}
@@ -1854,11 +2058,105 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		ipPacket:    ipPacket,
 	}
 	if sequence := initSequence(); sequence == nil {
+		if orphanRst != nil {
+			// outside the buffer lock: the receive callback can block on the
+			// return send path
+			self.receiveCallback(
+				source,
+				provideMode,
+				&IpPath{
+					Version:         ipVersion,
+					Protocol:        IpProtocolTcp,
+					SourceIp:        orphanSourceIp,
+					SourcePort:      int(tcp.sourcePort),
+					DestinationIp:   orphanDestinationIp,
+					DestinationPort: int(tcp.destinationPort),
+				},
+				orphanRst,
+			)
+			MessagePoolReturn(orphanRst)
+		}
 		// sequence does not exist and not a syn packet, drop
 		return false, nil
 	} else {
 		return sequence.send(sendItem, timeout)
 	}
+}
+
+// removeSequenceWithLock is the TCP counterpart of the UDP helper above.
+// Eager index removal keeps the cap exact even when canceled sequence
+// goroutines have not reached their deferred cleanup yet. The caller holds
+// mutex.
+func (self *TcpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, sequence *TcpSequence) {
+	if self.sequences[bufferId] != sequence {
+		return
+	}
+	delete(self.sequences, bufferId)
+	sourceSequences := self.sourceSequences[sequence.source]
+	delete(sourceSequences, bufferId)
+	if len(sourceSequences) == 0 {
+		delete(self.sourceSequences, sequence.source)
+	}
+	sequence.Cancel()
+}
+
+// tcpRstForOrphan builds the RFC 793 reset for a segment that matched no
+// sequence, addressed back to the segment's source: with ACK set the reset
+// carries seq = segment.ack and no ack flag; otherwise seq 0 and
+// ack = segment.seq + payload length (+1 each for syn/fin), with RST|ACK.
+func tcpRstForOrphan(ipVersion int, tcp *parsedTcp) []byte {
+	var ipHeaderByteCount int
+	switch ipVersion {
+	case 4:
+		ipHeaderByteCount = Ipv4HeaderSizeWithoutExtensions
+	case 6:
+		ipHeaderByteCount = Ipv6HeaderSize
+	default:
+		return nil
+	}
+
+	packet := MessagePoolGet(ipHeaderByteCount + TcpHeaderSizeWithoutExtensions)
+	switch ipVersion {
+	case 4:
+		writeIpv4Header(packet, ipProtocolNumberTcp, tcp.destinationIp, tcp.sourceIp)
+	case 6:
+		writeIpv6Header(packet, ipProtocolNumberTcp, tcp.destinationIp, tcp.sourceIp)
+	}
+
+	t := packet[ipHeaderByteCount:]
+	binary.BigEndian.PutUint16(t[0:2], tcp.destinationPort)
+	binary.BigEndian.PutUint16(t[2:4], tcp.sourcePort)
+	var seq uint32
+	var ackNumber uint32
+	flags := byte(tcpFlagRst)
+	if tcp.ack {
+		seq = tcp.ackNumber
+	} else {
+		ackNumber = tcp.seq + uint32(len(tcp.payload))
+		if tcp.syn {
+			ackNumber += 1
+		}
+		if tcp.fin {
+			ackNumber += 1
+		}
+		flags |= tcpFlagAck
+	}
+	binary.BigEndian.PutUint32(t[4:8], seq)
+	binary.BigEndian.PutUint32(t[8:12], ackNumber)
+	// data offset, no options
+	t[12] = byte(TcpHeaderSizeWithoutExtensions/4) << 4
+	t[13] = flags
+	// window
+	t[14] = 0
+	t[15] = 0
+	// checksum, set below
+	t[16] = 0
+	t[17] = 0
+	// urgent
+	t[18] = 0
+	t[19] = 0
+	binary.BigEndian.PutUint16(t[16:18], transportChecksum(ipProtocolNumberTcp, tcp.destinationIp, tcp.sourceIp, t))
+	return packet
 }
 
 /*
@@ -2977,6 +3275,9 @@ func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
 		ProtocolVersion:         DefaultProtocolVersion,
 		SecurityPolicyGenerator: DefaultProviderSecurityPolicyWithStats,
 		EventEpoch:              1 * time.Second,
+		// scaled by the memory budget: bounds the per-source return provide
+		// mode map (see `recordSourceProvideMode`)
+		MaxSourceCount: MemoryScaledCount(8192, 1024),
 	}
 }
 
@@ -2989,6 +3290,10 @@ type RemoteUserNatProviderSettings struct {
 
 	// epoch to flush packet stats events to listeners
 	EventEpoch time.Duration
+
+	// the maximum number of sources tracked for return provide modes.
+	// 0 is no limit.
+	MaxSourceCount int
 }
 
 type RemoteUserNatProvider struct {
@@ -3007,8 +3312,8 @@ type RemoteUserNatProvider struct {
 	packetStatsCounters  *packetStatsCounters
 	packetStatsCallbacks *CallbackList[PacketStatsFunction]
 
-	// the min (most private) provide mode each source has sent under, so the
-	// return path can echo it. A source on the same network sends under
+	// the return provide mode recorded per source (see recordSourceProvideMode),
+	// so the return path can echo it. A source on the same network sends under
 	// ProvideMode_Network and its return traffic should also be network mode,
 	// which skips the public security rules and forgoes the companion contract.
 	stateLock         sync.Mutex
@@ -3105,20 +3410,42 @@ func (self *RemoteUserNatProvider) runPacketStats() {
 	}
 }
 
-// recordSourceProvideMode keeps the min (most private) provide mode a source
-// has egressed under, so the return path can echo it
+// recordSourceProvideMode remembers the provide mode to echo on a source's
+// return path. ProvideMode is a set of flags, not an ordered scale, so this is a
+// per-case choice, never a numeric min: prefer the same-Network relationship once
+// a source has used it — its Network contract is verified, so the return traffic
+// can ride the network relationship and skip the public ingress rules — otherwise
+// remember the source's (non-Network) mode so the echo rides a companion contract.
 func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideMode protocol.ProvideMode) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if existing, ok := self.sourceProvideMode[sourceId]; !ok || provideMode < existing {
+	switch existing, ok := self.sourceProvideMode[sourceId]; {
+	case !ok:
+		// bound the map: evict an arbitrary entry at the cap. Eviction is
+		// safe — the return path falls back to the packet's carried provide
+		// mode (see `sourceReturnProvideMode`), and an active source
+		// re-records on its next inbound packet.
+		if maxCount := self.settings.MaxSourceCount; 0 < maxCount && maxCount <= len(self.sourceProvideMode) {
+			for evictSourceId := range self.sourceProvideMode {
+				delete(self.sourceProvideMode, evictSourceId)
+				break
+			}
+		}
+		self.sourceProvideMode[sourceId] = provideMode
+	case existing == protocol.ProvideMode_Network:
+		// already network; keep it
+	case provideMode == protocol.ProvideMode_Network:
+		self.sourceProvideMode[sourceId] = protocol.ProvideMode_Network
+	default:
 		self.sourceProvideMode[sourceId] = provideMode
 	}
 }
 
-// minSourceProvideMode returns the recorded min provide mode for a source,
-// falling back to the provide mode of the current return packet (carried back
-// through the local nat conntrack) if the source is not yet tracked
-func (self *RemoteUserNatProvider) minSourceProvideMode(sourceId Id, fallback protocol.ProvideMode) protocol.ProvideMode {
+// sourceReturnProvideMode returns the recorded return provide mode for a source
+// (see recordSourceProvideMode), falling back to the provide mode of the current
+// return packet (carried back through the local nat conntrack) if the source is
+// not yet tracked
+func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback protocol.ProvideMode) protocol.ProvideMode {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if provideMode, ok := self.sourceProvideMode[sourceId]; ok {
@@ -3174,12 +3501,12 @@ func (self *RemoteUserNatProvider) Receive(
 		defer MessagePoolReturn(ipPacketFromProvider.IpPacket.PacketBytes)
 	}
 
-	// echo the min provide mode the source sent under. A same-network source
+	// echo the recorded return provide mode for the source. A same-network source
 	// sends under ProvideMode_Network; its return traffic is also network mode,
 	// which uses the network relationship (no companion contract) so the device
 	// receives it as network mode and skips the public ingress rules. Other
 	// modes ride a companion contract (verified as Stream) as before.
-	returnProvideMode := self.minSourceProvideMode(source.SourceId, provideMode)
+	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
 	opts := []any{}
 	if returnProvideMode != protocol.ProvideMode_Network {
 		opts = append(opts, CompanionContract())
@@ -3234,14 +3561,14 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
 			}
-			// echo the min provide mode the source sent under, like the
+			// echo the recorded return provide mode for the source, like the
 			// provider's other return traffic. A same-network source pings
 			// under ProvideMode_Network; its echo is also network mode (no
 			// companion contract). For other modes the source only provides
 			// ProvideMode_Stream, so a forward contract would be rejected
 			// (no permission); the echo rides a companion contract instead.
 			echoOpts := []any{}
-			if self.minSourceProvideMode(source.SourceId, provideMode) != protocol.ProvideMode_Network {
+			if self.sourceReturnProvideMode(source.SourceId, provideMode) != protocol.ProvideMode_Network {
 				echoOpts = append(echoOpts, CompanionContract())
 			}
 			self.client.SendWithTimeout(
@@ -3406,13 +3733,13 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
-	minRelationship := max(provideMode, self.provideMode)
+	relationship := egressRelationship(provideMode, self.provideMode)
 
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
 	if err != nil {
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(minRelationship, ipPath, payload)
+	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
 	if err != nil {
 		return false
 	}
@@ -3881,34 +4208,39 @@ func (self *userLimited) UpdateLastActivityTime() {
 	self.lastActivityTime = time.Now()
 }
 
-func applyLruUserLimit[R UserLimited](resources []R, ulimit int, limitCallback func(R) bool) {
-	// limit the total connections per source to avoid blowing up the ulimit
-	if n := len(resources) - ulimit; 0 < n {
-		resourceLastActivityTimes := map[UserLimited]time.Time{}
-		for _, resource := range resources {
-			resourceLastActivityTimes[resource] = resource.LastActivityTime()
-		}
-		// order by last activity time
-		slices.SortFunc(resources, func(a R, b R) int {
-			lastActivityTimeA := resourceLastActivityTimes[a]
-			lastActivityTimeB := resourceLastActivityTimes[b]
-			if lastActivityTimeA.Before(lastActivityTimeB) {
-				return -1
-			} else if lastActivityTimeB.Before(lastActivityTimeA) {
-				return 1
-			} else {
-				return 0
+const lruEvictionSampleSize = 32
+
+// applyLruMapLimit bounds eviction work independently of table cardinality.
+// Go map iteration starts at a pseudo-random bucket, so choosing the oldest of
+// the first fixed-size sample is an approximate LRU without collecting and
+// sorting the entire flow table under its dispatch lock. limitCallback must
+// remove an accepted resource from resources; it owns any cancellation.
+func applyLruMapLimit[K comparable, R UserLimited](
+	resources map[K]R,
+	limit int,
+	limitCallback func(K, R) bool,
+) {
+	for limit < len(resources) {
+		var oldestKey K
+		var oldest R
+		var oldestTime time.Time
+		found := false
+		sampled := 0
+		for key, resource := range resources {
+			activityTime := resource.LastActivityTime()
+			if !found || activityTime.Before(oldestTime) {
+				oldestKey = key
+				oldest = resource
+				oldestTime = activityTime
+				found = true
 			}
-		})
-		i := 0
-		for _, resource := range resources {
-			if limitCallback(resource) {
-				i += 1
-				resource.Cancel()
-			}
-			if n <= i {
+			sampled += 1
+			if lruEvictionSampleSize <= sampled {
 				break
 			}
+		}
+		if !found || !limitCallback(oldestKey, oldest) {
+			return
 		}
 	}
 }

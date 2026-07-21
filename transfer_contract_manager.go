@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	// "runtime/debug"
 	mathrand "math/rand"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	// "google.golang.org/protobuf/proto"
 
@@ -313,6 +314,9 @@ type ContractManager struct {
 	contractStatsEntries   map[contractStatsKey]*contractStatsEntry
 	contractStatsCallbacks *CallbackList[ContractStatsFunction]
 	contractStatsStarted   bool
+	// per-contract event sequence numbers, assigned under `contractStatsLock`
+	// at snapshot time (see `emitContractStats`)
+	contractStatsSequences map[Id]uint64
 
 	controlSyncProvide    *ControlSync
 	controlSyncProvideOob *ControlSyncOob
@@ -355,6 +359,7 @@ func NewContractManager(
 		localStats:                 NewContractManagerStats(),
 		contractStatsEntries:       map[contractStatsKey]*contractStatsEntry{},
 		contractStatsCallbacks:     NewCallbackList[ContractStatsFunction](),
+		contractStatsSequences:     map[Id]uint64{},
 		controlSyncProvide:         NewControlSync(ctx, client, "provide"),
 		controlSyncProvideOob:      NewControlSyncOob(ctx, client, "provide-oob"),
 	}
@@ -1285,7 +1290,7 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 		defer self.mutex.Unlock()
 
 		if self.client.log.V(1).Enabled() {
-			self.client.log.Infof("[contract]flush %s %s\n", self.client.ClientId(), maps.Keys(self.destinationContracts))
+			self.client.log.Infof("[contract]flush %s %s\n", self.client.ClientId(), slices.Collect(maps.Keys(self.destinationContracts)))
 		}
 
 		contracts := []*protocol.Contract{}

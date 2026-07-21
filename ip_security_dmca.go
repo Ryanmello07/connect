@@ -37,8 +37,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/exp/maps"
 )
 
 // number of flow-table shards. Sharding keeps the per-packet table lookup off a
@@ -123,8 +121,11 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		EncryptedPopcountBand:         0.10,
 		EncryptedMaxPrintableFraction: 0.50,
 		EncryptedMinNormalizedEntropy: 0.85,
-		MaxFlows:                      65536,
-		FlowTtl:                       300 * time.Second,
+		// scaled by the memory budget: each tracked flow holds ~100-200
+		// bytes (state + map overhead), so the cap bounds the policy's
+		// worst case footprint per instance
+		MaxFlows: MemoryScaledCount(65536, 4096),
+		FlowTtl:  300 * time.Second,
 	}
 }
 
@@ -463,8 +464,8 @@ func (self *dmcaDetector) evictWithLock(shard *dmcaFlowShard) {
 	if len(shard.flows) < self.perShardCap {
 		return
 	}
-	applyLruUserLimit(maps.Values(shard.flows), self.perShardCap-1, func(st *dmcaFlowState) bool {
-		delete(shard.flows, st.key)
+	applyLruMapLimit(shard.flows, self.perShardCap-1, func(key Ip6Path, st *dmcaFlowState) bool {
+		delete(shard.flows, key)
 		return true
 	})
 }

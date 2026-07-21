@@ -7,8 +7,10 @@ package connect
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,9 +124,14 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// the tunnel/upstream can take tens of seconds to establish on first connect; the
 			// budget must cover a full slow connect (tun dial 30s) plus TLS handshake (30s) so a
 			// query racing startup waits for the tunnel rather than failing early.
-			ResolveTimeout:     60 * time.Second,
-			ResponseTtl:        60,
-			ReverseTtl:         5 * time.Minute,
+			ResolveTimeout: 60 * time.Second,
+			ResponseTtl:    60,
+			// server names are stable and the map is capped + memory-shed, so retain
+			// affinity records well past the OS resolver's own cache lifetime: a client
+			// that dials from its DNS cache (long-TTL records like pbs.com's 24h) emits no
+			// query the mux can record, so a short reverse TTL would idle-evict the name
+			// while the client keeps using the ip, blanking the block-action host feed.
+			ReverseTtl:         1 * time.Hour,
 			ReverseMaxEntries:  defaultReverseMaxEntries,
 			MaxInflightQueries: defaultMaxInflightDnsQueries,
 			// handicapped local fallback: if the tunnel-DoH hasn't answered within 5s, also resolve
@@ -142,6 +149,10 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 }
 
 const (
+	// dnsTypeSvcb / dnsTypeHttps are the SVCB (64) and HTTPS (65) question types
+	// (RFC 9460), not defined by x/net/dns/dnsmessage.
+	dnsTypeSvcb  = dnsmessage.Type(64)
+	dnsTypeHttps = dnsmessage.Type(65)
 	// defaultMaxInflightDnsQueries is the DnsUpgradeSettings.MaxInflightQueries default.
 	defaultMaxInflightDnsQueries = 96
 	// maxDnsRespondersPerQuestion caps the responders attached to one in-flight question, so
@@ -190,9 +201,17 @@ type UpgradeMux struct {
 	inflight     map[DohKey]*dnsFlight
 
 	// reverse maps a resolved IP to the hostname(s) the mux served for it, for the
-	// multi-client's ServerName path affinity (point 4).
-	reverseLock sync.Mutex
-	reverse     map[netip.Addr]reverseEntry
+	// multi-client's ServerName path affinity (point 4) and block-action server-name
+	// reporting. Self-contained + independently testable (see reverseIndex); the mux
+	// records DoH resolutions into it, drives its idle eviction from run(), and its
+	// ServerNameLookup / ServerNamesLearnedNotifier methods delegate to it.
+	reverse *reverseIndex
+
+	// sni passively captures the TLS SNI of egress TCP/443 ClientHellos into the reverse
+	// index, naming flows the DNS path can't (a client dialing an ip from its own DNS
+	// cache emits no query the mux sees). Observation only — the flow always passes
+	// through. Self-contained + independently testable (see sniSniffer).
+	sni *sniSniffer
 }
 
 // dnsResolverSettings extracts the resolver config from the mux settings (nil = no DNS
@@ -275,9 +294,16 @@ func NewUpgradeMux(
 		source:      source,
 		provideMode: provideMode,
 		inflight:    map[DohKey]*dnsFlight{},
-		reverse:     map[netip.Addr]reverseEntry{},
 	}
 	self.settings.Store(settings)
+	// the reverse index reads its cap from the live settings (reverseMaxEntries), so a
+	// SetSettings change to ReverseMaxEntries applies without rebuilding the index
+	self.reverse = newReverseIndex(self.reverseMaxEntries)
+	// captured TLS SNIs feed the same reverse index as DNS resolutions (firing the
+	// learned callbacks that invalidate stale block-action decisions)
+	self.sni = newSniSniffer(func(dstAddr netip.Addr, serverName string) {
+		self.reverse.record([]netip.Addr{dstAddr}, serverName)
+	})
 	// bound the resolver cache and fan-out below the server/proxy defaults (see
 	// DefaultDohSettings); the mux resolves a device's queries, not a data plane's
 	dohSettings := DefaultDohSettings()
@@ -289,7 +315,7 @@ func NewUpgradeMux(
 	// so the block action ignore matcher (which lists the server names)
 	// also matches the resolved server addresses
 	dohSettings.DohServerResolvedCallback = func(domain string, addrs []netip.Addr) {
-		self.recordServerNames(addrs, domain)
+		self.reverse.record(addrs, domain)
 	}
 	tunSettings.DohSettings = dohSettings
 	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
@@ -311,18 +337,26 @@ func NewUpgradeMux(
 }
 
 // onSend claims and terminates intercepted DNS (UDP/53) and HTTP (TCP/80); everything else
-// passes through to the upstream. The claim decision is a pure function of (protocol, dst
-// port), so it is read from a cheap, allocation-free header peek — only a claimed flow (or a
-// header the peek can't classify, e.g. IPv6 extension headers) needs the allocating full
-// parse. This keeps the pass-through bulk off the parse/allocation path entirely.
+// passes through to the upstream. TCP/443 passes through too, but is first observed for its
+// TLS SNI (never claimed). The claim decision is a pure function of (protocol, dst port), so
+// it is read from a cheap, allocation-free header peek — only a claimed flow (or a header the
+// peek can't classify, e.g. IPv6 extension headers) needs the allocating full parse. This
+// keeps the pass-through bulk off the parse/allocation path entirely.
 func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
-	switch peekClaim(packet) {
+	var tls tlsSegment
+	switch peekClaim(packet, &tls) {
 	case peekOther:
 		return false // not a claimable flow — pass through without parsing
 	case peekHttp:
 		// block drops claimed plaintext HTTP; otherwise it passes through unchanged. neither
 		// needs the full parse, so the pass-through :80 bulk stays off the allocating parse path.
 		return self.httpBlocked()
+	case peekTls:
+		// observe the ClientHello for its SNI, then always pass through — TLS is never
+		// claimed, only named. peekClaim already extracted the flow/payload while classifying,
+		// so the sniffer reassembles from that segment without re-walking the L4 headers.
+		self.sni.observeSegment(tls)
+		return false
 	}
 	// peekDns or peekUndecided — classify with the authoritative full parse
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
@@ -376,6 +410,7 @@ const (
 	peekOther     peekResult = iota // not a claimable flow → pass through
 	peekDns                         // UDP/53 (DNS)
 	peekHttp                        // TCP/80 (HTTP)
+	peekTls                         // TCP/443 (observed for SNI, never claimed)
 	peekUndecided                   // header can't be classified cheaply → full parse
 )
 
@@ -383,7 +418,11 @@ const (
 // (ParseIpPathWithPayload allocates the IpPath and an address backing per call). peekUndecided
 // means the header can't be classified cheaply — IPv6 with extension headers, or a
 // short/unsupported header — and the caller must fall back to the full parse.
-func peekClaim(packet []byte) peekResult {
+//
+// For a TCP/443 packet (peekTls) it also fills *seg with the flow 4-tuple and TCP payload, so
+// the SNI sniffer can reassemble without re-walking the L4 headers; seg is left untouched for
+// every other result. Pass a throwaway *tlsSegment when only the classification is wanted.
+func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 	if len(packet) < 20 {
 		return peekUndecided
 	}
@@ -395,8 +434,21 @@ func peekClaim(packet []byte) peekResult {
 		}
 		switch packet[9] { // protocol
 		case 6: // tcp
-			if 80 == int(packet[ihl+2])<<8|int(packet[ihl+3]) {
+			switch int(packet[ihl+2])<<8 | int(packet[ihl+3]) {
+			case 80:
 				return peekHttp
+			case 443:
+				totalLen := int(packet[2])<<8 | int(packet[3])
+				if totalLen < ihl || len(packet) < totalLen {
+					totalLen = len(packet)
+				}
+				src, _ := netip.AddrFromSlice(packet[12:16])
+				dst, _ := netip.AddrFromSlice(packet[16:20])
+				if s, ok := tcpSegment443(packet, ihl, totalLen, src, dst); ok {
+					*seg = s
+					return peekTls
+				}
+				return peekOther
 			}
 			return peekOther
 		case 17: // udp
@@ -413,8 +465,22 @@ func peekClaim(packet []byte) peekResult {
 		}
 		switch packet[6] { // next header
 		case 6: // tcp
-			if 80 == int(packet[42])<<8|int(packet[43]) {
+			switch int(packet[42])<<8 | int(packet[43]) {
+			case 80:
 				return peekHttp
+			case 443:
+				payloadLen := int(packet[4])<<8 | int(packet[5])
+				end := 40 + payloadLen
+				if len(packet) < end {
+					end = len(packet)
+				}
+				src, _ := netip.AddrFromSlice(packet[8:24])
+				dst, _ := netip.AddrFromSlice(packet[24:40])
+				if s, ok := tcpSegment443(packet, 40, end, src, dst); ok {
+					*seg = s
+					return peekTls
+				}
+				return peekOther
 			}
 			return peekOther
 		case 17: // udp
@@ -451,14 +517,23 @@ type dnsFlight struct {
 	// workers is the outstanding pipeline goroutine count; the flight is removed when it
 	// reaches 0 without a reply (resolution failed: send nothing, the clients retry)
 	workers int
+	// cancel is shared by every worker in an A/AAAA race. The first
+	// authoritative answer cancels its losing sibling, and the flight remains
+	// in inflight until all workers have observed cancellation and exited.
+	cancel context.CancelFunc
 }
 
 // handleDns claims a single A/AAAA DNS query and attaches it to the resolution
 // pipeline for its question — joining the in-flight pipeline when one exists, else
 // starting one (resolution can block on the network, so it runs asynchronously via
 // the Tun's DohCache). The pipeline writes each attached client its own response and
-// records the IP→hostname mapping. Other query types are not claimed and pass
-// through to the upstream.
+// records the IP→hostname mapping. SVCB/HTTPS (64/65) queries are claimed and
+// forwarded opaquely over the tunnel DoH — the record (alpn/hints/ech) is preserved
+// for the client, and its ipv4hint/ipv6hint addresses are recorded into the reverse
+// index so those flows are named; when the forward cannot answer (remote DoH off or
+// failed) the client gets a prompt SERVFAIL, and an over-UDP-size record gets a
+// truncated (TC) reply, so a resolver waiting on the HTTPS RR never hangs on the
+// claimed type. Other query types are not claimed and pass through to the upstream.
 //
 // The parsed question is a value (dnsmessage copies the name into a fixed array), and
 // the reversed path owns its address bytes, so nothing aliases the recycled packet
@@ -473,7 +548,11 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	if err != nil {
 		return false
 	}
-	domain := strings.TrimSuffix(question.Name.String(), ".")
+	// lower cased: clients that randomize query casing (dns 0x20) must coalesce,
+	// cache, and record as one name — the reverse index and its learned callbacks
+	// key on this. The client's reply echoes the original-cased question, which is
+	// carried separately on the responder.
+	domain := strings.ToLower(strings.TrimSuffix(question.Name.String(), "."))
 
 	// the blocker consults every query type, ahead of any resolution or
 	// caching: a blocked name answers A/AAAA with the unspecified address
@@ -503,12 +582,22 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 		return true
 	}
 
+	// A/AAAA resolve-and-synthesize; SVCB/HTTPS forward the record opaquely (the resolver
+	// parses A/AAAA into addresses but not SVCB, and forwarding preserves the record's
+	// alpn/hints/ech for the client). Both coalesce on the same in-flight machinery.
 	var recordType string
+	forward := false
 	switch question.Type {
 	case dnsmessage.TypeA:
 		recordType = "A"
 	case dnsmessage.TypeAAAA:
 		recordType = "AAAA"
+	case dnsTypeHttps:
+		recordType = "HTTPS"
+		forward = true
+	case dnsTypeSvcb:
+		recordType = "SVCB"
+		forward = true
 	default:
 		return false
 	}
@@ -523,7 +612,11 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	}
 	key := NewDohKey(recordType, domain)
 	if fl := self.attachDnsResponder(key, responder); fl != nil {
-		self.startDnsPipeline(key, fl, recordType, domain)
+		if forward {
+			self.startHttpsForwardPipeline(key, fl, question.Type, domain)
+		} else {
+			self.startDnsPipeline(key, fl, recordType, domain)
+		}
 	}
 	return true
 }
@@ -539,6 +632,12 @@ func (self *UpgradeMux) attachDnsResponder(key DohKey, responder dnsResponder) *
 	self.inflightLock.Lock()
 	defer self.inflightLock.Unlock()
 	if fl, ok := self.inflight[key]; ok {
+		// An answer has already snapshotted this flight's responders. Keep the
+		// flight counted until its losing workers exit, but do not attach a
+		// responder that could no longer receive that answer.
+		if fl.replied {
+			return nil
+		}
 		for _, r := range fl.responders {
 			if r.id == responder.id && r.reverse.DestinationPort == responder.reverse.DestinationPort && r.reverse.DestinationIp.Equal(responder.reverse.DestinationIp) {
 				// a retransmit of an attached query; it is answered when the pipeline replies
@@ -580,11 +679,12 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	}
 	fallback := self.fallbackDohCache.Load()
 
-	queryContext := func() (context.Context, context.CancelFunc) {
-		if 0 < resolveTimeout {
-			return context.WithTimeout(self.ctx, resolveTimeout)
-		}
-		return self.ctx, func() {}
+	var queryCtx context.Context
+	var queryCancel context.CancelFunc
+	if 0 < resolveTimeout {
+		queryCtx, queryCancel = context.WithTimeout(self.ctx, resolveTimeout)
+	} else {
+		queryCtx, queryCancel = context.WithCancel(self.ctx)
 	}
 
 	// reply delivers the first successful resolution to every attached responder, exactly
@@ -597,6 +697,7 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			return
 		}
 		var responders []dnsResponder
+		var cancel context.CancelFunc
 		func() {
 			self.inflightLock.Lock()
 			defer self.inflightLock.Unlock()
@@ -605,15 +706,19 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			}
 			fl.replied = true
 			responders = fl.responders
-			if self.inflight[key] == fl {
-				delete(self.inflight, key)
-			}
+			cancel = fl.cancel
 		}()
 		if responders == nil {
 			return
 		}
+		// Cancel the losing resolver before doing response construction and
+		// delivery. The flight remains in the map until workerDone observes
+		// every worker exit, so MaxInflightQueries also bounds queued losers.
+		if cancel != nil {
+			cancel()
+		}
 		if 0 < len(addrs) {
-			self.recordServerNames(addrs, domain)
+			self.reverse.record(addrs, domain)
 		}
 		for i := range responders {
 			r := &responders[i]
@@ -628,11 +733,19 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	// workerDone retires the flight once every worker has exited without an answer, so a
 	// failed question frees its slot for the clients' retries to start a fresh pipeline.
 	workerDone := func() {
+		var cancel context.CancelFunc
 		self.inflightLock.Lock()
-		defer self.inflightLock.Unlock()
 		fl.workers -= 1
-		if fl.workers == 0 && !fl.replied && self.inflight[key] == fl {
-			delete(self.inflight, key)
+		if fl.workers == 0 {
+			if self.inflight[key] == fl {
+				delete(self.inflight, key)
+			}
+			cancel = fl.cancel
+			fl.cancel = nil
+		}
+		self.inflightLock.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 	}
 
@@ -644,6 +757,7 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 		self.inflightLock.Lock()
 		defer self.inflightLock.Unlock()
 		fl.workers = workers
+		fl.cancel = queryCancel
 	}()
 
 	// primary: resolve over the tunnel-DoH (preferred — egresses the tunnel, no DNS leak), retrying
@@ -653,8 +767,6 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	tunnelOk := make(chan struct{})
 	go HandleError(func() {
 		defer workerDone()
-		queryCtx, queryCancel := queryContext()
-		defer queryCancel()
 		addrs, authoritative := self.resolveTunnelDoh(queryCtx, recordType, domain)
 		if 0 < len(addrs) || authoritative {
 			close(tunnelOk) // the tunnel won — signal the fallback to skip its local query (no leak)
@@ -670,19 +782,254 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	if workers == 2 {
 		go HandleError(func() {
 			defer workerDone()
+			timer := time.NewTimer(localFallbackTimeout)
+			defer timer.Stop()
 			select {
-			case <-time.After(localFallbackTimeout):
+			case <-timer.C:
 			case <-tunnelOk:
 				return
-			case <-self.ctx.Done():
+			case <-queryCtx.Done():
 				return
 			}
-			queryCtx, queryCancel := queryContext()
-			defer queryCancel()
 			addrs, authoritative := fallback.QueryResult(queryCtx, recordType, domain)
 			reply(addrs, authoritative)
 		})
 	}
+}
+
+// maxForwardedHttpsResponse bounds the SVCB/HTTPS response delivered to the client over UDP/53.
+// A larger record's hints are still recorded, but the record itself is not delivered — the
+// client instead gets a truncated (TC) reply, the accurate signal that the answer exceeds
+// UDP/53, so it can fail over to its own TCP/EDNS0 path (which passes through the mux
+// unclaimed) or fall back to A/AAAA without waiting out a timeout.
+const maxForwardedHttpsResponse = 1232
+
+// startHttpsForwardPipeline forwards one SVCB/HTTPS question over the tunnel DoH and fans the raw
+// record out to the flight's responders (each gets the record with its own DNS transaction id),
+// recording the record's ipv4hint/ipv6hint addresses into the reverse index so those flows are
+// named. The type is claimed unconditionally, so a forward that cannot answer (remote DoH
+// disabled, or the forward failed) must not black-hole the query: the client gets a prompt
+// SERVFAIL and falls back to A/AAAA immediately — resolvers serialize on the HTTPS RR answer,
+// and silence here would stall them until their own timeout.
+func (self *UpgradeMux) startHttpsForwardPipeline(key DohKey, fl *dnsFlight, qType dnsmessage.Type, domain string) {
+	var resolveTimeout time.Duration
+	if dns := self.settings.Load().Dns; dns != nil {
+		resolveTimeout = dns.ResolveTimeout
+	}
+	go HandleError(func() {
+		// always retire the flight so the key can't leak
+		defer func() {
+			self.inflightLock.Lock()
+			defer self.inflightLock.Unlock()
+			if self.inflight[key] == fl {
+				delete(self.inflight, key)
+			}
+		}()
+
+		queryCtx := self.ctx
+		if 0 < resolveTimeout {
+			var cancel context.CancelFunc
+			queryCtx, cancel = context.WithTimeout(self.ctx, resolveTimeout)
+			defer cancel()
+		}
+		if response, ok := self.mux.Tun().DohCache().Forward(queryCtx, qType, domain); ok {
+			self.fanOutHttpsForward(key, fl, domain, response)
+		} else {
+			// fail fast instead of dropping: remote DoH is off or the forward
+			// failed, and no answer will ever come from this pipeline
+			self.deliverDnsStatus(self.takeHttpsForwardResponders(key, fl), dnsmessage.RCodeServerFailure, false)
+		}
+	})
+}
+
+// takeHttpsForwardResponders snapshots and retires an SVCB/HTTPS flight exactly once,
+// returning nil when the flight has already replied. Removing the flight in the same
+// critical section as the responder snapshot means a query racing completion either
+// joins before this snapshot and is answered, or creates a new flight afterward.
+func (self *UpgradeMux) takeHttpsForwardResponders(key DohKey, fl *dnsFlight) []dnsResponder {
+	var responders []dnsResponder
+	func() {
+		self.inflightLock.Lock()
+		defer self.inflightLock.Unlock()
+		if fl.replied {
+			return
+		}
+		fl.replied = true
+		responders = fl.responders
+		if self.inflight[key] == fl {
+			delete(self.inflight, key)
+		}
+	}()
+	return responders
+}
+
+// deliverDnsStatus answers each responder with a header+question-only response carrying
+// `rcode` and, when `truncated`, the TC bit — the fail-fast replies (SERVFAIL for a dead
+// forward, TC for an answer that exceeds UDP/53).
+func (self *UpgradeMux) deliverDnsStatus(responders []dnsResponder, rcode dnsmessage.RCode, truncated bool) {
+	for i := range responders {
+		r := &responders[i]
+		respPayload, err := buildDnsStatusResponse(r.id, r.question, rcode, truncated)
+		if err != nil {
+			continue
+		}
+		self.mux.deliverDownstream(r.source, r.provideMode, r.reverse, ipOosPacket(r.reverse, respPayload))
+	}
+}
+
+// fanOutHttpsForward delivers a forwarded SVCB/HTTPS record to the flight's responders (each with
+// its own DNS transaction id stamped in) and records the record's ipv4hint/ipv6hint addresses into
+// the reverse index. An oversized record is captured (hints recorded) but answered with a
+// truncated (TC) reply instead of the record; a malformed record is answered SERVFAIL. Split from
+// the forward round-trip so it is testable with a canned response (the tunnel-DoH round-trip
+// itself can't be driven in a connect unit test — see the skipped
+// TestUpgradeMuxDefaultDnsThroughTunnel).
+func (self *UpgradeMux) fanOutHttpsForward(key DohKey, fl *dnsFlight, domain string, response []byte) {
+	responders := self.takeHttpsForwardResponders(key, fl)
+	if responders == nil {
+		return
+	}
+
+	// record the hint addresses -> domain (fires the learned callbacks that invalidate stale
+	// block-action decisions), so a flow to a hint ip reports the server name
+	if hints := parseHttpsHints(response); 0 < len(hints) {
+		self.reverse.record(hints, domain)
+	}
+
+	if maxForwardedHttpsResponse < len(response) {
+		// oversized for UDP/53: truncation is the accurate signal — the client
+		// retries over its own TCP path (unclaimed pass-through) or falls back
+		// to A/AAAA, instead of timing out on silence
+		self.deliverDnsStatus(responders, dnsmessage.RCodeSuccess, true)
+		return
+	}
+	if len(response) < 2 {
+		// malformed beyond repair (no transaction id to patch): a failure
+		self.deliverDnsStatus(responders, dnsmessage.RCodeServerFailure, false)
+		return
+	}
+	for i := range responders {
+		r := &responders[i]
+		// The DoH lookup uses the normalized lowercase domain, but DNS 0x20
+		// clients validate that the response echoes their exact query casing.
+		// Patch both the transaction id and the (same-length) question name
+		// without changing answer offsets or compression pointers.
+		resp, ok := dnsResponseForResponder(response, r)
+		if !ok {
+			continue
+		}
+		self.mux.deliverDownstream(r.source, r.provideMode, r.reverse, ipOosPacket(r.reverse, resp))
+	}
+}
+
+// dnsResponseForResponder copies a one-question DNS response and restores the
+// responder's original question casing. The normalized DoH query and original
+// query differ only by ASCII case, so the wire name has identical length and
+// answer compression offsets remain valid. A compressed/mismatched question is
+// rejected rather than returning a response that can fail DNS 0x20 validation.
+func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, bool) {
+	if len(response) < 12 || binary.BigEndian.Uint16(response[4:6]) != 1 {
+		return nil, false
+	}
+	name := responder.question.Name.String()
+	if name == "" || name[len(name)-1] != '.' {
+		return nil, false
+	}
+
+	wireName := make([]byte, 0, len(name)+1)
+	for labelStart := 0; labelStart < len(name)-1; {
+		labelEnd := strings.IndexByte(name[labelStart:], '.')
+		if labelEnd < 0 || 63 < labelEnd {
+			return nil, false
+		}
+		labelEnd += labelStart
+		wireName = append(wireName, byte(labelEnd-labelStart))
+		wireName = append(wireName, name[labelStart:labelEnd]...)
+		labelStart = labelEnd + 1
+	}
+	wireName = append(wireName, 0)
+
+	questionEnd := 12 + len(wireName)
+	if len(response) < questionEnd+4 {
+		return nil, false
+	}
+	responseName := response[12:questionEnd]
+	for i := range wireName {
+		a := responseName[i]
+		b := wireName[i]
+		if 'A' <= a && a <= 'Z' {
+			a += 'a' - 'A'
+		}
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if a != b {
+			return nil, false
+		}
+	}
+	if dnsmessage.Type(binary.BigEndian.Uint16(response[questionEnd:questionEnd+2])) != responder.question.Type ||
+		dnsmessage.Class(binary.BigEndian.Uint16(response[questionEnd+2:questionEnd+4])) != responder.question.Class {
+		return nil, false
+	}
+
+	result := make([]byte, len(response))
+	copy(result, response)
+	binary.BigEndian.PutUint16(result[0:2], responder.id)
+	copy(result[12:questionEnd], wireName)
+	return result, true
+}
+
+// parseHttpsHints extracts the ipv4hint (SvcParamKey 4) and ipv6hint (key 6) addresses from the
+// SVCB/HTTPS answers of a DNS response wire, for recording into the reverse index. Malformed input
+// yields the hints parsed so far.
+func parseHttpsHints(response []byte) []netip.Addr {
+	var parser dnsmessage.Parser
+	if _, err := parser.Start(response); err != nil {
+		return nil
+	}
+	if err := parser.SkipAllQuestions(); err != nil {
+		return nil
+	}
+	var hints []netip.Addr
+	for {
+		h, err := parser.AnswerHeader()
+		if err != nil { // ErrSectionDone or malformed
+			break
+		}
+		switch h.Type {
+		case dnsTypeHttps:
+			r, err := parser.HTTPSResource()
+			if err != nil {
+				return hints
+			}
+			hints = appendSvcbHints(hints, &r.SVCBResource)
+		case dnsTypeSvcb:
+			r, err := parser.SVCBResource()
+			if err != nil {
+				return hints
+			}
+			hints = appendSvcbHints(hints, &r)
+		default:
+			if err := parser.SkipAnswer(); err != nil {
+				return hints
+			}
+		}
+	}
+	return hints
+}
+
+func appendSvcbHints(hints []netip.Addr, r *dnsmessage.SVCBResource) []netip.Addr {
+	if v, ok := r.GetParam(dnsmessage.SVCParamIPv4Hint); ok {
+		for i := 0; i+4 <= len(v); i += 4 {
+			hints = append(hints, netip.AddrFrom4([4]byte(v[i:i+4])))
+		}
+	}
+	if v, ok := r.GetParam(dnsmessage.SVCParamIPv6Hint); ok {
+		for i := 0; i+16 <= len(v); i += 16 {
+			hints = append(hints, netip.AddrFrom16([16]byte(v[i:i+16])))
+		}
+	}
+	return hints
 }
 
 // dnsRetryBackoff is the wait between tunnel-DoH resolution attempts, for attempts that fail
@@ -715,6 +1062,27 @@ func (self *UpgradeMux) resolveTunnelDoh(ctx context.Context, recordType string,
 			return addrs, authoritative
 		}
 	}
+}
+
+// buildDnsStatusResponse builds a header+question-only response: `rcode` (SERVFAIL for a
+// forward that can never answer) and/or the TC bit (an answer that exceeds UDP/53). Used by
+// the SVCB/HTTPS forward path to fail fast — the claimed type must never be a black hole.
+func buildDnsStatusResponse(id uint16, question dnsmessage.Question, rcode dnsmessage.RCode, truncated bool) ([]byte, error) {
+	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 id,
+		Response:           true,
+		RecursionAvailable: true,
+		Truncated:          truncated,
+		RCode:              rcode,
+	})
+	builder.EnableCompression()
+	if err := builder.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := builder.Question(question); err != nil {
+		return nil, err
+	}
+	return builder.Finish()
 }
 
 func buildDnsResponse(id uint16, question dnsmessage.Question, addrs []netip.Addr, ttl uint32) ([]byte, error) {
@@ -765,52 +1133,101 @@ type reverseEntry struct {
 	lastActivityNanos int64
 }
 
-func (self *UpgradeMux) recordServerNames(addrs []netip.Addr, domain string) {
-	maxEntries := defaultReverseMaxEntries
-	if dns := self.settings.Load().Dns; dns != nil && 0 < dns.ReverseMaxEntries {
-		maxEntries = dns.ReverseMaxEntries
-	}
-	now := time.Now().UnixNano()
-	self.reverseLock.Lock()
-	defer self.reverseLock.Unlock()
-	for _, addr := range addrs {
-		e, ok := self.reverse[addr]
-		if !ok && maxEntries <= len(self.reverse) {
-			// at the cap: make room by evicting the least-recently-active of a sample,
-			// so a resolve burst cannot grow the map without bound between TTL sweeps
-			self.evictOldestReverseSampleLocked()
-		}
-		found := false
-		for _, name := range e.serverNames {
-			if name == domain {
-				found = true
-				break
-			}
-		}
-		if !found {
-			if maxServerNamesPerIp <= len(e.serverNames) {
-				// keep the most recent names for a shared IP (CDN fronting many hosts):
-				// drop the oldest
-				copy(e.serverNames, e.serverNames[1:])
-				e.serverNames[len(e.serverNames)-1] = domain
-			} else {
-				e.serverNames = append(e.serverNames, domain)
-			}
-		}
-		e.lastActivityNanos = now
-		self.reverse[addr] = e
+// reverseIndex maps a resolved ip to the server name(s) observed for it (from DNS
+// resolution), for the multi-client's ServerName path affinity and block-action
+// server-name reporting. It is self-contained — it holds no tun/mux and runs no
+// background loop — so it can be constructed and driven directly in a test; the
+// owning UpgradeMux records DoH resolutions into it (record), drives its idle
+// eviction from its maintenance loop (evictIdle), and delegates its ServerNameLookup
+// / ServerNamesLearnedNotifier methods to it.
+type reverseIndex struct {
+	// maxEntries returns the live hard cap on the map between TTL sweeps. Read per
+	// insert (not snapshotted) so a settings change to ReverseMaxEntries applies
+	// without rebuilding the index.
+	maxEntries func() int
+
+	lock             sync.Mutex
+	entries          map[netip.Addr]reverseEntry
+	learnedCallbacks *CallbackList[ServerNamesLearnedFunction]
+}
+
+func newReverseIndex(maxEntries func() int) *reverseIndex {
+	return &reverseIndex{
+		maxEntries:       maxEntries,
+		entries:          map[netip.Addr]reverseEntry{},
+		learnedCallbacks: NewCallbackList[ServerNamesLearnedFunction](),
 	}
 }
 
-// evictOldestReverseSampleLocked deletes the least-recently-active record of a
+// record associates domain with each of addrs (a DoH resolution), refreshing their
+// activity, and fires the learned callbacks for the ips that newly gained the name.
+func (self *reverseIndex) record(addrs []netip.Addr, domain string) {
+	maxEntries := self.maxEntries()
+	now := time.Now().UnixNano()
+	// the ips for which this domain was newly recorded (took the !found branch)
+	var learned []netip.Addr
+	func() {
+		self.lock.Lock()
+		defer self.lock.Unlock()
+		for _, addr := range addrs {
+			e, ok := self.entries[addr]
+			if !ok && maxEntries <= len(self.entries) {
+				// at the cap: make room by evicting the least-recently-active of a sample,
+				// so a resolve burst cannot grow the map without bound between TTL sweeps
+				self.evictOldestSampleLocked()
+			}
+			found := false
+			for _, name := range e.serverNames {
+				if name == domain {
+					found = true
+					break
+				}
+			}
+			if !found {
+				if maxServerNamesPerIp <= len(e.serverNames) {
+					// keep the most recent names for a shared IP (CDN fronting many hosts):
+					// drop the oldest
+					copy(e.serverNames, e.serverNames[1:])
+					e.serverNames[len(e.serverNames)-1] = domain
+				} else {
+					e.serverNames = append(e.serverNames, domain)
+				}
+				learned = append(learned, addr)
+			}
+			e.lastActivityNanos = now
+			self.entries[addr] = e
+		}
+	}()
+	// notify downstream (e.g. the multi-client's block-action decision caches) of
+	// the newly-learned names, OUTSIDE the lock, so subsequent block actions for
+	// these ips report the server name instead of the ip going forward
+	if 0 < len(learned) {
+		for _, callback := range self.learnedCallbacks.Get() {
+			HandleError(func() {
+				callback(learned)
+			})
+		}
+	}
+}
+
+// addLearnedCallback registers a callback fired with the ips for which a new server
+// name was just learned.
+func (self *reverseIndex) addLearnedCallback(callback ServerNamesLearnedFunction) func() {
+	callbackId := self.learnedCallbacks.Add(callback)
+	return func() {
+		self.learnedCallbacks.Remove(callbackId)
+	}
+}
+
+// evictOldestSampleLocked deletes the least-recently-active record of a
 // reverseEvictSampleSize sample (map iteration starts at a random bucket, so the
 // sample is effectively random): approximate LRU at O(sample) per over-cap insert.
-func (self *UpgradeMux) evictOldestReverseSampleLocked() {
+func (self *reverseIndex) evictOldestSampleLocked() {
 	var oldestAddr netip.Addr
 	var oldestNanos int64
 	found := false
 	i := 0
-	for addr, e := range self.reverse {
+	for addr, e := range self.entries {
 		if !found || e.lastActivityNanos < oldestNanos {
 			oldestAddr = addr
 			oldestNanos = e.lastActivityNanos
@@ -822,43 +1239,152 @@ func (self *UpgradeMux) evictOldestReverseSampleLocked() {
 		}
 	}
 	if found {
-		delete(self.reverse, oldestAddr)
+		delete(self.entries, oldestAddr)
 	}
 }
 
-// ServerNames returns the hostname(s) the mux has resolved to the given IP, for
-// ServerName-based path affinity. Empty if none seen. Implements ServerNameLookup.
-func (self *UpgradeMux) ServerNames(ip string) []string {
+// serverNames returns the hostname(s) recorded for the given ip, for ServerName-based
+// path affinity. Empty if none seen. Refreshes the record's activity.
+func (self *reverseIndex) serverNames(ip string) []string {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
 		return nil
 	}
-	self.reverseLock.Lock()
-	defer self.reverseLock.Unlock()
-	e, ok := self.reverse[addr]
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	e, ok := self.entries[addr]
 	if !ok {
 		return nil
 	}
 	// refresh activity so an IP that is actively routed keeps its affinity record
 	e.lastActivityNanos = time.Now().UnixNano()
-	self.reverse[addr] = e
+	self.entries[addr] = e
 	return append([]string{}, e.serverNames...)
 }
 
-// touchServerNames refreshes the affinity record for ip — a return packet's source — so an
-// IP with live (return) traffic keeps its IP→hostname affinity and is not idle-evicted. It
-// is a no-op for an IP with no record (e.g. a direct-IP flow that was never resolved here).
-func (self *UpgradeMux) touchServerNames(ip net.IP) {
+// touch refreshes the affinity record for ip — a return packet's source — so an IP with
+// live (return) traffic keeps its IP→hostname affinity and is not idle-evicted. It is a
+// no-op for an IP with no record (e.g. a direct-IP flow that was never resolved here).
+func (self *reverseIndex) touch(ip net.IP) {
 	addr, ok := netIPAddr(ip)
 	if !ok {
 		return
 	}
-	self.reverseLock.Lock()
-	defer self.reverseLock.Unlock()
-	if e, ok := self.reverse[addr]; ok {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	if e, ok := self.entries[addr]; ok {
 		e.lastActivityNanos = time.Now().UnixNano()
-		self.reverse[addr] = e
+		self.entries[addr] = e
 	}
+}
+
+// evictIdle drops affinity records idle at least ttl (none when ttl <= 0).
+func (self *reverseIndex) evictIdle(ttl time.Duration) {
+	if 0 < ttl {
+		cutoff := time.Now().UnixNano() - int64(ttl)
+		self.lock.Lock()
+		defer self.lock.Unlock()
+		for addr, e := range self.entries {
+			if e.lastActivityNanos <= cutoff {
+				delete(self.entries, addr)
+			}
+		}
+	}
+}
+
+// shed drops the least-recently-active records under host memory pressure, keeping the
+// most-recently-active half. A full clear would strip the names for every live flow
+// (which re-look-up affinity only on a new flow, not per packet), flipping active
+// downloads from by-name to by-IP routing and blanking the block-action host feed; the
+// active records are the small, useful part of the map, so retaining them costs little
+// while still releasing the bulk (idle, never-to-be-seen-again resolutions).
+func (self *reverseIndex) shed() {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	if len(self.entries) <= 1 {
+		return
+	}
+	// keep the most-recently-active half: collect activity times, find the median, and
+	// drop records at or below it (approximate — ties around the median may skew the
+	// kept count slightly, which is fine for a memory-pressure shed).
+	times := make([]int64, 0, len(self.entries))
+	for _, e := range self.entries {
+		times = append(times, e.lastActivityNanos)
+	}
+	slices.Sort(times)
+	cutoff := times[len(times)/2]
+	for addr, e := range self.entries {
+		if e.lastActivityNanos < cutoff {
+			delete(self.entries, addr)
+		}
+	}
+}
+
+// adoptFrom copies src's records into this index (keeping the more-recently-active on a
+// key collision), so a freshly built index inherits the names a prior instance learned —
+// e.g. across a mux rebuild on reconnect. Server names outlive the physical connection,
+// so carrying them avoids blanking the host feed for every already-open flow after a
+// reconnect. Callbacks are NOT copied (the new index has its own subscribers). No-op on a
+// nil src.
+func (self *reverseIndex) adoptFrom(src *reverseIndex) {
+	if src == nil {
+		return
+	}
+	// snapshot src under its lock, then merge under ours, so the two locks never nest.
+	// serverNames is deep-copied in the snapshot: record mutates a capped entry's slice
+	// in place, and src may still be recording (a draining prior mux) after the merge —
+	// the adopted entries must not share backing arrays with it
+	var srcEntries map[netip.Addr]reverseEntry
+	func() {
+		src.lock.Lock()
+		defer src.lock.Unlock()
+		srcEntries = make(map[netip.Addr]reverseEntry, len(src.entries))
+		for addr, e := range src.entries {
+			e.serverNames = append([]string{}, e.serverNames...)
+			srcEntries[addr] = e
+		}
+	}()
+	maxEntries := self.maxEntries()
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	for addr, e := range srcEntries {
+		existing, ok := self.entries[addr]
+		if ok && existing.lastActivityNanos >= e.lastActivityNanos {
+			continue
+		}
+		if !ok && maxEntries <= len(self.entries) {
+			self.evictOldestSampleLocked()
+		}
+		self.entries[addr] = e
+	}
+}
+
+// count returns the number of records held (observability / tests).
+func (self *reverseIndex) count() int {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	return len(self.entries)
+}
+
+// reverseMaxEntries is the live hard cap on the reverse index between TTL sweeps, from
+// the mux's DNS settings (ReverseMaxEntries), falling back to the default.
+func (self *UpgradeMux) reverseMaxEntries() int {
+	if dns := self.settings.Load().Dns; dns != nil && 0 < dns.ReverseMaxEntries {
+		return dns.ReverseMaxEntries
+	}
+	return defaultReverseMaxEntries
+}
+
+// ServerNames returns the hostname(s) the mux has resolved to the given IP, for
+// ServerName-based path affinity. Empty if none seen. Implements ServerNameLookup.
+func (self *UpgradeMux) ServerNames(ip string) []string {
+	return self.reverse.serverNames(ip)
+}
+
+// AddServerNamesLearnedCallback registers a callback fired with the ips for which
+// a new server name was just learned (implements ServerNamesLearnedNotifier).
+func (self *UpgradeMux) AddServerNamesLearnedCallback(callback ServerNamesLearnedFunction) func() {
+	return self.reverse.addLearnedCallback(callback)
 }
 
 // reverseTtl is the configured IP→hostname affinity TTL (0 if unset/disabled).
@@ -867,20 +1393,6 @@ func (self *UpgradeMux) reverseTtl() time.Duration {
 		return dns.ReverseTtl
 	}
 	return 0
-}
-
-// evictReverse drops affinity records idle at least ttl (none when ttl <= 0).
-func (self *UpgradeMux) evictReverse(ttl time.Duration) {
-	if 0 < ttl {
-		cutoff := time.Now().UnixNano() - int64(ttl)
-		self.reverseLock.Lock()
-		defer self.reverseLock.Unlock()
-		for addr, e := range self.reverse {
-			if e.lastActivityNanos <= cutoff {
-				delete(self.reverse, addr)
-			}
-		}
-	}
 }
 
 // run is the mux's lifecycle loop: it TTL-evicts the IP→hostname affinity map so it doesn't grow
@@ -898,7 +1410,7 @@ func (self *UpgradeMux) run() {
 			return
 		case <-time.After(interval):
 		}
-		self.evictReverse(ttl)
+		self.reverse.evictIdle(ttl)
 	}
 }
 
@@ -914,7 +1426,7 @@ func (self *UpgradeMux) SendPacket(source TransferPath, provideMode protocol.Pro
 // the idle TTL and its routing would flip from base-domain to by-IP, breaking the flow.
 func (self *UpgradeMux) Receive(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 	if ipPath != nil {
-		self.touchServerNames(ipPath.SourceIp)
+		self.reverse.touch(ipPath.SourceIp)
 	}
 	self.mux.Receive(source, provideMode, ipPath, packet)
 }
@@ -939,18 +1451,30 @@ func (self *UpgradeMux) SetSettings(settings *UpgradeMuxSettings) {
 	}
 }
 
-// ShedMemory drops the mux's recoverable caches — the resolver caches (with their pooled
-// connections) and the IP→hostname affinity map — under host memory pressure. Subsequent
-// queries re-resolve and re-dial; flows that re-look-up affinity fall back to by-IP routing
-// until re-resolved.
+// ShedMemory drops the mux's recoverable caches under host memory pressure: the resolver
+// caches (with their pooled connections) fully, and the IP→hostname affinity map down to
+// its most-recently-active half. The active affinity records are the small, useful part
+// (live flows re-look-up affinity only on a new flow), so they are retained — a full drop
+// would flip active flows to by-IP routing and blank the block-action host feed — while
+// the idle bulk is released.
 func (self *UpgradeMux) ShedMemory() {
 	self.mux.Tun().DohCache().ShedMemory()
 	if fallback := self.fallbackDohCache.Load(); fallback != nil {
 		fallback.ShedMemory()
 	}
-	self.reverseLock.Lock()
-	defer self.reverseLock.Unlock()
-	clear(self.reverse)
+	self.reverse.shed()
+	self.sni.shed()
+}
+
+// AdoptServerNames seeds this mux's reverse index with the names a prior mux learned,
+// so a rebuild (e.g. on reconnect / location change) doesn't blank the IP→hostname
+// affinity — and the block-action host feed — for flows the OS keeps open across the
+// reconnect (server names outlive the physical connection). No-op on a nil prior.
+func (self *UpgradeMux) AdoptServerNames(prior *UpgradeMux) {
+	if prior == nil {
+		return
+	}
+	self.reverse.adoptFrom(prior.reverse)
 }
 
 func (self *UpgradeMux) Close() {

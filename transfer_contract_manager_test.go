@@ -9,12 +9,79 @@ import (
 
 	// mathrand "math/rand"
 
-	"github.com/go-playground/assert/v2"
-
 	// "google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// TestTakeContractStreamStamped pins the oob loop behind platform stream
+// steering: the reply sequence requests contracts under a plain (no-stream)
+// contract key, and the platform may return a contract whose stored bytes
+// carry a stream id ("switch to the stream"). The stamped contract must
+// queue under the request's key and carry the stream id through
+// `newSequenceContract` into the sequence path — which is what steers the
+// writer onto the stream and marks the contract stats.
+func TestTakeContractStreamStamped(t *testing.T) {
+	ctx := context.Background()
+	clientId := NewId()
+	settings := DefaultClientSettings()
+	settings.ContractManagerSettings.LegacyCreateContract = true
+	client := NewClient(ctx, clientId, NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	contractManager := client.ContractManager()
+
+	destinationId := NewId()
+	streamId := NewId()
+
+	contractManager.SetProvideModesWithReturnTraffic(map[protocol.ProvideMode]bool{
+		protocol.ProvideMode_Network: true,
+	})
+	relationship := protocol.ProvideMode_Network
+	provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
+	AssertEqual(t, true, ok)
+
+	storedContract := &protocol.StoredContract{
+		ContractId:        NewId().Bytes(),
+		TransferByteCount: uint64(gib(1)),
+		SourceId:          clientId.Bytes(),
+		DestinationId:     destinationId.Bytes(),
+		StreamId:          streamId.Bytes(),
+	}
+	storedContractBytes, err := ProtoMarshal(storedContract)
+	AssertEqual(t, nil, err)
+	storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
+
+	result := &protocol.CreateContractResult{
+		Contract: &protocol.Contract{
+			StoredContractBytes: storedContractBytes,
+			StoredContractHmac:  storedContractHmac,
+			ProvideMode:         relationship,
+		},
+	}
+	frame, err := ToFrame(result, DefaultProtocolVersion)
+	AssertEqual(t, nil, err)
+
+	// the request key has no stream — the requester does not know the
+	// platform will steer it
+	contractKey := ContractKey{
+		Destination: DestinationId(destinationId),
+	}
+	err = contractManager.HandleControlFrame(contractKey, frame)
+	AssertEqual(t, nil, err)
+
+	contract := contractManager.TakeContract(ctx, contractKey, 5*time.Second)
+	AssertEqual(t, true, contract != nil)
+
+	sequenceContract, err := newSequenceContract(client.log, "s", contract, 1, 1.0)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, true, sequenceContract.path.IsStream())
+	AssertEqual(t, streamId, sequenceContract.path.StreamId)
+	AssertEqual(
+		t,
+		TransferPath{DestinationId: destinationId, StreamId: streamId},
+		sequenceContract.path.DestinationMask(),
+	)
+}
 
 func TestTakeContract(t *testing.T) {
 	// in parallel, add contracts, take contracts, and optionally return contract
@@ -50,7 +117,7 @@ func TestTakeContract(t *testing.T) {
 
 			relationship := protocol.ProvideMode_Public
 			provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
-			assert.Equal(t, true, ok)
+			AssertEqual(t, true, ok)
 
 			storedContract := &protocol.StoredContract{
 				ContractId:        contractId.Bytes(),
@@ -59,12 +126,12 @@ func TestTakeContract(t *testing.T) {
 				DestinationId:     destinationId.Bytes(),
 			}
 			storedContractBytes, err := ProtoMarshal(storedContract)
-			assert.Equal(t, nil, err)
+			AssertEqual(t, nil, err)
 			defer MessagePoolReturn(storedContractBytes)
 			storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
 
 			verified := contractManager.Verify(storedContractHmac, storedContractBytes, relationship)
-			assert.Equal(t, true, verified)
+			AssertEqual(t, true, verified)
 
 			result := &protocol.CreateContractResult{
 				Contract: &protocol.Contract{
@@ -74,7 +141,7 @@ func TestTakeContract(t *testing.T) {
 				},
 			}
 			frame, err := ToFrame(result, DefaultProtocolVersion)
-			assert.Equal(t, nil, err)
+			AssertEqual(t, nil, err)
 
 			contractManager.HandleControlFrame(
 				ContractKey{
@@ -122,12 +189,12 @@ func TestTakeContract(t *testing.T) {
 		case contract := <-contracts:
 			var storedContract protocol.StoredContract
 			err := ProtoUnmarshal(contract.StoredContractBytes, &storedContract)
-			assert.Equal(t, nil, err)
+			AssertEqual(t, nil, err)
 
 			contractId, err := IdFromBytes(storedContract.ContractId)
-			assert.Equal(t, nil, err)
+			AssertEqual(t, nil, err)
 
-			assert.Equal(t, false, contractIds[contractId])
+			AssertEqual(t, false, contractIds[contractId])
 			contractIds[contractId] = true
 
 		case <-time.After(timeout):
@@ -137,14 +204,14 @@ func TestTakeContract(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, k*n, len(contractIds))
+	AssertEqual(t, k*n, len(contractIds))
 
 	// no more
 	contractKey := ContractKey{
 		Destination: DestinationId(destinationId),
 	}
 	contract := contractManager.TakeContract(ctx, contractKey, 0)
-	assert.Equal(t, nil, contract)
+	AssertEqual(t, nil, contract)
 
 	// all the contracts are accounted for
 }
@@ -178,40 +245,40 @@ func TestStoredContractHmacCutover(t *testing.T) {
 	}()
 
 	// sanity: the two formats have different lengths and contents
-	assert.Equal(t, len(storedContractBytes)+sha256.Size, len(legacyExpected))
-	assert.Equal(t, sha256.Size, len(standardExpected))
+	AssertEqual(t, len(storedContractBytes)+sha256.Size, len(legacyExpected))
+	AssertEqual(t, sha256.Size, len(standardExpected))
 
 	// future cutoff → signer emits legacy
 	futureHmac := SignStoredContract(futureSettings, provideSecretKey, storedContractBytes)
-	assert.Equal(t, legacyExpected, futureHmac)
+	AssertEqual(t, legacyExpected, futureHmac)
 
 	// past cutoff → signer emits standard
 	pastHmac := SignStoredContract(pastSettings, provideSecretKey, storedContractBytes)
-	assert.Equal(t, standardExpected, pastHmac)
+	AssertEqual(t, standardExpected, pastHmac)
 
 	// VerifyStoredContract accepts both formats regardless of the cutoff time
-	assert.Equal(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, legacyExpected))
-	assert.Equal(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, standardExpected))
-	assert.Equal(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, legacyExpected))
-	assert.Equal(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, standardExpected))
+	AssertEqual(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, legacyExpected))
+	AssertEqual(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, standardExpected))
+	AssertEqual(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, legacyExpected))
+	AssertEqual(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, standardExpected))
 
 	// tampered contract bytes are rejected for both formats and both settings
 	tampered := []byte("tampered stored contract bytes payload")
-	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, tampered, legacyExpected))
-	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, tampered, standardExpected))
-	assert.Equal(t, false, VerifyStoredContract(futureSettings, provideSecretKey, tampered, legacyExpected))
-	assert.Equal(t, false, VerifyStoredContract(futureSettings, provideSecretKey, tampered, standardExpected))
+	AssertEqual(t, false, VerifyStoredContract(pastSettings, provideSecretKey, tampered, legacyExpected))
+	AssertEqual(t, false, VerifyStoredContract(pastSettings, provideSecretKey, tampered, standardExpected))
+	AssertEqual(t, false, VerifyStoredContract(futureSettings, provideSecretKey, tampered, legacyExpected))
+	AssertEqual(t, false, VerifyStoredContract(futureSettings, provideSecretKey, tampered, standardExpected))
 
 	// wrong provide key is rejected for both formats and both settings
 	wrongKey := []byte("wrong-provide-secret-key-which-is-long-enough")
-	assert.Equal(t, false, VerifyStoredContract(pastSettings, wrongKey, storedContractBytes, legacyExpected))
-	assert.Equal(t, false, VerifyStoredContract(pastSettings, wrongKey, storedContractBytes, standardExpected))
-	assert.Equal(t, false, VerifyStoredContract(futureSettings, wrongKey, storedContractBytes, legacyExpected))
-	assert.Equal(t, false, VerifyStoredContract(futureSettings, wrongKey, storedContractBytes, standardExpected))
+	AssertEqual(t, false, VerifyStoredContract(pastSettings, wrongKey, storedContractBytes, legacyExpected))
+	AssertEqual(t, false, VerifyStoredContract(pastSettings, wrongKey, storedContractBytes, standardExpected))
+	AssertEqual(t, false, VerifyStoredContract(futureSettings, wrongKey, storedContractBytes, legacyExpected))
+	AssertEqual(t, false, VerifyStoredContract(futureSettings, wrongKey, storedContractBytes, standardExpected))
 
 	// an HMAC of an unsupported length is rejected
 	bogus := []byte("not-a-valid-hmac")
-	assert.Equal(t, false, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, bogus))
+	AssertEqual(t, false, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, bogus))
 }
 
 // TestContractQueueExpire verifies that queued contracts no sequence takes are
@@ -239,7 +306,7 @@ func TestContractQueueExpire(t *testing.T) {
 		contractId := NewId()
 		relationship := protocol.ProvideMode_Public
 		provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
-		assert.Equal(t, true, ok)
+		AssertEqual(t, true, ok)
 
 		storedContract := &protocol.StoredContract{
 			ContractId:        contractId.Bytes(),
@@ -248,7 +315,7 @@ func TestContractQueueExpire(t *testing.T) {
 			DestinationId:     destinationId.Bytes(),
 		}
 		storedContractBytes, err := ProtoMarshal(storedContract)
-		assert.Equal(t, nil, err)
+		AssertEqual(t, nil, err)
 		storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
 		contract := &protocol.Contract{
 			StoredContractBytes: storedContractBytes,
@@ -268,16 +335,16 @@ func TestContractQueueExpire(t *testing.T) {
 		Contract: contract,
 	}
 	frame, err := ToFrame(result, DefaultProtocolVersion)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	err = contractManager.HandleControlFrame(contractKey, frame)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	queueCount := func() int {
 		contractManager.mutex.Lock()
 		defer contractManager.mutex.Unlock()
 		return len(contractManager.destinationContracts)
 	}
-	assert.Equal(t, 1, queueCount())
+	AssertEqual(t, 1, queueCount())
 
 	// the janitor expires the orphan and removes the emptied queue
 	expired := false
@@ -288,26 +355,26 @@ func TestContractQueueExpire(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	assert.Equal(t, true, expired)
+	AssertEqual(t, true, expired)
 
 	// the expired contract is no longer takeable
 	takenContract := contractManager.TakeContract(ctx, contractKey, 0)
-	assert.Equal(t, nil, takenContract)
+	AssertEqual(t, nil, takenContract)
 
 	// Poll guard: a stale queued contract is never handed out
 	queue := newContractQueue(nil, false)
 	staleContract, staleStoredContract := makeContract()
 	queue.Add(staleContract, staleStoredContract)
 	polled, expiredContracts := queue.Poll(time.Now().Add(time.Minute))
-	assert.Equal(t, nil, polled)
-	assert.Equal(t, 1, len(expiredContracts))
+	AssertEqual(t, nil, polled)
+	AssertEqual(t, 1, len(expiredContracts))
 
 	// a fresh contract polled with expiry disabled (zero minEnqueueTime) is handed out
 	freshContract, freshStoredContract := makeContract()
 	queue.Add(freshContract, freshStoredContract)
 	polled, expiredContracts = queue.Poll(time.Time{})
-	assert.Equal(t, freshContract, polled)
-	assert.Equal(t, 0, len(expiredContracts))
+	AssertEqual(t, freshContract, polled)
+	AssertEqual(t, 0, len(expiredContracts))
 }
 
 // TestContractQueueShutdownFlush verifies that when the contract manager
@@ -334,7 +401,7 @@ func TestContractQueueShutdownFlush(t *testing.T) {
 	contractId := NewId()
 	relationship := protocol.ProvideMode_Public
 	provideSecretKey, ok := contractManager.GetProvideSecretKey(relationship)
-	assert.Equal(t, true, ok)
+	AssertEqual(t, true, ok)
 	storedContract := &protocol.StoredContract{
 		ContractId:        contractId.Bytes(),
 		TransferByteCount: uint64(gib(1)),
@@ -342,7 +409,7 @@ func TestContractQueueShutdownFlush(t *testing.T) {
 		DestinationId:     destinationId.Bytes(),
 	}
 	storedContractBytes, err := ProtoMarshal(storedContract)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	storedContractHmac := SignStoredContract(contractManager.settings, provideSecretKey, storedContractBytes)
 	contract := &protocol.Contract{
 		StoredContractBytes: storedContractBytes,
@@ -357,16 +424,16 @@ func TestContractQueueShutdownFlush(t *testing.T) {
 		Contract: contract,
 	}
 	frame, err := ToFrame(result, DefaultProtocolVersion)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 	err = contractManager.HandleControlFrame(contractKey, frame)
-	assert.Equal(t, nil, err)
+	AssertEqual(t, nil, err)
 
 	queueCount := func() int {
 		contractManager.mutex.Lock()
 		defer contractManager.mutex.Unlock()
 		return len(contractManager.destinationContracts)
 	}
-	assert.Equal(t, 1, queueCount())
+	AssertEqual(t, 1, queueCount())
 
 	// closing the client triggers the shutdown flush of pending contracts
 	client.Cancel()
@@ -379,5 +446,5 @@ func TestContractQueueShutdownFlush(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	assert.Equal(t, true, flushed)
+	AssertEqual(t, true, flushed)
 }
