@@ -152,6 +152,22 @@ func (self *RouteManager) RemoveTransport(transport Transport) {
 	self.UpdateTransport(transport, nil)
 }
 
+// HasActiveTransport reports whether any transport is currently registered
+// with routes. The transport set is the ground truth for whether this client
+// has a carrier at all: transports register on (re)connect via
+// UpdateTransport and are removed when their connection dies, so an empty set
+// means nothing this client sends can leave the device and nothing can
+// arrive. Consumers use that to rule the client's silence inadmissible as
+// evidence against the remote end -- see detectBlackhole and sendStalled in
+// the multi client. Both match states are read because UpdateTransport writes
+// them together but a send-only or receive-only transport is still a carrier.
+func (self *RouteManager) HasActiveTransport() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	return 0 < len(self.writerMatchState.transportRoutes) || 0 < len(self.readerMatchState.transportRoutes)
+}
+
 func (self *RouteManager) getTransportStats(transport Transport) (writerStats *RouteStats, readerStats *RouteStats) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -334,6 +350,17 @@ type MultiRouteSelector struct {
 	// `NotifyChannel` — both on every packet. the route set changes rarely, so
 	// the snapshot moves that work off the hot path.
 	activeRoutesSnapshot atomic.Pointer[routeSnapshot]
+
+	// A selector reader is one ordered packet stream. Serializing Read also
+	// lets it reuse one lazy timeout timer instead of allocating time.After
+	// state on every packet. A selector writer is likewise one ordered packet
+	// stream; serialization preserves that order and lets blocked writes reuse
+	// one bounded timer instead of allocating two runtime timer objects per
+	// backpressured transfer frame.
+	readMutex  sync.Mutex
+	readTimer  *time.Timer
+	writeMutex sync.Mutex
+	writeTimer *time.Timer
 }
 
 // routeSnapshot is an immutable view of the selector's active routes published
@@ -681,8 +708,50 @@ func (self *MultiRouteSelector) Write(ctx context.Context, transferFrameBytes []
 
 // MultiRouteWriter
 func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrameBytes []byte, timeout time.Duration) (bool, error) {
-	// write to the first channel available, in random priority
 	enterTime := time.Now()
+
+	// Preserve the allocation-free, lock-free common path. SendSequence owns a
+	// writer selector and writes its ordered stream serially; the mutex below is
+	// only needed when a write must retain and reuse the selector timer.
+	initialSnapshot := self.activeRoutesSnapshot.Load()
+	initialRoutes := initialSnapshot.shuffled()
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(initialRoutes))
+	}
+	for _, route := range initialRoutes {
+		select {
+		case route <- transferFrameBytes:
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[mrw]nb %s->%s s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
+			}
+			self.updateSendStats(route, 1, ByteCount(len(transferFrameBytes)))
+			return true, nil
+		default:
+		}
+	}
+
+	self.writeMutex.Lock()
+	defer self.writeMutex.Unlock()
+	defer func() {
+		if self.writeTimer != nil {
+			self.writeTimer.Stop()
+		}
+	}()
+
+	// write to the first channel available, in random priority
+	// Arm the selector's timer only if the nonblocking route pass fails, then
+	// retain the same absolute deadline across transport-update retries. The
+	// timer object itself is lazy and bounded to one per writer selector.
+	timeoutChannel := func() (<-chan time.Time, bool) {
+		if timeout < 0 {
+			return nil, false
+		}
+		remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
+		if remainingTimeout <= 0 {
+			return nil, true
+		}
+		return resetOrCreateTimer(&self.writeTimer, remainingTimeout), false
+	}
 	for {
 		// read the active routes and the transport-update channel from the
 		// lock-free snapshot instead of taking the selector and monitor locks
@@ -722,12 +791,9 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 				route1 = activeRoutes[1]
 			}
 			var timeoutChan <-chan time.Time
-			if 0 <= timeout {
-				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
-				if remainingTimeout <= 0 {
-					return false, nil
-				}
-				timeoutChan = time.After(remainingTimeout)
+			var expired bool
+			if timeoutChan, expired = timeoutChannel(); expired {
+				return false, nil
 			}
 			select {
 			case <-ctx.Done():
@@ -792,9 +858,8 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 		}
 
 		timeoutIndex := len(selectCases)
-		if 0 <= timeout {
-			remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
-			if remainingTimeout <= 0 {
+		if timeoutChan, expired := timeoutChannel(); timeoutChan != nil || expired {
+			if expired {
 				// add a default case
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir: reflect.SelectDefault,
@@ -803,7 +868,7 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 				// add a timeout case
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir:  reflect.SelectRecv,
-					Chan: reflect.ValueOf(time.After(remainingTimeout)),
+					Chan: reflect.ValueOf(timeoutChan),
 				})
 			}
 		}
@@ -838,6 +903,14 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 
 // MultiRouteReader
 func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration) ([]byte, error) {
+	self.readMutex.Lock()
+	defer self.readMutex.Unlock()
+	defer func() {
+		if self.readTimer != nil {
+			self.readTimer.Stop()
+		}
+	}()
+
 	// read from the first channel available, in random priority
 	enterTime := time.Now()
 	for {
@@ -894,7 +967,7 @@ func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration)
 				if remainingTimeout <= 0 {
 					return nil, nil
 				}
-				timeoutChan = time.After(remainingTimeout)
+				timeoutChan = resetOrCreateTimer(&self.readTimer, remainingTimeout)
 			}
 			select {
 			case <-ctx.Done():
@@ -975,9 +1048,10 @@ func (self *MultiRouteSelector) Read(ctx context.Context, timeout time.Duration)
 				})
 			} else {
 				// add a timeout case
+				timeoutChan := resetOrCreateTimer(&self.readTimer, remainingTimeout)
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir:  reflect.SelectRecv,
-					Chan: reflect.ValueOf(time.After(remainingTimeout)),
+					Chan: reflect.ValueOf(timeoutChan),
 				})
 			}
 		}

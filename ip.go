@@ -9,12 +9,12 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
-	// "syscall"
 	// "runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	// "google.golang.org/protobuf/proto"
@@ -44,8 +44,26 @@ const debugVerifyHeaders = false
 // `provideMode` is the relationship between the source and this device
 type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
 
-// receive into a raw socket
+// receive into a raw socket. ipPath is the canonical outbound flow identity
+// (client→server), while packet retains its actual wire direction
+// (server→client on a normal return). A callee that needs the packet's source
+// or destination must inspect packet rather than infer its direction from
+// ipPath. Both are read-only for the duration of the callback. A callee that
+// retains packet must call MessagePoolShareReadOnly; a callee that needs a
+// mutable path must clone it.
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
+
+// receive a batch of packets from one flow (same source, provideMode, ipPath)
+// in a single call, so a consumer can coalesce them (see the provider return
+// path, which packs the batch into one wire Pack). The packet buffers are
+// read-only and valid only for the duration of the callback. A callee that
+// retains one must call MessagePoolShareReadOnly before returning.
+type ReceivePacketsFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte)
+
+// the internal batch delivery hook plumbed from the nat into the per-flow
+// read-loops: reports whether a batch consumer took the batch, so the loop
+// falls back to per-packet delivery when none is registered
+type receivePacketsBatchFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte) (batched bool)
 
 type UserNatClient interface {
 	// `SendPacketFunction`
@@ -88,7 +106,11 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		ReadBufferByteCount: DefaultMtu,
 		SequenceBufferSize:  bufferSize,
 		WriteBatchSize:      64,
-		UserLimit:           0,
+		// Flows are assigned round-robin to a bounded number of ordered
+		// receive workers. Workers start lazily, so one active flow still uses
+		// one receive worker; five or five thousand flows use at most four.
+		ReceiveShardCount: 4,
+		UserLimit:         0,
 		// A process with an explicit memory budget is a constrained device and
 		// gets a scaled hard cap. Unbudgeted server/provider callers are not
 		// silently assigned the phone cap; provider entry points select their
@@ -111,8 +133,16 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
-		ReadTimeout:        300 * time.Second,
-		WriteTimeout:       15 * time.Second,
+		ReadTimeout: 300 * time.Second,
+		// WriteTimeout bounds ZERO-progress time on the upstream socket (the
+		// write pipeline re-arms it on partial progress). A closed window on
+		// the tunnel side legitimately parks the whole pipeline — the device's
+		// acks can starve for tens of seconds behind a saturated tunnel — and
+		// a kill here tears down an alive flow with an RST. A dead upstream
+		// peer normally surfaces as RST/EPIPE rather than eternal silence, and
+		// the idle reaper (IdleTimeout/ReadTimeout) still bounds a truly
+		// wedged flow, so patience is cheap.
+		WriteTimeout:       60 * time.Second,
 		AckCompressTimeout: 50 * time.Millisecond,
 		IdleTimeout:        300 * time.Second,
 		SequenceBufferSize: bufferSize,
@@ -128,7 +158,10 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		GlobalLimit:        globalLimit,
 		EnableOrphanRst:    true,
 		OrphanRstPerSecond: 256,
-		ConnectSettings:    *DefaultConnectSettings(),
+		// on by default: the benchmark range is reserved (RFC 2544) and the
+		// synthetic server only ever answers flows explicitly addressed to it
+		EnableSyntheticSpeed: true,
+		ConnectSettings:      *DefaultConnectSettings(),
 	}
 	return tcpBufferSettings
 }
@@ -153,8 +186,9 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 		SequenceBufferSize: MemoryScaledCount(defaultIpBufferSize, 256),
 		SendShardCount:     1,
 		// BufferTimeout:      15 * time.Second,
-		UdpBufferSettings: DefaultUdpBufferSettings(),
-		TcpBufferSettings: DefaultTcpBufferSettings(),
+		UdpBufferSettings:  DefaultUdpBufferSettings(),
+		TcpBufferSettings:  DefaultTcpBufferSettings(),
+		IcmpBufferSettings: DefaultIcmpBufferSettings(),
 	}
 }
 
@@ -167,6 +201,50 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 // provider default from before the idle reap was shortened.
 const providerUdpIdleTimeout = 300 * time.Second
 
+// per-flow byte cost model for deriving the provider flow caps from the
+// provider memory target: the expected in-process bytes one flow pins
+// (channel backing arrays and queued packets, read buffer occupancy, window
+// bookkeeping). Kernel socket buffers are excluded — they live outside the
+// process footprint. These are the calibration levers for the provider
+// target; validate changes against the provider load measurement
+// (sdk TestDeviceLocalProviderMemoryUnderLoad).
+const providerUdpFlowByteCount = 2 * 1024
+const providerTcpFlowByteCount = 8 * 1024
+
+// the icmp item of the same model: the backend read and write buffers (one
+// mtu each on unix; the windows transactor's bounded outstanding reply
+// buffers are comparable), the send queue backing array, flow bookkeeping,
+// and the packet-class pool buffer a live flow keeps in circulation.
+// Calibrated to the marginal heap of a live flow (~7 KiB measured, see
+// TestIcmpFlowMemoryFootprint), rounded up. Like its udp and tcp siblings
+// this figure is heap attributable: goroutine stacks (~10 KiB for a flow's
+// two goroutines) and kernel socket buffers live outside it.
+const providerIcmpFlowByteCount = 8 * 1024
+
+// the icmp share of the nat target. icmp is an additive item above the
+// udp/tcp split (see the provider profile below), so the divisor bounds the
+// overcommit rather than carving the other tables.
+const providerIcmpTargetDivisor = 16
+
+// A cold public page can fan out across more than 100 origins while the
+// browser keeps prior http/2 and quic connections alive. The target-derived
+// 4 MiB mobile provider profile used to cap one source at 51 tcp and 153 udp
+// flows, so an ordinary page evicted live handshakes and fell onto the
+// browser's 17/33/65 second syn retry ladder. These are bounded functional
+// floors, not unlimited exceptions: the aggregate caps still contain the
+// complete table, and larger provider targets continue to scale from the
+// byte-cost model above.
+const providerMinUdpUserLimit = 256
+const providerMinUdpGlobalLimit = 512
+const providerMinTcpUserLimit = 256
+const providerMinTcpGlobalLimit = 512
+
+// icmp functional floors, in the style of the udp/tcp floors above: echo
+// flows are one per ping process, so even a tiny target keeps a working
+// ping table (see ICMP.md).
+const providerMinIcmpUserLimit = 64
+const providerMinIcmpGlobalLimit = 128
+
 // DefaultProviderLocalUserNatSettings is the explicit provider/egress profile.
 // A process that installed a memory budget is a constrained device and gets
 // the scaled per-source/aggregate caps. An unbudgeted desktop/server provider
@@ -175,7 +253,67 @@ const providerUdpIdleTimeout = 300 * time.Second
 // server-scale load. Keeping this choice here makes provider policy explicit
 // without changing every generic LocalUserNat caller.
 func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
+	return DefaultProviderLocalUserNatSettingsWithMemoryTarget(0)
+}
+
+// DefaultProviderLocalUserNatSettingsWithMemoryTarget sizes the provider
+// profile from the owner's provider memory target (the per-device share, see
+// the sdk device wiring). 0 keeps the legacy behavior: process-budget-scaled
+// caps, or unlimited flow counts for an unbudgeted server/desktop provider.
+func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCount) *LocalUserNatSettings {
 	settings := DefaultLocalUserNatSettings()
+	if 0 < targetByteCount {
+		// the provider target has its own gate, independent of the process
+		// budget. Half the target sizes the egress nat flow tables (60% udp /
+		// 40% tcp by bytes, converted to flow counts by the per-flow cost
+		// model above, keeping the historical user:global ratios and floors);
+		// the other half sizes the provider client's transfer budgets (see
+		// the sdk device wiring). Flows over a cap evict the
+		// least-recently-active flow, so the tables remain predictably
+		// bounded under load. The functional fanout floors above may exceed a
+		// very small target's byte-derived count.
+		natTarget := targetByteCount / 2
+		udpGlobalLimit := max(providerMinUdpGlobalLimit, int(natTarget*3/5/providerUdpFlowByteCount))
+		tcpGlobalLimit := max(providerMinTcpGlobalLimit, int(natTarget*2/5/providerTcpFlowByteCount))
+		settings.UdpBufferSettings.UserLimit = max(providerMinUdpUserLimit, udpGlobalLimit/4)
+		settings.UdpBufferSettings.GlobalLimit = udpGlobalLimit
+		settings.TcpBufferSettings.UserLimit = max(providerMinTcpUserLimit, tcpGlobalLimit/2)
+		settings.TcpBufferSettings.GlobalLimit = tcpGlobalLimit
+		// icmp is its own budget item, additive above the udp/tcp split: an
+		// idle icmp path must not shrink the udp/tcp tables, so its bound is
+		// not carved from their shares. The caps are ceilings — an unused
+		// table holds zero bytes — and while icmp flows exist the worst-case
+		// overcommit of the nat target is bounded by the divisor (like the
+		// functional floors above at small targets).
+		icmpGlobalLimit := max(
+			providerMinIcmpGlobalLimit,
+			int(natTarget/providerIcmpTargetDivisor/providerIcmpFlowByteCount),
+		)
+		settings.IcmpBufferSettings.UserLimit = max(providerMinIcmpUserLimit, icmpGlobalLimit/2)
+		settings.IcmpBufferSettings.GlobalLimit = icmpGlobalLimit
+
+		// The generic process profile leaves headroom above one full tcp
+		// window. A provider can hold hundreds of simultaneous page flows, so
+		// multiplying that spare channel capacity by every flow wastes
+		// several MiB. Retain exactly enough slots for a max-window burst of
+		// full-size IPv6 tcp packets; the lossless source contract remains
+		// intact while active provider memory becomes proportional to the
+		// advertised window instead of the unrelated process-wide default.
+		tcpPayloadByteCount := max(
+			1,
+			settings.TcpBufferSettings.Mtu-Ipv6HeaderSize-TcpHeaderSizeWithoutExtensions,
+		)
+		windowPacketCount := int(
+			(settings.TcpBufferSettings.MaxWindowSize +
+				uint32(tcpPayloadByteCount) - 1) /
+				uint32(tcpPayloadByteCount),
+		)
+		settings.TcpBufferSettings.SequenceBufferSize = min(
+			settings.TcpBufferSettings.SequenceBufferSize,
+			max(1, windowPacketCount),
+		)
+		return settings
+	}
 	if MemoryBudget() <= 0 {
 		// unbudgeted: keep the unlimited flow counts and give plain-udp NAT
 		// bindings the provider-tuned idle instead of the general short reap
@@ -186,6 +324,8 @@ func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
 	settings.UdpBufferSettings.GlobalLimit = MemoryScaledCount(2048, 256)
 	settings.TcpBufferSettings.UserLimit = MemoryScaledCount(256, 32)
 	settings.TcpBufferSettings.GlobalLimit = MemoryScaledCount(512, 64)
+	settings.IcmpBufferSettings.UserLimit = MemoryScaledCount(128, 16)
+	settings.IcmpBufferSettings.GlobalLimit = MemoryScaledCount(256, 32)
 	return settings
 }
 
@@ -199,6 +339,7 @@ func DefaultLocalUserNatSettingsWithBufferSize(bufferSize int) *LocalUserNatSett
 		SendShardCount:     1,
 		UdpBufferSettings:  DefaultUdpBufferSettingsWithBufferSize(bufferSize),
 		TcpBufferSettings:  DefaultTcpBufferSettingsWithBufferSize(bufferSize),
+		IcmpBufferSettings: DefaultIcmpBufferSettingsWithBufferSize(bufferSize),
 	}
 }
 
@@ -214,10 +355,14 @@ type LocalUserNatSettings struct {
 	// BufferTimeout      time.Duration
 	UdpBufferSettings *UdpBufferSettings
 	TcpBufferSettings *TcpBufferSettings
+	// nil resolves to the defaults, so settings constructed before icmp
+	// support keep working
+	IcmpBufferSettings *IcmpBufferSettings
 
-	// Log, when set, is used by the local user nat and its udp/tcp buffers
-	// and sequences (propagated to the buffer settings `Log` fields that are
-	// nil). nil resolves to `DefaultLogger()`.
+	// Log, when set, is used by the local user nat and its udp/tcp/icmp
+	// buffers and sequences (used for a buffer whose settings `Log` is nil,
+	// via a private copy — the caller's settings are never mutated).
+	// nil resolves to `DefaultLogger()`.
 	Log Logger
 }
 
@@ -236,6 +381,8 @@ type LocalUserNat struct {
 
 	// receive callback
 	receiveCallbacks *CallbackList[ReceivePacketFunction]
+	// batch receive callback (see receivePackets)
+	receivePacketsCallbacks *CallbackList[ReceivePacketsFunction]
 }
 
 func NewLocalUserNatWithDefaults(ctx context.Context, clientTag string) *LocalUserNat {
@@ -246,21 +393,42 @@ func NewLocalUserNat(ctx context.Context, clientTag string, settings *LocalUserN
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	log := loggerOrDefault(settings.Log)
-	// propagate so a nat-level logger covers the udp/tcp buffers and sequences
-	if settings.UdpBufferSettings != nil && settings.UdpBufferSettings.Log == nil {
-		settings.UdpBufferSettings.Log = log
-	}
-	if settings.TcpBufferSettings != nil && settings.TcpBufferSettings.Log == nil {
-		settings.TcpBufferSettings.Log = log
+	// propagate so a nat-level logger covers the udp/tcp/icmp buffers and
+	// sequences. Copy instead of writing through the caller's settings: the
+	// caller may share them with other components or concurrent
+	// constructions (see the platform transport framer settings for the
+	// same rule).
+	{
+		copied := *settings
+		if copied.UdpBufferSettings != nil && copied.UdpBufferSettings.Log == nil {
+			udpCopied := *copied.UdpBufferSettings
+			udpCopied.Log = log
+			copied.UdpBufferSettings = &udpCopied
+		}
+		if copied.TcpBufferSettings != nil && copied.TcpBufferSettings.Log == nil {
+			tcpCopied := *copied.TcpBufferSettings
+			tcpCopied.Log = log
+			copied.TcpBufferSettings = &tcpCopied
+		}
+		if copied.IcmpBufferSettings == nil {
+			copied.IcmpBufferSettings = DefaultIcmpBufferSettings()
+		}
+		if copied.IcmpBufferSettings.Log == nil {
+			icmpCopied := *copied.IcmpBufferSettings
+			icmpCopied.Log = log
+			copied.IcmpBufferSettings = &icmpCopied
+		}
+		settings = &copied
 	}
 	localUserNat := &LocalUserNat{
-		ctx:              cancelCtx,
-		cancel:           cancel,
-		clientTag:        clientTag,
-		log:              log,
-		sendPackets:      make(chan *SendPacket, settings.SequenceBufferSize),
-		settings:         settings,
-		receiveCallbacks: NewCallbackList[ReceivePacketFunction](),
+		ctx:                     cancelCtx,
+		cancel:                  cancel,
+		clientTag:               clientTag,
+		log:                     log,
+		sendPackets:             make(chan *SendPacket, settings.SequenceBufferSize),
+		settings:                settings,
+		receiveCallbacks:        NewCallbackList[ReceivePacketFunction](),
+		receivePacketsCallbacks: NewCallbackList[ReceivePacketsFunction](),
 	}
 	go HandleError(localUserNat.Run)
 
@@ -355,6 +523,40 @@ func (self *LocalUserNat) receive(source TransferPath, provideMode protocol.Prov
 		HandleError(func() {
 			receiveCallback(source, provideMode, ipPath, packet)
 		})
+	}
+}
+
+// receivePackets fans a flow's packet batch to the registered batch
+// callbacks (the provider return path coalesces it into one wire Pack).
+// Batch consumers take the batch exclusively: when any is registered, the
+// per-packet callbacks do not see these packets (the flow read-loop only
+// falls back to per-packet delivery when receivePackets reports
+// not-batched). A nat therefore has either batch consumers (the provider
+// exit nat) or per-packet consumers (the device local nats), not both.
+// The batch callback shares read-only what it retains; the read-loop keeps
+// buffer ownership.
+func (self *LocalUserNat) receivePackets(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte) (batched bool) {
+	batchCallbacks := self.receivePacketsCallbacks.Get()
+	for _, batchCallback := range batchCallbacks {
+		HandleError(func() {
+			batchCallback(source, provideMode, ipPath, packets)
+		})
+		batched = true
+	}
+	return batched
+}
+
+func (self *LocalUserNat) hasReceivePacketsCallback() bool {
+	return 0 < len(self.receivePacketsCallbacks.Get())
+}
+
+// AddReceivePacketsCallback registers a batch receive callback (see
+// receivePackets). A batch callback borrows the flow's drained packet buffers
+// for the duration of the call; the read loop retains ownership.
+func (self *LocalUserNat) AddReceivePacketsCallback(receiveCallback ReceivePacketsFunction) func() {
+	callbackId := self.receivePacketsCallbacks.Add(receiveCallback)
+	return func() {
+		self.receivePacketsCallbacks.Remove(callbackId)
 	}
 }
 
@@ -475,14 +677,26 @@ func sendShard(ipPacket []byte, shardCount int) int {
 			if Ipv4HeaderSizeWithoutExtensions <= len(ipPacket) {
 				hashBytes(ipPacket[12:20])
 				headerByteCount := int(ipPacket[0]&0xf) * 4
-				if headerByteCount+4 <= len(ipPacket) {
+				if ipProtocolNumber(ipPacket[9]) == ipProtocolNumberIcmp4 {
+					// the first transport bytes are type/code/checksum, which
+					// vary per packet; the echo identifier is the flow identity
+					if headerByteCount+6 <= len(ipPacket) {
+						hashBytes(ipPacket[headerByteCount+4 : headerByteCount+6])
+					}
+				} else if headerByteCount+4 <= len(ipPacket) {
 					hashBytes(ipPacket[headerByteCount : headerByteCount+4])
 				}
 			}
 		case 6:
 			if Ipv6HeaderSize+4 <= len(ipPacket) {
 				hashBytes(ipPacket[8:40])
-				hashBytes(ipPacket[Ipv6HeaderSize : Ipv6HeaderSize+4])
+				if ipProtocolNumber(ipPacket[6]) == ipProtocolNumberIcmp6 {
+					if Ipv6HeaderSize+6 <= len(ipPacket) {
+						hashBytes(ipPacket[Ipv6HeaderSize+4 : Ipv6HeaderSize+6])
+					}
+				} else {
+					hashBytes(ipPacket[Ipv6HeaderSize : Ipv6HeaderSize+4])
+				}
 			}
 		}
 	}
@@ -496,11 +710,26 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer := NewUdp6Buffer(self.ctx, self.receive, self.settings.UdpBufferSettings)
 	tcp4Buffer := NewTcp4Buffer(self.ctx, self.receive, self.settings.TcpBufferSettings)
 	tcp6Buffer := NewTcp6Buffer(self.ctx, self.receive, self.settings.TcpBufferSettings)
+	icmp4Buffer := NewIcmp4Buffer(self.ctx, self.receive, self.settings.IcmpBufferSettings)
+	icmp6Buffer := NewIcmp6Buffer(self.ctx, self.receive, self.settings.IcmpBufferSettings)
+	// the per-flow read-loops route their drained batch through
+	// receivePackets, which coalesces it into one wire Pack when a batch
+	// consumer is registered (the provider return path) and otherwise
+	// reports not-batched so the loop falls back to per-packet delivery.
+	// The check is live (per batch), since the provider registers its batch
+	// callback after this nat's Run starts.
+	udp4Buffer.receivePacketsCallback = self.receivePackets
+	udp6Buffer.receivePacketsCallback = self.receivePackets
+	tcp4Buffer.receivePacketsCallback = self.receivePackets
+	tcp6Buffer.receivePacketsCallback = self.receivePackets
+	icmp4Buffer.receivePacketsCallback = self.receivePackets
+	icmp6Buffer.receivePacketsCallback = self.receivePackets
 
 	// parsed per-packet views. these are copied by value into the send items,
 	// so the locals can be reused across packets.
 	var udpPacket parsedUdp
 	var tcpPacket parsedTcp
+	var icmpPacket parsedIcmp
 
 	handleIpPacket := func(source TransferPath, provideMode protocol.ProvideMode, ipPacket []byte) {
 		if len(ipPacket) == 0 {
@@ -533,13 +762,18 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					)
 					return success && err == nil
 				}
+				delivered := false
 				if self.log.V(2).Enabled() {
-					TraceWithReturn(
+					delivered = TraceWithReturn(
 						fmt.Sprintf("[lnr]send udp4 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
 						c,
 					)
 				} else {
-					c()
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
 				}
 			case ipProtocolNumberTcp:
 				if !parseTcpPacket(sourceIp, destinationIp, transport, &tcpPacket) {
@@ -557,13 +791,55 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					)
 					return success && err == nil
 				}
+				delivered := false
 				if self.log.V(2).Enabled() {
-					TraceWithReturn(
+					delivered = TraceWithReturn(
 						fmt.Sprintf("[lnr]send tcp4 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
 						c,
 					)
 				} else {
-					c()
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
+				}
+			case ipProtocolNumberIcmp4:
+				if !parseIcmpPacket(4, sourceIp, destinationIp, transport, &icmpPacket) {
+					// unsupported type or malformed, drop
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				if !icmpPacket.echoRequest {
+					// an outbound echo reply is always an orphan: unsolicited
+					// inbound pings cannot reach a source, and the egress
+					// backends cannot send one anyway (see ICMP.md)
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				icmpPacket.ttl = ipPacket[8]
+				c := func() bool {
+					success, err := icmp4Buffer.send(
+						source,
+						provideMode,
+						&icmpPacket,
+						self.settings.IcmpBufferSettings.WriteTimeout,
+						ipPacket,
+					)
+					return success && err == nil
+				}
+				delivered := false
+				if self.log.V(2).Enabled() {
+					delivered = TraceWithReturn(
+						fmt.Sprintf("[lnr]send icmp4 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
+						c,
+					)
+				} else {
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
 				}
 			default:
 				// no support for this protocol, drop
@@ -593,13 +869,18 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					)
 					return success && err == nil
 				}
+				delivered := false
 				if self.log.V(2).Enabled() {
-					TraceWithReturn(
+					delivered = TraceWithReturn(
 						fmt.Sprintf("[lnr]send udp6 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
 						c,
 					)
 				} else {
-					c()
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
 				}
 			case ipProtocolNumberTcp:
 				if !parseTcpPacket(sourceIp, destinationIp, transport, &tcpPacket) {
@@ -617,13 +898,55 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					)
 					return success && err == nil
 				}
+				delivered := false
 				if self.log.V(2).Enabled() {
-					TraceWithReturn(
+					delivered = TraceWithReturn(
 						fmt.Sprintf("[lnr]send tcp6 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
 						c,
 					)
 				} else {
-					c()
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
+				}
+			case ipProtocolNumberIcmp6:
+				if !parseIcmpPacket(6, sourceIp, destinationIp, transport, &icmpPacket) {
+					// unsupported type or malformed, drop
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				if !icmpPacket.echoRequest {
+					// an outbound echo reply is always an orphan (see the v4
+					// case)
+					MessagePoolReturn(ipPacket)
+					return
+				}
+				// hop limit
+				icmpPacket.ttl = ipPacket[7]
+				c := func() bool {
+					success, err := icmp6Buffer.send(
+						source,
+						provideMode,
+						&icmpPacket,
+						self.settings.IcmpBufferSettings.WriteTimeout,
+						ipPacket,
+					)
+					return success && err == nil
+				}
+				delivered := false
+				if self.log.V(2).Enabled() {
+					delivered = TraceWithReturn(
+						fmt.Sprintf("[lnr]send icmp6 %s<-%s s(%s)", self.clientTag, source.SourceId, source.StreamId),
+						c,
+					)
+				} else {
+					delivered = c()
+				}
+				if !delivered {
+					// full/timeout drop: the sequence never took ownership
+					MessagePoolReturn(ipPacket)
 				}
 			default:
 				// no support for this protocol, drop
@@ -724,6 +1047,12 @@ type UdpBufferSettings struct {
 	// the maximum number of payloads to process under a single write deadline.
 	// udp datagrams cannot be coalesced, so each payload is one socket write.
 	WriteBatchSize int
+	// Number of ordered receive-dispatch shards shared by every UDP flow in
+	// this address-family buffer. Zero retains the default of four for custom
+	// settings built before this field existed. Each shard queue has
+	// SequenceBufferSize slots, making aggregate user-space receive
+	// backpressure independent of flow count.
+	ReceiveShardCount int
 	// the number of open sockets per user
 	// uses an lru cleanup where new sockets over the limit close old sockets
 	UserLimit int
@@ -738,12 +1067,17 @@ type UdpBufferSettings struct {
 }
 
 // iana ip protocol numbers, as carried in the ipv4 protocol and ipv6 next
-// header fields. only tcp and udp are handled; other protocols are dropped.
+// header fields. tcp, udp, and icmp echo are handled; other protocols are
+// dropped. the icmp numbers also label the flow-teardown unreachable
+// messages built by `ipOosUnreachable`, which are injected toward the
+// source.
 type ipProtocolNumber uint8
 
 const (
-	ipProtocolNumberTcp = ipProtocolNumber(6)
-	ipProtocolNumberUdp = ipProtocolNumber(17)
+	ipProtocolNumberIcmp4 = ipProtocolNumber(1)
+	ipProtocolNumberTcp   = ipProtocolNumber(6)
+	ipProtocolNumberUdp   = ipProtocolNumber(17)
+	ipProtocolNumberIcmp6 = ipProtocolNumber(58)
 )
 
 // minimal parsed views of packets on the send path.
@@ -804,6 +1138,13 @@ func parseIpv4(ipPacket []byte) (ipProtocol ipProtocolNumber, sourceIp net.IP, d
 	headerByteCount := int(ipPacket[0]&0xf) * 4
 	totalByteCount := int(binary.BigEndian.Uint16(ipPacket[2:4]))
 	if headerByteCount < Ipv4HeaderSizeWithoutExtensions || totalByteCount < headerByteCount || len(ipPacket) < totalByteCount {
+		return
+	}
+	// fragments are not reassembled: a non-first fragment has no transport
+	// header and a first fragment has a truncated payload, so either would
+	// misparse payload bytes as transport fields. one 16 bit load covers mf
+	// plus the whole offset field (0x3fff); df and the reserved bit pass.
+	if binary.BigEndian.Uint16(ipPacket[6:8])&0x3fff != 0 {
 		return
 	}
 	ipProtocol = ipProtocolNumber(ipPacket[9])
@@ -957,6 +1298,139 @@ func writeIpv6Header(packet []byte, ipProtocol ipProtocolNumber, packetSourceIp 
 	copy(packet[24:40], packetDestinationIp)
 }
 
+// udpReceiveDispatcher replaces one receive channel and one receive goroutine
+// per UDP flow with a small set of shared FIFO shards. A flow is permanently
+// assigned to one shard, and its socket has exactly one read producer, so its
+// callback order is unchanged. The aggregate user-space queue is now
+// shardCount*SequenceBufferSize rather than flowCount*SequenceBufferSize.
+//
+// A callback can still block unrelated flows in the same shard. Four shards
+// bound that failure domain without reintroducing per-flow stacks/queues; the
+// socket kernel buffers provide the next bounded absorption layer.
+const defaultUdpReceiveShardCount = 4
+
+type udpReceiveDispatchItem struct {
+	sequence *UdpSequence
+	packet   []byte
+}
+
+type udpReceiveDispatchShard struct {
+	ctx       context.Context
+	startOnce sync.Once
+	items     chan udpReceiveDispatchItem
+	batchSize int
+}
+
+type udpReceiveDispatcher struct {
+	ctx       context.Context
+	shards    []udpReceiveDispatchShard
+	nextShard int
+}
+
+func newUdpReceiveDispatcher(ctx context.Context, settings *UdpBufferSettings) *udpReceiveDispatcher {
+	shardCount := settings.ReceiveShardCount
+	if shardCount <= 0 {
+		shardCount = defaultUdpReceiveShardCount
+	}
+	dispatcher := &udpReceiveDispatcher{
+		ctx:    ctx,
+		shards: make([]udpReceiveDispatchShard, shardCount),
+	}
+	for i := range dispatcher.shards {
+		dispatcher.shards[i] = udpReceiveDispatchShard{
+			ctx:       ctx,
+			items:     make(chan udpReceiveDispatchItem, max(0, settings.SequenceBufferSize)),
+			batchSize: max(1, settings.WriteBatchSize),
+		}
+	}
+	return dispatcher
+}
+
+// assignShard is called under UdpBuffer.mutex when a flow is created.
+func (dispatcher *udpReceiveDispatcher) assignShard() int {
+	shard := dispatcher.nextShard
+	dispatcher.nextShard = (dispatcher.nextShard + 1) % len(dispatcher.shards)
+	return shard
+}
+
+func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []byte) bool {
+	if dispatcher == nil || sequence == nil || len(dispatcher.shards) == 0 {
+		return false
+	}
+	shard := &dispatcher.shards[sequence.receiveShard]
+	shard.startOnce.Do(func() {
+		go HandleError(shard.run)
+	})
+	select {
+	case <-dispatcher.ctx.Done():
+		return false
+	case <-sequence.ctx.Done():
+		return false
+	case shard.items <- udpReceiveDispatchItem{sequence: sequence, packet: packet}:
+		return true
+	}
+}
+
+func (shard *udpReceiveDispatchShard) run() {
+	batch := make([][]byte, 0, shard.batchSize)
+	var pending udpReceiveDispatchItem
+	hasPending := false
+
+	releaseQueued := func() {
+		if hasPending {
+			MessagePoolReturn(pending.packet)
+			pending = udpReceiveDispatchItem{}
+			hasPending = false
+		}
+		for {
+			select {
+			case item := <-shard.items:
+				MessagePoolReturn(item.packet)
+			default:
+				return
+			}
+		}
+	}
+
+	for {
+		var item udpReceiveDispatchItem
+		if hasPending {
+			item = pending
+			pending = udpReceiveDispatchItem{}
+			hasPending = false
+		} else {
+			select {
+			case <-shard.ctx.Done():
+				releaseQueued()
+				return
+			case item = <-shard.items:
+			}
+		}
+
+		sequence := item.sequence
+		batch = append(batch[:0], item.packet)
+
+		// Coalesce only adjacent packets from the same flow. Holding one
+		// different-flow item as pending preserves the shard's total FIFO
+		// order while retaining the existing two-frame wire batching win.
+	fill:
+		for len(batch) < cap(batch) {
+			select {
+			case next := <-shard.items:
+				if next.sequence != sequence {
+					pending = next
+					hasPending = true
+					break fill
+				}
+				batch = append(batch, next.packet)
+			default:
+				break fill
+			}
+		}
+		sequence.receiveBatch(batch)
+	}
+}
+
 type Udp4Buffer struct {
 	UdpBuffer[BufferId4]
 }
@@ -1018,10 +1492,12 @@ func (self *Udp6Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 }
 
 type UdpBuffer[BufferId comparable] struct {
-	ctx               context.Context
-	log               Logger
-	receiveCallback   ReceivePacketFunction
-	udpBufferSettings *UdpBufferSettings
+	ctx                    context.Context
+	log                    Logger
+	receiveCallback        ReceivePacketFunction
+	receivePacketsCallback receivePacketsBatchFunction
+	udpBufferSettings      *UdpBufferSettings
+	receiveDispatcher      *udpReceiveDispatcher
 
 	mutex sync.Mutex
 
@@ -1039,6 +1515,7 @@ func newUdpBuffer[BufferId comparable](
 		log:               loggerOrDefault(udpBufferSettings.Log),
 		receiveCallback:   receiveCallback,
 		udpBufferSettings: udpBufferSettings,
+		receiveDispatcher: newUdpReceiveDispatcher(ctx, udpBufferSettings),
 		sequences:         map[BufferId]*UdpSequence{},
 		sourceSequences:   map[TransferPath]map[BufferId]*UdpSequence{},
 	}
@@ -1134,6 +1611,9 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			udp.destinationPort,
 			self.udpBufferSettings,
 		)
+		sequence.receivePacketsCallback = self.receivePacketsCallback
+		sequence.receiveDispatcher = self.receiveDispatcher
+		sequence.receiveShard = self.receiveDispatcher.assignShard()
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -1193,14 +1673,20 @@ func (self *UdpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, seque
 }
 
 type UdpSequence struct {
-	ctx               context.Context
-	cancel            context.CancelFunc
-	log               Logger
-	receiveCallback   ReceivePacketFunction
-	udpBufferSettings *UdpBufferSettings
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	log                    Logger
+	receiveCallback        ReceivePacketFunction
+	receivePacketsCallback receivePacketsBatchFunction
+	receiveDispatcher      *udpReceiveDispatcher
+	receiveShard           int
+	udpBufferSettings      *UdpBufferSettings
 
 	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
+	// Lazily allocated only when the bounded send queue actually blocks.
+	// sendMutex serializes Reset/Stop.
+	sendTimer *time.Timer
 
 	idleCondition *IdleCondition
 
@@ -1283,14 +1769,38 @@ func (self *UdpSequence) send(sendItem *UdpSendItem, timeout time.Duration) (boo
 			return false, nil
 		}
 	} else {
+		timeoutChan := resetOrCreateTimer(&self.sendTimer, timeout)
 		select {
 		case <-self.ctx.Done():
+			self.sendTimer.Stop()
 			return false, errors.New("Done.")
 		case self.sendItems <- sendItem:
+			self.sendTimer.Stop()
 			return true, nil
-		case <-time.After(timeout):
+		case <-timeoutChan:
 			return false, nil
 		}
+	}
+}
+
+func (self *UdpSequence) receivePacket(packet []byte) {
+	self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
+	MessagePoolReturn(packet)
+}
+
+// receiveBatch delivers a flow's drained batch in one call when a batch
+// consumer is registered (coalesced into one wire Pack), else per packet. The
+// dispatcher owns the buffers; the consumer shares read-only what it retains.
+func (self *UdpSequence) receiveBatch(packets [][]byte) {
+	if self.receivePacketsCallback != nil &&
+		self.receivePacketsCallback(self.source, self.provideMode, self.IpPath(), packets) {
+		for _, packet := range packets {
+			MessagePoolReturn(packet)
+		}
+		return
+	}
+	for _, packet := range packets {
+		self.receivePacket(packet)
 	}
 }
 
@@ -1320,11 +1830,6 @@ func (self *UdpSequence) Run() {
 		}()
 	}()
 
-	receive := func(packet []byte) {
-		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
-		MessagePoolReturn(packet)
-	}
-
 	self.log.V(2).Infof("[init]udp connect\n")
 	socket, err := self.udpBufferSettings.DialContext(
 		self.ctx,
@@ -1334,6 +1839,13 @@ func (self *UdpSequence) Run() {
 	if err != nil {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]udp connect error = %s\n", err)
+		}
+		// answer the source instead of going silent: udp "dial" cannot yield a
+		// meaningful refusal at connect time, so always send the capacity-class
+		// unreachable through the same receive callback, then return -- no
+		// socket exists.
+		if _, signal := classifyDialFailure(self.IpPath(), err); signal != nil {
+			self.receivePacket(MessagePoolCopy(signal))
 		}
 		return
 	}
@@ -1351,139 +1863,11 @@ func (self *UdpSequence) Run() {
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
 
-	// pipelines
-
-	type writePayload struct {
-		sendIter uint64
-		payload  []byte
-		ipPacket []byte
-	}
-
-	writePayloads := make(chan writePayload, self.udpBufferSettings.SequenceBufferSize)
 	go HandleError(func() {
-		// best effort return of queued payloads after cancel
-		defer func() {
-			for {
-				select {
-				case writePayload, ok := <-writePayloads:
-					if !ok {
-						return
-					}
-					MessagePoolReturn(writePayload.ipPacket)
-				default:
-					return
-				}
-			}
-		}()
+		// The dispatcher owns every successfully enqueued packet. Canceling
+		// the sequence closes the socket/main send loop, but already queued
+		// packets remain valid and drain in shard FIFO order.
 		defer self.cancel()
-
-		batch := make([]writePayload, 0, self.udpBufferSettings.WriteBatchSize)
-
-		for {
-			batch = batch[:0]
-			closed := false
-			select {
-			case <-self.ctx.Done():
-				return
-			case writePayload, ok := <-writePayloads:
-				if !ok {
-					return
-				}
-				batch = append(batch, writePayload)
-			}
-			// opportunistically batch queued payloads under a single write deadline
-		drain:
-			for len(batch) < self.udpBufferSettings.WriteBatchSize {
-				select {
-				case writePayload, ok := <-writePayloads:
-					if !ok {
-						closed = true
-						break drain
-					}
-					batch = append(batch, writePayload)
-				default:
-					break drain
-				}
-			}
-
-			writeEndTime := time.Now().Add(self.udpBufferSettings.WriteTimeout)
-			socket.SetWriteDeadline(writeEndTime)
-			var writeErr error
-			for _, writePayload := range batch {
-				if writeErr == nil {
-					// each payload is one datagram. datagrams cannot be coalesced.
-					n, err := socket.Write(writePayload.payload)
-					if err == nil {
-						if self.log.V(2).Enabled() {
-							self.log.Infof("[f%d]udp forward %d\n", writePayload.sendIter, n)
-						}
-					} else {
-						if self.log.V(1).Enabled() {
-							self.log.Infof("[f%d]udp forward %d error = %s", writePayload.sendIter, n, err)
-						}
-					}
-					if 0 < n {
-						self.UpdateLastActivityTime()
-					}
-					writeErr = err
-				}
-				MessagePoolReturn(writePayload.ipPacket)
-			}
-			if writeErr != nil {
-				// timeout or socket error
-				return
-			}
-			if closed {
-				return
-			}
-		}
-	}, self.cancel)
-
-	readPackets := make(chan []byte, self.udpBufferSettings.SequenceBufferSize)
-	go HandleError(func() {
-		defer self.cancel()
-
-		defer func() {
-			// drain to the close so that ordered data and any final
-			// fin/rst reach the source on teardown. the socket read side
-			// always closes `readPackets` on exit, which is unblocked by
-			// the deferred socket close in `Run`
-			for packet := range readPackets {
-				receive(packet)
-			}
-		}()
-
-	read:
-		for {
-			select {
-			case <-self.ctx.Done():
-				return
-			case packet, ok := <-readPackets:
-				if !ok {
-					return
-				}
-				receive(packet)
-				// opportunistically drain queued packets to reduce wakeups
-				for {
-					select {
-					case packet, ok := <-readPackets:
-						if !ok {
-							return
-						}
-						receive(packet)
-					default:
-						continue read
-					}
-				}
-			}
-		}
-	}, self.cancel)
-
-	go HandleError(func() {
-		// close without cancel so that the receive pipeline drains all
-		// queued packets before the sequence cancels.
-		// the receive pipeline cancels after the drain.
-		defer close(readPackets)
 
 		buffer := make([]byte, self.udpBufferSettings.ReadBufferByteCount)
 
@@ -1521,10 +1905,13 @@ func (self *UdpSequence) Run() {
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
 					}
-					select {
-					case <-self.ctx.Done():
+					if self.receiveDispatcher == nil {
+						// Directly constructed sequences (primarily focused
+						// tests) retain synchronous ordered delivery.
+						self.singleDataPacket[0] = packet
+						self.receiveBatch(self.singleDataPacket[:])
+					} else if !self.receiveDispatcher.enqueue(self, packet) {
 						MessagePoolReturn(packet)
-					case readPackets <- packet:
 					}
 				}
 			}
@@ -1546,26 +1933,52 @@ func (self *UdpSequence) Run() {
 	}, self.cancel)
 
 	sendIter := uint64(0)
-	// returns false when the sequence must stop
-	handleSendItem := func(sendItem *UdpSendItem) bool {
-		payload := sendItem.udp.payload
-
-		if 0 < len(payload) {
-			writePayload := writePayload{
-				payload:  payload,
-				sendIter: sendIter,
-				ipPacket: sendItem.ipPacket,
-			}
+	// The sequence goroutine owns the outbound socket writes directly. The
+	// former write worker plus writePayloads channel duplicated both one
+	// goroutine and one SequenceBufferSize queue per UDP flow. sendItems is
+	// already the bounded producer/consumer queue, and net.Conn permits one
+	// concurrent reader plus one writer, so the extra stage added memory,
+	// scheduling, and a handoff without adding parallelism.
+	writeBatch := make([]*UdpSendItem, 0, self.udpBufferSettings.WriteBatchSize)
+	writeSendItems := func(first *UdpSendItem) bool {
+		writeBatch = append(writeBatch[:0], first)
+	drain:
+		for len(writeBatch) < cap(writeBatch) {
 			select {
-			case writePayloads <- writePayload:
-			case <-self.ctx.Done():
-				MessagePoolReturn(sendItem.ipPacket)
-				return false
+			case sendItem, ok := <-self.sendItems:
+				if !ok {
+					break drain
+				}
+				writeBatch = append(writeBatch, sendItem)
+			default:
+				break drain
 			}
-		} else {
-			MessagePoolReturn(sendItem.ipPacket)
 		}
-		return true
+
+		socket.SetWriteDeadline(time.Now().Add(self.udpBufferSettings.WriteTimeout))
+		var writeErr error
+		for _, sendItem := range writeBatch {
+			payload := sendItem.udp.payload
+			if writeErr == nil && 0 < len(payload) {
+				// Each payload is one datagram; writes cannot be coalesced, but
+				// the drained batch shares one deadline and one scheduler wake.
+				n, err := socket.Write(payload)
+				if err == nil {
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[f%d]udp forward %d\n", sendIter, n)
+					}
+				} else if self.log.V(1).Enabled() {
+					self.log.Infof("[f%d]udp forward %d error = %s", sendIter, n, err)
+				}
+				if 0 < n {
+					self.UpdateLastActivityTime()
+				}
+				writeErr = err
+			}
+			MessagePoolReturn(sendItem.ipPacket)
+			sendIter += 1
+		}
+		return writeErr == nil
 	}
 
 	// reusable idle timer: this send loop wakes per datagram, so a per-iteration
@@ -1574,7 +1987,6 @@ func (self *UdpSequence) Run() {
 	idleTimer := time.NewTimer(0)
 	defer idleTimer.Stop()
 
-send:
 	for {
 		checkpointId := self.idleCondition.Checkpoint()
 		idleTimer.Reset(self.udpBufferSettings.IdleTimeout)
@@ -1585,24 +1997,8 @@ send:
 			if !ok {
 				return
 			}
-			if !handleSendItem(sendItem) {
+			if !writeSendItems(sendItem) {
 				return
-			}
-			sendIter += 1
-			// opportunistically drain queued send items to reduce wakeups
-			for {
-				select {
-				case sendItem, ok := <-self.sendItems:
-					if !ok {
-						return
-					}
-					if !handleSendItem(sendItem) {
-						return
-					}
-					sendIter += 1
-				default:
-					continue send
-				}
 			}
 		case <-idleTimer.C:
 			done := false
@@ -1785,6 +2181,14 @@ type TcpBufferSettings struct {
 	// valve: orphan packets are attacker-influenceable). <= 0 is unlimited.
 	OrphanRstPerSecond int
 
+	// EnableSyntheticSpeed terminates TCP flows to the RFC 2544 benchmark
+	// range 198.18.0.0/15 at an in-memory synthetic speed server instead of
+	// dialing upstream (see ip_synthetic_speed.go). The range is never
+	// publicly routable, so no real destination is shadowed. Serves
+	// measurement of the tunnel path itself, isolated from origin and
+	// upstream network variability.
+	EnableSyntheticSpeed bool
+
 	ConnectSettings
 }
 
@@ -1849,10 +2253,11 @@ func (self *Tcp6Buffer) send(source TransferPath, provideMode protocol.ProvideMo
 }
 
 type TcpBuffer[BufferId comparable] struct {
-	log               Logger
-	ctx               context.Context
-	receiveCallback   ReceivePacketFunction
-	tcpBufferSettings *TcpBufferSettings
+	log                    Logger
+	ctx                    context.Context
+	receiveCallback        ReceivePacketFunction
+	receivePacketsCallback receivePacketsBatchFunction
+	tcpBufferSettings      *TcpBufferSettings
 
 	mutex sync.Mutex
 
@@ -1924,10 +2329,23 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				if 0 == len(sourceSequences) {
 					delete(self.sourceSequences, sequence.source)
 				}
-				MessagePoolReturn(ipPacket)
+				// Return false without consuming ipPacket; the LocalUserNat
+				// dispatcher owns and returns every packet a sequence does not
+				// accept.
 				return nil
 			}
-			return sequence
+			if !tcp.syn || sequence.ctx.Err() == nil && tcp.seq == sequence.initialSynSeq {
+				return sequence
+			}
+
+			// A source may reuse a four-tuple before the previous sequence's
+			// goroutine reaches deferred map cleanup. A fresh SYN sent to that
+			// old sequence is rejected by its established sequence-number
+			// check, leaving the replacement connection silent until timeout.
+			// Keep an exact live SYN retransmission on the current generation;
+			// a different initial sequence number, or a canceled generation,
+			// atomically replaces it.
+			self.removeSequenceWithLock(bufferId, sequence)
 		}
 
 		if !tcp.syn {
@@ -1947,10 +2365,10 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				orphanSourceIp = ipBacking[:sourceIpByteCount:sourceIpByteCount]
 				orphanDestinationIp = ipBacking[sourceIpByteCount:]
 			}
-			MessagePoolReturn(ipPacket)
 			if self.log.V(2).Enabled() {
 				self.log.Infof("[lnr]tcp drop no syn (%s)\n", tcp.flagsString())
 			}
+			// As above, false means ownership stays with the dispatcher.
 			return nil
 		}
 
@@ -2024,8 +2442,10 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			tcp.sourcePort,
 			destinationIpCopy,
 			tcp.destinationPort,
+			tcp.seq,
 			self.tcpBufferSettings,
 		)
+		sequence.receivePacketsCallback = self.receivePacketsCallback
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -2167,19 +2587,59 @@ is not implemented.
 This is a safe assumption when moving packets from local raw socket
 to the UNAT via `transfer`, which is lossless and in-order.
 */
+// writeWithProgressDeadline writes to an upstream socket, bounding
+// ZERO-PROGRESS time rather than total time: the deadline re-arms whenever a
+// write advances, so a peer applying ordinary flow control (accepting data
+// steadily but slowly) is not failed, while a peer that accepts nothing for a
+// full timeout still is.
+//
+// A single deadline for the whole batch killed alive flows under sustained
+// bulk transfer: the return path's acks stall behind saturated tunnel queues
+// long enough that the upstream socket drains slower than one batch, and the
+// partial write at the deadline tore the sequence down (observed as mid-stream
+// resets in the full-stack tcp test).
+func writeWithProgressDeadline(
+	socket net.Conn,
+	buffers net.Buffers,
+	timeout time.Duration,
+) (int64, error) {
+	n := int64(0)
+	for {
+		socket.SetWriteDeadline(time.Now().Add(timeout))
+		wn, err := buffers.WriteTo(socket)
+		n += wn
+		if err == nil {
+			return n, nil
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() && 0 < wn {
+			// progress inside this deadline window: the peer is alive and
+			// draining, so give the remainder a fresh window
+			continue
+		}
+		return n, err
+	}
+}
+
 type TcpSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
 
-	receiveCallback ReceivePacketFunction
+	receiveCallback        ReceivePacketFunction
+	receivePacketsCallback receivePacketsBatchFunction
 
 	tcpBufferSettings *TcpBufferSettings
 
 	sendMutex sync.Mutex
 	sendItems chan *TcpSendItem
+	// Lazily allocated only when the bounded send queue actually blocks.
+	// sendMutex serializes Reset/Stop.
+	sendTimer *time.Timer
 
 	idleCondition *IdleCondition
+	// immutable generation identity used to distinguish a retransmitted SYN
+	// from four-tuple reuse while the previous flow is still being reaped
+	initialSynSeq uint32
 
 	ConnectionState
 }
@@ -2190,6 +2650,7 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 	ipVersion int,
 	sourceIp net.IP, sourcePort uint16,
 	destinationIp net.IP, destinationPort uint16,
+	initialSynSeq uint32,
 	tcpBufferSettings *TcpBufferSettings) *TcpSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
@@ -2201,6 +2662,7 @@ func NewTcpSequence(ctx context.Context, receiveCallback ReceivePacketFunction,
 		tcpBufferSettings: tcpBufferSettings,
 		sendItems:         make(chan *TcpSendItem, tcpBufferSettings.SequenceBufferSize),
 		idleCondition:     NewIdleCondition(),
+		initialSynSeq:     initialSynSeq,
 		ConnectionState: ConnectionState{
 			source:          source,
 			provideMode:     provideMode,
@@ -2277,14 +2739,70 @@ func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (boo
 			return false, nil
 		}
 	} else {
+		timeoutChan := resetOrCreateTimer(&self.sendTimer, timeout)
 		select {
 		case <-self.ctx.Done():
+			self.sendTimer.Stop()
 			return false, errors.New("Done.")
 		case self.sendItems <- sendItem:
+			self.sendTimer.Stop()
 			return true, nil
-		case <-time.After(timeout):
+		case <-timeoutChan:
 			return false, nil
 		}
+	}
+}
+
+// initializeSynWithLock establishes sequence and window state from the first
+// SYN. The sequence mutex must be held.
+func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
+	// SYN and FIN consume one sequence number.
+	self.sendSeq = tcp.seq + 1
+	// The synthetic return sequence may start at the sender's sequence because
+	// there is no transport-security boundary between the two sides.
+	self.receiveSeq = tcp.seq
+	self.receiveSeqAck = tcp.seq
+
+	parseWindowScaleOpts := func() (bool, uint32) {
+		options := tcp.options
+		for optionIndex := 0; optionIndex < len(options); {
+			switch options[optionIndex] {
+			case 0:
+				return false, 0
+			case 1:
+				optionIndex += 1
+			default:
+				if len(options) < optionIndex+2 {
+					return false, 0
+				}
+				optionByteCount := int(options[optionIndex+1])
+				if optionByteCount < 2 || len(options) < optionIndex+optionByteCount {
+					return false, 0
+				}
+				if options[optionIndex] == 3 && optionByteCount == 3 {
+					return true, min(uint32(options[optionIndex+2]), 14)
+				}
+				optionIndex += optionByteCount
+			}
+		}
+		return false, 0
+	}
+
+	self.enableWindowScale, self.receiveWindowScale = parseWindowScaleOpts()
+	// RFC 7323 applies the negotiated scale only after the handshake. The
+	// Window field in a SYN is always the literal, unscaled value.
+	self.receiveWindowSize = uint32(tcp.windowSize)
+	self.receiveWindowEnd = self.receiveSeqAck + self.receiveWindowSize
+	self.receiveWindowEndSet = true
+	if self.enableWindowScale {
+		bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
+		if 0 <= bits {
+			self.windowScale = uint32(math.Ceil(bits))
+		} else {
+			self.windowScale = 0
+		}
+	} else {
+		self.windowScale = 0
 	}
 }
 
@@ -2314,11 +2832,34 @@ func (self *TcpSequence) Run() {
 		}()
 	}()
 
+	// One timer serves the initial SYN wait and the steady-state idle wait.
+	// The send loop wakes per segment, so time.After here previously allocated
+	// a timer per packet even when the send channel was immediately ready.
+	idleTimer := time.NewTimer(0)
+	defer idleTimer.Stop()
+
 	// note receive is called from multiple goroutines
 	// tcp packets with ack may be reordered due to being written in parallel
 	receive := func(packet []byte) {
 		self.receiveCallback(self.source, self.provideMode, self.IpPath(), packet)
 		MessagePoolReturn(packet)
+	}
+	// receiveBatch: coalesce a drained batch into one return-path wire Pack
+	// when a batch consumer is registered, else deliver per packet. The
+	// read-loop owns the buffers; the consumer shares read-only what it
+	// retains, so we free our owning ref for each (same ownership as
+	// `receive`).
+	receiveBatch := func(packets [][]byte) {
+		if self.receivePacketsCallback != nil &&
+			self.receivePacketsCallback(self.source, self.provideMode, self.IpPath(), packets) {
+			for _, packet := range packets {
+				MessagePoolReturn(packet)
+			}
+			return
+		}
+		for _, packet := range packets {
+			receive(packet)
+		}
 	}
 
 	// f, _ := tcpConn.File()
@@ -2329,10 +2870,13 @@ func (self *TcpSequence) Run() {
 	var packetErr error
 	for syn := false; !syn; {
 		checkpointId := self.idleCondition.Checkpoint()
+		idleTimer.Reset(self.tcpBufferSettings.ConnectTimeout)
 		select {
 		case <-self.ctx.Done():
+			idleTimer.Stop()
 			return
 		case sendItem := <-self.sendItems:
+			idleTimer.Stop()
 			if self.log.V(2).Enabled() {
 				self.log.Infof("[init]send(%d)\n", len(sendItem.tcp.payload))
 			}
@@ -2344,57 +2888,7 @@ func (self *TcpSequence) Run() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
 
-					// sendSeq is the next expected sequence number
-					// SYN and FIN consume one
-					self.sendSeq = sendItem.tcp.seq + 1
-					// start the send seq at send seq
-					// this is arbitrary, and since there is no transport security risk back to sender is fine
-					self.receiveSeq = sendItem.tcp.seq
-					self.receiveSeqAck = sendItem.tcp.seq
-
-					parseWindowScaleOpts := func() (bool, uint32) {
-						options := sendItem.tcp.options
-						for i := 0; i < len(options); {
-							switch options[i] {
-							case 0:
-								// end of options
-								return false, 0
-							case 1:
-								// nop
-								i += 1
-							default:
-								if len(options) < i+2 {
-									return false, 0
-								}
-								optionByteCount := int(options[i+1])
-								if optionByteCount < 2 || len(options) < i+optionByteCount {
-									return false, 0
-								}
-								if options[i] == 3 && optionByteCount == 3 {
-									// window scale
-									// see 2.3  Using the Window Scale Option
-									return true, min(uint32(options[i+2]), 14)
-								}
-								i += optionByteCount
-							}
-						}
-						return false, 0
-					}
-
-					self.enableWindowScale, self.receiveWindowScale = parseWindowScaleOpts()
-					self.receiveWindowSize = uint32(sendItem.tcp.windowSize) << self.receiveWindowScale
-					if self.enableWindowScale {
-						// compute the window scale to fit the window size in uint16
-						bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
-						if 0 <= bits {
-							self.windowScale = uint32(math.Ceil(bits))
-						} else {
-							self.windowScale = 0
-						}
-					} else {
-						// turn off window scale for send
-						self.windowScale = 0
-					}
+					self.initializeSynWithLock(&sendItem.tcp)
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[init]window=%d/%d, receive=%d/%d\n", self.windowSize, self.windowScale, self.receiveWindowSize, self.receiveWindowScale)
 					}
@@ -2411,7 +2905,7 @@ func (self *TcpSequence) Run() {
 				}
 			}
 			MessagePoolReturn(sendItem.ipPacket)
-		case <-time.After(self.tcpBufferSettings.ConnectTimeout):
+		case <-idleTimer.C:
 			if self.idleCondition.Close(checkpointId) {
 				// close the sequence
 				self.log.V(2).Infof("[init]connect timeout\n")
@@ -2427,14 +2921,56 @@ func (self *TcpSequence) Run() {
 
 	// connect to upstream before sending the syn+ack
 	self.log.V(2).Infof("[init]tcp connect\n")
-	socket, err := self.tcpBufferSettings.DialContext(
-		self.ctx,
-		"tcp",
-		self.IpPath().DestinationHostPort(),
-	)
+	var socket net.Conn
+	var err error
+	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
+		// benchmark-range destination: terminate at the in-memory synthetic
+		// speed server (see ip_synthetic_speed.go)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+		}
+		socket = newSyntheticSpeedConn()
+	} else {
+		socket, err = self.tcpBufferSettings.DialContext(
+			self.ctx,
+			"tcp",
+			self.IpPath().DestinationHostPort(),
+		)
+	}
 	if err != nil {
+		// The source has not seen our synthetic syn-ack yet. Abandoning the
+		// sequence silently makes it retransmit the syn on an exponential
+		// schedule (17/33/65 seconds in Chromium under repeated provider dial
+		// failure). Release the unsent syn-ack and reject the flow so the
+		// source can fail or retry immediately. A parent cancellation is
+		// teardown, not an upstream refusal, and must not generate new output.
+		MessagePoolReturn(packet)
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]tcp connect error = %s\n", err)
+		}
+		// answer the source instead of going silent: a refused destination gets
+		// an honest RST+ACK, everything else a capacity-class unreachable. both
+		// ride the same receive callback the SynAck uses (from-destination
+		// orientation); then return as before -- no socket exists. the ctx
+		// guard implements the comment above: classifyDialFailure cannot tell
+		// a canceled parent from a capacity failure, and teardown must not
+		// generate new output.
+		if self.ctx.Err() == nil {
+			switch action, signal := classifyDialFailure(self.IpPath(), err); action {
+			case dialFailureRst:
+				var rstPacket []byte
+				var rstErr error
+				func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+					rstPacket, rstErr = self.RstAck()
+				}()
+				if rstErr == nil {
+					receive(rstPacket)
+				}
+			case dialFailureUnreachable:
+				receive(MessagePoolCopy(signal))
+			}
 		}
 		return
 	}
@@ -2489,9 +3025,10 @@ func (self *TcpSequence) Run() {
 	// pipelines
 
 	type writePayload struct {
-		sendIter uint64
-		payload  []byte
-		ipPacket []byte
+		sendIter         uint64
+		ipPacket         []byte
+		payloadOffset    uint16
+		payloadByteCount uint16
 	}
 
 	writePayloads := make(chan writePayload, self.tcpBufferSettings.SequenceBufferSize)
@@ -2545,16 +3082,21 @@ func (self *TcpSequence) Run() {
 			bufferStorage = bufferStorage[:0]
 			byteCount := 0
 			for _, writePayload := range batch {
-				bufferStorage = append(bufferStorage, writePayload.payload)
-				byteCount += len(writePayload.payload)
+				payloadStart := int(writePayload.payloadOffset)
+				payloadEnd := payloadStart + int(writePayload.payloadByteCount)
+				payload := writePayload.ipPacket[payloadStart:payloadEnd]
+				bufferStorage = append(bufferStorage, payload)
+				byteCount += len(payload)
 			}
 			// `net.Buffers` uses a single vectored write when the socket supports it.
 			// `WriteTo` retries partial writes until fully written, a timeout, or an error.
 			buffers := net.Buffers(bufferStorage)
 
-			writeEndTime := time.Now().Add(self.tcpBufferSettings.WriteTimeout)
-			socket.SetWriteDeadline(writeEndTime)
-			n, err := buffers.WriteTo(socket)
+			n, err := writeWithProgressDeadline(
+				socket,
+				buffers,
+				self.tcpBufferSettings.WriteTimeout,
+			)
 
 			if err == nil {
 				if self.log.V(2).Enabled() {
@@ -2581,7 +3123,16 @@ func (self *TcpSequence) Run() {
 		}
 	}, self.cancel)
 
-	readPackets := make(chan []byte, self.tcpBufferSettings.SequenceBufferSize)
+	// Keep at most one callback batch of read-ahead per flow. The former
+	// SequenceBufferSize queue reserved a full send window again even though
+	// the socket reader already enforces that window. One batch preserves the
+	// measured socket-read/delivery overlap while a stalled callback still
+	// applies bounded backpressure to its own flow.
+	readQueueSize := min(
+		self.tcpBufferSettings.SequenceBufferSize,
+		max(1, self.tcpBufferSettings.WriteBatchSize),
+	)
+	readPackets := make(chan []byte, readQueueSize)
 	go HandleError(func() {
 		defer self.cancel()
 
@@ -2595,6 +3146,10 @@ func (self *TcpSequence) Run() {
 			}
 		}()
 
+		// reused across drains; receiveBatch consumes it before the next
+		// drain reuses it
+		batch := make([][]byte, 0, self.tcpBufferSettings.WriteBatchSize)
+
 	read:
 		for {
 			select {
@@ -2604,19 +3159,23 @@ func (self *TcpSequence) Run() {
 				if !ok {
 					return
 				}
-				receive(packet)
-				// opportunistically drain queued packets to reduce wakeups
-				for {
+				batch = append(batch[:0], packet)
+				// opportunistically drain queued packets into one batch to
+				// reduce wakeups and coalesce the return-path wire Pack
+				for len(batch) < cap(batch) {
 					select {
 					case packet, ok := <-readPackets:
 						if !ok {
+							receiveBatch(batch)
 							return
 						}
-						receive(packet)
+						batch = append(batch, packet)
 					default:
+						receiveBatch(batch)
 						continue read
 					}
 				}
+				receiveBatch(batch)
 			}
 		}
 	}, self.cancel)
@@ -2881,23 +3440,10 @@ func (self *TcpSequence) Run() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 
-			// signed-delta comparisons are wraparound-tolerant across the
-			// 4 GB uint32 boundary. since the transfer from local to remote
-			// is lossless and preserves order, any seq other than the
-			// exact expected sendSeq must be a retransmit.
-			if int32(sendItem.tcp.seq-self.sendSeq) != 0 || sendItem.tcp.syn {
-				// a retransmit; ignore
-				drop = true
-			} else if sendItem.tcp.ack {
-				// acks are reliably delivered (see above).
-				// note the window size can be adjusted at any time for the same
-				// receive seq number, e.g. ->0 then ->full on receiver full.
-				// use signed delta so wrapped ack numbers compare correctly.
-				if 0 <= int32(sendItem.tcp.ackNumber-self.receiveSeqAck) {
-					self.receiveWindowSize = uint32(sendItem.tcp.windowSize) << self.receiveWindowScale
-					self.receiveSeqAck = sendItem.tcp.ackNumber
-					receiveAckCond.Broadcast()
-				}
+			var receiveAckUpdated bool
+			drop, receiveAckUpdated = self.applySendItemWithLock(&sendItem.tcp)
+			if receiveAckUpdated {
+				receiveAckCond.Broadcast()
 			}
 		}()
 
@@ -2922,10 +3468,15 @@ func (self *TcpSequence) Run() {
 		payload := sendItem.tcp.payload
 		if 0 < len(payload) {
 			// seq += uint32(len(payload))
+			ipHeaderByteCount := Ipv6HeaderSize
+			if sendItem.ipPacket[0]>>4 == 4 {
+				ipHeaderByteCount = int(sendItem.ipPacket[0]&0xf) * 4
+			}
 			writePayload := writePayload{
-				payload:  payload,
-				sendIter: sendIter,
-				ipPacket: sendItem.ipPacket,
+				sendIter:         sendIter,
+				ipPacket:         sendItem.ipPacket,
+				payloadOffset:    uint16(ipHeaderByteCount + TcpHeaderSizeWithoutExtensions + len(sendItem.tcp.options)),
+				payloadByteCount: uint16(len(payload)),
 			}
 			// FIXME count the number of non-blocking versus blocking channel adds
 			// FIXME every window size, check the count:
@@ -3008,10 +3559,13 @@ func (self *TcpSequence) Run() {
 send:
 	for {
 		checkpointId := self.idleCondition.Checkpoint()
+		idleTimer.Reset(self.tcpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
+			idleTimer.Stop()
 			return
 		case sendItem := <-self.sendItems:
+			idleTimer.Stop()
 			if !handleSendItem(sendItem) {
 				if !fin {
 					return
@@ -3034,7 +3588,7 @@ send:
 					continue send
 				}
 			}
-		case <-time.After(self.tcpBufferSettings.IdleTimeout):
+		case <-idleTimer.C:
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -3059,6 +3613,58 @@ send:
 	select {
 	case <-self.ctx.Done():
 	}
+}
+
+// applySendItemWithLock updates the return-path acknowledgment/window and
+// reports whether an established packet's sequence-bearing portion is in
+// order. The caller holds mutex.
+func (self *TcpSequence) applySendItemWithLock(tcp *parsedTcp) (drop bool, receiveAckUpdated bool) {
+	if tcp.ack &&
+		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
+		0 <= int32(self.receiveSeq-tcp.ackNumber) {
+		// ACK generation and upload packetization may run concurrently in the
+		// source TCP stack. A pure ACK can therefore arrive with a sequence
+		// just ahead of or behind upload payload already delivered here. Its
+		// ACK field is independent and must still reopen the return window.
+		// Bound it by receiveSeq so a corrupt/future ACK cannot acknowledge
+		// bytes this sequence has not emitted.
+		if !self.receiveWindowEndSet {
+			self.receiveWindowEnd = self.receiveSeqAck + self.receiveWindowSize
+			self.receiveWindowEndSet = true
+		}
+
+		// A TCP receiver never shrinks the right edge it has already
+		// advertised. ACK generation and application reads can produce
+		// duplicate window updates concurrently, so their callback order is
+		// not a reliable chronology. Preserve the greatest advertised edge:
+		// this accepts zero-window closure (the ACK advances to the existing
+		// edge), accepts a later reopen (the edge grows), and ignores a stale
+		// smaller-window duplicate that arrives after the reopen.
+		receiveWindowEnd := tcp.ackNumber + (uint32(tcp.windowSize) << self.receiveWindowScale)
+		if 0 < int32(receiveWindowEnd-self.receiveWindowEnd) {
+			self.receiveWindowEnd = receiveWindowEnd
+		}
+
+		receiveSeqAck := tcp.ackNumber
+		receiveWindowSize := uint32(0)
+		if 0 < int32(self.receiveWindowEnd-receiveSeqAck) {
+			receiveWindowSize = self.receiveWindowEnd - receiveSeqAck
+		}
+		if self.receiveSeqAck != receiveSeqAck || self.receiveWindowSize != receiveWindowSize {
+			self.receiveSeqAck = receiveSeqAck
+			self.receiveWindowSize = receiveWindowSize
+			receiveAckUpdated = true
+		}
+	}
+
+	// Pure ACKs consume no sequence space and tolerate the full-duplex
+	// scheduling described above. Payload, FIN, and an unexpected established
+	// SYN remain strictly in order because the user-NAT does not reorder or
+	// retransmit that direction.
+	if tcp.syn || (0 < len(tcp.payload) || tcp.fin) && int32(tcp.seq-self.sendSeq) != 0 {
+		drop = true
+	}
+	return
 }
 
 func (self *TcpSequence) Cancel() {
@@ -3086,14 +3692,16 @@ type ConnectionState struct {
 
 	mutex sync.Mutex
 
-	sendSeq            uint32
-	receiveSeq         uint32
-	receiveSeqAck      uint32
-	receiveWindowSize  uint32
-	receiveWindowScale uint32
-	enableWindowScale  bool
-	windowSize         uint32
-	windowScale        uint32
+	sendSeq             uint32
+	receiveSeq          uint32
+	receiveSeqAck       uint32
+	receiveWindowSize   uint32
+	receiveWindowEnd    uint32
+	receiveWindowEndSet bool
+	receiveWindowScale  uint32
+	enableWindowScale   bool
+	windowSize          uint32
+	windowScale         uint32
 	// encodedWindowSize  uint16
 
 	// cached immutable ip path for this connection (see IpPath). primed at
@@ -3270,14 +3878,28 @@ func (self *ConnectionState) tcpPacket(flags byte, seq uint32, payload []byte) [
 }
 
 func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
+	return DefaultRemoteUserNatProviderSettingsWithMemoryTarget(0)
+}
+
+// DefaultRemoteUserNatProviderSettingsWithMemoryTarget sizes the provider
+// wrapper from the owner's provider memory target. 0 keeps the legacy
+// process-budget-scaled bounds.
+func DefaultRemoteUserNatProviderSettingsWithMemoryTarget(targetByteCount ByteCount) *RemoteUserNatProviderSettings {
+	// bounds the per-source return provide mode map (see
+	// `recordSourceProvideMode`): derived from the provider memory target
+	// when set (~1 KiB of target per tracked source), else scaled by the
+	// process memory budget
+	maxSourceCount := MemoryScaledCount(8192, 1024)
+	if 0 < targetByteCount {
+		maxSourceCount = max(1024, int(targetByteCount/kib(1)))
+	}
 	return &RemoteUserNatProviderSettings{
 		WriteTimeout:            30 * time.Second,
 		ProtocolVersion:         DefaultProtocolVersion,
 		SecurityPolicyGenerator: DefaultProviderSecurityPolicyWithStats,
 		EventEpoch:              1 * time.Second,
-		// scaled by the memory budget: bounds the per-source return provide
-		// mode map (see `recordSourceProvideMode`)
-		MaxSourceCount: MemoryScaledCount(8192, 1024),
+		MaxSourceCount:          maxSourceCount,
+		IngressDispatchTimeout:  5 * time.Millisecond,
 	}
 }
 
@@ -3294,6 +3916,17 @@ type RemoteUserNatProviderSettings struct {
 	// the maximum number of sources tracked for return provide modes.
 	// 0 is no limit.
 	MaxSourceCount int
+
+	// IngressDispatchTimeout bounds how long ClientReceive waits for a full
+	// nat dispatch channel before dropping a pack's packets. Bounded
+	// backpressure (not drop-on-full): a burst that instantaneously fills
+	// the dispatch would otherwise discard whole packs, corrupting per-flow
+	// tcp state (the nat implements no retransmit toward the socket) and
+	// stalling flows to their deadlines — measured as a run-collapse under
+	// burst. The wait runs on the per-source receive sequence goroutine, so
+	// one source's burst delays only its own receive processing. 0 restores
+	// drop-on-full.
+	IngressDispatchTimeout time.Duration
 }
 
 type RemoteUserNatProvider struct {
@@ -3318,6 +3951,10 @@ type RemoteUserNatProvider struct {
 	// which skips the public security rules and forgoes the companion contract.
 	stateLock         sync.Mutex
 	sourceProvideMode map[Id]protocol.ProvideMode
+	// sourceP2pPriorityRefresh rate-limits Network-peer admission promotion
+	// on the provider packet path. Entries are bounded with
+	// sourceProvideMode and removed on the same arbitrary safe eviction.
+	sourceP2pPriorityRefresh map[Id]time.Time
 	// the packet stats epoch worker started (on the first callback)
 	packetStatsStarted bool
 }
@@ -3338,18 +3975,29 @@ func NewRemoteUserNatProvider(
 	// the client ctx) so Close stops it, rather than leaking it for the life of the client
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
 	userNatProvider := &RemoteUserNatProvider{
-		ctx:                  cancelCtx,
-		client:               client,
-		cancel:               cancel,
-		localUserNat:         localUserNat,
-		securityPolicy:       settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
-		settings:             settings,
-		packetStatsCounters:  &packetStatsCounters{},
-		packetStatsCallbacks: NewCallbackList[PacketStatsFunction](),
-		sourceProvideMode:    map[Id]protocol.ProvideMode{},
+		ctx:                      cancelCtx,
+		client:                   client,
+		cancel:                   cancel,
+		localUserNat:             localUserNat,
+		securityPolicy:           settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
+		settings:                 settings,
+		packetStatsCounters:      &packetStatsCounters{},
+		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),
+		sourceProvideMode:        map[Id]protocol.ProvideMode{},
+		sourceP2pPriorityRefresh: map[Id]time.Time{},
 	}
 
-	localUserNatUnsub := localUserNat.AddReceivePacketCallback(userNatProvider.Receive)
+	// Register both return paths. No-contract peers can take the NAT's drained
+	// batch directly; contract-bearing peers are fanned back to Receive so the
+	// transfer sequence can leave contract heads unbatched and only coalesce
+	// already-queued frames when the current contract has room. Synthesized
+	// control packets always arrive through the per-packet callback.
+	localUserNatBatchUnsub := localUserNat.AddReceivePacketsCallback(userNatProvider.ReceiveBatch)
+	localUserNatPacketUnsub := localUserNat.AddReceivePacketCallback(userNatProvider.Receive)
+	localUserNatUnsub := func() {
+		localUserNatBatchUnsub()
+		localUserNatPacketUnsub()
+	}
 	userNatProvider.localUserNatUnsub = localUserNatUnsub
 	clientUnsub := client.AddReceiveCallback(userNatProvider.ClientReceive)
 	userNatProvider.clientUnsub = clientUnsub
@@ -3428,6 +4076,7 @@ func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideM
 		if maxCount := self.settings.MaxSourceCount; 0 < maxCount && maxCount <= len(self.sourceProvideMode) {
 			for evictSourceId := range self.sourceProvideMode {
 				delete(self.sourceProvideMode, evictSourceId)
+				delete(self.sourceP2pPriorityRefresh, evictSourceId)
 				break
 			}
 		}
@@ -3438,6 +4087,41 @@ func (self *RemoteUserNatProvider) recordSourceProvideMode(sourceId Id, provideM
 		self.sourceProvideMode[sourceId] = protocol.ProvideMode_Network
 	default:
 		self.sourceProvideMode[sourceId] = provideMode
+	}
+}
+
+const providerP2pPriorityRefreshInterval = 5 * time.Second
+
+// refreshP2pPriority promotes an explicitly selected same-network source out
+// of the provider's bounded public-peer admission lottery. The provider sees
+// the relationship on relayed data before P2P is established, so it can
+// reclaim one existing reservation without requiring new StreamOpen protocol
+// fields or increasing the fixed memory ceiling.
+func (self *RemoteUserNatProvider) refreshP2pPriority(sourceId Id, provideMode protocol.ProvideMode) {
+	if provideMode != protocol.ProvideMode_Network || sourceId == (Id{}) {
+		return
+	}
+	now := time.Now()
+	shouldRefresh := false
+	self.stateLock.Lock()
+	if self.sourceP2pPriorityRefresh == nil {
+		self.sourceP2pPriorityRefresh = map[Id]time.Time{}
+	}
+	if _, ok := self.sourceP2pPriorityRefresh[sourceId]; !ok {
+		if maxCount := self.settings.MaxSourceCount; 0 < maxCount && maxCount <= len(self.sourceP2pPriorityRefresh) {
+			for evictSourceId := range self.sourceP2pPriorityRefresh {
+				delete(self.sourceP2pPriorityRefresh, evictSourceId)
+				break
+			}
+		}
+	}
+	if next := self.sourceP2pPriorityRefresh[sourceId]; !now.Before(next) {
+		self.sourceP2pPriorityRefresh[sourceId] = now.Add(providerP2pPriorityRefreshInterval)
+		shouldRefresh = true
+	}
+	self.stateLock.Unlock()
+	if shouldRefresh {
+		self.client.webRtcManager.PrioritizePeer(sourceId)
 	}
 }
 
@@ -3454,7 +4138,163 @@ func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback
 	return fallback
 }
 
+// providerReturnTransferOption keeps every provider-to-client frame on the
+// same sender sequence as the rest of that relationship. Network-peer data
+// and active WebRTC signaling use ForceStream. ForceStream is part of the
+// sender's sequence key but is not carried on the wire, so returning Network
+// traffic with the default option would fork a second live sequence that the
+// receiver cannot distinguish from the first. Whichever sequence id arrived
+// second would supersede the other and could leave its acknowledged traffic
+// permanently dropped as "older". Non-Network returns continue to ride the
+// companion contract that the remote source grants.
+func providerReturnTransferOptions(
+	defaultOptions TransferOptions,
+	provideMode protocol.ProvideMode,
+) TransferOptions {
+	if provideMode == protocol.ProvideMode_Network {
+		defaultOptions.CompanionContract = false
+		defaultOptions.ForceStream = true
+		defaultOptions.NetworkPeer = true
+	} else {
+		defaultOptions.CompanionContract = true
+		defaultOptions.ForceStream = false
+		defaultOptions.NetworkPeer = false
+	}
+	return defaultOptions
+}
+
 // `ReceivePacketFunction`
+// providerReturnBatchMaxFrames / providerReturnBatchMaxBytes bound one
+// coalesced return Pack so the complete transfer frame stays below the
+// platform and resident transport's 4 KiB message limit. Two mtu packets
+// plus the Pack/TransferFrame envelope fit; three do not.
+const providerReturnBatchMaxFrames = sendPackBatchMaxFrames
+const providerReturnBatchMaxBytes = sendPackBatchMaxMessageByteCount
+
+// `ReceivePacketsFunction`
+// ReceiveBatch coalesces a flow's drained packet batch into one wire Pack
+// (chunked to the frame/byte bounds), collapsing the per-packet
+// route/transport handoffs to one per chunk. All packets share the flow's
+// source/ipPath, so the egress policy is evaluated once. Ownership mirrors
+// the per-packet Receive: each packet is shared read-only into a frame; the
+// share/marshal buffers are freed on the same raw/wrapped rules.
+func (self *RemoteUserNatProvider) ReceiveBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	if len(packets) == 0 {
+		return
+	}
+	if self.client.ClientId() == source.SourceId {
+		if self.client.log.V(2).Enabled() {
+			self.client.log.Infof("drop remote user nat provider s packet ->%s\n", source.SourceId)
+		}
+		return
+	}
+	// A contract frame is attached to a sequence head and at contract
+	// boundaries. This layer cannot see that overhead, so only pre-batch when
+	// the peer is explicitly no-contract. Contract-bearing traffic returns to
+	// the per-packet path; SendSequence performs envelope-safe coalescing once
+	// a contract is established and an earlier item is still outstanding.
+	if !self.client.ContractManager().SendNoContract(source.SourceId) {
+		for _, packet := range packets {
+			self.Receive(source, provideMode, ipPath, packet)
+		}
+		return
+	}
+	// flow-level egress policy (ipPath is constant across the batch)
+	r, err := self.securityPolicy.InspectEgress(provideMode, ipPath, nil)
+	if err != nil {
+		return
+	}
+	self.securityPolicy.RefreshEgress(ipPath)
+	if r != SecurityPolicyResultAllow {
+		var blockedBytes int64
+		for _, packet := range packets {
+			blockedBytes += int64(len(packet))
+		}
+		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(packets)))
+		self.packetStatsCounters.blockEgressByteCount.Add(blockedBytes)
+		return
+	}
+
+	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+	returnOption := providerReturnTransferOptions(
+		self.client.settings.DefaultTransferOpts,
+		returnProvideMode,
+	)
+	destination := source.Reverse()
+
+	// build frames, flushing a chunk when the frame/byte bound is hit
+	frames := make([]*protocol.Frame, 0, providerReturnBatchMaxFrames)
+	wrappedShares := make([][]byte, 0, providerReturnBatchMaxFrames)
+	var chunkBytes int64
+	var chunkPacketBytes int64
+
+	flush := func() {
+		if len(frames) == 0 {
+			return
+		}
+		packetBytes := chunkPacketBytes
+		frameCount := len(frames)
+		// the pack references the slice asynchronously until the send
+		// sequence marshals it — hand it ownership and start a fresh slice
+		// for the next chunk (never reuse the backing array)
+		sendFrames := frames
+		frames = make([]*protocol.Frame, 0, providerReturnBatchMaxFrames)
+		sent := self.client.SendMultiWithTimeout(
+			sendFrames,
+			destination,
+			func(err error) {},
+			self.settings.WriteTimeout,
+			returnOption,
+		)
+		if sent {
+			self.packetStatsCounters.remoteEgressPacketCount.Add(int64(frameCount))
+			self.packetStatsCounters.remoteEgressByteCount.Add(packetBytes)
+		} else {
+			// the send did not take the frames: free their message bytes
+			// (raw shares or wrapped marshal buffers)
+			for _, frame := range sendFrames {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		// wrapped frames carry a separate share buffer, freed unconditionally
+		// (mirrors the per-packet `!Raw` defer); not referenced by the pack,
+		// so the local slice can be reused
+		for _, share := range wrappedShares {
+			MessagePoolReturn(share)
+		}
+		wrappedShares = wrappedShares[:0]
+		chunkBytes = 0
+		chunkPacketBytes = 0
+	}
+
+	for _, packet := range packets {
+		packetShare := MessagePoolShareReadOnly(packet)
+		frame, err := ipPacketFromProviderFrame(packetShare, self.settings.ProtocolVersion)
+		if err != nil {
+			MessagePoolReturn(packetShare)
+			if self.client.log.V(2).Enabled() {
+				self.client.log.Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
+			}
+			panic(err)
+		}
+		if !frame.Raw {
+			wrappedShares = append(wrappedShares, packetShare)
+		}
+		frames = append(frames, frame)
+		chunkBytes += int64(len(frame.MessageBytes))
+		chunkPacketBytes += int64(len(packet))
+		if providerReturnBatchMaxFrames <= len(frames) || providerReturnBatchMaxBytes <= chunkBytes {
+			flush()
+		}
+	}
+	flush()
+}
+
 func (self *RemoteUserNatProvider) Receive(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -3485,21 +4325,7 @@ func (self *RemoteUserNatProvider) Receive(
 		return
 	}
 
-	ipPacketFromProvider := &protocol.IpPacketFromProvider{
-		IpPacket: &protocol.IpPacket{
-			PacketBytes: MessagePoolShareReadOnly(packet),
-		},
-	}
-	frame, err := ToFrame(ipPacketFromProvider, self.settings.ProtocolVersion)
-	if err != nil {
-		if self.client.log.V(2).Enabled() {
-			self.client.log.Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
-		}
-		panic(err)
-	}
-	if !frame.Raw {
-		defer MessagePoolReturn(ipPacketFromProvider.IpPacket.PacketBytes)
-	}
+	packetShare := MessagePoolShareReadOnly(packet)
 
 	// echo the recorded return provide mode for the source. A same-network source
 	// sends under ProvideMode_Network; its return traffic is also network mode,
@@ -3507,27 +4333,53 @@ func (self *RemoteUserNatProvider) Receive(
 	// receives it as network mode and skips the public ingress rules. Other
 	// modes ride a companion contract (verified as Stream) as before.
 	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
-	opts := []any{}
-	if returnProvideMode != protocol.ProvideMode_Network {
-		opts = append(opts, CompanionContract())
-	}
+	returnOption := providerReturnTransferOptions(
+		self.client.settings.DefaultTransferOpts,
+		returnProvideMode,
+	)
 	// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
 	c := func() bool {
-		// ack := make(chan error)
-		sent := self.client.SendWithTimeout(
-			frame,
-			source.Reverse(),
-			func(err error) {},
-			self.settings.WriteTimeout,
-			opts...,
-		)
+		var sent bool
+		if 2 <= self.settings.ProtocolVersion {
+			sent, _ = self.client.sendRawWithTimeoutDetailed(
+				protocol.MessageType_IpIpPacketFromProvider,
+				packetShare,
+				source.Reverse(),
+				nil,
+				0,
+				self.settings.WriteTimeout,
+				returnOption,
+			)
+		} else {
+			frame, err := ipPacketFromProviderFrame(packetShare, self.settings.ProtocolVersion)
+			if err != nil {
+				MessagePoolReturn(packetShare)
+				if self.client.log.V(2).Enabled() {
+					self.client.log.Infof("drop remote user nat provider s packet ->%s = %s\n", source.SourceId, err)
+				}
+				panic(err)
+			}
+			// Legacy marshal bytes are owned by the send. The packet share is
+			// independent and is released after the synchronous enqueue.
+			sent = self.client.SendWithTimeout(
+				frame,
+				source.Reverse(),
+				func(err error) {},
+				self.settings.WriteTimeout,
+				returnOption,
+			)
+			MessagePoolReturn(packetShare)
+			if !sent {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
 		if sent {
 			self.packetStatsCounters.remoteEgressPacketCount.Add(1)
 			self.packetStatsCounters.remoteEgressByteCount.Add(int64(len(packet)))
-		} else {
+		} else if 2 <= self.settings.ProtocolVersion {
 			// the send did not take the frame: free it. For raw frames this undoes
 			// the packet share above; for wrapped frames it frees the marshal buffer.
-			MessagePoolReturn(frame.MessageBytes)
+			MessagePoolReturn(packetShare)
 		}
 		// if sent {
 		// 	self.client.log.Infof("[trace]provider return packet sent for %s\n", source.SourceId)
@@ -3551,6 +4403,12 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
 
 	provideMode := peer.ProvideMode
+	// One observation per delivered Pack is enough. The former call inside
+	// every packet case serialized a large coalesced return batch on this
+	// provider-global lock even though every frame has the same source and
+	// relationship.
+	self.recordSourceProvideMode(source.SourceId, provideMode)
+	self.refreshP2pPriority(source.SourceId, provideMode)
 
 	// collect the allowed packets and queue them into the local user nat as one batch
 	var packets [][]byte
@@ -3561,52 +4419,69 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof("[ip]provider ping <- %s(%d)\n", source, provideMode)
 			}
+			// Receive callback frames are borrowed and valid only until this
+			// callback returns. The send queue is asynchronous, so forwarding
+			// `frame` itself lets the decoded-frame pool reset/reuse it before
+			// SendSequence serializes it. Besides corrupting the echo, that can
+			// make contract accounting charge the original empty IpPing and
+			// later acknowledge whatever larger frame reused the object,
+			// terminating the whole send sequence with "Bad accounting".
+			//
+			// Keep the payload alive with a read-only share and give the send
+			// its own frame object. IpPing is rare, so the one small object is
+			// preferable to letting a callback-lifetime object escape.
+			echoBytes := MessagePoolShareReadOnly(frame.MessageBytes)
+			echoFrame := &protocol.Frame{
+				MessageType:  frame.MessageType,
+				MessageBytes: echoBytes,
+				Raw:          frame.Raw,
+			}
 			// echo the recorded return provide mode for the source, like the
 			// provider's other return traffic. A same-network source pings
 			// under ProvideMode_Network; its echo is also network mode (no
 			// companion contract). For other modes the source only provides
 			// ProvideMode_Stream, so a forward contract would be rejected
 			// (no permission); the echo rides a companion contract instead.
-			echoOpts := []any{}
-			if self.sourceReturnProvideMode(source.SourceId, provideMode) != protocol.ProvideMode_Network {
-				echoOpts = append(echoOpts, CompanionContract())
-			}
-			self.client.SendWithTimeout(
-				frame,
+			returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+			if !self.client.SendWithTimeout(
+				echoFrame,
 				source.Reverse(),
 				func(err error) {},
 				0,
-				echoOpts...,
-			)
+				providerReturnTransferOptions(
+					self.client.settings.DefaultTransferOpts,
+					returnProvideMode,
+				),
+			) {
+				MessagePoolReturn(echoBytes)
+			}
 		case protocol.MessageType_IpIpPacketToProvider:
-			ipPacketToProvider_, err := FromFrame(frame)
+			packetBytes, err := ipPacketToProviderBytes(frame)
 			if err != nil {
 				panic(err)
 			}
-			ipPacketToProvider := ipPacketToProvider_.(*protocol.IpPacketToProvider)
 
-			ipPath, payload, err := ParseIpPathWithPayload(ipPacketToProvider.IpPacket.PacketBytes)
+			var ipPath IpPath
+			payload, err := parseIpPathWithPayloadBorrowed(packetBytes, &ipPath)
 			if err == nil {
 				// the provider's ingress is the remote client's egress (outbound, received from the
 				// tunnel); the reversed provider policy applies the client-egress DPI here
-				r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, payload)
-				self.securityPolicy.RefreshIngress(ipPath)
+				r, err := inspectAndRefreshIngressBorrowed(self.securityPolicy, provideMode, ipPath, payload)
 				if err == nil {
 					switch r {
 					case SecurityPolicyResultAllow:
 						var packet []byte
 						if frame.Raw {
-							packet = MessagePoolShareReadOnly(ipPacketToProvider.IpPacket.PacketBytes)
+							packet = MessagePoolShareReadOnly(packetBytes)
 						} else {
-							packet = MessagePoolCopy(ipPacketToProvider.IpPacket.PacketBytes)
+							packet = MessagePoolCopy(packetBytes)
 						}
 						packets = append(packets, packet)
 						packetsByteCount += ByteCount(len(packet))
-						self.recordSourceProvideMode(source.SourceId, provideMode)
 					default:
 						// drop or incident: blocked by the provider security policy
 						self.packetStatsCounters.blockIngressPacketCount.Add(1)
-						self.packetStatsCounters.blockIngressByteCount.Add(int64(len(ipPacketToProvider.IpPacket.PacketBytes)))
+						self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
 						if r == SecurityPolicyResultIncident {
 							self.client.ReportAbuse(source)
 						}
@@ -3622,7 +4497,9 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				source,
 				provideMode,
 				packets,
-				0,
+				// bounded backpressure for burst safety
+				// (see `IngressDispatchTimeout`)
+				self.settings.IngressDispatchTimeout,
 			)
 			if success {
 				self.packetStatsCounters.remoteIngressPacketCount.Add(int64(len(packets)))
@@ -3735,15 +4612,15 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	relationship := egressRelationship(provideMode, self.provideMode)
 
-	ipPath, payload, err := ParseIpPathWithPayload(packet)
+	var ipPath IpPath
+	payload, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
 	if err != nil {
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	r, err := inspectAndRefreshEgressBorrowed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		return false
 	}
-	self.securityPolicy.RefreshEgress(ipPath)
 
 	switch r {
 	case SecurityPolicyResultAllow:
@@ -3753,26 +4630,35 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 			return false
 		}
 
-		ipPacketToProvider := &protocol.IpPacketToProvider{
-			IpPacket: &protocol.IpPacket{
-				PacketBytes: MessagePoolShareReadOnly(packet),
-			},
+		// The default v2 path embeds the raw frame in the pooled SendPack. It
+		// consumes packet only when the send accepts it and avoids both a frame
+		// allocation and the extra share that previously left the caller's
+		// original reference outstanding after a successful send.
+		if 2 <= DefaultProtocolVersion {
+			success, _ := self.client.sendRawMultiHopWithTimeoutDetailed(
+				protocol.MessageType_IpIpPacketToProvider,
+				packet,
+				destination,
+				nil,
+				0,
+				timeout,
+			)
+			return success
 		}
-		frame, err := ToFrame(ipPacketToProvider, DefaultProtocolVersion)
+
+		frame, err := ipPacketToProviderFrame(packet, DefaultProtocolVersion)
 		if err != nil {
 			panic(err)
 		}
-		if !frame.Raw {
-			defer MessagePoolReturn(packet)
-		}
 
 		// the sender will control transfer
-		opts := []any{}
 		// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
-		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout, opts...)
-		if !success {
-			// the send did not take the frame: free it. For raw frames this undoes
-			// the packet share above; for wrapped frames it frees the marshal buffer.
+		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout)
+		if success {
+			// Legacy serialization copied the packet into frame.MessageBytes;
+			// consume the caller's packet only after the queue accepts the copy.
+			MessagePoolReturn(packet)
+		} else {
 			MessagePoolReturn(frame.MessageBytes)
 		}
 		return success
@@ -3798,13 +4684,10 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 		// self.client.log.Infof("[trace]receive frame %s\n", frame.MessageType)
 		switch frame.MessageType {
 		case protocol.MessageType_IpIpPacketFromProvider:
-			ipPacketFromProvider_, err := FromFrame(frame)
+			packet, err := ipPacketFromProviderBytes(frame)
 			if err != nil {
 				panic(err)
 			}
-			ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
-
-			packet := ipPacketFromProvider.IpPacket.PacketBytes
 
 			ipPath, err := ParseIpPath(packet)
 			if err == nil {
@@ -3932,6 +4815,7 @@ const (
 	IpProtocolUnknown IpProtocol = 0
 	IpProtocolTcp     IpProtocol = 1
 	IpProtocolUdp     IpProtocol = 2
+	IpProtocolIcmp    IpProtocol = 3
 )
 
 func (self IpProtocol) String() string {
@@ -3940,6 +4824,8 @@ func (self IpProtocol) String() string {
 		return "tcp"
 	case IpProtocolUdp:
 		return "udp"
+	case IpProtocolIcmp:
+		return "icmp"
 	default:
 		return "unknown"
 	}
@@ -3968,8 +4854,29 @@ func ParseIpPath(ipPacket []byte) (*IpPath, error) {
 }
 
 func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
+	var ipPath IpPath
+	payload, err := parseIpPathWithPayloadBorrowed(ipPacket, &ipPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The public result owns its addresses. Keep this copy outside the borrowed
+	// parser so escape analysis does not conservatively apply this allocation
+	// branch to every synchronous borrowed parse.
+	ipBacking := make(net.IP, len(ipPath.SourceIp)+len(ipPath.DestinationIp))
+	sourceByteCount := copy(ipBacking, ipPath.SourceIp)
+	copy(ipBacking[sourceByteCount:], ipPath.DestinationIp)
+	ipPath.SourceIp = ipBacking[:sourceByteCount:sourceByteCount]
+	ipPath.DestinationIp = ipBacking[sourceByteCount:]
+	return &ipPath, payload, nil
+}
+
+// parseIpPathWithPayloadBorrowed fills ipPath without allocating address
+// copies. The address slices alias ipPacket and are valid only while ipPacket
+// is valid. It is for synchronous packet-policy hot paths; anything retaining
+// an IpPath must use ParseIpPathWithPayload instead.
+func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, error) {
 	if len(ipPacket) == 0 {
-		return nil, nil, fmt.Errorf("Empty packet.")
+		return nil, fmt.Errorf("Empty packet.")
 	}
 	ipVersion := uint8(ipPacket[0]) >> 4
 	var ipProtocol ipProtocolNumber
@@ -3984,59 +4891,98 @@ func ParseIpPathWithPayload(ipPacket []byte) (*IpPath, []byte, error) {
 		ipProtocol, sourceIp, destinationIp, transport, ok = parseIpv6(ipPacket)
 	default:
 		// no support for this version
-		return nil, nil, fmt.Errorf("No support for ip version %d", ipVersion)
+		return nil, fmt.Errorf("No support for ip version %d", ipVersion)
 	}
 	if !ok {
-		return nil, nil, fmt.Errorf("Malformed ip packet.")
+		return nil, fmt.Errorf("Malformed ip packet.")
 	}
-
-	// copy the ips so the ip path can be retained independently of the shared
-	// packet buffer (which is recycled after the handoff call). both copies share
-	// one backing allocation instead of one per address.
-	ipBacking := make(net.IP, len(sourceIp)+len(destinationIp))
-	sn := copy(ipBacking, sourceIp)
-	copy(ipBacking[sn:], destinationIp)
-	sourceIpCopy := ipBacking[:sn:sn]
-	destinationIpCopy := ipBacking[sn:]
 
 	switch ipProtocol {
 	case ipProtocolNumberUdp:
 		var udp parsedUdp
 		if !parseUdpPacket(sourceIp, destinationIp, transport, &udp) {
-			return nil, nil, fmt.Errorf("Malformed udp packet.")
+			return nil, fmt.Errorf("Malformed udp packet.")
 		}
 
-		return &IpPath{
+		*ipPath = IpPath{
 			Version:         int(ipVersion),
 			Protocol:        IpProtocolUdp,
-			SourceIp:        sourceIpCopy,
+			SourceIp:        sourceIp,
 			SourcePort:      int(udp.sourcePort),
-			DestinationIp:   destinationIpCopy,
+			DestinationIp:   destinationIp,
 			DestinationPort: int(udp.destinationPort),
-		}, udp.payload, nil
+		}
+		return udp.payload, nil
 	case ipProtocolNumberTcp:
 		var tcp parsedTcp
 		if !parseTcpPacket(sourceIp, destinationIp, transport, &tcp) {
-			return nil, nil, fmt.Errorf("Malformed tcp packet.")
+			return nil, fmt.Errorf("Malformed tcp packet.")
 		}
 
-		return &IpPath{
+		*ipPath = IpPath{
 			Version:           int(ipVersion),
 			Protocol:          IpProtocolTcp,
-			SourceIp:          sourceIpCopy,
+			SourceIp:          sourceIp,
 			SourcePort:        int(tcp.sourcePort),
-			DestinationIp:     destinationIpCopy,
+			DestinationIp:     destinationIp,
 			DestinationPort:   int(tcp.destinationPort),
 			SequenceNumber:    tcp.seq,
 			AckSequenceNumber: tcp.ackNumber,
 			Syn:               tcp.syn,
 			Rst:               tcp.rst,
 			Ack:               tcp.ack,
-		}, tcp.payload, nil
+		}
+		return tcp.payload, nil
 	default:
-		// no support for this protocol
-		return nil, nil, fmt.Errorf("No support for protocol %d", ipProtocol)
+		// icmp and the unsupported protocols are parsed out of line: keeping
+		// this switch at its original two hot cases preserves the tcp and udp
+		// dispatch (adding cases here measurably slowed the udp parse)
+		return parseIcmpIpPathBorrowed(ipVersion, ipProtocol, sourceIp, destinationIp, transport, ipPath)
 	}
+}
+
+// parseIcmpIpPathBorrowed is the cold tail of parseIpPathWithPayloadBorrowed:
+// icmp echo, else the unsupported protocol error. Split out so the hot tcp/udp
+// dispatch above is unchanged by icmp support.
+//
+//go:noinline
+func parseIcmpIpPathBorrowed(
+	ipVersion uint8,
+	ipProtocol ipProtocolNumber,
+	sourceIp net.IP,
+	destinationIp net.IP,
+	transport []byte,
+	ipPath *IpPath,
+) ([]byte, error) {
+	switch ipProtocol {
+	case ipProtocolNumberIcmp4, ipProtocolNumberIcmp6:
+	default:
+		return nil, fmt.Errorf("No support for protocol %d", ipProtocol)
+	}
+	if (ipProtocol == ipProtocolNumberIcmp4) != (ipVersion == 4) {
+		// the icmp variant must match the ip version
+		return nil, fmt.Errorf("No support for protocol %d", ipProtocol)
+	}
+	var icmp parsedIcmp
+	if !parseIcmpPacket(int(ipVersion), sourceIp, destinationIp, transport, &icmp) {
+		return nil, fmt.Errorf("Unsupported or malformed icmp packet.")
+	}
+
+	// the echo identifier stands in for the port on the client side of the
+	// flow: the source side of a request, the destination side of a reply,
+	// so Reverse aligns the two directions (see ICMP.md)
+	*ipPath = IpPath{
+		Version:       int(ipVersion),
+		Protocol:      IpProtocolIcmp,
+		SourceIp:      sourceIp,
+		DestinationIp: destinationIp,
+	}
+	if icmp.echoRequest {
+		ipPath.SourcePort = int(icmp.identifier)
+	} else {
+		ipPath.DestinationPort = int(icmp.identifier)
+	}
+	return icmp.payload, nil
 }
 
 func (self *IpPath) SourceHostPort() string {
@@ -4099,6 +5045,64 @@ func (self *IpPath) ToIp6Path() Ip6Path {
 	}
 }
 
+// dialFailureAction classifies a failed upstream DialContext into the signal
+// the provider sends back to the source in place of the SynAck. Without a
+// signal the source sits in syn-retransmit backoff (3s..63s) and the blackhole
+// timeout eventually removes the provider along with its working flows -- the
+// bug this replaces.
+type dialFailureAction int
+
+const (
+	// dialFailureNone: send nothing (nil path / unsupported ip version).
+	dialFailureNone dialFailureAction = iota
+	// dialFailureRst: the destination itself refused the connection. The caller
+	// answers with ConnectionState.RstAck() -- honest tcp semantics, forwarded
+	// to the app.
+	dialFailureRst
+	// dialFailureUnreachable: capacity-class failure. The caller delivers the
+	// icmp destination-unreachable packet returned alongside this action.
+	dialFailureUnreachable
+)
+
+// classifyDialFailure maps an upstream DialContext error to the signal the
+// provider should return in place of a SynAck. It is pure -- no live socket, no
+// ConnectionState -- so the errno logic is unit-testable.
+//
+// For dialFailureUnreachable the built icmp packet is returned as well (a fresh
+// non-pool buffer from ipOosUnreachable; the caller copies it into the pool
+// before delivery). For dialFailureRst and dialFailureNone the packet is nil --
+// a RST needs the ConnectionState's sequence state, so the caller builds it.
+//
+// tcp + ECONNREFUSED means the destination refused: RST+ACK. Anything else on
+// tcp (timeouts, EMFILE/ENFILE, EADDRNOTAVAIL, unreachable, unrecognized) is
+// capacity-class and gets an unreachable; defaulting unrecognized errors to the
+// capacity class is deliberate -- new clients intercept the signal and old ones
+// drop it at ParseIpPath, so a misclassification is cheap. errors.Is folds the
+// Windows WSAECONNREFUSED onto syscall.ECONNREFUSED, but the providers this runs
+// on are almost all linux, so linux errno semantics are what matter. udp "dial"
+// cannot produce a meaningful ECONNREFUSED at connect time, so udp is always
+// capacity-class.
+func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) {
+	if ipPath == nil {
+		return dialFailureNone, nil
+	}
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return dialFailureRst, nil
+		}
+		// otherwise fall through to the unreachable build below
+	case IpProtocolUdp:
+		// always capacity-class; fall through
+	default:
+		return dialFailureNone, nil
+	}
+	if packet, ok := ipOosUnreachable(ipPath); ok {
+		return dialFailureUnreachable, packet
+	}
+	return dialFailureNone, nil
+}
+
 func (self *IpPath) Source() *IpPath {
 	return &IpPath{
 		Protocol:   self.Protocol,
@@ -4117,8 +5121,11 @@ func (self *IpPath) Destination() *IpPath {
 	}
 }
 
-func (self *IpPath) Reverse() *IpPath {
-	return &IpPath{
+// ReverseValue returns the flow tuple in the opposite direction without
+// allocating. Sequence/flag state is intentionally omitted, matching Reverse:
+// synthetic packets built from a reversed path are out of sequence.
+func (self *IpPath) ReverseValue() IpPath {
+	return IpPath{
 		Protocol:        self.Protocol,
 		Version:         self.Version,
 		SourceIp:        self.DestinationIp,
@@ -4126,6 +5133,11 @@ func (self *IpPath) Reverse() *IpPath {
 		DestinationIp:   self.SourceIp,
 		DestinationPort: self.SourcePort,
 	}
+}
+
+func (self *IpPath) Reverse() *IpPath {
+	reversed := self.ReverseValue()
+	return &reversed
 }
 
 // comparable

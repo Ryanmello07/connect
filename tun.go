@@ -9,10 +9,13 @@ package connect
 import (
 	// "bytes"
 	"context"
-	// "errors"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"runtime"
 	// "regexp"
 	mathrand "math/rand"
 	"strconv"
@@ -32,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	stackgro "gvisor.dev/gvisor/pkg/tcpip/stack/gro"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
@@ -68,16 +72,35 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// stack). Max applies per connection, so it caps per-connection memory; a
 		// memory-constrained IpMux on a private stack shrinks these much further.
 		// default and max are per connection, so scaled by the memory budget.
+		// The tunnel path's effective ack rtt runs orders of magnitude above
+		// loopback (userspace relay hops + ack coalescing), so the throughput
+		// of a single stream is window/rtt-bound: the former 256KiB default
+		// measured ~1.8 MiB/s upload / ~0.8 MiB/s download against a tunnel
+		// with 17+ MiB/s of udp capacity. Larger defaults let auto-tuning
+		// reach a window that covers the tunnel's bandwidth-delay product.
 		TcpReceiveBuffer: TcpBufferRange{
 			Min:     4 * 1024,
-			Default: int(MemoryScaledByteCount(kib(256), kib(64))),
-			Max:     int(MemoryScaledByteCount(mib(1), kib(256))),
+			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
+			Max:     int(MemoryScaledByteCount(mib(4), kib(512))),
 		},
 		TcpSendBuffer: TcpBufferRange{
 			Min:     4 * 1024,
-			Default: int(MemoryScaledByteCount(kib(256), kib(64))),
-			Max:     int(MemoryScaledByteCount(mib(1), kib(256))),
+			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
+			Max:     int(MemoryScaledByteCount(mib(4), kib(512))),
 		},
+
+		// cap rto backoff well below the gvisor default (120s). The path under
+		// the tun is a tunnel that does its own retransmission, so segment loss
+		// is dominated by transient starvation/burst-drop windows; after such a
+		// window a 120s-capped backoff strands an otherwise-recovered stream in
+		// a minutes-long silent stall. Retrying every few seconds bounds the
+		// stall at negligible bandwidth cost.
+		TcpMaxRto: 8 * time.Second,
+
+		// coalesce WriteBatch tcp packets into super-segments before delivery
+		// (see Tun.WriteBatch). Off in a zero-value TunSettings, which keeps
+		// hand-rolled settings on the per-packet behavior.
+		TcpGro: true,
 	}
 }
 
@@ -111,6 +134,17 @@ type TunSettings struct {
 	// consumer should lower them.
 	TcpReceiveBuffer TcpBufferRange
 	TcpSendBuffer    TcpBufferRange
+
+	// TcpMaxRto, when positive, caps the gVisor TCP retransmission timeout
+	// (the default cap is 120s). See DefaultTunSettings for why the tun uses
+	// a small cap.
+	TcpMaxRto time.Duration
+
+	// TcpGro enables generic receive offload for Tun.WriteBatch: the tcp
+	// packets of one batch coalesce into super-segments before delivery,
+	// amortizing per-segment dispatch, endpoint enqueue, and ack generation.
+	// Tun.Write is unaffected.
+	TcpGro bool
 }
 
 // TcpBufferRange is a gVisor TCP buffer auto-tuning range in bytes.
@@ -120,7 +154,7 @@ type TcpBufferRange struct {
 	Max     int
 }
 
-func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange) *stack.Stack {
+func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange, tcpMaxRto time.Duration) *stack.Stack {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true})},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
@@ -147,6 +181,10 @@ func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange) *stack.Stack
 			Default: tcpSend.Default,
 			Max:     tcpSend.Max,
 		}
+		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
+	}
+	if 0 < tcpMaxRto {
+		opt := tcpip.TCPMaxRTOOption(tcpMaxRto)
 		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
 	}
 
@@ -316,7 +354,7 @@ type Tun struct {
 
 	settings *TunSettings
 
-	ep                        *channel.Endpoint
+	ep                        *tunLinkEndpoint
 	stack                     *stack.Stack
 	nicId                     tcpip.NICID
 	nicIdAllocator            *NicIdAllocator
@@ -326,12 +364,216 @@ type Tun struct {
 	// registeredAddresses map[netip.Addr]bool
 	dohResolver atomic.Pointer[DohCache]
 
+	// tcpInboundShards preserve same-flow injection order while independent
+	// browser connections continue in parallel.
+	tcpInboundShards [tunTcpInboundShardCount]tunTcpInboundShard
+
+	// gro coalesces the tcp packets of a WriteBatch into super-segments
+	// before delivery, amortizing the per-segment dispatch, endpoint
+	// enqueue, and ack generation that dominate the per-packet Write path.
+	// groMu serializes batches (the gvisor GRO state is not thread-safe);
+	// per-batch Flush empties the state, so no packet outlives its batch.
+	groMu sync.Mutex
+	gro   stackgro.GRO
+
 	// closeOnce makes Close idempotent: a second Close must not return the nic id and
 	// local address to the shared allocators again — a double return hands the same
 	// address out twice, and two later tuns silently share it (breaking their routing).
 	closeOnce sync.Once
 
 	stateLock sync.Mutex
+}
+
+const (
+	// Reconcile each producer burst well below gVisor's 100-segment processing
+	// quantum. A processor that meets a syscall-owned endpoint relies on the
+	// subsequent user unlock to requeue it; the transfer shim has no return-path
+	// retransmission with which to recover from a missed handoff.
+	tunTcpInboundBurstPacketCount = 16
+	tunTcpInboundShardCount       = 32
+)
+
+// tunTcpInboundShard bounds one set of TCP flow handoffs without serializing
+// unrelated flows. Its fixed arrays make memory independent of flow churn.
+type tunTcpInboundShard struct {
+	writeLock     sync.Mutex
+	packetCount   uint32
+	endpointIds   [tunTcpInboundBurstPacketCount]stack.TransportEndpointID
+	endpointCount int
+}
+
+// tcpInboundFlow parses the endpoint identity and stable shard of a complete,
+// unfragmented IPv4 TCP packet.
+func tcpInboundFlow(packet []byte) (stack.TransportEndpointID, int, bool) {
+	if len(packet) < header.IPv4MinimumSize || packet[0]>>4 != 4 || packet[9] != uint8(header.TCPProtocolNumber) {
+		return stack.TransportEndpointID{}, 0, false
+	}
+	ipHeaderByteCount := int(packet[0]&0x0f) * 4
+	if ipHeaderByteCount < header.IPv4MinimumSize ||
+		len(packet) < ipHeaderByteCount+header.TCPMinimumSize ||
+		binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+		return stack.TransportEndpointID{}, 0, false
+	}
+	transport := packet[ipHeaderByteCount:]
+	localPort := binary.BigEndian.Uint16(transport[2:4])
+	remotePort := binary.BigEndian.Uint16(transport[0:2])
+	endpointId := stack.TransportEndpointID{
+		LocalPort:     localPort,
+		LocalAddress:  tcpip.AddrFrom4Slice(packet[16:20]),
+		RemotePort:    remotePort,
+		RemoteAddress: tcpip.AddrFrom4Slice(packet[12:16]),
+	}
+	flowHash := uint32(localPort)<<16 | uint32(remotePort)
+	flowHash ^= binary.BigEndian.Uint32(packet[12:16])
+	flowHash ^= binary.BigEndian.Uint32(packet[16:20])
+	flowHash ^= flowHash >> 16
+	return endpointId, int(flowHash & (tunTcpInboundShardCount - 1)), true
+}
+
+// addTcpInboundEndpointWithLock records an endpoint once in the current
+// bounded burst. The shard write lock must be held.
+func (self *Tun) addTcpInboundEndpointWithLock(shard *tunTcpInboundShard, endpointId stack.TransportEndpointID) {
+	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
+		if shard.endpointIds[endpointIndex] == endpointId {
+			return
+		}
+	}
+	shard.endpointIds[shard.endpointCount] = endpointId
+	shard.endpointCount += 1
+}
+
+// advanceTcpInboundShardWithLock records one injection and reports when its
+// shard needs an endpoint handoff. The shard write lock must be held.
+func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpointId stack.TransportEndpointID) bool {
+	self.addTcpInboundEndpointWithLock(shard, endpointId)
+	shard.packetCount += 1
+	if shard.packetCount < tunTcpInboundBurstPacketCount {
+		return false
+	}
+	shard.packetCount = 0
+	return true
+}
+
+// synchronizeTcpInboundProcessorsWithLock performs gVisor's documented user
+// unlock handoff for every endpoint touched in the burst. The shard write lock
+// remains held so the next burst cannot overtake the handoff.
+func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundShard) {
+	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
+		endpointId := shard.endpointIds[endpointIndex]
+		stackEndpoint := self.stack.FindTransportEndpoint(
+			ipv4.ProtocolNumber,
+			tcp.ProtocolNumber,
+			endpointId,
+			self.nicId,
+		)
+		if endpoint, ok := stackEndpoint.(*tcp.Endpoint); ok {
+			endpoint.LockUser()
+			endpoint.UnlockUser()
+		}
+	}
+	shard.endpointCount = 0
+	// UnlockUser requeues protocol work but does not run it synchronously.
+	// Yield once while this shard remains gated so the awakened worker cannot
+	// be starved by an immediately reacquired producer lock.
+	runtime.Gosched()
+}
+
+// tunLinkEndpoint converts channel.Endpoint's silent bounded-queue drop into
+// bounded backpressure. The user-NAT TCP bridge is intentionally lossless and
+// does not retransmit its return path, so dropping one ACK here can otherwise
+// strand a flow forever at its advertised receive window.
+type tunLinkEndpoint struct {
+	*channel.Endpoint
+	ctx   context.Context
+	space chan struct{}
+
+	// dispatcher is the NIC's network dispatcher, captured at Attach so
+	// WriteBatch can deliver GRO-coalesced packets through the same path
+	// InjectInbound uses.
+	dispatcherMu sync.RWMutex
+	dispatcher   stack.NetworkDispatcher
+}
+
+func (self *tunLinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	self.dispatcherMu.Lock()
+	self.dispatcher = dispatcher
+	self.dispatcherMu.Unlock()
+	self.Endpoint.Attach(dispatcher)
+}
+
+func (self *tunLinkEndpoint) networkDispatcher() stack.NetworkDispatcher {
+	self.dispatcherMu.RLock()
+	defer self.dispatcherMu.RUnlock()
+	return self.dispatcher
+}
+
+func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpip.LinkAddress) *tunLinkEndpoint {
+	endpoint := channel.New(size, mtu, linkAddr)
+	// Inbound packets originate from the in-process user NAT over an
+	// authenticated tunnel, so ip/tcp checksum validation here is redundant
+	// cost. It is also REQUIRED for GRO delivery (see Tun.WriteBatch): gvisor's
+	// GRO extends the leading packet's ip TotalLength on merge without
+	// recomputing the ip header checksum — its deployments assume RX checksum
+	// offload — and without this capability the ipv4 layer drops every merged
+	// packet as checksum-invalid.
+	endpoint.LinkEPCapabilities |= stack.CapabilityRXChecksumOffload
+	return &tunLinkEndpoint{
+		Endpoint: endpoint,
+		ctx:      ctx,
+		space:    make(chan struct{}, 1),
+	}
+}
+
+func (self *tunLinkEndpoint) notifySpace() {
+	select {
+	case self.space <- struct{}{}:
+	default:
+	}
+}
+
+func (self *tunLinkEndpoint) Read() *stack.PacketBuffer {
+	packet := self.Endpoint.Read()
+	if packet != nil {
+		self.notifySpace()
+	}
+	return packet
+}
+
+func (self *tunLinkEndpoint) ReadContext(ctx context.Context) *stack.PacketBuffer {
+	packet := self.Endpoint.ReadContext(ctx)
+	if packet != nil {
+		self.notifySpace()
+	}
+	return packet
+}
+
+func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, tcpip.Error) {
+	packetSlice := packets.AsSlice()
+	written := 0
+	remaining := packets
+	for {
+		n, err := self.Endpoint.WritePackets(remaining)
+		written += n
+		if err != nil || written == len(packetSlice) {
+			return written, err
+		}
+
+		// A partial batch is unusual (gVisor normally passes one packet), so
+		// construct its suffix only on queue saturation. A completely rejected
+		// one-packet write reuses the original list without allocating.
+		if 0 < n {
+			remaining = stack.PacketBufferList{}
+			for _, packet := range packetSlice[written:] {
+				remaining.PushBack(packet)
+			}
+		}
+
+		select {
+		case <-self.ctx.Done():
+			return written, &tcpip.ErrClosedForSend{}
+		case <-self.space:
+		}
+	}
 }
 
 func CreateTunWithDefaults(ctx context.Context) (*Tun, error) {
@@ -359,13 +601,18 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	// each Tun owns a private gVisor stack, destroyed on Close() so all of its
 	// endpoints are reclaimed. (There is no shared stack: it could not reclaim a
 	// closed Tun's connection endpoints, leaking them under Tun churn.)
-	tunStackInstance := newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer)
+	tunStackInstance := newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer, settings.TcpMaxRto)
 
 	localAddresses := []netip.Addr{
 		localIpv4Address,
 	}
 
-	ep := channel.New(settings.ChannelSize, uint32(settings.Mtu), tcpip.LinkAddress(fmt.Sprintf("%x", nicId)))
+	ep := newTunLinkEndpoint(
+		cancelCtx,
+		settings.ChannelSize,
+		uint32(settings.Mtu),
+		tcpip.LinkAddress(fmt.Sprintf("%x", nicId)),
+	)
 
 	releaseOnError := func() {
 		ep.Close()
@@ -418,6 +665,8 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	}
 	tun.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicId})
 
+	tun.gro.Init(settings.TcpGro)
+
 	return tun, nil
 }
 
@@ -452,8 +701,9 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, request
 }
 
 // SetDnsResolverSettings rebuilds the tun's DohCache with new resolver settings and DoH request
-// timeout, taking effect for subsequent queries (the prior cache's in-flight queries are
-// unaffected). Safe to call concurrently with DohCache()/Query.
+// timeout, taking effect for subsequent queries. Retiring the prior cache cancels its in-flight
+// requests so no old-path dial or pooled connection survives the swap. Safe to call concurrently
+// with DohCache()/Query.
 func (self *Tun) SetDnsResolverSettings(dnsResolverSettings *DnsResolverSettings, requestTimeout time.Duration) {
 	if replaced := self.dohResolver.Swap(self.buildDohCache(dnsResolverSettings, requestTimeout)); replaced != nil {
 		// release the replaced cache's pooled connections (and their endpoints on this
@@ -533,22 +783,145 @@ func (self *Tun) ReadBatch(packets [][]byte) (int, error) {
 
 // safe to call from multiple goroutines
 func (self *Tun) Write(packet []byte) (int, error) {
+	return self.write(packet, nil)
+}
+
+// WriteBatch injects a batch of packets, coalescing the batch's tcp packets
+// into super-segments (GRO) before delivery when TcpGro is enabled. This
+// amortizes the per-segment dispatch, endpoint enqueue, processor wake, and
+// ack generation that make per-packet Write the inbound throughput ceiling.
+// Same-flow order is preserved: each touched tcp flow's shard write lock is
+// held from the flow's first packet until the whole batch has been delivered,
+// exactly like consecutive Write calls. Cross-flow order within a batch is
+// not guaranteed (IP makes no such guarantee). The caller retains ownership
+// of every packet slice.
+func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	if len(packets) == 1 {
+		return self.write(packets[0], nil)
+	}
+
+	dispatcher := self.ep.networkDispatcher()
+	if dispatcher == nil {
+		// not attached (only possible mid-construction): fall back per packet
+		total := 0
+		for _, packet := range packets {
+			n, err := self.write(packet, nil)
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+		return total, nil
+	}
+
+	self.groMu.Lock()
+	defer self.groMu.Unlock()
+	self.gro.Dispatcher = dispatcher
+
+	// first-touch shard locks are held until the batch is fully delivered, so
+	// a concurrent Write on the same flow cannot interleave mid-batch
+	var lockedShards [tunTcpInboundShardCount]bool
+	defer func() {
+		for shardIndex := range lockedShards {
+			if lockedShards[shardIndex] {
+				self.tcpInboundShards[shardIndex].writeLock.Unlock()
+			}
+		}
+	}()
+
+	total := 0
+	for _, packet := range packets {
+		if len(packet) == 0 {
+			continue
+		}
+		if packet[0]>>4 != 4 {
+			// ipv4-only tun, matching write()
+			continue
+		}
+
+		endpointId, shardIndex, tcpInbound := tcpInboundFlow(packet)
+		var shard *tunTcpInboundShard
+		if tcpInbound {
+			shard = &self.tcpInboundShards[shardIndex]
+			if !lockedShards[shardIndex] {
+				shard.writeLock.Lock()
+				lockedShards[shardIndex] = true
+			}
+		}
+
+		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: buffer.MakeWithData(packet),
+		})
+		pkb.NetworkProtocolNumber = header.IPv4ProtocolNumber
+		// the trusted in-process NAT computed these checksums; skipping GRO's
+		// re-validation matches the link's CapabilityRXChecksumOffload
+		pkb.RXChecksumValidated = true
+		self.gro.Enqueue(pkb)
+		pkb.DecRef()
+		total += len(packet)
+
+		if tcpInbound && self.advanceTcpInboundShardWithLock(shard, endpointId) {
+			// the shard's burst is full: deliver everything queued so far so
+			// the user-unlock handoff runs against enqueued segments
+			// (write()'s inject-then-synchronize order), and so the shard's
+			// bounded endpoint array cannot overflow mid-batch
+			self.gro.Flush()
+			self.synchronizeTcpInboundProcessorsWithLock(shard)
+		}
+	}
+	self.gro.Flush()
+
+	return total, nil
+}
+
+// write injects one packet and releases the creator's PacketBuffer reference
+// after gVisor has taken any references it needs. onRelease is test
+// instrumentation invoked when every gVisor reference has also been released.
+func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	// defer MessagePoolReturn(packet)
 
 	if len(packet) == 0 {
 		return 0, nil
 	}
 
+	endpointId, shardIndex, tcpInbound := tcpInboundFlow(packet)
+	var tcpInboundShard *tunTcpInboundShard
+	synchronize := false
+	if tcpInbound {
+		tcpInboundShard = &self.tcpInboundShards[shardIndex]
+		tcpInboundShard.writeLock.Lock()
+		synchronize = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+	}
+
 	// copy the packet
 	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(packet),
+		Payload:   buffer.MakeWithData(packet),
+		OnRelease: onRelease,
 	})
+	// InjectInbound borrows the creator's reference. The stack takes its own
+	// references for asynchronous work, exactly as gVisor's TUN and veth link
+	// endpoints do. Without this release, every inbound packet and its copied
+	// payload remain live for the process lifetime.
 
 	switch packet[0] >> 4 {
 	case 4:
 		self.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
+		pkb.DecRef()
+		if tcpInbound {
+			if synchronize {
+				self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			}
+			tcpInboundShard.writeLock.Unlock()
+		}
 		return len(packet), nil
 	default:
+		pkb.DecRef()
+		if tcpInbound {
+			tcpInboundShard.writeLock.Unlock()
+		}
 		return 0, syscall.EAFNOSUPPORT
 	}
 }
@@ -635,33 +1008,135 @@ func (self *Tun) dialUdp(laddr *tcpip.FullAddress, raddr *tcpip.FullAddress, pro
 
 // safe to call from multiple goroutines
 func (self *Tun) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
+	return raceTunDialContext(
+		ctx,
+		self.ctx,
+		network,
+		address,
+		self.settings.DialRace,
+		self.settings.DialRaceTimeout,
+		self.settings.DialTimeout,
+		self.dialContext,
+	)
+}
+
+type tunDialResult struct {
+	conn net.Conn
+	err  error
+}
+
+func raceTunDialContext(
+	ctx context.Context,
+	tunCtx context.Context,
+	network string,
+	address string,
+	dialRace int,
+	dialRaceTimeout time.Duration,
+	dialTimeout time.Duration,
+	dialContext DialContextFunction,
+) (net.Conn, error) {
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	defer raceCancel()
-	raceOut := make(chan net.Conn)
-	for range self.settings.DialRace {
+
+	// One absolute deadline bounds the whole staggered race. The former shape
+	// waited DialRaceTimeout after every launch and then waited
+	// DialTimeout-DialRaceTimeout again; with the default two attempts a
+	// nominal 30s dial could take 32s, and larger race counts grew without
+	// bound.
+	overallTimer := time.NewTimer(max(time.Duration(0), dialTimeout))
+	defer overallTimer.Stop()
+
+	attemptCount := max(1, dialRace)
+	results := make(chan tunDialResult)
+	launched := 0
+	completed := 0
+	var lastErr error
+	launch := func() {
+		launched++
 		go HandleError(func() {
-			conn, err := self.dialContext(raceCtx, network, address)
-			if err == nil {
-				select {
-				case <-raceCtx.Done():
+			conn, err := dialContext(raceCtx, network, address)
+			select {
+			case results <- tunDialResult{conn: conn, err: err}:
+			case <-raceCtx.Done():
+				if conn != nil {
 					conn.Close()
-				case raceOut <- conn:
 				}
 			}
 		})
-		select {
-		case conn := <-raceOut:
-			return conn, nil
-		case <-time.After(self.settings.DialRaceTimeout):
+	}
+
+	launch()
+	if dialRaceTimeout <= 0 {
+		for launched < attemptCount {
+			launch()
 		}
 	}
-	select {
-	case <-raceCtx.Done():
-		return nil, fmt.Errorf("Done.")
-	case conn := <-raceOut:
-		return conn, nil
-	case <-time.After(self.settings.DialTimeout - self.settings.DialRaceTimeout):
-		return nil, fmt.Errorf("Timeout.")
+
+	var staggerTimer *time.Timer
+	var staggerC <-chan time.Time
+	scheduleStagger := func() {
+		if launched >= attemptCount || dialRaceTimeout <= 0 {
+			staggerC = nil
+			return
+		}
+		if staggerTimer == nil {
+			staggerTimer = time.NewTimer(dialRaceTimeout)
+		} else {
+			staggerTimer.Reset(dialRaceTimeout)
+		}
+		staggerC = staggerTimer.C
+	}
+	stopStagger := func() {
+		if staggerTimer != nil {
+			staggerTimer.Stop()
+		}
+		staggerC = nil
+	}
+	defer stopStagger()
+	scheduleStagger()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-tunCtx.Done():
+			return nil, tunCtx.Err()
+		case <-raceCtx.Done():
+			return nil, raceCtx.Err()
+		case <-overallTimer.C:
+			return nil, os.ErrDeadlineExceeded
+		case <-staggerC:
+			launch()
+			scheduleStagger()
+		case result := <-results:
+			if result.err == nil && result.conn != nil {
+				// The result channel is deliberately unbuffered. Exactly one
+				// successful connection transfers ownership to this caller;
+				// after return, raceCancel makes every other successful dial
+				// close instead of leaving it queued with no receiver.
+				return result.conn, nil
+			}
+			if result.conn != nil {
+				result.conn.Close()
+			}
+			if result.err != nil {
+				lastErr = result.err
+			} else {
+				lastErr = errors.New("dial returned no connection")
+			}
+			completed++
+			if completed == attemptCount {
+				return nil, lastErr
+			}
+
+			// A definitive failure is a stronger signal than the stagger:
+			// replace it immediately rather than adding avoidable latency.
+			if launched < attemptCount {
+				stopStagger()
+				launch()
+				scheduleStagger()
+			}
+		}
 	}
 }
 
@@ -746,8 +1221,9 @@ func (self *Tun) Dial(network, address string) (net.Conn, error) {
 func (self *Tun) Close() error {
 	self.closeOnce.Do(func() {
 		self.cancel()
-		// release the resolver cache's pooled h2/TLS connections promptly; their endpoints on
-		// this stack are destroyed with it below either way
+		// Cancel and join resolver HTTP requests/dials before destroying the
+		// stack, so net/http cannot install a late h2/TLS connection after the
+		// idle pool was closed.
 		self.dohResolver.Load().Close()
 		self.stack.RemoveNIC(self.nicId)
 		// ep.Close() drains and DecRefs any packets still queued in the endpoint.

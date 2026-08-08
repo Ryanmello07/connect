@@ -25,11 +25,25 @@ import (
 
 // manage contracts which are embedded into each transfer sequence
 
+// oobErrThrottle rate-limits `[contract]oob err`. During a control-API outage
+// every sequence's contract request fails, so this line is emitted once per
+// sequence per retry across the whole client. See logThrottle in
+// log_throttle.go.
+var oobErrThrottle = newLogThrottle(time.Minute)
+
+// shouldLogOobErr reports whether an out-of-band error should be logged and the number of errors suppressed since the previous allowed log.
+func shouldLogOobErr() (bool, int64) { return oobErrThrottle.Allow(time.Now()) }
+
 type ContractKey struct {
 	Destination       TransferPath
 	IntermediaryIds   MultiHopId
 	CompanionContract bool
 	ForceStream       bool
+	// NetworkPeer is contract sizing/retention policy, not routing identity:
+	// it is true only when the sender has an authenticated same-network
+	// relationship with Destination. Unlike ForceStream, it never classifies a
+	// public direct stream as trusted/no-escrow.
+	NetworkPeer bool
 	// EncryptionRole separates the contract queues of the two per-peer
 	// encryption send sequences to the same destination: the client-role
 	// sequence (normal application data) and the server-role sequence
@@ -65,19 +79,34 @@ type ContractStatus struct {
 type ContractStatusFunction = func(ContractStatus *ContractStatus)
 
 type contractStatusCallbackWorker struct {
-	ctx                     context.Context
-	cancel                  context.CancelFunc
-	callback                ContractStatusFunction
-	receiveContractStatuses chan *ContractStatus
+	ctx      context.Context
+	cancel   context.CancelFunc
+	callback ContractStatusFunction
+
+	// Status delivery is observability/control feedback, not the Client
+	// send/receive/forward backpressure contract. A suspended observer must not
+	// eventually fill a channel and park HandleControlFrame. Keep the latest
+	// status per contract key in a bounded ordered set instead.
+	stateLock  sync.Mutex
+	pending    map[ContractKey]*ContractStatus
+	order      []ContractKey
+	orderHead  int
+	orderCount int
+	maxCount   int
+	closed     bool
+	notify     chan struct{}
 }
 
 func newContractStatusCallbackWorker(ctx context.Context, callback ContractStatusFunction, bufferSize int) *contractStatusCallbackWorker {
 	callbackCtx, cancel := context.WithCancel(ctx)
 	worker := &contractStatusCallbackWorker{
-		ctx:                     callbackCtx,
-		cancel:                  cancel,
-		callback:                callback,
-		receiveContractStatuses: make(chan *ContractStatus, bufferSize),
+		ctx:      callbackCtx,
+		cancel:   cancel,
+		callback: callback,
+		pending:  map[ContractKey]*ContractStatus{},
+		order:    make([]ContractKey, max(1, bufferSize)),
+		maxCount: max(1, bufferSize),
+		notify:   make(chan struct{}, 1),
 	}
 	go HandleError(worker.run, cancel)
 	return worker
@@ -88,10 +117,22 @@ func (self *contractStatusCallbackWorker) run() {
 		select {
 		case <-self.ctx.Done():
 			return
-		case contractStatus := <-self.receiveContractStatuses:
-			if self.ctx.Err() != nil {
-				return
+		case <-self.notify:
+		}
+		for {
+			self.stateLock.Lock()
+			if self.closed || self.orderCount == 0 {
+				self.stateLock.Unlock()
+				break
 			}
+			key := self.order[self.orderHead]
+			self.order[self.orderHead] = ContractKey{}
+			self.orderHead = (self.orderHead + 1) % self.maxCount
+			self.orderCount -= 1
+			contractStatus := self.pending[key]
+			delete(self.pending, key)
+			self.stateLock.Unlock()
+
 			HandleError(func() {
 				self.callback(contractStatus)
 			})
@@ -100,13 +141,51 @@ func (self *contractStatusCallbackWorker) run() {
 }
 
 func (self *contractStatusCallbackWorker) Dispatch(contractStatus *ContractStatus) {
+	if contractStatus == nil {
+		return
+	}
+	cloned := *contractStatus
+
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	key := cloned.Key
+	if _, ok := self.pending[key]; !ok {
+		if self.maxCount <= self.orderCount {
+			evictedKey := self.order[self.orderHead]
+			delete(self.pending, evictedKey)
+			// Full ring: overwrite the oldest slot with the new tail, then
+			// advance head so the following oldest stays at the front.
+			self.order[self.orderHead] = key
+			self.orderHead = (self.orderHead + 1) % self.maxCount
+		} else {
+			tail := (self.orderHead + self.orderCount) % self.maxCount
+			self.order[tail] = key
+			self.orderCount += 1
+		}
+	}
+	self.pending[key] = &cloned
+	self.stateLock.Unlock()
+
 	select {
 	case <-self.ctx.Done():
-	case self.receiveContractStatuses <- contractStatus:
+	case self.notify <- struct{}{}:
+	default:
 	}
 }
 
 func (self *contractStatusCallbackWorker) Close() {
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closed = true
+	clear(self.pending)
+	self.order = nil
+	self.stateLock.Unlock()
 	self.cancel()
 }
 
@@ -197,10 +276,24 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		panic(err)
 	}
 	return &ContractManagerSettings{
-		SequenceBufferSize:                bufferSize,
-		InitialContractTransferByteCount:  kib(16),
-		StandardContractTransferByteCount: mib(128),
-		ContractTransferByteSeqScale:      4,
+		SequenceBufferSize: bufferSize,
+		// The first contract of every sequence used to be kib(16), of which
+		// ~80% is usable -- about nine packets. Acquiring a contract blocks
+		// the send sequence, so a new destination paid two blocking
+		// negotiations before it reached the second contract: one to open,
+		// one nine packets later. Web traffic is many short flows to many
+		// destinations, and every new destination restarts at sequence 0, so
+		// it never outgrows that; a provider log showed ~40 opening
+		// acquisitions in 13 minutes across ten destinations at 80ms-2.4s
+		// each, which is what a several-second stall on a new domain looks
+		// like. mib(1) covers essentially any single web response in the
+		// opening contract. It is a larger pre-settlement exposure to an
+		// unproven peer -- a deliberate tradeoff of escrow risk for the
+		// first-connection stall, bounded by the unchanged mib(128) ceiling.
+		InitialContractTransferByteCount:            mib(1),
+		InitialNetworkPeerContractTransferByteCount: mib(1),
+		StandardContractTransferByteCount:           mib(128),
+		ContractTransferByteSeqScale:                4,
 
 		NetworkEventTimeEnableContracts: networkEventTimeEnableContracts,
 		NetworkEventTimeChangeHmac:      networkEventTimeChangeHmac,
@@ -233,8 +326,15 @@ type ContractManagerSettings struct {
 	SequenceBufferSize int
 
 	// this should be enough to do a single ping
-	InitialContractTransferByteCount  ByteCount
-	StandardContractTransferByteCount ByteCount
+	InitialContractTransferByteCount ByteCount
+	// InitialNetworkPeerContractTransferByteCount covers a bounded interactive
+	// burst to a stable same-network peer. Network contracts are no-escrow and
+	// otherwise exhaust 16 KiB during the first page, blocking the ordered
+	// sequence on a control-plane round trip. Public/friends streams retain the
+	// small initial contract because ForceStream is a routing choice, not a
+	// trusted relationship, and their contracts may reserve escrow.
+	InitialNetworkPeerContractTransferByteCount ByteCount
+	StandardContractTransferByteCount           ByteCount
 	// scale up the contract size over this many contracts
 	ContractTransferByteSeqScale uint64
 
@@ -430,18 +530,7 @@ func (self *ContractManager) expireQueuedContracts() {
 		}
 
 		minEnqueueTime := time.Now().Add(-timeout)
-		expired := []*protocol.Contract{}
-		func() {
-			self.mutex.Lock()
-			defer self.mutex.Unlock()
-
-			for contractKey, contractQueue := range self.destinationContracts {
-				expired = append(expired, contractQueue.Expire(minEnqueueTime)...)
-				if contractQueue.IsDone() {
-					delete(self.destinationContracts, contractKey)
-				}
-			}
-		}()
+		expired := self.expireQueuedContractsBefore(minEnqueueTime)
 		if 0 < len(expired) {
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof("[contract]expired %d queued contracts\n", len(expired))
@@ -450,6 +539,43 @@ func (self *ContractManager) expireQueuedContracts() {
 			self.closeContracts(expired)
 		}
 	}
+}
+
+// expireQueuedContractsBefore removes orphaned pending contracts while
+// retaining the prefetched successor of every live send contract. A send
+// sequence can use one small contract slowly for longer than the orphan expiry
+// window; expiring its already-created successor turns the eventual boundary
+// into a synchronous control-plane pause. The open contract is the ownership
+// lease: sequence teardown removes it synchronously and force-flushes the
+// successor queue, so skipping that queue does not make orphan retention
+// unbounded.
+func (self *ContractManager) expireQueuedContractsBefore(
+	minEnqueueTime time.Time,
+) []*protocol.Contract {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	expired := []*protocol.Contract{}
+	for contractKey, contractQueue := range self.destinationContracts {
+		if self.isNetworkPeerContract(contractKey) &&
+			self.hasOpenContractForKeyWithLock(contractKey) {
+			// Keep the newest successor even when it outlives the orphan
+			// timeout, but do not retain every delayed/retried create result.
+			// One stale successor is sufficient to make rollover immediate;
+			// retaining all of them would make a slow live sequence an
+			// unbounded memory/escrow sink.
+			expired = append(
+				expired,
+				contractQueue.ExpireBeforeKeepingNewest(minEnqueueTime)...,
+			)
+			continue
+		}
+		expired = append(expired, contractQueue.Expire(minEnqueueTime)...)
+		if contractQueue.IsDone() {
+			delete(self.destinationContracts, contractKey)
+		}
+	}
+	return expired
 }
 
 func (self *ContractManager) providePing() {
@@ -738,6 +864,7 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 		}
 	}()
 	if changed {
+		self.reconcileInboundProviderStreams()
 		if provideFrame, err := self.provideFrame(); err == nil && provideFrame != nil {
 			self.controlSyncProvide.Send(
 				provideFrame,
@@ -748,6 +875,38 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 		return true
 	}
 	return false
+}
+
+// inboundProviderStreamPolicy converts provide registration into the policy
+// applicable to endpoint StreamOpen state. Stream is return-traffic
+// registration, not permission to originate a provider stream. Pause keeps
+// only same-network provider streams, matching provideFrame and Verify.
+func inboundProviderStreamPolicy(
+	provideModes map[protocol.ProvideMode]bool,
+	providePaused bool,
+) (allowAny bool, allowNetwork bool) {
+	allowNetwork = provideModes[protocol.ProvideMode_Network]
+	if !providePaused {
+		allowAny =
+			provideModes[protocol.ProvideMode_FriendsAndFamily] ||
+				provideModes[protocol.ProvideMode_Public] ||
+				provideModes[protocol.ProvideMode_PublicStream]
+	}
+	return
+}
+
+func (self *ContractManager) inboundProviderStreamPolicy() (allowAny bool, allowNetwork bool) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return inboundProviderStreamPolicy(self.provideModes, self.providePaused)
+}
+
+func (self *ContractManager) reconcileInboundProviderStreams() {
+	if self.client.streamManager == nil || self.client.peerManager == nil {
+		return
+	}
+	allowAny, allowNetwork := self.inboundProviderStreamPolicy()
+	self.client.streamManager.reconcileInboundProviderStreams(allowAny, allowNetwork)
 }
 
 func (self *ContractManager) IsProvidePaused() bool {
@@ -833,7 +992,6 @@ func (self *ContractManager) SetProvideModes(provideModes map[protocol.ProvideMo
 // the change with the platform.
 func (self *ContractManager) applyProvideModes(provideModes map[protocol.ProvideMode]bool) {
 	self.mutex.Lock()
-	defer self.mutex.Unlock()
 
 	// keep all keys (see note on `provideSecretKeys`)
 	for provideMode, allow := range provideModes {
@@ -853,6 +1011,11 @@ func (self *ContractManager) applyProvideModes(provideModes map[protocol.Provide
 
 	self.provideModes = maps.Clone(provideModes)
 	self.provideMonitor.NotifyAll()
+	self.mutex.Unlock()
+
+	// Reconcile after publishing the new local policy and outside the manager
+	// lock: stream cancellation can fan into route/transport teardown.
+	self.reconcileInboundProviderStreams()
 }
 
 func (self *ContractManager) SetProvideModesWithAckCallback(provideModes map[protocol.ProvideMode]bool, ackCallback func(err error)) {
@@ -992,13 +1155,15 @@ func (self *ContractManager) TakeContract(
 	timeout time.Duration,
 ) *protocol.Contract {
 	contractQueue := self.openContractQueue(contractKey)
-	defer self.closeContractQueue(contractKey)
+	defer self.closeContractQueue(contractKey, contractQueue)
 
 	enterTime := time.Now()
 	for {
 		notify := contractQueue.updateMonitor.NotifyChannel()
 		var minEnqueueTime time.Time
-		if 0 < self.settings.ContractQueueExpireTimeout {
+		if 0 < self.settings.ContractQueueExpireTimeout &&
+			!(self.isNetworkPeerContract(contractKey) &&
+				self.hasOpenContractForKey(contractKey)) {
 			minEnqueueTime = time.Now().Add(-self.settings.ContractQueueExpireTimeout)
 		}
 		contract, expired := contractQueue.Poll(minEnqueueTime)
@@ -1061,6 +1226,27 @@ func (self *ContractManager) TakeContract(
 	}
 }
 
+func (self *ContractManager) hasOpenContractForKey(contractKey ContractKey) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.hasOpenContractForKeyWithLock(contractKey)
+}
+
+func (self *ContractManager) hasOpenContractForKeyWithLock(contractKey ContractKey) bool {
+	if self.settings.LegacyCreateContract {
+		contractKey = contractKey.Legacy()
+	}
+	for _, openContractKey := range self.localStats.ContractOpenKeys {
+		if self.settings.LegacyCreateContract {
+			openContractKey = openContractKey.Legacy()
+		}
+		if openContractKey == contractKey {
+			return true
+		}
+	}
+	return false
+}
+
 func (self *ContractManager) addContract(contractKey ContractKey, contract *protocol.Contract) error {
 	storedContract := &protocol.StoredContract{}
 	err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
@@ -1082,7 +1268,7 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 
 	func() {
 		contractQueue := self.openContractQueue(contractKey)
-		defer self.closeContractQueue(contractKey)
+		defer self.closeContractQueue(contractKey, contractQueue)
 		contractQueue.Add(contract, storedContract)
 	}()
 
@@ -1092,14 +1278,14 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
 	// look at destinationContracts and last contract to get previous contract id
 	contractQueue := self.openContractQueue(contractKey)
-	defer self.closeContractQueue(contractKey)
+	defer self.closeContractQueue(contractKey, contractQueue)
 
 	streamVersion := uint32(DefaultStreamVersion)
 
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
-		TransferByteCount: uint64(self.contractByteCount(contractSeqIndex, minByteCount)),
+		TransferByteCount: uint64(self.contractByteCount(contractKey, contractSeqIndex, minByteCount)),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		StreamVersion:     &streamVersion,
@@ -1121,6 +1307,8 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			if err == nil {
+				// the OOB round-trip completed: the backend is reachable
+				noteBackendSuccess()
 				for _, resultFrame := range resultFrames {
 					self.HandleControlFrame(contractKey, resultFrame)
 				}
@@ -1129,25 +1317,70 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
-					self.client.log.Infof("[contract]oob err = %s\n", err)
+					noteBackendFailure()
+					if ok, suppressed := shouldLogOobErr(); ok {
+						if suppressed > 0 {
+							self.client.log.Infof("[contract]oob err = %s (%d suppressed)\n", err, suppressed)
+						} else {
+							self.client.log.Infof("[contract]oob err = %s\n", err)
+						}
+					} else if v := self.client.log.V(1); v.Enabled() {
+						v.Infof("[contract]oob err = %s\n", err)
+					}
 				}
 			}
 		},
 	)
 }
 
-func (self *ContractManager) contractByteCount(contractSeqIndex uint64, minByteCount ByteCount) ByteCount {
+func (self *ContractManager) contractByteCount(
+	contractKey ContractKey,
+	contractSeqIndex uint64,
+	minByteCount ByteCount,
+) ByteCount {
+	initialContractTransferByteCount := max(
+		ByteCount(0),
+		self.settings.InitialContractTransferByteCount,
+	)
+	if self.isNetworkPeerContract(contractKey) {
+		initialContractTransferByteCount = max(
+			initialContractTransferByteCount,
+			self.settings.InitialNetworkPeerContractTransferByteCount,
+		)
+	}
+	standardContractTransferByteCount := self.settings.StandardContractTransferByteCount
+	if standardContractTransferByteCount <= 0 {
+		standardContractTransferByteCount = initialContractTransferByteCount
+	} else {
+		initialContractTransferByteCount = min(
+			initialContractTransferByteCount,
+			standardContractTransferByteCount,
+		)
+	}
 	targetByteCount := func() ByteCount {
 		if self.settings.ContractTransferByteSeqScale <= contractSeqIndex {
-			return self.settings.StandardContractTransferByteCount
+			return standardContractTransferByteCount
 		} else {
 			// lerp between initial and standard
-			return self.settings.InitialContractTransferByteCount + ByteCount(
-				(contractSeqIndex*uint64(self.settings.StandardContractTransferByteCount-self.settings.InitialContractTransferByteCount))/self.settings.ContractTransferByteSeqScale,
+			return initialContractTransferByteCount + ByteCount(
+				(contractSeqIndex*uint64(standardContractTransferByteCount-initialContractTransferByteCount))/self.settings.ContractTransferByteSeqScale,
 			)
 		}
 	}()
-	return max(targetByteCount, minByteCount)
+	return max(targetByteCount, minByteCount, ByteCount(0))
+}
+
+func (self *ContractManager) isNetworkPeerContract(contractKey ContractKey) bool {
+	if contractKey.NetworkPeer {
+		return true
+	}
+	destinationId := contractKey.Destination.DestinationId
+	if destinationId == (Id{}) {
+		return false
+	}
+	return self.client != nil &&
+		self.client.peerManager != nil &&
+		self.client.peerManager.isConnectedNetworkPeer(destinationId)
 }
 
 func (self *ContractManager) CheckpointContract(
@@ -1256,7 +1489,7 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		if sendErr == nil && opened {
 			contractQueue := self.openContractQueue(contractKey)
 			contractQueue.RemoveUsedContract(contractId)
-			self.closeContractQueue(contractKey)
+			self.closeContractQueue(contractKey, contractQueue)
 		}
 	})
 }
@@ -1280,7 +1513,15 @@ func (self *ContractManager) ResetLocalStats() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	// Open-contract maps are operational ownership state as well as stats:
+	// they let CloseContract associate the close with its queue and keep a
+	// live sequence's prefetched successor out of orphan expiry. Reset the
+	// counters while preserving those live entries.
+	openByteCounts := self.localStats.ContractOpenByteCounts
+	openKeys := self.localStats.ContractOpenKeys
 	self.localStats = NewContractManagerStats()
+	self.localStats.ContractOpenByteCounts = openByteCounts
+	self.localStats.ContractOpenKeys = openKeys
 }
 
 func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
@@ -1290,7 +1531,7 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 		defer self.mutex.Unlock()
 
 		if self.client.log.V(1).Enabled() {
-			self.client.log.Infof("[contract]flush %s %s\n", self.client.ClientId(), slices.Collect(maps.Keys(self.destinationContracts)))
+			self.client.log.Infof("[contract]flush %s %v\n", self.client.ClientId(), slices.Collect(maps.Keys(self.destinationContracts)))
 		}
 
 		contracts := []*protocol.Contract{}
@@ -1310,7 +1551,7 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 
 func (self *ContractManager) FlushContractQueue(contractKey ContractKey, resetUsedContractIds bool) []Id {
 	contractQueue := self.openContractQueue(contractKey)
-	defer self.closeContractQueueWithForceRemove(contractKey, true)
+	defer self.closeContractQueueWithForceRemove(contractKey, contractQueue, true)
 
 	contracts := contractQueue.Flush(resetUsedContractIds)
 
@@ -1349,13 +1590,20 @@ func (self *ContractManager) openContractQueue(contractKey ContractKey) *contrac
 	return contractQueue
 }
 
-func (self *ContractManager) closeContractQueue(contractKey ContractKey) {
-	self.closeContractQueueWithForceRemove(contractKey, false)
+func (self *ContractManager) closeContractQueue(contractKey ContractKey, contractQueue *contractQueue) {
+	self.closeContractQueueWithForceRemove(contractKey, contractQueue, false)
 }
 
-func (self *ContractManager) closeContractQueueWithForceRemove(contractKey ContractKey, forceRemove bool) {
+func (self *ContractManager) closeContractQueueWithForceRemove(
+	contractKey ContractKey,
+	ownedQueue *contractQueue,
+	forceRemove bool,
+) {
 	if self.settings.LegacyCreateContract {
 		contractKey = contractKey.Legacy()
+	}
+	if ownedQueue == nil {
+		return
 	}
 
 	var toDrain *contractQueue
@@ -1363,18 +1611,24 @@ func (self *ContractManager) closeContractQueueWithForceRemove(contractKey Contr
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
-		contractQueue, ok := self.destinationContracts[contractKey]
-		if !ok {
+		// Close exactly the queue generation returned by openContractQueue.
+		// A force-flush may have removed it and installed a replacement at the
+		// same key while this caller was blocked in OOB/control work. Looking
+		// up by key here would decrement and potentially delete that replacement.
+		ownedQueue.Close()
+		if self.destinationContracts[contractKey] != ownedQueue {
+			if forceRemove {
+				toDrain = ownedQueue
+			}
 			return
 		}
-		contractQueue.Close()
 		if forceRemove {
 			// remove from the map so future addContract creates a fresh queue.
 			// existing waiters on the old monitor would never wake up
 			// otherwise; drain wakes them so they can bail.
 			delete(self.destinationContracts, contractKey)
-			toDrain = contractQueue
-		} else if contractQueue.IsDone() {
+			toDrain = ownedQueue
+		} else if ownedQueue.IsDone() {
 			delete(self.destinationContracts, contractKey)
 		}
 	}()
@@ -1454,6 +1708,38 @@ func (self *contractQueue) Expire(minEnqueueTime time.Time) []*protocol.Contract
 	defer self.mutex.Unlock()
 
 	return self.expireWithLock(minEnqueueTime)
+}
+
+// ExpireBeforeKeepingNewest expires stale entries while retaining at most one
+// stale successor. If a non-stale successor exists, every stale entry can be
+// removed; otherwise the newest stale entry is the bounded rollover reserve.
+func (self *contractQueue) ExpireBeforeKeepingNewest(
+	minEnqueueTime time.Time,
+) []*protocol.Contract {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	if minEnqueueTime.IsZero() || len(self.contracts) == 0 {
+		return nil
+	}
+	var newestId Id
+	var newestTime time.Time
+	for contractId, queued := range self.contracts {
+		if newestTime.IsZero() || newestTime.Before(queued.enqueueTime) {
+			newestId = contractId
+			newestTime = queued.enqueueTime
+		}
+	}
+
+	expired := []*protocol.Contract{}
+	for contractId, queued := range self.contracts {
+		if queued.enqueueTime.Before(minEnqueueTime) &&
+			(contractId != newestId || !newestTime.Before(minEnqueueTime)) {
+			expired = append(expired, queued.contract)
+			delete(self.contracts, contractId)
+		}
+	}
+	return expired
 }
 
 func (self *contractQueue) expireWithLock(minEnqueueTime time.Time) []*protocol.Contract {

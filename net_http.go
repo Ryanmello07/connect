@@ -152,17 +152,86 @@ type ClientStrategy struct {
 	extenderIpSecrets map[netip.Addr]string
 
 	nextConnectTime time.Time
+	// reconnectFastPathCount is the number of reconnect fast-path slots
+	// currently held (see NextReconnectTime). Guarded by mutex. The zero value
+	// means all slots free, so a bare test-constructed strategy works
+	// unchanged.
+	reconnectFastPathCount int
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
 	return NewClientStrategy(ctx, DefaultClientStrategySettings())
 }
 
+func newNormalDialTlsContext(
+	settings *ClientStrategySettings,
+	nextProtos []string,
+) DialTlsContextFunction {
+	netDialer := settings.NetDialer()
+	tlsConfig := newClientTlsConfig(settings.TlsConfig, nextProtos)
+	if settings.ProxySettings == nil {
+		tlsDialer := &tls.Dialer{
+			NetDialer: netDialer,
+			Config:    tlsConfig,
+		}
+		return tlsDialer.DialContext
+	}
+
+	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		proxyDialContext := settings.ProxySettings.NewDialContext(
+			ctx,
+			netDialer,
+		)
+
+		// The rest of this function is adapted from tls.Dialer to use a
+		// context-aware proxy dialer.
+		conn, err := proxyDialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		if netDialer.Timeout != 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
+			defer cancel()
+		}
+		if !netDialer.Deadline.IsZero() {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
+			defer cancel()
+		}
+
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		config := tlsConfig.Clone()
+		if config.ServerName == "" {
+			config.ServerName = host
+		}
+		tlsConn := tls.Client(conn, config)
+		tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
+		defer tlsCancel()
+		if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
+			tlsConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+}
+
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
-	// propagate so a strategy-level logger covers dial logging
+	// propagate so a strategy-level logger covers dial logging. Copy instead
+	// of writing through the caller's settings: the caller may share them
+	// with concurrent constructions or other readers (see the platform
+	// transport framer settings for the same rule).
 	if settings.ConnectSettings.Log == nil {
-		settings.ConnectSettings.Log = settings.Log
+		copied := *settings
+		copied.ConnectSettings.Log = settings.Log
+		settings = &copied
 	}
 
 	// create dialers to match settings
@@ -172,77 +241,13 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	if settings.EnableNormal {
 		// TODO ECH support
 		if settings.ExposeServerHostNames && settings.ExposeServerIps {
-			netDialer := settings.NetDialer()
-
-			var tlsDialContext DialTlsContextFunction
-			if settings.ProxySettings != nil {
-				tlsDialContext = func(ctx context.Context, network string, addr string) (net.Conn, error) {
-					proxyDialContext := settings.ProxySettings.NewDialContext(
-						ctx,
-						netDialer,
-					)
-
-					// this rest of this function is adapted from `tls.dial` to use a proxy dialer
-
-					conn, err := proxyDialContext(ctx, network, addr)
-					if err != nil {
-						return nil, err
-					}
-
-					if netDialer.Timeout != 0 {
-						var cancel context.CancelFunc
-						ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
-						defer cancel()
-					}
-
-					if !netDialer.Deadline.IsZero() {
-						var cancel context.CancelFunc
-						ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
-						defer cancel()
-					}
-
-					host, _, err := net.SplitHostPort(addr)
-					if err != nil {
-						panic(err)
-					}
-
-					tlsConfig := settings.TlsConfig
-					if tlsConfig == nil {
-						// `tls.defaultConfig`
-						tlsConfig = &tls.Config{}
-					}
-					if tlsConfig.ServerName == "" {
-						c := tlsConfig.Clone()
-						c.ServerName = host
-						tlsConfig = c
-					}
-
-					tlsConn := tls.Client(conn, tlsConfig)
-					func() {
-						tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
-						defer tlsCancel()
-						err = tlsConn.HandshakeContext(tlsCtx)
-					}()
-					if err != nil {
-						tlsConn.Close()
-						return nil, err
-					}
-					return tlsConn, nil
-				}
-			} else {
-				tlsDialer := &tls.Dialer{
-					NetDialer: netDialer,
-					Config:    settings.TlsConfig,
-				}
-				tlsDialContext = tlsDialer.DialContext
-			}
-
 			dialer := &clientDialer{
-				description:    "normal",
-				minimumWeight:  0.5,
-				priority:       25,
-				dialTlsContext: tlsDialContext,
-				settings:       settings,
+				description:        "normal",
+				minimumWeight:      0.5,
+				priority:           25,
+				dialTlsContext:     newNormalDialTlsContext(settings, clientWebSocketNextProtos),
+				httpDialTlsContext: newNormalDialTlsContext(settings, clientHttpNextProtos),
+				settings:           settings,
 			}
 			dialers[dialer] = true
 		}
@@ -252,28 +257,31 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		if settings.ExposeServerHostNames && settings.ExposeServerIps {
 			// fragment+reorder
 			dialer1 := &clientDialer{
-				description:    "fragment+reorder",
-				minimumWeight:  0.25,
-				priority:       50,
-				dialTlsContext: NewResilientDialTlsContext(&settings.ConnectSettings, true, true),
-				settings:       settings,
+				description:        "fragment+reorder",
+				minimumWeight:      0.25,
+				priority:           50,
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, true, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, true, clientHttpNextProtos),
+				settings:           settings,
 			}
 			// fragment
 			// this is the highest priority because it has no performance impact and additional security benefits
 			dialer2 := &clientDialer{
-				description:    "fragment",
-				minimumWeight:  0.25,
-				priority:       0,
-				dialTlsContext: NewResilientDialTlsContext(&settings.ConnectSettings, true, false),
-				settings:       settings,
+				description:        "fragment",
+				minimumWeight:      0.25,
+				priority:           0,
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, false, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, false, clientHttpNextProtos),
+				settings:           settings,
 			}
 			// reorder
 			dialer3 := &clientDialer{
-				description:    "reorder",
-				minimumWeight:  0.25,
-				priority:       50,
-				dialTlsContext: NewResilientDialTlsContext(&settings.ConnectSettings, false, true),
-				settings:       settings,
+				description:        "reorder",
+				minimumWeight:      0.25,
+				priority:           50,
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, false, true, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, false, true, clientHttpNextProtos),
+				settings:           settings,
 			}
 
 			dialers[dialer1] = true
@@ -315,7 +323,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 	*/
 
-	return &ClientStrategy{
+	clientStrategy := &ClientStrategy{
 		ctx:                 ctx,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
@@ -323,7 +331,27 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		resolvedExtenderIps: resolvedExtenderIps,
 		extenderIpSecrets:   map[netip.Addr]string{},
 	}
+	// a host network path change drops the dialers' pooled http connections:
+	// they are bound to the old path, and the next api call (auth,
+	// find-providers) would otherwise stall on a dead socket until its
+	// timeout. Clients rebuild lazily on next use. Unsubscribe rides ctx.
+	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
+	go HandleError(func() {
+		<-ctx.Done()
+		unsubNetworkChange()
+	})
+	return clientStrategy
+}
 
+// networkChanged drops every dialer's pooled connections (idle sockets bound
+// to the old network path); in-flight requests finish on their own
+// connections, and the http clients rebuild lazily on next use.
+func (self *ClientStrategy) networkChanged() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for dialer := range self.dialers {
+		dialer.Close()
+	}
 }
 
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {
@@ -363,6 +391,73 @@ func (self *ClientStrategy) NextConnectTime() time.Time {
 	}
 	self.nextConnectTime = nextConnectTime
 	return nextConnectTime
+}
+
+const (
+	// reconnectFastPathLimit caps how many callers may hold the reconnect
+	// fast path (NextReconnectTime) at once. A device runs a handful of
+	// platform transports (h1 + the h3/pt variants), so 4 covers the common
+	// migration re-dial burst while guaranteeing the platform LB never sees
+	// more than 4 unpaced dials from one strategy -- callers past the cap fall
+	// back to the serialized NextConnectTime staircase.
+	reconnectFastPathLimit = 4
+	// reconnectFastPathMaxDelay is the independent per-caller jitter for a
+	// fast-path reconnect: uniform in [0, 250ms). Enough spread that
+	// concurrent reconnects do not hit the LB in the same instant, small
+	// enough that it never becomes the dominant term of a reconnect.
+	reconnectFastPathMaxDelay = 250 * time.Millisecond
+)
+
+// NextReconnectTime is the scoped fast path of NextConnectTime for a caller
+// whose transport was connected and just lost its connection.
+//
+// NextConnectTime advances ONE shared timestamp 100ms-1s per caller, which is
+// the right shape for cold connects: a burst of brand-new connections
+// staircases instead of stampeding the platform. After a network migration the
+// same staircase is wrong -- every transport held a working connection seconds
+// ago and every one of them must re-dial now, so ~8 necessary re-dials queue
+// behind each other and the last waits multiple seconds for a connection the
+// network could carry immediately. A reconnect burst is also not a stampede:
+// its size is bounded by how many connections were up, and each caller dials
+// once.
+//
+// So a caller that self-identifies as reconnecting draws a small INDEPENDENT
+// jitter (0-250ms) that neither reads nor advances the shared timestamp. The
+// fast path is capped at reconnectFastPathLimit concurrent holders (a
+// semaphore on the strategy) so the platform LB still never sees an unbounded
+// herd; a caller past the cap falls back to the serialized path. The returned
+// release func frees the slot and MUST be called once the dial attempt
+// completes (success or failure); it is idempotent and never nil. Callers use
+// this only for the FIRST dial after a lost connection -- retries after a
+// failed reconnect go back through NextConnectTime, restoring the old pacing
+// exactly when the platform itself is what is failing.
+func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
+	acquired := false
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if self.reconnectFastPathCount < reconnectFastPathLimit {
+			self.reconnectFastPathCount += 1
+			acquired = true
+		}
+	}()
+	if !acquired {
+		// over the cap: this burst is not small after all; serialize like any
+		// other connect. NextConnectTime takes the mutex itself, so it must be
+		// called with the lock released (done above).
+		return self.NextConnectTime(), func() {}
+	}
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			self.reconnectFastPathCount -= 1
+		})
+	}
+	jitter := time.Duration(mathrand.Int63n(int64(reconnectFastPathMaxDelay)))
+	return time.Now().Add(jitter), release
 }
 
 func (self *ClientStrategy) dialerWeights() map[*clientDialer]float32 {
@@ -1044,17 +1139,13 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 	}
 
 	for _, extenderConfig := range extenderConfigs {
-		dialTlsContext := NewExtenderDialTlsContext(
-			&self.settings.ConnectSettings,
-			extenderConfig,
-		)
-
 		dialer := &clientDialer{
-			minimumWeight:  self.settings.ExtenderMinimumWeight,
-			priority:       100,
-			dialTlsContext: dialTlsContext,
-			extenderConfig: extenderConfig,
-			settings:       self.settings,
+			minimumWeight:      self.settings.ExtenderMinimumWeight,
+			priority:           100,
+			dialTlsContext:     newExtenderDialTlsContext(&self.settings.ConnectSettings, extenderConfig, clientWebSocketNextProtos),
+			httpDialTlsContext: newExtenderDialTlsContext(&self.settings.ConnectSettings, extenderConfig, clientHttpNextProtos),
+			extenderConfig:     extenderConfig,
+			settings:           self.settings,
 		}
 		expandedDialers = append(expandedDialers, dialer)
 	}
@@ -1074,7 +1165,12 @@ type clientDialer struct {
 	// 0 is max
 	priority int
 
-	dialTlsContext DialTlsContextFunction
+	// WebSocket upgrades require HTTP/1.1, while ordinary API requests can
+	// negotiate HTTP/2. Keep protocol-specific TLS dialers so enabling h2 for
+	// the API cannot make gorilla/websocket receive an h2 connection it cannot
+	// speak.
+	dialTlsContext     DialTlsContextFunction
+	httpDialTlsContext DialTlsContextFunction
 
 	extenderConfig *ExtenderConfig
 
@@ -1095,13 +1191,25 @@ func (self *clientDialer) HttpClient() *http.Client {
 	defer self.mutex.Unlock()
 
 	if self.httpClient == nil {
+		dialTlsContext := self.httpDialTlsContext
+		if dialTlsContext == nil {
+			dialTlsContext = self.dialTlsContext
+		}
 		transport := &http.Transport{
-			DialTLSContext:        self.dialTlsContext,
+			DialTLSContext:        dialTlsContext,
 			IdleConnTimeout:       self.settings.ConnectSettings.IdleConnTimeout,
 			TLSHandshakeTimeout:   self.settings.ConnectSettings.TlsTimeout,
 			ResponseHeaderTimeout: self.settings.ConnectTimeout,
 			ExpectContinueTimeout: self.settings.ConnectTimeout,
 			DisableKeepAlives:     false,
+			// A custom DialTLSContext disables net/http's automatic HTTP/2
+			// attempt unless this is set. ConnectControl and peer-key requests
+			// arrive in parallel while a provider window forms; keeping the
+			// implicit HTTP/1.1 fallback opened one TLS connection per request,
+			// repeatedly paying the pinned P-384 certificate-chain verification
+			// and creating visible CPU/pause bursts on mobile. HTTP/2
+			// multiplexes those requests over the established connection.
+			ForceAttemptHTTP2: true,
 		}
 		// a custom dial context applies to plain (non-tls) connections;
 		// tls connections use the dialTlsContext chain above
@@ -1121,9 +1229,23 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 	defer self.mutex.Unlock()
 
 	if self.websocketDialer == nil {
+		var netDialTlsContext DialTlsContextFunction
+		if self.dialTlsContext != nil {
+			netDialTlsContext = func(
+				ctx context.Context,
+				network string,
+				address string,
+			) (net.Conn, error) {
+				conn, err := self.dialTlsContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				return newWebSocketWriteBatchConn(conn), nil
+			}
+		}
 		// pool, size := MessagePool(2048)
 		self.websocketDialer = &websocket.Dialer{
-			NetDialTLSContext: self.dialTlsContext,
+			NetDialTLSContext: netDialTlsContext,
 			HandshakeTimeout:  settings.HandshakeTimeout,
 			// ReadBufferSize: size,
 			// WriteBufferSize: size,
@@ -1133,7 +1255,17 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 		// a custom dial context applies to plain ws:// connections;
 		// wss:// uses the dialTlsContext chain above
 		if dialContextSettings := settings.ConnectSettings.DialContextSettings; dialContextSettings != nil {
-			self.websocketDialer.NetDialContext = dialContextSettings.DialContext
+			self.websocketDialer.NetDialContext = func(
+				ctx context.Context,
+				network string,
+				address string,
+			) (net.Conn, error) {
+				conn, err := dialContextSettings.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				return newWebSocketWriteBatchConn(conn), nil
+			}
 		}
 	}
 	return self.websocketDialer

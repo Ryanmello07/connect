@@ -13,6 +13,36 @@ import (
 	_ "embed"
 )
 
+const clientTlsSessionCacheCapacity = 16
+
+var (
+	clientHttpNextProtos      = []string{"h2", "http/1.1"}
+	clientWebSocketNextProtos = []string{"http/1.1"}
+)
+
+// newClientTlsConfig isolates TLS session tickets to one dial path and, when
+// nextProtos is non-nil, advertises the application protocols that path's
+// caller can actually speak. A distinct bounded cache per dialer avoids
+// linking direct, resilient, and extender egress addresses while making an
+// unavoidable re-dial cheaper.
+func newClientTlsConfig(base *tls.Config, nextProtos []string) *tls.Config {
+	var config *tls.Config
+	if base == nil {
+		config = &tls.Config{}
+	} else {
+		config = base.Clone()
+	}
+	if nextProtos != nil {
+		config.NextProtos = append([]string(nil), nextProtos...)
+	}
+	// Always replace a caller-supplied cache. The strategy derives separate
+	// configs for ordinary HTTP, WebSocket, every resilient mode, and every
+	// extender; sharing the base config's cache would let a server correlate
+	// those otherwise-independent egress paths through a redeemed ticket.
+	config.ClientSessionCache = tls.NewLRUClientSessionCache(clientTlsSessionCacheCapacity)
+	return config
+}
+
 // the let's encrypt root CAs as defined at https://letsencrypt.org/certificates/
 // this includes:
 // - ISRG Root X1
@@ -32,6 +62,12 @@ func PinnedCertPool() (*x509.CertPool, error) {
 	return certPool, nil
 }
 
+// tlsClientSessionCacheCapacity sizes the per-config LRU session cache. The
+// client talks to a handful of platform hosts (api, connect, extenders resolved
+// to the platform), each caching at most a couple of tickets, so 32 is
+// generous while bounding memory to a few KB.
+const tlsClientSessionCacheCapacity = 32
+
 func DefaultTlsConfig() (*tls.Config, error) {
 	certPool, err := PinnedCertPool()
 	if err != nil {
@@ -41,6 +77,30 @@ func DefaultTlsConfig() (*tls.Config, error) {
 	tlsConfig := &tls.Config{
 		RootCAs:    certPool,
 		MinVersion: tls.VersionTLS12,
+		// Session resumption across re-dials (C4). Without a cache every
+		// reconnect pays a full handshake -- an extra round trip plus the
+		// certificate exchange -- exactly when latency matters most (a
+		// network migration re-dialing every transport at once).
+		//
+		// One cache per DefaultTlsConfig() result, shared by reference by
+		// every Clone() of it: the resilient/fragmenting dialers clone
+		// ConnectSettings.TlsConfig per dial (net_resilient.go), and the h3
+		// transport clones QuicTlsConfig per dial (transport.go, where
+		// quic-go also uses it for 0-RTT via DialEarly) -- all those clones
+		// resume against the same tickets, which is the point. Sharing one
+		// cache across hosts is safe: entries are keyed by session key
+		// (server name / addr), so same-host re-dials hit and distinct hosts
+		// never collide. The pinned RootCAs pool composes with resumption --
+		// a ticket only exists for a session whose chain already verified
+		// against the pinned pool, and Go re-validates a cached session
+		// before offering it, falling back to a full (re-verified) handshake
+		// whenever the server declines the ticket.
+		//
+		// Deliberately NOT attached to the extender configs
+		// (net_extender.go): those spoof unrelated fronted server names with
+		// InsecureSkipVerify, and a shared ticket cache could link separate
+		// extender profiles to an observer. They keep full handshakes.
+		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheCapacity),
 	}
 	return tlsConfig, nil
 }

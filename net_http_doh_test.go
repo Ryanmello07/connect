@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,64 @@ func writeDohWire(w http.ResponseWriter, r *http.Request, records []netip.Addr, 
 	}
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Write(resp)
+}
+
+func TestDohLaunchStaggerClosedStopCancels(t *testing.T) {
+	stop := make(chan struct{})
+	close(stop)
+	if waitDohLaunchStagger(context.Background(), stop, time.Hour) {
+		t.Fatal("closed stop channel must cancel the stagger wait")
+	}
+}
+
+func TestDohLaunchStaggerCanceledContextCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if waitDohLaunchStagger(ctx, make(chan struct{}), time.Hour) {
+		t.Fatal("canceled context must cancel the stagger wait")
+	}
+}
+
+func TestDohLaunchStaggerTimerAdmitsHedge(t *testing.T) {
+	if !waitDohLaunchStagger(context.Background(), make(chan struct{}), time.Nanosecond) {
+		t.Fatal("timer expiry must admit the next hedge")
+	}
+}
+
+func TestDohLaunchStaggerCancellationAtTimerBoundary(t *testing.T) {
+	// Exercise the expiry/cancellation boundary concurrently. The historical
+	// Stop-then-drain pattern could select cancellation, observe Stop == false,
+	// and then wait forever for a value from Go 1.23+'s synchronous timer
+	// channel. Either timer or cancellation may win; every waiter must return.
+	const waiterCount = 1024
+	start := make(chan struct{})
+	completed := make(chan struct{}, waiterCount)
+	for i := range waiterCount {
+		go func(i int) {
+			<-start
+			if i%2 == 0 {
+				stop := make(chan struct{})
+				close(stop)
+				waitDohLaunchStagger(context.Background(), stop, time.Nanosecond)
+			} else {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				waitDohLaunchStagger(ctx, make(chan struct{}), time.Nanosecond)
+			}
+			completed <- struct{}{}
+		}(i)
+	}
+	close(start)
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for i := 0; i < waiterCount; i++ {
+		select {
+		case <-completed:
+		case <-deadline.C:
+			t.Fatalf("only %d/%d boundary waiters returned", i, waiterCount)
+		}
+	}
 }
 
 func TestDohQuery(t *testing.T) {
@@ -345,8 +404,19 @@ func TestDohServerStagger(t *testing.T) {
 
 	testIp := netip.MustParseAddr("93.184.216.34")
 	var totalRequests int32
+	// responseDelay makes the race assertion deterministic: with instant
+	// answers the first server can respond before the launcher fires the
+	// second, legitimately short-circuiting the fan-out
+	var responseDelayMs int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&totalRequests, 1)
+		if delay := atomic.LoadInt32(&responseDelayMs); 0 < delay {
+			select {
+			case <-time.After(time.Duration(delay) * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
 	})
 	a := httptest.NewServer(handler)
@@ -357,6 +427,10 @@ func TestDohServerStagger(t *testing.T) {
 	settings := DefaultDohSettings()
 	settings.RequestTimeout = 5 * time.Second
 	settings.DohServerStagger = 500 * time.Millisecond
+	// test the stagger mechanism in isolation: disable the quiet-cache race
+	// (which intentionally bypasses the stagger when little is in flight —
+	// see DohServerRaceMaxInFlight)
+	settings.DohServerRaceMaxInFlight = 0
 	settings.DnsResolverSettings.EnableRemoteDoh = true
 	settings.DnsResolverSettings.EnableRemoteDns = false
 	settings.DnsResolverSettings.EnableLocalDns = false
@@ -368,6 +442,176 @@ func TestDohServerStagger(t *testing.T) {
 	// the first-ordered server answers immediately, well within the 500ms stagger, so the second
 	// server is never launched
 	AssertEqual(t, int32(1), atomic.LoadInt32(&totalRequests))
+
+	// with the quiet-cache race enabled (the default), an isolated query
+	// bypasses the stagger and fans out immediately (hedged request). the
+	// servers delay so both launches reliably precede either answer.
+	atomic.StoreInt32(&totalRequests, 0)
+	atomic.StoreInt32(&responseDelayMs, 100)
+	settings.DohServerRaceMaxInFlight = DefaultDohSettings().DohServerRaceMaxInFlight
+	raceCache := NewDohCache(settings)
+	addrs = raceCache.Query(ctx, "A", "race.example")
+	AssertEqual(t, slices.Contains(addrs, testIp), true)
+	AssertEqual(t, int32(2), atomic.LoadInt32(&totalRequests))
+}
+
+func TestDohServerStaggerTracksWarmPathState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testIp := netip.MustParseAddr("93.184.216.34")
+	var totalRequests atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		totalRequests.Add(1)
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+	})
+	a := httptest.NewServer(handler)
+	defer a.Close()
+	b := httptest.NewServer(handler)
+	defer b.Close()
+
+	var pathWarm atomic.Bool
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 2 * time.Second
+	settings.DohServerStagger = 300 * time.Millisecond
+	settings.DohServerWarmStagger = 50 * time.Millisecond
+	settings.DohServerRaceMaxInFlight = 0
+	settings.DohPathWarm = pathWarm.Load
+	settings.MaxServersPerQuery = 2
+	settings.MaxConcurrentHttpRequests = 4
+	settings.DohServerHedgeReserve = 1
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
+
+	cache := NewDohCache(settings)
+	defer cache.Close()
+
+	// Cold: the first 200ms answer beats the conservative 300ms stagger.
+	addrs := cache.Query(ctx, "A", "cold-stagger.example")
+	if !slices.Contains(addrs, testIp) {
+		t.Fatalf("cold query missing %s: %v", testIp, addrs)
+	}
+	if got := totalRequests.Load(); got != 1 {
+		t.Fatalf("cold path launched %d requests, want 1", got)
+	}
+
+	// Warm: the 50ms override launches the hedge before either 200ms answer.
+	pathWarm.Store(true)
+	totalRequests.Store(0)
+	addrs = cache.Query(ctx, "A", "warm-stagger.example")
+	if !slices.Contains(addrs, testIp) {
+		t.Fatalf("warm query missing %s: %v", testIp, addrs)
+	}
+	if got := totalRequests.Load(); got != 2 {
+		t.Fatalf("warm path launched %d requests, want 2", got)
+	}
+}
+
+func TestDohWarmPrimaryWaveReservesHedgeCapacity(t *testing.T) {
+	settings := DefaultDohSettings()
+	settings.MaxConcurrentHttpRequests = 32
+	settings.DohServerHedgeReserve = 4
+	settings.DohPathWarm = func() bool { return true }
+	cache := NewDohCache(settings)
+	defer cache.Close()
+
+	if got := cap(cache.remoteClient.httpSem); got != 32 {
+		t.Fatalf("http capacity=%d, want 32", got)
+	}
+	if got := cap(cache.remoteClient.primarySem); got != 28 {
+		t.Fatalf("warm primary capacity=%d, want 28", got)
+	}
+	if cache.remoteClient.primarySem != cache.localClient.primarySem {
+		t.Fatal("remote/local clients must share one primary-wave reserve")
+	}
+}
+
+func TestDohQuietRaceAdmissionIsPredictablyBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const queryCount = 8
+	const raceMax = 2
+	// Every query launches its first server immediately; only raceMax queries
+	// may bypass the stagger and launch their second server too.
+	const expectedImmediateRequests = queryCount + raceMax
+
+	testIp := netip.MustParseAddr("93.184.216.34")
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	requestSeen := make(chan struct{}, 2*queryCount)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- struct{}{}
+		select {
+		case <-release:
+			writeDohWire(w, r, []netip.Addr{testIp}, 60, false)
+		case <-r.Context().Done():
+		}
+	})
+	a := httptest.NewServer(handler)
+	defer a.Close()
+	b := httptest.NewServer(handler)
+	defer b.Close()
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 5 * time.Second
+	settings.DohServerStagger = 2 * time.Second
+	settings.DohServerRaceMaxInFlight = raceMax
+	settings.MaxServersPerQuery = 2
+	settings.MaxConcurrentHttpRequests = 2 * queryCount
+	settings.MaxConcurrentResolutions = queryCount
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{a.URL, b.URL}
+
+	dohCache := NewDohCache(settings)
+	defer dohCache.Close()
+	start := make(chan struct{})
+	results := make(chan []netip.Addr, queryCount)
+	for i := range queryCount {
+		go func(i int) {
+			<-start
+			results <- dohCache.Query(ctx, "A", fmt.Sprintf("race-bound-%d.example", i))
+		}(i)
+	}
+	close(start)
+
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for i := 0; i < expectedImmediateRequests; i++ {
+		select {
+		case <-requestSeen:
+		case <-timer.C:
+			t.Fatalf("saw only %d/%d immediate requests", i, expectedImmediateRequests)
+		}
+	}
+	// Well before the two-second stagger, no additional query may have raced.
+	select {
+	case <-requestSeen:
+		t.Fatalf("more than %d requests bypassed the stagger", expectedImmediateRequests)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	for range queryCount {
+		select {
+		case addrs := <-results:
+			if !slices.Contains(addrs, testIp) {
+				t.Fatalf("query result missing %s: %v", testIp, addrs)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for query results")
+		}
+	}
 }
 
 // TestDohHttpConcurrencyLimit: MaxConcurrentHttpRequests hard-caps concurrent in-flight DoH
@@ -599,5 +843,259 @@ func TestDohCacheShedMemory(t *testing.T) {
 	assertResolves("query after shed")
 	if got := atomic.LoadInt32(&requests); got != 2 {
 		t.Fatalf("requests after shed = %d, want 2 (the shed cache re-resolves)", got)
+	}
+}
+
+// expireCachedDohEntry rewinds every address expiration of the cached entry
+// for (recordType, domain) to `age` in the past, simulating a record set whose
+// TTL ran out that long ago -- the state serve-stale (RFC 8767) operates on.
+func expireCachedDohEntry(t *testing.T, cache *DohCache, recordType string, domain string, age time.Duration) {
+	t.Helper()
+	key := NewDohKey(recordType, domain)
+	cache.stateLock.Lock()
+	defer cache.stateLock.Unlock()
+	r := cache.queryResultExpiration[key]
+	if r == nil {
+		t.Fatalf("no cached entry for %s %s to expire", recordType, domain)
+	}
+	expireTime := time.Now().Add(-age)
+	for addr := range r.AddrExpirations {
+		r.AddrExpirations[addr] = expireTime
+	}
+}
+
+// TestDohCacheServesStaleOnResolverFailure: an expired-but-retained answer is served when the
+// fresh resolution fails (every resolver path errored -- the SERVFAIL shape), which is exactly
+// the exit-failover moment DNS must not add to. The stale serve never suppresses the resolution
+// attempt, and a later successful resolve replaces the stale answer with the fresh one.
+func TestDohCacheServesStaleOnResolverFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	staleIp := netip.MustParseAddr("203.0.113.41")
+	freshIp := netip.MustParseAddr("203.0.113.42")
+	var failing atomic.Bool
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		if failing.Load() {
+			// a transient resolver failure, NOT an authoritative answer
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if atomic.LoadInt32(&requestCount) == 1 {
+			writeDohWire(w, r, []netip.Addr{staleIp}, 60, false)
+		} else {
+			writeDohWire(w, r, []netip.Addr{freshIp}, 60, false)
+		}
+	}))
+	defer server.Close()
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 1 * time.Second
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+
+	dohCache := NewDohCache(settings)
+
+	// resolve and cache
+	addrs, authoritative := dohCache.QueryResult(ctx, "A", "stale.example")
+	AssertEqual(t, authoritative, true)
+	AssertEqual(t, slices.Contains(addrs, staleIp), true)
+
+	// the record's TTL runs out, and then every resolver path fails
+	expireCachedDohEntry(t, dohCache, "A", "stale.example", 1*time.Second)
+	failing.Store(true)
+
+	addrs, authoritative = dohCache.QueryResult(ctx, "A", "stale.example")
+	if !slices.Contains(addrs, staleIp) {
+		t.Fatalf("stale answer not served on resolver failure: %v", addrs)
+	}
+	if !authoritative {
+		t.Error("a stale-served answer must not read as SERVFAIL to the caller")
+	}
+	if got := dohCache.staleServeCount.Load(); got != 1 {
+		t.Errorf("staleServeCount = %d, want 1", got)
+	}
+	// the fresh resolution was attempted (stale never suppresses it)
+	if got := atomic.LoadInt32(&requestCount); got < 2 {
+		t.Errorf("requests = %d, want >= 2 (the stale serve must still attempt a fresh resolve)", got)
+	}
+
+	// the resolver recovers: the next query resolves fresh and replaces the
+	// stale answer rather than keeping it
+	failing.Store(false)
+	addrs, authoritative = dohCache.QueryResult(ctx, "A", "stale.example")
+	AssertEqual(t, authoritative, true)
+	AssertEqual(t, slices.Contains(addrs, freshIp), true)
+	AssertEqual(t, slices.Contains(addrs, staleIp), false)
+	if got := dohCache.staleServeCount.Load(); got != 1 {
+		t.Errorf("staleServeCount after recovery = %d, want 1 (fresh answers are not stale serves)", got)
+	}
+}
+
+// TestDohCacheStaleDoesNotOverrideAuthoritative: an authoritative NXDOMAIN wins over retained
+// stale data -- serve-stale exists for resolver FAILURE only, and a name the resolver
+// re-confirmed absent must not keep resolving to its dead addresses. The authoritative miss
+// also replaces the retained entry (later queries hit the cached miss).
+func TestDohCacheStaleDoesNotOverrideAuthoritative(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oldIp := netip.MustParseAddr("203.0.113.43")
+	var nxdomain atomic.Bool
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		if nxdomain.Load() {
+			writeDohWire(w, r, nil, 0, true)
+		} else {
+			writeDohWire(w, r, []netip.Addr{oldIp}, 60, false)
+		}
+	}))
+	defer server.Close()
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 1 * time.Second
+	settings.MissExpiration = 1 * time.Minute
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+
+	dohCache := NewDohCache(settings)
+
+	addrs, authoritative := dohCache.QueryResult(ctx, "A", "gone.example")
+	AssertEqual(t, authoritative, true)
+	AssertEqual(t, slices.Contains(addrs, oldIp), true)
+
+	expireCachedDohEntry(t, dohCache, "A", "gone.example", 1*time.Second)
+	nxdomain.Store(true)
+
+	addrs, authoritative = dohCache.QueryResult(ctx, "A", "gone.example")
+	if len(addrs) != 0 {
+		t.Fatalf("stale data overrode an authoritative NXDOMAIN: %v", addrs)
+	}
+	AssertEqual(t, authoritative, true)
+	if got := dohCache.staleServeCount.Load(); got != 0 {
+		t.Errorf("staleServeCount = %d, want 0 (authoritative answers are never stale serves)", got)
+	}
+
+	// the authoritative miss replaced the retained entry: a repeat query is a
+	// cache hit (no new upstream request) and stays empty
+	before := atomic.LoadInt32(&requestCount)
+	addrs, authoritative = dohCache.QueryResult(ctx, "A", "gone.example")
+	AssertEqual(t, len(addrs), 0)
+	AssertEqual(t, authoritative, true)
+	AssertEqual(t, atomic.LoadInt32(&requestCount), before)
+}
+
+// TestDohCacheStalePastBoundNotServed: the serve-stale bound is a hard limit -- an answer
+// expired longer than dohStaleServeBound ago is not served on failure, and its entry leaves
+// the cache.
+func TestDohCacheStalePastBoundNotServed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oldIp := netip.MustParseAddr("203.0.113.44")
+	var failing atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeDohWire(w, r, []netip.Addr{oldIp}, 60, false)
+	}))
+	defer server.Close()
+
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 1 * time.Second
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+
+	dohCache := NewDohCache(settings)
+
+	_, authoritative := dohCache.QueryResult(ctx, "A", "ancient.example")
+	AssertEqual(t, authoritative, true)
+
+	expireCachedDohEntry(t, dohCache, "A", "ancient.example", dohStaleServeBound+1*time.Second)
+	failing.Store(true)
+
+	addrs, authoritative := dohCache.QueryResult(ctx, "A", "ancient.example")
+	AssertEqual(t, len(addrs), 0)
+	AssertEqual(t, authoritative, false)
+	if got := dohCache.staleServeCount.Load(); got != 0 {
+		t.Errorf("staleServeCount = %d, want 0 (past the bound nothing may be served)", got)
+	}
+
+	// past-bound entries are dropped rather than retained
+	key := NewDohKey("A", "ancient.example")
+	dohCache.stateLock.Lock()
+	_, retained := dohCache.queryResultExpiration[key]
+	dohCache.stateLock.Unlock()
+	AssertEqual(t, retained, false)
+}
+
+// TestDohStaleUsableBounds pins the retention predicate itself: records inside the bound are
+// stale-usable, records past it are not, and an authoritative miss never is (converting a
+// resolver failure into a stale "does not exist" would be the harmful direction).
+func TestDohStaleUsableBounds(t *testing.T) {
+	now := time.Now()
+	addr := netip.MustParseAddr("203.0.113.45")
+
+	inside := &DohResult{
+		Time:            now.Add(-1 * time.Minute),
+		AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(-1 * time.Second)},
+	}
+	AssertEqual(t, inside.Valid(now, 5*time.Minute), false)
+	AssertEqual(t, inside.staleUsable(now), true)
+
+	past := &DohResult{
+		Time:            now.Add(-1 * time.Hour),
+		AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(-dohStaleServeBound - time.Second)},
+	}
+	AssertEqual(t, past.staleUsable(now), false)
+
+	miss := &DohResult{
+		Time: now.Add(-1 * time.Hour),
+		Miss: true,
+	}
+	AssertEqual(t, miss.staleUsable(now), false)
+}
+
+// TestDohStaleRetentionMemoryBound: retaining expired entries must not unbound the cache --
+// pruneCacheLocked's CacheMaxEntries cap evicts oldest-first over stale entries exactly as it
+// does over fresh ones, while stale-usable entries under the cap survive the validity sweep.
+func TestDohStaleRetentionMemoryBound(t *testing.T) {
+	settings := DefaultDohSettings()
+	settings.CacheMaxEntries = 8
+	cache := NewDohCache(settings)
+
+	now := time.Now()
+	addr := netip.MustParseAddr("203.0.113.46")
+
+	cache.stateLock.Lock()
+	for i := range 20 {
+		key := NewDohKey("A", fmt.Sprintf("stale%d.example", i))
+		cache.queryResultExpiration[key] = &DohResult{
+			Time: now.Add(-time.Duration(i+1) * time.Second),
+			// expired but inside the serve-stale bound: retained by the
+			// validity sweep, so only the entry cap bounds them
+			AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(-1 * time.Second)},
+		}
+	}
+	cache.pruneCacheLocked(now, 0)
+	retained := len(cache.queryResultExpiration)
+	cache.stateLock.Unlock()
+
+	if settings.CacheMaxEntries < retained {
+		t.Fatalf("stale retention broke the memory bound: %d entries > cap %d", retained, settings.CacheMaxEntries)
+	}
+	if retained == 0 {
+		t.Fatal("the validity sweep dropped stale-usable entries: serve-stale has nothing to serve")
 	}
 }

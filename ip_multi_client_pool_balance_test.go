@@ -59,6 +59,202 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 	}
 }
 
+// The simple single-destination client uses the same raw v2 envelope as the
+// multi-client. A successful send must consume exactly the caller's packet
+// reference; taking an extra read-only share here leaves one reference
+// outstanding on every packet even though all transfer queues drain cleanly.
+func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
+	poolOutstanding := func() int64 {
+		taken, returned, _ := MessagePoolCounts()
+		return int64(taken) - int64(returned)
+	}
+	settle := func() int64 {
+		prev := poolOutstanding()
+		stableCount := 0
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			n := poolOutstanding()
+			if n == prev {
+				stableCount += 1
+				if 4 <= stableCount {
+					break
+				}
+			} else {
+				stableCount = 0
+				prev = n
+			}
+		}
+		return prev
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultClientSettings()
+	settings.SendBufferSettings.SequenceBufferSize = 0
+	settings.SendBufferSettings.AckBufferSize = 0
+	settings.ReceiveBufferSettings.SequenceBufferSize = 0
+	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+
+	received := make(chan struct{}, 32)
+	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
+		for _, frame := range frames {
+			if frame.MessageType == protocol.MessageType_IpIpPacketToProvider {
+				select {
+				case received <- struct{}{}:
+				default:
+				}
+			}
+		}
+	})
+	natClient, err := testingNewClient(
+		ctx,
+		providerClient,
+		func(TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := settle()
+	source := SourceId(NewId())
+	const packetCount = 16
+	for i := 0; i < packetCount; i += 1 {
+		packet := poolBalanceUdp4Packet(
+			net.ParseIP("10.0.0.1"),
+			40000+i,
+			net.ParseIP("203.0.113.7"),
+			33434,
+			[]byte("single-client pool balance"),
+		)
+		if !natClient.SendPacket(source, protocol.ProvideMode_Network, packet, time.Second) {
+			MessagePoolReturn(packet)
+			t.Fatal("single-destination send was not accepted")
+		}
+	}
+	for i := 0; i < packetCount; i += 1 {
+		select {
+		case <-received:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("provider received %d/%d packets", i, packetCount)
+		}
+	}
+
+	natClient.Close()
+	providerClient.Close()
+	cancel()
+	after := settle()
+	if before < after {
+		t.Fatalf("single-destination raw sends left pooled buffers outstanding: %d -> %d (+%d)",
+			before, after, after-before)
+	}
+}
+
+// A rejected multi-client race candidate never takes ownership. The race
+// helper must undo only its read-only share and leave the caller's original
+// packet live for another candidate or retry.
+func TestMultiClientRejectedRaceAttemptRetainsOriginalPacket(t *testing.T) {
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	clientCancel()
+
+	settings := DefaultMultiClientSettings()
+	channelCtx, channelCancel := context.WithCancel(context.Background())
+	defer channelCancel()
+	channel := &multiClientChannel{
+		ctx:                       channelCtx,
+		cancel:                    channelCancel,
+		log:                       NewNoopLogger(),
+		args:                      &multiClientChannelArgs{},
+		settings:                  settings,
+		client:                    client,
+		eventBuckets:              []*multiClientEventBucket{},
+		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+		packetStats:               &clientWindowStats{log: NewNoopLogger()},
+	}
+
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.ParseIP("10.0.0.1"),
+		SourcePort:      40000,
+		DestinationIp:   net.ParseIP("203.0.113.7"),
+		DestinationPort: 443,
+	}
+	packet := poolBalanceUdp4Packet(
+		ipPath.SourceIp,
+		ipPath.SourcePort,
+		ipPath.DestinationIp,
+		ipPath.DestinationPort,
+		[]byte("rejected race ownership"),
+	)
+
+	if sendMultiClientRaceAttempt(channel, packet, ipPath, 0) {
+		MessagePoolReturn(packet)
+		t.Fatal("canceled client accepted race packet")
+	}
+	if pooled, _ := MessagePoolCheck(packet); !pooled {
+		t.Fatal("rejected race attempt returned the caller's original packet")
+	}
+	if returned := MessagePoolReturn(packet); !returned {
+		t.Fatal("original packet was not the final live reference after rejected race attempt")
+	}
+}
+
+// A rejected race candidate and an accepted sibling overlap in production:
+// the multi-client releases the original race owner when any candidate wins,
+// then SendSequence releases the winner's share asynchronously. The rejected
+// candidate must not consume either of those two references.
+func TestMultiClientRejectedRaceAttemptRetainsSuccessfulSiblingPacket(t *testing.T) {
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	clientCancel()
+
+	channelCtx, channelCancel := context.WithCancel(context.Background())
+	defer channelCancel()
+	channel := &multiClientChannel{
+		ctx:                       channelCtx,
+		cancel:                    channelCancel,
+		log:                       NewNoopLogger(),
+		args:                      &multiClientChannelArgs{},
+		settings:                  DefaultMultiClientSettings(),
+		client:                    client,
+		eventBuckets:              []*multiClientEventBucket{},
+		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+		packetStats:               &clientWindowStats{log: NewNoopLogger()},
+	}
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.ParseIP("10.0.0.1"),
+		SourcePort:      40000,
+		DestinationIp:   net.ParseIP("203.0.113.7"),
+		DestinationPort: 443,
+	}
+	packet := poolBalanceUdp4Packet(
+		ipPath.SourceIp,
+		ipPath.SourcePort,
+		ipPath.DestinationIp,
+		ipPath.DestinationPort,
+		[]byte("mixed race ownership"),
+	)
+	successfulSiblingPacket := MessagePoolShareReadOnly(packet)
+
+	if sendMultiClientRaceAttempt(channel, packet, ipPath, 0) {
+		MessagePoolReturn(successfulSiblingPacket)
+		MessagePoolReturn(packet)
+		t.Fatal("canceled client accepted race packet")
+	}
+	if returned := MessagePoolReturn(packet); returned {
+		t.Fatal("original race owner was the final reference while a successful sibling remained")
+	}
+	if returned := MessagePoolReturn(successfulSiblingPacket); !returned {
+		t.Fatal("successful sibling did not retain the final live packet reference")
+	}
+}
+
 // runMultiClientPoolCycle is one destination-change cycle: an in-memory exit, a
 // multi-client over it, a burst of egress packets, then teardown of both.
 func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
@@ -107,13 +303,13 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
-	received := make(chan []byte, 64)
+	received := make(chan struct{}, 64)
 	multi := NewRemoteUserNatMultiClient(
 		cycleCtx,
 		testMultiClientGenerator(providerClient),
 		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 			select {
-			case received <- MessagePoolShareReadOnly(packet):
+			case received <- struct{}{}:
 			default:
 			}
 		},
@@ -136,20 +332,10 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 	echoes := 0
 	for echoes < 1 {
 		select {
-		case packet := <-received:
-			MessagePoolReturn(packet)
+		case <-received:
 			echoes += 1
 		case <-echoDeadline.C:
 			t.Logf("cycle saw %d echoes (echo not required for balance)", echoes)
-			return
-		}
-	}
-	// drain anything else delivered
-	for {
-		select {
-		case packet := <-received:
-			MessagePoolReturn(packet)
-		default:
 			return
 		}
 	}

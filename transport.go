@@ -58,6 +58,11 @@ const TransportVersion = 2
 // note we don't run this because it's most efficient to let the gc handle some infrequent orphaned messages
 const DebugCloseSend = false
 
+// The platform WebSocket writer combines only messages already waiting on its
+// bounded route. Four production-safe transfer frames fit in one 16 KiB TLS
+// record, reducing write syscalls without adding a batching delay.
+const platformWebSocketWriteBatchMaxMessages = 4
+
 type TransportControl = byte
 
 const (
@@ -93,12 +98,139 @@ func (self *ClientAuth) ClientId() (Id, error) {
 	return byJwt.ClientId, nil
 }
 
+// Throttles for the log lines that flood during a control-API outage. Each is
+// package-level because the flood is across every transport and sequence at
+// once, not within one of them — a per-instance limiter would still emit once
+// per client per interval, which on a provider with thousands of clients is not
+// a limit at all. See logThrottle in log_throttle.go.
+var (
+	authErrThrottle  = newLogThrottle(time.Minute)
+	writeErrThrottle = newLogThrottle(time.Minute)
+)
+
+// shouldLogAuthErr reports whether an authentication error should be logged and returns the throttle state.
+func shouldLogAuthErr() (bool, int64) { return authErrThrottle.Allow(time.Now()) }
+
+// shouldLogWriteErr reports whether a write error should be logged and returns the associated throttle value.
+func shouldLogWriteErr() (bool, int64) { return writeErrThrottle.Allow(time.Now()) }
+
+// lastBackendFailNano is the time of the most recent backend failure (auth or
+// contract OOB), in unix nanos. Not throttled — every failure updates it, so
+// isBackendDegraded can tell a live outage from a stale count left by an old
+// blip on an otherwise idle provider.
+var lastBackendFailNano atomic.Int64
+
+// consecutiveBackendFails counts backend failures since the last success. Any
+// successful auth or OOB round-trip resets it to 0. A real platform outage
+// drives this up quickly because every attempt fails with nothing to reset it;
+// isolated transient timeouts never accumulate, because an interleaved success
+// clears the count.
+//
+// This is process-wide rather than per-Client on purpose: "is the control API
+// reachable from this host" is a property of the host, not of any one client.
+// The known limit of that framing: a process talking to MULTIPLE platform urls
+// (separate network spaces) shares one signal across them, so a dead custom
+// endpoint can gate a healthy one. Accepted for now -- the fleet and app cases
+// run one platform per process -- and keying this state by platform url is the
+// upgrade path if that changes.
+// A host running many clients gets a stronger signal from sharing the counter,
+// because a success on any client clears it — so a single misbehaving client
+// cannot trip the threshold on its own, and only a fault broad enough to fail
+// every client in a row reads as an outage. That is exactly the distinction
+// isBackendDegraded is trying to draw.
+var consecutiveBackendFails atomic.Int64
+
+// backendDegradedFailThreshold is how many consecutive backend failures (with
+// no intervening success) are required before the backend is treated as
+// degraded. Set above the level of normal transient churn so a stray timeout on
+// a busy provider is never mistaken for an outage.
+const backendDegradedFailThreshold = 3
+
+// backendDegradedWindow is how recent the last failure must be for the counter
+// to be trusted. Comfortably larger than the 60s reconnect-backoff cap, so a
+// real outage's retries always read as recent.
+const backendDegradedWindow = 2 * time.Minute
+
+// isBackendDegraded reports whether backend failures have accumulated past the
+// threshold with no intervening success, and the last one is recent. It
+// distinguishes a sustained outage (every attempt failing) from the isolated
+// single-connection timeouts that are normal churn.
+//
+// Callers use it to avoid queueing work that cannot complete: with the control
+// API unreachable, no client can authorize a contract, so contract creation,
+// contract retry pacing, and window expansion are all spending bandwidth on
+// data that has nowhere to go.
+//
+// During an outage where the transport stays connected (the control API down,
+// the websocket alive), auth never re-runs and the gated CreateContract is the
+// only other success source -- so nothing can SUCCEED to clear the state.
+// Recovery then rides the recency window instead: after backendDegradedWindow
+// without failures this reads false, the sequences that tick before three
+// fresh failures land probe the backend, and either one succeeds (clearing the
+// state) or the gate re-trips. The steady state of a long OOB-only outage is
+// therefore a bounded probe burst every ~backendDegradedWindow, not a latched
+// stop -- which is also what makes recovery need no timer of its own.
+func isBackendDegraded() bool {
+	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
+		return false
+	}
+	return time.Now().UnixNano()-lastBackendFailNano.Load() < int64(backendDegradedWindow)
+}
+
+// backendFailMu serializes the failure-state transition. Recording a failure is
+// a single logical step made of three stores (age out a dead streak, adjust the
+// counter, refresh the timestamp); interleaving them could half-clear a stale
+// streak and leave it readable as live. Backend failures are rare by definition,
+// so serializing them costs nothing, and isBackendDegraded stays lock-free.
+var backendFailMu sync.Mutex
+
+// noteBackendFailure records a failed backend round-trip (auth or contract OOB).
+//
+// A streak older than backendDegradedWindow is discarded rather than extended.
+// Without that, an idle provider that saw a few failures long ago and simply
+// stopped retrying would carry the old count forward: the next single failure
+// would push the total past the threshold with a fresh timestamp, and the
+// backend would read as degraded on the strength of one recent failure. The
+// threshold means "consecutive failures within the window", so a gap that
+// invalidates the streak for isBackendDegraded must also reset it here.
+func noteBackendFailure() {
+	now := time.Now().UnixNano()
+
+	backendFailMu.Lock()
+	defer backendFailMu.Unlock()
+
+	last := lastBackendFailNano.Load()
+	if last != 0 && int64(backendDegradedWindow) <= now-last {
+		consecutiveBackendFails.Store(1)
+	} else {
+		consecutiveBackendFails.Add(1)
+	}
+	lastBackendFailNano.Store(now)
+}
+
+// noteBackendSuccess clears the recorded backend failure state after a
+// successful auth or OOB round-trip.
+// It takes backendFailMu for the same reason noteBackendFailure does: clearing
+// the count and the timestamp is one logical transition. Unsynchronized, a
+// concurrent failure could land its increment and timestamp between the two
+// stores here, leaving a positive count with a zero timestamp — a state
+// isBackendDegraded reads as "not degraded" while failures are in fact
+// accumulating.
+func noteBackendSuccess() {
+	backendFailMu.Lock()
+	defer backendFailMu.Unlock()
+
+	consecutiveBackendFails.Store(0)
+	lastBackendFailNano.Store(0)
+}
+
 // (ctx, network, address)
 // type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
 
 type PlatformTransportSettings struct {
 	// Log, when set, is used by the platform transport and its framer
-	// (propagated to `FramerSettings.Log` when nil).
+	// (used for the framer when `FramerSettings.Log` is nil, via a private
+	// copy — the caller's `FramerSettings` is never mutated).
 	// nil resolves to `DefaultLogger()`.
 	Log Logger
 
@@ -181,6 +313,12 @@ type PlatformTransport struct {
 	auth        *ClientAuth
 
 	settings *PlatformTransportSettings
+	// the effective framer settings: `settings.FramerSettings`, or a private
+	// copy of it when the transport log is propagated into a nil
+	// `FramerSettings.Log`. The caller's settings are never mutated — they
+	// may be shared with concurrent framer users (see
+	// NewPlatformTransportWithTargetMode).
+	framerSettings *FramerSettings
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -201,6 +339,28 @@ type PlatformTransport struct {
 	// transport to come up before closing the old one (CONNECTDRAIN2.md §3.3)
 	registeredCount  atomic.Int64
 	connectedMonitor *Monitor
+
+	// kickMonitor closes the live connection (if any) so the run loop
+	// re-dials immediately — fired on a host network path change
+	// (NetworkChanged), where the current socket is likely bound to a dead
+	// path and would otherwise linger until a ping/write timeout notices.
+	// Ported from upstream main e05ecee, merged with our reconnect fast
+	// path: the kicked re-dial goes through NextReconnectTime (small
+	// independent jitter, capped concurrency) rather than the serialized
+	// NextConnectTime staircase, since a network change is a legitimate
+	// fresh start.
+	kickMonitor *Monitor
+	// unsubNetworkChange removes this transport from the process
+	// network-change listeners when the run loop exits.
+	unsubNetworkChange func()
+}
+
+// Kick closes the transport's live connection (if any) and skips any pending
+// reconnect backoff so the run loop re-dials immediately over the new path.
+// The transport itself stays up; an in-flight dial is unaffected. Safe to
+// call at any time.
+func (self *PlatformTransport) Kick() {
+	self.kickMonitor.NotifyAll()
 }
 
 // IsConnected reports whether the transport has a connection with routes
@@ -271,9 +431,14 @@ func NewPlatformTransportWithTargetMode(
 ) *PlatformTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	log := loggerOrDefault(settings.Log)
-	// propagate so a transport-level logger covers the framer
-	if settings.FramerSettings != nil && settings.FramerSettings.Log == nil {
-		settings.FramerSettings.Log = log
+	// propagate so a transport-level logger covers the framer. Copy instead
+	// of writing through the caller's settings: the caller may share the
+	// framer settings with concurrently running framers (racing this write).
+	framerSettings := settings.FramerSettings
+	if framerSettings != nil && framerSettings.Log == nil {
+		copied := *framerSettings
+		copied.Log = log
+		framerSettings = &copied
 	}
 	transport := &PlatformTransport{
 		ctx:    cancelCtx,
@@ -292,13 +457,23 @@ func NewPlatformTransportWithTargetMode(
 		platformUrl:          platformUrl,
 		auth:                 auth,
 		settings:             settings,
+		framerSettings:       framerSettings,
 		availableModeMonitor: NewMonitor(),
 		availableModes:       map[TransportMode]bool{},
 		targetMode:           targetMode,
 		mode:                 NewMonitorValue(TransportModeNone),
 		connectedMonitor:     NewMonitor(),
+		kickMonitor:          NewMonitor(),
 	}
-	go HandleError(transport.run, cancel)
+	// a host network path change kicks the live connection so the re-dial
+	// happens now instead of after a ping/write timeout notices the dead path.
+	// unsubscribe rides the run loop exit (ctx cancel), not just Close — most
+	// owners tear transports down by canceling the client ctx.
+	transport.unsubNetworkChange = AddNetworkChangeListener(transport.Kick)
+	go HandleError(func() {
+		defer transport.unsubNetworkChange()
+		transport.run()
+	}, cancel)
 	return transport
 }
 
@@ -506,6 +681,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 	}
 
+	// hadConnection marks the iteration immediately after a connection ran and
+	// died: only that first re-dial takes the reconnect fast path
+	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
+	// the serialized NextConnectTime pacing.
+	hadConnection := false
+
 	for {
 		// stand down while a strictly better mode is active
 		func() {
@@ -579,10 +760,27 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			return ws, nil
 		}
 
-		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+		// a transport that was connected and just died takes the reconnect
+		// fast path (small independent jitter, capped concurrency) instead of
+		// the shared serializing staircase; see NextReconnectTime. The release
+		// frees the fast-path slot as soon as the dial attempt completes, on
+		// every exit path.
+		var connectTime time.Time
+		releaseReconnect := func() {}
+		if hadConnection {
+			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+			hadConnection = false
+		} else {
+			connectTime = self.clientStrategy.NextConnectTime()
+		}
+		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
+				releaseReconnect()
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed while waiting to dial: any pacing computed
+				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
 		}
@@ -594,15 +792,45 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			ws, err = connect()
 		}
+		releaseReconnect()
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			// a canceled dial is local teardown -- this transport or its owner
+			// shutting down mid-connect -- not a backend signal. Without this
+			// carve-out, closing a multi-client window cancels many transports
+			// at once and the burst of canceled dials trips the degraded
+			// threshold with fresh timestamps, so the NEXT session starts
+			// gated. The contract OOB path makes the same carve-out on
+			// client.Done.
+			if self.ctx.Err() == nil {
+				noteBackendFailure()
+			}
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			} else if v := self.log.V(1); v.Enabled() {
+				// throttled at INFO; -v=1 still shows every attempt
+				v.Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed: the failed dial was likely on the dead
+				// path — retry now over the new one instead of waiting out
+				// the backoff, and take the reconnect fast path (a network
+				// change is a legitimate fresh start, not staircase churn)
+				hadConnection = true
+				continue
 			case <-reconnect.After():
 				continue
 			}
 		}
+
+		// auth succeeded: the backend is reachable
+		noteBackendSuccess()
 
 		c := func() {
 			defer ws.Close()
@@ -612,6 +840,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			// a network-change kick closes this connection so the loop
+			// re-dials over the new path immediately (see Kick). the ws.Close
+			// is what unblocks a reader/writer parked in a socket call that
+			// handleCancel alone cannot wake.
+			kick := self.kickMonitor.NotifyChannel()
+			go HandleError(func() {
+				select {
+				case <-handleCtx.Done():
+				case <-kick:
+					self.log.Infof("[t]kick: closing connection for re-dial\n")
+					handleCancel()
+					ws.Close()
+				}
+			})
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64
@@ -695,6 +938,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
+				// Close the socket before waiting for the writer. A context
+				// cancellation does not interrupt a goroutine already blocked
+				// in net.Conn.Write. Waiting first inverted that dependency:
+				// window-client removal, app disconnect, and migration could
+				// remain stuck until WriteTimeout, retaining the old transport
+				// and all of its queues. The outer deferred Close remains as an
+				// idempotent backstop for exits before routes are registered.
+				ws.Close()
 				// once the writer has exited and no new writes can be routed,
 				// drain any pooled messages still sitting in send. a stale
 				// reflect.Select in MultiRouteSelector that captured our
@@ -739,14 +990,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				defer handleCancel()
 
 				speedTest := false
+				pingTimer := time.NewTimer(0)
+				defer pingTimer.Stop()
+				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 
-				write := func(message []byte) error {
-					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+				writeMessage := func(message []byte) error {
 					err := ws.WriteMessage(websocket.BinaryMessage, message)
 					MessagePoolReturn(message)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
-						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+						if ok, suppressed := shouldLogWriteErr(); ok {
+							if suppressed > 0 {
+								self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+							} else {
+								self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
+						} else if v := self.log.V(1); v.Enabled() {
+							v.Infof("[ts]%s-> error = %s\n", clientId, err)
+						}
 						return err
 					}
 					if self.log.V(2).Enabled() {
@@ -755,6 +1016,64 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 					writeCounter.Add(1)
 					return nil
+				}
+				write := func(message []byte) error {
+					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					return writeMessage(message)
+				}
+				writeSendMessage := func(message []byte) error {
+					if len(message) <= 16 {
+						self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+						MessagePoolReturn(message)
+						return nil
+					}
+					return writeMessage(message)
+				}
+
+				writeBatchConn, _ :=
+					ws.UnderlyingConn().(*webSocketWriteBatchConn)
+				writeReadySendBatch := func(
+					firstMessage []byte,
+				) (sendOpen bool, err error) {
+					if writeBatchConn == nil {
+						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+						return true, writeSendMessage(firstMessage)
+					}
+
+					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					writeBatchConn.beginWriteBatch()
+					if err = writeSendMessage(firstMessage); err != nil {
+						writeBatchConn.abortWriteBatch()
+						return true, err
+					}
+
+					sendOpen = true
+				drainReady:
+					for range platformWebSocketWriteBatchMaxMessages - 1 {
+						select {
+						case <-handleCtx.Done():
+							writeBatchConn.abortWriteBatch()
+							return false, nil
+						case message, ok := <-send:
+							if !ok {
+								sendOpen = false
+								break drainReady
+							}
+							if err = writeSendMessage(message); err != nil {
+								writeBatchConn.abortWriteBatch()
+								return true, err
+							}
+						default:
+							break drainReady
+						}
+					}
+					if err = writeBatchConn.flushWriteBatch(); err != nil {
+						// A WebSocket write timeout or partial TLS write cannot
+						// be recovered; the transfer sequence retains each
+						// item and retries it over the replacement route.
+						self.log.Infof("[ts]%s-> batch flush error = %s\n", clientId, err)
+					}
+					return
 				}
 
 				for {
@@ -766,12 +1085,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						select {
 						case <-handleCtx.Done():
 							return
-						case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+						case <-pingTimer.C:
 							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 								// note that for websocket a dealine timeout cannot be recovered
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
 							if !ok {
 								return
@@ -785,6 +1105,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if write(message) != nil {
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-send:
 							if !ok {
 								return
@@ -795,6 +1116,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							} else if write(message) != nil {
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					} else {
 						select {
@@ -808,18 +1130,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							// 	panic("[t]shared should be set")
 							// }
 
-							if len(message) <= 16 {
-								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-								MessagePoolReturn(message)
-							} else if write(message) != nil {
+							sendOpen, err := writeReadySendBatch(message)
+							if err != nil || !sendOpen {
 								return
 							}
-						case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+						case <-pingTimer.C:
 							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 								// note that for websocket a dealine timeout cannot be recovered
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
 							if !ok {
 								return
@@ -833,6 +1155,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if write(message) != nil {
 								return
 							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					}
 				}
@@ -846,6 +1169,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 					drain(receive)
 					drain(controlSend)
+				}()
+				var receiveTimer *time.Timer
+				defer func() {
+					if receiveTimer != nil {
+						receiveTimer.Stop()
+					}
 				}()
 
 				speedTest := false
@@ -933,21 +1262,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							continue
 						}
 
+						timeoutChan := resetOrCreateTimer(&receiveTimer, self.settings.ReadTimeout)
 						select {
 						case <-handleCtx.Done():
+							receiveTimer.Stop()
 							MessagePoolReturn(message)
 							return
 						case receive <- message:
+							receiveTimer.Stop()
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[tr]%s<-\n", clientId)
 							}
-						case <-time.After(self.settings.ReadTimeout):
+						case <-timeoutChan:
 							self.log.Infof("[tr]drop %s<-\n", clientId)
 							MessagePoolReturn(message)
 						}
 					default:
 						if self.log.V(2).Enabled() {
-							self.log.Infof("[tr]other=%s %s<-\n", messageType, clientId)
+							self.log.Infof("[tr]other=%v %s<-\n", messageType, clientId)
 						}
 					}
 
@@ -978,10 +1310,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			c()
 		}
+		// the connection ran and died: the next dial is a reconnect
+		hadConnection = true
 
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-self.kickMonitor.NotifyChannel():
+			// a kick arriving after the connection already died skips the
+			// residual backoff — the fast-path re-dial starts now. (the kick
+			// that killed the connection closed the previous notify channel;
+			// this arm arms a fresh one, so one kick fires exactly once here.)
 		case <-reconnect.After():
 		}
 	}
@@ -1014,6 +1353,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		case <-time.After(initialTimeout):
 		}
 	}
+
+	// hadConnection marks the iteration immediately after a connection ran and
+	// died: only that first re-dial takes the reconnect fast path
+	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
+	// the serialized NextConnectTime pacing.
+	hadConnection := false
 
 	for {
 		// wait until we are back in the specific pt mode or auto mode
@@ -1168,7 +1513,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				return nil, err
 			}
 
-			framer := NewFramer(self.settings.FramerSettings)
+			framer := NewFramer(self.framerSettings)
 
 			stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
 			if err := framer.Write(stream, authBytes); err != nil {
@@ -1193,10 +1538,27 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}, nil
 		}
 
-		if connectDelay := self.clientStrategy.NextConnectTime().Sub(time.Now()); 0 < connectDelay {
+		// a transport that was connected and just died takes the reconnect
+		// fast path (small independent jitter, capped concurrency) instead of
+		// the shared serializing staircase; see NextReconnectTime. The release
+		// frees the fast-path slot as soon as the dial attempt completes, on
+		// every exit path.
+		var connectTime time.Time
+		releaseReconnect := func() {}
+		if hadConnection {
+			connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+			hadConnection = false
+		} else {
+			connectTime = self.clientStrategy.NextConnectTime()
+		}
+		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
+				releaseReconnect()
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed while waiting to dial: any pacing computed
+				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
 		}
@@ -1208,15 +1570,44 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			connStream, err = connect()
 		}
+		releaseReconnect()
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			// a canceled dial is local teardown -- this transport or its owner
+			// shutting down mid-connect -- not a backend signal. Without this
+			// carve-out, closing a multi-client window cancels many transports
+			// at once and the burst of canceled dials trips the degraded
+			// threshold with fresh timestamps, so the NEXT session starts
+			// gated. The contract OOB path makes the same carve-out on
+			// client.Done.
+			if self.ctx.Err() == nil {
+				noteBackendFailure()
+			}
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			} else if v := self.log.V(1); v.Enabled() {
+				// throttled at INFO; -v=1 still shows every attempt
+				v.Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-self.kickMonitor.NotifyChannel():
+				// network changed: retry now over the new path and take the
+				// reconnect fast path (see the h1 loop above)
+				hadConnection = true
+				continue
 			case <-reconnect.After():
 				continue
 			}
 		}
+
+		// auth succeeded: the backend is reachable
+		noteBackendSuccess()
+
 		conn := connStream.conn
 		stream := connStream.stream
 
@@ -1229,7 +1620,22 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
-			framer := NewFramer(self.settings.FramerSettings)
+			// a network-change kick closes this connection so the loop
+			// re-dials over the new path immediately (see Kick). closing the
+			// QUIC connection is what unblocks a reader/writer parked in a
+			// stream call that handleCancel alone cannot wake.
+			kick := self.kickMonitor.NotifyChannel()
+			go HandleError(func() {
+				select {
+				case <-handleCtx.Done():
+				case <-kick:
+					self.log.Infof("[t]kick: closing connection for re-dial\n")
+					handleCancel()
+					conn.CloseWithError(0, "network change")
+				}
+			})
+
+			framer := NewFramer(self.framerSettings)
 
 			var readCounter atomic.Uint64
 			var writeCounter atomic.Uint64
@@ -1274,6 +1680,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
+				// Like the websocket path, a QUIC stream write already in the
+				// kernel does not observe context cancellation. Break the
+				// connection before joining the writer so teardown is bounded
+				// by local scheduling rather than the write deadline.
+				conn.CloseWithError(0, "transport teardown")
 				// note `send` is not closed. drain any pooled bytes still
 				// queued after the writer exits and RemoveTransport has
 				// stopped new route writes. a stale reflect.Select may
@@ -1317,6 +1728,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				defer h3WriterCancel()
 				defer handleCancel()
 
+				pingTimer := time.NewTimer(0)
+				defer pingTimer.Stop()
+				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+
 				for {
 					select {
 					case <-handleCtx.Done():
@@ -1333,18 +1748,28 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						MessagePoolReturn(message)
 						if err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
-							self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							if ok, suppressed := shouldLogWriteErr(); ok {
+								if suppressed > 0 {
+									self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+								} else {
+									self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+								}
+							} else if v := self.log.V(1); v.Enabled() {
+								v.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
 							return
 						}
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[ts]%s->\n", clientId)
 						}
-					case <-WakeupAfter(self.settings.PingTimeout, self.settings.PingTimeout):
+						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+					case <-pingTimer.C:
 						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
 						if err := framer.Write(stream, make([]byte, 0)); err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							return
 						}
+						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 					}
 				}
 			}, handleCancel)
@@ -1353,6 +1778,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				defer func() {
 					handleCancel()
 					close(receive)
+				}()
+				var receiveTimer *time.Timer
+				defer func() {
+					if receiveTimer != nil {
+						receiveTimer.Stop()
+					}
 				}()
 
 				for {
@@ -1378,15 +1809,21 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						continue
 					}
 
+					timeoutChan := resetOrCreateTimer(
+						&receiveTimer,
+						time.Duration(slowMultiple)*self.settings.ReadTimeout,
+					)
 					select {
 					case <-handleCtx.Done():
+						receiveTimer.Stop()
 						MessagePoolReturn(message)
 						return
 					case receive <- message:
+						receiveTimer.Stop()
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
 						}
-					case <-time.After(time.Duration(slowMultiple) * self.settings.ReadTimeout):
+					case <-timeoutChan:
 						self.log.Infof("[tr]drop %s<-\n", clientId)
 						MessagePoolReturn(message)
 					}
@@ -1406,10 +1843,16 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		} else {
 			c()
 		}
+		// the connection ran and died: the next dial is a reconnect
+		hadConnection = true
 
 		select {
 		case <-self.ctx.Done():
 			return
+		case <-self.kickMonitor.NotifyChannel():
+			// a kick arriving after the connection already died skips the
+			// residual backoff — the fast-path re-dial starts now (see the
+			// h1 loop above)
 		case <-reconnect.After():
 		}
 	}
@@ -1417,6 +1860,12 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 func (self *PlatformTransport) Close() {
 	self.cancel()
+	// unsubscribe eagerly (idempotent; the run loop's deferred unsubscribe
+	// also fires) so a NetworkChanged broadcast racing Close cannot kick a
+	// transport whose owner already considers it dead.
+	if self.unsubNetworkChange != nil {
+		self.unsubNetworkChange()
+	}
 }
 
 func connectHost(platformUrl string) (string, error) {

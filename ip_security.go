@@ -51,9 +51,10 @@ func (self SecurityPolicyResult) String() string {
 
 type SecurityPolicy interface {
 	Stats() *SecurityPolicyStatsCollector
+	// ipPath, its address slices, and payload are read-only and valid only for
+	// the duration of each call. Implementations that retain them must copy.
 	// InspectEgress decides the fate of a packet on the send (client->destination)
-	// direction. payload is the L4 payload (may be nil for header-only inspection); it is
-	// valid only for the duration of the call.
+	// direction. payload is the L4 payload (may be nil for header-only inspection).
 	InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error)
 	// InspectIngress decides the fate of a packet on the return (destination->client)
 	// direction.
@@ -64,6 +65,92 @@ type SecurityPolicy interface {
 	// call them at every forwarding point alongside (or in place of) the inspection.
 	RefreshEgress(ipPath *IpPath)
 	RefreshIngress(ipPath *IpPath)
+}
+
+// borrowedEgressSecurityPolicy is the built-in, allocation-free counterpart to
+// the public pointer API. A dynamic interface call is conservatively allowed to
+// retain its pointer argument, so passing a stack IpPath through SecurityPolicy
+// forces one heap object per packet even though the documented contract is
+// call-scoped. Built-ins accept the path by value; custom policies continue to
+// use the compatible public fallback below.
+type borrowedEgressSecurityPolicy interface {
+	inspectAndRefreshEgressBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPath IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, error)
+}
+
+func inspectAndRefreshEgressBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	if borrowed, ok := policy.(borrowedEgressSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshEgressBorrowed(provideMode, ipPath, payload)
+	}
+	return inspectAndRefreshEgressFallback(policy, provideMode, ipPath, payload)
+}
+
+// Keep the address-taking fallback in a separate non-inlined function. Escape
+// analysis is flow-insensitive within a function; placing &ipPath in the fast
+// dispatcher would allocate its copy even when the built-in value interface
+// succeeds.
+//
+//go:noinline
+func inspectAndRefreshEgressFallback(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	// An external implementation may retain a pointer despite the interface
+	// contract. Let only this fallback copy escape, never the caller's stack
+	// path.
+	result, err := policy.InspectEgress(provideMode, &ipPath, payload)
+	if err == nil {
+		policy.RefreshEgress(&ipPath)
+	}
+	return result, err
+}
+
+// borrowedIngressSecurityPolicy is the return-path counterpart to
+// borrowedEgressSecurityPolicy. The public pointer API remains available for
+// custom policies, while built-ins can inspect a packet-backed stack value
+// without forcing one heap IpPath per received packet.
+type borrowedIngressSecurityPolicy interface {
+	inspectAndRefreshIngressBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPath IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, error)
+}
+
+func inspectAndRefreshIngressBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	if borrowed, ok := policy.(borrowedIngressSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshIngressBorrowed(provideMode, ipPath, payload)
+	}
+	return inspectAndRefreshIngressFallback(policy, provideMode, ipPath, payload)
+}
+
+//go:noinline
+func inspectAndRefreshIngressFallback(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := policy.InspectIngress(provideMode, &ipPath, payload)
+	if err == nil {
+		policy.RefreshIngress(&ipPath)
+	}
+	return result, err
 }
 
 // egressRelationship combines the packet source's provide mode with the local
@@ -135,6 +222,18 @@ func (self *securityPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPa
 	return result, err
 }
 
+func (self *securityPolicy) inspectAndRefreshEgressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.InspectEgress(provideMode, &ipPath, payload)
+	if err == nil {
+		self.RefreshEgress(&ipPath)
+	}
+	return result, err
+}
+
 func (self *securityPolicy) inspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, nil
@@ -177,6 +276,18 @@ func (self *securityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipP
 	result, err := self.inspectIngress(provideMode, ipPath)
 	if ipPath != nil {
 		self.stats.AddSource(ipPath, result, 1)
+	}
+	return result, err
+}
+
+func (self *securityPolicy) inspectAndRefreshIngressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.InspectIngress(provideMode, &ipPath, payload)
+	if err == nil {
+		self.RefreshIngress(&ipPath)
 	}
 	return result, err
 }
@@ -238,7 +349,23 @@ func (self *disableSecurityPolicy) InspectEgress(provideMode protocol.ProvideMod
 	return SecurityPolicyResultAllow, nil
 }
 
+func (self *disableSecurityPolicy) inspectAndRefreshEgressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
 func (self *disableSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *disableSecurityPolicy) inspectAndRefreshIngressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
 	return SecurityPolicyResultAllow, nil
 }
 
@@ -267,8 +394,28 @@ func (self *reverseSecurityPolicy) InspectEgress(provideMode protocol.ProvideMod
 	return self.policy.InspectIngress(provideMode, ipPath, payload)
 }
 
+func (self *reverseSecurityPolicy) inspectAndRefreshEgressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.policy.InspectIngress(provideMode, &ipPath, payload)
+	if err == nil {
+		self.policy.RefreshIngress(&ipPath)
+	}
+	return result, err
+}
+
 func (self *reverseSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	return self.policy.InspectEgress(provideMode, ipPath, payload)
+}
+
+func (self *reverseSecurityPolicy) inspectAndRefreshIngressBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return inspectAndRefreshEgressBorrowed(self.policy, provideMode, ipPath, payload)
 }
 
 func (self *reverseSecurityPolicy) RefreshEgress(ipPath *IpPath) {
@@ -308,6 +455,17 @@ func isPublicUnicast(ip net.IP) bool {
 }
 
 type SecurityPolicyStats = map[SecurityPolicyResult]map[SecurityDestination]uint64
+
+const (
+	// securityPolicyStatsMaxDestinationsPerResult includes one overflow
+	// destination. Security-policy statistics are diagnostics, not flow state:
+	// a long-lived provider must not retain every ephemeral port it has ever
+	// relayed or clone that growing set whenever statistics are inspected.
+	securityPolicyStatsMaxDestinationsPerResult = 1024
+	securityPolicyStatsUnknownResult            = SecurityPolicyResult(-1)
+)
+
+var securityPolicyStatsOverflowDestination = SecurityDestination{}
 
 type SecurityDestination struct {
 	Version  int
@@ -381,6 +539,9 @@ func (self *SecurityDestination) Cmp(b SecurityDestination) int {
 }
 
 func (self *SecurityDestination) String() string {
+	if *self == securityPolicyStatsOverflowDestination {
+		return "other destinations"
+	}
 	return fmt.Sprintf("ipv%d %s %s",
 		self.Version,
 		self.Protocol.String(),
@@ -403,13 +564,24 @@ func DefaultSecurityPolicyStatsCollector() *SecurityPolicyStatsCollector {
 	}
 }
 
-func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
-	var destination SecurityDestination
-	if self.includeIp {
-		destination = newSecurityDestination(ipPath)
-	} else {
-		// port only, no ip
-		destination = newSecurityDestinationPort(ipPath)
+// add records one diagnostic count while bounding every result's destination
+// cardinality. Built-in policies produce the three declared results; callers
+// passing another integer share one unknown-result bucket so arbitrary result
+// values cannot defeat the memory bound.
+func (self *SecurityPolicyStatsCollector) add(
+	destination SecurityDestination,
+	result SecurityPolicyResult,
+	count uint64,
+) {
+	if count == 0 {
+		return
+	}
+	switch result {
+	case SecurityPolicyResultDrop,
+		SecurityPolicyResultAllow,
+		SecurityPolicyResultIncident:
+	default:
+		result = securityPolicyStatsUnknownResult
 	}
 
 	self.stateLock.Lock()
@@ -420,7 +592,24 @@ func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result 
 		destinationCounts = map[SecurityDestination]uint64{}
 		self.resultDestinationCounts[result] = destinationCounts
 	}
+	if _, ok := destinationCounts[destination]; !ok &&
+		securityPolicyStatsMaxDestinationsPerResult <= len(destinationCounts)+1 {
+		// Reserve the final slot for all later destinations. A real IpPath has
+		// version 4 or 6, so the zero destination cannot collide with one.
+		destination = securityPolicyStatsOverflowDestination
+	}
 	destinationCounts[destination] += count
+}
+
+func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
+	var destination SecurityDestination
+	if self.includeIp {
+		destination = newSecurityDestination(ipPath)
+	} else {
+		// port only, no ip
+		destination = newSecurityDestinationPort(ipPath)
+	}
+	self.add(destination, result, count)
 }
 
 func (self *SecurityPolicyStatsCollector) AddSource(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
@@ -431,16 +620,7 @@ func (self *SecurityPolicyStatsCollector) AddSource(ipPath *IpPath, result Secur
 		// port only, no ip
 		destination = newSecuritySourcePort(ipPath)
 	}
-
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-
-	destinationCounts, ok := self.resultDestinationCounts[result]
-	if !ok {
-		destinationCounts = map[SecurityDestination]uint64{}
-		self.resultDestinationCounts[result] = destinationCounts
-	}
-	destinationCounts[destination] += count
+	self.add(destination, result, count)
 }
 
 func (self *SecurityPolicyStatsCollector) Stats(reset bool) SecurityPolicyStats {
