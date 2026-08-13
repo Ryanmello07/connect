@@ -7,6 +7,7 @@ import (
 	"testing"
 )
 
+// TestErrorSentinelsAreDistinct asserts no two sentinels are errors.Is-equal to each other.
 func TestErrorSentinelsAreDistinct(t *testing.T) {
 	sentinels := []error{
 		ErrTruncated,
@@ -37,6 +38,7 @@ func TestErrorSentinelsAreDistinct(t *testing.T) {
 	}
 }
 
+// TestErrorSentinelsSurviveAJoin asserts sentinels survive errors.Join without losing their identity.
 func TestErrorSentinelsSurviveAJoin(t *testing.T) {
 	joined := errors.Join(ErrLengthExceedsMax, ErrTruncated)
 	if !errors.Is(joined, ErrLengthExceedsMax) {
@@ -50,6 +52,7 @@ func TestErrorSentinelsSurviveAJoin(t *testing.T) {
 	}
 }
 
+// TestLengthLimits asserts the three length constants match RFC 9420 and spec A section 5.8.
 func TestLengthLimits(t *testing.T) {
 	if MaxVarint != 1073741823 {
 		t.Errorf("MaxVarint is %d, want 1073741823 per rfc 9420 section 2.1.2", MaxVarint)
