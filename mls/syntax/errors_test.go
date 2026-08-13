@@ -38,7 +38,10 @@ func TestErrorSentinelsAreDistinct(t *testing.T) {
 	}
 }
 
-// TestErrorSentinelsSurviveAJoin asserts sentinels survive errors.Join without losing their identity.
+// TestErrorSentinelsSurviveAJoin guards against a future custom Unwrap or Is method on a sentinel
+// breaking errors.Join traversal. The test cannot fail today: sentinels are plain errors.New values,
+// so join behaviour is entirely standard library. It exists as a regression guard because seven
+// downstream packages compare these sentinels with errors.Is.
 func TestErrorSentinelsSurviveAJoin(t *testing.T) {
 	joined := errors.Join(ErrLengthExceedsMax, ErrTruncated)
 	if !errors.Is(joined, ErrLengthExceedsMax) {
