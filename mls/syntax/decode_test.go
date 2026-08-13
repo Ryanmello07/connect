@@ -122,19 +122,54 @@ func TestReaderLimitIsCarried(t *testing.T) {
 // immediately without consuming input, and Done reports it too. This mirrors the
 // precedent set for NewWriterLimit in encode.go — validate at construction, do not
 // defer — because ErrNegativeLength's own doc comment claims it fires on exactly
-// this misuse, on both halves of the codec.
+// this misuse, on both halves of the codec. Checked across all five read methods
+// (ReadUint8, ReadUint16, ReadUint32, ReadUint64, ReadRaw), since the sticky guard
+// sits at a distinct call site in each and any one of them could be missed.
 func TestNewReaderLimitRejectsNegative(t *testing.T) {
-	r := NewReaderLimit([]byte{0x01, 0x02}, -1)
+	r := NewReaderLimit([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, -1)
 	if _, err := r.ReadUint8(); !errors.Is(err, ErrNegativeLength) {
 		t.Errorf("ReadUint8 gave %v, want ErrNegativeLength", err)
 	}
-	if r.Offset() != 0 {
-		t.Errorf("Offset is %d, want 0: a read reporting the construction error must not consume input", r.Offset())
+	if _, err := r.ReadUint16(); !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("ReadUint16 gave %v, want ErrNegativeLength", err)
+	}
+	if _, err := r.ReadUint32(); !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("ReadUint32 gave %v, want ErrNegativeLength", err)
+	}
+	if _, err := r.ReadUint64(); !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("ReadUint64 gave %v, want ErrNegativeLength", err)
 	}
 	if _, err := r.ReadRaw(1); !errors.Is(err, ErrNegativeLength) {
 		t.Errorf("ReadRaw gave %v, want ErrNegativeLength", err)
 	}
+	if r.Offset() != 0 {
+		t.Errorf("Offset is %d, want 0: a read reporting the construction error must not consume input", r.Offset())
+	}
 	if err := r.Done(); !errors.Is(err, ErrNegativeLength) {
 		t.Errorf("Done gave %v, want ErrNegativeLength", err)
+	}
+}
+
+// TestReaderLatchesAFailureAsSticky asserts that once a read fails, that failure
+// is latched into the Reader: a caller that ignores the error and issues a
+// second, smaller read against the same still-unconsumed bytes must not silently
+// succeed and reinterpret them as a different field. It must instead report the
+// same, first error, and Done must report it too rather than treating the
+// (partially, wrongly) advanced input as fully consumed.
+func TestReaderLatchesAFailureAsSticky(t *testing.T) {
+	r := NewReader([]byte{0x01, 0x02})
+	if _, err := r.ReadUint32(); !errors.Is(err, ErrTruncated) {
+		t.Fatalf("ReadUint32 gave %v, want ErrTruncated", err)
+	}
+	// The two bytes above are enough to satisfy ReadUint16 on their own: without
+	// latching, this call would silently succeed and return 0x0102.
+	if v, err := r.ReadUint16(); !errors.Is(err, ErrTruncated) {
+		t.Errorf("ReadUint16 after an ignored ErrTruncated gave value %#x, err %v; want the latched ErrTruncated and no value", v, err)
+	}
+	if r.Offset() != 0 {
+		t.Errorf("Offset is %d, want 0: a read blocked by the latched error must not consume input", r.Offset())
+	}
+	if err := r.Done(); !errors.Is(err, ErrTruncated) {
+		t.Errorf("Done gave %v, want the latched ErrTruncated", err)
 	}
 }

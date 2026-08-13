@@ -1,14 +1,22 @@
 // The decode half of the codec, and the mirror of Writer in encode.go. Reader is a
 // cursor over a byte slice: every read is bounds checked against the bytes that
 // remain before it advances the cursor, so a failed read leaves the cursor exactly
-// where it was and the first error reported is always the cause rather than a
-// downstream symptom of it. This file carries the cursor and the fixed-width
-// portion of the contract — ReadUint8/16/32/64, ReadRaw and the full consumption
-// check Done. Tasks 6 and 8-11 add the variable length reads (ReadVarint,
-// ReadOpaque, ReadOpaqueLP, ReadSub, ReadSubLP, ReadOptional) to this same file;
-// those are where a declared length gets checked against the configured maximum
-// and the bytes that remain before anything is allocated, so a hostile length
-// prefix can never size an allocation.
+// where it was. The first failure is sticky: it latches into the Reader, so every
+// later read and Done report that same error instead of running their own check
+// against bytes the failed read never validated. Without this, a caller that
+// ignores one failed read could have a later, smaller read silently succeed
+// against the same untouched bytes and reinterpret them as a different field —
+// a structurally valid decode of the wrong fields, with no error to catch it. So
+// the first error reported is always the cause rather than a downstream symptom
+// of it, matching the sticky error Writer carries in encode.go, for the same
+// reason: a caller that does not check every return should not get a silently
+// wrong decode. This file carries the cursor and the fixed-width portion of the
+// contract — ReadUint8/16/32/64, ReadRaw and the full consumption check Done.
+// Tasks 6 and 8-11 add the variable length reads (ReadVarint, ReadOpaque,
+// ReadOpaqueLP, ReadSub, ReadSubLP, ReadOptional) to this same file; those are
+// where a declared length gets checked against the configured maximum and the
+// bytes that remain before anything is allocated, so a hostile length prefix can
+// never size an allocation.
 //
 // ReadRaw's result is a copy, never a view into the input: MLS verifies a
 // signature over serialized bytes and then uses the decoded fields, so a field
@@ -21,18 +29,22 @@ package syntax
 import "encoding/binary"
 
 // Reader is a bounds-checked cursor over a byte slice. Every read checks the bytes
-// that remain before it advances the cursor, so a failed read never moves it.
-// Not safe for concurrent use.
+// that remain before it advances the cursor, so a failed read never moves it, and
+// the first failure sticks: once any read fails, every subsequent read and Done
+// report that same error instead of re-checking bytes the failed read never
+// validated, matching Writer's sticky error in encode.go. Not safe for
+// concurrent use.
 type Reader struct {
 	bs              []byte
 	pos             int
 	maxVectorLength int
-	// err is the sticky construction time error. It is set only by NewReaderLimit
-	// when given a negative limit, and it is checked first by every method that
-	// returns an error, so that misuse is reported on every subsequent call
-	// instead of being deferred to whatever bounds check would otherwise have
-	// run first — the same validate-at-construction precedent NewWriterLimit
-	// follows in encode.go.
+	// err is the sticky error. It starts out set only when NewReaderLimit is
+	// given a negative limit — the same validate-at-construction precedent
+	// NewWriterLimit follows in encode.go — and from then on every read method
+	// that fails also calls setErr, first error wins. Checked first by every
+	// method that returns an error, so a caller who ignores one failed read
+	// cannot have a later read silently reinterpret the same, still-unconsumed
+	// bytes as a different, smaller field and succeed.
 	err error
 }
 
@@ -85,10 +97,20 @@ func (self *Reader) MaxVectorLength() int {
 	return self.maxVectorLength
 }
 
-// Done returns the sticky construction time error if one was set; otherwise
-// ErrTrailingBytes if bytes remain unconsumed; otherwise nil. This is the full
-// consumption rule: a decoder that ignores a tail accepts two encodings of one
-// object, and MLS signs over serialized forms.
+// setErr records err as the sticky error if none has been recorded yet; first
+// error wins, so a later, unrelated failure never overwrites the cause — the
+// same first-error-wins rule Writer.setErr enforces in encode.go.
+func (self *Reader) setErr(err error) {
+	if self.err == nil {
+		self.err = err
+	}
+}
+
+// Done returns the sticky error if one was set — either the construction time
+// misuse or a prior read's latched failure — otherwise ErrTrailingBytes if bytes
+// remain unconsumed, otherwise nil. This is the full consumption rule: a decoder
+// that ignores a tail accepts two encodings of one object, and MLS signs over
+// serialized forms.
 func (self *Reader) Done() error {
 	if self.err != nil {
 		return self.err
@@ -100,13 +122,15 @@ func (self *Reader) Done() error {
 }
 
 // ReadUint8 reads one byte. Reports ErrTruncated if none remain; the cursor does
-// not advance on failure.
+// not advance on failure, and the failure latches: every later read and Done on
+// this Reader report the same error instead of running their own check.
 func (self *Reader) ReadUint8() (uint8, error) {
 	if self.err != nil {
 		return 0, self.err
 	}
 	if self.Remaining() < 1 {
-		return 0, ErrTruncated
+		self.setErr(ErrTruncated)
+		return 0, self.err
 	}
 	v := self.bs[self.pos]
 	self.pos += 1
@@ -114,13 +138,16 @@ func (self *Reader) ReadUint8() (uint8, error) {
 }
 
 // ReadUint16 reads two bytes, most significant byte first. Reports ErrTruncated
-// if fewer than two remain; the cursor does not advance on failure.
+// if fewer than two remain; the cursor does not advance on failure, and the
+// failure latches: every later read and Done on this Reader report the same
+// error instead of running their own check.
 func (self *Reader) ReadUint16() (uint16, error) {
 	if self.err != nil {
 		return 0, self.err
 	}
 	if self.Remaining() < 2 {
-		return 0, ErrTruncated
+		self.setErr(ErrTruncated)
+		return 0, self.err
 	}
 	v := binary.BigEndian.Uint16(self.bs[self.pos:])
 	self.pos += 2
@@ -128,13 +155,16 @@ func (self *Reader) ReadUint16() (uint16, error) {
 }
 
 // ReadUint32 reads four bytes, most significant byte first. Reports ErrTruncated
-// if fewer than four remain; the cursor does not advance on failure.
+// if fewer than four remain; the cursor does not advance on failure, and the
+// failure latches: every later read and Done on this Reader report the same
+// error instead of running their own check.
 func (self *Reader) ReadUint32() (uint32, error) {
 	if self.err != nil {
 		return 0, self.err
 	}
 	if self.Remaining() < 4 {
-		return 0, ErrTruncated
+		self.setErr(ErrTruncated)
+		return 0, self.err
 	}
 	v := binary.BigEndian.Uint32(self.bs[self.pos:])
 	self.pos += 4
@@ -143,13 +173,15 @@ func (self *Reader) ReadUint32() (uint32, error) {
 
 // ReadUint64 reads eight bytes, most significant byte first. Reports
 // ErrTruncated if fewer than eight remain; the cursor does not advance on
-// failure.
+// failure, and the failure latches: every later read and Done on this Reader
+// report the same error instead of running their own check.
 func (self *Reader) ReadUint64() (uint64, error) {
 	if self.err != nil {
 		return 0, self.err
 	}
 	if self.Remaining() < 8 {
-		return 0, ErrTruncated
+		self.setErr(ErrTruncated)
+		return 0, self.err
 	}
 	v := binary.BigEndian.Uint64(self.bs[self.pos:])
 	self.pos += 8
@@ -161,16 +193,19 @@ func (self *Reader) ReadUint64() (uint64, error) {
 // view into the input, so a decoded field cannot be mutated through the buffer
 // it came from and cannot pin it. Reports ErrNegativeLength if n is negative;
 // reports ErrTruncated if fewer than n bytes remain. The cursor does not advance
-// on failure.
+// on failure, and the failure latches: every later read and Done on this Reader
+// report the same error instead of running their own check.
 func (self *Reader) ReadRaw(n int) ([]byte, error) {
 	if self.err != nil {
 		return nil, self.err
 	}
 	if n < 0 {
-		return nil, ErrNegativeLength
+		self.setErr(ErrNegativeLength)
+		return nil, self.err
 	}
 	if n > self.Remaining() {
-		return nil, ErrTruncated
+		self.setErr(ErrTruncated)
+		return nil, self.err
 	}
 	out := make([]byte, n)
 	copy(out, self.bs[self.pos:self.pos+n])
