@@ -24,7 +24,10 @@
 // does.
 package syntax
 
-import "errors"
+import (
+	"bytes"
+	"errors"
+)
 
 // Marshaler is the encode half of the one method set every wire type in package
 // mls implements. The error is the encoder's own semantic refusal, distinct from
@@ -98,4 +101,67 @@ func Unmarshal(bs []byte, v Unmarshaler) error {
 func UnmarshalLimit(bs []byte, v Unmarshaler, maxVectorLength int) error {
 	r := NewReaderLimit(bs, maxVectorLength)
 	return errors.Join(v.UnmarshalMLS(r), r.Done())
+}
+
+// CheckRoundTrip asserts gate 4 property 2 (spec A section 4.4) against one
+// input: if bs decodes, then encode(decode(bs)) must equal bs and
+// decode(encode(decode(bs))) must re-encode identically. An input that does not
+// decode carries no obligation and returns nil, because rejection is a legitimate
+// outcome and the differential oracle compares accept and reject separately.
+//
+// Every fuzz target in connect/mls and connect/message calls this rather than
+// writing the property again, so there is one definition of "round trips" in the
+// system. Call it as CheckRoundTrip[KeyPackage, *KeyPackage](bs).
+//
+// Two things a caller has to know, because both are ways of holding this that
+// look like coverage and are not.
+//
+// The nil on a rejected input is a vacuity trap for a fuzzer. Uniform random
+// bytes almost never decode as a structure of any complexity, so a target that
+// feeds only random bytes returns nil on nearly every call and passes without
+// ever reaching an assertion. The measurement is in marshal_test.go and the
+// conclusion is that a fuzz corpus must be seeded with valid encodings; the
+// property is only worth what the corpus reaching it is worth.
+//
+// The second pass is a nondeterminism check and nothing else. Once the first
+// re-encode is byte exact, decoding those same bytes again is the same call on
+// the same input, so for a codec that is a pure function of its input it cannot
+// disagree — ErrRoundTripNotStable is unreachable and the second pass is dead
+// weight. It fires only when a codec carries hidden state between calls, which is
+// the shape of a real defect worth a second pass to find: a map ranged during
+// encode, a decoder consulting a package level registry that a later
+// registration mutates, a buffer shared across decodes. That defect is invisible
+// to the byte exactness check, which sees one encode.
+//
+// The bound is the default MaxVectorLength, so a structure that only decodes
+// under MaxRatchetTreeLength is rejected here and returns nil rather than being
+// checked. Ratchet tree fuzzing needs its own entry point; this is deliberately
+// not it.
+func CheckRoundTrip[T any, PT interface {
+	*T
+	Codec
+}](bs []byte) error {
+	first := PT(new(T))
+	if err := Unmarshal(bs, first); err != nil {
+		return nil
+	}
+	reencoded, err := Marshal(first)
+	if err != nil {
+		return errors.Join(ErrRoundTripNotByteExact, err)
+	}
+	if !bytes.Equal(reencoded, bs) {
+		return ErrRoundTripNotByteExact
+	}
+	second := PT(new(T))
+	if err := Unmarshal(reencoded, second); err != nil {
+		return errors.Join(ErrRoundTripNotStable, err)
+	}
+	again, err := Marshal(second)
+	if err != nil {
+		return errors.Join(ErrRoundTripNotStable, err)
+	}
+	if !bytes.Equal(again, reencoded) {
+		return ErrRoundTripNotStable
+	}
+	return nil
 }

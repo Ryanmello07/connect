@@ -288,3 +288,307 @@ func TestMarshalLimitAndUnmarshalLimitRejectANegativeLimit(t *testing.T) {
 		t.Errorf("UnmarshalLimit gave %v, want ErrNegativeLength", err)
 	}
 }
+
+func TestCheckRoundTripAcceptsAValidEncoding(t *testing.T) {
+	in := marshalProbe{Value: 0xbeef, Body: []byte{0xaa, 0xbb}}
+	bs, err := Marshal(&in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := CheckRoundTrip[marshalProbe, *marshalProbe](bs); err != nil {
+		t.Errorf("gave %v on a valid encoding, want nil", err)
+	}
+}
+
+func TestCheckRoundTripIgnoresARejectedInput(t *testing.T) {
+	// a truncated input has no round trip obligation
+	if err := CheckRoundTrip[marshalProbe, *marshalProbe]([]byte{0xbe}); err != nil {
+		t.Errorf("gave %v on a rejected input, want nil", err)
+	}
+	if err := CheckRoundTrip[marshalProbe, *marshalProbe](nil); err != nil {
+		t.Errorf("gave %v on empty input, want nil", err)
+	}
+}
+
+// the property that catches the real bug: a decoder that accepts a non canonical
+// encoding will decode it, re-encode to the canonical form, and disagree
+func TestCheckRoundTripCatchesANonCanonicalEncoding(t *testing.T) {
+	// 0x4002 is the two octet varint form of 2, which the decoder must already
+	// reject; this asserts the property would catch it if the decoder did not
+	nonCanonical := []byte{0xbe, 0xef, 0x40, 0x02, 0xaa, 0xbb}
+	probe := marshalProbe{}
+	if err := Unmarshal(nonCanonical, &probe); err == nil {
+		t.Fatalf("the decoder accepted a non minimal length prefix; rule 1 is broken")
+	}
+	if err := CheckRoundTrip[marshalProbe, *marshalProbe](nonCanonical); err != nil {
+		t.Errorf("gave %v for an input the decoder rejects, want nil", err)
+	}
+}
+
+// lenientProbe is the accept-two-encodings defect in miniature, and exists so that
+// the byte exactness half of CheckRoundTrip can be shown to fire rather than
+// assumed to. It decodes any non zero octet as set and encodes set as 0x01, so
+// 0x02 is a second wire form of a value its own encoder can only produce one way —
+// the shape of a signature bypass primitive, since a verifier would accept bytes a
+// signer never produced. Every case in the table below is one octet in and one
+// octet out, so the comparison inside CheckRoundTrip is decided by content and
+// never by a length difference; that is the regime a prefix comparison can sit in
+// and appear to work while testing nothing.
+type lenientProbe struct {
+	flag bool
+}
+
+var _ Codec = (*lenientProbe)(nil)
+
+func (self *lenientProbe) MarshalMLS(w *Writer) error {
+	if self.flag {
+		w.WriteUint8(0x01)
+	} else {
+		w.WriteUint8(0x00)
+	}
+	return nil
+}
+
+func (self *lenientProbe) UnmarshalMLS(r *Reader) error {
+	v, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	self.flag = v != 0
+	return nil
+}
+
+// TestCheckRoundTripReportsANonByteExactReencode is the non-vacuity proof for the
+// first half of the property. The two accepted encodings are in the same table as
+// the two rejected ones, so "it fired" is measured against a probe that is shown
+// to round trip rather than against an assumption that it would have.
+func TestCheckRoundTripReportsANonByteExactReencode(t *testing.T) {
+	cases := []struct {
+		input []byte
+		want  error
+	}{
+		{input: []byte{0x00}, want: nil},
+		{input: []byte{0x01}, want: nil},
+		{input: []byte{0x02}, want: ErrRoundTripNotByteExact},
+		{input: []byte{0xff}, want: ErrRoundTripNotByteExact},
+	}
+	for _, c := range cases {
+		err := CheckRoundTrip[lenientProbe, *lenientProbe](c.input)
+		if c.want == nil && err != nil {
+			t.Errorf("%x gave %v, want nil", c.input, err)
+		}
+		if c.want != nil && !errors.Is(err, c.want) {
+			t.Errorf("%x gave %v, want ErrRoundTripNotByteExact", c.input, err)
+		}
+	}
+}
+
+// TestCheckRoundTripReportsAnEncoderThatRefusesAnAcceptedValue covers the other
+// way byte exactness fails: the decoder accepted a value its own encoder has no
+// serialization for, so there are no bytes to compare at all. The refusal has to
+// come back with the sentinel rather than instead of it, because a fuzz target
+// only checks the sentinel.
+func TestCheckRoundTripReportsAnEncoderThatRefusesAnAcceptedValue(t *testing.T) {
+	err := CheckRoundTrip[refusingProbe, *refusingProbe]([]byte{0xbe, 0xef})
+	if !errors.Is(err, ErrRoundTripNotByteExact) {
+		t.Errorf("gave %v, want ErrRoundTripNotByteExact", err)
+	}
+	if !errors.Is(err, errProbeRefusal) {
+		t.Errorf("gave %v, want the encoder's refusal carried alongside the sentinel", err)
+	}
+}
+
+// driftingProbe models the only defect class the second pass of CheckRoundTrip can
+// catch: a codec that is not a pure function of its input. Once the first
+// re-encode is byte exact, the second pass decodes the very same bytes, so a
+// deterministic codec cannot disagree with itself there and ErrRoundTripNotStable
+// would be unreachable. What makes it reachable is hidden state carried between
+// calls — a map ranged during encode, a decoder consulting a registry a later
+// registration mutated, a buffer shared across decodes. CheckRoundTrip builds its
+// own values with new(T), so that state cannot live on the probe instance and
+// lives in the package level vars below instead, which is exactly where the real
+// defects live too.
+type driftingProbe struct {
+	value        uint8
+	refuseEncode bool
+}
+
+var _ Codec = (*driftingProbe)(nil)
+
+var (
+	driftingProbeDecodes int
+	driftingProbeDrift   func(self *driftingProbe) error
+)
+
+var errProbeEncodeDrift = errors.New("mls syntax: probe refuses to encode on the second pass")
+
+func (self *driftingProbe) MarshalMLS(w *Writer) error {
+	if self.refuseEncode {
+		return errProbeEncodeDrift
+	}
+	w.WriteUint8(self.value)
+	return nil
+}
+
+func (self *driftingProbe) UnmarshalMLS(r *Reader) error {
+	v, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	self.value = v
+	driftingProbeDecodes += 1
+	if driftingProbeDecodes >= 2 && driftingProbeDrift != nil {
+		return driftingProbeDrift(self)
+	}
+	return nil
+}
+
+// TestCheckRoundTripReportsAnUnstableSecondPass is the non-vacuity proof for the
+// second half of the property, and the first case in the table is the control that
+// keeps the other three honest: with no drift installed the same probe over the
+// same input returns nil, so each failure below is attributable to the drift
+// rather than to a probe that could never have passed. Each drift is one of the
+// three ways the second pass can end — a value that re-encodes differently, a
+// decode that now refuses, an encode that now refuses — and the two refusals must
+// carry their own error alongside the sentinel.
+func TestCheckRoundTripReportsAnUnstableSecondPass(t *testing.T) {
+	cases := []struct {
+		drift     func(self *driftingProbe) error
+		want      error
+		wantCause error
+	}{
+		{
+			drift:     nil,
+			want:      nil,
+			wantCause: nil,
+		},
+		{
+			drift:     func(self *driftingProbe) error { self.value ^= 0xff; return nil },
+			want:      ErrRoundTripNotStable,
+			wantCause: nil,
+		},
+		{
+			drift:     func(self *driftingProbe) error { return errProbeDecodeRefusal },
+			want:      ErrRoundTripNotStable,
+			wantCause: errProbeDecodeRefusal,
+		},
+		{
+			drift:     func(self *driftingProbe) error { self.refuseEncode = true; return nil },
+			want:      ErrRoundTripNotStable,
+			wantCause: errProbeEncodeDrift,
+		},
+	}
+	for i, c := range cases {
+		driftingProbeDecodes = 0
+		driftingProbeDrift = c.drift
+		err := CheckRoundTrip[driftingProbe, *driftingProbe]([]byte{0x5a})
+		if c.want == nil && err != nil {
+			t.Errorf("case %d gave %v with no drift installed, want nil", i, err)
+		}
+		if c.want != nil && !errors.Is(err, c.want) {
+			t.Errorf("case %d gave %v, want ErrRoundTripNotStable", i, err)
+		}
+		if c.wantCause != nil && !errors.Is(err, c.wantCause) {
+			t.Errorf("case %d gave %v, want the cause carried alongside the sentinel", i, err)
+		}
+		if driftingProbeDecodes < 2 {
+			t.Errorf("case %d decoded %d times, so the second pass never ran and the case proved nothing", i, driftingProbeDecodes)
+		}
+	}
+	driftingProbeDrift = nil
+	driftingProbeDecodes = 0
+}
+
+// nextXorshift advances a 64 bit xorshift state and returns it. It is inlined here
+// rather than taken from math/rand so this file adds no import to a package whose
+// dependency set is a structural gate, and so the corpus below is byte for byte
+// the same on every platform and every toolchain — a reachability number nobody
+// else can reproduce is not a measurement. Any non zero seed works; zero is the
+// one fixed point and never used.
+func nextXorshift(state *uint64) uint64 {
+	*state ^= *state << 13
+	*state ^= *state >> 7
+	*state ^= *state << 17
+	return *state
+}
+
+// TestCheckRoundTripReachabilityOverAFuzzLikeCorpus measures the thing that
+// decides whether every downstream fuzz target is worth anything. CheckRoundTrip
+// returns nil for input that does not decode, which is the right contract and also
+// a trap: a target fed only uniform random bytes returns nil on nearly every call
+// and reports green while never once reaching an assertion. So this counts, over
+// three corpora a fuzzer would plausibly produce, how many inputs actually reach
+// the round trip assertions, and fails if the seeded corpus stops reaching them.
+//
+// The predicate is Unmarshal under the default limit, which is the identical call
+// CheckRoundTrip makes to decide the same question, so the count is what the
+// property saw and not a model of it. marshalProbe is deliberately a far easier
+// target than any real structure: two octets, then a varint prefixed opaque field.
+// A structure with a version, a cipher suite, several nested vectors and an
+// enumerated arm is orders of magnitude harder to hit at random, so the random
+// number here is an upper bound on what a real target would reach.
+func TestCheckRoundTripReachabilityOverAFuzzLikeCorpus(t *testing.T) {
+	valid := [][]byte{}
+	for _, body := range [][]byte{
+		nil,
+		{0xaa},
+		{0xaa, 0xbb},
+		bytes.Repeat([]byte{0x11}, 63),
+		bytes.Repeat([]byte{0x22}, 64),
+		bytes.Repeat([]byte{0x33}, 300),
+	} {
+		bs, err := Marshal(&marshalProbe{Value: 0xbeef, Body: body})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		valid = append(valid, bs)
+	}
+
+	truncated := [][]byte{}
+	for _, bs := range valid {
+		for n := 0; n < len(bs); n += 1 {
+			truncated = append(truncated, bs[:n])
+		}
+	}
+
+	random := [][]byte{}
+	state := uint64(0x5eed5eed5eed5eed)
+	for i := 0; i < 4096; i += 1 {
+		n := int(nextXorshift(&state) % 16)
+		bs := make([]byte, n)
+		for j := 0; j < n; j += 1 {
+			bs[j] = uint8(nextXorshift(&state))
+		}
+		random = append(random, bs)
+	}
+
+	corpora := []struct {
+		name    string
+		inputs  [][]byte
+		wantAll bool
+	}{
+		{name: "valid encodings", inputs: valid, wantAll: true},
+		{name: "truncated valid encodings", inputs: truncated, wantAll: false},
+		{name: "uniform random bytes", inputs: random, wantAll: false},
+	}
+	for _, corpus := range corpora {
+		reached := 0
+		for _, bs := range corpus.inputs {
+			out := marshalProbe{}
+			if Unmarshal(bs, &out) == nil {
+				reached += 1
+			}
+			// a correct codec must never fail the property, whatever the input
+			if err := CheckRoundTrip[marshalProbe, *marshalProbe](bs); err != nil {
+				t.Errorf("%s: %x gave %v, want nil", corpus.name, bs, err)
+			}
+		}
+		t.Logf("%s: %d of %d inputs decoded and reached the round trip assertions", corpus.name, reached, len(corpus.inputs))
+		if corpus.wantAll && reached != len(corpus.inputs) {
+			t.Errorf("%s: only %d of %d reached, so the corpus below it is not a baseline", corpus.name, reached, len(corpus.inputs))
+		}
+		if !corpus.wantAll && reached == len(corpus.inputs) {
+			t.Errorf("%s: every one of %d inputs decoded, which means the corpus is not what it claims to be", corpus.name, len(corpus.inputs))
+		}
+	}
+}
