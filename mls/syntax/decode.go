@@ -215,9 +215,10 @@ func (self *Reader) ReadRaw(n int) ([]byte, error) {
 
 // validateLength checks a declared length before the caller may allocate
 // anything sized by it: first against self.err, so a Reader that already carries
-// a latched failure never validates n against bytes that failed read never
-// checked and hands back a clean result — matching every other error-returning
-// method in this file. Then against this Reader's configured maximum, reporting
+// a latched failure can never validate n and hand back a clean result, which
+// would revive reads the sticky contract says must stay dead — matching every
+// other error-returning method in this file. Then against this Reader's
+// configured maximum, reporting
 // ErrLengthExceedsMax, then — only once that check has passed — against the
 // bytes actually remaining in the input, reporting ErrLengthExceedsInput. The two
 // failures are kept distinct because downstream callers need to tell "this field
