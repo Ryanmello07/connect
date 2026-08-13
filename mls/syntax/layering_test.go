@@ -12,10 +12,11 @@ import (
 
 const selfImportPath = "github.com/urnetwork/connect/mls/syntax"
 
+// Fails if go list -deps reports a dependency whose first path element is not stdlib.
 func TestSyntaxImportsStdlibOnly(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", ".").Output()
+	out, err := exec.Command("go", "list", "-deps", ".").CombinedOutput()
 	if err != nil {
-		t.Fatalf("go list -deps failed: %v", err)
+		t.Fatalf("go list -deps failed: %v\n%s", err, out)
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		dep := strings.TrimSpace(line)

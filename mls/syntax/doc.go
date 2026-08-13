@@ -1,9 +1,9 @@
 // The TLS presentation language of RFC 8446 section 3 as MLS uses it: fixed width
 // integers, opaque V with the RFC 9420 section 2.1.2 variable length prefix,
-// optional T, and byte length prefixed vectors. MASTER's LP(x) 32 bit big endian
-// prefix lives here too, because connect/message encodes records through this same
-// package and one length prefix implementation means one place for a length prefix
-// bug to be.
+// optional T, and byte length prefixed vectors. The master protocol design's LP(x)
+// 32 bit big endian prefix lives here too, because connect/message encodes records
+// through this same package and one length prefix implementation means one place
+// for a length prefix bug to be.
 //
 // Four rules, each with a fuzz property behind it (spec A section 5.8):
 //
