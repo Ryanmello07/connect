@@ -6,6 +6,7 @@ package syntax
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -225,7 +226,12 @@ func TestReadOpaqueEmptyIsNonNil(t *testing.T) {
 // invalid: over the configured maximum, over the bytes actually remaining (both
 // when the varint claims more input than exists at all, and when it claims more
 // than trails the prefix), and a non minimally encoded varint prefix rejected by
-// ReadVarint itself before takeLength ever runs.
+// ReadVarint itself before validateLength ever runs. It also pins, for every
+// case, that a rejected call leaves Offset at 0: the mark/restore in ReadOpaque
+// must undo a validly decoded varint's cursor advance too, not just leave the
+// cursor wherever validateLength's own failure found it, matching the
+// no-advance-on-failure precedent TestReaderTruncatedReadDoesNotAdvance and
+// TestNewReaderLimitRejectsNegative set elsewhere in this file.
 func TestReadOpaqueChecksTheLimitThenTheInput(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -242,29 +248,49 @@ func TestReadOpaqueChecksTheLimitThenTheInput(t *testing.T) {
 		if _, err := r.ReadOpaque(); !errors.Is(err, c.wantErr) {
 			t.Errorf("%s gave %v, want %v", c.name, err, c.wantErr)
 		}
+		if r.Offset() != 0 {
+			t.Errorf("%s left Offset at %d, want 0: a rejected ReadOpaque must not consume input", c.name, r.Offset())
+		}
 	}
 }
 
 // TestReadOpaqueRejectsAHostileLengthWithoutAllocating is the security property
 // the plan calls out by name: a four byte input can declare a varint length up to
 // 0x3fffffff (about 1 GiB), far more than MaxVectorLength (1 MiB) and far more
-// than the four bytes actually present. If ReadOpaque ever allocated the declared
-// length before validating it against the maximum and the remaining input, this
-// test would make a gigabyte scale allocation on every one of its 200 runs.
-// testing.AllocsPerRun measures that directly instead of merely being slow to
-// fail: a Reader construction is the only allocation expected, so the count
-// must stay small and constant, never scaled to the attacker supplied length.
+// than the four bytes actually present. It makes two distinct assertions, each
+// catching a different regression:
+//
+//   - testing.AllocsPerRun counts allocation *events*, not bytes. It reliably
+//     catches a loop based over-allocation (repeated append growth costs many
+//     events), but a single `out := make([]byte, length)` moved above validation
+//     costs exactly one extra event — indistinguishable from noise against a
+//     generous bound — so this assertion alone would not catch that regression.
+//   - runtime.MemStats.TotalAlloc measures bytes actually allocated, which is
+//     what the security property is really about: if ReadOpaque ever allocated
+//     the declared length before validating it, this would jump from a few
+//     hundred bytes to roughly a gigabyte on a single call, which the 4096 byte
+//     bound below catches deterministically — no reliance on an OOM or a timeout
+//     to notice.
 func TestReadOpaqueRejectsAHostileLengthWithoutAllocating(t *testing.T) {
 	input := []byte{0xbf, 0xff, 0xff, 0xff} // declares length 0x3fffffff, ~1 GiB
 	if _, err := NewReader(input).ReadOpaque(); !errors.Is(err, ErrLengthExceedsMax) {
 		t.Fatalf("got %v, want ErrLengthExceedsMax", err)
 	}
+
 	allocs := testing.AllocsPerRun(200, func() {
 		r := NewReader(input)
 		_, _ = r.ReadOpaque()
 	})
 	if allocs > 4 {
-		t.Errorf("ReadOpaque allocated %.1f times per run rejecting a hostile length, want a small constant count, not one sized to the declared ~1 GiB length", allocs)
+		t.Errorf("ReadOpaque allocated %.1f times per run rejecting a hostile length, want a small constant event count", allocs)
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _ = NewReader(input).ReadOpaque()
+	runtime.ReadMemStats(&after)
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 4096 {
+		t.Errorf("ReadOpaque allocated %d bytes rejecting a hostile length, want well under the declared ~1 GiB", grew)
 	}
 }
 

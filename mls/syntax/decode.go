@@ -213,8 +213,11 @@ func (self *Reader) ReadRaw(n int) ([]byte, error) {
 	return out, nil
 }
 
-// takeLength validates a declared length before the caller may allocate anything
-// sized by it: first against this Reader's configured maximum, reporting
+// validateLength checks a declared length before the caller may allocate
+// anything sized by it: first against self.err, so a Reader that already carries
+// a latched failure never validates n against bytes that failed read never
+// checked and hands back a clean result — matching every other error-returning
+// method in this file. Then against this Reader's configured maximum, reporting
 // ErrLengthExceedsMax, then — only once that check has passed — against the
 // bytes actually remaining in the input, reporting ErrLengthExceedsInput. The two
 // failures are kept distinct because downstream callers need to tell "this field
@@ -223,9 +226,12 @@ func (self *Reader) ReadRaw(n int) ([]byte, error) {
 // int64 before comparing, so a length near the uint32 range on a platform where
 // int is 32 bits can never wrap around into looking small and passing either
 // check; only once both checks pass is n narrowed to int for the caller to size a
-// make with. Does not itself touch the cursor: every caller decides what to do
-// with it on failure.
-func (self *Reader) takeLength(n uint32) (int, error) {
+// make with. Named for what it does, not for a cursor motion: it validates and
+// deliberately does not touch the cursor, leaving that to the caller.
+func (self *Reader) validateLength(n uint32) (int, error) {
+	if self.err != nil {
+		return 0, self.err
+	}
 	if int64(n) > int64(self.maxVectorLength) {
 		self.setErr(ErrLengthExceedsMax)
 		return 0, self.err
@@ -238,10 +244,10 @@ func (self *Reader) takeLength(n uint32) (int, error) {
 }
 
 // ReadOpaque decodes opaque x<V>: a varint length prefix read by ReadVarint,
-// then that many bytes. The declared length is validated by takeLength — against
-// the configured maximum and then against the bytes actually remaining — before
-// any allocation, so a hostile length prefix can never size a make; the two
-// rejections surface as the distinct sentinels ErrLengthExceedsMax and
+// then that many bytes. The declared length is validated by validateLength —
+// against the configured maximum and then against the bytes actually remaining —
+// before any allocation, so a hostile length prefix can never size a make; the
+// two rejections surface as the distinct sentinels ErrLengthExceedsMax and
 // ErrLengthExceedsInput. The result is always a copy, never a view into the
 // input, matching ReadRaw, and is never nil even for a zero length value, so an
 // empty opaque field and an absent one stay distinguishable in Go despite
@@ -258,7 +264,7 @@ func (self *Reader) ReadOpaque() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length, err := self.takeLength(n)
+	length, err := self.validateLength(n)
 	if err != nil {
 		self.pos = mark
 		return nil, err
