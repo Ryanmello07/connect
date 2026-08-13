@@ -53,8 +53,9 @@ func TestWriterRawTakesNoPrefix(t *testing.T) {
 // TestWriterErrorIsStickyAndSuppressesLaterWrites asserts the first error set wins over
 // later ones, that Err and Bytes both report it, that Bytes hands back nil bytes
 // alongside a non nil error, and that a write after an error is a no op — exercised
-// through all five write methods (WriteUint8, WriteUint16, WriteUint32, WriteUint64,
-// WriteRaw), since each carries the identical error guard at a distinct call site.
+// through all six write methods (WriteUint8, WriteUint16, WriteUint32, WriteUint64,
+// WriteRaw, WriteVarint), since each carries the identical error guard at a distinct
+// call site.
 func TestWriterErrorIsStickyAndSuppressesLaterWrites(t *testing.T) {
 	w := NewWriter()
 	w.WriteUint8(0x01)
@@ -64,6 +65,7 @@ func TestWriterErrorIsStickyAndSuppressesLaterWrites(t *testing.T) {
 	w.WriteUint32(0xffffffff)
 	w.WriteUint64(0xffffffffffffffff)
 	w.WriteRaw([]byte{0xff, 0xff, 0xff})
+	w.WriteVarint(0x2a)
 	if !errors.Is(w.Err(), ErrLengthExceedsMax) {
 		t.Errorf("Err is %v, want the first error ErrLengthExceedsMax", w.Err())
 	}

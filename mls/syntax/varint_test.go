@@ -41,7 +41,8 @@ func TestWriteVarintIsMinimal(t *testing.T) {
 		w.WriteVarint(c.value)
 		out, err := w.Bytes()
 		if err != nil {
-			t.Fatalf("value %d: unexpected error %v", c.value, err)
+			t.Errorf("value %d: unexpected error %v", c.value, err)
+			continue
 		}
 		if !bytes.Equal(out, c.encoded) {
 			t.Errorf("value %d encoded to %x, want %x", c.value, out, c.encoded)
@@ -67,5 +68,24 @@ func TestWriteVarintRejectsValuesAboveTheRange(t *testing.T) {
 		if w.Len() != 0 {
 			t.Errorf("value %d: Len is %d, want 0: an overflow must append nothing", v, w.Len())
 		}
+	}
+}
+
+// TestWriteVarintOverflowDoesNotOverwriteAnEarlierError asserts that when a Writer
+// already carries a sticky error, calling WriteVarint with a value past MaxVarint
+// does not replace it with ErrVarintOverflow: first error wins, so the reported
+// cause stays the original one, not whichever no op write happened to run last.
+func TestWriteVarintOverflowDoesNotOverwriteAnEarlierError(t *testing.T) {
+	w := NewWriter()
+	w.setErr(ErrLengthExceedsMax)
+	w.WriteVarint(MaxVarint + 1)
+	if w.Len() != 0 {
+		t.Errorf("Len is %d, want 0: a write after an error must append nothing", w.Len())
+	}
+	if !errors.Is(w.Err(), ErrLengthExceedsMax) {
+		t.Errorf("Err is %v, want the original ErrLengthExceedsMax, not ErrVarintOverflow", w.Err())
+	}
+	if errors.Is(w.Err(), ErrVarintOverflow) {
+		t.Errorf("Err is %v: the overflowing WriteVarint call overwrote the earlier error", w.Err())
 	}
 }
