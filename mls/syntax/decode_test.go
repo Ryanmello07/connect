@@ -348,3 +348,55 @@ func TestOpaqueRoundTripsTheEmptyStringFromANilWrite(t *testing.T) {
 		t.Errorf("Done gave %v", err)
 	}
 }
+
+// TestReadOpaqueLPRoundTrips asserts a body past the 16 bit boundary — 70000
+// bytes, which no two octet prefix could carry — survives WriteOpaqueLP and
+// ReadOpaqueLP unchanged and consumes the input exactly, so the record layer's
+// fields are not silently capped at 65535 bytes.
+func TestReadOpaqueLPRoundTrips(t *testing.T) {
+	body := bytes.Repeat([]byte{0x11}, 70000)
+	w := NewWriter()
+	w.WriteOpaqueLP(body)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	got, err := r.ReadOpaqueLP()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("decoded %d bytes, want %d", len(got), len(body))
+	}
+	if err := r.Done(); err != nil {
+		t.Errorf("Done gave %v", err)
+	}
+}
+
+// TestReadOpaqueLPChecksTheLimitThenTheInput asserts each way an LP prefix can be
+// invalid surfaces its own sentinel — over the configured maximum, over the bytes
+// actually remaining, and a prefix the input ends partway through — and that
+// every rejection leaves Offset at 0, so the four octets a rejected read consumed
+// to see the length are given back rather than left half consumed for whatever
+// reads next.
+func TestReadOpaqueLPChecksTheLimitThenTheInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []byte
+		wantErr error
+	}{
+		{"length above the limit", []byte{0xff, 0xff, 0xff, 0xff}, ErrLengthExceedsMax},
+		{"length above the remaining input", []byte{0x00, 0x00, 0x00, 0x40, 0x11}, ErrLengthExceedsInput},
+		{"prefix truncated", []byte{0x00, 0x00, 0x00}, ErrTruncated},
+	}
+	for _, c := range cases {
+		r := NewReader(c.input)
+		if _, err := r.ReadOpaqueLP(); !errors.Is(err, c.wantErr) {
+			t.Errorf("%s gave %v, want %v", c.name, err, c.wantErr)
+		}
+		if r.Offset() != 0 {
+			t.Errorf("%s advanced the cursor to %d on a failed read", c.name, r.Offset())
+		}
+	}
+}

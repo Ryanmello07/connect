@@ -275,3 +275,38 @@ func (self *Reader) ReadOpaque() ([]byte, error) {
 	self.pos += length
 	return out, nil
 }
+
+// ReadOpaqueLP decodes LP(x): a fixed 32 bit big endian length read by
+// ReadUint32, then that many bytes. This is the record layer's form that
+// connect/message uses for every record field and every AAD and write_auth
+// preimage, not the varint prefixed form MLS structures use — that one is
+// ReadOpaque, and the two are never interchangeable. The declared length is
+// validated by validateLength — against the configured maximum and then against
+// the bytes actually remaining — before any allocation, so a prefix declaring up
+// to four gibibytes can never size a make; the two rejections surface as the
+// distinct sentinels ErrLengthExceedsMax and ErrLengthExceedsInput. The prefix
+// must be consumed before validateLength runs, since that check is against the
+// bytes remaining after it, so on a failure the cursor is restored to where it
+// stood before this call rather than left four bytes past a prefix whose length
+// was then refused. The result is always a copy, never a view into the input,
+// matching ReadRaw, and is never nil even for a zero length value. Every failure
+// latches: later reads and Done report the same error.
+func (self *Reader) ReadOpaqueLP() ([]byte, error) {
+	if self.err != nil {
+		return nil, self.err
+	}
+	mark := self.pos
+	n, err := self.ReadUint32()
+	if err != nil {
+		return nil, err
+	}
+	length, err := self.validateLength(n)
+	if err != nil {
+		self.pos = mark
+		return nil, err
+	}
+	out := make([]byte, length)
+	copy(out, self.bs[self.pos:self.pos+length])
+	self.pos += length
+	return out, nil
+}

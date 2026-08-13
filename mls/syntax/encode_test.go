@@ -171,3 +171,53 @@ func TestWriteOpaqueRefusesToExceedTheLimit(t *testing.T) {
 		t.Errorf("over limit write gave %v, want ErrLengthExceedsMax", err)
 	}
 }
+
+// TestWriteOpaqueLPUsesAFixedThirtyTwoBitPrefix asserts the length prefix is
+// always four big endian octets regardless of how short the body is, unlike the
+// varint form whose width tracks the value: a nil body and an empty one both
+// encode to four zero octets, so the record layer can locate a field's body at a
+// fixed offset without first parsing a variable width prefix.
+func TestWriteOpaqueLPUsesAFixedThirtyTwoBitPrefix(t *testing.T) {
+	cases := []struct {
+		body []byte
+		want []byte
+	}{
+		{nil, []byte{0x00, 0x00, 0x00, 0x00}},
+		{[]byte{}, []byte{0x00, 0x00, 0x00, 0x00}},
+		{[]byte{0xaa}, []byte{0x00, 0x00, 0x00, 0x01, 0xaa}},
+		{[]byte{0xaa, 0xbb}, []byte{0x00, 0x00, 0x00, 0x02, 0xaa, 0xbb}},
+	}
+	for _, c := range cases {
+		w := NewWriter()
+		w.WriteOpaqueLP(c.body)
+		out, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("body %x: unexpected error %v", c.body, err)
+		}
+		if !bytes.Equal(out, c.want) {
+			t.Errorf("body %x encoded to %x, want %x", c.body, out, c.want)
+		}
+	}
+}
+
+// the two prefix forms must never be confusable, because connect/message uses LP
+// for records and connect/mls uses <V> for MLS structures and one codec serves both
+func TestLPAndVarintPrefixesAreDistinct(t *testing.T) {
+	for _, body := range [][]byte{nil, {0xaa}, bytes.Repeat([]byte{0x11}, 200)} {
+		lp := NewWriter()
+		lp.WriteOpaqueLP(body)
+		lpBytes, err := lp.Bytes()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		v := NewWriter()
+		v.WriteOpaque(body)
+		vBytes, err := v.Bytes()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if bytes.Equal(lpBytes, vBytes) {
+			t.Errorf("body %x encoded identically under both prefix forms: %x", body, lpBytes)
+		}
+	}
+}

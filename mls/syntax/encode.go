@@ -145,3 +145,26 @@ func (self *Writer) WriteOpaque(bs []byte) {
 	self.WriteVarint(uint32(len(bs)))
 	self.WriteRaw(bs)
 }
+
+// WriteOpaqueLP appends bs as LP(x) in the master protocol design's notation: a
+// fixed 32 bit big endian length, then the bytes verbatim. This is the record
+// layer's prefix and not MLS's — connect/message builds every record field and
+// every AAD and write_auth preimage with it, where a fixed width prefix keeps a
+// preimage's field boundaries independent of the lengths inside it. It never
+// appears inside an MLS structure, where the form is WriteOpaque, and the two are
+// never interchangeable. A nil and an empty slice both encode to the four zero
+// octets, since the wire format has no representation for "absent". The length is
+// checked against this Writer's configured maximum before either write happens,
+// so a caller cannot silently produce a field a compliant reader would refuse; a
+// no op once the Writer has already failed.
+func (self *Writer) WriteOpaqueLP(bs []byte) {
+	if self.err != nil {
+		return
+	}
+	if len(bs) > self.maxVectorLength {
+		self.setErr(ErrLengthExceedsMax)
+		return
+	}
+	self.WriteUint32(uint32(len(bs)))
+	self.WriteRaw(bs)
+}
