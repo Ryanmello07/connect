@@ -168,3 +168,98 @@ func (self *Writer) WriteOpaqueLP(bs []byte) {
 	self.WriteUint32(uint32(len(bs)))
 	self.WriteRaw(bs)
 }
+
+// nestedRegion encodes a nested structure into a scratch Writer and hands back the
+// bytes it produced, for a caller that will then frame them. It is the shared body
+// of WriteNested and WriteNestedLP, which differ only in how the region's length
+// prefix is spelled, and it exists as one copy for the same reason takeRegion does
+// on the decode side: the sequence is short, and the line inside it that is easy to
+// get wrong is the one that must not be got wrong twice.
+//
+// That line is the scratch Writer's construction. The limit is inherited from this
+// Writer rather than defaulted, because the limit belongs to the encode as a whole
+// and not to the depth at which a field happens to sit. A plain NewWriter here would
+// cap every nested field at MaxVectorLength even inside a ratchet tree encode
+// running at MaxRatchetTreeLength, and the failure would be silent on every small
+// input and appear only on a large tree — a refusal to encode a structure the
+// protocol allows, in the case that is hardest to reach in a test and likeliest to
+// arrive in production. The same inheritance is what WriteVector does for its
+// elements and what subReader does for a nested decode.
+//
+// Both failures are latched on this Writer as well as returned: encodeOne's own
+// semantic refusal, and any failure the scratch Writer latched that encodeOne did
+// not report, which is the ordinary shape of a leaf write failing inside an encoder
+// whose leaf writes are return free and which therefore returns nil. The returned
+// error is the callback's own where there is one, matching WriteOptional; this
+// Writer carried no error when the nested encode began, since the callers check that
+// on entry, so first error wins has nothing older to prefer either way.
+func (self *Writer) nestedRegion(encodeOne func(w *Writer) error) ([]byte, error) {
+	scratch := NewWriterLimit(self.maxVectorLength)
+	if err := encodeOne(scratch); err != nil {
+		self.setErr(err)
+		return nil, err
+	}
+	region, err := scratch.Bytes()
+	if err != nil {
+		self.setErr(err)
+		return nil, err
+	}
+	return region, nil
+}
+
+// WriteNested encodes a structure into a region of its own and appends that region
+// as opaque x<V>, and is the encode side counterpart to ReadNested: the form a
+// structure carried inside a varint prefixed region should ordinarily be written
+// through. The region has to be built before it can be framed, since its length is
+// the prefix, so the structure is encoded into a scratch Writer and the result goes
+// out through WriteOpaque, which is where the prefix and the vector length limit are
+// applied.
+//
+// The scratch Writer inherits this Writer's limit. That is the whole point of the
+// helper: the alternative every call site would otherwise hand roll is a plain
+// NewWriter, which caps the nested field at MaxVectorLength no matter what limit the
+// surrounding encode is running at, so a ratchet tree encode at
+// MaxRatchetTreeLength would refuse a nested field it is entitled to write. Nothing
+// smaller than a multi mebibyte tree shows the difference, which is why the line is
+// here once rather than in every encoder.
+//
+// A refusal from encodeOne, a failure the scratch Writer latched, and a region too
+// long for this Writer's limit are all both returned and latched, so the failure is
+// unavoidable at Bytes even if the return is dropped. A dropped refusal on this side
+// of the codec produces wrong signed bytes rather than a failure, and MLS signs over
+// serialized forms, so that is the one outcome this package does not allow. That
+// last case is also why the successful path returns the sticky error rather than a
+// bare nil: WriteOpaque is return free and reports an over long region through the
+// sticky error alone, and a caller checking this return deserves to hear about it
+// there too, exactly as WriteVector does. A no op reporting the existing failure once
+// this Writer has already failed, which also keeps a nested encoder's side effects
+// and refusals out of an encoding that will never be handed out.
+func (self *Writer) WriteNested(encodeOne func(w *Writer) error) error {
+	if self.err != nil {
+		return self.err
+	}
+	region, err := self.nestedRegion(encodeOne)
+	if err != nil {
+		return err
+	}
+	self.WriteOpaque(region)
+	return self.err
+}
+
+// WriteNestedLP is WriteNested framed as LP(x): the fixed 32 bit big endian prefix
+// connect/message uses for a record field that carries a structure, rather than the
+// varint prefix MLS structures use. The two are never interchangeable, and a
+// structure written with the wrong one is a record no reader of either layer will
+// accept. Every property WriteNested documents holds here unchanged, including the
+// inherited scratch limit and the latching of every failure.
+func (self *Writer) WriteNestedLP(encodeOne func(w *Writer) error) error {
+	if self.err != nil {
+		return self.err
+	}
+	region, err := self.nestedRegion(encodeOne)
+	if err != nil {
+		return err
+	}
+	self.WriteOpaqueLP(region)
+	return self.err
+}

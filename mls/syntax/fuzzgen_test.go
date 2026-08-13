@@ -182,12 +182,12 @@ type testStruct struct {
 
 var _ Codec = (*testStruct)(nil)
 
-// MarshalMLS writes the fields in declaration order. The nested structure is
-// framed by hand because the Writer has no counterpart to ReadNested: an encoder
-// that wants a structure inside a varint prefixed region encodes it into a scratch
-// Writer inheriting the outer limit and hands the result to WriteOpaque, which is
-// what WriteVector does internally for its elements. The five generators modelled
-// on this one will each need the same three lines.
+// MarshalMLS writes the fields in declaration order. The nested structure goes
+// through WriteNested, the encode side counterpart to ReadNested, which encodes it
+// into a scratch Writer inheriting the outer limit and frames the result with
+// WriteOpaque. The five generators modelled on this one should do the same rather
+// than hand rolling those lines, since the inherited limit is the part that is
+// silent when it is wrong.
 func (self *testStruct) MarshalMLS(w *Writer) error {
 	w.WriteUint16(self.Version)
 	w.WriteUint8(self.Flags)
@@ -208,16 +208,9 @@ func (self *testStruct) MarshalMLS(w *Writer) error {
 	if err != nil {
 		return err
 	}
-	scratch := NewWriterLimit(w.MaxVectorLength())
-	if err := self.Nested.MarshalMLS(scratch); err != nil {
-		return err
-	}
-	nested, err := scratch.Bytes()
-	if err != nil {
-		return err
-	}
-	w.WriteOpaque(nested)
-	return nil
+	return w.WriteNested(func(w *Writer) error {
+		return self.Nested.MarshalMLS(w)
+	})
 }
 
 // UnmarshalMLS reads the fields in the same order and assigns nothing until every

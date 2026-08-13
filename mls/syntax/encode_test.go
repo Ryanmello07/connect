@@ -222,6 +222,279 @@ func TestLPAndVarintPrefixesAreDistinct(t *testing.T) {
 	}
 }
 
+// nestedWriters is the two framings WriteNested and WriteNestedLP put around the
+// same nested encoding, paired with the return free opaque write each one is meant
+// to be equivalent to. A table rather than two copies of every case below, because
+// every property here holds identically for both forms and a property asserted for
+// only one of them is how the two drift apart.
+var nestedWriters = []struct {
+	name        string
+	writeNested func(w *Writer, encodeOne func(w *Writer) error) error
+	writeOpaque func(w *Writer, bs []byte)
+}{
+	{
+		name:        "varint framed",
+		writeNested: (*Writer).WriteNested,
+		writeOpaque: (*Writer).WriteOpaque,
+	},
+	{
+		name:        "LP framed",
+		writeNested: (*Writer).WriteNestedLP,
+		writeOpaque: (*Writer).WriteOpaqueLP,
+	},
+}
+
+// TestWriteNestedInheritsTheOuterVectorLimit is the whole reason the helper exists,
+// and it is written to fail on a scratch Writer built with NewWriter instead of
+// NewWriterLimit(self.MaxVectorLength()). The outer Writer is at
+// MaxRatchetTreeLength and the nested body is one byte past MaxVectorLength, so the
+// two constructions disagree: inheriting accepts the body, and a fresh default
+// limited scratch refuses it with ErrLengthExceedsMax even though the encode it is
+// part of is allowed sixteen mebibytes. The second half of the loop asserts that a
+// default limited outer Writer really does refuse this body, so the case cannot
+// quietly degenerate into one both constructions accept — without that, a body
+// under a mebibyte would pass here whatever the scratch was built with.
+func TestWriteNestedInheritsTheOuterVectorLimit(t *testing.T) {
+	body := bytes.Repeat([]byte{0x5a}, MaxVectorLength+1)
+	for _, c := range nestedWriters {
+		w := NewWriterLimit(MaxRatchetTreeLength)
+		err := c.writeNested(w, func(w *Writer) error {
+			w.WriteOpaque(body)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("%s: a nested body of %d bytes under the ratchet tree limit gave %v; only a scratch writer built at the default limit refuses it", c.name, len(body), err)
+		}
+		out, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: Bytes gave %v", c.name, err)
+		}
+		if !bytes.HasSuffix(out, body) {
+			t.Errorf("%s: encoding of %d bytes does not end in the nested body", c.name, len(out))
+		}
+		// four octets of outer prefix, four of the nested opaque's own varint
+		if len(out) != 8+len(body) {
+			t.Errorf("%s: encoded %d bytes, want %d", c.name, len(out), 8+len(body))
+		}
+		def := NewWriter()
+		if err := c.writeNested(def, func(w *Writer) error {
+			w.WriteOpaque(body)
+			return nil
+		}); !errors.Is(err, ErrLengthExceedsMax) {
+			t.Errorf("%s: the same body at the default limit gave %v, want ErrLengthExceedsMax; the two limits do not separate, so this case proves nothing", c.name, err)
+		}
+	}
+}
+
+// TestWriteNestedIsANoOpAfterAFailure asserts the entry guard on the sticky error:
+// a Writer that has already failed reports that error, appends nothing, and never
+// runs encodeOne. Running the encoder anyway would let a nested structure's side
+// effects and semantic refusals happen inside an encoding that can never be handed
+// out, and would let a later failure inside the region displace the real cause in
+// the report.
+func TestWriteNestedIsANoOpAfterAFailure(t *testing.T) {
+	for _, c := range nestedWriters {
+		w := NewWriter()
+		w.WriteUint8(0x01)
+		w.setErr(ErrTruncated)
+		ran := false
+		err := c.writeNested(w, func(w *Writer) error {
+			ran = true
+			w.WriteUint8(0x02)
+			return nil
+		})
+		if !errors.Is(err, ErrTruncated) {
+			t.Errorf("%s: gave %v on a failed Writer, want the carried ErrTruncated", c.name, err)
+		}
+		if ran {
+			t.Errorf("%s: encodeOne ran on a Writer that had already failed", c.name)
+		}
+		if w.Len() != 1 {
+			t.Errorf("%s: Len is %d, want 1: nothing may be appended after a failure", c.name, w.Len())
+		}
+	}
+}
+
+// TestWriteNestedLatchesAnEncoderRefusal asserts a refusal from encodeOne is both
+// returned and set sticky, matching WriteOptional. A caller that drops the return
+// would otherwise take an encoding its own encoder refused to produce, and on this
+// side of the codec a dropped refusal is wrong signed bytes rather than a failure.
+func TestWriteNestedLatchesAnEncoderRefusal(t *testing.T) {
+	refused := errors.New("mls syntax test: nested encoder refused")
+	for _, c := range nestedWriters {
+		w := NewWriter()
+		w.WriteUint8(0x01)
+		err := c.writeNested(w, func(w *Writer) error {
+			w.WriteUint8(0x02)
+			return refused
+		})
+		if !errors.Is(err, refused) {
+			t.Errorf("%s: returned %v, want the encoder's own refusal", c.name, err)
+		}
+		if !errors.Is(w.Err(), refused) {
+			t.Errorf("%s: Err is %v, want the refusal latched on the outer Writer", c.name, w.Err())
+		}
+		out, err := w.Bytes()
+		if !errors.Is(err, refused) {
+			t.Errorf("%s: Bytes gave %v, want the refusal", c.name, err)
+		}
+		if out != nil {
+			t.Errorf("%s: Bytes returned %x alongside a refusal, want nil", c.name, out)
+		}
+	}
+}
+
+// TestWriteNestedSurfacesAScratchFailure asserts a failure the scratch Writer
+// latched but the encoder did not report is still fatal. The encoder here returns
+// nil after writing an opaque field past the inherited limit, which is exactly the
+// shape of a leaf write failing inside a nested encoder that only ever returns nil
+// because the leaf writes are return free. Dropping the error from scratch.Bytes
+// would frame the nil that Bytes hands back alongside it as an empty region: a
+// well formed encoding of a structure that was never encoded.
+func TestWriteNestedSurfacesAScratchFailure(t *testing.T) {
+	for _, c := range nestedWriters {
+		w := NewWriterLimit(16)
+		err := c.writeNested(w, func(w *Writer) error {
+			w.WriteOpaque(bytes.Repeat([]byte{0x11}, 20))
+			return nil
+		})
+		if !errors.Is(err, ErrLengthExceedsMax) {
+			t.Errorf("%s: returned %v, want the scratch Writer's ErrLengthExceedsMax", c.name, err)
+		}
+		if !errors.Is(w.Err(), ErrLengthExceedsMax) {
+			t.Errorf("%s: Err is %v, want ErrLengthExceedsMax latched on the outer Writer", c.name, w.Err())
+		}
+		if w.Len() != 0 {
+			t.Errorf("%s: Len is %d, want 0: a refused region must not be framed as an empty one", c.name, w.Len())
+		}
+	}
+}
+
+// TestWriteNestedReportsAnOverLongRegion asserts the framing write's own refusal
+// reaches the return, not only the sticky error. The nested encoding here is inside
+// the inherited limit for every field it contains — the raw write carries no length
+// prefix and so no limit check — and only the assembled region is too long, which
+// the return free WriteOpaque reports through the sticky error alone. Returning a
+// bare nil at the end would hide it from a caller that checks the return, the same
+// reason WriteVector ends in the sticky error rather than nil.
+func TestWriteNestedReportsAnOverLongRegion(t *testing.T) {
+	for _, c := range nestedWriters {
+		w := NewWriterLimit(16)
+		err := c.writeNested(w, func(w *Writer) error {
+			w.WriteRaw(bytes.Repeat([]byte{0x11}, 20))
+			return nil
+		})
+		if !errors.Is(err, ErrLengthExceedsMax) {
+			t.Errorf("%s: returned %v for a region of 20 bytes at a limit of 16, want ErrLengthExceedsMax", c.name, err)
+		}
+		if !errors.Is(w.Err(), ErrLengthExceedsMax) {
+			t.Errorf("%s: Err is %v, want ErrLengthExceedsMax", c.name, w.Err())
+		}
+	}
+}
+
+// TestWriteNestedFramesExactlyTheHandRolledEncoding asserts the helper is a faithful
+// replacement for the scratch-and-WriteOpaque idiom it exists to remove rather than
+// merely a plausible one: byte for byte the same output, over an empty nested
+// structure and over one whose own opaque field crosses the varint width boundary.
+// The two framings are also asserted to differ from each other, since one codec
+// serves both the MLS varint prefix and the record layer's fixed 32 bit one and a
+// helper that confused them would pass every other case here.
+func TestWriteNestedFramesExactlyTheHandRolledEncoding(t *testing.T) {
+	items := []testItem{
+		{Kind: 0x0000, Data: nil},
+		{Kind: 0x0102, Data: []byte{0xaa}},
+		{Kind: 0xffff, Data: bytes.Repeat([]byte{0x5a}, 63)},
+		{Kind: 0x0001, Data: bytes.Repeat([]byte{0x5a}, 64)},
+	}
+	for _, item := range items {
+		framed := make([][]byte, len(nestedWriters))
+		for i, c := range nestedWriters {
+			w := NewWriter()
+			w.WriteUint8(0x7f)
+			if err := c.writeNested(w, func(w *Writer) error {
+				return item.MarshalMLS(w)
+			}); err != nil {
+				t.Fatalf("%s: item %x gave %v", c.name, item.Data, err)
+			}
+			out, err := w.Bytes()
+			if err != nil {
+				t.Fatalf("%s: item %x: Bytes gave %v", c.name, item.Data, err)
+			}
+			hand := NewWriter()
+			hand.WriteUint8(0x7f)
+			scratch := NewWriterLimit(hand.MaxVectorLength())
+			if err := item.MarshalMLS(scratch); err != nil {
+				t.Fatalf("%s: item %x: hand rolled encode gave %v", c.name, item.Data, err)
+			}
+			region, err := scratch.Bytes()
+			if err != nil {
+				t.Fatalf("%s: item %x: hand rolled Bytes gave %v", c.name, item.Data, err)
+			}
+			c.writeOpaque(hand, region)
+			want, err := hand.Bytes()
+			if err != nil {
+				t.Fatalf("%s: item %x: hand rolled outer Bytes gave %v", c.name, item.Data, err)
+			}
+			if !bytes.Equal(out, want) {
+				t.Errorf("%s: item %x encoded to %x, want the hand rolled %x", c.name, item.Data, out, want)
+			}
+			framed[i] = append([]byte{}, out...)
+		}
+		if bytes.Equal(framed[0], framed[1]) {
+			t.Errorf("item %x encoded identically under both nested framings: %x", item.Data, framed[0])
+		}
+	}
+}
+
+// TestWriteNestedRoundTripsThroughReadNested asserts the region the encode half
+// frames is exactly the region the decode half runs to empty. ReadNested reports
+// ErrTrailingBytes for a region longer than the structure inside it and ErrTruncated
+// for a shorter one, so a framing that was off by any amount in either direction
+// fails here rather than at some later call site.
+func TestWriteNestedRoundTripsThroughReadNested(t *testing.T) {
+	items := []testItem{
+		{Kind: 0x0000, Data: nil},
+		{Kind: 0x0102, Data: []byte{0xaa, 0xbb}},
+		{Kind: 0xffff, Data: bytes.Repeat([]byte{0x5a}, 200)},
+	}
+	cases := []struct {
+		name  string
+		write func(w *Writer, encodeOne func(w *Writer) error) error
+		read  func(r *Reader, decodeOne func(r *Reader) error) error
+	}{
+		{name: "varint framed", write: (*Writer).WriteNested, read: (*Reader).ReadNested},
+		{name: "LP framed", write: (*Writer).WriteNestedLP, read: (*Reader).ReadNestedLP},
+	}
+	for _, c := range cases {
+		for _, item := range items {
+			w := NewWriter()
+			if err := c.write(w, func(w *Writer) error {
+				return item.MarshalMLS(w)
+			}); err != nil {
+				t.Fatalf("%s: item %x gave %v", c.name, item.Data, err)
+			}
+			out, err := w.Bytes()
+			if err != nil {
+				t.Fatalf("%s: item %x: Bytes gave %v", c.name, item.Data, err)
+			}
+			r := NewReader(out)
+			decoded := testItem{}
+			if err := c.read(r, func(r *Reader) error {
+				return decoded.UnmarshalMLS(r)
+			}); err != nil {
+				t.Fatalf("%s: item %x: decode gave %v", c.name, item.Data, err)
+			}
+			if err := r.Done(); err != nil {
+				t.Errorf("%s: item %x: Done gave %v", c.name, item.Data, err)
+			}
+			if decoded.Kind != item.Kind || !bytes.Equal(decoded.Data, item.Data) {
+				t.Errorf("%s: decoded %x %x, want %x %x", c.name, decoded.Kind, decoded.Data, item.Kind, item.Data)
+			}
+		}
+	}
+}
+
 // the property the three case check above only spot checks, swept across every
 // varint width boundary. The three bodies it uses are 0, 1 and 200 bytes, all of
 // which fall in the regime where the two encodings differ in total length — one or
