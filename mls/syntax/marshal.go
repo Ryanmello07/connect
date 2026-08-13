@@ -133,19 +133,47 @@ func UnmarshalLimit(bs []byte, v Unmarshaler, maxVectorLength int) error {
 // registration mutates, a buffer shared across decodes. That defect is invisible
 // to the byte exactness check, which sees one encode.
 //
-// The bound is the default MaxVectorLength, so a structure that only decodes
-// under MaxRatchetTreeLength is rejected here and returns nil rather than being
-// checked. Ratchet tree fuzzing needs its own entry point; this is deliberately
-// not it.
+// The bound is the default MaxVectorLength, which is correct for every structure
+// but the ratchet tree; CheckRoundTripLimit is the form the tree paths call, and
+// this is that with the default limit rather than a second copy of the sequence,
+// so the two cannot drift apart in what they check.
 func CheckRoundTrip[T any, PT interface {
 	*T
 	Codec
 }](bs []byte) error {
+	return CheckRoundTripLimit[T, PT](bs, MaxVectorLength)
+}
+
+// CheckRoundTripLimit is the same property under a caller chosen vector length
+// limit; the ratchet tree paths pass MaxRatchetTreeLength and nothing else raises
+// the bound, matching MarshalLimit and UnmarshalLimit above. Everything
+// CheckRoundTrip documents holds here unchanged, including the nil for an input
+// that does not decode and the second pass being a nondeterminism check rather
+// than a second round trip.
+//
+// A structure that only decodes under the raised bound does not decode under the
+// default one, so through the default entry point it takes the no-obligation path
+// and returns nil — correct against the contract, and silent. A ratchet tree fuzz
+// target built on the default bound would therefore be not merely mostly vacuous
+// but entirely so, indistinguishable from one finding nothing wrong. That is why
+// this exists here rather than being left for the call site to discover.
+//
+// The limit goes to both halves, and that is the point of threading it through
+// rather than only raising the decoder. A tree that decoded under
+// MaxRatchetTreeLength and then re-encoded through a Writer still capped at
+// MaxVectorLength would fail byte exactness with ErrLengthExceedsMax, reporting a
+// round trip violation for a reason that has nothing to do with canonicality — a
+// false positive arriving in the one situation where somebody is chasing a real
+// one.
+func CheckRoundTripLimit[T any, PT interface {
+	*T
+	Codec
+}](bs []byte, maxVectorLength int) error {
 	first := PT(new(T))
-	if err := Unmarshal(bs, first); err != nil {
+	if err := UnmarshalLimit(bs, first, maxVectorLength); err != nil {
 		return nil
 	}
-	reencoded, err := Marshal(first)
+	reencoded, err := MarshalLimit(first, maxVectorLength)
 	if err != nil {
 		return errors.Join(ErrRoundTripNotByteExact, err)
 	}
@@ -153,10 +181,10 @@ func CheckRoundTrip[T any, PT interface {
 		return ErrRoundTripNotByteExact
 	}
 	second := PT(new(T))
-	if err := Unmarshal(reencoded, second); err != nil {
+	if err := UnmarshalLimit(reencoded, second, maxVectorLength); err != nil {
 		return errors.Join(ErrRoundTripNotStable, err)
 	}
-	again, err := Marshal(second)
+	again, err := MarshalLimit(second, maxVectorLength)
 	if err != nil {
 		return errors.Join(ErrRoundTripNotStable, err)
 	}

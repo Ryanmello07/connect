@@ -499,6 +499,181 @@ func TestCheckRoundTripReportsAnUnstableSecondPass(t *testing.T) {
 	driftingProbeDecodes = 0
 }
 
+// limitObservingProbe records the vector length limit of every buffer it is
+// handed. It exists alongside limitReportingProbe rather than reusing it because
+// CheckRoundTrip builds its own values with new(T) and never hands them back, so a
+// limit recorded on the instance is a limit nobody can read; these have to be
+// package level to be observable at all. It writes and reads nothing, so the limit
+// is the only thing under test and empty input round trips.
+type limitObservingProbe struct{}
+
+var _ Codec = (*limitObservingProbe)(nil)
+
+var (
+	observedWriterLimits []int
+	observedReaderLimits []int
+)
+
+func (self *limitObservingProbe) MarshalMLS(w *Writer) error {
+	observedWriterLimits = append(observedWriterLimits, w.MaxVectorLength())
+	return nil
+}
+
+func (self *limitObservingProbe) UnmarshalMLS(r *Reader) error {
+	observedReaderLimits = append(observedReaderLimits, r.MaxVectorLength())
+	return nil
+}
+
+// TestCheckRoundTripCarriesItsLimitToBothHalves pins the delegation and the two
+// halves at once, and does it by observing the limit rather than by observing an
+// outcome the limit happens to change. That distinction is the whole test: over an
+// input the default bound rejects, a correct entry point and one that ignored its
+// limit argument both return nil — one because there is no obligation and one
+// because it checked the wrong thing — so an outcome based assertion here could
+// never tell them apart. Reading the number off the buffer can.
+//
+// Four observations are required per call, two decodes and two encodes, so a
+// version that raised only the decoder is caught by the writer half and a version
+// that skipped the second pass is caught by the count.
+func TestCheckRoundTripCarriesItsLimitToBothHalves(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(bs []byte) error
+		want int
+	}{
+		{
+			name: "the default entry point delegates with MaxVectorLength",
+			run:  CheckRoundTrip[limitObservingProbe, *limitObservingProbe],
+			want: MaxVectorLength,
+		},
+		{
+			name: "the limit taking form carries the ratchet tree bound",
+			run: func(bs []byte) error {
+				return CheckRoundTripLimit[limitObservingProbe, *limitObservingProbe](bs, MaxRatchetTreeLength)
+			},
+			want: MaxRatchetTreeLength,
+		},
+		{
+			name: "the limit taking form carries an arbitrary bound",
+			run: func(bs []byte) error {
+				return CheckRoundTripLimit[limitObservingProbe, *limitObservingProbe](bs, 32)
+			},
+			want: 32,
+		},
+	}
+	for _, c := range cases {
+		observedWriterLimits = nil
+		observedReaderLimits = nil
+		if err := c.run(nil); err != nil {
+			t.Fatalf("%s: unexpected error: %v", c.name, err)
+		}
+		if len(observedReaderLimits) != 2 || len(observedWriterLimits) != 2 {
+			t.Errorf("%s: %d decodes and %d encodes, want 2 of each so both passes are measured", c.name, len(observedReaderLimits), len(observedWriterLimits))
+		}
+		for _, got := range observedReaderLimits {
+			if got != c.want {
+				t.Errorf("%s: bounded a Reader at %d, want %d", c.name, got, c.want)
+			}
+		}
+		for _, got := range observedWriterLimits {
+			if got != c.want {
+				t.Errorf("%s: bounded a Writer at %d, want %d", c.name, got, c.want)
+			}
+		}
+	}
+	observedWriterLimits = nil
+	observedReaderLimits = nil
+}
+
+// bulkyLenientProbe is lenientProbe's defect — any non zero octet decodes as set,
+// set encodes as 0x01 — carried behind an opaque field large enough that the whole
+// structure only decodes under the raised bound. It is what the gap looks like in
+// practice: a real round trip violation sitting inside a value the default bound
+// will not even look at.
+type bulkyLenientProbe struct {
+	flag bool
+	body []byte
+}
+
+var _ Codec = (*bulkyLenientProbe)(nil)
+
+func (self *bulkyLenientProbe) MarshalMLS(w *Writer) error {
+	if self.flag {
+		w.WriteUint8(0x01)
+	} else {
+		w.WriteUint8(0x00)
+	}
+	w.WriteOpaque(self.body)
+	return nil
+}
+
+func (self *bulkyLenientProbe) UnmarshalMLS(r *Reader) error {
+	v, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	body, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	self.flag = v != 0
+	self.body = body
+	return nil
+}
+
+// TestCheckRoundTripLimitExercisesAValueTheDefaultBoundRejects is the test that
+// would have caught the gap. Both inputs are one octet over MaxVectorLength in
+// their opaque field, so neither decodes under the default bound and the default
+// entry point returns nil for both — the documented no-obligation contract, which
+// is correct and completely silent, and is why a ratchet tree target built on it
+// would report green having checked nothing at all.
+//
+// The non-vacuity is carried by the second input. Under the raised bound it must
+// come back ErrRoundTripNotByteExact, which a limit taking form that ignored its
+// argument could not produce: it would fail to decode and return nil like the
+// default one does. So this fails against that version rather than merely passing
+// against this one. The first input is the control that keeps the second
+// attributable — same size, same raised bound, correct codec, nil — so the
+// sentinel below is the leniency being caught and not the size.
+//
+// The differing octet is the flag rather than a length, so both encodings are the
+// same total length and the comparison inside the property is decided by content.
+func TestCheckRoundTripLimitExercisesAValueTheDefaultBoundRejects(t *testing.T) {
+	oversized := bytes.Repeat([]byte{0x77}, MaxVectorLength+1)
+
+	roundTripping := marshalProbe{Value: 0xbeef, Body: oversized}
+	clean, err := MarshalLimit(&roundTripping, MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	lenient := bulkyLenientProbe{flag: true, body: oversized}
+	broken, err := MarshalLimit(&lenient, MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 0x02 is the second wire form of a flag the encoder only ever writes as 0x01
+	broken[0] = 0x02
+
+	// the gap: neither input decodes under the default bound, so the property is
+	// never reached and both come back nil
+	if err := CheckRoundTrip[marshalProbe, *marshalProbe](clean); err != nil {
+		t.Errorf("the default bound gave %v, want nil on an input it cannot decode", err)
+	}
+	if err := CheckRoundTrip[bulkyLenientProbe, *bulkyLenientProbe](broken); err != nil {
+		t.Errorf("the default bound gave %v, want nil on an input it cannot decode", err)
+	}
+
+	// and under the raised bound the property is actually exercised, which is what
+	// these two between them measure
+	if err := CheckRoundTripLimit[marshalProbe, *marshalProbe](clean, MaxRatchetTreeLength); err != nil {
+		t.Errorf("the raised bound gave %v on a value that round trips, want nil", err)
+	}
+	if err := CheckRoundTripLimit[bulkyLenientProbe, *bulkyLenientProbe](broken, MaxRatchetTreeLength); !errors.Is(err, ErrRoundTripNotByteExact) {
+		t.Errorf("the raised bound gave %v on a value that does not round trip, want ErrRoundTripNotByteExact", err)
+	}
+}
+
 // nextXorshift advances a 64 bit xorshift state and returns it. It is inlined here
 // rather than taken from math/rand so this file adds no import to a package whose
 // dependency set is a structural gate, and so the corpus below is byte for byte
