@@ -244,6 +244,49 @@ func (self *Reader) validateLength(n uint32) (int, error) {
 	return int(n), nil
 }
 
+// takeRegion is the shared tail of every length prefixed read. It validates the
+// length a prefix has just declared and, only once that passes, consumes the
+// region that length describes, handing back where the region starts so the
+// caller can copy it out or build a view over it. mark is the cursor from before
+// the prefix was read: a refused length restores it, so a caller who ignores the
+// error is never left parked partway inside a field that was rejected — the
+// prefix has to be consumed before the length can be checked against the bytes
+// remaining after it, so there is always something to give back. Latching is
+// validateLength's job and already done by the time this returns, so what is left
+// here is only the cursor. It exists because ReadOpaque, ReadOpaqueLP, ReadSub
+// and ReadSubLP differ solely in how the prefix is spelled and in what they build
+// from the region; four copies of the validate, restore and advance sequence is
+// how they would drift apart, and the one that drifted would be the one missing
+// the restore.
+func (self *Reader) takeRegion(mark int, n uint32) (int, int, error) {
+	length, err := self.validateLength(n)
+	if err != nil {
+		self.pos = mark
+		return 0, 0, err
+	}
+	start := self.pos
+	self.pos += length
+	return start, length, nil
+}
+
+// subReader builds the bounded view an already validated and already consumed
+// region describes. The view is deliberately not a copy — it is read only, and a
+// nested structure would otherwise cost a copy of every byte at every level of
+// nesting — but its capacity is clipped to its length by the three index slice,
+// so an append inside it allocates a fresh array instead of writing over the
+// bytes the parent has not read yet. It inherits the parent's vector length
+// limit, since the ratchet tree's raised maximum has to survive the step into a
+// nested structure, and it starts with no sticky error of its own: a failure
+// inside the region belongs to the region.
+func (self *Reader) subReader(start int, length int) *Reader {
+	return &Reader{
+		bs:              self.bs[start : start+length : start+length],
+		pos:             0,
+		maxVectorLength: self.maxVectorLength,
+		err:             nil,
+	}
+}
+
 // ReadOpaque decodes opaque x<V>: a varint length prefix read by ReadVarint,
 // then that many bytes. The declared length is validated by validateLength —
 // against the configured maximum and then against the bytes actually remaining —
@@ -265,14 +308,12 @@ func (self *Reader) ReadOpaque() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length, err := self.validateLength(n)
+	start, length, err := self.takeRegion(mark, n)
 	if err != nil {
-		self.pos = mark
 		return nil, err
 	}
 	out := make([]byte, length)
-	copy(out, self.bs[self.pos:self.pos+length])
-	self.pos += length
+	copy(out, self.bs[start:start+length])
 	return out, nil
 }
 
@@ -300,13 +341,72 @@ func (self *Reader) ReadOpaqueLP() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length, err := self.validateLength(n)
+	start, length, err := self.takeRegion(mark, n)
 	if err != nil {
-		self.pos = mark
 		return nil, err
 	}
 	out := make([]byte, length)
-	copy(out, self.bs[self.pos:self.pos+length])
-	self.pos += length
+	copy(out, self.bs[start:start+length])
 	return out, nil
+}
+
+// ReadSub returns a bounded view over the next opaque x<V> region, for a
+// structure carried inside an opaque field: the extension bodies and GroupInfo
+// paths of later waves, and ReadVector. The prefix and its length go through the
+// same ReadVarint and validateLength this file's other variable length reads use,
+// so a hostile length is refused before anything is sized by it, and on a
+// rejection the cursor is restored to where it stood before the call and the
+// failure latches into this Reader.
+//
+// The parent advances past the whole region however much of it the sub reader
+// consumes, so a caller that stops early — or that abandons the nested structure
+// after a failure inside it — cannot desynchronise the parent, and a failure
+// inside the region latches on the sub reader alone rather than taking the rest
+// of the message down with it.
+//
+// That is also the one obligation this hands back to the caller: because the
+// parent skips the region wholesale, bytes the sub reader leaves behind are
+// invisible to the parent, whose own Done reports success. The caller must call
+// Done on the returned Reader once the nested structure is finished. Without
+// it, a region longer than the structure inside it is silently accepted, which is
+// a second valid encoding of one object — the same class of defect the varint's
+// minimal form rule exists to prevent, and it matters for the same reason: MLS
+// signs over serialized bytes, so an encoding a verifier accepts but a signer
+// never produced is a signature bypass primitive.
+func (self *Reader) ReadSub() (*Reader, error) {
+	if self.err != nil {
+		return nil, self.err
+	}
+	mark := self.pos
+	n, err := self.ReadVarint()
+	if err != nil {
+		return nil, err
+	}
+	start, length, err := self.takeRegion(mark, n)
+	if err != nil {
+		return nil, err
+	}
+	return self.subReader(start, length), nil
+}
+
+// ReadSubLP is ReadSub over an LP(x) region, for a record field that carries a
+// structure: connect/message nests inside the fixed 32 bit prefix exactly as MLS
+// nests inside the varint one, and the two prefixes are never interchangeable.
+// Every property ReadSub documents holds here unchanged, including the caller's
+// obligation to call Done on the returned Reader — the parent skips the whole
+// region either way, so only the sub reader can see bytes left over inside it.
+func (self *Reader) ReadSubLP() (*Reader, error) {
+	if self.err != nil {
+		return nil, self.err
+	}
+	mark := self.pos
+	n, err := self.ReadUint32()
+	if err != nil {
+		return nil, err
+	}
+	start, length, err := self.takeRegion(mark, n)
+	if err != nil {
+		return nil, err
+	}
+	return self.subReader(start, length), nil
 }

@@ -447,3 +447,289 @@ func TestReadOpaqueLPRefusesALatchedReader(t *testing.T) {
 		t.Errorf("latched Reader gave %v, want ErrNegativeLength", err)
 	}
 }
+
+// TestReadSubIsBoundedAndAdvancesTheParent asserts the two halves of the
+// sub-reader contract at once: the view sees exactly the declared region and
+// refuses a read that would reach past it, and the parent is left positioned
+// after the whole region rather than wherever the sub-reader stopped, so the
+// field that follows the nested structure decodes correctly.
+func TestReadSubIsBoundedAndAdvancesTheParent(t *testing.T) {
+	w := NewWriter()
+	w.WriteOpaque([]byte{0xaa, 0xbb, 0xcc})
+	w.WriteUint16(0xbeef)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	sub, err := r.ReadSub()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sub.Remaining() != 3 {
+		t.Fatalf("sub reader sees %d bytes, want 3", sub.Remaining())
+	}
+	if _, err := sub.ReadRaw(4); !errors.Is(err, ErrTruncated) {
+		t.Errorf("sub reader read past its region")
+	}
+	if v, err := r.ReadUint16(); err != nil || v != 0xbeef {
+		t.Errorf("parent gave %#x, %v after ReadSub; want beef, nil", v, err)
+	}
+	if err := r.Done(); err != nil {
+		t.Errorf("Done gave %v", err)
+	}
+}
+
+// TestReadSubInheritsTheLimit asserts the raised ratchet tree limit survives the
+// step into a nested structure. A sub-reader that silently fell back to the
+// package default would reject a legitimate tree field with ErrLengthExceedsMax
+// at whatever depth the tree happens to be nested, which is a decode failure that
+// only shows up on large groups.
+func TestReadSubInheritsTheLimit(t *testing.T) {
+	w := NewWriterLimit(MaxRatchetTreeLength)
+	w.WriteOpaque(bytes.Repeat([]byte{0x11}, 8))
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReaderLimit(encoded, MaxRatchetTreeLength)
+	sub, err := r.ReadSub()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sub.MaxVectorLength() != MaxRatchetTreeLength {
+		t.Errorf("sub reader limit is %d, want the parent's %d", sub.MaxVectorLength(), MaxRatchetTreeLength)
+	}
+}
+
+// TestReadSubLPIsBounded asserts the record layer's fixed width prefix produces
+// the same bounded view and the same parent advance as the varint form, since
+// connect/message nests structures inside LP fields exactly as MLS nests them
+// inside opaque ones.
+func TestReadSubLPIsBounded(t *testing.T) {
+	w := NewWriter()
+	w.WriteOpaqueLP([]byte{0xaa, 0xbb})
+	w.WriteUint8(0x77)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	sub, err := r.ReadSubLP()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sub.Remaining() != 2 {
+		t.Errorf("sub reader sees %d bytes, want 2", sub.Remaining())
+	}
+	if v, err := r.ReadUint8(); err != nil || v != 0x77 {
+		t.Errorf("parent gave %#x, %v; want 77, nil", v, err)
+	}
+}
+
+// TestReadSubCannotGrowIntoTheParent asserts the three index slice: a sub reader
+// is a view rather than a copy, so without the capacity clip an append inside it
+// would write into the parent's own backing array, corrupting bytes the parent
+// has not read yet.
+func TestReadSubCannotGrowIntoTheParent(t *testing.T) {
+	r := NewReader([]byte{0x01, 0xaa, 0xbb, 0xcc})
+	sub, err := r.ReadSub()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	grown := append(sub.bs, 0xff)
+	if len(r.bs) < 4 || r.bs[2] != 0xbb {
+		t.Errorf("appending to the sub reader's slice overwrote the parent's bytes: %x", r.bs)
+	}
+	if grown[1] != 0xff {
+		t.Errorf("append did not produce the expected value")
+	}
+}
+
+// TestReadSubChecksTheLimitThenTheInput asserts a rejected region surfaces the
+// same distinguishable sentinel ReadOpaque would give for the same bytes, and
+// that Offset is back at 0 afterward: the mark and restore must undo a validly
+// decoded varint prefix's advance, or the caller that ignores the error leaves
+// the cursor parked inside a region that was never accepted.
+func TestReadSubChecksTheLimitThenTheInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []byte
+		wantErr error
+	}{
+		{name: "length above the limit", input: []byte{0xbf, 0xff, 0xff, 0xff}, wantErr: ErrLengthExceedsMax},
+		{name: "length above the remaining input", input: []byte{0x40, 0x40, 0x11, 0x11}, wantErr: ErrLengthExceedsInput},
+		{name: "prefix only", input: []byte{0x05}, wantErr: ErrLengthExceedsInput},
+		{name: "non minimal prefix", input: []byte{0x40, 0x00}, wantErr: ErrVarintNotMinimal},
+	}
+	for _, c := range cases {
+		r := NewReader(c.input)
+		if _, err := r.ReadSub(); !errors.Is(err, c.wantErr) {
+			t.Errorf("%s gave %v, want %v", c.name, err, c.wantErr)
+		}
+		if r.Offset() != 0 {
+			t.Errorf("%s left Offset at %d, want 0: a rejected ReadSub must not consume input", c.name, r.Offset())
+		}
+	}
+}
+
+// TestReadSubLPChecksTheLimitThenTheInput is the fixed width counterpart, and the
+// cursor assertion matters more here: the four prefix octets are consumed before
+// the length can be validated at all, so a rejected read that skipped the restore
+// would hand the next read four bytes of body as if they were a new field.
+func TestReadSubLPChecksTheLimitThenTheInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []byte
+		wantErr error
+	}{
+		{name: "length above the limit", input: []byte{0xff, 0xff, 0xff, 0xff}, wantErr: ErrLengthExceedsMax},
+		{name: "length above the remaining input", input: []byte{0x00, 0x00, 0x00, 0x40, 0x11}, wantErr: ErrLengthExceedsInput},
+		{name: "prefix truncated", input: []byte{0x00, 0x00, 0x00}, wantErr: ErrTruncated},
+	}
+	for _, c := range cases {
+		r := NewReader(c.input)
+		if _, err := r.ReadSubLP(); !errors.Is(err, c.wantErr) {
+			t.Errorf("%s gave %v, want %v", c.name, err, c.wantErr)
+		}
+		if r.Offset() != 0 {
+			t.Errorf("%s advanced the cursor to %d on a failed read", c.name, r.Offset())
+		}
+	}
+}
+
+// TestReadSubLatchesOnFailure defends the sticky contract on the varint form. The
+// input declares a 64 byte region and supplies two bytes, so the read fails with
+// the cursor correctly restored to 0 — and the four octets it refused are then
+// still sitting there for the next read to reinterpret. Unlatched, ReadUint32
+// returns 0x40401111 with a nil error, a structurally valid decode of an entirely
+// different field, and Done then reports ErrTrailingBytes, describing leftovers
+// instead of the real failure. Round trip tests cannot see any of that.
+func TestReadSubLatchesOnFailure(t *testing.T) {
+	input := []byte{0x40, 0x40, 0x11, 0x11} // declares 64, only 2 bytes follow
+	r := NewReader(input)
+	if _, err := r.ReadSub(); !errors.Is(err, ErrLengthExceedsInput) {
+		t.Fatalf("ReadSub gave %v, want ErrLengthExceedsInput", err)
+	}
+	if v, err := r.ReadUint32(); err == nil {
+		t.Errorf("after a failed read, ReadUint32 returned %#x with nil error", v)
+	}
+	if err := r.Done(); err == nil || errors.Is(err, ErrTrailingBytes) {
+		t.Errorf("Done reported %v, masking the real failure", err)
+	}
+}
+
+// TestReadSubLPLatchesOnFailure is the same defence for the fixed width form, and
+// it is the one the plan's own sample fails: that sample open codes the two
+// length comparisons and returns bare sentinels, so nothing latches. The input
+// declares 64 bytes and supplies one; on the unlatched version the following
+// ReadUint32 returns 0x40 with a nil error and Done reports ErrTrailingBytes.
+func TestReadSubLPLatchesOnFailure(t *testing.T) {
+	input := []byte{0x00, 0x00, 0x00, 0x40, 0x11} // declares 64, only 1 byte follows
+	r := NewReader(input)
+	if _, err := r.ReadSubLP(); !errors.Is(err, ErrLengthExceedsInput) {
+		t.Fatalf("ReadSubLP gave %v, want ErrLengthExceedsInput", err)
+	}
+	if v, err := r.ReadUint32(); err == nil {
+		t.Errorf("after a failed read, ReadUint32 returned %#x with nil error", v)
+	}
+	if err := r.Done(); err == nil || errors.Is(err, ErrTrailingBytes) {
+		t.Errorf("Done reported %v, masking the real failure", err)
+	}
+}
+
+// TestReadSubLPRefusesALatchedReader defends the entry guard. The plan's sample
+// has none, so on a Reader that NewReaderLimit already latched with
+// ErrNegativeLength it would compare the declared length against that negative
+// maximum and report ErrLengthExceedsMax instead, burying the construction time
+// misuse under a downstream symptom of it and breaking first error wins. The
+// input is a well formed single byte region, so only the missing guard can make
+// this fail.
+func TestReadSubLPRefusesALatchedReader(t *testing.T) {
+	r := NewReaderLimit([]byte{0x00, 0x00, 0x00, 0x01, 0xaa}, -1) // latched ErrNegativeLength
+	if _, err := r.ReadSubLP(); !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("latched Reader gave %v, want ErrNegativeLength", err)
+	}
+}
+
+// TestReadSubRefusesALatchedReader pins the same contract on the varint form.
+// Unlike its LP sibling this one cannot distinguish a present entry guard from an
+// absent one, because ReadVarint carries its own guard and runs first, so the
+// error surfaces either way; it is here so the contract is asserted rather than
+// inferred from a call it happens to delegate to today.
+func TestReadSubRefusesALatchedReader(t *testing.T) {
+	r := NewReaderLimit([]byte{0x01, 0xaa}, -1) // latched ErrNegativeLength
+	if _, err := r.ReadSub(); !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("latched Reader gave %v, want ErrNegativeLength", err)
+	}
+}
+
+// TestSubReaderFailureDoesNotLatchOntoTheParent asserts the isolation that makes
+// the unconditional parent advance safe. A malformed nested structure must latch
+// on the sub reader alone: the parent already skipped the whole region, so it is
+// still positioned on a field boundary and must stay usable, letting a caller
+// decide for itself whether a bad nested structure is fatal or a field it can
+// ignore. If the failure propagated to the parent instead, one unparseable
+// extension body would take the rest of the message down with it.
+func TestSubReaderFailureDoesNotLatchOntoTheParent(t *testing.T) {
+	w := NewWriter()
+	w.WriteOpaque([]byte{0xaa, 0xbb})
+	w.WriteUint16(0xbeef)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	sub, err := r.ReadSub()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := sub.ReadUint32(); !errors.Is(err, ErrTruncated) {
+		t.Fatalf("sub reader gave %v, want ErrTruncated", err)
+	}
+	if err := sub.Done(); !errors.Is(err, ErrTruncated) {
+		t.Errorf("sub reader Done gave %v, want the latched ErrTruncated", err)
+	}
+	if v, err := r.ReadUint16(); err != nil || v != 0xbeef {
+		t.Errorf("parent gave %#x, %v after the sub reader failed; want beef, nil", v, err)
+	}
+	if err := r.Done(); err != nil {
+		t.Errorf("parent Done gave %v, want nil: a sub reader's failure must not latch onto the parent", err)
+	}
+}
+
+// TestUnderConsumingSubReaderIsCaughtOnlyByDone pins the one place this design
+// leaves open, so the next reader of this file finds it asserted rather than
+// discovers it. The parent skips the whole region however little of it the sub
+// reader consumes, which is what keeps the parent synchronised — but it also
+// means bytes left over inside the region are invisible to the parent: its own
+// Done reports success. Only the sub reader's Done can see them, and the caller
+// is what obliges the codec to ask. Two encodings of one object would otherwise
+// both be accepted, in a codec whose serialized forms MLS signs over, so
+// ReadSub's doc comment requires the call and this test shows what it catches.
+func TestUnderConsumingSubReaderIsCaughtOnlyByDone(t *testing.T) {
+	w := NewWriter()
+	w.WriteOpaque([]byte{0xaa, 0xbb, 0xcc})
+	w.WriteUint16(0xbeef)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	sub, err := r.ReadSub()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v, err := sub.ReadUint8(); err != nil || v != 0xaa {
+		t.Fatalf("sub reader gave %#x, %v; want aa, nil", v, err)
+	}
+	if err := sub.Done(); !errors.Is(err, ErrTrailingBytes) {
+		t.Errorf("sub reader Done gave %v, want ErrTrailingBytes for the 2 bytes it left", err)
+	}
+	if v, err := r.ReadUint16(); err != nil || v != 0xbeef {
+		t.Errorf("parent gave %#x, %v; want beef, nil", v, err)
+	}
+	if err := r.Done(); err != nil {
+		t.Errorf("parent Done gave %v, want nil: the parent cannot see inside the region, which is why the caller must call the sub reader's Done", err)
+	}
+}
