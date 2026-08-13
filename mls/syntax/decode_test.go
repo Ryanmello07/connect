@@ -400,3 +400,50 @@ func TestReadOpaqueLPChecksTheLimitThenTheInput(t *testing.T) {
 		}
 	}
 }
+
+// TestReadOpaqueLPLatchesOnFailure defends the property that a rejected LP read
+// latches its failure into the Reader, and it exists because nothing else in this
+// file can tell a latching implementation from a non latching one. The plan's own
+// sample for this method returns bare sentinels — return nil, ErrTruncated — with
+// no setErr, and every other test here passes against that version: the round
+// trip never fails, and the rejection cases only check the returned error and the
+// cursor, both of which the bare sentinel version gets right. What it gets wrong
+// is everything after. The input below declares 64 bytes and supplies one, so the
+// read fails with the cursor correctly restored to 0 — and then, unlatched, the
+// very same four prefix octets are still sitting there for the next read to
+// reinterpret: ReadUint32 returns 0x40 with a nil error, a structurally valid
+// decode of an entirely different field, and Done then reports ErrTrailingBytes,
+// which masks the real failure by describing the leftover body byte instead. That
+// is the Task 4 vulnerability reproduced in a new method, in a codec whose
+// serialized forms MLS signs over, and round trip tests cannot see it. Do not
+// simplify this method back to the plan sample; this test is the reason it
+// differs.
+func TestReadOpaqueLPLatchesOnFailure(t *testing.T) {
+	input := []byte{0x00, 0x00, 0x00, 0x40, 0x11} // declares 64, only 1 byte follows
+	r := NewReader(input)
+	if _, err := r.ReadOpaqueLP(); err == nil {
+		t.Fatalf("expected the read to fail")
+	}
+	if v, err := r.ReadUint32(); err == nil {
+		t.Errorf("after a failed read, ReadUint32 returned %#x with nil error", v)
+	}
+	if err := r.Done(); err == nil || errors.Is(err, ErrTrailingBytes) {
+		t.Errorf("Done reported %v, masking the real failure", err)
+	}
+}
+
+// TestReadOpaqueLPRefusesALatchedReader defends the other half of the sticky
+// contract: the entry guard that makes a read on an already failed Reader report
+// that first error rather than running its own bounds check. The plan's sample
+// has no such guard, so on a Reader constructed with a negative limit — which
+// NewReaderLimit latches as ErrNegativeLength before any read — it would proceed
+// to compare the declared length against that negative maximum and report
+// ErrLengthExceedsMax instead, burying the construction time misuse under a
+// downstream symptom of it and breaking first error wins. The input here is a
+// well formed single byte value, so only the missing guard can make this fail.
+func TestReadOpaqueLPRefusesALatchedReader(t *testing.T) {
+	r := NewReaderLimit([]byte{0x00, 0x00, 0x00, 0x01, 0xaa}, -1) // latched ErrNegativeLength
+	if _, err := r.ReadOpaqueLP(); !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("latched Reader gave %v, want ErrNegativeLength", err)
+	}
+}
