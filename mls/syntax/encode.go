@@ -28,19 +28,29 @@ func NewWriter() *Writer {
 }
 
 // NewWriterLimit returns a Writer bounded by a caller chosen vector length limit;
-// the ratchet tree paths pass MaxRatchetTreeLength and nothing else raises it.
+// the ratchet tree paths pass MaxRatchetTreeLength and nothing else raises it. Zero
+// is a legitimate limit: a Writer that accepts no variable length content. A
+// negative limit is the API misuse ErrNegativeLength documents: the returned
+// Writer carries ErrNegativeLength as its sticky error from construction, so
+// every write on it is a no op and Bytes reports the error.
 func NewWriterLimit(maxVectorLength int) *Writer {
-	return &Writer{
+	w := &Writer{
 		bs:              nil,
 		err:             nil,
 		maxVectorLength: maxVectorLength,
 	}
+	if maxVectorLength < 0 {
+		w.setErr(ErrNegativeLength)
+	}
+	return w
 }
 
 // Bytes returns the accumulated encoding, or the first error seen. The returned
 // bytes are nil whenever the error is non nil, so a caller cannot take a
-// truncated encoding by accident; the result is undefined if err is non-nil and
-// bs was mutated after the fact, which no method in this package does.
+// truncated encoding by accident: bs is never mutated once err is set, by any
+// method in this package. The returned slice aliases the Writer's internal
+// buffer and is only valid until the next Write* call on this Writer; a caller
+// that needs to keep it must copy.
 func (self *Writer) Bytes() ([]byte, error) {
 	if self.err != nil {
 		return nil, self.err

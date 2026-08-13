@@ -52,13 +52,18 @@ func TestWriterRawTakesNoPrefix(t *testing.T) {
 
 // TestWriterErrorIsStickyAndSuppressesLaterWrites asserts the first error set wins over
 // later ones, that Err and Bytes both report it, that Bytes hands back nil bytes
-// alongside a non nil error, and that a write after an error is a no op.
+// alongside a non nil error, and that a write after an error is a no op — exercised
+// through all five write methods (WriteUint8, WriteUint16, WriteUint32, WriteUint64,
+// WriteRaw), since each carries the identical error guard at a distinct call site.
 func TestWriterErrorIsStickyAndSuppressesLaterWrites(t *testing.T) {
 	w := NewWriter()
 	w.WriteUint8(0x01)
 	w.setErr(ErrLengthExceedsMax)
 	w.setErr(ErrTruncated)
+	w.WriteUint16(0xffff)
+	w.WriteUint32(0xffffffff)
 	w.WriteUint64(0xffffffffffffffff)
+	w.WriteRaw([]byte{0xff, 0xff, 0xff})
 	if !errors.Is(w.Err(), ErrLengthExceedsMax) {
 		t.Errorf("Err is %v, want the first error ErrLengthExceedsMax", w.Err())
 	}
@@ -71,6 +76,27 @@ func TestWriterErrorIsStickyAndSuppressesLaterWrites(t *testing.T) {
 	}
 	if w.Len() != 1 {
 		t.Errorf("Len is %d, want 1: writes after an error must be no ops", w.Len())
+	}
+}
+
+// TestNewWriterLimitRejectsNegative asserts a negative limit sets ErrNegativeLength as
+// the sticky error at construction time, before any write, and that a write on such a
+// Writer is a no op just like any other post error write.
+func TestNewWriterLimitRejectsNegative(t *testing.T) {
+	w := NewWriterLimit(-1)
+	if !errors.Is(w.Err(), ErrNegativeLength) {
+		t.Errorf("Err is %v, want ErrNegativeLength", w.Err())
+	}
+	w.WriteUint8(0x01)
+	if w.Len() != 0 {
+		t.Errorf("Len is %d, want 0: a write on a negative limit Writer must be a no op", w.Len())
+	}
+	out, err := w.Bytes()
+	if !errors.Is(err, ErrNegativeLength) {
+		t.Errorf("Bytes returned %v, want ErrNegativeLength", err)
+	}
+	if out != nil {
+		t.Errorf("Bytes returned %x alongside an error, want nil", out)
 	}
 }
 
