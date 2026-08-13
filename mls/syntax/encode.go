@@ -125,3 +125,23 @@ func (self *Writer) WriteRaw(bs []byte) {
 	}
 	self.bs = append(self.bs, bs...)
 }
+
+// WriteOpaque appends bs as opaque x<V> — the RFC 9420 section 2.1.2 varint
+// length prefix, then the bytes verbatim — and is the encoder every opaque field
+// in this codec goes through. A nil and an empty slice both encode to the single
+// zero length prefix octet, since the wire format has no separate representation
+// for "absent": len(bs) is what WriteVarint sees either way. The length is
+// checked against this Writer's configured maximum before either write happens,
+// so a caller cannot silently produce a field a compliant reader would refuse; a
+// no op once the Writer has already failed.
+func (self *Writer) WriteOpaque(bs []byte) {
+	if self.err != nil {
+		return
+	}
+	if len(bs) > self.maxVectorLength {
+		self.setErr(ErrLengthExceedsMax)
+		return
+	}
+	self.WriteVarint(uint32(len(bs)))
+	self.WriteRaw(bs)
+}

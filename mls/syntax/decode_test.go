@@ -173,3 +173,152 @@ func TestReaderLatchesAFailureAsSticky(t *testing.T) {
 		t.Errorf("Done gave %v, want the latched ErrTruncated", err)
 	}
 }
+
+// TestReadOpaqueRoundTripsAndCopies asserts a value ReadOpaque decodes from
+// WriteOpaque's own output is byte identical to the original, that Done reports
+// full consumption afterward, and that the returned slice does not alias the
+// Reader's input: mutating the result must not change the source bytes.
+func TestReadOpaqueRoundTripsAndCopies(t *testing.T) {
+	body := bytes.Repeat([]byte{0x11}, 100)
+	w := NewWriter()
+	w.WriteOpaque(body)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	got, err := r.ReadOpaque()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("decoded %x, want %x", got, body)
+	}
+	if err := r.Done(); err != nil {
+		t.Errorf("Done gave %v", err)
+	}
+	got[0] = 0xff
+	if encoded[2] != 0x11 {
+		t.Errorf("ReadOpaque aliased the input")
+	}
+}
+
+// TestReadOpaqueEmptyIsNonNil asserts decoding the single zero length octet gives
+// a zero length slice that is not nil: opaque x<V> encodes "zero bytes" but has
+// no wire representation for "absent", so ReadOpaque must never hand back nil.
+func TestReadOpaqueEmptyIsNonNil(t *testing.T) {
+	r := NewReader([]byte{0x00})
+	got, err := r.ReadOpaque()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Errorf("empty opaque decoded to nil, want a zero length non nil slice")
+	}
+	if len(got) != 0 {
+		t.Errorf("empty opaque decoded to %x", got)
+	}
+}
+
+// TestReadOpaqueChecksTheLimitThenTheInput asserts ReadOpaque rejects a declared
+// length with the correct, distinguishable sentinel for each way it can be
+// invalid: over the configured maximum, over the bytes actually remaining (both
+// when the varint claims more input than exists at all, and when it claims more
+// than trails the prefix), and a non minimally encoded varint prefix rejected by
+// ReadVarint itself before takeLength ever runs.
+func TestReadOpaqueChecksTheLimitThenTheInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []byte
+		wantErr error
+	}{
+		{"length above the limit", []byte{0xbf, 0xff, 0xff, 0xff}, ErrLengthExceedsMax},
+		{"length above the remaining input", []byte{0x40, 0x40, 0x11, 0x11}, ErrLengthExceedsInput},
+		{"prefix only", []byte{0x05}, ErrLengthExceedsInput},
+		{"non minimal prefix", []byte{0x40, 0x00}, ErrVarintNotMinimal},
+	}
+	for _, c := range cases {
+		r := NewReader(c.input)
+		if _, err := r.ReadOpaque(); !errors.Is(err, c.wantErr) {
+			t.Errorf("%s gave %v, want %v", c.name, err, c.wantErr)
+		}
+	}
+}
+
+// TestReadOpaqueRejectsAHostileLengthWithoutAllocating is the security property
+// the plan calls out by name: a four byte input can declare a varint length up to
+// 0x3fffffff (about 1 GiB), far more than MaxVectorLength (1 MiB) and far more
+// than the four bytes actually present. If ReadOpaque ever allocated the declared
+// length before validating it against the maximum and the remaining input, this
+// test would make a gigabyte scale allocation on every one of its 200 runs.
+// testing.AllocsPerRun measures that directly instead of merely being slow to
+// fail: a Reader construction is the only allocation expected, so the count
+// must stay small and constant, never scaled to the attacker supplied length.
+func TestReadOpaqueRejectsAHostileLengthWithoutAllocating(t *testing.T) {
+	input := []byte{0xbf, 0xff, 0xff, 0xff} // declares length 0x3fffffff, ~1 GiB
+	if _, err := NewReader(input).ReadOpaque(); !errors.Is(err, ErrLengthExceedsMax) {
+		t.Fatalf("got %v, want ErrLengthExceedsMax", err)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		r := NewReader(input)
+		_, _ = r.ReadOpaque()
+	})
+	if allocs > 4 {
+		t.Errorf("ReadOpaque allocated %.1f times per run rejecting a hostile length, want a small constant count, not one sized to the declared ~1 GiB length", allocs)
+	}
+}
+
+// TestOpaqueRoundTripsAcrossVarintWidthBoundaries asserts that at every length
+// where the varint prefix's width changes — 0, 1, 63, 64, 16383, 16384 — a value
+// WriteOpaque emits decodes back through ReadOpaque byte identical to the
+// original, with zero the boundary case people forget: an empty opaque field is
+// not a special case in the encoding, only in whether the result is nil.
+func TestOpaqueRoundTripsAcrossVarintWidthBoundaries(t *testing.T) {
+	for _, length := range []int{0, 1, 63, 64, 16383, 16384} {
+		body := bytes.Repeat([]byte{0x11}, length)
+		w := NewWriter()
+		w.WriteOpaque(body)
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("length %d: unexpected error %v", length, err)
+		}
+		r := NewReader(encoded)
+		got, err := r.ReadOpaque()
+		if err != nil {
+			t.Fatalf("length %d: unexpected error %v", length, err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("length %d: decoded %x, want %x", length, got, body)
+		}
+		if got == nil {
+			t.Errorf("length %d: decoded to nil, want a non nil slice", length)
+		}
+		if err := r.Done(); err != nil {
+			t.Errorf("length %d: Done gave %v", length, err)
+		}
+	}
+}
+
+// TestOpaqueRoundTripsTheEmptyStringFromANilWrite asserts the specific boundary
+// the brief calls out by name: writing a nil slice through WriteOpaque and
+// reading it back through ReadOpaque must round trip to a zero length, non nil
+// slice, not to nil and not to an error.
+func TestOpaqueRoundTripsTheEmptyStringFromANilWrite(t *testing.T) {
+	w := NewWriter()
+	w.WriteOpaque(nil)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := NewReader(encoded)
+	got, err := r.ReadOpaque()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("decoded %#v, want a zero length non nil slice", got)
+	}
+	if err := r.Done(); err != nil {
+		t.Errorf("Done gave %v", err)
+	}
+}

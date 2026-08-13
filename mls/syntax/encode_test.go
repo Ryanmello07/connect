@@ -112,3 +112,62 @@ func TestWriterLimitIsCarried(t *testing.T) {
 		t.Errorf("NewWriterLimit did not take the given limit")
 	}
 }
+
+// TestWriteOpaqueTreatsNilAndEmptyAlike asserts a nil slice and a zero length,
+// non nil slice both encode to the single zero length varint octet: opaque x<V>
+// has no representation for "absent", only for "zero bytes", so the two Go values
+// must collapse to the same wire form.
+func TestWriteOpaqueTreatsNilAndEmptyAlike(t *testing.T) {
+	for _, in := range [][]byte{nil, {}} {
+		w := NewWriter()
+		w.WriteOpaque(in)
+		out, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(out, []byte{0x00}) {
+			t.Errorf("empty opaque encoded to %x, want 00", out)
+		}
+	}
+}
+
+// TestWriteOpaqueUsesTheVarintPrefix asserts WriteOpaque prefixes the body with
+// exactly the RFC 9420 section 2.1.2 varint encoding of its length, at each width
+// the varint format uses: one octet up to 63, two octets from 64, four octets
+// from 16384.
+func TestWriteOpaqueUsesTheVarintPrefix(t *testing.T) {
+	cases := []struct {
+		length int
+		prefix []byte
+	}{
+		{1, []byte{0x01}},
+		{63, []byte{0x3f}},
+		{64, []byte{0x40, 0x40}},
+		{16383, []byte{0x7f, 0xff}},
+		{16384, []byte{0x80, 0x00, 0x40, 0x00}},
+	}
+	for _, c := range cases {
+		body := bytes.Repeat([]byte{0x11}, c.length)
+		w := NewWriter()
+		w.WriteOpaque(body)
+		out, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("length %d: unexpected error %v", c.length, err)
+		}
+		want := append(append([]byte{}, c.prefix...), body...)
+		if !bytes.Equal(out, want) {
+			t.Errorf("length %d encoded to %x..., want prefix %x", c.length, out[:len(c.prefix)+1], c.prefix)
+		}
+	}
+}
+
+// TestWriteOpaqueRefusesToExceedTheLimit asserts a body longer than the Writer's
+// configured maximum vector length sets the sticky ErrLengthExceedsMax instead of
+// silently accepting an oversized field.
+func TestWriteOpaqueRefusesToExceedTheLimit(t *testing.T) {
+	w := NewWriterLimit(16)
+	w.WriteOpaque(bytes.Repeat([]byte{0x11}, 17))
+	if _, err := w.Bytes(); !errors.Is(err, ErrLengthExceedsMax) {
+		t.Errorf("over limit write gave %v, want ErrLengthExceedsMax", err)
+	}
+}

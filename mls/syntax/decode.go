@@ -212,3 +212,59 @@ func (self *Reader) ReadRaw(n int) ([]byte, error) {
 	self.pos += n
 	return out, nil
 }
+
+// takeLength validates a declared length before the caller may allocate anything
+// sized by it: first against this Reader's configured maximum, reporting
+// ErrLengthExceedsMax, then — only once that check has passed — against the
+// bytes actually remaining in the input, reporting ErrLengthExceedsInput. The two
+// failures are kept distinct because downstream callers need to tell "this field
+// is simply too large" apart from "this input was truncated or lied about its
+// length." n is a uint32 straight from ReadVarint and both comparisons widen to
+// int64 before comparing, so a length near the uint32 range on a platform where
+// int is 32 bits can never wrap around into looking small and passing either
+// check; only once both checks pass is n narrowed to int for the caller to size a
+// make with. Does not itself touch the cursor: every caller decides what to do
+// with it on failure.
+func (self *Reader) takeLength(n uint32) (int, error) {
+	if int64(n) > int64(self.maxVectorLength) {
+		self.setErr(ErrLengthExceedsMax)
+		return 0, self.err
+	}
+	if int64(n) > int64(self.Remaining()) {
+		self.setErr(ErrLengthExceedsInput)
+		return 0, self.err
+	}
+	return int(n), nil
+}
+
+// ReadOpaque decodes opaque x<V>: a varint length prefix read by ReadVarint,
+// then that many bytes. The declared length is validated by takeLength — against
+// the configured maximum and then against the bytes actually remaining — before
+// any allocation, so a hostile length prefix can never size a make; the two
+// rejections surface as the distinct sentinels ErrLengthExceedsMax and
+// ErrLengthExceedsInput. The result is always a copy, never a view into the
+// input, matching ReadRaw, and is never nil even for a zero length value, so an
+// empty opaque field and an absent one stay distinguishable in Go despite
+// encoding identically on the wire. On any failure the cursor is restored to
+// where it stood before this call — not left partway past a validly decoded
+// varint whose length then failed — and the failure latches: every later read
+// and Done on this Reader report the same error.
+func (self *Reader) ReadOpaque() ([]byte, error) {
+	if self.err != nil {
+		return nil, self.err
+	}
+	mark := self.pos
+	n, err := self.ReadVarint()
+	if err != nil {
+		return nil, err
+	}
+	length, err := self.takeLength(n)
+	if err != nil {
+		self.pos = mark
+		return nil, err
+	}
+	out := make([]byte, length)
+	copy(out, self.bs[self.pos:self.pos+length])
+	self.pos += length
+	return out, nil
+}
