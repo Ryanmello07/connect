@@ -221,3 +221,59 @@ func TestLPAndVarintPrefixesAreDistinct(t *testing.T) {
 		}
 	}
 }
+
+// the property the three case check above only spot checks, swept across every
+// varint width boundary. The three bodies it uses are 0, 1 and 200 bytes, all of
+// which fall in the regime where the two encodings differ in total length — one or
+// two prefix octets against LP's four — so the check cannot fail whatever the
+// prefixes say, and it never reaches the interesting case. From 16384 bytes up both
+// forms are four octets and the encodings are the same total length, and
+// distinctness rests entirely on the first octet: LP's is the length's top byte,
+// which cannot exceed 0x3f because WriteOpaque refuses anything above MaxVarint, so
+// its top two bits are 00, while the four octet varint's first octet carries the
+// prefix 10. This asserts distinctness directly and also asserts that the equal
+// length regime was actually reached, so the sweep cannot quietly degenerate into
+// the trivial one.
+func TestLPAndVarintPrefixesNeverCoincideAcrossWidths(t *testing.T) {
+	lengths := []int{}
+	// every length up to just past the one octet boundary, then each width boundary
+	// and its neighbours, then the top of the range WriteOpaque accepts
+	for n := 0; n <= 300; n += 1 {
+		lengths = append(lengths, n)
+	}
+	lengths = append(lengths,
+		16382, 16383, 16384, 16385, 16386,
+		65535, 65536, 100000,
+		MaxVectorLength-1, MaxVectorLength,
+	)
+	sameLengthCases := 0
+	for _, n := range lengths {
+		body := bytes.Repeat([]byte{0x5a}, n)
+		lp := NewWriter()
+		lp.WriteOpaqueLP(body)
+		lpBytes, err := lp.Bytes()
+		if err != nil {
+			t.Fatalf("length %d: unexpected error %v", n, err)
+		}
+		v := NewWriter()
+		v.WriteOpaque(body)
+		vBytes, err := v.Bytes()
+		if err != nil {
+			t.Fatalf("length %d: unexpected error %v", n, err)
+		}
+		if bytes.Equal(lpBytes, vBytes) {
+			t.Errorf("length %d encoded identically under both prefix forms", n)
+		}
+		if len(lpBytes) == len(vBytes) {
+			sameLengthCases += 1
+			// the encodings agree on every byte but the prefix here, so the whole
+			// property rests on the first octet's top two bits
+			if lpBytes[0]>>6 == vBytes[0]>>6 {
+				t.Errorf("length %d gave both forms the same two prefix bits %#02b", n, lpBytes[0]>>6)
+			}
+		}
+	}
+	if sameLengthCases == 0 {
+		t.Errorf("no length produced two encodings of equal total length, so the interesting regime was never reached")
+	}
+}
