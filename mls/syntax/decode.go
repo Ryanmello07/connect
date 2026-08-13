@@ -16,7 +16,10 @@
 // ReadOpaqueLP, ReadSub, ReadSubLP, ReadOptional) to this same file; those are
 // where a declared length gets checked against the configured maximum and the
 // bytes that remain before anything is allocated, so a hostile length prefix can
-// never size an allocation.
+// never size an allocation. ReadNested and ReadNestedLP sit on top of the sub
+// reader pair and are what a nested structure should ordinarily be decoded
+// through: they run the region to empty and latch anything that goes wrong inside
+// it onto this Reader, so neither obligation depends on a call site remembering.
 //
 // ReadRaw's result is a copy, never a view into the input: MLS verifies a
 // signature over serialized bytes and then uses the decoded fields, so a field
@@ -352,11 +355,18 @@ func (self *Reader) ReadOpaqueLP() ([]byte, error) {
 
 // ReadSub returns a bounded view over the next opaque x<V> region, for a
 // structure carried inside an opaque field: the extension bodies and GroupInfo
-// paths of later waves, and ReadVector. The prefix and its length go through the
-// same ReadVarint and validateLength this file's other variable length reads use,
-// so a hostile length is refused before anything is sized by it, and on a
-// rejection the cursor is restored to where it stood before the call and the
-// failure latches into this Reader.
+// paths of later waves, and ReadVector. It is the raw escape hatch, not the
+// default — reach for ReadNested unless the raw view is what is actually wanted,
+// because ReadNested discharges the obligation described below instead of handing
+// it back. The two carry deliberately different contracts and this one is for a
+// caller that genuinely needs the independent Reader: one that means to tolerate
+// an unparseable region rather than fail on it, or to consume part of a region
+// and decide the rest is not its business.
+//
+// The prefix and its length go through the same ReadVarint and validateLength
+// this file's other variable length reads use, so a hostile length is refused
+// before anything is sized by it, and on a rejection the cursor is restored to
+// where it stood before the call and the failure latches into this Reader.
 //
 // The parent advances past the whole region however much of it the sub reader
 // consumes, so a caller that stops early — or that abandons the nested structure
@@ -372,7 +382,10 @@ func (self *Reader) ReadOpaqueLP() ([]byte, error) {
 // a second valid encoding of one object — the same class of defect the varint's
 // minimal form rule exists to prevent, and it matters for the same reason: MLS
 // signs over serialized bytes, so an encoding a verifier accepts but a signer
-// never produced is a signature bypass primitive.
+// never produced is a signature bypass primitive. An obligation stated in a doc
+// comment is only as good as the call sites that remember it, which is why
+// ReadNested exists and why it, rather than this, is what a nested structure
+// should ordinarily be decoded through.
 func (self *Reader) ReadSub() (*Reader, error) {
 	if self.err != nil {
 		return nil, self.err
@@ -392,9 +405,11 @@ func (self *Reader) ReadSub() (*Reader, error) {
 // ReadSubLP is ReadSub over an LP(x) region, for a record field that carries a
 // structure: connect/message nests inside the fixed 32 bit prefix exactly as MLS
 // nests inside the varint one, and the two prefixes are never interchangeable.
-// Every property ReadSub documents holds here unchanged, including the caller's
-// obligation to call Done on the returned Reader — the parent skips the whole
-// region either way, so only the sub reader can see bytes left over inside it.
+// Every property ReadSub documents holds here unchanged, including its status as
+// the escape hatch rather than the default and the caller's obligation to call
+// Done on the returned Reader — the parent skips the whole region either way, so
+// only the sub reader can see bytes left over inside it. ReadNestedLP is the form
+// that discharges that obligation for the caller.
 func (self *Reader) ReadSubLP() (*Reader, error) {
 	if self.err != nil {
 		return nil, self.err
@@ -409,4 +424,72 @@ func (self *Reader) ReadSubLP() (*Reader, error) {
 		return nil, err
 	}
 	return self.subReader(start, length), nil
+}
+
+// ReadNested decodes a structure carried inside an opaque x<V> region, and is the
+// form a nested structure should ordinarily go through. It takes the region with
+// ReadSub, runs decodeOne against the bounded view, and then calls Done on that
+// view itself, folding the answer into what it returns. Full consumption of the
+// region is therefore enforced structurally rather than by convention: a region
+// longer than the structure inside it is a second valid encoding of one object,
+// and in a codec whose serialized forms MLS signs over an encoding a verifier
+// accepts but a signer never produced is a signature bypass primitive. ReadSub
+// hands that obligation back to its caller and every one of those call sites is a
+// place it can be forgotten; here there is no call site to forget it.
+//
+// Every failure — decodeOne's own refusal and the region's leftover bytes alike —
+// is latched on this Reader rather than only returned, and this is the same
+// reasoning ReadVector documents, which is where the rule was first established.
+// ReadSub has already advanced this Reader past the entire region by the time
+// decodeOne runs, and a failure inside the region latches on the sub reader, which
+// is a separate Reader the caller never receives; a semantic refusal from
+// decodeOne latches nothing at all, since its own reads all succeeded. So a caller
+// that drops the return would hold a Reader that is clean, positioned at the next
+// field, and reporting nil from Done, having silently skipped a region that was
+// never accepted. Latching is what makes that impossible.
+//
+// The returned error is this Reader's sticky error, which is always the failure
+// just recorded: ReadSub's entry check has already established that no error was
+// carried when the nested decode began, so first error wins has nothing older to
+// prefer.
+func (self *Reader) ReadNested(decodeOne func(r *Reader) error) error {
+	// no entry check on self.err is needed or observable: ReadSub is the first
+	// thing this touches and it checks self.err itself, so a latched Reader fails
+	// here with nothing read and decodeOne never runs — the same reasoning
+	// ReadVector records for the same delegation.
+	sub, err := self.ReadSub()
+	if err != nil {
+		return err
+	}
+	if err := decodeOne(sub); err != nil {
+		self.setErr(err)
+		return self.err
+	}
+	if err := sub.Done(); err != nil {
+		self.setErr(err)
+		return self.err
+	}
+	return nil
+}
+
+// ReadNestedLP is ReadNested over an LP(x) region, for a record field that carries
+// a structure: connect/message nests inside the fixed 32 bit prefix exactly as MLS
+// nests inside the varint one, and the two prefixes are never interchangeable.
+// Every property ReadNested documents holds here unchanged — the region is run to
+// empty, and both a decoder refusal and leftover bytes latch on this Reader rather
+// than only being returned.
+func (self *Reader) ReadNestedLP(decodeOne func(r *Reader) error) error {
+	sub, err := self.ReadSubLP()
+	if err != nil {
+		return err
+	}
+	if err := decodeOne(sub); err != nil {
+		self.setErr(err)
+		return self.err
+	}
+	if err := sub.Done(); err != nil {
+		self.setErr(err)
+		return self.err
+	}
+	return nil
 }

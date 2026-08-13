@@ -26,5 +26,9 @@
 // signed bytes rather than a failure, so those need a channel the sticky error does
 // not give them. Marshal joins the two, so the semantic error and the buffer error
 // both surface. Reader returns an error per read, because decoding is a branch per
-// field and every one of them matters.
+// field and every one of them matters, and Unmarshal joins the decoder's error with
+// the full consumption check for the same reason its counterpart joins: a decoder
+// that refuses a structure on semantic grounds may also have left a tail behind it,
+// and rule 3 is not something a caller should hear about only when nothing else went
+// wrong.
 package syntax

@@ -733,3 +733,188 @@ func TestUnderConsumingSubReaderIsCaughtOnlyByDone(t *testing.T) {
 		t.Errorf("parent Done gave %v, want nil: the parent cannot see inside the region, which is why the caller must call the sub reader's Done", err)
 	}
 }
+
+// nestedForms drives every ReadNested case over both prefixes. The varint form and
+// the fixed 32 bit form differ only in how the region is framed and carry the same
+// contract, so each property below is asserted against both rather than against
+// the varint one with the record layer's form left to inference.
+var nestedForms = []struct {
+	name   string
+	encode func(w *Writer, body []byte)
+	nested func(r *Reader, decodeOne func(r *Reader) error) error
+}{
+	{
+		name:   "varint",
+		encode: func(w *Writer, body []byte) { w.WriteOpaque(body) },
+		nested: func(r *Reader, decodeOne func(r *Reader) error) error { return r.ReadNested(decodeOne) },
+	},
+	{
+		name:   "lp",
+		encode: func(w *Writer, body []byte) { w.WriteOpaqueLP(body) },
+		nested: func(r *Reader, decodeOne func(r *Reader) error) error { return r.ReadNestedLP(decodeOne) },
+	},
+}
+
+// errNestedRefusal stands in for a semantic refusal from a nested decoder: every
+// read it made succeeded, and it declined the structure anyway. That is the one
+// failure no read of its own can latch, so it is what the latching contract has to
+// be measured against.
+var errNestedRefusal = errors.New("mls syntax: nested probe refuses to decode")
+
+// TestReadNestedRunsTheRegionToEmpty is the positive case: a decoder that consumes
+// exactly its region succeeds, the parent is left on the next field boundary, and
+// the parent's own Done reports success. Without this the failure cases below could
+// all be satisfied by a method that never succeeded at all.
+func TestReadNestedRunsTheRegionToEmpty(t *testing.T) {
+	for _, form := range nestedForms {
+		w := NewWriter()
+		form.encode(w, []byte{0x01, 0x02})
+		w.WriteUint16(0xbeef)
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", form.name, err)
+		}
+		r := NewReader(encoded)
+		var got uint16
+		err = form.nested(r, func(sub *Reader) error {
+			v, err := sub.ReadUint16()
+			got = v
+			return err
+		})
+		if err != nil {
+			t.Errorf("%s gave %v, want nil", form.name, err)
+		}
+		if got != 0x0102 {
+			t.Errorf("%s decoded %#x, want 0x102", form.name, got)
+		}
+		if v, err := r.ReadUint16(); err != nil || v != 0xbeef {
+			t.Errorf("%s: parent gave %#x, %v after the region; want beef, nil", form.name, v, err)
+		}
+		if err := r.Done(); err != nil {
+			t.Errorf("%s: parent Done gave %v, want nil", form.name, err)
+		}
+	}
+}
+
+// TestReadNestedRejectsBytesLeftInTheRegion is the whole reason this method exists
+// on top of ReadSub. The region carries four bytes and the decoder reads two and
+// reports success, which ReadSub would accept silently — the parent has already
+// skipped the whole region, so its own Done sees nothing wrong inside it, and two
+// encodings of one object would both be accepted in a codec whose serialized forms
+// MLS signs over. A version that hands the Done obligation back to the caller
+// returns nil here. The parent read afterwards is what separates latching from
+// merely returning: unlatched, it hands back beef with a nil error, so a caller who
+// drops the return carries on against a structure that was never accepted.
+func TestReadNestedRejectsBytesLeftInTheRegion(t *testing.T) {
+	for _, form := range nestedForms {
+		w := NewWriter()
+		form.encode(w, []byte{0x01, 0x02, 0x03, 0x04})
+		w.WriteUint16(0xbeef)
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", form.name, err)
+		}
+		r := NewReader(encoded)
+		err = form.nested(r, func(sub *Reader) error {
+			_, err := sub.ReadUint16()
+			return err
+		})
+		if !errors.Is(err, ErrTrailingBytes) {
+			t.Errorf("%s gave %v for the 2 bytes the decoder left, want ErrTrailingBytes", form.name, err)
+		}
+		if v, err := r.ReadUint16(); err == nil {
+			t.Errorf("%s: parent returned %#x with a nil error after an unfinished region; the failure did not latch", form.name, v)
+		}
+		if err := r.Done(); !errors.Is(err, ErrTrailingBytes) {
+			t.Errorf("%s: parent Done gave %v, want the latched ErrTrailingBytes", form.name, err)
+		}
+	}
+}
+
+// TestReadNestedLatchesADecoderRefusal covers the failure that latches nowhere on
+// its own: the decoder consumed its region exactly and refused on semantic grounds,
+// so neither the sub reader nor the parent carries anything. Returning alone would
+// leave a caller who drops the return holding a clean parent positioned at the next
+// field, having skipped a region it never accepted — which is what the parent read
+// here measures, since unlatched it yields beef with a nil error.
+func TestReadNestedLatchesADecoderRefusal(t *testing.T) {
+	for _, form := range nestedForms {
+		w := NewWriter()
+		form.encode(w, []byte{0x01, 0x02})
+		w.WriteUint16(0xbeef)
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", form.name, err)
+		}
+		r := NewReader(encoded)
+		err = form.nested(r, func(sub *Reader) error {
+			if _, err := sub.ReadUint16(); err != nil {
+				return err
+			}
+			return errNestedRefusal
+		})
+		if !errors.Is(err, errNestedRefusal) {
+			t.Errorf("%s gave %v, want the decoder's refusal", form.name, err)
+		}
+		if v, err := r.ReadUint16(); err == nil {
+			t.Errorf("%s: parent returned %#x with a nil error after a refused region; the refusal did not latch", form.name, v)
+		}
+		if err := r.Done(); !errors.Is(err, errNestedRefusal) {
+			t.Errorf("%s: parent Done gave %v, want the latched refusal", form.name, err)
+		}
+	}
+}
+
+// TestReadNestedCatchesASwallowedReadFailure is the case the loop-to-empty
+// reasoning alone does not cover, and it is why the Done fold is not redundant with
+// consuming the region. The decoder asks for four bytes from a two byte region,
+// ignores the failure and reports success. That read latched on the sub reader,
+// which nothing else would ever look at, so the structure would be built from bytes
+// that were never there. Done on the sub reader reports the latched ErrTruncated
+// rather than ErrTrailingBytes, which is how this stays distinguishable from the
+// leftover byte case above.
+func TestReadNestedCatchesASwallowedReadFailure(t *testing.T) {
+	for _, form := range nestedForms {
+		w := NewWriter()
+		form.encode(w, []byte{0x01, 0x02})
+		w.WriteUint16(0xbeef)
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", form.name, err)
+		}
+		r := NewReader(encoded)
+		err = form.nested(r, func(sub *Reader) error {
+			sub.ReadUint32() // deliberately ignored, as a careless decoder would
+			return nil
+		})
+		if !errors.Is(err, ErrTruncated) {
+			t.Errorf("%s gave %v for a swallowed read failure, want ErrTruncated", form.name, err)
+		}
+		if v, err := r.ReadUint16(); err == nil {
+			t.Errorf("%s: parent returned %#x with a nil error; the swallowed failure did not latch", form.name, v)
+		}
+	}
+}
+
+// TestReadNestedRefusesALatchedReader pins the entry guard, which is delegated to
+// the sub reader pair rather than written twice: a Reader that NewReaderLimit
+// latched at construction must report that misuse and must not run the nested
+// decoder against a limit it already refused.
+func TestReadNestedRefusesALatchedReader(t *testing.T) {
+	for _, form := range nestedForms {
+		w := NewWriter()
+		form.encode(w, []byte{0xaa, 0xbb})
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", form.name, err)
+		}
+		r := NewReaderLimit(encoded, -1) // latched ErrNegativeLength
+		err = form.nested(r, func(sub *Reader) error {
+			t.Errorf("%s: the nested decoder ran on a latched Reader", form.name)
+			return nil
+		})
+		if !errors.Is(err, ErrNegativeLength) {
+			t.Errorf("%s: latched Reader gave %v, want ErrNegativeLength", form.name, err)
+		}
+	}
+}
