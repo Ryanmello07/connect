@@ -2,6 +2,8 @@ module github.com/urnetwork/connect
 
 go 1.26.3
 
+toolchain go1.26.5
+
 require (
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/golang-jwt/jwt/v5 v5.3.1
