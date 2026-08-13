@@ -153,9 +153,14 @@ func TestReadVectorPropagatesAnElementError(t *testing.T) {
 	}
 }
 
-// the element count is bounded by the declared byte length, which is bounded by the
-// limit, so a hostile input cannot make the slice grow without bound
-func TestReadVectorAllocationIsBoundedByInput(t *testing.T) {
+// the decode direction of the byte count rule: eight declared bytes of a two octet
+// element is four elements, not eight. The count is never read off the wire, it falls
+// out of consuming the region, which is why a vector prefix and an element count can
+// never disagree. Named for what it asserts: the earlier name claimed it bounded the
+// allocation a hostile input can cause, which it neither does nor can see — it feeds
+// a well formed nine byte input and checks a length.
+// TestVectorCapacityHintIsBoundedByAConstant in alloc_test.go covers that property.
+func TestReadVectorDecodesByteCountNotElementCount(t *testing.T) {
 	r := NewReader([]byte{0x08, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44})
 	got, err := ReadVector(r, readUint16Item)
 	if err != nil {
