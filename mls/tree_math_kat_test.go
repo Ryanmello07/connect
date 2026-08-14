@@ -61,8 +61,21 @@ type treeMathVector struct {
 // VectorFamily.File is.
 const treeMathVectorFile = "tree-math.json"
 
+// the entry count upstream publishes for this family, one per leaf count on
+// the ladder. It lives here rather than inside a single test because the
+// loader below checks it on every call.
+const treeMathVectorCount = 10
+
 // decodes the vendored family through the shared loader, failing the test
 // rather than returning an error so every caller is a one-liner.
+//
+// The count is checked here, in the loader, rather than only in the corpus
+// tripwire below. A loader that silently returns nothing passes every caller
+// that ranges over its result, and plan p1 shipped exactly that shape before
+// needing the same guard. It matters here because every command the plan
+// prescribes for the tasks that follow names one test with -run, so none of
+// them runs the tripwire: with the guard only there, emptying the corpus
+// leaves those vector tests passing over zero entries and asserting nothing.
 func loadTreeMathVectors(t *testing.T) []treeMathVector {
 	t.Helper()
 	rawEntries := LoadVectorFile(t, treeMathVectorFile)
@@ -73,6 +86,14 @@ func loadTreeMathVectors(t *testing.T) []treeMathVector {
 			t.Fatalf("decode %s entry %d: %v", treeMathVectorFile, i, err)
 		}
 		vectors = append(vectors, vector)
+	}
+	// checked on what is handed back, not on what was read. guarding the input
+	// count instead looks equivalent and is not: it passes for a loader whose
+	// body is later reduced to returning nil, which is the exact regression this
+	// guard exists to catch. the first version of this check made that mistake
+	// and survived the mutation it was written for.
+	if len(vectors) != treeMathVectorCount {
+		t.Fatalf("returning %d entries for %s, want %d: a vector test over a short corpus asserts nothing", len(vectors), treeMathVectorFile, treeMathVectorCount)
 	}
 	return vectors
 }
@@ -137,12 +158,19 @@ func TestTreeMathVectorFileShape(t *testing.T) {
 		}
 		totalNodes += v.NNodes
 	}
-	// also kept for the reader rather than for coverage. reaching here means
-	// all ten entries matched the ladder and each carried n_nodes 2*n_leaves-1,
-	// which fixes the sum at 2036; the per-entry relation above is what a
-	// re-vendored corpus actually trips. this line records the figure the plan
-	// measured, so a future edit that weakens either input has one number to
-	// re-derive against.
+	// do not delete this line. it is the only caller-side statement of the
+	// corpus size, and it catches something the loader's own guard structurally
+	// cannot: a loader whose body still builds ten entries but hands back
+	// something else. that guard runs before the return, so a return statement
+	// reduced to nil walks straight past it, and the sum here is what fails.
+	// measured, not assumed - with this line removed, that mutation passes the
+	// whole file while the loader's guard is still in place.
+	//
+	// an earlier revision of this comment said the opposite: "kept for the
+	// reader rather than for coverage", reasoning that reaching here meant all
+	// ten entries had matched. reaching here means the ladder walked whatever
+	// was returned, however much that was. a reader who believed the comment
+	// would have deleted the one assertion holding that down.
 	if totalNodes != 2036 {
 		t.Fatalf("nodes across the family: %d, want 2036", totalNodes)
 	}
