@@ -151,6 +151,15 @@ func ExtendedLeafCount(n LeafCount) (LeafCount, error) {
 	if n == 0 {
 		return 1, nil
 	}
+	// range is tested before fullness, matching checkLeafCount, because a count
+	// past MaxLeafCount is both out of range and not a power of two and the
+	// order alone decides which sentinel the caller sees. Testing fullness
+	// first reported MaxLeafCount+1 as ErrLeafCountNotFull here while the shared
+	// check called the same value ErrLeafCountRange, so a caller switching on the
+	// sentinel would have had to know which function produced it.
+	if n > MaxLeafCount {
+		return 0, ErrLeafCountRange
+	}
 	if !IsFullLeafCount(n) {
 		return 0, ErrLeafCountNotFull
 	}
