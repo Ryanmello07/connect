@@ -1,4 +1,4 @@
-// The only place in mls, message or sdk that calls ECDH. Master section 7.2 and spec A
+// The only place in mls or message that calls ECDH. Master section 7.2 and spec A
 // section 5.9, guardrail 3: every x25519 operation goes through crypto/ecdh and a
 // returned error is a hard validation failure, never logged and continued.
 //
@@ -7,8 +7,11 @@
 // caller through one wrapper turns that refusal into ErrInvalidPoint, so there is
 // exactly one line in the tree that could ignore it and that line is reviewed.
 //
-// crypto_forbidden_test.go asserts both halves of that: no other file in either package
-// calls ECDH, and no call site anywhere discards its result.
+// crypto_forbidden_test.go asserts both halves of that, and only over the roots it walks,
+// which are these two packages: no other file in either calls ECDH, and no call site in
+// either discards its result. sdk is a separate module outside those roots and still
+// carries the banned GenerateSharedSecret, which is its own migration — the claim above
+// is exactly as wide as the gate that proves it and no wider.
 //
 // Nothing here accepts a nil key. crypto/ecdh dereferences both operands before it looks
 // at either, so a nil reaching the exchange is a panic rather than a refusal, and a

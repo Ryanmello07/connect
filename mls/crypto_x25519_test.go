@@ -15,7 +15,15 @@
 // Key generation gets its own tests because the standard library's does not honour the
 // reader it is handed. Delegating would leave the randomness parameter untestable and
 // silently non-deterministic, so the two tests below state the opposite: a fixed reader
-// fixes the key, and a broken one is an error rather than a key from somewhere else.
+// fixes the key, and a broken one is an error rather than a key from somewhere else. A
+// fixed reader is not enough on its own, though — a constant byte one is blind to every
+// permutation of the scalar — so the ordering is stated with a scripted reader against a
+// published vector.
+//
+// The last thing a smoke test cannot see is that the parsers hand back the bytes they
+// were given. The curve masks and reduces the encoding itself, so a wrapper that
+// normalised first would change no secret anywhere in this file; that claim therefore
+// gets its own test rather than riding along with one about lengths.
 //
 // There is no hex helper declared here. This package has exactly one and it is the
 // interop harness's MustHex, which has not landed yet, so the vectors below decode
@@ -447,6 +455,66 @@ func TestX25519RejectsWrongKeyLengths(t *testing.T) {
 	}
 }
 
+// TestX25519ParsersReturnTheEncodingTheyWereGiven states that neither parser rewrites a
+// key on the way through. Nothing else in this file can see that, because crypto/ecdh
+// masks bit 255 and reduces modulo the field prime inside the scalar multiplication
+// itself: a wrapper that normalised the encoding first would leave every shared secret
+// here exactly where it is, and clearing bit 255 before ecdh.X25519().NewPublicKey does
+// in fact pass every other test in the package. The refusal tests above do not reach it
+// either — they ask only whether a spelling was refused, never what the accepted ones
+// hold.
+//
+// It matters upstream of the curve rather than at it. A KeyPackage carries an hpke public
+// key into structures that get signed and hashed, so a parser that quietly respells a
+// peer's key is a signature that stops verifying later, not a wrong secret now.
+//
+// The spellings are generated rather than transcribed, for the same reason the low order
+// ones are, and the counts at the end name the two normalisations actually exercised. A
+// table that lost its bit 255 spelling, or the one that is still above the prime after
+// masking, would otherwise compare canonical bytes to themselves and report success.
+func TestX25519ParsersReturnTheEncodingTheyWereGiven(t *testing.T) {
+	alicePublic, err := hex.DecodeString(rfc7748AlicePublic)
+	if err != nil {
+		t.Fatalf("alice public key hex: %v", err)
+	}
+	// the base point, small enough that u plus the prime is still a 32 byte encoding,
+	// and a published key, which is large enough that it is not
+	coordinates := []*big.Int{big.NewInt(9), x25519CoordinateOf(alicePublic)}
+	prime := x25519FieldPrime()
+	highBitSpellings := 0
+	abovePrimeSpellings := 0
+	for _, u := range coordinates {
+		for _, encoded := range x25519EncodingsOf(u) {
+			if encoded[x25519KeySize-1]&0x80 != 0 {
+				highBitSpellings++
+			}
+			masked := slices.Clone(encoded)
+			masked[x25519KeySize-1] &= 0x7f
+			if x25519CoordinateOf(masked).Cmp(prime) >= 0 {
+				abovePrimeSpellings++
+			}
+			priv, err := X25519PrivateKey(encoded)
+			if err != nil {
+				t.Errorf("X25519PrivateKey(%x): %v", encoded, err)
+			} else if got := priv.Bytes(); !bytes.Equal(got, encoded) {
+				t.Errorf("X25519PrivateKey rewrote the encoding it was given: %x, want %x", got, encoded)
+			}
+			pub, err := X25519PublicKey(encoded)
+			if err != nil {
+				t.Errorf("X25519PublicKey(%x): %v", encoded, err)
+			} else if got := pub.Bytes(); !bytes.Equal(got, encoded) {
+				t.Errorf("X25519PublicKey rewrote the encoding it was given: %x, want %x", got, encoded)
+			}
+		}
+	}
+	if highBitSpellings == 0 {
+		t.Errorf("no spelling with bit 255 set was parsed, so the masking a parser could do went untested")
+	}
+	if abovePrimeSpellings == 0 {
+		t.Errorf("no spelling above the prime after masking was parsed, so the reduction a parser could do went untested")
+	}
+}
+
 // TestX25519DHRefusesANilKey states the guard that stands between a caller who ignored a
 // parse error and a crash. crypto/ecdh reads the curve off both operands before it looks
 // at either, so a nil on either side is a nil dereference rather than a refusal, and a
@@ -485,6 +553,15 @@ func TestX25519DHRefusesANilKey(t *testing.T) {
 // the exact shape of the randomness parameters this plan's contract declares further up
 // the stack. The scalar must be the bytes the reader supplied, in order, and two readers
 // that differ must produce keys that differ.
+//
+// A constant byte reader cannot state the "in order" half of that, and for a while this
+// test used nothing else. Its output is invariant under every permutation, so reversing
+// the scalar, rotating it by one byte, or sorting it all passed the whole package. Sorting
+// is the one that matters: it leaves a key that looks fine and is deterministic under a
+// fixed reader while cutting the scalar to one of the 32 byte multisets over 256 symbols,
+// about 141 bits rather than 256. The scripted case below is what closes that — a
+// published scalar has no symmetry for a permutation to hide behind. An ascending byte
+// pattern would not do, since a sorted input is a fixed point of the sort.
 func TestX25519GenerateKeyReadsTheReaderItIsGiven(t *testing.T) {
 	first, err := X25519GenerateKey(constantReader{value: 0x07})
 	if err != nil {
@@ -507,6 +584,28 @@ func TestX25519GenerateKeyReadsTheReaderItIsGiven(t *testing.T) {
 	}
 	if bytes.Equal(first.Bytes(), other.Bytes()) {
 		t.Errorf("two different readers produced the same scalar %x", first.Bytes())
+	}
+	// the ordering claim, which no constant byte reader above can make. The published
+	// scalar is the natural script: asserting the key it derives to as well turns this
+	// into the reproducibility claim the whole deviation from ecdh.GenerateKey exists
+	// for — hand this function a scripted reader and a published vector comes back.
+	script, err := hex.DecodeString(rfc7748AlicePrivate)
+	if err != nil {
+		t.Fatalf("alice private key hex: %v", err)
+	}
+	scripted, err := X25519GenerateKey(bytes.NewReader(script))
+	if err != nil {
+		t.Fatalf("generate from a scripted reader: %v", err)
+	}
+	if got := scripted.Bytes(); !bytes.Equal(got, script) {
+		t.Errorf("scalar = %x, want the reader's bytes in order %x", got, script)
+	}
+	wantPublic, err := hex.DecodeString(rfc7748AlicePublic)
+	if err != nil {
+		t.Fatalf("alice public key hex: %v", err)
+	}
+	if got := scripted.PublicKey().Bytes(); !bytes.Equal(got, wantPublic) {
+		t.Errorf("public key = %x, want the published %x", got, wantPublic)
 	}
 	// and the documented nil fallback still reaches a real entropy source, or the
 	// one input that used to work would now be the most dangerous one
