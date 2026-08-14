@@ -206,3 +206,415 @@ func TestLog2(t *testing.T) {
 		}
 	}
 }
+
+// the sizing trio, asserted as absolute values against the RFC's own
+// definition: a full leaf count is a power of two, its depth is that exponent,
+// and any count between two powers of two rounds up to the enclosing tree.
+//
+// the plan's table for this ran 0 to 8 and then jumped to 512 and the top of
+// the range. that is the shape Task 2's review rejected — a version wrong only
+// across an interior band passes a table that never enters one. the literal
+// rows carry hand-computed values at every boundary that matters, and the sweep
+// after them walks all thirty-two full counts with the count on either side, so
+// no band is unasserted.
+func TestFullLeafCountAndDepth(t *testing.T) {
+	sizeCases := []struct {
+		leafCount     LeafCount
+		full          bool
+		depth         uint32
+		fullLeafCount LeafCount
+	}{
+		// the empty tree, which is not a tree: no depth, and no enclosing full
+		// count to round up to.
+		{leafCount: 0, full: false, depth: 0, fullLeafCount: 0},
+		// the bottom of the range, where a power of two and its neighbours are
+		// the same handful of values.
+		{leafCount: 1, full: true, depth: 0, fullLeafCount: 1},
+		{leafCount: 2, full: true, depth: 1, fullLeafCount: 2},
+		{leafCount: 3, full: false, depth: 2, fullLeafCount: 4},
+		{leafCount: 4, full: true, depth: 2, fullLeafCount: 4},
+		{leafCount: 5, full: false, depth: 3, fullLeafCount: 8},
+		{leafCount: 6, full: false, depth: 3, fullLeafCount: 8},
+		{leafCount: 7, full: false, depth: 3, fullLeafCount: 8},
+		{leafCount: 8, full: true, depth: 3, fullLeafCount: 8},
+		{leafCount: 9, full: false, depth: 4, fullLeafCount: 16},
+		{leafCount: 15, full: false, depth: 4, fullLeafCount: 16},
+		{leafCount: 16, full: true, depth: 4, fullLeafCount: 16},
+		{leafCount: 17, full: false, depth: 5, fullLeafCount: 32},
+		// the middle, which the plan's table skipped from 8 to 512 to the top.
+		{leafCount: 511, full: false, depth: 9, fullLeafCount: 512},
+		{leafCount: 512, full: true, depth: 9, fullLeafCount: 512},
+		{leafCount: 513, full: false, depth: 10, fullLeafCount: 1024},
+		{leafCount: 1024, full: true, depth: 10, fullLeafCount: 1024},
+		{leafCount: 1025, full: false, depth: 11, fullLeafCount: 2048},
+		{leafCount: 65535, full: false, depth: 16, fullLeafCount: 65536},
+		{leafCount: 65536, full: true, depth: 16, fullLeafCount: 65536},
+		{leafCount: 65537, full: false, depth: 17, fullLeafCount: 131072},
+		{leafCount: 1<<30 - 1, full: false, depth: 30, fullLeafCount: 1 << 30},
+		{leafCount: 1 << 30, full: true, depth: 30, fullLeafCount: 1 << 30},
+		{leafCount: 1<<30 + 1, full: false, depth: 31, fullLeafCount: MaxLeafCount},
+		// the top of the range. one leaf below MaxLeafCount still rounds up to
+		// it; one above has no enclosing tree at all.
+		{leafCount: MaxLeafCount - 1, full: false, depth: 31, fullLeafCount: MaxLeafCount},
+		{leafCount: MaxLeafCount, full: true, depth: 31, fullLeafCount: MaxLeafCount},
+		// the plan wrote depth 31 for the two rows below and its own
+		// implementation answers 32, so the plan's test failed the plan's code.
+		// 32 is the value to keep. bits.Len32 of anything from 2^31 up is 32,
+		// LeafCount is a uint32, and Go defines a shift past the width of the
+		// type as zero rather than a panic — so a depth of 32 makes 1 << depth
+		// collapse to zero and an out-of-range count fail closed, where 31 would
+		// hand back MaxLeafCount, an in-range and entirely plausible wrong tree.
+		// both halves of that were verified by running.
+		{leafCount: MaxLeafCount + 1, full: false, depth: 32, fullLeafCount: 0},
+		{leafCount: 0xFFFFFFFF, full: false, depth: 32, fullLeafCount: 0},
+	}
+	for _, c := range sizeCases {
+		if got := IsFullLeafCount(c.leafCount); got != c.full {
+			t.Errorf("%d leaves full: %v, want %v", c.leafCount, got, c.full)
+		}
+		if got := TreeDepth(c.leafCount); got != c.depth {
+			t.Errorf("%d leaves depth: %d, want %d", c.leafCount, got, c.depth)
+		}
+		if got := FullLeafCount(c.leafCount); got != c.fullLeafCount {
+			t.Errorf("%d leaves full count: %d, want %d", c.leafCount, got, c.fullLeafCount)
+		}
+	}
+
+	// every full leaf count the type can hold, each with the count one below and
+	// one above it. the expectation is the loop's own exponent rather than a
+	// recomputation of the implementation's formula, so it cannot agree with a
+	// wrong version by construction.
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		if !IsFullLeafCount(leafCount) {
+			t.Errorf("%d leaves full: false, want true", leafCount)
+		}
+		if got := TreeDepth(leafCount); got != depth {
+			t.Errorf("%d leaves depth: %d, want %d", leafCount, got, depth)
+		}
+		if got := FullLeafCount(leafCount); got != leafCount {
+			t.Errorf("%d leaves full count: %d, want %d", leafCount, got, leafCount)
+		}
+
+		// from depth 2 up. below a tree of one or two leaves the neighbour is
+		// itself a full count, and the literal rows above carry those.
+		if depth >= 2 {
+			below := leafCount - 1
+			if IsFullLeafCount(below) {
+				t.Errorf("%d leaves full: true, want false", below)
+			}
+			if got := TreeDepth(below); got != depth {
+				t.Errorf("%d leaves depth: %d, want %d", below, got, depth)
+			}
+			if got := FullLeafCount(below); got != leafCount {
+				t.Errorf("%d leaves full count: %d, want %d", below, got, leafCount)
+			}
+		}
+
+		// up to depth 30. one leaf above a tree of one is two, which is full,
+		// and one above MaxLeafCount has no enclosing tree — the literal rows
+		// carry both.
+		if 1 <= depth && depth <= 30 {
+			above := leafCount + 1
+			if IsFullLeafCount(above) {
+				t.Errorf("%d leaves full: true, want false", above)
+			}
+			if got := TreeDepth(above); got != depth+1 {
+				t.Errorf("%d leaves depth: %d, want %d", above, got, depth+1)
+			}
+			if got := FullLeafCount(above); got != leafCount*2 {
+				t.Errorf("%d leaves full count: %d, want %d", above, got, leafCount*2)
+			}
+		}
+	}
+}
+
+// the node-array width and the leaf count it describes, in both directions.
+//
+// this pair is deliberately total over counts that are not powers of two,
+// because the ratchet_tree extension carries an array with its trailing blank
+// nodes stripped: six non-blank leaves encode as eleven nodes, and the receiver
+// extends that to the enclosing full tree of eight (RFC 9420 section 12.4.3.1).
+// the plan's table jumped from width 11 to width 1023, and the odd widths in
+// between are exactly the ones a stripped array actually has.
+func TestLeafCountFromNodeWidth(t *testing.T) {
+	widthCases := []struct {
+		nodeWidth uint32
+		leafCount LeafCount
+	}{
+		{nodeWidth: 1, leafCount: 1},
+		{nodeWidth: 3, leafCount: 2},
+		{nodeWidth: 5, leafCount: 3},
+		{nodeWidth: 7, leafCount: 4},
+		{nodeWidth: 9, leafCount: 5},
+		{nodeWidth: 11, leafCount: 6},
+		{nodeWidth: 13, leafCount: 7},
+		{nodeWidth: 15, leafCount: 8},
+		{nodeWidth: 21, leafCount: 11},
+		{nodeWidth: 1021, leafCount: 511},
+		{nodeWidth: 1023, leafCount: 512},
+		{nodeWidth: 1025, leafCount: 513},
+		{nodeWidth: 0x0000FFFF, leafCount: 32768},
+		{nodeWidth: 0x7FFFFFFF, leafCount: 1 << 30},
+		// the widest array the type can hold, which is the full tree of
+		// MaxLeafCount leaves, and the one below it, which is not full.
+		{nodeWidth: 0xFFFFFFFD, leafCount: MaxLeafCount - 1},
+		{nodeWidth: 0xFFFFFFFF, leafCount: MaxLeafCount},
+	}
+	for _, c := range widthCases {
+		got, err := LeafCountFromNodeWidth(c.nodeWidth)
+		if err != nil {
+			t.Errorf("width %d: %v", c.nodeWidth, err)
+			continue
+		}
+		if got != c.leafCount {
+			t.Errorf("width %d: %d leaves, want %d", c.nodeWidth, got, c.leafCount)
+		}
+		if roundTrip := NodeWidth(got); roundTrip != c.nodeWidth {
+			t.Errorf("width %d round trip: %d", c.nodeWidth, roundTrip)
+		}
+	}
+
+	// an even width, and zero, describe no node array at all. the returned count
+	// is checked alongside the error: a version that answers and refuses at the
+	// same time hands a wrong tree to any caller that reads only the value.
+	badWidths := []uint32{0, 2, 10, 1022, 0xFFFFFFFE}
+	for _, badWidth := range badWidths {
+		got, err := LeafCountFromNodeWidth(badWidth)
+		if !errors.Is(err, ErrNodeWidthNotOdd) {
+			t.Errorf("width %d: %v, want %v", badWidth, err, ErrNodeWidthNotOdd)
+		}
+		if got != 0 {
+			t.Errorf("width %d: %d leaves alongside the refusal, want 0", badWidth, got)
+		}
+	}
+
+	// the other direction at every full count: the width is what NodeWidth says
+	// it is, and decoding it returns the count it came from.
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		nodeWidth := NodeWidth(leafCount)
+		if want := 2*uint32(leafCount) - 1; nodeWidth != want {
+			t.Errorf("%d leaves width: %d, want %d", leafCount, nodeWidth, want)
+		}
+		got, err := LeafCountFromNodeWidth(nodeWidth)
+		if err != nil {
+			t.Errorf("width %d: %v", nodeWidth, err)
+			continue
+		}
+		if got != leafCount {
+			t.Errorf("width %d: %d leaves, want %d", nodeWidth, got, leafCount)
+		}
+	}
+
+	if got := FullLeafCount(6); got != 8 {
+		t.Errorf("full count containing 6 leaves: %d, want 8", got)
+	}
+}
+
+// extension and truncation, as absolute sizes.
+//
+// a test that only checks that extending and then truncating returns the
+// original is satisfied by two functions wrong in mirror-image ways, so every
+// case here pins the size itself against the RFC's definition. the sweep at the
+// end then reaches the same size by three independent routes — the extension of
+// a tree, the enclosing full count of one leaf past it, and the truncation to
+// that leaf — which no mirror-image pair satisfies.
+func TestExtendAndTruncate(t *testing.T) {
+	// RFC 9420 section 7.7: extending doubles the tree.
+	extendCases := []struct {
+		leafCount LeafCount
+		extended  LeafCount
+	}{
+		{leafCount: 0, extended: 1},
+		{leafCount: 1, extended: 2},
+		{leafCount: 2, extended: 4},
+		{leafCount: 4, extended: 8},
+		{leafCount: 8, extended: 16},
+		{leafCount: 512, extended: 1024},
+		{leafCount: 65536, extended: 131072},
+		{leafCount: 1 << 29, extended: 1 << 30},
+		// the last count that can be extended at all: doubling it is exactly
+		// MaxLeafCount.
+		{leafCount: 1 << 30, extended: MaxLeafCount},
+	}
+	for _, c := range extendCases {
+		got, err := ExtendedLeafCount(c.leafCount)
+		if err != nil {
+			t.Errorf("extend %d: %v", c.leafCount, err)
+			continue
+		}
+		if got != c.extended {
+			t.Errorf("extend %d: %d, want %d", c.leafCount, got, c.extended)
+		}
+	}
+
+	extendErrorCases := []struct {
+		leafCount LeafCount
+		err       error
+	}{
+		// a count that is not a power of two names no tree, so there is nothing
+		// to double.
+		{leafCount: 3, err: ErrLeafCountNotFull},
+		{leafCount: 5, err: ErrLeafCountNotFull},
+		{leafCount: 1<<30 + 1, err: ErrLeafCountNotFull},
+		// MaxLeafCount is a tree and cannot be doubled inside a uint32.
+		{leafCount: MaxLeafCount, err: ErrLeafCountRange},
+		// past MaxLeafCount the refusal is ErrLeafCountNotFull and not
+		// ErrLeafCountRange, because no value above 2^31 is a power of two and
+		// the fullness test runs first. pinned as observed rather than changed:
+		// the produced-surface contract says a count that is not a power of two
+		// gets ErrLeafCountNotFull, and these are not. worth knowing that
+		// checkLeafCount classifies the same two values as out of range, so the
+		// taxonomy is not uniform across the file.
+		{leafCount: MaxLeafCount + 1, err: ErrLeafCountNotFull},
+		{leafCount: 0xFFFFFFFF, err: ErrLeafCountNotFull},
+	}
+	for _, c := range extendErrorCases {
+		got, err := ExtendedLeafCount(c.leafCount)
+		if !errors.Is(err, c.err) {
+			t.Errorf("extend %d: %v, want %v", c.leafCount, err, c.err)
+		}
+		if got != 0 {
+			t.Errorf("extend %d: %d leaves alongside the refusal, want 0", c.leafCount, got)
+		}
+	}
+
+	// RFC 9420 section 12.1.3: after a remove, the tree is truncated to 2^d
+	// leaves where d is the smallest value with 2^d greater than the index of
+	// the rightmost non-blank leaf.
+	truncateCases := []struct {
+		rightmostNonBlankLeaf LeafIndex
+		leafCount             LeafCount
+	}{
+		{rightmostNonBlankLeaf: 0, leafCount: 1},
+		{rightmostNonBlankLeaf: 1, leafCount: 2},
+		{rightmostNonBlankLeaf: 2, leafCount: 4},
+		{rightmostNonBlankLeaf: 3, leafCount: 4},
+		{rightmostNonBlankLeaf: 4, leafCount: 8},
+		{rightmostNonBlankLeaf: 7, leafCount: 8},
+		{rightmostNonBlankLeaf: 8, leafCount: 16},
+		{rightmostNonBlankLeaf: 15, leafCount: 16},
+		{rightmostNonBlankLeaf: 16, leafCount: 32},
+		{rightmostNonBlankLeaf: 499, leafCount: 512},
+		{rightmostNonBlankLeaf: 511, leafCount: 512},
+		{rightmostNonBlankLeaf: 512, leafCount: 1024},
+		{rightmostNonBlankLeaf: 65535, leafCount: 65536},
+		{rightmostNonBlankLeaf: 65536, leafCount: 131072},
+		{rightmostNonBlankLeaf: 1<<30 - 1, leafCount: 1 << 30},
+		{rightmostNonBlankLeaf: 1 << 30, leafCount: MaxLeafCount},
+		// the last leaf of the largest representable tree, which truncates to
+		// that whole tree.
+		{rightmostNonBlankLeaf: LeafIndex(MaxLeafCount - 1), leafCount: MaxLeafCount},
+	}
+	for _, c := range truncateCases {
+		got, err := TruncatedLeafCount(c.rightmostNonBlankLeaf)
+		if err != nil {
+			t.Errorf("truncate to leaf %d: %v", c.rightmostNonBlankLeaf, err)
+			continue
+		}
+		if got != c.leafCount {
+			t.Errorf("truncate to leaf %d: %d leaves, want %d", c.rightmostNonBlankLeaf, got, c.leafCount)
+		}
+	}
+
+	// a leaf index at or past MaxLeafCount sits in no representable tree. the
+	// plan asserted neither of these, so nothing in it reached the refusal at
+	// all, and a version with the guard deleted answered MaxLeafCount for every
+	// one of them.
+	badLeaves := []LeafIndex{LeafIndex(MaxLeafCount), LeafIndex(MaxLeafCount) + 1, 0xFFFFFFFF}
+	for _, badLeaf := range badLeaves {
+		got, err := TruncatedLeafCount(badLeaf)
+		if !errors.Is(err, ErrLeafOutOfRange) {
+			t.Errorf("truncate to leaf %d: %v, want %v", badLeaf, err, ErrLeafOutOfRange)
+		}
+		if got != 0 {
+			t.Errorf("truncate to leaf %d: %d leaves alongside the refusal, want 0", badLeaf, got)
+		}
+	}
+
+	// the two functions against each other and against the sizing trio, at
+	// every full count. the rightmost leaf of a full tree truncates back to that
+	// same tree, and one leaf past it names the extended tree by both the
+	// rounding route and the truncation route.
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+
+		lastLeaf := LeafIndex(leafCount - 1)
+		kept, err := TruncatedLeafCount(lastLeaf)
+		if err != nil {
+			t.Errorf("truncate to leaf %d: %v", lastLeaf, err)
+		} else if kept != leafCount {
+			t.Errorf("truncate to leaf %d: %d leaves, want %d", lastLeaf, kept, leafCount)
+		}
+
+		// MaxLeafCount cannot be extended, and its own refusal is a row above.
+		if depth == 31 {
+			continue
+		}
+		extended, err := ExtendedLeafCount(leafCount)
+		if err != nil {
+			t.Errorf("extend %d: %v", leafCount, err)
+			continue
+		}
+		if want := LeafCount(1) << (depth + 1); extended != want {
+			t.Errorf("extend %d: %d, want %d", leafCount, extended, want)
+		}
+		if got := FullLeafCount(leafCount + 1); got != extended {
+			t.Errorf("full count containing %d leaves: %d, want the extension of %d, %d", leafCount+1, got, leafCount, extended)
+		}
+		firstNewLeaf := LeafIndex(leafCount)
+		grown, err := TruncatedLeafCount(firstNewLeaf)
+		if err != nil {
+			t.Errorf("truncate to leaf %d: %v", firstNewLeaf, err)
+			continue
+		}
+		if grown != extended {
+			t.Errorf("truncate to leaf %d: %d leaves, want the extension of %d, %d", firstNewLeaf, grown, leafCount, extended)
+		}
+	}
+}
+
+// checkLeafCount is the shared entry check every later leaf-count function is
+// built on, and this task introduces it with no caller: Root, the first one,
+// lands in Task 4. shipping an unexercised gate for a later task to pick up is
+// the shape that produced p1's nine unfailable tests, and log2 was already
+// shipped that way once in this file, so it is asserted here.
+//
+// the classification matters as much as the refusal. a caller told
+// ErrLeafCountNotFull can round the count up with FullLeafCount and retry; a
+// caller told ErrLeafCountRange cannot, and folding the two together is how a
+// count past the range becomes a tree of MaxLeafCount leaves.
+func TestCheckLeafCount(t *testing.T) {
+	checkCases := []struct {
+		leafCount LeafCount
+		err       error
+	}{
+		{leafCount: 0, err: ErrLeafCountRange},
+		{leafCount: 1, err: nil},
+		{leafCount: 2, err: nil},
+		{leafCount: 3, err: ErrLeafCountNotFull},
+		{leafCount: 4, err: nil},
+		{leafCount: 6, err: ErrLeafCountNotFull},
+		{leafCount: 512, err: nil},
+		{leafCount: 513, err: ErrLeafCountNotFull},
+		{leafCount: 65536, err: nil},
+		{leafCount: 1 << 30, err: nil},
+		{leafCount: MaxLeafCount - 1, err: ErrLeafCountNotFull},
+		{leafCount: MaxLeafCount, err: nil},
+		{leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
+		{leafCount: 0xFFFFFFFF, err: ErrLeafCountRange},
+	}
+	for _, c := range checkCases {
+		err := checkLeafCount(c.leafCount)
+		if c.err == nil {
+			if err != nil {
+				t.Errorf("%d leaves: %v, want no error", c.leafCount, err)
+			}
+			continue
+		}
+		if !errors.Is(err, c.err) {
+			t.Errorf("%d leaves: %v, want %v", c.leafCount, err, c.err)
+		}
+	}
+}

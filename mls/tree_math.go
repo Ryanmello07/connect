@@ -110,3 +110,77 @@ func NodeWidth(n LeafCount) uint32 {
 	}
 	return 2*(uint32(n)-1) + 1
 }
+
+// whether n is a leaf count a valid tree can actually have: non-zero, in range,
+// and a power of two.
+func IsFullLeafCount(n LeafCount) bool {
+	return n > 0 && n <= MaxLeafCount && n&(n-1) == 0
+}
+
+// the depth of the full tree that contains n leaves, which is the length of any
+// leaf's direct path in that tree. one leaf is depth zero.
+func TreeDepth(n LeafCount) uint32 {
+	if n <= 1 {
+		return 0
+	}
+	return uint32(bits.Len32(uint32(n) - 1))
+}
+
+// the smallest full leaf count that contains n leaves. zero for n == 0 and for
+// n past MaxLeafCount, so an out-of-range count fails closed.
+func FullLeafCount(n LeafCount) LeafCount {
+	if n == 0 || n > MaxLeafCount {
+		return 0
+	}
+	return LeafCount(1) << TreeDepth(n)
+}
+
+// the leaf count an array of w nodes describes. every node array has an odd
+// width, and a truncated ratchet_tree array yields a count that is not a power
+// of two — pass the result through FullLeafCount to get the tree it belongs to.
+func LeafCountFromNodeWidth(w uint32) (LeafCount, error) {
+	if w == 0 || w%2 == 0 {
+		return 0, ErrNodeWidthNotOdd
+	}
+	return LeafCount((uint64(w) + 1) / 2), nil
+}
+
+// the leaf count after adding a blank root whose left subtree is the existing
+// tree (RFC 9420 section 7.7). an empty tree extends to one leaf.
+func ExtendedLeafCount(n LeafCount) (LeafCount, error) {
+	if n == 0 {
+		return 1, nil
+	}
+	if !IsFullLeafCount(n) {
+		return 0, ErrLeafCountNotFull
+	}
+	if n == MaxLeafCount {
+		return 0, ErrLeafCountRange
+	}
+	return n * 2, nil
+}
+
+// the leaf count after removing right subtrees until one holds a non-blank leaf
+// (RFC 9420 section 12.1.3): 2^d for the smallest d with 2^d greater than the
+// index of the rightmost non-blank leaf.
+//
+// which leaf that is depends on node contents and is decided by the caller;
+// only the arithmetic lives here.
+func TruncatedLeafCount(rightmostNonBlankLeaf LeafIndex) (LeafCount, error) {
+	if LeafCount(rightmostNonBlankLeaf) >= MaxLeafCount {
+		return 0, ErrLeafOutOfRange
+	}
+	return LeafCount(1) << TreeDepth(LeafCount(rightmostNonBlankLeaf)+1), nil
+}
+
+// the shared entry check for every function that takes a leaf count and answers
+// about a real tree.
+func checkLeafCount(n LeafCount) error {
+	if n == 0 || n > MaxLeafCount {
+		return ErrLeafCountRange
+	}
+	if !IsFullLeafCount(n) {
+		return ErrLeafCountNotFull
+	}
+	return nil
+}
