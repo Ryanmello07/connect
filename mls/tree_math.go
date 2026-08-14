@@ -60,6 +60,12 @@ func log2(x uint32) uint32 {
 }
 
 // the array position of a leaf: leaf L sits at node 2*L.
+//
+// total, and so wraps rather than refusing: a leaf index of 2^31 or above sits
+// in no representable tree, and 2*L for it is taken modulo 2^32 — leaf 2^31
+// answers node 0, indistinguishable from leaf 0. every caller range-checks its
+// leaf count against MaxLeafCount before converting, so no reachable path holds
+// an index that large, but a zero from this function is not an error signal.
 func (self LeafIndex) NodeIndex() NodeIndex {
 	return NodeIndex(2 * uint32(self))
 }
