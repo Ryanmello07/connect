@@ -24,11 +24,11 @@ func TestExtender(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 
-	// actual content server, port 443 (127.0.0.1)
+	// actual content server, ephemeral port
 	// https, self signed
 	// one route, /hello
 
-	// extender server, port 442
+	// extender server, port 1442
 
 	// client
 
@@ -49,17 +49,27 @@ func TestExtender(t *testing.T) {
 	connect.AssertEqual(t, os.WriteFile(certFile, certPemBytes, 0o600), nil)
 	connect.AssertEqual(t, os.WriteFile(keyFile, keyPemBytes, 0o600), nil)
 
-	// the ports are shared between the servers, the client and the readiness poll
-	// below, so that the poll cannot drift from what actually gets listened on
-	const contentPort = 443
+	// the extender port is shared between the server, the client and the readiness
+	// poll below, so that the poll cannot drift from what is listened on
 	const extenderPort = 1442
 
+	// bind the content server here rather than inside ListenAndServeTLS on a
+	// goroutine. that form throws the bind error away, and the port it used, 443,
+	// is privileged on linux, so under an unprivileged CI user the content server
+	// silently never came up. the request then died with an EOF from the
+	// extender's own refused forward dial, which reads like a startup race and is
+	// not one. port 0 takes an ephemeral port: no privilege, and no collision with
+	// whatever else is on the machine.
+	contentListener, err := net.Listen("tcp", ":0")
+	connect.AssertEqual(t, err, nil)
+	defer contentListener.Close()
+	contentPort := contentListener.Addr().(*net.TCPAddr).Port
+
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", contentPort),
 		Handler: &testExtenderServer{},
 	}
 	defer server.Close()
-	go server.ListenAndServeTLS(certFile, keyFile)
+	go server.ServeTLS(contentListener, certFile, keyFile)
 
 	extenderServer := NewExtenderServer(
 		ctx,
@@ -74,15 +84,12 @@ func TestExtender(t *testing.T) {
 	defer extenderServer.Close()
 	go extenderServer.ListenAndServe()
 
-	// both listeners bind on a goroutine, so wait until each one actually accepts
-	// before issuing the request. a fixed sleep here is a race: on a loaded runner
-	// the bind can land after the sleep expires and the request then fails with
-	// EOF, which is what talking to a not-yet-listening socket looks like.
-	awaitListening(
-		t,
-		fmt.Sprintf("127.0.0.1:%d", contentPort),
-		fmt.Sprintf("127.0.0.1:%d", extenderPort),
-	)
+	// the extender binds on a goroutine, so wait until it actually accepts before
+	// issuing the request. a fixed sleep here would be a race: on a loaded runner
+	// the bind can land after the sleep expires, and the request then fails
+	// against a socket that is not listening yet. the content listener above is
+	// already bound by the time we get here, so it needs no poll.
+	awaitListening(t, fmt.Sprintf("127.0.0.1:%d", extenderPort))
 
 	localIp, err := netip.ParseAddr("127.0.0.1")
 	connect.AssertEqual(t, err, nil)
@@ -102,14 +109,16 @@ func TestExtender(t *testing.T) {
 			Profile: connect.ExtenderProfile{
 				ConnectMode: connect.ExtenderConnectModeTcpTls,
 				ServerName:  "bringyour.com",
-				Port:        1442,
+				Port:        extenderPort,
 			},
 			Ip:     localIp,
 			Secret: "montrose",
 		},
 	)
 
-	r, err := client.Get("https://localhost/hello")
+	// the extender forwards to the host:port the client dialed, so the content
+	// port travels to it in the extender header
+	r, err := client.Get(fmt.Sprintf("https://localhost:%d/hello", contentPort))
 
 	connect.AssertEqual(t, err, nil)
 	connect.AssertEqual(t, r.StatusCode, 200)

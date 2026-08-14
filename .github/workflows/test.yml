@@ -50,10 +50,15 @@ jobs:
       # tests actually ran. the root package (the data path) takes ~9 min.
       #
       # extender used to be excluded here and run in a `continue-on-error` step
-      # instead, because TestExtender slept a fixed 1s for its two listeners to
-      # bind and failed with EOF when a loaded runner needed longer. The test now
-      # polls both listeners until they accept, so extender gates like everything
-      # else. A step that cannot fail the job is a note, not a gate.
+      # instead, on the theory that TestExtender raced its 1s startup sleep. It
+      # did not: it failed identically in every run, ~0.2s AFTER that sleep had
+      # already expired. Its content server bound :443, which is privileged for
+      # the unprivileged runner user, and ListenAndServeTLS threw the bind error
+      # away on a goroutine, so the failure surfaced only as an EOF from the
+      # extender's refused forward dial. The content server now binds an
+      # ephemeral port up front with the error checked, and the extender
+      # listener is polled rather than slept on, so extender gates like
+      # everything else. A step that cannot fail the job is a note, not a gate.
       #
       # TestPump, TestPumpTrim and TestCombineTrim used to fail on a Windows dev
       # box and only there. time.Now() advances every ~500us on Windows, so a
