@@ -49,6 +49,12 @@ jobs:
       # -count=1 defeats the test result cache so a green run always means the
       # tests actually ran. the root package (the data path) takes ~9 min.
       #
+      # extender used to be excluded here and run in a `continue-on-error` step
+      # instead, because TestExtender slept a fixed 1s for its two listeners to
+      # bind and failed with EOF when a loaded runner needed longer. The test now
+      # polls both listeners until they accept, so extender gates like everything
+      # else. A step that cannot fail the job is a note, not a gate.
+      #
       # If you run this suite on a Windows dev box instead, expect TestPump,
       # TestPumpTrim and TestCombineTrim to fail there and only there. They are
       # not broken: pumpQueue orders by time.Now() with a strict Before, and
@@ -58,15 +64,4 @@ jobs:
       # durable fix would be an insertion sequence tiebreak in pumpQueue, which
       # is a data path change and deliberately not made here.
       - name: Test
-        run: go test -count=1 -timeout 20m $(go list ./... | grep -v '/extender$')
-
-      # extender's TestExtender fails on a fresh checkout, before any change of
-      # ours: it sleeps a fixed 1s for its TLS and extender listeners to come up
-      # (extender_test.go:71) and then fails the request with EOF, which is what
-      # racing a not-yet-listening socket looks like on a loaded runner. It is a
-      # separate transport component, not the multi-client data path this work
-      # touches, so it is reported but not allowed to gate. Remove this step
-      # once the startup race is fixed.
-      - name: Test extender (known flaky, non-blocking)
-        continue-on-error: true
-        run: go test -count=1 -timeout 5m ./extender/...
+        run: go test -count=1 -timeout 20m ./...

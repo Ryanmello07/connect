@@ -49,8 +49,13 @@ func TestExtender(t *testing.T) {
 	connect.AssertEqual(t, os.WriteFile(certFile, certPemBytes, 0o600), nil)
 	connect.AssertEqual(t, os.WriteFile(keyFile, keyPemBytes, 0o600), nil)
 
+	// the ports are shared between the servers, the client and the readiness poll
+	// below, so that the poll cannot drift from what actually gets listened on
+	const contentPort = 443
+	const extenderPort = 1442
+
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", 443),
+		Addr:    fmt.Sprintf(":%d", contentPort),
 		Handler: &testExtenderServer{},
 	}
 	defer server.Close()
@@ -61,7 +66,7 @@ func TestExtender(t *testing.T) {
 		[]string{"montrose"},
 		[]string{"localhost"},
 		map[int][]connect.ExtenderConnectMode{
-			1442: []connect.ExtenderConnectMode{connect.ExtenderConnectModeTcpTls},
+			extenderPort: []connect.ExtenderConnectMode{connect.ExtenderConnectModeTcpTls},
 		},
 		&net.Dialer{},
 		settings,
@@ -69,9 +74,15 @@ func TestExtender(t *testing.T) {
 	defer extenderServer.Close()
 	go extenderServer.ListenAndServe()
 
-	select {
-	case <-time.After(1 * time.Second):
-	}
+	// both listeners bind on a goroutine, so wait until each one actually accepts
+	// before issuing the request. a fixed sleep here is a race: on a loaded runner
+	// the bind can land after the sleep expires and the request then fails with
+	// EOF, which is what talking to a not-yet-listening socket looks like.
+	awaitListening(
+		t,
+		fmt.Sprintf("127.0.0.1:%d", contentPort),
+		fmt.Sprintf("127.0.0.1:%d", extenderPort),
+	)
 
 	localIp, err := netip.ParseAddr("127.0.0.1")
 	connect.AssertEqual(t, err, nil)
@@ -107,6 +118,32 @@ func TestExtender(t *testing.T) {
 	connect.AssertEqual(t, err, nil)
 	connect.AssertEqual(t, string(body), "{}")
 
+}
+
+// awaitListening blocks until every addr accepts a tcp connection, and fails the
+// test if any of them is still not accepting when the overall deadline passes.
+func awaitListening(t *testing.T, addrs ...string) {
+	t.Helper()
+
+	const timeout = 5 * time.Second
+	const pollInterval = 10 * time.Millisecond
+
+	deadline := time.Now().Add(timeout)
+	for _, addr := range addrs {
+		for {
+			conn, err := net.DialTimeout("tcp", addr, pollInterval*10)
+			if err == nil {
+				conn.Close()
+				break
+			}
+			if !time.Now().Before(deadline) {
+				t.Fatalf("%s was not accepting connections within %s: %s", addr, timeout, err)
+			}
+			select {
+			case <-time.After(pollInterval):
+			}
+		}
+	}
 }
 
 func TestSelfSignValiditySpansPresent(t *testing.T) {
