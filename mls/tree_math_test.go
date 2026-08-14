@@ -496,15 +496,17 @@ func TestExtendAndTruncate(t *testing.T) {
 		{leafCount: 1<<30 + 1, err: ErrLeafCountNotFull},
 		// MaxLeafCount is a tree and cannot be doubled inside a uint32.
 		{leafCount: MaxLeafCount, err: ErrLeafCountRange},
-		// past MaxLeafCount the refusal is ErrLeafCountNotFull and not
-		// ErrLeafCountRange, because no value above 2^31 is a power of two and
-		// the fullness test runs first. pinned as observed rather than changed:
-		// the produced-surface contract says a count that is not a power of two
-		// gets ErrLeafCountNotFull, and these are not. worth knowing that
-		// checkLeafCount classifies the same two values as out of range, so the
-		// taxonomy is not uniform across the file.
-		{leafCount: MaxLeafCount + 1, err: ErrLeafCountNotFull},
-		{leafCount: 0xFFFFFFFF, err: ErrLeafCountNotFull},
+		// past MaxLeafCount the refusal is ErrLeafCountRange, matching
+		// checkLeafCount on the same input. these values are both out of range
+		// and not powers of two, so the order of the two tests alone decided
+		// which sentinel came back, and the two functions disagreed. settled in
+		// favour of range by the argument TestCheckLeafCount already makes below:
+		// a caller told ErrLeafCountNotFull may round up with FullLeafCount and
+		// retry, and for a count past the maximum that retry is exactly how it
+		// ends up holding a tree of MaxLeafCount leaves. ErrLeafCountRange
+		// forbids the retry, so it is the safe classification here.
+		{leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
+		{leafCount: 0xFFFFFFFF, err: ErrLeafCountRange},
 	}
 	for _, c := range extendErrorCases {
 		got, err := ExtendedLeafCount(c.leafCount)
