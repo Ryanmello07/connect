@@ -8,7 +8,14 @@
 // The low order case is the whole point of guardrail 3. crypto/ecdh accepts any 32 byte
 // u coordinate and refuses at the exchange, so the test that names that refusal counts
 // how many points actually reached it: a parser that rejected everything would otherwise
-// skip the loop body and report success.
+// skip the loop body and report success. A blacklist of literals is only half an answer
+// there, because the encoding is masked and reduced before it is used, so the same point
+// arrives under several spellings; those are derived rather than transcribed.
+//
+// Key generation gets its own tests because the standard library's does not honour the
+// reader it is handed. Delegating would leave the randomness parameter untestable and
+// silently non-deterministic, so the two tests below state the opposite: a fixed reader
+// fixes the key, and a broken one is an error rather than a key from somewhere else.
 //
 // There is no hex helper declared here. This package has exactly one and it is the
 // interop harness's MustHex, which has not landed yet, so the vectors below decode
@@ -17,9 +24,13 @@ package mls
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
+	"math/big"
+	"slices"
 	"testing"
 )
 
@@ -76,6 +87,105 @@ var x25519DerivationVectors = []struct {
 	{name: "rfc 7748 section 6.1, bob", privateKey: rfc7748BobPrivate, publicKey: rfc7748BobPublic},
 }
 
+// The small subgroup u coordinates every x25519 implementation blacklists, in canonical
+// form: zero, one, and the two that generate the order eight torsion. Clamping makes
+// every scalar a multiple of eight, so all four drive the x25519 output to zero, which
+// is the case the banned sdk.GenerateSharedSecret answers with an all zero secret and a
+// nil error.
+var x25519LowOrderPoints = [][]byte{
+	make([]byte, x25519KeySize),
+	{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
+		0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00},
+	{0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
+		0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57},
+}
+
+// A reader that never yields, so the entropy failure path is exercised rather than
+// assumed. The error is the test's own value, which is what lets the assertion say the
+// reader's error came back rather than that some error did.
+type failingReader struct {
+	err error
+}
+
+func (self failingReader) Read(p []byte) (int, error) {
+	return 0, self.err
+}
+
+// A reader that yields one byte value forever. Two readers built the same way are the
+// same entropy source, which is what makes the determinism claim below checkable.
+type constantReader struct {
+	value byte
+}
+
+func (self constantReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = self.value
+	}
+	return len(p), nil
+}
+
+// A reader with fewer bytes than a key needs. A short read is the failure a length check
+// after the fact would miss, since the tail of the buffer would be zeros nobody chose.
+type shortReader struct {
+	remaining int
+}
+
+func (self *shortReader) Read(p []byte) (int, error) {
+	if self.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), self.remaining)
+	for i := range n {
+		p[i] = 0xa5
+	}
+	self.remaining -= n
+	return n, nil
+}
+
+// The curve25519 field prime, 2^255 - 19.
+func x25519FieldPrime() *big.Int {
+	prime := new(big.Int).Lsh(big.NewInt(1), 255)
+	return prime.Sub(prime, big.NewInt(19))
+}
+
+// A little endian u coordinate as a number, so the encodings of one point can be
+// enumerated rather than transcribed from a list someone else assembled.
+func x25519CoordinateOf(encoded []byte) *big.Int {
+	bigEndian := slices.Clone(encoded)
+	slices.Reverse(bigEndian)
+	return new(big.Int).SetBytes(bigEndian)
+}
+
+// Every 32 byte string that denotes u. RFC 7748 section 5 masks bit 255 of the encoding
+// and then reduces modulo the prime, so u, u + p, and either of those with bit 255 set
+// are up to four spellings of one point; u + p only survives the mask while it stays
+// below bit 255, and anything that would not fit in 32 bytes is not an encoding at all.
+// The canonical form is first.
+func x25519EncodingsOf(u *big.Int) [][]byte {
+	highBit := new(big.Int).Lsh(big.NewInt(1), 255)
+	limit := new(big.Int).Lsh(big.NewInt(1), 256)
+
+	congruent := []*big.Int{u}
+	if plusPrime := new(big.Int).Add(u, x25519FieldPrime()); plusPrime.Cmp(highBit) < 0 {
+		congruent = append(congruent, plusPrime)
+	}
+	encodings := [][]byte{}
+	for _, value := range congruent {
+		for _, spelling := range []*big.Int{value, new(big.Int).Add(value, highBit)} {
+			if spelling.Cmp(limit) >= 0 {
+				continue
+			}
+			encoded := make([]byte, x25519KeySize)
+			spelling.FillBytes(encoded)
+			slices.Reverse(encoded)
+			encodings = append(encodings, encoded)
+		}
+	}
+	return encodings
+}
+
 // TestX25519RoundTrip is the plan's agreement check: two freshly generated parties reach
 // the same 32 bytes from opposite sides. On its own it is satisfied by any symmetric
 // function, which is what the known answer and sensitivity tests below are for.
@@ -99,8 +209,8 @@ func TestX25519RoundTrip(t *testing.T) {
 	if !bytes.Equal(ab, ba) {
 		t.Fatalf("shared secrets differ: %x vs %x", ab, ba)
 	}
-	if len(ab) != 32 {
-		t.Fatalf("shared secret is %d bytes, want 32", len(ab))
+	if len(ab) != x25519KeySize {
+		t.Fatalf("shared secret is %d bytes, want %d", len(ab), x25519KeySize)
 	}
 }
 
@@ -216,24 +326,12 @@ func TestX25519SecretDependsOnThePeerKey(t *testing.T) {
 // parser that started refusing them would skip every assertion in the body and leave
 // this test passing while covering nothing.
 func TestX25519LowOrderPointIsAnError(t *testing.T) {
-	lowOrderPoints := [][]byte{
-		// the small subgroup points of curve25519: the identity, the order one
-		// point, and the two of order eight. Clamping makes every scalar a
-		// multiple of eight, so all four drive the x25519 output to zero.
-		make([]byte, 32),
-		{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-		{0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
-			0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00},
-		{0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
-			0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57},
-	}
 	priv, err := X25519GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	reachedTheExchange := 0
-	for i, point := range lowOrderPoints {
+	for i, point := range x25519LowOrderPoints {
 		pub, err := X25519PublicKey(point)
 		if err != nil {
 			// rejecting at parse is also acceptable, and is still not a zero
@@ -254,7 +352,64 @@ func TestX25519LowOrderPointIsAnError(t *testing.T) {
 		}
 	}
 	if reachedTheExchange == 0 {
-		t.Errorf("all %d low order points were refused at parse, so the exchange refusal this test is named for went unexercised", len(lowOrderPoints))
+		t.Errorf("all %d low order points were refused at parse, so the exchange refusal this test is named for went unexercised", len(x25519LowOrderPoints))
+	}
+}
+
+// TestX25519RefusesEveryEncodingOfALowOrderPoint closes the gap a literal blacklist
+// leaves. A peer chooses the bytes on the wire, and the same low order point can be sent
+// as u, as u plus the field prime, or with bit 255 set, all of which the masking and
+// reduction in RFC 7748 section 5 collapse back to u before the scalar multiplication.
+// A refusal that keyed on the canonical spelling would pass the test above and still
+// hand a caller a zero secret for the others, so the spellings here are generated from
+// the point rather than transcribed.
+//
+// The prime minus one row is a low order point the canonical list does not carry, kept
+// as arithmetic rather than as a fifth hex blob so it cannot drift from the prime it is
+// defined by.
+//
+// The counting is what stops this becoming the previous test under a new name. Only the
+// spellings that are not the canonical one are counted, and every coordinate has to
+// contribute at least one that reached the exchange and was refused there — so a
+// generator that emitted only canonical forms, or a parser that started rejecting the
+// non canonical ones before they got that far, fails here rather than passing quietly.
+func TestX25519RefusesEveryEncodingOfALowOrderPoint(t *testing.T) {
+	priv, err := X25519GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	coordinates := []*big.Int{new(big.Int).Sub(x25519FieldPrime(), big.NewInt(1))}
+	for _, point := range x25519LowOrderPoints {
+		coordinates = append(coordinates, x25519CoordinateOf(point))
+	}
+	for _, u := range coordinates {
+		encodings := x25519EncodingsOf(u)
+		refusedAtTheExchange := 0
+		for i, encoded := range encodings {
+			pub, err := X25519PublicKey(encoded)
+			if err != nil {
+				if !errors.Is(err, ErrInvalidPoint) {
+					t.Errorf("u = %x as %x: parse error = %v, want ErrInvalidPoint", u, encoded, err)
+				}
+				continue
+			}
+			secret, err := X25519DH(priv, pub)
+			if !errors.Is(err, ErrInvalidPoint) {
+				t.Errorf("u = %x as %x: error = %v, want ErrInvalidPoint", u, encoded, err)
+				continue
+			}
+			if secret != nil {
+				t.Errorf("u = %x as %x: returned a secret alongside the error: %x", u, encoded, secret)
+				continue
+			}
+			// index 0 is the canonical spelling the previous test already covers
+			if i != 0 {
+				refusedAtTheExchange++
+			}
+		}
+		if refusedAtTheExchange == 0 {
+			t.Errorf("u = %x contributed no non canonical spelling that was refused at the exchange, out of %d encodings", u, len(encodings))
+		}
 	}
 }
 
@@ -289,6 +444,112 @@ func TestX25519RejectsWrongKeyLengths(t *testing.T) {
 	}
 	if _, err := X25519PublicKey(accepted); err != nil {
 		t.Errorf("X25519PublicKey refused a %d byte u coordinate: %v", x25519KeySize, err)
+	}
+}
+
+// TestX25519DHRefusesANilKey states the guard that stands between a caller who ignored a
+// parse error and a crash. crypto/ecdh reads the curve off both operands before it looks
+// at either, so a nil on either side is a nil dereference rather than a refusal, and a
+// panic in the exchange is a remotely reachable one: the nil a caller holds is what
+// X25519PublicKey hands back when a peer's key was malformed. The sentinel is the length
+// error, which is what parsing that missing key would have returned.
+func TestX25519DHRefusesANilKey(t *testing.T) {
+	priv, err := X25519GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	nilCases := []struct {
+		name string
+		priv *ecdh.PrivateKey
+		pub  *ecdh.PublicKey
+	}{
+		{name: "nil public key", priv: priv, pub: nil},
+		{name: "nil private key", priv: nil, pub: priv.PublicKey()},
+		{name: "both nil", priv: nil, pub: nil},
+	}
+	for _, nilCase := range nilCases {
+		secret, err := X25519DH(nilCase.priv, nilCase.pub)
+		if !errors.Is(err, ErrBadKeyLength) {
+			t.Errorf("%s: error = %v, want ErrBadKeyLength", nilCase.name, err)
+		}
+		if secret != nil {
+			t.Errorf("%s: returned a secret alongside the error: %x", nilCase.name, secret)
+		}
+	}
+}
+
+// TestX25519GenerateKeyReadsTheReaderItIsGiven is the claim the standard library stopped
+// making. Since Go 1.26 ecdh.GenerateKey ignores its reader unless
+// GODEBUG=cryptocustomrand=1, so delegating would leave a caller that passed a fixed
+// reader with a different key every call and no way to reproduce a published vector —
+// the exact shape of the randomness parameters this plan's contract declares further up
+// the stack. The scalar must be the bytes the reader supplied, in order, and two readers
+// that differ must produce keys that differ.
+func TestX25519GenerateKeyReadsTheReaderItIsGiven(t *testing.T) {
+	first, err := X25519GenerateKey(constantReader{value: 0x07})
+	if err != nil {
+		t.Fatalf("generate from a fixed reader: %v", err)
+	}
+	want := bytes.Repeat([]byte{0x07}, x25519KeySize)
+	if got := first.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("scalar = %x, want the reader's bytes %x", got, want)
+	}
+	again, err := X25519GenerateKey(constantReader{value: 0x07})
+	if err != nil {
+		t.Fatalf("generate from the same fixed reader: %v", err)
+	}
+	if !bytes.Equal(first.Bytes(), again.Bytes()) {
+		t.Errorf("the same reader produced %x then %x", first.Bytes(), again.Bytes())
+	}
+	other, err := X25519GenerateKey(constantReader{value: 0x09})
+	if err != nil {
+		t.Fatalf("generate from a different fixed reader: %v", err)
+	}
+	if bytes.Equal(first.Bytes(), other.Bytes()) {
+		t.Errorf("two different readers produced the same scalar %x", first.Bytes())
+	}
+	// and the documented nil fallback still reaches a real entropy source, or the
+	// one input that used to work would now be the most dangerous one
+	fallback, err := X25519GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate from a nil reader: %v", err)
+	}
+	fallbackAgain, err := X25519GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate from a nil reader again: %v", err)
+	}
+	if bytes.Equal(fallback.Bytes(), fallbackAgain.Bytes()) {
+		t.Errorf("a nil reader produced the same scalar twice: %x", fallback.Bytes())
+	}
+}
+
+// TestX25519GenerateKeyFailsWhenRandomFails is the other half of that. A key generator
+// that answers a dead entropy source with a usable key is worse than one that crashes,
+// because nothing downstream can tell. The error has to be the reader's own and not one
+// of this package's sentinels: a caller distinguishing a broken machine from a malformed
+// input reads the wrong answer otherwise.
+func TestX25519GenerateKeyFailsWhenRandomFails(t *testing.T) {
+	entropyIsDown := errors.New("entropy source is down")
+	priv, err := X25519GenerateKey(failingReader{err: entropyIsDown})
+	if !errors.Is(err, entropyIsDown) {
+		t.Errorf("error = %v, want the reader's own error", err)
+	}
+	if priv != nil {
+		t.Errorf("a failing reader still produced a key: %x", priv.Bytes())
+	}
+	// a reader that runs dry part way is the same failure with a quieter shape: the
+	// tail of the scalar would be zeros nobody chose
+	priv, err = X25519GenerateKey(&shortReader{remaining: x25519KeySize - 1})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("short reader error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if priv != nil {
+		t.Errorf("a short reader still produced a key: %x", priv.Bytes())
+	}
+	for _, sentinel := range []error{ErrBadKeyLength, ErrInvalidPoint} {
+		if errors.Is(err, sentinel) {
+			t.Errorf("an entropy failure was reported as %v", sentinel)
+		}
 	}
 }
 
