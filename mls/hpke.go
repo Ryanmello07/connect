@@ -25,6 +25,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
+	"io"
 )
 
 const (
@@ -120,4 +121,136 @@ func hpkeLabeledExpand(suiteId []byte, prk []byte, label string, info []byte, le
 	labeledInfo = append(labeledInfo, label...)
 	labeledInfo = append(labeledInfo, info...)
 	return hkdf.Expand(sha256.New, prk, string(labeledInfo), length)
+}
+
+// A serialized hpke public key, in the SerializePublicKey encoding RFC 9180 section 7.1.1
+// fixes for DHKEM(X25519): the raw 32 byte u coordinate, no prefix. Named byte slices
+// rather than an interface, because MLS carries them as opaque vectors and every consumer
+// needs the bytes anyway — and named at all rather than left as []byte so a signature
+// cannot silently take a private key where a public one belongs.
+type HpkePublicKey []byte
+
+// A serialized hpke private key, the 32 byte x25519 scalar as DeriveKeyPair expanded it.
+// It is deliberately not the clamped form: crypto/ecdh clamps inside the multiplication
+// and RFC 9180 serializes the unclamped scalar, so storing the clamped one here would
+// disagree with every published vector.
+type HpkePrivateKey []byte
+
+// DeriveKeyPair, RFC 9180 section 7.1.3. For DHKEM(X25519) the expanded scalar is used
+// directly: there is no rejection sampling — that is the NIST curves' branch of the same
+// section — and no clamping, which is x25519's own and happens inside the multiplication.
+//
+// The kem suite id is the one that belongs here rather than the whole suite id. A key pair
+// is a property of the kem alone, so deriving it under the full identifier would give the
+// same ikm a different key pair per aead, and the two registered suites would stop sharing
+// a keystore for no reason RFC 9180 states.
+func HpkeDeriveKeyPair(params *SuiteParams, ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
+	suiteId := hpkeKemSuiteId(params)
+	dkpPrk := hpkeLabeledExtract(suiteId, nil, "dkp_prk", ikm)
+	scalar, err := hpkeLabeledExpand(suiteId, dkpPrk, "sk", nil, params.Nsk)
+	if err != nil {
+		return nil, nil, err
+	}
+	priv, err := X25519PrivateKey(scalar)
+	if err != nil {
+		return nil, nil, err
+	}
+	return HpkePrivateKey(priv.Bytes()), HpkePublicKey(priv.PublicKey().Bytes()), nil
+}
+
+// ExtractAndExpand, RFC 9180 section 4.1: the hash that turns a raw diffie-hellman output
+// into a kem shared secret. Skipping it and returning dh would produce 32 bytes that
+// round-trip perfectly between an encap and a decap that both skipped it, which is why the
+// vector table rather than the round trip is what holds this function in place.
+func hpkeExtractAndExpand(params *SuiteParams, dh []byte, kemContext []byte) ([]byte, error) {
+	suiteId := hpkeKemSuiteId(params)
+	eaePrk := hpkeLabeledExtract(suiteId, nil, "eae_prk", dh)
+	return hpkeLabeledExpand(suiteId, eaePrk, "shared_secret", kemContext, params.Nsecret)
+}
+
+// Encap, RFC 9180 section 4.1, drawing the ephemeral key from the reader it is handed.
+// The reader is a parameter rather than a package level source so a caller can reproduce a
+// published encapsulation; it reaches x25519 through X25519GenerateKey, which reads it
+// itself because ecdh.GenerateKey no longer does.
+func hpkeEncap(random io.Reader, params *SuiteParams, pub HpkePublicKey) ([]byte, []byte, error) {
+	ephemeral, err := X25519GenerateKey(random)
+	if err != nil {
+		return nil, nil, err
+	}
+	return hpkeEncapDeterministic(params, pub, HpkePrivateKey(ephemeral.Bytes()))
+}
+
+// Encap with the ephemeral key supplied, so the RFC's vectors drive production code rather
+// than a parallel implementation written for the test. It is the whole of Encap; the
+// randomized entry point above is only the key draw in front of it.
+//
+// kem_context is enc || pkRm and the order is load bearing. Both halves are 32 bytes of
+// public key, so a transposition changes no length, returns no error and still agrees with
+// a decap transposed the same way — it is visible only against a published shared secret.
+// The same is true of which key goes where: pkRm is the recipient's static key and enc is
+// this call's ephemeral public key, and writing enc twice, which is what reading the
+// ephemeral key for both positions would do, is equally silent.
+func hpkeEncapDeterministic(params *SuiteParams, pub HpkePublicKey, ephemeralPriv HpkePrivateKey) ([]byte, []byte, error) {
+	if len(ephemeralPriv) != params.Nsk {
+		return nil, nil, ErrBadKeyLength
+	}
+	if len(pub) != params.Npk {
+		return nil, nil, ErrBadKeyLength
+	}
+	ephemeral, err := X25519PrivateKey(ephemeralPriv)
+	if err != nil {
+		return nil, nil, err
+	}
+	recipient, err := X25519PublicKey(pub)
+	if err != nil {
+		return nil, nil, err
+	}
+	dh, err := X25519DH(ephemeral, recipient)
+	if err != nil {
+		return nil, nil, err
+	}
+	kemOutput := ephemeral.PublicKey().Bytes()
+	kemContext := make([]byte, 0, len(kemOutput)+len(pub))
+	kemContext = append(kemContext, kemOutput...)
+	kemContext = append(kemContext, pub...)
+	sharedSecret, err := hpkeExtractAndExpand(params, dh, kemContext)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sharedSecret, kemOutput, nil
+}
+
+// Decap, RFC 9180 section 4.1. The recipient's half of the kem context is recomputed from
+// its own private key rather than taken from a caller, which is the only way the two sides
+// can be made to agree on pkRm without a second wire field to get wrong — and it is why a
+// decap that put its own key first would still round trip against nothing but itself.
+//
+// A wrong length is refused before the curve rather than at it, and the two lengths get
+// different sentinels on purpose: a kem output is a peer's bytes off the wire, while a
+// private key of the wrong length is this process's own bug, and a caller triaging the two
+// needs to tell them apart.
+func hpkeDecap(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte) ([]byte, error) {
+	if len(kemOutput) != params.Nenc {
+		return nil, ErrBadKemOutput
+	}
+	if len(priv) != params.Nsk {
+		return nil, ErrBadKeyLength
+	}
+	recipient, err := X25519PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	ephemeral, err := X25519PublicKey(kemOutput)
+	if err != nil {
+		return nil, err
+	}
+	dh, err := X25519DH(recipient, ephemeral)
+	if err != nil {
+		return nil, err
+	}
+	recipientPub := recipient.PublicKey().Bytes()
+	kemContext := make([]byte, 0, len(kemOutput)+len(recipientPub))
+	kemContext = append(kemContext, kemOutput...)
+	kemContext = append(kemContext, recipientPub...)
+	return hpkeExtractAndExpand(params, dh, kemContext)
 }

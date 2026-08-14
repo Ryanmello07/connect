@@ -16,13 +16,23 @@
 // the same transposition moves every derived byte in the vector. A single suite table
 // would therefore be a table that cannot see the mistake this file exists to catch.
 //
-// The vectors stop where task 5 does. RFC 9180 publishes the key schedule inputs and
+// The vectors stop where task 6 does. RFC 9180 publishes the key schedule inputs and
 // outputs — shared_secret, key_schedule_context, secret, key, base_nonce,
 // exporter_secret — and each of those is a labelled extract or expand away from the
-// previous one, so the whole chain up to the aead is reachable with the four functions
-// this task defines and no others. The aead itself, the sequence number and the context
-// object are tasks 6 to 8, and the vendored corpus that replaces these transcriptions is
-// task 9's.
+// previous one, so the whole chain up to the aead is reachable with the four labelled kdf
+// functions and no others; the kem key pairs, the encapsulation and the decapsulation are
+// published beside them and are what the second half of this file pins. The aead itself,
+// the sequence number and the context object are tasks 7 and 8, and the vendored corpus
+// that replaces these transcriptions is task 9's.
+//
+// Nothing about DHKEM is reachable by round trip. Encap and Decap that are wrong in the
+// same way agree with each other perfectly: transpose enc and pkRm in the kem context on
+// both sides, write the ephemeral key into the recipient's slot on both sides, respell
+// eae_prk, or return the raw diffie-hellman output in place of the extract-and-expand, and
+// every one of those still produces a 32 byte secret both parties reach. Each was applied
+// to hpke.go and left the round trip, the length checks and the determinism checks green.
+// So the encap and decap tests below assert against published bytes, and the round trip is
+// only there to say the two entry points are not separately correct against nothing.
 //
 // There is no general hex helper declared here. This package's one decoder is the interop
 // harness's MustHex, which has not landed, so the single decode below is inlined against
@@ -33,16 +43,33 @@ package mls
 import (
 	"bytes"
 	"crypto/hkdf"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"testing"
 )
 
-// One base mode entry of RFC 9180 appendix A, as published: the hex is transcribed from
-// the RFC text, and the fields are exactly those a labelled extract or expand consumes or
-// produces. mode is not a field because base mode is the only mode this file implements
-// and hpkeModeBase is the constant under test rather than an input.
+// One base mode entry of RFC 9180 appendix A, as published, with the fields exactly those
+// a labelled extract or expand, a key pair derivation, an encapsulation or a decapsulation
+// consumes or produces. mode is not a field because base mode is the only mode this file
+// implements and hpkeModeBase is the constant under test rather than an input.
+//
+// Two provenances, stated per field because a known answer test is worth only its sourcing
+// and a value taken from the implementation it checks proves nothing. info, skEm, pkRm,
+// enc, shared_secret, key_schedule_context, secret, key, base_nonce and exporter_secret
+// were transcribed from the RFC 9180 appendix A text by task 5. ikmE, ikmR and skRm — the
+// three task 6 needs and appendix A prints but task 5 had no use for — were read out of
+// the pinned toolchain's own vendored copy of the same corpus, at
+// GOROOT/src/crypto/hpke/testdata/rfc9180.json, which is the cfrg published
+// test-vectors.json filtered to the base mode entries.
+//
+// The two sources overlap on info, pkRm and enc and agree on all three, so each checks the
+// other's transcription. Beyond that the table is self checking in a way a hand copied
+// blob is not: ikmE has to derive to the skEm the RFC printed and to the enc it printed,
+// ikmR to skRm and pkRm, and skRm with enc to the shared_secret that task 5 already pinned
+// through an independent path. A wrong character in any of the three new fields fails
+// against a value that was already in the table rather than being absorbed.
 //
 // info is the RFC's own "Ode on a Grecian Urn" string. It is not empty on purpose: an
 // empty info would make the info_hash extract indistinguishable from the psk_id_hash one
@@ -51,7 +78,10 @@ type rfc9180BaseVector struct {
 	name               string
 	suite              CipherSuite
 	info               string
+	ikmE               string
 	skEm               string
+	ikmR               string
+	skRm               string
 	pkRm               string
 	enc                string
 	sharedSecret       string
@@ -71,7 +101,10 @@ var rfc9180BaseVectors = []rfc9180BaseVector{
 		name:               "rfc 9180 appendix a.1.1, aes-128-gcm",
 		suite:              CipherSuiteX25519AesGcm128Sha256Ed25519,
 		info:               "4f6465206f6e2061204772656369616e2055726e",
+		ikmE:               "7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234",
 		skEm:               "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736",
+		ikmR:               "6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037",
+		skRm:               "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
 		pkRm:               "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
 		enc:                "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
 		sharedSecret:       "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
@@ -85,7 +118,10 @@ var rfc9180BaseVectors = []rfc9180BaseVector{
 		name:               "rfc 9180 appendix a.2.1, chacha20-poly1305",
 		suite:              CipherSuiteX25519ChaCha20Sha256Ed25519,
 		info:               "4f6465206f6e2061204772656369616e2055726e",
+		ikmE:               "909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b",
 		skEm:               "f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600",
+		ikmR:               "1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df",
+		skRm:               "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
 		pkRm:               "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
 		enc:                "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
 		sharedSecret:       "0bbe78490412b4bbea4812666f7916932b828bba79942424abb65244930d69a7",
@@ -389,4 +425,432 @@ func TestHpkeExpandCeilingMatchesTheRegistry(t *testing.T) {
 			t.Errorf("suite %#04x has Nh %d, so its expand ceiling is %d, but the constant is %d", uint16(suite), params.Nh, 255*params.Nh, hpkeMaxExpandLength)
 		}
 	}
+}
+
+// TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs is the known answer for DeriveKeyPair,
+// and the reason the ikm fields were added to the table. Determinism, the sizes and the
+// sensitivity to the ikm are all satisfied by any deterministic function of the input, so
+// none of them can tell the RFC's derivation from a plausible neighbour: dropping the
+// dkp_prk label, respelling it, expanding under "key" instead of "sk", or deriving under
+// the whole suite id instead of the kem one each leave a well formed 32 byte scalar and a
+// public key on the curve. Only the published pair separates them.
+//
+// Both key pairs of each vector are derived, because they exercise different halves of
+// what follows: skEm is the input to encapsulation and skRm to decapsulation, and a
+// derivation that was right for one and wrong for the other is exactly the shape a single
+// row would miss. pkEm is checked as enc, since RFC 9180 section 4.1 defines the
+// encapsulated key of a DHKEM as SerializePublicKey(pkE) and the appendix prints the two
+// as the same bytes.
+func TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs(t *testing.T) {
+	if len(rfc9180BaseVectors) == 0 {
+		t.Fatal("the vector table is empty, so the loop below asserts nothing")
+	}
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		derivations := []struct {
+			role       string
+			ikm        string
+			privateKey string
+			publicKey  string
+		}{
+			{role: "ephemeral", ikm: vector.ikmE, privateKey: vector.skEm, publicKey: vector.enc},
+			{role: "recipient", ikm: vector.ikmR, privateKey: vector.skRm, publicKey: vector.pkRm},
+		}
+		for _, derivation := range derivations {
+			ikm := decodeVectorField(t, vector.name, derivation.role+" ikm", derivation.ikm)
+			priv, pub, err := HpkeDeriveKeyPair(params, ikm)
+			if err != nil {
+				t.Fatalf("%s: %s: HpkeDeriveKeyPair: %v", vector.name, derivation.role, err)
+			}
+			wantPriv := decodeVectorField(t, vector.name, derivation.role+" private key", derivation.privateKey)
+			if !bytes.Equal(priv, wantPriv) {
+				t.Errorf("%s: %s private key = %x, want %x", vector.name, derivation.role, priv, wantPriv)
+			}
+			wantPub := decodeVectorField(t, vector.name, derivation.role+" public key", derivation.publicKey)
+			if !bytes.Equal(pub, wantPub) {
+				t.Errorf("%s: %s public key = %x, want %x", vector.name, derivation.role, pub, wantPub)
+			}
+		}
+	}
+}
+
+// TestHpkeDeriveKeyPairIsDeterministic states the properties the known answer above cannot
+// reach on its own: that a second call on the same ikm returns the same pair rather than
+// reading entropy somewhere, that the lengths are the ones the suite fixes, and that the
+// ikm is actually consumed. On its own this test is satisfied by any deterministic
+// function, which is why it is written beside the vectors rather than instead of them.
+func TestHpkeDeriveKeyPairIsDeterministic(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	ikm := bytes.Repeat([]byte{0x42}, 32)
+	priv1, pub1, err := HpkeDeriveKeyPair(params, ikm)
+	if err != nil {
+		t.Fatalf("derive 1: %v", err)
+	}
+	priv2, pub2, err := HpkeDeriveKeyPair(params, ikm)
+	if err != nil {
+		t.Fatalf("derive 2: %v", err)
+	}
+	if !bytes.Equal(priv1, priv2) || !bytes.Equal(pub1, pub2) {
+		t.Fatalf("derive is not deterministic")
+	}
+	if len(priv1) != params.Nsk || len(pub1) != params.Npk {
+		t.Fatalf("sizes are %d/%d, want %d/%d", len(priv1), len(pub1), params.Nsk, params.Npk)
+	}
+	_, pub3, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x43}, 32))
+	if err != nil {
+		t.Fatalf("derive 3: %v", err)
+	}
+	if bytes.Equal(pub1, pub3) {
+		t.Fatalf("different ikm produced the same public key")
+	}
+}
+
+// TestHpkeEncapMatchesThePublishedEncapsulation is the assertion this task turns on. Both
+// entry points are driven from the vector's own ephemeral scalar and both have to produce
+// the shared secret and the enc RFC 9180 printed.
+//
+// The randomized one is included rather than assumed equivalent because the plan's own test
+// for that only checked the deterministic one against a key pair it derived itself, which
+// is true of any pair of functions that return their argument. Driving hpkeEncap from a
+// reader scripted with skEm reaches the same published bytes through the code path
+// production actually uses, and the equality check afterwards is then a statement about two
+// things that were each separately pinned.
+//
+// What this catches that the round trip cannot: kem_context transposed to pkRm concatenated
+// with enc, the recipient's key replaced by the ephemeral one in the second slot, eae_prk or
+// shared_secret respelled or dropped, the extract-and-expand skipped so the raw
+// diffie-hellman output is returned, and the kem suite id swapped for the whole suite id.
+// All six were applied to hpke.go and all six survive every non vector test in this file.
+func TestHpkeEncapMatchesThePublishedEncapsulation(t *testing.T) {
+	if len(rfc9180BaseVectors) == 0 {
+		t.Fatal("the vector table is empty, so the loop below asserts nothing")
+	}
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		skEm := decodeVectorField(t, vector.name, "skEm", vector.skEm)
+		pkRm := HpkePublicKey(decodeVectorField(t, vector.name, "pkRm", vector.pkRm))
+		wantSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		wantEnc := decodeVectorField(t, vector.name, "enc", vector.enc)
+
+		secret, enc, err := hpkeEncapDeterministic(params, pkRm, HpkePrivateKey(skEm))
+		if err != nil {
+			t.Fatalf("%s: hpkeEncapDeterministic: %v", vector.name, err)
+		}
+		if !bytes.Equal(secret, wantSecret) {
+			t.Errorf("%s: deterministic shared_secret = %x, want %x", vector.name, secret, wantSecret)
+		}
+		if !bytes.Equal(enc, wantEnc) {
+			t.Errorf("%s: deterministic enc = %x, want %x", vector.name, enc, wantEnc)
+		}
+
+		// the same encapsulation through the randomized entry point, whose ephemeral
+		// scalar is whatever its reader supplies — which is what makes the vector
+		// reachable from the function production calls
+		randomizedSecret, randomizedEnc, err := hpkeEncap(bytes.NewReader(skEm), params, pkRm)
+		if err != nil {
+			t.Fatalf("%s: hpkeEncap: %v", vector.name, err)
+		}
+		if !bytes.Equal(randomizedSecret, wantSecret) {
+			t.Errorf("%s: randomized shared_secret = %x, want %x", vector.name, randomizedSecret, wantSecret)
+		}
+		if !bytes.Equal(randomizedEnc, wantEnc) {
+			t.Errorf("%s: randomized enc = %x, want %x", vector.name, randomizedEnc, wantEnc)
+		}
+	}
+}
+
+// TestHpkeDecapMatchesThePublishedSharedSecret is the other side, and it is not implied by
+// the encap vectors. Decap never sees pkRm on the wire — it recomputes that half of the kem
+// context from the private key it holds — so it is a second implementation of the same
+// concatenation, with its own opportunity to put its own key first, and the round trip
+// cannot see the difference because it would agree with an encap transposed to match.
+func TestHpkeDecapMatchesThePublishedSharedSecret(t *testing.T) {
+	if len(rfc9180BaseVectors) == 0 {
+		t.Fatal("the vector table is empty, so the loop below asserts nothing")
+	}
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		skRm := HpkePrivateKey(decodeVectorField(t, vector.name, "skRm", vector.skRm))
+		enc := decodeVectorField(t, vector.name, "enc", vector.enc)
+		secret, err := hpkeDecap(params, skRm, enc)
+		if err != nil {
+			t.Fatalf("%s: hpkeDecap: %v", vector.name, err)
+		}
+		want := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		if !bytes.Equal(secret, want) {
+			t.Errorf("%s: shared_secret = %x, want %x", vector.name, secret, want)
+		}
+	}
+}
+
+// TestHpkeEncapDecapAgree is the frame around the vectors rather than an assertion in its
+// own right: it says the two entry points are the same computation over a key pair neither
+// vector supplies, across both registered suites and with a real entropy source. Every
+// mutation listed in this file's comment passes it. What it does add is the sensitivity
+// check at the end — a decapsulation under a different private key has to reach different
+// bytes, which is the one thing here that a constant returning kem would fail.
+func TestHpkeEncapDecapAgree(t *testing.T) {
+	suites := Suites()
+	if len(suites) == 0 {
+		t.Fatal("the registry is empty, so the loop below asserts nothing")
+	}
+	for _, suite := range suites {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("LookupSuite %#04x: %v", uint16(suite), err)
+		}
+		priv, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x01}, 32))
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		sharedSecret, kemOutput, err := hpkeEncap(rand.Reader, params, pub)
+		if err != nil {
+			t.Fatalf("encap: %v", err)
+		}
+		if len(kemOutput) != params.Nenc {
+			t.Fatalf("kem output is %d bytes, want %d", len(kemOutput), params.Nenc)
+		}
+		if len(sharedSecret) != params.Nsecret {
+			t.Fatalf("shared secret is %d bytes, want %d", len(sharedSecret), params.Nsecret)
+		}
+		back, err := hpkeDecap(params, priv, kemOutput)
+		if err != nil {
+			t.Fatalf("decap: %v", err)
+		}
+		if !bytes.Equal(sharedSecret, back) {
+			t.Fatalf("suite %#04x: encap and decap disagree", uint16(suite))
+		}
+		strangerPriv, _, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x02}, 32))
+		if err != nil {
+			t.Fatalf("derive a stranger: %v", err)
+		}
+		// DHKEM does not authenticate the recipient, so the wrong key is not an error;
+		// it is a different secret, and a kem that ignored its inputs would be caught
+		// here and nowhere else in this test
+		stranger, err := hpkeDecap(params, strangerPriv, kemOutput)
+		if err != nil {
+			t.Fatalf("decap under a stranger's key: %v", err)
+		}
+		if bytes.Equal(sharedSecret, stranger) {
+			t.Fatalf("suite %#04x: a different private key reached the same secret %x", uint16(suite), stranger)
+		}
+	}
+}
+
+// TestHpkeEncapDeterministicMatchesEncap states the equivalence the vector gate depends on,
+// over an ephemeral key that is not a published one: task 9 drives encapsulation through
+// hpkeEncapDeterministic, so that entry point has to be the computation hpkeEncap performs
+// rather than a second one written for the tests. The reader is scripted with the ephemeral
+// scalar, which is the only way to hold the two sides to the same key.
+//
+// The plan's version of this test compared nothing: it checked that the deterministic
+// encapsulation's kem output was the ephemeral public key and that the secret had the right
+// length, and never called hpkeEncap at all, so the name was the whole of the claim.
+func TestHpkeEncapDeterministicMatchesEncap(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	_, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x03}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	ephemeralPriv, ephemeralPub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x04}, 32))
+	if err != nil {
+		t.Fatalf("derive ephemeral: %v", err)
+	}
+	sharedSecret, kemOutput, err := hpkeEncapDeterministic(params, pub, ephemeralPriv)
+	if err != nil {
+		t.Fatalf("encap deterministic: %v", err)
+	}
+	if !bytes.Equal(kemOutput, ephemeralPub) {
+		t.Fatalf("kem output %x is not the ephemeral public key %x", kemOutput, ephemeralPub)
+	}
+	if len(sharedSecret) != params.Nsecret {
+		t.Fatalf("shared secret is %d bytes, want %d", len(sharedSecret), params.Nsecret)
+	}
+	randomizedSecret, randomizedKemOutput, err := hpkeEncap(bytes.NewReader(ephemeralPriv), params, pub)
+	if err != nil {
+		t.Fatalf("encap from a scripted reader: %v", err)
+	}
+	if !bytes.Equal(randomizedSecret, sharedSecret) {
+		t.Fatalf("the two entry points disagree on the secret: %x vs %x", randomizedSecret, sharedSecret)
+	}
+	if !bytes.Equal(randomizedKemOutput, kemOutput) {
+		t.Fatalf("the two entry points disagree on the kem output: %x vs %x", randomizedKemOutput, kemOutput)
+	}
+}
+
+// TestHpkeDecapRejectsWrongLengths covers the lengths that must not reach the curve. The
+// two sentinels are distinguished on purpose: a kem output is a peer's bytes and a private
+// key of the wrong length is this process's own bug, and a caller triaging the two reads
+// the wrong answer if they collapse. The accepting case is asserted beside them because a
+// function hardwired to refuse everything satisfies every refusal on its own.
+func TestHpkeDecapRejectsWrongLengths(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	priv, _, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x02}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	for _, n := range []int{0, 31, 33, 1024} {
+		secret, err := hpkeDecap(params, priv, make([]byte, n))
+		if !errors.Is(err, ErrBadKemOutput) {
+			t.Errorf("decap(%d bytes) error = %v, want ErrBadKemOutput", n, err)
+		}
+		if secret != nil {
+			t.Errorf("decap(%d bytes) refused and returned %d bytes anyway", n, len(secret))
+		}
+	}
+	for _, n := range []int{0, 31, 33, 64} {
+		secret, err := hpkeDecap(params, make(HpkePrivateKey, n), make([]byte, params.Nenc))
+		if !errors.Is(err, ErrBadKeyLength) {
+			t.Errorf("decap with a %d byte private key error = %v, want ErrBadKeyLength", n, err)
+		}
+		if secret != nil {
+			t.Errorf("decap with a %d byte private key refused and returned %d bytes anyway", n, len(secret))
+		}
+	}
+	_, kemOutput, err := hpkeEncap(rand.Reader, params, mustDeriveHpkePublicKey(t, params, 0x02))
+	if err != nil {
+		t.Fatalf("encap: %v", err)
+	}
+	if _, err := hpkeDecap(params, priv, kemOutput); err != nil {
+		t.Fatalf("decap refused a well formed kem output: %v", err)
+	}
+}
+
+// TestHpkeEncapRejectsWrongLengths is the same statement on the other side, and it needs
+// its own test because the two length checks there guard different arguments: a recipient
+// key off the wire and an ephemeral scalar the caller chose.
+func TestHpkeEncapRejectsWrongLengths(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	pub := mustDeriveHpkePublicKey(t, params, 0x05)
+	ephemeral := HpkePrivateKey(bytes.Repeat([]byte{0x06}, params.Nsk))
+	for _, n := range []int{0, 31, 33, 64} {
+		secret, enc, err := hpkeEncapDeterministic(params, make(HpkePublicKey, n), ephemeral)
+		if !errors.Is(err, ErrBadKeyLength) {
+			t.Errorf("encap to a %d byte public key error = %v, want ErrBadKeyLength", n, err)
+		}
+		if secret != nil || enc != nil {
+			t.Errorf("encap to a %d byte public key refused and returned %d/%d bytes anyway", n, len(secret), len(enc))
+		}
+		secret, enc, err = hpkeEncapDeterministic(params, pub, make(HpkePrivateKey, n))
+		if !errors.Is(err, ErrBadKeyLength) {
+			t.Errorf("encap from a %d byte ephemeral scalar error = %v, want ErrBadKeyLength", n, err)
+		}
+		if secret != nil || enc != nil {
+			t.Errorf("encap from a %d byte ephemeral scalar refused and returned %d/%d bytes anyway", n, len(secret), len(enc))
+		}
+	}
+	if _, _, err := hpkeEncapDeterministic(params, pub, ephemeral); err != nil {
+		t.Fatalf("encap refused well formed keys: %v", err)
+	}
+}
+
+// TestHpkeRefusesALowOrderPeerKey carries guardrail 3's refusal through the kem. X25519DH
+// reports a low order point as ErrInvalidPoint and crypto_x25519_test.go pins that; what is
+// unproven until here is that the kem propagates it rather than deriving a shared secret
+// from an all zero diffie-hellman output, which is what the whole guardrail exists to stop
+// and which would look exactly like a working key exchange to both parties.
+//
+// Both directions are covered because the two functions reach the curve through different
+// arguments: encap takes the peer key as a recipient public key, decap takes it as a kem
+// output off the wire. The count keeps the loop honest, the way the x25519 tests do — if
+// the parsers ever started refusing these points, every assertion in the body would be
+// skipped and the test would still pass.
+func TestHpkeRefusesALowOrderPeerKey(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	priv, _, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x08}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	ephemeral := HpkePrivateKey(bytes.Repeat([]byte{0x09}, params.Nsk))
+	refused := 0
+	for i, point := range x25519LowOrderPoints {
+		secret, enc, err := hpkeEncapDeterministic(params, HpkePublicKey(point), ephemeral)
+		if !errors.Is(err, ErrInvalidPoint) {
+			t.Errorf("point %d: encap error = %v, want ErrInvalidPoint", i, err)
+			continue
+		}
+		if secret != nil || enc != nil {
+			t.Errorf("point %d: encap refused and returned %d/%d bytes anyway", i, len(secret), len(enc))
+			continue
+		}
+		secret, err = hpkeDecap(params, priv, point)
+		if !errors.Is(err, ErrInvalidPoint) {
+			t.Errorf("point %d: decap error = %v, want ErrInvalidPoint", i, err)
+			continue
+		}
+		if secret != nil {
+			t.Errorf("point %d: decap refused and returned %d bytes anyway", i, len(secret))
+			continue
+		}
+		refused++
+	}
+	if refused == 0 {
+		t.Errorf("none of the %d low order points was refused by both directions, so this test covered nothing", len(x25519LowOrderPoints))
+	}
+}
+
+// TestHpkeEncapFailsWhenRandomFails is the key draw's own failure path. An encapsulation
+// that answered a dead entropy source with an ephemeral key from somewhere else is worse
+// than one that fails, because the peer would decapsulate it happily. The error has to be
+// the reader's own rather than one of this package's sentinels, for the same reason
+// X25519GenerateKey's is.
+func TestHpkeEncapFailsWhenRandomFails(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	pub := mustDeriveHpkePublicKey(t, params, 0x0a)
+	entropyIsDown := errors.New("entropy source is down")
+	secret, enc, err := hpkeEncap(failingReader{err: entropyIsDown}, params, pub)
+	if !errors.Is(err, entropyIsDown) {
+		t.Errorf("error = %v, want the reader's own error", err)
+	}
+	if secret != nil || enc != nil {
+		t.Errorf("a failing reader still produced %d/%d bytes", len(secret), len(enc))
+	}
+	secret, enc, err = hpkeEncap(&shortReader{remaining: params.Nsk - 1}, params, pub)
+	if err == nil {
+		t.Errorf("a short reader still produced an encapsulation")
+	}
+	if secret != nil || enc != nil {
+		t.Errorf("a short reader still produced %d/%d bytes", len(secret), len(enc))
+	}
+}
+
+// One key pair's public half from a constant ikm, so a test that needs a well formed
+// recipient key and nothing else does not spell out the derivation and its error handling
+// each time. It is deliberately not a vector key: the tests using it are about lengths,
+// entropy and refusals, and reaching for a published key there would suggest the value
+// mattered.
+func mustDeriveHpkePublicKey(t *testing.T, params *SuiteParams, ikmByte byte) HpkePublicKey {
+	t.Helper()
+	_, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{ikmByte}, params.Nsk))
+	if err != nil {
+		t.Fatalf("HpkeDeriveKeyPair: %v", err)
+	}
+	return pub
 }
