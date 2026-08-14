@@ -32,6 +32,8 @@ package mls
 
 import (
 	"bytes"
+	"crypto/hkdf"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"testing"
@@ -329,11 +331,47 @@ func TestHpkeLabeledExpandRejectsUnrepresentableLengths(t *testing.T) {
 	}
 }
 
+// TestHpkeExpandCeilingIsTheLibrarysOwnBoundary pins hpkeMaxExpandLength to something
+// other than itself. Every assertion about the ceiling in the refusal test above is
+// written as hpkeMaxExpandLength or hpkeMaxExpandLength+1, so together they say only
+// "the guard fires just above wherever the constant sits" — which is true of any value
+// the constant could hold, and measurably so: setting it to 1*hpkeKdfNh, a 255 fold
+// under estimate, leaves the whole package green, as does 254*hpkeKdfNh. Only 256*
+// failed, and only because crypto/hkdf enforces its own limit.
+//
+// So the constant is asserted here against the library it exists to describe rather than
+// against the guard that reads it. RFC 5869 section 2.3 stops the expansion counter at
+// 255 and crypto/hkdf implements exactly that, so 255*Nh is the largest length the kdf
+// will serve and 255*Nh+1 is the smallest it refuses. A ceiling that drifted tighter
+// fails on the reject half, because the kdf still serves that length; one that drifted
+// looser fails on the accept half, because the kdf will not serve it.
+//
+// Calling hkdf here is allowed and was checked against crypto_forbidden_test.go rather
+// than assumed: the confinement gate's needle is hkdf.Extract( and not hkdf.Expand(, and
+// it runs over productionSources, which drops every _test.go file.
+func TestHpkeExpandCeilingIsTheLibrarysOwnBoundary(t *testing.T) {
+	prk := make([]byte, hpkeKdfNh)
+	out, err := hkdf.Expand(sha256.New, prk, "ceiling", hpkeMaxExpandLength)
+	if err != nil {
+		t.Errorf("the kdf refused %d bytes, so the ceiling sits above what it will serve: %v", hpkeMaxExpandLength, err)
+	} else if len(out) != hpkeMaxExpandLength {
+		t.Errorf("the kdf returned %d bytes for a request of %d", len(out), hpkeMaxExpandLength)
+	}
+	if _, err := hkdf.Expand(sha256.New, prk, "ceiling", hpkeMaxExpandLength+1); err == nil {
+		t.Errorf("the kdf served %d bytes, so the ceiling sits below what it will serve", hpkeMaxExpandLength+1)
+	}
+}
+
 // TestHpkeExpandCeilingMatchesTheRegistry keeps the constant the guard above is written
 // against from drifting away from the suites it guards. hpkeMaxExpandLength is 255 times
 // the kdf output size, and it is stated once for HMAC-SHA256 rather than read per suite;
 // a third suite whose Nh was not 32 would make it wrong for that suite without changing a
 // line of hpke.go.
+//
+// Both halves are needed and neither implies the other. The Nh check catches a suite that
+// arrived with a different kdf output; the ceiling check catches the constant being
+// restated as anything but 255 times it — which is what this test was named for and did
+// not do, since its body mentioned only Nh.
 func TestHpkeExpandCeilingMatchesTheRegistry(t *testing.T) {
 	suites := Suites()
 	if len(suites) == 0 {
@@ -346,6 +384,9 @@ func TestHpkeExpandCeilingMatchesTheRegistry(t *testing.T) {
 		}
 		if params.Nh != hpkeKdfNh {
 			t.Errorf("suite %#04x has Nh %d, the expand ceiling assumes %d", uint16(suite), params.Nh, hpkeKdfNh)
+		}
+		if hpkeMaxExpandLength != 255*params.Nh {
+			t.Errorf("suite %#04x has Nh %d, so its expand ceiling is %d, but the constant is %d", uint16(suite), params.Nh, 255*params.Nh, hpkeMaxExpandLength)
 		}
 	}
 }
