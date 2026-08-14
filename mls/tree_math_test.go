@@ -257,8 +257,9 @@ func TestFullLeafCountAndDepth(t *testing.T) {
 		// it; one above has no enclosing tree at all.
 		{leafCount: MaxLeafCount - 1, full: false, depth: 31, fullLeafCount: MaxLeafCount},
 		{leafCount: MaxLeafCount, full: true, depth: 31, fullLeafCount: MaxLeafCount},
-		// the plan wrote depth 31 for the two rows below and its own
-		// implementation answers 32, so the plan's test failed the plan's code.
+		// the plan carried the first of the two rows below and wrote depth 31 for
+		// it, while its own implementation answers 32: the plan's test failed the
+		// plan's code, which is how this was found.
 		// 32 is the value to keep. bits.Len32 of anything from 2^31 up is 32,
 		// LeafCount is a uint32, and Go defines a shift past the width of the
 		// type as zero rather than a panic — so a depth of 32 makes 1 << depth
@@ -325,6 +326,41 @@ func TestFullLeafCountAndDepth(t *testing.T) {
 			if got := FullLeafCount(above); got != leafCount*2 {
 				t.Errorf("%d leaves full count: %d, want %d", above, got, leafCount*2)
 			}
+		}
+	}
+
+	// everything above asserts edges: a power of two, the count either side of
+	// it, and the ends of the range. a version wrong strictly inside a doubling
+	// band and right at both of its ends passes all of it, and measured, one
+	// wrong across 600 to 1000 did — no row and no sweep above enters that band.
+	//
+	// so the low range is checked exhaustively against an independent oracle.
+	// the oracle is the RFC's own statement, that the tree doubles until it
+	// holds the count, rather than a second bit trick, so it agrees with the
+	// implementation only if both are right. it stops at 2^22 to keep this test
+	// in the tens of milliseconds; above that the power-of-two sweep and the
+	// literal rows are what hold.
+	//
+	// this does make most of the literal rows redundant against a wrong
+	// implementation, which is worth stating plainly rather than claiming every
+	// row is load-bearing. they are not redundant against a wrong test: their
+	// expectations are constants and the two sweeps compute theirs, so a bug in
+	// an oracle is caught by the rows and never by itself.
+	wantDepth := uint32(0)
+	wantFullLeafCount := LeafCount(1)
+	for leafCount := LeafCount(1); leafCount <= 1<<22; leafCount += 1 {
+		if leafCount > wantFullLeafCount {
+			wantFullLeafCount *= 2
+			wantDepth += 1
+		}
+		if got := TreeDepth(leafCount); got != wantDepth {
+			t.Fatalf("%d leaves depth: %d, want %d", leafCount, got, wantDepth)
+		}
+		if got := FullLeafCount(leafCount); got != wantFullLeafCount {
+			t.Fatalf("%d leaves full count: %d, want %d", leafCount, got, wantFullLeafCount)
+		}
+		if want := leafCount == wantFullLeafCount; IsFullLeafCount(leafCount) != want {
+			t.Fatalf("%d leaves full: %v, want %v", leafCount, !want, want)
 		}
 	}
 }
@@ -519,9 +555,11 @@ func TestExtendAndTruncate(t *testing.T) {
 	}
 
 	// a leaf index at or past MaxLeafCount sits in no representable tree. the
-	// plan asserted neither of these, so nothing in it reached the refusal at
-	// all, and a version with the guard deleted answered MaxLeafCount for every
-	// one of them.
+	// plan asserted none of these, so nothing in it reached the refusal at all.
+	// measured, with the guard deleted: the two just past MaxLeafCount answer a
+	// tree of zero leaves, and 0xFFFFFFFF answers a tree of one — the largest
+	// leaf index the type can hold, silently naming the smallest tree there is,
+	// because the count wraps to zero before the depth is taken.
 	badLeaves := []LeafIndex{LeafIndex(MaxLeafCount), LeafIndex(MaxLeafCount) + 1, 0xFFFFFFFF}
 	for _, badLeaf := range badLeaves {
 		got, err := TruncatedLeafCount(badLeaf)
@@ -571,6 +609,25 @@ func TestExtendAndTruncate(t *testing.T) {
 		}
 		if grown != extended {
 			t.Errorf("truncate to leaf %d: %d leaves, want the extension of %d, %d", firstNewLeaf, grown, leafCount, extended)
+		}
+	}
+
+	// truncation, exhaustively, against the same independent oracle the sizing
+	// test uses: the smallest tree that still holds the leaf, reached by
+	// doubling rather than by a bit trick. every case above sits at a power of
+	// two or next to one, and a version wrong only in the middle of a band
+	// passes all of them.
+	wantLeafCount := LeafCount(1)
+	for leaf := LeafIndex(0); leaf < 1<<22; leaf += 1 {
+		if LeafCount(leaf) >= wantLeafCount {
+			wantLeafCount *= 2
+		}
+		got, err := TruncatedLeafCount(leaf)
+		if err != nil {
+			t.Fatalf("truncate to leaf %d: %v", leaf, err)
+		}
+		if got != wantLeafCount {
+			t.Fatalf("truncate to leaf %d: %d leaves, want %d", leaf, got, wantLeafCount)
 		}
 	}
 }
