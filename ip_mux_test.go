@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -13,9 +14,61 @@ import (
 
 // a recorder for sent (upstream) and received (downstream) packets
 type ipMuxRecorder struct {
-	mu       sync.Mutex
-	sent     [][]byte
-	received [][]byte
+	mu                 sync.Mutex
+	sent               [][]byte
+	received           [][]byte
+	receivedBatchCount int
+}
+
+// A batch upstream recorder consumes exact-flow groups without a route.
+type ipMuxBatchUpstreamRecorder struct {
+	groups [][]string
+}
+
+// Singular sends are not expected in the exact-flow regression.
+func (self *ipMuxBatchUpstreamRecorder) SendPacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packet []byte,
+	timeout time.Duration,
+) bool {
+	return false
+}
+
+// Copies payload observations and consumes every packet in the group.
+func (self *ipMuxBatchUpstreamRecorder) sendPacketGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool {
+	payloads := []string{}
+	for _, packet := range group.packets {
+		_, payload, err := ParseIpPathWithPayload(packet)
+		if err != nil {
+			panic(err)
+		}
+		payloads = append(payloads, string(payload))
+		MessagePoolReturn(packet)
+	}
+	self.groups = append(self.groups, payloads)
+	return true
+}
+
+// The recorder copies borrowed packets and records the number of boundary
+// calls independently of the packet total.
+func (self *ipMuxRecorder) receivePackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.receivedBatchCount += 1
+	for _, packet := range packets {
+		self.received = append(self.received, append([]byte{}, packet...))
+	}
 }
 
 func (self *ipMuxRecorder) upstream(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
@@ -97,6 +150,80 @@ func TestIpMuxPassthrough(t *testing.T) {
 	}
 }
 
+// A locally claimed send transfers packet ownership to the mux boundary.
+func TestIpMuxClaimedSendReturnsPacketOwnership(t *testing.T) {
+	packet := MessagePoolGet(64)
+	witness := MessagePoolShareReadOnly(packet)
+	mux := &IpMux{
+		onSend: func(
+			source TransferPath,
+			provideMode protocol.ProvideMode,
+			packet []byte,
+			timeout time.Duration,
+		) bool {
+			return true
+		},
+	}
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, packet, 0) {
+		t.Fatal("claimed packet was rejected")
+	}
+	if !MessagePoolReturn(witness) {
+		t.Fatal("claimed send retained packet ownership")
+	}
+}
+
+// One mixed TUN burst crosses the upstream once per exact directional flow,
+// preserving first-seen flow order and packet order within each flow.
+func TestIpMuxSendPacketBatchGroupsDirectionalFlows(t *testing.T) {
+	packets := [][]byte{
+		testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("a1")),
+		testingUdp4Packet("10.0.0.2", "203.0.113.8", 443, []byte("b1")),
+		testingUdp4Packet("10.0.0.1", "203.0.113.7", 443, []byte("a2")),
+	}
+	recorder := &ipMuxBatchUpstreamRecorder{}
+	groupClassificationCount := 0
+	mux := &IpMux{
+		onSend: func(
+			source TransferPath,
+			provideMode protocol.ProvideMode,
+			packet []byte,
+			timeout time.Duration,
+		) bool {
+			t.Fatal("batch path decomposed a homogeneous group")
+			return false
+		},
+	}
+	mux.setOnSendGroup(func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		group *ipPacketGroup,
+		timeout time.Duration,
+	) bool {
+		groupClassificationCount += 1
+		return false
+	})
+	mux.setUpstreamGroupSend(recorder.sendPacketGroup)
+	if sentPacketCount := mux.SendPacketBatch(
+		TransferPath{},
+		protocol.ProvideMode_Network,
+		packets,
+		0,
+	); sentPacketCount != len(packets) {
+		t.Fatalf("sent packets=%d, want %d", sentPacketCount, len(packets))
+	}
+	want := [][]string{{"a1", "a2"}, {"b1"}}
+	if !reflect.DeepEqual(recorder.groups, want) {
+		t.Fatalf("group payloads=%v, want %v", recorder.groups, want)
+	}
+	if groupClassificationCount != len(want) {
+		t.Fatalf(
+			"group classifications=%d, want %d",
+			groupClassificationCount,
+			len(want),
+		)
+	}
+}
+
 func TestIpMuxReceiveDoesNotTrustMisleadingPathDestination(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,6 +266,52 @@ func TestIpMuxReceiveRoutesLocalPacketWithoutPathMetadata(t *testing.T) {
 	mux.Receive(TransferPath{}, protocol.ProvideMode_Network, nil, packet)
 	if _, received := rec.counts(); received != 0 {
 		t.Fatalf("mux-local packet without metadata reached downstream: received=%d, want 0", received)
+	}
+}
+
+// A downstream burst must cross the mux once while retaining ordinary packet
+// order and suppressing duplicate singular delivery.
+func TestIpMuxReceivePacketsBatchesDownstream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &ipMuxRecorder{}
+	mux := NewIpMux(
+		ctx,
+		tun,
+		TransferPath{},
+		protocol.ProvideMode_Network,
+		0,
+		nil,
+		nil,
+		recorder.receive,
+		nil,
+	)
+	defer mux.Close()
+	unsub := mux.AddPacketsReceiver(recorder.receivePackets)
+	defer unsub()
+	packets := [][]byte{
+		newIpMuxIpv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.2")),
+		newIpMuxIpv4Packet(net.ParseIP("1.0.0.1"), net.ParseIP("10.0.0.2")),
+	}
+	mux.ReceivePackets(
+		TransferPath{},
+		protocol.ProvideMode_Network,
+		nil,
+		packets,
+	)
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.receivedBatchCount != 1 || len(recorder.received) != len(packets) {
+		t.Fatalf(
+			"downstream batch calls=%d packets=%d, want 1/%d",
+			recorder.receivedBatchCount,
+			len(recorder.received),
+			len(packets),
+		)
 	}
 }
 

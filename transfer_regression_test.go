@@ -21,11 +21,12 @@ import (
 // ownership rule.
 //
 // The receive sequence buffers consecutive in-order items and dispatches their
-// frames in one callback. A receive callback can panic — a resident tearing
-// down mid-control-processing does exactly that — and the batch must already
-// be out of the sequence's fields when it runs. Otherwise the exit path's
-// flush re-delivers a half-processed batch, or acks frames whose processing
-// failed, and the peer never resends them.
+// frames through one internal callback. That dispatcher can panic after
+// partially dispatching a batch, so the batch must already be out of the
+// sequence's fields when it runs. Otherwise the exit path's flush re-delivers
+// the partial batch or acks frames whose dispatch failed. Client.receive
+// separately isolates each registered application callback panic; the direct
+// callback here models a failure outside that isolation boundary.
 //
 // Without the fix (batch cleared only after the callback returns) the panicking
 // batch is still buffered, so the second flush re-delivers it and this fails.
@@ -73,6 +74,76 @@ func TestFlushDeliverReleasesBatchBeforeCallback(t *testing.T) {
 	}()
 	if deliveries != 1 {
 		t.Fatalf("batch delivered %d times, want exactly 1", deliveries)
+	}
+}
+
+// Application callback failures are isolated at the real Client.receive
+// dispatch boundary. A failed observer cannot suppress later observers, and
+// callback completion still constitutes transport delivery, so flushDeliver
+// advances the reliable item's ACK window. This uses the exact cached callback
+// installed in production ReceivePacks; injecting a raw callback into the item
+// would bypass the behavior under test.
+func TestFlushDeliverProductionDispatcherIsolatesApplicationPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &Client{
+		log:              NewNoopLogger(),
+		receiveCallbacks: NewCallbackList[ReceiveFunction](),
+	}
+	client.receiveCallback = client.receive
+
+	panickingCallbackCalled := false
+	client.AddReceiveCallback(func(TransferPath, []*protocol.Frame, Peer) {
+		panickingCallbackCalled = true
+		panic("application callback failed")
+	})
+	laterCallbackCalled := false
+	client.AddReceiveCallback(func(TransferPath, []*protocol.Frame, Peer) {
+		laterCallbackCalled = true
+	})
+
+	sequenceNumber := uint64(7)
+	messageId := NewId()
+	frame := &protocol.Frame{MessageType: protocol.MessageType_TransferExchangeSignals}
+	seq := NewReceiveSequence(
+		ctx,
+		client,
+		SourceId(NewId()),
+		NewId(),
+		sequenceTlsRoleServer,
+		false,
+		DefaultReceiveBufferSettings(),
+	)
+	seq.deliverItems = []*receiveItem{
+		{
+			transferItem: transferItem{
+				messageId:      messageId,
+				sequenceNumber: sequenceNumber,
+			},
+			receiveCallback: client.receiveCallback,
+			ack:             true,
+		},
+	}
+	seq.deliverFrames = []*protocol.Frame{frame}
+
+	seq.flushDeliver()
+
+	if !panickingCallbackCalled {
+		t.Fatal("panicking application callback was not dispatched")
+	}
+	if !laterCallbackCalled {
+		t.Fatal("application callback panic suppressed a later callback")
+	}
+	ackSnapshot := seq.ackWindow.Snapshot(true)
+	if ackSnapshot.ackUpdateCount != 1 {
+		t.Fatalf("ACK update count = %d, want 1", ackSnapshot.ackUpdateCount)
+	}
+	if ackSnapshot.headAck.sequenceNumber != sequenceNumber {
+		t.Fatalf("ACK sequence number = %d, want %d", ackSnapshot.headAck.sequenceNumber, sequenceNumber)
+	}
+	if ackSnapshot.headAck.messageId != messageId {
+		t.Fatalf("ACK message id = %s, want %s", ackSnapshot.headAck.messageId, messageId)
 	}
 }
 
@@ -260,7 +331,7 @@ func TestSelectiveAckPauseKeepsAProbeScheduled(t *testing.T) {
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: []byte("probe"),
 	}
-	if !client.SendWithTimeout(frame, DestinationId(peerId), nil, 5*time.Second) {
+	if !client.SendWithTimeout(frame, peerId, nil, 5*time.Second) {
 		t.Fatal("send failed")
 	}
 
@@ -390,7 +461,7 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
-		s.EncryptionSettings.Encrypt = true
+		s.EncryptionSettings.Mode = EncryptionModeOpportunistic
 		s.EncryptionSettings.TlsTimeout = 30 * time.Second
 		s.EncryptionSettings.EncryptionControlUseCompanion = false
 		// a fast cadence against a much longer assertion window, so the test
@@ -443,7 +514,7 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 		send := func(client *Client, dst Id, label string) {
 			m := &protocol.SimpleMessage{Content: label}
 			if frame, err := ToFrame(m, DefaultProtocolVersion); err == nil {
-				client.Send(frame, DestinationId(dst), func(error) {})
+				client.Send(frame, dst, func(error) {})
 			}
 		}
 		for i := 0; ; i += 1 {

@@ -14,12 +14,12 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 	defer cancel()
 
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Encrypt = false
+	settings.EncryptionSettings.Mode = EncryptionModeOff
 	sender := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer sender.Cancel()
 
 	receiverSettings := DefaultClientSettings()
-	receiverSettings.EncryptionSettings.Encrypt = false
+	receiverSettings.EncryptionSettings.Mode = EncryptionModeOff
 	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 	defer receiver.Cancel()
 
@@ -68,7 +68,7 @@ func TestSendMultiWithTimeoutDeliversOneBatchAndOneAck(t *testing.T) {
 	var ackCount atomic.Int32
 	if !sender.SendMultiWithTimeout(
 		frames,
-		DestinationId(receiver.ClientId()),
+		receiver.ClientId(),
 		func(err error) {
 			ackCount.Add(1)
 			ack <- err

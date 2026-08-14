@@ -59,9 +59,15 @@ const TransportVersion = 2
 const DebugCloseSend = false
 
 // The platform WebSocket writer combines only messages already waiting on its
-// bounded route. Four production-safe transfer frames fit in one 16 KiB TLS
-// record, reducing write syscalls without adding a batching delay.
-const platformWebSocketWriteBatchMaxMessages = 4
+// bounded route. Eight ordinary transfer frames remain below the wrapper's
+// 16 KiB retained-byte bound, reducing write syscalls without adding a
+// batching delay. Oversized frames flush through the same bounded wrapper.
+const platformWebSocketWriteBatchMaxMessages = 8
+
+const (
+	platformH3WriteBatchMaxMessageCount = 16
+	platformH3WriteBatchMaxByteCount    = 64 * 1024
+)
 
 type TransportControl = byte
 
@@ -245,6 +251,13 @@ type PlatformTransportSettings struct {
 	WriteTimeout         time.Duration
 	ReadTimeout          time.Duration
 	TransportGenerator   func() (sendTransport Transport, receiveTransport Transport)
+	// SendRouteObserver exposes route ownership to deterministic integration
+	// harnesses. It must not block. Nil retains normal production behavior.
+	SendRouteObserver func(transport Transport, route Route, connected bool)
+	// AuthFrameObserver borrows the exact pooled authentication frame before
+	// transport I/O. Tests may retain it to prove lifecycle ownership. It must
+	// not block; nil retains normal production behavior.
+	AuthFrameObserver    func(authFrameBytes []byte)
 	TransportBufferSize  int
 	InactiveDrainTimeout time.Duration
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
@@ -264,6 +277,22 @@ type PlatformTransportSettings struct {
 	FramerSettings *FramerSettings
 
 	PtDnsSlowMultiple int
+
+	// H3PacketConnFactory, when set, creates the UDP endpoint for a plain H3
+	// dial. Tests use it to place QUIC below a userspace network model. Nil
+	// retains the host UDP socket and physical-egress binding path. The
+	// platform transport owns and closes every returned endpoint.
+	H3PacketConnFactory func(context.Context) (net.PacketConn, error)
+
+	// Nil outside package tests. A barrier here can hold the exact seam after
+	// logical route removal and before connection and writer cleanup.
+	afterRoutesRemovedForTest func()
+	// Nil outside package tests. A barrier here can hold a receive worker before
+	// it releases channel and pooled-message ownership.
+	beforeReceiveWorkerCleanupForTest func()
+	// Nil outside package tests. The observer borrows one H3 receive message
+	// after the channel accepts its ownership.
+	afterH3ReceiveEnqueueForTest func([]byte)
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -305,6 +334,11 @@ type PlatformTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
+	// done closes after run joins every mode runner and its connection workers.
+	done chan struct{}
+
+	// runWaitGroup owns the mode runners started synchronously by run.
+	runWaitGroup sync.WaitGroup
 
 	clientStrategy *ClientStrategy
 	routeManager   *RouteManager
@@ -353,6 +387,31 @@ type PlatformTransport struct {
 	// unsubNetworkChange removes this transport from the process
 	// network-change listeners when the run loop exits.
 	unsubNetworkChange func()
+}
+
+// newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
+// testable. DPLPMTUD remains enabled so a validated path can grow beyond the
+// conservative initial packet and adapt after migration without fragmentation.
+func newPlatformQuicConfig(
+	settings *PlatformTransportSettings,
+	slowMultiple int,
+) *quic.Config {
+	return &quic.Config{
+		HandshakeIdleTimeout: time.Duration(slowMultiple) *
+			(settings.QuicConnectTimeout + settings.QuicHandshakeTimeout),
+		MaxIdleTimeout:    settings.PingTimeout * 4,
+		KeepAlivePeriod:   0,
+		Allow0RTT:         true,
+		InitialPacketSize: 1400,
+		// Pin the receive windows and stream counts. The platform transport
+		// uses one bidirectional stream; the stream counts bound abuse.
+		InitialStreamReceiveWindow:     uint64(kib(256)),
+		MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
+		InitialConnectionReceiveWindow: uint64(kib(512)),
+		MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
+		MaxIncomingStreams:             8,
+		MaxIncomingUniStreams:          8,
+	}
 }
 
 // Kick closes the transport's live connection (if any) and skips any pending
@@ -444,6 +503,7 @@ func NewPlatformTransportWithTargetMode(
 		ctx:    cancelCtx,
 		cancel: cancel,
 		log:    log,
+		done:   make(chan struct{}),
 		// cancel: func() {
 		// 	select {
 		// 	case <- ctx.Done():
@@ -471,6 +531,7 @@ func NewPlatformTransportWithTargetMode(
 	// owners tear transports down by canceling the client ctx.
 	transport.unsubNetworkChange = AddNetworkChangeListener(transport.Kick)
 	go HandleError(func() {
+		defer close(transport.done)
 		defer transport.unsubNetworkChange()
 		transport.run()
 	}, cancel)
@@ -558,15 +619,18 @@ func modePreference(mode TransportMode) int {
 }
 
 func (self *PlatformTransport) run() {
-	defer self.cancel()
+	defer func() {
+		self.cancel()
+		self.runWaitGroup.Wait()
+	}()
 
 	// TODO udp protocols need proxy protocol support in the load balancer
 	// see https://github.com/nginx/nginx/issues/1061
 	switch self.targetMode {
 	case TransportModeAuto:
-		go HandleError(func() {
+		self.startModeRunner(func() {
 			self.runH1(0)
-		}, self.cancel)
+		})
 		// go HandleError(func() {
 		// 	self.runH3(TransportModeH3, 0, 1)
 		// }, self.cancel)
@@ -577,21 +641,21 @@ func (self *PlatformTransport) run() {
 		// 	self.runH3(TransportModeH3DnsPump, self.settings.ModeInitialDelay*2, self.settings.PtDnsSlowMultiple)
 		// }, self.cancel)
 	case TransportModeH3:
-		go HandleError(func() {
+		self.startModeRunner(func() {
 			self.runH3(TransportModeH3, 0, 1)
-		}, self.cancel)
+		})
 	case TransportModeH1:
-		go HandleError(func() {
+		self.startModeRunner(func() {
 			self.runH1(0)
-		}, self.cancel)
+		})
 	case TransportModeH3Dns:
-		go HandleError(func() {
+		self.startModeRunner(func() {
 			self.runH3(TransportModeH3Dns, 0, self.settings.PtDnsSlowMultiple)
-		}, self.cancel)
+		})
 	case TransportModeH3DnsPump:
-		go HandleError(func() {
+		self.startModeRunner(func() {
 			self.runH3(TransportModeH3DnsPump, 0, self.settings.PtDnsSlowMultiple)
-		}, self.cancel)
+		})
 	}
 
 	for {
@@ -642,6 +706,16 @@ func (self *PlatformTransport) run() {
 			return
 		}
 	}
+}
+
+// Starts one owned mode runner. All runners are registered before run can
+// reach its cancellation wait, so Wait never races a later Add.
+func (self *PlatformTransport) startModeRunner(run func()) {
+	self.runWaitGroup.Add(1)
+	go HandleError(func() {
+		defer self.runWaitGroup.Done()
+		run()
+	}, self.cancel)
 }
 
 // returns true is other is better than current
@@ -735,6 +809,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					return nil, err
 				}
 				defer MessagePoolReturn(authBytes)
+				if self.settings.AuthFrameObserver != nil {
+					self.settings.AuthFrameObserver(authBytes)
+				}
 
 				ws.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout))
 				if err := ws.WriteMessage(websocket.BinaryMessage, authBytes); err != nil {
@@ -846,12 +923,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
+			// The connection owns every worker it starts. Registration happens
+			// synchronously before cleanup can Wait, and the outer wrapper keeps
+			// panic rescue handlers inside the owned lifetime.
+			var connectionWaitGroup sync.WaitGroup
+			startConnectionWorker := func(run func(), handlers ...any) {
+				connectionWaitGroup.Add(1)
+				go func() {
+					defer connectionWaitGroup.Done()
+					HandleError(run, handlers...)
+				}()
+			}
+
 			// a network-change kick closes this connection so the loop
 			// re-dials over the new path immediately (see Kick). the ws.Close
 			// is what unblocks a reader/writer parked in a socket call that
 			// handleCancel alone cannot wake.
 			kick := self.kickMonitor.NotifyChannel()
-			go HandleError(func() {
+			startConnectionWorker(func() {
 				select {
 				case <-handleCtx.Done():
 				case <-kick:
@@ -889,7 +978,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if DebugCloseSend {
 				// use zero buffer here so that the transport can stop accepting and not drop messages
 				exportedSend = make(chan []byte)
-				go HandleError(func() {
+				startConnectionWorker(func() {
 					defer func() {
 						handleCancel()
 						close(send)
@@ -932,37 +1021,35 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
+			if self.settings.SendRouteObserver != nil {
+				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
+			}
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 			self.setRegistered(true)
 
-			// scoped to the writer goroutine; canceled when it exits so the
-			// outer defer can drain `send` without racing the writer.
-			writerCtx, writerCancel := context.WithCancel(context.Background())
 			defer func() {
 				self.setRegistered(false)
 				self.routeManager.RemoveTransport(sendTransport)
+				if self.settings.SendRouteObserver != nil {
+					self.settings.SendRouteObserver(sendTransport, exportedSend, false)
+				}
 				self.routeManager.RemoveTransport(receiveTransport)
+				if self.settings.afterRoutesRemovedForTest != nil {
+					self.settings.afterRoutesRemovedForTest()
+				}
 				handleCancel()
-				// Close the socket before waiting for the writer. A context
-				// cancellation does not interrupt a goroutine already blocked
-				// in net.Conn.Write. Waiting first inverted that dependency:
-				// window-client removal, app disconnect, and migration could
-				// remain stuck until WriteTimeout, retaining the old transport
-				// and all of its queues. The outer deferred Close remains as an
-				// idempotent backstop for exits before routes are registered.
+				// Close the socket before joining workers. Context cancellation
+				// cannot interrupt a goroutine already blocked in socket I/O.
 				ws.Close()
-				// once the writer has exited and no new writes can be routed,
-				// drain any pooled messages still sitting in send. a stale
-				// reflect.Select in MultiRouteSelector that captured our
-				// route snapshot may still resolve after RemoveTransport;
-				// drain again briefly to catch any final messages.
-				<-writerCtx.Done()
-				drain(send)
-				time.Sleep(time.Millisecond)
+				// Route removal joins admitted selector writes. Joining every
+				// connection worker then closes the remaining reader, watcher,
+				// and socket-writer ownership before completion is published.
+				connectionWaitGroup.Wait()
+				// No producer can enqueue after the join, so one deterministic
+				// drain releases every pooled message still sitting in send.
 				drain(send)
 			}()
-
-			go HandleError(func() {
+			startConnectionWorker(func() {
 				defer handleCancel()
 
 				for {
@@ -990,8 +1077,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}, handleCancel)
 
-			go HandleError(func() {
-				defer writerCancel()
+			startConnectionWorker(func() {
 				defer handleCancel()
 
 				speedTest := false
@@ -1036,7 +1122,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 
 				writeBatchConn, _ :=
-					ws.UnderlyingConn().(*webSocketWriteBatchConn)
+					ws.UnderlyingConn().(*WebSocketWriteBatchConn)
 				writeReadySendBatch := func(
 					firstMessage []byte,
 				) (sendOpen bool, err error) {
@@ -1046,9 +1132,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-					writeBatchConn.beginWriteBatch()
+					writeBatchConn.BeginWriteBatch()
 					if err = writeSendMessage(firstMessage); err != nil {
-						writeBatchConn.abortWriteBatch()
+						writeBatchConn.AbortWriteBatch()
 						return true, err
 					}
 
@@ -1057,7 +1143,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					for range platformWebSocketWriteBatchMaxMessages - 1 {
 						select {
 						case <-handleCtx.Done():
-							writeBatchConn.abortWriteBatch()
+							writeBatchConn.AbortWriteBatch()
 							return false, nil
 						case message, ok := <-send:
 							if !ok {
@@ -1065,14 +1151,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								break drainReady
 							}
 							if err = writeSendMessage(message); err != nil {
-								writeBatchConn.abortWriteBatch()
+								writeBatchConn.AbortWriteBatch()
 								return true, err
 							}
 						default:
 							break drainReady
 						}
 					}
-					if err = writeBatchConn.flushWriteBatch(); err != nil {
+					if err = writeBatchConn.FlushWriteBatch(); err != nil {
 						// A WebSocket write timeout or partial TLS write cannot
 						// be recovered; the transfer sequence retains each
 						// item and retries it over the replacement route.
@@ -1166,8 +1252,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}, handleCancel)
 
-			go HandleError(func() {
+			startConnectionWorker(func() {
 				defer func() {
+					if self.settings.beforeReceiveWorkerCleanupForTest != nil {
+						self.settings.beforeReceiveWorkerCleanupForTest()
+					}
 					handleCancel()
 					close(receive)
 					close(controlSend)
@@ -1341,16 +1430,6 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 	clientId, _ := self.auth.ClientId()
 
-	authBytes, err := EncodeFrame(&protocol.Auth{
-		ByJwt:      self.auth.ByJwt,
-		AppVersion: self.auth.AppVersion,
-		InstanceId: self.auth.InstanceId.Bytes(),
-	}, self.settings.ProtocolVersion)
-	if err != nil {
-		return
-	}
-	defer MessagePoolReturn(authBytes)
-
 	if 0 < initialTimeout {
 		select {
 		case <-self.ctx.Done():
@@ -1385,36 +1464,32 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 
 		type ConnStream struct {
-			conn   *quic.Conn
-			stream *quic.Stream
+			conn          *quic.Conn
+			stream        *quic.Stream
+			packetConn    net.PacketConn
+			quicTransport *quic.Transport
 		}
 
 		connect := func() (*ConnStream, error) {
 			// quicConfig := &quic.Config{
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
+			authBytes, err := EncodeFrame(&protocol.Auth{
+				ByJwt:      self.auth.ByJwt,
+				AppVersion: self.auth.AppVersion,
+				InstanceId: self.auth.InstanceId.Bytes(),
+			}, self.settings.ProtocolVersion)
+			if err != nil {
+				return nil, err
+			}
+			defer MessagePoolReturn(authBytes)
+			if self.settings.AuthFrameObserver != nil {
+				self.settings.AuthFrameObserver(authBytes)
+			}
 
 			success := false
 
-			quicConfig := &quic.Config{
-				HandshakeIdleTimeout:    time.Duration(slowMultiple) * (self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout),
-				MaxIdleTimeout:          self.settings.PingTimeout * 4,
-				KeepAlivePeriod:         0,
-				Allow0RTT:               true,
-				DisablePathMTUDiscovery: true,
-				InitialPacketSize:       1400,
-				// pin the receive windows and stream counts. the library
-				// defaults allow ~15mib per connection plus ~6mib per stream;
-				// the max windows are per connection, so scaled by the memory
-				// budget. the platform transport uses one bidirectional
-				// stream, so the stream counts only bound abuse.
-				InitialStreamReceiveWindow:     uint64(kib(256)),
-				MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
-				InitialConnectionReceiveWindow: uint64(kib(512)),
-				MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
-				MaxIncomingStreams:             8,
-				MaxIncomingUniStreams:          8,
-			}
+			quicConfig := newPlatformQuicConfig(self.settings, slowMultiple)
 			var tlsConfig *tls.Config
 			if self.settings.QuicTlsConfig != nil {
 				// copy
@@ -1424,22 +1499,43 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}
 
 			var packetConn net.PacketConn
-
-			udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			var udpConn *net.UDPConn
+			// an injected endpoint owns its own routing, so only the host UDP
+			// socket is pinned to the physical egress interface.
+			egressPinned := false
+			if ptMode == TransportModeH3 && self.settings.H3PacketConnFactory != nil {
+				packetConn, err = self.settings.H3PacketConnFactory(self.ctx)
+			} else {
+				udpConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+				if err == nil {
+					// bind to the physical egress interface so the platform
+					// QUIC connection never loops into the tunnel this process
+					// provides (R1); a no-op off Windows and when no egress
+					// index is set. a bind failure is not fatal -- the
+					// connection is still worth attempting -- but it must not
+					// be silent: an unpinned socket here follows the route
+					// table into our own tun and blackholes, which is
+					// indistinguishable from a dead network unless someone
+					// says so.
+					egressPinned = egressBound()
+					if bindErr := applyEgress(udpConn); bindErr != nil {
+						egressPinned = false
+						self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", bindErr)
+					}
+					packetConn = udpConn
+				}
+			}
 			if err != nil {
+				// A factory can return a usable endpoint together with an error.
+				// Ownership transfers on every non-nil return, including this
+				// rejected result.
+				if packetConn != nil {
+					packetConn.Close()
+				}
 				return nil, err
 			}
-			// bind to the physical egress interface so the platform QUIC
-			// connection never loops into the tunnel this process provides
-			// (R1); a no-op off Windows and when no egress index is set.
-			// not fatal -- the connection is still worth attempting -- but it
-			// must not be silent: an unpinned socket here follows the route
-			// table into our own tun and blackholes, which is indistinguishable
-			// from a dead network unless someone says so.
-			egressPinned := egressBound()
-			if err := applyEgress(udpConn); err != nil {
-				egressPinned = false
-				self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", err)
+			if packetConn == nil {
+				return nil, fmt.Errorf("H3 packet connection factory returned nil")
 			}
 			// single close path: once packetConn is bound (either directly
 			// to udpConn or wrapping it via packetTranslation), it owns the
@@ -1452,7 +1548,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 				if packetConn != nil {
 					packetConn.Close()
-				} else {
+				} else if udpConn != nil {
 					udpConn.Close()
 				}
 			}()
@@ -1500,10 +1596,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				if err != nil {
 					return nil, err
 				}
-				packetConn = udpConn
 			}
 
-			self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", udpAddr, serverName, udpConn.LocalAddr(), egressPinned)
+			// packetConn, not udpConn: an injected endpoint has no host socket,
+			// and a packet translation reports the address of the one it wraps.
+			self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", udpAddr, serverName, packetConn.LocalAddr(), egressPinned)
 
 			tlsConfig.ServerName = serverName
 			quicTransport := &quic.Transport{
@@ -1511,6 +1608,11 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				// createdConn: true,
 				// isSingleUse: true,
 			}
+			defer func() {
+				if !success {
+					quicTransport.Close()
+				}
+			}()
 			conn, err := quicTransport.DialEarly(self.ctx, udpAddr, tlsConfig, quicConfig)
 
 			// conn, err := quic.Dial(self.ctx, packetConn, packetConn.ConnectedAddr(), self.settings.QuicTlsConfig, quicConfig)
@@ -1550,8 +1652,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 
 			success = true
 			return &ConnStream{
-				conn:   conn,
-				stream: stream,
+				conn:          conn,
+				stream:        stream,
+				packetConn:    packetConn,
+				quicTransport: quicTransport,
 			}, nil
 		}
 
@@ -1634,6 +1738,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 		stream := connStream.stream
 
 		c := func() {
+			defer connStream.packetConn.Close()
+			defer connStream.quicTransport.Close()
 			defer conn.CloseWithError(0, "")
 
 			self.setModeAvailable(ptMode, true)
@@ -1642,12 +1748,24 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
+			// The connection owns every worker it starts. Registration happens
+			// synchronously before cleanup can Wait, and the outer wrapper keeps
+			// panic rescue handlers inside the owned lifetime.
+			var connectionWaitGroup sync.WaitGroup
+			startConnectionWorker := func(run func(), handlers ...any) {
+				connectionWaitGroup.Add(1)
+				go func() {
+					defer connectionWaitGroup.Done()
+					HandleError(run, handlers...)
+				}()
+			}
+
 			// a network-change kick closes this connection so the loop
 			// re-dials over the new path immediately (see Kick). closing the
 			// QUIC connection is what unblocks a reader/writer parked in a
 			// stream call that handleCancel alone cannot wake.
 			kick := self.kickMonitor.NotifyChannel()
-			go HandleError(func() {
+			startConnectionWorker(func() {
 				select {
 				case <-handleCtx.Done():
 				case <-kick:
@@ -1691,34 +1809,82 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			}
 
 			self.routeManager.UpdateTransport(sendTransport, []Route{send})
+			if self.settings.SendRouteObserver != nil {
+				self.settings.SendRouteObserver(sendTransport, send, true)
+			}
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 			self.setRegistered(true)
 
-			// scoped to the writer goroutine; canceled when it exits so the
-			// outer defer can drain `send` without racing the writer.
-			h3WriterCtx, h3WriterCancel := context.WithCancel(context.Background())
 			defer func() {
 				self.setRegistered(false)
 				self.routeManager.RemoveTransport(sendTransport)
+				if self.settings.SendRouteObserver != nil {
+					self.settings.SendRouteObserver(sendTransport, send, false)
+				}
 				self.routeManager.RemoveTransport(receiveTransport)
+				if self.settings.afterRoutesRemovedForTest != nil {
+					self.settings.afterRoutesRemovedForTest()
+				}
 				handleCancel()
-				// Like the websocket path, a QUIC stream write already in the
-				// kernel does not observe context cancellation. Break the
-				// connection before joining the writer so teardown is bounded
-				// by local scheduling rather than the write deadline.
+				// Like the websocket path, break blocked socket I/O before
+				// joining every owned connection worker.
 				conn.CloseWithError(0, "transport teardown")
-				// note `send` is not closed. drain any pooled bytes still
-				// queued after the writer exits and RemoveTransport has
-				// stopped new route writes. a stale reflect.Select may
-				// still resolve after RemoveTransport; drain again briefly
-				// to catch any final messages.
-				<-h3WriterCtx.Done()
+				connectionWaitGroup.Wait()
+				// Route removal and the worker join leave no producer that can
+				// enqueue after these deterministic pooled-message drains.
 				drain(send)
-				time.Sleep(time.Millisecond)
-				drain(send)
+				drain(receive)
 			}()
+			writeBatchStorage := make([]byte, platformH3WriteBatchMaxByteCount)
+			writeReadySendBatch := func(
+				firstMessage []byte,
+			) (sendOpen bool, pendingMessage []byte, err error) {
+				var messageStorage [platformH3WriteBatchMaxMessageCount][]byte
+				messages := messageStorage[:1]
+				messages[0] = firstMessage
+				batchByteCount := len(firstMessage) + 4
+				sendOpen = true
+			drainReady:
+				for len(messages) < cap(messages) {
+					select {
+					case <-handleCtx.Done():
+						sendOpen = false
+						break drainReady
+					case message, ok := <-send:
+						if !ok {
+							sendOpen = false
+							break drainReady
+						}
+						framedByteCount := len(message) + 4
+						if platformH3WriteBatchMaxByteCount < batchByteCount+framedByteCount {
+							pendingMessage = message
+							break drainReady
+						}
+						messages = append(messages, message)
+						batchByteCount += framedByteCount
+					default:
+						break drainReady
+					}
+				}
 
-			go HandleError(func() {
+				stream.SetWriteDeadline(
+					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
+				)
+				err = framer.WriteBatchWithStorage(
+					stream,
+					messages,
+					writeBatchStorage,
+				)
+				for _, message := range messages {
+					MessagePoolReturn(message)
+				}
+				if err == nil {
+					writeCounter.Add(uint64(len(messages)))
+				}
+				return
+			}
+
+			startConnectionWorker(func() {
 				defer handleCancel()
 
 				for {
@@ -1746,28 +1912,46 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 			}, handleCancel)
 
-			go HandleError(func() {
-				defer h3WriterCancel()
+			startConnectionWorker(func() {
 				defer handleCancel()
 
 				pingTimer := time.NewTimer(0)
 				defer pingTimer.Stop()
 				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 
+				var pendingMessage []byte
+				defer func() {
+					if pendingMessage != nil {
+						MessagePoolReturn(pendingMessage)
+					}
+				}()
 				for {
-					select {
-					case <-handleCtx.Done():
-						return
-					case message, ok := <-send:
-						if !ok {
+					message := pendingMessage
+					pendingMessage = nil
+					if message == nil {
+						select {
+						case <-handleCtx.Done():
 							return
+						case nextMessage, ok := <-send:
+							if !ok {
+								return
+							}
+							message = nextMessage
+						case <-pingTimer.C:
+							stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+							if err := framer.Write(stream, make([]byte, 0)); err != nil {
+								return
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							continue
 						}
+					}
+					{
 						// if !MessagePoolCheckShared(message) {
 						// 	panic("[t]shared should be set")
 						// }
-						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
-						err := framer.Write(stream, message)
-						MessagePoolReturn(message)
+						sendOpen, nextMessage, err := writeReadySendBatch(message)
+						pendingMessage = nextMessage
 						if err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
 							if ok, suppressed := shouldLogWriteErr(); ok {
@@ -1781,23 +1965,22 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							}
 							return
 						}
+						if !sendOpen {
+							return
+						}
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[ts]%s->\n", clientId)
-						}
-						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
-					case <-pingTimer.C:
-						stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
-						if err := framer.Write(stream, make([]byte, 0)); err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							return
 						}
 						resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 					}
 				}
 			}, handleCancel)
 
-			go HandleError(func() {
+			startConnectionWorker(func() {
 				defer func() {
+					if self.settings.beforeReceiveWorkerCleanupForTest != nil {
+						self.settings.beforeReceiveWorkerCleanupForTest()
+					}
 					handleCancel()
 					close(receive)
 				}()
@@ -1842,6 +2025,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						return
 					case receive <- message:
 						receiveTimer.Stop()
+						if self.settings.afterH3ReceiveEnqueueForTest != nil {
+							self.settings.afterH3ReceiveEnqueueForTest(message)
+						}
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
 						}
@@ -1887,6 +2073,25 @@ func (self *PlatformTransport) Close() {
 	// transport whose owner already considers it dead.
 	if self.unsubNetworkChange != nil {
 		self.unsubNetworkChange()
+	}
+}
+
+// Closes after every mode runner and connection worker has released route,
+// socket, channel, and pooled-message ownership. Close remains nonblocking.
+func (self *PlatformTransport) Done() <-chan struct{} {
+	return self.done
+}
+
+// CloseAndWait cancels the transport and joins its owned mode runners. The
+// caller's context is only a liveness bound; cancellation continues after it
+// returns.
+func (self *PlatformTransport) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-self.done:
+		return nil
 	}
 }
 
