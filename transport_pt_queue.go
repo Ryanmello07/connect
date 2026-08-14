@@ -49,8 +49,15 @@ func newCombineQueue(settings *PacketTranslationSettings) *combineQueue {
 	return cq
 }
 
+// removes every item that was updated at or before minUpdateTime.
+// the boundary is inclusive because updateTime is stamped from time.Now() and
+// callers pass a cutoff sampled from the same clock. with a coarse clock an
+// item stamped just before the cutoff was sampled compares equal to it, and an
+// exclusive boundary would leave that item in the queue until the next call.
+// time.Now() advances every ~500us on Windows, so on that platform the whole
+// tail of a burst can share the cutoff's tick.
 func (self *combineQueue) RemoveOlder(minUpdateTime time.Time) {
-	for 0 < len(self.orderedItems) && self.orderedItems[0].updateTime.Before(minUpdateTime) {
+	for 0 < len(self.orderedItems) && !self.orderedItems[0].updateTime.After(minUpdateTime) {
 		item := heap.Remove(self, 0).(*combineItem)
 
 		delete(self.keyItems, item.key)
@@ -286,11 +293,13 @@ func (self *pumpQueue) RemoveLastN(addr net.Addr, n int) []*pumpItem {
 	return items
 }
 
+// removes every item that was updated at or before minUpdateTime.
+// see combineQueue.RemoveOlder for why the boundary is inclusive.
 func (self *pumpQueue) RemoveOlder(minUpdateTime time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	for 0 < len(self.orderedItems) && self.orderedItems[0].updateTime.Before(minUpdateTime) {
+	for 0 < len(self.orderedItems) && !self.orderedItems[0].updateTime.After(minUpdateTime) {
 		item := heap.Remove(self, 0).(*pumpItem)
 		maxHeap, ok := self.addrMaxHeap[item.addr.String()]
 		if ok {
