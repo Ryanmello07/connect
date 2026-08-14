@@ -30,14 +30,29 @@ const (
 	CipherSuiteX25519ChaCha20Sha256Ed25519  CipherSuite = 0x0003
 )
 
-// Hpke algorithm identifiers, RFC 9180 sections 7.1 to 7.3. Note that the kdf and the
-// aes-128-gcm aead share the value 0x0001 in two different registries, so these are
-// never interchangeable despite comparing equal.
+// Hpke algorithm identifiers, RFC 9180 sections 7.1 to 7.3. Three registries, three
+// types: the kdf HKDF-SHA256 and the aead AES-128-GCM are both 0x0001, in two separate
+// registries, so on a shared uint16 they compare equal and a declaration that wrote one
+// where the other belongs compiled and satisfied every value assertion in this package.
+// Declared distinct, that transposition is a compile error instead.
+//
+// The limit is worth stating, because the types do not say it. hpke.go writes these
+// through binary.BigEndian.AppendUint16, which takes a uint16, and the explicit
+// conversion that demands is exactly where the typing is discarded — so
+// uint16(params.AeadId) in the kdf position of hpkeSuiteId still compiles. These types
+// close the registry declaration hole; the encoder hole stays closed by the appendix A
+// vectors for both suites, where 0x0003 disagrees on the aead and moves every byte.
+type (
+	HpkeKemId  uint16
+	HpkeKdfId  uint16
+	HpkeAeadId uint16
+)
+
 const (
-	HpkeKemX25519HkdfSha256  uint16 = 0x0020
-	HpkeKdfHkdfSha256        uint16 = 0x0001
-	HpkeAeadAes128Gcm        uint16 = 0x0001
-	HpkeAeadChaCha20Poly1305 uint16 = 0x0003
+	HpkeKemX25519HkdfSha256  HpkeKemId  = 0x0020
+	HpkeKdfHkdfSha256        HpkeKdfId  = 0x0001
+	HpkeAeadAes128Gcm        HpkeAeadId = 0x0001
+	HpkeAeadChaCha20Poly1305 HpkeAeadId = 0x0003
 )
 
 // Signature scheme identifier as MLS carries it, from the TLS SignatureScheme
@@ -55,9 +70,9 @@ const SignatureSchemeEd25519 uint16 = 0x0807
 type SuiteParams struct {
 	Suite       CipherSuite
 	Name        string
-	KemId       uint16
-	KdfId       uint16
-	AeadId      uint16
+	KemId       HpkeKemId
+	KdfId       HpkeKdfId
+	AeadId      HpkeAeadId
 	SignatureId uint16
 	Nh          int
 	Nk          int

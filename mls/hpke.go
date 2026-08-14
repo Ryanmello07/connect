@@ -10,12 +10,15 @@
 //
 // Two of the identifiers this file concatenates collide. RFC 9180 section 7.2 gives
 // HKDF-SHA256 the kdf code point 0x0001 and section 7.3 gives AES-128-GCM the aead
-// code point 0x0001, in two separate registries, so writing one where the other
-// belongs compiles and compares equal. Nothing in the type system separates them —
-// both are uint16 — which is why the suite id built here is pinned by vectors from
-// both registered suites rather than by an equality check on a single one: the two
-// agree on the kdf and disagree on the aead, so a transposition that is invisible on
-// 0x0001 moves every derived byte on 0x0003.
+// code point 0x0001, in two separate registries, so the two compare equal. suite.go
+// declares HpkeKdfId and HpkeAeadId as distinct types, which makes a registry entry
+// writing one where the other belongs a compile error — but that does not reach the
+// three appends below. binary.BigEndian.AppendUint16 takes a uint16, and the explicit
+// conversion it demands is exactly where the typing is discarded, so writing
+// uint16(params.AeadId) into the kdf position here still compiles. That is why the
+// suite id is pinned by vectors from both registered suites rather than by an equality
+// check on a single one: the two agree on the kdf and disagree on the aead, so a
+// transposition that is invisible on 0x0001 moves every derived byte on 0x0003.
 package mls
 
 import (
@@ -46,7 +49,7 @@ const (
 func hpkeKemSuiteId(params *SuiteParams) []byte {
 	suiteId := make([]byte, 0, 5)
 	suiteId = append(suiteId, "KEM"...)
-	return binary.BigEndian.AppendUint16(suiteId, params.KemId)
+	return binary.BigEndian.AppendUint16(suiteId, uint16(params.KemId))
 }
 
 // The whole suite identifier, RFC 9180 section 5.1, in the order the RFC fixes: kem,
@@ -57,9 +60,9 @@ func hpkeKemSuiteId(params *SuiteParams) []byte {
 func hpkeSuiteId(params *SuiteParams) []byte {
 	suiteId := make([]byte, 0, 10)
 	suiteId = append(suiteId, "HPKE"...)
-	suiteId = binary.BigEndian.AppendUint16(suiteId, params.KemId)
-	suiteId = binary.BigEndian.AppendUint16(suiteId, params.KdfId)
-	return binary.BigEndian.AppendUint16(suiteId, params.AeadId)
+	suiteId = binary.BigEndian.AppendUint16(suiteId, uint16(params.KemId))
+	suiteId = binary.BigEndian.AppendUint16(suiteId, uint16(params.KdfId))
+	return binary.BigEndian.AppendUint16(suiteId, uint16(params.AeadId))
 }
 
 // LabeledExtract, RFC 9180 section 4. hkdf.Extract takes (ikm, salt) — the reverse of
