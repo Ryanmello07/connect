@@ -290,13 +290,18 @@ func TestHpkeLabeledExtractTreatsNilAndEmptySaltAlike(t *testing.T) {
 	}
 }
 
-// TestHpkeLabeledExpandRejectsUnrepresentableLengths covers the three lengths that must
-// not produce a key. Over 255*Nh there is nothing HKDF-Expand can return; over 65535 the
-// two byte length prefix would be encoded modulo 2^16, so the preimage would claim a
-// length the call is not making; and below zero crypto/hkdf.Expand answers with an empty
-// slice and a nil error, which is the silently short key the plan's own comment forbids.
-// The accepting case is asserted beside them, because a function hardwired to refuse
-// everything satisfies the refusals on its own.
+// TestHpkeLabeledExpandRejectsUnrepresentableLengths covers the lengths that must not
+// produce a key. Over 255*Nh there is nothing HKDF-Expand can return. Below zero
+// crypto/hkdf.Expand does not return anything at all: its fips140 body opens with
+// out := make([]byte, 0, keyLen) and a negative cap is "makeslice: cap out of range", so
+// the refusal asserted here is what stands between a caller supplied length and a dead
+// process — task 8's Export takes that length from a caller.
+//
+// The two lengths past 65535 are subsumed by the 8160 ceiling as the constants stand
+// today; they are carried against a suite whose Nh would lift the ceiling past what the
+// two byte I2OSP prefix can encode, which is the only world where they assert something
+// the ceiling does not. The accepting case is asserted beside all of them, because a
+// function hardwired to refuse everything satisfies the refusals on its own.
 func TestHpkeLabeledExpandRejectsUnrepresentableLengths(t *testing.T) {
 	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {

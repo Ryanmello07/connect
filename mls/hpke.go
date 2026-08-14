@@ -89,12 +89,23 @@ func hpkeLabeledExtract(suiteId []byte, salt []byte, label string, ikm []byte) [
 // LabeledExpand, RFC 9180 section 4. The info argument of crypto/hkdf.Expand is typed
 // string but is not text; the conversion is byte preserving.
 //
-// The length is refused before it is encoded rather than left to hkdf.Expand. Two
-// things go wrong otherwise. The two byte prefix is I2OSP(L, 2), so a length above
-// 65535 would be encoded modulo 2^16 — a preimage claiming a length the call is not
-// making. And crypto/hkdf.Expand answers a negative length with an empty slice and a
-// nil error, which is the silently short key this refusal exists to rule out. Past
-// this guard the conversion below is lossless by construction.
+// The length is refused here rather than left to hkdf.Expand, because hkdf.Expand does
+// not refuse a negative one — it dies on it. crypto/internal/fips140/hkdf opens Expand
+// with out := make([]byte, 0, keyLen), reached before the expansion loop and before the
+// counter overflow check that loop carries, so a negative keyLen is a makeslice panic
+// and the process goes with it. Measured on go1.26.5: -1 panics with "makeslice: cap out
+// of range", 8160 returns 8160 bytes, 8161 returns "hkdf: requested key length too
+// large". So this guard converts a caller supplied length into a typed error instead of
+// a process kill, which is what task 8's Export(exporterContext, length) needs — that
+// length comes from a caller, not from the suite.
+//
+// The upper bound is one bound and not two. 255*Nh is 8160 and the two byte I2OSP prefix
+// only misencodes above 65535, so the ceiling refuses every length the prefix could wrap
+// long before the prefix could wrap: the uint16 conversion below is lossless because the
+// ceiling made it so, and a separate length > 65535 branch here would be unreachable.
+// The ceiling is not this package's own policy either — hkdf.Expand enforces the same
+// 255*Nh limit, which is the fact hpke_test.go pins the constant against rather than
+// pinning it against itself.
 func hpkeLabeledExpand(suiteId []byte, prk []byte, label string, info []byte, length int) ([]byte, error) {
 	if length < 0 || length > hpkeMaxExpandLength {
 		return nil, ErrBadKeyLength
