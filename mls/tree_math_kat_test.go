@@ -110,8 +110,19 @@ func TestTreeMathVectorFileShape(t *testing.T) {
 		if v.NLeaves != wantLeaves[i] {
 			t.Fatalf("entry %d: n_leaves %d, want %d", i, v.NLeaves, wantLeaves[i])
 		}
+		// kept for the reader, not for coverage: the row above pins n_leaves to
+		// an exact power of two, so nothing that reaches here can fail this. it
+		// states the property the ladder exists to express, and goes live the
+		// day the ladder is relaxed to a range.
 		if v.NLeaves&(v.NLeaves-1) != 0 {
 			t.Fatalf("entry %d: n_leaves %d is not a power of two", i, v.NLeaves)
+		}
+		// n_nodes is otherwise pinned only in aggregate, by the family total
+		// below, and self-consistently, by the column lengths. neither notices
+		// node counts moved from one entry to another, so the relation that
+		// defines a full tree is asserted per entry.
+		if v.NNodes != 2*v.NLeaves-1 {
+			t.Fatalf("entry %d: n_nodes %d, want 2*%d-1 = %d", i, v.NNodes, v.NLeaves, 2*v.NLeaves-1)
 		}
 		columns := map[string]int{
 			"left":    len(v.Left),
@@ -126,6 +137,12 @@ func TestTreeMathVectorFileShape(t *testing.T) {
 		}
 		totalNodes += v.NNodes
 	}
+	// also kept for the reader rather than for coverage. reaching here means
+	// all ten entries matched the ladder and each carried n_nodes 2*n_leaves-1,
+	// which fixes the sum at 2036; the per-entry relation above is what a
+	// re-vendored corpus actually trips. this line records the figure the plan
+	// measured, so a future edit that weakens either input has one number to
+	// re-derive against.
 	if totalNodes != 2036 {
 		t.Fatalf("nodes across the family: %d, want 2036", totalNodes)
 	}
