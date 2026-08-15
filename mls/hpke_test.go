@@ -149,6 +149,35 @@ func decodeVectorField(t *testing.T, vectorName string, fieldName string, value 
 	return decoded
 }
 
+// The guard every known answer loop below opens with. A table that lost a row is not an
+// empty table, and only the empty case was ever refused — so until this existed, dropping
+// either appendix A row left every task 6 known answer green, and the only thing that
+// failed was a task 5 salt test that happened to index the second row.
+//
+// That is the wrong defence for the claim this file makes. The file comment above rests on
+// carrying both registered suites, because RFC 9180 gives HKDF-SHA256 the kdf code point
+// 0x0001 and AES-128-GCM the aead code point 0x0001: on the aes suite a kdf/aead
+// transposition moves no byte anyone can see, and the chacha suite at 0x0003 is the only
+// place it shows. A one row table is therefore a table that cannot see the mistake these
+// vectors exist to catch, whichever row is left.
+//
+// It asserts a row per registered suite in the registry's own order rather than a literal
+// two, so a third suite registered without a vector fails here as well, and the loops
+// below and the test that indexes rfc9180BaseVectors[1] by hand agree about which row is
+// which for a stated reason.
+func requireAVectorPerRegisteredSuite(t *testing.T) {
+	t.Helper()
+	suites := Suites()
+	if len(rfc9180BaseVectors) != len(suites) {
+		t.Fatalf("the vector table holds %d rows for %d registered suites, so a suite goes unpinned", len(rfc9180BaseVectors), len(suites))
+	}
+	for i, suite := range suites {
+		if rfc9180BaseVectors[i].suite != suite {
+			t.Fatalf("vector row %d is for suite %#04x, want %#04x", i, uint16(rfc9180BaseVectors[i].suite), uint16(suite))
+		}
+	}
+}
+
 // TestHpkeSuiteIds pins the two identifiers byte for byte against RFC 9180 section 5.1,
 // written out as literals rather than rebuilt from the registry so this test disagrees
 // with hpke.go when hpke.go changes. The chacha row is the load bearing one: it is the
@@ -185,9 +214,7 @@ func TestHpkeSuiteIds(t *testing.T) {
 // The diffie-hellman itself comes from X25519DH, which crypto_x25519_test.go already pins
 // against RFC 7748, so a failure here is a kdf failure rather than a curve one.
 func TestHpkeKemSuiteIdDerivesThePublishedSharedSecret(t *testing.T) {
-	if len(rfc9180BaseVectors) == 0 {
-		t.Fatal("the vector table is empty, so the loop below asserts nothing")
-	}
+	requireAVectorPerRegisteredSuite(t)
 	for _, vector := range rfc9180BaseVectors {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
@@ -227,9 +254,7 @@ func TestHpkeKemSuiteIdDerivesThePublishedSharedSecret(t *testing.T) {
 // salt is the 32 byte shared secret and whose ikm is empty, which is the one shape where
 // swapping crypto/hkdf's two arguments cannot be mistaken for anything else.
 func TestHpkeLabeledExtractKat(t *testing.T) {
-	if len(rfc9180BaseVectors) == 0 {
-		t.Fatal("the vector table is empty, so the loop below asserts nothing")
-	}
+	requireAVectorPerRegisteredSuite(t)
 	for _, vector := range rfc9180BaseVectors {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
@@ -265,9 +290,7 @@ func TestHpkeLabeledExtractKat(t *testing.T) {
 // lengths here, and differently again between the two suites, whose keys are 16 and 32
 // bytes from the same construction.
 func TestHpkeLabeledExpandKat(t *testing.T) {
-	if len(rfc9180BaseVectors) == 0 {
-		t.Fatal("the vector table is empty, so the loop below asserts nothing")
-	}
+	requireAVectorPerRegisteredSuite(t)
 	for _, vector := range rfc9180BaseVectors {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
@@ -313,9 +336,7 @@ func TestHpkeLabeledExtractTreatsNilAndEmptySaltAlike(t *testing.T) {
 		t.Fatalf("LookupSuite: %v", err)
 	}
 	suiteId := hpkeKemSuiteId(params)
-	if len(rfc9180BaseVectors) != 2 {
-		t.Fatalf("the vector table holds %d entries, want the two appendix a rows", len(rfc9180BaseVectors))
-	}
+	requireAVectorPerRegisteredSuite(t)
 	chacha := rfc9180BaseVectors[1]
 	ikm := decodeVectorField(t, chacha.name, "shared_secret", chacha.sharedSecret)
 	fromNil := hpkeLabeledExtract(suiteId, nil, "eae_prk", ikm)
@@ -442,9 +463,7 @@ func TestHpkeExpandCeilingMatchesTheRegistry(t *testing.T) {
 // encapsulated key of a DHKEM as SerializePublicKey(pkE) and the appendix prints the two
 // as the same bytes.
 func TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs(t *testing.T) {
-	if len(rfc9180BaseVectors) == 0 {
-		t.Fatal("the vector table is empty, so the loop below asserts nothing")
-	}
+	requireAVectorPerRegisteredSuite(t)
 	for _, vector := range rfc9180BaseVectors {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
@@ -528,9 +547,7 @@ func TestHpkeDeriveKeyPairIsDeterministic(t *testing.T) {
 // diffie-hellman output is returned, and the kem suite id swapped for the whole suite id.
 // All six were applied to hpke.go and all six survive every non vector test in this file.
 func TestHpkeEncapMatchesThePublishedEncapsulation(t *testing.T) {
-	if len(rfc9180BaseVectors) == 0 {
-		t.Fatal("the vector table is empty, so the loop below asserts nothing")
-	}
+	requireAVectorPerRegisteredSuite(t)
 	for _, vector := range rfc9180BaseVectors {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
@@ -574,9 +591,7 @@ func TestHpkeEncapMatchesThePublishedEncapsulation(t *testing.T) {
 // concatenation, with its own opportunity to put its own key first, and the round trip
 // cannot see the difference because it would agree with an encap transposed to match.
 func TestHpkeDecapMatchesThePublishedSharedSecret(t *testing.T) {
-	if len(rfc9180BaseVectors) == 0 {
-		t.Fatal("the vector table is empty, so the loop below asserts nothing")
-	}
+	requireAVectorPerRegisteredSuite(t)
 	for _, vector := range rfc9180BaseVectors {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
