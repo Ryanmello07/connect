@@ -698,6 +698,11 @@ func TestHpkeEncapDeterministicMatchesEncap(t *testing.T) {
 // key of the wrong length is this process's own bug, and a caller triaging the two reads
 // the wrong answer if they collapse. The accepting case is asserted beside them because a
 // function hardwired to refuse everything satisfies every refusal on its own.
+//
+// The case where both lengths are wrong is asserted too, because the two loops below leave
+// it free: each holds one length right, so neither can see which check runs first. hpkeDecap's
+// own comment states a precedence — the peer's bytes are reported ahead of the local bug —
+// and an order nothing pins is an order a later edit reverses without a failing test.
 func TestHpkeDecapRejectsWrongLengths(t *testing.T) {
 	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
@@ -724,6 +729,13 @@ func TestHpkeDecapRejectsWrongLengths(t *testing.T) {
 		if secret != nil {
 			t.Errorf("decap with a %d byte private key refused and returned %d bytes anyway", n, len(secret))
 		}
+	}
+	bothWrong, err := hpkeDecap(params, make(HpkePrivateKey, 31), make([]byte, 31))
+	if !errors.Is(err, ErrBadKemOutput) {
+		t.Errorf("decap with both lengths wrong error = %v, want ErrBadKemOutput", err)
+	}
+	if bothWrong != nil {
+		t.Errorf("decap with both lengths wrong refused and returned %d bytes anyway", len(bothWrong))
 	}
 	_, kemOutput, err := hpkeEncap(rand.Reader, params, mustDeriveHpkePublicKey(t, params, 0x02))
 	if err != nil {
@@ -762,6 +774,134 @@ func TestHpkeEncapRejectsWrongLengths(t *testing.T) {
 	}
 	if _, _, err := hpkeEncapDeterministic(params, pub, ephemeral); err != nil {
 		t.Fatalf("encap refused well formed keys: %v", err)
+	}
+}
+
+// TestHpkeKemReadsTheFieldItNames is the assertion the two tests above cannot make. Every
+// length they check comes from a registered suite, and the registry gives Nh, Nsecret,
+// Nenc, Npk, Nsk, NsigPub and NsigPriv the same 32 in both of its entries — so a function
+// that read a neighbouring field instead of the one RFC 9180 names would satisfy every
+// vector, every round trip and every refusal in this file. Seven fields holding one value
+// are seven names for the same assertion. Nk, Nn and Nt are not in that set: the registry
+// gives them 16 or 32, 12 and 16, so a kem gate that read one of those is already refused
+// by the appendix A rows above and needs nothing here.
+//
+// Separating them does not need a registered suite, which is the reason this is testable
+// at all. None of the four kem entry points consults the registry: each reads the
+// *SuiteParams its caller hands it, and LookupSuite already returns a fresh copy rather
+// than the registry's own entry. So the probes below are handed a SuiteParams whose length
+// fields disagree, and such a value does not have to be registered, implementable or even
+// coherent — nothing is derived from it but the length under test.
+//
+// The keys handed to each probe are well formed, so a probe that fails says the length
+// gate did not fire rather than that some later gate fired in its place: a kem that drops
+// or misdirects one of these checks reaches the curve and succeeds, and succeeding is what
+// each assertion below denies.
+//
+// hpke.go reads a length in six places and all six are covered here — the Nsecret the
+// shared secret expands to, the Nsk DeriveKeyPair expands to, and the four gates encap and
+// decap open with. The two scalar gates need a probe of their own rather than riding on
+// the recipient key one: under a suite that widens Npk, a scalar gate that wrongly read
+// Npk refuses exactly what the right one refuses, so widening Nsk instead is what tells
+// them apart.
+func TestHpkeKemReadsTheFieldItNames(t *testing.T) {
+	registered, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	priv, pub, err := HpkeDeriveKeyPair(registered, bytes.Repeat([]byte{0x0e}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	ephemeral := HpkePrivateKey(bytes.Repeat([]byte{0x0f}, registered.Nsk))
+	_, kemOutput, err := hpkeEncapDeterministic(registered, pub, ephemeral)
+	if err != nil {
+		t.Fatalf("encap: %v", err)
+	}
+
+	// the shared secret expands to Nsecret, not to any of the lengths beside it
+	wideNsecret := hpkeFieldProbeParams(32)
+	wideNsecret.Nsecret = 48
+	secret, err := hpkeExtractAndExpand(wideNsecret, make([]byte, 32), make([]byte, 64))
+	if err != nil {
+		t.Fatalf("extract and expand under Nsecret 48: %v", err)
+	}
+	if len(secret) != 48 {
+		t.Errorf("shared secret is %d bytes under a suite whose Nsecret is 48 and whose every other length is 32, want 48", len(secret))
+	}
+
+	// the derived scalar expands to Nsk, not to any of the lengths around it. This probe
+	// runs the other way round — narrow where the others are wide — because a derivation
+	// has no refusal to assert: what says the right field was read is that the key pair
+	// came out usable, and only the right field is a length x25519 accepts.
+	narrowNsk := hpkeFieldProbeParams(48)
+	narrowNsk.Nsk = 32
+	probePriv, probePub, err := HpkeDeriveKeyPair(narrowNsk, bytes.Repeat([]byte{0x11}, 32))
+	if err != nil {
+		t.Fatalf("derive under a suite whose only 32 byte length is Nsk: %v", err)
+	}
+	if len(probePriv) != 32 || len(probePub) != 32 {
+		t.Errorf("derived %d/%d bytes under Nsk 32, want 32/32", len(probePriv), len(probePub))
+	}
+
+	// encap gates the recipient key on Npk, and gates it itself rather than leaving the
+	// refusal to X25519PublicKey, whose own 32 byte length check would accept this key
+	wideNpk := hpkeFieldProbeParams(32)
+	wideNpk.Npk = 48
+	if gotSecret, gotEnc, err := hpkeEncapDeterministic(wideNpk, pub, ephemeral); !errors.Is(err, ErrBadKeyLength) {
+		t.Errorf("encap to a %d byte recipient key under Npk 48 returned %d/%d bytes and error %v, want ErrBadKeyLength",
+			len(pub), len(gotSecret), len(gotEnc), err)
+	}
+
+	// both scalar gates read Nsk — encap's ephemeral scalar and decap's private key
+	wideNsk := hpkeFieldProbeParams(32)
+	wideNsk.Nsk = 48
+	if gotSecret, gotEnc, err := hpkeEncapDeterministic(wideNsk, pub, ephemeral); !errors.Is(err, ErrBadKeyLength) {
+		t.Errorf("encap from a %d byte ephemeral scalar under Nsk 48 returned %d/%d bytes and error %v, want ErrBadKeyLength",
+			len(ephemeral), len(gotSecret), len(gotEnc), err)
+	}
+	if gotSecret, err := hpkeDecap(wideNsk, priv, kemOutput); !errors.Is(err, ErrBadKeyLength) {
+		t.Errorf("decap with a %d byte private key under Nsk 48 returned %d bytes and error %v, want ErrBadKeyLength",
+			len(priv), len(gotSecret), err)
+	}
+
+	// decap gates the kem output on Nenc, not on the Npk that holds the same 32
+	wideNenc := hpkeFieldProbeParams(32)
+	wideNenc.Nenc = 48
+	if gotSecret, err := hpkeDecap(wideNenc, priv, kemOutput); !errors.Is(err, ErrBadKemOutput) {
+		t.Errorf("decap of a %d byte kem output under Nenc 48 returned %d bytes and error %v, want ErrBadKemOutput",
+			len(kemOutput), len(gotSecret), err)
+	}
+}
+
+// The probe suite the test above builds on: a SuiteParams no registry holds, in which
+// every length field carries the same background value. The caller then widens the single
+// field it means to separate, so the field under test is the only one the probe can be
+// answered by and every other length says the opposite.
+//
+// Nothing is passed per field. A helper taking the lengths one by one — positionally or by
+// name — can be called with one left out, and a length left out is zero: a gate comparing
+// against zero refuses every input, which is exactly what these probes expect to see and
+// would make one pass while asserting nothing. Setting all of them from one argument is
+// what makes that unrepresentable, and it is why NsigPub and NsigPriv are here at all
+// despite no kem function naming them — they are 32 in both registered entries too, so a
+// gate that read one would be invisible everywhere else in this file.
+func hpkeFieldProbeParams(background int) *SuiteParams {
+	return &SuiteParams{
+		Suite:    CipherSuiteX25519ChaCha20Sha256Ed25519,
+		KemId:    HpkeKemX25519HkdfSha256,
+		KdfId:    HpkeKdfHkdfSha256,
+		AeadId:   HpkeAeadChaCha20Poly1305,
+		Nh:       background,
+		Nk:       background,
+		Nn:       background,
+		Nt:       background,
+		Nsecret:  background,
+		Nenc:     background,
+		Npk:      background,
+		Nsk:      background,
+		NsigPub:  background,
+		NsigPriv: background,
 	}
 }
 
