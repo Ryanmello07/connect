@@ -913,9 +913,20 @@ func hpkeFieldProbeParams(background int) *SuiteParams {
 //
 // Both directions are covered because the two functions reach the curve through different
 // arguments: encap takes the peer key as a recipient public key, decap takes it as a kem
-// output off the wire. The count keeps the loop honest, the way the x25519 tests do — if
-// the parsers ever started refusing these points, every assertion in the body would be
-// skipped and the test would still pass.
+// output off the wire. Nothing else in the package covers either: with the kem swallowing
+// X25519DH's error and deriving from an all zero output, in encap, in decap, or in both,
+// this is the only test in mls that fails.
+//
+// The count is what keeps the loop honest, and it counts the same quantity
+// crypto_x25519_test.go counts: points that reached the exchange, not points that were
+// refused. Those are different, and only the first is a measure of coverage. crypto/ecdh
+// accepts every 32 byte u coordinate today and refuses at the exchange, so all four points
+// reach X25519DH; a parser that started refusing them at parse would satisfy every
+// assertion in the body — ErrInvalidPoint is ErrInvalidPoint whichever gate returned it —
+// and a counter of refusals would go on reporting four while the exchange refusal this
+// test exists for went unexercised. Counting refusals here was measurably wrong, not
+// theoretically: with a parse blacklist and the swallow applied together, the refusal
+// counter left this test green while the kem derived keys from a zero shared secret.
 func TestHpkeRefusesALowOrderPeerKey(t *testing.T) {
 	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
@@ -926,8 +937,18 @@ func TestHpkeRefusesALowOrderPeerKey(t *testing.T) {
 		t.Fatalf("derive: %v", err)
 	}
 	ephemeral := HpkePrivateKey(bytes.Repeat([]byte{0x09}, params.Nsk))
-	refused := 0
+	reachedTheExchange := 0
 	for i, point := range x25519LowOrderPoints {
+		// the gate both entry points below parse this peer key through. Refusing here is
+		// also not a zero secret and is acceptable, but it says nothing about the kem, so
+		// the point is not counted and its assertions are not run.
+		if _, err := X25519PublicKey(point); err != nil {
+			if !errors.Is(err, ErrInvalidPoint) {
+				t.Errorf("point %d: parse error = %v, want ErrInvalidPoint", i, err)
+			}
+			continue
+		}
+		reachedTheExchange++
 		secret, enc, err := hpkeEncapDeterministic(params, HpkePublicKey(point), ephemeral)
 		if !errors.Is(err, ErrInvalidPoint) {
 			t.Errorf("point %d: encap error = %v, want ErrInvalidPoint", i, err)
@@ -944,12 +965,10 @@ func TestHpkeRefusesALowOrderPeerKey(t *testing.T) {
 		}
 		if secret != nil {
 			t.Errorf("point %d: decap refused and returned %d bytes anyway", i, len(secret))
-			continue
 		}
-		refused++
 	}
-	if refused == 0 {
-		t.Errorf("none of the %d low order points was refused by both directions, so this test covered nothing", len(x25519LowOrderPoints))
+	if reachedTheExchange == 0 {
+		t.Errorf("none of the %d low order points reached the exchange, so this test covered nothing", len(x25519LowOrderPoints))
 	}
 }
 
