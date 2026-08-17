@@ -85,7 +85,13 @@ func TestMultiClientMonitorPairingFlappingProviders(t *testing.T) {
 	live, stuck, maxLive := mirror.sample(settings.PingTimeout + settings.WindowExpandTimeout + settings.StatsWindowMaxUnhealthyDuration + settings.WindowResizeTimeout + removeTimeout + 3*time.Second)
 	fmt.Printf("[leaktest2] final live=%d stuck=%d maxLive=%d totalSeen=%d\n", live, stuck, maxLive, mirror.totalSeen())
 
-	bound := 3 * (12 + 4)
+	// DERIVED from the settings under test, not the literals 12+4. Those were
+	// the quality/speed WindowSizeHardMax values at the time this was written;
+	// when the quality window was raised to 6/12/16 this bound stayed at 48 and
+	// the test failed on a healthy run (maxLive=53). Its twin in
+	// ip_remote_multi_client_grid_leak_test.go had the identical stale literal.
+	bound := 3 * (settings.WindowSizes[WindowTypeQuality].WindowSizeHardMax +
+		settings.WindowSizes[WindowTypeSpeed].WindowSizeHardMax)
 	if maxLive > bound {
 		t.Errorf("live point set grew beyond bound: maxLive=%d > %d", maxLive, bound)
 	}
