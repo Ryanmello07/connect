@@ -78,10 +78,13 @@ func TestMultiClientMonitorPairingUnableToConnect(t *testing.T) {
 	live, stuck, maxLive := mirror.sample(settings.PingTimeout + settings.WindowExpandTimeout + removeTimeout + 2*time.Second)
 	fmt.Printf("[leaktest] final live=%d stuck=%d maxLive=%d totalSeen=%d\n", live, stuck, maxLive, mirror.totalSeen())
 
-	// the window targets are WindowSizeMin(quality)=2 + min(speed)=1 with hard max
-	// 12+4. a healthy pairing keeps the live set within a small multiple of the
+	// the window targets are WindowSizeMin(quality)=6 + min(speed)=1 with hard max
+	// 16+4. a healthy pairing keeps the live set within a small multiple of the
 	// hard max; give slack for in-flight evaluations across both windows.
-	bound := 3 * (12 + 4)
+	// DERIVED, not copied: reading the hard maxes out of the settings under test
+	// means raising a default cannot silently invalidate this bound again.
+	bound := 3 * (settings.WindowSizes[WindowTypeQuality].WindowSizeHardMax +
+		settings.WindowSizes[WindowTypeSpeed].WindowSizeHardMax)
 	if maxLive > bound {
 		t.Errorf("live point set grew beyond bound: maxLive=%d > %d", maxLive, bound)
 	}
