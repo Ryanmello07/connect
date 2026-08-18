@@ -80,7 +80,7 @@ func TestEgressResolverInertWithoutTheEgressMark(t *testing.T) {
 	SetEgressInterfaceIndex(0, 0)
 	// The resolver IS handed out unconditionally now — gating at handout froze
 	// nil into the primary control dialer, which is built once
-	// (net_http.go:176) and would then never pick the fix up. What must stay
+	// (newNormalDialTlsContext) and would then never pick the fix up. What must stay
 	// inert off the daemon is the BEHAVIOUR: egressResolverDial takes its
 	// unmarked branch and dials the server the Go resolver chose, unbound,
 	// exactly as the platform resolver would.

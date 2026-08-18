@@ -101,8 +101,8 @@ var egressBoundResolver = &net.Resolver{
 //
 // THE GATE IS INSIDE Dial, NOT HERE, and that is load-bearing rather than
 // stylistic. ConnectSettings.NetDialer() is called ONCE for the primary
-// control dialer — net_http.go:176 builds a tls.Dialer and returns its
-// DialContext — so whatever this function answers at construction is frozen
+// control dialer — newNormalDialTlsContext builds a tls.Dialer around it and
+// returns its DialContext — so whatever this function answers at construction is frozen
 // into that dialer for the process's life. Gating here returned nil to every
 // caller constructed before the daemon's cgroup-BPF program attaches, and the
 // fix would then never engage no matter how marked the process later became:

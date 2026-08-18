@@ -141,13 +141,14 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				// RAISED 2/6/12 -> 6/12/16. A quality window of 2 has no
 				// redundancy: one bad provider is half the window, and a
 				// second is a total failure with nothing left to fall back
-				// to. Field report on linux, 2026-08-17: an idle session sat
-				// at 2 held / ~4 probed (evaluationpoolmultiple=2), both went
+				// to. Field report on linux: an idle session sat at 2 held /
+				// ~4 probed (EvaluationPoolMultiple=2), both went
 				// unresponsive, and because windowOutcomeAction returns
 				// outcomeNone once failOutcome has latched, the window never
 				// rebuilt for the remaining 22 minutes of the session. A
-				// larger floor makes a single bad provider survivable rather
-				// than fatal, which is the point of holding a window at all.
+				// larger floor does not fix that latch, but it makes a single
+				// bad provider survivable rather than fatal, which is the
+				// point of holding a window at all.
 				//
 				// Cost is real and deliberate: WindowSizeMin is a floor that
 				// holds AT IDLE, so this raises steady-state provider
@@ -1258,6 +1259,7 @@ type RemoteUserNatMultiClient struct {
 	// bounded logging work while retaining first-error and total visibility.
 	sendParseDropCount        atomic.Uint64
 	sendPolicyDropCount       atomic.Uint64
+	sendSmtpDropCount         atomic.Uint64
 	sendIcmpDisabledDropCount atomic.Uint64
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge the
@@ -1273,6 +1275,7 @@ type RemoteUserNatMultiClient struct {
 
 	securityPolicyStats *SecurityPolicyStatsCollector
 	securityPolicy      SecurityPolicy
+	smtpEgressGuard     smtpEgressGuard
 
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -1290,6 +1293,16 @@ type RemoteUserNatMultiClient struct {
 	// (created lazily, so a fixture-assembled parent works), bounded by
 	// qualificationMaxEntries. See ip_remote_multi_client_probe.go.
 	qualification map[MultiHopId]*providerQualification
+	// destinationServiceFailures is passive, destination+port-scoped negative
+	// memory. It makes an unanswered/rejected connect re-race onto a different
+	// exit without treating one site's egress policy as a provider-wide fault.
+	// Guarded by stateLock; see ip_remote_multi_client_service_failure.go.
+	destinationServiceFailures map[destinationServiceFailureKey]destinationServiceFailure
+	// dnsExitHints maps a canonical server-name affinity group to the exit
+	// that delivered its tunneled DoH answer. Guarded by stateLock; see
+	// ip_remote_multi_client_dns_affinity.go.
+	dnsExitHints        map[string]dnsExitHint
+	dnsAddressExitHints map[netip.Addr]dnsExitHint
 	// demotionStates is scoredPlacementReorder's owned N-of-M demotion
 	// bookkeeping (routing_score.go's demotionState), keyed per (exit,
 	// class) by demotionKey. Guarded by stateLock, created lazily like
@@ -2039,28 +2052,31 @@ func NewRemoteUserNatMultiClient(
 	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
 
 	multiClient := &RemoteUserNatMultiClient{
-		ctx:                    cancelCtx,
-		cancel:                 cancel,
-		log:                    log,
-		generator:              generator,
-		settings:               settings,
-		windows:                map[WindowType]*multiClientWindow{},
-		securityPolicyStats:    securityPolicyStats,
-		securityPolicy:         settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
-		provideMode:            provideMode,
-		ip4PathUpdates:         map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates:         map[Ip6Path]*multiClientChannelUpdate{},
-		affinityIp4Paths:       map[Ip4Path]map[Ip4Path]time.Time{},
-		affinityIp6Paths:       map[Ip6Path]map[Ip6Path]time.Time{},
-		clientUpdates:          map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-		qualification:          map[MultiHopId]*providerQualification{},
-		localUserNat:           localUserNat,
-		blockActionCache:       newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		blockActionCollector:   newBlockActionCollector(settings.BlockActionAggMaxCount, log),
-		blockActionIgnoreCache: newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		packetStatsCounters:    &packetStatsCounters{},
-		packetStatsCallbacks:   NewCallbackList[PacketStatsFunction](),
-		reliabilityMetrics:     newReliabilityMetrics(),
+		ctx:                        cancelCtx,
+		cancel:                     cancel,
+		log:                        log,
+		generator:                  generator,
+		settings:                   settings,
+		windows:                    map[WindowType]*multiClientWindow{},
+		securityPolicyStats:        securityPolicyStats,
+		securityPolicy:             settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
+		provideMode:                provideMode,
+		ip4PathUpdates:             map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:             map[Ip6Path]*multiClientChannelUpdate{},
+		affinityIp4Paths:           map[Ip4Path]map[Ip4Path]time.Time{},
+		affinityIp6Paths:           map[Ip6Path]map[Ip6Path]time.Time{},
+		clientUpdates:              map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		qualification:              map[MultiHopId]*providerQualification{},
+		destinationServiceFailures: map[destinationServiceFailureKey]destinationServiceFailure{},
+		dnsExitHints:               map[string]dnsExitHint{},
+		dnsAddressExitHints:        map[netip.Addr]dnsExitHint{},
+		localUserNat:               localUserNat,
+		blockActionCache:           newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		blockActionCollector:       newBlockActionCollector(settings.BlockActionAggMaxCount, log),
+		blockActionIgnoreCache:     newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		packetStatsCounters:        &packetStatsCounters{},
+		packetStatsCallbacks:       NewCallbackList[PacketStatsFunction](),
+		reliabilityMetrics:         newReliabilityMetrics(),
 	}
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
@@ -4050,6 +4066,14 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
+			// A tunneled DNS answer is topology-sensitive: for an unpinned
+			// flow, its exact resolver exit outranks an older hostname donor.
+			// The flow still joins its ordinary groups below, but those groups
+			// cannot silently move the first connection away from the egress
+			// location that produced its A/AAAA answer.
+			if pin.appId == "" {
+				self.inheritDnsExitHintWithLock(update, ipPath, affinityIpPaths)
+			}
 
 			followWinner, sawScatter := false, false
 			for _, affinityIpPath := range affinityIpPaths {
@@ -4068,7 +4092,6 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					sawScatter = sawScatter || scattered
 				}
 			}
-
 			// the app pin's cross-version convergence, consulted BEFORE the
 			// destination bridge below: the ip4 and ip6 affinity groups are
 			// separate maps, so a dual-stack pinned app would otherwise take
@@ -4209,6 +4232,11 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
+			// See the v4 twin: DNS topology outranks older domain affinity for
+			// unpinned flows, while the explicit app pin remains authoritative.
+			if pin.appId == "" {
+				self.inheritDnsExitHintWithLock(update, ipPath, affinityIpPaths)
+			}
 
 			followWinner, sawScatter := false, false
 			for _, affinityIpPath := range affinityIpPaths {
@@ -4227,7 +4255,6 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					sawScatter = sawScatter || scattered
 				}
 			}
-
 			// see the v4 twin: the app pin converges across ip versions, and
 			// outranks the destination bridge below
 			if pin.appId != "" && update.client.Load() == nil {
@@ -5081,6 +5108,86 @@ func (self *RemoteUserNatMultiClient) logSparseSendDrop(
 	)
 }
 
+// smtpBlockActionParts performs the ordinary association/override lookup for
+// the two SMTP decisions that occur before the general security policy. This
+// keeps the explicit local route and an encryption rejection visible through
+// the same BlockAction stream as every other egress routing decision.
+func (self *RemoteUserNatMultiClient) smtpBlockActionParts(
+	ipPath *IpPath,
+) (decision *blockActionDecision, match *blockActionMatch, blockerBlock bool) {
+	ignored := self.blockActionIgnored(ipPath)
+	if !ignored && self.ipAssoc != nil {
+		self.ipAssoc.AddEgressPacket(ipPath)
+	}
+
+	blockActionState := self.blockActionState.Load()
+	config := self.config.Load()
+	blockerActive := config.blocker != nil && config.blocker.Enabled()
+	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+	}
+	if decision != nil {
+		match = decision.match
+		blockerBlock = decision.blockerBlock
+	}
+	return
+}
+
+// sendSmtpLocal routes TCP/25 directly regardless of localSecurityBypass. The
+// forced Drop+local combination is deliberate: block and blocker overrides
+// still work, but a route override cannot move port 25 onto a provider.
+func (self *RemoteUserNatMultiClient) sendSmtpLocal(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) bool {
+	decision, match, blockerBlock := self.smtpBlockActionParts(ipPath)
+	block, local := blockActionApply(
+		SecurityPolicyResultDrop,
+		true,
+		blockerBlock,
+		match,
+	)
+	byteCount := ByteCount(len(packet))
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		self.blockActionCollector.add(decision, block, local, match, byteCount)
+	}
+	if block {
+		self.packetStatsCounters.blockEgressPacketCount.Add(1)
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		return false
+	}
+	if !local || self.localUserNat == nil {
+		return false
+	}
+	success := self.localUserNat.SendPacket(source, provideMode, packet, 0)
+	if success {
+		self.packetStatsCounters.localEgressPacketCount.Add(1)
+		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+	}
+	return success
+}
+
+func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	decision, _, _ := self.smtpBlockActionParts(ipPath)
+	byteCount := ByteCount(len(packet))
+	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		// Encryption enforcement is not overridable. Pass no match so a user
+		// override is not reported as the cause of this mandatory rejection.
+		self.blockActionCollector.add(decision, true, false, nil, byteCount)
+	}
+	self.packetStatsCounters.blockEgressPacketCount.Add(1)
+	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
+	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+}
+
 // `SendPacketFunction`
 func (self *RemoteUserNatMultiClient) SendPacket(
 	source TransferPath,
@@ -5100,6 +5207,26 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		// fleet broadly parses icmp, since a not-yet-upgraded provider
 		// silently blackholes icmp flows
 		self.logSparseSendDrop("icmp disabled", &self.sendIcmpDisabledDropCount, errIcmpDisabled)
+		return false
+	}
+	// Port 25 is a deliberate local-only route and must be selected before
+	// CFAA inspection (which classifies privileged SMTP as a drop). Ports
+	// 465/587 remain provider-routed only while their SMTP/TLS stream validates.
+	if smtpRoutesLocally(ipPath) {
+		if ipPath.Syn && !ipPath.Ack {
+			self.logSmtpPolicyOutcome(ipPath, "local")
+		}
+		return self.sendSmtpLocal(source, provideMode, ipPath, packet)
+	}
+	smtpVerdict, smtpMilestone := self.smtpEgressGuard.inspectDetailed(ipPath, payload)
+	switch smtpMilestone {
+	case smtpEgressMilestoneSecure:
+		self.logSmtpPolicyOutcome(ipPath, "encrypted")
+	case smtpEgressMilestoneRejected:
+		self.logSmtpPolicyOutcome(ipPath, "rejected")
+	}
+	if smtpVerdict == smtpEgressReject {
+		self.rejectSmtpPacket(source, provideMode, ipPath, packet)
 		return false
 	}
 	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
@@ -5199,6 +5326,20 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 
 	sentPacketCount := 0
 	for _, group := range groups {
+		if smtpNeedsOrderedSend(group.ipPath) {
+			// SMTP validation is stream-ordered and may accept an earlier
+			// negotiation segment while rejecting a later plaintext segment.
+			// Preserve that per-packet result instead of applying the ordinary
+			// all-or-nothing flow-group transaction.
+			for _, packet := range group.packets {
+				if self.SendPacket(source, provideMode, packet, timeout) {
+					sentPacketCount += 1
+				} else {
+					MessagePoolReturn(packet)
+				}
+			}
+			continue
+		}
 		if self.sendPacketGroup(source, provideMode, group, timeout) {
 			sentPacketCount += len(group.packets)
 			continue
@@ -5879,6 +6020,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			for _, windowType := range self.selectWindowTypes(firstPacket) {
 				if window, ok := self.windows[windowType]; ok {
 					orderedClients := self.raceCandidates(window)
+					// A destination+port failure is narrower than the
+					// window's rank. Widen across healthy tiers before
+					// filtering so a rejected SMTP endpoint actually gets a
+					// different egress address on its retransmitted SYN.
+					if self.destinationServiceFailurePresent(orderedClients, ipPath) {
+						if crossed := window.orderedClientsCrossTier(); 0 < len(crossed) {
+							orderedClients = crossed
+						} else if fallback := window.lastResortClients(); 0 < len(fallback) {
+							orderedClients = fallback
+						}
+					}
+					orderedClients = self.filterDestinationServiceFailures(orderedClients, ipPath)
 					if scoredPlacementEnabled(self.reliabilitySettings()) {
 						// guarded scored-placement path (Phase 1): re-orders the
 						// already health-filtered field above, never widens or
@@ -6483,6 +6636,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		packet := packets[i]
 
 		// mirror clientReceivePacket's pre-delivery pipeline exactly
+		self.smtpEgressGuard.retireReturn(ipPath)
 		r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
 		if err != nil {
 			continue
@@ -6510,6 +6664,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 			// the dial-strike window, exactly as on the per-packet path.
 			if update.receivedInbound.CompareAndSwap(false, true) {
 				sourceClient.addConnectSuccess()
+				self.clearDestinationServiceFailure(sourceClient, update.ipPath)
+				self.logSmtpProviderOutcome(update.ipPath, sourceClient, "connected")
 			}
 			batchPackets = append(batchPackets, packet)
 			continue
@@ -6530,6 +6686,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	ipPath *IpPath,
 	packet []byte,
 ) {
+	self.smtpEgressGuard.retireReturn(ipPath)
 	r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
 	if err != nil {
 		return
@@ -6606,6 +6763,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	// channel after receiveClientPath returns, outside every lock, so the
 	// channel stateLock never nests under the parent or per-flow stateLock.
 	connectSucceeded := false
+	var connectPath *IpPath
 	// boundUpdate is set when this path commits a flow to sourceClient, so the
 	// clientUpdates bookkeeping can be recorded after receiveClientPath
 	// returns. Same reason as connectSucceeded above: bindClientFlow takes the
@@ -6621,6 +6779,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			// flow already carrying data).
 			if update.receivedInbound.CompareAndSwap(false, true) {
 				connectSucceeded = true
+				connectPath = update.ipPath
 			}
 			p := &receivePacket{
 				Source:      source,
@@ -6642,6 +6801,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			// committed between the lock-free check and acquiring the lock
 			if update.receivedInbound.CompareAndSwap(false, true) {
 				connectSucceeded = true
+				connectPath = update.ipPath
 			}
 			p := &receivePacket{
 				Source:      source,
@@ -6699,6 +6859,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			boundUpdate = update
 			if update.receivedInbound.CompareAndSwap(false, true) {
 				connectSucceeded = true
+				connectPath = update.ipPath
 			}
 			receivePacket := &receivePacket{
 				Source:      source,
@@ -6720,6 +6881,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	// successes). recorded outside every lock held above.
 	if connectSucceeded {
 		sourceClient.addConnectSuccess()
+		self.clearDestinationServiceFailure(sourceClient, connectPath)
+		self.logSmtpProviderOutcome(connectPath, sourceClient, "connected")
 	}
 	// a race won from the receive path commits the flow without the send path
 	// ever noticing a change, so this is the only place the bookkeeping can be
@@ -6818,6 +6981,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		}
 
 		matched = true
+		self.recordDestinationServiceFailureWithLock(sourceClient, egressIpPath)
 
 		if rerace {
 			// unbind exactly like removeClient does per-update, minus teardown
@@ -6851,6 +7015,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 
 	if rerace {
 		self.reliabilityMetrics.flowReraced()
+		self.logSmtpProviderOutcome(egressIpPath, sourceClient, "reraced")
 		// swallowed: the icmp is never forwarded. the app's retransmit drives
 		// recovery. this is the whole point -- ~1s instead of 3-63s.
 		return true
@@ -7323,6 +7488,9 @@ func (self *RemoteUserNatMultiClient) Close() {
 		clear(self.ip6PathUpdates)
 		clear(self.affinityIp4Paths)
 		clear(self.affinityIp6Paths)
+		clear(self.destinationServiceFailures)
+		clear(self.dnsExitHints)
+		clear(self.dnsAddressExitHints)
 	}()
 
 	// close updates outside the parent lock: update.Close() takes the per-flow
