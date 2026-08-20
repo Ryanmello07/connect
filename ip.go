@@ -30,9 +30,13 @@ import (
 const defaultIpBufferSize = 1024
 
 // packets are written directly into the receiver tap/tun interface,
-// so the packet size must not exceed the device interface mtu (1440).
+// so the packet size must not exceed the device interface MTU.
 // this is a contract with the devices and must not be raised.
-const DefaultMtu = 1440
+// DefaultMtu is shared by every native tunnel interface and the provider-side
+// packetizer. At 1,100 bytes, a full steady-state encrypted IP Transfer frame
+// uses H3's reliable stream at QUIC's safe 1,200-byte packet floor; smaller
+// complete messages that fit one DATAGRAM retain the unordered packet lane.
+const DefaultMtu = 1100
 const Ipv4HeaderSizeWithoutExtensions = 20
 const Ipv6HeaderSize = 40
 const UdpHeaderSize = 8
@@ -51,14 +55,17 @@ type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, ti
 // or destination must inspect packet rather than infer its direction from
 // ipPath. Both are read-only for the duration of the callback. A callee that
 // retains packet must call MessagePoolShareReadOnly; a callee that needs a
-// mutable path must clone it.
+// mutable path must clone it. The callback runs inline and must not block,
+// except when it is the documented final device-TUN injection boundary.
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 // receive a batch of packets from one flow (same source, provideMode, ipPath)
 // in a single call, so a consumer can coalesce them (see the provider return
 // path, which packs the batch into one wire Pack). The packet buffers are
 // read-only and valid only for the duration of the callback. A callee that
-// retains one must call MessagePoolShareReadOnly before returning.
+// retains one must call MessagePoolShareReadOnly before returning. It has the
+// same inline/nonblocking contract and final device-TUN exception as
+// ReceivePacketFunction.
 type ReceivePacketsFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte)
 
 // Identifies whether the callback owns irreplaceable upstream TCP state. It is
@@ -178,6 +185,42 @@ type ipPacketFlowKey struct {
 	ipVersion       uint8
 }
 
+// ipPacketFlowKeyFromPath returns the exact directional tuple without
+// retaining any of the packet-backed IP slices in ipPath.
+func ipPacketFlowKeyFromPath(ipPath *IpPath) (ipPacketFlowKey, bool) {
+	if ipPath == nil ||
+		ipPath.SourcePort < 0 || 65535 < ipPath.SourcePort ||
+		ipPath.DestinationPort < 0 || 65535 < ipPath.DestinationPort {
+		return ipPacketFlowKey{}, false
+	}
+
+	var sourceIp net.IP
+	var destinationIp net.IP
+	switch ipPath.Version {
+	case 4:
+		sourceIp = ipPath.SourceIp.To4()
+		destinationIp = ipPath.DestinationIp.To4()
+	case 6:
+		sourceIp = ipPath.SourceIp.To16()
+		destinationIp = ipPath.DestinationIp.To16()
+	default:
+		return ipPacketFlowKey{}, false
+	}
+	if sourceIp == nil || destinationIp == nil {
+		return ipPacketFlowKey{}, false
+	}
+
+	key := ipPacketFlowKey{
+		protocol:        ipPath.Protocol,
+		sourcePort:      uint16(ipPath.SourcePort),
+		destinationPort: uint16(ipPath.DestinationPort),
+		ipVersion:       uint8(ipPath.Version),
+	}
+	copy(key.sourceIp[:], sourceIp)
+	copy(key.destinationIp[:], destinationIp)
+	return key, true
+}
+
 // ipPacketGroup owns its packet-slice header and a canonical path whose
 // addresses do not alias packet storage. The packet buffers remain with the
 // caller until that caller transfers or returns them.
@@ -191,39 +234,20 @@ type ipPacketGroup struct {
 
 // Returns a comparable flow key and a path with owned canonical addresses.
 func ownIpPacketFlow(ipPath *IpPath) (ipPacketFlowKey, *IpPath, bool) {
-	if ipPath == nil ||
-		ipPath.SourcePort < 0 || 65535 < ipPath.SourcePort ||
-		ipPath.DestinationPort < 0 || 65535 < ipPath.DestinationPort {
+	key, ok := ipPacketFlowKeyFromPath(ipPath)
+	if !ok {
 		return ipPacketFlowKey{}, nil, false
 	}
 
-	var sourceIp net.IP
-	var destinationIp net.IP
 	var ipByteCount int
 	switch ipPath.Version {
 	case 4:
-		sourceIp = ipPath.SourceIp.To4()
-		destinationIp = ipPath.DestinationIp.To4()
 		ipByteCount = net.IPv4len
 	case 6:
-		sourceIp = ipPath.SourceIp.To16()
-		destinationIp = ipPath.DestinationIp.To16()
 		ipByteCount = net.IPv6len
-	default:
-		return ipPacketFlowKey{}, nil, false
 	}
-	if sourceIp == nil || destinationIp == nil {
-		return ipPacketFlowKey{}, nil, false
-	}
-
-	key := ipPacketFlowKey{
-		protocol:        ipPath.Protocol,
-		sourcePort:      uint16(ipPath.SourcePort),
-		destinationPort: uint16(ipPath.DestinationPort),
-		ipVersion:       uint8(ipPath.Version),
-	}
-	copy(key.sourceIp[:], sourceIp)
-	copy(key.destinationIp[:], destinationIp)
+	sourceIp := ipPath.SourceIp[len(ipPath.SourceIp)-ipByteCount:]
+	destinationIp := ipPath.DestinationIp[len(ipPath.DestinationIp)-ipByteCount:]
 
 	ownedIpPath := *ipPath
 	ipBacking := make(net.IP, 2*ipByteCount)
@@ -308,9 +332,13 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		// short idle reap, standard for udp nats: single round trip flows
 		// (dns, quic probes) dominate udp flow counts, and each idle flow
 		// pins its channels, read buffer, and goroutines until reaped
-		IdleTimeout:         60 * time.Second,
-		Mtu:                 DefaultMtu,
-		ReadBufferByteCount: DefaultMtu,
+		IdleTimeout: 60 * time.Second,
+		Mtu:         DefaultMtu,
+		// QUIC Initial datagrams are at least 1,200 bytes. The IP packet path
+		// fragments them at DefaultMtu, but the provider-facing UDP socket must
+		// first receive the complete datagram. 2 KiB covers ordinary QUIC and
+		// EDNS responses without a 64 KiB buffer in every UDP flow.
+		ReadBufferByteCount: defaultUdpReadBufferByteCount,
 		SequenceBufferSize:  bufferSize,
 		WriteBatchSize:      64,
 		// Flows are assigned round-robin to a bounded number of ordered
@@ -1020,7 +1048,13 @@ func sendShard(ipPacket []byte, shardCount int) int {
 			if Ipv4HeaderSizeWithoutExtensions <= len(ipPacket) {
 				hashBytes(ipPacket[12:20])
 				headerByteCount := int(ipPacket[0]&0xf) * 4
-				if ipProtocolNumber(ipPacket[9]) == ipProtocolNumberIcmp4 {
+				flagsAndOffset := binary.BigEndian.Uint16(ipPacket[6:8])
+				if flagsAndOffset&0x3fff != 0 {
+					// Non-first fragments do not contain transport ports. Pin every
+					// fragment of one datagram by its shared IPv4 identity instead.
+					hashBytes(ipPacket[9:10])
+					hashBytes(ipPacket[4:6])
+				} else if ipProtocolNumber(ipPacket[9]) == ipProtocolNumberIcmp4 {
 					// the first transport bytes are type/code/checksum, which
 					// vary per packet; the echo identifier is the flow identity
 					if headerByteCount+6 <= len(ipPacket) {
@@ -1048,6 +1082,8 @@ func sendShard(ipPacket []byte, shardCount int) int {
 
 func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	defer self.cancel()
+	ipv4Fragments := newIpv4FragmentReassembler()
+	defer ipv4Fragments.close()
 
 	udp4Buffer := newUdp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
 	udp6Buffer := newUdp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
@@ -1084,6 +1120,10 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 		ipVersion := uint8(ipPacket[0]) >> 4
 		switch ipVersion {
 		case 4:
+			ipPacket = ipv4Fragments.process(source, transferKey, provideMode, ipPacket)
+			if ipPacket == nil {
+				return
+			}
 			ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(ipPacket)
 			if !ok {
 				// malformed, drop
@@ -2616,29 +2656,37 @@ func (self *StreamState) IpPath() *IpPath {
 // this must only be called from one goroutine
 // this is called from the writer only and does not need to syncrhronize with the reader state
 func (self *StreamState) DataPackets(payload []byte, n int, mtu int) ([][]byte, error) {
+	if n < 0 || len(payload) < n {
+		return nil, errors.New("invalid UDP payload length")
+	}
 	var headerByteCount int
 	switch self.ipVersion {
 	case 4:
 		headerByteCount = Ipv4HeaderSizeWithoutExtensions + UdpHeaderSize
 	case 6:
 		headerByteCount = Ipv6HeaderSize + UdpHeaderSize
+	default:
+		return nil, errors.New("unsupported IP version")
 	}
-
-	packetByteCount := mtu - headerByteCount
-	if n <= packetByteCount {
+	if 0xffff-UdpHeaderSize < n {
+		return nil, errors.New("UDP payload exceeds the datagram limit")
+	}
+	if 0xffff-Ipv4HeaderSizeWithoutExtensions-UdpHeaderSize < n && self.ipVersion == 4 {
+		return nil, errors.New("UDP payload exceeds the IPv4 packet limit")
+	}
+	if n <= mtu-headerByteCount {
 		// reuse the single-packet backing for the common unfragmented case
 		// (see singleDataPacket); the result is consumed before the next call.
 		self.singleDataPacket[0] = self.udpPacket(payload[0:n])
 		return self.singleDataPacket[:], nil
 	}
-	// fragment into separate datagrams
-	packets := make([][]byte, 0, (n+packetByteCount-1)/packetByteCount)
-	for i := 0; i < n; {
-		j := min(i+packetByteCount, n)
-		packets = append(packets, self.udpPacket(payload[i:j]))
-		i = j
+	if self.ipVersion == 6 {
+		// Splitting one UDP payload into several independent datagrams corrupts
+		// application framing. IPv6 is intentionally not advertised by the
+		// current product, and its Fragment extension is not parsed here.
+		return nil, errors.New("oversized IPv6 UDP datagram is unsupported")
 	}
-	return packets, nil
+	return fragmentIpv4Packet(self.udpPacket(payload[:n]), mtu)
 }
 
 // builds a udp packet from the stream destination to the stream source
@@ -3686,7 +3734,13 @@ func (self *TcpSequence) Run() {
 	}
 
 	self.log.V(2).Infof("[init]receive SYN+ACK\n")
-	self.receivePacket(packet, receiveRecoveryModeNonblocking)
+	// The upstream may be server-first (SMTP/587, SSH, IMAP): socket bytes can
+	// be readable immediately after connect. Keep the SYN+ACK on the same
+	// synchronous recovery lane as those bytes so the socket reader cannot
+	// overtake a queued handshake packet. The provider has already consumed the
+	// successful dial and the following stream is lossless, so this control is
+	// part of that ordered ownership boundary too.
+	self.receivePacket(packet, receiveRecoveryModeTcpSocket)
 
 	/*
 		if v, ok := socket.(*net.TCPConn); ok {
@@ -5013,6 +5067,7 @@ type providerReturnItem struct {
 	packets         [][]byte
 	packetByteCount ByteCount
 	batch           bool
+	schedulingKey   sendSchedulingKey
 	observer        func(RemoteUserNatProviderReturnSendObservation)
 	observerToken   uint64
 	observerFlowKey RemoteUserNatProviderReturnFlowKey
@@ -5185,10 +5240,12 @@ type RemoteUserNatProvider struct {
 	// Defense in depth at the exit. Client and provider policies are
 	// intentionally independent, and multiple tunnel clients can share an IP
 	// tuple, so smtpEgressGuard namespaces its state by the authenticated source.
-	smtpIngressGuard  smtpEgressGuard
-	settings          *RemoteUserNatProviderSettings
-	localUserNatUnsub func()
-	clientUnsub       func()
+	smtpIngressGuard     smtpEgressGuard
+	ingressIpv4Fragments ipv4FragmentGate
+	egressIpv4Fragments  ipv4FragmentGate
+	settings             *RemoteUserNatProviderSettings
+	localUserNatUnsub    func()
+	clientUnsub          func()
 
 	// cumulative packet counts relayed for remote clients, in the same
 	// direction convention as the contracts: ingress is traffic received from
@@ -5587,7 +5644,7 @@ func (self *RemoteUserNatProvider) AddPacketStatsCallback(packetStatsCallback Pa
 
 // flushes packet stats events to listeners on the event epoch
 func (self *RemoteUserNatProvider) runPacketStats() {
-	lastPacketStats := PacketStats{}
+	var lastPacketStats *PacketStats
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -5597,8 +5654,8 @@ func (self *RemoteUserNatProvider) runPacketStats() {
 
 		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
 			packetStats := self.packetStatsCounters.snapshot()
-			if *packetStats != lastPacketStats {
-				lastPacketStats = *packetStats
+			if !packetStatsEqual(packetStats, lastPacketStats) {
+				lastPacketStats = packetStats
 				for _, callback := range callbacks {
 					HandleError(func() {
 						callback(packetStats)
@@ -5711,10 +5768,11 @@ func providerReturnTransferOptions(
 	return defaultOptions
 }
 
-// Provider-return TCP stays Transfer-reliable even on a direct stream because
-// the proxy may have already consumed upstream socket bytes. UDP and ICMP
-// retain datagram semantics on the direct carrier. Platform and DataChannel
-// returns retain their established acknowledgements.
+// Provider-return TCP always stays Transfer-reliable because the proxy may
+// have already consumed upstream socket bytes. Carrier reliability cannot
+// commit those bytes across a disconnect or route replacement. UDP and ICMP
+// retain datagram semantics on a direct carrier; otherwise they retain the
+// configured default.
 func providerReturnIpTransferOptions(
 	defaultOptions TransferOptions,
 	provideMode protocol.ProvideMode,
@@ -5722,17 +5780,19 @@ func providerReturnIpTransferOptions(
 	ipProtocol IpProtocol,
 ) TransferOptions {
 	options := providerReturnTransferOptions(defaultOptions, provideMode, transferKey)
-	if transferKey.ForceStream {
-		options.Ack = ipProtocol == IpProtocolTcp
+	if ipProtocol == IpProtocolTcp {
+		options.Ack = true
+	} else if transferKey.ForceStream {
+		options.Ack = false
 	}
 	return options
 }
 
 // `ReceivePacketFunction`
 // providerReturnBatchMaxFrames / providerReturnBatchMaxBytes bound one
-// coalesced return Pack so the complete transfer frame stays below the
-// platform and resident transport's 4 KiB message limit. Two mtu packets
-// plus the Pack/TransferFrame envelope fit; three do not.
+// coalesced return Pack so the complete encrypted Transfer frame stays eligible
+// for one H3 DATAGRAM. One full-MTU packet, or up to two smaller packets whose
+// combined message bytes stay within one MTU, fit the bound.
 const providerReturnBatchMaxFrames = sendPackBatchMaxFrames
 const providerReturnBatchMaxBytes = sendPackBatchMaxMessageByteCount
 
@@ -5787,6 +5847,11 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		item.ipProtocol,
 	)
 	destinationId := item.source.SourceId
+	transportAttribution := newTransportPacketAttribution(
+		self.packetStatsCounters,
+		1,
+		item.packetByteCount,
+	)
 	var sent bool
 	if 2 <= self.settings.ProtocolVersion {
 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
@@ -5800,6 +5865,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnOption,
 				returnTransferKey,
 				Ctx(self.ctx),
+				sendSchedulingKeyOption{key: item.schedulingKey},
+				observeTransportWrite(transportAttribution.observe),
 			)
 			return attemptSent
 		})
@@ -5828,6 +5895,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnOption,
 				returnTransferKey,
 				Ctx(self.ctx),
+				sendSchedulingKeyOption{key: item.schedulingKey},
+				observeTransportWrite(transportAttribution.observe),
 			)
 		})
 		if !sent {
@@ -5835,8 +5904,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		}
 	}
 	if sent {
-		self.packetStatsCounters.remoteEgressPacketCount.Add(1)
-		self.packetStatsCounters.remoteEgressByteCount.Add(int64(item.packetByteCount))
+		transportAttribution.admit()
 	} else {
 		self.congestionDrops.addReturnSend(1, item.packetByteCount)
 	}
@@ -5875,6 +5943,11 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		frames = make([]*protocol.Frame, 0, providerReturnBatchMaxFrames)
 		frameCount := len(sendFrames)
 		packetBytes := chunkPacketBytes
+		transportAttribution := newTransportPacketAttribution(
+			self.packetStatsCounters,
+			frameCount,
+			ByteCount(packetBytes),
+		)
 		sent := self.retryReturnSend(
 			item,
 			frameCount,
@@ -5888,12 +5961,13 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 					returnOption,
 					returnTransferKey,
 					Ctx(self.ctx),
+					sendSchedulingKeyOption{key: item.schedulingKey},
+					observeTransportWrite(transportAttribution.observe),
 				)
 			},
 		)
 		if sent {
-			self.packetStatsCounters.remoteEgressPacketCount.Add(int64(frameCount))
-			self.packetStatsCounters.remoteEgressByteCount.Add(packetBytes)
+			transportAttribution.admit()
 		} else {
 			allSent = false
 			self.congestionDrops.addReturnSend(frameCount, ByteCount(packetBytes))
@@ -5920,6 +5994,13 @@ func (self *RemoteUserNatProvider) sendReturnBatch(item *providerReturnItem) boo
 		frame, err := ipPacketFromProviderFrame(packet, self.settings.ProtocolVersion)
 		if err != nil {
 			panic(err)
+		}
+		// Keep a complete Pack within the same one-MTU message-byte bound used
+		// by Transfer's ordinary coalescer. One individually oversized frame
+		// still advances alone; the H3 selector will place it on the stream.
+		if 0 < len(frames) &&
+			providerReturnBatchMaxBytes < chunkBytes+int64(len(frame.MessageBytes)) {
+			flush()
 		}
 		if frame.Raw {
 			packets[packetIndex] = nil
@@ -6004,6 +6085,62 @@ func (self *RemoteUserNatProvider) inspectReturnPacketsForSender(
 	)
 }
 
+// Performs the provider-side return policy on a complete UDP datagram and
+// queues its original IPv4 fragments. The fragments are owned by the caller
+// and transfer to the return item only on success.
+func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	recoveryMode receiveRecoveryMode,
+	canonicalIpPath *IpPath,
+	reassembled []byte,
+	fragments [][]byte,
+) bool {
+	if len(fragments) == 0 || canonicalIpPath == nil {
+		return false
+	}
+	returnIpPath, err := ParseIpPath(reassembled)
+	if err != nil || returnIpPath.Version != 4 || returnIpPath.Protocol != IpProtocolUdp {
+		return false
+	}
+	self.smtpIngressGuard.retireReturnForOwner(source.SourceId, returnIpPath)
+	r, err := inspectAndRefreshEgressForSenderBorrowed(
+		self.securityPolicy,
+		source.SourceId,
+		provideMode,
+		*returnIpPath,
+		nil,
+	)
+	if err != nil {
+		return false
+	}
+	var byteCount ByteCount
+	for _, fragment := range fragments {
+		byteCount += ByteCount(len(fragment))
+	}
+	if r != SecurityPolicyResultAllow {
+		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
+		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		return false
+	}
+
+	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+	returnTransferKey := providerReplyTransferKey(transferKey, returnProvideMode)
+	item := self.takeReturnItem()
+	item.source = source.LocalMask()
+	item.transferKey = returnTransferKey
+	item.provideMode = returnProvideMode
+	item.recoveryMode = recoveryMode
+	item.ipProtocol = canonicalIpPath.Protocol
+	item.schedulingKey = ipSendSchedulingKey(canonicalIpPath)
+	item.batch = true
+	item.packets = append(item.packets, fragments...)
+	item.packetByteCount = byteCount
+	self.enqueueReturnItem(item)
+	return true
+}
+
 // Returns a keyed NAT batch without dropping its explicit recovery owner.
 func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	source TransferPath,
@@ -6020,6 +6157,47 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	if self.client.ClientId() == source.SourceId {
 		if self.client.log.V(2).Enabled() {
 			self.client.log.Infof("drop remote user nat provider s packet ->%s\n", source.SourceId)
+		}
+		return
+	}
+	containsIpv4Fragments := false
+	for _, packet := range packets {
+		if isIpv4FragmentPacket(packet) {
+			containsIpv4Fragments = true
+			break
+		}
+	}
+	if containsIpv4Fragments {
+		for _, packet := range packets {
+			if !isIpv4FragmentPacket(packet) {
+				self.receiveTransferWithRecovery(
+					source,
+					transferKey,
+					provideMode,
+					recoveryMode,
+					ipPath,
+					packet,
+				)
+				continue
+			}
+			result := self.egressIpv4Fragments.processOwned(
+				source,
+				transferKey,
+				provideMode,
+				MessagePoolCopy(packet),
+			)
+			if result.packet != nil && self.enqueueFragmentedReturn(
+				source,
+				transferKey,
+				provideMode,
+				recoveryMode,
+				ipPath,
+				result.packet,
+				result.fragments,
+			) {
+				result.fragments = nil
+			}
+			returnIpv4FragmentProcessResult(result)
 		}
 		return
 	}
@@ -6069,6 +6247,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = ipPath.Protocol
+	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.batch = true
 	for _, packet := range packets {
 		item.packets = append(item.packets, MessagePoolShareReadOnly(packet))
@@ -6123,6 +6302,27 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 		}
 		return
 	}
+	if isIpv4FragmentPacket(packet) {
+		result := self.egressIpv4Fragments.processOwned(
+			source,
+			transferKey,
+			provideMode,
+			MessagePoolCopy(packet),
+		)
+		if result.packet != nil && self.enqueueFragmentedReturn(
+			source,
+			transferKey,
+			provideMode,
+			recoveryMode,
+			ipPath,
+			result.packet,
+			result.fragments,
+		) {
+			result.fragments = nil
+		}
+		returnIpv4FragmentProcessResult(result)
+		return
+	}
 	// the provider's egress is the return into the tunnel (destination->client); the reversed
 	// provider policy applies the client-ingress source check here, then refreshes the flow so an
 	// active download isn't reclaimed while the outbound side is quiet
@@ -6153,6 +6353,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = ipPath.Protocol
+	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.packet = MessagePoolShareReadOnly(packet)
 	item.packetByteCount = ByteCount(len(packet))
 	self.enqueueReturnItem(item)
@@ -6233,6 +6434,61 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 			packetBytes, err := ipPacketToProviderBytes(frame)
 			if err != nil {
 				panic(err)
+			}
+			if isIpv4FragmentPacket(packetBytes) {
+				result := self.ingressIpv4Fragments.processOwned(
+					source,
+					transferKey,
+					provideMode,
+					MessagePoolCopy(packetBytes),
+				)
+				if result.packet != nil {
+					var ipPath IpPath
+					payload, parseErr := parseIpPathWithPayloadBorrowed(result.packet, &ipPath)
+					if parseErr == nil && ipPath.Version == 4 && ipPath.Protocol == IpProtocolUdp {
+						r, inspectErr := inspectAndRefreshIngressForSenderBorrowed(
+							self.securityPolicy,
+							source.SourceId,
+							provideMode,
+							ipPath,
+							payload,
+						)
+						if inspectErr == nil && r == SecurityPolicyResultAllow {
+							if 0 < len(result.fragments) && appendIpPacketGroup(
+								&packetGroups,
+								packetGroupsByKey,
+								&ipPath,
+								payload,
+								result.fragments[0],
+							) {
+								for _, fragment := range result.fragments[1:] {
+									if !appendIpPacketGroup(
+										&packetGroups,
+										packetGroupsByKey,
+										&ipPath,
+										payload,
+										fragment,
+									) {
+										panic("validated IPv4 fragment group lost its flow identity")
+									}
+								}
+								result.fragments = nil
+							}
+						} else if inspectErr == nil {
+							var fragmentByteCount int64
+							for _, fragment := range result.fragments {
+								fragmentByteCount += int64(len(fragment))
+							}
+							self.packetStatsCounters.blockIngressPacketCount.Add(int64(len(result.fragments)))
+							self.packetStatsCounters.blockIngressByteCount.Add(fragmentByteCount)
+							if r == SecurityPolicyResultIncident {
+								self.client.ReportAbuse(source)
+							}
+						}
+					}
+				}
+				returnIpv4FragmentProcessResult(result)
+				continue
 			}
 
 			var ipPath IpPath
@@ -6322,8 +6578,11 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 				0,
 			)
 			if success {
-				self.packetStatsCounters.remoteIngressPacketCount.Add(int64(len(packetGroup.packets)))
-				self.packetStatsCounters.remoteIngressByteCount.Add(int64(packetGroup.byteCount))
+				self.packetStatsCounters.recordRemoteIngress(
+					peer.TransportType,
+					int64(len(packetGroup.packets)),
+					packetGroup.byteCount,
+				)
 			} else {
 				self.congestionDrops.addIngressNat(len(packetGroup.packets), packetGroup.byteCount)
 				for _, packet := range packetGroup.packets {
@@ -6358,6 +6617,8 @@ func (self *RemoteUserNatProvider) Close() {
 		if self.cancel != nil {
 			self.cancel()
 		}
+		self.ingressIpv4Fragments.close()
+		self.egressIpv4Fragments.close()
 		self.returnStateLock.Lock()
 		self.returnClosed = true
 		self.returnStateLock.Unlock()
@@ -6387,6 +6648,8 @@ type RemoteUserNatClient struct {
 	receivePacketCallback ReceivePacketFunction
 	securityPolicy        SecurityPolicy
 	smtpEgressGuard       smtpEgressGuard
+	egressIpv4Fragments   ipv4FragmentGate
+	ingressIpv4Fragments  ipv4FragmentGate
 	pathTable             *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
@@ -6461,6 +6724,33 @@ func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyS
 
 // `SendPacketFunction`
 func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
+	if isIpv4FragmentPacket(packet) {
+		result := self.egressIpv4Fragments.processOwned(
+			source,
+			TransferKey{},
+			provideMode,
+			packet,
+		)
+		if result.packet != nil {
+			if self.sendReassembledIpv4UdpFragments(
+				source,
+				provideMode,
+				result.packet,
+				result.fragments,
+				timeout,
+			) {
+				// The local NAT or Transfer now owns every original fragment.
+				result.fragments = nil
+			}
+		}
+		returnIpv4FragmentProcessResult(result)
+		// Fragment admission consumes the input even when the completed
+		// datagram is rejected by policy. Returning true preserves the
+		// SendPacket ownership contract; block/drop accounting happens at the
+		// completed-datagram boundary.
+		return true
+	}
+
 	relationship := egressRelationship(provideMode, self.provideMode)
 
 	var ipPath IpPath
@@ -6541,6 +6831,80 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 	}
 }
 
+// Runs device-side policy once on a complete fragmented UDP datagram, then
+// forwards the original MTU-sized IPv4 fragments as one ordered Transfer
+// group. Other fragmented protocols are rejected; TCP should segment at MSS,
+// and accepting a partial TCP/SMTP header would create a policy-evasion path.
+func (self *RemoteUserNatClient) sendReassembledIpv4UdpFragments(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	reassembled []byte,
+	fragments [][]byte,
+	timeout time.Duration,
+) bool {
+	if len(fragments) == 0 {
+		return false
+	}
+	ipPath, payload, err := ParseIpPathWithPayload(reassembled)
+	if err != nil || ipPath.Version != 4 || ipPath.Protocol != IpProtocolUdp {
+		return false
+	}
+	relationship := egressRelationship(provideMode, self.provideMode)
+	r, err := inspectAndRefreshEgressBorrowed(self.securityPolicy, relationship, *ipPath, payload)
+	if err != nil {
+		return false
+	}
+	if r == SecurityPolicyResultDrop && self.LocalSecurityBypass() {
+		return self.localUserNat != nil && self.localUserNat.SendPackets(
+			source,
+			provideMode,
+			fragments,
+			timeout,
+		)
+	}
+	if r != SecurityPolicyResultAllow || self.client == nil || self.pathTable == nil {
+		return false
+	}
+	destination, err := self.pathTable.SelectDestination(reassembled)
+	if err != nil {
+		return false
+	}
+	frames := make([]*protocol.Frame, len(fragments))
+	for i, fragment := range fragments {
+		frame, frameErr := ipPacketToProviderFrame(fragment, DefaultProtocolVersion)
+		if frameErr != nil {
+			for _, built := range frames[:i] {
+				if !built.Raw {
+					MessagePoolReturn(built.MessageBytes)
+				}
+			}
+			return false
+		}
+		frames[i] = frame
+	}
+	success, sendErr := self.client.sendMultiHopGroupWithTimeoutDetailed(
+		frames,
+		destination,
+		func(error) {},
+		timeout,
+		scheduleIpFlow(ipPath),
+	)
+	if sendErr != nil || !success {
+		for _, frame := range frames {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		return false
+	}
+	for i, frame := range frames {
+		if !frame.Raw {
+			MessagePoolReturn(fragments[i])
+		}
+	}
+	return true
+}
+
 // SendPacketBatch consumes every packet and reports the exact number accepted
 // by the basic remote client's existing per-packet multi-hop send path.
 func (self *RemoteUserNatClient) SendPacketBatch(
@@ -6575,11 +6939,43 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			if err != nil {
 				panic(err)
 			}
+			if isIpv4FragmentPacket(packet) {
+				result := self.ingressIpv4Fragments.processOwned(
+					source,
+					peer.TransferKey,
+					peer.ProvideMode,
+					MessagePoolCopy(packet),
+				)
+				if result.packet != nil {
+					ipPath, parseErr := ParseIpPath(result.packet)
+					if parseErr == nil && ipPath.Version == 4 && ipPath.Protocol == IpProtocolUdp {
+						self.smtpEgressGuard.retireReturn(ipPath)
+						self.securityPolicy.RefreshIngress(ipPath)
+						for _, fragment := range result.fragments {
+							fragment := fragment
+							HandleError(func() {
+								self.receivePacketCallback(
+									source,
+									peer.ProvideMode,
+									ipPath,
+									fragment,
+								)
+							})
+						}
+					}
+				}
+				returnIpv4FragmentProcessResult(result)
+				continue
+			}
 
 			ipPath, err := ParseIpPath(packet)
 			if err == nil {
 				self.smtpEgressGuard.retireReturn(ipPath)
 				self.securityPolicy.RefreshIngress(ipPath)
+				// Deliberate device-TUN exception from CODESTYLE.md: Transfer
+				// acknowledges only after this borrowed packet returns, so the
+				// synchronous final injection is its receive-side flow control.
+				// This exception does not permit another send or queued wait here.
 				HandleError(func() {
 					self.receivePacketCallback(
 						source,
@@ -6600,6 +6996,8 @@ func (self *RemoteUserNatClient) Shuffle() {
 func (self *RemoteUserNatClient) Close() {
 	// self.client.RemoveReceiveCallback(self.clientCallbackId)
 	self.cancel()
+	self.egressIpv4Fragments.close()
+	self.ingressIpv4Fragments.close()
 	self.localUserNat.Close()
 	self.localUserNatUnsub()
 	self.clientUnsub()
@@ -6729,10 +7127,19 @@ type IpPath struct {
 
 	SequenceNumber    uint32
 	AckSequenceNumber uint32
-	Syn               bool
-	Fin               bool
-	Rst               bool
-	Ack               bool
+	// TcpWindowSize is the raw 16-bit advertised receive window. Keeping it in
+	// the parsed path lets tunnel collapse prevention distinguish a genuine
+	// zero-window close/reopen from a duplicate ACK; the negotiated scale is
+	// irrelevant for that change detector.
+	TcpWindowSize uint16
+	// TcpPayloadByteCount makes the FIN edge unambiguous: a FIN can legally
+	// share a segment with application bytes, and its acknowledged sequence is
+	// therefore seq + payload + 1 rather than merely seq + 1.
+	TcpPayloadByteCount int
+	Syn                 bool
+	Fin                 bool
+	Rst                 bool
+	Ack                 bool
 
 	ServerName string
 }
@@ -6809,18 +7216,20 @@ func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, er
 		}
 
 		*ipPath = IpPath{
-			Version:           int(ipVersion),
-			Protocol:          IpProtocolTcp,
-			SourceIp:          sourceIp,
-			SourcePort:        int(tcp.sourcePort),
-			DestinationIp:     destinationIp,
-			DestinationPort:   int(tcp.destinationPort),
-			SequenceNumber:    tcp.seq,
-			AckSequenceNumber: tcp.ackNumber,
-			Syn:               tcp.syn,
-			Fin:               tcp.fin,
-			Rst:               tcp.rst,
-			Ack:               tcp.ack,
+			Version:             int(ipVersion),
+			Protocol:            IpProtocolTcp,
+			SourceIp:            sourceIp,
+			SourcePort:          int(tcp.sourcePort),
+			DestinationIp:       destinationIp,
+			DestinationPort:     int(tcp.destinationPort),
+			SequenceNumber:      tcp.seq,
+			AckSequenceNumber:   tcp.ackNumber,
+			TcpWindowSize:       tcp.windowSize,
+			TcpPayloadByteCount: len(tcp.payload),
+			Syn:                 tcp.syn,
+			Fin:                 tcp.fin,
+			Rst:                 tcp.rst,
+			Ack:                 tcp.ack,
 		}
 		return tcp.payload, nil
 	default:
