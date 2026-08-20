@@ -138,6 +138,14 @@ const (
 	dmcaBittorrent    dmcaVerdict = 3
 )
 
+// dmcaFlowKey separates identical virtual tuples by the authenticated sender
+// at a provider. Device-side policies use the zero id because they have one
+// local owner.
+type dmcaFlowKey struct {
+	senderClientId Id
+	ip6Path        Ip6Path
+}
+
 // dmcaFlowState is the per-flow state machine. It implements UserLimited so the
 // shared applyLruUserLimit eviction can bound memory.
 type dmcaFlowState struct {
@@ -147,7 +155,11 @@ type dmcaFlowState struct {
 	// taking mu, so steady-state packets on a decided flow are lock-free
 	terminal int32
 
-	key Ip6Path
+	key dmcaFlowKey
+	// These identify the TCP generation that created the state. They are set
+	// before publication and remain immutable.
+	synSeen     bool
+	synSequence uint32
 
 	// mu guards the inspection bookkeeping below, touched only while INSPECTING
 	mu               sync.Mutex
@@ -251,7 +263,7 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 
 type dmcaFlowShard struct {
 	mu    sync.RWMutex
-	flows map[Ip6Path]*dmcaFlowState
+	flows map[dmcaFlowKey]*dmcaFlowState
 }
 
 type dmcaDetector struct {
@@ -276,7 +288,7 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 	}
 	for i := range self.shards {
 		self.shards[i] = &dmcaFlowShard{
-			flows: map[Ip6Path]*dmcaFlowState{},
+			flows: map[dmcaFlowKey]*dmcaFlowState{},
 		}
 	}
 	// reclaim flows idle past FlowTtl. The capacity-LRU eviction (evictWithLock) still
@@ -336,7 +348,7 @@ func (self *dmcaDetector) flowCount() int {
 // refresh updates a tracked flow's last-activity time — the eviction key for both the idle scan
 // and the capacity-LRU. An untracked key (a privileged-port flow, or one already evicted) is a
 // no-op; reverse-direction packets never create state.
-func (self *dmcaDetector) refresh(key Ip6Path) {
+func (self *dmcaDetector) refresh(key dmcaFlowKey) {
 	shard := self.shards[dmcaShardIndex(key)]
 	shard.mu.RLock()
 	st := shard.flows[key]
@@ -346,9 +358,46 @@ func (self *dmcaDetector) refresh(key Ip6Path) {
 	}
 }
 
+// remove retires one exact sender-owned flow.
+func (self *dmcaDetector) remove(key dmcaFlowKey) {
+	shard := self.shards[dmcaShardIndex(key)]
+	shard.mu.Lock()
+	delete(shard.flows, key)
+	shard.mu.Unlock()
+}
+
+// removeSender retires all flow state owned by one authenticated sender.
+func (self *dmcaDetector) removeSender(senderClientId Id) {
+	for _, shard := range self.shards {
+		shard.mu.Lock()
+		for key := range shard.flows {
+			if key.senderClientId == senderClientId {
+				delete(shard.flows, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+}
+
+// dmcaFlowKeyForPath canonicalizes the directional egress tuple.
+func dmcaFlowKeyForPath(senderClientId Id, ipPath *IpPath) dmcaFlowKey {
+	ip6Path := ipPath.ToIp6Path()
+	// The affinity server name is not part of the transport flow identity.
+	ip6Path.ServerName = ""
+	return dmcaFlowKey{
+		senderClientId: senderClientId,
+		ip6Path:        ip6Path,
+	}
+}
+
 // touchEgress refreshes a flow from a sent (client->destination) packet — the packet's 5-tuple is
 // the flow key directly.
 func (self *dmcaDetector) touchEgress(ipPath *IpPath) {
+	self.touchEgressForSender(Id{}, ipPath)
+}
+
+// touchEgressForSender refreshes or retires one sender-owned outbound flow.
+func (self *dmcaDetector) touchEgressForSender(senderClientId Id, ipPath *IpPath) {
 	if !self.settings.Enabled {
 		return
 	}
@@ -361,15 +410,23 @@ func (self *dmcaDetector) touchEgress(ipPath *IpPath) {
 	if ipPath.DestinationPort < 1024 {
 		return
 	}
-	key := ipPath.ToIp6Path()
-	// the flow 5-tuple is the identity here; the affinity ServerName is not set
-	key.ServerName = ""
+	key := dmcaFlowKeyForPath(senderClientId, ipPath)
+	if ipPath.Protocol == IpProtocolTcp && (ipPath.Fin || ipPath.Rst) {
+		self.remove(key)
+		return
+	}
 	self.refresh(key)
 }
 
 // touchIngress refreshes a flow from a received (destination->client) packet, reversing the
 // 5-tuple to the egress key the flow is stored under.
 func (self *dmcaDetector) touchIngress(ipPath *IpPath) {
+	self.touchIngressForSender(Id{}, ipPath)
+}
+
+// touchIngressForSender maps a sender-owned return packet back to its outbound
+// flow. Either direction's TCP teardown retires the state immediately.
+func (self *dmcaDetector) touchIngressForSender(senderClientId Id, ipPath *IpPath) {
 	if !self.settings.Enabled {
 		return
 	}
@@ -382,25 +439,51 @@ func (self *dmcaDetector) touchIngress(ipPath *IpPath) {
 	if ipPath.SourcePort < 1024 {
 		return
 	}
-	key := ipPath.Reverse().ToIp6Path()
-	key.ServerName = ""
+	reversePath := ipPath.Reverse()
+	key := dmcaFlowKeyForPath(senderClientId, reversePath)
+	if ipPath.Protocol == IpProtocolTcp && (ipPath.Fin || ipPath.Rst) {
+		self.remove(key)
+		return
+	}
 	self.refresh(key)
 }
 
-func dmcaShardIndex(key Ip6Path) int {
-	// FNV-1a over the destination ip + ports; distribution, not security
+// retireEgressForSender removes state when the provider NAT closes a TCP
+// sequence without observing a wire teardown.
+func (self *dmcaDetector) retireEgressForSender(senderClientId Id, ipPath *IpPath) {
+	if !self.settings.Enabled || ipPath == nil || ipPath.Protocol != IpProtocolTcp ||
+		ipPath.DestinationPort < 1024 {
+		return
+	}
+	self.remove(dmcaFlowKeyForPath(senderClientId, ipPath))
+}
+
+func dmcaShardIndex(key dmcaFlowKey) int {
+	// FNV-1a over the sender, destination ip, and ports; distribution only.
 	h := uint32(2166136261)
-	for _, b := range key.DestinationIp {
+	for _, b := range key.senderClientId {
 		h = (h ^ uint32(b)) * 16777619
 	}
-	h = (h ^ uint32(key.SourcePort)) * 16777619
-	h = (h ^ uint32(key.DestinationPort)) * 16777619
+	for _, b := range key.ip6Path.DestinationIp {
+		h = (h ^ uint32(b)) * 16777619
+	}
+	h = (h ^ uint32(key.ip6Path.SourcePort)) * 16777619
+	h = (h ^ uint32(key.ip6Path.DestinationPort)) * 16777619
 	return int(h % dmcaFlowShards)
 }
 
 // classify advances the per-flow state machine and returns the raw verdict
 // (consulting the injected web-standards detector during inspection).
 func (self *dmcaDetector) classify(ipPath *IpPath, payload []byte) dmcaVerdict {
+	return self.classifyForSender(Id{}, ipPath, payload)
+}
+
+// classifyForSender advances state scoped to an authenticated provider sender.
+func (self *dmcaDetector) classifyForSender(
+	senderClientId Id,
+	ipPath *IpPath,
+	payload []byte,
+) dmcaVerdict {
 	if !self.settings.Enabled {
 		return dmcaAllow
 	}
@@ -419,30 +502,73 @@ func (self *dmcaDetector) classify(ipPath *IpPath, payload []byte) dmcaVerdict {
 		return dmcaAllow
 	}
 
-	key := ipPath.ToIp6Path()
-	// the flow 5-tuple is the identity here; the affinity ServerName is not set
-	key.ServerName = ""
+	key := dmcaFlowKeyForPath(senderClientId, ipPath)
 	shard := self.shards[dmcaShardIndex(key)]
 
-	shard.mu.RLock()
-	st := shard.flows[key]
-	shard.mu.RUnlock()
-	if st == nil {
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Rst {
 		shard.mu.Lock()
-		st = shard.flows[key]
-		if st == nil {
-			// seed the activity time on creation; ongoing refreshes come from the per-direction
-			// RefreshEgress/RefreshIngress calls at the forwarding points
-			st = &dmcaFlowState{key: key, lastActivityUnixNanos: time.Now().UnixNano()}
-			self.evictWithLock(shard)
-			shard.flows[key] = st
-		}
+		delete(shard.flows, key)
 		shard.mu.Unlock()
+		return dmcaAllow
 	}
 
-	v := dmcaVerdict(atomic.LoadInt32(&st.terminal))
+	createState := func() *dmcaFlowState {
+		state := &dmcaFlowState{
+			key:                   key,
+			lastActivityUnixNanos: time.Now().UnixNano(),
+		}
+		if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
+			state.synSeen = true
+			state.synSequence = ipPath.SequenceNumber
+		}
+		return state
+	}
+
+	var state *dmcaFlowState
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
+		// A SYN is the generation boundary. Serialize its replacement so a new
+		// connection cannot inherit a terminal verdict from tuple reuse.
+		shard.mu.Lock()
+		state = shard.flows[key]
+		if state == nil || !state.synSeen || state.synSequence != ipPath.SequenceNumber {
+			replacing := state != nil
+			state = createState()
+			if !replacing {
+				self.evictWithLock(shard)
+			}
+			shard.flows[key] = state
+		}
+		shard.mu.Unlock()
+	} else {
+		shard.mu.RLock()
+		state = shard.flows[key]
+		shard.mu.RUnlock()
+		if state == nil {
+			shard.mu.Lock()
+			state = shard.flows[key]
+			if state == nil {
+				// Ongoing refreshes come from the per-direction forwarding points.
+				state = createState()
+				self.evictWithLock(shard)
+				shard.flows[key] = state
+			}
+			shard.mu.Unlock()
+		}
+	}
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Fin {
+		// Inspect a payload-bearing FIN, then retire only the generation seen here.
+		defer func() {
+			shard.mu.Lock()
+			defer shard.mu.Unlock()
+			if shard.flows[key] == state {
+				delete(shard.flows, key)
+			}
+		}()
+	}
+
+	v := dmcaVerdict(atomic.LoadInt32(&state.terminal))
 	if dmcaInspecting == v {
-		v = st.advance(ipPath, payload, self.settings, self.web)
+		v = state.advance(ipPath, payload, self.settings, self.web)
 	}
 	return v
 }
@@ -464,7 +590,7 @@ func (self *dmcaDetector) evictWithLock(shard *dmcaFlowShard) {
 	if len(shard.flows) < self.perShardCap {
 		return
 	}
-	applyLruMapLimit(shard.flows, self.perShardCap-1, func(key Ip6Path, st *dmcaFlowState) bool {
+	applyLruMapLimit(shard.flows, self.perShardCap-1, func(key dmcaFlowKey, st *dmcaFlowState) bool {
 		delete(shard.flows, key)
 		return true
 	})

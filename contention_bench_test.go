@@ -8,6 +8,7 @@ package connect
 import (
 	"context"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,6 +47,38 @@ func BenchmarkRouteSelectorWrite(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+}
+
+// Compares the atomic writer-lifecycle admission with the previous immutable
+// snapshot load and direct route send. Both cases retain identical channel
+// transfer work, so their delta isolates the teardown-safety cost.
+func BenchmarkRouteSnapshotWriterAdmission(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selector := NewMultiRouteSelector(ctx, "bench", nil, SourceId(NewId()), true)
+	defer selector.Close()
+	route := make(chan []byte, 1)
+	selector.updateTransport(NewSendGatewayTransport(), []Route{route})
+	frame := make([]byte, 1400)
+
+	b.Run("immutable_snapshot_control", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			snapshot := selector.activeRoutesSnapshot.Load()
+			snapshot.routes[0] <- frame
+			<-route
+		}
+	})
+	b.Run("atomic_writer_admission", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			snapshot := selector.acquireWriterSnapshot()
+			snapshot.routes[0] <- frame
+			snapshot.releaseWriter()
+			<-route
+		}
+	})
 }
 
 // isolates the route-selector read hot path (one active route).
@@ -112,11 +145,7 @@ func BenchmarkMultiClientEgressParallel(b *testing.B) {
 	defer cancel()
 
 	providerClientId := NewId()
-	settings := DefaultClientSettings()
-	settings.SendBufferSettings.SequenceBufferSize = 0
-	settings.SendBufferSettings.AckBufferSize = 0
-	settings.ReceiveBufferSettings.SequenceBufferSize = 0
-	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	settings := DefaultClientSettingsWithBufferSize(256)
 	providerClient := NewClient(ctx, providerClientId, NewNoContractClientOob(), settings)
 	defer providerClient.Cancel()
 
@@ -130,6 +159,7 @@ func BenchmarkMultiClientEgressParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer natClient.Close()
 
 	clientId := NewId()
 	source := SourceId(clientId)
@@ -175,18 +205,55 @@ func BenchmarkMultiClientBidirectional(b *testing.B) {
 	defer cancel()
 
 	providerClientId := NewId()
-	settings := DefaultClientSettings()
-	settings.SendBufferSettings.SequenceBufferSize = 0
-	settings.SendBufferSettings.AckBufferSize = 0
-	settings.ReceiveBufferSettings.SequenceBufferSize = 0
-	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	settings := DefaultClientSettingsWithBufferSize(256)
 	providerClient := NewClient(ctx, providerClientId, NewNoContractClientOob(), settings)
 	defer providerClient.Cancel()
 
+	type providerEcho struct {
+		packet      []byte
+		destination Id
+		transferKey TransferKey
+	}
+	providerEchoes := make(chan providerEcho, 1024)
+	var providerEchoWaitGroup sync.WaitGroup
+	workerCount := min(runtime.GOMAXPROCS(0), 4)
+	for range workerCount {
+		providerEchoWaitGroup.Add(1)
+		go func() {
+			defer providerEchoWaitGroup.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					for {
+						select {
+						case echo := <-providerEchoes:
+							MessagePoolReturn(echo.packet)
+						default:
+							return
+						}
+					}
+				case echo := <-providerEchoes:
+					success, _ := providerClient.sendRawWithTimeoutDetailed(
+						protocol.MessageType_IpIpPacketFromProvider,
+						echo.packet,
+						echo.destination,
+						nil,
+						0,
+						time.Second,
+						echo.transferKey,
+					)
+					if !success {
+						MessagePoolReturn(echo.packet)
+					}
+				}
+			}
+		}()
+	}
 	// the provider echoes each received packet back with the path reversed, so
 	// the echo lands on the originating flow's update (the steady-state ingress
-	// path).
-	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	// path). The shared receive callback only performs a bounded zero-wait
+	// handoff; fixed workers own the blocking transfer sends.
+	providerReceiveUnsub := providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			packet, err := ipPacketToProviderBytes(frame)
 			if err != nil {
@@ -199,16 +266,23 @@ func BenchmarkMultiClientBidirectional(b *testing.B) {
 			}
 			reversed := ipPath.ReverseValue()
 			echo := ipOosPacket(&reversed, payload)
-			providerClient.sendRawWithTimeoutDetailed(
-				protocol.MessageType_IpIpPacketFromProvider,
-				echo,
-				source.Reverse(),
-				nil,
-				0,
-				-1,
-			)
+			select {
+			case providerEchoes <- providerEcho{
+				packet:      echo,
+				destination: source.SourceId,
+				transferKey: peer.TransferKey,
+			}:
+			default:
+				MessagePoolReturn(echo)
+			}
 		}
 	})
+	defer func() {
+		providerReceiveUnsub()
+		cancel()
+		providerClient.Cancel()
+		providerEchoWaitGroup.Wait()
+	}()
 
 	var receiveCount atomic.Int64
 	natClient, err := testingNewMultiClient(
@@ -221,6 +295,7 @@ func BenchmarkMultiClientBidirectional(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer natClient.Close()
 
 	clientId := NewId()
 	source := SourceId(clientId)

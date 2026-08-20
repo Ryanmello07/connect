@@ -323,7 +323,7 @@ func TestChannelInterceptDoesNotBumpReceiveCounters(t *testing.T) {
 		args:        &multiClientChannelArgs{},
 		settings:    DefaultMultiClientSettings(),
 		packetStats: &clientWindowStats{log: DefaultLogger()},
-		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, transportType TransportType, ipPath *IpPath, packet []byte) {
 		},
 		dialFailureCallback: func(sourceClient *multiClientChannel, egressIpPath *IpPath) bool {
 			gotClient = sourceClient
@@ -487,11 +487,11 @@ func TestSendPathInferenceUsesDialProbePacket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 	if !strings.Contains(body, "dialProbePacket(ipPath)") {
-		t.Error("sendPacket does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
+		t.Error("sendParsedPacketGroup does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
 	}
 }

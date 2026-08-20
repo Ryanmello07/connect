@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,11 +90,7 @@ func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	settings := DefaultClientSettings()
-	settings.SendBufferSettings.SequenceBufferSize = 0
-	settings.SendBufferSettings.AckBufferSize = 0
-	settings.ReceiveBufferSettings.SequenceBufferSize = 0
-	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	settings := DefaultClientSettingsWithBufferSize(32)
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 
 	received := make(chan struct{}, 32)
@@ -157,6 +154,13 @@ func TestMultiClientRejectedRaceAttemptRetainsOriginalPacket(t *testing.T) {
 	clientCtx, clientCancel := context.WithCancel(context.Background())
 	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	clientCancel()
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := client.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("join rejected race client: %v", err)
+		}
+	})
 
 	settings := DefaultMultiClientSettings()
 	channelCtx, channelCancel := context.WithCancel(context.Background())
@@ -210,6 +214,13 @@ func TestMultiClientRejectedRaceAttemptRetainsSuccessfulSiblingPacket(t *testing
 	clientCtx, clientCancel := context.WithCancel(context.Background())
 	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	clientCancel()
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := client.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("join mixed race client: %v", err)
+		}
+	})
 
 	channelCtx, channelCancel := context.WithCancel(context.Background())
 	defer channelCancel()
@@ -255,22 +266,148 @@ func TestMultiClientRejectedRaceAttemptRetainsSuccessfulSiblingPacket(t *testing
 	}
 }
 
+// The production multi-client race fans one original packet into every
+// candidate. When every candidate refuses admission, each candidate returns
+// exactly its share and sendPacket leaves the original with its caller.
+func TestMultiClientRejectedProductionRaceRetainsOriginalPacket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultMultiClientSettings()
+	settings.DestinationAffinity = false
+	generator := &TestMultiClientGenerator{}
+	clients := map[Id]*multiClientChannel{}
+	for clientIndex := 0; clientIndex < 2; clientIndex += 1 {
+		clientCtx, clientCancel := context.WithCancel(ctx)
+		client := NewClient(
+			clientCtx,
+			NewId(),
+			NewNoContractClientOob(),
+			DefaultClientSettings(),
+		)
+		clientCancel()
+		t.Cleanup(func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer closeCancel()
+			if err := client.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("join production race client: %v", err)
+			}
+		})
+		channelCtx, channelCancel := context.WithCancel(ctx)
+		defer channelCancel()
+		channel := &multiClientChannel{
+			ctx:                       channelCtx,
+			cancel:                    channelCancel,
+			log:                       NewNoopLogger(),
+			args:                      &multiClientChannelArgs{},
+			settings:                  settings,
+			client:                    client,
+			eventBuckets:              []*multiClientEventBucket{},
+			ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
+			ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
+			packetStats:               &clientWindowStats{log: NewNoopLogger()},
+		}
+		clients[client.ClientId()] = channel
+	}
+	window := &multiClientWindow{
+		ctx:        ctx,
+		log:        NewNoopLogger(),
+		generator:  generator,
+		windowType: WindowTypeQuality,
+		settings:   settings,
+		clients:    clients,
+	}
+	multiClient := &RemoteUserNatMultiClient{
+		ctx:                ctx,
+		cancel:             cancel,
+		log:                NewNoopLogger(),
+		generator:          generator,
+		settings:           settings,
+		windows:            map[WindowType]*multiClientWindow{WindowTypeQuality: window},
+		ip4PathUpdates:     map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:     map[Ip6Path]*multiClientChannelUpdate{},
+		affinityIp4Paths:   map[Ip4Path]map[Ip4Path]time.Time{},
+		affinityIp6Paths:   map[Ip6Path]map[Ip6Path]time.Time{},
+		clientUpdates:      map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		reliabilityMetrics: newReliabilityMetrics(),
+	}
+	if candidates := multiClient.raceCandidates(window); len(candidates) != 2 {
+		t.Fatalf("production race candidates=%d, want=2", len(candidates))
+	}
+	packet := poolBalanceUdp4Packet(
+		net.ParseIP("10.0.0.1"),
+		40000,
+		net.ParseIP("203.0.113.7"),
+		33434,
+		[]byte("rejected production race ownership"),
+	)
+	parsedPacket, err := newParsedPacket(packet)
+	if err != nil {
+		MessagePoolReturn(packet)
+		t.Fatalf("parse production race packet: %v", err)
+	}
+	if multiClient.sendPacket(
+		SourceId(NewId()),
+		protocol.ProvideMode_Network,
+		parsedPacket,
+		0,
+	) {
+		MessagePoolReturn(packet)
+		t.Fatal("canceled production candidates accepted race packet")
+	}
+	if pooled, _ := MessagePoolCheck(packet); !pooled {
+		t.Fatal("rejected production race returned the caller's original packet")
+	}
+	if returned := MessagePoolReturn(packet); !returned {
+		t.Fatal("production race caller did not retain the final packet reference")
+	}
+}
+
 // runMultiClientPoolCycle is one destination-change cycle: an in-memory exit, a
 // multi-client over it, a burst of egress packets, then teardown of both.
 func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 	cycleCtx, cycleCancel := context.WithCancel(ctx)
 	defer cycleCancel()
 
-	clientSettings := DefaultClientSettings()
-	clientSettings.SendBufferSettings.SequenceBufferSize = 0
-	clientSettings.SendBufferSettings.AckBufferSize = 0
-	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
-	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
+	clientSettings := DefaultClientSettingsWithBufferSize(32)
 	providerClient := NewClient(cycleCtx, NewId(), NewNoContractClientOob(), clientSettings)
-	defer providerClient.Cancel()
+
+	type providerEcho struct {
+		frame       *protocol.Frame
+		destination Id
+		transferKey TransferKey
+	}
+	providerEchoes := make(chan providerEcho, 32)
+	var providerEchoWaitGroup sync.WaitGroup
+	providerEchoWaitGroup.Add(1)
+	go func() {
+		defer providerEchoWaitGroup.Done()
+		for {
+			select {
+			case <-cycleCtx.Done():
+				for {
+					select {
+					case echo := <-providerEchoes:
+						MessagePoolReturn(echo.frame.MessageBytes)
+					default:
+						return
+					}
+				}
+			case echo := <-providerEchoes:
+				if !providerClient.SendWithTimeout(
+					echo.frame,
+					echo.destination,
+					func(error) {},
+					time.Second,
+					echo.transferKey,
+				) {
+					MessagePoolReturn(echo.frame.MessageBytes)
+				}
+			}
+		}
+	}()
 
 	// echo any IpPacketToProvider back with the path reversed, like an exit would
-	providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
+	providerReceiveUnsub := providerClient.AddReceiveCallback(func(src TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			if frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
 				continue
@@ -294,12 +431,23 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 				MessagePoolReturn(packet)
 				continue
 			}
-			sent := providerClient.SendWithTimeout(frame, src.Reverse(), func(err error) {}, -1)
-			if !sent {
+			select {
+			case providerEchoes <- providerEcho{
+				frame:       frame,
+				destination: src.SourceId,
+				transferKey: peer.TransferKey,
+			}:
+			default:
 				MessagePoolReturn(frame.MessageBytes)
 			}
 		}
 	})
+	defer func() {
+		providerReceiveUnsub()
+		cycleCancel()
+		providerClient.Cancel()
+		providerEchoWaitGroup.Wait()
+	}()
 
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats

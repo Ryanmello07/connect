@@ -3,6 +3,7 @@ package connect
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/maphash"
 	"io"
@@ -326,29 +327,37 @@ var orderedMessagePools = sync.OnceValue(func() []*messagePool {
 func poolStats(pools []*messagePool) {
 	// print stats from all pools on a regular interval
 	for {
-		for _, pool := range pools {
-			snapshot := pool.snapshot()
-			for tag := range 256 {
-				taken := snapshot.takenTags[tag]
-				returned := snapshot.returnedTags[tag]
-				created := snapshot.createdTags[tag]
-				if 0 < taken {
-					ratio := float32(returned) / float32(taken)
-					reuse := float32(taken-created) / float32(taken)
-					var caller string
-					func() {
-						debugStateLock.Lock()
-						defer debugStateLock.Unlock()
-						caller = strings.Join(slices.Collect(maps.Keys(tagCallers[uint8(tag)])), "/")
-					}()
+		// Per-tag pool efficiency is developer diagnostics: one line per pool
+		// per tag per cycle, which made this the largest single log source in
+		// the embedding services. Skip the whole pass unless the operator opts
+		// in, so the snapshots, the caller joins, and the debug lock are not
+		// paid for either. Embedders that need the aggregate without the
+		// volume read `MessagePoolCounts`/`MessagePoolUnpooledCounts`.
+		if v := DefaultLogger().V(1); v.Enabled() {
+			for _, pool := range pools {
+				snapshot := pool.snapshot()
+				for tag := range 256 {
+					taken := snapshot.takenTags[tag]
+					returned := snapshot.returnedTags[tag]
+					created := snapshot.createdTags[tag]
+					if 0 < taken {
+						ratio := float32(returned) / float32(taken)
+						reuse := float32(taken-created) / float32(taken)
+						var caller string
+						func() {
+							debugStateLock.Lock()
+							defer debugStateLock.Unlock()
+							caller = strings.Join(slices.Collect(maps.Keys(tagCallers[uint8(tag)])), "/")
+						}()
 
-					DefaultLogger().Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)
+						v.Infof("pool[%d] tag=%d [%s] r=%d/t=%d/c=%d = %.2f%% return / %.2f%% reuse\n", pool.size, tag, caller, returned, taken, created, 100*ratio, 100*reuse)
+					}
 				}
 			}
-		}
 
-		if taken, byteCount := MessagePoolUnpooledCounts(); 0 < taken {
-			DefaultLogger().Infof("pool[unpooled] t=%d bytes=%d\n", taken, byteCount)
+			if taken, byteCount := MessagePoolUnpooledCounts(); 0 < taken {
+				v.Infof("pool[unpooled] t=%d bytes=%d\n", taken, byteCount)
+			}
 		}
 
 		select {
@@ -400,7 +409,7 @@ func ResizeMessagePools(packetByteCount ByteCount, largeObjectByteCounts ...Byte
 func WarmMessagePools() {
 	for _, pool := range orderedMessagePools() {
 		if pool.size == packetPoolSize {
-			const maxWarmByteCount = 1 << 20
+			const maxWarmByteCount = 1024 * 1024
 			pool.warm(min(pool.capacity()/4, maxWarmByteCount/pool.size))
 		}
 	}
@@ -537,6 +546,28 @@ func MessagePool(targetSize int) (*messagePool, int) {
 
 func MessagePoolReadAll(r io.Reader) ([]byte, error) {
 	return MessagePoolReadAllWithTag(r, 0)
+}
+
+var ErrMessageTooLarge = errors.New("message exceeds byte limit")
+
+// MessagePoolReadAllLimit preserves MessagePoolReadAll's ownership contract
+// while putting a hard ceiling on data read from an untrusted framed stream.
+// On an error it returns no buffer, so callers never need to return a partial
+// message to the pool.
+func MessagePoolReadAllLimit(r io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("invalid message byte limit %d", maxBytes)
+	}
+
+	message, err := MessagePoolReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if maxBytes < int64(len(message)) {
+		MessagePoolReturn(message)
+		return nil, fmt.Errorf("%w: limit %d", ErrMessageTooLarge, maxBytes)
+	}
+	return message, nil
 }
 
 func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {

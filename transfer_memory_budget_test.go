@@ -493,7 +493,7 @@ func newBudgetTestSender(ctx context.Context, sendBudget *TransferMemoryBudget, 
 	clientSettings.SendBufferSettings.MaxResendInterval = 300 * time.Second
 	// plaintext, so the one-way (withheld ack) wirings never depend on a
 	// handshake round trip
-	clientSettings.EncryptionSettings.Encrypt = false
+	clientSettings.EncryptionSettings.Mode = EncryptionModeOff
 	return NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 }
 
@@ -501,7 +501,7 @@ func newBudgetTestSender(ctx context.Context, sendBudget *TransferMemoryBudget, 
 // return path so the receiver's acks drain the sender's resend queue.
 func attachBudgetTestPeer(ctx context.Context, sender *Client, withAcks bool, receiveCallback ReceiveFunction) *budgetTestPeer {
 	receiverSettings := DefaultClientSettings()
-	receiverSettings.EncryptionSettings.Encrypt = false
+	receiverSettings.EncryptionSettings.Mode = EncryptionModeOff
 	receiverClient := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 
 	forwardRoute := make(chan []byte)
@@ -568,7 +568,7 @@ func fillBudgetTestQueue(sender *Client, destinationId Id, payloadByteCount int,
 	for i := 0; i < maxMessages; i += 1 {
 		success := sender.SendWithTimeout(
 			budgetTestFrame(payloadByteCount),
-			DestinationId(destinationId),
+			destinationId,
 			func(err error) {},
 			500*time.Millisecond,
 		)
@@ -765,7 +765,7 @@ func TestTransferBudgetLiveness(t *testing.T) {
 			for j := 0; j < messagesPerPeer; j += 1 {
 				success := sender.SendWithTimeout(
 					budgetTestFrame(payloadByteCount),
-					DestinationId(peers[i].receiverClient.ClientId()),
+					peers[i].receiverClient.ClientId(),
 					func(err error) {
 						if err == nil {
 							ackCount.Add(1)
@@ -845,4 +845,72 @@ func TestTransferBudgetChurnBalance(t *testing.T) {
 		t.Errorf("expected borrowing across the churn cycles")
 	}
 	fmt.Printf("churn balance: reserved=released=%d across 4 cycles\n", reserved)
+}
+
+// The ordinary client matches the maximum unreliable message flight with
+// zero-wait receive headroom, while explicit buffer-size constructors retain
+// their caller-selected count for constrained and deadlock tests.
+func TestDefaultReceiveSequenceHandoffIsCountAndByteBounded(t *testing.T) {
+	settings := DefaultClientSettings()
+	if got := settings.ReceiveBufferSettings.SequenceBufferSize; got != 256 {
+		t.Fatalf("default receive sequence slots = %d, want 256", got)
+	}
+	if got := settings.ReceiveBufferSettings.SequenceBufferByteCount; got != kib(256) {
+		t.Fatalf("default receive sequence byte limit = %d, want %d", got, kib(256))
+	}
+
+	explicit := DefaultClientSettingsWithBufferSize(7)
+	if got := explicit.ReceiveBufferSettings.SequenceBufferSize; got != 7 {
+		t.Fatalf("explicit receive sequence slots = %d, want 7", got)
+	}
+}
+
+// Small frames may use independent count headroom, but encoded bytes waiting
+// for one ReceiveSequence worker never exceed the configured budget. Removing
+// one channel item immediately restores byte admission without waiting.
+func TestReceiveSequenceHandoffEnforcesByteBudgetWithoutBlocking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultReceiveBufferSettingsWithBufferSize(8)
+	settings.SequenceBufferByteCount = 100
+	sequence := newReceiveSequence(
+		ctx,
+		&Client{},
+		SourceId(NewId()),
+		NewId(),
+		TransferKey{},
+		settings,
+	)
+
+	newPack := func() *ReceivePack {
+		return &ReceivePack{
+			MessageByteCount:   40,
+			TransferFrameBytes: MessagePoolGet(40),
+		}
+	}
+	first := newPack()
+	second := newPack()
+	third := newPack()
+	for index, pack := range []*ReceivePack{first, second} {
+		if accepted, err := sequence.Pack(pack, 0); !accepted || err != nil {
+			t.Fatalf("admit pack %d: accepted=%t err=%v", index, accepted, err)
+		}
+	}
+	if accepted, err := sequence.Pack(third, 0); accepted || err != nil {
+		t.Fatalf("byte-overflow pack: accepted=%t err=%v", accepted, err)
+	}
+	if got := sequence.packQueueByteCount.Load(); got != 80 {
+		t.Fatalf("retained handoff bytes = %d, want 80", got)
+	}
+
+	dequeued := <-sequence.packs
+	sequence.releasePackQueue(dequeued)
+	dequeued.messagePoolReturn()
+	if accepted, err := sequence.Pack(third, 0); !accepted || err != nil {
+		t.Fatalf("readmit after dequeue: accepted=%t err=%v", accepted, err)
+	}
+	sequence.Close()
+	if got := sequence.packQueueByteCount.Load(); got != 0 {
+		t.Fatalf("closed sequence retained %d handoff bytes", got)
+	}
 }
