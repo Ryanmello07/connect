@@ -180,6 +180,7 @@ type ApiMultiClientGenerator struct {
 	newPlatformTransport func(
 		client *Client,
 		auth *ClientAuth,
+		targetMode TransportMode,
 		settings *PlatformTransportSettings,
 	) apiWindowPlatformTransport
 }
@@ -715,7 +716,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 			return
 		}
 	}
-	transport, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
+	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
 	// Enable return traffic for this client and block until the platform has
 	// committed the provide secret. The companion (Stream) contract on the return
 	// path is verified against this secret, so using the client before it is
@@ -787,7 +788,7 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 	client *Client,
 	auth *ClientAuth,
 	settings *PlatformTransportSettings,
-) (apiWindowPlatformTransport, uint64) {
+) (apiWindowPlatformTransport, TransportMode, uint64) {
 	targetMode, modePreferences, policyVersion := self.platformTransportPolicy()
 	settingsValue := *settings
 	if modePreferences != nil {
@@ -796,7 +797,7 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 	effectiveSettings := &settingsValue
 	var transport apiWindowPlatformTransport
 	if self.newPlatformTransport != nil {
-		transport = self.newPlatformTransport(client, auth, effectiveSettings)
+		transport = self.newPlatformTransport(client, auth, targetMode, effectiveSettings)
 	} else {
 		transport = NewPlatformTransportWithTargetMode(
 			client.Ctx(),
@@ -813,7 +814,7 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 			self.settings.PlatformTransportCreated(client, platformTransport)
 		}
 	}
-	return transport, policyVersion
+	return transport, targetMode, policyVersion
 }
 
 // MigrateClientTransport implements MultiClientGeneratorTransportMigrator.
@@ -890,7 +891,25 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			return
 		}
 
-		next, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
+		next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
+		brokeBeforeMake := false
+		if nextPlatform, ok := next.(*PlatformTransport); ok {
+			if currentPlatform, ok := current.(*PlatformTransport); ok &&
+				!nextPlatform.CanMakeBeforeBreakFrom(currentPlatform) {
+				// Two full H3 claims can exceed the platform memory cap. Recheck
+				// ownership before releasing the old carrier; transitions involving
+				// H1 use the bounded handoff and retain make-before-break instead.
+				self.transportLock.Lock()
+				stillCurrent := self.transports[client] == state && state.current == current
+				self.transportLock.Unlock()
+				if !stillCurrent {
+					next.Close()
+					return
+				}
+				current.Close()
+				brokeBeforeMake = true
+			}
+		}
 		connectTimeout := self.settings.MigrateConnectTimeout
 		if connectTimeout <= 0 {
 			connectTimeout = 60 * time.Second
@@ -910,8 +929,28 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 				return
 			case <-notify:
 			case <-connectTimer.C:
+				if brokeBeforeMake {
+					// The old full-H3 working set was released to respect the
+					// memory cap. It is no longer a usable fallback, so install the
+					// replacement even if its first dial has not connected yet. The
+					// PlatformTransport owns its reconnect loop and will continue
+					// trying under the requested policy.
+					swapped := false
+					self.transportLock.Lock()
+					if self.transports[client] == state && state.current == current {
+						state.current = next
+						state.policyVersion = nextPolicyVersion
+						swapped = true
+					}
+					self.transportLock.Unlock()
+					if !swapped {
+						next.Close()
+					}
+					return
+				}
 				// Keep the old transport: it is still a valid route, and the
-				// server's drain excuse/reconnect path remains the backstop.
+				// server's drain excuse/reconnect path remains the backstop. Closing
+				// the failed replacement also returns any temporary handoff loan.
 				// Disarm BEFORE closing the replacement so the close is the
 				// definitive "migration released" signal: the deferred disarm
 				// runs after this return, so an observer gating on the
@@ -945,7 +984,9 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 		}
 		// Only now break the old route. For the interval between next becoming
 		// connected and this close, RouteManager can carry traffic over both.
-		current.Close()
+		if !brokeBeforeMake {
+			current.Close()
+		}
 	})
 }
 
