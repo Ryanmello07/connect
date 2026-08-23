@@ -193,3 +193,16 @@ func checkLeafCount(n LeafCount) error {
 	}
 	return nil
 }
+
+// the index of the root of a tree with n leaves.
+//
+// the root sits at 2^d - 1 for a tree of depth d, so it is the one index that
+// is the same for every count in a doubling band — which is exactly why a
+// non-power-of-two count is refused here rather than quietly answered.
+func Root(n LeafCount) (NodeIndex, error) {
+	if err := checkLeafCount(n); err != nil {
+		return 0, err
+	}
+	w := NodeWidth(n)
+	return NodeIndex((uint32(1) << log2(w)) - 1), nil
+}

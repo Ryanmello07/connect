@@ -9,6 +9,7 @@ package mls
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -173,5 +174,44 @@ func TestTreeMathVectorFileShape(t *testing.T) {
 	// would have deleted the one assertion holding that down.
 	if totalNodes != 2036 {
 		t.Fatalf("nodes across the family: %d, want 2036", totalNodes)
+	}
+}
+
+func TestTreeMathVectorRoot(t *testing.T) {
+	vectors := loadTreeMathVectors(t)
+	for _, v := range vectors {
+		leafCount := LeafCount(v.NLeaves)
+		if got := NodeWidth(leafCount); got != v.NNodes {
+			t.Errorf("n_leaves %d: node width %d, want %d", v.NLeaves, got, v.NNodes)
+		}
+		root, err := Root(leafCount)
+		if err != nil {
+			t.Errorf("n_leaves %d: root: %v", v.NLeaves, err)
+			continue
+		}
+		if uint32(root) != v.Root {
+			t.Errorf("n_leaves %d: root %d, want %d", v.NLeaves, root, v.Root)
+		}
+	}
+
+	// a leaf count that is not a power of two is refused rather than answered
+	// for the enclosing full tree, which is what the appendix C pseudocode
+	// silently does.
+	if _, err := Root(3); !errors.Is(err, ErrLeafCountNotFull) {
+		t.Errorf("root of 3 leaves: %v, want %v", err, ErrLeafCountNotFull)
+	}
+	if _, err := Root(0); !errors.Is(err, ErrLeafCountRange) {
+		t.Errorf("root of 0 leaves: %v, want %v", err, ErrLeafCountRange)
+	}
+	if _, err := Root(MaxLeafCount + 1); !errors.Is(err, ErrLeafCountRange) {
+		t.Errorf("root past MaxLeafCount: %v, want %v", err, ErrLeafCountRange)
+	}
+
+	root, err := Root(MaxLeafCount)
+	if err != nil {
+		t.Fatalf("root of MaxLeafCount: %v", err)
+	}
+	if root != NodeIndex(1<<31)-1 {
+		t.Errorf("root of MaxLeafCount: %d, want %d", root, NodeIndex(1<<31)-1)
 	}
 }
