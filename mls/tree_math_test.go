@@ -677,3 +677,138 @@ func TestCheckLeafCount(t *testing.T) {
 		}
 	}
 }
+
+// the root index at every tree size the type can hold, which vector family 1
+// cannot reach.
+//
+// the family's ladder is 1 to 512 leaves, so it pins depths 0 to 9, and the one
+// other size the plan names is MaxLeafCount at depth 31. depths 10 to 30 are
+// asserted nowhere else in this plan. measured, against the family runner
+// alone: a version wrong across exactly that band passes, and so does one wrong
+// at depth 20 alone, or at depth 10 alone. depths 0, 9 and 31 were measured too
+// and are already held, so the ladder's ends and the plan's MaxLeafCount row
+// are load-bearing rather than decoration.
+//
+// the sweeps take their expectation from the loop's own exponent, never from
+// log2 or NodeWidth, so they cannot agree with a wrong version by construction.
+func TestRoot(t *testing.T) {
+	// hand-computed from 2^d - 1, one per octave the family stops short of.
+	rootCases := []struct {
+		leafCount LeafCount
+		root      NodeIndex
+	}{
+		{leafCount: 1, root: 0},
+		{leafCount: 2, root: 1},
+		{leafCount: 4, root: 3},
+		{leafCount: 8, root: 7},
+		{leafCount: 512, root: 511},
+		{leafCount: 1024, root: 1023},
+		{leafCount: 65536, root: 65535},
+		{leafCount: 1 << 20, root: 1<<20 - 1},
+		{leafCount: 1 << 25, root: 1<<25 - 1},
+		{leafCount: 1 << 30, root: 1<<30 - 1},
+		{leafCount: MaxLeafCount, root: 0x7FFFFFFF},
+	}
+	for _, c := range rootCases {
+		got, err := Root(c.leafCount)
+		if err != nil {
+			t.Errorf("root of %d leaves: %v", c.leafCount, err)
+			continue
+		}
+		if got != c.root {
+			t.Errorf("root of %d leaves: %d, want %d", c.leafCount, got, c.root)
+		}
+	}
+
+	// every full count the type can hold, and the counts either side of it. a
+	// count one off a power of two is not a tree, so it is refused, and the
+	// refusal is read with its index: a version that answers and refuses at the
+	// same time hands a real in-tree node to a caller that reads only the value.
+	//
+	// the mid-band probe is what stops this being an ends-only table. a version
+	// that enforces fullness at the edges of a doubling band and rounds up
+	// inside it is refused here at every depth from two up, which no row above
+	// and no ladder in the family reaches.
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		wantRoot := NodeIndex(1)<<depth - 1
+
+		got, err := Root(leafCount)
+		if err != nil {
+			t.Errorf("root of %d leaves: %v", leafCount, err)
+		} else if got != wantRoot {
+			t.Errorf("root of %d leaves: %d, want %d", leafCount, got, wantRoot)
+		}
+
+		notTrees := []LeafCount{}
+		if depth >= 2 {
+			notTrees = append(notTrees, leafCount-1)
+		}
+		// one above and half again are both past MaxLeafCount at depth 31,
+		// where the refusal is range rather than fullness; the out-of-range
+		// rows below carry that end.
+		if 1 <= depth && depth <= 30 {
+			notTrees = append(notTrees, leafCount+1)
+		}
+		if 2 <= depth && depth <= 30 {
+			notTrees = append(notTrees, leafCount+leafCount/2)
+		}
+		for _, notTree := range notTrees {
+			refused, err := Root(notTree)
+			if !errors.Is(err, ErrLeafCountNotFull) {
+				t.Errorf("root of %d leaves: %v, want %v", notTree, err, ErrLeafCountNotFull)
+			}
+			if refused != 0 {
+				t.Errorf("root of %d leaves: %d alongside the refusal, want 0", notTree, refused)
+			}
+		}
+	}
+
+	// past the top of the range there is no tree to have a root, and the
+	// sentinel says range rather than fullness so that a caller cannot round the
+	// count up with FullLeafCount and retry into a tree of MaxLeafCount leaves.
+	outOfRange := []LeafCount{0, MaxLeafCount + 1, 0xFFFFFFFF}
+	for _, leafCount := range outOfRange {
+		refused, err := Root(leafCount)
+		if !errors.Is(err, ErrLeafCountRange) {
+			t.Errorf("root of %d leaves: %v, want %v", leafCount, err, ErrLeafCountRange)
+		}
+		if refused != 0 {
+			t.Errorf("root of %d leaves: %d alongside the refusal, want 0", leafCount, refused)
+		}
+	}
+
+	// the low range exhaustively, against the same doubling oracle the sizing
+	// test uses rather than against a second bit trick, so the two agree only if
+	// both are right. every count is either a tree, whose root is one below it,
+	// or no tree at all. this is what closes the single-count holes the sweeps
+	// above leave: measured, a version that skips the guard for exactly one
+	// interior count passes everything else in this file.
+	//
+	// it stops at 2^22 to keep the test in the tens of milliseconds, so a
+	// version wrong at one count above that and right everywhere else survives
+	// this file — measured, not assumed. closing that needs a walk of all 2^31
+	// counts, and the same ceiling is what TestFullLeafCountAndDepth settles for.
+	wantFullLeafCount := LeafCount(1)
+	for leafCount := LeafCount(1); leafCount <= 1<<22; leafCount += 1 {
+		if leafCount > wantFullLeafCount {
+			wantFullLeafCount *= 2
+		}
+		got, err := Root(leafCount)
+		if leafCount != wantFullLeafCount {
+			if !errors.Is(err, ErrLeafCountNotFull) {
+				t.Fatalf("root of %d leaves: %v, want %v", leafCount, err, ErrLeafCountNotFull)
+			}
+			if got != 0 {
+				t.Fatalf("root of %d leaves: %d alongside the refusal, want 0", leafCount, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("root of %d leaves: %v", leafCount, err)
+		}
+		if want := NodeIndex(leafCount) - 1; got != want {
+			t.Fatalf("root of %d leaves: %d, want %d", leafCount, got, want)
+		}
+	}
+}

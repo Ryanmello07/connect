@@ -196,15 +196,30 @@ func TestTreeMathVectorRoot(t *testing.T) {
 
 	// a leaf count that is not a power of two is refused rather than answered
 	// for the enclosing full tree, which is what the appendix C pseudocode
-	// silently does.
-	if _, err := Root(3); !errors.Is(err, ErrLeafCountNotFull) {
-		t.Errorf("root of 3 leaves: %v, want %v", err, ErrLeafCountNotFull)
+	// silently does. the ladder above is powers of two only, so these three are
+	// the whole of what the runner says about a count no tree can have.
+	//
+	// the index is read back alongside every refusal, which the rest of this
+	// package already does and the plan's form of these three checks did not.
+	// measured: a version that hands back the enclosing full tree's root and the
+	// error together passes when the value is discarded, and a caller reading
+	// only the value then gets node 3, a real node of the four-leaf tree.
+	refusalCases := []struct {
+		leafCount LeafCount
+		err       error
+	}{
+		{leafCount: 3, err: ErrLeafCountNotFull},
+		{leafCount: 0, err: ErrLeafCountRange},
+		{leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
 	}
-	if _, err := Root(0); !errors.Is(err, ErrLeafCountRange) {
-		t.Errorf("root of 0 leaves: %v, want %v", err, ErrLeafCountRange)
-	}
-	if _, err := Root(MaxLeafCount + 1); !errors.Is(err, ErrLeafCountRange) {
-		t.Errorf("root past MaxLeafCount: %v, want %v", err, ErrLeafCountRange)
+	for _, c := range refusalCases {
+		root, err := Root(c.leafCount)
+		if !errors.Is(err, c.err) {
+			t.Errorf("root of %d leaves: %v, want %v", c.leafCount, err, c.err)
+		}
+		if root != 0 {
+			t.Errorf("root of %d leaves: %d alongside the refusal, want 0", c.leafCount, root)
+		}
 	}
 
 	root, err := Root(MaxLeafCount)
