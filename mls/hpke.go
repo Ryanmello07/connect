@@ -22,10 +22,15 @@
 package mls
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
 	"io"
+	"math"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
@@ -253,4 +258,193 @@ func hpkeDecap(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte) ([]by
 	kemContext = append(kemContext, kemOutput...)
 	kemContext = append(kemContext, recipientPub...)
 	return hpkeExtractAndExpand(params, dh, kemContext)
+}
+
+// An established hpke context: the aead the key schedule produced, the base nonce that
+// aead is used with, the exporter secret beside it, and the sequence number that keeps
+// one message's nonce off every other message's.
+//
+// Not safe for concurrent use, and that is a property of the construction rather than an
+// omission. Seal and Open each read the sequence number and then advance it, so two
+// goroutines sealing at once take the same one and encrypt two messages under one nonce
+// — which for chacha20-poly1305 and for aes-gcm alike hands an observer the xor of the
+// two plaintexts and the material to forge under that key. Every caller in this tree owns
+// its context for the length of one message.
+type HpkeContext struct {
+	params         *SuiteParams
+	suiteId        []byte
+	aead           cipher.AEAD
+	baseNonce      []byte
+	exporterSecret []byte
+	sequence       uint64
+}
+
+// The aead a suite names, over a key of exactly the length that suite fixes. The length
+// is refused here rather than left to the two constructors so a wrong key is one
+// sentinel instead of two library specific error strings, and so the refusal reads the
+// registry's own Nk rather than a constructor's opinion of what a key should be.
+func hpkeNewAead(params *SuiteParams, key []byte) (cipher.AEAD, error) {
+	if len(key) != params.Nk {
+		return nil, ErrBadKeyLength
+	}
+	switch params.AeadId {
+	case HpkeAeadChaCha20Poly1305:
+		return chacha20poly1305.New(key)
+	case HpkeAeadAes128Gcm:
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.NewGCM(block)
+	default:
+		return nil, ErrUnknownCipherSuite
+	}
+}
+
+// key_schedule_context for mode_base, RFC 9180 section 5.1: the mode byte, then the hash
+// of the psk id, then the hash of the info, in that order and no other.
+//
+// The preimage is built here rather than inline in the key schedule because its order is
+// the one mistake in this file that nothing downstream can see. Both hashes are 32 bytes
+// out of the same kdf, so transposing them yields a context of exactly the right length
+// that the key, the base nonce and the exporter secret all follow consistently, and a
+// sender and a receiver transposed alike agree with each other on every byte. The mode is
+// the same shape of mistake: 0x01 where 0x00 belongs moves every derived value and breaks
+// nothing a round trip can observe. Only the published context separates any of them, and
+// returning the preimage is what lets it be compared against one directly instead of
+// through three expansions that each blame the wrong thing.
+func hpkeKeyScheduleContext(suiteId []byte, info []byte) []byte {
+	pskIdHash := hpkeLabeledExtract(suiteId, nil, "psk_id_hash", nil)
+	infoHash := hpkeLabeledExtract(suiteId, nil, "info_hash", info)
+	keyScheduleContext := make([]byte, 0, 1+len(pskIdHash)+len(infoHash))
+	keyScheduleContext = append(keyScheduleContext, hpkeModeBase)
+	keyScheduleContext = append(keyScheduleContext, pskIdHash...)
+	return append(keyScheduleContext, infoHash...)
+}
+
+// KeySchedule for mode_base, RFC 9180 section 5.1. psk and psk_id are the empty defaults,
+// which is not a shortcut taken here: the v1 profile has no psks at all, which is the
+// same reason the psk, auth and auth-psk modes are absent from the file.
+//
+// The three expansions read three different suite fields — Nk, Nn and Nh — and the last
+// of those holds the same 32 that six other fields hold in both registered suites, so a
+// derivation that read one of those instead is invisible to any vector. hpke_test.go
+// separates them with probe suites for that reason.
+//
+// The aead's own nonce size is checked against Nn rather than assumed to equal it. The
+// base nonce is expanded to Nn and ComputeNonce sizes its output the same way, so a suite
+// whose Nn disagreed with its aead would hand cipher.AEAD a nonce of the wrong length —
+// and both aeads here panic on that rather than returning an error, so the first Seal
+// would take the process with it. Refusing at construction turns that into a typed error
+// before any key exists, and it is what makes the eight byte counter in ComputeNonce fit
+// by construction rather than by assumption.
+func hpkeKeySchedule(params *SuiteParams, sharedSecret []byte, info []byte) (*HpkeContext, error) {
+	suiteId := hpkeSuiteId(params)
+	keyScheduleContext := hpkeKeyScheduleContext(suiteId, info)
+
+	secret := hpkeLabeledExtract(suiteId, sharedSecret, "secret", nil)
+	key, err := hpkeLabeledExpand(suiteId, secret, "key", keyScheduleContext, params.Nk)
+	if err != nil {
+		return nil, err
+	}
+	baseNonce, err := hpkeLabeledExpand(suiteId, secret, "base_nonce", keyScheduleContext, params.Nn)
+	if err != nil {
+		return nil, err
+	}
+	exporterSecret, err := hpkeLabeledExpand(suiteId, secret, "exp", keyScheduleContext, params.Nh)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := hpkeNewAead(params, key)
+	if err != nil {
+		return nil, err
+	}
+	if aead.NonceSize() != params.Nn {
+		return nil, ErrBadNonceLength
+	}
+	return &HpkeContext{
+		params:         params,
+		suiteId:        suiteId,
+		aead:           aead,
+		baseNonce:      baseNonce,
+		exporterSecret: exporterSecret,
+		sequence:       0,
+	}, nil
+}
+
+// ComputeNonce, RFC 9180 section 5.2: base_nonce xor I2OSP(seq, Nn). The counter is big
+// endian and right aligned, so it occupies the low bytes and a sequence number past 255
+// moves the byte above them — which is exactly where an implementation that wrote the
+// counter little endian, or at the front, agrees with itself for the first 256 messages
+// and with nobody else ever.
+func (self *HpkeContext) nonce() []byte {
+	nonce := make([]byte, self.params.Nn)
+	binary.BigEndian.PutUint64(nonce[self.params.Nn-8:], self.sequence)
+	for i := range nonce {
+		nonce[i] ^= self.baseNonce[i]
+	}
+	return nonce
+}
+
+// IncrementSeq, RFC 9180 section 5.2. The RFC's own limit is 2^(8*Nn)-1, which for the 12
+// byte nonce both registered suites use is far past anything a uint64 holds, so what
+// binds here is the counter's width: at the maximum the next increment wraps to zero and
+// repeats a nonce under a key already used, which loses confidentiality and authenticity
+// of every message on both sides of the repeat. The context stops instead of rolling
+// over, and stopping is the whole of the recovery — a context that has run out is
+// finished, not resettable.
+func (self *HpkeContext) advance() error {
+	if self.sequence == math.MaxUint64 {
+		return ErrSequenceOverflow
+	}
+	self.sequence++
+	return nil
+}
+
+// ContextS.Seal, RFC 9180 section 5.2: seal at the current sequence number, then advance.
+// On the advance's refusal the ciphertext is dropped rather than returned, because it was
+// produced at a sequence number the context cannot move past and handing it to a caller
+// would put the next message on the same nonce.
+func (self *HpkeContext) Seal(aad []byte, plaintext []byte) ([]byte, error) {
+	ciphertext := self.aead.Seal(nil, self.nonce(), plaintext, aad)
+	if err := self.advance(); err != nil {
+		return nil, err
+	}
+	return ciphertext, nil
+}
+
+// ContextR.Open, RFC 9180 section 5.2. A failure is always ErrAeadOpen: which of the key,
+// the nonce, the aad and the ciphertext was wrong is nothing a caller can act on and
+// nothing a peer gets to learn from the error it provoked.
+//
+// The sequence advances only on success. A receiver that advanced on failure could be
+// pushed past its sender by one injected packet, and every genuine message after it would
+// then open under the wrong nonce and be refused — a denial of service available to
+// anyone who can write to the transport.
+func (self *HpkeContext) Open(aad []byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := self.aead.Open(nil, self.nonce(), ciphertext, aad)
+	if err != nil {
+		return nil, ErrAeadOpen
+	}
+	if err := self.advance(); err != nil {
+		return nil, err
+	}
+	return plaintext, nil
+}
+
+// Context.Export, RFC 9180 section 5.3. It is keyed on the exporter secret rather than on
+// the aead key, so an exported value outlives a context whose messages are spent and can
+// never be confused with one of them, and it leaves the sequence number alone, so
+// exporting interleaves with sealing and cannot silently cost a message.
+//
+// The length is the caller's, and it is the only one in this file that is: every other
+// expansion here takes a suite field. That makes hpkeLabeledExpand's guard load bearing
+// rather than defensive — crypto/hkdf.Expand dies on a negative length instead of
+// refusing it, so the guard is what stands between a caller's arithmetic and the process.
+// The sentinel it returns is ErrBadKeyLength rather than an export specific one: the two
+// fail at the same guard for the same reason and leave a caller the same nothing to do,
+// and a second sentinel would have to be threaded through the crypto error contract to
+// say so.
+func (self *HpkeContext) Export(exporterContext []byte, length int) ([]byte, error) {
+	return hpkeLabeledExpand(self.suiteId, self.exporterSecret, "sec", exporterContext, length)
 }

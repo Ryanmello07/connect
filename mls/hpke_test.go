@@ -1028,3 +1028,126 @@ func mustDeriveHpkePublicKey(t *testing.T, params *SuiteParams, ikmByte byte) Hp
 	}
 	return pub
 }
+
+func TestHpkeContextSequenceAdvances(t *testing.T) {
+	// each Seal must use base_nonce XOR seq. a context that reused nonce zero would
+	// still decrypt correctly under a matching receiver, so the only way to catch it
+	// is to assert the ciphertexts differ for identical plaintext.
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	sender, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x05}, 32), []byte("info"))
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	receiver, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x05}, 32), []byte("info"))
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	plaintext := []byte("the same plaintext every time")
+	var previous []byte
+	for i := 0; i < 4; i++ {
+		ciphertext, err := sender.Seal([]byte("aad"), plaintext)
+		if err != nil {
+			t.Fatalf("seal %d: %v", i, err)
+		}
+		if bytes.Equal(ciphertext, previous) {
+			t.Fatalf("seal %d repeated the previous ciphertext: the sequence did not advance", i)
+		}
+		previous = ciphertext
+		back, err := receiver.Open([]byte("aad"), ciphertext)
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		if !bytes.Equal(back, plaintext) {
+			t.Fatalf("open %d returned %q", i, back)
+		}
+	}
+}
+
+func TestHpkeContextOpenRejectsTamper(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	sender, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x06}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	ciphertext, err := sender.Seal([]byte("aad"), []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	for i := range ciphertext {
+		receiver, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x06}, 32), nil)
+		if err != nil {
+			t.Fatalf("key schedule: %v", err)
+		}
+		tampered := bytes.Clone(ciphertext)
+		tampered[i] ^= 0x01
+		if _, err := receiver.Open([]byte("aad"), tampered); !errors.Is(err, ErrAeadOpen) {
+			t.Fatalf("flipping byte %d: error = %v, want ErrAeadOpen", i, err)
+		}
+	}
+	receiver, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x06}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	if _, err := receiver.Open([]byte("different aad"), ciphertext); !errors.Is(err, ErrAeadOpen) {
+		t.Fatalf("wrong aad: error = %v, want ErrAeadOpen", err)
+	}
+}
+
+func TestHpkeContextExportIsLabelSeparated(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	ctx, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x07}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	a, err := ctx.Export([]byte("context a"), 32)
+	if err != nil {
+		t.Fatalf("export a: %v", err)
+	}
+	b, err := ctx.Export([]byte("context b"), 32)
+	if err != nil {
+		t.Fatalf("export b: %v", err)
+	}
+	if bytes.Equal(a, b) {
+		t.Fatalf("different exporter contexts produced the same value")
+	}
+	// export must not consume a sequence number
+	again, err := ctx.Export([]byte("context a"), 32)
+	if err != nil {
+		t.Fatalf("export a again: %v", err)
+	}
+	if !bytes.Equal(a, again) {
+		t.Fatalf("export is not stable across calls")
+	}
+}
+
+func TestHpkeAeadKeyLengthIsSuiteBound(t *testing.T) {
+	// 0x0003 is a 32-byte key, 0x0001 is 16. a provider that hardcoded 32 would pass
+	// every chacha test and silently fail on the aes suite.
+	for _, testCase := range []struct {
+		suite CipherSuite
+		nk    int
+	}{
+		{suite: CipherSuiteX25519AesGcm128Sha256Ed25519, nk: 16},
+		{suite: CipherSuiteX25519ChaCha20Sha256Ed25519, nk: 32},
+	} {
+		params, err := LookupSuite(testCase.suite)
+		if err != nil {
+			t.Fatalf("LookupSuite: %v", err)
+		}
+		if _, err := hpkeNewAead(params, make([]byte, testCase.nk)); err != nil {
+			t.Errorf("suite %#04x rejected a %d-byte key: %v", uint16(testCase.suite), testCase.nk, err)
+		}
+		if _, err := hpkeNewAead(params, make([]byte, testCase.nk+1)); !errors.Is(err, ErrBadKeyLength) {
+			t.Errorf("suite %#04x accepted a %d-byte key", uint16(testCase.suite), testCase.nk+1)
+		}
+	}
+}
