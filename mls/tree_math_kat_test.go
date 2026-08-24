@@ -284,6 +284,32 @@ func checkRelationColumn(t *testing.T, label string, undefined error, nLeaves ui
 	return false, true
 }
 
+// the columns an entry publishes are as long as the entry says the tree is.
+//
+// checked in each of the three runners that indexes one, and not only in the
+// corpus tripwire above, because a short column is a panic at v.Left[i] rather
+// than a failure and a panic takes the whole test binary down with it. measured
+// against a corpus with one entry's sibling column one short: the package
+// reported 16 of its 32 tests, and the three that name the truncated column
+// were among the sixteen that never ran.
+func checkColumnLengths(t *testing.T, v treeMathVector) {
+	t.Helper()
+	columns := []struct {
+		label     string
+		published []*uint32
+	}{
+		{label: "left", published: v.Left},
+		{label: "right", published: v.Right},
+		{label: "parent", published: v.Parent},
+		{label: "sibling", published: v.Sibling},
+	}
+	for _, column := range columns {
+		if uint32(len(column.published)) != v.NNodes {
+			t.Fatalf("n_leaves %d: %s has %d entries, want n_nodes %d", v.NLeaves, column.label, len(column.published), v.NNodes)
+		}
+	}
+}
+
 func TestTreeMathVectorChildren(t *testing.T) {
 	vectors := loadTreeMathVectors(t)
 
@@ -302,6 +328,7 @@ func TestTreeMathVectorChildren(t *testing.T) {
 	rightRefusals, rightMatches := 0, 0
 
 	for _, v := range vectors {
+		checkColumnLengths(t, v)
 		for i := uint32(0); i < v.NNodes; i += 1 {
 			nodeIndex := NodeIndex(i)
 
@@ -438,6 +465,7 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 	siblingRefusals, siblingMatches := 0, 0
 
 	for _, v := range vectors {
+		checkColumnLengths(t, v)
 		leafCount := LeafCount(v.NLeaves)
 		for i := uint32(0); i < v.NNodes; i += 1 {
 			nodeIndex := NodeIndex(i)
@@ -844,15 +872,10 @@ func checkTreeMathEntry(t *testing.T, v treeMathVector) (refusals int, matches i
 		},
 	}
 
-	// the column lengths are checked here and not only in the corpus tripwire,
-	// because this runner is also where an entry that was never read off disk
-	// arrives: indexing a short column would panic, where naming it says which
-	// column was truncated.
-	for _, relation := range relations {
-		if uint32(len(relation.published)) != v.NNodes {
-			t.Fatalf("n_leaves %d: %s has %d entries, want n_nodes %d", v.NLeaves, relation.label, len(relation.published), v.NNodes)
-		}
-	}
+	// before any column is indexed, and by the same helper the two per-function
+	// runners call: this runner is also where an entry that was never read off
+	// disk arrives, and naming the truncated column says which one it was.
+	checkColumnLengths(t, v)
 
 	for i := uint32(0); i < v.NNodes; i += 1 {
 		for _, relation := range relations {
@@ -964,12 +987,25 @@ func generateTreeMathVectors(t *testing.T) json.RawMessage {
 
 // vector family 1, the gate spec A section 4.2.1 names for this plan.
 //
-// the two totals are the whole point of it. every relation of every node of
-// every entry is checked, and what the totals pin is that the checking actually
-// happened: 1023 leaves and 1023 parents across the ladder, one root per entry.
-// a runner that walked a short corpus, skipped an entry, or read null as
-// nothing to check here lands on a different pair and fails, where a plain
-// "every assertion passed" would not notice any of the three.
+// what it holds that nothing above it does is the first loop: the vendored
+// bytes walked through verifyTreeMathVector, which is the function the shared
+// harness will call, in the arity it will call it with, over the corpus it will
+// hand it. everywhere else in this file that function is run against entries
+// this package generated, and a verifier checked only against its own
+// generator's output is this package's arithmetic read back as this package's
+// expectation - its per-entry arm counts would never meet a published number at
+// all.
+//
+// the totals below are not that. they are the family sums of the eight the two
+// per-function runners already assert - 1023 + 1023 + 10 + 10 refusals and
+// 1013 + 1013 + 2026 + 2026 matches - so no production mutant fails here and
+// passes there, and this row is a restatement rather than a second opinion.
+// stated plainly because the first version of this comment called the totals
+// "the whole point of it", and a reader who believed that would take this test
+// for independent evidence it is not. they are kept because 8144 is the number
+// spec A's family-1 row publishes and the row a reader comes to a gate to find,
+// and because they are what a runner that walked a short corpus, skipped an
+// entry, or read null as nothing to check here lands wrong on.
 //
 // the registration this task was to land with it is deferred and is not
 // silently missing: mls/vectors_test.go, where the validation and interop
@@ -981,6 +1017,18 @@ func generateTreeMathVectors(t *testing.T) json.RawMessage {
 // one-line deletion once the file lands, and
 // TestTreeMathVectorRegistrationFollowsTheHarness below fails the day it does.
 func TestTreeMathVectors(t *testing.T) {
+	// the count is pinned here as well as inside loadTreeMathVectors because
+	// this loop does not go through it: a raw corpus that decoded to nothing
+	// would leave the harness's own entry point run zero times, and the loop
+	// beneath would still be the only thing that noticed.
+	rawEntries := LoadVectorFile(t, treeMathVectorFile)
+	if len(rawEntries) != treeMathVectorCount {
+		t.Fatalf("%s holds %d entries, want %d: a gate over a short corpus asserts nothing", treeMathVectorFile, len(rawEntries), treeMathVectorCount)
+	}
+	for _, rawEntry := range rawEntries {
+		verifyTreeMathVector(t, rawEntry)
+	}
+
 	vectors := loadTreeMathVectors(t)
 
 	refusals, matches := 0, 0
@@ -1097,6 +1145,181 @@ func TestTreeMathVectorGenerateThenVerify(t *testing.T) {
 	}
 }
 
+// every go file of this package, parsed.
+//
+// the package is read as syntax rather than as text, which is the one thing
+// crypto_forbidden_test.go's line-based scanner deliberately does not do. its
+// tradeoff does not carry here. it over-reports, and a ban list that
+// over-reports is merely noisy; this one under-reports, because the failure
+// messages below have to quote the call they are asking for and a text scan
+// then finds that quotation and concludes the call is already there. measured:
+// the text version of this check passed with the registry present and nothing
+// registered, matching its own error message. a call expression is not a string
+// literal to a parser.
+//
+// an empty glob is fatal rather than an empty answer. every question asked of
+// this scan is answered "found nothing" today, so a scan that read no file at
+// all would agree with the package it is checking.
+func parsePackageSources(t *testing.T, fileSet *token.FileSet) []*ast.File {
+	t.Helper()
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob the package sources: %v", err)
+	}
+	parsedFiles := make([]*ast.File, 0, len(sources))
+	for _, source := range sources {
+		parsed, err := parser.ParseFile(fileSet, source, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", source, err)
+		}
+		parsedFiles = append(parsedFiles, parsed)
+	}
+	if len(parsedFiles) == 0 {
+		t.Fatal("the glob read no go file in this package: the scan is broken, not the package")
+	}
+	return parsedFiles
+}
+
+// the package-level names one parsed file declares, added to names.
+//
+// a var counts alongside a func because the registry is a name, not a keyword:
+// a var holding a func value declares RegisterVectorFamily as surely as a func
+// declaration does, and a scan that recognised only func declarations would
+// read the registry as absent while its call sites were being counted. that
+// reads as "no harness yet" for as long as the harness is written that way,
+// which is silence in the one direction this file exists to break.
+func packageDeclarations(parsed *ast.File, names map[string]int) {
+	for _, declaration := range parsed.Decls {
+		switch typed := declaration.(type) {
+		case *ast.FuncDecl:
+			// a method is a name on its receiver, not on the package.
+			if typed.Recv == nil {
+				names[typed.Name.Name] += 1
+			}
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, name := range valueSpec.Names {
+					names[name.Name] += 1
+				}
+			}
+		}
+	}
+}
+
+// where callee is called with carried named somewhere inside its arguments.
+//
+// the pairing is the whole of it. counting calls of the registry by its own
+// name answers "did anything register", not "did family 1 register", and those
+// two answers part company the moment a second family lands - which, for a
+// harness that vendors sixteen of them, is the normal case and not the edge
+// one. what makes a registration this family's is the function it hands over,
+// so that is what is looked for, and it is looked for anywhere in the argument
+// rather than at one field of one literal: through the composite literal the
+// message below prescribes, and equally through a wrapper or a literal built
+// under a different field name.
+func callsCarrying(fileSet *token.FileSet, parsed *ast.File, callee string, carried string) []token.Position {
+	positions := []token.Position{}
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, ok := call.Fun.(*ast.Ident)
+		if !ok || name.Name != callee {
+			return true
+		}
+		for _, argument := range call.Args {
+			if mentionsIdent(argument, carried) {
+				positions = append(positions, fileSet.Position(call.Pos()))
+				break
+			}
+		}
+		return true
+	})
+	return positions
+}
+
+// whether name appears in the subtree as an identifier.
+//
+// as an identifier and not as text, for the reason the parse above gives: both
+// names this scan looks for are quoted in the failure messages below, and a
+// matcher that read string literals would find the test's own instructions.
+func mentionsIdent(node ast.Node, name string) bool {
+	found := false
+	ast.Inspect(node, func(inner ast.Node) bool {
+		if ident, ok := inner.(*ast.Ident); ok && ident.Name == name {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// whether a package-level declaration of name still lists the integer literal
+// want.
+//
+// this is the second half of the change the message below asks for, and it is
+// the half no build failure and no other test could observe: a family whose
+// number is still in expectedPendingFamilies is one the harness's own runner
+// skips, so a family 1 that is registered and still listed is executed by
+// nobody while both the registration and the vectors job look done. the value
+// is read as a subtree rather than as a slice of elements, so that a list which
+// lands as a map keyed by number is read the same way.
+func declarationLists(parsed *ast.File, name string, want string) bool {
+	listed := false
+	for _, declaration := range parsed.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range general.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, declared := range valueSpec.Names {
+				if declared.Name != name || i >= len(valueSpec.Values) {
+					continue
+				}
+				ast.Inspect(valueSpec.Values[i], func(node ast.Node) bool {
+					literal, ok := node.(*ast.BasicLit)
+					if ok && literal.Kind == token.INT && literal.Value == want {
+						listed = true
+					}
+					return !listed
+				})
+			}
+		}
+	}
+	return listed
+}
+
+// a package holding both shapes each detector above has to tell apart: one it
+// must find and one it must not. it is parsed and never compiled, so the names
+// in it are the harness's rather than this package's.
+//
+// this is the control the first version of this test did not have, and the
+// registration pair is the finding that produced it. counted by the name of the
+// registry, this source scores two calls, and family 1 is one of them only
+// because family 2 is also there - so the same count with family 1's line
+// deleted is still two, and the test reports the package registered.
+const vectorHarnessControlSource = `package mls
+
+var RegisterVectorFamily = func(family VectorFamily) {}
+
+func init() {
+	RegisterVectorFamily(VectorFamily{Number: 2, Verify: verifyCryptoBasicsVector})
+	RegisterVectorFamily(VectorFamily{Number: 1, Verify: verifyTreeMathVector})
+}
+
+var expectedPendingFamilies = []int{1, 2}
+var expectedSettledFamilies = []int{2}
+`
+
 // the deferred half of this task, recorded where it will be executed rather
 // than only in a plan.
 //
@@ -1110,61 +1333,77 @@ func TestTreeMathVectorGenerateThenVerify(t *testing.T) {
 // what says it is not: it fails from the moment the registry exists until the
 // registration is written, and then it passes and stays passed.
 //
-// the package is read as syntax rather than as text, which is the one thing
-// crypto_forbidden_test.go's line-based scanner deliberately does not do. its
-// tradeoff does not carry here. it over-reports, and a ban list that
-// over-reports is merely noisy; this one under-reports, because the failure
-// message below has to quote the call it is asking for and a text scan then
-// finds that quotation and concludes the call is already there. measured: the
-// text version of this check passed with the registry present and nothing
-// registered, matching its own error message. a call expression is not a string
-// literal to a parser.
+// what it looks for is family 1's own verifier reaching the registry, and not a
+// call of the registry by name. the first version asked the second question and
+// could not fail in the case it was written for: with the registry present,
+// family 2 registered and family 1 not, it passed. so did the shape a registry
+// file usually carries all by itself, a test of its own registry - one call of
+// RegisterVectorFamily anywhere in the package was enough for it to report
+// family 1 registered. both are the state named above, reported green.
 func TestTreeMathVectorRegistrationFollowsTheHarness(t *testing.T) {
-	sources, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("glob the package sources: %v", err)
-	}
-
-	declares := map[string]int{}
-	calls := map[string]int{}
 	fileSet := token.NewFileSet()
-	for _, source := range sources {
-		parsed, err := parser.ParseFile(fileSet, source, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatalf("parse %s: %v", source, err)
+	parsedFiles := parsePackageSources(t, fileSet)
+
+	declarations := map[string]int{}
+	registrations := []token.Position{}
+	loaderCalls := []token.Position{}
+	stillPending := false
+	for _, parsed := range parsedFiles {
+		packageDeclarations(parsed, declarations)
+		registrations = append(registrations, callsCarrying(fileSet, parsed, "RegisterVectorFamily", "verifyTreeMathVector")...)
+		loaderCalls = append(loaderCalls, callsCarrying(fileSet, parsed, "LoadVectorFile", "treeMathVectorFile")...)
+		if declarationLists(parsed, "expectedPendingFamilies", "1") {
+			stillPending = true
 		}
-		ast.Inspect(parsed, func(node ast.Node) bool {
-			switch typed := node.(type) {
-			case *ast.FuncDecl:
-				if typed.Recv == nil {
-					declares[typed.Name.Name] += 1
-				}
-			case *ast.CallExpr:
-				if name, ok := typed.Fun.(*ast.Ident); ok {
-					calls[name.Name] += 1
-				}
-			}
-			return true
-		})
 	}
 
-	// the positive control. a scan that found nothing reports what a clean
-	// package reports, and both halves of the answer below are "found nothing",
-	// so neither is trusted until the same two detectors are run against a
-	// symbol this package certainly declares once and certainly calls. that
-	// stays true after the harness lands: the stand-in is deleted and the same
-	// declaration arrives from vectors_test.go, with the callers untouched.
-	if declares["LoadVectorFile"] != 1 {
-		t.Fatalf("the declaration scan found %d declarations of LoadVectorFile, want 1: the scan is broken, not the package", declares["LoadVectorFile"])
+	// the positive control against this package. every answer the scan gives
+	// below is "found nothing", and "found nothing" is also what a broken scan
+	// reports, so none of them is trusted until the same two detectors are run
+	// against a symbol this package certainly declares once and certainly calls.
+	// that stays true after the harness lands: the stand-in is deleted and the
+	// same declaration arrives from vectors_test.go, with the callers untouched.
+	if declarations["LoadVectorFile"] != 1 {
+		t.Fatalf("the declaration scan found %d declarations of LoadVectorFile, want 1: the scan is broken, not the package", declarations["LoadVectorFile"])
 	}
-	if calls["LoadVectorFile"] == 0 {
-		t.Fatal("the call scan found no calls to LoadVectorFile: the scan is broken, not the package")
+	if len(loaderCalls) == 0 {
+		t.Fatal("the call scan found no call of LoadVectorFile carrying treeMathVectorFile: the scan is broken, not the package")
 	}
 
-	declared := declares["RegisterVectorFamily"] > 0
-	registered := calls["RegisterVectorFamily"] > 0
+	// the control above says the scan finds something. this says it finds the
+	// right thing, which is the harder half and the one that was wrong: the
+	// source holds a registration this scan must claim and one it must not, in a
+	// package that declares its registry in the shape the declaration scan above
+	// would otherwise miss.
+	controlSet := token.NewFileSet()
+	control, err := parser.ParseFile(controlSet, "control.go", vectorHarnessControlSource, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the control source: %v", err)
+	}
+	controlDeclarations := map[string]int{}
+	packageDeclarations(control, controlDeclarations)
+	controlRegistrations := callsCarrying(controlSet, control, "RegisterVectorFamily", "verifyTreeMathVector")
+	if len(controlRegistrations) != 1 {
+		t.Fatalf("the registration scan found %d family-1 registrations in a control holding that one and family 2's, want 1: the scan is broken, not the package", len(controlRegistrations))
+	}
+	controlCases := []struct {
+		label string
+		got   bool
+		want  bool
+	}{
+		{label: "a registry declared as a var is a declaration", got: controlDeclarations["RegisterVectorFamily"] == 1, want: true},
+		{label: "a pending list holding 1 is read as pending", got: declarationLists(control, "expectedPendingFamilies", "1"), want: true},
+		{label: "a neighbouring list without 1 is not", got: declarationLists(control, "expectedSettledFamilies", "1"), want: false},
+	}
+	for _, c := range controlCases {
+		if c.got != c.want {
+			t.Fatalf("control: %s: %t, want %t: the scan is broken, not the package", c.label, c.got, c.want)
+		}
+	}
 
-	if declared && !registered {
+	declared := declarations["RegisterVectorFamily"] > 0
+
+	if declared && len(registrations) == 0 {
 		t.Fatalf("the vector harness registry has landed and family 1 is still unregistered.\n"+
 			"add to %s:\n\n"+
 			"func init() {\n"+
@@ -1181,7 +1420,22 @@ func TestTreeMathVectorRegistrationFollowsTheHarness(t *testing.T) {
 			"still pending is the state where the vectors job skips family 1 and reports green.",
 			treeMathVectorRunnerFile)
 	}
-	if registered && !declared {
-		t.Fatalf("%s registers family 1 with a harness this package does not declare", treeMathVectorRunnerFile)
+	if len(registrations) > 0 && stillPending {
+		t.Fatalf("family 1 is registered at %s and expectedPendingFamilies still lists 1.\n"+
+			"delete 1 from that list in this commit: registered while still pending is the\n"+
+			"state the registration above was written to leave behind, and the vectors job\n"+
+			"reports green from it with family 1 never executed.",
+			registrations[0])
+	}
+
+	// a call of an unqualified name this package does not declare does not
+	// compile, so this arm cannot fire on a package that builds. it is the two
+	// halves of the scan disagreeing - the call half seeing a name the
+	// declaration half cannot find - which is what the var-declared registry
+	// produced before the declaration half learned to read vars. it is kept for
+	// that reason and reports the position of the call rather than a file named
+	// in advance, because the call it is describing need not be in this file.
+	if len(registrations) > 0 && !declared {
+		t.Fatalf("%s registers family 1 with a harness this package does not declare", registrations[0])
 	}
 }
