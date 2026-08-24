@@ -16,14 +16,15 @@
 // the same transposition moves every derived byte in the vector. A single suite table
 // would therefore be a table that cannot see the mistake this file exists to catch.
 //
-// The vectors stop where task 6 does. RFC 9180 publishes the key schedule inputs and
-// outputs — shared_secret, key_schedule_context, secret, key, base_nonce,
+// The vectors now run the whole of base mode. RFC 9180 publishes the key schedule
+// inputs and outputs — shared_secret, key_schedule_context, secret, key, base_nonce,
 // exporter_secret — and each of those is a labelled extract or expand away from the
-// previous one, so the whole chain up to the aead is reachable with the four labelled kdf
+// previous one, so the chain up to the aead is reachable with the four labelled kdf
 // functions and no others; the kem key pairs, the encapsulation and the decapsulation are
-// published beside them and are what the second half of this file pins. The aead itself,
-// the sequence number and the context object are tasks 7 and 8, and the vendored corpus
-// that replaces these transcriptions is task 9's.
+// published beside them, and past those the appendix prints the sealed message at six
+// sequence numbers and three exported values, which is what pins the aead, the nonce
+// counter and the secret export. The vendored corpus that replaces these transcriptions
+// is a later task's.
 //
 // Nothing about DHKEM is reachable by round trip. Encap and Decap that are wrong in the
 // same way agree with each other perfectly: transpose enc and pkRm in the kem context on
@@ -47,6 +48,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -74,6 +76,32 @@ import (
 // info is the RFC's own "Ode on a Grecian Urn" string. It is not empty on purpose: an
 // empty info would make the info_hash extract indistinguishable from the psk_id_hash one
 // beside it, and the two differ only in their label.
+// One published encryption of an appendix A entry: the message the sender's context
+// produces at one sequence number, with the nonce the RFC prints beside it.
+//
+// The sequence numbers are the RFC's own and they are sparse — 0, 1, 2, 4, 255 and 256 —
+// which is why the known answer walks the context between them with messages it throws
+// away rather than sealing six times. The last two are the load bearing rows: an
+// implementation that wrote the counter little endian, or at the front of the nonce, or
+// that advanced by anything other than one, agrees with itself and with the first four
+// and diverges exactly where the counter crosses a byte.
+type rfc9180Encryption struct {
+	sequence uint64
+	pt       string
+	aad      string
+	nonce    string
+	ct       string
+}
+
+// One published exported value. length is carried beside the value rather than taken from
+// it, so a transcription that lost a byte fails as a disagreement about a published length
+// instead of quietly asserting a shorter export.
+type rfc9180Export struct {
+	exporterContext string
+	length          int
+	value           string
+}
+
 type rfc9180BaseVector struct {
 	name               string
 	suite              CipherSuite
@@ -90,6 +118,8 @@ type rfc9180BaseVector struct {
 	key                string
 	baseNonce          string
 	exporterSecret     string
+	encryptions        []rfc9180Encryption
+	exports            []rfc9180Export
 }
 
 // The two appendix A entries whose kem, kdf and aead this package registers. A.1 is
@@ -113,6 +143,19 @@ var rfc9180BaseVectors = []rfc9180BaseVector{
 		key:                "4531685d41d65f03dc48f6b8302c05b0",
 		baseNonce:          "56d890e5accaaf011cff4b7d",
 		exporterSecret:     "45ff1c2e220db587171952c0592d5f5ebe103f1561a2614e38f2ffd47e99e3f8",
+		encryptions: []rfc9180Encryption{
+			{sequence: 0, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d30", nonce: "56d890e5accaaf011cff4b7d", ct: "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a"},
+			{sequence: 1, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d31", nonce: "56d890e5accaaf011cff4b7c", ct: "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84"},
+			{sequence: 2, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d32", nonce: "56d890e5accaaf011cff4b7f", ct: "498dfcabd92e8acedc281e85af1cb4e3e31c7dc394a1ca20e173cb72516491588d96a19ad4a683518973dcc180"},
+			{sequence: 4, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d34", nonce: "56d890e5accaaf011cff4b79", ct: "583bd32bc67a5994bb8ceaca813d369bca7b2a42408cddef5e22f880b631215a09fc0012bc69fccaa251c0246d"},
+			{sequence: 255, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323535", nonce: "56d890e5accaaf011cff4b82", ct: "7175db9717964058640a3a11fb9007941a5d1757fda1a6935c805c21af32505bf106deefec4a49ac38d71c9e0a"},
+			{sequence: 256, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323536", nonce: "56d890e5accaaf011cff4a7d", ct: "957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3fbeda97d2e0e1aba483a2df9f2"},
+		},
+		exports: []rfc9180Export{
+			{exporterContext: "", length: 32, value: "3853fe2b4035195a573ffc53856e77058e15d9ea064de3e59f4961d0095250ee"},
+			{exporterContext: "00", length: 32, value: "2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5"},
+			{exporterContext: "54657374436f6e74657874", length: 32, value: "e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931"},
+		},
 	},
 	{
 		name:               "rfc 9180 appendix a.2.1, chacha20-poly1305",
@@ -130,6 +173,19 @@ var rfc9180BaseVectors = []rfc9180BaseVector{
 		key:                "ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91",
 		baseNonce:          "5c4d98150661b848853b547f",
 		exporterSecret:     "a3b010d4994890e2c6968a36f64470d3c824c8f5029942feb11e7a74b2921922",
+		encryptions: []rfc9180Encryption{
+			{sequence: 0, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d30", nonce: "5c4d98150661b848853b547f", ct: "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28"},
+			{sequence: 1, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d31", nonce: "5c4d98150661b848853b547e", ct: "6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e85285337cc95ba5f59992dc98c"},
+			{sequence: 2, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d32", nonce: "5c4d98150661b848853b547d", ct: "71146bd6795ccc9c49ce25dda112a48f202ad220559502cef1f34271e0cb4b02b4f10ecac6f48c32f878fae86b"},
+			{sequence: 4, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d34", nonce: "5c4d98150661b848853b547b", ct: "63357a2aa291f5a4e5f27db6baa2af8cf77427c7c1a909e0b37214dd47db122bb153495ff0b02e9e54a50dbe16"},
+			{sequence: 255, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323535", nonce: "5c4d98150661b848853b5480", ct: "18ab939d63ddec9f6ac2b60d61d36a7375d2070c9b683861110757062c52b8880a5f6b3936da9cd6c23ef2a95c"},
+			{sequence: 256, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323536", nonce: "5c4d98150661b848853b557f", ct: "7a4a13e9ef23978e2c520fd4d2e757514ae160cd0cd05e556ef692370ca53076214c0c40d4c728d6ed9e727a5b"},
+		},
+		exports: []rfc9180Export{
+			{exporterContext: "", length: 32, value: "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e"},
+			{exporterContext: "00", length: 32, value: "8c1df14732580e5501b00f82b10a1647b40713191b7c1240ac80e2b68808ba69"},
+			{exporterContext: "54657374436f6e74657874", length: 32, value: "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53"},
+		},
 	},
 }
 
@@ -147,6 +203,19 @@ func decodeVectorField(t *testing.T, vectorName string, fieldName string, value 
 		t.Fatalf("%s: %s decoded to nothing", vectorName, fieldName)
 	}
 	return decoded
+}
+
+// One transcribed field that is allowed to decode to nothing, for the exporter context
+// the appendix prints with nothing after the colon. decodeVectorField refuses an empty
+// decode because an empty expected value is a comparison against nothing; an empty input
+// is the opposite case and is published, and it is the only one that can see an exporter
+// substituting a default of its own for a caller that supplied none.
+func decodePossiblyEmptyVectorField(t *testing.T, vectorName string, fieldName string, value string) []byte {
+	t.Helper()
+	if value == "" {
+		return nil
+	}
+	return decodeVectorField(t, vectorName, fieldName, value)
 }
 
 // The guard every known answer loop below opens with. A table that lost a row is not an
@@ -1129,6 +1198,13 @@ func TestHpkeContextExportIsLabelSeparated(t *testing.T) {
 	}
 }
 
+// TestHpkeAeadKeyLengthIsSuiteBound holds the aead key gate to the registry rather than
+// to a constant, which is the whole of what separates a provider that reads Nk from one
+// that hardcoded 32: every chacha test passes either way and only the aes entry disagrees.
+//
+// The refusals run both sides of the length. One byte over on its own leaves a gate
+// written as an upper bound passing — len(key) > Nk refuses nk+1 and accepts every short
+// key beneath it — and that was measured, not supposed.
 func TestHpkeAeadKeyLengthIsSuiteBound(t *testing.T) {
 	// 0x0003 is a 32-byte key, 0x0001 is 16. a provider that hardcoded 32 would pass
 	// every chacha test and silently fail on the aes suite.
@@ -1146,8 +1222,506 @@ func TestHpkeAeadKeyLengthIsSuiteBound(t *testing.T) {
 		if _, err := hpkeNewAead(params, make([]byte, testCase.nk)); err != nil {
 			t.Errorf("suite %#04x rejected a %d-byte key: %v", uint16(testCase.suite), testCase.nk, err)
 		}
-		if _, err := hpkeNewAead(params, make([]byte, testCase.nk+1)); !errors.Is(err, ErrBadKeyLength) {
-			t.Errorf("suite %#04x accepted a %d-byte key", uint16(testCase.suite), testCase.nk+1)
+		// 2*nk is not idle on the aes row: 32 bytes is a valid aes-256 key, so a gate
+		// that let it through would build a working aead of a suite nobody asked for
+		// rather than failing to build one at all.
+		for _, wrong := range []int{0, testCase.nk - 1, testCase.nk + 1, 2 * testCase.nk} {
+			if _, err := hpkeNewAead(params, make([]byte, wrong)); !errors.Is(err, ErrBadKeyLength) {
+				t.Errorf("suite %#04x accepted a %d-byte key: error = %v, want ErrBadKeyLength", uint16(testCase.suite), wrong, err)
+			}
 		}
+	}
+}
+
+// TestHpkeKeyScheduleContextMatchesThePublishedContext is the whole defence of the one
+// field order in this file that produces a well formed answer when it is wrong. mode,
+// psk_id_hash and info_hash concatenate to 65 bytes in that order, and the two hashes are
+// the same 32 bytes out of the same kdf — so transposing them is a context of exactly the
+// right length that the key, the base nonce and the exporter secret all follow
+// consistently, and that a sender and a receiver transposed alike agree on byte for byte.
+// The mode is the same shape: 0x01 in place of 0x00, or no mode byte at all, moves every
+// derived value and breaks nothing a round trip can see. All three were applied to
+// hpke.go and left the whole package green except this test.
+//
+// It asserts hpkeKeyScheduleContext rather than rebuilding the concatenation, and that is
+// the difference between it and the assertion the labelled extract known answer makes
+// above: that one builds the context in the test and compares it, so it holds the extract
+// and nothing else, and it passes against a key schedule that assembled the same three
+// pieces in any order at all.
+func TestHpkeKeyScheduleContextMatchesThePublishedContext(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		info := decodeVectorField(t, vector.name, "info", vector.info)
+		got := hpkeKeyScheduleContext(hpkeSuiteId(params), info)
+		want := decodeVectorField(t, vector.name, "key_schedule_context", vector.keyScheduleContext)
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: key_schedule_context = %x, want %x", vector.name, got, want)
+		}
+	}
+}
+
+// TestHpkeKeyScheduleMatchesThePublishedSchedule drives the key schedule itself from the
+// published shared secret and info and compares what the context kept. It is not the same
+// assertion as the labelled expand known answer above, which expands from the published
+// secret with the published context and so says nothing about how the key schedule
+// arrived at either: extracting the secret with crypto/hkdf's two arguments the wrong way
+// round, or building the context under the kem suite id, leaves that test green and this
+// one red.
+//
+// The key is not a field of the context and is not compared here. It is pinned by the
+// published ciphertexts in the test below, which is a stronger statement about it than
+// any length would be: a key that is the right size and the wrong bytes seals nothing the
+// RFC would recognise.
+//
+// Both registered suites, because the aes entry is where several of these become visible
+// at all. Nk is 16 there and 32 here, so a key expanded to any of the seven suite fields
+// that hold 32 is a key the aead refuses on the aes row and accepts silently on this one.
+func TestHpkeKeyScheduleMatchesThePublishedSchedule(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		info := decodeVectorField(t, vector.name, "info", vector.info)
+		ctx, err := hpkeKeySchedule(params, sharedSecret, info)
+		if err != nil {
+			t.Fatalf("%s: key schedule: %v", vector.name, err)
+		}
+		wantBaseNonce := decodeVectorField(t, vector.name, "base_nonce", vector.baseNonce)
+		if !bytes.Equal(ctx.baseNonce, wantBaseNonce) {
+			t.Errorf("%s: base_nonce = %x, want %x", vector.name, ctx.baseNonce, wantBaseNonce)
+		}
+		wantExporterSecret := decodeVectorField(t, vector.name, "exporter_secret", vector.exporterSecret)
+		if !bytes.Equal(ctx.exporterSecret, wantExporterSecret) {
+			t.Errorf("%s: exporter_secret = %x, want %x", vector.name, ctx.exporterSecret, wantExporterSecret)
+		}
+		if ctx.sequence != 0 {
+			t.Errorf("%s: a fresh context is at sequence %d, want 0", vector.name, ctx.sequence)
+		}
+	}
+}
+
+// TestHpkeContextSealMatchesThePublishedEncryptions is where the aead, the nonce counter
+// and the derived key are pinned, and it is the only test in this package that can see
+// most of what the counter can get wrong. base_nonce xor I2OSP(seq, Nn) written little
+// endian, written at the front of the nonce, added instead of xored, or advanced by two
+// per message is in every case an implementation that agrees with itself, decrypts its
+// own traffic, produces a different ciphertext for every message, and matches nobody.
+// Each of those was applied to hpke.go and left the sequence, tamper and export tests
+// green.
+//
+// The sparse sequence numbers are the RFC's own and they are the point. 0, 1, 2 and 4
+// separate the counter from a constant; 255 and 256 are where it crosses a byte, which is
+// the only place a little endian counter and a big endian one disagree about which byte
+// of the nonce to move. The context is walked to each published number with messages that
+// are sealed and thrown away, exactly as a sender that had sent them would be, and the
+// walk is counted here rather than read off the context so that a context which never
+// advances fails an assertion instead of spinning.
+//
+// The receiver opens the published ciphertext rather than the one the sender just
+// produced, so the two directions are pinned against the RFC independently instead of
+// against each other.
+func TestHpkeContextSealMatchesThePublishedEncryptions(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		if len(vector.encryptions) < 6 {
+			t.Fatalf("%s carries %d encryptions, want the six the appendix prints", vector.name, len(vector.encryptions))
+		}
+		if last := vector.encryptions[len(vector.encryptions)-1]; last.sequence <= 255 {
+			t.Fatalf("%s stops at sequence %d, so the counter never crosses a byte", vector.name, last.sequence)
+		}
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		info := decodeVectorField(t, vector.name, "info", vector.info)
+		sender, err := hpkeKeySchedule(params, sharedSecret, info)
+		if err != nil {
+			t.Fatalf("%s: sender key schedule: %v", vector.name, err)
+		}
+		receiver, err := hpkeKeySchedule(params, sharedSecret, info)
+		if err != nil {
+			t.Fatalf("%s: receiver key schedule: %v", vector.name, err)
+		}
+		position := uint64(0)
+		for _, encryption := range vector.encryptions {
+			for position < encryption.sequence {
+				filler, err := sender.Seal(nil, nil)
+				if err != nil {
+					t.Fatalf("%s: walking to sequence %d, seal at %d: %v", vector.name, encryption.sequence, position, err)
+				}
+				if _, err := receiver.Open(nil, filler); err != nil {
+					t.Fatalf("%s: walking to sequence %d, open at %d: %v", vector.name, encryption.sequence, position, err)
+				}
+				position++
+			}
+			if sender.sequence != position || receiver.sequence != position {
+				t.Fatalf("%s: after %d messages the sender is at sequence %d and the receiver at %d",
+					vector.name, position, sender.sequence, receiver.sequence)
+			}
+			wantNonce := decodeVectorField(t, vector.name, "nonce", encryption.nonce)
+			if got := sender.nonce(); !bytes.Equal(got, wantNonce) {
+				t.Errorf("%s: nonce at sequence %d = %x, want %x", vector.name, encryption.sequence, got, wantNonce)
+			}
+			aad := decodeVectorField(t, vector.name, "aad", encryption.aad)
+			plaintext := decodeVectorField(t, vector.name, "pt", encryption.pt)
+			wantCiphertext := decodeVectorField(t, vector.name, "ct", encryption.ct)
+			if len(wantCiphertext) != len(plaintext)+params.Nt {
+				t.Fatalf("%s: the published ciphertext at sequence %d is %d bytes for %d of plaintext and a %d byte tag",
+					vector.name, encryption.sequence, len(wantCiphertext), len(plaintext), params.Nt)
+			}
+			ciphertext, err := sender.Seal(aad, plaintext)
+			if err != nil {
+				t.Fatalf("%s: seal at sequence %d: %v", vector.name, encryption.sequence, err)
+			}
+			if !bytes.Equal(ciphertext, wantCiphertext) {
+				t.Errorf("%s: ciphertext at sequence %d = %x, want %x", vector.name, encryption.sequence, ciphertext, wantCiphertext)
+			}
+			back, err := receiver.Open(aad, wantCiphertext)
+			if err != nil {
+				t.Fatalf("%s: open at sequence %d: %v", vector.name, encryption.sequence, err)
+			}
+			if !bytes.Equal(back, plaintext) {
+				t.Errorf("%s: open at sequence %d returned %x, want %x", vector.name, encryption.sequence, back, plaintext)
+			}
+			position++
+		}
+	}
+}
+
+// TestHpkeContextExportMatchesThePublishedExports pins the exporter against the values
+// the appendix prints. Nothing else in this package can: a respelled label, the base
+// nonce in place of the exporter secret, or the kem suite id in place of the whole one
+// each produce 32 well formed bytes that differ per exporter context and are stable
+// across calls, which is everything the label separation test asks for. All three were
+// applied to hpke.go and left it green.
+//
+// The empty exporter context is one of the three the RFC publishes and is carried for a
+// reason of its own: it is the only input that can see an implementation substituting a
+// default of its own for a caller that supplied none.
+func TestHpkeContextExportMatchesThePublishedExports(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		if len(vector.exports) < 3 {
+			t.Fatalf("%s carries %d exported values, want the three the appendix prints", vector.name, len(vector.exports))
+		}
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		info := decodeVectorField(t, vector.name, "info", vector.info)
+		ctx, err := hpkeKeySchedule(params, sharedSecret, info)
+		if err != nil {
+			t.Fatalf("%s: key schedule: %v", vector.name, err)
+		}
+		for _, export := range vector.exports {
+			exporterContext := decodePossiblyEmptyVectorField(t, vector.name, "exporter_context", export.exporterContext)
+			want := decodeVectorField(t, vector.name, "exported_value", export.value)
+			if len(want) != export.length {
+				t.Fatalf("%s: the published export for context %q is %d bytes, the table says %d",
+					vector.name, export.exporterContext, len(want), export.length)
+			}
+			got, err := ctx.Export(exporterContext, export.length)
+			if err != nil {
+				t.Fatalf("%s: export for context %q: %v", vector.name, export.exporterContext, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s: export for context %q = %x, want %x", vector.name, export.exporterContext, got, want)
+			}
+		}
+	}
+}
+
+// TestHpkeContextExportLeavesTheSequenceAlone states what an export costs the sender, and
+// it is here because the stability check in the label separation test above cannot state
+// it. Export does not read the sequence number, so a version that advanced it returns
+// exactly the same bytes as one that does not: applied to hpke.go, an Export that
+// consumed a sequence number left every assertion in that test green, including the one
+// whose comment says the sequence must not be consumed. What sees it is the next message
+// — after an export, the seal at sequence 1 must still be the sequence 1 the RFC printed.
+func TestHpkeContextExportLeavesTheSequenceAlone(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	vector := rfc9180BaseVectors[1]
+	params, err := LookupSuite(vector.suite)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	if len(vector.encryptions) < 2 || vector.encryptions[0].sequence != 0 || vector.encryptions[1].sequence != 1 {
+		t.Fatalf("%s does not open with sequences 0 and 1, so the assertion below is about other messages", vector.name)
+	}
+	ctx, err := hpkeKeySchedule(params,
+		decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret),
+		decodeVectorField(t, vector.name, "info", vector.info))
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	first := vector.encryptions[0]
+	if _, err := ctx.Seal(decodeVectorField(t, vector.name, "aad", first.aad), decodeVectorField(t, vector.name, "pt", first.pt)); err != nil {
+		t.Fatalf("seal at sequence 0: %v", err)
+	}
+	if _, err := ctx.Export([]byte("an export between two messages"), 32); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if ctx.sequence != 1 {
+		t.Errorf("the context is at sequence %d after one message and one export, want 1", ctx.sequence)
+	}
+	second := vector.encryptions[1]
+	ciphertext, err := ctx.Seal(decodeVectorField(t, vector.name, "aad", second.aad), decodeVectorField(t, vector.name, "pt", second.pt))
+	if err != nil {
+		t.Fatalf("seal at sequence 1: %v", err)
+	}
+	want := decodeVectorField(t, vector.name, "ct", second.ct)
+	if !bytes.Equal(ciphertext, want) {
+		t.Errorf("the message after an export sealed to %x, want the published sequence 1 ciphertext %x", ciphertext, want)
+	}
+}
+
+// TestHpkeContextOpenDoesNotAdvanceOnAFailure covers the receiver that an attacker could
+// otherwise push past its sender with one injected packet: every genuine message after it
+// would open under the wrong nonce and be refused, which is a denial of service available
+// to anyone who can write to the transport.
+//
+// The tamper test above cannot see this. It builds a fresh receiver for every byte it
+// flips, so no receiver in it is ever asked to open a genuine message after refusing a
+// forged one — which is the only observation the property has. Applied to hpke.go, an
+// Open that advanced on failure left that test green.
+func TestHpkeContextOpenDoesNotAdvanceOnAFailure(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	sharedSecret := bytes.Repeat([]byte{0x14}, 32)
+	sender, err := hpkeKeySchedule(params, sharedSecret, []byte("info"))
+	if err != nil {
+		t.Fatalf("sender key schedule: %v", err)
+	}
+	receiver, err := hpkeKeySchedule(params, sharedSecret, []byte("info"))
+	if err != nil {
+		t.Fatalf("receiver key schedule: %v", err)
+	}
+	aad := []byte("aad")
+	messages := [][]byte{[]byte("the first message"), []byte("the second message")}
+	sealed := make([][]byte, 0, len(messages))
+	for i, message := range messages {
+		ciphertext, err := sender.Seal(aad, message)
+		if err != nil {
+			t.Fatalf("seal %d: %v", i, err)
+		}
+		sealed = append(sealed, ciphertext)
+	}
+	forgery := bytes.Clone(sealed[0])
+	forgery[0] ^= 0x01
+	if _, err := receiver.Open(aad, forgery); !errors.Is(err, ErrAeadOpen) {
+		t.Fatalf("the forgery opened: error = %v, want ErrAeadOpen", err)
+	}
+	if receiver.sequence != 0 {
+		t.Errorf("the receiver is at sequence %d after refusing a forgery, want 0", receiver.sequence)
+	}
+	for i, ciphertext := range sealed {
+		back, err := receiver.Open(aad, ciphertext)
+		if err != nil {
+			t.Fatalf("the genuine message %d was refused after a forgery: %v", i, err)
+		}
+		if !bytes.Equal(back, messages[i]) {
+			t.Errorf("message %d opened to %q, want %q", i, back, messages[i])
+		}
+	}
+}
+
+// TestHpkeContextRefusesToWrapTheSequence covers the one arithmetic failure in this file
+// that is a total break rather than a wrong answer. A counter that wrapped would put a
+// second message on a nonce already used, and a repeated nonce hands an observer the xor
+// of the two plaintexts and, under both of these aeads, the material to forge under that
+// key for the rest of the context's life.
+//
+// The boundary is asserted from both sides because only that says where it is. A guard
+// that never fires is the break itself; a guard one message early silently drops the last
+// message a context was entitled to send, and neither an equality against the constant
+// nor a refusal on its own separates the two. The RFC's own limit is 2^(8*Nn)-1 and is
+// unreachable in a uint64, so what is asserted here is the counter's own width.
+//
+// Open's half is not reachable by sealing: at the last sequence number Seal computes a
+// ciphertext and then drops it, so this package can never produce the message that would
+// provoke it. The message a peer which did not stop would send is built from the
+// context's own aead, and the assertion is that it decrypts and is still not handed back.
+func TestHpkeContextRefusesToWrapTheSequence(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	sharedSecret := bytes.Repeat([]byte{0x15}, 32)
+	aad := []byte("aad")
+	plaintext := []byte("the last message this context may send")
+
+	sender, err := hpkeKeySchedule(params, sharedSecret, nil)
+	if err != nil {
+		t.Fatalf("sender key schedule: %v", err)
+	}
+	sender.sequence = math.MaxUint64 - 1
+	last, err := sender.Seal(aad, plaintext)
+	if err != nil {
+		t.Fatalf("the last representable message was refused: %v", err)
+	}
+	if sender.sequence != math.MaxUint64 {
+		t.Fatalf("the sender is at sequence %d after its last message, want %d", sender.sequence, uint64(math.MaxUint64))
+	}
+	beyond, err := sender.Seal(aad, plaintext)
+	if !errors.Is(err, ErrSequenceOverflow) {
+		t.Errorf("sealing past the last sequence number: error = %v, want ErrSequenceOverflow", err)
+	}
+	if beyond != nil {
+		t.Errorf("the refused seal returned %d bytes anyway", len(beyond))
+	}
+	if sender.sequence != math.MaxUint64 {
+		t.Errorf("the sequence moved to %d on the refusal, so it wrapped rather than stopping", sender.sequence)
+	}
+
+	receiver, err := hpkeKeySchedule(params, sharedSecret, nil)
+	if err != nil {
+		t.Fatalf("receiver key schedule: %v", err)
+	}
+	receiver.sequence = math.MaxUint64 - 1
+	back, err := receiver.Open(aad, last)
+	if err != nil {
+		t.Fatalf("the last representable message did not open: %v", err)
+	}
+	if !bytes.Equal(back, plaintext) {
+		t.Errorf("the last message opened to %q, want %q", back, plaintext)
+	}
+	fromANonconformingPeer := receiver.aead.Seal(nil, receiver.nonce(), plaintext, aad)
+	if opened, err := receiver.Open(aad, fromANonconformingPeer); !errors.Is(err, ErrSequenceOverflow) {
+		t.Errorf("opening past the last sequence number returned %q and error %v, want ErrSequenceOverflow", opened, err)
+	}
+}
+
+// TestHpkeContextExportRefusesUnrepresentableLengths is about the process rather than
+// about a value. The export length is the only one in this package that comes from a
+// caller — every other expansion takes a suite field — and crypto/hkdf.Expand does not
+// refuse a negative one, it dies on it: its fips140 body opens with make([]byte, 0,
+// keyLen) and a negative cap is "makeslice: cap out of range". So this says an export
+// length reaches the guard rather than the kdf. Applied to hpke.go, an Export that called
+// hkdf.Expand directly took the test binary down here.
+//
+// The accepting lengths are asserted beside the refusals, because a function hardwired to
+// refuse everything satisfies refusals on its own.
+func TestHpkeContextExportRefusesUnrepresentableLengths(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	ctx, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x16}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	for _, length := range []int{-1, hpkeMaxExpandLength + 1} {
+		out, err := ctx.Export([]byte("context"), length)
+		if !errors.Is(err, ErrBadKeyLength) {
+			t.Errorf("export of %d bytes returned error %v, want ErrBadKeyLength", length, err)
+		}
+		if out != nil {
+			t.Errorf("export of %d bytes refused and returned %d bytes anyway", length, len(out))
+		}
+	}
+	for _, length := range []int{0, 1, params.Nk, hpkeMaxExpandLength} {
+		out, err := ctx.Export([]byte("context"), length)
+		if err != nil {
+			t.Fatalf("export rejected %d bytes: %v", length, err)
+		}
+		if len(out) != length {
+			t.Fatalf("export of %d bytes returned %d", length, len(out))
+		}
+	}
+}
+
+// TestHpkeKeyScheduleReadsTheFieldItNames is the key schedule's half of what
+// TestHpkeKemReadsTheFieldItNames does for the kem, and it exists for exactly one of the
+// three lengths the schedule expands to.
+//
+// Two of the three are separated by the registry itself and were measured to be. Nk is 16
+// on the aes entry and 32 on the chacha one, so a key expanded to any other field is a
+// key the aead refuses on at least one of the two rows: all nine interchanges died
+// against the published vectors. Nn is 12 while every other field is 16 or 32, so a base
+// nonce expanded to any of them is the wrong length against a published base_nonce: all
+// nine died there too.
+//
+// Nh is separated by nothing. It is 32 in both entries, and so are Nsecret, Nenc, Npk,
+// Nsk, NsigPub and NsigPriv — seven fields holding one value — so an exporter secret
+// expanded to any of the other six is byte for byte the published one. Each of the six
+// was applied to hpke.go and left the entire package green, this test excepted, and a
+// constant 32 in place of the field is the same case and dies here for the same reason.
+//
+// The probe suite is the kem probes' own, which is what keeps a length from being left
+// out and read as zero. Nn is pinned to 12 in both rows rather than left at the
+// background because the key schedule refuses a suite whose Nn disagrees with its aead,
+// and a probe that could not build a context would assert nothing.
+func TestHpkeKeyScheduleReadsTheFieldItNames(t *testing.T) {
+	sharedSecret := bytes.Repeat([]byte{0x17}, 32)
+
+	// the exporter secret expands to Nh and not to the six other fields holding the same
+	// 32 that both registered suites give it
+	wideNh := hpkeFieldProbeParams(32)
+	wideNh.Nn = 12
+	wideNh.Nh = 48
+	ctx, err := hpkeKeySchedule(wideNh, sharedSecret, nil)
+	if err != nil {
+		t.Fatalf("key schedule under Nh 48: %v", err)
+	}
+	if len(ctx.exporterSecret) != 48 {
+		t.Errorf("the exporter secret is %d bytes under a suite whose Nh is 48 and whose every other length is 32 or 12, want 48", len(ctx.exporterSecret))
+	}
+
+	// and the key and the base nonce expand to Nk and Nn under a background that agrees
+	// with neither. The key is asserted by the schedule completing at all: the aead gate
+	// reads the same Nk, so a key of any other length is refused there.
+	wideBackground := hpkeFieldProbeParams(48)
+	wideBackground.Nk = 32
+	wideBackground.Nn = 12
+	ctx, err = hpkeKeySchedule(wideBackground, sharedSecret, nil)
+	if err != nil {
+		t.Fatalf("key schedule under Nk 32 and Nn 12 with every other length 48, so the key was not expanded to Nk: %v", err)
+	}
+	if len(ctx.baseNonce) != 12 {
+		t.Errorf("the base nonce is %d bytes under a suite whose Nn is 12 and whose every other length is 32 or 48, want 12", len(ctx.baseNonce))
+	}
+	if len(ctx.exporterSecret) != 48 {
+		t.Errorf("the exporter secret is %d bytes under a suite whose Nh is 48, want 48", len(ctx.exporterSecret))
+	}
+}
+
+// TestHpkeKeyScheduleRefusesANonceLengthTheAeadWillNotTake covers a mismatch that is not
+// a wrong answer but a dead process. ComputeNonce sizes its output from Nn, and both
+// aeads panic on a nonce that is not their own length rather than returning an error, so
+// a suite whose Nn disagreed with its aead would take the program down at the first Seal.
+// The refusal happens at construction, before a key exists.
+//
+// Nothing in the registry can reach it — both entries agree with their aead — so a probe
+// suite is the only way to state it, and the accepting case is asserted beside it so the
+// refusal is not just "a probe suite fails".
+//
+// This guard is also why the two Nn reads inside ComputeNonce need no probe of their own:
+// every context that exists has Nn equal to its aead's nonce size, so a nonce built to
+// any other length is unreachable rather than merely detectable.
+func TestHpkeKeyScheduleRefusesANonceLengthTheAeadWillNotTake(t *testing.T) {
+	sharedSecret := bytes.Repeat([]byte{0x18}, 32)
+	probe := hpkeFieldProbeParams(32)
+	probe.Nn = 13
+	ctx, err := hpkeKeySchedule(probe, sharedSecret, nil)
+	if !errors.Is(err, ErrBadNonceLength) {
+		t.Fatalf("a suite whose Nn is 13 against a 12 byte aead: error = %v, want ErrBadNonceLength", err)
+	}
+	if ctx != nil {
+		t.Errorf("the refused key schedule returned a context anyway")
+	}
+	probe.Nn = 12
+	if _, err := hpkeKeySchedule(probe, sharedSecret, nil); err != nil {
+		t.Errorf("the aead's own nonce length was refused: %v", err)
 	}
 }
