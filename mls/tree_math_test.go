@@ -2263,7 +2263,7 @@ func reportSpan(t *testing.T, level uint32, block uint64) {
 // does walk arbitrary node indices but asks only whether a span holds its own
 // node, which all 12 satisfy. closing the class needs that target to assert
 // the endpoints against the layout instead, or a walk of all 2^32 indices,
-// which is 13 seconds of a suite that runs in two.
+// which is 13 seconds of a suite that runs in under two.
 //
 // the band itself is measured too. cut this file back to the family's ladder,
 // with every other row kept and the counts adjusted so it is still green, and
