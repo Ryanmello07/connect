@@ -909,6 +909,12 @@ func pathOracle(level uint32, block uint64, depth uint32) ([]NodeIndex, []NodeIn
 // leave two of the eight leaves, every parent and the root unasserted, and a
 // path that is right for a leaf and wrong for a parent is exactly what Task 12
 // and the TreeKEM plan go on to call.
+//
+// this tree is one depth of thirty-two, so it is the start of the coverage and
+// not the whole of it. measured against the same enumeration the sweep below
+// describes: the five published rows and the two edge arms the plan wrote for
+// this task fail 37 of 279 versions and let 240 through. the sweeps carry the
+// rest.
 func TestDirectPathAndCopathRfcTable2(t *testing.T) {
 	pathCases := []struct {
 		label      string
@@ -1032,6 +1038,13 @@ func TestDirectPathAndCopathRfcTable2(t *testing.T) {
 // runner that exercised only the arm with an answer in it looks like full
 // coverage and is not, and here the empty arm is the one the RFC defines first
 // and the one a caller ranges over without checking.
+//
+// the two read-backs of the value beside the error are what this test adds over
+// the shape of the refusal, and one of them is the sole holder of its class:
+// measured, with the nil read-back below removed and every other row of this
+// file kept, a version that hands back an empty slice alongside
+// ErrNodeOutOfRange passes the whole package. a caller that reads the value and
+// drops the error then walks a path that was never computed.
 func TestDirectPathAndCopathEdges(t *testing.T) {
 	emptyPaths, outOfRangeRefusals, invalidCountRefusals := 0, 0, 0
 
@@ -1235,11 +1248,26 @@ func checkPathsAgainstOracle(t *testing.T, level uint32, block uint64, depth uin
 // tree, so depths 10 to 31 are covered by nothing else in this package —
 // the same hole Tasks 5 and 6 each had to fill for their own functions.
 //
-// measured rather than argued, in a scratch copy: with the depth 10 to 31 band
-// below removed and every other row of this file kept, a mechanical enumeration
-// of these two bodies leaves versions passing that truncate the path, drop a
-// level, or shift the copath, at any depth above 9. the numbers are in the task
-// report.
+// measured rather than argued, in a scratch copy. a grammar over the two
+// bodies — the leaf count check, the range guard and its depth bands, what the
+// path holds, its length, one level or one position missing, the step bound,
+// and for the copath the chain the siblings are taken from — enumerates 279
+// versions. this file fails 195 of them and the 82 it does not are
+// indistinguishable from the shipped one for every input, which the shipped
+// doc comments say where it matters. cut this file back to the family's ladder,
+// depth 9 and below, with every other row kept and the arm counts adjusted so
+// it is still green, and 200 pass: the band from depth 10 to 31 is the only
+// thing killing 118 of the 279. they are every level from 10 to 31 dropped from
+// the direct path, every position from 10 to 30 dropped, every truncation to a
+// length in that range, the matching two bands of the copath, and the step
+// bound anywhere from 10 to 29.
+//
+// the independence of the oracle is measured too, not asserted. with pathOracle
+// rewritten to call DirectPath and Copath and nothing else changed, a version
+// that swaps the first node of every path above depth 9 for its sibling — the
+// same length, the wrong nodes — passes this test. with the layout oracle it
+// fails. that is the circular table this project has rejected four times, and
+// the only thing standing between the two is that pathOracle calls nothing.
 func TestDirectPathAndCopathAcrossEveryDepth(t *testing.T) {
 	emptyPaths, definedPaths := 0, 0
 

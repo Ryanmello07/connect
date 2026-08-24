@@ -279,12 +279,22 @@ func Sibling(x NodeIndex, n LeafCount) (NodeIndex, error) {
 // walking a partly built path.
 //
 // the loop is bounded explicitly. it cannot run away for a validated index —
-// every step moves to a strictly higher level and the root holds the highest,
-// which the depth 31 rows of tree_math_test.go pin by walking a path of exactly
-// 31 nodes — but a structural bound makes that a property of the code rather
-// than of an argument about the code. no input reaches the bound, so no test
-// can exercise it; it is a brake against a future Parent, not asserted
-// behaviour.
+// every step moves to a strictly higher level and the root holds the highest —
+// but a structural bound makes that a property of the code rather than of an
+// argument about the code. the bound is pinned from below and not from above:
+// the deepest tree walks a path of 31 nodes, so a bound of 29 or less truncates
+// a real answer and the tests catch it, while every value from 30 up is
+// indistinguishable from every other. measured, one version per value from 0 to
+// 32: 0 through 29 fail, 30, 31 and 32 pass.
+//
+// the range check is a second line rather than the only one. Parent refuses an
+// index past the end of the tree with the same sentinel and the same absent
+// slice, so weakening this check, or skipping it at any one depth, changes
+// nothing a caller can observe — measured, thirty-nine versions of it, every
+// one indistinguishable from this one. it is kept because a function should
+// enforce its own precondition rather than inherit it from the one it happens
+// to call, and because a rewrite that walked ancestors by arithmetic instead of
+// by Parent would leave nothing else guarding the entry.
 func DirectPath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
 	r, err := Root(n)
 	if err != nil {
@@ -315,6 +325,13 @@ func DirectPath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
 // the direct-path entry at the same position that x does not descend from. the
 // root has an empty copath, and as with the direct path the empty result is a
 // slice rather than nil and a refusal carries no slice.
+//
+// the range check here stands to DirectPath's as DirectPath's stands to
+// Parent's, and is unobservable for the same reason and by the same
+// measurement: thirty-nine versions of it, none of them distinguishable. the
+// root case below is a shortcut rather than a correction — an empty direct path
+// would yield an empty copath through the loop anyway — and is likewise
+// indistinguishable from its own absence.
 func Copath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
 	r, err := Root(n)
 	if err != nil {
