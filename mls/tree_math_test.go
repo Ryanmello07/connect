@@ -2251,8 +2251,27 @@ func reportSpan(t *testing.T, level uint32, block uint64) {
 // keyed on a level and is blind to versions keyed on a node. so the second band
 // walks every block of every level from 8 up — 2^24-1 nodes, the whole of the
 // band the family cannot reach and two levels below it — and the third and
-// fourth walk every block at each end of the levels below that, where the
-// family and the eight-leaf fixtures already hold the middle.
+// fourth walk every block at each end of the levels below that.
+//
+// what that leaves is stated rather than implied. levels 0 to 7 have too many
+// blocks to walk — level zero alone has 2^31 — so they are held at both ends
+// and on the ladder, and a version wrong at exactly one node of those levels
+// in the interior of a tree larger than 2^20 leaves passes this file.
+// measured: of the 134 versions the block class enumerates, 122 die and the 12
+// that live are all at levels 0 to 7 and all at a block a third or two thirds
+// along. nothing else in this package reaches them, and Task 14's fuzz target
+// does walk arbitrary node indices but asks only whether a span holds its own
+// node, which all 12 satisfy. closing the class needs that target to assert
+// the endpoints against the layout instead, or a walk of all 2^32 indices,
+// which is 13 seconds of a suite that runs in two.
+//
+// the band itself is measured too. cut this file back to the family's ladder,
+// with every other row kept and the counts adjusted so it is still green, and
+// 269 of the 622 die instead of 572: the rows that reach above the ladder are
+// the only thing killing 303 of them. 264 name a level from 10 to 31, 22 are
+// guard thresholds from k > 9 to k > 30, each of which collapses the span of
+// every node above its own level, and 17 are single-node versions at levels 0
+// to 9 sitting past the end of a 512-leaf tree.
 func TestSubtreeSpanAtEveryLevel(t *testing.T) {
 	leafRows, parentRows := 0, 0
 	for level := uint32(0); level <= 31; level += 1 {
@@ -2363,6 +2382,14 @@ func TestSubtreeSpanAtEveryLevel(t *testing.T) {
 // full coverage and is not, and here the second arm is the one that decides
 // whether an index a caller never validated can pass itself off as the head of
 // the whole array.
+//
+// this test is the sole holder of four versions, measured one test at a time
+// rather than claimed: the range guard removed, the guarded answer written as
+// the whole array, and either halving rounded up instead of down. every other
+// test in this package passes all four. the first two would make an index no
+// tree holds the head of every node of the largest tree; the second two are
+// this function at every index a tree does hold, and differ only at the index
+// that is in none, where the rounding wraps to zero.
 func TestSubtreeSpanArms(t *testing.T) {
 	leafArms, outOfRangeArms := 0, 0
 
