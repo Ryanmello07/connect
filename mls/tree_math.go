@@ -206,3 +206,29 @@ func Root(n LeafCount) (NodeIndex, error) {
 	w := NodeWidth(n)
 	return NodeIndex((uint32(1) << log2(w)) - 1), nil
 }
+
+// the left child of a parent node. children are computed from the index alone,
+// so no leaf count is needed and the answer is the same in every tree that
+// contains x.
+func Left(x NodeIndex) (NodeIndex, error) {
+	k := x.Level()
+	if k == 0 {
+		return 0, ErrLeafHasNoChildren
+	}
+	if k > 31 {
+		return 0, ErrNodeOutOfRange
+	}
+	return x ^ NodeIndex(uint32(0x01)<<(k-1)), nil
+}
+
+// the right child of a parent node.
+func Right(x NodeIndex) (NodeIndex, error) {
+	k := x.Level()
+	if k == 0 {
+		return 0, ErrLeafHasNoChildren
+	}
+	if k > 31 {
+		return 0, ErrNodeOutOfRange
+	}
+	return x ^ NodeIndex(uint32(0x03)<<(k-1)), nil
+}

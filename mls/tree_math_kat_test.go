@@ -230,3 +230,52 @@ func TestTreeMathVectorRoot(t *testing.T) {
 		t.Errorf("root of MaxLeafCount: %d, want %d", root, NodeIndex(1<<31)-1)
 	}
 }
+
+func TestTreeMathVectorChildren(t *testing.T) {
+	vectors := loadTreeMathVectors(t)
+	for _, v := range vectors {
+		for i := uint32(0); i < v.NNodes; i += 1 {
+			nodeIndex := NodeIndex(i)
+
+			gotLeft, leftErr := Left(nodeIndex)
+			if want := v.Left[i]; want == nil {
+				if leftErr == nil {
+					t.Errorf("n_leaves %d node %d: left %d, want undefined", v.NLeaves, i, gotLeft)
+				} else if !errors.Is(leftErr, ErrLeafHasNoChildren) {
+					t.Errorf("n_leaves %d node %d: left: %v, want %v", v.NLeaves, i, leftErr, ErrLeafHasNoChildren)
+				}
+			} else {
+				if leftErr != nil {
+					t.Errorf("n_leaves %d node %d: left: %v, want %d", v.NLeaves, i, leftErr, *want)
+				} else if uint32(gotLeft) != *want {
+					t.Errorf("n_leaves %d node %d: left %d, want %d", v.NLeaves, i, gotLeft, *want)
+				}
+			}
+
+			gotRight, rightErr := Right(nodeIndex)
+			if want := v.Right[i]; want == nil {
+				if rightErr == nil {
+					t.Errorf("n_leaves %d node %d: right %d, want undefined", v.NLeaves, i, gotRight)
+				} else if !errors.Is(rightErr, ErrLeafHasNoChildren) {
+					t.Errorf("n_leaves %d node %d: right: %v, want %v", v.NLeaves, i, rightErr, ErrLeafHasNoChildren)
+				}
+			} else {
+				if rightErr != nil {
+					t.Errorf("n_leaves %d node %d: right: %v, want %d", v.NLeaves, i, rightErr, *want)
+				} else if uint32(gotRight) != *want {
+					t.Errorf("n_leaves %d node %d: right %d, want %d", v.NLeaves, i, gotRight, *want)
+				}
+			}
+		}
+	}
+
+	// 0xFFFFFFFF is one past the last node of the largest representable tree,
+	// and its level of 32 would shift a child computation off the end of a
+	// uint32. it is refused rather than answered with a truncated index.
+	if _, err := Left(NodeIndex(0xFFFFFFFF)); !errors.Is(err, ErrNodeOutOfRange) {
+		t.Errorf("left of 0xFFFFFFFF: %v, want %v", err, ErrNodeOutOfRange)
+	}
+	if _, err := Right(NodeIndex(0xFFFFFFFF)); !errors.Is(err, ErrNodeOutOfRange) {
+		t.Errorf("right of 0xFFFFFFFF: %v, want %v", err, ErrNodeOutOfRange)
+	}
+}
