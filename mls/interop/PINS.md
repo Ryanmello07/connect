@@ -63,8 +63,17 @@ and the sixteen mlswg files were once vendored already smudged with a manifest c
 smudged bytes, so they verified against bytes upstream never published.
 `testdata/vectors/rfc/.gitattributes` carries `* -text` and was committed before the file it
 protects; `git ls-files --eol` reports `i/lf w/lf attr/-text`, and
-`TestHpkeVectorFileCarriesTheBytesUpstreamPublished` refuses a carriage return in the file at all.
+`TestHpkeVectorFileWasNotSmudgedOnTheWayIn` refuses a carriage return in the file at all.
 
-The vendored digest is pinned a second time in `mls/hpke_vectors_test.go` as `hpkeVectorSha256`,
-and `TestHpkeVectorDigestIsRecordedInThePinFile` asserts this file and that constant agree, so the
-two cannot drift apart.
+Every value above is pinned a second time in `mls/hpke_vectors_test.go` — the vendored digest as
+`hpkeVectorSha256`, the repository, commit, path and upstream digest as the constants beside it —
+and `TestHpkeVectorProvenanceIsRecordedInThePinFile` compares the two copies field by field: it
+parses the fenced block and the table above rather than grepping the file, because the commit
+appears three times and the vendored digest twice, and a `strings.Contains` over the whole file is
+answered by whichever copy was not corrupted. It also holds the fetch url to the three fields it is
+built out of, and the predicate, the serialization call and the stated depth to the constants the
+tests loop over, so re-vendoring has to move both copies or fail. Before it existed, 33 of 35
+corruptions of this section left all 82 tests in the package green.
+`TestHpkeVectorDirectoryDisablesGitsTextConversion` reads `testdata/vectors/rfc/.gitattributes`
+itself, so the rule going missing fails on the commit that removes it rather than on the next
+person's fresh clone.
