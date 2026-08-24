@@ -231,51 +231,179 @@ func TestTreeMathVectorRoot(t *testing.T) {
 	}
 }
 
+// asserts one column of one node against one child function and reports which
+// of the two arms it confirmed, so the caller can prove it exercised both.
+//
+// the left and right columns carry identical rules, so the rules are stated
+// once here rather than twice at the call site: two copies is how one half
+// acquires an assertion the other lacks, and a reader has to diff forty lines
+// to notice.
+func checkChildColumn(t *testing.T, label string, nLeaves uint32, node uint32, got NodeIndex, err error, want *uint32) (refused bool, matched bool) {
+	t.Helper()
+	if want == nil {
+		if err == nil {
+			t.Errorf("n_leaves %d node %d: %s %d, want undefined", nLeaves, node, label, got)
+			return false, false
+		}
+		if !errors.Is(err, ErrLeafHasNoChildren) {
+			t.Errorf("n_leaves %d node %d: %s: %v, want %v", nLeaves, node, label, err, ErrLeafHasNoChildren)
+			return false, false
+		}
+		// the index is read back alongside the refusal, as the root runner above
+		// already does. measured: a version that hands back x with the error
+		// satisfies both checks above, and a caller that reads only the value
+		// then has a leaf as its own child.
+		if got != 0 {
+			t.Errorf("n_leaves %d node %d: %s %d alongside the refusal, want 0", nLeaves, node, label, got)
+			return false, false
+		}
+		return true, false
+	}
+	if err != nil {
+		t.Errorf("n_leaves %d node %d: %s: %v, want %d", nLeaves, node, label, err, *want)
+		return false, false
+	}
+	if uint32(got) != *want {
+		t.Errorf("n_leaves %d node %d: %s %d, want %d", nLeaves, node, label, got, *want)
+		return false, false
+	}
+	return false, true
+}
+
 func TestTreeMathVectorChildren(t *testing.T) {
 	vectors := loadTreeMathVectors(t)
+
+	// both arms of every column are counted, and what is counted is a confirmed
+	// assertion rather than a column entry seen. counting entries seen would
+	// sit at the same number while every assertion beneath it was skipped,
+	// which is the shape a guard in this package already had to be rewritten
+	// out of.
+	//
+	// the counting exists because null is the majority of these columns at
+	// every size, and a runner that reads null as "nothing to check here" tests
+	// the parent half of the family and silently drops the leaf refusal
+	// entirely. measured: with the null arm made unreachable, a version of Left
+	// and Right with no leaf guard at all passes the whole of this test.
+	leftRefusals, leftMatches := 0, 0
+	rightRefusals, rightMatches := 0, 0
+
 	for _, v := range vectors {
 		for i := uint32(0); i < v.NNodes; i += 1 {
 			nodeIndex := NodeIndex(i)
 
 			gotLeft, leftErr := Left(nodeIndex)
-			if want := v.Left[i]; want == nil {
-				if leftErr == nil {
-					t.Errorf("n_leaves %d node %d: left %d, want undefined", v.NLeaves, i, gotLeft)
-				} else if !errors.Is(leftErr, ErrLeafHasNoChildren) {
-					t.Errorf("n_leaves %d node %d: left: %v, want %v", v.NLeaves, i, leftErr, ErrLeafHasNoChildren)
-				}
-			} else {
-				if leftErr != nil {
-					t.Errorf("n_leaves %d node %d: left: %v, want %d", v.NLeaves, i, leftErr, *want)
-				} else if uint32(gotLeft) != *want {
-					t.Errorf("n_leaves %d node %d: left %d, want %d", v.NLeaves, i, gotLeft, *want)
-				}
+			refused, matched := checkChildColumn(t, "left", v.NLeaves, i, gotLeft, leftErr, v.Left[i])
+			if refused {
+				leftRefusals += 1
+			}
+			if matched {
+				leftMatches += 1
 			}
 
 			gotRight, rightErr := Right(nodeIndex)
-			if want := v.Right[i]; want == nil {
-				if rightErr == nil {
-					t.Errorf("n_leaves %d node %d: right %d, want undefined", v.NLeaves, i, gotRight)
-				} else if !errors.Is(rightErr, ErrLeafHasNoChildren) {
-					t.Errorf("n_leaves %d node %d: right: %v, want %v", v.NLeaves, i, rightErr, ErrLeafHasNoChildren)
-				}
-			} else {
-				if rightErr != nil {
-					t.Errorf("n_leaves %d node %d: right: %v, want %d", v.NLeaves, i, rightErr, *want)
-				} else if uint32(gotRight) != *want {
-					t.Errorf("n_leaves %d node %d: right %d, want %d", v.NLeaves, i, gotRight, *want)
-				}
+			refused, matched = checkChildColumn(t, "right", v.NLeaves, i, gotRight, rightErr, v.Right[i])
+			if refused {
+				rightRefusals += 1
+			}
+			if matched {
+				rightMatches += 1
 			}
 		}
 	}
 
+	// the leaf counts on the family's ladder sum to 1023, and every entry holds
+	// one fewer parent than it holds leaves, so the family publishes 1023
+	// undefined children and 1013 defined ones per column — 2036 in all, the
+	// node total the corpus tripwire pins. the totals are asserted rather than
+	// only "more than none" so that a runner which skipped part of the ladder,
+	// or part of an entry, fails here too.
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "left refusals", got: leftRefusals, want: 1023},
+		{label: "left matches", got: leftMatches, want: 1013},
+		{label: "right refusals", got: rightRefusals, want: 1023},
+		{label: "right matches", got: rightMatches, want: 1013},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+
+	// the family stops at 512 leaves, so its deepest parent is that entry's
+	// root at level 9 and it says nothing at all about levels 10 and above.
+	// nothing later in this package covers them either: the structural sweep
+	// also stops at 512 leaves, and the fuzz target asserts only that an
+	// answer is inside the tree.
+	//
+	// measured, not assumed: against the family plus the two refusal probes
+	// below, every range guard from k > 9 through k >= 31 passes. each of them
+	// refuses only nodes the family never asks about, and 0xFFFFFFFF is
+	// expected to be refused anyway. the level 31 row is what brackets the
+	// guard from below; 0xFFFFFFFF brackets it from above.
+	//
+	// the expected values are not the operation under test. in the array layout
+	// a node at level k spans the 2^(k+1)-1 nodes centred on itself, so its
+	// children are the centres of the two halves, at x-2^(k-1) and x+2^(k-1).
+	// that derivation reproduces all 2036 published entries of this family
+	// exactly, and the level 5 row is itself published — it is the root of the
+	// 32-leaf entry — so the table is anchored to vendored data at one row
+	// rather than resting on arithmetic alone.
+	boundaryCases := []struct {
+		nodeIndex NodeIndex
+		left      NodeIndex
+		right     NodeIndex
+	}{
+		// level 5, the root of the family's 32-leaf entry.
+		{nodeIndex: 0x0000001F, left: 0x0000000F, right: 0x0000002F},
+		// level 16 and level 30, two subtree roots no published entry reaches.
+		{nodeIndex: 0x0000FFFF, left: 0x00007FFF, right: 0x00017FFF},
+		{nodeIndex: 0x3FFFFFFF, left: 0x1FFFFFFF, right: 0x5FFFFFFF},
+		// level 31, the root of the largest representable tree and the deepest
+		// node that has children at all.
+		{nodeIndex: 0x7FFFFFFF, left: 0x3FFFFFFF, right: 0xBFFFFFFF},
+	}
+	for _, c := range boundaryCases {
+		gotLeft, err := Left(c.nodeIndex)
+		if err != nil {
+			t.Errorf("left of %d: %v, want %d", c.nodeIndex, err, c.left)
+		} else if gotLeft != c.left {
+			t.Errorf("left of %d: %d, want %d", c.nodeIndex, gotLeft, c.left)
+		}
+		gotRight, err := Right(c.nodeIndex)
+		if err != nil {
+			t.Errorf("right of %d: %v, want %d", c.nodeIndex, err, c.right)
+		} else if gotRight != c.right {
+			t.Errorf("right of %d: %d, want %d", c.nodeIndex, gotRight, c.right)
+		}
+	}
+
+	// the refusal below is reachable at exactly one index, and only because
+	// Level is total and answers 32 there. this line is the diagnosis rather
+	// than the coverage: a Level clamped to 31 already fails the two checks
+	// after it, because the clamped version answers 0x7FFFFFFF instead of
+	// refusing. it is here so that failure names its cause instead of looking
+	// like a broken guard.
+	if got := NodeIndex(0xFFFFFFFF).Level(); got != 32 {
+		t.Fatalf("level of 0xFFFFFFFF: %d, want 32: no index reaches the range refusal below at any other level", got)
+	}
+
 	// 0xFFFFFFFF is one past the last node of the largest representable tree,
 	// and its level of 32 would shift a child computation off the end of a
-	// uint32. it is refused rather than answered with a truncated index.
-	if _, err := Left(NodeIndex(0xFFFFFFFF)); !errors.Is(err, ErrNodeOutOfRange) {
+	// uint32. it is refused rather than answered with a truncated index, and
+	// the index is read back alongside the refusal for the same reason as in
+	// the column checker above.
+	if gotLeft, err := Left(NodeIndex(0xFFFFFFFF)); !errors.Is(err, ErrNodeOutOfRange) {
 		t.Errorf("left of 0xFFFFFFFF: %v, want %v", err, ErrNodeOutOfRange)
+	} else if gotLeft != 0 {
+		t.Errorf("left of 0xFFFFFFFF: %d alongside the refusal, want 0", gotLeft)
 	}
-	if _, err := Right(NodeIndex(0xFFFFFFFF)); !errors.Is(err, ErrNodeOutOfRange) {
+	if gotRight, err := Right(NodeIndex(0xFFFFFFFF)); !errors.Is(err, ErrNodeOutOfRange) {
 		t.Errorf("right of 0xFFFFFFFF: %v, want %v", err, ErrNodeOutOfRange)
+	} else if gotRight != 0 {
+		t.Errorf("right of 0xFFFFFFFF: %d alongside the refusal, want 0", gotRight)
 	}
 }
