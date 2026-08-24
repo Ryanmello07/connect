@@ -2190,55 +2190,122 @@ func TestSubtreeSpanAndLeaves(t *testing.T) {
 	}
 }
 
+// reports whether one node's span and leaf range are the absolute answers the
+// array layout gives for it.
+//
+// a plain predicate rather than an assertion taking t, because the sweeps below
+// call it twenty million times and t.Helper walks the call stack on every call.
+// what a mismatch looks like is reportSpan's business, and that runs once.
+func spanAgrees(level uint32, block uint64) bool {
+	nodeIndex := nodeAt(level, block)
+	wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf := spanOracle(level, block)
+	firstNode, lastNode := SubtreeSpan(nodeIndex)
+	if firstNode != wantFirstNode || lastNode != wantLastNode {
+		return false
+	}
+	firstLeaf, lastLeaf := SubtreeLeaves(nodeIndex)
+	if firstLeaf != wantFirstLeaf || lastLeaf != wantLastLeaf {
+		return false
+	}
+	// the two answers have to describe one subtree: the leaves at the ends of
+	// the range are the nodes at the ends of the span. that is what makes the
+	// halving sound rather than merely plausible, and it is the claim the one
+	// index outside every tree does not satisfy — TestSubtreeSpanArms names
+	// that index and pins the contradiction there.
+	return firstLeaf.NodeIndex() == firstNode && lastLeaf.NodeIndex() == lastNode
+}
+
+// fails the test with everything the layout expected of one node beside
+// everything the package answered for it, because a span mismatch is rarely
+// only at the end the predicate above stopped on.
+func reportSpan(t *testing.T, level uint32, block uint64) {
+	t.Helper()
+	nodeIndex := nodeAt(level, block)
+	wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf := spanOracle(level, block)
+	firstNode, lastNode := SubtreeSpan(nodeIndex)
+	firstLeaf, lastLeaf := SubtreeLeaves(nodeIndex)
+	t.Fatalf("level %d block %d: node %d spans [%d, %d] over leaves [%d, %d], want [%d, %d] over [%d, %d]",
+		level, block, nodeIndex, firstNode, lastNode, firstLeaf, lastLeaf, wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf)
+}
+
 // the absolute endpoints at every level a node can have, against the layout
 // oracle rather than against a property.
 //
 // this is where the boundary lives, and it is the same boundary every task in
 // this plan has had to fill. the vector family stops at 512 leaves and so
 // reaches levels 0 to 9; the plan's own table for this task stops at level 3;
-// the structural sweep of Task 13 stops at 512 leaves too, and the fuzz target
-// asserts only that an answer is inside the tree. levels 10 to 31 are reached
-// by nothing else in this package.
+// the structural sweep of Task 13 stops at 512 leaves too and asserts
+// containment, parity and width rather than the endpoints; and the fuzz target
+// asserts only that the span holds its own node. levels 10 to 31 are reached by
+// nothing else in this package.
 //
-// four blocks per level rather than one, because a span is a function of the
-// block as well as the level and a version right at the left edge of the array
-// can be wrong everywhere else. the leaf range is asserted beside the node span
-// on every row, since the two can disagree — the node span can be right while
-// the halving that turns it into leaves is off by one, and neither is derived
-// from the other here.
+// the leaf range is asserted beside the node span on every row, since the two
+// can disagree — the node span can be right while the halving that turns it
+// into leaves is off by one, and neither is derived from the other here.
+//
+// four bands, and the reason there are four rather than one is measured. the
+// first is a ladder of four blocks a level, which was the whole sweep until a
+// version keyed on one interior block was put to it: wrong at level 16 block 2
+// and right everywhere else, it passed, and so did the same version at levels
+// 10, 20 and 25 and at four other blocks apiece. a block ladder kills versions
+// keyed on a level and is blind to versions keyed on a node. so the second band
+// walks every block of every level from 8 up — 2^24-1 nodes, the whole of the
+// band the family cannot reach and two levels below it — and the third and
+// fourth walk every block at each end of the levels below that, where the
+// family and the eight-leaf fixtures already hold the middle.
 func TestSubtreeSpanAtEveryLevel(t *testing.T) {
 	leafRows, parentRows := 0, 0
-
 	for level := uint32(0); level <= 31; level += 1 {
 		for _, block := range spanBlocks(level) {
-			nodeIndex := nodeAt(level, block)
-			wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf := spanOracle(level, block)
-
-			firstNode, lastNode := SubtreeSpan(nodeIndex)
-			if firstNode != wantFirstNode || lastNode != wantLastNode {
-				t.Fatalf("level %d block %d: node %d span: [%d, %d], want [%d, %d]", level, block, nodeIndex, firstNode, lastNode, wantFirstNode, wantLastNode)
+			if !spanAgrees(level, block) {
+				reportSpan(t, level, block)
 			}
-
-			firstLeaf, lastLeaf := SubtreeLeaves(nodeIndex)
-			if firstLeaf != wantFirstLeaf || lastLeaf != wantLastLeaf {
-				t.Fatalf("level %d block %d: node %d leaves: [%d, %d], want [%d, %d]", level, block, nodeIndex, firstLeaf, lastLeaf, wantFirstLeaf, wantLastLeaf)
-			}
-
-			// the two answers have to describe one subtree. the leaves at the
-			// ends of the range sit at the ends of the span, which is what
-			// makes the halving above sound rather than merely plausible, and
-			// it is a claim the one index outside every tree does not satisfy —
-			// TestSubtreeSpanArms names that index and pins the contradiction
-			// there.
-			if firstLeaf.NodeIndex() != firstNode || lastLeaf.NodeIndex() != lastNode {
-				t.Fatalf("level %d block %d: node %d leaves [%d, %d] sit at nodes [%d, %d], want the span [%d, %d]", level, block, nodeIndex, firstLeaf, lastLeaf, firstLeaf.NodeIndex(), lastLeaf.NodeIndex(), firstNode, lastNode)
-			}
-
 			if level == 0 {
 				leafRows += 1
 			} else {
 				parentRows += 1
 			}
+		}
+	}
+
+	// every block of every level from 8 up, with nothing sampled: the band the
+	// vector family cannot reach, plus the two levels below it where the family
+	// stops, walked node by node.
+	bandRows := 0
+	for level := uint32(8); level <= 31; level += 1 {
+		for block := uint64(0); block < uint64(1)<<(31-level); block += 1 {
+			if !spanAgrees(level, block) {
+				reportSpan(t, level, block)
+			}
+			bandRows += 1
+		}
+	}
+
+	// the levels below that have too many blocks to walk — level zero alone has
+	// 2^31 — so they are walked at both ends instead. the low end is every node
+	// of a tree of 2^20 leaves, which is the same shape the family covers at
+	// 512 leaves carried eleven doublings further.
+	lowRows := 0
+	for level := uint32(0); level <= 7; level += 1 {
+		for block := uint64(0); block < uint64(1)<<(20-level); block += 1 {
+			if !spanAgrees(level, block) {
+				reportSpan(t, level, block)
+			}
+			lowRows += 1
+		}
+	}
+
+	// and the same number of blocks at the far end of each of those levels,
+	// where the endpoints of a span are the ones that can run off the end of
+	// the array rather than under it.
+	topRows := 0
+	for level := uint32(0); level <= 7; level += 1 {
+		blockCount := uint64(1) << (31 - level)
+		for block := blockCount - uint64(1)<<(20-level); block < blockCount; block += 1 {
+			if !spanAgrees(level, block) {
+				reportSpan(t, level, block)
+			}
+			topRows += 1
 		}
 	}
 
@@ -2269,11 +2336,16 @@ func TestSubtreeSpanAtEveryLevel(t *testing.T) {
 		got   int
 		want  int
 	}{
-		// level 0 has 2^31 blocks, so all four of its probes exist.
-		{label: "leaf rows", got: leafRows, want: 4},
+		// level 0 has 2^31 blocks, so all four of its ladder probes exist.
+		{label: "ladder leaf rows", got: leafRows, want: 4},
 		// four probes at each of levels 1 to 29, two at level 30 which has two
 		// blocks, and one at level 31 which has one.
-		{label: "parent rows", got: parentRows, want: 119},
+		{label: "ladder parent rows", got: parentRows, want: 119},
+		// sum(k=8..31) 2^(31-k).
+		{label: "every block above level 7", got: bandRows, want: 16777215},
+		// sum(k=0..7) 2^(20-k), at each end.
+		{label: "every low block below level 8", got: lowRows, want: 2088960},
+		{label: "every top block below level 8", got: topRows, want: 2088960},
 		{label: "root rows", got: rootRows, want: 32},
 	}
 	for _, c := range countCases {
@@ -2537,6 +2609,35 @@ func TestInSubtreeAtEveryLevel(t *testing.T) {
 		}
 	}
 
+	// the same two slots, at every block of every level from 8 up rather than
+	// at four blocks a level, for the reason TestSubtreeSpanAtEveryLevel gives:
+	// a ladder of blocks kills versions keyed on a level and is blind to a
+	// version keyed on one node.
+	bandInside, bandOutside := 0, 0
+	for level := uint32(8); level <= 31; level += 1 {
+		for block := uint64(0); block < uint64(1)<<(31-level); block += 1 {
+			head := nodeAt(level, block)
+			firstNode, lastNode, _, _ := spanOracle(level, block)
+			if !InSubtree(head, firstNode) {
+				t.Fatalf("level %d block %d: node %d does not head the first slot %d of its own subtree", level, block, head, firstNode)
+			}
+			if !InSubtree(head, lastNode) {
+				t.Fatalf("level %d block %d: node %d does not head the last slot %d of its own subtree", level, block, head, lastNode)
+			}
+			bandInside += 2
+			if firstNode > 0 {
+				if InSubtree(head, firstNode-1) {
+					t.Fatalf("level %d block %d: node %d heads slot %d, one below its subtree", level, block, head, firstNode-1)
+				}
+				bandOutside += 1
+			}
+			if InSubtree(head, lastNode+1) {
+				t.Fatalf("level %d block %d: node %d heads slot %d, one above its subtree", level, block, head, lastNode+1)
+			}
+			bandOutside += 1
+		}
+	}
+
 	// x is inside every node of its own direct path and inside no node of its
 	// copath, at every depth. the leftmost and the rightmost node of each level
 	// are taken, which for the ancestor chain is the difference between one
@@ -2583,6 +2684,10 @@ func TestInSubtreeAtEveryLevel(t *testing.T) {
 		// one slot outside each end, less the 32 blocks that start at slot zero
 		// and so have no slot below them.
 		{label: "outside probes", got: outsideProbes, want: 214},
+		// 2^24-1 spans above level 7, two slots inside each.
+		{label: "band inside probes", got: bandInside, want: 33554430},
+		// one slot outside each end, less the 24 blocks that start at slot zero.
+		{label: "band outside probes", got: bandOutside, want: 33554406},
 		// two nodes at each level below the root and one at the root, over 32
 		// depths: sum(d=0..31) 2d+1.
 		{label: "path rows", got: pathRows, want: 1024},
