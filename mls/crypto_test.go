@@ -1611,7 +1611,7 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 	waitGroup.Wait()
 }
 
-// The methods tasks 12 to 16 complete must refuse to be called until they are, rather
+// The methods tasks 14 to 16 complete must refuse to be called until they are, rather
 // than returning a zero value. A stub returning nil, nil from HpkeOpen would compile,
 // satisfy the interface, and be a total authentication bypass for anyone calling it in
 // the meantime. This is the counterpart of TestProviderHasNoRemainingStubs in task 16:
@@ -1623,9 +1623,6 @@ func TestProviderStubsRefuseToBeCalled(t *testing.T) {
 		name string
 		call func()
 	}{
-		{name: "ExpandWithLabel", call: func() { crypto.ExpandWithLabel(nil, "label", nil, 32) }},
-		{name: "DeriveSecret", call: func() { crypto.DeriveSecret(nil, "label") }},
-		{name: "DeriveTreeSecret", call: func() { crypto.DeriveTreeSecret(nil, "label", 0, 32) }},
 		{name: "SignWithLabel", call: func() { crypto.SignWithLabel(nil, "label", nil) }},
 		{name: "VerifyWithLabel", call: func() { crypto.VerifyWithLabel(nil, "label", nil, nil) }},
 		{name: "SignatureKeyPair", call: func() { crypto.SignatureKeyPair() }},

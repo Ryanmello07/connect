@@ -263,22 +263,13 @@ func (self *suiteCryptoProvider) Random(n int) []byte {
 	return b
 }
 
-// Completed in tasks 12 through 16, and loud until then. A stub returning a zero value
+// ExpandWithLabel, DeriveSecret and DeriveTreeSecret are task 12's and live in
+// crypto_labels.go, beside the other RFC 9420 labelled constructions.
+//
+// Completed in tasks 14 through 16, and loud until then. A stub returning a zero value
 // would compile, satisfy the interface and be a silent wrong answer — nil, nil out of
 // HpkeOpen is an authentication bypass — so each of these refuses to be called instead.
 // TestProviderHasNoRemainingStubs asserts in task 16 that none survive the wave.
-func (self *suiteCryptoProvider) ExpandWithLabel(secret []byte, label string, context []byte, length int) []byte {
-	panic("mls: ExpandWithLabel not implemented until task 12")
-}
-
-func (self *suiteCryptoProvider) DeriveSecret(secret []byte, label string) []byte {
-	panic("mls: DeriveSecret not implemented until task 12")
-}
-
-func (self *suiteCryptoProvider) DeriveTreeSecret(secret []byte, label string, generation uint32, length int) []byte {
-	panic("mls: DeriveTreeSecret not implemented until task 12")
-}
-
 func (self *suiteCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
 	panic("mls: SignWithLabel not implemented until task 14")
 }
