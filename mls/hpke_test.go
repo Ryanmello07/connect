@@ -1166,6 +1166,39 @@ func TestHpkeContextOpenRejectsTamper(t *testing.T) {
 	if _, err := receiver.Open([]byte("different aad"), ciphertext); !errors.Is(err, ErrAeadOpen) {
 		t.Fatalf("wrong aad: error = %v, want ErrAeadOpen", err)
 	}
+
+	// an empty aad is bound as tightly as a present one, and it is the shape MLS itself
+	// uses: RFC 9420 section 5.1.2 has EncryptWithLabel call SealBase with no additional
+	// data at all, so it is the aad every message this package goes on to carry will
+	// have. An Open that retried with a nil aad when the tag failed would leave every
+	// such message opening under any aad an attacker picked, and nothing above sees it —
+	// the flip loop and the wrong aad case both seal under "aad", so the retry fails
+	// there too. Measured: that Open survived the whole package before this block.
+	unbound, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x06}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	sealedWithNoAad, err := unbound.Seal(nil, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal with no aad: %v", err)
+	}
+	receiver, err = hpkeKeySchedule(params, bytes.Repeat([]byte{0x06}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	if _, err := receiver.Open([]byte("an aad the sender never used"), sealedWithNoAad); !errors.Is(err, ErrAeadOpen) {
+		t.Errorf("a message sealed with no aad opened under one: error = %v, want ErrAeadOpen", err)
+	}
+	// beside it, because a receiver that refused everything would satisfy the refusal
+	receiver, err = hpkeKeySchedule(params, bytes.Repeat([]byte{0x06}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	if back, err := receiver.Open(nil, sealedWithNoAad); err != nil {
+		t.Errorf("the aad the sender did use was refused: %v", err)
+	} else if !bytes.Equal(back, []byte("plaintext")) {
+		t.Errorf("the message sealed with no aad opened to %q", back)
+	}
 }
 
 func TestHpkeContextExportIsLabelSeparated(t *testing.T) {
@@ -1206,6 +1239,18 @@ func TestHpkeContextExportIsLabelSeparated(t *testing.T) {
 // written as an upper bound passing — len(key) > Nk refuses nk+1 and accepts every short
 // key beneath it — and that was measured, not supposed.
 func TestHpkeAeadKeyLengthIsSuiteBound(t *testing.T) {
+	// neither registry entry can reach the constructor's default, so a version that fell
+	// open there — handing an unregistered aead id a working chacha20-poly1305 instead
+	// of refusing it — passes every row below. Measured: it did. The probe's Nk is 32
+	// and the key is 32 bytes so the length gate passes and the switch is what answers.
+	unknown := hpkeFieldProbeParams(32)
+	unknown.AeadId = HpkeAeadId(0xffff)
+	if aead, err := hpkeNewAead(unknown, make([]byte, 32)); !errors.Is(err, ErrUnknownCipherSuite) {
+		t.Errorf("an unregistered aead id: error = %v, want ErrUnknownCipherSuite", err)
+	} else if aead != nil {
+		t.Errorf("the refused constructor returned an aead anyway")
+	}
+
 	// 0x0003 is a 32-byte key, 0x0001 is 16. a provider that hardcoded 32 would pass
 	// every chacha test and silently fail on the aes suite.
 	for _, testCase := range []struct {
@@ -1597,8 +1642,57 @@ func TestHpkeContextRefusesToWrapTheSequence(t *testing.T) {
 		t.Errorf("the last message opened to %q, want %q", back, plaintext)
 	}
 	fromANonconformingPeer := receiver.aead.Seal(nil, receiver.nonce(), plaintext, aad)
-	if opened, err := receiver.Open(aad, fromANonconformingPeer); !errors.Is(err, ErrSequenceOverflow) {
-		t.Errorf("opening past the last sequence number returned %q and error %v, want ErrSequenceOverflow", opened, err)
+	if opened, err := receiver.Open(aad, fromANonconformingPeer); !errors.Is(err, ErrSequenceOverflow) || opened != nil {
+		t.Errorf("opening past the last sequence number returned %q and error %v, want nothing and ErrSequenceOverflow", opened, err)
+	}
+}
+
+// TestHpkeContextNonceCarriesEveryBitOfTheSequence pins the counter's width and its
+// placement above the range any published row reaches. Appendix A stops at sequence 256,
+// so every vector in this file exercises the counter's low nine bits and nothing over
+// them, and the wrap test above sets sender and receiver to the same sequence number by
+// hand, so a truncation applies to both alike and they go on agreeing with each other.
+// Measured: a ComputeNonce writing self.sequence&0x1ff, &0xffff, &0xffffffff,
+// &0xffffffffffff or the low 63 bits left the entire package green. The 32 bit one
+// recomputes the sequence zero nonce at sequence 2^32 under a key still in use, which is
+// the repeat the overflow guard exists to prevent, arriving 2^32 messages before the
+// guard can see it.
+//
+// What is asserted is the whole of I2OSP(seq, Nn) at one bit a time: setting bit b of the
+// sequence number must flip exactly the bit of the nonce that a big endian counter in the
+// low Nn bytes puts it in, and nothing else. The counter enters by xor, so nonce(1<<b)
+// xor nonce(0) is I2OSP(1<<b, Nn) with the base nonce cancelled out and no assumption
+// about it. That the 65 nonces are then pairwise distinct — the security half, since a
+// collision is a repeated nonce under a live key — follows from the 64 deltas being
+// distinct and nonzero.
+//
+// Distinctness on its own is weaker, and measurably so: a counter that or-folded its
+// high half onto its low one puts sequence 2^32 on sequence 1's nonce, which is not
+// sequence zero's, so a comparison against the sequence zero nonce alone passes it. A
+// counter that xor-folded instead is a bijection and passes pairwise distinctness too —
+// no repeat, but a divergence from every conforming peer above 2^32. Both die here.
+func TestHpkeContextNonceCarriesEveryBitOfTheSequence(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	ctx, err := hpkeKeySchedule(params, bytes.Repeat([]byte{0x19}, 32), nil)
+	if err != nil {
+		t.Fatalf("key schedule: %v", err)
+	}
+	ctx.sequence = 0
+	atZero := ctx.nonce()
+	for bit := 0; bit < 64; bit++ {
+		ctx.sequence = uint64(1) << bit
+		delta := ctx.nonce()
+		for i := range delta {
+			delta[i] ^= atZero[i]
+		}
+		want := make([]byte, params.Nn)
+		want[params.Nn-1-bit/8] = 1 << (bit % 8)
+		if !bytes.Equal(delta, want) {
+			t.Errorf("bit %d of the sequence number moves the nonce by %x, want %x", bit, delta, want)
+		}
 	}
 }
 
