@@ -232,3 +232,40 @@ func Right(x NodeIndex) (NodeIndex, error) {
 	}
 	return x ^ NodeIndex(uint32(0x03)<<(k-1)), nil
 }
+
+// the parent of a node in a tree with n leaves.
+//
+// the leaf count is used only to locate the root, exactly as in appendix C; the
+// arithmetic itself is index-only. it is done in uint64 so the shift by k+1 is
+// obviously in range without an argument about the maximum level of a non-root
+// node.
+func Parent(x NodeIndex, n LeafCount) (NodeIndex, error) {
+	r, err := Root(n)
+	if err != nil {
+		return 0, err
+	}
+	if uint32(x) >= NodeWidth(n) {
+		return 0, ErrNodeOutOfRange
+	}
+	if x == r {
+		return 0, ErrRootHasNoParent
+	}
+	k := uint64(x.Level())
+	b := (uint64(x) >> (k + 1)) & 0x01
+	return NodeIndex((uint64(x) | (uint64(1) << k)) ^ (b << (k + 1))), nil
+}
+
+// the other child of the node's parent.
+func Sibling(x NodeIndex, n LeafCount) (NodeIndex, error) {
+	p, err := Parent(x, n)
+	if err != nil {
+		if errors.Is(err, ErrRootHasNoParent) {
+			return 0, ErrRootHasNoSibling
+		}
+		return 0, err
+	}
+	if x < p {
+		return Right(p)
+	}
+	return Left(p)
+}

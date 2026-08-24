@@ -407,3 +407,53 @@ func TestTreeMathVectorChildren(t *testing.T) {
 		t.Errorf("right of 0xFFFFFFFF: %d alongside the refusal, want 0", gotRight)
 	}
 }
+
+func TestTreeMathVectorParentAndSibling(t *testing.T) {
+	vectors := loadTreeMathVectors(t)
+	for _, v := range vectors {
+		leafCount := LeafCount(v.NLeaves)
+		for i := uint32(0); i < v.NNodes; i += 1 {
+			nodeIndex := NodeIndex(i)
+
+			gotParent, parentErr := Parent(nodeIndex, leafCount)
+			if want := v.Parent[i]; want == nil {
+				if parentErr == nil {
+					t.Errorf("n_leaves %d node %d: parent %d, want undefined", v.NLeaves, i, gotParent)
+				} else if !errors.Is(parentErr, ErrRootHasNoParent) {
+					t.Errorf("n_leaves %d node %d: parent: %v, want %v", v.NLeaves, i, parentErr, ErrRootHasNoParent)
+				}
+			} else {
+				if parentErr != nil {
+					t.Errorf("n_leaves %d node %d: parent: %v, want %d", v.NLeaves, i, parentErr, *want)
+				} else if uint32(gotParent) != *want {
+					t.Errorf("n_leaves %d node %d: parent %d, want %d", v.NLeaves, i, gotParent, *want)
+				}
+			}
+
+			gotSibling, siblingErr := Sibling(nodeIndex, leafCount)
+			if want := v.Sibling[i]; want == nil {
+				if siblingErr == nil {
+					t.Errorf("n_leaves %d node %d: sibling %d, want undefined", v.NLeaves, i, gotSibling)
+				} else if !errors.Is(siblingErr, ErrRootHasNoSibling) {
+					t.Errorf("n_leaves %d node %d: sibling: %v, want %v", v.NLeaves, i, siblingErr, ErrRootHasNoSibling)
+				}
+			} else {
+				if siblingErr != nil {
+					t.Errorf("n_leaves %d node %d: sibling: %v, want %d", v.NLeaves, i, siblingErr, *want)
+				} else if uint32(gotSibling) != *want {
+					t.Errorf("n_leaves %d node %d: sibling %d, want %d", v.NLeaves, i, gotSibling, *want)
+				}
+			}
+		}
+
+		// a node past the end of the array is refused, not answered. the
+		// appendix C pseudocode answers, which is how an index decoded from a
+		// message reaches arithmetic it has no business reaching.
+		if _, err := Parent(NodeIndex(v.NNodes), leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+			t.Errorf("n_leaves %d: parent of node %d: %v, want %v", v.NLeaves, v.NNodes, err, ErrNodeOutOfRange)
+		}
+		if _, err := Sibling(NodeIndex(v.NNodes), leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+			t.Errorf("n_leaves %d: sibling of node %d: %v, want %v", v.NLeaves, v.NNodes, err, ErrNodeOutOfRange)
+		}
+	}
+}
