@@ -403,15 +403,16 @@ func CommonAncestor(x NodeIndex, y NodeIndex) NodeIndex {
 	// descendants is not that node. measured, either one removed and every
 	// version fails.
 	//
-	// their level tests are another matter, and the enumeration says which of
-	// the two is load-bearing. the first one's is: without it the test fires
-	// for an index that merely falls inside y's slot range rather than inside
-	// y's subtree, and a version without it fails. the second one's is not,
-	// because the first runs ahead of it and has already answered every pair
-	// this one would get wrong — measured, that test dropped, narrowed to a
-	// strict comparison, or skipped when x is a leaf, all indistinguishable
-	// from this code for every input. it is kept because a condition that is
-	// only correct in the presence of the block above it is a trap for whoever
+	// their level tests are another matter, and the enumeration says which
+	// part of each is load-bearing. dropping the first one's is caught: the
+	// shift test on its own also fires for an index that merely falls inside
+	// y's index range rather than inside y's subtree. dropping the second
+	// one's is not, because the first runs ahead of it and has already
+	// answered every pair it would get wrong — measured, that test dropped,
+	// narrowed to a strict comparison or to an inequality, and either test
+	// skipped when its own operand is a leaf, all indistinguishable from this
+	// code for every input. they are kept because a condition that is only
+	// correct in the presence of the block above it is a trap for whoever
 	// reorders them.
 	levelOfX := uint64(x.Level()) + 1
 	levelOfY := uint64(y.Level()) + 1

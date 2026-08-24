@@ -1723,12 +1723,12 @@ func TestCommonAncestorKnownValues(t *testing.T) {
 // the loop condition and its two steps, the returned position, the answer
 // perturbed at one level, the answer perturbed for one level of an operand, the
 // arithmetic width, and the loop stopped after each of 34 counts — enumerates
-// 226 versions. this file kills 210 and the 16 it does not are indistinguishable
+// 225 versions. this file kills 209 and the 16 it does not are indistinguishable
 // from the shipped body for every input, which was checked separately over
 // 373099 designed pairs rather than inferred from the sweep. cut this file and
 // the two below back to depth 9, with every other row kept and the arm counts
-// adjusted so they are still green, and 97 are killed: the band from level 10
-// to 31 is the only thing killing 113 of the 226. among them are the three
+// adjusted so they are still green, and 96 are killed: the band from level 10
+// to 31 is the only thing killing 113 of the 225. among them are the three
 // versions that are wrong only above the family's ladder — each shortcut
 // skipped above level 9, and an answer perturbed above level 9 — and every
 // bound on the loop from 10 to 31.
