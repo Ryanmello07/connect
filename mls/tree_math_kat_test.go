@@ -462,6 +462,13 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 		// only the width probed, a guard reading exactly equal to the width
 		// survives the whole of this test, and it hands a caller node 17 of a
 		// fifteen-node tree.
+		//
+		// all three earn their place, by ablation rather than by argument: drop
+		// one past the width and a guard holed at exactly that index survives at
+		// every leaf count this loop covers, and drop the top of the type and a
+		// guard that refuses only the first two indices outside the tree and
+		// answers beyond them survives at every one of them. each of the two is
+		// the sole killer of its own class, ten counts apiece.
 		outOfRangeCases := []NodeIndex{
 			NodeIndex(v.NNodes),
 			NodeIndex(v.NNodes + 1),
@@ -577,8 +584,12 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 	// refusal of the largest tree (its only node, 0x7FFFFFFF, is that root, and
 	// is out of range in every smaller tree, so it has no defined arm to
 	// assert), and level 32 as the out-of-range probe below. all thirty-two
-	// valid leaf counts are covered too: 2^0 through 2^9 by the family and 2^9
-	// through 2^31 here.
+	// valid leaf counts are covered too, and in each of the three arms both
+	// functions have - a defined answer, the root refusal, and the refusal of
+	// an index past the end: 2^0 through 2^9 by the family and 2^9 through 2^31
+	// here. the third arm is named separately because the leaf count is as much
+	// an input to the range guard as it is to the root check, and a table that
+	// probes only inside each tree says nothing whatever about it.
 	boundaryCases := []struct {
 		level      uint32
 		leafCount  LeafCount
@@ -610,6 +621,11 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 		{level: 29, leafCount: 1 << 30, leftChild: 0x1FFFFFFF, parent: 0x3FFFFFFF, rightChild: 0x5FFFFFFF},
 		{level: 30, leafCount: 1 << 31, leftChild: 0x3FFFFFFF, parent: 0x7FFFFFFF, rightChild: 0xBFFFFFFF},
 	}
+	// the probe loop inside this one skips an index the type cannot hold, and a
+	// skip is invisible: a mistyped width would leave every one of those rows
+	// vacuous with the test still passing. the executed count is asserted after
+	// the loop for that reason.
+	outOfRangeProbes := 0
 	for _, c := range boundaryCases {
 		// the row states which level it exercises, and the claim above about
 		// which levels are covered rests on that being true, so it is asserted
@@ -669,6 +685,55 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 		} else if got != 0 {
 			t.Errorf("sibling of node %d in %d leaves: %d alongside the refusal, want 0", c.parent, c.leafCount, got)
 		}
+
+		// and an index past the end of this tree, which nothing else in the
+		// package reaches at this leaf count. the per-entry probe above brackets
+		// the range guard at the ten counts the family publishes and the probe
+		// below it at the one count whose width fills the index type, so without
+		// these rows the guard is unasserted at the twenty-one counts in
+		// between.
+		//
+		// the same three indices the per-entry probe uses, for the same reasons:
+		// the width itself separates a guard reading at least the width from one
+		// reading more than it, one past the width stops a guard holed at
+		// exactly that index, and the top of the type stops a guard that refuses
+		// the first two indices outside the tree and answers beyond them. the
+		// largest tree's width is the top of the type, so one past it is not
+		// representable and is dropped rather than wrapped round to node 0,
+		// which is in range.
+		//
+		// measured: with these rows removed and every other row of this test
+		// kept, a mechanical enumeration of the guard as a function of leaf
+		// count leaves a hundred and six versions passing - skipped at one
+		// count, off by one at one count, holed at one index of one count,
+		// refusing only the first two indices outside one count's tree, and
+		// banded to the family's counts plus the largest. with them, the only
+		// versions still passing are four rewrites of the guard into itself.
+		width := uint64(NodeWidth(c.leafCount))
+		for _, probe := range []uint64{width, width + 1, 0xFFFFFFFF} {
+			if probe > 0xFFFFFFFF {
+				continue
+			}
+			outOfRangeProbes += 1
+			nodeIndex := NodeIndex(probe)
+			if got, err := Parent(nodeIndex, c.leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("parent of node %d in %d leaves: %v, want %v", nodeIndex, c.leafCount, err, ErrNodeOutOfRange)
+			} else if got != 0 {
+				t.Errorf("parent of node %d in %d leaves: %d alongside the refusal, want 0", nodeIndex, c.leafCount, got)
+			}
+			if got, err := Sibling(nodeIndex, c.leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("sibling of node %d in %d leaves: %v, want %v", nodeIndex, c.leafCount, err, ErrNodeOutOfRange)
+			} else if got != 0 {
+				t.Errorf("sibling of node %d in %d leaves: %d alongside the refusal, want 0", nodeIndex, c.leafCount, got)
+			}
+		}
+	}
+
+	// twenty-two of the twenty-three rows probe three indices past the end of
+	// their tree. the largest tree's width is the top of the index type, so one
+	// past it is not representable and that row probes two.
+	if outOfRangeProbes != 68 {
+		t.Errorf("boundary out-of-range probes: %d, want 68", outOfRangeProbes)
 	}
 
 	// the top of the index range at the largest representable leaf count, which
@@ -679,8 +744,11 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 	// level set at the very top of the type. 0xFFFFFFFF is one past the end of
 	// the tree and so inside no tree at all, and it is the one index the width
 	// guard has to refuse here, where every smaller index is in range - the
-	// per-entry probe above brackets that guard at ten small sizes and this
-	// brackets it at the only size where the width fills the type.
+	// per-entry probe brackets that guard at the ten sizes the family publishes
+	// and the boundary rows at the twenty-three above them, this size included.
+	// the row is kept anyway: 0xFFFFFFFF is the one index in the whole type that
+	// is outside every tree, and it reads here beside the defined answers it
+	// borders.
 	topOfRangeCases := []struct {
 		nodeIndex NodeIndex
 		parent    NodeIndex
