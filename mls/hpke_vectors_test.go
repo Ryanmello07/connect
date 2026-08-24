@@ -1,8 +1,35 @@
-// the RFC 9180 base-mode vectors, both suites we instantiate.
+// The RFC 9180 base mode corpus this package is held to, and the loader that is the one
+// way into it.
 //
-// these drive production code: encapsulation runs through hpkeEncapDeterministic
-// with the vector's own ephemeral key, so a passing run means the shipped Encap is
-// right rather than that a test reimplemented it.
+// The values were transcribed by hand into this package before this file existed, because
+// tasks 5 to 8 had to verify themselves before there was a corpus to verify against. Two
+// corpora that are meant to agree, with nothing asserting that they do, is how they drift,
+// so the transcriptions are gone and this file is what remains. The commit that added it
+// carried a bridge test asserting the two agreed on all 94 published values they shared;
+// that agreement is why the vendored file is trusted here, since a file fetched from a url
+// proves nothing about itself beyond its own digest.
+//
+// The corpus is the whole published one rather than the six sequence numbers RFC 9180
+// appendix A prints. That is the difference between the transcription and the file: the
+// appendix is a readable excerpt and test-vectors.json is the corpus, so the seal known
+// answer now walks 257 sequence numbers per suite where it used to walk six.
+//
+// Provenance is the part that has to be argued rather than asserted, and interop/PINS.md
+// argues it. Both digests there were reproduced from the upstream commit before these
+// bytes were written: the upstream file hashes to 61fc662f…, the filtered re-serialization
+// hashes to the constant below, the two vendored entries deep-equal the two upstream
+// entries the predicate selects, and re-running the transform reproduces these bytes. The
+// filter exists because the upstream file is 5.9 MB and 128 entries, 126 of them for
+// algorithms this implementation does not have.
+//
+// Only two entries are vendored and that is a claim about the registry rather than about
+// the RFC. RFC 9180 gives HKDF-SHA256 the kdf code point 0x0001 and AES-128-GCM the aead
+// code point 0x0001 in two separate registries, so on suite 0x0001 those two positions
+// hold the same byte and a transposition between them moves nothing anyone can observe. On
+// suite 0x0003 the aead is 0x0003 and the same transposition moves every derived byte. A
+// corpus carrying one suite is therefore a corpus that cannot see the mistake hpke.go's
+// file comment is about, whichever suite it carries — which is why loadHpkeVectors refuses
+// to return anything but one entry per registered suite.
 package mls
 
 import (
@@ -12,23 +39,43 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
+// One published encryption, as the upstream file carries it: the message a sender's
+// context produces at one sequence number, with the nonce printed beside it.
+//
+// sequence is not a field of the file. Upstream indexes the encryptions array by sequence
+// number and prints no counter, so the loader supplies it from the position and the nonce
+// comparison is what holds that reading honest — an off by one between index and sequence
+// moves the low byte of every nonce and fails at the first row.
 type hpkeVectorEncryption struct {
 	Aad   string `json:"aad"`
 	Ct    string `json:"ct"`
 	Nonce string `json:"nonce"`
 	Pt    string `json:"pt"`
+
+	sequence uint64
 }
 
+// One published exported value. The length travels with the value rather than being read
+// off it, so a corpus that lost a byte fails as a disagreement about a published length
+// instead of quietly asserting a shorter export.
 type hpkeVectorExport struct {
 	ExporterContext string `json:"exporter_context"`
 	Length          int    `json:"L"`
 	ExportedValue   string `json:"exported_value"`
 }
 
+// One base mode entry, with every field a labelled extract or expand, a key pair
+// derivation, an encapsulation, a decapsulation, a seal or an export consumes or produces.
+//
+// name and suite are derived by the loader and are not in the file. The file identifies an
+// entry by the kem, kdf and aead code points it was generated for, which is the only
+// identification that can be checked against the registry rather than trusted; suite is
+// the registry's answer to that triple and name is for the failure messages.
 type hpkeVector struct {
 	Mode               int                    `json:"mode"`
 	KemId              HpkeKemId              `json:"kem_id"`
@@ -50,40 +97,33 @@ type hpkeVector struct {
 	ExporterSecret     string                 `json:"exporter_secret"`
 	Encryptions        []hpkeVectorEncryption `json:"encryptions"`
 	Exports            []hpkeVectorExport     `json:"exports"`
+
+	name  string
+	suite CipherSuite
 }
 
 const hpkeVectorPath = "testdata/vectors/rfc/hpke-rfc9180-x25519.json"
 
-// the digest recorded in interop/PINS.md. a vector file that changed under us must
-// break the build, not quietly weaken the gate.
+// The digest recorded in interop/PINS.md, where the provenance that makes it worth
+// anything is written down. A vector file that changed under us must break the build
+// rather than quietly weaken every known answer that reads it.
 const hpkeVectorSha256 = "3cc5f951dea0b7dbe80419215e64c810498ee4dd76c376763bbe6860c346b11a"
 
-// TestHpkeVectorFileCarriesTheBytesUpstreamPublished is the provenance check the digest
-// pin above cannot make on its own. A digest says the file has not moved since the digest
-// was taken; it says nothing about what the file was when that happened. This repository
-// has already vendored a corpus whose sixteen files were all rewritten by git's autocrlf
-// on the way in and whose manifest was then computed over the rewritten bytes, so it
-// verified sixteen of sixteen against bytes upstream never published, and only a reviewer
-// who fetched upstream and compared noticed.
-//
-// A carriage return is what that rewrite leaves behind. Upstream publishes this file with
-// no CR byte anywhere in it, so one appearing here means the bytes were smudged between
-// upstream and the index — and the count is asserted rather than the presence, so the
-// message names how badly. testdata/vectors/rfc/.gitattributes carries the -text that
-// prevents it; this is the assertion that notices when it stops working.
-func TestHpkeVectorFileCarriesTheBytesUpstreamPublished(t *testing.T) {
-	raw, err := os.ReadFile(hpkeVectorPath)
-	if err != nil {
-		t.Fatalf("read %s: %v", hpkeVectorPath, err)
-	}
-	if len(raw) == 0 {
-		t.Fatalf("%s is empty, so the count below is about nothing", hpkeVectorPath)
-	}
-	if n := bytes.Count(raw, []byte{'\r'}); n != 0 {
-		t.Fatalf("%s carries %d carriage returns; upstream publishes it with none, so these bytes are not the bytes that were fetched", hpkeVectorPath, n)
-	}
-}
+// The published sequence numbers the corpus has to reach. 255 and 256 are the load bearing
+// pair: a counter written little endian, or written at the front of the nonce, agrees with
+// a big endian one on every sequence number below 256 and disagrees at exactly the byte
+// crossing. A corpus that stopped short of it would leave every nonce known answer passing
+// against an implementation that matches nobody.
+const hpkeVectorHighestSequence = 256
 
+// The corpus, with every shape assertion the loops that consume it depend on already made.
+//
+// The assertions live here rather than in the tests because this is the only place that
+// can make them once for all of them. A table that lost a row is not an empty table, and
+// only the empty case was ever refused — so until the count was checked, dropping either
+// entry left every known answer in the package green. The same is true of the encryptions
+// and the exports: a loop over an empty slice reports success, so a corpus stripped to its
+// key schedule would satisfy the seal and export known answers by never running them.
 func loadHpkeVectors(t *testing.T) []hpkeVector {
 	t.Helper()
 	raw, err := os.ReadFile(hpkeVectorPath)
@@ -98,31 +138,41 @@ func loadHpkeVectors(t *testing.T) []hpkeVector {
 	if err := json.Unmarshal(raw, &vectors); err != nil {
 		t.Fatalf("parse %s: %v", hpkeVectorPath, err)
 	}
-	if len(vectors) != 2 {
-		t.Fatalf("%s has %d vectors, want 2", hpkeVectorPath, len(vectors))
+	suites := Suites()
+	if len(vectors) != len(suites) {
+		t.Fatalf("%s holds %d vectors for %d registered suites, so a suite goes unpinned",
+			hpkeVectorPath, len(vectors), len(suites))
+	}
+	for i := range vectors {
+		params := suiteForHpkeVector(t, vectors[i])
+		vectors[i].suite = params.Suite
+		vectors[i].name = "rfc 9180 test-vectors.json, mode 0, " + params.Name
+		for j := range vectors[i].Encryptions {
+			vectors[i].Encryptions[j].sequence = uint64(j)
+		}
+	}
+	slices.SortFunc(vectors, func(a hpkeVector, b hpkeVector) int {
+		return int(a.suite) - int(b.suite)
+	})
+	for i, suite := range suites {
+		if vectors[i].suite != suite {
+			t.Fatalf("vector %d is for suite %#04x, want %#04x", i, uint16(vectors[i].suite), uint16(suite))
+		}
+		if got := len(vectors[i].Encryptions); got <= hpkeVectorHighestSequence {
+			t.Fatalf("%s carries %d encryptions, so the sequence counter never reaches %d and never crosses a byte",
+				vectors[i].name, got, hpkeVectorHighestSequence)
+		}
+		if len(vectors[i].Exports) == 0 {
+			t.Fatalf("%s carries no exported values, so every export known answer would loop over nothing", vectors[i].name)
+		}
 	}
 	return vectors
 }
 
-// TestHpkeVectorDigestIsRecordedInThePinFile ties the constant above to the one pin file.
-// The constant's own comment says the digest is recorded in interop/PINS.md, and until this
-// existed nothing held it to that: re-vendoring at a newer upstream commit and updating only
-// the constant would have left the pin file describing a file that is no longer there, with
-// every test still green. The provenance claim is the thing being protected here, and a
-// provenance claim nobody compares is the failure mode this whole directory was rebuilt for.
-func TestHpkeVectorDigestIsRecordedInThePinFile(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join("interop", "PINS.md"))
-	if err != nil {
-		t.Fatalf("read interop/PINS.md: %v", err)
-	}
-	if !strings.Contains(string(body), hpkeVectorSha256) {
-		t.Errorf("interop/PINS.md does not record the vendored digest %s", hpkeVectorSha256)
-	}
-	if !strings.Contains(string(body), hpkeVectorPath) {
-		t.Errorf("interop/PINS.md does not name %s", hpkeVectorPath)
-	}
-}
-
+// The registered suite a vector was generated for, refusing anything else. A vector for a
+// mode, kem, kdf or aead this package does not implement asserts nothing about it, and
+// silently skipping such an entry is how a corpus ends up with two rows and one of them
+// tested.
 func suiteForHpkeVector(t *testing.T, vector hpkeVector) *SuiteParams {
 	t.Helper()
 	if vector.Mode != 0 {
@@ -141,236 +191,101 @@ func suiteForHpkeVector(t *testing.T, vector hpkeVector) *SuiteParams {
 	return nil
 }
 
-func TestHpkeVectorDeriveKeyPair(t *testing.T) {
-	for _, vector := range loadHpkeVectors(t) {
-		params := suiteForHpkeVector(t, vector)
-		privE, pubE, err := HpkeDeriveKeyPair(params, decodeVectorField(t, "vector", "ikmE", vector.IkmE))
-		if err != nil {
-			t.Fatalf("derive e: %v", err)
-		}
-		if !bytes.Equal(privE, decodeVectorField(t, "vector", "skEm", vector.SkEm)) {
-			t.Errorf("aead %#04x: skEm = %x, want %s", vector.AeadId, privE, vector.SkEm)
-		}
-		if !bytes.Equal(pubE, decodeVectorField(t, "vector", "pkEm", vector.PkEm)) {
-			t.Errorf("aead %#04x: pkEm = %x, want %s", vector.AeadId, pubE, vector.PkEm)
-		}
-		privR, pubR, err := HpkeDeriveKeyPair(params, decodeVectorField(t, "vector", "ikmR", vector.IkmR))
-		if err != nil {
-			t.Fatalf("derive r: %v", err)
-		}
-		if !bytes.Equal(privR, decodeVectorField(t, "vector", "skRm", vector.SkRm)) {
-			t.Errorf("aead %#04x: skRm = %x, want %s", vector.AeadId, privR, vector.SkRm)
-		}
-		if !bytes.Equal(pubR, decodeVectorField(t, "vector", "pkRm", vector.PkRm)) {
-			t.Errorf("aead %#04x: pkRm = %x, want %s", vector.AeadId, pubR, vector.PkRm)
-		}
-	}
-}
-
-func TestHpkeVectorEncapAndDecap(t *testing.T) {
-	for _, vector := range loadHpkeVectors(t) {
-		params := suiteForHpkeVector(t, vector)
-		sharedSecret, kemOutput, err := hpkeEncapDeterministic(params,
-			HpkePublicKey(decodeVectorField(t, "vector", "pkRm", vector.PkRm)),
-			HpkePrivateKey(decodeVectorField(t, "vector", "skEm", vector.SkEm)))
-		if err != nil {
-			t.Fatalf("encap: %v", err)
-		}
-		if !bytes.Equal(kemOutput, decodeVectorField(t, "vector", "enc", vector.Enc)) {
-			t.Errorf("aead %#04x: enc = %x, want %s", vector.AeadId, kemOutput, vector.Enc)
-		}
-		if !bytes.Equal(sharedSecret, decodeVectorField(t, "vector", "shared_secret", vector.SharedSecret)) {
-			t.Errorf("aead %#04x: shared_secret = %x, want %s", vector.AeadId, sharedSecret, vector.SharedSecret)
-		}
-		back, err := hpkeDecap(params, HpkePrivateKey(decodeVectorField(t, "vector", "skRm", vector.SkRm)),
-			decodeVectorField(t, "vector", "enc", vector.Enc))
-		if err != nil {
-			t.Fatalf("decap: %v", err)
-		}
-		if !bytes.Equal(back, decodeVectorField(t, "vector", "shared_secret", vector.SharedSecret)) {
-			t.Errorf("aead %#04x: decap shared_secret = %x, want %s", vector.AeadId, back, vector.SharedSecret)
-		}
-	}
-}
-
-func TestHpkeVectorKeySchedule(t *testing.T) {
-	for _, vector := range loadHpkeVectors(t) {
-		params := suiteForHpkeVector(t, vector)
-		ctx, err := hpkeKeySchedule(params, decodeVectorField(t, "vector", "shared_secret", vector.SharedSecret),
-			decodeVectorField(t, "vector", "info", vector.Info))
-		if err != nil {
-			t.Fatalf("key schedule: %v", err)
-		}
-		if !bytes.Equal(ctx.baseNonce, decodeVectorField(t, "vector", "base_nonce", vector.BaseNonce)) {
-			t.Errorf("aead %#04x: base_nonce = %x, want %s", vector.AeadId, ctx.baseNonce, vector.BaseNonce)
-		}
-		if !bytes.Equal(ctx.exporterSecret, decodeVectorField(t, "vector", "exporter_secret", vector.ExporterSecret)) {
-			t.Errorf("aead %#04x: exporter_secret = %x, want %s", vector.AeadId, ctx.exporterSecret, vector.ExporterSecret)
-		}
-	}
-}
-
-func TestHpkeVectorEncryptions(t *testing.T) {
-	// the vector's encryptions are indexed by sequence number, which is exactly the
-	// context's own counter, so this walks the nonce derivation as well as the aead.
-	for _, vector := range loadHpkeVectors(t) {
-		params := suiteForHpkeVector(t, vector)
-		sender, err := hpkeKeySchedule(params, decodeVectorField(t, "vector", "shared_secret", vector.SharedSecret),
-			decodeVectorField(t, "vector", "info", vector.Info))
-		if err != nil {
-			t.Fatalf("key schedule: %v", err)
-		}
-		for i, encryption := range vector.Encryptions {
-			nonce := sender.nonce()
-			if !bytes.Equal(nonce, decodeVectorField(t, "vector", "nonce", encryption.Nonce)) {
-				t.Fatalf("aead %#04x seq %d: nonce = %x, want %s", vector.AeadId, i, nonce, encryption.Nonce)
-			}
-			ciphertext, err := sender.Seal(decodeVectorField(t, "vector", "aad", encryption.Aad),
-				decodeVectorField(t, "vector", "pt", encryption.Pt))
-			if err != nil {
-				t.Fatalf("seal %d: %v", i, err)
-			}
-			if !bytes.Equal(ciphertext, decodeVectorField(t, "vector", "ct", encryption.Ct)) {
-				t.Fatalf("aead %#04x seq %d: ct = %x, want %s", vector.AeadId, i, ciphertext, encryption.Ct)
-			}
-		}
-	}
-}
-
-func TestHpkeVectorExports(t *testing.T) {
-	for _, vector := range loadHpkeVectors(t) {
-		params := suiteForHpkeVector(t, vector)
-		ctx, err := hpkeKeySchedule(params, decodeVectorField(t, "vector", "shared_secret", vector.SharedSecret),
-			decodeVectorField(t, "vector", "info", vector.Info))
-		if err != nil {
-			t.Fatalf("key schedule: %v", err)
-		}
-		for i, export := range vector.Exports {
-			got, err := ctx.Export(decodePossiblyEmptyVectorField(t, "vector", "exporter_context", export.ExporterContext), export.Length)
-			if err != nil {
-				t.Fatalf("export %d: %v", i, err)
-			}
-			if !bytes.Equal(got, decodeVectorField(t, "vector", "exported_value", export.ExportedValue)) {
-				t.Errorf("aead %#04x export %d = %x, want %s", vector.AeadId, i, got, export.ExportedValue)
-			}
-		}
-	}
-}
-
-// TestVendoredVectorsMatchTheInlineTranscriptions is the bridge between the two corpora
-// and it exists only for the length of this task's own commit. Tasks 5 and 6 built
-// rfc9180BaseVectors by three independent routes that agree — hand transcription from
-// the RFC 9180 appendix A text, the pinned toolchain's own vendored cfrg corpus at
-// GOROOT/src/crypto/hpke/testdata/rfc9180.json, and a direct read of the RFC — and the
-// vendored file arrives by a fourth. Replacing the table without comparing the two would
-// discard that agreement and leave the new corpus resting on nothing but its own digest,
-// which is what a file fetched from a url proves about itself and nothing more.
+// TestHpkeVectorFileCarriesTheBytesUpstreamPublished is the provenance check the digest
+// pin cannot make on its own. A digest says the file has not moved since the digest was
+// taken; it says nothing about what the file was when that happened. This repository has
+// already vendored a corpus whose sixteen files were all rewritten by git's autocrlf on
+// the way in and whose manifest was then computed over the rewritten bytes, so it verified
+// sixteen of sixteen against bytes upstream never published, and only a reviewer who
+// fetched upstream and compared noticed.
 //
-// It compares decoded bytes rather than the hex text, since a value that differs only in
-// case is the same published value and a spelling disagreement is not the claim here.
+// A carriage return is what that rewrite leaves behind. Upstream publishes this file with
+// none anywhere in it, so one appearing here means the bytes were smudged between upstream
+// and the index — and the count is reported rather than merely the presence, because a
+// single stray one and a wholesale rewrite are different accidents.
+// testdata/vectors/rfc/.gitattributes carries the -text that prevents it; this is the
+// assertion that notices when it stops working.
+func TestHpkeVectorFileCarriesTheBytesUpstreamPublished(t *testing.T) {
+	raw, err := os.ReadFile(hpkeVectorPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", hpkeVectorPath, err)
+	}
+	if len(raw) == 0 {
+		t.Fatalf("%s is empty, so the count below is about nothing", hpkeVectorPath)
+	}
+	if n := bytes.Count(raw, []byte{'\r'}); n != 0 {
+		t.Fatalf("%s carries %d carriage returns; upstream publishes it with none, so these bytes are not the bytes that were fetched",
+			hpkeVectorPath, n)
+	}
+}
+
+// TestHpkeVectorDigestIsRecordedInThePinFile ties the constant to the one pin file. The
+// constant's own comment says the digest is recorded in interop/PINS.md, and until this
+// existed nothing held it to that: re-vendoring at a newer upstream commit and updating
+// only the constant would leave the pin file describing a file that is no longer there,
+// with every test still green. The provenance claim is what is being protected, and a
+// provenance claim nobody compares is the failure this directory was rebuilt for.
+func TestHpkeVectorDigestIsRecordedInThePinFile(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("interop", "PINS.md"))
+	if err != nil {
+		t.Fatalf("read interop/PINS.md: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{hpkeVectorSha256, hpkeVectorPath} {
+		if !strings.Contains(text, want) {
+			t.Errorf("interop/PINS.md does not record %s", want)
+		}
+	}
+}
+
+// TestHpkeVectorCorpusIsTheWholePublishedCorpus states the shape every known answer in
+// this package relies on, as a test of its own rather than only as a precondition inside
+// the loader. The loader's assertions run whenever a test loads the corpus, but they read
+// as plumbing; a reader asking what the corpus is supposed to contain should not have to
+// infer it from a helper's fatal calls.
 //
-// Every count is asserted before the comparison. A bridge that walked an empty table, or
-// a table whose rows failed to match a suite, would report agreement between the vendored
-// corpus and nothing at all — which is the exact shape of the vacuous pass this project
-// has paid for twice.
-func TestVendoredVectorsMatchTheInlineTranscriptions(t *testing.T) {
-	vendored := map[CipherSuite]hpkeVector{}
+// The counts are exact rather than lower bounds. A corpus that grew an entry is a corpus
+// somebody re-vendored under a different filter, and the right response is a failure that
+// says so rather than a loop that quietly covers more or less than the pin file claims.
+func TestHpkeVectorCorpusIsTheWholePublishedCorpus(t *testing.T) {
+	vectors := loadHpkeVectors(t)
+	if len(vectors) != 2 {
+		t.Fatalf("the corpus holds %d entries, want 2", len(vectors))
+	}
+	for _, vector := range vectors {
+		if got := len(vector.Encryptions); got != hpkeVectorHighestSequence+1 {
+			t.Errorf("%s carries %d encryptions, want %d", vector.name, got, hpkeVectorHighestSequence+1)
+		}
+		if got := len(vector.Exports); got != 3 {
+			t.Errorf("%s carries %d exported values, want 3", vector.name, got)
+		}
+		if vector.KemId != HpkeKemX25519HkdfSha256 || vector.KdfId != HpkeKdfHkdfSha256 {
+			t.Errorf("%s is for kem %#04x kdf %#04x, want %#04x and %#04x",
+				vector.name, vector.KemId, vector.KdfId, HpkeKemX25519HkdfSha256, HpkeKdfHkdfSha256)
+		}
+	}
+	// the two entries have to differ in their aead, since that is the only position where
+	// the 0x0001 kdf and aead collision is visible at all
+	if vectors[0].AeadId == vectors[1].AeadId {
+		t.Fatalf("both entries are for aead %#04x, so the kdf and aead positions can be transposed unobserved", vectors[0].AeadId)
+	}
+}
+
+// TestHpkeVectorEncapsulatedKeyIsTheEphemeralPublicKey states what RFC 9180 section 4.1
+// means by enc for a DHKEM: SerializePublicKey(pkE) and nothing else. The corpus publishes
+// pkEm and enc as separate fields and the key derivation known answer compares the derived
+// ephemeral public key against one of them, so without this the other is never read and a
+// corpus whose two fields disagreed would go unnoticed.
+//
+// It is also the only thing in this package that says the encapsulated key is a public key
+// rather than an opaque kem output. Both are 32 bytes here, so no length can say it.
+func TestHpkeVectorEncapsulatedKeyIsTheEphemeralPublicKey(t *testing.T) {
 	for _, vector := range loadHpkeVectors(t) {
-		vendored[suiteForHpkeVector(t, vector).Suite] = vector
-	}
-	if len(vendored) != 2 {
-		t.Fatalf("the vendored corpus resolved to %d suites, want 2", len(vendored))
-	}
-	if len(rfc9180BaseVectors) != 2 {
-		t.Fatalf("the inline table holds %d rows, want 2", len(rfc9180BaseVectors))
-	}
-	compared := 0
-	for _, inline := range rfc9180BaseVectors {
-		vector, ok := vendored[inline.suite]
-		if !ok {
-			t.Fatalf("%s: the vendored corpus has no entry for suite %#04x", inline.name, uint16(inline.suite))
-		}
-		fields := []struct {
-			field    string
-			inline   string
-			vendored string
-		}{
-			{field: "info", inline: inline.info, vendored: vector.Info},
-			{field: "ikmE", inline: inline.ikmE, vendored: vector.IkmE},
-			{field: "skEm", inline: inline.skEm, vendored: vector.SkEm},
-			{field: "ikmR", inline: inline.ikmR, vendored: vector.IkmR},
-			{field: "skRm", inline: inline.skRm, vendored: vector.SkRm},
-			{field: "pkRm", inline: inline.pkRm, vendored: vector.PkRm},
-			{field: "enc", inline: inline.enc, vendored: vector.Enc},
-			{field: "pkEm", inline: inline.enc, vendored: vector.PkEm},
-			{field: "shared_secret", inline: inline.sharedSecret, vendored: vector.SharedSecret},
-			{field: "key_schedule_context", inline: inline.keyScheduleContext, vendored: vector.KeyScheduleContext},
-			{field: "secret", inline: inline.secret, vendored: vector.Secret},
-			{field: "key", inline: inline.key, vendored: vector.Key},
-			{field: "base_nonce", inline: inline.baseNonce, vendored: vector.BaseNonce},
-			{field: "exporter_secret", inline: inline.exporterSecret, vendored: vector.ExporterSecret},
-		}
-		for _, field := range fields {
-			want := decodeVectorField(t, inline.name, field.field, field.inline)
-			got := decodeVectorField(t, inline.name, field.field, field.vendored)
-			if !bytes.Equal(got, want) {
-				t.Errorf("%s: vendored %s = %x, the inline transcription says %x", inline.name, field.field, got, want)
-			}
-			compared++
-		}
-		if len(inline.encryptions) != 6 {
-			t.Fatalf("%s: the inline table holds %d encryptions, want the six the appendix prints", inline.name, len(inline.encryptions))
-		}
-		for _, encryption := range inline.encryptions {
-			if encryption.sequence >= uint64(len(vector.Encryptions)) {
-				t.Fatalf("%s: the vendored corpus stops before sequence %d", inline.name, encryption.sequence)
-			}
-			published := vector.Encryptions[encryption.sequence]
-			rows := []struct {
-				field    string
-				inline   string
-				vendored string
-			}{
-				{field: "pt", inline: encryption.pt, vendored: published.Pt},
-				{field: "aad", inline: encryption.aad, vendored: published.Aad},
-				{field: "nonce", inline: encryption.nonce, vendored: published.Nonce},
-				{field: "ct", inline: encryption.ct, vendored: published.Ct},
-			}
-			for _, row := range rows {
-				want := decodeVectorField(t, inline.name, row.field, row.inline)
-				got := decodeVectorField(t, inline.name, row.field, row.vendored)
-				if !bytes.Equal(got, want) {
-					t.Errorf("%s: vendored %s at sequence %d = %x, the inline transcription says %x",
-						inline.name, row.field, encryption.sequence, got, want)
-				}
-				compared++
-			}
-		}
-		if len(inline.exports) != len(vector.Exports) {
-			t.Fatalf("%s: the inline table holds %d exports and the vendored corpus %d",
-				inline.name, len(inline.exports), len(vector.Exports))
-		}
-		for i, export := range inline.exports {
-			published := vector.Exports[i]
-			if export.length != published.Length {
-				t.Errorf("%s: vendored export %d is %d bytes, the inline transcription says %d",
-					inline.name, i, published.Length, export.length)
-			}
-			want := decodePossiblyEmptyVectorField(t, inline.name, "exporter_context", export.exporterContext)
-			got := decodePossiblyEmptyVectorField(t, inline.name, "exporter_context", published.ExporterContext)
-			if !bytes.Equal(got, want) {
-				t.Errorf("%s: vendored exporter_context %d = %x, the inline transcription says %x", inline.name, i, got, want)
-			}
-			wantValue := decodeVectorField(t, inline.name, "exported_value", export.value)
-			gotValue := decodeVectorField(t, inline.name, "exported_value", published.ExportedValue)
-			if !bytes.Equal(gotValue, wantValue) {
-				t.Errorf("%s: vendored exported_value %d = %x, the inline transcription says %x", inline.name, i, gotValue, wantValue)
-			}
-			compared += 3
+		pkEm := decodeVectorField(t, vector.name, "pkEm", vector.PkEm)
+		enc := decodeVectorField(t, vector.name, "enc", vector.Enc)
+		if !bytes.Equal(pkEm, enc) {
+			t.Errorf("%s: pkEm = %x but enc = %x, and RFC 9180 section 4.1 makes them the same bytes",
+				vector.name, pkEm, enc)
 		}
 	}
-	if compared != 94 {
-		t.Fatalf("the bridge compared %d published values, want 94", compared)
-	}
-	t.Logf("the vendored corpus agrees with the inline transcriptions on all %d published values", compared)
 }

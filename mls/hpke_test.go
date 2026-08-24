@@ -6,25 +6,33 @@
 // transpose the kdf and aead code points — each one still extracts, still expands, still
 // errors nowhere, and still hands back keys of exactly the right length that no other
 // implementation will ever reproduce. So nothing here rests on a call having succeeded.
-// Every claim about a derived byte is pinned to a value printed in RFC 9180 appendix A,
-// and the round trips and length checks are only the frame around that.
+// Every claim about a derived byte is pinned to a value RFC 9180 published, read out of
+// the corpus hpke_vectors_test.go vendors, and the round trips and length checks are only
+// the frame around that.
 //
 // Both registered suites are carried because the collision named in hpke.go's file
 // comment is invisible on one of them: 0x0001 is simultaneously the HKDF-SHA256 kdf and
 // the AES-128-GCM aead, so on suite 0x0001 the two positions hold the same byte and a
 // transposition changes nothing anyone could observe. On 0x0003 the aead is 0x0003 and
-// the same transposition moves every derived byte in the vector. A single suite table
-// would therefore be a table that cannot see the mistake this file exists to catch.
+// the same transposition moves every derived byte in the vector. A single suite corpus
+// would therefore be a corpus that cannot see the mistake this file exists to catch, which
+// is why loadHpkeVectors refuses to return anything but one entry per registered suite.
 //
 // The vectors now run the whole of base mode. RFC 9180 publishes the key schedule
 // inputs and outputs — shared_secret, key_schedule_context, secret, key, base_nonce,
 // exporter_secret — and each of those is a labelled extract or expand away from the
 // previous one, so the chain up to the aead is reachable with the four labelled kdf
 // functions and no others; the kem key pairs, the encapsulation and the decapsulation are
-// published beside them, and past those the appendix prints the sealed message at six
-// sequence numbers and three exported values, which is what pins the aead, the nonce
-// counter and the secret export. The vendored corpus that replaces these transcriptions
-// is a later task's.
+// published beside them, and past those the corpus carries the sealed message at every
+// sequence number from 0 to 256 and three exported values, which is what pins the aead,
+// the nonce counter and the secret export.
+//
+// The values reach this file through loadHpkeVectors and nowhere else. They were
+// transcribed inline while tasks 5 to 8 were being written, because there was no corpus to
+// check against until this one was vendored; the transcriptions are gone, and the commit
+// that removed them asserted first that the vendored file agreed with them on all 94
+// published values the two shared. Two corpora that are meant to agree, with nothing
+// asserting that they do, is how they drift.
 //
 // Nothing about DHKEM is reachable by round trip. Encap and Decap that are wrong in the
 // same way agree with each other perfectly: transpose enc and pkRm in the kem context on
@@ -36,9 +44,9 @@
 // only there to say the two entry points are not separately correct against nothing.
 //
 // There is no general hex helper declared here. This package's one decoder is the interop
-// harness's MustHex, which has not landed, so the single decode below is inlined against
-// the day it does rather than becoming a second one with its own opinion about odd length
-// input.
+// harness's MustHex, which has not landed, so the two below are the package's own and are
+// written to be replaced by it rather than to compete with it: they take the vector and
+// field names, so a bad value fails as a named field rather than as an empty slice.
 package mls
 
 import (
@@ -53,146 +61,9 @@ import (
 	"testing"
 )
 
-// One base mode entry of RFC 9180 appendix A, as published, with the fields exactly those
-// a labelled extract or expand, a key pair derivation, an encapsulation or a decapsulation
-// consumes or produces. mode is not a field because base mode is the only mode this file
-// implements and hpkeModeBase is the constant under test rather than an input.
-//
-// Two provenances, stated per field because a known answer test is worth only its sourcing
-// and a value taken from the implementation it checks proves nothing. info, skEm, pkRm,
-// enc, shared_secret, key_schedule_context, secret, key, base_nonce and exporter_secret
-// were transcribed from the RFC 9180 appendix A text by task 5. ikmE, ikmR and skRm — the
-// three task 6 needs and appendix A prints but task 5 had no use for — were read out of
-// the pinned toolchain's own vendored copy of the same corpus, at
-// GOROOT/src/crypto/hpke/testdata/rfc9180.json, which is the cfrg published
-// test-vectors.json filtered to the base mode entries.
-//
-// The two sources overlap on info, pkRm and enc and agree on all three, so each checks the
-// other's transcription. Beyond that the table is self checking in a way a hand copied
-// blob is not: ikmE has to derive to the skEm the RFC printed and to the enc it printed,
-// ikmR to skRm and pkRm, and skRm with enc to the shared_secret that task 5 already pinned
-// through an independent path. A wrong character in any of the three new fields fails
-// against a value that was already in the table rather than being absorbed.
-//
-// info is the RFC's own "Ode on a Grecian Urn" string. It is not empty on purpose: an
-// empty info would make the info_hash extract indistinguishable from the psk_id_hash one
-// beside it, and the two differ only in their label.
-// One published encryption of an appendix A entry: the message the sender's context
-// produces at one sequence number, with the nonce the RFC prints beside it.
-//
-// The sequence numbers are the RFC's own and they are sparse — 0, 1, 2, 4, 255 and 256 —
-// which is why the known answer walks the context between them with messages it throws
-// away rather than sealing six times. The last two are the load bearing rows: an
-// implementation that wrote the counter little endian, or at the front of the nonce, or
-// that advanced by anything other than one, agrees with itself and with the first four
-// and diverges exactly where the counter crosses a byte.
-type rfc9180Encryption struct {
-	sequence uint64
-	pt       string
-	aad      string
-	nonce    string
-	ct       string
-}
-
-// One published exported value. length is carried beside the value rather than taken from
-// it, so a transcription that lost a byte fails as a disagreement about a published length
-// instead of quietly asserting a shorter export.
-type rfc9180Export struct {
-	exporterContext string
-	length          int
-	value           string
-}
-
-type rfc9180BaseVector struct {
-	name               string
-	suite              CipherSuite
-	info               string
-	ikmE               string
-	skEm               string
-	ikmR               string
-	skRm               string
-	pkRm               string
-	enc                string
-	sharedSecret       string
-	keyScheduleContext string
-	secret             string
-	key                string
-	baseNonce          string
-	exporterSecret     string
-	encryptions        []rfc9180Encryption
-	exports            []rfc9180Export
-}
-
-// The two appendix A entries whose kem, kdf and aead this package registers. A.1 is
-// DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM and A.2 is the same with
-// ChaCha20-Poly1305; the RFC's other entries name a kem or a mode that is not
-// implemented here and would assert nothing.
-var rfc9180BaseVectors = []rfc9180BaseVector{
-	{
-		name:               "rfc 9180 appendix a.1.1, aes-128-gcm",
-		suite:              CipherSuiteX25519AesGcm128Sha256Ed25519,
-		info:               "4f6465206f6e2061204772656369616e2055726e",
-		ikmE:               "7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234",
-		skEm:               "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736",
-		ikmR:               "6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037",
-		skRm:               "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
-		pkRm:               "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
-		enc:                "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
-		sharedSecret:       "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
-		keyScheduleContext: "00725611c9d98c07c03f60095cd32d400d8347d45ed67097bbad50fc56da742d07cb6cffde367bb0565ba28bb02c90744a20f5ef37f30523526106f637abb05449",
-		secret:             "12fff91991e93b48de37e7daddb52981084bd8aa64289c3788471d9a9712f397",
-		key:                "4531685d41d65f03dc48f6b8302c05b0",
-		baseNonce:          "56d890e5accaaf011cff4b7d",
-		exporterSecret:     "45ff1c2e220db587171952c0592d5f5ebe103f1561a2614e38f2ffd47e99e3f8",
-		encryptions: []rfc9180Encryption{
-			{sequence: 0, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d30", nonce: "56d890e5accaaf011cff4b7d", ct: "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a"},
-			{sequence: 1, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d31", nonce: "56d890e5accaaf011cff4b7c", ct: "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84"},
-			{sequence: 2, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d32", nonce: "56d890e5accaaf011cff4b7f", ct: "498dfcabd92e8acedc281e85af1cb4e3e31c7dc394a1ca20e173cb72516491588d96a19ad4a683518973dcc180"},
-			{sequence: 4, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d34", nonce: "56d890e5accaaf011cff4b79", ct: "583bd32bc67a5994bb8ceaca813d369bca7b2a42408cddef5e22f880b631215a09fc0012bc69fccaa251c0246d"},
-			{sequence: 255, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323535", nonce: "56d890e5accaaf011cff4b82", ct: "7175db9717964058640a3a11fb9007941a5d1757fda1a6935c805c21af32505bf106deefec4a49ac38d71c9e0a"},
-			{sequence: 256, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323536", nonce: "56d890e5accaaf011cff4a7d", ct: "957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3fbeda97d2e0e1aba483a2df9f2"},
-		},
-		exports: []rfc9180Export{
-			{exporterContext: "", length: 32, value: "3853fe2b4035195a573ffc53856e77058e15d9ea064de3e59f4961d0095250ee"},
-			{exporterContext: "00", length: 32, value: "2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5"},
-			{exporterContext: "54657374436f6e74657874", length: 32, value: "e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931"},
-		},
-	},
-	{
-		name:               "rfc 9180 appendix a.2.1, chacha20-poly1305",
-		suite:              CipherSuiteX25519ChaCha20Sha256Ed25519,
-		info:               "4f6465206f6e2061204772656369616e2055726e",
-		ikmE:               "909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b",
-		skEm:               "f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600",
-		ikmR:               "1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df",
-		skRm:               "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
-		pkRm:               "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
-		enc:                "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
-		sharedSecret:       "0bbe78490412b4bbea4812666f7916932b828bba79942424abb65244930d69a7",
-		keyScheduleContext: "00431df6cd95e11ff49d7013563baf7f11588c75a6611ee2a4404a49306ae4cfc5b69c5718a60cc5876c358d3f7fc31ddb598503f67be58ea1e798c0bb19eb9796",
-		secret:             "5b9cd775e64b437a2335cf499361b2e0d5e444d5cb41a8a53336d8fe402282c6",
-		key:                "ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91",
-		baseNonce:          "5c4d98150661b848853b547f",
-		exporterSecret:     "a3b010d4994890e2c6968a36f64470d3c824c8f5029942feb11e7a74b2921922",
-		encryptions: []rfc9180Encryption{
-			{sequence: 0, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d30", nonce: "5c4d98150661b848853b547f", ct: "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28"},
-			{sequence: 1, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d31", nonce: "5c4d98150661b848853b547e", ct: "6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e85285337cc95ba5f59992dc98c"},
-			{sequence: 2, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d32", nonce: "5c4d98150661b848853b547d", ct: "71146bd6795ccc9c49ce25dda112a48f202ad220559502cef1f34271e0cb4b02b4f10ecac6f48c32f878fae86b"},
-			{sequence: 4, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d34", nonce: "5c4d98150661b848853b547b", ct: "63357a2aa291f5a4e5f27db6baa2af8cf77427c7c1a909e0b37214dd47db122bb153495ff0b02e9e54a50dbe16"},
-			{sequence: 255, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323535", nonce: "5c4d98150661b848853b5480", ct: "18ab939d63ddec9f6ac2b60d61d36a7375d2070c9b683861110757062c52b8880a5f6b3936da9cd6c23ef2a95c"},
-			{sequence: 256, pt: "4265617574792069732074727574682c20747275746820626561757479", aad: "436f756e742d323536", nonce: "5c4d98150661b848853b557f", ct: "7a4a13e9ef23978e2c520fd4d2e757514ae160cd0cd05e556ef692370ca53076214c0c40d4c728d6ed9e727a5b"},
-		},
-		exports: []rfc9180Export{
-			{exporterContext: "", length: 32, value: "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e"},
-			{exporterContext: "00", length: 32, value: "8c1df14732580e5501b00f82b10a1647b40713191b7c1240ac80e2b68808ba69"},
-			{exporterContext: "54657374436f6e74657874", length: 32, value: "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53"},
-		},
-	},
-}
-
-// One transcribed field, with a bad transcription fatal rather than an empty slice: an
+// One field of the vendored corpus, with a bad value fatal rather than an empty slice: an
 // odd length or a stray character would otherwise silently turn a known answer into a
-// comparison against nothing, which is the one way a table like this passes while
+// comparison against nothing, which is the one way a corpus like this passes while
 // asserting less than it says.
 func decodeVectorField(t *testing.T, vectorName string, fieldName string, value string) []byte {
 	t.Helper()
@@ -206,8 +77,8 @@ func decodeVectorField(t *testing.T, vectorName string, fieldName string, value 
 	return decoded
 }
 
-// One transcribed field that is allowed to decode to nothing, for the exporter context
-// the appendix prints with nothing after the colon. decodeVectorField refuses an empty
+// One field that is allowed to decode to nothing, for the exporter context the corpus
+// carries as an empty string. decodeVectorField refuses an empty
 // decode because an empty expected value is a comparison against nothing; an empty input
 // is the opposite case and is published, and it is the only one that can see an exporter
 // substituting a default of its own for a caller that supplied none.
@@ -217,35 +88,6 @@ func decodePossiblyEmptyVectorField(t *testing.T, vectorName string, fieldName s
 		return nil
 	}
 	return decodeVectorField(t, vectorName, fieldName, value)
-}
-
-// The guard every known answer loop below opens with. A table that lost a row is not an
-// empty table, and only the empty case was ever refused — so until this existed, dropping
-// either appendix A row left every task 6 known answer green, and the only thing that
-// failed was a task 5 salt test that happened to index the second row.
-//
-// That is the wrong defence for the claim this file makes. The file comment above rests on
-// carrying both registered suites, because RFC 9180 gives HKDF-SHA256 the kdf code point
-// 0x0001 and AES-128-GCM the aead code point 0x0001: on the aes suite a kdf/aead
-// transposition moves no byte anyone can see, and the chacha suite at 0x0003 is the only
-// place it shows. A one row table is therefore a table that cannot see the mistake these
-// vectors exist to catch, whichever row is left.
-//
-// It asserts a row per registered suite in the registry's own order rather than a literal
-// two, so a third suite registered without a vector fails here as well, and the loops
-// below and the test that indexes rfc9180BaseVectors[1] by hand agree about which row is
-// which for a stated reason.
-func requireAVectorPerRegisteredSuite(t *testing.T) {
-	t.Helper()
-	suites := Suites()
-	if len(rfc9180BaseVectors) != len(suites) {
-		t.Fatalf("the vector table holds %d rows for %d registered suites, so a suite goes unpinned", len(rfc9180BaseVectors), len(suites))
-	}
-	for i, suite := range suites {
-		if rfc9180BaseVectors[i].suite != suite {
-			t.Fatalf("vector row %d is for suite %#04x, want %#04x", i, uint16(rfc9180BaseVectors[i].suite), uint16(suite))
-		}
-	}
 }
 
 // TestHpkeSuiteIds pins the two identifiers byte for byte against RFC 9180 section 5.1,
@@ -284,17 +126,16 @@ func TestHpkeSuiteIds(t *testing.T) {
 // The diffie-hellman itself comes from X25519DH, which crypto_x25519_test.go already pins
 // against RFC 7748, so a failure here is a kdf failure rather than a curve one.
 func TestHpkeKemSuiteIdDerivesThePublishedSharedSecret(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		priv, err := X25519PrivateKey(decodeVectorField(t, vector.name, "skEm", vector.skEm))
+		priv, err := X25519PrivateKey(decodeVectorField(t, vector.name, "skEm", vector.SkEm))
 		if err != nil {
 			t.Fatalf("%s: skEm: %v", vector.name, err)
 		}
-		pkRm := decodeVectorField(t, vector.name, "pkRm", vector.pkRm)
+		pkRm := decodeVectorField(t, vector.name, "pkRm", vector.PkRm)
 		pub, err := X25519PublicKey(pkRm)
 		if err != nil {
 			t.Fatalf("%s: pkRm: %v", vector.name, err)
@@ -304,13 +145,13 @@ func TestHpkeKemSuiteIdDerivesThePublishedSharedSecret(t *testing.T) {
 			t.Fatalf("%s: dh: %v", vector.name, err)
 		}
 		kemSuiteId := hpkeKemSuiteId(params)
-		kemContext := append(decodeVectorField(t, vector.name, "enc", vector.enc), pkRm...)
+		kemContext := append(decodeVectorField(t, vector.name, "enc", vector.Enc), pkRm...)
 		eaePrk := hpkeLabeledExtract(kemSuiteId, nil, "eae_prk", dh)
 		got, err := hpkeLabeledExpand(kemSuiteId, eaePrk, "shared_secret", kemContext, params.Nsecret)
 		if err != nil {
 			t.Fatalf("%s: shared_secret: %v", vector.name, err)
 		}
-		want := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		want := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
 		if !bytes.Equal(got, want) {
 			t.Errorf("%s: shared_secret = %x, want %x", vector.name, got, want)
 		}
@@ -324,25 +165,24 @@ func TestHpkeKemSuiteIdDerivesThePublishedSharedSecret(t *testing.T) {
 // salt is the 32 byte shared secret and whose ikm is empty, which is the one shape where
 // swapping crypto/hkdf's two arguments cannot be mistaken for anything else.
 func TestHpkeLabeledExtractKat(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
 		suiteId := hpkeSuiteId(params)
 		pskIdHash := hpkeLabeledExtract(suiteId, nil, "psk_id_hash", nil)
-		infoHash := hpkeLabeledExtract(suiteId, nil, "info_hash", decodeVectorField(t, vector.name, "info", vector.info))
+		infoHash := hpkeLabeledExtract(suiteId, nil, "info_hash", decodeVectorField(t, vector.name, "info", vector.Info))
 		context := append([]byte{hpkeModeBase}, pskIdHash...)
 		context = append(context, infoHash...)
-		wantContext := decodeVectorField(t, vector.name, "key_schedule_context", vector.keyScheduleContext)
+		wantContext := decodeVectorField(t, vector.name, "key_schedule_context", vector.KeyScheduleContext)
 		if !bytes.Equal(context, wantContext) {
 			t.Errorf("%s: key_schedule_context = %x, want %x", vector.name, context, wantContext)
 		}
 
-		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
 		secret := hpkeLabeledExtract(suiteId, sharedSecret, "secret", nil)
-		wantSecret := decodeVectorField(t, vector.name, "secret", vector.secret)
+		wantSecret := decodeVectorField(t, vector.name, "secret", vector.Secret)
 		if !bytes.Equal(secret, wantSecret) {
 			t.Errorf("%s: secret = %x, want %x", vector.name, secret, wantSecret)
 		}
@@ -360,24 +200,23 @@ func TestHpkeLabeledExtractKat(t *testing.T) {
 // lengths here, and differently again between the two suites, whose keys are 16 and 32
 // bytes from the same construction.
 func TestHpkeLabeledExpandKat(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
 		suiteId := hpkeSuiteId(params)
-		secret := decodeVectorField(t, vector.name, "secret", vector.secret)
-		context := decodeVectorField(t, vector.name, "key_schedule_context", vector.keyScheduleContext)
+		secret := decodeVectorField(t, vector.name, "secret", vector.Secret)
+		context := decodeVectorField(t, vector.name, "key_schedule_context", vector.KeyScheduleContext)
 		expansions := []struct {
 			field  string
 			label  string
 			length int
 			want   string
 		}{
-			{field: "key", label: "key", length: params.Nk, want: vector.key},
-			{field: "base_nonce", label: "base_nonce", length: params.Nn, want: vector.baseNonce},
-			{field: "exporter_secret", label: "exp", length: params.Nh, want: vector.exporterSecret},
+			{field: "key", label: "key", length: params.Nk, want: vector.Key},
+			{field: "base_nonce", label: "base_nonce", length: params.Nn, want: vector.BaseNonce},
+			{field: "exporter_secret", label: "exp", length: params.Nh, want: vector.ExporterSecret},
 		}
 		for _, expansion := range expansions {
 			got, err := hpkeLabeledExpand(suiteId, secret, expansion.label, context, expansion.length)
@@ -406,9 +245,8 @@ func TestHpkeLabeledExtractTreatsNilAndEmptySaltAlike(t *testing.T) {
 		t.Fatalf("LookupSuite: %v", err)
 	}
 	suiteId := hpkeKemSuiteId(params)
-	requireAVectorPerRegisteredSuite(t)
-	chacha := rfc9180BaseVectors[1]
-	ikm := decodeVectorField(t, chacha.name, "shared_secret", chacha.sharedSecret)
+	chacha := loadHpkeVectors(t)[1]
+	ikm := decodeVectorField(t, chacha.name, "shared_secret", chacha.SharedSecret)
 	fromNil := hpkeLabeledExtract(suiteId, nil, "eae_prk", ikm)
 	fromEmpty := hpkeLabeledExtract(suiteId, []byte{}, "eae_prk", ikm)
 	if !bytes.Equal(fromNil, fromEmpty) {
@@ -518,8 +356,8 @@ func TestHpkeExpandCeilingMatchesTheRegistry(t *testing.T) {
 	}
 }
 
-// TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs is the known answer for DeriveKeyPair,
-// and the reason the ikm fields were added to the table. Determinism, the sizes and the
+// TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs is the known answer for DeriveKeyPair.
+// Determinism, the sizes and the
 // sensitivity to the ikm are all satisfied by any deterministic function of the input, so
 // none of them can tell the RFC's derivation from a plausible neighbour: dropping the
 // dkp_prk label, respelling it, expanding under "key" instead of "sk", or deriving under
@@ -529,12 +367,14 @@ func TestHpkeExpandCeilingMatchesTheRegistry(t *testing.T) {
 // Both key pairs of each vector are derived, because they exercise different halves of
 // what follows: skEm is the input to encapsulation and skRm to decapsulation, and a
 // derivation that was right for one and wrong for the other is exactly the shape a single
-// row would miss. pkEm is checked as enc, since RFC 9180 section 4.1 defines the
-// encapsulated key of a DHKEM as SerializePublicKey(pkE) and the appendix prints the two
-// as the same bytes.
+// entry would miss. The ephemeral public key is checked against the corpus's own pkEm
+// rather than against its enc, and TestHpkeVectorEncapsulatedKeyIsTheEphemeralPublicKey
+// separately asserts the two are the same bytes — which is what RFC 9180 section 4.1 means
+// by defining the encapsulated key of a DHKEM as SerializePublicKey(pkE). Split that way,
+// a corpus whose two fields disagreed fails as a disagreement about the corpus instead of
+// as a derivation failure that blames this function.
 func TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
@@ -545,8 +385,8 @@ func TestHpkeDeriveKeyPairMatchesThePublishedKeyPairs(t *testing.T) {
 			privateKey string
 			publicKey  string
 		}{
-			{role: "ephemeral", ikm: vector.ikmE, privateKey: vector.skEm, publicKey: vector.enc},
-			{role: "recipient", ikm: vector.ikmR, privateKey: vector.skRm, publicKey: vector.pkRm},
+			{role: "ephemeral", ikm: vector.IkmE, privateKey: vector.SkEm, publicKey: vector.Enc},
+			{role: "recipient", ikm: vector.IkmR, privateKey: vector.SkRm, publicKey: vector.PkRm},
 		}
 		for _, derivation := range derivations {
 			ikm := decodeVectorField(t, vector.name, derivation.role+" ikm", derivation.ikm)
@@ -617,16 +457,15 @@ func TestHpkeDeriveKeyPairIsDeterministic(t *testing.T) {
 // diffie-hellman output is returned, and the kem suite id swapped for the whole suite id.
 // All six were applied to hpke.go and all six survive every non vector test in this file.
 func TestHpkeEncapMatchesThePublishedEncapsulation(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		skEm := decodeVectorField(t, vector.name, "skEm", vector.skEm)
-		pkRm := HpkePublicKey(decodeVectorField(t, vector.name, "pkRm", vector.pkRm))
-		wantSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
-		wantEnc := decodeVectorField(t, vector.name, "enc", vector.enc)
+		skEm := decodeVectorField(t, vector.name, "skEm", vector.SkEm)
+		pkRm := HpkePublicKey(decodeVectorField(t, vector.name, "pkRm", vector.PkRm))
+		wantSecret := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
+		wantEnc := decodeVectorField(t, vector.name, "enc", vector.Enc)
 
 		secret, enc, err := hpkeEncapDeterministic(params, pkRm, HpkePrivateKey(skEm))
 		if err != nil {
@@ -661,19 +500,18 @@ func TestHpkeEncapMatchesThePublishedEncapsulation(t *testing.T) {
 // concatenation, with its own opportunity to put its own key first, and the round trip
 // cannot see the difference because it would agree with an encap transposed to match.
 func TestHpkeDecapMatchesThePublishedSharedSecret(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		skRm := HpkePrivateKey(decodeVectorField(t, vector.name, "skRm", vector.skRm))
-		enc := decodeVectorField(t, vector.name, "enc", vector.enc)
+		skRm := HpkePrivateKey(decodeVectorField(t, vector.name, "skRm", vector.SkRm))
+		enc := decodeVectorField(t, vector.name, "enc", vector.Enc)
 		secret, err := hpkeDecap(params, skRm, enc)
 		if err != nil {
 			t.Fatalf("%s: hpkeDecap: %v", vector.name, err)
 		}
-		want := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
+		want := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
 		if !bytes.Equal(secret, want) {
 			t.Errorf("%s: shared_secret = %x, want %x", vector.name, secret, want)
 		}
@@ -869,7 +707,7 @@ func TestHpkeEncapRejectsWrongLengths(t *testing.T) {
 // vector, every round trip and every refusal in this file. Seven fields holding one value
 // are seven names for the same assertion. Nk, Nn and Nt are not in that set: the registry
 // gives them 16 or 32, 12 and 16, so a kem gate that read one of those is already refused
-// by the appendix A rows above and needs nothing here.
+// by the known answers above and needs nothing here.
 //
 // Separating them does not need a registered suite, which is the reason this is testable
 // at all. None of the four kem entry points consults the registry: each reads the
@@ -1295,15 +1133,14 @@ func TestHpkeAeadKeyLengthIsSuiteBound(t *testing.T) {
 // and nothing else, and it passes against a key schedule that assembled the same three
 // pieces in any order at all.
 func TestHpkeKeyScheduleContextMatchesThePublishedContext(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		info := decodeVectorField(t, vector.name, "info", vector.info)
+		info := decodeVectorField(t, vector.name, "info", vector.Info)
 		got := hpkeKeyScheduleContext(hpkeSuiteId(params), info)
-		want := decodeVectorField(t, vector.name, "key_schedule_context", vector.keyScheduleContext)
+		want := decodeVectorField(t, vector.name, "key_schedule_context", vector.KeyScheduleContext)
 		if !bytes.Equal(got, want) {
 			t.Errorf("%s: key_schedule_context = %x, want %x", vector.name, got, want)
 		}
@@ -1327,23 +1164,22 @@ func TestHpkeKeyScheduleContextMatchesThePublishedContext(t *testing.T) {
 // at all. Nk is 16 there and 32 here, so a key expanded to any of the seven suite fields
 // that hold 32 is a key the aead refuses on the aes row and accepts silently on this one.
 func TestHpkeKeyScheduleMatchesThePublishedSchedule(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
-		info := decodeVectorField(t, vector.name, "info", vector.info)
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
+		info := decodeVectorField(t, vector.name, "info", vector.Info)
 		ctx, err := hpkeKeySchedule(params, sharedSecret, info)
 		if err != nil {
 			t.Fatalf("%s: key schedule: %v", vector.name, err)
 		}
-		wantBaseNonce := decodeVectorField(t, vector.name, "base_nonce", vector.baseNonce)
+		wantBaseNonce := decodeVectorField(t, vector.name, "base_nonce", vector.BaseNonce)
 		if !bytes.Equal(ctx.baseNonce, wantBaseNonce) {
 			t.Errorf("%s: base_nonce = %x, want %x", vector.name, ctx.baseNonce, wantBaseNonce)
 		}
-		wantExporterSecret := decodeVectorField(t, vector.name, "exporter_secret", vector.exporterSecret)
+		wantExporterSecret := decodeVectorField(t, vector.name, "exporter_secret", vector.ExporterSecret)
 		if !bytes.Equal(ctx.exporterSecret, wantExporterSecret) {
 			t.Errorf("%s: exporter_secret = %x, want %x", vector.name, ctx.exporterSecret, wantExporterSecret)
 		}
@@ -1362,32 +1198,35 @@ func TestHpkeKeyScheduleMatchesThePublishedSchedule(t *testing.T) {
 // Each of those was applied to hpke.go and left the sequence, tamper and export tests
 // green.
 //
-// The sparse sequence numbers are the RFC's own and they are the point. 0, 1, 2 and 4
-// separate the counter from a constant; 255 and 256 are where it crosses a byte, which is
-// the only place a little endian counter and a big endian one disagree about which byte
-// of the nonce to move. The context is walked to each published number with messages that
-// are sealed and thrown away, exactly as a sender that had sent them would be, and the
-// walk is counted here rather than read off the context so that a context which never
-// advances fails an assertion instead of spinning.
+// The published sequence numbers are the RFC's own and they are the point. The corpus
+// carries every one from 0 to 256: the low ones separate the counter from a constant, and
+// 255 and 256 are where it crosses a byte, which is the only place a little endian counter
+// and a big endian one disagree about which byte of the nonce to move. Reaching 256 is
+// asserted rather than assumed, because a corpus re-vendored under a filter that truncated
+// the encryptions would otherwise leave every nonce assertion here passing against an
+// implementation that matches nobody.
+//
+// The context is walked to each published number with messages that are sealed and thrown
+// away, exactly as a sender that had sent them would be. That walk is a no-op on this
+// corpus, whose sequence numbers are consecutive, and it is kept because the appendix A
+// excerpt these vectors used to be transcribed from is sparse and a later corpus may be
+// too; the position is counted here rather than read off the context so that a context
+// which never advances fails an assertion instead of spinning.
 //
 // The receiver opens the published ciphertext rather than the one the sender just
 // produced, so the two directions are pinned against the RFC independently instead of
 // against each other.
 func TestHpkeContextSealMatchesThePublishedEncryptions(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		if len(vector.encryptions) < 6 {
-			t.Fatalf("%s carries %d encryptions, want the six the appendix prints", vector.name, len(vector.encryptions))
-		}
-		if last := vector.encryptions[len(vector.encryptions)-1]; last.sequence <= 255 {
+		if last := vector.Encryptions[len(vector.Encryptions)-1]; last.sequence < hpkeVectorHighestSequence {
 			t.Fatalf("%s stops at sequence %d, so the counter never crosses a byte", vector.name, last.sequence)
 		}
-		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
-		info := decodeVectorField(t, vector.name, "info", vector.info)
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
+		info := decodeVectorField(t, vector.name, "info", vector.Info)
 		sender, err := hpkeKeySchedule(params, sharedSecret, info)
 		if err != nil {
 			t.Fatalf("%s: sender key schedule: %v", vector.name, err)
@@ -1397,7 +1236,7 @@ func TestHpkeContextSealMatchesThePublishedEncryptions(t *testing.T) {
 			t.Fatalf("%s: receiver key schedule: %v", vector.name, err)
 		}
 		position := uint64(0)
-		for _, encryption := range vector.encryptions {
+		for _, encryption := range vector.Encryptions {
 			for position < encryption.sequence {
 				filler, err := sender.Seal(nil, nil)
 				if err != nil {
@@ -1412,13 +1251,13 @@ func TestHpkeContextSealMatchesThePublishedEncryptions(t *testing.T) {
 				t.Fatalf("%s: after %d messages the sender is at sequence %d and the receiver at %d",
 					vector.name, position, sender.sequence, receiver.sequence)
 			}
-			wantNonce := decodeVectorField(t, vector.name, "nonce", encryption.nonce)
+			wantNonce := decodeVectorField(t, vector.name, "nonce", encryption.Nonce)
 			if got := sender.nonce(); !bytes.Equal(got, wantNonce) {
 				t.Errorf("%s: nonce at sequence %d = %x, want %x", vector.name, encryption.sequence, got, wantNonce)
 			}
-			aad := decodeVectorField(t, vector.name, "aad", encryption.aad)
-			plaintext := decodeVectorField(t, vector.name, "pt", encryption.pt)
-			wantCiphertext := decodeVectorField(t, vector.name, "ct", encryption.ct)
+			aad := decodeVectorField(t, vector.name, "aad", encryption.Aad)
+			plaintext := decodeVectorField(t, vector.name, "pt", encryption.Pt)
+			wantCiphertext := decodeVectorField(t, vector.name, "ct", encryption.Ct)
 			if len(wantCiphertext) != len(plaintext)+params.Nt {
 				t.Fatalf("%s: the published ciphertext at sequence %d is %d bytes for %d of plaintext and a %d byte tag",
 					vector.name, encryption.sequence, len(wantCiphertext), len(plaintext), params.Nt)
@@ -1453,34 +1292,33 @@ func TestHpkeContextSealMatchesThePublishedEncryptions(t *testing.T) {
 // reason of its own: it is the only input that can see an implementation substituting a
 // default of its own for a caller that supplied none.
 func TestHpkeContextExportMatchesThePublishedExports(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		if len(vector.exports) < 3 {
-			t.Fatalf("%s carries %d exported values, want the three the appendix prints", vector.name, len(vector.exports))
+		if len(vector.Exports) != 3 {
+			t.Fatalf("%s carries %d exported values, want the three RFC 9180 publishes", vector.name, len(vector.Exports))
 		}
-		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret)
-		info := decodeVectorField(t, vector.name, "info", vector.info)
+		sharedSecret := decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret)
+		info := decodeVectorField(t, vector.name, "info", vector.Info)
 		ctx, err := hpkeKeySchedule(params, sharedSecret, info)
 		if err != nil {
 			t.Fatalf("%s: key schedule: %v", vector.name, err)
 		}
-		for _, export := range vector.exports {
-			exporterContext := decodePossiblyEmptyVectorField(t, vector.name, "exporter_context", export.exporterContext)
-			want := decodeVectorField(t, vector.name, "exported_value", export.value)
-			if len(want) != export.length {
+		for _, export := range vector.Exports {
+			exporterContext := decodePossiblyEmptyVectorField(t, vector.name, "exporter_context", export.ExporterContext)
+			want := decodeVectorField(t, vector.name, "exported_value", export.ExportedValue)
+			if len(want) != export.Length {
 				t.Fatalf("%s: the published export for context %q is %d bytes, the table says %d",
-					vector.name, export.exporterContext, len(want), export.length)
+					vector.name, export.ExporterContext, len(want), export.Length)
 			}
-			got, err := ctx.Export(exporterContext, export.length)
+			got, err := ctx.Export(exporterContext, export.Length)
 			if err != nil {
-				t.Fatalf("%s: export for context %q: %v", vector.name, export.exporterContext, err)
+				t.Fatalf("%s: export for context %q: %v", vector.name, export.ExporterContext, err)
 			}
 			if !bytes.Equal(got, want) {
-				t.Errorf("%s: export for context %q = %x, want %x", vector.name, export.exporterContext, got, want)
+				t.Errorf("%s: export for context %q = %x, want %x", vector.name, export.ExporterContext, got, want)
 			}
 		}
 	}
@@ -1494,23 +1332,22 @@ func TestHpkeContextExportMatchesThePublishedExports(t *testing.T) {
 // whose comment says the sequence must not be consumed. What sees it is the next message
 // — after an export, the seal at sequence 1 must still be the sequence 1 the RFC printed.
 func TestHpkeContextExportLeavesTheSequenceAlone(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	vector := rfc9180BaseVectors[1]
+	vector := loadHpkeVectors(t)[1]
 	params, err := LookupSuite(vector.suite)
 	if err != nil {
 		t.Fatalf("LookupSuite: %v", err)
 	}
-	if len(vector.encryptions) < 2 || vector.encryptions[0].sequence != 0 || vector.encryptions[1].sequence != 1 {
+	if len(vector.Encryptions) < 2 || vector.Encryptions[0].sequence != 0 || vector.Encryptions[1].sequence != 1 {
 		t.Fatalf("%s does not open with sequences 0 and 1, so the assertion below is about other messages", vector.name)
 	}
 	ctx, err := hpkeKeySchedule(params,
-		decodeVectorField(t, vector.name, "shared_secret", vector.sharedSecret),
-		decodeVectorField(t, vector.name, "info", vector.info))
+		decodeVectorField(t, vector.name, "shared_secret", vector.SharedSecret),
+		decodeVectorField(t, vector.name, "info", vector.Info))
 	if err != nil {
 		t.Fatalf("key schedule: %v", err)
 	}
-	first := vector.encryptions[0]
-	if _, err := ctx.Seal(decodeVectorField(t, vector.name, "aad", first.aad), decodeVectorField(t, vector.name, "pt", first.pt)); err != nil {
+	first := vector.Encryptions[0]
+	if _, err := ctx.Seal(decodeVectorField(t, vector.name, "aad", first.Aad), decodeVectorField(t, vector.name, "pt", first.Pt)); err != nil {
 		t.Fatalf("seal at sequence 0: %v", err)
 	}
 	if _, err := ctx.Export([]byte("an export between two messages"), 32); err != nil {
@@ -1519,12 +1356,12 @@ func TestHpkeContextExportLeavesTheSequenceAlone(t *testing.T) {
 	if ctx.sequence != 1 {
 		t.Errorf("the context is at sequence %d after one message and one export, want 1", ctx.sequence)
 	}
-	second := vector.encryptions[1]
-	ciphertext, err := ctx.Seal(decodeVectorField(t, vector.name, "aad", second.aad), decodeVectorField(t, vector.name, "pt", second.pt))
+	second := vector.Encryptions[1]
+	ciphertext, err := ctx.Seal(decodeVectorField(t, vector.name, "aad", second.Aad), decodeVectorField(t, vector.name, "pt", second.Pt))
 	if err != nil {
 		t.Fatalf("seal at sequence 1: %v", err)
 	}
-	want := decodeVectorField(t, vector.name, "ct", second.ct)
+	want := decodeVectorField(t, vector.name, "ct", second.Ct)
 	if !bytes.Equal(ciphertext, want) {
 		t.Errorf("the message after an export sealed to %x, want the published sequence 1 ciphertext %x", ciphertext, want)
 	}
@@ -1649,9 +1486,9 @@ func TestHpkeContextRefusesToWrapTheSequence(t *testing.T) {
 }
 
 // TestHpkeContextNonceCarriesEveryBitOfTheSequence pins the counter's width and its
-// placement above the range any published row reaches. Appendix A stops at sequence 256,
-// so every vector in this file exercises the counter's low nine bits and nothing over
-// them, and the wrap test above sets sender and receiver to the same sequence number by
+// placement above the range any published vector reaches. The corpus stops at sequence
+// 256, so every known answer in this file exercises the counter's low nine bits and
+// nothing over them, and the wrap test above sets sender and receiver to the same sequence number by
 // hand, so a truncation applies to both alike and they go on agreeing with each other.
 // Measured: a ComputeNonce writing self.sequence&0x1ff, &0xffff, &0xffffffff,
 // &0xffffffffffff or the low 63 bits left the entire package green. The 32 bit one
@@ -1933,24 +1770,23 @@ func TestHpkeOpenBaseRejectsWrongRecipient(t *testing.T) {
 // to hpke.go and survived the whole package. The published ciphertext covers the aad in
 // its tag, so it is the assertion that sees it.
 func TestHpkeSealBaseMatchesThePublishedSingleShot(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		if len(vector.encryptions) == 0 || vector.encryptions[0].sequence != 0 {
+		if len(vector.Encryptions) == 0 || vector.Encryptions[0].sequence != 0 {
 			t.Fatalf("%s does not open at sequence 0, so a single shot cannot be compared against it", vector.name)
 		}
-		first := vector.encryptions[0]
-		info := decodePossiblyEmptyVectorField(t, vector.name, "info", vector.info)
-		aad := decodeVectorField(t, vector.name, "aad", first.aad)
-		plaintext := decodeVectorField(t, vector.name, "pt", first.pt)
-		wantEnc := decodeVectorField(t, vector.name, "enc", vector.enc)
-		wantCiphertext := decodeVectorField(t, vector.name, "ct", first.ct)
-		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.skEm)
-		recipient := decodeVectorField(t, vector.name, "pkRm", vector.pkRm)
-		recipientPriv := decodeVectorField(t, vector.name, "skRm", vector.skRm)
+		first := vector.Encryptions[0]
+		info := decodePossiblyEmptyVectorField(t, vector.name, "info", vector.Info)
+		aad := decodeVectorField(t, vector.name, "aad", first.Aad)
+		plaintext := decodeVectorField(t, vector.name, "pt", first.Pt)
+		wantEnc := decodeVectorField(t, vector.name, "enc", vector.Enc)
+		wantCiphertext := decodeVectorField(t, vector.name, "ct", first.Ct)
+		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.SkEm)
+		recipient := decodeVectorField(t, vector.name, "pkRm", vector.PkRm)
+		recipientPriv := decodeVectorField(t, vector.name, "skRm", vector.SkRm)
 
 		kemOutput, ciphertext, err := HpkeSealBase(bytes.NewReader(ephemeral), params, HpkePublicKey(recipient), info, aad, plaintext)
 		if err != nil {
@@ -1988,26 +1824,25 @@ func TestHpkeSealBaseMatchesThePublishedSingleShot(t *testing.T) {
 // and produces a working looking context. Both were applied to hpke.go; the published
 // base nonce is what refuses them.
 func TestHpkeSetupBaseMatchesThePublishedSetup(t *testing.T) {
-	requireAVectorPerRegisteredSuite(t)
-	for _, vector := range rfc9180BaseVectors {
+	for _, vector := range loadHpkeVectors(t) {
 		params, err := LookupSuite(vector.suite)
 		if err != nil {
 			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
 		}
-		if len(vector.encryptions) == 0 || vector.encryptions[0].sequence != 0 {
+		if len(vector.Encryptions) == 0 || vector.Encryptions[0].sequence != 0 {
 			t.Fatalf("%s does not open at sequence 0, so a fresh context cannot be compared against it", vector.name)
 		}
-		first := vector.encryptions[0]
-		info := decodePossiblyEmptyVectorField(t, vector.name, "info", vector.info)
-		aad := decodeVectorField(t, vector.name, "aad", first.aad)
-		plaintext := decodeVectorField(t, vector.name, "pt", first.pt)
-		wantCiphertext := decodeVectorField(t, vector.name, "ct", first.ct)
-		wantEnc := decodeVectorField(t, vector.name, "enc", vector.enc)
-		wantBaseNonce := decodeVectorField(t, vector.name, "base_nonce", vector.baseNonce)
-		wantExporterSecret := decodeVectorField(t, vector.name, "exporter_secret", vector.exporterSecret)
-		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.skEm)
-		recipient := decodeVectorField(t, vector.name, "pkRm", vector.pkRm)
-		recipientPriv := decodeVectorField(t, vector.name, "skRm", vector.skRm)
+		first := vector.Encryptions[0]
+		info := decodePossiblyEmptyVectorField(t, vector.name, "info", vector.Info)
+		aad := decodeVectorField(t, vector.name, "aad", first.Aad)
+		plaintext := decodeVectorField(t, vector.name, "pt", first.Pt)
+		wantCiphertext := decodeVectorField(t, vector.name, "ct", first.Ct)
+		wantEnc := decodeVectorField(t, vector.name, "enc", vector.Enc)
+		wantBaseNonce := decodeVectorField(t, vector.name, "base_nonce", vector.BaseNonce)
+		wantExporterSecret := decodeVectorField(t, vector.name, "exporter_secret", vector.ExporterSecret)
+		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.SkEm)
+		recipient := decodeVectorField(t, vector.name, "pkRm", vector.PkRm)
+		recipientPriv := decodeVectorField(t, vector.name, "skRm", vector.SkRm)
 
 		kemOutput, sender, err := HpkeSetupBaseS(bytes.NewReader(ephemeral), params, HpkePublicKey(recipient), info)
 		if err != nil {
