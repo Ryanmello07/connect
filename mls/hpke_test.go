@@ -1819,3 +1819,75 @@ func TestHpkeKeyScheduleRefusesANonceLengthTheAeadWillNotTake(t *testing.T) {
 		t.Errorf("the aead's own nonce length was refused: %v", err)
 	}
 }
+
+func TestHpkeSealBaseRoundTrip(t *testing.T) {
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("LookupSuite: %v", err)
+		}
+		priv, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x08}, 32))
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		info := []byte("the info")
+		aad := []byte("the aad")
+		plaintext := []byte("the plaintext")
+		kemOutput, ciphertext, err := HpkeSealBase(rand.Reader, params, pub, info, aad, plaintext)
+		if err != nil {
+			t.Fatalf("seal: %v", err)
+		}
+		if len(ciphertext) != len(plaintext)+params.Nt {
+			t.Fatalf("ciphertext is %d bytes, want %d", len(ciphertext), len(plaintext)+params.Nt)
+		}
+		back, err := HpkeOpenBase(params, priv, kemOutput, info, aad, ciphertext)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if !bytes.Equal(back, plaintext) {
+			t.Fatalf("suite %#04x round trip returned %q", uint16(suite), back)
+		}
+	}
+}
+
+func TestHpkeOpenBaseRejectsWrongInfo(t *testing.T) {
+	// info is bound through the key schedule, so a wrong info is an open failure and
+	// not a silently different plaintext. MLS puts the label and context here.
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	priv, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x09}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	kemOutput, ciphertext, err := HpkeSealBase(rand.Reader, params, pub, []byte("info a"), nil, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if _, err := HpkeOpenBase(params, priv, kemOutput, []byte("info b"), nil, ciphertext); !errors.Is(err, ErrAeadOpen) {
+		t.Fatalf("wrong info: error = %v, want ErrAeadOpen", err)
+	}
+}
+
+func TestHpkeOpenBaseRejectsWrongRecipient(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	_, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x0a}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	otherPriv, _, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x0b}, 32))
+	if err != nil {
+		t.Fatalf("derive other: %v", err)
+	}
+	kemOutput, ciphertext, err := HpkeSealBase(rand.Reader, params, pub, nil, nil, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if _, err := HpkeOpenBase(params, otherPriv, kemOutput, nil, nil, ciphertext); !errors.Is(err, ErrAeadOpen) {
+		t.Fatalf("wrong recipient: error = %v, want ErrAeadOpen", err)
+	}
+}

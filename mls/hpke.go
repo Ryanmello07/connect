@@ -448,3 +448,96 @@ func (self *HpkeContext) Open(aad []byte, ciphertext []byte) ([]byte, error) {
 func (self *HpkeContext) Export(exporterContext []byte, length int) ([]byte, error) {
 	return hpkeLabeledExpand(self.suiteId, self.exporterSecret, "sec", exporterContext, length)
 }
+
+// SetupBaseS, RFC 9180 section 5.1.1: draw an ephemeral key pair, encapsulate to the
+// recipient, and turn the resulting shared secret into a sending context. The returned
+// bytes are that call's encapsulated key, which the recipient needs and which is public.
+//
+// A context is built here and never cached. The ephemeral key is what makes two
+// encapsulations to one recipient produce two unrelated keys, so anything that held a
+// context or an ephemeral key across calls would put a second message on the first
+// message's key at the first message's sequence number — one nonce, two plaintexts, and
+// the aead's confidentiality and authenticity both gone. Nothing in this file has a
+// package level variable for that reason.
+//
+// The shared secret is not returned. It and the encapsulated key are both 32 bytes under
+// the registered kem, so a caller handed both could pass either into a key schedule and
+// the mistake would only be visible against a published vector; the context is the only
+// thing a caller has any use for, so it is the only thing that leaves.
+func HpkeSetupBaseS(random io.Reader, params *SuiteParams, pub HpkePublicKey, info []byte) ([]byte, *HpkeContext, error) {
+	sharedSecret, kemOutput, err := hpkeEncap(random, params, pub)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctx, err := hpkeKeySchedule(params, sharedSecret, info)
+	if err != nil {
+		return nil, nil, err
+	}
+	return kemOutput, ctx, nil
+}
+
+// SetupBaseR, RFC 9180 section 5.1.1: decapsulate a sender's encapsulated key and build
+// the receiving context from it. The context starts at sequence zero, which is where the
+// sender's first message was sealed, and the two run in step from there.
+//
+// info is the sender's and it is bound into the key schedule rather than checked against
+// anything, so a receiver that expected a different one does not learn that here — it
+// learns it when the first Open refuses. That is the RFC's design and it is what makes
+// the MLS label and group context, which travel through this argument, unforgeable rather
+// than merely declared.
+func HpkeSetupBaseR(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte) (*HpkeContext, error) {
+	sharedSecret, err := hpkeDecap(params, priv, kemOutput)
+	if err != nil {
+		return nil, err
+	}
+	return hpkeKeySchedule(params, sharedSecret, info)
+}
+
+// SealBase, the single-shot api of RFC 9180 section 6.1 and the only form MLS uses: set
+// up a context, seal exactly one message with it, and drop it.
+//
+// Dropping it is the point. The context is a local, so every call encapsulates under a
+// fresh ephemeral key and seals at sequence zero under a key no other call holds. An
+// implementation that kept the context instead — to save an encapsulation, to memoize on
+// the recipient key, or by reaching for a package level one — would either seal the
+// second message at sequence one, which no single-shot receiver can open because it
+// builds its own context at zero, or reset the sequence and seal two plaintexts under one
+// key and one nonce. The second of those round trips perfectly and is a total break: for
+// both aeads here the ciphertexts differ from the plaintexts by the same keystream, so
+// their xor is the xor of the plaintexts, and the authenticator's key falls out of the
+// pair as well. hpke_test.go measures exactly that xor rather than trusting the round
+// trip, which cannot see it.
+//
+// The two returned slices are the encapsulated key and the ciphertext, in that order, and
+// both are []byte — a transposed return compiles. What separates them is that the
+// encapsulated key is Nenc bytes and the ciphertext is the plaintext plus Nt, so the
+// vector known answers and the length assertion beside them are what hold the order.
+func HpkeSealBase(random io.Reader, params *SuiteParams, pub HpkePublicKey, info []byte, aad []byte, plaintext []byte) ([]byte, []byte, error) {
+	kemOutput, ctx, err := HpkeSetupBaseS(random, params, pub, info)
+	if err != nil {
+		return nil, nil, err
+	}
+	ciphertext, err := ctx.Seal(aad, plaintext)
+	if err != nil {
+		return nil, nil, err
+	}
+	return kemOutput, ciphertext, nil
+}
+
+// OpenBase, RFC 9180 section 6.1. The context is per call here for the same reason it is
+// on the sending side, with one more: a receiving context that survived a call would
+// advance its sequence number past the zero every single-shot message is sealed at, and
+// would then refuse every message after the first.
+//
+// info and aad are both authenticated and neither is recoverable from the ciphertext, so
+// a message sealed under either of them opens under nothing else — info because it moves
+// the whole key schedule, aad because the aead's tag covers it. Both come back as
+// ErrAeadOpen, since which one a peer got wrong is not something the peer gets to learn
+// from the error it provoked.
+func HpkeOpenBase(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	ctx, err := HpkeSetupBaseR(params, priv, kemOutput, info)
+	if err != nil {
+		return nil, err
+	}
+	return ctx.Open(aad, ciphertext)
+}
