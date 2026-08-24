@@ -58,6 +58,18 @@
 // against the shape fails on correct code. The corpus carries such a message for both
 // suites; what is asserted over it is the plaintext it has to equal, which is the claim
 // that was wanted.
+//
+// What the corpus alters is every message it records as opening, and the messages it
+// records are a cross product rather than a list. A recorded success nobody alters is a
+// success no seed can tell from an unconditional accept: with the published 45 byte
+// message as the only altered one, an open that hands back an empty plaintext for any
+// ciphertext of exactly the tag length — an authentication bypass for every empty message
+// — is refused by nothing here. And an alteration reaches a lenient fallback only if the
+// message it alters can provoke one: an open that drops its aad binding above a thousand
+// bytes, or that accepts an aad claimed over a message sealed with none, is invisible to a
+// corpus whose one message is 45 bytes and carries both fields. So the basis is sealed at
+// each of three plaintext lengths under each of nine info and aad pairings, and the field
+// by alteration cross product runs over all of them rather than over one of them.
 package mls
 
 import (
@@ -66,14 +78,56 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"regexp"
+	"strings"
 	"testing"
 )
+
+// How many times the alteration set is applied to what it produced, in the two targets
+// whose claims are about pairs of inputs rather than about one.
+//
+// One round is near misses of a published value; a second round is what puts two inputs in
+// every length band, which is what an injectivity or a distinctness claim has to compare.
+// A third would multiply the corpus again for bands that are already occupied.
+const hpkeFuzzAlterationRounds = 2
+
+// The narrowest exported value two different exporter contexts are required to differ in.
+//
+// Sixteen bytes because that is where a coincidence stops being plausible: a search
+// comparing ten million inputs against the few thousand values held below runs a collision
+// probability around two in a billion at this width and around one at four bytes. It is a
+// property of the arithmetic rather than of the ciphersuite, so it is written here rather
+// than read from Nh or Nt, both of which happen to sit near it.
+const hpkeFuzzExportCollisionWidth = 16
+
+// The most pairs the two collision maps hold.
+//
+// A seed run fills them with the whole corpus and stops well short of this. A -fuzz run
+// would otherwise add an entry per execution and take the worker's memory with it, so past
+// this many the claim is made against the inputs already held rather than against every
+// input a search has ever produced — which still fails on any collapse that lands on one
+// of them, and which is the whole corpus in the run continuous integration performs.
+const hpkeFuzzDerivationsTracked = 4096
 
 // The over long length every field is grown to. Large enough that an implementation
 // sizing a buffer from it would be visible against the few hundred bytes everything else
 // here runs at, small enough that a -fuzz run mutating a corpus full of them still
 // executes at a useful rate.
 const hpkeFuzzOverlongLength = 8192
+
+// The bytes an over long info, an over long aad and an over long plaintext are sealed
+// under.
+//
+// Three different fillers rather than one, and none of them the 0x5a the "grown"
+// alteration writes, so that growing one of these fields produces bytes it did not already
+// hold. An alteration that leaves a field equal to what it was is the unaltered message
+// under another name, and the corpus would then be asserting a refusal against an input
+// that has to open.
+var (
+	hpkeFuzzOverlongInfo      = bytes.Repeat([]byte{0xa5}, hpkeFuzzOverlongLength)
+	hpkeFuzzOverlongAad       = bytes.Repeat([]byte{0x3c}, hpkeFuzzOverlongLength)
+	hpkeFuzzOverlongPlaintext = bytes.Repeat([]byte{0xc3}, hpkeFuzzOverlongLength)
+)
 
 // One recipient the open target's selector byte picks between: a suite, the private key an
 // open is attempted with, and whether that key is the length its suite fixes. The last
@@ -87,13 +141,28 @@ type hpkeFuzzRecipient struct {
 }
 
 // The recipients the open target selects between: the published recipient key of every
-// registered suite, then three malformed forms of the first.
+// registered suite, then three malformed forms of the first, then one key that is
+// malformed only relative to the suite it is offered under.
 //
 // The malformed ones are here because HpkeOpenBase's private key is not a fuzz argument —
 // it is this process's own key rather than a peer's bytes — so the gate that refuses it is
 // unreachable from a signature that fuzzes only the wire fields, and a target that cannot
 // reach a gate says nothing about it. They are cut from a published key rather than
 // invented, so the only thing wrong with any of them is its length.
+//
+// The three cut keys reach that gate but cannot say it answered. X25519PrivateKey refuses
+// the same three lengths with the same sentinel one line further down, so deleting
+// hpkeDecap's own check leaves every one of them producing ErrBadKeyLength anyway, and a
+// check placed where it cannot observe its subject is worth nothing. The last recipient is
+// what separates them: a whole published key under a SuiteParams whose Nsk is not the
+// curve's length, which the gate refuses because it reads the registry and which the curve
+// accepts because it reads RFC 7748. Delete the gate and that message opens, so the
+// refusal asserted over it is the gate's and nothing else's.
+//
+// Widening rather than narrowing, and widening the field alone: no other length in the
+// open path is Nsk, and every other field of the probe is the registered suite's, so an
+// input offered under it reaches exactly the one gate under test and is answered by
+// nothing downstream that happens to also refuse it.
 func hpkeFuzzRecipients(tb testing.TB, vectors []hpkeVector) []hpkeFuzzRecipient {
 	tb.Helper()
 	recipients := make([]hpkeFuzzRecipient, 0, len(vectors)+3)
@@ -125,6 +194,14 @@ func hpkeFuzzRecipients(tb testing.TB, vectors []hpkeVector) []hpkeFuzzRecipient
 			privIsWellFormed: false,
 		})
 	}
+	widenedNsk := *whole.params
+	widenedNsk.Nsk = whole.params.Nsk + 16
+	recipients = append(recipients, hpkeFuzzRecipient{
+		name:             fmt.Sprintf("a whole recipient key under a suite whose Nsk is %d", widenedNsk.Nsk),
+		params:           &widenedNsk,
+		priv:             whole.priv,
+		privIsWellFormed: false,
+	})
 	return recipients
 }
 
@@ -148,6 +225,15 @@ type hpkeFuzzAlteration struct {
 // These are crossed with the fields rather than chosen per field. A hand written list is
 // how a corpus ends up exercising one field five ways and another once, and the field that
 // got one is always the one nobody thought about.
+//
+// Four of them hand back their input unchanged when it is empty, and every caller drops an
+// alteration that changed nothing. An empty field is not hypothetical here: the message
+// basis seals under an absent info and an absent aad on purpose, since that is the only
+// way the corpus can offer one of them over a message that carried none. Indexing the
+// first or the last byte of such a field would be an index out of range inside a seed
+// constructor, which reads as a broken test binary rather than as a corpus that outgrew
+// its helpers, and emptying an already empty field would produce the unaltered message
+// with a refusal written beside it.
 func hpkeFuzzAlterations() []hpkeFuzzAlteration {
 	return []hpkeFuzzAlteration{
 		{
@@ -155,8 +241,13 @@ func hpkeFuzzAlterations() []hpkeFuzzAlteration {
 			apply: func(bs []byte) []byte { return nil },
 		},
 		{
-			name:  "one byte short",
-			apply: func(bs []byte) []byte { return bytes.Clone(bs[:len(bs)-1]) },
+			name: "one byte short",
+			apply: func(bs []byte) []byte {
+				if len(bs) == 0 {
+					return nil
+				}
+				return bytes.Clone(bs[:len(bs)-1])
+			},
 		},
 		{
 			name:  "one byte long",
@@ -179,6 +270,9 @@ func hpkeFuzzAlterations() []hpkeFuzzAlteration {
 		{
 			name: "with the low bit of its first byte flipped",
 			apply: func(bs []byte) []byte {
+				if len(bs) == 0 {
+					return nil
+				}
 				altered := bytes.Clone(bs)
 				altered[0] ^= 0x01
 				return altered
@@ -188,6 +282,9 @@ func hpkeFuzzAlterations() []hpkeFuzzAlteration {
 		{
 			name: "with the high bit of its last byte flipped",
 			apply: func(bs []byte) []byte {
+				if len(bs) == 0 {
+					return nil
+				}
 				altered := bytes.Clone(bs)
 				altered[len(altered)-1] ^= 0x80
 				return altered
@@ -242,61 +339,171 @@ type hpkeFuzzOpenCase struct {
 	wantErr       error
 }
 
-// One published message, decoded once so the cross product below does not decode hex per
-// case, with the ephemeral private key kept for the one message this file seals itself.
-type hpkeFuzzMessage struct {
-	params     *SuiteParams
-	skEm       []byte
-	pkRm       []byte
-	kemOutput  []byte
-	info       []byte
-	aad        []byte
-	ciphertext []byte
-	plaintext  []byte
+// One named value a field of the message basis is sealed with: a plaintext length, an
+// info, or an aad.
+//
+// Three classes for each rather than one value, because a length gate and an absent field
+// are the two cheapest places for a lenient decoder to hide. The published plaintext is
+// the known answer; the empty one is the input that separates a successful open from a
+// refusal in the one place the two look alike, since both hand back a nil slice and no
+// published vector seals one; the over long one is what puts a ciphertext that has to open
+// above any length an implementation could gate a fallback on.
+type hpkeFuzzValueClass struct {
+	name  string
+	bytes []byte
 }
 
-// The published single shot message of every registered suite, read out of the vendored
-// corpus.
+// One info and aad pairing the message basis is sealed under.
+//
+// Absent, published and over long for each of the two, crossed rather than listed. Absent
+// is the half the published corpus cannot supply and the half that matters most: both
+// vendored entries carry a non-empty info and a non-empty aad, so an alteration of them
+// can only change a value that was already there and never claim one over a message that
+// carried none — which is exactly the direction an open with a lenient fallback survives.
+// Over long is the other half: a fallback an implementation gated on a length is reachable
+// only from a message sealed above that length.
+type hpkeFuzzBindingClass struct {
+	name string
+	info []byte
+	aad  []byte
+}
+
+// One sealed message the corpus offers and then alters: the four wire fields as a peer
+// would send them, the suite they belong to, and the plaintext the unaltered form has to
+// open to.
+//
+// isPublished separates the one message of each suite whose bytes RFC 9180 printed from
+// the rest of the basis, which this package sealed itself. The published one is a known
+// answer; the others are not, and nothing about their bytes is asserted beyond the
+// plaintext they were sealed over and the encapsulated key they had to reproduce.
+type hpkeFuzzSealed struct {
+	name        string
+	suite       int
+	params      *SuiteParams
+	kemOutput   []byte
+	info        []byte
+	aad         []byte
+	ciphertext  []byte
+	plaintext   []byte
+	isPublished bool
+}
+
+// The whole message basis: for every registered suite, the published single shot message,
+// and then that suite's own seal of every plaintext class under every binding class.
 //
 // The first encryption is the one a single shot open can reach: HpkeOpenBase builds a
 // receiving context at sequence zero and opens exactly one message with it, so the
 // published encryptions past index zero belong to the context tests and not here.
-func hpkeFuzzMessages(tb testing.TB, vectors []hpkeVector) []hpkeFuzzMessage {
+//
+// Everything past the published message is sealed from the vector's own ephemeral private
+// key rather than from a random reader, so the corpus is the same bytes on every run and a
+// crasher found against it is reproducible. That the seal reproduced the published
+// encapsulated key is checked each time, since a fixed reader that stopped being the
+// ephemeral key would silently turn the whole basis into messages for a different context.
+//
+// One member of the basis is the published message rather than a near miss of it: the
+// published plaintext under the published info and aad is what the vector already printed,
+// and sealing it here has to reproduce those bytes. It is left in the cross product rather
+// than skipped, and the identity is asserted rather than deduplicated away, because that
+// makes the one message this file seals under known conditions a known answer instead of a
+// collision the corpus quietly drops.
+func hpkeFuzzSealedMessages(tb testing.TB, vectors []hpkeVector) []hpkeFuzzSealed {
 	tb.Helper()
-	messages := make([]hpkeFuzzMessage, 0, len(vectors))
-	for _, vector := range vectors {
+	sealed := []hpkeFuzzSealed{}
+	for index, vector := range vectors {
 		if len(vector.Encryptions) == 0 {
 			tb.Fatalf("%s carries no encryptions, so there is no published message to open", vector.name)
 		}
 		first := vector.Encryptions[0]
-		messages = append(messages, hpkeFuzzMessage{
-			params:     suiteForHpkeVector(tb, vector),
-			skEm:       decodeVectorField(tb, vector.name, "skEm", vector.SkEm),
-			pkRm:       decodeVectorField(tb, vector.name, "pkRm", vector.PkRm),
-			kemOutput:  decodeVectorField(tb, vector.name, "enc", vector.Enc),
-			info:       decodePossiblyEmptyVectorField(tb, vector.name, "info", vector.Info),
-			aad:        decodePossiblyEmptyVectorField(tb, vector.name, "encryptions[0].aad", first.Aad),
-			ciphertext: decodeVectorField(tb, vector.name, "encryptions[0].ct", first.Ct),
-			plaintext:  decodeVectorField(tb, vector.name, "encryptions[0].pt", first.Pt),
-		})
+		params := suiteForHpkeVector(tb, vector)
+		skEm := decodeVectorField(tb, vector.name, "skEm", vector.SkEm)
+		pkRm := decodeVectorField(tb, vector.name, "pkRm", vector.PkRm)
+		published := hpkeFuzzSealed{
+			name:        "the published single shot message for " + params.Name,
+			suite:       index,
+			params:      params,
+			kemOutput:   decodeVectorField(tb, vector.name, "enc", vector.Enc),
+			info:        decodePossiblyEmptyVectorField(tb, vector.name, "info", vector.Info),
+			aad:         decodePossiblyEmptyVectorField(tb, vector.name, "encryptions[0].aad", first.Aad),
+			ciphertext:  decodeVectorField(tb, vector.name, "encryptions[0].ct", first.Ct),
+			plaintext:   decodeVectorField(tb, vector.name, "encryptions[0].pt", first.Pt),
+			isPublished: true,
+		}
+		sealed = append(sealed, published)
+
+		plaintexts := []hpkeFuzzValueClass{
+			{name: "the published plaintext", bytes: published.plaintext},
+			{name: "an empty plaintext", bytes: nil},
+			{name: "an over long plaintext", bytes: hpkeFuzzOverlongPlaintext},
+		}
+		infos := []hpkeFuzzValueClass{
+			{name: "no info", bytes: nil},
+			{name: "the published info", bytes: published.info},
+			{name: "an over long info", bytes: hpkeFuzzOverlongInfo},
+		}
+		aads := []hpkeFuzzValueClass{
+			{name: "no aad", bytes: nil},
+			{name: "the published aad", bytes: published.aad},
+			{name: "an over long aad", bytes: hpkeFuzzOverlongAad},
+		}
+		bindings := []hpkeFuzzBindingClass{}
+		for _, info := range infos {
+			for _, aad := range aads {
+				bindings = append(bindings, hpkeFuzzBindingClass{
+					name: info.name + " and " + aad.name,
+					info: info.bytes,
+					aad:  aad.bytes,
+				})
+			}
+		}
+
+		for _, plaintext := range plaintexts {
+			for _, binding := range bindings {
+				kemOutput, ciphertext, err := HpkeSealBase(
+					bytes.NewReader(skEm), params, HpkePublicKey(pkRm), binding.info, binding.aad, plaintext.bytes)
+				if err != nil {
+					tb.Fatalf("sealing %s under %s for %s: %v", plaintext.name, binding.name, params.Name, err)
+				}
+				if !bytes.Equal(kemOutput, published.kemOutput) {
+					tb.Fatalf("sealing %s under %s for %s encapsulated %x, want the published %x: the fixed reader was not the ephemeral key",
+						plaintext.name, binding.name, params.Name, kemOutput, published.kemOutput)
+				}
+				if bytes.Equal(plaintext.bytes, published.plaintext) &&
+					bytes.Equal(binding.info, published.info) && bytes.Equal(binding.aad, published.aad) &&
+					!bytes.Equal(ciphertext, published.ciphertext) {
+					tb.Fatalf("sealing the published plaintext under the published info and aad for %s produced %x, want the published %x",
+						params.Name, ciphertext, published.ciphertext)
+				}
+				sealed = append(sealed, hpkeFuzzSealed{
+					name:       fmt.Sprintf("%s sealed by this package under %s for %s", plaintext.name, binding.name, params.Name),
+					suite:      index,
+					params:     params,
+					kemOutput:  kemOutput,
+					info:       binding.info,
+					aad:        binding.aad,
+					ciphertext: ciphertext,
+					plaintext:  plaintext.bytes,
+				})
+			}
+		}
 	}
-	return messages
+	if len(sealed) == 0 {
+		tb.Fatalf("the vector corpus yielded no message, so every case below would be about nothing")
+	}
+	return sealed
 }
 
-// The whole open corpus: per suite, the published message, the same message resealed over
-// an empty plaintext, the cross product of every field with every alteration, and an input
-// with nothing in any field; then, for each malformed recipient key, the published message
-// and the published message with a kem output one byte short, which is the pair that pins
-// which of the two length gates answers first.
+// The whole open corpus: every message of the basis, the cross product of its four wire
+// fields with every alteration, an input with nothing in any field; then, for each
+// recipient key that is wrong for its suite, the published message and the published
+// message with a kem output one byte short, which is the pair that pins which of the two
+// length gates answers first.
 //
-// The empty plaintext message is this package's own seal and is labelled so: it is not a
-// known answer and nothing about its bytes is asserted. It is here because a zero length
-// plaintext is the input that separates a successful open from a refusal in the one place
-// the two look alike — both hand back a nil slice — and because no published vector seals
-// an empty message. It is sealed from the vector's own ephemeral private key rather than
-// from a random reader, so the corpus is the same bytes on every run and a crasher found
-// against it is reproducible.
-func hpkeFuzzOpenCases(tb testing.TB, recipients []hpkeFuzzRecipient, messages []hpkeFuzzMessage) []hpkeFuzzOpenCase {
+// An alteration that left a field equal to what it was is dropped rather than recorded.
+// The basis seals under an absent info and an absent aad, and emptying or truncating an
+// already empty field produces the message itself — which has to open, and which would
+// then be sitting in the corpus with a refusal written beside it.
+func hpkeFuzzOpenCases(tb testing.TB, recipients []hpkeFuzzRecipient, messages []hpkeFuzzSealed) []hpkeFuzzOpenCase {
 	tb.Helper()
 	fields := []struct {
 		name             string
@@ -328,10 +535,11 @@ func hpkeFuzzOpenCases(tb testing.TB, recipients []hpkeFuzzRecipient, messages [
 	}
 
 	cases := []hpkeFuzzOpenCase{}
-	for index, message := range messages {
-		published := hpkeFuzzOpenCase{
-			name:          "the published single shot message for " + message.params.Name,
-			recipient:     index,
+	suitesSeen := map[int]bool{}
+	for _, message := range messages {
+		whole := hpkeFuzzOpenCase{
+			name:          message.name,
+			recipient:     message.suite,
 			kemOutput:     message.kemOutput,
 			info:          message.info,
 			aad:           message.aad,
@@ -339,45 +547,32 @@ func hpkeFuzzOpenCases(tb testing.TB, recipients []hpkeFuzzRecipient, messages [
 			wantOpen:      true,
 			wantPlaintext: message.plaintext,
 		}
-		cases = append(cases, published)
-
-		emptyKemOutput, emptyCiphertext, err := HpkeSealBase(
-			bytes.NewReader(message.skEm), message.params, HpkePublicKey(message.pkRm), message.info, message.aad, nil)
-		if err != nil {
-			tb.Fatalf("sealing an empty plaintext for %s: %v", message.params.Name, err)
-		}
-		if !bytes.Equal(emptyKemOutput, message.kemOutput) {
-			tb.Fatalf("sealing an empty plaintext for %s encapsulated %x, want the published %x: the fixed reader was not the ephemeral key",
-				message.params.Name, emptyKemOutput, message.kemOutput)
-		}
-		cases = append(cases, hpkeFuzzOpenCase{
-			name:          "an empty plaintext sealed by this package for " + message.params.Name,
-			recipient:     index,
-			kemOutput:     emptyKemOutput,
-			info:          message.info,
-			aad:           message.aad,
-			ciphertext:    emptyCiphertext,
-			wantOpen:      true,
-			wantPlaintext: nil,
-		})
+		cases = append(cases, whole)
 
 		for _, field := range fields {
 			for _, alteration := range hpkeFuzzAlterations() {
-				altered := published
-				altered.name = fmt.Sprintf("%s, %s %s", message.params.Name, field.name, alteration.name)
+				value := alteration.apply(field.get(whole))
+				if bytes.Equal(value, field.get(whole)) {
+					continue
+				}
+				altered := whole
+				altered.name = fmt.Sprintf("%s, %s %s", message.name, field.name, alteration.name)
 				altered.wantOpen = false
 				altered.wantPlaintext = nil
 				altered.wantErr = hpkeFuzzAlteredOutcome(field.suiteFixesLength, alteration)
-				field.set(&altered, alteration.apply(field.get(published)))
+				field.set(&altered, value)
 				cases = append(cases, altered)
 			}
 		}
 
-		cases = append(cases, hpkeFuzzOpenCase{
-			name:      "every field empty for " + message.params.Name,
-			recipient: index,
-			wantErr:   ErrBadKemOutput,
-		})
+		if !suitesSeen[message.suite] {
+			suitesSeen[message.suite] = true
+			cases = append(cases, hpkeFuzzOpenCase{
+				name:      "every field empty for " + message.params.Name,
+				recipient: message.suite,
+				wantErr:   ErrBadKemOutput,
+			})
+		}
 	}
 
 	for index, recipient := range recipients {
@@ -446,7 +641,8 @@ func hpkeFuzzIsTypedRefusal(err error) bool {
 	return false
 }
 
-// Whether this process was asked to search, rather than to run the seed corpus.
+// Whether this process was asked to search the named target, rather than to run its seed
+// corpus.
 //
 // The reachability accounting below is a statement about a seed run and only a seed run.
 // Under -fuzz the body executes in worker processes that are handed whatever the
@@ -455,19 +651,56 @@ func hpkeFuzzIsTypedRefusal(err error) bool {
 // reachability at the end of every successful search. Measured on go1.26.5: the
 // coordinator's own cleanup sees zero inputs after two and a half million executions
 // across its workers.
-func hpkeFuzzSearchRequested() bool {
+//
+// The target's own name is what this is keyed on, because -fuzz names one target and the
+// three here are accounted for separately. Reading the flag as a process wide yes or no
+// would let a search of any one of them report success for the other two over a corpus
+// that had stopped reaching the code under test — and a workflow that runs -fuzz once per
+// target, which is the shape p1's syntax workflow already has, would do exactly that.
+//
+// The pattern is matched the way testing matches it: split on "/" and the first element
+// treated as an unanchored regexp over the top level name. A pattern that will not compile
+// is a failure the test binary reports on its own, and reporting a reachability failure
+// beside it would only bury it, so it is read as a search.
+func hpkeFuzzSearchRequested(target string) bool {
 	requested := flag.Lookup("test.fuzz")
-	return requested != nil && requested.Value.String() != ""
+	if requested == nil || requested.Value.String() == "" {
+		return false
+	}
+	pattern, _, _ := strings.Cut(requested.Value.String(), "/")
+	matched, err := regexp.MatchString(pattern, target)
+	if err != nil {
+		return true
+	}
+	return matched
+}
+
+// Whether -run narrowed a target's corpus to part of itself.
+//
+// testing splits -run on "/" and applies the elements past the first to subtests, and every
+// seed of a fuzz target is a subtest. So a pattern with a second element runs some seeds
+// and not others, and the accounting below — which is a statement about the corpus as a
+// whole — has nothing to say about what that run reached. Reporting five failures about
+// the filter alongside the one real failure lands the cost on exactly the loop a developer
+// reaches for when one seed fails.
+//
+// A pattern with a single element either selects a target whole or does not run it at all,
+// and leaves the accounting live. That is what keeps continuous integration covered:
+// test.yml passes no -run.
+func hpkeFuzzCorpusNarrowed() bool {
+	requested := flag.Lookup("test.run")
+	return requested != nil && strings.Contains(requested.Value.String(), "/")
 }
 
 // FuzzHpkeOpenBase drives the whole receiving half — decapsulation, key schedule and aead
 // open — from bytes a peer chose, and holds it to the four claims in this file's comment.
 //
 // The seed corpus is the coverage under continuous integration, so it is generated rather
-// than listed: the published message of each registered suite, that message resealed
-// empty, the cross product of its four wire fields with eight alterations, an input with
-// nothing in it, and the malformed recipient rows. Every one of them carries the outcome
-// it must produce, so the seed run is a table of known answers and not a panic watch.
+// than listed: for each registered suite the published message and this package's own seal
+// of every plaintext class under every info and aad pairing, each crossed with its four
+// wire fields and eight alterations, an input with nothing in it, and the wrong recipient
+// key rows. Every one of them carries the outcome it must produce, so the seed run is a
+// table of known answers and not a panic watch.
 //
 // The counters are what stop this from passing while proving nothing. An open that never
 // succeeds has evaluated no part of the success claim, and an open that never reaches the
@@ -477,21 +710,33 @@ func hpkeFuzzSearchRequested() bool {
 // of the two counts for that reason, which is why the count that matters is the number of
 // messages that actually opened to their published plaintext.
 //
-// Narrowing -run to a single seed trips those counters. That is intended rather than an
-// accident: a run of one seed has not evaluated the corpus, and a target reporting success
-// for it would be reporting success for a run that proved nothing.
+// Narrowing -run below the target's own name skips the accounting rather than tripping it.
+// A run of one seed has not evaluated the corpus and cannot answer what the corpus
+// reached, and answering anyway would put five failures about the filter alongside the one
+// failure the developer narrowed the run to read.
 func FuzzHpkeOpenBase(f *testing.F) {
 	vectors := loadHpkeVectors(f)
-	messages := hpkeFuzzMessages(f, vectors)
+	messages := hpkeFuzzSealedMessages(f, vectors)
 	recipients := hpkeFuzzRecipients(f, vectors)
 	cases := hpkeFuzzOpenCases(f, recipients, messages)
 
+	// two alterations of two different messages can meet on one input — emptying the
+	// ciphertext of any two messages sealed under the same info and aad spells the same
+	// bytes, and this package's own seal of the published plaintext under the published
+	// pairing is the published message — and such a pair is seeded once and named after the
+	// first of them. What is still fatal is the two of them disagreeing about the outcome,
+	// because then one of the two expectations can never be reached and the corpus is
+	// asserting both.
 	expected := map[string]hpkeFuzzOpenCase{}
 	for _, one := range cases {
 		key := hpkeFuzzOpenKey(one.recipient, one.kemOutput, one.info, one.aad, one.ciphertext)
 		if previous, ok := expected[key]; ok {
-			f.Fatalf("%q and %q are the same input, so one of their two expectations can never be reached",
-				previous.name, one.name)
+			if previous.wantOpen != one.wantOpen || previous.wantErr != one.wantErr ||
+				!bytes.Equal(previous.wantPlaintext, one.wantPlaintext) {
+				f.Fatalf("%q and %q are the same input and disagree about what it produces",
+					previous.name, one.name)
+			}
+			continue
 		}
 		expected[key] = one
 		f.Add(uint8(one.recipient), one.kemOutput, one.info, one.aad, one.ciphertext)
@@ -503,12 +748,15 @@ func FuzzHpkeOpenBase(f *testing.F) {
 	// only under -fuzz — which is to say, never in continuous integration. These are the
 	// rows that keep it live: what holds them is the rule that an input the corpus never
 	// recorded must not open, and nothing else.
-	for index, message := range messages {
-		for other := range messages {
-			if other == index {
+	for _, message := range messages {
+		if !message.isPublished {
+			continue
+		}
+		for _, other := range messages {
+			if !other.isPublished || other.suite == message.suite {
 				continue
 			}
-			f.Add(uint8(other), message.kemOutput, message.info, message.aad, message.ciphertext)
+			f.Add(uint8(other.suite), message.kemOutput, message.info, message.aad, message.ciphertext)
 		}
 	}
 
@@ -520,7 +768,7 @@ func FuzzHpkeOpenBase(f *testing.F) {
 	refusedAtTheCurve := 0
 
 	f.Cleanup(func() {
-		if hpkeFuzzSearchRequested() {
+		if hpkeFuzzSearchRequested(f.Name()) || hpkeFuzzCorpusNarrowed() {
 			return
 		}
 		if inputs == 0 {
@@ -625,10 +873,15 @@ func FuzzHpkeOpenBase(f *testing.F) {
 // together: the equality catches a derivation that reads the aead, the known answers catch
 // one that is wrong the same way under both.
 //
-// The negative direction is asserted too. An ikm that is not the published one must not
-// produce the published key pair, which is what fails on a derivation that ignores its
-// input and returns a constant — a derivation that would satisfy every length check, every
-// determinism check and the cross suite equality at once.
+// The negative direction is asserted twice, and the second of the two is the one with
+// teeth. An ikm that is not the published one must not produce the published key pair,
+// which is what fails on a derivation that ignores its input and returns a constant — a
+// derivation that would satisfy every length check, every determinism check and the cross
+// suite equality at once. But a derivation that collapsed many ikms onto one key that is
+// not a published one satisfies that too: it is deterministic, it agrees across the suites,
+// its output is the right length, and it reproduces no published key. What denies it is
+// injectivity — two different ikms may not derive one private key — and injectivity is a
+// claim about a pair, so nothing that looks at one input at a time can make it.
 func FuzzHpkeDeriveKeyPair(f *testing.F) {
 	vectors := loadHpkeVectors(f)
 	suites := Suites()
@@ -653,29 +906,48 @@ func FuzzHpkeDeriveKeyPair(f *testing.F) {
 	// because several of them collapse onto one another on a single field: emptying a
 	// vector and truncating a one byte one are the same seed, and adding it twice would
 	// only run it twice.
+	//
+	// They are applied to what they produced as well as to the published ikm, which is
+	// what an injectivity claim needs and what one round could not give it. One round
+	// yields near misses of a published ikm and no two of them are alike past a length
+	// band; a second round yields the pairs — two ikms over eight thousand bytes, two that
+	// share a prefix and differ after it — that a derivation dropping part of its input
+	// maps onto one key. Depth is a constant here rather than a search: each round
+	// multiplies the corpus by the alteration count before the deduplication takes it back
+	// down, and two rounds is where every length band the alterations name is occupied
+	// twice.
 	seeded := map[string]bool{}
+	frontier := [][]byte{}
 	add := func(ikm []byte) {
 		if seeded[string(ikm)] {
 			return
 		}
 		seeded[string(ikm)] = true
+		frontier = append(frontier, ikm)
 		f.Add(ikm)
 	}
 	for _, pair := range published {
 		add(pair.ikm)
-		for _, alteration := range hpkeFuzzAlterations() {
-			add(alteration.apply(pair.ikm))
-		}
 	}
 	add(nil)
 	add([]byte{0x00})
 	add(bytes.Repeat([]byte{0xff}, 32))
+	for round := 0; round < hpkeFuzzAlterationRounds; round++ {
+		current := frontier
+		frontier = nil
+		for _, ikm := range current {
+			for _, alteration := range hpkeFuzzAlterations() {
+				add(alteration.apply(ikm))
+			}
+		}
+	}
 
 	inputs := 0
 	matched := make([]int, len(published))
+	derivations := map[string][]byte{}
 
 	f.Cleanup(func() {
-		if hpkeFuzzSearchRequested() {
+		if hpkeFuzzSearchRequested(f.Name()) || hpkeFuzzCorpusNarrowed() {
 			return
 		}
 		if inputs == 0 {
@@ -719,6 +991,15 @@ func FuzzHpkeDeriveKeyPair(f *testing.F) {
 				t.Fatalf("%s derived a different key pair from the same ikm as %s, and the two share a kem, so the derivation is reading the aead",
 					params.Name, mustSuiteName(t, suites[0]))
 			}
+		}
+
+		if previous, ok := derivations[string(priv)]; ok {
+			if !bytes.Equal(previous, ikm) {
+				t.Fatalf("a %d byte ikm and a %d byte ikm both derived %x, so the derivation is not reading the whole of its input",
+					len(previous), len(ikm), priv)
+			}
+		} else if len(derivations) < hpkeFuzzDerivationsTracked {
+			derivations[string(priv)] = bytes.Clone(ikm)
 		}
 
 		for index, pair := range published {
@@ -783,6 +1064,23 @@ func hpkeFuzzExportKey(length int, exporterContext []byte) string {
 // length check. A guard that refused everything would satisfy every refusal in this target
 // and is caught by the published rows; a guard that refused nothing panics on the first
 // negative length.
+//
+// What the published rows cannot say is that the exporter reads the whole of its context.
+// Every context RFC 9180 prints here is eleven bytes or shorter, so an exporter that
+// stopped reading past some larger length reproduces all three published values and is
+// refused by nothing. The corpus therefore carries the same alteration closure the derive
+// target does — contexts at every length class, twice over, so that each band holds a pair
+// — and the claim over them is that two different contexts do not export the same value at
+// the same length.
+//
+// That claim holds only where the value is wide enough for a collision to be a statement
+// about the exporter. A one byte export takes 256 values, so two contexts landing on one
+// of them is the pigeonhole and not a defect — a search finds such a pair in seconds, and
+// it did: the first bounded -fuzz run of this target produced a one byte export of two
+// different contexts and reported it as a failure of the implementation. Below
+// hpkeFuzzExportCollisionWidth the exported value is compared against nothing, which costs
+// the claim nothing, since every published export and every context of the closure is
+// seeded at thirty two bytes.
 func FuzzHpkeContextExport(f *testing.F) {
 	vectors := loadHpkeVectors(f)
 	contexts := []hpkeFuzzExportContext{}
@@ -797,11 +1095,37 @@ func FuzzHpkeContextExport(f *testing.F) {
 			info:         decodePossiblyEmptyVectorField(f, vector.name, "info", vector.Info),
 			published:    map[string][]byte{},
 		}
+		seeded := map[string]bool{}
+		frontier := [][]byte{}
+		lengths := []int{}
+		add := func(exporterContext []byte) {
+			if seeded[string(exporterContext)] {
+				return
+			}
+			seeded[string(exporterContext)] = true
+			frontier = append(frontier, exporterContext)
+			for _, length := range lengths {
+				f.Add(uint8(len(contexts)), length, exporterContext)
+			}
+		}
 		for _, export := range vector.Exports {
 			exporterContext := decodePossiblyEmptyVectorField(f, vector.name, "exports.exporter_context", export.ExporterContext)
 			entry.published[hpkeFuzzExportKey(export.Length, exporterContext)] =
 				decodeVectorField(f, vector.name, "exports.exported_value", export.ExportedValue)
 			f.Add(uint8(len(contexts)), export.Length, exporterContext)
+			lengths = append(lengths, export.Length)
+			seeded[string(exporterContext)] = true
+			frontier = append(frontier, exporterContext)
+		}
+		add([]byte("exporter context"))
+		for round := 0; round < hpkeFuzzAlterationRounds; round++ {
+			current := frontier
+			frontier = nil
+			for _, exporterContext := range current {
+				for _, alteration := range hpkeFuzzAlterations() {
+					add(alteration.apply(exporterContext))
+				}
+			}
 		}
 		// the boundaries the guard is written for: below zero, at zero, at the ceiling,
 		// one past it, and the two extremes an int holds. hkdf.Expand dies rather than
@@ -818,9 +1142,10 @@ func FuzzHpkeContextExport(f *testing.F) {
 	refused := 0
 	produced := 0
 	matched := make([]int, len(contexts))
+	exported := map[string][]byte{}
 
 	f.Cleanup(func() {
-		if hpkeFuzzSearchRequested() {
+		if hpkeFuzzSearchRequested(f.Name()) || hpkeFuzzCorpusNarrowed() {
 			return
 		}
 		if inputs == 0 {
@@ -868,6 +1193,17 @@ func FuzzHpkeContextExport(f *testing.F) {
 		}
 		if ctx.sequence != 0 {
 			t.Fatalf("%s: an export moved the sequence number to %d, so exporting costs a message", entry.name, ctx.sequence)
+		}
+		if err == nil && length >= hpkeFuzzExportCollisionWidth {
+			collision := fmt.Sprintf("%d|%d|%x", index, length, value)
+			if previous, ok := exported[collision]; ok {
+				if !bytes.Equal(previous, exporterContext) {
+					t.Fatalf("%s: a %d byte exporter context and a %d byte one both exported %x at %d bytes, so the exporter is not reading the whole of its context",
+						entry.name, len(previous), len(exporterContext), value, length)
+				}
+			} else if len(exported) < hpkeFuzzDerivationsTracked {
+				exported[collision] = bytes.Clone(exporterContext)
+			}
 		}
 		if want, ok := entry.published[hpkeFuzzExportKey(length, exporterContext)]; ok {
 			if !bytes.Equal(value, want) {
