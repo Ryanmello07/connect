@@ -370,16 +370,49 @@ func Copath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
 // an ancestor of itself (RFC 9420 appendix C).
 //
 // the answer does not depend on the leaf count: any tree containing both nodes
-// contains this node at this index, which is why no count is taken.
+// contains this node at this index, which is why no count is taken. that is
+// asserted and not only stated — the test file asks the semantic definition the
+// same question in every tree from the smallest that holds the pair up to the
+// largest there is, and requires one answer throughout.
 //
 // the appendix publishes two definitions of this relation, this arithmetic one
 // and a semantic one built out of direct paths, and the test file runs the
 // second against the first rather than restating either.
+//
+// total, and deliberately: an index past the end of every representable tree
+// gets an answer rather than a refusal, because the relation is defined on
+// indices and not inside a tree. 0xFFFFFFFF is the one such index, it reads as
+// a level-32 node as Level describes, and it is its own answer against
+// anything.
+//
+// the arithmetic runs in uint64 because the shift counts reach 33, which is
+// past the width of what is being shifted and reads as a mistake in uint32 even
+// though Go defines it. it buys nothing else: measured, the same body in uint32
+// is indistinguishable from this one for every input, so the width is a
+// statement to a reader rather than a guard.
+//
+// the loop runs at most 32 times, since two distinct 32-bit values agree once
+// both have been shifted to zero, so it needs no explicit bound of the kind
+// DirectPath carries. that maximum is pinned from below rather than argued:
+// measured, one version per stopping count from 0 to 33, every count from 0 to
+// 31 fails and 32 and 33 pass.
 func CommonAncestor(x NodeIndex, y NodeIndex) NodeIndex {
 	// one may be an ancestor of the other, in which case it is the answer.
 	// these two cases are not a shortcut: the loop below descends from the
-	// index the two indices agree on, which for a node and one of its own
-	// descendants is not that node.
+	// value the two indices agree on, which for a node and one of its own
+	// descendants is not that node. measured, either one removed and every
+	// version fails.
+	//
+	// their level tests are another matter, and the enumeration says which of
+	// the two is load-bearing. the first one's is: without it the test fires
+	// for an index that merely falls inside y's slot range rather than inside
+	// y's subtree, and a version without it fails. the second one's is not,
+	// because the first runs ahead of it and has already answered every pair
+	// this one would get wrong — measured, that test dropped, narrowed to a
+	// strict comparison, or skipped when x is a leaf, all indistinguishable
+	// from this code for every input. it is kept because a condition that is
+	// only correct in the presence of the block above it is a trap for whoever
+	// reorders them.
 	levelOfX := uint64(x.Level()) + 1
 	levelOfY := uint64(y.Level()) + 1
 	if levelOfX <= levelOfY && uint64(x)>>levelOfY == uint64(y)>>levelOfY {

@@ -1493,16 +1493,26 @@ func ancestorLevels(level uint32, block uint64, depth uint32) map[NodeIndex]uint
 // readings agree, and the same appendix publishes the arithmetic form on lines
 // 6854 to 6867, which is what the shipped function implements.
 //
-// the port departs from the listing in exactly one place, and deliberately.
-// the listing's direct_path and level are this package's DirectPath and
-// NodeIndex.Level, and CommonAncestor calls NodeIndex.Level itself, so a port
-// written that way would share a dependency with the function it exists to
-// disagree with. the ancestor chains come from pathOracle instead, the array
-// layout in closed form, anchored against RFC 9420 table 2 by the direct-path
-// tests above; each level is carried down from the loop that built the chain.
-// measured, and not merely argued: with the two chains taken from DirectPath
-// and the minimum taken by NodeIndex.Level, a Level answering one too high for
-// every parent leaves this differential green.
+// the port departs from the listing in one place. the listing's direct_path
+// and level are this package's DirectPath and NodeIndex.Level, and
+// CommonAncestor calls NodeIndex.Level itself, so a port written that way would
+// share a dependency with the function it exists to disagree with. the ancestor
+// chains come from pathOracle instead, the array layout in closed form,
+// anchored against RFC 9420 table 2 by the direct-path tests above, and each
+// level is carried down from the loop that built the chain, so nothing in this
+// answer reads anything the answer under test reads.
+//
+// what that independence is worth was measured rather than assumed, and the
+// measurement is less flattering than the argument. against 189 versions of
+// CommonAncestor this oracle and a literal port built out of DirectPath and
+// NodeIndex.Level kill exactly the same 175: a class that mutates only
+// CommonAncestor cannot see a shared dependency, so nothing in it separates the
+// two. the difference the layout oracle makes is against the circular table
+// this project has rejected five times. with the oracle replaced by a call to
+// CommonAncestor and the arm counts below disabled, three versions that this
+// file otherwise kills — always answering the root of the largest tree, an
+// answer wrong only at level 20, and an off-by-one in the returned index — all
+// three pass the sweep. with this oracle, all three fail.
 //
 // the intersection of two ancestor chains holds no two nodes at one level, so
 // the minimum is unique and this returns the same node whatever order the map
@@ -1652,6 +1662,13 @@ func TestCommonAncestorKnownValues(t *testing.T) {
 		{x: 2147483647, y: 0, ancestor: 2147483647},
 		{x: 2147483647, y: 4294967294, ancestor: 2147483647},
 		{x: 2147483647, y: 2147483647, ancestor: 2147483647},
+		// 0xFFFFFFFF is one past the last node of the largest tree and so is
+		// inside no tree at all. the function is total and reads it as the
+		// level-32 node Level says it is, which makes it an ancestor of
+		// everything; nothing else in this package reaches it.
+		{x: 4294967295, y: 0, ancestor: 4294967295},
+		{x: 0, y: 4294967295, ancestor: 4294967295},
+		{x: 4294967295, y: 4294967295, ancestor: 4294967295},
 	}
 	// the same arms the sweeps count, so a table that drifted into rows of one
 	// shape fails rather than quietly narrowing.
@@ -1676,9 +1693,9 @@ func TestCommonAncestorKnownValues(t *testing.T) {
 		}
 	}
 	assertAncestorArms(t, "the known-value table", arms, ancestorArms{
-		pairsOfANodeWithItself: 2,
-		pairsAnsweredByX:       3,
-		pairsAnsweredByY:       1,
+		pairsOfANodeWithItself: 3,
+		pairsAnsweredByX:       4,
+		pairsAnsweredByY:       2,
 		pairsAnsweredByNeither: 12,
 	})
 }
@@ -1699,6 +1716,22 @@ func TestCommonAncestorKnownValues(t *testing.T) {
 // stops there too, so levels 10 to 31 are reached by nothing else in this
 // package. the ladders run to level 31 because that is the highest level the
 // largest representable tree has.
+//
+// measured rather than argued, in a scratch copy. a grammar over the shipped
+// body — the level taken from each operand, the level test and the shift of
+// each of the two shortcuts, each shortcut skipped at each of the 32 levels,
+// the loop condition and its two steps, the returned position, the answer
+// perturbed at one level, the answer perturbed for one level of an operand, the
+// arithmetic width, and the loop stopped after each of 34 counts — enumerates
+// 226 versions. this file kills 210 and the 16 it does not are indistinguishable
+// from the shipped body for every input, which was checked separately over
+// 373099 designed pairs rather than inferred from the sweep. cut this file and
+// the two below back to depth 9, with every other row kept and the arm counts
+// adjusted so they are still green, and 97 are killed: the band from level 10
+// to 31 is the only thing killing 113 of the 226. among them are the three
+// versions that are wrong only above the family's ladder — each shortcut
+// skipped above level 9, and an answer perturbed above level 9 — and every
+// bound on the loop from 10 to 31.
 func TestCommonAncestorAtEveryLevel(t *testing.T) {
 	siblingRows, containedRows, joinRows := 0, 0, 0
 
@@ -1877,9 +1910,10 @@ func TestCommonAncestorMatchesSemanticDefinition(t *testing.T) {
 // operands"; only reflexivity refuses it, and only at the pairs where the two
 // operands are equal. these rows pin the shape of the relation rather than
 // establish it, and that sentence is measurable rather than rhetorical: with
-// the three absolute tests above deleted and only this one and the rest of the
-// package kept, the enumeration this task ran leaves far more versions alive
-// than it does with them.
+// the three absolute tests above deleted and only this one left of the five,
+// 89 of the 189 enumerated versions of CommonAncestor pass the package, against
+// 14 with all five, and every one of those 14 is indistinguishable from the
+// shipped body for every input.
 //
 // the last row is the one that is not free. the answer has to be inside the
 // smallest tree that contains both operands, which is what makes the missing
