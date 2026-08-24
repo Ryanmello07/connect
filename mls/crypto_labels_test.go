@@ -1,4 +1,4 @@
-// The RFC 9420 section 5.1 labelled kdf, held to published bytes.
+// The RFC 9420 section 5.1 and 5.2 labelled constructions, held to published bytes.
 //
 // Every mistake this file exists to catch produces a well formed output of exactly the
 // right length. Dropping the "MLS 1.0 " prefix, altering it, omitting the uint16 length,
@@ -9,13 +9,14 @@
 // distinguishes them, so the load bearing tests here are the ones that compare against
 // bytes this project did not compute.
 //
-// Three vendored corpora carry that weight, and each of them is the only source for
+// Five vendored corpora carry that weight, and each of them is the only source for
 // something. The digests of all three are pinned by TestVectorFilesArePinned in
 // vectors_pin_test.go, so vendored here means the bytes that manifest names.
 //
 //   - crypto-basics.json is the direct one: one published answer each for
-//     ExpandWithLabel, DeriveSecret and DeriveTreeSecret, per suite. It is the only
-//     corpus that names the three functions of this file.
+//     ExpandWithLabel, DeriveSecret, DeriveTreeSecret and RefHash, per suite. It is the
+//     only corpus that names the constructions of this file, and its RefHash entry is
+//     the only published pin on the RefHashInput encoding.
 //   - secret-tree.json is the only published pin on the generation's byte order. Every
 //     derive_tree_secret vector in crypto-basics uses generation 0xa0a0a0a0, which is its
 //     own reversal, so that corpus cannot tell a big endian uint32 from a little endian
@@ -24,6 +25,21 @@
 //   - key-schedule.json is the only published context longer than 63 bytes. Its group
 //     context is 112 bytes, so a hand rolled one byte length prefix in place of
 //     WriteOpaque agrees with every other vector here and disagrees there.
+//   - welcome.json is the only published pin on the key package reference label. The
+//     new_member field of an EncryptedGroupSecrets is MakeKeyPackageRef over the
+//     KeyPackage the Welcome is addressed to, so the corpus carries a reference somebody
+//     else computed. Its key packages are hundreds of bytes, which also makes it the
+//     only published RefHash value past the one byte length prefix.
+//   - passive-client-handling-commit.json is the same for the proposal reference label:
+//     its commits reference proposals it also publishes, so MakeProposalRef over the
+//     AuthenticatedContent that framed one must land in the commit bytes.
+//
+// Those last two are what make the two reference labels non circular. Comparing a
+// constant against a string literal in the same tree, which is all
+// TestRefLabelsAreTheRfcStrings can do, cannot tell a correct label from one this
+// project misspelled the same way twice — and a misspelled label still produces 32
+// bytes, still separates the two reference kinds, still round trips, and interoperates
+// with no peer alive.
 //
 // The counts are asserted rather than assumed. A loader that filtered every entry away
 // reports exactly what a clean run reports, so each vector test counts the comparisons it
@@ -57,12 +73,13 @@ import (
 )
 
 // One crypto-basics entry, reduced to the three constructions this file owns. The other
-// fields of the published object belong to tasks 13 and 14 and are not read here.
+// fields of the published object belong to task 14 and are not read here.
 type labelKatBasics struct {
 	CipherSuite      uint16                   `json:"cipher_suite"`
 	ExpandWithLabel  labelKatExpandWithLabel  `json:"expand_with_label"`
 	DeriveSecret     labelKatDeriveSecret     `json:"derive_secret"`
 	DeriveTreeSecret labelKatDeriveTreeSecret `json:"derive_tree_secret"`
+	RefHash          labelKatRefHash          `json:"ref_hash"`
 }
 
 // An ExpandWithLabel known answer: every argument, and the bytes it must produce.
@@ -88,6 +105,17 @@ type labelKatDeriveTreeSecret struct {
 	Generation uint32 `json:"generation"`
 	Length     int    `json:"length"`
 	Out        string `json:"out"`
+}
+
+// A RefHash known answer. The published label is the bare string "RefHash" with no
+// "MLS 1.0 " prefix, which is what says RefHash must not add one: its callers carry
+// theirs. The value is 32 bytes, inside the one byte length prefix, so this entry pins
+// which bytes are hashed but not how a longer field is framed. welcome.json is what does
+// that.
+type labelKatRefHash struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
+	Out   string `json:"out"`
 }
 
 // One secret-tree entry. Only the single leaf entries are used, where the whole secret
@@ -157,6 +185,40 @@ type labelKatExporter struct {
 	Secret  string `json:"secret"`
 }
 
+// One welcome entry, reduced to the joiner's key package and the Welcome addressed to
+// it. Both are published as serialized MLSMessages.
+type labelKatWelcome struct {
+	CipherSuite uint16 `json:"cipher_suite"`
+	KeyPackage  string `json:"key_package"`
+	Welcome     string `json:"welcome"`
+}
+
+// One passive client transcript, reduced to the epochs whose commits reference proposals.
+type labelKatPassiveClient struct {
+	CipherSuite uint16                 `json:"cipher_suite"`
+	Epochs      []labelKatPassiveEpoch `json:"epochs"`
+}
+
+// One epoch of it: the proposals the client is handed, and the commit that names them.
+type labelKatPassiveEpoch struct {
+	Proposals []string `json:"proposals"`
+	Commit    string   `json:"commit"`
+}
+
+// The four byte MLSMessage header the corpora put ahead of a KeyPackage and ahead of a
+// PublicMessage: protocol version mls10, then the wire format (RFC 9420 section 6).
+// Neither reference is taken over all of these bytes, and both headers are asserted
+// rather than assumed, so a re-vendored corpus that changed shape fails where it changed
+// instead of hashing a header into a reference.
+var (
+	mlsMessageKeyPackageHeader    = []byte{0x00, 0x01, 0x00, 0x05}
+	mlsMessagePublicMessageHeader = []byte{0x00, 0x01, 0x00, 0x01}
+)
+
+// The protocol version field an MLSMessage opens with. It is the only part of that header
+// which is not also part of the AuthenticatedContent a proposal reference is taken over.
+const mlsMessageVersionLength = 2
+
 // A vendored corpus, decoded. A missing or unparsable file is fatal rather than skipped:
 // a corpus that is not there is the same silence as a corpus that agrees with everything.
 func loadLabelKat(t *testing.T, name string, into any) {
@@ -194,6 +256,17 @@ const (
 	labelKatBasicsComparisons     = 6
 	labelKatSecretTreeComparisons = 20
 	labelKatScheduleComparisons   = 120
+)
+
+// The published references each reference corpus must contribute, counted for the same
+// reason. crypto-basics publishes one RefHash answer per suite and two suites are
+// registered; welcome.json publishes one Welcome per suite; the passive client corpus
+// publishes thirteen transcripts per suite, one epoch of each references a single
+// proposal, so twelve land per registered suite.
+const (
+	labelKatRefHashComparisons = 2
+	labelKatKeyPackageRefs     = 2
+	labelKatProposalRefs       = 24
 )
 
 // The generation the secret-tree corpus publishes beyond zero. It is a constant here
@@ -333,28 +406,48 @@ func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 		t.Fatalf("mlsLabelBytes returned a preimage its writer had already refused")
 	}
 	// the assertions above build their own writer, so none of them can see which limit
-	// the label path chose for its own. these run through mlsKdfLabel, at both fields it
-	// writes: a raised limit there accepts a field a compliant reader refuses, and a
-	// lowered one refuses a preimage the protocol requires, and neither moves a byte of
-	// any published answer.
+	// the label path chose for its own. these run through the constructions themselves,
+	// at every field a caller's bytes flow into: a raised limit there accepts a field a
+	// compliant reader refuses, and a lowered one refuses a preimage the protocol
+	// requires, and neither moves a byte of any published answer. it is also where a
+	// hand rolled length prefix stops, since a uint8 written ahead of a raw field agrees
+	// with WriteOpaque below 64 bytes and consults no limit at all.
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	for _, testCase := range []struct {
 		name string
+		room int
 		call func(n int)
 	}{
-		{name: "the context field", call: func(n int) { mlsKdfLabel("label", make([]byte, n), 32) }},
-		{name: "the label field", call: func(n int) { mlsKdfLabel(strings.Repeat("x", n), nil, 32) }},
+		{
+			name: "the kdf label's context field",
+			room: syntax.MaxVectorLength,
+			call: func(n int) { mlsKdfLabel("label", make([]byte, n), 32) },
+		},
+		{
+			// the kdf label carries the "MLS 1.0 " prefix as well, so its own boundary
+			// sits that many bytes below the limit
+			name: "the kdf label's label field",
+			room: syntax.MaxVectorLength - len(MlsLabelPrefix),
+			call: func(n int) { mlsKdfLabel(strings.Repeat("x", n), nil, 32) },
+		},
+		{
+			// RefHash adds nothing to the label it is handed, so both of its fields
+			// reach the whole limit
+			name: "the ref hash label field",
+			room: syntax.MaxVectorLength,
+			call: func(n int) { RefHash(crypto, strings.Repeat("x", n), nil) },
+		},
+		{
+			name: "the ref hash value field",
+			room: syntax.MaxVectorLength,
+			call: func(n int) { RefHash(crypto, "label", make([]byte, n)) },
+		},
 	} {
-		// the label field carries the prefix as well, so its own boundary sits that many
-		// bytes below the limit
-		room := syntax.MaxVectorLength
-		if testCase.name == "the label field" {
-			room -= len(MlsLabelPrefix)
+		if recovered := recoveredPanic(func() { testCase.call(testCase.room) }); recovered != nil {
+			t.Errorf("a labelled construction refused %s at the limit: %v", testCase.name, recovered)
 		}
-		if recovered := recoveredPanic(func() { testCase.call(room) }); recovered != nil {
-			t.Errorf("mlsKdfLabel refused %s at the limit: %v", testCase.name, recovered)
-		}
-		if recovered := recoveredPanic(func() { testCase.call(room + 1) }); recovered == nil {
-			t.Errorf("mlsKdfLabel accepted %s one byte past the limit", testCase.name)
+		if recovered := recoveredPanic(func() { testCase.call(testCase.room + 1) }); recovered == nil {
+			t.Errorf("a labelled construction accepted %s one byte past the limit", testCase.name)
 		}
 	}
 }
@@ -386,6 +479,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 	want := []string{
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
+		"crypto_labels.go: syntax.NewWriter()",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
@@ -410,8 +504,9 @@ func mlsKdfLabel(label string, context []byte, length int) []byte {
 }
 `
 
-// Every preimage is storage of its own. These two are the only functions in this file a
-// caller cannot reach through the provider, so nothing else in the package can see them
+// Every preimage is storage of its own. These two are the only preimage builders in this
+// file a caller cannot reach through the provider, so nothing else in the package can see
+// them
 // answer out of one reused array — and a reused array here is not merely a stale digest:
 // mlsKdfLabel is on the path of every derivation, so two goroutines deriving at once
 // would each expand over the other's preimage. There is no race detector on this machine
@@ -788,5 +883,240 @@ func TestExpandWithLabelMatchesTheKeyScheduleVectors(t *testing.T) {
 	}
 	if longestContext <= 63 {
 		t.Fatalf("the longest published group context is %d bytes, so nothing here reaches the two byte length prefix", longestContext)
+	}
+}
+
+func TestRefHashDoesNotAddTheMlsPrefix(t *testing.T) {
+	// RefHash takes the whole label. MakeKeyPackageRef hands it
+	// "MLS 1.0 KeyPackage Reference" already prefixed, and the crypto-basics vector
+	// hands it the bare string "RefHash" that must not gain one, so adding the prefix
+	// inside RefHash would pass every round trip in this package and fail the vector and
+	// every peer.
+	//
+	// Both halves below build their expected preimage with the same writer RefHash uses,
+	// so this separates a prefixed label from a bare one and nothing else: a dropped or
+	// narrowed length prefix agrees with itself on both sides. The published corpora are
+	// what see that.
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	value := []byte("the value")
+
+	bare := syntax.NewWriter()
+	bare.WriteOpaque([]byte("RefHash"))
+	bare.WriteOpaque(value)
+	input, err := bare.Bytes()
+	if err != nil {
+		t.Fatalf("encode the bare label input: %v", err)
+	}
+	if got, want := RefHash(crypto, "RefHash", value), crypto.Hash(input); !bytes.Equal(got, want) {
+		t.Fatalf("RefHash = %x, want %x", got, want)
+	}
+
+	writer := syntax.NewWriter()
+	writer.WriteOpaque([]byte(MlsLabelPrefix + "RefHash"))
+	writer.WriteOpaque(value)
+	prefixed, err := writer.Bytes()
+	if err != nil {
+		t.Fatalf("encode the prefixed label input: %v", err)
+	}
+	if bytes.Equal(RefHash(crypto, "RefHash", value), crypto.Hash(prefixed)) {
+		t.Fatalf("RefHash added the MLS 1.0 prefix")
+	}
+}
+
+func TestRefLabelsAreTheRfcStrings(t *testing.T) {
+	// RFC 9420 section 5.2 spells both labels out with the prefix already inside them.
+	// This holds the constants to that text, and it is the weakest of the three pins on
+	// them: both sides of each comparison are strings this project typed, so a label
+	// misspelled the same way in crypto_labels.go and here passes. What separates that
+	// reading is TestKeyPackageRefLabelMatchesThePublishedWelcomes and
+	// TestProposalRefLabelMatchesThePublishedCommits, where the digest came from
+	// somebody else's implementation.
+	if KeyPackageRefLabel != "MLS 1.0 KeyPackage Reference" {
+		t.Errorf("KeyPackageRefLabel = %q", KeyPackageRefLabel)
+	}
+	if ProposalRefLabel != "MLS 1.0 Proposal Reference" {
+		t.Errorf("ProposalRefLabel = %q", ProposalRefLabel)
+	}
+	// and they are two labels rather than one written twice, which no comparison of a
+	// reference against itself can see
+	if KeyPackageRefLabel == ProposalRefLabel {
+		t.Errorf("the two reference labels are the same string %q", KeyPackageRefLabel)
+	}
+}
+
+func TestKeyPackageRefAndProposalRefDiffer(t *testing.T) {
+	// the same bytes referenced as a key package and as a proposal must not collide,
+	// which is the entire reason the two labels exist. a maker that shared a label with
+	// the other still returns 32 bytes, still returns them deterministically and still
+	// separates different inputs, so nothing weaker than a comparison of the two makers
+	// over one input can see it.
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	value := bytes.Repeat([]byte{0x13}, 64)
+	keyPackageRef := MakeKeyPackageRef(crypto, value)
+	proposalRef := MakeProposalRef(crypto, value)
+	if bytes.Equal(keyPackageRef, proposalRef) {
+		t.Fatalf("key package and proposal references collide")
+	}
+	if len(keyPackageRef) != crypto.HashSize() || len(proposalRef) != crypto.HashSize() {
+		t.Fatalf("reference sizes are %d/%d, want %d", len(keyPackageRef), len(proposalRef), crypto.HashSize())
+	}
+	// and each maker is its own label rather than the other's, which the inequality above
+	// holds just as well when the two are swapped
+	if !bytes.Equal(keyPackageRef, RefHash(crypto, KeyPackageRefLabel, value)) {
+		t.Fatalf("MakeKeyPackageRef is not RefHash with the key package label")
+	}
+	if !bytes.Equal(proposalRef, RefHash(crypto, ProposalRefLabel, value)) {
+		t.Fatalf("MakeProposalRef is not RefHash with the proposal label")
+	}
+}
+
+func TestRefHashMatchesTheCryptoBasicsVectors(t *testing.T) {
+	// the published RefHashInput encoding. every assertion above builds its expected
+	// preimage with the writer under test, so a dropped label length, a dropped value
+	// length or a transposition of the two fields agrees with all of them; these are the
+	// bytes this project did not compute.
+	vectors := []labelKatBasics{}
+	loadLabelKat(t, "crypto-basics.json", &vectors)
+	compared := 0
+	for _, vector := range vectors {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		refHash := vector.RefHash
+		assertLabelKat(t, fmt.Sprintf("ref_hash suite %#04x", uint16(suite)),
+			RefHash(crypto, refHash.Label, mustDecodeHex(t, "value", refHash.Value)),
+			refHash.Out)
+		// the corpus publishes the bare label, which is the other half of why RefHash
+		// must not add the prefix: if upstream ever republished a prefixed one, the
+		// comparison above would still pass against an implementation that added its own
+		if strings.HasPrefix(refHash.Label, MlsLabelPrefix) {
+			t.Errorf("suite %#04x publishes ref_hash under the prefixed label %q, so this corpus no longer says RefHash takes a bare one",
+				uint16(suite), refHash.Label)
+		}
+		compared++
+	}
+	if compared != labelKatRefHashComparisons {
+		t.Fatalf("compared %d published ref_hash answers, want %d", compared, labelKatRefHashComparisons)
+	}
+}
+
+func TestKeyPackageRefLabelMatchesThePublishedWelcomes(t *testing.T) {
+	// the key package reference label, pinned to a digest this project did not compute.
+	// EncryptedGroupSecrets.new_member is MakeKeyPackageRef over the KeyPackage the
+	// Welcome is addressed to (RFC 9420 sections 5.2 and 12.4.3.1), so the reference the
+	// generator wrote is in the published Welcome bytes and nothing but the right label
+	// over the right encoding reproduces it.
+	//
+	// It is the only assertion in this package that can see a label misspelled
+	// consistently, a swapped pair of labels, or a hand rolled one byte length prefix:
+	// the crypto-basics value is 32 bytes and its label is 7, both inside that prefix,
+	// while these key packages are hundreds of bytes long.
+	vectors := []labelKatWelcome{}
+	loadLabelKat(t, "welcome.json", &vectors)
+	found := 0
+	for _, vector := range vectors {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		message := mustDecodeHex(t, "the published key package", vector.KeyPackage)
+		welcome := mustDecodeHex(t, "the published welcome", vector.Welcome)
+		// the corpus publishes the key package wrapped in an MLSMessage and the
+		// reference is over the KeyPackage inside it, so the header comes off first
+		if len(message) <= len(mlsMessageKeyPackageHeader) || !bytes.HasPrefix(message, mlsMessageKeyPackageHeader) {
+			t.Errorf("suite %#04x publishes a key package of %d bytes headed %x, want the mls10 key package header %x",
+				uint16(suite), len(message), message[:min(len(message), len(mlsMessageKeyPackageHeader))], mlsMessageKeyPackageHeader)
+			continue
+		}
+		keyPackage := message[len(mlsMessageKeyPackageHeader):]
+		if len(keyPackage) < 64 {
+			t.Errorf("suite %#04x publishes a key package of %d bytes, which is inside the one byte length prefix and cannot see a hand rolled one",
+				uint16(suite), len(keyPackage))
+			continue
+		}
+		reference := MakeKeyPackageRef(crypto, keyPackage)
+		if count := bytes.Count(welcome, reference); count != 1 {
+			t.Errorf("suite %#04x: the key package reference %x appears %d times in the published welcome, want once",
+				uint16(suite), reference, count)
+			continue
+		}
+		// and the proposal label over the same bytes is not what the Welcome carries,
+		// so this fails on a swap rather than finding the reference either way
+		if bytes.Contains(welcome, MakeProposalRef(crypto, keyPackage)) {
+			t.Errorf("suite %#04x: the published welcome carries the proposal labelled reference of its key package", uint16(suite))
+		}
+		found++
+	}
+	if found != labelKatKeyPackageRefs {
+		t.Fatalf("found %d published key package references, want %d", found, labelKatKeyPackageRefs)
+	}
+}
+
+func TestProposalRefLabelMatchesThePublishedCommits(t *testing.T) {
+	// the proposal reference label, pinned the same way. a Commit names each by reference
+	// proposal as MakeProposalRef over the AuthenticatedContent that framed it (RFC 9420
+	// sections 5.2 and 12.4), and passive-client-handling-commit.json publishes both
+	// halves: the proposal as an MLSMessage and the commit that references it.
+	//
+	// The AuthenticatedContent is reachable from the published PublicMessage without any
+	// framing code, which this plan does not own:
+	//
+	//	AuthenticatedContent = wire_format ‖ FramedContent ‖ FramedContentAuthData
+	//	MLSMessage           = version ‖ wire_format ‖ FramedContent ‖
+	//	                       FramedContentAuthData ‖ membership_tag<V>
+	//
+	// so it is the published message without its two byte version and without the
+	// trailing membership tag (RFC 9420 sections 6.1 and 6.2). Every step of that is
+	// asserted below rather than assumed, and a wrong slicing cannot agree with anything:
+	// the reference either lands in the commit bytes or it does not.
+	vectors := []labelKatPassiveClient{}
+	loadLabelKat(t, "passive-client-handling-commit.json", &vectors)
+	found := 0
+	for _, vector := range vectors {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		// the membership tag is a mac of the suite's hash size carried as a vector, and
+		// at 32 bytes its length prefix is the one byte form
+		membershipTag := 1 + crypto.HashSize()
+		for epochIndex, epoch := range vector.Epochs {
+			commit := mustDecodeHex(t, "the published commit", epoch.Commit)
+			for _, published := range epoch.Proposals {
+				at := fmt.Sprintf("suite %#04x epoch %d", uint16(suite), epochIndex)
+				message := mustDecodeHex(t, "the published proposal", published)
+				if len(message) <= len(mlsMessagePublicMessageHeader)+membershipTag ||
+					!bytes.HasPrefix(message, mlsMessagePublicMessageHeader) {
+					t.Errorf("%s: the proposal is %d bytes headed %x, want an mls10 public message",
+						at, len(message), message[:min(len(message), len(mlsMessagePublicMessageHeader))])
+					continue
+				}
+				if tag := message[len(message)-membershipTag]; int(tag) != crypto.HashSize() {
+					t.Errorf("%s: the proposal ends in a vector of %d bytes, want the %d byte membership tag",
+						at, tag, crypto.HashSize())
+					continue
+				}
+				authenticatedContent := message[mlsMessageVersionLength : len(message)-membershipTag]
+				reference := MakeProposalRef(crypto, authenticatedContent)
+				if count := bytes.Count(commit, reference); count != 1 {
+					t.Errorf("%s: the proposal reference %x appears %d times in the published commit, want once",
+						at, reference, count)
+					continue
+				}
+				// and the key package label over the same content is not what the commit
+				// carries, so a swapped pair fails here rather than matching either way
+				if bytes.Contains(commit, MakeKeyPackageRef(crypto, authenticatedContent)) {
+					t.Errorf("%s: the published commit carries the key package labelled reference of a proposal", at)
+				}
+				found++
+			}
+		}
+	}
+	if found != labelKatProposalRefs {
+		t.Fatalf("found %d published proposal references, want %d", found, labelKatProposalRefs)
 	}
 }

@@ -1,4 +1,4 @@
-// The RFC 9420 section 5.1 labelled constructions. Every one of them is a TLS
+// The RFC 9420 section 5.1 and 5.2 labelled constructions. Every one of them is a TLS
 // presentation language struct, so all of them go through mls/syntax: there is one
 // length prefix implementation in the system and one place for a length prefix bug to be.
 //
@@ -7,12 +7,20 @@
 // that admits two readings is a signature bypass primitive. That is why nothing here hand
 // rolls a prefix.
 //
-// The whole security argument of this file is the "MLS 1.0 " prefix and the two length
-// prefixed fields after it, and none of it is observable from the outside: dropping the
+// The whole security argument of this file is the "MLS 1.0 " prefix and the length
+// prefixed fields around it, and none of it is observable from the outside: dropping the
 // prefix, altering it, dropping the uint16 length, writing the context raw, or
 // transposing label and context each produce a well formed output of exactly the
 // requested size. Only a published answer separates them, which is what
 // crypto_labels_test.go holds this to.
+//
+// The section 5.2 references carry the same argument one step further. Their two labels
+// differ in a single word, and swapping them, or letting both makers share one, produces
+// two references that are still 32 bytes, still deterministic and still distinct for
+// distinct inputs — while a key package reference and a proposal reference over the same
+// bytes have quietly become the same value. No property of the output says which label
+// built it, so what holds them is the corpora where another implementation wrote the
+// reference down.
 package mls
 
 import "github.com/urnetwork/connect/mls/syntax"
@@ -77,4 +85,53 @@ func (self *suiteCryptoProvider) DeriveTreeSecret(secret []byte, label string, g
 	writer := syntax.NewWriter()
 	writer.WriteUint32(generation)
 	return self.ExpandWithLabel(secret, label, mlsLabelBytes(writer), length)
+}
+
+// The reference labels of RFC 9420 section 5.2, written out in full because RefHash does
+// not add the "MLS 1.0 " prefix: here the prefix is part of the published label rather
+// than something a construction contributes.
+//
+// They are the entire domain separation between the two kinds of reference, and the one
+// input neither maker's own behaviour can expose. TestRefLabelsAreTheRfcStrings holds
+// them to the RFC's text, and the published Welcome and Commit corpora hold them to a
+// reference computed elsewhere, which is what a string this project typed twice cannot do.
+const (
+	KeyPackageRefLabel = "MLS 1.0 KeyPackage Reference"
+	ProposalRefLabel   = "MLS 1.0 Proposal Reference"
+)
+
+// struct { opaque label<V>; opaque value<V> } RefHashInput, hashed.
+//
+// The label is used verbatim. That is not an oversight and not an inconsistency with
+// ExpandWithLabel: RFC 9420 section 5.2 defines the reference labels with the prefix
+// already inside them, and the crypto-basics vector exercises this with a bare label that
+// must not gain one.
+//
+// Both fields are length prefixed, which is what keeps a reference from being forgeable
+// by moving the boundary: without the prefixes, a label ending in the first byte of a
+// value and a label one byte shorter hash the same input.
+//
+// The provider is a parameter rather than a receiver because the reference makers are
+// what the tree and the framing layers call, and they hold a CryptoProvider rather than
+// the concrete type. No error return, by the registry's fixed signature — see
+// mlsLabelBytes for why the writer cannot fail here.
+func RefHash(crypto CryptoProvider, label string, value []byte) []byte {
+	writer := syntax.NewWriter()
+	writer.WriteOpaque([]byte(label))
+	writer.WriteOpaque(value)
+	return crypto.Hash(mlsLabelBytes(writer))
+}
+
+// The reference by which a Welcome addresses a joiner and a proposal names the key package
+// it adds. The input is the serialized KeyPackage, not the MLSMessage that carried it.
+func MakeKeyPackageRef(crypto CryptoProvider, keyPackage []byte) []byte {
+	return RefHash(crypto, KeyPackageRefLabel, keyPackage)
+}
+
+// The reference by which a Commit names a proposal it does not carry by value. The input
+// is the serialized AuthenticatedContent that framed the proposal and not the Proposal
+// itself (RFC 9420 section 5.2), so the reference covers the sender and the signature
+// rather than only the proposed change.
+func MakeProposalRef(crypto CryptoProvider, authenticatedContent []byte) []byte {
+	return RefHash(crypto, ProposalRefLabel, authenticatedContent)
 }
