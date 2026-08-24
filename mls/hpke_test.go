@@ -65,7 +65,7 @@ import (
 // odd length or a stray character would otherwise silently turn a known answer into a
 // comparison against nothing, which is the one way a corpus like this passes while
 // asserting less than it says.
-func decodeVectorField(t *testing.T, vectorName string, fieldName string, value string) []byte {
+func decodeVectorField(t testing.TB, vectorName string, fieldName string, value string) []byte {
 	t.Helper()
 	decoded, err := hex.DecodeString(value)
 	if err != nil {
@@ -82,7 +82,7 @@ func decodeVectorField(t *testing.T, vectorName string, fieldName string, value 
 // decode because an empty expected value is a comparison against nothing; an empty input
 // is the opposite case and is published, and it is the only one that can see an exporter
 // substituting a default of its own for a caller that supplied none.
-func decodePossiblyEmptyVectorField(t *testing.T, vectorName string, fieldName string, value string) []byte {
+func decodePossiblyEmptyVectorField(t testing.TB, vectorName string, fieldName string, value string) []byte {
 	t.Helper()
 	if value == "" {
 		return nil

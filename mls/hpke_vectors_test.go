@@ -172,7 +172,7 @@ const hpkeVectorExportCount = 3
 // has already accepted, so a count check written after a loader fatal on the same count is a
 // check that cannot fail — three of the assertions in
 // TestHpkeVectorCorpusIsTheWholePublishedCorpus were exactly that until this split.
-func parseHpkeVectors(t *testing.T) []hpkeVector {
+func parseHpkeVectors(t testing.TB) []hpkeVector {
 	t.Helper()
 	raw, err := os.ReadFile(hpkeVectorPath)
 	if err != nil {
@@ -197,7 +197,7 @@ func parseHpkeVectors(t *testing.T) []hpkeVector {
 // entry left every known answer in the package green. The same is true of the encryptions
 // and the exports: a loop over an empty slice reports success, so a corpus stripped to its
 // key schedule would satisfy the seal and export known answers by never running them.
-func loadHpkeVectors(t *testing.T) []hpkeVector {
+func loadHpkeVectors(t testing.TB) []hpkeVector {
 	t.Helper()
 	vectors := parseHpkeVectors(t)
 	suites := Suites()
@@ -235,7 +235,7 @@ func loadHpkeVectors(t *testing.T) []hpkeVector {
 // mode, kem, kdf or aead this package does not implement asserts nothing about it, and
 // silently skipping such an entry is how a corpus ends up with two rows and one of them
 // tested.
-func suiteForHpkeVector(t *testing.T, vector hpkeVector) *SuiteParams {
+func suiteForHpkeVector(t testing.TB, vector hpkeVector) *SuiteParams {
 	t.Helper()
 	if vector.Mode != 0 {
 		t.Fatalf("vector mode is %d, want 0 (base)", vector.Mode)
