@@ -28,6 +28,17 @@
 // The counts are asserted rather than assumed. A loader that filtered every entry away
 // reports exactly what a clean run reports, so each vector test counts the comparisons it
 // actually made and fails if the number moved.
+//
+// Two properties are not published anywhere and rest on the hand derived rows of
+// TestKdfLabelEncoding instead, which is worth knowing when reading what the corpora do
+// and do not carry. The length field's high byte is one: every length in all three
+// corpora is 32, so nothing published can tell a uint16 from a uint8 above 255, and
+// lengths above 255 are reachable — Expand serves up to 8160 bytes and MLS-Exporter takes
+// a length the caller chooses. The empty label field is the other: no published vector
+// derives under an empty label, so the 0x00 that says "present and empty" rather than
+// "omitted" is pinned only by the row that writes it out. Both are held by the rows read
+// off RFC 9420 section 5.1 rather than by a byte this project did not compute, and there
+// is no vector in this corpus that could do better.
 package mls
 
 import (
@@ -38,6 +49,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -319,6 +332,121 @@ func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 	if recovered := recoveredPanic(func() { mlsLabelBytes(overlong) }); recovered == nil {
 		t.Fatalf("mlsLabelBytes returned a preimage its writer had already refused")
 	}
+	// the assertions above build their own writer, so none of them can see which limit
+	// the label path chose for its own. these run through mlsKdfLabel, at both fields it
+	// writes: a raised limit there accepts a field a compliant reader refuses, and a
+	// lowered one refuses a preimage the protocol requires, and neither moves a byte of
+	// any published answer.
+	for _, testCase := range []struct {
+		name string
+		call func(n int)
+	}{
+		{name: "the context field", call: func(n int) { mlsKdfLabel("label", make([]byte, n), 32) }},
+		{name: "the label field", call: func(n int) { mlsKdfLabel(strings.Repeat("x", n), nil, 32) }},
+	} {
+		// the label field carries the prefix as well, so its own boundary sits that many
+		// bytes below the limit
+		room := syntax.MaxVectorLength
+		if testCase.name == "the label field" {
+			room -= len(MlsLabelPrefix)
+		}
+		if recovered := recoveredPanic(func() { testCase.call(room) }); recovered != nil {
+			t.Errorf("mlsKdfLabel refused %s at the limit: %v", testCase.name, recovered)
+		}
+		if recovered := recoveredPanic(func() { testCase.call(room + 1) }); recovered == nil {
+			t.Errorf("mlsKdfLabel accepted %s one byte past the limit", testCase.name)
+		}
+	}
+}
+
+// Every way this package enters the codec, and the limit each entry carries.
+//
+// The behavioural half above reaches only the fields a caller's bytes flow into.
+// DeriveTreeSecret's writer takes a uint32 and nothing else, and WriteUint32 never
+// consults maxVectorLength, so no input can tell that writer's limit from any other —
+// which is the shape of a mutation that survives an entire package's tests. What pins it
+// instead is the constructor, read out of the source: MLS caps every field at
+// MaxVectorLength, only the ratchet tree paths pass MaxRatchetTreeLength, and nothing
+// here is a ratchet tree.
+//
+// The list is every syntax call in the package's non test source rather than the ones
+// this file makes, and it is pinned whole rather than filtered by name. A later task that
+// adds a construction adds a line here, which is the point: a raised limit is a decision
+// somebody has to write down, and syntax offers a Limit variant of every entry point.
+func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
+	entered := []string{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		for _, call := range mustParseSource(t, path).callsToPackage("syntax") {
+			entered = append(entered, path+": "+call)
+		}
+	}
+	want := []string{
+		"crypto_labels.go: syntax.NewWriter()",
+		"crypto_labels.go: syntax.NewWriter()",
+	}
+	if !slices.Equal(entered, want) {
+		t.Errorf("this package enters the codec at %v, want %v", entered, want)
+	}
+	// and the matcher reports a raised limit as the different call it is, rather than
+	// reading every constructor as the default one
+	control := mustParseText(t, "the raised limit control", raisedWriterLimitControl)
+	if calls := control.callsToPackage("syntax"); !slices.Equal(calls, []string{"syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)"}) {
+		t.Errorf("the matcher read %v out of a control building one raised writer", calls)
+	}
+}
+
+// A labelled construction whose writer would accept a field sixteen times longer than any
+// MLS structure permits. Every matcher above runs on this as well, so one that stopped
+// matching fails here rather than issuing the real file a clean bill.
+const raisedWriterLimitControl = `package mls
+
+func mlsKdfLabel(label string, context []byte, length int) []byte {
+	writer := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
+	writer.WriteUint16(uint16(length))
+	return mlsLabelBytes(writer)
+}
+`
+
+// Every preimage is storage of its own. These two are the only functions in this file a
+// caller cannot reach through the provider, so nothing else in the package can see them
+// answer out of one reused array — and a reused array here is not merely a stale digest:
+// mlsKdfLabel is on the path of every derivation, so two goroutines deriving at once
+// would each expand over the other's preimage. There is no race detector on this machine
+// to report that, so what says it cannot happen is that the storage is never shared.
+func TestLabelPreimagesAreFreshBuffers(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		call func() []byte
+	}{
+		{name: "mlsLabelBytes", call: func() []byte {
+			writer := syntax.NewWriter()
+			writer.WriteOpaque([]byte("preimage"))
+			return mlsLabelBytes(writer)
+		}},
+		{name: "mlsKdfLabel", call: func() []byte { return mlsKdfLabel("label", []byte("context"), 32) }},
+	} {
+		first, second := testCase.call(), testCase.call()
+		if len(first) == 0 || len(second) == 0 {
+			t.Errorf("%s returned nothing, so this shares nothing either", testCase.name)
+			continue
+		}
+		if &first[0] == &second[0] {
+			t.Errorf("two calls to %s returned the same storage", testCase.name)
+			continue
+		}
+		held := bytes.Clone(first)
+		// a third call with a longer argument, since a cache that reallocates for a
+		// bigger answer leaves the first result intact and only a same sized one moves it
+		mlsKdfLabel("a much longer label than the first", bytes.Repeat([]byte{0x7e}, 96), 48)
+		testCase.call()
+		if !bytes.Equal(first, held) {
+			t.Errorf("a preimage from %s changed from %x to %x when it was called again",
+				testCase.name, held, first)
+		}
+	}
 }
 
 func TestDeriveSecretIsExpandWithEmptyContext(t *testing.T) {
@@ -454,8 +582,12 @@ func TestExpandWithLabelSeparatesLabels(t *testing.T) {
 		crypto.ExpandWithLabel(secret, "a", []byte("bc"), 32)) {
 		t.Fatalf("label and context are not length separated")
 	}
-	// and label and context are two fields rather than one concatenation. a transposed
-	// pair of writes keeps every length and produces a well formed preimage.
+	// and the two arguments are not interchangeable. this arm cannot fail while the
+	// prefix rides on the label: "MLS 1.0 ab" against "MLS 1.0 cd" separates the two
+	// calls whichever order the fields are written in, so a transposed pair of writes
+	// passes here. it is kept as the statement of the property and not as coverage of it
+	// — what sees a transposition is TestKdfLabelEncoding, which pins the field order to
+	// bytes, and the three published corpora below.
 	if bytes.Equal(crypto.ExpandWithLabel(secret, "ab", []byte("cd"), 32),
 		crypto.ExpandWithLabel(secret, "cd", []byte("ab"), 32)) {
 		t.Fatalf("label and context are interchangeable")

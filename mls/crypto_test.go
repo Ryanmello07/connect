@@ -31,6 +31,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -613,6 +614,47 @@ func (self parsedSource) statementsOf(t *testing.T, receiver string, name string
 	return rendered
 }
 
+// The names of every method on one receiver type declared in this file. What the gates
+// below need it for is finding their own subject: a gate told which file to read reports
+// a clean bill on a file the implementation has moved out of, which is exactly what
+// happened when task 12 put three provider methods in a second file.
+func (self parsedSource) methodsOn(receiver string) []string {
+	names := []string{}
+	for _, declaration := range self.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || self.receiverOf(function) != receiver {
+			continue
+		}
+		names = append(names, function.Name.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Every call in this file written as a selector on one package, rendered. A gate over
+// which constructor a package is entered through reads this rather than the file's
+// characters, so a call spelled across two lines or with a differently named import
+// still reports as the call it is.
+func (self parsedSource) callsToPackage(pkg string) []string {
+	calls := []string{}
+	ast.Inspect(self.file, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		selector, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+		if base, isIdentifier := selector.X.(*ast.Ident); isIdentifier && base.Name == pkg {
+			calls = append(calls, self.render(call))
+		}
+		return true
+	})
+	slices.Sort(calls)
+	return calls
+}
+
 // Every assignment in the file that writes a field of a method's own receiver, as
 // "Method: statement". This is the mechanical half of the statelessness claim: a field
 // nobody writes is safe to share, and this reports the writes rather than trusting the
@@ -1187,6 +1229,136 @@ func TestProviderResultsDoNotShareMemoryWithTheirInputs(t *testing.T) {
 	if len(back) != 0 && &back[0] == &ciphertext[0] {
 		t.Errorf("open returned a plaintext aliasing the ciphertext")
 	}
+	assertEveryProviderCallLeavesItsArgumentsAlone(t, crypto)
+}
+
+// The same claim over every method of the interface that takes bytes, mechanically.
+//
+// Two things separate this from the hand written half above. It covers the whole surface
+// and says so, so a method added later is not silently left out. And every argument is
+// cut from a longer array and compared over the whole array afterwards: a provider that
+// appends into a caller's spare capacity to save an allocation leaves len alone, so a
+// comparison that stops at len reports nothing while the caller's next read past len
+// comes back changed.
+func assertEveryProviderCallLeavesItsArgumentsAlone(t *testing.T, crypto CryptoProvider) {
+	t.Helper()
+	secret := bytes.Repeat([]byte{0x61}, crypto.HashSize())
+	message := []byte("a message the provider is handed rather than one it makes")
+	tag := crypto.Mac(secret, message)
+	key := bytes.Repeat([]byte{0x62}, crypto.KeySize())
+	nonce := bytes.Repeat([]byte{0x63}, crypto.NonceSize())
+	aad := []byte("aad")
+	sealed, err := crypto.AeadSeal(key, nonce, aad, message)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	covered := []string{}
+	for _, testCase := range []struct {
+		name string
+		call func(take func(content []byte) []byte) []byte
+	}{
+		{name: "Hash", call: func(take func([]byte) []byte) []byte { return crypto.Hash(take(message)) }},
+		{name: "Mac", call: func(take func([]byte) []byte) []byte { return crypto.Mac(take(secret), take(message)) }},
+		{name: "MacVerify", call: func(take func([]byte) []byte) []byte {
+			if !crypto.MacVerify(take(secret), take(message), take(tag)) {
+				t.Errorf("MacVerify refused a tag it had just produced, so this ran the refusal path")
+			}
+			return nil
+		}},
+		{name: "Extract", call: func(take func([]byte) []byte) []byte { return crypto.Extract(take(secret), take(message)) }},
+		{name: "Expand", call: func(take func([]byte) []byte) []byte { return crypto.Expand(take(secret), take(message), 48) }},
+		{name: "ExpandWithLabel", call: func(take func([]byte) []byte) []byte {
+			return crypto.ExpandWithLabel(take(secret), "label", take(message), 48)
+		}},
+		{name: "DeriveSecret", call: func(take func([]byte) []byte) []byte {
+			return crypto.DeriveSecret(take(secret), "label")
+		}},
+		{name: "DeriveTreeSecret", call: func(take func([]byte) []byte) []byte {
+			return crypto.DeriveTreeSecret(take(secret), "label", 7, 48)
+		}},
+		{name: "AeadSeal", call: func(take func([]byte) []byte) []byte {
+			ciphertext, err := crypto.AeadSeal(take(key), take(nonce), take(aad), take(message))
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			return ciphertext
+		}},
+		{name: "AeadOpen", call: func(take func([]byte) []byte) []byte {
+			plaintext, err := crypto.AeadOpen(take(key), take(nonce), take(aad), take(sealed))
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			return plaintext
+		}},
+	} {
+		covered = append(covered, testCase.name)
+		recorder := &argumentRecorder{}
+		result := testCase.call(recorder.take)
+		if len(recorder.arrays) == 0 {
+			t.Errorf("%s was handed nothing, so this row observed nothing", testCase.name)
+			continue
+		}
+		if changed := recorder.changed(); len(changed) != 0 {
+			t.Errorf("%s changed the storage behind arguments %v of the %d it was handed",
+				testCase.name, changed, len(recorder.arrays))
+		}
+		if recorder.aliases(result) {
+			t.Errorf("%s returned a slice over one of its arguments", testCase.name)
+		}
+	}
+	assertCoversTheProviderSurface(t, "the argument immutability table", covered, map[string]string{
+		"Random": "is handed no bytes, only a count",
+	})
+}
+
+// The arguments one provider call was handed, and the storage behind each of them.
+//
+// Every argument is cut from an array longer than itself, so len(argument) is strictly
+// less than cap(argument) and an append into the spare capacity is a write this can see.
+// Recording the array rather than the slice is the whole point: the caller's slice header
+// never moves, and the bytes past its length are the ones a defect writes into.
+type argumentRecorder struct {
+	arrays [][]byte
+	before [][]byte
+}
+
+// One argument, over storage this recorder keeps a copy of. The trailing bytes are a
+// pattern rather than zeros: a mutant that appended a zero into the spare capacity would
+// be invisible against an array that was already zero there.
+func (self *argumentRecorder) take(content []byte) []byte {
+	array := append(bytes.Clone(content), bytes.Repeat([]byte{0x5c, 0xa3}, 32)...)
+	self.arrays = append(self.arrays, array)
+	self.before = append(self.before, bytes.Clone(array))
+	return array[:len(content)]
+}
+
+// The indexes of the arguments whose storage came back changed.
+func (self *argumentRecorder) changed() []int {
+	changed := []int{}
+	for i, array := range self.arrays {
+		if !bytes.Equal(array, self.before[i]) {
+			changed = append(changed, i)
+		}
+	}
+	return changed
+}
+
+// Whether a result is cut from the storage behind any argument. Comparing the result's
+// first element against every byte of every argument rather than against the first byte
+// of each catches a result taken from the middle of a caller's buffer as well as one
+// taken from the front.
+func (self *argumentRecorder) aliases(result []byte) bool {
+	if len(result) == 0 {
+		return false
+	}
+	for _, array := range self.arrays {
+		for i := range array {
+			if &array[i] == &result[0] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // The bytes the scripted reader hands out. Ninety six of them, in windows a mutant has to
@@ -1477,6 +1649,104 @@ func TestNewCryptoProviderWithRandomSubstitutesNothing(t *testing.T) {
 // of thought rather than a line of code.
 var providerFields = []string{"params *mls.SuiteParams", "random io.Reader"}
 
+// The files that declare a method on the one implementation.
+//
+// Every gate below scans all of them rather than one named file. That is the shape of a
+// defect this package already paid for: task 12 moved three methods into a second file,
+// four whole provider invariants went on reading the first, and the identical receiver
+// write failed or passed depending only on which file it was written in. A later task
+// adding a fourth file fails here rather than quietly leaving its methods unscanned.
+var providerMethodSourcePaths = []string{"crypto.go", "crypto_labels.go"}
+
+// Every go file of this package, test files included. A method on the shared provider
+// type is the thing being ruled out whichever file it is written in, and a file the scan
+// does not read is a file the rule does not reach.
+func packageSourcePaths(t *testing.T) []string {
+	t.Helper()
+	paths, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("list the package source: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatalf("the package holds no go files, so nothing below scanned anything")
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// Every method the interface names, read off the type rather than typed out.
+//
+// This is what the whole provider invariants below measure their own coverage against. A
+// hand written list of methods is the thing that goes stale when the surface grows, and
+// an invariant enumerating a surface that has moved on reports exactly what a complete
+// one reports.
+func providerMethodNames() []string {
+	names := []string{}
+	providerInterface := reflect.TypeOf((*CryptoProvider)(nil)).Elem()
+	for i := 0; i < providerInterface.NumMethod(); i++ {
+		names = append(names, providerInterface.Method(i).Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// The methods that answer with a size or a code point. They take no bytes and return no
+// storage, so there is nothing for a buffer, aliasing or immutability invariant to look
+// at; TestProviderSizes is what holds them.
+var providerValueMethods = []string{"HashSize", "KeySize", "NonceSize", "Suite"}
+
+// The methods tasks 14 to 16 still owe, which refuse to be called rather than answering.
+//
+// TestProviderStubsRefuseToBeCalled holds the refusal and reads this same list, so the
+// two cannot drift. Implementing one means taking it off here, and taking it off here is
+// what makes the invariants below demand it: a method that starts answering and is not
+// added to their tables fails the coverage gate instead of going unexamined.
+var providerStubMethods = []string{
+	"DeriveKeyPair", "HpkeOpen", "HpkeSeal", "SignWithLabel", "SignatureKeyPair", "VerifyWithLabel",
+}
+
+// One whole provider invariant's table, checked against the interface it is meant to
+// cover. What is excused is named with its reason rather than left out, so a method that
+// stops being excusable is a line somebody has to delete on purpose.
+func assertCoversTheProviderSurface(t *testing.T, gate string, covered []string, excused map[string]string) {
+	t.Helper()
+	surface := providerMethodNames()
+	want := []string{}
+	for _, name := range surface {
+		if slices.Contains(providerValueMethods, name) || slices.Contains(providerStubMethods, name) {
+			continue
+		}
+		if _, isExcused := excused[name]; !isExcused {
+			want = append(want, name)
+		}
+	}
+	got := slices.Clone(covered)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s covers %v, want %v", gate, got, want)
+	}
+	for name := range excused {
+		if !slices.Contains(surface, name) {
+			t.Errorf("%s excuses %s, which the provider does not declare", gate, name)
+		}
+	}
+}
+
+// The lists above name methods this type really has. A misspelling in any of them would
+// quietly shrink what the coverage gate demands, which is the same failure as a short
+// table written out by hand.
+func TestTheProviderSurfaceListsNameRealMethods(t *testing.T) {
+	surface := providerMethodNames()
+	for _, name := range slices.Concat(providerValueMethods, providerStubMethods) {
+		if !slices.Contains(surface, name) {
+			t.Errorf("%s is listed as part of the provider surface but is not a method of it", name)
+		}
+	}
+	if len(surface) == 0 {
+		t.Fatalf("the provider interface reported no methods, so every gate below excuses everything")
+	}
+}
+
 // A provider that keeps a call count. Its methods are the real ones with one assignment
 // added, which is the smallest version of the defect and the one a matcher aimed at
 // something louder would miss.
@@ -1502,6 +1772,11 @@ func (self *suiteCryptoProvider) Hash(data []byte) []byte {
 // is that the type has exactly the two fields it is documented to have, and that no method
 // writes to either: an immutable value shared between goroutines cannot race, whether or
 // not the detector is available to say so.
+//
+// The scan is over every file of the package rather than over one named file, and the
+// files that turn out to declare a method are pinned. Reading a single file made this
+// gate blind to a whole second half of the implementation, and the blindness was
+// invisible: the gate found its subject, found no write, and passed.
 func TestTheProviderHoldsNoMutableState(t *testing.T) {
 	fields := []string{}
 	providerType := reflect.TypeOf(suiteCryptoProvider{})
@@ -1513,15 +1788,50 @@ func TestTheProviderHoldsNoMutableState(t *testing.T) {
 		t.Errorf("suiteCryptoProvider holds %v, want %v — a new field has to be shown never written",
 			fields, providerFields)
 	}
-	source := mustParseSource(t, macVerifySourcePath)
-	if writes := source.receiverFieldWrites(providerReceiver); len(writes) != 0 {
-		t.Errorf("a method of %s writes to its receiver, so the provider is not safe to share: %v",
-			providerReceiver, writes)
+	declaring := []string{}
+	declared := []string{}
+	for _, path := range packageSourcePaths(t) {
+		source := mustParseSource(t, path)
+		methods := source.methodsOn(providerReceiver)
+		if len(methods) == 0 {
+			continue
+		}
+		declaring = append(declaring, path)
+		declared = append(declared, methods...)
+		if writes := source.receiverFieldWrites(providerReceiver); len(writes) != 0 {
+			t.Errorf("a method of %s in %s writes to its receiver, so the provider is not safe to share: %v",
+				providerReceiver, path, writes)
+		}
+	}
+	if !slices.Equal(declaring, providerMethodSourcePaths) {
+		t.Errorf("%s is implemented across %v, want %v — a file holding provider methods has to be scanned here",
+			providerReceiver, declaring, providerMethodSourcePaths)
+	}
+	// and what those files hold really is the whole implementation, so a scan cannot be
+	// complete over a set that has lost half of it
+	slices.Sort(declared)
+	if missing := missingFrom(providerMethodNames(), declared); len(missing) != 0 {
+		t.Errorf("%v are methods of the provider that no scanned file declares", missing)
 	}
 	control := mustParseText(t, "the stateful control", providerStatefulControl)
 	if writes := control.receiverFieldWrites(providerReceiver); len(writes) == 0 {
 		t.Errorf("the matcher reported no receiver write in a method whose first statement is one")
 	}
+	if methods := control.methodsOn(providerReceiver); !slices.Equal(methods, []string{"Hash"}) {
+		t.Errorf("the matcher read %v out of a control declaring one method", methods)
+	}
+}
+
+// The members of want that got does not hold, so a failure names what is absent rather
+// than printing two lists for a reader to difference by eye.
+func missingFrom(want []string, got []string) []string {
+	absent := []string{}
+	for _, name := range want {
+		if !slices.Contains(got, name) {
+			absent = append(absent, name)
+		}
+	}
+	return absent
 }
 
 // Every call returns storage of its own. A provider that answered out of one cached buffer
@@ -1530,10 +1840,22 @@ func TestTheProviderHoldsNoMutableState(t *testing.T) {
 // changes under it when the next call is made. The aliasing test above compares a result
 // against its input; this compares two results against each other, which is the direction
 // a cache is invisible in.
+//
+// The table covers every method of the interface that answers with bytes, and the gate at
+// the end says so: a later task that adds a method and not a row here fails rather than
+// leaving the new one uncovered.
 func TestProviderResultsAreFreshBuffers(t *testing.T) {
 	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519,
-		bytes.NewReader(bytes.Repeat(randomScript(t), 2)))
+		bytes.NewReader(bytes.Repeat(randomScript(t), 4)))
 	prk := crypto.Extract([]byte("salt"), []byte("ikm"))
+	key := bytes.Repeat([]byte{0x33}, crypto.KeySize())
+	nonce := bytes.Repeat([]byte{0x44}, crypto.NonceSize())
+	aad := []byte("aad")
+	sealed, err := crypto.AeadSeal(key, nonce, aad, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	covered := []string{}
 	for _, testCase := range []struct {
 		name string
 		call func() []byte
@@ -1542,8 +1864,28 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 		{name: "Mac", call: func() []byte { return crypto.Mac([]byte("key"), []byte("data")) }},
 		{name: "Extract", call: func() []byte { return crypto.Extract([]byte("salt"), []byte("ikm")) }},
 		{name: "Expand", call: func() []byte { return crypto.Expand(prk, []byte("info"), 48) }},
+		{name: "ExpandWithLabel", call: func() []byte {
+			return crypto.ExpandWithLabel(prk, "label", []byte("context"), 48)
+		}},
+		{name: "DeriveSecret", call: func() []byte { return crypto.DeriveSecret(prk, "label") }},
+		{name: "DeriveTreeSecret", call: func() []byte { return crypto.DeriveTreeSecret(prk, "label", 7, 48) }},
+		{name: "AeadSeal", call: func() []byte {
+			ciphertext, err := crypto.AeadSeal(key, nonce, aad, []byte("plaintext"))
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			return ciphertext
+		}},
+		{name: "AeadOpen", call: func() []byte {
+			plaintext, err := crypto.AeadOpen(key, nonce, aad, sealed)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			return plaintext
+		}},
 		{name: "Random", call: func() []byte { return crypto.Random(32) }},
 	} {
+		covered = append(covered, testCase.name)
 		first, second := testCase.call(), testCase.call()
 		if len(first) == 0 || len(second) == 0 {
 			t.Errorf("%s returned nothing, so this shares nothing either", testCase.name)
@@ -1562,6 +1904,9 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 				testCase.name, held, first, testCase.name)
 		}
 	}
+	assertCoversTheProviderSurface(t, "the fresh buffer table", covered, map[string]string{
+		"MacVerify": "answers with a bool, so there is no storage for it to share",
+	})
 }
 
 // Two providers over the same byte stream produce the same bytes, which is what makes a
@@ -1581,11 +1926,66 @@ func TestProviderWithRandomIsDeterministic(t *testing.T) {
 // so TestTheProviderHoldsNoMutableState is what carries the claim on a machine with no c
 // compiler. Both are here because they fail on different things: this one on a method that
 // disagrees with itself, that one on the shared field a disagreement would come from.
+//
+// Every method that answers deterministically is compared against an answer taken before
+// the goroutines start, rather than merely called. That comparison is what a machine with
+// no detector has: a provider answering out of one package level scratch array hands two
+// goroutines the same storage, and what the caller sees is the other goroutine's bytes.
 func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
-	key := bytes.Repeat([]byte{0x0f}, 32)
-	nonce := make([]byte, 12)
-	want := crypto.Hash([]byte("data"))
+	key := bytes.Repeat([]byte{0x0f}, crypto.KeySize())
+	secret := bytes.Repeat([]byte{0x0f}, crypto.HashSize())
+	nonce := make([]byte, crypto.NonceSize())
+	message := []byte("data")
+	tag := crypto.Mac(secret, message)
+	sealed, err := crypto.AeadSeal(key, nonce, nil, message)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	operations := []struct {
+		name string
+		call func() []byte
+	}{
+		{name: "Hash", call: func() []byte { return crypto.Hash(message) }},
+		{name: "Mac", call: func() []byte { return crypto.Mac(secret, message) }},
+		{name: "MacVerify", call: func() []byte {
+			if crypto.MacVerify(secret, message, tag) {
+				return []byte{0x01}
+			}
+			return []byte{0x00}
+		}},
+		{name: "Extract", call: func() []byte { return crypto.Extract(secret, message) }},
+		{name: "Expand", call: func() []byte { return crypto.Expand(secret, []byte("info"), 32) }},
+		{name: "ExpandWithLabel", call: func() []byte {
+			return crypto.ExpandWithLabel(secret, "label", []byte("context"), 48)
+		}},
+		{name: "DeriveSecret", call: func() []byte { return crypto.DeriveSecret(secret, "label") }},
+		{name: "DeriveTreeSecret", call: func() []byte { return crypto.DeriveTreeSecret(secret, "label", 7, 48) }},
+		{name: "AeadSeal", call: func() []byte {
+			ciphertext, err := crypto.AeadSeal(key, nonce, nil, message)
+			if err != nil {
+				return nil
+			}
+			return ciphertext
+		}},
+		{name: "AeadOpen", call: func() []byte {
+			plaintext, err := crypto.AeadOpen(key, nonce, nil, sealed)
+			if err != nil {
+				return nil
+			}
+			return plaintext
+		}},
+	}
+	covered := []string{}
+	want := make([][]byte, len(operations))
+	for i, operation := range operations {
+		covered = append(covered, operation.name)
+		want[i] = operation.call()
+		if len(want[i]) == 0 {
+			t.Fatalf("%s answered with nothing before any goroutine started", operation.name)
+		}
+	}
+	assertCoversTheProviderSurface(t, "the concurrency table", append(covered, "Random"), nil)
 
 	var waitGroup sync.WaitGroup
 	for i := 0; i < 32; i++ {
@@ -1593,18 +1993,13 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 		go func() {
 			defer waitGroup.Done()
 			for j := 0; j < 64; j++ {
-				if !bytes.Equal(crypto.Hash([]byte("data")), want) {
-					t.Errorf("Hash disagreed with itself under concurrency")
-					return
+				for k, operation := range operations {
+					if !bytes.Equal(operation.call(), want[k]) {
+						t.Errorf("%s disagreed with itself under concurrency", operation.name)
+						return
+					}
 				}
-				crypto.Mac(key, []byte("data"))
-				crypto.Extract(key, []byte("ikm"))
-				crypto.Expand(key, []byte("info"), 32)
 				crypto.Random(32)
-				if _, err := crypto.AeadSeal(key, nonce, nil, []byte("plaintext")); err != nil {
-					t.Errorf("seal: %v", err)
-					return
-				}
 			}
 		}()
 	}
@@ -1617,8 +2012,14 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 // the meantime. This is the counterpart of TestProviderHasNoRemainingStubs in task 16:
 // that one asserts the list is empty at the end of the wave, this one asserts that what
 // is still on the list is loud.
+//
+// The table is checked against providerStubMethods, which the whole provider invariants
+// read to decide what they are allowed to skip. Implementing one of these means taking it
+// off that list, and taking it off that list is what makes those invariants demand a row
+// for it — so a method cannot become live and uncovered in the same commit.
 func TestProviderStubsRefuseToBeCalled(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	refused := []string{}
 	for _, testCase := range []struct {
 		name string
 		call func()
@@ -1630,8 +2031,13 @@ func TestProviderStubsRefuseToBeCalled(t *testing.T) {
 		{name: "HpkeOpen", call: func() { crypto.HpkeOpen(nil, nil, nil, nil, nil) }},
 		{name: "DeriveKeyPair", call: func() { crypto.DeriveKeyPair(nil) }},
 	} {
+		refused = append(refused, testCase.name)
 		if recovered := recoveredPanic(testCase.call); recovered == nil {
 			t.Errorf("%s returned instead of refusing; an unimplemented method must not answer", testCase.name)
 		}
+	}
+	slices.Sort(refused)
+	if !slices.Equal(refused, providerStubMethods) {
+		t.Errorf("this table refuses %v, while the invariants skip %v", refused, providerStubMethods)
 	}
 }
