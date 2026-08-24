@@ -231,28 +231,30 @@ func TestTreeMathVectorRoot(t *testing.T) {
 	}
 }
 
-// asserts one column of one node against one child function and reports which
-// of the two arms it confirmed, so the caller can prove it exercised both.
+// asserts one relation column of one node against one function and reports
+// which of the two arms it confirmed, so the caller can prove it exercised
+// both.
 //
-// the left and right columns carry identical rules, so the rules are stated
-// once here rather than twice at the call site: two copies is how one half
-// acquires an assertion the other lacks, and a reader has to diff forty lines
+// all four relation columns carry identical rules and differ only in which
+// sentinel marks the undefined arm, so the rules are stated once here rather
+// than four times at the call sites: separate copies is how one column
+// acquires an assertion the others lack, and a reader has to diff forty lines
 // to notice.
-func checkChildColumn(t *testing.T, label string, nLeaves uint32, node uint32, got NodeIndex, err error, want *uint32) (refused bool, matched bool) {
+func checkRelationColumn(t *testing.T, label string, undefined error, nLeaves uint32, node uint32, got NodeIndex, err error, want *uint32) (refused bool, matched bool) {
 	t.Helper()
 	if want == nil {
 		if err == nil {
 			t.Errorf("n_leaves %d node %d: %s %d, want undefined", nLeaves, node, label, got)
 			return false, false
 		}
-		if !errors.Is(err, ErrLeafHasNoChildren) {
-			t.Errorf("n_leaves %d node %d: %s: %v, want %v", nLeaves, node, label, err, ErrLeafHasNoChildren)
+		if !errors.Is(err, undefined) {
+			t.Errorf("n_leaves %d node %d: %s: %v, want %v", nLeaves, node, label, err, undefined)
 			return false, false
 		}
 		// the index is read back alongside the refusal, as the root runner above
 		// already does. measured: a version that hands back x with the error
 		// satisfies both checks above, and a caller that reads only the value
-		// then has a leaf as its own child.
+		// then has a leaf as its own child, or the root as its own parent.
 		if got != 0 {
 			t.Errorf("n_leaves %d node %d: %s %d alongside the refusal, want 0", nLeaves, node, label, got)
 			return false, false
@@ -292,7 +294,7 @@ func TestTreeMathVectorChildren(t *testing.T) {
 			nodeIndex := NodeIndex(i)
 
 			gotLeft, leftErr := Left(nodeIndex)
-			refused, matched := checkChildColumn(t, "left", v.NLeaves, i, gotLeft, leftErr, v.Left[i])
+			refused, matched := checkRelationColumn(t, "left", ErrLeafHasNoChildren, v.NLeaves, i, gotLeft, leftErr, v.Left[i])
 			if refused {
 				leftRefusals += 1
 			}
@@ -301,7 +303,7 @@ func TestTreeMathVectorChildren(t *testing.T) {
 			}
 
 			gotRight, rightErr := Right(nodeIndex)
-			refused, matched = checkChildColumn(t, "right", v.NLeaves, i, gotRight, rightErr, v.Right[i])
+			refused, matched = checkRelationColumn(t, "right", ErrLeafHasNoChildren, v.NLeaves, i, gotRight, rightErr, v.Right[i])
 			if refused {
 				rightRefusals += 1
 			}
@@ -410,50 +412,303 @@ func TestTreeMathVectorChildren(t *testing.T) {
 
 func TestTreeMathVectorParentAndSibling(t *testing.T) {
 	vectors := loadTreeMathVectors(t)
+
+	// both arms of both columns are counted, for the reason the children runner
+	// above gives, and the argument is stronger here rather than weaker. null is
+	// half of each child column; it is ten of the 2036 entries in each of these
+	// two, one root per size. a runner that reads null as nothing to check here
+	// therefore still walks 99.5% of the family and looks like full coverage
+	// while asserting nothing whatever about either refusal. measured: with the
+	// family runner's null arm made unreachable, a Parent carrying no root
+	// guard at all and a Sibling that never translates the sentinel both pass
+	// it, and only the rows below this loop catch either of them.
+	parentRefusals, parentMatches := 0, 0
+	siblingRefusals, siblingMatches := 0, 0
+
 	for _, v := range vectors {
 		leafCount := LeafCount(v.NLeaves)
 		for i := uint32(0); i < v.NNodes; i += 1 {
 			nodeIndex := NodeIndex(i)
 
 			gotParent, parentErr := Parent(nodeIndex, leafCount)
-			if want := v.Parent[i]; want == nil {
-				if parentErr == nil {
-					t.Errorf("n_leaves %d node %d: parent %d, want undefined", v.NLeaves, i, gotParent)
-				} else if !errors.Is(parentErr, ErrRootHasNoParent) {
-					t.Errorf("n_leaves %d node %d: parent: %v, want %v", v.NLeaves, i, parentErr, ErrRootHasNoParent)
-				}
-			} else {
-				if parentErr != nil {
-					t.Errorf("n_leaves %d node %d: parent: %v, want %d", v.NLeaves, i, parentErr, *want)
-				} else if uint32(gotParent) != *want {
-					t.Errorf("n_leaves %d node %d: parent %d, want %d", v.NLeaves, i, gotParent, *want)
-				}
+			refused, matched := checkRelationColumn(t, "parent", ErrRootHasNoParent, v.NLeaves, i, gotParent, parentErr, v.Parent[i])
+			if refused {
+				parentRefusals += 1
+			}
+			if matched {
+				parentMatches += 1
 			}
 
 			gotSibling, siblingErr := Sibling(nodeIndex, leafCount)
-			if want := v.Sibling[i]; want == nil {
-				if siblingErr == nil {
-					t.Errorf("n_leaves %d node %d: sibling %d, want undefined", v.NLeaves, i, gotSibling)
-				} else if !errors.Is(siblingErr, ErrRootHasNoSibling) {
-					t.Errorf("n_leaves %d node %d: sibling: %v, want %v", v.NLeaves, i, siblingErr, ErrRootHasNoSibling)
-				}
-			} else {
-				if siblingErr != nil {
-					t.Errorf("n_leaves %d node %d: sibling: %v, want %d", v.NLeaves, i, siblingErr, *want)
-				} else if uint32(gotSibling) != *want {
-					t.Errorf("n_leaves %d node %d: sibling %d, want %d", v.NLeaves, i, gotSibling, *want)
-				}
+			refused, matched = checkRelationColumn(t, "sibling", ErrRootHasNoSibling, v.NLeaves, i, gotSibling, siblingErr, v.Sibling[i])
+			if refused {
+				siblingRefusals += 1
+			}
+			if matched {
+				siblingMatches += 1
 			}
 		}
 
 		// a node past the end of the array is refused, not answered. the
 		// appendix C pseudocode answers, which is how an index decoded from a
 		// message reaches arithmetic it has no business reaching.
-		if _, err := Parent(NodeIndex(v.NNodes), leafCount); !errors.Is(err, ErrNodeOutOfRange) {
-			t.Errorf("n_leaves %d: parent of node %d: %v, want %v", v.NLeaves, v.NNodes, err, ErrNodeOutOfRange)
+		//
+		// three indices, not one. the width itself is what separates a guard
+		// reading at least the width from one reading more than it, and the
+		// family pins the node one below, which every correct guard admits.
+		// one past the width and the top of the type are what stop the guard
+		// from being an equality or a narrow band that refuses the first index
+		// outside the tree and answers for every one after it. measured: with
+		// only the width probed, a guard reading exactly equal to the width
+		// survives the whole of this test, and it hands a caller node 17 of a
+		// fifteen-node tree.
+		outOfRangeCases := []NodeIndex{
+			NodeIndex(v.NNodes),
+			NodeIndex(v.NNodes + 1),
+			NodeIndex(0xFFFFFFFF),
 		}
-		if _, err := Sibling(NodeIndex(v.NNodes), leafCount); !errors.Is(err, ErrNodeOutOfRange) {
-			t.Errorf("n_leaves %d: sibling of node %d: %v, want %v", v.NLeaves, v.NNodes, err, ErrNodeOutOfRange)
+		for _, nodeIndex := range outOfRangeCases {
+			if got, err := Parent(nodeIndex, leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("n_leaves %d: parent of node %d: %v, want %v", v.NLeaves, nodeIndex, err, ErrNodeOutOfRange)
+			} else if got != 0 {
+				t.Errorf("n_leaves %d: parent of node %d: %d alongside the refusal, want 0", v.NLeaves, nodeIndex, got)
+			}
+			if got, err := Sibling(nodeIndex, leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("n_leaves %d: sibling of node %d: %v, want %v", v.NLeaves, nodeIndex, err, ErrNodeOutOfRange)
+			} else if got != 0 {
+				t.Errorf("n_leaves %d: sibling of node %d: %d alongside the refusal, want 0", v.NLeaves, nodeIndex, got)
+			}
 		}
+	}
+
+	// every entry publishes one root, and the root is the only node in an entry
+	// with neither a parent nor a sibling, so across the ten entries each of the
+	// two columns holds ten undefined and 2026 defined entries - 2036 in all,
+	// the node total the corpus tripwire pins. the totals are asserted rather
+	// than only "more than none" so that a runner which skipped part of the
+	// ladder, or part of an entry, fails here too.
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "parent refusals", got: parentRefusals, want: 10},
+		{label: "parent matches", got: parentMatches, want: 2026},
+		{label: "sibling refusals", got: siblingRefusals, want: 10},
+		{label: "sibling matches", got: siblingMatches, want: 2026},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+
+	// the family's ladder is powers of two only, so nothing above says what
+	// either function does with a leaf count no tree can have. both take the
+	// count only to locate the root, and both have to refuse before the index
+	// arithmetic runs rather than answering for the enclosing full tree.
+	//
+	// measured: with these rows removed and every other row kept, a Parent that
+	// discards the error from Root passes. Root hands back zero alongside its
+	// refusal, so the discarding version reads a root of node 0, then reports
+	// leaf 0 of a three-leaf tree as a root with no parent and node 1 as an
+	// ordinary node with parent 3. two node indices are used per count for that
+	// reason: one the wrong root swallows into a refusal and one it answers
+	// for. the same pair also separates a width check hoisted above the count
+	// check, which at zero leaves calls every index out of range instead.
+	invalidCountCases := []struct {
+		nodeIndex NodeIndex
+		leafCount LeafCount
+		err       error
+	}{
+		{nodeIndex: 0, leafCount: 3, err: ErrLeafCountNotFull},
+		{nodeIndex: 1, leafCount: 3, err: ErrLeafCountNotFull},
+		{nodeIndex: 0, leafCount: 0, err: ErrLeafCountRange},
+		{nodeIndex: 1, leafCount: 0, err: ErrLeafCountRange},
+		{nodeIndex: 0, leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
+		{nodeIndex: 1, leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
+	}
+	for _, c := range invalidCountCases {
+		parent, err := Parent(c.nodeIndex, c.leafCount)
+		if !errors.Is(err, c.err) {
+			t.Errorf("parent of node %d in %d leaves: %v, want %v", c.nodeIndex, c.leafCount, err, c.err)
+		}
+		if parent != 0 {
+			t.Errorf("parent of node %d in %d leaves: %d alongside the refusal, want 0", c.nodeIndex, c.leafCount, parent)
+		}
+		sibling, err := Sibling(c.nodeIndex, c.leafCount)
+		if !errors.Is(err, c.err) {
+			t.Errorf("sibling of node %d in %d leaves: %v, want %v", c.nodeIndex, c.leafCount, err, c.err)
+		}
+		if sibling != 0 {
+			t.Errorf("sibling of node %d in %d leaves: %d alongside the refusal, want 0", c.nodeIndex, c.leafCount, sibling)
+		}
+	}
+
+	// the family's deepest node is the root of its 512-leaf entry, at level 9,
+	// and that node is a refusal in both columns: the deepest node it publishes
+	// a parent or a sibling for is at level 8. so the family says nothing about
+	// levels 9 through 31, and nothing later in this package covers them
+	// either - the structural sweep also stops at 512 leaves and the fuzz
+	// target asserts only that an answer is inside the tree. it says nothing
+	// about leaf counts above 512 either, and the count is what locates the
+	// root both functions refuse at.
+	//
+	// measured, not assumed: with these rows removed and every other row of
+	// this test kept, two versions pass — a Parent whose index arithmetic is
+	// correct only up to level 8, and a Parent whose root guard fires only at
+	// the leaf counts the family publishes and answers a parent for the root of
+	// every larger tree.
+	//
+	// the expected values are not the operation under test. in the array layout
+	// a node at level k is the centre of the 2^(k+1)-1 nodes it spans, so the
+	// leftmost node of level k sits at 2^k-1; the parent spanning it and its
+	// neighbour is the centre of a 2^(k+2)-1 span based at zero, at 2^(k+1)-1;
+	// and that parent's other child is the centre of the upper half, at
+	// 3*2^k-1. in a tree of 2^(k+1) leaves that parent is the root, so each row
+	// pins a refusal at level k+1 as well. the same three closed forms
+	// reproduce all nine levels the family does publish, defined rows and root
+	// refusal alike - the level 8 row below is the 512-leaf entry itself,
+	// vendored - so the table is anchored to published data and every row above
+	// it is the same three forms continued.
+	//
+	// with these rows the two functions are asserted at every level a node can
+	// have: 0 through 8 by the family, 8 through 30 here, level 31 as the root
+	// refusal of the largest tree (its only node, 0x7FFFFFFF, is that root, and
+	// is out of range in every smaller tree, so it has no defined arm to
+	// assert), and level 32 as the out-of-range probe below. all thirty-two
+	// valid leaf counts are covered too: 2^0 through 2^9 by the family and 2^9
+	// through 2^31 here.
+	boundaryCases := []struct {
+		level      uint32
+		leafCount  LeafCount
+		leftChild  NodeIndex
+		parent     NodeIndex
+		rightChild NodeIndex
+	}{
+		{level: 8, leafCount: 1 << 9, leftChild: 0x000000FF, parent: 0x000001FF, rightChild: 0x000002FF},
+		{level: 9, leafCount: 1 << 10, leftChild: 0x000001FF, parent: 0x000003FF, rightChild: 0x000005FF},
+		{level: 10, leafCount: 1 << 11, leftChild: 0x000003FF, parent: 0x000007FF, rightChild: 0x00000BFF},
+		{level: 11, leafCount: 1 << 12, leftChild: 0x000007FF, parent: 0x00000FFF, rightChild: 0x000017FF},
+		{level: 12, leafCount: 1 << 13, leftChild: 0x00000FFF, parent: 0x00001FFF, rightChild: 0x00002FFF},
+		{level: 13, leafCount: 1 << 14, leftChild: 0x00001FFF, parent: 0x00003FFF, rightChild: 0x00005FFF},
+		{level: 14, leafCount: 1 << 15, leftChild: 0x00003FFF, parent: 0x00007FFF, rightChild: 0x0000BFFF},
+		{level: 15, leafCount: 1 << 16, leftChild: 0x00007FFF, parent: 0x0000FFFF, rightChild: 0x00017FFF},
+		{level: 16, leafCount: 1 << 17, leftChild: 0x0000FFFF, parent: 0x0001FFFF, rightChild: 0x0002FFFF},
+		{level: 17, leafCount: 1 << 18, leftChild: 0x0001FFFF, parent: 0x0003FFFF, rightChild: 0x0005FFFF},
+		{level: 18, leafCount: 1 << 19, leftChild: 0x0003FFFF, parent: 0x0007FFFF, rightChild: 0x000BFFFF},
+		{level: 19, leafCount: 1 << 20, leftChild: 0x0007FFFF, parent: 0x000FFFFF, rightChild: 0x0017FFFF},
+		{level: 20, leafCount: 1 << 21, leftChild: 0x000FFFFF, parent: 0x001FFFFF, rightChild: 0x002FFFFF},
+		{level: 21, leafCount: 1 << 22, leftChild: 0x001FFFFF, parent: 0x003FFFFF, rightChild: 0x005FFFFF},
+		{level: 22, leafCount: 1 << 23, leftChild: 0x003FFFFF, parent: 0x007FFFFF, rightChild: 0x00BFFFFF},
+		{level: 23, leafCount: 1 << 24, leftChild: 0x007FFFFF, parent: 0x00FFFFFF, rightChild: 0x017FFFFF},
+		{level: 24, leafCount: 1 << 25, leftChild: 0x00FFFFFF, parent: 0x01FFFFFF, rightChild: 0x02FFFFFF},
+		{level: 25, leafCount: 1 << 26, leftChild: 0x01FFFFFF, parent: 0x03FFFFFF, rightChild: 0x05FFFFFF},
+		{level: 26, leafCount: 1 << 27, leftChild: 0x03FFFFFF, parent: 0x07FFFFFF, rightChild: 0x0BFFFFFF},
+		{level: 27, leafCount: 1 << 28, leftChild: 0x07FFFFFF, parent: 0x0FFFFFFF, rightChild: 0x17FFFFFF},
+		{level: 28, leafCount: 1 << 29, leftChild: 0x0FFFFFFF, parent: 0x1FFFFFFF, rightChild: 0x2FFFFFFF},
+		{level: 29, leafCount: 1 << 30, leftChild: 0x1FFFFFFF, parent: 0x3FFFFFFF, rightChild: 0x5FFFFFFF},
+		{level: 30, leafCount: 1 << 31, leftChild: 0x3FFFFFFF, parent: 0x7FFFFFFF, rightChild: 0xBFFFFFFF},
+	}
+	for _, c := range boundaryCases {
+		// the row states which level it exercises, and the claim above about
+		// which levels are covered rests on that being true, so it is asserted
+		// rather than trusted: a mistyped index would otherwise cover one level
+		// twice and leave another with nothing.
+		levelCases := []struct {
+			nodeIndex NodeIndex
+			level     uint32
+		}{
+			{nodeIndex: c.leftChild, level: c.level},
+			{nodeIndex: c.rightChild, level: c.level},
+			{nodeIndex: c.parent, level: c.level + 1},
+		}
+		for _, l := range levelCases {
+			if got := l.nodeIndex.Level(); got != l.level {
+				t.Errorf("node %d level: %d, want %d", l.nodeIndex, got, l.level)
+			}
+		}
+
+		// the left child, whose parent lies above it.
+		if got, err := Parent(c.leftChild, c.leafCount); err != nil {
+			t.Errorf("parent of node %d in %d leaves: %v, want %d", c.leftChild, c.leafCount, err, c.parent)
+		} else if got != c.parent {
+			t.Errorf("parent of node %d in %d leaves: %d, want %d", c.leftChild, c.leafCount, got, c.parent)
+		}
+		if got, err := Sibling(c.leftChild, c.leafCount); err != nil {
+			t.Errorf("sibling of node %d in %d leaves: %v, want %d", c.leftChild, c.leafCount, err, c.rightChild)
+		} else if got != c.rightChild {
+			t.Errorf("sibling of node %d in %d leaves: %d, want %d", c.leftChild, c.leafCount, got, c.rightChild)
+		}
+
+		// the right child, whose parent lies below it. the two rows together are
+		// what separates the term that reads the bit above the level from a
+		// constant: a version that always adds passes the row above and fails
+		// this one.
+		if got, err := Parent(c.rightChild, c.leafCount); err != nil {
+			t.Errorf("parent of node %d in %d leaves: %v, want %d", c.rightChild, c.leafCount, err, c.parent)
+		} else if got != c.parent {
+			t.Errorf("parent of node %d in %d leaves: %d, want %d", c.rightChild, c.leafCount, got, c.parent)
+		}
+		if got, err := Sibling(c.rightChild, c.leafCount); err != nil {
+			t.Errorf("sibling of node %d in %d leaves: %v, want %d", c.rightChild, c.leafCount, err, c.leftChild)
+		} else if got != c.leftChild {
+			t.Errorf("sibling of node %d in %d leaves: %d, want %d", c.rightChild, c.leafCount, got, c.leftChild)
+		}
+
+		// and the parent, which at this leaf count is the root and so has
+		// neither. these are the only assertions in the package on a root
+		// refusal above level 9.
+		if got, err := Parent(c.parent, c.leafCount); !errors.Is(err, ErrRootHasNoParent) {
+			t.Errorf("parent of node %d in %d leaves: %v, want %v", c.parent, c.leafCount, err, ErrRootHasNoParent)
+		} else if got != 0 {
+			t.Errorf("parent of node %d in %d leaves: %d alongside the refusal, want 0", c.parent, c.leafCount, got)
+		}
+		if got, err := Sibling(c.parent, c.leafCount); !errors.Is(err, ErrRootHasNoSibling) {
+			t.Errorf("sibling of node %d in %d leaves: %v, want %v", c.parent, c.leafCount, err, ErrRootHasNoSibling)
+		} else if got != 0 {
+			t.Errorf("sibling of node %d in %d leaves: %d alongside the refusal, want 0", c.parent, c.leafCount, got)
+		}
+	}
+
+	// the top of the index range at the largest representable leaf count, which
+	// no entry of the family reaches. 0xFFFFFFFE is the last leaf of that tree,
+	// 0xFFFFFFFD is its parent and 0xFFFFFFFC its sibling; those are the
+	// deepest-indexed defined answers either function has, and they are the one
+	// place the parent of a level 0 node is asserted with the bit above the
+	// level set at the very top of the type. 0xFFFFFFFF is one past the end of
+	// the tree and so inside no tree at all, and it is the one index the width
+	// guard has to refuse here, where every smaller index is in range - the
+	// per-entry probe above brackets that guard at ten small sizes and this
+	// brackets it at the only size where the width fills the type.
+	topOfRangeCases := []struct {
+		nodeIndex NodeIndex
+		parent    NodeIndex
+		sibling   NodeIndex
+	}{
+		{nodeIndex: 0xFFFFFFFE, parent: 0xFFFFFFFD, sibling: 0xFFFFFFFC},
+	}
+	for _, c := range topOfRangeCases {
+		if got, err := Parent(c.nodeIndex, MaxLeafCount); err != nil {
+			t.Errorf("parent of node %d in MaxLeafCount leaves: %v, want %d", c.nodeIndex, err, c.parent)
+		} else if got != c.parent {
+			t.Errorf("parent of node %d in MaxLeafCount leaves: %d, want %d", c.nodeIndex, got, c.parent)
+		}
+		if got, err := Sibling(c.nodeIndex, MaxLeafCount); err != nil {
+			t.Errorf("sibling of node %d in MaxLeafCount leaves: %v, want %d", c.nodeIndex, err, c.sibling)
+		} else if got != c.sibling {
+			t.Errorf("sibling of node %d in MaxLeafCount leaves: %d, want %d", c.nodeIndex, got, c.sibling)
+		}
+	}
+
+	if got, err := Parent(NodeIndex(0xFFFFFFFF), MaxLeafCount); !errors.Is(err, ErrNodeOutOfRange) {
+		t.Errorf("parent of 0xFFFFFFFF in MaxLeafCount leaves: %v, want %v", err, ErrNodeOutOfRange)
+	} else if got != 0 {
+		t.Errorf("parent of 0xFFFFFFFF in MaxLeafCount leaves: %d alongside the refusal, want 0", got)
+	}
+	if got, err := Sibling(NodeIndex(0xFFFFFFFF), MaxLeafCount); !errors.Is(err, ErrNodeOutOfRange) {
+		t.Errorf("sibling of 0xFFFFFFFF in MaxLeafCount leaves: %v, want %v", err, ErrNodeOutOfRange)
+	} else if got != 0 {
+		t.Errorf("sibling of 0xFFFFFFFF in MaxLeafCount leaves: %d alongside the refusal, want 0", got)
 	}
 }
