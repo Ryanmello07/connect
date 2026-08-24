@@ -182,9 +182,20 @@ func (self *suiteCryptoProvider) Extract(salt []byte, ikm []byte) []byte {
 // rather than an error. The high side is the library's own 255*Nh, which hpke.go names
 // as hpkeMaxExpandLength and TestHpkeExpandCeilingIsTheLibrarysOwnBoundary pins against
 // crypto/hkdf itself rather than against either file's opinion of it.
+//
+// A pseudorandom key shorter than the hash is the same downgrade arriving from the other
+// side. RFC 5869 section 2.3 requires one of at least HashLen, crypto/hkdf enforces it in
+// fips140-only mode and nowhere else, and expanding from a short one derives every
+// subsequent secret from less entropy than the suite claims while handing back the full
+// count of bytes asked for. A caller that arrives here with one has a bug no length check
+// downstream can see, so this stops as well.
 func (self *suiteCryptoProvider) Expand(prk []byte, info []byte, length int) []byte {
 	if length < 0 || length > hpkeMaxExpandLength {
 		panic("mls: hkdf expand length " + strconv.Itoa(length) + " is outside 0.." + strconv.Itoa(hpkeMaxExpandLength))
+	}
+	if len(prk) < self.params.Nh {
+		panic("mls: hkdf expand pseudorandom key of " + strconv.Itoa(len(prk)) +
+			" bytes is shorter than the " + strconv.Itoa(self.params.Nh) + " byte hash")
 	}
 	out, err := hkdf.Expand(sha256.New, prk, string(info), length)
 	if err != nil {

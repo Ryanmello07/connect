@@ -25,8 +25,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"io"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -163,6 +168,12 @@ func TestProviderRefusesUnknownSuite(t *testing.T) {
 // FIPS 180-4, as crypto/sha256's own golden table carries it. Hash takes no key and no
 // suite, so the only thing that can be wrong about it is which hash it is — and a
 // truncated or doubled digest is exactly the shape of mistake a length check misses.
+//
+// The last three rows are here for their lengths rather than for their bytes. The rows
+// above them are all shorter than one sha256 block and shorter than a digest, so a hash
+// that read only the first block, or only the first thirty two bytes, agrees with every
+// one of them. FIPS 180-2 appendix B's two multi block messages and the sentence from
+// RFC 4634 cover 43, 56 and 112 bytes, which reach the second block and past it.
 func TestProviderHashMatchesTheFipsGoldens(t *testing.T) {
 	for _, testCase := range []struct {
 		in  string
@@ -173,6 +184,19 @@ func TestProviderHashMatchesTheFipsGoldens(t *testing.T) {
 		{in: "abc", out: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
 		{in: "abcd", out: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589"},
 		{in: "Nepal premier won't resign.", out: "7102cfd76e2e324889eece5d6c41921b1e142a4ac5a2692be78803097f6a48d8"},
+		{
+			in:  "The quick brown fox jumps over the lazy dog",
+			out: "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+		},
+		{
+			in:  "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+			out: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+		},
+		{
+			in: "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn" +
+				"hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+			out: "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+		},
 	} {
 		want := mustDecodeHex(t, "the digest of "+testCase.in, testCase.out)
 		for _, suite := range Suites() {
@@ -187,6 +211,64 @@ func TestProviderHashMatchesTheFipsGoldens(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if !bytes.Equal(crypto.Hash(nil), crypto.Hash([]byte{})) {
 		t.Errorf("Hash(nil) = %x and Hash of an empty slice = %x", crypto.Hash(nil), crypto.Hash([]byte{}))
+	}
+	// and a message of exactly HashSize bytes, which no row above is and which is the
+	// length RefHash will hand this in task 13. A copy through or an aliasing defect is
+	// most natural exactly where the input and the output are the same size, and every
+	// row above is short enough for one to hide in. The message is the digest of the
+	// empty string and the answer is therefore the published double sha256 of it.
+	digestOfEmpty := mustDecodeHex(t, "the digest of the empty message",
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	doubleDigest := mustDecodeHex(t, "the double digest of the empty message",
+		"5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456")
+	// the probe has to be able to see what it is aimed at: an all zero or palindromic
+	// message of that length would make a reversing hash the identity and this row would
+	// pass a defect rather than catch it
+	assertProbeIsNotItsOwnPermutation(t, "the thirty two byte message", digestOfEmpty)
+	if len(digestOfEmpty) != crypto.HashSize() {
+		t.Fatalf("the thirty two byte message is %d bytes and HashSize is %d", len(digestOfEmpty), crypto.HashSize())
+	}
+	for _, suite := range Suites() {
+		if got := mustProvider(t, suite).Hash(digestOfEmpty); !bytes.Equal(got, doubleDigest) {
+			t.Errorf("suite %#04x Hash of a %d byte message = %x, want %x",
+				uint16(suite), len(digestOfEmpty), got, doubleDigest)
+		}
+	}
+}
+
+// A probe over which sorting, reversing, rotating and collapsing to a constant are all
+// visible. Every one of those is the identity on some buffer — an ascending one is
+// already sorted, a palindromic one already reads backwards, an all zero one is all four
+// — and a probe that happens to be one of them turns a test that looks like it catches a
+// weakened primitive into a test that cannot. Task 4 shipped a 256 bit key collapsed to
+// about 141 bits behind exactly that, so this is asserted before the probe is used.
+func assertProbeIsNotItsOwnPermutation(t *testing.T, name string, probe []byte) {
+	t.Helper()
+	if len(probe) < 2 {
+		t.Fatalf("%s is %d bytes, which no permutation can move", name, len(probe))
+	}
+	ordered := bytes.Clone(probe)
+	slices.Sort(ordered)
+	if bytes.Equal(probe, ordered) {
+		t.Errorf("%s %x is already sorted, so a sorting defect is invisible in it", name, probe)
+	}
+	slices.Reverse(ordered)
+	if bytes.Equal(probe, ordered) {
+		t.Errorf("%s %x is sorted descending", name, probe)
+	}
+	reversed := bytes.Clone(probe)
+	slices.Reverse(reversed)
+	if bytes.Equal(probe, reversed) {
+		t.Errorf("%s %x reads the same backwards, so a reversing defect is invisible in it", name, probe)
+	}
+	for shift := 1; shift < len(probe); shift++ {
+		rotated := append(bytes.Clone(probe[shift:]), probe[:shift]...)
+		if bytes.Equal(probe, rotated) {
+			t.Errorf("%s %x equals itself rotated by %d", name, probe, shift)
+		}
+	}
+	if bytes.Equal(probe, bytes.Repeat(probe[:1], len(probe))) {
+		t.Errorf("%s %x is constant", name, probe)
 	}
 }
 
@@ -268,6 +350,60 @@ func TestProviderMacMatchesRfc4231(t *testing.T) {
 				t.Errorf("suite %#04x %s: MacVerify rejected the published tag", uint16(suite), vector.name)
 			}
 		}
+	}
+}
+
+// The lengths RFC 4231 does not carry, against hmac's own answer rather than against a
+// table. HKDF-Extract is HMAC keyed on the salt, and this file already pins the argument
+// order that way; the same construction pins the inputs the published table has no row
+// for, which is where a substituted default hides.
+//
+// RFC 4231's shortest key is twenty bytes, its shortest message is eight, and none of its
+// rows is thirty two bytes of key — the length every key this package derives will be. So
+// a mac that substituted a house key for an absent one, or hashed a key of exactly its own
+// digest length first, or read an absent message as some default, agrees with all six
+// published rows. Under a substituted default a caller handing no key still gets a tag that
+// verifies, and authenticates nobody: the silent downgrade this file exists to refuse.
+func TestProviderMacMatchesAnIndependentHmac(t *testing.T) {
+	independent := func(key []byte, data []byte) []byte {
+		mac := hmac.New(sha256.New, key)
+		mac.Write(data)
+		return mac.Sum(nil)
+	}
+	for _, testCase := range []struct {
+		name string
+		key  []byte
+		data []byte
+	}{
+		{name: "no key at all", key: nil, data: []byte("authenticated data")},
+		{name: "an empty key", key: []byte{}, data: []byte("authenticated data")},
+		{name: "a key of exactly the digest length", key: bytes.Repeat([]byte{0x0d}, 32), data: []byte("authenticated data")},
+		{name: "a key of exactly the block length", key: bytes.Repeat([]byte{0x0d}, 64), data: []byte("authenticated data")},
+		{name: "no message at all", key: bytes.Repeat([]byte{0x0d}, 32), data: nil},
+		{name: "an empty message", key: bytes.Repeat([]byte{0x0d}, 32), data: []byte{}},
+		{name: "neither a key nor a message", key: nil, data: nil},
+	} {
+		want := independent(testCase.key, testCase.data)
+		for _, suite := range Suites() {
+			crypto := mustProvider(t, suite)
+			if got := crypto.Mac(testCase.key, testCase.data); !bytes.Equal(got, want) {
+				t.Errorf("suite %#04x Mac with %s = %x, want %x", uint16(suite), testCase.name, got, want)
+			}
+			if !crypto.MacVerify(testCase.key, testCase.data, want) {
+				t.Errorf("suite %#04x MacVerify with %s rejected hmac's own tag", uint16(suite), testCase.name)
+			}
+		}
+	}
+	// and nil and empty are the same absent key and the same absent message, the pair a
+	// wrapper telling them apart would answer differently for
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	data := []byte("authenticated data")
+	if !bytes.Equal(crypto.Mac(nil, data), crypto.Mac([]byte{}, data)) {
+		t.Errorf("Mac reads a nil key and an empty one differently")
+	}
+	key := bytes.Repeat([]byte{0x0d}, 32)
+	if !bytes.Equal(crypto.Mac(key, nil), crypto.Mac(key, []byte{})) {
+		t.Errorf("Mac reads a nil message and an empty one differently")
 	}
 }
 
@@ -392,6 +528,132 @@ func variableTimeComparisonsIn(body string) []string {
 	return found
 }
 
+// One parsed go file, with the positions its statements can be rendered back through.
+//
+// Reading the parse tree rather than the file's characters is what turns a token list
+// into a shape. A hand written list of banned spellings is the thing this project has
+// understated five times running, and a comparison written as control flow carries none
+// of the tokens such a list holds while leaking exactly what the ban was about: a plain
+// byte loop inserted ahead of a subtle call passes a token gate and returns on the first
+// differing byte. A statement list does not care how the leak is spelled.
+type parsedSource struct {
+	fileSet *token.FileSet
+	file    *ast.File
+}
+
+// One file of this package, parsed. The path is read at test time rather than embedded,
+// so the gate reads what a reviewer will read.
+func mustParseSource(t *testing.T, path string) parsedSource {
+	t.Helper()
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return mustParseText(t, path, string(source))
+}
+
+// The same, over text a control holds, so every matcher below runs on a body known to
+// violate the rule as well as on the real one.
+func mustParseText(t *testing.T, name string, source string) parsedSource {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, name, source, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", name, err)
+	}
+	return parsedSource{fileSet: fileSet, file: file}
+}
+
+// The declaration of one function, or of one method on a named receiver type. Absence is
+// fatal rather than clean: a gate that stopped finding its subject must fail, not report
+// the subject it never read as compliant.
+func (self parsedSource) declarationOf(t *testing.T, receiver string, name string) *ast.FuncDecl {
+	t.Helper()
+	for _, declaration := range self.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Name.Name != name || self.receiverOf(function) != receiver {
+			continue
+		}
+		if function.Body == nil {
+			t.Fatalf("the declaration of %s %s has no body", receiver, name)
+		}
+		return function
+	}
+	t.Fatalf("no declaration of %s %s in %s", receiver, name, self.file.Name.Name)
+	return nil
+}
+
+// The receiver type of a declaration as it is written, or the empty string for a plain
+// function.
+func (self parsedSource) receiverOf(function *ast.FuncDecl) string {
+	if function.Recv == nil || len(function.Recv.List) != 1 {
+		return ""
+	}
+	return self.render(function.Recv.List[0].Type)
+}
+
+// One node back as source text. Rendering rather than slicing the original bytes is what
+// makes an expected statement a constant this file can hold: whitespace and line breaks
+// come out canonical however the file was written.
+func (self parsedSource) render(node ast.Node) string {
+	out := &bytes.Buffer{}
+	if err := printer.Fprint(out, self.fileSet, node); err != nil {
+		return "!render failed: " + err.Error()
+	}
+	return out.String()
+}
+
+// The statements of one declaration, each rendered.
+func (self parsedSource) statementsOf(t *testing.T, receiver string, name string) []string {
+	t.Helper()
+	rendered := []string{}
+	for _, statement := range self.declarationOf(t, receiver, name).Body.List {
+		rendered = append(rendered, self.render(statement))
+	}
+	return rendered
+}
+
+// Every assignment in the file that writes a field of a method's own receiver, as
+// "Method: statement". This is the mechanical half of the statelessness claim: a field
+// nobody writes is safe to share, and this reports the writes rather than trusting the
+// struct to stay the shape it is.
+func (self parsedSource) receiverFieldWrites(receiver string) []string {
+	writes := []string{}
+	for _, declaration := range self.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil || self.receiverOf(function) != receiver {
+			continue
+		}
+		names := function.Recv.List[0].Names
+		if len(names) != 1 {
+			continue
+		}
+		receiverName := names[0].Name
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			targets := []ast.Expr{}
+			switch statement := node.(type) {
+			case *ast.AssignStmt:
+				targets = statement.Lhs
+			case *ast.IncDecStmt:
+				targets = []ast.Expr{statement.X}
+			}
+			for _, target := range targets {
+				selector, isSelector := target.(*ast.SelectorExpr)
+				if !isSelector {
+					continue
+				}
+				base, isIdentifier := selector.X.(*ast.Ident)
+				if isIdentifier && base.Name == receiverName {
+					writes = append(writes, function.Name.Name+": "+self.render(node))
+				}
+			}
+			return true
+		})
+	}
+	slices.Sort(writes)
+	return writes
+}
+
 // Guardrail 8, checked by reading the source rather than by measuring, because a timing
 // measurement over a 32 byte comparison is noise on this machine and would be a flake in
 // continuous integration rather than a gate. What is asserted is therefore exactly what
@@ -418,6 +680,63 @@ func TestMacVerifyComparesInConstantTime(t *testing.T) {
 	}
 	if strings.Contains(control, constantTimeComparison) {
 		t.Errorf("the control body claims to call %s", constantTimeComparison)
+	}
+}
+
+// The receiver every method of the one implementation hangs off, as it is written.
+const providerReceiver = "*suiteCryptoProvider"
+
+// Exactly what MacVerify is allowed to be. The token gate above cannot see a comparison
+// spelled as control flow: a plain byte loop inserted ahead of the subtle call leaks the
+// position of the first differing byte, carries none of the banned tokens, and still
+// contains the required one. So the shape is pinned instead — these three statements and
+// nothing else — and a fourth statement of any kind fails here.
+var macVerifyStatements = []string{
+	"expected := self.Mac(key, data)",
+	"if len(tag) != len(expected) {\n\treturn false\n}",
+	"return subtle.ConstantTimeCompare(expected, tag) == 1",
+}
+
+// A MacVerify that a token gate reports clean and that leaks anyway. Every matcher below
+// runs on this as well as on crypto.go, so a matcher that stopped matching fails here
+// rather than issuing the real body a clean bill.
+const macVerifyLeakingControl = `package mls
+
+func (self *suiteCryptoProvider) MacVerify(key []byte, data []byte, tag []byte) bool {
+	expected := self.Mac(key, data)
+	if len(tag) != len(expected) {
+		return false
+	}
+	for i := range expected {
+		if expected[i] != tag[i] {
+			return false
+		}
+	}
+	return subtle.ConstantTimeCompare(expected, tag) == 1
+}
+`
+
+// Guardrail 8 again, as a shape rather than as a word list. What the token gate above
+// asserts is that a named variable time call is absent; what this asserts is that the
+// comparison is the only thing in the method, which is the claim the guardrail actually
+// makes. The control is a body the token gate passes and this one does not, so the two
+// halves are not the same assertion written twice.
+func TestMacVerifyIsOnlyTheConstantTimeComparison(t *testing.T) {
+	source := mustParseSource(t, macVerifySourcePath)
+	got := source.statementsOf(t, providerReceiver, "MacVerify")
+	if !slices.Equal(got, macVerifyStatements) {
+		t.Errorf("MacVerify is\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(macVerifyStatements, "\n"))
+	}
+	control := mustParseText(t, "the leaking control", macVerifyLeakingControl)
+	leaking := control.statementsOf(t, providerReceiver, "MacVerify")
+	if slices.Equal(leaking, macVerifyStatements) {
+		t.Errorf("the matcher read a body with a byte loop in it as the shape above")
+	}
+	// and the control is one the token gate really does pass, or this test is measuring
+	// a body the other gate would have caught anyway
+	body := methodBody(t, macVerifyLeakingControl, macVerifySignature)
+	if !strings.Contains(body, constantTimeComparison) || len(variableTimeComparisonsIn(body)) != 0 {
+		t.Errorf("the leaking control does not slip past the token gate, so this shape gate is untested")
 	}
 }
 
@@ -564,6 +883,51 @@ func TestProviderExpandIsAPrefixStream(t *testing.T) {
 	}
 	if bytes.Equal(crypto.Expand(prk, []byte("info"), 32), crypto.Expand(crypto.Extract([]byte("other salt"), []byte("ikm")), []byte("info"), 32)) {
 		t.Errorf("Expand ignores its pseudorandom key")
+	}
+	// every prk above is exactly the hash length, which is the one a wrapper truncating
+	// or padding its key agrees with. A longer one has to reach the hmac whole
+	long64 := append(bytes.Clone(prk), crypto.Extract([]byte("second salt"), []byte("ikm"))...)
+	if bytes.Equal(crypto.Expand(long64, []byte("info"), 32), crypto.Expand(long64[:32], []byte("info"), 32)) {
+		t.Errorf("Expand truncates a pseudorandom key longer than the hash")
+	}
+	if bytes.Equal(crypto.Expand(long64, []byte("info"), 32), crypto.Expand(long64[32:], []byte("info"), 32)) {
+		t.Errorf("Expand reads only the tail of a pseudorandom key longer than the hash")
+	}
+}
+
+// The other end of the same refusal. RFC 5869 section 2.3 requires a pseudorandom key of
+// at least the hash length, crypto/hkdf checks it only in fips140-only mode, and expanding
+// from a shorter one hands back every byte that was asked for while deriving all of them
+// from less entropy than the suite claims. That is the same silent downgrade as a short
+// return arriving from the other side, and a caller passing a stub or an empty slice is
+// exactly how it arrives.
+func TestProviderExpandRefusesAShortPseudorandomKey(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		full := crypto.Extract([]byte("salt"), []byte("ikm"))
+		if len(full) != crypto.HashSize() {
+			t.Fatalf("suite %#04x Extract produced %d bytes for a HashSize of %d", uint16(suite), len(full), crypto.HashSize())
+		}
+		for _, short := range [][]byte{nil, {}, full[:1], full[:16], full[:crypto.HashSize()-1]} {
+			recovered := recoveredPanic(func() { crypto.Expand(short, []byte("info"), 32) })
+			if recovered == nil {
+				t.Errorf("suite %#04x Expand under a %d byte pseudorandom key returned instead of refusing",
+					uint16(suite), len(short))
+				continue
+			}
+			if got := fmt.Sprint(recovered); !strings.HasPrefix(got, "mls: hkdf expand pseudorandom key ") {
+				t.Errorf("suite %#04x Expand under a %d byte pseudorandom key was refused by %q, not by this package's gate",
+					uint16(suite), len(short), got)
+			}
+		}
+		// the control: a key of exactly the hash length, and one longer, are both served,
+		// or the table above is satisfied by an Expand that refuses everything
+		for _, served := range [][]byte{full, append(bytes.Clone(full), full...)} {
+			if recovered := recoveredPanic(func() { crypto.Expand(served, []byte("info"), 32) }); recovered != nil {
+				t.Errorf("suite %#04x Expand under a %d byte pseudorandom key was refused with %v",
+					uint16(suite), len(served), recovered)
+			}
+		}
 	}
 }
 
@@ -766,18 +1130,24 @@ func TestProviderResultsDoNotShareMemoryWithTheirInputs(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	spare := func(b []byte) []byte { return append(make([]byte, 0, len(b)+64), b...) }
 
-	data := spare([]byte("the message"))
-	dataBefore := bytes.Clone(data)
-	digest := crypto.Hash(data)
-	tag := crypto.Mac(spare([]byte("key")), data)
-	prk := crypto.Extract(spare([]byte("salt")), data)
-	okm := crypto.Expand(prk, data, 48)
-	if !bytes.Equal(data, dataBefore) {
-		t.Errorf("a primitive changed its input from %x to %x", dataBefore, data)
-	}
-	for _, result := range [][]byte{digest, tag, prk, okm} {
-		if len(result) != 0 && &result[0] == &data[0] {
-			t.Errorf("a primitive returned a slice aliasing its input")
+	// both at a length nothing here shares with a result and at exactly HashSize, where
+	// the natural mistake is to hand the caller's own buffer back
+	for _, data := range [][]byte{
+		spare([]byte("the message")),
+		spare(crypto.Hash([]byte("a message of exactly the digest length"))),
+	} {
+		dataBefore := bytes.Clone(data)
+		digest := crypto.Hash(data)
+		tag := crypto.Mac(spare([]byte("key")), data)
+		prk := crypto.Extract(spare([]byte("salt")), data)
+		okm := crypto.Expand(prk, data, 48)
+		if !bytes.Equal(data, dataBefore) {
+			t.Errorf("a primitive changed its %d byte input from %x to %x", len(data), dataBefore, data)
+		}
+		for _, result := range [][]byte{digest, tag, prk, okm} {
+			if len(result) != 0 && &result[0] == &data[0] {
+				t.Errorf("a primitive returned a slice aliasing its %d byte input", len(data))
+			}
 		}
 	}
 
@@ -831,6 +1201,32 @@ func randomScript(t *testing.T) []byte {
 	return mustDecodeHex(t, "the random script", randomScriptHex)
 }
 
+// The lengths drawn from the script, in order, and the one place they are written. The
+// adequacy test and the consumption test both read this, so the windows proved adequate
+// are exactly the windows drawn: a list written out twice drifts, and a probe proved over
+// bytes nothing asks for proves nothing.
+var randomDrawLengths = []int{32, 16, 1, 47}
+
+// The stretches of the script the draws above land in, plus the whole of it. A draw of one
+// byte contributes no window: sorting, reversing and rotating a single byte are all the
+// identity, so there is nothing to prove about it and claiming otherwise would fail.
+func randomScriptWindows(t *testing.T) [][]byte {
+	t.Helper()
+	script := randomScript(t)
+	windows := [][]byte{script}
+	taken := 0
+	for _, length := range randomDrawLengths {
+		if length > 1 {
+			windows = append(windows, script[taken:taken+length])
+		}
+		taken += length
+	}
+	if taken != len(script) {
+		t.Fatalf("the draws cover %d bytes of a %d byte script", taken, len(script))
+	}
+	return windows
+}
+
 // The probe has to be able to see the mutants it is aimed at, and an ascending or
 // palindromic script cannot: sorting a script that is already sorted is the identity, and
 // so is reversing one that reads the same backwards. Task 4's key generator passed a
@@ -842,31 +1238,9 @@ func TestRandomScriptCanSeeAWeakenedReader(t *testing.T) {
 	if len(script) != 96 {
 		t.Fatalf("the script is %d bytes, want 96", len(script))
 	}
-	windows := [][]byte{script, script[:32], script[32:64], script[64:96], script[:16], script[16:32]}
-	for _, window := range windows {
-		ordered := bytes.Clone(window)
-		slices.Sort(ordered)
-		if bytes.Equal(window, ordered) {
-			t.Errorf("the window %x is already sorted, so a sorting reader is invisible in it", window)
-		}
-		slices.Reverse(ordered)
-		if bytes.Equal(window, ordered) {
-			t.Errorf("the window %x is sorted descending", window)
-		}
-		reversed := bytes.Clone(window)
-		slices.Reverse(reversed)
-		if bytes.Equal(window, reversed) {
-			t.Errorf("the window %x reads the same backwards, so a reversing reader is invisible in it", window)
-		}
-		for shift := 1; shift < len(window); shift++ {
-			rotated := append(bytes.Clone(window[shift:]), window[:shift]...)
-			if bytes.Equal(window, rotated) {
-				t.Errorf("the window %x equals itself rotated by %d", window, shift)
-			}
-		}
-		if bytes.Equal(window, bytes.Repeat(window[:1], len(window))) {
-			t.Errorf("the window %x is constant", window)
-		}
+	windows := randomScriptWindows(t)
+	for i, window := range windows {
+		assertProbeIsNotItsOwnPermutation(t, fmt.Sprintf("the window %d of the script", i), window)
 	}
 	for i := 0; i < len(windows); i++ {
 		for j := i + 1; j < len(windows); j++ {
@@ -886,7 +1260,7 @@ func TestProviderRandomConsumesItsReaderInOrder(t *testing.T) {
 	script := randomScript(t)
 	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, bytes.NewReader(script))
 	taken := 0
-	for _, length := range []int{32, 16, 1, 47} {
+	for _, length := range randomDrawLengths {
 		got := crypto.Random(length)
 		want := script[taken : taken+length]
 		if !bytes.Equal(got, want) {
@@ -994,13 +1368,199 @@ func TestProviderRandomIsNotConstant(t *testing.T) {
 	}
 }
 
-// The default constructor must not be deterministic. A provider that quietly took a fixed
-// stream would pass every other test in this package and destroy every key in production.
-func TestNewCryptoProviderDefaultsToCryptoRand(t *testing.T) {
+// Two default providers must not repeat each other. This is named for what it can see
+// rather than for the property it is near: a stream that varies is all a caller outside
+// the process can observe, and a sha256 counter, a linear congruential generator and a
+// process wide seed all vary. The claim that the varying stream is the operating system's
+// is not observable from here at all — no black box test separates a cryptographic source
+// from a seeded one, which is the whole point of a seeded one — so it is held by reading
+// the constructor instead, in TestNewCryptoProviderReadsTheProcessEntropySource below.
+// What this catches is the degenerate half: a constant or zero stream.
+func TestTwoDefaultProvidersDoNotRepeatEachOther(t *testing.T) {
 	first := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	second := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if bytes.Equal(first.Random(32), second.Random(32)) {
 		t.Fatalf("two default providers produced the same random bytes")
+	}
+}
+
+// Exactly what NewCryptoProvider is allowed to be. One statement, naming crypto/rand's
+// own reader and constructing nothing: a wrapper around it, a seeded expansion of it or
+// any other reader is a different statement and fails.
+var newCryptoProviderStatements = []string{
+	"return NewCryptoProviderWithRandom(suite, rand.Reader)",
+}
+
+// The import that supplies it, asserted separately so a file that no longer reads the
+// operating system at all fails on the import as well as on the statement.
+const cryptoRandImportPath = `"crypto/rand"`
+
+// A constructor over a stream that varies and is entirely predictable. Deleting
+// crypto/rand from crypto.go and substituting this passes every behavioural test in this
+// package, because two providers over a counter still disagree with each other — so this
+// is the body every matcher below is proved against.
+const newCryptoProviderDeterministicControl = `package mls
+
+import (
+	"crypto/sha256"
+)
+
+func NewCryptoProvider(suite CipherSuite) (CryptoProvider, error) {
+	return NewCryptoProviderWithRandom(suite, deterministicDefault{})
+}
+
+type deterministicDefault struct{}
+
+var deterministicCounter uint64
+
+func (deterministicDefault) Read(p []byte) (int, error) {
+	deterministicCounter++
+	block := sha256.Sum256([]byte{byte(deterministicCounter)})
+	return copy(p, block[:]), nil
+}
+`
+
+// The source of every key this package will ever generate, held by reading crypto.go.
+//
+// This is the one claim in this file that no input can distinguish from its violation.
+// A provider whose default source is a counter expanded through sha256 answers every
+// behavioural question exactly as the real one does: its output is never constant, never
+// zero, never repeated between two providers, and never repeated between two calls. It is
+// also entirely predictable, and every key, nonce and signature seed the implementation
+// produces would be recoverable from it. So the assertion is the constructor's own text,
+// mechanically, and the matcher is proved on a control that is precisely that substitution
+// rather than on a body that fails for some easier reason.
+func TestNewCryptoProviderReadsTheProcessEntropySource(t *testing.T) {
+	source := mustParseSource(t, macVerifySourcePath)
+	got := source.statementsOf(t, "", "NewCryptoProvider")
+	if !slices.Equal(got, newCryptoProviderStatements) {
+		t.Errorf("NewCryptoProvider is\n%s\nwant\n%s",
+			strings.Join(got, "\n"), strings.Join(newCryptoProviderStatements, "\n"))
+	}
+	if !slices.Contains(importPathsOf(source), cryptoRandImportPath) {
+		t.Errorf("%s does not import %s, so nothing in it reads the operating system",
+			macVerifySourcePath, cryptoRandImportPath)
+	}
+	control := mustParseText(t, "the deterministic control", newCryptoProviderDeterministicControl)
+	if substituted := control.statementsOf(t, "", "NewCryptoProvider"); slices.Equal(substituted, newCryptoProviderStatements) {
+		t.Errorf("the matcher read a constructor over a counter stream as the shape above")
+	}
+	if slices.Contains(importPathsOf(control), cryptoRandImportPath) {
+		t.Errorf("the control claims to import %s", cryptoRandImportPath)
+	}
+}
+
+// The import paths of one parsed file, quoted as they are written.
+func importPathsOf(source parsedSource) []string {
+	paths := []string{}
+	for _, imported := range source.file.Imports {
+		paths = append(paths, imported.Path.Value)
+	}
+	return paths
+}
+
+// Nothing is substituted for the source a caller passed. A constructor that quietly
+// replaced a nil reader with crypto/rand would make a test believing it had pinned the
+// randomness draw from production entropy instead, and the failing case it was written to
+// reproduce would stop reproducing. Random over a nil reader has nowhere to read from, so
+// the refusal is what says no substitution happened.
+func TestNewCryptoProviderWithRandomSubstitutesNothing(t *testing.T) {
+	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
+	if recovered := recoveredPanic(func() { crypto.Random(32) }); recovered == nil {
+		t.Errorf("a provider over a nil reader produced bytes, so it read something else")
+	}
+}
+
+// The fields the one implementation is allowed to hold, and what makes sharing it safe.
+// A field added later fails here on purpose: whether the new one is written after
+// construction is the question this whole test exists to ask, and answering it is a line
+// of thought rather than a line of code.
+var providerFields = []string{"params *mls.SuiteParams", "random io.Reader"}
+
+// A provider that keeps a call count. Its methods are the real ones with one assignment
+// added, which is the smallest version of the defect and the one a matcher aimed at
+// something louder would miss.
+const providerStatefulControl = `package mls
+
+type suiteCryptoProvider struct {
+	params *SuiteParams
+	random io.Reader
+	calls  int
+}
+
+func (self *suiteCryptoProvider) Hash(data []byte) []byte {
+	self.calls++
+	digest := sha256.Sum256(data)
+	return digest[:]
+}
+`
+
+// Spec A section 3.6, as a structure rather than as a hope. The concurrency test below
+// cannot see a data race in this environment — -race needs cgo and there is no C compiler
+// on this machine — so a provider carrying two shared fields written by every Hash call
+// runs thirty two goroutines over them and reports nothing. What holds the claim instead
+// is that the type has exactly the two fields it is documented to have, and that no method
+// writes to either: an immutable value shared between goroutines cannot race, whether or
+// not the detector is available to say so.
+func TestTheProviderHoldsNoMutableState(t *testing.T) {
+	fields := []string{}
+	providerType := reflect.TypeOf(suiteCryptoProvider{})
+	for i := 0; i < providerType.NumField(); i++ {
+		field := providerType.Field(i)
+		fields = append(fields, field.Name+" "+field.Type.String())
+	}
+	if !slices.Equal(fields, providerFields) {
+		t.Errorf("suiteCryptoProvider holds %v, want %v — a new field has to be shown never written",
+			fields, providerFields)
+	}
+	source := mustParseSource(t, macVerifySourcePath)
+	if writes := source.receiverFieldWrites(providerReceiver); len(writes) != 0 {
+		t.Errorf("a method of %s writes to its receiver, so the provider is not safe to share: %v",
+			providerReceiver, writes)
+	}
+	control := mustParseText(t, "the stateful control", providerStatefulControl)
+	if writes := control.receiverFieldWrites(providerReceiver); len(writes) == 0 {
+		t.Errorf("the matcher reported no receiver write in a method whose first statement is one")
+	}
+}
+
+// Every call returns storage of its own. A provider that answered out of one cached buffer
+// would pass every equality test in this file — each answer is right when it is read — and
+// would hand two goroutines the same array to write, and hand one caller a digest that
+// changes under it when the next call is made. The aliasing test above compares a result
+// against its input; this compares two results against each other, which is the direction
+// a cache is invisible in.
+func TestProviderResultsAreFreshBuffers(t *testing.T) {
+	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519,
+		bytes.NewReader(bytes.Repeat(randomScript(t), 2)))
+	prk := crypto.Extract([]byte("salt"), []byte("ikm"))
+	for _, testCase := range []struct {
+		name string
+		call func() []byte
+	}{
+		{name: "Hash", call: func() []byte { return crypto.Hash([]byte("data")) }},
+		{name: "Mac", call: func() []byte { return crypto.Mac([]byte("key"), []byte("data")) }},
+		{name: "Extract", call: func() []byte { return crypto.Extract([]byte("salt"), []byte("ikm")) }},
+		{name: "Expand", call: func() []byte { return crypto.Expand(prk, []byte("info"), 48) }},
+		{name: "Random", call: func() []byte { return crypto.Random(32) }},
+	} {
+		first, second := testCase.call(), testCase.call()
+		if len(first) == 0 || len(second) == 0 {
+			t.Errorf("%s returned nothing, so this shares nothing either", testCase.name)
+			continue
+		}
+		if &first[0] == &second[0] {
+			t.Errorf("two calls to %s returned the same storage", testCase.name)
+			continue
+		}
+		// and holding the first result across the second call does not change it, which
+		// is the failure a caller actually sees
+		held := bytes.Clone(first)
+		testCase.call()
+		if !bytes.Equal(first, held) {
+			t.Errorf("a result of %s changed from %x to %x when %s was called again",
+				testCase.name, held, first, testCase.name)
+		}
 	}
 }
 
@@ -1016,7 +1576,11 @@ func TestProviderWithRandomIsDeterministic(t *testing.T) {
 }
 
 // Spec A section 3.6: the provider NewCryptoProvider returns is stateless and safe for
-// concurrent use. Run under -race, which is what makes this mean anything.
+// concurrent use. Under -race this is the whole assertion; without it the race detector is
+// absent and this exercises the methods concurrently without being able to report a race,
+// so TestTheProviderHoldsNoMutableState is what carries the claim on a machine with no c
+// compiler. Both are here because they fail on different things: this one on a method that
+// disagrees with itself, that one on the shared field a disagreement would come from.
 func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	key := bytes.Repeat([]byte{0x0f}, 32)
