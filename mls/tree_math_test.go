@@ -812,3 +812,610 @@ func TestRoot(t *testing.T) {
 		}
 	}
 }
+
+// reports whether two node slices hold the same indices in the same order.
+// callers report the whole slice on a mismatch, because a path bug is almost
+// never at the element the first difference lands on.
+func sameNodeIndexes(got []NodeIndex, want []NodeIndex) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// the node at the given level spanning the given block of 2^level leaves, so
+// leaf L is the node at level zero and block L.
+//
+// RFC 9420 appendix C figure 32 lays a level-k node at the centre of the
+// 2^(k+1)-1 array slots it spans, which puts the b-th of them at
+// b*2^(k+1) + 2^k - 1. the arithmetic runs in uint64 so the last leaf of the
+// largest tree, node 2^32-2, is built without a wrap.
+func nodeAt(level uint32, block uint64) NodeIndex {
+	return NodeIndex(block<<(level+1) + uint64(1)<<level - 1)
+}
+
+// the direct path and copath of the node at (level, block) in a tree of the
+// given depth, from the array layout alone.
+//
+// no function of this package is called here, so the expectation cannot agree
+// with a wrong DirectPath or Copath by construction — which a table derived
+// from the functions under test would, and which is the shape this project has
+// rejected four times.
+//
+// the ancestor of a node at level k is the node covering the block of leaves
+// that contains it, at (k, block >> (k-level)); the copath entry beside that
+// ancestor is the ancestor's other child, one level down and in the sibling
+// block, at (k-1, (block >> (k-1-level)) ^ 1). neither form is argued for:
+// TestDirectPathAndCopathRfcTable2 runs both against all five rows RFC 9420
+// table 2 publishes and against the ten further nodes figure 11 draws, so a
+// wrong form fails there, against published data, before any sweep uses it.
+func pathOracle(level uint32, block uint64, depth uint32) ([]NodeIndex, []NodeIndex) {
+	directPath := []NodeIndex{}
+	copathNodes := []NodeIndex{}
+	for k := level + 1; k <= depth; k += 1 {
+		directPath = append(directPath, nodeAt(k, block>>(k-level)))
+		copathNodes = append(copathNodes, nodeAt(k-1, (block>>(k-1-level))^1))
+	}
+	return directPath, copathNodes
+}
+
+// RFC 9420 figure 11 and table 2: an eight-leaf tree with members at leaves
+// 0, 1, 4, 5 and 6. the figure labels the blank parents U, V, Z and the blank
+// leaf H, and table 2 publishes the direct path and copath of every member.
+//
+// table 2 is read out of the RFC text at
+// https://www.rfc-editor.org/rfc/rfc9420.txt section 4.1.2, and cross-read
+// against the copy at mls_measure/mls-go/rfc9420.txt, sha256
+// 467d709b7cea19d278204daca1af01910add522cd8e3325cb406f339efbb0d92. the two
+// readings agree. the published rows are:
+//
+//	Node | Direct path | Copath  | Filtered Direct Path
+//	A    | T, U, W     | B, V, Y | T, W
+//	B    | T, U, W     | A, V, Y | T, W
+//	E    | X, Y, W     | F, Z, U | X, Y, W
+//	F    | X, Y, W     | E, Z, U | X, Y, W
+//	G    | Z, Y, W     | H, X, U | Y, W
+//
+// the filtered column belongs to Task 12 and is not asserted here.
+//
+// node indices for the figure's labels:
+//
+//	A = 0   B = 2   E = 8   F = 10  G = 12  H = 14 (blank leaf 7)
+//	T = 1   V = 5 (blank)   X = 9   Z = 13 (blank)
+//	U = 3 (blank)           Y = 11
+//	W = 7 (root)
+//
+// table 2 publishes five of the tree's fifteen nodes, all of them leaves and
+// none of them the last leaf. the other ten are read off the tree figure 11
+// draws, which is published too and is what the RFC derives table 2 from; the
+// rows say which they are so a reviewer can see where the oracle ends and the
+// figure continued begins. all fifteen are here because the five published rows
+// leave two of the eight leaves, every parent and the root unasserted, and a
+// path that is right for a leaf and wrong for a parent is exactly what Task 12
+// and the TreeKEM plan go on to call.
+func TestDirectPathAndCopathRfcTable2(t *testing.T) {
+	pathCases := []struct {
+		label      string
+		published  bool
+		nodeIndex  NodeIndex
+		level      uint32
+		block      uint64
+		directPath []NodeIndex
+		copath     []NodeIndex
+	}{
+		{label: "A", published: true, nodeIndex: 0, level: 0, block: 0, directPath: []NodeIndex{1, 3, 7}, copath: []NodeIndex{2, 5, 11}},
+		{label: "B", published: true, nodeIndex: 2, level: 0, block: 1, directPath: []NodeIndex{1, 3, 7}, copath: []NodeIndex{0, 5, 11}},
+		{label: "E", published: true, nodeIndex: 8, level: 0, block: 4, directPath: []NodeIndex{9, 11, 7}, copath: []NodeIndex{10, 13, 3}},
+		{label: "F", published: true, nodeIndex: 10, level: 0, block: 5, directPath: []NodeIndex{9, 11, 7}, copath: []NodeIndex{8, 13, 3}},
+		{label: "G", published: true, nodeIndex: 12, level: 0, block: 6, directPath: []NodeIndex{13, 11, 7}, copath: []NodeIndex{14, 9, 3}},
+
+		// the two blank leaves figure 11 leaves unlabelled, at 2 and 3. they
+		// are the only nodes whose level 1 ancestor is V, and no published row
+		// reaches V from below.
+		{label: "leaf 2", nodeIndex: 4, level: 0, block: 2, directPath: []NodeIndex{5, 3, 7}, copath: []NodeIndex{6, 1, 11}},
+		{label: "leaf 3", nodeIndex: 6, level: 0, block: 3, directPath: []NodeIndex{5, 3, 7}, copath: []NodeIndex{4, 1, 11}},
+		// H, the blank leaf at 7 and the last leaf of the tree. its direct path
+		// is G's published one, the two being siblings, and its copath differs
+		// from G's only in the first entry, which figure 11 draws as G.
+		{label: "H", nodeIndex: 14, level: 0, block: 7, directPath: []NodeIndex{13, 11, 7}, copath: []NodeIndex{12, 9, 3}},
+
+		// the four level 1 parents.
+		{label: "T", nodeIndex: 1, level: 1, block: 0, directPath: []NodeIndex{3, 7}, copath: []NodeIndex{5, 11}},
+		{label: "V", nodeIndex: 5, level: 1, block: 1, directPath: []NodeIndex{3, 7}, copath: []NodeIndex{1, 11}},
+		{label: "X", nodeIndex: 9, level: 1, block: 2, directPath: []NodeIndex{11, 7}, copath: []NodeIndex{13, 3}},
+		{label: "Z", nodeIndex: 13, level: 1, block: 3, directPath: []NodeIndex{11, 7}, copath: []NodeIndex{9, 3}},
+
+		// the two level 2 parents, whose paths are one node long. that is the
+		// shortest non-empty path either function returns and the one length at
+		// which a copath built by shifting the direct path the wrong way still
+		// comes out the right length.
+		{label: "U", nodeIndex: 3, level: 2, block: 0, directPath: []NodeIndex{7}, copath: []NodeIndex{11}},
+		{label: "Y", nodeIndex: 11, level: 2, block: 1, directPath: []NodeIndex{7}, copath: []NodeIndex{3}},
+
+		// and the root, whose direct path RFC 9420 section 4.1.2 defines as the
+		// empty list before it defines any other.
+		{label: "W", nodeIndex: 7, level: 3, block: 0, directPath: []NodeIndex{}, copath: []NodeIndex{}},
+	}
+
+	// both arms are counted, as in Tasks 5 and 6. the empty arm is one row of
+	// fifteen here, so a loop that reached only the fourteen rows with a path
+	// on them would look like full coverage of this tree while asserting
+	// nothing whatever about the definition the RFC states first.
+	emptyPaths, definedPaths, publishedRows := 0, 0, 0
+
+	for _, c := range pathCases {
+		if c.published {
+			publishedRows += 1
+		}
+		if len(c.directPath) == 0 {
+			emptyPaths += 1
+		} else {
+			definedPaths += 1
+		}
+
+		// the row names its node twice, once as an index and once as a level
+		// and a block, and every sweep below reaches a node only through the
+		// second. a mistyped pair would leave those sweeps walking a different
+		// node from the one this row pins.
+		if got := nodeAt(c.level, c.block); got != c.nodeIndex {
+			t.Errorf("%s: node at level %d block %d: %d, want %d", c.label, c.level, c.block, got, c.nodeIndex)
+		}
+
+		// the layout oracle every sweep below takes its expectation from,
+		// against the published values. this is the anchor: two wrong closed
+		// forms fail here, against table 2, rather than agreeing quietly with a
+		// wrong implementation at a depth the RFC publishes nothing for.
+		oracleDirect, oracleCopath := pathOracle(c.level, c.block, 3)
+		if !sameNodeIndexes(oracleDirect, c.directPath) {
+			t.Errorf("%s: oracle direct path: %v, want %v", c.label, oracleDirect, c.directPath)
+		}
+		if !sameNodeIndexes(oracleCopath, c.copath) {
+			t.Errorf("%s: oracle copath: %v, want %v", c.label, oracleCopath, c.copath)
+		}
+
+		gotDirect, err := DirectPath(c.nodeIndex, 8)
+		if err != nil {
+			t.Errorf("%s direct path: %v", c.label, err)
+			continue
+		}
+		if !sameNodeIndexes(gotDirect, c.directPath) {
+			t.Errorf("%s direct path: %v, want %v", c.label, gotDirect, c.directPath)
+		}
+
+		gotCopath, err := Copath(c.nodeIndex, 8)
+		if err != nil {
+			t.Errorf("%s copath: %v", c.label, err)
+			continue
+		}
+		if !sameNodeIndexes(gotCopath, c.copath) {
+			t.Errorf("%s copath: %v, want %v", c.label, gotCopath, c.copath)
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// the eight-leaf tree holds fifteen nodes and exactly one of them, the
+		// root, has an empty path.
+		{label: "empty paths", got: emptyPaths, want: 1},
+		{label: "paths with nodes on them", got: definedPaths, want: 14},
+		// table 2 publishes five rows. deleting one would otherwise leave this
+		// test passing on the figure rows alone, with no published oracle in it
+		// at all.
+		{label: "published rows", got: publishedRows, want: 5},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the two arms neither table 2 nor any sweep of nodes inside a tree reaches:
+// the node that has no path at all, and the index that has no node.
+//
+// both arms are counted and both counts are asserted, as in Tasks 5 and 6. a
+// runner that exercised only the arm with an answer in it looks like full
+// coverage and is not, and here the empty arm is the one the RFC defines first
+// and the one a caller ranges over without checking.
+func TestDirectPathAndCopathEdges(t *testing.T) {
+	emptyPaths, outOfRangeRefusals, invalidCountRefusals := 0, 0, 0
+
+	// the root has an empty direct path and an empty copath, at every depth the
+	// index type can hold rather than at the one depth table 2 covers, and the
+	// empty slice is not nil: the doc comments promise a caller can range over
+	// the result with no nil check, and a promise nothing asserts is what p2
+	// task 9 shipped.
+	//
+	// depth zero is the one-leaf tree, whose only node is both its sole leaf
+	// and its root. it is called out again below because it is the arm a caller
+	// creating a group reaches first.
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		root, err := Root(leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: root: %v", leafCount, err)
+		}
+
+		rootPath, err := DirectPath(root, leafCount)
+		if err != nil {
+			t.Errorf("%d leaves: direct path of the root: %v", leafCount, err)
+		} else if len(rootPath) != 0 {
+			t.Errorf("%d leaves: direct path of the root: %v, want empty", leafCount, rootPath)
+		} else if rootPath == nil {
+			t.Errorf("%d leaves: direct path of the root is nil, want an empty slice", leafCount)
+		} else {
+			emptyPaths += 1
+		}
+
+		rootCopath, err := Copath(root, leafCount)
+		if err != nil {
+			t.Errorf("%d leaves: copath of the root: %v", leafCount, err)
+		} else if len(rootCopath) != 0 {
+			t.Errorf("%d leaves: copath of the root: %v, want empty", leafCount, rootCopath)
+		} else if rootCopath == nil {
+			t.Errorf("%d leaves: copath of the root is nil, want an empty slice", leafCount)
+		} else {
+			emptyPaths += 1
+		}
+
+		// an index past the end of this tree is refused rather than answered,
+		// and the refusal comes with no slice: a partly built path handed back
+		// beside an error is a path a caller reading only the value walks.
+		//
+		// three indices, for the reasons Task 6's runner gives. the width
+		// itself separates a guard reading at least the width from one reading
+		// more than it; one past the width stops a guard holed at exactly that
+		// index; and the top of the type stops a guard that refuses the first
+		// indices outside the tree and answers beyond them. the largest tree's
+		// width fills the index type, so one past it is not representable and
+		// is skipped rather than wrapped round to node 0, which is in range.
+		width := uint64(NodeWidth(leafCount))
+		for _, probe := range []uint64{width, width + 1, 0xFFFFFFFF} {
+			if probe > 0xFFFFFFFF {
+				continue
+			}
+			nodeIndex := NodeIndex(probe)
+			if got, err := DirectPath(nodeIndex, leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("%d leaves: direct path of node %d: %v, want %v", leafCount, nodeIndex, err, ErrNodeOutOfRange)
+			} else if got != nil {
+				t.Errorf("%d leaves: direct path of node %d: %v alongside the refusal, want no slice", leafCount, nodeIndex, got)
+			} else {
+				outOfRangeRefusals += 1
+			}
+			if got, err := Copath(nodeIndex, leafCount); !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("%d leaves: copath of node %d: %v, want %v", leafCount, nodeIndex, err, ErrNodeOutOfRange)
+			} else if got != nil {
+				t.Errorf("%d leaves: copath of node %d: %v alongside the refusal, want no slice", leafCount, nodeIndex, got)
+			} else {
+				outOfRangeRefusals += 1
+			}
+		}
+	}
+
+	// the one-leaf tree on its own, because it is the shape a caller creating a
+	// group holds and the only tree whose sole leaf is also its root.
+	solePath, solePathErr := DirectPath(0, 1)
+	soleCopath, soleCopathErr := Copath(0, 1)
+	soleLeafCases := []struct {
+		label string
+		path  []NodeIndex
+		err   error
+	}{
+		{label: "direct path", path: solePath, err: solePathErr},
+		{label: "copath", path: soleCopath, err: soleCopathErr},
+	}
+	soleLeafEmpties := 0
+	for _, c := range soleLeafCases {
+		if c.err != nil {
+			t.Errorf("sole leaf %s: %v", c.label, c.err)
+		} else if len(c.path) != 0 {
+			t.Errorf("sole leaf %s: %v, want empty", c.label, c.path)
+		} else if c.path == nil {
+			t.Errorf("sole leaf %s is nil, want an empty slice", c.label)
+		} else {
+			soleLeafEmpties += 1
+		}
+	}
+
+	// a leaf count no tree can have is refused before any index arithmetic
+	// runs, and the sentinel says which kind of refusal it is: a caller told the
+	// count is not full can round it up with FullLeafCount and retry, and one
+	// told it is out of range cannot.
+	//
+	// two node indices per count, for the reason Task 6's runner gives. a
+	// version that discarded the error from Root would read a root of node 0,
+	// answer an empty path for node 0 and refuse for node 1, so the two indices
+	// separate it where either alone does not. the same pair separates a width
+	// check hoisted above the count check, which at zero leaves calls every
+	// index out of range instead.
+	invalidCountCases := []struct {
+		nodeIndex NodeIndex
+		leafCount LeafCount
+		err       error
+	}{
+		{nodeIndex: 0, leafCount: 3, err: ErrLeafCountNotFull},
+		{nodeIndex: 1, leafCount: 3, err: ErrLeafCountNotFull},
+		{nodeIndex: 0, leafCount: 6, err: ErrLeafCountNotFull},
+		{nodeIndex: 1, leafCount: 6, err: ErrLeafCountNotFull},
+		{nodeIndex: 0, leafCount: MaxLeafCount - 1, err: ErrLeafCountNotFull},
+		{nodeIndex: 1, leafCount: MaxLeafCount - 1, err: ErrLeafCountNotFull},
+		{nodeIndex: 0, leafCount: 0, err: ErrLeafCountRange},
+		{nodeIndex: 1, leafCount: 0, err: ErrLeafCountRange},
+		{nodeIndex: 0, leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
+		{nodeIndex: 1, leafCount: MaxLeafCount + 1, err: ErrLeafCountRange},
+		{nodeIndex: 0, leafCount: 0xFFFFFFFF, err: ErrLeafCountRange},
+		{nodeIndex: 1, leafCount: 0xFFFFFFFF, err: ErrLeafCountRange},
+	}
+	for _, c := range invalidCountCases {
+		if got, err := DirectPath(c.nodeIndex, c.leafCount); !errors.Is(err, c.err) {
+			t.Errorf("direct path of node %d in %d leaves: %v, want %v", c.nodeIndex, c.leafCount, err, c.err)
+		} else if got != nil {
+			t.Errorf("direct path of node %d in %d leaves: %v alongside the refusal, want no slice", c.nodeIndex, c.leafCount, got)
+		} else {
+			invalidCountRefusals += 1
+		}
+		if got, err := Copath(c.nodeIndex, c.leafCount); !errors.Is(err, c.err) {
+			t.Errorf("copath of node %d in %d leaves: %v, want %v", c.nodeIndex, c.leafCount, err, c.err)
+		} else if got != nil {
+			t.Errorf("copath of node %d in %d leaves: %v alongside the refusal, want no slice", c.nodeIndex, c.leafCount, got)
+		} else {
+			invalidCountRefusals += 1
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// thirty-two depths, two functions, one empty answer each.
+		{label: "empty paths", got: emptyPaths, want: 64},
+		{label: "sole leaf empty paths", got: soleLeafEmpties, want: 2},
+		// thirty-one depths probe three indices past the end of their tree and
+		// the largest probes two, since one past its width is not
+		// representable, and each probe is put to both functions.
+		{label: "out of range refusals", got: outOfRangeRefusals, want: 190},
+		// twelve rows, both functions.
+		{label: "invalid leaf count refusals", got: invalidCountRefusals, want: 24},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// one node's direct path and copath against the layout oracle, returning the
+// length the oracle predicts so the caller can count the empty arm from the
+// oracle rather than from the answer under test.
+func checkPathsAgainstOracle(t *testing.T, level uint32, block uint64, depth uint32, n LeafCount) int {
+	t.Helper()
+	nodeIndex := nodeAt(level, block)
+	wantDirect, wantCopath := pathOracle(level, block, depth)
+
+	gotDirect, err := DirectPath(nodeIndex, n)
+	if err != nil {
+		t.Fatalf("%d leaves: direct path of node %d: %v", n, nodeIndex, err)
+	}
+	if !sameNodeIndexes(gotDirect, wantDirect) {
+		t.Fatalf("%d leaves: direct path of node %d: %v, want %v", n, nodeIndex, gotDirect, wantDirect)
+	}
+
+	gotCopath, err := Copath(nodeIndex, n)
+	if err != nil {
+		t.Fatalf("%d leaves: copath of node %d: %v", n, nodeIndex, err)
+	}
+	if !sameNodeIndexes(gotCopath, wantCopath) {
+		t.Fatalf("%d leaves: copath of node %d: %v, want %v", n, nodeIndex, gotCopath, wantCopath)
+	}
+	return len(wantDirect)
+}
+
+// the absolute contents of both paths at every depth a tree can have, against
+// the layout oracle table 2 anchors.
+//
+// table 2 covers one depth. the vector family covers none of these two
+// functions at all, Task 13's sweep stops at depth 9 and asserts laws rather
+// than values, and the fuzz target asserts only that an answer is inside the
+// tree, so depths 10 to 31 are covered by nothing else in this package —
+// the same hole Tasks 5 and 6 each had to fill for their own functions.
+//
+// measured rather than argued, in a scratch copy: with the depth 10 to 31 band
+// below removed and every other row of this file kept, a mechanical enumeration
+// of these two bodies leaves versions passing that truncate the path, drop a
+// level, or shift the copath, at any depth above 9. the numbers are in the task
+// report.
+func TestDirectPathAndCopathAcrossEveryDepth(t *testing.T) {
+	emptyPaths, definedPaths := 0, 0
+
+	// depths 0 to 9 exhaustively. walking (level, block) rather than the node
+	// index reaches every node exactly once — level k holds 2^(depth-k) nodes
+	// and the widths sum to 2^(depth+1)-1 — and it is the pair the oracle takes,
+	// so no node index is ever handed back to the oracle to be taken apart.
+	for depth := uint32(0); depth <= 9; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		for level := uint32(0); level <= depth; level += 1 {
+			for block := uint64(0); block < uint64(1)<<(depth-level); block += 1 {
+				if checkPathsAgainstOracle(t, level, block, depth, leafCount) == 0 {
+					emptyPaths += 1
+				} else {
+					definedPaths += 1
+				}
+			}
+		}
+	}
+
+	// depths 10 to 31, where a tree has too many nodes to walk. five blocks at
+	// every level of every depth: the first and second block, the last and
+	// second to last, and one with alternating bits, which is what separates a
+	// version right for an all-left or all-right ancestor chain from one right
+	// for a chain that turns. the mask keeps the count the same at every level,
+	// so a level holding a single block simply repeats it rather than dropping
+	// out of the total below.
+	blockProbes := []uint64{0, 1, 0xFFFFFFFF, 0xFFFFFFFE, 0xA5A5A5A5}
+	highDepthEmpty, highDepthDefined := 0, 0
+	for depth := uint32(10); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		for level := uint32(0); level <= depth; level += 1 {
+			blockMask := uint64(1)<<(depth-level) - 1
+			for _, probe := range blockProbes {
+				if checkPathsAgainstOracle(t, level, probe&blockMask, depth, leafCount) == 0 {
+					highDepthEmpty += 1
+				} else {
+					highDepthDefined += 1
+				}
+			}
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// the ten trees from one to 512 leaves hold 2^(d+1)-1 nodes each,
+		// 2036 in all, which is the node total the corpus tripwire pins for
+		// the same ladder. one node of each is its root.
+		{label: "empty paths up to 512 leaves", got: emptyPaths, want: 10},
+		{label: "paths with nodes on them up to 512 leaves", got: definedPaths, want: 2026},
+		// twenty-two depths, depth+1 levels each, five blocks a level:
+		// 5 * (11 + 12 + ... + 32) = 5 * 473 = 2365. the five at the top level
+		// of each depth are the root, whose blocks all mask to zero.
+		{label: "empty paths above 512 leaves", got: highDepthEmpty, want: 110},
+		{label: "paths with nodes on them above 512 leaves", got: highDepthDefined, want: 2255},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the relationship the two functions are defined by, asserted on its own.
+//
+// RFC 9420 section 4.1.2 defines the copath of a node as the node's sibling
+// followed by the siblings of its direct path excluding the root, so the two
+// results are the pair a mirror-image bug hides in: a copath built by shifting
+// a wrong direct path agrees with it at every length, and a test that only
+// compared their lengths, or derived one from the other, would pass on both.
+// the absolute contents are pinned against table 2 and the layout oracle above
+// and are not restated here; what is asserted here is the relation, against the
+// Parent and Sibling the vector family and Task 6's boundary rows already pin
+// at every level and every leaf count.
+func TestCopathIsTheSiblingOfTheDirectPath(t *testing.T) {
+	checkedPositions, emptyPathNodes := 0, 0
+
+	// the same two bands the absolute sweep walks, for the same reason: the
+	// relation has to hold at depth 31 as well as at depth 3, and nothing else
+	// in this package puts either function into a tree that deep.
+	blockProbes := []uint64{0, 1, 0xFFFFFFFF, 0xFFFFFFFE, 0xA5A5A5A5}
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		root, err := Root(leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: root: %v", leafCount, err)
+		}
+		for level := uint32(0); level <= depth; level += 1 {
+			blocks := []uint64{}
+			if depth <= 9 {
+				for block := uint64(0); block < uint64(1)<<(depth-level); block += 1 {
+					blocks = append(blocks, block)
+				}
+			} else {
+				blockMask := uint64(1)<<(depth-level) - 1
+				for _, probe := range blockProbes {
+					blocks = append(blocks, probe&blockMask)
+				}
+			}
+
+			for _, block := range blocks {
+				nodeIndex := nodeAt(level, block)
+				directPath, err := DirectPath(nodeIndex, leafCount)
+				if err != nil {
+					t.Fatalf("%d leaves: direct path of node %d: %v", leafCount, nodeIndex, err)
+				}
+				copathNodes, err := Copath(nodeIndex, leafCount)
+				if err != nil {
+					t.Fatalf("%d leaves: copath of node %d: %v", leafCount, nodeIndex, err)
+				}
+				if len(copathNodes) != len(directPath) {
+					t.Fatalf("%d leaves: node %d has a copath of %d beside a direct path of %d", leafCount, nodeIndex, len(copathNodes), len(directPath))
+				}
+				if len(directPath) == 0 {
+					if nodeIndex != root {
+						t.Fatalf("%d leaves: node %d has an empty direct path but is not the root %d", leafCount, nodeIndex, root)
+					}
+					emptyPathNodes += 1
+					continue
+				}
+				if last := directPath[len(directPath)-1]; last != root {
+					t.Fatalf("%d leaves: direct path of node %d ends at %d, want the root %d", leafCount, nodeIndex, last, root)
+				}
+
+				child := nodeIndex
+				for i := range directPath {
+					// the direct path is the chain of parents from the node up.
+					if got, err := Parent(child, leafCount); err != nil {
+						t.Fatalf("%d leaves: parent of node %d: %v", leafCount, child, err)
+					} else if got != directPath[i] {
+						t.Fatalf("%d leaves: direct path of node %d has %d at position %d, but the parent of %d is %d", leafCount, nodeIndex, directPath[i], i, child, got)
+					}
+					// and the copath is that chain's siblings, which is the
+					// half of the relation a mirror-image pair gets wrong in
+					// step with the other half.
+					if got, err := Sibling(child, leafCount); err != nil {
+						t.Fatalf("%d leaves: sibling of node %d: %v", leafCount, child, err)
+					} else if got != copathNodes[i] {
+						t.Fatalf("%d leaves: copath of node %d has %d at position %d, but the sibling of %d is %d", leafCount, nodeIndex, copathNodes[i], i, child, got)
+					}
+					// read the other way as well: the copath entry hangs off
+					// the direct path entry beside it, and is the child of it
+					// the node does not descend from. a copath shifted by a
+					// position satisfies one of these two and not both.
+					if got, err := Parent(copathNodes[i], leafCount); err != nil {
+						t.Fatalf("%d leaves: parent of copath node %d: %v", leafCount, copathNodes[i], err)
+					} else if got != directPath[i] {
+						t.Fatalf("%d leaves: copath node %d at position %d has parent %d, want the direct path node %d", leafCount, copathNodes[i], i, got, directPath[i])
+					}
+					if copathNodes[i] == child {
+						t.Fatalf("%d leaves: copath of node %d repeats %d at position %d, want the other child", leafCount, nodeIndex, child, i)
+					}
+					if copathNodes[i] == root {
+						t.Fatalf("%d leaves: copath of node %d holds the root %d at position %d", leafCount, nodeIndex, root, i)
+					}
+					checkedPositions += 1
+					child = directPath[i]
+				}
+			}
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// one root per depth, thirty-two depths. the top level of a depth above
+		// 9 is probed five times and every probe masks to the root, so those
+		// twenty-two depths contribute five each.
+		{label: "nodes with an empty path", got: emptyPathNodes, want: 10 + 110},
+		// a node at level k of a depth d tree has d-k positions on its path.
+		// summed over every node of depths 0 to 9 that is
+		// sum(d=0..9) sum(j=0..d) j*2^j = 14362, and over the five blocks a
+		// level of depths 10 to 31 it is 5/2 * sum(d=10..31) d*(d+1) = 26455.
+		{label: "checked positions", got: checkedPositions, want: 40817},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}

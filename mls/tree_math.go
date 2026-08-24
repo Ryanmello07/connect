@@ -269,3 +269,82 @@ func Sibling(x NodeIndex, n LeafCount) (NodeIndex, error) {
 	}
 	return Left(p)
 }
+
+// the path from x to the root, ordered leaf to root, excluding x and including
+// the root. the root's direct path is empty (RFC 9420 section 4.1.2).
+//
+// the result is always a slice and never nil, empty root included, so a caller
+// can range over it without a nil check. a refusal carries no slice at all, so
+// a caller that reads the value and drops the error walks nothing rather than
+// walking a partly built path.
+//
+// the loop is bounded explicitly. it cannot run away for a validated index —
+// every step moves to a strictly higher level and the root holds the highest,
+// which the depth 31 rows of tree_math_test.go pin by walking a path of exactly
+// 31 nodes — but a structural bound makes that a property of the code rather
+// than of an argument about the code. no input reaches the bound, so no test
+// can exercise it; it is a brake against a future Parent, not asserted
+// behaviour.
+func DirectPath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
+	r, err := Root(n)
+	if err != nil {
+		return nil, err
+	}
+	if uint32(x) >= NodeWidth(n) {
+		return nil, ErrNodeOutOfRange
+	}
+
+	pathNodes := make([]NodeIndex, 0, TreeDepth(n))
+	for steps := uint32(0); x != r; steps += 1 {
+		if steps > 32 {
+			return nil, ErrNodeOutOfRange
+		}
+		x, err = Parent(x, n)
+		if err != nil {
+			return nil, err
+		}
+		pathNodes = append(pathNodes, x)
+	}
+	return pathNodes, nil
+}
+
+// the sibling of x followed by the sibling of every node on x's direct path
+// except the root, ordered leaf to root (RFC 9420 section 4.1.2).
+//
+// always the same length as the direct path, and every entry is the child of
+// the direct-path entry at the same position that x does not descend from. the
+// root has an empty copath, and as with the direct path the empty result is a
+// slice rather than nil and a refusal carries no slice.
+func Copath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
+	r, err := Root(n)
+	if err != nil {
+		return nil, err
+	}
+	if uint32(x) >= NodeWidth(n) {
+		return nil, ErrNodeOutOfRange
+	}
+	if x == r {
+		return []NodeIndex{}, nil
+	}
+
+	pathNodes, err := DirectPath(x, n)
+	if err != nil {
+		return nil, err
+	}
+
+	// the siblings wanted are those of x and of every direct-path node below
+	// the root, which is the direct path shifted down by one with x in front.
+	// the root is never the argument to Sibling, which is why no refusal from
+	// it can reach a caller here.
+	copathNodes := make([]NodeIndex, 0, len(pathNodes))
+	child := x
+	for _, pathNode := range pathNodes {
+		sibling, err := Sibling(child, n)
+		if err != nil {
+			return nil, err
+		}
+		copathNodes = append(copathNodes, sibling)
+		child = pathNode
+	}
+	return copathNodes, nil
+}
