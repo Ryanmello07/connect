@@ -813,9 +813,20 @@ func TestRoot(t *testing.T) {
 	}
 }
 
+// compares two node slices and reports the whole slice on a mismatch, because
+// a path bug is almost never at the element the first difference lands on.
+//
+// Task 11's resolution fixtures call this as well, so the signature is the one
+// the plan declares here rather than the predicate below, which the sweeps use
+// because they report a node index and a leaf count beside the two slices.
+func assertNodeIndexes(t *testing.T, label string, got []NodeIndex, want []NodeIndex) {
+	t.Helper()
+	if !sameNodeIndexes(got, want) {
+		t.Errorf("%s: %v, want %v", label, got, want)
+	}
+}
+
 // reports whether two node slices hold the same indices in the same order.
-// callers report the whole slice on a mismatch, because a path bug is almost
-// never at the element the first difference lands on.
 func sameNodeIndexes(got []NodeIndex, want []NodeIndex) bool {
 	if len(got) != len(want) {
 		return false
@@ -983,18 +994,14 @@ func TestDirectPathAndCopathRfcTable2(t *testing.T) {
 			t.Errorf("%s direct path: %v", c.label, err)
 			continue
 		}
-		if !sameNodeIndexes(gotDirect, c.directPath) {
-			t.Errorf("%s direct path: %v, want %v", c.label, gotDirect, c.directPath)
-		}
+		assertNodeIndexes(t, c.label+" direct path", gotDirect, c.directPath)
 
 		gotCopath, err := Copath(c.nodeIndex, 8)
 		if err != nil {
 			t.Errorf("%s copath: %v", c.label, err)
 			continue
 		}
-		if !sameNodeIndexes(gotCopath, c.copath) {
-			t.Errorf("%s copath: %v, want %v", c.label, gotCopath, c.copath)
-		}
+		assertNodeIndexes(t, c.label+" copath", gotCopath, c.copath)
 	}
 
 	countCases := []struct {
