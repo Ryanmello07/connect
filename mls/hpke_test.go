@@ -48,6 +48,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"math"
 	"testing"
 )
@@ -1889,5 +1890,418 @@ func TestHpkeOpenBaseRejectsWrongRecipient(t *testing.T) {
 	}
 	if _, err := HpkeOpenBase(params, otherPriv, kemOutput, nil, nil, ciphertext); !errors.Is(err, ErrAeadOpen) {
 		t.Fatalf("wrong recipient: error = %v, want ErrAeadOpen", err)
+	}
+}
+
+// The bytes two slices of one length differ by. It exists for one assertion — the
+// keystream comparison in TestHpkeSealBaseBuildsAFreshContextPerCall — and it refuses
+// unequal lengths rather than truncating, because a comparison over a prefix is a
+// comparison that could pass by saying less than it meant to.
+func xorOf(t *testing.T, a []byte, b []byte) []byte {
+	t.Helper()
+	if len(a) != len(b) {
+		t.Fatalf("xor of %d and %d bytes", len(a), len(b))
+	}
+	delta := make([]byte, len(a))
+	for i := range delta {
+		delta[i] = a[i] ^ b[i]
+	}
+	return delta
+}
+
+// TestHpkeSealBaseMatchesThePublishedSingleShot is the single shot's own known answer,
+// and it is what says the composition is the RFC's rather than merely self consistent.
+// RFC 9180 section 6.1 defines SealBase as SetupBaseS followed by exactly one Seal, so
+// the published enc and the published sequence zero ciphertext are together a statement
+// about the whole composition: that the ephemeral key came from the reader the caller
+// handed in, that the info reached the key schedule, that the aad reached the aead, and
+// that the one message was sealed at sequence zero and not at any other.
+//
+// The ephemeral key is the vector's own skEm, fed in as the reader. X25519GenerateKey
+// reads exactly thirty two bytes and uses them as the scalar, so a bytes.Reader over
+// skEm reproduces the published encapsulation and the enc that comes back has to be the
+// published one — which is the only way to check the randomized entry point against a
+// vector at all.
+//
+// Both halves of the aad are load bearing here and nowhere else. A sender and a receiver
+// that both ignored the aad agree with each other on every message and pass the round
+// trip, the wrong info test and the wrong recipient test alike; that mutation was applied
+// to hpke.go and survived the whole package. The published ciphertext covers the aad in
+// its tag, so it is the assertion that sees it.
+func TestHpkeSealBaseMatchesThePublishedSingleShot(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		if len(vector.encryptions) == 0 || vector.encryptions[0].sequence != 0 {
+			t.Fatalf("%s does not open at sequence 0, so a single shot cannot be compared against it", vector.name)
+		}
+		first := vector.encryptions[0]
+		info := decodePossiblyEmptyVectorField(t, vector.name, "info", vector.info)
+		aad := decodeVectorField(t, vector.name, "aad", first.aad)
+		plaintext := decodeVectorField(t, vector.name, "pt", first.pt)
+		wantEnc := decodeVectorField(t, vector.name, "enc", vector.enc)
+		wantCiphertext := decodeVectorField(t, vector.name, "ct", first.ct)
+		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.skEm)
+		recipient := decodeVectorField(t, vector.name, "pkRm", vector.pkRm)
+		recipientPriv := decodeVectorField(t, vector.name, "skRm", vector.skRm)
+
+		kemOutput, ciphertext, err := HpkeSealBase(bytes.NewReader(ephemeral), params, HpkePublicKey(recipient), info, aad, plaintext)
+		if err != nil {
+			t.Fatalf("%s: seal: %v", vector.name, err)
+		}
+		if !bytes.Equal(kemOutput, wantEnc) {
+			t.Errorf("%s: seal encapsulated to %x, want the published %x", vector.name, kemOutput, wantEnc)
+		}
+		if !bytes.Equal(ciphertext, wantCiphertext) {
+			t.Errorf("%s: seal produced %x, want the published sequence 0 ciphertext %x", vector.name, ciphertext, wantCiphertext)
+		}
+		back, err := HpkeOpenBase(params, HpkePrivateKey(recipientPriv), wantEnc, info, aad, wantCiphertext)
+		if err != nil {
+			t.Fatalf("%s: open of the published ciphertext: %v", vector.name, err)
+		}
+		if !bytes.Equal(back, plaintext) {
+			t.Errorf("%s: open returned %x, want the published plaintext %x", vector.name, back, plaintext)
+		}
+	}
+}
+
+// TestHpkeSetupBaseMatchesThePublishedSetup pins the two setup entry points the single
+// shots are built from, at the one point a caller can still see the context: the sending
+// side has to hand back the published enc and a context holding the published base nonce
+// and exporter secret, and both sides have to start at sequence zero, because that is
+// where every single shot message is sealed and opened.
+//
+// Sealing the published sequence zero message through the returned context is what pins
+// the key, which cipher.AEAD does not expose. Without it the aead key could be expanded
+// from anything and the base nonce and exporter secret would still match.
+//
+// The two values the setup passes on are separately confusable: the shared secret and the
+// encapsulated key are both thirty two bytes under this kem, so a setup that fed the
+// encapsulated key into the key schedule, or returned the shared secret as enc, compiles
+// and produces a working looking context. Both were applied to hpke.go; the published
+// base nonce is what refuses them.
+func TestHpkeSetupBaseMatchesThePublishedSetup(t *testing.T) {
+	requireAVectorPerRegisteredSuite(t)
+	for _, vector := range rfc9180BaseVectors {
+		params, err := LookupSuite(vector.suite)
+		if err != nil {
+			t.Fatalf("%s: LookupSuite: %v", vector.name, err)
+		}
+		if len(vector.encryptions) == 0 || vector.encryptions[0].sequence != 0 {
+			t.Fatalf("%s does not open at sequence 0, so a fresh context cannot be compared against it", vector.name)
+		}
+		first := vector.encryptions[0]
+		info := decodePossiblyEmptyVectorField(t, vector.name, "info", vector.info)
+		aad := decodeVectorField(t, vector.name, "aad", first.aad)
+		plaintext := decodeVectorField(t, vector.name, "pt", first.pt)
+		wantCiphertext := decodeVectorField(t, vector.name, "ct", first.ct)
+		wantEnc := decodeVectorField(t, vector.name, "enc", vector.enc)
+		wantBaseNonce := decodeVectorField(t, vector.name, "base_nonce", vector.baseNonce)
+		wantExporterSecret := decodeVectorField(t, vector.name, "exporter_secret", vector.exporterSecret)
+		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.skEm)
+		recipient := decodeVectorField(t, vector.name, "pkRm", vector.pkRm)
+		recipientPriv := decodeVectorField(t, vector.name, "skRm", vector.skRm)
+
+		kemOutput, sender, err := HpkeSetupBaseS(bytes.NewReader(ephemeral), params, HpkePublicKey(recipient), info)
+		if err != nil {
+			t.Fatalf("%s: setup base s: %v", vector.name, err)
+		}
+		if !bytes.Equal(kemOutput, wantEnc) {
+			t.Errorf("%s: setup base s encapsulated to %x, want the published %x", vector.name, kemOutput, wantEnc)
+		}
+		receiver, err := HpkeSetupBaseR(params, HpkePrivateKey(recipientPriv), wantEnc, info)
+		if err != nil {
+			t.Fatalf("%s: setup base r: %v", vector.name, err)
+		}
+		for _, side := range []struct {
+			name string
+			ctx  *HpkeContext
+		}{
+			{name: "setup base s", ctx: sender},
+			{name: "setup base r", ctx: receiver},
+		} {
+			if side.ctx.sequence != 0 {
+				t.Errorf("%s: %s returned a context at sequence %d, want 0", vector.name, side.name, side.ctx.sequence)
+			}
+			if !bytes.Equal(side.ctx.baseNonce, wantBaseNonce) {
+				t.Errorf("%s: %s base nonce is %x, want the published %x", vector.name, side.name, side.ctx.baseNonce, wantBaseNonce)
+			}
+			if !bytes.Equal(side.ctx.exporterSecret, wantExporterSecret) {
+				t.Errorf("%s: %s exporter secret is %x, want the published %x", vector.name, side.name, side.ctx.exporterSecret, wantExporterSecret)
+			}
+		}
+		ciphertext, err := sender.Seal(aad, plaintext)
+		if err != nil {
+			t.Fatalf("%s: seal through the returned context: %v", vector.name, err)
+		}
+		if !bytes.Equal(ciphertext, wantCiphertext) {
+			t.Errorf("%s: the context from setup base s sealed to %x, want the published sequence 0 ciphertext %x", vector.name, ciphertext, wantCiphertext)
+		}
+		back, err := receiver.Open(aad, wantCiphertext)
+		if err != nil {
+			t.Fatalf("%s: open through the returned context: %v", vector.name, err)
+		}
+		if !bytes.Equal(back, plaintext) {
+			t.Errorf("%s: the context from setup base r opened to %x, want %x", vector.name, back, plaintext)
+		}
+	}
+}
+
+// TestHpkeSealBaseBuildsAFreshContextPerCall is the one this file exists for. A single
+// shot has to set up a context, use it once and drop it; an implementation that kept one
+// — memoized on the recipient key, hoisted to a package variable, or reused to save an
+// encapsulation — has two ways to be wrong and only one of them is visible to a round
+// trip.
+//
+// If the kept context advances, the second message is sealed at sequence one and no
+// single shot receiver can open it, because a receiver builds its own context at zero.
+// That one a round trip catches, but only a round trip that seals twice: the plan's seals
+// once per suite, and the caching mutant survived it and the entire package.
+//
+// If the kept context is reset instead, or if the key schedule is fed something that is
+// not the encapsulation's own shared secret, then two plaintexts are sealed under one key
+// at one nonce and everything round trips perfectly. Nothing about a round trip can see
+// it. What can is that both aeads here are a stream cipher with an authenticator over the
+// result, so under a repeated key and nonce the two ciphertexts differ by exactly what
+// the two plaintexts differ by. That xor is asserted directly below, and it is the only
+// assertion in the package that fails on a fresh-ephemeral implementation whose key
+// schedule ignores the shared secret — a mutant whose enc values are all distinct and
+// which therefore satisfies every freshness check beside it.
+//
+// The repeated plaintext is the third row. Two seals of one plaintext to one recipient
+// must still differ, which is the same property stated where an implementation that
+// cached on the plaintext rather than on the key would land.
+func TestHpkeSealBaseBuildsAFreshContextPerCall(t *testing.T) {
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("LookupSuite: %v", err)
+		}
+		priv, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x1a}, 32))
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		info := []byte("one info for every message")
+		aad := []byte("one aad for every message")
+		plaintexts := [][]byte{
+			[]byte("the first plaintext of an identical pair"),
+			[]byte("a second plaintext, of the same length!!"),
+			[]byte("the first plaintext of an identical pair"),
+		}
+		if len(plaintexts[0]) != len(plaintexts[1]) {
+			t.Fatalf("the first two plaintexts are %d and %d bytes, so the keystream comparison below is not the one it says it is",
+				len(plaintexts[0]), len(plaintexts[1]))
+		}
+		if bytes.Equal(plaintexts[0], plaintexts[1]) {
+			t.Fatalf("the first two plaintexts are equal, so the keystream comparison below asserts nothing")
+		}
+		kemOutputs := make([][]byte, 0, len(plaintexts))
+		ciphertexts := make([][]byte, 0, len(plaintexts))
+		for i, plaintext := range plaintexts {
+			kemOutput, ciphertext, err := HpkeSealBase(rand.Reader, params, pub, info, aad, plaintext)
+			if err != nil {
+				t.Fatalf("suite %#04x seal %d: %v", uint16(suite), i, err)
+			}
+			// every message is sealed at sequence zero, so every message opens under a
+			// receiving context that is also at sequence zero. A sender that kept its
+			// context past the first call fails here on the second.
+			back, err := HpkeOpenBase(params, priv, kemOutput, info, aad, ciphertext)
+			if err != nil {
+				t.Fatalf("suite %#04x open %d: %v", uint16(suite), i, err)
+			}
+			if !bytes.Equal(back, plaintext) {
+				t.Fatalf("suite %#04x open %d returned %q, want %q", uint16(suite), i, back, plaintext)
+			}
+			kemOutputs = append(kemOutputs, kemOutput)
+			ciphertexts = append(ciphertexts, ciphertext)
+		}
+		for i := range kemOutputs {
+			for j := i + 1; j < len(kemOutputs); j++ {
+				if bytes.Equal(kemOutputs[i], kemOutputs[j]) {
+					t.Errorf("suite %#04x seals %d and %d encapsulated to the same key %x, so both messages are under one key",
+						uint16(suite), i, j, kemOutputs[i])
+				}
+				if bytes.Equal(ciphertexts[i], ciphertexts[j]) {
+					t.Errorf("suite %#04x seals %d and %d produced the same ciphertext", uint16(suite), i, j)
+				}
+			}
+		}
+		body := len(plaintexts[0])
+		if delta := xorOf(t, ciphertexts[0][:body], ciphertexts[1][:body]); bytes.Equal(delta, xorOf(t, plaintexts[0], plaintexts[1])) {
+			t.Errorf("suite %#04x sealed two plaintexts to ciphertexts differing by exactly the plaintexts: one key and one nonce for both messages",
+				uint16(suite))
+		}
+	}
+}
+
+// TestHpkeOpenBaseRefusesEveryAlteredInput walks what a peer can change on the wire. Each
+// row is a refusal, and the unaltered case asserted before them is what keeps the table
+// from being satisfied by an open that refuses everything.
+//
+// The aad rows are the ones nothing else in the file reaches by property. A sender and a
+// receiver that both dropped the aad round trip, so the only two things that see it are
+// the published ciphertext in the known answer above and a wrong aad refused here.
+//
+// The other suite's parameters are a row because a single shot takes its suite from a
+// caller rather than from the ciphertext: nothing on the wire says which suite sealed a
+// message, and opening under the wrong one has to fail closed rather than return whatever
+// key schedule it reached.
+//
+// Every row asserts a nil plaintext beside the sentinel. An open that refused and handed
+// back the aead's scratch buffer anyway would satisfy an error-only assertion.
+func TestHpkeOpenBaseRefusesEveryAlteredInput(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	otherParams, err := LookupSuite(CipherSuiteX25519AesGcm128Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	priv, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x1b}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	info := []byte("the info this message was sealed under")
+	aad := []byte("the aad this message was sealed under")
+	plaintext := []byte("the plaintext")
+	kemOutput, ciphertext, err := HpkeSealBase(rand.Reader, params, pub, info, aad, plaintext)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if back, err := HpkeOpenBase(params, priv, kemOutput, info, aad, ciphertext); err != nil || !bytes.Equal(back, plaintext) {
+		t.Fatalf("the unaltered message returned %q and %v, so every refusal below would be one this open owes to nothing", back, err)
+	}
+	flipped := func(bs []byte, i int) []byte {
+		altered := bytes.Clone(bs)
+		altered[i] ^= 0x01
+		return altered
+	}
+	for _, row := range []struct {
+		name       string
+		params     *SuiteParams
+		kemOutput  []byte
+		info       []byte
+		aad        []byte
+		ciphertext []byte
+	}{
+		{name: "a different aad", params: params, kemOutput: kemOutput, info: info, aad: []byte("some other aad entirely"), ciphertext: ciphertext},
+		{name: "no aad at all", params: params, kemOutput: kemOutput, info: info, aad: nil, ciphertext: ciphertext},
+		{name: "one byte appended to the aad", params: params, kemOutput: kemOutput, info: info, aad: append(bytes.Clone(aad), 0x00), ciphertext: ciphertext},
+		{name: "one bit flipped in the aad", params: params, kemOutput: kemOutput, info: info, aad: flipped(aad, 0), ciphertext: ciphertext},
+		{name: "one bit flipped in the info", params: params, kemOutput: kemOutput, info: flipped(info, 0), aad: aad, ciphertext: ciphertext},
+		{name: "one bit flipped in the kem output", params: params, kemOutput: flipped(kemOutput, 0), info: info, aad: aad, ciphertext: ciphertext},
+		{name: "one bit flipped in the ciphertext body", params: params, kemOutput: kemOutput, info: info, aad: aad, ciphertext: flipped(ciphertext, 0)},
+		{name: "one bit flipped in the tag", params: params, kemOutput: kemOutput, info: info, aad: aad, ciphertext: flipped(ciphertext, len(ciphertext)-1)},
+		{name: "the ciphertext one byte short", params: params, kemOutput: kemOutput, info: info, aad: aad, ciphertext: ciphertext[:len(ciphertext)-1]},
+		{name: "an empty ciphertext", params: params, kemOutput: kemOutput, info: info, aad: aad, ciphertext: nil},
+		{name: "the other registered suite", params: otherParams, kemOutput: kemOutput, info: info, aad: aad, ciphertext: ciphertext},
+	} {
+		back, err := HpkeOpenBase(row.params, priv, row.kemOutput, row.info, row.aad, row.ciphertext)
+		if !errors.Is(err, ErrAeadOpen) {
+			t.Errorf("%s: error = %v, want ErrAeadOpen", row.name, err)
+		}
+		if back != nil {
+			t.Errorf("%s: refused and returned %d bytes anyway", row.name, len(back))
+		}
+	}
+}
+
+// TestHpkeSealBaseAndOpenBaseReportTheFailuresBeneathThem says the single shots pass their
+// kem's and their key schedule's refusals through rather than replacing them. The
+// sentinels are the interesting part: an implementation that swallowed an error and
+// carried on would build a whole key schedule over a nil shared secret and return a
+// context that works against nobody, and one that mapped everything to ErrAeadOpen would
+// tell a caller its own malformed key was a bad message.
+//
+// The setup entry points are asserted beside the single shots because that is where a
+// swallow would live. A setup that dropped its key schedule error returns a nil context
+// with a nil error, and the single shot in front of it then panics rather than failing,
+// which is a kill by accident and not the statement wanted here.
+//
+// The nonce length row is the only refusal the key schedule itself owns, and no
+// registered suite can reach it — both agree with their aead — so it uses the probe suite
+// the field tests build, with the same all-fields-from-one-argument discipline that keeps
+// a length from being left out and read as zero.
+func TestHpkeSealBaseAndOpenBaseReportTheFailuresBeneathThem(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	priv, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x1c}, 32))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	kemOutput, ciphertext, err := HpkeSealBase(rand.Reader, params, pub, nil, nil, []byte("the plaintext"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	badNonce := hpkeFieldProbeParams(32)
+	badNonce.Nn = 13
+	entropyIsDown := errors.New("entropy source is down")
+
+	// the reader is built per call rather than shared between the two below. shortReader
+	// carries its remaining count, so one instance handed to both entry points is drained
+	// by the first and answers the second with a plain EOF — a row that would then be
+	// asserting a different failure than the one it names.
+	for _, row := range []struct {
+		name   string
+		random func() io.Reader
+		params *SuiteParams
+		pub    HpkePublicKey
+		want   error
+	}{
+		{name: "a dead entropy source", random: func() io.Reader { return failingReader{err: entropyIsDown} }, params: params, pub: pub, want: entropyIsDown},
+		{name: "an entropy source that runs dry", random: func() io.Reader { return &shortReader{remaining: params.Nsk - 1} }, params: params, pub: pub, want: io.ErrUnexpectedEOF},
+		{name: "a recipient key one byte short", random: func() io.Reader { return rand.Reader }, params: params, pub: pub[:len(pub)-1], want: ErrBadKeyLength},
+		{name: "a recipient key one byte long", random: func() io.Reader { return rand.Reader }, params: params, pub: append(bytes.Clone(pub), 0x00), want: ErrBadKeyLength},
+		{name: "a suite whose nonce length the aead will not take", random: func() io.Reader { return rand.Reader }, params: badNonce, pub: pub, want: ErrBadNonceLength},
+	} {
+		gotEnc, gotCiphertext, err := HpkeSealBase(row.random(), row.params, row.pub, nil, nil, []byte("the plaintext"))
+		if !errors.Is(err, row.want) {
+			t.Errorf("seal with %s: error = %v, want %v", row.name, err, row.want)
+		}
+		if gotEnc != nil || gotCiphertext != nil {
+			t.Errorf("seal with %s: refused and returned %d/%d bytes anyway", row.name, len(gotEnc), len(gotCiphertext))
+		}
+		gotEnc, ctx, err := HpkeSetupBaseS(row.random(), row.params, row.pub, nil)
+		if !errors.Is(err, row.want) {
+			t.Errorf("setup base s with %s: error = %v, want %v", row.name, err, row.want)
+		}
+		if gotEnc != nil || ctx != nil {
+			t.Errorf("setup base s with %s: refused and returned %d bytes and a context anyway", row.name, len(gotEnc))
+		}
+	}
+
+	for _, row := range []struct {
+		name      string
+		params    *SuiteParams
+		priv      HpkePrivateKey
+		kemOutput []byte
+		want      error
+	}{
+		{name: "a kem output one byte short", params: params, priv: priv, kemOutput: kemOutput[:len(kemOutput)-1], want: ErrBadKemOutput},
+		{name: "a kem output one byte long", params: params, priv: priv, kemOutput: append(bytes.Clone(kemOutput), 0x00), want: ErrBadKemOutput},
+		{name: "an empty kem output", params: params, priv: priv, kemOutput: nil, want: ErrBadKemOutput},
+		{name: "a private key one byte short", params: params, priv: priv[:len(priv)-1], kemOutput: kemOutput, want: ErrBadKeyLength},
+		{name: "a suite whose nonce length the aead will not take", params: badNonce, priv: priv, kemOutput: kemOutput, want: ErrBadNonceLength},
+	} {
+		back, err := HpkeOpenBase(row.params, row.priv, row.kemOutput, nil, nil, ciphertext)
+		if !errors.Is(err, row.want) {
+			t.Errorf("open with %s: error = %v, want %v", row.name, err, row.want)
+		}
+		if back != nil {
+			t.Errorf("open with %s: refused and returned %d bytes anyway", row.name, len(back))
+		}
+		ctx, err := HpkeSetupBaseR(row.params, row.priv, row.kemOutput, nil)
+		if !errors.Is(err, row.want) {
+			t.Errorf("setup base r with %s: error = %v, want %v", row.name, err, row.want)
+		}
+		if ctx != nil {
+			t.Errorf("setup base r with %s: refused and returned a context anyway", row.name)
+		}
 	}
 }
