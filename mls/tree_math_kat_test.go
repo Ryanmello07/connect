@@ -1259,6 +1259,49 @@ func mentionsIdent(node ast.Node, name string) bool {
 	return found
 }
 
+// where name is handed over as a value rather than called or declared.
+//
+// this does not decide whether family 1 is registered - the scan above does
+// that, and it claims only a registration it can watch reach the registry,
+// which is the precision that keeps a second family's registration from
+// counting as this one's. this is the other side of that trade, and it is here
+// so that the trade is paid in an accurate message rather than in a misleading
+// one: a verifier handed to something this scan did not recognise is not an
+// unregistered family, and telling a reader it is sends them looking for a
+// registration that is already written. enumerated, the shapes that land here
+// are a family built into a variable first and a family returned by a
+// constructor.
+func identValueUses(fileSet *token.FileSet, parsed *ast.File, name string) []token.Position {
+	positions := []token.Position{}
+	// the positions an identifier of this name can occupy without being a value
+	// handed over: the callee of a call, the name of a declaration, the field
+	// half of a selector. marked on the way down, which reaches each of them
+	// before the identifier itself.
+	notAValue := map[*ast.Ident]bool{}
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CallExpr:
+			if ident, ok := typed.Fun.(*ast.Ident); ok {
+				notAValue[ident] = true
+			}
+		case *ast.FuncDecl:
+			notAValue[typed.Name] = true
+		case *ast.ValueSpec:
+			for _, ident := range typed.Names {
+				notAValue[ident] = true
+			}
+		case *ast.SelectorExpr:
+			notAValue[typed.Sel] = true
+		case *ast.Ident:
+			if typed.Name == name && !notAValue[typed] {
+				positions = append(positions, fileSet.Position(typed.Pos()))
+			}
+		}
+		return true
+	})
+	return positions
+}
+
 // whether a package-level declaration of name still lists the integer literal
 // want.
 //
@@ -1297,6 +1340,22 @@ func declarationLists(parsed *ast.File, name string, want string) bool {
 	}
 	return listed
 }
+
+// the registration the messages below ask for, in the shape the scan above
+// reads without being taught anything. it is a string literal and so is not a
+// call: the scan looks for call expressions, which is what lets this test quote
+// the code it wants without finding its own quotation and concluding the code
+// is already there.
+const treeMathVectorRegistration = `func init() {
+	RegisterVectorFamily(VectorFamily{
+		Number:   1,
+		Name:     "tree-math",
+		File:     treeMathVectorFile,
+		Slice:    "A1",
+		Verify:   verifyTreeMathVector,
+		Generate: generateTreeMathVectors,
+	})
+}`
 
 // a package holding both shapes each detector above has to tell apart: one it
 // must find and one it must not. it is parsed and never compiled, so the names
@@ -1347,11 +1406,13 @@ func TestTreeMathVectorRegistrationFollowsTheHarness(t *testing.T) {
 	declarations := map[string]int{}
 	registrations := []token.Position{}
 	loaderCalls := []token.Position{}
+	valueUses := []token.Position{}
 	stillPending := false
 	for _, parsed := range parsedFiles {
 		packageDeclarations(parsed, declarations)
 		registrations = append(registrations, callsCarrying(fileSet, parsed, "RegisterVectorFamily", "verifyTreeMathVector")...)
 		loaderCalls = append(loaderCalls, callsCarrying(fileSet, parsed, "LoadVectorFile", "treeMathVectorFile")...)
+		valueUses = append(valueUses, identValueUses(fileSet, parsed, "verifyTreeMathVector")...)
 		if declarationLists(parsed, "expectedPendingFamilies", "1") {
 			stillPending = true
 		}
@@ -1392,6 +1453,8 @@ func TestTreeMathVectorRegistrationFollowsTheHarness(t *testing.T) {
 		want  bool
 	}{
 		{label: "a registry declared as a var is a declaration", got: controlDeclarations["RegisterVectorFamily"] == 1, want: true},
+		{label: "a verifier handed to a literal is handed over", got: len(identValueUses(controlSet, control, "verifyTreeMathVector")) == 1, want: true},
+		{label: "a registry declared and called is not handed over", got: len(identValueUses(controlSet, control, "RegisterVectorFamily")) > 0, want: false},
 		{label: "a pending list holding 1 is read as pending", got: declarationLists(control, "expectedPendingFamilies", "1"), want: true},
 		{label: "a neighbouring list without 1 is not", got: declarationLists(control, "expectedSettledFamilies", "1"), want: false},
 	}
@@ -1403,22 +1466,32 @@ func TestTreeMathVectorRegistrationFollowsTheHarness(t *testing.T) {
 
 	declared := declarations["RegisterVectorFamily"] > 0
 
+	// the accurate half of the answer first. this scan claims a registration
+	// only where it can watch verifyTreeMathVector reach the registry, so a
+	// family built into a variable first, or returned by a constructor, is one
+	// it declines to claim rather than one it refuses. the verdict is the same
+	// and deliberately so - a shape this test cannot read is not a shape it
+	// should pass - but the reason a reader is given has to be the true one, or
+	// the obvious repair is to delete the test.
+	if declared && len(registrations) == 0 && len(valueUses) > 0 {
+		t.Fatalf("family 1's verifier is handed over at %s, and this scan cannot see it reach\n"+
+			"RegisterVectorFamily. it claims only a registration that carries\n"+
+			"verifyTreeMathVector into the call, so that another family's registration cannot\n"+
+			"count as this one's - which is the failure it was rewritten for. write the\n"+
+			"registration in the shape below, or teach this scan the shape you used. do not\n"+
+			"delete the check.\n\n"+
+			"%s\n\n"+
+			"and delete 1 from expectedPendingFamilies in the same commit: registered while\n"+
+			"still pending is the state where the vectors job skips family 1 and reports green.",
+			valueUses[0], treeMathVectorRegistration)
+	}
 	if declared && len(registrations) == 0 {
 		t.Fatalf("the vector harness registry has landed and family 1 is still unregistered.\n"+
 			"add to %s:\n\n"+
-			"func init() {\n"+
-			"\tRegisterVectorFamily(VectorFamily{\n"+
-			"\t\tNumber:   1,\n"+
-			"\t\tName:     \"tree-math\",\n"+
-			"\t\tFile:     treeMathVectorFile,\n"+
-			"\t\tSlice:    \"A1\",\n"+
-			"\t\tVerify:   verifyTreeMathVector,\n"+
-			"\t\tGenerate: generateTreeMathVectors,\n"+
-			"\t})\n"+
-			"}\n\n"+
+			"%s\n\n"+
 			"and delete 1 from expectedPendingFamilies in the same commit: registered while\n"+
 			"still pending is the state where the vectors job skips family 1 and reports green.",
-			treeMathVectorRunnerFile)
+			treeMathVectorRunnerFile, treeMathVectorRegistration)
 	}
 	if len(registrations) > 0 && stillPending {
 		t.Fatalf("family 1 is registered at %s and expectedPendingFamilies still lists 1.\n"+
