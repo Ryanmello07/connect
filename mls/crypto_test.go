@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"slices"
@@ -580,8 +581,15 @@ func TestProviderExpandRefusesUnrepresentableLengths(t *testing.T) {
 		}
 	}
 	for _, length := range []int{-1, -32, hpkeMaxExpandLength + 1, 1 << 16} {
-		if recovered := recoveredPanic(func() { crypto.Expand(prk, []byte("info"), length) }); recovered == nil {
+		recovered := recoveredPanic(func() { crypto.Expand(prk, []byte("info"), length) })
+		if recovered == nil {
 			t.Errorf("Expand returned for a length of %d instead of refusing it", length)
+			continue
+		}
+		// and the refusal is this package's gate rather than a makeslice from inside
+		// the kdf, which is what a negative length reaches when the gate is not there
+		if got := fmt.Sprint(recovered); !strings.HasPrefix(got, "mls: hkdf expand length ") {
+			t.Errorf("Expand at a length of %d was refused by %q, not by this package's gate", length, got)
 		}
 	}
 }
