@@ -32,6 +32,7 @@ package mls
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -374,6 +375,71 @@ func TestDeriveTreeSecretPutsGenerationInContext(t *testing.T) {
 	// encoding agrees with the low bytes of every vector and collides here.
 	if bytes.Equal(crypto.DeriveTreeSecret(secret, "handshake", 0x00000001, 32), crypto.DeriveTreeSecret(secret, "handshake", 0x01000001, 32)) {
 		t.Fatalf("generations differing above the low byte derive the same secret")
+	}
+}
+
+// A suite whose Nh agrees with nothing else about it. Both registered suites fix Nh, Nk
+// on 0x0003, Nsecret, Nenc, Npk, Nsk, NsigPub and NsigPriv at 32, so within the registry
+// the hash size and seven other parameters and the literal 32 are one number, and a
+// DeriveSecret written against any of them derives exactly what one written against Nh
+// derives. RFC 9420 registers five further suites at Nh 48 and 64, and on one of those the
+// same code returns a secret shorter than the suite claims while reporting success.
+//
+// Nothing in the registry can see that, so this provider is assembled rather than looked
+// up. Every other length is distinct from Nh and from the secret's own length, which is
+// what makes each substitution a different number rather than the same one.
+var labelKatSyntheticParams = SuiteParams{
+	Suite:       CipherSuite(0xfffe),
+	Name:        "synthetic_nh48",
+	KemId:       HpkeKemX25519HkdfSha256,
+	KdfId:       HpkeKdfHkdfSha256,
+	AeadId:      HpkeAeadChaCha20Poly1305,
+	SignatureId: SignatureSchemeEd25519,
+	Nh:          48,
+	Nk:          32,
+	Nn:          12,
+	Nt:          16,
+	Nsecret:     17,
+	Nenc:        18,
+	Npk:         19,
+	Nsk:         20,
+	NsigPub:     21,
+	NsigPriv:    22,
+}
+
+func TestDeriveSecretLengthIsTheSuitesHashSize(t *testing.T) {
+	crypto := &suiteCryptoProvider{params: &labelKatSyntheticParams, random: rand.Reader}
+	// longer than Nh so Expand's short pseudorandom key guard is not what is being
+	// measured here, and a different length from Nh so len(secret) is not Nh either.
+	secret := bytes.Repeat([]byte{0x13}, 64)
+	got := crypto.DeriveSecret(secret, "epoch")
+	if len(got) != labelKatSyntheticParams.Nh {
+		t.Fatalf("DeriveSecret returned %d bytes for a suite whose Nh is %d", len(got), labelKatSyntheticParams.Nh)
+	}
+	// and the length in the preimage moved with it, so this is the suite's hash size in
+	// both places rather than only in the size of the answer.
+	if want := crypto.ExpandWithLabel(secret, "epoch", nil, labelKatSyntheticParams.Nh); !bytes.Equal(got, want) {
+		t.Fatalf("DeriveSecret = %x, want %x", got, want)
+	}
+	for _, other := range []struct {
+		name  string
+		value int
+	}{
+		{name: "Nk", value: labelKatSyntheticParams.Nk},
+		{name: "Nn", value: labelKatSyntheticParams.Nn},
+		{name: "Nt", value: labelKatSyntheticParams.Nt},
+		{name: "Nsecret", value: labelKatSyntheticParams.Nsecret},
+		{name: "Nenc", value: labelKatSyntheticParams.Nenc},
+		{name: "Npk", value: labelKatSyntheticParams.Npk},
+		{name: "Nsk", value: labelKatSyntheticParams.Nsk},
+		{name: "NsigPub", value: labelKatSyntheticParams.NsigPub},
+		{name: "NsigPriv", value: labelKatSyntheticParams.NsigPriv},
+		{name: "the registry's own hash size", value: 32},
+		{name: "the secret's length", value: len(secret)},
+	} {
+		if other.value == labelKatSyntheticParams.Nh {
+			t.Errorf("%s is %d, the same as Nh, so substituting it here would change nothing", other.name, other.value)
+		}
 	}
 }
 
