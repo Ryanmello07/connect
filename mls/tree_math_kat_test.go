@@ -10,6 +10,9 @@ package mls
 import (
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,6 +70,16 @@ const treeMathVectorFile = "tree-math.json"
 // loader below checks it on every call.
 const treeMathVectorCount = 10
 
+// this file, named so a failure can say where the code it is asking for goes.
+const treeMathVectorRunnerFile = "mls/tree_math_kat_test.go"
+
+// every field an entry of this family carries, in the order upstream writes
+// them. stated once: the corpus tripwire reads it off the vendored bytes and
+// the generate direction reads it off the bytes this file produces, and two
+// copies is how the generated side ends up checked against a list that was
+// updated on the vendored side only.
+var treeMathVectorFields = []string{"n_leaves", "n_nodes", "root", "left", "right", "parent", "sibling"}
+
 // decodes the vendored family through the shared loader, failing the test
 // rather than returning an error so every caller is a one-liner.
 //
@@ -109,16 +122,15 @@ func TestTreeMathVectorFileShape(t *testing.T) {
 		t.Fatalf("entries: %d, want 10", len(rawEntries))
 	}
 
-	wantFields := []string{"n_leaves", "n_nodes", "root", "left", "right", "parent", "sibling"}
 	for i, rawEntry := range rawEntries {
 		var entry map[string]json.RawMessage
 		if err := json.Unmarshal(rawEntry, &entry); err != nil {
 			t.Fatalf("decode %s entry %d: %v", treeMathVectorFile, i, err)
 		}
-		if len(entry) != len(wantFields) {
-			t.Fatalf("entry %d: %d fields, want %d — the upstream format changed and the runner must be extended", i, len(entry), len(wantFields))
+		if len(entry) != len(treeMathVectorFields) {
+			t.Fatalf("entry %d: %d fields, want %d — the upstream format changed and the runner must be extended", i, len(entry), len(treeMathVectorFields))
 		}
-		for _, field := range wantFields {
+		for _, field := range treeMathVectorFields {
 			if _, ok := entry[field]; !ok {
 				t.Fatalf("entry %d: missing field %s", i, field)
 			}
@@ -778,5 +790,398 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 		t.Errorf("sibling of 0xFFFFFFFF in MaxLeafCount leaves: %v, want %v", err, ErrNodeOutOfRange)
 	} else if got != 0 {
 		t.Errorf("sibling of 0xFFFFFFFF in MaxLeafCount leaves: %d alongside the refusal, want 0", got)
+	}
+}
+
+// checks every relation one entry publishes, against the functions this plan
+// produces, and reports how many assertions were confirmed in each arm.
+//
+// what is counted is a confirmed assertion, not a column entry visited, for the
+// reason the two per-function runners above give: a count of entries visited
+// sits at the same number while every assertion beneath it is reported and
+// skipped. the checking itself is checkRelationColumn, unchanged, so the gate
+// inherits its sentinel and its read-back of the index alongside a refusal
+// rather than restating a weaker version of either.
+func checkTreeMathEntry(t *testing.T, v treeMathVector) (refusals int, matches int) {
+	t.Helper()
+	leafCount := LeafCount(v.NLeaves)
+
+	if got := NodeWidth(leafCount); got != v.NNodes {
+		t.Fatalf("n_leaves %d: node width %d, want %d", v.NLeaves, got, v.NNodes)
+	}
+	root, err := Root(leafCount)
+	if err != nil {
+		t.Fatalf("n_leaves %d: root: %v", v.NLeaves, err)
+	}
+	if uint32(root) != v.Root {
+		t.Fatalf("n_leaves %d: root %d, want %d", v.NLeaves, root, v.Root)
+	}
+
+	// the four columns, each paired with the function that answers it and the
+	// sentinel its undefined arm has to carry. stated once, walked once: the
+	// per-function runners above pair them at four separate call sites because
+	// each landed in its own task, and a gate that repeated that shape is where
+	// one column would quietly lose a check.
+	relations := []struct {
+		label     string
+		undefined error
+		answer    func(x NodeIndex) (NodeIndex, error)
+		published []*uint32
+	}{
+		{label: "left", undefined: ErrLeafHasNoChildren, answer: Left, published: v.Left},
+		{label: "right", undefined: ErrLeafHasNoChildren, answer: Right, published: v.Right},
+		{
+			label:     "parent",
+			undefined: ErrRootHasNoParent,
+			answer:    func(x NodeIndex) (NodeIndex, error) { return Parent(x, leafCount) },
+			published: v.Parent,
+		},
+		{
+			label:     "sibling",
+			undefined: ErrRootHasNoSibling,
+			answer:    func(x NodeIndex) (NodeIndex, error) { return Sibling(x, leafCount) },
+			published: v.Sibling,
+		},
+	}
+
+	// the column lengths are checked here and not only in the corpus tripwire,
+	// because this runner is also where an entry that was never read off disk
+	// arrives: indexing a short column would panic, where naming it says which
+	// column was truncated.
+	for _, relation := range relations {
+		if uint32(len(relation.published)) != v.NNodes {
+			t.Fatalf("n_leaves %d: %s has %d entries, want n_nodes %d", v.NLeaves, relation.label, len(relation.published), v.NNodes)
+		}
+	}
+
+	for i := uint32(0); i < v.NNodes; i += 1 {
+		for _, relation := range relations {
+			got, err := relation.answer(NodeIndex(i))
+			refused, matched := checkRelationColumn(t, relation.label, relation.undefined, v.NLeaves, i, got, err, relation.published[i])
+			if refused {
+				refusals += 1
+			}
+			if matched {
+				matches += 1
+			}
+		}
+	}
+	return refusals, matches
+}
+
+// one entry of family 1, decoded and checked, in the arity the shared vector
+// harness calls its families with. the registration that would hand this
+// function to that harness is deferred; see the note above TestTreeMathVectors.
+//
+// the count guard is not "did the loop run". it states which arm each of the
+// entry's assertions had to land in, and both numbers come from the shape of a
+// full tree rather than from this package: a full tree refuses both children at
+// each of its n_leaves leaves and refuses a parent and a sibling at its one
+// root, and defines every other relation. an entry whose nulls were dropped
+// therefore fails here even though every assertion it did make passed, which is
+// the failure a truncated or a naively regenerated entry produces.
+//
+// n_leaves of zero cannot reach the arithmetic below: no tree has zero leaves,
+// so the root lookup in checkTreeMathEntry has already failed the test.
+func verifyTreeMathVector(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	var v treeMathVector
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("decode tree-math entry: %v", err)
+	}
+	refusals, matches := checkTreeMathEntry(t, v)
+
+	// 2*n_leaves for the two child columns plus 2 for the root's parent and
+	// sibling; the rest of the 4*n_nodes assertions are defined relations.
+	wantRefusals := int(2*v.NLeaves + 2)
+	wantMatches := int(4*v.NNodes) - wantRefusals
+	if refusals != wantRefusals {
+		t.Fatalf("n_leaves %d: confirmed %d refusals, want %d", v.NLeaves, refusals, wantRefusals)
+	}
+	if matches != wantMatches {
+		t.Fatalf("n_leaves %d: confirmed %d matches, want %d", v.NLeaves, matches, wantMatches)
+	}
+}
+
+// the whole of family 1 recomputed from this file's arithmetic, at the ten
+// sizes upstream publishes, in the upstream field order and with null for every
+// undefined relation. the arity is the shared harness's generate direction: one
+// json.RawMessage holding the array the corpus file is.
+//
+// generated vectors are circular on their own — they are this package's answers
+// read back as this package's expectations — so nothing here is a gate by
+// itself. what makes it worth having is the comparison against the vendored
+// bytes in TestTreeMathVectorGenerateThenVerify.
+func generateTreeMathVectors(t *testing.T) json.RawMessage {
+	t.Helper()
+
+	// the corpus writes an undefined relation as null, so a refusal becomes a
+	// nil pointer and the error is deliberately not distinguished here: which
+	// sentinel a refusal carries is checked on the way back in, against the
+	// vendored column, not asserted on the way out against itself.
+	optional := func(x NodeIndex, err error) *uint32 {
+		if err != nil {
+			return nil
+		}
+		value := uint32(x)
+		return &value
+	}
+
+	vectors := make([]treeMathVector, 0, treeMathVectorCount)
+	for depth := uint32(0); depth < treeMathVectorCount; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		nodeWidth := NodeWidth(leafCount)
+		root, err := Root(leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: root: %v", leafCount, err)
+		}
+
+		v := treeMathVector{
+			NLeaves: uint32(leafCount),
+			NNodes:  nodeWidth,
+			Root:    uint32(root),
+			Left:    make([]*uint32, 0, nodeWidth),
+			Right:   make([]*uint32, 0, nodeWidth),
+			Parent:  make([]*uint32, 0, nodeWidth),
+			Sibling: make([]*uint32, 0, nodeWidth),
+		}
+		for i := uint32(0); i < nodeWidth; i += 1 {
+			nodeIndex := NodeIndex(i)
+			v.Left = append(v.Left, optional(Left(nodeIndex)))
+			v.Right = append(v.Right, optional(Right(nodeIndex)))
+			v.Parent = append(v.Parent, optional(Parent(nodeIndex, leafCount)))
+			v.Sibling = append(v.Sibling, optional(Sibling(nodeIndex, leafCount)))
+		}
+		vectors = append(vectors, v)
+	}
+
+	generated, err := json.Marshal(vectors)
+	if err != nil {
+		t.Fatalf("encode tree-math family: %v", err)
+	}
+	return json.RawMessage(generated)
+}
+
+// vector family 1, the gate spec A section 4.2.1 names for this plan.
+//
+// the two totals are the whole point of it. every relation of every node of
+// every entry is checked, and what the totals pin is that the checking actually
+// happened: 1023 leaves and 1023 parents across the ladder, one root per entry.
+// a runner that walked a short corpus, skipped an entry, or read null as
+// nothing to check here lands on a different pair and fails, where a plain
+// "every assertion passed" would not notice any of the three.
+//
+// the registration this task was to land with it is deferred and is not
+// silently missing: mls/vectors_test.go, where the validation and interop
+// harness plan declares VectorFamily, RegisterVectorFamily and
+// expectedPendingFamilies, does not exist in this tree, and inventing that
+// registry here would put a second, guessed copy of another plan's contract in
+// the package. verifyTreeMathVector and generateTreeMathVectors above already
+// carry the arities that contract publishes, so registering is an init() and a
+// one-line deletion once the file lands, and
+// TestTreeMathVectorRegistrationFollowsTheHarness below fails the day it does.
+func TestTreeMathVectors(t *testing.T) {
+	vectors := loadTreeMathVectors(t)
+
+	refusals, matches := 0, 0
+	for _, v := range vectors {
+		entryRefusals, entryMatches := checkTreeMathEntry(t, v)
+		refusals += entryRefusals
+		matches += entryMatches
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "refusals", got: refusals, want: 2066},
+		{label: "matches", got: matches, want: 6078},
+		// implied by the two rows above rather than independent of them, and
+		// kept because 8144 is the number spec A's family-1 row publishes and
+		// the one a reader comes here to find.
+		{label: "assertions", got: refusals + matches, want: 8144},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s across the family: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the generate direction against the verify direction, and then both against
+// the vendored bytes.
+//
+// the first half composes this file with itself and can only catch a generator
+// that disagrees with its own reader. the second half is the assertion that
+// makes generating worth doing at all: the family this package computes from
+// nothing but a leaf count has to equal, field for field and null for null, the
+// family the mlswg published. that is the same evidence the runner above gets,
+// arrived at from the other side.
+func TestTreeMathVectorGenerateThenVerify(t *testing.T) {
+	var generated []json.RawMessage
+	if err := json.Unmarshal(generateTreeMathVectors(t), &generated); err != nil {
+		t.Fatalf("decode the generated family: %v", err)
+	}
+	if len(generated) != treeMathVectorCount {
+		t.Fatalf("generated %d entries, want %d", len(generated), treeMathVectorCount)
+	}
+
+	for i, rawEntry := range generated {
+		verifyTreeMathVector(t, rawEntry)
+
+		// the field names are read off the generated bytes rather than through
+		// the entry type, because a struct round trip structurally cannot fail
+		// on them: a generator that wrote the wrong names would be read back
+		// through the same tags and agree with itself at every value.
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawEntry, &fields); err != nil {
+			t.Fatalf("decode generated entry %d as fields: %v", i, err)
+		}
+		if len(fields) != len(treeMathVectorFields) {
+			t.Fatalf("generated entry %d: %d fields, want %d", i, len(fields), len(treeMathVectorFields))
+		}
+		for _, field := range treeMathVectorFields {
+			if _, ok := fields[field]; !ok {
+				t.Fatalf("generated entry %d: missing field %s", i, field)
+			}
+		}
+	}
+
+	vendored := loadTreeMathVectors(t)
+	compared := 0
+	for i := range vendored {
+		var got treeMathVector
+		if err := json.Unmarshal(generated[i], &got); err != nil {
+			t.Fatalf("decode generated entry %d: %v", i, err)
+		}
+		want := vendored[i]
+		if got.NLeaves != want.NLeaves || got.NNodes != want.NNodes || got.Root != want.Root {
+			t.Fatalf("entry %d: generated (%d, %d, %d), vendored (%d, %d, %d)", i,
+				got.NLeaves, got.NNodes, got.Root, want.NLeaves, want.NNodes, want.Root)
+		}
+		columns := []struct {
+			name string
+			got  []*uint32
+			want []*uint32
+		}{
+			{name: "left", got: got.Left, want: want.Left},
+			{name: "right", got: got.Right, want: want.Right},
+			{name: "parent", got: got.Parent, want: want.Parent},
+			{name: "sibling", got: got.Sibling, want: want.Sibling},
+		}
+		for _, column := range columns {
+			if len(column.got) != len(column.want) {
+				t.Fatalf("entry %d %s: %d entries, want %d", i, column.name, len(column.got), len(column.want))
+			}
+			for j := range column.want {
+				if (column.got[j] == nil) != (column.want[j] == nil) {
+					t.Errorf("entry %d %s node %d: presence differs", i, column.name, j)
+					continue
+				}
+				if column.got[j] != nil && *column.got[j] != *column.want[j] {
+					t.Errorf("entry %d %s node %d: %d, want %d", i, column.name, j, *column.got[j], *column.want[j])
+					continue
+				}
+				compared += 1
+			}
+		}
+	}
+
+	// cells that agreed with the vendored column, counted rather than taken
+	// from the loop bounds: every length above is compared generated against
+	// vendored, so two empty columns satisfy all of them, and 8144 is what says
+	// the corpus was really on the other side of the comparison.
+	if compared != 8144 {
+		t.Errorf("generated cells agreeing with the vendored family: %d, want 8144", compared)
+	}
+}
+
+// the deferred half of this task, recorded where it will be executed rather
+// than only in a plan.
+//
+// registering family 1 needs the shared vector harness, which owns
+// VectorFamily, RegisterVectorFamily and expectedPendingFamilies in
+// mls/vectors_test.go. that file is not in this tree, so this plan neither
+// registers nor declares a guessed copy of it. the day it lands, the stand-in
+// LoadVectorFile above is a duplicate declaration and the package stops
+// building, which is the signal to delete the stand-in; nothing in that signal
+// mentions family 1, and a package that builds again looks finished. this is
+// what says it is not: it fails from the moment the registry exists until the
+// registration is written, and then it passes and stays passed.
+//
+// the package is read as syntax rather than as text, which is the one thing
+// crypto_forbidden_test.go's line-based scanner deliberately does not do. its
+// tradeoff does not carry here. it over-reports, and a ban list that
+// over-reports is merely noisy; this one under-reports, because the failure
+// message below has to quote the call it is asking for and a text scan then
+// finds that quotation and concludes the call is already there. measured: the
+// text version of this check passed with the registry present and nothing
+// registered, matching its own error message. a call expression is not a string
+// literal to a parser.
+func TestTreeMathVectorRegistrationFollowsTheHarness(t *testing.T) {
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob the package sources: %v", err)
+	}
+
+	declares := map[string]int{}
+	calls := map[string]int{}
+	fileSet := token.NewFileSet()
+	for _, source := range sources {
+		parsed, err := parser.ParseFile(fileSet, source, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", source, err)
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.FuncDecl:
+				if typed.Recv == nil {
+					declares[typed.Name.Name] += 1
+				}
+			case *ast.CallExpr:
+				if name, ok := typed.Fun.(*ast.Ident); ok {
+					calls[name.Name] += 1
+				}
+			}
+			return true
+		})
+	}
+
+	// the positive control. a scan that found nothing reports what a clean
+	// package reports, and both halves of the answer below are "found nothing",
+	// so neither is trusted until the same two detectors are run against a
+	// symbol this package certainly declares once and certainly calls. that
+	// stays true after the harness lands: the stand-in is deleted and the same
+	// declaration arrives from vectors_test.go, with the callers untouched.
+	if declares["LoadVectorFile"] != 1 {
+		t.Fatalf("the declaration scan found %d declarations of LoadVectorFile, want 1: the scan is broken, not the package", declares["LoadVectorFile"])
+	}
+	if calls["LoadVectorFile"] == 0 {
+		t.Fatal("the call scan found no calls to LoadVectorFile: the scan is broken, not the package")
+	}
+
+	declared := declares["RegisterVectorFamily"] > 0
+	registered := calls["RegisterVectorFamily"] > 0
+
+	if declared && !registered {
+		t.Fatalf("the vector harness registry has landed and family 1 is still unregistered.\n"+
+			"add to %s:\n\n"+
+			"func init() {\n"+
+			"\tRegisterVectorFamily(VectorFamily{\n"+
+			"\t\tNumber:   1,\n"+
+			"\t\tName:     \"tree-math\",\n"+
+			"\t\tFile:     treeMathVectorFile,\n"+
+			"\t\tSlice:    \"A1\",\n"+
+			"\t\tVerify:   verifyTreeMathVector,\n"+
+			"\t\tGenerate: generateTreeMathVectors,\n"+
+			"\t})\n"+
+			"}\n\n"+
+			"and delete 1 from expectedPendingFamilies in the same commit: registered while\n"+
+			"still pending is the state where the vectors job skips family 1 and reports green.",
+			treeMathVectorRunnerFile)
+	}
+	if registered && !declared {
+		t.Fatalf("%s registers family 1 with a harness this package does not declare", treeMathVectorRunnerFile)
 	}
 }
