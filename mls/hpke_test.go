@@ -1821,6 +1821,14 @@ func TestHpkeKeyScheduleRefusesANonceLengthTheAeadWillNotTake(t *testing.T) {
 	}
 }
 
+// TestHpkeSealBaseRoundTrip is the composition agreeing with itself across both
+// registered suites, which is worth less than it looks like: a sender and a receiver
+// wrong the same way agree perfectly, and the published vector further down is what says
+// the composition is the RFC's rather than merely self consistent. What this one carries
+// that nothing else does is the length. It is the only place a ciphertext HpkeSealBase
+// produced is measured against the plaintext plus the suite's own Nt, and since both
+// returned slices are []byte a transposed return compiles, so that measurement is half of
+// what holds their order.
 func TestHpkeSealBaseRoundTrip(t *testing.T) {
 	for _, suite := range Suites() {
 		params, err := LookupSuite(suite)
@@ -1851,9 +1859,14 @@ func TestHpkeSealBaseRoundTrip(t *testing.T) {
 	}
 }
 
+// TestHpkeOpenBaseRejectsWrongInfo is the only one of the three tests here that sees
+// info at all. It is bound through the key schedule rather than checked, so a wrong info
+// is an open failure and not a silently different plaintext — and a sender and a receiver
+// that both dropped it round trip, while the wrong recipient below refuses for a reason
+// that has nothing to do with info. Opening under an info the message was not sealed
+// under is what separates a key schedule that binds it from one that does not. MLS puts
+// the label and the group context here, which is why it has to bind.
 func TestHpkeOpenBaseRejectsWrongInfo(t *testing.T) {
-	// info is bound through the key schedule, so a wrong info is an open failure and
-	// not a silently different plaintext. MLS puts the label and context here.
 	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
 		t.Fatalf("LookupSuite: %v", err)
@@ -1871,6 +1884,13 @@ func TestHpkeOpenBaseRejectsWrongInfo(t *testing.T) {
 	}
 }
 
+// TestHpkeOpenBaseRejectsWrongRecipient is the only one of the three tests here that
+// separates the decapsulated shared secret from the encapsulated key that carries it.
+// Both are 32 bytes under the registered kem, so a key schedule fed the encapsulation
+// instead of the secret compiles, round trips, and refuses a wrong info exactly as it
+// should — while being a total break, since the encapsulation travels in the clear and
+// every holder of it then derives the same context. A recipient who holds the wrong
+// private key is where that stops agreeing.
 func TestHpkeOpenBaseRejectsWrongRecipient(t *testing.T) {
 	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
@@ -1891,22 +1911,6 @@ func TestHpkeOpenBaseRejectsWrongRecipient(t *testing.T) {
 	if _, err := HpkeOpenBase(params, otherPriv, kemOutput, nil, nil, ciphertext); !errors.Is(err, ErrAeadOpen) {
 		t.Fatalf("wrong recipient: error = %v, want ErrAeadOpen", err)
 	}
-}
-
-// The bytes two slices of one length differ by. It exists for one assertion — the
-// keystream comparison in TestHpkeSealBaseBuildsAFreshContextPerCall — and it refuses
-// unequal lengths rather than truncating, because a comparison over a prefix is a
-// comparison that could pass by saying less than it meant to.
-func xorOf(t *testing.T, a []byte, b []byte) []byte {
-	t.Helper()
-	if len(a) != len(b) {
-		t.Fatalf("xor of %d and %d bytes", len(a), len(b))
-	}
-	delta := make([]byte, len(a))
-	for i := range delta {
-		delta[i] = a[i] ^ b[i]
-	}
-	return delta
 }
 
 // TestHpkeSealBaseMatchesThePublishedSingleShot is the single shot's own known answer,
@@ -2059,17 +2063,21 @@ func TestHpkeSetupBaseMatchesThePublishedSetup(t *testing.T) {
 // If the kept context advances, the second message is sealed at sequence one and no
 // single shot receiver can open it, because a receiver builds its own context at zero.
 // That one a round trip catches, but only a round trip that seals twice: the plan's seals
-// once per suite, and the caching mutant survived it and the entire package.
+// once per suite, and a cache keyed on the suite survived it and the entire package. An
+// unkeyed package variable is the one shape of it the plan does catch, and only by
+// accident — the round trip's second suite finds the first suite's context waiting.
 //
 // If the kept context is reset instead, or if the key schedule is fed something that is
 // not the encapsulation's own shared secret, then two plaintexts are sealed under one key
 // at one nonce and everything round trips perfectly. Nothing about a round trip can see
 // it. What can is that both aeads here are a stream cipher with an authenticator over the
 // result, so under a repeated key and nonce the two ciphertexts differ by exactly what
-// the two plaintexts differ by. That xor is asserted directly below, and it is the only
-// assertion in the package that fails on a fresh-ephemeral implementation whose key
-// schedule ignores the shared secret — a mutant whose enc values are all distinct and
-// which therefore satisfies every freshness check beside it.
+// the two plaintexts differ by. That xor is asserted directly below. It and the repeated
+// plaintext's ciphertext equality are two detectors of one property: on a fresh-ephemeral
+// implementation whose key schedule ignores the shared secret — a mutant whose enc values
+// are all distinct, so every freshness check beside these two is satisfied — either one
+// alone still fails. Both are kept so an edit that drops one leaves the property standing
+// on the other. Dropping both is what lets that mutant through.
 //
 // The repeated plaintext is the third row. Two seals of one plaintext to one recipient
 // must still differ, which is the same property stated where an implementation that
@@ -2129,8 +2137,21 @@ func TestHpkeSealBaseBuildsAFreshContextPerCall(t *testing.T) {
 				}
 			}
 		}
+		// the bytes two slices of one length differ by. It refuses unequal lengths
+		// rather than truncating, because a comparison over a prefix is a comparison
+		// that could pass by saying less than it meant to.
+		xorOf := func(a []byte, b []byte) []byte {
+			if len(a) != len(b) {
+				t.Fatalf("xor of %d and %d bytes", len(a), len(b))
+			}
+			delta := make([]byte, len(a))
+			for i := range delta {
+				delta[i] = a[i] ^ b[i]
+			}
+			return delta
+		}
 		body := len(plaintexts[0])
-		if delta := xorOf(t, ciphertexts[0][:body], ciphertexts[1][:body]); bytes.Equal(delta, xorOf(t, plaintexts[0], plaintexts[1])) {
+		if delta := xorOf(ciphertexts[0][:body], ciphertexts[1][:body]); bytes.Equal(delta, xorOf(plaintexts[0], plaintexts[1])) {
 			t.Errorf("suite %#04x sealed two plaintexts to ciphertexts differing by exactly the plaintexts: one key and one nonce for both messages",
 				uint16(suite))
 		}
@@ -2144,6 +2165,17 @@ func TestHpkeSealBaseBuildsAFreshContextPerCall(t *testing.T) {
 // The aad rows are the ones nothing else in the file reaches by property. A sender and a
 // receiver that both dropped the aad round trip, so the only two things that see it are
 // the published ciphertext in the known answer above and a wrong aad refused here.
+//
+// Those rows all alter a message sealed under a non-empty info and a non-empty aad, which
+// walks the binding in one direction only: sealed under a value, opened under a different
+// one. The three rows over the bare message and the transposed pair walk the other
+// direction, and it is the direction an attacker picks. An open that retried under a nil
+// info, a nil aad, or the other argument when the caller's failed is invisible in the
+// first direction, because its retry fails there too; and every such retry is a receiver
+// that accepts a message carrying no group label at all from anyone holding the
+// recipient's public key, which is the unforgeability HpkeSetupBaseR's own comment
+// claims. Twelve retries of that shape were applied to hpke.go and all twelve survived
+// the whole package before these rows existed.
 //
 // The other suite's parameters are a row because a single shot takes its suite from a
 // caller rather than from the ciphertext: nothing on the wire says which suite sealed a
@@ -2175,6 +2207,16 @@ func TestHpkeOpenBaseRefusesEveryAlteredInput(t *testing.T) {
 	if back, err := HpkeOpenBase(params, priv, kemOutput, info, aad, ciphertext); err != nil || !bytes.Equal(back, plaintext) {
 		t.Fatalf("the unaltered message returned %q and %v, so every refusal below would be one this open owes to nothing", back, err)
 	}
+	// a second message, sealed under neither an info nor an aad, for the rows that claim
+	// a value over a message that carried none. Its own unaltered open is asserted for
+	// the same reason the one above is.
+	bareKemOutput, bareCiphertext, err := HpkeSealBase(rand.Reader, params, pub, nil, nil, plaintext)
+	if err != nil {
+		t.Fatalf("seal under neither an info nor an aad: %v", err)
+	}
+	if back, err := HpkeOpenBase(params, priv, bareKemOutput, nil, nil, bareCiphertext); err != nil || !bytes.Equal(back, plaintext) {
+		t.Fatalf("the unaltered bare message returned %q and %v, so the rows claiming a value over it would be refusals owed to nothing", back, err)
+	}
 	flipped := func(bs []byte, i int) []byte {
 		altered := bytes.Clone(bs)
 		altered[i] ^= 0x01
@@ -2193,6 +2235,9 @@ func TestHpkeOpenBaseRefusesEveryAlteredInput(t *testing.T) {
 		{name: "one byte appended to the aad", params: params, kemOutput: kemOutput, info: info, aad: append(bytes.Clone(aad), 0x00), ciphertext: ciphertext},
 		{name: "one bit flipped in the aad", params: params, kemOutput: kemOutput, info: info, aad: flipped(aad, 0), ciphertext: ciphertext},
 		{name: "one bit flipped in the info", params: params, kemOutput: kemOutput, info: flipped(info, 0), aad: aad, ciphertext: ciphertext},
+		{name: "an aad claimed over a message sealed with none", params: params, kemOutput: bareKemOutput, info: nil, aad: aad, ciphertext: bareCiphertext},
+		{name: "an info claimed over a message sealed with none", params: params, kemOutput: bareKemOutput, info: info, aad: nil, ciphertext: bareCiphertext},
+		{name: "the info and the aad transposed", params: params, kemOutput: kemOutput, info: aad, aad: info, ciphertext: ciphertext},
 		{name: "one bit flipped in the kem output", params: params, kemOutput: flipped(kemOutput, 0), info: info, aad: aad, ciphertext: ciphertext},
 		{name: "one bit flipped in the ciphertext body", params: params, kemOutput: kemOutput, info: info, aad: aad, ciphertext: flipped(ciphertext, 0)},
 		{name: "one bit flipped in the tag", params: params, kemOutput: kemOutput, info: info, aad: aad, ciphertext: flipped(ciphertext, len(ciphertext)-1)},
