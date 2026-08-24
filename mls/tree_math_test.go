@@ -1454,3 +1454,595 @@ func TestCopathIsTheSiblingOfTheDirectPath(t *testing.T) {
 		}
 	}
 }
+
+// the ancestors of one node, each mapped to its own level: the node itself and
+// every node above it on the way to the root of a tree of the given depth.
+//
+// the node is named by its level and by the block of 2^level leaves it spans
+// rather than by its index, which is what makes the level of every ancestor
+// known without asking for it — the i-th node of a direct path leaving level k
+// sits at level k+1+i. no function of this package is called here or by what
+// this calls, so nothing in the answer can move with a bug in the package.
+func ancestorLevels(level uint32, block uint64, depth uint32) map[NodeIndex]uint32 {
+	ancestors := map[NodeIndex]uint32{nodeAt(level, block): level}
+	directPath, _ := pathOracle(level, block, depth)
+	for i, node := range directPath {
+		ancestors[node] = level + 1 + uint32(i)
+	}
+	return ancestors
+}
+
+// the second of the two definitions RFC 9420 gives for the common ancestor,
+// which is the only reason a differential is possible here at all.
+//
+// ported from the appendix C listing, published as
+//
+//	# The common ancestor of two nodes is the lowest node that is in the
+//	# direct paths of both leaves.
+//	def common_ancestor_semantic(x, y, n):
+//	    dx = set([x]) | set(direct_path(x, n))
+//	    dy = set([y]) | set(direct_path(y, n))
+//	    dxy = dx & dy
+//	    if len(dxy) == 0:
+//	        raise Exception('failed to find common ancestor')
+//	    return min(dxy, key=level)
+//
+// read from https://www.rfc-editor.org/rfc/rfc9420.txt appendix C and from the
+// local copy at mls_measure/mls-go/rfc9420.txt lines 6843 to 6851, sha256
+// 467d709b7cea19d278204daca1af01910add522cd8e3325cb406f339efbb0d92. the two
+// readings agree, and the same appendix publishes the arithmetic form on lines
+// 6854 to 6867, which is what the shipped function implements.
+//
+// the port departs from the listing in exactly one place, and deliberately.
+// the listing's direct_path and level are this package's DirectPath and
+// NodeIndex.Level, and CommonAncestor calls NodeIndex.Level itself, so a port
+// written that way would share a dependency with the function it exists to
+// disagree with. the ancestor chains come from pathOracle instead, the array
+// layout in closed form, anchored against RFC 9420 table 2 by the direct-path
+// tests above; each level is carried down from the loop that built the chain.
+// measured, and not merely argued: with the two chains taken from DirectPath
+// and the minimum taken by NodeIndex.Level, a Level answering one too high for
+// every parent leaves this differential green.
+//
+// the intersection of two ancestor chains holds no two nodes at one level, so
+// the minimum is unique and this returns the same node whatever order the map
+// is walked in.
+func commonAncestorSemantic(t *testing.T, level uint32, block uint64, otherLevel uint32, otherBlock uint64, depth uint32) NodeIndex {
+	t.Helper()
+	ancestorsOfX := ancestorLevels(level, block, depth)
+	ancestorsOfY := ancestorLevels(otherLevel, otherBlock, depth)
+
+	lowest, lowestLevel, found := NodeIndex(0), uint32(0), false
+	for node, nodeLevel := range ancestorsOfX {
+		if _, shared := ancestorsOfY[node]; !shared {
+			continue
+		}
+		if !found || nodeLevel < lowestLevel {
+			lowest, lowestLevel, found = node, nodeLevel, true
+		}
+	}
+	if !found {
+		t.Fatalf("depth %d: no common ancestor of the node at level %d block %d and the node at level %d block %d", depth, level, block, otherLevel, otherBlock)
+	}
+	return lowest
+}
+
+// how many pairs of each shape a common-ancestor sweep reached.
+//
+// the implementation answers in three ways — the second operand is an ancestor
+// of the first, the first is an ancestor of the second, or the answer is
+// neither — and a sweep that reaches only one of them looks complete and is
+// not. the leaf-pair band below reaches no ancestor pair at all, which is why
+// its two ancestor arms are asserted to be empty rather than left unsaid.
+type ancestorArms struct {
+	pairsOfANodeWithItself int
+	pairsAnsweredByX       int
+	pairsAnsweredByY       int
+	pairsAnsweredByNeither int
+}
+
+// one pair of nodes against the semantic definition, absolutely and in both
+// orders, tallying the shape of the pair.
+//
+// both orders are checked against the same absolute answer rather than against
+// each other, because two answers that agree with each other can both be
+// wrong: a version that always returns the root is perfectly symmetric.
+//
+// the pair is named by level and block for the same reason the oracle is. no
+// node index is ever handed back to be taken apart, so nothing here needs a
+// second reading of NodeIndex.Level.
+func checkCommonAncestorAgainstSemantic(t *testing.T, level uint32, block uint64, otherLevel uint32, otherBlock uint64, depth uint32, arms *ancestorArms) {
+	t.Helper()
+	x, y := nodeAt(level, block), nodeAt(otherLevel, otherBlock)
+	want := commonAncestorSemantic(t, level, block, otherLevel, otherBlock, depth)
+
+	if got := CommonAncestor(x, y); got != want {
+		t.Fatalf("depth %d: common ancestor of %d and %d: %d, want %d", depth, x, y, got, want)
+	}
+	if got := CommonAncestor(y, x); got != want {
+		t.Fatalf("depth %d: common ancestor of %d and %d: %d, want %d", depth, y, x, got, want)
+	}
+
+	switch {
+	case x == y:
+		arms.pairsOfANodeWithItself += 1
+	case want == x:
+		arms.pairsAnsweredByX += 1
+	case want == y:
+		arms.pairsAnsweredByY += 1
+	default:
+		arms.pairsAnsweredByNeither += 1
+	}
+}
+
+// reports the four arms of a sweep against the totals derived from its own loop
+// structure, so a band that silently stopped short fails as loudly as a wrong
+// answer would.
+func assertAncestorArms(t *testing.T, band string, arms ancestorArms, want ancestorArms) {
+	t.Helper()
+	armCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "pairs of a node with itself", got: arms.pairsOfANodeWithItself, want: want.pairsOfANodeWithItself},
+		{label: "pairs answered by the first node", got: arms.pairsAnsweredByX, want: want.pairsAnsweredByX},
+		{label: "pairs answered by the second node", got: arms.pairsAnsweredByY, want: want.pairsAnsweredByY},
+		{label: "pairs answered by neither node", got: arms.pairsAnsweredByNeither, want: want.pairsAnsweredByNeither},
+	}
+	for _, c := range armCases {
+		if c.got != c.want {
+			t.Errorf("%s: %s: %d, want %d", band, c.label, c.got, c.want)
+		}
+	}
+}
+
+// the absolute answer for pairs whose common ancestor was worked out by hand
+// from the array layout, before anything was run.
+//
+// RFC 9420 publishes no table of common ancestors, so unlike the direct-path
+// fixtures above these rows are not quoted from the document; they are read off
+// appendix C figure 32's layout, in which the level-k node covering the b-th
+// block of 2^k leaves sits at array position b*2^(k+1) + 2^k - 1. the first
+// nine rows are the eight-leaf tree the plan named and can be checked against
+// figure 11's drawing node by node. the rest reach levels the eight-leaf tree
+// does not have: a tree has up to 32 levels and a fixture that stops at level
+// three pins one of them.
+//
+// symmetry is checked on every row, but the load-bearing assertion is the
+// absolute one beside it. symmetry, reflexivity and "the answer is an ancestor
+// of both" are each satisfied by a version that always returns the root, so a
+// fixture built out of them alone would be green on one.
+func TestCommonAncestorKnownValues(t *testing.T) {
+	ancestorCases := []struct {
+		x        NodeIndex
+		y        NodeIndex
+		ancestor NodeIndex
+	}{
+		// the eight-leaf tree of figure 11: leaves at 0, 2, 4, 6, 8, 10, 12 and
+		// 14, parents at 1, 5, 9 and 13, grandparents at 3 and 11, root at 7.
+		{x: 0, y: 0, ancestor: 0},
+		{x: 0, y: 2, ancestor: 1},
+		{x: 0, y: 4, ancestor: 3},
+		{x: 2, y: 6, ancestor: 3},
+		{x: 0, y: 14, ancestor: 7},
+		{x: 1, y: 0, ancestor: 1},
+		{x: 0, y: 1, ancestor: 1},
+		{x: 3, y: 11, ancestor: 7},
+		{x: 9, y: 13, ancestor: 11},
+		// two level-ten nodes side by side, joining at level eleven:
+		// 2^10-1 = 1023 and 2^11 + 2^10 - 1 = 3071 under 2^11-1 = 2047.
+		{x: 1023, y: 3071, ancestor: 2047},
+		// leaf 0 and leaf 2^20, the first leaf of the right half of the
+		// leftmost level-21 node: 2*2^20 = 2097152 under 2^21-1 = 2097151.
+		{x: 0, y: 2097152, ancestor: 2097151},
+		// the level-20 node covering leaves 0 to 2^20-1, and the leaf just past
+		// the end of it, which join one level up.
+		{x: 1048575, y: 2097152, ancestor: 2097151},
+		// a level-five node at the far left and the level-20 node covering
+		// leaves 2^20 to 2^21-1, which also join at level 21.
+		{x: 31, y: 3145727, ancestor: 2097151},
+		// the two level-30 halves of the largest tree, joining at its root
+		// 2^31-1 = 2147483647.
+		{x: 1073741823, y: 3221225471, ancestor: 2147483647},
+		// the first and last leaves of the largest tree, 0 and 2^32-2.
+		{x: 0, y: 4294967294, ancestor: 2147483647},
+		// the root of the largest tree is an ancestor of every node in it,
+		// including the last leaf and including itself.
+		{x: 2147483647, y: 0, ancestor: 2147483647},
+		{x: 2147483647, y: 4294967294, ancestor: 2147483647},
+		{x: 2147483647, y: 2147483647, ancestor: 2147483647},
+	}
+	// the same arms the sweeps count, so a table that drifted into rows of one
+	// shape fails rather than quietly narrowing.
+	arms := ancestorArms{}
+	for _, c := range ancestorCases {
+		if got := CommonAncestor(c.x, c.y); got != c.ancestor {
+			t.Errorf("common ancestor of %d and %d: %d, want %d", c.x, c.y, got, c.ancestor)
+		}
+		// the relation is symmetric.
+		if got := CommonAncestor(c.y, c.x); got != c.ancestor {
+			t.Errorf("common ancestor of %d and %d: %d, want %d", c.y, c.x, got, c.ancestor)
+		}
+		switch {
+		case c.x == c.y:
+			arms.pairsOfANodeWithItself += 1
+		case c.ancestor == c.x:
+			arms.pairsAnsweredByX += 1
+		case c.ancestor == c.y:
+			arms.pairsAnsweredByY += 1
+		default:
+			arms.pairsAnsweredByNeither += 1
+		}
+	}
+	assertAncestorArms(t, "the known-value table", arms, ancestorArms{
+		pairsOfANodeWithItself: 2,
+		pairsAnsweredByX:       3,
+		pairsAnsweredByY:       1,
+		pairsAnsweredByNeither: 12,
+	})
+}
+
+// the absolute answer at every level a node can have, from the layout and not
+// from the semantic oracle.
+//
+// the differential below is only as good as the oracle it runs against, so the
+// levels above the eight-leaf tree are anchored here as well, by three ladders
+// whose answers are closed forms rather than searches. every row is a triple
+// the layout fixes: two nodes side by side under one parent answer that parent;
+// a node and anything beneath it answer the node; and two nodes taken from
+// opposite halves of a level-k node answer that node whatever levels they
+// themselves sit at.
+//
+// this is where the boundary lives. the vector family stops at 512 leaves, the
+// plan's own differential stops at depth 9, and the invariant sweep of Task 13
+// stops there too, so levels 10 to 31 are reached by nothing else in this
+// package. the ladders run to level 31 because that is the highest level the
+// largest representable tree has.
+func TestCommonAncestorAtEveryLevel(t *testing.T) {
+	siblingRows, containedRows, joinRows := 0, 0, 0
+
+	// two nodes side by side at the same level answer their parent, at every
+	// level a parent can sit at.
+	for level := uint32(0); level <= 30; level += 1 {
+		x, y, want := nodeAt(level, 0), nodeAt(level, 1), nodeAt(level+1, 0)
+		if got := CommonAncestor(x, y); got != want {
+			t.Fatalf("level %d: common ancestor of %d and %d: %d, want %d", level, x, y, got, want)
+		}
+		if got := CommonAncestor(y, x); got != want {
+			t.Fatalf("level %d: common ancestor of %d and %d: %d, want %d", level, y, x, got, want)
+		}
+		siblingRows += 1
+	}
+
+	// a node and a node beneath it answer the higher node, at every pair of
+	// levels. the leftmost and the rightmost descendant at the lower level are
+	// both taken, because a version that shifted by the wrong operand's level
+	// is right for one of them and wrong for the other.
+	for level := uint32(1); level <= 31; level += 1 {
+		head := nodeAt(level, 0)
+		for inner := uint32(0); inner < level; inner += 1 {
+			for _, block := range []uint64{0, uint64(1)<<(level-inner) - 1} {
+				inside := nodeAt(inner, block)
+				if got := CommonAncestor(head, inside); got != head {
+					t.Fatalf("level %d: common ancestor of %d and %d beneath it: %d, want %d", level, head, inside, got, head)
+				}
+				if got := CommonAncestor(inside, head); got != head {
+					t.Fatalf("level %d: common ancestor of %d and %d above it: %d, want %d", level, inside, head, got, head)
+				}
+				containedRows += 1
+			}
+		}
+	}
+
+	// one node from each half of a level-k node answers that node, whatever
+	// levels the two are at. the left one is the leftmost node of its level and
+	// the right one the rightmost of its own, so the two are always in opposite
+	// halves of the level-k node at block zero.
+	for level := uint32(1); level <= 31; level += 1 {
+		want := nodeAt(level, 0)
+		for leftLevel := uint32(0); leftLevel < level; leftLevel += 1 {
+			for rightLevel := uint32(0); rightLevel < level; rightLevel += 1 {
+				x := nodeAt(leftLevel, 0)
+				y := nodeAt(rightLevel, uint64(1)<<(level-rightLevel)-1)
+				if got := CommonAncestor(x, y); got != want {
+					t.Fatalf("level %d: common ancestor of %d at level %d and %d at level %d: %d, want %d", level, x, leftLevel, y, rightLevel, got, want)
+				}
+				if got := CommonAncestor(y, x); got != want {
+					t.Fatalf("level %d: common ancestor of %d at level %d and %d at level %d: %d, want %d", level, y, rightLevel, x, leftLevel, got, want)
+				}
+				joinRows += 1
+			}
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// one parent per level from 1 to 31.
+		{label: "sibling pairs", got: siblingRows, want: 31},
+		// two descendants at each pair of levels (k, j) with j < k, which is
+		// 2 * sum(k=1..31) k.
+		{label: "containment pairs", got: containedRows, want: 992},
+		// every ordered pair of levels below each join level, sum(k=1..31) k*k.
+		{label: "join pairs", got: joinRows, want: 10416},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// RFC 9420 gives two independent definitions and the whole value of having both
+// is that they can be run against each other.
+//
+// three bands. every ordered pair of nodes of every tree up to 128 leaves; then
+// every ordered pair of leaves of the 256 and 512 leaf trees, which is the band
+// the plan named; then designed pairs at every level of every depth from 10 to
+// 31, which is where the boundary is and which nothing else in this package
+// reaches. the arms of each band are counted and pinned, and the leaf band's
+// two ancestor arms are pinned at zero: a band of leaves alone can never put
+// one operand inside the other, so a differential built only from leaf pairs
+// never runs either of the two shortcuts the implementation opens with.
+func TestCommonAncestorMatchesSemanticDefinition(t *testing.T) {
+	// depths 0 to 7 exhaustively. walking (level, block) reaches every node of
+	// the tree exactly once and is the pair the oracle takes, so no node index
+	// is ever handed back to the oracle to be taken apart.
+	exhaustiveArms := ancestorArms{}
+	for depth := uint32(0); depth <= 7; depth += 1 {
+		for level := uint32(0); level <= depth; level += 1 {
+			for block := uint64(0); block < uint64(1)<<(depth-level); block += 1 {
+				for otherLevel := uint32(0); otherLevel <= depth; otherLevel += 1 {
+					for otherBlock := uint64(0); otherBlock < uint64(1)<<(depth-otherLevel); otherBlock += 1 {
+						checkCommonAncestorAgainstSemantic(t, level, block, otherLevel, otherBlock, depth, &exhaustiveArms)
+					}
+				}
+			}
+		}
+	}
+	// a tree of depth d holds 2^(d+1)-1 nodes, so the eight trees hold 502
+	// between them and that many pairs are a node with itself. a level-k node
+	// has 2^(k+1)-2 nodes strictly beneath it, and summed over a whole tree
+	// that is (d-1)*2^(d+1)+2, which over the eight depths is 2582; the
+	// mirrored arm is the same size, and the rest answer neither operand.
+	assertAncestorArms(t, "every node pair up to 128 leaves", exhaustiveArms, ancestorArms{
+		pairsOfANodeWithItself: 502,
+		pairsAnsweredByX:       2582,
+		pairsAnsweredByY:       2582,
+		pairsAnsweredByNeither: 80702,
+	})
+
+	// the 256 and 512 leaf trees, leaf pairs only, which is the band the plan
+	// wrote and is kept because a leaf pair is what every caller of this
+	// function in the rest of the slice actually holds.
+	leafArms := ancestorArms{}
+	for depth := uint32(8); depth <= 9; depth += 1 {
+		for block := uint64(0); block < uint64(1)<<depth; block += 1 {
+			for otherBlock := uint64(0); otherBlock < uint64(1)<<depth; otherBlock += 1 {
+				checkCommonAncestorAgainstSemantic(t, 0, block, 0, otherBlock, depth, &leafArms)
+			}
+		}
+	}
+	// 256^2 + 512^2 pairs, of which 256 + 512 are a leaf with itself and no
+	// leaf is ever inside another.
+	assertAncestorArms(t, "every leaf pair at 256 and 512 leaves", leafArms, ancestorArms{
+		pairsOfANodeWithItself: 768,
+		pairsAnsweredByX:       0,
+		pairsAnsweredByY:       0,
+		pairsAnsweredByNeither: 326912,
+	})
+
+	// depths 10 to 31, where a tree has too many nodes to walk. every ordered
+	// pair of levels, and five blocks at each: the first and second block, the
+	// last and second to last, and one with alternating bits, which is what
+	// separates a version right for an all-left or all-right chain from one
+	// right for a chain that turns. the mask keeps the count the same at every
+	// level, so a level holding a single block repeats it rather than dropping
+	// out of the totals below.
+	blockProbes := []uint64{0, 1, 0xFFFFFFFF, 0xFFFFFFFE, 0xA5A5A5A5}
+	deepArms := ancestorArms{}
+	for depth := uint32(10); depth <= 31; depth += 1 {
+		for level := uint32(0); level <= depth; level += 1 {
+			blockMask := uint64(1)<<(depth-level) - 1
+			for otherLevel := uint32(0); otherLevel <= depth; otherLevel += 1 {
+				otherMask := uint64(1)<<(depth-otherLevel) - 1
+				for _, probe := range blockProbes {
+					for _, otherProbe := range blockProbes {
+						checkCommonAncestorAgainstSemantic(t, level, probe&blockMask, otherLevel, otherProbe&otherMask, depth, &deepArms)
+					}
+				}
+			}
+		}
+	}
+	// twenty-two depths, (d+1)^2 ordered level pairs each, twenty-five block
+	// pairs a level pair: 25 * sum(d=10..31) (d+1)^2 = 276375. the split
+	// between the four arms was derived from the same masks outside Go, not
+	// read off a run.
+	assertAncestorArms(t, "designed pairs from depth 10 to 31", deepArms, ancestorArms{
+		pairsOfANodeWithItself: 3025,
+		pairsAnsweredByX:       35308,
+		pairsAnsweredByY:       35308,
+		pairsAnsweredByNeither: 202734,
+	})
+}
+
+// the properties of the relation, asserted apart from the absolute answers
+// above because on their own they are nearly free.
+//
+// a version that always returns the root of the tree satisfies symmetry, "the
+// answer is an ancestor of both" and "the answer is at least as high as both
+// operands"; only reflexivity refuses it, and only at the pairs where the two
+// operands are equal. these rows pin the shape of the relation rather than
+// establish it, and that sentence is measurable rather than rhetorical: with
+// the three absolute tests above deleted and only this one and the rest of the
+// package kept, the enumeration this task ran leaves far more versions alive
+// than it does with them.
+//
+// the last row is the one that is not free. the answer has to be inside the
+// smallest tree that contains both operands, which is what makes the missing
+// leaf count in the signature sound, and it is the row a version returning the
+// root of the largest representable tree fails.
+func TestCommonAncestorProperties(t *testing.T) {
+	checkedPairs, reflexivePairs := 0, 0
+
+	check := func(depth uint32, level uint32, block uint64, otherLevel uint32, otherBlock uint64) {
+		t.Helper()
+		leafCount := LeafCount(1) << depth
+		x, y := nodeAt(level, block), nodeAt(otherLevel, otherBlock)
+		ancestor := CommonAncestor(x, y)
+
+		if got := CommonAncestor(y, x); got != ancestor {
+			t.Fatalf("%d leaves: common ancestor of %d and %d is %d one way and %d the other", leafCount, x, y, ancestor, got)
+		}
+		if x == y {
+			if ancestor != x {
+				t.Fatalf("%d leaves: common ancestor of %d with itself: %d", leafCount, x, ancestor)
+			}
+			reflexivePairs += 1
+		}
+		// idempotent: joining the answer back onto either operand answers the
+		// same node, which a version that climbed one level too far fails.
+		if got := CommonAncestor(ancestor, x); got != ancestor {
+			t.Fatalf("%d leaves: common ancestor of %d and %d beneath it: %d", leafCount, ancestor, x, got)
+		}
+		if got := CommonAncestor(ancestor, y); got != ancestor {
+			t.Fatalf("%d leaves: common ancestor of %d and %d beneath it: %d", leafCount, ancestor, y, got)
+		}
+		// an ancestor of both, read off the direct paths the rest of this file
+		// already pins against RFC 9420 table 2.
+		for _, operand := range []NodeIndex{x, y} {
+			if ancestor == operand {
+				continue
+			}
+			directPath, err := DirectPath(operand, leafCount)
+			if err != nil {
+				t.Fatalf("%d leaves: direct path of %d: %v", leafCount, operand, err)
+			}
+			onPath := false
+			for _, node := range directPath {
+				if node == ancestor {
+					onPath = true
+				}
+			}
+			if !onPath {
+				t.Fatalf("%d leaves: common ancestor %d of %d and %d is not on the direct path of %d", leafCount, ancestor, x, y, operand)
+			}
+		}
+		// and no lower than either operand.
+		if ancestor.Level() < level || ancestor.Level() < otherLevel {
+			t.Fatalf("%d leaves: common ancestor %d of %d and %d is at level %d, below level %d or %d", leafCount, ancestor, x, y, ancestor.Level(), level, otherLevel)
+		}
+		// inside the smallest tree holding both, which is the claim that makes
+		// the absent leaf count sound.
+		if uint32(ancestor) >= NodeWidth(leafCount) {
+			t.Fatalf("%d leaves: common ancestor %d of %d and %d is outside a tree that holds them both, of width %d", leafCount, ancestor, x, y, NodeWidth(leafCount))
+		}
+		checkedPairs += 1
+	}
+
+	// every ordered node pair of every tree up to 32 leaves.
+	for depth := uint32(0); depth <= 5; depth += 1 {
+		for level := uint32(0); level <= depth; level += 1 {
+			for block := uint64(0); block < uint64(1)<<(depth-level); block += 1 {
+				for otherLevel := uint32(0); otherLevel <= depth; otherLevel += 1 {
+					for otherBlock := uint64(0); otherBlock < uint64(1)<<(depth-otherLevel); otherBlock += 1 {
+						check(depth, level, block, otherLevel, otherBlock)
+					}
+				}
+			}
+		}
+	}
+
+	// and every ordered pair of levels in the largest tree there is, so the
+	// properties are pinned where the sweeps of this package otherwise stop.
+	for level := uint32(0); level <= 31; level += 1 {
+		for otherLevel := uint32(0); otherLevel <= 31; otherLevel += 1 {
+			check(31, level, 0, otherLevel, uint64(1)<<(31-otherLevel)-1)
+			check(31, level, uint64(1)<<(31-level)-1, otherLevel, 0)
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// 1 + 9 + 49 + 225 + 961 + 3969 pairs from the six trees, then two per
+		// ordered pair of the 32 levels.
+		{label: "checked pairs", got: checkedPairs, want: 5214 + 2048},
+		// one per node of the six trees, which is sum(d=0..5) 2^(d+1)-1, and in
+		// the deep band the pairs where both sides name one node: the only pair
+		// of levels at which they do is 31 against 31, once in each order.
+		{label: "pairs of a node with itself", got: reflexivePairs, want: 120 + 2},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the claim the missing leaf count rests on: any tree containing both nodes
+// contains their common ancestor, at the same index.
+//
+// the shipped doc comment states it and the plan's test block never looks at
+// it. it is checked here by asking the semantic definition the same question in
+// every tree that holds the pair, from the smallest up to the largest there is,
+// requiring one answer throughout, and requiring the count-free answer of the
+// shipped function to be that one.
+func TestCommonAncestorDoesNotDependOnTheLeafCount(t *testing.T) {
+	// pairs named by level and block, across the shapes: two leaves, a node and
+	// a leaf beneath it, two nodes at unequal levels, a node with itself.
+	pairCases := []struct {
+		level      uint32
+		block      uint64
+		otherLevel uint32
+		otherBlock uint64
+	}{
+		{level: 0, block: 0, otherLevel: 0, otherBlock: 1},
+		{level: 0, block: 0, otherLevel: 0, otherBlock: 5},
+		{level: 0, block: 3, otherLevel: 0, otherBlock: 4},
+		{level: 2, block: 0, otherLevel: 0, otherBlock: 3},
+		{level: 2, block: 0, otherLevel: 0, otherBlock: 4},
+		{level: 3, block: 1, otherLevel: 1, otherBlock: 0},
+		{level: 4, block: 0, otherLevel: 4, otherBlock: 1},
+		{level: 5, block: 2, otherLevel: 5, otherBlock: 2},
+		{level: 9, block: 1, otherLevel: 0, otherBlock: 0},
+		{level: 10, block: 0, otherLevel: 10, otherBlock: 1},
+	}
+	checkedTrees := 0
+	for _, c := range pairCases {
+		// the smallest tree holding both: deep enough for the higher of the two
+		// levels and for the higher of the two blocks.
+		smallestDepth := c.level
+		if smallestDepth < c.otherLevel {
+			smallestDepth = c.otherLevel
+		}
+		for c.block>>(smallestDepth-c.level) != 0 || c.otherBlock>>(smallestDepth-c.otherLevel) != 0 {
+			smallestDepth += 1
+		}
+
+		x, y := nodeAt(c.level, c.block), nodeAt(c.otherLevel, c.otherBlock)
+		ancestor := CommonAncestor(x, y)
+		for depth := smallestDepth; depth <= 31; depth += 1 {
+			want := commonAncestorSemantic(t, c.level, c.block, c.otherLevel, c.otherBlock, depth)
+			if want != ancestor {
+				t.Fatalf("%d leaves: common ancestor of %d and %d is %d there and %d in the smallest tree that holds them", LeafCount(1)<<depth, x, y, want, ancestor)
+			}
+			if uint32(ancestor) >= NodeWidth(LeafCount(1)<<depth) {
+				t.Fatalf("%d leaves: common ancestor %d of %d and %d is outside the tree", LeafCount(1)<<depth, ancestor, x, y)
+			}
+			checkedTrees += 1
+		}
+	}
+
+	// the smallest tree holding each pair is at depth 1, 3, 3, 2, 3, 4, 5, 7,
+	// 10 and 11, and each is carried up to depth 31, which is the sum of 32-d
+	// over those ten depths.
+	if want := 31 + 29 + 29 + 30 + 29 + 28 + 27 + 25 + 22 + 21; checkedTrees != want {
+		t.Errorf("confirmed trees checked: %d, want %d", checkedTrees, want)
+	}
+}

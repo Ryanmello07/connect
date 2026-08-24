@@ -365,3 +365,39 @@ func Copath(x NodeIndex, n LeafCount) ([]NodeIndex, error) {
 	}
 	return copathNodes, nil
 }
+
+// the lowest node that is an ancestor of both x and y, where a node counts as
+// an ancestor of itself (RFC 9420 appendix C).
+//
+// the answer does not depend on the leaf count: any tree containing both nodes
+// contains this node at this index, which is why no count is taken.
+//
+// the appendix publishes two definitions of this relation, this arithmetic one
+// and a semantic one built out of direct paths, and the test file runs the
+// second against the first rather than restating either.
+func CommonAncestor(x NodeIndex, y NodeIndex) NodeIndex {
+	// one may be an ancestor of the other, in which case it is the answer.
+	// these two cases are not a shortcut: the loop below descends from the
+	// index the two indices agree on, which for a node and one of its own
+	// descendants is not that node.
+	levelOfX := uint64(x.Level()) + 1
+	levelOfY := uint64(y.Level()) + 1
+	if levelOfX <= levelOfY && uint64(x)>>levelOfY == uint64(y)>>levelOfY {
+		return y
+	}
+	if levelOfY <= levelOfX && uint64(x)>>levelOfX == uint64(y)>>levelOfX {
+		return x
+	}
+
+	// otherwise shift both right until they agree; the number of shifts is one
+	// past the level of the node where the two subtrees join, and the value
+	// they agree on is that node's own index shifted down by the same amount.
+	shiftedX, shiftedY := uint64(x), uint64(y)
+	shifts := uint64(0)
+	for shiftedX != shiftedY {
+		shiftedX >>= 1
+		shiftedY >>= 1
+		shifts += 1
+	}
+	return NodeIndex((shiftedX << shifts) + (uint64(1) << (shifts - 1)) - 1)
+}
