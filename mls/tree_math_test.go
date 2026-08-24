@@ -2080,3 +2080,520 @@ func TestCommonAncestorDoesNotDependOnTheLeafCount(t *testing.T) {
 		t.Errorf("confirmed trees checked: %d, want %d", checkedTrees, want)
 	}
 }
+
+// the first and last node and the first and last leaf of the subtree headed by
+// the node at (level, block), from the array layout alone.
+//
+// no function of this package is called here, and the derivation is not the one
+// the shipped body uses. the body works from the node's own index and a
+// half-span either side of it; this works from the block of leaves the node
+// covers — a level-k node heads the 2^k leaves of block b, which are leaves
+// b*2^k through (b+1)*2^k - 1, and the array slots of its subtree run from the
+// slot of the first of those leaves to the slot of the last. nodeAt at level
+// zero is that slot, and it is the same layout TestDirectPathAndCopathRfcTable2
+// anchors against RFC 9420 table 2 and figure 11 before any sweep here uses it.
+//
+// the two derivations agreeing is the whole point. a span is where an
+// inclusive-exclusive mistake hides, and a span that is one slot short at
+// either end still contains the node, still nests inside its parent's span and
+// still has a plausible width, so nothing symmetric separates it. these are
+// absolute endpoints, reached without the arithmetic under test.
+//
+// the arithmetic runs in uint64 so the largest tree's root, whose last leaf is
+// 2^31-1 at node 2^32-2, is built without a wrap.
+func spanOracle(level uint32, block uint64) (firstNode NodeIndex, lastNode NodeIndex, firstLeaf LeafIndex, lastLeaf LeafIndex) {
+	first := block << level
+	last := (block+1)<<level - 1
+	return nodeAt(0, first), nodeAt(0, last), LeafIndex(first), LeafIndex(last)
+}
+
+// the blocks probed at one level: the two on the left, the one in the middle
+// and the one on the right of the largest representable tree.
+//
+// a level-k node of that tree sits at one of blocks 0 through 2^(31-k)-1, so
+// the list shortens at the top rather than repeating a block — level 31 has one
+// block and level 30 has two. the middle block earns its place: a version that
+// shifted the block by the wrong amount, or dropped its high bits, is right at
+// blocks 0 and 1 and right again at the all-ones block on the right.
+func spanBlocks(level uint32) []uint64 {
+	blockCount := uint64(1) << (31 - level)
+	blocks := []uint64{0}
+	if blockCount > 1 {
+		blocks = append(blocks, 1)
+	}
+	if blockCount > 2 {
+		blocks = append(blocks, blockCount/2)
+	}
+	if blockCount > 3 {
+		blocks = append(blocks, blockCount-1)
+	}
+	return blocks
+}
+
+// the span of every node of the eight-leaf tree and of four levels above it,
+// against values worked out by hand from the array layout before anything ran.
+//
+// the plan's table named seven of the eight-leaf tree's fifteen nodes. all
+// fifteen are here for the reason the direct-path fixture gives: seven rows
+// leave four leaves, three parents and one whole level unasserted, and the
+// eight-leaf rows can be checked node by node against the tree RFC 9420
+// figure 11 draws. the rows above them reach levels 4, 16, 30 and 31, which no
+// drawing in the RFC has and which the sweep below covers by machine — they are
+// here so the sweep's oracle is anchored by hand at the top of the range as
+// well as at the bottom.
+func TestSubtreeSpanAndLeaves(t *testing.T) {
+	spanCases := []struct {
+		nodeIndex NodeIndex
+		firstNode NodeIndex
+		lastNode  NodeIndex
+		firstLeaf LeafIndex
+		lastLeaf  LeafIndex
+	}{
+		// the eight-leaf tree, every node of it, read off figure 11.
+		{nodeIndex: 0, firstNode: 0, lastNode: 0, firstLeaf: 0, lastLeaf: 0},
+		{nodeIndex: 1, firstNode: 0, lastNode: 2, firstLeaf: 0, lastLeaf: 1},
+		{nodeIndex: 2, firstNode: 2, lastNode: 2, firstLeaf: 1, lastLeaf: 1},
+		{nodeIndex: 3, firstNode: 0, lastNode: 6, firstLeaf: 0, lastLeaf: 3},
+		{nodeIndex: 4, firstNode: 4, lastNode: 4, firstLeaf: 2, lastLeaf: 2},
+		{nodeIndex: 5, firstNode: 4, lastNode: 6, firstLeaf: 2, lastLeaf: 3},
+		{nodeIndex: 6, firstNode: 6, lastNode: 6, firstLeaf: 3, lastLeaf: 3},
+		{nodeIndex: 7, firstNode: 0, lastNode: 14, firstLeaf: 0, lastLeaf: 7},
+		{nodeIndex: 8, firstNode: 8, lastNode: 8, firstLeaf: 4, lastLeaf: 4},
+		{nodeIndex: 9, firstNode: 8, lastNode: 10, firstLeaf: 4, lastLeaf: 5},
+		{nodeIndex: 10, firstNode: 10, lastNode: 10, firstLeaf: 5, lastLeaf: 5},
+		{nodeIndex: 11, firstNode: 8, lastNode: 14, firstLeaf: 4, lastLeaf: 7},
+		{nodeIndex: 12, firstNode: 12, lastNode: 12, firstLeaf: 6, lastLeaf: 6},
+		{nodeIndex: 13, firstNode: 12, lastNode: 14, firstLeaf: 6, lastLeaf: 7},
+		{nodeIndex: 14, firstNode: 14, lastNode: 14, firstLeaf: 7, lastLeaf: 7},
+		// level 4, the root of a sixteen-leaf tree, and its right half.
+		{nodeIndex: 0x0000000F, firstNode: 0x00000000, lastNode: 0x0000001E, firstLeaf: 0, lastLeaf: 15},
+		{nodeIndex: 0x00000017, firstNode: 0x00000010, lastNode: 0x0000001E, firstLeaf: 8, lastLeaf: 15},
+		// level 16, at the left of the array and one block along.
+		{nodeIndex: 0x0000FFFF, firstNode: 0x00000000, lastNode: 0x0001FFFE, firstLeaf: 0x00000000, lastLeaf: 0x0000FFFF},
+		{nodeIndex: 0x0002FFFF, firstNode: 0x00020000, lastNode: 0x0003FFFE, firstLeaf: 0x00010000, lastLeaf: 0x0001FFFF},
+		// level 30, the two halves of the largest representable tree.
+		{nodeIndex: 0x3FFFFFFF, firstNode: 0x00000000, lastNode: 0x7FFFFFFE, firstLeaf: 0x00000000, lastLeaf: 0x3FFFFFFF},
+		{nodeIndex: 0xBFFFFFFF, firstNode: 0x80000000, lastNode: 0xFFFFFFFE, firstLeaf: 0x40000000, lastLeaf: 0x7FFFFFFF},
+		// level 31, the root of the largest representable tree, whose span is
+		// the whole node array.
+		{nodeIndex: 0x7FFFFFFF, firstNode: 0x00000000, lastNode: 0xFFFFFFFE, firstLeaf: 0x00000000, lastLeaf: 0x7FFFFFFF},
+	}
+	for _, c := range spanCases {
+		firstNode, lastNode := SubtreeSpan(c.nodeIndex)
+		if firstNode != c.firstNode || lastNode != c.lastNode {
+			t.Errorf("node %d span: [%d, %d], want [%d, %d]", c.nodeIndex, firstNode, lastNode, c.firstNode, c.lastNode)
+		}
+		firstLeaf, lastLeaf := SubtreeLeaves(c.nodeIndex)
+		if firstLeaf != c.firstLeaf || lastLeaf != c.lastLeaf {
+			t.Errorf("node %d leaves: [%d, %d], want [%d, %d]", c.nodeIndex, firstLeaf, lastLeaf, c.firstLeaf, c.lastLeaf)
+		}
+	}
+}
+
+// the absolute endpoints at every level a node can have, against the layout
+// oracle rather than against a property.
+//
+// this is where the boundary lives, and it is the same boundary every task in
+// this plan has had to fill. the vector family stops at 512 leaves and so
+// reaches levels 0 to 9; the plan's own table for this task stops at level 3;
+// the structural sweep of Task 13 stops at 512 leaves too, and the fuzz target
+// asserts only that an answer is inside the tree. levels 10 to 31 are reached
+// by nothing else in this package.
+//
+// four blocks per level rather than one, because a span is a function of the
+// block as well as the level and a version right at the left edge of the array
+// can be wrong everywhere else. the leaf range is asserted beside the node span
+// on every row, since the two can disagree — the node span can be right while
+// the halving that turns it into leaves is off by one, and neither is derived
+// from the other here.
+func TestSubtreeSpanAtEveryLevel(t *testing.T) {
+	leafRows, parentRows := 0, 0
+
+	for level := uint32(0); level <= 31; level += 1 {
+		for _, block := range spanBlocks(level) {
+			nodeIndex := nodeAt(level, block)
+			wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf := spanOracle(level, block)
+
+			firstNode, lastNode := SubtreeSpan(nodeIndex)
+			if firstNode != wantFirstNode || lastNode != wantLastNode {
+				t.Fatalf("level %d block %d: node %d span: [%d, %d], want [%d, %d]", level, block, nodeIndex, firstNode, lastNode, wantFirstNode, wantLastNode)
+			}
+
+			firstLeaf, lastLeaf := SubtreeLeaves(nodeIndex)
+			if firstLeaf != wantFirstLeaf || lastLeaf != wantLastLeaf {
+				t.Fatalf("level %d block %d: node %d leaves: [%d, %d], want [%d, %d]", level, block, nodeIndex, firstLeaf, lastLeaf, wantFirstLeaf, wantLastLeaf)
+			}
+
+			// the two answers have to describe one subtree. the leaves at the
+			// ends of the range sit at the ends of the span, which is what
+			// makes the halving above sound rather than merely plausible, and
+			// it is a claim the one index outside every tree does not satisfy —
+			// TestSubtreeSpanArms names that index and pins the contradiction
+			// there.
+			if firstLeaf.NodeIndex() != firstNode || lastLeaf.NodeIndex() != lastNode {
+				t.Fatalf("level %d block %d: node %d leaves [%d, %d] sit at nodes [%d, %d], want the span [%d, %d]", level, block, nodeIndex, firstLeaf, lastLeaf, firstLeaf.NodeIndex(), lastLeaf.NodeIndex(), firstNode, lastNode)
+			}
+
+			if level == 0 {
+				leafRows += 1
+			} else {
+				parentRows += 1
+			}
+		}
+	}
+
+	// the root of a tree spans the whole of its node array, at every depth. it
+	// is the one row that ties this file to NodeWidth, which the vector family
+	// pins at every size on its ladder, and it is the row an endpoint one too
+	// far fails by running past the end of the array a caller would index.
+	rootRows := 0
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leafCount := LeafCount(1) << depth
+		root, err := Root(leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: root: %v", leafCount, err)
+		}
+		firstNode, lastNode := SubtreeSpan(root)
+		if uint32(firstNode) != 0 || uint32(lastNode) != NodeWidth(leafCount)-1 {
+			t.Fatalf("%d leaves: root %d span: [%d, %d], want [0, %d]", leafCount, root, firstNode, lastNode, NodeWidth(leafCount)-1)
+		}
+		firstLeaf, lastLeaf := SubtreeLeaves(root)
+		if firstLeaf != 0 || LeafCount(lastLeaf) != leafCount-1 {
+			t.Fatalf("%d leaves: root %d leaves: [%d, %d], want [0, %d]", leafCount, root, firstLeaf, lastLeaf, leafCount-1)
+		}
+		rootRows += 1
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// level 0 has 2^31 blocks, so all four of its probes exist.
+		{label: "leaf rows", got: leafRows, want: 4},
+		// four probes at each of levels 1 to 29, two at level 30 which has two
+		// blocks, and one at level 31 which has one.
+		{label: "parent rows", got: parentRows, want: 119},
+		{label: "root rows", got: rootRows, want: 32},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the two arms of the span: the node that heads only itself, and the index that
+// heads nothing because it is in no tree.
+//
+// both arms are counted and both counts are asserted, as in Tasks 5, 6 and 8. a
+// run that reaches the arm with a subtree in it and never the other looks like
+// full coverage and is not, and here the second arm is the one that decides
+// whether an index a caller never validated can pass itself off as the head of
+// the whole array.
+func TestSubtreeSpanArms(t *testing.T) {
+	leafArms, outOfRangeArms := 0, 0
+
+	// a leaf heads itself and nothing else, at leaf indices across the whole
+	// range rather than at the two the plan's table names. the last row is the
+	// last leaf of the largest representable tree, one slot below the index
+	// that has no node, and it is the row a half-span one too wide runs off the
+	// end of the array on.
+	leafCases := []struct {
+		nodeIndex NodeIndex
+		leafIndex LeafIndex
+	}{
+		{nodeIndex: 0x00000000, leafIndex: 0x00000000},
+		{nodeIndex: 0x00000002, leafIndex: 0x00000001},
+		{nodeIndex: 0x00000004, leafIndex: 0x00000002},
+		{nodeIndex: 0x0000FFFE, leafIndex: 0x00007FFF},
+		{nodeIndex: 0x7FFFFFFE, leafIndex: 0x3FFFFFFF},
+		{nodeIndex: 0xFFFFFFFE, leafIndex: 0x7FFFFFFF},
+	}
+	for _, c := range leafCases {
+		firstNode, lastNode := SubtreeSpan(c.nodeIndex)
+		if firstNode != c.nodeIndex || lastNode != c.nodeIndex {
+			t.Errorf("leaf %d at node %d: span [%d, %d], want [%d, %d]", c.leafIndex, c.nodeIndex, firstNode, lastNode, c.nodeIndex, c.nodeIndex)
+			continue
+		}
+		firstLeaf, lastLeaf := SubtreeLeaves(c.nodeIndex)
+		if firstLeaf != c.leafIndex || lastLeaf != c.leafIndex {
+			t.Errorf("leaf %d at node %d: leaves [%d, %d], want [%d, %d]", c.leafIndex, c.nodeIndex, firstLeaf, lastLeaf, c.leafIndex, c.leafIndex)
+			continue
+		}
+		if !InSubtree(c.nodeIndex, c.nodeIndex) {
+			t.Errorf("leaf %d at node %d is not in its own subtree", c.leafIndex, c.nodeIndex)
+			continue
+		}
+		// the slots either side are what a span one wider at either end
+		// swallows, and for a leaf they are its own parent on one side and its
+		// sibling's subtree on the other, so a leaf that heads either heads a
+		// node above itself in the tree.
+		if c.nodeIndex > 0 && InSubtree(c.nodeIndex, c.nodeIndex-1) {
+			t.Errorf("leaf %d at node %d heads node %d", c.leafIndex, c.nodeIndex, c.nodeIndex-1)
+			continue
+		}
+		if InSubtree(c.nodeIndex, c.nodeIndex+1) {
+			t.Errorf("leaf %d at node %d heads node %d", c.leafIndex, c.nodeIndex, c.nodeIndex+1)
+			continue
+		}
+		leafArms += 1
+	}
+
+	// this line is the diagnosis rather than the coverage, exactly as in the
+	// children runner: the arm below is reachable at one index and only because
+	// Level is total and answers 32 there. a Level clamped to 31 fails the rows
+	// after it anyway, and would fail them looking like a broken span.
+	if got := NodeIndex(0xFFFFFFFF).Level(); got != 32 {
+		t.Fatalf("level of 0xFFFFFFFF: %d, want 32: no index reaches the refusal below at any other level", got)
+	}
+
+	// 0xFFFFFFFF is one past the last node of the largest representable tree,
+	// so it is in no tree and its own span is not representable — a level-32
+	// node would span 2^33-1 slots. it answers itself alone.
+	//
+	// the alternative is not a smaller mistake, which is why this arm is
+	// asserted rather than left to the guard's own doc comment. the arithmetic
+	// without the guard computes a half-span of 2^32-1, which truncates to
+	// 0xFFFFFFFF, and hands back [0, 0xFFFFFFFE]: the whole array of the
+	// largest tree. every node of every tree would then be inside the subtree
+	// of an index inside no tree, and a parent-hash check walking the leaves
+	// under a node it never range-checked would walk the whole group.
+	firstNode, lastNode := SubtreeSpan(0xFFFFFFFF)
+	if firstNode != 0xFFFFFFFF || lastNode != 0xFFFFFFFF {
+		t.Errorf("node 0xFFFFFFFF span: [%d, %d], want [4294967295, 4294967295]", firstNode, lastNode)
+	} else {
+		outOfRangeArms += 1
+	}
+
+	for _, probe := range []NodeIndex{0x00000000, 0x00000001, 0x00000002, 0x7FFFFFFF, 0xFFFFFFFD, 0xFFFFFFFE} {
+		if InSubtree(0xFFFFFFFF, probe) {
+			t.Errorf("node %d is in the subtree of 0xFFFFFFFF, which is in no tree", probe)
+		} else {
+			outOfRangeArms += 1
+		}
+	}
+	if !InSubtree(0xFFFFFFFF, 0xFFFFFFFF) {
+		t.Errorf("node 0xFFFFFFFF is not in its own subtree")
+	} else {
+		outOfRangeArms += 1
+	}
+
+	// and it is not inside the largest tree either, which is the other half of
+	// the same claim: the root of that tree spans the array up to 0xFFFFFFFE.
+	if InSubtree(0x7FFFFFFF, 0xFFFFFFFF) {
+		t.Errorf("node 0xFFFFFFFF is in the subtree of the root of the largest tree, which ends at 0xFFFFFFFE")
+	} else {
+		outOfRangeArms += 1
+	}
+
+	// the leaf range of that same index is where the pair contradicts itself,
+	// and the contradiction is pinned rather than glossed. the span above is
+	// the single odd slot 0xFFFFFFFF; the leaf range here is leaf 0x7FFFFFFF
+	// twice, whose node is 0xFFFFFFFE and is not in that span. it is also the
+	// exact pair the last leaf of the largest tree answers, so a caller that
+	// arrives with an index it never range-checked is handed a plausible
+	// in-range answer instead of a refusal.
+	//
+	// the signature has no room to say "no leaves under this", so this is
+	// asserted as the behaviour that ships rather than repaired here. every
+	// index reachable through a range check against NodeWidth is even at both
+	// ends of its span, and this row is unreachable from all of them.
+	outOfRangeFirstLeaf, outOfRangeLastLeaf := SubtreeLeaves(0xFFFFFFFF)
+	if outOfRangeFirstLeaf != 0x7FFFFFFF || outOfRangeLastLeaf != 0x7FFFFFFF {
+		t.Errorf("node 0xFFFFFFFF leaves: [%d, %d], want [2147483647, 2147483647]", outOfRangeFirstLeaf, outOfRangeLastLeaf)
+	} else {
+		outOfRangeArms += 1
+	}
+	if InSubtree(0xFFFFFFFF, outOfRangeFirstLeaf.NodeIndex()) {
+		t.Errorf("node 0xFFFFFFFF spans [%d, %d] and yet heads leaf %d at node %d", firstNode, lastNode, outOfRangeFirstLeaf, outOfRangeFirstLeaf.NodeIndex())
+	} else {
+		outOfRangeArms += 1
+	}
+
+	armCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "leaf spans", got: leafArms, want: 6},
+		// one span, six probes it does not head, one it does, one root that
+		// does not head it, one leaf range and one contradiction.
+		{label: "out of range answers", got: outOfRangeArms, want: 11},
+	}
+	for _, c := range armCases {
+		if c.got == 0 {
+			t.Fatalf("confirmed no %s: a run that reaches one arm of this function only looks complete and is not", c.label)
+		}
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+func TestInSubtree(t *testing.T) {
+	// every node of an eight-leaf tree is inside the root's subtree, and a node
+	// is inside its own.
+	for i := uint32(0); i < NodeWidth(8); i += 1 {
+		nodeIndex := NodeIndex(i)
+		if !InSubtree(7, nodeIndex) {
+			t.Errorf("node %d not in the root subtree", nodeIndex)
+		}
+		if !InSubtree(nodeIndex, nodeIndex) {
+			t.Errorf("node %d not in its own subtree", nodeIndex)
+		}
+	}
+
+	membershipCases := []struct {
+		head      NodeIndex
+		nodeIndex NodeIndex
+		inSubtree bool
+	}{
+		{head: 1, nodeIndex: 0, inSubtree: true},
+		{head: 1, nodeIndex: 2, inSubtree: true},
+		{head: 1, nodeIndex: 4, inSubtree: false},
+		{head: 3, nodeIndex: 5, inSubtree: true},
+		{head: 3, nodeIndex: 8, inSubtree: false},
+		{head: 11, nodeIndex: 8, inSubtree: true},
+		{head: 11, nodeIndex: 6, inSubtree: false},
+		{head: 0, nodeIndex: 1, inSubtree: false},
+	}
+	for _, c := range membershipCases {
+		if got := InSubtree(c.head, c.nodeIndex); got != c.inSubtree {
+			t.Errorf("node %d in subtree of %d: %v, want %v", c.nodeIndex, c.head, got, c.inSubtree)
+		}
+	}
+
+	// the span of a node agrees with the direct path: x is in the subtree of
+	// every node on its direct path and of no other node.
+	for i := uint32(0); i < NodeWidth(8); i += 1 {
+		nodeIndex := NodeIndex(i)
+		pathNodes, err := DirectPath(nodeIndex, 8)
+		if err != nil {
+			t.Fatalf("direct path of %d: %v", nodeIndex, err)
+		}
+		onPath := map[NodeIndex]bool{nodeIndex: true}
+		for _, pathNode := range pathNodes {
+			onPath[pathNode] = true
+		}
+		for j := uint32(0); j < NodeWidth(8); j += 1 {
+			head := NodeIndex(j)
+			if got := InSubtree(head, nodeIndex); got != onPath[head] {
+				t.Errorf("node %d in subtree of %d: %v, want %v", nodeIndex, head, got, onPath[head])
+			}
+		}
+	}
+}
+
+// membership at the two slots either side of a subtree, and along the direct
+// path, at every depth a tree can have.
+//
+// the test above is the plan's and it is the eight-leaf tree only. an endpoint
+// that is one slot out is invisible to every symmetric check — the head still
+// heads itself, the span still nests inside its parent's, the width is still
+// plausible — so what separates it is a probe at the slot immediately outside
+// each end. those two slots are asserted at every level and at four blocks per
+// level, which reaches the band from level 10 to 31 that nothing else in this
+// package does.
+//
+// the direct-path rows below are the same claim from the other side, and they
+// come from the layout oracle rather than from DirectPath and Copath: a wrong
+// span must not be excusable by a matching wrong path. the oracle calls nothing
+// in this package and is run against RFC 9420 table 2 and figure 11 above.
+func TestInSubtreeAtEveryLevel(t *testing.T) {
+	insideProbes, outsideProbes := 0, 0
+
+	for level := uint32(0); level <= 31; level += 1 {
+		for _, block := range spanBlocks(level) {
+			head := nodeAt(level, block)
+			firstNode, lastNode, _, _ := spanOracle(level, block)
+
+			if !InSubtree(head, firstNode) {
+				t.Fatalf("level %d block %d: node %d does not head the first slot %d of its own subtree", level, block, head, firstNode)
+			}
+			insideProbes += 1
+			if !InSubtree(head, lastNode) {
+				t.Fatalf("level %d block %d: node %d does not head the last slot %d of its own subtree", level, block, head, lastNode)
+			}
+			insideProbes += 1
+
+			// block zero starts at slot zero at every level, so the slot below
+			// it is not representable and is skipped rather than wrapped round
+			// to the top of the array, which is outside the subtree for an
+			// unrelated reason.
+			if firstNode > 0 {
+				if InSubtree(head, firstNode-1) {
+					t.Fatalf("level %d block %d: node %d heads slot %d, one below its subtree", level, block, head, firstNode-1)
+				}
+				outsideProbes += 1
+			}
+			// the slot above the last is always representable: the largest
+			// subtree there is ends at 0xFFFFFFFE, and the slot above that is
+			// the index no tree holds.
+			if InSubtree(head, lastNode+1) {
+				t.Fatalf("level %d block %d: node %d heads slot %d, one above its subtree", level, block, head, lastNode+1)
+			}
+			outsideProbes += 1
+		}
+	}
+
+	// x is inside every node of its own direct path and inside no node of its
+	// copath, at every depth. the leftmost and the rightmost node of each level
+	// are taken, which for the ancestor chain is the difference between one
+	// built by shifting the block and one built by masking it.
+	pathHeads, pathMisses, pathRows := 0, 0, 0
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		for level := uint32(0); level <= depth; level += 1 {
+			blocks := []uint64{0}
+			if level < depth {
+				blocks = append(blocks, uint64(1)<<(depth-level)-1)
+			}
+			for _, block := range blocks {
+				nodeIndex := nodeAt(level, block)
+				directPath, copathNodes := pathOracle(level, block, depth)
+
+				if !InSubtree(nodeIndex, nodeIndex) {
+					t.Fatalf("depth %d: node %d is not in its own subtree", depth, nodeIndex)
+				}
+				pathHeads += 1
+				for _, head := range directPath {
+					if !InSubtree(head, nodeIndex) {
+						t.Fatalf("depth %d: node %d is not in the subtree of %d on its direct path", depth, nodeIndex, head)
+					}
+					pathHeads += 1
+				}
+				for _, head := range copathNodes {
+					if InSubtree(head, nodeIndex) {
+						t.Fatalf("depth %d: node %d is in the subtree of %d on its copath", depth, nodeIndex, head)
+					}
+					pathMisses += 1
+				}
+				pathRows += 1
+			}
+		}
+	}
+
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// 123 spans, two slots inside each.
+		{label: "inside probes", got: insideProbes, want: 246},
+		// one slot outside each end, less the 32 blocks that start at slot zero
+		// and so have no slot below them.
+		{label: "outside probes", got: outsideProbes, want: 214},
+		// two nodes at each level below the root and one at the root, over 32
+		// depths: sum(d=0..31) 2d+1.
+		{label: "path rows", got: pathRows, want: 1024},
+		// each row confirms the node itself and one head per level above it.
+		{label: "path heads", got: pathHeads, want: 11936},
+		// and one copath node per level above it: sum(d=0..31) d*(d+1).
+		{label: "path misses", got: pathMisses, want: 10912},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}

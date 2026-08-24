@@ -821,6 +821,182 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 	}
 }
 
+// walks one relation column from a node to the end of the chain it leads
+// along, which for the left column is the leftmost slot of that node's subtree
+// and for the right column the rightmost.
+//
+// the walk is bounded and every step is range-checked. a column that pointed
+// back on itself would otherwise be an endless loop in a test rather than a
+// failure, and one that pointed past the end of the entry would be a panic
+// taking the whole binary down — the same failure mode checkColumnLengths was
+// written for, reached through the value of a column rather than its length.
+func walkColumnToEnd(t *testing.T, v treeMathVector, label string, column []*uint32, node uint32) uint32 {
+	t.Helper()
+	for steps := uint32(0); column[node] != nil; steps += 1 {
+		if steps > v.NNodes {
+			t.Fatalf("n_leaves %d: the %s column leads in a circle from node %d", v.NLeaves, label, node)
+		}
+		next := *column[node]
+		if next >= v.NNodes {
+			t.Fatalf("n_leaves %d node %d: %s %d is outside the %d nodes the entry publishes", v.NLeaves, node, label, next, v.NNodes)
+		}
+		node = next
+	}
+	return node
+}
+
+// the span, the leaf range and the membership relation of every node of every
+// published entry, against the columns upstream publishes.
+//
+// the family carries no span column, so the expectation is derived from the
+// columns it does carry, and the derivation is written out here rather than
+// implied. walking the left column down from a node until it says the node has
+// no children arrives at the leftmost slot of that node's subtree, and walking
+// the right column arrives at the rightmost: that is the definition of a span,
+// in vendored data, with none of the arithmetic under test in it. walking the
+// parent column up from a node arrives at every node whose subtree holds it,
+// which is the membership relation, and restricted to the even nodes it is the
+// leaf range as well.
+//
+// two columns rather than one, because they fail differently. a span derived
+// from left and right alone would be silent about a membership test that read
+// the range the wrong way round, and a membership relation derived from parent
+// alone says nothing about either endpoint on its own.
+//
+// the only relation of this package the derivation borrows is that leaf L sits
+// at node 2L, which TestNodeIndexLevelAndLeafMapping pins directly and which
+// the family's own n_nodes = 2*n_leaves - 1 carries at every size. it is not
+// the operation under test.
+//
+// the family reaches levels 0 to 9 and no further. levels 10 to 31 and the one
+// index that is in no tree are asserted in tree_math_test.go, whose ladders run
+// to level 31.
+func TestTreeMathVectorSubtreeSpan(t *testing.T) {
+	vectors := loadTreeMathVectors(t)
+
+	// the arms are counted for the reason the children runner gives, and the
+	// split here is between the node that heads a subtree and the leaf that
+	// heads only itself. a runner that reached parents only would pass a
+	// version that widened every span by a slot at both ends, since the leaf
+	// row is the one where a widened span reaches a node that is not below it.
+	leafHeads, parentHeads := 0, 0
+	leafRanges := 0
+	memberships, membershipsTrue := 0, 0
+
+	for _, v := range vectors {
+		checkColumnLengths(t, v)
+
+		for i := uint32(0); i < v.NNodes; i += 1 {
+			wantFirst := walkColumnToEnd(t, v, "left", v.Left, i)
+			wantLast := walkColumnToEnd(t, v, "right", v.Right, i)
+			firstNode, lastNode := SubtreeSpan(NodeIndex(i))
+			if uint32(firstNode) != wantFirst || uint32(lastNode) != wantLast {
+				t.Errorf("n_leaves %d node %d: span [%d, %d], want [%d, %d]", v.NLeaves, i, firstNode, lastNode, wantFirst, wantLast)
+			} else if wantFirst == i && wantLast == i {
+				leafHeads += 1
+			} else {
+				parentHeads += 1
+			}
+		}
+
+		// the membership relation and the leaf range, from the parent column.
+		// the ancestor set of one node is built once and then asked about every
+		// node of the entry, so the false half of the relation is walked as
+		// thoroughly as the true half: at 512 leaves a node is inside ten
+		// subtrees and outside the other 1013, and a runner that only confirmed
+		// the ten would pass a version answering true everywhere.
+		firstLeafUnder := make([]uint32, v.NNodes)
+		lastLeafUnder := make([]uint32, v.NNodes)
+		leafSeen := make([]bool, v.NNodes)
+		heads := make([]bool, v.NNodes)
+		for i := uint32(0); i < v.NNodes; i += 1 {
+			for j := range heads {
+				heads[j] = false
+			}
+			node := i
+			heads[node] = true
+			for steps := uint32(0); v.Parent[node] != nil; steps += 1 {
+				if steps > v.NNodes {
+					t.Fatalf("n_leaves %d: the parent column leads in a circle from node %d", v.NLeaves, i)
+				}
+				next := *v.Parent[node]
+				if next >= v.NNodes {
+					t.Fatalf("n_leaves %d node %d: parent %d is outside the %d nodes the entry publishes", v.NLeaves, node, next, v.NNodes)
+				}
+				node = next
+				heads[node] = true
+			}
+
+			for head := uint32(0); head < v.NNodes; head += 1 {
+				want := heads[head]
+				if got := InSubtree(NodeIndex(head), NodeIndex(i)); got != want {
+					t.Errorf("n_leaves %d: node %d in the subtree of %d: %v, want %v", v.NLeaves, i, head, got, want)
+					continue
+				}
+				memberships += 1
+				if !want {
+					continue
+				}
+				membershipsTrue += 1
+				if i%2 != 0 {
+					continue
+				}
+				leaf := i / 2
+				if !leafSeen[head] || leaf < firstLeafUnder[head] {
+					firstLeafUnder[head] = leaf
+				}
+				if !leafSeen[head] || leaf > lastLeafUnder[head] {
+					lastLeafUnder[head] = leaf
+				}
+				leafSeen[head] = true
+			}
+		}
+
+		for head := uint32(0); head < v.NNodes; head += 1 {
+			// every node of a full tree has a leaf beneath it, itself included,
+			// so an unreached head means the walk above stopped short rather
+			// than that the entry is unusual.
+			if !leafSeen[head] {
+				t.Fatalf("n_leaves %d: no leaf reached node %d through the parent column", v.NLeaves, head)
+			}
+			firstLeaf, lastLeaf := SubtreeLeaves(NodeIndex(head))
+			if uint32(firstLeaf) != firstLeafUnder[head] || uint32(lastLeaf) != lastLeafUnder[head] {
+				t.Errorf("n_leaves %d node %d: leaves [%d, %d], want [%d, %d]", v.NLeaves, head, firstLeaf, lastLeaf, firstLeafUnder[head], lastLeafUnder[head])
+			} else {
+				leafRanges += 1
+			}
+		}
+	}
+
+	// the leaf counts on the family's ladder sum to 1023 and every entry holds
+	// one fewer parent than it holds leaves, so 1023 of the 2036 published
+	// nodes head themselves alone and 1013 head a subtree. the totals are
+	// asserted rather than only "more than none" so that a runner which skipped
+	// part of the ladder, or part of an entry, fails here too.
+	//
+	// the membership totals come from the layout and not from a run. an entry
+	// of depth d publishes (2^(d+1)-1)^2 ordered pairs, and a node at level k
+	// lies inside d-k+1 subtrees, so the true half of one entry is
+	// sum(j=0..d) 2^j*(j+1) = d*2^(d+1) + 1. over the ladder d = 0 to 9 that is
+	// 1394018 pairs of which 16398 are true.
+	countCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "leaf heads", got: leafHeads, want: 1023},
+		{label: "parent heads", got: parentHeads, want: 1013},
+		{label: "leaf ranges", got: leafRanges, want: 2036},
+		{label: "memberships", got: memberships, want: 1394018},
+		{label: "memberships inside", got: membershipsTrue, want: 16398},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
 // checks every relation one entry publishes, against the functions this plan
 // produces, and reports how many assertions were confirmed in each arm.
 //

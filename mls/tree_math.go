@@ -435,3 +435,64 @@ func CommonAncestor(x NodeIndex, y NodeIndex) NodeIndex {
 	}
 	return NodeIndex((shiftedX << shifts) + (uint64(1) << (shifts - 1)) - 1)
 }
+
+// the first and last node indices of the subtree headed by x, inclusive.
+//
+// the subtree of a level-k node is the 2^(k+1)-1 array slots centred on that
+// node (RFC 9420 appendix C figure 32), so the ends are x - (2^k - 1) and
+// x + (2^k - 1). a node at level k has exactly k trailing one bits, so it is
+// never smaller than its own half-span and the subtraction cannot underflow;
+// the rightmost node of level k sits at 2^32 - 2^k - 1, so the addition cannot
+// overflow either.
+//
+// no leaf count is taken, for the reason CommonAncestor takes none: the span is
+// a property of the array layout and is the same in every tree that holds the
+// node. a caller that needs the span clipped to a tree range-checks x against
+// NodeWidth first, which every caller in this package already does.
+//
+// 0xFFFFFFFF is the one index no tree holds — it is one past the last node of
+// the largest representable tree — and it reads as a level-32 node as Level
+// describes. a level-32 subtree is 2^33-1 slots and is not representable, so it
+// answers itself alone. the alternative is not a smaller mistake: without this
+// guard the half-span is 2^32-1, which truncates to 0xFFFFFFFF, and the answer
+// is [0, 0xFFFFFFFE] — the whole array of the largest tree, which would make an
+// index inside no tree the head of every node of the largest one.
+func SubtreeSpan(x NodeIndex) (firstNode NodeIndex, lastNode NodeIndex) {
+	k := x.Level()
+	if k > 31 {
+		return x, x
+	}
+	halfSpan := NodeIndex((uint64(1) << k) - 1)
+	return x - halfSpan, x + halfSpan
+}
+
+// the first and last leaf indices under x, inclusive.
+//
+// the span of a node any tree holds runs from that node's leftmost leaf to its
+// rightmost, so both ends are even and both convert to a leaf exactly; for a
+// leaf the pair is that leaf twice.
+//
+// 0xFFFFFFFF is the exception and it is named rather than left to be found. its
+// span is the single odd slot 0xFFFFFFFF, so the halving truncates and the
+// answer is leaf 0x7FFFFFFF twice — which sits at node 0xFFFFFFFE and is not
+// inside the span above it, and which is also the exact pair the last leaf of
+// the largest tree answers. no signature without an error can say "no leaves
+// under this", so the answer is a plausible in-range one rather than a refusal,
+// and a caller holding an index it did not choose range-checks it against
+// NodeWidth first. every index that survives such a check is even at both ends
+// of its span.
+func SubtreeLeaves(x NodeIndex) (firstLeaf LeafIndex, lastLeaf LeafIndex) {
+	firstNode, lastNode := SubtreeSpan(x)
+	return LeafIndex(uint32(firstNode) / 2), LeafIndex(uint32(lastNode) / 2)
+}
+
+// whether x is head or a descendant of head.
+//
+// the subtree of a node is a contiguous run of array slots, so this is the
+// range test on the span rather than a walk up from x. the two give the same
+// answer (RFC 9420 appendix C figure 32) and the range test is the one that
+// terminates for an index no tree holds, since it asks nothing about a parent.
+func InSubtree(head NodeIndex, x NodeIndex) bool {
+	firstNode, lastNode := SubtreeSpan(head)
+	return firstNode <= x && x <= lastNode
+}
