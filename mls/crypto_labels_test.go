@@ -63,6 +63,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1118,5 +1119,114 @@ func TestProposalRefLabelMatchesThePublishedCommits(t *testing.T) {
 	}
 	if found != labelKatProposalRefs {
 		t.Fatalf("found %d published proposal references, want %d", found, labelKatProposalRefs)
+	}
+}
+
+// The constructions that are handed a writer rather than a caller's bytes, named with the
+// reason rather than left out of the gate below.
+var labelConstructionsOverNoInput = map[string]string{
+	"mlsLabelBytes": "takes the writer the other constructions built, and TestLabelPreimagesAreFreshBuffers holds its storage",
+}
+
+// Every function crypto_labels.go declares at package level, read off the parse tree
+// rather than typed out.
+//
+// The provider methods are receivers, and the whole provider invariants in crypto_test.go
+// cover them by reading the interface with reflect. Nothing read this file's package
+// level functions, and it is where tasks 13 to 16 each add one, so a hand written table
+// here would be that same blind spot one layer over: it would keep reporting a clean run
+// while the surface it was written for grew past it.
+func packageLevelFunctionsOf(t *testing.T, path string) []string {
+	t.Helper()
+	names := []string{}
+	for _, declaration := range mustParseSource(t, path).file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Recv != nil {
+			continue
+		}
+		names = append(names, function.Name.Name)
+	}
+	if len(names) == 0 {
+		t.Fatalf("%s declares no package level functions, so the gate below demands nothing", path)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func TestEveryConstructionInThisFileLeavesItsInputAlone(t *testing.T) {
+	// what a labelled construction is handed is a group's own secret, a serialized key
+	// package or the framing of somebody's proposal, and every one of them is read again
+	// after the reference is taken. A construction that wrote into the array its argument
+	// was cut from would corrupt the object it was asked to name, and one that answered
+	// out of storage it keeps would hand two callers the same reference. Neither is
+	// visible in any digest.
+	//
+	// The arguments go through the same recorder as the provider's, so each is cut from a
+	// longer array whose spare capacity holds a pattern rather than zeros: a construction
+	// that appends a zero byte to save an allocation leaves len alone, and against a
+	// zeroed array it also leaves the bytes past len alone.
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	value := bytes.Repeat([]byte{0x21}, 96)
+	covered := []string{}
+	for _, testCase := range []struct {
+		name string
+		call func(take func(content []byte) []byte) []byte
+	}{
+		{name: "mlsKdfLabel", call: func(take func([]byte) []byte) []byte {
+			return mlsKdfLabel("label", take(value), 32)
+		}},
+		{name: "RefHash", call: func(take func([]byte) []byte) []byte {
+			return RefHash(crypto, "MLS 1.0 a label", take(value))
+		}},
+		{name: "MakeKeyPackageRef", call: func(take func([]byte) []byte) []byte {
+			return MakeKeyPackageRef(crypto, take(value))
+		}},
+		{name: "MakeProposalRef", call: func(take func([]byte) []byte) []byte {
+			return MakeProposalRef(crypto, take(value))
+		}},
+	} {
+		covered = append(covered, testCase.name)
+		recorder := &argumentRecorder{}
+		first := testCase.call(recorder.take)
+		if len(recorder.arrays) == 0 {
+			t.Errorf("%s was handed nothing, so this row observed nothing", testCase.name)
+			continue
+		}
+		if len(first) == 0 {
+			t.Errorf("%s answered with nothing, so this row observed nothing", testCase.name)
+			continue
+		}
+		if changed := recorder.changed(); len(changed) != 0 {
+			t.Errorf("%s changed the storage behind arguments %v of the %d it was handed",
+				testCase.name, changed, len(recorder.arrays))
+		}
+		if recorder.aliases(first) {
+			t.Errorf("%s answered with a slice over one of its arguments", testCase.name)
+		}
+		second := testCase.call((&argumentRecorder{}).take)
+		if !bytes.Equal(first, second) {
+			t.Errorf("%s answered %x and then %x for one input", testCase.name, first, second)
+		}
+		if &first[0] == &second[0] {
+			t.Errorf("two calls to %s answered out of the same array", testCase.name)
+		}
+	}
+	// and the table names every construction the file declares rather than the ones this
+	// test happened to think of
+	declared := packageLevelFunctionsOf(t, "crypto_labels.go")
+	want := []string{}
+	for _, name := range declared {
+		if _, isExcused := labelConstructionsOverNoInput[name]; !isExcused {
+			want = append(want, name)
+		}
+	}
+	slices.Sort(covered)
+	if !slices.Equal(covered, want) {
+		t.Errorf("this gate covers %v, and crypto_labels.go declares %v", covered, want)
+	}
+	for name := range labelConstructionsOverNoInput {
+		if !slices.Contains(declared, name) {
+			t.Errorf("the gate excuses %s, which crypto_labels.go does not declare", name)
+		}
 	}
 }
