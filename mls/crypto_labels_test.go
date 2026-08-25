@@ -2780,7 +2780,16 @@ const (
 	// another recipient's key, an all zero ciphertext, an all one ciphertext, and one
 	// byte appended to a ciphertext that was otherwise authentic
 	decryptNamedRefusals = 4
+	// every ciphertext length up to the ceiling, and the coarse tail past it
+	decryptForgedCiphertextCeiling = 512
 )
+
+// The ciphertext lengths past the dense band that a forgery is still refused at.
+//
+// Past 512 a dense walk stops being the point and starts being the runtime. These are the
+// sizes an hpke message in this protocol reaches: a GroupSecrets in a Welcome, an
+// UpdatePathNode over a wide tree, and the two byte varint boundary above them.
+var decryptForgedCiphertextTail = []int{600, 700, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000, 4096, 8192}
 
 // A ciphertext this key really was sent, altered anywhere, is refused, and so is an
 // authentic one opened with another key.
@@ -2854,6 +2863,22 @@ func TestDecryptWithLabelRefusesEveryTamperedCiphertext(t *testing.T) {
 	for i := range ciphertext {
 		refuse(fmt.Sprintf("a ciphertext truncated to %d bytes", i), priv, kemOutput, ciphertext[:i], ErrAeadOpen)
 	}
+	// and a forgery at every ciphertext length, rather than at the one length the message
+	// above happens to be. Every walk before this one alters the bytes of a single
+	// ciphertext, which holds its length fixed at 33: the doc on the byte walk is a claim
+	// about position and says nothing about length, and the only other ciphertext lengths
+	// anywhere in this file are the plaintext lengths its sweeps happen to use plus Nt,
+	// which is 17 through 56, and the 48 the published vector carries. Measured, a band in
+	// *HpkeContext.Open that answered with the ciphertext it could not open survived all
+	// 2529 tests at 57, 64, 100, 128, 200, 500, 1000 and 4000 bytes, and 57 is the first
+	// length past the end of the sweep. A length is not a thing a forgery gets to pick
+	// from, so this walks them instead of sampling them.
+	for n := 0; n <= decryptForgedCiphertextCeiling; n++ {
+		refuse(fmt.Sprintf("a %d byte forgery", n), priv, kemOutput, sweptBytes(byte(n), n), ErrAeadOpen)
+	}
+	for _, n := range decryptForgedCiphertextTail {
+		refuse(fmt.Sprintf("a %d byte forgery", n), priv, kemOutput, sweptBytes(byte(n), n), ErrAeadOpen)
+	}
 	refuse("a ciphertext with a byte appended", priv, kemOutput, concatBytes(ciphertext, []byte{0x00}), ErrAeadOpen)
 	refuse("another recipient's key", otherPriv, kemOutput, ciphertext, ErrAeadOpen)
 	refuse("an all zero ciphertext", priv, kemOutput, make([]byte, len(ciphertext)), ErrAeadOpen)
@@ -2863,7 +2888,8 @@ func TestDecryptWithLabelRefusesEveryTamperedCiphertext(t *testing.T) {
 	for _, n := range []int{0, params.Nenc - 1, params.Nenc + 1, 2 * params.Nenc} {
 		refuse(fmt.Sprintf("a %d byte encapsulated key", n), priv, make([]byte, n), ciphertext, ErrBadKemOutput)
 	}
-	if want := 2*len(ciphertext) + len(kemOutput) + decryptNamedRefusals + decryptKemOutputLengthRefusals; refusals != want {
+	if want := 2*len(ciphertext) + len(kemOutput) + decryptNamedRefusals + decryptKemOutputLengthRefusals +
+		decryptForgedCiphertextCeiling + 1 + len(decryptForgedCiphertextTail); refusals != want {
 		t.Fatalf("the table refused %d alterations, want %d", refusals, want)
 	}
 	// and the control for the whole test: the authentic message still opens, so nothing
@@ -3363,11 +3389,68 @@ const (
 	unboundSweepBytes          = 256
 	unboundSweepByteLengths    = 3
 	unboundSweepCoarsePoints   = 77
-	// what the three sweeps refuse between them. seven reframings at each of 2259 points,
+	// the band of EncryptContext lengths the fourth sweep walks contiguously. ten is the
+	// shortest one there is, being the one octet length of the eight byte prefix over an
+	// empty label and the one octet length of an empty context
+	unboundSweepContextFloor   = 10
+	unboundSweepContextCeiling = 700
+	// what the four sweeps refuse between them. seven reframings at each of 2950 points,
 	// less the ones that coincided with the info the receiver demanded and were skipped,
 	// which is why this is a measured number rather than a product
-	unboundSweepRefusals = 16351
+	unboundSweepRefusals = 21187
 )
+
+// One demanded pair, as the length sweep below picks them.
+type labelledLengthPoint struct {
+	label   string
+	context []byte
+}
+
+// A label and a context whose EncryptContext is exactly n bytes, for every n in the band.
+//
+// The sweeps above walk the label length and the context length, which is not the same
+// thing as walking the length of what those two encode to. Their coarse tail reaches
+// context lengths of 250 and 300 and label lengths of 0 through 100, and between them they
+// produce no EncryptContext of exactly 300 bytes at all — which is where a band was
+// measured surviving all 2529 tests, and 300 is what an UpdatePathNode over a 275 byte
+// group context encodes to. The frame a band sits in reads the info it was handed, so the
+// length that matters is the length of the info and not the length of either field that
+// went into it.
+//
+// The pair for each length is searched for rather than computed, because the varint length
+// prefixes make the map from field lengths to encoded length neither injective nor
+// surjective in the label length alone: at a context length of 63 the prefix is one octet
+// and at 64 it is two, so a fixed label leaves a hole at every boundary and a second label
+// length is what fills it. Absence is fatal rather than skipped, so a hole in the band is a
+// failure here rather than a length nothing walked.
+func encryptContextsOfEveryLength(t *testing.T, floor int, ceiling int) []labelledLengthPoint {
+	t.Helper()
+	found := map[int]labelledLengthPoint{}
+	for labelLength := 0; labelLength <= 32; labelLength++ {
+		for contextLength := 0; contextLength <= ceiling; contextLength++ {
+			point := labelledLengthPoint{
+				label:   string(sweptBytes(0x41, labelLength)),
+				context: sweptBytes(0x80, contextLength),
+			}
+			encoded := len(mlsEncryptContext(point.label, point.context))
+			if encoded < floor || encoded > ceiling {
+				continue
+			}
+			if _, already := found[encoded]; !already {
+				found[encoded] = point
+			}
+		}
+	}
+	points := []labelledLengthPoint{}
+	for encoded := floor; encoded <= ceiling; encoded++ {
+		point, ok := found[encoded]
+		if !ok {
+			t.Fatalf("no label over a context encodes to a %d byte EncryptContext, so the sweep has a hole there", encoded)
+		}
+		points = append(points, point)
+	}
+	return points
+}
 
 // The reframings of one demanded pair that carry no binding the receiver demanded, built
 // as operations on the pair rather than as values.
@@ -3492,8 +3575,21 @@ func TestDecryptWithLabelRefusesAnUnboundMessageAtEveryFieldLength(t *testing.T)
 	if want := bytePoints + unboundSweepCoarsePoints; points != want {
 		t.Fatalf("the three sweeps visited %d points, want %d", points, want)
 	}
+	coarsePoints := points
+	// and the length of the EncryptContext itself, walked contiguously rather than left to
+	// whatever the field lengths above happened to encode to. A band sits in a frame that
+	// reads the info, so the length it is keyed on is the length of the info; the three
+	// sweeps above walk the two fields that go into it and leave gaps in what comes out,
+	// including the whole of 300, which is what an UpdatePathNode over a 275 byte group
+	// context encodes to and where a live bypass was measured.
+	for _, point := range encryptContextsOfEveryLength(t, unboundSweepContextFloor, unboundSweepContextCeiling) {
+		sweep(point.label, point.context, sweptBytes(0x30, 1+len(point.context)%40))
+	}
+	if want := coarsePoints + unboundSweepContextCeiling - unboundSweepContextFloor + 1; points != want {
+		t.Fatalf("the four sweeps visited %d points, want %d", points, want)
+	}
 	if refused != unboundSweepRefusals {
-		t.Fatalf("the three sweeps refused %d unbound messages, want %d", refused, unboundSweepRefusals)
+		t.Fatalf("the four sweeps refused %d unbound messages, want %d", refused, unboundSweepRefusals)
 	}
 }
 
@@ -3597,66 +3693,474 @@ func TestTheLabelledReceivingPathHasNoSecondContext(t *testing.T) {
 	}
 }
 
-// How many times one declaration names an identifier in its body, and whether it ever
-// assigns to it.
+// Every non test file of this package, parsed once.
 //
-// A whole body pin is the wrong instrument below HpkeSetupBaseR: hpkeKeySchedule is
-// fifteen statements of another task work, and pinning it here would turn every legitimate
-// edit to the key schedule into a failure in this file. What this asks instead is the one
-// thing the labelled encryption needs from those frames, which is that they forward the
-// info rather than look at it.
-func identifierUsesIn(self parsedSource, t *testing.T, name string, identifier string) (uses int, assigned bool) {
+// Every file rather than a named one, for the reason sourceDeclaringPackageFunction
+// records: a gate told which file to read goes on reporting a clean run while the thing it
+// guards is written next door.
+func packageSources(t *testing.T) []parsedSource {
 	t.Helper()
-	declaration := self.declarationOf(t, "", name)
-	ast.Inspect(declaration.Body, func(node ast.Node) bool {
-		if used, isIdentifier := node.(*ast.Ident); isIdentifier && used.Name == identifier {
-			uses++
+	sources := []parsedSource{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
 		}
-		assignment, isAssignment := node.(*ast.AssignStmt)
-		if !isAssignment {
+		sources = append(sources, mustParseSource(t, path))
+	}
+	if len(sources) == 0 {
+		t.Fatal("the package holds no non test source, so nothing below read anything")
+	}
+	return sources
+}
+
+// The file declaring one function, or one method on a named receiver type, found rather
+// than named. A subject in no file, or in two, is fatal rather than clean.
+func sourceDeclaringFrame(t *testing.T, receiver string, name string) parsedSource {
+	t.Helper()
+	if receiver == "" {
+		return sourceDeclaringPackageFunction(t, name)
+	}
+	found := []parsedSource{}
+	declaring := []string{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		parsed := mustParseSource(t, path)
+		if slices.Contains(parsed.methodsOn(receiver), name) {
+			found = append(found, parsed)
+			declaring = append(declaring, path)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%s is declared on %s in %v, want exactly one file of this package", name, receiver, declaring)
+	}
+	return found[0]
+}
+
+// One frame of the labelled path: a declaration, and the parameter of it that bytes a
+// caller handed EncryptWithLabel or DecryptWithLabel arrive in.
+//
+// A parameter rather than a function, because one function sits on the path twice for two
+// unrelated reasons. hpkeKeySchedule is handed the info, and is handed the key schedule
+// context it built out of it, and the two arrive by different routes and end at different
+// kdf calls; collapsing them would let one pin discharge a frame it never read.
+type labelledFrame struct {
+	receiver  string
+	name      string
+	parameter string
+}
+
+// One frame as a line, for sorting and for saying which one failed.
+func (self labelledFrame) String() string {
+	if self.receiver == "" {
+		return self.name + " " + self.parameter
+	}
+	return self.receiver + "." + self.name + " " + self.parameter
+}
+
+// One declaration of this package, with the parameter names a call site arguments line up
+// against.
+type labelledDeclaration struct {
+	source     parsedSource
+	receiver   string
+	name       string
+	parameters []string
+}
+
+// Every function and method of the supplied source, indexed by the name a call site
+// writes.
+//
+// By name and not by receiver, because the name is all a call site says. Resolving
+// ctx.Open(aad, ciphertext) to *HpkeContext.Open needs a type checker, and what this does
+// instead is match every declaration of that name whose parameter count equals the call
+// argument count. That over-approximates: self.aead.Open passes four arguments where
+// *HpkeContext.Open takes two parameters, so it resolves to nothing, but a package method
+// sharing a name and an arity with a standard library one would be walked as though it
+// were called. Over-approximating is the safe direction here. A frame that is not really
+// on the path costs a pin nobody needed; a frame that is really on the path and missed
+// costs the property.
+func labelledDeclarationsIn(sources []parsedSource) map[string][]labelledDeclaration {
+	index := map[string][]labelledDeclaration{}
+	for _, source := range sources {
+		for _, declaration := range source.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			parameters := []string{}
+			for _, field := range function.Type.Params.List {
+				if len(field.Names) == 0 {
+					parameters = append(parameters, "_")
+					continue
+				}
+				for _, written := range field.Names {
+					parameters = append(parameters, written.Name)
+				}
+			}
+			index[function.Name.Name] = append(index[function.Name.Name], labelledDeclaration{
+				source:     source,
+				receiver:   source.receiverOf(function),
+				name:       function.Name.Name,
+				parameters: parameters,
+			})
+		}
+	}
+	return index
+}
+
+// The declarations of this package one call site could be calling.
+func labelledCalleesOf(index map[string][]labelledDeclaration, call *ast.CallExpr) []labelledDeclaration {
+	name := ""
+	switch called := call.Fun.(type) {
+	case *ast.Ident:
+		name = called.Name
+	case *ast.SelectorExpr:
+		name = called.Sel.Name
+	default:
+		return nil
+	}
+	callees := []labelledDeclaration{}
+	for _, candidate := range index[name] {
+		if len(candidate.parameters) == len(call.Args) {
+			callees = append(callees, candidate)
+		}
+	}
+	return callees
+}
+
+// Where one declaration sends the bytes that arrived in one of its identifiers.
+//
+// The walk is coarse in the one direction that is safe. The taint spreads to any
+// identifier assigned from an expression that mentions a tainted one, which is what an
+// alias is, and to any local a tainted value is handed to as a method argument, which is
+// how the EncryptContext gets into the syntax writer mlsEncryptContext builds it in. It
+// stops at a call to a declaration this index holds: the bytes have entered a frame of
+// their own there, and that frame is walked in its turn rather than smeared over its
+// caller, which is what keeps the fifteen statements of hpkeKeySchedule from tainting
+// themselves through the key schedule context they compute.
+//
+// An alias is the shape this walk exists for. The instrument it replaces counted how many
+// times a body named its info and whether it assigned to that parameter, which two lines
+// defeat: given := info drops the count back to one and assigns to given rather than to
+// info. Nine such mutants survived all 2529 tests of this package, and one of them opened
+// a message sealed with no info at all under a 300 byte EncryptContext. A count is a
+// property of the spelling. Where the bytes go is a property of the body.
+//
+// What this cannot follow is a value laundered through an index expression or through a
+// field of a receiver. That is not excused, it is closed from the other side: every frame
+// this returns is pinned statement for statement below, so a body that launders its bytes
+// into a frame this walk would miss is a body that no longer matches its own pin. The two
+// instruments are load bearing together. The pins reject any edit to a frame on the path,
+// and the closure rejects a path that reaches a frame no pin names, so reaching somewhere
+// new means editing a pinned body to say so.
+func labelledFlowFrom(self labelledDeclaration, t *testing.T, index map[string][]labelledDeclaration, parameter string) []labelledFrame {
+	t.Helper()
+	body := self.source.declarationOf(t, self.receiver, self.name).Body
+	tainted := map[string]bool{parameter: true}
+	carries := func(node ast.Node) bool {
+		found := false
+		ast.Inspect(node, func(inner ast.Node) bool {
+			if named, isIdentifier := inner.(*ast.Ident); isIdentifier && tainted[named.Name] {
+				found = true
+			}
+			return true
+		})
+		return found
+	}
+	for spreading := true; spreading; {
+		spreading = false
+		mark := func(name string) {
+			if !tainted[name] {
+				tainted[name] = true
+				spreading = true
+			}
+		}
+		ast.Inspect(body, func(node ast.Node) bool {
+			// a value handed to a method on a local is part of that local from here on
+			if call, isCall := node.(*ast.CallExpr); isCall {
+				if selector, isSelector := call.Fun.(*ast.SelectorExpr); isSelector {
+					if base, isIdentifier := selector.X.(*ast.Ident); isIdentifier {
+						for _, argument := range call.Args {
+							if carries(argument) {
+								mark(base.Name)
+							}
+						}
+					}
+				}
+			}
+			assignment, isAssignment := node.(*ast.AssignStmt)
+			if !isAssignment {
+				return true
+			}
+			spreads := false
+			for _, value := range assignment.Rhs {
+				if !carries(value) {
+					continue
+				}
+				// a call this package declares is a frame of its own, so the bytes stop
+				// at it and are picked up there rather than here
+				if call, isCall := value.(*ast.CallExpr); isCall && len(labelledCalleesOf(index, call)) > 0 {
+					if carries(call.Fun) {
+						spreads = true
+					}
+					continue
+				}
+				spreads = true
+			}
+			if !spreads {
+				return true
+			}
+			for _, target := range assignment.Lhs {
+				if written, isIdentifier := target.(*ast.Ident); isIdentifier {
+					mark(written.Name)
+				}
+			}
+			return true
+		})
+	}
+	out := []labelledFrame{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
 			return true
 		}
-		for _, target := range assignment.Lhs {
-			if written, isIdentifier := target.(*ast.Ident); isIdentifier && written.Name == identifier {
-				assigned = true
+		for _, callee := range labelledCalleesOf(index, call) {
+			for i, argument := range call.Args {
+				if carries(argument) {
+					out = append(out, labelledFrame{
+						receiver:  callee.receiver,
+						name:      callee.name,
+						parameter: callee.parameters[i],
+					})
+				}
 			}
 		}
 		return true
 	})
-	return uses, assigned
+	return out
 }
 
-// The frames of the receiving path that carry the info, the parameter each carries it in,
-// and how many times that parameter may be named.
+// Every frame the bytes a caller supplied reach, from the seeds outward.
+func labelledPathClosure(t *testing.T, index map[string][]labelledDeclaration, seeds []labelledFrame) []string {
+	t.Helper()
+	declarationOf := func(frame labelledFrame) labelledDeclaration {
+		for _, candidate := range index[frame.name] {
+			if candidate.receiver == frame.receiver {
+				return candidate
+			}
+		}
+		t.Fatalf("the labelled path reaches %s, which the source read here does not declare", frame)
+		return labelledDeclaration{}
+	}
+	reached := map[labelledFrame]bool{}
+	queue := []labelledFrame{}
+	push := func(frame labelledFrame) {
+		if !reached[frame] {
+			reached[frame] = true
+			queue = append(queue, frame)
+		}
+	}
+	for _, seed := range seeds {
+		push(seed)
+	}
+	for len(queue) > 0 {
+		frame := queue[0]
+		queue = queue[1:]
+		for _, next := range labelledFlowFrom(declarationOf(frame), t, index, frame.parameter) {
+			push(next)
+		}
+	}
+	lines := []string{}
+	for frame := range reached {
+		lines = append(lines, frame.String())
+	}
+	slices.Sort(lines)
+	return lines
+}
+
+// The bytes a caller of the labelled encryption controls, and the frame each enters the
+// package at.
 //
-// The property is that the info a caller demanded is forwarded down the path unexamined
-// until it reaches the extract that hashes it, so there is nowhere on the way for a frame
-// to notice what it is holding. A band conditional on the info names it once more than the
-// forwarding does, in its condition; a frame that dropped it either assigns to it or names
-// it again in a second call. Neither is a shape a legitimate edit to these functions has a
-// reason to take.
+// The two exported entry points and their own parameters, rather than a point picked
+// somewhere inside. What a peer supplies is a label, a context and a message, and
+// everything below is what this package does with them; both entry point bodies are
+// themselves pinned in TestTheLabelledEncryptionIsOnlyItsOwnContext, so the seeds cannot
+// be walked away from by rewriting an entry point to hand its arguments somewhere else.
 //
-// The chain ends at hpkeLabeledExtract because below it is crypto/hkdf and the standard
-// library, and it names its ikm twice rather than once: the length goes into the capacity
-// of the preimage buffer and the bytes into the append. It is on the list at all because a
-// band written there is the last one in this tree that can still see the info, and it was
-// measured surviving every test in this package before this row existed. Nothing else in
-// the tree reads these bodies as shapes.
+// The last seed is not a parameter. keyScheduleContext is the info after
+// hpkeKeyScheduleContext has hashed it, and it is what carries the binding of the group
+// context into the three expansions that produce the key, the base nonce and the exporter
+// secret. A band written below that point drops the binding as completely as one written
+// above it, and stopping the walk where the bytes change shape is what left
+// hpkeLabeledExpand read by nothing: measured, an info dropping band there survived all
+// 2529 tests at 300 bytes and at 5000.
+var labelledPathSeeds = []labelledFrame{
+	{receiver: "", name: "EncryptWithLabel", parameter: "label"},
+	{receiver: "", name: "EncryptWithLabel", parameter: "context"},
+	{receiver: "", name: "EncryptWithLabel", parameter: "plaintext"},
+	{receiver: "", name: "DecryptWithLabel", parameter: "label"},
+	{receiver: "", name: "DecryptWithLabel", parameter: "context"},
+	{receiver: "", name: "DecryptWithLabel", parameter: "ciphertext"},
+	{receiver: "", name: "hpkeKeySchedule", parameter: "keyScheduleContext"},
+}
+
+// Every frame the seeds above reach, as the walk reports them.
 //
-// hpkeLabeledExpand is deliberately not here. What reaches it on this path is the key
-// schedule context, which is one mode byte and two digests, so its length is 65 whatever
-// the info was: a band on it fires for every message or for none, and firing for every
-// message is what the published vectors are for.
-var labelledReceivingPathFrames = []struct {
-	name      string
-	parameter string
-	uses      int
+// This is a list, and a hand written list is the thing this project has understated ten
+// times running. What makes it a different kind of list is that nothing in it is trusted:
+// the walk derives the same set from the syntax of the package on every run and the two
+// are compared both ways, so a frame added to the path fails here rather than waiting to
+// be noticed, and a frame deleted from this table fails here as well. The table is what a
+// reviewer reads. The walk is what says the table is the path.
+var labelledPathFrames = []string{
+	"*HpkeContext.Open ciphertext",
+	"*HpkeContext.Seal plaintext",
+	"*suiteCryptoProvider.HpkeOpen ciphertext",
+	"*suiteCryptoProvider.HpkeOpen info",
+	"*suiteCryptoProvider.HpkeSeal info",
+	"*suiteCryptoProvider.HpkeSeal plaintext",
+	"DecryptWithLabel ciphertext",
+	"DecryptWithLabel context",
+	"DecryptWithLabel label",
+	"EncryptWithLabel context",
+	"EncryptWithLabel label",
+	"EncryptWithLabel plaintext",
+	"HpkeOpenBase ciphertext",
+	"HpkeOpenBase info",
+	"HpkeSealBase info",
+	"HpkeSealBase plaintext",
+	"HpkeSetupBaseR info",
+	"HpkeSetupBaseS info",
+	"hpkeKeySchedule info",
+	"hpkeKeySchedule keyScheduleContext",
+	"hpkeKeyScheduleContext info",
+	"hpkeLabeledExpand info",
+	"hpkeLabeledExtract ikm",
+	"mlsEncryptContext context",
+	"mlsEncryptContext label",
+	"mlsLabelBytes w",
+}
+
+// The frames of the path that had no pin of their own, statement by statement. The seven
+// above them are pinned where they are declared, as the constructions they are.
+var mlsLabelBytesStatements = []string{
+	"encoded, err := w.Bytes()",
+	"if err != nil {\n\tpanic(\"mls: a labelled preimage could not be encoded: \" + err.Error())\n}",
+	"return encoded",
+}
+
+var hpkeSealBaseStatements = []string{
+	"kemOutput, ctx, err := HpkeSetupBaseS(random, params, pub, info)",
+	"if err != nil {\n\treturn nil, nil, err\n}",
+	"ciphertext, err := ctx.Seal(aad, plaintext)",
+	"if err != nil {\n\treturn nil, nil, err\n}",
+	"return kemOutput, ciphertext, nil",
+}
+
+var hpkeSetupBaseSStatements = []string{
+	"sharedSecret, kemOutput, err := hpkeEncap(random, params, pub)",
+	"if err != nil {\n\treturn nil, nil, err\n}",
+	"ctx, err := hpkeKeySchedule(params, sharedSecret, info)",
+	"if err != nil {\n\treturn nil, nil, err\n}",
+	"return kemOutput, ctx, nil",
+}
+
+var hpkeKeyScheduleStatements = []string{
+	"suiteId := hpkeSuiteId(params)",
+	"keyScheduleContext := hpkeKeyScheduleContext(suiteId, info)",
+	"secret := hpkeLabeledExtract(suiteId, sharedSecret, \"secret\", nil)",
+	"key, err := hpkeLabeledExpand(suiteId, secret, \"key\", keyScheduleContext, params.Nk)",
+	"if err != nil {\n\treturn nil, err\n}",
+	"baseNonce, err := hpkeLabeledExpand(suiteId, secret, \"base_nonce\", keyScheduleContext, params.Nn)",
+	"if err != nil {\n\treturn nil, err\n}",
+	"exporterSecret, err := hpkeLabeledExpand(suiteId, secret, \"exp\", keyScheduleContext, params.Nh)",
+	"if err != nil {\n\treturn nil, err\n}",
+	"aead, err := hpkeNewAead(params, key)",
+	"if err != nil {\n\treturn nil, err\n}",
+	"if aead.NonceSize() != params.Nn {\n\treturn nil, ErrBadNonceLength\n}",
+	"return &HpkeContext{\n\tparams:\t\tparams,\n\tsuiteId:\tsuiteId,\n\taead:\t\taead,\n\tbaseNonce:\tbaseNonce,\n\texporterSecret:\texporterSecret,\n\tsequence:\t0,\n}, nil",
+}
+
+var hpkeKeyScheduleContextStatements = []string{
+	"pskIdHash := hpkeLabeledExtract(suiteId, nil, \"psk_id_hash\", nil)",
+	"infoHash := hpkeLabeledExtract(suiteId, nil, \"info_hash\", info)",
+	"keyScheduleContext := make([]byte, 0, 1+len(pskIdHash)+len(infoHash))",
+	"keyScheduleContext = append(keyScheduleContext, hpkeModeBase)",
+	"keyScheduleContext = append(keyScheduleContext, pskIdHash...)",
+	"return append(keyScheduleContext, infoHash...)",
+}
+
+var hpkeLabeledExtractStatements = []string{
+	"labeledIkm := make([]byte, 0, len(hpkeVersionLabel)+len(suiteId)+len(label)+len(ikm))",
+	"labeledIkm = append(labeledIkm, hpkeVersionLabel...)",
+	"labeledIkm = append(labeledIkm, suiteId...)",
+	"labeledIkm = append(labeledIkm, label...)",
+	"labeledIkm = append(labeledIkm, ikm...)",
+	"prk, err := hkdf.Extract(sha256.New, labeledIkm, salt)",
+	"if err != nil {\n\tpanic(\"mls: hkdf extract failed with a compiled-in sha256: \" + err.Error())\n}",
+	"return prk",
+}
+
+var hpkeLabeledExpandStatements = []string{
+	"if length < 0 || length > hpkeMaxExpandLength {\n\treturn nil, ErrBadKeyLength\n}",
+	"labeledInfo := make([]byte, 0, 2+len(hpkeVersionLabel)+len(suiteId)+len(label)+len(info))",
+	"labeledInfo = binary.BigEndian.AppendUint16(labeledInfo, uint16(length))",
+	"labeledInfo = append(labeledInfo, hpkeVersionLabel...)",
+	"labeledInfo = append(labeledInfo, suiteId...)",
+	"labeledInfo = append(labeledInfo, label...)",
+	"labeledInfo = append(labeledInfo, info...)",
+	"return hkdf.Expand(sha256.New, prk, string(labeledInfo), length)",
+}
+
+var hpkeContextOpenStatements = []string{
+	"plaintext, err := self.aead.Open(nil, self.nonce(), ciphertext, aad)",
+	"if err != nil {\n\treturn nil, ErrAeadOpen\n}",
+	"if err := self.advance(); err != nil {\n\treturn nil, err\n}",
+	"return plaintext, nil",
+}
+
+var hpkeContextSealStatements = []string{
+	"ciphertext := self.aead.Seal(nil, self.nonce(), plaintext, aad)",
+	"if err := self.advance(); err != nil {\n\treturn nil, err\n}",
+	"return ciphertext, nil",
+}
+
+// The body every frame of the labelled path is held to.
+//
+// A whole body rather than a count of anything. The instrument this replaces asked how
+// many times a frame named its info and whether it assigned to that parameter, which is a
+// question about the spelling: a body that reads its info through a one line alias answers
+// it correctly and drops the binding anyway. A pin has no shape to sit outside of, because
+// the shape it accepts is the body itself.
+//
+// The price is that a legitimate edit to any of these fails here, including edits that
+// belong to task 8 rather than to this one. That is the intended price. The key schedule,
+// the key schedule context, the two kdf frames and the two aead frames are RFC 9180
+// constructions that are finished, and an edit to one of them is something a reviewer
+// should be made to look at rather than something that lands quietly. Every frame added
+// here was measured carrying a band that survived the whole package before it was pinned.
+var labelledPathPins = []struct {
+	receiver string
+	name     string
+	want     []string
 }{
-	{name: "HpkeOpenBase", parameter: "info", uses: 1},
-	{name: "HpkeSetupBaseR", parameter: "info", uses: 1},
-	{name: "hpkeKeySchedule", parameter: "info", uses: 1},
-	{name: "hpkeKeyScheduleContext", parameter: "info", uses: 1},
-	{name: "hpkeLabeledExtract", parameter: "ikm", uses: 2},
+	{receiver: "", name: "mlsEncryptContext", want: mlsEncryptContextStatements},
+	{receiver: "", name: "mlsLabelBytes", want: mlsLabelBytesStatements},
+	{receiver: "", name: "EncryptWithLabel", want: encryptWithLabelStatements},
+	{receiver: "", name: "DecryptWithLabel", want: decryptWithLabelStatements},
+	{receiver: providerReceiver, name: "HpkeSeal", want: hpkeSealStatements},
+	{receiver: providerReceiver, name: "HpkeOpen", want: hpkeOpenStatements},
+	{receiver: "", name: "HpkeSealBase", want: hpkeSealBaseStatements},
+	{receiver: "", name: "HpkeOpenBase", want: hpkeOpenBaseStatements},
+	{receiver: "", name: "HpkeSetupBaseS", want: hpkeSetupBaseSStatements},
+	{receiver: "", name: "HpkeSetupBaseR", want: hpkeSetupBaseRStatements},
+	{receiver: "", name: "hpkeKeySchedule", want: hpkeKeyScheduleStatements},
+	{receiver: "", name: "hpkeKeyScheduleContext", want: hpkeKeyScheduleContextStatements},
+	{receiver: "", name: "hpkeLabeledExtract", want: hpkeLabeledExtractStatements},
+	{receiver: "", name: "hpkeLabeledExpand", want: hpkeLabeledExpandStatements},
+	{receiver: "*HpkeContext", name: "Open", want: hpkeContextOpenStatements},
+	{receiver: "*HpkeContext", name: "Seal", want: hpkeContextSealStatements},
 }
 
 // A key schedule that drops the info it was handed at one length.
@@ -3699,35 +4203,342 @@ func hpkeKeyScheduleContext(suiteId []byte, info []byte) []byte {
 }
 `
 
-func TestTheLabelledReceivingPathForwardsItsInfoUnexamined(t *testing.T) {
-	for _, frame := range labelledReceivingPathFrames {
-		source := sourceDeclaringPackageFunction(t, frame.name)
-		uses, assigned := identifierUsesIn(source, t, frame.name, frame.parameter)
-		if uses != frame.uses {
-			t.Errorf("%s names its %s %d times, want %d: a frame that looks at the info is a frame that can drop it",
-				frame.name, frame.parameter, uses, frame.uses)
+// A receiving path with one more frame in it than the table above names.
+//
+// This is what says the walk discovers frames rather than reciting them. HpkeOpenBase here
+// delegates to a function that is nowhere in labelledPathFrames and nowhere in
+// labelledPathPins, and the closure over this source has to name it: a lenient retry moved
+// into a helper is the escape a pinned frame table has, and the escape is only closed if
+// growing the path is what fails rather than what goes unnoticed.
+const insertedFrameControl = `package mls
+
+func HpkeOpenBase(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	return openWithLenientRetry(params, priv, kemOutput, info, aad, ciphertext)
+}
+
+func openWithLenientRetry(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	ctx, err := HpkeSetupBaseR(params, priv, kemOutput, info)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, openErr := ctx.Open(aad, ciphertext)
+	if openErr != nil {
+		lenient, lenientErr := HpkeSetupBaseR(params, priv, kemOutput, nil)
+		if lenientErr != nil {
+			return nil, lenientErr
 		}
-		if assigned {
-			t.Errorf("%s assigns to its %s", frame.name, frame.parameter)
+		return lenient.Open(aad, ciphertext)
+	}
+	return plaintext, openErr
+}
+
+func HpkeSetupBaseR(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte) (*HpkeContext, error) {
+	return hpkeKeySchedule(params, nil, info)
+}
+
+func hpkeKeySchedule(params *SuiteParams, sharedSecret []byte, info []byte) (*HpkeContext, error) {
+	return nil, nil
+}
+
+func (self *HpkeContext) Open(aad []byte, ciphertext []byte) ([]byte, error) {
+	return nil, nil
+}
+`
+
+// A key schedule that drops the info it was handed at one length, through a one line
+// alias.
+//
+// This is the mutant the instrument this file used to carry could not see. It names info
+// exactly once, assigns to given rather than to info, and so answers a use count of one
+// and an assignment of false, which is what the previous gate asked for. Measured, it
+// survived all 2529 tests of this package, and on a tree carrying it a message sealed with
+// no info at all opened as an authentic one under a 300 byte EncryptContext, which is the
+// length mlsEncryptContext gives an UpdatePathNode over a 275 byte group context.
+const aliasDroppingKeyScheduleControl = `package mls
+
+func hpkeKeySchedule(params *SuiteParams, sharedSecret []byte, info []byte) (*HpkeContext, error) {
+	suiteId := hpkeSuiteId(params)
+	given := info
+	if len(given) == 300 {
+		given = nil
+	}
+	keyScheduleContext := hpkeKeyScheduleContext(suiteId, given)
+	secret := hpkeLabeledExtract(suiteId, sharedSecret, "secret", nil)
+	key, err := hpkeLabeledExpand(suiteId, secret, "key", keyScheduleContext, params.Nk)
+	if err != nil {
+		return nil, err
+	}
+	baseNonce, err := hpkeLabeledExpand(suiteId, secret, "base_nonce", keyScheduleContext, params.Nn)
+	if err != nil {
+		return nil, err
+	}
+	exporterSecret, err := hpkeLabeledExpand(suiteId, secret, "exp", keyScheduleContext, params.Nh)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := hpkeNewAead(params, key)
+	if err != nil {
+		return nil, err
+	}
+	if aead.NonceSize() != params.Nn {
+		return nil, ErrBadNonceLength
+	}
+	return &HpkeContext{
+		params:         params,
+		suiteId:        suiteId,
+		aead:           aead,
+		baseNonce:      baseNonce,
+		exporterSecret: exporterSecret,
+		sequence:       0,
+	}, nil
+}
+`
+
+// A key schedule that swaps the derived context rather than the info, keyed on what the
+// info hashed to.
+//
+// It never names info a second time and never assigns to anything derived from it, so no
+// instrument that watches the info can see it at all: what it reads is the digest, and the
+// digest of one group context is a constant an attacker knows. It is here because it is
+// the shape that says the pin has to be the whole body rather than the fate of one
+// parameter.
+const digestKeyedKeyScheduleControl = `package mls
+
+func hpkeKeySchedule(params *SuiteParams, sharedSecret []byte, info []byte) (*HpkeContext, error) {
+	suiteId := hpkeSuiteId(params)
+	keyScheduleContext := hpkeKeyScheduleContext(suiteId, info)
+	if bytes.Equal(keyScheduleContext, targetedContext) {
+		keyScheduleContext = hpkeKeyScheduleContext(suiteId, nil)
+	}
+	secret := hpkeLabeledExtract(suiteId, sharedSecret, "secret", nil)
+	key, err := hpkeLabeledExpand(suiteId, secret, "key", keyScheduleContext, params.Nk)
+	if err != nil {
+		return nil, err
+	}
+	baseNonce, err := hpkeLabeledExpand(suiteId, secret, "base_nonce", keyScheduleContext, params.Nn)
+	if err != nil {
+		return nil, err
+	}
+	exporterSecret, err := hpkeLabeledExpand(suiteId, secret, "exp", keyScheduleContext, params.Nh)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := hpkeNewAead(params, key)
+	if err != nil {
+		return nil, err
+	}
+	if aead.NonceSize() != params.Nn {
+		return nil, ErrBadNonceLength
+	}
+	return &HpkeContext{
+		params:         params,
+		suiteId:        suiteId,
+		aead:           aead,
+		baseNonce:      baseNonce,
+		exporterSecret: exporterSecret,
+		sequence:       0,
+	}, nil
+}
+`
+
+// An aead open that answers with the forgery it was handed at one ciphertext length.
+//
+// This frame is the last one on the receiving path and it sees no info at all, so every
+// gate written about the info reads straight past it. Measured, the band below survived
+// all 2529 tests at 57, 64, 100, 128, 200, 500, 1000 and 4000 bytes, and on a tree
+// carrying it at 100 a hundred byte forgery opened with a nil error, which is the one
+// thing the doc comment on DecryptWithLabel says can never happen.
+const forgeryAcceptingContextOpenControl = `package mls
+
+func (self *HpkeContext) Open(aad []byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := self.aead.Open(nil, self.nonce(), ciphertext, aad)
+	if err != nil && len(ciphertext) == 100 {
+		plaintext, err = ciphertext, nil
+	}
+	if err != nil {
+		return nil, ErrAeadOpen
+	}
+	if err := self.advance(); err != nil {
+		return nil, err
+	}
+	return plaintext, nil
+}
+`
+
+// A sending setup that drops the info it was handed at one length.
+//
+// The frame table before this one covered the receiving path alone, on the argument that a
+// lenient retry has to sit where it can see an open fail. That is true of retries and true
+// of nothing else: measured, the band below survived all 2529 tests, and it seals every
+// message whose EncryptContext is 300 bytes with no context binding at all, which no
+// conformant peer would open and which this implementation would open happily.
+const infoDroppingSetupBaseSControl = `package mls
+
+func HpkeSetupBaseS(random io.Reader, params *SuiteParams, pub HpkePublicKey, info []byte) ([]byte, *HpkeContext, error) {
+	sharedSecret, kemOutput, err := hpkeEncap(random, params, pub)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(info) == 300 {
+		info = nil
+	}
+	ctx, err := hpkeKeySchedule(params, sharedSecret, info)
+	if err != nil {
+		return nil, nil, err
+	}
+	return kemOutput, ctx, nil
+}
+`
+
+// A preimage encoder that answers with nothing at one length.
+//
+// This frame is above the provider rather than below it, and it is the one both directions
+// share: an EncryptContext dropped here is dropped for the sender and the receiver alike,
+// so the two still agree with each other and bind nothing. That is the same bypass the
+// alias control produces, written where no gate in this package looked before the walk
+// found this frame.
+const lengthBandLabelBytesControl = `package mls
+
+func mlsLabelBytes(w *syntax.Writer) []byte {
+	encoded, err := w.Bytes()
+	if err != nil {
+		panic("mls: a labelled preimage could not be encoded: " + err.Error())
+	}
+	if len(encoded) == 300 {
+		return nil
+	}
+	return encoded
+}
+`
+
+// A kdf expansion that drops the context it was handed at one length.
+//
+// The frame table before this one stopped at hpkeLabeledExtract, on the argument that what
+// reaches hpkeLabeledExpand on this path is 65 bytes whatever the info was, so a band on it
+// fires for every message or for none. The argument is sound about the key schedule and
+// says nothing about Export, which hands this frame a length its own caller chose.
+// Measured, the band below survived all 2529 tests at 300 bytes and at 5000.
+const infoDroppingLabeledExpandControl = `package mls
+
+func hpkeLabeledExpand(suiteId []byte, prk []byte, label string, info []byte, length int) ([]byte, error) {
+	if length < 0 || length > hpkeMaxExpandLength {
+		return nil, ErrBadKeyLength
+	}
+	if len(info) == 5000 {
+		info = nil
+	}
+	labeledInfo := make([]byte, 0, 2+len(hpkeVersionLabel)+len(suiteId)+len(label)+len(info))
+	labeledInfo = binary.BigEndian.AppendUint16(labeledInfo, uint16(length))
+	labeledInfo = append(labeledInfo, hpkeVersionLabel...)
+	labeledInfo = append(labeledInfo, suiteId...)
+	labeledInfo = append(labeledInfo, label...)
+	labeledInfo = append(labeledInfo, info...)
+	return hkdf.Expand(sha256.New, prk, string(labeledInfo), length)
+}
+`
+
+// Every frame the labelled path reaches has a pin, and every pin holds.
+//
+// The property is that a caller who hands EncryptWithLabel or DecryptWithLabel a label, a
+// context and a message has those bytes carried to the kdf and the aead unaltered, and
+// that nothing between here and there gets to decide what it is holding. The instrument
+// this replaces named that property and observed something weaker: it counted how many
+// times each of five frames named its info and whether it assigned to that parameter, and
+// its own comment enumerated two shapes and treated the enumeration as the class. It was
+// not the class. Nine mutants one alias outside it survived all 2529 tests, one of them a
+// live context binding bypass, and three further frames of the path were on no list at all.
+//
+// So the frames are derived rather than listed and the bodies are pinned rather than
+// counted. labelledPathClosure walks the syntax of the package from the two entry points
+// and reports every frame the caller bytes reach; that set is compared against
+// labelledPathFrames both ways, so the path growing a frame fails here. Every declaration
+// in it is then held to its whole body, so a frame changing what it does fails here too.
+// Neither half is enough alone: the pins do not know when the path grows, and the walk does
+// not know what a frame does.
+//
+// Each control below is a body that passed a great deal of this package before it was
+// written down, and every one of them was measured surviving all 2529 tests.
+func TestEveryFrameOfTheLabelledPathIsPinned(t *testing.T) {
+	index := labelledDeclarationsIn(packageSources(t))
+	if got := labelledPathClosure(t, index, labelledPathSeeds); !slices.Equal(got, labelledPathFrames) {
+		t.Errorf("the labelled path reaches\n%s\nand this gate knows of\n%s",
+			strings.Join(got, "\n"), strings.Join(labelledPathFrames, "\n"))
+	}
+	// every frame the walk reported is a frame some pin below reads, so a frame cannot be
+	// on the path and on no pin at once
+	pinned := []string{}
+	for _, pin := range labelledPathPins {
+		pinned = append(pinned, labelledFrame{receiver: pin.receiver, name: pin.name}.String())
+	}
+	slices.Sort(pinned)
+	reached := []string{}
+	for _, frame := range labelledPathFrames {
+		declaration, _, found := strings.Cut(frame, " ")
+		if !found {
+			t.Fatalf("%q is not a frame", frame)
+		}
+		if !slices.Contains(reached, declaration+" ") {
+			reached = append(reached, declaration+" ")
 		}
 	}
-	// and the counter reads each control as the different body it is, so a counter that
-	// stopped counting fails here rather than issuing the real bodies a clean bill
+	slices.Sort(reached)
+	if !slices.Equal(pinned, reached) {
+		t.Errorf("the path reaches the declarations\n%s\nand the pins read\n%s",
+			strings.Join(reached, "\n"), strings.Join(pinned, "\n"))
+	}
+	// and each of those bodies is what it is pinned to
+	for _, pin := range labelledPathPins {
+		source := sourceDeclaringFrame(t, pin.receiver, pin.name)
+		if got := source.statementsOf(t, pin.receiver, pin.name); !slices.Equal(got, pin.want) {
+			t.Errorf("%s%s is\n%s\nwant\n%s", pin.receiver, pin.name,
+				strings.Join(got, "\n"), strings.Join(pin.want, "\n"))
+		}
+	}
+	// and the walk names a frame this table does not, when the path grows one
+	control := labelledDeclarationsIn([]parsedSource{mustParseText(t, "an inserted frame", insertedFrameControl)})
+	grown := labelledPathClosure(t, control, []labelledFrame{
+		{receiver: "", name: "HpkeOpenBase", parameter: "info"},
+		{receiver: "", name: "HpkeOpenBase", parameter: "ciphertext"},
+	})
+	if !slices.Contains(grown, "openWithLenientRetry info") {
+		t.Errorf("the walk read a receiving path with a frame inserted in it as\n%s",
+			strings.Join(grown, "\n"))
+	}
+	for _, frame := range grown {
+		declaration, _, _ := strings.Cut(frame, " ")
+		if declaration == "openWithLenientRetry" && slices.Contains(pinned, declaration+" ") {
+			t.Errorf("the inserted frame is one this gate already pins, so it shows nothing")
+		}
+	}
+	// and each pin reads its control as the different body it is, so a pin that stopped
+	// matching fails here rather than issuing the real bodies a clean bill
 	for _, testCase := range []struct {
 		name     string
+		receiver string
+		method   string
 		control  string
-		assigned bool
+		want     []string
 	}{
-		{name: "a key schedule that drops its info", control: infoDroppingKeyScheduleControl, assigned: true},
-		{name: "a key schedule that reads its info", control: infoReadingKeyScheduleControl, assigned: false},
+		{name: "a key schedule that drops its info through an alias", receiver: "", method: "hpkeKeySchedule",
+			control: aliasDroppingKeyScheduleControl, want: hpkeKeyScheduleStatements},
+		{name: "a key schedule keyed on what its info hashed to", receiver: "", method: "hpkeKeySchedule",
+			control: digestKeyedKeyScheduleControl, want: hpkeKeyScheduleStatements},
+		{name: "a key schedule context that drops its info", receiver: "", method: "hpkeKeyScheduleContext",
+			control: infoDroppingKeyScheduleControl, want: hpkeKeyScheduleContextStatements},
+		{name: "a key schedule context that reads its info", receiver: "", method: "hpkeKeyScheduleContext",
+			control: infoReadingKeyScheduleControl, want: hpkeKeyScheduleContextStatements},
+		{name: "an aead open that answers with a forgery", receiver: "*HpkeContext", method: "Open",
+			control: forgeryAcceptingContextOpenControl, want: hpkeContextOpenStatements},
+		{name: "a sending setup that drops its info", receiver: "", method: "HpkeSetupBaseS",
+			control: infoDroppingSetupBaseSControl, want: hpkeSetupBaseSStatements},
+		{name: "a preimage encoder that answers with nothing", receiver: "", method: "mlsLabelBytes",
+			control: lengthBandLabelBytesControl, want: mlsLabelBytesStatements},
+		{name: "an expansion that drops the context it was handed", receiver: "", method: "hpkeLabeledExpand",
+			control: infoDroppingLabeledExpandControl, want: hpkeLabeledExpandStatements},
 	} {
 		control := mustParseText(t, testCase.name, testCase.control)
-		uses, assigned := identifierUsesIn(control, t, "hpkeKeyScheduleContext", "info")
-		if uses == 1 {
-			t.Errorf("the counter read %s as naming its info once", testCase.name)
-		}
-		if assigned != testCase.assigned {
-			t.Errorf("the counter read %s as assigned = %v, want %v", testCase.name, assigned, testCase.assigned)
+		if slices.Equal(control.statementsOf(t, testCase.receiver, testCase.method), testCase.want) {
+			t.Errorf("the pin read %s as the shape above", testCase.name)
 		}
 	}
 }
