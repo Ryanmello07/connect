@@ -4605,3 +4605,55 @@ func TestEveryProviderOperationDrawsExactlyWhatItUses(t *testing.T) {
 		}
 	}
 }
+
+// The published seal the provider must reproduce over a source the caller wrote.
+//
+// The corpus carries one entry per registered suite and each names the ephemeral scalar its
+// encapsulation was made with, so a provider handed that scalar as its whole entropy source
+// has to answer the published enc and the published sequence zero ciphertext.
+const providerHpkeSealComparisons = 2
+
+// The provider seals to the published bytes when the caller supplies the ephemeral key.
+//
+// TestProviderHpkeSealDrawsFromItsOwnReader already says the seal reads this provider's
+// source rather than the process's, and it says so by recomputing the encapsulation with
+// this package's own x25519 helper. That is the same code answering the same question
+// twice: a package that drew the right bytes and derived them wrongly agrees with itself
+// and with nothing else alive. What separates the two is a published pair, and the corpus
+// has one — the vector's skEm fed in as the provider's entire stream, the vector's enc and
+// ct expected back.
+//
+// It is the shape this task exists for, stated at the surface a caller actually holds. The
+// free function is pinned to the same corpus by TestHpkeSealBaseMatchesThePublishedSingleShot;
+// this is the interface method, because a method that stopped delegating is exactly the
+// edit a delegation invites and the free function agreeing says nothing about what the
+// provider answers.
+func TestProviderHpkeSealMatchesThePublishedSealOverItsOwnReader(t *testing.T) {
+	compared := 0
+	for _, vector := range loadHpkeVectors(t) {
+		if len(vector.Encryptions) == 0 || vector.Encryptions[0].sequence != 0 {
+			t.Fatalf("%s does not open at sequence 0, so a single shot cannot be compared against it", vector.name)
+		}
+		first := vector.Encryptions[0]
+		ephemeral := decodeVectorField(t, vector.name, "skEm", vector.SkEm)
+		crypto := mustProviderOver(t, vector.suite, bytes.NewReader(ephemeral))
+		kemOutput, ciphertext, err := crypto.HpkeSeal(
+			HpkePublicKey(decodeVectorField(t, vector.name, "pkRm", vector.PkRm)),
+			decodePossiblyEmptyVectorField(t, vector.name, "info", vector.Info),
+			decodeVectorField(t, vector.name, "aad", first.Aad),
+			decodeVectorField(t, vector.name, "pt", first.Pt))
+		if err != nil {
+			t.Fatalf("%s: HpkeSeal over the published ephemeral key: %v", vector.name, err)
+		}
+		if want := decodeVectorField(t, vector.name, "enc", vector.Enc); !bytes.Equal(kemOutput, want) {
+			t.Errorf("%s: the provider encapsulated %x, want the published %x", vector.name, kemOutput, want)
+		}
+		if want := decodeVectorField(t, vector.name, "ct", first.Ct); !bytes.Equal(ciphertext, want) {
+			t.Errorf("%s: the provider sealed %x, want the published %x", vector.name, ciphertext, want)
+		}
+		compared++
+	}
+	if compared != providerHpkeSealComparisons {
+		t.Fatalf("compared %d published seals, want %d", compared, providerHpkeSealComparisons)
+	}
+}

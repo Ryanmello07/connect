@@ -4544,3 +4544,73 @@ func TestEveryFrameOfTheLabelledPathIsPinned(t *testing.T) {
 		}
 	}
 }
+
+// RFC 8032 section 7.1, the published seed and the public key it expands to. The four
+// entries are the whole of that section's ed25519 test vectors.
+//
+// They are here rather than a pair this package computed for itself because the assertion
+// they carry is about a derivation, and a derivation checked against the same standard
+// library call the implementation makes is that call agreeing with itself. crypto-basics
+// publishes a priv and pub pair too, and it lands with p8; these hold the same claim now
+// and from a different document.
+var rfc8032SeedExpansions = []struct {
+	name   string
+	seed   string
+	public string
+}{
+	{
+		name:   "RFC 8032 section 7.1 TEST 1",
+		seed:   "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+		public: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+	},
+	{
+		name:   "RFC 8032 section 7.1 TEST 2",
+		seed:   "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+		public: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+	},
+	{
+		name:   "RFC 8032 section 7.1 TEST 3",
+		seed:   "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+		public: "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+	},
+	{
+		name:   "RFC 8032 section 7.1 TEST 1024",
+		seed:   "f5e5767cf153319517630f226876b86c8160cc583bc013744c6bf255f5cc0ee5",
+		public: "278117fc144c72340f67d0f2316e8386ceffbf2b2428c9c51fef7c597f1d426e",
+	},
+}
+
+// A provider over a published seed answers that seed and the published public key.
+//
+// TestSignatureKeyPairConsumesItsReaderInOrder says the seed is the bytes the reader
+// offered, in order, and checks the public half with ed25519.NewKeyFromSeed — the same call
+// the implementation makes, so that half of it is this package asking itself. A published
+// key is what turns it into a statement about ed25519 rather than about agreement, and it
+// is the only form that separates a generator which expanded the wrong thirty two bytes
+// from one that expanded the right ones.
+//
+// Each seed is checked for symmetry first. A seed that reads the same sorted, reversed or
+// rotated cannot see the weakening this project shipped in task 4, and a vector is not
+// exempt from that just because it is published.
+func TestSignatureKeyPairMatchesThePublishedSeedExpansions(t *testing.T) {
+	for _, vector := range rfc8032SeedExpansions {
+		seed := mustDecodeHex(t, vector.name+" seed", vector.seed)
+		want := mustDecodeHex(t, vector.name+" public key", vector.public)
+		assertProbeIsNotItsOwnPermutation(t, vector.name+" seed", seed)
+		for _, suite := range Suites() {
+			crypto := mustProviderOver(t, suite, bytes.NewReader(seed))
+			priv, pub, err := crypto.SignatureKeyPair()
+			if err != nil {
+				t.Fatalf("suite %#04x %s: SignatureKeyPair: %v", uint16(suite), vector.name, err)
+			}
+			if !bytes.Equal(priv, seed) {
+				t.Errorf("suite %#04x %s: the seed answered was %x, want the published %x",
+					uint16(suite), vector.name, priv, seed)
+			}
+			if !bytes.Equal(pub, want) {
+				t.Errorf("suite %#04x %s: the public key was %x, want the published %x",
+					uint16(suite), vector.name, pub, want)
+			}
+		}
+	}
+}
