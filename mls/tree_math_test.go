@@ -6300,3 +6300,536 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 		}
 	}
 }
+
+// every node of every tree size from one to 512 leaves, the top thirteen levels
+// of every size above that, and a five-block ladder over the levels below them,
+// against the structural laws the array representation has to satisfy.
+//
+// vector family 1 records answers for four relations at ten sizes; these are
+// the laws those answers are supposed to obey, checked everywhere.
+//
+// three bands, and the reason there are three. depths 0 to 9 walk every index
+// of the array, 2036 nodes, which is the band the plan wrote and the only band
+// that can be a whole tree. depths 10 to 31 walk the top thirteen levels of
+// each tree whole, 169,962 nodes, because a tree that deep has no walkable node
+// count but a level of it does. the levels below those get five blocks each,
+// the same five this file probes a wide level with everywhere else. so every
+// level from 0 to 31 is asserted in a tree that holds it, and every block below
+// 4096 at every one of them.
+//
+// what is not asserted is a block count and not a level count, and it is the
+// number rather than the hope: level k of a tree of depth d holds 2^(d-k)
+// blocks, this walks at most 4096 of them, and the largest tree holds 2^32-1
+// (level, block) pairs of which 86,015 are walked whole. the other
+// 4,294,881,280 are reached only where the ladder's five blocks land. a version
+// wrong over a run of blocks at one level, outside those, is not seen here.
+// that residual is what the walks in the rest of this file are sized against,
+// and the task report prices it against them one function at a time.
+func TestTreeMathInvariants(t *testing.T) {
+	shallowNodes, deepNodes, ladderNodes := int64(0), int64(0), int64(0)
+	blankParentPaths, populatedPaths := 0, 0
+
+	// the ten sizes the whole array of can be walked.
+	for depth := uint32(0); depth <= 9; depth += 1 {
+		shallowNodes += sweepEveryNode(t, depth)
+		blankParentPaths += sweepBlankParentShape(t, depth)
+		populatedPaths += sweepPopulatedShape(t, depth)
+	}
+
+	// the twenty-two above them, which no tree-shaped walk can hold.
+	for depth := uint32(10); depth <= 31; depth += 1 {
+		deepNodes += sweepTopLevels(t, depth)
+		ladderNodes += sweepLevelLadder(t, depth)
+		populatedPaths += sweepPopulatedShape(t, depth)
+	}
+
+	countCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		// the ten trees from one to 512 leaves hold 2^(d+1)-1 nodes each, 2036
+		// in all, which is the node total the corpus tripwire pins for the same
+		// ladder.
+		{label: "nodes of every tree to 512 leaves", got: shallowNodes, want: 2036},
+		// the top thirteen levels of a depth hold 2^13-1 nodes once the depth is
+		// at least twelve, and the whole tree below that: 14,333 nodes over the
+		// three depths from 10 to 12, then 8191 at each of the nineteen depths
+		// from 13 to 31.
+		{label: "nodes of the top levels above 512 leaves", got: deepNodes, want: 14333 + 19*8191},
+		// five blocks at each of the depth-12 levels the band above leaves out,
+		// which is 5 * sum(k=1..19) k over depths 13 to 31 and nothing below.
+		{label: "ladder nodes above 512 leaves", got: ladderNodes, want: 950},
+		// every leaf of the ten small trees.
+		{label: "filtered paths with every parent blank", got: int64(blankParentPaths), want: 1023},
+		// the same 1023, and five leaves at each of the twenty-two depths above.
+		{label: "filtered paths with nothing blank", got: int64(populatedPaths), want: 1023 + 110},
+	}
+	for _, c := range countCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// how many of a tree's levels the deep band walks whole.
+//
+// thirteen is bought with runtime and nothing else. a depth walks 2^13-1 nodes
+// of its own top levels, which is 169,962 nodes over the twenty-two depths
+// above 512 leaves, measured at 0.10s. sixteen is 1.15s and eighteen is 10.5s,
+// and neither moves the residual: what is left unwalked either way is a run of
+// blocks 2^31 wide at the bottom levels. what the constant buys is stated as a
+// level and not as a count: level k is walked whole in every tree from depth
+// max(10, k) to depth min(31, k+12), so every block below 4096 is walked at
+// every level from 0 to 31 and no level is ever left to the ladder alone.
+const invariantTopLevels = 13
+
+// the lowest level of a tree of the given depth that the deep band walks whole.
+func invariantFirstLevel(depth uint32) uint32 {
+	if depth+1 <= invariantTopLevels {
+		return 0
+	}
+	return depth + 1 - invariantTopLevels
+}
+
+// the structural laws one node of the array representation has to satisfy.
+//
+// the level and the block are the caller's, worked out from the layout rather
+// than read off the node, and every expectation here is built from them. that
+// is the difference between this and the body the plan wrote: the plan took the
+// node's level from NodeIndex.Level and then checked the levels of its
+// children, its parent and its direct path against that same number, so the
+// level a node is expected to be at came from the function being asked. the two
+// rows at the top of this one take it from the layout instead.
+//
+// the shape is the tree with nothing blank, whose resolution rule is the
+// identity: RFC 9420 section 4.1 resolves a non-blank node to that node alone.
+// it costs one pop a call, which is what lets the law be asserted at every node
+// of a walk this wide rather than at a designed few.
+func checkNodeInvariants(t *testing.T, shape NodeShape, depth uint32, root NodeIndex, level uint32, block uint64) {
+	t.Helper()
+	leafCount := shape.LeafCount()
+	nodeWidth := NodeWidth(leafCount)
+	nodeIndex := nodeAt(level, block)
+
+	if nodeIndex.Level() != level {
+		t.Fatalf("%d leaves: node %d level %d, want %d", leafCount, nodeIndex, nodeIndex.Level(), level)
+	}
+	if nodeIndex.IsLeaf() != (level == 0) {
+		t.Fatalf("%d leaves: node %d at level %d reports leaf %v", leafCount, nodeIndex, level, nodeIndex.IsLeaf())
+	}
+	if uint32(nodeIndex) >= nodeWidth {
+		t.Fatalf("%d leaves: node %d outside width %d", leafCount, nodeIndex, nodeWidth)
+	}
+	if level > depth {
+		t.Fatalf("%d leaves: node %d level %d exceeds depth %d", leafCount, nodeIndex, level, depth)
+	}
+
+	// children: the two half blocks one level down, straddling the node, and
+	// both naming it as their parent.
+	if nodeIndex.IsLeaf() {
+		if _, err := Left(nodeIndex); !errors.Is(err, ErrLeafHasNoChildren) {
+			t.Fatalf("%d leaves: left of leaf %d: %v", leafCount, nodeIndex, err)
+		}
+		if _, err := Right(nodeIndex); !errors.Is(err, ErrLeafHasNoChildren) {
+			t.Fatalf("%d leaves: right of leaf %d: %v", leafCount, nodeIndex, err)
+		}
+	} else {
+		leftChild, err := Left(nodeIndex)
+		if err != nil {
+			t.Fatalf("%d leaves: left of %d: %v", leafCount, nodeIndex, err)
+		}
+		rightChild, err := Right(nodeIndex)
+		if err != nil {
+			t.Fatalf("%d leaves: right of %d: %v", leafCount, nodeIndex, err)
+		}
+		if leftChild != nodeAt(level-1, 2*block) || rightChild != nodeAt(level-1, 2*block+1) {
+			t.Fatalf("%d leaves: children of %d: %d and %d, want %d and %d", leafCount, nodeIndex,
+				leftChild, rightChild, nodeAt(level-1, 2*block), nodeAt(level-1, 2*block+1))
+		}
+		if !(leftChild < nodeIndex && nodeIndex < rightChild) {
+			t.Fatalf("%d leaves: node %d children %d and %d do not straddle it", leafCount, nodeIndex, leftChild, rightChild)
+		}
+		if leftChild.Level() != level-1 || rightChild.Level() != level-1 {
+			t.Fatalf("%d leaves: node %d children at levels %d and %d, want %d", leafCount, nodeIndex, leftChild.Level(), rightChild.Level(), level-1)
+		}
+		leftParent, err := Parent(leftChild, leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: parent of %d: %v", leafCount, leftChild, err)
+		}
+		rightParent, err := Parent(rightChild, leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: parent of %d: %v", leafCount, rightChild, err)
+		}
+		if leftParent != nodeIndex || rightParent != nodeIndex {
+			t.Fatalf("%d leaves: parents of the children of %d: %d and %d", leafCount, nodeIndex, leftParent, rightParent)
+		}
+	}
+
+	// parent and sibling: defined for every node but the root, and the sibling
+	// relation is an involution.
+	if nodeIndex == root {
+		if _, err := Parent(nodeIndex, leafCount); !errors.Is(err, ErrRootHasNoParent) {
+			t.Fatalf("%d leaves: parent of root: %v", leafCount, err)
+		}
+		if _, err := Sibling(nodeIndex, leafCount); !errors.Is(err, ErrRootHasNoSibling) {
+			t.Fatalf("%d leaves: sibling of root: %v", leafCount, err)
+		}
+	} else {
+		parent, err := Parent(nodeIndex, leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: parent of %d: %v", leafCount, nodeIndex, err)
+		}
+		if parent != nodeAt(level+1, block>>1) {
+			t.Fatalf("%d leaves: parent of %d: %d, want %d", leafCount, nodeIndex, parent, nodeAt(level+1, block>>1))
+		}
+		if uint32(parent) >= nodeWidth {
+			t.Fatalf("%d leaves: parent of %d is %d, outside width %d", leafCount, nodeIndex, parent, nodeWidth)
+		}
+		if parent.Level() != level+1 {
+			t.Fatalf("%d leaves: parent of %d at level %d, want %d", leafCount, nodeIndex, parent.Level(), level+1)
+		}
+		sibling, err := Sibling(nodeIndex, leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: sibling of %d: %v", leafCount, nodeIndex, err)
+		}
+		if sibling != nodeAt(level, block^1) {
+			t.Fatalf("%d leaves: sibling of %d: %d, want %d", leafCount, nodeIndex, sibling, nodeAt(level, block^1))
+		}
+		back, err := Sibling(sibling, leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: sibling of %d: %v", leafCount, sibling, err)
+		}
+		if back != nodeIndex {
+			t.Fatalf("%d leaves: sibling of sibling of %d: %d", leafCount, nodeIndex, back)
+		}
+		if sibling.Level() != level {
+			t.Fatalf("%d leaves: sibling of %d at level %d, want %d", leafCount, nodeIndex, sibling.Level(), level)
+		}
+		if CommonAncestor(nodeIndex, sibling) != parent {
+			t.Fatalf("%d leaves: common ancestor of %d and its sibling: %d, want %d", leafCount, nodeIndex, CommonAncestor(nodeIndex, sibling), parent)
+		}
+	}
+
+	// direct path: strictly ascending levels, ending at the root, of the length
+	// the depth predicts.
+	pathNodes, err := DirectPath(nodeIndex, leafCount)
+	if err != nil {
+		t.Fatalf("%d leaves: direct path of %d: %v", leafCount, nodeIndex, err)
+	}
+	if uint32(len(pathNodes)) != depth-level {
+		t.Fatalf("%d leaves: direct path of %d has %d nodes, want %d", leafCount, nodeIndex, len(pathNodes), depth-level)
+	}
+	previousLevel := level
+	for _, pathNode := range pathNodes {
+		if uint32(pathNode) >= nodeWidth {
+			t.Fatalf("%d leaves: direct path of %d contains %d, outside width %d", leafCount, nodeIndex, pathNode, nodeWidth)
+		}
+		if pathNode.Level() != previousLevel+1 {
+			t.Fatalf("%d leaves: direct path of %d is not strictly ascending: %v", leafCount, nodeIndex, pathNodes)
+		}
+		previousLevel = pathNode.Level()
+		if !InSubtree(pathNode, nodeIndex) {
+			t.Fatalf("%d leaves: %d is on the direct path of %d but does not contain it", leafCount, pathNode, nodeIndex)
+		}
+		if CommonAncestor(nodeIndex, pathNode) != pathNode {
+			t.Fatalf("%d leaves: common ancestor of %d and its ancestor %d is not the ancestor", leafCount, nodeIndex, pathNode)
+		}
+	}
+	if len(pathNodes) > 0 && pathNodes[len(pathNodes)-1] != root {
+		t.Fatalf("%d leaves: direct path of %d ends at %d, want the root %d", leafCount, nodeIndex, pathNodes[len(pathNodes)-1], root)
+	}
+
+	// copath: same length as the direct path, in range, and disjoint from the
+	// direct path and from the node itself.
+	copathNodes, err := Copath(nodeIndex, leafCount)
+	if err != nil {
+		t.Fatalf("%d leaves: copath of %d: %v", leafCount, nodeIndex, err)
+	}
+	if len(copathNodes) != len(pathNodes) {
+		t.Fatalf("%d leaves: copath of %d has %d nodes, direct path has %d", leafCount, nodeIndex, len(copathNodes), len(pathNodes))
+	}
+	for j, copathNode := range copathNodes {
+		if uint32(copathNode) >= nodeWidth {
+			t.Fatalf("%d leaves: copath of %d contains %d, outside width %d", leafCount, nodeIndex, copathNode, nodeWidth)
+		}
+		if copathNode == nodeIndex {
+			t.Fatalf("%d leaves: copath of %d contains the node itself", leafCount, nodeIndex)
+		}
+		for _, pathNode := range pathNodes {
+			if copathNode == pathNode {
+				t.Fatalf("%d leaves: copath of %d intersects its direct path at %d", leafCount, nodeIndex, copathNode)
+			}
+		}
+		if InSubtree(copathNode, nodeIndex) {
+			t.Fatalf("%d leaves: copath node %d contains %d", leafCount, copathNode, nodeIndex)
+		}
+		// each copath node is a child of the direct-path node at the same
+		// position.
+		copathParent, err := Parent(copathNode, leafCount)
+		if err != nil {
+			t.Fatalf("%d leaves: parent of copath node %d: %v", leafCount, copathNode, err)
+		}
+		if copathParent != pathNodes[j] {
+			t.Fatalf("%d leaves: copath node %d has parent %d, want direct-path node %d", leafCount, copathNode, copathParent, pathNodes[j])
+		}
+	}
+
+	// subtree span: the run of array slots the layout puts under this node,
+	// even at both ends and holding 2^level leaves.
+	//
+	// the endpoints are asserted and not only the containment the plan wrote.
+	// containment, evenness and a leaf width of 2^level together still admit a
+	// span shifted bodily along the array: the level-two node at index 3 spans
+	// [0, 6], and [2, 8] contains 3, is even at both ends and covers four
+	// leaves, so the plan's three rows pass it in any tree of eight leaves or
+	// more.
+	firstNode, lastNode := SubtreeSpan(nodeIndex)
+	wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf := spanOracle(level, block)
+	if firstNode != wantFirstNode || lastNode != wantLastNode {
+		t.Fatalf("%d leaves: span of %d is [%d, %d], want [%d, %d]", leafCount, nodeIndex, firstNode, lastNode, wantFirstNode, wantLastNode)
+	}
+	if firstNode > nodeIndex || lastNode < nodeIndex {
+		t.Fatalf("%d leaves: span of %d is [%d, %d]", leafCount, nodeIndex, firstNode, lastNode)
+	}
+	if uint32(lastNode) >= nodeWidth {
+		t.Fatalf("%d leaves: span of %d ends at %d, outside width %d", leafCount, nodeIndex, lastNode, nodeWidth)
+	}
+	if !firstNode.IsLeaf() || !lastNode.IsLeaf() {
+		t.Fatalf("%d leaves: span of %d is [%d, %d], want both ends on leaves", leafCount, nodeIndex, firstNode, lastNode)
+	}
+	firstLeaf, lastLeaf := SubtreeLeaves(nodeIndex)
+	if firstLeaf != wantFirstLeaf || lastLeaf != wantLastLeaf {
+		t.Fatalf("%d leaves: node %d covers leaves %d..%d, want %d..%d", leafCount, nodeIndex, firstLeaf, lastLeaf, wantFirstLeaf, wantLastLeaf)
+	}
+	if uint64(lastLeaf-firstLeaf)+1 != uint64(1)<<level {
+		t.Fatalf("%d leaves: node %d covers leaves %d..%d at level %d", leafCount, nodeIndex, firstLeaf, lastLeaf, level)
+	}
+
+	// the one resolution rule that needs no blank node: a non-blank node
+	// resolves to itself alone (RFC 9420 section 4.1).
+	resolvedNodes, err := Resolution(shape, nodeIndex)
+	if err != nil {
+		t.Fatalf("%d leaves: resolution of %d: %v", leafCount, nodeIndex, err)
+	}
+	if len(resolvedNodes) != 1 || resolvedNodes[0] != nodeIndex {
+		t.Fatalf("%d leaves: resolution of the non-blank node %d: %v", leafCount, nodeIndex, resolvedNodes)
+	}
+}
+
+// the root of a tree the sweep is about to walk, refused loudly rather than
+// carried as a zero into every row below it.
+func sweepRoot(t *testing.T, leafCount LeafCount) NodeIndex {
+	t.Helper()
+	root, err := Root(leafCount)
+	if err != nil {
+		t.Fatalf("%d leaves: root: %v", leafCount, err)
+	}
+	if uint32(root) >= NodeWidth(leafCount) {
+		t.Fatalf("%d leaves: root %d outside width %d", leafCount, root, NodeWidth(leafCount))
+	}
+	if root != nodeAt(TreeDepth(leafCount), 0) {
+		t.Fatalf("%d leaves: root %d, want %d", leafCount, root, nodeAt(TreeDepth(leafCount), 0))
+	}
+	return root
+}
+
+// the tree with nothing blank and no unmerged leaf.
+//
+// this is the shape whose resolution is the identity, so it is the one a tree
+// of any size can be asked about node by node. the shapes with blanks in them
+// cost a descent and are confined to the depths the sweep can walk whole.
+func populatedShape(leafCount LeafCount) *functionShape {
+	return &functionShape{shapeLeafCount: leafCount}
+}
+
+// the blocks a level is probed at where it is too wide to walk.
+//
+// the first and second block, the last and second to last, and one with
+// alternating bits, which is what separates a version right for an all-left or
+// all-right ancestor chain from one right for a chain that turns. the same five
+// the direct-path and copath sweeps in this file use, masked to the level.
+var invariantBlockProbes = []uint64{0, 1, 0xFFFFFFFF, 0xFFFFFFFE, 0xA5A5A5A5}
+
+// every node of a tree of the given depth.
+//
+// walked by array index rather than by (level, block), so the set walked is
+// every index the array holds and not a set the layout arithmetic produced. the
+// level and block are then derived on the test side and checked back against
+// the layout, which is what lets the row above hand the invariants a level the
+// implementation did not supply.
+func sweepEveryNode(t *testing.T, depth uint32) int64 {
+	t.Helper()
+	leafCount := LeafCount(1) << depth
+	root := sweepRoot(t, leafCount)
+	shape := populatedShape(leafCount)
+	walked := int64(0)
+	for i := uint32(0); i < NodeWidth(leafCount); i += 1 {
+		level, block := nodeLevelAndBlock(NodeIndex(i))
+		if nodeAt(level, block) != NodeIndex(i) {
+			t.Fatalf("%d leaves: node %d reads as level %d block %d, which is node %d", leafCount, i, level, block, nodeAt(level, block))
+		}
+		checkNodeInvariants(t, shape, depth, root, level, block)
+		walked += 1
+	}
+	return walked
+}
+
+// every node of the top levels of a tree of the given depth.
+//
+// a tree above 512 leaves cannot be walked whole — the largest holds 2^32-1
+// nodes — and the levels are not the same size, so the affordable exhaustive
+// unit is a level and not a tree. the top thirteen levels of any depth are
+// 2^13-1 nodes together, which is the same walk at depth 13 and at depth 31.
+func sweepTopLevels(t *testing.T, depth uint32) int64 {
+	t.Helper()
+	leafCount := LeafCount(1) << depth
+	root := sweepRoot(t, leafCount)
+	shape := populatedShape(leafCount)
+	walked := int64(0)
+	for level := invariantFirstLevel(depth); level <= depth; level += 1 {
+		for block := uint64(0); block < uint64(1)<<(depth-level); block += 1 {
+			checkNodeInvariants(t, shape, depth, root, level, block)
+			walked += 1
+		}
+	}
+	return walked
+}
+
+// the levels of a tree of the given depth that the band above leaves out, at
+// five blocks each.
+//
+// these are the wide levels — level 0 of the largest tree is 2^31 nodes — and
+// five blocks a level is what the rest of this file probes them at. the count
+// is the same at every level, so a level that has fewer blocks than probes
+// would repeat rather than drop out of the total, which is why the ladder stops
+// where the exhaustive band starts and never overlaps it.
+func sweepLevelLadder(t *testing.T, depth uint32) int64 {
+	t.Helper()
+	leafCount := LeafCount(1) << depth
+	root := sweepRoot(t, leafCount)
+	shape := populatedShape(leafCount)
+	walked := int64(0)
+	for level := uint32(0); level < invariantFirstLevel(depth); level += 1 {
+		blockMask := uint64(1)<<(depth-level) - 1
+		for _, probe := range invariantBlockProbes {
+			checkNodeInvariants(t, shape, depth, root, level, probe&blockMask)
+			walked += 1
+		}
+	}
+	return walked
+}
+
+// the leaves a tree of the given depth is asked about by the two shape bands:
+// every one of them where the tree is small enough to walk, and the same five
+// blocks the ladder uses above that.
+func invariantLeaves(depth uint32) []LeafIndex {
+	if depth <= 9 {
+		leaves := make([]LeafIndex, 0, 1<<depth)
+		for leaf := uint64(0); leaf < uint64(1)<<depth; leaf += 1 {
+			leaves = append(leaves, LeafIndex(leaf))
+		}
+		return leaves
+	}
+	leafMask := uint64(1)<<depth - 1
+	leaves := make([]LeafIndex, 0, len(invariantBlockProbes))
+	for _, probe := range invariantBlockProbes {
+		leaves = append(leaves, LeafIndex(probe&leafMask))
+	}
+	return leaves
+}
+
+// the shape rules on a tree with every leaf populated and every parent blank:
+// the root resolves to the leaves in order, and every leaf's filtered direct
+// path is its whole direct path.
+//
+// this is the plan's own shape band and it is bounded by its own cost rather
+// than by a choice: the resolution of the root of such a tree is every leaf, so
+// the walk is linear in the tree and a 2^31-leaf one is an hour. the depths
+// above 512 leaves get the populated shape below instead, whose resolutions are
+// O(1) and whose filtered paths are therefore askable at every depth.
+func sweepBlankParentShape(t *testing.T, depth uint32) int {
+	t.Helper()
+	leafCount := LeafCount(1) << depth
+	nodeWidth := NodeWidth(leafCount)
+	blankParents := &fixtureShape{
+		fixtureLeafCount:   leafCount,
+		blankNodes:         map[NodeIndex]bool{},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	for i := uint32(1); i < nodeWidth; i += 2 {
+		blankParents.blankNodes[NodeIndex(i)] = true
+	}
+
+	root := sweepRoot(t, leafCount)
+	rootResolution, err := Resolution(blankParents, root)
+	if err != nil {
+		t.Fatalf("%d leaves: root resolution: %v", leafCount, err)
+	}
+	if LeafCount(len(rootResolution)) != leafCount {
+		t.Fatalf("%d leaves: root resolution has %d nodes", leafCount, len(rootResolution))
+	}
+	for i, resolvedNode := range rootResolution {
+		if resolvedNode != LeafIndex(i).NodeIndex() {
+			t.Fatalf("%d leaves: root resolution position %d is %d, want %d", leafCount, i, resolvedNode, LeafIndex(i).NodeIndex())
+		}
+	}
+
+	checked := 0
+	for _, leaf := range invariantLeaves(depth) {
+		pathSteps, err := FilteredDirectPath(blankParents, leaf)
+		if err != nil {
+			t.Fatalf("%d leaves: filtered direct path of leaf %d: %v", leafCount, leaf, err)
+		}
+		if uint32(len(pathSteps)) != depth {
+			t.Fatalf("%d leaves: filtered direct path of leaf %d has %d steps, want %d", leafCount, leaf, len(pathSteps), depth)
+		}
+		for _, pathStep := range pathSteps {
+			parent, err := Parent(pathStep.CopathChild, leafCount)
+			if err != nil {
+				t.Fatalf("%d leaves: parent of copath child %d: %v", leafCount, pathStep.CopathChild, err)
+			}
+			if parent != pathStep.Node {
+				t.Fatalf("%d leaves: copath child %d is not a child of %d", leafCount, pathStep.CopathChild, pathStep.Node)
+			}
+			if InSubtree(pathStep.CopathChild, leaf.NodeIndex()) {
+				t.Fatalf("%d leaves: copath child %d contains leaf %d", leafCount, pathStep.CopathChild, leaf)
+			}
+		}
+		checked += 1
+	}
+	return checked
+}
+
+// the same two rules on a tree with nothing blank, at every depth.
+//
+// nothing is filtered out of such a path — every copath child resolves to
+// itself and so is never empty — so the step count is the depth and both fields
+// of every step are the layout's own. this is the band that carries the shape
+// rules from 1024 leaves to 2^31, which the blank-parent band above cannot
+// reach at any price a test suite can pay.
+func sweepPopulatedShape(t *testing.T, depth uint32) int {
+	t.Helper()
+	leafCount := LeafCount(1) << depth
+	shape := populatedShape(leafCount)
+
+	checked := 0
+	for _, leaf := range invariantLeaves(depth) {
+		pathSteps, err := FilteredDirectPath(shape, leaf)
+		if err != nil {
+			t.Fatalf("%d leaves: filtered direct path of leaf %d: %v", leafCount, leaf, err)
+		}
+		if uint32(len(pathSteps)) != depth {
+			t.Fatalf("%d leaves: filtered direct path of leaf %d has %d steps, want %d", leafCount, leaf, len(pathSteps), depth)
+		}
+		wantPath, wantCopath := pathOracle(0, uint64(leaf), depth)
+		for i, pathStep := range pathSteps {
+			if pathStep.Node != wantPath[i] || pathStep.CopathChild != wantCopath[i] {
+				t.Fatalf("%d leaves: filtered direct path of leaf %d step %d is {%d, %d}, want {%d, %d}",
+					leafCount, leaf, i, pathStep.Node, pathStep.CopathChild, wantPath[i], wantCopath[i])
+			}
+		}
+		checked += 1
+	}
+	return checked
+}
