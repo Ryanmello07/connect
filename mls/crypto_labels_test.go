@@ -3626,16 +3626,37 @@ func identifierUsesIn(self parsedSource, t *testing.T, name string, identifier s
 	return uses, assigned
 }
 
-// The frames of the receiving path that carry the info, and how often each may name it.
+// The frames of the receiving path that carry the info, the parameter each carries it in,
+// and how many times that parameter may be named.
 //
-// Once, in every one of them. That is the whole property: the info a caller demanded is
-// forwarded down the path unexamined and reaches the extract that hashes it, so there is
-// nowhere on the way for a frame to notice what it is holding. A band conditional on the
-// info names it twice, in the condition and in the call; a frame that dropped it names it
-// twice as well, or assigns to it. Neither is a shape any legitimate edit to these
-// functions has a reason to take.
-var labelledReceivingPathFrames = []string{
-	"HpkeOpenBase", "HpkeSetupBaseR", "hpkeKeySchedule", "hpkeKeyScheduleContext",
+// The property is that the info a caller demanded is forwarded down the path unexamined
+// until it reaches the extract that hashes it, so there is nowhere on the way for a frame
+// to notice what it is holding. A band conditional on the info names it once more than the
+// forwarding does, in its condition; a frame that dropped it either assigns to it or names
+// it again in a second call. Neither is a shape a legitimate edit to these functions has a
+// reason to take.
+//
+// The chain ends at hpkeLabeledExtract because below it is crypto/hkdf and the standard
+// library, and it names its ikm twice rather than once: the length goes into the capacity
+// of the preimage buffer and the bytes into the append. It is on the list at all because a
+// band written there is the last one in this tree that can still see the info, and it was
+// measured surviving every test in this package before this row existed. Nothing else in
+// the tree reads these bodies as shapes.
+//
+// hpkeLabeledExpand is deliberately not here. What reaches it on this path is the key
+// schedule context, which is one mode byte and two digests, so its length is 65 whatever
+// the info was: a band on it fires for every message or for none, and firing for every
+// message is what the published vectors are for.
+var labelledReceivingPathFrames = []struct {
+	name      string
+	parameter string
+	uses      int
+}{
+	{name: "HpkeOpenBase", parameter: "info", uses: 1},
+	{name: "HpkeSetupBaseR", parameter: "info", uses: 1},
+	{name: "hpkeKeySchedule", parameter: "info", uses: 1},
+	{name: "hpkeKeyScheduleContext", parameter: "info", uses: 1},
+	{name: "hpkeLabeledExtract", parameter: "ikm", uses: 2},
 }
 
 // A key schedule that drops the info it was handed at one length.
@@ -3679,15 +3700,15 @@ func hpkeKeyScheduleContext(suiteId []byte, info []byte) []byte {
 `
 
 func TestTheLabelledReceivingPathForwardsItsInfoUnexamined(t *testing.T) {
-	for _, name := range labelledReceivingPathFrames {
-		source := sourceDeclaringPackageFunction(t, name)
-		uses, assigned := identifierUsesIn(source, t, name, "info")
-		if uses != 1 {
-			t.Errorf("%s names its info %d times, want once: a frame that looks at the info is a frame that can drop it",
-				name, uses)
+	for _, frame := range labelledReceivingPathFrames {
+		source := sourceDeclaringPackageFunction(t, frame.name)
+		uses, assigned := identifierUsesIn(source, t, frame.name, frame.parameter)
+		if uses != frame.uses {
+			t.Errorf("%s names its %s %d times, want %d: a frame that looks at the info is a frame that can drop it",
+				frame.name, frame.parameter, uses, frame.uses)
 		}
 		if assigned {
-			t.Errorf("%s assigns to its info", name)
+			t.Errorf("%s assigns to its %s", frame.name, frame.parameter)
 		}
 	}
 	// and the counter reads each control as the different body it is, so a counter that
