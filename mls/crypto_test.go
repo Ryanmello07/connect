@@ -1252,6 +1252,14 @@ func assertEveryProviderCallLeavesItsArgumentsAlone(t *testing.T, crypto CryptoP
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
+	signaturePriv, signaturePub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("generate the key pair the signature rows are built over: %v", err)
+	}
+	signature, err := crypto.SignWithLabel(signaturePriv, "label", message)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
 	covered := []string{}
 	for _, testCase := range []struct {
 		name string
@@ -1290,6 +1298,20 @@ func assertEveryProviderCallLeavesItsArgumentsAlone(t *testing.T, crypto CryptoP
 			}
 			return plaintext
 		}},
+		{name: "SignWithLabel", call: func(take func([]byte) []byte) []byte {
+			produced, err := crypto.SignWithLabel(SignaturePrivateKey(take(signaturePriv)), "label", take(message))
+			if err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			return produced
+		}},
+		{name: "VerifyWithLabel", call: func(take func([]byte) []byte) []byte {
+			if err := crypto.VerifyWithLabel(SignaturePublicKey(take(signaturePub)), "label",
+				take(message), take(signature)); err != nil {
+				t.Errorf("VerifyWithLabel refused a signature it had just made, so this ran the refusal path")
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -1307,7 +1329,8 @@ func assertEveryProviderCallLeavesItsArgumentsAlone(t *testing.T, crypto CryptoP
 		}
 	}
 	assertCoversTheProviderSurface(t, "the argument immutability table", covered, map[string]string{
-		"Random": "is handed no bytes, only a count",
+		"Random":           "is handed no bytes, only a count",
+		"SignatureKeyPair": "is handed no bytes, only its provider's own reader",
 	})
 }
 
@@ -1695,14 +1718,14 @@ func providerMethodNames() []string {
 // at; TestProviderSizes is what holds them.
 var providerValueMethods = []string{"HashSize", "KeySize", "NonceSize", "Suite"}
 
-// The methods tasks 14 to 16 still owe, which refuse to be called rather than answering.
+// The methods tasks 15 and 16 still owe, which refuse to be called rather than answering.
 //
 // TestProviderStubsRefuseToBeCalled holds the refusal and reads this same list, so the
 // two cannot drift. Implementing one means taking it off here, and taking it off here is
 // what makes the invariants below demand it: a method that starts answering and is not
 // added to their tables fails the coverage gate instead of going unexamined.
 var providerStubMethods = []string{
-	"DeriveKeyPair", "HpkeOpen", "HpkeSeal", "SignWithLabel", "SignatureKeyPair", "VerifyWithLabel",
+	"DeriveKeyPair", "HpkeOpen", "HpkeSeal",
 }
 
 // One whole provider invariant's table, checked against the interface it is meant to
@@ -1855,6 +1878,10 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
+	signaturePriv, _, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("generate the key pair the signature row is built over: %v", err)
+	}
 	covered := []string{}
 	for _, testCase := range []struct {
 		name string
@@ -1883,6 +1910,20 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 			}
 			return plaintext
 		}},
+		{name: "SignWithLabel", call: func() []byte {
+			signature, err := crypto.SignWithLabel(signaturePriv, "label", []byte("content"))
+			if err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			return signature
+		}},
+		{name: "SignatureKeyPair", call: func() []byte {
+			priv, _, err := crypto.SignatureKeyPair()
+			if err != nil {
+				t.Fatalf("SignatureKeyPair: %v", err)
+			}
+			return priv
+		}},
 		{name: "Random", call: func() []byte { return crypto.Random(32) }},
 	} {
 		covered = append(covered, testCase.name)
@@ -1904,8 +1945,30 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 				testCase.name, held, first, testCase.name)
 		}
 	}
+	// the row above follows the private half, because a row can only follow one slice.
+	// the public half is checked here rather than left out: a generator answering out of
+	// storage it keeps would hand two callers the same public key as readily as the same
+	// seed, and neither is visible in any signature either of them makes.
+	firstPriv, firstPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	secondPriv, secondPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair a second time: %v", err)
+	}
+	if len(firstPub) == 0 || len(secondPub) == 0 {
+		t.Fatalf("SignatureKeyPair answered with no public key, so this shares nothing either")
+	}
+	if &firstPub[0] == &secondPub[0] {
+		t.Errorf("two key pairs answered out of the same public key storage")
+	}
+	if &firstPub[0] == &firstPriv[0] || &secondPub[0] == &secondPriv[0] {
+		t.Errorf("a key pair answered with a public key cut from its own private key")
+	}
 	assertCoversTheProviderSurface(t, "the fresh buffer table", covered, map[string]string{
-		"MacVerify": "answers with a bool, so there is no storage for it to share",
+		"MacVerify":       "answers with a bool, so there is no storage for it to share",
+		"VerifyWithLabel": "answers with an error, so there is no storage for it to share",
 	})
 }
 
@@ -1942,6 +2005,14 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
+	signaturePriv, signaturePub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("generate the key pair the signature rows are built over: %v", err)
+	}
+	signature, err := crypto.SignWithLabel(signaturePriv, "label", message)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
 	operations := []struct {
 		name string
 		call func() []byte
@@ -1975,6 +2046,19 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 			}
 			return plaintext
 		}},
+		{name: "SignWithLabel", call: func() []byte {
+			produced, err := crypto.SignWithLabel(signaturePriv, "label", message)
+			if err != nil {
+				return nil
+			}
+			return produced
+		}},
+		{name: "VerifyWithLabel", call: func() []byte {
+			if crypto.VerifyWithLabel(signaturePub, "label", message, signature) == nil {
+				return []byte{0x01}
+			}
+			return []byte{0x00}
+		}},
 	}
 	covered := []string{}
 	want := make([][]byte, len(operations))
@@ -1985,7 +2069,7 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 			t.Fatalf("%s answered with nothing before any goroutine started", operation.name)
 		}
 	}
-	assertCoversTheProviderSurface(t, "the concurrency table", append(covered, "Random"), nil)
+	assertCoversTheProviderSurface(t, "the concurrency table", append(covered, "Random", "SignatureKeyPair"), nil)
 
 	var waitGroup sync.WaitGroup
 	for i := 0; i < 32; i++ {
@@ -2000,13 +2084,19 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 					}
 				}
 				crypto.Random(32)
+				// the two draws from the provider's reader, which answer differently
+				// every time and so are exercised rather than compared
+				if _, _, err := crypto.SignatureKeyPair(); err != nil {
+					t.Errorf("SignatureKeyPair failed under concurrency: %v", err)
+					return
+				}
 			}
 		}()
 	}
 	waitGroup.Wait()
 }
 
-// The methods tasks 14 to 16 complete must refuse to be called until they are, rather
+// The methods tasks 15 and 16 complete must refuse to be called until they are, rather
 // than returning a zero value. A stub returning nil, nil from HpkeOpen would compile,
 // satisfy the interface, and be a total authentication bypass for anyone calling it in
 // the meantime. This is the counterpart of TestProviderHasNoRemainingStubs in task 16:
@@ -2024,9 +2114,6 @@ func TestProviderStubsRefuseToBeCalled(t *testing.T) {
 		name string
 		call func()
 	}{
-		{name: "SignWithLabel", call: func() { crypto.SignWithLabel(nil, "label", nil) }},
-		{name: "VerifyWithLabel", call: func() { crypto.VerifyWithLabel(nil, "label", nil, nil) }},
-		{name: "SignatureKeyPair", call: func() { crypto.SignatureKeyPair() }},
 		{name: "HpkeSeal", call: func() { crypto.HpkeSeal(nil, nil, nil, nil) }},
 		{name: "HpkeOpen", call: func() { crypto.HpkeOpen(nil, nil, nil, nil, nil) }},
 		{name: "DeriveKeyPair", call: func() { crypto.DeriveKeyPair(nil) }},
@@ -2164,8 +2251,12 @@ func (self *taggingCryptoProvider) Random(n int) []byte {
 }
 
 func (self *taggingCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
-	self.passedThrough("SignWithLabel")
-	return self.inner.SignWithLabel(priv, label, content)
+	signature, err := self.inner.SignWithLabel(priv, label, content)
+	if err != nil {
+		self.passedThrough("SignWithLabel")
+		return nil, err
+	}
+	return self.tagged("SignWithLabel", signature), nil
 }
 
 func (self *taggingCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label string, content []byte, sig []byte) error {
@@ -2188,19 +2279,28 @@ func (self *taggingCryptoProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, Hp
 	return self.inner.DeriveKeyPair(ikm)
 }
 
+// Both halves are flipped, so a construction reading either one of them answers
+// differently over this provider. Two entries land in the call log for one call, which the
+// log is fine with: it is read to explain a failure and never compared for length.
 func (self *taggingCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
-	self.passedThrough("SignatureKeyPair")
-	return self.inner.SignatureKeyPair()
+	priv, pub, err := self.inner.SignatureKeyPair()
+	if err != nil {
+		self.passedThrough("SignatureKeyPair")
+		return nil, nil, err
+	}
+	return SignaturePrivateKey(self.tagged("SignatureKeyPair", priv)),
+		SignaturePublicKey(self.tagged("SignatureKeyPair", pub)), nil
 }
 
 // The methods the tagging provider hands back unchanged, named with the reason rather than
-// left out. MacVerify is the only one of them that is not a stub, and it answers a bool:
-// there is nothing in a yes or a no for a flip to change, so a construction that routed a
-// comparison through it cannot be separated by a different answer. The stubs are skipped
+// left out. Neither of the two is a stub, and neither answers with bytes: there is nothing
+// in a yes, a no or a refusal for a flip to change, so a construction that routed a
+// comparison through either cannot be separated by a different answer. The stubs are skipped
 // by assertCoversTheProviderSurface itself, so implementing one is what makes the gate
 // below demand it be tagged.
 var taggingProviderPassesThrough = map[string]string{
-	"MacVerify": "answers a bool, and flipping has nothing to change in a yes or a no",
+	"MacVerify":       "answers a bool, and flipping has nothing to change in a yes or a no",
+	"VerifyWithLabel": "answers an error, and flipping has nothing to change in a refusal",
 }
 
 // The tagging provider really does answer differently, method by method.
@@ -2223,6 +2323,12 @@ func TestTheTaggingProviderAnswersDifferentlyThanTheRealOne(t *testing.T) {
 	sealed, err := plain.AeadSeal(key, nonce, []byte("aad"), []byte("plaintext"))
 	if err != nil {
 		t.Fatalf("seal the ciphertext the AeadOpen row reads: %v", err)
+	}
+	// drawn from the provider underneath rather than written out, so the row below is
+	// built over whatever length the suite fixes
+	signaturePriv, _, err := plain.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("generate the key the SignWithLabel row is built over: %v", err)
 	}
 	tagged := []string{}
 	for _, testCase := range []struct {
@@ -2253,6 +2359,20 @@ func TestTheTaggingProviderAnswersDifferentlyThanTheRealOne(t *testing.T) {
 				t.Fatalf("AeadOpen: %v", openErr)
 			}
 			return out
+		}},
+		{name: "SignWithLabel", call: func(crypto CryptoProvider) []byte {
+			signature, signErr := crypto.SignWithLabel(signaturePriv, "label", []byte("content"))
+			if signErr != nil {
+				t.Fatalf("SignWithLabel: %v", signErr)
+			}
+			return signature
+		}},
+		{name: "SignatureKeyPair", call: func(crypto CryptoProvider) []byte {
+			priv, pub, keyErr := crypto.SignatureKeyPair()
+			if keyErr != nil {
+				t.Fatalf("SignatureKeyPair: %v", keyErr)
+			}
+			return concatBytes(priv, pub)
 		}},
 		{name: "Random", call: func(crypto CryptoProvider) []byte { return crypto.Random(32) }},
 	} {
@@ -2546,6 +2666,9 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 	}{
 		{name: "mlsKdfLabel", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{mlsKdfLabel("label", take(value), 32)}
+		}},
+		{name: "mlsSignContent", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{mlsSignContent("label", take(value))}
 		}},
 		{name: "RefHash", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{RefHash(crypto, "MLS 1.0 a label", take(value))}

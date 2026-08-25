@@ -23,7 +23,13 @@
 // reference down.
 package mls
 
-import "github.com/urnetwork/connect/mls/syntax"
+import (
+	"bytes"
+	"crypto/ed25519"
+	"io"
+
+	"github.com/urnetwork/connect/mls/syntax"
+)
 
 // The domain separator every MLS label carries before serialization. The version is part
 // of it: a future MLS derives different secrets from the same transcript rather than
@@ -134,4 +140,98 @@ func MakeKeyPackageRef(crypto CryptoProvider, keyPackage []byte) []byte {
 // rather than only the proposed change.
 func MakeProposalRef(crypto CryptoProvider, authenticatedContent []byte) []byte {
 	return RefHash(crypto, ProposalRefLabel, authenticatedContent)
+}
+
+// struct { opaque label<V>; opaque content<V> } SignContent, serialized, with the
+// "MLS 1.0 " prefix on the label.
+//
+// The two length prefixes are what make a signature cover one reading of its input rather
+// than every reading. Without them a label ending where the content begins and a label one
+// byte longer serialize to the same run of bytes, so a signature made for one purpose is a
+// valid signature for another over content the signer never saw. That is not a difference
+// the primitive can notice: ed25519 signs whatever it is handed.
+//
+// The prefix is on the label here and not on RefHash's, which is not an inconsistency:
+// RFC 9420 section 5.2 writes the reference labels out with the prefix already inside
+// them, and section 5.1.2 writes this one without.
+//
+// No error return, by the interface spec A section 3.3 fixes on the two callers below.
+// See mlsLabelBytes for why the writer cannot fail here.
+func mlsSignContent(label string, content []byte) []byte {
+	writer := syntax.NewWriter()
+	writer.WriteOpaque([]byte(MlsLabelPrefix + label))
+	writer.WriteOpaque(content)
+	return mlsLabelBytes(writer)
+}
+
+// The RFC 9420 section 5.1.2 signature: ed25519 over the SignContent preimage rather than
+// over the content, so a signature is bound to the purpose it was made for.
+//
+// The private key is the 32 byte RFC 8032 seed, which is what MLS carries on the wire and
+// what the crypto-basics vectors supply. Go's ed25519.PrivateKey is the seed followed by
+// the public key, so the expansion happens here and the 64 byte form never leaves this
+// function; a caller holding one of those would be storing the public half twice and
+// would fail the length check on the way back in.
+//
+// The length is checked against the registry's NsigPriv rather than against
+// ed25519.SeedSize, so a suite whose signature scheme is not this one fails at the gate
+// instead of inside ed25519.NewKeyFromSeed, which panics on a seed of the wrong length.
+// TestEverySuiteNamesTheSignatureSchemeTheProviderComputes is what keeps the two in step.
+func (self *suiteCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
+	if len(priv) != self.params.NsigPriv {
+		return nil, ErrBadSignatureKey
+	}
+	return ed25519.Sign(ed25519.NewKeyFromSeed(priv), mlsSignContent(label, content)), nil
+}
+
+// The inverse, where a failure is always an error and never a logged warning (spec A
+// section 5.9, guardrail 7). The caller has no branch to take other than rejecting the
+// message, and there is no fallback preimage: a verify that tried the bare label, the
+// unframed concatenation or the content itself after this one would accept a signature
+// minted for another purpose, which is the whole thing the label exists to prevent.
+//
+// A wrong key length is ErrBadSignatureKey and a wrong signature length is
+// ErrCryptoBadSignature. That split is deliberate. The key is this side's own
+// configuration and the length of it is a local bug worth naming; the signature arrived
+// from the network, and how it failed is not something an attacker gets to learn.
+//
+// ErrCryptoBadSignature rather than ErrBadSignature: the bare name is errors.go's
+// ValSem010, and errors.go wraps this one, so a framing caller can ask either question.
+func (self *suiteCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label string, content []byte, sig []byte) error {
+	if len(pub) != self.params.NsigPub {
+		return ErrBadSignatureKey
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return ErrCryptoBadSignature
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), mlsSignContent(label, content), sig) {
+		return ErrCryptoBadSignature
+	}
+	return nil
+}
+
+// A fresh signature key pair, seeded from this provider's own source.
+//
+// The seed is read from self.random rather than from crypto/rand, which is what lets a
+// test assert that the bytes offered are the bytes used, in order, and lets an interop
+// failure reproduce byte for byte. ed25519.GenerateKey would be the obvious call and is
+// deliberately not made: it substitutes crypto/rand.Reader for a nil reader, so a provider
+// built over a caller's source that turned out to be nil would silently generate from the
+// operating system and the pinned case would stop reproducing. Reading here means a nil
+// source fails loudly instead.
+//
+// A short or failing source is an error rather than a panic, because this method has an
+// error return where Random does not. What it must never be is a key: a seed assembled
+// from a partial read is a tail of zeroes nobody chose, and it would sign and verify
+// perfectly.
+//
+// The public half is copied out of the expanded key rather than sliced from it, so the two
+// results share no storage with each other and neither shares any with the reader.
+func (self *suiteCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
+	seed := make([]byte, self.params.NsigPriv)
+	if _, err := io.ReadFull(self.random, seed); err != nil {
+		return nil, nil, err
+	}
+	expanded := ed25519.NewKeyFromSeed(seed)
+	return SignaturePrivateKey(seed), SignaturePublicKey(bytes.Clone(expanded[ed25519.SeedSize:])), nil
 }

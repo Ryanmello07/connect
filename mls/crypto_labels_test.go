@@ -59,10 +59,13 @@ package mls
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -72,14 +75,16 @@ import (
 	"github.com/urnetwork/connect/mls/syntax"
 )
 
-// One crypto-basics entry, reduced to the four constructions this file owns. The other
-// fields of the published object belong to task 14 and are not read here.
+// One crypto-basics entry, reduced to the five constructions this file owns. The
+// remaining field of the published object, encrypt_with_label, belongs to task 15 and is
+// not read here.
 type labelKatBasics struct {
 	CipherSuite      uint16                   `json:"cipher_suite"`
 	ExpandWithLabel  labelKatExpandWithLabel  `json:"expand_with_label"`
 	DeriveSecret     labelKatDeriveSecret     `json:"derive_secret"`
 	DeriveTreeSecret labelKatDeriveTreeSecret `json:"derive_tree_secret"`
 	RefHash          labelKatRefHash          `json:"ref_hash"`
+	SignWithLabel    labelKatSignWithLabel    `json:"sign_with_label"`
 }
 
 // An ExpandWithLabel known answer: every argument, and the bytes it must produce.
@@ -442,6 +447,18 @@ func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 			room: syntax.MaxVectorLength,
 			call: func(n int) { RefHash(crypto, "label", make([]byte, n)) },
 		},
+		{
+			name: "the sign content's content field",
+			room: syntax.MaxVectorLength,
+			call: func(n int) { mlsSignContent("label", make([]byte, n)) },
+		},
+		{
+			// sign content carries the "MLS 1.0 " prefix as the kdf label does, so its
+			// own boundary sits that many bytes below the limit
+			name: "the sign content's label field",
+			room: syntax.MaxVectorLength - len(MlsLabelPrefix),
+			call: func(n int) { mlsSignContent(strings.Repeat("x", n), nil) },
+		},
 	} {
 		if recovered := recoveredPanic(func() { testCase.call(testCase.room) }); recovered != nil {
 			t.Errorf("a labelled construction refused %s at the limit: %v", testCase.name, recovered)
@@ -477,6 +494,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		}
 	}
 	want := []string{
+		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
@@ -1271,3 +1289,509 @@ func MakeGroupedBytes(label, value []byte, length int) []byte { return nil }
 
 func MakeUnprovidedRef(value []byte) []byte { return nil }
 `
+
+// One SignWithLabel known answer: every argument, and the signature it must produce.
+//
+// Ed25519 is deterministic, so this is a byte for byte answer rather than something that
+// can only be verified against. That matters more here than anywhere else in this file:
+// signing and then verifying one's own signature passes for an implementation that
+// dropped the "MLS 1.0 " prefix, dropped either length prefix, transposed the two fields
+// or signed the content alone, and every one of those is a different protocol. The
+// published bytes are the only thing that separates them.
+//
+// The published private key is 32 bytes, which is also what says MLS carries the RFC 8032
+// seed rather than go's 64 byte seed followed by public key.
+type labelKatSignWithLabel struct {
+	Label     string `json:"label"`
+	Content   string `json:"content"`
+	Priv      string `json:"priv"`
+	Pub       string `json:"pub"`
+	Signature string `json:"signature"`
+}
+
+// The published signatures the corpus must contribute, counted for the same reason as
+// every other total here. crypto-basics publishes one sign_with_label answer per suite and
+// two of its seven suites are registered.
+const labelKatSignatureComparisons = 2
+
+func TestSignContentEncoding(t *testing.T) {
+	// SignContent is { opaque label<V>; opaque content<V> } and the label carries the
+	// "MLS 1.0 " prefix. These rows are read off RFC 9420 section 5.1.2 rather than
+	// published, so TestSignWithLabelMatchesTheCryptoBasicsVectors is the authority and
+	// this is what says which field moved when it fails.
+	for _, testCase := range []struct {
+		name    string
+		label   string
+		content []byte
+		want    []byte
+	}{
+		{
+			name:    "a two byte content",
+			label:   "FramedContentTBS",
+			content: []byte{0xbe, 0xef},
+			want: concatBytes([]byte{byte(len(MlsLabelPrefix + "FramedContentTBS"))},
+				[]byte(MlsLabelPrefix+"FramedContentTBS"), []byte{0x02, 0xbe, 0xef}),
+		},
+		{
+			// an empty content still writes its length byte, which is the one shape a
+			// round trip cannot see: with no content bytes the readings "field omitted"
+			// and "field present and empty" differ only by this 0x00.
+			name:    "an empty label and an empty content",
+			label:   "",
+			content: nil,
+			want:    concatBytes([]byte{byte(len(MlsLabelPrefix))}, []byte(MlsLabelPrefix), []byte{0x00}),
+		},
+		{
+			// a content of 64 bytes crosses into the two byte prefix, so a hand rolled
+			// single byte length encodes 0x40 here and describes a preimage 63 bytes long
+			name:    "a content at the two byte prefix boundary",
+			label:   "y",
+			content: bytes.Repeat([]byte{0x5a}, 64),
+			want: concatBytes([]byte{byte(len(MlsLabelPrefix + "y"))}, []byte(MlsLabelPrefix+"y"),
+				[]byte{0x40, 0x40}, bytes.Repeat([]byte{0x5a}, 64)),
+		},
+	} {
+		if got := mlsSignContent(testCase.label, testCase.content); !bytes.Equal(got, testCase.want) {
+			t.Errorf("%s: mlsSignContent = %x, want %x", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+// Where the boundary between the label and the content falls is part of what is signed.
+//
+// The four splits below are one run of bytes divided four ways, so an encoder that
+// dropped either length prefix produces the same preimage for all of them and one
+// signature covers all four readings. That is a signature bypass primitive rather than a
+// cosmetic difference: a peer that splits the run differently reads a leaf node signature
+// as a framed content signature over content the signer never saw.
+func TestSignContentSeparatesTheLabelFromTheContent(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	splits := []struct {
+		label   string
+		content []byte
+	}{
+		{label: "abc", content: []byte("de")},
+		{label: "abcd", content: []byte("e")},
+		{label: "ab", content: []byte("cde")},
+		{label: "abcde", content: nil},
+	}
+	preimages := [][]byte{}
+	signatures := [][]byte{}
+	for _, split := range splits {
+		// the rows really are one run of bytes divided differently, or the framing is not
+		// what separates them and this test proves something easier
+		unframed := concatBytes([]byte(MlsLabelPrefix+split.label), split.content)
+		if !bytes.Equal(unframed, []byte(MlsLabelPrefix+"abcde")) {
+			t.Fatalf("the split %q over %x concatenates to %x rather than to the one run of bytes",
+				split.label, split.content, unframed)
+		}
+		signature, err := crypto.SignWithLabel(priv, split.label, split.content)
+		if err != nil {
+			t.Fatalf("sign under %q: %v", split.label, err)
+		}
+		preimages = append(preimages, mlsSignContent(split.label, split.content))
+		signatures = append(signatures, signature)
+	}
+	for i := range splits {
+		for j := range splits {
+			if i != j && bytes.Equal(preimages[i], preimages[j]) {
+				t.Errorf("the splits %q and %q build the same preimage %x",
+					splits[i].label, splits[j].label, preimages[i])
+			}
+			err := crypto.VerifyWithLabel(pub, splits[j].label, splits[j].content, signatures[i])
+			if i == j && err != nil {
+				t.Errorf("the signature under %q was refused under its own split: %v", splits[i].label, err)
+			}
+			if i != j && !errors.Is(err, ErrCryptoBadSignature) {
+				t.Errorf("the signature under %q verified under the split %q: error = %v, want ErrCryptoBadSignature",
+					splits[i].label, splits[j].label, err)
+			}
+		}
+	}
+}
+
+// The one published pin on the whole SignContent construction, and the only thing in this
+// file that separates the encoding from every plausible variant of it.
+//
+// The comparison is against the published signature itself rather than against a verify,
+// because ed25519 is deterministic and the stronger comparison is available: a signer that
+// framed the preimage differently produces different bytes here even though it would go on
+// verifying against itself all day.
+func TestSignWithLabelMatchesTheCryptoBasicsVectors(t *testing.T) {
+	entries := []labelKatBasics{}
+	loadLabelKat(t, "crypto-basics.json", &entries)
+	compared := 0
+	for _, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		vector := entry.SignWithLabel
+		what := fmt.Sprintf("suite %#04x sign_with_label", uint16(suite))
+		priv := SignaturePrivateKey(mustDecodeHex(t, what+" priv", vector.Priv))
+		pub := SignaturePublicKey(mustDecodeHex(t, what+" pub", vector.Pub))
+		content := mustDecodeHex(t, what+" content", vector.Content)
+		published := mustDecodeHex(t, what+" signature", vector.Signature)
+		signature, err := crypto.SignWithLabel(priv, vector.Label, content)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		assertLabelKat(t, what, signature, vector.Signature)
+		compared++
+		// and the verifier accepts the published signature under the published key, which
+		// is what says it rebuilds the preimage the publisher signed rather than only the
+		// one this package's own signer builds
+		if err := crypto.VerifyWithLabel(pub, vector.Label, content, published); err != nil {
+			t.Errorf("%s: the published signature was refused: %v", what, err)
+		}
+		// and refuses it under a label the publisher did not sign under, over bytes this
+		// project did not compute
+		if err := crypto.VerifyWithLabel(pub, vector.Label+"x", content, published); !errors.Is(err, ErrCryptoBadSignature) {
+			t.Errorf("%s: the published signature verified under another label: error = %v, want ErrCryptoBadSignature",
+				what, err)
+		}
+	}
+	if compared != labelKatSignatureComparisons {
+		t.Fatalf("compared %d published signatures, want %d", compared, labelKatSignatureComparisons)
+	}
+}
+
+func TestSignatureRoundTrip(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	if len(priv) != 32 || len(pub) != 32 {
+		t.Fatalf("key sizes are %d/%d, want 32/32, the private key being the RFC 8032 seed",
+			len(priv), len(pub))
+	}
+	content := []byte("the signed content")
+	sig, err := crypto.SignWithLabel(priv, "LeafNodeTBS", content)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if len(sig) != 64 {
+		t.Fatalf("signature is %d bytes, want 64", len(sig))
+	}
+	if err := crypto.VerifyWithLabel(pub, "LeafNodeTBS", content, sig); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	// and a second key pair is a different key pair, so a generator answering with one
+	// fixed pair fails here rather than round tripping forever
+	otherPriv, otherPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair a second time: %v", err)
+	}
+	if bytes.Equal(priv, otherPriv) || bytes.Equal(pub, otherPub) {
+		t.Fatalf("two key pairs from the process entropy source repeated each other")
+	}
+}
+
+func TestSignatureIsLabelBound(t *testing.T) {
+	// a signature made under one label must not verify under another. without this the
+	// label is decoration and a leaf node signature could be replayed as a framed content
+	// signature.
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	content := []byte("the signed content")
+	sig, err := crypto.SignWithLabel(priv, "LeafNodeTBS", content)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if err := crypto.VerifyWithLabel(pub, "FramedContentTBS", content, sig); !errors.Is(err, ErrCryptoBadSignature) {
+		t.Fatalf("wrong label verified: error = %v, want ErrCryptoBadSignature", err)
+	}
+	if err := crypto.VerifyWithLabel(pub, "LeafNodeTBS", append(bytes.Clone(content), '!'), sig); !errors.Is(err, ErrCryptoBadSignature) {
+		t.Fatalf("wrong content verified: error = %v, want ErrCryptoBadSignature", err)
+	}
+	tampered := bytes.Clone(sig)
+	tampered[0] ^= 0x01
+	if err := crypto.VerifyWithLabel(pub, "LeafNodeTBS", content, tampered); !errors.Is(err, ErrCryptoBadSignature) {
+		t.Fatalf("tampered signature verified: error = %v, want ErrCryptoBadSignature", err)
+	}
+	// and a label that only extends the one signed under is refused as well, so a
+	// verifier comparing prefixes rather than the whole preimage is caught too
+	if err := crypto.VerifyWithLabel(pub, "LeafNodeTBS2", content, sig); !errors.Is(err, ErrCryptoBadSignature) {
+		t.Fatalf("an extended label verified: error = %v, want ErrCryptoBadSignature", err)
+	}
+}
+
+// Every alteration of what a verify is handed is refused, one at a time.
+//
+// A verify that returns nil for everything passes a test that signs and then verifies its
+// own signature, and it is the single worst defect this package could ship: every leaf
+// node, every commit and every proposal in the protocol is authenticated by this call. So
+// each of the four inputs is altered on its own, with a control row that must still be
+// accepted so the table cannot be satisfied by a verify that refuses everything either.
+func TestVerifyWithLabelRefusesEveryAlteration(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	otherPriv, otherPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair a second time: %v", err)
+	}
+	label := "LeafNodeTBS"
+	content := []byte("the signed content")
+	sig, err := crypto.SignWithLabel(priv, label, content)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	otherSig, err := crypto.SignWithLabel(otherPriv, label, content)
+	if err != nil {
+		t.Fatalf("sign under the other key: %v", err)
+	}
+	// the control first: what follows is only meaningful against a verify that accepts
+	// the one thing it should
+	if err := crypto.VerifyWithLabel(pub, label, content, sig); err != nil {
+		t.Fatalf("the signature this key made over this content was refused: %v", err)
+	}
+	refusals := 0
+	refuse := func(name string, key SignaturePublicKey, under string, over []byte, signature []byte) {
+		refusals++
+		if err := crypto.VerifyWithLabel(key, under, over, signature); !errors.Is(err, ErrCryptoBadSignature) {
+			t.Errorf("%s verified: error = %v, want ErrCryptoBadSignature", name, err)
+		}
+	}
+	// every byte of the signature, so a verify that reads only a prefix of it is caught
+	// wherever it stopped reading
+	for i := range sig {
+		altered := bytes.Clone(sig)
+		altered[i] ^= 0x80
+		refuse(fmt.Sprintf("a signature with byte %d altered", i), pub, label, content, altered)
+	}
+	// every byte of the content, for the same reason
+	for i := range content {
+		altered := bytes.Clone(content)
+		altered[i] ^= 0x20
+		refuse(fmt.Sprintf("content with byte %d altered", i), pub, label, altered, sig)
+	}
+	// every byte of the public key, which is what says the verify reads the whole key
+	// rather than enough of it to look right
+	for i := range pub {
+		altered := bytes.Clone(pub)
+		altered[i] ^= 0x01
+		refuse(fmt.Sprintf("a public key with byte %d altered", i), altered, label, content, sig)
+	}
+	refuse("another key's signature", pub, label, content, otherSig)
+	refuse("this signature under another key", otherPub, label, content, sig)
+	refuse("an all zero signature", pub, label, content, make([]byte, len(sig)))
+	refuse("a signature of every one bit", pub, label, content, bytes.Repeat([]byte{0xff}, len(sig)))
+	refuse("an empty content", pub, label, nil, sig)
+	if want := len(sig) + len(content) + len(pub) + 5; refusals != want {
+		t.Fatalf("the table refused %d alterations, want %d", refusals, want)
+	}
+}
+
+// A signature this key really made, over a preimage the verifier does not demand, is
+// refused.
+//
+// This is the direction a lenient verifier is invisible in, and the one this project has
+// already paid for: task 8's aad and info binding was walked in one direction only and
+// twelve lenient fallback mutants passed the whole suite. A verify that tries the bare
+// label, the unframed concatenation or the content itself after the real preimage fails
+// round trips, stays label bound, refuses every alteration above and matches the published
+// vector, and accepts every row here.
+func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	label := "LeafNodeTBS"
+	content := []byte("the signed content")
+	key := ed25519.NewKeyFromSeed(priv)
+	prefixed := []byte(MlsLabelPrefix + label)
+	demanded := mlsSignContent(label, content)
+	for _, testCase := range []struct {
+		name     string
+		preimage []byte
+	}{
+		{name: "the content alone", preimage: content},
+		{name: "the prefixed label alone", preimage: prefixed},
+		{name: "the prefixed label and the content, unframed", preimage: concatBytes(prefixed, content)},
+		{name: "the bare label and the content, unframed", preimage: concatBytes([]byte(label), content)},
+		{name: "SignContent over the bare label", preimage: concatBytes([]byte{byte(len(label))},
+			[]byte(label), []byte{byte(len(content))}, content)},
+		{name: "SignContent with the content's length prefix dropped", preimage: concatBytes(
+			[]byte{byte(len(prefixed))}, prefixed, content)},
+		{name: "SignContent with the label's length prefix dropped", preimage: concatBytes(
+			prefixed, []byte{byte(len(content))}, content)},
+		{name: "SignContent with its two fields transposed", preimage: concatBytes(
+			[]byte{byte(len(content))}, content, []byte{byte(len(prefixed))}, prefixed)},
+		{name: "the digest of SignContent", preimage: crypto.Hash(demanded)},
+	} {
+		if bytes.Equal(testCase.preimage, demanded) {
+			t.Errorf("%s is the preimage the verifier demands, so this row separates nothing", testCase.name)
+			continue
+		}
+		signature := ed25519.Sign(key, testCase.preimage)
+		if err := crypto.VerifyWithLabel(pub, label, content, signature); !errors.Is(err, ErrCryptoBadSignature) {
+			t.Errorf("a signature over %s verified: error = %v, want ErrCryptoBadSignature", testCase.name, err)
+		}
+	}
+	// the control: a signature over the preimage the verifier does demand is accepted, so
+	// the rows above cannot be satisfied by a verify that refuses everything
+	if err := crypto.VerifyWithLabel(pub, label, content, ed25519.Sign(key, demanded)); err != nil {
+		t.Errorf("the signature over the demanded preimage was refused: %v", err)
+	}
+}
+
+func TestSignatureRejectsWrongKeySizes(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	for _, n := range []int{0, 31, 33, 64} {
+		if _, err := crypto.SignWithLabel(make(SignaturePrivateKey, n), "x", nil); !errors.Is(err, ErrBadSignatureKey) {
+			t.Errorf("sign with a %d-byte key error = %v, want ErrBadSignatureKey", n, err)
+		}
+		if err := crypto.VerifyWithLabel(make(SignaturePublicKey, n), "x", nil, make([]byte, 64)); !errors.Is(err, ErrBadSignatureKey) {
+			t.Errorf("verify with a %d-byte key error = %v, want ErrBadSignatureKey", n, err)
+		}
+	}
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	for _, n := range []int{0, 63, 65} {
+		if err := crypto.VerifyWithLabel(pub, "x", nil, make([]byte, n)); !errors.Is(err, ErrCryptoBadSignature) {
+			t.Errorf("verify a %d-byte signature error = %v, want ErrCryptoBadSignature", n, err)
+		}
+	}
+	// a truncated or extended copy of a real signature is refused for the same reason,
+	// and it is the version a length check written after the verify would let through
+	sig, err := crypto.SignWithLabel(priv, "x", nil)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	for _, altered := range [][]byte{sig[:63], append(bytes.Clone(sig), 0x00)} {
+		if err := crypto.VerifyWithLabel(pub, "x", nil, altered); !errors.Is(err, ErrCryptoBadSignature) {
+			t.Errorf("a %d-byte copy of a real signature error = %v, want ErrCryptoBadSignature", len(altered), err)
+		}
+	}
+	// and the control: the lengths the suite does fix are accepted, so the rows above are
+	// not satisfied by a verify that refuses every signature it is handed
+	if err := crypto.VerifyWithLabel(pub, "x", nil, sig); err != nil {
+		t.Errorf("a key and a signature of the suite's own lengths were refused: %v", err)
+	}
+}
+
+// The seed a key pair is built from is drawn from the provider's reader, is exactly the
+// bytes that reader offered, and is drawn in order.
+//
+// This is the property a constant reader cannot see, and the one this project has now paid
+// for twice. Task 4's generator was tested against a constant reader, where reversing,
+// rotating and sorting the scalar are all the identity, and every one of those weakenings
+// passed. Task 11's entropy test asked only whether two providers disagree with each
+// other, and a process global counter passed all 113 tests. So the windows are asserted to
+// be none of their own permutations before anything is asserted with them.
+func TestSignatureKeyPairConsumesItsReaderInOrder(t *testing.T) {
+	script := randomScript(t)
+	firstSeed, secondSeed := script[:32], script[32:64]
+	assertProbeIsNotItsOwnPermutation(t, "the first seed window of the script", firstSeed)
+	assertProbeIsNotItsOwnPermutation(t, "the second seed window of the script", secondSeed)
+	if bytes.Equal(firstSeed, secondSeed) {
+		t.Fatalf("the two seed windows are equal, so a generator that restarted its reader would be invisible")
+	}
+	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, bytes.NewReader(script))
+	for _, want := range [][]byte{firstSeed, secondSeed} {
+		priv, pub, err := crypto.SignatureKeyPair()
+		if err != nil {
+			t.Fatalf("SignatureKeyPair: %v", err)
+		}
+		if !bytes.Equal(priv, want) {
+			t.Errorf("the seed drawn was %x, want the %x the reader offered", priv, want)
+		}
+		expanded := ed25519.NewKeyFromSeed(want)
+		if !bytes.Equal(pub, expanded[ed25519.SeedSize:]) {
+			t.Errorf("the public key was %x, want the %x that seed expands to", pub, expanded[ed25519.SeedSize:])
+		}
+	}
+	// two seeds of 32 leave 32 of the 96 byte script, so a generator that drew more than
+	// the seed it answered with has already moved the reader past them
+	if got := crypto.Random(32); !bytes.Equal(got, script[64:]) {
+		t.Errorf("after two key pairs the reader stood at %x, want %x", got, script[64:])
+	}
+}
+
+// A short or failing source must not yield a key pair. Unlike Random this method has an
+// error return, so the refusal is an error rather than a panic, and the keys alongside it
+// are nil: a caller that read the slices instead of the error would otherwise sign under a
+// seed of zeroes and report success.
+func TestSignatureKeyPairRefusesAShortOrFailingReader(t *testing.T) {
+	script := randomScript(t)
+	for _, testCase := range []struct {
+		name   string
+		reader io.Reader
+	}{
+		{name: "an exhausted reader", reader: bytes.NewReader(nil)},
+		{name: "a reader one byte short", reader: bytes.NewReader(script[:31])},
+		{name: "a reader that fails at once", reader: failingReader{err: errors.New("entropy source is down")}},
+		{name: "a reader that stalls then ends", reader: &dribblingReader{remaining: bytes.Clone(script[:7]), stalls: 2}},
+	} {
+		crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, testCase.reader)
+		priv, pub, err := crypto.SignatureKeyPair()
+		if err == nil {
+			t.Errorf("SignatureKeyPair over %s answered with a key pair instead of an error", testCase.name)
+		}
+		if priv != nil || pub != nil {
+			t.Errorf("SignatureKeyPair over %s answered with %d and %d bytes alongside its error",
+				testCase.name, len(priv), len(pub))
+		}
+	}
+	// the control: a reader with enough bytes must not be refused, or the table above is
+	// satisfied by a generator that refuses everything
+	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, bytes.NewReader(script))
+	if _, _, err := crypto.SignatureKeyPair(); err != nil {
+		t.Errorf("SignatureKeyPair over a sufficient reader failed: %v", err)
+	}
+	// and a provider handed no reader does not fall back to the process entropy source,
+	// which is exactly what crypto/ed25519.GenerateKey does when it is passed a nil one
+	substituting := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
+	if recovered := recoveredPanic(func() { substituting.SignatureKeyPair() }); recovered == nil {
+		t.Errorf("SignatureKeyPair over a nil reader answered, so it read something else")
+	}
+}
+
+// Every registered suite names the signature scheme this file computes.
+//
+// The two entries agree on ed25519 and on 32 byte keys, so nothing here can tell
+// self.params.NsigPriv from a literal 32 and no input separates a length check that reads
+// the registry from one that does not. A third suite naming another scheme would reach
+// ed25519.NewKeyFromSeed with a seed of the wrong length and panic inside the standard
+// library rather than being refused, so the guard reads the registry rather than this
+// file, in the shape TestEverySuiteNamesTheHashTheProviderComputes already uses for the
+// hash.
+func TestEverySuiteNamesTheSignatureSchemeTheProviderComputes(t *testing.T) {
+	suites := Suites()
+	if len(suites) == 0 {
+		t.Fatalf("the registry named no suite, so this gate checked nothing")
+	}
+	for _, suite := range suites {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up %#04x: %v", uint16(suite), err)
+		}
+		if params.SignatureId != SignatureSchemeEd25519 {
+			t.Errorf("%s names signature scheme %#04x, and this package signs with ed25519",
+				params.Name, params.SignatureId)
+		}
+		if params.NsigPriv != ed25519.SeedSize {
+			t.Errorf("%s fixes a %d byte private signature key, and ed25519 seeds are %d",
+				params.Name, params.NsigPriv, ed25519.SeedSize)
+		}
+		if params.NsigPub != ed25519.PublicKeySize {
+			t.Errorf("%s fixes a %d byte public signature key, and ed25519 public keys are %d",
+				params.Name, params.NsigPub, ed25519.PublicKeySize)
+		}
+	}
+}
