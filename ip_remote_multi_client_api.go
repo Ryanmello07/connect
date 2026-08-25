@@ -66,6 +66,8 @@ type ApiMultiClientGenerator struct {
 	specs          []*ProviderSpec
 	clientStrategy *ClientStrategy
 
+	// guarded by excludeLock; grows when the app removes a provider
+	excludeLock      sync.Mutex
 	excludeClientIds []Id
 
 	apiUrl      string
@@ -182,11 +184,31 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 	return self.NextDestinationsContext(self.ctx, count, excludeDestinations, rankMode)
 }
 
+// ExcludeClientIds is the current exclusion set: the client ids never returned
+// by discovery. Read on the enumerator goroutine, mutated by the app thread
+// (see ExcludeClientId), so it is snapshot under the lock.
+func (self *ApiMultiClientGenerator) ExcludeClientIds() []Id {
+	self.excludeLock.Lock()
+	defer self.excludeLock.Unlock()
+	return slices.Clone(self.excludeClientIds)
+}
+
+// ExcludeClientId implements MultiClientGeneratorExcluder. The exclusion lives
+// as long as this generator: a destination change builds a new generator, so
+// reconnecting gives every provider a clean slate.
+func (self *ApiMultiClientGenerator) ExcludeClientId(clientId Id) {
+	self.excludeLock.Lock()
+	defer self.excludeLock.Unlock()
+	if !slices.Contains(self.excludeClientIds, clientId) {
+		self.excludeClientIds = append(self.excludeClientIds, clientId)
+	}
+}
+
 // NextDestinationsContext implements MultiClientGeneratorContext. Discovery is
 // owned by the caller's maintenance deadline rather than only by the
 // generator's process-lifetime context.
 func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
-	excludeClientIds := slices.Clone(self.excludeClientIds)
+	excludeClientIds := self.ExcludeClientIds()
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
 		excludeDestinationsIds = append(excludeDestinationsIds, excludeDestination.Ids())
@@ -285,6 +307,7 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 				destinations[destination] = DestinationStats{
 					EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
 					Tier:                    provider.Tier,
+					Location:                provider.Location,
 				}
 			}
 		}
@@ -656,6 +679,20 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			case <-connectTimer.C:
 				// Keep the old transport: it is still a valid route, and the
 				// server's drain excuse/reconnect path remains the backstop.
+				// Disarm BEFORE closing the replacement so the close is the
+				// definitive "migration released" signal: the deferred disarm
+				// runs after this return, so an observer gating on the
+				// replacement's close (or a follow-up MigrateClientTransport)
+				// would otherwise see migrating still armed in the window
+				// between the close and the return. The defer re-clears
+				// idempotently.
+				func() {
+					self.transportLock.Lock()
+					defer self.transportLock.Unlock()
+					if self.transports[client] == state {
+						state.migrating = false
+					}
+				}()
 				next.Close()
 				return
 			}
