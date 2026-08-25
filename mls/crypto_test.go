@@ -4509,3 +4509,99 @@ func TestTheProcessEntropySourceIsReachableFromOneFile(t *testing.T) {
 			importing, cryptoRandImportPath, want, defaultConstructorName)
 	}
 }
+
+// A source that counts what was drawn through it. What it exists to see is a draw nobody
+// can see in an answer: an operation that reads bytes it does not use leaves a caller's
+// script one position further on than the caller believes, and every draw after it comes
+// out of the wrong place.
+type countingReader struct {
+	inner io.Reader
+	drawn int
+}
+
+// Reads through, counting what came back rather than what was asked for, so a source that
+// dribbles is counted by what it actually gave.
+func (self *countingReader) Read(p []byte) (int, error) {
+	read, err := self.inner.Read(p)
+	self.drawn += read
+	return read, err
+}
+
+// What each operation of the surface draws, in bytes, read out of the registry rather than
+// written as a literal so a suite with a different scalar or seed length is asked for the
+// right number. An operation absent here draws nothing at all.
+//
+// These are measurements, and the gate below compares them in both directions: an operation
+// that stops drawing fails, an operation that starts drawing fails, and an operation that
+// draws a different count fails. That is what separates it from the stream dependence the
+// stub gate measures, which reads answers rather than draws — an operation that drew a byte
+// and discarded it answers identically over two streams and is invisible there. Measured:
+// an AeadSeal with a self.Random(1) in it passed TestProviderHasNoRemainingStubs.
+var providerStreamDraws = map[string]func(params *SuiteParams) int{
+	"EncryptWithLabel": func(params *SuiteParams) int { return params.Nsk },
+	"HpkeSeal":         func(params *SuiteParams) int { return params.Nsk },
+	"SignatureKeyPair": func(params *SuiteParams) int { return params.NsigPriv },
+}
+
+// Every operation draws exactly the bytes it uses and no others.
+//
+// The count is the part of "the caller's reader is consumed exactly, in order" that reading
+// one answer cannot state. TestProviderRandomConsumesItsReaderInOrder holds the order and
+// the bytes for Random, and the seal and the key pair are held to the windows they land in;
+// what this adds is that nothing else on the surface touches the stream at all, so those
+// windows stay where a caller put them.
+//
+// Random is the one row read from the arguments rather than from the registry: what it draws
+// is what it was asked for, and the gate's own argument is where that number lives.
+func TestEveryProviderOperationDrawsExactlyWhatItUses(t *testing.T) {
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up %#04x: %v", uint16(suite), err)
+		}
+		arguments := providerStubArguments(t, params, mustProviderOver(t, suite, providerStubStream(0x80)))
+		probed := []string{}
+		drawing := []string{}
+		for _, operation := range providerOperations(t) {
+			probed = append(probed, operation.name)
+			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
+			counting := &countingReader{inner: providerStubStream(0x80)}
+			subject := mustProviderOver(t, suite, counting)
+			arguments[providerInterfaceName] = subject
+			bound := operation.bind(subject)
+			call := []reflect.Value{}
+			for i, parameter := range operation.parameters {
+				call = append(call, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
+			}
+			if _, recovered := providerStubCall(bound, call); recovered != nil {
+				t.Errorf("%s refused this gate's arguments: %v", where, recovered)
+				continue
+			}
+			want := 0
+			if operation.name == "Random" {
+				want = arguments["n"].(int)
+			} else if draw, held := providerStreamDraws[operation.name]; held {
+				want = draw(params)
+			}
+			if counting.drawn != want {
+				t.Errorf("%s drew %d bytes of the source, want %d", where, counting.drawn, want)
+			}
+			if counting.drawn != 0 {
+				drawing = append(drawing, operation.name)
+			}
+		}
+		assertCoversEveryProviderOperation(t, "TestEveryProviderOperationDrawsExactlyWhatItUses", probed)
+		slices.Sort(drawing)
+		// and what draws is what the stub gate measured as moving with the stream, so an
+		// operation that draws without its answer moving fails one of the two
+		if !slices.Equal(drawing, providerStreamDependentOperations) {
+			t.Errorf("suite %#04x drew from the source in %v, and the operations whose answer moves with it are %v",
+				uint16(suite), drawing, providerStreamDependentOperations)
+		}
+		for name := range providerStreamDraws {
+			if !slices.Contains(probed, name) {
+				t.Errorf("providerStreamDraws names %s, which is not an operation of this surface", name)
+			}
+		}
+	}
+}
