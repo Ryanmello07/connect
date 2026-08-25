@@ -1774,6 +1774,12 @@ var providerValueMethods = []string{"HashSize", "KeySize", "NonceSize", "Suite"}
 // uncovered in the same commit. The refusal itself no longer has a subject: task 15
 // implemented the last three, and the table that held them to panicking would now be a loop
 // over nothing.
+//
+// Since task 16 it is also read the other way round. TestProviderHasNoRemainingStubs fails
+// while this holds any name at all, because a provider with a method it refuses to answer
+// is the thing that test is named after -- so writing a name here to let a whole provider
+// invariant skip a method is a decision that shows up as a failing completeness gate rather
+// than as a quiet exemption.
 var providerStubMethods = []string{}
 
 // One whole provider invariant's table, checked against the interface it is meant to
