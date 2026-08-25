@@ -5988,19 +5988,23 @@ func TestFilteredDirectPathDropsAtEveryBlockOfASmallTree(t *testing.T) {
 // node at a time, so certifying that costs 2^(k+1)-1 queries at level k for
 // this implementation, for the oracle beside it, and for any other
 // implementation of this interface: nothing can conclude a subtree is empty
-// without looking at all of it. measured, every level up to this one at three
-// blocks each is four seconds; one level further would add two seconds, level
-// 30 thirty-six and level 31 seventy.
+// without looking at all of it. measured, every level up to this one at up to
+// five blocks each is 7.4 seconds; one level further would add a second and a
+// half a block, level 30 twelve seconds a block and level 31 twenty-four.
 //
 // so the drop arm is observed to this level and the keep arm to level 31, and
 // what that leaves open is a class and not nothing. a version that forces a
 // keep has no drop to disagree with above this level, or at a block of a level
-// this sweep does not build a drop at; a version that forces a drop is caught
-// by the keep arm at every level and every block it walks. the first version of
-// this sweep built its drop at block 0 alone and a keep forced at block 1 of
-// levels 13, 18, 20, 24 and 26 survived the whole package, which is why there
-// are three blocks here and not one. the task report states what is left as a
-// measured class rather than arguing it away.
+// no drop is built at; a version that forces a drop is caught by the keep arm,
+// which walks every level and, since a kept node costs one query wherever it
+// is, a far wider set of blocks than this sweep can pay for.
+//
+// the blocks here were not chosen once and left. the first version of this
+// sweep built its drop at block 0 alone, and a keep forced at block 1 of levels
+// 13, 18, 20, 24 and 26 passed the whole package on nodes the other sweeps do
+// walk; with three blocks, twenty versions survived at blocks 2 and 3. the task
+// report states what is left as a measured class per level and per block rather
+// than arguing it away.
 const filteredDropLevelCeiling = 26
 
 // the highest level a dropped node is the root of its own tree at.
@@ -6015,8 +6019,9 @@ const filteredDropRootCeiling = 20
 // the first two.
 //
 // a drop costs the same 2^(k+1)-1 at every block of a level, so the block count
-// is what the top of the band is paid for. four blocks to level 24 and two
-// above it is 3.4 seconds; four blocks all the way would be 4.7.
+// is what the top of the band is paid for: four named blocks and a strided one
+// to level 24 and two named and a strided one above it is 7.4 seconds, where
+// four named blocks all the way would be 9.6.
 const filteredDropFourBlockCeiling = 24
 
 // a shape whose blank nodes are exactly the subtree headed by one node, so that
