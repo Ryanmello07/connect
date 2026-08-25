@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -3223,4 +3224,820 @@ func TestProviderDeriveKeyPairMatchesTheRfcVectors(t *testing.T) {
 	if compared != providerDeriveKeyPairComparisons {
 		t.Fatalf("compared %d published key pairs, want %d", compared, providerDeriveKeyPairComparisons)
 	}
+}
+
+// One declared parameter of an operation this gate calls, as the source writes it. The
+// name is what an argument is resolved by and the type is what it is converted to, so a
+// parameter the source renames or retypes stops resolving rather than quietly keeping
+// the value the old spelling had.
+type providerParameter struct {
+	name     string
+	typeName string
+}
+
+// One operation a caller reaches through the provider: an interface method bound to one,
+// or a package level construction handed one. Both are called through reflect, so the
+// argument list is built from the declaration rather than written out per call site.
+type providerOperation struct {
+	name       string
+	parameters []providerParameter
+	// The operation over one provider, ready to Call. For a method this is the bound
+	// method; for a construction it is the function, whose CryptoProvider parameter the
+	// argument builder fills with the same provider.
+	bind func(crypto CryptoProvider) reflect.Value
+}
+
+// The parameters of one declared signature, refusing an unnamed one rather than skipping
+// it. An argument is resolved by name here, so a parameter with no name is a parameter
+// this gate would silently hand a zero value to — and a zero argument is exactly the
+// input a stub is indistinguishable under.
+func parametersOf(t *testing.T, parsed parsedSource, owner string, signature *ast.FuncType) []providerParameter {
+	t.Helper()
+	parameters := []providerParameter{}
+	for _, field := range signature.Params.List {
+		if len(field.Names) == 0 {
+			t.Fatalf("a parameter of %s is unnamed, so this gate cannot resolve an argument for it", owner)
+		}
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				t.Fatalf("a parameter of %s is written _, so this gate cannot resolve an argument for it", owner)
+			}
+			parameters = append(parameters, providerParameter{name: name.Name, typeName: parsed.render(field.Type)})
+		}
+	}
+	return parameters
+}
+
+// The interface's own methods, with the parameter names the declaration gives them.
+//
+// The file holding the declaration is found rather than named. A gate that opens one
+// filename is the defect task 12 paid for, and it is silent: the gate finds its subject,
+// reads it, and reports the clean run a complete gate reports while the declaration has
+// moved next door. Exactly one file may declare it, so a second declaration is a failure
+// rather than a coin toss over which one is read.
+//
+// The result is cross checked against reflect. The parse tree carries the names and
+// reflect carries the types the calls are actually made through; a method in one and not
+// the other means this gate is calling a surface that is not the one the compiler sees.
+func providerInterfaceMethods(t *testing.T) []providerOperation {
+	t.Helper()
+	methods := []providerOperation{}
+	declaring := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			types, isTypeDeclaration := declaration.(*ast.GenDecl)
+			if !isTypeDeclaration || types.Tok != token.TYPE {
+				continue
+			}
+			for _, specification := range types.Specs {
+				named, isNamed := specification.(*ast.TypeSpec)
+				if !isNamed || named.Name.Name != providerInterfaceName {
+					continue
+				}
+				declared, isInterface := named.Type.(*ast.InterfaceType)
+				if !isInterface {
+					t.Fatalf("%s in %s is not an interface", providerInterfaceName, path)
+				}
+				declaring = append(declaring, path)
+				for _, field := range declared.Methods.List {
+					signature, isSignature := field.Type.(*ast.FuncType)
+					if !isSignature || len(field.Names) != 1 {
+						t.Fatalf("%s in %s holds an embedded member this gate cannot read", providerInterfaceName, path)
+					}
+					name := field.Names[0].Name
+					methods = append(methods, providerOperation{
+						name:       name,
+						parameters: parametersOf(t, parsed, name, signature),
+						bind: func(crypto CryptoProvider) reflect.Value {
+							return reflect.ValueOf(crypto).MethodByName(name)
+						},
+					})
+				}
+			}
+		}
+	}
+	if len(declaring) != 1 {
+		t.Fatalf("%d files of this package declare %s, want exactly 1: %v", len(declaring), providerInterfaceName, declaring)
+	}
+	read := []string{}
+	for _, method := range methods {
+		read = append(read, method.name)
+	}
+	slices.Sort(read)
+	if !slices.Equal(read, providerMethodNames()) {
+		t.Fatalf("the parse tree reads %v out of %s and the compiler sees %v",
+			read, providerInterfaceName, providerMethodNames())
+	}
+	return methods
+}
+
+// The package level constructions handed a provider, by the same reading.
+//
+// A construction here cannot be called through a name the way a method can, so each one
+// needs a value written down. That list is not what decides the class: the class is read
+// off the parse tree, and a construction with no value is a failure rather than a row
+// left out. A later task adding a sixth construction that takes a provider fails here
+// until somebody writes its name, which is the point.
+var providerConstructionValues = map[string]any{
+	"RefHash":           RefHash,
+	"MakeKeyPackageRef": MakeKeyPackageRef,
+	"MakeProposalRef":   MakeProposalRef,
+	"EncryptWithLabel":  EncryptWithLabel,
+	"DecryptWithLabel":  DecryptWithLabel,
+}
+
+// The name of the interface every gate in this file is written about, in one place so a
+// rename is one edit rather than a matcher that stops matching.
+const providerInterfaceName = "CryptoProvider"
+
+// Every construction of this package's non test source that takes a provider, with the
+// parameter names the declaration gives them.
+func providerConstructions(t *testing.T) []providerOperation {
+	t.Helper()
+	constructions := []providerOperation{}
+	found := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil {
+				continue
+			}
+			parameters := parametersOf(t, parsed, function.Name.Name, function.Type)
+			takesProvider := false
+			for _, parameter := range parameters {
+				if parameter.typeName == providerInterfaceName {
+					takesProvider = true
+				}
+			}
+			if !takesProvider {
+				continue
+			}
+			name := function.Name.Name
+			implementation, written := providerConstructionValues[name]
+			if !written {
+				t.Fatalf("%s takes a %s and providerConstructionValues holds no value for it, so this gate cannot call it",
+					name, providerInterfaceName)
+			}
+			found = append(found, name)
+			constructions = append(constructions, providerOperation{
+				name:       name,
+				parameters: parameters,
+				bind: func(crypto CryptoProvider) reflect.Value {
+					return reflect.ValueOf(implementation)
+				},
+			})
+		}
+	}
+	slices.Sort(found)
+	if !slices.Equal(found, packageLevelFunctionsTaking(t, providerInterfaceName)) {
+		t.Fatalf("this gate reads %v as the constructions taking a %s and the package level scan reads %v",
+			found, providerInterfaceName, packageLevelFunctionsTaking(t, providerInterfaceName))
+	}
+	for name := range providerConstructionValues {
+		if !slices.Contains(found, name) {
+			t.Errorf("providerConstructionValues names %s, which is not a construction of this package taking a %s",
+				name, providerInterfaceName)
+		}
+	}
+	return constructions
+}
+
+// Every operation this gate calls, both surfaces together.
+func providerOperations(t *testing.T) []providerOperation {
+	t.Helper()
+	return slices.Concat(providerInterfaceMethods(t), providerConstructions(t))
+}
+
+// The byte stream every provider in this gate draws from. It is a reader over a fixed
+// script rather than a constant, because a constant source cannot separate a Random that
+// returns what it read from one that sorts, reverses or rotates it -- the defect this
+// package shipped once already -- and every call here is made over a freshly built reader
+// so two calls that differ only in an argument really do differ only in that argument.
+func providerStubStream(first byte) io.Reader {
+	return bytes.NewReader(ascendingBytes(first, 4096))
+}
+
+// The base arguments every operation is called with, keyed by the spelling that resolves
+// them: a declared type name where the type says which value belongs there, and a
+// parameter name where it does not. The lengths come from the registry rather than from
+// literals or from the provider, so a suite whose key or nonce is a different size is
+// called correctly, and a size method that is itself a stub cannot shrink the arguments
+// every other row is built out of.
+//
+// Four parameter names are deliberately absent from the generic half. A ciphertext, a
+// kemOutput, a tag and a sig are answers rather than inputs, and the same spelling means a
+// different value in each operation that receives one. Each is written per operation
+// below, so a later method taking one of them fails to resolve rather than being handed
+// another operation's answer, which would fail for a reason that is not the one this gate
+// is about.
+func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvider) map[string]any {
+	t.Helper()
+	arguments := map[string]any{
+		providerInterfaceName:  crypto,
+		"data":                 ascendingBytes(0x10, 48),
+		"key":                  ascendingBytes(0x20, params.Nk),
+		"nonce":                ascendingBytes(0x30, params.Nn),
+		"salt":                 ascendingBytes(0x40, 40),
+		"ikm":                  ascendingBytes(0x50, 32),
+		"prk":                  ascendingBytes(0x60, params.Nh),
+		"secret":               ascendingBytes(0x70, params.Nh),
+		"info":                 ascendingBytes(0x80, 24),
+		"aad":                  ascendingBytes(0x90, 16),
+		"plaintext":            ascendingBytes(0xa0, 20),
+		"content":              ascendingBytes(0xb0, 28),
+		"context":              ascendingBytes(0xc0, 36),
+		"value":                ascendingBytes(0xd0, 44),
+		"keyPackage":           ascendingBytes(0xe0, 52),
+		"authenticatedContent": ascendingBytes(0xf0, 60),
+		"label":                "stub gate label",
+		"length":               32,
+		"n":                    32,
+		"generation":           uint32(7),
+	}
+	// the keys and the answers the receiving operations are handed, computed over a
+	// provider of this gate's own so that the operation under test still draws from a
+	// stream nothing has consumed
+	fixture := mustProviderOver(t, params.Suite, providerStubStream(0x01))
+	signaturePriv, signaturePub, err := fixture.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("generate the signature key pair every row is built over: %v", err)
+	}
+	hpkePriv, hpkePub, err := fixture.DeriveKeyPair(arguments["ikm"].([]byte))
+	if err != nil {
+		t.Fatalf("derive the hpke key pair every row is built over: %v", err)
+	}
+	arguments["SignaturePrivateKey"] = signaturePriv
+	arguments["SignaturePublicKey"] = signaturePub
+	arguments["HpkePrivateKey"] = hpkePriv
+	arguments["HpkePublicKey"] = hpkePub
+	arguments["MacVerify.tag"] = fixture.Mac(arguments["key"].([]byte), arguments["data"].([]byte))
+	signature, err := fixture.SignWithLabel(signaturePriv, arguments["label"].(string), arguments["content"].([]byte))
+	if err != nil {
+		t.Fatalf("sign the content the VerifyWithLabel row reads: %v", err)
+	}
+	arguments["VerifyWithLabel.sig"] = signature
+	sealed, err := fixture.AeadSeal(arguments["key"].([]byte), arguments["nonce"].([]byte),
+		arguments["aad"].([]byte), arguments["plaintext"].([]byte))
+	if err != nil {
+		t.Fatalf("seal the ciphertext the AeadOpen row reads: %v", err)
+	}
+	arguments["AeadOpen.ciphertext"] = sealed
+	kemOutput, hpkeSealed, err := fixture.HpkeSeal(hpkePub, arguments["info"].([]byte),
+		arguments["aad"].([]byte), arguments["plaintext"].([]byte))
+	if err != nil {
+		t.Fatalf("seal the message the HpkeOpen row reads: %v", err)
+	}
+	arguments["HpkeOpen.kemOutput"] = kemOutput
+	arguments["HpkeOpen.ciphertext"] = hpkeSealed
+	labelledKemOutput, labelledCiphertext, err := EncryptWithLabel(fixture, hpkePub,
+		arguments["label"].(string), arguments["context"].([]byte), arguments["plaintext"].([]byte))
+	if err != nil {
+		t.Fatalf("seal the message the DecryptWithLabel row reads: %v", err)
+	}
+	arguments["DecryptWithLabel.kemOutput"] = labelledKemOutput
+	arguments["DecryptWithLabel.ciphertext"] = labelledCiphertext
+	return arguments
+}
+
+// One parameter's base argument. The most specific spelling wins: an answer written for
+// this operation, then the declared type where the type decides which value belongs, then
+// the parameter name. A parameter none of the three resolves is fatal rather than skipped,
+// which is what makes a method added tomorrow fail this gate without anybody editing it.
+func providerStubArgument(t *testing.T, arguments map[string]any, operation string, parameter providerParameter, want reflect.Type) reflect.Value {
+	t.Helper()
+	for _, key := range []string{operation + "." + parameter.name, parameter.typeName, parameter.name} {
+		value, resolved := arguments[key]
+		if !resolved {
+			continue
+		}
+		found := reflect.ValueOf(value)
+		if found.Type() == want {
+			return found
+		}
+		if !found.Type().ConvertibleTo(want) {
+			t.Fatalf("the argument for %s.%s resolved as %s and the parameter is %s",
+				operation, parameter.name, found.Type(), want)
+		}
+		return found.Convert(want)
+	}
+	t.Fatalf("no base argument resolves %s.%s, declared %s, so this gate cannot call it",
+		operation, parameter.name, parameter.typeName)
+	return reflect.Value{}
+}
+
+// One argument, changed in the smallest way that leaves its shape alone.
+//
+// The length is preserved on purpose. An operation that reads only how many bytes it was
+// handed is a stub of exactly the kind this gate is about, a correctly sized answer that is
+// a function of nothing, and a perturbation that changed the length would separate it from
+// a real implementation for the wrong reason. A kind with no rule here is fatal, so a
+// method taking an argument this gate does not know how to move fails rather than being
+// called twice with the identical value and reported as observing it.
+func perturbedArgument(t *testing.T, operation string, parameter providerParameter, argument reflect.Value) reflect.Value {
+	t.Helper()
+	switch argument.Kind() {
+	case reflect.Slice:
+		if argument.Type().Elem().Kind() != reflect.Uint8 {
+			break
+		}
+		if argument.Len() == 0 {
+			t.Fatalf("the base argument for %s.%s is empty, so perturbing it changes nothing", operation, parameter.name)
+		}
+		moved := reflect.MakeSlice(argument.Type(), argument.Len(), argument.Len())
+		reflect.Copy(moved, argument)
+		last := argument.Len() - 1
+		moved.Index(last).SetUint(moved.Index(last).Uint() ^ 0xff)
+		return moved
+	case reflect.String:
+		text := argument.String()
+		if text == "" {
+			t.Fatalf("the base argument for %s.%s is empty, so perturbing it changes nothing", operation, parameter.name)
+		}
+		moved := reflect.New(argument.Type()).Elem()
+		moved.SetString(text[:len(text)-1] + string(rune(text[len(text)-1]^0x20)))
+		return moved
+	case reflect.Int:
+		moved := reflect.New(argument.Type()).Elem()
+		moved.SetInt(argument.Int() + 1)
+		return moved
+	case reflect.Uint32:
+		moved := reflect.New(argument.Type()).Elem()
+		moved.SetUint(argument.Uint() + 1)
+		return moved
+	case reflect.Interface:
+		if argument.Type() != reflect.TypeOf((*CryptoProvider)(nil)).Elem() {
+			break
+		}
+		// the tagging provider answers differently method by method, which
+		// TestTheTaggingProviderAnswersDifferentlyThanTheRealOne holds it to, so a
+		// construction that computed its answer without the provider it was handed
+		// reports here as a parameter nothing observes
+		return reflect.ValueOf(CryptoProvider(&taggingCryptoProvider{inner: argument.Interface().(CryptoProvider)}))
+	}
+	t.Fatalf("no perturbation is written for %s.%s, declared %s", operation, parameter.name, parameter.typeName)
+	return reflect.Value{}
+}
+
+// One call, with a panic caught rather than taken. A method that still refuses to be
+// called is exactly what this gate is looking for, and a test binary that died on the
+// first one would report nothing about the twenty operations after it.
+func providerStubCall(call reflect.Value, arguments []reflect.Value) (results []reflect.Value, recovered any) {
+	defer func() { recovered = recover() }()
+	return call.Call(arguments), nil
+}
+
+// A call's whole answer as text, so two calls are compared by everything they returned
+// rather than by the one result somebody thought to read. A refusal is part of the answer:
+// an operation whose argument moved from accepted to rejected has observed that argument
+// just as surely as one whose bytes changed.
+func providerStubAnswer(results []reflect.Value) string {
+	rendered := []string{}
+	for _, result := range results {
+		if result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Uint8 {
+			rendered = append(rendered, hex.EncodeToString(result.Bytes()))
+			continue
+		}
+		rendered = append(rendered, fmt.Sprint(result.Interface()))
+	}
+	return strings.Join(rendered, " ")
+}
+
+// The results of a base call that are indistinguishable from a stub's, named one by one.
+//
+// This is the half of the gate that a plausible zero value has to get past. A method
+// returning a correctly sized run of zeroes, a nil slice with a nil error, a false, or a
+// zero length satisfies every type level check and every compile assertion in this
+// package, and it is the shape a stub takes when somebody writes one to keep the build
+// green rather than to fail loudly.
+func providerStubZeroResults(results []reflect.Value) []string {
+	zero := []string{}
+	for i, result := range results {
+		position := "result " + strconv.Itoa(i)
+		switch {
+		case result.Type() == reflect.TypeOf((*error)(nil)).Elem():
+			if !result.IsNil() {
+				zero = append(zero, position+" is the error "+fmt.Sprint(result.Interface()))
+			}
+		case result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Uint8:
+			bytesOut := result.Bytes()
+			if len(bytesOut) == 0 {
+				zero = append(zero, position+" is empty")
+				continue
+			}
+			if !slices.ContainsFunc(bytesOut, func(b byte) bool { return b != 0 }) {
+				zero = append(zero, position+" is "+strconv.Itoa(len(bytesOut))+" zero bytes")
+			}
+		case result.Kind() == reflect.Bool:
+			if !result.Bool() {
+				zero = append(zero, position+" is false")
+			}
+		case result.CanInt():
+			if result.Int() == 0 {
+				zero = append(zero, position+" is zero")
+			}
+		case result.CanUint():
+			if result.Uint() == 0 {
+				zero = append(zero, position+" is zero")
+			}
+		default:
+			zero = append(zero, position+" is a "+result.Type().String()+", which this gate has no zero value rule for")
+		}
+	}
+	return zero
+}
+
+// The operations whose answer moves when the provider's byte stream does, measured rather
+// than assumed. Nothing is drawn anywhere else in this package, so this is the whole of
+// what randomness reaches, and the gate compares the measurement against this list in both
+// directions: an operation that stopped drawing fails here, and so does one that started.
+//
+// The first direction is what a stub trips. A Random that answered make([]byte, n) is a
+// function of its argument and nothing else, so it passes every perturbation this gate
+// makes and reports here as an operation that no longer reads the stream it was given.
+var providerStreamDependentOperations = []string{
+	"EncryptWithLabel",
+	"HpkeSeal",
+	"Random",
+	"SignatureKeyPair",
+}
+
+// The operations with no argument to move and no draw to make, each with the registry
+// field it must answer. There is nothing for a perturbation to observe in a method that
+// takes nothing and reads nothing, so what separates these from a stub is the suite
+// parameters, read out of the registry rather than out of the provider.
+//
+// The registry is the weaker of the two available gates and it is worth being exact about
+// that: it catches a zero, a hardcoded wrong constant and a method answering out of the
+// wrong field, and it cannot catch a registry entry that is itself wrong. TestProviderSizes
+// is what holds the registry, against literals rather than against itself.
+var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
+	"HashSize":  func(params *SuiteParams) any { return params.Nh },
+	"KeySize":   func(params *SuiteParams) any { return params.Nk },
+	"NonceSize": func(params *SuiteParams) any { return params.Nn },
+	"Suite":     func(params *SuiteParams) any { return params.Suite },
+}
+
+// Every operation on both surfaces is covered, with nothing skipped and nothing excused.
+//
+// The other coverage gate in this file lets a value method and a stub method out, because
+// what it covers is byte behaviour and neither has any. This one is about whether an
+// operation is implemented at all, so there is no such thing as a method it need not
+// reach, and there is no excusal map to write a name into.
+func assertCoversEveryProviderOperation(t *testing.T, gate string, probed []string) {
+	t.Helper()
+	want := slices.Concat(providerMethodNames(), packageLevelFunctionsTaking(t, providerInterfaceName))
+	slices.Sort(want)
+	got := slices.Clone(probed)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s reached %v, want %v", gate, got, want)
+	}
+}
+
+// The provider is completely implemented, for every registered suite, and no operation on
+// it is a placeholder.
+//
+// What "not a stub" means here is operational and it is worth writing down, because the
+// obvious readings are weaker than they look. Calling every method and checking that none
+// panicked -- the shape this gate was planned as -- is satisfied by every method that
+// returns a correctly sized run of zeroes, which is what a stub written to keep the build
+// green actually looks like. Checking that an answer is not the zero value is satisfied by
+// a constant. What is asserted instead is that every declared input of every operation is
+// observed in its answer: the operation is called once over a fixed byte stream, then once
+// per parameter with that parameter moved by a byte and everything else identical, and the
+// two answers must differ. A stub cannot pass that, because a stub is by construction a
+// function of fewer of its inputs than it declares.
+//
+// What that misses, stated rather than left for a reader to discover: an operation that is
+// a function of all of its inputs and computes the wrong one. Every input is observed, the
+// answers all differ, and this gate is silent. That class is the published vectors' --
+// RFC 4231 for the mac, RFC 5869 for the kdf, FIPS 180-4 for the hash, the vendored RFC
+// 9180 corpus for the aead and the whole hpke path, and the labelled constructions against
+// crypto-basics when p8 vendors it -- and it is why a stub gate is not a correctness gate.
+// It also misses an operation that observes each input separately but not jointly, for the
+// same reason and held by the same corpora.
+//
+// The two calls being compared are made over separately built readers holding the same
+// script, so the three operations that draw are deterministic across the pair and a
+// difference is attributable to the parameter that moved rather than to the entropy. The
+// control at the top of each row is what says so: the base call repeated over a fresh
+// reader must give the identical answer, and without it every row below would pass on a
+// provider whose answers were simply never twice the same.
+func TestProviderHasNoRemainingStubs(t *testing.T) {
+	if len(providerStubMethods) != 0 {
+		t.Errorf("providerStubMethods names %v, so the provider still refuses to answer somewhere", providerStubMethods)
+	}
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up %#04x: %v", uint16(suite), err)
+		}
+		newProvider := func(first byte) CryptoProvider {
+			return mustProviderOver(t, suite, providerStubStream(first))
+		}
+		arguments := providerStubArguments(t, params, newProvider(0x80))
+		probed := []string{}
+		drawing := []string{}
+		unobserved := []string{}
+		for _, operation := range providerOperations(t) {
+			probed = append(probed, operation.name)
+			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
+			subject := newProvider(0x80)
+			arguments[providerInterfaceName] = subject
+			bound := operation.bind(subject)
+			if bound.Type().NumIn() != len(operation.parameters) {
+				t.Fatalf("%s is declared with %d parameters and called with %d",
+					where, len(operation.parameters), bound.Type().NumIn())
+			}
+			base := []reflect.Value{}
+			for i, parameter := range operation.parameters {
+				base = append(base, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
+			}
+			results, recovered := providerStubCall(bound, base)
+			if recovered != nil {
+				t.Errorf("%s refused to answer: %v", where, recovered)
+				continue
+			}
+			if zero := providerStubZeroResults(results); len(zero) != 0 {
+				t.Errorf("%s answered %s, which is what a stub answers", where, strings.Join(zero, ", "))
+			}
+			answer := providerStubAnswer(results)
+			// the control: nothing about this row means anything if the same call twice
+			// does not agree with itself
+			repeated := newProvider(0x80)
+			arguments[providerInterfaceName] = repeated
+			control := []reflect.Value{}
+			for i, parameter := range operation.parameters {
+				control = append(control, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
+			}
+			repeatedResults, recovered := providerStubCall(operation.bind(repeated), control)
+			if recovered != nil {
+				t.Errorf("%s refused the repeated call: %v", where, recovered)
+				continue
+			}
+			if repeat := providerStubAnswer(repeatedResults); repeat != answer {
+				t.Errorf("%s answered %s and then %s over the same script, so no row below observes anything",
+					where, answer, repeat)
+				continue
+			}
+			observed := 0
+			// the stream is an input too, and it is the only one three of these have
+			alternate := newProvider(0x40)
+			arguments[providerInterfaceName] = alternate
+			streamed := []reflect.Value{}
+			for i, parameter := range operation.parameters {
+				streamed = append(streamed, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
+			}
+			streamedResults, recovered := providerStubCall(operation.bind(alternate), streamed)
+			if recovered != nil {
+				t.Errorf("%s refused a provider over another script: %v", where, recovered)
+				continue
+			}
+			if providerStubAnswer(streamedResults) != answer {
+				drawing = append(drawing, operation.name)
+				observed++
+			}
+			arguments[providerInterfaceName] = subject
+			for i, parameter := range operation.parameters {
+				moved := slices.Clone(base)
+				moved[i] = perturbedArgument(t, operation.name, parameter, base[i])
+				movedResults, recovered := providerStubCall(operation.bind(subject), moved)
+				if recovered != nil {
+					t.Errorf("%s refused to answer with %s moved by a byte: %v", where, parameter.name, recovered)
+					continue
+				}
+				if providerStubAnswer(movedResults) == answer {
+					t.Errorf("%s answers the same with %s moved by a byte, so it does not read the %s it was handed",
+						where, parameter.name, parameter.name)
+					continue
+				}
+				observed++
+			}
+			if observed == 0 {
+				unobserved = append(unobserved, operation.name)
+				registry, held := providerRegistryAnswers[operation.name]
+				if !held {
+					t.Errorf("%s has no input this gate can move and no registry field to answer, so nothing here separates it from a constant", where)
+					continue
+				}
+				if want := fmt.Sprint(registry(params)); answer != want {
+					t.Errorf("%s answered %s and the registry holds %s", where, answer, want)
+				}
+				if reads := providerReceiverFieldReads(t, operation.name); len(reads) == 0 {
+					t.Errorf("%s reads nothing of the provider it is a method of, so the registry comparison above compared a literal against the registry", where)
+				}
+			}
+		}
+		assertCoversEveryProviderOperation(t, "TestProviderHasNoRemainingStubs", probed)
+		slices.Sort(drawing)
+		if !slices.Equal(drawing, providerStreamDependentOperations) {
+			t.Errorf("suite %#04x draws randomness in %v, want %v", uint16(suite), drawing, providerStreamDependentOperations)
+		}
+		slices.Sort(unobserved)
+		registered := []string{}
+		for name := range providerRegistryAnswers {
+			registered = append(registered, name)
+		}
+		slices.Sort(registered)
+		if !slices.Equal(unobserved, registered) {
+			t.Errorf("suite %#04x has no movable input for %v, and the registry rows cover %v",
+				uint16(suite), unobserved, registered)
+		}
+	}
+}
+
+// One declaration's stub shapes, read off the parse tree.
+//
+// The gate this was planned as looked for one literal sentence, "not implemented until
+// task", in the text of the package. That is a hand written list of length one, and this
+// project has understated a class by writing one eleven times running: panic("todo"),
+// panic("unimplemented"), a placeholder somebody worded differently, or a body that returns
+// a correctly sized nothing all walk straight past a string match. What is read here is the
+// shape instead, and a shape does not care how a placeholder is worded.
+//
+// Three shapes, each of which a real declaration in this package has none of:
+//
+//   - a declaration with results whose body never returns one, which is what a body that
+//     only panics looks like from the outside;
+//   - a panic standing as a whole statement of the body rather than inside a branch, which
+//     is a refusal to run rather than a refusal of an input -- every real panic in this
+//     package is the else of a check;
+//   - a declaration that reads none of the parameters it takes, which is the plausible
+//     zero value: the body compiles, returns something of the right size, and is a
+//     function of nothing.
+//
+// Bodies of function literals are skipped, so a return or a panic written inside a closure
+// is read as the closure's and not as the declaration's.
+func providerStubShapesIn(parsed parsedSource) []string {
+	shapes := []string{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		where := parsed.file.Name.Name + "." + function.Name.Name
+		returns := false
+		read := map[string]bool{}
+		outermost(function.Body, func(node ast.Node) {
+			if _, isReturn := node.(*ast.ReturnStmt); isReturn {
+				returns = true
+			}
+			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
+				read[identifier.Name] = true
+			}
+		})
+		if function.Type.Results != nil && len(function.Type.Results.List) != 0 && !returns {
+			shapes = append(shapes, where+" declares a result and never returns one")
+		}
+		for _, statement := range function.Body.List {
+			expression, isExpression := statement.(*ast.ExprStmt)
+			if !isExpression {
+				continue
+			}
+			call, isCall := expression.X.(*ast.CallExpr)
+			if !isCall {
+				continue
+			}
+			if identifier, isIdentifier := call.Fun.(*ast.Ident); isIdentifier && identifier.Name == "panic" {
+				shapes = append(shapes, where+" panics as a statement of its body rather than inside a check")
+			}
+		}
+		parameters := []string{}
+		if function.Type.Params != nil {
+			for _, field := range function.Type.Params.List {
+				for _, name := range field.Names {
+					if name.Name != "_" {
+						parameters = append(parameters, name.Name)
+					}
+				}
+			}
+		}
+		if len(parameters) != 0 {
+			used := false
+			for _, name := range parameters {
+				if read[name] {
+					used = true
+				}
+			}
+			if !used {
+				shapes = append(shapes, where+" reads none of "+strings.Join(parameters, ", "))
+			}
+		}
+	}
+	slices.Sort(shapes)
+	return shapes
+}
+
+// Every node of one body except the bodies of the function literals inside it, so a return
+// or a panic written in a closure is read as the closure's own.
+func outermost(body *ast.BlockStmt, visit func(node ast.Node)) {
+	ast.Inspect(body, func(node ast.Node) bool {
+		if _, isLiteral := node.(*ast.FuncLit); isLiteral {
+			return false
+		}
+		if node != nil {
+			visit(node)
+		}
+		return true
+	})
+}
+
+// A file holding one of each shape, so a matcher that stopped matching fails here rather
+// than reporting the package clean. The fourth declaration is the negative half: a real
+// panic in this package is the else of a check, and it must not be read as a refusal to
+// run.
+const providerStubShapeControl = `package control
+
+func stubThatPanics(secret []byte) []byte {
+	panic("mls: not implemented yet")
+}
+
+func stubThatAnswersZeroes(secret []byte, length int) []byte {
+	return make([]byte, 32)
+}
+
+func realDeclaration(secret []byte, length int) []byte {
+	if length < 0 {
+		panic("mls: a negative length")
+	}
+	answer := make([]byte, length)
+	copy(answer, secret)
+	return answer
+}
+`
+
+// No declaration anywhere under the guardrail roots is a placeholder.
+//
+// The roots are the ones the primitive guardrails already walk, which is this package and
+// connect/message, so a stub written in either is read. Scanning one package would leave
+// the other's placeholders to be found by a caller, and this plan lands code in both.
+//
+// The matcher runs on a control as well as on the source. Without that half a matcher that
+// had stopped matching -- a parse that silently failed, a shape rule narrowed by an edit --
+// would report every file clean and pass, which is the one outcome a gate must never be
+// able to produce by accident.
+func TestNoStubShapesRemainInSource(t *testing.T) {
+	control := providerStubShapesIn(mustParseText(t, "the stub shape control", providerStubShapeControl))
+	want := []string{
+		"control.stubThatAnswersZeroes reads none of secret, length",
+		"control.stubThatPanics declares a result and never returns one",
+		"control.stubThatPanics panics as a statement of its body rather than inside a check",
+		"control.stubThatPanics reads none of secret",
+	}
+	if !slices.Equal(control, want) {
+		t.Errorf("the shape matcher read %v out of the control, want %v", control, want)
+	}
+	scanned := 0
+	for path, text := range productionSources(mustScanSources(t, forbiddenScanRoots).sourceTexts) {
+		scanned++
+		if shapes := providerStubShapesIn(mustParseText(t, path, text)); len(shapes) != 0 {
+			t.Errorf("%s still holds a placeholder: %v", path, shapes)
+		}
+	}
+	if scanned == 0 {
+		t.Fatalf("the scan read no non test source, so this gate examined nothing")
+	}
+}
+
+// The receiver fields one method of the provider reads, as "field", found wherever the
+// method is declared rather than in a file this gate names.
+//
+// It is what the four size and code point methods are held by beyond the registry
+// comparison. Both registered suites fix Nh at 32 and Nn at 12, so no input separates a
+// HashSize that answers the registry from one that answers the literal 32, and the
+// comparison above passes over both -- measured, not assumed: a HashSize hardcoded to 32
+// and a NonceSize hardcoded to 12 each pass all 2276 tests of this package. Reading the
+// declaration is what says the answer came from the suite the provider was built for. It
+// is a source shape rather than a behaviour, and the honest limit of it is that a body
+// which reads params and then ignores the value still passes.
+func providerReceiverFieldReads(t *testing.T, method string) []string {
+	t.Helper()
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		if !slices.Contains(parsed.methodsOn(providerReceiver), method) {
+			continue
+		}
+		declaration := parsed.declarationOf(t, providerReceiver, method)
+		names := declaration.Recv.List[0].Names
+		if len(names) != 1 {
+			t.Fatalf("the declaration of %s %s has no receiver name to read fields of", providerReceiver, method)
+		}
+		fields := []string{}
+		ast.Inspect(declaration.Body, func(node ast.Node) bool {
+			selector, isSelector := node.(*ast.SelectorExpr)
+			if !isSelector {
+				return true
+			}
+			if base, isIdentifier := selector.X.(*ast.Ident); isIdentifier && base.Name == names[0].Name {
+				fields = append(fields, selector.Sel.Name)
+			}
+			return true
+		})
+		slices.Sort(fields)
+		return slices.Compact(fields)
+	}
+	t.Fatalf("no file of this package declares %s %s", providerReceiver, method)
+	return nil
 }
