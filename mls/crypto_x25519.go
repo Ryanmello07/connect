@@ -22,7 +22,6 @@ package mls
 
 import (
 	"crypto/ecdh"
-	"crypto/rand"
 	"io"
 )
 
@@ -75,14 +74,17 @@ func X25519PublicKey(b []byte) (*ecdh.PublicKey, error) {
 // direction with no way to reproduce a published vector. Thirty two bytes read here is
 // what RFC 7748 section 6.1 says an x25519 private key is.
 //
-// A nil reader falls back to the process entropy source, which is what ecdh.GenerateKey
-// already did with one, so the single input that used to work still does and the change
-// above only affects readers a caller actually meant. Any other reader is honoured, and
-// its error is returned unwrapped: a failing entropy source is not a key length or a
-// curve problem and must not be reported as one.
+// A nil reader is refused rather than filled in. Falling back to the process source is
+// what ecdh.GenerateKey does with one, and inheriting that here made every randomness
+// parameter above this function decorative in exactly the case that matters: a provider
+// built by NewCryptoProviderWithRandom over a nil reader sealed twice under two different
+// ephemeral keys, because this was the draw underneath its HpkeSeal. The keys were good
+// keys, which is why nothing else could see it. Any reader a caller actually passed is
+// honoured, and its error is returned unwrapped: a failing entropy source is not a key
+// length or a curve problem and must not be reported as one.
 func X25519GenerateKey(random io.Reader) (*ecdh.PrivateKey, error) {
 	if random == nil {
-		random = rand.Reader
+		return nil, ErrNilRandomSource
 	}
 	scalar := make([]byte, x25519KeySize)
 	if _, err := io.ReadFull(random, scalar); err != nil {

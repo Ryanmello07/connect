@@ -25,6 +25,14 @@ var (
 	ErrInvalidPoint = errors.New("mls: x25519 produced an invalid shared secret")
 	// ErrBadKeyLength fires when a key is not the length its ciphersuite fixes.
 	ErrBadKeyLength = errors.New("mls: key length does not match the ciphersuite")
+	// ErrNilRandomSource fires when a caller hands a constructor or a key generator
+	// no entropy source at all. Substituting the process source for it is what this
+	// refusal exists to prevent: the key that came back would be a good key drawn
+	// from a stream the caller cannot reproduce, and the failing case a deterministic
+	// provider was built to reproduce would quietly stop reproducing. It is separate
+	// from ErrBadKeyLength and ErrInvalidPoint because a caller telling a broken
+	// machine from a malformed input reads the wrong answer otherwise.
+	ErrNilRandomSource = errors.New("mls: no random source was supplied")
 	// ErrBadNonceLength fires when an aead nonce is not the length its ciphersuite
 	// fixes, so a truncated or padded nonce can never silently reuse a keystream.
 	ErrBadNonceLength = errors.New("mls: nonce length does not match the ciphersuite")

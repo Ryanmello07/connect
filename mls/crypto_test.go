@@ -1703,12 +1703,29 @@ func importPathsOf(source parsedSource) []string {
 // Nothing is substituted for the source a caller passed. A constructor that quietly
 // replaced a nil reader with crypto/rand would make a test believing it had pinned the
 // randomness draw from production entropy instead, and the failing case it was written to
-// reproduce would stop reproducing. Random over a nil reader has nowhere to read from, so
-// the refusal is what says no substitution happened.
+// reproduce would stop reproducing.
+//
+// The refusal is at construction rather than at the first draw, and this test used to be
+// the reason it had to be. It asked whether Random over a nil reader refused, Random did,
+// and the test passed for a year over a provider whose HpkeSeal and EncryptWithLabel
+// reached the process source through X25519GenerateKey — one operation named out of the
+// four that draw. What holds the class now is
+// TestEveryEntropyTakingFunctionRefusesANilSource, which reads it off the parse tree; what
+// this holds is the boundary, where a provider with no source cannot be built at all.
 func TestNewCryptoProviderWithRandomSubstitutesNothing(t *testing.T) {
-	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
-	if recovered := recoveredPanic(func() { crypto.Random(32) }); recovered == nil {
-		t.Errorf("a provider over a nil reader produced bytes, so it read something else")
+	for _, suite := range Suites() {
+		crypto, err := NewCryptoProviderWithRandom(suite, nil)
+		if !errors.Is(err, ErrNilRandomSource) {
+			t.Errorf("NewCryptoProviderWithRandom(%#04x, nil) error = %v, want ErrNilRandomSource", uint16(suite), err)
+		}
+		if crypto != nil {
+			t.Errorf("NewCryptoProviderWithRandom(%#04x, nil) returned a provider alongside %v", uint16(suite), err)
+		}
+		// and the control: a reader with bytes in it is not refused, or the rows above are
+		// satisfied by a constructor that refuses everything
+		if _, err := NewCryptoProviderWithRandom(suite, bytes.NewReader(randomScript(t))); err != nil {
+			t.Errorf("NewCryptoProviderWithRandom(%#04x) refused a reader holding bytes: %v", uint16(suite), err)
+		}
 	}
 }
 
@@ -4046,4 +4063,449 @@ func providerReceiverFieldReads(t *testing.T, method string) []string {
 	}
 	t.Fatalf("no file of this package declares %s %s", providerReceiver, method)
 	return nil
+}
+
+// The type an entropy source is spelled as, in one place so a rename is one edit rather
+// than a filter that stops matching and a gate that stops demanding.
+const entropySourceTypeName = "io.Reader"
+
+// Every value the entropy gates call, keyed by the name the declaration gives it.
+//
+// The map is not the class. The class is read off the parse tree, and a function it names
+// with no value here is fatal rather than a row left out, so a sixth function taking an
+// entropy source is covered the day somebody declares it rather than the day somebody
+// remembers to add it.
+var entropyTakingFunctionValues = map[string]any{
+	"NewCryptoProviderWithRandom": NewCryptoProviderWithRandom,
+	"X25519GenerateKey":           X25519GenerateKey,
+	"HpkeSetupBaseS":              HpkeSetupBaseS,
+	"HpkeSealBase":                HpkeSealBase,
+	"hpkeEncap":                   hpkeEncap,
+}
+
+// One function of this package handed a caller's entropy source, with the parameter names
+// the declaration gives it.
+type entropyTakingFunction struct {
+	name       string
+	parameters []providerParameter
+	value      reflect.Value
+}
+
+// Every package level function of this package's non test source that takes an entropy
+// source, read the way providerConstructions reads the ones that take a provider: off the
+// parse tree, cross checked against the package level scan, with a value required for each.
+func entropyTakingFunctions(t *testing.T) []entropyTakingFunction {
+	t.Helper()
+	functions := []entropyTakingFunction{}
+	found := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil {
+				continue
+			}
+			parameters := parametersOf(t, parsed, function.Name.Name, function.Type)
+			takesSource := false
+			for _, parameter := range parameters {
+				if parameter.typeName == entropySourceTypeName {
+					takesSource = true
+				}
+			}
+			if !takesSource {
+				continue
+			}
+			name := function.Name.Name
+			implementation, written := entropyTakingFunctionValues[name]
+			if !written {
+				t.Fatalf("%s takes an %s and entropyTakingFunctionValues holds no value for it, so this gate cannot call it",
+					name, entropySourceTypeName)
+			}
+			found = append(found, name)
+			functions = append(functions, entropyTakingFunction{
+				name:       name,
+				parameters: parameters,
+				value:      reflect.ValueOf(implementation),
+			})
+		}
+	}
+	slices.Sort(found)
+	if !slices.Equal(found, packageLevelFunctionsTaking(t, entropySourceTypeName)) {
+		t.Fatalf("this gate reads %v as the functions taking an %s and the package level scan reads %v",
+			found, entropySourceTypeName, packageLevelFunctionsTaking(t, entropySourceTypeName))
+	}
+	for name := range entropyTakingFunctionValues {
+		if !slices.Contains(found, name) {
+			t.Errorf("entropyTakingFunctionValues names %s, which is not a function of this package taking an %s",
+				name, entropySourceTypeName)
+		}
+	}
+	return functions
+}
+
+// The arguments beside the entropy source, keyed the way providerStubArgument resolves
+// them: a declared type name where the type decides which value belongs, a parameter name
+// where it does not. The recipient key comes from a provider of this gate's own, so the
+// call under test still draws from a source nothing has touched.
+func entropyTakingArguments(t *testing.T, params *SuiteParams) map[string]any {
+	t.Helper()
+	fixture := mustProviderOver(t, params.Suite, providerStubStream(0x01))
+	_, pub, err := fixture.DeriveKeyPair(ascendingBytes(0x50, 32))
+	if err != nil {
+		t.Fatalf("derive the recipient key every row seals to: %v", err)
+	}
+	return map[string]any{
+		"CipherSuite":   params.Suite,
+		"*SuiteParams":  params,
+		"HpkePublicKey": pub,
+		"info":          ascendingBytes(0x80, 24),
+		"aad":           ascendingBytes(0x90, 16),
+		"plaintext":     ascendingBytes(0xa0, 20),
+	}
+}
+
+// The error a call answered with, and whether it declared one at all. The second half is
+// not bookkeeping: an operation with no error result has no way to refuse an input except
+// to panic, and a gate that read a missing error as a nil one would report every such
+// operation as having answered happily.
+func errorResultOf(results []reflect.Value) (failure error, declared bool) {
+	for _, result := range results {
+		if result.Type() != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+		declared = true
+		if !result.IsNil() {
+			failure = result.Interface().(error)
+		}
+	}
+	return failure, declared
+}
+
+// The results beside an error that carry something, so a refusal handing back key material
+// alongside its error is visible. A caller that reads the slice rather than the error is
+// the reason this is asserted and not assumed.
+func resultsBesideTheError(results []reflect.Value) []string {
+	answered := []string{}
+	for i, result := range results {
+		if result.Type() == reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+		position := "result " + strconv.Itoa(i)
+		switch result.Kind() {
+		case reflect.Slice, reflect.Pointer, reflect.Interface, reflect.Map, reflect.Func, reflect.Chan:
+			if !result.IsNil() {
+				answered = append(answered, position+" is a non nil "+result.Type().String())
+			}
+		default:
+			if !result.IsZero() {
+				answered = append(answered, position+" is "+fmt.Sprint(result.Interface()))
+			}
+		}
+	}
+	return answered
+}
+
+// A function that takes an entropy source refuses to run without one, rather than reaching
+// for the process's.
+//
+// A reader parameter is a promise: what this draws is the caller's bytes and nobody else's.
+// A function that answers a nil one by substituting crypto/rand keeps the signature and
+// breaks the promise silently. The key it hands back is a perfectly good key drawn from a
+// source the caller cannot reproduce, every round trip still round trips, and the failing
+// interop case the caller was pinning stops reproducing with nothing to say why.
+//
+// Measured before this gate existed, on this package as it stood: a provider built by
+// NewCryptoProviderWithRandom(suite, nil) sealed twice under two different ephemeral keys,
+// because HpkeSeal reaches X25519GenerateKey and that substituted the process source for
+// the nil one. Random and SignatureKeyPair refused it, and the gate that claimed the
+// property named Random alone, one of the four operations that draw.
+//
+// The class is read off the parse tree rather than written down, so the next function to
+// take a source is held the day it is declared.
+func TestEveryEntropyTakingFunctionRefusesANilSource(t *testing.T) {
+	source := reflect.TypeOf((*io.Reader)(nil)).Elem()
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up %#04x: %v", uint16(suite), err)
+		}
+		arguments := entropyTakingArguments(t, params)
+		for _, function := range entropyTakingFunctions(t) {
+			where := fmt.Sprintf("suite %#04x %s", uint16(suite), function.name)
+			signature := function.value.Type()
+			if signature.NumIn() != len(function.parameters) {
+				t.Fatalf("%s is declared with %d parameters and called with %d",
+					where, len(function.parameters), signature.NumIn())
+			}
+			call := func(given reflect.Value) []reflect.Value {
+				built := []reflect.Value{}
+				for i, parameter := range function.parameters {
+					if parameter.typeName == entropySourceTypeName {
+						built = append(built, given)
+						continue
+					}
+					built = append(built, providerStubArgument(t, arguments, function.name, parameter, signature.In(i)))
+				}
+				return built
+			}
+			// the control first: over a source with bytes in it the call must succeed, or
+			// the refusal below is satisfied by a function that refuses everything
+			results, recovered := providerStubCall(function.value, call(reflect.ValueOf(providerStubStream(0x80))))
+			if recovered != nil {
+				t.Errorf("%s refused a source holding bytes: %v", where, recovered)
+				continue
+			}
+			failure, declared := errorResultOf(results)
+			if !declared {
+				t.Fatalf("%s declares no error result, so it has no way to refuse a source it cannot read", where)
+			}
+			if failure != nil {
+				t.Errorf("%s refused a source holding bytes: %v", where, failure)
+				continue
+			}
+			refused, recovered := providerStubCall(function.value, call(reflect.Zero(source)))
+			if recovered != nil {
+				continue
+			}
+			if failure, _ := errorResultOf(refused); failure == nil {
+				t.Errorf("%s answered without an entropy source instead of refusing, so it read one nobody handed it", where)
+				continue
+			}
+			for _, answered := range resultsBesideTheError(refused) {
+				t.Errorf("%s answered with %s alongside its refusal", where, answered)
+			}
+		}
+	}
+}
+
+// Nothing on the provider surface reaches another source when the caller's runs dry.
+//
+// The nil case above is one shape of the substitution and this is the other: a source that
+// is present and empty. A consumer that answered a read error by falling back would pass
+// every gate in this file, because the key it produced would be a good key, so what is
+// asserted is the refusal itself, over every operation the surface declares.
+//
+// Both directions are compared. The operations that draw must refuse an exhausted source
+// and the operations that do not must be untouched by it, so a fallback introduced anywhere
+// drops a name out of the refusal set and a refusal introduced for some other reason adds
+// one. The measured set is the same list TestProviderHasNoRemainingStubs holds to the
+// stream, which is what keeps the two from drifting apart.
+func TestNoProviderOperationFallsBackWhenItsSourceRunsDry(t *testing.T) {
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up %#04x: %v", uint16(suite), err)
+		}
+		arguments := providerStubArguments(t, params, mustProviderOver(t, suite, providerStubStream(0x80)))
+		probed := []string{}
+		refused := []string{}
+		for _, operation := range providerOperations(t) {
+			probed = append(probed, operation.name)
+			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
+			subject := mustProviderOver(t, suite, bytes.NewReader(nil))
+			arguments[providerInterfaceName] = subject
+			bound := operation.bind(subject)
+			call := []reflect.Value{}
+			for i, parameter := range operation.parameters {
+				call = append(call, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
+			}
+			results, recovered := providerStubCall(bound, call)
+			if recovered != nil {
+				refused = append(refused, operation.name)
+				continue
+			}
+			if failure, _ := errorResultOf(results); failure != nil {
+				refused = append(refused, operation.name)
+				for _, answered := range resultsBesideTheError(results) {
+					t.Errorf("%s answered with %s alongside its refusal", where, answered)
+				}
+			}
+		}
+		assertCoversEveryProviderOperation(t, "TestNoProviderOperationFallsBackWhenItsSourceRunsDry", probed)
+		slices.Sort(refused)
+		if !slices.Equal(refused, providerStreamDependentOperations) {
+			t.Errorf("suite %#04x refused %v over an exhausted source, and the operations that draw are %v",
+				uint16(suite), refused, providerStreamDependentOperations)
+		}
+	}
+}
+
+// The non test source of the two crypto packages, the files themselves rather than the tree
+// under them. mls/syntax is a different plan's package with its own constraints, and a gate
+// that pinned its imports here would fail on that plan's edits rather than on this one's.
+func cryptoSourcePaths(t *testing.T) []string {
+	t.Helper()
+	paths := []string{}
+	for _, root := range forbiddenScanRoots {
+		found, err := filepath.Glob(filepath.Join(root, "*.go"))
+		if err != nil {
+			t.Fatalf("list the source of %s: %v", root, err)
+		}
+		production := 0
+		for _, path := range found {
+			if strings.HasSuffix(path, "_test.go") {
+				continue
+			}
+			paths = append(paths, filepath.ToSlash(path))
+			production++
+		}
+		if production == 0 {
+			t.Fatalf("%s holds no non test go file, so this gate read nothing of it", root)
+		}
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// Every package the crypto is built from, as a whole rather than as a ban list.
+//
+// A ban list is the shape this project has been walked past eleven times running: one edit
+// outside the list and the gate reports the clean run a complete gate reports. What is
+// pinned here is the complete set, so an import added anywhere in either package fails
+// until somebody writes it down. os, through which a build could pick its entropy source
+// out of the environment, fails exactly as loudly as a third party crypto library the slice
+// forbids outright.
+//
+// It is the mechanical half of the claim that the deterministic provider is reachable only
+// by an explicit caller. Nothing here can consult the environment, and the constraint gate
+// below says nothing here can be swapped out by a build tag either, so the only way to a
+// provider over a caller's reader is to call the constructor that takes one.
+var cryptoImportPaths = []string{
+	`"bytes"`,
+	`"crypto/aes"`,
+	`"crypto/cipher"`,
+	`"crypto/ecdh"`,
+	`"crypto/ed25519"`,
+	`"crypto/hkdf"`,
+	`"crypto/hmac"`,
+	`"crypto/rand"`,
+	`"crypto/sha256"`,
+	`"crypto/subtle"`,
+	`"encoding/binary"`,
+	`"errors"`,
+	`"github.com/urnetwork/connect/mls/syntax"`,
+	`"golang.org/x/crypto/chacha20poly1305"`,
+	`"io"`,
+	`"math"`,
+	`"slices"`,
+	`"strconv"`,
+}
+
+// The crypto is built from the packages above and no others.
+func TestTheCryptoIsBuiltFromExactlyThesePackages(t *testing.T) {
+	imported := []string{}
+	for _, path := range cryptoSourcePaths(t) {
+		imported = append(imported, importPathsOf(mustParseSource(t, path))...)
+	}
+	slices.Sort(imported)
+	imported = slices.Compact(imported)
+	if !slices.Equal(imported, cryptoImportPaths) {
+		t.Errorf("the crypto imports\n%s\nand this gate holds it to\n%s",
+			strings.Join(imported, "\n"), strings.Join(cryptoImportPaths, "\n"))
+	}
+}
+
+// The two spellings a build constraint has, which is the whole of them: the go command
+// reads //go:build and, for files predating go 1.17, // +build, and nothing else steers a
+// file into or out of a build.
+var buildConstraintPrefixes = []string{"//go:build", "// +build"}
+
+// A file carrying each spelling, so a matcher that stopped matching fails here rather than
+// reporting every file clean.
+const buildConstraintControl = `//go:build linux
+// +build linux
+
+package control
+`
+
+// No file of the crypto is selected by a build constraint.
+//
+// The slice's own constraint says the crypto is cross platform from the first commit with
+// no build tags on it, and the reason bites hardest here: a constrained file is a second
+// implementation the tests on this machine never see, and an entropy source swapped inside
+// one would be invisible to every gate in this package while shipping on another platform.
+// The whole file is read rather than the leading comment block alone, because a constraint
+// written below the package clause is inert and is exactly what somebody moves back up.
+func TestNoCryptoSourceCarriesABuildConstraint(t *testing.T) {
+	control := buildConstraintsIn(buildConstraintControl)
+	want := []string{"//go:build linux", "// +build linux"}
+	if !slices.Equal(control, want) {
+		t.Errorf("the constraint matcher read %v out of the control, want %v", control, want)
+	}
+	for _, path := range cryptoSourcePaths(t) {
+		text, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if lines := buildConstraintsIn(string(text)); len(lines) != 0 {
+			t.Errorf("%s carries %v; the crypto is built the same way on every platform", path, lines)
+		}
+	}
+}
+
+// The build constraint lines of one file's text. Carriage returns are normalised first for
+// the reason codeOf normalises them: a matcher anchored on what a line holds matches
+// nothing at all in a checkout git smudged, and a gate that matches nothing demands nothing.
+func buildConstraintsIn(text string) []string {
+	found := []string{}
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		for _, prefix := range buildConstraintPrefixes {
+			if strings.HasPrefix(trimmed, prefix) {
+				found = append(found, trimmed)
+			}
+		}
+	}
+	return found
+}
+
+// The constructor that is allowed to reach the operating system, in one place so a rename
+// is one edit rather than a matcher that stops matching.
+const defaultConstructorName = "NewCryptoProvider"
+
+// The file of the crypto that declares it, found rather than named. A gate told a filename
+// reports the clean bill of a complete gate on a file the declaration has moved out of,
+// which is the defect task 12 paid for, and it does it silently.
+func defaultConstructorFile(t *testing.T) string {
+	t.Helper()
+	declaring := []string{}
+	for _, path := range cryptoSourcePaths(t) {
+		for _, declaration := range mustParseSource(t, path).file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if isFunction && function.Recv == nil && function.Name.Name == defaultConstructorName {
+				declaring = append(declaring, path)
+			}
+		}
+	}
+	if len(declaring) != 1 {
+		t.Fatalf("%d files of the crypto declare %s, want exactly 1: %v",
+			len(declaring), defaultConstructorName, declaring)
+	}
+	return declaring[0]
+}
+
+// Exactly one file of the crypto can name the process entropy source, and it is the one
+// declaring the constructor whose whole job is to hand it over.
+//
+// This is the structural half of the refusal gates above, and it is the half that does not
+// depend on anybody thinking to call the right function with the right argument. A file
+// that cannot name crypto/rand cannot fall back to it, whether the fallback is written on a
+// nil reader, on a read error, or behind a package level variable no behavioural gate can
+// see. Measured: crypto_x25519.go imported it, for a nil reader fallback that made every
+// seal a provider over a caller's stream produced unreproducible.
+//
+// The allowed file is derived from the declaration rather than written down, so moving the
+// constructor moves the permission with it and moving the import does not.
+func TestTheProcessEntropySourceIsReachableFromOneFile(t *testing.T) {
+	importing := []string{}
+	for _, path := range cryptoSourcePaths(t) {
+		if slices.Contains(importPathsOf(mustParseSource(t, path)), cryptoRandImportPath) {
+			importing = append(importing, path)
+		}
+	}
+	want := []string{defaultConstructorFile(t)}
+	if !slices.Equal(importing, want) {
+		t.Errorf("%v import %s, and only %v declares %s and may",
+			importing, cryptoRandImportPath, want, defaultConstructorName)
+	}
 }

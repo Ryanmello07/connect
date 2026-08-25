@@ -2285,11 +2285,13 @@ func TestSignatureKeyPairRefusesAShortOrFailingReader(t *testing.T) {
 	if _, _, err := crypto.SignatureKeyPair(); err != nil {
 		t.Errorf("SignatureKeyPair over a sufficient reader failed: %v", err)
 	}
-	// and a provider handed no reader does not fall back to the process entropy source,
-	// which is exactly what crypto/ed25519.GenerateKey does when it is passed a nil one
-	substituting := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
-	if recovered := recoveredPanic(func() { substituting.SignatureKeyPair() }); recovered == nil {
-		t.Errorf("SignatureKeyPair over a nil reader answered, so it read something else")
+	// and no reader at all never reaches here: the constructor refuses it, so a generator
+	// that would have fallen back the way crypto/ed25519.GenerateKey does with a nil one
+	// has nothing to fall back from. TestNewCryptoProviderWithRandomSubstitutesNothing is
+	// where that boundary is asserted; this is the reading of it that says the refusal
+	// covers the source this method draws from
+	if _, err := NewCryptoProviderWithRandom(CipherSuiteX25519ChaCha20Sha256Ed25519, nil); !errors.Is(err, ErrNilRandomSource) {
+		t.Errorf("a provider over a nil reader was built, and its keys would come from somewhere nobody chose: %v", err)
 	}
 }
 

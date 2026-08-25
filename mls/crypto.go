@@ -101,7 +101,19 @@ func NewCryptoProvider(suite CipherSuite) (CryptoProvider, error) {
 // randomness consumes exactly the bytes it was offered, in order, which is the property
 // a constant reader cannot see. Production callers use NewCryptoProvider and get
 // crypto/rand; nothing in this package reads crypto/rand behind a caller's back.
+//
+// No source at all is refused here rather than at the first draw, and it is refused rather
+// than filled in. A provider that answered a nil reader with the process source would keep
+// this signature and break the sentence above silently: every key it produced would be a
+// good key, every round trip would still round trip, and the interop case the caller was
+// pinning would stop reproducing with nothing to say why. Refusing at construction is what
+// makes that a caller's error to handle rather than three separate draws to get right —
+// see TestEveryEntropyTakingFunctionRefusesANilSource, which reads the class off the parse
+// tree because this package has already shipped that substitution once.
 func NewCryptoProviderWithRandom(suite CipherSuite, random io.Reader) (CryptoProvider, error) {
+	if random == nil {
+		return nil, ErrNilRandomSource
+	}
 	params, err := LookupSuite(suite)
 	if err != nil {
 		return nil, err

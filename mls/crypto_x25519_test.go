@@ -607,18 +607,18 @@ func TestX25519GenerateKeyReadsTheReaderItIsGiven(t *testing.T) {
 	if got := scripted.PublicKey().Bytes(); !bytes.Equal(got, wantPublic) {
 		t.Errorf("public key = %x, want the published %x", got, wantPublic)
 	}
-	// and the documented nil fallback still reaches a real entropy source, or the
-	// one input that used to work would now be the most dangerous one
+	// and no reader at all is refused rather than filled in. This used to fall back to
+	// the process source, on the reasoning that a nil reader is what ecdh.GenerateKey
+	// accepts — and it made the reproducibility above a claim about this function alone.
+	// Every caller in the tree reaches x25519 through here, so a provider built over a
+	// caller's stream sealed under an ephemeral key drawn from somewhere nobody chose,
+	// and the key was a good key, which is why no round trip could see it.
 	fallback, err := X25519GenerateKey(nil)
-	if err != nil {
-		t.Fatalf("generate from a nil reader: %v", err)
+	if !errors.Is(err, ErrNilRandomSource) {
+		t.Errorf("generate from a nil reader error = %v, want ErrNilRandomSource", err)
 	}
-	fallbackAgain, err := X25519GenerateKey(nil)
-	if err != nil {
-		t.Fatalf("generate from a nil reader again: %v", err)
-	}
-	if bytes.Equal(fallback.Bytes(), fallbackAgain.Bytes()) {
-		t.Errorf("a nil reader produced the same scalar twice: %x", fallback.Bytes())
+	if fallback != nil {
+		t.Errorf("a nil reader still produced a scalar: %x", fallback.Bytes())
 	}
 }
 
