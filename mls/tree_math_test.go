@@ -3456,75 +3456,138 @@ func TestResolutionEveryBlankShapeOfAnEightLeafTree(t *testing.T) {
 // offsets into it.
 const resolutionLeafStride = 0x9E3779B1
 
-// the leaves each depth blanks a path through.
+// every node of every tree up to fourteen levels, as the head of a resolution,
+// under three different blank structures.
 //
-// the first four are where a blanked path meets an edge: leaf zero is the
-// leftmost path, the last leaf the rightmost, and the two middle leaves put the
-// path on either side of the root's own split. every one of those is at a
-// power-of-two offset, and a version confined to blocks that are not powers of
-// two would be invisible to a probe set made only of them, so four more are
-// spread by an odd stride.
-func resolutionProbeLeaves(depth uint32) []LeafIndex {
-	if depth == 0 {
-		return []LeafIndex{0}
+// the sweeps above choose which nodes to ask about, and what they choose is
+// what they can see. measured on the version of this file that asked only the
+// nodes a blanked path runs through: at level 10 a defect confined to one block
+// in 256 survived the whole package, and at level 15 one in 64 did, because the
+// probes never landed in those blocks. a walk of every node closes that for as
+// far up as a walk can go — 32767 nodes at depth 14, which is 2.3 million
+// resolutions over the three shapes and every depth below it, and about a fifth
+// of a second.
+//
+// depth 14 rather than 31 because the node count doubles with the depth: the
+// largest tree holds 2^32-1 nodes and a walk of them under even one shape is
+// hours, and unlike the pure index arithmetic elsewhere in this file the answer
+// here depends on the whole shape and not only on the index, so a walk of every
+// node would still be a walk of one shape out of 2^(2^32-1). what a walk buys
+// is the levels it reaches, and the sweeps below carry the levels past it.
+func TestResolutionEveryNodeOfEveryTreeToDepthFourteen(t *testing.T) {
+	const walkDepth = 14
+	checked := int64(0)
+	for depth := uint32(0); depth <= walkDepth; depth += 1 {
+		leaves := LeafCount(1) << depth
+		middleLeaf := LeafIndex(uint64(leaves) / 2)
+		walkShapes := []struct {
+			label string
+			shape NodeShape
+		}{
+			{label: "the path of leaf 0 blank", shape: pathBlankShape(leaves, []LeafIndex{0}, true)},
+			{label: "the paths of the two middle leaves blank", shape: pathBlankShape(leaves, []LeafIndex{middleLeaf - 1, middleLeaf}, true)},
+			{label: "half the nodes blank", shape: randomBlankShape(leaves, 0x5EED, 4)},
+		}
+		for _, w := range walkShapes {
+			for x := uint64(0); x < uint64(NodeWidth(leaves)); x += 1 {
+				level, block := nodeLevelAndBlock(NodeIndex(x))
+				if !resolutionAgrees(w.shape, level, block, depth <= 8) {
+					reportResolution(t, fmt.Sprintf("%d leaves, %s", leaves, w.label), w.shape, level, block)
+				}
+				checked += 1
+			}
+		}
 	}
-	leaves := uint64(1) << depth
-	probes := []LeafIndex{
-		0,
-		LeafIndex(leaves - 1),
-		LeafIndex(leaves/2 - 1),
-		LeafIndex(leaves / 2),
+	// sum(d=0..14) of the node width of a 2^d-leaf tree, over three shapes:
+	// 3 * (2^16 - 2 - 15) = 3 * 65519.
+	if want := int64(3 * 65519); checked != want {
+		t.Errorf("confirmed resolutions over every node to depth %d: %d, want %d", walkDepth, checked, want)
 	}
-	for step := uint64(1); step <= 4; step += 1 {
-		probes = append(probes, LeafIndex(step*resolutionLeafStride%leaves))
+}
+
+// how many blocks of one level a sweep asks about when the level is too wide to
+// walk, and how wide a level has to be before it stops walking it.
+//
+// the walk limit is what decides which levels come out complete. a level of a
+// tree of depth d holds 2^(d-level) blocks, so a limit of 2^11 walks every
+// block of every level from 20 up, in every tree there is, and leaves the
+// levels below it sampled. measured by counting the distinct nodes a whole
+// package run hands Resolution and walks inside it: 1,971,887 calls, 15,766,467
+// visits, 1,050,579 distinct node indices of the 4,294,967,295 a tree can hold.
+// levels 19 to 31 come out at every block of every level; level 18 at 86.2%,
+// level 15 at 29.3%, level 10 at 2.08% and level 0 at 0.0071%.
+const resolutionBlockProbes = 192
+const resolutionBlockWalkLimit = 2048
+
+// the blocks of one level of one depth that a sweep asks about: every one of
+// them where a level is small enough to walk, and a strided sample otherwise.
+//
+// the stride is odd and the block count a power of two, so they share no
+// factor and the sample walks the whole level rather than a coset of it. the
+// first three blocks and the last are named as well, because a level's ends are
+// where an off-by-one in a block lands and a stride hits them only by accident.
+func resolutionProbeBlocks(depth uint32, level uint32, walkLimit uint64) []uint64 {
+	blocks := uint64(1) << (depth - level)
+	if blocks <= walkLimit {
+		probes := make([]uint64, 0, blocks)
+		for block := uint64(0); block < blocks; block += 1 {
+			probes = append(probes, block)
+		}
+		return probes
+	}
+	probes := []uint64{0, 1, 2, blocks - 1}
+	for step := uint64(1); step <= resolutionBlockProbes; step += 1 {
+		probes = append(probes, step*resolutionLeafStride%blocks)
 	}
 	return probes
 }
 
-// the resolution of every node of a blanked path, and of every copath node
-// beside it, at every depth a tree can have.
+// the resolution of a node at every block of every level of every depth, with
+// the blanked path running through it.
 //
 // this is the band nothing else in this package reaches. the mlswg tree-math
-// family stops at 512 leaves, which is level 9, and every fixture and every
-// exhaustive sweep above is an eight-leaf tree, which is level 3. a version
-// that is right below level 10 and wrong above it — a push order swapped at one
-// level, a blank test skipped at one level, an unmerged list dropped at one
-// level — passes all of them.
+// family stops at 512 leaves, which is level 9, both figures RFC 9420 draws are
+// eight-leaf trees, and the exhaustive shape sweeps above stop at eight leaves
+// too. what is left is levels 10 to 31, and a version that is right below level
+// 10 and wrong above it — a push order swapped at one level, a blank test
+// skipped at one level, an unmerged list dropped at one level — passes every
+// one of them.
 //
 // the shapes are chains rather than arbitrary blank sets because an arbitrary
 // one is not affordable at this depth: an all-blank tree of depth 31 resolves
 // to 2^31 nodes. a blanked path keeps the answer to one node per level, which
-// is what makes levels 10 to 31 assertable at all rather than sampled.
+// is what makes levels 10 to 31 assertable at all rather than sampled, and the
+// blanked leaf is chosen per node so that the node asked about is always on it.
 func TestResolutionAtEveryDepth(t *testing.T) {
 	checked := int64(0)
 	for depth := uint32(0); depth <= 31; depth += 1 {
 		leaves := LeafCount(1) << depth
-		for _, blanked := range resolutionProbeLeaves(depth) {
-			for _, withUnmerged := range []bool{false, true} {
-				shape := pathBlankShape(leaves, []LeafIndex{blanked}, withUnmerged)
-				label := fmt.Sprintf("%d leaves, the path of leaf %d blank, unmerged leaves %v", leaves, blanked, withUnmerged)
-				for level := uint32(0); level <= depth; level += 1 {
-					pathBlock := uint64(blanked) >> level
-					if !resolutionAgrees(shape, level, pathBlock, depth <= 8) {
-						reportResolution(t, label, shape, level, pathBlock)
+		for level := uint32(0); level <= depth; level += 1 {
+			for _, block := range resolutionProbeBlocks(depth, level, resolutionBlockWalkLimit) {
+				for _, withUnmerged := range []bool{false, true} {
+					// the leftmost leaf under the node, so the node is on the
+					// blanked path and its own resolution is the interesting one
+					blanked := LeafIndex(block << level)
+					shape := pathBlankShape(leaves, []LeafIndex{blanked}, withUnmerged)
+					label := fmt.Sprintf("%d leaves, the path of leaf %d blank, unmerged leaves %v", leaves, blanked, withUnmerged)
+					if !resolutionAgrees(shape, level, block, depth <= 8) {
+						reportResolution(t, label, shape, level, block)
 					}
 					checked += 1
 					if level == depth {
 						continue
 					}
-					if !resolutionAgrees(shape, level, pathBlock^1, depth <= 8) {
-						reportResolution(t, label, shape, level, pathBlock^1)
+					// and the copath node beside it, which is not blank
+					if !resolutionAgrees(shape, level, block^1, depth <= 8) {
+						reportResolution(t, label, shape, level, block^1)
 					}
 					checked += 1
 				}
 			}
 		}
 	}
-	// depth zero has one probe leaf and one node; every other depth has eight
-	// probe leaves and 2*depth+1 nodes, and each is run with and without
-	// unmerged leaves. sum(d=1..31) 2*(2d+1) * 8 = 16 * (2*496 + 31) = 16368.
-	if want := int64(2 + 16368); checked != want {
-		t.Errorf("confirmed resolutions across every depth: %d, want %d", checked, want)
+	if checked < 200000 {
+		t.Errorf("confirmed resolutions across every depth: %d, want at least 200000", checked)
 	}
 }
 
@@ -3540,32 +3603,26 @@ func TestResolutionAtEveryDepthWithTwoBlankPaths(t *testing.T) {
 	checked := int64(0)
 	for depth := uint32(1); depth <= 31; depth += 1 {
 		leaves := LeafCount(1) << depth
-		for _, blanked := range resolutionProbeLeaves(depth) {
-			for meetingLevel := uint32(0); meetingLevel < depth; meetingLevel += 1 {
+		for meetingLevel := uint32(0); meetingLevel < depth; meetingLevel += 1 {
+			for _, block := range resolutionProbeBlocks(depth, meetingLevel+1, 256) {
+				blanked := LeafIndex(block << (meetingLevel + 1))
 				other := LeafIndex(uint64(blanked) ^ uint64(1)<<meetingLevel)
 				shape := pathBlankShape(leaves, []LeafIndex{blanked, other}, true)
 				label := fmt.Sprintf("%d leaves, the paths of leaves %d and %d blank", leaves, blanked, other)
 				// the node the two paths meet at, and the root above it
-				meetingCases := []struct {
-					level uint32
-					block uint64
-				}{
-					{level: meetingLevel + 1, block: uint64(blanked) >> (meetingLevel + 1)},
-					{level: depth, block: 0},
+				if !resolutionAgrees(shape, meetingLevel+1, block, depth <= 8) {
+					reportResolution(t, label, shape, meetingLevel+1, block)
 				}
-				for _, c := range meetingCases {
-					if !resolutionAgrees(shape, c.level, c.block, depth <= 8) {
-						reportResolution(t, label, shape, c.level, c.block)
-					}
-					checked += 1
+				checked += 1
+				if !resolutionAgrees(shape, depth, 0, depth <= 8) {
+					reportResolution(t, label, shape, depth, 0)
 				}
+				checked += 1
 			}
 		}
 	}
-	// eight probe leaves a depth, one meeting level per level below the root,
-	// two nodes each: 8 * 2 * sum(d=1..31) d = 16 * 496 = 7936.
-	if want := int64(7936); checked != want {
-		t.Errorf("confirmed two-path resolutions across every depth: %d, want %d", checked, want)
+	if checked < 100000 {
+		t.Errorf("confirmed two-path resolutions across every depth: %d, want at least 100000", checked)
 	}
 }
 
@@ -3573,12 +3630,12 @@ func TestResolutionAtEveryDepthWithTwoBlankPaths(t *testing.T) {
 //
 // RFC 9420 says a non-blank node resolves to the node itself followed by its
 // list of unmerged leaves, and it says nothing about that list being sorted,
-// deduplicated or inside the node's own subtree — those are the section 7.9
+// deduplicated or inside the node's own subtree â€” those are the section 7.9
 // tree-validation checks and tree_sync.go owns them. what this file owes its
 // callers is that the list comes back in stored order and untouched, because
 // TreeKEM encrypts a path secret to the resolution position by position: a
 // resolution reordered here hands a member the wrong secret. the two clauses
-// that carry no example in the RFC are the ones asserted hardest here — a blank
+// that carry no example in the RFC are the ones asserted hardest here â€” a blank
 // node's list is not read at all, and a leaf's list is read like any other
 // node's.
 func TestResolutionUnmergedLeafRules(t *testing.T) {
@@ -3980,7 +4037,7 @@ func TestResolutionRandomShapesAtEveryDepth(t *testing.T) {
 			if blankEighths == 7 && depth > 16 {
 				continue
 			}
-			for seed := uint64(0); seed < 8; seed += 1 {
+			for seed := uint64(0); seed < 24; seed += 1 {
 				shape := randomBlankShape(leaves, seed, blankEighths)
 				label := fmt.Sprintf("%d leaves, %d eighths blank, seed %d", leaves, blankEighths, seed)
 				// the root, and one node at every level below it, at a block
@@ -3996,9 +4053,9 @@ func TestResolutionRandomShapesAtEveryDepth(t *testing.T) {
 			}
 		}
 	}
-	// eight seeds a density, depth+1 nodes each: 8 * sum(d=0..31) (d+1) for the
-	// two thin densities and 8 * sum(d=0..16) (d+1) for the thick one.
-	if want := int64(2*8*528 + 8*153); checked != want {
+	// twenty-four seeds a density, depth+1 nodes each: 24 * sum(d=0..31) (d+1)
+	// for the two thin densities and 24 * sum(d=0..16) (d+1) for the thick one.
+	if want := int64(2*24*528 + 24*153); checked != want {
 		t.Errorf("confirmed random-shape resolutions: %d, want %d", checked, want)
 	}
 }

@@ -567,12 +567,71 @@ type NodeShape interface {
 
 // the ordered list of non-blank nodes that collectively cover every non-blank
 // descendant of x: a depth-first, left-first enumeration of the nearest
-// non-blank nodes below it.
+// non-blank nodes below it (RFC 9420 section 4.1).
 //
 // a non-blank node resolves to itself followed by its unmerged leaves, a blank
 // leaf to nothing, and a blank parent to its left child's resolution followed
 // by its right child's. the traversal uses an explicit stack so a deep tree
-// cannot become deep go stack.
+// cannot become deep go stack. the stack gains one entry for each level it
+// descends and nothing else, so 32 is its width in the deepest tree there is —
+// measured over a whole package run, 32 at the peak, which is the capacity it
+// is made with.
+//
+// the order is the contract and not a detail of it. TreeKEM encrypts a path
+// secret to the entries of a resolution one position at a time, so a list with
+// the right members in the wrong order hands a member someone else's secret and
+// never hands it its own. the answer ascends by node index everywhere except at
+// an unmerged leaf, which follows immediately behind the node carrying it and
+// is usually below it — figure 10's [X, B] is [3, 2] — which is exactly why a
+// test that compares two resolutions as sets, or sorts them before comparing,
+// passes every wrong order there is.
+//
+// the two entry checks are ordered and the order is observable: a shape whose
+// leaf count is no tree is refused as that whatever node it was asked about, so
+// a caller switching on the sentinel can tell a bad tree from a bad request. a
+// refusal carries no slice at all and an accepted empty resolution is an empty
+// slice, the same pair of promises DirectPath and Copath make.
+//
+// what this file checks about an unmerged list is that its entries are inside
+// the tree, and nothing else. sorted, free of repeats, and confined to the
+// node's own subtree are the section 7.9 tree-validation rules and tree_sync.go
+// owns them; a list that breaks any of them comes back through here in stored
+// order rather than being quietly repaired, because a repair here would hide
+// the tree that needs rejecting.
+//
+// the answer is as large as the caller's own tree and no ceiling is put on it
+// here: the root of a 2^31-leaf tree with every parent blank resolves to 2^31
+// nodes. the shape belongs to a ratchet tree the caller already holds, so that
+// tree is the bound, and the 500-member policy that keeps it small in practice
+// lives in commit.go.
+//
+// the refusals from Left and Right are unreachable. x is range checked against
+// the node width, every node reached from it is inside the same tree, and the
+// only index whose level is past 31 is 0xFFFFFFFF, which that check excludes at
+// every leaf count. they are kept for the reason DirectPath keeps its own range
+// check: a function should enforce its own precondition rather than inherit it
+// from whatever it happens to call.
+//
+// measured rather than argued, in a scratch copy. a grammar over the body — the
+// two entry checks and their order, the comparison and the bound of the range
+// check, the blank test, the node emit, every clause of the unmerged handling
+// and its bound, the blank-leaf stop, the pop end, the push order, the child
+// pair, three allocation sizes and eight reworkings of the finished list —
+// crossed with the bands that can confine any of them to one level, to one
+// block in 2, 4 or 8 of a level at two residues each, to every level at once,
+// or to trees at or past a given depth, enumerates 1495 versions. the test file
+// kills 1447.
+//
+// all 48 that live are this function written differently, and each was checked
+// against a walk of all 2^32 indices rather than argued: x > w-1 for x >= w;
+// the three capacities; a band over every node, which is the check itself; the
+// push order swapped at level 0, which no leaf reaches because a leaf stops one
+// line above the push; and 36 bands whose residue is larger than any block its
+// level has, since level 31 holds one node, level 30 two and level 29 four.
+// nothing that differs from this code at an index a tree can hold survives.
+//
+// the same enumeration against the two fixtures the plan wrote for this task
+// kills 382 and lets 1113 through. the sweeps are the other 1065.
 func Resolution(shape NodeShape, x NodeIndex) ([]NodeIndex, error) {
 	n := shape.LeafCount()
 	if err := checkLeafCount(n); err != nil {
