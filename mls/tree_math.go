@@ -551,3 +551,68 @@ func InSubtree(head NodeIndex, x NodeIndex) bool {
 	firstNode, lastNode := SubtreeSpan(head)
 	return firstNode <= x && x <= lastNode
 }
+
+// the minimal view of node contents the two shape rules need.
+//
+// tree.go implements this over the real ratchet tree, which keeps every public
+// key and credential out of this file. UnmergedLeaves returns the node's stored
+// list in stored order: that the list is sorted and that its entries are
+// non-blank leaves inside the node's subtree are RFC 9420 section 7.9
+// tree-validation checks and belong to tree_sync.go, not here.
+type NodeShape interface {
+	LeafCount() LeafCount
+	IsBlank(x NodeIndex) bool
+	UnmergedLeaves(x NodeIndex) []LeafIndex
+}
+
+// the ordered list of non-blank nodes that collectively cover every non-blank
+// descendant of x: a depth-first, left-first enumeration of the nearest
+// non-blank nodes below it.
+//
+// a non-blank node resolves to itself followed by its unmerged leaves, a blank
+// leaf to nothing, and a blank parent to its left child's resolution followed
+// by its right child's. the traversal uses an explicit stack so a deep tree
+// cannot become deep go stack.
+func Resolution(shape NodeShape, x NodeIndex) ([]NodeIndex, error) {
+	n := shape.LeafCount()
+	if err := checkLeafCount(n); err != nil {
+		return nil, err
+	}
+	if uint32(x) >= NodeWidth(n) {
+		return nil, ErrNodeOutOfRange
+	}
+
+	resolvedNodes := make([]NodeIndex, 0, 8)
+	pendingNodes := make([]NodeIndex, 0, 32)
+	pendingNodes = append(pendingNodes, x)
+	for len(pendingNodes) > 0 {
+		node := pendingNodes[len(pendingNodes)-1]
+		pendingNodes = pendingNodes[:len(pendingNodes)-1]
+
+		if !shape.IsBlank(node) {
+			resolvedNodes = append(resolvedNodes, node)
+			for _, leaf := range shape.UnmergedLeaves(node) {
+				if LeafCount(leaf) >= n {
+					return nil, ErrLeafOutOfRange
+				}
+				resolvedNodes = append(resolvedNodes, leaf.NodeIndex())
+			}
+			continue
+		}
+		if node.IsLeaf() {
+			continue
+		}
+
+		leftChild, err := Left(node)
+		if err != nil {
+			return nil, err
+		}
+		rightChild, err := Right(node)
+		if err != nil {
+			return nil, err
+		}
+		// pushed right first so the left child is popped first
+		pendingNodes = append(pendingNodes, rightChild, leftChild)
+	}
+	return resolvedNodes, nil
+}

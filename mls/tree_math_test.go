@@ -2960,3 +2960,130 @@ func TestInSubtreeEveryPairOfATree(t *testing.T) {
 		}
 	}
 }
+
+// a NodeShape backed by two explicit maps, so the worked examples RFC 9420
+// publishes can be written down node by node.
+type fixtureShape struct {
+	fixtureLeafCount   LeafCount
+	blankNodes         map[NodeIndex]bool
+	unmergedNodeLeaves map[NodeIndex][]LeafIndex
+}
+
+func (self *fixtureShape) LeafCount() LeafCount {
+	return self.fixtureLeafCount
+}
+
+func (self *fixtureShape) IsBlank(x NodeIndex) bool {
+	return self.blankNodes[x]
+}
+
+func (self *fixtureShape) UnmergedLeaves(x NodeIndex) []LeafIndex {
+	return self.unmergedNodeLeaves[x]
+}
+
+// RFC 9420 figure 10: an eight-leaf subtree with blanks and one unmerged leaf.
+//
+//	leaves A=0 B=2 _=4 D=6 E=8 F=10 _=12 H=14
+//	level one: _=1 _=5 Y=9 _=13
+//	level two: X=3 with unmerged leaf B, _=11
+//	level three: the top node = 7, blank
+func rfcFigure10Shape() *fixtureShape {
+	return &fixtureShape{
+		fixtureLeafCount: 8,
+		blankNodes: map[NodeIndex]bool{
+			1: true, 4: true, 5: true, 7: true, 11: true, 12: true, 13: true,
+		},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{
+			3: {1},
+		},
+	}
+}
+
+func TestResolutionRfcFigure10(t *testing.T) {
+	shape := rfcFigure10Shape()
+	resolutionCases := []struct {
+		label      string
+		nodeIndex  NodeIndex
+		resolution []NodeIndex
+	}{
+		// the resolution of a non-blank node is itself followed by its
+		// unmerged leaves.
+		{label: "X", nodeIndex: 3, resolution: []NodeIndex{3, 2}},
+		// the resolution of a blank leaf is empty.
+		{label: "leaf 2", nodeIndex: 4, resolution: []NodeIndex{}},
+		{label: "leaf 6", nodeIndex: 12, resolution: []NodeIndex{}},
+		// the resolution of a blank intermediate node concatenates its
+		// children, left first.
+		{label: "top node", nodeIndex: 7, resolution: []NodeIndex{3, 2, 9, 14}},
+		{label: "Y", nodeIndex: 9, resolution: []NodeIndex{9}},
+		{label: "node 13", nodeIndex: 13, resolution: []NodeIndex{14}},
+		{label: "node 11", nodeIndex: 11, resolution: []NodeIndex{9, 14}},
+		{label: "node 1", nodeIndex: 1, resolution: []NodeIndex{0, 2}},
+	}
+	for _, c := range resolutionCases {
+		got, err := Resolution(shape, c.nodeIndex)
+		if err != nil {
+			t.Errorf("%s resolution: %v", c.label, err)
+			continue
+		}
+		assertNodeIndexes(t, c.label+" resolution", got, c.resolution)
+	}
+}
+
+func TestResolutionEdges(t *testing.T) {
+	// a fully populated tree resolves to its root.
+	populated := &fixtureShape{
+		fixtureLeafCount:   8,
+		blankNodes:         map[NodeIndex]bool{},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	got, err := Resolution(populated, 7)
+	if err != nil {
+		t.Fatalf("populated root resolution: %v", err)
+	}
+	assertNodeIndexes(t, "populated root resolution", got, []NodeIndex{7})
+
+	// blank every parent and the resolution of the root is exactly the leaves,
+	// left to right.
+	blankParents := &fixtureShape{
+		fixtureLeafCount:   8,
+		blankNodes:         map[NodeIndex]bool{1: true, 3: true, 5: true, 7: true, 9: true, 11: true, 13: true},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	got, err = Resolution(blankParents, 7)
+	if err != nil {
+		t.Fatalf("blank-parent root resolution: %v", err)
+	}
+	assertNodeIndexes(t, "blank-parent root resolution", got, []NodeIndex{0, 2, 4, 6, 8, 10, 12, 14})
+
+	// an entirely blank tree resolves to nothing.
+	allBlank := &fixtureShape{
+		fixtureLeafCount:   8,
+		blankNodes:         map[NodeIndex]bool{},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	for i := uint32(0); i < NodeWidth(8); i += 1 {
+		allBlank.blankNodes[NodeIndex(i)] = true
+	}
+	got, err = Resolution(allBlank, 7)
+	if err != nil {
+		t.Fatalf("all-blank root resolution: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("all-blank root resolution: %v, want empty", got)
+	}
+
+	if _, err := Resolution(rfcFigure10Shape(), 15); !errors.Is(err, ErrNodeOutOfRange) {
+		t.Errorf("resolution of node 15: %v, want %v", err, ErrNodeOutOfRange)
+	}
+
+	// an unmerged leaf outside the tree is a malformed shape, not a panic.
+	malformed := &fixtureShape{
+		fixtureLeafCount:   8,
+		blankNodes:         map[NodeIndex]bool{},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{7: {99}},
+	}
+	if _, err := Resolution(malformed, 7); !errors.Is(err, ErrLeafOutOfRange) {
+		t.Errorf("resolution with an out-of-range unmerged leaf: %v, want %v", err, ErrLeafOutOfRange)
+	}
+}
