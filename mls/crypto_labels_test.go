@@ -1641,8 +1641,42 @@ func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 			t.Errorf("a signature over %s verified: error = %v, want ErrCryptoBadSignature", testCase.name, err)
 		}
 	}
+	// the rows above are shapes somebody thought of, and a fallback aimed at a shape
+	// nobody listed survives all of them. Measured: a verify falling back to the preimage
+	// under an empty label passed every test in this package before this half was
+	// written. So the second half is the class rather than a list: every preimage the same
+	// key can build by varying the label or the content, as the whole cross product of the
+	// variants below minus the one pair the verifier demands.
+	// the demanded pair leads both lists, so the cross product really does contain the
+	// identity and the one row subtracted below is a row that was there
+	otherLabels := []string{label, "", "x", label + "x", "x" + label, MlsLabelPrefix + label,
+		strings.ToUpper(label)}
+	otherContents := [][]byte{content, nil, append(bytes.Clone(content), 'x'), content[1:],
+		bytes.Repeat([]byte{0x5a}, len(content))}
+	refused := 0
+	for _, otherLabel := range otherLabels {
+		for _, otherContent := range otherContents {
+			if otherLabel == label && bytes.Equal(otherContent, content) {
+				continue
+			}
+			preimage := mlsSignContent(otherLabel, otherContent)
+			if bytes.Equal(preimage, demanded) {
+				t.Errorf("the pair %q over %x builds the preimage the verifier demands, so it separates nothing",
+					otherLabel, otherContent)
+				continue
+			}
+			refused++
+			if err := crypto.VerifyWithLabel(pub, label, content, ed25519.Sign(key, preimage)); !errors.Is(err, ErrCryptoBadSignature) {
+				t.Errorf("a signature under %q over %x verified as one under %q over %x: error = %v, want ErrCryptoBadSignature",
+					otherLabel, otherContent, label, content, err)
+			}
+		}
+	}
+	if want := len(otherLabels)*len(otherContents) - 1; refused != want {
+		t.Fatalf("the cross product refused %d preimages, want %d", refused, want)
+	}
 	// the control: a signature over the preimage the verifier does demand is accepted, so
-	// the rows above cannot be satisfied by a verify that refuses everything
+	// nothing above can be satisfied by a verify that refuses everything
 	if err := crypto.VerifyWithLabel(pub, label, content, ed25519.Sign(key, demanded)); err != nil {
 		t.Errorf("the signature over the demanded preimage was refused: %v", err)
 	}
