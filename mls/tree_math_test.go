@@ -1248,11 +1248,15 @@ func checkPathsAgainstOracle(t *testing.T, level uint32, block uint64, depth uin
 // the absolute contents of both paths at every depth a tree can have, against
 // the layout oracle table 2 anchors.
 //
-// table 2 covers one depth. the vector family covers none of these two
-// functions at all, Task 13's sweep stops at depth 9 and asserts laws rather
-// than values, and the fuzz target asserts only that an answer is inside the
-// tree, so depths 10 to 31 are covered by nothing else in this package —
-// the same hole Tasks 5 and 6 each had to fill for their own functions.
+// table 2 covers one depth, the vector family covers none of these two
+// functions at all, and the fuzz target asserts only that an answer is inside
+// the tree. Task 13's sweep reaches every depth since this comment was first
+// written, but it asks a path what it is shaped like — its length, its
+// ascending levels, that every entry contains the node and every copath entry
+// is the other child of the entry beside it — and compares contents against the
+// layout only for the paths of leaves. the rows below are what pins the
+// contents of a parent's path above depth 9, which is the same hole Tasks 5
+// and 6 each had to fill for their own functions.
 //
 // measured rather than argued, in a scratch copy. a grammar over the two
 // bodies — the leaf count check, the range guard and its depth bands, what the
@@ -1717,10 +1721,13 @@ func TestCommonAncestorKnownValues(t *testing.T) {
 // opposite halves of a level-k node answer that node whatever levels they
 // themselves sit at.
 //
-// this is where the boundary lives. the vector family stops at 512 leaves, the
-// plan's own differential stops at depth 9, and the invariant sweep of Task 13
-// stops there too, so levels 10 to 31 are reached by nothing else in this
-// package. the ladders run to level 31 because that is the highest level the
+// this is where the boundary lives. the vector family stops at 512 leaves and
+// the plan's own differential stops at depth 9. Task 13's sweep reaches every
+// level since this comment was first written, but the only pairs it forms are a
+// node with its own sibling and a node with its own ancestor, which are exactly
+// the two shortcuts the implementation opens with; the third band below is the
+// one that puts two nodes from opposite halves of a level-k node at unequal
+// levels. the ladders run to level 31 because that is the highest level the
 // largest representable tree has.
 //
 // measured rather than argued, in a scratch copy. a grammar over the shipped
@@ -2332,10 +2339,11 @@ func reportSpan(t *testing.T, level uint32, block uint64) {
 // this is where the boundary lives, and it is the same boundary every task in
 // this plan has had to fill. the vector family stops at 512 leaves and so
 // reaches levels 0 to 9; the plan's own table for this task stops at level 3;
-// the structural sweep of Task 13 stops at 512 leaves too and asserts
-// containment, parity and width rather than the endpoints; and the fuzz target
-// asserts only that the span holds its own node. levels 10 to 31 are reached by
-// nothing else in this package.
+// and the fuzz target asserts only that the span holds its own node. the
+// structural sweep of Task 13 does assert both endpoints at every level since
+// this comment was first written, but only at the blocks it walks — every block
+// below 4096 at each level, and five more. this is the test that walks all
+// 2^32-1 of them.
 //
 // the leaf range is asserted beside the node span on every row, since the two
 // can disagree — the node span can be right while the halving that turns it
@@ -6323,8 +6331,10 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 // (level, block) pairs of which 86,015 are walked whole. the other
 // 4,294,881,280 are reached only where the ladder's five blocks land. a version
 // wrong over a run of blocks at one level, outside those, is not seen here.
-// that residual is what the walks in the rest of this file are sized against,
-// and the task report prices it against them one function at a time.
+// that residual is what the walks in the rest of this file are sized against.
+// measured, from outside: of the versions of Parent that are wrong at one block
+// of one level, this sweep kills every one at blocks 2^0 through 2^12 and none
+// at 2^13 and above.
 //
 // one thing here is narrower than it looks. both shape fixtures are shapes in
 // which nothing is ever filtered out: a tree with every parent blank resolves
@@ -6333,6 +6343,46 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 // direct path and no step is ever dropped. this sweep therefore never observes
 // the drop, at any depth. that arm belongs to Task 12's shape sweeps and is not
 // duplicated here.
+//
+// measured rather than argued, in a scratch copy, and the enumeration is read
+// off the file rather than written down: every function tree_math.go declares
+// is perturbed at its return, and a scan of the parsed source says which — 24
+// of the 26, with checkLeafCount returning only errors and commonAncestorRaw
+// reached through its wrapper. a scalar answer is perturbed by a single-bit
+// error confined to one level or one tree depth, a list answer by a dropped,
+// duplicated, truncated, swapped or bit-flipped element at each position, and
+// Parent again at one block of one level. that is 16,253 versions.
+//
+// this sweep kills 15,709 of them. the sweep the plan wrote kills 5,445, and
+// the whole of the difference is the band: at every level key from 10 to 31 the
+// plan's version kills none and this one kills all of them. what this sweep
+// kills that nothing else in this package kills is zero — every version it
+// fails is failed by some other test as well, so its value is that it asks
+// relations between the functions, against the layout, and not that it reaches
+// somewhere alone.
+//
+// what it does not kill is 544, and every one is named. 120 are perturbations
+// at index 0xFFFFFFFF, the level-32 index no tree holds, which a sweep of trees
+// cannot reach and TestSubtreeSpanArms owns. 166 are on the five leaf-count
+// functions this sweep never names, which are Task 3's. 51 are Parent wrong at
+// one block of 2^13 or above, which is exactly where the walk stops and which
+// TestFilteredDirectPathAtEveryDepth kills — measured, not assumed. 204 are
+// perturbations that cannot differ from this file for any input and are marked
+// rather than run, and the remaining 3 are the same thing found late: a swap of
+// positions 30 and 31 of a list that never holds 32 entries.
+//
+// the block boundary is the sharpest thing the enumeration says. of the
+// block-confined Parent versions, this sweep kills every one at blocks 2^0
+// through 2^12 and none at 2^13, 2^14 or 2^15. that is the walk, seen from
+// outside.
+//
+// two things the grammar cannot express, said here so the next reader does not
+// read its silence as coverage. it perturbs answers and never error arms, so
+// the rows here that assert a refusal — that a leaf has no children, that the
+// root has no parent or sibling — are not exercised by it at all. and of the 67
+// rows in this test, 39 are the first to fail on some version of the class and
+// 28 are not, which against this class makes them redundant with a row that
+// runs before them rather than dead.
 func TestTreeMathInvariants(t *testing.T) {
 	shallowNodes, deepNodes, ladderNodes := int64(0), int64(0), int64(0)
 	blankParentPaths, populatedPaths := 0, 0
@@ -6472,6 +6522,16 @@ func checkNodeInvariants(t *testing.T, shape NodeShape, depth uint32, root NodeI
 		if leftParent != nodeIndex || rightParent != nodeIndex {
 			t.Fatalf("%d leaves: parents of the children of %d: %d and %d", leafCount, nodeIndex, leftParent, rightParent)
 		}
+	}
+
+	// a node is its own ancestor, which RFC 9420 appendix C states and which is
+	// the one pair this sweep would otherwise never form. every other pair it
+	// builds answers a parent or a higher ancestor, so the reflexive answer —
+	// the only one that can be a leaf — went unasked, and the enumeration found
+	// it: thirty-two versions of CommonAncestor whose answer is perturbed at
+	// level zero passed this sweep without this row and fail with it.
+	if CommonAncestor(nodeIndex, nodeIndex) != nodeIndex {
+		t.Fatalf("%d leaves: common ancestor of %d with itself: %d", leafCount, nodeIndex, CommonAncestor(nodeIndex, nodeIndex))
 	}
 
 	// parent and sibling: defined for every node but the root, and the sibling
