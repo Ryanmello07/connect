@@ -5201,3 +5201,285 @@ func TestFilteredDirectPathEdges(t *testing.T) {
 		}
 	}
 }
+
+// the levels a published corpus reaches as the level of a dropped node, one
+// slot per level, which is what says where a corpus stops being an oracle for
+// the filter and starts being an oracle only for the copy.
+const filteredDropLevels = 8
+
+// every leaf of every ratchet tree the tree-validation family publishes, with
+// the expected filtered path derived from the published resolutions.
+//
+// this is the strongest oracle in this file for the filter. the family
+// publishes the resolution of every node of 98 real trees carrying 1036 blank
+// nodes, so the expectation here reaches nothing of this package at all: the
+// direct path and the copath come from pathOracle, which table 2 anchors, and
+// the emptiness comes from the working group's own published list. what it
+// asserts is the contents and not the length, at every leaf of every tree.
+//
+// the drop counts are asserted per level as well as in total. a tree with no
+// blanks has a filtered path identical to its direct path, so a corpus that
+// happened to be fully populated would confirm a filter that does nothing at
+// all; 1925 of the 7966 direct-path nodes here are dropped, at levels 1
+// through 5, and a version of this test that stopped decoding early would
+// report a clean sweep with a smaller number in every one of those slots.
+//
+// the widths reached are 3, 7, 15, 63 and 127, so nothing above level 6 is a
+// path node and nothing above level 5 is ever dropped. the sweeps below carry
+// the depth and this carries the provenance.
+func TestFilteredDirectPathAgainstPublishedTreeValidationResolutions(t *testing.T) {
+	entries := LoadVectorFile(t, treeValidationVectorFile)
+	if len(entries) != treeValidationEntryCount {
+		t.Fatalf("tree-validation entries: %d, want %d", len(entries), treeValidationEntryCount)
+	}
+	confirmedLeaves, directNodes, filteredNodes, droppedNodes, pathsWithADrop := 0, 0, 0, 0, 0
+	dropsByLevel := [filteredDropLevels]int{}
+	for entry, raw := range entries {
+		vector := treeValidationVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("entry %d: %v", entry, err)
+		}
+		label := fmt.Sprintf("tree-validation entry %d", entry)
+		tree, err := hex.DecodeString(vector.Tree)
+		if err != nil {
+			t.Fatalf("%s: the ratchet tree is not hex: %v", label, err)
+		}
+		shape, width := decodeRatchetTreeShape(t, label, tree)
+		if width != len(vector.Resolutions) {
+			t.Fatalf("%s: node width %d from the tree, %d published resolutions",
+				label, width, len(vector.Resolutions))
+		}
+		// the depth from the width, without asking the arithmetic under test:
+		// a tree of depth d is 2^(d+1)-1 slots wide.
+		depth := uint32(0)
+		for uint32(1)<<(depth+1)-1 < uint32(width) {
+			depth += 1
+		}
+		for leaf := uint64(0); leaf < uint64(1)<<depth; leaf += 1 {
+			directPath, copathNodes := pathOracle(0, leaf, depth)
+			want := []PathStep{}
+			for i := range directPath {
+				if len(vector.Resolutions[copathNodes[i]]) == 0 {
+					droppedNodes += 1
+					copathLevel, _ := nodeLevelAndBlock(copathNodes[i])
+					dropsByLevel[copathLevel+1] += 1
+					continue
+				}
+				want = append(want, PathStep{Node: directPath[i], CopathChild: copathNodes[i]})
+			}
+			got, err := FilteredDirectPath(shape, LeafIndex(leaf))
+			if err != nil {
+				t.Fatalf("%s: leaf %d: %v", label, leaf, err)
+			}
+			if !samePathSteps(got, want) {
+				t.Fatalf("%s: leaf %d: %v, want %v derived from the published resolutions",
+					label, leaf, got, want)
+			}
+			confirmedLeaves += 1
+			directNodes += len(directPath)
+			filteredNodes += len(want)
+			if len(want) != len(directPath) {
+				pathsWithADrop += 1
+			}
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "leaves", got: confirmedLeaves, want: 1638},
+		{label: "direct path nodes", got: directNodes, want: 7966},
+		{label: "filtered path nodes", got: filteredNodes, want: 6041},
+		{label: "dropped nodes", got: droppedNodes, want: 1925},
+		{label: "leaves that lose a node", got: pathsWithADrop, want: 560},
+		// per level, so a corpus that stopped being read after the small trees
+		// reports a smaller number in the levels only the large ones reach. a
+		// path node is never at level zero and the roots of these trees are
+		// never dropped, and both zeroes are asserted for the same reason the
+		// other five slots are.
+		{label: "drops at level 0", got: dropsByLevel[0], want: 0},
+		{label: "drops at level 1", got: dropsByLevel[1], want: 511},
+		{label: "drops at level 2", got: dropsByLevel[2], want: 462},
+		{label: "drops at level 3", got: dropsByLevel[3], want: 392},
+		{label: "drops at level 4", got: dropsByLevel[4], want: 336},
+		{label: "drops at level 5", got: dropsByLevel[5], want: 224},
+		{label: "drops at level 6", got: dropsByLevel[6], want: 0},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// one update path of the treekem family, decoded for the two fields this file
+// can be judged by.
+type treeKemUpdatePath struct {
+	Sender     uint32 `json:"sender"`
+	UpdatePath string `json:"update_path"`
+}
+
+// one entry of the treekem family: a ratchet tree and the update paths the
+// working group generated over it.
+type treeKemVector struct {
+	RatchetTree string              `json:"ratchet_tree"`
+	UpdatePaths []treeKemUpdatePath `json:"update_paths"`
+}
+
+// the family file, named relative to testdata/vectors exactly as
+// VectorFamily.File is.
+const treeKemVectorFile = "treekem.json"
+
+// the counts upstream publishes, so a decoder that quietly stopped early fails
+// here rather than reporting a clean sweep over three entries.
+const treeKemEntryCount = 77
+const treeKemUpdatePathCount = 434
+const treeKemPathNodeCount = 1155
+const treeKemCiphertextCount = 1246
+const treeKemDroppedNodeCount = 70
+
+// the number of nodes of one UpdatePath and the ciphertext count of each,
+// which are the two things of an update path this file is judged by.
+//
+// RFC 9420 section 7.4 puts one node in an UpdatePath per entry of the
+// sender's filtered direct path, and one encryption of that node's path secret
+// per entry of the resolution of the node's copath child. so the length of the
+// vector is a published filtered-path length and the counts inside it are
+// published resolution sizes, both generated by an implementation that is not
+// this one.
+//
+// everything else is skipped by length rather than interpreted, so no key,
+// signature or ciphertext is looked at and nothing cryptographic is reached
+// from here. a variable-length vector carries a byte count and not an element
+// count, which is why both loops here run to an offset rather than a number of
+// turns.
+func (self *presentationReader) readUpdatePathCiphertextCounts() []int {
+	self.skipLeafNode()
+	nodesLength := self.readLength()
+	if self.failed || self.offset+nodesLength > len(self.body) {
+		self.failed = true
+		return nil
+	}
+	nodesEnd := self.offset + nodesLength
+	ciphertextCounts := []int{}
+	for self.offset < nodesEnd && !self.failed {
+		self.skipOpaque() // encryption_key
+		ciphertextsLength := self.readLength()
+		if self.failed || self.offset+ciphertextsLength > len(self.body) {
+			self.failed = true
+			return nil
+		}
+		ciphertextsEnd := self.offset + ciphertextsLength
+		ciphertexts := 0
+		for self.offset < ciphertextsEnd && !self.failed {
+			self.skipOpaque() // kem_output
+			self.skipOpaque() // ciphertext
+			ciphertexts += 1
+		}
+		if self.failed || self.offset != ciphertextsEnd {
+			self.failed = true
+			return nil
+		}
+		ciphertextCounts = append(ciphertextCounts, ciphertexts)
+	}
+	if self.failed || self.offset != nodesEnd {
+		self.failed = true
+		return nil
+	}
+	return ciphertextCounts
+}
+
+// every update path the treekem family publishes, against the filtered direct
+// path of the leaf that sent it.
+//
+// the tree-validation family above publishes resolutions, which is what the
+// filter is defined in terms of; this one publishes the object the filter
+// exists to size. a working-group implementation put one node in each of these
+// 434 update paths per entry of the sender's filtered direct path, so the node
+// count is a published answer to exactly the question ValSem202 asks, and the
+// ciphertext count of each node is a published size for the resolution of that
+// step's copath child. neither is derived here.
+//
+// the trees are 3, 7 and 15 nodes wide with 189 blank nodes among them, and 70
+// of the 1225 direct-path nodes across the corpus are dropped, so the corpus
+// can tell a filter from a copy of the direct path. what it cannot do is reach
+// past level 3 or assert the identity of a node, and the two sweeps that
+// follow are what carry those.
+func TestFilteredDirectPathAgainstPublishedTreekemUpdatePaths(t *testing.T) {
+	entries := LoadVectorFile(t, treeKemVectorFile)
+	if len(entries) != treeKemEntryCount {
+		t.Fatalf("treekem entries: %d, want %d", len(entries), treeKemEntryCount)
+	}
+	updatePaths, pathNodes, ciphertexts, droppedNodes := 0, 0, 0, 0
+	for entry, raw := range entries {
+		vector := treeKemVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("entry %d: %v", entry, err)
+		}
+		label := fmt.Sprintf("treekem entry %d", entry)
+		tree, err := hex.DecodeString(vector.RatchetTree)
+		if err != nil {
+			t.Fatalf("%s: the ratchet tree is not hex: %v", label, err)
+		}
+		shape, width := decodeRatchetTreeShape(t, label, tree)
+		for _, published := range vector.UpdatePaths {
+			updatePath, err := hex.DecodeString(published.UpdatePath)
+			if err != nil {
+				t.Fatalf("%s: sender %d: the update path is not hex: %v", label, published.Sender, err)
+			}
+			reader := &presentationReader{body: updatePath, offset: 0, failed: false}
+			publishedCounts := reader.readUpdatePathCiphertextCounts()
+			if reader.failed || reader.offset != len(updatePath) {
+				t.Fatalf("%s: sender %d: the update path did not decode to a whole number of nodes",
+					label, published.Sender)
+			}
+
+			got, err := FilteredDirectPath(shape, LeafIndex(published.Sender))
+			if err != nil {
+				t.Fatalf("%s: sender %d: %v", label, published.Sender, err)
+			}
+			if len(got) != len(publishedCounts) {
+				t.Fatalf("%s: sender %d: %v, and the published update path carries %d nodes",
+					label, published.Sender, got, len(publishedCounts))
+			}
+			for i, step := range got {
+				resolution, err := Resolution(shape, step.CopathChild)
+				if err != nil {
+					t.Fatalf("%s: sender %d: step %d: %v", label, published.Sender, i, err)
+				}
+				if len(resolution) != publishedCounts[i] {
+					t.Fatalf("%s: sender %d: step %d %v: the copath child resolves to %d nodes and the published update path encrypts to %d",
+						label, published.Sender, i, step, len(resolution), publishedCounts[i])
+				}
+				ciphertexts += publishedCounts[i]
+			}
+			// the direct path of a leaf of this tree is one node per level, so
+			// what the filter removed is the depth less what it kept.
+			depth := uint32(0)
+			for uint32(1)<<(depth+1)-1 < uint32(width) {
+				depth += 1
+			}
+			updatePaths += 1
+			pathNodes += len(got)
+			droppedNodes += int(depth) - len(got)
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "published update paths", got: updatePaths, want: treeKemUpdatePathCount},
+		{label: "published update path nodes", got: pathNodes, want: treeKemPathNodeCount},
+		{label: "published encryptions of a path secret", got: ciphertexts, want: treeKemCiphertextCount},
+		// and the corpus has to filter something or it cannot tell the filter
+		// from the direct path it cuts.
+		{label: "nodes the filter removed", got: droppedNodes, want: treeKemDroppedNodeCount},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
