@@ -65,6 +65,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
 	"io"
 	"os"
 	"path/filepath"
@@ -3592,6 +3593,120 @@ func TestTheLabelledReceivingPathHasNoSecondContext(t *testing.T) {
 		control := mustParseText(t, testCase.name, testCase.control)
 		if slices.Equal(control.statementsOf(t, "", testCase.method), testCase.want) {
 			t.Errorf("the matcher read %s as the shape above", testCase.name)
+		}
+	}
+}
+
+// How many times one declaration names an identifier in its body, and whether it ever
+// assigns to it.
+//
+// A whole body pin is the wrong instrument below HpkeSetupBaseR: hpkeKeySchedule is
+// fifteen statements of another task work, and pinning it here would turn every legitimate
+// edit to the key schedule into a failure in this file. What this asks instead is the one
+// thing the labelled encryption needs from those frames, which is that they forward the
+// info rather than look at it.
+func identifierUsesIn(self parsedSource, t *testing.T, name string, identifier string) (uses int, assigned bool) {
+	t.Helper()
+	declaration := self.declarationOf(t, "", name)
+	ast.Inspect(declaration.Body, func(node ast.Node) bool {
+		if used, isIdentifier := node.(*ast.Ident); isIdentifier && used.Name == identifier {
+			uses++
+		}
+		assignment, isAssignment := node.(*ast.AssignStmt)
+		if !isAssignment {
+			return true
+		}
+		for _, target := range assignment.Lhs {
+			if written, isIdentifier := target.(*ast.Ident); isIdentifier && written.Name == identifier {
+				assigned = true
+			}
+		}
+		return true
+	})
+	return uses, assigned
+}
+
+// The frames of the receiving path that carry the info, and how often each may name it.
+//
+// Once, in every one of them. That is the whole property: the info a caller demanded is
+// forwarded down the path unexamined and reaches the extract that hashes it, so there is
+// nowhere on the way for a frame to notice what it is holding. A band conditional on the
+// info names it twice, in the condition and in the call; a frame that dropped it names it
+// twice as well, or assigns to it. Neither is a shape any legitimate edit to these
+// functions has a reason to take.
+var labelledReceivingPathFrames = []string{
+	"HpkeOpenBase", "HpkeSetupBaseR", "hpkeKeySchedule", "hpkeKeyScheduleContext",
+}
+
+// A key schedule that drops the info it was handed at one length.
+//
+// This is the last frame that still holds the info as bytes: below it the info has been
+// hashed into the key schedule context and there is nothing left to condition on. It is
+// also where the sweep and both pins ran out. Measured, the identical band written here
+// and gated on an info length of 5000 survived all 2528 tests, and it is a bypass rather
+// than a protocol split, because it maps the info the receiver demanded onto the nil a
+// sender never bound anything to.
+const infoDroppingKeyScheduleControl = `package mls
+
+func hpkeKeyScheduleContext(suiteId []byte, info []byte) []byte {
+	if len(info) == 5000 {
+		info = nil
+	}
+	pskIdHash := hpkeLabeledExtract(suiteId, nil, "psk_id_hash", nil)
+	infoHash := hpkeLabeledExtract(suiteId, nil, "info_hash", info)
+	keyScheduleContext := make([]byte, 0, 1+len(pskIdHash)+len(infoHash))
+	keyScheduleContext = append(keyScheduleContext, hpkeModeBase)
+	keyScheduleContext = append(keyScheduleContext, pskIdHash...)
+	return append(keyScheduleContext, infoHash...)
+}
+`
+
+// A key schedule that reads the info without assigning to it, so the counter has to be
+// what catches it rather than the assignment check.
+const infoReadingKeyScheduleControl = `package mls
+
+func hpkeKeyScheduleContext(suiteId []byte, info []byte) []byte {
+	pskIdHash := hpkeLabeledExtract(suiteId, nil, "psk_id_hash", nil)
+	infoHash := hpkeLabeledExtract(suiteId, nil, "info_hash", info)
+	if len(info) == 5000 {
+		infoHash = hpkeLabeledExtract(suiteId, nil, "info_hash", nil)
+	}
+	keyScheduleContext := make([]byte, 0, 1+len(pskIdHash)+len(infoHash))
+	keyScheduleContext = append(keyScheduleContext, hpkeModeBase)
+	keyScheduleContext = append(keyScheduleContext, pskIdHash...)
+	return append(keyScheduleContext, infoHash...)
+}
+`
+
+func TestTheLabelledReceivingPathForwardsItsInfoUnexamined(t *testing.T) {
+	for _, name := range labelledReceivingPathFrames {
+		source := sourceDeclaringPackageFunction(t, name)
+		uses, assigned := identifierUsesIn(source, t, name, "info")
+		if uses != 1 {
+			t.Errorf("%s names its info %d times, want once: a frame that looks at the info is a frame that can drop it",
+				name, uses)
+		}
+		if assigned {
+			t.Errorf("%s assigns to its info", name)
+		}
+	}
+	// and the counter reads each control as the different body it is, so a counter that
+	// stopped counting fails here rather than issuing the real bodies a clean bill
+	for _, testCase := range []struct {
+		name     string
+		control  string
+		assigned bool
+	}{
+		{name: "a key schedule that drops its info", control: infoDroppingKeyScheduleControl, assigned: true},
+		{name: "a key schedule that reads its info", control: infoReadingKeyScheduleControl, assigned: false},
+	} {
+		control := mustParseText(t, testCase.name, testCase.control)
+		uses, assigned := identifierUsesIn(control, t, "hpkeKeyScheduleContext", "info")
+		if uses == 1 {
+			t.Errorf("the counter read %s as naming its info once", testCase.name)
+		}
+		if assigned != testCase.assigned {
+			t.Errorf("the counter read %s as assigned = %v, want %v", testCase.name, assigned, testCase.assigned)
 		}
 	}
 }
