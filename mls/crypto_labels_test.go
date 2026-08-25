@@ -3495,3 +3495,103 @@ func TestDecryptWithLabelRefusesAnUnboundMessageAtEveryFieldLength(t *testing.T)
 		t.Fatalf("the three sweeps refused %d unbound messages, want %d", refused, unboundSweepRefusals)
 	}
 }
+
+// The two frames between HpkeOpen and the derived context, which still see the info.
+//
+// The pin above stops at HpkeOpen, and one frame further down is out of its reach and out
+// of the sweep reach at once: measured, the identical nil info fallback written inside
+// HpkeOpenBase and gated on an info length of 5000 survived all 2527 tests of this
+// package. Nothing else in the tree read those bodies as shapes, so a fallback there was
+// held by no test at all.
+//
+// These two rather than the whole chain. A lenient retry has to sit somewhere that sees
+// the open fail, and of everything DecryptWithLabel delegates into only HpkeOpenBase does:
+// HpkeSetupBaseR and hpkeKeySchedule are handed an info and build one context out of it,
+// with no failure to react to. HpkeSetupBaseR is pinned anyway because it is the frame a
+// second context would be built through, so a fallback moved down one more step is a shape
+// somebody has to change here as well.
+var hpkeOpenBaseStatements = []string{
+	"ctx, err := HpkeSetupBaseR(params, priv, kemOutput, info)",
+	"if err != nil {\n\treturn nil, err\n}",
+	"return ctx.Open(aad, ciphertext)",
+}
+
+var hpkeSetupBaseRStatements = []string{
+	"sharedSecret, err := hpkeDecap(params, priv, kemOutput)",
+	"if err != nil {\n\treturn nil, err\n}",
+	"return hpkeKeySchedule(params, sharedSecret, info)",
+}
+
+// The mutant this pin was written for, kept as the control that shows the pin rejects it.
+// It opens every authentic message, refuses every altered one, refuses every reframing the
+// sweep reaches, and accepts a message sealed with no info at all whenever the receiver
+// demanded one of exactly 5000 bytes.
+const lenientOpenBaseControl = `package mls
+
+func HpkeOpenBase(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	ctx, err := HpkeSetupBaseR(params, priv, kemOutput, info)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, openErr := ctx.Open(aad, ciphertext)
+	if openErr != nil && len(info) == 5000 {
+		lenient, lenientErr := HpkeSetupBaseR(params, priv, kemOutput, nil)
+		if lenientErr != nil {
+			return nil, lenientErr
+		}
+		return lenient.Open(aad, ciphertext)
+	}
+	return plaintext, openErr
+}
+`
+
+// A setup that builds a second context under no info when the first one decapsulates.
+// It cannot see an open fail, so on its own it changes no answer; what it is here for is
+// that a fallback pushed down out of HpkeOpenBase has to be written through this frame.
+const secondContextSetupControl = `package mls
+
+func HpkeSetupBaseR(params *SuiteParams, priv HpkePrivateKey, kemOutput []byte, info []byte) (*HpkeContext, error) {
+	sharedSecret, err := hpkeDecap(params, priv, kemOutput)
+	if err != nil {
+		return nil, err
+	}
+	if len(info) == 5000 {
+		return hpkeKeySchedule(params, sharedSecret, nil)
+	}
+	return hpkeKeySchedule(params, sharedSecret, info)
+}
+`
+
+func TestTheLabelledReceivingPathHasNoSecondContext(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		want []string
+	}{
+		{name: "HpkeOpenBase", want: hpkeOpenBaseStatements},
+		{name: "HpkeSetupBaseR", want: hpkeSetupBaseRStatements},
+	} {
+		source := sourceDeclaringPackageFunction(t, testCase.name)
+		if got := source.statementsOf(t, "", testCase.name); !slices.Equal(got, testCase.want) {
+			t.Errorf("%s is\n%s\nwant\n%s", testCase.name,
+				strings.Join(got, "\n"), strings.Join(testCase.want, "\n"))
+		}
+	}
+	// and the matcher reads each control as the different body it is, so a matcher that
+	// stopped matching fails here rather than issuing the real bodies a clean bill
+	for _, testCase := range []struct {
+		name    string
+		method  string
+		control string
+		want    []string
+	}{
+		{name: "an open base that retries with no info", method: "HpkeOpenBase",
+			control: lenientOpenBaseControl, want: hpkeOpenBaseStatements},
+		{name: "a setup that builds a second context", method: "HpkeSetupBaseR",
+			control: secondContextSetupControl, want: hpkeSetupBaseRStatements},
+	} {
+		control := mustParseText(t, testCase.name, testCase.control)
+		if slices.Equal(control.statementsOf(t, "", testCase.method), testCase.want) {
+			t.Errorf("the matcher read %s as the shape above", testCase.name)
+		}
+	}
+}
