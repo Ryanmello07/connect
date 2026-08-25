@@ -2400,3 +2400,402 @@ func TestThePackageLevelFunctionScanReadsEveryNonTestFile(t *testing.T) {
 		t.Errorf("the package level function scan read %v, and this package's non test source is %v", scanned, source)
 	}
 }
+
+// The named types of one parsed file whose underlying type is a byte slice.
+//
+// A construction taking an HpkePublicKey is handed a caller's array exactly as one taking
+// a []byte is, and to the compiler the two are the same storage. A filter matching the
+// spelling []byte alone would drop nine of this package's constructions out of the class
+// below and report the clean run a complete filter reports.
+func packageByteSliceTypeNamesIn(parsed parsedSource) []string {
+	names := []string{}
+	for _, declaration := range parsed.file.Decls {
+		types, isTypeDeclaration := declaration.(*ast.GenDecl)
+		if !isTypeDeclaration || types.Tok != token.TYPE {
+			continue
+		}
+		for _, specification := range types.Specs {
+			named, isNamed := specification.(*ast.TypeSpec)
+			if !isNamed {
+				continue
+			}
+			slice, isSlice := named.Type.(*ast.ArrayType)
+			if !isSlice || slice.Len != nil || parsed.render(slice.Elt) != "byte" {
+				continue
+			}
+			names = append(names, named.Name.Name)
+		}
+	}
+	return names
+}
+
+// Every type of this package's non test source that is a byte slice under another name.
+func packageByteSliceTypeNames(t *testing.T) []string {
+	t.Helper()
+	names := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		names = append(names, packageByteSliceTypeNamesIn(mustParseSource(t, path))...)
+	}
+	if len(names) == 0 {
+		t.Fatalf("this package names no byte slice type, so the class below is filtered on a spelling")
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Every package level construction of this package that is handed a caller's bytes.
+//
+// This is the class the immutability gate below covers, read off the parse tree rather
+// than typed out. A construction taking no byte slice cannot write into an array it was
+// handed, so the filter is the property rather than a list somebody keeps in step.
+func packageLevelFunctionsTakingCallerBytes(t *testing.T) []string {
+	t.Helper()
+	byteSlices := slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t))
+	names := []string{}
+	for _, function := range packageLevelFunctions(t).functions {
+		for _, parameter := range function.parameters {
+			if slices.Contains(byteSlices, parameter) {
+				names = append(names, function.name)
+				break
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatalf("no package level function of this package is handed bytes, so the gate below demands nothing")
+	}
+	slices.Sort(names)
+	return names
+}
+
+// The constructions whose answer carries no bytes, named with what they answer instead.
+//
+// The aliasing, determinism and fresh storage halves of the gate below read a construction's
+// byte results, and these have none to read. Naming them rather than letting a row quietly
+// answer with nothing is what keeps the gate from passing over a row that stopped returning
+// its result: a name that is not here must answer with bytes, and a name that is here must
+// not.
+var packageConstructionsAnsweringNoBytes = map[string]string{
+	"hpkeNewAead":      "answers a cipher.AEAD over the key, and the key is what this reads",
+	"hpkeKeySchedule":  "answers an *HpkeContext holding the derivations rather than the bytes",
+	"HpkeSetupBaseR":   "answers an *HpkeContext, the recipient half having no wire output",
+	"X25519PrivateKey": "answers an *ecdh.PrivateKey, which is the library's own storage",
+	"X25519PublicKey":  "answers an *ecdh.PublicKey, which is the library's own storage",
+}
+
+// A construction handed a caller's bytes that this gate does not hold, named with the
+// reason. Nothing is excusable today; the map exists so that a construction which cannot
+// be held is a line somebody writes on purpose rather than one left out of the table.
+var packageConstructionsOverBorrowedBytes = map[string]string{}
+
+// Every construction this package hands a caller's array leaves that array alone, answers
+// the same thing twice and answers out of storage of its own.
+//
+// What these are handed is a group's own secret, a serialized key package, somebody's
+// framed proposal, a peer's public key or a ciphertext off the wire, and every one of them
+// is read again after the call. A construction that wrote into the array its argument was
+// cut from would corrupt the object it was asked to name, and one that answered out of
+// storage it keeps would hand two callers the same bytes. Neither is visible in any digest,
+// any published vector or any round trip: the answer is right, and the caller's buffer is
+// wrong afterwards.
+//
+// The arguments go through a recorder, so each is cut from a longer array whose spare
+// capacity holds a pattern rather than zeros: a construction that appends a byte to save an
+// allocation leaves len alone, and against a zeroed array it would leave the bytes past len
+// looking untouched as well.
+//
+// The scope is the package and not one file. The gate this replaces enumerated
+// crypto_labels.go, which is the defect task 12 paid for one layer over — the identical
+// scribble into a caller's spare capacity failed in the file the gate named and passed in
+// every other file of the package, and hpke.go's fourteen constructions over caller bytes
+// were held by nothing at all. It lives here rather than beside the labelled constructions
+// for the same reason: the class is the package's, so the gate is the package's.
+//
+// Determinism is checkable for the three constructions that draw an ephemeral key because
+// they are handed the reader they draw from, and a constant reader hands them the same key
+// twice.
+func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite these rows are built over: %v", err)
+	}
+	value := bytes.Repeat([]byte{0x21}, 96)
+	suiteId := hpkeSuiteId(params)
+	kemSuiteId := hpkeKemSuiteId(params)
+	ikm := bytes.Repeat([]byte{0x31}, params.Nsk)
+	priv, pub, err := HpkeDeriveKeyPair(params, ikm)
+	if err != nil {
+		t.Fatalf("derive the key pair these rows are built over: %v", err)
+	}
+	sharedSecret, kemOutput, err := hpkeEncap(constantReader{value: 0x77}, params, pub)
+	if err != nil {
+		t.Fatalf("encapsulate the shared secret these rows are built over: %v", err)
+	}
+	info := []byte("the info every hpke row carries")
+	aad := []byte("the aad every hpke row carries")
+	plaintext := []byte("the plaintext every hpke row carries")
+	sealedKemOutput, sealedCiphertext, err := HpkeSealBase(constantReader{value: 0x66}, params, pub, info, aad, plaintext)
+	if err != nil {
+		t.Fatalf("seal the ciphertext the open rows read: %v", err)
+	}
+	key := bytes.Repeat([]byte{0x44}, params.Nk)
+	covered := []string{}
+	for _, testCase := range []struct {
+		name string
+		call func(take func(content []byte) []byte) [][]byte
+	}{
+		{name: "mlsKdfLabel", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{mlsKdfLabel("label", take(value), 32)}
+		}},
+		{name: "RefHash", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{RefHash(crypto, "MLS 1.0 a label", take(value))}
+		}},
+		{name: "MakeKeyPackageRef", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{MakeKeyPackageRef(crypto, take(value))}
+		}},
+		{name: "MakeProposalRef", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{MakeProposalRef(crypto, take(value))}
+		}},
+		{name: "hpkeLabeledExtract", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{hpkeLabeledExtract(take(kemSuiteId), take(ikm), "eae_prk", take(sharedSecret))}
+		}},
+		{name: "hpkeLabeledExpand", call: func(take func([]byte) []byte) [][]byte {
+			expanded, expandErr := hpkeLabeledExpand(take(kemSuiteId), take(sharedSecret), "shared_secret", take(info), 32)
+			if expandErr != nil {
+				t.Fatalf("hpkeLabeledExpand: %v", expandErr)
+			}
+			return [][]byte{expanded}
+		}},
+		{name: "HpkeDeriveKeyPair", call: func(take func([]byte) []byte) [][]byte {
+			derivedPriv, derivedPub, deriveErr := HpkeDeriveKeyPair(params, take(ikm))
+			if deriveErr != nil {
+				t.Fatalf("HpkeDeriveKeyPair: %v", deriveErr)
+			}
+			return [][]byte{derivedPriv, derivedPub}
+		}},
+		{name: "hpkeExtractAndExpand", call: func(take func([]byte) []byte) [][]byte {
+			secret, expandErr := hpkeExtractAndExpand(params, take(sharedSecret), take(kemOutput))
+			if expandErr != nil {
+				t.Fatalf("hpkeExtractAndExpand: %v", expandErr)
+			}
+			return [][]byte{secret}
+		}},
+		{name: "hpkeEncap", call: func(take func([]byte) []byte) [][]byte {
+			secret, encapsulated, encapErr := hpkeEncap(constantReader{value: 0x77}, params, HpkePublicKey(take(pub)))
+			if encapErr != nil {
+				t.Fatalf("hpkeEncap: %v", encapErr)
+			}
+			return [][]byte{secret, encapsulated}
+		}},
+		{name: "hpkeEncapDeterministic", call: func(take func([]byte) []byte) [][]byte {
+			secret, encapsulated, encapErr := hpkeEncapDeterministic(params, HpkePublicKey(take(pub)), HpkePrivateKey(take(priv)))
+			if encapErr != nil {
+				t.Fatalf("hpkeEncapDeterministic: %v", encapErr)
+			}
+			return [][]byte{secret, encapsulated}
+		}},
+		{name: "hpkeDecap", call: func(take func([]byte) []byte) [][]byte {
+			secret, decapErr := hpkeDecap(params, HpkePrivateKey(take(priv)), take(kemOutput))
+			if decapErr != nil {
+				t.Fatalf("hpkeDecap: %v", decapErr)
+			}
+			return [][]byte{secret}
+		}},
+		{name: "hpkeNewAead", call: func(take func([]byte) []byte) [][]byte {
+			if _, aeadErr := hpkeNewAead(params, take(key)); aeadErr != nil {
+				t.Fatalf("hpkeNewAead: %v", aeadErr)
+			}
+			return nil
+		}},
+		{name: "hpkeKeyScheduleContext", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{hpkeKeyScheduleContext(take(suiteId), take(info))}
+		}},
+		{name: "hpkeKeySchedule", call: func(take func([]byte) []byte) [][]byte {
+			if _, scheduleErr := hpkeKeySchedule(params, take(sharedSecret), take(info)); scheduleErr != nil {
+				t.Fatalf("hpkeKeySchedule: %v", scheduleErr)
+			}
+			return nil
+		}},
+		{name: "HpkeSetupBaseS", call: func(take func([]byte) []byte) [][]byte {
+			encapsulated, _, setupErr := HpkeSetupBaseS(constantReader{value: 0x66}, params, HpkePublicKey(take(pub)), take(info))
+			if setupErr != nil {
+				t.Fatalf("HpkeSetupBaseS: %v", setupErr)
+			}
+			return [][]byte{encapsulated}
+		}},
+		{name: "HpkeSetupBaseR", call: func(take func([]byte) []byte) [][]byte {
+			_, setupErr := HpkeSetupBaseR(params, HpkePrivateKey(take(priv)), take(sealedKemOutput), take(info))
+			if setupErr != nil {
+				t.Fatalf("HpkeSetupBaseR: %v", setupErr)
+			}
+			return nil
+		}},
+		{name: "HpkeSealBase", call: func(take func([]byte) []byte) [][]byte {
+			encapsulated, ciphertext, sealErr := HpkeSealBase(constantReader{value: 0x66}, params,
+				HpkePublicKey(take(pub)), take(info), take(aad), take(plaintext))
+			if sealErr != nil {
+				t.Fatalf("HpkeSealBase: %v", sealErr)
+			}
+			return [][]byte{encapsulated, ciphertext}
+		}},
+		{name: "HpkeOpenBase", call: func(take func([]byte) []byte) [][]byte {
+			opened, openErr := HpkeOpenBase(params, HpkePrivateKey(take(priv)), take(sealedKemOutput),
+				take(info), take(aad), take(sealedCiphertext))
+			if openErr != nil {
+				t.Fatalf("HpkeOpenBase: %v", openErr)
+			}
+			return [][]byte{opened}
+		}},
+		{name: "X25519PrivateKey", call: func(take func([]byte) []byte) [][]byte {
+			if _, keyErr := X25519PrivateKey(take(priv)); keyErr != nil {
+				t.Fatalf("X25519PrivateKey: %v", keyErr)
+			}
+			return nil
+		}},
+		{name: "X25519PublicKey", call: func(take func([]byte) []byte) [][]byte {
+			if _, keyErr := X25519PublicKey(take(pub)); keyErr != nil {
+				t.Fatalf("X25519PublicKey: %v", keyErr)
+			}
+			return nil
+		}},
+	} {
+		covered = append(covered, testCase.name)
+		recorder := &argumentRecorder{}
+		first := testCase.call(recorder.take)
+		if len(recorder.arrays) == 0 {
+			t.Errorf("%s was handed nothing, so this row observed nothing", testCase.name)
+			continue
+		}
+		if changed := recorder.changed(); len(changed) != 0 {
+			t.Errorf("%s changed the storage behind arguments %v of the %d it was handed",
+				testCase.name, changed, len(recorder.arrays))
+		}
+		_, answersNoBytes := packageConstructionsAnsweringNoBytes[testCase.name]
+		if answersNoBytes {
+			if len(first) != 0 {
+				t.Errorf("%s is named as answering no bytes and answered %d results", testCase.name, len(first))
+			}
+			continue
+		}
+		if len(first) == 0 {
+			t.Errorf("%s answered with nothing, so this row observed nothing", testCase.name)
+			continue
+		}
+		second := testCase.call((&argumentRecorder{}).take)
+		if len(second) != len(first) {
+			t.Errorf("%s answered %d results and then %d for one input", testCase.name, len(first), len(second))
+			continue
+		}
+		for i, answer := range first {
+			if len(answer) == 0 {
+				t.Errorf("%s answered nothing in result %d, so that result observed nothing", testCase.name, i)
+				continue
+			}
+			if recorder.aliases(answer) {
+				t.Errorf("%s answered result %d over one of its arguments", testCase.name, i)
+			}
+			if !bytes.Equal(answer, second[i]) {
+				t.Errorf("%s answered %x and then %x in result %d for one input",
+					testCase.name, answer, second[i], i)
+			}
+			if len(second[i]) != 0 && &answer[0] == &second[i][0] {
+				t.Errorf("two calls to %s answered result %d out of the same array", testCase.name, i)
+			}
+		}
+	}
+	// and the table names every construction this package hands a caller's bytes rather
+	// than the ones this test happened to think of
+	declared := packageLevelFunctionsTakingCallerBytes(t)
+	want := []string{}
+	for _, name := range declared {
+		if _, isExcused := packageConstructionsOverBorrowedBytes[name]; !isExcused {
+			want = append(want, name)
+		}
+	}
+	slices.Sort(covered)
+	if !slices.Equal(covered, want) {
+		t.Errorf("this gate covers %v, and the package hands bytes to %v", covered, want)
+	}
+	for name := range packageConstructionsOverBorrowedBytes {
+		if !slices.Contains(declared, name) {
+			t.Errorf("the gate excuses %s, which no construction of this package declares", name)
+		}
+	}
+	for name := range packageConstructionsAnsweringNoBytes {
+		if !slices.Contains(declared, name) {
+			t.Errorf("%s is named as answering no bytes, and no construction of this package declares it", name)
+		}
+	}
+}
+
+// The byte slice type scan reads a name as the storage it is.
+//
+// Every construction of hpke.go takes its keys under a name rather than as a []byte, so a
+// scan that read only the spelling []byte would drop them out of the class above — and a
+// class that shrank is a gate that demands less while reporting exactly what it reported
+// before. The control names a byte slice, a slice of something else, an array of bytes and
+// a name for a name, so a scan that matched on the word byte alone fails here.
+func TestTheByteSliceTypeScanReadsNamedStorage(t *testing.T) {
+	parsed := mustParseText(t, "the named storage control", namedByteSliceControl)
+	found := packageByteSliceTypeNamesIn(parsed)
+	slices.Sort(found)
+	if want := []string{"AnotherKey", "SomeKey"}; !slices.Equal(found, want) {
+		t.Errorf("the byte slice type scan read %v out of the control, want %v", found, want)
+	}
+	// and the real package's named storage is read the same way
+	if named := packageByteSliceTypeNames(t); !slices.Contains(named, "HpkePublicKey") {
+		t.Errorf("the byte slice type scan read %v out of this package, which names HpkePublicKey", named)
+	}
+}
+
+// Four type declarations, one of which is a byte slice under another name and three of
+// which are not. Every byte slice scan above runs on this as well, so one that started
+// matching a fixed array or a slice of something else fails here rather than widening the
+// class in silence.
+const namedByteSliceControl = `package mls
+
+type SomeKey []byte
+
+type AnotherKey []byte
+
+type NotAKey []uint16
+
+type NotASlice [32]byte
+
+type NotStorage SomeKey
+`
+
+// The recorder can see the smallest write a construction makes into its caller's array.
+//
+// Every immutability gate in this package is only as good as what the recorder fills the
+// spare capacity with. Fill it with zeros and the commonest defect of the class — an
+// append that saves an allocation by writing a zero byte past the caller's length —
+// changes nothing the recorder can compare, and every row of every gate above reports the
+// clean run it reports today. Measured: with the pattern replaced by zeros, a scribble
+// into hpkeDecap's kem output survives the whole package.
+//
+// The aliasing half has the same shape. A result cut from the middle of a caller's array
+// shares that array's storage exactly as one cut from the front does, and a check that
+// compared only against each argument's first byte would call it fresh.
+func TestTheArgumentRecorderSeesTheSmallestWrite(t *testing.T) {
+	appended := &argumentRecorder{}
+	argument := appended.take(bytes.Repeat([]byte{0x11}, 8))
+	_ = append(argument, 0x00)
+	if changed := appended.changed(); len(changed) != 1 {
+		t.Errorf("the recorder reported %v changed after a zero was appended into the spare capacity behind its one argument, want the argument",
+			changed)
+	}
+	untouched := &argumentRecorder{}
+	untouched.take(bytes.Repeat([]byte{0x11}, 8))
+	if changed := untouched.changed(); len(changed) != 0 {
+		t.Errorf("the recorder reported %v changed after nothing was written, so it cannot tell a write from a read", changed)
+	}
+	aliasing := &argumentRecorder{}
+	borrowed := aliasing.take(bytes.Repeat([]byte{0x11}, 8))
+	if !aliasing.aliases(borrowed[4:]) {
+		t.Errorf("the recorder read a result cut from the middle of its argument as storage of its own")
+	}
+	if aliasing.aliases(bytes.Repeat([]byte{0x11}, 8)) {
+		t.Errorf("the recorder read a fresh array holding the same bytes as one of its arguments")
+	}
+}
