@@ -5805,13 +5805,27 @@ func checkFilteredPathRelations(t *testing.T, label string, shape NodeShape, lea
 // resolution to O(depth) nodes, which is what makes the levels assertable at
 // all, and the sweep that follows carries the drop arm at the price it costs.
 func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
-	checked := int64(0)
-	stepsByArm, dropsByArm := [4]int64{}, [4]int64{}
+	checked, pathsWithANode := int64(0), int64(0)
+	stepsByArm, dropsByArm, walkedByArm := [4]int64{}, [4]int64{}, [4]int64{}
 	for depth := uint32(0); depth <= 31; depth += 1 {
 		leaves := LeafCount(1) << depth
 		sweepLeaves := []LeafIndex{0, LeafIndex(uint64(leaves) - 1)}
 		for probe := uint64(1); probe <= 6; probe += 1 {
 			sweepLeaves = append(sweepLeaves, LeafIndex(probe*resolutionLeafStride%uint64(leaves)))
+		}
+		// and the leftmost leaf under a named block of every level, so the
+		// path this arm walks passes through those blocks rather than through
+		// whatever the stride happens to reach. a kept node costs one query
+		// wherever it is, so the block set here is as wide as it likes where
+		// the drop arm's is what its 2^(k+1)-1 pays for. measured: with the
+		// eight leaves above alone, a version that forced a drop at block 9 of
+		// level 13, 16, 20, 22, 24, 25 or 26 passed the whole package.
+		for level := uint32(0); level <= depth; level += 1 {
+			for _, block := range []uint64{1, 2, 3, 5, 9} {
+				if leaf := block << level; leaf < uint64(leaves) {
+					sweepLeaves = append(sweepLeaves, LeafIndex(leaf))
+				}
+			}
 		}
 		for _, leaf := range sweepLeaves {
 			sibling := LeafIndex(uint64(leaf) ^ 0x01)
@@ -5854,6 +5868,10 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 				checked += 1
 				stepsByArm[arm] += int64(len(got))
 				dropsByArm[arm] += int64(depth) - int64(len(got))
+				walkedByArm[arm] += int64(depth)
+				if arm == 2 && depth >= 1 {
+					pathsWithANode += 1
+				}
 			}
 		}
 	}
@@ -5862,21 +5880,22 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 		got   int64
 		want  int64
 	}{
-		{label: "filtered paths across every depth", got: checked, want: 32 * 8 * 4},
+		{label: "filtered paths across every depth", got: checked, want: 10092},
+		{label: "direct path nodes walked by one arm", got: walkedByArm[0], want: 52581},
 		// each arm counted on its own, so an arm that stopped reaching its own
 		// answer is visible rather than covered by the other three. the first
-		// two drop nothing by construction — 8 leaves times the sum of the
-		// depths, which is 496 — the third drops its level one node at every
-		// depth of one or more, and the fourth is a measured count of a fixed
-		// seed rather than a derived one.
-		{label: "nodes kept with nothing blank", got: stepsByArm[0], want: 8 * 496},
+		// two drop nothing by construction, so their kept counts are the whole
+		// of what they walked; the third drops its level one node on every path
+		// that has one; and the fourth is a measured count of a fixed seed
+		// rather than a derived one.
+		{label: "nodes kept with nothing blank", got: stepsByArm[0], want: walkedByArm[0]},
 		{label: "nodes dropped with nothing blank", got: dropsByArm[0], want: 0},
-		{label: "nodes kept with the leaf's own path blank", got: stepsByArm[1], want: 8 * 496},
+		{label: "nodes kept with the leaf's own path blank", got: stepsByArm[1], want: walkedByArm[1]},
 		{label: "nodes dropped with the leaf's own path blank", got: dropsByArm[1], want: 0},
-		{label: "nodes kept with the sibling's path blank", got: stepsByArm[2], want: 8 * 465},
-		{label: "nodes dropped with the sibling's path blank", got: dropsByArm[2], want: 8 * 31},
-		{label: "nodes kept with half the nodes blank", got: stepsByArm[3], want: 3810},
-		{label: "nodes dropped with half the nodes blank", got: dropsByArm[3], want: 158},
+		{label: "nodes kept with the sibling's path blank", got: stepsByArm[2], want: walkedByArm[2] - pathsWithANode},
+		{label: "nodes dropped with the sibling's path blank", got: dropsByArm[2], want: pathsWithANode},
+		{label: "nodes kept with half the nodes blank", got: stepsByArm[3], want: 50864},
+		{label: "nodes dropped with half the nodes blank", got: dropsByArm[3], want: 1717},
 	}
 	for _, c := range confirmedCases {
 		if c.got != c.want {
