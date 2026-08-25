@@ -3361,10 +3361,11 @@ const (
 	unboundSweepContextLengths = 71
 	unboundSweepBytes          = 256
 	unboundSweepByteLengths    = 3
-	// what the two sweeps refuse between them. seven reframings at each of 2259 points,
+	unboundSweepCoarsePoints   = 77
+	// what the three sweeps refuse between them. seven reframings at each of 2259 points,
 	// less the ones that coincided with the info the receiver demanded and were skipped,
 	// which is why this is a measured number rather than a product
-	unboundSweepRefusals = 15812
+	unboundSweepRefusals = 16351
 )
 
 // The reframings of one demanded pair that carry no binding the receiver demanded, built
@@ -3472,9 +3473,25 @@ func TestDecryptWithLabelRefusesAnUnboundMessageAtEveryFieldLength(t *testing.T)
 		}
 	}
 	if want := lengthPoints + unboundSweepBytes*unboundSweepByteLengths; points != want {
-		t.Fatalf("the two sweeps visited %d points, want %d", points, want)
+		t.Fatalf("the length and byte sweeps visited %d points, want %d", points, want)
+	}
+	bytePoints := points
+	// and a coarse tail past where a dense sweep is affordable. a fallback conditional on
+	// what it is handed has to sit at some length, and the dense sweep above ends at 20
+	// and 70 — which is a place for one to sit rather than a bound on where one can be.
+	// these are the lengths a label or a context in this protocol plausibly reaches: past
+	// the two octet varint boundary at 16383 is where a dense sweep stops being the point
+	// and the statement pin takes over.
+	for _, labelLength := range []int{0, 1, 14, 20, 32, 64, 100} {
+		for _, contextLength := range []int{100, 150, 200, 250, 300, 400, 500, 700, 1000, 1500, 2000} {
+			sweep(string(sweptBytes(0x41, labelLength)), sweptBytes(0x80, contextLength),
+				sweptBytes(0x30, 1+(labelLength+contextLength)%40))
+		}
+	}
+	if want := bytePoints + unboundSweepCoarsePoints; points != want {
+		t.Fatalf("the three sweeps visited %d points, want %d", points, want)
 	}
 	if refused != unboundSweepRefusals {
-		t.Fatalf("the two sweeps refused %d unbound messages, want %d", refused, unboundSweepRefusals)
+		t.Fatalf("the three sweeps refused %d unbound messages, want %d", refused, unboundSweepRefusals)
 	}
 }
