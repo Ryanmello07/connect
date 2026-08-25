@@ -10,7 +10,7 @@
 // bytes this project did not compute.
 //
 // Five vendored corpora carry that weight, and each of them is the only source for
-// something. The digests of all three are pinned by TestVectorFilesArePinned in
+// something. The digests of all five are pinned by TestVectorFilesArePinned in
 // vectors_pin_test.go, so vendored here means the bytes that manifest names.
 //
 //   - crypto-basics.json is the direct one: one published answer each for
@@ -73,7 +73,7 @@ import (
 	"github.com/urnetwork/connect/mls/syntax"
 )
 
-// One crypto-basics entry, reduced to the three constructions this file owns. The other
+// One crypto-basics entry, reduced to the four constructions this file owns. The other
 // fields of the published object belong to task 14 and are not read here.
 type labelKatBasics struct {
 	CipherSuite      uint16                   `json:"cipher_suite"`
@@ -262,8 +262,8 @@ const (
 // The published references each reference corpus must contribute, counted for the same
 // reason. crypto-basics publishes one RefHash answer per suite and two suites are
 // registered; welcome.json publishes one Welcome per suite; the passive client corpus
-// publishes thirteen transcripts per suite, one epoch of each references a single
-// proposal, so twelve land per registered suite.
+// publishes thirteen transcripts per registered suite, of which six reference no proposal
+// at all, six reference exactly one and one references six, so twelve land per suite.
 const (
 	labelKatRefHashComparisons = 2
 	labelKatKeyPackageRefs     = 2
@@ -1038,16 +1038,18 @@ func TestKeyPackageRefLabelMatchesThePublishedWelcomes(t *testing.T) {
 				uint16(suite), len(keyPackage))
 			continue
 		}
+		// the proposal label over the same bytes is not what the Welcome carries, and
+		// this is read before the count below rather than after it: the count reports
+		// and moves on to the next suite, so a check written under it is one no failing
+		// input ever reaches
+		if bytes.Contains(welcome, MakeProposalRef(crypto, keyPackage)) {
+			t.Errorf("suite %#04x: the published welcome carries the proposal labelled reference of its key package", uint16(suite))
+		}
 		reference := MakeKeyPackageRef(crypto, keyPackage)
 		if count := bytes.Count(welcome, reference); count != 1 {
 			t.Errorf("suite %#04x: the key package reference %x appears %d times in the published welcome, want once",
 				uint16(suite), reference, count)
 			continue
-		}
-		// and the proposal label over the same bytes is not what the Welcome carries,
-		// so this fails on a swap rather than finding the reference either way
-		if bytes.Contains(welcome, MakeProposalRef(crypto, keyPackage)) {
-			t.Errorf("suite %#04x: the published welcome carries the proposal labelled reference of its key package", uint16(suite))
 		}
 		found++
 	}
@@ -1102,16 +1104,18 @@ func TestProposalRefLabelMatchesThePublishedCommits(t *testing.T) {
 					continue
 				}
 				authenticatedContent := message[mlsMessageVersionLength : len(message)-membershipTag]
+				// the key package label over the same content is not what the commit
+				// carries, and this is read before the count below rather than after it:
+				// the count reports and moves on to the next proposal, so a check written
+				// under it is one no failing input ever reaches
+				if bytes.Contains(commit, MakeKeyPackageRef(crypto, authenticatedContent)) {
+					t.Errorf("%s: the published commit carries the key package labelled reference of a proposal", at)
+				}
 				reference := MakeProposalRef(crypto, authenticatedContent)
 				if count := bytes.Count(commit, reference); count != 1 {
 					t.Errorf("%s: the proposal reference %x appears %d times in the published commit, want once",
 						at, reference, count)
 					continue
-				}
-				// and the key package label over the same content is not what the commit
-				// carries, so a swapped pair fails here rather than matching either way
-				if bytes.Contains(commit, MakeKeyPackageRef(crypto, authenticatedContent)) {
-					t.Errorf("%s: the published commit carries the key package labelled reference of a proposal", at)
 				}
 				found++
 			}

@@ -178,8 +178,14 @@ func productionSources(sourceTexts map[string]string) map[string]string {
 // matcher below still reports what a reader will find. Blanking rather than deleting
 // keeps a stripped line from joining the two lines around it into a shape neither of
 // them had.
+//
+// The line endings are normalised first, because every matcher downstream of this
+// anchors on what a line holds, and a carriage return sits on the end of every one of
+// them in a checkout git smudged. This repository has already paid for that once, with
+// eighty four source anchors passing on windows because they matched nothing at all --
+// and a matcher that stops matching is a gate that stops demanding.
 func codeOf(text string) string {
-	lines := strings.Split(text, "\n")
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	code := make([]string, 0, len(lines))
 	inBlock := false
 	for _, line := range lines {
