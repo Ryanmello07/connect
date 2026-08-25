@@ -9,8 +9,21 @@
 // reach back — connect/mls imports only the standard library, golang.org/x/crypto, and
 // its own child mls/syntax.
 //
-// The package is a doc stub for now: the X-Wing implementation lands with the tasks
-// that need it. It exists this early because the forbidden primitive gate in
-// mls/crypto_forbidden_test.go walks this directory, and a gate whose root is missing
-// either fails outright or, worse, reports clean having read nothing.
+// What is here so far is the record and its two ladders, in record.go: the go form of
+// the record master section 8 defines, the size ladder a body is padded to, the eph
+// ladder a transient record expires on, and the one pair of functions that crosses
+// between the retention class as go carries it and the single byte the wire carries it
+// in. The key schedule, the codec, the authenticators and the server attachment land
+// beside them and read these types. Nothing in this package logs a failure and carries
+// on: every error here is one of the sentinels in errors.go, and the only helpers that
+// may answer with a bare bool are the three constant time verifiers of spec A section
+// 5.7.
+//
+// Two rules in this package are enforced by a test rather than by the compiler, and
+// both walk the directory tree rather than reading a list of files. The forbidden
+// primitive gate in mls/crypto_forbidden_test.go covers this package as well as its own,
+// which is why the directory existed before there was anything in it: a gate whose root
+// is missing either fails outright or, worse, reports clean having read nothing. The
+// join gate in record_test.go covers this package and connect/mls, and holds the
+// class-and-bucket join to record.go alone.
 package message
