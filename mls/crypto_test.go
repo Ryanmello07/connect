@@ -2041,3 +2041,362 @@ func TestProviderStubsRefuseToBeCalled(t *testing.T) {
 		t.Errorf("this table refuses %v, while the invariants skip %v", refused, providerStubMethods)
 	}
 }
+
+// A provider that answers what the real one answers with every byte flipped, and records
+// what it was asked.
+//
+// This exists for the constructions that take a CryptoProvider as a parameter rather than
+// as a receiver. Nothing about their output says which provider computed it: one that
+// reached for crypto/sha256 directly, or built a provider of its own out of a hardcoded
+// suite, agrees with every published corpus and every known answer in this package,
+// because the suite in those corpora is the suite it hardcoded. A provider that is not the
+// real one is the only input that tells the two apart — a construction that routed through
+// the parameter answers differently over this one, and a construction that ignored the
+// parameter answers exactly the same.
+//
+// The methods are written out rather than promoted from an embedded CryptoProvider on
+// purpose. A promoted method is one the compiler supplies, so a method added to the
+// interface would arrive here already implemented, tagging nothing and quietly narrowing
+// what the gates that use this can see — which is the shape task 12 paid for. Written out,
+// the build stops until somebody decides what the new method does here.
+type taggingCryptoProvider struct {
+	inner CryptoProvider
+	calls []string
+}
+
+// Drift between the interface and this wrapper fails at build rather than at the gate that
+// reads it, which is the whole reason the methods are written out.
+var _ CryptoProvider = (*taggingCryptoProvider)(nil)
+
+// One answer, recorded and flipped. Cloning rather than flipping in place matters: what
+// the whole provider invariants hold is that the real provider hands out storage nobody
+// else writes into, and a wrapper that flipped the array it was handed would break that
+// from the test side.
+func (self *taggingCryptoProvider) tagged(name string, answer []byte) []byte {
+	self.calls = append(self.calls, name)
+	flipped := bytes.Clone(answer)
+	for i := range flipped {
+		flipped[i] ^= 0x5a
+	}
+	return flipped
+}
+
+// One call whose answer carries no bytes to flip, recorded and passed through. A
+// construction that reached only for a size still shows up in the call log, so a gate can
+// say whether the provider was touched at all separately from whether its answer was used.
+func (self *taggingCryptoProvider) passedThrough(name string) {
+	self.calls = append(self.calls, name)
+}
+
+func (self *taggingCryptoProvider) Suite() CipherSuite {
+	self.passedThrough("Suite")
+	return self.inner.Suite()
+}
+
+func (self *taggingCryptoProvider) HashSize() int {
+	self.passedThrough("HashSize")
+	return self.inner.HashSize()
+}
+
+func (self *taggingCryptoProvider) KeySize() int {
+	self.passedThrough("KeySize")
+	return self.inner.KeySize()
+}
+
+func (self *taggingCryptoProvider) NonceSize() int {
+	self.passedThrough("NonceSize")
+	return self.inner.NonceSize()
+}
+
+func (self *taggingCryptoProvider) Hash(data []byte) []byte {
+	return self.tagged("Hash", self.inner.Hash(data))
+}
+
+func (self *taggingCryptoProvider) Mac(key []byte, data []byte) []byte {
+	return self.tagged("Mac", self.inner.Mac(key, data))
+}
+
+func (self *taggingCryptoProvider) MacVerify(key []byte, data []byte, tag []byte) bool {
+	self.passedThrough("MacVerify")
+	return self.inner.MacVerify(key, data, tag)
+}
+
+func (self *taggingCryptoProvider) Extract(salt []byte, ikm []byte) []byte {
+	return self.tagged("Extract", self.inner.Extract(salt, ikm))
+}
+
+func (self *taggingCryptoProvider) Expand(prk []byte, info []byte, length int) []byte {
+	return self.tagged("Expand", self.inner.Expand(prk, info, length))
+}
+
+func (self *taggingCryptoProvider) ExpandWithLabel(secret []byte, label string, context []byte, length int) []byte {
+	return self.tagged("ExpandWithLabel", self.inner.ExpandWithLabel(secret, label, context, length))
+}
+
+func (self *taggingCryptoProvider) DeriveSecret(secret []byte, label string) []byte {
+	return self.tagged("DeriveSecret", self.inner.DeriveSecret(secret, label))
+}
+
+func (self *taggingCryptoProvider) DeriveTreeSecret(secret []byte, label string, generation uint32, length int) []byte {
+	return self.tagged("DeriveTreeSecret", self.inner.DeriveTreeSecret(secret, label, generation, length))
+}
+
+func (self *taggingCryptoProvider) AeadSeal(key []byte, nonce []byte, aad []byte, plaintext []byte) ([]byte, error) {
+	ciphertext, err := self.inner.AeadSeal(key, nonce, aad, plaintext)
+	if err != nil {
+		self.passedThrough("AeadSeal")
+		return nil, err
+	}
+	return self.tagged("AeadSeal", ciphertext), nil
+}
+
+func (self *taggingCryptoProvider) AeadOpen(key []byte, nonce []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := self.inner.AeadOpen(key, nonce, aad, ciphertext)
+	if err != nil {
+		self.passedThrough("AeadOpen")
+		return nil, err
+	}
+	return self.tagged("AeadOpen", plaintext), nil
+}
+
+func (self *taggingCryptoProvider) Random(n int) []byte {
+	return self.tagged("Random", self.inner.Random(n))
+}
+
+func (self *taggingCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
+	self.passedThrough("SignWithLabel")
+	return self.inner.SignWithLabel(priv, label, content)
+}
+
+func (self *taggingCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label string, content []byte, sig []byte) error {
+	self.passedThrough("VerifyWithLabel")
+	return self.inner.VerifyWithLabel(pub, label, content, sig)
+}
+
+func (self *taggingCryptoProvider) HpkeSeal(pub HpkePublicKey, info []byte, aad []byte, plaintext []byte) ([]byte, []byte, error) {
+	self.passedThrough("HpkeSeal")
+	return self.inner.HpkeSeal(pub, info, aad, plaintext)
+}
+
+func (self *taggingCryptoProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	self.passedThrough("HpkeOpen")
+	return self.inner.HpkeOpen(priv, kemOutput, info, aad, ciphertext)
+}
+
+func (self *taggingCryptoProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
+	self.passedThrough("DeriveKeyPair")
+	return self.inner.DeriveKeyPair(ikm)
+}
+
+func (self *taggingCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
+	self.passedThrough("SignatureKeyPair")
+	return self.inner.SignatureKeyPair()
+}
+
+// The methods the tagging provider hands back unchanged, named with the reason rather than
+// left out. MacVerify is the only one of them that is not a stub, and it answers a bool:
+// there is nothing in a yes or a no for a flip to change, so a construction that routed a
+// comparison through it cannot be separated by a different answer. The stubs are skipped
+// by assertCoversTheProviderSurface itself, so implementing one is what makes the gate
+// below demand it be tagged.
+var taggingProviderPassesThrough = map[string]string{
+	"MacVerify": "answers a bool, and flipping has nothing to change in a yes or a no",
+}
+
+// The tagging provider really does answer differently, method by method.
+//
+// Without this, every gate that reads it is vacuous in the direction that matters. A
+// tagged method that stopped tagging would make the constructions agree with the real
+// provider, and the routing gate would report that none of them use the provider they were
+// handed; drop the flip from only the one method a construction happens to call and that
+// gate reports a clean run while observing nothing at all. Each row is one method's answer
+// over the tagging provider against the same method's answer over the provider inside it.
+//
+// The provider underneath draws from a constant reader, because the Random row otherwise
+// compares two draws that differ on their own whatever the wrapper does.
+func TestTheTaggingProviderAnswersDifferentlyThanTheRealOne(t *testing.T) {
+	plain := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, constantReader{value: 0x3d})
+	tagging := &taggingCryptoProvider{inner: plain}
+	secret := bytes.Repeat([]byte{0x4b}, plain.HashSize())
+	key := bytes.Repeat([]byte{0x11}, plain.KeySize())
+	nonce := bytes.Repeat([]byte{0x22}, plain.NonceSize())
+	sealed, err := plain.AeadSeal(key, nonce, []byte("aad"), []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal the ciphertext the AeadOpen row reads: %v", err)
+	}
+	tagged := []string{}
+	for _, testCase := range []struct {
+		name string
+		call func(crypto CryptoProvider) []byte
+	}{
+		{name: "Hash", call: func(crypto CryptoProvider) []byte { return crypto.Hash([]byte("data")) }},
+		{name: "Mac", call: func(crypto CryptoProvider) []byte { return crypto.Mac(key, []byte("data")) }},
+		{name: "Extract", call: func(crypto CryptoProvider) []byte { return crypto.Extract(nil, secret) }},
+		{name: "Expand", call: func(crypto CryptoProvider) []byte { return crypto.Expand(secret, []byte("info"), 32) }},
+		{name: "ExpandWithLabel", call: func(crypto CryptoProvider) []byte {
+			return crypto.ExpandWithLabel(secret, "label", []byte("context"), 32)
+		}},
+		{name: "DeriveSecret", call: func(crypto CryptoProvider) []byte { return crypto.DeriveSecret(secret, "label") }},
+		{name: "DeriveTreeSecret", call: func(crypto CryptoProvider) []byte {
+			return crypto.DeriveTreeSecret(secret, "label", 7, 32)
+		}},
+		{name: "AeadSeal", call: func(crypto CryptoProvider) []byte {
+			out, sealErr := crypto.AeadSeal(key, nonce, []byte("aad"), []byte("plaintext"))
+			if sealErr != nil {
+				t.Fatalf("AeadSeal: %v", sealErr)
+			}
+			return out
+		}},
+		{name: "AeadOpen", call: func(crypto CryptoProvider) []byte {
+			out, openErr := crypto.AeadOpen(key, nonce, []byte("aad"), sealed)
+			if openErr != nil {
+				t.Fatalf("AeadOpen: %v", openErr)
+			}
+			return out
+		}},
+		{name: "Random", call: func(crypto CryptoProvider) []byte { return crypto.Random(32) }},
+	} {
+		tagged = append(tagged, testCase.name)
+		answer := testCase.call(plain)
+		flipped := testCase.call(tagging)
+		if len(answer) == 0 {
+			t.Errorf("%s answered no bytes, so this row separates nothing", testCase.name)
+			continue
+		}
+		if bytes.Equal(answer, flipped) {
+			t.Errorf("%s answers the same over the tagging provider as over the real one, so nothing routed through it is observable",
+				testCase.name)
+		}
+		if len(answer) != len(flipped) {
+			t.Errorf("%s answered %d bytes over the tagging provider and %d over the real one; a tag must not change the length",
+				testCase.name, len(flipped), len(answer))
+		}
+	}
+	// and the rows are every method the tagging provider claims to tag, so a method that
+	// stops being a stub is a row somebody has to write rather than one whose answer goes
+	// on being passed through
+	assertCoversTheProviderSurface(t, "the tagging provider", tagged, taggingProviderPassesThrough)
+}
+
+// One function this package declares at package level, with the file that declares it and
+// the parameter types it is written to take.
+type packageLevelFunction struct {
+	file       string
+	name       string
+	parameters []string
+}
+
+// What one scan of the package's source read: the functions, and the files they came out
+// of.
+//
+// The files are carried because the functions alone cannot say what was missed. A scan
+// that stopped reading a file returns a shorter list of functions, and a shorter list of
+// functions still satisfies every gate whose table was never extended — which is the
+// understatement this package has paid for repeatedly. The file list is what a gate can
+// compare against the package's own source.
+type packageLevelScan struct {
+	files     []string
+	functions []packageLevelFunction
+}
+
+// The package level functions of one parsed file.
+//
+// Parameter types come back rendered and one per name, so a signature written
+// func f(a, b []byte) reads the same here as one written func f(a []byte, b []byte). A
+// gate that filters on a type is then filtering on what the compiler sees rather than on
+// how the line happened to be spaced, and the grouped form is the one a filter over the
+// file's characters would misread.
+func packageLevelFunctionsIn(parsed parsedSource, path string) []packageLevelFunction {
+	functions := []packageLevelFunction{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Recv != nil {
+			continue
+		}
+		parameters := []string{}
+		for _, field := range function.Type.Params.List {
+			rendered := parsed.render(field.Type)
+			written := len(field.Names)
+			if written == 0 {
+				written = 1
+			}
+			for i := 0; i < written; i++ {
+				parameters = append(parameters, rendered)
+			}
+		}
+		functions = append(functions, packageLevelFunction{
+			file:       path,
+			name:       function.Name.Name,
+			parameters: parameters,
+		})
+	}
+	return functions
+}
+
+// Every package level function of the package's non test source.
+//
+// The scan is every file rather than a named one, which is the shape task 12 paid for: a
+// gate that enumerates a filename goes on reporting a clean run while the thing it guards
+// is written next door. Test files are skipped because what these gates are about is the
+// surface the package ships, and a helper written for a table is not a construction
+// anybody outside the tests calls.
+//
+// TestThePackageLevelFunctionScanReadsEveryNonTestFile writes that same rule out a second
+// time and compares. The repetition is deliberate: a rule stated once here and read by
+// every gate is a rule that can be narrowed in one place, and every gate reading it would
+// narrow with it and report a clean run.
+func packageLevelFunctions(t *testing.T) packageLevelScan {
+	t.Helper()
+	scan := packageLevelScan{files: []string{}, functions: []packageLevelFunction{}}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		scan.files = append(scan.files, path)
+		scan.functions = append(scan.functions, packageLevelFunctionsIn(mustParseSource(t, path), path)...)
+	}
+	if len(scan.functions) == 0 {
+		t.Fatalf("the package's non test source declares no package level functions, so every gate reading this demands nothing")
+	}
+	return scan
+}
+
+// The names of the package level functions whose parameters include one of a given type.
+//
+// Absence is fatal rather than clean, for the same reason every other enumeration here is:
+// a filter that stopped matching leaves the gate reading it demanding nothing, and a gate
+// that demands nothing reports exactly what a complete one reports.
+func packageLevelFunctionsTaking(t *testing.T, parameter string) []string {
+	t.Helper()
+	names := []string{}
+	for _, function := range packageLevelFunctions(t).functions {
+		if slices.Contains(function.parameters, parameter) {
+			names = append(names, function.name)
+		}
+	}
+	if len(names) == 0 {
+		t.Fatalf("no package level function of this package takes a %s, so the gate reading this demands nothing", parameter)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// The scan reads the whole package rather than the part a gate's table already covers.
+//
+// A scan narrowed by one filename is invisible from the gates that read it: they compare
+// their tables against a shorter list of declared functions, find it matches, and report
+// the clean run they would report if nothing had been narrowed at all. What says otherwise
+// is the package's own file list, written out here a second time rather than taken from
+// the scan.
+func TestThePackageLevelFunctionScanReadsEveryNonTestFile(t *testing.T) {
+	scanned := packageLevelFunctions(t).files
+	source := []string{}
+	for _, path := range packageSourcePaths(t) {
+		if !strings.HasSuffix(path, "_test.go") {
+			source = append(source, path)
+		}
+	}
+	if !slices.Equal(scanned, source) {
+		t.Errorf("the package level function scan read %v, and this package's non test source is %v", scanned, source)
+	}
+}

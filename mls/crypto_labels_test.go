@@ -1230,3 +1230,150 @@ func TestEveryConstructionInThisFileLeavesItsInputAlone(t *testing.T) {
 		}
 	}
 }
+
+// A construction that takes a provider and is not held to using it, named with the reason.
+// Nothing is excusable today; the map exists so that a construction which cannot be held
+// is a line somebody writes on purpose rather than one left out of the table below.
+var labelConstructionsOverAnyProvider = map[string]string{}
+
+// A construction handed a provider computes with that provider and not with one of its
+// own.
+//
+// This is the property the parameter exists for. RefHash, MakeKeyPackageRef and
+// MakeProposalRef take a CryptoProvider rather than hanging off one because the tree and
+// the framing layers hold the interface, and a construction that reached for
+// crypto/sha256 directly, or built a provider out of a hardcoded suite, agrees with every
+// byte in this file: the corpora are all X25519/SHA-256, which is the suite it would have
+// hardcoded. Every known answer, every published reference and every argument gate here
+// passes over it. So does go vet, and so does gofmt.
+//
+// What separates the two is a provider that answers differently. Over the tagging provider
+// a construction that routed through its parameter answers with different bytes, and one
+// that ignored the parameter answers with the same bytes it answered over the real one.
+// The call log goes into the failure because the two ways of getting this wrong read
+// differently there: a construction that ignored its parameter outright called nothing,
+// and one that used it for a size and then hashed on its own called only a size method.
+//
+// The table is checked against every package level function of this package's source that
+// takes a CryptoProvider, read off the parse tree. That is what makes the gate demand the
+// next one: plan task 15 adds EncryptWithLabel and DecryptWithLabel with this same
+// signature, and they fail here until somebody writes them a row, whichever file they land
+// in.
+func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
+	plain := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	value := bytes.Repeat([]byte{0x21}, 96)
+	covered := []string{}
+	for _, testCase := range []struct {
+		name string
+		call func(crypto CryptoProvider) []byte
+	}{
+		{name: "RefHash", call: func(crypto CryptoProvider) []byte {
+			return RefHash(crypto, "MLS 1.0 a label", value)
+		}},
+		{name: "MakeKeyPackageRef", call: func(crypto CryptoProvider) []byte {
+			return MakeKeyPackageRef(crypto, value)
+		}},
+		{name: "MakeProposalRef", call: func(crypto CryptoProvider) []byte {
+			return MakeProposalRef(crypto, value)
+		}},
+	} {
+		covered = append(covered, testCase.name)
+		tagging := &taggingCryptoProvider{inner: plain}
+		overTheRealProvider := testCase.call(plain)
+		overTheTaggingProvider := testCase.call(tagging)
+		if len(overTheRealProvider) == 0 {
+			t.Errorf("%s answered with nothing, so this row observed nothing", testCase.name)
+			continue
+		}
+		if bytes.Equal(overTheRealProvider, overTheTaggingProvider) {
+			t.Errorf("%s answered the same bytes over a provider that flips every answer, so it did not route through the provider it was handed; it called %v",
+				testCase.name, tagging.calls)
+		}
+	}
+	// and the table names every construction of this package that takes a provider rather
+	// than the ones this test happened to think of
+	declared := packageLevelFunctionsTaking(t, "CryptoProvider")
+	want := []string{}
+	for _, name := range declared {
+		if _, isExcused := labelConstructionsOverAnyProvider[name]; !isExcused {
+			want = append(want, name)
+		}
+	}
+	slices.Sort(covered)
+	if !slices.Equal(covered, want) {
+		t.Errorf("this gate covers %v, and the package declares %v", covered, want)
+	}
+	for name := range labelConstructionsOverAnyProvider {
+		if !slices.Contains(declared, name) {
+			t.Errorf("the gate excuses %s, which no function of this package declares", name)
+		}
+	}
+}
+
+// The parameter scan reads a type however the signature was spaced.
+//
+// Go lets a run of parameters share one type, and a construction written
+// func MakeSharedRef(first, second CryptoProvider) declares two providers off one written
+// type. A scan that read the type once per field rather than once per name would report a
+// signature this package does not have, and a scan that read only the first or the last
+// name of a group would drop constructions out of the enumeration above entirely — which
+// shrinks what that gate demands without changing anything it reports.
+//
+// The rows are the whole parameter list rather than a yes or a no on one type, because
+// the miscount is invisible to a membership test: a grouped pair read once still contains
+// a provider. The control declares both spellings, a grouped pair, and one construction
+// that takes no provider at all.
+func TestTheParameterScanReadsEveryNameOfAGroupedParameter(t *testing.T) {
+	parsed := mustParseText(t, "the grouped parameter control", groupedParameterControl)
+	read := map[string][]string{}
+	for _, function := range packageLevelFunctionsIn(parsed, "the grouped parameter control") {
+		read[function.name] = function.parameters
+	}
+	for _, testCase := range []struct {
+		name       string
+		parameters []string
+	}{
+		{name: "MakeSpacedRef", parameters: []string{"CryptoProvider", "[]byte"}},
+		{name: "MakeGroupedRef", parameters: []string{"string", "CryptoProvider"}},
+		{name: "MakeSharedRef", parameters: []string{"CryptoProvider", "CryptoProvider"}},
+		{name: "MakeGroupedBytes", parameters: []string{"[]byte", "[]byte", "int"}},
+		{name: "MakeUnprovidedRef", parameters: []string{"[]byte"}},
+	} {
+		if !slices.Equal(read[testCase.name], testCase.parameters) {
+			t.Errorf("the parameter scan read %s as taking %v, want %v",
+				testCase.name, read[testCase.name], testCase.parameters)
+		}
+	}
+	if len(read) != 5 {
+		t.Errorf("the parameter scan read %d functions out of the control, want 5", len(read))
+	}
+	// and the type filter the gate above runs on picks exactly the three that take one
+	found := []string{}
+	for name, parameters := range read {
+		if slices.Contains(parameters, "CryptoProvider") {
+			found = append(found, name)
+		}
+	}
+	slices.Sort(found)
+	if want := []string{"MakeGroupedRef", "MakeSharedRef", "MakeSpacedRef"}; !slices.Equal(found, want) {
+		t.Errorf("the type filter read %v out of the control, want %v", found, want)
+	}
+}
+
+// Constructions in every spelling a parameter list can take: one type per name, a type
+// written after another parameter, two names sharing one type, two byte slices sharing
+// one type, and one construction that takes no provider. Every scan and every filter above
+// runs on this as well, so one that stopped reading a spelling fails here rather than
+// issuing the real package a clean bill.
+const groupedParameterControl = `package mls
+
+func MakeSpacedRef(crypto CryptoProvider, value []byte) []byte { return nil }
+
+func MakeGroupedRef(label string, crypto CryptoProvider) []byte { return nil }
+
+func MakeSharedRef(first, second CryptoProvider) []byte { return nil }
+
+func MakeGroupedBytes(label, value []byte, length int) []byte { return nil }
+
+func MakeUnprovidedRef(value []byte) []byte { return nil }
+`
