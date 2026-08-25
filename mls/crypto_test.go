@@ -3173,3 +3173,54 @@ func TestProviderHpkeSealDrawsFromItsOwnReader(t *testing.T) {
 		t.Errorf("two seals over one provider encapsulated the same key %x", nextKemOutput)
 	}
 }
+
+// The published key pairs the provider must reproduce. The corpus holds one entry per
+// registered suite and each publishes two derivations, the recipient key and the ephemeral
+// one, so a loader that dropped an entry or a field fails here rather than comparing less.
+const providerDeriveKeyPairComparisons = 4
+
+// The provider derives the key pair its input keying material names and not one of some
+// other input.
+//
+// Nothing else in this package can see it. Every other test derives a pair and then uses
+// both halves consistently, so a method that hashed its ikm first, or derived under the
+// whole suite identifier rather than the kem one, answers with a perfectly good key pair
+// and round trips forever. Measured: one such mutant survived every behavioural test in
+// this package and was caught only by reading the source. What separates them is a
+// published pair, which RFC 9180 gives twice per entry.
+//
+// The free function beside it is held to the same corpus by hpke_vectors_test.go. Both are
+// pinned rather than one, because a method that stopped delegating is exactly the kind of
+// edit a delegation invites, and the free function agreeing with the corpus says nothing
+// about what the interface answers.
+func TestProviderDeriveKeyPairMatchesTheRfcVectors(t *testing.T) {
+	compared := 0
+	for _, vector := range loadHpkeVectors(t) {
+		crypto := mustProvider(t, vector.suite)
+		for _, testCase := range []struct {
+			name string
+			ikm  string
+			priv string
+			pub  string
+		}{
+			{name: "the recipient key", ikm: vector.IkmR, priv: vector.SkRm, pub: vector.PkRm},
+			{name: "the ephemeral key", ikm: vector.IkmE, priv: vector.SkEm, pub: vector.PkEm},
+		} {
+			compared++
+			what := vector.name + ", " + testCase.name
+			priv, pub, err := crypto.DeriveKeyPair(mustDecodeHex(t, what+" ikm", testCase.ikm))
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			if want := mustDecodeHex(t, what+" private key", testCase.priv); !bytes.Equal(priv, want) {
+				t.Errorf("%s private key = %x, want %x", what, priv, want)
+			}
+			if want := mustDecodeHex(t, what+" public key", testCase.pub); !bytes.Equal(pub, want) {
+				t.Errorf("%s public key = %x, want %x", what, pub, want)
+			}
+		}
+	}
+	if compared != providerDeriveKeyPairComparisons {
+		t.Fatalf("compared %d published key pairs, want %d", compared, providerDeriveKeyPairComparisons)
+	}
+}
