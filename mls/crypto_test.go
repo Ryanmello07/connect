@@ -26,9 +26,11 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"go/types"
 	"io"
 	"os"
 	"path/filepath"
@@ -4065,79 +4067,482 @@ func providerReceiverFieldReads(t *testing.T, method string) []string {
 	return nil
 }
 
-// The type an entropy source is spelled as, in one place so a rename is one edit rather
-// than a filter that stops matching and a gate that stops demanding.
+// The type an entropy source is spelled as, for the messages below and for nothing else.
+//
+// What decides the class is the type the compiler resolves, not this spelling. A filter
+// comparing rendered parameter names to "io.Reader" is a one element list, and a list is
+// what this package has been walked past eleven times: a type alias to io.Reader renders
+// as its own name, is io.Reader to the compiler, and a function taking one is read by
+// such a filter as taking no entropy source at all. The gate reading the filter then
+// holds four functions and reports exactly what a gate holding five reports.
 const entropySourceTypeName = "io.Reader"
 
-// Every value the entropy gates call, keyed by the name the declaration gives it.
-//
-// The map is not the class. The class is read off the parse tree, and a function it names
-// with no value here is fatal rather than a row left out, so a sixth function taking an
-// entropy source is covered the day somebody declares it rather than the day somebody
-// remembers to add it.
-var entropyTakingFunctionValues = map[string]any{
-	"NewCryptoProviderWithRandom": NewCryptoProviderWithRandom,
-	"X25519GenerateKey":           X25519GenerateKey,
-	"HpkeSetupBaseS":              HpkeSetupBaseS,
-	"HpkeSealBase":                HpkeSealBase,
-	"hpkeEncap":                   hpkeEncap,
+// The root of the package these gates can call into, spelled as forbiddenScanRoots
+// spells it so the two can be compared rather than assumed equal.
+const cryptoOwnRoot = "."
+
+// One of the crypto's packages as the type checker reads it. The files are parsed here
+// rather than through mustParseSource because the type information is keyed by the
+// expression nodes of this parse, so a second parse of the same text carries none of it.
+type checkedPackage struct {
+	root  string
+	paths []string
+	files []parsedSource
+	info  *types.Info
+	pkg   *types.Package
 }
 
-// One function of this package handed a caller's entropy source, with the parameter names
-// the declaration gives it.
-type entropyTakingFunction struct {
+var cryptoTypeCheckMutex sync.Mutex
+var cryptoTypeChecked = map[string]checkedPackage{}
+var cryptoTypeImporterOnce sync.Once
+var cryptoTypeImporterValue types.Importer
+
+// One importer for every check, so the io package the entropy type is taken from is one
+// object rather than one per walk. It resolves a dependency from that dependency's own
+// source, which needs no build cache and no go command: measured, the whole walk of this
+// package costs about two seconds and completes with the go tool off the path entirely.
+func cryptoTypeImporter() types.Importer {
+	cryptoTypeImporterOnce.Do(func() {
+		cryptoTypeImporterValue = importer.ForCompiler(token.NewFileSet(), "source", nil)
+	})
+	return cryptoTypeImporterValue
+}
+
+// The non test go files of one root, refusing a root that held none for the reason
+// cryptoSourcePaths does: a walk that read nothing reports exactly what a walk over clean
+// source reports.
+func rootSourcePaths(t *testing.T, root string) []string {
+	t.Helper()
+	found, err := filepath.Glob(filepath.Join(root, "*.go"))
+	if err != nil {
+		t.Fatalf("list the source of %s: %v", root, err)
+	}
+	paths := []string{}
+	for _, path := range found {
+		if !strings.HasSuffix(path, "_test.go") {
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		t.Fatalf("%s holds no non test go file, so every gate reading it demands nothing", root)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// The type checker's reading of one root's non test source, computed once.
+//
+// A failed check is fatal rather than a fall back to reading names. A gate that could not
+// resolve its subject must fail; one that quietly reverted to matching the spelling would
+// go on reporting the clean run of a complete gate while holding a narrower class, which
+// is the failure this whole file is written against.
+func typeCheckedRoot(t *testing.T, root string) checkedPackage {
+	t.Helper()
+	cryptoTypeCheckMutex.Lock()
+	defer cryptoTypeCheckMutex.Unlock()
+	if checked, done := cryptoTypeChecked[root]; done {
+		return checked
+	}
+	checked := typeCheckedFiles(t, root, rootSourcePaths(t, root), nil)
+	cryptoTypeChecked[root] = checked
+	return checked
+}
+
+// The same, over text a control holds rather than over a root, so every matcher below runs
+// on a package known to violate the rule as well as on the real one.
+func typeCheckedText(t *testing.T, name string, source string) checkedPackage {
+	t.Helper()
+	cryptoTypeCheckMutex.Lock()
+	defer cryptoTypeCheckMutex.Unlock()
+	return typeCheckedFiles(t, name, []string{name}, map[string]string{name: source})
+}
+
+// One package checked, from files on disk or from text a control holds. The caller holds
+// the importer mutex: the source importer carries a cache and is not safe to enter twice
+// at once.
+func typeCheckedFiles(t *testing.T, path string, names []string, text map[string]string) checkedPackage {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	parsed := []parsedSource{}
+	files := []*ast.File{}
+	for _, name := range names {
+		var source any
+		if held, written := text[name]; written {
+			source = held
+		} else {
+			read, err := os.ReadFile(name)
+			if err != nil {
+				t.Fatalf("read %s: %v", name, err)
+			}
+			source = read
+		}
+		file, err := parser.ParseFile(fileSet, name, source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		parsed = append(parsed, parsedSource{fileSet: fileSet, file: file})
+		files = append(files, file)
+	}
+	info := &types.Info{
+		Types: map[ast.Expr]types.TypeAndValue{},
+		Defs:  map[*ast.Ident]types.Object{},
+	}
+	refused := []string{}
+	config := types.Config{
+		Importer:         cryptoTypeImporter(),
+		IgnoreFuncBodies: true,
+		Error:            func(err error) { refused = append(refused, err.Error()) },
+	}
+	pkg, err := config.Check(path, fileSet, files, info)
+	if err != nil || len(refused) != 0 {
+		t.Fatalf("type check %s: %v %s", path, err, strings.Join(refused, "; "))
+	}
+	return checkedPackage{root: path, paths: names, files: parsed, info: info, pkg: pkg}
+}
+
+// The type an entropy source is, taken from the io package the crypto is compiled against
+// rather than from a name written here.
+func entropySourceType(t *testing.T) types.Type {
+	t.Helper()
+	cryptoTypeCheckMutex.Lock()
+	imported, err := cryptoTypeImporter().Import("io")
+	cryptoTypeCheckMutex.Unlock()
+	if err != nil {
+		t.Fatalf("import io to read the type an entropy source is: %v", err)
+	}
+	reader := imported.Scope().Lookup("Reader")
+	if reader == nil {
+		t.Fatalf("the io package declares no Reader, so the class below is read off nothing")
+	}
+	return reader.Type()
+}
+
+// The type the crypto answers a provider as, likewise read off the package rather than
+// off a spelling.
+func providerInterfaceType(t *testing.T) types.Type {
+	t.Helper()
+	declared := typeCheckedRoot(t, cryptoOwnRoot).pkg.Scope().Lookup(providerInterfaceName)
+	if declared == nil {
+		t.Fatalf("this package declares no %s, so the constructor class below is read off nothing",
+			providerInterfaceName)
+	}
+	return declared.Type()
+}
+
+// One function of a root's non test source as both readings see it: the name the
+// declaration gives it, the parameter names an argument is resolved by, and the signature
+// the compiler assigned it.
+type declaredFunction struct {
 	name       string
 	parameters []providerParameter
-	value      reflect.Value
+	signature  *types.Signature
 }
 
-// Every package level function of this package's non test source that takes an entropy
-// source, read the way providerConstructions reads the ones that take a provider: off the
-// parse tree, cross checked against the package level scan, with a value required for each.
-func entropyTakingFunctions(t *testing.T) []entropyTakingFunction {
+// Whether one type is another, as the compiler reads it: the same type, or a type
+// declared over the identical underlying one.
+//
+// Both halves are the same defect twice. An alias is the same type and a rendered name
+// filter still walks past it. A defined type over the identical interface is a different
+// type carrying the same method set, which a caller converts into and which reads exactly
+// the same bytes, and a class matching only the first would report a function taking one
+// as taking no entropy source at all.
+func sameTypeAs(want types.Type) func(types.Type) bool {
+	return func(found types.Type) bool {
+		return types.Identical(found, want) || types.Identical(found.Underlying(), want.Underlying())
+	}
+}
+
+// The positions of the parameters whose type the compiler reads as want.
+//
+// Positions rather than names or spellings, because what a call has to put a value at is a
+// position, and what the line spells the type as is not what decides whether it is one.
+func (self declaredFunction) takes(want types.Type) []int {
+	is := sameTypeAs(want)
+	at := []int{}
+	for i := 0; i < self.signature.Params().Len(); i++ {
+		if is(self.signature.Params().At(i).Type()) {
+			at = append(at, i)
+		}
+	}
+	return at
+}
+
+// The position of the first result whose type is want, or -1 for a function that answers
+// none.
+func (self declaredFunction) answersAt(want types.Type) int {
+	is := sameTypeAs(want)
+	for i := 0; i < self.signature.Results().Len(); i++ {
+		if is(self.signature.Results().At(i).Type()) {
+			return i
+		}
+	}
+	return -1
+}
+
+// Every function a checked package declares, package level and method alike.
+//
+// Methods are read too, and that is not tidiness. This class was read off package level
+// functions alone, with a skip on every declaration carrying a receiver, and a method on
+// the one implementation taking an entropy source and answering a nil one with the
+// process source belonged to neither this class nor the provider surface class, which
+// derives off the interface. A receiver was the whole of what it took to be invisible to
+// both, and the substitution the refusal gate exists to forbid survived the suite when it
+// was written that way.
+func declaredFunctionsIn(t *testing.T, checked checkedPackage) []declaredFunction {
 	t.Helper()
-	functions := []entropyTakingFunction{}
-	found := []string{}
-	for _, path := range packageLevelFunctions(t).files {
-		parsed := mustParseSource(t, path)
+	functions := []declaredFunction{}
+	for _, parsed := range checked.files {
 		for _, declaration := range parsed.file.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction || function.Recv != nil {
+			if !isFunction {
 				continue
 			}
-			parameters := parametersOf(t, parsed, function.Name.Name, function.Type)
-			takesSource := false
-			for _, parameter := range parameters {
-				if parameter.typeName == entropySourceTypeName {
-					takesSource = true
-				}
+			name := declaredFunctionName(parsed, function)
+			defined, isDefined := checked.info.Defs[function.Name]
+			if !isDefined {
+				t.Fatalf("the type checker read no definition of %s in %s", name, checked.root)
 			}
-			if !takesSource {
-				continue
+			signature, isSignature := defined.Type().(*types.Signature)
+			if !isSignature {
+				t.Fatalf("the type checker reads %s as a %s rather than as a function", name, defined.Type())
 			}
-			name := function.Name.Name
-			implementation, written := entropyTakingFunctionValues[name]
-			if !written {
-				t.Fatalf("%s takes an %s and entropyTakingFunctionValues holds no value for it, so this gate cannot call it",
-					name, entropySourceTypeName)
+			parameters := parametersOf(t, parsed, name, function.Type)
+			if len(parameters) != signature.Params().Len() {
+				t.Fatalf("%s is written with %d parameters and the compiler sees %d",
+					name, len(parameters), signature.Params().Len())
 			}
-			found = append(found, name)
-			functions = append(functions, entropyTakingFunction{
-				name:       name,
-				parameters: parameters,
-				value:      reflect.ValueOf(implementation),
+			functions = append(functions, declaredFunction{
+				name: name, parameters: parameters, signature: signature,
 			})
 		}
 	}
+	return functions
+}
+
+// Every function one root declares.
+func declaredFunctionsOf(t *testing.T, root string) []declaredFunction {
+	t.Helper()
+	return declaredFunctionsIn(t, typeCheckedRoot(t, root))
+}
+
+// The name one declaration is keyed by: a package level function by its own name, a method
+// as (receiver).name. It is the spelling the type checker's own reading below produces, so
+// the two readings can be compared rather than trusted to agree.
+func declaredFunctionName(parsed parsedSource, function *ast.FuncDecl) string {
+	receiver := parsed.receiverOf(function)
+	if receiver == "" {
+		return function.Name.Name
+	}
+	return "(" + receiver + ")." + function.Name.Name
+}
+
+// The names of the functions of a checked package whose signature a predicate selects,
+// read off the type checker's own scope rather than off any declaration.
+//
+// The repetition is the point. A walk that stopped descending into a file, or a filter that
+// stopped matching, returns a shorter class, and every gate reading it demands less while
+// reporting exactly what a complete one reports. These two readings share the type check
+// and nothing else: this one never looks at a parse tree.
+//
+// Named interfaces are skipped. An interface method is a declaration with no body and
+// nothing to substitute inside it, and it is not a function declaration, so counting it
+// here would put the two readings permanently out of step. What implements it is a method
+// on a concrete type, which both readings see.
+func typeCheckedFunctionsMatching(t *testing.T, checked checkedPackage, matches func(*types.Signature) bool) []string {
+	t.Helper()
+	names := []string{}
+	relative := types.RelativeTo(checked.pkg)
+	scope := checked.pkg.Scope()
+	for _, name := range scope.Names() {
+		switch object := scope.Lookup(name).(type) {
+		case *types.Func:
+			if matches(object.Signature()) {
+				names = append(names, name)
+			}
+		case *types.TypeName:
+			named, isNamed := object.Type().(*types.Named)
+			if !isNamed {
+				continue
+			}
+			if _, isInterface := named.Underlying().(*types.Interface); isInterface {
+				continue
+			}
+			for i := 0; i < named.NumMethods(); i++ {
+				method := named.Method(i)
+				if !matches(method.Signature()) {
+					continue
+				}
+				names = append(names,
+					"("+types.TypeString(method.Signature().Recv().Type(), relative)+")."+method.Name())
+			}
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// A signature that takes a want somewhere in its parameters.
+func signatureTaking(want types.Type) func(*types.Signature) bool {
+	is := sameTypeAs(want)
+	return func(signature *types.Signature) bool {
+		for i := 0; i < signature.Params().Len(); i++ {
+			if is(signature.Params().At(i).Type()) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// A signature that answers a want somewhere in its results.
+func signatureAnswering(want types.Type) func(*types.Signature) bool {
+	is := sameTypeAs(want)
+	return func(signature *types.Signature) bool {
+		for i := 0; i < signature.Results().Len(); i++ {
+			if is(signature.Results().At(i).Type()) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// A value one of the entropy gates calls, bound over whatever the call needs. A package
+// level function is callable as it stands; a method needs a receiver, which is why every
+// entry is a binder rather than a bare function value.
+type entropyTakingBinder func(t *testing.T, params *SuiteParams) reflect.Value
+
+// A package level function, which is its own value.
+func entropyTakingValue(function any) entropyTakingBinder {
+	return func(t *testing.T, params *SuiteParams) reflect.Value { return reflect.ValueOf(function) }
+}
+
+// Every value the entropy gates call, keyed by the name the declaration gives it: a
+// package level function by its own name, a method as (receiver).name.
+//
+// The map is not the class. The class is read off the type checked package, and a function
+// it names with no value here is fatal rather than a row left out, so a sixth function
+// taking an entropy source is covered the day somebody declares it rather than the day
+// somebody remembers to add it. A method is written here as a binder that builds its
+// receiver over a source of the gate's own and returns
+// reflect.ValueOf(receiver).MethodByName(name), so the source under test is still the one
+// the call is handed rather than one the receiver is already holding.
+var entropyTakingFunctionValues = map[string]entropyTakingBinder{
+	"NewCryptoProviderWithRandom": entropyTakingValue(NewCryptoProviderWithRandom),
+	"X25519GenerateKey":           entropyTakingValue(X25519GenerateKey),
+	"HpkeSetupBaseS":              entropyTakingValue(HpkeSetupBaseS),
+	"HpkeSealBase":                entropyTakingValue(HpkeSealBase),
+	"hpkeEncap":                   entropyTakingValue(hpkeEncap),
+}
+
+// One function of this package handed a caller's entropy source, with the parameter names
+// the declaration gives it and the positions the source is passed at.
+type entropyTakingFunction struct {
+	name       string
+	parameters []providerParameter
+	sources    []int
+	bind       entropyTakingBinder
+}
+
+// Every function of this package that takes an entropy source, read off the type checked
+// package, cross checked against the type checker's own scope, with a value required for
+// each.
+func entropyTakingFunctions(t *testing.T) []entropyTakingFunction {
+	t.Helper()
+	source := entropySourceType(t)
+	functions := []entropyTakingFunction{}
+	found := []string{}
+	for _, declared := range declaredFunctionsOf(t, cryptoOwnRoot) {
+		sources := declared.takes(source)
+		if len(sources) == 0 {
+			continue
+		}
+		bind, written := entropyTakingFunctionValues[declared.name]
+		if !written {
+			t.Fatalf("%s takes an %s and entropyTakingFunctionValues holds no value for it, so this gate cannot call it",
+				declared.name, entropySourceTypeName)
+		}
+		found = append(found, declared.name)
+		functions = append(functions, entropyTakingFunction{
+			name: declared.name, parameters: declared.parameters, sources: sources, bind: bind,
+		})
+	}
+	if len(functions) == 0 {
+		t.Fatalf("no function of this package takes an %s, so the gate reading this demands nothing",
+			entropySourceTypeName)
+	}
 	slices.Sort(found)
-	if !slices.Equal(found, packageLevelFunctionsTaking(t, entropySourceTypeName)) {
-		t.Fatalf("this gate reads %v as the functions taking an %s and the package level scan reads %v",
-			found, entropySourceTypeName, packageLevelFunctionsTaking(t, entropySourceTypeName))
+	scoped := typeCheckedFunctionsMatching(t, typeCheckedRoot(t, cryptoOwnRoot), signatureTaking(source))
+	if !slices.Equal(found, scoped) {
+		t.Fatalf("this gate reads %v as the functions taking an %s and the type checker's own scope reads %v",
+			found, entropySourceTypeName, scoped)
 	}
 	for name := range entropyTakingFunctionValues {
 		if !slices.Contains(found, name) {
 			t.Errorf("entropyTakingFunctionValues names %s, which is not a function of this package taking an %s",
 				name, entropySourceTypeName)
+		}
+	}
+	return functions
+}
+
+// Every value the constructor gate calls, by the same rule: the class is read off the type
+// checked package and a constructor with no value here is fatal rather than a row left out,
+// so a third way to build a provider is held the day it is declared.
+var providerBuildingFunctionValues = map[string]entropyTakingBinder{
+	"NewCryptoProvider":           entropyTakingValue(NewCryptoProvider),
+	"NewCryptoProviderWithRandom": entropyTakingValue(NewCryptoProviderWithRandom),
+}
+
+// One way to build a provider: where a source goes in, and where the provider comes back.
+type providerBuildingFunction struct {
+	name       string
+	parameters []providerParameter
+	sources    []int
+	answersAt  int
+	bind       entropyTakingBinder
+}
+
+// Every function of this package that answers a provider.
+func providerBuildingFunctions(t *testing.T) []providerBuildingFunction {
+	t.Helper()
+	provider := providerInterfaceType(t)
+	source := entropySourceType(t)
+	functions := []providerBuildingFunction{}
+	found := []string{}
+	for _, declared := range declaredFunctionsOf(t, cryptoOwnRoot) {
+		answersAt := declared.answersAt(provider)
+		if answersAt < 0 {
+			continue
+		}
+		bind, written := providerBuildingFunctionValues[declared.name]
+		if !written {
+			t.Fatalf("%s answers a %s and providerBuildingFunctionValues holds no value for it, so this gate cannot call it",
+				declared.name, providerInterfaceName)
+		}
+		found = append(found, declared.name)
+		functions = append(functions, providerBuildingFunction{
+			name:       declared.name,
+			parameters: declared.parameters,
+			sources:    declared.takes(source),
+			answersAt:  answersAt,
+			bind:       bind,
+		})
+	}
+	if len(functions) == 0 {
+		t.Fatalf("no function of this package answers a %s, so the gate reading this demands nothing",
+			providerInterfaceName)
+	}
+	slices.Sort(found)
+	scoped := typeCheckedFunctionsMatching(t, typeCheckedRoot(t, cryptoOwnRoot), signatureAnswering(provider))
+	if !slices.Equal(found, scoped) {
+		t.Fatalf("this gate reads %v as the functions answering a %s and the type checker's own scope reads %v",
+			found, providerInterfaceName, scoped)
+	}
+	for name := range providerBuildingFunctionValues {
+		if !slices.Contains(found, name) {
+			t.Errorf("providerBuildingFunctionValues names %s, which is not a function of this package answering a %s",
+				name, providerInterfaceName)
 		}
 	}
 	return functions
@@ -4223,7 +4628,7 @@ func resultsBesideTheError(results []reflect.Value) []string {
 // The class is read off the parse tree rather than written down, so the next function to
 // take a source is held the day it is declared.
 func TestEveryEntropyTakingFunctionRefusesANilSource(t *testing.T) {
-	source := reflect.TypeOf((*io.Reader)(nil)).Elem()
+	nothing := func(want reflect.Type) reflect.Value { return reflect.Zero(want) }
 	for _, suite := range Suites() {
 		params, err := LookupSuite(suite)
 		if err != nil {
@@ -4232,25 +4637,32 @@ func TestEveryEntropyTakingFunctionRefusesANilSource(t *testing.T) {
 		arguments := entropyTakingArguments(t, params)
 		for _, function := range entropyTakingFunctions(t) {
 			where := fmt.Sprintf("suite %#04x %s", uint16(suite), function.name)
-			signature := function.value.Type()
+			value := function.bind(t, params)
+			signature := value.Type()
 			if signature.NumIn() != len(function.parameters) {
 				t.Fatalf("%s is declared with %d parameters and called with %d",
 					where, len(function.parameters), signature.NumIn())
 			}
-			call := func(given reflect.Value) []reflect.Value {
+			// the source goes in at whatever positions the compiler reads as one, converted
+			// to the type the parameter is declared with: an entropy source spelled as a
+			// type of its own is still the same bytes and is still called through here
+			call := func(given func(want reflect.Type) reflect.Value) []reflect.Value {
 				built := []reflect.Value{}
 				for i, parameter := range function.parameters {
-					if parameter.typeName == entropySourceTypeName {
-						built = append(built, given)
+					if slices.Contains(function.sources, i) {
+						built = append(built, given(signature.In(i)))
 						continue
 					}
 					built = append(built, providerStubArgument(t, arguments, function.name, parameter, signature.In(i)))
 				}
 				return built
 			}
+			holding := func(want reflect.Type) reflect.Value {
+				return reflect.ValueOf(providerStubStream(0x80)).Convert(want)
+			}
 			// the control first: over a source with bytes in it the call must succeed, or
 			// the refusal below is satisfied by a function that refuses everything
-			results, recovered := providerStubCall(function.value, call(reflect.ValueOf(providerStubStream(0x80))))
+			results, recovered := providerStubCall(value, call(holding))
 			if recovered != nil {
 				t.Errorf("%s refused a source holding bytes: %v", where, recovered)
 				continue
@@ -4263,7 +4675,7 @@ func TestEveryEntropyTakingFunctionRefusesANilSource(t *testing.T) {
 				t.Errorf("%s refused a source holding bytes: %v", where, failure)
 				continue
 			}
-			refused, recovered := providerStubCall(function.value, call(reflect.Zero(source)))
+			refused, recovered := providerStubCall(value, call(nothing))
 			if recovered != nil {
 				continue
 			}
@@ -4274,6 +4686,201 @@ func TestEveryEntropyTakingFunctionRefusesANilSource(t *testing.T) {
 			for _, answered := range resultsBesideTheError(refused) {
 				t.Errorf("%s answered with %s alongside its refusal", where, answered)
 			}
+		}
+	}
+}
+
+// A package whose entropy source is spelled every way a line can spell one.
+//
+// The alias is the whole point of it. A filter comparing the rendered parameter type to
+// "io.Reader" reads SeedFrom as taking no entropy source, and the gate reading that filter
+// then demands nothing of it while reporting exactly what a complete gate reports. The
+// method is the other half: a class that skipped every declaration carrying a receiver
+// read the identical fallback as belonging to nothing at all. Neither is a hypothetical --
+// both were written into this package, and both passed the whole suite.
+const entropyClassControl = `package control
+
+import "io"
+
+type EntropySource = io.Reader
+
+type RandomSource io.Reader
+
+type holder struct{}
+
+func SeedFrom(source EntropySource, length int) ([]byte, error) { return nil, nil }
+
+func (self *holder) SeedFrom(random io.Reader, length int) ([]byte, error) { return nil, nil }
+
+func Wrapped(source RandomSource) ([]byte, error) { return nil, nil }
+
+func NoSource(length int) ([]byte, error) { return nil, nil }
+`
+
+// Every name of the control the entropy class must read as taking a source, and no other.
+//
+// NoSource is the negative half, and it is the half that keeps the row above from being
+// satisfied by a matcher that answers yes to everything. Wrapped is in the class on
+// purpose: RandomSource is a different type from io.Reader and carries the identical
+// interface, so a function taking one reads exactly the bytes a function taking an
+// io.Reader reads, and a class that matched only the type itself would report it as taking
+// no entropy source at all.
+var entropyClassControlMembers = []string{"(*holder).SeedFrom", "SeedFrom", "Wrapped"}
+
+// The entropy class reads a type, not a spelling, and a declaration, not a package level
+// declaration.
+//
+// Both readings are run over the control, because the two are each other's cross check in
+// the real gate and a control that proved only one of them would leave the other free to
+// stop matching. A matcher that reads the control the way a rendered name filter does --
+// SeedFrom absent, the method absent -- fails here rather than passing everything quietly.
+func TestTheEntropyClassReadsATypeRatherThanASpelling(t *testing.T) {
+	control := typeCheckedText(t, "the entropy class control", entropyClassControl)
+	source := entropySourceType(t)
+	read := []string{}
+	for _, declared := range declaredFunctionsIn(t, control) {
+		if len(declared.takes(source)) != 0 {
+			read = append(read, declared.name)
+		}
+	}
+	slices.Sort(read)
+	if !slices.Equal(read, entropyClassControlMembers) {
+		t.Errorf("the class read %v out of the control, want %v", read, entropyClassControlMembers)
+	}
+	scoped := typeCheckedFunctionsMatching(t, control, signatureTaking(source))
+	if !slices.Equal(scoped, entropyClassControlMembers) {
+		t.Errorf("the type checker's own scope read %v out of the control, want %v",
+			scoped, entropyClassControlMembers)
+	}
+}
+
+// The type checked walk reads the same source the parse tree walks read.
+//
+// Two readings of "this package's non test source" that disagree are one gate demanding
+// less than the one beside it while both report clean, and the narrower one is invisible
+// from inside itself. The root is compared against the guardrails' own list rather than
+// assumed to be in it, so a root renamed there does not leave this walking somewhere the
+// bans no longer cover.
+func TestTheTypeCheckedWalkReadsTheSameSourceAsTheParseTreeWalk(t *testing.T) {
+	checked := typeCheckedRoot(t, cryptoOwnRoot)
+	if scanned := packageLevelFunctions(t).files; !slices.Equal(checked.paths, scanned) {
+		t.Errorf("the type checked walk read %v and the package level scan read %v", checked.paths, scanned)
+	}
+	if !slices.Contains(forbiddenScanRoots, cryptoOwnRoot) {
+		t.Errorf("%q is not one of the roots the guardrails walk, %v", cryptoOwnRoot, forbiddenScanRoots)
+	}
+}
+
+// A provider holds the source it was built over, and a provider built over none holds the
+// operating system's.
+//
+// This is the frame the constructor pin does not reach.
+// TestNewCryptoProviderReadsTheProcessEntropySource holds NewCryptoProvider to a single
+// statement, and that statement is a call: what the called constructor then puts in the
+// provider's field is a line neither that pin nor any behavioural gate in this file reads.
+// Measured, on this package as it stood: three lines inside NewCryptoProviderWithRandom
+// answering rand.Reader with a counter expanded through sha256 passed all 2284 tests, and
+// every key, nonce and signature seed the implementation produced was recoverable from a
+// sixty four bit counter. Two providers over a counter still disagree with each other,
+// which is exactly why the same substitution passed all 113 tests in task 11.
+//
+// So the assertion is identity, and it enumerates nothing: the source a constructor was
+// handed must be the value in the field, and a constructor handed none must hold
+// crypto/rand's own reader. A wrapper, a buffer, a whitener and a seeded expansion of it
+// all fail that, and no list has to be kept in step for it to stay true. Pinning the
+// delegate's text instead would have been the same defect one hop lower -- a statement pin
+// stops at the next call, and this reads the field however many calls it took to fill.
+//
+// The two rows are each other's control. A read of the field that always answered
+// rand.Reader would fail the row over a caller's source, and one that always answered the
+// caller's source would fail the row over none, so neither row can be satisfied by a
+// comparison that is not looking at the field.
+func TestEveryProviderConstructorHoldsTheSourceItWasGiven(t *testing.T) {
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up %#04x: %v", uint16(suite), err)
+		}
+		arguments := entropyTakingArguments(t, params)
+		for _, function := range providerBuildingFunctions(t) {
+			where := fmt.Sprintf("suite %#04x %s", uint16(suite), function.name)
+			value := function.bind(t, params)
+			signature := value.Type()
+			if signature.NumIn() != len(function.parameters) {
+				t.Fatalf("%s is declared with %d parameters and called with %d",
+					where, len(function.parameters), signature.NumIn())
+			}
+			given := providerStubStream(0x80)
+			built := []reflect.Value{}
+			for i, parameter := range function.parameters {
+				if slices.Contains(function.sources, i) {
+					built = append(built, reflect.ValueOf(given).Convert(signature.In(i)))
+					continue
+				}
+				built = append(built, providerStubArgument(t, arguments, function.name, parameter, signature.In(i)))
+			}
+			results, recovered := providerStubCall(value, built)
+			if recovered != nil {
+				t.Errorf("%s panicked building a provider: %v", where, recovered)
+				continue
+			}
+			if failure, _ := errorResultOf(results); failure != nil {
+				t.Errorf("%s refused to build a provider: %v", where, failure)
+				continue
+			}
+			answered := results[function.answersAt].Interface()
+			holding, isTheImplementation := answered.(*suiteCryptoProvider)
+			if !isTheImplementation {
+				t.Fatalf("%s answered a %T, and this gate reads the entropy source off a %s",
+					where, answered, providerReceiver)
+			}
+			want, what := io.Reader(rand.Reader), "crypto/rand's own reader"
+			if len(function.sources) != 0 {
+				want, what = given, "the source it was handed"
+			}
+			if holding.random != want {
+				t.Errorf("%s built a provider drawing from a %T rather than from %s",
+					where, holding.random, what)
+			}
+		}
+	}
+}
+
+// No function taking an entropy source lives where this gate cannot call it.
+//
+// mls may not import message -- the layering the message package's own doc states, and the
+// reason that package exists this early -- so a function there taking an entropy source
+// cannot be reached from here at all. What holds it is therefore a tripwire rather than a
+// refusal: it fails the day one is declared, rather than passing unobserved.
+//
+// The residual is written down rather than left to be re-derived, because half of the
+// defect is already held there and half is not. TestTheProcessEntropySourceIsReachableFrom
+// OneFile walks both roots and lets only the file declaring NewCryptoProvider import
+// crypto/rand, so a fallback onto the process source in message fails today; measured, a
+// reader taking function written there with a crypto/rand fallback dies on that gate. A
+// fallback onto a source that is merely deterministic does not, and in a key encapsulation
+// that is the same defect -- measured, the same function with a fixed byte source instead
+// passed all 2284 tests. Task 20 lands X-Wing key generation over a seed in exactly that
+// package.
+//
+// Measured when this was written: message declares no function at all, so the class outside
+// this package is empty and the residual is the tripwire itself. It is not vacuous through
+// a broken walk: rootSourcePaths refuses a root holding no non test source, and the type
+// check of that root is fatal if it does not complete.
+func TestNoEntropyTakingFunctionLivesWhereThisGateCannotCallIt(t *testing.T) {
+	source := entropySourceType(t)
+	for _, root := range forbiddenScanRoots {
+		if root == cryptoOwnRoot {
+			continue
+		}
+		for _, declared := range declaredFunctionsOf(t, root) {
+			if len(declared.takes(source)) == 0 {
+				continue
+			}
+			t.Errorf("%s declares %s, which takes an entropy source and is outside the package "+
+				"TestEveryEntropyTakingFunctionRefusesANilSource can call into: hold its refusal in "+
+				"that package's own tests, and extend this gate to name where that is held",
+				root, declared.name)
 		}
 	}
 }
