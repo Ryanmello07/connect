@@ -5885,6 +5885,83 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 	}
 }
 
+// the deepest tree every block of every level is walked as the head of a drop.
+//
+// the deep sweep above pays 2^(k+1)-1 for one drop at level k, so it can afford
+// a handful of blocks and no more. in a tree of depth d the whole of level k is
+// 2^(d-k) blocks of 2^k nodes each, which is 2^d for the level and d*2^d for
+// the tree however the levels are shaped — so every block of every level of a
+// small tree costs what one drop at the top of a large one does. sixteen is
+// where that stops being free: 900 thousand node visits and a tenth of a
+// second, doubling with every level after it.
+const filteredDropBlockWalkDepth = 16
+
+// a dropped node at every block of every level of every tree to depth sixteen.
+//
+// the sweep above chooses blocks and what it chooses is what it can see. that
+// is not a hypothetical here: its first version built the drop at block 0
+// alone, and a version that forced a keep at block 1 of level 13, 18, 20, 24 or
+// 26 passed the whole package on a node the other sweeps do walk. this walks
+// the blocks instead of choosing them, for as far up as walking is affordable,
+// and the block band left open above depth sixteen is stated in the task report
+// with the count that measures it.
+func TestFilteredDirectPathDropsAtEveryBlockOfASmallTree(t *testing.T) {
+	checked, dropped := int64(0), int64(0)
+	for depth := uint32(1); depth <= filteredDropBlockWalkDepth; depth += 1 {
+		leaves := LeafCount(1) << depth
+		for level := uint32(1); level <= depth; level += 1 {
+			for block := uint64(0); block < uint64(1)<<(depth-level); block += 1 {
+				// the leftmost leaf under the node that has to come out, so
+				// that node is at this block of this level and its copath
+				// child is the odd half block one level down.
+				leaf := LeafIndex(block << level)
+				shape := subtreeBlankShape(leaves, level-1, block<<1|0x01)
+				if !filteredPathAgrees(shape, leaf, depth) {
+					reportFilteredPath(t, fmt.Sprintf("%d leaves, the copath child at level %d block %d blank throughout",
+						leaves, level-1, block<<1|0x01), shape, leaf, depth)
+				}
+				got, err := FilteredDirectPath(shape, leaf)
+				if err != nil {
+					t.Fatalf("%d leaves, level %d block %d: %v", leaves, level, block, err)
+				}
+				position := 0
+				for walked := uint32(1); walked <= depth; walked += 1 {
+					if walked == level {
+						dropped += 1
+						continue
+					}
+					stepLevel, stepBlock := nodeLevelAndBlock(got[position].Node)
+					if stepLevel != walked || stepBlock != uint64(leaf)>>walked {
+						t.Fatalf("%d leaves, level %d block %d: step %d is node %d at level %d block %d, want level %d block %d",
+							leaves, level, block, position, got[position].Node, stepLevel, stepBlock, walked, uint64(leaf)>>walked)
+					}
+					position += 1
+				}
+				if position != len(got) {
+					t.Fatalf("%d leaves, level %d block %d: %v is longer than one node short of the path",
+						leaves, level, block, got)
+				}
+				checked += 1
+			}
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		// the blocks of a tree of depth d number 2^d - 1 across its levels, so
+		// the walk is the sum of that over d from 1 to the walk depth.
+		{label: "drops observed", got: checked, want: int64(1<<(filteredDropBlockWalkDepth+1) - 2 - filteredDropBlockWalkDepth)},
+		{label: "dropped nodes", got: dropped, want: int64(1<<(filteredDropBlockWalkDepth+1) - 2 - filteredDropBlockWalkDepth)},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
 // the highest level a dropped node is observed at, and why the line is there.
 //
 // a node is dropped when its copath child resolves to nothing, and a subtree
@@ -5914,6 +5991,14 @@ const filteredDropLevelCeiling = 26
 // drop at that level. the shallow arm is kept well below the ceiling because it
 // runs beside the deep one at every level rather than instead of it.
 const filteredDropRootCeiling = 20
+
+// the highest level a drop is built at the first four blocks of, rather than at
+// the first two.
+//
+// a drop costs the same 2^(k+1)-1 at every block of a level, so the block count
+// is what the top of the band is paid for. four blocks to level 24 and two
+// above it is 3.4 seconds; four blocks all the way would be 4.7.
+const filteredDropFourBlockCeiling = 24
 
 // a shape whose blank nodes are exactly the subtree headed by one node, so that
 // node resolves to nothing and every other node of the tree resolves to itself.
@@ -5950,20 +6035,30 @@ func subtreeBlankShape(leaves LeafCount, headLevel uint32, headBlock uint64) *fu
 func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 	checked, dropped := int64(0), int64(0)
 	for level := uint32(1); level <= filteredDropLevelCeiling; level += 1 {
+		// the same drop at several blocks of the level, since a version gated
+		// on one block of one level is what the sweeps around this one cannot
+		// see. the first four blocks are named and one more is strided, and
+		// the count thins at the top because a drop at level k costs 2^(k+1)-1
+		// whatever block it is at.
+		blockCount := uint64(4)
+		if level > filteredDropFourBlockCeiling {
+			blockCount = 2
+		}
 		blocks := uint64(1) << (31 - level)
 		depthCases := []struct {
 			depth uint32
 			leaf  LeafIndex
-		}{
-			// the same drop at three blocks of the level, since a version
-			// gated on one block of one level is what the sweeps around this
-			// one cannot see. leaf 0 puts the node that has to come out at
-			// block 0, and the other two put it at block 1 and at a strided
-			// block.
-			{depth: 31, leaf: 0},
-			{depth: 31, leaf: LeafIndex(uint64(1) << level)},
-			{depth: 31, leaf: LeafIndex((uint64(resolutionLeafStride) % blocks) << level)},
+		}{}
+		for block := uint64(0); block < blockCount; block += 1 {
+			depthCases = append(depthCases, struct {
+				depth uint32
+				leaf  LeafIndex
+			}{depth: 31, leaf: LeafIndex(block << level)})
 		}
+		depthCases = append(depthCases, struct {
+			depth uint32
+			leaf  LeafIndex
+		}{depth: 31, leaf: LeafIndex((uint64(resolutionLeafStride) % blocks) << level)})
 		if level <= filteredDropRootCeiling {
 			depthCases = append(depthCases, struct {
 				depth uint32
@@ -6011,8 +6106,12 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 		got   int64
 		want  int64
 	}{
-		{label: "drops observed", got: checked, want: int64(3*filteredDropLevelCeiling + filteredDropRootCeiling)},
-		{label: "dropped nodes", got: dropped, want: int64(3*filteredDropLevelCeiling + filteredDropRootCeiling)},
+		// five blocks a level up to the four-block ceiling and three above it,
+		// plus the shallow arm.
+		{label: "drops observed", got: checked, want: int64(5*filteredDropFourBlockCeiling +
+			3*(filteredDropLevelCeiling-filteredDropFourBlockCeiling) + filteredDropRootCeiling)},
+		{label: "dropped nodes", got: dropped, want: int64(5*filteredDropFourBlockCeiling +
+			3*(filteredDropLevelCeiling-filteredDropFourBlockCeiling) + filteredDropRootCeiling)},
 	}
 	for _, c := range confirmedCases {
 		if c.got != c.want {
