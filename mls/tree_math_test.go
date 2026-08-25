@@ -2826,7 +2826,7 @@ func reportMembership(t *testing.T, level uint32, block uint64) {
 // interior slot above level 4 is probed rather than walked, so what lives is a
 // version wrong over a run of one subtree narrower than the ladder's step at
 // that level and right at every other node of the array. measured over an
-// enumeration of 441 versions, of which the sampled file let 227 through: 11
+// enumeration of 447 versions, of which the sampled file let 229 through: 11
 // live here, every one of them a run inside a single node narrower than one
 // part in spanProbeSteps — one slot at levels 5 to 31, a 1/1024 run at levels 5
 // to 12, a 1/64 run at level 5 — and every version of that shape keyed on a

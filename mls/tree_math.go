@@ -485,10 +485,12 @@ func CommonAncestor(x NodeIndex, y NodeIndex) NodeIndex {
 // levels 0 to 7 at 0.09766% each — and versions wrong over runs of hundreds of
 // millions of nodes at those levels passed the file. the sweep walks every
 // index a tree can hold now, so that class is closed by construction rather
-// than counted down: of 441 versions enumerated over the three bodies and the
+// than counted down: of 447 versions enumerated over the three bodies and the
 // conditions that confine them to a level, a node, a run of blocks or a run of
-// one span, 227 lived before and 11 live after, all 11 of them a run inside one
-// node's subtree at a level whose spans are probed rather than walked.
+// one span, 229 lived before and 14 live after — 11 of them a run inside one
+// node's subtree at a level whose spans are probed rather than walked, and 3 a
+// slot in the block past one node's subtree below level 5. both are keyed on a
+// node, and the test file says what closing them would cost.
 func SubtreeSpan(x NodeIndex) (firstNode NodeIndex, lastNode NodeIndex) {
 	k := x.Level()
 	if k > 31 {
