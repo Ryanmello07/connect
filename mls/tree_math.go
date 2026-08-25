@@ -614,24 +614,36 @@ type NodeShape interface {
 //
 // measured rather than argued, in a scratch copy. a grammar over the body — the
 // two entry checks and their order, the comparison and the bound of the range
-// check, the blank test, the node emit, every clause of the unmerged handling
-// and its bound, the blank-leaf stop, the pop end, the push order, the child
-// pair, three allocation sizes and eight reworkings of the finished list —
-// crossed with the bands that can confine any of them to one level, to one
-// block in 2, 4 or 8 of a level at two residues each, to every level at once,
-// or to trees at or past a given depth, enumerates 1495 versions. the test file
-// kills 1447.
+// check, the blank test, the node emit, every clause of the unmerged handling,
+// the position in the list and the node at which its bound is enforced, the
+// blank-leaf stop, the pop end, the push order, the child pair, six allocation
+// sizes and seven reworkings of the finished list — enumerates versions of this
+// function, and each is run against the test file. the counts are dated, so
+// they live in the task report where being superseded is expected rather than
+// here where nothing checks them.
 //
-// all 48 that live are this function written differently, and each was checked
-// against a walk of all 2^32 indices rather than argued: x > w-1 for x >= w;
-// the three capacities; a band over every node, which is the check itself; the
-// push order swapped at level 0, which no leaf reaches because a leaf stops one
-// line above the push; and 36 bands whose residue is larger than any block its
-// level has, since level 31 holds one node, level 30 two and level 29 four.
-// nothing that differs from this code at an index a tree can hold survives.
+// what lives at every index at once is this function written differently, and
+// each was checked by running it against this code over more than a million
+// shapes rather than argued: the six make capacities, since a slice of length
+// zero is non-nil whatever it was made with and append grows it either way;
+// and x > w-1 for x >= w, which is the same test at every width, because a leaf
+// count that passed the check above makes the width at least one.
 //
-// the same enumeration against the two fixtures the plan wrote for this task
-// kills 382 and lets 1113 through. the sweeps are the other 1065.
+// what is not covered is a class and not nothing. reaching a node and being
+// able to see a defect at it are different things, and an earlier version of
+// this comment ran them together: it argued from the levels the suite reaches
+// that no defect above level 18 could hide, and a push order swapped at one
+// block of level 19 disproved it at a node the suite does visit. the sweeps ask
+// about every block of every level from 19 up as the head of a resolution, in
+// every representable tree, and a defect confined to one block of one of those
+// levels has nowhere to sit — 180 such versions were run, none survived. level
+// 18 is the boundary: every tree but the deepest walks it whole, and of 60
+// single-block versions there 11 survived, nine of them in the half of the
+// level that exists only in a 2^31-leaf tree. from level 17 down the blocks of
+// a level are sampled by a stride and the surviving class is real: of 90
+// versions at level 17, 52 lived, and every one aimed at a block the suite
+// never reaches lived by construction. closing that is a walk of 2^32 nodes per
+// shape, which is why the line is drawn where it is rather than argued away.
 func Resolution(shape NodeShape, x NodeIndex) ([]NodeIndex, error) {
 	n := shape.LeafCount()
 	if err := checkLeafCount(n); err != nil {
