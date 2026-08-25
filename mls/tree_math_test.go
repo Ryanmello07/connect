@@ -6325,11 +6325,19 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 // wrong over a run of blocks at one level, outside those, is not seen here.
 // that residual is what the walks in the rest of this file are sized against,
 // and the task report prices it against them one function at a time.
+//
+// one thing here is narrower than it looks. both shape fixtures are shapes in
+// which nothing is ever filtered out: a tree with every parent blank resolves
+// every copath child to leaves, and a tree with nothing blank resolves every
+// copath child to itself, so a filtered direct path in either is the whole
+// direct path and no step is ever dropped. this sweep therefore never observes
+// the drop, at any depth. that arm belongs to Task 12's shape sweeps and is not
+// duplicated here.
 func TestTreeMathInvariants(t *testing.T) {
 	shallowNodes, deepNodes, ladderNodes := int64(0), int64(0), int64(0)
 	blankParentPaths, populatedPaths := 0, 0
 
-	// the ten sizes the whole array of can be walked.
+	// the ten sizes whose whole array can be walked.
 	for depth := uint32(0); depth <= 9; depth += 1 {
 		shallowNodes += sweepEveryNode(t, depth)
 		blankParentPaths += sweepBlankParentShape(t, depth)
@@ -6578,12 +6586,21 @@ func checkNodeInvariants(t *testing.T, shape NodeShape, depth uint32, root NodeI
 	// subtree span: the run of array slots the layout puts under this node,
 	// even at both ends and holding 2^level leaves.
 	//
-	// the endpoints are asserted and not only the containment the plan wrote.
-	// containment, evenness and a leaf width of 2^level together still admit a
-	// span shifted bodily along the array: the level-two node at index 3 spans
+	// the endpoints are asserted and not only the containment the plan wrote,
+	// and the leaf pair beside them. the plan's three span rows do pass a span
+	// shifted bodily along the array — the level-two node at index 3 spans
 	// [0, 6], and [2, 8] contains 3, is even at both ends and covers four
-	// leaves, so the plan's three rows pass it in any tree of eight leaves or
-	// more.
+	// leaves — but the plan's InSubtree rows read the same function and do not,
+	// so a shifted span is caught there. measured, that shift at level two: the
+	// plan's sweep fails at "3 is on the direct path of 0 but does not contain
+	// it", which is an InSubtree row and not a span row.
+	//
+	// the leaf pair is the one with nothing behind it. SubtreeLeaves is read by
+	// nothing else in the plan's body, so shifting both its ends by one leaf at
+	// level two passes the plan's sweep whole. measured, it fails here at "node
+	// 3 covers leaves 1..4, want 0..3", and in the rest of this package at
+	// TestSubtreeSpanAndLeaves, TestSubtreeSpanAtEveryLevel and
+	// TestTreeMathVectorSubtreeSpan.
 	firstNode, lastNode := SubtreeSpan(nodeIndex)
 	wantFirstNode, wantLastNode, wantFirstLeaf, wantLastLeaf := spanOracle(level, block)
 	if firstNode != wantFirstNode || lastNode != wantLastNode {
@@ -6617,19 +6634,30 @@ func checkNodeInvariants(t *testing.T, shape NodeShape, depth uint32, root NodeI
 	}
 }
 
-// the root of a tree the sweep is about to walk, refused loudly rather than
-// carried as a zero into every row below it.
-func sweepRoot(t *testing.T, leafCount LeafCount) NodeIndex {
+// the root of the tree of the given depth, refused loudly rather than carried
+// as a zero into every row below it.
+//
+// the depth is the caller's and not TreeDepth's, for the reason the node laws
+// take their level from the layout: a sweep that asks the package where the top
+// of the tree is cannot then check anything against it.
+func sweepRoot(t *testing.T, depth uint32) NodeIndex {
 	t.Helper()
+	leafCount := LeafCount(1) << depth
 	root, err := Root(leafCount)
 	if err != nil {
 		t.Fatalf("%d leaves: root: %v", leafCount, err)
 	}
+	if root != nodeAt(depth, 0) {
+		t.Fatalf("%d leaves: root %d, want %d", leafCount, root, nodeAt(depth, 0))
+	}
 	if uint32(root) >= NodeWidth(leafCount) {
 		t.Fatalf("%d leaves: root %d outside width %d", leafCount, root, NodeWidth(leafCount))
 	}
-	if root != nodeAt(TreeDepth(leafCount), 0) {
-		t.Fatalf("%d leaves: root %d, want %d", leafCount, root, nodeAt(TreeDepth(leafCount), 0))
+	// the width is the bound every range row below is checked against, so it is
+	// pinned here rather than believed. 2^(d+1)-1, computed in uint64 so the
+	// largest tree's 2^32-1 is not a wrap.
+	if uint64(NodeWidth(leafCount)) != uint64(2)<<depth-1 {
+		t.Fatalf("%d leaves: node width %d, want %d", leafCount, NodeWidth(leafCount), uint64(2)<<depth-1)
 	}
 	return root
 }
@@ -6661,7 +6689,7 @@ var invariantBlockProbes = []uint64{0, 1, 0xFFFFFFFF, 0xFFFFFFFE, 0xA5A5A5A5}
 func sweepEveryNode(t *testing.T, depth uint32) int64 {
 	t.Helper()
 	leafCount := LeafCount(1) << depth
-	root := sweepRoot(t, leafCount)
+	root := sweepRoot(t, depth)
 	shape := populatedShape(leafCount)
 	walked := int64(0)
 	for i := uint32(0); i < NodeWidth(leafCount); i += 1 {
@@ -6684,7 +6712,7 @@ func sweepEveryNode(t *testing.T, depth uint32) int64 {
 func sweepTopLevels(t *testing.T, depth uint32) int64 {
 	t.Helper()
 	leafCount := LeafCount(1) << depth
-	root := sweepRoot(t, leafCount)
+	root := sweepRoot(t, depth)
 	shape := populatedShape(leafCount)
 	walked := int64(0)
 	for level := invariantFirstLevel(depth); level <= depth; level += 1 {
@@ -6707,7 +6735,7 @@ func sweepTopLevels(t *testing.T, depth uint32) int64 {
 func sweepLevelLadder(t *testing.T, depth uint32) int64 {
 	t.Helper()
 	leafCount := LeafCount(1) << depth
-	root := sweepRoot(t, leafCount)
+	root := sweepRoot(t, depth)
 	shape := populatedShape(leafCount)
 	walked := int64(0)
 	for level := uint32(0); level < invariantFirstLevel(depth); level += 1 {
@@ -6761,7 +6789,7 @@ func sweepBlankParentShape(t *testing.T, depth uint32) int {
 		blankParents.blankNodes[NodeIndex(i)] = true
 	}
 
-	root := sweepRoot(t, leafCount)
+	root := sweepRoot(t, depth)
 	rootResolution, err := Resolution(blankParents, root)
 	if err != nil {
 		t.Fatalf("%d leaves: root resolution: %v", leafCount, err)
