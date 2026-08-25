@@ -9,6 +9,7 @@ package mls
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -3085,5 +3086,919 @@ func TestResolutionEdges(t *testing.T) {
 	}
 	if _, err := Resolution(malformed, 7); !errors.Is(err, ErrLeafOutOfRange) {
 		t.Errorf("resolution with an out-of-range unmerged leaf: %v, want %v", err, ErrLeafOutOfRange)
+	}
+}
+
+// the level and block of a node, worked out from the array layout rather than
+// through the level function this package exports, so a shape and its oracle do
+// not inherit whatever that function does.
+//
+// a level-k node has exactly k trailing one bits and nodeAt lays it at
+// block*2^(k+1) + 2^k - 1, so adding one and shifting right by k+1 recovers the
+// block. the loop stops at 32 so 0xFFFFFFFF, whose bits are all ones, is
+// answered rather than spun on.
+func nodeLevelAndBlock(x NodeIndex) (uint32, uint64) {
+	level := uint32(0)
+	for level < 32 && (uint64(x)>>level)&0x01 == 1 {
+		level += 1
+	}
+	return level, (uint64(x) + 1) >> (level + 1)
+}
+
+// a NodeShape whose two rules are closures, so a fixture can be a predicate
+// over a tree far too large to write down node by node.
+type functionShape struct {
+	shapeLeafCount LeafCount
+	blankNode      func(x NodeIndex) bool
+	unmergedOfNode func(x NodeIndex) []LeafIndex
+}
+
+func (self *functionShape) LeafCount() LeafCount {
+	return self.shapeLeafCount
+}
+
+// a nil predicate is a tree with nothing blank, which is what the range and
+// leaf-count arms want: they are decided before any node is looked at.
+func (self *functionShape) IsBlank(x NodeIndex) bool {
+	if self.blankNode == nil {
+		return false
+	}
+	return self.blankNode(x)
+}
+
+func (self *functionShape) UnmergedLeaves(x NodeIndex) []LeafIndex {
+	if self.unmergedOfNode == nil {
+		return nil
+	}
+	return self.unmergedOfNode(x)
+}
+
+// two unmerged leaves on every third node and one on every other third, drawn
+// from inside the node's own subtree and stored last-then-first.
+//
+// the stored order is deliberately not the ascending one. an unmerged leaf is a
+// descendant of the node that carries it, so a leaf in the left half of a
+// parent's subtree has a smaller index than the parent does, and the resolution
+// [parent, that leaf] is the one place the answer does not ascend. a version
+// that sorts its result, or that sorts one node's unmerged list, agrees with
+// this one everywhere else.
+func pathBlankUnmerged(x NodeIndex) []LeafIndex {
+	level, block := nodeLevelAndBlock(x)
+	firstLeaf := LeafIndex(block << level)
+	lastLeaf := LeafIndex((block+1)<<level - 1)
+	switch uint64(x) % 3 {
+	case 0:
+		return nil
+	case 1:
+		return []LeafIndex{lastLeaf}
+	default:
+		return []LeafIndex{lastLeaf, firstLeaf}
+	}
+}
+
+// a shape whose blank nodes are exactly the direct paths of the given leaves,
+// those leaves included.
+//
+// the exhaustive fixtures below cannot reach past a handful of levels: a tree
+// of depth 31 holds 2^32-1 nodes and an all-blank one resolves to 2^31 leaves,
+// which is neither walkable nor allocatable. blanking a chain instead keeps the
+// answer to O(depth) nodes at every depth, which is what lets the levels the
+// vector family stops short of be asserted whole rather than sampled.
+//
+// a node at (level, block) is an ancestor of leaf L, or is L, exactly when
+// block equals L shifted right by the level, which is a test of the node's
+// index alone and reaches no function of this package.
+func pathBlankShape(leaves LeafCount, blankLeaves []LeafIndex, withUnmerged bool) *functionShape {
+	shape := &functionShape{
+		shapeLeafCount: leaves,
+		blankNode: func(x NodeIndex) bool {
+			level, block := nodeLevelAndBlock(x)
+			for _, leaf := range blankLeaves {
+				if uint64(leaf)>>level == block {
+					return true
+				}
+			}
+			return false
+		},
+		unmergedOfNode: nil,
+	}
+	if withUnmerged {
+		shape.unmergedOfNode = pathBlankUnmerged
+	}
+	return shape
+}
+
+// a shape over a small tree whose blank set and unmerged-leaf placement are
+// both bit masks, so every shape a tree of that size can have is a counter.
+type maskShape struct {
+	shapeLeafCount LeafCount
+	blankMask      uint32
+	unmergedMask   uint32
+}
+
+func (self *maskShape) LeafCount() LeafCount {
+	return self.shapeLeafCount
+}
+
+func (self *maskShape) IsBlank(x NodeIndex) bool {
+	return self.blankMask>>uint32(x)&0x01 == 1
+}
+
+// two entries that move with the node, one counting down and one counting up,
+// so a version that emits some other node's list, or sorts one, or drops a
+// repeat, differs here. at some nodes the pair ascends and at others it does
+// not.
+func (self *maskShape) UnmergedLeaves(x NodeIndex) []LeafIndex {
+	if self.unmergedMask>>uint32(x)&0x01 == 0 {
+		return nil
+	}
+	within := uint32(x) % uint32(self.shapeLeafCount)
+	return []LeafIndex{LeafIndex(uint32(self.shapeLeafCount) - 1 - within), LeafIndex(within)}
+}
+
+// the resolution of the node at (level, block), applied straight from the three
+// rules RFC 9420 section 4.1 states, from the head down.
+//
+// nothing of the implementation is reached: the children are the two half
+// blocks one level down rather than Left and Right, the leaf case is the level
+// rather than IsLeaf, the head is not range checked against a width, and an
+// unmerged leaf becomes a node by doubling rather than through
+// LeafIndex.NodeIndex. TestResolutionOraclesAgainstRfcFigure10 runs it against
+// the three lists the RFC publishes before any sweep uses it.
+//
+// the budget is not a guard against a deep tree, since the recursion is bounded
+// by the level, but against a wide blank one: descending an all-blank 2^31-leaf
+// tree would visit 2^32 nodes, and a sweep that built one by accident should
+// say so rather than run for an hour.
+func descentResolution(shape NodeShape, level uint32, block uint64, budget *int) ([]NodeIndex, bool) {
+	*budget -= 1
+	if *budget < 0 {
+		return nil, false
+	}
+	x := nodeAt(level, block)
+	if !shape.IsBlank(x) {
+		resolved := []NodeIndex{x}
+		for _, leaf := range shape.UnmergedLeaves(x) {
+			resolved = append(resolved, NodeIndex(2*uint64(leaf)))
+		}
+		return resolved, true
+	}
+	if level == 0 {
+		return []NodeIndex{}, true
+	}
+	leftResolution, ok := descentResolution(shape, level-1, 2*block, budget)
+	if !ok {
+		return nil, false
+	}
+	rightResolution, ok := descentResolution(shape, level-1, 2*block+1, budget)
+	if !ok {
+		return nil, false
+	}
+	return append(leftResolution, rightResolution...), true
+}
+
+// the same resolution reached without any traversal: an ascending walk of every
+// array slot the node spans, keeping each non-blank slot with nothing but blank
+// nodes between it and the head.
+//
+// this is a second oracle and not a spare one. the descent above unrolls the
+// same recursion the implementation's stack does, so one misreading of the
+// third rule could sit in both; this reads the rules as a per-slot predicate,
+// with no recursion and no notion of a child at all, and the two are compared
+// against each other as well as against the RFC's published lists. it costs
+// 2^(level+1) slots, so only the small fixtures use it.
+func scanResolution(shape NodeShape, level uint32, block uint64) []NodeIndex {
+	resolved := []NodeIndex{}
+	firstNode := block << (level + 1)
+	for offset := uint64(0); offset < uint64(1)<<(level+1)-1; offset += 1 {
+		x := NodeIndex(firstNode + offset)
+		if shape.IsBlank(x) {
+			continue
+		}
+		nodeLevel, nodeBlock := nodeLevelAndBlock(x)
+		covered := true
+		for ancestorLevel := nodeLevel + 1; ancestorLevel <= level; ancestorLevel += 1 {
+			if !shape.IsBlank(nodeAt(ancestorLevel, nodeBlock>>(ancestorLevel-nodeLevel))) {
+				covered = false
+				break
+			}
+		}
+		if !covered {
+			continue
+		}
+		resolved = append(resolved, x)
+		for _, leaf := range shape.UnmergedLeaves(x) {
+			resolved = append(resolved, NodeIndex(2*uint64(leaf)))
+		}
+	}
+	return resolved
+}
+
+// the two oracles above against the three resolutions RFC 9420 publishes for
+// figure 10, before either is used to judge anything.
+//
+// the figure and its worked answers are read out of the RFC text at
+// https://www.rfc-editor.org/rfc/rfc9420.txt, sha256
+// 467d709b7cea19d278204daca1af01910add522cd8e3325cb406f339efbb0d92, lines 961
+// to 1003: the three rules at lines 968, 971 and 973, the figure at lines 981
+// to 995, and the published answers at lines 999, 1001 and 1003 —
+//
+//	The resolution of node X is the list [X, B].
+//	The resolution of leaf 2 or leaf 6 is the empty list [].
+//	The resolution of top node is the list [X, B, Y, H].
+//
+// cross-read against the HTML rendering at
+// https://www.rfc-editor.org/rfc/rfc9420.html section 4.1, which prints the
+// same three rules, the same figure and the same three answers. the two
+// readings agree.
+//
+// the RFC prints three of the figure's answers and the fixture above asserts
+// eight. the other five are read off the figure, which is published too and is
+// what the RFC derives its three from; the oracles here are what makes the
+// difference between the two visible, since a misreading of the third rule
+// would have to be made the same way twice, in two different shapes of code, to
+// survive this.
+func TestResolutionOraclesAgainstRfcFigure10(t *testing.T) {
+	shape := rfcFigure10Shape()
+	publishedCases := []struct {
+		label      string
+		level      uint32
+		block      uint64
+		resolution []NodeIndex
+	}{
+		{label: "node X", level: 2, block: 0, resolution: []NodeIndex{3, 2}},
+		{label: "leaf 2", level: 0, block: 2, resolution: []NodeIndex{}},
+		{label: "leaf 6", level: 0, block: 6, resolution: []NodeIndex{}},
+		{label: "top node", level: 3, block: 0, resolution: []NodeIndex{3, 2, 9, 14}},
+	}
+	for _, c := range publishedCases {
+		budget := 1 << 16
+		descent, ok := descentResolution(shape, c.level, c.block, &budget)
+		if !ok {
+			t.Errorf("%s: the descent oracle ran past its budget", c.label)
+			continue
+		}
+		assertNodeIndexes(t, c.label+" by descent", descent, c.resolution)
+		assertNodeIndexes(t, c.label+" by scan", scanResolution(shape, c.level, c.block), c.resolution)
+	}
+}
+
+// compares one node's resolution against the two oracles and says only whether
+// they agreed, so a sweep can run a million rows and stop on the first that
+// differs rather than printing a million lines.
+//
+// the scan oracle is skipped above the depth its cost allows; the descent
+// oracle runs on every row.
+func resolutionAgrees(shape NodeShape, level uint32, block uint64, withScan bool) bool {
+	budget := 1 << 20
+	want, ok := descentResolution(shape, level, block, &budget)
+	if !ok {
+		return false
+	}
+	got, err := Resolution(shape, nodeAt(level, block))
+	if err != nil {
+		return false
+	}
+	if !sameNodeIndexes(got, want) {
+		return false
+	}
+	if withScan && !sameNodeIndexes(want, scanResolution(shape, level, block)) {
+		return false
+	}
+	return true
+}
+
+// the same comparison once more on t, so a stopped sweep names the node and
+// prints all three lists instead of a boolean.
+func reportResolution(t *testing.T, label string, shape NodeShape, level uint32, block uint64) {
+	t.Helper()
+	x := nodeAt(level, block)
+	budget := 1 << 20
+	want, ok := descentResolution(shape, level, block, &budget)
+	if !ok {
+		t.Fatalf("%s: node %d at level %d block %d: the descent oracle ran past its budget", label, x, level, block)
+	}
+	got, err := Resolution(shape, x)
+	if err != nil {
+		t.Fatalf("%s: node %d at level %d block %d: %v", label, x, level, block, err)
+	}
+	if !sameNodeIndexes(got, want) {
+		t.Fatalf("%s: node %d at level %d block %d: %v, want %v", label, x, level, block, got, want)
+	}
+	if scan := scanResolution(shape, level, block); !sameNodeIndexes(want, scan) {
+		t.Fatalf("%s: node %d at level %d block %d: the two oracles disagree, descent %v and scan %v",
+			label, x, level, block, want, scan)
+	}
+	t.Fatalf("%s: node %d at level %d block %d was refused by the sweep and agrees when it is asked again",
+		label, x, level, block)
+}
+
+// every shape a four-leaf tree can have: each of the 128 blank sets crossed
+// with each of the 128 placements of an unmerged list, at each of its 7 nodes.
+//
+// the fixtures above are one shape of the many a tree can be in, and the three
+// rules interact: a blank node's children can be blank, a blank leaf can be the
+// left or the right child, a whole blank subtree contributes nothing several
+// levels up, and an unmerged list on a blank node must not be read at all. a
+// hand-picked list of shapes cannot cover that crossing and a wrong version
+// sits in the gap, so the shapes are counted rather than chosen.
+func TestResolutionEveryShapeOfAFourLeafTree(t *testing.T) {
+	const leaves = LeafCount(4)
+	width := NodeWidth(leaves)
+	checked := int64(0)
+	for blankMask := uint32(0); blankMask < uint32(1)<<width; blankMask += 1 {
+		for unmergedMask := uint32(0); unmergedMask < uint32(1)<<width; unmergedMask += 1 {
+			shape := &maskShape{shapeLeafCount: leaves, blankMask: blankMask, unmergedMask: unmergedMask}
+			for x := uint32(0); x < width; x += 1 {
+				level, block := nodeLevelAndBlock(NodeIndex(x))
+				if !resolutionAgrees(shape, level, block, true) {
+					reportResolution(t, fmt.Sprintf("blank mask %#x unmerged mask %#x", blankMask, unmergedMask), shape, level, block)
+				}
+				checked += 1
+			}
+		}
+	}
+	if want := int64(1<<14) * int64(width); checked != want {
+		t.Errorf("confirmed resolutions of a four-leaf tree: %d, want %d", checked, want)
+	}
+}
+
+// every blank shape an eight-leaf tree can have, with and without an unmerged
+// list on every node, at each of its 15 nodes.
+//
+// eight leaves is the size of both figures RFC 9420 draws and of every fixture
+// above, and 32768 is how many blank sets a tree that size has. the crossing
+// with the unmerged placement is not exhaustive here — that would be 2^30
+// shapes — so the four-leaf sweep above carries it and this one carries the
+// depth.
+func TestResolutionEveryBlankShapeOfAnEightLeafTree(t *testing.T) {
+	const leaves = LeafCount(8)
+	width := NodeWidth(leaves)
+	checked := int64(0)
+	for _, unmergedMask := range []uint32{0, uint32(1)<<NodeWidth(8) - 1} {
+		for blankMask := uint32(0); blankMask < uint32(1)<<width; blankMask += 1 {
+			shape := &maskShape{shapeLeafCount: leaves, blankMask: blankMask, unmergedMask: unmergedMask}
+			for x := uint32(0); x < width; x += 1 {
+				level, block := nodeLevelAndBlock(NodeIndex(x))
+				if !resolutionAgrees(shape, level, block, true) {
+					reportResolution(t, fmt.Sprintf("blank mask %#x unmerged mask %#x", blankMask, unmergedMask), shape, level, block)
+				}
+				checked += 1
+			}
+		}
+	}
+	if want := 2 * int64(1<<15) * int64(width); checked != want {
+		t.Errorf("confirmed resolutions of an eight-leaf tree: %d, want %d", checked, want)
+	}
+}
+
+// an odd stride, so the probe leaves of a depth are not all at power-of-two
+// offsets into it.
+const resolutionLeafStride = 0x9E3779B1
+
+// the leaves each depth blanks a path through.
+//
+// the first four are where a blanked path meets an edge: leaf zero is the
+// leftmost path, the last leaf the rightmost, and the two middle leaves put the
+// path on either side of the root's own split. every one of those is at a
+// power-of-two offset, and a version confined to blocks that are not powers of
+// two would be invisible to a probe set made only of them, so four more are
+// spread by an odd stride.
+func resolutionProbeLeaves(depth uint32) []LeafIndex {
+	if depth == 0 {
+		return []LeafIndex{0}
+	}
+	leaves := uint64(1) << depth
+	probes := []LeafIndex{
+		0,
+		LeafIndex(leaves - 1),
+		LeafIndex(leaves/2 - 1),
+		LeafIndex(leaves / 2),
+	}
+	for step := uint64(1); step <= 4; step += 1 {
+		probes = append(probes, LeafIndex(step*resolutionLeafStride%leaves))
+	}
+	return probes
+}
+
+// the resolution of every node of a blanked path, and of every copath node
+// beside it, at every depth a tree can have.
+//
+// this is the band nothing else in this package reaches. the mlswg tree-math
+// family stops at 512 leaves, which is level 9, and every fixture and every
+// exhaustive sweep above is an eight-leaf tree, which is level 3. a version
+// that is right below level 10 and wrong above it — a push order swapped at one
+// level, a blank test skipped at one level, an unmerged list dropped at one
+// level — passes all of them.
+//
+// the shapes are chains rather than arbitrary blank sets because an arbitrary
+// one is not affordable at this depth: an all-blank tree of depth 31 resolves
+// to 2^31 nodes. a blanked path keeps the answer to one node per level, which
+// is what makes levels 10 to 31 assertable at all rather than sampled.
+func TestResolutionAtEveryDepth(t *testing.T) {
+	checked := int64(0)
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leaves := LeafCount(1) << depth
+		for _, blanked := range resolutionProbeLeaves(depth) {
+			for _, withUnmerged := range []bool{false, true} {
+				shape := pathBlankShape(leaves, []LeafIndex{blanked}, withUnmerged)
+				label := fmt.Sprintf("%d leaves, the path of leaf %d blank, unmerged leaves %v", leaves, blanked, withUnmerged)
+				for level := uint32(0); level <= depth; level += 1 {
+					pathBlock := uint64(blanked) >> level
+					if !resolutionAgrees(shape, level, pathBlock, depth <= 8) {
+						reportResolution(t, label, shape, level, pathBlock)
+					}
+					checked += 1
+					if level == depth {
+						continue
+					}
+					if !resolutionAgrees(shape, level, pathBlock^1, depth <= 8) {
+						reportResolution(t, label, shape, level, pathBlock^1)
+					}
+					checked += 1
+				}
+			}
+		}
+	}
+	// depth zero has one probe leaf and one node; every other depth has eight
+	// probe leaves and 2*depth+1 nodes, and each is run with and without
+	// unmerged leaves. sum(d=1..31) 2*(2d+1) * 8 = 16 * (2*496 + 31) = 16368.
+	if want := int64(2 + 16368); checked != want {
+		t.Errorf("confirmed resolutions across every depth: %d, want %d", checked, want)
+	}
+}
+
+// the same band again with two blanked paths, so a blank node has two blank
+// children at every level in turn.
+//
+// a single blanked path never produces that: every blank node on it has one
+// blank child and one populated sibling, so a version that resolves only its
+// first blank child, or that stops descending when the second child is blank
+// too, agrees with the sweep above at every depth. the two paths meet at level
+// j+1, and j runs over every level of every depth.
+func TestResolutionAtEveryDepthWithTwoBlankPaths(t *testing.T) {
+	checked := int64(0)
+	for depth := uint32(1); depth <= 31; depth += 1 {
+		leaves := LeafCount(1) << depth
+		for _, blanked := range resolutionProbeLeaves(depth) {
+			for meetingLevel := uint32(0); meetingLevel < depth; meetingLevel += 1 {
+				other := LeafIndex(uint64(blanked) ^ uint64(1)<<meetingLevel)
+				shape := pathBlankShape(leaves, []LeafIndex{blanked, other}, true)
+				label := fmt.Sprintf("%d leaves, the paths of leaves %d and %d blank", leaves, blanked, other)
+				// the node the two paths meet at, and the root above it
+				meetingCases := []struct {
+					level uint32
+					block uint64
+				}{
+					{level: meetingLevel + 1, block: uint64(blanked) >> (meetingLevel + 1)},
+					{level: depth, block: 0},
+				}
+				for _, c := range meetingCases {
+					if !resolutionAgrees(shape, c.level, c.block, depth <= 8) {
+						reportResolution(t, label, shape, c.level, c.block)
+					}
+					checked += 1
+				}
+			}
+		}
+	}
+	// eight probe leaves a depth, one meeting level per level below the root,
+	// two nodes each: 8 * 2 * sum(d=1..31) d = 16 * 496 = 7936.
+	if want := int64(7936); checked != want {
+		t.Errorf("confirmed two-path resolutions across every depth: %d, want %d", checked, want)
+	}
+}
+
+// the unmerged-leaf half of the first rule, one clause at a time.
+//
+// RFC 9420 says a non-blank node resolves to the node itself followed by its
+// list of unmerged leaves, and it says nothing about that list being sorted,
+// deduplicated or inside the node's own subtree — those are the section 7.9
+// tree-validation checks and tree_sync.go owns them. what this file owes its
+// callers is that the list comes back in stored order and untouched, because
+// TreeKEM encrypts a path secret to the resolution position by position: a
+// resolution reordered here hands a member the wrong secret. the two clauses
+// that carry no example in the RFC are the ones asserted hardest here — a blank
+// node's list is not read at all, and a leaf's list is read like any other
+// node's.
+func TestResolutionUnmergedLeafRules(t *testing.T) {
+	unmergedCases := []struct {
+		label      string
+		shape      *fixtureShape
+		nodeIndex  NodeIndex
+		resolution []NodeIndex
+	}{
+		{
+			label: "the stored order is kept rather than sorted",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{7: {3, 1, 0}},
+			},
+			nodeIndex:  7,
+			resolution: []NodeIndex{7, 6, 2, 0},
+		},
+		{
+			label: "a repeated unmerged leaf is kept",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{7: {1, 1}},
+			},
+			nodeIndex:  7,
+			resolution: []NodeIndex{7, 2, 2},
+		},
+		{
+			label: "a blank node's unmerged list is not read",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{7: true},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{7: {1}},
+			},
+			nodeIndex:  7,
+			resolution: []NodeIndex{3, 11},
+		},
+		{
+			label: "a blank leaf's unmerged list is not read",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{4: true},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{4: {0}},
+			},
+			nodeIndex:  4,
+			resolution: []NodeIndex{},
+		},
+		{
+			label: "a non-blank leaf carries its unmerged list like any other node",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{4: {5}},
+			},
+			nodeIndex:  4,
+			resolution: []NodeIndex{4, 10},
+		},
+		{
+			label: "an unmerged leaf outside the node's own subtree is emitted as stored",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{3: {7}},
+			},
+			nodeIndex:  3,
+			resolution: []NodeIndex{3, 14},
+		},
+		{
+			label: "an empty unmerged list is the node alone",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{7: {}},
+			},
+			nodeIndex:  7,
+			resolution: []NodeIndex{7},
+		},
+		{
+			label: "the last leaf of the tree is inside it",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{7: {7}},
+			},
+			nodeIndex:  7,
+			resolution: []NodeIndex{7, 14},
+		},
+		{
+			label: "a blank node's children carry theirs",
+			shape: &fixtureShape{
+				fixtureLeafCount:   8,
+				blankNodes:         map[NodeIndex]bool{7: true, 3: true},
+				unmergedNodeLeaves: map[NodeIndex][]LeafIndex{1: {1, 0}, 5: {3}, 11: {5, 4}},
+			},
+			nodeIndex:  7,
+			resolution: []NodeIndex{1, 2, 0, 5, 6, 11, 10, 8},
+		},
+	}
+	for _, c := range unmergedCases {
+		got, err := Resolution(c.shape, c.nodeIndex)
+		if err != nil {
+			t.Errorf("%s: %v", c.label, err)
+			continue
+		}
+		assertNodeIndexes(t, c.label, got, c.resolution)
+	}
+}
+
+// a shape that is not a tree is refused as one, whatever node it is asked
+// about.
+//
+// the order of the two entry checks is the whole of this: a shape with three
+// leaves has a node width of five, so node 99 is outside it as well, and only
+// reading the leaf count first makes the refusal say which of the two things is
+// wrong. a caller that switches on the sentinel to decide whether to reject the
+// tree or the request needs that order to hold.
+func TestResolutionRefusesAMalformedShape(t *testing.T) {
+	malformedCases := []struct {
+		label     string
+		leafCount LeafCount
+		nodeIndex NodeIndex
+		want      error
+	}{
+		{label: "no leaves", leafCount: 0, nodeIndex: 0, want: ErrLeafCountRange},
+		{label: "no leaves, node past every width", leafCount: 0, nodeIndex: 0xFFFFFFFF, want: ErrLeafCountRange},
+		{label: "three leaves", leafCount: 3, nodeIndex: 0, want: ErrLeafCountNotFull},
+		{label: "three leaves, node past the width", leafCount: 3, nodeIndex: 99, want: ErrLeafCountNotFull},
+		{label: "six leaves", leafCount: 6, nodeIndex: 4, want: ErrLeafCountNotFull},
+		{label: "one under the largest tree", leafCount: MaxLeafCount - 1, nodeIndex: 0, want: ErrLeafCountNotFull},
+		{label: "one over the largest tree", leafCount: MaxLeafCount + 1, nodeIndex: 0, want: ErrLeafCountRange},
+		{label: "the largest count the type holds", leafCount: LeafCount(0xFFFFFFFF), nodeIndex: 0, want: ErrLeafCountRange},
+	}
+	for _, c := range malformedCases {
+		shape := &functionShape{shapeLeafCount: c.leafCount, blankNode: nil, unmergedOfNode: nil}
+		got, err := Resolution(shape, c.nodeIndex)
+		if !errors.Is(err, c.want) {
+			t.Errorf("%s: %v, want %v", c.label, err, c.want)
+		}
+		if got != nil {
+			t.Errorf("%s: refused with %v, want no slice at all", c.label, got)
+		}
+	}
+}
+
+// the node-range check at both sides of the boundary, at every depth a tree can
+// have.
+//
+// the fixtures above ask this at one depth, where an off-by-one in the width is
+// worth exactly one node. asked at all 32 depths the same off-by-one has to be
+// wrong at 32 boundaries, and a check weakened only above the depths the
+// figures draw has nowhere left to hide.
+func TestResolutionNodeRangeAtEveryDepth(t *testing.T) {
+	checked := int64(0)
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leaves := LeafCount(1) << depth
+		width := NodeWidth(leaves)
+		shape := &functionShape{shapeLeafCount: leaves, blankNode: nil, unmergedOfNode: nil}
+
+		// the last node of the array is inside the tree and resolves to itself
+		lastNode := NodeIndex(width - 1)
+		got, err := Resolution(shape, lastNode)
+		if err != nil {
+			t.Fatalf("%d leaves: node %d: %v", leaves, lastNode, err)
+		}
+		assertNodeIndexes(t, fmt.Sprintf("%d leaves, the last node", leaves), got, []NodeIndex{lastNode})
+		checked += 1
+
+		// and the root does too
+		root := NodeIndex(uint32(1)<<depth - 1)
+		got, err = Resolution(shape, root)
+		if err != nil {
+			t.Fatalf("%d leaves: the root at node %d: %v", leaves, root, err)
+		}
+		assertNodeIndexes(t, fmt.Sprintf("%d leaves, the root", leaves), got, []NodeIndex{root})
+		checked += 1
+
+		// the width itself is one past the end. at depth 31 the width is
+		// 0xFFFFFFFF, the one index no tree holds, so the two arms below meet
+		// there and the third would wrap to node zero rather than refuse.
+		outsideCases := []NodeIndex{NodeIndex(width)}
+		if depth < 31 {
+			outsideCases = append(outsideCases, NodeIndex(width+1), 0xFFFFFFFF)
+		}
+		for _, outside := range outsideCases {
+			got, err := Resolution(shape, outside)
+			if !errors.Is(err, ErrNodeOutOfRange) {
+				t.Errorf("%d leaves: node %d: %v, want %v", leaves, outside, err, ErrNodeOutOfRange)
+			}
+			if got != nil {
+				t.Errorf("%d leaves: node %d refused with %v, want no slice at all", leaves, outside, got)
+			}
+			checked += 1
+		}
+	}
+	// two inside arms a depth, plus one outside arm at depth 31 and three at
+	// each of the other 31.
+	if want := int64(2*32 + 1 + 3*31); checked != want {
+		t.Errorf("confirmed range arms: %d, want %d", checked, want)
+	}
+}
+
+// the unmerged-leaf range check at both sides of the boundary, at every depth.
+//
+// the bound is the shape's own leaf count and not a constant, so it moves with
+// every depth; the eight-leaf fixture pins it at one of the 32 places it can
+// be. the arms at depth 31 are the ones that say the arithmetic does not wrap:
+// leaf 2^31-1 is the last leaf of the largest tree and sits at node 2^32-2,
+// one short of the only index no tree holds.
+func TestResolutionUnmergedLeafRangeAtEveryDepth(t *testing.T) {
+	checked := int64(0)
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leaves := LeafCount(1) << depth
+		root := NodeIndex(uint32(1)<<depth - 1)
+
+		lastLeaf := LeafIndex(uint32(leaves) - 1)
+		inside := &functionShape{
+			shapeLeafCount: leaves,
+			blankNode:      nil,
+			unmergedOfNode: func(x NodeIndex) []LeafIndex { return []LeafIndex{lastLeaf} },
+		}
+		got, err := Resolution(inside, root)
+		if err != nil {
+			t.Fatalf("%d leaves: the root with unmerged leaf %d: %v", leaves, lastLeaf, err)
+		}
+		assertNodeIndexes(t, fmt.Sprintf("%d leaves, the root with its last leaf unmerged", leaves),
+			got, []NodeIndex{root, NodeIndex(2 * uint64(lastLeaf))})
+		checked += 1
+
+		outsideLeaves := []LeafIndex{LeafIndex(leaves)}
+		if depth < 31 {
+			outsideLeaves = append(outsideLeaves, 0x7FFFFFFF, 0xFFFFFFFF)
+		}
+		for _, outsideLeaf := range outsideLeaves {
+			outside := &functionShape{
+				shapeLeafCount: leaves,
+				blankNode:      nil,
+				unmergedOfNode: func(x NodeIndex) []LeafIndex { return []LeafIndex{outsideLeaf} },
+			}
+			got, err := Resolution(outside, root)
+			if !errors.Is(err, ErrLeafOutOfRange) {
+				t.Errorf("%d leaves: the root with unmerged leaf %d: %v, want %v", leaves, outsideLeaf, err, ErrLeafOutOfRange)
+			}
+			if got != nil {
+				t.Errorf("%d leaves: the root with unmerged leaf %d refused with %v, want no slice at all", leaves, outsideLeaf, got)
+			}
+			checked += 1
+		}
+	}
+	// one inside arm a depth, plus one outside arm at depth 31 and three at
+	// each of the other 31.
+	if want := int64(32 + 1 + 3*31); checked != want {
+		t.Errorf("confirmed unmerged range arms: %d, want %d", checked, want)
+	}
+}
+
+// an unmerged leaf outside the tree is refused from wherever in the walk it is
+// met, and nothing already resolved comes back with it.
+//
+// the fixture the plan wrote for this puts the bad leaf on the node the call
+// starts at, which a version that range-checks only its own argument answers
+// the same way. here the tree is the deepest one there is and the bad leaf sits
+// on the first node the walk emits, on one in the middle, and on the last, so a
+// check that fires only at the head, or only before the first emit, or that
+// keeps the partial answer, differs at one of the three.
+func TestResolutionRefusesAnUnmergedLeafFoundDeepInTheWalk(t *testing.T) {
+	const depth = 31
+	leaves := LeafCount(1) << depth
+	root := NodeIndex(uint32(1)<<depth - 1)
+	blankPath := func(x NodeIndex) bool {
+		_, block := nodeLevelAndBlock(x)
+		return block == 0
+	}
+
+	// the direct path of leaf 0 is blank, so the walk emits the copath sibling
+	// of every level in turn, level 0 first and level 30 last.
+	populated := &functionShape{shapeLeafCount: leaves, blankNode: blankPath, unmergedOfNode: nil}
+	got, err := Resolution(populated, root)
+	if err != nil {
+		t.Fatalf("the root of a 2^31-leaf tree with the path of leaf 0 blank: %v", err)
+	}
+	siblings := []NodeIndex{}
+	for level := uint32(0); level < depth; level += 1 {
+		siblings = append(siblings, nodeAt(level, 1))
+	}
+	assertNodeIndexes(t, "the copath of leaf 0 in a 2^31-leaf tree", got, siblings)
+
+	for _, level := range []uint32{0, 1, 15, 29, 30} {
+		bad := nodeAt(level, 1)
+		shape := &functionShape{
+			shapeLeafCount: leaves,
+			blankNode:      blankPath,
+			unmergedOfNode: func(x NodeIndex) []LeafIndex {
+				if x != bad {
+					return nil
+				}
+				return []LeafIndex{LeafIndex(leaves)}
+			},
+		}
+		got, err := Resolution(shape, root)
+		if !errors.Is(err, ErrLeafOutOfRange) {
+			t.Errorf("the bad unmerged leaf on node %d at level %d: %v, want %v", bad, level, err, ErrLeafOutOfRange)
+		}
+		if got != nil {
+			t.Errorf("the bad unmerged leaf on node %d at level %d refused with %v, want no slice at all", bad, level, got)
+		}
+	}
+}
+
+// an accepted resolution is always a slice, empty included.
+//
+// a caller ranges over the answer without a nil check, and an empty resolution
+// is the ordinary answer for a blank leaf rather than an unusual one, so the
+// distinction between an empty slice and no slice is the one this file uses to
+// separate an answer from a refusal. DirectPath and Copath make the same
+// promise and it is asserted the same way.
+func TestResolutionAlwaysReturnsASlice(t *testing.T) {
+	blankLeaf := &fixtureShape{
+		fixtureLeafCount:   8,
+		blankNodes:         map[NodeIndex]bool{4: true},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	emptyCases := []struct {
+		label     string
+		shape     NodeShape
+		nodeIndex NodeIndex
+	}{
+		{label: "a blank leaf", shape: blankLeaf, nodeIndex: 4},
+		{label: "an entirely blank tree", shape: pathBlankShape(8, []LeafIndex{0, 1, 2, 3, 4, 5, 6, 7}, false), nodeIndex: 7},
+		{label: "a blank subtree of a populated tree", shape: pathBlankShape(8, []LeafIndex{4, 5}, false), nodeIndex: 9},
+	}
+	for _, c := range emptyCases {
+		got, err := Resolution(c.shape, c.nodeIndex)
+		if err != nil {
+			t.Errorf("%s: %v", c.label, err)
+			continue
+		}
+		if got == nil {
+			t.Errorf("%s: no slice at all, want an empty one", c.label)
+		}
+		if len(got) != 0 {
+			t.Errorf("%s: %v, want empty", c.label, got)
+		}
+	}
+}
+
+// a mixer over a seed and a node index, so a random blank set is a function
+// rather than a table and a tree of any depth can have one.
+//
+// the constants are splitmix64's. nothing here is cryptographic; what is wanted
+// is that neighbouring indices land in unrelated places, so that a blank set is
+// not a run of blocks or a pattern in the low bits and a version confined to
+// either is not hidden by the shape it is asked about.
+func resolutionShapeHash(seed uint64, x NodeIndex) uint64 {
+	mixed := seed ^ (uint64(x)+1)*0x9E3779B97F4A7C15
+	mixed ^= mixed >> 30
+	mixed *= 0xBF58476D1CE4E5B9
+	mixed ^= mixed >> 27
+	mixed *= 0x94D049BB133111EB
+	mixed ^= mixed >> 31
+	return mixed
+}
+
+// a shape whose blank set is the given fraction of eighths of the tree, chosen
+// by the mixer above, with unmerged leaves everywhere.
+func randomBlankShape(leaves LeafCount, seed uint64, blankEighths uint64) *functionShape {
+	return &functionShape{
+		shapeLeafCount: leaves,
+		blankNode: func(x NodeIndex) bool {
+			return resolutionShapeHash(seed, x)%8 < blankEighths
+		},
+		unmergedOfNode: pathBlankUnmerged,
+	}
+}
+
+// arbitrary blank structure at every depth, rather than the chains the two
+// sweeps above blank.
+//
+// a blanked path is one shape, and a narrow one: every blank node on it has
+// exactly one blank child, and the sibling beside it is the head of a fully
+// populated subtree. what it cannot ask about is a blank node whose left
+// subtree is blank several levels down while its right subtree is populated at
+// the top, which is the shape a real tree takes after a few removes, and which
+// is where the third rule's ordering does the most work. the exhaustive sweeps
+// ask about every such shape but only up to eight leaves.
+//
+// half the nodes blank is the interesting density and also the affordable one:
+// a node is in the resolution only if every ancestor up to the head is blank,
+// so at one half the expected count is one node a level and the answer stays
+// O(depth) at every depth. one eighth thins it to almost nothing and seven
+// eighths thickens it until the walk is exponential, which is why the thick
+// arm stops at sixteen levels.
+func TestResolutionRandomShapesAtEveryDepth(t *testing.T) {
+	checked := int64(0)
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leaves := LeafCount(1) << depth
+		for _, blankEighths := range []uint64{1, 4, 7} {
+			if blankEighths == 7 && depth > 16 {
+				continue
+			}
+			for seed := uint64(0); seed < 8; seed += 1 {
+				shape := randomBlankShape(leaves, seed, blankEighths)
+				label := fmt.Sprintf("%d leaves, %d eighths blank, seed %d", leaves, blankEighths, seed)
+				// the root, and one node at every level below it, at a block
+				// the mixer picks so the probes are not all in the leftmost
+				// subtree.
+				for level := uint32(0); level <= depth; level += 1 {
+					block := resolutionShapeHash(seed, NodeIndex(level)) % (uint64(1) << (depth - level))
+					if !resolutionAgrees(shape, level, block, depth <= 8) {
+						reportResolution(t, label, shape, level, block)
+					}
+					checked += 1
+				}
+			}
+		}
+	}
+	// eight seeds a density, depth+1 nodes each: 8 * sum(d=0..31) (d+1) for the
+	// two thin densities and 8 * sum(d=0..16) (d+1) for the thick one.
+	if want := int64(2*8*528 + 8*153); checked != want {
+		t.Errorf("confirmed random-shape resolutions: %d, want %d", checked, want)
 	}
 }
