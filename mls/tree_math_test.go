@@ -8,6 +8,8 @@
 package mls
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
@@ -3133,8 +3135,54 @@ func (self *functionShape) UnmergedLeaves(x NodeIndex) []LeafIndex {
 	return self.unmergedOfNode(x)
 }
 
-// two unmerged leaves on every third node and one on every other third, drawn
-// from inside the node's own subtree and stored last-then-first.
+// how a sweep places unmerged lists over the nodes of a tree.
+//
+// the mixture is what a tree looks like after a few adds and the dense
+// placement is what makes the ordering contract observable everywhere. the
+// version of this file that had only the mixture chose the list length from the
+// node index alone, so a node's length was fixed for the whole suite: measured
+// over a whole package run, of the 603,855 distinct nodes above level 3 that
+// the walk reached, 382,786 never had a non-empty unmerged list read on them in
+// any test and 493,512 never had one with a second entry. at levels 20 and up,
+// where every node of every level is reached, that was exactly a third and two
+// thirds. the single node of level 31 fell in the one-entry class, so reversing
+// or sorting its list was a no-op and both defects passed the whole package.
+// the dense placement gives every node a two-entry list, which takes the choice
+// off the index.
+type unmergedPlacement uint32
+
+const (
+	unmergedNone unmergedPlacement = iota
+	unmergedMixed
+	unmergedDense
+)
+
+// the two leaves a node's unmerged list is built from, larger first.
+//
+// a parent takes the last and first leaf of its own subtree. a leaf spans one
+// leaf, so a pair drawn from its own subtree would be a repeat and neither the
+// order nor the second position would be observable there; it reaches for the
+// tree's last leaf instead, or leaf 0 when it is that leaf. both are inside the
+// tree, which is all this file's range check asks. only a one-leaf tree has no
+// second leaf to reach for, and there the pair is the repeat.
+func unmergedPairOfNode(leaves LeafCount, x NodeIndex) (LeafIndex, LeafIndex) {
+	level, block := nodeLevelAndBlock(x)
+	firstLeaf := LeafIndex(block << level)
+	lastLeaf := LeafIndex((block+1)<<level - 1)
+	if firstLeaf != lastLeaf {
+		return lastLeaf, firstLeaf
+	}
+	other := LeafIndex(uint32(leaves) - 1)
+	if other == firstLeaf {
+		other = 0
+	}
+	if other > firstLeaf {
+		return other, firstLeaf
+	}
+	return firstLeaf, other
+}
+
+// the unmerged list a placement gives one node, stored larger-first.
 //
 // the stored order is deliberately not the ascending one. an unmerged leaf is a
 // descendant of the node that carries it, so a leaf in the left half of a
@@ -3142,17 +3190,18 @@ func (self *functionShape) UnmergedLeaves(x NodeIndex) []LeafIndex {
 // [parent, that leaf] is the one place the answer does not ascend. a version
 // that sorts its result, or that sorts one node's unmerged list, agrees with
 // this one everywhere else.
-func pathBlankUnmerged(x NodeIndex) []LeafIndex {
-	level, block := nodeLevelAndBlock(x)
-	firstLeaf := LeafIndex(block << level)
-	lastLeaf := LeafIndex((block+1)<<level - 1)
+func unmergedLeavesOfNode(placement unmergedPlacement, leaves LeafCount, x NodeIndex) []LeafIndex {
+	larger, smaller := unmergedPairOfNode(leaves, x)
+	if placement == unmergedDense {
+		return []LeafIndex{larger, smaller}
+	}
 	switch uint64(x) % 3 {
 	case 0:
 		return nil
 	case 1:
-		return []LeafIndex{lastLeaf}
+		return []LeafIndex{larger}
 	default:
-		return []LeafIndex{lastLeaf, firstLeaf}
+		return []LeafIndex{larger, smaller}
 	}
 }
 
@@ -3168,7 +3217,7 @@ func pathBlankUnmerged(x NodeIndex) []LeafIndex {
 // a node at (level, block) is an ancestor of leaf L, or is L, exactly when
 // block equals L shifted right by the level, which is a test of the node's
 // index alone and reaches no function of this package.
-func pathBlankShape(leaves LeafCount, blankLeaves []LeafIndex, withUnmerged bool) *functionShape {
+func pathBlankShape(leaves LeafCount, blankLeaves []LeafIndex, placement unmergedPlacement) *functionShape {
 	shape := &functionShape{
 		shapeLeafCount: leaves,
 		blankNode: func(x NodeIndex) bool {
@@ -3182,8 +3231,10 @@ func pathBlankShape(leaves LeafCount, blankLeaves []LeafIndex, withUnmerged bool
 		},
 		unmergedOfNode: nil,
 	}
-	if withUnmerged {
-		shape.unmergedOfNode = pathBlankUnmerged
+	if placement != unmergedNone {
+		shape.unmergedOfNode = func(x NodeIndex) []LeafIndex {
+			return unmergedLeavesOfNode(placement, leaves, x)
+		}
 	}
 	return shape
 }
@@ -3484,9 +3535,9 @@ func TestResolutionEveryNodeOfEveryTreeToDepthFourteen(t *testing.T) {
 			label string
 			shape NodeShape
 		}{
-			{label: "the path of leaf 0 blank", shape: pathBlankShape(leaves, []LeafIndex{0}, true)},
-			{label: "the paths of the two middle leaves blank", shape: pathBlankShape(leaves, []LeafIndex{middleLeaf - 1, middleLeaf}, true)},
-			{label: "half the nodes blank", shape: randomBlankShape(leaves, 0x5EED, 4)},
+			{label: "the path of leaf 0 blank", shape: pathBlankShape(leaves, []LeafIndex{0}, unmergedMixed)},
+			{label: "the paths of the two middle leaves blank", shape: pathBlankShape(leaves, []LeafIndex{middleLeaf - 1, middleLeaf}, unmergedDense)},
+			{label: "half the nodes blank", shape: randomBlankShape(leaves, 0x5EED, 4, unmergedDense)},
 		}
 		for _, w := range walkShapes {
 			for x := uint64(0); x < uint64(NodeWidth(leaves)); x += 1 {
@@ -3508,16 +3559,24 @@ func TestResolutionEveryNodeOfEveryTreeToDepthFourteen(t *testing.T) {
 // how many blocks of one level a sweep asks about when the level is too wide to
 // walk, and how wide a level has to be before it stops walking it.
 //
-// the walk limit is what decides which levels come out complete. a level of a
-// tree of depth d holds 2^(d-level) blocks, so a limit of 2^11 walks every
-// block of every level from 20 up, in every tree there is, and leaves the
-// levels below it sampled. measured by counting the distinct nodes a whole
-// package run hands Resolution and walks inside it: 1,971,887 calls, 15,766,467
-// visits, 1,050,579 distinct node indices of the 4,294,967,295 a tree can hold.
-// levels 19 to 31 come out at every block of every level; level 18 at 86.2%,
-// level 15 at 29.3%, level 10 at 2.08% and level 0 at 0.0071%.
+// the walk limit is what decides which levels this sweep asks about whole. a
+// level of a tree of depth d holds 2^(d-level) blocks, so a limit of 2^12 walks
+// every block of every level from d-12 up, which is level 19 in the deepest
+// tree there is, and leaves the levels below it sampled by the stride.
+//
+// visiting a node and being able to observe a defect at it are not the same
+// thing, and the distance between them is what this limit buys. measured by
+// counting the distinct nodes a whole package run hands Resolution and walks
+// inside it: 1,972,095 calls, 15,766,994 visits, 1,050,579 distinct node
+// indices of the 4,294,967,295 a tree can hold, with levels 19 to 31 reached at
+// every block, level 18 at 86.2%, level 15 at 29.3%, level 10 at 2.08% and
+// level 0 at 0.0071%. under the previous limit of 2^11 level 19 was reached
+// whole but only sampled by this sweep, and a push order swapped at one of its
+// 4096 blocks passed the whole package even though the node was visited. the
+// limit is one power of two higher for that reason, and the same argument now
+// applies one level down: see the residual on Resolution itself.
 const resolutionBlockProbes = 192
-const resolutionBlockWalkLimit = 2048
+const resolutionBlockWalkLimit = 4096
 
 // the blocks of one level of one depth that a sweep asks about: every one of
 // them where a level is small enough to walk, and a strided sample otherwise.
@@ -3564,12 +3623,12 @@ func TestResolutionAtEveryDepth(t *testing.T) {
 		leaves := LeafCount(1) << depth
 		for level := uint32(0); level <= depth; level += 1 {
 			for _, block := range resolutionProbeBlocks(depth, level, resolutionBlockWalkLimit) {
-				for _, withUnmerged := range []bool{false, true} {
+				for _, placement := range []unmergedPlacement{unmergedNone, unmergedMixed, unmergedDense} {
 					// the leftmost leaf under the node, so the node is on the
 					// blanked path and its own resolution is the interesting one
 					blanked := LeafIndex(block << level)
-					shape := pathBlankShape(leaves, []LeafIndex{blanked}, withUnmerged)
-					label := fmt.Sprintf("%d leaves, the path of leaf %d blank, unmerged leaves %v", leaves, blanked, withUnmerged)
+					shape := pathBlankShape(leaves, []LeafIndex{blanked}, placement)
+					label := fmt.Sprintf("%d leaves, the path of leaf %d blank, unmerged placement %d", leaves, blanked, placement)
 					if !resolutionAgrees(shape, level, block, depth <= 8) {
 						reportResolution(t, label, shape, level, block)
 					}
@@ -3607,7 +3666,7 @@ func TestResolutionAtEveryDepthWithTwoBlankPaths(t *testing.T) {
 			for _, block := range resolutionProbeBlocks(depth, meetingLevel+1, 256) {
 				blanked := LeafIndex(block << (meetingLevel + 1))
 				other := LeafIndex(uint64(blanked) ^ uint64(1)<<meetingLevel)
-				shape := pathBlankShape(leaves, []LeafIndex{blanked, other}, true)
+				shape := pathBlankShape(leaves, []LeafIndex{blanked, other}, unmergedDense)
 				label := fmt.Sprintf("%d leaves, the paths of leaves %d and %d blank", leaves, blanked, other)
 				// the node the two paths meet at, and the root above it
 				if !resolutionAgrees(shape, meetingLevel+1, block, depth <= 8) {
@@ -3630,12 +3689,12 @@ func TestResolutionAtEveryDepthWithTwoBlankPaths(t *testing.T) {
 //
 // RFC 9420 says a non-blank node resolves to the node itself followed by its
 // list of unmerged leaves, and it says nothing about that list being sorted,
-// deduplicated or inside the node's own subtree â€” those are the section 7.9
+// deduplicated or inside the node's own subtree — those are the section 7.9
 // tree-validation checks and tree_sync.go owns them. what this file owes its
 // callers is that the list comes back in stored order and untouched, because
 // TreeKEM encrypts a path secret to the resolution position by position: a
 // resolution reordered here hands a member the wrong secret. the two clauses
-// that carry no example in the RFC are the ones asserted hardest here â€” a blank
+// that carry no example in the RFC are the ones asserted hardest here — a blank
 // node's list is not read at all, and a leaf's list is read like any other
 // node's.
 func TestResolutionUnmergedLeafRules(t *testing.T) {
@@ -3893,56 +3952,192 @@ func TestResolutionUnmergedLeafRangeAtEveryDepth(t *testing.T) {
 	}
 }
 
+// the sibling of a leaf's direct path at every level, level 0 first.
+//
+// these are the nodes the root of a tree with that one path blanked resolves
+// to. the order here is by level and is not the order the resolution emits
+// them in: the walk is left-first, so it emits them by level only when the
+// blanked path is the leftmost one, which is why the assertion below writes
+// this list out for leaf 0 and leans on the descent oracle for the rest.
+//
+// the blanked leaf is a parameter rather than leaf 0 so that the nodes carrying
+// the refusals below sit at blocks spread across their level rather than all at
+// block 1, which is the block the sibling of leaf 0 has at every level.
+func copathSiblings(blankedLeaf LeafIndex, depth uint32) []NodeIndex {
+	siblings := []NodeIndex{}
+	for level := uint32(0); level < depth; level += 1 {
+		siblings = append(siblings, nodeAt(level, (uint64(blankedLeaf)>>level)^1))
+	}
+	return siblings
+}
+
+// a shape whose blank nodes are exactly the direct path of one leaf, that leaf
+// included, with one named node carrying a given unmerged list and no other
+// node carrying one.
+//
+// a carrier of 0xFFFFFFFF is no node of any tree, so passing it is how a caller
+// asks for the blanked path alone.
+func onePathBlankWithList(leaves LeafCount, blankedLeaf LeafIndex, carrier NodeIndex, list []LeafIndex) *functionShape {
+	return &functionShape{
+		shapeLeafCount: leaves,
+		blankNode: func(x NodeIndex) bool {
+			level, block := nodeLevelAndBlock(x)
+			return uint64(blankedLeaf)>>level == block
+		},
+		unmergedOfNode: func(x NodeIndex) []LeafIndex {
+			if x != carrier {
+				return nil
+			}
+			return list
+		},
+	}
+}
+
 // an unmerged leaf outside the tree is refused from wherever in the walk it is
 // met, and nothing already resolved comes back with it.
 //
 // the fixture the plan wrote for this puts the bad leaf on the node the call
 // starts at, which a version that range-checks only its own argument answers
 // the same way. here the tree is the deepest one there is and the bad leaf sits
-// on the first node the walk emits, on one in the middle, and on the last, so a
-// check that fires only at the head, or only before the first emit, or that
-// keeps the partial answer, differs at one of the three.
+// on the first node the walk emits, on ones in the middle, and on the last, so
+// a check that fires only at the head, or only before the first emit, or that
+// keeps the partial answer, differs at one of them.
+//
+// the blanked leaf is walked as well. every carrier here is the sibling of the
+// blanked leaf's path, so blanking leaf 0 puts all of them at block 1 of their
+// level and a bound that fires only in the low blocks of a level is invisible;
+// three blanked leaves spread across the tree put them at unrelated blocks.
 func TestResolutionRefusesAnUnmergedLeafFoundDeepInTheWalk(t *testing.T) {
 	const depth = 31
 	leaves := LeafCount(1) << depth
 	root := NodeIndex(uint32(1)<<depth - 1)
-	blankPath := func(x NodeIndex) bool {
-		_, block := nodeLevelAndBlock(x)
-		return block == 0
-	}
+	checked := int64(0)
 
-	// the direct path of leaf 0 is blank, so the walk emits the copath sibling
-	// of every level in turn, level 0 first and level 30 last.
-	populated := &functionShape{shapeLeafCount: leaves, blankNode: blankPath, unmergedOfNode: nil}
-	got, err := Resolution(populated, root)
+	// with the leftmost path blank the walk emits the copath by level, which is
+	// the one arrangement that can be written down without an oracle.
+	got, err := Resolution(onePathBlankWithList(leaves, 0, 0xFFFFFFFF, nil), root)
 	if err != nil {
 		t.Fatalf("the root of a 2^31-leaf tree with the path of leaf 0 blank: %v", err)
 	}
-	siblings := []NodeIndex{}
-	for level := uint32(0); level < depth; level += 1 {
-		siblings = append(siblings, nodeAt(level, 1))
-	}
-	assertNodeIndexes(t, "the copath of leaf 0 in a 2^31-leaf tree", got, siblings)
+	assertNodeIndexes(t, "the copath of leaf 0 in a 2^31-leaf tree", got, copathSiblings(0, depth))
+	checked += 1
 
-	for _, level := range []uint32{0, 1, 15, 29, 30} {
-		bad := nodeAt(level, 1)
-		shape := &functionShape{
-			shapeLeafCount: leaves,
-			blankNode:      blankPath,
-			unmergedOfNode: func(x NodeIndex) []LeafIndex {
-				if x != bad {
-					return nil
+	blankedLeaves := []LeafIndex{0, LeafIndex(uint32(leaves) - 1), LeafIndex(uint32(leaves) / 3)}
+	for _, blankedLeaf := range blankedLeaves {
+		// the same tree against the descent oracle, which carries the emitted
+		// order for a blanked path anywhere in the tree.
+		populated := onePathBlankWithList(leaves, blankedLeaf, 0xFFFFFFFF, nil)
+		if !resolutionAgrees(populated, depth, 0, false) {
+			reportResolution(t, fmt.Sprintf("the path of leaf %d blank", blankedLeaf), populated, depth, 0)
+		}
+		checked += 1
+
+		for _, level := range []uint32{0, 1, 15, 29, 30} {
+			bad := nodeAt(level, (uint64(blankedLeaf)>>level)^1)
+			shape := onePathBlankWithList(leaves, blankedLeaf, bad, []LeafIndex{LeafIndex(leaves)})
+			got, err := Resolution(shape, root)
+			if !errors.Is(err, ErrLeafOutOfRange) {
+				t.Errorf("the bad unmerged leaf on node %d at level %d: %v, want %v", bad, level, err, ErrLeafOutOfRange)
+			}
+			if got != nil {
+				t.Errorf("the bad unmerged leaf on node %d at level %d refused with %v, want no slice at all", bad, level, got)
+			}
+			checked += 1
+		}
+	}
+	if want := int64(1 + len(blankedLeaves)*6); checked != want {
+		t.Errorf("confirmed deep-walk refusals: %d, want %d", checked, want)
+	}
+}
+
+// the longest unmerged list the position sweep below builds.
+const resolutionUnmergedListLimit = 5
+
+// an unmerged leaf outside the tree is refused wherever it sits in the list and
+// whatever else the list holds.
+//
+// every other out-of-range probe in this file puts the bad leaf alone in its
+// list, and a bound enforced at one position of one list answers all of them
+// identically. measured by enumerating the versions of this function and
+// running each against the rest of the file: a check hoisted out of the loop to
+// test the first entry only, the last entry only, one that runs only for a list
+// of one, only at even positions, only for the first two entries, or only for
+// lists of two or fewer -- six versions -- passed every other test here. what
+// separates them from this code is a bad leaf that is neither the only entry
+// nor at position zero, so the length of the list and the position of the bad
+// leaf in it are both walked here rather than fixed.
+//
+// the carrier is walked too, over a leaf and a parent and the head node itself,
+// because the same enumeration holds versions that check only at a leaf, only
+// at a parent, or only on the node the call started at.
+func TestResolutionRefusesAnOutOfRangeUnmergedLeafAtEveryPosition(t *testing.T) {
+	checked := int64(0)
+	depths := []uint32{1, 2, 3, 8, 20, 31}
+	for _, depth := range depths {
+		leaves := LeafCount(1) << depth
+		root := NodeIndex(uint32(1)<<depth - 1)
+		lastLeaf := LeafIndex(uint32(leaves) - 1)
+		badLeaf := LeafIndex(leaves)
+		for _, blankedLeaf := range []LeafIndex{0, lastLeaf} {
+			siblings := copathSiblings(blankedLeaf, depth)
+			carriers := []struct {
+				label   string
+				carrier NodeIndex
+				head    bool
+			}{
+				// the node the call starts at, in a tree with nothing blank
+				{label: "the head node", carrier: root, head: true},
+				// the first node the walk emits, which is a leaf
+				{label: "the first node the walk emits", carrier: siblings[0], head: false},
+				// the last, which is a parent in every tree past two leaves
+				{label: "the last node the walk emits", carrier: siblings[len(siblings)-1], head: false},
+			}
+			for _, c := range carriers {
+				for listLength := 1; listLength <= resolutionUnmergedListLimit; listLength += 1 {
+					for badPosition := 0; badPosition < listLength; badPosition += 1 {
+						list := make([]LeafIndex, 0, listLength)
+						for i := 0; i < listLength; i += 1 {
+							if i == badPosition {
+								list = append(list, badLeaf)
+								continue
+							}
+							list = append(list, LeafIndex(uint32(i)%uint32(leaves)))
+						}
+						carrier := c.carrier
+						var shape *functionShape
+						if c.head {
+							shape = &functionShape{
+								shapeLeafCount: leaves,
+								blankNode:      nil,
+								unmergedOfNode: func(x NodeIndex) []LeafIndex {
+									if x != carrier {
+										return nil
+									}
+									return list
+								},
+							}
+						} else {
+							shape = onePathBlankWithList(leaves, blankedLeaf, carrier, list)
+						}
+						got, err := Resolution(shape, root)
+						label := fmt.Sprintf("%d leaves, %s at node %d, %d entries with the bad one at %d",
+							leaves, c.label, carrier, listLength, badPosition)
+						if !errors.Is(err, ErrLeafOutOfRange) {
+							t.Errorf("%s: %v, want %v", label, err, ErrLeafOutOfRange)
+						}
+						if got != nil {
+							t.Errorf("%s: refused with %v, want no slice at all", label, got)
+						}
+						checked += 1
+					}
 				}
-				return []LeafIndex{LeafIndex(leaves)}
-			},
+			}
 		}
-		got, err := Resolution(shape, root)
-		if !errors.Is(err, ErrLeafOutOfRange) {
-			t.Errorf("the bad unmerged leaf on node %d at level %d: %v, want %v", bad, level, err, ErrLeafOutOfRange)
-		}
-		if got != nil {
-			t.Errorf("the bad unmerged leaf on node %d at level %d refused with %v, want no slice at all", bad, level, got)
-		}
+	}
+	// each depth crossed with two blanked leaves, three carriers, and the 15
+	// list-and-position pairs a list of one to five has.
+	if want := int64(len(depths) * 2 * 3 * 15); checked != want {
+		t.Errorf("confirmed out-of-range unmerged positions: %d, want %d", checked, want)
 	}
 }
 
@@ -3965,8 +4160,8 @@ func TestResolutionAlwaysReturnsASlice(t *testing.T) {
 		nodeIndex NodeIndex
 	}{
 		{label: "a blank leaf", shape: blankLeaf, nodeIndex: 4},
-		{label: "an entirely blank tree", shape: pathBlankShape(8, []LeafIndex{0, 1, 2, 3, 4, 5, 6, 7}, false), nodeIndex: 7},
-		{label: "a blank subtree of a populated tree", shape: pathBlankShape(8, []LeafIndex{4, 5}, false), nodeIndex: 9},
+		{label: "an entirely blank tree", shape: pathBlankShape(8, []LeafIndex{0, 1, 2, 3, 4, 5, 6, 7}, unmergedNone), nodeIndex: 7},
+		{label: "a blank subtree of a populated tree", shape: pathBlankShape(8, []LeafIndex{4, 5}, unmergedNone), nodeIndex: 9},
 	}
 	for _, c := range emptyCases {
 		got, err := Resolution(c.shape, c.nodeIndex)
@@ -4001,14 +4196,16 @@ func resolutionShapeHash(seed uint64, x NodeIndex) uint64 {
 }
 
 // a shape whose blank set is the given fraction of eighths of the tree, chosen
-// by the mixer above, with unmerged leaves everywhere.
-func randomBlankShape(leaves LeafCount, seed uint64, blankEighths uint64) *functionShape {
+// by the mixer above, with unmerged leaves placed as asked.
+func randomBlankShape(leaves LeafCount, seed uint64, blankEighths uint64, placement unmergedPlacement) *functionShape {
 	return &functionShape{
 		shapeLeafCount: leaves,
 		blankNode: func(x NodeIndex) bool {
 			return resolutionShapeHash(seed, x)%8 < blankEighths
 		},
-		unmergedOfNode: pathBlankUnmerged,
+		unmergedOfNode: func(x NodeIndex) []LeafIndex {
+			return unmergedLeavesOfNode(placement, leaves, x)
+		},
 	}
 }
 
@@ -4038,7 +4235,12 @@ func TestResolutionRandomShapesAtEveryDepth(t *testing.T) {
 				continue
 			}
 			for seed := uint64(0); seed < 24; seed += 1 {
-				shape := randomBlankShape(leaves, seed, blankEighths)
+				// alternating so a node meets both a mixture and a list of two
+				placement := unmergedMixed
+				if seed%2 == 1 {
+					placement = unmergedDense
+				}
+				shape := randomBlankShape(leaves, seed, blankEighths, placement)
 				label := fmt.Sprintf("%d leaves, %d eighths blank, seed %d", leaves, blankEighths, seed)
 				// the root, and one node at every level below it, at a block
 				// the mixer picks so the probes are not all in the leftmost
@@ -4057,5 +4259,326 @@ func TestResolutionRandomShapesAtEveryDepth(t *testing.T) {
 	// for the two thin densities and 24 * sum(d=0..16) (d+1) for the thick one.
 	if want := int64(2*24*528 + 24*153); checked != want {
 		t.Errorf("confirmed random-shape resolutions: %d, want %d", checked, want)
+	}
+}
+
+// the published resolutions of the mlswg tree-validation family, family 13 of
+// the sixteen the validation and interop harness plan vendors.
+//
+// this is the only external oracle for this function that exists. the plan for
+// this task recorded that RFC 9420 figure 10 and table 2 were the only
+// published expected outputs for the blank-node rules; that was wrong, and the
+// file holding the counterexample was already in the tree. every entry of
+// tree-validation.json carries a resolutions column: the resolution of every
+// node of a real ratchet tree, computed by the working group's own
+// implementations rather than by anything in this repository. 98 entries carry
+// 3178 of them.
+//
+// the two oracles above are hand written from the same three sentences of
+// section 4.1 that the implementation is, by the same reader, so a misreading
+// of the third rule made twice survives them both. this one is independent of
+// this repository entirely, which is the only assertion here that is.
+//
+// what it does not carry is depth or list length: the trees are 3 to 127 nodes
+// wide, so nothing above level 6 is reached, and every unmerged list in the
+// corpus holds exactly one leaf, so the ordering contract is untouched by it.
+// the sweeps above carry both and this carries the provenance.
+type treeValidationVector struct {
+	CipherSuite uint16     `json:"cipher_suite"`
+	Tree        string     `json:"tree"`
+	Resolutions [][]uint32 `json:"resolutions"`
+}
+
+// the family file, named relative to testdata/vectors exactly as
+// VectorFamily.File is.
+const treeValidationVectorFile = "tree-validation.json"
+
+// the counts upstream publishes, so a decoder that quietly stopped early fails
+// here rather than reporting a clean sweep over three entries. a scan that
+// finds nothing because it is broken reports what a clean one reports, and
+// these are what separate the two.
+const treeValidationEntryCount = 98
+const treeValidationResolutionCount = 3178
+const treeValidationBlankNodeCount = 1036
+const treeValidationUnmergedCount = 21
+
+// a NodeShape over a ratchet tree decoded from the wire, which is what lets the
+// published resolutions be asked of this file at all.
+type ratchetTreeShape struct {
+	shapeLeafCount     LeafCount
+	blankNodes         map[NodeIndex]bool
+	unmergedNodeLeaves map[NodeIndex][]LeafIndex
+}
+
+func (self *ratchetTreeShape) LeafCount() LeafCount {
+	return self.shapeLeafCount
+}
+
+func (self *ratchetTreeShape) IsBlank(x NodeIndex) bool {
+	return self.blankNodes[x]
+}
+
+func (self *ratchetTreeShape) UnmergedLeaves(x NodeIndex) []LeafIndex {
+	return self.unmergedNodeLeaves[x]
+}
+
+// a reader over one vector's ratchet tree, in the RFC 9420 section 2.1
+// presentation language.
+//
+// this decodes the wire form a second time rather than calling the codec
+// tree.go will own, and deliberately: an oracle that shares a decoder with the
+// thing it judges cannot catch the decoder. it reads only what the two shape
+// rules need — which slots are blank and what each parent's unmerged list holds
+// — and skips every key, credential and signature by length rather than
+// interpreting it, so nothing cryptographic is reached from here.
+type presentationReader struct {
+	body   []byte
+	offset int
+	failed bool
+}
+
+// the variable-length vector header of section 2.1.2: the top two bits of the
+// first byte give the header width and the rest is the length.
+func (self *presentationReader) readLength() int {
+	if self.failed || self.offset >= len(self.body) {
+		self.failed = true
+		return 0
+	}
+	first := self.body[self.offset]
+	switch first >> 6 {
+	case 0:
+		self.offset += 1
+		return int(first & 0x3F)
+	case 1:
+		if self.offset+2 > len(self.body) {
+			self.failed = true
+			return 0
+		}
+		value := int(first&0x3F)<<8 | int(self.body[self.offset+1])
+		self.offset += 2
+		return value
+	case 2:
+		if self.offset+4 > len(self.body) {
+			self.failed = true
+			return 0
+		}
+		value := int(first&0x3F)<<24 | int(self.body[self.offset+1])<<16 |
+			int(self.body[self.offset+2])<<8 | int(self.body[self.offset+3])
+		self.offset += 4
+		return value
+	}
+	self.failed = true
+	return 0
+}
+
+// skips a length-prefixed field without looking at it.
+func (self *presentationReader) skipOpaque() {
+	length := self.readLength()
+	if self.failed || self.offset+length > len(self.body) {
+		self.failed = true
+		return
+	}
+	self.offset += length
+}
+
+func (self *presentationReader) readUint8() uint8 {
+	if self.failed || self.offset+1 > len(self.body) {
+		self.failed = true
+		return 0
+	}
+	value := self.body[self.offset]
+	self.offset += 1
+	return value
+}
+
+func (self *presentationReader) readUint16() uint16 {
+	if self.failed || self.offset+2 > len(self.body) {
+		self.failed = true
+		return 0
+	}
+	value := uint16(self.body[self.offset])<<8 | uint16(self.body[self.offset+1])
+	self.offset += 2
+	return value
+}
+
+func (self *presentationReader) readUint32() uint32 {
+	if self.failed || self.offset+4 > len(self.body) {
+		self.failed = true
+		return 0
+	}
+	value := uint32(self.body[self.offset])<<24 | uint32(self.body[self.offset+1])<<16 |
+		uint32(self.body[self.offset+2])<<8 | uint32(self.body[self.offset+3])
+	self.offset += 4
+	return value
+}
+
+// a LeafNode, skipped field by field. nothing of it is kept: a leaf carries no
+// unmerged list, so all this decides is where the next node starts.
+func (self *presentationReader) skipLeafNode() {
+	self.skipOpaque() // encryption_key
+	self.skipOpaque() // signature_key
+	switch self.readUint16() {
+	case 1: // basic credential
+		self.skipOpaque() // identity
+	case 2: // x509 credential
+		self.skipOpaque() // the whole certificate vector
+	default:
+		self.failed = true
+		return
+	}
+	for field := 0; field < 5; field += 1 {
+		self.skipOpaque() // the five capability vectors
+	}
+	switch self.readUint8() {
+	case 1: // key_package, followed by a lifetime of two uint64
+		self.offset += 16
+		if self.offset > len(self.body) {
+			self.failed = true
+			return
+		}
+	case 2: // update, nothing follows
+	case 3: // commit, followed by a parent hash
+		self.skipOpaque()
+	default:
+		self.failed = true
+		return
+	}
+	self.skipOpaque() // extensions
+	self.skipOpaque() // signature
+}
+
+// a ParentNode. its unmerged list is the one field of a node body this file
+// needs, so it is the one field read rather than skipped.
+func (self *presentationReader) readParentNodeUnmerged() []LeafIndex {
+	self.skipOpaque() // encryption_key
+	self.skipOpaque() // parent_hash
+	length := self.readLength()
+	if self.failed || length%4 != 0 || self.offset+length > len(self.body) {
+		self.failed = true
+		return nil
+	}
+	unmerged := []LeafIndex{}
+	for read := 0; read < length; read += 4 {
+		unmerged = append(unmerged, LeafIndex(self.readUint32()))
+	}
+	return unmerged
+}
+
+// one vector's ratchet tree as a NodeShape.
+//
+// RFC 9420 section 7.8 truncates trailing blank nodes from the wire form, so
+// the array on the wire is shorter than the tree and the width is recovered
+// as the smallest full node width that holds it. the slots past the end are
+// blank, which is what makes the truncation lossless.
+func decodeRatchetTreeShape(t *testing.T, label string, tree []byte) (*ratchetTreeShape, int) {
+	t.Helper()
+	reader := &presentationReader{body: tree, offset: 0, failed: false}
+	total := reader.readLength()
+	if reader.failed || reader.offset+total != len(tree) {
+		t.Fatalf("%s: the ratchet tree is not one presentation-language vector", label)
+	}
+	end := reader.offset + total
+	blankNodes := map[NodeIndex]bool{}
+	unmergedNodeLeaves := map[NodeIndex][]LeafIndex{}
+	encoded := 0
+	for reader.offset < end && !reader.failed {
+		x := NodeIndex(encoded)
+		if reader.readUint8() == 0 {
+			blankNodes[x] = true
+		} else {
+			switch reader.readUint8() {
+			case 1:
+				reader.skipLeafNode()
+			case 2:
+				if unmerged := reader.readParentNodeUnmerged(); len(unmerged) != 0 {
+					unmergedNodeLeaves[x] = unmerged
+				}
+			default:
+				t.Fatalf("%s: node %d is neither a leaf nor a parent", label, encoded)
+			}
+		}
+		encoded += 1
+	}
+	if reader.failed || reader.offset != end {
+		t.Fatalf("%s: the ratchet tree did not decode to a whole number of nodes", label)
+	}
+
+	depth := uint32(0)
+	for uint32(1)<<(depth+1)-1 < uint32(encoded) {
+		depth += 1
+	}
+	width := uint32(1)<<(depth+1) - 1
+	for x := uint32(encoded); x < width; x += 1 {
+		blankNodes[NodeIndex(x)] = true
+	}
+	return &ratchetTreeShape{
+		shapeLeafCount:     LeafCount(1) << depth,
+		blankNodes:         blankNodes,
+		unmergedNodeLeaves: unmergedNodeLeaves,
+	}, int(width)
+}
+
+// every resolution the mlswg publishes for a real ratchet tree, against this
+// file's Resolution.
+//
+// the widths the corpus reaches are 3, 7, 15, 63 and 127, so this asserts
+// nothing above level 6 and every unmerged list in it holds one leaf. what it
+// asserts instead is that the reading of section 4.1 in this package is the
+// working group's reading, which no oracle written here can establish.
+func TestResolutionAgainstPublishedTreeValidationVectors(t *testing.T) {
+	entries := LoadVectorFile(t, treeValidationVectorFile)
+	if len(entries) != treeValidationEntryCount {
+		t.Fatalf("tree-validation entries: %d, want %d", len(entries), treeValidationEntryCount)
+	}
+	confirmed := 0
+	blankNodes := 0
+	unmergedEntries := 0
+	for entry, raw := range entries {
+		vector := treeValidationVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("entry %d: %v", entry, err)
+		}
+		label := fmt.Sprintf("tree-validation entry %d", entry)
+		tree, err := hex.DecodeString(vector.Tree)
+		if err != nil {
+			t.Fatalf("%s: the ratchet tree is not hex: %v", label, err)
+		}
+		shape, width := decodeRatchetTreeShape(t, label, tree)
+		if width != len(vector.Resolutions) {
+			t.Fatalf("%s: node width %d from the tree, %d published resolutions",
+				label, width, len(vector.Resolutions))
+		}
+		blankNodes += len(shape.blankNodes)
+		for _, unmerged := range shape.unmergedNodeLeaves {
+			unmergedEntries += len(unmerged)
+		}
+		for x, published := range vector.Resolutions {
+			want := make([]NodeIndex, 0, len(published))
+			for _, node := range published {
+				want = append(want, NodeIndex(node))
+			}
+			got, err := Resolution(shape, NodeIndex(x))
+			if err != nil {
+				t.Fatalf("%s: node %d: %v", label, x, err)
+			}
+			if !sameNodeIndexes(got, want) {
+				t.Fatalf("%s: node %d: %v, want the published %v", label, x, got, want)
+			}
+			confirmed += 1
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "published resolutions", got: confirmed, want: treeValidationResolutionCount},
+		{label: "blank nodes", got: blankNodes, want: treeValidationBlankNodeCount},
+		{label: "unmerged leaves", got: unmergedEntries, want: treeValidationUnmergedCount},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
 	}
 }
