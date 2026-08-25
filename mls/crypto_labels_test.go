@@ -3352,3 +3352,129 @@ func TestTheLabelledEncryptionIsOnlyItsOwnContext(t *testing.T) {
 			declared, labelPackageFunctions)
 	}
 }
+
+// The label and context lengths the sweep below walks, and the leading bytes it walks at
+// short lengths. Both totals are asserted where they are used, for the reason every other
+// total in this file is: a loop that stopped iterating reports what a complete one reports.
+const (
+	unboundSweepLabelLengths   = 21
+	unboundSweepContextLengths = 71
+	unboundSweepBytes          = 256
+	unboundSweepByteLengths    = 3
+	// what the two sweeps refuse between them. seven reframings at each of 2259 points,
+	// less the ones that coincided with the info the receiver demanded and were skipped,
+	// which is why this is a measured number rather than a product
+	unboundSweepRefusals = 15812
+)
+
+// The reframings of one demanded pair that carry no binding the receiver demanded, built
+// as operations on the pair rather than as values.
+//
+// These are the infos an implementation falls back to: none at all, an empty one, the
+// context raw, the prefixed label alone, the two unframed, the two transposed, and the
+// digest of the preimage. Each is skipped where it happens to coincide with the demanded
+// info, so a row can never be satisfied by opening the message it was supposed to refuse.
+func unboundEncryptContexts(crypto CryptoProvider, label string, context []byte) [][]byte {
+	prefixed := []byte(MlsLabelPrefix + label)
+	demanded := mlsEncryptContext(label, context)
+	candidates := [][]byte{
+		nil,
+		{},
+		bytes.Clone(context),
+		prefixed,
+		concatBytes(prefixed, context),
+		mlsEncryptContext(string(context), []byte(label)),
+		crypto.Hash(demanded),
+	}
+	unbound := [][]byte{}
+	for _, candidate := range candidates {
+		if bytes.Equal(candidate, demanded) {
+			continue
+		}
+		unbound = append(unbound, candidate)
+	}
+	return unbound
+}
+
+// A message carrying no binding, at every field length the sweep reaches, is refused.
+//
+// The generated class is four demanded pairs deep, and four pairs fix four label lengths
+// and four context lengths. A fallback conditional on what it is handed is invisible to
+// all of them: task 14 measured a lenient verify that fired only for labels of eleven
+// bytes surviving all 2257 tests of a probe that only ever used two. So this sweeps the
+// lengths instead of sampling them, and sweeps the plaintext length with them so the
+// ciphertext length moves as well.
+//
+// The second half sweeps the leading byte at short lengths, because a band can be keyed on
+// what a label says rather than on how long it is, and every label in every corpus vendored
+// here begins with a capital letter.
+//
+// What this cannot reach is a band keyed on a length past the end of the sweep. The pin in
+// TestTheLabelledEncryptionIsOnlyItsOwnContext is what covers that, by reading the bodies
+// rather than by asking them a question they can decline to answer.
+func TestDecryptWithLabelRefusesAnUnboundMessageAtEveryFieldLength(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite this sweep is built over: %v", err)
+	}
+	priv, pub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x1c}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	sealer := newLabelledSealer(t, params, rand.Reader, pub)
+	refused := 0
+	points := 0
+	sweep := func(label string, context []byte, plaintext []byte) {
+		points++
+		demanded := mlsEncryptContext(label, context)
+		// the control at every point: what follows is only meaningful against a decrypt
+		// that opens the one message it should, and a control per point is what says the
+		// refusals below are about the info rather than about the point
+		if back, err := DecryptWithLabel(crypto, priv, label, context,
+			sealer.kemOutput, sealer.seal(t, demanded, plaintext)); err != nil {
+			t.Fatalf("a %d byte label over a %d byte context: the bound message was refused: %v",
+				len(label), len(context), err)
+		} else if !bytes.Equal(back, plaintext) {
+			t.Fatalf("a %d byte label over a %d byte context: the bound message opened as %x",
+				len(label), len(context), back)
+		}
+		for _, info := range unboundEncryptContexts(crypto, label, context) {
+			refused++
+			back, err := DecryptWithLabel(crypto, priv, label, context,
+				sealer.kemOutput, sealer.seal(t, info, plaintext))
+			if !errors.Is(err, ErrAeadOpen) {
+				t.Fatalf("a message sealed under info %x opened as one under a %d byte label over a %d byte context: error = %v, want ErrAeadOpen",
+					info, len(label), len(context), err)
+			}
+			if back != nil {
+				t.Fatalf("a message sealed under info %x was refused and still answered %x", info, back)
+			}
+		}
+	}
+	for labelLength := 0; labelLength < unboundSweepLabelLengths; labelLength++ {
+		for contextLength := 0; contextLength < unboundSweepContextLengths; contextLength++ {
+			// the plaintext length moves with the point, so a band keyed on how long the
+			// ciphertext is has no fixed value to sit at either
+			sweep(string(sweptBytes(0x41, labelLength)), sweptBytes(0x80, contextLength),
+				sweptBytes(0x30, 1+(labelLength*contextLength)%40))
+		}
+	}
+	if points != unboundSweepLabelLengths*unboundSweepContextLengths {
+		t.Fatalf("the length sweep visited %d points, want %d",
+			points, unboundSweepLabelLengths*unboundSweepContextLengths)
+	}
+	lengthPoints := points
+	for first := 0; first < unboundSweepBytes; first++ {
+		for labelLength := 1; labelLength <= unboundSweepByteLengths; labelLength++ {
+			sweep(string(sweptBytes(byte(first), labelLength)),
+				sweptBytes(byte(first)^0x55, labelLength), []byte("plaintext"))
+		}
+	}
+	if want := lengthPoints + unboundSweepBytes*unboundSweepByteLengths; points != want {
+		t.Fatalf("the two sweeps visited %d points, want %d", points, want)
+	}
+	if refused != unboundSweepRefusals {
+		t.Fatalf("the two sweeps refused %d unbound messages, want %d", refused, unboundSweepRefusals)
+	}
+}
