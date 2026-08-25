@@ -174,9 +174,14 @@ func mlsSignContent(label string, content []byte) []byte {
 // would fail the length check on the way back in.
 //
 // The length is checked against the registry's NsigPriv rather than against
-// ed25519.SeedSize, so a suite whose signature scheme is not this one fails at the gate
-// instead of inside ed25519.NewKeyFromSeed, which panics on a seed of the wrong length.
-// TestEverySuiteNamesTheSignatureSchemeTheProviderComputes is what keeps the two in step.
+// ed25519.SeedSize, so the refusal states the suite's own contract rather than this
+// primitive's. That is the whole of what it buys, and it is worth being exact about which
+// way the safety runs: the registry is the weaker of the two gates here, not the stronger.
+// A suite naming a 64 byte private key would pass this check with a 64 byte key and panic
+// inside ed25519.NewKeyFromSeed — measured, "ed25519: bad seed length: 64" — where the
+// literal would have refused it. What keeps that unreachable is not this line but
+// TestEverySuiteNamesTheSignatureSchemeTheProviderComputes, which holds every registered
+// suite to ed25519 and to 32 and 32.
 func (self *suiteCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
 	if len(priv) != self.params.NsigPriv {
 		return nil, ErrBadSignatureKey
@@ -196,13 +201,19 @@ func (self *suiteCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label s
 // from the network, and how it failed is not something an attacker gets to learn.
 //
 // The key length gate is load bearing: crypto/ed25519.Verify panics on a public key of
-// any other length rather than answering. The signature length gate is not, and that is
-// worth writing down rather than leaving for the next reader to rediscover. The library
-// refuses every length but 64 as the first statement of its own verify, so removing this
-// one changes no answer — measured over 1539 lengths and bodies from 0 to 512 bytes, 0
-// disagreements. It stays because the contract it states is this package's rather than
-// the library's, and because it is the line that would still be right if the suite's
-// signature scheme ever stopped being ed25519.
+// any other length rather than answering. It reads the registry for the same reason
+// SignWithLabel's does and with the same caveat — a suite naming 64 would pass it and
+// panic in the library, measured, so what makes the gate sufficient is the registered
+// suites being held to 32 rather than anything this line does.
+//
+// The signature length gate is not load bearing, and that is worth writing down rather
+// than leaving for the next reader to rediscover. The library refuses every length but 64
+// as the first statement of its own verify, so removing this one changes no answer —
+// measured over 10260 lengths and bodies from 0 to 512 bytes, 0 disagreements. It stays
+// because the contract it states is this package's rather than the library's, and because
+// it is the line that would still be right if the suite's signature scheme ever stopped
+// being ed25519. TestTheSignatureMethodsAreOnlyTheirOwnPreimage is what holds it there,
+// since no input can.
 //
 // ErrCryptoBadSignature rather than ErrBadSignature: the bare name is errors.go's
 // ValSem010, and errors.go wraps this one, so a framing caller can ask either question.
@@ -234,12 +245,18 @@ func (self *suiteCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label s
 // from a partial read is a tail of zeroes nobody chose, and it would sign and verify
 // perfectly.
 //
-// The public half is copied out of the expanded key rather than sliced from it. No test
-// can see the difference and none pretends to — measured over 4096 key pairs: the bytes
-// agree, two calls never share storage either way, and neither form aliases the seed.
-// What a slice would do is keep the whole 64 byte expanded key reachable from the public
-// key, and its first 32 bytes are the secret seed, so a caller holding only a public key
-// would be holding a private one as well.
+// The public half is copied out of the expanded key rather than sliced from it. No input
+// can see the difference — measured over 65536 key pairs: the bytes agree, two calls never
+// share storage either way, and neither form aliases the seed. What a slice would do is
+// keep the whole 64 byte expanded key reachable from the public key, and its first 32 bytes
+// are the secret seed, so a caller holding only a public key would be holding a private one
+// as well. TestTheSignatureMethodsAreOnlyTheirOwnPreimage is what holds it, by reading this
+// statement rather than by asking the answer a question it cannot hear.
+//
+// The private half is the seed buffer and not expanded[:32], which is a difference an input
+// can see even though the bytes never differ: a window onto the expanded key has room for
+// 32 more, so a caller appending to what it was told is a private key writes over the public
+// half of the same pair. TestSignatureKeyPairAnswersStorageOfItsOwn is that assertion.
 func (self *suiteCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
 	seed := make([]byte, self.params.NsigPriv)
 	if _, err := io.ReadFull(self.random, seed); err != nil {

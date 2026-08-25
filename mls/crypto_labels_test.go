@@ -1314,6 +1314,107 @@ type labelKatSignWithLabel struct {
 // two of its seven suites are registered.
 const labelKatSignatureComparisons = 2
 
+// The RFC 9420 section 2.1.2 variable length integer, written out here rather than taken
+// from syntax.
+//
+// An encoder compared against the encoder it is built out of agrees with itself however
+// either of them is wrong, which is why mls/syntax carries its own known answers. What a
+// second implementation buys here is the shape no corpus in this tree reaches:
+// crypto-basics signs one label of thirteen bytes over a content of thirty two, and the
+// rows below pin four more, so five (label length, content length) pairs are pinned out of
+// the thirty seven this package exercises. An encoder wrong only outside those five agrees
+// with every byte this project can compare and with no other implementation alive —
+// measured, a label written raw for exactly the lengths the corpora never use passed all
+// 2257 tests before this sweep existed.
+func referenceVarint(length int) []byte {
+	switch {
+	case length <= 0x3f:
+		return []byte{byte(length)}
+	case length <= 0x3fff:
+		return []byte{byte(length>>8) | 0x40, byte(length)}
+	default:
+		return []byte{byte(length>>24) | 0x80, byte(length >> 16), byte(length >> 8), byte(length)}
+	}
+}
+
+// struct { opaque label<V>; opaque content<V> } SignContent, assembled without syntax.
+func referenceSignContent(label string, content []byte) []byte {
+	prefixed := []byte(MlsLabelPrefix + label)
+	return concatBytes(referenceVarint(len(prefixed)), prefixed, referenceVarint(len(content)), content)
+}
+
+// A field of a given length whose bytes all differ, so a prefix describing the right count
+// of the wrong bytes is visible. The first byte is the caller's, which is what lets a sweep
+// vary where a label starts as well as how long it is.
+func sweptBytes(first byte, length int) []byte {
+	out := make([]byte, length)
+	for i := range out {
+		out[i] = first + byte(i)
+	}
+	return out
+}
+
+// What the two sweeps below compare, counted for the same reason as every other total
+// here: a loop that stopped iterating reports exactly what a complete one reports.
+const (
+	// label lengths 0..60 against content lengths 0..70, which carries both fields across
+	// the one to two octet varint boundary at 64
+	signContentLengthSweepComparisons = 61 * 71
+	// every first byte at the short lengths, which is what a narrow band encoder keyed on
+	// a label's leading byte rather than on its length hides behind
+	signContentByteSweepComparisons = 9 * 5 * 256
+)
+
+// mlsSignContent agrees with an independently written encoder over a swept space rather
+// than at the handful of shapes anybody wrote down.
+//
+// The two sweeps are different classes and neither contains the other. The first varies
+// both lengths, which separates a hand rolled single octet prefix from the varint at 64 and
+// an omitted field from an empty one at 0. The second varies the leading byte at short
+// lengths, because a defect can be keyed on what a label says rather than on how long it
+// is, and every label in every corpus vendored here begins with a capital letter.
+func TestSignContentMatchesAnIndependentEncoder(t *testing.T) {
+	compared := 0
+	for labelLength := 0; labelLength <= 60; labelLength++ {
+		label := string(sweptBytes(0x40, labelLength))
+		for contentLength := 0; contentLength <= 70; contentLength++ {
+			compared++
+			content := sweptBytes(0x80, contentLength)
+			got := mlsSignContent(label, content)
+			if want := referenceSignContent(label, content); !bytes.Equal(got, want) {
+				t.Fatalf("mlsSignContent over a %d byte label and a %d byte content = %x, want %x",
+					labelLength, contentLength, got, want)
+			}
+		}
+	}
+	if compared != signContentLengthSweepComparisons {
+		t.Fatalf("the length sweep compared %d encodings, want %d", compared, signContentLengthSweepComparisons)
+	}
+	compared = 0
+	for labelLength := 0; labelLength <= 8; labelLength++ {
+		for contentLength := 0; contentLength <= 4; contentLength++ {
+			for first := 0; first < 256; first++ {
+				compared++
+				label := string(sweptBytes(byte(first), labelLength))
+				content := sweptBytes(byte(first)^0x55, contentLength)
+				got := mlsSignContent(label, content)
+				if want := referenceSignContent(label, content); !bytes.Equal(got, want) {
+					t.Fatalf("mlsSignContent over a %d byte label beginning %#02x and a %d byte content = %x, want %x",
+						labelLength, first, contentLength, got, want)
+				}
+			}
+		}
+	}
+	if compared != signContentByteSweepComparisons {
+		t.Fatalf("the byte sweep compared %d encodings, want %d", compared, signContentByteSweepComparisons)
+	}
+	// and the reference is not the implementation written a second time: it must disagree
+	// with an encoder that dropped a length prefix, or the sweeps above compare nothing
+	if bytes.Equal(referenceSignContent("a", []byte("bc")), concatBytes([]byte(MlsLabelPrefix+"a"), []byte("bc"))) {
+		t.Errorf("the reference encoder builds the unframed concatenation, so it frames nothing")
+	}
+}
+
 func TestSignContentEncoding(t *testing.T) {
 	// SignContent is { opaque label<V>; opaque content<V> } and the label carries the
 	// "MLS 1.0 " prefix. These rows are read off RFC 9420 section 5.1.2 rather than
@@ -1359,11 +1460,26 @@ func TestSignContentEncoding(t *testing.T) {
 
 // Where the boundary between the label and the content falls is part of what is signed.
 //
-// The four splits below are one run of bytes divided four ways, so an encoder that
-// dropped either length prefix produces the same preimage for all of them and one
+// The four splits in the first table are one run of bytes divided four ways, so an encoder
+// that dropped both length prefixes produces the same preimage for all of them and one
 // signature covers all four readings. That is a signature bypass primitive rather than a
 // cosmetic difference: a peer that splits the run differently reads a leaf node signature
 // as a framed content signature over content the signer never saw.
+//
+// Both prefixes, not either. Measured, an encoder that dropped one alone leaves all four
+// rows distinct — the surviving prefix byte differs between them, 0x0b/0x0c/0x0a/0x0d for
+// the label and 0x02/0x01/0x03/0x00 for the content — and passes this table. The second
+// table is what separates a dropped label prefix on its own: two pairs whose preimages
+// collide the moment the label is written raw, so one signature really does cover both
+// readings there.
+//
+// There is no third table because a dropped content prefix admits no collision at all. The
+// content is the last field, so a preimage of the form { varint length; label; content }
+// still decodes one way: the varint fixes where the label ends and everything after it is
+// the content. Dropping it is a protocol split rather than a bypass, and what holds it is
+// the published signature in TestSignWithLabelMatchesTheCryptoBasicsVectors and the swept
+// comparison in TestSignContentMatchesAnIndependentEncoder, neither of which needs a
+// collision to see it.
 func TestSignContentSeparatesTheLabelFromTheContent(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	priv, pub, err := crypto.SignatureKeyPair()
@@ -1411,6 +1527,32 @@ func TestSignContentSeparatesTheLabelFromTheContent(t *testing.T) {
 					splits[i].label, splits[j].label, err)
 			}
 		}
+	}
+	// the second table: two pairs that build one preimage the moment the label's own
+	// length prefix is dropped. The label of the second row ends in the length byte the
+	// first row's content begins with, so a raw label swallows the boundary and the two
+	// readings become the same bytes.
+	collidingLabels := []string{"ab", "ab\x03"}
+	collidingContents := [][]byte{{0x02, 'c', 'd'}, {'c', 'd'}}
+	rawFramed := [][]byte{}
+	for i := range collidingLabels {
+		rawFramed = append(rawFramed, concatBytes([]byte(MlsLabelPrefix+collidingLabels[i]),
+			referenceVarint(len(collidingContents[i])), collidingContents[i]))
+	}
+	if !bytes.Equal(rawFramed[0], rawFramed[1]) {
+		t.Fatalf("the two rows build %x and %x with the label written raw, so they separate nothing",
+			rawFramed[0], rawFramed[1])
+	}
+	collidingSignature, err := crypto.SignWithLabel(priv, collidingLabels[0], collidingContents[0])
+	if err != nil {
+		t.Fatalf("sign under %q: %v", collidingLabels[0], err)
+	}
+	if err := crypto.VerifyWithLabel(pub, collidingLabels[0], collidingContents[0], collidingSignature); err != nil {
+		t.Fatalf("the signature under %q was refused under its own pair: %v", collidingLabels[0], err)
+	}
+	if err := crypto.VerifyWithLabel(pub, collidingLabels[1], collidingContents[1], collidingSignature); !errors.Is(err, ErrCryptoBadSignature) {
+		t.Errorf("the signature under %q over %x verified under %q over %x: error = %v, want ErrCryptoBadSignature",
+			collidingLabels[0], collidingContents[0], collidingLabels[1], collidingContents[1], err)
 	}
 }
 
@@ -1594,15 +1736,288 @@ func TestVerifyWithLabelRefusesEveryAlteration(t *testing.T) {
 	}
 }
 
+// One demanded pair the refusal class below is generated around.
+//
+// One pair is not enough. A fallback can be conditional on what it is handed, and a verify
+// lenient only for labels of eleven bytes passes a probe that only ever uses two —
+// measured, exactly that mutant survived all 2257 tests of the version this replaces. So
+// the generators run over a table: a real RFC label, a two byte pair, an empty pair, and a
+// label carrying whitespace over a content past the one octet prefix boundary.
+//
+// The sweep flag says whether the exhaustive single edit neighbourhood runs on a pair, and
+// rawSweep the same for the neighbourhood of the preimage itself. Both are the field length
+// times the whole byte alphabet and every member costs a signature and a verification, so
+// they run where the fields are short and one real label, while the generators that cost
+// nothing run everywhere.
+type signatureProbePair struct {
+	name     string
+	label    string
+	content  []byte
+	sweep    bool
+	rawSweep bool
+}
+
+// The pairs, and how many of them there are, asserted where they are used.
+func signatureProbePairs() []signatureProbePair {
+	return []signatureProbePair{
+		{name: "an RFC label", label: "LeafNodeTBS", content: []byte("sig"), sweep: true},
+		{name: "two byte fields", label: "Ab", content: []byte("Cd"), sweep: true, rawSweep: true},
+		{name: "empty fields", label: "", content: nil, sweep: true, rawSweep: true},
+		{name: "a spaced label over a content past the one octet prefix",
+			label: " FramedContentTBS ", content: bytes.Repeat([]byte{0x5a}, 64)},
+	}
+}
+
+// Every field one byte away from this one, over the whole alphabet: each deletion, each
+// substitution and each insertion, at every position.
+//
+// This is the class rather than a list. A fallback that appends any byte, drops any byte or
+// changes any byte is a member whether or not that byte is one somebody would have written
+// down, which is exactly the difference between this and the seven named labels it
+// replaces: a fallback to the label plus "x" died on that list and one to the label plus
+// "y" passed everything.
+func singleByteEdits(field []byte) [][]byte {
+	edits := [][]byte{}
+	for i := range field {
+		edits = append(edits, concatBytes(field[:i], field[i+1:]))
+	}
+	for i := range field {
+		for b := 0; b < 256; b++ {
+			if byte(b) == field[i] {
+				continue
+			}
+			edits = append(edits, concatBytes(field[:i], []byte{byte(b)}, field[i+1:]))
+		}
+	}
+	for i := 0; i <= len(field); i++ {
+		for b := 0; b < 256; b++ {
+			edits = append(edits, concatBytes(field[:i], []byte{byte(b)}, field[i:]))
+		}
+	}
+	return edits
+}
+
+// The bytes a rewrite may add, taken from the field rather than chosen: every byte it
+// carries, each of those with its case bit flipped, and the two extremes. An alphabet
+// somebody picked would be one more list to keep in step with the fields it is used on.
+func rewriteAlphabet(field []byte) []byte {
+	alphabet := []byte{0x00, 0xff}
+	for _, b := range field {
+		alphabet = append(alphabet, b, b^0x20)
+	}
+	slices.Sort(alphabet)
+	return slices.Compact(alphabet)
+}
+
+// Every whole field rewrite, as operations over the field rather than as values.
+//
+// A single byte edit cannot reach a doubled field, a reversed one or a case folded one, and
+// those are the shapes a lenient verify is actually written with. Naming the operation
+// rather than the result is what keeps this a class: the same repertoire over a different
+// demanded pair yields different values with nothing edited here.
+func fieldRewrites(field []byte) [][]byte {
+	half := len(field) / 2
+	reversed := bytes.Clone(field)
+	slices.Reverse(reversed)
+	sorted := bytes.Clone(field)
+	slices.Sort(sorted)
+	rewrites := [][]byte{
+		nil,
+		field[:len(field)-min(1, len(field))],
+		field[min(1, len(field)):],
+		field[:half],
+		field[half:],
+		reversed,
+		sorted,
+		bytes.ToLower(field),
+		bytes.ToUpper(field),
+		bytes.Repeat(field, 2),
+		bytes.Repeat(field, 3),
+		bytes.Repeat(field, 4),
+		make([]byte, len(field)),
+		bytes.Repeat([]byte{0xff}, len(field)),
+		bytes.TrimSpace(field),
+		concatBytes([]byte(MlsLabelPrefix), field),
+		bytes.TrimPrefix(field, []byte(MlsLabelPrefix)),
+	}
+	for _, b := range rewriteAlphabet(field) {
+		rewrites = append(rewrites, concatBytes(field, []byte{b}), concatBytes([]byte{b}, field))
+	}
+	return rewrites
+}
+
+// Every arrangement of the fields a signer holds, in either framing.
+//
+// The rows a reader writes out — the content alone, the prefixed label alone, the two
+// unframed, the two transposed, one prefix dropped — are all members of this, and so are
+// the arrangements nobody writes out. Generating it is what makes the claim "every
+// reframing of these fields" rather than "these nine".
+func fieldArrangements(label string, content []byte) [][]byte {
+	framed := [][]byte{}
+	for _, field := range [][]byte{[]byte(MlsLabelPrefix + label), []byte(label), content, nil} {
+		framed = append(framed, bytes.Clone(field), concatBytes(referenceVarint(len(field)), field))
+	}
+	arrangements := [][]byte{}
+	for _, first := range framed {
+		arrangements = append(arrangements, first)
+		for _, second := range framed {
+			arrangements = append(arrangements, concatBytes(first, second))
+		}
+	}
+	return arrangements
+}
+
+// The deterministic source the walk below draws from.
+//
+// A 64 bit xorshift rather than a math/rand Rand, for the reason mls/syntax records for the
+// same choice: a corpus that is byte for byte the same on every platform and every
+// toolchain is what makes a failure reproducible from a seed alone. Zero is xorshift's
+// fixed point and would emit one value forever, so it is replaced rather than accepted.
+type labelProbeRand struct {
+	state uint64
+}
+
+func newLabelProbeRand(seed uint64) *labelProbeRand {
+	if seed == 0 {
+		seed = 0x9e3779b97f4a7c15
+	}
+	return &labelProbeRand{state: seed}
+}
+
+// The next word, and a value below a bound. The modulo is biased for a bound that does not
+// divide the word size, which is irrelevant to a corpus generator and would not be to
+// anything carrying a security property.
+func (self *labelProbeRand) below(bound int) int {
+	self.state ^= self.state << 13
+	self.state ^= self.state >> 7
+	self.state ^= self.state << 17
+	if bound <= 0 {
+		return 0
+	}
+	return int(self.state % uint64(bound))
+}
+
+// One edit of a field, drawn from the same repertoire the generators above enumerate.
+func (self *labelProbeRand) edit(field []byte) []byte {
+	switch self.below(7) {
+	case 0:
+		if len(field) == 0 {
+			return field
+		}
+		at := self.below(len(field))
+		return concatBytes(field[:at], field[at+1:])
+	case 1:
+		at := self.below(len(field) + 1)
+		return concatBytes(field[:at], []byte{byte(self.below(256))}, field[at:])
+	case 2:
+		if len(field) == 0 {
+			return field
+		}
+		at := self.below(len(field))
+		return concatBytes(field[:at], []byte{byte(self.below(256))}, field[at+1:])
+	case 3:
+		return field[:self.below(len(field)+1)]
+	case 4:
+		return field[self.below(len(field)+1):]
+	case 5:
+		return bytes.Repeat(field, 2+self.below(3))
+	default:
+		if len(field) == 0 {
+			return field
+		}
+		folded := bytes.Clone(field)
+		folded[self.below(len(folded))] ^= 0x20
+		return folded
+	}
+}
+
+// How many pairs the walk draws per demanded pair, and the seed it draws them from. The
+// seed is written down so a failure reproduces from this line rather than from a lucky run.
+const (
+	labelProbeWalkSteps = 1500
+	labelProbeWalkSeed  = 0x5d1e4b7c9a30f682
+)
+
+// One to four edits applied to both fields at once, drawn deterministically.
+//
+// The three generators above are each complete over the shapes they describe and silent
+// about every other. This samples outside them: a fallback two edits away in each field, or
+// one that combines a rewrite with an insertion, is reached here or not at all.
+func walkedPairs(random *labelProbeRand, pair signatureProbePair) [][]byte {
+	preimages := [][]byte{}
+	for step := 0; step < labelProbeWalkSteps; step++ {
+		otherLabel := []byte(pair.label)
+		otherContent := bytes.Clone(pair.content)
+		for edit := 0; edit <= random.below(4); edit++ {
+			if random.below(2) == 0 {
+				otherLabel = random.edit(otherLabel)
+			} else {
+				otherContent = random.edit(otherContent)
+			}
+		}
+		preimages = append(preimages, mlsSignContent(string(otherLabel), otherContent))
+	}
+	return preimages
+}
+
+// Every preimage the class holds for one demanded pair.
+func alternativePreimages(random *labelProbeRand, pair signatureProbePair) [][]byte {
+	label := []byte(pair.label)
+	demanded := mlsSignContent(pair.label, pair.content)
+	preimages := [][]byte{}
+	if pair.sweep {
+		for _, edited := range singleByteEdits(label) {
+			preimages = append(preimages, mlsSignContent(string(edited), pair.content))
+		}
+		for _, edited := range singleByteEdits(pair.content) {
+			preimages = append(preimages, mlsSignContent(pair.label, edited))
+		}
+	}
+	if pair.rawSweep {
+		// the same edits over the preimage itself, which reaches what no (label, content)
+		// pair can: a truncation, an extension, a byte changed inside a length prefix
+		preimages = append(preimages, singleByteEdits(demanded)...)
+	}
+	for _, otherLabel := range fieldRewrites(label) {
+		for _, otherContent := range fieldRewrites(pair.content) {
+			preimages = append(preimages, mlsSignContent(string(otherLabel), otherContent))
+		}
+	}
+	preimages = append(preimages, fieldRewrites(demanded)...)
+	preimages = append(preimages, fieldArrangements(pair.label, pair.content)...)
+	preimages = append(preimages, walkedPairs(random, pair)...)
+	return preimages
+}
+
+// How many distinct preimages the generated class holds, pinned so a generator that
+// degenerated fails rather than reporting what a working one reports.
+//
+// It is a count of distinct values rather than of iterations on purpose: a repertoire whose
+// operations all collapsed to the identity would still iterate the same number of times.
+const signatureRefusedPreimages = 29183
+
 // A signature this key really made, over a preimage the verifier does not demand, is
 // refused.
 //
 // This is the direction a lenient verifier is invisible in, and the one this project has
-// already paid for: task 8's aad and info binding was walked in one direction only and
-// twelve lenient fallback mutants passed the whole suite. A verify that tries the bare
-// label, the unframed concatenation or the content itself after the real preimage fails
-// round trips, stays label bound, refuses every alteration above and matches the published
-// vector, and accepts every row here.
+// now paid for twice. Task 8's aad and info binding was walked in one direction only and
+// twelve lenient fallback mutants passed the whole suite. Then the first answer to that
+// here was a cross product of seven named labels and five named contents, which is a list
+// of seven wearing a cross product's clothes: a verify falling back to the label plus "x"
+// died on it and one falling back to the label plus "y" passed all 2257 tests, along with
+// forty more of the same shape, each accepting a signature the key really made under
+// another label.
+//
+// So the refused set is generated. The named rows below stay, because a failure among them
+// says which reframing was accepted rather than only that one was, but they are no longer
+// what the claim rests on. Four generators carry that, none of which names a value:
+// singleByteEdits over the whole alphabet, fieldRewrites as operations rather than results,
+// fieldArrangements over both framings of both fields, and a deterministic multi edit walk
+// outside all three.
+//
+// What no generator can do is enumerate every preimage, so two things bound it. The count
+// of distinct ones is asserted, and TestTheSignatureMethodsAreOnlyTheirOwnPreimage covers
+// what a neighbourhood cannot by reading the method's own statements.
 func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	priv, pub, err := crypto.SignatureKeyPair()
@@ -1641,42 +2056,40 @@ func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 			t.Errorf("a signature over %s verified: error = %v, want ErrCryptoBadSignature", testCase.name, err)
 		}
 	}
-	// the rows above are shapes somebody thought of, and a fallback aimed at a shape
-	// nobody listed survives all of them. Measured: a verify falling back to the preimage
-	// under an empty label passed every test in this package before this half was
-	// written. So the second half is the class rather than a list: every preimage the same
-	// key can build by varying the label or the content, as the whole cross product of the
-	// variants below minus the one pair the verifier demands.
-	// the demanded pair leads both lists, so the cross product really does contain the
-	// identity and the one row subtracted below is a row that was there
-	otherLabels := []string{label, "", "x", label + "x", "x" + label, MlsLabelPrefix + label,
-		strings.ToUpper(label)}
-	otherContents := [][]byte{content, nil, append(bytes.Clone(content), 'x'), content[1:],
-		bytes.Repeat([]byte{0x5a}, len(content))}
+	// the rows above are shapes somebody thought of, and a fallback aimed at a shape nobody
+	// listed survives all of them. So the rest is generated, over every demanded pair in
+	// the table, and every generated preimage the same key can build is refused.
+	random := newLabelProbeRand(labelProbeWalkSeed)
 	refused := 0
-	for _, otherLabel := range otherLabels {
-		for _, otherContent := range otherContents {
-			if otherLabel == label && bytes.Equal(otherContent, content) {
+	for _, pair := range signatureProbePairs() {
+		pairDemanded := mlsSignContent(pair.label, pair.content)
+		// the control first, per pair: what follows is only meaningful against a verify
+		// that accepts the one preimage it should
+		if err := crypto.VerifyWithLabel(pub, pair.label, pair.content, ed25519.Sign(key, pairDemanded)); err != nil {
+			t.Fatalf("%s: the signature over the demanded preimage was refused: %v", pair.name, err)
+		}
+		tried := map[string]bool{string(pairDemanded): true}
+		generated := alternativePreimages(random, pair)
+		if len(generated) == 0 {
+			t.Fatalf("%s: the generators built nothing, so this pair observed nothing", pair.name)
+		}
+		for _, preimage := range generated {
+			if tried[string(preimage)] {
 				continue
 			}
-			preimage := mlsSignContent(otherLabel, otherContent)
-			if bytes.Equal(preimage, demanded) {
-				t.Errorf("the pair %q over %x builds the preimage the verifier demands, so it separates nothing",
-					otherLabel, otherContent)
-				continue
-			}
+			tried[string(preimage)] = true
 			refused++
-			if err := crypto.VerifyWithLabel(pub, label, content, ed25519.Sign(key, preimage)); !errors.Is(err, ErrCryptoBadSignature) {
-				t.Errorf("a signature under %q over %x verified as one under %q over %x: error = %v, want ErrCryptoBadSignature",
-					otherLabel, otherContent, label, content, err)
+			if err := crypto.VerifyWithLabel(pub, pair.label, pair.content, ed25519.Sign(key, preimage)); !errors.Is(err, ErrCryptoBadSignature) {
+				t.Errorf("%s: a signature over %x verified as one under %q over %x: error = %v, want ErrCryptoBadSignature",
+					pair.name, preimage, pair.label, pair.content, err)
 			}
 		}
 	}
-	if want := len(otherLabels)*len(otherContents) - 1; refused != want {
-		t.Fatalf("the cross product refused %d preimages, want %d", refused, want)
+	if refused != signatureRefusedPreimages {
+		t.Fatalf("the generated class refused %d distinct preimages, want %d", refused, signatureRefusedPreimages)
 	}
-	// the control: a signature over the preimage the verifier does demand is accepted, so
-	// nothing above can be satisfied by a verify that refuses everything
+	// and the control for the whole test: a signature over the preimage the verifier does
+	// demand is accepted, so nothing above is satisfied by a verify that refuses everything
 	if err := crypto.VerifyWithLabel(pub, label, content, ed25519.Sign(key, demanded)); err != nil {
 		t.Errorf("the signature over the demanded preimage was refused: %v", err)
 	}
@@ -1796,6 +2209,40 @@ func TestSignatureKeyPairRefusesAShortOrFailingReader(t *testing.T) {
 	}
 }
 
+// Neither half of a key pair carries storage past its own length.
+//
+// go's ed25519 private key is the seed followed by the public key, so a generator handing
+// back expanded[:32] rather than the seed buffer answers thirty two bytes that read
+// identically and carry thirty two more behind their length. The bytes agree every time —
+// that mutant passed every other test in this package — and what separates it is a caller
+// that appends: the append lands in the spare capacity, which is the public half of the
+// same key, and the pair the caller holds stops agreeing with itself.
+//
+// Both halves are asserted, over more than one pair, because the two are built differently
+// and only one of them is a make of the exact size.
+func TestSignatureKeyPairAnswersStorageOfItsOwn(t *testing.T) {
+	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, bytes.NewReader(randomScript(t)))
+	for pair := 0; pair < 3; pair++ {
+		priv, pub, err := crypto.SignatureKeyPair()
+		if err != nil {
+			t.Fatalf("SignatureKeyPair: %v", err)
+		}
+		if cap(priv) != len(priv) {
+			t.Errorf("pair %d: the private key is %d bytes with room for %d, so a caller appending to it writes into whatever follows",
+				pair, len(priv), cap(priv))
+		}
+		if cap(pub) != len(pub) {
+			t.Errorf("pair %d: the public key is %d bytes with room for %d, so a caller appending to it writes into whatever follows",
+				pair, len(pub), cap(pub))
+		}
+		// and the control: the two halves really are the halves of one expanded key, so the
+		// rows above are about where the storage came from rather than about the bytes
+		if expanded := ed25519.NewKeyFromSeed(priv); !bytes.Equal(pub, expanded[ed25519.SeedSize:]) {
+			t.Errorf("pair %d: the public key is not the one this seed expands to", pair)
+		}
+	}
+}
+
 // Every registered suite names the signature scheme this file computes.
 //
 // The two entries agree on ed25519 and on 32 byte keys, so nothing here can tell
@@ -1827,5 +2274,177 @@ func TestEverySuiteNamesTheSignatureSchemeTheProviderComputes(t *testing.T) {
 			t.Errorf("%s fixes a %d byte public signature key, and ed25519 public keys are %d",
 				params.Name, params.NsigPub, ed25519.PublicKeySize)
 		}
+	}
+}
+
+// The file declaring one method of the provider, found rather than named.
+//
+// Task 12 shipped a gate that was told which file to read, and the implementation moved:
+// the identical defect failed in crypto.go and passed all 2230 tests in crypto_labels.go. A
+// gate that finds its own subject cannot be walked away from, and a subject that is in no
+// file, or in two, is fatal rather than clean.
+func sourceDeclaringProviderMethod(t *testing.T, name string) parsedSource {
+	t.Helper()
+	found := []parsedSource{}
+	declaring := []string{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		parsed := mustParseSource(t, path)
+		if slices.Contains(parsed.methodsOn(providerReceiver), name) {
+			found = append(found, parsed)
+			declaring = append(declaring, path)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%s is declared on %s in %v, want exactly one file of this package", name, providerReceiver, declaring)
+	}
+	return found[0]
+}
+
+// The three signature methods, statement by statement.
+//
+// Everything above walks the two directions a lenient verify can be caught in, and the class
+// it walks is generated rather than listed — but a class is still a neighbourhood, and the
+// shapes outside it are exactly the ones nobody thought to generate. A verify falling back
+// to the preimage over the digest of the content is a member of no generator in this file.
+//
+// Three further weakenings are behaviourally invisible altogether, and were measured to be:
+//
+//   - the key length gates read self.params, and both registered suites fix 32 and 32, so a
+//     literal ed25519.SeedSize in their place agrees with every input there is. Measured,
+//     eight such mutants survive every test in this package.
+//   - the signature length gate changes no answer at all, which crypto_labels.go says in as
+//     many words: crypto/ed25519 refuses every length but 64 as the first statement of its
+//     own verify.
+//   - the public half is cloned out of the expanded key rather than sliced from it, and a
+//     slice would keep the secret seed alive behind a public key with nothing able to see
+//     the difference.
+//
+// So the bodies are pinned as shapes, in the form TestMacVerifyIsOnlyTheConstantTimeComparison
+// already uses for the same reason. Each control below is a body that passes every other
+// test in this package, which is what says the pin carries something they do not.
+var signWithLabelStatements = []string{
+	"if len(priv) != self.params.NsigPriv {\n\treturn nil, ErrBadSignatureKey\n}",
+	"return ed25519.Sign(ed25519.NewKeyFromSeed(priv), mlsSignContent(label, content)), nil",
+}
+
+var verifyWithLabelStatements = []string{
+	"if len(pub) != self.params.NsigPub {\n\treturn ErrBadSignatureKey\n}",
+	"if len(sig) != ed25519.SignatureSize {\n\treturn ErrCryptoBadSignature\n}",
+	"if !ed25519.Verify(ed25519.PublicKey(pub), mlsSignContent(label, content), sig) {\n\treturn ErrCryptoBadSignature\n}",
+	"return nil",
+}
+
+var signatureKeyPairStatements = []string{
+	"seed := make([]byte, self.params.NsigPriv)",
+	"if _, err := io.ReadFull(self.random, seed); err != nil {\n\treturn nil, nil, err\n}",
+	"expanded := ed25519.NewKeyFromSeed(seed)",
+	"return SignaturePrivateKey(seed), SignaturePublicKey(bytes.Clone(expanded[ed25519.SeedSize:])), nil",
+}
+
+// A verify that round trips, stays label bound, refuses every alteration, matches the
+// published vector, and accepts a signature the key really made under a different label.
+//
+// The fallback is the preimage over the digest of the content, which is outside every
+// generator above: no sequence of edits to a three byte content produces a thirty two byte
+// digest of it. This is the shape the pin exists for.
+const lenientVerifyControl = `package mls
+
+func (self *suiteCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label string, content []byte, sig []byte) error {
+	if len(pub) != self.params.NsigPub {
+		return ErrBadSignatureKey
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return ErrCryptoBadSignature
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), mlsSignContent(label, content), sig) {
+		if ed25519.Verify(ed25519.PublicKey(pub), mlsSignContent(label, self.Hash(content)), sig) {
+			return nil
+		}
+		return ErrCryptoBadSignature
+	}
+	return nil
+}
+`
+
+// A sign whose length gate reads ed25519 rather than the suite it was built for. Every
+// registered suite fixes 32, so no input tells the two apart; a suite naming another scheme
+// would reach ed25519.NewKeyFromSeed and panic either way, which is what the comment on the
+// gate says and what this control keeps honest.
+const registryBlindSignControl = `package mls
+
+func (self *suiteCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
+	if len(priv) != ed25519.SeedSize {
+		return nil, ErrBadSignatureKey
+	}
+	return ed25519.Sign(ed25519.NewKeyFromSeed(priv), mlsSignContent(label, content)), nil
+}
+`
+
+// A generator whose public half is a window onto the expanded key rather than a copy of it.
+// The bytes are the same, the capacity is the same, and the sixty four byte array whose
+// first half is the secret seed stays reachable for as long as the public key does.
+const slicedPublicKeyControl = `package mls
+
+func (self *suiteCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
+	seed := make([]byte, self.params.NsigPriv)
+	if _, err := io.ReadFull(self.random, seed); err != nil {
+		return nil, nil, err
+	}
+	expanded := ed25519.NewKeyFromSeed(seed)
+	return SignaturePrivateKey(seed), SignaturePublicKey(expanded[ed25519.SeedSize:]), nil
+}
+`
+
+// The provider methods this file declares, pinned whole rather than filtered by name. Plan
+// task 15 adds EncryptWithLabel and DecryptWithLabel; whichever file they land in, they fail
+// here until somebody decides whether they belong in the pin above.
+var labelProviderMethods = []string{
+	"DeriveSecret", "DeriveTreeSecret", "ExpandWithLabel", "SignWithLabel", "SignatureKeyPair", "VerifyWithLabel",
+}
+
+func TestTheSignatureMethodsAreOnlyTheirOwnPreimage(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		want []string
+	}{
+		{name: "SignWithLabel", want: signWithLabelStatements},
+		{name: "VerifyWithLabel", want: verifyWithLabelStatements},
+		{name: "SignatureKeyPair", want: signatureKeyPairStatements},
+	} {
+		source := sourceDeclaringProviderMethod(t, testCase.name)
+		if got := source.statementsOf(t, providerReceiver, testCase.name); !slices.Equal(got, testCase.want) {
+			t.Errorf("%s is\n%s\nwant\n%s", testCase.name,
+				strings.Join(got, "\n"), strings.Join(testCase.want, "\n"))
+		}
+	}
+	// and the matcher reads each control as the different body it is, so a matcher that
+	// stopped matching fails here rather than issuing the real bodies a clean bill
+	for _, testCase := range []struct {
+		name    string
+		method  string
+		control string
+		want    []string
+	}{
+		{name: "a verify with a fallback preimage", method: "VerifyWithLabel",
+			control: lenientVerifyControl, want: verifyWithLabelStatements},
+		{name: "a sign reading its length from ed25519", method: "SignWithLabel",
+			control: registryBlindSignControl, want: signWithLabelStatements},
+		{name: "a generator slicing its public half", method: "SignatureKeyPair",
+			control: slicedPublicKeyControl, want: signatureKeyPairStatements},
+	} {
+		control := mustParseText(t, testCase.name, testCase.control)
+		if slices.Equal(control.statementsOf(t, providerReceiver, testCase.method), testCase.want) {
+			t.Errorf("the matcher read %s as the shape above", testCase.name)
+		}
+	}
+	// and the pin names every provider method of the file it reads, so a construction added
+	// beside these three is a decision somebody writes down rather than a gap
+	declaring := sourceDeclaringProviderMethod(t, "VerifyWithLabel")
+	if declared := declaring.methodsOn(providerReceiver); !slices.Equal(declared, labelProviderMethods) {
+		t.Errorf("the file declaring VerifyWithLabel declares %v, and this gate knows of %v",
+			declared, labelProviderMethods)
 	}
 }
