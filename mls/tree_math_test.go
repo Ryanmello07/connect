@@ -5928,7 +5928,7 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 // query wherever it is, so the keep side does not have to choose: one leaf a
 // block of level twelve is 2^19 whole paths and puts every block of every level
 // at or above twelve on one of them. twelve is where that stops being free —
-// 524,288 paths of a 2^31-leaf tree, measured at two seconds, and every level
+// 524,288 paths of a 2^31-leaf tree, measured at 1.7 seconds, and every level
 // below it doubles that.
 //
 // the multiplier is not the one the leaf sweeps stride with, so the blocks this
@@ -6023,9 +6023,9 @@ func TestFilteredDirectPathWalksEveryBlockOfTheDeepestTree(t *testing.T) {
 // 2^(d-k) blocks of 2^k nodes each, which is 2^d for the level and d*2^d for
 // the tree however the levels are shaped — so every block of every level of a
 // small tree costs what one drop at the top of a large one does. eighteen is
-// where that stops being free: 524,268 drops at about two seconds, and every
-// level after it a little over doubles that — nineteen is four seconds and
-// twenty is nine. it was sixteen, and two more levels of depth is four times
+// where that stops being free: 524,268 drops at 1.1 seconds, and every level
+// after it a little over doubles that — nineteen is about two and a half
+// seconds and twenty about six. it was sixteen, and two more levels is four times
 // the blocks at every level: level k of a tree of depth d has a drop built at
 // every block under 2^(d-k), which is the low end of the class the report
 // states as a fraction.
@@ -6104,23 +6104,27 @@ func TestFilteredDirectPathDropsAtEveryBlockOfASmallTree(t *testing.T) {
 // node at a time, so certifying that costs 2^(k+1)-1 queries at level k for
 // this implementation, for the oracle beside it, and for any other
 // implementation of this interface: nothing can conclude a subtree is empty
-// without looking at all of it. measured, every level up to this one at up to
-// five blocks each is 7.4 seconds; one level further would add a second and a
-// half a block, level 30 twelve seconds a block and level 31 twenty-four.
+// without looking at all of it. measured, this band is 14,347 drops in the
+// deepest tree and 20 in shallow ones at 9.7 seconds; one level further would
+// add about a second and a half a block, level 30 twelve seconds a block and
+// level 31 twenty-four.
 //
 // so the drop arm is observed to this level and the keep arm to level 31, and
 // what that leaves open is a class and not nothing. a version that forces a
 // keep has no drop to disagree with above this level, or at a block of a level
-// no drop is built at; a version that forces a drop is caught by the keep arm,
-// which walks every level and, since a kept node costs one query wherever it
-// is, a far wider set of blocks than this sweep can pay for.
+// no drop is built at, and that is the larger half of the residual by far: this
+// band reaches 4 of the 128 blocks of level 24 and 1056 of the 262,144 of level
+// 13. a version that forces a drop is caught by the keep side, which walks
+// every block of every level at or above twelve and a stride of them below it.
 //
-// the blocks here were not chosen once and left. the first version of this
-// sweep built its drop at block 0 alone, and a keep forced at block 1 of levels
-// 13, 18, 20, 24 and 26 passed the whole package on nodes the other sweeps do
-// walk; with three blocks, twenty versions survived at blocks 2 and 3. the task
-// report states what is left as a measured class per level and per block rather
-// than arguing it away.
+// the blocks here were not chosen once and left, and they are no longer chosen
+// at all. the first version of this sweep built its drop at block 0 alone, and
+// a keep forced at block 1 of levels 13, 18, 20, 24 and 26 passed the whole
+// package; with three blocks, twenty versions survived at blocks 2 and 3; with
+// four and a strided one, the enumeration that judged it drop-forced only at
+// blocks it had itself named and called the band covered. what a level can
+// afford is now filteredDropBlocks and the report states what is left as a
+// fraction of each level rather than as a list of pairs.
 const filteredDropLevelCeiling = 26
 
 // the highest level a dropped node is the root of its own tree at.
