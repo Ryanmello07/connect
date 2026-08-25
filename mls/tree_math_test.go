@@ -5892,14 +5892,19 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 // node at a time, so certifying that costs 2^(k+1)-1 queries at level k for
 // this implementation, for the oracle beside it, and for any other
 // implementation of this interface: nothing can conclude a subtree is empty
-// without looking at all of it. measured, every level up to this one together
-// is 1.6 seconds; level 27 alone would add as much again, level 30 twelve
-// seconds and level 31 twenty-four. the drop arm is observed to this level and
-// the keep arm to level 31, and what that leaves open is a class rather than
-// nothing: a version that forces a keep at a level above this one has no drop
-// to disagree with, where one that forces a drop is caught by the keep arm at
-// every level there is. the task report states it as measured rather than
-// arguing it away.
+// without looking at all of it. measured, every level up to this one at three
+// blocks each is four seconds; one level further would add two seconds, level
+// 30 thirty-six and level 31 seventy.
+//
+// so the drop arm is observed to this level and the keep arm to level 31, and
+// what that leaves open is a class and not nothing. a version that forces a
+// keep has no drop to disagree with above this level, or at a block of a level
+// this sweep does not build a drop at; a version that forces a drop is caught
+// by the keep arm at every level and every block it walks. the first version of
+// this sweep built its drop at block 0 alone and a keep forced at block 1 of
+// levels 13, 18, 20, 24 and 26 survived the whole package, which is why there
+// are three blocks here and not one. the task report states what is left as a
+// measured class rather than arguing it away.
 const filteredDropLevelCeiling = 26
 
 // the highest level a dropped node is the root of its own tree at.
@@ -5945,11 +5950,19 @@ func subtreeBlankShape(leaves LeafCount, headLevel uint32, headBlock uint64) *fu
 func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 	checked, dropped := int64(0), int64(0)
 	for level := uint32(1); level <= filteredDropLevelCeiling; level += 1 {
+		blocks := uint64(1) << (31 - level)
 		depthCases := []struct {
 			depth uint32
 			leaf  LeafIndex
 		}{
+			// the same drop at three blocks of the level, since a version
+			// gated on one block of one level is what the sweeps around this
+			// one cannot see. leaf 0 puts the node that has to come out at
+			// block 0, and the other two put it at block 1 and at a strided
+			// block.
 			{depth: 31, leaf: 0},
+			{depth: 31, leaf: LeafIndex(uint64(1) << level)},
+			{depth: 31, leaf: LeafIndex((uint64(resolutionLeafStride) % blocks) << level)},
 		}
 		if level <= filteredDropRootCeiling {
 			depthCases = append(depthCases, struct {
@@ -5998,8 +6011,8 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 		got   int64
 		want  int64
 	}{
-		{label: "levels a drop was observed at", got: checked, want: int64(filteredDropLevelCeiling + filteredDropRootCeiling)},
-		{label: "dropped nodes", got: dropped, want: int64(filteredDropLevelCeiling + filteredDropRootCeiling)},
+		{label: "drops observed", got: checked, want: int64(3*filteredDropLevelCeiling + filteredDropRootCeiling)},
+		{label: "dropped nodes", got: dropped, want: int64(3*filteredDropLevelCeiling + filteredDropRootCeiling)},
 	}
 	for _, c := range confirmedCases {
 		if c.got != c.want {
