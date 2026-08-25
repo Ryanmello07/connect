@@ -265,3 +265,69 @@ func (self *suiteCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, Signat
 	expanded := ed25519.NewKeyFromSeed(seed)
 	return SignaturePrivateKey(seed), SignaturePublicKey(bytes.Clone(expanded[ed25519.SeedSize:])), nil
 }
+
+// struct { opaque label<V>; opaque context<V> } EncryptContext, serialized, with the
+// "MLS 1.0 " prefix on the label.
+//
+// It builds the same bytes mlsSignContent would build for the same two fields, and it is
+// written out rather than delegating to it. RFC 9420 declares SignContent in section 5.1.2
+// and EncryptContext in section 5.1.3 as two structures which happen to have the same
+// shape; nothing binds them to stay that way, and an alias would make a revision to either
+// silently a revision to both.
+//
+// The two length prefixes carry the same argument they carry there. Without them a label
+// ending where the context begins and a label one byte longer serialize to the same run of
+// bytes, so a message sealed for one purpose opens as a message for another under a context
+// the sender never chose.
+//
+// No error return, by the interface spec A section 3.3 fixes on the two callers below. See
+// mlsLabelBytes for why the writer cannot fail here.
+func mlsEncryptContext(label string, context []byte) []byte {
+	writer := syntax.NewWriter()
+	writer.WriteOpaque([]byte(MlsLabelPrefix + label))
+	writer.WriteOpaque(context)
+	return mlsLabelBytes(writer)
+}
+
+// EncryptWithLabel, RFC 9420 section 5.1.3: the EncryptContext is the hpke info and the
+// aead aad is empty.
+//
+// Which of the two the context travels in is the whole of this function, and no round trip
+// can see it. MLS binds the context through the key schedule, so a construction that sealed
+// it into aad instead encrypts and decrypts against itself perfectly, matches the published
+// message in no corpus and talks to no peer alive. The published crypto-basics message is
+// what separates the two, and TestProviderHpkeSealUsesAnEmptyAadForLabelledEncryption walks
+// the other placement from a peer's side.
+//
+// The provider is a parameter rather than a receiver because the tree and the framing
+// layers hold the interface rather than the concrete type, which is the same reason RefHash
+// takes one. Reaching for a provider of its own here would agree with every corpus in this
+// package, since they are all the suite it would have hardcoded.
+//
+// The two results are the encapsulated key and the ciphertext, in that order, and both are
+// []byte, so a transposed return compiles. What separates them is Nenc against the
+// plaintext plus Nt, which the round trip test asserts rather than assumes.
+//
+// The flat pair rather than an *HpkeCiphertext: that shape belongs beside the TreeKEM type
+// it would return, and this package declares no TreeKEM types.
+func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, context []byte, plaintext []byte) ([]byte, []byte, error) {
+	return crypto.HpkeSeal(pub, mlsEncryptContext(label, context), nil, plaintext)
+}
+
+// DecryptWithLabel, the inverse, where a failure is always an error and never a plaintext
+// (spec A section 5.9, guardrail 7).
+//
+// There is no fallback info. An open that retried with no info, with the bare label or with
+// the unframed concatenation after this one would accept a message sealed for another
+// purpose, which is the whole thing the label exists to prevent — and it is invisible from
+// the sending side, because a receiver that retries still opens the message that was sealed
+// correctly. TestDecryptWithLabelRefusesCiphertextsSealedUnderAnyOtherContext walks it from
+// the side an attacker picks instead.
+//
+// The nil plaintext on the failure path is HpkeOpen's and is load bearing there for the
+// reason AeadOpen records: an authentic empty message also comes back as a nil slice, so a
+// caller reading the slice rather than the error accepts every forgery of exactly tag
+// length.
+func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, context []byte, kemOutput []byte, ciphertext []byte) ([]byte, error) {
+	return crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)
+}

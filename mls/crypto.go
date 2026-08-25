@@ -265,20 +265,41 @@ func (self *suiteCryptoProvider) Random(n int) []byte {
 
 // ExpandWithLabel, DeriveSecret and DeriveTreeSecret are task 12's, and SignWithLabel,
 // VerifyWithLabel and SignatureKeyPair are task 14's; all six live in crypto_labels.go,
-// beside the other RFC 9420 labelled constructions.
+// beside the other RFC 9420 labelled constructions. EncryptWithLabel and DecryptWithLabel
+// live there too, and reach hpke through the three methods below.
 //
-// Completed in tasks 15 and 16, and loud until then. A stub returning a zero value
-// would compile, satisfy the interface and be a silent wrong answer — nil, nil out of
-// HpkeOpen is an authentication bypass — so each of these refuses to be called instead.
-// TestProviderHasNoRemainingStubs asserts in task 16 that none survive the wave.
+// The RFC 9180 base mode single shot, as the interface's three hpke methods. Each is the
+// whole of its operation and none of them holds anything: hpke.go builds a context per
+// call for the reason recorded there, and a memoized context or a cached ephemeral key
+// here would put a second message on the first message's key at the first message's
+// sequence number.
+//
+// The seal's ephemeral key is drawn from self.random, which is the same source
+// SignatureKeyPair reads and for the same three reasons. NewCryptoProviderWithRandom
+// promises above that nothing in this package reads crypto/rand behind a caller's back, and
+// a seal that reached for rand.Reader would be that promise broken by the only other method
+// here which draws anything. A provider built over a caller's stream is what lets an
+// interop failure reproduce byte for byte, and an encapsulation is the one part of a
+// labelled encryption that is not a function of its inputs, so it is the part that has to
+// come from somewhere a caller can pin. And it is what makes EncryptWithLabel observable at
+// all: over a fixed stream two calls agree, so a construction that ignored the provider it
+// was handed answers differently, which is what the routing and immutability gates compare.
+//
+// Production is unchanged: NewCryptoProvider hands this crypto/rand.Reader.
 func (self *suiteCryptoProvider) HpkeSeal(pub HpkePublicKey, info []byte, aad []byte, plaintext []byte) ([]byte, []byte, error) {
-	panic("mls: HpkeSeal not implemented until task 15")
+	return HpkeSealBase(self.random, self.params, pub, info, aad, plaintext)
 }
 
+// The receiving half. There is no fallback: an open that retried under a different info
+// after this one accepts a message sealed for another purpose, and hpke's info is exactly
+// what the labelled constructions in crypto_labels.go bind their label and context through.
 func (self *suiteCryptoProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
-	panic("mls: HpkeOpen not implemented until task 15")
+	return HpkeOpenBase(self.params, priv, kemOutput, info, aad, ciphertext)
 }
 
+// DeriveKeyPair over the suite's kem, which is deterministic in its input keying material
+// and draws no randomness of its own — so a caller who wants a fresh key pair brings a
+// fresh ikm, from Random or from anywhere else it trusts.
 func (self *suiteCryptoProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
-	panic("mls: DeriveKeyPair not implemented until task 15")
+	return HpkeDeriveKeyPair(self.params, ikm)
 }

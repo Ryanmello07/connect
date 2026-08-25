@@ -1260,62 +1260,105 @@ func assertEveryProviderCallLeavesItsArgumentsAlone(t *testing.T, crypto CryptoP
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
+	hpkePriv, hpkePub, err := crypto.DeriveKeyPair(secret)
+	if err != nil {
+		t.Fatalf("derive the key pair the hpke rows are built over: %v", err)
+	}
+	info := []byte("the info the hpke rows carry")
+	sealedKemOutput, sealedCiphertext, err := crypto.HpkeSeal(hpkePub, info, aad, message)
+	if err != nil {
+		t.Fatalf("seal the message the HpkeOpen row reads: %v", err)
+	}
 	covered := []string{}
+	// the results are a list rather than one slice, because a method answering with two of
+	// them has two chances to hand back a window onto a caller array, and a row following
+	// only the first would not see the second
 	for _, testCase := range []struct {
 		name string
-		call func(take func(content []byte) []byte) []byte
+		call func(take func(content []byte) []byte) [][]byte
 	}{
-		{name: "Hash", call: func(take func([]byte) []byte) []byte { return crypto.Hash(take(message)) }},
-		{name: "Mac", call: func(take func([]byte) []byte) []byte { return crypto.Mac(take(secret), take(message)) }},
-		{name: "MacVerify", call: func(take func([]byte) []byte) []byte {
+		{name: "Hash", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.Hash(take(message))}
+		}},
+		{name: "Mac", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.Mac(take(secret), take(message))}
+		}},
+		{name: "MacVerify", call: func(take func([]byte) []byte) [][]byte {
 			if !crypto.MacVerify(take(secret), take(message), take(tag)) {
 				t.Errorf("MacVerify refused a tag it had just produced, so this ran the refusal path")
 			}
 			return nil
 		}},
-		{name: "Extract", call: func(take func([]byte) []byte) []byte { return crypto.Extract(take(secret), take(message)) }},
-		{name: "Expand", call: func(take func([]byte) []byte) []byte { return crypto.Expand(take(secret), take(message), 48) }},
-		{name: "ExpandWithLabel", call: func(take func([]byte) []byte) []byte {
-			return crypto.ExpandWithLabel(take(secret), "label", take(message), 48)
+		{name: "Extract", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.Extract(take(secret), take(message))}
 		}},
-		{name: "DeriveSecret", call: func(take func([]byte) []byte) []byte {
-			return crypto.DeriveSecret(take(secret), "label")
+		{name: "Expand", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.Expand(take(secret), take(message), 48)}
 		}},
-		{name: "DeriveTreeSecret", call: func(take func([]byte) []byte) []byte {
-			return crypto.DeriveTreeSecret(take(secret), "label", 7, 48)
+		{name: "ExpandWithLabel", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.ExpandWithLabel(take(secret), "label", take(message), 48)}
 		}},
-		{name: "AeadSeal", call: func(take func([]byte) []byte) []byte {
+		{name: "DeriveSecret", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.DeriveSecret(take(secret), "label")}
+		}},
+		{name: "DeriveTreeSecret", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{crypto.DeriveTreeSecret(take(secret), "label", 7, 48)}
+		}},
+		{name: "AeadSeal", call: func(take func([]byte) []byte) [][]byte {
 			ciphertext, err := crypto.AeadSeal(take(key), take(nonce), take(aad), take(message))
 			if err != nil {
 				t.Fatalf("seal: %v", err)
 			}
-			return ciphertext
+			return [][]byte{ciphertext}
 		}},
-		{name: "AeadOpen", call: func(take func([]byte) []byte) []byte {
+		{name: "AeadOpen", call: func(take func([]byte) []byte) [][]byte {
 			plaintext, err := crypto.AeadOpen(take(key), take(nonce), take(aad), take(sealed))
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
-			return plaintext
+			return [][]byte{plaintext}
 		}},
-		{name: "SignWithLabel", call: func(take func([]byte) []byte) []byte {
+		{name: "SignWithLabel", call: func(take func([]byte) []byte) [][]byte {
 			produced, err := crypto.SignWithLabel(SignaturePrivateKey(take(signaturePriv)), "label", take(message))
 			if err != nil {
 				t.Fatalf("sign: %v", err)
 			}
-			return produced
+			return [][]byte{produced}
 		}},
-		{name: "VerifyWithLabel", call: func(take func([]byte) []byte) []byte {
+		{name: "VerifyWithLabel", call: func(take func([]byte) []byte) [][]byte {
 			if err := crypto.VerifyWithLabel(SignaturePublicKey(take(signaturePub)), "label",
 				take(message), take(signature)); err != nil {
 				t.Errorf("VerifyWithLabel refused a signature it had just made, so this ran the refusal path")
 			}
 			return nil
 		}},
+		{name: "DeriveKeyPair", call: func(take func([]byte) []byte) [][]byte {
+			priv, pub, err := crypto.DeriveKeyPair(take(secret))
+			if err != nil {
+				t.Fatalf("DeriveKeyPair: %v", err)
+			}
+			return [][]byte{priv, pub}
+		}},
+		{name: "HpkeSeal", call: func(take func([]byte) []byte) [][]byte {
+			kemOutput, ciphertext, err := crypto.HpkeSeal(HpkePublicKey(take(hpkePub)),
+				take(info), take(aad), take(message))
+			if err != nil {
+				t.Fatalf("HpkeSeal: %v", err)
+			}
+			return [][]byte{kemOutput, ciphertext}
+		}},
+		{name: "HpkeOpen", call: func(take func([]byte) []byte) [][]byte {
+			plaintext, err := crypto.HpkeOpen(HpkePrivateKey(take(hpkePriv)), take(sealedKemOutput),
+				take(info), take(aad), take(sealedCiphertext))
+			if err != nil {
+				t.Fatalf("HpkeOpen: %v", err)
+			}
+			return [][]byte{plaintext}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
-		result := testCase.call(recorder.take)
+		results := testCase.call(recorder.take)
 		if len(recorder.arrays) == 0 {
 			t.Errorf("%s was handed nothing, so this row observed nothing", testCase.name)
 			continue
@@ -1324,8 +1367,10 @@ func assertEveryProviderCallLeavesItsArgumentsAlone(t *testing.T, crypto CryptoP
 			t.Errorf("%s changed the storage behind arguments %v of the %d it was handed",
 				testCase.name, changed, len(recorder.arrays))
 		}
-		if recorder.aliases(result) {
-			t.Errorf("%s returned a slice over one of its arguments", testCase.name)
+		for i, result := range results {
+			if recorder.aliases(result) {
+				t.Errorf("%s returned result %d over one of its arguments", testCase.name, i)
+			}
 		}
 	}
 	assertCoversTheProviderSurface(t, "the argument immutability table", covered, map[string]string{
@@ -1718,15 +1763,17 @@ func providerMethodNames() []string {
 // at; TestProviderSizes is what holds them.
 var providerValueMethods = []string{"HashSize", "KeySize", "NonceSize", "Suite"}
 
-// The methods tasks 15 and 16 still owe, which refuse to be called rather than answering.
+// The methods that refuse to be called rather than answering, which since task 15 is none
+// of them.
 //
-// TestProviderStubsRefuseToBeCalled holds the refusal and reads this same list, so the
-// two cannot drift. Implementing one means taking it off here, and taking it off here is
-// what makes the invariants below demand it: a method that starts answering and is not
-// added to their tables fails the coverage gate instead of going unexamined.
-var providerStubMethods = []string{
-	"DeriveKeyPair", "HpkeOpen", "HpkeSeal",
-}
+// The list stays, empty, because it is what assertCoversTheProviderSurface reads to decide
+// what a whole provider invariant may skip. A later task that adds a method it cannot
+// implement in the same commit writes the name here on purpose, and taking it off again is
+// what makes every invariant below demand a row for it — so a method cannot become live and
+// uncovered in the same commit. The refusal itself no longer has a subject: task 15
+// implemented the last three, and the table that held them to panicking would now be a loop
+// over nothing.
+var providerStubMethods = []string{}
 
 // One whole provider invariant's table, checked against the interface it is meant to
 // cover. What is excused is named with its reason rather than left out, so a method that
@@ -1868,8 +1915,11 @@ func missingFrom(want []string, got []string) []string {
 // the end says so: a later task that adds a method and not a row here fails rather than
 // leaving the new one uncovered.
 func TestProviderResultsAreFreshBuffers(t *testing.T) {
+	// the script is repeated far past what the rows below consume. every draw here comes
+	// out of it, and a reader that ran dry mid table would fail as a short read rather
+	// than as the shared storage this test is about
 	crypto := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519,
-		bytes.NewReader(bytes.Repeat(randomScript(t), 4)))
+		bytes.NewReader(bytes.Repeat(randomScript(t), 16)))
 	prk := crypto.Extract([]byte("salt"), []byte("ikm"))
 	key := bytes.Repeat([]byte{0x33}, crypto.KeySize())
 	nonce := bytes.Repeat([]byte{0x44}, crypto.NonceSize())
@@ -1881,6 +1931,14 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 	signaturePriv, _, err := crypto.SignatureKeyPair()
 	if err != nil {
 		t.Fatalf("generate the key pair the signature row is built over: %v", err)
+	}
+	hpkePriv, hpkePub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x55}, 32))
+	if err != nil {
+		t.Fatalf("derive the key pair the hpke rows are built over: %v", err)
+	}
+	sealedKemOutput, sealedCiphertext, err := crypto.HpkeSeal(hpkePub, []byte("info"), aad, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal the message the HpkeOpen row reads: %v", err)
 	}
 	covered := []string{}
 	for _, testCase := range []struct {
@@ -1925,6 +1983,27 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 			return priv
 		}},
 		{name: "Random", call: func() []byte { return crypto.Random(32) }},
+		{name: "DeriveKeyPair", call: func() []byte {
+			priv, _, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x55}, 32))
+			if err != nil {
+				t.Fatalf("DeriveKeyPair: %v", err)
+			}
+			return priv
+		}},
+		{name: "HpkeSeal", call: func() []byte {
+			_, ciphertext, err := crypto.HpkeSeal(hpkePub, []byte("info"), aad, []byte("plaintext"))
+			if err != nil {
+				t.Fatalf("HpkeSeal: %v", err)
+			}
+			return ciphertext
+		}},
+		{name: "HpkeOpen", call: func() []byte {
+			plaintext, err := crypto.HpkeOpen(hpkePriv, sealedKemOutput, []byte("info"), aad, sealedCiphertext)
+			if err != nil {
+				t.Fatalf("HpkeOpen: %v", err)
+			}
+			return plaintext
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		first, second := testCase.call(), testCase.call()
@@ -1965,6 +2044,40 @@ func TestProviderResultsAreFreshBuffers(t *testing.T) {
 	}
 	if &firstPub[0] == &firstPriv[0] || &secondPub[0] == &secondPriv[0] {
 		t.Errorf("a key pair answered with a public key cut from its own private key")
+	}
+	// the two rows above follow one slice each for the same reason, so the halves they
+	// cannot follow are checked here: a derived public key cut from its own private key,
+	// and an encapsulated key answered out of storage the next seal writes over
+	firstDerivedPriv, firstDerivedPub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x55}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	secondDerivedPriv, secondDerivedPub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x55}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair a second time: %v", err)
+	}
+	if len(firstDerivedPub) == 0 || len(secondDerivedPub) == 0 {
+		t.Fatalf("DeriveKeyPair answered with no public key, so this shares nothing either")
+	}
+	if &firstDerivedPub[0] == &secondDerivedPub[0] || &firstDerivedPriv[0] == &secondDerivedPriv[0] {
+		t.Errorf("two derived key pairs answered out of the same storage")
+	}
+	if &firstDerivedPub[0] == &firstDerivedPriv[0] {
+		t.Errorf("a derived key pair answered with a public key cut from its own private key")
+	}
+	firstSealKemOutput, _, err := crypto.HpkeSeal(hpkePub, []byte("info"), aad, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("HpkeSeal: %v", err)
+	}
+	secondSealKemOutput, _, err := crypto.HpkeSeal(hpkePub, []byte("info"), aad, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("HpkeSeal a second time: %v", err)
+	}
+	if len(firstSealKemOutput) == 0 || len(secondSealKemOutput) == 0 {
+		t.Fatalf("HpkeSeal answered with no encapsulated key, so this shares nothing either")
+	}
+	if &firstSealKemOutput[0] == &secondSealKemOutput[0] {
+		t.Errorf("two seals answered out of the same encapsulated key storage")
 	}
 	assertCoversTheProviderSurface(t, "the fresh buffer table", covered, map[string]string{
 		"MacVerify":       "answers with a bool, so there is no storage for it to share",
@@ -2013,6 +2126,14 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
+	hpkePriv, hpkePub, err := crypto.DeriveKeyPair(secret)
+	if err != nil {
+		t.Fatalf("derive the key pair the hpke rows are built over: %v", err)
+	}
+	sealedKemOutput, sealedCiphertext, err := crypto.HpkeSeal(hpkePub, []byte("info"), nil, message)
+	if err != nil {
+		t.Fatalf("seal the message the HpkeOpen row reads: %v", err)
+	}
 	operations := []struct {
 		name string
 		call func() []byte
@@ -2059,6 +2180,20 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 			}
 			return []byte{0x00}
 		}},
+		{name: "DeriveKeyPair", call: func() []byte {
+			priv, pub, err := crypto.DeriveKeyPair(secret)
+			if err != nil {
+				return nil
+			}
+			return concatBytes(priv, pub)
+		}},
+		{name: "HpkeOpen", call: func() []byte {
+			plaintext, err := crypto.HpkeOpen(hpkePriv, sealedKemOutput, []byte("info"), nil, sealedCiphertext)
+			if err != nil {
+				return nil
+			}
+			return plaintext
+		}},
 	}
 	covered := []string{}
 	want := make([][]byte, len(operations))
@@ -2069,7 +2204,7 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 			t.Fatalf("%s answered with nothing before any goroutine started", operation.name)
 		}
 	}
-	assertCoversTheProviderSurface(t, "the concurrency table", append(covered, "Random", "SignatureKeyPair"), nil)
+	assertCoversTheProviderSurface(t, "the concurrency table", append(covered, "Random", "SignatureKeyPair", "HpkeSeal"), nil)
 
 	var waitGroup sync.WaitGroup
 	for i := 0; i < 32; i++ {
@@ -2084,49 +2219,20 @@ func TestProviderIsSafeForConcurrentUse(t *testing.T) {
 					}
 				}
 				crypto.Random(32)
-				// the two draws from the provider's reader, which answer differently
+				// the three draws from the provider reader, which answer differently
 				// every time and so are exercised rather than compared
 				if _, _, err := crypto.SignatureKeyPair(); err != nil {
 					t.Errorf("SignatureKeyPair failed under concurrency: %v", err)
+					return
+				}
+				if _, _, err := crypto.HpkeSeal(hpkePub, []byte("info"), nil, message); err != nil {
+					t.Errorf("HpkeSeal failed under concurrency: %v", err)
 					return
 				}
 			}
 		}()
 	}
 	waitGroup.Wait()
-}
-
-// The methods tasks 15 and 16 complete must refuse to be called until they are, rather
-// than returning a zero value. A stub returning nil, nil from HpkeOpen would compile,
-// satisfy the interface, and be a total authentication bypass for anyone calling it in
-// the meantime. This is the counterpart of TestProviderHasNoRemainingStubs in task 16:
-// that one asserts the list is empty at the end of the wave, this one asserts that what
-// is still on the list is loud.
-//
-// The table is checked against providerStubMethods, which the whole provider invariants
-// read to decide what they are allowed to skip. Implementing one of these means taking it
-// off that list, and taking it off that list is what makes those invariants demand a row
-// for it — so a method cannot become live and uncovered in the same commit.
-func TestProviderStubsRefuseToBeCalled(t *testing.T) {
-	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
-	refused := []string{}
-	for _, testCase := range []struct {
-		name string
-		call func()
-	}{
-		{name: "HpkeSeal", call: func() { crypto.HpkeSeal(nil, nil, nil, nil) }},
-		{name: "HpkeOpen", call: func() { crypto.HpkeOpen(nil, nil, nil, nil, nil) }},
-		{name: "DeriveKeyPair", call: func() { crypto.DeriveKeyPair(nil) }},
-	} {
-		refused = append(refused, testCase.name)
-		if recovered := recoveredPanic(testCase.call); recovered == nil {
-			t.Errorf("%s returned instead of refusing; an unimplemented method must not answer", testCase.name)
-		}
-	}
-	slices.Sort(refused)
-	if !slices.Equal(refused, providerStubMethods) {
-		t.Errorf("this table refuses %v, while the invariants skip %v", refused, providerStubMethods)
-	}
 }
 
 // A provider that answers what the real one answers with every byte flipped, and records
@@ -2264,19 +2370,36 @@ func (self *taggingCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label
 	return self.inner.VerifyWithLabel(pub, label, content, sig)
 }
 
+// Both results are flipped, for the reason SignatureKeyPair's are: a construction reading
+// either one of them answers differently over this provider. The encapsulated key is
+// flipped as well as the ciphertext because EncryptWithLabel returns both and a gate
+// following only one of them would not see a construction that used the other.
 func (self *taggingCryptoProvider) HpkeSeal(pub HpkePublicKey, info []byte, aad []byte, plaintext []byte) ([]byte, []byte, error) {
-	self.passedThrough("HpkeSeal")
-	return self.inner.HpkeSeal(pub, info, aad, plaintext)
+	kemOutput, ciphertext, err := self.inner.HpkeSeal(pub, info, aad, plaintext)
+	if err != nil {
+		self.passedThrough("HpkeSeal")
+		return nil, nil, err
+	}
+	return self.tagged("HpkeSeal", kemOutput), self.tagged("HpkeSeal", ciphertext), nil
 }
 
 func (self *taggingCryptoProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
-	self.passedThrough("HpkeOpen")
-	return self.inner.HpkeOpen(priv, kemOutput, info, aad, ciphertext)
+	plaintext, err := self.inner.HpkeOpen(priv, kemOutput, info, aad, ciphertext)
+	if err != nil {
+		self.passedThrough("HpkeOpen")
+		return nil, err
+	}
+	return self.tagged("HpkeOpen", plaintext), nil
 }
 
 func (self *taggingCryptoProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
-	self.passedThrough("DeriveKeyPair")
-	return self.inner.DeriveKeyPair(ikm)
+	priv, pub, err := self.inner.DeriveKeyPair(ikm)
+	if err != nil {
+		self.passedThrough("DeriveKeyPair")
+		return nil, nil, err
+	}
+	return HpkePrivateKey(self.tagged("DeriveKeyPair", priv)),
+		HpkePublicKey(self.tagged("DeriveKeyPair", pub)), nil
 }
 
 // Both halves are flipped, so a construction reading either one of them answers
@@ -2330,6 +2453,17 @@ func TestTheTaggingProviderAnswersDifferentlyThanTheRealOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate the key the SignWithLabel row is built over: %v", err)
 	}
+	hpkePriv, hpkePub, err := plain.DeriveKeyPair(secret)
+	if err != nil {
+		t.Fatalf("derive the key pair the hpke rows are built over: %v", err)
+	}
+	// the provider underneath draws from a constant reader, so the seal below is the same
+	// encapsulation every time and the HpkeSeal row compares a tag rather than two
+	// unrelated ephemeral keys
+	sealedKemOutput, sealedCiphertext, err := plain.HpkeSeal(hpkePub, []byte("info"), []byte("aad"), []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("seal the message the HpkeOpen row reads: %v", err)
+	}
 	tagged := []string{}
 	for _, testCase := range []struct {
 		name string
@@ -2375,6 +2509,27 @@ func TestTheTaggingProviderAnswersDifferentlyThanTheRealOne(t *testing.T) {
 			return concatBytes(priv, pub)
 		}},
 		{name: "Random", call: func(crypto CryptoProvider) []byte { return crypto.Random(32) }},
+		{name: "DeriveKeyPair", call: func(crypto CryptoProvider) []byte {
+			priv, pub, deriveErr := crypto.DeriveKeyPair(secret)
+			if deriveErr != nil {
+				t.Fatalf("DeriveKeyPair: %v", deriveErr)
+			}
+			return concatBytes(priv, pub)
+		}},
+		{name: "HpkeSeal", call: func(crypto CryptoProvider) []byte {
+			kemOutput, ciphertext, sealErr := crypto.HpkeSeal(hpkePub, []byte("info"), []byte("aad"), []byte("plaintext"))
+			if sealErr != nil {
+				t.Fatalf("HpkeSeal: %v", sealErr)
+			}
+			return concatBytes(kemOutput, ciphertext)
+		}},
+		{name: "HpkeOpen", call: func(crypto CryptoProvider) []byte {
+			plaintext, openErr := crypto.HpkeOpen(hpkePriv, sealedKemOutput, []byte("info"), []byte("aad"), sealedCiphertext)
+			if openErr != nil {
+				t.Fatalf("HpkeOpen: %v", openErr)
+			}
+			return plaintext
+		}},
 	} {
 		tagged = append(tagged, testCase.name)
 		answer := testCase.call(plain)
@@ -2659,6 +2814,16 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		t.Fatalf("seal the ciphertext the open rows read: %v", err)
 	}
 	key := bytes.Repeat([]byte{0x44}, params.Nk)
+	// a second provider over a constant reader, for the one construction here that
+	// encapsulates. EncryptWithLabel draws its ephemeral key through the provider it is
+	// handed, so over a fixed stream it answers the same twice and the determinism half of
+	// this gate can see it; over the process entropy source it would answer differently
+	// every call and the row would be a comparison of two unrelated messages.
+	deterministic := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, constantReader{value: 0x55})
+	labelledKemOutput, labelledCiphertext, err := EncryptWithLabel(deterministic, pub, "UpdatePathNode", value, plaintext)
+	if err != nil {
+		t.Fatalf("seal the message the DecryptWithLabel row reads: %v", err)
+	}
 	covered := []string{}
 	for _, testCase := range []struct {
 		name string
@@ -2669,6 +2834,25 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		}},
 		{name: "mlsSignContent", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{mlsSignContent("label", take(value))}
+		}},
+		{name: "mlsEncryptContext", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{mlsEncryptContext("label", take(value))}
+		}},
+		{name: "EncryptWithLabel", call: func(take func([]byte) []byte) [][]byte {
+			kemOutput, ciphertext, encryptErr := EncryptWithLabel(deterministic,
+				HpkePublicKey(take(pub)), "UpdatePathNode", take(value), take(plaintext))
+			if encryptErr != nil {
+				t.Fatalf("EncryptWithLabel: %v", encryptErr)
+			}
+			return [][]byte{kemOutput, ciphertext}
+		}},
+		{name: "DecryptWithLabel", call: func(take func([]byte) []byte) [][]byte {
+			opened, decryptErr := DecryptWithLabel(crypto, HpkePrivateKey(take(priv)), "UpdatePathNode",
+				take(value), take(labelledKemOutput), take(labelledCiphertext))
+			if decryptErr != nil {
+				t.Fatalf("DecryptWithLabel: %v", decryptErr)
+			}
+			return [][]byte{opened}
 		}},
 		{name: "RefHash", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{RefHash(crypto, "MLS 1.0 a label", take(value))}
@@ -2920,5 +3104,72 @@ func TestTheArgumentRecorderSeesTheSmallestWrite(t *testing.T) {
 	}
 	if aliasing.aliases(bytes.Repeat([]byte{0x11}, 8)) {
 		t.Errorf("the recorder read a fresh array holding the same bytes as one of its arguments")
+	}
+}
+
+// The seal draws its ephemeral key from the provider reader and from nothing else.
+//
+// A seal that reached for crypto/rand behind the caller back seals correctly, opens
+// correctly, matches every published message and round trips forever: an ephemeral x25519
+// key is an ephemeral x25519 key, and no ciphertext says which stream produced it. So
+// nothing in this package can see the difference by comparing answers, and two of its
+// enumeration gates quietly stop being able to see anything at all, because a construction
+// whose answer differs on every call over one provider is a row that separates nothing.
+//
+// What says otherwise is the stream. Two providers over one script must agree, the
+// encapsulated key must be the public key of the script own first Nsk bytes, and the next
+// draw must come from where the seal left off — a seal over the process source fails all
+// three, and a seal that consumed the wrong number of bytes fails the third.
+//
+// This is the property NewCryptoProviderWithRandom exists for, and the reason
+// SignatureKeyPair reads self.random rather than calling ed25519.GenerateKey.
+func TestProviderHpkeSealDrawsFromItsOwnReader(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite: %v", err)
+	}
+	script := bytes.Repeat(randomScript(t), 4)
+	first := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, bytes.NewReader(script))
+	second := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, bytes.NewReader(script))
+	_, pub, err := first.DeriveKeyPair(bytes.Repeat([]byte{0x23}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	firstKemOutput, firstCiphertext, err := first.HpkeSeal(pub, []byte("info"), nil, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("HpkeSeal: %v", err)
+	}
+	secondKemOutput, secondCiphertext, err := second.HpkeSeal(pub, []byte("info"), nil, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("HpkeSeal over the second provider: %v", err)
+	}
+	if !bytes.Equal(firstKemOutput, secondKemOutput) || !bytes.Equal(firstCiphertext, secondCiphertext) {
+		t.Fatalf("two providers over one script sealed %x/%x and %x/%x",
+			firstKemOutput, firstCiphertext, secondKemOutput, secondCiphertext)
+	}
+	// and the encapsulated key is the public key of the bytes the script opens with, so a
+	// seal drawing the right count of bytes from the wrong place fails here as well
+	ephemeral, err := X25519PrivateKey(script[:params.Nsk])
+	if err != nil {
+		t.Fatalf("read the ephemeral key the script opens with: %v", err)
+	}
+	if want := ephemeral.PublicKey().Bytes(); !bytes.Equal(firstKemOutput, want) {
+		t.Errorf("the seal encapsulated %x, and the script first %d bytes are the private key of %x",
+			firstKemOutput, params.Nsk, want)
+	}
+	// and the stream is left where the seal stopped rather than where it started, which is
+	// what says the bytes were consumed rather than peeked at
+	if drawn := first.Random(32); !bytes.Equal(drawn, script[params.Nsk:params.Nsk+32]) {
+		t.Errorf("the draw after a seal read %x, and the script continues %x",
+			drawn, script[params.Nsk:params.Nsk+32])
+	}
+	// and a second seal over the same provider is a second encapsulation, so nothing here
+	// is satisfied by a seal that answers one fixed message
+	nextKemOutput, _, err := first.HpkeSeal(pub, []byte("info"), nil, []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("HpkeSeal a second time: %v", err)
+	}
+	if bytes.Equal(firstKemOutput, nextKemOutput) {
+		t.Errorf("two seals over one provider encapsulated the same key %x", nextKemOutput)
 	}
 }

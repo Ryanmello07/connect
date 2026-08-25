@@ -75,9 +75,8 @@ import (
 	"github.com/urnetwork/connect/mls/syntax"
 )
 
-// One crypto-basics entry, reduced to the five constructions this file owns. The
-// remaining field of the published object, encrypt_with_label, belongs to task 15 and is
-// not read here.
+// One crypto-basics entry, reduced to the six constructions this file owns, which is now
+// every field the published object carries.
 type labelKatBasics struct {
 	CipherSuite      uint16                   `json:"cipher_suite"`
 	ExpandWithLabel  labelKatExpandWithLabel  `json:"expand_with_label"`
@@ -85,6 +84,26 @@ type labelKatBasics struct {
 	DeriveTreeSecret labelKatDeriveTreeSecret `json:"derive_tree_secret"`
 	RefHash          labelKatRefHash          `json:"ref_hash"`
 	SignWithLabel    labelKatSignWithLabel    `json:"sign_with_label"`
+	EncryptWithLabel labelKatEncryptWithLabel `json:"encrypt_with_label"`
+}
+
+// An EncryptWithLabel known answer: the recipient's key pair, the label and context the
+// message was sealed under, and the message itself.
+//
+// It is a known answer in the opening direction only. Sealing draws a fresh ephemeral key,
+// so no published ciphertext can be reproduced by running EncryptWithLabel, and what this
+// entry pins is that DecryptWithLabel rebuilds the EncryptContext the publisher sealed
+// under. That makes it the only thing in this file which can see whether the context
+// travels in the hpke info or in the aead's aad: both round trip against themselves, and
+// only one of them opens this message.
+type labelKatEncryptWithLabel struct {
+	Label      string `json:"label"`
+	Context    string `json:"context"`
+	Priv       string `json:"priv"`
+	Pub        string `json:"pub"`
+	KemOutput  string `json:"kem_output"`
+	Ciphertext string `json:"ciphertext"`
+	Plaintext  string `json:"plaintext"`
 }
 
 // An ExpandWithLabel known answer: every argument, and the bytes it must produce.
@@ -459,6 +478,18 @@ func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 			room: syntax.MaxVectorLength - len(MlsLabelPrefix),
 			call: func(n int) { mlsSignContent(strings.Repeat("x", n), nil) },
 		},
+		{
+			name: "the encrypt context's context field",
+			room: syntax.MaxVectorLength,
+			call: func(n int) { mlsEncryptContext("label", make([]byte, n)) },
+		},
+		{
+			// and the same prefix again, so the encrypt context's label boundary sits
+			// where the kdf label's and the sign content's do
+			name: "the encrypt context's label field",
+			room: syntax.MaxVectorLength - len(MlsLabelPrefix),
+			call: func(n int) { mlsEncryptContext(strings.Repeat("x", n), nil) },
+		},
 	} {
 		if recovered := recoveredPanic(func() { testCase.call(testCase.room) }); recovered != nil {
 			t.Errorf("a labelled construction refused %s at the limit: %v", testCase.name, recovered)
@@ -494,6 +525,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		}
 	}
 	want := []string{
+		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
@@ -1172,8 +1204,20 @@ var labelConstructionsOverAnyProvider = map[string]string{}
 // signature, and they fail here until somebody writes them a row, whichever file they land
 // in.
 func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
-	plain := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	// the provider underneath draws from a constant reader, because EncryptWithLabel
+	// encapsulates to a fresh ephemeral key and would otherwise answer differently on
+	// every call whatever provider it was handed — which is a row that separates nothing
+	// while looking like the loudest one here
+	plain := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, constantReader{value: 0x35})
 	value := bytes.Repeat([]byte{0x21}, 96)
+	priv, pub, err := plain.DeriveKeyPair(bytes.Repeat([]byte{0x22}, 32))
+	if err != nil {
+		t.Fatalf("derive the key pair the labelled encryption rows are built over: %v", err)
+	}
+	sealedKemOutput, sealedCiphertext, err := EncryptWithLabel(plain, pub, "UpdatePathNode", value, []byte("secret"))
+	if err != nil {
+		t.Fatalf("seal the message the DecryptWithLabel row reads: %v", err)
+	}
 	covered := []string{}
 	for _, testCase := range []struct {
 		name string
@@ -1187,6 +1231,21 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 		}},
 		{name: "MakeProposalRef", call: func(crypto CryptoProvider) []byte {
 			return MakeProposalRef(crypto, value)
+		}},
+		{name: "EncryptWithLabel", call: func(crypto CryptoProvider) []byte {
+			_, ciphertext, encryptErr := EncryptWithLabel(crypto, pub, "UpdatePathNode", value, []byte("secret"))
+			if encryptErr != nil {
+				t.Fatalf("EncryptWithLabel: %v", encryptErr)
+			}
+			return ciphertext
+		}},
+		{name: "DecryptWithLabel", call: func(crypto CryptoProvider) []byte {
+			plaintext, decryptErr := DecryptWithLabel(crypto, priv, "UpdatePathNode", value,
+				sealedKemOutput, sealedCiphertext)
+			if decryptErr != nil {
+				t.Fatalf("DecryptWithLabel: %v", decryptErr)
+			}
+			return plaintext
 		}},
 	} {
 		covered = append(covered, testCase.name)
@@ -1749,6 +1808,10 @@ func TestVerifyWithLabelRefusesEveryAlteration(t *testing.T) {
 // times the whole byte alphabet and every member costs a signature and a verification, so
 // they run where the fields are short and one real label, while the generators that cost
 // nothing run everywhere.
+//
+// The second field is the content of a SignContent and the context of an EncryptContext.
+// The two structures have the same shape, so one table of pairs describes both classes and
+// the encoder is what says which is being generated.
 type signatureProbePair struct {
 	name     string
 	label    string
@@ -1943,7 +2006,7 @@ const (
 // The three generators above are each complete over the shapes they describe and silent
 // about every other. This samples outside them: a fallback two edits away in each field, or
 // one that combines a rewrite with an insertion, is reached here or not at all.
-func walkedPairs(random *labelProbeRand, pair signatureProbePair) [][]byte {
+func walkedPairs(random *labelProbeRand, pair signatureProbePair, encode func(string, []byte) []byte) [][]byte {
 	preimages := [][]byte{}
 	for step := 0; step < labelProbeWalkSteps; step++ {
 		otherLabel := []byte(pair.label)
@@ -1955,22 +2018,29 @@ func walkedPairs(random *labelProbeRand, pair signatureProbePair) [][]byte {
 				otherContent = random.edit(otherContent)
 			}
 		}
-		preimages = append(preimages, mlsSignContent(string(otherLabel), otherContent))
+		preimages = append(preimages, encode(string(otherLabel), otherContent))
 	}
 	return preimages
 }
 
-// Every preimage the class holds for one demanded pair.
-func alternativePreimages(random *labelProbeRand, pair signatureProbePair) [][]byte {
+// Every preimage the class holds for one demanded pair, under one of the two labelled
+// encodings.
+//
+// The encoder is a parameter because RFC 9420 gives section 5.1.2's SignContent and
+// section 5.1.3's EncryptContext the same two field shape over two different second
+// fields, so the same repertoire of edits describes the class for both. Passing it rather
+// than naming one is what lets the encryption class be generated instead of listed, which
+// is the whole lesson of the seven named labels this replaced.
+func alternativePreimages(random *labelProbeRand, pair signatureProbePair, encode func(string, []byte) []byte) [][]byte {
 	label := []byte(pair.label)
-	demanded := mlsSignContent(pair.label, pair.content)
+	demanded := encode(pair.label, pair.content)
 	preimages := [][]byte{}
 	if pair.sweep {
 		for _, edited := range singleByteEdits(label) {
-			preimages = append(preimages, mlsSignContent(string(edited), pair.content))
+			preimages = append(preimages, encode(string(edited), pair.content))
 		}
 		for _, edited := range singleByteEdits(pair.content) {
-			preimages = append(preimages, mlsSignContent(pair.label, edited))
+			preimages = append(preimages, encode(pair.label, edited))
 		}
 	}
 	if pair.rawSweep {
@@ -1980,12 +2050,12 @@ func alternativePreimages(random *labelProbeRand, pair signatureProbePair) [][]b
 	}
 	for _, otherLabel := range fieldRewrites(label) {
 		for _, otherContent := range fieldRewrites(pair.content) {
-			preimages = append(preimages, mlsSignContent(string(otherLabel), otherContent))
+			preimages = append(preimages, encode(string(otherLabel), otherContent))
 		}
 	}
 	preimages = append(preimages, fieldRewrites(demanded)...)
 	preimages = append(preimages, fieldArrangements(pair.label, pair.content)...)
-	preimages = append(preimages, walkedPairs(random, pair)...)
+	preimages = append(preimages, walkedPairs(random, pair, encode)...)
 	return preimages
 }
 
@@ -2078,7 +2148,7 @@ func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 			t.Fatalf("%s: the signature over the demanded preimage was refused: %v", pair.name, err)
 		}
 		tried := map[string]bool{string(pairDemanded): true}
-		generated := alternativePreimages(random, pair)
+		generated := alternativePreimages(random, pair, mlsSignContent)
 		if len(generated) == 0 {
 			t.Fatalf("%s: the generators built nothing, so this pair observed nothing", pair.name)
 		}
@@ -2459,5 +2529,826 @@ func TestTheSignatureMethodsAreOnlyTheirOwnPreimage(t *testing.T) {
 	if declared := declaring.methodsOn(providerReceiver); !slices.Equal(declared, labelProviderMethods) {
 		t.Errorf("the file declaring VerifyWithLabel declares %v, and this gate knows of %v",
 			declared, labelProviderMethods)
+	}
+}
+
+// struct { opaque label<V>; opaque context<V> } EncryptContext, assembled without syntax.
+//
+// It builds the same bytes as referenceSignContent, and that is a fact about RFC 9420
+// rather than a shortcut taken here: section 5.1.2's SignContent and section 5.1.3's
+// EncryptContext are two structs of the same shape over two different second fields. The
+// coincidence is exactly why this is written out a second time instead of calling that
+// one. A reference that delegated could not tell an EncryptContext encoder which had
+// become an alias of the SignContent one from an encoder that agreed with it, and the two
+// are separate structures which a later revision of either may move apart.
+func referenceEncryptContext(label string, context []byte) []byte {
+	prefixed := []byte(MlsLabelPrefix + label)
+	return concatBytes(referenceVarint(len(prefixed)), prefixed, referenceVarint(len(context)), context)
+}
+
+// What the two sweeps below compare, counted for the same reason as every other total in
+// this file: a loop that stopped iterating reports exactly what a complete one reports.
+// The spaces are the two the SignContent sweeps cover, because the field shapes and the
+// varint boundary they cross are the same.
+const (
+	encryptContextLengthSweepComparisons = 61 * 71
+	encryptContextByteSweepComparisons   = 9 * 5 * 256
+)
+
+// mlsEncryptContext agrees with an independently written encoder over a swept space
+// rather than at the handful of shapes anybody wrote down.
+//
+// The two sweeps are the ones TestSignContentMatchesAnIndependentEncoder runs and for the
+// same two reasons. The first varies both lengths, which separates a hand rolled single
+// octet prefix from the varint at 64 and an omitted field from an empty one at 0. The
+// second varies the leading byte at short lengths, because a defect can be keyed on what
+// a label says rather than on how long it is, and every label in every corpus vendored
+// here begins with a capital letter.
+func TestEncryptContextMatchesAnIndependentEncoder(t *testing.T) {
+	compared := 0
+	for labelLength := 0; labelLength <= 60; labelLength++ {
+		label := string(sweptBytes(0x40, labelLength))
+		for contextLength := 0; contextLength <= 70; contextLength++ {
+			compared++
+			context := sweptBytes(0x80, contextLength)
+			got := mlsEncryptContext(label, context)
+			if want := referenceEncryptContext(label, context); !bytes.Equal(got, want) {
+				t.Fatalf("mlsEncryptContext over a %d byte label and a %d byte context = %x, want %x",
+					labelLength, contextLength, got, want)
+			}
+		}
+	}
+	if compared != encryptContextLengthSweepComparisons {
+		t.Fatalf("the length sweep compared %d encodings, want %d", compared, encryptContextLengthSweepComparisons)
+	}
+	compared = 0
+	for labelLength := 0; labelLength <= 8; labelLength++ {
+		for contextLength := 0; contextLength <= 4; contextLength++ {
+			for first := 0; first < 256; first++ {
+				compared++
+				label := string(sweptBytes(byte(first), labelLength))
+				context := sweptBytes(byte(first)^0x55, contextLength)
+				got := mlsEncryptContext(label, context)
+				if want := referenceEncryptContext(label, context); !bytes.Equal(got, want) {
+					t.Fatalf("mlsEncryptContext over a %d byte label beginning %#02x and a %d byte context = %x, want %x",
+						labelLength, first, contextLength, got, want)
+				}
+			}
+		}
+	}
+	if compared != encryptContextByteSweepComparisons {
+		t.Fatalf("the byte sweep compared %d encodings, want %d", compared, encryptContextByteSweepComparisons)
+	}
+	// and the reference is not the implementation written a second time: it must disagree
+	// with an encoder that dropped a length prefix, or the sweeps above compare nothing
+	if bytes.Equal(referenceEncryptContext("a", []byte("bc")), concatBytes([]byte(MlsLabelPrefix+"a"), []byte("bc"))) {
+		t.Errorf("the reference encoder builds the unframed concatenation, so it frames nothing")
+	}
+}
+
+func TestEncryptContextEncoding(t *testing.T) {
+	// EncryptContext is { opaque label<V>; opaque context<V> } and the label carries the
+	// "MLS 1.0 " prefix. This becomes the hpke info, and RFC 9420 section 5.1.3 seals
+	// with an empty aead aad: the context travels through info and never through aad.
+	//
+	// These rows are read off the RFC rather than published, so
+	// TestDecryptWithLabelMatchesTheCryptoBasicsVectors is the authority and this is what
+	// says which field moved when it fails.
+	for _, testCase := range []struct {
+		name    string
+		label   string
+		context []byte
+		want    []byte
+	}{
+		{
+			name:    "a two byte context",
+			label:   "UpdatePathNode",
+			context: []byte{0xca, 0xfe},
+			want: concatBytes([]byte{byte(len(MlsLabelPrefix + "UpdatePathNode"))},
+				[]byte(MlsLabelPrefix+"UpdatePathNode"), []byte{0x02, 0xca, 0xfe}),
+		},
+		{
+			// an empty context still writes its length byte, which is the one shape a
+			// round trip cannot see: with no context bytes the readings "field omitted"
+			// and "field present and empty" differ only by this 0x00.
+			name:    "an empty label and an empty context",
+			label:   "",
+			context: nil,
+			want:    concatBytes([]byte{byte(len(MlsLabelPrefix))}, []byte(MlsLabelPrefix), []byte{0x00}),
+		},
+		{
+			// a context of 64 bytes crosses into the two byte prefix, so a hand rolled
+			// single byte length encodes 0x40 here and describes a context 63 bytes long
+			name:    "a context at the two byte prefix boundary",
+			label:   "y",
+			context: bytes.Repeat([]byte{0x5a}, 64),
+			want: concatBytes([]byte{byte(len(MlsLabelPrefix + "y"))}, []byte(MlsLabelPrefix+"y"),
+				[]byte{0x40, 0x40}, bytes.Repeat([]byte{0x5a}, 64)),
+		},
+	} {
+		if got := mlsEncryptContext(testCase.label, testCase.context); !bytes.Equal(got, testCase.want) {
+			t.Errorf("%s: mlsEncryptContext = %x, want %x", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+func TestEncryptWithLabelRoundTrip(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("suite %#04x: %v", uint16(suite), err)
+		}
+		priv, pub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x14}, 32))
+		if err != nil {
+			t.Fatalf("suite %#04x DeriveKeyPair: %v", uint16(suite), err)
+		}
+		context := []byte("the group context")
+		plaintext := bytes.Repeat([]byte{0x15}, 32)
+		kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, "UpdatePathNode", context, plaintext)
+		if err != nil {
+			t.Fatalf("suite %#04x encrypt: %v", uint16(suite), err)
+		}
+		// the two results are both byte slices, so a transposed return compiles and the
+		// round trip below catches it only while the two lengths happen to differ. what
+		// says which is which is the kem's Nenc and the aead's expansion by Nt.
+		if len(kemOutput) != params.Nenc {
+			t.Errorf("suite %#04x encapsulated key is %d bytes, want Nenc = %d",
+				uint16(suite), len(kemOutput), params.Nenc)
+		}
+		if len(ciphertext) != len(plaintext)+params.Nt {
+			t.Errorf("suite %#04x ciphertext is %d bytes, want the plaintext plus Nt = %d",
+				uint16(suite), len(ciphertext), len(plaintext)+params.Nt)
+		}
+		back, err := DecryptWithLabel(crypto, priv, "UpdatePathNode", context, kemOutput, ciphertext)
+		if err != nil {
+			t.Fatalf("suite %#04x decrypt: %v", uint16(suite), err)
+		}
+		if !bytes.Equal(back, plaintext) {
+			t.Fatalf("suite %#04x round trip returned %x", uint16(suite), back)
+		}
+		// and a second call to the same key under the same label is a second
+		// encapsulation, so an implementation that cached a context or an ephemeral key
+		// fails here rather than sealing two plaintexts under one key and one nonce
+		otherKemOutput, otherCiphertext, err := EncryptWithLabel(crypto, pub, "UpdatePathNode", context, plaintext)
+		if err != nil {
+			t.Fatalf("suite %#04x encrypt a second time: %v", uint16(suite), err)
+		}
+		if bytes.Equal(kemOutput, otherKemOutput) || bytes.Equal(ciphertext, otherCiphertext) {
+			t.Errorf("suite %#04x sealed the same plaintext to the same key twice identically", uint16(suite))
+		}
+	}
+}
+
+func TestEncryptWithLabelIsLabelAndContextBound(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x16}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, "UpdatePathNode", []byte("context a"), []byte("secret"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	// the control first: what follows is only meaningful against a decrypt that opens the
+	// one message it should
+	if _, err := DecryptWithLabel(crypto, priv, "UpdatePathNode", []byte("context a"), kemOutput, ciphertext); err != nil {
+		t.Fatalf("the message sealed under this label and context was refused: %v", err)
+	}
+	if _, err := DecryptWithLabel(crypto, priv, "Welcome", []byte("context a"), kemOutput, ciphertext); !errors.Is(err, ErrAeadOpen) {
+		t.Errorf("wrong label decrypted: error = %v, want ErrAeadOpen", err)
+	}
+	if _, err := DecryptWithLabel(crypto, priv, "UpdatePathNode", []byte("context b"), kemOutput, ciphertext); !errors.Is(err, ErrAeadOpen) {
+		t.Errorf("wrong context decrypted: error = %v, want ErrAeadOpen", err)
+	}
+}
+
+func TestProviderHpkeSealUsesAnEmptyAadForLabelledEncryption(t *testing.T) {
+	// EncryptWithLabel must reach HpkeSeal with a nil aad. sealing the context into aad
+	// instead of info would round trip inside this implementation and fail every peer,
+	// which is exactly the class of bug the interop harness is slow to find.
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x17}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	context := []byte("the group context")
+	kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, "UpdatePathNode", context, []byte("secret"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	back, err := crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext("UpdatePathNode", context), nil, ciphertext)
+	if err != nil {
+		t.Fatalf("open with info=EncryptContext and aad=nil failed: %v", err)
+	}
+	if !bytes.Equal(back, []byte("secret")) {
+		t.Fatalf("open returned %q", back)
+	}
+	// and the transposition itself, walked from the peer's side rather than from this
+	// one. the row above says the labelled seal is openable the way the RFC says; these
+	// say the other two placements are not, so an implementation that put the context in
+	// aad is refused here instead of talking happily to itself.
+	for _, testCase := range []struct {
+		name string
+		info []byte
+		aad  []byte
+	}{
+		{name: "a message carrying its context in aad", info: nil, aad: mlsEncryptContext("UpdatePathNode", context)},
+		{name: "a message carrying its context in info and aad",
+			info: mlsEncryptContext("UpdatePathNode", context),
+			aad:  mlsEncryptContext("UpdatePathNode", context)},
+	} {
+		otherKemOutput, otherCiphertext, err := crypto.HpkeSeal(pub, testCase.info, testCase.aad, []byte("secret"))
+		if err != nil {
+			t.Fatalf("%s: seal: %v", testCase.name, err)
+		}
+		if _, err := DecryptWithLabel(crypto, priv, "UpdatePathNode", context,
+			otherKemOutput, otherCiphertext); !errors.Is(err, ErrAeadOpen) {
+			t.Errorf("%s decrypted: error = %v, want ErrAeadOpen", testCase.name, err)
+		}
+	}
+}
+
+// What the tamper table below refuses, counted for the same reason as every other total
+// here: a loop that stopped iterating reports exactly what a complete one reports. The
+// two byte sweeps and the truncations are sized from the message they run on, so the
+// total is assembled at the call site rather than written out as a number here.
+const (
+	// an empty kem output, one byte short of Nenc, one byte over, and twice Nenc
+	decryptKemOutputLengthRefusals = 4
+	// another recipient's key, an all zero ciphertext, an all one ciphertext, and one
+	// byte appended to a ciphertext that was otherwise authentic
+	decryptNamedRefusals = 4
+)
+
+// A ciphertext this key really was sent, altered anywhere, is refused, and so is an
+// authentic one opened with another key.
+//
+// This is the half a round trip cannot see at all. A DecryptWithLabel returning nil, nil
+// passes any test that encrypts and then decrypts its own message: the plaintext compares
+// equal to nothing only when somebody looks, and the error is the only thing separating an
+// authentic empty message from every forgery of exactly tag length. So every row here
+// reads the error and the returned slice both, and the slice must be nil: a caller that
+// branches on the bytes rather than on the error accepts whatever the last row produced.
+//
+// Every byte of the ciphertext and every byte of the encapsulated key are walked rather
+// than one of each. A decrypt that authenticated a prefix of its ciphertext is caught
+// wherever it stopped reading, and one that read only part of the encapsulated key is
+// caught the same way — neither is visible from a single altered byte somebody picked.
+func TestDecryptWithLabelRefusesEveryTamperedCiphertext(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite this table is built over: %v", err)
+	}
+	priv, pub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x18}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	otherPriv, _, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x19}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair a second time: %v", err)
+	}
+	label := "UpdatePathNode"
+	context := []byte("the group context")
+	plaintext := []byte("the sealed secret")
+	kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, label, context, plaintext)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	// the control first: what follows is only meaningful against a decrypt that opens the
+	// one message it should
+	if back, err := DecryptWithLabel(crypto, priv, label, context, kemOutput, ciphertext); err != nil {
+		t.Fatalf("the authentic message was refused: %v", err)
+	} else if !bytes.Equal(back, plaintext) {
+		t.Fatalf("the authentic message opened as %x", back)
+	}
+	refusals := 0
+	refuse := func(name string, key HpkePrivateKey, kem []byte, sealed []byte, want error) {
+		refusals++
+		back, err := DecryptWithLabel(crypto, key, label, context, kem, sealed)
+		if !errors.Is(err, want) {
+			t.Errorf("%s decrypted: error = %v, want %v", name, err, want)
+		}
+		if back != nil {
+			t.Errorf("%s was refused and still answered %x; the error is the only thing separating "+
+				"an authentic empty message from a forgery", name, back)
+		}
+	}
+	// every byte of the ciphertext, which covers the aead body and its tag alike
+	for i := range ciphertext {
+		altered := bytes.Clone(ciphertext)
+		altered[i] ^= 0x80
+		refuse(fmt.Sprintf("a ciphertext with byte %d altered", i), priv, kemOutput, altered, ErrAeadOpen)
+	}
+	// every byte of the encapsulated key, which is what says the decapsulation reads the
+	// whole of it rather than enough of it to look right
+	for i := range kemOutput {
+		altered := bytes.Clone(kemOutput)
+		altered[i] ^= 0x01
+		refuse(fmt.Sprintf("an encapsulated key with byte %d altered", i), priv, altered, ciphertext, ErrAeadOpen)
+	}
+	// every prefix of the ciphertext, including the empty one: a decrypt that stopped
+	// authenticating at some offset is refused wherever that offset falls
+	for i := range ciphertext {
+		refuse(fmt.Sprintf("a ciphertext truncated to %d bytes", i), priv, kemOutput, ciphertext[:i], ErrAeadOpen)
+	}
+	refuse("a ciphertext with a byte appended", priv, kemOutput, concatBytes(ciphertext, []byte{0x00}), ErrAeadOpen)
+	refuse("another recipient's key", otherPriv, kemOutput, ciphertext, ErrAeadOpen)
+	refuse("an all zero ciphertext", priv, kemOutput, make([]byte, len(ciphertext)), ErrAeadOpen)
+	refuse("a ciphertext of every one bit", priv, kemOutput, bytes.Repeat([]byte{0xff}, len(ciphertext)), ErrAeadOpen)
+	// and an encapsulated key of the wrong length stops at the kem's own gate rather than
+	// reaching the aead, which is a different sentinel and says so
+	for _, n := range []int{0, params.Nenc - 1, params.Nenc + 1, 2 * params.Nenc} {
+		refuse(fmt.Sprintf("a %d byte encapsulated key", n), priv, make([]byte, n), ciphertext, ErrBadKemOutput)
+	}
+	if want := 2*len(ciphertext) + len(kemOutput) + decryptNamedRefusals + decryptKemOutputLengthRefusals; refusals != want {
+		t.Fatalf("the table refused %d alterations, want %d", refusals, want)
+	}
+	// and the control for the whole test: the authentic message still opens, so nothing
+	// above is satisfied by a decrypt that refuses everything
+	if back, err := DecryptWithLabel(crypto, priv, label, context, kemOutput, ciphertext); err != nil {
+		t.Errorf("the authentic message was refused after the table: %v", err)
+	} else if !bytes.Equal(back, plaintext) {
+		t.Errorf("the authentic message opened as %x after the table", back)
+	}
+}
+
+// One encapsulation to one recipient, reused across a whole class of infos.
+//
+// Every ciphertext it produces is one a peer could really have sent. RFC 9180 base mode
+// derives the key schedule from the shared secret and the info, and the encapsulated key
+// depends on neither, so sealing under ten thousand infos to one recipient is one
+// encapsulation and ten thousand key schedules. That is what makes the class below
+// affordable: the alternative is an x25519 multiplication per candidate on the sending
+// side as well as on the receiving one, and the receiving one is the side under test.
+//
+// TestTheLabelledSealerIsHpkeSealBase is what says this really is the sending half rather
+// than something shaped like it, by building one over a fixed ephemeral key and comparing
+// against HpkeSealBase over the same one.
+type labelledSealer struct {
+	params    *SuiteParams
+	kemOutput []byte
+	secret    []byte
+}
+
+// A sealer over one encapsulation drawn from a caller's reader, so a fixed reader gives a
+// sealer whose messages are byte for byte reproducible.
+func newLabelledSealer(t *testing.T, params *SuiteParams, random io.Reader, pub HpkePublicKey) *labelledSealer {
+	t.Helper()
+	secret, kemOutput, err := hpkeEncap(random, params, pub)
+	if err != nil {
+		t.Fatalf("encapsulate the shared secret the class is sealed under: %v", err)
+	}
+	return &labelledSealer{params: params, kemOutput: kemOutput, secret: secret}
+}
+
+// One message under one info, sealed at sequence zero with an empty aad, which is what
+// RFC 9420 section 5.1.3 puts on the wire.
+func (self *labelledSealer) seal(t *testing.T, info []byte, plaintext []byte) []byte {
+	t.Helper()
+	context, err := hpkeKeySchedule(self.params, self.secret, info)
+	if err != nil {
+		t.Fatalf("key schedule over a %d byte info: %v", len(info), err)
+	}
+	ciphertext, err := context.Seal(nil, plaintext)
+	if err != nil {
+		t.Fatalf("seal under a %d byte info: %v", len(info), err)
+	}
+	return ciphertext
+}
+
+// The sealer is the sending half of hpke and not a second implementation of it.
+//
+// Without this the class below is a class of messages nothing else produces, and a decrypt
+// that refused all of them would prove nothing about the messages a peer really sends. The
+// comparison is against HpkeSealBase over the same ephemeral key, so the two agree byte for
+// byte or the sealer is not what it claims.
+func TestTheLabelledSealerIsHpkeSealBase(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite: %v", err)
+	}
+	_, pub, err := HpkeDeriveKeyPair(params, bytes.Repeat([]byte{0x1a}, 32))
+	if err != nil {
+		t.Fatalf("HpkeDeriveKeyPair: %v", err)
+	}
+	plaintext := []byte("the sealed secret")
+	compared := 0
+	for _, info := range [][]byte{nil, {}, []byte("info"), mlsEncryptContext("UpdatePathNode", []byte("context"))} {
+		compared++
+		sealer := newLabelledSealer(t, params, constantReader{value: 0x88}, pub)
+		kemOutput, ciphertext, err := HpkeSealBase(constantReader{value: 0x88}, params, pub, info, nil, plaintext)
+		if err != nil {
+			t.Fatalf("HpkeSealBase over a %d byte info: %v", len(info), err)
+		}
+		if !bytes.Equal(sealer.kemOutput, kemOutput) {
+			t.Errorf("the sealer encapsulated %x and HpkeSealBase %x over one ephemeral key",
+				sealer.kemOutput, kemOutput)
+		}
+		if got := sealer.seal(t, info, plaintext); !bytes.Equal(got, ciphertext) {
+			t.Errorf("the sealer produced %x over a %d byte info and HpkeSealBase %x", got, len(info), ciphertext)
+		}
+	}
+	if compared != 4 {
+		t.Fatalf("compared %d infos, want 4", compared)
+	}
+}
+
+// How many infos the walk draws per demanded pair, and the seed it draws them from.
+//
+// A seed of its own rather than the signature walk's, so the two classes are two samples
+// of the neighbourhood rather than one sample used twice. The seed is written down so a
+// failure reproduces from this line rather than from a lucky run.
+const encryptProbeWalkSeed = 0x2f8c61a4e97d05b3
+
+// What the generated class holds, pinned so a generator that degenerated fails rather than
+// reporting exactly what a working one reports. Two numbers, for the reason
+// signatureBuiltPreimages records: the built total moves when a generator stops
+// generating, and the distinct total moves when the encoding changes under it.
+const (
+	encryptBuiltContexts   = 35226
+	encryptRefusedContexts = 29145
+)
+
+// A message this recipient's key really can decapsulate, sealed under an info the receiver
+// does not demand, is refused.
+//
+// This is the direction the attacker picks, and the one this project has now paid for
+// twice. Task 8's aad and info binding was walked in one direction only — a message sealed
+// under the demanded info, opened while demanding another — and twelve lenient fallback
+// mutants passed all 78 tests, each of them accepting a message sealed with no info at
+// all. Walking it that way cannot see any of them: the fallback fires on the receiving
+// side, and a receiver that retries with nil info still opens the message that was sealed
+// with the right one. What sees it is a message sealed with the wrong info, or with none,
+// arriving at a receiver demanding the right one.
+//
+// So the class is generated on the sending side. Four generators carry it, none of which
+// names a value: singleByteEdits over the whole alphabet, fieldRewrites as operations
+// rather than results, fieldArrangements over both framings of both fields, and a
+// deterministic multi edit walk outside all three. The infos an implementer would fall
+// back to — nil, the empty vector, the bare label, the unframed concatenation, the context
+// alone — are all members, and so are the ones nobody would write down.
+//
+// What no generator can do is enumerate every info, so two things bound it. The count of
+// distinct ones is asserted, and TestTheLabelledEncryptionIsOnlyItsOwnContext covers what a
+// neighbourhood cannot by reading the constructions' own statements.
+func TestDecryptWithLabelRefusesCiphertextsSealedUnderAnyOtherContext(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite this class is built over: %v", err)
+	}
+	priv, pub, err := crypto.DeriveKeyPair(bytes.Repeat([]byte{0x1b}, 32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	plaintext := []byte("the sealed secret")
+	sealer := newLabelledSealer(t, params, rand.Reader, pub)
+	random := newLabelProbeRand(encryptProbeWalkSeed)
+	refused := 0
+	built := 0
+	for _, pair := range signatureProbePairs() {
+		demanded := mlsEncryptContext(pair.label, pair.content)
+		// the control first, per pair: what follows is only meaningful against a decrypt
+		// that opens the one message it should, and it is also what says this sealer's
+		// messages reach the receiver at all
+		if back, err := DecryptWithLabel(crypto, priv, pair.label, pair.content,
+			sealer.kemOutput, sealer.seal(t, demanded, plaintext)); err != nil {
+			t.Fatalf("%s: the message sealed under the demanded context was refused: %v", pair.name, err)
+		} else if !bytes.Equal(back, plaintext) {
+			t.Fatalf("%s: the message sealed under the demanded context opened as %x", pair.name, back)
+		}
+		tried := map[string]bool{string(demanded): true}
+		generated := alternativePreimages(random, pair, mlsEncryptContext)
+		if len(generated) == 0 {
+			t.Fatalf("%s: the generators built nothing, so this pair observed nothing", pair.name)
+		}
+		built += len(generated)
+		for _, info := range generated {
+			if tried[string(info)] {
+				continue
+			}
+			tried[string(info)] = true
+			refused++
+			back, err := DecryptWithLabel(crypto, priv, pair.label, pair.content,
+				sealer.kemOutput, sealer.seal(t, info, plaintext))
+			if !errors.Is(err, ErrAeadOpen) {
+				t.Errorf("%s: a message sealed under info %x opened as one under %q over %x: error = %v, want ErrAeadOpen",
+					pair.name, info, pair.label, pair.content, err)
+			}
+			if back != nil {
+				t.Errorf("%s: a message sealed under info %x was refused and still answered %x",
+					pair.name, info, back)
+			}
+		}
+	}
+	if built != encryptBuiltContexts {
+		t.Fatalf("the generators built %d contexts, want %d", built, encryptBuiltContexts)
+	}
+	if refused != encryptRefusedContexts {
+		t.Fatalf("the generated class refused %d distinct contexts, want %d", refused, encryptRefusedContexts)
+	}
+	// and the control for the whole test: a message sealed under the info the receiver
+	// does demand still opens, so nothing above is satisfied by a decrypt that refuses
+	// everything
+	demanded := mlsEncryptContext("UpdatePathNode", []byte("the group context"))
+	if back, err := DecryptWithLabel(crypto, priv, "UpdatePathNode", []byte("the group context"),
+		sealer.kemOutput, sealer.seal(t, demanded, plaintext)); err != nil {
+		t.Errorf("the message sealed under the demanded context was refused: %v", err)
+	} else if !bytes.Equal(back, plaintext) {
+		t.Errorf("the message sealed under the demanded context opened as %x", back)
+	}
+}
+
+// The published DecryptWithLabel answers the corpus must contribute, counted for the same
+// reason as every other total here. crypto-basics publishes one encrypt_with_label entry
+// per suite and two of its seven suites are registered.
+const labelKatEncryptComparisons = 2
+
+// The RFC 9420 section 5.1.3 encryption, held to bytes this project did not compute.
+//
+// Nothing else in this file can hold it. EncryptWithLabel draws a fresh ephemeral key, so
+// its output is not a known answer and cannot be compared against one; what is published
+// is a message somebody else sealed, and opening that is the only direction in which the
+// construction meets bytes from outside this tree. An implementation that put the context
+// in the aad, dropped the "MLS 1.0 " prefix, dropped either length prefix or transposed the
+// two fields round trips against itself perfectly and fails here, which is the whole reason
+// the corpus is vendored.
+func TestDecryptWithLabelMatchesTheCryptoBasicsVectors(t *testing.T) {
+	entries := []labelKatBasics{}
+	loadLabelKat(t, "crypto-basics.json", &entries)
+	compared := 0
+	for _, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		vector := entry.EncryptWithLabel
+		what := fmt.Sprintf("suite %#04x encrypt_with_label", uint16(suite))
+		priv := HpkePrivateKey(mustDecodeHex(t, what+" priv", vector.Priv))
+		pub := HpkePublicKey(mustDecodeHex(t, what+" pub", vector.Pub))
+		context := mustDecodeHex(t, what+" context", vector.Context)
+		kemOutput := mustDecodeHex(t, what+" kem_output", vector.KemOutput)
+		ciphertext := mustDecodeHex(t, what+" ciphertext", vector.Ciphertext)
+		plaintext, err := DecryptWithLabel(crypto, priv, vector.Label, context, kemOutput, ciphertext)
+		if err != nil {
+			t.Fatalf("%s: the published message was refused: %v", what, err)
+		}
+		assertLabelKat(t, what, plaintext, vector.Plaintext)
+		compared++
+		// the published pair really is a pair, which is what says this package reads the
+		// private key the way the publisher wrote it rather than agreeing by accident with
+		// a scalar it never checked
+		key, err := X25519PrivateKey(priv)
+		if err != nil {
+			t.Fatalf("%s: the published private key was refused: %v", what, err)
+		}
+		if got := key.PublicKey().Bytes(); !bytes.Equal(got, pub) {
+			t.Errorf("%s: the published private key belongs to %x, and the published public key is %x",
+				what, got, pub)
+		}
+		// and the published message does not open under a label the publisher did not
+		// seal under, over bytes this project did not compute
+		if _, err := DecryptWithLabel(crypto, priv, vector.Label+"x", context, kemOutput,
+			ciphertext); !errors.Is(err, ErrAeadOpen) {
+			t.Errorf("%s: the published message opened under another label: error = %v, want ErrAeadOpen",
+				what, err)
+		}
+		// and not under a context the publisher did not seal under either
+		if _, err := DecryptWithLabel(crypto, priv, vector.Label, concatBytes(context, []byte{0x00}),
+			kemOutput, ciphertext); !errors.Is(err, ErrAeadOpen) {
+			t.Errorf("%s: the published message opened under another context: error = %v, want ErrAeadOpen",
+				what, err)
+		}
+	}
+	if compared != labelKatEncryptComparisons {
+		t.Fatalf("compared %d published encryptions, want %d", compared, labelKatEncryptComparisons)
+	}
+}
+
+// The file declaring one package level function, found rather than named, for the reason
+// sourceDeclaringProviderMethod records: a gate told which file to read reports a clean
+// bill on a file the implementation has moved out of. A subject in no file, or in two, is
+// fatal rather than clean.
+func sourceDeclaringPackageFunction(t *testing.T, name string) parsedSource {
+	t.Helper()
+	found := []parsedSource{}
+	declaring := []string{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		parsed := mustParseSource(t, path)
+		for _, function := range packageLevelFunctionsIn(parsed, path) {
+			if function.name != name {
+				continue
+			}
+			found = append(found, parsed)
+			declaring = append(declaring, path)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%s is declared in %v, want exactly one file of this package", name, declaring)
+	}
+	return found[0]
+}
+
+// The three constructions of RFC 9420 section 5.1.3, statement by statement.
+var mlsEncryptContextStatements = []string{
+	"writer := syntax.NewWriter()",
+	"writer.WriteOpaque([]byte(MlsLabelPrefix + label))",
+	"writer.WriteOpaque(context)",
+	"return mlsLabelBytes(writer)",
+}
+
+var encryptWithLabelStatements = []string{
+	"return crypto.HpkeSeal(pub, mlsEncryptContext(label, context), nil, plaintext)",
+}
+
+var decryptWithLabelStatements = []string{
+	"return crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)",
+}
+
+// The three provider methods they reach hpke through.
+var hpkeSealStatements = []string{
+	"return HpkeSealBase(self.random, self.params, pub, info, aad, plaintext)",
+}
+
+var hpkeOpenStatements = []string{
+	"return HpkeOpenBase(self.params, priv, kemOutput, info, aad, ciphertext)",
+}
+
+var deriveKeyPairStatements = []string{
+	"return HpkeDeriveKeyPair(self.params, ikm)",
+}
+
+// An open that retries with no info at all when the first attempt fails.
+//
+// This is the shape task 8 measured twelve of, and every one of them is caught behaviourally
+// by TestDecryptWithLabelRefusesCiphertextsSealedUnderAnyOtherContext, since nil is a member
+// of the generated class. It is written out anyway because the pin has to be shown reading a
+// body it must reject, and because the next fallback somebody writes will not be this one.
+const lenientHpkeOpenControl = `package mls
+
+func (self *suiteCryptoProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := HpkeOpenBase(self.params, priv, kemOutput, info, aad, ciphertext)
+	if err != nil {
+		return HpkeOpenBase(self.params, priv, kemOutput, nil, aad, ciphertext)
+	}
+	return plaintext, nil
+}
+`
+
+// An open that retries under the digest of the info it was handed.
+//
+// No sequence of edits to a label or a context produces the thirty two byte digest of the
+// preimage they encode to, so this is outside every generator in this file — the shape the
+// pin exists for rather than the shape the class already covers.
+const digestFallbackHpkeOpenControl = `package mls
+
+func (self *suiteCryptoProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := HpkeOpenBase(self.params, priv, kemOutput, info, aad, ciphertext)
+	if err != nil {
+		return HpkeOpenBase(self.params, priv, kemOutput, self.Hash(info), aad, ciphertext)
+	}
+	return plaintext, nil
+}
+`
+
+// A seal that draws its ephemeral key from the process entropy source rather than from the
+// provider's own.
+//
+// It seals correctly, opens correctly, matches every published message and passes every
+// round trip: the encapsulated key is a fresh x25519 key either way, and nothing about a
+// ciphertext says which stream produced it. What it costs is everything
+// NewCryptoProviderWithRandom exists for. A caller's provider stops being reproducible, and
+// the two gates that compare a construction's answer over two providers stop being able to
+// see anything, because the answer differs on every call whatever provider was handed in.
+const processRandomSealControl = `package mls
+
+func (self *suiteCryptoProvider) HpkeSeal(pub HpkePublicKey, info []byte, aad []byte, plaintext []byte) ([]byte, []byte, error) {
+	return HpkeSealBase(rand.Reader, self.params, pub, info, aad, plaintext)
+}
+`
+
+// An encryption that carries its context in the aead's aad rather than in the hpke info.
+// It round trips against itself, matches no published message and talks to no peer, which
+// is what TestDecryptWithLabelMatchesTheCryptoBasicsVectors is for; the pin is what says so
+// without needing a corpus.
+const aadCarryingEncryptControl = `package mls
+
+func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, context []byte, plaintext []byte) ([]byte, []byte, error) {
+	return crypto.HpkeSeal(pub, nil, mlsEncryptContext(label, context), plaintext)
+}
+`
+
+// A decrypt that answers with whatever the open produced and no error. Every refusal in
+// this file reads the error, so this dies behaviourally as well; it is here because it is
+// the smallest version of "a decrypt that does not decrypt" and the pin has to be shown
+// rejecting it.
+const errorDiscardingDecryptControl = `package mls
+
+func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, context []byte, kemOutput []byte, ciphertext []byte) ([]byte, error) {
+	plaintext, _ := crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)
+	return plaintext, nil
+}
+`
+
+// The package level constructions the file declaring DecryptWithLabel holds, pinned whole
+// rather than filtered by name, for the reason labelProviderMethods is: a labelled
+// construction added beside these is a decision somebody writes down rather than a gap.
+var labelPackageFunctions = []string{
+	"DecryptWithLabel", "EncryptWithLabel", "MakeKeyPackageRef", "MakeProposalRef", "RefHash",
+	"mlsEncryptContext", "mlsKdfLabel", "mlsLabelBytes", "mlsSignContent",
+}
+
+// The labelled encryption is its own EncryptContext and nothing else.
+//
+// Everything above walks the direction an attacker picks — a message sealed under some
+// other info arriving at a receiver demanding the real one — and the class it walks is
+// generated rather than listed. But a class is still a neighbourhood, and the shapes
+// outside it are exactly the ones nobody thought to generate: an open that retries under
+// the digest of the info it was handed is a member of no generator in this file, because no
+// sequence of edits to a label or a context produces a digest of the preimage they encode
+// to.
+//
+// Two further weakenings are behaviourally invisible in the other direction. Which of info
+// and aad the context travels in is invisible to any test that seals and opens with this
+// same implementation, and is visible only against the published message in
+// TestDecryptWithLabelMatchesTheCryptoBasicsVectors and against the transposition rows in
+// TestProviderHpkeSealUsesAnEmptyAadForLabelledEncryption. And a fresh ephemeral key per
+// call is what keeps two messages to one recipient off one nonce, which no equality test
+// can see.
+//
+// So the bodies are pinned as shapes, in the form TestTheSignatureMethodsAreOnlyTheirOwnPreimage
+// already uses for the same reason. Each control below is a body that passes a great deal
+// of this package, which is what says the pin carries something those tests do not.
+func TestTheLabelledEncryptionIsOnlyItsOwnContext(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		want []string
+	}{
+		{name: "mlsEncryptContext", want: mlsEncryptContextStatements},
+		{name: "EncryptWithLabel", want: encryptWithLabelStatements},
+		{name: "DecryptWithLabel", want: decryptWithLabelStatements},
+	} {
+		source := sourceDeclaringPackageFunction(t, testCase.name)
+		if got := source.statementsOf(t, "", testCase.name); !slices.Equal(got, testCase.want) {
+			t.Errorf("%s is\n%s\nwant\n%s", testCase.name,
+				strings.Join(got, "\n"), strings.Join(testCase.want, "\n"))
+		}
+	}
+	for _, testCase := range []struct {
+		name string
+		want []string
+	}{
+		{name: "HpkeSeal", want: hpkeSealStatements},
+		{name: "HpkeOpen", want: hpkeOpenStatements},
+		{name: "DeriveKeyPair", want: deriveKeyPairStatements},
+	} {
+		source := sourceDeclaringProviderMethod(t, testCase.name)
+		if got := source.statementsOf(t, providerReceiver, testCase.name); !slices.Equal(got, testCase.want) {
+			t.Errorf("%s is\n%s\nwant\n%s", testCase.name,
+				strings.Join(got, "\n"), strings.Join(testCase.want, "\n"))
+		}
+	}
+	// and the matcher reads each control as the different body it is, so a matcher that
+	// stopped matching fails here rather than issuing the real bodies a clean bill
+	for _, testCase := range []struct {
+		name     string
+		receiver string
+		method   string
+		control  string
+		want     []string
+	}{
+		{name: "an open that retries with no info", receiver: providerReceiver, method: "HpkeOpen",
+			control: lenientHpkeOpenControl, want: hpkeOpenStatements},
+		{name: "an open that retries under the digest of its info", receiver: providerReceiver, method: "HpkeOpen",
+			control: digestFallbackHpkeOpenControl, want: hpkeOpenStatements},
+		{name: "a seal drawing from the process entropy source", receiver: providerReceiver, method: "HpkeSeal",
+			control: processRandomSealControl, want: hpkeSealStatements},
+		{name: "an encryption carrying its context in aad", receiver: "", method: "EncryptWithLabel",
+			control: aadCarryingEncryptControl, want: encryptWithLabelStatements},
+		{name: "a decrypt that discards its error", receiver: "", method: "DecryptWithLabel",
+			control: errorDiscardingDecryptControl, want: decryptWithLabelStatements},
+	} {
+		control := mustParseText(t, testCase.name, testCase.control)
+		if slices.Equal(control.statementsOf(t, testCase.receiver, testCase.method), testCase.want) {
+			t.Errorf("the matcher read %s as the shape above", testCase.name)
+		}
+	}
+	// and the pin names every package level construction of the file it reads, so a
+	// labelled construction added beside these is a decision somebody writes down
+	declaring := sourceDeclaringPackageFunction(t, "DecryptWithLabel")
+	declared := []string{}
+	for _, function := range packageLevelFunctionsIn(declaring, "the file declaring DecryptWithLabel") {
+		declared = append(declared, function.name)
+	}
+	slices.Sort(declared)
+	if !slices.Equal(declared, labelPackageFunctions) {
+		t.Errorf("the file declaring DecryptWithLabel declares %v, and this gate knows of %v",
+			declared, labelPackageFunctions)
 	}
 }
