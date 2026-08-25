@@ -5483,3 +5483,527 @@ func TestFilteredDirectPathAgainstPublishedTreekemUpdatePaths(t *testing.T) {
 		}
 	}
 }
+
+// the level of the highest bit two leaf indices differ at, which for a node's
+// first leaf and a leaf of the tree is the level of the copath child the node
+// sits under.
+//
+// the caller has already decided the two are different, so the walk down from
+// the depth always finds a level and the zero at the end is the case where
+// they differ in the last bit alone.
+func leafDivergenceLevel(first uint64, leaf uint64, depth uint32) uint32 {
+	for level := depth; level > 0; level -= 1 {
+		if first>>level != leaf>>level {
+			return level
+		}
+	}
+	return 0
+}
+
+// a shape whose blank nodes are exactly the subtrees headed by the copath
+// children a mask names, so the filtered path of the leaf is its direct path
+// with the levels in the mask removed and nothing else touched.
+//
+// bit j of the mask blanks the copath child at level j, which is the child of
+// the path node at level j+1, so the mask is the set of path nodes that must
+// come out. every other node of the tree is populated, which makes every other
+// copath child resolve to itself and makes the expected answer a closed form
+// over the mask rather than something read off the implementation.
+//
+// membership is decided from the node's first leaf and nothing else: a node
+// whose first leaf agrees with the leaf above the divergence level is an
+// ancestor of the leaf and so on its direct path, and any other node sits
+// inside exactly one copath child, the one at the level its first leaf
+// diverges from the leaf at. no function of this package is reached.
+func dropMaskShape(leaves LeafCount, leaf LeafIndex, mask uint64, depth uint32) *functionShape {
+	return &functionShape{
+		shapeLeafCount: leaves,
+		blankNode: func(x NodeIndex) bool {
+			level, block := nodeLevelAndBlock(x)
+			first := block << level
+			if first == uint64(leaf) {
+				return false
+			}
+			divergence := leafDivergenceLevel(first, uint64(leaf), depth)
+			if level > divergence {
+				return false
+			}
+			return mask>>divergence&0x01 == 1
+		},
+		unmergedOfNode: nil,
+	}
+}
+
+// compares one leaf's filtered path against the oracle and says only whether
+// they agreed, so a sweep can run a million rows and stop on the first that
+// differs rather than printing a million lines.
+func filteredPathAgrees(shape NodeShape, leaf LeafIndex, depth uint32) bool {
+	got, err := FilteredDirectPath(shape, leaf)
+	if err != nil {
+		return false
+	}
+	if got == nil {
+		return false
+	}
+	return samePathSteps(got, filteredPathOracle(shape, leaf, depth))
+}
+
+// the same comparison once more on t, so a stopped sweep names the leaf and
+// prints both paths instead of a boolean.
+func reportFilteredPath(t *testing.T, label string, shape NodeShape, leaf LeafIndex, depth uint32) {
+	t.Helper()
+	got, err := FilteredDirectPath(shape, leaf)
+	if err != nil {
+		t.Fatalf("%s: leaf %d: %v", label, leaf, err)
+	}
+	if got == nil {
+		t.Fatalf("%s: leaf %d: nil, want a slice", label, leaf)
+	}
+	want := filteredPathOracle(shape, leaf, depth)
+	if !samePathSteps(got, want) {
+		t.Fatalf("%s: leaf %d: %v, want %v", label, leaf, got, want)
+	}
+	t.Fatalf("%s: leaf %d was refused by the sweep and agrees when it is asked again", label, leaf)
+}
+
+// every shape a four-leaf tree can have, at each of its four leaves: each of
+// the 128 blank sets crossed with each of the 128 placements of an unmerged
+// list.
+//
+// the fixtures above are a handful of shapes out of the many a tree can be in,
+// and the rules interact: a copath child can be a blank leaf, a blank parent
+// over blanks, a blank parent over one blank and one member, or a member with
+// unmerged leaves, and the same tree filters differently for different leaves.
+// a hand-picked list cannot cover that crossing and a wrong version sits in the
+// gap, so the shapes are counted rather than chosen.
+func TestFilteredDirectPathEveryShapeOfAFourLeafTree(t *testing.T) {
+	const leaves = LeafCount(4)
+	width := NodeWidth(leaves)
+	checked, dropped := int64(0), int64(0)
+	for blankMask := uint32(0); blankMask < uint32(1)<<width; blankMask += 1 {
+		for unmergedMask := uint32(0); unmergedMask < uint32(1)<<width; unmergedMask += 1 {
+			shape := &maskShape{shapeLeafCount: leaves, blankMask: blankMask, unmergedMask: unmergedMask}
+			for leaf := LeafIndex(0); LeafCount(leaf) < leaves; leaf += 1 {
+				if !filteredPathAgrees(shape, leaf, 2) {
+					reportFilteredPath(t, fmt.Sprintf("blank mask %#x unmerged mask %#x", blankMask, unmergedMask), shape, leaf, 2)
+				}
+				got, err := FilteredDirectPath(shape, leaf)
+				if err != nil {
+					t.Fatalf("blank mask %#x leaf %d: %v", blankMask, leaf, err)
+				}
+				checked += 1
+				dropped += int64(2 - len(got))
+			}
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		{label: "filtered paths of a four-leaf tree", got: checked, want: int64(1<<14) * int64(leaves)},
+		// and the filter has to bite across that crossing, or every one of
+		// those rows is a copy of the direct path. it bites on 40960 of the
+		// 131072 nodes.
+		{label: "nodes dropped across the crossing", got: dropped, want: 40960},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// every blank shape an eight-leaf tree can have, with and without an unmerged
+// list on every node, at each of its eight leaves.
+//
+// eight leaves is the size of both figures RFC 9420 draws and of every fixture
+// above, and 32768 is how many blank sets a tree that size has. the crossing
+// with the unmerged placement is not exhaustive here — that would be 2^30
+// shapes — so the four-leaf sweep carries it and this one carries the depth.
+func TestFilteredDirectPathEveryBlankShapeOfAnEightLeafTree(t *testing.T) {
+	const leaves = LeafCount(8)
+	width := NodeWidth(leaves)
+	checked, dropped := int64(0), int64(0)
+	for _, unmergedMask := range []uint32{0, uint32(1)<<width - 1} {
+		for blankMask := uint32(0); blankMask < uint32(1)<<width; blankMask += 1 {
+			shape := &maskShape{shapeLeafCount: leaves, blankMask: blankMask, unmergedMask: unmergedMask}
+			for leaf := LeafIndex(0); LeafCount(leaf) < leaves; leaf += 1 {
+				if !filteredPathAgrees(shape, leaf, 3) {
+					reportFilteredPath(t, fmt.Sprintf("blank mask %#x unmerged mask %#x", blankMask, unmergedMask), shape, leaf, 3)
+				}
+				got, err := FilteredDirectPath(shape, leaf)
+				if err != nil {
+					t.Fatalf("blank mask %#x leaf %d: %v", blankMask, leaf, err)
+				}
+				checked += 1
+				dropped += int64(3 - len(got))
+			}
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		{label: "filtered paths of an eight-leaf tree", got: checked, want: 2 * int64(1<<15) * int64(leaves)},
+		{label: "nodes dropped across the blank sets", got: dropped, want: 331776},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the deepest tree every drop pattern of every level is enumerated for.
+//
+// a pattern names a subset of the levels of one leaf's direct path, so a tree
+// of depth d has 2^d of them and each costs the size of the subtrees it blanks.
+// twelve is where the product stops being affordable: the whole sweep is 90
+// million node visits and seven tenths of a second, and every step up doubles
+// it twice.
+const filteredDropPatternDepth = 12
+
+// every subset of the levels of a leaf's direct path, as the set of nodes the
+// filter must remove, at every depth up to twelve.
+//
+// this is the enumeration the hand-written tables cannot reach. a filtered path
+// of the right length holding the wrong nodes is the defect this function has,
+// and it hides in which levels come out rather than in how many: a version that
+// drops the node above the empty child rather than the node beside it, or that
+// drops one level late, or that keeps the first drop and no other, produces a
+// path of a plausible length for most shapes. asking for every pattern at every
+// depth leaves it nowhere to sit up to the depth this reaches, and the depth
+// sweep below carries the levels past it one pattern at a time.
+func TestFilteredDirectPathEveryDropPattern(t *testing.T) {
+	checked, dropped := int64(0), int64(0)
+	for depth := uint32(1); depth <= filteredDropPatternDepth; depth += 1 {
+		leaves := LeafCount(1) << depth
+		// leaf 0 sits on the left edge of every block it is in and the strided
+		// leaf does not, so the copath children of the two are on opposite
+		// sides of their parents at every level.
+		sweepLeaves := []LeafIndex{0, LeafIndex(resolutionLeafStride % uint32(leaves))}
+		for _, leaf := range sweepLeaves {
+			for mask := uint64(0); mask < uint64(1)<<depth; mask += 1 {
+				shape := dropMaskShape(leaves, leaf, mask, depth)
+				if !filteredPathAgrees(shape, leaf, depth) {
+					reportFilteredPath(t, fmt.Sprintf("%d leaves, drop mask %#x", leaves, mask), shape, leaf, depth)
+				}
+				got, err := FilteredDirectPath(shape, leaf)
+				if err != nil {
+					t.Fatalf("%d leaves, drop mask %#x, leaf %d: %v", leaves, mask, leaf, err)
+				}
+				// the mask is the answer in closed form as well as through the
+				// oracle: a set bit is a level that must not be in the result
+				// and a clear bit is a level that must.
+				position := 0
+				for level := uint32(1); level <= depth; level += 1 {
+					if mask>>(level-1)&0x01 == 1 {
+						dropped += 1
+						continue
+					}
+					if position >= len(got) {
+						t.Fatalf("%d leaves, drop mask %#x, leaf %d: %v is short of level %d",
+							leaves, mask, leaf, got, level)
+					}
+					if stepLevel, _ := nodeLevelAndBlock(got[position].Node); stepLevel != level {
+						t.Fatalf("%d leaves, drop mask %#x, leaf %d: step %d is node %d at level %d, want level %d",
+							leaves, mask, leaf, position, got[position].Node, stepLevel, level)
+					}
+					position += 1
+				}
+				if position != len(got) {
+					t.Fatalf("%d leaves, drop mask %#x, leaf %d: %v is longer than the mask allows",
+						leaves, mask, leaf, got)
+				}
+				checked += 1
+			}
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		// 2 leaves times the sum of 2^d over d from 1 to 12.
+		{label: "drop patterns", got: checked, want: 2 * (1<<13 - 2)},
+		// and every level of every one of them is either dropped or kept, half
+		// the patterns each way: 2 * sum over d of d * 2^(d-1).
+		{label: "levels dropped across the patterns", got: dropped, want: 2 * 45057},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the relations a filtered path holds against the two path functions it is cut
+// out of, checked for one leaf of one tree.
+//
+// none of these is the definition — the oracle is — and that is the point of
+// them. the definition says which nodes come out; these say the survivors are
+// still a path: the nodes are a subsequence of the direct path in order, each
+// step pairs with the copath entry standing beside its node, and each step's
+// copath child really is the child of its node on the far side from the leaf.
+// a version that paired a node with the wrong copath entry, or that emitted the
+// copath child as the node, satisfies the length and fails here.
+func checkFilteredPathRelations(t *testing.T, label string, shape NodeShape, leaf LeafIndex, steps []PathStep) {
+	t.Helper()
+	n := shape.LeafCount()
+	leafNode := leaf.NodeIndex()
+	directPath, err := DirectPath(leafNode, n)
+	if err != nil {
+		t.Fatalf("%s: direct path of leaf %d: %v", label, leaf, err)
+	}
+	copathNodes, err := Copath(leafNode, n)
+	if err != nil {
+		t.Fatalf("%s: copath of leaf %d: %v", label, leaf, err)
+	}
+	position := 0
+	for _, step := range steps {
+		for position < len(directPath) && directPath[position] != step.Node {
+			position += 1
+		}
+		if position >= len(directPath) {
+			t.Fatalf("%s: leaf %d: step %v is not on the direct path %v in order", label, leaf, step, directPath)
+		}
+		if step.CopathChild != copathNodes[position] {
+			t.Fatalf("%s: leaf %d: step %v pairs with copath entry %d", label, leaf, step, copathNodes[position])
+		}
+		parent, err := Parent(step.CopathChild, n)
+		if err != nil {
+			t.Fatalf("%s: leaf %d: parent of %d: %v", label, leaf, step.CopathChild, err)
+		}
+		if parent != step.Node {
+			t.Fatalf("%s: leaf %d: step %v has a copath child whose parent is %d", label, leaf, step, parent)
+		}
+		if !InSubtree(step.Node, leafNode) {
+			t.Fatalf("%s: leaf %d: step %v keys a node the leaf is not under", label, leaf, step)
+		}
+		if InSubtree(step.CopathChild, leafNode) {
+			t.Fatalf("%s: leaf %d: step %v encrypts to a subtree the leaf is inside", label, leaf, step)
+		}
+		position += 1
+	}
+}
+
+// the filtered path of leaves of every tree size, under four blank structures.
+//
+// this is the band nothing else in this file reaches. the mlswg families stop
+// at 127 nodes, which is level 6, both figures RFC 9420 draws are eight-leaf
+// trees, and the exhaustive shape sweeps stop at eight leaves and the drop
+// patterns at twelve levels. what is left is levels 13 to 31, and a version
+// that is right below level 13 and wrong above it — a step paired with the
+// wrong copath entry at one level, a node emitted in place of its copath child
+// at one level — passes every one of them.
+//
+// the shapes are chains and thin random sets rather than arbitrary blank ones
+// because an arbitrary one is not affordable at this depth: a copath child at
+// level 30 that is blank throughout is 2^31 nodes to walk. these keep every
+// resolution to O(depth) nodes, which is what makes the levels assertable at
+// all, and the sweep that follows carries the drop arm at the price it costs.
+func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
+	checked := int64(0)
+	stepsByArm, dropsByArm := [4]int64{}, [4]int64{}
+	for depth := uint32(0); depth <= 31; depth += 1 {
+		leaves := LeafCount(1) << depth
+		sweepLeaves := []LeafIndex{0, LeafIndex(uint64(leaves) - 1)}
+		for probe := uint64(1); probe <= 6; probe += 1 {
+			sweepLeaves = append(sweepLeaves, LeafIndex(probe*resolutionLeafStride%uint64(leaves)))
+		}
+		for _, leaf := range sweepLeaves {
+			sibling := LeafIndex(uint64(leaf) ^ 0x01)
+			if LeafCount(sibling) >= leaves {
+				sibling = leaf
+			}
+			sweepShapes := []struct {
+				label string
+				shape NodeShape
+			}{
+				// nothing blank, so every copath child resolves to itself and
+				// the filtered path is the whole direct path at every level.
+				{label: "nothing blank", shape: &functionShape{
+					shapeLeafCount: leaves,
+					blankNode:      nil,
+					unmergedOfNode: func(x NodeIndex) []LeafIndex { return unmergedLeavesOfNode(unmergedDense, leaves, x) },
+				}},
+				// the leaf's own path blank, which blanks nothing on its copath
+				// and so again drops nothing: the arm that says the filter reads
+				// the copath side and not the leaf's own.
+				{label: "the path of the leaf blank", shape: pathBlankShape(leaves, []LeafIndex{leaf}, unmergedMixed)},
+				// the sibling leaf's path blank, which makes the level zero
+				// copath child a blank leaf and drops the level one node, while
+				// every copath child above it is a blank parent over something
+				// populated and stays.
+				{label: "the path of the sibling leaf blank", shape: pathBlankShape(leaves, []LeafIndex{sibling}, unmergedDense)},
+				// and half the nodes blank, so a copath child is as likely to be
+				// a blank node with a populated frontier under it as a member.
+				{label: "half the nodes blank", shape: randomBlankShape(leaves, 0x5EED+uint64(leaf), 4, unmergedDense)},
+			}
+			for arm, w := range sweepShapes {
+				if !filteredPathAgrees(w.shape, leaf, depth) {
+					reportFilteredPath(t, fmt.Sprintf("%d leaves, %s", leaves, w.label), w.shape, leaf, depth)
+				}
+				got, err := FilteredDirectPath(w.shape, leaf)
+				if err != nil {
+					t.Fatalf("%d leaves, %s, leaf %d: %v", leaves, w.label, leaf, err)
+				}
+				checkFilteredPathRelations(t, fmt.Sprintf("%d leaves, %s", leaves, w.label), w.shape, leaf, got)
+				checked += 1
+				stepsByArm[arm] += int64(len(got))
+				dropsByArm[arm] += int64(depth) - int64(len(got))
+			}
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		{label: "filtered paths across every depth", got: checked, want: 32 * 8 * 4},
+		// each arm counted on its own, so an arm that stopped reaching its own
+		// answer is visible rather than covered by the other three. the first
+		// two drop nothing by construction — 8 leaves times the sum of the
+		// depths, which is 496 — the third drops its level one node at every
+		// depth of one or more, and the fourth is a measured count of a fixed
+		// seed rather than a derived one.
+		{label: "nodes kept with nothing blank", got: stepsByArm[0], want: 8 * 496},
+		{label: "nodes dropped with nothing blank", got: dropsByArm[0], want: 0},
+		{label: "nodes kept with the leaf's own path blank", got: stepsByArm[1], want: 8 * 496},
+		{label: "nodes dropped with the leaf's own path blank", got: dropsByArm[1], want: 0},
+		{label: "nodes kept with the sibling's path blank", got: stepsByArm[2], want: 8 * 465},
+		{label: "nodes dropped with the sibling's path blank", got: dropsByArm[2], want: 8 * 31},
+		{label: "nodes kept with half the nodes blank", got: stepsByArm[3], want: 3810},
+		{label: "nodes dropped with half the nodes blank", got: dropsByArm[3], want: 158},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the highest level a dropped node is observed at, and why the line is there.
+//
+// a node is dropped when its copath child resolves to nothing, and a subtree
+// resolves to nothing only if every node in it is blank. the shape answers one
+// node at a time, so certifying that costs 2^(k+1)-1 queries at level k for
+// this implementation, for the oracle beside it, and for any other
+// implementation of this interface: nothing can conclude a subtree is empty
+// without looking at all of it. measured, every level up to this one together
+// is 1.6 seconds; level 27 alone would add as much again, level 30 twelve
+// seconds and level 31 twenty-four. the drop arm is observed to this level and
+// the keep arm to level 31, and what that leaves open is a class rather than
+// nothing: a version that forces a keep at a level above this one has no drop
+// to disagree with, where one that forces a drop is caught by the keep arm at
+// every level there is. the task report states it as measured rather than
+// arguing it away.
+const filteredDropLevelCeiling = 26
+
+// the highest level a dropped node is the root of its own tree at.
+//
+// dropping the root means half the tree is blank, which is the one drop the
+// published corpora never show, and it costs the same 2^(k+1)-1 as any other
+// drop at that level. the shallow arm is kept well below the ceiling because it
+// runs beside the deep one at every level rather than instead of it.
+const filteredDropRootCeiling = 20
+
+// a shape whose blank nodes are exactly the subtree headed by one node, so that
+// node resolves to nothing and every other node of the tree resolves to itself.
+//
+// membership is underNode, which decides it from the array layout with a shift
+// and two comparisons and reaches no function of this package. it is a shift
+// and two comparisons rather than a mask over the levels because this is the
+// shape the deep drop sweep pays 2^k queries to, and a predicate that walked
+// the levels would multiply that by the depth.
+func subtreeBlankShape(leaves LeafCount, headLevel uint32, headBlock uint64) *functionShape {
+	return &functionShape{
+		shapeLeafCount: leaves,
+		blankNode: func(x NodeIndex) bool {
+			return underNode(headLevel, headBlock, x)
+		},
+		unmergedOfNode: nil,
+	}
+}
+
+// a dropped node at every level, in the deepest tree there is and in the
+// shallowest tree that has one.
+//
+// the sweep above never drops above level one, because every shape it can
+// afford leaves something populated under every copath child. this is the arm
+// that pays for a drop: one copath child blanked throughout, one level at a
+// time, with every other node of the tree populated so the rest of the path
+// stays and the answer is the direct path less exactly one node.
+//
+// the two depths are not the same case. in the deepest tree the dropped node
+// has a populated parent above it, so a version that dropped the node above the
+// empty child rather than the node beside it produces a path one node short in
+// the wrong place; in the shallowest the dropped node is the root, so the same
+// version produces a path that is the right length and stops one node early.
+func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
+	checked, dropped := int64(0), int64(0)
+	for level := uint32(1); level <= filteredDropLevelCeiling; level += 1 {
+		depthCases := []struct {
+			depth uint32
+			leaf  LeafIndex
+		}{
+			{depth: 31, leaf: 0},
+		}
+		if level <= filteredDropRootCeiling {
+			depthCases = append(depthCases, struct {
+				depth uint32
+				leaf  LeafIndex
+			}{depth: level, leaf: LeafIndex(resolutionLeafStride % (uint32(1) << level))})
+		}
+		for _, c := range depthCases {
+			leaves := LeafCount(1) << c.depth
+			// the copath child of this leaf at one level below the node that
+			// has to come out, blanked throughout.
+			shape := subtreeBlankShape(leaves, level-1, uint64(c.leaf)>>(level-1)^0x01)
+			label := fmt.Sprintf("%d leaves, the copath child at level %d blank throughout", leaves, level-1)
+			if !filteredPathAgrees(shape, c.leaf, c.depth) {
+				reportFilteredPath(t, label, shape, c.leaf, c.depth)
+			}
+			got, err := FilteredDirectPath(shape, c.leaf)
+			if err != nil {
+				t.Fatalf("%s: leaf %d: %v", label, c.leaf, err)
+			}
+			checkFilteredPathRelations(t, label, shape, c.leaf, got)
+			if len(got) != int(c.depth)-1 {
+				t.Fatalf("%s: leaf %d: %d nodes, want %d", label, c.leaf, len(got), int(c.depth)-1)
+			}
+			// and the node missing is the one at this level, which a count
+			// cannot see: every level of the path is walked and the one the
+			// mask names must be absent while every other must be present.
+			position := 0
+			for walked := uint32(1); walked <= c.depth; walked += 1 {
+				if walked == level {
+					dropped += 1
+					continue
+				}
+				stepLevel, _ := nodeLevelAndBlock(got[position].Node)
+				if stepLevel != walked {
+					t.Fatalf("%s: leaf %d: step %d is node %d at level %d, want level %d",
+						label, c.leaf, position, got[position].Node, stepLevel, walked)
+				}
+				position += 1
+			}
+			checked += 1
+		}
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		{label: "levels a drop was observed at", got: checked, want: int64(filteredDropLevelCeiling + filteredDropRootCeiling)},
+		{label: "dropped nodes", got: dropped, want: int64(filteredDropLevelCeiling + filteredDropRootCeiling)},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
