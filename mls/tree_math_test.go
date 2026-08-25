@@ -2225,173 +2225,6 @@ func walkNodes(chunks []nodeChunk, check func(level uint32, block uint64) bool) 
 	return walked, first.failed, first.level, first.block
 }
 
-// whether x is the node at (level, block) or one of its descendants, from the
-// array layout alone.
-//
-// the subtree of a level-k node is the 2^(k+1)-1 slots of the leaves it covers
-// and the parents between them, which is the whole of the block of 2^(k+1)
-// slots that node sits in bar the last one — the last belongs to the node above,
-// which starts a block earlier. so membership is a shift and two comparisons on
-// the block, and it borrows nothing from the functions under test: no span, no
-// level, no comparison against an endpoint. that is the point of it. a
-// membership oracle built from the span would agree with a wrong span by
-// construction, which is the shape spanOracle was written to avoid, and this is
-// the same avoidance one relation further on.
-func underNode(level uint32, block uint64, x NodeIndex) bool {
-	return uint64(x)>>(level+1) == block && uint64(x) != (block+1)<<(level+1)-1
-}
-
-// the widest subtree the membership sweep walks slot by slot instead of probing
-// at chosen offsets: 31 slots, which is level 4.
-//
-// every level costs about the same to walk whole — a level has 2^(31-k) nodes
-// and each spans 2^(k+1)-1 slots, so the product is 2^32 either way — which
-// puts walking all 32 levels whole at 137e9 probes and 20 seconds. the first
-// five levels are 26e9 probes and three of those seconds, and they are where
-// the nodes are: 4.16e9 of the 4.29e9. above level 4 a whole walk also stops
-// being the cheaper of the two, since the probe set below is 37 slots and a
-// level-5 subtree is 63.
-const spanWalkWidth = 31
-
-// how many offsets that move with the block a wide subtree is probed at inside
-// its span, and how many anywhere in the array.
-const spanMovingProbes = 8
-const spanDistantProbes = 8
-
-// odd multipliers for those moving offsets. any odd numbers would do; these are
-// the usual mixing constants. what matters is that they are odd, so the offsets
-// they reach are not the powers of two the ends, the head and the ladder
-// already land on, and that the block multiplies one of them, so the offsets
-// differ from one node of a level to the next.
-const spanBlockStride = 0x9E3779B1
-const spanOffsetStride = 0x85EBCA6B
-const spanDistantStride = 0xC2B2AE35
-
-// how many steps the ladder inside one wide span has.
-//
-// sixteen up to level 7, and above it a budget of 2^25 probes a level, which is
-// the shape the cost has: the nodes at a level halve as the level rises while
-// their spans double, so a flat budget buys 64 steps at level 8 and 2^25 at
-// level 31 for a tenth of a second over the whole band. the fraction of a span
-// between two steps is what the ladder is for — the class it holds is a version
-// that answers wrong over a run of a subtree rather than at a slot of it, which
-// no probe at an end can see — and that fraction is 1/16 at the bottom and
-// 2^-25 at the top.
-func spanProbeSteps(level uint32) uint64 {
-	steps := uint64(16)
-	if level >= 8 {
-		steps = 64
-		if budget := uint64(1) << (level - 6); budget > steps {
-			steps = budget
-		}
-	}
-	if width := uint64(1)<<(level+1) - 1; steps > width {
-		steps = width
-	}
-	return steps
-}
-
-// the first slot InSubtree answers wrong about for one node, against the layout
-// oracle, if there is one.
-//
-// a narrow subtree is walked whole, from the slot below it to the slot above:
-// 33 slots at level 4, at every one of the 2^27 nodes of that level. a
-// wide one is probed at both ends, at the head, along a ladder of even steps,
-// at offsets that move with the block, and at slots spread across the whole
-// array rather than beside the span. the moving offsets are what a ladder
-// cannot hold: a ladder lands on the same fractions of a span at every node of
-// a level, so a version keyed on an offset rather than on a fraction sits
-// between its steps at every node of that level, and these offsets sit
-// somewhere else at every block.
-//
-// the probes beside the span and the distant ones ask whether InSubtree agrees
-// with underNode, so the false half of the relation is asserted as directly as
-// the true half. the ladder and the moving offsets are inside the span by
-// construction, since the ends they are measured from are the layout's.
-func membershipDisagreement(level uint32, block uint64) (NodeIndex, bool) {
-	head := nodeAt(level, block)
-	firstNode, lastNode, _, _ := spanOracle(level, block)
-	width := uint64(1)<<(level+1) - 1
-
-	// the slot below block zero is not representable, so a walk that started
-	// there would wrap to the top of the array and ask about a slot that is
-	// outside the subtree for an unrelated reason. the slot above the last
-	// always is: the widest subtree ends at 0xFFFFFFFE and the slot above that
-	// is the index no tree holds.
-	lowest := firstNode
-	if firstNode > 0 {
-		lowest = firstNode - 1
-	}
-
-	// a narrow subtree is every slot of it and the slot either side, and the
-	// counter runs in uint64 because the top block of a level ends at
-	// 0xFFFFFFFE: a uint32 counter that reached the slot above it would wrap
-	// round to zero and walk the array again for ever.
-	if width <= spanWalkWidth {
-		if lowest != firstNode && InSubtree(head, lowest) {
-			return lowest, true
-		}
-		if InSubtree(head, lastNode+1) {
-			return lastNode + 1, true
-		}
-		for slot := uint64(firstNode); slot <= uint64(lastNode); slot += 1 {
-			if !InSubtree(head, NodeIndex(slot)) {
-				return NodeIndex(slot), true
-			}
-		}
-		return 0, false
-	}
-
-	for _, x := range [5]NodeIndex{lowest, firstNode, head, lastNode, lastNode + 1} {
-		if InSubtree(head, x) != underNode(level, block, x) {
-			return x, true
-		}
-	}
-	steps := spanProbeSteps(level)
-	for step := uint64(1); step < steps; step += 1 {
-		x := firstNode + NodeIndex(width*step/steps)
-		if !InSubtree(head, x) {
-			return x, true
-		}
-	}
-	for probe := uint64(0); probe < spanMovingProbes; probe += 1 {
-		x := firstNode + NodeIndex((block*spanBlockStride+probe*spanOffsetStride)%width)
-		if !InSubtree(head, x) {
-			return x, true
-		}
-	}
-	for probe := uint64(0); probe < spanDistantProbes; probe += 1 {
-		x := NodeIndex(uint32(block*spanBlockStride + probe*spanDistantStride))
-		if InSubtree(head, x) != underNode(level, block, x) {
-			return x, true
-		}
-	}
-	return 0, false
-}
-
-// reports whether one node's membership answers are the layout's.
-//
-// a plain predicate rather than an assertion taking t, for the reason
-// spanAgrees gives: the sweep below calls it 4.29e9 times and t.Helper walks
-// the call stack on every call.
-func membershipAgrees(level uint32, block uint64) bool {
-	_, disagrees := membershipDisagreement(level, block)
-	return !disagrees
-}
-
-// fails the test with the node, the slot it disagreed about and both answers.
-func reportMembership(t *testing.T, level uint32, block uint64) {
-	t.Helper()
-	x, disagrees := membershipDisagreement(level, block)
-	head := nodeAt(level, block)
-	if !disagrees {
-		t.Fatalf("level %d block %d: node %d was refused by the sweep and agrees when it is asked again", level, block, head)
-	}
-	firstNode, lastNode, _, _ := spanOracle(level, block)
-	t.Fatalf("level %d block %d: node %d heads [%d, %d] over the layout, and holds slot %d: %v, want %v",
-		level, block, head, firstNode, lastNode, x, InSubtree(head, x), underNode(level, block, x))
-}
-
 // the span of every node of the eight-leaf tree and of four levels above it,
 // against values worked out by hand from the array layout before anything ran.
 //
@@ -2576,13 +2409,20 @@ func TestSubtreeSpanAtEveryLevel(t *testing.T) {
 // whether an index a caller never validated can pass itself off as the head of
 // the whole array.
 //
-// this test is the sole holder of four versions, measured one test at a time
-// rather than claimed: the range guard removed, the guarded answer written as
-// the whole array, and either halving rounded up instead of down. every other
-// test in this package passes all four. the first two would make an index no
-// tree holds the head of every node of the largest tree; the second two are
-// this function at every index a tree does hold, and differ only at the index
-// that is in none, where the rounding wraps to zero.
+// this test is the sole holder of four named versions, measured one test at a
+// time rather than claimed, and re-measured against the sweeps that replaced
+// the sampled ones: the range guard removed, the guarded answer written as the
+// whole array, and either halving rounded up instead of down. every other test
+// in this package passes all four. the first two would make an index no tree
+// holds the head of every node of the largest tree; the second two are this
+// function at every index a tree does hold, and differ only at the index that
+// is in none, where the rounding wraps to zero.
+//
+// four is what one enumeration reached and not a count of the class, which is
+// the distinction this task got wrong elsewhere and is not repeating here: a
+// wider catalogue of versions makes this test the only killer of many more, and
+// what it holds alone is every version that differs only at the index no tree
+// holds, since that index is the one the sweeps below never reach as a head.
 func TestSubtreeSpanArms(t *testing.T) {
 	leafArms, outOfRangeArms := 0, 0
 
@@ -2777,6 +2617,173 @@ func TestInSubtree(t *testing.T) {
 	}
 }
 
+// whether x is the node at (level, block) or one of its descendants, from the
+// array layout alone.
+//
+// the subtree of a level-k node is the 2^(k+1)-1 slots of the leaves it covers
+// and the parents between them, which is the whole of the block of 2^(k+1)
+// slots that node sits in bar the last one — the last belongs to the node above,
+// which starts a block earlier. so membership is a shift and two comparisons on
+// the block, and it borrows nothing from the functions under test: no span, no
+// level, no comparison against an endpoint. that is the point of it. a
+// membership oracle built from the span would agree with a wrong span by
+// construction, which is the shape spanOracle was written to avoid, and this is
+// the same avoidance one relation further on.
+func underNode(level uint32, block uint64, x NodeIndex) bool {
+	return uint64(x)>>(level+1) == block && uint64(x) != (block+1)<<(level+1)-1
+}
+
+// the widest subtree the membership sweep walks slot by slot instead of probing
+// at chosen offsets: 31 slots, which is level 4.
+//
+// every level costs about the same to walk whole — a level has 2^(31-k) nodes
+// and each spans 2^(k+1)-1 slots, so the product is 2^32 either way — which
+// puts walking all 32 levels whole at 137e9 probes and 20 seconds. the first
+// five levels are 26e9 probes and three of those seconds, and they are where
+// the nodes are: 4.16e9 of the 4.29e9. above level 4 a whole walk also stops
+// being the cheaper of the two, since the probe set below is 37 slots and a
+// level-5 subtree is 63.
+const spanWalkWidth = 31
+
+// how many offsets that move with the block a wide subtree is probed at inside
+// its span, and how many anywhere in the array.
+const spanMovingProbes = 8
+const spanDistantProbes = 8
+
+// odd multipliers for those moving offsets. any odd numbers would do; these are
+// the usual mixing constants. what matters is that they are odd, so the offsets
+// they reach are not the powers of two the ends, the head and the ladder
+// already land on, and that the block multiplies one of them, so the offsets
+// differ from one node of a level to the next.
+const spanBlockStride = 0x9E3779B1
+const spanOffsetStride = 0x85EBCA6B
+const spanDistantStride = 0xC2B2AE35
+
+// how many steps the ladder inside one wide span has.
+//
+// sixteen up to level 7, and above it a budget of 2^25 probes a level, which is
+// the shape the cost has: the nodes at a level halve as the level rises while
+// their spans double, so a flat budget buys 64 steps at level 8 and 2^25 at
+// level 31 for a tenth of a second over the whole band. the fraction of a span
+// between two steps is what the ladder is for — the class it holds is a version
+// that answers wrong over a run of a subtree rather than at a slot of it, which
+// no probe at an end can see — and that fraction is 1/16 at the bottom and
+// 2^-25 at the top.
+func spanProbeSteps(level uint32) uint64 {
+	steps := uint64(16)
+	if level >= 8 {
+		steps = 64
+		if budget := uint64(1) << (level - 6); budget > steps {
+			steps = budget
+		}
+	}
+	if width := uint64(1)<<(level+1) - 1; steps > width {
+		steps = width
+	}
+	return steps
+}
+
+// the first slot InSubtree answers wrong about for one node, against the layout
+// oracle, if there is one.
+//
+// a narrow subtree is walked whole, from the slot below it to the slot above:
+// 33 slots at level 4, at every one of the 2^27 nodes of that level. a
+// wide one is probed at both ends, at the head, along a ladder of even steps,
+// at offsets that move with the block, and at slots spread across the whole
+// array rather than beside the span. the moving offsets are what a ladder
+// cannot hold: a ladder lands on the same fractions of a span at every node of
+// a level, so a version keyed on an offset rather than on a fraction sits
+// between its steps at every node of that level, and these offsets sit
+// somewhere else at every block.
+//
+// the probes beside the span and the distant ones ask whether InSubtree agrees
+// with underNode, so the false half of the relation is asserted as directly as
+// the true half. the ladder and the moving offsets are inside the span by
+// construction, since the ends they are measured from are the layout's.
+func membershipDisagreement(level uint32, block uint64) (NodeIndex, bool) {
+	head := nodeAt(level, block)
+	firstNode, lastNode, _, _ := spanOracle(level, block)
+	width := uint64(1)<<(level+1) - 1
+
+	// the slot below block zero is not representable, so a walk that started
+	// there would wrap to the top of the array and ask about a slot that is
+	// outside the subtree for an unrelated reason. the slot above the last
+	// always is: the widest subtree ends at 0xFFFFFFFE and the slot above that
+	// is the index no tree holds.
+	lowest := firstNode
+	if firstNode > 0 {
+		lowest = firstNode - 1
+	}
+
+	// a narrow subtree is every slot of it and the slot either side, and the
+	// counter runs in uint64 because the top block of a level ends at
+	// 0xFFFFFFFE: a uint32 counter that reached the slot above it would wrap
+	// round to zero and walk the array again for ever.
+	if width <= spanWalkWidth {
+		if lowest != firstNode && InSubtree(head, lowest) {
+			return lowest, true
+		}
+		if InSubtree(head, lastNode+1) {
+			return lastNode + 1, true
+		}
+		for slot := uint64(firstNode); slot <= uint64(lastNode); slot += 1 {
+			if !InSubtree(head, NodeIndex(slot)) {
+				return NodeIndex(slot), true
+			}
+		}
+		return 0, false
+	}
+
+	for _, x := range [5]NodeIndex{lowest, firstNode, head, lastNode, lastNode + 1} {
+		if InSubtree(head, x) != underNode(level, block, x) {
+			return x, true
+		}
+	}
+	steps := spanProbeSteps(level)
+	for step := uint64(1); step < steps; step += 1 {
+		x := firstNode + NodeIndex(width*step/steps)
+		if !InSubtree(head, x) {
+			return x, true
+		}
+	}
+	for probe := uint64(0); probe < spanMovingProbes; probe += 1 {
+		x := firstNode + NodeIndex((block*spanBlockStride+probe*spanOffsetStride)%width)
+		if !InSubtree(head, x) {
+			return x, true
+		}
+	}
+	for probe := uint64(0); probe < spanDistantProbes; probe += 1 {
+		x := NodeIndex(uint32(block*spanBlockStride + probe*spanDistantStride))
+		if InSubtree(head, x) != underNode(level, block, x) {
+			return x, true
+		}
+	}
+	return 0, false
+}
+
+// reports whether one node's membership answers are the layout's.
+//
+// a plain predicate rather than an assertion taking t, for the reason
+// spanAgrees gives: the sweep below calls it 4.29e9 times and t.Helper walks
+// the call stack on every call.
+func membershipAgrees(level uint32, block uint64) bool {
+	_, disagrees := membershipDisagreement(level, block)
+	return !disagrees
+}
+
+// fails the test with the node, the slot it disagreed about and both answers.
+func reportMembership(t *testing.T, level uint32, block uint64) {
+	t.Helper()
+	x, disagrees := membershipDisagreement(level, block)
+	head := nodeAt(level, block)
+	if !disagrees {
+		t.Fatalf("level %d block %d: node %d was refused by the sweep and agrees when it is asked again", level, block, head)
+	}
+	firstNode, lastNode, _, _ := spanOracle(level, block)
+	t.Fatalf("level %d block %d: node %d heads [%d, %d] over the layout, and holds slot %d: %v, want %v",
+		level, block, head, firstNode, lastNode, x, InSubtree(head, x), underNode(level, block, x))
+}
+
 // membership at every node of the largest representable tree: the slots either
 // side of its subtree, slots inside it, slots nowhere near it, and the direct
 // path, at every depth a tree can have.
@@ -2810,16 +2817,27 @@ func TestInSubtree(t *testing.T) {
 // span must not be excusable by a matching wrong path. the oracle calls nothing
 // in this package and is run against RFC 9420 table 2 and figure 11 above.
 //
-// the sweep is 4.29e9 nodes and 28.7e9 probes, which is 3.4 seconds across the
-// cores of this machine. what it does not reach is stated rather than implied:
-// levels 4 and up are probed at chosen offsets inside a span rather than at
-// every slot, so a version wrong at one slot of one wide subtree and right
-// everywhere else lives — the ladder holds any run of a span wider than a
-// sixteenth of it at level 4, and a thirty-two-millionth of it at level 31, and
-// the moving offsets hold the rest by fraction rather than by node.
-// TestInSubtreeEveryPairOfATree closes that class outright up to level 14 for
-// the leftmost 2^14 leaves, and closing it for the whole array is 137e9 probes
-// and 20 seconds, measured.
+// the sweep is 4.29e9 nodes and the probe rule adds up to 31,876,710,348 slots
+// asked about, which is 5 seconds across the 24 cores this was written on.
+//
+// what it does not reach is stated as a class rather than as a list of nodes,
+// which is the correction this task's review turned on: a list of instances is
+// not a class, and this plan has confused the two once for every task in it. an
+// interior slot above level 4 is probed rather than walked, so what lives is a
+// version wrong over a run of one subtree narrower than the ladder's step at
+// that level and right at every other node of the array. measured over an
+// enumeration of 441 versions, of which the sampled file let 227 through: 11
+// live here, every one of them a run inside a single node narrower than one
+// part in spanProbeSteps — one slot at levels 5 to 31, a 1/1024 run at levels 5
+// to 12, a 1/64 run at level 5 — and every version of that shape keyed on a
+// level rather than on a node dies. three more live one relation away: a
+// version answering true for a slot in the block past one node's subtree, at
+// levels 0 to 4, where every slot of a span and the two beside it are walked
+// and nothing further is asked. more probes do not close either class, since
+// both are keyed on a node and a probe that moves cannot be everywhere; walking
+// every slot of every subtree does, and that is 133,143,986,177 probes and 19
+// seconds, measured. TestInSubtreeEveryPairOfATree closes both for the leftmost
+// 2^14 leaves for an eighth of a second.
 func TestInSubtreeAtEveryLevel(t *testing.T) {
 	walked, failed, failLevel, failBlock := walkNodes(nodeChunks(0, 31), membershipAgrees)
 	if failed {
@@ -2890,7 +2908,7 @@ func TestInSubtreeAtEveryLevel(t *testing.T) {
 // the sweep above probes a wide subtree at its ends, along a ladder and at
 // offsets that move with the block, which is not the same as asking about every
 // slot; this asks about every slot, of every node, in the largest tree the pair
-// count affords. 32,767 nodes and 1,073,676,289 pairs, a fifth of a second.
+// count affords. 32,767 nodes and 1,073,676,289 pairs, an eighth of a second.
 //
 // what it holds that nothing else in this package does is the whole of the
 // relation at the levels the vector family cannot reach. that family walks
@@ -2931,6 +2949,9 @@ func TestInSubtreeEveryPairOfATree(t *testing.T) {
 	}{
 		// sum(k=0..14) 2^(14-k) = 2^15-1, the node width of the tree.
 		{label: "nodes of a 2^14-leaf tree", got: walked, want: 32767},
+		// every row asks about every slot, so this is the row count times the
+		// width rather than a second thing counted, and it is here because the
+		// number of pairs is what the test is worth knowing by.
 		{label: "ordered pairs", got: walked * int64(width), want: 1073676289},
 	}
 	for _, c := range countCases {

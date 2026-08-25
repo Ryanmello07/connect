@@ -475,8 +475,20 @@ func CommonAncestor(x NodeIndex, y NodeIndex) NodeIndex {
 // half-span computed in uint32, Level's leaf shortcut dropped, level zero
 // collapsed to itself, and the guarded answer written as x, 0xFFFFFFFF. that
 // they are this function was established by walking all 2^32 indices, not
-// inferred from the sweep. the other 12 are real and are named in the test
-// file, which says what would close them.
+// inferred from the sweep.
+//
+// the other 12 were called real and named one node at a time, and the naming
+// was the error. the class was not twelve nodes: it was every version that
+// agreed with this one wherever the tests looked, and the tests looked at
+// 0.4879% of the domain. measured since, by counting the distinct arguments a
+// whole package run passes here — 20,955,304 of the 4,294,967,296 indices, with
+// levels 0 to 7 at 0.09766% each — and versions wrong over runs of hundreds of
+// millions of nodes at those levels passed the file. the sweep walks every
+// index a tree can hold now, so that class is closed by construction rather
+// than counted down: of 441 versions enumerated over the three bodies and the
+// conditions that confine them to a level, a node, a run of blocks or a run of
+// one span, 227 lived before and 11 live after, all 11 of them a run inside one
+// node's subtree at a level whose spans are probed rather than walked.
 func SubtreeSpan(x NodeIndex) (firstNode NodeIndex, lastNode NodeIndex) {
 	k := x.Level()
 	if k > 31 {
@@ -518,6 +530,21 @@ func SubtreeLeaves(x NodeIndex) (firstLeaf LeafIndex, lastLeaf LeafIndex) {
 // range test on the span rather than a walk up from x. the two give the same
 // answer (RFC 9420 appendix C figure 32) and the range test is the one that
 // terminates for an index no tree holds, since it asks nothing about a parent.
+//
+// which slots this is asked about is worth recording, because for a while it
+// was asked too narrowly to see a whole shape of mistake. the sweeps used to
+// probe a subtree at its two ends, at the head, and at the leftmost and
+// rightmost descendant on a direct path, and every one of those is a
+// power-of-two offset into the span: measured on that file, level 10 was asked
+// about 21 of the 2,047 offsets a span has, level 20 about 41 of 2,097,151 and
+// level 31 about 63 of 4,294,967,295. a version answering false for the quarter
+// of every subtree between 1/4 and 1/2 of its span, at every head above level
+// 9, passed the whole package — and section 7.9 has this function intersecting
+// unmerged leaves with the leaves under a child, where being wrong over a
+// quarter of a large subtree is a parent hash that verifies when it should not.
+// it is asked now about every slot of a subtree up to level 4, about a ladder
+// and offsets that move with the block above that, about slots nowhere near the
+// span, and about every ordered pair of a 2^14-leaf tree.
 func InSubtree(head NodeIndex, x NodeIndex) bool {
 	firstNode, lastNode := SubtreeSpan(head)
 	return firstNode <= x && x <= lastNode
