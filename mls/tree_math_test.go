@@ -5262,6 +5262,15 @@ func TestFilteredDirectPathAgainstPublishedTreeValidationResolutions(t *testing.
 				if len(vector.Resolutions[copathNodes[i]]) == 0 {
 					droppedNodes += 1
 					copathLevel, _ := nodeLevelAndBlock(copathNodes[i])
+					// a re-vendored corpus carrying a deeper tree indexes past this
+					// table, and a panic inside a test is not a report. the widths
+					// published today are 3, 7, 15, 63 and 127, so nothing here reaches
+					// slot 6; a corpus that did says which level it reached rather than
+					// stopping the run with a bare index.
+					if int(copathLevel)+1 >= filteredDropLevels {
+						t.Fatalf("%s: leaf %d: a node dropped at level %d, and this table holds %d levels",
+							label, leaf, copathLevel+1, filteredDropLevels)
+					}
 					dropsByLevel[copathLevel+1] += 1
 					continue
 				}
@@ -5813,18 +5822,21 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 		for probe := uint64(1); probe <= 6; probe += 1 {
 			sweepLeaves = append(sweepLeaves, LeafIndex(probe*resolutionLeafStride%uint64(leaves)))
 		}
-		// and the leftmost leaf under a named block of every level, so the
-		// path this arm walks passes through those blocks rather than through
-		// whatever the stride happens to reach. a kept node costs one query
-		// wherever it is, so the block set here is as wide as it likes where
-		// the drop arm's is what its 2^(k+1)-1 pays for. measured: with the
-		// eight leaves above alone, a version that forced a drop at block 9 of
-		// level 13, 16, 20, 22, 24, 25 or 26 passed the whole package.
+		// and a leaf under blocks spread across the whole of every level, so
+		// the path this arm walks passes through blocks anywhere in a level
+		// rather than through whatever the leaf stride happens to reach. the
+		// blocks are strided rather than written down because a written-down
+		// set has been wrong here twice: with the eight leaves above alone a
+		// version that forced a drop at block 9 of level 13, 16, 20, 22, 24,
+		// 25 or 26 passed the whole package, and with the five named blocks
+		// that replaced them one at block 11 of level 16, 20, 21, 22, 23, 24
+		// or 26 still did. the walk below covers that band by walking it
+		// instead of sampling it; this arm is the four blank structures
+		// carried across every depth beside it.
 		for level := uint32(0); level <= depth; level += 1 {
-			for _, block := range []uint64{1, 2, 3, 5, 9} {
-				if leaf := block << level; leaf < uint64(leaves) {
-					sweepLeaves = append(sweepLeaves, LeafIndex(leaf))
-				}
+			for probe := uint64(1); probe <= filteredKeepSpreadBlocks; probe += 1 {
+				block := probe * filteredKeepSpreadStride % (uint64(1) << (depth - level))
+				sweepLeaves = append(sweepLeaves, LeafIndex(block<<level))
 			}
 		}
 		for _, leaf := range sweepLeaves {
@@ -5880,8 +5892,10 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 		got   int64
 		want  int64
 	}{
-		{label: "filtered paths across every depth", got: checked, want: 10092},
-		{label: "direct path nodes walked by one arm", got: walkedByArm[0], want: 52581},
+		// eight leaves a depth plus five blocks of each of its levels, over
+		// depths 0 to 31, each of them under four blank structures.
+		{label: "filtered paths across every depth", got: checked, want: 4 * (32*8 + 5*528)},
+		{label: "direct path nodes walked by one arm", got: walkedByArm[0], want: 58528},
 		// each arm counted on its own, so an arm that stopped reaching its own
 		// answer is visible rather than covered by the other three. the first
 		// two drop nothing by construction, so their kept counts are the whole
@@ -5894,8 +5908,106 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 		{label: "nodes dropped with the leaf's own path blank", got: dropsByArm[1], want: 0},
 		{label: "nodes kept with the sibling's path blank", got: stepsByArm[2], want: walkedByArm[2] - pathsWithANode},
 		{label: "nodes dropped with the sibling's path blank", got: dropsByArm[2], want: pathsWithANode},
-		{label: "nodes kept with half the nodes blank", got: stepsByArm[3], want: 50864},
-		{label: "nodes dropped with half the nodes blank", got: dropsByArm[3], want: 1717},
+		{label: "nodes kept with half the nodes blank", got: stepsByArm[3], want: 56830},
+		{label: "nodes dropped with half the nodes blank", got: dropsByArm[3], want: 1698},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// the level of the deepest tree at and above which every block is walked, the
+// multiplier that spreads the blocks below it, and how many blocks of a level
+// the depth sweep above reaches beside this walk.
+//
+// the sweep above chooses which blocks its leaves pass through, and choosing is
+// what left a version that forced a drop at block 11 of level 16, 20, 21, 22,
+// 23, 24 or 26 alive on a node no test walked at all. a kept node costs one
+// query wherever it is, so the keep side does not have to choose: one leaf a
+// block of level twelve is 2^19 whole paths and puts every block of every level
+// at or above twelve on one of them. twelve is where that stops being free —
+// 524,288 paths of a 2^31-leaf tree, measured at two seconds, and every level
+// below it doubles that.
+//
+// the multiplier is not the one the leaf sweeps stride with, so the blocks this
+// reaches below level twelve are not the blocks the other arms reach and a
+// version gated on one of them cannot be gated on the set that found it.
+const filteredKeepBlockLevel = 12
+const filteredKeepSpreadStride = 0x85EBCA6B
+const filteredKeepSpreadBlocks = 5
+
+// every block of every level of the deepest tree there is, from
+// filteredKeepBlockLevel up, walked as a path with nothing dropped.
+//
+// this is the drop-forcing half of the (level, block) class, and above level
+// twelve it is walked rather than sampled: as block runs over every value of
+// that level, block >> (k - filteredKeepBlockLevel) runs over every block of
+// every level k at or above it, so each of those nodes is a step of a path
+// compared whole against the oracle. a version that keeps one node of one level
+// where it must come out, or that pairs one step with the wrong copath child at
+// one block of one level, has nowhere in that band to sit.
+//
+// below level twelve this is a stride and not a cover: level k sees one block
+// in 2^(12-k), offset inside each block so they are not the multiples of a
+// single power of two, and the block walk below builds a drop at every block
+// under 2^(d-k) of a tree of depth d. what that leaves is in the task report as
+// a fraction per level rather than as a list of pairs.
+//
+// one blank structure, because the structure that keeps every node is what this
+// arm is for: with nothing blank every copath child resolves to itself, the
+// answer is the whole direct path, and every level of it is asserted at its own
+// block. the four structures are the sweep above, which carries them across
+// every depth and pays a handful of blocks a level for it.
+func TestFilteredDirectPathWalksEveryBlockOfTheDeepestTree(t *testing.T) {
+	leaves := LeafCount(1) << 31
+	shape := &functionShape{
+		shapeLeafCount: leaves,
+		blankNode:      nil,
+		unmergedOfNode: nil,
+	}
+	checked, walked := int64(0), int64(0)
+	offsetMask := uint64(1)<<filteredKeepBlockLevel - 1
+	for block := uint64(0); block < uint64(1)<<(31-filteredKeepBlockLevel); block += 1 {
+		// the block, and a leaf inside it that is not its left edge, so the
+		// levels below this one are strided across their blocks instead of
+		// landing on the multiples of 2^12 every time.
+		leaf := LeafIndex(block<<filteredKeepBlockLevel |
+			block*filteredKeepSpreadStride&offsetMask)
+		if !filteredPathAgrees(shape, leaf, 31) {
+			reportFilteredPath(t, "2^31 leaves, nothing blank", shape, leaf, 31)
+		}
+		got, err := FilteredDirectPath(shape, leaf)
+		if err != nil {
+			t.Fatalf("2^31 leaves, leaf %d: %v", leaf, err)
+		}
+		if len(got) != 31 {
+			t.Fatalf("2^31 leaves, leaf %d: %d nodes, want 31", leaf, len(got))
+		}
+		// and the block of every step in closed form beside the oracle, since
+		// the block is what this walk enumerates: step k-1 must be the node at
+		// level k of this leaf, which is block leaf>>k of that level.
+		for level := uint32(1); level <= 31; level += 1 {
+			stepLevel, stepBlock := nodeLevelAndBlock(got[level-1].Node)
+			if stepLevel != level || stepBlock != uint64(leaf)>>level {
+				t.Fatalf("2^31 leaves, leaf %d: step %d is node %d at level %d block %d, want level %d block %d",
+					leaf, level-1, got[level-1].Node, stepLevel, stepBlock, level, uint64(leaf)>>level)
+			}
+			walked += 1
+		}
+		checked += 1
+	}
+	confirmedCases := []struct {
+		label string
+		got   int64
+		want  int64
+	}{
+		// one path a block of level twelve, each of them the whole depth of the
+		// tree, so every block of every level from twelve to thirty-one is a
+		// step of one of them.
+		{label: "whole paths walked", got: checked, want: 1 << (31 - filteredKeepBlockLevel)},
+		{label: "path nodes asserted at their block", got: walked, want: 31 << (31 - filteredKeepBlockLevel)},
 	}
 	for _, c := range confirmedCases {
 		if c.got != c.want {
@@ -5910,10 +6022,14 @@ func TestFilteredDirectPathAtEveryDepth(t *testing.T) {
 // a handful of blocks and no more. in a tree of depth d the whole of level k is
 // 2^(d-k) blocks of 2^k nodes each, which is 2^d for the level and d*2^d for
 // the tree however the levels are shaped — so every block of every level of a
-// small tree costs what one drop at the top of a large one does. sixteen is
-// where that stops being free: 900 thousand node visits and a tenth of a
-// second, doubling with every level after it.
-const filteredDropBlockWalkDepth = 16
+// small tree costs what one drop at the top of a large one does. eighteen is
+// where that stops being free: 524,268 drops at about two seconds, and every
+// level after it a little over doubles that — nineteen is four seconds and
+// twenty is nine. it was sixteen, and two more levels of depth is four times
+// the blocks at every level: level k of a tree of depth d has a drop built at
+// every block under 2^(d-k), which is the low end of the class the report
+// states as a fraction.
+const filteredDropBlockWalkDepth = 18
 
 // a dropped node at every block of every level of every tree to depth sixteen.
 //
@@ -6015,14 +6131,45 @@ const filteredDropLevelCeiling = 26
 // runs beside the deep one at every level rather than instead of it.
 const filteredDropRootCeiling = 20
 
-// the highest level a drop is built at the first four blocks of, rather than at
-// the first two.
+// the queries one level of the drop band may spend on blocks, the most blocks
+// any level spends them at, and the fewest a level builds a drop at however
+// dear a drop there is.
 //
-// a drop costs the same 2^(k+1)-1 at every block of a level, so the block count
-// is what the top of the band is paid for: four named blocks and a strided one
-// to level 24 and two named and a strided one above it is 7.4 seconds, where
-// four named blocks all the way would be 9.6.
-const filteredDropFourBlockCeiling = 24
+// a drop at level k costs 2^(k+1)-1 queries, so how many blocks of a level are
+// affordable is not something to write a list down for: it is a budget divided
+// by what a drop there costs. it was a list — the first four blocks to level 24
+// and the first two above it — and the list is what made this band's residual a
+// table of named pairs rather than a fraction, and what let a catalogue that
+// drop-forced at blocks 2, 5 and 9 conclude the band was covered. the budget
+// makes the band flat, every level paying about the same; the cap stops the
+// cheap levels spending their budget on per-path overhead instead of on
+// queries; the floor holds the dear levels at three blocks each.
+const filteredDropQueryBudget = 1 << 24
+const filteredDropBlockCap = 1 << 10
+const filteredDropMinBlocks = 3
+
+// how many blocks of one level the drop band builds a drop at, from what a drop
+// at that level costs.
+//
+// this is the whole of the rule, so the band can be priced from it and the
+// report can state what it leaves open per level instead of per pair: level k of
+// the deepest tree has 2^(31-k) blocks and this reaches filteredDropBlocks(k) of
+// them, which is 1024 up to level 13 and halves from there to the floor of 3 at
+// level 22.
+func filteredDropBlocks(level uint32) uint64 {
+	blocks := uint64(1) << (31 - level)
+	count := uint64(filteredDropQueryBudget) >> (level + 1)
+	if count > filteredDropBlockCap {
+		count = filteredDropBlockCap
+	}
+	if count < filteredDropMinBlocks {
+		count = filteredDropMinBlocks
+	}
+	if count > blocks {
+		count = blocks
+	}
+	return count
+}
 
 // a shape whose blank nodes are exactly the subtree headed by one node, so that
 // node resolves to nothing and every other node of the tree resolves to itself.
@@ -6059,25 +6206,27 @@ func subtreeBlankShape(leaves LeafCount, headLevel uint32, headBlock uint64) *fu
 func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 	checked, dropped := int64(0), int64(0)
 	for level := uint32(1); level <= filteredDropLevelCeiling; level += 1 {
-		// the same drop at several blocks of the level, since a version gated
-		// on one block of one level is what the sweeps around this one cannot
-		// see. the first four blocks are named and one more is strided, and
-		// the count thins at the top because a drop at level k costs 2^(k+1)-1
-		// whatever block it is at.
-		blockCount := uint64(4)
-		if level > filteredDropFourBlockCeiling {
-			blockCount = 2
-		}
+		// the same drop at as many blocks of the level as its price allows,
+		// since a version gated on one block of one level is what the sweeps
+		// around this one cannot see. block zero is named because it is the one
+		// block whose leaf is the left edge of every level at once; the rest
+		// are strided across the whole of the level rather than taken from its
+		// bottom, which is the part the block walk below already covers exactly.
+		blockCount := filteredDropBlocks(level)
 		blocks := uint64(1) << (31 - level)
 		depthCases := []struct {
 			depth uint32
 			leaf  LeafIndex
 		}{}
 		for block := uint64(0); block < blockCount; block += 1 {
+			at := uint64(0)
+			if block > 0 {
+				at = block * filteredKeepSpreadStride % blocks
+			}
 			depthCases = append(depthCases, struct {
 				depth uint32
 				leaf  LeafIndex
-			}{depth: 31, leaf: LeafIndex(block << level)})
+			}{depth: 31, leaf: LeafIndex(at << level)})
 		}
 		depthCases = append(depthCases, struct {
 			depth uint32
@@ -6130,12 +6279,16 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 		got   int64
 		want  int64
 	}{
-		// five blocks a level up to the four-block ceiling and three above it,
-		// plus the shallow arm.
-		{label: "drops observed", got: checked, want: int64(5*filteredDropFourBlockCeiling +
-			3*(filteredDropLevelCeiling-filteredDropFourBlockCeiling) + filteredDropRootCeiling)},
-		{label: "dropped nodes", got: dropped, want: int64(5*filteredDropFourBlockCeiling +
-			3*(filteredDropLevelCeiling-filteredDropFourBlockCeiling) + filteredDropRootCeiling)},
+		// what filteredDropBlocks allows at each level, written out rather than
+		// summed by the rule the loop uses, so a change to the rule has to be
+		// stated here as well as made there: 1024 blocks a level for levels 1
+		// to 13, then 512, 256, 128, 64, 32, 16, 8, 4, and the floor of 3 from
+		// level 22 to the ceiling — 14,347 in all. one strided block a level
+		// beside them, and the shallow arm below the root ceiling.
+		{label: "drops observed", got: checked,
+			want: int64(14347 + filteredDropLevelCeiling + filteredDropRootCeiling)},
+		{label: "dropped nodes", got: dropped,
+			want: int64(14347 + filteredDropLevelCeiling + filteredDropRootCeiling)},
 	}
 	for _, c := range confirmedCases {
 		if c.got != c.want {
