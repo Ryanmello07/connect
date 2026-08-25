@@ -4582,3 +4582,622 @@ func TestResolutionAgainstPublishedTreeValidationVectors(t *testing.T) {
 		}
 	}
 }
+
+// RFC 9420 figure 11 as a shape: the eight-leaf tree table 2 publishes paths
+// for, with members at leaves 0, 1, 4, 5 and 6.
+//
+// this is the tree TestDirectPathAndCopathRfcTable2 asserts the first two
+// columns of, written down a second time because the third column needs a
+// shape and the first two do not. read out of the RFC text at
+// https://www.rfc-editor.org/rfc/rfc9420.txt section 4.1.2, sha256
+// 467d709b7cea19d278204daca1af01910add522cd8e3325cb406f339efbb0d92: the
+// definition at line 1015, figure 11 at lines 1025 to 1037 and table 2 at lines
+// 1045 to 1059. cross-read against the HTML rendering at
+// https://www.rfc-editor.org/rfc/rfc9420.html section 4.1.2, which prints the
+// same definition, the same figure and the same five rows. the two readings
+// agree.
+//
+// the figure marks six of the fifteen nodes blank with an underscore: the
+// parents U, V and Z, the two unlabelled leaves at 2 and 3, and the leaf H at
+// 7. the other nine carry a member. the test below asserts all fifteen and not
+// only the six in the map, so a stray blank is caught as well as a missing one.
+func rfcFigure11Shape() *fixtureShape {
+	return &fixtureShape{
+		fixtureLeafCount: 8,
+		blankNodes: map[NodeIndex]bool{
+			3: true, 4: true, 5: true, 6: true, 13: true, 14: true,
+		},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+}
+
+// reports whether two step slices hold the same pairs in the same order.
+//
+// order is the contract here as it is for a resolution: an UpdatePath carries
+// one node per step in this order and a member decrypts the step its own leaf
+// sits under, so a path with the right steps in the wrong order hands out the
+// wrong secrets and still has the right length.
+func samePathSteps(got []PathStep, want []PathStep) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func assertPathSteps(t *testing.T, label string, got []PathStep, want []PathStep) {
+	t.Helper()
+	if !samePathSteps(got, want) {
+		t.Errorf("%s: %v, want %v", label, got, want)
+	}
+}
+
+// whether the resolution of a node is empty, decided without building it: a
+// subtree resolves to nothing exactly when every node in it is blank, and this
+// stops at the first node that is not.
+//
+// this is a third reading of section 4.1 and not a shortcut through the two
+// already here. descentResolution unrolls the recursion the implementation's
+// stack does and scanResolution reads the rules as a per-slot predicate; this
+// reads only the emptiness question the filter actually asks, which is the one
+// thing the filter needs and the one thing neither of those two answers
+// cheaply. it reaches no function of this package: the children are the two
+// half blocks one level down and the leaf case is the level.
+//
+// the early exit is what makes the deep sweeps affordable at all, and it is
+// also why the drop arm costs what it does: a subtree that really is blank
+// throughout has no early exit anywhere in it, so certifying one empty
+// resolution at level k is 2^(k+1)-1 shape queries for this oracle exactly as
+// it is for the implementation.
+//
+// TestFilteredDirectPathEmptinessOracle runs it against both of the other two
+// over every shape of a four-leaf tree and every blank shape of an eight-leaf
+// tree before any sweep uses it.
+func blankThroughout(shape NodeShape, level uint32, block uint64) bool {
+	if !shape.IsBlank(nodeAt(level, block)) {
+		return false
+	}
+	if level == 0 {
+		return true
+	}
+	return blankThroughout(shape, level-1, 2*block) && blankThroughout(shape, level-1, 2*block+1)
+}
+
+// the same question asked of a node index rather than of a level and a block.
+func emptyResolution(shape NodeShape, x NodeIndex) bool {
+	level, block := nodeLevelAndBlock(x)
+	return blankThroughout(shape, level, block)
+}
+
+// the filtered direct path of a leaf, from the array layout and the emptiness
+// rule alone.
+//
+// no function of this package is called: the direct path and the copath come
+// from pathOracle, which TestDirectPathAndCopathRfcTable2 anchors against all
+// five published rows, and the filter comes from blankThroughout. an oracle
+// built out of DirectPath, Sibling and Resolution would agree with a wrong
+// FilteredDirectPath by construction, which is the shape this project has
+// rejected repeatedly.
+func filteredPathOracle(shape NodeShape, leaf LeafIndex, depth uint32) []PathStep {
+	directPath, copathNodes := pathOracle(0, uint64(leaf), depth)
+	steps := []PathStep{}
+	for i := range directPath {
+		if emptyResolution(shape, copathNodes[i]) {
+			continue
+		}
+		steps = append(steps, PathStep{Node: directPath[i], CopathChild: copathNodes[i]})
+	}
+	return steps
+}
+
+// the emptiness oracle against the two resolution oracles it is a shortcut
+// through, over every shape a four-leaf tree can have and every blank shape an
+// eight-leaf tree can have.
+//
+// "a subtree resolves to nothing exactly when every node in it is blank" is a
+// derived reading of section 4.1 and not one of its three rules, so it is
+// checked against the two oracles that do restate the rules rather than
+// asserted. an unmerged leaf is appended only behind a node that is already in
+// the list, so it can never be the difference between empty and not — which is
+// the one thing the RFC's own parenthetical about unmerged leaves warns a
+// reader about, and which the crossing with the unmerged mask here is what
+// establishes rather than assumes.
+func TestFilteredDirectPathEmptinessOracle(t *testing.T) {
+	checkedNodes, emptyNodes := 0, 0
+	sweepCases := []struct {
+		leaves        LeafCount
+		blankMasks    uint32
+		unmergedMasks []uint32
+	}{
+		{leaves: 4, blankMasks: 1 << 7, unmergedMasks: []uint32{0, 1, 42, 85, 127}},
+		{leaves: 8, blankMasks: 1 << 15, unmergedMasks: []uint32{0, 1<<15 - 1}},
+	}
+	for _, c := range sweepCases {
+		width := NodeWidth(c.leaves)
+		for _, unmergedMask := range c.unmergedMasks {
+			for blankMask := uint32(0); blankMask < c.blankMasks; blankMask += 1 {
+				shape := &maskShape{shapeLeafCount: c.leaves, blankMask: blankMask, unmergedMask: unmergedMask}
+				for x := uint32(0); x < width; x += 1 {
+					level, block := nodeLevelAndBlock(NodeIndex(x))
+					budget := 1 << 20
+					descent, ok := descentResolution(shape, level, block, &budget)
+					if !ok {
+						t.Fatalf("node %d: the descent oracle ran past its budget", x)
+					}
+					got := emptyResolution(shape, NodeIndex(x))
+					if got != (len(descent) == 0) {
+						t.Fatalf("node %d of blank mask %#x unmerged mask %#x: empty %v, descent %v",
+							x, blankMask, unmergedMask, got, descent)
+					}
+					if scan := scanResolution(shape, level, block); got != (len(scan) == 0) {
+						t.Fatalf("node %d of blank mask %#x unmerged mask %#x: empty %v, scan %v",
+							x, blankMask, unmergedMask, got, scan)
+					}
+					checkedNodes += 1
+					if got {
+						emptyNodes += 1
+					}
+				}
+			}
+		}
+	}
+	// 5 * 2^7 * 7 for the four-leaf tree and 2 * 2^15 * 15 for the eight-leaf
+	// one. the empty count is asserted too: a version of the oracle that called
+	// everything non-empty would agree with both of the others at every node
+	// that is non-empty, which is most of them.
+	confirmedCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "nodes", got: checkedNodes, want: 5*(1<<7)*7 + 2*(1<<15)*15},
+		{label: "nodes that resolve to nothing", got: emptyNodes, want: 5*289 + 2*147969},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// RFC 9420 table 2, the filtered column, over the tree of figure 11.
+//
+// the five rows the RFC publishes are marked, and the other three leaves are
+// read off the figure the RFC derives them from. all eight are here because the
+// published rows leave the two blank leaves at 2 and 3 and the blank leaf H
+// unasserted, and those three are where a filtered path differs most from the
+// direct path it is cut out of: H keeps all three of its nodes while its
+// sibling G keeps two.
+//
+// each row carries the direct path and the copath as well, and the filtered
+// steps are checked to be a subsequence of the two zipped together. a filtered
+// path of the right length can hold the wrong nodes, and a filter that drops
+// the wrong entries produces a path that is still a plausible one, so the
+// pairing is asserted position by position rather than the length compared.
+func TestFilteredDirectPathRfcTable2(t *testing.T) {
+	shape := rfcFigure11Shape()
+
+	// figure 11 marks a node blank with an underscore. all fifteen are here so
+	// a stray blank in the fixture is caught as well as a missing one, and the
+	// labels are the figure's so a reader can check the fixture against the
+	// picture rather than against this file.
+	blankCases := []struct {
+		label     string
+		nodeIndex NodeIndex
+		blank     bool
+	}{
+		{label: "A", nodeIndex: 0, blank: false},
+		{label: "T", nodeIndex: 1, blank: false},
+		{label: "B", nodeIndex: 2, blank: false},
+		{label: "U", nodeIndex: 3, blank: true},
+		{label: "leaf 2", nodeIndex: 4, blank: true},
+		{label: "V", nodeIndex: 5, blank: true},
+		{label: "leaf 3", nodeIndex: 6, blank: true},
+		{label: "W", nodeIndex: 7, blank: false},
+		{label: "E", nodeIndex: 8, blank: false},
+		{label: "X", nodeIndex: 9, blank: false},
+		{label: "F", nodeIndex: 10, blank: false},
+		{label: "Y", nodeIndex: 11, blank: false},
+		{label: "G", nodeIndex: 12, blank: false},
+		{label: "Z", nodeIndex: 13, blank: true},
+		{label: "H", nodeIndex: 14, blank: true},
+	}
+	blankLabelled := 0
+	for _, c := range blankCases {
+		if got := shape.IsBlank(c.nodeIndex); got != c.blank {
+			t.Errorf("%s blank: %v, want %v", c.label, got, c.blank)
+		}
+		if c.blank {
+			blankLabelled += 1
+		}
+	}
+	if blankLabelled != len(shape.blankNodes) {
+		t.Errorf("blank nodes read off the figure: %d, the fixture holds %d", blankLabelled, len(shape.blankNodes))
+	}
+
+	filteredCases := []struct {
+		label        string
+		published    bool
+		leafIndex    LeafIndex
+		directPath   []NodeIndex
+		copath       []NodeIndex
+		filteredPath []PathStep
+	}{
+		// U is dropped because V, the child of U on the copath of A, is a blank
+		// parent over two blank leaves and resolves to nothing.
+		{label: "A", published: true, leafIndex: 0,
+			directPath: []NodeIndex{1, 3, 7}, copath: []NodeIndex{2, 5, 11},
+			filteredPath: []PathStep{{Node: 1, CopathChild: 2}, {Node: 7, CopathChild: 11}}},
+		{label: "B", published: true, leafIndex: 1,
+			directPath: []NodeIndex{1, 3, 7}, copath: []NodeIndex{0, 5, 11},
+			filteredPath: []PathStep{{Node: 1, CopathChild: 0}, {Node: 7, CopathChild: 11}}},
+		// E and F keep the whole direct path: Z is blank but resolves to G, and
+		// U is blank but resolves to T.
+		{label: "E", published: true, leafIndex: 4,
+			directPath: []NodeIndex{9, 11, 7}, copath: []NodeIndex{10, 13, 3},
+			filteredPath: []PathStep{{Node: 9, CopathChild: 10}, {Node: 11, CopathChild: 13}, {Node: 7, CopathChild: 3}}},
+		{label: "F", published: true, leafIndex: 5,
+			directPath: []NodeIndex{9, 11, 7}, copath: []NodeIndex{8, 13, 3},
+			filteredPath: []PathStep{{Node: 9, CopathChild: 8}, {Node: 11, CopathChild: 13}, {Node: 7, CopathChild: 3}}},
+		// Z is dropped from the path of G because H, the child of Z on the
+		// copath of G, is a blank leaf.
+		{label: "G", published: true, leafIndex: 6,
+			directPath: []NodeIndex{13, 11, 7}, copath: []NodeIndex{14, 9, 3},
+			filteredPath: []PathStep{{Node: 11, CopathChild: 9}, {Node: 7, CopathChild: 3}}},
+
+		// the two unlabelled blank leaves, whose level one parent V is the one
+		// node no published row reaches from below. V is dropped for both of
+		// them, and for the reason U is dropped for A: the copath child is a
+		// blank leaf.
+		{label: "leaf 2", leafIndex: 2,
+			directPath: []NodeIndex{5, 3, 7}, copath: []NodeIndex{6, 1, 11},
+			filteredPath: []PathStep{{Node: 3, CopathChild: 1}, {Node: 7, CopathChild: 11}}},
+		{label: "leaf 3", leafIndex: 3,
+			directPath: []NodeIndex{5, 3, 7}, copath: []NodeIndex{4, 1, 11},
+			filteredPath: []PathStep{{Node: 3, CopathChild: 1}, {Node: 7, CopathChild: 11}}},
+		// H, the blank leaf beside G. its direct path is the one G publishes,
+		// the two being siblings, and it keeps all three nodes where G keeps
+		// two: the copath child that made G drop Z is G itself, which is not
+		// blank. the pair is what makes the filter depending on the copath side
+		// rather than on the leaf's own side observable in this tree at all.
+		{label: "H", leafIndex: 7,
+			directPath: []NodeIndex{13, 11, 7}, copath: []NodeIndex{12, 9, 3},
+			filteredPath: []PathStep{{Node: 13, CopathChild: 12}, {Node: 11, CopathChild: 9}, {Node: 7, CopathChild: 3}}},
+	}
+
+	publishedRows, droppedNodes, fullPaths := 0, 0, 0
+	for _, c := range filteredCases {
+		if c.published {
+			publishedRows += 1
+		}
+		droppedNodes += len(c.directPath) - len(c.filteredPath)
+		if len(c.filteredPath) == len(c.directPath) {
+			fullPaths += 1
+		}
+
+		// the two path columns of the row, from the layout oracle, so a
+		// mistyped direct path or copath here is caught rather than silently
+		// changing what the filtered column is checked against.
+		oracleDirect, oracleCopath := pathOracle(0, uint64(c.leafIndex), 3)
+		if !sameNodeIndexes(oracleDirect, c.directPath) {
+			t.Errorf("%s: oracle direct path: %v, want %v", c.label, oracleDirect, c.directPath)
+		}
+		if !sameNodeIndexes(oracleCopath, c.copath) {
+			t.Errorf("%s: oracle copath: %v, want %v", c.label, oracleCopath, c.copath)
+		}
+
+		// the filtered column against the first two columns of the same row: a
+		// subsequence of the direct path, each entry paired with the copath
+		// entry standing beside it. this is what a length comparison cannot
+		// see, and it is the whole of the difference between a filter that
+		// drops the right nodes and one that drops as many.
+		position := 0
+		for _, step := range c.filteredPath {
+			for position < len(c.directPath) && c.directPath[position] != step.Node {
+				position += 1
+			}
+			if position >= len(c.directPath) {
+				t.Errorf("%s: step %v is not on the direct path %v in order", c.label, step, c.directPath)
+				break
+			}
+			if step.CopathChild != c.copath[position] {
+				t.Errorf("%s: step %v pairs with copath entry %d, want %d",
+					c.label, step, step.CopathChild, c.copath[position])
+			}
+			position += 1
+		}
+
+		if got := filteredPathOracle(shape, c.leafIndex, 3); !samePathSteps(got, c.filteredPath) {
+			t.Errorf("%s oracle filtered direct path: %v, want %v", c.label, got, c.filteredPath)
+		}
+
+		got, err := FilteredDirectPath(shape, c.leafIndex)
+		if err != nil {
+			t.Errorf("%s filtered direct path: %v", c.label, err)
+			continue
+		}
+		assertPathSteps(t, c.label+" filtered direct path", got, c.filteredPath)
+	}
+
+	confirmedCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		// table 2 publishes five rows. deleting one would otherwise leave this
+		// test passing on the figure rows alone, with no published oracle in it.
+		{label: "published rows", got: publishedRows, want: 5},
+		// and the filter has to bite somewhere in this table or the table
+		// cannot tell a filter from a copy of the direct path. it bites on five
+		// of the eight leaves, once each.
+		{label: "nodes dropped across the table", got: droppedNodes, want: 5},
+		{label: "leaves that keep their whole direct path", got: fullPaths, want: 3},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}
+
+// a fixture over a tree of the given size with every node blank, which is the
+// shape the interesting edges are built out of by putting a few nodes back.
+func allBlankFixture(leaves LeafCount) *fixtureShape {
+	shape := &fixtureShape{
+		fixtureLeafCount:   leaves,
+		blankNodes:         map[NodeIndex]bool{},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	for x := uint32(0); x < NodeWidth(leaves); x += 1 {
+		shape.blankNodes[NodeIndex(x)] = true
+	}
+	return shape
+}
+
+// the edges of the filter: the tree where nothing is dropped, the tree where
+// everything is, the two shapes that decide whether an unmerged list can move
+// the answer, and every refusal.
+//
+// the two ends are asserted by contents and not by length. filtering changes
+// the length, so a length is the one thing about a filtered path that a wrong
+// filter can still get right: a path of the right length can hold the wrong
+// nodes, and every leaf of the eight-leaf tree here has a three-step path with
+// different nodes in it.
+func TestFilteredDirectPathEdges(t *testing.T) {
+	// every leaf populated and every parent blank. nothing filters out, because
+	// every copath child is either a populated leaf or a blank parent over
+	// populated leaves, so the filtered path is the whole direct path.
+	populatedLeaves := &fixtureShape{
+		fixtureLeafCount:   8,
+		blankNodes:         map[NodeIndex]bool{1: true, 3: true, 5: true, 7: true, 9: true, 11: true, 13: true},
+		unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+	}
+	// a lone member at leaf 0 with every other node blank. every copath child
+	// of leaf 0 resolves to nothing, so it has no path node to key at all, and
+	// every other leaf keeps exactly one node: the ancestor it shares with leaf
+	// 0, whose copath child is the only subtree with anything in it.
+	loneMember := allBlankFixture(8)
+	loneMember.blankNodes[0] = false
+
+	fullPaths, emptyPaths, singlePaths := 0, 0, 0
+	shapeCases := []struct {
+		label        string
+		shape        *fixtureShape
+		leafIndex    LeafIndex
+		filteredPath []PathStep
+	}{
+		{label: "every leaf populated, leaf 0", shape: populatedLeaves, leafIndex: 0,
+			filteredPath: []PathStep{{Node: 1, CopathChild: 2}, {Node: 3, CopathChild: 5}, {Node: 7, CopathChild: 11}}},
+		{label: "every leaf populated, leaf 1", shape: populatedLeaves, leafIndex: 1,
+			filteredPath: []PathStep{{Node: 1, CopathChild: 0}, {Node: 3, CopathChild: 5}, {Node: 7, CopathChild: 11}}},
+		{label: "every leaf populated, leaf 2", shape: populatedLeaves, leafIndex: 2,
+			filteredPath: []PathStep{{Node: 5, CopathChild: 6}, {Node: 3, CopathChild: 1}, {Node: 7, CopathChild: 11}}},
+		{label: "every leaf populated, leaf 3", shape: populatedLeaves, leafIndex: 3,
+			filteredPath: []PathStep{{Node: 5, CopathChild: 4}, {Node: 3, CopathChild: 1}, {Node: 7, CopathChild: 11}}},
+		{label: "every leaf populated, leaf 4", shape: populatedLeaves, leafIndex: 4,
+			filteredPath: []PathStep{{Node: 9, CopathChild: 10}, {Node: 11, CopathChild: 13}, {Node: 7, CopathChild: 3}}},
+		{label: "every leaf populated, leaf 5", shape: populatedLeaves, leafIndex: 5,
+			filteredPath: []PathStep{{Node: 9, CopathChild: 8}, {Node: 11, CopathChild: 13}, {Node: 7, CopathChild: 3}}},
+		{label: "every leaf populated, leaf 6", shape: populatedLeaves, leafIndex: 6,
+			filteredPath: []PathStep{{Node: 13, CopathChild: 14}, {Node: 11, CopathChild: 9}, {Node: 7, CopathChild: 3}}},
+		{label: "every leaf populated, leaf 7", shape: populatedLeaves, leafIndex: 7,
+			filteredPath: []PathStep{{Node: 13, CopathChild: 12}, {Node: 11, CopathChild: 9}, {Node: 7, CopathChild: 3}}},
+
+		{label: "a lone member, leaf 0", shape: loneMember, leafIndex: 0, filteredPath: []PathStep{}},
+		{label: "a lone member, leaf 1", shape: loneMember, leafIndex: 1,
+			filteredPath: []PathStep{{Node: 1, CopathChild: 0}}},
+		{label: "a lone member, leaf 2", shape: loneMember, leafIndex: 2,
+			filteredPath: []PathStep{{Node: 3, CopathChild: 1}}},
+		{label: "a lone member, leaf 3", shape: loneMember, leafIndex: 3,
+			filteredPath: []PathStep{{Node: 3, CopathChild: 1}}},
+		{label: "a lone member, leaf 4", shape: loneMember, leafIndex: 4,
+			filteredPath: []PathStep{{Node: 7, CopathChild: 3}}},
+		{label: "a lone member, leaf 5", shape: loneMember, leafIndex: 5,
+			filteredPath: []PathStep{{Node: 7, CopathChild: 3}}},
+		{label: "a lone member, leaf 6", shape: loneMember, leafIndex: 6,
+			filteredPath: []PathStep{{Node: 7, CopathChild: 3}}},
+		{label: "a lone member, leaf 7", shape: loneMember, leafIndex: 7,
+			filteredPath: []PathStep{{Node: 7, CopathChild: 3}}},
+	}
+	for _, c := range shapeCases {
+		switch len(c.filteredPath) {
+		case 0:
+			emptyPaths += 1
+		case 1:
+			singlePaths += 1
+		case int(TreeDepth(8)):
+			fullPaths += 1
+		}
+		if got := filteredPathOracle(c.shape, c.leafIndex, 3); !samePathSteps(got, c.filteredPath) {
+			t.Errorf("%s oracle: %v, want %v", c.label, got, c.filteredPath)
+		}
+		got, err := FilteredDirectPath(c.shape, c.leafIndex)
+		if err != nil {
+			t.Errorf("%s: %v", c.label, err)
+			continue
+		}
+		if got == nil {
+			t.Errorf("%s: nil, want a slice", c.label)
+			continue
+		}
+		assertPathSteps(t, c.label, got, c.filteredPath)
+	}
+
+	// an unmerged leaf cannot decide whether a node is filtered out, and these
+	// two arms are what says so rather than a comment.
+	//
+	// the RFC's definition carries a parenthetical warning that unmerged leaves
+	// of the copath child count toward its resolution, and the shape the plan
+	// wrote for this task hung a list on a copath child that was not blank —
+	// where the node is already in its own resolution and the list cannot be
+	// what keeps it. it is kept below as the first arm, honestly labelled, and
+	// the second is the one with something to say: a list on a blank node is
+	// not read at all, so a subtree that is blank throughout still resolves to
+	// nothing however many unmerged leaves are hung on it. a version that read
+	// the list off a blank node would keep this node and fail here.
+	unmergedOnMember := allBlankFixture(8)
+	unmergedOnMember.blankNodes[0] = false
+	unmergedOnMember.blankNodes[11] = false
+	unmergedOnMember.unmergedNodeLeaves[11] = []LeafIndex{4}
+
+	unmergedOnBlank := allBlankFixture(8)
+	unmergedOnBlank.blankNodes[0] = false
+	unmergedOnBlank.unmergedNodeLeaves[11] = []LeafIndex{4}
+	unmergedOnBlank.unmergedNodeLeaves[5] = []LeafIndex{2, 3}
+
+	unmergedCases := []struct {
+		label        string
+		shape        *fixtureShape
+		filteredPath []PathStep
+	}{
+		{label: "an unmerged leaf on a copath child that is not blank", shape: unmergedOnMember,
+			filteredPath: []PathStep{{Node: 7, CopathChild: 11}}},
+		{label: "an unmerged leaf on a copath child that is blank", shape: unmergedOnBlank,
+			filteredPath: []PathStep{}},
+	}
+	for _, c := range unmergedCases {
+		if got := filteredPathOracle(c.shape, 0, 3); !samePathSteps(got, c.filteredPath) {
+			t.Errorf("%s oracle: %v, want %v", c.label, got, c.filteredPath)
+		}
+		got, err := FilteredDirectPath(c.shape, 0)
+		if err != nil {
+			t.Errorf("%s: %v", c.label, err)
+			continue
+		}
+		assertPathSteps(t, c.label, got, c.filteredPath)
+	}
+
+	// the same tree twice, once bare and once with an unmerged list on every
+	// node of it, over every leaf. an unmerged leaf is appended behind a node
+	// that is already in the resolution, so it can move the length of a
+	// resolution but never its emptiness, and the filter reads nothing but the
+	// emptiness. a version that filtered on a resolution of more than one node,
+	// or that counted the unmerged leaves as the resolution, differs here at
+	// every leaf.
+	figureWithUnmerged := rfcFigure11Shape()
+	for x := uint32(0); x < NodeWidth(8); x += 1 {
+		if figureWithUnmerged.blankNodes[NodeIndex(x)] {
+			continue
+		}
+		figureWithUnmerged.unmergedNodeLeaves[NodeIndex(x)] = []LeafIndex{0, 4}
+	}
+	unmergedInvariantLeaves := 0
+	for leaf := LeafIndex(0); leaf < 8; leaf += 1 {
+		bare, err := FilteredDirectPath(rfcFigure11Shape(), leaf)
+		if err != nil {
+			t.Fatalf("leaf %d without unmerged leaves: %v", leaf, err)
+		}
+		hung, err := FilteredDirectPath(figureWithUnmerged, leaf)
+		if err != nil {
+			t.Fatalf("leaf %d with unmerged leaves: %v", leaf, err)
+		}
+		if !samePathSteps(bare, hung) {
+			t.Errorf("leaf %d: %v with unmerged leaves hung on every node, %v without", leaf, hung, bare)
+		}
+		unmergedInvariantLeaves += 1
+	}
+
+	// a malformed unmerged list on the copath side is a refusal and not a
+	// filtered path, and the same list on the leaf's own direct path is not
+	// seen at all. the second is not an oversight to be repaired here: the
+	// filter reads the copath side and nothing else, so a tree that is
+	// malformed elsewhere is tree_sync.go's to reject, and a version of this
+	// function that refused it would be reading nodes it has no reason to read.
+	malformedOnCopath := rfcFigure11Shape()
+	malformedOnCopath.unmergedNodeLeaves[11] = []LeafIndex{99}
+	malformedOnDirectPath := rfcFigure11Shape()
+	malformedOnDirectPath.unmergedNodeLeaves[1] = []LeafIndex{99}
+
+	if got, err := FilteredDirectPath(malformedOnCopath, 0); !errors.Is(err, ErrLeafOutOfRange) {
+		t.Errorf("an unmerged leaf outside the tree on a copath child: %v, want %v", err, ErrLeafOutOfRange)
+	} else if got != nil {
+		t.Errorf("an unmerged leaf outside the tree on a copath child: %v beside the refusal, want nil", got)
+	}
+	if got, err := FilteredDirectPath(malformedOnDirectPath, 0); err != nil {
+		t.Errorf("an unmerged leaf outside the tree on the direct path: %v, want no refusal", err)
+	} else if !samePathSteps(got, []PathStep{{Node: 1, CopathChild: 2}, {Node: 7, CopathChild: 11}}) {
+		t.Errorf("an unmerged leaf outside the tree on the direct path: %v, want the path of A", got)
+	}
+
+	// the refusals, each with the value beside it read back. a version that
+	// handed an empty slice back alongside a refusal passes every assertion
+	// about the shape of the error, and a caller that reads the value and drops
+	// the error then keys no node at all where it should have refused to
+	// commit.
+	refusalCases := []struct {
+		label     string
+		leafCount LeafCount
+		leafIndex LeafIndex
+		want      error
+	}{
+		{label: "the leaf past the end of an eight-leaf tree", leafCount: 8, leafIndex: 8, want: ErrLeafOutOfRange},
+		{label: "the largest leaf index there is", leafCount: 8, leafIndex: 0xFFFFFFFF, want: ErrLeafOutOfRange},
+		{label: "a tree of no leaves", leafCount: 0, leafIndex: 0, want: ErrLeafCountRange},
+		{label: "a tree past the largest representable", leafCount: MaxLeafCount + 1, leafIndex: 0, want: ErrLeafCountRange},
+		{label: "a tree of three leaves", leafCount: 3, leafIndex: 0, want: ErrLeafCountNotFull},
+		// the two entry checks in order: a shape that is no tree is refused as
+		// that whatever leaf it was asked about, so a caller switching on the
+		// sentinel can tell a bad tree from a bad request.
+		{label: "a bad leaf of a tree of three leaves", leafCount: 3, leafIndex: 99, want: ErrLeafCountNotFull},
+		{label: "a bad leaf of a tree of no leaves", leafCount: 0, leafIndex: 99, want: ErrLeafCountRange},
+	}
+	refusals := 0
+	for _, c := range refusalCases {
+		shape := &fixtureShape{
+			fixtureLeafCount:   c.leafCount,
+			blankNodes:         map[NodeIndex]bool{},
+			unmergedNodeLeaves: map[NodeIndex][]LeafIndex{},
+		}
+		got, err := FilteredDirectPath(shape, c.leafIndex)
+		if !errors.Is(err, c.want) {
+			t.Errorf("%s: %v, want %v", c.label, err, c.want)
+			continue
+		}
+		if got != nil {
+			t.Errorf("%s: %v beside the refusal, want nil", c.label, got)
+			continue
+		}
+		refusals += 1
+	}
+
+	confirmedCases := []struct {
+		label string
+		got   int
+		want  int
+	}{
+		{label: "leaves that keep their whole direct path", got: fullPaths, want: 8},
+		{label: "leaves with no path node to key", got: emptyPaths, want: 1},
+		{label: "leaves that keep one node", got: singlePaths, want: 7},
+		{label: "leaves whose path is unmoved by unmerged leaves", got: unmergedInvariantLeaves, want: 8},
+		{label: "refusals", got: refusals, want: len(refusalCases)},
+	}
+	for _, c := range confirmedCases {
+		if c.got != c.want {
+			t.Errorf("confirmed %s: %d, want %d", c.label, c.got, c.want)
+		}
+	}
+}

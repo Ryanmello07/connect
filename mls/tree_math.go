@@ -687,3 +687,103 @@ func Resolution(shape NodeShape, x NodeIndex) ([]NodeIndex, error) {
 	}
 	return resolvedNodes, nil
 }
+
+// one node of a filtered direct path together with the child of that node the
+// source leaf does not descend from.
+//
+// the pair is carried rather than the node alone because every caller needs
+// both, and deriving the second from the first is the step that gets written
+// backwards: RFC 9420 section 7.4 encrypts the path secret of the node to the
+// resolution of the copath child and never the other way about. both fields
+// are indices of the same tree, so a version that swaps them type-checks and
+// round-trips, which is why the tests compare steps and not node lists.
+type PathStep struct {
+	Node        NodeIndex
+	CopathChild NodeIndex
+}
+
+// the direct path of a leaf with every node removed whose child on that leaf's
+// copath resolves to nothing, ordered leaf to root, each surviving node paired
+// with that copath child (RFC 9420 section 4.1.2).
+//
+// a removed node needs no key pair of its own, because encrypting to it would
+// be encrypting to its non-copath child, which is the child the leaf descends
+// from and already holds the secret. the length of the result is the number of
+// nodes an UpdatePath has to carry, which is what ValSem202 checks, and the
+// order is the order they appear in it.
+//
+// that order is the contract and not a detail of it, as it is for a
+// resolution. each step's secret is encrypted to the resolution of that step's
+// copath child, so a path holding the right steps in the wrong order hands
+// every member below the first difference someone else's secret. a test that
+// compares two filtered paths as sets, or by length, passes every wrong order
+// there is — and length is the one property of this answer a wrong filter
+// still gets right, since filtering is what changes it.
+//
+// what decides a step is whether the copath child's resolution is empty and
+// nothing else about it. an unmerged leaf is appended behind a node that is
+// already in the list, so it moves the length of a resolution and never
+// whether it is empty: the parenthetical in section 4.1.2 warning that
+// unmerged leaves count toward the copath child's resolution guards against
+// reading a resolution as the blank rule alone, and is not a case that can
+// move this answer. the test file establishes that by asking one tree twice,
+// with and without a list hung on every node, rather than restating it.
+//
+// the whole resolution is built rather than a search stopped at the first
+// non-blank node, and the refusal that comes with it is inherited on purpose:
+// a copath child carrying an unmerged leaf outside the tree is a malformed
+// shape, and a filtered path over one would be a path for a tree that cannot
+// exist. the leaf's own side is not read, so the same malformed list on the
+// direct path passes unseen; rejecting that is section 7.9 tree validation and
+// tree_sync.go owns it.
+//
+// the cost of a dropped node is not incidental. certifying that a subtree
+// resolves to nothing means finding no non-blank node anywhere in it, and the
+// shape answers one node at a time, so a drop at level k costs 2^(k+1)-1
+// queries here or in any other implementation of this interface, where a kept
+// node costs one. that is the bound on how far up the tests observe a drop,
+// and the level they reach is dated so it lives in the task report.
+//
+// the refusals from Sibling are unreachable. the node it is asked about is the
+// leaf on the first pass and the previous path node on every later one, and
+// the root is only ever the last path node, so it is never the argument. the
+// two entry checks are ordered as Resolution's are — a shape that is no tree
+// is refused as that whatever leaf it was asked about — and a refusal carries
+// no slice at all while an accepted empty path is an empty slice, which is the
+// pair of promises DirectPath, Copath and Resolution all make.
+func FilteredDirectPath(shape NodeShape, leaf LeafIndex) ([]PathStep, error) {
+	n := shape.LeafCount()
+	if err := checkLeafCount(n); err != nil {
+		return nil, err
+	}
+	if LeafCount(leaf) >= n {
+		return nil, ErrLeafOutOfRange
+	}
+
+	leafNode := leaf.NodeIndex()
+	pathNodes, err := DirectPath(leafNode, n)
+	if err != nil {
+		return nil, err
+	}
+
+	pathSteps := make([]PathStep, 0, len(pathNodes))
+	child := leafNode
+	for _, pathNode := range pathNodes {
+		copathChild, err := Sibling(child, n)
+		if err != nil {
+			return nil, err
+		}
+		copathResolution, err := Resolution(shape, copathChild)
+		if err != nil {
+			return nil, err
+		}
+		if len(copathResolution) > 0 {
+			pathSteps = append(pathSteps, PathStep{
+				Node:        pathNode,
+				CopathChild: copathChild,
+			})
+		}
+		child = pathNode
+	}
+	return pathSteps, nil
+}
