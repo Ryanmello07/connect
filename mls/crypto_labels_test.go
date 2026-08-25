@@ -1989,12 +1989,20 @@ func alternativePreimages(random *labelProbeRand, pair signatureProbePair) [][]b
 	return preimages
 }
 
-// How many distinct preimages the generated class holds, pinned so a generator that
-// degenerated fails rather than reporting what a working one reports.
+// What the generated class holds, pinned so a generator that degenerated fails rather than
+// reporting exactly what a working one reports.
 //
-// It is a count of distinct values rather than of iterations on purpose: a repertoire whose
-// operations all collapsed to the identity would still iterate the same number of times.
-const signatureRefusedPreimages = 29183
+// Two numbers, because they fail differently. The built total counts what the generators
+// emitted and depends on nothing but their own shape, so it moves when a generator stops
+// generating. The distinct total counts what survived deduplication, which is the one that
+// matters — a repertoire whose operations all collapsed to the identity would emit the
+// same number of values and refuse one — and it also moves when mlsSignContent's encoding
+// changes, since two candidates that encoded apart may now encode the same. A run where
+// only the second moved is that, and is worth reading as such rather than re-pinning.
+const (
+	signatureBuiltPreimages   = 35226
+	signatureRefusedPreimages = 29183
+)
 
 // A signature this key really made, over a preimage the verifier does not demand, is
 // refused.
@@ -2061,6 +2069,7 @@ func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 	// the table, and every generated preimage the same key can build is refused.
 	random := newLabelProbeRand(labelProbeWalkSeed)
 	refused := 0
+	built := 0
 	for _, pair := range signatureProbePairs() {
 		pairDemanded := mlsSignContent(pair.label, pair.content)
 		// the control first, per pair: what follows is only meaningful against a verify
@@ -2073,6 +2082,7 @@ func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 		if len(generated) == 0 {
 			t.Fatalf("%s: the generators built nothing, so this pair observed nothing", pair.name)
 		}
+		built += len(generated)
 		for _, preimage := range generated {
 			if tried[string(preimage)] {
 				continue
@@ -2084,6 +2094,9 @@ func TestVerifyWithLabelRefusesSignaturesOverOtherPreimages(t *testing.T) {
 					pair.name, preimage, pair.label, pair.content, err)
 			}
 		}
+	}
+	if built != signatureBuiltPreimages {
+		t.Fatalf("the generators built %d preimages, want %d", built, signatureBuiltPreimages)
 	}
 	if refused != signatureRefusedPreimages {
 		t.Fatalf("the generated class refused %d distinct preimages, want %d", refused, signatureRefusedPreimages)
