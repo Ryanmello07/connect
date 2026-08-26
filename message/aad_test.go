@@ -361,6 +361,20 @@ var aadHeaderMutators = map[string]func(*aadInput){
 	},
 }
 
+// One mutation, looked up by name rather than indexed straight, so a field with no
+// mutator reports itself here instead of calling a nil function and taking the rest of
+// the run down with it. TestEveryHeaderFieldHasAMutator is what should catch that first;
+// this is what keeps its failure from turning into an abort that hides every gate after
+// it — which is exactly what happened the first time a field was added without one.
+func aadMutate(t testing.TB, name string, in *aadInput) {
+	t.Helper()
+	mutate, present := aadHeaderMutators[name]
+	if !present {
+		t.Fatalf("%s has no mutator, so nothing in this file ever varies it", name)
+	}
+	mutate(in)
+}
+
 // The field names of a struct, read out of the type rather than written down. This is
 // what makes every list below a computed class: a field added to RecordHeader or to
 // BodyBinding appears here on the next run, without anybody remembering to add it.
@@ -435,7 +449,7 @@ func TestTheProjectionCarriesEveryFieldItSelects(t *testing.T) {
 	base := aadBaseInput()
 	for _, name := range aadFieldNames(BodyBinding{}) {
 		mutated := base.copy()
-		aadHeaderMutators[name](&mutated)
+		aadMutate(t, name, &mutated)
 		fromBase := reflect.ValueOf(base.header.BodyBinding()).FieldByName(name).Interface()
 		fromMutated := reflect.ValueOf(mutated.header.BodyBinding()).FieldByName(name).Interface()
 		if reflect.DeepEqual(fromBase, fromMutated) {
@@ -457,7 +471,7 @@ func TestEveryFieldAADHeadCoversChangesIt(t *testing.T) {
 	want := mustAADHead(t, "the base header", aadKatAlgId, &base.header, base.attachment)
 	for _, name := range aadFieldNames(RecordHeader{}) {
 		mutated := base.copy()
-		aadHeaderMutators[name](&mutated)
+		aadMutate(t, name, &mutated)
 		got := mustAADHead(t, "the header with "+name+" changed", aadKatAlgId, &mutated.header, mutated.attachment)
 		if bytes.Equal(got, want) {
 			t.Errorf("changing %s leaves aad_head unchanged at\n%s", name, hex.EncodeToString(want))
@@ -472,7 +486,7 @@ func TestEveryFieldAADBodyCoversChangesIt(t *testing.T) {
 	want := mustAADBody(t, "the base header", aadKatAlgId, base.header.BodyBinding())
 	for _, name := range aadFieldNames(BodyBinding{}) {
 		mutated := base.copy()
-		aadHeaderMutators[name](&mutated)
+		aadMutate(t, name, &mutated)
 		got := mustAADBody(t, "the header with "+name+" changed", aadKatAlgId, mutated.header.BodyBinding())
 		if bytes.Equal(got, want) {
 			t.Errorf("changing %s leaves aad_body unchanged at\n%s", name, hex.EncodeToString(want))
@@ -506,7 +520,7 @@ func TestAADBodyIgnoresEveryHeaderFieldItDoesNotCover(t *testing.T) {
 	want := mustAADBody(t, "the base header", aadKatAlgId, base.header.BodyBinding())
 	for _, name := range uncovered {
 		mutated := base.copy()
-		aadHeaderMutators[name](&mutated)
+		aadMutate(t, name, &mutated)
 		got := mustAADBody(t, "the header with "+name+" changed", aadKatAlgId, mutated.header.BodyBinding())
 		if !bytes.Equal(got, want) {
 			t.Errorf("changing %s changed aad_body, which covers no such field:\n got: %s\nwant: %s", name, hex.EncodeToString(got), hex.EncodeToString(want))
@@ -546,7 +560,7 @@ func aadCorpus(t testing.TB, fields []string) []struct {
 	}{{name: "the base header", input: aadBaseInput()}}
 	for _, name := range fields {
 		mutated := aadBaseInput()
-		aadHeaderMutators[name](&mutated)
+		aadMutate(t, name, &mutated)
 		corpus = append(corpus, struct {
 			name  string
 			input aadInput
