@@ -6424,10 +6424,11 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 // the block boundary is the sharpest thing the enumeration says, and it is the
 // walk seen from outside. of the 10,280 versions of those eight functions
 // confined to one block of one level, every one below block 4096 is reached
-// here, and above it only the two blocks that end the level are — 1,520
-// versions at the ends, ten in the interior, where the ladder's alternating-bit
-// probe happens to land on a node some Parent call is handed. the other 3,590
-// are interior blocks at or above 4096 and this sweep never touches one.
+// here, and above it almost nothing but the two blocks that end the level:
+// 1,520 versions at those two ends and ten in the interior, where the ladder's
+// alternating-bit probe happens to land on a node some Parent call is handed.
+// the other 3,590 are interior blocks at or above 4096 and this sweep never
+// touches one.
 //
 // two figures from the earlier and smaller class are kept because they were
 // measured then and were not re-measured now: the sweep the plan wrote killed
