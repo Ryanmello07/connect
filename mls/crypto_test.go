@@ -35,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -3357,13 +3358,13 @@ func providerInterfaceMethods(t *testing.T) []providerOperation {
 	return methods
 }
 
-// The package level constructions handed a provider, by the same reading.
+// The value each package level construction is called through.
 //
-// A construction here cannot be called through a name the way a method can, so each one
-// needs a value written down. That list is not what decides the class: the class is read
-// off the parse tree, and a construction with no value is a failure rather than a row
-// left out. A later task adding a sixth construction that takes a provider fails here
-// until somebody writes its name, which is the point.
+// A construction cannot be called through a name the way a method can, so each one needs a
+// value written down. This list is not what decides the class -- the class is read off the
+// type checker below, and a construction with no value here is a failure rather than a row
+// left out -- and it is not trusted to be what it says either: assertIsTheFunctionNamed
+// holds every value to the function its key names.
 var providerConstructionValues = map[string]any{
 	"RefHash":           RefHash,
 	"MakeKeyPackageRef": MakeKeyPackageRef,
@@ -3376,44 +3377,116 @@ var providerConstructionValues = map[string]any{
 // rename is one edit rather than a matcher that stops matching.
 const providerInterfaceName = "CryptoProvider"
 
-// Every construction of this package's non test source that takes a provider, with the
-// parameter names the declaration gives them.
+// The value written for one construction is the function its key names, read off the
+// compiled program rather than taken on trust.
+//
+// The map above is this gate's one hand written line. Its keys are held to the parse tree
+// in both directions and its values are held to nothing, so two rows pointing at one
+// sibling function report full coverage of both while one of them is never called.
+// Measured, against the version this replaces: with MakeKeyPackageRef and MakeProposalRef
+// swapped, every one of this package's 2287 tests passed; and with one of them aliased to
+// the other beside a MakeProposalRef reduced to a placeholder, both halves of this gate
+// passed and the placeholder was found only by the published commit vectors.
+func assertIsTheFunctionNamed(t *testing.T, name string, implementation any) {
+	t.Helper()
+	value := reflect.ValueOf(implementation)
+	if value.Kind() != reflect.Func {
+		t.Fatalf("providerConstructionValues maps %s to a %s rather than to a function", name, value.Kind())
+	}
+	compiled := runtime.FuncForPC(value.Pointer())
+	if compiled == nil {
+		t.Fatalf("the value providerConstructionValues maps %s to is not a compiled function", name)
+	}
+	if !strings.HasSuffix(compiled.Name(), "."+name) {
+		t.Fatalf("providerConstructionValues maps %s to %s, so the row written for %s calls something else",
+			name, compiled.Name(), name)
+	}
+}
+
+// No parameter of this package's non test source carries a provider to a position this
+// gate cannot hand one to.
+//
+// The class below is the parameters whose type is the provider, which is the position a
+// caller normally writes and is not the only one a provider arrives through. A variadic
+// ...CryptoProvider is a slice to the compiler and its own spelling to a renderer, so it
+// sits in neither the class nor the package level scan the class is cross checked against,
+// and the two agree on a shrunken class exactly as they agree on a complete one. Measured,
+// against the version this replaces: a variadic construction added to crypto.go passed all
+// 2287 tests of this package while being called by nothing.
+//
+// Three readings, none of them the source spelling. sameTypeAs is the compiler's own
+// identity, which sees through an alias and through a defined type over the interface.
+// types.Implements is what catches a wider interface that embeds the provider and the
+// concrete type that satisfies it. And the type checker's canonical rendering of a
+// composite carries the provider's own qualified name, which is what catches a slice, a
+// map, a pointer or a variadic of them; the underlying type is rendered as well, so it
+// takes two levels of naming to hide one. The residual is that third level, and it is a
+// spelling nothing in this package has any reason to write.
+func assertNoProviderArrivesUncallable(t *testing.T, function declaredFunction) {
+	t.Helper()
+	provider := providerInterfaceType(t)
+	declared, isInterface := provider.Underlying().(*types.Interface)
+	if !isInterface {
+		t.Fatalf("%s is not an interface, so the class below is read off nothing", providerInterfaceName)
+	}
+	callable := sameTypeAs(provider)
+	spelled := types.TypeString(provider, nil)
+	for i := 0; i < function.signature.Params().Len(); i++ {
+		at := function.signature.Params().At(i).Type()
+		if callable(at) {
+			continue
+		}
+		if !types.Implements(at, declared) &&
+			!strings.Contains(types.TypeString(at, nil), spelled) &&
+			!strings.Contains(types.TypeString(at.Underlying(), nil), spelled) {
+			continue
+		}
+		t.Fatalf("%s takes a %s at position %d, which carries a %s to a position this gate cannot fill",
+			function.name, at, i, providerInterfaceName)
+	}
+}
+
+// The package level constructions handed a provider, by the same reading.
+//
+// A construction here cannot be called through a name the way a method can, so each one
+// needs a value written down. That list is not what decides the class: the class is read
+// off the type checker, and a construction with no value is a failure rather than a row
+// left out. A later task adding a sixth construction that takes a provider fails here
+// until somebody writes its name, which is the point.
+//
+// The class is the compiler's reading of the signature rather than the spelling the source
+// gives the parameter, which is what makes an interface embedding the provider a member of
+// it. The two are then cross checked against each other: the spelling based package level
+// scan must name the same five, so a construction visible to one reading and not the other
+// stops this gate rather than being dropped by both.
 func providerConstructions(t *testing.T) []providerOperation {
 	t.Helper()
+	provider := providerInterfaceType(t)
 	constructions := []providerOperation{}
 	found := []string{}
-	for _, path := range packageLevelFunctions(t).files {
-		parsed := mustParseSource(t, path)
-		for _, declaration := range parsed.file.Decls {
-			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction || function.Recv != nil {
-				continue
-			}
-			parameters := parametersOf(t, parsed, function.Name.Name, function.Type)
-			takesProvider := false
-			for _, parameter := range parameters {
-				if parameter.typeName == providerInterfaceName {
-					takesProvider = true
-				}
-			}
-			if !takesProvider {
-				continue
-			}
-			name := function.Name.Name
-			implementation, written := providerConstructionValues[name]
-			if !written {
-				t.Fatalf("%s takes a %s and providerConstructionValues holds no value for it, so this gate cannot call it",
-					name, providerInterfaceName)
-			}
-			found = append(found, name)
-			constructions = append(constructions, providerOperation{
-				name:       name,
-				parameters: parameters,
-				bind: func(crypto CryptoProvider) reflect.Value {
-					return reflect.ValueOf(implementation)
-				},
-			})
+	for _, function := range declaredFunctionsOf(t, cryptoOwnRoot) {
+		if function.method {
+			continue
 		}
+		assertNoProviderArrivesUncallable(t, function)
+		if len(function.takes(provider)) == 0 {
+			continue
+		}
+		name := function.name
+		implementation, listed := providerConstructionValues[name]
+		if !listed {
+			t.Fatalf("%s takes a %s and providerConstructionValues holds no value for it, so this gate cannot call it",
+				name, providerInterfaceName)
+		}
+		assertIsTheFunctionNamed(t, name, implementation)
+		found = append(found, name)
+		constructions = append(constructions, providerOperation{
+			name:       name,
+			parameters: function.parameters,
+			bind: func(crypto CryptoProvider) reflect.Value {
+				return reflect.ValueOf(implementation)
+			},
+		})
 	}
 	slices.Sort(found)
 	if !slices.Equal(found, packageLevelFunctionsTaking(t, providerInterfaceName)) {
@@ -3438,8 +3511,14 @@ func providerOperations(t *testing.T) []providerOperation {
 // The byte stream every provider in this gate draws from. It is a reader over a fixed
 // script rather than a constant, because a constant source cannot separate a Random that
 // returns what it read from one that sorts, reverses or rotates it -- the defect this
-// package shipped once already -- and every call here is made over a freshly built reader
-// so two calls that differ only in an argument really do differ only in that argument.
+// package shipped once already.
+//
+// Every call the gate makes is made over a provider built for that call alone. Two calls
+// through one provider are two different questions once anything has drawn: the second
+// reads the stream on from where the first left it and answers differently whatever its
+// arguments were, so a row comparing them would be satisfied by the entropy rather than by
+// the argument that moved. Measured, against the version this replaces: a HpkeSeal that
+// discarded its plaintext argument outright left both halves of this gate passing.
 func providerStubStream(first byte) io.Reader {
 	return bytes.NewReader(ascendingBytes(first, 4096))
 }
@@ -3552,7 +3631,31 @@ func providerStubArgument(t *testing.T, arguments map[string]any, operation stri
 	return reflect.Value{}
 }
 
-// One argument, changed in the smallest way that leaves its shape alone.
+// One moved argument, with the words for where it moved, so a row that fails names the
+// position rather than only the parameter.
+type providerPerturbation struct {
+	where string
+	value reflect.Value
+}
+
+// The positions of a run of bytes this gate moves: the first, the middle and the last,
+// deduplicated so a run too short to hold three is probed once rather than three times.
+//
+// Read off the length rather than written down. One position is a narrower property than
+// the one this gate states: an operation reading only the last byte of each argument it
+// was handed is a function of two of its eighty bytes, and a perturbation that only ever
+// moves that last byte separates it from a complete implementation not at all. Measured,
+// against the version this replaces: a mac over key[len-1] and data[len-1] and an extract
+// over salt[len-1] and ikm[len-1] each passed both halves of this gate, and were caught
+// only by RFC 4231 and RFC 5869.
+func perturbedPositions(length int) []int {
+	at := []int{0, length / 2, length - 1}
+	slices.Sort(at)
+	return slices.Compact(at)
+}
+
+// One argument's perturbations, each changed in the smallest way that leaves its shape
+// alone.
 //
 // The length is preserved on purpose. An operation that reads only how many bytes it was
 // handed is a stub of exactly the kind this gate is about, a correctly sized answer that is
@@ -3560,8 +3663,9 @@ func providerStubArgument(t *testing.T, arguments map[string]any, operation stri
 // a real implementation for the wrong reason. A kind with no rule here is fatal, so a
 // method taking an argument this gate does not know how to move fails rather than being
 // called twice with the identical value and reported as observing it.
-func perturbedArgument(t *testing.T, operation string, parameter providerParameter, argument reflect.Value) reflect.Value {
+func providerPerturbations(t *testing.T, operation string, parameter providerParameter, argument reflect.Value) []providerPerturbation {
 	t.Helper()
+	moved := []providerPerturbation{}
 	switch argument.Kind() {
 	case reflect.Slice:
 		if argument.Type().Elem().Kind() != reflect.Uint8 {
@@ -3570,27 +3674,40 @@ func perturbedArgument(t *testing.T, operation string, parameter providerParamet
 		if argument.Len() == 0 {
 			t.Fatalf("the base argument for %s.%s is empty, so perturbing it changes nothing", operation, parameter.name)
 		}
-		moved := reflect.MakeSlice(argument.Type(), argument.Len(), argument.Len())
-		reflect.Copy(moved, argument)
-		last := argument.Len() - 1
-		moved.Index(last).SetUint(moved.Index(last).Uint() ^ 0xff)
+		for _, at := range perturbedPositions(argument.Len()) {
+			value := reflect.MakeSlice(argument.Type(), argument.Len(), argument.Len())
+			reflect.Copy(value, argument)
+			value.Index(at).SetUint(value.Index(at).Uint() ^ 0xff)
+			moved = append(moved, providerPerturbation{
+				where: "byte " + strconv.Itoa(at) + " of " + strconv.Itoa(argument.Len()),
+				value: value,
+			})
+		}
 		return moved
 	case reflect.String:
 		text := argument.String()
 		if text == "" {
 			t.Fatalf("the base argument for %s.%s is empty, so perturbing it changes nothing", operation, parameter.name)
 		}
-		moved := reflect.New(argument.Type()).Elem()
-		moved.SetString(text[:len(text)-1] + string(rune(text[len(text)-1]^0x20)))
+		for _, at := range perturbedPositions(len(text)) {
+			letters := []byte(text)
+			letters[at] ^= 0x20
+			value := reflect.New(argument.Type()).Elem()
+			value.SetString(string(letters))
+			moved = append(moved, providerPerturbation{
+				where: "character " + strconv.Itoa(at) + " of " + strconv.Itoa(len(text)),
+				value: value,
+			})
+		}
 		return moved
 	case reflect.Int:
-		moved := reflect.New(argument.Type()).Elem()
-		moved.SetInt(argument.Int() + 1)
-		return moved
+		value := reflect.New(argument.Type()).Elem()
+		value.SetInt(argument.Int() + 1)
+		return append(moved, providerPerturbation{where: "one higher", value: value})
 	case reflect.Uint32:
-		moved := reflect.New(argument.Type()).Elem()
-		moved.SetUint(argument.Uint() + 1)
-		return moved
+		value := reflect.New(argument.Type()).Elem()
+		value.SetUint(argument.Uint() + 1)
+		return append(moved, providerPerturbation{where: "one higher", value: value})
 	case reflect.Interface:
 		if argument.Type() != reflect.TypeOf((*CryptoProvider)(nil)).Elem() {
 			break
@@ -3599,10 +3716,11 @@ func perturbedArgument(t *testing.T, operation string, parameter providerParamet
 		// TestTheTaggingProviderAnswersDifferentlyThanTheRealOne holds it to, so a
 		// construction that computed its answer without the provider it was handed
 		// reports here as a parameter nothing observes
-		return reflect.ValueOf(CryptoProvider(&taggingCryptoProvider{inner: argument.Interface().(CryptoProvider)}))
+		wrapped := CryptoProvider(&taggingCryptoProvider{inner: argument.Interface().(CryptoProvider)})
+		return append(moved, providerPerturbation{where: "wrapped in the tagging provider", value: reflect.ValueOf(wrapped)})
 	}
 	t.Fatalf("no perturbation is written for %s.%s, declared %s", operation, parameter.name, parameter.typeName)
-	return reflect.Value{}
+	return nil
 }
 
 // One call, with a panic caught rather than taken. A method that still refuses to be
@@ -3710,6 +3828,13 @@ var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
 // what it covers is byte behaviour and neither has any. This one is about whether an
 // operation is implemented at all, so there is no such thing as a method it need not
 // reach, and there is no excusal map to write a name into.
+//
+// What is passed in is the operations whose rows ran, recorded at the far end of each row
+// rather than on entry to it. Recorded on entry this compares an enumeration against
+// itself: probed is then the name list of providerOperations, want is the same two readings
+// that list is built from, and a t.Fatalf upstream has already refused to go on unless the
+// two agree -- so no version of the product could make it fire. Recorded at the end it says
+// the row was carried out, and an operation that stopped at a refusal is named here too.
 func assertCoversEveryProviderOperation(t *testing.T, gate string, probed []string) {
 	t.Helper()
 	want := slices.Concat(providerMethodNames(), packageLevelFunctionsTaking(t, providerInterfaceName))
@@ -3731,9 +3856,9 @@ func assertCoversEveryProviderOperation(t *testing.T, gate string, probed []stri
 // green actually looks like. Checking that an answer is not the zero value is satisfied by
 // a constant. What is asserted instead is that every declared input of every operation is
 // observed in its answer: the operation is called once over a fixed byte stream, then once
-// per parameter with that parameter moved by a byte and everything else identical, and the
-// two answers must differ. A stub cannot pass that, because a stub is by construction a
-// function of fewer of its inputs than it declares.
+// per parameter and probed position with that one position moved and everything else
+// identical, and the two answers must differ. A stub cannot pass that, because a stub is by
+// construction a function of fewer of its inputs than it declares.
 //
 // What that misses, stated rather than left for a reader to discover: an operation that is
 // a function of all of its inputs and computes the wrong one. Every input is observed, the
@@ -3744,12 +3869,17 @@ func assertCoversEveryProviderOperation(t *testing.T, gate string, probed []stri
 // It also misses an operation that observes each input separately but not jointly, for the
 // same reason and held by the same corpora.
 //
-// The two calls being compared are made over separately built readers holding the same
-// script, so the three operations that draw are deterministic across the pair and a
-// difference is attributable to the parameter that moved rather than to the entropy. The
-// control at the top of each row is what says so: the base call repeated over a fresh
-// reader must give the identical answer, and without it every row below would pass on a
+// Every call is made over a provider of its own, built over a freshly opened reader on the
+// same script, so the four operations that draw are deterministic across any pair of calls
+// and a difference is attributable to the argument that moved rather than to the entropy.
+// The control at the top of each row is what says so: the base call repeated over a fresh
+// provider must give the identical answer, and without it every row below would pass on a
 // provider whose answers were simply never twice the same.
+//
+// Each argument is moved at more than one position, read off its length rather than written
+// down. Moving only its last byte states a weaker property than the one above -- that the
+// last position of each input is observed -- and an operation narrowed to that one byte
+// passes it. perturbedPositions records what that cost when it was the whole of the rule.
 func TestProviderHasNoRemainingStubs(t *testing.T) {
 	if len(providerStubMethods) != 0 {
 		t.Errorf("providerStubMethods names %v, so the provider still refuses to answer somewhere", providerStubMethods)
@@ -3767,7 +3897,6 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 		drawing := []string{}
 		unobserved := []string{}
 		for _, operation := range providerOperations(t) {
-			probed = append(probed, operation.name)
 			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
 			subject := newProvider(0x80)
 			arguments[providerInterfaceName] = subject
@@ -3824,21 +3953,41 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 				drawing = append(drawing, operation.name)
 				observed++
 			}
-			arguments[providerInterfaceName] = subject
 			for i, parameter := range operation.parameters {
-				moved := slices.Clone(base)
-				moved[i] = perturbedArgument(t, operation.name, parameter, base[i])
-				movedResults, recovered := providerStubCall(operation.bind(subject), moved)
-				if recovered != nil {
-					t.Errorf("%s refused to answer with %s moved by a byte: %v", where, parameter.name, recovered)
-					continue
+				positions := len(providerPerturbations(t, operation.name, parameter, base[i]))
+				for at := 0; at < positions; at++ {
+					// a provider of its own for every call. Four of these operations
+					// draw, so a moved call sharing the base call's provider would read
+					// the stream on from where the base call left it and answer
+					// differently whatever the argument did -- which is a row that
+					// separates nothing while looking like the strictest one here, and
+					// is the shape crypto_labels_test.go names in the labelled routing
+					// gate for the same reason.
+					movedProvider := newProvider(0x80)
+					arguments[providerInterfaceName] = movedProvider
+					moved := []reflect.Value{}
+					for j, other := range operation.parameters {
+						moved = append(moved, providerStubArgument(t, arguments, operation.name, other, bound.Type().In(j)))
+					}
+					perturbations := providerPerturbations(t, operation.name, parameter, moved[i])
+					if len(perturbations) != positions {
+						t.Fatalf("%s resolves %s to %d perturbations and then to %d",
+							where, parameter.name, positions, len(perturbations))
+					}
+					moved[i] = perturbations[at].value
+					movedResults, recovered := providerStubCall(operation.bind(movedProvider), moved)
+					if recovered != nil {
+						t.Errorf("%s refused to answer with %s moved at %s: %v",
+							where, parameter.name, perturbations[at].where, recovered)
+						continue
+					}
+					if providerStubAnswer(movedResults) == answer {
+						t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
+							where, parameter.name, perturbations[at].where, parameter.name)
+						continue
+					}
+					observed++
 				}
-				if providerStubAnswer(movedResults) == answer {
-					t.Errorf("%s answers the same with %s moved by a byte, so it does not read the %s it was handed",
-						where, parameter.name, parameter.name)
-					continue
-				}
-				observed++
 			}
 			if observed == 0 {
 				unobserved = append(unobserved, operation.name)
@@ -3854,6 +4003,10 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 					t.Errorf("%s reads nothing of the provider it is a method of, so the registry comparison above compared a literal against the registry", where)
 				}
 			}
+			// recorded here rather than on entry: an operation is covered by this gate
+			// when its row has run, and one that stopped at a refusal above is reported
+			// as unreached rather than as probed
+			probed = append(probed, operation.name)
 		}
 		assertCoversEveryProviderOperation(t, "TestProviderHasNoRemainingStubs", probed)
 		slices.Sort(drawing)
@@ -3889,9 +4042,13 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 //   - a panic standing as a whole statement of the body rather than inside a branch, which
 //     is a refusal to run rather than a refusal of an input -- every real panic in this
 //     package is the else of a check;
-//   - a declaration that reads none of the parameters it takes, which is the plausible
-//     zero value: the body compiles, returns something of the right size, and is a
-//     function of nothing.
+//   - a parameter the body never reads, which is the plausible zero value: the body
+//     compiles, returns something of the right size, and is a function of less than it
+//     declares.
+//
+// The third is every parameter rather than any one of them. Asking only that some parameter
+// be read is a rule a two parameter placeholder satisfies by touching one of them, and it
+// is weaker than the behavioural half of this task states for the same declarations.
 //
 // Bodies of function literals are skipped, so a return or a panic written inside a closure
 // is read as the closure's and not as the declaration's.
@@ -3904,15 +4061,12 @@ func providerStubShapesIn(parsed parsedSource) []string {
 		}
 		where := parsed.file.Name.Name + "." + function.Name.Name
 		returns := false
-		read := map[string]bool{}
 		outermost(function.Body, func(node ast.Node) {
 			if _, isReturn := node.(*ast.ReturnStmt); isReturn {
 				returns = true
 			}
-			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
-				read[identifier.Name] = true
-			}
 		})
+		read := identifiersReadIn(function.Body)
 		if function.Type.Results != nil && len(function.Type.Results.List) != 0 && !returns {
 			shapes = append(shapes, where+" declares a result and never returns one")
 		}
@@ -3929,30 +4083,104 @@ func providerStubShapesIn(parsed parsedSource) []string {
 				shapes = append(shapes, where+" panics as a statement of its body rather than inside a check")
 			}
 		}
-		parameters := []string{}
 		if function.Type.Params != nil {
 			for _, field := range function.Type.Params.List {
 				for _, name := range field.Names {
-					if name.Name != "_" {
-						parameters = append(parameters, name.Name)
+					if name.Name != "_" && !read[name.Name] {
+						shapes = append(shapes, where+" does not read "+name.Name)
 					}
 				}
-			}
-		}
-		if len(parameters) != 0 {
-			used := false
-			for _, name := range parameters {
-				if read[name] {
-					used = true
-				}
-			}
-			if !used {
-				shapes = append(shapes, where+" reads none of "+strings.Join(parameters, ", "))
 			}
 		}
 	}
 	slices.Sort(shapes)
 	return shapes
+}
+
+// The identifiers one body reads as values.
+//
+// The tail of a selector is not one of them, and neither is a field name written in a
+// struct type inside the body. A method reading self.params.Nh mentions the identifiers
+// params and Nh while reading nothing of either name, so counting every identifier would
+// read a declaration taking a parameter called params as reading it whatever the body did
+// with the argument. That is the alias defeat this project has already paid for once, in
+// task 15, arriving through the other half of the same node.
+//
+// A key in a composite literal is counted, because telling a struct field name from a map
+// key needs the type and this walk has none. Over counting there costs a name that is a
+// parameter's name and a field's name at once, which is a narrower miss than the one it
+// avoids.
+func identifiersReadIn(body *ast.BlockStmt) map[string]bool {
+	tails := map[*ast.Ident]bool{}
+	outermost(body, func(node ast.Node) {
+		switch found := node.(type) {
+		case *ast.SelectorExpr:
+			tails[found.Sel] = true
+		case *ast.Field:
+			for _, name := range found.Names {
+				tails[name] = true
+			}
+		}
+	})
+	read := map[string]bool{}
+	outermost(body, func(node ast.Node) {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && !tails[identifier] {
+			read[identifier.Name] = true
+		}
+	})
+	return read
+}
+
+// The unexported declarations of one package that nothing in it names.
+//
+// A placeholder written to keep a build green is a declaration with a body and no caller,
+// and none of the shapes above can see one: it compiles, it returns something of the right
+// size, and a body that reads each of its parameters once satisfies every rule there.
+// Measured, against the version this replaces: a two parameter placeholder appended to
+// crypto.go, reading both of its parameters and called by nobody, passed all 2287 tests of
+// this package.
+//
+// The class is the package's own source rather than a list. A name mentioned anywhere in
+// it except at its own declaration is reached, which counts a function passed as a value
+// and a method reached through an interface as well as a plain call, so the reading errs
+// towards calling a declaration live. Exported declarations are the package's surface and
+// are called from outside it; init is called by the runtime and named by nobody, and so is
+// a main. What this leaves open is an exported placeholder, which is a different thing from
+// a leftover: it is on the surface an auditor reads.
+func uncalledDeclarationsIn(files []parsedSource) []string {
+	declared := map[string]bool{}
+	own := map[*ast.Ident]bool{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			name := function.Name.Name
+			if ast.IsExported(name) || name == "init" || name == "main" {
+				continue
+			}
+			declared[name] = true
+			own[function.Name] = true
+		}
+	}
+	named := map[string]bool{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && !own[identifier] {
+				named[identifier.Name] = true
+			}
+			return true
+		})
+	}
+	uncalled := []string{}
+	for name := range declared {
+		if !named[name] {
+			uncalled = append(uncalled, name)
+		}
+	}
+	slices.Sort(uncalled)
+	return uncalled
 }
 
 // Every node of one body except the bodies of the function literals inside it, so a return
@@ -3970,9 +4198,12 @@ func outermost(body *ast.BlockStmt, visit func(node ast.Node)) {
 }
 
 // A file holding one of each shape, so a matcher that stopped matching fails here rather
-// than reporting the package clean. The fourth declaration is the negative half: a real
-// panic in this package is the else of a check, and it must not be read as a refusal to
-// run.
+// than reporting the package clean. The last declaration is the negative half: a real panic
+// in this package is the else of a check, and it must not be read as a refusal to run.
+//
+// stubThatReadsOneOfTwo is what says the parameter rule is every parameter rather than any
+// one of them, and stubThatNamesAFieldInstead is what says an identifier in a selector's
+// tail is not a read of a parameter that shares its spelling.
 const providerStubShapeControl = `package control
 
 func stubThatPanics(secret []byte) []byte {
@@ -3981,6 +4212,15 @@ func stubThatPanics(secret []byte) []byte {
 
 func stubThatAnswersZeroes(secret []byte, length int) []byte {
 	return make([]byte, 32)
+}
+
+func stubThatReadsOneOfTwo(secret []byte, length int) []byte {
+	return make([]byte, length)
+}
+
+func stubThatNamesAFieldInstead(params []byte, length int) []byte {
+	answer := struct{ params []byte }{}
+	return append(answer.params, byte(length))
 }
 
 func realDeclaration(secret []byte, length int) []byte {
@@ -3993,36 +4233,81 @@ func realDeclaration(secret []byte, length int) []byte {
 }
 `
 
+// A package holding one reached declaration and one nothing names, for the same reason the
+// shape control exists: a call graph reading that had stopped reading would report every
+// package clean and pass.
+const providerUncalledControl = `package control
+
+func used(secret []byte) []byte {
+	return secret
+}
+
+func notImplementedYet(secret []byte, length int) []byte {
+	if len(secret) < 0 {
+		return nil
+	}
+	return make([]byte, length)
+}
+
+func Exported(secret []byte) []byte {
+	return used(secret)
+}
+`
+
 // No declaration anywhere under the guardrail roots is a placeholder.
 //
 // The roots are the ones the primitive guardrails already walk, which is this package and
 // connect/message, so a stub written in either is read. Scanning one package would leave
 // the other's placeholders to be found by a caller, and this plan lands code in both.
 //
-// The matcher runs on a control as well as on the source. Without that half a matcher that
+// Two readings, because a placeholder has two ways of being invisible. The shapes are per
+// file and say what a body does with what it was handed. The call graph is per package and
+// says whether anything reaches the body at all, which is the half that catches a
+// declaration whose body is a perfectly well formed function of nothing anybody calls.
+//
+// Both matchers run on a control as well as on the source. Without that half a matcher that
 // had stopped matching -- a parse that silently failed, a shape rule narrowed by an edit --
 // would report every file clean and pass, which is the one outcome a gate must never be
 // able to produce by accident.
 func TestNoStubShapesRemainInSource(t *testing.T) {
 	control := providerStubShapesIn(mustParseText(t, "the stub shape control", providerStubShapeControl))
 	want := []string{
-		"control.stubThatAnswersZeroes reads none of secret, length",
+		"control.stubThatAnswersZeroes does not read length",
+		"control.stubThatAnswersZeroes does not read secret",
+		"control.stubThatNamesAFieldInstead does not read params",
 		"control.stubThatPanics declares a result and never returns one",
+		"control.stubThatPanics does not read secret",
 		"control.stubThatPanics panics as a statement of its body rather than inside a check",
-		"control.stubThatPanics reads none of secret",
+		"control.stubThatReadsOneOfTwo does not read secret",
 	}
 	if !slices.Equal(control, want) {
 		t.Errorf("the shape matcher read %v out of the control, want %v", control, want)
 	}
+	reached := uncalledDeclarationsIn([]parsedSource{mustParseText(t, "the uncalled control", providerUncalledControl)})
+	if !slices.Equal(reached, []string{"notImplementedYet"}) {
+		t.Errorf("the call graph matcher read %v out of its control, want [notImplementedYet]", reached)
+	}
 	scanned := 0
+	packages := map[string][]parsedSource{}
 	for path, text := range productionSources(mustScanSources(t, forbiddenScanRoots).sourceTexts) {
 		scanned++
-		if shapes := providerStubShapesIn(mustParseText(t, path, text)); len(shapes) != 0 {
+		parsed := mustParseText(t, path, text)
+		if shapes := providerStubShapesIn(parsed); len(shapes) != 0 {
 			t.Errorf("%s still holds a placeholder: %v", path, shapes)
 		}
+		where := filepath.ToSlash(filepath.Dir(path))
+		packages[where] = append(packages[where], parsed)
 	}
 	if scanned == 0 {
 		t.Fatalf("the scan read no non test source, so this gate examined nothing")
+	}
+	if len(packages) == 0 {
+		t.Fatalf("the scan grouped no package, so the call graph half examined nothing")
+	}
+	for where, files := range packages {
+		if uncalled := uncalledDeclarationsIn(files); len(uncalled) != 0 {
+			t.Errorf("%s declares %v, which nothing in it names", where, uncalled)
+		}
 	}
 }
 
@@ -4236,6 +4521,10 @@ type declaredFunction struct {
 	name       string
 	parameters []providerParameter
 	signature  *types.Signature
+	// whether the declaration carries a receiver. The provider's methods are reached
+	// through the interface, so the construction class is the package level half, and a
+	// filter reading that off the rendered name would depend on how one is spelled.
+	method bool
 }
 
 // Whether one type is another, as the compiler reads it: the same type, or a type
@@ -4313,6 +4602,7 @@ func declaredFunctionsIn(t *testing.T, checked checkedPackage) []declaredFunctio
 			}
 			functions = append(functions, declaredFunction{
 				name: name, parameters: parameters, signature: signature,
+				method: function.Recv != nil,
 			})
 		}
 	}
@@ -4907,7 +5197,6 @@ func TestNoProviderOperationFallsBackWhenItsSourceRunsDry(t *testing.T) {
 		probed := []string{}
 		refused := []string{}
 		for _, operation := range providerOperations(t) {
-			probed = append(probed, operation.name)
 			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
 			subject := mustProviderOver(t, suite, bytes.NewReader(nil))
 			arguments[providerInterfaceName] = subject
@@ -4917,6 +5206,9 @@ func TestNoProviderOperationFallsBackWhenItsSourceRunsDry(t *testing.T) {
 				call = append(call, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
 			}
 			results, recovered := providerStubCall(bound, call)
+			// recorded off the call rather than off the enumeration, so an operation this
+			// loop never called is reported as unreached
+			probed = append(probed, operation.name)
 			if recovered != nil {
 				refused = append(refused, operation.name)
 				continue
@@ -5170,7 +5462,6 @@ func TestEveryProviderOperationDrawsExactlyWhatItUses(t *testing.T) {
 		probed := []string{}
 		drawing := []string{}
 		for _, operation := range providerOperations(t) {
-			probed = append(probed, operation.name)
 			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
 			counting := &countingReader{inner: providerStubStream(0x80)}
 			subject := mustProviderOver(t, suite, counting)
@@ -5196,6 +5487,9 @@ func TestEveryProviderOperationDrawsExactlyWhatItUses(t *testing.T) {
 			if counting.drawn != 0 {
 				drawing = append(drawing, operation.name)
 			}
+			// recorded here rather than on entry, for the reason the stub gate records it
+			// here: covered means the row ran, not that the name was enumerated
+			probed = append(probed, operation.name)
 		}
 		assertCoversEveryProviderOperation(t, "TestEveryProviderOperationDrawsExactlyWhatItUses", probed)
 		slices.Sort(drawing)
