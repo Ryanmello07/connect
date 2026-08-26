@@ -6358,11 +6358,13 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 // blocks, this walks at most 4096 of them, and the largest tree holds 2^32-1
 // (level, block) pairs of which 86,015 are walked whole. the other
 // 4,294,881,280 are reached only where the ladder's five blocks land. a version
-// wrong over a run of blocks at one level, outside those, is not seen here.
-// that residual is what the walks in the rest of this file are sized against.
-// measured, from outside: of the versions of Parent that are wrong at one block
-// of one level, this sweep kills every one at blocks 2^0 through 2^12 and none
-// at 2^13 and above.
+// wrong over a run of blocks at one level, above 4096 and away from the two
+// blocks that end the level, is not seen here — and, measured below, is not
+// seen anywhere else in this package either. that is the largest thing this
+// test does not hold. it was priced smaller once, and the reason is worth
+// keeping: the earlier enumeration confined only Parent to a block and drew
+// only powers of two, and powers of two are the blocks the deep filtered-path
+// walk steps through, so the versions it excused died for the wrong reason.
 //
 // one thing here is narrower than it looks. both shape fixtures are shapes in
 // which nothing is ever filtered out: a tree with every parent blank resolves
@@ -6373,44 +6375,81 @@ func TestFilteredDirectPathDropsAtEveryLevel(t *testing.T) {
 // duplicated here.
 //
 // measured rather than argued, in a scratch copy, and the enumeration is read
-// off the file rather than written down: every function tree_math.go declares
-// is perturbed at its return, and a scan of the parsed source says which — 24
-// of the 26, with checkLeafCount returning only errors and commonAncestorRaw
-// reached through its wrapper. a scalar answer is perturbed by a single-bit
-// error confined to one level or one tree depth, a list answer by a dropped,
-// duplicated, truncated, swapped or bit-flipped element at each position, and
-// Parent again at one block of one level. that is 16,253 versions.
+// off the file rather than written down: every declaration tree_math.go makes
+// is renamed and re-exposed through a switchable hook, and a scan of the parsed
+// source says which — 25 of the 26, checkLeafCount being the one that returns
+// an error and nothing else, at 27 hook keys because SubtreeSpan and
+// SubtreeLeaves each answer twice. a scalar answer is perturbed by a single-bit
+// error at five bit positions, a list answer by a dropped, duplicated, swapped
+// or truncated element, and each of those is confined to one level, one tree
+// depth, or one block of one level. the blocks are drawn and not listed, which
+// is the whole difference between this pricing and the last: a level-k node of
+// the largest tree is one of 2^(31-k), each level is probed at the four ends
+// this file's own ladder walks and at five more drawn across the whole of that
+// range, and that is 257 blocks over the 32 levels. 27,342 versions in all.
 //
-// this sweep kills 15,709 of them. the sweep the plan wrote kills 5,445, and
-// the whole of the difference is the band: at every level key from 10 to 31 the
-// plan's version kills none and this one kills all of them. what this sweep
-// kills that nothing else in this package kills is zero — every version it
-// fails is failed by some other test as well, so its value is that it asks
-// relations between the functions, against the layout, and not that it reaches
-// somewhere alone.
+// this sweep applies 14,770 of them and kills 14,549. a further 240 meet a
+// scope of it and cannot change any answer it computes, and 12,305 it never
+// meets at all.
 //
-// what it does not kill is 544, and every one is named. 120 are perturbations
-// at index 0xFFFFFFFF, the level-32 index no tree holds, which a sweep of trees
-// cannot reach and TestSubtreeSpanArms owns. 166 are on the five leaf-count
-// functions this sweep never names, which are Task 3's. 51 are Parent wrong at
-// one block of 2^13 or above, which is exactly where the walk stops and which
-// TestFilteredDirectPathAtEveryDepth kills — measured, not assumed. 204 are
-// perturbations that cannot differ from this file for any input and are marked
-// rather than run, and the remaining 3 are the same thing found late: a swap of
-// positions 30 and 31 of a list that never holds 32 entries.
+// the 221 it applies and does not fail on are named, all four kinds. 133 are
+// TreeDepth, which this sweep calls on every DirectPath and only as the
+// capacity of the slice DirectPath allocates, so no row can read the answer —
+// reached on every path in the walk and observed by nothing, which is not the
+// same as unreached and is filed apart from it here for that reason. 50 are the
+// index Left or Right returns beside its refusal at a leaf and 30 the index
+// Parent or Sibling returns beside its refusal at the root, both of which the
+// rows here check the error of and not the value. and 8 reorder the first two
+// nodes of a copath child's resolution under the blank-parent shape, which the
+// filtered path reads for emptiness alone. a further 27 versions are excluded
+// rather than run: TreeDepth with its top bit flipped asks DirectPath for a
+// slice of 2^31 entries, which is an allocation this machine will not serve,
+// and by the reading that makes the other 133 survive they can change nothing
+// here either.
 //
-// the block boundary is the sharpest thing the enumeration says. of the
-// block-confined Parent versions, this sweep kills every one at blocks 2^0
-// through 2^12 and none at 2^13, 2^14 or 2^15. that is the walk, seen from
-// outside.
+// the residual is the part of the 12,305 that no other test holds, and it is
+// measured and not assumed: every (function, level, block) all 78 tests of this
+// package reach was recorded, and 8,290 of these versions name a key none of
+// them ever invokes, so no test can fail on one. 4,200 of those are impossible
+// rather than unheld — a leaf is at level 0, so the three functions that take a
+// leaf index cannot be asked at any other level. the other 4,090 are a real
+// gap. 2,620 of them are the gap this comment used to close by hand: Left,
+// Right, Parent, Sibling, DirectPath, Copath, CommonAncestor or Resolution
+// wrong at one block of one level, with nothing in this package able to fail.
+// the remaining 1,470 are the leaf mapping asked about a parent node, which
+// refuses there, and three functions asked at blocks of level 0 that nothing
+// reaches. the 4,015 versions this sweep never applies but some other test does
+// reach are not classified: nothing is claimed about them either way.
+//
+// the block boundary is the sharpest thing the enumeration says, and it is the
+// walk seen from outside. of the 10,280 versions of those eight functions
+// confined to one block of one level, every one below block 4096 is reached
+// here, and above it only the two blocks that end the level are — 1,520
+// versions at the ends, ten in the interior, where the ladder's alternating-bit
+// probe happens to land on a node some Parent call is handed. the other 3,590
+// are interior blocks at or above 4096 and this sweep never touches one.
+//
+// two figures from the earlier and smaller class are kept because they were
+// measured then and were not re-measured now: the sweep the plan wrote killed
+// 5,445 of 16,253 where this one killed 15,709, the whole of the difference
+// being the deep band; and what this sweep killed that no other test in this
+// package killed was zero.
 //
 // two things the grammar cannot express, said here so the next reader does not
 // read its silence as coverage. it perturbs answers and never error arms, so
 // the rows here that assert a refusal — that a leaf has no children, that the
-// root has no parent or sibling — are not exercised by it at all. and of the 67
-// rows in this test, 39 are the first to fail on some version of the class and
-// 28 are not, which against this class makes them redundant with a row that
-// runs before them rather than dead.
+// root has no parent or sibling — are not exercised by it at all. and six rows
+// cannot fail for any implementation at all, rather than merely being redundant
+// against this class: the two range rows at the top of checkNodeInvariants, the
+// straddle row, the containment and in-width rows beside the span endpoints,
+// and the leaf-count row beside the leaf pair. each is a consequence of the
+// exact-oracle row that runs immediately before it, or of the width sweepRoot
+// pins, and a Fatalf ends the call, so no input can reach one in a failing
+// state. that is traced by hand and not measured, because a first-failure
+// column cannot tell an unfalsifiable row from a redundant one. they are kept
+// rather than dropped because the two at the top also guard the level and block
+// this function is handed by its caller, which is a contract the enumeration
+// does not perturb.
 func TestTreeMathInvariants(t *testing.T) {
 	shallowNodes, deepNodes, ladderNodes := int64(0), int64(0), int64(0)
 	blankParentPaths, populatedPaths := 0, 0
