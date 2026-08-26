@@ -24,16 +24,19 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/constant"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -554,17 +557,26 @@ func TestGroupContextRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
+// goldenGroupContextEncodings is the set of valid encodings the refusal properties below are
+// stated over. Both hand derivations are in it, so the extension vector and the present but
+// empty opaque field are covered, and two upstream vectors carrying 64 and 48 byte hashes put
+// both varint widths in the set as another implementation wrote them.
+func goldenGroupContextEncodings(t *testing.T) map[string][]byte {
+	t.Helper()
+	return map[string][]byte{
+		"vector golden":    handDerivedEpoch0GroupContext(t),
+		"extension golden": handDerivedExtensionGolden(),
+		"upstream 64 byte": upstreamGroupContext(t, 0x0004, 0),
+		"upstream 48 byte": upstreamGroupContext(t, 0x0007, 2),
+	}
+}
+
 // TestGroupContextRejectsEverySingleByteTruncation asserts every proper prefix of a
 // valid encoding is refused rather than yielding a partly populated struct. The set of
 // prefixes is derived from the encoding's own length, so a field added to the structure
 // widens this test without anybody editing it.
 func TestGroupContextRejectsEverySingleByteTruncation(t *testing.T) {
-	for name, full := range map[string][]byte{
-		"vector golden":    handDerivedEpoch0GroupContext(t),
-		"extension golden": handDerivedExtensionGolden(),
-		"upstream 64 byte": upstreamGroupContext(t, 0x0004, 0),
-		"upstream 48 byte": upstreamGroupContext(t, 0x0007, 2),
-	} {
+	for name, full := range goldenGroupContextEncodings(t) {
 		refused := 0
 		for n := 0; n < len(full); n++ {
 			parsed := &GroupContext{}
@@ -581,6 +593,94 @@ func TestGroupContextRejectsEverySingleByteTruncation(t *testing.T) {
 			t.Errorf("%s: the untruncated encoding was refused too (%v), so the loop above proves nothing", name, err)
 		}
 	}
+}
+
+// sentinelGroupContext is a receiver whose every field holds a value no golden holds, so an
+// assignment made before a decode failed is visible whatever it assigned. A zeroed receiver
+// would show an early assignment only when the input's value for that field happens not to be
+// zero, which makes the observation depend on the fixture rather than on the code.
+func sentinelGroupContext() *GroupContext {
+	return &GroupContext{
+		Version:                 ProtocolVersion(0x1234),
+		CipherSuite:             CipherSuite(0x5678),
+		GroupId:                 []byte{0x9a, 0x9b},
+		Epoch:                   0x0123456789abcdef,
+		TreeHash:                []byte{0x9c},
+		ConfirmedTranscriptHash: []byte{0x9d, 0x9e, 0x9f},
+		Extensions:              []Extension{{ExtensionType: ExtensionType(0x4321), ExtensionData: []byte{0xa0}}},
+	}
+}
+
+// TestGroupContextUnmarshalAssignsNothingWhenItRefuses states the all or nothing rule
+// UnmarshalMLS documents: a decode that fails leaves the caller's struct exactly as it was
+// handed over.
+//
+// The rule earns a test because the struct a decode writes into is not always fresh. Under C1
+// the byte level entry point is syntax.Unmarshal(bs, gc) into a value the caller owns, which
+// invites reuse across epochs, and a decoder that assigned as it read would leave a refused
+// decode holding some fields from the new input and the rest from the old one. That composite
+// is not a mangled struct anybody would notice: it is a well formed GroupContext describing a
+// group binding that never existed, and re-encoding it produces bytes some peer will hash.
+//
+// Two families of refusable input are swept, both derived. Every proper prefix of every
+// golden fails somewhere in the field sequence, which reaches the assignments that happen
+// before the failing read. Every single byte change to the two hand derived goldens reaches
+// what a truncation cannot — a length prefix that overruns its region, a vector whose entries
+// do not fill it — and those fail after all six leading fields have been read successfully.
+//
+// UnmarshalMLS is called directly rather than through syntax.Unmarshal because the trailing
+// byte refusal belongs to the outer layer and happens after every field has legitimately been
+// assigned, so routing through it would count a correct decode as a refusal.
+func TestGroupContextUnmarshalAssignsNothingWhenItRefuses(t *testing.T) {
+	inputs := map[string][][]byte{}
+	for name, full := range goldenGroupContextEncodings(t) {
+		prefixes := [][]byte{}
+		for n := 0; n < len(full); n++ {
+			prefixes = append(prefixes, full[:n])
+		}
+		inputs[name+" truncated"] = prefixes
+	}
+	for name, full := range map[string][]byte{
+		"vector golden":    handDerivedEpoch0GroupContext(t),
+		"extension golden": handDerivedExtensionGolden(),
+	} {
+		corruptions := [][]byte{}
+		for position := range full {
+			for delta := 1; delta < 256; delta++ {
+				corrupted := append([]byte{}, full...)
+				corrupted[position] = byte((int(full[position]) + delta) % 256)
+				corruptions = append(corruptions, corrupted)
+			}
+		}
+		inputs[name+" corrupted"] = corruptions
+	}
+
+	refused, accepted := 0, 0
+	for name, family := range inputs {
+		familyRefused := 0
+		for _, input := range family {
+			untouched := sentinelGroupContext()
+			parsed := sentinelGroupContext()
+			if err := parsed.UnmarshalMLS(syntax.NewReader(input)); err == nil {
+				accepted++
+				continue
+			}
+			familyRefused++
+			if !reflect.DeepEqual(parsed, untouched) {
+				t.Fatalf("%s: a refused %d byte input changed the caller's context\n from %#v\n to   %#v",
+					name, len(input), untouched, parsed)
+			}
+		}
+		if familyRefused == 0 {
+			t.Errorf("%s: none of its %d inputs was refused, so this family evaluated the property zero times",
+				name, len(family))
+		}
+		refused += familyRefused
+	}
+	if accepted == 0 {
+		t.Fatal("every input was refused, so the corruption sweep produced nothing decodable and is not the sweep it claims to be")
+	}
+	t.Logf("%d refused inputs left the caller's context untouched, %d were accepted", refused, accepted)
 }
 
 // TestGroupContextEitherRefusesOrExactlyReproducesEverySingleByteCorruption is the
@@ -633,75 +733,135 @@ func TestGroupContextEitherRefusesOrExactlyReproducesEverySingleByteCorruption(t
 // the generated round trip corpus
 // ---------------------------------------------------------------------------
 
-// registryConstantsOfType reads this package's production source and returns the value
-// of every package level constant declared with the named type.
+// The registry constant derivation.
 //
-// The corpus below is built from what this returns rather than from a list typed out
-// beside it, because a hand written list of a registry's members is a list that is
-// already one member short the day somebody adds one — and the member it is short of is
-// the one nothing has ever encoded. Deriving it means a new ExtensionType constant
-// enters the round trip corpus in the commit that declares it.
-func registryConstantsOfType(t *testing.T, typeName string) map[string]uint64 {
+// The corpus below is built from what this returns rather than from a list typed out beside
+// it, because a hand written list of a registry's members is a list that is already one member
+// short the day somebody adds one — and the member it is short of is the one nothing has ever
+// encoded. Deriving it means a new ExtensionType constant enters the round trip corpus in the
+// commit that declares it.
+//
+// That claim holds only if the derivation reads every legal way to declare one, and the first
+// version of it did not. It walked the syntax tree and took a constant only when the spec
+// carried the type name and the value was a bare integer literal; every other shape hit a
+// silent continue. An ExtensionType written as 1 << 4, one written as an offset from another
+// code point, an iota block, and a spec that inherits its type from the line above are all
+// ordinary Go, all four declare a real registry member, and all four were dropped without a
+// word — a derived gate that had quietly become an enumeration of one spelling, which is rule
+// 5's failure with extra steps. So the value comes from go/types now, which is the thing that
+// decides what a constant is, and the class is every constant the package declares rather than
+// every constant somebody thought to spell simply.
+
+var (
+	packageTypeCheckOnce  sync.Once
+	packageTypeChecked    *types.Package
+	packageTypeCheckFiles int
+	packageTypeCheckErr   error
+)
+
+// typeCheckedPackage type checks this package's production source, once per process. The check
+// costs a second or two and several tests read registries out of it, so the memo is what keeps
+// the derivation cheap enough to be used everywhere it belongs.
+func typeCheckedPackage(t *testing.T) *types.Package {
 	t.Helper()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read the package directory: %v", err)
+	packageTypeCheckOnce.Do(func() {
+		packageTypeChecked, packageTypeCheckFiles, packageTypeCheckErr =
+			checkPackageSource(".", "github.com/urnetwork/connect/mls")
+	})
+	if packageTypeCheckErr != nil {
+		t.Fatalf("type check this package's production source: %v", packageTypeCheckErr)
 	}
-	found := map[string]uint64{}
+	if packageTypeCheckFiles == 0 {
+		t.Fatal("no production go file was read from the package directory, so this derivation proves nothing")
+	}
+	return packageTypeChecked
+}
+
+// checkPackageSource parses every production file of one directory and type checks them
+// together.
+//
+// A check error is returned rather than tolerated. go/types hands back a partial package when
+// it can, and a partial package is a partial scope, which is a derivation that silently
+// enumerates less than the source declares — the failure this whole approach exists to remove,
+// reintroduced one layer down.
+func checkPackageSource(directory string, packagePath string) (*types.Package, int, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", directory, err)
+	}
 	fileSet := token.NewFileSet()
-	read := 0
+	files := []*ast.File{}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
+		parsed, err := parser.ParseFile(fileSet, filepath.Join(directory, name), nil, parser.SkipObjectResolution)
 		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
+			return nil, 0, fmt.Errorf("parse %s: %w", name, err)
 		}
-		read++
-		for _, declaration := range parsed.Decls {
-			generic, isGeneric := declaration.(*ast.GenDecl)
-			if !isGeneric || generic.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range generic.Specs {
-				value, isValue := spec.(*ast.ValueSpec)
-				if !isValue {
-					continue
-				}
-				identifier, isIdentifier := value.Type.(*ast.Ident)
-				if !isIdentifier || identifier.Name != typeName {
-					continue
-				}
-				for i, ident := range value.Names {
-					if i >= len(value.Values) {
-						continue
-					}
-					literal, isLiteral := value.Values[i].(*ast.BasicLit)
-					if !isLiteral || literal.Kind != token.INT {
-						continue
-					}
-					parsedValue, err := strconv.ParseUint(literal.Value, 0, 64)
-					if err != nil {
-						t.Fatalf("%s = %s is not an integer literal this derivation can read: %v",
-							ident.Name, literal.Value, err)
-					}
-					found[ident.Name] = parsedValue
-				}
-			}
-		}
+		files = append(files, parsed)
 	}
-	if read == 0 {
-		t.Fatalf("no production go file read from the package directory, so this derivation proves nothing")
+	config := types.Config{
+		// from source rather than from the compiler's export data, so the check reads the tree
+		// as it is on disk and does not need the package to have been installed.
+		Importer: importer.ForCompiler(fileSet, "source", nil),
+		// no constant is declared inside a function body, and the bodies are most of what the
+		// check would otherwise cost.
+		IgnoreFuncBodies: true,
+	}
+	checked, err := config.Check(packagePath, fileSet, files, nil)
+	if err != nil {
+		return nil, len(files), err
+	}
+	return checked, len(files), nil
+}
+
+// namedTypeConstants returns the value of every package level constant in a checked package
+// whose declared type is the named one. It is split from registryConstantsOfType so the
+// completeness control below can run the same reader over a package written to hold the
+// awkward spellings — which cannot be added to production source, since a probe constant in
+// extension.go is a code point in a live registry and this file's own corpus would encode it.
+func namedTypeConstants(t *testing.T, pkg *types.Package, typeName string) map[string]uint64 {
+	t.Helper()
+	found := map[string]uint64{}
+	scope := pkg.Scope()
+	for _, name := range scope.Names() {
+		declared, isConstant := scope.Lookup(name).(*types.Const)
+		if !isConstant {
+			continue
+		}
+		named, isNamed := types.Unalias(declared.Type()).(*types.Named)
+		if !isNamed || named.Obj().Name() != typeName || named.Obj().Pkg() != pkg {
+			continue
+		}
+		value, exact := constant.Uint64Val(constant.ToInt(declared.Val()))
+		if !exact {
+			t.Fatalf("%s = %s is not a uint64, so the registry it belongs to cannot be enumerated as code points",
+				name, declared.Val())
+		}
+		found[name] = value
 	}
 	return found
 }
 
-// TestTheRegistryConstantDerivationReadsTheSource is the positive control on the
-// derivation above. A scan that read nothing returns an empty map, and an empty map
-// silently shrinks the corpus to whatever boundary values are hardcoded beside it — a
-// derived gate reporting green having derived nothing.
+// registryConstantsOfType is what the corpus generator calls. An empty result is fatal here
+// rather than at the call site: the generators append their own boundary values to whatever
+// this returns, so a derivation that found nothing would shrink the corpus to those two values
+// and report green having encoded no registered code point at all.
+func registryConstantsOfType(t *testing.T, typeName string) map[string]uint64 {
+	t.Helper()
+	found := namedTypeConstants(t, typeCheckedPackage(t), typeName)
+	if len(found) == 0 {
+		t.Fatalf("the derivation found no %s constant, so any corpus built from it holds only its hardcoded boundary values", typeName)
+	}
+	return found
+}
+
+// TestTheRegistryConstantDerivationReadsTheSource is the positive control on the derivation
+// above, run against the real package. A scan that read nothing returns an empty map, and an
+// empty map silently shrinks the corpus to whatever boundary values are hardcoded beside it —
+// a derived gate reporting green having derived nothing.
 func TestTheRegistryConstantDerivationReadsTheSource(t *testing.T) {
 	for typeName, mustHold := range map[string]map[string]uint64{
 		"ProtocolVersion": {"ProtocolVersionMls10": 0x0001},
@@ -715,9 +875,6 @@ func TestTheRegistryConstantDerivationReadsTheSource(t *testing.T) {
 		},
 	} {
 		derived := registryConstantsOfType(t, typeName)
-		if len(derived) == 0 {
-			t.Fatalf("the derivation found no %s constant at all, so any corpus built from it is empty", typeName)
-		}
 		for name, want := range mustHold {
 			got, ok := derived[name]
 			if !ok {
@@ -728,11 +885,75 @@ func TestTheRegistryConstantDerivationReadsTheSource(t *testing.T) {
 				t.Errorf("%s = %#x, want %#x", name, got, want)
 			}
 		}
+		t.Logf("%s: %d constants derived", typeName, len(derived))
 	}
-	if found := registryConstantsOfType(t, "ThisTypeDoesNotExistAnywhereInPackageMls"); len(found) != 0 {
+	if found := namedTypeConstants(t, typeCheckedPackage(t), "ThisTypeDoesNotExistAnywhereInPackageMls"); len(found) != 0 {
 		t.Fatalf("the derivation reported %d constants of a type that cannot exist, so it is matching text rather than declarations", len(found))
 	}
 }
+
+// TestTheRegistryConstantDerivationReadsEveryLegalConstantForm is the control the test above
+// cannot be. A list of names known to be declared separates "found nothing" from "found
+// something" and nothing more: it cannot tell six of six from six of ten, which is exactly the
+// shortfall a value reader restricted to bare literals produces. This states the completeness
+// half instead, over a throwaway package whose registry members are written in every form the
+// language allows.
+func TestTheRegistryConstantDerivationReadsEveryLegalConstantForm(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "probe.go"), []byte(probeRegistrySource), 0o600); err != nil {
+		t.Fatalf("write the probe package: %v", err)
+	}
+	checked, read, err := checkPackageSource(directory, "probe")
+	if err != nil {
+		t.Fatalf("type check the probe package: %v", err)
+	}
+	if read != 1 {
+		t.Fatalf("the probe package read %d files, want 1", read)
+	}
+	want := map[string]uint64{
+		"ProbeLiteral":   0x0002,
+		"ProbeShifted":   0x0010,
+		"ProbeOffset":    0x0066,
+		"ProbeParen":     0x000f,
+		"ProbeConverted": 0x0700,
+		"ProbeIota":      0x0800,
+		"ProbeIotaNext":  0x0801,
+		"ProbeIotaLast":  0x0802,
+	}
+	got := namedTypeConstants(t, checked, "ProbeRegistry")
+	if !maps.Equal(got, want) {
+		t.Fatalf("the derivation read\n %v\nwant\n %v", got, want)
+	}
+}
+
+// A registry whose members are declared in every form the language permits: a bare literal, a
+// shift, an offset from another member, a parenthesised expression, a conversion on a spec
+// carrying no type, and an iota block whose second and third members carry neither a type nor
+// a value of their own. The syntax tree scan this replaced read one of those six spellings and
+// dropped the other five in silence.
+const probeRegistrySource = `package probe
+
+type ProbeRegistry uint16
+
+const ProbeLiteral ProbeRegistry = 0x0002
+
+const (
+	ProbeShifted   ProbeRegistry = 1 << 4
+	ProbeOffset    ProbeRegistry = ProbeLiteral + 100
+	ProbeParen     ProbeRegistry = (3 * 5)
+	ProbeConverted               = ProbeRegistry(0x0700)
+)
+
+const (
+	ProbeIota ProbeRegistry = iota + 0x0800
+	ProbeIotaNext
+	ProbeIotaLast
+)
+
+// a constant of another type entirely, so a filter keying on the name rather than on the
+// declared type fails here
+const ProbeNotInTheRegistry uint16 = 0xdead
+`
 
 // sortedValues returns a derived constant set as a stable, deduplicated value list.
 func sortedValues(constants map[string]uint64) []uint64 {
@@ -1066,45 +1287,211 @@ func varyGroupContextField(field reflect.Value) bool {
 // Clone
 // ---------------------------------------------------------------------------
 
-// TestGroupContextCloneIsDeep asserts a cloned context shares no backing array with the
-// original, so an epoch held for out of order receipt cannot be mutated by the live
-// epoch. The extension bodies are included: they are the field a shallow copy is most
-// likely to miss, because copying the slice header looks like copying the slice.
-func TestGroupContextCloneIsDeep(t *testing.T) {
-	original := extensionGoldenGroupContext()
-	before, err := syntax.Marshal(original)
-	if err != nil {
-		t.Fatalf("syntax.Marshal: %v", err)
+// contextLeaf is one location inside a group context that a holder of that context can write
+// to: a scalar field, or the backing array of one opaque field.
+type contextLeaf struct {
+	path  string
+	value reflect.Value
+}
+
+// isBytes reports whether the leaf is an opaque field rather than a scalar.
+func (self contextLeaf) isBytes() bool {
+	return self.value.Kind() == reflect.Slice
+}
+
+// write changes the leaf. For an opaque field that means changing a byte of the backing array
+// rather than reassigning the field, because a clone that shares the array is only visible
+// through the array.
+func (self contextLeaf) write() {
+	target := self.value
+	if self.isBytes() {
+		target = self.value.Index(0)
 	}
-	clone := original.Clone()
-	if !groupContextsAgree(original, clone) {
-		t.Fatal("the clone does not hold the original's value")
+	target.SetUint(target.Uint() ^ 0xff)
+}
+
+// contextLeavesOf walks a group context and returns every location a holder can write to,
+// derived from the shape of the structure rather than listed beside it.
+//
+// Listing them is what broke the clone gate before. The version that shipped wrote to GroupId,
+// TreeHash and the first extension body and left ConfirmedTranscriptHash out, so a Clone that
+// aliased the confirmed transcript hash — the one field the confirmation tag is computed over,
+// and therefore the aliasing that matters most — passed. A walk cannot leave a field out, and
+// a field whose shape it does not recognise is fatal rather than skipped, so the next field
+// added to this structure either enters the gate or stops it.
+func contextLeavesOf(t *testing.T, path string, value reflect.Value) []contextLeaf {
+	t.Helper()
+	switch value.Kind() {
+	case reflect.Pointer:
+		if value.IsNil() {
+			t.Fatalf("%s is nil, so nothing under it is reachable", path)
+		}
+		return contextLeavesOf(t, path, value.Elem())
+	case reflect.Struct:
+		leaves := []contextLeaf{}
+		for i := range value.NumField() {
+			field := value.Type().Field(i)
+			if !field.IsExported() {
+				t.Fatalf("%s.%s is unexported, so this walk cannot reach it and cannot say whether Clone copies it",
+					path, field.Name)
+			}
+			leaves = append(leaves, contextLeavesOf(t, path+"."+field.Name, value.Field(i))...)
+		}
+		return leaves
+	case reflect.Slice:
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return []contextLeaf{{path: path, value: value}}
+		}
+		leaves := []contextLeaf{}
+		for i := range value.Len() {
+			leaves = append(leaves, contextLeavesOf(t, fmt.Sprintf("%s[%d]", path, i), value.Index(i))...)
+		}
+		return leaves
+	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return []contextLeaf{{path: path, value: value}}
+	}
+	t.Fatalf("%s is a %s, a shape this walk cannot write to, which leaves Clone's treatment of it unknown rather than absent",
+		path, value.Kind())
+	return nil
+}
+
+// cloneGateGroupContext is the fixture the gate below walks: every field carries a value and
+// every opaque field carries at least one byte.
+//
+// extensionGoldenGroupContext is the wrong fixture for this, and was the one used. Its
+// confirmed transcript hash is empty on purpose — that golden exists partly to pin the
+// encoding of a field that is present and empty — and an empty opaque field has no byte to
+// write through, so the gate simply stopped asserting anything about that field.
+func cloneGateGroupContext() *GroupContext {
+	return &GroupContext{
+		Version:                 ProtocolVersion(0xfafb),
+		CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:                 []byte{0xa1, 0xa2, 0xa3},
+		Epoch:                   0xfedcba9876543210,
+		TreeHash:                []byte{0xb1, 0xb2},
+		ConfirmedTranscriptHash: []byte{0xc1, 0xc2, 0xc3, 0xc4},
+		Extensions: []Extension{
+			{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{0xd1, 0xd2}},
+			{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0xe1}},
+		},
+	}
+}
+
+// TestGroupContextCloneIsDeepAtEveryWritableLocation asserts that writing anywhere inside a
+// cloned context leaves the original exactly as it was, over every location the walk finds.
+// That is the property Clone exists for: an epoch retained to decrypt out of order traffic
+// must not be reachable from the live one, and a shared transcript hash or a shared extensions
+// slice makes it reachable.
+func TestGroupContextCloneIsDeepAtEveryWritableLocation(t *testing.T) {
+	fixture := cloneGateGroupContext()
+	leaves := contextLeavesOf(t, "GroupContext", reflect.ValueOf(fixture))
+	if len(leaves) == 0 {
+		t.Fatal("the walk found no writable location, so the sweep below would assert nothing")
+	}
+	for _, leaf := range leaves {
+		if leaf.isBytes() && leaf.value.Len() == 0 {
+			t.Fatalf("the fixture leaves %s empty, so no byte of it can be written and any aliasing of it would go unseen — which is exactly how a shared confirmed transcript hash passed this gate before",
+				leaf.path)
+		}
 	}
 
-	clone.Version ^= 0xffff
-	clone.CipherSuite ^= 0xffff
-	clone.Epoch ^= math.MaxUint64
-	clone.GroupId[0] ^= 0xff
-	clone.TreeHash[0] ^= 0xff
-	clone.Extensions[0].ExtensionType ^= 0xffff
-	clone.Extensions[0].ExtensionData[0] ^= 0xff
+	written := map[string]bool{}
+	for index := range len(leaves) {
+		original := cloneGateGroupContext()
+		untouched := cloneGateGroupContext()
+		before, err := syntax.Marshal(original)
+		if err != nil {
+			t.Fatalf("syntax.Marshal: %v", err)
+		}
+		clone := original.Clone()
+		if !groupContextsAgree(original, clone) {
+			t.Fatal("the clone does not hold the original's value")
+		}
+		cloneLeaves := contextLeavesOf(t, "GroupContext", reflect.ValueOf(clone))
+		if len(cloneLeaves) != len(leaves) {
+			t.Fatalf("the clone exposes %d writable locations and the original %d, so the two are not the same shape",
+				len(cloneLeaves), len(leaves))
+		}
+		leaf := cloneLeaves[index]
+		written[leaf.path] = true
+		leaf.write()
 
-	after, err := syntax.Marshal(original)
-	if err != nil {
-		t.Fatalf("syntax.Marshal after mutating the clone: %v", err)
+		if !reflect.DeepEqual(original, untouched) {
+			t.Errorf("writing to the clone's %s changed the original:\n original %#v\n want     %#v",
+				leaf.path, original, untouched)
+			continue
+		}
+		after, err := syntax.Marshal(original)
+		if err != nil {
+			t.Fatalf("syntax.Marshal after writing to the clone's %s: %v", leaf.path, err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Errorf("writing to the clone's %s changed the original's encoding:\n before %x\n after  %x",
+				leaf.path, before, after)
+		}
 	}
-	if !bytes.Equal(before, after) {
-		t.Fatalf("mutating the clone changed the original's encoding:\n before %x\n after  %x", before, after)
+
+	// the coverage half, derived from the type rather than asserted as a count: every field of
+	// the structure must have contributed at least one location, so a fixture that left
+	// Extensions empty — and therefore walked no extension body — fails here instead of
+	// reporting a clean sweep of the fields it happened to reach.
+	structure := reflect.TypeOf(GroupContext{})
+	for i := range structure.NumField() {
+		name := structure.Field(i).Name
+		covered := false
+		for path := range written {
+			if strings.HasPrefix(path, "GroupContext."+name) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("no writable location under GroupContext.%s was exercised, so Clone's treatment of that field is untested", name)
+		}
 	}
-	if bytes.Equal(clone.GroupId, original.GroupId) {
-		t.Error("GroupId is shared")
+	t.Logf("%d writable locations checked: %s", len(written), strings.Join(slices.Sorted(maps.Keys(written)), " "))
+}
+
+// TestGroupContextCloneReproducesTheValueExactlyIncludingNilness asserts a clone is the same
+// Go value as its original and not merely the same encoding — which for the opaque fields
+// means nil clones to nil and empty non nil clones to empty non nil.
+//
+// This needs an observer of its own because everything else in the file is blind to it by
+// design. The wire has one spelling for both, groupContextsAgree equates them on purpose since
+// the decoder only ever produces the non nil form, and the encoding comparison in the corpus
+// clone test cannot see a difference the encoding does not carry. cloneBytes states the
+// distinction in its comment and, until this, nothing watched it.
+//
+// The corpus is reused rather than a case picked by hand, because its opaque axis already
+// carries nil, empty and four lengths in each of the three positions, and its extension axis
+// carries a nil vector, an empty one, and bodies of both kinds.
+func TestGroupContextCloneReproducesTheValueExactlyIncludingNilness(t *testing.T) {
+	corpus := generatedGroupContexts(t)
+	nils, empties := 0, 0
+	for _, context := range corpus {
+		for _, leaf := range contextLeavesOf(t, "GroupContext", reflect.ValueOf(context)) {
+			if !leaf.isBytes() {
+				continue
+			}
+			if leaf.value.IsNil() {
+				nils++
+			} else if leaf.value.Len() == 0 {
+				empties++
+			}
+		}
 	}
-	if bytes.Equal(clone.TreeHash, original.TreeHash) {
-		t.Error("TreeHash is shared")
+	if nils == 0 || empties == 0 {
+		t.Fatalf("the corpus carries %d nil and %d empty opaque fields; both are needed or this property is evaluated in one direction only",
+			nils, empties)
 	}
-	if bytes.Equal(clone.Extensions[0].ExtensionData, original.Extensions[0].ExtensionData) {
-		t.Error("ExtensionData is shared")
+	for index, context := range corpus {
+		if clone := context.Clone(); !reflect.DeepEqual(context, clone) {
+			t.Fatalf("case %d %s: the clone is not the same value as the original:\n original %#v\n clone    %#v",
+				index, describeGroupContext(context), context, clone)
+		}
 	}
+	t.Logf("%d clones reproduced their original exactly, across %d nil and %d empty opaque fields",
+		len(corpus), nils, empties)
 }
 
 // TestGroupContextCloneEncodesIdenticallyForEveryCorpusCase asserts the clone of every
