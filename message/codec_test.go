@@ -8,7 +8,12 @@
 // perfectly and agree with nobody — so the layout is written down a second time, in
 // rawRecord below, and every corpus record's encoding is compared against it. rawRecord
 // is also how this file reaches the records the encoder cannot produce: an is_commit
-// byte of 2, a blob id one byte short, a ct_body that is not its rung.
+// byte of 2, a blob id one byte short, a ct_body that is not its rung. rawRecord lives
+// beside the encoder, though, so a permutation applied to both at once passes it; the two
+// anchors that do not move with the code are the pinned records, one on the blob rung and
+// one carrying a body, each a hexadecimal string derived by hand from the table and
+// asserted byte for byte. Between them every field is pinned in both of the shapes it
+// takes.
 //
 // The second is that the round trip is byte exact over a corpus that is a cross product
 // rather than a list. The axes are the retention wire alphabet, the size ladder, the
@@ -20,10 +25,12 @@
 //
 // The third is that nothing is silently accepted and changed. Every single byte
 // truncation of a valid record is refused, every trailing byte is refused, and every
-// single byte corruption of the fixed region either is refused or re-encodes to exactly
-// the corrupted bytes. That last one is spec A section 5.8 rule 4 and it is the property
-// that catches a field read at the wrong width, which is the one defect a round trip over
-// well formed records cannot see.
+// single byte corruption either is refused or re-encodes to exactly the corrupted bytes —
+// over the fixed region across the whole class and ladder cross product, and over the
+// variable region, where the four length prefixes and the framing live, on one record per
+// rung. That last one is spec A section 5.8 rule 4 and it is the property that catches a
+// field read at the wrong width, which is the one defect a round trip over well formed
+// records cannot see.
 //
 // The fourth is that the two entry points are one parser. Every byte string this file
 // constructs — corpus, truncation, corruption, hand built refusal — goes through
@@ -120,6 +127,15 @@ func rawRecordOf(t testing.TB, r *Record) rawRecord {
 	if err != nil {
 		t.Fatalf("the join refused class %d bucket %d: %v", r.Header.RetentionClass, r.Header.EphBucket, err)
 	}
+	return rawRecordFields(r, retentionWire)
+}
+
+// The same mapping with the retention byte supplied, for a caller that has already asked
+// the join for it and has something of its own to say about the answer. One function
+// rather than two copies of the field list, because the field list is the layout and a
+// second copy of the layout in this file would be a second thing to keep in step with
+// codec.go's table.
+func rawRecordFields(r *Record, retentionWire byte) rawRecord {
 	return rawRecord{
 		formatVersion:    recordFormatVersion,
 		groupId:          r.Header.GroupId[:],
@@ -477,6 +493,53 @@ func fixedRegionCorpus(t testing.TB) []corpusEntry {
 	return subset
 }
 
+// One record per rung, with every length prefixed field populated, plus one carrying an
+// inline body: the corpus for the walk over the variable region.
+//
+// Every field of the variable region has to be present in at least one of these or the
+// walk never reaches its bytes, which is why the attachment and the write_auth are on and
+// why the blob rung is in the set — its blob id is the only 32 byte length prefixed field
+// the layout has. The rungs come from the parser like every other alphabet in this file, so
+// a rung added tomorrow is walked without anything here being edited.
+func variableRegionCorpus(t testing.TB) []corpusEntry {
+	t.Helper()
+	shapes := acceptedSizeBuckets(t)
+	classes := acceptedWireBytes(t)
+	entries := []corpusEntry{}
+	for _, sizeBucket := range sortedByteKeys(shapes) {
+		entries = append(entries, corpusEntry{
+			name:   fmt.Sprintf("bucket=%d body=0", sizeBucket),
+			record: corpusRecord(classes[probeRetentionWire], sizeBucket, shapes[sizeBucket], true, true, false, 0, u64Triple{}),
+		})
+	}
+	// the smallest rung that carries an inline body, so the walk reaches ct_body's own
+	// bytes and the prefix that frames them without walking 64 KiB of them.
+	for _, sizeBucket := range sortedByteKeys(shapes) {
+		length := SizeBucketCtBodyBytes(SizeBucket(sizeBucket))
+		if length < 0 {
+			continue
+		}
+		entries = append(entries, corpusEntry{
+			name:   fmt.Sprintf("bucket=%d body=%d", sizeBucket, length),
+			record: corpusRecord(classes[probeRetentionWire], sizeBucket, shapes[sizeBucket], true, true, false, length, u64Triple{}),
+		})
+		break
+	}
+	if len(entries) == 0 {
+		t.Fatal("the variable region corpus is empty, so the walk below would hold vacuously")
+	}
+	bodies := 0
+	for _, entry := range entries {
+		if 0 < len(entry.record.CtBody) {
+			bodies++
+		}
+	}
+	if bodies == 0 {
+		t.Fatal("no record in the variable region corpus carries a body, so ct_body's own bytes are never walked")
+	}
+	return entries
+}
+
 // ── the two entry points, asked together ────────────────────────────────────────────
 
 // Every byte string this file hands to the parser goes through here.
@@ -702,6 +765,99 @@ func TestOneRecordIsPinnedToItsExactBytes(t *testing.T) {
 	}
 }
 
+// A second record pinned to its exact bytes, and the one thing the first cannot pin: a
+// present ct_body.
+//
+// The record above is on the blob rung, where ct_body is absent by rule, so its LP(ct_body)
+// is four zero octets and its hex says nothing about where a body sits or how it is framed.
+// A body only exists on the other five rungs, so it takes a second vector, and this is it:
+// the smallest rung, its body exactly the rung's ciphertext length, and the other axes
+// deliberately the opposite of the first vector's — a non eph class rather than eph, no
+// server attachment rather than one, is_commit clear rather than set, expire_at unset
+// rather than a timestamp — so between the two every field is pinned in both of the shapes
+// it takes.
+//
+// Derived by hand from codec.go's table, field by field, and not by printing what
+// EncodeRecord produced: a vector taken from the encoder pins the encoder to itself. Each
+// line below is one row of that table. The body is the 272 bytes 0x00, 0x01 … 0xff, 0x00 …
+// 0x0f, which is 256 for the rung plus the 16 byte aead tag, and it is a pattern rather
+// than a constant so that a body written at the wrong offset lands on bytes that are not
+// the ones it should have.
+func TestOneRecordWithABodyIsPinnedToItsExactBytes(t *testing.T) {
+	const want = "01" + // format_version
+		"2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40" + // group_id
+		"808182838485868788898a8b8c8d8e8f" + // sender_handle
+		"0000000100000000" + // epoch: the first value that does not fit in 32 bits
+		"ffffffffffffffff" + // stream_index: the top of the range
+		"00" + // is_commit: clear
+		"01" + // retention_class_wire: durable, a class that carries no bucket
+		"00" + // size_bucket: the 256 B rung
+		"0000000000000000" + // expire_at: unset
+		"4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60" + // body_hash
+		"00000000" + // LP(blob_id): absent, as it is on every rung but the blob one
+		"00000000" + // LP(server_attachment): absent, an ordinary record
+		"00000010" + // LP(ct_head) declares 16
+		"909192939495969798999a9b9c9d9e9f" + // ct_head
+		"00000110" + // LP(ct_body) declares 0x110 = 272 = 256 + the 16 byte aead tag
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" + // ct_body
+		"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f" +
+		"404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f" +
+		"606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f" +
+		"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f" +
+		"a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf" +
+		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf" +
+		"e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff" +
+		"000102030405060708090a0b0c0d0e0f" + // the body's last 16 bytes, back at 0x00
+		"6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80" // write_auth
+
+	record := Record{
+		Header: RecordHeader{
+			Epoch:          0x0000000100000000,
+			StreamIndex:    0xFFFFFFFFFFFFFFFF,
+			IsCommit:       false,
+			RetentionClass: RetentionDurable,
+			EphBucket:      0,
+			SizeBucket:     SizeBucket256,
+			ExpireAt:       0,
+		},
+	}
+	for i := range record.Header.GroupId {
+		record.Header.GroupId[i] = byte(0x21 + i)
+	}
+	for i := range record.Header.SenderHandle {
+		record.Header.SenderHandle[i] = byte(0x80 + i)
+	}
+	for i := range record.Header.BodyHash {
+		record.Header.BodyHash[i] = byte(0x41 + i)
+	}
+	for i := range record.WriteAuth {
+		record.WriteAuth[i] = byte(0x61 + i)
+	}
+	record.CtHead = make([]byte, 16)
+	for i := range record.CtHead {
+		record.CtHead[i] = byte(0x90 + i)
+	}
+	// the length comes from the ladder rather than from a 272 written here, so a ladder
+	// that moved produces a record the pinned bytes no longer describe — which is the
+	// failure this vector is for.
+	record.CtBody = make([]byte, SizeBucketCtBodyBytes(SizeBucket256))
+	for i := range record.CtBody {
+		record.CtBody[i] = byte(i)
+	}
+
+	got := mustEncode(t, "the pinned record with a body", &record)
+	if hex.EncodeToString(got) != want {
+		t.Fatalf("the pinned record with a body encodes to\n%s\nwant\n%s", hex.EncodeToString(got), want)
+	}
+	parsed, err := parseBoth(t, "the pinned record with a body", got)
+	if err != nil {
+		t.Fatalf("the pinned record with a body does not parse: %v", err)
+	}
+	if difference := recordDifference(&record, parsed); difference != "" {
+		t.Errorf("the pinned record with a body does not round trip: %s differs", difference)
+	}
+}
+
 // ── the round trip ──────────────────────────────────────────────────────────────────
 
 // Byte exact both ways over the whole corpus: the record encodes, the encoding parses
@@ -809,6 +965,51 @@ func TestEverySingleByteCorruptionOfTheFixedRegionIsRejectedOrRoundTrips(t *test
 				}
 				corrupted[offset] = byte(value)
 				what := fmt.Sprintf("%s with byte %d set to 0x%02x", entry.name, offset, value)
+				parsed, err := parseBoth(t, what, corrupted)
+				if err != nil {
+					continue
+				}
+				again, err := EncodeRecord(parsed)
+				if err != nil {
+					t.Fatalf("%s: parsed and then refused to re-encode: %v", what, err)
+				}
+				if !bytes.Equal(again, corrupted) {
+					t.Fatalf("%s: parsed and re-encoded to different bytes, so a byte was accepted and silently changed", what)
+				}
+			}
+			corrupted[offset] = original
+		}
+	}
+}
+
+// The same property over the rest of the record: the four length prefixes, the bytes of
+// ct_head and ct_body, and the trailing mac.
+//
+// Spec A section 5.8 rule 4 is stated over every accepted input, not over the first
+// hundred odd bytes of one, and the variable region is where the framing lives. A length
+// prefix read at the wrong width, or a field consumed at the wrong offset, moves every
+// field after it, and a walk that stops before the first prefix never sees it.
+//
+// The corpus is one record per rung rather than the whole cross product, because this walk
+// costs the record's length times 255 parses and the property is about the framing, which
+// the retention class and the u64 fields do not change. The one record carrying an inline
+// body is on the smallest rung that has one, for the same reason: the property does not get
+// truer with 64 KiB of body to walk.
+func TestEverySingleByteCorruptionOfTheVariableRegionIsRejectedOrRoundTrips(t *testing.T) {
+	for _, entry := range variableRegionCorpus(t) {
+		valid := mustEncode(t, entry.name, &entry.record)
+		if len(valid) <= recordFixedRegionBytes {
+			t.Fatalf("%s: encoded to %d bytes, so it has no variable region to walk", entry.name, len(valid))
+		}
+		corrupted := slices.Clone(valid)
+		for offset := recordFixedRegionBytes; offset < len(valid); offset++ {
+			original := corrupted[offset]
+			for value := 0; value <= 0xFF; value++ {
+				if byte(value) == original {
+					continue
+				}
+				corrupted[offset] = byte(value)
+				what := fmt.Sprintf("%s with byte %d of %d set to 0x%02x", entry.name, offset, len(valid), value)
 				parsed, err := parseBoth(t, what, corrupted)
 				if err != nil {
 					continue
