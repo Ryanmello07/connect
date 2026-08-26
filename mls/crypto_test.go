@@ -3003,6 +3003,13 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return nil
 		}},
+		// group_context.go's field copier. It is the smallest member of this class and
+		// the one where the properties are the whole function: Clone exists so a retained
+		// past epoch cannot alias the live one, so a copier that answered a view over its
+		// argument would defeat the only thing it is for, and no encoding would change.
+		{name: "cloneBytes", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{cloneBytes(take(plaintext))}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}

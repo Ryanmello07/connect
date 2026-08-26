@@ -531,6 +531,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
+		// the extensions<V> pair. Both take the caller's Writer or Reader rather than
+		// building one, so the limit they run under is whichever the caller opened —
+		// which is the default one everywhere until a ratchet tree encode exists to
+		// raise it, and this line is where that decision would have to be written down.
+		"extension.go: syntax.ReadVector(r, readOneExtension)",
+		"extension.go: syntax.WriteVector(w, exts, writeOneExtension)",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)

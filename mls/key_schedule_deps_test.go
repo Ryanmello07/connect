@@ -46,6 +46,25 @@ var (
 	_ func([]byte) *syntax.Reader            = syntax.NewReader
 	_ func(syntax.Marshaler) ([]byte, error) = syntax.Marshal
 	_ func([]byte, syntax.Unmarshaler) error = syntax.Unmarshal
+
+	// registry section 2 again, the vector pair. extensions<V> is the first structure in
+	// this package to reach them, and they are generic, so the pin instantiates them at
+	// the element type this package actually uses: a callback shape that moved would
+	// still satisfy an uninstantiated mention and stop compiling here.
+	_ func(*syntax.Writer, []Extension, func(*syntax.Writer, Extension) error) error     = syntax.WriteVector[Extension]
+	_ func(*syntax.Reader, func(*syntax.Reader) (Extension, error)) ([]Extension, error) = syntax.ReadVector[Extension]
+
+	// registry section 6.2 — the extension vector codec is the inline, writer and reader
+	// taking pair of override O-4, never the byte returning MarshalExtensions p5 first
+	// proposed: GroupContext carries the vector inline, so a byte returning half would
+	// put a hand written WriteOpaque at this call site and four others.
+	_ func(*syntax.Writer, []Extension) error   = WriteExtensions
+	_ func(*syntax.Reader) ([]Extension, error) = ReadExtensions
+
+	// this plan, task 3 — Clone is a method expression here so the pin covers the
+	// receiver as well as the result. A Clone that started returning a value rather than
+	// a pointer would still satisfy every call site that immediately dereferences it.
+	_ func(*GroupContext) *GroupContext = (*GroupContext).Clone
 )
 
 // Pinned values, which drift differently from functions: a constant retyped or a
@@ -63,6 +82,31 @@ var (
 	// the pin: a struct or an array behind either name stops compiling here.
 	_ []byte = HpkePublicKey(nil)
 	_ []byte = HpkePrivateKey(nil)
+
+	// registry section 6.1 — both registry enums are uint16 and nothing narrower. The
+	// 0xffff conversion is the pin: it is a compile error the moment either type is
+	// retyped to a uint8, which a plain assignment of a small constant would not catch.
+	_ ProtocolVersion = ProtocolVersionMls10
+	_ ProtocolVersion = ProtocolVersion(0xffff)
+	_ ExtensionType   = ExtensionType(0xffff)
+
+	// registry section 6.2 — Extension is the two field struct with a slice body, in the
+	// registry's field order and spelling. A field renamed or retyped stops compiling.
+	_ Extension = Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: nil}
+	_ []byte    = Extension{}.ExtensionData
+
+	// this plan, task 3 — every field of GroupContext at the registry's type. This is
+	// the pin the whole key schedule rests on: the structure is hashed into the confirmed
+	// transcript and mixed into every epoch derivation, so a field retyped here is two
+	// members deriving different secrets, and the field list is written out one line each
+	// so that a field ADDED is a line missing rather than a silent widening.
+	_ ProtocolVersion = GroupContext{}.Version
+	_ CipherSuite     = GroupContext{}.CipherSuite
+	_ []byte          = GroupContext{}.GroupId
+	_ uint64          = GroupContext{}.Epoch
+	_ []byte          = GroupContext{}.TreeHash
+	_ []byte          = GroupContext{}.ConfirmedTranscriptHash
+	_ []Extension     = GroupContext{}.Extensions
 )
 
 // pinnedCodec exists only to carry the C1 method set. Declaring the two methods and then
@@ -82,6 +126,13 @@ var (
 	_ syntax.Marshaler   = (*pinnedCodec)(nil)
 	_ syntax.Unmarshaler = (*pinnedCodec)(nil)
 	_ syntax.Codec       = (*pinnedCodec)(nil)
+
+	// the two structures of this plan that have landed carry the same method set. Their
+	// own files assert this too; repeating it here is deliberate, because the assertion
+	// in a production file is one an author fixing a build failure can delete, and this
+	// file is counted.
+	_ syntax.Codec = (*Extension)(nil)
+	_ syntax.Codec = (*GroupContext)(nil)
 )
 
 // TestConsumedCryptoProviderShape pins the CryptoProvider method set this plan calls,
@@ -309,12 +360,6 @@ var crossPlanSymbolsNotYetLanded = map[string]string{
 	"Right":                  "p3 tree math",
 	"LeafIndex.NodeIndex":    "p3 tree math",
 	"NodeIndex.Level":        "p3 tree math",
-	"ProtocolVersion":        "p5 registry enums and extensions",
-	"ProtocolVersionMls10":   "p5 registry enums and extensions",
-	"ExtensionType":          "p5 registry enums and extensions",
-	"Extension":              "p5 registry enums and extensions",
-	"WriteExtensions":        "p5 registry enums and extensions",
-	"ReadExtensions":         "p5 registry enums and extensions",
 	"ContentType":            "p6 framing",
 	"ContentTypeApplication": "p6 framing",
 	"ContentTypeProposal":    "p6 framing",
@@ -332,7 +377,6 @@ var crossPlanSymbolsNotYetLanded = map[string]string{
 	"LoadVectorFile":         "p8 validation and interop",
 	"MustHex":                "p8 validation and interop",
 	"HexOf":                  "p8 validation and interop",
-	"GroupContext":           "this plan, task 3",
 	"PreSharedKeyId":         "this plan, task 13",
 }
 
@@ -349,8 +393,8 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 	// removes the only thing that will notice its symbol landing, and deleting it is the
 	// cheapest way to quieten this test. answering an entry properly is a pin written
 	// above, the entry deleted, and this number decremented in the same commit.
-	if len(crossPlanSymbolsNotYetLanded) != 34 {
-		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 34; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
+	if len(crossPlanSymbolsNotYetLanded) != 27 {
+		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 27; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
 			len(crossPlanSymbolsNotYetLanded))
 	}
 	declared := packageLevelDeclarations(t, ".")
@@ -474,7 +518,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 15,
+	"key_schedule_deps_test.go": 34,
 	"pins_test.go":              8,
 }
 
