@@ -1,0 +1,11 @@
+# protoc emits LF and nothing downstream normalizes it back, so a checkout that
+# writes CRLF makes every regeneration rewrite every line ending. `git status`
+# then reports the generated files as modified while `git diff` reports nothing,
+# and the reproducibility check "regenerate and see an empty diff" stops meaning
+# what it says. core.autocrlf=true is set at system scope on the Windows boxes
+# that build this repo, which is exactly that checkout.
+#
+# Pinning the protobuf inputs and their generated Go to LF keeps the regenerate-
+# and-diff check honest: after this, a diff in a .pb.go is a real change.
+*.proto text eol=lf
+*.pb.go text eol=lf

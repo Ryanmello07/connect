@@ -28,6 +28,7 @@ package protocol_test
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -44,21 +45,40 @@ type armAuth struct {
 	// hide the defect instead of naming it.
 	op int
 	// requiresReqAuth is true for the five arms Spec A §5.7 lists under
-	// "Required on", false for the ten it lists under "NOT used on".
+	// "Required on" — the only list §5.7 gives that this file transcribes verbatim.
+	// It is false for ten arms, but §5.7 does not name ten: its "NOT used on" list
+	// holds exactly five (HelloRequest, CreateGroupRequest, UnsubscribeRequest,
+	// SubmitRequest, RecoveryFetchRequest) and never mentions rendezvous. The other
+	// five exemptions — the rendezvous arms 20-24 — come from Spec B §4.3.8, which
+	// is also the only source for the op bytes of any exempt arm; §5.7 gives op
+	// bytes only for the five required ones. Cite the source you actually read:
+	// this comment is the reader's map back to the normative text, and the whole
+	// argument of this file is that two independent transcriptions of one fact are
+	// a gift.
 	requiresReqAuth bool
 }
 
-// specA57 transcribes Spec A §5.7 in full: both the arms that require req_auth and
-// the arms that are exempt, each with the op byte Spec B §4.3.8 gives it.
+// specA57 transcribes the classification in full: both the arms that require
+// req_auth and the arms that are exempt, each with its op byte. It is named for
+// Spec A §5.7 because that is where the required set comes from, but only the
+// first block below is §5.7's; the second is Spec B §4.3.8's.
 //
-//	Required on, with their op bytes:  FetchRequest (13), SubscribeRequest (14),
-//	                                   GroupStatusRequest (16), BlobGrantRequest (17),
-//	                                   WrapFetchRequest (19).
+// Spec A §5.7, verbatim — "Required on, with their op bytes":
 //
-//	NOT used on: HelloRequest (10), CreateGroupRequest (11), SubmitRequest (12),
-//	             UnsubscribeRequest (15), RecoveryFetchRequest (18),
-//	             and the five rendezvous arms (20-24), which name no group and carry
-//	             their own Ed25519 authenticator instead (Spec B §4.3.11).
+//	FetchRequest (13), SubscribeRequest (14), GroupStatusRequest (16),
+//	BlobGrantRequest (17), WrapFetchRequest (19).
+//
+// Spec B §4.3.8, "The arms that carry no req_auth, each for its own reason", which
+// is the source of every exempt arm AND of every exempt arm's op byte (Spec A
+// §5.7 lists only the first five of these, gives no numbers for them, and does not
+// mention rendezvous at all):
+//
+//	HelloRequest (10), CreateGroupRequest (11), SubmitRequest (12),
+//	UnsubscribeRequest (15), RecoveryFetchRequest (18),
+//	and the five rendezvous arms — RendezvousRegisterRequest (20),
+//	RendezvousOpenRequest (21), RendezvousDepositRequest (22),
+//	RendezvousCollectRequest (23), RendezvousRetireRequest (24) — which name no
+//	group and carry their own Ed25519 authenticator instead (Spec B §4.3.11).
 //
 // This map is a decision table, not an inventory: its KEY SET is asserted equal to
 // the descriptor's arm set, so it cannot silently fall behind message.proto.
@@ -418,49 +438,487 @@ func TestArmNumberMeansOneOperationAcrossEnvelopes(t *testing.T) {
 	}
 }
 
+// isAuthenticatorField DERIVES whether a field is a request authenticator, rather
+// than matching it against a list of the authenticators that exist today.
+//
+// Spec B §4.3 puts the request authenticator at field 15 in every message that has
+// one. There are six such fields right now: `req_auth` on the five authenticated
+// read arms, and the five rendezvous authenticators of §4.3.11 — `register_auth`,
+// `open_auth`, `deposit_auth`, `collect_auth`, `retire_auth` — which §4.3.11
+// describes as sitting "at field 15, the slot req_auth occupies on the group
+// arms", each under its own name because each is verified against a different
+// pinned key.
+//
+// The naming convention is what makes the class derivable: every authenticator in
+// message.proto is spelled `<something>_auth`, and nothing else in the file is.
+// `write_auth` is the one authenticator that is NOT a proto field at all — it
+// lives inside the opaque Record.record_bytes and is parsed by
+// message.ParseRecord (§4.3.3, §12.1 A-2) — so it cannot be caught here and does
+// not need to be.
+//
+// A hand-typed list of the six names would let a SEVENTH authenticator, added
+// under any other name, escape the field-15 assertion in silence. Given the shape
+// of §4.3.11 a sixth rendezvous operation is a plausible near-term addition, and
+// the whole point of this test is that it should not be possible to add one
+// without deciding, explicitly, that its authenticator sits at 15.
+func isAuthenticatorField(name protoreflect.Name) bool {
+	return strings.HasSuffix(string(name), "_auth")
+}
+
+// knownAuthenticatorFields is NOT the class this test gates — isAuthenticatorField
+// is. It is a floor: the six authenticator fields that exist in message.proto
+// today, asserted to be found by the derivation, so that a derivation which
+// quietly stops matching anything (a renamed suffix, a walk over the wrong file)
+// fails loudly instead of passing over an empty set.
+var knownAuthenticatorFields = []string{
+	"req_auth", "register_auth", "open_auth", "deposit_auth", "collect_auth", "retire_auth",
+}
+
 // TestReqAuthAndReadEpochUseTheirReservedFieldNumbers walks every message in
-// message.proto, not a list of the ones that happen to have these fields today.
-// Spec B §4.3 puts read_epoch at 14 and the request authenticator at 15 in every
-// message that has one, including the five rendezvous authenticators of §4.3.11,
-// which sit at 15 under their own names. Because req_auth is zeroed inside
-// canonical_request_bytes, its field number decides where the hole in the canonical
-// bytes falls, so it is as much a protocol constant as the op byte is.
+// message.proto, not a list of the ones that happen to have these fields today,
+// and derives the authenticator class by name rather than enumerating it.
+// Because req_auth is zeroed inside canonical_request_bytes, its field number
+// decides where the hole in the canonical bytes falls, so it is as much a protocol
+// constant as the op byte is.
 func TestReqAuthAndReadEpochUseTheirReservedFieldNumbers(t *testing.T) {
 	fd := (*protocol.MessageServerRequest)(nil).ProtoReflect().Descriptor().ParentFile()
-	authFieldNames := map[string]bool{
-		"req_auth":      true,
-		"register_auth": true,
-		"open_auth":     true,
-		"deposit_auth":  true,
-		"collect_auth":  true,
-		"retire_auth":   true,
-	}
 	msgs := fd.Messages()
-	checked := 0
+	foundAuth := map[string]bool{}
+	checkedEpoch := 0
 	for i := 0; i < msgs.Len(); i++ {
 		md := msgs.Get(i)
 		fields := md.Fields()
 		for j := 0; j < fields.Len(); j++ {
 			f := fields.Get(j)
 			name := string(f.Name())
-			if authFieldNames[name] {
-				checked++
+			if isAuthenticatorField(f.Name()) {
+				foundAuth[name] = true
 				if f.Number() != 15 {
 					t.Errorf("%s.%s is field %d; Spec B §4.3 reserves 15 for the request "+
 						"authenticator, and req_auth's number decides where the zeroed hole "+
 						"falls inside canonical_request_bytes (Spec A §5.7)", md.FullName(), name, f.Number())
 				}
+				if f.Kind() != protoreflect.BytesKind || f.Cardinality() == protoreflect.Repeated {
+					t.Errorf("%s.%s is %v %v; every authenticator in Spec B §4.3 is a singular "+
+						"`bytes`, and canonical_request_bytes is defined as that field \"set to "+
+						"zero length\" (Spec A §5.7), which only a length-delimited field has",
+						md.FullName(), name, f.Cardinality(), f.Kind())
+				}
 			}
 			if name == "read_epoch" {
-				checked++
+				checkedEpoch++
 				if f.Number() != 14 {
 					t.Errorf("%s.read_epoch is field %d; Spec B §4.3 reserves 14 for it", md.FullName(), f.Number())
 				}
 			}
 		}
 	}
-	if checked == 0 {
-		t.Fatal("walked message.proto and found no req_auth or read_epoch field at all; " +
+	if len(foundAuth) == 0 || checkedEpoch == 0 {
+		t.Fatal("walked message.proto and found no authenticator or no read_epoch field at all; " +
 			"the walk is looking at the wrong file descriptor")
+	}
+	for _, name := range knownAuthenticatorFields {
+		if !foundAuth[name] {
+			t.Errorf("the authenticator derivation did not match %q, which message.proto still "+
+				"defines. isAuthenticatorField has stopped recognising the class it is supposed "+
+				"to derive, so the field-15 assertion is now passing over a smaller set than it "+
+				"claims to cover.", name)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE BODY OF AN AUTHENTICATED REQUEST IS A MAC INPUT IN FULL, NOT JUST ITS
+// ARM NUMBER.
+//
+// Everything above gates the op byte, req_auth's field number and read_epoch's.
+// That stops one level above the class the spec actually names. Spec A §5.7 and
+// Spec B §4.3.8 define
+//
+//	canonical_request_bytes = the deterministically-marshaled request body message
+//	                          (protobuf deterministic marshal, fields ascending)
+//	                          with its own `req_auth` field set to zero length.
+//
+// "the request body message" — the whole message. Every field number in it, every
+// field's wire type, and every field's presence rule is therefore a protocol
+// constant hashed into the MAC, exactly as the arm number is. Transposing
+// FetchRequest's `heads_only = 4` and `class_mask = 5`, deleting a field,
+// narrowing `read_epoch` from uint64 to uint32, or adding a proto3 `optional`
+// keyword to a scalar all change canonical_request_bytes for the same logical
+// request — and all of them compile, parse, and round-trip. They surface only as
+// a MAC mismatch on one operation, for one implementation, answered with the
+// deliberately non-specific REASON_REJECTED of §4.5. That is the same archetypal
+// defect the op-byte gate exists to prevent, one level down.
+//
+// The round-trip tests in message_test.go cannot see any of this: `populate`
+// derives the field set from the same descriptor it then compares against, so
+// source and destination agree on whatever schema the file happens to declare.
+// Nothing that reads only the descriptor can catch a descriptor that is wrong.
+// The transcription below is the second, independent source that makes the
+// comparison possible.
+//
+// The CLASS is derived, not listed. The seed set is every message in
+// message.proto that carries a `req_auth` field — the exact class §5.7's recipe
+// applies to — and the gated set is the transitive closure of the message types
+// reachable from those seeds, because a nested message inside a MAC input is
+// itself inside the MAC. `Subscription` is in the closure for exactly that
+// reason: it is not a request body, but SubscribeRequest carries a repeated
+// Subscription, so its field numbers are hashed too.
+//
+// The rendezvous arms are deliberately NOT seeded here. Their authenticators are
+// Ed25519 signatures over the explicit field-by-field preimages of Spec A §5.14,
+// not over a marshaled body, so their field numbering is pinned by that preimage
+// rather than by canonical_request_bytes. Only `req_auth` carries the
+// whole-message rule.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// macFieldSpec is one field of a MAC-input message as Spec B declares it, on
+// every axis that changes canonical_request_bytes.
+type macFieldSpec struct {
+	// number is the field number, which is the wire tag.
+	number int
+	// kind is the declared type, which fixes the wire type and the encoding.
+	kind protoreflect.Kind
+	// cardinality distinguishes singular from repeated; a repeated field encodes
+	// as several occurrences, or one packed run, rather than as one value.
+	cardinality protoreflect.Cardinality
+	// typeName is the fully-qualified name of the message or enum type, for
+	// MessageKind and EnumKind fields, and "" for scalars. A field that keeps its
+	// number and kind but changes its message type reshapes the bytes entirely.
+	typeName string
+	// explicitPresence is true only where the spec writes the proto3 `optional`
+	// keyword. It is false everywhere in Spec B §4.3, and it matters: under
+	// implicit presence a zero-valued field is omitted from the encoding, while
+	// under explicit presence a zero that was set is emitted. The two spellings
+	// of the same logical request then MAC differently.
+	explicitPresence bool
+}
+
+func macScalar(number int, kind protoreflect.Kind) macFieldSpec {
+	return macFieldSpec{number: number, kind: kind, cardinality: protoreflect.Optional}
+}
+
+func macRepeatedMessage(number int, typeName string) macFieldSpec {
+	return macFieldSpec{
+		number:      number,
+		kind:        protoreflect.MessageKind,
+		cardinality: protoreflect.Repeated,
+		typeName:    typeName,
+	}
+}
+
+func macEnum(number int, typeName string) macFieldSpec {
+	return macFieldSpec{
+		number:      number,
+		kind:        protoreflect.EnumKind,
+		cardinality: protoreflect.Optional,
+		typeName:    typeName,
+	}
+}
+
+// specBMacInputs transcribes, from the proto blocks of Spec B §4.3.4 (Fetch),
+// §4.3.5 (Subscribe), §4.3.6 (Blob grant), §4.3.9 (Wrap fetch) and §4.3.10
+// (GroupStatusRequest), every field of every message that is hashed into a
+// req_auth. Keyed by the message's simple name, then by the field's name, so a
+// RENAME shows up as a key-set difference and a RENUMBER as a value difference.
+//
+// This map is a transcription, not an inventory: TestMacInputMessagesAreExactlyTheReqAuthClosure
+// asserts its key set equals the closure derived from the descriptor, so a field
+// added to an authenticated body — or a new message type nested inside one —
+// fails here until somebody copies the spec's numbering in.
+var specBMacInputs = map[string]map[string]macFieldSpec{
+	// Spec B §4.3.4.
+	"FetchRequest": {
+		"group_id":        macScalar(1, protoreflect.BytesKind),
+		"since_record_id": macScalar(2, protoreflect.Uint64Kind),
+		"limit":           macScalar(3, protoreflect.Uint32Kind),
+		"heads_only":      macScalar(4, protoreflect.BoolKind),
+		"class_mask":      macScalar(5, protoreflect.Uint32Kind),
+		"read_epoch":      macScalar(14, protoreflect.Uint64Kind),
+		"req_auth":        macScalar(15, protoreflect.BytesKind),
+	},
+	// Spec B §4.3.5.
+	"SubscribeRequest": {
+		"subscriptions": macRepeatedMessage(1, "bringyour.Subscription"),
+		"replace":       macScalar(2, protoreflect.BoolKind),
+		"read_epoch":    macScalar(14, protoreflect.Uint64Kind),
+		"req_auth":      macScalar(15, protoreflect.BytesKind),
+	},
+	// Spec B §4.3.5. Not a request body, but every SubscribeRequest carries a
+	// repeated Subscription, so these two numbers are inside the MAC as surely as
+	// SubscribeRequest's own are.
+	"Subscription": {
+		"group_id":        macScalar(1, protoreflect.BytesKind),
+		"since_record_id": macScalar(2, protoreflect.Uint64Kind),
+	},
+	// Spec B §4.3.6.
+	"BlobGrantRequest": {
+		"group_id":        macScalar(1, protoreflect.BytesKind),
+		"blob_id":         macScalar(2, protoreflect.BytesKind),
+		"direction":       macEnum(3, "bringyour.Direction"),
+		"declared_bytes":  macScalar(4, protoreflect.Uint64Kind),
+		"retention_class": macScalar(5, protoreflect.Uint32Kind),
+		"read_epoch":      macScalar(14, protoreflect.Uint64Kind),
+		"req_auth":        macScalar(15, protoreflect.BytesKind),
+	},
+	// Spec B §4.3.10, which declares it on one line.
+	"GroupStatusRequest": {
+		"group_id":   macScalar(1, protoreflect.BytesKind),
+		"read_epoch": macScalar(14, protoreflect.Uint64Kind),
+		"req_auth":   macScalar(15, protoreflect.BytesKind),
+	},
+	// Spec B §4.3.9.
+	"WrapFetchRequest": {
+		"group_id":           macScalar(1, protoreflect.BytesKind),
+		"epoch":              macScalar(2, protoreflect.Uint64Kind),
+		"wrap_target_handle": macScalar(3, protoreflect.BytesKind),
+		"want_snapshot":      macScalar(4, protoreflect.BoolKind),
+		"read_epoch":         macScalar(14, protoreflect.Uint64Kind),
+		"req_auth":           macScalar(15, protoreflect.BytesKind),
+	},
+}
+
+// reqAuthSeeds returns the messages Spec A §5.7's canonical_request_bytes recipe
+// applies to: those carrying a `req_auth`. Derived from the file descriptor.
+func reqAuthSeeds(t *testing.T) []protoreflect.MessageDescriptor {
+	t.Helper()
+	fd := (*protocol.MessageServerRequest)(nil).ProtoReflect().Descriptor().ParentFile()
+	msgs := fd.Messages()
+	var seeds []protoreflect.MessageDescriptor
+	for i := 0; i < msgs.Len(); i++ {
+		md := msgs.Get(i)
+		if md.Fields().ByName("req_auth") != nil {
+			seeds = append(seeds, md)
+		}
+	}
+	return seeds
+}
+
+// macInputClosure returns every message descriptor reachable from a req_auth
+// carrier, seeds included, keyed by simple name. Reachability is what makes this
+// a derived class rather than a list: nesting a new message type inside an
+// authenticated body pulls that type into the MAC, and therefore into the gate.
+func macInputClosure(t *testing.T) map[string]protoreflect.MessageDescriptor {
+	t.Helper()
+	out := map[string]protoreflect.MessageDescriptor{}
+	var visit func(md protoreflect.MessageDescriptor)
+	visit = func(md protoreflect.MessageDescriptor) {
+		name := string(md.Name())
+		if _, seen := out[name]; seen {
+			return
+		}
+		out[name] = md
+		fields := md.Fields()
+		for i := 0; i < fields.Len(); i++ {
+			f := fields.Get(i)
+			if sub := f.Message(); sub != nil {
+				visit(sub)
+			}
+			if f.IsMap() {
+				if sub := f.MapValue().Message(); sub != nil {
+					visit(sub)
+				}
+			}
+		}
+	}
+	for _, seed := range reqAuthSeeds(t) {
+		visit(seed)
+	}
+	return out
+}
+
+// TestMacInputMessagesAreExactlyTheReqAuthClosure is the equality that makes the
+// field-level assertions below mean something, in the same way
+// TestRequestArmSetMatchesSpecA57 does for the arms. Without it, a field added to
+// FetchRequest — or a whole new message type nested inside SubscribeRequest —
+// would simply go ungated.
+func TestMacInputMessagesAreExactlyTheReqAuthClosure(t *testing.T) {
+	closure := macInputClosure(t)
+
+	seeds := reqAuthSeeds(t)
+	if len(seeds) != 5 {
+		t.Errorf("found %d messages carrying req_auth; Spec A §5.7 requires it on exactly five "+
+			"(FetchRequest, SubscribeRequest, GroupStatusRequest, BlobGrantRequest, WrapFetchRequest). "+
+			"canonical_request_bytes is defined for that class and no other.", len(seeds))
+	}
+
+	for name := range closure {
+		if _, ok := specBMacInputs[name]; !ok {
+			t.Errorf("%s is reachable from a req_auth-carrying request body, so every one of its "+
+				"field numbers is hashed into canonical_request_bytes (Spec A §5.7), but Spec B's "+
+				"declaration of it has not been transcribed into specBMacInputs. Transcribe it: "+
+				"the numbers are protocol constants, not implementation detail.", name)
+		}
+	}
+	for name := range specBMacInputs {
+		if _, ok := closure[name]; !ok {
+			t.Errorf("specBMacInputs transcribes %s, but nothing reachable from a req_auth-carrying "+
+				"body has that name any more. Either the message was renamed — which changes nothing "+
+				"on the wire but breaks this cross-check — or it dropped out of the MAC input set, "+
+				"which is a protocol change.", name)
+		}
+	}
+	if len(closure) != len(specBMacInputs) {
+		t.Errorf("MAC-input closure has %d messages, specBMacInputs transcribes %d", len(closure), len(specBMacInputs))
+	}
+}
+
+// TestMacInputFieldsMatchSpecB compares every field of every MAC-input message
+// against Spec B on the axes that change canonical_request_bytes: name, number,
+// kind, cardinality, type and presence. The message set is derived; only the
+// numbering is transcribed.
+func TestMacInputFieldsMatchSpecB(t *testing.T) {
+	closure := macInputClosure(t)
+	names := make([]string, 0, len(closure))
+	for name := range closure {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	checked := 0
+	for _, name := range names {
+		md := closure[name]
+		want, ok := specBMacInputs[name]
+		if !ok {
+			// Reported by TestMacInputMessagesAreExactlyTheReqAuthClosure.
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			fields := md.Fields()
+
+			// Key-set equality in both directions: a deleted field and an added
+			// field are each a change to the MAC preimage.
+			seen := map[string]bool{}
+			for i := 0; i < fields.Len(); i++ {
+				seen[string(fields.Get(i).Name())] = true
+			}
+			for fname := range want {
+				if !seen[fname] {
+					t.Errorf("Spec B declares %s.%s, which message.proto does not have. A field "+
+						"missing from a MAC input changes canonical_request_bytes for every "+
+						"request of this kind, so this client can never authenticate to a "+
+						"server built from the spec.", name, fname)
+				}
+			}
+			for i := 0; i < fields.Len(); i++ {
+				fname := string(fields.Get(i).Name())
+				if _, ok := want[fname]; !ok {
+					t.Errorf("message.proto declares %s.%s, which Spec B does not. Every field of "+
+						"this message is hashed into canonical_request_bytes (Spec A §5.7), so an "+
+						"extra field is an extra MAC input that no peer built from the spec will "+
+						"reproduce.", name, fname)
+				}
+			}
+
+			for i := 0; i < fields.Len(); i++ {
+				f := fields.Get(i)
+				fname := string(f.Name())
+				spec, ok := want[fname]
+				if !ok {
+					continue
+				}
+				checked++
+				if int(f.Number()) != spec.number {
+					t.Errorf("%s.%s is field %d; Spec B numbers it %d. The field number is the wire "+
+						"tag, and the tag bytes are inside canonical_request_bytes, so this is a "+
+						"silent cross-implementation MAC failure answered with REASON_REJECTED.",
+						name, fname, f.Number(), spec.number)
+				}
+				if f.Kind() != spec.kind {
+					t.Errorf("%s.%s is %v; Spec B declares it %v. The kind fixes the wire type and "+
+						"the encoding of the value, both of which are inside the MAC.",
+						name, fname, f.Kind(), spec.kind)
+				}
+				if f.Cardinality() != spec.cardinality {
+					t.Errorf("%s.%s is %v; Spec B declares it %v. Repeated and singular encode "+
+						"differently, so this changes canonical_request_bytes.",
+						name, fname, f.Cardinality(), spec.cardinality)
+				}
+				gotType := ""
+				if f.Message() != nil {
+					gotType = string(f.Message().FullName())
+				} else if f.Enum() != nil {
+					gotType = string(f.Enum().FullName())
+				}
+				if gotType != spec.typeName {
+					t.Errorf("%s.%s has type %q; Spec B declares %q. A field that keeps its number "+
+						"but changes its type reshapes the MAC preimage completely.",
+						name, fname, gotType, spec.typeName)
+				}
+				if f.HasOptionalKeyword() != spec.explicitPresence {
+					t.Errorf("%s.%s: proto3 `optional` keyword present = %v, Spec B declares %v. "+
+						"Explicit presence emits a set zero value that implicit presence omits, so "+
+						"two implementations that disagree about the keyword compute different "+
+						"canonical_request_bytes for the same logical request — the same defect "+
+						"the req_auth field-number rule guards against, one field over.",
+						name, fname, f.HasOptionalKeyword(), spec.explicitPresence)
+				}
+				wantPresence := spec.explicitPresence ||
+					(spec.cardinality == protoreflect.Optional &&
+						(spec.kind == protoreflect.MessageKind || spec.kind == protoreflect.GroupKind))
+				if f.HasPresence() != wantPresence {
+					t.Errorf("%s.%s: HasPresence() = %v, Spec B's declaration implies %v",
+						name, fname, f.HasPresence(), wantPresence)
+				}
+				if od := f.ContainingOneof(); od != nil && !od.IsSynthetic() {
+					t.Errorf("%s.%s sits inside `oneof %s`. Spec B declares no oneof in any MAC "+
+						"input; membership changes which fields may be present at once and so "+
+						"changes the set of reachable canonical_request_bytes.", name, fname, od.Name())
+				}
+			}
+
+			// A oneof added to a MAC input would also let two peers disagree about
+			// which fields can coexist. Synthetic oneofs (the proto3 `optional`
+			// keyword) are reported per-field above, with a better message.
+			oneofs := md.Oneofs()
+			for i := 0; i < oneofs.Len(); i++ {
+				if od := oneofs.Get(i); !od.IsSynthetic() {
+					t.Errorf("%s declares `oneof %s`; Spec B declares none on any MAC input", name, od.Name())
+				}
+			}
+		})
+	}
+	if checked == 0 {
+		t.Fatal("compared no fields at all; the MAC-input closure is empty and this gate is vacuous")
+	}
+	t.Logf("compared %d fields across %d MAC-input messages against Spec B", checked, len(names))
+}
+
+// TestMacInputEnumsAreTranscribed closes the last hole in the closure: an enum
+// reachable from a MAC input contributes its VALUE NUMBERS to the preimage, not
+// just its field's tag. BlobGrantRequest.direction is the live case —
+// DIRECTION_UPLOAD encodes as 1 and nothing else — so Direction's numbering is a
+// MAC input in exactly the way FetchRequest's field numbers are.
+//
+// The transcription itself lives in specBEnums (message_wire_test.go), which
+// covers every enum in message.proto; this asserts the reachable ones are in it,
+// so a new enum introduced into an authenticated body cannot arrive ungated.
+func TestMacInputEnumsAreTranscribed(t *testing.T) {
+	closure := macInputClosure(t)
+	reachable := map[string]bool{}
+	for _, md := range closure {
+		fields := md.Fields()
+		for i := 0; i < fields.Len(); i++ {
+			f := fields.Get(i)
+			if ed := f.Enum(); ed != nil {
+				reachable[string(ed.Name())] = true
+			}
+			if f.IsMap() {
+				if ed := f.MapValue().Enum(); ed != nil {
+					reachable[string(ed.Name())] = true
+				}
+			}
+		}
+	}
+	if len(reachable) == 0 {
+		t.Fatal("no enum is reachable from any MAC input; BlobGrantRequest.direction is a " +
+			"Direction, so the closure walk is wrong")
+	}
+	for name := range reachable {
+		if _, ok := specBEnums[name]; !ok {
+			t.Errorf("enum %s is reachable from a req_auth-carrying request body, so its value "+
+				"numbers are hashed into canonical_request_bytes, but it is not transcribed in "+
+				"specBEnums", name)
+		}
 	}
 }

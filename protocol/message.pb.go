@@ -70,6 +70,25 @@ func (Direction) EnumDescriptor() ([]byte, []int) {
 	return file_message_proto_rawDescGZIP(), []int{0}
 }
 
+// RECORDED HAZARD, NOT A DEVIATION — REASON_OK = 0, and 0 is what an unset field
+// decodes as.
+//
+// `reason` is a plain proto3 field on MessageServerResponse (2), SubmitResult (1)
+// and SubscriptionAck (3), so it has implicit presence: a reason that was never
+// populated — a partially-built SubmitResult inside a batch, a field lost to a
+// truncated or hand-rolled encoder — decodes as REASON_OK, which is to say as
+// success. Failing toward success is a poor default anywhere; it is a worse one on
+// a surface whose whole design is built around refusals being uninformative but
+// unambiguous (§4.5's deliberately non-specific REASON_REJECTED, §5.1's padded
+// latency on the reject path). `Direction`, twenty lines up, gets the sentinel
+// right: 0 is DIRECTION_UNSPECIFIED and means nothing.
+//
+// It is transcribed here exactly as §4.5 declares it, because it IS §4.5 — a
+// spec-level default, not an implementation slip. Renumbering it unilaterally
+// would move all eighteen values against a normative table that Spec C and the
+// §11.1 cross-implementation vectors also read. Raised as a spec divergence for a
+// Spec B ruling; message_wire_test.go pins the current numbering meanwhile, so the
+// ruling has to be recorded rather than slipped in.
 type Reason int32
 
 const (
