@@ -3441,8 +3441,8 @@ func assertNoProviderArrivesUncallable(t *testing.T, function declaredFunction) 
 			!strings.Contains(types.TypeString(at.Underlying(), nil), spelled) {
 			continue
 		}
-		t.Fatalf("%s takes a %s at position %d, which carries a %s to a position this gate cannot fill",
-			function.name, at, i, providerInterfaceName)
+		t.Fatalf("%s takes %s at position %d, which the compiler reads as %s and which carries a %s to a position this gate cannot fill",
+			function.name, function.parameters[i].typeName, i, at, providerInterfaceName)
 	}
 }
 
@@ -3725,7 +3725,7 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 
 // One call, with a panic caught rather than taken. A method that still refuses to be
 // called is exactly what this gate is looking for, and a test binary that died on the
-// first one would report nothing about the twenty operations after it.
+// first one would report nothing about the operations after it.
 func providerStubCall(call reflect.Value, arguments []reflect.Value) (results []reflect.Value, recovered any) {
 	defer func() { recovered = recover() }()
 	return call.Call(arguments), nil
@@ -3860,8 +3860,11 @@ func assertCoversEveryProviderOperation(t *testing.T, gate string, probed []stri
 // identical, and the two answers must differ. A stub cannot pass that, because a stub is by
 // construction a function of fewer of its inputs than it declares.
 //
-// What that misses, stated rather than left for a reader to discover: an operation that is
-// a function of all of its inputs and computes the wrong one. Every input is observed, the
+// What that misses, stated rather than left for a reader to discover. Three positions of
+// each argument are probed rather than all of them, so an operation reading exactly those
+// three and nothing else passes -- narrower than the one position the first version of this
+// gate probed, and not nothing. And an operation that is a function of all of its inputs
+// and computes the wrong one. Every input is observed, the
 // answers all differ, and this gate is silent. That class is the published vectors' --
 // RFC 4231 for the mac, RFC 5869 for the kdf, FIPS 180-4 for the hash, the vendored RFC
 // 9180 corpus for the aead and the whole hpke path, and the labelled constructions against
@@ -4049,6 +4052,12 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 // The third is every parameter rather than any one of them. Asking only that some parameter
 // be read is a rule a two parameter placeholder satisfies by touching one of them, and it
 // is weaker than the behavioural half of this task states for the same declarations.
+//
+// What the third misses, stated rather than left to be found: a body that names a parameter
+// and discards the value, which is a source shape no reading of the parse tree separates
+// from a body that uses it. Measured: hpkeSuiteId reduced to "_ = params; return
+// make([]byte, 10)" passes every shape here, and is caught by fourteen published vector
+// tests. That is where the class sits for the declarations no behavioural gate reaches.
 //
 // Bodies of function literals are skipped, so a return or a panic written inside a closure
 // is read as the closure's and not as the declaration's.
