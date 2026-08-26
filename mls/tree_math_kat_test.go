@@ -35,7 +35,14 @@ const vectorDir = "testdata/vectors"
 // It fails the test rather than returning an error because every failure it can
 // report — the corpus is absent, the corpus is not a JSON array — is a broken
 // checkout rather than a condition any caller could handle.
-func LoadVectorFile(t *testing.T, file string) []json.RawMessage {
+//
+// The parameter is testing.TB and not *testing.T so that a seed corpus can be
+// built from the vendored bytes: f.Add lives in FuzzXxx(f *testing.F), which
+// holds no *testing.T, and a fuzz target that typed its seed leaf counts out by
+// hand instead would be a second copy of the ladder this corpus already
+// publishes. Every *testing.T caller is unaffected, since *testing.T is a
+// testing.TB.
+func LoadVectorFile(t testing.TB, file string) []json.RawMessage {
 	t.Helper()
 	body, err := os.ReadFile(filepath.Join(filepath.FromSlash(vectorDir), file))
 	if err != nil {
@@ -90,7 +97,7 @@ var treeMathVectorFields = []string{"n_leaves", "n_nodes", "root", "left", "righ
 // prescribes for the tasks that follow names one test with -run, so none of
 // them runs the tripwire: with the guard only there, emptying the corpus
 // leaves those vector tests passing over zero entries and asserting nothing.
-func loadTreeMathVectors(t *testing.T) []treeMathVector {
+func loadTreeMathVectors(t testing.TB) []treeMathVector {
 	t.Helper()
 	rawEntries := LoadVectorFile(t, treeMathVectorFile)
 	vectors := make([]treeMathVector, 0, len(rawEntries))
