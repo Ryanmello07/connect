@@ -537,6 +537,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// raise it, and this line is where that decision would have to be written down.
 		"extension.go: syntax.ReadVector(r, readOneExtension)",
 		"extension.go: syntax.WriteVector(w, exts, writeOneExtension)",
+		// the joiner derivation's group context preimage. The default limit and not the
+		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
+		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
+		// over a context that had been allowed past that is a secret no peer running the
+		// default limit could have derived.
+		"key_schedule.go: syntax.Marshal(groupContext)",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
@@ -1183,9 +1189,18 @@ func TestProposalRefLabelMatchesThePublishedCommits(t *testing.T) {
 }
 
 // A construction that takes a provider and is not held to using it, named with the reason.
-// Nothing is excusable today; the map exists so that a construction which cannot be held
-// is a line somebody writes on purpose rather than one left out of the table below.
-var labelConstructionsOverAnyProvider = map[string]string{}
+// The map exists so that a construction which cannot be held is a line somebody writes on
+// purpose rather than one left out of the table below.
+var labelConstructionsOverAnyProvider = map[string]string{
+	// ZeroSecret reaches the provider for a length and for nothing else. The tagging
+	// provider passes HashSize through — it has no bytes to flip in an int — so the
+	// answer over it is the answer over the real one, and a row here would report "did
+	// not route through its provider" for every possible implementation. It is not
+	// unheld: TestProviderHasNoRemainingStubs holds it to Nh zero bytes read out of the
+	// registry, TestNoStubShapesRemainInSource requires its body to read the parameter,
+	// and key_schedule_test.go sweeps every registered suite.
+	"ZeroSecret": "answers a length from the provider and no bytes, so the tagging provider cannot separate it from a constant",
+}
 
 // A construction handed a provider computes with that provider and not with one of its
 // own.
@@ -1253,6 +1268,20 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("DecryptWithLabel: %v", decryptErr)
 			}
 			return plaintext
+		}},
+		// the key schedule's first derivation. It reaches the provider twice, for the
+		// extract and for the labelled expand, and neither is visible in the answer: a
+		// joiner secret computed with a provider of its own is a well formed 32 bytes
+		// that agrees with every corpus in this package, because the corpora are all the
+		// suite it would have hardcoded.
+		{name: "DeriveJoinerSecret", call: func(crypto CryptoProvider) []byte {
+			joiner, joinerErr := DeriveJoinerSecret(crypto,
+				bytes.Repeat([]byte{0x71}, 32), bytes.Repeat([]byte{0x72}, 32),
+				ksVectorEpoch0GroupContext(t))
+			if joinerErr != nil {
+				t.Fatalf("DeriveJoinerSecret: %v", joinerErr)
+			}
+			return joiner
 		}},
 	} {
 		covered = append(covered, testCase.name)

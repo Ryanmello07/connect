@@ -24,11 +24,19 @@
 package mls
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -376,3 +384,498 @@ func TestOnlyTheGroupContextErrorAnswersToTheSyntaxSentinel(t *testing.T) {
 // It is not forgotten: all five are in crossPlanSymbolsNotYetLanded in
 // key_schedule_deps_test.go, so the moment the validation plan lands them that gate fails
 // and names them. Whoever answers it writes their pins and this test in the same commit.
+
+// ---------------------------------------------------------------------------
+// task 5: ZeroSecret and DeriveJoinerSecret
+// ---------------------------------------------------------------------------
+
+// TestZeroSecretIsKdfNhZeroBytesForEverySuite asserts the three things a test can honestly
+// observe about the all-zero secret: it is KDF.Nh bytes long, every one of them is zero,
+// and two calls do not share storage.
+//
+// The suites are read out of the registry rather than listed, so a third registered suite
+// with a different Nh is judged here instead of being quietly skipped.
+//
+// What is deliberately NOT claimed, for the reason key_schedule.go's comment gives: that
+// this is the RIGHT zero. One run of Nh zero bytes is indistinguishable from another, so
+// nothing about the returned value says it is the substitute RFC 9420 makes for a missing
+// commit secret or a missing psk. The published corpora that expand over it say that, and
+// they belong to the tasks that consume this function. A test here asserting more would be
+// reassuring rather than checking, which is the shape task 2 wrote down instead of faking.
+func TestZeroSecretIsKdfNhZeroBytesForEverySuite(t *testing.T) {
+	suites := Suites()
+	if len(suites) == 0 {
+		t.Fatal("the registry named no suite, so this test examined nothing")
+	}
+	for _, suite := range suites {
+		crypto := mustProvider(t, suite)
+		if crypto.HashSize() == 0 {
+			t.Fatalf("suite %#04x reports a hash size of 0, so an empty slice would satisfy every assertion below",
+				uint16(suite))
+		}
+		zero := ZeroSecret(crypto)
+		if len(zero) != crypto.HashSize() {
+			t.Errorf("suite %#04x: ZeroSecret is %d bytes, want KDF.Nh = %d",
+				uint16(suite), len(zero), crypto.HashSize())
+			continue
+		}
+		for i, b := range zero {
+			if b != 0 {
+				t.Errorf("suite %#04x: byte %d of ZeroSecret is %d, want 0", uint16(suite), i, b)
+				break
+			}
+		}
+		// the key schedule erases what it has finished with, so a shared constant would
+		// come back cleared on every later call with nothing to say why.
+		zero[0] = 0xff
+		again := ZeroSecret(crypto)
+		if again[0] != 0 {
+			t.Errorf("suite %#04x: ZeroSecret hands out storage a previous caller can write through",
+				uint16(suite))
+		}
+		if &again[0] == &zero[0] {
+			t.Errorf("suite %#04x: two calls to ZeroSecret returned the same backing array", uint16(suite))
+		}
+	}
+}
+
+// keyScheduleKatFile is the mlswg family the published joiner secrets live in, and
+// keyScheduleKatJoinerComparisons is how many of them this package's registered suites
+// account for: two suites, five epochs each.
+//
+// The count is asserted rather than assumed. A filter that stopped matching — a suite
+// renumbered, a json field renamed so every string decodes empty — turns a known answer
+// test into a loop that runs zero times and reports PASS, which is the one outcome a known
+// answer test must not be able to reach.
+const (
+	keyScheduleKatFile              = "key-schedule.json"
+	keyScheduleKatJoinerComparisons = 10
+)
+
+// keyScheduleKatVectors returns the published key schedule entries, having first checked
+// that the file on disk is the blob mlswg published at the commit interop/PINS.md pins.
+//
+// Which file and which entries, written down rather than left to be reconstructed: this is
+// testdata/vectors/key-schedule.json from mlswg/mls-implementations test-vectors at the
+// commit mlswgVectorUpstreamCommit names, and what is read from it are the entries whose
+// cipher_suite this package registers, all five epochs of each, fields initial_init_secret,
+// commit_secret, group_context, joiner_secret and init_secret.
+//
+// The provenance is verified here rather than left to the upstream anchor test. That test
+// failing does not stop this one running, and a known answer test that compares against a
+// file it did not authenticate is a known answer test that an edit to the file can make
+// agree with anything. VECTORS.sha256 would not close it either: it is a digest of the
+// local bytes, so re-recording one line of it makes a rewritten corpus verify. The digest
+// used here is the one read out of upstream's git object store.
+func keyScheduleKatVectors(t *testing.T) []labelKatSchedule {
+	t.Helper()
+	want, anchored := mlswgVectorUpstreamSha256[keyScheduleKatFile]
+	if !anchored {
+		t.Fatalf("%s carries no upstream digest, so the answers below would be compared against an unauthenticated file",
+			keyScheduleKatFile)
+	}
+	raw, err := os.ReadFile(filepath.Join(mlswgVectorDirectory, keyScheduleKatFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", keyScheduleKatFile, err)
+	}
+	digest := sha256.Sum256(normalisedLineEndings(raw))
+	if got := hex.EncodeToString(digest[:]); got != want {
+		t.Fatalf("%s hashes to %s with its line endings normalised; %s/%s at %s published %s. These are not the answers mlswg published, so nothing below is a known answer test",
+			keyScheduleKatFile, got, mlswgVectorUpstreamRepository, mlswgVectorUpstreamDirectory,
+			mlswgVectorUpstreamCommit, want)
+	}
+	vectors := []labelKatSchedule{}
+	loadLabelKat(t, keyScheduleKatFile, &vectors)
+	if len(vectors) == 0 {
+		t.Fatalf("%s parsed to no entries", keyScheduleKatFile)
+	}
+	return vectors
+}
+
+// TestDeriveJoinerSecretMatchesTheMlswgKeySchedule is the known answer test guardrail 1
+// exists for, and it is the deliverable of this task.
+//
+// joiner_secret is Extract(init_secret_[n-1], commit_secret) expanded under "joiner". Both
+// Extract arguments are KDF.Nh secrets, so transposing them compiles, returns 32 bytes, and
+// produces a value that is deterministic, that differs for differing inputs, that round
+// trips and that satisfies every self consistency check this package could write. Nothing
+// separates the two except a value neither side of the swap invented.
+//
+// Three things stop the comparison passing vacuously. The corpus is authenticated against
+// upstream before it is read. The number of comparisons is counted and asserted, and the
+// suites the loop matched are compared against the registry. And each epoch's two Extract
+// inputs are required to differ, because an epoch whose init secret happened to equal its
+// commit secret would agree with a swapped implementation and pin nothing.
+//
+// The group context goes in as the decoded structure, which is what DeriveJoinerSecret's
+// signature takes, so this walks the section 8.1 codec as well. The re-encoding is asserted
+// against the published bytes first: a codec that disagreed would otherwise be reported
+// here as a key schedule failure, which is the wrong sentence about the wrong file.
+func TestDeriveJoinerSecretMatchesTheMlswgKeySchedule(t *testing.T) {
+	compared := 0
+	matched := []CipherSuite{}
+	for _, vector := range keyScheduleKatVectors(t) {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		matched = append(matched, suite)
+		crypto := mustProvider(t, suite)
+		previousInit := mustDecodeHex(t, "initial_init_secret", vector.InitialInitSecret)
+		for index, epoch := range vector.Epochs {
+			at := fmt.Sprintf(" suite %#04x epoch %d", uint16(suite), index)
+			commitSecret := mustDecodeHex(t, "commit_secret"+at, epoch.CommitSecret)
+			if bytes.Equal(previousInit, commitSecret) {
+				t.Errorf("%s: the init secret and the commit secret are the same bytes, so this epoch agrees with a swapped Extract and pins nothing about the argument order",
+					at)
+			}
+			publishedContext := mustDecodeHex(t, "group_context"+at, epoch.GroupContext)
+			groupContext := &GroupContext{}
+			if err := syntax.Unmarshal(publishedContext, groupContext); err != nil {
+				t.Fatalf("%s: decode the published group context: %v", at, err)
+			}
+			reEncoded, err := syntax.Marshal(groupContext)
+			if err != nil {
+				t.Fatalf("%s: re-encode the decoded group context: %v", at, err)
+			}
+			if !bytes.Equal(reEncoded, publishedContext) {
+				t.Fatalf("%s: the group context codec re-encodes to %x and the corpus published %x, so a joiner mismatch below would be the codec and not the key schedule",
+					at, reEncoded, publishedContext)
+			}
+			joiner, err := DeriveJoinerSecret(crypto, previousInit, commitSecret, groupContext)
+			if err != nil {
+				t.Fatalf("%s: DeriveJoinerSecret: %v", at, err)
+			}
+			assertLabelKat(t, "joiner_secret"+at, joiner, epoch.JoinerSecret)
+			compared++
+			previousInit = mustDecodeHex(t, "init_secret"+at, epoch.InitSecret)
+		}
+	}
+	if compared != keyScheduleKatJoinerComparisons {
+		t.Fatalf("compared %d published joiner secrets, want %d; the loop matched %v",
+			compared, keyScheduleKatJoinerComparisons, matched)
+	}
+	if got := slices.Sorted(slices.Values(matched)); !slices.Equal(got, Suites()) {
+		t.Fatalf("the corpus answered for %v and this package registers %v", got, Suites())
+	}
+}
+
+// independentJoinerSecret is RFC 9420's joiner derivation written out from the two RFCs it
+// is made of, using crypto/hmac and nothing this package computes.
+//
+// It is here because the corpus and the implementation could in principle agree for a
+// reason other than being right: a vendored file is bytes on disk, and the whole argument
+// that they are mlswg's bytes is a digest comparison against a commit this repository only
+// records the name of. This is a second statement of the same answer that a reader can
+// check line by line without fetching anything:
+//
+//	RFC 5869 section 2.2      HKDF-Extract(salt, IKM) = HMAC-Hash(key = salt, data = IKM)
+//	RFC 9420 section 8        the salt is init_secret_[n-1]; the IKM is commit_secret
+//	RFC 9420 section 8        joiner = ExpandWithLabel(prk, "joiner", GroupContext, KDF.Nh)
+//	RFC 9420 section 5.1      ExpandWithLabel expands under the serialization of
+//	                          struct { uint16 length; opaque label<V>; opaque context<V> },
+//	                          the label carrying the "MLS 1.0 " prefix
+//	RFC 9420 section 2.1.2    opaque<V> takes a variable length integer prefix: one octet
+//	                          with prefix bits 0b00 below 64, two with 0b01 up to 16383
+//	RFC 5869 section 2.3      HKDF-Expand's first block is HMAC(prk, info || 0x01), and 32
+//	                          octets is exactly that first block under sha256
+//
+// so for the 14 octet label "MLS 1.0 joiner" and a 112 octet group context the info is
+//
+//	00 20      the requested output length, 32, big endian uint16
+//	0e         label<V> byte length 14; 14 < 64 so one octet, prefix bits 0b00
+//	4d 4c ..   the 14 label octets, "MLS 1.0 joiner"
+//	40 70      context<V> byte length 112; 112 > 63 so two octets: 0x40|(112>>8), 112&0xff
+//	00 01 ..   the 112 group context octets
+//
+// Every part of that is a hazard with no other witness in this package. A single octet
+// length on a 112 byte context, a label without the "MLS 1.0 " prefix, a length field
+// holding the label's size instead of the output's, or the two opaque fields transposed all
+// produce a perfectly well formed 32 byte secret.
+func independentJoinerSecret(t *testing.T, initSecretPrev []byte, commitSecret []byte, groupContext []byte) []byte {
+	t.Helper()
+	// HKDF-Extract: the salt is the hmac key and the input keying material is the message
+	extract := hmac.New(sha256.New, initSecretPrev)
+	extract.Write(commitSecret)
+	prk := extract.Sum(nil)
+
+	label := []byte("MLS 1.0 joiner")
+	if len(label) >= 64 {
+		t.Fatalf("the label is %d octets, so the one octet varint written below is the wrong encoding", len(label))
+	}
+	if len(groupContext) < 64 || len(groupContext) > 16383 {
+		t.Fatalf("the group context is %d octets, so the two octet varint written below is the wrong encoding",
+			len(groupContext))
+	}
+	info := []byte{}
+	info = append(info, byte(sha256.Size>>8), byte(sha256.Size))
+	info = append(info, byte(len(label)))
+	info = append(info, label...)
+	info = append(info, 0x40|byte(len(groupContext)>>8), byte(len(groupContext)))
+	info = append(info, groupContext...)
+
+	// HKDF-Expand, first and only block: 32 octets is one sha256 output
+	expand := hmac.New(sha256.New, prk)
+	expand.Write(info)
+	expand.Write([]byte{0x01})
+	return expand.Sum(nil)
+}
+
+// TestDeriveJoinerSecretMatchesAnIndependentDerivation runs that derivation against every
+// published epoch and requires all three — this package, the corpus, and the hand written
+// HKDF — to agree.
+//
+// The swapped call is checked first on the hand written side. A derivation that gave the
+// same answer with its two Extract arguments transposed could not see the defect this whole
+// task exists for, and would agree with a swapped implementation while looking like a
+// second opinion.
+func TestDeriveJoinerSecretMatchesAnIndependentDerivation(t *testing.T) {
+	compared := 0
+	for _, vector := range keyScheduleKatVectors(t) {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		previousInit := mustDecodeHex(t, "initial_init_secret", vector.InitialInitSecret)
+		for index, epoch := range vector.Epochs {
+			at := fmt.Sprintf(" suite %#04x epoch %d", uint16(suite), index)
+			commitSecret := mustDecodeHex(t, "commit_secret"+at, epoch.CommitSecret)
+			publishedContext := mustDecodeHex(t, "group_context"+at, epoch.GroupContext)
+			groupContext := &GroupContext{}
+			if err := syntax.Unmarshal(publishedContext, groupContext); err != nil {
+				t.Fatalf("%s: decode the published group context: %v", at, err)
+			}
+			want := independentJoinerSecret(t, previousInit, commitSecret, publishedContext)
+			if swapped := independentJoinerSecret(t, commitSecret, previousInit, publishedContext); bytes.Equal(swapped, want) {
+				t.Fatalf("%s: the hand written derivation gives one answer for both argument orders, so it cannot see a transposition",
+					at)
+			}
+			got, err := DeriveJoinerSecret(crypto, previousInit, commitSecret, groupContext)
+			if err != nil {
+				t.Fatalf("%s: DeriveJoinerSecret: %v", at, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s: DeriveJoinerSecret = %x and the hand written HKDF gives %x", at, got, want)
+			}
+			assertLabelKat(t, "the hand written HKDF against the published joiner_secret"+at, want, epoch.JoinerSecret)
+			compared++
+			previousInit = mustDecodeHex(t, "init_secret"+at, epoch.InitSecret)
+		}
+	}
+	if compared != keyScheduleKatJoinerComparisons {
+		t.Fatalf("compared %d epochs, want %d", compared, keyScheduleKatJoinerComparisons)
+	}
+}
+
+// TestDeriveJoinerSecretRefusesSecretsThatAreNotKdfNh sweeps lengths on both arguments
+// rather than testing one short case.
+//
+// HKDF-Extract accepts every length of either argument, so a truncated init secret produces
+// a perfectly well formed pseudorandom key and an epoch nobody else derives; the mistake
+// then surfaces epochs later as an undecryptable message. The nil result is asserted
+// alongside the error, since a caller reading the slice rather than the error would
+// otherwise take a full length secret out of a refused call.
+//
+// The accepting control runs first, so the refusals below are attributable to the lengths
+// rather than to something else about the call.
+func TestDeriveJoinerSecretRefusesSecretsThatAreNotKdfNh(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		good := bytes.Repeat([]byte{0xa5}, nh)
+		other := bytes.Repeat([]byte{0x5a}, nh)
+		groupContext := ksVectorEpoch0GroupContext(t)
+		if _, err := DeriveJoinerSecret(crypto, good, other, groupContext); err != nil {
+			t.Fatalf("suite %#04x: two KDF.Nh secrets were refused: %v", uint16(suite), err)
+		}
+		for _, length := range []int{0, 1, nh - 1, nh + 1, 2 * nh} {
+			wrong := bytes.Repeat([]byte{0xa5}, length)
+			for _, testCase := range []struct {
+				name   string
+				init   []byte
+				commit []byte
+			}{
+				{name: "init secret", init: wrong, commit: other},
+				{name: "commit secret", init: good, commit: wrong},
+			} {
+				secret, err := DeriveJoinerSecret(crypto, testCase.init, testCase.commit, groupContext)
+				if !errors.Is(err, ErrSecretLength) {
+					t.Errorf("suite %#04x: a %d byte %s gave err = %v, want ErrSecretLength",
+						uint16(suite), length, testCase.name, err)
+				}
+				if secret != nil {
+					t.Errorf("suite %#04x: a %d byte %s was refused and %d bytes of secret came back beside the error",
+						uint16(suite), length, testCase.name, len(secret))
+				}
+			}
+		}
+		// nil is the zero length case arriving with no storage at all, which a length
+		// check written as a nil check would answer differently
+		for _, testCase := range []struct {
+			name   string
+			init   []byte
+			commit []byte
+		}{
+			{name: "init secret", init: nil, commit: other},
+			{name: "commit secret", init: good, commit: nil},
+		} {
+			if _, err := DeriveJoinerSecret(crypto, testCase.init, testCase.commit, groupContext); !errors.Is(err, ErrSecretLength) {
+				t.Errorf("suite %#04x: a nil %s gave err = %v, want ErrSecretLength",
+					uint16(suite), testCase.name, err)
+			}
+		}
+	}
+}
+
+// mutatedGroupContexts returns one copy of the context per field of GroupContext, each with
+// exactly that field changed, keyed by the field's name.
+//
+// The fields are read off the type rather than listed. This project has been walked past a
+// hand written list of a class fourteen times, and here the consequence is specific: a
+// field added to GroupContext by a later plan and left out of a list is a field nothing
+// requires to be in the preimage, which is two members deriving different secrets from
+// contexts they both consider equal.
+//
+// An unhandled kind is fatal rather than skipped, because a skipped field is a field this
+// gate stops judging in silence.
+func mutatedGroupContexts(t *testing.T, base *GroupContext) map[string]*GroupContext {
+	t.Helper()
+	contextType := reflect.TypeOf(GroupContext{})
+	if contextType.NumField() == 0 {
+		t.Fatal("GroupContext declares no field, so this gate would compare nothing")
+	}
+	extensionType := reflect.TypeOf(Extension{})
+	mutated := map[string]*GroupContext{}
+	for i := range contextType.NumField() {
+		name := contextType.Field(i).Name
+		clone := base.Clone()
+		target := reflect.ValueOf(clone).Elem().Field(i)
+		switch {
+		case target.CanUint():
+			target.SetUint(target.Uint() + 1)
+		case target.Kind() == reflect.Slice && target.Type().Elem().Kind() == reflect.Uint8:
+			target.Set(reflect.AppendSlice(target, reflect.ValueOf([]byte{0x7f})))
+		case target.Kind() == reflect.Slice && target.Type().Elem() == extensionType:
+			target.Set(reflect.Append(target, reflect.ValueOf(Extension{
+				ExtensionType: ExtensionType(0xf00d),
+				ExtensionData: []byte{0x01},
+			})))
+		default:
+			t.Fatalf("GroupContext.%s is a %s and this gate does not know how to change one; teach it rather than letting the field go unjudged",
+				name, target.Type())
+		}
+		mutated[name] = clone
+	}
+	return mutated
+}
+
+// TestDeriveJoinerSecretReadsEveryFieldOfTheGroupContext walks what the published corpus
+// cannot.
+//
+// Every mlswg key schedule vector carries one protocol version, one cipher suite, one group
+// id per entry and an empty extensions vector, so four of GroupContext's seven fields never
+// move anywhere in the whole corpus. An implementation that dropped the version, the cipher
+// suite, the group id or the extensions out of the preimage matches every published joiner
+// secret there is, and splits from any peer whose group differs from the vector's in one of
+// them.
+//
+// The two secrets and the argument order are checked here too. The transposition assertion
+// is necessary and not sufficient — it says the two arguments are not interchangeable, and
+// says nothing about which way round is right. The known answer tests above are what say
+// that; this one is what fails first and most legibly when they cannot run.
+func TestDeriveJoinerSecretReadsEveryFieldOfTheGroupContext(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	base := ksVectorEpoch0GroupContext(t)
+	initSecret := bytes.Repeat([]byte{0xa5}, crypto.HashSize())
+	commitSecret := bytes.Repeat([]byte{0x5a}, crypto.HashSize())
+	want, err := DeriveJoinerSecret(crypto, initSecret, commitSecret, base)
+	if err != nil {
+		t.Fatalf("DeriveJoinerSecret over the base context: %v", err)
+	}
+
+	cases := mutatedGroupContexts(t, base)
+	if fields := reflect.TypeOf(GroupContext{}).NumField(); len(cases) != fields {
+		t.Fatalf("GroupContext declares %d fields and this gate built %d cases", fields, len(cases))
+	}
+	for _, name := range slices.Sorted(maps.Keys(cases)) {
+		got, err := DeriveJoinerSecret(crypto, initSecret, commitSecret, cases[name])
+		if err != nil {
+			t.Errorf("GroupContext.%s changed: DeriveJoinerSecret: %v", name, err)
+			continue
+		}
+		if bytes.Equal(got, want) {
+			t.Errorf("changing GroupContext.%s left the joiner secret unchanged, so that field is not in the preimage the epoch is bound to",
+				name)
+		}
+	}
+
+	changedInit := bytes.Clone(initSecret)
+	changedInit[0] ^= 0x01
+	changedCommit := bytes.Clone(commitSecret)
+	changedCommit[len(changedCommit)-1] ^= 0x01
+	for _, testCase := range []struct {
+		what   string
+		init   []byte
+		commit []byte
+	}{
+		{what: "the init secret", init: changedInit, commit: commitSecret},
+		{what: "the commit secret", init: initSecret, commit: changedCommit},
+		{what: "the two Extract arguments transposed", init: commitSecret, commit: initSecret},
+	} {
+		got, err := DeriveJoinerSecret(crypto, testCase.init, testCase.commit, base)
+		if err != nil {
+			t.Errorf("%s: DeriveJoinerSecret: %v", testCase.what, err)
+			continue
+		}
+		if bytes.Equal(got, want) {
+			t.Errorf("%s left the joiner secret unchanged", testCase.what)
+		}
+	}
+}
+
+// TestDeriveJoinerSecretLeavesTheCallersInputsAlone. The function erases the pseudorandom
+// key it built, which is right, and the three things it was handed belong to the caller,
+// which means it must not.
+//
+// init_secret_[n-1] in particular is still needed if the commit that produced this joiner
+// secret turns out to be invalid: a caller whose init secret came back as KDF.Nh zero bytes
+// would derive the next epoch from them, and every derivation downstream would look fine.
+// The aliasing half is the same hazard arriving later — a joiner secret that is a window
+// onto one of its inputs is one caller's zeroize away from erasing a secret it does not own.
+func TestDeriveJoinerSecretLeavesTheCallersInputsAlone(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	initSecret := bytes.Repeat([]byte{0xa5}, crypto.HashSize())
+	commitSecret := bytes.Repeat([]byte{0x5a}, crypto.HashSize())
+	initBefore := bytes.Clone(initSecret)
+	commitBefore := bytes.Clone(commitSecret)
+	groupContext := ksVectorEpoch0GroupContext(t)
+	contextBefore := groupContext.Clone()
+
+	joiner, err := DeriveJoinerSecret(crypto, initSecret, commitSecret, groupContext)
+	if err != nil {
+		t.Fatalf("DeriveJoinerSecret: %v", err)
+	}
+	if !bytes.Equal(initSecret, initBefore) {
+		t.Errorf("the caller's init secret is %x after the call and was %x", initSecret, initBefore)
+	}
+	if !bytes.Equal(commitSecret, commitBefore) {
+		t.Errorf("the caller's commit secret is %x after the call and was %x", commitSecret, commitBefore)
+	}
+	if !reflect.DeepEqual(groupContext, contextBefore) {
+		t.Errorf("the group context handed in came back as %+v, having been %+v", groupContext, contextBefore)
+	}
+	if len(joiner) != crypto.HashSize() {
+		t.Fatalf("the joiner secret is %d bytes, want %d", len(joiner), crypto.HashSize())
+	}
+	// snapshotted after the call rather than compared against initBefore, so this
+	// reports aliasing and not an erase the two checks above have already named
+	initAfter := bytes.Clone(initSecret)
+	commitAfter := bytes.Clone(commitSecret)
+	for i := range joiner {
+		joiner[i] ^= 0xff
+	}
+	if !bytes.Equal(initSecret, initAfter) || !bytes.Equal(commitSecret, commitAfter) {
+		t.Errorf("writing through the joiner secret changed one of the secrets it was derived from, so it is a window onto storage the caller owns")
+	}
+}

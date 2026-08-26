@@ -2852,6 +2852,11 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		t.Fatalf("seal the ciphertext the open rows read: %v", err)
 	}
 	key := bytes.Repeat([]byte{0x44}, params.Nk)
+	// the key schedule row's two secrets, at exactly KDF.Nh because DeriveJoinerSecret
+	// refuses anything else, and different from each other so the row is not satisfied by
+	// an implementation that reads one of them twice
+	initSecretPrev := bytes.Repeat([]byte{0x71}, params.Nh)
+	commitSecret := bytes.Repeat([]byte{0x72}, params.Nh)
 	// a second provider over a constant reader, for the one construction here that
 	// encapsulates. EncryptWithLabel draws its ephemeral key through the provider it is
 	// handed, so over a fixed stream it answers the same twice and the determinism half of
@@ -3009,6 +3014,19 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		// argument would defeat the only thing it is for, and no encoding would change.
 		{name: "cloneBytes", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{cloneBytes(take(plaintext))}
+		}},
+		// the key schedule's first derivation. Both secrets are the caller's and both are
+		// read again after the call — the previous epoch's init secret is still needed if
+		// the commit turns out to be invalid — and the function erases a pseudorandom key
+		// of its own in between them, so a zeroize aimed one line wrong lands in an array
+		// the caller still owns and every derivation after it comes out of zeroes.
+		{name: "DeriveJoinerSecret", call: func(take func([]byte) []byte) [][]byte {
+			joiner, joinerErr := DeriveJoinerSecret(crypto, take(initSecretPrev), take(commitSecret),
+				ksVectorEpoch0GroupContext(t))
+			if joinerErr != nil {
+				t.Fatalf("DeriveJoinerSecret: %v", joinerErr)
+			}
+			return [][]byte{joiner}
 		}},
 	} {
 		covered = append(covered, testCase.name)
@@ -3384,11 +3402,13 @@ func providerInterfaceMethods(t *testing.T) []providerOperation {
 // left out -- and it is not trusted to be what it says either: assertIsTheFunctionNamed
 // holds every value to the function its key names.
 var providerConstructionValues = map[string]any{
-	"RefHash":           RefHash,
-	"MakeKeyPackageRef": MakeKeyPackageRef,
-	"MakeProposalRef":   MakeProposalRef,
-	"EncryptWithLabel":  EncryptWithLabel,
-	"DecryptWithLabel":  DecryptWithLabel,
+	"RefHash":            RefHash,
+	"MakeKeyPackageRef":  MakeKeyPackageRef,
+	"MakeProposalRef":    MakeProposalRef,
+	"EncryptWithLabel":   EncryptWithLabel,
+	"DecryptWithLabel":   DecryptWithLabel,
+	"ZeroSecret":         ZeroSecret,
+	"DeriveJoinerSecret": DeriveJoinerSecret,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3573,6 +3593,25 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		"value":                ascendingBytes(0xd0, 44),
 		"keyPackage":           ascendingBytes(0xe0, 52),
 		"authenticatedContent": ascendingBytes(0xf0, 60),
+		// the key schedule's two secrets, at exactly KDF.Nh because DeriveJoinerSecret
+		// refuses every other length, and distinct so a row that read one of them twice
+		// is not answered by the other
+		"initSecretPrev": ascendingBytes(0x11, params.Nh),
+		"commitSecret":   ascendingBytes(0x22, params.Nh),
+		// the epoch binding the joiner derivation expands over. Every field carries
+		// something, so the perturbation below has a field to move and an encoder that
+		// dropped one is not hidden by that field being empty to begin with.
+		"groupContext": &GroupContext{
+			Version:                 ProtocolVersionMls10,
+			CipherSuite:             params.Suite,
+			GroupId:                 ascendingBytes(0x01, 32),
+			Epoch:                   7,
+			TreeHash:                ascendingBytes(0x02, params.Nh),
+			ConfirmedTranscriptHash: ascendingBytes(0x03, params.Nh),
+			Extensions: []Extension{
+				{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: ascendingBytes(0x04, 8)},
+			},
+		},
 		"label":                "stub gate label",
 		"length":               32,
 		"n":                    32,
@@ -3726,6 +3765,18 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		value := reflect.New(argument.Type()).Elem()
 		value.SetUint(argument.Uint() + 1)
 		return append(moved, providerPerturbation{where: "one higher", value: value})
+	case reflect.Pointer:
+		if argument.Type() != reflect.TypeOf((*GroupContext)(nil)) || argument.IsNil() {
+			break
+		}
+		// the epoch, because it is the field two contexts of one group differ in and
+		// nothing else: an operation that dropped the group context out of its preimage
+		// answers identically here, and one that kept it cannot. The copy is a Clone
+		// rather than a shallow struct copy, so this perturbation cannot write through
+		// into the base argument every other row is built from.
+		perturbed := argument.Interface().(*GroupContext).Clone()
+		perturbed.Epoch++
+		return append(moved, providerPerturbation{where: "epoch one higher", value: reflect.ValueOf(perturbed)})
 	case reflect.Interface:
 		if argument.Type() != reflect.TypeOf((*CryptoProvider)(nil)).Elem() {
 			break
@@ -3838,6 +3889,20 @@ var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
 	"KeySize":   func(params *SuiteParams) any { return params.Nk },
 	"NonceSize": func(params *SuiteParams) any { return params.Nn },
 	"Suite":     func(params *SuiteParams) any { return params.Suite },
+	// not a size method, and the same shape. ZeroSecret has no input this gate can move
+	// — the provider it takes carries a length and nothing else, and the tagging provider
+	// passes a length through unchanged — and its whole contract is a value the registry
+	// fixes: KDF.Nh zero bytes. Written as the rendering providerStubAnswer makes of a
+	// byte slice result, so the comparison below is over the same text.
+	//
+	// This is stricter than the "not the zero value" report it stands in for rather than
+	// weaker: the zero value IS ZeroSecret's correct answer, so that report can only be
+	// noise here, while this one fails a wrong length and a byte that is not zero. What
+	// it cannot see is an Nh hardcoded rather than read from the provider, which is the
+	// same limit the four size methods carry; what closes it for those is the receiver
+	// field read below, and for this one it is TestNoStubShapesRemainInSource, whose
+	// unread parameter shape fails a body that never reaches for the provider at all.
+	"ZeroSecret": func(params *SuiteParams) any { return strings.Repeat("00", params.Nh) },
 }
 
 // Every operation on both surfaces is covered, with nothing skipped and nothing excused.
@@ -3935,7 +4000,13 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 				t.Errorf("%s refused to answer: %v", where, recovered)
 				continue
 			}
-			if zero := providerStubZeroResults(results); len(zero) != 0 {
+			// an operation whose whole contract is a value the registry fixes answers the
+			// zero value on purpose, and ZeroSecret's correct answer is Nh zero bytes. It
+			// is held to providerRegistryAnswers below instead, which is the stricter of
+			// the two: "not the zero value" would pass a wrong length and a wrong
+			// constant, and the registry comparison passes neither.
+			_, answersARegistryValue := providerRegistryAnswers[operation.name]
+			if zero := providerStubZeroResults(results); len(zero) != 0 && !answersARegistryValue {
 				t.Errorf("%s answered %s, which is what a stub answers", where, strings.Join(zero, ", "))
 			}
 			answer := providerStubAnswer(results)
@@ -3975,6 +4046,19 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 				observed++
 			}
 			for i, parameter := range operation.parameters {
+				// an operation whose answer the registry fixes is judged by that value
+				// rather than by moving its arguments, and this is where the two readings
+				// meet. The four size methods satisfy "no argument to move" by taking no
+				// argument; ZeroSecret is the shape that has one and still has nothing to
+				// move, because the provider it takes carries a length and the tagging
+				// provider passes a length through unchanged. Breaking here leaves
+				// observed at zero, which is what routes it to the registry comparison
+				// below -- and that comparison is the stricter of the two, so nothing is
+				// waved through: a name added here whose answer DOES move fails the
+				// unobserved-against-registered check at the end of the suite loop.
+				if answersARegistryValue {
+					break
+				}
 				positions := len(providerPerturbations(t, operation.name, parameter, base[i]))
 				for at := 0; at < positions; at++ {
 					// a provider of its own for every call. Four of these operations
@@ -4020,8 +4104,17 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 				if want := fmt.Sprint(registry(params)); answer != want {
 					t.Errorf("%s answered %s and the registry holds %s", where, answer, want)
 				}
-				if reads := providerReceiverFieldReads(t, operation.name); len(reads) == 0 {
-					t.Errorf("%s reads nothing of the provider it is a method of, so the registry comparison above compared a literal against the registry", where)
+				// the receiver field read is a property of a METHOD of the provider: it
+				// is what says the answer came from the suite this provider was built
+				// for rather than from a literal. A package level construction has no
+				// receiver to read, so the class is taken from the interface rather than
+				// assumed — and for one of those the same fact is held by
+				// TestNoStubShapesRemainInSource, whose unread parameter shape fails a
+				// body that never reaches for the provider it was handed.
+				if slices.Contains(providerMethodNames(), operation.name) {
+					if reads := providerReceiverFieldReads(t, operation.name); len(reads) == 0 {
+						t.Errorf("%s reads nothing of the provider it is a method of, so the registry comparison above compared a literal against the registry", where)
+					}
 				}
 			}
 			// recorded here rather than on entry: an operation is covered by this gate
@@ -4305,9 +4398,10 @@ func Exported(secret []byte) []byte {
 // spelling keeps the excuse alive after the real one has found its caller. Measured in both
 // directions before the key was widened. This is the base name exemption this project keeps
 // rediscovering, transposed from file names onto symbol names.
-var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
-	"./zeroizeSecret": "the key schedule and the secret tree erase every secret through it, from p4 task 5 on; secret_zeroize.go and key_schedule_test.go land together",
-}
+// It is empty, and that is the entry it held expiring exactly as it was written to: p4
+// task 5 landed key_schedule.go, DeriveJoinerSecret erases its pseudorandom key through
+// zeroizeSecret, and the excuse died with the condition it named rather than outliving it.
+var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{}
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
 // the package directory the gate grouped a file under, then the declaration's name. It is
@@ -5346,11 +5440,12 @@ func cryptoSourcePaths(t *testing.T) []string {
 // out of the environment, fails exactly as loudly as a third party crypto library the slice
 // forbids outright.
 //
-// fmt is on the list for connect/message alone, and only ever as fmt.Errorf("%w: ...",
-// sentinel, detail): the sentinel stays the matchable identity and the wrap carries the
-// octet counts a caller needs to see. It is written down rather than argued away because
-// this list is the record of what the two packages may reach, and the record is the point.
-// Nothing in mls itself imports it.
+// fmt is on the list only ever as fmt.Errorf("%w: ...", sentinel, detail): the sentinel
+// stays the matchable identity and the wrap carries the octet counts a caller needs to
+// see. It is written down rather than argued away because this list is the record of what
+// the two packages may reach, and the record is the point. It arrived for connect/message
+// and mls now reaches it too, in errors_key_schedule.go and key_schedule.go, under the
+// same restriction.
 //
 // It is the mechanical half of the claim that the deterministic provider is reachable only
 // by an explicit caller. Nothing here can consult the environment, and the constraint gate
