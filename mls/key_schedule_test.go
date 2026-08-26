@@ -2089,41 +2089,44 @@ func TestNewKeyScheduleFromEpochSecretHasNoJoinerOrWelcomeSecret(t *testing.T) {
 // TestNewKeyScheduleFromEpochSecretCopiesTheSample observes the sentence
 // NewKeyScheduleFromEpochSecret writes: the sample is copied rather than retained.
 //
-// Retaining it would make the epoch's whole key schedule a window onto a buffer the caller
+// Retaining it would make the epoch's parent secret a window onto a buffer the caller
 // still owns, and the caller of this is a NewGroup that just sampled KDF.Nh bytes and is
-// about to erase them — which would erase the parent of the live epoch instead.
+// about to erase them — which would erase the live epoch's parent instead of its own copy.
+//
+// What this reads is the unexported field, because nothing else can see the property. The
+// nine are derived at construction, so they are already their own storage whether the
+// parent was copied or not: a test that erased the sample and compared the nine passes
+// over both implementations, which is what the first version of this test did. Reading
+// the field is not a widening of anything — G6 is about what the type EXPORTS, and
+// TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret is what holds that; a test
+// in the same package is where a white box property like this one belongs.
 func TestNewKeyScheduleFromEpochSecretCopiesTheSample(t *testing.T) {
 	for _, suite := range Suites() {
 		crypto := mustProvider(t, suite)
 		at := fmt.Sprintf("suite %#04x", uint16(suite))
 		sample := crypto.Random(crypto.HashSize())
+		kept := bytes.Clone(sample)
 		schedule, err := NewKeyScheduleFromEpochSecret(crypto, sample, ksVectorEpoch0GroupContext(t))
 		if err != nil {
 			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", at, err)
 		}
-		kept := map[string][]byte{}
-		for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
-			kept[name] = bytes.Clone(secret)
+		// the control: the sample was read at all, so the comparisons below are not
+		// satisfied by a constructor that never looked at its argument
+		if len(schedule.epochSecret) != crypto.HashSize() {
+			t.Fatalf("%s: the epoch holds %d bytes as its parent, want KDF.Nh = %d",
+				at, len(schedule.epochSecret), crypto.HashSize())
 		}
-		// the caller does what a NewGroup does with a sample it has finished handing over
+		if !bytes.Equal(schedule.epochSecret, kept) {
+			t.Fatalf("%s: the epoch's parent is not the sample it was handed", at)
+		}
+		if &schedule.epochSecret[0] == &sample[0] {
+			t.Errorf("%s: the epoch retained the caller's sample rather than copying it", at)
+		}
+		// and the consequence, read the way a caller would produce it: whoever sampled the
+		// secret erases its own copy, and the live epoch is unmoved
 		zeroizeSecret(sample)
-		after := epochSecretsByField(t, schedule.Secrets())
-		for _, name := range slices.Sorted(maps.Keys(kept)) {
-			if !bytes.Equal(after[name], kept[name]) {
-				t.Errorf("%s: erasing the caller's sample changed EpochSecrets.%s, so the epoch is a window onto storage the caller owns",
-					at, name)
-			}
-		}
-		// and the control: the sample was read at all. a schedule built over the erased
-		// buffer must differ, or the comparison above holds for a constructor that never
-		// looked at its argument.
-		second, err := NewKeyScheduleFromEpochSecret(crypto, sample, ksVectorEpoch0GroupContext(t))
-		if err != nil {
-			t.Fatalf("%s: NewKeyScheduleFromEpochSecret over the erased sample: %v", at, err)
-		}
-		if bytes.Equal(second.Secrets().InitSecret, kept["InitSecret"]) {
-			t.Errorf("%s: a schedule over KDF.Nh zero bytes derived the same init_secret as one over the sample, so the sample was never read",
-				at)
+		if !bytes.Equal(schedule.epochSecret, kept) {
+			t.Errorf("%s: erasing the caller's sample cleared the epoch's own parent secret", at)
 		}
 	}
 }

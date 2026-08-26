@@ -3462,13 +3462,13 @@ func providerInterfaceMethods(t *testing.T) []providerOperation {
 // left out -- and it is not trusted to be what it says either: assertIsTheFunctionNamed
 // holds every value to the function its key names.
 var providerConstructionValues = map[string]any{
-	"RefHash":            RefHash,
-	"MakeKeyPackageRef":  MakeKeyPackageRef,
-	"MakeProposalRef":    MakeProposalRef,
-	"EncryptWithLabel":   EncryptWithLabel,
-	"DecryptWithLabel":   DecryptWithLabel,
-	"ZeroSecret":         ZeroSecret,
-	"DeriveJoinerSecret": DeriveJoinerSecret,
+	"RefHash":                       RefHash,
+	"MakeKeyPackageRef":             MakeKeyPackageRef,
+	"MakeProposalRef":               MakeProposalRef,
+	"EncryptWithLabel":              EncryptWithLabel,
+	"DecryptWithLabel":              DecryptWithLabel,
+	"ZeroSecret":                    ZeroSecret,
+	"DeriveJoinerSecret":            DeriveJoinerSecret,
 	"NewKeySchedule":                NewKeySchedule,
 	"NewKeyScheduleFromJoiner":      NewKeyScheduleFromJoiner,
 	"NewKeyScheduleFromEpochSecret": NewKeyScheduleFromEpochSecret,
@@ -3688,10 +3688,10 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 				{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: ascendingBytes(0x04, 8)},
 			},
 		},
-		"label":                "stub gate label",
-		"length":               32,
-		"n":                    32,
-		"generation":           uint32(7),
+		"label":      "stub gate label",
+		"length":     32,
+		"n":          32,
+		"generation": uint32(7),
 	}
 	// the keys and the answers the receiving operations are handed, computed over a
 	// provider of this gate's own so that the operation under test still draws from a

@@ -1324,7 +1324,7 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 			return schedule.Secrets().InitSecret
 		}},
 		{name: "newKeyScheduleFromParts", call: func(crypto CryptoProvider) []byte {
-			return newKeyScheduleFromParts(crypto, []byte("the encoded group context"),
+			return newKeyScheduleFromParts(crypto, bytes.Repeat([]byte{0x7c}, 112),
 				bytes.Repeat([]byte{0x79}, 32), bytes.Repeat([]byte{0x7a}, 32),
 				bytes.Repeat([]byte{0x7b}, 32)).Secrets().InitSecret
 		}},
