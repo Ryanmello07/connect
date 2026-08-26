@@ -33,11 +33,16 @@
 // publishes it, while a sentinel only an unpublished function can reach is not, because
 // publishing it would widen the server's allowlist with a name no server can use.
 //
-// The last two below are of that kind. ErrRecordHeaderNil and ErrServerAttachmentMismatch
-// are AADHead's, AADHead builds the aad_head preimage of master section 8 and is on no
-// line of section 12.1, and the server never decrypts, so it never builds either preimage.
-// If one of them ever becomes reachable from a published function it stops being of that
-// kind, and the amendment that publishes it lands with the change that made it reachable.
+// The last four below are of that kind, in two shapes. ErrRecordHeaderNil and
+// ErrServerAttachmentMismatch are the preimage builders', those builders are on no line of
+// section 12.1, and the server never decrypts, so it never builds an aad at all.
+// ErrServerNonceEmpty and ErrAuthKeyLength are write_auth's, and they are of that kind for
+// a second reason on top of the first: no function returns them. They are the cause the
+// computing half panics with and the reason the verifying half answers false, so a server
+// holding this package's published surface has no error path either one can arrive on, and
+// putting them on the allowlist would name something no server can match. If any of the
+// four ever becomes the return of a published function it stops being of that kind, and the
+// amendment that publishes it lands with the change that made it reachable.
 package message
 
 import "errors"
@@ -103,4 +108,19 @@ var (
 	// of the two would make a record's fate depend on which one this function happened to
 	// pick.
 	ErrServerAttachmentMismatch = errors.New("message: the server attachment argument and the header's own field disagree")
+	// Fires when either authenticator of spec A section 5.7 is asked to compute against an
+	// empty server nonce. That section's own sentence is the rule — this layer takes the
+	// nonce as an opaque byte string and refuses to compute with an empty one — and the
+	// alternative to refusing is a tag over a preimage with no connection in it, which every
+	// record that lost its nonce would carry alike. The computing half panics with this
+	// wrapped and the verifying half answers false on it; writeauth.go's comment argues why
+	// the two halves differ.
+	ErrServerNonceEmpty = errors.New("message: the server nonce is empty, and this layer does not compute with an empty one")
+	// Fires when a mac key is not exactly thirty two octets. HMAC accepts a key of any
+	// length, the empty one included, so without this a server that looked up a missing
+	// write key and passed the nil it got back would compute a mac under the empty key — and
+	// a client that had derived nothing would compute the same one, so two ends holding no
+	// key would authenticate. Master section 8.3 puts both keys on the wire at exactly this
+	// width, so any other length is a bug rather than a shorter key.
+	ErrAuthKeyLength = errors.New("message: a mac key is not the thirty two octets both derivations produce")
 )
