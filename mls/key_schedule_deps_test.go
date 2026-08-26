@@ -220,14 +220,19 @@ var keyScheduleVectorFamilies = []string{
 // checks all sixteen families; this checks the four this plan cannot run without, so a
 // change to that file's list cannot quietly drop one of them.
 //
-// KNOWN DEFECT, stated rather than asserted because asserting it would leave this branch
-// red for a condition this plan may not fix: the sixteen vendored files are CRLF, while
-// the mlswg blobs at the commit interop/PINS.md pins are LF. key-schedule.json is
-// 0e29a307... here and 05aa9a68... upstream. VECTORS.sha256 was computed over the local
-// bytes, so it verifies sixteen for sixteen against bytes upstream never published. Every
-// hex value inside is intact and encoding/json treats CR as whitespace, so no KAT in this
-// plan is wrong because of it — what is lost is the provenance claim, and re-vendoring
-// belongs to the task that vendored them.
+// The manifest half is worth exactly what the manifest is worth, and on its own that is
+// less than it reads: VECTORS.sha256 is computed over the bytes in this checkout, so a
+// file edited together with its manifest line verifies. The claim "a file whose digest
+// disagrees with the manifest is a file that changed after it was pinned" is true; the
+// claim it invites — that a file agreeing with the manifest is the file upstream published
+// — is not, and this plan should not have leaned on it. What makes the second claim true
+// is vectors_upstream_test.go, which holds every vendored family to the digest mlswg
+// published at the commit interop/PINS.md pins. Read the two together.
+//
+// The known smudge, kept here because this plan reads these four files: all sixteen were
+// vendored through a checkout with core.autocrlf on and none is byte-identical to upstream.
+// Normalised, all sixteen match, so no KAT is wrong; re-vendoring at LF belongs to the task
+// that vendored them.
 func TestVectorFilesPresent(t *testing.T) {
 	if len(keyScheduleVectorFamilies) != 4 {
 		t.Fatalf("this plan gates %d vector families, want the 4 of its file structure table",
@@ -340,6 +345,14 @@ var crossPlanSymbolsNotYetLanded = map[string]string{
 // symbols this package certainly declares, one of each kind the collector handles, and a
 // name that certainly does not exist.
 func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
+	// the count is what stops the map shrinking. an entry deleted rather than answered
+	// removes the only thing that will notice its symbol landing, and deleting it is the
+	// cheapest way to quieten this test. answering an entry properly is a pin written
+	// above, the entry deleted, and this number decremented in the same commit.
+	if len(crossPlanSymbolsNotYetLanded) != 34 {
+		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 34; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
+			len(crossPlanSymbolsNotYetLanded))
+	}
 	declared := packageLevelDeclarations(t, ".")
 	t.Logf("%d package level declarations read from this package's source", len(declared))
 
@@ -437,4 +450,268 @@ func receiverTypeName(expr ast.Expr) string {
 		return typed.Name
 	}
 	return ""
+}
+
+// keyScheduleDepsFile is this file, named so the gates below can read it. Two of the ways a
+// pin stops being a pin are covered from here: it can be deleted, and it can never have
+// been written for a symbol this package already consumes.
+const keyScheduleDepsFile = "key_schedule_deps_test.go"
+
+// pinBlockSizes is how many package level blank identifier declarations each test file of
+// this package carries. That form -- var _ T = X -- is what a compile time pin is.
+//
+// A pin that pins the wrong shape catches drift by failing, which is the whole point of
+// this file. A pin that is DELETED catches nothing, and deleting the pin that just failed
+// is the cheapest way to make a drift induced build failure green. Nothing counted them, so
+// three could be removed from the block at the top of this file with the whole package
+// still green -- measured, not supposed. The two lists in this file already make exactly
+// this bargain (keyScheduleVectorFamilies, and in key_schedule_test.go the owned errors);
+// the pin block was the one enumeration left out of it.
+//
+// The class is derived rather than listed: the gate reads the directory and requires every
+// test file that holds pins to appear here and every entry here to be such a file. A fourth
+// pin file therefore cannot land uncounted, and the cost is the intended one -- adding a
+// pin means bumping a number in the same commit.
+var pinBlockSizes = map[string]int{
+	"crypto_test.go":            1,
+	"key_schedule_deps_test.go": 15,
+	"pins_test.go":              8,
+}
+
+// blankPinControl holds two package level pins and one blank assignment inside a function
+// body. A counter that had drifted into counting statements reads three out of it and fails
+// here, rather than reporting every file's pins present and intact.
+var blankPinControl = strings.Join([]string{
+	"package control",
+	"",
+	"var _ int = 1",
+	"",
+	"var (",
+	"\t_ string = \"two\"",
+	"\tnamed    = 3",
+	")",
+	"",
+	"func control() {",
+	"\t_ = named",
+	"}",
+	"",
+}, "\n")
+
+// packageLevelBlankPins counts the blank identifier names a parsed file declares at package
+// level. Const is counted beside var because either spelling holds a pin, and a pin moved
+// from one to the other should not read as a pin deleted.
+func packageLevelBlankPins(file *ast.File) int {
+	pins := 0
+	for _, declaration := range file.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || (generic.Tok != token.VAR && generic.Tok != token.CONST) {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, isValue := spec.(*ast.ValueSpec)
+			if !isValue {
+				continue
+			}
+			for _, name := range value.Names {
+				if name.Name == "_" {
+					pins++
+				}
+			}
+		}
+	}
+	return pins
+}
+
+// TestNoPinBlockShrinksWithoutFailing is the presence guard the pin block never had.
+//
+// Every other assertion in this file is about a pin being WRONG. This one is about a pin
+// being GONE, which is the failure mode that looks like success: the drift lands, the pin
+// fails the build, and the fastest way past a failing build is to delete the line that
+// failed. Nothing then reports that the detector was removed along with the thing it was
+// detecting.
+func TestNoPinBlockShrinksWithoutFailing(t *testing.T) {
+	fileSet := token.NewFileSet()
+	control, err := parser.ParseFile(fileSet, "blank_pin_control.go", blankPinControl,
+		parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	if got := packageLevelBlankPins(control); got != 2 {
+		t.Fatalf("the counter read %d pins out of the control, want 2; it is not counting package level blank declarations", got)
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	counted := map[string]int{}
+	read := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		read++
+		if pins := packageLevelBlankPins(parsed); pins != 0 {
+			counted[name] = pins
+		}
+	}
+	if read == 0 {
+		t.Fatalf("no test file read from the package directory, so this gate counted nothing")
+	}
+	for _, name := range slices.Sorted(maps.Keys(counted)) {
+		want, listed := pinBlockSizes[name]
+		if !listed {
+			t.Errorf("%s declares %d compile time pins and pinBlockSizes does not count them, so they can be deleted one at a time with nothing failing; add the file and its count",
+				name, counted[name])
+			continue
+		}
+		if counted[name] != want {
+			t.Errorf("%s declares %d compile time pins, pinBlockSizes says %d; a pin added is a number to bump here, a pin removed is a detector removed and needs saying out loud",
+				name, counted[name], want)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(pinBlockSizes)) {
+		if _, holds := counted[name]; !holds {
+			t.Errorf("pinBlockSizes counts %d pins in %s and it declares none; either every pin in it was deleted or the file was",
+				pinBlockSizes[name], name)
+		}
+	}
+}
+
+// firstPartyImportPrefix is the module this repository publishes. A symbol reached through
+// an import under it crosses a plan boundary inside this slice, which is the class this
+// file exists to pin. Anything from the standard library or a third party module is pinned
+// by pins_test.go instead.
+const firstPartyImportPrefix = "github.com/urnetwork/connect"
+
+// firstPartyConsumptionControl names one first party symbol in a comment, one through a
+// value and one through a call, and one standard library symbol. A collector that had
+// started reading text rather than the syntax tree reports the comment; one that had lost
+// its import filter reports strings.TrimSpace. Both are shapes this package actually has:
+// errors_key_schedule.go's doc names syntax.Unmarshal in prose without calling it.
+var firstPartyConsumptionControl = strings.Join([]string{
+	"package control",
+	"",
+	"import (",
+	"\t\"strings\"",
+	"",
+	"\t\"github.com/urnetwork/connect/mls/syntax\"",
+	")",
+	"",
+	"// syntax.NamedOnlyInAComment is prose and not a consumer.",
+	"func control(text string) error {",
+	"\tif strings.TrimSpace(text) == \"\" {",
+	"\t\treturn syntax.ErrTruncated",
+	"\t}",
+	"\tw := syntax.NewWriter()",
+	"\t_ = w",
+	"\treturn nil",
+	"}",
+	"",
+}, "\n")
+
+// firstPartyQualifiedNames returns every Package.Symbol a parsed file reaches through a
+// first party import, sorted and deduplicated. It reads the syntax tree, so a name that
+// appears only in a comment is not a consumer of it.
+func firstPartyQualifiedNames(file *ast.File) []string {
+	locals := map[string]bool{}
+	for _, imported := range file.Imports {
+		path := strings.Trim(imported.Path.Value, "\"")
+		if !strings.HasPrefix(path, firstPartyImportPrefix) {
+			continue
+		}
+		local := path[strings.LastIndex(path, "/")+1:]
+		if imported.Name != nil {
+			local = imported.Name.Name
+		}
+		locals[local] = true
+	}
+	if len(locals) == 0 {
+		return nil
+	}
+	found := map[string]bool{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, isSelector := node.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+		qualifier, isIdentifier := selector.X.(*ast.Ident)
+		if !isIdentifier || !locals[qualifier.Name] {
+			return true
+		}
+		found[qualifier.Name+"."+selector.Sel.Name] = true
+		return true
+	})
+	return slices.Sorted(maps.Keys(found))
+}
+
+// TestEveryFirstPartySymbolTheSourceConsumesIsNamedHere derives the consumed set from the
+// consuming code instead of from a transcription of the registry.
+//
+// crossPlanSymbolsNotYetLanded above cannot be derived, and the reason is honest: the code
+// that will call those symbols is written by later tasks, so there is nothing in this tree
+// to read them out of. That argument holds only for what has NOT landed. Everything this
+// package's production source already reaches across a plan boundary is in the tree and can
+// be read, and this is that half: every syntax.X the source names must be named in the pin
+// block, so a call to an unpinned entry point fails on the commit that writes the call
+// rather than on the commit that changes the signature.
+//
+// What it does not close, said plainly rather than left to be discovered: a symbol from
+// another plan landing in package mls itself is not qualified by a package name, so nothing
+// here distinguishes it from this package's own declarations. That hole is what
+// crossPlanSymbolsNotYetLanded covers by hand, and it stays a hand written list until a
+// consumer exists to derive it from.
+func TestEveryFirstPartySymbolTheSourceConsumesIsNamedHere(t *testing.T) {
+	fileSet := token.NewFileSet()
+	control, err := parser.ParseFile(fileSet, "first_party_control.go", firstPartyConsumptionControl,
+		parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	want := []string{"syntax.ErrTruncated", "syntax.NewWriter"}
+	if got := firstPartyQualifiedNames(control); !slices.Equal(got, want) {
+		t.Fatalf("the collector read %v out of the control, want %v; it is either reading comments or ignoring the import filter",
+			got, want)
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	consumed := map[string]string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, qualified := range firstPartyQualifiedNames(parsed) {
+			consumed[qualified] = name
+		}
+	}
+	if len(consumed) == 0 {
+		t.Fatalf("this package's production source reaches no first party symbol at all, which cannot be right while crypto_labels.go builds a syntax.Writer; the collector read nothing")
+	}
+
+	pins, err := parser.ParseFile(fileSet, keyScheduleDepsFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", keyScheduleDepsFile, err)
+	}
+	pinned := firstPartyQualifiedNames(pins)
+	for _, qualified := range slices.Sorted(maps.Keys(consumed)) {
+		if !slices.Contains(pinned, qualified) {
+			t.Errorf("%s reaches %s and %s never names it, so nothing in this package fails when that signature moves; write its pin in the block at the top of this file",
+				consumed[qualified], qualified, keyScheduleDepsFile)
+		}
+	}
+	t.Logf("%d first party symbols reached by this package's production source, each held to a pin in %s",
+		len(consumed), keyScheduleDepsFile)
 }

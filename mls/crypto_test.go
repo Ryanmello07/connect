@@ -4288,8 +4288,25 @@ func Exported(secret []byte) []byte {
 // A declaration excused here is still held by its own tests. That is the difference
 // between "no caller yet" and the placeholder this gate is about, which has no tests
 // either.
+//
+// The key is the package the declaration is in and then its name, because the gate walks
+// more than one package and a bare name is not an address in it. Keyed on the name alone,
+// this table excused any declaration spelled that way anywhere under the roots -- an
+// unrelated uncalled zeroizeSecret written in connect/message would be waved through by an
+// entry about mls -- and, worse, it silenced its own expiry: the expiry check asks whether
+// the excused name is still uncalled SOMEWHERE, so a foreign declaration of the same
+// spelling keeps the excuse alive after the real one has found its caller. Measured in both
+// directions before the key was widened. This is the base name exemption this project keeps
+// rediscovering, transposed from file names onto symbol names.
 var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
-	"zeroizeSecret": "the key schedule and the secret tree erase every secret through it, from p4 task 5 on; secret_zeroize.go and key_schedule_test.go land together",
+	"./zeroizeSecret": "the key schedule and the secret tree erase every secret through it, from p4 task 5 on; secret_zeroize.go and key_schedule_test.go land together",
+}
+
+// declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
+// the package directory the gate grouped a file under, then the declaration's name. It is
+// one function so the table, the sweep and the expiry check cannot spell it three ways.
+func declarationAddress(where string, name string) string {
+	return where + "/" + name
 }
 
 // No declaration anywhere under the guardrail roots is a placeholder.
@@ -4342,16 +4359,13 @@ func TestNoStubShapesRemainInSource(t *testing.T) {
 	if len(packages) == 0 {
 		t.Fatalf("the scan grouped no package, so the call graph half examined nothing")
 	}
-	excused := map[string]bool{}
-	for name := range packageDeclarationsAwaitingTheirFirstCaller {
-		excused[name] = true
-	}
 	stillUncalled := []string{}
 	for where, files := range packages {
 		reported := []string{}
 		for _, name := range uncalledDeclarationsIn(files) {
-			stillUncalled = append(stillUncalled, name)
-			if !excused[name] {
+			address := declarationAddress(where, name)
+			stillUncalled = append(stillUncalled, address)
+			if _, isExcused := packageDeclarationsAwaitingTheirFirstCaller[address]; !isExcused {
 				reported = append(reported, name)
 			}
 		}
@@ -4359,12 +4373,14 @@ func TestNoStubShapesRemainInSource(t *testing.T) {
 			t.Errorf("%s declares %v, which nothing in it names", where, reported)
 		}
 	}
-	// and the excuse expires by failing rather than by being remembered: a name here
-	// that no package declares, or that something now calls, is a line to delete.
-	for name, why := range packageDeclarationsAwaitingTheirFirstCaller {
-		if !slices.Contains(stillUncalled, name) {
+	// and the excuse expires by failing rather than by being remembered: an address here
+	// that no package declares, or that something now calls, is a line to delete. the
+	// address carries the package, so an unrelated declaration of the same name in the
+	// other root neither excuses this one nor keeps its excuse alive.
+	for address, why := range packageDeclarationsAwaitingTheirFirstCaller {
+		if !slices.Contains(stillUncalled, address) {
 			t.Errorf("%s is excused as awaiting its first caller (%s), and it is now either called or gone; delete the entry",
-				name, why)
+				address, why)
 		}
 	}
 }
