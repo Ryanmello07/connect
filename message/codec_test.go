@@ -38,6 +38,18 @@
 // about the record's existence or about its header. The agreement is therefore asserted
 // over every input any test here ever builds rather than over a list someone remembered
 // to extend.
+//
+// The fifth is the fuzz target and the corpus checked in beside it. Every byte string above
+// was chosen by something in this file; the corpus carries the near miss framings a byte
+// walk does not produce — a prefix declaring more than the input holds, two prefixes swapped
+// between fields — and a plain go test replays them. It is asserted to exist, to hold both
+// accepted and refused entries, and to satisfy the same property, so it cannot quietly
+// become a directory nothing reads.
+//
+// One property is deliberately not here. That the set of records EncodeRecord will write and
+// the set ParseRecord will read are the same set is codec_agreement_test.go's, asserted over
+// a space computed from these same alphabets, with the refusals it has to reach derived from
+// the call graph rather than from a list.
 package message
 
 import (
@@ -45,7 +57,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -1272,12 +1288,104 @@ func TestTheRetentionByteGoesThroughTheOneSplit(t *testing.T) {
 
 // ── the fuzzer ──────────────────────────────────────────────────────────────────────
 
+// Where the checked-in fuzz corpus lives. Go replays every file under here on a plain go
+// test, without -fuzz, which is the whole reason the malformed inputs are on disk rather
+// than added as seeds in code: a seed added in code sits beside the tests that already
+// cover it, and a file here is replayed by anybody who runs the package.
+const fuzzCorpusDir = "testdata/fuzz/FuzzParseRecord"
+
+// The corpus is there, it is read, and it says something.
+//
+// Two ways a checked-in corpus quietly stops being one, and this test refuses both. It can
+// be deleted or renamed — a corpus directory whose name no longer matches the fuzz target
+// is replayed by nothing and reported by nothing, so the count is asserted rather than
+// assumed. And it can drift into inputs the parser refuses without exception, at which
+// point the whole re-encode half of the fuzz property is unreachable from it: an input that
+// is refused exercises the refusal and stops, and it is the accepted ones that have to
+// re-encode to themselves. So at least one entry has to parse.
+//
+// The property itself is asserted here as well, over exactly the same bytes the fuzz target
+// would see, so a corpus entry that violates it fails the ordinary test run rather than
+// waiting for somebody to pass -fuzz.
+func TestTheCheckedInFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
+	entries, err := os.ReadDir(fuzzCorpusDir)
+	if err != nil {
+		t.Fatalf("the checked-in fuzz corpus is unreadable at %s: %v", fuzzCorpusDir, err)
+	}
+	accepted := 0
+	refused := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		bs := fuzzCorpusEntry(t, filepath.Join(fuzzCorpusDir, entry.Name()))
+		record, err := parseBoth(t, entry.Name(), bs)
+		if err != nil {
+			refused++
+			continue
+		}
+		accepted++
+		again, err := EncodeRecord(record)
+		if err != nil {
+			t.Fatalf("%s: parsed and then refused to re-encode: %v", entry.Name(), err)
+		}
+		if !bytes.Equal(again, bs) {
+			t.Fatalf("%s: parsed and re-encoded to %d different bytes, so this record has two encodings", entry.Name(), len(again))
+		}
+	}
+	if accepted+refused == 0 {
+		t.Fatalf("%s holds no corpus entry, so the fuzz target replays nothing but its own well formed seeds", fuzzCorpusDir)
+	}
+	if accepted == 0 {
+		t.Fatalf("%s: all %d entries are refused, so no entry ever reaches the re-encode half of the property", fuzzCorpusDir, refused)
+	}
+	if refused == 0 {
+		t.Fatalf("%s: all %d entries are accepted, so the malformed inputs it exists to carry are gone", fuzzCorpusDir, accepted)
+	}
+	t.Logf("%d corpus entries, %d accepted and %d refused", accepted+refused, accepted, refused)
+}
+
+// The bytes one corpus file holds. The format is go's own: a version line, then the value
+// as a go literal, one value per file for a target that takes one argument.
+func fuzzCorpusEntry(t testing.TB, path string) []byte {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[0], "go test fuzz v") {
+		t.Fatalf("%s is not a go fuzz corpus file: it begins %q", path, lines[0])
+	}
+	literal := strings.TrimSpace(lines[1])
+	literal, isBytes := strings.CutPrefix(literal, "[]byte(")
+	if !isBytes {
+		t.Fatalf("%s carries a value that is not a []byte, and this target takes one", path)
+	}
+	literal, isBytes = strings.CutSuffix(literal, ")")
+	if !isBytes {
+		t.Fatalf("%s carries an unterminated []byte literal", path)
+	}
+	unquoted, err := strconv.Unquote(literal)
+	if err != nil {
+		t.Fatalf("%s does not hold a go string literal: %v", path, err)
+	}
+	return []byte(unquoted)
+}
+
 // The one property that has to hold over bytes nobody chose: an input is refused, or it
 // re-encodes to itself exactly. Anything else is a second encoding of one record, and the
 // write_auth mac is over exactly one of them.
 //
 // The two entry points are asked together here as well, so the fuzzer explores their
 // agreement over inputs no test in this file would have thought to build.
+//
+// The seeds this function adds are all well formed, because a mutator wants a valid record
+// to work outward from. The malformed inputs live in testdata/fuzz/FuzzParseRecord, checked
+// in, which is what makes a plain go test replay them: near miss framings, prefixes that
+// declare more than the input holds, a body one byte off its rung, prefixes swapped between
+// two fields. Those are edits no single byte walk in this file produces, and having them on
+// disk is also what gives a finding from an explicit -fuzz run somewhere to land.
 func FuzzParseRecord(f *testing.F) {
 	for _, entry := range shortCorpus(f) {
 		bs, err := EncodeRecord(&entry.record)
