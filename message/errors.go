@@ -33,6 +33,20 @@
 // publishes it, while a sentinel only an unpublished function can reach is not, because
 // publishing it would widen the server's allowlist with a name no server can use.
 //
+// Six more are of the first kind and are owed the amendment rather than already carrying
+// it. ErrServerAttachmentKindUnknown, ErrServerAttachmentBody,
+// ErrServerAttachmentNoneEncoded, ErrServerAttachmentFieldLength, ErrServerAttachmentAlgId
+// and ErrExpectedWrapCountZero are all reachable from ParseServerAttachment and
+// EncodeServerAttachment, and both of those are on section 12.1's block in spec A and in
+// spec B's character for character restatement of it. So by the rule in the paragraph above
+// each of the six is owed a line in both refusal blocks, and neither block carries one yet:
+// those blocks list nine names, all of them the record codec's, and were written before this
+// encoding existed. Spec B section 5.1 check 3 is the caller that needs them — it is the
+// server's static shape check, it calls ParseServerAttachment, and a refusal it cannot name
+// is one it can only match on message text, which is exactly what the nine were amended in
+// to prevent. The gap is recorded here because this file is where the rule is written down,
+// and it is a spec defect of the same shape as ClassIsPrunable's absence from the same block.
+//
 // The last four below are of that kind, in two shapes. ErrRecordHeaderNil and
 // ErrServerAttachmentMismatch are the preimage builders', those builders are on no line of
 // section 12.1, and the server never decrypts, so it never builds an aad at all.
@@ -94,6 +108,47 @@ var (
 	// retention or skipped by a heads_only fetch; any other length is a body that was not
 	// padded to its rung, which leaks the length the padding exists to hide.
 	ErrCtBodyLength = errors.New("message: ct_body length is neither absent nor the size bucket's")
+	// Fires when a server attachment names a kind spec A section 5.11 does not define,
+	// on either side of the codec. It is a refusal and never a silently ignored
+	// attachment: spec B section 5.1 check 3 is what stands between a record and the
+	// database, and an attachment the server cannot parse is one it cannot check, so a
+	// kind nobody recognises would carry the epoch key install, the recovery index and
+	// the wrap index past every question check 3 asks of them.
+	ErrServerAttachmentKindUnknown = errors.New("message: server attachment kind is not one spec A section 5.11 defines")
+	// Fires when an attachment's kind and the body it carries disagree, in both
+	// directions: a kind with no body, a kind with the wrong body, and two bodies set at
+	// once. One sentinel because it is one rule — an attachment is exactly one kind and
+	// carries exactly that kind's body — and resolving the disagreement instead of
+	// refusing it would encode whichever half the encoder happened to prefer, which is a
+	// record whose author believed it said something else.
+	ErrServerAttachmentBody = errors.New("message: a server attachment's kind and the body it carries disagree")
+	// Fires when the absent attachment arrives spelled out as kind 0x0000 with an empty
+	// body rather than as the empty field. Both specs say an ordinary record carries a
+	// zero length server_attachment and NOT kind 0x0000, and section 5.11's test
+	// obligation says why: the two must encode identically or H(server_attachment)
+	// differs between client and server. Accepting the long form would give one
+	// attachment two encodings with two different hashes, and the write_auth mac and both
+	// aeads are over exactly one of them.
+	ErrServerAttachmentNoneEncoded = errors.New("message: an absent server attachment is the empty field and not an encoded kind 0x0000")
+	// Fires when one of the six length prefixed fields of an attachment is not the exact
+	// width spec A section 5.11 gives it. One sentinel across all six for the reason
+	// ErrBlobIdPresence is one across both directions of its rule: they are one rule, and
+	// a caller that told them apart would be acting on a distinction the wire does not
+	// carry. Spec B section 5.1 check 3 names four of the six outright.
+	ErrServerAttachmentFieldLength = errors.New("message: a server attachment field is not the exact width spec A section 5.11 gives it")
+	// Fires when an attachment carries an algorithm identifier other than the one master
+	// section 7.1 registers for its kind. It is the "known alg_id" of spec B section 5.1
+	// check 3, and it is per kind rather than against the registry as a whole: an epoch
+	// attachment announcing Ed25519 claims its two 32 octet keys came out of a signature
+	// algorithm, which is a record built by something that does not know what the field
+	// is for.
+	ErrServerAttachmentAlgId = errors.New("message: a server attachment carries an algorithm identifier its kind does not name")
+	// Fires when an epoch attachment expects no wraps at all. Spec B section 5.1 check 3
+	// requires expected_wrap_count > 0, and the epoch it opens has at least its own
+	// snapshot in the wrap set, so zero is not a small fan out: it names a count the
+	// EpochComplete marker can never match, which leaves the group readable and not
+	// writable with nothing able to close it.
+	ErrExpectedWrapCountZero = errors.New("message: an epoch attachment expects no wraps at all")
 	// Fires when AADHead is handed no header at all. The same caller bug ErrRecordNil
 	// names, one layer in, and reported rather than dereferenced for the reason nothing in
 	// this package panics: a preimage builder runs on the seal and the open path alike, and

@@ -20,8 +20,11 @@
 // and the rule that generated it. Beside them again, in aad.go and writeauth.go, are the
 // four preimages a record is authenticated by: the two aeads master section 8 seals the
 // body and the head under, and the two macs master section 9.2 authorizes a write and a
-// read with, together with the two per epoch keys those macs run under. The key schedule
-// and the server attachment land beside those and read the same types.
+// read with, together with the two per epoch keys those macs run under. Beside those, in
+// attachment.go, is the server attachment of spec A section 5.11: the one structured field
+// of a record the server may read, its four kinds and their kind discriminator, and every
+// question spec B section 5.1 check 3 asks of a parsed one, so that the server asks rather
+// than re-derives. The key schedule lands beside them and reads the same types.
 // Nothing in this package logs a failure and carries on: every error here is one of the
 // sentinels in errors.go, and the only bare bools are the three constant time verifiers
 // of spec A section 5.7 and that class predicate, none of which reports a failure. The
