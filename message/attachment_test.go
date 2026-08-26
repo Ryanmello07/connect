@@ -77,6 +77,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -1051,6 +1052,61 @@ func TestTheAbsentAttachmentAndAttachmentNoneEncodeIdentically(t *testing.T) {
 	}
 }
 
+// The same equivalence carried the one hop that matters: through aad_head, on the encoder's
+// own bytes.
+//
+// The test above pins the cause and aad_test.go's vector pins the consequence, but the two
+// have never been joined — aad_test.go hands AADHead an attachment it wrote by hand, and
+// nothing in this package yet routes EncodeServerAttachment's answer into a RecordHeader.
+// The record builder that will is the place this property actually breaks, and until it
+// exists this is the join: the encoder's answer for an absent attachment and for an explicit
+// AttachmentNone, each carried into the header field the mac is taken over, must land on the
+// identical preimage — and on the identical preimage a header holding no attachment at all
+// gives, which is the vector aad_test.go pins to its exact bytes.
+//
+// It observes what the byte comparison above cannot: a change that made either spelling
+// contribute bytes of its own reaches the aead through H(server_attachment), and a record
+// built by a client with one spelling is then a record the server hashes differently and
+// refuses as a bad mac — the intermittent failure spec B section 12.1 A-1 exists to prevent.
+func TestBothSpellingsOfTheAbsentAttachmentGiveTheSameAadHead(t *testing.T) {
+	// LP(H(server_attachment)) for the absent attachment, from spec A section 5.11 and
+	// master section 0's notation line rather than from this package: the 32 bit prefix
+	// 00000020 and the SHA-256 of the empty string, which is a value any second
+	// implementation holds without running any of this.
+	const wantTail = "00000020" + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	spellings := []struct {
+		name       string
+		attachment *ServerAttachment
+	}{
+		{name: "an absent attachment", attachment: nil},
+		{name: "an explicit AttachmentNone", attachment: &ServerAttachment{Kind: AttachmentNone}},
+	}
+	header := aadKatOrdinaryHeader()
+	if header.ServerAttachment != nil {
+		t.Fatal("the ordinary header already carries an attachment, so it pins no absence")
+	}
+	want := mustAADHead(t, "a header carrying no attachment", aadKatAlgId, &header, nil)
+	if tail := hex.EncodeToString(want); !strings.HasSuffix(tail, wantTail) {
+		t.Fatalf("aad_head ends %s, want LP(SHA-256(\"\")) %s", tail[len(tail)-len(wantTail):], wantTail)
+	}
+	for _, spelling := range spellings {
+		encoded, err := EncodeServerAttachment(spelling.attachment)
+		if err != nil {
+			t.Fatalf("%s does not encode: %v", spelling.name, err)
+		}
+		// the header field and the argument both, because AADHead compares them and a
+		// spelling that answered bytes would otherwise be refused rather than observed
+		carried := aadKatOrdinaryHeader()
+		carried.ServerAttachment = encoded
+		got := mustAADHead(t, spelling.name, aadKatAlgId, &carried, encoded)
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s encoded to %s and gives aad_head\n%s\nwant\n%s",
+				spelling.name, hex.EncodeToString(encoded), hex.EncodeToString(got), hex.EncodeToString(want))
+		}
+	}
+}
+
 // Empty input parses back as the absent attachment with no body, which is what every ordinary
 // record carries.
 func TestEmptyInputParsesAsTheAbsentAttachment(t *testing.T) {
@@ -1338,6 +1394,10 @@ func TestAnUnknownKindIsADecodeError(t *testing.T) {
 // a body in and leaves the old Kind. Resolving it — encoding whichever half the encoder
 // preferred — would put a record on the wire whose author believed it said something else,
 // and the server would act on the half this package chose.
+//
+// This is the one body the tag does not name. The other half of the presence rule — more
+// bodies than one, whatever the tag — fails in a direction this loop cannot reach and is
+// asserted below over a cross product of its own.
 func TestAKindAndABodyThatDisagreeAreRefused(t *testing.T) {
 	byKind := validAttachmentsByKind(t)
 	for _, code := range specAttachmentCodes() {
@@ -1359,12 +1419,124 @@ func TestAKindAndABodyThatDisagreeAreRefused(t *testing.T) {
 			}
 		}
 	}
-	// and two bodies at once, which is the same rule from the other side
-	both := *byKind[AttachmentWrap]
-	both.Complete = byKind[AttachmentComplete].Complete
-	if _, err := EncodeServerAttachment(&both); !errors.Is(err, ErrServerAttachmentBody) {
-		t.Errorf("an attachment carrying two bodies was refused with %v, want ErrServerAttachmentBody", err)
+}
+
+// One body pointer of ServerAttachment: where it sits in the struct, the name a failure
+// reports it by, and the value the package's own valid attachment of that kind carries.
+type attachmentBodyField struct {
+	index int
+	name  string
+	value reflect.Value
+}
+
+// Every body ServerAttachment can carry, read off the struct rather than listed.
+//
+// The class the presence rule is about is "more than one body set", and this project has
+// been walked past a hand written membership list twelve times: a list of the four body
+// fields, or of the pairs of them, is a list that understates the class the day a fifth
+// pointer is declared. So the fields are found by walking the type for its pointers — Kind
+// is the only field that is not one — and each is paired with the value it holds in the
+// valid attachment that sets it, which is how the walk learns what a well formed body of
+// that field looks like without a table anyone has to keep in step.
+//
+// Both directions are asserted rather than assumed. A pointer no valid attachment sets is a
+// body every cross product below would skip in silence, and a pointer two of them set is one
+// the walk cannot attribute, so each is a fatal here rather than a gap there.
+func attachmentBodyFields(t testing.TB) []attachmentBodyField {
+	t.Helper()
+	byKind := validAttachmentsByKind(t)
+	fields := []attachmentBodyField{}
+	structType := reflect.TypeOf(ServerAttachment{})
+	for i := range structType.NumField() {
+		declared := structType.Field(i)
+		if declared.Type.Kind() != reflect.Pointer {
+			continue
+		}
+		var value reflect.Value
+		for _, code := range specAttachmentCodes() {
+			field := reflect.ValueOf(*byKind[ServerAttachmentKind(code)]).Field(i)
+			if field.IsNil() {
+				continue
+			}
+			if value.IsValid() {
+				t.Fatalf("two valid attachments set %s, so the walk cannot say which kind's body it is", declared.Name)
+			}
+			value = field
+		}
+		if !value.IsValid() {
+			t.Fatalf("no valid attachment sets %s, so no cross product below ever puts a body in it", declared.Name)
+		}
+		fields = append(fields, attachmentBodyField{index: i, name: declared.Name, value: value})
 	}
+	if len(fields) < 2 {
+		t.Fatalf("ServerAttachment carries %d body pointers, so no attachment can carry two and the walk below holds vacuously", len(fields))
+	}
+	return fields
+}
+
+// An attachment carrying more than one body is refused, whichever bodies they are and
+// whatever kind it is labelled — and nothing comes out of the encoder when it is.
+//
+// This is the other half of the rule above and it fails in a direction the mislabelling half
+// cannot see. bodyKind reports the LAST body it finds, in the order the struct declares them,
+// so `carried != a.Kind` already refuses every arrangement whose EARLIER body is the one Kind
+// names. The arrangements it does not refuse are the ones whose later body matches — a
+// WrapTag and an EpochComplete under kind EpochComplete, say — and for those the presence
+// count is the only thing standing between the caller and an encoding. Without it the encoder
+// writes the one body the switch reaches and drops the other on the floor, which is verbatim
+// the failure the ServerAttachment doc comment says is refused: an attachment carrying an
+// EpochAttachment under the WrapTag tag encoded as a wrap tag with the epoch attachment
+// quietly dropped. The record's H(server_attachment) then covers an attachment its author did
+// not write, and the server indexes a wrap record as a marker with nothing anywhere refusing
+// it.
+//
+// The space is every subset of the bodies with at least two in it, crossed with every kind
+// the alphabet defines, both computed rather than written down. A pair picked by hand covers
+// one of twelve orderings and — since six of the twelve are refused by the mislabelling half
+// anyway — has a one in two chance of observing nothing at all.
+func TestEveryAttachmentCarryingMoreThanOneBodyIsRefusedUnderEveryKind(t *testing.T) {
+	fields := attachmentBodyFields(t)
+	codes := specAttachmentCodes()
+	refused := 0
+	for subset := 1; subset < 1<<len(fields); subset++ {
+		for _, code := range codes {
+			attachment := &ServerAttachment{Kind: ServerAttachmentKind(code)}
+			bodies := reflect.ValueOf(attachment).Elem()
+			names := []string{}
+			for i, field := range fields {
+				if subset&(1<<i) == 0 {
+					continue
+				}
+				bodies.Field(field.index).Set(field.value)
+				names = append(names, field.name)
+			}
+			if len(names) < 2 {
+				continue
+			}
+			what := fmt.Sprintf("the %s bodies at once under kind %s",
+				strings.Join(names, " and "), specAttachmentKindNames[ServerAttachmentKind(code)])
+			bs, err := EncodeServerAttachment(attachment)
+			if err == nil {
+				t.Fatalf("%s: accepted, and it encoded to %s — every body but one is dropped from the wire",
+					what, hex.EncodeToString(bs))
+			}
+			if !errors.Is(err, ErrServerAttachmentBody) {
+				t.Errorf("%s: refused with %v, want ErrServerAttachmentBody", what, err)
+			}
+			// a refusal that still answered bytes is a refusal a caller ignoring the error
+			// puts on the wire, which is the same dropped body by another route
+			if len(bs) != 0 {
+				t.Errorf("%s: refused and still answered %s", what, hex.EncodeToString(bs))
+			}
+			refused++
+		}
+	}
+	// the subsets of two or more, crossed with the alphabet, counted from the two derived
+	// sets rather than from a number typed here
+	if want := (1<<len(fields) - 1 - len(fields)) * len(codes); refused != want {
+		t.Fatalf("%d multi body attachments were offered and the cross product has %d in it", refused, want)
+	}
+	t.Logf("%d multi body attachments refused across %d bodies and %d kinds", refused, len(fields), len(codes))
 }
 
 // ── what check 3 relies on NOT being refused ────────────────────────────────────────

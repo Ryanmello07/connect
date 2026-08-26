@@ -473,6 +473,19 @@ func checkWrapTag(t *WrapTag) error {
 // — that wrap_count equals the epoch's expected_wrap_count — is an equality against an
 // attachment this layer is never handed, so it belongs to the server and is not restated
 // here as a bound this function could only guess at.
+//
+// Which leaves the nil guard as the whole body, and it reads as the odd one out beside
+// checkEpochAttachment, checkRecoveryTag and checkWrapTag, all three of which dereference
+// the body they are handed without one. No input reaches it: checkServerAttachment runs the
+// presence rule first, and bodyKind names AttachmentComplete only when Complete is set, so
+// the marker's body is never nil by the time this is called. It stays for two reasons that
+// outrank the symmetry. It fails closed if the presence rule is ever loosened, which is the
+// only direction that edit goes. And it is the one thing this body does with the argument it
+// is handed — take it out and the function ignores its own parameter, which is the
+// placeholder shape mls/crypto_test.go's TestNoStubShapesRemainInSource refuses across this
+// package and that one. The three siblings read their body because they have a width to
+// check against; this one reads its body because a body with nothing to check is what is
+// left to read.
 func checkEpochComplete(c *EpochComplete) error {
 	if c == nil {
 		return fmt.Errorf("%w: kind 0x%04x carries no body", ErrServerAttachmentBody, uint16(AttachmentComplete))
