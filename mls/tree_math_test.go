@@ -6988,3 +6988,51 @@ func sweepPopulatedShape(t *testing.T, depth uint32) int {
 	}
 	return checked
 }
+
+// LeafIndex.NodeIndex documents a wrap — "2*L for it is taken modulo 2^32 — leaf 2^31
+// answers node 0, indistinguishable from leaf 0" — and until this test nothing in the
+// repository held it to that. The whole mls package passed with the method returning a
+// 0xFFFFFFFF sentinel for every index at or above 2^31 instead, which is a different
+// contract in the one place the doc comment is careful: a sentinel is an error signal and
+// the comment says explicitly that a zero from this function is not one. A caller written
+// against the comment and a caller written against the sentinel disagree about whether a
+// large index is representable, and nothing failed to tell them apart.
+//
+// The check does not recompute 2*uint32(self), which is the implementation's own
+// expression and would pass for any mutation that kept it. It multiplies in 64 bits and
+// reduces afterwards, so the wrap is asserted as arithmetic the implementation performs
+// implicitly through overflow rather than as a copy of the line under test.
+func TestLeafIndexToNodeIndexWrapsAsDocumentedRatherThanSignalling(t *testing.T) {
+	// derived rather than listed: every power-of-two boundary and its neighbours, which is
+	// where a width confusion shows, plus the two the doc comment names by hand. a listed
+	// set would have to be re-listed whenever the width changed, and the width is the thing
+	// being tested.
+	var leaves []LeafIndex
+	for bit := 0; bit < 32; bit++ {
+		base := uint32(1) << uint(bit)
+		for _, delta := range []int64{-1, 0, 1} {
+			v := int64(base) + delta
+			if v >= 0 && v <= int64(^uint32(0)) {
+				leaves = append(leaves, LeafIndex(uint32(v)))
+			}
+		}
+	}
+	leaves = append(leaves, 0, 1, 2, LeafIndex(^uint32(0)))
+
+	for _, leaf := range leaves {
+		want := NodeIndex(uint32((2 * uint64(leaf)) % (1 << 32)))
+		if got := leaf.NodeIndex(); got != want {
+			t.Fatalf("leaf %d converts to node %d, want %d: the doc comment says 2*L is taken modulo 2^32, so this method never signals and never refuses",
+				uint32(leaf), uint32(got), uint32(want))
+		}
+	}
+
+	// the two claims the comment makes in prose, pinned as values so that rewording the
+	// comment cannot quietly reword the contract.
+	if got := LeafIndex(1 << 31).NodeIndex(); got != 0 {
+		t.Fatalf("leaf 2^31 converts to node %d, want 0: the comment names this case", uint32(got))
+	}
+	if LeafIndex(1<<31).NodeIndex() != LeafIndex(0).NodeIndex() {
+		t.Fatal("leaf 2^31 and leaf 0 must be indistinguishable after conversion; the comment says so, and a caller that range-checks against MaxLeafCount first is why that is tolerable")
+	}
+}
