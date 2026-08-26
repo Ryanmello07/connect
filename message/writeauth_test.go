@@ -52,9 +52,11 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"go/types"
 	"maps"
 	"os"
 	"path/filepath"
@@ -1307,6 +1309,230 @@ func TestNothingComputesUnderAKeyThatIsNotThirtyTwoOctets(t *testing.T) {
 	}
 }
 
+// The verifiers a behavioural test covers, held to the class the syntax tree gate derives.
+//
+// A test that calls a function has to name it — there is no walking the tree into a call — so
+// the class is asserted here rather than iterated: the names a test covers must be exactly the
+// Verify prefixed functions the scan finds in this package's production source. Spec A section
+// 5.7 already names a third verifier that is not written yet, VerifyRecoveryProof, and on the
+// day it is declared every test that goes through this fails until it covers that one too. It
+// is the whole of what stands between a rule about verifiers and a rule about the two
+// verifiers somebody remembered.
+func authAssertVerifiersCovered(t testing.TB, covered ...string) {
+	t.Helper()
+	derived := authVerifierNames(mustScanAuthSources(t, authScanDir))
+	slices.Sort(covered)
+	if !slices.Equal(derived, covered) {
+		t.Fatalf("this test covers %v and the package declares %v; a verifier outside the covered set is one nothing here observes",
+			covered, derived)
+	}
+}
+
+// No tag at all verifies under a key that is not the thirty two octets both derivations
+// produce, and the all zero tag is the one that had to be written down.
+//
+// This is the other half of the test above, and it is the half that observes the refusal rather
+// than the key that was refused. That one builds the correct mac under a short key and asserts
+// false, which a verifier that dropped authTag's error answers too: the tag such a verifier
+// computes on a refused key is the zero tag, and the zero tag is not the mac it was offered.
+// What observes the dropped error is an attacker's own tag against a refused key — and spec A
+// section 2.4 is what hands the attacker the tag to pick, because the server rebuilds
+// record_bytes from its stored columns with write_auth left zero on every read, so an all zero
+// tag is the value every record any client has ever read back already carries. A verifier that
+// answered true to that under a key it had itself refused would accept all of them, from a
+// caller holding no key at all.
+//
+// The lengths are walked rather than listed, out to twice the width. "Not thirty two octets" is
+// the class; five examples of it are five examples.
+func TestNoTagVerifiesUnderAKeyThatIsNotThirtyTwoOctets(t *testing.T) {
+	authAssertVerifiersCovered(t, "VerifyRequestAuth", "VerifyWriteAuth")
+	root := writeAuthKatStorageRoot()
+	writeKey := WriteKey(root)
+	readKey := ReadKey(root)
+	input := writeAuthKatEphInput()
+	requestBytes := aadRamp(0xf0, 6)
+	const op uint8 = 13
+
+	// the positive control, first: both verifiers say true under the key the derivations
+	// produce. Without it every refusal below is satisfied by a verifier that answers false to
+	// everything it is ever given.
+	record := writeAuthRecordOf(writeKey, input)
+	if !VerifyWriteAuth(writeKey, input.nonce, record) {
+		t.Fatal("the record does not verify under its own write key, so every refusal below observes nothing")
+	}
+	requestTag := ComputeRequestAuth(readKey, input.nonce, op, requestBytes)
+	if !VerifyRequestAuth(readKey, input.nonce, op, requestBytes, requestTag[:]) {
+		t.Fatal("the request does not verify under its own read key, so every refusal below observes nothing")
+	}
+
+	// the tags an attacker gets to choose. What matters is that the choice is the attacker's
+	// and not that any of them is plausible: a verifier that computes nothing under a refused
+	// key compares against whatever its own failure left behind, and the first of these is that
+	// value.
+	tags := []struct {
+		name string
+		tag  [32]byte
+	}{
+		{name: "an all zero tag, which spec A section 2.4 makes the read path's own value", tag: [32]byte{}},
+		{name: "a tag of thirty two 0xff octets", tag: [32]byte(bytes.Repeat([]byte{0xFF}, authTagBytes))},
+		{name: "a ramp", tag: [32]byte(aadRamp(0x00, authTagBytes))},
+		{name: "the tag the real write key takes over this record", tag: record.WriteAuth},
+		{name: "the tag the real read key takes over this request", tag: requestTag},
+	}
+	type refusedKey struct {
+		name string
+		key  []byte
+	}
+	refused := []refusedKey{{name: "a nil key", key: nil}}
+	for length := range 2*authKeyBytes + 1 {
+		if length == authKeyBytes {
+			continue
+		}
+		refused = append(refused, refusedKey{name: fmt.Sprintf("a %d octet key", length), key: aadRamp(0x01, length)})
+	}
+	for _, wrong := range refused {
+		for _, chosen := range tags {
+			forged := &Record{Header: input.header, CtHead: input.ctHead, WriteAuth: chosen.tag}
+			if VerifyWriteAuth(wrong.key, input.nonce, forged) {
+				t.Errorf("VerifyWriteAuth accepts %s under %s", chosen.name, wrong.name)
+			}
+			if VerifyRequestAuth(wrong.key, input.nonce, op, requestBytes, chosen.tag[:]) {
+				t.Errorf("VerifyRequestAuth accepts %s under %s", chosen.name, wrong.name)
+			}
+		}
+		// and the tag at the lengths a verifier that had computed nothing makes easy to hit,
+		// the empty one among them
+		for _, arrived := range [][]byte{nil, {}, make([]byte, authTagBytes)} {
+			if VerifyRequestAuth(wrong.key, input.nonce, op, requestBytes, arrived) {
+				t.Errorf("VerifyRequestAuth accepts a %d octet tag under %s", len(arrived), wrong.name)
+			}
+		}
+	}
+}
+
+// The mac of the empty preimage under each of the two keys the pinned storage root derives.
+//
+// It is the value a verifier that dropped the preimage builder's error would be checking
+// against, because a refused build hands back no bytes at all. It is pinned rather than only
+// computed for the reason every other vector here is: a test anchored to a number says
+// something a test anchored to whatever this package just produced does not. Taken the same way
+// as the rest — HMAC-SHA-256 under the pinned keys over a message of zero length, outside this
+// package:
+//
+//	HMAC-SHA-256(9902690f…1a4738b9, "") = 698fb81c…253b7234
+//	HMAC-SHA-256(74f60668…d803ee66, "") = b132d1ce…039410eb
+const (
+	writeAuthEmptyPreimageTagHex   = "698fb81c23a7a18e8371f9030f11b374f46cf15bf0a838b430f09af3253b7234"
+	requestAuthEmptyPreimageTagHex = "b132d1cec040fe093e1c26ca1241388a636b028fe90fc3247bc426fe039410eb"
+)
+
+// No tag verifies on an input that has no preimage, and the tag of the empty preimage least of
+// all.
+//
+// Every refusal the builders can reach is an input there are no bytes to mac for: an empty
+// nonce, and a class and eph bucket pair the wire has no octet for. A verifier that dropped the
+// builder's error would mac the nothing it got back instead, and the consequence is not a wrong
+// answer on an odd input — it is a second authenticator this package never meant to have.
+// HMAC(write_key, "") names no nonce, no group, no epoch and no record. Every member of the
+// group holds write_key, so any of them builds that tag offline, and a server that accepted it
+// would accept it on every connection that has not yet issued a nonce, for every record at
+// once. The nonce is in the preimage precisely so that a tag from one connection cannot be
+// replayed onto another, and this is that defence deleted.
+//
+// The refused headers are the second half of it. A class and bucket pair with no wire octet has
+// no preimage either, so a verifier that macd the empty one would collapse every such record
+// onto a single tag: one forgery that fits all of them.
+//
+// None of it is observed by the refusal tests that already exist. They offer a correct-key
+// correct-preimage tag and get a mismatch, which the collapsed verifier produces as well —
+// its tag is over the empty preimage rather than over theirs, so it disagrees with them by
+// luck. What observes it is the empty preimage's own tag, which is why that one is built here
+// out of crypto/hmac and pinned above.
+func TestNoTagVerifiesOnAnInputThatHasNoPreimage(t *testing.T) {
+	authAssertVerifiersCovered(t, "VerifyRequestAuth", "VerifyWriteAuth")
+	root := writeAuthKatStorageRoot()
+	writeKey := WriteKey(root)
+	readKey := ReadKey(root)
+	input := writeAuthKatEphInput()
+	requestBytes := aadRamp(0xf0, 6)
+	const op uint8 = 13
+
+	// the tag of no bytes at all, taken with crypto/hmac because this package will not build
+	// it, and checked against the pinned value so the test is anchored to a number rather than
+	// to what it just computed
+	emptyPreimageTag := func(key []byte) [32]byte {
+		mac := hmac.New(sha256.New, key)
+		mac.Write(nil)
+		return [32]byte(mac.Sum(nil))
+	}
+	writeCollapsed := emptyPreimageTag(writeKey)
+	readCollapsed := emptyPreimageTag(readKey)
+	if hex.EncodeToString(writeCollapsed[:]) != writeAuthEmptyPreimageTagHex {
+		t.Fatalf("the empty preimage's tag under the write key is %s, want %s",
+			hex.EncodeToString(writeCollapsed[:]), writeAuthEmptyPreimageTagHex)
+	}
+	if hex.EncodeToString(readCollapsed[:]) != requestAuthEmptyPreimageTagHex {
+		t.Fatalf("the empty preimage's tag under the read key is %s, want %s",
+			hex.EncodeToString(readCollapsed[:]), requestAuthEmptyPreimageTagHex)
+	}
+
+	// the positive control: the same verifier and the same key, on an input that does have a
+	// preimage
+	if !VerifyWriteAuth(writeKey, input.nonce, writeAuthRecordOf(writeKey, input)) {
+		t.Fatal("the record does not verify under its own write key, so every refusal below observes nothing")
+	}
+
+	// every header the builder refuses, which is every one the join has no wire octet for
+	illegalBucket := input.header
+	illegalBucket.RetentionClass = RetentionDurable
+	illegalBucket.EphBucket = 3
+	pastTheLadder := input.header
+	pastTheLadder.EphBucket = ephBucketMax + 1
+	unknownClass := input.header
+	unknownClass.RetentionClass = RetentionClass(9)
+	unknownClass.EphBucket = 0
+
+	for _, refused := range []struct {
+		name   string
+		nonce  []byte
+		header RecordHeader
+	}{
+		{name: "a nil nonce", nonce: nil, header: input.header},
+		{name: "a zero length nonce", nonce: []byte{}, header: input.header},
+		{name: "an eph bucket on a durable class", nonce: input.nonce, header: illegalBucket},
+		{name: "an eph bucket past the ladder", nonce: input.nonce, header: pastTheLadder},
+		{name: "a retention class the wire has no octet for", nonce: input.nonce, header: unknownClass},
+	} {
+		// the builder really does refuse this input, or the assertion under it is about an
+		// input that has a preimage after all
+		if _, err := writeAuthPreimage(refused.nonce, &refused.header, input.ctHead, refused.header.ServerAttachment); err == nil {
+			t.Errorf("the builder accepts %s, so the refusal below observes nothing", refused.name)
+		}
+		record := &Record{Header: refused.header, CtHead: input.ctHead, WriteAuth: writeCollapsed}
+		if VerifyWriteAuth(writeKey, refused.nonce, record) {
+			t.Errorf("VerifyWriteAuth accepts the empty preimage's tag on %s; write_auth is then a value any member builds offline and replays onto every connection at once",
+				refused.name)
+		}
+	}
+
+	// the read path's own shape of it. A req_auth over no preimage is independent of the nonce,
+	// of the op and of the request body all three, so one tag would authorise every read on
+	// every nonce-less connection — and the loop is what says that rather than a single call.
+	for _, empty := range [][]byte{nil, {}} {
+		if _, err := requestAuthPreimage(empty, op, requestBytes); err == nil {
+			t.Errorf("the builder accepts a %d octet nonce, so the refusals below observe nothing", len(empty))
+		}
+		for _, other := range []uint8{0, 13, 14, 16, 17, 19, 255} {
+			for _, body := range [][]byte{nil, requestBytes, aadRamp(0x01, 1), aadRamp(0x77, 64)} {
+				if VerifyRequestAuth(readKey, empty, other, body, readCollapsed[:]) {
+					t.Errorf("VerifyRequestAuth accepts the empty preimage's tag for op %d over a %d octet body under a %d octet nonce",
+						other, len(body), len(empty))
+				}
+			}
+		}
+	}
+}
+
 // The other two refusals the builder can reach, and the corresponding false on the verifying
 // side.
 //
@@ -1394,12 +1620,24 @@ const (
 // that is not there, which is loud, while one that picks the wrong declaration reports nothing
 // and is silent.
 type authScan struct {
+	dir          string
 	fileSet      *token.FileSet
 	decls        map[string][]*ast.FuncDecl
 	pathOf       map[string][]string
 	stringConsts map[string]string
 	constNames   map[string]bool
+	typeNames    map[string]bool
+	imports      []authImport
 	fileCount    int
+}
+
+// One import as a call site sees it. The name is what an expression qualifies with, and the
+// path is where the comparator class reads that package's own declarations from, so the two
+// have to travel together: a package imported under an alias is banned under the alias, and a
+// package with no import is a package with no call.
+type authImport struct {
+	name string
+	path string
 }
 
 // Walks one directory and parses every go file in it, without comments.
@@ -1419,11 +1657,13 @@ type authScan struct {
 // refusal itself can be tested.
 func scanAuthSources(dir string) (authScan, error) {
 	scan := authScan{
+		dir:          dir,
 		fileSet:      token.NewFileSet(),
 		decls:        map[string][]*ast.FuncDecl{},
 		pathOf:       map[string][]string{},
 		stringConsts: map[string]string{},
 		constNames:   map[string]bool{},
+		typeNames:    map[string]bool{},
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1440,6 +1680,19 @@ func scanAuthSources(dir string) (authScan, error) {
 			return scan, fmt.Errorf("parse %s: %w", path, err)
 		}
 		scan.fileCount++
+		for _, spec := range file.Imports {
+			imported, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return scan, fmt.Errorf("parse %s: an import path that is not a string: %s", path, spec.Path.Value)
+			}
+			name := imported[strings.LastIndex(imported, "/")+1:]
+			if spec.Name != nil {
+				name = spec.Name.Name
+			}
+			if !slices.Contains(scan.imports, authImport{name: name, path: imported}) {
+				scan.imports = append(scan.imports, authImport{name: name, path: imported})
+			}
+		}
 		for _, decl := range file.Decls {
 			switch typed := decl.(type) {
 			case *ast.FuncDecl:
@@ -1449,10 +1702,12 @@ func scanAuthSources(dir string) (authScan, error) {
 				scan.decls[typed.Name.Name] = append(scan.decls[typed.Name.Name], typed)
 				scan.pathOf[typed.Name.Name] = append(scan.pathOf[typed.Name.Name], path)
 			case *ast.GenDecl:
-				if typed.Tok != token.CONST {
-					continue
+				switch typed.Tok {
+				case token.CONST:
+					collectAuthConsts(scan, typed)
+				case token.TYPE:
+					collectAuthTypes(scan, typed)
 				}
-				collectAuthConsts(scan, typed)
 			}
 		}
 	}
@@ -1487,6 +1742,16 @@ func collectAuthConsts(scan authScan, decl *ast.GenDecl) {
 				continue
 			}
 			scan.stringConsts[name.Name] = value
+		}
+	}
+}
+
+// The type names of one declaration, so that a conversion through one is not mistaken for a
+// call to something this package does not declare.
+func collectAuthTypes(scan authScan, decl *ast.GenDecl) {
+	for _, spec := range decl.Specs {
+		if typeSpec, isType := spec.(*ast.TypeSpec); isType {
+			scan.typeNames[typeSpec.Name.Name] = true
 		}
 	}
 }
@@ -1704,22 +1969,270 @@ func TestTheCallGraphWalkFlagsTheControlFixture(t *testing.T) {
 	}
 }
 
-// ── guardrail G8: every tag comparison is constant time ─────────────────────────────
+// ── guardrail G8: every comparison of data is constant time ─────────────────────────
 
-// The comparators that answer in a time proportional to how many leading octets matched. Each
-// is written as it is spelled at a call site, and the list is the one thing here that is
-// enumerated rather than derived — the class it is applied to is not.
-var authVariableTimeComparators = []string{
-	"bytes.Equal",
-	"bytes.Compare",
-	"bytes.EqualFold",
-	"reflect.DeepEqual",
-	"strings.Compare",
-	"strings.EqualFold",
+// The one comparison this package decides anything with, and the package it comes from.
+//
+// crypto/subtle is exempt from the derived class below as a whole package rather than by this
+// one name. Everything in it answers in a time that depends on the lengths and on nothing else,
+// which is the property the guardrail is about, so exempting the package is what keeps a
+// verifier that reached for ConstantTimeByteEq from being reported for using the sanctioned
+// tool. Nothing else is exempt from anything.
+const (
+	authConstantTimeComparator = "subtle.ConstantTimeCompare"
+	authConstantTimePackage    = "crypto/subtle"
+)
+
+// The spellings of "a byte string" and of "one of its elements" in go, which is what the
+// classifier below reads a signature for.
+//
+// These are language spellings and not a list of functions: a comparator is any function of the
+// right shape over them, and the shape is what the rule matches. A type parameter is in both
+// sets because a generic comparator's arguments are always type parameters — slices.Equal takes
+// two S and slices.Index takes an S and an E — and there is no way to tell which of the two it
+// is from the signature alone without resolving the constraint.
+var (
+	authDataShapes   = []string{"[]byte", "[]rune", "string", "any", "interface{}"}
+	authScalarShapes = []string{"byte", "rune", "uint8", "int32"}
+)
+
+// Whether a parameter's type is the shape of a byte string, or of one of its elements.
+func authIsDataShaped(text string, typeParams map[string]bool) bool {
+	return typeParams[text] || slices.Contains(authDataShapes, text)
 }
 
-// The constant time comparison every verifier has to reach.
-const authConstantTimeComparator = "subtle.ConstantTimeCompare"
+func authIsScalarShaped(text string, typeParams map[string]bool) bool {
+	return typeParams[text] || slices.Contains(authScalarShapes, text)
+}
+
+// The text of one node under the file set it was parsed with.
+func authNodeText(fileSet *token.FileSet, node ast.Node) string {
+	var out strings.Builder
+	if err := printer.Fprint(&out, fileSet, node); err != nil {
+		return "an expression that could not be printed"
+	}
+	return out.String()
+}
+
+// One parameter type per parameter, with a group like (a, b []byte) counted twice.
+func authParamTypes(fileSet *token.FileSet, decl *ast.FuncDecl) []string {
+	found := []string{}
+	if decl.Type.Params == nil {
+		return found
+	}
+	for _, field := range decl.Type.Params.List {
+		text := authNodeText(fileSet, field.Type)
+		for range max(len(field.Names), 1) {
+			found = append(found, text)
+		}
+	}
+	return found
+}
+
+// The names one function declares as its own type parameters.
+func authTypeParamNames(decl *ast.FuncDecl) map[string]bool {
+	names := map[string]bool{}
+	if decl.Type.TypeParams == nil {
+		return names
+	}
+	for _, field := range decl.Type.TypeParams.List {
+		for _, name := range field.Names {
+			names[name.Name] = true
+		}
+	}
+	return names
+}
+
+// Whether a function answers a question rather than producing a value: a bool or an int is
+// somewhere in what it hands back.
+func authAnswersAQuestion(fileSet *token.FileSet, decl *ast.FuncDecl) bool {
+	if decl.Type.Results == nil {
+		return false
+	}
+	for _, field := range decl.Type.Results.List {
+		switch authNodeText(fileSet, field.Type) {
+		case "bool", "int":
+			return true
+		}
+	}
+	return false
+}
+
+// Whether one declaration of another package answers a question about two byte strings, which
+// is the whole of what makes a function a comparator here.
+//
+// The shape: exported, not a method, answering with a bool or an int somewhere, over two
+// arguments of the same data shaped type — or over one data shaped argument and a scalar of the
+// kind that data holds, which is bytes.IndexByte and slices.Index. It is the shape of
+// bytes.Equal, bytes.Compare, bytes.HasPrefix, bytes.HasSuffix, bytes.Contains, bytes.Index,
+// bytes.Cut, bytes.EqualFold, slices.Equal, slices.Compare, slices.Contains, maps.Equal,
+// reflect.DeepEqual and every strings twin of them, and of none of sha256.Sum256, hkdf.Expand,
+// hmac.New, syntax.NewWriter, errors.New or fmt.Errorf.
+//
+// It over reports where it is unsure and that is the direction it is meant to fail in. It calls
+// fmt.Sscanf a comparator, because a function taking two strings and answering an int is
+// indistinguishable from one at this depth, and it calls hmac.Equal one although hmac.Equal is
+// constant time, because guardrail G8's text is that the comparison is spelled with
+// crypto/subtle rather than that it happens to be safe. A member that should not be one is an
+// argument with a reviewer at compile time; a member that is missing is the mutant that lived.
+func authIsDataComparator(fileSet *token.FileSet, decl *ast.FuncDecl) bool {
+	if decl.Recv != nil || decl.Type == nil || !decl.Name.IsExported() {
+		return false
+	}
+	if !authAnswersAQuestion(fileSet, decl) {
+		return false
+	}
+	typeParams := authTypeParamNames(decl)
+	params := authParamTypes(fileSet, decl)
+	for i, one := range params {
+		if !authIsDataShaped(one, typeParams) {
+			continue
+		}
+		for j, other := range params {
+			if i == j {
+				continue
+			}
+			if one == other || authIsScalarShaped(other, typeParams) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// The module the scanned directory belongs to: where its go.mod is, and what it calls itself.
+func authModuleOf(t testing.TB, dir string) (string, string) {
+	t.Helper()
+	current, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("resolving %s: %v", dir, err)
+	}
+	for {
+		contents, err := os.ReadFile(filepath.Join(current, "go.mod"))
+		if err == nil {
+			for line := range strings.SplitSeq(string(contents), "\n") {
+				if path, isModule := strings.CutPrefix(strings.TrimSpace(line), "module "); isModule {
+					return current, strings.TrimSpace(path)
+				}
+			}
+			t.Fatalf("the go.mod above %s names no module", dir)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			t.Fatalf("no go.mod above %s, so an import of this module resolves to no directory", dir)
+		}
+		current = parent
+	}
+}
+
+// Where one import path's source is read from: the standard library under the toolchain's own
+// GOROOT, or this module's own tree for a path under its module line.
+//
+// A path that resolves to neither is fatal rather than skipped. A skipped package is a package
+// every call into it is cleared for, silently, which is the shape of gate this file exists to
+// not be.
+func authImportedPackageDir(t testing.TB, scan authScan, path string) string {
+	t.Helper()
+	candidate := filepath.Join(build.Default.GOROOT, "src", filepath.FromSlash(path))
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	root, module := authModuleOf(t, scan.dir)
+	if path == module || strings.HasPrefix(path, module+"/") {
+		candidate = filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(strings.TrimPrefix(path, module), "/")))
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	t.Fatalf("the import %q resolves to no directory this gate can read; the comparators of a package it cannot read are comparators it cannot ban", path)
+	return ""
+}
+
+// Every function declaration of one imported package, read out of that package's own source.
+func authImportedPackageDecls(t testing.TB, scan authScan, path string) (*token.FileSet, []*ast.FuncDecl) {
+	t.Helper()
+	dir := authImportedPackageDir(t, scan, path)
+	fileSet := token.NewFileSet()
+	decls := []*ast.FuncDecl{}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading %s for %s: %v", dir, path, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fileSet, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parsing %s of %s: %v", name, path, err)
+		}
+		for _, decl := range file.Decls {
+			if function, isFunction := decl.(*ast.FuncDecl); isFunction {
+				decls = append(decls, function)
+			}
+		}
+	}
+	if len(decls) == 0 {
+		t.Fatalf("%s (%s) yielded no declaration at all, so no comparator of it can be in the class", path, dir)
+	}
+	return fileSet, decls
+}
+
+// The comparator class guardrail G8 is about, computed from the source of the packages the
+// scanned code imports.
+//
+// It is derived and not written down, because every list anyone writes understates it. The
+// enumeration this replaced held six names, bytes.Equal and bytes.Compare among them, and did
+// not hold bytes.HasPrefix — which leaks strictly more than bytes.Equal does, one answer per
+// query about how many leading octets matched, and recovers a forged tag in about thirty two
+// times two hundred and fifty six tries. bytes.HasSuffix, bytes.Contains, bytes.Index,
+// bytes.IndexByte, bytes.Cut, slices.Equal, slices.Compare, slices.Index, slices.Contains,
+// strings.HasPrefix, strings.Contains and maps.Equal were all outside it as well. A ban list
+// that holds bytes.Compare and not bytes.HasPrefix is the signature of an enumeration; the
+// class is the shape, and the shape is what this reads.
+//
+// The class is derived from the imports of the source being scanned, which is what makes it
+// self extending. A comparator cannot be called without its package being imported, so the edit
+// that adds the call adds the import, and that package's whole comparator surface enters the
+// class on the same run — including a package nothing here has ever imported, and including a
+// comparator the standard library has not shipped yet.
+func authDataComparators(t testing.TB, scan authScan) []string {
+	t.Helper()
+	if len(scan.imports) == 0 {
+		t.Fatalf("%s imports nothing, so a class derived from its imports is empty and every call is cleared", scan.dir)
+	}
+	found := []string{}
+	for _, imported := range scan.imports {
+		if imported.path == authConstantTimePackage {
+			continue
+		}
+		fileSet, decls := authImportedPackageDecls(t, scan, imported.path)
+		for _, decl := range decls {
+			if authIsDataComparator(fileSet, decl) {
+				found = append(found, imported.name+"."+decl.Name.Name)
+			}
+		}
+	}
+	slices.Sort(found)
+	return slices.Compact(found)
+}
+
+// Every name the language itself declares, read out of go/types' universe scope.
+//
+// It is what a function is allowed to call without leaving its package: len, copy, append,
+// panic and the rest of the builtins, and the predeclared type names, which are conversions
+// rather than calls. It comes from the toolchain so that a builtin a later go release adds is
+// admitted by the release that adds it rather than by an edit here. The only two that compare
+// anything are min and max, and they compare ordered numbers rather than tags — a verifier that
+// tried to decide a tag with them would still need the equality that the rule below catches.
+func authUniverseNames() map[string]bool {
+	names := map[string]bool{}
+	for _, name := range types.Universe.Names() {
+		names[name] = true
+	}
+	return names
+}
 
 // Whether an expression is a constant as far as the rule below is concerned: a literal, nil,
 // true, false, a composite literal, or a package level constant of the scanned source.
@@ -1747,46 +2260,42 @@ func authIsConstantExpr(scan authScan, expr ast.Expr) bool {
 
 // The text of one expression, for a failure message that has to show what it found.
 func authExprText(scan authScan, expr ast.Expr) string {
-	var out strings.Builder
-	if err := printer.Fprint(&out, scan.fileSet, expr); err != nil {
-		return "an expression that could not be printed"
-	}
-	return out.String()
+	return authNodeText(scan.fileSet, expr)
 }
 
 // Every variable time equality decision inside one function's own body.
 //
-// Two shapes, because the ban list and the general rule each miss what the other catches. A
-// named comparator is the shape guardrail G8 names, and a list of names is the only way to
-// catch it. An == between two values is the shape a list of names never sees at all: a tag is a
-// [32]byte, go compares arrays with == for free, and tag == record.WriteAuth is a variable time
-// comparison that mentions nothing.
+// Two shapes, because the derived comparator class and the general rule each miss what the
+// other catches. A named comparator is the shape guardrail G8 names, and the class it is
+// matched against is the computed one. An == between two values is the shape no class of
+// function names ever sees at all: a tag is a [32]byte, go compares arrays with == for free,
+// and tag == record.WriteAuth is a variable time comparison that mentions nothing.
 //
-// The rule reads the function's own body and not everything it reaches, and that is a real
-// blind spot rather than an oversight. Widening it to the reachable set would flag the
-// attachment comparison in the preimage builder, which is not a tag and is not secret, and a
-// gate that fires on something correct is a gate that gets an exemption written for it. What
-// covers the moved comparison instead is the positive half below: a verifier must reach a
-// constant time comparison, transitively, so a tag comparison delegated to a helper is still
-// required to be the right one.
-func authVariableTimeComparisons(scan authScan, name string) []string {
+// The rule reads the function's own body and not everything it reaches. What covers a
+// comparison moved into a helper is the pair of rules either side of it: the comparator class
+// is banned across every function this package ships, wherever the helper is, and a verifier
+// must reach a constant time comparison transitively, so a tag comparison delegated to a helper
+// is still required to be the right one. What none of the three sees is a hand written loop
+// inside a helper that returns early on the first octet that differs — no comparator is named,
+// no == is written in a verifier, and the constant time comparison is still reached.
+func authVariableTimeComparisons(scan authScan, name string, comparators []string) []string {
+	found := append(authComparatorCalls(scan, name, comparators), authValueEqualities(scan, name)...)
+	slices.Sort(found)
+	return found
+}
+
+// The first shape: a call to a member of the derived comparator class.
+func authComparatorCalls(scan authScan, name string, comparators []string) []string {
 	found := []string{}
 	for _, decl := range scan.decls[name] {
 		ast.Inspect(decl.Body, func(node ast.Node) bool {
-			switch typed := node.(type) {
-			case *ast.CallExpr:
-				text := authExprText(scan, typed.Fun)
-				if slices.Contains(authVariableTimeComparators, text) {
-					found = append(found, text+" at "+scan.fileSet.Position(typed.Pos()).String())
-				}
-			case *ast.BinaryExpr:
-				if typed.Op != token.EQL && typed.Op != token.NEQ {
-					return true
-				}
-				if authIsConstantExpr(scan, typed.X) || authIsConstantExpr(scan, typed.Y) {
-					return true
-				}
-				found = append(found, authExprText(scan, typed)+" at "+scan.fileSet.Position(typed.Pos()).String())
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			text := authExprText(scan, call.Fun)
+			if slices.Contains(comparators, text) {
+				found = append(found, text+" at "+scan.fileSet.Position(call.Pos()).String())
 			}
 			return true
 		})
@@ -1795,13 +2304,94 @@ func authVariableTimeComparisons(scan authScan, name string) []string {
 	return found
 }
 
-// Every function in the scan whose name begins with Verify, which is the class both halves of
-// the rule run over.
+// The second: an equality between two values, which names no function at all.
+func authValueEqualities(scan authScan, name string) []string {
+	found := []string{}
+	for _, decl := range scan.decls[name] {
+		ast.Inspect(decl.Body, func(node ast.Node) bool {
+			binary, isBinary := node.(*ast.BinaryExpr)
+			if !isBinary {
+				return true
+			}
+			if binary.Op != token.EQL && binary.Op != token.NEQ {
+				return true
+			}
+			if authIsConstantExpr(scan, binary.X) || authIsConstantExpr(scan, binary.Y) {
+				return true
+			}
+			found = append(found, authExprText(scan, binary)+" at "+scan.fileSet.Position(binary.Pos()).String())
+			return true
+		})
+	}
+	slices.Sort(found)
+	return found
+}
+
+// Every call in one function's own body that leaves this package for anything other than the
+// constant time comparison.
+//
+// This is the comparator class with its bounds taken off, and it is here because a class
+// derived from signatures still has a shape and anything outside that shape is outside it.
+// bytes.Cut answers "does this tag begin with that one" through three return values;
+// strings.Builder answers it through a method; a helper in a package nothing has classified
+// answers it however it likes. So for the two functions whose answer is the authentication
+// decision, the rule is not that no comparator is called — it is that nothing outside this
+// package is called at all, with one exception, and the exception is the comparison the
+// guardrail names.
+//
+// A call to a method on a value is not a call out of the package by this rule, because the
+// receiver had to come from somewhere and everything that could produce one here is either a
+// call this rule already sees or a value of this package's own. A conversion through a
+// predeclared or package level type name is not a call at all.
+func authForeignCalls(scan authScan, name string) []string {
+	imported := map[string]bool{}
+	for _, one := range scan.imports {
+		imported[one.name] = true
+	}
+	universe := authUniverseNames()
+	found := []string{}
+	for _, decl := range scan.decls[name] {
+		ast.Inspect(decl.Body, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			switch callee := call.Fun.(type) {
+			case *ast.Ident:
+				if _, declared := scan.decls[callee.Name]; declared {
+					return true
+				}
+				if scan.typeNames[callee.Name] || universe[callee.Name] {
+					return true
+				}
+				found = append(found, callee.Name+" at "+scan.fileSet.Position(call.Pos()).String())
+			case *ast.SelectorExpr:
+				text := authExprText(scan, call.Fun)
+				if text == authConstantTimeComparator {
+					return true
+				}
+				qualifier, isIdent := callee.X.(*ast.Ident)
+				if !isIdent || !imported[qualifier.Name] {
+					return true
+				}
+				found = append(found, text+" at "+scan.fileSet.Position(call.Pos()).String())
+			}
+			return true
+		})
+	}
+	slices.Sort(found)
+	return found
+}
+
+// Every function in the scan whose name begins with Verify, which is the class the verifier
+// rules run over.
 //
 // It is computed from the tree rather than written down, so a fourth verifier — spec A section
-// 5.7's VerifyRecoveryProof is the one already named and not yet written — is under the rule
+// 5.7's VerifyRecoveryProof is the one already named and not yet written — is under the rules
 // the day it is declared, with nobody remembering to add it. Guardrail G8's own text names
-// three file names instead; a file name is a place, and the rule is about a kind of function.
+// three file names instead; a file name is a place, and these rules are about a kind of
+// function. The rule below that is about the place is the one G8 spells, and it covers every
+// file rather than three.
 func authVerifierNames(scan authScan) []string {
 	names := []string{}
 	for name := range scan.decls {
@@ -1856,22 +2446,70 @@ func authVerifiersUnderGate(t testing.TB, scan authScan) []string {
 	return verifiers
 }
 
-// Guardrail G8, the ban half: no verifier decides equality in variable time.
+// Guardrail G8 at the scope its own text gives it: nothing this package ships compares data
+// with a variable time call, in any file and in any function.
+//
+// G8's mechanical half is a ban on a place — "grep gate forbids bytes.Equal in validation.go,
+// writeauth.go, framing.go" — and this is that ban with both of its lists computed. The files
+// are every production file of the package, because the scan reads the directory rather than
+// three names; the comparators are the derived class, because bytes.Equal is one member of it.
+// The package obeys it literally: the two attachment comparisons that were bytes.Equal are
+// spelled with crypto/subtle, which is why this rule needs no exemption written into it and why
+// nothing here has to decide which comparison is over a tag.
+func TestNoProductionFunctionComparesDataOutsideConstantTime(t *testing.T) {
+	scan := mustScanAuthSources(t, authScanDir)
+	comparators := authDataComparators(t, scan)
+	t.Logf("%d go files, %d functions, %d imports, %d comparators in the derived class: %v",
+		scan.fileCount, len(scan.decls), len(scan.imports), len(comparators), comparators)
+	// the comparator half only. The == between two values is the other shape of the same
+	// defect and it is asserted over the verifiers rather than here, because two values
+	// compared with == are ordinary in a codec and a header and everything else this package
+	// ships, and a gate that fired on all of them would be a gate with exemptions.
+	for _, name := range slices.Sorted(maps.Keys(scan.decls)) {
+		for _, comparison := range authComparatorCalls(scan, name, comparators) {
+			t.Errorf("%s compares data outside constant time: %s; every comparison of data in this package goes through %s",
+				name, comparison, authConstantTimeComparator)
+		}
+	}
+}
+
+// Guardrail G8, the ban half over the verifiers: no verifier decides equality in variable time.
 func TestNoVerifierDecidesEqualityInVariableTime(t *testing.T) {
 	scan := mustScanAuthSources(t, authScanDir)
+	comparators := authDataComparators(t, scan)
 	verifiers := authVerifiersUnderGate(t, scan)
 	t.Logf("%d verifiers under the gate: %v", len(verifiers), verifiers)
 	for _, name := range verifiers {
-		for _, comparison := range authVariableTimeComparisons(scan, name) {
+		for _, comparison := range authVariableTimeComparisons(scan, name, comparators) {
 			t.Errorf("%s decides equality in variable time: %s; every tag comparison goes through %s",
 				name, comparison, authConstantTimeComparator)
 		}
 	}
 }
 
+// The same ban with its bounds taken off: a verifier reaches out of this package for the
+// constant time comparison and for nothing else.
+//
+// It is the rule that catches what a class derived from signatures cannot. The mutant this was
+// written for kept the constant time comparison and put a fast path in front of it —
+// bytes.HasPrefix(carried, tag) && subtle.ConstantTimeCompare(tag, carried) == 1 — which is
+// byte for byte the same answer, so no vector, no bit flip walk and no independence test can
+// see it, and it leaks the number of leading octets that matched to anyone who can time it.
+// Under this rule the fast path is not reported for being a comparator. It is reported for
+// being a call out of the package that is not the one exception.
+func TestAVerifierReachesOutOfItsPackageOnlyForTheConstantTimeComparison(t *testing.T) {
+	scan := mustScanAuthSources(t, authScanDir)
+	for _, name := range authVerifiersUnderGate(t, scan) {
+		for _, foreign := range authForeignCalls(scan, name) {
+			t.Errorf("%s calls %s; a verifier's answer is decided by %s and by nothing else, and what it needs from elsewhere belongs behind a function of this package",
+				name, foreign, authConstantTimeComparator)
+		}
+	}
+}
+
 // Guardrail G8, the half that says what must be there instead. Banning the wrong comparator is
 // not the same as requiring the right one: a verifier that compared nothing at all, or that
-// moved its comparison into a helper and then wrote the helper wrong, passes the ban and fails
+// moved its comparison into a helper and then wrote the helper wrong, passes the bans and fails
 // here.
 func TestEveryVerifierReachesAConstantTimeComparison(t *testing.T) {
 	scan := mustScanAuthSources(t, authScanDir)
@@ -1883,7 +2521,7 @@ func TestEveryVerifierReachesAConstantTimeComparison(t *testing.T) {
 	}
 }
 
-// The positive control for both halves, and the negative one beside it.
+// The positive control for all three halves, and the negative one beside them.
 //
 // The expected sets are exact, so a matcher that widened to flag every function it reads fails
 // here as surely as one that stopped matching. The fixture's clean verifiers are the negative
@@ -1891,34 +2529,89 @@ func TestEveryVerifierReachesAConstantTimeComparison(t *testing.T) {
 // requirement really is transitive — and documented.go is the third half again: it names every
 // banned act in prose alone, and the gates parse without comments, so a matcher that read the
 // text rather than the tree would flag it.
+//
+// Three of the fixture's violations are the ones the enumeration this replaced let through:
+// bytes.HasPrefix in front of a constant time comparison, slices.Equal, and strings.Contains.
+// None of the three was on the six name list. All three are in the class the fixture's own
+// imports derive, and the assertions below say so by name, because "the class is bigger" is not
+// an observation and "the class holds this member" is.
 func TestTheConstantTimeGateFlagsTheControlFixture(t *testing.T) {
 	control := mustScanAuthSources(t, authControlScanDir)
+	comparators := authDataComparators(t, control)
+	t.Logf("%d comparators derived from the fixture's %d imports: %v", len(comparators), len(control.imports), comparators)
+	// the derived class holds the members the enumeration missed, named one at a time. The six
+	// it did hold are bytes.Equal, bytes.Compare, bytes.EqualFold, reflect.DeepEqual,
+	// strings.Compare and strings.EqualFold, and every name below is a comparator that was
+	// outside it.
+	for _, want := range []string{
+		"bytes.HasPrefix", "bytes.HasSuffix", "bytes.Contains", "bytes.Index", "bytes.IndexByte",
+		"bytes.Cut", "slices.Equal", "slices.Compare", "slices.Index", "slices.Contains",
+		"strings.HasPrefix", "strings.Contains",
+	} {
+		if !slices.Contains(comparators, want) {
+			t.Errorf("the derived class does not hold %s, which answers how many leading octets matched", want)
+		}
+	}
+	// and it holds what the enumeration did hold, so the derivation is a superset of it rather
+	// than a different set
+	for _, want := range []string{"bytes.Equal", "bytes.Compare", "bytes.EqualFold", "strings.Compare", "strings.EqualFold"} {
+		if !slices.Contains(comparators, want) {
+			t.Errorf("the derived class does not hold %s, which the enumeration it replaced did hold", want)
+		}
+	}
+	// and it does not hold everything it read: the packages the fixture imports are full of
+	// functions that are not comparators
+	for _, notAComparator := range []string{"bytes.NewReader", "bytes.Repeat", "strings.Join", "slices.Sort", "fmt.Errorf", "fmt.Sprint"} {
+		if slices.Contains(comparators, notAComparator) {
+			t.Errorf("the derived class holds %s, which answers no question about two byte strings; a class that flags everything bans nothing",
+				notAComparator)
+		}
+	}
+
 	flagged := []string{}
+	foreign := []string{}
 	uncovered := []string{}
 	verifiers := authVerifierNames(control)
 	if len(verifiers) == 0 {
 		t.Fatal("the fixture declares no verifier, so it controls nothing")
 	}
 	for _, name := range verifiers {
-		if 0 < len(authVariableTimeComparisons(control, name)) {
+		if 0 < len(authVariableTimeComparisons(control, name, comparators)) {
 			flagged = append(flagged, name)
+		}
+		if 0 < len(authForeignCalls(control, name)) {
+			foreign = append(foreign, name)
 		}
 		if !authReachesConstantTimeCompare(t, control, name) {
 			uncovered = append(uncovered, name)
 		}
 	}
-	wantFlagged := []string{"VerifyByArrayComparison", "VerifyByBytesEqual"}
+	wantFlagged := []string{"VerifyByArrayComparison", "VerifyByBytesEqual", "VerifyByPrefixFastPath", "VerifyBySlicesEqual", "VerifyByStringsContains"}
 	if !slices.Equal(flagged, wantFlagged) {
 		t.Errorf("the variable time rule flagged %v in the fixture, want %v", flagged, wantFlagged)
 	}
-	wantUncovered := []string{"VerifyByArrayComparison", "VerifyByBytesEqual", "VerifyWithNoComparisonAtAll"}
+	wantForeign := []string{"VerifyByBytesEqual", "VerifyByForeignHelper", "VerifyByPrefixFastPath", "VerifyBySlicesEqual", "VerifyByStringsContains"}
+	if !slices.Equal(foreign, wantForeign) {
+		t.Errorf("the rule over calls out of the package flagged %v in the fixture, want %v", foreign, wantForeign)
+	}
+	wantUncovered := []string{"VerifyByArrayComparison", "VerifyByBytesEqual", "VerifyBySlicesEqual", "VerifyByStringsContains", "VerifyWithNoComparisonAtAll"}
 	if !slices.Equal(uncovered, wantUncovered) {
 		t.Errorf("the constant time requirement flagged %v in the fixture, want %v", uncovered, wantUncovered)
 	}
-	// and the clean ones are clean under both, which is what says the rules do not fire on
+	// the two that only one rule sees, stated as the difference rather than left to be read out
+	// of the three sets above: the prefix fast path reaches a constant time comparison and is
+	// still a violation, and the verifier that asks another package for a second opinion is one
+	// though it calls no comparator at all
+	if slices.Contains(uncovered, "VerifyByPrefixFastPath") {
+		t.Error("VerifyByPrefixFastPath is reported as reaching no constant time comparison; it reaches one, which is why the other two rules have to see it")
+	}
+	if slices.Contains(flagged, "VerifyByForeignHelper") {
+		t.Error("VerifyByForeignHelper is reported as a comparator call; it calls none, and the rule that has to see it is the one about leaving the package")
+	}
+	// and the clean ones are clean under all three, which is what says the rules do not fire on
 	// everything they read
 	for _, name := range []string{"VerifyClean", "VerifyCleanThroughAHelper", "VerifyDocumented"} {
-		if slices.Contains(flagged, name) || slices.Contains(uncovered, name) {
+		if slices.Contains(flagged, name) || slices.Contains(foreign, name) || slices.Contains(uncovered, name) {
 			t.Errorf("%s is flagged, and it compares in constant time", name)
 		}
 	}

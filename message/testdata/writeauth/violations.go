@@ -22,6 +22,9 @@ package writeauth
 import (
 	"bytes"
 	"crypto/subtle"
+	"fmt"
+	"slices"
+	"strings"
 )
 
 // ── the read path reaching the write key ──
@@ -92,3 +95,36 @@ func VerifyClean(tag []byte, carried []byte) bool {
 func VerifyCleanThroughAHelper(tag []byte, carried []byte) bool { return fixtureSameTag(tag, carried) }
 
 func fixtureSameTag(a []byte, b []byte) bool { return subtle.ConstantTimeCompare(a, b) == 1 }
+
+// ── the three the enumeration let through ──
+
+// The mutant that lived. The constant time comparison still decides the answer, so this
+// verifier agrees with VerifyClean on every input there is and no behavioural test can tell
+// them apart; the fast path in front of it answers early on the first octet that differs,
+// which is an oracle for how many leading octets of a forged tag were right. bytes.HasPrefix
+// was on no ban list anyone wrote, and bytes.Equal was on all of them.
+func VerifyByPrefixFastPath(tag []byte, carried []byte) bool {
+	return bytes.HasPrefix(carried, tag) && subtle.ConstantTimeCompare(tag, carried) == 1
+}
+
+// The same act through a second package, because what makes a comparator is the shape and
+// not the spelling: a generic equality over any slice answers exactly what bytes.Equal does.
+func VerifyBySlicesEqual(tag []byte, carried []byte) bool { return slices.Equal(tag, carried) }
+
+// And through a third, over the text of a tag rather than its octets, which is what a
+// verifier that hex encoded both sides first would reach for.
+func VerifyByStringsContains(tag string, carried string) bool {
+	return strings.Contains(carried, tag)
+}
+
+// ── the one no comparator class can see ──
+
+// A verifier that decides with the constant time comparison and then asks another package
+// for a second opinion. fmt.Sprint answers no question about two byte strings, so it is in
+// no derived comparator class and never will be; it is still a call out of the package
+// inside the function whose answer is the authentication decision, and its argument is the
+// tag. It is what says the rule over a verifier is that nothing foreign is called at all
+// rather than that no comparator is.
+func VerifyByForeignHelper(tag []byte, carried []byte) bool {
+	return subtle.ConstantTimeCompare(tag, carried) == 1 && fmt.Sprint(tag) != ""
+}

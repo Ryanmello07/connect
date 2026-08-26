@@ -85,14 +85,17 @@
 // refusing it closes the bypass rather than narrowing it.
 //
 // Guardrail G8 of spec A section 5.9 governs the last of it: every tag comparison goes
-// through crypto/subtle.ConstantTimeCompare, and bytes.Equal on a tag in this file is a
-// defect. The gate in writeauth_test.go reads the syntax tree for it rather than trusting
-// the diff, over a class of functions it computes from the tree rather than one written down
-// here.
+// through crypto/subtle.ConstantTimeCompare, and the guardrail's mechanical half bans
+// bytes.Equal in this file — the file and not a kind of function. Nothing here compares two
+// byte strings by any other means, the attachment check included, and that is not zeal about
+// a comparison that is neither secret nor a tag: a file scoped ban with one exemption in it
+// is a ban every later reader has to re-derive, and the exemption is where the next
+// comparison hides. The gates in writeauth_test.go read the syntax tree for it rather than
+// trusting the diff, over classes they compute from the tree — the functions they judge, and
+// the comparators they ban, both — rather than over lists written down here.
 package message
 
 import (
-	"bytes"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -232,7 +235,14 @@ func writeAuthPreimage(serverNonce []byte, h *RecordHeader, ctHead []byte, serve
 	if len(serverNonce) == 0 {
 		return nil, ErrServerNonceEmpty
 	}
-	if !bytes.Equal(h.ServerAttachment, serverAttachment) {
+	// subtle.ConstantTimeCompare rather than bytes.Equal, and the attachment is not a tag.
+	// Guardrail G8 of spec A section 5.9 bans bytes.Equal in this file rather than in a kind
+	// of function, and a file scoped ban that the file itself breaks once is a ban with a
+	// judgement call in front of it — every later reader has to decide whether this
+	// comparison is the exempt kind. It answers the same question here: the lengths are
+	// public and equal length inputs are compared whole, so nil and empty stay the one value
+	// LP cannot tell apart, which is what bytes.Equal answered too.
+	if subtle.ConstantTimeCompare(h.ServerAttachment, serverAttachment) != 1 {
 		return nil, fmt.Errorf("%w: the header carries %d bytes and the argument carries %d",
 			ErrServerAttachmentMismatch, len(h.ServerAttachment), len(serverAttachment))
 	}

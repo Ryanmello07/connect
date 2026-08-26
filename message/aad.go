@@ -74,8 +74,8 @@
 package message
 
 import (
-	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -206,7 +206,12 @@ func AADHead(algId uint16, h *RecordHeader, serverAttachment []byte) ([]byte, er
 	if h == nil {
 		return nil, ErrRecordHeaderNil
 	}
-	if !bytes.Equal(h.ServerAttachment, serverAttachment) {
+	// subtle.ConstantTimeCompare rather than bytes.Equal, for the reason writeauth.go's
+	// sibling check gives: guardrail G8's mechanical half is a file scoped ban on bytes.Equal
+	// and a ban with one exemption written into it is a ban with a judgement call in front of
+	// it. The answer is the same one — equal lengths compared whole, so a nil and an empty
+	// attachment remain the one value LP cannot tell apart.
+	if subtle.ConstantTimeCompare(h.ServerAttachment, serverAttachment) != 1 {
 		return nil, fmt.Errorf("%w: the header carries %d bytes and the argument carries %d",
 			ErrServerAttachmentMismatch, len(h.ServerAttachment), len(serverAttachment))
 	}
