@@ -171,3 +171,16 @@ func TestOnlyTheGroupContextErrorAnswersToTheSyntaxSentinel(t *testing.T) {
 		t.Fatalf("%d of the ten errors answer to syntax.ErrTrailingBytes, want exactly 1", matched)
 	}
 }
+
+// One test this task's plan asked for is not here, and this is the note that says so
+// rather than letting its absence look like an oversight.
+//
+// TestPskSentinelsBelongToTheValidationPlan asserts that ErrPskNonceLength, ErrPskType
+// and ErrDuplicatePsk resolve to the validation plan's declarations and that
+// ValSem(ValSem401, detail) preserves its detail under errors.Is. None of those five
+// names exists in this package yet, so the test cannot compile, and an undefined name
+// takes the whole package down rather than showing up as one red test.
+//
+// It is not forgotten: all five are in crossPlanSymbolsNotYetLanded in
+// key_schedule_deps_test.go, so the moment the validation plan lands them that gate fails
+// and names them. Whoever answers it writes their pins and this test in the same commit.
