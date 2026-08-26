@@ -5274,6 +5274,12 @@ func cryptoSourcePaths(t *testing.T) []string {
 // out of the environment, fails exactly as loudly as a third party crypto library the slice
 // forbids outright.
 //
+// fmt is on the list for connect/message alone, and only ever as fmt.Errorf("%w: ...",
+// sentinel, detail): the sentinel stays the matchable identity and the wrap carries the
+// octet counts a caller needs to see. It is written down rather than argued away because
+// this list is the record of what the two packages may reach, and the record is the point.
+// Nothing in mls itself imports it.
+//
 // It is the mechanical half of the claim that the deterministic provider is reachable only
 // by an explicit caller. Nothing here can consult the environment, and the constraint gate
 // below says nothing here can be swapped out by a build tag either, so the only way to a
@@ -5291,6 +5297,7 @@ var cryptoImportPaths = []string{
 	`"crypto/subtle"`,
 	`"encoding/binary"`,
 	`"errors"`,
+	`"fmt"`,
 	`"github.com/urnetwork/connect/mls/syntax"`,
 	`"golang.org/x/crypto/chacha20poly1305"`,
 	`"io"`,
