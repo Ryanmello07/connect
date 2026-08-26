@@ -376,9 +376,22 @@ func TestTreeMathVectorChildren(t *testing.T) {
 
 	// the family stops at 512 leaves, so its deepest parent is that entry's
 	// root at level 9 and it says nothing at all about levels 10 and above.
-	// nothing later in this package covers them either: the structural sweep
-	// also stops at 512 leaves, and the fuzz target asserts only that an
+	// the rows below were added when nothing later in this package covered
+	// them; the structural sweep now does, and this comment no longer claims
+	// otherwise. measured against that sweep, every version of Left or Right
+	// whose answer is perturbed at one level dies there at every level from 1
+	// to 31, and the only survivors are at level 0, where both functions
+	// refuse and the answer beside the refusal is what these rows pin. a range
+	// guard that refuses above level 9 fails there too, since the sweep takes
+	// an error from either function as a failure at every interior node of
+	// every tree size to 2^31 leaves — that half is traced from the sweep's
+	// body and not measured, because the enumeration behind it perturbs
+	// answers and never error arms. the fuzz target asserts only that an
 	// answer is inside the tree.
+	//
+	// what stays this table's own is the anchor rather than the reach: these
+	// expectations are read out of published vector data, and the sweep's are
+	// read off the array layout.
 	//
 	// measured, not assumed: against the family plus the two refusal probes
 	// below, every range guard from k > 9 through k >= 31 passes. each of them
@@ -595,11 +608,16 @@ func TestTreeMathVectorParentAndSibling(t *testing.T) {
 	// the family's deepest node is the root of its 512-leaf entry, at level 9,
 	// and that node is a refusal in both columns: the deepest node it publishes
 	// a parent or a sibling for is at level 8. so the family says nothing about
-	// levels 9 through 31, and nothing later in this package covers them
-	// either - the structural sweep also stops at 512 leaves and the fuzz
-	// target asserts only that an answer is inside the tree. it says nothing
-	// about leaf counts above 512 either, and the count is what locates the
-	// root both functions refuse at.
+	// levels 9 through 31. the rows below were added when nothing later in this
+	// package covered them; the structural sweep now does, and this comment no
+	// longer claims otherwise. measured against that sweep, every version of
+	// Parent or Sibling whose answer is perturbed at one level dies there at
+	// every level from 0 to 30, and the only survivors are at level 31, where
+	// both functions refuse at the root of the largest tree and the answer
+	// beside the refusal is what these rows pin. the fuzz target asserts only
+	// that an answer is inside the tree. the family says nothing about leaf
+	// counts above 512 either, and the count is what locates the root both
+	// functions refuse at.
 	//
 	// measured, not assumed: with these rows removed and every other row of
 	// this test kept, two versions pass — a Parent whose index arithmetic is

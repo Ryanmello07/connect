@@ -3,8 +3,9 @@
 // the mlswg tree-math vector family covers six of this file's twenty-four
 // exported callables and only at power-of-two sizes, so the tests here carry
 // the rest: the two worked examples RFC 9420 publishes, a differential against
-// the RFC's own second definition of the common ancestor, and an exhaustive
-// sweep of every node of every tree size up to 512 leaves.
+// the RFC's own second definition of the common ancestor, and a structural
+// sweep that walks every node of every tree size up to 512 leaves and, above
+// that, every level of every tree size to 2^31 leaves.
 package mls
 
 import (
@@ -81,12 +82,20 @@ func TestNodeIndexLevelAndLeafMapping(t *testing.T) {
 	// that argument applies to the middle of the range too, and this table at
 	// first did not carry it there: it jumped from the fixture's level 3
 	// straight to 31. also measured — with only the fixture and the two
-	// endpoints, a Level wrong by one across an interior band passes, and
-	// nothing else in these tests covers that band either. the invariant sweep
-	// stops at 512 leaves, so it reaches level 9; the fuzz target asserts only
-	// that the level is at most 32. levels 5, 16 and 30 are asserted below,
-	// which cuts the widest unasserted run from twenty-seven levels (4 to 30)
-	// to thirteen (17 to 29).
+	// endpoints, a Level wrong by one across an interior band passes, and at
+	// the time nothing else in these tests covered that band either. levels 5,
+	// 16 and 30 are asserted below, which cut the widest unasserted run from
+	// twenty-seven levels (4 to 30) to thirteen (17 to 29).
+	//
+	// the interior band is no longer this table's alone, so the reason these
+	// rows are here is not the one first written. the structural sweep walks
+	// every level of every tree size to 2^31 leaves, and measured against it,
+	// every version of Level whose answer is perturbed at one level dies
+	// there — all 160 of them, five bit positions at each of the thirty-two
+	// levels from 0 to 31. what these rows hold that it cannot is level 32:
+	// 0xFFFFFFFF sits in no tree, so no sweep of trees reaches it, and the
+	// out-of-range refusal in the children functions is built on its level
+	// being 32. the fuzz target asserts only that the level is at most 32.
 	//
 	// no live group reaches any of this. the v1 product cap is 500 members, so
 	// a real tree stops at level 9. these rows are gate strength, not a bug.
@@ -1359,8 +1368,13 @@ func TestCopathIsTheSiblingOfTheDirectPath(t *testing.T) {
 	checkedPositions, emptyPathNodes := 0, 0
 
 	// the same two bands the absolute sweep walks, for the same reason: the
-	// relation has to hold at depth 31 as well as at depth 3, and nothing else
-	// in this package puts either function into a tree that deep.
+	// relation has to hold at depth 31 as well as at depth 3. it is no longer
+	// the only thing in this package that puts either function into a tree
+	// that deep — the structural sweep does too, and measured, every version
+	// of DirectPath or Copath whose answer is perturbed at one tree depth dies
+	// there at every depth from 1 to 31. this test is kept for what the
+	// comment above says it asserts, which is the relation itself, and no
+	// claim is made here about being the only thing that reaches these depths.
 	blockProbes := []uint64{0, 1, 0xFFFFFFFF, 0xFFFFFFFE, 0xA5A5A5A5}
 	for depth := uint32(0); depth <= 31; depth += 1 {
 		leafCount := LeafCount(1) << depth
@@ -1828,8 +1842,13 @@ func TestCommonAncestorAtEveryLevel(t *testing.T) {
 // three bands. every ordered pair of nodes of every tree up to 128 leaves; then
 // every ordered pair of leaves of the 256 and 512 leaf trees, which is the band
 // the plan named; then designed pairs at every level of every depth from 10 to
-// 31, which is where the boundary is and which nothing else in this package
-// reaches. the arms of each band are counted and pinned, and the leaf band's
+// 31, which is where the boundary is. that top band is no longer reached by
+// nothing else: the structural sweep asks the function at every level of every
+// depth to 31, and measured, all 160 versions of it perturbed at one level die
+// there. what this band holds that the sweep cannot is the second definition —
+// the sweep checks an ancestor against the layout, and this checks it against
+// the RFC's other formulation. the arms of each band are counted and pinned,
+// and the leaf band's
 // two ancestor arms are pinned at zero: a band of leaves alone can never put
 // one operand inside the other, so a differential built only from leaf pairs
 // never runs either of the two shortcuts the implementation opens with.
@@ -3612,13 +3631,18 @@ func resolutionProbeBlocks(depth uint32, level uint32, walkLimit uint64) []uint6
 // the resolution of a node at every block of every level of every depth, with
 // the blanked path running through it.
 //
-// this is the band nothing else in this package reaches. the mlswg tree-math
-// family stops at 512 leaves, which is level 9, both figures RFC 9420 draws are
-// eight-leaf trees, and the exhaustive shape sweeps above stop at eight leaves
-// too. what is left is levels 10 to 31, and a version that is right below level
-// 10 and wrong above it — a push order swapped at one level, a blank test
-// skipped at one level, an unmerged list dropped at one level — passes every
-// one of them.
+// this is the band nothing else in this package reaches with a blank node in
+// it. the mlswg tree-math family stops at 512 leaves, which is level 9, both
+// figures RFC 9420 draws are eight-leaf trees, and the exhaustive shape sweeps
+// above stop at eight leaves too. the structural sweep does ask this function
+// at every level to 31 — measured, of the 160 versions of it perturbed at one
+// level it kills 137 and the other 23 cannot change a one-node answer at all,
+// so none survive it — but above 512 leaves it asks only a tree with nothing
+// blank, whose resolution is the identity, and its one blank shape is the root
+// of a tree of at most 512 leaves. so a version that is right
+// below level 10 and wrong above it in the descent — a push order swapped at
+// one level, a blank test skipped at one level, an unmerged list dropped at one
+// level — passes every one of them.
 //
 // the shapes are chains rather than arbitrary blank sets because an arbitrary
 // one is not affordable at this depth: an all-blank tree of depth 31 resolves
@@ -5808,13 +5832,17 @@ func checkFilteredPathRelations(t *testing.T, label string, shape NodeShape, lea
 
 // the filtered path of leaves of every tree size, under four blank structures.
 //
-// this is the band nothing else in this file reaches. the mlswg families stop
-// at 127 nodes, which is level 6, both figures RFC 9420 draws are eight-leaf
-// trees, and the exhaustive shape sweeps stop at eight leaves and the drop
-// patterns at twelve levels. what is left is levels 13 to 31, and a version
-// that is right below level 13 and wrong above it — a step paired with the
-// wrong copath entry at one level, a node emitted in place of its copath child
-// at one level — passes every one of them.
+// this is the band nothing else in this file reaches with a step ever dropped.
+// the mlswg families stop at 127 nodes, which is level 6, both figures RFC 9420
+// draws are eight-leaf trees, and the exhaustive shape sweeps stop at eight
+// leaves and the drop patterns at twelve levels. the structural sweep does
+// reach levels 13 to 31 now, and it checks both fields of every step against
+// the layout oracle there, so a step paired with the wrong copath entry at one
+// level no longer passes everything — that pair of examples was true when this
+// comment was written and is not any more. what is left is the drop itself:
+// both of that sweep's shapes filter nothing out, so a version right below
+// level 13 and wrong above it in which steps survive the filter passes every
+// one of them.
 //
 // the shapes are chains and thin random sets rather than arbitrary blank ones
 // because an arbitrary one is not affordable at this depth: a copath child at
