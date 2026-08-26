@@ -13,8 +13,12 @@
 // the record master section 8 defines, the size ladder a body is padded to, the eph
 // ladder a transient record expires on, the one pair of functions that crosses between
 // the retention class as go carries it and the single byte the wire carries it in, and
-// the class predicate spec B section 7.2 sweeps on. The key schedule, the codec, the
-// authenticators and the server attachment land beside them and read these types.
+// the class predicate spec B section 7.2 sweeps on. Beside them, in codec.go, is the
+// wire form of that record: the layout is defined there rather than in any spec, because
+// no spec gives one — spec B carries record_bytes opaquely and says only that this
+// package's encoder produced it — and codec.go's opening comment states both the table
+// and the rule that generated it. The key schedule, the authenticators and the server
+// attachment land beside those and read the same types.
 // Nothing in this package logs a failure and carries on: every error here is one of the
 // sentinels in errors.go, and the only bare bools are the three constant time verifiers
 // of spec A section 5.7 and that class predicate, none of which reports a failure.
