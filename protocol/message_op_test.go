@@ -264,19 +264,19 @@ func TestReqAuthArmsCarryAReqAuthField(t *testing.T) {
 		}
 		hasReqAuth := md.Fields().ByName("req_auth") != nil
 		if hasReqAuth != spec.requiresReqAuth {
-			t.Errorf("arm %q: Spec A §5.7 says requiresReqAuth=%v, but %s %s a req_auth field",
+			t.Errorf("arm %q: Spec A §5.7 says requiresReqAuth=%v, but %s %s req_auth field",
 				name, spec.requiresReqAuth, md.FullName(),
-				map[bool]string{true: "has", false: "has no"}[hasReqAuth])
+				map[bool]string{true: "has a", false: "has no"}[hasReqAuth])
 		}
 		// §4.3.8: the read key is selected by read_epoch, which travels inside
 		// canonical_request_bytes. An authenticated request without it would force
 		// the server to trial keys, which §4.3.8 explicitly forbids.
 		hasReadEpoch := md.Fields().ByName("read_epoch") != nil
 		if hasReadEpoch != spec.requiresReqAuth {
-			t.Errorf("arm %q: requiresReqAuth=%v, but %s %s a read_epoch field. Spec B §4.3.8 "+
+			t.Errorf("arm %q: requiresReqAuth=%v, but %s %s read_epoch field. Spec B §4.3.8 "+
 				"requires the epoch to be named inside the MAC so the server never trials keys.",
 				name, spec.requiresReqAuth, md.FullName(),
-				map[bool]string{true: "has", false: "has no"}[hasReadEpoch])
+				map[bool]string{true: "has a", false: "has no"}[hasReadEpoch])
 		}
 	}
 }

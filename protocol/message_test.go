@@ -9,6 +9,7 @@ package protocol_test
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -25,7 +26,10 @@ func sampleScalar(t *testing.T, fd protoreflect.FieldDescriptor, seed int) proto
 	t.Helper()
 	switch fd.Kind() {
 	case protoreflect.BoolKind:
-		return protoreflect.ValueOfBool(true)
+		// Distinct across seeds so that a bool map key yields two entries rather
+		// than one; a lone entry cannot exhibit an unstable iteration order, which
+		// would make TestDeterministicMarshalIsStable pass vacuously.
+		return protoreflect.ValueOfBool(seed%2 == 0)
 	case protoreflect.Uint32Kind:
 		return protoreflect.ValueOfUint32(uint32(1000 + seed))
 	case protoreflect.Uint64Kind:
@@ -35,7 +39,10 @@ func sampleScalar(t *testing.T, fd protoreflect.FieldDescriptor, seed int) proto
 	case protoreflect.Int64Kind:
 		return protoreflect.ValueOfInt64(int64(1_000_000 + seed))
 	case protoreflect.StringKind:
-		return protoreflect.ValueOfString("sample-" + string(fd.Name()))
+		// The seed MUST be part of the value. Without it every generated map key
+		// collides, the map holds one entry, and a deterministic-marshal test over
+		// it can never fail.
+		return protoreflect.ValueOfString(fmt.Sprintf("sample-%s-%d", fd.Name(), seed))
 	case protoreflect.BytesKind:
 		b := make([]byte, 8)
 		for i := range b {
@@ -70,7 +77,14 @@ func populate(t *testing.T, m protoreflect.Message, depth int) {
 		switch {
 		case fd.IsMap():
 			mp := m.Mutable(fd).Map()
-			for k := 0; k < 2; k++ {
+			// Enough entries that a non-deterministic iteration order is all but
+			// certain to show itself. Two entries in one Go map bucket agree by
+			// chance often enough to make a stability check flaky.
+			want := 8
+			if fd.MapKey().Kind() == protoreflect.BoolKind {
+				want = 2 // a bool key admits no more
+			}
+			for k := 0; k < want; k++ {
 				key := sampleScalar(t, fd.MapKey(), k).MapKey()
 				val := fd.MapValue()
 				if val.Kind() == protoreflect.MessageKind || val.Kind() == protoreflect.GroupKind {
@@ -82,6 +96,11 @@ func populate(t *testing.T, m protoreflect.Message, depth int) {
 				} else {
 					mp.Set(key, sampleScalar(t, val, k))
 				}
+			}
+			if mp.Len() != want {
+				t.Fatalf("populating map field %s produced %d entries, wanted %d: the generated "+
+					"keys collide, so any ordering test over this map would pass vacuously",
+					fd.FullName(), mp.Len(), want)
 			}
 		case fd.IsList():
 			list := m.Mutable(fd).List()
@@ -221,7 +240,7 @@ func TestDeterministicMarshalIsStable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
-			for k := 0; k < 8; k++ {
+			for k := 0; k < 32; k++ {
 				again, err := opts.Marshal(m.Interface())
 				if err != nil {
 					t.Fatalf("marshal %d: %v", k, err)
