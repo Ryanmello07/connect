@@ -215,6 +215,15 @@ func expandAuthKey(storageRoot []byte, info string) []byte {
 // that took that path — every record with an empty nonce, or with a class and bucket pair
 // the wire has no byte for — would carry the same mac under the same key. The file comment
 // argues the division between this half and the verifying half at length.
+//
+// What it panics on, since neither spec says and a published function that panics owes its
+// caller the list: ErrRecordHeaderNil for no header, ErrServerNonceEmpty for a nonce of no
+// octets, ErrServerAttachmentMismatch for an attachment argument that disagrees with the
+// header's, and the join's own ErrEphBucketOnNonEphClass, ErrEphBucketOutOfRange or
+// ErrRetentionClassUnknown for a class and bucket pair the wire has no octet for. The panic
+// value is the wrapped sentinel in every case, so a caller that recovers names what it caught
+// with errors.Is instead of matching on message text — which is guardrail G7 of spec A section
+// 5.9 read through a panic rather than through a return.
 func WriteAuthPreimage(serverNonce []byte, h *RecordHeader, ctHead []byte, serverAttachment []byte) []byte {
 	preimage, err := writeAuthPreimage(serverNonce, h, ctHead, serverAttachment)
 	if err != nil {
@@ -282,6 +291,10 @@ func writeAuthPreimage(serverNonce []byte, h *RecordHeader, ctHead []byte, serve
 // It is the last step of the construction order spec A section 5.2 makes a type: the body is
 // sealed, body_hash is taken, the header is complete, ct_head is sealed, and only then is
 // there a preimage to mac. Every dependency is acyclic and this is the end of the chain.
+//
+// It panics on everything WriteAuthPreimage panics on, which its comment lists, and on one
+// more of its own: ErrAuthKeyLength for a write key that is not thirty two octets, which a
+// lookup that missed and answered nil arrives at. The panic value is the wrapped sentinel.
 func ComputeWriteAuth(writeKey []byte, serverNonce []byte, h *RecordHeader, ctHead []byte, serverAttachment []byte) [32]byte {
 	return mustAuthTag(writeKey, WriteAuthPreimage(serverNonce, h, ctHead, serverAttachment))
 }
@@ -332,7 +345,8 @@ func VerifyWriteAuth(writeKey []byte, serverNonce []byte, r *Record) bool {
 // so the server selects a key by an authenticated value rather than by a hint beside one.
 //
 // It panics on a refusal for the reason WriteAuthPreimage does, and the file comment argues
-// it.
+// it. There is one refusal here — ErrServerNonceEmpty, for a nonce of no octets — and the panic
+// value is the wrapped sentinel, so a caller that recovers can name it with errors.Is.
 func RequestAuthPreimage(serverNonce []byte, op uint8, requestBytes []byte) []byte {
 	preimage, err := requestAuthPreimage(serverNonce, op, requestBytes)
 	if err != nil {
@@ -365,6 +379,9 @@ func requestAuthPreimage(serverNonce []byte, op uint8, requestBytes []byte) ([]b
 // request the server cannot resolve for any member that was offline across a commit for more
 // than sixty seconds, which is every member the read key exists for.
 // TestReadAuthNeverUsesWriteKey walks the call graph from here and asserts it.
+//
+// It panics on an empty nonce with ErrServerNonceEmpty and on a read key that is not thirty two
+// octets with ErrAuthKeyLength, in both cases with the wrapped sentinel as the panic value.
 func ComputeRequestAuth(readKey []byte, serverNonce []byte, op uint8, requestBytes []byte) [32]byte {
 	return mustAuthTag(readKey, RequestAuthPreimage(serverNonce, op, requestBytes))
 }

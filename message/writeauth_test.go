@@ -24,21 +24,35 @@
 // asserted as well — the fields of Record that must leave the tag alone, record_id among
 // them, are computed as the ones the covered set does not name.
 //
-// The rejection tests are the same class turned around, plus the one class the vectors
-// cannot reach at all: every single bit of the tag, flipped, in all two hundred and fifty
-// six positions.
+// The rejection tests are the same class turned around, plus the two classes the vectors
+// cannot reach at all: every single bit of the tag, flipped, in all two hundred and fifty six
+// positions, and the tags an attacker picks rather than computes. That second one is where the
+// two verifiers stopped being observed. Every rejection test written first pairs a correct-key
+// correct-preimage tag with a refused input and gets a mismatch — which a verifier that had
+// discarded the error and computed something else entirely also produces, by luck, because what
+// it computed is not what it was offered either. What observes the discarded error is the tag
+// that verifier would have computed: the zero tag under a key it refused, and the mac of the
+// empty preimage under an input that has none. Both are pinned, and both are what
+// TestNoTagVerifiesUnderAKeyThatIsNotThirtyTwoOctets and TestNoTagVerifiesOnAnInputThatHasNoPreimage
+// are for.
 //
-// Two gates read the syntax tree. The constant time gate is guardrail G8 of spec A section
-// 5.9, and its class is computed — every function in this package's production files whose
-// name begins with Verify — rather than the three file names the guardrail's own text
-// happens to list. TestReadAuthNeverUsesWriteKey is section 5.7's own obligation, and that
-// section says how it is to be met: by walking the call graph of ComputeRequestAuth. It is
-// a real walk, transitive, over edges read out of the syntax tree, and the class of things
-// it looks for is computed too — a write key deriver is any function that names the
-// "write/v1" label, by literal or through a constant, so a second deriver added later is in
-// the class on the day it is written. Both gates have a positive control under testdata,
-// because a gate that reports nothing because it is broken reports exactly what a gate that
-// reports nothing because the package is clean reports.
+// Four gates read the syntax tree, and every class any of them runs over is computed. Three are
+// guardrail G8 of spec A section 5.9. The place the guardrail names is every production file of
+// the package rather than the three file names its text happens to list, and the comparators it
+// bans there are derived from the source of the packages this code imports rather than written
+// down — the enumeration that stood here held six names and did not hold bytes.HasPrefix, which
+// leaks more than bytes.Equal does. The functions the other two run over are computed as well:
+// every function whose name begins with Verify. For those two the ban has no bounds at all —
+// nothing outside this package is called but the constant time comparison — because a class
+// derived from signatures still has a shape, and bytes.Cut and fmt.Sprint are outside it.
+// The fourth is TestReadAuthNeverUsesWriteKey, section 5.7's own obligation, and that section
+// says how it is to be met: by walking the call graph of ComputeRequestAuth. It is a real walk,
+// transitive, over edges read out of the syntax tree, and the class of things it looks for is
+// computed too — a write key deriver is any function that names the "write/v1" label, by
+// literal or through a constant, so a second deriver added later is in the class on the day it
+// is written. Every one of the four has a positive control under testdata, because a gate that
+// reports nothing because it is broken reports exactly what a gate that reports nothing because
+// the package is clean reports.
 //
 // What the gates do not see is stated where each one is defined rather than here, because a
 // gate whose blind spots are only in a summary is a gate whose blind spots are not read.
@@ -2560,8 +2574,14 @@ func TestTheConstantTimeGateFlagsTheControlFixture(t *testing.T) {
 		}
 	}
 	// and it does not hold everything it read: the packages the fixture imports are full of
-	// functions that are not comparators
-	for _, notAComparator := range []string{"bytes.NewReader", "bytes.Repeat", "strings.Join", "slices.Sort", "fmt.Errorf", "fmt.Sprint"} {
+	// functions that are not comparators. The second row is the one that holds the classifier
+	// to answering a question rather than to taking two arguments: every one of them takes two
+	// byte strings and hands back a third, which is a transformation and not a decision, and a
+	// classifier that stopped reading the result type would swallow the lot.
+	for _, notAComparator := range []string{
+		"bytes.NewReader", "bytes.Repeat", "strings.Join", "slices.Sort", "fmt.Errorf", "fmt.Sprint",
+		"bytes.Replace", "bytes.Split", "bytes.TrimPrefix", "bytes.Join", "strings.Replace", "strings.Split", "strings.TrimSuffix",
+	} {
 		if slices.Contains(comparators, notAComparator) {
 			t.Errorf("the derived class holds %s, which answers no question about two byte strings; a class that flags everything bans nothing",
 				notAComparator)
