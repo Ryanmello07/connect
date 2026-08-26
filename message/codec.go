@@ -49,13 +49,18 @@
 // that the two are the same list.
 //
 // That second one is a statement about this file and not about the package, and the
-// difference matters because the allowlist test spec A section 12.1 describes enumerates
-// the package. The refusals below are the sentinels in errors.go and those are exported:
-// section 5.9 guardrail 7 requires every failure here to be a typed error, and a typed
-// error the server cannot name is one it can only match on message text. Both section
-// 12.1 blocks listed functions and types and no errors, so the nine of them were added
+// difference matters because of what the allowlist test spec A section 12.1 describes
+// asserts: the names in that block, which are what the server may reach, and not the set
+// this package exports. Amendments A-9 and B-9 say so in as many words, and aad.go is the
+// standing example — it exports the two preimage builders of master section 8, both
+// deliberately on no line of section 12.1, because a server that never decrypts never
+// builds either. The refusals below are the sentinels in errors.go and nine of those are
+// on the block: section 5.9 guardrail 7 requires every failure here to be a typed error,
+// and a typed error the server cannot name is one it can only match on message text. Both
+// section 12.1 blocks listed functions and types and no errors, so the nine were added
 // there as amendments A-8 and B-8. The two lists are still the same list; the way to keep
-// them that way is to amend the block, not to leave a name off it.
+// them that way is to amend the block the day something on it can return a name the block
+// does not carry, not to leave the name off.
 package message
 
 import (

@@ -17,23 +17,27 @@
 // value worth naming, so errors.Is holds for the caller while the message still carries
 // the byte or the bucket that was refused.
 //
-// Every name here is on spec A section 12.1's published surface, which is the surface the
-// allowlist test in the message server repo enumerates, and spec B section 12.1 restates
-// it. They were not on it originally — that block listed functions and types and no
+// Nine of the names below are on spec A section 12.1's published surface, which is the
+// surface the allowlist test in the message server repo asserts, and spec B section 12.1
+// restates it. They were not on it originally — that block listed functions and types and no
 // errors — and they were added as amendments A-8 and B-8 rather than kept internal,
 // because the guardrail above only means anything if the caller can name what it caught:
 // an error a server cannot name is one it can only match on message text.
 //
-// The rule for a sentinel added later follows from that reason rather than from the count.
-// A sentinel the server can provoke is an addition to the published surface and belongs in
-// the same commit as the amendment that publishes it. A sentinel only a function the
-// server never calls can reach is not: publishing it would widen the allowlist of section
-// 12.1 with a name no server can use, and that block is an allowlist of what the server
-// may reach and not an inventory of this package. The last two below are of that kind —
-// ErrRecordHeaderNil and ErrServerAttachmentMismatch are AADHead's, and AADHead is a
-// sealing side builder that never appears on the server's surface, which holds verifiers
-// and no builders at all. If one of them ever becomes reachable from a published function,
-// it stops being of that kind and the amendment is owed.
+// The rule for a sentinel added later is section 12.1's own rather than this file's, and it
+// is reachability and not the count: amendments A-9 and B-9 of 2026-08-25 say so, in the
+// two blocks the rule governs. That block is the allowlist of what the server may reach
+// and not an inventory of what this package exports — it carries no preimage builder
+// either, and aad.go exports two — so a sentinel a published function can return is an
+// addition to the published surface and belongs in the same commit as the amendment that
+// publishes it, while a sentinel only an unpublished function can reach is not, because
+// publishing it would widen the server's allowlist with a name no server can use.
+//
+// The last two below are of that kind. ErrRecordHeaderNil and ErrServerAttachmentMismatch
+// are AADHead's, AADHead builds the aad_head preimage of master section 8 and is on no
+// line of section 12.1, and the server never decrypts, so it never builds either preimage.
+// If one of them ever becomes reachable from a published function it stops being of that
+// kind, and the amendment that publishes it lands with the change that made it reachable.
 package message
 
 import "errors"
