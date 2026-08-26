@@ -1331,8 +1331,21 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 	} {
 		covered = append(covered, testCase.name)
 		tagging := &taggingCryptoProvider{inner: plain}
-		overTheRealProvider := testCase.call(plain)
-		overTheTaggingProvider := testCase.call(tagging)
+		// each call is made with a panic caught rather than taken. A defect in a construction
+		// swept here panics on inputs this test chose, and an uncaught one takes the test
+		// BINARY down: this test is reported as the single failure of the run, every test
+		// declared after it never runs, and the key schedule's own gates report nothing at
+		// all. Measured, not supposed -- see recoveringRow in key_schedule_test.go.
+		overTheRealProvider, raised := recoveringRow(func() []byte { return testCase.call(plain) })
+		if raised != nil {
+			t.Errorf("%s panicked with %v rather than answering", testCase.name, raised)
+			continue
+		}
+		overTheTaggingProvider, raised := recoveringRow(func() []byte { return testCase.call(tagging) })
+		if raised != nil {
+			t.Errorf("%s panicked with %v over the tagging provider; it called %v", testCase.name, raised, tagging.calls)
+			continue
+		}
 		if len(overTheRealProvider) == 0 {
 			t.Errorf("%s answered with nothing, so this row observed nothing", testCase.name)
 			continue

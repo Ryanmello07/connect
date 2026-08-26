@@ -29,6 +29,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -40,6 +41,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -120,38 +122,12 @@ func TestZeroizeSecretAcceptsNilAndEmpty(t *testing.T) {
 	zeroizeSecret(make([]byte, 0, 16))
 }
 
-// secretZeroizeFile is the file the erase helpers live in. The gate below reads the file
-// rather than naming zeroizeSecret, because the rule is a property of what that file is
-// for — a store the caller drops immediately afterwards — and not of one name. A second
-// erase helper landing beside it is held to the same rule without anyone remembering to
-// extend a list.
-const secretZeroizeFile = "secret_zeroize.go"
-
 // noInlineDirective is the compiler directive, matched as a whole line. secret_zeroize.go
 // argues from the directive by name twice in prose, so a substring search over the file is
 // answered by the argument for the directive rather than by the directive, and deleting
 // the line leaves both mentions behind. That is why this is compared against a comment of
 // the syntax tree, and against the whole of it.
 const noInlineDirective = "//go:noinline"
-
-// noInlineControl holds one of each shape the matcher has to tell apart: the directive
-// present, the directive named only in prose, and no doc comment at all. Without it a
-// matcher that had stopped matching — a doc group no longer populated because the parse
-// dropped comments — would report the source clean and pass, which is the one outcome a
-// gate must never be able to reach by accident.
-const noInlineControl = "package control\n" +
-	"\n" +
-	"// erasedWithTheDirective is what this gate wants: the directive on a line of its own,\n" +
-	"// contiguous with the declaration.\n" +
-	"//\n" +
-	"//go:noinline\n" +
-	"func erasedWithTheDirective(secret []byte) {}\n" +
-	"\n" +
-	"// erasedWithOnlyProse argues from the noinline directive and does not carry it. This is\n" +
-	"// the shape a search for the text noinline cannot tell from the one above.\n" +
-	"func erasedWithOnlyProse(secret []byte) {}\n" +
-	"\n" +
-	"func erasedWithNoDocAtAll(secret []byte) {}\n"
 
 // carriesTheNoInlineDirective reports whether a doc group holds the directive as one of
 // its own lines. The text is trimmed because this repository is checked out with
@@ -169,65 +145,327 @@ func carriesTheNoInlineDirective(doc *ast.CommentGroup) bool {
 	return false
 }
 
-// functionsWithoutTheNoInlineDirective names every function a parsed file declares whose
-// doc comment does not carry the directive, in declaration order.
-func functionsWithoutTheNoInlineDirective(file *ast.File) []string {
-	missing := []string{}
-	for _, declaration := range file.Decls {
-		function, isFunction := declaration.(*ast.FuncDecl)
-		if !isFunction {
+// mustParseCommented is the shared parse with the doc comments kept.
+//
+// mustParseSource drops them, because every other gate in this package reads statements
+// and types rather than prose. The matcher below reads a compiler directive, which lives
+// in a doc comment and nowhere else, and over a tree parsed without comments it would
+// answer "absent" for every function in the package -- a gate that reports the whole
+// source in violation rather than one that reads it. Its own control is what says the
+// difference is being seen.
+func mustParseCommented(t *testing.T, name string, source string) parsedSource {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, name, source, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", name, err)
+	}
+	return parsedSource{fileSet: fileSet, file: file}
+}
+
+// mustReadCommented is the same over one file of this package's source on disk.
+func mustReadCommented(t *testing.T, path string) parsedSource {
+	t.Helper()
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return mustParseCommented(t, path, string(source))
+}
+
+// rootIdentifierOf reduces the target of a write to the name whose array is written
+// through, so secret[i], secret[1:][i] and (secret)[i] all report secret.
+//
+// Without it a write spelled through a reslice sits outside the matcher below while landing
+// on exactly the same bytes, which is the shape an erase helper would take on the day
+// somebody wanted one this gate did not see.
+func rootIdentifierOf(expr ast.Expr) string {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name
+	case *ast.ParenExpr:
+		return rootIdentifierOf(typed.X)
+	case *ast.IndexExpr:
+		return rootIdentifierOf(typed.X)
+	case *ast.SliceExpr:
+		return rootIdentifierOf(typed.X)
+	}
+	return ""
+}
+
+// byteSlicesHandedTo names the receiver and parameters of one declaration that are storage
+// somebody else owns: a []byte, or one of this package's own names for a []byte.
+//
+// The named types are read rather than the spelling []byte alone, because HpkePrivateKey is
+// the same array to the compiler and an eraser written over one is the same eraser.
+func byteSlicesHandedTo(parsed parsedSource, function *ast.FuncDecl, named []string) []string {
+	fields := []*ast.Field{}
+	if function.Recv != nil {
+		fields = append(fields, function.Recv.List...)
+	}
+	if function.Type.Params != nil {
+		fields = append(fields, function.Type.Params.List...)
+	}
+	handed := []string{}
+	for _, field := range fields {
+		rendered := parsed.render(field.Type)
+		if rendered != "[]byte" && !slices.Contains(named, rendered) {
 			continue
 		}
+		for _, name := range field.Names {
+			if name.Name != "_" {
+				handed = append(handed, name.Name)
+			}
+		}
+	}
+	return handed
+}
+
+// namesReachingTheSameStorage extends a set of names by the locals cut from them, to a
+// fixed point.
+//
+// A local assigned from a parameter, or from a reslice of one, is the caller's array under
+// another name, and an erase written through it is the same erase. One hop is the shape
+// that actually gets written -- window := secret[n:] -- and the fixed point follows a chain
+// of them. A local built by make or by bytes.Clone roots at a call rather than at a name and
+// is correctly not added: that is storage of the function's own.
+func namesReachingTheSameStorage(function *ast.FuncDecl, handed []string) []string {
+	reaching := map[string]bool{}
+	for _, name := range handed {
+		reaching[name] = true
+	}
+	for {
+		grew := false
+		ast.Inspect(function, func(node ast.Node) bool {
+			assignment, isAssignment := node.(*ast.AssignStmt)
+			if !isAssignment || len(assignment.Lhs) != len(assignment.Rhs) {
+				return true
+			}
+			for i, right := range assignment.Rhs {
+				root := rootIdentifierOf(right)
+				if root == "" || !reaching[root] {
+					continue
+				}
+				target, isBare := assignment.Lhs[i].(*ast.Ident)
+				if !isBare || target.Name == "_" || reaching[target.Name] {
+					continue
+				}
+				reaching[target.Name] = true
+				grew = true
+			}
+			return true
+		})
+		if !grew {
+			return slices.Sorted(maps.Keys(reaching))
+		}
+	}
+}
+
+// namesWrittenThrough is the subset of those a body writes INTO rather than reads,
+// reslices or passes on.
+//
+// Three spellings reach somebody else's array: an index assignment or an increment of one,
+// the clear builtin, and copy with the name as its destination. Rebinding the header --
+// secret = something -- is deliberately not one of them: it moves the local name and leaves
+// the caller's bytes exactly as they were.
+func namesWrittenThrough(function *ast.FuncDecl, reaching []string) []string {
+	written := map[string]bool{}
+	mark := func(target ast.Expr) {
+		if root := rootIdentifierOf(target); root != "" && slices.Contains(reaching, root) {
+			written[root] = true
+		}
+	}
+	ast.Inspect(function, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.AssignStmt:
+			for _, target := range typed.Lhs {
+				if _, isIndex := target.(*ast.IndexExpr); isIndex {
+					mark(target)
+				}
+			}
+		case *ast.IncDecStmt:
+			if _, isIndex := typed.X.(*ast.IndexExpr); isIndex {
+				mark(typed.X)
+			}
+		case *ast.CallExpr:
+			builtin, isName := typed.Fun.(*ast.Ident)
+			if isName && len(typed.Args) != 0 && (builtin.Name == "clear" || builtin.Name == "copy") {
+				mark(typed.Args[0])
+			}
+		}
+		return true
+	})
+	return slices.Sorted(maps.Keys(written))
+}
+
+// eraseHelpersIn names the functions one parsed file declares that write through storage
+// their caller owns, and which of those do not carry the directive.
+func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
+	helpers := []string{}
+	missing := []string{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		handed := byteSlicesHandedTo(parsed, function, named)
+		if len(handed) == 0 {
+			continue
+		}
+		if len(namesWrittenThrough(function, namesReachingTheSameStorage(function, handed))) == 0 {
+			continue
+		}
+		helpers = append(helpers, function.Name.Name)
 		if !carriesTheNoInlineDirective(function.Doc) {
 			missing = append(missing, function.Name.Name)
 		}
 	}
-	return missing
+	return helpers, missing
 }
 
+// eraseHelperControl holds one of each shape the matchers have to tell apart: the four
+// spellings that reach a caller's array, a write into storage the function made for itself,
+// a read of a parameter, a rebinding of one, a function handed no bytes at all, the
+// directive present, and the directive named only in prose.
+//
+// Without it a matcher that had stopped matching -- a parse that dropped comments, a walk
+// that stopped descending into bodies, a type filter that stopped seeing named storage --
+// would report the real source clean and pass, which is the one outcome a gate must never
+// be able to reach by accident.
+const eraseHelperControl = "package control\n" +
+	"\n" +
+	"type ControlKey []byte\n" +
+	"\n" +
+	"// erasedWithTheDirective is what this gate wants: a write through a parameter, with\n" +
+	"// the directive on a line of its own.\n" +
+	"//\n" +
+	"//go:noinline\n" +
+	"func erasedWithTheDirective(secret []byte) {\n" +
+	"\tfor i := range secret {\n" +
+	"\t\tsecret[i] = 0\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"// erasedWithOnlyProse argues from the noinline directive and does not carry it. This\n" +
+	"// is the shape a search for the text noinline cannot tell from the one above.\n" +
+	"func erasedWithOnlyProse(secret []byte) {\n" +
+	"\tfor i := range secret {\n" +
+	"\t\tsecret[i] = 0\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"func erasedThroughALocalCutFromTheParameter(secret []byte) {\n" +
+	"\twindow := secret[1:]\n" +
+	"\twindow[0] = 0\n" +
+	"}\n" +
+	"\n" +
+	"func erasedWithClearOverNamedStorage(key ControlKey) {\n" +
+	"\tclear(key)\n" +
+	"}\n" +
+	"\n" +
+	"func erasedWithCopy(secret []byte) {\n" +
+	"\tcopy(secret, make([]byte, len(secret)))\n" +
+	"}\n" +
+	"\n" +
+	"func writesOnlyIntoStorageOfItsOwn(secret []byte) []byte {\n" +
+	"\tout := make([]byte, len(secret))\n" +
+	"\tcopy(out, secret)\n" +
+	"\tout[0] = 0\n" +
+	"\treturn out\n" +
+	"}\n" +
+	"\n" +
+	"func readsAParameter(secret []byte) byte {\n" +
+	"\treturn secret[0]\n" +
+	"}\n" +
+	"\n" +
+	"func rebindsAParameter(secret []byte) []byte {\n" +
+	"\tsecret = nil\n" +
+	"\treturn secret\n" +
+	"}\n" +
+	"\n" +
+	"func takesNoBytesAtAll(count int) int {\n" +
+	"\treturn count + 1\n" +
+	"}\n"
+
 // TestEveryEraseHelperCarriesTheNoInlineDirective observes the one mechanism
-// secret_zeroize.go's argument rests on.
+// secret_zeroize.go's argument rests on, over every function this package declares rather
+// than over one file of it.
 //
 // What that file claims is that the stores reach memory. A compiler may delete a write to
 // memory it can prove is never read again, and in a caller that drops the secret straight
 // afterwards these writes are exactly that; across a call it cannot inline it cannot make
-// the proof. So the directive is not decoration, it is the whole mechanism — and before
-// this test, deleting the line changed nothing any test could see.
+// the proof. So the directive is not decoration, it is the whole mechanism.
 //
-// The honest limit, stated rather than hidden: no go test can observe an elision, so this
-// asserts the presence of the mechanism and not the effect. That is a proxy. It is the
-// proxy the file's own argument is made of, which is why its absence has to fail here.
+// The class is what a function DOES and not where it is written. The version this replaces
+// parsed secret_zeroize.go by name, while its own comment claimed that "a second erase
+// helper landing beside it is held to the same rule without anyone remembering to extend a
+// list" -- true of a helper landing beside it and false of one landing anywhere else.
+// Measured, not supposed: the identical helper declared in key_schedule.go and used to
+// erase member_secret left that gate silent, and with the one line exemption a contributor
+// would copy verbatim from zeroizeSecret's own row in packageConstructionsOverBorrowedBytes
+// the whole package was green -- with member_secret erased by a helper the compiler is
+// entitled to inline and elide.
+//
+// Why "writes through storage its caller owns" is the same set as "erases a secret" here
+// rather than a wider one: a construction of this package that writes into an array it was
+// handed and is NOT an eraser is already forbidden, by
+// TestEveryConstructionInThisPackageLeavesItsInputAlone, whose own excuse for zeroizeSecret
+// is that writing into the caller's array is the function. The two gates meet on exactly
+// this class, which is why neither of them has to name it.
+//
+// Two honest limits, stated rather than hidden. No go test can observe an elision, so this
+// asserts the presence of the mechanism and not the effect -- the proxy the file's own
+// argument is made of. And the write has to be spelled through the parameter or through a
+// local cut from it; an array reached through a struct field, or handed on to a function
+// declared elsewhere, is past what a syntax matcher can follow, and neither is a shape an
+// erase helper has any reason to take.
 func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
-	fileSet := token.NewFileSet()
-	control, err := parser.ParseFile(fileSet, "noinline_control.go", noInlineControl,
-		parser.ParseComments|parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse the control: %v", err)
+	control := mustParseCommented(t, "the erase helper control", eraseHelperControl)
+	helpers, missing := eraseHelpersIn(control, []string{"ControlKey"})
+	wantHelpers := []string{
+		"erasedWithTheDirective",
+		"erasedWithOnlyProse",
+		"erasedThroughALocalCutFromTheParameter",
+		"erasedWithClearOverNamedStorage",
+		"erasedWithCopy",
 	}
-	want := []string{"erasedWithOnlyProse", "erasedWithNoDocAtAll"}
-	if got := functionsWithoutTheNoInlineDirective(control); !slices.Equal(got, want) {
-		t.Fatalf("the matcher read %v out of the control, want %v; it is not telling the directive from the prose that argues for it",
-			got, want)
+	if !slices.Equal(helpers, wantHelpers) {
+		t.Fatalf("the matcher read %v out of the control as erase helpers, want %v; it is not telling a write through the caller's array from a read of one or from a write into storage of the function's own",
+			helpers, wantHelpers)
+	}
+	wantMissing := []string{
+		"erasedWithOnlyProse",
+		"erasedThroughALocalCutFromTheParameter",
+		"erasedWithClearOverNamedStorage",
+		"erasedWithCopy",
+	}
+	if !slices.Equal(missing, wantMissing) {
+		t.Fatalf("the matcher read %v out of the control as missing the directive, want %v; it is not telling the directive from the prose that argues for it",
+			missing, wantMissing)
 	}
 
-	parsed, err := parser.ParseFile(fileSet, secretZeroizeFile, nil,
-		parser.ParseComments|parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", secretZeroizeFile, err)
-	}
-	declared := 0
-	for _, declaration := range parsed.Decls {
-		if _, isFunction := declaration.(*ast.FuncDecl); isFunction {
-			declared++
+	named := packageByteSliceTypeNames(t)
+	found := []string{}
+	unprotected := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		declared, without := eraseHelpersIn(mustReadCommented(t, path), named)
+		found = append(found, declared...)
+		for _, name := range without {
+			unprotected = append(unprotected, path+": "+name)
 		}
 	}
-	if declared == 0 {
-		t.Fatalf("%s declares no function, so this gate examined nothing", secretZeroizeFile)
+	// the positive control on the real source. This package certainly declares one erase
+	// helper, and a scan that had stopped finding it would report the same clean run a
+	// complete one reports.
+	if !slices.Contains(found, "zeroizeSecret") {
+		t.Fatalf("the scan read %v as this package's erase helpers and zeroizeSecret is not among them, so it is not reading what it claims to",
+			found)
 	}
-	if missing := functionsWithoutTheNoInlineDirective(parsed); len(missing) != 0 {
-		t.Errorf("%s declares %v without a %s line of their own; that directive is the only thing between these stores and a compiler entitled to delete them, and the file's own comment says so",
-			secretZeroizeFile, missing, noInlineDirective)
+	if len(unprotected) != 0 {
+		t.Errorf("%v write through storage their caller owns without a %s line of their own; that directive is the only thing between these stores and a compiler entitled to delete them, and secret_zeroize.go's own comment says so",
+			unprotected, noInlineDirective)
 	}
+	t.Logf("%d erase helpers read out of this package's source: %v", len(found), found)
 }
 
 // keyScheduleErrorsFile is the single file this plan declares its typed errors in. Every
@@ -1021,6 +1259,53 @@ func (self *wideKdfProvider) ExpandWithLabel(secret []byte, label string, contex
 	return out
 }
 
+// The rest of the hash and kdf surface, at the same width.
+//
+// A provider that answered KDF.Nh 48 and went on hashing at 32 would be incoherent, and the
+// differential gate below reads output LENGTHS: over such a provider RefHash would answer 32
+// bytes while the provider claimed 48, and the gate would report a construction that reads
+// its length off the provider as one that writes 32 down. Everything Nh governs therefore
+// moves together, and nothing here is a fake answering the right number of bytes -- it is
+// SHA-384 and HMAC-SHA384 and HKDF-SHA384, the same primitives one width up.
+//
+// KeySize and NonceSize are deliberately NOT overridden. Nk and Nn are the aead's and have
+// nothing to do with the kdf, and a suite whose hash grew does not thereby get a wider aead
+// key; moving them would make this provider incoherent in the other direction.
+func (self *wideKdfProvider) Hash(data []byte) []byte {
+	digest := sha512.Sum384(data)
+	return digest[:]
+}
+
+func (self *wideKdfProvider) Mac(key []byte, data []byte) []byte {
+	mac := hmac.New(sha512.New384, key)
+	mac.Write(data)
+	return mac.Sum(nil)
+}
+
+func (self *wideKdfProvider) MacVerify(key []byte, data []byte, tag []byte) bool {
+	expected := self.Mac(key, data)
+	if len(tag) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(expected, tag) == 1
+}
+
+func (self *wideKdfProvider) Expand(prk []byte, info []byte, length int) []byte {
+	out, err := hkdf.Expand(sha512.New384, prk, string(info), length)
+	if err != nil {
+		panic("mls test: hkdf-sha384 expand: " + err.Error())
+	}
+	return out
+}
+
+// DeriveSecret is ExpandWithLabel over no context at KDF.Nh, which is the definition
+// RFC 9420 gives it and what crypto_labels.go writes. Routed through this type's own
+// ExpandWithLabel so the width follows HashSize rather than being written down twice, and so
+// the requested lengths are recorded here as well.
+func (self *wideKdfProvider) DeriveSecret(secret []byte, label string) []byte {
+	return self.ExpandWithLabel(secret, label, nil, self.HashSize())
+}
+
 // TestDeriveJoinerSecretReadsKdfNhFromTheProvider is the input the registered suites cannot
 // supply.
 //
@@ -1653,8 +1938,116 @@ func exposedByteSlices(t *testing.T, what string, result reflect.Value) [][]byte
 	return nil
 }
 
+// recoveringRow runs one row of a package wide sweep with a panic caught rather than taken.
+//
+// A sweep like the ones below calls production code with inputs the test chose, and a defect
+// that panics on one of them takes the test BINARY down: go reports the panicking test as
+// the single failure of the run, every test declared after it never runs, and every gate
+// those tests hold reports nothing at all. Measured, not supposed: deriving InitSecret from
+// the welcome_secret that is nil on the group creation path panicked inside
+// TestEveryConstructionHandedAProviderRoutesThroughIt, and a whole package run then reported
+// one failure in crypto_labels_test.go, 2325 fewer passes and nothing whatever about the key
+// schedule -- while the key schedule's own gates, run on their own, caught that same edit
+// three times over. A row that panics is a failure OF THAT ROW, and the rest of the package
+// still has to answer for itself.
+//
+// t.Fatalf inside the call is unaffected: it leaves the goroutine through runtime.Goexit
+// rather than through a panic, recover answers nil, and the exit goes on happening.
+//
+// recoveredPanic in crypto_test.go is the same guard for a call that answers nothing.
+func recoveringRow[T any](call func() T) (answer T, raised any) {
+	defer func() { raised = recover() }()
+	return call(), nil
+}
+
+// TestTheSweepRowRecoveryReturnsRatherThanTakingTheBinaryDown is the control on that.
+//
+// A recovery that had stopped recovering is invisible from every sweep that uses it: the
+// binary dies exactly as it did before, and the run reports one failure somewhere else. The
+// normal path is asserted alongside, because a helper that swallowed every answer would make
+// each of those sweeps compare nothing and report the clean run a working one reports.
+func TestTheSweepRowRecoveryReturnsRatherThanTakingTheBinaryDown(t *testing.T) {
+	answer, raised := recoveringRow(func() []byte { return []byte{0x11, 0x22} })
+	if raised != nil {
+		t.Errorf("a call that did not panic reported %v", raised)
+	}
+	if !bytes.Equal(answer, []byte{0x11, 0x22}) {
+		t.Errorf("a call that did not panic answered %x, want 1122", answer)
+	}
+	answer, raised = recoveringRow(func() []byte { panic("the row panicked") })
+	if raised == nil {
+		t.Fatal("a call that panicked reported no panic, so every sweep reading this recovery would still take the binary down")
+	}
+	if raised != "the row panicked" {
+		t.Errorf("the recovery reported %v rather than what was raised", raised)
+	}
+	if answer != nil {
+		t.Errorf("a call that panicked answered %x rather than nothing", answer)
+	}
+}
+
+// epochSecretOfTheEpoch states epoch_secret independently of the type under test, over the
+// corpus's own published inputs: Extract(joiner_secret, psk_secret) expanded under "epoch"
+// over the published GroupContext bytes.
+//
+// Independent is the point. A statement read off the schedule would agree with any schedule,
+// including one that hands the secret out.
+func epochSecretOfTheEpoch(t *testing.T, epoch ksVectorEpoch) []byte {
+	t.Helper()
+	return epoch.crypto.ExpandWithLabel(
+		epoch.crypto.Extract(
+			mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret), epoch.pskSecret),
+		"epoch", mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext),
+		epoch.crypto.HashSize())
+}
+
+// bytesTheScheduleHandsOut is every byte slice reachable through *KeySchedule's own exported
+// surface, with the names of the methods that were called.
+//
+// The class is the type's exported surface read by reflection, not a list of accessors
+// written here, so a method added later joins by existing. The exported fields are refused
+// outright: storage reachable without going through a method is storage this sweep would
+// never call for.
+func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([][]byte, []string) {
+	t.Helper()
+	scheduleType := reflect.TypeOf(schedule)
+	valueType := scheduleType.Elem()
+	for i := range valueType.NumField() {
+		if valueType.Field(i).IsExported() {
+			t.Fatalf("%s: KeySchedule has exported field %s, so its storage is reachable without going through a method this sweep reads",
+				at, valueType.Field(i).Name)
+		}
+	}
+
+	exposed := [][]byte{}
+	swept := []string{}
+	for i := range scheduleType.NumMethod() {
+		method := scheduleType.Method(i)
+		if method.Type.NumIn() != 1 {
+			if reason, excused := keyScheduleMethodsTakingArguments[method.Name]; !excused {
+				t.Fatalf("%s: (*KeySchedule).%s takes arguments and this sweep calls with none; give it arguments here or write down in keyScheduleMethodsTakingArguments why it cannot surface epoch_secret",
+					at, method.Name)
+			} else {
+				t.Logf("%s: (*KeySchedule).%s not swept: %s", at, method.Name, reason)
+			}
+			continue
+		}
+		swept = append(swept, method.Name)
+		for _, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)}) {
+			exposed = append(exposed,
+				exposedByteSlices(t, "(*KeySchedule)."+method.Name, result)...)
+		}
+	}
+	for name := range keyScheduleMethodsTakingArguments {
+		if _, found := scheduleType.MethodByName(name); !found {
+			t.Errorf("keyScheduleMethodsTakingArguments excuses %s, which *KeySchedule does not declare", name)
+		}
+	}
+	return exposed, swept
+}
+
 // TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret is guardrail G6 read as
-// behaviour rather than as a convention.
+// behaviour rather than as a convention, over the type's own surface.
 //
 // epoch_secret is the parent of all nine. A caller holding it holds confirmation_key and
 // membership_key — the two secrets that authenticate a commit — and every other secret the
@@ -1670,48 +2063,16 @@ func exposedByteSlices(t *testing.T, what string, result reflect.Value) [][]byte
 // and the sweep asserts it found the secrets it should find before concluding it did not
 // find the one it should not: a flattener that read nothing reports the same clean run as
 // one that read everything.
+//
+// This half covers what the TYPE hands out. What the PACKAGE hands out is a wider class and
+// is covered next door, by TestNoExportedFunctionOfThisPackageHandsOutTheEpochSecret: a free
+// function taking a *KeySchedule reaches the same unexported field and is nowhere in this
+// reflection.
 func TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret(t *testing.T) {
 	for _, epoch := range ksVectorEpochs(t) {
 		schedule := epoch.schedule(t)
-		epochSecret := epoch.crypto.ExpandWithLabel(
-			epoch.crypto.Extract(
-				mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret), epoch.pskSecret),
-			"epoch", mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext),
-			epoch.crypto.HashSize())
-
-		scheduleType := reflect.TypeOf(schedule)
-		valueType := scheduleType.Elem()
-		for i := range valueType.NumField() {
-			if valueType.Field(i).IsExported() {
-				t.Fatalf("%s: KeySchedule has exported field %s, so its storage is reachable without going through a method this sweep reads",
-					epoch.at, valueType.Field(i).Name)
-			}
-		}
-
-		exposed := [][]byte{}
-		swept := []string{}
-		for i := range scheduleType.NumMethod() {
-			method := scheduleType.Method(i)
-			if method.Type.NumIn() != 1 {
-				if reason, excused := keyScheduleMethodsTakingArguments[method.Name]; !excused {
-					t.Fatalf("%s: (*KeySchedule).%s takes arguments and this sweep calls with none; give it arguments here or write down in keyScheduleMethodsTakingArguments why it cannot surface epoch_secret",
-						epoch.at, method.Name)
-				} else {
-					t.Logf("%s: (*KeySchedule).%s not swept: %s", epoch.at, method.Name, reason)
-				}
-				continue
-			}
-			swept = append(swept, method.Name)
-			for _, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)}) {
-				exposed = append(exposed,
-					exposedByteSlices(t, "(*KeySchedule)."+method.Name, result)...)
-			}
-		}
-		for name := range keyScheduleMethodsTakingArguments {
-			if _, found := scheduleType.MethodByName(name); !found {
-				t.Errorf("keyScheduleMethodsTakingArguments excuses %s, which *KeySchedule does not declare", name)
-			}
-		}
+		epochSecret := epochSecretOfTheEpoch(t, epoch)
+		exposed, swept := bytesTheScheduleHandsOut(t, epoch.at, schedule)
 
 		// the controls: the sweep reached the surface, and the flattener really does
 		// return the bytes behind it. Without these an accessor that answered nothing,
@@ -1737,6 +2098,422 @@ func TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret(t *testing.T) {
 				t.Errorf("%s: the exported surface hands out epoch_secret at position %d of %d; it is the parent of every secret of this epoch and G6 says no exported symbol returns it",
 					epoch.at, index, len(exposed))
 			}
+		}
+	}
+}
+
+// epochSecretStorageField is the unexported field an epoch keeps its parent secret in.
+//
+// This names the SUBJECT of G6 and not the class G6 covers. The class — every exported
+// symbol through which a caller can reach that storage — is derived below, starting from
+// whichever type declares this field, so a free function nobody thought of joins it by
+// existing. A rename this cannot find is fatal rather than clean: a gate that lost its
+// subject reports exactly the clean run a complete one reports.
+const epochSecretStorageField = "epochSecret"
+
+// structTypesIn adds the named struct types one parsed file declares.
+func structTypesIn(parsed parsedSource, into map[string]*ast.StructType) {
+	for _, declaration := range parsed.file.Decls {
+		types, isTypeDeclaration := declaration.(*ast.GenDecl)
+		if !isTypeDeclaration || types.Tok != token.TYPE {
+			continue
+		}
+		for _, specification := range types.Specs {
+			named, isNamed := specification.(*ast.TypeSpec)
+			if !isNamed {
+				continue
+			}
+			if structure, isStruct := named.Type.(*ast.StructType); isStruct {
+				into[named.Name.Name] = structure
+			}
+		}
+	}
+}
+
+// identifiersNamedIn collects every bare identifier a type expression mentions, so *T, []T,
+// map[K]T, T[P] and func(T) all report T.
+//
+// A rendered string compared with strings.Contains would answer yes for a type whose name
+// merely contains another's, and no for one spelled across a line break.
+func identifiersNamedIn(expr ast.Expr) []string {
+	named := []string{}
+	ast.Inspect(expr, func(node ast.Node) bool {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
+			named = append(named, identifier.Name)
+		}
+		return true
+	})
+	return named
+}
+
+// theTypesHoldingTheEpochSecret is the closure over a set of named struct types of "keeps
+// the epoch secret": the type that declares the field, and any type with a field that
+// mentions one that does.
+//
+// A closure rather than the one declaring type, because a struct holding a *KeySchedule
+// hands its own holder the same storage, and an exported function taking one of those is
+// handed the epoch secret just as surely as one taking the schedule itself.
+func theTypesHoldingTheEpochSecret(structs map[string]*ast.StructType) []string {
+	holding := map[string]bool{}
+	for name, structure := range structs {
+		for _, field := range structure.Fields.List {
+			for _, declared := range field.Names {
+				if declared.Name == epochSecretStorageField {
+					holding[name] = true
+				}
+			}
+		}
+	}
+	for {
+		grew := false
+		for name, structure := range structs {
+			if holding[name] {
+				continue
+			}
+			for _, field := range structure.Fields.List {
+				for _, mentioned := range identifiersNamedIn(field.Type) {
+					if holding[mentioned] {
+						holding[name] = true
+						grew = true
+					}
+				}
+			}
+		}
+		if !grew {
+			return slices.Sorted(maps.Keys(holding))
+		}
+	}
+}
+
+// theExportedSurfaceReaching is every exported package level function of the parsed files
+// whose signature mentions one of those types, in either direction.
+//
+// Both directions, because both are ways an exported symbol comes to have an epoch secret
+// to give away: a parameter is handed one, and a result hands one out to be read further.
+// Methods are excluded and are not uncovered — the exported methods of a holder are swept by
+// reflection in the gate above, which is a reading of the compiled type rather than of its
+// source and therefore sees an embedded surface this parse would not.
+func theExportedSurfaceReaching(files []parsedSource, holders []string) []string {
+	reaching := []string{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil || !function.Name.IsExported() {
+				continue
+			}
+			fields := []*ast.Field{}
+			if function.Type.Params != nil {
+				fields = append(fields, function.Type.Params.List...)
+			}
+			if function.Type.Results != nil {
+				fields = append(fields, function.Type.Results.List...)
+			}
+			for _, field := range fields {
+				if slices.ContainsFunc(identifiersNamedIn(field.Type), func(name string) bool {
+					return slices.Contains(holders, name)
+				}) {
+					reaching = append(reaching, function.Name.Name)
+					break
+				}
+			}
+		}
+	}
+	slices.Sort(reaching)
+	return reaching
+}
+
+// packageLevelValuesNaming is every package level var or const of the parsed files whose
+// declared type, or whose initialiser, mentions one of those names.
+//
+// A standing value of a holder type would be an epoch secret reachable with no call at all,
+// so the sweep below could not see it however complete its rows were. This package declares
+// none and this is what says so.
+func packageLevelValuesNaming(files []parsedSource, holders []string) []string {
+	naming := []string{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			values, isValueDeclaration := declaration.(*ast.GenDecl)
+			if !isValueDeclaration || (values.Tok != token.VAR && values.Tok != token.CONST) {
+				continue
+			}
+			for _, specification := range values.Specs {
+				value, isValue := specification.(*ast.ValueSpec)
+				if !isValue {
+					continue
+				}
+				mentioned := []string{}
+				if value.Type != nil {
+					mentioned = append(mentioned, identifiersNamedIn(value.Type)...)
+				}
+				for _, initialiser := range value.Values {
+					mentioned = append(mentioned, identifiersNamedIn(initialiser)...)
+				}
+				if !slices.ContainsFunc(mentioned, func(name string) bool { return slices.Contains(holders, name) }) {
+					continue
+				}
+				for _, declared := range value.Names {
+					naming = append(naming, declared.Name)
+				}
+			}
+		}
+	}
+	slices.Sort(naming)
+	return naming
+}
+
+// epochSecretHolderControl declares one of each shape the derivation has to tell apart: the
+// struct that keeps the secret, a struct that reaches it through a pointer to that one, a
+// struct that keeps a byte slice under another name entirely, exported functions taking and
+// answering a holder, an unexported one, an exported one over something else, and a package
+// level value of a holder type.
+//
+// Without it a derivation that had stopped deriving — a parse that read no structs, a
+// closure that never seeded — would report an empty class, every gate reading it would
+// demand nothing, and the run would look exactly like the run of a complete one.
+const epochSecretHolderControl = "package control\n" +
+	"\n" +
+	"type Holder struct {\n" +
+	"\tcrypto      int\n" +
+	"\tepochSecret []byte\n" +
+	"}\n" +
+	"\n" +
+	"type Wrapper struct {\n" +
+	"\tinner *Holder\n" +
+	"}\n" +
+	"\n" +
+	"type Unrelated struct {\n" +
+	"\tsecret []byte\n" +
+	"}\n" +
+	"\n" +
+	"var TheStandingHolder = &Holder{}\n" +
+	"\n" +
+	"func ExportedOverTheHolder(holder *Holder) []byte {\n" +
+	"\treturn holder.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func ExportedOverTheWrapper(wrapper Wrapper) []byte {\n" +
+	"\treturn wrapper.inner.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func ExportedAnsweringAHolder(seed []byte) (*Holder, error) {\n" +
+	"\treturn nil, nil\n" +
+	"}\n" +
+	"\n" +
+	"func exportedNowhere(holder *Holder) []byte {\n" +
+	"\treturn holder.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func ExportedOverSomethingElse(unrelated *Unrelated) []byte {\n" +
+	"\treturn unrelated.secret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) Exported() []byte {\n" +
+	"\treturn nil\n" +
+	"}\n"
+
+// epochSecretHolderSweeps is how this gate reads a value of a type that keeps the epoch
+// secret. It is keyed by type name and checked against the derived closure in both
+// directions, so a second holder landing in this package fails here until somebody teaches
+// the sweep to read one rather than falling outside it in silence.
+var epochSecretHolderSweeps = map[string]func(t *testing.T, at string, value reflect.Value) [][]byte{
+	"KeySchedule": func(t *testing.T, at string, value reflect.Value) [][]byte {
+		t.Helper()
+		if value.IsNil() {
+			return nil
+		}
+		schedule, isSchedule := value.Interface().(*KeySchedule)
+		if !isSchedule {
+			t.Fatalf("%s: the sweep was handed a %s where a *KeySchedule belongs", at, value.Type())
+		}
+		exposed, _ := bytesTheScheduleHandsOut(t, at, schedule)
+		return exposed
+	},
+}
+
+// bytesTheAnswerHandsOut flattens everything one construction answered into the byte slices
+// a caller can read off it.
+//
+// A holder is read through its own exported surface, which is what makes a construction
+// answering a *KeySchedule cover the same ground as the reflection sweep. An error is
+// required to be nil rather than read: every row here is built out of the published corpus
+// and succeeds, so an error is this gate's own bug and not a place a secret hides.
+func bytesTheAnswerHandsOut(t *testing.T, at string, name string, results []reflect.Value) [][]byte {
+	t.Helper()
+	errorInterface := reflect.TypeOf((*error)(nil)).Elem()
+	exposed := [][]byte{}
+	for _, result := range results {
+		if result.Type() == errorInterface {
+			if !result.IsNil() {
+				t.Fatalf("%s%s answered %v, and the rows here are built out of the published corpus to succeed",
+					name, at, result.Interface())
+			}
+			continue
+		}
+		held := result.Type()
+		if held.Kind() == reflect.Pointer {
+			held = held.Elem()
+		}
+		if sweep, isHolder := epochSecretHolderSweeps[held.Name()]; isHolder {
+			exposed = append(exposed, sweep(t, at, result)...)
+			continue
+		}
+		exposed = append(exposed, exposedByteSlices(t, name+at, result)...)
+	}
+	return exposed
+}
+
+// epochSecretSurfaceRows calls each exported function that can reach an epoch secret and
+// hands back what it answered.
+//
+// The keys are held to the derived class in both directions by the gate below. That is what
+// closes the hole the type level sweep alone left: a package level
+// func EpochSecretOf(schedule *KeySchedule) []byte compiles, is exported, is exactly the leak
+// G6 forbids, and is nowhere in a reflection over (*KeySchedule)'s methods. Measured, not
+// supposed: appended to key_schedule.go it passed all 5132 tests of mls and message.
+//
+// NewKeyScheduleFromEpochSecret is driven with the independently derived epoch secret itself
+// rather than with an arbitrary sample, so the schedule under it holds the exact value the
+// comparison is looking for.
+var epochSecretSurfaceRows = map[string]func(t *testing.T, epoch ksVectorEpoch) []reflect.Value{
+	"NewKeySchedule": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
+		schedule, err := NewKeySchedule(
+			epoch.crypto, epoch.initPrev, epoch.commitSecret, epoch.pskSecret, epoch.groupContext)
+		return []reflect.Value{reflect.ValueOf(schedule), reflect.ValueOf(&err).Elem()}
+	},
+	"NewKeyScheduleFromJoiner": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
+		joinerSecret := mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret)
+		schedule, err := NewKeyScheduleFromJoiner(
+			epoch.crypto, joinerSecret, epoch.pskSecret, epoch.groupContext)
+		return []reflect.Value{reflect.ValueOf(schedule), reflect.ValueOf(&err).Elem()}
+	},
+	"NewKeyScheduleFromEpochSecret": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
+		schedule, err := NewKeyScheduleFromEpochSecret(
+			epoch.crypto, epochSecretOfTheEpoch(t, epoch), epoch.groupContext)
+		return []reflect.Value{reflect.ValueOf(schedule), reflect.ValueOf(&err).Elem()}
+	},
+}
+
+// TestNoExportedFunctionOfThisPackageHandsOutTheEpochSecret is the other half of guardrail
+// G6: what the PACKAGE hands out, rather than what the type does.
+//
+// The gate above sweeps (*KeySchedule)'s own reflected surface, and epoch_secret is an
+// unexported field, so every symbol declared in package mls can read it — a free function
+// most of all. Measured, not supposed: with
+// func EpochSecretOf(schedule *KeySchedule) []byte { return schedule.epochSecret } appended
+// to key_schedule.go, all 5132 tests of mls and message passed. The one other package wide
+// gate that might have seen it, TestEveryConstructionInThisPackageLeavesItsInputAlone,
+// collects the constructions that are HANDED bytes, and that one takes only a schedule.
+//
+// So the class here is derived rather than reflected: every exported package level function
+// whose signature mentions a type that keeps the epoch secret, read off the parse tree, with
+// the holder types themselves derived by closure from whichever struct declares the storage.
+// A function added later joins by existing and fails this until somebody writes the row that
+// reads what it answers.
+func TestNoExportedFunctionOfThisPackageHandsOutTheEpochSecret(t *testing.T) {
+	// the control first: the closure seeds, follows one hop, and the surface filter tells
+	// an exported function over a holder from an unexported one and from an exported one
+	// over something else
+	control := mustParseText(t, "the epoch secret holder control", epochSecretHolderControl)
+	controlStructs := map[string]*ast.StructType{}
+	structTypesIn(control, controlStructs)
+	controlHolders := theTypesHoldingTheEpochSecret(controlStructs)
+	if want := []string{"Holder", "Wrapper"}; !slices.Equal(controlHolders, want) {
+		t.Fatalf("the closure read %v out of the control as holding the epoch secret, want %v; it is not seeding on the storage or not following a reference to it",
+			controlHolders, want)
+	}
+	controlSurface := theExportedSurfaceReaching([]parsedSource{control}, controlHolders)
+	wantSurface := []string{"ExportedAnsweringAHolder", "ExportedOverTheHolder", "ExportedOverTheWrapper"}
+	if !slices.Equal(controlSurface, wantSurface) {
+		t.Fatalf("the surface filter read %v out of the control, want %v; it is not reading both directions of a signature, or not telling exported from not",
+			controlSurface, wantSurface)
+	}
+	if standing := packageLevelValuesNaming([]parsedSource{control}, controlHolders); !slices.Equal(standing, []string{"TheStandingHolder"}) {
+		t.Fatalf("the package level value scan read %v out of the control, want [TheStandingHolder]", standing)
+	}
+
+	// then this package's own source
+	structs := map[string]*ast.StructType{}
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		files = append(files, parsed)
+		structTypesIn(parsed, structs)
+	}
+	holders := theTypesHoldingTheEpochSecret(structs)
+	if len(holders) == 0 {
+		t.Fatalf("no struct of this package's source declares a field named %s, so the class below is empty and this gate demands nothing; if the storage was renamed, rename it here too",
+			epochSecretStorageField)
+	}
+	for _, holder := range holders {
+		if _, known := epochSecretHolderSweeps[holder]; !known {
+			t.Fatalf("%s keeps the epoch secret and this gate has no way to read a value of one; add it to epochSecretHolderSweeps rather than letting a second holder fall outside G6",
+				holder)
+		}
+	}
+	for name := range epochSecretHolderSweeps {
+		if !slices.Contains(holders, name) {
+			t.Errorf("epochSecretHolderSweeps reads a %s and no struct of this package keeps the epoch secret under that name", name)
+		}
+	}
+	if standing := packageLevelValuesNaming(files, holders); len(standing) != 0 {
+		t.Errorf("%v are package level values of a type that keeps the epoch secret, so one is reachable with no call for this sweep to make",
+			standing)
+	}
+
+	surface := theExportedSurfaceReaching(files, holders)
+	if len(surface) == 0 {
+		t.Fatalf("no exported function of this package mentions %v, and this package declares three constructors that answer one, so the scan is reading nothing",
+			holders)
+	}
+	for _, name := range surface {
+		if _, covered := epochSecretSurfaceRows[name]; !covered {
+			t.Errorf("%s is exported and its signature carries %v, so it can hand out epoch_secret and nothing here calls it; write it a row in epochSecretSurfaceRows",
+				name, holders)
+		}
+	}
+	for name := range epochSecretSurfaceRows {
+		if !slices.Contains(surface, name) {
+			t.Errorf("epochSecretSurfaceRows calls %s, which is not an exported function of this package reaching %v", name, holders)
+		}
+	}
+	t.Logf("guardrail 6 swept over %v, holders %v", surface, holders)
+
+	for _, epoch := range ksVectorEpochs(t) {
+		epochSecret := epochSecretOfTheEpoch(t, epoch)
+		readAcrossTheRows := [][]byte{}
+		for _, name := range surface {
+			row, covered := epochSecretSurfaceRows[name]
+			if !covered {
+				continue
+			}
+			results, raised := recoveringRow(func() []reflect.Value { return row(t, epoch) })
+			if raised != nil {
+				t.Errorf("%s%s panicked with %v rather than answering", name, epoch.at, raised)
+				continue
+			}
+			exposed := bytesTheAnswerHandsOut(t, epoch.at, name, results)
+			// a row that answered nothing observed nothing, and reports the clean run a
+			// row that answered everything reports
+			if !slices.ContainsFunc(exposed, func(b []byte) bool { return len(b) != 0 }) {
+				t.Errorf("%s%s answered no bytes at all, so this row read nothing to compare",
+					name, epoch.at)
+				continue
+			}
+			for index, secret := range exposed {
+				if bytes.Equal(secret, epochSecret) {
+					t.Errorf("%s%s hands out epoch_secret at position %d of %d; it is the parent of every secret of this epoch and G6 says no exported symbol of this package returns it",
+						name, epoch.at, index, len(exposed))
+				}
+			}
+			readAcrossTheRows = append(readAcrossTheRows, exposed...)
+		}
+		// and the control on the flattener rather than on any one row: a secret these
+		// constructions certainly hand out has to come back out of it, or a secret they
+		// must not hand out would be missed the same way
+		known := epoch.schedule(t).Secrets().InitSecret
+		if !slices.ContainsFunc(readAcrossTheRows, func(b []byte) bool { return bytes.Equal(b, known) }) {
+			t.Fatalf("%s: the sweep read %d byte slices off %v and init_secret is not among them, so it is not reading what it claims to",
+				epoch.at, len(readAcrossTheRows), surface)
 		}
 	}
 }
@@ -1981,9 +2758,17 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 	}
 	for _, name := range slices.Sorted(maps.Keys(covered)) {
 		// the control: a real context is accepted, so a refusal below is the nil and not
-		// the other arguments
-		if err := covered[name](ksVectorEpoch0GroupContext(t)); err != nil {
-			t.Fatalf("%s: a real group context was refused: %v", name, err)
+		// the other arguments. The control is itself made with a panic caught, because a
+		// defect on the accepting path is a failure of this test and not a reason for the
+		// test BINARY to stop -- every gate declared after this one would report nothing.
+		var accepted error
+		if recovered := recoveredPanic(func() { accepted = covered[name](ksVectorEpoch0GroupContext(t)) }); recovered != nil {
+			t.Errorf("%s: a real group context panicked with %v", name, recovered)
+			continue
+		}
+		if accepted != nil {
+			t.Errorf("%s: a real group context was refused: %v", name, accepted)
+			continue
 		}
 		for _, testCase := range []struct {
 			what    string
@@ -2009,6 +2794,39 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 // the group creation entry point
 // ---------------------------------------------------------------------------
 
+// scheduleFromEpochSecretRecovering builds a group creation schedule with a panic caught
+// rather than taken.
+//
+// This is the one entry point whose joiner_secret and welcome_secret are nil, so it is where
+// a derivation reaching for the wrong parent raises out of the kdf instead of answering. An
+// uncaught raise stops the test BINARY, and every gate declared after it in this package
+// then reports nothing at all -- see recoveringRow, which records what that cost. A nil
+// answer means this helper already said what went wrong and the caller moves on to the next
+// row rather than to the next test.
+func scheduleFromEpochSecretRecovering(
+	t *testing.T,
+	at string,
+	crypto CryptoProvider,
+	epochSecret []byte,
+	groupContext *GroupContext,
+) *KeySchedule {
+	t.Helper()
+	var schedule *KeySchedule
+	var err error
+	recovered := recoveredPanic(func() {
+		schedule, err = NewKeyScheduleFromEpochSecret(crypto, epochSecret, groupContext)
+	})
+	if recovered != nil {
+		t.Errorf("%s: NewKeyScheduleFromEpochSecret panicked with %v rather than answering", at, recovered)
+		return nil
+	}
+	if err != nil {
+		t.Errorf("%s: NewKeyScheduleFromEpochSecret: %v", at, err)
+		return nil
+	}
+	return schedule
+}
+
 // TestNewKeyScheduleFromEpochSecretDerivesTheSameNineSecrets asserts the creation path
 // reaches the same nine secrets as the commit path, given the epoch_secret the commit path
 // computed. Anything else means a group's creator and its first joiner are in different
@@ -2031,9 +2849,9 @@ func TestNewKeyScheduleFromEpochSecretDerivesTheSameNineSecrets(t *testing.T) {
 			"epoch", mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext),
 			epoch.crypto.HashSize())
 
-		fromEpoch, err := NewKeyScheduleFromEpochSecret(epoch.crypto, epochSecret, epoch.groupContext)
-		if err != nil {
-			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", epoch.at, err)
+		fromEpoch := scheduleFromEpochSecretRecovering(t, epoch.at, epoch.crypto, epochSecret, epoch.groupContext)
+		if fromEpoch == nil {
+			continue
 		}
 		fromCommit := epochSecretsByField(t, epoch.schedule(t).Secrets())
 		created := epochSecretsByField(t, fromEpoch.Secrets())
@@ -2064,10 +2882,10 @@ func TestNewKeyScheduleFromEpochSecretHasNoJoinerOrWelcomeSecret(t *testing.T) {
 	for _, suite := range Suites() {
 		crypto := mustProvider(t, suite)
 		at := fmt.Sprintf("suite %#04x", uint16(suite))
-		schedule, err := NewKeyScheduleFromEpochSecret(
-			crypto, crypto.Random(crypto.HashSize()), ksVectorEpoch0GroupContext(t))
-		if err != nil {
-			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", at, err)
+		schedule := scheduleFromEpochSecretRecovering(
+			t, at, crypto, crypto.Random(crypto.HashSize()), ksVectorEpoch0GroupContext(t))
+		if schedule == nil {
+			continue
 		}
 		if schedule.JoinerSecret() != nil {
 			t.Errorf("%s: JoinerSecret = %x, want nil on the creation path", at, schedule.JoinerSecret())
@@ -2106,9 +2924,9 @@ func TestNewKeyScheduleFromEpochSecretCopiesTheSample(t *testing.T) {
 		at := fmt.Sprintf("suite %#04x", uint16(suite))
 		sample := crypto.Random(crypto.HashSize())
 		kept := bytes.Clone(sample)
-		schedule, err := NewKeyScheduleFromEpochSecret(crypto, sample, ksVectorEpoch0GroupContext(t))
-		if err != nil {
-			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", at, err)
+		schedule := scheduleFromEpochSecretRecovering(t, at, crypto, sample, ksVectorEpoch0GroupContext(t))
+		if schedule == nil {
+			continue
 		}
 		// the control: the sample was read at all, so the comparisons below are not
 		// satisfied by a constructor that never looked at its argument
@@ -2128,5 +2946,402 @@ func TestNewKeyScheduleFromEpochSecretCopiesTheSample(t *testing.T) {
 		if !bytes.Equal(schedule.epochSecret, kept) {
 			t.Errorf("%s: erasing the caller's sample cleared the epoch's own parent secret", at)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KDF.Nh is read off the provider, over every construction handed one
+//
+// Both registered suites fix Nh at 32, so nothing already in this tree separates a body
+// that reads KDF.Nh off the provider it was handed from one that writes 32 down. The two
+// gates above supply that input for two hand picked functions. This supplies it for the
+// class.
+//
+// Measured, not supposed: nh := crypto.HashSize() replaced by nh := 32 in
+// NewKeyScheduleFromJoiner passed all 5132 tests of mls and message, and so did the same
+// substitution in NewKeyScheduleFromJoiner and NewKeyScheduleFromEpochSecret at once. Not a
+// wrong answer today — it is a gate that would not fire on the day a third suite lands,
+// which is the day it exists for, and suite.go's own file comment asserts the class it
+// violates: "Every length check in the package reads a field of it rather than a literal, so
+// a suite added later cannot leave a hardcoded 32 behind in code that was only ever
+// exercised at 32."
+// ---------------------------------------------------------------------------
+
+// kdfNhCoincidences is the positions at which two runs of one construction disagree about
+// whether a length is KDF.Nh.
+//
+// The property is stated as an equivalence rather than as a length: an answer that is KDF.Nh
+// bytes over one provider must be KDF.Nh bytes over the other, whichever provider that is.
+// A body that writes 32 down answers 32 over both, so over the narrow provider the length
+// IS Nh and over the wide one it is not, and the position is reported. A body that reads the
+// provider answers 32 and then 48 and reports nothing. Both directions are compared, because
+// a length hardcoded at 48 is the same defect written the other way round.
+func kdfNhCoincidences(narrow [][]byte, wide [][]byte, narrowNh int, wideNh int) []int {
+	found := []int{}
+	for i := range min(len(narrow), len(wide)) {
+		if (len(narrow[i]) == narrowNh) != (len(wide[i]) == wideNh) {
+			found = append(found, i)
+		}
+	}
+	return found
+}
+
+// constructionsWhoseAnswerOnlyCoincidesWithKdfNh is a construction the equivalence above
+// cannot hold, named with the reason. The gate checks every name here against the derived
+// class, so an entry cannot outlive the construction it excuses.
+var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
+	// the first of its two answers is the KEM output, which is Nenc bytes. X25519 fixes
+	// Nenc at 32 and the narrow suite's KDF.Nh is also 32, so the equality is the suite's
+	// coincidence rather than anything this construction did; the kdf getting wider does
+	// not make an X25519 public key wider. Its other answer is the ciphertext, which is
+	// the plaintext plus the aead tag and is not a kdf length either.
+	"EncryptWithLabel": "answers a KEM output at Nenc and a ciphertext at Nt, neither of which is KDF.Nh; Nenc coincides with Nh at 32 under the narrow suite",
+}
+
+// scheduleStorageReaders is how this gate reads each byte slice a *KeySchedule keeps behind
+// its accessors.
+//
+// epoch_secret is where a hardcoded KDF.Nh sits unobserved from outside the type. The nine
+// secrets derived from it are expanded at the provider's own width whatever width their
+// parent had, and the parent itself must never reach an exported symbol -- that is guardrail
+// G6 -- so a parent truncated to 32 bytes under a 48 byte kdf is invisible to every gate that
+// reads only what the epoch hands out. This is the reading that sees it, and it is available
+// because these tests are the package's own.
+//
+// The keys are checked against the type's own fields by reflection in both directions, so a
+// fifth byte slice field cannot land unread.
+var scheduleStorageReaders = map[string]func(schedule *KeySchedule) []byte{
+	"groupContextBytes": func(schedule *KeySchedule) []byte { return schedule.groupContextBytes },
+	"joinerSecret":      func(schedule *KeySchedule) []byte { return schedule.joinerSecret },
+	"welcomeSecret":     func(schedule *KeySchedule) []byte { return schedule.welcomeSecret },
+	"epochSecret":       func(schedule *KeySchedule) []byte { return schedule.epochSecret },
+}
+
+// bytesTheScheduleKeeps is everything the type holds: what its exported surface hands out,
+// followed by the storage behind it, in a fixed order so two runs of one construction compare
+// position by position.
+func bytesTheScheduleKeeps(t *testing.T, at string, schedule *KeySchedule) [][]byte {
+	t.Helper()
+	byteSlice := reflect.TypeOf([]byte(nil))
+	fields := []string{}
+	valueType := reflect.TypeOf(schedule).Elem()
+	for i := range valueType.NumField() {
+		if valueType.Field(i).Type != byteSlice {
+			continue
+		}
+		name := valueType.Field(i).Name
+		fields = append(fields, name)
+		if _, read := scheduleStorageReaders[name]; !read {
+			t.Fatalf("KeySchedule keeps a []byte field %s that scheduleStorageReaders has no reader for, so its length falls outside every comparison this gate makes",
+				name)
+		}
+	}
+	for name := range scheduleStorageReaders {
+		if !slices.Contains(fields, name) {
+			t.Errorf("scheduleStorageReaders reads %s, which KeySchedule does not declare as a []byte field", name)
+		}
+	}
+	slices.Sort(fields)
+	kept, _ := bytesTheScheduleHandsOut(t, at, schedule)
+	for _, name := range fields {
+		kept = append(kept, scheduleStorageReaders[name](schedule))
+	}
+	return kept
+}
+
+// TestEveryConstructionHandedAProviderReadsKdfNhFromIt is the differential the registered
+// suites cannot supply, over the class rather than over two functions of it.
+//
+// The class is every package level construction of this package that takes a CryptoProvider,
+// read off the parse tree by the same scan TestEveryConstructionHandedAProviderRoutesThroughIt
+// reads, and each has to have a row here. A construction added later fails this until
+// somebody writes one, which is what makes the class the package's rather than this test's.
+//
+// The two providers are the registered suite and the same suite with its whole hash and kdf
+// surface one width up. Coherence matters: see the wide provider's own comment. What is
+// compared is only whether a length IS the provider's Nh, so a construction whose answers
+// have nothing to do with the kdf reports nothing without needing to be excused for it.
+func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
+	// the constant reader is what makes EncryptWithLabel answer the same ciphertext twice;
+	// over the process entropy source its rows would compare two unrelated messages
+	narrow := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, constantReader{value: 0x35})
+	wide := &wideKdfProvider{CryptoProvider: narrow}
+	if narrow.HashSize() == wide.HashSize() {
+		t.Fatalf("both providers answer KDF.Nh %d, so every row below compares a length against itself",
+			narrow.HashSize())
+	}
+
+	value := bytes.Repeat([]byte{0x21}, 96)
+	priv, pub, err := narrow.DeriveKeyPair(bytes.Repeat([]byte{0x22}, 32))
+	if err != nil {
+		t.Fatalf("derive the key pair the labelled rows are built over: %v", err)
+	}
+	// deliberately neither 32 nor 48 long, so the labelled rows do not report a coincidence
+	// that belongs to the plaintext this test chose
+	plaintext := []byte("seven..")
+	sealedKemOutput, sealedCiphertext, err := EncryptWithLabel(narrow, pub, "UpdatePathNode", value, plaintext)
+	if err != nil {
+		t.Fatalf("seal the message the DecryptWithLabel rows read: %v", err)
+	}
+	// the serialized group context travels through the schedule rows as one of the answers
+	// the epoch hands out, and it is the same bytes over both providers. A context that
+	// happened to be KDF.Nh octets long would therefore read as a written down length, so
+	// the coincidence is ruled out here rather than discovered as a failure in a row.
+	encodedGroupContext, err := syntax.Marshal(ksVectorEpoch0GroupContext(t))
+	if err != nil {
+		t.Fatalf("encode the group context the schedule rows are built over: %v", err)
+	}
+	if len(encodedGroupContext) == narrow.HashSize() || len(encodedGroupContext) == wide.HashSize() {
+		t.Fatalf("the published epoch 0 group context encodes to %d octets, which is one of the two KDF.Nh values this gate compares against",
+			len(encodedGroupContext))
+	}
+
+	// every schedule row answers through the type's own exported surface, so the nine
+	// derived secrets, the joiner secret and the welcome secret are all read
+	scheduleAnswers := func(t *testing.T, at string, schedule *KeySchedule, err error) [][]byte {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", at, err)
+		}
+		return bytesTheScheduleKeeps(t, " over a provider whose KDF.Nh is "+
+			strconv.Itoa(schedule.crypto.HashSize()), schedule)
+	}
+
+	covered := []string{}
+	compared := 0
+	coincidences := 0
+	for _, testCase := range []struct {
+		name string
+		call func(t *testing.T, crypto CryptoProvider) [][]byte
+	}{
+		{name: "RefHash", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return [][]byte{RefHash(crypto, "MLS 1.0 a label", value)}
+		}},
+		{name: "MakeKeyPackageRef", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return [][]byte{MakeKeyPackageRef(crypto, value)}
+		}},
+		{name: "MakeProposalRef", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return [][]byte{MakeProposalRef(crypto, value)}
+		}},
+		{name: "EncryptWithLabel", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			kemOutput, ciphertext, sealErr := EncryptWithLabel(crypto, pub, "UpdatePathNode", value, plaintext)
+			if sealErr != nil {
+				t.Fatalf("EncryptWithLabel: %v", sealErr)
+			}
+			return [][]byte{kemOutput, ciphertext}
+		}},
+		{name: "DecryptWithLabel", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			opened, openErr := DecryptWithLabel(crypto, priv, "UpdatePathNode", value,
+				sealedKemOutput, sealedCiphertext)
+			if openErr != nil {
+				t.Fatalf("DecryptWithLabel: %v", openErr)
+			}
+			return [][]byte{opened}
+		}},
+		{name: "ZeroSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return [][]byte{ZeroSecret(crypto)}
+		}},
+		{name: "DeriveJoinerSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nh := crypto.HashSize()
+			joiner, joinerErr := DeriveJoinerSecret(crypto,
+				bytes.Repeat([]byte{0x71}, nh), bytes.Repeat([]byte{0x72}, nh),
+				ksVectorEpoch0GroupContext(t))
+			if joinerErr != nil {
+				t.Fatalf("DeriveJoinerSecret: %v", joinerErr)
+			}
+			return [][]byte{joiner}
+		}},
+		{name: "NewKeySchedule", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nh := crypto.HashSize()
+			schedule, scheduleErr := NewKeySchedule(crypto,
+				bytes.Repeat([]byte{0x73}, nh), bytes.Repeat([]byte{0x74}, nh),
+				bytes.Repeat([]byte{0x75}, nh), ksVectorEpoch0GroupContext(t))
+			return scheduleAnswers(t, "NewKeySchedule", schedule, scheduleErr)
+		}},
+		{name: "NewKeyScheduleFromJoiner", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nh := crypto.HashSize()
+			schedule, scheduleErr := NewKeyScheduleFromJoiner(crypto,
+				bytes.Repeat([]byte{0x76}, nh), bytes.Repeat([]byte{0x77}, nh),
+				ksVectorEpoch0GroupContext(t))
+			return scheduleAnswers(t, "NewKeyScheduleFromJoiner", schedule, scheduleErr)
+		}},
+		{name: "NewKeyScheduleFromEpochSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			schedule, scheduleErr := NewKeyScheduleFromEpochSecret(crypto,
+				bytes.Repeat([]byte{0x78}, crypto.HashSize()), ksVectorEpoch0GroupContext(t))
+			return scheduleAnswers(t, "NewKeyScheduleFromEpochSecret", schedule, scheduleErr)
+		}},
+		{name: "newKeyScheduleFromParts", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nh := crypto.HashSize()
+			schedule := newKeyScheduleFromParts(crypto, encodedGroupContext,
+				bytes.Repeat([]byte{0x79}, nh), bytes.Repeat([]byte{0x7a}, nh),
+				bytes.Repeat([]byte{0x7b}, nh))
+			return scheduleAnswers(t, "newKeyScheduleFromParts", schedule, nil)
+		}},
+	} {
+		covered = append(covered, testCase.name)
+		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })
+		if raised != nil {
+			t.Errorf("%s panicked with %v over a provider whose KDF.Nh is %d", testCase.name, raised, narrow.HashSize())
+			continue
+		}
+		overTheWideProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, wide) })
+		if raised != nil {
+			t.Errorf("%s panicked with %v over a provider whose KDF.Nh is %d; a construction that reads its lengths off the provider it was handed works at either width",
+				testCase.name, raised, wide.HashSize())
+			continue
+		}
+		if len(overTheNarrowProvider) != len(overTheWideProvider) {
+			t.Errorf("%s answered %d results at KDF.Nh %d and %d at KDF.Nh %d",
+				testCase.name, len(overTheNarrowProvider), narrow.HashSize(),
+				len(overTheWideProvider), wide.HashSize())
+			continue
+		}
+		if len(overTheNarrowProvider) == 0 {
+			t.Errorf("%s answered nothing, so this row compared no length", testCase.name)
+			continue
+		}
+		for _, answer := range overTheNarrowProvider {
+			compared++
+			if len(answer) == narrow.HashSize() {
+				coincidences++
+			}
+		}
+		if reason, excused := constructionsWhoseAnswerOnlyCoincidesWithKdfNh[testCase.name]; excused {
+			t.Logf("%s not held to the KDF.Nh equivalence: %s", testCase.name, reason)
+			continue
+		}
+		for _, at := range kdfNhCoincidences(overTheNarrowProvider, overTheWideProvider,
+			narrow.HashSize(), wide.HashSize()) {
+			t.Errorf("%s answered %d bytes in result %d over a provider whose KDF.Nh is %d and %d bytes over one whose KDF.Nh is %d; exactly one of those is KDF.Nh, so that length is written down rather than read off the provider",
+				testCase.name, len(overTheNarrowProvider[at]), at, narrow.HashSize(),
+				len(overTheWideProvider[at]), wide.HashSize())
+		}
+	}
+
+	// the control on the comparison itself. A gate that reported the package clean having
+	// compared nothing reports exactly what a complete one reports, so the shape it exists
+	// to catch is run through it here and has to be caught, and a shape it must not catch
+	// is run through it too.
+	writtenDown := func(crypto CryptoProvider) [][]byte { return [][]byte{make([]byte, 32)} }
+	if found := kdfNhCoincidences(writtenDown(narrow), writtenDown(wide),
+		narrow.HashSize(), wide.HashSize()); !slices.Equal(found, []int{0}) {
+		t.Fatalf("the comparison reported %v for a construction that answers a written down 32 bytes whatever provider it is handed, want [0]",
+			found)
+	}
+	readOff := func(crypto CryptoProvider) [][]byte { return [][]byte{ZeroSecret(crypto)} }
+	if found := kdfNhCoincidences(readOff(narrow), readOff(wide),
+		narrow.HashSize(), wide.HashSize()); len(found) != 0 {
+		t.Fatalf("the comparison reported %v for a construction that reads its length off the provider, so every row above is reporting a defect that is not there",
+			found)
+	}
+	// and the rows really did put KDF.Nh lengths through it: a sweep in which no answer was
+	// ever Nh long would satisfy the equivalence for every possible implementation
+	if coincidences == 0 {
+		t.Fatalf("%d answers were compared and none of them was KDF.Nh bytes long over either provider, so this gate held nothing",
+			compared)
+	}
+	t.Logf("%d answers compared across %d constructions, %d of them KDF.Nh bytes at %d",
+		compared, len(covered), coincidences, narrow.HashSize())
+
+	// and the table names every construction of this package that takes a provider rather
+	// than the ones this test happened to think of
+	declared := packageLevelFunctionsTaking(t, providerInterfaceName)
+	slices.Sort(covered)
+	if !slices.Equal(covered, declared) {
+		t.Errorf("this gate covers %v, and the package declares %v", covered, declared)
+	}
+	for name := range constructionsWhoseAnswerOnlyCoincidesWithKdfNh {
+		if !slices.Contains(declared, name) {
+			t.Errorf("the gate excuses %s from the KDF.Nh equivalence, and no construction of this package declares it", name)
+		}
+	}
+}
+
+// TestEveryAccessorAnsweringAPointerAnswersIntoTheSchedulesOwnStorage observes the sentence
+// above Secrets(): "The pointer is into the schedule's own storage, which is what lets the
+// epoch erase them in place."
+//
+// A body that answered a pointer to a COPY of the struct — copied := self.secrets; return
+// &copied — still shares the nine backing arrays, so an erase that overwrites bytes stays
+// visible and every other test of this package passes. Measured, not supposed: all 5132
+// tests of mls and message passed over that edit. What it breaks is the other spelling of
+// the erase this plan's task 12 will write: a Zeroize that NILS the fields leaves the
+// returned copy holding nine live keys, and the caller reading through it has an epoch's
+// worth of secrets the group believes are gone.
+//
+// The class is read off the type rather than named: every exported method of *KeySchedule
+// that takes no argument and answers a pointer, so an accessor added later joins by
+// existing. Three things are asserted, because each is satisfiable by a different wrong
+// implementation — two calls answer the same pointer, a write through it is visible to the
+// next call, and two schedules answer different pointers, which is what separates "into the
+// schedule's own storage" from "into a package level singleton".
+func TestEveryAccessorAnsweringAPointerAnswersIntoTheSchedulesOwnStorage(t *testing.T) {
+	epochs := ksVectorEpochs(t)
+	if len(epochs) < 2 {
+		t.Fatalf("the corpus answered for %d epochs and the last assertion here needs two schedules", len(epochs))
+	}
+	answered := []string{}
+	scheduleType := reflect.TypeOf((*KeySchedule)(nil))
+	for i := range scheduleType.NumMethod() {
+		method := scheduleType.Method(i)
+		if method.Type.NumIn() != 1 || method.Type.NumOut() != 1 || method.Type.Out(0).Kind() != reflect.Pointer {
+			continue
+		}
+		answered = append(answered, method.Name)
+		pointerOf := func(schedule *KeySchedule) uintptr {
+			return method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)})[0].Pointer()
+		}
+		schedule := epochs[0].schedule(t)
+		first, second := pointerOf(schedule), pointerOf(schedule)
+		if first == 0 {
+			t.Errorf("(*KeySchedule).%s answered nil, so this row observed nothing", method.Name)
+			continue
+		}
+		if first != second {
+			t.Errorf("(*KeySchedule).%s answered a different address on each call, so it is handing back a copy rather than the schedule's own storage; an erase that nils the fields would leave that copy holding live keys",
+				method.Name)
+		}
+		if other := pointerOf(epochs[1].schedule(t)); other == first {
+			t.Errorf("(*KeySchedule).%s answered the same address for two different schedules, so it is not answering into either one's own storage",
+				method.Name)
+		}
+	}
+	if len(answered) == 0 {
+		t.Fatal("no exported method of *KeySchedule answers a pointer, so this gate swept nothing; Secrets() is one")
+	}
+
+	// and the write through, which is the property the aliasing exists for. Reflection can
+	// say two calls agree on an address; only a write says the address is the storage the
+	// schedule itself reads.
+	schedule := epochs[0].schedule(t)
+	secrets := schedule.Secrets()
+	kept := secrets.InitSecret
+	secrets.InitSecret = nil
+	if schedule.Secrets().InitSecret != nil {
+		t.Error("a field nilled through the pointer Secrets() answered is still set when the schedule is asked again, so that pointer is not into the schedule's own storage")
+	}
+	secrets.InitSecret = kept
+	if !bytes.Equal(schedule.Secrets().InitSecret, kept) {
+		t.Error("restoring the field through the same pointer did not reach the schedule, so this row proved nothing about either direction")
+	}
+}
+
+// TestPastEpochWindowIsThePromisedThirtyTwoEpochs pins the exported constant.
+//
+// Nothing consumes it yet — the retention it bounds is this plan's task 12 — so there is no
+// behaviour to observe and until that task lands the value can be changed to anything with
+// the whole package green. Measured, not supposed: 32 replaced by 8 passed all 5132 tests of
+// mls and message.
+//
+// It is pinned rather than left because it is already exported, and because the number is a
+// product promise rather than a tuning constant: key_schedule.go's own comment argues for it
+// against exactly the value a mutation restores — "Thirty-two rather than eight because the
+// window is a product promise about how long a laptop may stay closed, and an active group
+// can burn eight epochs in a day." A task that means to change it changes this line in the
+// same commit, which is a line a reviewer sees.
+func TestPastEpochWindowIsThePromisedThirtyTwoEpochs(t *testing.T) {
+	if PastEpochWindow != 32 {
+		t.Errorf("PastEpochWindow is %d and the promise written above it is thirty-two epochs; if the window is meant to change, change the comment that argues for it and this line together",
+			PastEpochWindow)
 	}
 }

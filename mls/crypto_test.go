@@ -3091,7 +3091,14 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
-		first := testCase.call(recorder.take)
+		// with a panic caught rather than taken, for the reason recoveringRow gives: a row
+		// that panics on inputs this test chose would otherwise take the test binary down,
+		// and every gate declared after this one with it.
+		first, raised := recoveringRow(func() [][]byte { return testCase.call(recorder.take) })
+		if raised != nil {
+			t.Errorf("%s panicked with %v rather than answering", testCase.name, raised)
+			continue
+		}
 		if len(recorder.arrays) == 0 {
 			t.Errorf("%s was handed nothing, so this row observed nothing", testCase.name)
 			continue
@@ -3111,7 +3118,11 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			t.Errorf("%s answered with nothing, so this row observed nothing", testCase.name)
 			continue
 		}
-		second := testCase.call((&argumentRecorder{}).take)
+		second, raised := recoveringRow(func() [][]byte { return testCase.call((&argumentRecorder{}).take) })
+		if raised != nil {
+			t.Errorf("%s answered once and then panicked with %v", testCase.name, raised)
+			continue
+		}
 		if len(second) != len(first) {
 			t.Errorf("%s answered %d results and then %d for one input", testCase.name, len(first), len(second))
 			continue
