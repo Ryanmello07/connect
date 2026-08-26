@@ -1,15 +1,18 @@
-// The record types, the two ladders, and the gate that keeps the class/bucket join in
-// one place.
+// The record types, the two ladders, and the gate that keeps the class/bucket crossing
+// in one place.
 //
-// Two things are being observed here and they fail in opposite directions. The first is
-// that the wire alphabet is exactly the nine bytes master section 8 admits and that the
-// split and the join are inverses over it — asserted by asking about all 256 bytes and
-// all 65536 class/bucket pairs rather than by writing the legal ones down, so a parser
-// that widened tomorrow widens the derived set and fails here instead of quietly
-// accepting a byte no other implementation will. The second is that no other file
-// rebuilds the join out of arithmetic, which needs a walk of the tree rather than a
-// list of files, and a positive control so that "found nothing" cannot mean "the
-// matchers stopped matching".
+// Three things are being observed here and they fail in different directions. The first
+// is that the wire alphabet is exactly the nine bytes master section 8 admits and that
+// the split and the join are inverses over it — asserted by asking about all 256 bytes
+// and all 65536 class/bucket pairs rather than by writing the legal ones down, so a
+// parser that widened tomorrow widens the derived set and fails here instead of quietly
+// accepting a byte no other implementation will. The second is that each of those nine
+// bytes means what the spec says it means, which is the one thing no derived property
+// can see: a table permuted in both directions round trips perfectly and agrees with
+// nobody, so the meanings are written down once, in masterWireTable, and everything
+// compares against that. The third is that no other file rebuilds either half of the
+// crossing, which needs a walk of the tree rather than a list of files, and a positive
+// control so that "found nothing" cannot mean "the rules stopped matching".
 //
 // The pinned literals are pinned on purpose. Spec B indexes and CHECKs on the
 // ct_body column of the size ladder and restates the eph ladder, so a drift in either
@@ -20,13 +23,15 @@ package message
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
-	"unicode"
 )
 
 // A split retention class: the two halves of the wire byte, as go carries them.
@@ -56,18 +61,130 @@ func acceptedWireBytes(t *testing.T) map[byte]classBucket {
 	return accepted
 }
 
-// The nine bytes of master section 8, the one place in this file they are written out.
-// The set under test is computed; this is what it is compared against, and a widening
-// or a narrowing of the parser moves the computed set off it.
+// The wire table of master section 8 and spec A section 5.1, written out once: every
+// legal byte, and the class and the bucket it means. The set of legal bytes is derived
+// from the parser everywhere else in this file; this is the one place the MEANING of a
+// byte is written down.
+//
+// It has to be written down, because nothing derived can pin it. Swap durable and media
+// in the split and in the join together and every byte still round trips, every pair is
+// still distinct, the join still refuses everything it should — the package agrees with
+// itself perfectly, and the records it writes are sealed under K_media where every other
+// implementation looks for K_durable (master section 8.1), carry a retention_class byte
+// inside aad_body, aad_head and the write_auth preimage that no other reader will
+// reproduce, and are pruned by the server on the wrong class. The same holds for any
+// permutation of the eph buckets. A self consistent table is the one error a property
+// about the table cannot see.
+var masterWireTable = map[byte]classBucket{
+	0x00: {class: RetentionPermanent, bucket: 0},
+	0x01: {class: RetentionDurable, bucket: 0},
+	0x02: {class: RetentionMedia, bucket: 0},
+	0x10: {class: RetentionEph, bucket: 0},
+	0x11: {class: RetentionEph, bucket: 1},
+	0x12: {class: RetentionEph, bucket: 2},
+	0x13: {class: RetentionEph, bucket: 3},
+	0x14: {class: RetentionEph, bucket: 4},
+	0x15: {class: RetentionEph, bucket: 5},
+}
+
+// The bytes of the table above, sorted, as the one written down alphabet every derived
+// set is compared against.
+func masterWireBytes() []int {
+	bytes := make([]int, 0, len(masterWireTable))
+	for wire := range masterWireTable {
+		bytes = append(bytes, int(wire))
+	}
+	slices.Sort(bytes)
+	return bytes
+}
+
+// The alphabet: the nine bytes of master section 8 and nothing else. The set under test
+// is computed by asking the split about all 256 of them; the set it is compared against
+// is the table above, so a widening or a narrowing of the parser moves the computed set
+// off the one place the spec is written down.
 func TestRetentionClassOfAcceptsExactlyTheNineLegalBytes(t *testing.T) {
 	accepted := []int{}
 	for wire := range acceptedWireBytes(t) {
 		accepted = append(accepted, int(wire))
 	}
 	slices.Sort(accepted)
-	want := []int{0x00, 0x01, 0x02, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15}
+	want := masterWireBytes()
+	if len(want) != 9 {
+		t.Fatalf("the wire table names %d bytes, want the 9 of master section 8", len(want))
+	}
 	if !slices.Equal(accepted, want) {
 		t.Errorf("the split accepts %v, want exactly %v; 0x03..0x0f and 0x16..0xff are all errors", accepted, want)
+	}
+}
+
+// The mapping itself, which is the thing the round trip and the two inverse properties
+// do not touch: each of the nine bytes decodes to the class and the bucket the table
+// names, and joins back from them. A byte that means something else here is a record no
+// other implementation can open and one the server prunes under a class its writer never
+// chose.
+func TestEveryWireByteMeansWhatMasterSection8Says(t *testing.T) {
+	accepted := acceptedWireBytes(t)
+	for _, value := range masterWireBytes() {
+		wire := byte(value)
+		want := masterWireTable[wire]
+		got, legal := accepted[wire]
+		if !legal {
+			t.Errorf("0x%02x is class %d bucket %d in master section 8, and the split refuses it", wire, want.class, want.bucket)
+			continue
+		}
+		if got != want {
+			t.Errorf("0x%02x splits to class %d bucket %d, want the class %d bucket %d of master section 8", wire, got.class, got.bucket, want.class, want.bucket)
+		}
+		joined, err := RetentionClassWire(want.class, want.bucket)
+		if err != nil {
+			t.Errorf("class %d bucket %d is 0x%02x in master section 8, and the join refused it: %v", want.class, want.bucket, wire, err)
+			continue
+		}
+		if joined != wire {
+			t.Errorf("class %d bucket %d joins to 0x%02x, want the 0x%02x master section 8 names", want.class, want.bucket, joined, wire)
+		}
+	}
+	for wire, pair := range accepted {
+		if _, named := masterWireTable[wire]; !named {
+			t.Errorf("the split accepts 0x%02x as class %d bucket %d, and master section 8 names no such byte", wire, pair.class, pair.bucket)
+		}
+	}
+}
+
+// The go side tags, pinned to the values spec A section 5.1 declares. Every other
+// retention test reads its classes back out of the split, so the tags float free of the
+// spec unless something says what they are — and one of them says more than its own
+// value: RetentionPermanent is 0, which is what makes the zero value of a RecordHeader a
+// permanent record rather than a class the join refuses outright.
+func TestRetentionClassTagsAreTheValuesSpecASection51Declares(t *testing.T) {
+	pinned := []struct {
+		name  string
+		class RetentionClass
+		want  uint8
+	}{
+		{name: "RetentionPermanent", class: RetentionPermanent, want: 0},
+		{name: "RetentionDurable", class: RetentionDurable, want: 1},
+		{name: "RetentionMedia", class: RetentionMedia, want: 2},
+		{name: "RetentionEph", class: RetentionEph, want: 3},
+	}
+	for _, tag := range pinned {
+		if uint8(tag.class) != tag.want {
+			t.Errorf("%s is %d, want %d", tag.name, uint8(tag.class), tag.want)
+		}
+		// and the value handed back with a refusal is none of them, so a caller that
+		// dropped the error is holding something every later check refuses
+		if retentionClassInvalid == tag.class {
+			t.Errorf("the class the split returns with a refusal is %s", tag.name)
+		}
+	}
+	var header RecordHeader
+	if header.RetentionClass != RetentionPermanent {
+		t.Errorf("the class of a zero valued header is %d, want permanent", header.RetentionClass)
+	}
+	if wire, err := RetentionClassWire(header.RetentionClass, header.EphBucket); err != nil {
+		t.Errorf("a zero valued header does not encode: %v", err)
+	} else if wire != 0x00 {
+		t.Errorf("a zero valued header encodes as 0x%02x, want 0x00", wire)
 	}
 }
 
@@ -247,6 +364,51 @@ func TestSizeBucketLadderIsPinned(t *testing.T) {
 	}
 }
 
+// The named rungs of the size ladder, pinned to the values spec A section 5.1 declares
+// and to the lengths behind them. The ladder test above indexes with raw integers, which
+// leaves the constants a caller actually writes unchecked: SizeBucket256 pointing at the
+// 64 KiB rung pads a two hundred byte message to 65536 bytes, and a test that only ever
+// asks about SizeBucket(0) stays green while it happens.
+func TestSizeBucketConstantsNameTheRungsSpecASection51Declares(t *testing.T) {
+	pinned := []struct {
+		name      string
+		rung      SizeBucket
+		want      uint8
+		wantBytes int
+	}{
+		{name: "SizeBucket256", rung: SizeBucket256, want: 0, wantBytes: 256},
+		{name: "SizeBucket1K", rung: SizeBucket1K, want: 1, wantBytes: 1024},
+		{name: "SizeBucket4K", rung: SizeBucket4K, want: 2, wantBytes: 4096},
+		{name: "SizeBucket16K", rung: SizeBucket16K, want: 3, wantBytes: 16384},
+		{name: "SizeBucket64K", rung: SizeBucket64K, want: 4, wantBytes: 65536},
+		// the blob rung is the one whose name promises no inline body at all
+		{name: "SizeBucketBlob", rung: SizeBucketBlob, want: 5, wantBytes: noLadderValue},
+	}
+	for _, rung := range pinned {
+		if uint8(rung.rung) != rung.want {
+			t.Errorf("%s is %d, want %d", rung.name, uint8(rung.rung), rung.want)
+		}
+		body := SizeBucketBytes(rung.rung)
+		ctBody := SizeBucketCtBodyBytes(rung.rung)
+		if rung.wantBytes < 0 {
+			if 0 <= body || 0 <= ctBody {
+				t.Errorf("%s has no inline body but reports %d body bytes and %d ct_body bytes", rung.name, body, ctBody)
+			}
+			continue
+		}
+		if body != rung.wantBytes {
+			t.Errorf("%s is %d body bytes, want %d", rung.name, body, rung.wantBytes)
+		}
+		if want := rung.wantBytes + aeadTagBytes; ctBody != want {
+			t.Errorf("%s is %d ct_body bytes, want %d", rung.name, ctBody, want)
+		}
+	}
+	// and the names cover the whole ladder, so a seventh rung cannot arrive unnamed
+	if len(pinned) != int(SizeBucketBlob)+1 {
+		t.Errorf("%d rungs are named, want the %d the ladder ends at", len(pinned), int(SizeBucketBlob)+1)
+	}
+}
+
 // The relation between the two size functions, over every rung, derived rather than
 // listed: whatever the ladder says, the ciphertext is the body plus the 16 byte aead
 // tag and nothing else. This is what stops the two functions drifting apart in a change
@@ -300,6 +462,65 @@ func TestEphBucketSecondsLadderIsPinned(t *testing.T) {
 	}
 }
 
+// The eph ladder as a record on the wire meets it: the byte, and the window the server
+// will prune a record carrying it on.
+//
+// The ladder test above pins the seconds against the go bucket index, which leaves the
+// byte a bucket is reached by unpinned. Permute the buckets in the split and the join
+// together and every seconds value is still exactly where that test looks for it, while
+// 0x10 has become an hour and the rung that is never persisted has moved somewhere else
+// on the wire. K_eph[n][b][t] = HKDF-Expand(eph_root[n], "eph/v1" || u8(b) || u64(t), 32)
+// keys on b (master section 8.1), so a permuted bucket is a record nobody can open, and
+// a transient that gets stored for an hour is the one thing the transient rung promises
+// never to do.
+var masterEphWindowSeconds = map[byte]int{
+	0x10: neverPersisted,
+	0x11: 3600,
+	0x12: 28800,
+	0x13: 86400,
+	0x14: 604800,
+	0x15: 2419200,
+}
+
+// What the table above says about the transient rung: no window at all, because the
+// record is never stored to have one.
+const neverPersisted = -1
+
+func TestEveryEphWireByteCarriesTheWindowMasterSection8Names(t *testing.T) {
+	for _, value := range masterWireBytes() {
+		wire := byte(value)
+		want, isEphByte := masterEphWindowSeconds[wire]
+		if !isEphByte {
+			if masterWireTable[wire].class == RetentionEph {
+				t.Errorf("0x%02x is an eph byte in the wire table and the eph ladder gives it no window", wire)
+			}
+			continue
+		}
+		class, bucket, err := RetentionClassOf(wire)
+		if err != nil {
+			t.Errorf("0x%02x carries an eph window and the split refuses it: %v", wire, err)
+			continue
+		}
+		if class != RetentionEph {
+			t.Errorf("0x%02x carries an eph window and splits to class %d", wire, class)
+			continue
+		}
+		seconds := EphBucketSeconds(bucket)
+		if want == neverPersisted {
+			if 0 <= seconds {
+				t.Errorf("0x%02x is the transient rung and is never persisted, and it reports a window of %d seconds", wire, seconds)
+			}
+			continue
+		}
+		if seconds != want {
+			t.Errorf("a record written as 0x%02x expires after %d seconds, want the %d of master section 8", wire, seconds, want)
+		}
+	}
+	if len(masterEphWindowSeconds) != 6 {
+		t.Errorf("the eph ladder names %d bytes, want the 6 rungs of master section 8", len(masterEphWindowSeconds))
+	}
+}
+
 // The two ladders answer over exactly the buckets the wire admits, derived from the
 // alphabet: every eph byte on the wire names a rung, and no rung exists that the wire
 // cannot name. A ladder that grew a seventh rung would put a window behind a byte no
@@ -331,126 +552,346 @@ func TestEphLadderCoversExactlyTheBucketsTheWireAdmits(t *testing.T) {
 	}
 }
 
-// ── the gate: the join happens in one file and nowhere else ──────────────────────
+// Prunability, pinned per class against spec B section 3.5's column and asked of every
+// value a RetentionClass can hold. Spec B section 7.2 is what the column summarises:
+// permanent takes no action at prune_after ever, and every other class loses its body.
+//
+// A value that is not a class at all answers no, which is the answer that keeps data. It
+// is also the answer that cannot be reached honestly — the split refuses the byte long
+// before anything holds such a class — so what this pins is that a caller who got there
+// dishonestly does not get a delete out of it.
+func TestClassIsPrunableAnswersSpecBSection35(t *testing.T) {
+	prunable := map[RetentionClass]bool{
+		RetentionPermanent: false,
+		RetentionDurable:   true,
+		RetentionMedia:     true,
+		RetentionEph:       true,
+	}
+	// the classes are read off the wire alphabet rather than listed, so a class the wire
+	// grows has to be given an answer here before this test will pass again
+	onTheWire := map[RetentionClass]bool{}
+	for _, pair := range acceptedWireBytes(t) {
+		onTheWire[pair.class] = true
+	}
+	if len(onTheWire) != len(prunable) {
+		t.Errorf("the wire alphabet names %d classes and spec B section 3.5 pins %d", len(onTheWire), len(prunable))
+	}
+	for class := range onTheWire {
+		if _, pinned := prunable[class]; !pinned {
+			t.Errorf("the wire alphabet names class %d, which spec B section 3.5 says nothing about", class)
+		}
+	}
+	for value := 0; value <= 0xFF; value++ {
+		class := RetentionClass(value)
+		answer := ClassIsPrunable(class)
+		want, legal := prunable[class]
+		switch {
+		case legal && answer != want:
+			t.Errorf("class %d is prunable=%v, want %v", value, answer, want)
+		case !legal && answer:
+			t.Errorf("class %d is not a class at all and answers that its body may be erased", value)
+		}
+	}
+	// the one answer that is a promise rather than a policy: master section 12.2 and
+	// spec B section 7.2 both say a permanent record is never acted on
+	if ClassIsPrunable(RetentionPermanent) {
+		t.Error("permanent is prunable, and permanent is the class that is never erased")
+	}
+}
+
+// ── the gate: the crossing happens in one file and nowhere else ──────────────────
 //
 // Spec A section 5.1 bans four expression shapes — class<<4, class|bucket, 16+bucket
-// and class*16 — anywhere but the two functions in record.go. The ban is the mechanical
-// half of the argument in those functions' comments: a second join is a second place
-// the class and the bucket can be conflated, and the conflation is silent.
+// and class*16 — anywhere but the two functions in record.go, and the sentence beside
+// them says those two functions are the only ones in the system that join OR SPLIT the
+// class and the bucket. All four names are join shapes, so a gate that stops at them
+// forbids building the byte and allows taking it apart, which is the same conflation
+// read backwards: a prune query that recovers the class with wire>>4 treats eph bucket 1
+// as a different class from eph bucket 0 exactly as class<<4 does. The split half is
+// banned here too, under names of its own.
+//
+// The rules read the syntax tree rather than the text, which is what keeps them from
+// being a list of the spellings somebody thought of. retentionWireByClass[class]+bucket
+// is the same join as 16+bucket and no pattern anchored on an identifier spans the
+// bracket; a comment on the end of a line of code is prose that a text matcher reads as
+// code. Both are free here: an operand is a subtree, so the words in it are found
+// wherever they sit, and comments are not expressions at all.
 //
 // Nothing below rests on a scan having run, for the reason mls/crypto_forbidden_test.go
 // gives at length and this file follows: a scanner that finds nothing because it is
 // broken reports exactly what one that finds nothing because the tree is clean reports.
-// So the scan refuses a root it could not read or that held no go source; every matcher
-// is a function the gates and a positive control both call; the control feeds it a
-// fixture committing all four shapes, so a matcher that stopped matching fails there
-// rather than passing the tree quietly; and a second fixture writes all four shapes in
-// prose and does the legal thing, so "not reported" means "allowed or absent" rather
-// than "the matchers are asleep".
+// So the scan refuses a root it could not read, that held no go source, or that held a
+// file it could not parse; the set of paths the gate iterates is checked against the set
+// the scan collected, because a gate handed an empty set reports every root clean having
+// examined nothing; the allowance is counted, because an allowance that widened is the
+// same clean report; every rule is a function the gates and a positive control both
+// call; the control feeds it a fixture committing every banned shape, so a rule that
+// stopped matching fails there rather than issuing the tree a clean bill; and a second
+// fixture writes every shape in prose, and puts one of those sentences on the end of a
+// line of working code, so "not reported" means "allowed or absent" rather than "the
+// rules are asleep".
 
 // The trees the ban covers, relative to this package's directory. connect itself is not
 // among them and cannot be: it is the parent, it may not import either of these
-// packages, and its data path is full of unrelated bit arithmetic that these matchers
-// would report on. The sdk root is added only when it is really there, since a missing
-// root is one the scan refuses outright.
+// packages, and its data path is full of unrelated bit arithmetic these rules would
+// report on.
 const (
 	messageRoot    = "."
 	mlsRoot        = "../mls"
-	sdkRoot        = "../sdk"
-	joinSelfName   = "record_test.go"
 	joinControlDir = "testdata/forbidden"
 )
 
-// Only record.go may join or split the two halves. The list is what the gate reads and
-// what its failure message prints, so a message cannot outlive the rule.
-var joinAllowedFiles = []string{"record.go"}
+// The one file allowed to cross between the two shapes, as the scan keys it: a path
+// under a root, not a base name. A base name exempts every file called record.go in
+// every root, and connect/mls is free to grow one tomorrow — the allowance is the whole
+// of this gate's surface area, so it names a place and not a filename.
+var joinAllowedPaths = []string{"record.go"}
 
-// The scan roots, computed rather than fixed: sdk does not exist in this tree today and
-// the day it lands is the day this gate has to start covering it, so its absence is
-// logged instead of assumed.
+// Where the sdk module sits, derived from where this module ends rather than written
+// down. sdk is a sibling repository of connect and not a directory inside it, so a root
+// of "../sdk" — which is what this said — resolves to connect/sdk and can never exist,
+// and the gate logged that it would cover sdk the day it appeared while that day could
+// not come. Walking up to the module root and stepping out of it is the same sentence in
+// code, and it cannot resolve to a path inside connect.
+func joinSdkRoot(t *testing.T) string {
+	t.Helper()
+	moduleRoot := messageRoot
+	for range 8 {
+		if _, err := os.Stat(filepath.Join(moduleRoot, "go.mod")); err == nil {
+			return filepath.ToSlash(filepath.Join(moduleRoot, "..", "sdk"))
+		}
+		moduleRoot = filepath.Join(moduleRoot, "..")
+	}
+	t.Fatalf("no go.mod above %s, so the sdk root cannot be derived", messageRoot)
+	return ""
+}
+
+// The scan roots, computed rather than fixed: sdk is a separate checkout and a tree that
+// holds only connect is a tree where it is genuinely absent, so its absence is logged
+// instead of assumed — and asserted about, in TestTheSdkRootIsASiblingOfThisModule,
+// because a root that is present and uncovered is the failure this logging hides.
 func joinScanRoots(t *testing.T) []string {
 	t.Helper()
 	roots := []string{messageRoot, mlsRoot}
+	sdkRoot := joinSdkRoot(t)
 	if entry, err := os.Stat(sdkRoot); err == nil && entry.IsDir() {
 		roots = append(roots, sdkRoot)
 	} else {
-		t.Logf("%s is not in this tree, so the gate covers %v; it joins the roots the day it appears", sdkRoot, roots)
+		t.Logf("%s is not checked out beside connect, so the gate covers %v; it joins the roots the day it appears", sdkRoot, roots)
 	}
 	return roots
 }
 
-// One banned expression shape, with the name spec A gives it so a failure reads as the
-// rule rather than as a regular expression.
-type joinShape struct {
-	name    string
-	pattern *regexp.Regexp
+// Which half of the crossing a rule names. Both halves are the same defect — a second
+// place the class and the bucket meet, and a second place they can be conflated — but
+// spec A enumerates only the join shapes, so the join half is pinned to exactly the four
+// names spec A gives while the split half is free to grow.
+type joinHalf int
+
+const (
+	joinsTheByte joinHalf = iota
+	splitsTheByte
+)
+
+// What a failure says the file did, so the message reads as the rule.
+func (self joinHalf) verb() string {
+	if self == splitsTheByte {
+		return "splits"
+	}
+	return "joins"
 }
 
-// The operand fragments the shapes are built from. An operand is recognised by its
-// name, which is how a matcher tells a join of a class and a bucket from arithmetic
-// that happens to use the same operator: identifiers in this tree carry the words the
-// spec uses. The trailing close parens catch the converted form, uint8(class)|bucket.
+// One banned expression shape: the name spec A gives it, or the name this file gives its
+// mirror image, the half it belongs to, and the predicate over one binary expression
+// that decides it.
+type joinShape struct {
+	name    string
+	half    joinHalf
+	commits func(op token.Token, left, right joinOperand) bool
+}
+
+// One operand of a binary expression, reduced to the two things the rules ask about: the
+// words its identifiers use, and the integer it is when it is a constant.
+//
+// The words are how a rule tells a join of a class and a bucket from arithmetic that
+// happens to use the same operator — identifiers in this tree carry the words the spec
+// uses. They are collected from the whole operand subtree rather than from its outermost
+// identifier, which is what stops a table lookup, a conversion or a field selector from
+// hiding the name: retentionWireByClass[retentionClass] names the class as plainly as
+// retentionClass does, and a table lookup exactly like that one walked straight past the
+// patterns this replaced.
+type joinOperand struct {
+	words    string
+	constant int64
+	isConst  bool
+}
+
+// The vocabulary. A rule asks about a word rather than about a spelling, so a name the
+// gate has never seen still answers for it.
+func (self joinOperand) namesClass() bool {
+	return strings.Contains(self.words, "class") || strings.Contains(self.words, "retention")
+}
+
+func (self joinOperand) namesBucket() bool {
+	return strings.Contains(self.words, "bucket")
+}
+
+// The byte itself, which is the thing a split takes apart. Only the split rules ask
+// about this word, and only alongside the eph base: connect/mls calls its own encodings
+// wire formats all over and none of that is this.
+func (self joinOperand) namesWireByte() bool {
+	return strings.Contains(self.words, "wire")
+}
+
+func (self joinOperand) isValue(value int64) bool {
+	return self.isConst && self.constant == value
+}
+
+// The numbers the two halves are written with: the eph base, the nibble it sits in, and
+// the mask that takes the bucket back out from under it.
 const (
-	classOperand   = `[a-z0-9_.]*(?:class|retention)[a-z0-9_.]*\)*`
-	bucketOperand  = `[a-z0-9_.]*bucket[a-z0-9_.]*\)*`
-	ephBaseLiteral = `(?:16|0x10)`
-	notDigit       = `(?:[^0-9]|$)`
-	// The or shape takes the eph base in hex only. A decimal 16 beside a pipe is the
-	// tail of a shift in a varint decoder far more often than it is this join —
-	// mls/syntax/varint.go writes uint32(b[i+1])<<16|... and means nothing by it — and a
-	// gate that fires there is a gate the next contributor turns off. Nothing is lost:
-	// a decimal join still has to name its bucket on the other side of the pipe, which
-	// the bucket operand catches.
-	ephBaseHex = `0x10`
+	ephBaseValue     int64 = 16
+	nibbleShiftValue int64 = 4
+	ephBucketMask    int64 = 0x0f
 )
+
+// One side names the class and the other names the bucket, with the eph base standing in
+// for the class: a 16 beside a bucket is the class, written as the byte it becomes.
+func joinMixesClassAndBucket(left, right joinOperand) bool {
+	classSide := func(operand joinOperand) bool {
+		return operand.namesClass() || operand.isValue(ephBaseValue)
+	}
+	return (classSide(left) && right.namesBucket()) || (classSide(right) && left.namesBucket())
+}
+
+// Either side names the retention vocabulary at all, which is as much as the or shape
+// asks: a pipe beside a class or a bucket is the join whatever sits on the other side of
+// it, and over reporting is the safe direction for a ban list.
+func joinTouchesTheVocabulary(left, right joinOperand) bool {
+	return left.namesClass() || left.namesBucket() || right.namesClass() || right.namesBucket()
+}
 
 var classBucketJoinShapes = []joinShape{
 	// class<<4. Matched on the shift alone rather than on an operand, because neither
 	// package packs bits: there is no other reason to shift a value by exactly four
-	// here, and over reporting is the safe direction for a ban list. A legitimate shift
-	// by four arriving later is a review conversation, which is the point.
-	{name: "class<<4", pattern: regexp.MustCompile(`(?i)<<4` + notDigit)},
+	// here, and a legitimate shift by four arriving later is a review conversation,
+	// which is the point.
+	{name: "class<<4", half: joinsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		return op == token.SHL && right.isValue(nibbleShiftValue)
+	}},
 	// class|bucket, in either operand order, with either half named or the eph base
-	// written as a literal. The trailing and leading non pipe is what keeps a logical
-	// or out of the report.
-	{name: "class|bucket", pattern: regexp.MustCompile(
-		`(?i)(?:(?:` + classOperand + `|` + bucketOperand + `|` + ephBaseHex + `)\|(?:[^|]|$))` +
-			`|(?:(?:^|[^|])\|(?:` + classOperand + `|` + bucketOperand + `|` + ephBaseHex + `))`)},
-	// 16+bucket, in either order, with the base written as a literal or named.
-	{name: "16+bucket", pattern: regexp.MustCompile(
-		`(?i)(?:(?:` + ephBaseLiteral + `|` + classOperand + `)\+` + bucketOperand + `)` +
-			`|(?:` + bucketOperand + `\+(?:` + ephBaseLiteral + notDigit + `|` + classOperand + `))`)},
-	// class*16, in either order.
-	{name: "class*16", pattern: regexp.MustCompile(
-		`(?i)(?:` + classOperand + `\*` + ephBaseLiteral + notDigit + `)` +
-			`|(?:` + ephBaseLiteral + `\*` + classOperand + `)`)},
+	// written as the literal it is. The exclusive or is the same join once more — the
+	// two nibbles cannot overlap, so it carries the identical byte — and is matched
+	// here rather than given a name of its own that spec A does not use.
+	{name: "class|bucket", half: joinsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		if op != token.OR && op != token.XOR {
+			return false
+		}
+		return joinTouchesTheVocabulary(left, right) || left.isValue(ephBaseValue) || right.isValue(ephBaseValue)
+	}},
+	// 16+bucket, in either order, with the base written as a literal, named, or looked
+	// up in a table. The base has to appear as itself or as the class beside a named
+	// bucket, because adding sixteen to something is otherwise ordinary arithmetic:
+	// mls/hpke_fuzz_test.go widens a key length with params.Nsk+16 and means nothing by
+	// it.
+	{name: "16+bucket", half: joinsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		return op == token.ADD && joinMixesClassAndBucket(left, right)
+	}},
+	// class*16, in either order, which is the shift written for a reader who dislikes
+	// shifts. The class multiplied by the base is the whole join on its own, with the
+	// bucket added somewhere else or not yet added at all, so unlike the addition this
+	// one does not need a bucket beside it.
+	{name: "class*16", half: joinsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		if op != token.MUL {
+			return false
+		}
+		return joinMixesClassAndBucket(left, right) ||
+			(left.namesClass() && right.isValue(ephBaseValue)) ||
+			(right.namesClass() && left.isValue(ephBaseValue))
+	}},
+	// wire>>4, the class taken back out of the high nibble, matched on the shift alone
+	// for the reason class<<4 is.
+	{name: "wire>>4", half: splitsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		return op == token.SHR && right.isValue(nibbleShiftValue)
+	}},
+	// wire&0x0f, the bucket taken out from under the base. The mask is what makes it
+	// this rather than a flag test, so the rule is the mask and not the operator.
+	{name: "wire&0x0f", half: splitsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		return op == token.AND && (left.isValue(ephBucketMask) || right.isValue(ephBucketMask))
+	}},
+	// wire-0x10, the bucket recovered by subtracting the base, and wire/16 and wire%16,
+	// the two halves recovered by dividing by it. Unlike the two shifts these need a
+	// name on the other side: subtracting sixteen from a length is how an aead tag is
+	// stripped, and a remainder mod sixteen is how mls/syntax/marshal_test.go picks a
+	// small index. Neither is this.
+	{name: "wire-0x10", half: splitsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
+		if op != token.SUB && op != token.QUO && op != token.REM {
+			return false
+		}
+		baseSide := func(operand joinOperand) bool {
+			return operand.isValue(ephBaseValue) || operand.namesClass()
+		}
+		byteSide := func(operand joinOperand) bool {
+			return operand.namesClass() || operand.namesBucket() || operand.namesWireByte()
+		}
+		return (baseSide(left) && byteSide(right)) || (baseSide(right) && byteSide(left))
+	}},
 }
 
-// One walk's result: the text of every go file found, keyed by slash separated path,
-// and how many files each root contributed. The per root count is what separates "the
-// roots are clean" from "a root was never read".
+// The shape names of one half, for a message that has to say what was looked for and for
+// the assertion that spec A's four are all still here.
+func shapeNames(half joinHalf) []string {
+	names := []string{}
+	for _, shape := range classBucketJoinShapes {
+		if shape.half == half {
+			names = append(names, shape.name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// One walk's result: the text and the syntax tree of every go file found, keyed by slash
+// separated path, and the root each one came from. The per root attribution is what
+// separates "the roots are clean" from "a root was never read", and it is one map rather
+// than a count beside a map so the two cannot disagree.
 type joinScan struct {
-	sourceTexts    map[string]string
-	rootFileCounts map[string]int
+	fileSet     *token.FileSet
+	sourceTexts map[string]string
+	syntax      map[string]*ast.File
+	rootOf      map[string]string
 }
 
-// Walks each root and collects go source. A directory named testdata or interop is
-// skipped unless a root names it outright, which is how the controls reach their
-// fixture and nothing else reaches it.
+// How many files each root contributed, derived from the attribution.
+func (self joinScan) countsByRoot() map[string]int {
+	counts := map[string]int{}
+	for _, root := range self.rootOf {
+		counts[root]++
+	}
+	return counts
+}
+
+// Walks each root, reads and parses every go file under it. A directory named testdata
+// or interop is skipped unless a root names it outright, which is how the controls reach
+// their fixture and nothing else reaches it.
 //
-// A root that cannot be walked and a root that yielded no go file are both errors,
-// because either one produces a scan that reports every gate clean without having read
-// any code. The error is returned rather than failed on so that the refusal can be
-// tested directly instead of asserted about.
+// A root that cannot be walked, a root that yielded no go file, and a file that does not
+// parse are all errors, because each one produces a scan that reports every gate clean
+// having read no code, or having read it and understood none of it. The error is
+// returned rather than failed on so that the refusal can be tested directly instead of
+// asserted about.
 func scanJoinSources(roots []string) (joinScan, error) {
 	scan := joinScan{
-		sourceTexts:    map[string]string{},
-		rootFileCounts: map[string]int{},
+		fileSet:     token.NewFileSet(),
+		sourceTexts: map[string]string{},
+		syntax:      map[string]*ast.File{},
+		rootOf:      map[string]string{},
 	}
 	if len(roots) == 0 {
 		return scan, fmt.Errorf("no roots to scan")
 	}
 	for _, root := range roots {
+		found := 0
 		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -468,14 +909,25 @@ func scanJoinSources(roots []string) (joinScan, error) {
 			if err != nil {
 				return err
 			}
-			scan.sourceTexts[filepath.ToSlash(path)] = string(body)
-			scan.rootFileCounts[root]++
+			text := string(body)
+			syntax, err := parser.ParseFile(scan.fileSet, path, text, parser.SkipObjectResolution)
+			if err != nil {
+				return fmt.Errorf("parse %s: %w", path, err)
+			}
+			slashPath := filepath.ToSlash(path)
+			if earlier, repeated := scan.rootOf[slashPath]; repeated {
+				return fmt.Errorf("%s was contributed by both %s and %s, so the per root attribution is not a partition", slashPath, earlier, root)
+			}
+			scan.sourceTexts[slashPath] = text
+			scan.syntax[slashPath] = syntax
+			scan.rootOf[slashPath] = root
+			found++
 			return nil
 		})
 		if err != nil {
 			return scan, fmt.Errorf("walk %s: %w", root, err)
 		}
-		if scan.rootFileCounts[root] == 0 {
+		if found == 0 {
 			return scan, fmt.Errorf("walk %s read no go files; the scan is broken, not the source", root)
 		}
 	}
@@ -493,109 +945,138 @@ func mustScanJoinSources(t *testing.T, roots []string) joinScan {
 	return scan
 }
 
-// Every scanned file except this one, with the exemption counted so it stays at one.
-// This file has to quote all four banned shapes to match them, so it is the one file no
-// matcher may run against, and a second file cannot quietly join it and become a place
-// to hide a real join.
-func joinSourcesUnderGate(t *testing.T, scan joinScan) map[string]string {
-	t.Helper()
-	gated := map[string]string{}
-	exempt := 0
-	for path, text := range scan.sourceTexts {
-		if filepath.Base(path) == joinSelfName {
-			exempt++
-			continue
-		}
-		gated[path] = text
-	}
-	if exempt != 1 {
-		t.Errorf("%d scanned files carry the self exemption, want exactly 1 named %s", exempt, joinSelfName)
-	}
-	return gated
-}
-
-// One file's text with comments blanked out and line positions preserved, so a failure
-// names the line a reader will find. Blanking rather than deleting keeps a stripped line
-// from joining the two around it into a shape neither of them had.
+// The paths the gate iterates, with the accounting that keeps an empty set from reading
+// as a clean tree.
 //
-// Comments are stripped because these gates are about expressions, while the comment
-// explaining why the join is confined is the comment a reader most wants: record.go and
-// this file both write all four banned shapes in prose for exactly that reason, and a
-// gate that fires on the sentence teaching the rule is a gate the next contributor
-// deletes. Line endings are normalised first — autocrlf is on at system scope on this
-// platform, and a matcher anchored on a line that ends in a carriage return is a gate
-// that has already stopped demanding anything.
-func joinCodeOf(text string) string {
-	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
-	code := make([]string, 0, len(lines))
-	inBlock := false
-	for _, line := range lines {
-		if inBlock {
-			_, afterClose, closed := strings.Cut(line, "*/")
-			if !closed {
-				code = append(code, "")
-				continue
-			}
-			inBlock = false
-			line = afterClose
-		}
-		if strings.HasPrefix(strings.TrimSpace(line), "//") {
-			code = append(code, "")
-			continue
-		}
-		if beforeOpen, afterOpen, opened := strings.Cut(line, "/*"); opened {
-			if _, tail, closed := strings.Cut(afterOpen, "*/"); closed {
-				line = beforeOpen + tail
-			} else {
-				inBlock = true
-				line = beforeOpen
-			}
-		}
-		code = append(code, line)
+// The scan refuses a root it could not read, but the set the gate walks is a step past
+// the scan, and a set that lost its contents between the two reports every root clean
+// having examined nothing — silently, because there is nothing left to report on. So the
+// arithmetic is here, in the function that hands the gate its work: every file the scan
+// collected is in the set, the set is not empty, and every root contributed to it.
+func joinPathsUnderGate(t *testing.T, scan joinScan, roots []string) []string {
+	t.Helper()
+	paths := joinScannedPaths(scan.syntax)
+	if len(paths) == 0 {
+		t.Fatal("the gate was handed no file to examine, so every rule below would hold vacuously")
 	}
-	return strings.Join(code, "\n")
-}
-
-// One line with every space removed, so that class | bucket and class|bucket are the
-// same shape to a matcher and a contributor cannot get past the gate with gofmt.
-func squeezed(line string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsSpace(r) {
-			return -1
+	if len(paths) != len(scan.sourceTexts) {
+		t.Fatalf("the gate would examine %d files while the scan collected %d", len(paths), len(scan.sourceTexts))
+	}
+	counts := scan.countsByRoot()
+	for _, root := range roots {
+		if counts[root] == 0 {
+			t.Fatalf("nothing from %s reached the gate, so that root is uncovered", root)
 		}
-		return r
-	}, line)
+	}
+	return paths
 }
 
-// Every line of one file's code that commits shape, squeezed as the matcher sees it, so
-// a failure prints the expression rather than a line number. The gates and the controls
-// both call this, so a change that makes it stop matching fails the control instead of
-// passing every file in the tree.
-func joinShapeLines(text string, shape joinShape) []string {
+// The source text of one node, whitespace collapsed, so a failure prints the expression
+// a reader will find rather than a line number they have to go and look up.
+func joinSourceOf(scan joinScan, text string, node ast.Node) string {
+	from := scan.fileSet.Position(node.Pos()).Offset
+	to := scan.fileSet.Position(node.End()).Offset
+	if from < 0 || len(text) < to || to <= from {
+		return "?"
+	}
+	return strings.Join(strings.Fields(text[from:to]), " ")
+}
+
+// Reduces one operand to what the rules ask about. Parentheses and conversions are
+// unwrapped on the way, so byte(0x10) is the same constant as 0x10 and (class) is the
+// same operand as class.
+func joinOperandOf(expr ast.Expr) joinOperand {
+	operand := joinOperand{}
+	words := strings.Builder{}
+	ast.Inspect(expr, func(node ast.Node) bool {
+		if ident, isIdent := node.(*ast.Ident); isIdent {
+			words.WriteString(strings.ToLower(ident.Name))
+			words.WriteByte(' ')
+		}
+		return true
+	})
+	operand.words = words.String()
+	if value, isConst := joinConstantOf(expr); isConst {
+		operand.constant = value
+		operand.isConst = true
+	}
+	return operand
+}
+
+// The integer an operand is, when it is one. A conversion of a literal counts, because
+// byte(16) and 16 are the same sixteen; a call to anything else does not, because this
+// gate cannot know what it answers.
+func joinConstantOf(expr ast.Expr) (int64, bool) {
+	switch node := expr.(type) {
+	case *ast.ParenExpr:
+		return joinConstantOf(node.X)
+	case *ast.CallExpr:
+		if _, isConversion := node.Fun.(*ast.Ident); isConversion && len(node.Args) == 1 {
+			return joinConstantOf(node.Args[0])
+		}
+	case *ast.BasicLit:
+		if node.Kind == token.INT {
+			if value, err := strconv.ParseInt(node.Value, 0, 64); err == nil {
+				return value, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// Every expression in one file that commits shape, with its position and its source, so
+// a failure is actionable. The gates and the controls both call this, so a rule that
+// stopped matching fails the control instead of passing every file in the tree.
+func joinShapeExpressions(scan joinScan, path string, shape joinShape) []string {
 	found := []string{}
-	for _, line := range strings.Split(joinCodeOf(text), "\n") {
-		squeezedLine := squeezed(line)
-		if shape.pattern.MatchString(squeezedLine) {
-			found = append(found, squeezedLine)
-		}
+	syntax, scanned := scan.syntax[path]
+	if !scanned {
+		return found
 	}
+	text := scan.sourceTexts[path]
+	ast.Inspect(syntax, func(node ast.Node) bool {
+		binary, isBinary := node.(*ast.BinaryExpr)
+		if !isBinary {
+			return true
+		}
+		left := joinOperandOf(binary.X)
+		right := joinOperandOf(binary.Y)
+		if shape.commits(binary.Op, left, right) {
+			found = append(found, fmt.Sprintf("%s: %s", scan.fileSet.Position(binary.Pos()), joinSourceOf(scan, text, binary)))
+		}
+		return true
+	})
 	return found
 }
 
-// The scanned paths whose code commits shape and whose base name is not allowed to,
-// each with the lines that did it, so a failure is actionable and a control can compare
-// an exact set.
-func joinViolations(sourceTexts map[string]string, shape joinShape, allowedFiles []string) map[string][]string {
+// The scanned paths whose code commits shape and that are not allowed to, each with the
+// expressions that did it.
+func joinViolations(scan joinScan, paths []string, shape joinShape, allowedPaths []string) map[string][]string {
 	violations := map[string][]string{}
-	for path, text := range sourceTexts {
-		if slices.Contains(allowedFiles, filepath.Base(path)) {
+	for _, path := range paths {
+		if slices.Contains(allowedPaths, path) {
 			continue
 		}
-		if lines := joinShapeLines(text, shape); 0 < len(lines) {
-			violations[path] = lines
+		if expressions := joinShapeExpressions(scan, path, shape); 0 < len(expressions) {
+			violations[path] = expressions
 		}
 	}
 	return violations
+}
+
+// Which of the paths the allowance let past, sorted. Compared against the allowance
+// itself rather than trusted to be it: an allowance that widened — to a base name, to a
+// directory, to a pattern that matches more than it names — is a gate that reports clean
+// over the files it stopped looking at, and this count is the only evidence.
+func joinAllowanceUsed(paths []string, allowedPaths []string) []string {
+	used := []string{}
+	for _, path := range paths {
+		if slices.Contains(allowedPaths, path) {
+			used = append(used, path)
+		}
+	}
+	slices.Sort(used)
+	return used
 }
 
 // The paths of anything keyed by path, sorted, for a failure message that has to show
@@ -613,99 +1094,139 @@ func joinScannedPaths[V any](byPath map[string]V) []string {
 // One fixture file, missing being fatal rather than empty: an absent fixture would make
 // every control assertion below trivially true, which is the failure this half of the
 // file exists to rule out.
-func joinControlFile(t *testing.T, control joinScan, name string) string {
+func joinControlPath(t *testing.T, control joinScan, name string) string {
 	t.Helper()
-	text, ok := control.sourceTexts[joinControlDir+"/"+name]
-	if !ok {
-		t.Fatalf("control fixture %s is missing; the scan read %v", name, joinScannedPaths(control.sourceTexts))
+	path := joinControlDir + "/" + name
+	if _, scanned := control.syntax[path]; !scanned {
+		t.Fatalf("control fixture %s is missing; the scan read %v", name, joinScannedPaths(control.syntax))
 	}
-	return text
+	return path
 }
 
-// The gate. Test files are in scope as well as production ones: a test that rebuilds the
-// join is a second implementation of it, and the assertion it makes about the wire is
-// then an assertion about itself.
+// The gate. Test files are in scope as well as production ones, this one included: a
+// test that rebuilds the join is a second implementation of it, and the assertion it
+// then makes about the wire is an assertion about itself. Nothing is exempt but the file
+// that is allowed to cross, and that exemption is counted.
 func TestClassBucketJoinIsConfinedToRecordGo(t *testing.T) {
-	scan := mustScanJoinSources(t, joinScanRoots(t))
-	sources := joinSourcesUnderGate(t, scan)
+	roots := joinScanRoots(t)
+	scan := mustScanJoinSources(t, roots)
+	paths := joinPathsUnderGate(t, scan, roots)
+	if used := joinAllowanceUsed(paths, joinAllowedPaths); !slices.Equal(used, slices.Sorted(slices.Values(joinAllowedPaths))) {
+		t.Errorf("the allowance let %v past, want exactly %v", used, joinAllowedPaths)
+	}
+	t.Logf("%d files under the gate, %v across the roots %v", len(paths), scan.countsByRoot(), roots)
 	for _, shape := range classBucketJoinShapes {
-		violations := joinViolations(sources, shape, joinAllowedFiles)
+		violations := joinViolations(scan, paths, shape, joinAllowedPaths)
 		for _, path := range joinScannedPaths(violations) {
-			t.Errorf("%s joins the retention class and the eph bucket in the shape %s; only %s may: %v",
-				path, shape.name, strings.Join(joinAllowedFiles, " and "), violations[path])
+			t.Errorf("%s %s the retention class and the eph bucket in the shape %s; only %s may: %v",
+				path, shape.half.verb(), shape.name, strings.Join(joinAllowedPaths, " and "), violations[path])
 		}
 	}
 }
 
-// The allowance is only worth having if the join really is in the file it names. A
-// record.go that had stopped joining — because the join moved to a helper the matchers
+// The allowance is only worth having if the crossing really is in the file it names. A
+// record.go that had stopped joining — because the crossing moved to a helper the rules
 // do not look at, or because it was written in some shape none of them cover — would
-// leave the gate above passing over a tree where the rule no longer holds.
-func TestTheAllowedFileActuallyJoins(t *testing.T) {
+// leave the gate above passing over a tree where the rule no longer holds. Both halves
+// are required: the file allowed to join is the file allowed to split, and a split that
+// moved out from under the allowance is as silent as a join that did.
+func TestTheAllowedFileActuallyCrossesBothWays(t *testing.T) {
 	scan := mustScanJoinSources(t, []string{messageRoot})
-	for _, name := range joinAllowedFiles {
-		text, ok := scan.sourceTexts[name]
-		if !ok {
-			t.Fatalf("%s is allowed to join but the scan did not read it; it read %v", name, joinScannedPaths(scan.sourceTexts))
+	for _, allowed := range joinAllowedPaths {
+		if _, scanned := scan.syntax[allowed]; !scanned {
+			t.Fatalf("%s is allowed to cross but the scan did not read it; it read %v", allowed, joinScannedPaths(scan.syntax))
 		}
-		joins := []string{}
+		committed := map[joinHalf][]string{}
 		for _, shape := range classBucketJoinShapes {
-			if 0 < len(joinShapeLines(text, shape)) {
-				joins = append(joins, shape.name)
+			if 0 < len(joinShapeExpressions(scan, allowed, shape)) {
+				committed[shape.half] = append(committed[shape.half], shape.name)
 			}
 		}
-		if len(joins) == 0 {
-			t.Errorf("%s is the only file allowed to join the class and the bucket, and it commits none of the shapes %v; either the join moved or the matchers no longer see it", name, shapeNames())
-		} else {
-			t.Logf("%s joins in the shapes %v", name, joins)
+		for _, half := range []joinHalf{joinsTheByte, splitsTheByte} {
+			if len(committed[half]) == 0 {
+				t.Errorf("%s is the only file allowed to cross between the class and the bucket, and nothing in it %s them in any of the shapes %v; either that half moved or the rules no longer see it",
+					allowed, half.verb(), shapeNames(half))
+			}
+		}
+		t.Logf("%s joins in %v and splits in %v", allowed, committed[joinsTheByte], committed[splitsTheByte])
+	}
+}
+
+// The allowance names a path and not a base name, exercised rather than asserted.
+//
+// This is one line of the gate, the line that decides whether a file is exempt, and it
+// is the whole of the gate's surface area, so it is tested against a file that is not
+// there rather than trusted to be right. connect/mls is free to grow a record.go
+// tomorrow; on a base name it would inherit the exemption of a file in another package
+// and every rule would stop looking at it, silently, because an exemption reports
+// nothing. The same fixture is asked about twice, under the path the allowance names and
+// under a path that merely shares its base name, and the two answers have to differ.
+func TestTheAllowanceIsAPathAndNotABaseName(t *testing.T) {
+	control := mustScanJoinSources(t, []string{joinControlDir})
+	fixture := joinControlPath(t, control, "join.go")
+	for _, allowed := range joinAllowedPaths {
+		elsewhere := mlsRoot + "/" + filepath.Base(allowed)
+		for _, path := range []string{allowed, elsewhere} {
+			control.sourceTexts[path] = control.sourceTexts[fixture]
+			control.syntax[path] = control.syntax[fixture]
+			control.rootOf[path] = messageRoot
+		}
+		for _, shape := range classBucketJoinShapes {
+			if violations := joinViolations(control, []string{allowed}, shape, joinAllowedPaths); 0 < len(violations) {
+				t.Errorf("%s is the file the allowance names and it was reported for %s: %v", allowed, shape.name, violations)
+			}
+			if violations := joinViolations(control, []string{elsewhere}, shape, joinAllowedPaths); len(violations) == 0 {
+				t.Errorf("%s commits %s and the allowance let it past; only %v is exempt, and %s is another package's file that happens to share a name",
+					elsewhere, shape.name, joinAllowedPaths, elsewhere)
+			}
 		}
 	}
 }
 
-// The shape names, for a message that has to list what was looked for.
-func shapeNames() []string {
-	names := make([]string, 0, len(classBucketJoinShapes))
-	for _, shape := range classBucketJoinShapes {
-		names = append(names, shape.name)
+// The positive control. Every rule must fire on the fixture that commits its shape, and
+// the confinement check must report that fixture and nothing else, so a rule that
+// stopped matching fails here rather than issuing the tree a clean bill.
+func TestJoinRulesFlagTheControlFixture(t *testing.T) {
+	// spec A section 5.1 enumerates the join half, so that half is pinned to its four
+	// names; the split half is this file's own reading of the same sentence and only has
+	// to exist
+	if want := []string{"16+bucket", "class*16", "class<<4", "class|bucket"}; !slices.Equal(shapeNames(joinsTheByte), want) {
+		t.Fatalf("the join half bans %v, want the %v of spec A section 5.1", shapeNames(joinsTheByte), want)
 	}
-	return names
-}
-
-// The positive control. Every matcher must fire on the fixture that commits its shape,
-// and the confinement check must report that fixture and nothing else, so a matcher
-// that stopped matching fails here rather than issuing the tree a clean bill.
-func TestJoinMatchersFlagTheControlFixture(t *testing.T) {
-	if len(classBucketJoinShapes) != 4 {
-		t.Fatalf("%d shapes are banned, want the 4 of spec A section 5.1", len(classBucketJoinShapes))
+	if len(shapeNames(splitsTheByte)) == 0 {
+		t.Fatal("nothing bans the split half, and the split is the join read backwards")
 	}
 	control := mustScanJoinSources(t, []string{joinControlDir})
-	text := joinControlFile(t, control, "join.go")
+	paths := joinScannedPaths(control.syntax)
+	fixture := joinControlPath(t, control, "join.go")
 	for _, shape := range classBucketJoinShapes {
-		lines := joinShapeLines(text, shape)
-		if len(lines) == 0 {
-			t.Errorf("the matcher for %s found nothing in the control fixture, so it is no longer a gate", shape.name)
+		expressions := joinShapeExpressions(control, fixture, shape)
+		if len(expressions) == 0 {
+			t.Errorf("the rule for %s found nothing in the control fixture, so it is no longer a gate", shape.name)
 			continue
 		}
-		t.Logf("%s matched %v", shape.name, lines)
-		violations := joinViolations(control.sourceTexts, shape, joinAllowedFiles)
-		if !slices.Equal(joinScannedPaths(violations), []string{joinControlDir + "/join.go"}) {
+		t.Logf("%s matched %v", shape.name, expressions)
+		violations := joinViolations(control, paths, shape, joinAllowedPaths)
+		if !slices.Equal(joinScannedPaths(violations), []string{fixture}) {
 			t.Errorf("the confinement check reported %v for %s, want only the fixture that commits it", joinScannedPaths(violations), shape.name)
 		}
 	}
 }
 
-// The negative half of the control: a fixture that writes all four shapes in prose and
-// does the legal thing must be reported by nothing. Without it, a matcher that answered
-// yes to every file would pass the positive control above.
-func TestJoinMatchersIgnoreTheDocumentedFixture(t *testing.T) {
+// The negative half of the control: a fixture that writes every shape in prose, puts one
+// of those sentences on the end of a line of working code, and commits none of them,
+// must be reported by nothing. Without it, a rule that answered yes to every expression
+// would pass the positive control above.
+func TestJoinRulesIgnoreTheDocumentedFixture(t *testing.T) {
 	control := mustScanJoinSources(t, []string{joinControlDir})
-	text := joinControlFile(t, control, "documented.go")
+	fixture := joinControlPath(t, control, "documented.go")
 	for _, shape := range classBucketJoinShapes {
-		if lines := joinShapeLines(text, shape); 0 < len(lines) {
-			t.Errorf("the matcher for %s fired on %v in the fixture that only writes about the shapes", shape.name, lines)
+		if expressions := joinShapeExpressions(control, fixture, shape); 0 < len(expressions) {
+			t.Errorf("the rule for %s fired on %v in the fixture that only writes about the shapes", shape.name, expressions)
 		}
 	}
 	// and it has to actually contain them, or it controls nothing
+	text := control.sourceTexts[fixture]
 	for _, shape := range classBucketJoinShapes {
 		if !strings.Contains(text, shape.name) {
 			t.Errorf("the documented fixture does not mention %s, so it controls nothing", shape.name)
@@ -737,31 +1258,93 @@ func TestJoinScanRefusesARootItCannotCover(t *testing.T) {
 	}
 }
 
-// What the gate actually read, reported rather than trusted. The bookkeeping check is
-// the part the scan itself does not do: a per root count that no longer adds up to the
+// A file the parser cannot read is refused too. Every rule below the scan reads a syntax
+// tree, so a file that produced none is a file nothing was asked about — and skipping it
+// quietly is how a whole root becomes invisible one file at a time.
+//
+// The root holds a file that parses as well as the one that does not, and the error has
+// to name the broken one. Without the file that parses this answers for the wrong
+// reason: a skipped file leaves the root contributing nothing, the empty root rule fires,
+// and the scan is refused whether or not anything ever looked at the parse. With it, the
+// parse is the only thing left that can fail.
+//
+// The broken file is written here rather than committed: a go file that does not parse,
+// sitting in the tree, is something every formatter and every editor reports forever.
+func TestJoinScanRefusesAFileItCannotParse(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "good.go"), []byte("package good\n"), 0o600); err != nil {
+		t.Fatalf("writing the fixture that parses: %v", err)
+	}
+	if _, err := scanJoinSources([]string{root}); err != nil {
+		t.Fatalf("a root holding one file that parses was refused: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "broken.go"), []byte("package good\n\nfunc ("), 0o600); err != nil {
+		t.Fatalf("writing the unparseable fixture: %v", err)
+	}
+	_, err := scanJoinSources([]string{root})
+	if err == nil {
+		t.Fatal("a root holding a file the parser refused scanned clean")
+	}
+	if !strings.Contains(err.Error(), "broken.go") {
+		t.Errorf("the scan was refused with %v, which does not name the file that would not parse", err)
+	}
+}
+
+// What the gate actually read, reported rather than trusted. The bookkeeping check is the
+// part the scan itself does not do: a per root attribution that no longer adds up to the
 // collected set means files are being counted for a root that did not supply them.
 func TestJoinScanCoversEveryRoot(t *testing.T) {
 	roots := joinScanRoots(t)
 	scan := mustScanJoinSources(t, roots)
+	counts := scan.countsByRoot()
 	total := 0
 	for _, root := range roots {
-		t.Logf("root %s contributed %d go files", root, scan.rootFileCounts[root])
-		total += scan.rootFileCounts[root]
+		t.Logf("root %s contributed %d go files", root, counts[root])
+		total += counts[root]
 	}
-	if len(scan.sourceTexts) != total {
-		t.Errorf("the scan holds %d files while the roots counted %d", len(scan.sourceTexts), total)
+	if len(scan.syntax) != total {
+		t.Errorf("the scan holds %d files while the roots counted %d", len(scan.syntax), total)
 	}
-	if len(scan.rootFileCounts) != len(roots) {
-		t.Errorf("%d roots contributed files, want %d", len(scan.rootFileCounts), len(roots))
+	if len(counts) != len(roots) {
+		t.Errorf("%d roots contributed files, want %d", len(counts), len(roots))
 	}
 }
 
-// The fixture is a file full of real joins, so the gate must be unable to see it. If a
-// directory named testdata ever stopped being skipped, the gate would fail on the
-// control instead of on the code, which is loud but misleading; this names the reason.
+// The sdk root has to be a path a checkout can actually put sdk in. It is a sibling
+// repository of connect, so a root that resolves inside connect is one sdk will never be
+// at — and because a missing root is logged rather than failed, an unreachable one is a
+// gate that promises to cover sdk in a message and never does. This is the assertion the
+// log line cannot make for itself.
+func TestTheSdkRootIsASiblingOfThisModule(t *testing.T) {
+	sdkRoot := joinSdkRoot(t)
+	moduleRoot, err := filepath.Abs(filepath.Join(messageRoot, ".."))
+	if err != nil {
+		t.Fatalf("resolving the module root: %v", err)
+	}
+	sdkAbsolute, err := filepath.Abs(sdkRoot)
+	if err != nil {
+		t.Fatalf("resolving %s: %v", sdkRoot, err)
+	}
+	if strings.HasPrefix(sdkAbsolute, moduleRoot+string(filepath.Separator)) {
+		t.Errorf("the sdk root %s resolves inside %s; sdk is a sibling repository and no checkout puts it there", sdkAbsolute, moduleRoot)
+	}
+	// and when the sibling really is checked out, the gate has to be covering it
+	entry, err := os.Stat(sdkRoot)
+	if err != nil || !entry.IsDir() {
+		t.Skipf("sdk is not checked out beside connect at %s, so there is nothing to cover", sdkAbsolute)
+	}
+	if !slices.Contains(joinScanRoots(t), sdkRoot) {
+		t.Errorf("%s is checked out and the gate does not cover it", sdkAbsolute)
+	}
+}
+
+// The fixture is a file full of real joins and splits, so the gate must be unable to see
+// it. If a directory named testdata ever stopped being skipped, the gate would fail on
+// the control instead of on the code, which is loud but misleading; this names the
+// reason.
 func TestJoinScanSkipsTestdata(t *testing.T) {
 	scan := mustScanJoinSources(t, joinScanRoots(t))
-	for _, path := range joinScannedPaths(scan.sourceTexts) {
+	for _, path := range joinScannedPaths(scan.syntax) {
 		if strings.HasPrefix(path, "testdata/") || strings.Contains(path, "/testdata/") {
 			t.Errorf("the gate read %s; the control fixture and vendored corpora must stay out of scope", path)
 		}

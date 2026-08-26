@@ -3,13 +3,15 @@
 // carries on, and that rule is what the shape of this file enforces.
 //
 // The rule has a second half worth stating here, because this is the file a reader
-// checks it against. Nothing in this package signals a failure with a bool. The only
-// three helpers that may return a bare bool are the verifiers of spec A section 5.7 —
-// VerifyWriteAuth, VerifyRequestAuth and VerifyRecoveryProof — where the bool is the
-// answer to a constant time comparison rather than a report of something having gone
-// wrong, and each of their callers is asserted to return on false. Everything else
-// hands back one of these values, so a caller that wants to continue past a failure has
-// to write the code that ignores an error, in plain sight.
+// checks it against. Nothing in this package signals a failure with a bool. The
+// verifiers of spec A section 5.7 — VerifyWriteAuth, VerifyRequestAuth and
+// VerifyRecoveryProof — return a bare bool because it is the answer to a constant time
+// comparison rather than a report of something having gone wrong, and each of their
+// callers is asserted to return on false. A predicate that answers a question about a
+// legal value is in the same category and not an exception to anything: ClassIsPrunable
+// says what a class is, and there is no failure in it to report. Everything that can
+// actually fail hands back one of these values, so a caller that wants to continue past
+// a failure has to write the code that ignores an error, in plain sight.
 //
 // Sentinels rather than error structs, and wrapped with %w at each site that has a
 // value worth naming, so errors.Is holds for the caller while the message still carries

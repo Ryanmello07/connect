@@ -10,9 +10,11 @@
 // The one thing to know before editing. The retention class and the eph bucket are two
 // fields in go and a single byte on the wire, and RetentionClassOf and RetentionClassWire
 // at the bottom of this file are the only two functions in the entire system that cross
-// between those two shapes. Their comments say why. A gate in record_test.go walks this
-// package and connect/mls for the four expression shapes that would quietly reimplement
-// the join somewhere else, and record.go is the one file it exempts.
+// between those two shapes. Their comments say why. A gate in record_test.go parses this
+// package, connect/mls and the sdk repository beside connect, and reports every
+// expression that would quietly rebuild either half of that crossing somewhere else.
+// record.go is the one path it exempts — the path, not the base name, so a record.go
+// arriving in another package is gated like anything else.
 package message
 
 import "fmt"
@@ -206,13 +208,14 @@ var nonEphWireBytes = map[RetentionClass]byte{
 // No other value is legal. 0x03 through 0x0f and 0x16 through 0xff are all errors.
 //
 // This function and RetentionClassWire are the only two in the system that split or
-// join the class and the eph bucket, and the ban is mechanical: record_test.go walks
-// this package and connect/mls for the four expression shapes that would rebuild the
-// join elsewhere. The reason is not tidiness. A single u8 whose meaning depends on its
-// own high bits is exactly the field that gets compared with == somewhere — in a prune
-// query, in a key lookup, in a switch — and that comparison silently treats eph bucket
-// 1 as a different class from eph bucket 0, so half the eph records fall out of a rule
-// that reads as though it covered all of them. With the split confined here, every
+// join the class and the eph bucket, and the ban is mechanical: record_test.go reads the
+// syntax tree of every go file under this package, connect/mls and sdk, and reports the
+// expressions that would rebuild the join or the split elsewhere. The reason is not
+// tidiness. A single u8 whose meaning depends on its own high bits is exactly the field
+// that gets compared with == somewhere — in a prune query, in a key lookup, in a switch
+// — and that comparison silently treats eph bucket 1 as a different class from eph
+// bucket 0, so half the eph records fall out of a rule that reads as though it covered
+// all of them. With the split confined here, every
 // caller above holds a class it can compare and a bucket it can compare, and neither
 // comparison can accidentally be about the other.
 //
@@ -245,6 +248,15 @@ func RetentionClassOf(wire byte) (RetentionClass, uint8, error) {
 //
 // The byte returned alongside an error is not a legal wire byte, for the same reason
 // the split's class is not a legal class.
+//
+// The signature diverges from the one spec A section 12.1 publishes, which is
+// RetentionClassWire(c RetentionClass, ephBucket uint8) byte with no error, and the
+// divergence is deliberate: the error is what makes the two refusals above possible at
+// all, and a function that cannot refuse has to normalise, which is the silent
+// mis-storage those two paragraphs exist to prevent. Master section 8 gives no go
+// signature, so it does not settle it. Both section 12.1 blocks — spec A's and the copy
+// spec B restates — need the amendment, and spec B's server will not compile against
+// this package until they get it.
 func RetentionClassWire(class RetentionClass, ephBucket uint8) (byte, error) {
 	if class == RetentionEph {
 		if ephBucketMax < ephBucket {
@@ -260,4 +272,35 @@ func RetentionClassWire(class RetentionClass, ephBucket uint8) (byte, error) {
 		return retentionWireInvalid, fmt.Errorf("%w: class %d carries eph bucket %d", ErrEphBucketOnNonEphClass, class, ephBucket)
 	}
 	return wire, nil
+}
+
+// Whether the server may ever erase the body of a record of this class. Spec B section
+// 7.2 gives the action each class takes at prune_after and spec B section 3.5 sums it up
+// in a column: permanent is never prunable, and every other class has a deadline past
+// which the body goes.
+//
+// The question is about the class alone. A durable group that publishes no ttl has an
+// infinite deadline, but it is still a class the sweep acts on, and the deadline itself
+// is the server's arithmetic over the group's policy rather than anything this package
+// can answer.
+//
+// A value this package does not define as a class answers no. Spec A section 12.1
+// publishes this without an error, so there is nowhere to report one, and no is the
+// answer that keeps data: a byte that decoded to nothing legal was refused at the split
+// long before it reached here, and a caller that walked past that refusal must not have
+// the walk turned into a delete. The bool is a property of a legal value rather than a
+// report of a failure, which is why it does not break the rule errors.go states.
+func ClassIsPrunable(class RetentionClass) bool {
+	prunable, known := classPrunable[class]
+	return known && prunable
+}
+
+// The prunable column of spec B section 3.5. A table rather than a comparison against
+// permanent, so a class added later has to be given an answer here instead of inheriting
+// one from whichever side of a != it happens to fall.
+var classPrunable = map[RetentionClass]bool{
+	RetentionPermanent: false,
+	RetentionDurable:   true,
+	RetentionMedia:     true,
+	RetentionEph:       true,
 }
