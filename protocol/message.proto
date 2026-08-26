@@ -57,6 +57,19 @@ message MessageServerRequest {
 message MessageServerResponse {
     uint64 request_id = 1;
     Reason reason = 2;                  // REASON_OK on success
+    uint32 retry_after_ms = 3;          // Spec B §4.5. Meaningful ONLY when reason is
+                                        // REASON_RATE_LIMITED or REASON_CARD_RATE_LIMITED;
+                                        // zero and ignored otherwise. It is on the envelope
+                                        // rather than in a body because rate limiting can
+                                        // refuse ANY operation, including ones whose
+                                        // response body is empty or absent.
+                                        //
+                                        // Safe to add late for a narrow reason, NOT the
+                                        // general one: it is not on any signed field list.
+                                        // Response fields are not categorically additive —
+                                        // FetchAttestation.sig covers nine FetchResponse
+                                        // fields and MASTER §9.4 requires both sides to
+                                        // agree on that preimage byte for byte.
     oneof body {
         HelloResponse         hello           = 10;
         CreateGroupResponse   create_group    = 11;
@@ -330,8 +343,12 @@ message TransientPush {                 // EPH(0) — receipts, typing. Never to
 // authenticator break. Raised as a spec divergence; settle it against Spec B
 // before first ship.
 message UnsubscribeRequest {
-    repeated bytes group_ids = 1;       // the subscriptions on THIS connection to cancel;
-                                        // empty = cancel every subscription on it
+    repeated bytes group_ids = 1;       // cancel these subscriptions on THIS connection.
+                                        // Unknown ids are ignored, never refused: refusing
+                                        // would make this an existence oracle for the price
+                                        // of one request.
+    bool           all       = 2;       // true = cancel every subscription on this connection.
+                                        // When true, group_ids MUST be empty and is ignored.
 }
 
 

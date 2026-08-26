@@ -499,9 +499,23 @@ func (*MessageServerRequest_RendezvousCollect) isMessageServerRequest_Body() {}
 func (*MessageServerRequest_RendezvousRetire) isMessageServerRequest_Body() {}
 
 type MessageServerResponse struct {
-	state     protoimpl.MessageState `protogen:"open.v1"`
-	RequestId uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Reason    Reason                 `protobuf:"varint,2,opt,name=reason,proto3,enum=bringyour.Reason" json:"reason,omitempty"` // REASON_OK on success
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	RequestId    uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Reason       Reason                 `protobuf:"varint,2,opt,name=reason,proto3,enum=bringyour.Reason" json:"reason,omitempty"`             // REASON_OK on success
+	RetryAfterMs uint32                 `protobuf:"varint,3,opt,name=retry_after_ms,json=retryAfterMs,proto3" json:"retry_after_ms,omitempty"` // Spec B §4.5. Meaningful ONLY when reason is
+	// REASON_RATE_LIMITED or REASON_CARD_RATE_LIMITED;
+	// zero and ignored otherwise. It is on the envelope
+	// rather than in a body because rate limiting can
+	// refuse ANY operation, including ones whose
+	// response body is empty or absent.
+	//
+	// Safe to add late for a narrow reason, NOT the
+	// general one: it is not on any signed field list.
+	// Response fields are not categorically additive —
+	// FetchAttestation.sig covers nine FetchResponse
+	// fields and MASTER §9.4 requires both sides to
+	// agree on that preimage byte for byte.
+	//
 	// Types that are valid to be assigned to Body:
 	//
 	//	*MessageServerResponse_Hello
@@ -565,6 +579,13 @@ func (x *MessageServerResponse) GetReason() Reason {
 		return x.Reason
 	}
 	return Reason_REASON_OK
+}
+
+func (x *MessageServerResponse) GetRetryAfterMs() uint32 {
+	if x != nil {
+		return x.RetryAfterMs
+	}
+	return 0
 }
 
 func (x *MessageServerResponse) GetBody() isMessageServerResponse_Body {
@@ -2516,8 +2537,12 @@ func (x *TransientPush) GetRecords() []*Record {
 // authenticator break. Raised as a spec divergence; settle it against Spec B
 // before first ship.
 type UnsubscribeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	GroupIds      [][]byte               `protobuf:"bytes,1,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"` // the subscriptions on THIS connection to cancel;
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	GroupIds [][]byte               `protobuf:"bytes,1,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"` // cancel these subscriptions on THIS connection.
+	// Unknown ids are ignored, never refused: refusing
+	// would make this an existence oracle for the price
+	// of one request.
+	All           bool `protobuf:"varint,2,opt,name=all,proto3" json:"all,omitempty"` // true = cancel every subscription on this connection.
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2557,6 +2582,13 @@ func (x *UnsubscribeRequest) GetGroupIds() [][]byte {
 		return x.GroupIds
 	}
 	return nil
+}
+
+func (x *UnsubscribeRequest) GetAll() bool {
+	if x != nil {
+		return x.All
+	}
+	return false
 }
 
 type BlobGrantRequest struct {
@@ -4436,11 +4468,12 @@ const file_message_proto_rawDesc = "" +
 	"\x12rendezvous_deposit\x18\x16 \x01(\v2#.bringyour.RendezvousDepositRequestH\x00R\x11rendezvousDeposit\x12T\n" +
 	"\x12rendezvous_collect\x18\x17 \x01(\v2#.bringyour.RendezvousCollectRequestH\x00R\x11rendezvousCollect\x12Q\n" +
 	"\x11rendezvous_retire\x18\x18 \x01(\v2\".bringyour.RendezvousRetireRequestH\x00R\x10rendezvousRetireB\x06\n" +
-	"\x04body\"\xbd\b\n" +
+	"\x04body\"\xe3\b\n" +
 	"\x15MessageServerResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12)\n" +
-	"\x06reason\x18\x02 \x01(\x0e2\x11.bringyour.ReasonR\x06reason\x120\n" +
+	"\x06reason\x18\x02 \x01(\x0e2\x11.bringyour.ReasonR\x06reason\x12$\n" +
+	"\x0eretry_after_ms\x18\x03 \x01(\rR\fretryAfterMs\x120\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2\x18.bringyour.HelloResponseH\x00R\x05hello\x12C\n" +
 	"\fcreate_group\x18\v \x01(\v2\x1e.bringyour.CreateGroupResponseH\x00R\vcreateGroup\x123\n" +
@@ -4611,9 +4644,10 @@ const file_message_proto_rawDesc = "" +
 	"\x14high_water_record_id\x18\x03 \x01(\x04R\x11highWaterRecordId\"W\n" +
 	"\rTransientPush\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\fR\agroupId\x12+\n" +
-	"\arecords\x18\x02 \x03(\v2\x11.bringyour.RecordR\arecords\"1\n" +
+	"\arecords\x18\x02 \x03(\v2\x11.bringyour.RecordR\arecords\"C\n" +
 	"\x12UnsubscribeRequest\x12\x1b\n" +
-	"\tgroup_ids\x18\x01 \x03(\fR\bgroupIds\"\x84\x02\n" +
+	"\tgroup_ids\x18\x01 \x03(\fR\bgroupIds\x12\x10\n" +
+	"\x03all\x18\x02 \x01(\bR\x03all\"\x84\x02\n" +
 	"\x10BlobGrantRequest\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\fR\agroupId\x12\x17\n" +
 	"\ablob_id\x18\x02 \x01(\fR\x06blobId\x122\n" +
