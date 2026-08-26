@@ -44,7 +44,7 @@ type classBucket struct {
 // bytes rather than by writing the nine down. Everything below reads its universe out
 // of this, so a parser that accepted a tenth byte would carry that byte into every
 // assertion that follows and be caught by the one that pins the set.
-func acceptedWireBytes(t *testing.T) map[byte]classBucket {
+func acceptedWireBytes(t testing.TB) map[byte]classBucket {
 	t.Helper()
 	accepted := map[byte]classBucket{}
 	for value := 0; value <= 0xFF; value++ {

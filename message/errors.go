@@ -36,4 +36,35 @@ var (
 	// it silently — which stores the record as though the caller's belief about the
 	// bucket had been right.
 	ErrEphBucketOnNonEphClass = errors.New("message: a retention class other than eph carries a non zero eph bucket")
+	// Fires when EncodeRecord is handed no record at all. A nil here is a caller bug
+	// rather than a bad record, and it is reported rather than dereferenced because the
+	// server encodes on the read path, where a panic would take a fetch for an unrelated
+	// group down with it.
+	ErrRecordNil = errors.New("message: no record to encode")
+	// Fires when a record's leading format version byte is not the one this package
+	// writes. It is its own sentinel rather than a generic decode failure because every
+	// offset in the record is only meaningful under a known version, so this is the one
+	// refusal a caller can act on — by asking for a newer client rather than by treating
+	// the record as corrupt.
+	ErrRecordFormatVersion = errors.New("message: record format version is not one this package reads")
+	// Fires when the is_commit byte is neither 0 nor 1. The server acts on this field, so
+	// it is authenticated, and a decoder that read it as "any non zero is true" would let
+	// two implementations that disagree about the byte both believe they had parsed the
+	// record while the mac over it says they had not.
+	ErrIsCommitNotBoolean = errors.New("message: the is_commit byte is neither 0 nor 1")
+	// Fires when a size bucket is past the top of the ladder. There are six rungs and no
+	// seventh, and a record naming one has no body length, no ct_body check the server
+	// could apply, and no padding rung its sender could have padded to.
+	ErrSizeBucketOutOfRange = errors.New("message: size bucket is outside 0..5")
+	// Fires in both directions of the blob rule: a record on the blob rung whose blob id
+	// is not exactly 32 bytes, and a record off it that carries one at all. The two are
+	// one sentinel because they are one rule — the presence of the blob id is the size
+	// bucket restated — and a caller that told them apart would be acting on a
+	// distinction the record does not carry.
+	ErrBlobIdPresence = errors.New("message: blob id presence disagrees with the size bucket")
+	// Fires when a ct_body is neither absent nor exactly the ciphertext length of its size
+	// bucket. Absent is legal on the read path, where the body may have been erased by
+	// retention or skipped by a heads_only fetch; any other length is a body that was not
+	// padded to its rung, which leaks the length the padding exists to hide.
+	ErrCtBodyLength = errors.New("message: ct_body length is neither absent nor the size bucket's")
 )
