@@ -22,9 +22,18 @@
 // it. They were not on it originally — that block listed functions and types and no
 // errors — and they were added as amendments A-8 and B-8 rather than kept internal,
 // because the guardrail above only means anything if the caller can name what it caught:
-// an error a server cannot name is one it can only match on message text. A sentinel
-// added here is an addition to that surface and belongs in the same commit as the
-// amendment that publishes it.
+// an error a server cannot name is one it can only match on message text.
+//
+// The rule for a sentinel added later follows from that reason rather than from the count.
+// A sentinel the server can provoke is an addition to the published surface and belongs in
+// the same commit as the amendment that publishes it. A sentinel only a function the
+// server never calls can reach is not: publishing it would widen the allowlist of section
+// 12.1 with a name no server can use, and that block is an allowlist of what the server
+// may reach and not an inventory of this package. The last two below are of that kind —
+// ErrRecordHeaderNil and ErrServerAttachmentMismatch are AADHead's, and AADHead is a
+// sealing side builder that never appears on the server's surface, which holds verifiers
+// and no builders at all. If one of them ever becomes reachable from a published function,
+// it stops being of that kind and the amendment is owed.
 package message
 
 import "errors"
@@ -76,4 +85,18 @@ var (
 	// retention or skipped by a heads_only fetch; any other length is a body that was not
 	// padded to its rung, which leaks the length the padding exists to hide.
 	ErrCtBodyLength = errors.New("message: ct_body length is neither absent nor the size bucket's")
+	// Fires when AADHead is handed no header at all. The same caller bug ErrRecordNil
+	// names, one layer in, and reported rather than dereferenced for the reason nothing in
+	// this package panics: a preimage builder runs on the seal and the open path alike, and
+	// a nil there would take down a fetch of records that are every one of them well formed.
+	ErrRecordHeaderNil = errors.New("message: no record header to build a preimage over")
+	// Fires when AADHead's attachment argument and the header's own ServerAttachment field
+	// disagree. The attachment is one value carried in two places — the argument, which is
+	// the shape spec A section 12.1 publishes for the sibling WriteAuthPreimage, and the
+	// header field the parser fills in — and a caller that lets them differ seals ct_head
+	// under a preimage no reader will reconstruct, which surfaces as an aead failure on a
+	// record that is otherwise entirely valid. Refused rather than resolved: preferring one
+	// of the two would make a record's fate depend on which one this function happened to
+	// pick.
+	ErrServerAttachmentMismatch = errors.New("message: the server attachment argument and the header's own field disagree")
 )
