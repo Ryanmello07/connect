@@ -72,12 +72,21 @@ func ZeroSecret(crypto CryptoProvider) []byte {
 //
 // The pseudorandom key is erased before returning. It is not the joiner secret and nothing
 // downstream needs it, and it is one HKDF-Expand away from every key of the epoch.
+//
+// A nil context is refused rather than serialized. syntax.Marshal is handed a non nil
+// interface holding a nil pointer, so MarshalMLS dereferences it and the caller gets a
+// runtime panic raised inside the syntax package, naming neither this function nor the
+// argument that was missing. Every caller of this takes its context off a struct field,
+// which is exactly where an unset one comes from.
 func DeriveJoinerSecret(
 	crypto CryptoProvider,
 	initSecretPrev []byte,
 	commitSecret []byte,
 	groupContext *GroupContext,
 ) ([]byte, error) {
+	if groupContext == nil {
+		return nil, ErrNilGroupContext
+	}
 	nh := crypto.HashSize()
 	if len(initSecretPrev) != nh {
 		return nil, fmt.Errorf("%w: init secret is %d bytes, want %d", ErrSecretLength, len(initSecretPrev), nh)

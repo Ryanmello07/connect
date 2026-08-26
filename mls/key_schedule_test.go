@@ -25,8 +25,10 @@ package mls
 
 import (
 	"bytes"
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -233,10 +235,16 @@ func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
 // difference between sweeping the class and sweeping a copy of it.
 const keyScheduleErrorsFile = "errors_key_schedule.go"
 
-// keyScheduleOwnedErrors is registry section 5.6: the ten this plan declares, keyed by the
-// name each is declared under so the derivation below can compare the two sets by name.
+// keyScheduleOwnedErrors is registry section 5.6's ten plus ErrNilGroupContext, keyed by
+// the name each is declared under so the derivation below can compare the two sets by name.
 // ErrPskNonceLength, ErrPskType and ErrDuplicatePsk are deliberately absent — they are
 // ValSem401, ValSem402 and ValSem403 and belong to the validation plan's errors.go.
+//
+// ErrNilGroupContext is the one name here the registry does not carry. It is not a protocol
+// condition; it is the refusal that stands where DeriveJoinerSecret used to raise a nil
+// pointer dereference out of syntax.Marshal, and it is declared beside the others because
+// this file is where the key schedule's errors live and a second declaration site is how
+// two sentinels for one condition happen.
 //
 // Nothing here is trusted: TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile holds
 // this map to what errors_key_schedule.go actually declares, in both directions.
@@ -244,6 +252,7 @@ var keyScheduleOwnedErrors = map[string]error{
 	"ErrSecretLength":                 ErrSecretLength,
 	"ErrExportLength":                 ErrExportLength,
 	"ErrGroupContextTrailingBytes":    ErrGroupContextTrailingBytes,
+	"ErrNilGroupContext":              ErrNilGroupContext,
 	"ErrTranscriptHashLength":         ErrTranscriptHashLength,
 	"ErrPskCount":                     ErrPskCount,
 	"ErrSecretTreeLeafOutOfRange":     ErrSecretTreeLeafOutOfRange,
@@ -304,12 +313,16 @@ func TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile(t *testing.T) {
 // vars sharing one errors.New value make a length failure indistinguishable from an
 // exhaustion failure at every call site that branches on them.
 //
-// The count assertion pins the registry: section 5.6 names ten, so an eleventh is a change
-// to the registry and has to be made deliberately. What stops the list shrinking, and what
+// The count assertion pins the file: a name added to it is a change somebody has to make
+// deliberately, in the same commit, with a reason. What stops the list shrinking, and what
 // stops it lagging behind the file, is the derivation above rather than this number.
+//
+// Eleven rather than the ten of registry section 5.6: ErrNilGroupContext is the twelfth
+// name this file could have carried and the first one added here that the registry does not
+// list, because it names an argument that was missing rather than a protocol condition.
 func TestKeyScheduleErrorsAreDistinct(t *testing.T) {
-	if len(keyScheduleOwnedErrors) != 10 {
-		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6", len(keyScheduleOwnedErrors))
+	if len(keyScheduleOwnedErrors) != 11 {
+		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext", len(keyScheduleOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(keyScheduleOwnedErrors))
 	for i, name := range names {
@@ -877,5 +890,281 @@ func TestDeriveJoinerSecretLeavesTheCallersInputsAlone(t *testing.T) {
 	}
 	if !bytes.Equal(initSecret, initAfter) || !bytes.Equal(commitSecret, commitAfter) {
 		t.Errorf("writing through the joiner secret changed one of the secrets it was derived from, so it is a window onto storage the caller owns")
+	}
+}
+
+// extractCapturingProvider keeps the pseudorandom key DeriveJoinerSecret builds, so a test
+// can read that storage back after the call has returned.
+//
+// The slice is returned unchanged rather than copied, and that is the whole mechanism this
+// observes: zeroizeSecret writes through the backing array its argument points at, so a
+// wrapper that handed the caller a clone would be handing it a different array the erase
+// never reaches, and the property would read as absent however the production code behaved.
+// The count is kept too, because "the key was erased" means nothing if no key was made.
+type extractCapturingProvider struct {
+	CryptoProvider
+	extracted [][]byte
+}
+
+func (self *extractCapturingProvider) Extract(salt []byte, ikm []byte) []byte {
+	prk := self.CryptoProvider.Extract(salt, ikm)
+	self.extracted = append(self.extracted, prk)
+	return prk
+}
+
+// TestDeriveJoinerSecretErasesThePseudorandomKey observes the sentence key_schedule.go
+// writes above DeriveJoinerSecret: "The pseudorandom key is erased before returning."
+//
+// Nothing observed it before. Deleting the zeroizeSecret call failed exactly one assertion
+// in the whole package -- TestNoStubShapesRemainInSource reporting that zeroizeSecret then
+// has no caller -- which is a statement about the call graph and not about the key. That
+// catch expires on the next production caller of the helper, and the plan lands six of
+// them; this one does not expire, because what it reads is the storage.
+//
+// The control matters as much as the assertion. A run of Nh zero bytes is what a stub
+// answers, so "every byte is zero afterwards" is only evidence if the same Extract over the
+// same inputs produces something that is not already zero, and that is asserted first.
+func TestDeriveJoinerSecretErasesThePseudorandomKey(t *testing.T) {
+	for _, suite := range Suites() {
+		inner := mustProvider(t, suite)
+		nh := inner.HashSize()
+		initSecret := bytes.Repeat([]byte{0xa5}, nh)
+		commitSecret := bytes.Repeat([]byte{0x5a}, nh)
+		groupContext := ksVectorEpoch0GroupContext(t)
+
+		// the control: the key this call will erase is not zero to begin with
+		fresh := inner.Extract(initSecret, commitSecret)
+		if !slices.ContainsFunc(fresh, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("suite %#04x: Extract over these inputs is already %d zero bytes, so an all zero reading below would say nothing",
+				uint16(suite), len(fresh))
+		}
+
+		crypto := &extractCapturingProvider{CryptoProvider: inner}
+		joiner, err := DeriveJoinerSecret(crypto, initSecret, commitSecret, groupContext)
+		if err != nil {
+			t.Fatalf("suite %#04x: DeriveJoinerSecret: %v", uint16(suite), err)
+		}
+		if len(crypto.extracted) != 1 {
+			t.Fatalf("suite %#04x: Extract was called %d times, want 1; this gate reads the key that one call returned",
+				uint16(suite), len(crypto.extracted))
+		}
+		prk := crypto.extracted[0]
+		if len(prk) != nh {
+			t.Fatalf("suite %#04x: the pseudorandom key is %d bytes, want %d", uint16(suite), len(prk), nh)
+		}
+		for i, b := range prk {
+			if b != 0 {
+				t.Errorf("suite %#04x: byte %d of the pseudorandom key is %#02x after the call, want 0; it is one HKDF-Expand away from every key of the epoch and nothing downstream needs it",
+					uint16(suite), i, b)
+				break
+			}
+		}
+		// and the erase reached the key rather than the answer: a joiner secret that came
+		// back zero would satisfy the loop above for the wrong reason
+		if len(joiner) != nh {
+			t.Fatalf("suite %#04x: the joiner secret is %d bytes, want %d", uint16(suite), len(joiner), nh)
+		}
+		if !slices.ContainsFunc(joiner, func(b byte) bool { return b != 0 }) {
+			t.Errorf("suite %#04x: the joiner secret came back as %d zero bytes, so the erase reached the value that was returned",
+				uint16(suite), len(joiner))
+		}
+	}
+}
+
+// wideKdfHashSize is a KDF.Nh neither registered suite has.
+const wideKdfHashSize = sha512.Size384
+
+// wideKdfProvider is a provider whose KDF.Nh is not 32.
+//
+// Both registered suites fix Nh at 32, so nothing already in this tree separates a body
+// that reads KDF.Nh off the provider it was handed from one that writes 32 down. Measured,
+// not supposed: nh := crypto.HashSize() replaced by nh := 32 in DeriveJoinerSecret passed
+// every test of this package. This is the input that separates them, and it is the same
+// limit the ZeroSecret note in crypto_test.go records.
+//
+// It is a real kdf rather than a fake answering the right number of bytes: HKDF-SHA384,
+// whose Nh is 48, expanding over the same mlsKdfLabel preimage the production provider
+// builds. Only the three methods DeriveJoinerSecret reaches are overridden; everything else
+// is the registered suite's, so a derivation that grew a fourth call would get a working
+// method rather than a nil dereference that reads as this gate's own bug.
+//
+// The requested expansion lengths are recorded because KDF.Nh governs two separate things
+// here -- which lengths are refused, and how many bytes are asked for -- and a body that
+// read the provider for the first and wrote 32 for the second would pass a length check
+// alone.
+type wideKdfProvider struct {
+	CryptoProvider
+	expandedLengths []int
+}
+
+func (self *wideKdfProvider) HashSize() int {
+	return wideKdfHashSize
+}
+
+// (salt, ikm) in, (ikm, salt) out, which is the swap crypto.go makes and the reason
+// guardrail 1 confines the call. Calling the library here is allowed: the confinement gate
+// runs over productionSources, which drops every _test.go file.
+func (self *wideKdfProvider) Extract(salt []byte, ikm []byte) []byte {
+	prk, err := hkdf.Extract(sha512.New384, ikm, salt)
+	if err != nil {
+		panic("mls test: hkdf-sha384 extract: " + err.Error())
+	}
+	return prk
+}
+
+func (self *wideKdfProvider) ExpandWithLabel(secret []byte, label string, context []byte, length int) []byte {
+	self.expandedLengths = append(self.expandedLengths, length)
+	out, err := hkdf.Expand(sha512.New384, secret, string(mlsKdfLabel(label, context, length)), length)
+	if err != nil {
+		panic("mls test: hkdf-sha384 expand: " + err.Error())
+	}
+	return out
+}
+
+// TestDeriveJoinerSecretReadsKdfNhFromTheProvider is the input the registered suites cannot
+// supply.
+//
+// KDF.Nh governs three things in this derivation: whether the init secret is the right
+// length, whether the commit secret is, and how many bytes the expansion is asked for. A
+// literal 32 answers all three correctly for both registered suites and incorrectly for
+// every suite whose hash is not sha256, and the failure would arrive as an epoch that looks
+// valid on this side and matches nobody.
+//
+// Both directions are asserted. A provider whose Nh is 48 must accept 48 byte secrets --
+// which a hardcoded 32 refuses -- and must refuse 32 byte ones, which a hardcoded 32
+// accepts. Either half alone is satisfiable by a different mistake.
+func TestDeriveJoinerSecretReadsKdfNhFromTheProvider(t *testing.T) {
+	inner := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if inner.HashSize() == wideKdfHashSize {
+		t.Fatalf("the registered suite's KDF.Nh is already %d, so this gate separates nothing", wideKdfHashSize)
+	}
+	crypto := &wideKdfProvider{CryptoProvider: inner}
+	if crypto.HashSize() != wideKdfHashSize {
+		t.Fatalf("the wide provider answers KDF.Nh %d, want %d", crypto.HashSize(), wideKdfHashSize)
+	}
+	groupContext := ksVectorEpoch0GroupContext(t)
+
+	wideInit := bytes.Repeat([]byte{0xa5}, wideKdfHashSize)
+	wideCommit := bytes.Repeat([]byte{0x5a}, wideKdfHashSize)
+	joiner, err := DeriveJoinerSecret(crypto, wideInit, wideCommit, groupContext)
+	if err != nil {
+		t.Fatalf("two %d byte secrets over a provider whose KDF.Nh is %d were refused: %v",
+			wideKdfHashSize, wideKdfHashSize, err)
+	}
+	if len(joiner) != wideKdfHashSize {
+		t.Errorf("the joiner secret is %d bytes and the provider's KDF.Nh is %d", len(joiner), wideKdfHashSize)
+	}
+	if !slices.Equal(crypto.expandedLengths, []int{wideKdfHashSize}) {
+		t.Errorf("the expansion was asked for %v bytes, want [%d]; the output length is KDF.Nh as much as the refusals are",
+			crypto.expandedLengths, wideKdfHashSize)
+	}
+
+	// the other half: 32 bytes is the wrong length for THIS provider, and a hardcoded 32
+	// is exactly what takes it
+	narrowInit := bytes.Repeat([]byte{0xa5}, inner.HashSize())
+	narrowCommit := bytes.Repeat([]byte{0x5a}, inner.HashSize())
+	for _, testCase := range []struct {
+		name   string
+		init   []byte
+		commit []byte
+	}{
+		{name: "init secret", init: narrowInit, commit: wideCommit},
+		{name: "commit secret", init: wideInit, commit: narrowCommit},
+	} {
+		secret, err := DeriveJoinerSecret(crypto, testCase.init, testCase.commit, groupContext)
+		if !errors.Is(err, ErrSecretLength) {
+			t.Errorf("a %d byte %s over a provider whose KDF.Nh is %d gave err = %v, want ErrSecretLength",
+				inner.HashSize(), testCase.name, wideKdfHashSize, err)
+		}
+		if secret != nil {
+			t.Errorf("a %d byte %s was refused and %d bytes of secret came back beside the error",
+				inner.HashSize(), testCase.name, len(secret))
+		}
+	}
+}
+
+// TestZeroSecretReadsKdfNhFromTheProvider closes, for ZeroSecret, the limit the registry
+// note in crypto_test.go records against it.
+//
+// ZeroSecret's whole contract is KDF.Nh zero bytes, and both registered suites fix Nh at
+// 32, so make([]byte, 32) answers correctly for every input already in this tree. The
+// perturbation gate cannot separate the two either: the one argument ZeroSecret takes is a
+// provider, and the tagging provider passes a length through unchanged, which is exactly
+// why that gate routes ZeroSecret to a registry comparison rather than to a moved input. A
+// provider whose Nh is not 32 is the input that separates them, and it is the same one
+// DeriveJoinerSecret is held to below.
+func TestZeroSecretReadsKdfNhFromTheProvider(t *testing.T) {
+	inner := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if inner.HashSize() == wideKdfHashSize {
+		t.Fatalf("the registered suite's KDF.Nh is already %d, so this gate separates nothing", wideKdfHashSize)
+	}
+	zero := ZeroSecret(&wideKdfProvider{CryptoProvider: inner})
+	if len(zero) != wideKdfHashSize {
+		t.Errorf("ZeroSecret over a provider whose KDF.Nh is %d answered %d bytes", wideKdfHashSize, len(zero))
+	}
+	if slices.ContainsFunc(zero, func(b byte) bool { return b != 0 }) {
+		t.Errorf("ZeroSecret answered %x, which is not the all zero secret", zero)
+	}
+}
+
+// joinerSecretRecovering calls DeriveJoinerSecret with a panic caught rather than taken.
+//
+// A refusal that is not a refusal is exactly what the gate below is looking for, and a test
+// binary that died on it would report nothing about the assertions after it -- and would
+// report a nil pointer dereference raised inside the syntax package, which names neither
+// this function nor the argument that was missing.
+func joinerSecretRecovering(
+	crypto CryptoProvider,
+	initSecretPrev []byte,
+	commitSecret []byte,
+	groupContext *GroupContext,
+) (secret []byte, err error, recovered any) {
+	defer func() { recovered = recover() }()
+	secret, err = DeriveJoinerSecret(crypto, initSecretPrev, commitSecret, groupContext)
+	return secret, err, nil
+}
+
+// TestDeriveJoinerSecretRefusesANilGroupContext pins the missing argument as a typed error.
+//
+// syntax.Marshal is handed a non nil interface holding a nil pointer, so MarshalMLS
+// dereferences it and the caller gets a runtime panic out of the syntax package. Every
+// caller of this derivation takes its context off a struct field, so an unset field is how
+// a nil arrives, and the epoch that field belongs to is the thing a reader needs named.
+//
+// The accepting control runs first, so the refusals below are attributable to the nil
+// rather than to something else about the call.
+func TestDeriveJoinerSecretRefusesANilGroupContext(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		initSecret := bytes.Repeat([]byte{0xa5}, nh)
+		commitSecret := bytes.Repeat([]byte{0x5a}, nh)
+		if _, err := DeriveJoinerSecret(crypto, initSecret, commitSecret, ksVectorEpoch0GroupContext(t)); err != nil {
+			t.Fatalf("suite %#04x: a real group context was refused: %v", uint16(suite), err)
+		}
+		// the literal and a nil valued variable of the type are the same argument, and
+		// the second is how an unset struct field arrives
+		var unset *GroupContext
+		for _, testCase := range []struct {
+			name    string
+			context *GroupContext
+		}{
+			{name: "a nil literal", context: nil},
+			{name: "an unset field", context: unset},
+		} {
+			secret, err, recovered := joinerSecretRecovering(crypto, initSecret, commitSecret, testCase.context)
+			if recovered != nil {
+				t.Errorf("suite %#04x: %s panicked with %v rather than being refused",
+					uint16(suite), testCase.name, recovered)
+				continue
+			}
+			if !errors.Is(err, ErrNilGroupContext) {
+				t.Errorf("suite %#04x: %s gave err = %v, want ErrNilGroupContext", uint16(suite), testCase.name, err)
+			}
+			if secret != nil {
+				t.Errorf("suite %#04x: %s was refused and %d bytes of secret came back beside the error",
+					uint16(suite), testCase.name, len(secret))
+			}
+		}
 	}
 }

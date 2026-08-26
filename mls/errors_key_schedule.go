@@ -38,6 +38,15 @@ var (
 	ErrGroupContextTrailingBytes = fmt.Errorf(
 		"mls: group context has trailing bytes: %w", syntax.ErrTrailingBytes)
 
+	// ErrNilGroupContext is returned when a derivation is handed no GroupContext at
+	// all. It is a typed refusal rather than the nil pointer dereference the
+	// serialization would otherwise raise: syntax.Marshal receives a non nil interface
+	// holding a nil pointer, MarshalMLS dereferences it, and the caller gets a panic
+	// out of the syntax package naming neither the argument nor the derivation. Every
+	// epoch derivation takes its context off a struct field, so an unset field is the
+	// way this arrives.
+	ErrNilGroupContext = errors.New("mls: no group context was supplied")
+
 	// ErrTranscriptHashLength is returned when a transcript hash is not KDF.Nh bytes.
 	ErrTranscriptHashLength = errors.New("mls: transcript hash has the wrong length")
 

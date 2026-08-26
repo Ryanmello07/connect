@@ -61,19 +61,38 @@ var forbiddenPrimitiveTokens = []string{
 // reviewable files instead of scattering a silent argument transposition.
 const hkdfExtractNeedle = "hkdf.Extract("
 
-var hkdfExtractAllowedFiles = []string{"crypto.go", "hpke.go"}
+// The two files that may make the call, as PATHS relative to this package's directory --
+// which is the key scanSources collects a file under -- and not as base names.
+//
+// A base name is the exemption shape this project keeps rediscovering, and here it is load
+// bearing: this gate is the only thing in the tree that catches a direct hkdf.Extract, so
+// its exemption is the whole of guardrail 1's confinement. Read off the base name, every
+// crypto.go and every hpke.go anywhere under forbiddenScanRoots inherited the excuse -- a
+// subpackage's, a subdirectory's -- and moving a confined call into one of them was
+// invisible. TestHkdfConfinementFlagsTheControlFixture builds one nested twin per entry
+// here and requires each to be reported, so a path added without its twin fails rather
+// than arriving uncontrolled.
+var hkdfExtractAllowedPaths = []string{"crypto.go", "hpke.go"}
 
 // Guardrail 3. One helper turns an x25519 failure into ErrInvalidPoint, so there is
 // exactly one place that could ignore it and that place is reviewed.
 const ecdhNeedle = ".ECDH("
 
-var ecdhAllowedFiles = []string{"crypto_x25519.go"}
+// The one file that may make the call, as a path for the reason above.
+var ecdhAllowedPaths = []string{"crypto_x25519.go"}
 
 // This file has to quote every token and every assignment shape it bans, so it is the
-// one file no matcher may run against. The exemption is by exact base name and the
-// count of files taking it is asserted, so a second file cannot quietly join it and
-// become a place to hide a real call.
-const forbiddenSelfName = "crypto_forbidden_test.go"
+// one file no matcher may run against. The exemption is by exact scanned path -- not by
+// base name, which would excuse a crypto_forbidden_test.go in any subdirectory of either
+// root -- and the count of files taking it is asserted, so a second file cannot quietly
+// join it and become a place to hide a real call.
+const forbiddenSelfPath = "crypto_forbidden_test.go"
+
+// The control fixture's subdirectory, holding a twin of each allowed path: the same base
+// name, one directory deeper. Under a base name reading every twin is exempt and the
+// controls below report only violations.go; under a path reading every twin is a
+// violation, which is what those controls demand.
+const forbiddenNestedControlDirectory = "nested"
 
 // One walk's result: the text of every go file found, keyed by slash separated path,
 // and how many files each root contributed. The per root count is what separates "the
@@ -148,14 +167,14 @@ func sourcesUnderGate(t *testing.T, scan forbiddenScan) map[string]string {
 	gated := map[string]string{}
 	exempt := 0
 	for path, text := range scan.sourceTexts {
-		if filepath.Base(path) == forbiddenSelfName {
+		if path == forbiddenSelfPath {
 			exempt++
 			continue
 		}
 		gated[path] = text
 	}
 	if exempt != 1 {
-		t.Errorf("%d scanned files carry the self exemption, want exactly 1 named %s", exempt, forbiddenSelfName)
+		t.Errorf("%d scanned files carry the self exemption, want exactly 1 at %s", exempt, forbiddenSelfPath)
 	}
 	return gated
 }
@@ -228,20 +247,49 @@ func forbiddenTokensIn(text string, tokens []string) []string {
 	return found
 }
 
-// The scanned paths whose code contains needle and whose base name is not allowed,
-// sorted so a failure reads the same twice and a control can compare an exact set.
-func confinementViolations(sourceTexts map[string]string, needle string, allowedFiles []string) []string {
+// The scanned paths whose code contains needle and whose PATH is not allowed, sorted so a
+// failure reads the same twice and a control can compare an exact set.
+//
+// The comparison is against the whole key the scan collected the file under. Comparing
+// base names is what this used to do, and it excused a file by what it was called rather
+// than by where it is: one crypto.go is reviewed and confined, and every other crypto.go
+// under either root inherited that review without anybody making a decision.
+func confinementViolations(sourceTexts map[string]string, needle string, allowedPaths []string) []string {
 	violations := []string{}
 	for path, text := range sourceTexts {
 		if !strings.Contains(codeOf(text), needle) {
 			continue
 		}
-		if !slices.Contains(allowedFiles, filepath.Base(path)) {
+		if !slices.Contains(allowedPaths, path) {
 			violations = append(violations, path)
 		}
 	}
 	slices.Sort(violations)
 	return violations
+}
+
+// One list of allowed paths, rewritten to the control fixture's copies of them, so the
+// controls run the gate's own allowed list rather than a second transcription of it.
+func underControlRoot(paths []string) []string {
+	rooted := make([]string, 0, len(paths))
+	for _, path := range paths {
+		rooted = append(rooted, forbiddenControlRoot+"/"+path)
+	}
+	slices.Sort(rooted)
+	return rooted
+}
+
+// The nested twin of each allowed path: the same base name, in a directory no allowed path
+// names. Derived from the allowed list rather than written out, so an entry added there
+// without a fixture here fails the control instead of going uncontrolled.
+func nestedControlTwins(allowedPaths []string) []string {
+	twins := make([]string, 0, len(allowedPaths))
+	for _, path := range allowedPaths {
+		twins = append(twins,
+			forbiddenControlRoot+"/"+forbiddenNestedControlDirectory+"/"+filepath.Base(path))
+	}
+	slices.Sort(twins)
+	return twins
 }
 
 // The lines of code that take an x25519 result and throw it, or its error, away. Both
@@ -280,9 +328,16 @@ func scannedPaths(sourceTexts map[string]string) []string {
 // rule out.
 func controlFile(t *testing.T, control forbiddenScan, name string) string {
 	t.Helper()
-	text, ok := control.sourceTexts[forbiddenControlRoot+"/"+name]
+	return controlFileAt(t, control, forbiddenControlRoot+"/"+name)
+}
+
+// The same, addressed by the scanned path, which is what the confinement controls hold
+// because their expectations are built out of the gate's own allowed list.
+func controlFileAt(t *testing.T, control forbiddenScan, path string) string {
+	t.Helper()
+	text, ok := control.sourceTexts[path]
 	if !ok {
-		t.Fatalf("control fixture %s is missing; the scan read %v", name, scannedPaths(control.sourceTexts))
+		t.Fatalf("control fixture %s is missing; the scan read %v", path, scannedPaths(control.sourceTexts))
 	}
 	return text
 }
@@ -302,8 +357,8 @@ func TestForbiddenPrimitivesAreAbsent(t *testing.T) {
 func TestHkdfExtractHasOnlyTwoCallSites(t *testing.T) {
 	scan := mustScanSources(t, forbiddenScanRoots)
 	sources := productionSources(sourcesUnderGate(t, scan))
-	for _, path := range confinementViolations(sources, hkdfExtractNeedle, hkdfExtractAllowedFiles) {
-		t.Errorf("%s calls %s; only %s may", path, hkdfExtractNeedle, strings.Join(hkdfExtractAllowedFiles, " and "))
+	for _, path := range confinementViolations(sources, hkdfExtractNeedle, hkdfExtractAllowedPaths) {
+		t.Errorf("%s calls %s; only %s may", path, hkdfExtractNeedle, strings.Join(hkdfExtractAllowedPaths, " and "))
 	}
 }
 
@@ -311,8 +366,8 @@ func TestHkdfExtractHasOnlyTwoCallSites(t *testing.T) {
 func TestEcdhHasOneCallSite(t *testing.T) {
 	scan := mustScanSources(t, forbiddenScanRoots)
 	sources := productionSources(sourcesUnderGate(t, scan))
-	for _, path := range confinementViolations(sources, ecdhNeedle, ecdhAllowedFiles) {
-		t.Errorf("%s calls %s; only %s may", path, ecdhNeedle, strings.Join(ecdhAllowedFiles, " and "))
+	for _, path := range confinementViolations(sources, ecdhNeedle, ecdhAllowedPaths) {
+		t.Errorf("%s calls %s; only %s may", path, ecdhNeedle, strings.Join(ecdhAllowedPaths, " and "))
 	}
 }
 
@@ -350,32 +405,55 @@ func TestForbiddenTokenMatcherFlagsTheControlFixture(t *testing.T) {
 
 // The positive control for the guardrail 1 confinement, run through the allowed list the
 // gate itself uses. Every fixture file is checked to contain the call before the report
-// is compared, so an unreported file means the name was allowed rather than that the
+// is compared, so an unreported file means the path was allowed rather than that the
 // fixture forgot to make the call.
+//
+// The nested twins are the half that says the exemption is by path. Each is the base name
+// of an allowed path in a directory no allowed path names, so a base name reading excuses
+// every one of them and reports only violations.go -- which is exactly what this gate did
+// before, and exactly what the expectation below refuses. The twins are derived from the
+// allowed list rather than listed, so a third allowed path cannot land without one.
 func TestHkdfConfinementFlagsTheControlFixture(t *testing.T) {
 	control := mustScanSources(t, []string{forbiddenControlRoot})
-	for _, name := range append([]string{"violations.go"}, hkdfExtractAllowedFiles...) {
-		if !strings.Contains(codeOf(controlFile(t, control, name)), hkdfExtractNeedle) {
-			t.Fatalf("control fixture %s does not call %s, so it controls nothing", name, hkdfExtractNeedle)
+	allowed := underControlRoot(hkdfExtractAllowedPaths)
+	twins := nestedControlTwins(hkdfExtractAllowedPaths)
+	if len(twins) != len(hkdfExtractAllowedPaths) || len(twins) == 0 {
+		t.Fatalf("the allowed list holds %d paths and the control built %d twins",
+			len(hkdfExtractAllowedPaths), len(twins))
+	}
+	violating := []string{forbiddenControlRoot + "/violations.go"}
+	for _, path := range slices.Concat(violating, allowed, twins) {
+		if !strings.Contains(codeOf(controlFileAt(t, control, path)), hkdfExtractNeedle) {
+			t.Fatalf("control fixture %s does not call %s, so it controls nothing", path, hkdfExtractNeedle)
 		}
 	}
-	violations := confinementViolations(control.sourceTexts, hkdfExtractNeedle, hkdfExtractAllowedFiles)
-	want := []string{forbiddenControlRoot + "/violations.go"}
+	violations := confinementViolations(control.sourceTexts, hkdfExtractNeedle, allowed)
+	want := slices.Concat(violating, twins)
+	slices.Sort(want)
 	if !slices.Equal(violations, want) {
 		t.Errorf("the confinement check reported %v, want %v", violations, want)
 	}
 }
 
-// The positive control for the guardrail 3 confinement, built the same way.
+// The positive control for the guardrail 3 confinement, built the same way and with the
+// same nested twin, because guardrail 3's exemption had the same shape as guardrail 1's.
 func TestEcdhConfinementFlagsTheControlFixture(t *testing.T) {
 	control := mustScanSources(t, []string{forbiddenControlRoot})
-	for _, name := range append([]string{"violations.go"}, ecdhAllowedFiles...) {
-		if !strings.Contains(codeOf(controlFile(t, control, name)), ecdhNeedle) {
-			t.Fatalf("control fixture %s does not call %s, so it controls nothing", name, ecdhNeedle)
+	allowed := underControlRoot(ecdhAllowedPaths)
+	twins := nestedControlTwins(ecdhAllowedPaths)
+	if len(twins) != len(ecdhAllowedPaths) || len(twins) == 0 {
+		t.Fatalf("the allowed list holds %d paths and the control built %d twins",
+			len(ecdhAllowedPaths), len(twins))
+	}
+	violating := []string{forbiddenControlRoot + "/violations.go"}
+	for _, path := range slices.Concat(violating, allowed, twins) {
+		if !strings.Contains(codeOf(controlFileAt(t, control, path)), ecdhNeedle) {
+			t.Fatalf("control fixture %s does not call %s, so it controls nothing", path, ecdhNeedle)
 		}
 	}
-	violations := confinementViolations(control.sourceTexts, ecdhNeedle, ecdhAllowedFiles)
-	want := []string{forbiddenControlRoot + "/violations.go"}
+	violations := confinementViolations(control.sourceTexts, ecdhNeedle, allowed)
+	want := slices.Concat(violating, twins)
+	slices.Sort(want)
 	if !slices.Equal(violations, want) {
 		t.Errorf("the confinement check reported %v, want %v", violations, want)
 	}

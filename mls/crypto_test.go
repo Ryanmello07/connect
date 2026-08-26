@@ -3902,6 +3902,13 @@ var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
 	// same limit the four size methods carry; what closes it for those is the receiver
 	// field read below, and for this one it is TestNoStubShapesRemainInSource, whose
 	// unread parameter shape fails a body that never reaches for the provider at all.
+	//
+	// That shape reading is a source shape, and a body that reads the provider and then
+	// ignores the value walks past it. What closes the same limit behaviourally is an
+	// input this registry cannot supply: a provider whose Nh is not 32. That is what
+	// key_schedule_test.go's wideKdfProvider is, and what TestZeroSecretReadsKdfNhFrom-
+	// TheProvider holds this construction to. Both registered suites fix Nh at 32, so
+	// nothing registered here separates a literal from a provider read.
 	"ZeroSecret": func(params *SuiteParams) any { return strings.Repeat("00", params.Nh) },
 }
 
@@ -4046,19 +4053,28 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 				observed++
 			}
 			for i, parameter := range operation.parameters {
-				// an operation whose answer the registry fixes is judged by that value
-				// rather than by moving its arguments, and this is where the two readings
-				// meet. The four size methods satisfy "no argument to move" by taking no
-				// argument; ZeroSecret is the shape that has one and still has nothing to
-				// move, because the provider it takes carries a length and the tagging
-				// provider passes a length through unchanged. Breaking here leaves
-				// observed at zero, which is what routes it to the registry comparison
-				// below -- and that comparison is the stricter of the two, so nothing is
-				// waved through: a name added here whose answer DOES move fails the
-				// unobserved-against-registered check at the end of the suite loop.
-				if answersARegistryValue {
-					break
-				}
+				// every operation is perturbed, the registry rows included. The four size
+				// methods satisfy "no argument to move" by taking no argument, so this loop
+				// never runs for them; ZeroSecret is the shape that has one and still has
+				// nothing to move, because the provider it takes carries a length and the
+				// tagging provider passes a length through unchanged. That is a fact about
+				// ZeroSecret's answer, and it is MEASURED here rather than assumed by
+				// skipping the measurement.
+				//
+				// The version this replaces broke out of the loop for any name the registry
+				// held, which left observed at zero by construction for every one of them.
+				// The unobserved-against-registered comparison at the end of the suite loop
+				// -- the check whose whole job is to fail when a name is added to the
+				// registry to quiet a real perturbation failure -- was then satisfied
+				// tautologically, and could not fail whatever the code did. Measured, not
+				// supposed: a RefHash row added to providerRegistryAnswers passed this gate
+				// with all three of RefHash's movable parameters unprobed.
+				//
+				// What a registry row is excused from is the REPORT below, not the
+				// measurement: an answer the suite parameters fix is supposed to stay put
+				// under a perturbation, so a row that does not move is not a failure for
+				// one. A row that DOES move still counts, still keeps the name out of
+				// unobserved, and still fails at the end of the suite loop.
 				positions := len(providerPerturbations(t, operation.name, parameter, base[i]))
 				for at := 0; at < positions; at++ {
 					// a provider of its own for every call. Four of these operations
@@ -4087,8 +4103,15 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 						continue
 					}
 					if providerStubAnswer(movedResults) == answer {
-						t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
-							where, parameter.name, perturbations[at].where, parameter.name)
+						// not moving is what an answer the registry fixes is for, so it is
+						// not a fault in one of those -- and it is not a pass either:
+						// observed stays where it is, which is what routes the operation to
+						// the registry comparison below, and that comparison is the stricter
+						// of the two readings.
+						if !answersARegistryValue {
+							t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
+								where, parameter.name, perturbations[at].where, parameter.name)
+						}
 						continue
 					}
 					observed++
