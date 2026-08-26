@@ -173,12 +173,14 @@ func mustReadCommented(t *testing.T, path string) parsedSource {
 	return mustParseCommented(t, path, string(source))
 }
 
-// rootIdentifierOf reduces the target of a write to the name whose array is written
-// through, so secret[i], secret[1:][i] and (secret)[i] all report secret.
+// rootIdentifierOf reduces the target of a write to the name whose storage is written
+// through, so secret[i], secret[1:][i], (secret)[i] and self.secrets.InitSecret[i] all report
+// the name they hang off.
 //
-// Without it a write spelled through a reslice sits outside the matcher below while landing
-// on exactly the same bytes, which is the shape an erase helper would take on the day
-// somebody wanted one this gate did not see.
+// Without it a write spelled through a reslice, or through a field of the receiver, sits
+// outside the matcher below while landing on exactly the same bytes -- and those are the two
+// shapes an erase helper actually takes: a free one is handed the slice, and a method erases
+// what its own receiver holds.
 func rootIdentifierOf(expr ast.Expr) string {
 	switch typed := expr.(type) {
 	case *ast.Ident:
@@ -189,25 +191,36 @@ func rootIdentifierOf(expr ast.Expr) string {
 		return rootIdentifierOf(typed.X)
 	case *ast.SliceExpr:
 		return rootIdentifierOf(typed.X)
+	case *ast.SelectorExpr:
+		return rootIdentifierOf(typed.X)
 	}
 	return ""
 }
 
-// byteSlicesHandedTo names the receiver and parameters of one declaration that are storage
-// somebody else owns: a []byte, or one of this package's own names for a []byte.
+// storageOutlivingTheCall names the receiver and parameters of one declaration through which
+// a write reaches bytes that are still there when the call returns.
 //
-// The named types are read rather than the spelling []byte alone, because HpkePrivateKey is
-// the same array to the compiler and an eraser written over one is the same eraser.
-func byteSlicesHandedTo(parsed parsedSource, function *ast.FuncDecl, named []string) []string {
-	fields := []*ast.Field{}
-	if function.Recv != nil {
-		fields = append(fields, function.Recv.List...)
-	}
-	if function.Type.Params != nil {
-		fields = append(fields, function.Type.Params.List...)
-	}
+// Two sources. A parameter whose type is a []byte, or one of this package's own names for a
+// []byte -- the named types are read rather than the spelling alone, because HpkePrivateKey
+// is the same array to the compiler and an eraser written over one is the same eraser. And
+// the receiver, whatever its type, because a method that erases what its own object holds is
+// the other shape an erase helper takes -- the (*KeySchedule).Zeroize this plan's task 12
+// adds is exactly it, and a class that stopped at parameters would let it land undirected.
+func storageOutlivingTheCall(parsed parsedSource, function *ast.FuncDecl, named []string) []string {
 	handed := []string{}
-	for _, field := range fields {
+	if function.Recv != nil {
+		for _, field := range function.Recv.List {
+			for _, name := range field.Names {
+				if name.Name != "_" {
+					handed = append(handed, name.Name)
+				}
+			}
+		}
+	}
+	if function.Type.Params == nil {
+		return handed
+	}
+	for _, field := range function.Type.Params.List {
 		rendered := parsed.render(field.Type)
 		if rendered != "[]byte" && !slices.Contains(named, rendered) {
 			continue
@@ -299,7 +312,7 @@ func namesWrittenThrough(function *ast.FuncDecl, reaching []string) []string {
 }
 
 // eraseHelpersIn names the functions one parsed file declares that write through storage
-// their caller owns, and which of those do not carry the directive.
+// outliving the call, and which of those do not carry the directive.
 func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
 	helpers := []string{}
 	missing := []string{}
@@ -308,7 +321,7 @@ func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
 		if !isFunction || function.Body == nil {
 			continue
 		}
-		handed := byteSlicesHandedTo(parsed, function, named)
+		handed := storageOutlivingTheCall(parsed, function, named)
 		if len(handed) == 0 {
 			continue
 		}
@@ -324,9 +337,10 @@ func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
 }
 
 // eraseHelperControl holds one of each shape the matchers have to tell apart: the four
-// spellings that reach a caller's array, a write into storage the function made for itself,
-// a read of a parameter, a rebinding of one, a function handed no bytes at all, the
-// directive present, and the directive named only in prose.
+// spellings that reach a caller's array, the same write made through a field of the receiver,
+// a write into storage the function made for itself, a read of a parameter, a read of the
+// receiver, a rebinding of a parameter, a function handed no bytes at all, the directive
+// present, and the directive named only in prose.
 //
 // Without it a matcher that had stopped matching -- a parse that dropped comments, a walk
 // that stopped descending into bodies, a type filter that stopped seeing named storage --
@@ -385,6 +399,22 @@ const eraseHelperControl = "package control\n" +
 	"\n" +
 	"func takesNoBytesAtAll(count int) int {\n" +
 	"\treturn count + 1\n" +
+	"}\n" +
+	"\n" +
+	"type ControlHolder struct {\n" +
+	"\tsecret []byte\n" +
+	"}\n" +
+	"\n" +
+	"// erasedThroughTheReceiver is the shape a Zeroize method takes: the storage is the\n" +
+	"// object's own rather than a caller's, and the write is the same write.\n" +
+	"func (self *ControlHolder) erasedThroughTheReceiver() {\n" +
+	"\tfor i := range self.secret {\n" +
+	"\t\tself.secret[i] = 0\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"func (self *ControlHolder) readsItsOwnStorageOnly() int {\n" +
+	"\treturn len(self.secret)\n" +
 	"}\n"
 
 // TestEveryEraseHelperCarriesTheNoInlineDirective observes the one mechanism
@@ -415,10 +445,10 @@ const eraseHelperControl = "package control\n" +
 //
 // Two honest limits, stated rather than hidden. No go test can observe an elision, so this
 // asserts the presence of the mechanism and not the effect -- the proxy the file's own
-// argument is made of. And the write has to be spelled through the parameter or through a
-// local cut from it; an array reached through a struct field, or handed on to a function
-// declared elsewhere, is past what a syntax matcher can follow, and neither is a shape an
-// erase helper has any reason to take.
+// argument is made of. And the write has to be spelled through the name whose storage it
+// reaches: a parameter, a local cut from one, or a field of the receiver. A slice handed on
+// to a function declared elsewhere and erased there is past what a syntax matcher can
+// follow -- though the function it is handed to is itself in this class, and is held here.
 func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
 	control := mustParseCommented(t, "the erase helper control", eraseHelperControl)
 	helpers, missing := eraseHelpersIn(control, []string{"ControlKey"})
@@ -428,6 +458,7 @@ func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
 		"erasedThroughALocalCutFromTheParameter",
 		"erasedWithClearOverNamedStorage",
 		"erasedWithCopy",
+		"erasedThroughTheReceiver",
 	}
 	if !slices.Equal(helpers, wantHelpers) {
 		t.Fatalf("the matcher read %v out of the control as erase helpers, want %v; it is not telling a write through the caller's array from a read of one or from a write into storage of the function's own",
@@ -438,6 +469,7 @@ func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
 		"erasedThroughALocalCutFromTheParameter",
 		"erasedWithClearOverNamedStorage",
 		"erasedWithCopy",
+		"erasedThroughTheReceiver",
 	}
 	if !slices.Equal(missing, wantMissing) {
 		t.Fatalf("the matcher read %v out of the control as missing the directive, want %v; it is not telling the directive from the prose that argues for it",
@@ -462,7 +494,7 @@ func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
 			found)
 	}
 	if len(unprotected) != 0 {
-		t.Errorf("%v write through storage their caller owns without a %s line of their own; that directive is the only thing between these stores and a compiler entitled to delete them, and secret_zeroize.go's own comment says so",
+		t.Errorf("%v write through storage that outlives the call -- a caller's array or the receiver's own -- without a %s line of their own; that directive is the only thing between these stores and a compiler entitled to delete them, and secret_zeroize.go's own comment says so",
 			unprotected, noInlineDirective)
 	}
 	t.Logf("%d erase helpers read out of this package's source: %v", len(found), found)
