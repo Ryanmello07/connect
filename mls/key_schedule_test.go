@@ -1168,3 +1168,962 @@ func TestDeriveJoinerSecretRefusesANilGroupContext(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the epoch key schedule
+//
+// Nine secrets come out of one epoch_secret. They are all KDF.Nh bytes, they are all
+// indistinguishable from random, and the only thing that separates any two of them is the
+// string handed to DeriveSecret. So a test that reads a length, a non zero-ness, a
+// determinism or a round trip passes for all nine no matter which label produced which,
+// and two labels swapped between two fields is a change no such test can see.
+//
+// What sees it is a known answer nothing in this package computed, which is the corpus the
+// sweeps below run over: every epoch of every registered suite, driven through the
+// KeySchedule type rather than through the primitives — crypto_labels_test.go already holds
+// the primitives to the same file, and a schedule that agreed with the primitives while
+// wiring them together wrongly would pass that and fail every peer.
+//
+// The set of nine is read off EpochSecrets by reflection everywhere below rather than
+// written out as a list. A list is the shape this repository has paid for fourteen times:
+// the tenth secret, or the field renamed, drops out of the class and every sweep goes on
+// reporting the clean run a complete sweep reports.
+// ---------------------------------------------------------------------------
+
+// keyScheduleKatEpochs is how many epochs of the published corpus this package's registered
+// suites account for, and keyScheduleKatEpochComparisons is how many published answers that
+// is: joiner_secret, welcome_secret and the nine derived secrets, per epoch.
+//
+// Both are asserted rather than assumed, for the reason keyScheduleKatJoinerComparisons is.
+// A filter that stopped matching — a suite renumbered, a json field renamed so every string
+// decodes empty — turns every sweep below into a loop that runs zero times and reports
+// PASS, which is the one outcome a known answer test must not be able to reach.
+const (
+	keyScheduleKatEpochs           = 10
+	keyScheduleKatEpochComparisons = 110
+)
+
+// One epoch of the authenticated corpus, with the inputs the KeySchedule constructors take
+// already decoded and the previous epoch's init secret already chained in.
+//
+// The published epoch is carried alongside so a sweep can reach whichever answers it needs
+// without re-deriving the chain, and the suite and the position travel with it because a
+// failure that cannot say which epoch it came from sends a reader to the wrong file.
+type ksVectorEpoch struct {
+	suite        CipherSuite
+	crypto       CryptoProvider
+	at           string
+	groupContext *GroupContext
+	initPrev     []byte
+	commitSecret []byte
+	pskSecret    []byte
+	published    labelKatEpoch
+}
+
+// ksVectorEpochs is every epoch of every suite this package registers, taken from the
+// corpus keyScheduleKatVectors has already authenticated against upstream's git object
+// store.
+//
+// Three things here stop the sweeps that read this from passing vacuously, and each is a
+// property of the corpus rather than of the code under test:
+//
+//   - the number of epochs is counted and asserted, and the suites that matched are
+//     compared against the registry, so a filter that stopped matching is loud;
+//   - the group context is re-encoded and compared against the published bytes before it is
+//     handed on, so a codec disagreement is reported as a codec disagreement rather than as
+//     a key schedule failure in the wrong file;
+//   - each of the two Extract calls in the section 8 chain has its two arguments compared,
+//     and an epoch whose arguments happened to be equal is reported. Extract(a, b) and
+//     Extract(b, a) agree exactly when a == b, so such an epoch pins nothing about the
+//     argument order — which is guardrail 1, and the one mistake in this file that a
+//     self consistent implementation reproduces perfectly.
+func ksVectorEpochs(t *testing.T) []ksVectorEpoch {
+	t.Helper()
+	epochs := []ksVectorEpoch{}
+	matched := []CipherSuite{}
+	for _, vector := range keyScheduleKatVectors(t) {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		matched = append(matched, suite)
+		crypto := mustProvider(t, suite)
+		previousInit := mustDecodeHex(t, "initial_init_secret", vector.InitialInitSecret)
+		for index, published := range vector.Epochs {
+			at := fmt.Sprintf(" suite %#04x epoch %d", uint16(suite), index)
+			commitSecret := mustDecodeHex(t, "commit_secret"+at, published.CommitSecret)
+			pskSecret := mustDecodeHex(t, "psk_secret"+at, published.PskSecret)
+			publishedJoiner := mustDecodeHex(t, "joiner_secret"+at, published.JoinerSecret)
+			if bytes.Equal(previousInit, commitSecret) {
+				t.Errorf("%s: init_secret_[n-1] and commit_secret are the same bytes, so this epoch agrees with a transposed Extract in the joiner step and pins nothing about the argument order",
+					at)
+			}
+			if bytes.Equal(publishedJoiner, pskSecret) {
+				t.Errorf("%s: joiner_secret and psk_secret are the same bytes, so this epoch agrees with a transposed Extract in the member step and pins nothing about the argument order",
+					at)
+			}
+			publishedContext := mustDecodeHex(t, "group_context"+at, published.GroupContext)
+			groupContext := &GroupContext{}
+			if err := syntax.Unmarshal(publishedContext, groupContext); err != nil {
+				t.Fatalf("%s: decode the published group context: %v", at, err)
+			}
+			reEncoded, err := syntax.Marshal(groupContext)
+			if err != nil {
+				t.Fatalf("%s: re-encode the decoded group context: %v", at, err)
+			}
+			if !bytes.Equal(reEncoded, publishedContext) {
+				t.Fatalf("%s: the group context codec re-encodes to %x and the corpus published %x, so a secret mismatch below would be the codec and not the key schedule",
+					at, reEncoded, publishedContext)
+			}
+			epochs = append(epochs, ksVectorEpoch{
+				suite:        suite,
+				crypto:       crypto,
+				at:           at,
+				groupContext: groupContext,
+				initPrev:     previousInit,
+				commitSecret: commitSecret,
+				pskSecret:    pskSecret,
+				published:    published,
+			})
+			previousInit = mustDecodeHex(t, "init_secret"+at, published.InitSecret)
+		}
+	}
+	if len(epochs) != keyScheduleKatEpochs {
+		t.Fatalf("the corpus answered for %d epochs, want %d; the loop matched %v",
+			len(epochs), keyScheduleKatEpochs, matched)
+	}
+	if got := slices.Sorted(slices.Values(matched)); !slices.Equal(got, Suites()) {
+		t.Fatalf("the corpus answered for %v and this package registers %v", got, Suites())
+	}
+	return epochs
+}
+
+// schedule builds the committer's key schedule for this epoch.
+func (self ksVectorEpoch) schedule(t *testing.T) *KeySchedule {
+	t.Helper()
+	schedule, err := NewKeySchedule(
+		self.crypto, self.initPrev, self.commitSecret, self.pskSecret, self.groupContext)
+	if err != nil {
+		t.Fatalf("%s: NewKeySchedule: %v", self.at, err)
+	}
+	return schedule
+}
+
+// epochSecretsByField reads EpochSecrets field by field off the struct rather than off a
+// list written here, so a tenth secret added to the type joins every sweep that calls this
+// instead of quietly falling outside all of them.
+//
+// The type of each field is checked as it is read. reflect.Value.Bytes panics on a field
+// that is not a byte slice, and a panic inside a helper is a worse sentence than a name and
+// a type, so the refusal is written out.
+func epochSecretsByField(t *testing.T, secrets *EpochSecrets) map[string][]byte {
+	t.Helper()
+	if secrets == nil {
+		t.Fatal("Secrets() answered nil, so every sweep over the nine would run over nothing")
+	}
+	value := reflect.ValueOf(*secrets)
+	byteSlice := reflect.TypeOf([]byte(nil))
+	fields := map[string][]byte{}
+	for i := range value.NumField() {
+		name := value.Type().Field(i).Name
+		field := value.Field(i)
+		if field.Type() != byteSlice {
+			t.Fatalf("EpochSecrets.%s is %s rather than []byte, so the sweeps over the derived secrets do not cover it",
+				name, field.Type())
+		}
+		fields[name] = field.Bytes()
+	}
+	if len(fields) == 0 {
+		t.Fatal("EpochSecrets read as no fields at all, so every sweep below runs over nothing")
+	}
+	return fields
+}
+
+// publishedEpochSecret is the corpus answer for one field of EpochSecrets.
+//
+// The switch is exhaustive over the type rather than over a list, because the caller drives
+// it with the field names reflection read: a field added to EpochSecrets with no published
+// answer arrives at the default case and is reported as unpinned, which is exactly the
+// state a new secret is in until somebody finds the corpus field that answers it.
+func publishedEpochSecret(t *testing.T, field string, epoch labelKatEpoch) string {
+	t.Helper()
+	switch field {
+	case "SenderData":
+		return epoch.SenderDataSecret
+	case "Encryption":
+		return epoch.EncryptionSecret
+	case "Exporter":
+		return epoch.ExporterSecret
+	case "External":
+		return epoch.ExternalSecret
+	case "Confirmation":
+		return epoch.ConfirmationKey
+	case "Membership":
+		return epoch.MembershipKey
+	case "ResumptionPsk":
+		return epoch.ResumptionPsk
+	case "EpochAuthenticator":
+		return epoch.EpochAuthenticator
+	case "InitSecret":
+		return epoch.InitSecret
+	default:
+		t.Fatalf("EpochSecrets.%s has no published answer in %s, so this package derives a secret nobody else's implementation pins",
+			field, keyScheduleKatFile)
+		return ""
+	}
+}
+
+// TestKeyScheduleMatchesTheMlswgKeySchedule is the deliverable of this task: every secret
+// RFC 9420 section 8 derives for an epoch, compared against the answer mlswg published for
+// that epoch, through the type rather than through the primitives.
+//
+// This is the only test in this file that can tell the nine apart. Each is 32 pseudorandom
+// bytes, so "membership_key holds the value confirm produced" is a state in which every
+// length check, every distinctness check, every aliasing check and every round trip in this
+// package still passes. Two labels transposed between two fields is a two character edit
+// that no peer would ever interoperate with and that nothing else here would notice.
+//
+// The vacuity controls live in ksVectorEpochs, which authenticates the corpus, counts the
+// epochs, compares the matched suites against the registry, re-encodes each group context
+// against the published bytes and refuses an epoch whose Extract arguments coincide. What
+// is counted here is the answers compared, because a sweep whose inner loop stopped
+// producing rows reports the clean run a full one reports.
+func TestKeyScheduleMatchesTheMlswgKeySchedule(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		assertLabelKat(t, "joiner_secret"+epoch.at, schedule.JoinerSecret(), epoch.published.JoinerSecret)
+		assertLabelKat(t, "welcome_secret"+epoch.at, schedule.WelcomeSecret(), epoch.published.WelcomeSecret)
+		compared += 2
+		fields := epochSecretsByField(t, schedule.Secrets())
+		for _, name := range slices.Sorted(maps.Keys(fields)) {
+			assertLabelKat(t, "EpochSecrets."+name+epoch.at,
+				fields[name], publishedEpochSecret(t, name, epoch.published))
+			compared++
+		}
+	}
+	if compared != keyScheduleKatEpochComparisons {
+		t.Fatalf("compared %d published answers, want %d", compared, keyScheduleKatEpochComparisons)
+	}
+}
+
+// TestKeyScheduleGroupContextBytesAreThePublishedEncoding asserts the schedule expanded over
+// the bytes the corpus published, and hands back those same bytes.
+//
+// Both halves matter and they are different claims. The first is that every key of the
+// epoch was derived over the encoding a peer will use. The second is that a caller which
+// signs or MACs under GroupContextBytes signs under that same encoding rather than under a
+// re-encoding of the struct, which is where a second serialization could drift.
+func TestKeyScheduleGroupContextBytesAreThePublishedEncoding(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		published := mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext)
+		if got := epoch.schedule(t).GroupContextBytes(); !bytes.Equal(got, published) {
+			t.Errorf("%s: GroupContextBytes = %x, want %x", epoch.at, got, published)
+		}
+	}
+}
+
+// TestNoTwoEpochSecretsAreEqual sweeps the set reflection read rather than nine hand
+// written pair comparisons, which is the difference between a gate and a transcription: a
+// tenth secret, or a field renamed, joins this sweep by existing.
+//
+// A label pasted onto the line below it produces two identical secrets, and every
+// individual known answer still passes if both published values came from the same run of a
+// reference implementation that made the same mistake. Two derived secrets being equal is
+// not a coincidence at 32 bytes; it is a copied label.
+func TestNoTwoEpochSecretsAreEqual(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		fields := epochSecretsByField(t, epoch.schedule(t).Secrets())
+		names := slices.Sorted(maps.Keys(fields))
+		if len(names) < 2 {
+			t.Fatalf("%s: EpochSecrets read as %d fields, so no pair exists to compare", epoch.at, len(names))
+		}
+		for i, first := range names {
+			for _, second := range names[i+1:] {
+				if bytes.Equal(fields[first], fields[second]) {
+					t.Errorf("%s: EpochSecrets.%s and EpochSecrets.%s are the same %d bytes, which at this length is a copied DeriveSecret label rather than a collision",
+						epoch.at, first, second, len(fields[first]))
+				}
+			}
+		}
+	}
+}
+
+// TestEpochSecretsDoNotAliasEachOther is the storage half of the sweep above: two fields
+// that hold the same backing array are equal today and are also a pair where erasing one
+// silently erases the other, which is what Zeroize will do to this struct.
+//
+// Distinct values do not imply distinct storage — a field assigned a subslice of another
+// starting at a different offset differs in value and still shares the array — so the
+// comparison is on the address of the first element rather than on the bytes.
+func TestEpochSecretsDoNotAliasEachOther(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		fields := epochSecretsByField(t, epoch.schedule(t).Secrets())
+		names := slices.Sorted(maps.Keys(fields))
+		for i, first := range names {
+			if len(fields[first]) == 0 {
+				t.Fatalf("%s: EpochSecrets.%s is empty, so it has no storage to compare", epoch.at, first)
+			}
+			for _, second := range names[i+1:] {
+				if &fields[first][0] == &fields[second][0] {
+					t.Errorf("%s: EpochSecrets.%s and EpochSecrets.%s start in the same array, so erasing one erases the other",
+						epoch.at, first, second)
+				}
+			}
+		}
+	}
+}
+
+// TestEveryEpochSecretIsKdfNhBytes sweeps the reflected set for the one property a
+// truncation breaks and a known answer would report as a value mismatch.
+//
+// It is separate from the known answer test because it says which mistake was made. A
+// secret sliced to the AEAD key length is a well formed key that a peer's AEAD will accept
+// the wrong number of bytes of, and "want 32 bytes, got 16" is a sentence a reader can act
+// on where "these two hex strings differ" is not.
+func TestEveryEpochSecretIsKdfNhBytes(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		nh := epoch.crypto.HashSize()
+		fields := epochSecretsByField(t, epoch.schedule(t).Secrets())
+		for _, name := range slices.Sorted(maps.Keys(fields)) {
+			if len(fields[name]) != nh {
+				t.Errorf("%s: EpochSecrets.%s is %d bytes, want KDF.Nh = %d",
+					epoch.at, name, len(fields[name]), nh)
+			}
+		}
+	}
+}
+
+// deriveSecretRecordingProvider keeps what every DeriveSecret call was handed and what it
+// answered, so a test can read the shape of the derivation off the implementation's own
+// behaviour instead of transcribing the nine labels a second time.
+//
+// A second transcription is what makes a label test vacuous: a test holding its own copy of
+// the list agrees with whatever the implementation spells as long as both were edited
+// together, which is exactly how a swapped pair survives. What is asserted from these
+// records is structure — one parent for all nine, distinct labels, a label that matters —
+// and the spelling itself is left to the published corpus.
+//
+// The secret is cloned because member_secret is erased in place immediately after the
+// welcome derivation, so a record holding the caller's slice would read back as zeros. The
+// answer is NOT cloned: it is the storage the schedule retains, and comparing the address
+// of its first element is how a record is matched to the field it became.
+type deriveSecretCall struct {
+	secret []byte
+	label  string
+	answer []byte
+}
+
+type deriveSecretRecordingProvider struct {
+	CryptoProvider
+	calls []deriveSecretCall
+}
+
+func (self *deriveSecretRecordingProvider) DeriveSecret(secret []byte, label string) []byte {
+	answer := self.CryptoProvider.DeriveSecret(secret, label)
+	self.calls = append(self.calls, deriveSecretCall{
+		secret: bytes.Clone(secret),
+		label:  label,
+		answer: answer,
+	})
+	return answer
+}
+
+// TestEveryEpochSecretIsDerivedFromOneParentUnderItsOwnLabel observes the three structural
+// claims newKeyScheduleFromParts makes, none of which the published answers separate on
+// their own once a value has been pinned.
+//
+//   - every one of the nine is DeriveSecret of the SAME parent. A secret derived from
+//     member_secret, from welcome_secret or from another of the nine is still 32
+//     pseudorandom bytes, and the corpus only says what the right answer is, not which
+//     parent a wrong one came from.
+//   - the nine labels are pairwise distinct. This is the same failure the value sweep
+//     catches, read at the input rather than at the output, and it names the label.
+//   - the label is what separates them: the same parent under a label differing by one
+//     character answers with different bytes.
+//
+// The parent is checked against an independent statement of epoch_secret rather than merely
+// against itself, so "all nine came from one parent" cannot be satisfied by all nine coming
+// from the wrong one. That statement is RFC 9420 section 8 written out over the corpus's own
+// inputs, and both of its steps are already held to the published answers by
+// TestExpandWithLabelMatchesTheKeyScheduleVectors.
+func TestEveryEpochSecretIsDerivedFromOneParentUnderItsOwnLabel(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		recording := &deriveSecretRecordingProvider{CryptoProvider: epoch.crypto}
+		schedule, err := NewKeySchedule(
+			recording, epoch.initPrev, epoch.commitSecret, epoch.pskSecret, epoch.groupContext)
+		if err != nil {
+			t.Fatalf("%s: NewKeySchedule: %v", epoch.at, err)
+		}
+		fields := epochSecretsByField(t, schedule.Secrets())
+
+		// the independent parent: Extract(joiner_secret, psk_secret) expanded under
+		// "epoch" over the group context, per RFC 9420 section 8
+		wantParent := epoch.crypto.ExpandWithLabel(
+			epoch.crypto.Extract(
+				mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret), epoch.pskSecret),
+			"epoch", mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext),
+			epoch.crypto.HashSize())
+
+		labels := map[string]string{}
+		for _, name := range slices.Sorted(maps.Keys(fields)) {
+			secret := fields[name]
+			if len(secret) == 0 {
+				t.Fatalf("%s: EpochSecrets.%s is empty, so no record can be matched to it", epoch.at, name)
+			}
+			matches := []deriveSecretCall{}
+			for _, call := range recording.calls {
+				if len(call.answer) > 0 && &call.answer[0] == &secret[0] {
+					matches = append(matches, call)
+				}
+			}
+			if len(matches) != 1 {
+				t.Fatalf("%s: EpochSecrets.%s is the answer of %d recorded DeriveSecret calls, want 1; it is either not a DeriveSecret answer at all or it was copied out of one",
+					epoch.at, name, len(matches))
+			}
+			if !bytes.Equal(matches[0].secret, wantParent) {
+				t.Errorf("%s: EpochSecrets.%s was derived from %x and epoch_secret is %x, so it hangs off the wrong parent",
+					epoch.at, name, matches[0].secret, wantParent)
+			}
+			if owner, taken := labels[matches[0].label]; taken {
+				t.Errorf("%s: EpochSecrets.%s and EpochSecrets.%s were both derived under %q, so one label was pasted over the other",
+					epoch.at, name, owner, matches[0].label)
+			}
+			labels[matches[0].label] = name
+
+			// and the label is load bearing: one character of it changes the answer
+			if altered := epoch.crypto.DeriveSecret(wantParent, matches[0].label+"x"); bytes.Equal(altered, secret) {
+				t.Errorf("%s: EpochSecrets.%s is unchanged by altering only its DeriveSecret label, so the label is not what separates it from the other eight",
+					epoch.at, name)
+			}
+		}
+		if len(labels) != len(fields) {
+			t.Errorf("%s: %d distinct labels produced %d secrets", epoch.at, len(labels), len(fields))
+		}
+		// the welcome derivation is the tenth recorded call and hangs off member_secret,
+		// so a count of exactly ten says nothing else reached for the parent behind the
+		// package's back
+		if len(recording.calls) != len(fields)+1 {
+			t.Errorf("%s: %d DeriveSecret calls, want %d: the nine and welcome_secret",
+				epoch.at, len(recording.calls), len(fields)+1)
+		}
+		if _, welcomeIsAnEpochSecret := labels["welcome"]; welcomeIsAnEpochSecret {
+			t.Errorf("%s: an epoch secret was derived under the welcome label", epoch.at)
+		}
+	}
+}
+
+// keyScheduleMethodsTakingArguments names an exported method of *KeySchedule the epoch
+// secret sweep below cannot call, with the reason. It is empty at this task: all four
+// accessors take the receiver and nothing else.
+//
+// It exists so that a later task adding an argument taking method — Export and the two tag
+// verifiers are in this plan — has to write down why that method cannot be swept, rather
+// than have it silently fall outside a gate whose whole subject is what this type is
+// allowed to hand out. The map is checked against the type, so an entry cannot outlive the
+// method it excuses.
+var keyScheduleMethodsTakingArguments = map[string]string{}
+
+// exposedByteSlices flattens everything one call handed back into the byte slices a caller
+// can read. A []byte result is one; a pointer to a struct is each of its exported byte
+// slice fields, which is the shape Secrets() has.
+func exposedByteSlices(t *testing.T, what string, result reflect.Value) [][]byte {
+	t.Helper()
+	byteSlice := reflect.TypeOf([]byte(nil))
+	if result.Type() == byteSlice {
+		return [][]byte{result.Bytes()}
+	}
+	if result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct {
+		if result.IsNil() {
+			return nil
+		}
+		exposed := [][]byte{}
+		element := result.Elem()
+		for i := range element.NumField() {
+			if !element.Type().Field(i).IsExported() {
+				continue
+			}
+			exposed = append(exposed,
+				exposedByteSlices(t, what+"."+element.Type().Field(i).Name, element.Field(i))...)
+		}
+		return exposed
+	}
+	t.Fatalf("%s answers a %s, which this sweep cannot read for bytes; extend it rather than letting a new result shape fall outside guardrail 6",
+		what, result.Type())
+	return nil
+}
+
+// TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret is guardrail G6 read as
+// behaviour rather than as a convention.
+//
+// epoch_secret is the parent of all nine. A caller holding it holds confirmation_key and
+// membership_key — the two secrets that authenticate a commit — and every other secret the
+// epoch will ever produce, so an accessor returning it is a one line change that gives the
+// epoch away while every other test in this file goes on passing. It is also the natural
+// thing to add: a constructor wants to return it and a test helper wants to accept it, which
+// is why this is written down at the task that first derives it rather than left to the one
+// that names the guardrail.
+//
+// The class is the type's own exported surface read by reflection, not a list of accessors
+// written here, so a method added later joins the sweep by existing. What each answer is
+// compared against is an independent statement of epoch_secret over the corpus's own inputs,
+// and the sweep asserts it found the secrets it should find before concluding it did not
+// find the one it should not: a flattener that read nothing reports the same clean run as
+// one that read everything.
+func TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		epochSecret := epoch.crypto.ExpandWithLabel(
+			epoch.crypto.Extract(
+				mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret), epoch.pskSecret),
+			"epoch", mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext),
+			epoch.crypto.HashSize())
+
+		scheduleType := reflect.TypeOf(schedule)
+		valueType := scheduleType.Elem()
+		for i := range valueType.NumField() {
+			if valueType.Field(i).IsExported() {
+				t.Fatalf("%s: KeySchedule has exported field %s, so its storage is reachable without going through a method this sweep reads",
+					epoch.at, valueType.Field(i).Name)
+			}
+		}
+
+		exposed := [][]byte{}
+		swept := []string{}
+		for i := range scheduleType.NumMethod() {
+			method := scheduleType.Method(i)
+			if method.Type.NumIn() != 1 {
+				if reason, excused := keyScheduleMethodsTakingArguments[method.Name]; !excused {
+					t.Fatalf("%s: (*KeySchedule).%s takes arguments and this sweep calls with none; give it arguments here or write down in keyScheduleMethodsTakingArguments why it cannot surface epoch_secret",
+						epoch.at, method.Name)
+				} else {
+					t.Logf("%s: (*KeySchedule).%s not swept: %s", epoch.at, method.Name, reason)
+				}
+				continue
+			}
+			swept = append(swept, method.Name)
+			for _, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)}) {
+				exposed = append(exposed,
+					exposedByteSlices(t, "(*KeySchedule)."+method.Name, result)...)
+			}
+		}
+		for name := range keyScheduleMethodsTakingArguments {
+			if _, found := scheduleType.MethodByName(name); !found {
+				t.Errorf("keyScheduleMethodsTakingArguments excuses %s, which *KeySchedule does not declare", name)
+			}
+		}
+
+		// the controls: the sweep reached the surface, and the flattener really does
+		// return the bytes behind it. Without these an accessor that answered nothing,
+		// or a flattener that dropped every struct field, reports the same clean run.
+		if len(swept) < 4 {
+			t.Fatalf("%s: swept %d exported methods of *KeySchedule (%v), and the type declares four accessors at least",
+				epoch.at, len(swept), swept)
+		}
+		fields := epochSecretsByField(t, schedule.Secrets())
+		if len(exposed) < len(fields)+2 {
+			t.Fatalf("%s: the sweep read %d byte slices off the exported surface and Secrets() alone carries %d, so it is not reading what it claims to",
+				epoch.at, len(exposed), len(fields))
+		}
+		for _, known := range [][]byte{schedule.JoinerSecret(), schedule.Secrets().InitSecret} {
+			if !slices.ContainsFunc(exposed, func(b []byte) bool { return bytes.Equal(b, known) }) {
+				t.Fatalf("%s: the sweep did not find a secret the type certainly exposes, so a secret it must not expose would be missed too",
+					epoch.at)
+			}
+		}
+
+		for index, secret := range exposed {
+			if bytes.Equal(secret, epochSecret) {
+				t.Errorf("%s: the exported surface hands out epoch_secret at position %d of %d; it is the parent of every secret of this epoch and G6 says no exported symbol returns it",
+					epoch.at, index, len(exposed))
+			}
+		}
+	}
+}
+
+// TestNewKeyScheduleErasesTheMemberSecret observes the sentence key_schedule.go writes above
+// NewKeyScheduleFromJoiner: member_secret is erased once it has produced the two things it
+// feeds.
+//
+// member_secret is not one of the epoch's secrets and nothing downstream reads it, and it
+// reproduces welcome_secret and epoch_secret — which is to say all nine — from one
+// HKDF-Expand each. Deleting the zeroizeSecret call changes no answer this package
+// computes, so nothing but a read of that storage sees it.
+//
+// The control is the same one TestDeriveJoinerSecretErasesThePseudorandomKey carries: an all
+// zero reading only means something if the key was not already zero, and a returned secret
+// that came back zero would satisfy the loop for the wrong reason.
+func TestNewKeyScheduleErasesTheMemberSecret(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		joinerSecret := mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret)
+
+		fresh := epoch.crypto.Extract(joinerSecret, epoch.pskSecret)
+		if !slices.ContainsFunc(fresh, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("%s: Extract over these inputs is already %d zero bytes, so an all zero reading below would say nothing",
+				epoch.at, len(fresh))
+		}
+
+		crypto := &extractCapturingProvider{CryptoProvider: epoch.crypto}
+		schedule, err := NewKeyScheduleFromJoiner(crypto, joinerSecret, epoch.pskSecret, epoch.groupContext)
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromJoiner: %v", epoch.at, err)
+		}
+		if len(crypto.extracted) != 1 {
+			t.Fatalf("%s: Extract was called %d times, want 1; this gate reads the key that one call returned",
+				epoch.at, len(crypto.extracted))
+		}
+		member := crypto.extracted[0]
+		for i, b := range member {
+			if b != 0 {
+				t.Errorf("%s: byte %d of member_secret is %#02x after the call, want 0; it reproduces every secret of the epoch",
+					epoch.at, i, b)
+				break
+			}
+		}
+		// and the erase reached member_secret rather than what it produced
+		if !slices.ContainsFunc(schedule.WelcomeSecret(), func(b byte) bool { return b != 0 }) {
+			t.Errorf("%s: welcome_secret came back as %d zero bytes, so the erase reached the values that were kept",
+				epoch.at, len(schedule.WelcomeSecret()))
+		}
+	}
+}
+
+// expandCapturingProvider keeps every ExpandWithLabel answer, for the same reason and with
+// the same no-copy discipline extractCapturingProvider has: what is read afterwards is the
+// storage the production code held, not a clone of it.
+type expandCapturingProvider struct {
+	CryptoProvider
+	expanded [][]byte
+}
+
+func (self *expandCapturingProvider) ExpandWithLabel(
+	secret []byte, label string, context []byte, length int,
+) []byte {
+	answer := self.CryptoProvider.ExpandWithLabel(secret, label, context, length)
+	self.expanded = append(self.expanded, answer)
+	return answer
+}
+
+// TestNewKeyScheduleErasesTheJoinerSecretItDerived observes both outcomes of the one
+// derivation NewKeySchedule makes on its own account.
+//
+// On the refusal the joiner secret reached no caller: it is derived before psk_secret is
+// looked at, so a psk of the wrong length leaves a live secret behind. On success the
+// schedule holds a copy of its own, so the storage this one was computed into is again a
+// live secret nothing will ever come back for. Returning without erasing it is the shape
+// a reader would not think twice about, and it changes no answer this package computes:
+// joiner_secret is one Extract and one Expand from the whole epoch, and a Welcome is
+// sealed under what it produces.
+//
+// The success half also reads the schedule's own joiner secret back, because an erase
+// aimed one line wrong would clear that instead and the epoch would go on looking fine
+// until a Welcome sealed under zeros.
+func TestNewKeyScheduleErasesTheJoinerSecretItDerived(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		for _, testCase := range []struct {
+			what      string
+			pskSecret []byte
+			refused   bool
+		}{
+			{what: "refused for a short psk secret", pskSecret: epoch.pskSecret[:len(epoch.pskSecret)-1], refused: true},
+			{what: "accepted", pskSecret: epoch.pskSecret},
+		} {
+			at := epoch.at + " " + testCase.what
+			crypto := &expandCapturingProvider{CryptoProvider: epoch.crypto}
+			schedule, err := NewKeySchedule(
+				crypto, epoch.initPrev, epoch.commitSecret, testCase.pskSecret, epoch.groupContext)
+			if testCase.refused {
+				if !errors.Is(err, ErrSecretLength) {
+					t.Fatalf("%s: err = %v, want ErrSecretLength", at, err)
+				}
+				if schedule != nil {
+					t.Errorf("%s: a schedule came back beside the refusal", at)
+				}
+			} else if err != nil {
+				t.Fatalf("%s: NewKeySchedule: %v", at, err)
+			}
+			// the joiner expansion is the first, whether or not the epoch expansion follows
+			if len(crypto.expanded) == 0 {
+				t.Fatalf("%s: ExpandWithLabel was never called, so this row read no joiner secret", at)
+			}
+			derived := crypto.expanded[0]
+			if len(derived) != epoch.crypto.HashSize() {
+				t.Fatalf("%s: the captured expansion is %d bytes, want KDF.Nh = %d",
+					at, len(derived), epoch.crypto.HashSize())
+			}
+			for i, b := range derived {
+				if b != 0 {
+					t.Errorf("%s: byte %d of the derived joiner secret is %#02x afterwards, want 0; nothing will ever come back for that storage",
+						at, i, b)
+					break
+				}
+			}
+			// and on the accepted path the erase reached that storage rather than the copy
+			// the epoch keeps, which is the value a Welcome is sealed under
+			if schedule != nil {
+				assertLabelKat(t, "joiner_secret"+at, schedule.JoinerSecret(), epoch.published.JoinerSecret)
+			}
+		}
+	}
+}
+
+// TestKeyScheduleConstructorsRefuseSecretsThatAreNotKdfNh sweeps every wrong length of every
+// secret argument of every constructor, rather than the one short case.
+//
+// HKDF-Extract accepts any length of either argument and answers with a well formed
+// pseudorandom key, so none of these is refused by the arithmetic. A secret one byte short,
+// one byte long, empty or absent all produce an epoch that is internally consistent and
+// that no peer agrees with, which surfaces as an undecryptable message rather than as the
+// length mistake it is.
+func TestKeyScheduleConstructorsRefuseSecretsThatAreNotKdfNh(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		nh := epoch.crypto.HashSize()
+		joinerSecret := mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret)
+		wrongLengths := map[string][]byte{
+			"one byte short": bytes.Repeat([]byte{0x11}, nh-1),
+			"one byte long":  bytes.Repeat([]byte{0x11}, nh+1),
+			"empty":          {},
+			"nil":            nil,
+		}
+		for _, name := range slices.Sorted(maps.Keys(wrongLengths)) {
+			wrong := wrongLengths[name]
+			for _, testCase := range []struct {
+				what string
+				call func() (*KeySchedule, error)
+			}{
+				{what: "NewKeySchedule init_secret", call: func() (*KeySchedule, error) {
+					return NewKeySchedule(epoch.crypto, wrong, epoch.commitSecret, epoch.pskSecret, epoch.groupContext)
+				}},
+				{what: "NewKeySchedule commit_secret", call: func() (*KeySchedule, error) {
+					return NewKeySchedule(epoch.crypto, epoch.initPrev, wrong, epoch.pskSecret, epoch.groupContext)
+				}},
+				{what: "NewKeySchedule psk_secret", call: func() (*KeySchedule, error) {
+					return NewKeySchedule(epoch.crypto, epoch.initPrev, epoch.commitSecret, wrong, epoch.groupContext)
+				}},
+				{what: "NewKeyScheduleFromJoiner joiner_secret", call: func() (*KeySchedule, error) {
+					return NewKeyScheduleFromJoiner(epoch.crypto, wrong, epoch.pskSecret, epoch.groupContext)
+				}},
+				{what: "NewKeyScheduleFromJoiner psk_secret", call: func() (*KeySchedule, error) {
+					return NewKeyScheduleFromJoiner(epoch.crypto, joinerSecret, wrong, epoch.groupContext)
+				}},
+				{what: "NewKeyScheduleFromEpochSecret epoch_secret", call: func() (*KeySchedule, error) {
+					return NewKeyScheduleFromEpochSecret(epoch.crypto, wrong, epoch.groupContext)
+				}},
+			} {
+				schedule, err := testCase.call()
+				if !errors.Is(err, ErrSecretLength) {
+					t.Errorf("%s: %s %s gave err = %v, want ErrSecretLength",
+						epoch.at, testCase.what, name, err)
+				}
+				if schedule != nil {
+					t.Errorf("%s: %s %s was refused and a schedule came back beside the error",
+						epoch.at, testCase.what, name)
+				}
+			}
+		}
+	}
+}
+
+// keyScheduleConstructorsOverAGroupContext is every exported package level function that
+// takes a *GroupContext, read off this package's own source rather than listed.
+//
+// A list would be the fourteenth understatement in this repository. Every one of these
+// serializes the context it is handed, syntax.Marshal receives a non nil interface holding a
+// nil pointer, and MarshalMLS dereferences it — so the missing one is not a function without
+// the guard, it is a function whose caller gets a panic out of the syntax package naming
+// neither the function nor the argument that was absent. Every one of them takes its context
+// off a struct field, which is exactly where an unset one comes from.
+func keyScheduleConstructorsOverAGroupContext(t *testing.T) []string {
+	t.Helper()
+	exported := []string{}
+	for _, name := range packageLevelFunctionsTaking(t, "*GroupContext") {
+		if ast.IsExported(name) {
+			exported = append(exported, name)
+		}
+	}
+	if len(exported) == 0 {
+		t.Fatal("no exported package level function of this package takes a *GroupContext, so the gate below demands nothing")
+	}
+	return exported
+}
+
+// TestEveryConstructorOverAGroupContextRefusesANilOne holds the class the scan above found,
+// so a fourth constructor added to this file is refused entry until it is covered here.
+func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	nh := crypto.HashSize()
+	secret := bytes.Repeat([]byte{0x5c}, nh)
+	// a nil literal and a nil valued variable of the type are the same argument, and the
+	// second is how an unset struct field arrives
+	var unset *GroupContext
+	covered := map[string]func(context *GroupContext) error{
+		"DeriveJoinerSecret": func(context *GroupContext) error {
+			_, err := DeriveJoinerSecret(crypto, secret, secret, context)
+			return err
+		},
+		"NewKeySchedule": func(context *GroupContext) error {
+			_, err := NewKeySchedule(crypto, secret, secret, secret, context)
+			return err
+		},
+		"NewKeyScheduleFromJoiner": func(context *GroupContext) error {
+			_, err := NewKeyScheduleFromJoiner(crypto, secret, secret, context)
+			return err
+		},
+		"NewKeyScheduleFromEpochSecret": func(context *GroupContext) error {
+			_, err := NewKeyScheduleFromEpochSecret(crypto, secret, context)
+			return err
+		},
+	}
+	found := keyScheduleConstructorsOverAGroupContext(t)
+	if got := slices.Sorted(maps.Keys(covered)); !slices.Equal(got, slices.Sorted(slices.Values(found))) {
+		t.Fatalf("this gate covers %v and the package's source declares %v as exported functions over a *GroupContext",
+			got, found)
+	}
+	for _, name := range slices.Sorted(maps.Keys(covered)) {
+		// the control: a real context is accepted, so a refusal below is the nil and not
+		// the other arguments
+		if err := covered[name](ksVectorEpoch0GroupContext(t)); err != nil {
+			t.Fatalf("%s: a real group context was refused: %v", name, err)
+		}
+		for _, testCase := range []struct {
+			what    string
+			context *GroupContext
+		}{
+			{what: "a nil literal", context: nil},
+			{what: "an unset field", context: unset},
+		} {
+			var err error
+			recovered := recoveredPanic(func() { err = covered[name](testCase.context) })
+			if recovered != nil {
+				t.Errorf("%s: %s panicked with %v rather than being refused", name, testCase.what, recovered)
+				continue
+			}
+			if !errors.Is(err, ErrNilGroupContext) {
+				t.Errorf("%s: %s gave err = %v, want ErrNilGroupContext", name, testCase.what, err)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the group creation entry point
+// ---------------------------------------------------------------------------
+
+// TestNewKeyScheduleFromEpochSecretDerivesTheSameNineSecrets asserts the creation path
+// reaches the same nine secrets as the commit path, given the epoch_secret the commit path
+// computed. Anything else means a group's creator and its first joiner are in different
+// epochs from the first message.
+//
+// The epoch secret is recomputed here from the corpus's own inputs rather than taken off the
+// schedule, because the type deliberately never exports it — see
+// TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret. Widening a signature to make
+// this test easier is the thing G6 is about, so the test is written against what the type is
+// allowed to expose.
+//
+// The set compared is the one reflection read, so the two paths are held to agreeing on
+// every field EpochSecrets has rather than on the nine that were current when this was
+// written.
+func TestNewKeyScheduleFromEpochSecretDerivesTheSameNineSecrets(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		epochSecret := epoch.crypto.ExpandWithLabel(
+			epoch.crypto.Extract(
+				mustDecodeHex(t, "joiner_secret"+epoch.at, epoch.published.JoinerSecret), epoch.pskSecret),
+			"epoch", mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext),
+			epoch.crypto.HashSize())
+
+		fromEpoch, err := NewKeyScheduleFromEpochSecret(epoch.crypto, epochSecret, epoch.groupContext)
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", epoch.at, err)
+		}
+		fromCommit := epochSecretsByField(t, epoch.schedule(t).Secrets())
+		created := epochSecretsByField(t, fromEpoch.Secrets())
+		if got, want := slices.Sorted(maps.Keys(created)), slices.Sorted(maps.Keys(fromCommit)); !slices.Equal(got, want) {
+			t.Fatalf("%s: the creation path answers with fields %v and the commit path with %v", epoch.at, got, want)
+		}
+		for _, name := range slices.Sorted(maps.Keys(fromCommit)) {
+			if !bytes.Equal(fromCommit[name], created[name]) {
+				t.Errorf("%s: EpochSecrets.%s is %x from the commit path and %x from the creation path",
+					epoch.at, name, fromCommit[name], created[name])
+			}
+		}
+		if !bytes.Equal(fromEpoch.GroupContextBytes(), mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext)) {
+			t.Errorf("%s: the creation path expanded over %x", epoch.at, fromEpoch.GroupContextBytes())
+		}
+	}
+}
+
+// TestNewKeyScheduleFromEpochSecretHasNoJoinerOrWelcomeSecret asserts the two secrets that
+// are undefined on this path read as nil.
+//
+// A group created from a sampled epoch_secret was never joined, so there is no joiner_secret
+// and no welcome_secret to be had. Substituting KDF.Nh zero bytes for either would keep the
+// signatures the registry fixes and would seal a Welcome under a run of zeros — a key an
+// attacker also has — while every length check in this package passed. Nil is what makes the
+// caller's mistake a refusal at the first length check downstream.
+func TestNewKeyScheduleFromEpochSecretHasNoJoinerOrWelcomeSecret(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		at := fmt.Sprintf("suite %#04x", uint16(suite))
+		schedule, err := NewKeyScheduleFromEpochSecret(
+			crypto, crypto.Random(crypto.HashSize()), ksVectorEpoch0GroupContext(t))
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", at, err)
+		}
+		if schedule.JoinerSecret() != nil {
+			t.Errorf("%s: JoinerSecret = %x, want nil on the creation path", at, schedule.JoinerSecret())
+		}
+		if schedule.WelcomeSecret() != nil {
+			t.Errorf("%s: WelcomeSecret = %x, want nil on the creation path", at, schedule.WelcomeSecret())
+		}
+		// and the nine are there, so the nils above are the two that are undefined rather
+		// than a schedule that derived nothing at all
+		for _, name := range slices.Sorted(maps.Keys(epochSecretsByField(t, schedule.Secrets()))) {
+			if got := epochSecretsByField(t, schedule.Secrets())[name]; len(got) != crypto.HashSize() {
+				t.Errorf("%s: EpochSecrets.%s is %d bytes on the creation path, want KDF.Nh = %d",
+					at, name, len(got), crypto.HashSize())
+			}
+		}
+	}
+}
+
+// TestNewKeyScheduleFromEpochSecretCopiesTheSample observes the sentence
+// NewKeyScheduleFromEpochSecret writes: the sample is copied rather than retained.
+//
+// Retaining it would make the epoch's whole key schedule a window onto a buffer the caller
+// still owns, and the caller of this is a NewGroup that just sampled KDF.Nh bytes and is
+// about to erase them — which would erase the parent of the live epoch instead.
+func TestNewKeyScheduleFromEpochSecretCopiesTheSample(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		at := fmt.Sprintf("suite %#04x", uint16(suite))
+		sample := crypto.Random(crypto.HashSize())
+		schedule, err := NewKeyScheduleFromEpochSecret(crypto, sample, ksVectorEpoch0GroupContext(t))
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromEpochSecret: %v", at, err)
+		}
+		kept := map[string][]byte{}
+		for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
+			kept[name] = bytes.Clone(secret)
+		}
+		// the caller does what a NewGroup does with a sample it has finished handing over
+		zeroizeSecret(sample)
+		after := epochSecretsByField(t, schedule.Secrets())
+		for _, name := range slices.Sorted(maps.Keys(kept)) {
+			if !bytes.Equal(after[name], kept[name]) {
+				t.Errorf("%s: erasing the caller's sample changed EpochSecrets.%s, so the epoch is a window onto storage the caller owns",
+					at, name)
+			}
+		}
+		// and the control: the sample was read at all. a schedule built over the erased
+		// buffer must differ, or the comparison above holds for a constructor that never
+		// looked at its argument.
+		second, err := NewKeyScheduleFromEpochSecret(crypto, sample, ksVectorEpoch0GroupContext(t))
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromEpochSecret over the erased sample: %v", at, err)
+		}
+		if bytes.Equal(second.Secrets().InitSecret, kept["InitSecret"]) {
+			t.Errorf("%s: a schedule over KDF.Nh zero bytes derived the same init_secret as one over the sample, so the sample was never read",
+				at)
+		}
+	}
+}

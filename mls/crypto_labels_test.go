@@ -543,6 +543,13 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// over a context that had been allowed past that is a secret no peer running the
 		// default limit could have derived.
 		"key_schedule.go: syntax.Marshal(groupContext)",
+		// the same preimage from the two entry points that do not reach it through the
+		// joiner derivation: the one a Welcome'd member takes, and the one a group being
+		// created takes. Same structure, same reason, same limit. Three calls rather than
+		// one shared helper because each sits on a path that can refuse before the other
+		// two are reachable, and a helper would move the decision rather than remove it.
+		"key_schedule.go: syntax.Marshal(groupContext)",
+		"key_schedule.go: syntax.Marshal(groupContext)",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
@@ -1282,6 +1289,44 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("DeriveJoinerSecret: %v", joinerErr)
 			}
 			return joiner
+		}},
+		// the three key schedule entry points and the assembler behind them. Each reaches
+		// the provider for an extract, an expand and nine derivations, and none of that
+		// is visible in the answer: an epoch computed with a provider of its own is nine
+		// well formed secrets that agree with every corpus in this package, because the
+		// corpora are all the suite it would have hardcoded. init_secret is the result
+		// read because it is the one field every entry point fills — joiner_secret and
+		// welcome_secret are nil on the creation path by design.
+		{name: "NewKeySchedule", call: func(crypto CryptoProvider) []byte {
+			schedule, scheduleErr := NewKeySchedule(crypto,
+				bytes.Repeat([]byte{0x73}, 32), bytes.Repeat([]byte{0x74}, 32),
+				bytes.Repeat([]byte{0x75}, 32), ksVectorEpoch0GroupContext(t))
+			if scheduleErr != nil {
+				t.Fatalf("NewKeySchedule: %v", scheduleErr)
+			}
+			return schedule.Secrets().InitSecret
+		}},
+		{name: "NewKeyScheduleFromJoiner", call: func(crypto CryptoProvider) []byte {
+			schedule, scheduleErr := NewKeyScheduleFromJoiner(crypto,
+				bytes.Repeat([]byte{0x76}, 32), bytes.Repeat([]byte{0x77}, 32),
+				ksVectorEpoch0GroupContext(t))
+			if scheduleErr != nil {
+				t.Fatalf("NewKeyScheduleFromJoiner: %v", scheduleErr)
+			}
+			return schedule.Secrets().InitSecret
+		}},
+		{name: "NewKeyScheduleFromEpochSecret", call: func(crypto CryptoProvider) []byte {
+			schedule, scheduleErr := NewKeyScheduleFromEpochSecret(crypto,
+				bytes.Repeat([]byte{0x78}, 32), ksVectorEpoch0GroupContext(t))
+			if scheduleErr != nil {
+				t.Fatalf("NewKeyScheduleFromEpochSecret: %v", scheduleErr)
+			}
+			return schedule.Secrets().InitSecret
+		}},
+		{name: "newKeyScheduleFromParts", call: func(crypto CryptoProvider) []byte {
+			return newKeyScheduleFromParts(crypto, []byte("the encoded group context"),
+				bytes.Repeat([]byte{0x79}, 32), bytes.Repeat([]byte{0x7a}, 32),
+				bytes.Repeat([]byte{0x7b}, 32)).Secrets().InitSecret
 		}},
 	} {
 		covered = append(covered, testCase.name)

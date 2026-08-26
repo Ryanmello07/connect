@@ -2798,6 +2798,14 @@ var packageConstructionsOverBorrowedBytes = map[string]string{
 	// is reachable — which is this gate's "does not scribble on the caller" property,
 	// asserted at the one boundary that still applies to an eraser.
 	"zeroizeSecret": "erases a secret in place; writing into the caller's array is the function",
+	// the key schedule's internal assembler. It retains three of the four arrays it is
+	// handed — that is what building an epoch out of parts means — so the aliasing half
+	// of this gate would be holding it to not doing its job. It is unexported and no
+	// caller's bytes reach it: each of the three exported constructors copies or freshly
+	// derives every secret before passing it here, which is exactly the property this
+	// gate holds THEM to in the rows below. So the class is covered at the boundary
+	// where a caller exists, and excused at the one line inside it where there is none.
+	"newKeyScheduleFromParts": "assembles an epoch out of storage its three callers have already copied or derived; retaining it is the function",
 }
 
 // Every construction this package hands a caller's array leaves that array alone, answers
@@ -2857,6 +2865,12 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 	// an implementation that reads one of them twice
 	initSecretPrev := bytes.Repeat([]byte{0x71}, params.Nh)
 	commitSecret := bytes.Repeat([]byte{0x72}, params.Nh)
+	// and the three the epoch constructors take, at KDF.Nh for the same reason and all
+	// distinct from each other and from the two above, so no row is satisfied by a
+	// construction that read one of its arguments twice
+	pskSecret := bytes.Repeat([]byte{0x73}, params.Nh)
+	joinerSecret := bytes.Repeat([]byte{0x74}, params.Nh)
+	epochSecret := bytes.Repeat([]byte{0x75}, params.Nh)
 	// a second provider over a constant reader, for the one construction here that
 	// encapsulates. EncryptWithLabel draws its ephemeral key through the provider it is
 	// handed, so over a fixed stream it answers the same twice and the determinism half of
@@ -3027,6 +3041,52 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 				t.Fatalf("DeriveJoinerSecret: %v", joinerErr)
 			}
 			return [][]byte{joiner}
+		}},
+		// the three key schedule entry points. Every secret each of them is handed is one
+		// the caller reads again — an init secret is still needed if the commit turns out
+		// to be invalid, a psk secret is shared by every epoch that names the same psk, and
+		// the sampled epoch secret of a group being created is the caller's to erase — and
+		// each of these erases a secret of its own somewhere in the middle, so a zeroize
+		// aimed one line wrong lands in an array the caller still owns and every derivation
+		// after it comes out of zeroes.
+		//
+		// The aliasing half is the load bearing one here. These retain what they build the
+		// epoch from and erase all of it when the epoch leaves PastEpochWindow, so an
+		// answer that were a view over an argument is a caller's slice cleared as a side
+		// effect of an epoch ageing out — which no vector, digest or round trip can see.
+		{name: "NewKeySchedule", call: func(take func([]byte) []byte) [][]byte {
+			schedule, scheduleErr := NewKeySchedule(crypto, take(initSecretPrev), take(commitSecret),
+				take(pskSecret), ksVectorEpoch0GroupContext(t))
+			if scheduleErr != nil {
+				t.Fatalf("NewKeySchedule: %v", scheduleErr)
+			}
+			return [][]byte{
+				schedule.JoinerSecret(), schedule.WelcomeSecret(),
+				schedule.Secrets().InitSecret, schedule.GroupContextBytes(),
+			}
+		}},
+		{name: "NewKeyScheduleFromJoiner", call: func(take func([]byte) []byte) [][]byte {
+			schedule, scheduleErr := NewKeyScheduleFromJoiner(crypto, take(joinerSecret),
+				take(pskSecret), ksVectorEpoch0GroupContext(t))
+			if scheduleErr != nil {
+				t.Fatalf("NewKeyScheduleFromJoiner: %v", scheduleErr)
+			}
+			return [][]byte{
+				schedule.JoinerSecret(), schedule.WelcomeSecret(),
+				schedule.Secrets().InitSecret, schedule.GroupContextBytes(),
+			}
+		}},
+		// the creation path answers nil for joiner_secret and welcome_secret by design, so
+		// those two are absent here rather than read as empty results — see
+		// TestNewKeyScheduleFromEpochSecretHasNoJoinerOrWelcomeSecret, which is what holds
+		// them to being nil.
+		{name: "NewKeyScheduleFromEpochSecret", call: func(take func([]byte) []byte) [][]byte {
+			schedule, scheduleErr := NewKeyScheduleFromEpochSecret(crypto, take(epochSecret),
+				ksVectorEpoch0GroupContext(t))
+			if scheduleErr != nil {
+				t.Fatalf("NewKeyScheduleFromEpochSecret: %v", scheduleErr)
+			}
+			return [][]byte{schedule.Secrets().InitSecret, schedule.GroupContextBytes()}
 		}},
 	} {
 		covered = append(covered, testCase.name)
@@ -3409,6 +3469,10 @@ var providerConstructionValues = map[string]any{
 	"DecryptWithLabel":   DecryptWithLabel,
 	"ZeroSecret":         ZeroSecret,
 	"DeriveJoinerSecret": DeriveJoinerSecret,
+	"NewKeySchedule":                NewKeySchedule,
+	"NewKeyScheduleFromJoiner":      NewKeyScheduleFromJoiner,
+	"NewKeyScheduleFromEpochSecret": NewKeyScheduleFromEpochSecret,
+	"newKeyScheduleFromParts":       newKeyScheduleFromParts,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3598,6 +3662,18 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		// is not answered by the other
 		"initSecretPrev": ascendingBytes(0x11, params.Nh),
 		"commitSecret":   ascendingBytes(0x22, params.Nh),
+		// the epoch schedule's own four, on the same rule: exactly KDF.Nh, because every
+		// constructor refuses any other length and a refused call is a row that observed
+		// nothing, and all four distinct so a construction that read one of them where it
+		// meant another still moves when the one it did not read is perturbed.
+		"pskSecret":     ascendingBytes(0x33, params.Nh),
+		"joinerSecret":  ascendingBytes(0x44, params.Nh),
+		"welcomeSecret": ascendingBytes(0x55, params.Nh),
+		"epochSecret":   ascendingBytes(0x66, params.Nh),
+		// the assembler takes the group context already encoded rather than as a struct.
+		// It is stored and handed back rather than expanded over, so any bytes will do,
+		// and a length no MLS field has keeps it from being read as anything else.
+		"encodedGroupContext": ascendingBytes(0x77, 37),
 		// the epoch binding the joiner derivation expands over. Every field carries
 		// something, so the perturbation below has a field to move and an encoder that
 		// dropped one is not hidden by that field being empty to begin with.
@@ -3804,11 +3880,63 @@ func providerStubCall(call reflect.Value, arguments []reflect.Value) (results []
 // rather than by the one result somebody thought to read. A refusal is part of the answer:
 // an operation whose argument moved from accepted to rejected has observed that argument
 // just as surely as one whose bytes changed.
+// The byte slices a structured answer carries, read through unexported fields.
+//
+// A construction can answer with a type rather than with bytes, and the epoch key
+// schedule's entry points do: they answer a *KeySchedule holding twelve secrets behind
+// unexported fields. Two readings of such an answer are wrong here and one is right.
+//
+// Rendering it with fmt is wrong. fmt prints a nested pointer as a machine address, and
+// the type holds the provider it was built with, so two calls that agreed on every
+// secret render differently -- which fails the control above for every row, and would
+// make every perturbation below "differ" for a reason that is not the perturbation.
+//
+// Reading only exported fields is wrong the other way. This package keeps its secrets
+// unexported on purpose, so that reading renders a fully implemented type as no bytes
+// at all -- which is exactly the answer a stub gives, and this gate would report it as
+// one while being unable to tell the two apart.
+//
+// So what is read is every byte slice the value reaches, unexported included, in
+// declaration order, recursing into struct fields and stopping at everything else. A
+// secret is bytes; a field that is neither bytes nor a struct of them is state whose
+// identity says nothing about whether the inputs were observed.
+//
+// The bytes are copied out one at a time because reflect refuses Bytes and Interface on
+// a value reached through an unexported field. Uint on an element is permitted, is a
+// read and not a handle, and needs no unsafe.
+func providerStructByteFields(value reflect.Value) [][]byte {
+	carried := [][]byte{}
+	for i := range value.NumField() {
+		field := value.Field(i)
+		switch {
+		case field.Kind() == reflect.Slice && field.Type().Elem().Kind() == reflect.Uint8:
+			out := make([]byte, field.Len())
+			for at := range out {
+				out[at] = byte(field.Index(at).Uint())
+			}
+			carried = append(carried, out)
+		case field.Kind() == reflect.Struct:
+			carried = append(carried, providerStructByteFields(field)...)
+		}
+	}
+	return carried
+}
+
 func providerStubAnswer(results []reflect.Value) string {
 	rendered := []string{}
 	for _, result := range results {
 		if result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Uint8 {
 			rendered = append(rendered, hex.EncodeToString(result.Bytes()))
+			continue
+		}
+		if result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct {
+			if result.IsNil() {
+				rendered = append(rendered, "nil")
+			} else {
+				for _, carried := range providerStructByteFields(result.Elem()) {
+					rendered = append(rendered, hex.EncodeToString(carried))
+				}
+			}
 			continue
 		}
 		rendered = append(rendered, fmt.Sprint(result.Interface()))
@@ -3840,6 +3968,25 @@ func providerStubZeroResults(results []reflect.Value) []string {
 			}
 			if !slices.ContainsFunc(bytesOut, func(b byte) bool { return b != 0 }) {
 				zero = append(zero, position+" is "+strconv.Itoa(len(bytesOut))+" zero bytes")
+			}
+		case result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct:
+			if result.IsNil() {
+				zero = append(zero, position+" is nil")
+				continue
+			}
+			carried := providerStructByteFields(result.Elem())
+			if len(carried) == 0 {
+				zero = append(zero, position+" is a "+result.Type().String()+" carrying no bytes at all")
+				continue
+			}
+			for at, field := range carried {
+				if len(field) == 0 {
+					zero = append(zero, position+" field "+strconv.Itoa(at)+" is empty")
+					continue
+				}
+				if !slices.ContainsFunc(field, func(b byte) bool { return b != 0 }) {
+					zero = append(zero, position+" field "+strconv.Itoa(at)+" is "+strconv.Itoa(len(field))+" zero bytes")
+				}
 			}
 		case result.Kind() == reflect.Bool:
 			if !result.Bool() {
@@ -3912,6 +4059,24 @@ var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
 	"ZeroSecret": func(params *SuiteParams) any { return strings.Repeat("00", params.Nh) },
 }
 
+// The positions of a structured answer that are empty on purpose, named with the reason.
+//
+// An empty byte field is what a stub answers, so the reader above reports every one of
+// them. The exception is a field a type's own contract says is UNDEFINED on the path
+// under test, and the epoch key schedule has exactly one such path: a group being
+// created was never joined, so it has no joiner_secret and no welcome_secret. Answering
+// KDF.Nh zero bytes there instead of nil would seal a Welcome under a key an attacker
+// also has, so nil is the whole point rather than an omission, and this is where that
+// decision is written down.
+//
+// The positions are the reports they excuse, verbatim, and the gate requires each to
+// have actually been reported before removing it. An entry for a field that comes back
+// carrying bytes therefore fails rather than sitting here excusing nothing, which is how
+// an exemption stops outliving the design it was written for.
+var providerConstructionsWithUndefinedResults = map[string][]string{
+	"NewKeyScheduleFromEpochSecret": {"result 0 field 1 is empty", "result 0 field 2 is empty"},
+}
+
 // Every operation on both surfaces is covered, with nothing skipped and nothing excused.
 //
 // The other coverage gate in this file lets a value method and a stub method out, because
@@ -3977,6 +4142,11 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 	if len(providerStubMethods) != 0 {
 		t.Errorf("providerStubMethods names %v, so the provider still refuses to answer somewhere", providerStubMethods)
 	}
+	for name := range providerConstructionsWithUndefinedResults {
+		if _, called := providerConstructionValues[name]; !called {
+			t.Errorf("providerConstructionsWithUndefinedResults excuses %s, which this gate does not call", name)
+		}
+	}
 	for _, suite := range Suites() {
 		params, err := LookupSuite(suite)
 		if err != nil {
@@ -4013,7 +4183,15 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 			// the two: "not the zero value" would pass a wrong length and a wrong
 			// constant, and the registry comparison passes neither.
 			_, answersARegistryValue := providerRegistryAnswers[operation.name]
-			if zero := providerStubZeroResults(results); len(zero) != 0 && !answersARegistryValue {
+			zero := providerStubZeroResults(results)
+			for _, undefined := range providerConstructionsWithUndefinedResults[operation.name] {
+				if !slices.Contains(zero, undefined) {
+					t.Errorf("%s names %q as undefined on this path and it came back carrying bytes, so the exemption is excusing something that no longer happens",
+						where, undefined)
+				}
+				zero = slices.DeleteFunc(zero, func(report string) bool { return report == undefined })
+			}
+			if len(zero) != 0 && !answersARegistryValue {
 				t.Errorf("%s answered %s, which is what a stub answers", where, strings.Join(zero, ", "))
 			}
 			answer := providerStubAnswer(results)

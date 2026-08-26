@@ -17,6 +17,7 @@
 package mls
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -103,4 +104,243 @@ func DeriveJoinerSecret(
 	joinerSecret := crypto.ExpandWithLabel(prk, "joiner", encodedGroupContext, nh)
 	zeroizeSecret(prk)
 	return joinerSecret, nil
+}
+
+// EpochSecrets is every secret RFC 9420 section 8 derives from epoch_secret, and it is
+// the whole of what an epoch hands out.
+//
+// epoch_secret itself is deliberately absent, which is guardrail G6. It is the parent of
+// all nine, so a caller holding it holds confirmation_key and membership_key too — the two
+// that authenticate a commit — and every later secret this epoch will ever produce. A
+// field added here for it, or an accessor added to KeySchedule, would be one line that
+// gives the epoch away, so what stops that is a test rather than this paragraph: see
+// TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret.
+//
+// All nine are KDF.Nh bytes and all nine are indistinguishable from random, which is why
+// the only test that can tell them apart is a known answer somebody else published. A
+// label copied from the line above compiles, produces a well formed secret of the right
+// length, and disagrees with every peer.
+type EpochSecrets struct {
+	SenderData         []byte
+	Encryption         []byte
+	Exporter           []byte
+	External           []byte
+	Confirmation       []byte
+	Membership         []byte
+	ResumptionPsk      []byte
+	EpochAuthenticator []byte
+	InitSecret         []byte
+}
+
+// KeySchedule is one epoch of the RFC 9420 section 8 key schedule: the secrets that epoch
+// holds and the serialized GroupContext they were all expanded over.
+//
+// Not safe for concurrent use. The owning Group serializes access, and the secrets are
+// erased in place when the epoch leaves PastEpochWindow, so a second goroutine reading one
+// of them across that erase reads a partly zeroed key rather than a stale one.
+//
+// Every secret the schedule is handed is COPIED into storage of its own, and every secret
+// it derives is storage of its own from the start. So the epoch never writes through an
+// array a caller still holds, which matters because the last thing this type does is erase
+// every one of them in place: an epoch that retained its caller's joiner secret would clear
+// that caller's slice as a side effect of leaving PastEpochWindow. The other half of that
+// bargain is the caller's: whoever hands a secret in still owns the copy it handed, and this
+// type's erase cannot reach it.
+type KeySchedule struct {
+	crypto            CryptoProvider
+	groupContextBytes []byte
+	joinerSecret      []byte
+	welcomeSecret     []byte
+	epochSecret       []byte
+	secrets           EpochSecrets
+}
+
+// NewKeySchedule advances the schedule into the epoch groupContext describes, from the
+// previous epoch's init_secret and this commit's commit_secret. This is the committer's
+// path and the path of every member who processes that commit.
+//
+// The GroupContext is the one for the epoch being ENTERED. Every length check on the two
+// secrets, and the refusal of a nil context, belong to DeriveJoinerSecret, which this
+// delegates the first half of the derivation to.
+func NewKeySchedule(
+	crypto CryptoProvider,
+	initSecretPrev []byte,
+	commitSecret []byte,
+	pskSecret []byte,
+	groupContext *GroupContext,
+) (*KeySchedule, error) {
+	joinerSecret, err := DeriveJoinerSecret(crypto, initSecretPrev, commitSecret, groupContext)
+	if err != nil {
+		return nil, err
+	}
+	schedule, err := NewKeyScheduleFromJoiner(crypto, joinerSecret, pskSecret, groupContext)
+	// the joiner secret this call derived reaches no caller of this function either way:
+	// on the refusal it is dropped, and on success the schedule keeps a copy of its own. It
+	// is one Extract and one Expand away from every key of the epoch, so the storage it was
+	// computed into is erased rather than left for the collector. A psk secret of the wrong
+	// length is exactly the shape that reaches the refusal.
+	zeroizeSecret(joinerSecret)
+	if err != nil {
+		return nil, err
+	}
+	return schedule, nil
+}
+
+// NewKeyScheduleFromJoiner builds the schedule a joiner reaches from the joiner_secret
+// carried in its GroupSecrets, which is the only path a member added by Welcome has: it
+// never sees init_secret_[n-1] or commit_secret. RFC 9420 section 8:
+//
+//	member_secret  = KDF.Extract(joiner_secret, psk_secret)
+//	welcome_secret = DeriveSecret(member_secret, "welcome")
+//	epoch_secret   = ExpandWithLabel(member_secret, "epoch", GroupContext_[n], KDF.Nh)
+//
+// joiner_secret is the salt of that Extract and psk_secret is the input keying material,
+// in that order, through CryptoProvider.Extract. See the file comment: both are KDF.Nh
+// pseudorandom secrets, so the transposition compiles and answers with a secret exactly as
+// well formed as the right one.
+//
+// Both must be exactly KDF.Nh bytes. HKDF-Extract accepts any length of either argument and
+// would hand back a well formed pseudorandom key, so a short psk secret becomes an epoch
+// that looks valid on this side and matches nobody — surfacing epochs later as an
+// undecryptable message rather than as the length mistake it is.
+//
+// A nil context is refused rather than serialized, for the reason DeriveJoinerSecret gives:
+// syntax.Marshal is handed a non nil interface holding a nil pointer and MarshalMLS
+// dereferences it, so the caller would get a panic out of the syntax package naming neither
+// this function nor the argument that was missing.
+//
+// member_secret is erased once it has produced the two things it feeds. The epoch does not
+// retain it and nothing downstream needs it, and it reproduces both welcome_secret and
+// epoch_secret — which is to say all nine secrets — from one HKDF-Expand each.
+//
+// The joiner secret is copied rather than retained, for the reason the type comment gives.
+// The caller keeps the array it passed and owes it a zeroize of its own.
+func NewKeyScheduleFromJoiner(
+	crypto CryptoProvider,
+	joinerSecret []byte,
+	pskSecret []byte,
+	groupContext *GroupContext,
+) (*KeySchedule, error) {
+	if groupContext == nil {
+		return nil, ErrNilGroupContext
+	}
+	nh := crypto.HashSize()
+	if len(joinerSecret) != nh {
+		return nil, fmt.Errorf("%w: joiner secret is %d bytes, want %d", ErrSecretLength, len(joinerSecret), nh)
+	}
+	if len(pskSecret) != nh {
+		return nil, fmt.Errorf("%w: psk secret is %d bytes, want %d", ErrSecretLength, len(pskSecret), nh)
+	}
+	encodedGroupContext, err := syntax.Marshal(groupContext)
+	if err != nil {
+		return nil, err
+	}
+	// Extract takes (salt, ikm), the order the spec writes. joiner_secret is the salt.
+	memberSecret := crypto.Extract(joinerSecret, pskSecret)
+	welcomeSecret := crypto.DeriveSecret(memberSecret, "welcome")
+	epochSecret := crypto.ExpandWithLabel(memberSecret, "epoch", encodedGroupContext, nh)
+	zeroizeSecret(memberSecret)
+	return newKeyScheduleFromParts(
+		crypto, encodedGroupContext, bytes.Clone(joinerSecret), welcomeSecret, epochSecret), nil
+}
+
+// newKeyScheduleFromParts expands one epoch_secret into the nine derived secrets.
+//
+// Both exported constructors route through here, so a label can only ever be wrong in one
+// place rather than in two places that agree with each other. The nine labels are written
+// as literals and are deliberately not exported as a table: a test that read its
+// expectations off such a table would agree with any spelling of them, which is the one
+// shape a known answer test must not have. What holds these is the published corpus in
+// key_schedule_test.go.
+//
+// joinerSecret and welcomeSecret are nil on the group creation path, where neither is
+// defined. The accessors return that nil unchanged rather than substituting a zero secret,
+// so a caller cannot seal a Welcome under KDF.Nh zero bytes and believe it used a key.
+func newKeyScheduleFromParts(
+	crypto CryptoProvider,
+	encodedGroupContext []byte,
+	joinerSecret []byte,
+	welcomeSecret []byte,
+	epochSecret []byte,
+) *KeySchedule {
+	return &KeySchedule{
+		crypto:            crypto,
+		groupContextBytes: encodedGroupContext,
+		joinerSecret:      joinerSecret,
+		welcomeSecret:     welcomeSecret,
+		epochSecret:       epochSecret,
+		secrets: EpochSecrets{
+			SenderData:         crypto.DeriveSecret(epochSecret, "sender data"),
+			Encryption:         crypto.DeriveSecret(epochSecret, "encryption"),
+			Exporter:           crypto.DeriveSecret(epochSecret, "exporter"),
+			External:           crypto.DeriveSecret(epochSecret, "external"),
+			Confirmation:       crypto.DeriveSecret(epochSecret, "confirm"),
+			Membership:         crypto.DeriveSecret(epochSecret, "membership"),
+			ResumptionPsk:      crypto.DeriveSecret(epochSecret, "resumption"),
+			EpochAuthenticator: crypto.DeriveSecret(epochSecret, "authentication"),
+			InitSecret:         crypto.DeriveSecret(epochSecret, "init"),
+		},
+	}
+}
+
+// NewKeyScheduleFromEpochSecret builds the schedule of a group being created, from the
+// fresh epoch_secret of KDF.Nh bytes RFC 9420 section 11 says to sample. It is the only
+// entry point a NewGroup can use: there is no previous init_secret to advance from and no
+// joiner_secret to be handed, so neither of the other two constructors has an argument to
+// be called with.
+//
+// joiner_secret and welcome_secret are undefined here and the accessors return nil. The
+// creator obtains real ones by committing the first Add, which runs the section 8
+// derivation in NewKeySchedule.
+//
+// The sample is copied rather than retained, so an epoch cannot be changed under its own
+// members by a caller that reuses its buffer. That leaves the caller holding the only other
+// copy and this type's erase cannot reach it: whoever samples an epoch secret owes it a
+// zeroize of its own once this has returned.
+func NewKeyScheduleFromEpochSecret(
+	crypto CryptoProvider,
+	epochSecret []byte,
+	groupContext *GroupContext,
+) (*KeySchedule, error) {
+	if groupContext == nil {
+		return nil, ErrNilGroupContext
+	}
+	nh := crypto.HashSize()
+	if len(epochSecret) != nh {
+		return nil, fmt.Errorf("%w: epoch secret is %d bytes, want %d", ErrSecretLength, len(epochSecret), nh)
+	}
+	encodedGroupContext, err := syntax.Marshal(groupContext)
+	if err != nil {
+		return nil, err
+	}
+	return newKeyScheduleFromParts(
+		crypto, encodedGroupContext, nil, nil, bytes.Clone(epochSecret)), nil
+}
+
+// JoinerSecret is the joiner_secret a Welcome carries to a new member, or nil on the group
+// creation path, where the group was never joined and no such secret exists.
+func (self *KeySchedule) JoinerSecret() []byte {
+	return self.joinerSecret
+}
+
+// WelcomeSecret is the input to the Welcome AEAD key and nonce, or nil on the group
+// creation path. Nil rather than a zero secret, so a caller that seals a Welcome with it
+// fails a length check instead of sealing under KDF.Nh zero bytes.
+func (self *KeySchedule) WelcomeSecret() []byte {
+	return self.welcomeSecret
+}
+
+// Secrets is the epoch's nine derived secrets. The pointer is into the schedule's own
+// storage, which is what lets the epoch erase them in place; a caller that keeps one past
+// that erase keeps a slice of zeros rather than a live key.
+func (self *KeySchedule) Secrets() *EpochSecrets {
+	return &self.secrets
+}
+
+// GroupContextBytes is the serialized GroupContext this epoch expanded over, which is also
+// what framing signs and MACs under. Handing back the same bytes the derivations used is
+// the point: a caller that re-encoded the struct itself could sign over an encoding no key
+// in this epoch was derived from.
+func (self *KeySchedule) GroupContextBytes() []byte {
+	return self.groupContextBytes
 }
