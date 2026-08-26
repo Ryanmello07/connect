@@ -16,6 +16,15 @@
 // Sentinels rather than error structs, and wrapped with %w at each site that has a
 // value worth naming, so errors.Is holds for the caller while the message still carries
 // the byte or the bucket that was refused.
+//
+// Every name here is on spec A section 12.1's published surface, which is the surface the
+// allowlist test in the message server repo enumerates, and spec B section 12.1 restates
+// it. They were not on it originally — that block listed functions and types and no
+// errors — and they were added as amendments A-8 and B-8 rather than kept internal,
+// because the guardrail above only means anything if the caller can name what it caught:
+// an error a server cannot name is one it can only match on message text. A sentinel
+// added here is an addition to that surface and belongs in the same commit as the
+// amendment that publishes it.
 package message
 
 import "errors"

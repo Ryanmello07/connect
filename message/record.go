@@ -249,14 +249,14 @@ func RetentionClassOf(wire byte) (RetentionClass, uint8, error) {
 // The byte returned alongside an error is not a legal wire byte, for the same reason
 // the split's class is not a legal class.
 //
-// The signature diverges from the one spec A section 12.1 publishes, which is
-// RetentionClassWire(c RetentionClass, ephBucket uint8) byte with no error, and the
-// divergence is deliberate: the error is what makes the two refusals above possible at
-// all, and a function that cannot refuse has to normalise, which is the silent
-// mis-storage those two paragraphs exist to prevent. Master section 8 gives no go
-// signature, so it does not settle it. Both section 12.1 blocks — spec A's and the copy
-// spec B restates — need the amendment, and spec B's server will not compile against
-// this package until they get it.
+// The signature returns an error where spec A section 12.1 first published a bare byte,
+// and the error is what makes the two refusals above possible at all: a function that
+// cannot refuse has to normalise, which is the silent mis-storage those two paragraphs
+// exist to prevent. Master section 8 gives no go signature, so it did not settle it.
+// Both section 12.1 blocks — spec A's and the character for character copy spec B
+// restates — now publish this arity, as amendments A-8 and B-8 of 2026-08-25. It is an
+// arity and not a spelling, so a server written against the old block does not compile
+// rather than misbehaving, which is why it was worth amending rather than working around.
 func RetentionClassWire(class RetentionClass, ephBucket uint8) (byte, error) {
 	if class == RetentionEph {
 		if ephBucketMax < ephBucket {
