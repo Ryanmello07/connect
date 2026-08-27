@@ -3120,7 +3120,7 @@ func declaredAcross(files []parsedSource) []sourceDeclaration {
 	return declared
 }
 
-// theNamesReachingTheEpochSecret is every declared name whose body can reach the storage
+// theNamesReachingTheStorage is every declared name whose body can reach the named storage
 // epochSecretStorageField names: the ones that mention it, closed over the names they call.
 //
 // One identifier check covers every spelling go has for that storage. ast.Inspect descends
@@ -3135,7 +3135,7 @@ func declaredAcross(files []parsedSource) []sourceDeclaration {
 // objected to -- where a call graph that resolved too little reports exactly the clean run a
 // complete one reports. A method value taken without a call is an identifier too, so
 // f := self.leak handed somewhere else is read by the same pass.
-func theNamesReachingTheEpochSecret(declared []sourceDeclaration) []string {
+func theNamesReachingTheStorage(declared []sourceDeclaration, storage string) []string {
 	mentions := func(body *ast.BlockStmt, wanted map[string]bool) bool {
 		if body == nil {
 			return false
@@ -3149,7 +3149,7 @@ func theNamesReachingTheEpochSecret(declared []sourceDeclaration) []string {
 		})
 		return found
 	}
-	reaching := map[string]bool{epochSecretStorageField: true}
+	reaching := map[string]bool{storage: true}
 	for {
 		grew := false
 		for _, one := range declared {
@@ -3162,7 +3162,7 @@ func theNamesReachingTheEpochSecret(declared []sourceDeclaration) []string {
 			}
 		}
 		if !grew {
-			delete(reaching, epochSecretStorageField)
+			delete(reaching, storage)
 			return slices.Sorted(maps.Keys(reaching))
 		}
 	}
@@ -3201,7 +3201,7 @@ func hasSomewhereToPutASecret(one sourceDeclaration, byteSlices []string) bool {
 }
 
 func theExportedMethodsHandingOutWhatTheyReach(declared []sourceDeclaration, byteSlices []string) []string {
-	reaching := theNamesReachingTheEpochSecret(declared)
+	reaching := theNamesReachingTheStorage(declared, epochSecretStorageField)
 	handingOut := []string{}
 	for _, one := range declared {
 		if one.receiver == "" || !one.exported || !slices.Contains(reaching, one.name) {
@@ -3327,7 +3327,7 @@ func TestNoExportedMethodOfThisPackageCanReachTheEpochSecret(t *testing.T) {
 		"reader",
 		"theSecretOf",
 	}
-	if reaching := theNamesReachingTheEpochSecret(controlDeclarations); !slices.Equal(reaching, wantReaching) {
+	if reaching := theNamesReachingTheStorage(controlDeclarations, epochSecretStorageField); !slices.Equal(reaching, wantReaching) {
 		t.Fatalf("the closure read %v out of the control as reaching the epoch secret, want %v; it is not seeding on the storage or not following a call",
 			reaching, wantReaching)
 	}
@@ -3348,7 +3348,7 @@ func TestNoExportedMethodOfThisPackageCanReachTheEpochSecret(t *testing.T) {
 		files = append(files, mustParseSource(t, path))
 	}
 	declared := declaredAcross(files)
-	reaching := theNamesReachingTheEpochSecret(declared)
+	reaching := theNamesReachingTheStorage(declared, epochSecretStorageField)
 	// the positive control on the real source: this package certainly assembles an epoch out
 	// of a parent secret, and a derivation that had stopped deriving would say it does not
 	if len(reaching) == 0 {
@@ -8895,7 +8895,7 @@ func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
 	// the control first: the closure reads the shapes that reach the storage, and the escape
 	// scan tells the eight ways out from the four legitimate shapes that look like them
 	control := []parsedSource{mustParseText(t, "the epoch secret escape control", epochSecretEscapeControl)}
-	controlReaching := theNamesReachingTheEpochSecret(declaredAcross(control))
+	controlReaching := theNamesReachingTheStorage(declaredAcross(control), epochSecretStorageField)
 	wantReaching := []string{
 		"CutsALocalFromIt",
 		"KeepsItInItsOwnStorage",
@@ -8936,7 +8936,7 @@ func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
 	for _, path := range packageLevelFunctions(t).files {
 		files = append(files, mustParseSource(t, path))
 	}
-	reaching := theNamesReachingTheEpochSecret(declaredAcross(files))
+	reaching := theNamesReachingTheStorage(declaredAcross(files), epochSecretStorageField)
 	if len(reaching) == 0 {
 		t.Fatalf("no declaration of this package's source mentions %s, so the class below is empty and this gate demands nothing; if the storage was renamed, rename it in epochSecretStorageField too",
 			epochSecretStorageField)
