@@ -290,10 +290,10 @@ func (self *secretTreeByteWalk) at(where string, value reflect.Value, depth int)
 		// derived from it flap.
 		keys := value.MapKeys()
 		slices.SortFunc(keys, func(a reflect.Value, b reflect.Value) int {
-			return strings.Compare(providerMapKeyOrder(a), providerMapKeyOrder(b))
+			return strings.Compare(secretTreeMapKeyOrder(a), secretTreeMapKeyOrder(b))
 		})
 		for _, key := range keys {
-			rendered := providerMapKeyOrder(key)
+			rendered := secretTreeMapKeyOrder(key)
 			self.at(where+"{"+rendered+"}", key, depth+1)
 			self.at(where+"["+rendered+"]", value.MapIndex(key), depth+1)
 		}
@@ -307,6 +307,26 @@ func (self *secretTreeByteWalk) at(where string, value reflect.Value, depth int)
 		self.unwalked = append(self.unwalked,
 			where+" is a "+value.Kind().String()+" of type "+value.Type().String())
 	}
+}
+
+// secretTreeMapKeyOrder renders one map key for the walk's ordering, widening
+// providerMapKeyOrder over STRUCT keys.
+//
+// providerMapKeyOrder answers a struct with its type name, which is one string for every key
+// of the map -- so the sort below has nothing to separate them by, and go randomises map
+// iteration on purpose. p4 task 22's ratchets map is keyed by a struct, so without this the
+// walk over a SecretTree reports its values in a different order on every run and every count
+// derived from it flaps. The fields are read with reflect rather than through Interface,
+// which panics on a value reached through an unexported field.
+func secretTreeMapKeyOrder(key reflect.Value) string {
+	if key.Kind() != reflect.Struct {
+		return providerMapKeyOrder(key)
+	}
+	rendered := []string{key.Type().String()}
+	for at := range key.NumField() {
+		rendered = append(rendered, secretTreeMapKeyOrder(key.Field(at)))
+	}
+	return strings.Join(rendered, "/")
 }
 
 // secretTreeWalkOf reads every byte a value reaches, and reports what it could not walk.
@@ -1222,9 +1242,11 @@ var secretTreeGeometryFields = map[string]func(t *testing.T, n LeafCount) uint64
 // task 22 adds ratchets to this struct, and the failure is where its author decides whether
 // the new field is cached geometry or mutable state.
 var secretTreeStateFields = map[string]string{
-	"stateLock": "the mutex guarding nodes; it holds no value to derive",
+	"stateLock": "the mutex guarding the mutable fields; it holds no value to derive",
 	"crypto":    "the provider the caller handed in, which the tree does not choose",
 	"nodes":     "the mutable node secrets, whose contents change with every take",
+	"ratchets":  "the per leaf hash ratchets, created on demand and advanced per message",
+	"erased":    "whether Zeroize has run, which is a fact about this tree's lifetime and not about its shape",
 }
 
 // TestSecretTreeCachedGeometryIsDerivedFromTheLeafCount holds every cached bound of a
@@ -1585,5 +1607,1398 @@ func TestSecretTreeASecondTakeIsAlwaysTheConsumedRefusalAndNeverTheInvariantOne(
 	// every leaf of every swept width, taken again immediately, in three orders.
 	if refused != 3*127 {
 		t.Fatalf("refused %d second takes, want %d", refused, 3*127)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task 22 and 23: the plan's own tests, kept where they observe something
+// ---------------------------------------------------------------------------
+
+// TestRatchetRootsUseDistinctLabels asserts the handshake and application ratchets
+// are separate expansions of the same leaf secret. Sharing one ratchet between
+// handshake and application messages would reuse an AEAD key and nonce pair.
+func TestRatchetRootsUseDistinctLabels(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	tree, err := NewSecretTree(crypto, 1, encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	handshake, err := tree.ratchetFor(0, RatchetHandshake)
+	if err != nil {
+		t.Fatalf("ratchetFor handshake: %v", err)
+	}
+	application, err := tree.ratchetFor(0, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor application: %v", err)
+	}
+	nh := crypto.HashSize()
+	wantHandshake := crypto.ExpandWithLabel(encryptionSecret, "handshake", nil, nh)
+	wantApplication := crypto.ExpandWithLabel(encryptionSecret, "application", nil, nh)
+	if !bytes.Equal(handshake.secret, wantHandshake) {
+		t.Fatalf("handshake root = %x, want %x", handshake.secret, wantHandshake)
+	}
+	if !bytes.Equal(application.secret, wantApplication) {
+		t.Fatalf("application root = %x, want %x", application.secret, wantApplication)
+	}
+}
+
+// TestRatchetStepDerivesKeyNonceAndSuccessor pins the three DeriveTreeSecret calls of
+// RFC 9420 section 9.1 and asserts the ratchet advances by exactly one generation.
+func TestRatchetStepDerivesKeyNonceAndSuccessor(t *testing.T) {
+	crypto := stTestCrypto(t)
+	tree, err := NewSecretTree(crypto, 1, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	r, err := tree.ratchetFor(0, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	root := append([]byte(nil), r.secret...)
+	wantKey := crypto.DeriveTreeSecret(root, "key", 0, crypto.KeySize())
+	wantNonce := crypto.DeriveTreeSecret(root, "nonce", 0, crypto.NonceSize())
+	wantNext := crypto.DeriveTreeSecret(root, "secret", 0, crypto.HashSize())
+
+	generation, keys, err := r.step()
+	if err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	if generation != 0 {
+		t.Fatalf("generation = %d, want 0", generation)
+	}
+	if !bytes.Equal(keys.key, wantKey) {
+		t.Fatalf("key = %x, want %x", keys.key, wantKey)
+	}
+	if !bytes.Equal(keys.nonce, wantNonce) {
+		t.Fatalf("nonce = %x, want %x", keys.nonce, wantNonce)
+	}
+	if !bytes.Equal(r.secret, wantNext) {
+		t.Fatalf("successor secret = %x, want %x", r.secret, wantNext)
+	}
+	if r.head != 1 {
+		t.Fatalf("head = %d, want 1", r.head)
+	}
+}
+
+// TestRatchetStepBindsTheGeneration asserts generation 1 uses generation 1 in the
+// DeriveTreeSecret context and not 0, so a copy-paste of the previous call is caught.
+func TestRatchetStepBindsTheGeneration(t *testing.T) {
+	crypto := stTestCrypto(t)
+	tree, err := NewSecretTree(crypto, 1, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	r, err := tree.ratchetFor(0, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	if _, _, err := r.step(); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	secondRoot := append([]byte(nil), r.secret...)
+	wantKey := crypto.DeriveTreeSecret(secondRoot, "key", 1, crypto.KeySize())
+	generation, keys, err := r.step()
+	if err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	if generation != 1 {
+		t.Fatalf("generation = %d, want 1", generation)
+	}
+	if !bytes.Equal(keys.key, wantKey) {
+		t.Fatalf("generation 1 key is not bound to generation 1")
+	}
+}
+
+// TestRatchetKeysAreNeverRepeated asserts the first two hundred generations produce
+// two hundred distinct key and nonce pairs, which is the AEAD safety property.
+//
+// Two hundred consecutive generations from zero is the middle of the range and cannot see
+// a boundary; TestRatchetKeyNonceAndSuccessorAreDerivedAtEveryGenerationBoundary and
+// TestRatchetRefusesToWrapTheGenerationCounter are where the ends are.
+func TestRatchetKeysAreNeverRepeated(t *testing.T) {
+	tree, err := NewSecretTree(stTestCrypto(t), 1, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	r, err := tree.ratchetFor(0, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	seen := map[string]uint32{}
+	for i := 0; i < 200; i++ {
+		generation, keys, err := r.step()
+		if err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		fingerprint := string(keys.key) + "|" + string(keys.nonce)
+		if previous, ok := seen[fingerprint]; ok {
+			t.Fatalf("generation %d repeats the key and nonce of generation %d", generation, previous)
+		}
+		seen[fingerprint] = generation
+	}
+}
+
+// TestNextSenderKeyAdvances asserts the sender path hands out consecutive generations
+// and never repeats one.
+//
+// The two lengths are the plan's literals and are kept as literals on purpose: on this
+// suite they are the right numbers, and what they cannot see -- a body that writes 32 and
+// 12 down instead of reading them -- is measured on a suite whose Nk and Nn are neither,
+// in TestRatchetReadsItsKeyAndNonceWidthsOffTheProviderItWasHanded.
+func TestNextSenderKeyAdvances(t *testing.T) {
+	tree, err := NewSecretTree(stTestCrypto(t), 8, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	for want := uint32(0); want < 5; want++ {
+		generation, key, nonce, err := tree.NextSenderKey(2, RatchetApplication)
+		if err != nil {
+			t.Fatalf("NextSenderKey: %v", err)
+		}
+		if generation != want {
+			t.Fatalf("generation = %d, want %d", generation, want)
+		}
+		if len(key) != 32 || len(nonce) != 12 {
+			t.Fatalf("key %d bytes, nonce %d bytes", len(key), len(nonce))
+		}
+	}
+	generation, err := tree.SenderGeneration(2, RatchetApplication)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if generation != 5 {
+		t.Fatalf("SenderGeneration = %d, want 5", generation)
+	}
+}
+
+// TestReceiverKeyOutOfOrderUsesTheWindow asserts a message that arrives at generation
+// 3 before generations 0 to 2 does not destroy them, which is what makes an out-of-
+// order delivery a delay rather than three lost messages.
+func TestReceiverKeyOutOfOrderUsesTheWindow(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+
+	sender, err := NewSecretTree(crypto, 8, encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	expected := map[uint32][]byte{}
+	for i := 0; i < 4; i++ {
+		generation, key, _, err := sender.NextSenderKey(5, RatchetHandshake)
+		if err != nil {
+			t.Fatalf("NextSenderKey: %v", err)
+		}
+		expected[generation] = key
+	}
+
+	receiver, err := NewSecretTree(crypto, 8, encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	got3, _, err := receiver.ReceiverKey(5, RatchetHandshake, 3)
+	if err != nil {
+		t.Fatalf("ReceiverKey(3): %v", err)
+	}
+	if !bytes.Equal(got3, expected[3]) {
+		t.Fatalf("generation 3 key mismatch")
+	}
+	for _, generation := range []uint32{0, 1, 2} {
+		got, _, err := receiver.ReceiverKey(5, RatchetHandshake, generation)
+		if err != nil {
+			t.Fatalf("ReceiverKey(%d): %v", generation, err)
+		}
+		if !bytes.Equal(got, expected[generation]) {
+			t.Fatalf("generation %d key mismatch", generation)
+		}
+	}
+}
+
+// TestReceiverKeyIsSingleUse asserts a generation cannot be fetched twice, so a
+// replayed message cannot be decrypted a second time from the window.
+//
+// It is the one test in this file that observes a real key and nonce REPEAT rather than a
+// derivation defect: everywhere else the generation number is bound into the KDF context,
+// so a repeat needs two independent faults, while the window can hand one pair back twice
+// with a single missing delete.
+func TestReceiverKeyIsSingleUse(t *testing.T) {
+	tree, err := NewSecretTree(stTestCrypto(t), 8, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 0); err != nil {
+		t.Fatalf("ReceiverKey: %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("err = %v, want ErrRatchetGenerationConsumed", err)
+	}
+	// and the same for a generation that came out of the WINDOW rather than off the head,
+	// which is the path with the delete in it.
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 4); err != nil {
+		t.Fatalf("ReceiverKey(4): %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 2); err != nil {
+		t.Fatalf("ReceiverKey(2) out of the window: %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 2); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("a window generation was handed out twice: err = %v, want ErrRatchetGenerationConsumed", err)
+	}
+}
+
+// TestReceiverKeyRefusesUnboundedSkip asserts a forged generation number cannot force
+// an unbounded KDF loop. Without this bound a single 32-bit field is a denial of
+// service that costs the sender nothing.
+func TestReceiverKeyRefusesUnboundedSkip(t *testing.T) {
+	tree, err := NewSecretTree(stTestCrypto(t), 8, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	_, _, err = tree.ReceiverKey(1, RatchetApplication, MaxGenerationSkip+1)
+	if !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("err = %v, want ErrRatchetGenerationTooFarAhead", err)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, ^uint32(0)); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("err = %v, want ErrRatchetGenerationTooFarAhead", err)
+	}
+	// the ratchet must be untouched by a refused request
+	generation, err := tree.SenderGeneration(1, RatchetApplication)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if generation != 0 {
+		t.Fatalf("a refused request advanced the ratchet to %d", generation)
+	}
+}
+
+// TestSecretTreeZeroize asserts every retained node secret and ratchet secret is
+// cleared when the epoch is dropped.
+func TestSecretTreeZeroize(t *testing.T) {
+	tree, err := NewSecretTree(stTestCrypto(t), 8, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	if _, _, _, err := tree.NextSenderKey(0, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	r, err := tree.ratchetFor(0, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	retained := append([]byte(nil), r.secret...)
+	tree.Zeroize()
+	if bytes.Equal(r.secret, retained) {
+		t.Fatal("the ratchet secret survived Zeroize")
+	}
+	for node, secret := range tree.nodes {
+		for _, b := range secret {
+			if b != 0 {
+				t.Fatalf("node %d secret survived Zeroize", node)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the ratchet properties a middle-of-the-range test cannot see
+// ---------------------------------------------------------------------------
+
+// stNewTree builds a tree of the given width over the vector encryption secret.
+func stNewTree(t *testing.T, leafCount LeafCount) *SecretTree {
+	t.Helper()
+	tree, err := NewSecretTree(stTestCrypto(t), leafCount, MustHex(t, stVectorEncryptionSecret))
+	if err != nil {
+		t.Fatalf("NewSecretTree(%d): %v", leafCount, err)
+	}
+	return tree
+}
+
+// stRatchetKinds is both ratchet types, derived from the iota run rather than listed, so a
+// third type added to the constant block joins every sweep below instead of being covered
+// by whichever of these two a sweep happened to name.
+func stRatchetKinds() []RatchetType {
+	kinds := []RatchetType{}
+	for kind := RatchetHandshake; kind <= RatchetApplication; kind++ {
+		kinds = append(kinds, kind)
+	}
+	return kinds
+}
+
+// stRatchetLabel is the RFC 9420 section 9 label each ratchet type expands its leaf secret
+// under. It is a switch and not a map so a type added without a label fails the build here
+// rather than expanding under the empty string.
+func stRatchetLabel(t *testing.T, kind RatchetType) string {
+	t.Helper()
+	switch kind {
+	case RatchetHandshake:
+		return "handshake"
+	case RatchetApplication:
+		return "application"
+	}
+	t.Fatalf("ratchet type %d has no label in this test's own table, so nothing here derives its root", kind)
+	return ""
+}
+
+// stRatchetRoot derives one leaf's ratchet root independently of the code under test: the
+// node secret comes from stExpectedNodeSecret, which walks the tree math upward, and the
+// expansion is the section 9 label.
+func stRatchetRoot(t *testing.T, crypto CryptoProvider, encryptionSecret []byte,
+	leafCount LeafCount, leaf LeafIndex, kind RatchetType) []byte {
+	t.Helper()
+	leafSecret := stExpectedNodeSecret(t, crypto, encryptionSecret, leafCount, leaf.NodeIndex())
+	return crypto.ExpandWithLabel(leafSecret, stRatchetLabel(t, kind), nil, crypto.HashSize())
+}
+
+// stAllZero reports whether every byte is zero, which is what an erased secret looks like.
+func stAllZero(b []byte) bool {
+	for _, one := range b {
+		if one != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// stGenerationBoundaries is the generations this file sweeps, DERIVED from the width of the
+// counter rather than typed out.
+//
+// A nonce defect has already shipped on this project at 2^32 while sixty-nine tests that all
+// sat in the middle of the range reported green, so what this covers is the edges: zero, one
+// past it, both sides of every byte boundary the counter has, and the last two values it can
+// hold. Every entry comes out of the loop, so a counter that was ever widened sweeps the new
+// boundaries without anyone editing a list.
+func stGenerationBoundaries() []uint32 {
+	last := ^uint32(0)
+	bits := 0
+	for shifted := last; shifted != 0; shifted >>= 1 {
+		bits++
+	}
+	out := []uint32{0, 1, 2}
+	for at := 8; at < bits; at += 8 {
+		edge := uint32(1) << at
+		out = append(out, edge-1, edge, edge+1)
+	}
+	out = append(out, last-1, last)
+	return out
+}
+
+// TestRatchetGenerationBoundarySweepReachesTheEndsOfTheCounter is the control on the sweep
+// every boundary test below is scoped by. A generator that returned three small numbers
+// would leave each of those tests reporting green over the middle of the range, which is
+// exactly the shape of the defect this file is guarding against.
+func TestRatchetGenerationBoundarySweepReachesTheEndsOfTheCounter(t *testing.T) {
+	swept := stGenerationBoundaries()
+	last := ^uint32(0)
+	for _, want := range []uint32{0, 1, 1 << 8, 1<<16 - 1, 1 << 16, 1 << 24, last - 1, last} {
+		if !slices.Contains(swept, want) {
+			t.Errorf("the boundary sweep does not reach generation %d", want)
+		}
+	}
+	if len(swept) != len(slices.Compact(slices.Sorted(slices.Values(swept)))) {
+		t.Fatalf("the boundary sweep repeats a generation, so its counts are not what they look like")
+	}
+	// three at each of the three interior byte boundaries, plus zero, one, two, and the last
+	// two values the counter holds.
+	if len(swept) != 3+3*3+2 {
+		t.Fatalf("the boundary sweep has %d entries, want %d", len(swept), 3+3*3+2)
+	}
+}
+
+// TestRatchetKeyNonceAndSuccessorAreDerivedAtEveryGenerationBoundary asserts that at each
+// end of the counter the three derivations are still the RFC 9420 section 9.1 ones and that
+// no two generations reach the same key and nonce pair.
+//
+// The ratchet is PLANTED at each boundary rather than stepped to it. Reaching 2^32-1 one
+// step at a time is four billion HKDF calls, and the generations that need covering are
+// precisely the ones no loop a test can run ever arrives at -- which is why the shipped
+// defect this guards against was invisible: everything anyone ran stopped in the middle.
+func TestRatchetKeyNonceAndSuccessorAreDerivedAtEveryGenerationBoundary(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	const leafCount = LeafCount(8)
+	const leaf = LeafIndex(3)
+	root := stRatchetRoot(t, crypto, encryptionSecret, leafCount, leaf, RatchetApplication)
+
+	pairs := map[string]uint32{}
+	nonces := map[string]uint32{}
+	keys := map[string]uint32{}
+	for _, generation := range stGenerationBoundaries() {
+		tree := stNewTree(t, leafCount)
+		r, err := tree.ratchetFor(leaf, RatchetApplication)
+		if err != nil {
+			t.Fatalf("ratchetFor: %v", err)
+		}
+		// the control on the planting: the fixture below derives from the same root the
+		// ratchet is actually holding, so a disagreement is the step and not the fixture.
+		if !bytes.Equal(r.secret, root) {
+			t.Fatalf("the ratchet root is %x and this test derived %x", r.secret, root)
+		}
+		r.head = generation
+
+		stepped, got, err := r.step()
+		if err != nil {
+			t.Fatalf("step at generation %d: %v", generation, err)
+		}
+		if stepped != generation {
+			t.Fatalf("a ratchet at generation %d produced generation %d", generation, stepped)
+		}
+		wantKey := crypto.DeriveTreeSecret(root, "key", generation, crypto.KeySize())
+		wantNonce := crypto.DeriveTreeSecret(root, "nonce", generation, crypto.NonceSize())
+		wantNext := crypto.DeriveTreeSecret(root, "secret", generation, crypto.HashSize())
+		if !bytes.Equal(got.key, wantKey) {
+			t.Fatalf("generation %d key = %x, want %x", generation, got.key, wantKey)
+		}
+		if !bytes.Equal(got.nonce, wantNonce) {
+			t.Fatalf("generation %d nonce = %x, want %x", generation, got.nonce, wantNonce)
+		}
+		if !bytes.Equal(r.secret, wantNext) {
+			t.Fatalf("generation %d successor = %x, want %x", generation, r.secret, wantNext)
+		}
+		if stAllZero(got.nonce) || stAllZero(got.key) {
+			t.Fatalf("generation %d produced a zero key or nonce", generation)
+		}
+
+		if previous, ok := pairs[string(got.key)+"|"+string(got.nonce)]; ok {
+			t.Fatalf("generation %d reaches the same key and nonce pair as generation %d, which is the AEAD break this sweep exists for",
+				generation, previous)
+		}
+		pairs[string(got.key)+"|"+string(got.nonce)] = generation
+		// the halves separately as well. A pair stays unique if only one half moves, so a
+		// nonce frozen across generations is invisible to the pair check while being the
+		// exact defect that matters if the key ever stops moving too.
+		if previous, ok := nonces[string(got.nonce)]; ok {
+			t.Fatalf("generation %d repeats the nonce of generation %d", generation, previous)
+		}
+		nonces[string(got.nonce)] = generation
+		if previous, ok := keys[string(got.key)]; ok {
+			t.Fatalf("generation %d repeats the key of generation %d", generation, previous)
+		}
+		keys[string(got.key)] = generation
+	}
+	if len(pairs) != len(stGenerationBoundaries()) {
+		t.Fatalf("swept %d generations and collected %d pairs", len(stGenerationBoundaries()), len(pairs))
+	}
+}
+
+// TestRatchetKeysAreNeverRepeatedOverAContiguousSweep is the same property over an unbroken
+// run rather than over sampled boundaries, so a body that is right at every edge this file
+// names and wrong three steps in has nowhere to hide.
+func TestRatchetKeysAreNeverRepeatedOverAContiguousSweep(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	const leafCount = LeafCount(8)
+	const leaf = LeafIndex(6)
+	const generations = 4096
+
+	tree := stNewTree(t, leafCount)
+	r, err := tree.ratchetFor(leaf, RatchetHandshake)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	// the independent chain, walked forward from the root this test derived itself.
+	secret := stRatchetRoot(t, crypto, encryptionSecret, leafCount, leaf, RatchetHandshake)
+	pairs := map[string]uint32{}
+	for want := uint32(0); want < generations; want++ {
+		wantKey := crypto.DeriveTreeSecret(secret, "key", want, crypto.KeySize())
+		wantNonce := crypto.DeriveTreeSecret(secret, "nonce", want, crypto.NonceSize())
+		secret = crypto.DeriveTreeSecret(secret, "secret", want, crypto.HashSize())
+
+		generation, got, err := r.step()
+		if err != nil {
+			t.Fatalf("step %d: %v", want, err)
+		}
+		if generation != want {
+			t.Fatalf("step %d produced generation %d", want, generation)
+		}
+		if !bytes.Equal(got.key, wantKey) || !bytes.Equal(got.nonce, wantNonce) {
+			t.Fatalf("generation %d disagrees with the independently derived chain", generation)
+		}
+		if previous, ok := pairs[string(got.key)+"|"+string(got.nonce)]; ok {
+			t.Fatalf("generation %d repeats the key and nonce pair of generation %d", generation, previous)
+		}
+		pairs[string(got.key)+"|"+string(got.nonce)] = generation
+	}
+	if len(pairs) != generations {
+		t.Fatalf("collected %d pairs over %d generations", len(pairs), generations)
+	}
+	if !bytes.Equal(r.secret, secret) {
+		t.Fatalf("after %d generations the ratchet secret has drifted from the independent chain", generations)
+	}
+}
+
+// TestRatchetRefusesToWrapTheGenerationCounter asserts the ratchet stops at 2^32-1 instead
+// of rolling the counter back to zero.
+//
+// A wrap is not a lost message. It is the generation numbers on the wire starting again at
+// zero under keys that have moved on, so every one of them collides with a number this
+// receiver has already marked consumed, and the four billionth message silently becomes a
+// replay of the first. Reaching the wrap is only possible by planting the head, which is
+// why this is the boundary that shipped broken elsewhere on this project.
+func TestRatchetRefusesToWrapTheGenerationCounter(t *testing.T) {
+	last := ^uint32(0)
+	tree := stNewTree(t, 8)
+	r, err := tree.ratchetFor(4, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	r.head = last - 2
+
+	produced := []uint32{}
+	var refusal error
+	for range 5 {
+		generation, keys, err := r.step()
+		if err != nil {
+			refusal = err
+			if keys != nil {
+				t.Fatalf("an exhausted step returned key material as well as %v", err)
+			}
+			break
+		}
+		produced = append(produced, generation)
+	}
+	if !errors.Is(refusal, ErrRatchetExhausted) {
+		t.Fatalf("the step past the end of the counter answered %v, want ErrRatchetExhausted", refusal)
+	}
+	if want := []uint32{last - 2, last - 1, last}; !slices.Equal(produced, want) {
+		t.Fatalf("the ratchet produced generations %v, want %v -- a zero in that list is the counter wrapping", produced, want)
+	}
+	if r.head != last {
+		t.Fatalf("the head is %d after exhaustion, want it parked at %d; a head below that reclassifies every consumed generation as future", r.head, last)
+	}
+	if !r.exhausted {
+		t.Fatal("the ratchet is not marked exhausted, so the next step will hand out a generation again")
+	}
+	// and the receiving path agrees rather than looping: an old generation is consumed, the
+	// last one is exhausted, and neither produces a key.
+	if _, err := r.keyFor(0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("generation 0 on an exhausted ratchet answered %v, want ErrRatchetGenerationConsumed", err)
+	}
+	if _, err := r.keyFor(last); !errors.Is(err, ErrRatchetExhausted) {
+		t.Fatalf("generation %d on an exhausted ratchet answered %v, want ErrRatchetExhausted", last, err)
+	}
+}
+
+// TestRatchetSpentSecretIsErasedInPlaceAndTheSuccessorIsNotThePredecessor is the forward
+// secrecy half of the ratchet and the half no correctness test can see.
+//
+// The spent secret is held as an ALIAS and not as a copy. An in place erasure is invisible
+// to a copy -- the plan's own TestRatchetStepDerivesKeyNonceAndSuccessor takes one, and
+// passes unchanged against a step that never calls zeroizeSecret -- so the only way to
+// observe it is to keep the slice header the ratchet itself was holding.
+func TestRatchetSpentSecretIsErasedInPlaceAndTheSuccessorIsNotThePredecessor(t *testing.T) {
+	observed := 0
+	for _, kind := range stRatchetKinds() {
+		tree := stNewTree(t, 8)
+		r, err := tree.ratchetFor(7, kind)
+		if err != nil {
+			t.Fatalf("ratchetFor: %v", err)
+		}
+		for step := range 8 {
+			spent := r.secret
+			before := append([]byte(nil), spent...)
+			if stAllZero(before) {
+				t.Fatalf("the ratchet secret before step %d is already a run of zeros, so this step could observe no erasure", step)
+			}
+			if _, _, err := r.step(); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+			if !stAllZero(spent) {
+				t.Fatalf("the spent ratchet secret of generation %d survived the step as %x; anyone taking the process now recomputes every generation from here back",
+					step, spent)
+			}
+			if bytes.Equal(r.secret, before) {
+				t.Fatalf("the successor at generation %d is its own predecessor, so the ratchet is not advancing", step)
+			}
+			if stAllZero(r.secret) {
+				t.Fatalf("the successor at generation %d is a run of zeros, which every party in the world can compute", step)
+			}
+			observed++
+		}
+	}
+	if observed != 8*len(stRatchetKinds()) {
+		t.Fatalf("observed %d steps, want %d", observed, 8*len(stRatchetKinds()))
+	}
+}
+
+// TestRatchetRetainsNoSpentSecretInAnyFieldOfTheTreesType is the other half of the same
+// claim, at the scope this file learned to use: the TYPE and not a field name.
+//
+// The alias test next door sees a secret that was overwritten. It cannot see one that was
+// COPIED somewhere first -- an archive map, a debug slice, a second field added by a later
+// task -- and that shape passed all 750 tests of this package before secretTreeRetainedBytes
+// existed. This one walks everything the tree still reaches.
+func TestRatchetRetainsNoSpentSecretInAnyFieldOfTheTreesType(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	const leafCount = LeafCount(8)
+	const leaf = LeafIndex(2)
+	const steps = 12
+
+	tree := stNewTree(t, leafCount)
+	r, err := tree.ratchetFor(leaf, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	// the chain this test derives for itself: chain[i] is the secret generation i is derived
+	// from, so chain[0:steps] are all spent by the end and chain[steps] is the live one.
+	chain := [][]byte{stRatchetRoot(t, crypto, encryptionSecret, leafCount, leaf, RatchetApplication)}
+	for generation := uint32(0); generation < steps; generation++ {
+		chain = append(chain, crypto.DeriveTreeSecret(chain[generation], "secret", generation, crypto.HashSize()))
+	}
+	for at := range steps {
+		if _, _, err := r.step(); err != nil {
+			t.Fatalf("step %d: %v", at, err)
+		}
+	}
+	if !bytes.Equal(r.secret, chain[steps]) {
+		t.Fatalf("the ratchet is not on the chain this test derived, so nothing below is measuring the right values")
+	}
+
+	held := secretTreeRetainedBytes(t, tree)
+	for spent := range steps {
+		for _, one := range held {
+			if bytes.Contains(one.carried, chain[spent]) {
+				t.Fatalf("the ratchet secret of generation %d is still held at %s after %d further steps",
+					spent, one.where, steps-spent)
+			}
+		}
+	}
+	// the control: the LIVE secret is reachable, so "not found" above means erased rather
+	// than meaning this walk never looked inside the ratchets at all.
+	found := ""
+	for _, one := range held {
+		if bytes.Contains(one.carried, chain[steps]) {
+			found = one.where
+			break
+		}
+	}
+	if found == "" {
+		t.Fatal("the walk did not find the ratchet's live secret anywhere on the tree, so the sweep above holds vacuously")
+	}
+}
+
+// TestNoTwoRatchetsShareAKeyNoncePairAtAnyGeneration is the cross-sender half of the AEAD
+// safety property.
+//
+// Every generation of every leaf's two ratchets is collected into one table, so a descent
+// that gave two leaves the same node secret, a table keyed on less than the leaf and the
+// type, or a root expansion that ignored its label all land as a collision here. It is the
+// defect that is silent by construction: two senders each producing a perfectly correct
+// sequence, which happens to be the same sequence.
+func TestNoTwoRatchetsShareAKeyNoncePairAtAnyGeneration(t *testing.T) {
+	const leafCount = LeafCount(8)
+	const generations = 64
+	tree := stNewTree(t, leafCount)
+	leaves := stLeavesOf(t, leafCount)
+	kinds := stRatchetKinds()
+
+	type owner struct {
+		leaf       LeafIndex
+		kind       RatchetType
+		generation uint32
+	}
+	pairs := map[string]owner{}
+	nonces := map[string]owner{}
+	for _, leaf := range leaves {
+		for _, kind := range kinds {
+			for want := uint32(0); want < generations; want++ {
+				generation, key, nonce, err := tree.NextSenderKey(leaf, kind)
+				if err != nil {
+					t.Fatalf("NextSenderKey(%d, %d): %v", leaf, kind, err)
+				}
+				if generation != want {
+					t.Fatalf("leaf %d kind %d produced generation %d, want %d", leaf, kind, generation, want)
+				}
+				mine := owner{leaf: leaf, kind: kind, generation: generation}
+				if previous, ok := pairs[string(key)+"|"+string(nonce)]; ok {
+					t.Fatalf("leaf %d kind %d generation %d reaches the same key and nonce pair as leaf %d kind %d generation %d",
+						mine.leaf, mine.kind, mine.generation, previous.leaf, previous.kind, previous.generation)
+				}
+				pairs[string(key)+"|"+string(nonce)] = mine
+				// the nonce alone as well. Two senders on one nonce is safe only while their
+				// keys differ, and "their keys differ" is the thing above that would already
+				// have failed -- so a nonce collision here is a warning that a single further
+				// defect completes the break.
+				if previous, ok := nonces[string(nonce)]; ok {
+					t.Fatalf("leaf %d kind %d generation %d repeats the nonce of leaf %d kind %d generation %d",
+						mine.leaf, mine.kind, mine.generation, previous.leaf, previous.kind, previous.generation)
+				}
+				nonces[string(nonce)] = mine
+			}
+		}
+	}
+	if want := len(leaves) * len(kinds) * generations; len(pairs) != want {
+		t.Fatalf("collected %d distinct pairs over %d leaves, %d ratchet types and %d generations, want %d",
+			len(pairs), len(leaves), len(kinds), generations, want)
+	}
+}
+
+// TestSenderAndReceiverAgreeForEveryLeafAndKindAndDisagreeAcrossThem is the routing half:
+// the receiving path must reach the SAME key the sending path produced for that leaf and
+// that type, and a different one for every other leaf and type.
+//
+// The negative half is what makes it a routing test rather than a round trip. A ReceiverKey
+// that ignored its leaf argument would agree with a sender for one leaf and be wrong for the
+// other seven, and a round trip over a single leaf reports that as green.
+func TestSenderAndReceiverAgreeForEveryLeafAndKindAndDisagreeAcrossThem(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	const leafCount = LeafCount(8)
+	const generations = 3
+	leaves := stLeavesOf(t, leafCount)
+	kinds := stRatchetKinds()
+
+	sender, err := NewSecretTree(crypto, leafCount, encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	type slot struct {
+		leaf       LeafIndex
+		kind       RatchetType
+		generation uint32
+	}
+	sent := map[slot][]byte{}
+	for _, leaf := range leaves {
+		for _, kind := range kinds {
+			for range generations {
+				generation, key, nonce, err := sender.NextSenderKey(leaf, kind)
+				if err != nil {
+					t.Fatalf("NextSenderKey: %v", err)
+				}
+				sent[slot{leaf: leaf, kind: kind, generation: generation}] = append(append([]byte(nil), key...), nonce...)
+			}
+		}
+	}
+
+	matched := 0
+	for at, want := range sent {
+		receiver, err := NewSecretTree(crypto, leafCount, encryptionSecret)
+		if err != nil {
+			t.Fatalf("NewSecretTree: %v", err)
+		}
+		key, nonce, err := receiver.ReceiverKey(at.leaf, at.kind, at.generation)
+		if err != nil {
+			t.Fatalf("ReceiverKey(%d, %d, %d): %v", at.leaf, at.kind, at.generation, err)
+		}
+		if got := append(append([]byte(nil), key...), nonce...); !bytes.Equal(got, want) {
+			t.Fatalf("leaf %d kind %d generation %d: the receiver derived %x and the sender produced %x",
+				at.leaf, at.kind, at.generation, got, want)
+		}
+		matched++
+		// and every other slot answers something else, so the agreement above is about this
+		// leaf and this type rather than about the tree having one keystream.
+		for other := range sent {
+			if other == at {
+				continue
+			}
+			if bytes.Equal(sent[other], want) {
+				t.Fatalf("leaf %d kind %d generation %d and leaf %d kind %d generation %d produce the same key and nonce",
+					at.leaf, at.kind, at.generation, other.leaf, other.kind, other.generation)
+			}
+		}
+	}
+	if want := len(leaves) * len(kinds) * generations; matched != want {
+		t.Fatalf("matched %d slots, want %d", matched, want)
+	}
+}
+
+// TestRatchetReadsItsKeyAndNonceWidthsOffTheProviderItWasHanded is the differential the
+// registry cannot supply, for the two lengths the ratchet reads on every single step.
+//
+// Both registered suites fix Nn at 12, and 0x0003 fixes Nk at 32 -- which is also Nh, also
+// the length of every vector in this file, and also the literal a body would have written
+// down. So inside the registry a read of NonceSize() and a written 12 are one number, and
+// nothing else in this tree separates them. This provider is assembled at an Nk and an Nn no
+// registered suite has, so each substitution is a different number rather than the same one.
+func TestRatchetReadsItsKeyAndNonceWidthsOffTheProviderItWasHanded(t *testing.T) {
+	crypto := &suiteCryptoProvider{params: &ksWelcomeSyntheticParams, random: rand.Reader}
+	nk, nn, nh := crypto.KeySize(), crypto.NonceSize(), crypto.HashSize()
+	// the substitutions this provider has to be able to see. A length here that coincided
+	// with another would leave the assertions below satisfied by the literal they exist to
+	// catch, which is how a differential goes quiet without failing.
+	for _, one := range []struct {
+		name  string
+		value int
+	}{
+		{name: "this suite's Nn", value: nn},
+		{name: "this suite's Nh", value: nh},
+		{name: "the registered chacha suite's Nk", value: 32},
+		{name: "the registered nonce size", value: 12},
+	} {
+		if one.value == nk {
+			t.Fatalf("%s is %d, the same as this fixture's Nk, so this differential is blind to it", one.name, one.value)
+		}
+	}
+	for _, one := range []struct {
+		name  string
+		value int
+	}{
+		{name: "this suite's Nh", value: nh},
+		{name: "the registered nonce size", value: 12},
+	} {
+		if one.value == nn {
+			t.Fatalf("%s is %d, the same as this fixture's Nn, so this differential is blind to it", one.name, one.value)
+		}
+	}
+
+	encryptionSecret := bytes.Repeat([]byte{0x5a}, nh)
+	tree, err := NewSecretTree(crypto, 8, encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	generation, key, nonce, err := tree.NextSenderKey(5, RatchetApplication)
+	if err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	if generation != 0 {
+		t.Fatalf("generation = %d, want 0", generation)
+	}
+	if len(key) != nk {
+		t.Fatalf("the key is %d bytes for a suite whose Nk is %d", len(key), nk)
+	}
+	if len(nonce) != nn {
+		t.Fatalf("the nonce is %d bytes for a suite whose Nn is %d", len(nonce), nn)
+	}
+	r, err := tree.ratchetFor(5, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	if len(r.secret) != nh {
+		t.Fatalf("the successor secret is %d bytes for a suite whose Nh is %d", len(r.secret), nh)
+	}
+
+	// and the width moved INSIDE the preimage with it, not only in the size of the answer:
+	// KDFLabel carries the length, so a body deriving 32 bytes and a body deriving Nk bytes
+	// disagree in every byte rather than in a prefix.
+	root := stRatchetRoot(t, crypto, encryptionSecret, 8, 5, RatchetApplication)
+	if want := crypto.DeriveTreeSecret(root, "key", 0, nk); !bytes.Equal(key, want) {
+		t.Fatalf("the key is %x, want %x", key, want)
+	}
+	if want := crypto.DeriveTreeSecret(root, "nonce", 0, nn); !bytes.Equal(nonce, want) {
+		t.Fatalf("the nonce is %x, want %x", nonce, want)
+	}
+	atThirtyTwo := crypto.DeriveTreeSecret(root, "key", 0, 32)
+	if bytes.Equal(atThirtyTwo[:nk], key) {
+		t.Fatalf("deriving 32 bytes and deriving %d agree on their first %d, so a hardcoded key size would be a truncation this test could not see", nk, nk)
+	}
+	atTwelve := crypto.DeriveTreeSecret(root, "nonce", 0, 12)
+	if bytes.Equal(atTwelve[:nn], nonce) {
+		t.Fatalf("deriving 12 bytes and deriving %d agree on their first %d, so a hardcoded nonce size would be a truncation this test could not see", nn, nn)
+	}
+
+	// the receiving path reads the same two lengths; it is a separate call site and has
+	// silently disagreed with its sending twin elsewhere on this project.
+	receiver, err := NewSecretTree(crypto, 8, encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	gotKey, gotNonce, err := receiver.ReceiverKey(5, RatchetApplication, 0)
+	if err != nil {
+		t.Fatalf("ReceiverKey: %v", err)
+	}
+	if len(gotKey) != nk || len(gotNonce) != nn {
+		t.Fatalf("the receiver produced a %d byte key and a %d byte nonce, want %d and %d", len(gotKey), len(gotNonce), nk, nn)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the generation window: its bound, its eviction and its edges
+// ---------------------------------------------------------------------------
+
+// TestReceiverKeySkipBoundIsExactlyMaxGenerationSkip pins both sides of the bound, DERIVED
+// from the constant rather than typed.
+//
+// Off by one in the permissive direction is still a bound and costs an extra thousand KDF
+// calls; off by one the other way drops a message that legitimately arrived, and the sender
+// has no way to learn it happened. The bound is also checked to be measured from the HEAD
+// and not from zero, which is the version that silently stops working after the first
+// thousand messages of an epoch.
+func TestReceiverKeySkipBoundIsExactlyMaxGenerationSkip(t *testing.T) {
+	tree := stNewTree(t, 8)
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, MaxGenerationSkip); err != nil {
+		t.Fatalf("a skip of exactly MaxGenerationSkip (%d) was refused: %v", MaxGenerationSkip, err)
+	}
+	if _, _, err := tree.ReceiverKey(3, RatchetApplication, MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("a skip of MaxGenerationSkip+1 (%d) answered %v, want ErrRatchetGenerationTooFarAhead", MaxGenerationSkip+1, err)
+	}
+	// leaf 1's head is now one past the generation it served, and the same distance ahead of
+	// THAT is accepted again.
+	head, err := tree.SenderGeneration(1, RatchetApplication)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if head != MaxGenerationSkip+1 {
+		t.Fatalf("the head is %d after serving generation %d", head, MaxGenerationSkip)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, head+MaxGenerationSkip); err != nil {
+		t.Fatalf("a skip of MaxGenerationSkip from a head of %d was refused: %v", head, err)
+	}
+	moved, err := tree.SenderGeneration(1, RatchetApplication)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if moved <= head {
+		t.Fatalf("the head did not move past %d, so the check below is the same one as above", head)
+	}
+	if _, _, err := tree.ReceiverKey(1, RatchetApplication, moved+MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("a skip of MaxGenerationSkip+1 from a head of %d answered %v, want ErrRatchetGenerationTooFarAhead", moved, err)
+	}
+}
+
+// TestReceiverKeyWindowIsBoundedAndEvictsTheOldest asserts the retained skipped keys are
+// capped at RatchetWindowSize and that what goes when the cap is reached is the oldest.
+//
+// Both edges matter and they fail in opposite directions. A window that never evicts is a
+// memory bound chosen by whoever sends the messages: one silent sender, four billion
+// retained keys. A window that evicts too eagerly throws away messages that legitimately
+// arrived out of order, which the sender never learns about.
+//
+// The number of requests is DERIVED from the two constants. The plan's own version of this
+// test asked for exactly MaxGenerationSkip and then required generation 0 to be gone -- with
+// the two constants equal, that request retains exactly RatchetWindowSize keys and evicts
+// nothing, so the assertion could not hold against any implementation. What is written here
+// computes how many maximal skips it takes to exceed the window, and refuses to run if that
+// count would not exceed it.
+func TestReceiverKeyWindowIsBoundedAndEvictsTheOldest(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(1)
+	const kind = RatchetApplication
+
+	// each maximal skip retains exactly MaxGenerationSkip keys, so this is how many of them
+	// it takes to push the retained set past the window.
+	hops := (RatchetWindowSize + int(MaxGenerationSkip)) / int(MaxGenerationSkip)
+	retainedWithoutEviction := hops * int(MaxGenerationSkip)
+	if retainedWithoutEviction <= RatchetWindowSize {
+		t.Fatalf("this sequence retains at most %d keys and the window holds %d, so it could not observe an eviction",
+			retainedWithoutEviction, RatchetWindowSize)
+	}
+
+	requested := []uint32{}
+	head := uint32(0)
+	for range hops {
+		asked := head + MaxGenerationSkip
+		if _, _, err := tree.ReceiverKey(leaf, kind, asked); err != nil {
+			t.Fatalf("ReceiverKey(%d): %v", asked, err)
+		}
+		requested = append(requested, asked)
+		head = asked + 1
+	}
+
+	r, err := tree.ratchetFor(leaf, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	if len(r.window) > RatchetWindowSize {
+		t.Fatalf("the window holds %d entries after %d maximal skips, want at most %d; unbounded retention is a memory bound the sender chooses",
+			len(r.window), hops, RatchetWindowSize)
+	}
+	if len(r.window) != RatchetWindowSize {
+		t.Fatalf("the window holds %d entries after overflowing, want exactly its bound of %d; evicting more than it has to loses messages that arrived",
+			len(r.window), RatchetWindowSize)
+	}
+
+	// every generation this sequence skipped and did not consume, oldest first.
+	skipped := []uint32{}
+	for generation := uint32(0); generation < head; generation++ {
+		if !slices.Contains(requested, generation) {
+			skipped = append(skipped, generation)
+		}
+	}
+	want := skipped[len(skipped)-RatchetWindowSize:]
+	if got := slices.Sorted(maps.Keys(r.window)); !slices.Equal(got, want) {
+		t.Fatalf("the window retained generations %d..%d, want the newest %d, %d..%d",
+			got[0], got[len(got)-1], RatchetWindowSize, want[0], want[len(want)-1])
+	}
+
+	// and the eviction is visible through the API rather than only in the field: the oldest
+	// skipped generation now reads as consumed, which is the visible gap the product needs,
+	// and the newest retained one is still usable.
+	if _, _, err := tree.ReceiverKey(leaf, kind, skipped[0]); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("generation %d survived a window that overflowed: err = %v", skipped[0], err)
+	}
+	if _, _, err := tree.ReceiverKey(leaf, kind, want[len(want)-1]); err != nil {
+		t.Fatalf("the newest retained generation %d was not usable: %v", want[len(want)-1], err)
+	}
+}
+
+// TestReceiverKeyWindowStaysBoundedUnderARepeatedMaximalSkip is the memory claim over a
+// sender that never stops skipping, rather than over the single overflow next door.
+func TestReceiverKeyWindowStaysBoundedUnderARepeatedMaximalSkip(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(3)
+	const kind = RatchetHandshake
+	r, err := tree.ratchetFor(leaf, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	// enough rounds to exceed the window several times over, derived so the count follows the
+	// constants rather than standing beside them.
+	rounds := 3 * (RatchetWindowSize + int(MaxGenerationSkip)) / int(MaxGenerationSkip)
+	head := uint32(0)
+	for at := range rounds {
+		asked := head + MaxGenerationSkip
+		if _, _, err := tree.ReceiverKey(leaf, kind, asked); err != nil {
+			t.Fatalf("ReceiverKey(%d): %v", asked, err)
+		}
+		head = asked + 1
+		if len(r.window) > RatchetWindowSize {
+			t.Fatalf("after %d maximal skips the window holds %d entries, want at most %d", at+1, len(r.window), RatchetWindowSize)
+		}
+	}
+	if rounds*int(MaxGenerationSkip) <= RatchetWindowSize {
+		t.Fatalf("this sequence never exceeds the window, so the bound above was never tested")
+	}
+	if len(r.window) != RatchetWindowSize {
+		t.Fatalf("the window settled at %d entries, want its bound of %d", len(r.window), RatchetWindowSize)
+	}
+}
+
+// TestSecretTreeZeroizeLeavesNoRatchetOrWindowSecretAnywhereOnTheType is Zeroize at the
+// scope of the type.
+//
+// The plan's TestSecretTreeZeroize reads two field names, tree.nodes and one ratchet's
+// secret. Neither reaches the RETAINED WINDOW KEYS, which after an out of order delivery
+// are live AEAD keys sitting in a map -- and an epoch leaving PastEpochWindow with its
+// window keys intact is the same failure as one leaving with its ratchet secrets intact.
+func TestSecretTreeZeroizeLeavesNoRatchetOrWindowSecretAnywhereOnTheType(t *testing.T) {
+	tree := stNewTree(t, 8)
+	// a sender, and a receiver that skipped -- so the tree holds ratchet secrets, retained
+	// window keys and node secrets for the leaves nobody has touched.
+	if _, _, _, err := tree.NextSenderKey(0, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(2, RatchetHandshake, 6); err != nil {
+		t.Fatalf("ReceiverKey: %v", err)
+	}
+
+	targets := map[string]string{}
+	windowKeys := 0
+	for at, r := range tree.ratchets {
+		targets[string(r.secret)] = fmt.Sprintf("the ratchet secret of leaf %d kind %d", at.leaf, at.kind)
+		for generation, keys := range r.window {
+			targets[string(keys.key)] = fmt.Sprintf("the retained key of leaf %d kind %d generation %d", at.leaf, at.kind, generation)
+			targets[string(keys.nonce)] = fmt.Sprintf("the retained nonce of leaf %d kind %d generation %d", at.leaf, at.kind, generation)
+			windowKeys++
+		}
+	}
+	for node, secret := range tree.nodes {
+		targets[string(secret)] = fmt.Sprintf("the node secret of node %d", node)
+	}
+	if windowKeys == 0 {
+		t.Fatal("no window keys were retained, so this test cannot say anything about them")
+	}
+	if len(targets) < 4 {
+		t.Fatalf("only %d secrets to check, which is not a tree in the state this test needs", len(targets))
+	}
+
+	// the control: every one of them is reachable BEFORE the erasure, so an absence
+	// afterwards is the erasure and not a walk that stopped looking.
+	before := secretTreeRetainedBytes(t, tree)
+	for secret, what := range targets {
+		found := false
+		for _, one := range before {
+			if bytes.Contains(one.carried, []byte(secret)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("the walk does not reach %s even before Zeroize, so its absence afterwards would prove nothing", what)
+		}
+	}
+
+	tree.Zeroize()
+
+	for _, one := range secretTreeRetainedBytes(t, tree) {
+		for secret, what := range targets {
+			if bytes.Contains(one.carried, []byte(secret)) {
+				t.Fatalf("%s survived Zeroize and is still held at %s", what, one.where)
+			}
+		}
+	}
+}
+
+// TestEveryExportedSecretTreeMethodRefusesAfterZeroize derives the class rather than naming
+// it: every exported method of this type that can report an error must report ErrEpochErased
+// once the epoch has been erased, and any method that cannot report an error must return
+// nothing that could carry a secret.
+//
+// Enumerating the three methods that exist today is the shape this project keeps having to
+// undo -- a table named "every rule" holding five of six. Reading the method set means the
+// exported surface p6 and later plans add arrives already covered, and an added method that
+// hands back key material with no way to refuse fails HERE rather than at the epoch that
+// needed the refusal.
+//
+// The reason a refusal is required at all: Zeroize overwrites every node secret and every
+// ratchet secret with Nh zero bytes, and expanding a run of zeros is not a weak derivation,
+// it is one every party in the world can perform. A method that answered from an erased tree
+// would return a real looking key, with no error, that offers no confidentiality at all.
+func TestEveryExportedSecretTreeMethodRefusesAfterZeroize(t *testing.T) {
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	pointer := reflect.TypeOf(&SecretTree{})
+	if pointer.NumMethod() == 0 {
+		t.Fatal("*SecretTree has no exported methods, so this gate read the wrong type")
+	}
+
+	call := func(tree *SecretTree, method reflect.Method) []reflect.Value {
+		arguments := []reflect.Value{reflect.ValueOf(tree)}
+		for at := 1; at < method.Type.NumIn(); at++ {
+			arguments = append(arguments, reflect.Zero(method.Type.In(at)))
+		}
+		return method.Func.Call(arguments)
+	}
+
+	// the control, on a tree that was never erased. Without it a build where every method
+	// returned ErrEpochErased unconditionally -- or where errors.Is answered yes to
+	// everything -- would satisfy the sweep below completely.
+	live := stNewTree(t, 8)
+	for at := range pointer.NumMethod() {
+		method := pointer.Method(at)
+		for _, result := range call(live, method) {
+			if !result.Type().Implements(errorType) || result.IsNil() {
+				continue
+			}
+			if errors.Is(result.Interface().(error), ErrEpochErased) {
+				t.Fatalf("%s answered ErrEpochErased on a tree that was never zeroized", method.Name)
+			}
+		}
+	}
+
+	erased := stNewTree(t, 8)
+	if _, _, _, err := erased.NextSenderKey(0, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	erased.Zeroize()
+
+	refusals := 0
+	for at := range pointer.NumMethod() {
+		method := pointer.Method(at)
+		refused := false
+		carries := []string{}
+		for _, result := range call(erased, method) {
+			if result.Type().Implements(errorType) {
+				if result.IsNil() {
+					continue
+				}
+				if err := result.Interface().(error); !errors.Is(err, ErrEpochErased) {
+					t.Errorf("%s on an erased tree answered %v, want ErrEpochErased", method.Name, err)
+				} else {
+					refused = true
+					refusals++
+				}
+				continue
+			}
+			switch result.Kind() {
+			case reflect.Slice, reflect.Array, reflect.String, reflect.Pointer,
+				reflect.Interface, reflect.Map, reflect.Struct:
+				carries = append(carries, result.Type().String())
+			}
+		}
+		if !refused && len(carries) != 0 {
+			t.Errorf("%s returns %v on an erased tree with no error to refuse through, so it can hand back key material derived from a run of zeros",
+				method.Name, carries)
+		}
+	}
+	if refusals == 0 {
+		t.Fatal("no exported method refused an erased tree, so this gate is reporting on nothing")
+	}
+}
+
+// TestZeroizeIsIdempotentAndRefusesEveryLaterDerivation states the two halves of the flag in
+// terms a caller sees, so the field is not the only thing observing it.
+func TestZeroizeIsIdempotentAndRefusesEveryLaterDerivation(t *testing.T) {
+	tree := stNewTree(t, 8)
+	if _, _, _, err := tree.NextSenderKey(1, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	tree.Zeroize()
+	tree.Zeroize()
+
+	// a leaf that had a ratchet, and one that never did: the refusal must not depend on
+	// whether the tree happens to hold a cached ratchet for the leaf being asked about.
+	for _, leaf := range []LeafIndex{1, 6} {
+		for _, kind := range stRatchetKinds() {
+			if _, _, _, err := tree.NextSenderKey(leaf, kind); !errors.Is(err, ErrEpochErased) {
+				t.Errorf("NextSenderKey(%d, %d) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
+			}
+			if _, _, err := tree.ReceiverKey(leaf, kind, 0); !errors.Is(err, ErrEpochErased) {
+				t.Errorf("ReceiverKey(%d, %d, 0) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
+			}
+			if _, err := tree.SenderGeneration(leaf, kind); !errors.Is(err, ErrEpochErased) {
+				t.Errorf("SenderGeneration(%d, %d) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
+			}
+		}
+	}
+	// the unexported path underneath refuses too, so a later task reaching for the node
+	// secrets directly cannot walk around the flag.
+	if _, err := tree.takeLeafSecret(6); !errors.Is(err, ErrEpochErased) {
+		t.Errorf("takeLeafSecret after Zeroize answered %v, want ErrEpochErased", err)
+	}
+}
+
+// TestRatchetForRefusesAnUnknownRatchetType asserts the zero value and every code point past
+// the two named ones are refused rather than defaulted.
+//
+// A default would be the worst kind of correct: a ContentType decoded one layer up that fell
+// through to "handshake" would put an application message on the handshake ratchet, and both
+// streams would then draw from one keystream while every individual derivation stayed right.
+func TestRatchetForRefusesAnUnknownRatchetType(t *testing.T) {
+	known := stRatchetKinds()
+	refused := 0
+	for probe := 0; probe < 256; probe++ {
+		kind := RatchetType(probe)
+		tree := stNewTree(t, 8)
+		_, _, _, err := tree.NextSenderKey(0, kind)
+		if slices.Contains(known, kind) {
+			if err != nil {
+				t.Fatalf("ratchet type %d is one of this package's own and was refused: %v", kind, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("ratchet type %d was accepted, so a decoded content type that fell through has a keystream to share", kind)
+		}
+		refused++
+	}
+	if want := 256 - len(known); refused != want {
+		t.Fatalf("refused %d ratchet types, want %d", refused, want)
+	}
+}
+
+// TestSenderAndReceiverPathsShareOneRatchetPerLeafAndKind asserts the two entry points reach
+// the SAME ratchet, so a leaf that both sends and receives on one tree cannot end up with two
+// heads over one keystream.
+func TestSenderAndReceiverPathsShareOneRatchetPerLeafAndKind(t *testing.T) {
+	tree := stNewTree(t, 8)
+	if _, _, _, err := tree.NextSenderKey(4, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	head, err := tree.SenderGeneration(4, RatchetApplication)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if head != 1 {
+		t.Fatalf("head = %d after one send, want 1", head)
+	}
+	// generation 0 has been handed out already, so the receiving path must call it consumed
+	// rather than deriving it a second time from a ratchet of its own.
+	if _, _, err := tree.ReceiverKey(4, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("ReceiverKey(0) after the sender took it answered %v, want ErrRatchetGenerationConsumed", err)
+	}
+	// and the other type of the same leaf is untouched by all of it.
+	if other, err := tree.SenderGeneration(4, RatchetHandshake); err != nil || other != 0 {
+		t.Fatalf("the handshake ratchet of leaf 4 is at generation %d (err %v), want 0", other, err)
+	}
+}
+
+// TestEvictedWindowKeysAreErasedInPlace is the eviction half of the window's erasure, and it
+// is written with ALIASES because nothing else can see it.
+//
+// A key evicted from the window is deleted from the map, so from that moment nothing on the
+// tree reaches it and the type-derived walk this file scopes every other forward secrecy
+// claim by reports it gone whether it was overwritten or merely dropped. Measured: with both
+// zeroizeSecret calls removed from prune, every test in this package still passed. Holding
+// the slice header the window itself was holding is the only way to ask the question.
+func TestEvictedWindowKeysAreErasedInPlace(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(1)
+	const kind = RatchetApplication
+	if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip); err != nil {
+		t.Fatalf("ReceiverKey(%d): %v", MaxGenerationSkip, err)
+	}
+	r, err := tree.ratchetFor(leaf, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	if len(r.window) != RatchetWindowSize {
+		t.Fatalf("the window holds %d entries and this test needs it exactly full at %d", len(r.window), RatchetWindowSize)
+	}
+	held := map[uint32][][]byte{}
+	for generation, keys := range r.window {
+		held[generation] = [][]byte{keys.key, keys.nonce}
+		if stAllZero(keys.key) || stAllZero(keys.nonce) {
+			t.Fatalf("the retained key material of generation %d is already zero, so an erasure here would be invisible", generation)
+		}
+	}
+
+	// a SMALL further skip, so some entries are evicted and some survive. A skip large enough
+	// to clear the whole window would leave the survivor half of this test with nothing in it.
+	const extra = uint32(4)
+	if int(extra) >= RatchetWindowSize || extra > MaxGenerationSkip {
+		t.Fatalf("a further skip of %d cannot both overflow a window of %d and leave survivors", extra, RatchetWindowSize)
+	}
+	head, err := tree.SenderGeneration(leaf, kind)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(leaf, kind, head+extra); err != nil {
+		t.Fatalf("ReceiverKey(%d): %v", head+extra, err)
+	}
+
+	evicted, survived := 0, 0
+	for generation, pair := range held {
+		if _, ok := r.window[generation]; ok {
+			survived++
+			if stAllZero(pair[0]) || stAllZero(pair[1]) {
+				t.Fatalf("generation %d is still in the window and its key material has been erased under it", generation)
+			}
+			continue
+		}
+		evicted++
+		if !stAllZero(pair[0]) {
+			t.Fatalf("the key of evicted generation %d survives the eviction as %x", generation, pair[0])
+		}
+		if !stAllZero(pair[1]) {
+			t.Fatalf("the nonce of evicted generation %d survives the eviction as %x", generation, pair[1])
+		}
+	}
+	if evicted != int(extra) {
+		t.Fatalf("%d entries were evicted by a further skip of %d, want %d", evicted, extra, extra)
+	}
+	if survived != RatchetWindowSize-int(extra) {
+		t.Fatalf("%d entries survived, want %d; without survivors the control above is vacuous", survived, RatchetWindowSize-int(extra))
+	}
+}
+
+// TestZeroizeErasesTheRetainedWindowKeysInPlace is the same question for the epoch's end.
+//
+// Zeroize could satisfy every other test in this file by dropping the window rather than
+// erasing it -- measured, with the erase loop replaced by a single clear(), the whole package
+// stayed green -- and dropping it leaves live AEAD keys of an epoch that was supposed to be
+// gone sitting in whatever the allocator does with them next.
+func TestZeroizeErasesTheRetainedWindowKeysInPlace(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(2)
+	const kind = RatchetHandshake
+	if _, _, err := tree.ReceiverKey(leaf, kind, 6); err != nil {
+		t.Fatalf("ReceiverKey: %v", err)
+	}
+	r, err := tree.ratchetFor(leaf, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	aliases := [][]byte{r.secret}
+	for _, keys := range r.window {
+		aliases = append(aliases, keys.key, keys.nonce)
+	}
+	// six skipped generations, each with a key and a nonce, plus the ratchet secret.
+	if want := 1 + 2*6; len(aliases) != want {
+		t.Fatalf("this ratchet holds %d secrets, want %d", len(aliases), want)
+	}
+	for at, one := range aliases {
+		if stAllZero(one) {
+			t.Fatalf("retained secret %d is already zero, so its erasure would be invisible", at)
+		}
+	}
+
+	tree.Zeroize()
+
+	for at, one := range aliases {
+		if !stAllZero(one) {
+			t.Fatalf("retained secret %d survived Zeroize as %x", at, one)
+		}
+	}
+	// and it is unreachable as well as erased, so neither half stands in for the other.
+	if len(r.window) != 0 {
+		t.Fatalf("the window still holds %d entries after Zeroize", len(r.window))
 	}
 }

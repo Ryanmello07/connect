@@ -28,12 +28,18 @@ import (
 
 // SecretTree holds the node secrets of one epoch that no leaf has consumed yet.
 //
-// stateLock guards nodes, the only mutable field. crypto, leafCount, width, depth and root
-// are written once by the constructor and read without it, which is what lets an exported
-// method hold the lock and still read the count. Every unexported helper in this file
-// assumes its caller holds stateLock; every exported entry point that touches nodes takes
-// it. LeafCount deliberately does NOT take it, so a later exported method can report the
-// count while holding it without deadlocking on its own accessor.
+// stateLock guards nodes, ratchets and erased, which are the mutable fields. crypto,
+// leafCount, width, depth and root are written once by the constructor and read without it,
+// which is what lets an exported method hold the lock and still read the count. Every
+// unexported helper in this file assumes its caller holds stateLock; every exported entry
+// point that touches the mutable state takes it. LeafCount deliberately does NOT take it, so
+// a later exported method can report the count while holding it without deadlocking on its
+// own accessor.
+//
+// erased is set by Zeroize and is checked before any derivation. It is state and not a
+// convenience: once the secrets have been overwritten, every node secret and every ratchet
+// secret is a run of Nh zero bytes, and a derivation from those is a value any party can
+// compute. See ratchetFor.
 type SecretTree struct {
 	stateLock sync.Mutex
 	crypto    CryptoProvider
@@ -42,6 +48,8 @@ type SecretTree struct {
 	depth     uint32
 	root      NodeIndex
 	nodes     map[NodeIndex][]byte
+	ratchets  map[ratchetKey]*ratchet
+	erased    bool
 }
 
 // NewSecretTree seeds the tree with encryption_secret at the root.
@@ -96,6 +104,10 @@ func NewSecretTree(crypto CryptoProvider, leafCount LeafCount, encryptionSecret 
 		// the copy is deliberate: the tree erases what it holds, and erasing a caller's
 		// slice in place would zero a secret the key schedule still owns.
 		nodes: map[NodeIndex][]byte{root: append([]byte(nil), encryptionSecret...)},
+		// created here rather than lazily: ratchetFor stores into it while holding the lock,
+		// and a nil map would panic on the first sender rather than on a code path a test
+		// happened to miss.
+		ratchets: map[ratchetKey]*ratchet{},
 	}
 	return self, nil
 }
@@ -198,6 +210,13 @@ func (self *SecretTree) pathToLeaf(leaf LeafIndex) ([]NodeIndex, error) {
 //
 //go:noinline
 func (self *SecretTree) takeLeafSecret(leaf LeafIndex) ([]byte, error) {
+	// an erased tree still HOLDS a node secret for every unconsumed leaf; every byte of it
+	// is zero. Expanding that would hand back a leaf secret an attacker can derive without
+	// knowing anything about the group, so the whole surface that reaches node secrets
+	// refuses once Zeroize has run, and this is the deepest point of it.
+	if self.erased {
+		return nil, fmt.Errorf("%w: leaf %d", ErrEpochErased, leaf)
+	}
 	path, err := self.pathToLeaf(leaf)
 	if err != nil {
 		return nil, err
@@ -278,4 +297,341 @@ func (self *SecretTree) takeLeafSecret(leaf LeafIndex) ([]byte, error) {
 	}
 	delete(self.nodes, target)
 	return secret, nil
+}
+
+// ---------------------------------------------------------------------------
+// the per-sender hash ratchets: RFC 9420 section 9.1
+// ---------------------------------------------------------------------------
+
+// RatchetType selects a leaf's handshake or application ratchet. The two are separate
+// expansions of one leaf secret so a handshake message and an application message can
+// never share an AEAD key and nonce.
+//
+// The zero value is deliberately not one of them. A ratchet type arrives from a decoded
+// ContentType one layer up, and a zero that silently meant "handshake" would route an
+// application message onto the handshake ratchet -- which is not a decode failure, it is
+// two different message streams drawing from one keystream.
+type RatchetType uint8
+
+const (
+	RatchetHandshake RatchetType = iota + 1
+	RatchetApplication
+)
+
+// ratchetKey names one ratchet: one leaf, one type. Both halves are in the key because the
+// whole safety argument of this file is that no two senders and no two message streams
+// ever reach the same key and nonce pair, and a table keyed on less than this would hand
+// one ratchet to two of them.
+type ratchetKey struct {
+	leaf LeafIndex
+	kind RatchetType
+}
+
+// generationKeys is one generation's AEAD key and nonce.
+type generationKeys struct {
+	key   []byte
+	nonce []byte
+}
+
+// ratchet is one leaf's hash ratchet for one RatchetType.
+//
+// head is the next generation this ratchet will produce, and secret is the ratchet secret
+// that generation will be derived from, so the pair always describes the SAME point on the
+// chain. Nothing may advance one without the other: a head that moved on its own would
+// re-derive a generation number under a secret that has already moved, and a secret that
+// moved on its own would put two generations on one number.
+//
+// exhausted is what stops head from wrapping at 2^32. A wrap is not a wasted message, it is
+// generation numbers being reused on the wire while the keys behind them have moved on, and
+// the receiver's own consumed check then reads the reused number as a replay. There is no
+// successor past 2^32-1, so the honest answer is a refusal and a rekey.
+type ratchet struct {
+	crypto    CryptoProvider
+	secret    []byte
+	head      uint32
+	exhausted bool
+	window    map[uint32]*generationKeys
+}
+
+// newRatchet builds one ratchet over this tree's own provider, taking ownership of the root
+// secret: it is erased in place by the first step, so the caller must not keep it or pass a
+// slice it still reads.
+//
+// The provider is read off the receiver rather than taken as a parameter. Two reasons, and
+// the second is the one that decided it. A ratchet built over a provider that is not the
+// one the tree derived its leaf secret with would derive at another suite's widths from
+// this suite's secret. And the class this package holds every construction handed a
+// provider to -- routed through it, reads Nh off it, draws exactly what it uses, leaves its
+// input alone -- is about DERIVATIONS; a struct literal that stores what it is given
+// answers none of those questions, and would have to be excused from all six.
+func (self *SecretTree) newRatchet(rootSecret []byte) *ratchet {
+	return &ratchet{
+		crypto: self.crypto,
+		secret: rootSecret,
+		head:   0,
+		window: map[uint32]*generationKeys{},
+	}
+}
+
+// step derives the head generation's key and nonce, replaces the ratchet secret with its
+// successor, erases the old secret and advances the head.
+//
+// The three derivations all read the CURRENT secret, before it is replaced, and each binds
+// the generation number into the KDF context. That binding is what makes a repeated key and
+// nonce pair require two independent defects rather than one: the secret advancing and the
+// generation number advancing would both have to stop.
+//
+// The erasure is the forward secrecy, and it is the half no correctness test can see. A
+// ratchet that derives its successor and keeps the predecessor answers every "what is
+// generation n's key" question identically, and hands anyone who takes the process a second
+// later every generation from that point back to the epoch's start.
+//
+// The three lengths are read off the provider. Both registered suites fix Nn at 12 and one
+// of them fixes Nk at 32, which is also Nh and also the literal a body would have written
+// down, so inside the registry a read and a constant are the same number.
+//
+// The noinline directive is here for the reason takeLeafSecret carries one: this function
+// is in the erase-helper class, and the directive keeps the store inside zeroizeSecret
+// across a call boundary the compiler cannot see through.
+//
+//go:noinline
+func (self *ratchet) step() (uint32, *generationKeys, error) {
+	if self.exhausted {
+		return 0, nil, fmt.Errorf("%w: generation %d was the last", ErrRatchetExhausted, self.head)
+	}
+	generation := self.head
+	keys := &generationKeys{
+		key:   self.crypto.DeriveTreeSecret(self.secret, "key", generation, self.crypto.KeySize()),
+		nonce: self.crypto.DeriveTreeSecret(self.secret, "nonce", generation, self.crypto.NonceSize()),
+	}
+	next := self.crypto.DeriveTreeSecret(self.secret, "secret", generation, self.crypto.HashSize())
+	zeroizeSecret(self.secret)
+	self.secret = next
+	if generation == ^uint32(0) {
+		// the counter is not allowed to wrap. head stays where it is so a later keyFor
+		// still classifies every generation below it as consumed rather than as future.
+		self.exhausted = true
+	} else {
+		self.head = generation + 1
+	}
+	return generation, keys, nil
+}
+
+// keyFor returns the keys for one generation, ratcheting forward and retaining the
+// generations it passes so an out of order delivery is a delay and not a lost message.
+//
+// Single use: a generation already handed out is deleted from the window as it is returned,
+// so a replayed message cannot be decrypted a second time out of the retained keys. That
+// deletion is the only thing standing between the window and a real key and nonce reuse,
+// because unlike every other path here the window can hand the SAME pair back twice.
+//
+// The order of the three refusals matters. A generation below the head is consumed, which is
+// a fact about this receiver; a generation far above it is a bound, which is a fact about
+// what a sender is allowed to ask for. Reversing them would report an old generation as "too
+// far ahead" whenever the head had run past the bound.
+//
+// The noinline directive is the one this package's erase-helper gate derives: prune erases
+// through storage that outlives this call, and the directive is what keeps those stores
+// across a boundary the compiler cannot see through.
+//
+//go:noinline
+func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
+	if keys, ok := self.window[generation]; ok {
+		delete(self.window, generation)
+		return keys, nil
+	}
+	if generation < self.head {
+		return nil, fmt.Errorf("%w: generation %d, head %d", ErrRatchetGenerationConsumed, generation, self.head)
+	}
+	// generation is at or above head here, so the subtraction cannot wrap.
+	if generation-self.head > MaxGenerationSkip {
+		return nil, fmt.Errorf("%w: generation %d, head %d, bound %d",
+			ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip)
+	}
+	// the loop is bounded by the same distance the check above admits, rather than left to
+	// terminate on an argument about step advancing the head. It cannot run away for a
+	// ratchet whose head moves -- at most MaxGenerationSkip+1 steps reach any generation the
+	// check above lets through -- but a head that stopped advancing turns this into a hang,
+	// and a hang a peer reaches by choosing a generation number is the denial of service the
+	// bound exists to prevent. Measured: with step leaving the head where it is, three tests
+	// of this package stop failing and start TIMING OUT, which is the worse of the two.
+	//
+	// The invariant that makes it redundant is asserted rather than argued:
+	// TestRatchetKeysAreNeverRepeatedOverAContiguousSweep holds four thousand consecutive
+	// steps to consecutive generations, and TestRatchetRefusesToWrapTheGenerationCounter
+	// holds the one place the head legitimately stops.
+	for steps := uint32(0); ; steps++ {
+		if steps > MaxGenerationSkip {
+			return nil, fmt.Errorf("%w: generation %d, head %d, bound %d: the ratchet stopped advancing",
+				ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip)
+		}
+		stepped, keys, err := self.step()
+		if err != nil {
+			return nil, err
+		}
+		if stepped == generation {
+			return keys, nil
+		}
+		self.window[stepped] = keys
+		self.prune()
+	}
+}
+
+// prune evicts the oldest retained generations once the window is over its bound.
+//
+// It is a bound on MEMORY, and the party who decides how much of it gets used is whoever
+// sends the messages. Without eviction a sender that skips generations forever grows a
+// receiver's heap forever; with eviction at one an ordinary out of order delivery loses
+// every message but the newest. The oldest is what goes, because a skipped generation that
+// has not arrived yet grows less likely to arrive the older it gets.
+func (self *ratchet) prune() {
+	for len(self.window) > RatchetWindowSize {
+		oldest := ^uint32(0)
+		for generation := range self.window {
+			if generation < oldest {
+				oldest = generation
+			}
+		}
+		keys := self.window[oldest]
+		zeroizeSecret(keys.key)
+		zeroizeSecret(keys.nonce)
+		delete(self.window, oldest)
+	}
+}
+
+// zeroize clears the ratchet secret and every retained window entry.
+//
+//go:noinline
+func (self *ratchet) zeroize() {
+	zeroizeSecret(self.secret)
+	for generation, keys := range self.window {
+		zeroizeSecret(keys.key)
+		zeroizeSecret(keys.nonce)
+		delete(self.window, generation)
+	}
+}
+
+// ratchetFor returns the leaf's ratchet, creating BOTH of a leaf's ratchets together so the
+// leaf node secret is taken from the tree exactly once and erased immediately. Taking it
+// twice is refused by the tree, so creating them one at a time would make the second kind
+// unreachable for every leaf.
+//
+// The erased check is first, and not after the type check or after the cache lookup. An
+// erased tree holds Nh zero bytes where each node secret was, and expanding a run of zeros
+// is not a weak derivation, it is a PUBLIC one: any party can compute it knowing nothing
+// about the group. So an epoch past its window refuses rather than answers, which is the
+// same call ErrEpochErased's own comment makes for the key schedule.
+//
+// The caller holds stateLock; this function does not take it.
+//
+// The noinline directive is the erase-helper class's, for the leaf secret erased below.
+//
+//go:noinline
+func (self *SecretTree) ratchetFor(leaf LeafIndex, kind RatchetType) (*ratchet, error) {
+	if self.erased {
+		return nil, fmt.Errorf("%w: leaf %d", ErrEpochErased, leaf)
+	}
+	if kind != RatchetHandshake && kind != RatchetApplication {
+		return nil, fmt.Errorf("%w: unknown ratchet type %d", ErrSecretTreeLeafOutOfRange, kind)
+	}
+	key := ratchetKey{leaf: leaf, kind: kind}
+	if existing, ok := self.ratchets[key]; ok {
+		return existing, nil
+	}
+	leafSecret, err := self.takeLeafSecret(leaf)
+	if err != nil {
+		return nil, err
+	}
+	nh := self.crypto.HashSize()
+	self.ratchets[ratchetKey{leaf: leaf, kind: RatchetHandshake}] =
+		self.newRatchet(self.crypto.ExpandWithLabel(leafSecret, "handshake", nil, nh))
+	self.ratchets[ratchetKey{leaf: leaf, kind: RatchetApplication}] =
+		self.newRatchet(self.crypto.ExpandWithLabel(leafSecret, "application", nil, nh))
+	// the leaf secret has produced both roots and is now the one value that could regenerate
+	// either of them, so it stops existing here.
+	zeroizeSecret(leafSecret)
+	return self.ratchets[key], nil
+}
+
+const (
+	// MaxGenerationSkip bounds how far ahead of the current head a receiver will ratchet in
+	// one step. A generation number is attacker supplied, and without a bound a single
+	// uint32 buys four billion KDF calls for the price of one forged header.
+	MaxGenerationSkip uint32 = 1024
+
+	// RatchetWindowSize bounds the skipped keys retained for out of order receipt. A sender
+	// that skips more than this many produces a visible gap, which is the same trade spec A
+	// section 5.5 makes for records.
+	RatchetWindowSize int = 1024
+)
+
+// NextSenderKey returns the next generation's key and nonce for our own leaf, and advances
+// that leaf's ratchet past it. There is no way to ask for the same generation twice, which
+// is what makes this the encrypt path: a caller that dropped the answer and called again
+// gets the NEXT generation rather than the one it lost.
+func (self *SecretTree) NextSenderKey(leaf LeafIndex, kind RatchetType) (generation uint32, key []byte, nonce []byte, err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	r, err := self.ratchetFor(leaf, kind)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	generation, keys, err := r.step()
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	return generation, keys.key, keys.nonce, nil
+}
+
+// ReceiverKey returns one generation's key and nonce for another member's leaf.
+//
+// A returned error is a visible gap for the product, never a silent skip:
+// ErrRatchetGenerationConsumed and ErrRatchetGenerationTooFarAhead both say the key never
+// existed or no longer does, which is a different statement from ValSem006 -- that one is
+// the AEAD refusing a message whose key was found.
+func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation uint32) (key []byte, nonce []byte, err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	r, err := self.ratchetFor(leaf, kind)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := r.keyFor(generation)
+	if err != nil {
+		return nil, nil, err
+	}
+	return keys.key, keys.nonce, nil
+}
+
+// SenderGeneration is the next generation this leaf's ratchet will hand out.
+//
+// It creates the ratchet if it does not exist yet, which is why it can fail: asking a
+// consumed leaf where its ratchet stands is the same question as asking for its secret.
+func (self *SecretTree) SenderGeneration(leaf LeafIndex, kind RatchetType) (uint32, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	r, err := self.ratchetFor(leaf, kind)
+	if err != nil {
+		return 0, err
+	}
+	return r.head, nil
+}
+
+// Zeroize clears every secret the tree still holds and refuses every later derivation.
+// Called when the epoch leaves PastEpochWindow.
+//
+// The flag is the load bearing half. Zeroizing without it leaves a tree whose node secrets
+// and ratchet secrets are all Nh zero bytes and whose methods all still answer, and the
+// answers would be keys derived from a value every party in the world can compute, handed
+// back with no error. Erasing and refusing are one operation here for that reason.
+func (self *SecretTree) Zeroize() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for _, secret := range self.nodes {
+		zeroizeSecret(secret)
+	}
+	for _, r := range self.ratchets {
+		r.zeroize()
+	}
+	self.erased = true
 }

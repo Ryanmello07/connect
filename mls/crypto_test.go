@@ -4838,12 +4838,10 @@ func Exported(secret []byte) []byte {
 // p4 task 5 landed key_schedule.go, DeriveJoinerSecret erases its pseudorandom key through
 // zeroizeSecret, and the excuse died with the condition it named rather than outliving it.
 var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
-	// p4 task 21 lands the secret tree, its descent and its deletions; task 22 lands the
-	// handshake and application ratchets that take its leaves. Until that commit the only
-	// thing naming takeLeafSecret is secret_tree_test.go, which is exactly the condition
-	// this table is for: a complete body whose caller is written next, not a placeholder.
-	// It expires by failing the moment ratchetFor names it.
-	"./takeLeafSecret": "p4 task 22's ratchetFor is its first production caller",
+	// empty, and that is the state to keep it in. Its one entry was takeLeafSecret, excused
+	// between p4 task 21 landing the secret tree's descent and p4 task 22 landing the
+	// ratchetFor that calls it, and it expired by FAILING the moment ratchetFor named it,
+	// which is the only way an excuse of this kind ever comes back off.
 }
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:

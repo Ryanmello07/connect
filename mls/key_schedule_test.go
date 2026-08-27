@@ -8592,13 +8592,45 @@ func whereOneDeclarationPutsIt(parsed parsedSource, function *ast.FuncDecl, name
 // three was defeated by writing the same leak a different way: copy() instead of =, a package
 // level func variable instead of a parameter, a func typed field instead of either. All three
 // mutants passed the gate that advertised catching exactly those shapes.
+//
+// Which DECLARATIONS are scanned is the closure's own admission test re-applied to each body,
+// and not a match on the name alone. The closure resolves callees by name on purpose, which
+// over-approximates in the safe direction -- x.Foo() joins whatever Foo this package declares
+// -- but reading the resulting NAME set back as a set of declarations is a different use of
+// it, and one that is over-approximate in a direction that is not safe at all: it reports a
+// declaration that shares a SPELLING with a reaching one, on another type, whose body cannot
+// reach the storage by any path. p4 task 22 lands the second Zeroize of this package, on
+// *SecretTree, whose body touches nothing of the key schedule and which this gate reported
+// as leaking the epoch secret through sync.Mutex.Lock. A false report a reader has to learn
+// to ignore is how a gate stops being read.
+//
+// Nothing is lost by it: a body reaches the storage only by naming it or by calling something
+// that does, and either one puts a name from reaching -- or the storage itself -- inside that
+// body, which is exactly what is tested here. The over-approximation for CALLEES is untouched.
 func theDeclarationsPuttingWhatTheyReachBeyondTheCall(files []parsedSource, reaching []string, storage string) []string {
 	names := namesTheseFilesDeclare(files)
+	admitted := map[string]bool{storage: true}
+	for _, name := range reaching {
+		admitted[name] = true
+	}
+	mentionsAnAdmittedName := func(body *ast.BlockStmt) bool {
+		found := false
+		ast.Inspect(body, func(node ast.Node) bool {
+			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && admitted[identifier.Name] {
+				found = true
+			}
+			return !found
+		})
+		return found
+	}
 	escaping := []string{}
 	for _, parsed := range files {
 		for _, declaration := range parsed.file.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
 			if !isFunction || function.Body == nil || !slices.Contains(reaching, function.Name.Name) {
+				continue
+			}
+			if !mentionsAnAdmittedName(function.Body) {
 				continue
 			}
 			for _, why := range whereOneDeclarationPutsIt(parsed, function, names, storage) {
