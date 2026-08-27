@@ -4337,6 +4337,58 @@ func TestKeyScheduleExportSeparatesItsLabelAndItsContextIndependently(t *testing
 	}
 }
 
+// TestKeyScheduleExportHashesItsContextSoACallerMayPassAnyLength observes the sentence
+// Export's own comment writes, and it is the one claim about the context that nothing in the
+// corpus can make: every published exporter context is KDF.Nh octets long.
+//
+// The context reaches the expansion as an opaque<V> field of the KDFLabel preimage, and that
+// field's length prefix is bounded by syntax.MaxVectorLength. So a body that passed the
+// caller's context THROUGH instead of hashing it reproduces nothing published — the known
+// answer catches it — but a body that hashed it in the corpus's range and passed it through
+// outside would not be caught by any comparison against the corpus at all, and would panic out
+// of the syntax package the first time a caller passed a context bigger than a megabyte.
+// For URmessage's seed recovery that context is a caller's data and not this package's.
+//
+// Hashing first makes the field KDF.Nh octets whatever arrived, and the second half asserts
+// the whole of the caller's context reached the hash rather than a prefix of it.
+func TestKeyScheduleExportHashesItsContextSoACallerMayPassAnyLength(t *testing.T) {
+	epoch := ksVectorEpochs(t)[0]
+	schedule := epoch.schedule(t)
+	length := epoch.crypto.HashSize()
+	// one octet past the longest vector the preimage encoder will write, so a context that
+	// reached that encoder unhashed could not be encoded at all
+	oversized := bytes.Repeat([]byte{0x77}, syntax.MaxVectorLength+1)
+	// with the panic caught rather than taken: the failure this row exists for IS a panic,
+	// raised inside the syntax package, and taking it would end the test binary and every
+	// gate declared after this one with it
+	answer, raised := recoveringRow(func() exportAnswer {
+		exported, err := schedule.Export("URmessage/v1/storage", oversized, length)
+		return exportAnswer{exported: exported, err: err}
+	})
+	if raised != nil {
+		t.Fatalf("Export over a %d octet context panicked with %v; the context is reaching the KDFLabel preimage unhashed, where syntax.MaxVectorLength of %d bounds it",
+			len(oversized), raised, syntax.MaxVectorLength)
+	}
+	if answer.err != nil {
+		t.Fatalf("Export over a %d octet context: %v", len(oversized), answer.err)
+	}
+	if len(answer.exported) != length {
+		t.Fatalf("Export over a %d octet context answered %d bytes, want %d",
+			len(oversized), len(answer.exported), length)
+	}
+	// and the whole of it was hashed: one octet changed at the far end changes the answer,
+	// which a body that hashed a prefix of the caller's context would not
+	altered := bytes.Clone(oversized)
+	altered[len(altered)-1] ^= 0x01
+	other, err := schedule.Export("URmessage/v1/storage", altered, length)
+	if err != nil {
+		t.Fatalf("Export over the altered context: %v", err)
+	}
+	if bytes.Equal(answer.exported, other) {
+		t.Error("changing the last octet of the context did not change the export, so only a prefix of the caller's context reaches the derivation")
+	}
+}
+
 // TestKeyScheduleExportHonoursTheRequestedLengthExactly is the property the corpus cannot
 // hold, because both registered suites publish their exporter answer at exactly KDF.Nh bytes.
 //
@@ -4389,6 +4441,13 @@ func TestKeyScheduleExportHonoursTheRequestedLengthExactly(t *testing.T) {
 	}
 }
 
+// exportAnswer is one Export result carried through recoveringRow, which is generic over a
+// single value and cannot carry a pair.
+type exportAnswer struct {
+	exported []byte
+	err      error
+}
+
 // TestKeyScheduleExportRefusesALengthOutsideTheKdfRange asserts the two ends of the range are
 // typed refusals rather than a panic out of the provider or a silently different length.
 //
@@ -4403,15 +4462,29 @@ func TestKeyScheduleExportRefusesALengthOutsideTheKdfRange(t *testing.T) {
 		schedule := epoch.schedule(t)
 		nh := epoch.crypto.HashSize()
 		for _, length := range []int{-1, -nh, 255*nh + 1, 1 << 30} {
-			exported, err := schedule.Export("URmessage/v1/storage", exportSweepContext, length)
-			if !errors.Is(err, ErrExportLength) {
-				t.Errorf("%s: Export at %d bytes answered %v, want ErrExportLength", epoch.at, length, err)
-			}
-			if exported != nil {
-				t.Errorf("%s: Export at %d bytes refused and answered %d bytes as well",
-					epoch.at, length, len(exported))
-			}
+			// with the panic caught rather than taken, for the reason recoveringRow gives.
+			// A length gate that stopped gating does not answer a wrong error here: the
+			// negative rows reach make([]byte, 0, keyLen) inside crypto/hkdf, which is a
+			// panic, and a panic in this row would take the test BINARY down and with it
+			// every gate declared after it. Measured, not supposed: dropping the negative
+			// half of the gate ran 8 of the 14 tests of this sweep before the binary died.
+			answer, raised := recoveringRow(func() exportAnswer {
+				exported, err := schedule.Export("URmessage/v1/storage", exportSweepContext, length)
+				return exportAnswer{exported: exported, err: err}
+			})
 			refused++
+			if raised != nil {
+				t.Errorf("%s: Export at %d bytes panicked with %v; a length outside the kdf's range is a caller's number and comes back as ErrExportLength",
+					epoch.at, length, raised)
+				continue
+			}
+			if !errors.Is(answer.err, ErrExportLength) {
+				t.Errorf("%s: Export at %d bytes answered %v, want ErrExportLength", epoch.at, length, answer.err)
+			}
+			if answer.exported != nil {
+				t.Errorf("%s: Export at %d bytes refused and answered %d bytes as well",
+					epoch.at, length, len(answer.exported))
+			}
 		}
 		// and the boundary itself is inside the range rather than one past it
 		if exported, err := schedule.Export("URmessage/v1/storage", exportSweepContext, 255*nh); err != nil {
