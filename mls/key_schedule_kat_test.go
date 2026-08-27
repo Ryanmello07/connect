@@ -702,7 +702,14 @@ func independentOpaqueV(t *testing.T, body []byte) []byte {
 // prefix, or the two opaque fields transposed all give a well formed 32 octet answer.
 func independentExpandWithLabel(t *testing.T, secret []byte, label string, context []byte, length int) []byte {
 	t.Helper()
-	if length != sha256.Size {
+	// one HKDF-Expand block and a prefix of it, which covers every width this tree asks for:
+	// KDF.Nh is 32 at both registered suites, and the secret tree's AEAD widths are narrower
+	// still -- Nk 16 or 32, Nn 12. RFC 5869 section 2.3 takes the first L octets of
+	// T(1) || T(2) || ..., so for any L at or below the hash size the answer is a prefix of
+	// the first block and no second block is defined. A width past that is refused rather
+	// than truncated the other way, because the block this writes would then be the whole
+	// answer and would silently agree with an implementation that stopped early too.
+	if length <= 0 || length > sha256.Size {
 		t.Fatalf("this derivation writes one HKDF-Expand block and was asked for %d octets", length)
 	}
 	// the KDFLabel bytes are written by independentKdfLabel, which is the single hand
@@ -713,7 +720,11 @@ func independentExpandWithLabel(t *testing.T, secret []byte, label string, conte
 	expand := hmac.New(sha256.New, secret)
 	expand.Write(independentKdfLabel(t, label, context, length))
 	expand.Write([]byte{0x01})
-	return expand.Sum(nil)
+	// the length field inside the KDFLabel above is the REQUESTED width and the block is cut
+	// to the same width here. Writing the block whole while asking for a narrower one is the
+	// mistake that looks right: the first 16 octets of a 32 octet request are not the 16
+	// octet answer, because the width is inside the preimage.
+	return expand.Sum(nil)[:length]
 }
 
 // independentPskSecret is the RFC 9420 section 8.4 recurrence, written out with crypto/hmac
@@ -1391,18 +1402,27 @@ func TestTheGenerateDirectionSharesNoCodePathWithVerify(t *testing.T) {
 	for _, required := range []string{
 		"independentPskSecret", "independentPskSecretTransposed", "independentExpandWithLabel",
 		"independentKdfLabel", "independentKeyScheduleSecrets", "independentGroupContext",
+		"independentSecretTreeLeafSecret", "independentSecretTreeRatchet",
+		"independentDeriveTreeSecret", "independentSenderDataKeyNonce",
 	} {
 		if !slices.Contains(roots, required) {
 			t.Fatalf("the root derivation found %v and %s is not among them, so it is reading nothing useful over %d declared functions",
 				roots, required, len(declared))
 		}
 	}
-	// generatePskSecretVectors is family 6's generator and computes its answers with the
-	// hand written derivation, so it is held to the same rule. Family 5's generator is
-	// NOT: it takes external_pub from the implementation because DeriveKeyPair is HPKE and
-	// this tree has no second X25519, and TestVectorKeyScheduleGenerate is what says the
-	// rest of that generator's answers came from the hand written path.
-	roots = append(roots, "generatePskSecretVectors")
+	// generatePskSecretVectors is family 6's generator and generateSecretTreeCases is family
+	// 3's; both compute every answer they emit with the hand written derivations, so both are
+	// held to the same rule. Family 5's generator is NOT: it takes external_pub from the
+	// implementation because DeriveKeyPair is HPKE and this tree has no second X25519, and
+	// TestVectorKeyScheduleGenerate is what says the rest of that generator's answers came
+	// from the hand written path.
+	//
+	// Named rather than derived, and that is a gap worth stating: the "independent" prefix is a
+	// claim a function makes about itself and these two make the same claim in their names
+	// without carrying the prefix. What stops a third generator arriving unheld is
+	// assertVectorFamilyIsInstalled, which requires every registered Generate to be the one its
+	// own runner declares, plus each family's own generate test -- not this list.
+	roots = append(roots, "generatePskSecretVectors", "generateSecretTreeCases")
 	for _, root := range roots {
 		shared := []string{}
 		for name := range reachableNames(t, declared, root) {

@@ -293,26 +293,59 @@ func (self *vectorRunTally) assertRun(t *testing.T, wantCovered int, wantSkipped
 // failure rather than a comparison of nothing against nothing.
 func publishedCorpusField(t *testing.T, published map[string]json.RawMessage, name string) string {
 	t.Helper()
-	key, nested, isNested := strings.Cut(name, ".")
+	key, rest, isNested := strings.Cut(name, ".")
 	raw, found := published[key]
 	if !found {
 		t.Fatalf("the corpus case does not publish %q, so whatever decodes it decodes to nothing and every comparison over it is vacuous", key)
 	}
-	if isNested {
-		inner := map[string]json.RawMessage{}
-		if err := json.Unmarshal(raw, &inner); err != nil {
-			t.Fatalf("the published %s is not a json object: %v", key, err)
-		}
-		raw, found = inner[nested]
-		if !found {
-			t.Fatalf("the published %s does not carry %q", key, nested)
-		}
+	// a loop rather than one nesting step, because a family's answers are not all one level
+	// down: secret-tree publishes a leaf's generation at leaves[leaf][generation], and a
+	// reader that could only take a key would have to decode that array through the
+	// comparator's own struct, which is the one decode this function exists to be
+	// independent of.
+	walked := key
+	for isNested {
+		var segment string
+		segment, rest, isNested = strings.Cut(rest, ".")
+		raw = publishedCorpusSegment(t, raw, walked, segment)
+		walked += "." + segment
 	}
 	text := ""
 	if err := json.Unmarshal(raw, &text); err != nil {
 		t.Fatalf("the published %s is not a json string: %v", name, err)
 	}
 	return text
+}
+
+// publishedCorpusSegment steps one segment of a dotted path into a published value: a json
+// object takes a key and a json array takes a decimal index.
+//
+// The index arm is what lets a family address an answer inside a published array. It is a
+// FAILURE and never an empty answer when the segment does not address anything -- an index
+// past the end, or a key the case does not carry -- for publishedCorpusField's own reason:
+// the whole point of this second decode is that a path which addresses nothing is loud here
+// rather than an empty string compared against an empty string somewhere else.
+func publishedCorpusSegment(t *testing.T, raw json.RawMessage, walked string, segment string) json.RawMessage {
+	t.Helper()
+	if index, err := strconv.Atoi(segment); err == nil {
+		elements := []json.RawMessage{}
+		if err := json.Unmarshal(raw, &elements); err != nil {
+			t.Fatalf("the published %s is addressed by index %d and is not a json array: %v", walked, index, err)
+		}
+		if index < 0 || index >= len(elements) {
+			t.Fatalf("the published %s holds %d elements and index %d was asked for", walked, len(elements), index)
+		}
+		return elements[index]
+	}
+	inner := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &inner); err != nil {
+		t.Fatalf("the published %s is not a json object: %v", walked, err)
+	}
+	nested, found := inner[segment]
+	if !found {
+		t.Fatalf("the published %s does not carry %q", walked, segment)
+	}
+	return nested
 }
 
 // theJsonKeyOf is the json key one field of a corpus row is published under, read off that
