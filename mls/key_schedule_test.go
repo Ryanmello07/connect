@@ -5626,6 +5626,26 @@ func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.
 // is read, for the reason keyScheduleKatVectors gives: a known answer test that compares
 // against a file an edit can change is a known answer test that can be made to agree with
 // anything.
+//
+// Measured, not supposed, and this is why none of the sampling shapes survives here. The three
+// tests p4 task 10 supplies were ported to the helpers this package actually declares — the
+// plan's MustHex, ksTestCrypto, ksVectorEpoch0Schedule, ksVectorConfirmationKey and
+// ksVectorMembershipKey do not exist, so as written they do not compile — and run against
+// seven edits to the four functions under test. Four of the seven left all three GREEN:
+//
+//   - a verifier comparing only the FIRST BYTE of a 32 byte tag and ignoring the other 31,
+//     which is a forgery found in 256 tries;
+//   - the same over the first 16;
+//   - the comparison moved off CryptoProvider.MacVerify onto bytes.Equal, which answers
+//     identically and gives up the constant time property no behavioural test can see;
+//   - the erased epoch refusals deleted, so a tag is taken and accepted under KDF.Nh zero bytes.
+//
+// The plan's own verifier test refuses a tag with bit zero of byte zero flipped, and that is the
+// whole of what it samples, so a comparison that reads byte zero and stops satisfies it exactly.
+// Its membership test carries no length case at all and survived a verifier that accepts every
+// truncation. What the three did catch is a verifier returning true unconditionally, and the two
+// keys swapped. That is the reason every refusal below is derived over the length of the thing
+// it alters, and the reason the routing gate at the end of this file exists at all.
 
 // The two further mlswg families this task reads, and how many comparisons each contributes
 // once the entries for suites this package does not register are dropped: one confirmation
