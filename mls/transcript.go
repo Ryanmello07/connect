@@ -89,6 +89,9 @@ func ConfirmedTranscriptHash(crypto CryptoProvider, interimBefore []byte, confir
 // layer's fixed width one: the codec is asked for it rather than a byte being written
 // here, so the one place that decides how an MLS vector is spelled stays syntax.
 func InterimTranscriptHash(crypto CryptoProvider, confirmedAfter []byte, confirmationTag []byte) ([]byte, error) {
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the interim hash is the provider's", ErrNilCryptoProvider)
+	}
 	w := syntax.NewWriter()
 	w.WriteOpaque(confirmationTag)
 	input, err := w.Bytes()
@@ -111,6 +114,9 @@ func InterimTranscriptHash(crypto CryptoProvider, confirmedAfter []byte, confirm
 // Neither field is written until both values exist, so a writer failure leaves the epoch
 // where it was rather than half advanced.
 func (self *TranscriptHashes) Update(crypto CryptoProvider, confirmedTranscriptHashInput []byte, confirmationTag []byte) error {
+	if crypto == nil {
+		return fmt.Errorf("%w: both hashes it advances are the provider's", ErrNilCryptoProvider)
+	}
 	confirmed := ConfirmedTranscriptHash(crypto, self.Interim, confirmedTranscriptHashInput)
 	interim, err := InterimTranscriptHash(crypto, confirmed, confirmationTag)
 	if err != nil {
@@ -130,6 +136,9 @@ func (self *TranscriptHashes) Update(crypto CryptoProvider, confirmedTranscriptH
 // bytes. A short confirmed hash seeds a member with an interim value no peer agrees with,
 // and that surfaces one commit later as a confirmation tag mismatch naming nothing.
 func (self *TranscriptHashes) SetFromGroupInfo(crypto CryptoProvider, confirmedTranscriptHash []byte, confirmationTag []byte) error {
+	if crypto == nil {
+		return fmt.Errorf("%w: the interim hash it seeds is the provider's", ErrNilCryptoProvider)
+	}
 	nh := crypto.HashSize()
 	if len(confirmedTranscriptHash) != nh {
 		return fmt.Errorf("%w: confirmed transcript hash is %d bytes, want %d",

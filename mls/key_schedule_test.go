@@ -245,29 +245,57 @@ func storageOutlivingTheCall(parsed parsedSource, function *ast.FuncDecl, named 
 // that actually gets written -- window := secret[n:] -- and the fixed point follows a chain
 // of them. A local built by make or by bytes.Clone roots at a call rather than at a name and
 // is correctly not added: that is storage of the function's own.
+//
+// Two further spellings bind a name to storage the call does not own, and both are how this
+// package's own erasers are written rather than shapes imagined for a control. A comma ok
+// read of a map the receiver holds -- keys, ok := self.window[generation] -- puts two names
+// on the left of one expression, which the pairwise walk below steps straight past; that is
+// eraseKey. And the value of a range over one -- for _, secret := range self.nodes -- binds
+// the same storage with no assignment at all; that is (*SecretTree).Zeroize. Measured, not
+// supposed: without these two neither function reached the class the gate below derives,
+// while that gate's own comment named the second shape as the one it exists for.
 func namesReachingTheSameStorage(function *ast.FuncDecl, handed []string) []string {
 	reaching := map[string]bool{}
 	for _, name := range handed {
 		reaching[name] = true
 	}
+	// bind answers whether it added a name, so the fixed point below terminates on the pass
+	// that adds nothing rather than on a count of hops.
+	bind := func(target ast.Expr, source ast.Expr) bool {
+		root := rootIdentifierOf(source)
+		if root == "" || !reaching[root] {
+			return false
+		}
+		name, isBare := target.(*ast.Ident)
+		if !isBare || name.Name == "_" || reaching[name.Name] {
+			return false
+		}
+		reaching[name.Name] = true
+		return true
+	}
 	for {
 		grew := false
 		ast.Inspect(function, func(node ast.Node) bool {
-			assignment, isAssignment := node.(*ast.AssignStmt)
-			if !isAssignment || len(assignment.Lhs) != len(assignment.Rhs) {
-				return true
-			}
-			for i, right := range assignment.Rhs {
-				root := rootIdentifierOf(right)
-				if root == "" || !reaching[root] {
-					continue
+			switch typed := node.(type) {
+			case *ast.AssignStmt:
+				if len(typed.Lhs) == len(typed.Rhs) {
+					for i, right := range typed.Rhs {
+						grew = bind(typed.Lhs[i], right) || grew
+					}
+					return true
 				}
-				target, isBare := assignment.Lhs[i].(*ast.Ident)
-				if !isBare || target.Name == "_" || reaching[target.Name] {
-					continue
+				// one expression destructured across several names: the comma ok read. The
+				// storage is the first name, and what follows it is the ok -- a bool, which
+				// carries none.
+				if len(typed.Rhs) == 1 && len(typed.Lhs) != 0 {
+					grew = bind(typed.Lhs[0], typed.Rhs[0]) || grew
 				}
-				reaching[target.Name] = true
-				grew = true
+			case *ast.RangeStmt:
+				// the VALUE of a range names the storage; the key is an index or a map key
+				// and names none.
+				if typed.Value != nil {
+					grew = bind(typed.Value, typed.X) || grew
+				}
 			}
 			return true
 		})
@@ -314,11 +342,75 @@ func namesWrittenThrough(function *ast.FuncDecl, reaching []string) []string {
 	return slices.Sorted(maps.Keys(written))
 }
 
-// eraseHelpersIn names the functions one parsed file declares that write through storage
-// outliving the call, and which of those do not carry the directive.
-func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
-	helpers := []string{}
-	missing := []string{}
+// namesHandedThatStorage is the functions this body CALLS with one of those names as an
+// argument.
+//
+// It is the other half of "writes through storage outliving the call". A body that hands the
+// caller's array to an eraser has erased it just as surely as one that spells the loop, and
+// in this package that is how erasure is nearly always written: one zeroizeSecret, called
+// with the storage. A matcher reading only the spelled writes put eraseKey, (*ratchet).step,
+// (*ratchet).zeroize, (*KeySchedule).Zeroize and (*SecretTree).Zeroize in no class at all --
+// three of them carrying a comment claiming membership of this one, and two of them carrying
+// no directive.
+//
+// An argument and NOT a receiver. A method called on the same object -- self.pruneRetained()
+// -- reaches that object's storage too, but so does every exported method of a type that
+// erases anything anywhere, so counting receivers closes the class over the whole type and
+// ends by demanding the directive of MessageKey and ReceiverKey. What separates those from an
+// erase helper is intent, and no matcher reads intent. The line is drawn where a name is
+// handed over, which is the shape zeroizeSecret is called in everywhere here.
+//
+// The callee is read by its bare name, so a method and a package level function sharing one
+// name are one entry. That can only WIDEN the class -- it admits a body whose callee merely
+// shares a name with an eraser -- and a wider class demands the directive of more
+// declarations rather than fewer, which is the direction a gate is allowed to be wrong in.
+func namesHandedThatStorage(function *ast.FuncDecl, reaching []string) []string {
+	handed := map[string]bool{}
+	ast.Inspect(function, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		callee := ""
+		switch named := call.Fun.(type) {
+		case *ast.Ident:
+			callee = named.Name
+		case *ast.SelectorExpr:
+			callee = named.Sel.Name
+		}
+		if callee == "" {
+			return true
+		}
+		for _, argument := range call.Args {
+			if root := rootIdentifierOf(argument); root != "" && slices.Contains(reaching, root) {
+				handed[callee] = true
+			}
+		}
+		return true
+	})
+	return slices.Sorted(maps.Keys(handed))
+}
+
+// eraseHelperCandidate is one declaration as the matchers read it: whether its own body
+// spells a write through storage that outlives the call, and which functions it hands that
+// storage to.
+//
+// The two are kept apart because only the first can be decided by inspecting the declaration
+// alone. Whether handing the storage on is an erasure depends on what the callee does, which
+// is a question about the package rather than about this file, and it is answered by the
+// closure below.
+type eraseHelperCandidate struct {
+	file      string
+	name      string
+	spelled   bool
+	handsOn   []string
+	directive bool
+}
+
+// eraseHelperCandidatesIn reads every declaration of one parsed file that is handed storage
+// outliving the call.
+func eraseHelperCandidatesIn(parsed parsedSource, path string, named []string) []eraseHelperCandidate {
+	candidates := []eraseHelperCandidate{}
 	for _, declaration := range parsed.file.Decls {
 		function, isFunction := declaration.(*ast.FuncDecl)
 		if !isFunction || function.Body == nil {
@@ -328,12 +420,57 @@ func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
 		if len(handed) == 0 {
 			continue
 		}
-		if len(namesWrittenThrough(function, namesReachingTheSameStorage(function, handed))) == 0 {
+		reaching := namesReachingTheSameStorage(function, handed)
+		candidates = append(candidates, eraseHelperCandidate{
+			file:      path,
+			name:      function.Name.Name,
+			spelled:   len(namesWrittenThrough(function, reaching)) != 0,
+			handsOn:   namesHandedThatStorage(function, reaching),
+			directive: carriesTheNoInlineDirective(function.Doc),
+		})
+	}
+	return candidates
+}
+
+// eraseHelperClass closes the base class -- the declarations that spell the write -- under
+// "hands that storage to a member", and answers the members in declaration order together
+// with the members carrying no directive.
+//
+// The closure is a fixed point rather than one hop, so a helper reached through a chain of
+// them is a member. There is no seed written down anywhere: the base is whatever spells a
+// write, which today is zeroizeSecret and the four control shapes, and a package that erased
+// through some other primitive would derive that one instead.
+func eraseHelperClass(candidates []eraseHelperCandidate) ([]string, []eraseHelperCandidate) {
+	member := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.spelled {
+			member[candidate.name] = true
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, candidate := range candidates {
+			if member[candidate.name] {
+				continue
+			}
+			for _, callee := range candidate.handsOn {
+				if member[callee] {
+					member[candidate.name] = true
+					grew = true
+					break
+				}
+			}
+		}
+	}
+	helpers := []string{}
+	missing := []eraseHelperCandidate{}
+	for _, candidate := range candidates {
+		if !member[candidate.name] {
 			continue
 		}
-		helpers = append(helpers, function.Name.Name)
-		if !carriesTheNoInlineDirective(function.Doc) {
-			missing = append(missing, function.Name.Name)
+		helpers = append(helpers, candidate.name)
+		if !candidate.directive {
+			missing = append(missing, candidate)
 		}
 	}
 	return helpers, missing
@@ -341,14 +478,16 @@ func eraseHelpersIn(parsed parsedSource, named []string) ([]string, []string) {
 
 // eraseHelperControl holds one of each shape the matchers have to tell apart: the four
 // spellings that reach a caller's array, the same write made through a field of the receiver,
-// a write into storage the function made for itself, a read of a parameter, a read of the
+// the three ways a body hands that storage to an eraser instead of writing it itself, a write
+// into storage the function made for itself, storage of its own handed to an eraser, the
+// caller's array handed to something that is not one, a read of a parameter, a read of the
 // receiver, a rebinding of a parameter, a function handed no bytes at all, the directive
 // present, and the directive named only in prose.
 //
 // Without it a matcher that had stopped matching -- a parse that dropped comments, a walk
-// that stopped descending into bodies, a type filter that stopped seeing named storage --
-// would report the real source clean and pass, which is the one outcome a gate must never
-// be able to reach by accident.
+// that stopped descending into bodies, a type filter that stopped seeing named storage, a
+// closure that stopped following the hand-off -- would report the real source clean and pass,
+// which is the one outcome a gate must never be able to reach by accident.
 const eraseHelperControl = "package control\n" +
 	"\n" +
 	"type ControlKey []byte\n" +
@@ -384,6 +523,25 @@ const eraseHelperControl = "package control\n" +
 	"\tcopy(secret, make([]byte, len(secret)))\n" +
 	"}\n" +
 	"\n" +
+	"// handsTheParameterToAnEraser spells no write at all and erases the caller's array\n" +
+	"// just the same. It is the shape every erasure in this package is actually written in.\n" +
+	"func handsTheParameterToAnEraser(secret []byte) {\n" +
+	"\terasedWithTheDirective(secret)\n" +
+	"}\n" +
+	"\n" +
+	"// handsAnEraserStorageOfItsOwn calls the same eraser with an array it made, which\n" +
+	"// erases nothing anybody else can see.\n" +
+	"func handsAnEraserStorageOfItsOwn(secret []byte) {\n" +
+	"\tout := make([]byte, len(secret))\n" +
+	"\terasedWithTheDirective(out)\n" +
+	"}\n" +
+	"\n" +
+	"// handsTheParameterToSomethingThatDoesNotErase is the other half: the storage is the\n" +
+	"// caller's and the callee is not a member, so neither is this.\n" +
+	"func handsTheParameterToSomethingThatDoesNotErase(secret []byte) int {\n" +
+	"\treturn readsAParameter(secret)\n" +
+	"}\n" +
+	"\n" +
 	"func writesOnlyIntoStorageOfItsOwn(secret []byte) []byte {\n" +
 	"\tout := make([]byte, len(secret))\n" +
 	"\tcopy(out, secret)\n" +
@@ -391,8 +549,8 @@ const eraseHelperControl = "package control\n" +
 	"\treturn out\n" +
 	"}\n" +
 	"\n" +
-	"func readsAParameter(secret []byte) byte {\n" +
-	"\treturn secret[0]\n" +
+	"func readsAParameter(secret []byte) int {\n" +
+	"\treturn int(secret[0])\n" +
 	"}\n" +
 	"\n" +
 	"func rebindsAParameter(secret []byte) []byte {\n" +
@@ -406,6 +564,7 @@ const eraseHelperControl = "package control\n" +
 	"\n" +
 	"type ControlHolder struct {\n" +
 	"\tsecret []byte\n" +
+	"\twindow map[int][]byte\n" +
 	"}\n" +
 	"\n" +
 	"// erasedThroughTheReceiver is the shape a Zeroize method takes: the storage is the\n" +
@@ -413,6 +572,24 @@ const eraseHelperControl = "package control\n" +
 	"func (self *ControlHolder) erasedThroughTheReceiver() {\n" +
 	"\tfor i := range self.secret {\n" +
 	"\t\tself.secret[i] = 0\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"// erasedThroughACommaOkReadOfItsOwnMap is eraseKey: two names on the left of one\n" +
+	"// expression, and the erase written through the first of them.\n" +
+	"func (self *ControlHolder) erasedThroughACommaOkReadOfItsOwnMap(at int) {\n" +
+	"\theld, ok := self.window[at]\n" +
+	"\tif !ok {\n" +
+	"\t\treturn\n" +
+	"\t}\n" +
+	"\terasedWithTheDirective(held)\n" +
+	"}\n" +
+	"\n" +
+	"// erasedThroughARangeOverItsOwnMap is (*SecretTree).Zeroize: the name is bound by a\n" +
+	"// range rather than by an assignment, and it is the same storage.\n" +
+	"func (self *ControlHolder) erasedThroughARangeOverItsOwnMap() {\n" +
+	"\tfor _, held := range self.window {\n" +
+	"\t\terasedWithTheDirective(held)\n" +
 	"\t}\n" +
 	"}\n" +
 	"\n" +
@@ -439,6 +616,17 @@ const eraseHelperControl = "package control\n" +
 // the whole package was green -- with member_secret erased by a helper the compiler is
 // entitled to inline and elide.
 //
+// "What a function does" then has to include HANDING the storage to an eraser, which is the
+// second understatement this gate has been through. A body that spells the write is one
+// shape of erasure and this package barely uses it: there is one zeroizeSecret, and every
+// other eraser here calls it. A matcher reading only the spelled writes derived a class of
+// exactly one member out of the real source, and left outside it every function whose
+// comment claims membership -- eraseKey, (*ratchet).step, (*ratchet).zeroize -- along with
+// the two Zeroize methods, one of which this gate's own comment named as the shape it exists
+// for. Measured: with the //go:noinline line deleted from (*ratchet).eraseKey, all 526 tests
+// of this package passed. The class is therefore closed under the hand-off, by
+// eraseHelperClass, from a base nobody writes down.
+//
 // Why "writes through storage its caller owns" is the same set as "erases a secret" here
 // rather than a wider one: a construction of this package that writes into an array it was
 // handed and is NOT an eraser is already forbidden, by
@@ -448,57 +636,75 @@ const eraseHelperControl = "package control\n" +
 //
 // Two honest limits, stated rather than hidden. No go test can observe an elision, so this
 // asserts the presence of the mechanism and not the effect -- the proxy the file's own
-// argument is made of. And the write has to be spelled through the name whose storage it
-// reaches: a parameter, a local cut from one, or a field of the receiver. A slice handed on
-// to a function declared elsewhere and erased there is past what a syntax matcher can
-// follow -- though the function it is handed to is itself in this class, and is held here.
+// argument is made of. And the hand-off is followed by the ARGUMENT and not by the receiver:
+// a method that erases through a member call on its own object -- evictOldest, which chooses
+// a generation and leaves the erase to eraseKey -- is outside this class, because counting
+// receivers closes it over every exported method of a type that erases anything anywhere.
+// Those declarations carry the directive by the convention this package keeps rather than
+// because anything here demands it, and their comments say so.
 func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
-	control := mustParseCommented(t, "the erase helper control", eraseHelperControl)
-	helpers, missing := eraseHelpersIn(control, []string{"ControlKey"})
+	const controlName = "the erase helper control"
+	control := mustParseCommented(t, controlName, eraseHelperControl)
+	helpers, missing := eraseHelperClass(eraseHelperCandidatesIn(control, controlName, []string{"ControlKey"}))
 	wantHelpers := []string{
 		"erasedWithTheDirective",
 		"erasedWithOnlyProse",
 		"erasedThroughALocalCutFromTheParameter",
 		"erasedWithClearOverNamedStorage",
 		"erasedWithCopy",
+		"handsTheParameterToAnEraser",
 		"erasedThroughTheReceiver",
+		"erasedThroughACommaOkReadOfItsOwnMap",
+		"erasedThroughARangeOverItsOwnMap",
 	}
 	if !slices.Equal(helpers, wantHelpers) {
-		t.Fatalf("the matcher read %v out of the control as erase helpers, want %v; it is not telling a write through the caller's array from a read of one or from a write into storage of the function's own",
+		t.Fatalf("the matcher read %v out of the control as erase helpers, want %v; it is not telling a write through the caller's array -- spelled, or handed to an eraser -- from a read of one or from a write into storage of the function's own",
 			helpers, wantHelpers)
+	}
+	missingNames := []string{}
+	for _, candidate := range missing {
+		missingNames = append(missingNames, candidate.name)
 	}
 	wantMissing := []string{
 		"erasedWithOnlyProse",
 		"erasedThroughALocalCutFromTheParameter",
 		"erasedWithClearOverNamedStorage",
 		"erasedWithCopy",
+		"handsTheParameterToAnEraser",
 		"erasedThroughTheReceiver",
+		"erasedThroughACommaOkReadOfItsOwnMap",
+		"erasedThroughARangeOverItsOwnMap",
 	}
-	if !slices.Equal(missing, wantMissing) {
+	if !slices.Equal(missingNames, wantMissing) {
 		t.Fatalf("the matcher read %v out of the control as missing the directive, want %v; it is not telling the directive from the prose that argues for it",
-			missing, wantMissing)
+			missingNames, wantMissing)
 	}
 
 	named := packageByteSliceTypeNames(t)
-	found := []string{}
-	unprotected := []string{}
+	candidates := []eraseHelperCandidate{}
 	for _, path := range packageLevelFunctions(t).files {
-		declared, without := eraseHelpersIn(mustReadCommented(t, path), named)
-		found = append(found, declared...)
-		for _, name := range without {
-			unprotected = append(unprotected, path+": "+name)
-		}
+		candidates = append(candidates, eraseHelperCandidatesIn(mustReadCommented(t, path), path, named)...)
 	}
-	// the positive control on the real source. This package certainly declares one erase
-	// helper, and a scan that had stopped finding it would report the same clean run a
+	found, unprotected := eraseHelperClass(candidates)
+	// the positive controls on the real source, one per half of the derivation. This package
+	// certainly declares one helper that spells the write and several that hand the storage
+	// to it, and a scan that had stopped finding either would report the same clean run a
 	// complete one reports.
 	if !slices.Contains(found, "zeroizeSecret") {
 		t.Fatalf("the scan read %v as this package's erase helpers and zeroizeSecret is not among them, so it is not reading what it claims to",
 			found)
 	}
+	if !slices.Contains(found, "eraseKey") {
+		t.Fatalf("the scan read %v as this package's erase helpers and eraseKey is not among them, so the class is not closed under the hand-off and every erasure written as one zeroizeSecret call is outside it",
+			found)
+	}
 	if len(unprotected) != 0 {
-		t.Errorf("%v write through storage that outlives the call -- a caller's array or the receiver's own -- without a %s line of their own; that directive is the only thing between these stores and a compiler entitled to delete them, and secret_zeroize.go's own comment says so",
-			unprotected, noInlineDirective)
+		reported := []string{}
+		for _, candidate := range unprotected {
+			reported = append(reported, candidate.file+": "+candidate.name)
+		}
+		t.Errorf("%v erase storage that outlives the call -- a caller's array or the receiver's own -- without a %s line of their own; that directive is the only thing between these stores and a compiler entitled to delete them, and secret_zeroize.go's own comment says so",
+			reported, noInlineDirective)
 	}
 	t.Logf("%d erase helpers read out of this package's source: %v", len(found), found)
 }
@@ -7884,7 +8090,7 @@ func theByteSlicesHeldBy(structs map[string]*ast.StructType, root string, named 
 // check over each, a log line -- would satisfy a mention count while erasing nothing, and that
 // is precisely the shape "make Zeroize a no-op" takes once the calls are gone.
 //
-// The helpers are derived by eraseHelpersIn rather than named here, so an erase spelled through
+// The helpers are derived by eraseHelperClass rather than named here, so an erase spelled through
 // a second helper counts -- and that second helper is held to the noinline directive by
 // TestEveryEraseHelperCarriesTheNoInlineDirective, which is what makes delegating to one an
 // erase at all.
@@ -7973,15 +8179,15 @@ func TestZeroizeErasesEveryByteSliceThisTypeDeclares(t *testing.T) {
 	// then this package's own source
 	files := []parsedSource{}
 	structs := map[string]*ast.StructType{}
-	helpers := []string{}
+	candidates := []eraseHelperCandidate{}
 	named := packageByteSliceTypeNames(t)
 	for _, path := range packageLevelFunctions(t).files {
 		parsed := mustParseSource(t, path)
 		files = append(files, parsed)
 		structTypesIn(parsed, structs)
-		declared, _ := eraseHelpersIn(mustReadCommented(t, path), named)
-		helpers = append(helpers, declared...)
+		candidates = append(candidates, eraseHelperCandidatesIn(mustReadCommented(t, path), path, named)...)
 	}
+	helpers, _ := eraseHelperClass(candidates)
 	if len(helpers) == 0 {
 		t.Fatal("this package's source declares no erase helper, so the reading below finds no erase however Zeroize is written")
 	}

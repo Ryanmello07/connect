@@ -63,6 +63,18 @@ var (
 	// a length failure re-derives and re-passes the secret it supplied, which is the wrong
 	// repair for an argument that was never supplied at all, and every other refusal these
 	// constructors make names its own condition rather than borrowing one.
+	//
+	// It is the whole class's answer and not one constructor's. Every declaration of this
+	// package that takes a provider and can report an error returns this before it judges any
+	// other argument -- ahead of the group context check and ahead of every length, because
+	// each of those reads KDF.Nh off the provider and a body that checked them first would
+	// dereference the thing it is about to refuse. The six that answer no error cannot report
+	// it and stop instead, which is the alternative to handing back a plausibly shaped value
+	// derived from nothing. Both halves are swept by
+	// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt over a class read
+	// off the type checker; before it, this sentinel was returned from exactly one of the
+	// twenty one declarations that take a provider and the other twenty raised a nil pointer
+	// dereference.
 	ErrNilCryptoProvider = errors.New("mls: no crypto provider was supplied")
 
 	// ErrTranscriptHashLength is returned when a transcript hash is not KDF.Nh bytes.

@@ -172,19 +172,37 @@ var (
 // second declaration beside it, and until then this block is what makes a p6 that arrives
 // with a different shape a build failure here.
 //
-// The width is pinned through a 0xff conversion, which is a compile error the moment the type
-// is widened past the octet the wire format gives it -- an assignment of a small constant
-// would not catch that, and a content type read at two octets moves every field after it in a
-// PrivateMessage header. The three constants are pinned as members of the type, which holds
-// their spelling and their type but NOT their values: a code point that moved is a number and
-// not a type error, so TestContentTypeCarriesTheWireValuesTheRegistryGivesIt is what holds
-// those, and it derives them off the type rather than reading this block.
+// The width takes two lines, and the 0xff conversion is only one of them. That conversion says
+// that 255 FITS, which rules out a signed octet and nothing else: ContentType(0xff) compiles
+// unchanged at uint16, at uint32 and at every wider type. So the sentence this block used to
+// carry -- that the conversion "is a compile error the moment the type is widened past the
+// octet the wire format gives it" -- was false, and it was false in the one file a later plan
+// reads to decide what still protects it. Measured, not supposed: with type ContentType uint8
+// changed to uint16 this package BUILT and 657 of its 658 tests passed, the single failure
+// being TestContentTypeCarriesTheWireValuesTheRegistryGivesIt, which holds the width through
+// int(^ContentType(0))+1 != 256 and is therefore what was holding it all along.
+//
+// The upper half is the constant below the block. ^ContentType(0) is a typed constant equal to
+// the type's own maximum, so converting it to a uint8 is exactly the statement "this type is
+// no wider than an octet", and a widened type stops COMPILING here rather than failing a test
+// somewhere. That is the failure this block wants: a content type read at two octets moves
+// every field after it in a PrivateMessage header, and nothing about that is a type error at
+// any call site.
+//
+// The three constants are pinned as members of the type, which holds their spelling and their
+// type but NOT their values: a code point that moved is a number and not a type error, so
+// TestContentTypeCarriesTheWireValuesTheRegistryGivesIt is what holds those, and it derives
+// them off the type rather than reading this block.
 var (
 	_ ContentType = ContentType(0xff)
 	_ ContentType = ContentTypeApplication
 	_ ContentType = ContentTypeProposal
 	_ ContentType = ContentTypeCommit
 )
+
+// the upper half of the width, which the conversions above cannot give. A type wider than an
+// octet makes this constant overflow its conversion and the package stops building.
+const _ = uint8(^ContentType(0))
 
 // p3 tree math — the index surface registry section 4 gives this plan, pinned at the
 // shapes convention C3 fixes: counts are LeafCount and indices are LeafIndex/NodeIndex,
@@ -706,7 +724,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 73,
+	"key_schedule_deps_test.go": 74,
 	"pins_test.go":              8,
 }
 

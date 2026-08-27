@@ -85,6 +85,12 @@ func DeriveJoinerSecret(
 	commitSecret []byte,
 	groupContext *GroupContext,
 ) ([]byte, error) {
+	// the provider is asked for ahead of the group context and ahead of every length
+	// below, because each of those checks reads KDF.Nh off it: there is no argument this
+	// function can judge without one, so "no provider" is the first thing it can say.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: joiner_secret is an extraction and an expansion through it", ErrNilCryptoProvider)
+	}
 	if groupContext == nil {
 		return nil, ErrNilGroupContext
 	}
@@ -169,6 +175,9 @@ func NewKeySchedule(
 	pskSecret []byte,
 	groupContext *GroupContext,
 ) (*KeySchedule, error) {
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: every secret of the epoch is derived through it", ErrNilCryptoProvider)
+	}
 	joinerSecret, err := DeriveJoinerSecret(crypto, initSecretPrev, commitSecret, groupContext)
 	if err != nil {
 		return nil, err
@@ -221,6 +230,12 @@ func NewKeyScheduleFromJoiner(
 	pskSecret []byte,
 	groupContext *GroupContext,
 ) (*KeySchedule, error) {
+	// the provider is asked for ahead of the group context and ahead of every length
+	// below, because each of those checks reads KDF.Nh off it: there is no argument this
+	// function can judge without one, so "no provider" is the first thing it can say.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: every secret of the epoch is derived through it", ErrNilCryptoProvider)
+	}
 	if groupContext == nil {
 		return nil, ErrNilGroupContext
 	}
@@ -302,6 +317,12 @@ func NewKeyScheduleFromEpochSecret(
 	epochSecret []byte,
 	groupContext *GroupContext,
 ) (*KeySchedule, error) {
+	// the provider is asked for ahead of the group context and ahead of every length
+	// below, because each of those checks reads KDF.Nh off it: there is no argument this
+	// function can judge without one, so "no provider" is the first thing it can say.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the nine derived secrets are expansions through it", ErrNilCryptoProvider)
+	}
 	if groupContext == nil {
 		return nil, ErrNilGroupContext
 	}
@@ -621,6 +642,9 @@ func (self *KeySchedule) VerifyMembershipTag(authenticatedContentTbm []byte, tag
 // joined — so without this the creator would seal encrypted_group_info under an expansion of
 // nothing, which every party can recompute, and get err == nil for it.
 func WelcomeKeyNonce(crypto CryptoProvider, welcomeSecret []byte) (key []byte, nonce []byte, err error) {
+	if crypto == nil {
+		return nil, nil, fmt.Errorf("%w: the welcome key and nonce are two expansions through it", ErrNilCryptoProvider)
+	}
 	nh := crypto.HashSize()
 	if len(welcomeSecret) != nh {
 		return nil, nil, fmt.Errorf("%w: welcome secret is %d bytes, want %d", ErrSecretLength, len(welcomeSecret), nh)
@@ -656,6 +680,16 @@ func WelcomeKeyNonce(crypto CryptoProvider, welcomeSecret []byte) (key []byte, n
 // rather than answering. Without that, every method here would go on answering — a tag, an
 // export, an HPKE key pair, all derived from KDF.Nh zero bytes, all publicly computable, all
 // the right length, and all with err == nil.
+//
+// The noinline directive goes with the paragraph above rather than around it. That the stores
+// live inside zeroizeSecret is what keeps them across a call boundary; carrying the directive
+// here as well is the class's rule, and a member that reasons its way out of a rule is how the
+// rule stops being one. TestEveryEraseHelperCarriesTheNoInlineDirective derives that class
+// transitively -- a body handing the receiver's storage to an eraser is a member exactly as
+// one spelling the write is -- and this method and (*SecretTree).Zeroize are the two it was
+// blind to while its own comment named this one.
+//
+//go:noinline
 func (self *KeySchedule) Zeroize() {
 	zeroizeSecret(self.joinerSecret)
 	zeroizeSecret(self.welcomeSecret)

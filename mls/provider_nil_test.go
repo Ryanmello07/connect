@@ -1,0 +1,209 @@
+// The gate over what this package does when a construction that derives everything through a
+// CryptoProvider is handed none.
+//
+// ErrNilCryptoProvider is declared for exactly that condition and, before this file, was
+// returned from ONE of the twenty one declarations that take a provider. The other twenty
+// raised a nil pointer dereference out of whatever line first read a width off it -- most of
+// them the very first statement of the body. Measured, not supposed: SenderDataKeyNonce(nil,
+// nil, nil) panicked with "invalid memory address or nil pointer dereference", and so did
+// WelcomeKeyNonce, which has the same shape and shipped with the same omission. A panic out of
+// a library is not a refusal: it takes the caller's process rather than its call, and it says
+// nothing about which of the arguments was wrong.
+//
+// The class is derived twice over rather than listed. providerConstructions reads the package
+// level half off the type checker and providerDrivenMethods reads the method half, and
+// TestEveryDeclarationTakingAProviderIsHeldByExactlyOneOfTheTwoClasses compares the two
+// against the whole, so a declaration cannot fall between them. What each member has to do is
+// derived too: a signature with an error result must return ErrNilCryptoProvider, and one
+// without has nothing to report with and must not answer at all.
+package mls
+
+import (
+	"errors"
+	"reflect"
+	"slices"
+	"testing"
+)
+
+// providerNilMethodRow is one method of the class, with a call that hands it no provider.
+//
+// A method needs a receiver and a construction does not, which is the whole reason this half
+// is a table and the other half is reflect over the function value. Every receiver here is the
+// zero value or the package's own constructor for one: what the method does with a nil
+// provider must not depend on what its receiver holds, and a row that had to build a valid
+// receiver first would be asserting something else.
+type providerNilMethodRow struct {
+	name string
+	call func() error
+}
+
+// providerNilMethodRows is the table, one row per member of the derived method class.
+//
+// It is not what decides the class: providerDrivenMethodRowsFor holds it against
+// providerDrivenMethodNames in both directions, so a method with no row fails this gate rather
+// than being left out of it.
+func providerNilMethodRows() []providerNilMethodRow {
+	return []providerNilMethodRow{
+		{name: "(*PreSharedKeyId).Validate", call: func() error {
+			return (&PreSharedKeyId{}).Validate(nil)
+		}},
+		{name: "(*TranscriptHashes).Update", call: func() error {
+			hashes := InitialTranscriptHashes()
+			return hashes.Update(nil, nil, nil)
+		}},
+		{name: "(*TranscriptHashes).SetFromGroupInfo", call: func() error {
+			hashes := InitialTranscriptHashes()
+			return hashes.SetFromGroupInfo(nil, nil, nil)
+		}},
+	}
+}
+
+// providerErrorResult is the position of the error a signature answers, or -1 for one that
+// answers none.
+//
+// This is the derivation that decides what the gate demands of a member, and it is read off
+// the compiled signature rather than off a table of exemptions. A construction that cannot
+// report is exempt from reporting BECAUSE of its signature, and it stops being exempt the
+// moment somebody gives it an error to return.
+func providerErrorResult(signature reflect.Type) int {
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	for i := 0; i < signature.NumOut(); i++ {
+		if signature.Out(i) == errorType {
+			return i
+		}
+	}
+	return -1
+}
+
+// providerCallWithNoProvider calls one construction with the zero value of every parameter,
+// which is a nil provider at the provider's position, and answers what came back or what it
+// panicked with.
+//
+// Zero values everywhere and not just at the provider. A construction handed a nil provider
+// and otherwise valid arguments would still be reading a length off the provider to check
+// them, so there is no "otherwise valid" to hand: what the zero arguments make this gate
+// assert is that the provider is refused BEFORE any argument is judged, which is the only
+// order that does not dereference it.
+func providerCallWithNoProvider(t *testing.T, name string, function reflect.Value) (results []reflect.Value, panicked any) {
+	t.Helper()
+	signature := function.Type()
+	if signature.IsVariadic() {
+		t.Fatalf("%s is variadic, so this gate cannot build its argument list", name)
+	}
+	arguments := make([]reflect.Value, signature.NumIn())
+	for i := range arguments {
+		arguments[i] = reflect.Zero(signature.In(i))
+	}
+	defer func() {
+		panicked = recover()
+	}()
+	return function.Call(arguments), nil
+}
+
+// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt sweeps both halves of
+// the class.
+//
+// What it demands of a member that can report an error is the sentinel this package declares
+// for the condition, and not merely "some error": a length refusal raised because
+// crypto.HashSize() answered zero would satisfy a bare err != nil while still having read a
+// method off a nil interface, and an ErrSecretLength for a secret nobody could have got right
+// sends the caller to check its arguments over a provider it never passed.
+//
+// What it demands of a member that CANNOT report is that it does not answer. Those six
+// constructions hand back bytes and nothing else -- RefHash, the two reference makers,
+// ZeroSecret, EmptyPskSecret and ConfirmedTranscriptHash -- so the only alternative to
+// stopping is a plausibly shaped value derived from no provider at all, which is worse than a
+// panic and is the outcome this half rules out. Their exemption from the sentinel is read off
+// their signatures rather than written down here, so it lapses the moment one of them grows an
+// error to return.
+func TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt(t *testing.T) {
+	reporting, silent := 0, 0
+	for _, construction := range providerConstructions(t) {
+		function := construction.bind(nil)
+		at := providerErrorResult(function.Type())
+		if at < 0 {
+			// it has no way to say no, so what it must not do is say yes.
+			_, panicked := providerCallWithNoProvider(t, construction.name, function)
+			if panicked == nil {
+				t.Errorf("%s answers no error and returned a value when handed no provider; every byte of that value was derived from nothing, and a caller cannot tell it from a real one",
+					construction.name)
+			}
+			silent++
+			continue
+		}
+		results, panicked := providerCallWithNoProvider(t, construction.name, function)
+		if panicked != nil {
+			t.Errorf("%s panicked with %v when handed no provider, and it answers an error at result %d; %v is what the caller has to be given",
+				construction.name, panicked, at, ErrNilCryptoProvider)
+			reporting++
+			continue
+		}
+		answered, _ := results[at].Interface().(error)
+		if !errors.Is(answered, ErrNilCryptoProvider) {
+			t.Errorf("%s handed no provider answered %v, want %v", construction.name, answered, ErrNilCryptoProvider)
+		}
+		reporting++
+	}
+	if reporting == 0 || silent == 0 {
+		t.Fatalf("the sweep read %d constructions that can report and %d that cannot; with either half empty this gate is holding one rule rather than the two it states",
+			reporting, silent)
+	}
+
+	rows := providerNilMethodRowsFor(t, providerDrivenMethodNames(t))
+	if len(rows) == 0 {
+		t.Fatal("no method of this package was driven with a nil provider, so the method half of this gate demands nothing")
+	}
+	for _, row := range rows {
+		answered := providerNilRefusalOf(t, row)
+		if !errors.Is(answered, ErrNilCryptoProvider) {
+			t.Errorf("%s handed no provider answered %v, want %v", row.name, answered, ErrNilCryptoProvider)
+		}
+	}
+}
+
+// providerNilRefusalOf runs one method row and turns a panic into the error it should have
+// been, so one member dereferencing the nil interface is a failure of its own row rather than
+// the end of the sweep.
+func providerNilRefusalOf(t *testing.T, row providerNilMethodRow) (answered error) {
+	t.Helper()
+	defer func() {
+		if panicked := recover(); panicked != nil {
+			t.Errorf("%s panicked with %v when handed no provider", row.name, panicked)
+			answered = nil
+		}
+	}()
+	return row.call()
+}
+
+// providerNilMethodRowsFor holds this file's rows against the derived class in both directions.
+//
+// It is providerDrivenMethodRowsFor's check over this file's own row type: a member with no row
+// is a method nothing here runs, and a row naming a method this package does not declare is a
+// row that outlived what it covered.
+func providerNilMethodRowsFor(t *testing.T, class []string) []providerNilMethodRow {
+	t.Helper()
+	byName := map[string]providerNilMethodRow{}
+	for _, row := range providerNilMethodRows() {
+		if _, repeated := byName[row.name]; repeated {
+			t.Fatalf("providerNilMethodRows declares %s twice, so one of the two is never run", row.name)
+		}
+		byName[row.name] = row
+	}
+	for name := range byName {
+		if !slices.Contains(class, name) {
+			t.Errorf("providerNilMethodRows names %s, and no method of this package takes a %s under that name",
+				name, providerInterfaceName)
+		}
+	}
+	rows := []providerNilMethodRow{}
+	for _, name := range class {
+		row, written := byName[name]
+		if !written {
+			t.Errorf("the nil provider gate: %s is handed a %s and has no row, so nothing holds it",
+				name, providerInterfaceName)
+			continue
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}

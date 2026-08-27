@@ -215,6 +215,9 @@ var _ syntax.Codec = (*PreSharedKeyId)(nil)
 // resumption secret from a group nobody re-initialised be mixed into an epoch, which is
 // the confusion the usage field exists to prevent.
 func (self *PreSharedKeyId) Validate(crypto CryptoProvider) error {
+	if crypto == nil {
+		return fmt.Errorf("%w: the nonce this validates is KDF.Nh, read off it", ErrNilCryptoProvider)
+	}
 	if len(self.PskNonce) != crypto.HashSize() {
 		return fmt.Errorf("%w: %d bytes, want %d",
 			errPskNonceLength, len(self.PskNonce), crypto.HashSize())
@@ -351,6 +354,9 @@ func marshalPskLabel(id *PreSharedKeyId, index uint16, count uint16) ([]byte, er
 // caller, so there is no order of calls that reaches a psk_secret over a list ValSem401,
 // ValSem402 or ValSem403 refuses.
 func PskSecret(crypto CryptoProvider, psks []PreSharedKeyInput) ([]byte, error) {
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: psk_secret is a chain of extractions through it", ErrNilCryptoProvider)
+	}
 	pskSecret := ZeroSecret(crypto)
 	if len(psks) == 0 {
 		return pskSecret, nil

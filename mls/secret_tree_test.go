@@ -4393,27 +4393,55 @@ func TestMessageKeyDoesNotConsumeUntilErased(t *testing.T) {
 // TestEraseMessageKeyZeroizesTheEntry asserts the erase clears the BYTES rather than only
 // dropping the map entry, which is the whole point of it existing.
 //
-// The three guards before the erase are what stop this from holding against an implementation
-// that answers nothing: a key of the wrong width, a key that was already zeros, or a key and a
-// nonce that are one array would all satisfy a pair of "is every byte zero" loops.
+// It reads the window's own slices rather than the pair MessageKey answered with. That pair is
+// a COPY -- see MessageKey, where handing the entry's storage out is what let one holder's
+// erase turn another holder's key into zeros -- and a copy is the wrong instrument for this
+// question: it goes on reading its own untouched bytes whether the entry behind it was erased
+// or merely dropped, which is exactly the difference this test exists to see. The alias taken
+// out of the window is the only thing that can tell the two apart, for the reason
+// TestZeroizeErasesTheRetainedWindowKeysInPlace gives.
+//
+// The guards before the erase are what stop this from holding against an implementation that
+// answers nothing: a key of the wrong width, a key that was already zeros, a key and a nonce
+// that are one array, or an answer that turned out to BE the entry would each satisfy a pair
+// of "is every byte zero" loops.
 func TestEraseMessageKeyZeroizesTheEntry(t *testing.T) {
 	crypto := stTestCrypto(t)
 	tree := stNewTree(t, 8)
-	key, nonce, err := tree.MessageKey(ContentTypeCommit, 4, 1)
+	const leaf = LeafIndex(4)
+	const generation = uint32(1)
+	answered, answeredNonce, err := tree.MessageKey(ContentTypeCommit, leaf, generation)
 	if err != nil {
 		t.Fatalf("MessageKey: %v", err)
 	}
+	r, err := tree.ratchetFor(leaf, RatchetHandshake)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	entry, retained := r.window[generation]
+	if !retained {
+		t.Fatalf("generation %d is not in the window after a lookup that does not consume, so there is nothing here for the erase to clear", generation)
+	}
+	key, nonce := entry.key, entry.nonce
 	if len(key) != crypto.KeySize() || len(nonce) != crypto.NonceSize() {
-		t.Fatalf("MessageKey answered a %d byte key and a %d byte nonce, want %d and %d",
+		t.Fatalf("the retained entry holds a %d byte key and a %d byte nonce, want %d and %d",
 			len(key), len(nonce), crypto.KeySize(), crypto.NonceSize())
 	}
 	if stAllZero(key) || stAllZero(nonce) {
-		t.Fatal("the key or nonce was already all zeros before the erase, so the assertions below hold against an implementation that never derived anything")
+		t.Fatal("the entry's key or nonce was already all zeros before the erase, so the assertions below hold against an implementation that never derived anything")
 	}
 	if ksSharesStorage(key, nonce) {
 		t.Fatal("the key and the nonce share storage, so one erase would read as two")
 	}
-	tree.EraseMessageKey(ContentTypeCommit, 4, 1)
+	if !bytes.Equal(key, answered) || !bytes.Equal(nonce, answeredNonce) {
+		t.Fatal("the pair MessageKey answered with is not the entry it was taken from, so this test is erasing something the caller was never given")
+	}
+	if ksSharesStorage(key, answered) || ksSharesStorage(nonce, answeredNonce) {
+		t.Fatal("MessageKey answered with the window's own storage rather than a copy of it; see TestMessageKeyDoesNotHandTwoHoldersOneArrayOfKeyBytes for what that costs")
+	}
+
+	tree.EraseMessageKey(ContentTypeCommit, leaf, generation)
+
 	for i, b := range key {
 		if b != 0 {
 			t.Fatalf("key byte %d = %d after erase, want 0", i, b)
@@ -4423,6 +4451,10 @@ func TestEraseMessageKeyZeroizesTheEntry(t *testing.T) {
 		if b != 0 {
 			t.Fatalf("nonce byte %d = %d after erase, want 0", i, b)
 		}
+	}
+	// and the entry is unreachable as well as erased, so neither half stands in for the other.
+	if _, still := r.window[generation]; still {
+		t.Fatalf("generation %d is still in the window after the erase", generation)
 	}
 }
 
@@ -4867,5 +4899,361 @@ func TestSenderDataKeyNonceReadsBothLengthsOffTheProviderItWasHanded(t *testing.
 		bytes.Equal(nonce, truncated[:len(nonce)]) {
 		t.Errorf("sender_data_nonce is the first %d bytes of a 12 byte expansion rather than an expansion of %d",
 			len(nonce), ksWelcomeSyntheticParams.Nn)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the storage a key source hands back, and who is allowed to write through it
+// ---------------------------------------------------------------------------
+
+// stKeySourceRow is one exported method of *SecretTree that answers key material, and a call
+// that drives it far enough to answer.
+type stKeySourceRow struct {
+	name string
+	call func(t *testing.T, tree *SecretTree) (key []byte, nonce []byte)
+}
+
+// stKeySourceRows is the table, one row per member of the class stMethodsAnsweringBytes
+// derives.
+//
+// It is not what decides the class. A method answering bytes with no row here is a failure of
+// the gate below rather than a member quietly left out, which is the difference between
+// sweeping a class and sweeping a copy of it: this package has measured a hand written list
+// understating the real one more times than it has measured anything else.
+func stKeySourceRows() []stKeySourceRow {
+	return []stKeySourceRow{
+		{name: "MessageKey", call: func(t *testing.T, tree *SecretTree) ([]byte, []byte) {
+			t.Helper()
+			key, nonce, err := tree.MessageKey(ContentTypeApplication, 2, 3)
+			if err != nil {
+				t.Fatalf("MessageKey: %v", err)
+			}
+			return key, nonce
+		}},
+		{name: "NextMessageKey", call: func(t *testing.T, tree *SecretTree) ([]byte, []byte) {
+			t.Helper()
+			key, nonce, _, err := tree.NextMessageKey(ContentTypeCommit, 2)
+			if err != nil {
+				t.Fatalf("NextMessageKey: %v", err)
+			}
+			return key, nonce
+		}},
+		{name: "NextSenderKey", call: func(t *testing.T, tree *SecretTree) ([]byte, []byte) {
+			t.Helper()
+			_, key, nonce, err := tree.NextSenderKey(2, RatchetApplication)
+			if err != nil {
+				t.Fatalf("NextSenderKey: %v", err)
+			}
+			return key, nonce
+		}},
+		{name: "ReceiverKey", call: func(t *testing.T, tree *SecretTree) ([]byte, []byte) {
+			t.Helper()
+			key, nonce, err := tree.ReceiverKey(2, RatchetHandshake, 3)
+			if err != nil {
+				t.Fatalf("ReceiverKey: %v", err)
+			}
+			return key, nonce
+		}},
+	}
+}
+
+// stMethodsAnsweringBytes is every exported method of *SecretTree whose results include a
+// []byte, read off the compiled type rather than typed out.
+//
+// The reading is reflect's rather than the source's on purpose: what a caller can be handed is
+// what the METHOD SET offers, so a key source added under a name nobody thought to write down
+// here is a member of this class the moment it compiles. Absence is fatal, for the reason
+// every other derivation in this package is: a filter that stopped matching leaves the gate
+// reading it demanding nothing, and a gate that demands nothing reports exactly what a
+// complete one reports.
+func stMethodsAnsweringBytes(t *testing.T) []string {
+	t.Helper()
+	tree := reflect.TypeOf(&SecretTree{})
+	byteSlice := reflect.TypeOf([]byte(nil))
+	names := []string{}
+	for i := 0; i < tree.NumMethod(); i++ {
+		method := tree.Method(i)
+		for result := 0; result < method.Type.NumOut(); result++ {
+			if method.Type.Out(result) == byteSlice {
+				names = append(names, method.Name)
+				break
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("no exported method of *SecretTree answers a []byte, so the gate reading this demands nothing")
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestEveryExportedKeySourceHandsTheCallerStorageTheTreeNeverWritesThrough sweeps the methods
+// that answer key material and holds every one of them to the same rule: what comes back is
+// the caller's own storage, and no later call of this type writes through it.
+//
+// The rule is not a nicety. Three of this type's operations zeroize retained key material IN
+// PLACE -- EraseMessageKey, the tree wide bound's eviction, and Zeroize -- so a method that
+// answers with a slice the tree can still reach through its own maps has handed the caller
+// bytes that a later, unrelated call silently turns into Nk zeros, with the nil error it was
+// already given standing. And because every exported method here takes stateLock while the
+// caller reads its answer without one, the same aliasing is an unsynchronised write to key
+// bytes another goroutine is reading.
+//
+// Zeroize is the disturbance because it is the widest one the type has: it erases every
+// ratchet secret and every retained window entry, so a method answering with storage the tree
+// still reaches fails here whichever map that storage is reachable through, rather than only
+// for the one path a purpose built probe happened to walk.
+//
+// Measured, not supposed: with MessageKey answering keys.key and keys.nonce straight out of
+// the window entry it deliberately leaves behind, this gate fails on that row and passes on
+// the other three -- which is the exact shape of the defect. ReceiverKey is safe because
+// keyFor deletes the entry as it returns it, and the two sender paths are safe because step's
+// keys never enter a window at all.
+func TestEveryExportedKeySourceHandsTheCallerStorageTheTreeNeverWritesThrough(t *testing.T) {
+	crypto := stTestCrypto(t)
+	rows := stKeySourceRows()
+	driven := []string{}
+	for _, row := range rows {
+		driven = append(driven, row.name)
+	}
+	slices.Sort(driven)
+	if class := stMethodsAnsweringBytes(t); !slices.Equal(driven, class) {
+		t.Fatalf("this gate drives %v and the exported methods of *SecretTree answering a []byte are %v; a key source with no row here is a member of the class that nothing sweeps",
+			driven, class)
+	}
+	for _, row := range rows {
+		tree := stNewTree(t, 8)
+		key, nonce := row.call(t, tree)
+		if len(key) != crypto.KeySize() || len(nonce) != crypto.NonceSize() {
+			t.Fatalf("%s answered a %d byte key and a %d byte nonce, want %d and %d",
+				row.name, len(key), len(nonce), crypto.KeySize(), crypto.NonceSize())
+		}
+		if stAllZero(key) || stAllZero(nonce) {
+			t.Fatalf("%s answered zeros before anything had been erased, so the comparison below would hold for an implementation that answers nothing", row.name)
+		}
+		if ksSharesStorage(key, nonce) {
+			t.Fatalf("%s answered a key and a nonce over one array, so one erase would reach both", row.name)
+		}
+		wasKey, wasNonce := bytes.Clone(key), bytes.Clone(nonce)
+
+		tree.Zeroize()
+
+		if !bytes.Equal(key, wasKey) {
+			t.Errorf("%s answered with storage Zeroize wrote through: the caller was handed %x and now holds %x",
+				row.name, wasKey, key)
+		}
+		if !bytes.Equal(nonce, wasNonce) {
+			t.Errorf("%s answered with nonce storage Zeroize wrote through: the caller was handed %x and now holds %x",
+				row.name, wasNonce, nonce)
+		}
+	}
+}
+
+// TestMessageKeyDoesNotHandTwoHoldersOneArrayOfKeyBytes is the repeatable lookup's own half of
+// that rule, and it is the one MessageKey alone can fail.
+//
+// MessageKey is the only key source here that leaves the generation in the window, so it is
+// the only one that can answer the same question twice -- and answering it out of the entry
+// would give both holders one array. The pair is "look up, open, erase", so two holders is not
+// hypothetical: it is a worker pool opening two copies of one message, and the erase either of
+// them makes when it is done is then a write into the other's key.
+func TestMessageKeyDoesNotHandTwoHoldersOneArrayOfKeyBytes(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(3)
+	const generation = uint32(2)
+	first, firstNonce, err := tree.MessageKey(ContentTypeApplication, leaf, generation)
+	if err != nil {
+		t.Fatalf("MessageKey: %v", err)
+	}
+	second, secondNonce, err := tree.MessageKey(ContentTypeApplication, leaf, generation)
+	if err != nil {
+		t.Fatalf("second MessageKey: %v", err)
+	}
+	if stAllZero(first) || stAllZero(firstNonce) {
+		t.Fatal("the lookup answered zeros, so every comparison below holds against an implementation that answers nothing")
+	}
+	if !bytes.Equal(first, second) || !bytes.Equal(firstNonce, secondNonce) {
+		t.Fatal("two lookups of one generation disagreed, so the two holders below are not holding one key")
+	}
+	if ksSharesStorage(first, second) {
+		t.Fatal("two lookups of one generation were handed one array of key bytes, so either holder's erase writes into the other's key")
+	}
+	if ksSharesStorage(firstNonce, secondNonce) {
+		t.Fatal("two lookups of one generation were handed one array of nonce bytes")
+	}
+
+	// the erase one holder makes when its message has opened, which is the call the pair is
+	// built around, must not be a write into what the other holder was told is its key.
+	wasKey, wasNonce := bytes.Clone(first), bytes.Clone(firstNonce)
+	tree.EraseMessageKey(ContentTypeApplication, leaf, generation)
+
+	if !bytes.Equal(first, wasKey) || !bytes.Equal(second, wasKey) {
+		t.Errorf("one holder's erase rewrote the other's key: the holders were handed %x and now hold %x and %x",
+			wasKey, first, second)
+	}
+	if !bytes.Equal(firstNonce, wasNonce) || !bytes.Equal(secondNonce, wasNonce) {
+		t.Errorf("one holder's erase rewrote the other's nonce: the holders were handed %x and now hold %x and %x",
+			wasNonce, firstNonce, secondNonce)
+	}
+}
+
+// stFillPastTheRetainedBound takes a tree to exactly one retained key past
+// MaxRetainedWindowKeys, with generation 0 of the leaf's APPLICATION ratchet as the oldest
+// entry of the fullest window, and answers that ratchet.
+//
+// The state is built through the ratchets themselves rather than through more lookups, and
+// that is the difference between the two tests below observing what they are named for and
+// reporting a setup failure. A setup built out of the call under test cannot outlive a change
+// to that call: measured, with MessageKey's tree wide bound moved from the way in to the way
+// out, the tree never stands over the bound between calls at all, so a setup that filled it
+// with lookups failed at its own guard and said nothing about the key material handed back.
+//
+// Nothing here is a state a peer cannot reach. peekFor is what a header naming a leaf and a
+// generation reaches, in both orderings and with no authentication anywhere: the exported path
+// differs only in when the bound is applied on top of it.
+func stFillPastTheRetainedBound(t *testing.T, tree *SecretTree, leaf LeafIndex) *ratchet {
+	t.Helper()
+	application, err := tree.ratchetFor(leaf, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor(application): %v", err)
+	}
+	// the target of a skip is the one entry the per ratchet prune does not count, so a skip to
+	// MaxRetainedWindowKeys-1 retains the whole run from generation 0.
+	if _, err := application.peekFor(uint32(MaxRetainedWindowKeys) - 1); err != nil {
+		t.Fatalf("peekFor(%d): %v", MaxRetainedWindowKeys-1, err)
+	}
+	if len(application.window) != MaxRetainedWindowKeys {
+		t.Fatalf("this ratchet retains %d generations and the tests reading this need exactly %d",
+			len(application.window), MaxRetainedWindowKeys)
+	}
+	if _, oldest := application.window[0]; !oldest {
+		t.Fatal("generation 0 is not retained, so it is not the entry a tree wide eviction would take")
+	}
+	// one key retained on another ratchet puts the tree past the bound while leaving the
+	// application ratchet the fullest, so the eviction takes from it rather than from the
+	// window that grew last.
+	handshake, err := tree.ratchetFor(leaf, RatchetHandshake)
+	if err != nil {
+		t.Fatalf("ratchetFor(handshake): %v", err)
+	}
+	if _, err := handshake.peekFor(0); err != nil {
+		t.Fatalf("peekFor(handshake, 0): %v", err)
+	}
+	if retained := stTotalRetainedWindowKeys(tree); retained != MaxRetainedWindowKeys+1 {
+		t.Fatalf("the tree retains %d generation keys and the tests reading this need exactly %d, one past the bound",
+			retained, MaxRetainedWindowKeys+1)
+	}
+	return application
+}
+
+// TestARetainedBoundEvictionDoesNotWriteThroughAKeyAlreadyHandedBack is the third writer, and
+// the one no caller of MessageKey can see coming.
+//
+// EraseMessageKey is at least the holder's own call. This one is not: a generation retained
+// for a message that has not been opened yet is evicted -- and zeroized -- by a LATER lookup
+// of an unrelated generation, because the tree wide bound holds the whole tree's retained keys
+// to MaxRetainedWindowKeys and takes from the fullest ratchet. A caller handed the entry's own
+// storage therefore watches its key turn to zeros between the lookup and the open, with
+// nothing having failed and nothing having been reported.
+func TestARetainedBoundEvictionDoesNotWriteThroughAKeyAlreadyHandedBack(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(0)
+	held, heldNonce, err := tree.MessageKey(ContentTypeApplication, leaf, 0)
+	if err != nil {
+		t.Fatalf("MessageKey(0): %v", err)
+	}
+	if stAllZero(held) || stAllZero(heldNonce) {
+		t.Fatal("the lookup answered zeros, so the comparison below holds against an implementation that answers nothing")
+	}
+	wasKey, wasNonce := bytes.Clone(held), bytes.Clone(heldNonce)
+
+	application := stFillPastTheRetainedBound(t, tree, leaf)
+
+	// the next lookup applies the bound, and what it takes is the oldest generation of the
+	// fullest ratchet -- which is the generation still being held above.
+	if _, _, err := tree.MessageKey(ContentTypeApplication, leaf, uint32(MaxRetainedWindowKeys)); err != nil {
+		t.Fatalf("MessageKey(%d): %v", MaxRetainedWindowKeys, err)
+	}
+	if _, still := application.window[0]; still {
+		t.Fatal("generation 0 survived a lookup made with the tree past the bound, so this test observed no eviction at all")
+	}
+
+	if !bytes.Equal(held, wasKey) {
+		t.Errorf("the tree wide eviction wrote through a key already handed back: the caller was given %x and now holds %x",
+			wasKey, held)
+	}
+	if !bytes.Equal(heldNonce, wasNonce) {
+		t.Errorf("the tree wide eviction wrote through a nonce already handed back: the caller was given %x and now holds %x",
+			wasNonce, heldNonce)
+	}
+}
+
+// TestMessageKeyNeverAnswersWithKeyMaterialTheRetainedBoundHasZeroized observes the ORDER
+// MessageKey applies the tree wide bound in, which its own comment argues at length and which
+// nothing in this package could see.
+//
+// The bound evicts by zeroizing in place. Applied before the lookup, it can only reach keys
+// that already existed; applied after it, the entry it takes can be the very one the lookup
+// just found, and what the caller is handed is then Nk zero bytes and a NIL ERROR -- a key
+// every party in the world can compute, presented as this sender's. That is the one outcome
+// this path is written to make impossible, and it is what a refactor reading "apply the bound
+// on the way out" reintroduces in one line.
+//
+// Measured, not supposed: with self.pruneRetained() moved from the top of MessageKey to the
+// line before its return, all 658 tests of this package passed. The tree wide bound test
+// cannot see it either -- with the prune moved, the retained total ends up UNDER the ceiling
+// that test asserts, so it reads the move as an implementation that bounds harder.
+//
+// The state this needs is generation 0 sitting as the oldest entry of the fullest ratchet with
+// the tree one key past the bound, so the eviction picks exactly the generation being asked
+// for. It is built by stFillPastTheRetainedBound rather than out of lookups, for the reason
+// that helper gives.
+//
+// The oracle is an independent tree over the same encryption secret. Without it "the answer is
+// not zeros" is the whole assertion, and a build answering some other generation's key would
+// satisfy it.
+func TestMessageKeyNeverAnswersWithKeyMaterialTheRetainedBoundHasZeroized(t *testing.T) {
+	const leaf = LeafIndex(0)
+	oracle := stNewTree(t, 8)
+	trueKey, trueNonce, err := oracle.ReceiverKey(leaf, RatchetApplication, 0)
+	if err != nil {
+		t.Fatalf("the oracle's ReceiverKey: %v", err)
+	}
+	if stAllZero(trueKey) || stAllZero(trueNonce) {
+		t.Fatal("the oracle answered zeros for generation 0, so every comparison below is against nothing")
+	}
+
+	tree := stNewTree(t, 8)
+	key, nonce, err := tree.MessageKey(ContentTypeApplication, leaf, 0)
+	if err != nil {
+		t.Fatalf("MessageKey(0): %v", err)
+	}
+	if !bytes.Equal(key, trueKey) || !bytes.Equal(nonce, trueNonce) {
+		t.Fatal("the tree and the oracle disagree on generation 0 before anything was evicted, so the comparison below is not comparing keys")
+	}
+
+	application := stFillPastTheRetainedBound(t, tree, leaf)
+
+	// the lookup this test is written for. Generation 0 is the oldest entry of the fullest
+	// ratchet, so the bound evicts and zeroizes precisely the entry being asked for.
+	answered, answeredNonce, err := tree.MessageKey(ContentTypeApplication, leaf, 0)
+	if _, still := application.window[0]; still {
+		t.Fatal("generation 0 survived a lookup made with the tree past the bound, so this test observed no eviction of the entry it asks for")
+	}
+	if err != nil {
+		// the honest answer: the bound took the key before the lookup reached it, and a
+		// refusal says so. What is forbidden is answering anyway.
+		if !errors.Is(err, ErrRatchetGenerationConsumed) {
+			t.Errorf("MessageKey refused the evicted generation with %v, want ErrRatchetGenerationConsumed", err)
+		}
+		return
+	}
+	if stAllZero(answered) || stAllZero(answeredNonce) {
+		t.Fatalf("MessageKey answered key %x and nonce %x with a NIL ERROR after the bound zeroized that entry; the bound is being applied on the way out, and zeros are a key every party in the world can compute",
+			answered, answeredNonce)
+	}
+	if !bytes.Equal(answered, trueKey) || !bytes.Equal(answeredNonce, trueNonce) {
+		t.Errorf("MessageKey answered %x and %x for generation 0, and generation 0's key and nonce are %x and %x",
+			answered, answeredNonce, trueKey, trueNonce)
 	}
 }

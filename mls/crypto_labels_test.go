@@ -3421,11 +3421,20 @@ var mlsEncryptContextStatements = []string{
 	"return mlsLabelBytes(writer)",
 }
 
+// The two labelled constructions, each a refusal and one call.
+//
+// The refusal is pinned with the call rather than trimmed off it, because a statement list
+// that skipped a leading guard would be a list a second guard could hide in. What it says is
+// the class rule ErrNilCryptoProvider carries: the provider is refused before anything reads a
+// method off it, and here that is the whole body. The controls below carry the same refusal,
+// so each of them still differs from its pin in exactly the one way it was written to differ.
 var encryptWithLabelStatements = []string{
+	"if crypto == nil {\n\treturn nil, nil, fmt.Errorf(\"%w: the seal is the provider's HPKE\", ErrNilCryptoProvider)\n}",
 	"return crypto.HpkeSeal(pub, mlsEncryptContext(label, context), nil, plaintext)",
 }
 
 var decryptWithLabelStatements = []string{
+	"if crypto == nil {\n\treturn nil, fmt.Errorf(\"%w: the open is the provider's HPKE\", ErrNilCryptoProvider)\n}",
 	"return crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)",
 }
 
@@ -3498,6 +3507,9 @@ func (self *suiteCryptoProvider) HpkeSeal(pub HpkePublicKey, info []byte, aad []
 const aadCarryingEncryptControl = `package mls
 
 func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, context []byte, plaintext []byte) ([]byte, []byte, error) {
+	if crypto == nil {
+		return nil, nil, fmt.Errorf("%w: the seal is the provider's HPKE", ErrNilCryptoProvider)
+	}
 	return crypto.HpkeSeal(pub, nil, mlsEncryptContext(label, context), plaintext)
 }
 `
@@ -3509,6 +3521,9 @@ func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, co
 const errorDiscardingDecryptControl = `package mls
 
 func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, context []byte, kemOutput []byte, ciphertext []byte) ([]byte, error) {
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the open is the provider's HPKE", ErrNilCryptoProvider)
+	}
 	plaintext, _ := crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)
 	return plaintext, nil
 }

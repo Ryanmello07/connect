@@ -26,6 +26,7 @@ package mls
 import (
 	"bytes"
 	"crypto/ed25519"
+	"fmt"
 	"io"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -311,6 +312,9 @@ func mlsEncryptContext(label string, context []byte) []byte {
 // The flat pair rather than an *HpkeCiphertext: that shape belongs beside the TreeKEM type
 // it would return, and this package declares no TreeKEM types.
 func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, context []byte, plaintext []byte) ([]byte, []byte, error) {
+	if crypto == nil {
+		return nil, nil, fmt.Errorf("%w: the seal is the provider's HPKE", ErrNilCryptoProvider)
+	}
 	return crypto.HpkeSeal(pub, mlsEncryptContext(label, context), nil, plaintext)
 }
 
@@ -329,5 +333,8 @@ func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, co
 // caller reading the slice rather than the error accepts every forgery of exactly tag
 // length.
 func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, context []byte, kemOutput []byte, ciphertext []byte) ([]byte, error) {
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the open is the provider's HPKE", ErrNilCryptoProvider)
+	}
 	return crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)
 }

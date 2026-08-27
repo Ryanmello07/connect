@@ -538,9 +538,13 @@ func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
 // reaches can see the difference, and this package has already measured that shape passing
 // every test it had.
 //
-// The noinline directive is this package's erase-helper class: the window map outlives the
-// call, and the directive keeps the store inside zeroizeSecret across a boundary the compiler
-// cannot see through.
+// The noinline directive is this package's erase-helper class, and this function is a member
+// of that class through the HAND-OFF rather than through a write it spells: the window map
+// outlives the call, the entry read out of it with a comma ok read is that same storage, and
+// zeroizeSecret is where the stores are. TestEveryEraseHelperCarriesTheNoInlineDirective
+// derives the class transitively for exactly this reason. Until it did, this sentence named an
+// enforcement that was not there: deleting the directive from the line below was invisible to
+// all 526 tests of this package.
 //
 //go:noinline
 func (self *ratchet) eraseKey(generation uint32) {
@@ -566,9 +570,15 @@ func (self *ratchet) eraseKey(generation uint32) {
 // on one path and missing on the other -- and both reach it through eraseKey, so the third
 // way an entry leaves the window cannot be present on one path and missing there either.
 //
-// The noinline directive is this package's erase-helper class, carried here and on eraseKey
-// both: the window map outlives either call, and the directive keeps the store inside
-// zeroizeSecret across a boundary the compiler cannot see through.
+// The noinline directive is carried here by the same convention, and this function is the one
+// place that convention runs ahead of the gate: the erasure it performs is eraseKey's, reached
+// through a method call on the same receiver, and
+// TestEveryEraseHelperCarriesTheNoInlineDirective follows the hand-off through ARGUMENTS only.
+// Counting receivers would close the class over every exported method of this type that erases
+// anything anywhere, MessageKey and ReceiverKey included, and what separates those from an
+// erase helper is intent, which no matcher reads. So the line is drawn where a name is handed
+// over, and this paragraph says which side of it this function is on rather than claiming a
+// membership it does not have.
 //
 //go:noinline
 func (self *ratchet) evictOldest() {
@@ -838,6 +848,15 @@ func (self *SecretTree) SenderGeneration(leaf LeafIndex, kind RatchetType) (uint
 // and ratchet secrets are all Nh zero bytes and whose methods all still answer, and the
 // answers would be keys derived from a value every party in the world can compute, handed
 // back with no error. Erasing and refusing are one operation here for that reason.
+//
+// The noinline directive is this package's erase-helper class. Every store this method makes
+// is inside zeroizeSecret and inside the ratchet's own zeroize, reached with storage of this
+// object handed over as an argument, which is what makes it a member of the class
+// TestEveryEraseHelperCarriesTheNoInlineDirective derives -- the same membership the gate's
+// own comment named as the shape it exists for, and did not hold until the class was closed
+// under the hand-off.
+//
+//go:noinline
 func (self *SecretTree) Zeroize() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -925,17 +944,42 @@ func (self *SecretTree) NextMessageKey(contentType ContentType, leaf LeafIndex) 
 // message needs. ReceiverKey is the consuming form and keeps its single use semantics,
 // because it has no erase counterpart.
 //
-// The tree wide retained bound is applied on the way IN rather than on the way out, which is
-// the one place this differs from ReceiverKey. Both paths retain every generation they step
-// past, and both are reachable by anyone who can put a leaf index and a generation number in
-// a header, so neither may leave the aggregate unbounded -- without it a peer materialises
-// every leaf's two ratchets and fills every one of their windows from headers that never had
-// to be authentic, which is a number multiplied by the group size rather than a bound. But
-// the answer here STAYS in the window until the caller erases it, and pruneRetained zeroizes
-// what it evicts, so a bound applied afterwards could hand back Nk zero bytes with a nil
-// error. Applied first, the eviction cannot reach a key that does not exist yet, and what the
-// receiver retains is at most MaxRetainedWindowKeys plus the single ratchet this call
-// advanced -- a constant, and still not a multiple of the group size.
+// The pair is COPIED out of the window rather than handed out of it, and that is a
+// consequence of the sentence above rather than caution. Every other key source on this type
+// answers with storage nothing else names -- step's keys never enter a window, and keyFor
+// deletes the entry as it returns it -- but this one deliberately leaves the entry where it
+// is, so the slices inside it are still reachable from the lock guarded map after the lock is
+// dropped. Handing those slices out puts the caller's key bytes under three later writers,
+// each of which zeroizes IN PLACE: EraseMessageKey for the same generation, pruneRetained
+// evicting it, and Zeroize at the end of the epoch. Measured on the shape this replaces: two
+// lookups of one generation were handed ONE array, so an erase by either holder turned the
+// other's key into Nk zero bytes it had already been told were good; and a holder of
+// generation 0 watched its key go to zero when a later lookup pushed the tree past
+// MaxRetainedWindowKeys. Both come back with a nil error, which is the same defect the
+// ordering below exists to prevent, reached from the other end. This type is built for
+// concurrent callers -- see the lock discipline gate -- so the aliasing is also a write to
+// key bytes another goroutine is reading, outside stateLock and outside anything the race
+// detector could attribute to a caller.
+//
+// What the copy does not do is erase itself. The window's entry is still zeroized by
+// EraseMessageKey, and the copy is the caller's to drop -- exactly the terms NextSenderKey's
+// and ReceiverKey's answers already come on, which is the point: one rule for every key this
+// type hands out rather than one method with its own.
+//
+// The tree wide retained bound is applied on the way IN rather than on the way out. Both
+// paths retain every generation they step past, and both are reachable by anyone who can put
+// a leaf index and a generation number in a header, so neither may leave the aggregate
+// unbounded -- without it a peer materialises every leaf's two ratchets and fills every one
+// of their windows from headers that never had to be authentic, which is a number multiplied
+// by the group size rather than a bound. But the answer here STAYS in the window until the
+// caller erases it, and pruneRetained zeroizes what it evicts, so a bound applied afterwards
+// could hand back Nk zero bytes with a nil error: the copy is taken from the entry, and an
+// entry evicted between the lookup and the copy is copied as zeros. Applied first, the
+// eviction cannot reach a key that does not exist yet, and what the receiver retains is at
+// most MaxRetainedWindowKeys plus the single ratchet this call advanced -- a constant, and
+// still not a multiple of the group size. The ordering is observed by
+// TestMessageKeyNeverAnswersWithKeyMaterialTheRetainedBoundHasZeroized rather than argued for
+// here; it survived this file having only the paragraph.
 func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -955,7 +999,7 @@ func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, gene
 	if err != nil {
 		return nil, nil, err
 	}
-	return keys.key, keys.nonce, nil
+	return append([]byte(nil), keys.key...), append([]byte(nil), keys.nonce...), nil
 }
 
 // EraseMessageKey is the forward secrecy erase the framing layer's replay guard is built on:
@@ -1014,6 +1058,9 @@ func (self *SecretTree) EraseMessageKey(contentType ContentType, leaf LeafIndex,
 // of the provider are indistinguishable -- which is what the synthetic suite in this
 // construction's own width test exists to separate.
 func SenderDataKeyNonce(crypto CryptoProvider, senderDataSecret []byte, ciphertext []byte) (key []byte, nonce []byte, err error) {
+	if crypto == nil {
+		return nil, nil, fmt.Errorf("%w: the sender data key and nonce are two expansions through it", ErrNilCryptoProvider)
+	}
 	nh := crypto.HashSize()
 	if len(senderDataSecret) != nh {
 		return nil, nil, fmt.Errorf("%w: sender data secret is %d bytes, want %d",
