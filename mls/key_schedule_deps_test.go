@@ -107,6 +107,22 @@ var (
 	_ []byte          = GroupContext{}.TreeHash
 	_ []byte          = GroupContext{}.ConfirmedTranscriptHash
 	_ []Extension     = GroupContext{}.Extensions
+
+	// this plan, task 13 — every field of PreSharedKeyId at the registry's type, written
+	// out one line each for the same reason GroupContext's block is: a field ADDED shows
+	// up as a line missing here rather than as a widening nobody reads. The two enums are
+	// pinned through a 0xff conversion, which is a compile error the moment either is
+	// widened past the octet the wire format gives it — an assignment of a small constant
+	// would not catch that, and a psktype written at two octets moves every byte of a
+	// psk_secret preimage.
+	_ PskType            = PskType(0xff)
+	_ ResumptionPskUsage = ResumptionPskUsage(0xff)
+	_ PskType            = PreSharedKeyId{}.PskType
+	_ []byte             = PreSharedKeyId{}.PskId
+	_ ResumptionPskUsage = PreSharedKeyId{}.Usage
+	_ []byte             = PreSharedKeyId{}.PskGroupId
+	_ uint64             = PreSharedKeyId{}.PskEpoch
+	_ []byte             = PreSharedKeyId{}.PskNonce
 )
 
 // pinnedCodec exists only to carry the C1 method set. Declaring the two methods and then
@@ -127,12 +143,13 @@ var (
 	_ syntax.Unmarshaler = (*pinnedCodec)(nil)
 	_ syntax.Codec       = (*pinnedCodec)(nil)
 
-	// the two structures of this plan that have landed carry the same method set. Their
+	// the three structures of this plan that have landed carry the same method set. Their
 	// own files assert this too; repeating it here is deliberate, because the assertion
 	// in a production file is one an author fixing a build failure can delete, and this
 	// file is counted.
 	_ syntax.Codec = (*Extension)(nil)
 	_ syntax.Codec = (*GroupContext)(nil)
+	_ syntax.Codec = (*PreSharedKeyId)(nil)
 )
 
 // TestConsumedCryptoProviderShape pins the CryptoProvider method set this plan calls,
@@ -354,9 +371,10 @@ func readVectorManifest(t *testing.T) map[string]string {
 // call them is written by later tasks. What IS derived is whether each has landed, which
 // is read from the package's own syntax tree below rather than kept as a boolean here.
 //
-// GroupContext and PreSharedKeyId are this plan's own, from tasks 3 and 13. They are in
-// the same list for the same reason: the moment either exists, this file owes it the
-// var _ syntax.Codec pin the plan's task 1 block carries.
+// GroupContext and PreSharedKeyId are this plan's own, from tasks 3 and 13, and both have
+// now landed and been answered with the var _ syntax.Codec pin the plan's task 1 block
+// carries plus a field by field pin above. They were in this list for the same reason
+// every cross plan name is: the moment a type exists, this file owes it that pin.
 var crossPlanSymbolsNotYetLanded = map[string]string{
 	"LeafIndex":              "p3 tree math",
 	"NodeIndex":              "p3 tree math",
@@ -384,7 +402,6 @@ var crossPlanSymbolsNotYetLanded = map[string]string{
 	"LoadVectorFile":         "p8 validation and interop",
 	"MustHex":                "p8 validation and interop",
 	"HexOf":                  "p8 validation and interop",
-	"PreSharedKeyId":         "this plan, task 13",
 }
 
 // TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere fails when a producing plan merges
@@ -400,8 +417,8 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 	// removes the only thing that will notice its symbol landing, and deleting it is the
 	// cheapest way to quieten this test. answering an entry properly is a pin written
 	// above, the entry deleted, and this number decremented in the same commit.
-	if len(crossPlanSymbolsNotYetLanded) != 27 {
-		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 27; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
+	if len(crossPlanSymbolsNotYetLanded) != 26 {
+		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 26 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
 			len(crossPlanSymbolsNotYetLanded))
 	}
 	declared := packageLevelDeclarations(t, ".")
@@ -525,7 +542,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 34,
+	"key_schedule_deps_test.go": 43,
 	"pins_test.go":              8,
 }
 
