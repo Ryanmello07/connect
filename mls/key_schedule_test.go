@@ -1987,17 +1987,40 @@ var keyScheduleMethodArgumentRows = map[string]func(schedule *KeySchedule) [][]r
 	},
 }
 
+// exposedAnswerAt names one answer of one method: the method, and the position of the result
+// it came out of.
+//
+// The position is what makes an excuse per ANSWER rather than per METHOD. ExternalKeyPair
+// answers a private key at Nsk and a public key at Npk, neither of which is a kdf length, and
+// an excuse keyed on the method alone would go on covering a THIRD answer that is one. The two
+// results it has today each carry their own line, and a result added to it is excused by
+// nobody until somebody writes one.
+type exposedAnswerAt struct {
+	method string
+	result int
+}
+
+func (self exposedAnswerAt) String() string {
+	return fmt.Sprintf("(*KeySchedule).%s result %d", self.method, self.result)
+}
+
 // exposedSlice is one byte slice a sweep read off an exported surface, with the method it
-// came out of and the path inside that method's answer.
+// came out of, the position of the result it came out of, and the path inside that result.
 //
 // The provenance travels with the bytes because the sweeps reading these want different
 // subsets of them: guardrail 6 asks about every one, and the KDF.Nh differential next door
-// has to leave out the answers that are not kdf lengths at all. Carrying the name is what
+// has to leave out the answers that are not kdf lengths at all. Carrying the address is what
 // lets that second sweep say what it dropped instead of dropping by position.
 type exposedSlice struct {
 	method string
+	result int
 	path   string
 	bytes  []byte
+}
+
+// at is the address the excuse tables below are keyed by.
+func (self exposedSlice) at() exposedAnswerAt {
+	return exposedAnswerAt{method: self.method, result: self.result}
 }
 
 // exposedBytes is the byte slices alone, in order, for a sweep that does not care where each
@@ -2177,9 +2200,10 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 		}
 		swept = append(swept, method.Name)
 		for _, row := range rows {
-			for _, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(schedule)}, row...)) {
+			for index, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(schedule)}, row...)) {
 				for _, one := range exposedByteSlices(t, "(*KeySchedule)."+method.Name, result) {
 					one.method = method.Name
+					one.result = index
 					exposed = append(exposed, one)
 				}
 			}
@@ -2534,7 +2558,7 @@ func bytesTheAnswerHandsOut(t *testing.T, at string, name string, results []refl
 // closes the hole the type level sweep alone left: a package level
 // func EpochSecretOf(schedule *KeySchedule) []byte compiles, is exported, is exactly the leak
 // G6 forbids, and is nowhere in a reflection over (*KeySchedule)'s methods. Measured, not
-// supposed: appended to key_schedule.go it passed all 5132 tests of mls and message.
+// supposed: appended to key_schedule.go it left the whole of mls and message green.
 //
 // NewKeyScheduleFromEpochSecret is driven with the independently derived epoch secret itself
 // rather than with an arbitrary sample, so the schedule under it holds the exact value the
@@ -2565,7 +2589,7 @@ var epochSecretSurfaceRows = map[string]func(t *testing.T, epoch ksVectorEpoch) 
 // unexported field, so every symbol declared in package mls can read it — a free function
 // most of all. Measured, not supposed: with
 // func EpochSecretOf(schedule *KeySchedule) []byte { return schedule.epochSecret } appended
-// to key_schedule.go, all 5132 tests of mls and message passed. The one other package wide
+// to key_schedule.go, the whole of mls and message was green. The one other package wide
 // gate that might have seen it, TestEveryConstructionInThisPackageLeavesItsInputAlone,
 // collects the constructions that are HANDED bytes, and that one takes only a schedule.
 //
@@ -3457,7 +3481,7 @@ func TestNewKeyScheduleFromEpochSecretCopiesTheSample(t *testing.T) {
 // class.
 //
 // Measured, not supposed: nh := crypto.HashSize() replaced by nh := 32 in
-// NewKeyScheduleFromJoiner passed all 5132 tests of mls and message, and so did the same
+// NewKeyScheduleFromJoiner left the whole of mls and message green, and so did the same
 // substitution in NewKeyScheduleFromJoiner and NewKeyScheduleFromEpochSecret at once. Not a
 // wrong answer today — it is a gate that would not fire on the day a third suite lands,
 // which is the day it exists for, and suite.go's own file comment asserts the class it
@@ -3497,17 +3521,24 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 	"EncryptWithLabel": "answers a KEM output at Nenc and a ciphertext at Nt, neither of which is KDF.Nh; Nenc coincides with Nh at 32 under the narrow suite",
 }
 
-// scheduleAnswersThatAreNotKdfLengths names an exported method of *KeySchedule whose answer
-// the KDF.Nh equivalence below cannot hold, with the reason. It is the same excuse
+// scheduleAnswersThatAreNotKdfLengths names one ANSWER of an exported method of *KeySchedule
+// that the KDF.Nh equivalence below cannot hold, with the reason. It is the same excuse
 // constructionsWhoseAnswerOnlyCoincidesWithKdfNh carries for a package level construction,
 // one level down: the schedule's answers reach that gate through the rows that build a
 // schedule, so a method answering something that is not a kdf length cannot be excused by
 // naming the construction without excusing the whole epoch with it.
 //
-// It is checked against the type in both directions and against the sweep's own output, so
-// an entry cannot outlive the method it excuses and cannot sit here excusing nothing.
-var scheduleAnswersThatAreNotKdfLengths = map[string]string{
-	"ExternalKeyPair": "answers an hpke private key at Nsk and a public key at Npk, neither of which is KDF.Nh; X25519 fixes both at 32 and the narrow suite's KDF.Nh is also 32, so the equality is that suite's coincidence rather than anything this method did, and a kdf getting wider does not make an X25519 key wider",
+// Keyed per answer rather than per method, which is the tighter form exposedSlice was given a
+// position for. Keyed on ExternalKeyPair alone this excused EVERY answer of that method, so a
+// third result that IS a kdf length would have joined the excuse by existing and left the
+// differential silent about it. Two results today, two lines.
+//
+// Every entry is checked against the type, against the method's own arity and against the
+// sweep's own output, so an excuse cannot outlive the method it names, cannot name a result
+// position the method does not have, and cannot sit here excusing nothing.
+var scheduleAnswersThatAreNotKdfLengths = map[exposedAnswerAt]string{
+	{method: "ExternalKeyPair", result: 0}: "the hpke private key, which is Nsk; X25519 fixes it at 32 and the narrow suite's KDF.Nh is also 32, so the equality is that suite's coincidence rather than anything this method did, and a kdf getting wider does not make an X25519 key wider",
+	{method: "ExternalKeyPair", result: 1}: "the hpke public key, which is Npk; the same coincidence at 32 and the same reason a wider kdf does not widen it",
 }
 
 // scheduleStorageReaders is how this gate reads each byte slice a *KeySchedule keeps behind
@@ -3556,25 +3587,33 @@ func bytesTheScheduleKeeps(t *testing.T, at string, schedule *KeySchedule) [][]b
 	slices.Sort(fields)
 	handedOut, _ := bytesTheScheduleHandsOut(t, at, schedule)
 	kept := [][]byte{}
-	dropped := map[string]bool{}
+	dropped := map[exposedAnswerAt]bool{}
 	for _, one := range handedOut {
-		if _, notAKdfLength := scheduleAnswersThatAreNotKdfLengths[one.method]; notAKdfLength {
-			dropped[one.method] = true
+		if _, notAKdfLength := scheduleAnswersThatAreNotKdfLengths[one.at()]; notAKdfLength {
+			dropped[one.at()] = true
 			continue
 		}
 		kept = append(kept, one.bytes)
 	}
-	for name, reason := range scheduleAnswersThatAreNotKdfLengths {
-		if _, found := reflect.TypeOf(schedule).MethodByName(name); !found {
-			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s, which *KeySchedule does not declare", name)
+	for answer, reason := range scheduleAnswersThatAreNotKdfLengths {
+		method, found := reflect.TypeOf(schedule).MethodByName(answer.method)
+		if !found {
+			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s, which *KeySchedule does not declare", answer)
 			continue
 		}
-		// an excuse that dropped nothing is an excuse for a method the sweep is no longer
+		// an excuse for a result position the method does not have is an excuse that can
+		// never fire, and the sweep below would drop nothing while the table looked complete
+		if answer.result >= method.Type.NumOut() {
+			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s and that method answers %d results",
+				answer, method.Type.NumOut())
+			continue
+		}
+		// an excuse that dropped nothing is an excuse for an answer the sweep is no longer
 		// reading, which is the shape that leaves this gate looking complete while covering
 		// less than it did
-		if !dropped[name] {
-			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s (%s) and the sweep read no answer of that method to drop",
-				name, reason)
+		if !dropped[answer] {
+			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s (%s) and the sweep read no such answer to drop",
+				answer, reason)
 		}
 	}
 	for _, name := range fields {
@@ -3797,9 +3836,9 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 //
 // A body that answered a pointer to a COPY of the struct — copied := self.secrets; return
 // &copied — still shares the nine backing arrays, so an erase that overwrites bytes stays
-// visible and every other test of this package passes. Measured, not supposed: all 5132
-// tests of mls and message passed over that edit. What it breaks is the other spelling of
-// the erase this plan's task 12 will write: a Zeroize that NILS the fields leaves the
+// visible and every other test of this package passes. Measured, not supposed: the whole of
+// mls and message was green over that edit. What it breaks is the other spelling of the erase
+// this plan's task 12 will write: a Zeroize that NILS the fields leaves the
 // returned copy holding nine live keys, and the caller reading through it has an epoch's
 // worth of secrets the group believes are gone.
 //
@@ -3864,7 +3903,7 @@ func TestEveryAccessorAnsweringAPointerAnswersIntoTheSchedulesOwnStorage(t *test
 //
 // Nothing consumes it yet — the retention it bounds is this plan's task 12 — so there is no
 // behaviour to observe and until that task lands the value can be changed to anything with
-// the whole package green. Measured, not supposed: 32 replaced by 8 passed all 5132 tests of
+// the whole package green. Measured, not supposed: 32 replaced by 8 left green the whole of
 // mls and message.
 //
 // It is pinned rather than left because it is already exported, and because the number is a

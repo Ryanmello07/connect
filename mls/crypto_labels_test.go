@@ -67,9 +67,12 @@ import (
 	"fmt"
 	"go/ast"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -4712,4 +4715,462 @@ func TestSignatureKeyPairMatchesThePublishedSeedExpansions(t *testing.T) {
 			}
 		}
 	}
+}
+
+// theEpochsFieldOf is the field of a key-schedule entry that carries the epochs, found by
+// reflection rather than written down: the one field whose element type is labelKatEpoch.
+//
+// Derived because the scan below anchors on the spelling of that field, and a gate anchored on
+// a spelling somebody may rename is a gate that reads nothing afterwards and reports the clean
+// run a working one reports.
+func theEpochsFieldOf(t *testing.T) string {
+	t.Helper()
+	entry := reflect.TypeOf(labelKatSchedule{})
+	epoch := reflect.TypeOf(labelKatEpoch{})
+	for i := range entry.NumField() {
+		field := entry.Field(i)
+		if field.Type.Kind() == reflect.Slice && field.Type.Elem() == epoch {
+			return field.Name
+		}
+	}
+	t.Fatalf("no field of %s is a slice of %s, so the corpus reader scan has nothing to anchor on",
+		entry.Name(), epoch.Name())
+	return ""
+}
+
+// jsonKeysDecodedBy is every json object key some struct of the parsed source decodes, read off
+// the struct tags rather than off a list.
+//
+// One corpus is transcribed by more than one struct here — the key schedule reads an epoch
+// through labelKatEpoch and the group context codec reads the same epoch through a narrower
+// entry of its own — so "is this published key decoded anywhere" is a question about the
+// package and not about either struct. Asking it of one struct would report the other's fields
+// as unread.
+func jsonKeysDecodedBy(files []parsedSource) []string {
+	keys := map[string]bool{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			structure, isStruct := node.(*ast.StructType)
+			if !isStruct {
+				return true
+			}
+			for _, field := range structure.Fields.List {
+				if field.Tag == nil {
+					continue
+				}
+				tag, err := strconv.Unquote(field.Tag.Value)
+				if err != nil {
+					continue
+				}
+				name, tagged := reflect.StructTag(tag).Lookup("json")
+				if !tagged {
+					continue
+				}
+				keys[strings.Split(name, ",")[0]] = true
+			}
+			return true
+		})
+	}
+	return slices.Sorted(maps.Keys(keys))
+}
+
+// theFunctionsAnswering is every function of the parsed source whose results name a type.
+//
+// The reader scan needs it to tell one corpus from another. Three structs of this package carry
+// a field spelled Epochs and each has an element type of its own, so "ranged over something
+// called Epochs" is not the same question as "ranged over the epochs of a key schedule entry",
+// and the difference is the function the value came out of.
+func theFunctionsAnswering(files []parsedSource, named string) map[string]bool {
+	answering := map[string]bool{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Type.Results == nil {
+				continue
+			}
+			for _, result := range function.Type.Results.List {
+				if slices.Contains(identifiersNamedIn(result.Type), named) {
+					answering[function.Name.Name] = true
+				}
+			}
+		}
+	}
+	return answering
+}
+
+// corpusEpochReadings is every field name of the epoch type that the parsed source reads off a
+// value the corpus produced.
+//
+// The point is the BASE and not the name. Four of this struct's fields are spelled the same as
+// a field of EpochSecrets or a method of *KeySchedule — JoinerSecret, WelcomeSecret, InitSecret
+// and Exporter — so a scan that counted every selector of that spelling would report
+// schedule.JoinerSecret() as a reader of the corpus and pass with the corpus field unread. A
+// reading is therefore a selector whose base is a value this scan watched the corpus flow into,
+// and the flow is followed in two hops rather than assumed. First an identifier is bound to a
+// key-schedule ENTRY: a parameter or result declared of that type, a variable assigned from a
+// composite literal of it or from a function that answers one, or the value variable of a range
+// over any of those. Then an identifier is bound to an EPOCH: the value variable of a range over
+// that entry's epochs field, an identifier assigned from an index into it, an index read through
+// directly, a struct field declared of the epoch type, or a parameter declared of it.
+//
+// Both hops are needed and the first one is not decoration. Measured, not supposed: with the
+// second hop alone — anything ranged over a field spelled Epochs — a field ADDED to labelKatEpoch
+// and read by nothing passed this gate, because group_context_test.go transcribes the same
+// corpus through an entry of its own and reads a field of that spelling off it.
+//
+// The identifiers are collected PER DECLARATION and the selectors read back within that same
+// declaration, because go identifiers are scoped and this package binds the spelling "epoch" to
+// two different types: labelKatEpoch in the corpus reader, and ksVectorEpoch in every sweep over
+// the derived schedules. A package wide set of names would count epoch.crypto in one function as
+// a reading of the corpus in the other.
+//
+// Two honest limits, both in the direction of over-reporting a reader rather than missing a
+// field. Struct field names are package wide, so a second struct with a field of the same
+// spelling and a different type would widen the class. And a value bound at package level rather
+// than inside a declaration is not read at all, which this package does not do.
+func corpusEpochReadings(files []parsedSource, scheduleType string, epochsField string, epochType string) []string {
+	answering := theFunctionsAnswering(files, scheduleType)
+	namesTheEpochType := func(expr ast.Expr) bool {
+		return slices.Contains(identifiersNamedIn(expr), epochType)
+	}
+	// the struct fields first, which are the one part of this that is package wide
+	fieldNames := map[string]bool{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			structure, isStruct := node.(*ast.StructType)
+			if !isStruct {
+				return true
+			}
+			for _, field := range structure.Fields.List {
+				if !namesTheEpochType(field.Type) {
+					continue
+				}
+				for _, name := range field.Names {
+					fieldNames[name.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	read := map[string]bool{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			// hop one: the identifiers of this declaration that hold a key schedule entry.
+			// Two passes, because a declaration may range over a variable assigned further up
+			// and one pass in source order would not have bound it yet.
+			entries := map[string]bool{}
+			producesAnEntry := func(expr ast.Expr) bool {
+				for _, named := range identifiersNamedIn(expr) {
+					if named == scheduleType || answering[named] || entries[named] {
+						return true
+					}
+				}
+				return false
+			}
+			for range 2 {
+				ast.Inspect(function, func(node ast.Node) bool {
+					switch shape := node.(type) {
+					case *ast.RangeStmt:
+						if value, isIdentifier := shape.Value.(*ast.Ident); isIdentifier && producesAnEntry(shape.X) {
+							entries[value.Name] = true
+						}
+					case *ast.AssignStmt:
+						for i, right := range shape.Rhs {
+							if i >= len(shape.Lhs) || !producesAnEntry(right) {
+								continue
+							}
+							if left, isIdentifier := shape.Lhs[i].(*ast.Ident); isIdentifier {
+								entries[left.Name] = true
+							}
+						}
+					case *ast.FuncType:
+						for _, list := range []*ast.FieldList{shape.Params, shape.Results} {
+							if list == nil {
+								continue
+							}
+							for _, field := range list.List {
+								if !slices.Contains(identifiersNamedIn(field.Type), scheduleType) {
+									continue
+								}
+								for _, name := range field.Names {
+									entries[name.Name] = true
+								}
+							}
+						}
+					}
+					return true
+				})
+			}
+			overTheEpochs := func(expr ast.Expr) bool {
+				selector, isSelector := expr.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != epochsField {
+					return false
+				}
+				base, isIdentifier := selector.X.(*ast.Ident)
+				return isIdentifier && entries[base.Name]
+			}
+			// hop two: the identifiers of this declaration that hold one epoch of it
+			identifiers := map[string]bool{}
+			ast.Inspect(function, func(node ast.Node) bool {
+				switch shape := node.(type) {
+				case *ast.RangeStmt:
+					if value, isIdentifier := shape.Value.(*ast.Ident); isIdentifier && overTheEpochs(shape.X) {
+						identifiers[value.Name] = true
+					}
+				case *ast.AssignStmt:
+					for i, right := range shape.Rhs {
+						indexed, isIndex := right.(*ast.IndexExpr)
+						if !isIndex || !overTheEpochs(indexed.X) || i >= len(shape.Lhs) {
+							continue
+						}
+						if left, isIdentifier := shape.Lhs[i].(*ast.Ident); isIdentifier {
+							identifiers[left.Name] = true
+						}
+					}
+				case *ast.FuncType:
+					for _, list := range []*ast.FieldList{shape.Params, shape.Results} {
+						if list == nil {
+							continue
+						}
+						for _, field := range list.List {
+							if !namesTheEpochType(field.Type) {
+								continue
+							}
+							for _, name := range field.Names {
+								identifiers[name.Name] = true
+							}
+						}
+					}
+				}
+				return true
+			})
+			ast.Inspect(function, func(node ast.Node) bool {
+				selector, isSelector := node.(*ast.SelectorExpr)
+				if !isSelector {
+					return true
+				}
+				switch base := selector.X.(type) {
+				case *ast.Ident:
+					if identifiers[base.Name] {
+						read[selector.Sel.Name] = true
+					}
+				case *ast.SelectorExpr:
+					if fieldNames[base.Sel.Name] {
+						read[selector.Sel.Name] = true
+					}
+				case *ast.IndexExpr:
+					if overTheEpochs(base.X) {
+						read[selector.Sel.Name] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	return slices.Sorted(maps.Keys(read))
+}
+
+// corpusEpochReaderControl declares one of each shape that scan has to find, and two it has to
+// refuse: a field of the same spelling read off a value the corpus never flowed into, and the
+// same spelling bound to another type in a function of its own. Without those the scan would be
+// a search for a name, which is exactly the reading that reports schedule.JoinerSecret() as a
+// reader of joiner_secret.
+const corpusEpochReaderControl = "package control\n" +
+	"\n" +
+	"type Epoch struct {\n" +
+	"\tGroupContext string\n" +
+	"\tCommitSecret string\n" +
+	"\tNeverRead    string\n" +
+	"}\n" +
+	"\n" +
+	"type Schedule struct {\n" +
+	"\tEpochs []Epoch\n" +
+	"}\n" +
+	"\n" +
+	"type carrier struct {\n" +
+	"\tpublished Epoch\n" +
+	"}\n" +
+	"\n" +
+	"type decoy struct {\n" +
+	"\tNeverRead string\n" +
+	"}\n" +
+	"\n" +
+	"type OtherSchedule struct {\n" +
+	"\tEpochs []OtherEpoch\n" +
+	"}\n" +
+	"\n" +
+	"type OtherEpoch struct {\n" +
+	"\tNeverRead string\n" +
+	"}\n" +
+	"\n" +
+	"func schedulesOfTheCorpus() []Schedule {\n" +
+	"\treturn nil\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughACallResult() string {\n" +
+	"\tfor _, entry := range schedulesOfTheCorpus() {\n" +
+	"\t\tfor _, epoch := range entry.Epochs {\n" +
+	"\t\t\treturn epoch.CommitSecret\n" +
+	"\t\t}\n" +
+	"\t}\n" +
+	"\treturn \"\"\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughACompositeLiteral() string {\n" +
+	"\tentries := []Schedule{}\n" +
+	"\tfor _, entry := range entries {\n" +
+	"\t\tfor _, epoch := range entry.Epochs {\n" +
+	"\t\t\treturn epoch.GroupContext\n" +
+	"\t\t}\n" +
+	"\t}\n" +
+	"\treturn \"\"\n" +
+	"}\n" +
+	"\n" +
+	"func readsAnEpochsFieldOfAnotherCorpus(other OtherSchedule) string {\n" +
+	"\tfor _, epoch := range other.Epochs {\n" +
+	"\t\treturn epoch.NeverRead\n" +
+	"\t}\n" +
+	"\treturn \"\"\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughARangeVariable(entry Schedule) string {\n" +
+	"\tfor _, epoch := range entry.Epochs {\n" +
+	"\t\treturn epoch.GroupContext\n" +
+	"\t}\n" +
+	"\treturn \"\"\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughAnIndexExpression(entry Schedule) string {\n" +
+	"\treturn entry.Epochs[0].CommitSecret\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughAnAssignedVariable(entry Schedule) string {\n" +
+	"\tpublished := entry.Epochs[0]\n" +
+	"\treturn published.GroupContext\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughAStructField(held carrier) string {\n" +
+	"\treturn held.published.CommitSecret\n" +
+	"}\n" +
+	"\n" +
+	"func readsThroughAParameter(epoch Epoch) string {\n" +
+	"\treturn epoch.GroupContext\n" +
+	"}\n" +
+	"\n" +
+	"func readsTheSameNameOffSomethingElse(other decoy) string {\n" +
+	"\treturn other.NeverRead\n" +
+	"}\n" +
+	"\n" +
+	"func readsTheSameSpellingBoundToAnotherType(epoch decoy) string {\n" +
+	"\treturn epoch.NeverRead\n" +
+	"}\n"
+
+// TestEveryPublishedFieldOfTheKeyScheduleCorpusIsDecodedAndRead holds the corpus SCHEMA to the
+// rule every other class in this package is held to: derive it, never enumerate it.
+//
+// labelKatEpoch is the one published structure nothing swept. EpochSecrets is read field by
+// field by reflection everywhere, so a tenth secret joins every gate by existing; the corpus
+// entry beside it is a hand written transcription of somebody else's json with no check in
+// either direction, so a field could be declared and read by nobody, or published and decoded
+// by nobody, with the suite green. ExternalPub is the case that made it visible: a field whose
+// only reader is a single test, and nothing said so.
+//
+// Three readings, because the ways a published answer goes uncompared are different. A key the
+// corpus publishes that no struct decodes is an answer mlswg computed that never enters this
+// package at all. A field declared here whose key the corpus does not publish decodes to the
+// empty string, and every comparison over it then compares nothing. And a field that decodes
+// fine and nothing reads is dead schema that looks like coverage: a reviewer counting fields
+// sees a corpus fully transcribed.
+//
+// The first of the three is asked of the PACKAGE and the other two of labelKatEpoch, because
+// this corpus is transcribed twice — group_context_test.go reads tree_hash and
+// confirmed_transcript_hash through a narrower entry of its own, and asking "is this key
+// decoded" of one struct would report the other's fields as nobody's.
+func TestEveryPublishedFieldOfTheKeyScheduleCorpusIsDecodedAndRead(t *testing.T) {
+	// the control first: the reader scan finds each of the five shapes, refuses a field of the
+	// same spelling read off something else, and refuses the same spelling bound to another
+	// type in a declaration of its own
+	control := []parsedSource{mustParseText(t, "the corpus epoch reader control", corpusEpochReaderControl)}
+	want := []string{"CommitSecret", "GroupContext"}
+	if readings := corpusEpochReadings(control, "Schedule", "Epochs", "Epoch"); !slices.Equal(readings, want) {
+		t.Fatalf("the reader scan read %v out of the control, want %v; it is either missing one of the ways a corpus epoch is bound or counting a selector off something else",
+			readings, want)
+	}
+	if keys := jsonKeysDecodedBy(control); len(keys) != 0 {
+		t.Fatalf("the json tag scan read %v out of a control that carries no tags", keys)
+	}
+
+	files := []parsedSource{}
+	for _, path := range packageSourcePaths(t) {
+		files = append(files, mustParseSource(t, path))
+	}
+	decoded := jsonKeysDecodedBy(files)
+	if !slices.Contains(decoded, "cipher_suite") {
+		t.Fatalf("the json tag scan read %d keys off this package's source and cipher_suite is not among them, so it is not reading what it claims to",
+			len(decoded))
+	}
+
+	epochType := reflect.TypeOf(labelKatEpoch{})
+	declared := map[string]string{}
+	for i := range epochType.NumField() {
+		field := epochType.Field(i)
+		tag, tagged := field.Tag.Lookup("json")
+		if !tagged {
+			t.Fatalf("%s.%s carries no json tag, so nothing decodes into it", epochType.Name(), field.Name)
+		}
+		declared[strings.Split(tag, ",")[0]] = field.Name
+	}
+	if len(declared) != epochType.NumField() {
+		t.Fatalf("%s declares %d fields under %d json names, so two of them decode from one key",
+			epochType.Name(), epochType.NumField(), len(declared))
+	}
+
+	entries := []struct {
+		Epochs []map[string]json.RawMessage `json:"epochs"`
+	}{}
+	loadLabelKat(t, keyScheduleKatFile, &entries)
+	published := map[string]bool{}
+	epochs := 0
+	for _, entry := range entries {
+		for _, epoch := range entry.Epochs {
+			epochs++
+			for key := range epoch {
+				published[key] = true
+			}
+			for key, name := range declared {
+				if _, carried := epoch[key]; !carried {
+					t.Errorf("%s.%s decodes from %q and an epoch of %s does not publish that key, so it decodes to nothing and every comparison over it is vacuous",
+						epochType.Name(), name, key, keyScheduleKatFile)
+				}
+			}
+		}
+	}
+	if epochs == 0 {
+		t.Fatalf("%s parsed to no epochs at all, so this gate compared the schema against nothing", keyScheduleKatFile)
+	}
+	for _, key := range slices.Sorted(maps.Keys(published)) {
+		if !slices.Contains(decoded, key) {
+			t.Errorf("%s publishes %s for every epoch and no struct of this package decodes that key, so it is an answer somebody else computed that never enters this package",
+				keyScheduleKatFile, key)
+		}
+	}
+
+	// and every field of the epoch this file declares is read off a corpus value
+	readings := corpusEpochReadings(
+		files, reflect.TypeOf(labelKatSchedule{}).Name(), theEpochsFieldOf(t), epochType.Name())
+	if len(readings) == 0 {
+		t.Fatalf("the reader scan read no field of %s off this package's own source, and the key schedule certainly reads several, so it is reading nothing",
+			epochType.Name())
+	}
+	for i := range epochType.NumField() {
+		if name := epochType.Field(i).Name; !slices.Contains(readings, name) {
+			t.Errorf("%s.%s is decoded out of %s and nothing in this package reads it off a corpus epoch, so it is a published answer no test compares against",
+				epochType.Name(), name, keyScheduleKatFile)
+		}
+	}
+	t.Logf("%d fields of %s, read off a corpus epoch: %v", epochType.NumField(), epochType.Name(), readings)
 }
