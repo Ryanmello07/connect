@@ -340,10 +340,15 @@ func (self transcriptHashComparison) verdict() error {
 	// interim hash, or that hashed the confirmed hash without the tag, answers the same value
 	// whatever those two inputs hold.
 	//
-	// Addressed BY NAME and not by position. self.checks[0] is the confirmed hash only while
-	// the emit order holds, and an order nothing refuses points both controls at the wrong pair
-	// permanently. incomplete() now holds the order and this holds the name, so neither one
-	// alone is what keeps these two aimed.
+	// Addressed BY NAME and not by position. self.checks[0] is the confirmed hash only while the
+	// emit order holds, and an order nothing refuses points both controls at the wrong pair
+	// permanently. What refuses that reorder is incomplete(), and that is the half a mutation can
+	// see: swap the two rows and it fails, delete the order check and
+	// TestTranscriptHashComparisonCannotReportAComparisonItDidNotMake fails. Reading by name here
+	// is redundant with it and is stated as redundant rather than as a second guarantee -- with
+	// the order enforced the two are equivalent, and replacing these two lines with self.checks[0]
+	// and self.checks[1] is a mutation nothing catches. It is here so that a later edit weakening
+	// the order check cannot silently re-aim the controls as well.
 	confirmedAnswer := self.answerNamed("ConfirmedTranscriptHash")
 	interimAnswer := self.answerNamed("InterimTranscriptHash")
 	if len(confirmedAnswer) == 0 || len(interimAnswer) == 0 {
