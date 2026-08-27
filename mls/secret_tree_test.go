@@ -57,6 +57,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"go/ast"
 	"maps"
 	"reflect"
 	"slices"
@@ -1912,30 +1913,78 @@ func stNewTree(t *testing.T, leafCount LeafCount) *SecretTree {
 	return tree
 }
 
-// stRatchetKinds is both ratchet types, derived from the iota run rather than listed, so a
-// third type added to the constant block joins every sweep below instead of being covered
-// by whichever of these two a sweep happened to name.
-func stRatchetKinds() []RatchetType {
+// stRatchetTypeCodePoints is every value a RatchetType can hold, derived from the width of
+// the underlying type rather than from a written 256. A type widened to uint16 sweeps the
+// wider space without anyone editing this.
+func stRatchetTypeCodePoints() int {
+	return int(^RatchetType(0)) + 1
+}
+
+// stRatchetKinds is every ratchet type that reaches a keystream, DERIVED by asking the
+// implementation which code points it admits.
+//
+// The version this replaces bounded a loop with `kind <= RatchetApplication` while its own
+// comment claimed to derive the set from the iota run. It did not: a third type added to that
+// constant block and wired into ratchetFor was covered by ZERO of the sweeps keyed on this
+// helper -- the cross-ratchet key and nonce uniqueness sweep, the sender/receiver routing
+// sweep, the spent-secret erasure sweep and the post-Zeroize refusal sweep all silently
+// skipped the third live keystream. Measured, by adding one: `stRatchetKinds() = [1 2]` while
+// `RatchetFuture = 3` had a ratchet, a root and a keystream of its own.
+//
+// What is written here probes the whole code point space of the type and keeps the ones
+// ratchetFor answers, so the set is exactly "the types that reach a keystream" and a new one
+// joins every sweep below with no list to extend. The probe is destructive -- ratchetFor
+// consumes the leaf's node secret -- so each code point gets its own tree.
+//
+// Each admitted kind is required to have a label in this file's own table as well, because
+// every independent derivation here needs one; that check is what turns "a third type was
+// added and nothing here knows its label" into a failure that names this helper rather than
+// into a root expanded under the empty string.
+func stRatchetKinds(t *testing.T) []RatchetType {
+	t.Helper()
 	kinds := []RatchetType{}
-	for kind := RatchetHandshake; kind <= RatchetApplication; kind++ {
+	for point := range stRatchetTypeCodePoints() {
+		kind := RatchetType(point)
+		if _, err := stNewTree(t, 1).ratchetFor(0, kind); err != nil {
+			continue
+		}
+		if _, ok := stRatchetLabelOf(kind); !ok {
+			t.Fatalf("ratchet type %d reaches a keystream and has no label in stRatchetLabelOf, so every derivation in this file that is meant to cover it cannot be written",
+				kind)
+		}
 		kinds = append(kinds, kind)
+	}
+	if len(kinds) == 0 {
+		t.Fatal("no ratchet type reaches a keystream, so every sweep scoped by this helper ran over nothing")
 	}
 	return kinds
 }
 
-// stRatchetLabel is the RFC 9420 section 9 label each ratchet type expands its leaf secret
-// under. It is a switch and not a map so a type added without a label fails the build here
-// rather than expanding under the empty string.
-func stRatchetLabel(t *testing.T, kind RatchetType) string {
-	t.Helper()
+// stRatchetLabelOf is the RFC 9420 section 9 label a ratchet type expands its leaf secret
+// under, and whether this file knows one for it.
+//
+// It is a switch and not a map so a type added without a label is a decision somebody makes
+// here rather than a root expanded under the empty string, and it is INDEPENDENT of the
+// implementation on purpose: stRatchetRoot derives the expected root from it, so a label read
+// out of secret_tree.go would agree with a swapped pair of labels there.
+func stRatchetLabelOf(kind RatchetType) (string, bool) {
 	switch kind {
 	case RatchetHandshake:
-		return "handshake"
+		return "handshake", true
 	case RatchetApplication:
-		return "application"
+		return "application", true
 	}
-	t.Fatalf("ratchet type %d has no label in this test's own table, so nothing here derives its root", kind)
-	return ""
+	return "", false
+}
+
+// stRatchetLabel is the same, fatal on a type this file has no label for.
+func stRatchetLabel(t *testing.T, kind RatchetType) string {
+	t.Helper()
+	label, ok := stRatchetLabelOf(kind)
+	if !ok {
+		t.Fatalf("ratchet type %d has no label in this test's own table, so nothing here derives its root", kind)
+	}
+	return label
 }
 
 // stRatchetRoot derives one leaf's ratchet root independently of the code under test: the
@@ -2167,13 +2216,31 @@ func TestRatchetRefusesToWrapTheGenerationCounter(t *testing.T) {
 	if !r.exhausted {
 		t.Fatal("the ratchet is not marked exhausted, so the next step will hand out a generation again")
 	}
-	// and the receiving path agrees rather than looping: an old generation is consumed, the
-	// last one is exhausted, and neither produces a key.
-	if _, err := r.keyFor(0); !errors.Is(err, ErrRatchetGenerationConsumed) {
-		t.Fatalf("generation 0 on an exhausted ratchet answered %v, want ErrRatchetGenerationConsumed", err)
+	// and the receiving path agrees rather than looping, with ONE sentinel across the whole
+	// range of the counter: every generation this ratchet produced is a replay, including the
+	// last one it parked on.
+	//
+	// That last one is the value the "below the head" test cannot classify -- head stops at
+	// 2^32-1, so 2^32-1 is neither below it nor far enough above it to be refused as a skip,
+	// and it used to fall through into the loop and come back as ErrRatchetExhausted. A
+	// caller reading the sentinel to decide "is this a replay" got a different answer for the
+	// last message of an epoch than for every other message of it.
+	for _, generation := range []uint32{0, 1, last - 2, last - 1, last} {
+		if _, err := r.keyFor(generation); !errors.Is(err, ErrRatchetGenerationConsumed) {
+			t.Fatalf("generation %d on an exhausted ratchet answered %v, want ErrRatchetGenerationConsumed", generation, err)
+		}
 	}
-	if _, err := r.keyFor(last); !errors.Is(err, ErrRatchetExhausted) {
-		t.Fatalf("generation %d on an exhausted ratchet answered %v, want ErrRatchetExhausted", last, err)
+	// exhaustion is still reported, and it is the SENDER's fact: there is no next generation,
+	// so rekey. Losing that sentinel entirely would leave a sender looking at a refusal it
+	// cannot tell from a transient one.
+	if _, _, _, err := tree.NextSenderKey(4, RatchetApplication); !errors.Is(err, ErrRatchetExhausted) {
+		t.Fatalf("the sender path on an exhausted ratchet answered %v, want ErrRatchetExhausted", err)
+	}
+	// and the two sentinels are distinguishable, so the loop above is not satisfied by an
+	// error that answers to both.
+	if errors.Is(ErrRatchetExhausted, ErrRatchetGenerationConsumed) ||
+		errors.Is(ErrRatchetGenerationConsumed, ErrRatchetExhausted) {
+		t.Fatal("the exhausted and consumed sentinels answer to each other, so neither assertion above separates them")
 	}
 }
 
@@ -2186,7 +2253,7 @@ func TestRatchetRefusesToWrapTheGenerationCounter(t *testing.T) {
 // observe it is to keep the slice header the ratchet itself was holding.
 func TestRatchetSpentSecretIsErasedInPlaceAndTheSuccessorIsNotThePredecessor(t *testing.T) {
 	observed := 0
-	for _, kind := range stRatchetKinds() {
+	for _, kind := range stRatchetKinds(t) {
 		tree := stNewTree(t, 8)
 		r, err := tree.ratchetFor(7, kind)
 		if err != nil {
@@ -2214,8 +2281,8 @@ func TestRatchetSpentSecretIsErasedInPlaceAndTheSuccessorIsNotThePredecessor(t *
 			observed++
 		}
 	}
-	if observed != 8*len(stRatchetKinds()) {
-		t.Fatalf("observed %d steps, want %d", observed, 8*len(stRatchetKinds()))
+	if observed != 8*len(stRatchetKinds(t)) {
+		t.Fatalf("observed %d steps, want %d", observed, 8*len(stRatchetKinds(t)))
 	}
 }
 
@@ -2284,12 +2351,19 @@ func TestRatchetRetainsNoSpentSecretInAnyFieldOfTheTreesType(t *testing.T) {
 // type, or a root expansion that ignored its label all land as a collision here. It is the
 // defect that is silent by construction: two senders each producing a perfectly correct
 // sequence, which happens to be the same sequence.
+//
+// It sweeps in two halves, and the second is here because the first is the middle of the
+// range. Sixty-four consecutive generations from zero says nothing about the ends of a 32 bit
+// counter, and the middle of the range is exactly where the nonce defect this project already
+// shipped sat green through sixty-nine tests. The second half plants every ratchet at every
+// boundary stGenerationBoundaries derives and adds those keys to the SAME two tables, so a
+// collision between two senders at 2^32-1 is a failure here rather than a gap.
 func TestNoTwoRatchetsShareAKeyNoncePairAtAnyGeneration(t *testing.T) {
 	const leafCount = LeafCount(8)
 	const generations = 64
 	tree := stNewTree(t, leafCount)
 	leaves := stLeavesOf(t, leafCount)
-	kinds := stRatchetKinds()
+	kinds := stRatchetKinds(t)
 
 	type owner struct {
 		leaf       LeafIndex
@@ -2330,6 +2404,57 @@ func TestNoTwoRatchetsShareAKeyNoncePairAtAnyGeneration(t *testing.T) {
 		t.Fatalf("collected %d distinct pairs over %d leaves, %d ratchet types and %d generations, want %d",
 			len(pairs), len(leaves), len(kinds), generations, want)
 	}
+
+	// and the same table carries on to the ENDS of the counter.
+	//
+	// Sixty-four consecutive generations is the middle of the range, and the middle of the
+	// range is exactly where the 2^32 nonce defect on this project sat green through sixty-
+	// nine tests. A cross-ratchet collision needs two ratchets to reach one key and nonce
+	// pair, and nothing about the low generations says the high ones cannot -- the generation
+	// is bound into all three derivations, so the arithmetic that binds it is the thing being
+	// swept here, at every boundary the counter has rather than at the ones a loop can walk
+	// to. The heads are PLANTED, because stepping to 2^32-1 is four billion HKDF calls.
+	planted := 0
+	for _, boundary := range stGenerationBoundaries() {
+		for _, leaf := range leaves {
+			for _, kind := range kinds {
+				r, err := tree.ratchetFor(leaf, kind)
+				if err != nil {
+					t.Fatalf("ratchetFor(%d, %d): %v", leaf, kind, err)
+				}
+				// the exhausted flag is cleared with the head, because a boundary sweep that
+				// stopped at the first ratchet to reach 2^32-1 would cover the last boundary
+				// for one ratchet and none of the others.
+				r.head = boundary
+				r.exhausted = false
+				generation, keys, err := r.step()
+				if err != nil {
+					t.Fatalf("step at boundary %d for leaf %d kind %d: %v", boundary, leaf, kind, err)
+				}
+				if generation != boundary {
+					t.Fatalf("a ratchet planted at %d produced generation %d", boundary, generation)
+				}
+				mine := owner{leaf: leaf, kind: kind, generation: generation}
+				if previous, ok := pairs[string(keys.key)+"|"+string(keys.nonce)]; ok {
+					t.Fatalf("leaf %d kind %d generation %d reaches the same key and nonce pair as leaf %d kind %d generation %d",
+						mine.leaf, mine.kind, mine.generation, previous.leaf, previous.kind, previous.generation)
+				}
+				pairs[string(keys.key)+"|"+string(keys.nonce)] = mine
+				if previous, ok := nonces[string(keys.nonce)]; ok {
+					t.Fatalf("leaf %d kind %d generation %d repeats the nonce of leaf %d kind %d generation %d",
+						mine.leaf, mine.kind, mine.generation, previous.leaf, previous.kind, previous.generation)
+				}
+				nonces[string(keys.nonce)] = mine
+				planted++
+			}
+		}
+	}
+	if want := len(stGenerationBoundaries()) * len(leaves) * len(kinds); planted != want {
+		t.Fatalf("planted %d boundary generations, want %d", planted, want)
+	}
+	if want := len(leaves)*len(kinds)*generations + planted; len(pairs) != want {
+		t.Fatalf("collected %d distinct pairs once the boundaries were swept, want %d", len(pairs), want)
+	}
 }
 
 // TestSenderAndReceiverAgreeForEveryLeafAndKindAndDisagreeAcrossThem is the routing half:
@@ -2345,7 +2470,7 @@ func TestSenderAndReceiverAgreeForEveryLeafAndKindAndDisagreeAcrossThem(t *testi
 	const leafCount = LeafCount(8)
 	const generations = 3
 	leaves := stLeavesOf(t, leafCount)
-	kinds := stRatchetKinds()
+	kinds := stRatchetKinds(t)
 
 	sender, err := NewSecretTree(crypto, leafCount, encryptionSecret)
 	if err != nil {
@@ -2816,7 +2941,7 @@ func TestZeroizeIsIdempotentAndRefusesEveryLaterDerivation(t *testing.T) {
 	// a leaf that had a ratchet, and one that never did: the refusal must not depend on
 	// whether the tree happens to hold a cached ratchet for the leaf being asked about.
 	for _, leaf := range []LeafIndex{1, 6} {
-		for _, kind := range stRatchetKinds() {
+		for _, kind := range stRatchetKinds(t) {
 			if _, _, _, err := tree.NextSenderKey(leaf, kind); !errors.Is(err, ErrEpochErased) {
 				t.Errorf("NextSenderKey(%d, %d) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
 			}
@@ -2851,6 +2976,13 @@ func TestZeroizeIsIdempotentAndRefusesEveryLaterDerivation(t *testing.T) {
 // indistinguishable, this test passed, because the invariant refusal caught what the type
 // check no longer did and answered the same sentinel. Two guards over one property with no
 // way to tell which fired is one guard that can be deleted silently.
+//
+// stRatchetKinds now DERIVES the admitted set by asking this same function, which is what
+// makes every sweep in this file cover a third ratchet type the day one is added -- and which
+// makes "every code point outside the admitted set is refused" true of any set whatsoever. So
+// the membership half of this test is stated at NAMED code points instead: the zero value
+// reaches no keystream, and the two the RFC names do. What is left over the whole code point
+// space is the part the derivation cannot make vacuous -- which of the two refusals answers.
 func TestRatchetForRefusesAnUnknownRatchetType(t *testing.T) {
 	// the control on the matcher: the two refusals differ only in the sentinel the second
 	// wraps, so an errors.Is that could not see it through the wrapping would report every
@@ -2863,9 +2995,24 @@ func TestRatchetForRefusesAnUnknownRatchetType(t *testing.T) {
 		t.Fatal("the ordinary refusal answers to the invariant sentinel, so every refusal below would read as the invariant one")
 	}
 
-	known := stRatchetKinds()
+	known := stRatchetKinds(t)
+
+	// the anti-default claim, stated at named code points rather than against the derived set,
+	// because stRatchetKinds now DERIVES its answer from the same function under test and
+	// "every code point outside the admitted set is refused" would be true of any set at all.
+	// These three are the assertions that survive the derivation: the zero value has no
+	// keystream, and the two the RFC names do.
+	if slices.Contains(known, RatchetType(0)) {
+		t.Fatal("the zero ratchet type reaches a keystream, so a content type that decoded to nothing routes onto a real one")
+	}
+	for _, named := range []RatchetType{RatchetHandshake, RatchetApplication} {
+		if !slices.Contains(known, named) {
+			t.Fatalf("ratchet type %d is one of this package's own and reaches no keystream, so every sweep scoped by the derived set is missing it", named)
+		}
+	}
+
 	refused := 0
-	for probe := 0; probe < 256; probe++ {
+	for probe := range stRatchetTypeCodePoints() {
 		kind := RatchetType(probe)
 		tree := stNewTree(t, 8)
 		_, _, _, err := tree.NextSenderKey(0, kind)
@@ -2886,8 +3033,11 @@ func TestRatchetForRefusesAnUnknownRatchetType(t *testing.T) {
 		}
 		refused++
 	}
-	if want := 256 - len(known); refused != want {
+	if want := stRatchetTypeCodePoints() - len(known); refused != want {
 		t.Fatalf("refused %d ratchet types, want %d", refused, want)
+	}
+	if refused == 0 {
+		t.Fatal("every code point of the type reaches a keystream, so the refusal this test is about never fired")
 	}
 }
 
@@ -3027,5 +3177,883 @@ func TestZeroizeErasesTheRetainedWindowKeysInPlace(t *testing.T) {
 	// and it is unreachable as well as erased, so neither half stands in for the other.
 	if len(r.window) != 0 {
 		t.Fatalf("the window still holds %d entries after Zeroize", len(r.window))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the leaf secret's own erasure, and the memory a peer can make a receiver hold
+// ---------------------------------------------------------------------------
+
+// TestRatchetForErasesTheLeafSecretInPlaceOnceBothRootsExist is the erasure ratchetFor
+// performs, observed rather than assumed, over every leaf of every swept width.
+//
+// The leaf secret is the single value that regenerates BOTH of that leaf's ratchet roots --
+// that sender's whole epoch keystream -- and secret_tree.go says it "stops existing here".
+// Nothing observed that. Measured: with zeroizeSecret(leafSecret) replaced by
+// `_ = leafSecret`, every test of this package and of ../message passed, byte identical to
+// the clean run. It is the fourth member of a class whose other three each needed a
+// purpose-made alias test after surviving a first pass -- the spent ratchet secret, the
+// evicted window keys and the window keys Zeroize clears -- and it was the one left out.
+//
+// It has to be an ALIAS, for the reason the other three do. takeLeafSecret hands the caller
+// the slice it had in tree.nodes and deletes the map entry, so from that moment nothing the
+// tree reaches names those bytes and the type-derived walk this file scopes its other forward
+// secrecy claims by reports the secret gone whether it was overwritten or merely dropped. The
+// slice header the map itself was holding is the only thing that can tell the two apart.
+//
+// The alias is taken from a leaf whose secret is ALREADY IN THE TREE, which is what a sibling
+// take arranges: expanding their common parent stores both children, so after the sibling is
+// consumed the leaf's own node secret is sitting in tree.nodes waiting for it. A one-leaf tree
+// needs no sibling, because there the root IS the leaf.
+//
+// The two ratchet roots are compared against an independent derivation as well, so the
+// opposite edit -- erasing the leaf secret BEFORE the roots are expanded from it -- fails here
+// rather than passing the erasure half of this test.
+func TestRatchetForErasesTheLeafSecretInPlaceOnceBothRootsExist(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	kinds := stRatchetKinds(t)
+	observed := 0
+	for _, leafCount := range stSweptLeafCounts() {
+		for _, leaf := range stLeavesOf(t, leafCount) {
+			for _, asked := range kinds {
+				tree := stNewTree(t, leafCount)
+				if leafCount > 1 {
+					// the leaf-level sibling, which in a full tree is the leaf index with its
+					// low bit flipped. Consuming it expands their common parent and leaves
+					// this leaf's own node secret held.
+					if _, err := tree.ratchetFor(leaf^1, asked); err != nil {
+						t.Fatalf("width %d: ratchetFor(sibling of %d, %d): %v", leafCount, leaf, asked, err)
+					}
+				}
+				alias, held := tree.nodes[leaf.NodeIndex()]
+				if !held {
+					t.Fatalf("width %d: leaf %d's node secret is not in the tree before it is taken, so this test aliases nothing",
+						leafCount, leaf)
+				}
+				want := stExpectedNodeSecret(t, crypto, encryptionSecret, leafCount, leaf.NodeIndex())
+				if !bytes.Equal(alias, want) {
+					t.Fatalf("width %d: the alias taken for leaf %d is %x, want that leaf's node secret %x",
+						leafCount, leaf, alias, want)
+				}
+				if stAllZero(alias) {
+					t.Fatalf("width %d: leaf %d's node secret is already a run of zeros, so its erasure would be invisible",
+						leafCount, leaf)
+				}
+
+				if _, err := tree.ratchetFor(leaf, asked); err != nil {
+					t.Fatalf("width %d: ratchetFor(%d, %d): %v", leafCount, leaf, asked, err)
+				}
+
+				// both roots were derived from the live secret before it went.
+				for _, kind := range kinds {
+					r, ok := tree.ratchets[ratchetKey{leaf: leaf, kind: kind}]
+					if !ok {
+						t.Fatalf("width %d: leaf %d has no %d ratchet after ratchetFor(%d)", leafCount, leaf, kind, asked)
+					}
+					if root := stRatchetRoot(t, crypto, encryptionSecret, leafCount, leaf, kind); !bytes.Equal(r.secret, root) {
+						t.Fatalf("width %d: leaf %d's %d ratchet root is %x, want %x -- a root expanded from an already erased leaf secret is one every party can compute",
+							leafCount, leaf, kind, r.secret, root)
+					}
+				}
+				if !stAllZero(alias) {
+					t.Fatalf("width %d: the leaf secret of leaf %d survived ratchetFor as %x; anyone taking the process now rebuilds BOTH of that sender's ratchets from it",
+						leafCount, leaf, alias)
+				}
+				observed++
+			}
+		}
+	}
+	sweptLeaves := 0
+	for _, leafCount := range stSweptLeafCounts() {
+		sweptLeaves += int(leafCount)
+	}
+	if want := sweptLeaves * len(kinds); observed != want {
+		t.Fatalf("observed %d erasures over the swept widths, want %d", observed, want)
+	}
+}
+
+// stTotalRetainedWindowKeys is the number of skipped generation keys the WHOLE tree holds.
+func stTotalRetainedWindowKeys(tree *SecretTree) int {
+	total := 0
+	for _, r := range tree.ratchets {
+		total += len(r.window)
+	}
+	return total
+}
+
+// stRetainedByteCount is every byte the tree still reaches, summed, at the type-derived scope
+// the rest of this file's forward secrecy claims use. A field added later that retained key
+// material joins this count without anyone naming it.
+func stRetainedByteCount(t *testing.T, tree *SecretTree) int {
+	t.Helper()
+	total := 0
+	for _, one := range secretTreeRetainedBytes(t, tree) {
+		total += len(one.carried)
+	}
+	return total
+}
+
+// stForgeAHeaderPerRatchet drives one maximal forged ReceiverKey skip at every leaf of every
+// kind, which is what an unauthenticated peer can do with nothing but a leaf index and a
+// generation number: ratchetFor -- and so takeLeafSecret -- runs before any generation check
+// and before any AEAD, so every one of these is served far enough to fill a window.
+//
+// It returns how many ratchets it reached, so the callers can state what the retention WOULD
+// have been without a tree wide bound rather than assert against a number typed in beside it.
+func stForgeAHeaderPerRatchet(t *testing.T, tree *SecretTree, leafCount LeafCount) int {
+	t.Helper()
+	kinds := stRatchetKinds(t)
+	reached := 0
+	for _, leaf := range stLeavesOf(t, leafCount) {
+		for _, kind := range kinds {
+			if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip); err != nil {
+				t.Fatalf("a forged header for leaf %d kind %d was refused: %v", leaf, kind, err)
+			}
+			reached++
+		}
+	}
+	return reached
+}
+
+// TestRetainedWindowKeysAreBoundedForTheWholeTreeAndNotPerRatchet is the memory a peer can
+// make a receiver hold, bounded.
+//
+// RatchetWindowSize bounds ONE ratchet, and the number of ratchets is not the receiver's
+// choice: a peer picking leaf indices and generation numbers out of the air materialises every
+// leaf's two ratchets and fills every one of their windows, and nothing it sent had to be
+// authentic. Measured on the shape this replaces: a 64 leaf tree, four forged headers per
+// ratchet, 131072 retained generation keys and 17 MB of heap -- linear in the group size, so
+// a 1024 leaf group reaches roughly 270 MB from roughly 4096 forged headers.
+//
+// The control is what makes this more than an assertion that some number is small: the count
+// this sequence would retain WITHOUT the tree wide bound is computed from the same run, and
+// the test refuses to run if that count does not exceed the bound.
+func TestRetainedWindowKeysAreBoundedForTheWholeTreeAndNotPerRatchet(t *testing.T) {
+	for _, leafCount := range []LeafCount{8, 64} {
+		tree := stNewTree(t, leafCount)
+		reached := stForgeAHeaderPerRatchet(t, tree, leafCount)
+		if want := int(leafCount) * len(stRatchetKinds(t)); reached != want {
+			t.Fatalf("width %d: the forged headers reached %d ratchets, want %d", leafCount, reached, want)
+		}
+		unbounded := reached * int(MaxGenerationSkip)
+		if unbounded <= MaxRetainedWindowKeys {
+			t.Fatalf("width %d: this sequence retains at most %d keys without any tree wide bound and the bound is %d, so it could not observe one",
+				leafCount, unbounded, MaxRetainedWindowKeys)
+		}
+		retained := stTotalRetainedWindowKeys(tree)
+		if retained > MaxRetainedWindowKeys {
+			t.Fatalf("width %d: %d retained generation keys after %d forged headers, want at most %d -- a per ratchet bound multiplied by a ratchet count the peer chooses is not a bound",
+				leafCount, retained, reached, MaxRetainedWindowKeys)
+		}
+		if retained != MaxRetainedWindowKeys {
+			t.Fatalf("width %d: %d retained generation keys, want the bound of %d held exactly; evicting past it loses messages that arrived",
+				leafCount, retained, MaxRetainedWindowKeys)
+		}
+	}
+}
+
+// TestRetainedKeyMaterialDoesNotGrowWithTheGroupSize is the same claim at the scope of the
+// TYPE and as a DIFFERENCE, which is the form the finding was written in: the retention was
+// reported as linear in the leaf count, so what has to be shown is that it no longer is.
+//
+// Two trees get the identical adversarial sequence at two widths, and every byte either one
+// still reaches is summed by the type-derived walk. What legitimately differs between them is
+// the per sender state -- one ratchet secret per leaf per kind, which IS a function of the
+// group and cannot be otherwise -- so the difference is required to be exactly that and
+// nothing more. Any retention that scaled with the group in any other field, named or not,
+// lands here as a surplus.
+func TestRetainedKeyMaterialDoesNotGrowWithTheGroupSize(t *testing.T) {
+	const small = LeafCount(8)
+	const large = LeafCount(64)
+	crypto := stTestCrypto(t)
+	kinds := len(stRatchetKinds(t))
+
+	measure := func(leafCount LeafCount) int {
+		tree := stNewTree(t, leafCount)
+		stForgeAHeaderPerRatchet(t, tree, leafCount)
+		if retained := stTotalRetainedWindowKeys(tree); retained != MaxRetainedWindowKeys {
+			t.Fatalf("width %d retained %d generation keys rather than saturating the bound at %d, so the two widths below are not being compared under the same pressure",
+				leafCount, retained, MaxRetainedWindowKeys)
+		}
+		// every leaf was consumed by the sequence, so the node array holds nothing and the
+		// difference between the widths cannot come from there.
+		if len(tree.nodes) != 0 {
+			t.Fatalf("width %d still holds %d node secrets after every leaf was reached", leafCount, len(tree.nodes))
+		}
+		return stRetainedByteCount(t, tree)
+	}
+
+	grew := measure(large) - measure(small)
+	// one ratchet secret per extra leaf per kind, at the provider's hash size.
+	want := int(large-small) * kinds * crypto.HashSize()
+	if want == 0 {
+		t.Fatal("the two widths differ by no per sender state at all, so the comparison below is vacuous")
+	}
+	if grew != want {
+		t.Fatalf("a group eight times the size retains %d more bytes, want exactly %d -- the extra per sender ratchet secrets and nothing else. A surplus is retention that scales with a number the other members choose",
+			grew, want)
+	}
+}
+
+// TestATreeWideEvictionTakesFromTheFullestRatchetSoOneSenderCannotEvictAnother is the half of
+// the tree wide bound that decides whether it is a defence or a new attack.
+//
+// A bound that evicted the globally oldest generation would hand a flooding sender a way to
+// drop other members' messages: the handful of keys an honest out of order sender is holding
+// are older than everything the flooder just produced, so they would go first and the honest
+// sender's messages would arrive at a receiver that had thrown their keys away. Taking from
+// the largest holder puts the pressure on whoever made it.
+func TestATreeWideEvictionTakesFromTheFullestRatchetSoOneSenderCannotEvictAnother(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const honest = LeafIndex(2)
+	const flooder = LeafIndex(5)
+	const kind = RatchetApplication
+	// an ordinary out of order delivery: a few generations skipped, then the one that arrived.
+	const honestSkip = uint32(4)
+	if _, _, err := tree.ReceiverKey(honest, kind, honestSkip); err != nil {
+		t.Fatalf("the honest sender's first message was refused: %v", err)
+	}
+	honestRatchet, err := tree.ratchetFor(honest, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor(honest): %v", err)
+	}
+	if len(honestRatchet.window) != int(honestSkip) {
+		t.Fatalf("the honest sender left %d generations retained, want %d", len(honestRatchet.window), honestSkip)
+	}
+	kept := map[uint32][][]byte{}
+	for generation, keys := range honestRatchet.window {
+		kept[generation] = [][]byte{keys.key, keys.nonce}
+	}
+
+	// the flooder now asks for maximal skips until the tree wide bound has been reached and
+	// overrun several times over.
+	rounds := 3 * (MaxRetainedWindowKeys + int(MaxGenerationSkip)) / int(MaxGenerationSkip)
+	head := uint32(0)
+	for range rounds {
+		asked := head + MaxGenerationSkip
+		if _, _, err := tree.ReceiverKey(flooder, kind, asked); err != nil {
+			t.Fatalf("the flooder's request for generation %d was refused: %v", asked, err)
+		}
+		head = asked + 1
+		if retained := stTotalRetainedWindowKeys(tree); retained > MaxRetainedWindowKeys {
+			t.Fatalf("the tree retains %d generation keys mid flood, want at most %d", retained, MaxRetainedWindowKeys)
+		}
+	}
+	if rounds*int(MaxGenerationSkip) <= MaxRetainedWindowKeys {
+		t.Fatal("this flood never exceeds the tree wide bound, so nothing above was ever evicted")
+	}
+	if retained := stTotalRetainedWindowKeys(tree); retained != MaxRetainedWindowKeys {
+		t.Fatalf("the tree settled at %d retained generation keys, want the bound of %d; without the bound reached, surviving it means nothing",
+			retained, MaxRetainedWindowKeys)
+	}
+
+	// the honest sender's retained keys are all still there, still the same bytes, and still
+	// usable through the exported surface.
+	for generation := uint32(0); generation < honestSkip; generation++ {
+		pair, ok := kept[generation]
+		if !ok {
+			t.Fatalf("generation %d was never retained, so this test never held it", generation)
+		}
+		if stAllZero(pair[0]) || stAllZero(pair[1]) {
+			t.Fatalf("the honest sender's generation %d was erased under a flood from another leaf", generation)
+		}
+		key, nonce, err := tree.ReceiverKey(honest, kind, generation)
+		if err != nil {
+			t.Fatalf("the honest sender's generation %d was evicted by another leaf's flood: %v", generation, err)
+		}
+		if !bytes.Equal(key, pair[0]) || !bytes.Equal(nonce, pair[1]) {
+			t.Fatalf("the honest sender's generation %d came back as different key material than the window held", generation)
+		}
+	}
+}
+
+// TestTheTreeWideEvictionErasesWhatItDropsInPlace is the erasure of the new eviction path,
+// written with ALIASES because nothing else can see it.
+//
+// A key dropped from a window is gone from everything the tree reaches, so the type-derived
+// walk reports it absent whether it was overwritten or merely deleted -- exactly the gap that
+// let the per ratchet eviction's own missing erasure pass every test in this package. Both
+// paths evict through one helper now, and this is the assertion that says so from the tree
+// wide side.
+//
+// The two ratchets are each set UNDER the per ratchet bound and over the tree wide one when
+// summed, so the only eviction that can fire in this test is the tree wide one.
+func TestTheTreeWideEvictionErasesWhatItDropsInPlace(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const kind = RatchetHandshake
+	const first = LeafIndex(1)
+	const second = LeafIndex(3)
+	share := uint32(MaxRetainedWindowKeys * 3 / 4)
+	if int(share) > RatchetWindowSize {
+		t.Fatalf("a share of %d is over the per ratchet bound of %d, so that eviction would fire too and this test could not say which one ran",
+			share, RatchetWindowSize)
+	}
+	if share > MaxGenerationSkip {
+		t.Fatalf("a share of %d is over the skip bound of %d, so the requests below are refused", share, MaxGenerationSkip)
+	}
+	if 2*int(share) <= MaxRetainedWindowKeys {
+		t.Fatalf("two shares of %d do not exceed the tree wide bound of %d, so nothing is evicted", share, MaxRetainedWindowKeys)
+	}
+
+	if _, _, err := tree.ReceiverKey(first, kind, share); err != nil {
+		t.Fatalf("ReceiverKey(first): %v", err)
+	}
+	firstRatchet, err := tree.ratchetFor(first, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor(first): %v", err)
+	}
+	if len(firstRatchet.window) != int(share) {
+		t.Fatalf("the first ratchet retained %d generations, want %d", len(firstRatchet.window), share)
+	}
+	kept := map[uint32][][]byte{}
+	for generation, keys := range firstRatchet.window {
+		kept[generation] = [][]byte{keys.key, keys.nonce}
+		if stAllZero(keys.key) || stAllZero(keys.nonce) {
+			t.Fatalf("generation %d is already a run of zeros, so an erasure here would be invisible", generation)
+		}
+	}
+
+	if _, _, err := tree.ReceiverKey(second, kind, share); err != nil {
+		t.Fatalf("ReceiverKey(second): %v", err)
+	}
+	if retained := stTotalRetainedWindowKeys(tree); retained != MaxRetainedWindowKeys {
+		t.Fatalf("the tree retains %d generation keys, want the bound of %d", retained, MaxRetainedWindowKeys)
+	}
+
+	evicted, survived := 0, 0
+	for generation, pair := range kept {
+		if _, ok := firstRatchet.window[generation]; ok {
+			survived++
+			if stAllZero(pair[0]) || stAllZero(pair[1]) {
+				t.Fatalf("generation %d is still in the window and its key material has been erased under it", generation)
+			}
+			continue
+		}
+		evicted++
+		if !stAllZero(pair[0]) {
+			t.Fatalf("the key of generation %d survives a tree wide eviction as %x", generation, pair[0])
+		}
+		if !stAllZero(pair[1]) {
+			t.Fatalf("the nonce of generation %d survives a tree wide eviction as %x", generation, pair[1])
+		}
+	}
+	if evicted == 0 {
+		t.Fatal("nothing was evicted from the first ratchet, so the erasure above was never asked about")
+	}
+	if survived == 0 {
+		t.Fatal("the whole first ratchet was evicted, so the control that says a live entry is left alone is vacuous")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the lock discipline, in the one environment where the race detector cannot run
+// ---------------------------------------------------------------------------
+
+// The honest limit, stated before the gate rather than after it. `go test -race` is what
+// would verify SecretTree's concurrency claim, and it cannot run here: -race requires cgo,
+// and with CGO_ENABLED=1 the toolchain answers `cgo: C compiler "gcc" not found`. So the
+// claim in the type's own comment -- every exported method takes stateLock and every
+// unexported helper is reached only under it -- was verified by reading, and a claim verified
+// by reading is a claim nothing re-checks when the file changes.
+//
+// The two below are what CAN be checked in this environment, and neither is the race
+// detector. The first reads the discipline off the syntax tree, deriving both the guarded
+// fields and the method set from the source rather than from a list; it sees a lock that was
+// dropped from a method, and it cannot see a race that the discipline itself does not prevent.
+// The second observes the OUTCOME a dropped lock produces -- two callers handed one generation
+// number, which is a key and nonce reuse -- and it is a probabilistic observation of a
+// deterministic rule, which is why it stands beside the gate rather than instead of it.
+
+// stReceiverTypeName is the name of the type a method is declared on, through a pointer
+// receiver and through a generic one.
+func stReceiverTypeName(expr ast.Expr) string {
+	switch typed := expr.(type) {
+	case *ast.StarExpr:
+		return stReceiverTypeName(typed.X)
+	case *ast.IndexExpr:
+		return stReceiverTypeName(typed.X)
+	case *ast.IndexListExpr:
+		return stReceiverTypeName(typed.X)
+	case *ast.Ident:
+		return typed.Name
+	}
+	return ""
+}
+
+// stReceiverField reduces an expression to the field of the receiver whose storage it hangs
+// off, so self.nodes, self.nodes[node], (self.nodes)[node] and self.stateLock.Lock all report
+// the field they reach through.
+//
+// Without it a read spelled through an index, and the lock spelled through its own method,
+// sit outside the matcher while naming exactly the same field -- and those are the two shapes
+// the state of this type is actually touched in.
+func stReceiverField(receiver string, expr ast.Expr) string {
+	if receiver == "" {
+		return ""
+	}
+	switch typed := expr.(type) {
+	case *ast.ParenExpr:
+		return stReceiverField(receiver, typed.X)
+	case *ast.IndexExpr:
+		return stReceiverField(receiver, typed.X)
+	case *ast.SliceExpr:
+		return stReceiverField(receiver, typed.X)
+	case *ast.StarExpr:
+		return stReceiverField(receiver, typed.X)
+	case *ast.SelectorExpr:
+		if ident, ok := typed.X.(*ast.Ident); ok && ident.Name == receiver {
+			return typed.Sel.Name
+		}
+		return stReceiverField(receiver, typed.X)
+	}
+	return ""
+}
+
+// stLockRule is what the gate found out about one method of the type under it.
+type stLockRule struct {
+	name     string
+	exported bool
+	touches  bool
+	locks    bool
+}
+
+// stLockDiscipline reads one type's lock discipline off the syntax tree.
+//
+// Nothing here is written down. The METHOD SET comes from the declarations, so a method added
+// in a file added later is covered. The GUARDED FIELDS are derived as the fields the type's own
+// methods write -- an assignment, an increment, a delete or a clear whose storage hangs off the
+// receiver -- so a mutable field added later joins the rule with no list to extend, and the
+// four the constructor writes once and never again stay out of it, which is what lets
+// LeafCount answer with no lock while an exported method holds it. The LOCK is derived as the
+// field this type calls Lock on.
+//
+// Reachability is transitive, because it has to be: the three methods that hand out key
+// material touch none of the guarded fields themselves, they call ratchetFor. A rule that read
+// one body would report all three as touching nothing and pass a version of this file with
+// every lock deleted.
+func stLockDiscipline(t *testing.T, sources []parsedSource, typeName string) (rules []stLockRule, guarded []string, lockField string) {
+	t.Helper()
+	type method struct {
+		decl     *ast.FuncDecl
+		receiver string
+	}
+	methods := map[string]method{}
+	for _, source := range sources {
+		for _, decl := range source.file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 || fn.Body == nil {
+				continue
+			}
+			if stReceiverTypeName(fn.Recv.List[0].Type) != typeName {
+				continue
+			}
+			receiver := ""
+			if len(fn.Recv.List[0].Names) == 1 {
+				receiver = fn.Recv.List[0].Names[0].Name
+			}
+			if previous, ok := methods[fn.Name.Name]; ok {
+				t.Fatalf("%s.%s is declared twice (%v), so this gate would judge one of the two",
+					typeName, fn.Name.Name, previous.decl.Name.NamePos)
+			}
+			methods[fn.Name.Name] = method{decl: fn, receiver: receiver}
+		}
+	}
+	if len(methods) == 0 {
+		t.Fatalf("no method of %s was found, so this gate read nothing", typeName)
+	}
+
+	// the fields the type writes: that is what "mutable" means here, and it is the whole of
+	// what the lock exists for.
+	guardedSet := map[string]bool{}
+	lockSet := map[string]bool{}
+	for _, one := range methods {
+		ast.Inspect(one.decl.Body, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.AssignStmt:
+				for _, target := range typed.Lhs {
+					if field := stReceiverField(one.receiver, target); field != "" {
+						guardedSet[field] = true
+					}
+				}
+			case *ast.IncDecStmt:
+				if field := stReceiverField(one.receiver, typed.X); field != "" {
+					guardedSet[field] = true
+				}
+			case *ast.CallExpr:
+				if builtin, ok := typed.Fun.(*ast.Ident); ok && len(typed.Args) > 0 {
+					if builtin.Name == "delete" || builtin.Name == "clear" {
+						if field := stReceiverField(one.receiver, typed.Args[0]); field != "" {
+							guardedSet[field] = true
+						}
+					}
+				}
+				if selector, ok := typed.Fun.(*ast.SelectorExpr); ok {
+					if selector.Sel.Name == "Lock" || selector.Sel.Name == "Unlock" {
+						if field := stReceiverField(one.receiver, selector.X); field != "" {
+							lockSet[field] = true
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	guarded = slices.Sorted(maps.Keys(guardedSet))
+	locks := slices.Sorted(maps.Keys(lockSet))
+	if len(locks) != 1 {
+		t.Fatalf("%s calls Lock on %v, and this gate is written for exactly one lock", typeName, locks)
+	}
+	lockField = locks[0]
+	if slices.Contains(guarded, lockField) {
+		t.Fatalf("the lock field %s is also written as state, so the gate cannot tell the guard from the guarded", lockField)
+	}
+
+	// what each body reaches directly, and which sibling methods it calls.
+	touches := map[string]bool{}
+	calls := map[string][]string{}
+	for name, one := range methods {
+		ast.Inspect(one.decl.Body, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.SelectorExpr:
+				if ident, ok := typed.X.(*ast.Ident); ok && ident.Name == one.receiver && guardedSet[typed.Sel.Name] {
+					touches[name] = true
+				}
+			case *ast.CallExpr:
+				selector, ok := typed.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				ident, ok := selector.X.(*ast.Ident)
+				if !ok || ident.Name != one.receiver {
+					return true
+				}
+				if _, isSibling := methods[selector.Sel.Name]; isSibling {
+					calls[name] = append(calls[name], selector.Sel.Name)
+				}
+			}
+			return true
+		})
+	}
+	for changed := true; changed; {
+		changed = false
+		for name := range methods {
+			if touches[name] {
+				continue
+			}
+			for _, called := range calls[name] {
+				if touches[called] {
+					touches[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	for name, one := range methods {
+		rules = append(rules, stLockRule{
+			name:     name,
+			exported: ast.IsExported(name),
+			touches:  touches[name],
+			locks:    stTakesTheLockFirst(one.decl, one.receiver, lockField),
+		})
+	}
+	slices.SortFunc(rules, func(a stLockRule, b stLockRule) int { return strings.Compare(a.name, b.name) })
+	return rules, guarded, lockField
+}
+
+// stTakesTheLockFirst reports whether a body opens with the lock taken and its release
+// deferred, in that order and as its first two statements.
+//
+// Both halves and the position are the rule. A Lock with no deferred Unlock leaks the lock
+// down every error return of a function that has five of them, and a Lock that is not first
+// leaves whatever ran ahead of it reading guarded state unguarded, which is the defect the
+// gate is for rather than a stylistic preference.
+func stTakesTheLockFirst(decl *ast.FuncDecl, receiver string, lockField string) bool {
+	if decl.Body == nil || len(decl.Body.List) < 2 {
+		return false
+	}
+	isCall := func(expr ast.Expr, name string) bool {
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != name {
+			return false
+		}
+		return stReceiverField(receiver, selector.X) == lockField
+	}
+	taken, ok := decl.Body.List[0].(*ast.ExprStmt)
+	if !ok || !isCall(taken.X, "Lock") {
+		return false
+	}
+	released, ok := decl.Body.List[1].(*ast.DeferStmt)
+	if !ok {
+		return false
+	}
+	return isCall(released.Call, "Unlock")
+}
+
+// stLockViolations applies the rule, so the real type and the control source below are judged
+// by one function rather than by two copies of it that could drift apart.
+//
+// The two halves fail in opposite directions and both are real. An exported method that
+// reaches guarded state without the lock is the unguarded access. An unexported helper that
+// takes the lock itself deadlocks the moment an exported method that already holds it calls
+// down -- which is every path through this type -- so "the caller holds it" has to be uniform
+// rather than a habit.
+func stLockViolations(rules []stLockRule) []string {
+	found := []string{}
+	for _, rule := range rules {
+		if !rule.touches {
+			continue
+		}
+		if rule.exported && !rule.locks {
+			found = append(found, rule.name+" reaches guarded state and does not take the lock first")
+		}
+		if !rule.exported && rule.locks {
+			found = append(found, rule.name+" reaches guarded state and takes the lock itself, so an exported caller holding it deadlocks")
+		}
+	}
+	slices.Sort(found)
+	return found
+}
+
+// stPackageImplementationSources is every non-test go file of this package, parsed.
+//
+// The paths come from packageSourcePaths, which globs the directory, so a method moved into a
+// file added later is scanned rather than silently unread. That is a defect this package has
+// already paid for once: task 12 moved three methods into a second file and four provider
+// invariants went on reading the first.
+func stPackageImplementationSources(t *testing.T) []parsedSource {
+	t.Helper()
+	sources := []parsedSource{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		sources = append(sources, mustParseSource(t, path))
+	}
+	if len(sources) == 0 {
+		t.Fatal("no implementation file of this package was parsed, so the gate below read nothing")
+	}
+	return sources
+}
+
+// stLockControlSource is a type with the shape of SecretTree and both violations in it, so
+// what the gate can SEE is measured rather than assumed.
+//
+// A gate that reported no violation would report exactly what a gate over a correct type
+// reports, which is the one outcome a gate like this must never reach by accident. The
+// control also carries the two shapes that must NOT be reported -- an exported method that
+// touches no guarded field and takes no lock, and an unexported helper that touches guarded
+// state and correctly leaves the locking to its caller -- so a matcher that answered "in
+// violation" for everything fails here too.
+const stLockControlSource = `package control
+
+import "sync"
+
+type control struct {
+	guard    sync.Mutex
+	table    map[int][]byte
+	settled  bool
+	constant int
+}
+
+func (self *control) Correct() {
+	self.guard.Lock()
+	defer self.guard.Unlock()
+	self.helper()
+}
+
+func (self *control) Unguarded() int {
+	return len(self.table)
+}
+
+func (self *control) Reads() int {
+	return self.constant
+}
+
+func (self *control) helper() {
+	self.table[0] = nil
+	delete(self.table, 1)
+	self.settled = true
+}
+
+func (self *control) selfLocking() {
+	self.guard.Lock()
+	defer self.guard.Unlock()
+	self.settled = false
+}
+`
+
+// TestTheLockDisciplineGateSeesBothViolationsItIsWrittenFor is the control on the gate below.
+func TestTheLockDisciplineGateSeesBothViolationsItIsWrittenFor(t *testing.T) {
+	source := mustParseText(t, "lock_control.go", stLockControlSource)
+	rules, guarded, lockField := stLockDiscipline(t, []parsedSource{source}, "control")
+
+	if lockField != "guard" {
+		t.Fatalf("the gate found the lock field %q, want guard", lockField)
+	}
+	// derived from the writes, so the field the control only ever reads is not in it.
+	if want := []string{"settled", "table"}; !slices.Equal(guarded, want) {
+		t.Fatalf("the gate derived the guarded fields %v, want %v", guarded, want)
+	}
+
+	found := stLockViolations(rules)
+	want := []string{
+		"Unguarded reaches guarded state and does not take the lock first",
+		"selfLocking reaches guarded state and takes the lock itself, so an exported caller holding it deadlocks",
+	}
+	if !slices.Equal(found, want) {
+		t.Fatalf("the gate reported %v over the control, want %v", found, want)
+	}
+
+	// and the transitive half is seen: Correct touches nothing itself and reaches the guarded
+	// table through helper, so a gate that read one body would have nothing to judge it by.
+	byName := map[string]stLockRule{}
+	for _, rule := range rules {
+		byName[rule.name] = rule
+	}
+	if !byName["Correct"].touches {
+		t.Fatal("the gate does not see that Correct reaches guarded state through helper, so it would pass a type whose every exported method delegated")
+	}
+	if byName["Reads"].touches {
+		t.Fatal("the gate reports a method that only reads a write-once field as reaching guarded state, so it would force a lock onto an accessor that must not take one")
+	}
+}
+
+// TestEveryPathToTheSecretTreesGuardedStateObservesOneLockDiscipline is the discipline the
+// type's own comment claims, read off the source rather than off the prose.
+//
+// See the note above this section for what this does and does not stand in for: the race
+// detector cannot run in this environment, and a syntax gate is not one. What it does is stop
+// the claim from being true only on the day somebody read it.
+func TestEveryPathToTheSecretTreesGuardedStateObservesOneLockDiscipline(t *testing.T) {
+	rules, guarded, lockField := stLockDiscipline(t, stPackageImplementationSources(t), "SecretTree")
+
+	if len(guarded) == 0 {
+		t.Fatal("no field of SecretTree is written by any of its methods, so the rule below ran over nothing")
+	}
+	exported, unexported, unguardedReaders := 0, 0, 0
+	for _, rule := range rules {
+		switch {
+		case rule.touches && rule.exported:
+			exported++
+		case rule.touches:
+			unexported++
+		default:
+			unguardedReaders++
+		}
+	}
+	if exported == 0 {
+		t.Fatal("no exported method of SecretTree reaches its guarded state, so half this rule ran over nothing")
+	}
+	if unexported == 0 {
+		t.Fatal("no unexported helper of SecretTree reaches its guarded state, so the other half ran over nothing")
+	}
+	if unguardedReaders == 0 {
+		t.Fatal("every method reaches guarded state, so the gate cannot show it distinguishes the ones that do not")
+	}
+
+	if found := stLockViolations(rules); len(found) != 0 {
+		t.Fatalf("the %s discipline is broken by: %v", lockField, found)
+	}
+}
+
+// TestNoTwoCallersAreHandedOneGenerationUnderConcurrentSenders is the outcome half, in the
+// absence of the race detector.
+//
+// What a dropped lock produces here is not a corrupt map, it is two callers handed the SAME
+// generation number for one leaf and one ratchet type -- which is one key and one nonce used
+// twice, the failure this whole file exists to prevent. So the assertion is on the numbers
+// rather than on the mechanism: every generation handed out exactly once, and the set of them
+// contiguous from zero, which is what a lost update to the head breaks in both directions at
+// the same time.
+//
+// Its limit, stated rather than left implied: a race that did not happen to interleave on a
+// given run is a race this test reports as absent. It stands beside the syntax gate above,
+// which is deterministic and sees the missing lock itself, rather than instead of it.
+func TestNoTwoCallersAreHandedOneGenerationUnderConcurrentSenders(t *testing.T) {
+	const leafCount = LeafCount(8)
+	const workers = 8
+	const perWorker = 48
+	tree := stNewTree(t, leafCount)
+	leaves := stLeavesOf(t, leafCount)
+	kinds := stRatchetKinds(t)
+
+	type slot struct {
+		leaf LeafIndex
+		kind RatchetType
+	}
+	type handout struct {
+		slot       slot
+		generation uint32
+	}
+	handed := make(chan handout, workers*perWorker*len(leaves)*len(kinds))
+	failures := make(chan error, workers)
+
+	var running sync.WaitGroup
+	for range workers {
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			for range perWorker {
+				for _, leaf := range leaves {
+					for _, kind := range kinds {
+						generation, key, nonce, err := tree.NextSenderKey(leaf, kind)
+						if err != nil {
+							failures <- fmt.Errorf("NextSenderKey(%d, %d): %w", leaf, kind, err)
+							return
+						}
+						if len(key) == 0 || len(nonce) == 0 {
+							failures <- fmt.Errorf("NextSenderKey(%d, %d) answered %d key bytes and %d nonce bytes", leaf, kind, len(key), len(nonce))
+							return
+						}
+						handed <- handout{slot: slot{leaf: leaf, kind: kind}, generation: generation}
+						// a reader on the same lock, so the exported surface is exercised in
+						// both directions rather than only by the writer.
+						if _, err := tree.SenderGeneration(leaf, kind); err != nil {
+							failures <- fmt.Errorf("SenderGeneration(%d, %d): %w", leaf, kind, err)
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+	running.Wait()
+	close(handed)
+	close(failures)
+	for err := range failures {
+		t.Fatalf("a concurrent sender failed: %v", err)
+	}
+
+	seen := map[slot]map[uint32]bool{}
+	for one := range handed {
+		if seen[one.slot] == nil {
+			seen[one.slot] = map[uint32]bool{}
+		}
+		if seen[one.slot][one.generation] {
+			t.Fatalf("leaf %d kind %d handed generation %d to two callers, which is one key and one nonce used twice",
+				one.slot.leaf, one.slot.kind, one.generation)
+		}
+		seen[one.slot][one.generation] = true
+	}
+	if want := len(leaves) * len(kinds); len(seen) != want {
+		t.Fatalf("%d leaf and kind pairs produced generations, want %d", len(seen), want)
+	}
+	for one, generations := range seen {
+		if len(generations) != workers*perWorker {
+			t.Fatalf("leaf %d kind %d produced %d generations, want %d", one.leaf, one.kind, len(generations), workers*perWorker)
+		}
+		for generation := range uint32(workers * perWorker) {
+			if !generations[generation] {
+				t.Fatalf("leaf %d kind %d never produced generation %d, so the head skipped a value while two callers shared another",
+					one.leaf, one.kind, generation)
+			}
+		}
 	}
 }

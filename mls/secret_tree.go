@@ -440,7 +440,19 @@ func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
 		delete(self.window, generation)
 		return keys, nil
 	}
-	if generation < self.head {
+	// every generation this ratchet has already produced is a replay, and that includes the
+	// one an exhausted ratchet is parked on. head does not advance past 2^32-1, so the last
+	// generation of an epoch is the single value the "below the head" test cannot classify --
+	// without the second arm it misses the window, passes the skip bound at a distance of
+	// zero, enters the loop and comes back as ErrRatchetExhausted, while every other
+	// generation of the same epoch comes back as ErrRatchetGenerationConsumed. A caller
+	// asking "is this a replay" has to get one answer across the whole range of the counter,
+	// not two that depend on which end of it the epoch reached.
+	//
+	// Exhaustion stays the SENDER's sentinel: NextSenderKey reaches step directly and still
+	// answers ErrRatchetExhausted, which is the fact that party needs -- there is no next
+	// generation, rekey.
+	if generation < self.head || (self.exhausted && generation == self.head) {
 		return nil, fmt.Errorf("%w: generation %d, head %d", ErrRatchetGenerationConsumed, generation, self.head)
 	}
 	// generation is at or above head here, so the subtraction cannot wrap.
@@ -477,25 +489,110 @@ func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
 	}
 }
 
-// prune evicts the oldest retained generations once the window is over its bound.
+// evictOldest drops the oldest retained generation, erasing its key material in place.
+//
+// The oldest is what goes, because a skipped generation that has not arrived yet grows less
+// likely to arrive the older it gets.
+//
+// It is one helper rather than a loop written out in each of the two callers, because the
+// ERASURE is the half a caller omits silently: a bare delete leaves live AEAD keys wherever
+// the allocator puts them next, nothing the tree still reaches can see the difference, and
+// this package has already measured that shape passing every test it had. Both the per
+// ratchet bound and the tree wide one evict through here, so the erasure cannot be present
+// on one path and missing on the other.
+//
+// The noinline directive is this package's erase-helper class: the window map outlives the
+// call, and the directive keeps the store inside zeroizeSecret across a boundary the
+// compiler cannot see through.
+//
+//go:noinline
+func (self *ratchet) evictOldest() {
+	if len(self.window) == 0 {
+		return
+	}
+	oldest := ^uint32(0)
+	for generation := range self.window {
+		if generation < oldest {
+			oldest = generation
+		}
+	}
+	keys := self.window[oldest]
+	zeroizeSecret(keys.key)
+	zeroizeSecret(keys.nonce)
+	delete(self.window, oldest)
+}
+
+// prune evicts the oldest retained generations once THIS ratchet is over its own bound.
 //
 // It is a bound on MEMORY, and the party who decides how much of it gets used is whoever
 // sends the messages. Without eviction a sender that skips generations forever grows a
 // receiver's heap forever; with eviction at one an ordinary out of order delivery loses
-// every message but the newest. The oldest is what goes, because a skipped generation that
-// has not arrived yet grows less likely to arrive the older it gets.
+// every message but the newest.
+//
+// This bound is per ratchet, which is the whole of what it can promise: the number of
+// ratchets is not the receiver's choice. SecretTree.pruneRetained is the other half.
 func (self *ratchet) prune() {
 	for len(self.window) > RatchetWindowSize {
-		oldest := ^uint32(0)
-		for generation := range self.window {
-			if generation < oldest {
-				oldest = generation
+		self.evictOldest()
+	}
+}
+
+// ratchetKeyLess orders two ratchet keys.
+//
+// It exists so the eviction below breaks a tie between two equally full windows by the key
+// rather than by go's randomised map iteration. A bound that reached a different ratchet on
+// every run would be a bound whose behaviour cannot be stated, let alone tested.
+func ratchetKeyLess(left ratchetKey, right ratchetKey) bool {
+	if left.leaf != right.leaf {
+		return left.leaf < right.leaf
+	}
+	return left.kind < right.kind
+}
+
+// pruneRetained holds the skipped generation keys retained across EVERY ratchet of this tree
+// to one bound.
+//
+// RatchetWindowSize bounds one ratchet, and the number of ratchets is not this receiver's
+// choice. ReceiverKey reaches ratchetFor -- and so takeLeafSecret -- before any generation
+// check and before any AEAD, because in section 9 the AEAD tag is the authentication and the
+// key has to exist before it can be checked. So a peer that picks leaf indices and generation
+// numbers out of the air materialises every leaf's two ratchets and fills every one of their
+// windows, and nothing it sent had to be authentic. Measured on the shape this replaces: a 64
+// leaf tree, four forged headers per ratchet, 131072 retained generation keys and 17 MB of
+// heap -- and the figure is LINEAR IN THE GROUP SIZE, so a 1024 leaf group reaches roughly
+// 270 MB from roughly 4096 unauthenticated headers. A bound multiplied by a number the
+// attacker chooses is not a bound.
+//
+// What goes is the oldest generation OF THE FULLEST RATCHET, and the choice of ratchet is the
+// half that matters. Evicting the globally oldest generation instead would let one flooding
+// sender push out the handful of keys an honest out of order sender is holding, which turns a
+// memory bound into a way to drop other members' messages; taking from the largest holder
+// puts the pressure on whoever created it.
+//
+// The caller holds stateLock.
+func (self *SecretTree) pruneRetained() {
+	for {
+		retained := 0
+		var fullest *ratchet
+		var fullestKey ratchetKey
+		for key, r := range self.ratchets {
+			retained += len(r.window)
+			if fullest == nil || len(r.window) > len(fullest.window) ||
+				(len(r.window) == len(fullest.window) && ratchetKeyLess(key, fullestKey)) {
+				fullest, fullestKey = r, key
 			}
 		}
-		keys := self.window[oldest]
-		zeroizeSecret(keys.key)
-		zeroizeSecret(keys.nonce)
-		delete(self.window, oldest)
+		if retained <= MaxRetainedWindowKeys {
+			return
+		}
+		if fullest == nil || len(fullest.window) == 0 {
+			// unreachable: retained is the sum of the window lengths, so a total over the
+			// bound means some window is non empty and the fullest is one of those. It is a
+			// return and not an assertion because the alternative for a loop whose only exit
+			// is the bound would be to spin forever on a state it cannot fix.
+			return
+		}
+		fullest.evictOldest()
 	}
 }
 
@@ -573,10 +670,26 @@ const (
 	// uint32 buys four billion KDF calls for the price of one forged header.
 	MaxGenerationSkip uint32 = 1024
 
-	// RatchetWindowSize bounds the skipped keys retained for out of order receipt. A sender
-	// that skips more than this many produces a visible gap, which is the same trade spec A
-	// section 5.5 makes for records.
+	// RatchetWindowSize bounds the skipped keys retained for out of order receipt BY ONE
+	// RATCHET. A sender that skips more than this many produces a visible gap, which is the
+	// same trade spec A section 5.5 makes for records.
 	RatchetWindowSize int = 1024
+
+	// MaxRetainedWindowKeys bounds the skipped keys retained by the WHOLE TREE, across every
+	// ratchet it holds, so a receiver's retained key memory is a constant rather than a
+	// multiple of the group size -- and the group size is a number the other members choose.
+	// See SecretTree.pruneRetained for what a peer buys without it, measured.
+	//
+	// It is RatchetWindowSize itself and not a multiple of it, so a tree of any size retains
+	// at most what a single ratchet could already cost and adding senders adds no memory at
+	// all. What keeps that from starving an honest out of order sender is WHICH entry goes:
+	// the eviction always lands on the fullest window, so a member holding a handful of
+	// skipped keys is never the one paying for a member holding a thousand.
+	//
+	// It is derived from RatchetWindowSize rather than written down again, so the two cannot
+	// drift into a state where the per ratchet bound is the larger of the pair and the tree
+	// wide one is the only bound that ever fires.
+	MaxRetainedWindowKeys int = RatchetWindowSize
 )
 
 // NextSenderKey returns the next generation's key and nonce for our own leaf, and advances
@@ -611,6 +724,15 @@ func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation
 		return nil, nil, err
 	}
 	keys, err := r.keyFor(generation)
+	// the tree wide bound is applied whether or not the request was served. keyFor retains
+	// every generation it steps past, and a request that fails partway through -- an
+	// exhausted ratchet -- has retained them just the same, so a bound applied only on the
+	// success path is one a peer walks around by always failing.
+	//
+	// The keys just handed out are not at risk from this: keyFor deletes the generation it
+	// returns from the window before returning it, and a generation it stepped to is never
+	// put in the window at all.
+	self.pruneRetained()
 	if err != nil {
 		return nil, nil, err
 	}
