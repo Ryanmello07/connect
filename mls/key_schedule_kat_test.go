@@ -55,6 +55,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,10 +64,13 @@ import (
 	"go/token"
 	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // The family, and the accounting that makes its runner unable to pass having compared
@@ -772,13 +776,13 @@ func independentExpandWithLabel(t *testing.T, secret []byte, label string, conte
 	if length != sha256.Size {
 		t.Fatalf("this derivation writes one HKDF-Expand block and was asked for %d octets", length)
 	}
-	prefixed := []byte("MLS 1.0 " + label)
-	info := []byte{byte(length >> 8), byte(length)}
-	info = append(info, independentOpaqueV(t, prefixed)...)
-	info = append(info, independentOpaqueV(t, context)...)
-
+	// the KDFLabel bytes are written by independentKdfLabel, which is the single hand
+	// written encoder of this file. Inlining them here would make it two, and a second
+	// hand encoder is a second opinion nothing checks -- task 18 holds the one below
+	// against this package's own ExpandWithLabel byte for byte, and that check would say
+	// nothing about a copy living here.
 	expand := hmac.New(sha256.New, secret)
-	expand.Write(info)
+	expand.Write(independentKdfLabel(t, label, context, length))
 	expand.Write([]byte{0x01})
 	return expand.Sum(nil)
 }
@@ -1268,6 +1272,69 @@ func productionFunctionNames(t *testing.T) map[string]bool {
 	return names
 }
 
+// siblingPackageQualifiers is every package of THIS MODULE that this package imports, by
+// the identifier a call site writes: syntax today, and whatever a later plan adds.
+//
+// This exists because a mutation survived the gate below without it. productionFunctionNames
+// reads this package's own non test files, so it holds PskSecret and ExpandWithLabel and
+// knows nothing about mls/syntax -- and the codec is exactly what a hand written wire
+// encoder is supposed to be a second opinion about. An "independent" group context encoder
+// whose body was replaced with a syntax.Marshal call reached the code under test and the
+// gate reported clean, which is the whole failure this file exists to make impossible, one
+// package boundary out.
+//
+// What is banned is the QUALIFIER and not the function name, because the walk matches text
+// and cannot tell syntax.Marshal from json.Marshal: adding Marshal to the class would flag
+// every generator that serializes its cases. Banning the qualifier is both tighter and
+// truer -- a derivation that answers independently has no business naming a sibling package
+// of the code under test at all, whichever function of it it calls.
+//
+// Derived from the import statements rather than written down, because the class grows: p5
+// and p6 add packages under this module and a list would exempt every one of them.
+func siblingPackageQualifiers(t *testing.T) map[string]bool {
+	t.Helper()
+	const modulePrefix = `"github.com/urnetwork/connect/`
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	qualifiers := map[string]bool{}
+	read := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		read++
+		for _, imported := range parsed.Imports {
+			if !strings.HasPrefix(imported.Path.Value, modulePrefix) {
+				continue
+			}
+			// the identifier a call site writes: the explicit alias where there is one,
+			// and the last path element otherwise.
+			qualifier := strings.Trim(imported.Path.Value, `"`)
+			qualifier = qualifier[strings.LastIndex(qualifier, "/")+1:]
+			if imported.Name != nil {
+				qualifier = imported.Name.Name
+			}
+			qualifiers[qualifier] = true
+		}
+	}
+	if read == 0 {
+		t.Fatal("no production file was read, so the class below would be empty and every gate over it vacuous")
+	}
+	if !qualifiers["syntax"] {
+		t.Fatalf("the import scan read %d files and did not find %s, which this package certainly imports, so it is deriving nothing",
+			read, "mls/syntax")
+	}
+	return qualifiers
+}
+
 // oneHopLaunderingRoot and oneHopLaunderingHelper are the control on the call graph walk:
 // a generator in one file, and the helper it calls declared in another, with the code under
 // test reached only from the helper.
@@ -1348,14 +1415,66 @@ func TestTheGenerateDirectionSharesNoCodePathWithVerify(t *testing.T) {
 		t.Fatalf("the walk sees %d functions over every test file and %d over the runner files alone; it is not reading the wider class",
 			len(declared), len(testFileFunctions(runners)))
 	}
+	// the forbidden class: this package's own production functions, and the qualifier of
+	// every sibling package of this module it imports. The second half is not decoration
+	// -- an independent encoder rewritten as a syntax.Marshal call reaches the codec it is
+	// meant to be a second opinion about, and the function name class cannot see it
+	// because the codec is declared one directory over.
 	production := productionFunctionNames(t)
+	siblings := siblingPackageQualifiers(t)
+	for qualifier := range siblings {
+		if production[qualifier] {
+			t.Fatalf("%s is both a production function name and a sibling package qualifier, so a hit on it says nothing about which one was reached",
+				qualifier)
+		}
+		production[qualifier] = true
+	}
+	// the control on the second half: the walk must actually report the qualifier of a
+	// function that names it, or banning it bans nothing.
+	if !reachableNames(t, declared, "compareKeyScheduleVector")["syntax"] {
+		t.Fatal("the walk does not report syntax from a function that calls syntax.Marshal, so banning the qualifier below bans nothing")
+	}
 
 	verifyReaches := reachableNames(t, declared, "comparePskSecretVector")
 	if !verifyReaches["PskSecret"] {
 		t.Fatal("the verify direction does not reach PskSecret, so the collector is reading nothing and the disjointness below is vacuous")
 	}
 
-	for _, root := range []string{"generatePskSecretVectors", "independentPskSecret", "independentPskSecretTransposed"} {
+	// the roots, DERIVED and not listed: every function these test files declare whose
+	// name claims independence, plus the generator of family 6, which answers with the
+	// hand written derivation and owes the same disjointness.
+	//
+	// Derived because a list covers the functions that existed when it was written. Task
+	// 18 adds six independent functions to this file and later plans add their own; the
+	// version of this loop that named three of them would have gone on reporting a clean
+	// run over the three while a fourth reached straight into the package it is meant to
+	// be a second opinion about. The naming convention IS the claim, so it is what the
+	// gate reads.
+	roots := []string{}
+	for name := range declared {
+		if strings.HasPrefix(name, "independent") {
+			roots = append(roots, name)
+		}
+	}
+	slices.Sort(roots)
+	// the derivation must have found the ones this tree certainly declares, or it is
+	// matching nothing and the disjointness below holds over an empty set.
+	for _, required := range []string{
+		"independentPskSecret", "independentPskSecretTransposed", "independentExpandWithLabel",
+		"independentKdfLabel", "independentKeyScheduleSecrets", "independentGroupContext",
+	} {
+		if !slices.Contains(roots, required) {
+			t.Fatalf("the root derivation found %v and %s is not among them, so it is reading nothing useful over %d declared functions",
+				roots, required, len(declared))
+		}
+	}
+	// generatePskSecretVectors is family 6's generator and computes its answers with the
+	// hand written derivation, so it is held to the same rule. Family 5's generator is
+	// NOT: it takes external_pub from the implementation because DeriveKeyPair is HPKE and
+	// this tree has no second X25519, and TestVectorKeyScheduleGenerate is what says the
+	// rest of that generator's answers came from the hand written path.
+	roots = append(roots, "generatePskSecretVectors")
+	for _, root := range roots {
 		shared := []string{}
 		for name := range reachableNames(t, declared, root) {
 			if production[name] {
@@ -1368,8 +1487,8 @@ func TestTheGenerateDirectionSharesNoCodePathWithVerify(t *testing.T) {
 				root, shared)
 		}
 	}
-	t.Logf("the generate direction was walked over %d functions declared across %d test files, against %d production function names",
-		len(declared), len(all), len(production))
+	t.Logf("the generate direction was walked over %d functions declared across %d test files, against %d production function names; %d independent roots: %v",
+		len(declared), len(all), len(production), len(roots), roots)
 }
 
 // TestNoVectorRunnerCanSkip holds every vector harness file to failing rather than skipping.
@@ -1436,4 +1555,1705 @@ func skipsNamedIn(file *ast.File, skips map[string]bool) []string {
 		return true
 	})
 	return slices.Sorted(maps.Keys(found))
+}
+
+// ---------------------------------------------------------------------------
+// vector family 5, key-schedule.json
+// ---------------------------------------------------------------------------
+
+// The family, and the accounting that makes its runner unable to pass having compared
+// nothing.
+//
+// These are transcriptions of what testdata/vectors/key-schedule.json holds at the pinned
+// mlswg commit: seven entries, one per published ciphersuite, five epochs each, of which
+// the two suites this package registers account for two entries and ten epochs. Fourteen
+// answers are compared per epoch, so 140 comparisons, and the corpus publishes 140
+// DISTINCT values for them -- no two of the answers this runner checks are the same
+// string -- which is what makes the distinctness assertion in the runner a real one rather
+// than a count of one repeated value.
+//
+// Written down rather than derived, for the reason task 16 gives: deriving the expected
+// count with the same filter that is under test is how a filter matching nothing ends up
+// agreeing with itself. What IS derived and checked alongside them is that compared plus
+// skipped equals the number of entries read.
+const (
+	keyScheduleFamilyVectors        = 2
+	keyScheduleFamilySkipped        = 5
+	keyScheduleFamilyEpochs         = 10
+	keyScheduleFamilyChecksPerEpoch = 14
+	keyScheduleFamilyComparisons    = keyScheduleFamilyEpochs * keyScheduleFamilyChecksPerEpoch
+)
+
+// keyScheduleVector is one entry of key-schedule.json. Binary fields stay strings for the
+// reason pskSecretKatVector gives: MustHex is the single decoder and a struct holding
+// []byte would need a second one at the json boundary.
+type keyScheduleVector struct {
+	CipherSuite       uint16             `json:"cipher_suite"`
+	GroupId           string             `json:"group_id"`
+	InitialInitSecret string             `json:"initial_init_secret"`
+	Epochs            []keyScheduleEpoch `json:"epochs"`
+}
+
+// keyScheduleEpoch is one epoch of a key-schedule vector: the three inputs the epoch is
+// advanced on, the serialized group context, and every published answer.
+//
+// Exporter is labelKatExporter, which crypto_labels_test.go already declares for this same
+// corpus. Its Label is a string in the mlswg format while every sibling field is hex, and
+// it is NOT hex decoded -- see task 8's TestKeyScheduleExportLabelIsNotHexDecoded.
+type keyScheduleEpoch struct {
+	TreeHash                string           `json:"tree_hash"`
+	CommitSecret            string           `json:"commit_secret"`
+	PskSecret               string           `json:"psk_secret"`
+	ConfirmedTranscriptHash string           `json:"confirmed_transcript_hash"`
+	GroupContext            string           `json:"group_context"`
+	JoinerSecret            string           `json:"joiner_secret"`
+	WelcomeSecret           string           `json:"welcome_secret"`
+	InitSecret              string           `json:"init_secret"`
+	SenderDataSecret        string           `json:"sender_data_secret"`
+	EncryptionSecret        string           `json:"encryption_secret"`
+	ExporterSecret          string           `json:"exporter_secret"`
+	EpochAuthenticator      string           `json:"epoch_authenticator"`
+	ExternalSecret          string           `json:"external_secret"`
+	ConfirmationKey         string           `json:"confirmation_key"`
+	MembershipKey           string           `json:"membership_key"`
+	ResumptionPsk           string           `json:"resumption_psk"`
+	ExternalPub             string           `json:"external_pub"`
+	Exporter                labelKatExporter `json:"exporter"`
+}
+
+// keyScheduleCheckNames is every comparison this runner makes for one epoch, named by the
+// json path the published answer lives at rather than by the Go field that decodes it.
+//
+// The json path is the load bearing choice. The runner re-reads each published answer out
+// of a GENERIC decode of the same entry -- map[string]json.RawMessage, no struct tags
+// involved -- and holds the comparator's answer against that, so a struct tag renamed or
+// misspelled shows up here as a key the corpus does not publish rather than as a field
+// that silently decodes to the empty string and compares equal to nothing.
+//
+// The order is the order the comparator emits them in, and incomplete() requires every
+// name to appear exactly once per epoch, so a comparison dropped from the middle of an
+// epoch is a failure rather than a smaller count nobody wrote down.
+var keyScheduleCheckNames = []string{
+	"group_context",
+	"joiner_secret",
+	"welcome_secret",
+	"sender_data_secret",
+	"encryption_secret",
+	"exporter_secret",
+	"external_secret",
+	"confirmation_key",
+	"membership_key",
+	"resumption_psk",
+	"epoch_authenticator",
+	"init_secret",
+	"external_pub",
+	"exporter.secret",
+}
+
+// keyScheduleNonSecretChecks are the three of those fourteen that are not a KDF.Nh secret
+// of the epoch: the serialized group context, whose width is its own contents'; the
+// external HPKE public key, whose width is the suite's Npk and not the kdf's; and the
+// MLS-Exporter answer, whose width is the length the vector asked for.
+//
+// They are named here so the secret class below can be derived by subtraction. The width
+// and aliasing controls apply to the secret class only, and a class written out directly
+// would be an eleven name list that a twelfth secret would silently fall out of.
+var keyScheduleNonSecretChecks = []string{"group_context", "external_pub", "exporter.secret"}
+
+// keyScheduleSecretChecks is every check whose published answer must be exactly KDF.Nh
+// octets and must differ from every other secret of its own epoch, derived by subtracting
+// the three above from the fourteen.
+//
+// Derived because the class grows with the schedule. Nine of the eleven are the fields of
+// EpochSecrets and the other two sit above them, so
+// TestKeyScheduleFamilyChecksAreTheWholeEpoch holds this count to that type's own field
+// count plus joiner and welcome. A tenth secret added to the schedule fails there rather
+// than quietly leaving this list a name short.
+func keyScheduleSecretChecks() []string {
+	names := []string{}
+	for _, name := range keyScheduleCheckNames {
+		if !slices.Contains(keyScheduleNonSecretChecks, name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// Family 5 is installed here, and 5 is deleted from expectedPendingFamilies in the same
+// commit. Without both halves TestVectorFamiliesVerify runs one fewer family and the
+// manifest gate stays green while claiming this family is unimplemented.
+func init() {
+	RegisterVectorFamily(VectorFamily{
+		Number:   5,
+		Name:     "Key schedule",
+		File:     keyScheduleKatFile,
+		Slice:    "A3",
+		Verify:   verifyKeyScheduleVector,
+		Generate: generateKeyScheduleVector,
+	})
+}
+
+// The refusals compareKeyScheduleVector makes, as sentinels rather than as formatted
+// strings, so a test can require a specific refusal rather than "some error".
+//
+// They are what makes the comparison observable at all. Every entry of the vendored corpus
+// agrees with this implementation, so a comparator that checked everything and a
+// comparator that checked nothing produce identical runs over it; the only way to tell
+// them apart is to hand it an answer that is wrong on purpose and require the matching
+// refusal, which is TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept.
+var (
+	errKeyScheduleWidth      = errors.New("a published key schedule secret is not the suite's KDF.Nh")
+	errKeyScheduleAliased    = errors.New("two published secrets of one epoch are the same value")
+	errKeyScheduleMismatch   = errors.New("a key schedule answer does not match the published one")
+	errKeyScheduleDidNotMove = errors.New("flipping one octet of the published commit secret left joiner_secret unchanged")
+	errKeyScheduleIncomplete = errors.New("the comparison reports values it cannot have computed")
+)
+
+// keyScheduleCheck is one answer this package computed held against one answer the corpus
+// published, filed under the json path the published half lives at.
+type keyScheduleCheck struct {
+	epoch int
+	name  string
+	got   []byte
+	want  []byte
+}
+
+// keyScheduleComparison is what one run of compareKeyScheduleVector PRODUCED, and it is
+// the only thing its callers are allowed to judge it by.
+//
+// The shape is task 16's and it is here for task 16's reason. A comparator returning a
+// bool reports that control reached the bottom of the function and not that a comparison
+// happened: an early return above it leaves the runner counting vectors that never called
+// NewKeySchedule at all, and the run stays green. Every field below is written at the
+// point the work that produces it happens, so a return that skipped the work reports the
+// zero value, and a caller that judges the values rather than the fact of returning sees
+// that.
+type keyScheduleComparison struct {
+	// inScope is true when the vector's ciphersuite is one this package registers. A
+	// false here is not a failure and not a skip: it is a vector with no provider.
+	inScope bool
+	// hashSize is the suite's KDF.Nh, read off the provider rather than assumed.
+	hashSize int
+	// epochs is how many epochs of the vector were advanced through.
+	epochs int
+	// checks is every comparison the run made, in the order it made them.
+	checks []keyScheduleCheck
+	// joiner is epoch 0's joiner secret, and perturbed is the same with one octet of the
+	// vector's own commit_secret flipped. Equal means the corpus data never reached the
+	// derivation.
+	joiner    []byte
+	perturbed []byte
+}
+
+// incomplete reports whether the evidence a compared vector must carry is missing or
+// inconsistent, without looking at whether any answer was right.
+//
+// This is the vacuity half, split from the correctness half on purpose. bytes.Equal over
+// two empty slices says they agree, so a check whose got or want is empty has compared
+// nothing whatever the comparison would say about it -- and a runner that counted such
+// checks would report the full 140 having derived none of them.
+func (self keyScheduleComparison) incomplete() error {
+	switch {
+	case !self.inScope:
+		return fmt.Errorf("%w: the vector is out of scope and carries no comparison", errKeyScheduleIncomplete)
+	case self.hashSize == 0:
+		return fmt.Errorf("%w: no KDF.Nh was read from the provider", errKeyScheduleIncomplete)
+	case self.epochs == 0:
+		return fmt.Errorf("%w: no epoch was advanced through", errKeyScheduleIncomplete)
+	case len(self.checks) != self.epochs*keyScheduleFamilyChecksPerEpoch:
+		return fmt.Errorf("%w: %d epochs produced %d comparisons and each epoch owes %d",
+			errKeyScheduleIncomplete, self.epochs, len(self.checks), keyScheduleFamilyChecksPerEpoch)
+	case len(self.joiner) != self.hashSize || len(self.perturbed) != self.hashSize:
+		return fmt.Errorf("%w: the flipped octet control was never run", errKeyScheduleIncomplete)
+	}
+	// every name exactly once per epoch, so a comparison dropped from the middle of an
+	// epoch cannot be made up for by another one made twice.
+	seen := map[string]int{}
+	for _, check := range self.checks {
+		if len(check.got) == 0 || len(check.want) == 0 {
+			return fmt.Errorf("%w: epoch %d %s compared %d computed octets against %d published ones, and an empty comparison agrees with anything",
+				errKeyScheduleIncomplete, check.epoch, check.name, len(check.got), len(check.want))
+		}
+		if check.epoch < 0 || check.epoch >= self.epochs {
+			return fmt.Errorf("%w: a comparison is filed under epoch %d of %d",
+				errKeyScheduleIncomplete, check.epoch, self.epochs)
+		}
+		seen[check.name]++
+	}
+	for _, name := range keyScheduleCheckNames {
+		if seen[name] != self.epochs {
+			return fmt.Errorf("%w: %s was compared %d times over %d epochs",
+				errKeyScheduleIncomplete, name, seen[name], self.epochs)
+		}
+	}
+	if len(seen) != keyScheduleFamilyChecksPerEpoch {
+		return fmt.Errorf("%w: the run compared %d distinct answers per epoch and this family checks %d",
+			errKeyScheduleIncomplete, len(seen), keyScheduleFamilyChecksPerEpoch)
+	}
+	return nil
+}
+
+// verdict is the whole judgement over one compared vector: it must be complete, every
+// published secret must be the suite's width, no two secrets of one epoch may be the same
+// value, every comparison must agree, and the vacuity control must have moved.
+//
+// The order is deliberate. A width failure and an aliasing failure are both statements
+// that this is not the comparison the corpus intends, and reporting either as a plain
+// mismatch would let a test asking for one of them be satisfied by the other.
+func (self keyScheduleComparison) verdict() error {
+	if err := self.incomplete(); err != nil {
+		return err
+	}
+	secrets := keyScheduleSecretChecks()
+	for _, check := range self.checks {
+		if !slices.Contains(secrets, check.name) {
+			continue
+		}
+		if len(check.want) != self.hashSize {
+			return fmt.Errorf("%w: epoch %d %s is %d octets against a KDF.Nh of %d",
+				errKeyScheduleWidth, check.epoch, check.name, len(check.want), self.hashSize)
+		}
+	}
+	// the nine secrets of an epoch are DeriveSecret over one epoch_secret under nine
+	// different labels, and joiner and welcome sit above them. All eleven are KDF.Nh
+	// octets of apparent random, so a label copied from the line above produces a
+	// perfectly well formed secret; two published answers holding one value would be a
+	// corpus this comparison cannot tell those two labels apart with.
+	published := map[int]map[string]string{}
+	for _, check := range self.checks {
+		if !slices.Contains(secrets, check.name) {
+			continue
+		}
+		epoch, started := published[check.epoch]
+		if !started {
+			epoch = map[string]string{}
+			published[check.epoch] = epoch
+		}
+		text := HexOf(check.want)
+		if previous, duplicated := epoch[text]; duplicated {
+			return fmt.Errorf("%w: epoch %d publishes %s for both %s and %s",
+				errKeyScheduleAliased, check.epoch, text, previous, check.name)
+		}
+		epoch[text] = check.name
+	}
+	for _, check := range self.checks {
+		if !bytes.Equal(check.got, check.want) {
+			return fmt.Errorf("%w: epoch %d %s = %s, the corpus publishes %s",
+				errKeyScheduleMismatch, check.epoch, check.name, HexOf(check.got), HexOf(check.want))
+		}
+	}
+	if bytes.Equal(self.perturbed, self.joiner) {
+		return fmt.Errorf("%w: %s, so the corpus data never reached the derivation",
+			errKeyScheduleDidNotMove, HexOf(self.joiner))
+	}
+	return nil
+}
+
+// verifyKeyScheduleVector is the registry's shim: the signature RegisterVectorFamily needs,
+// over the comparator that does the work and reports what it produced.
+//
+// The split is the whole point, and it is the defect task 16 shipped and then had to fix.
+// Verify cannot return anything, so a runner counting calls to it would count a vector it
+// declined to check exactly as it counts one it compared.
+func verifyKeyScheduleVector(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	evidence, err := compareKeyScheduleVector(t, raw)
+	if err != nil {
+		t.Fatalf("key-schedule: %v", err)
+	}
+	if !evidence.inScope {
+		return
+	}
+	if err := evidence.verdict(); err != nil {
+		t.Fatalf("key-schedule: %v", err)
+	}
+}
+
+// compareKeyScheduleVector runs one entry of key-schedule.json and returns what the run
+// produced. A vector at a ciphersuite v1 does not implement is not a failure and not a
+// skip: it comes back with inScope false and nothing else set.
+//
+// The chain is carried forward with OUR init_secret rather than re-seeded from the vector
+// at each epoch, so a divergence surfaces at the epoch that caused it instead of being
+// masked by the next reseed. Only initial_init_secret is read from the vector.
+//
+// A corpus that will not parse or will not hex decode is fatal here rather than returned,
+// because it is not a verdict about this implementation -- it is the evidence itself being
+// unreadable. Everything that IS a verdict about this implementation is returned, so a
+// caller can require a refusal instead of hoping the corpus disagrees with a defect.
+func compareKeyScheduleVector(t *testing.T, raw json.RawMessage) (keyScheduleComparison, error) {
+	t.Helper()
+	vector := keyScheduleVector{}
+	if err := json.Unmarshal(raw, &vector); err != nil {
+		t.Fatalf("parse key-schedule entry: %v", err)
+	}
+	suite, ok := implementedSuite(vector.CipherSuite)
+	if !ok {
+		return keyScheduleComparison{}, nil
+	}
+	crypto, err := NewCryptoProvider(suite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
+	}
+	evidence := keyScheduleComparison{
+		inScope:  true,
+		hashSize: crypto.HashSize(),
+		epochs:   len(vector.Epochs),
+	}
+	initSecret := MustHex(t, vector.InitialInitSecret)
+	if len(initSecret) != evidence.hashSize {
+		return evidence, fmt.Errorf("%w: initial_init_secret is %d octets against a KDF.Nh of %d",
+			errKeyScheduleWidth, len(initSecret), evidence.hashSize)
+	}
+
+	for n, epoch := range vector.Epochs {
+		groupContext := &GroupContext{
+			Version:                 ProtocolVersionMls10,
+			CipherSuite:             suite,
+			GroupId:                 MustHex(t, vector.GroupId),
+			Epoch:                   uint64(n),
+			TreeHash:                MustHex(t, epoch.TreeHash),
+			ConfirmedTranscriptHash: MustHex(t, epoch.ConfirmedTranscriptHash),
+			Extensions:              nil,
+		}
+		encoded, err := syntax.Marshal(groupContext)
+		if err != nil {
+			return evidence, fmt.Errorf("epoch %d: syntax.Marshal: %w", n, err)
+		}
+		commitSecret := MustHex(t, epoch.CommitSecret)
+		pskSecret := MustHex(t, epoch.PskSecret)
+		schedule, err := NewKeySchedule(crypto, initSecret, commitSecret, pskSecret, groupContext)
+		if err != nil {
+			return evidence, fmt.Errorf("epoch %d: NewKeySchedule: %w", n, err)
+		}
+		secrets := schedule.Secrets()
+		_, externalPub, err := schedule.ExternalKeyPair()
+		if err != nil {
+			return evidence, fmt.Errorf("epoch %d: ExternalKeyPair: %w", n, err)
+		}
+		exported, err := schedule.Export(
+			epoch.Exporter.Label, MustHex(t, epoch.Exporter.Context), epoch.Exporter.Length)
+		if err != nil {
+			return evidence, fmt.Errorf("epoch %d: Export: %w", n, err)
+		}
+		// the order here is keyScheduleCheckNames' order, which incomplete() holds it to.
+		for _, check := range []struct {
+			name string
+			got  []byte
+			want string
+		}{
+			{"group_context", encoded, epoch.GroupContext},
+			{"joiner_secret", schedule.JoinerSecret(), epoch.JoinerSecret},
+			{"welcome_secret", schedule.WelcomeSecret(), epoch.WelcomeSecret},
+			{"sender_data_secret", secrets.SenderData, epoch.SenderDataSecret},
+			{"encryption_secret", secrets.Encryption, epoch.EncryptionSecret},
+			{"exporter_secret", secrets.Exporter, epoch.ExporterSecret},
+			{"external_secret", secrets.External, epoch.ExternalSecret},
+			{"confirmation_key", secrets.Confirmation, epoch.ConfirmationKey},
+			{"membership_key", secrets.Membership, epoch.MembershipKey},
+			{"resumption_psk", secrets.ResumptionPsk, epoch.ResumptionPsk},
+			{"epoch_authenticator", secrets.EpochAuthenticator, epoch.EpochAuthenticator},
+			{"init_secret", secrets.InitSecret, epoch.InitSecret},
+			{"external_pub", externalPub, epoch.ExternalPub},
+			{"exporter.secret", exported, epoch.Exporter.Secret},
+		} {
+			evidence.checks = append(evidence.checks, keyScheduleCheck{
+				epoch: n,
+				name:  check.name,
+				got:   bytes.Clone(check.got),
+				want:  MustHex(t, check.want),
+			})
+		}
+
+		// the vacuity control, run on the first epoch: one octet of the corpus's own
+		// commit_secret, flipped, must move joiner_secret. An agreement that survives this
+		// was not computed from the corpus -- a renamed json field, a struct tag typo, a
+		// decoder returning nothing all leave the answer where it was.
+		if n == 0 {
+			evidence.joiner = bytes.Clone(schedule.JoinerSecret())
+			if len(commitSecret) == 0 {
+				return evidence, fmt.Errorf("%w: epoch 0 publishes no commit_secret to flip", errKeyScheduleIncomplete)
+			}
+			flipped := bytes.Clone(commitSecret)
+			flipped[0] ^= 0x01
+			moved, err := NewKeySchedule(crypto, initSecret, flipped, pskSecret, groupContext)
+			if err != nil {
+				return evidence, fmt.Errorf("epoch 0: NewKeySchedule over the flipped commit secret: %w", err)
+			}
+			evidence.perturbed = bytes.Clone(moved.JoinerSecret())
+		}
+
+		// carry our own init_secret forward, not the vector's.
+		initSecret = bytes.Clone(secrets.InitSecret)
+	}
+	return evidence, evidence.verdict()
+}
+
+// keyScheduleCorpusField reads one published answer out of an epoch decoded as a GENERIC
+// json object, addressed by the same dotted json path the comparator files its check
+// under.
+//
+// Generic on purpose. The comparator reads the corpus through keyScheduleEpoch's struct
+// tags and this reads the same bytes with no struct involved, so the two are independent
+// decodes of one file: a tag misspelled, renamed, or pointed at a key the corpus does not
+// publish decodes to the empty string on the comparator's side and is a missing key here,
+// which is a failure rather than a comparison of nothing against nothing.
+func keyScheduleCorpusField(t *testing.T, epoch map[string]json.RawMessage, name string) string {
+	t.Helper()
+	key, nested, isNested := strings.Cut(name, ".")
+	raw, published := epoch[key]
+	if !published {
+		t.Fatalf("the corpus epoch does not publish %q, so whatever decodes it decodes to nothing and every comparison over it is vacuous", key)
+	}
+	if isNested {
+		inner := map[string]json.RawMessage{}
+		if err := json.Unmarshal(raw, &inner); err != nil {
+			t.Fatalf("the published %s is not a json object: %v", key, err)
+		}
+		raw, published = inner[nested]
+		if !published {
+			t.Fatalf("the published %s does not carry %q", key, nested)
+		}
+	}
+	text := ""
+	if err := json.Unmarshal(raw, &text); err != nil {
+		t.Fatalf("the published %s is not a json string: %v", name, err)
+	}
+	return text
+}
+
+// TestVectorKeySchedule is vector family 5 over the published corpus.
+//
+// Every assertion after the loop exists because the loop can be made to run zero times
+// without anything else in this package noticing. A filter that matched nothing, a filter
+// that matched all seven published suites, a corpus that parsed to an empty array, a
+// comparator that declined every vector: each of those is a green run of this test with
+// the assertions removed, and a failure with them.
+//
+// What the loop counts is not calls that returned. It counts comparisons whose evidence
+// this runner itself re-checked against a generic decode of the corpus text, so a
+// comparator that answered without computing anything is a failure here rather than a
+// number that looks right.
+func TestVectorKeySchedule(t *testing.T) {
+	entries := LoadVectorFile(t, keyScheduleKatFile)
+	if len(entries) == 0 {
+		t.Fatalf("%s parsed to no entries, so every comparison below would be against nothing", keyScheduleKatFile)
+	}
+
+	vectors, skipped, epochs, compared := 0, 0, 0, 0
+	matched := map[CipherSuite]int{}
+	// published counts every entry by its ciphersuite, in scope or not, so the per suite
+	// split below is derived from the corpus rather than transcribed here.
+	published := map[uint16]int{}
+	answers := map[string]int{}
+	for index, raw := range entries {
+		header := struct {
+			CipherSuite uint16                       `json:"cipher_suite"`
+			Epochs      []map[string]json.RawMessage `json:"epochs"`
+		}{}
+		if err := json.Unmarshal(raw, &header); err != nil {
+			t.Fatalf("vector %d: %v", index, err)
+		}
+		published[header.CipherSuite]++
+		suite, ok := implementedSuite(header.CipherSuite)
+		if !ok {
+			skipped++
+			continue
+		}
+		evidence, err := compareKeyScheduleVector(t, raw)
+		if err != nil {
+			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
+		}
+		if !evidence.inScope {
+			t.Fatalf("vector %d is at suite %#04x, which this package registers, and the comparator declined it",
+				index, header.CipherSuite)
+		}
+		if err := evidence.verdict(); err != nil {
+			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
+		}
+		if evidence.epochs != len(header.Epochs) {
+			t.Fatalf("vector %d publishes %d epochs and the comparator advanced through %d",
+				index, len(header.Epochs), evidence.epochs)
+		}
+		// and this runner's own half of the comparison, against the answers it read out
+		// of the corpus text itself with no struct tag in the way.
+		for _, check := range evidence.checks {
+			want := keyScheduleCorpusField(t, header.Epochs[check.epoch], check.name)
+			if got := HexOf(check.got); got != want {
+				t.Fatalf("vector %d (suite %#04x) epoch %d: this package computes %s for %s, the corpus publishes %s",
+					index, header.CipherSuite, check.epoch, got, check.name, want)
+			}
+			answers[want]++
+			compared++
+		}
+		vectors++
+		epochs += evidence.epochs
+		matched[suite]++
+	}
+
+	if vectors+skipped != len(entries) {
+		t.Fatalf("%d compared and %d skipped over %d entries; an entry took neither branch",
+			vectors, skipped, len(entries))
+	}
+	if vectors != keyScheduleFamilyVectors {
+		t.Fatalf("compared %d published key schedules, want %d; the filter matched %v",
+			vectors, keyScheduleFamilyVectors, matched)
+	}
+	if skipped != keyScheduleFamilySkipped {
+		t.Fatalf("skipped %d entries at unimplemented suites, want %d", skipped, keyScheduleFamilySkipped)
+	}
+	if epochs != keyScheduleFamilyEpochs {
+		t.Fatalf("advanced through %d epochs, want %d", epochs, keyScheduleFamilyEpochs)
+	}
+	if compared != keyScheduleFamilyComparisons {
+		t.Fatalf("made %d comparisons over %d epochs, want %d", compared, epochs, keyScheduleFamilyComparisons)
+	}
+	if got := slices.Sorted(maps.Keys(matched)); !slices.Equal(got, Suites()) {
+		t.Fatalf("the corpus answered for %v and this package registers %v", got, Suites())
+	}
+	// the per suite split, which the key set above says nothing about: a corpus that grew
+	// a second entry at one registered suite would satisfy the key set and the total while
+	// leaving the other suite covered by one entry instead of two.
+	for _, suite := range Suites() {
+		want := published[uint16(suite)]
+		if want == 0 {
+			t.Fatalf("the corpus publishes nothing at suite %#04x, which this package registers", uint16(suite))
+		}
+		if matched[suite] != want {
+			t.Fatalf("suite %#04x was compared %d times and the corpus publishes %d entries at it",
+				uint16(suite), matched[suite], want)
+		}
+	}
+	// the corpus publishes 140 distinct answers for the 140 comparisons, so a file read as
+	// one repeated value -- every field decoding to the same string, every epoch decoding
+	// as epoch 0 -- compares the right number of times against the wrong number of answers
+	// and fails here.
+	if len(answers) != keyScheduleFamilyComparisons {
+		t.Fatalf("the %d comparisons were made against %d distinct published answers, want %d",
+			compared, len(answers), keyScheduleFamilyComparisons)
+	}
+	t.Logf("key-schedule: %d vectors over %d epochs, %d comparisons against %d distinct published answers, %d entries skipped at unimplemented suites",
+		vectors, epochs, compared, len(answers), skipped)
+}
+
+// TestKeyScheduleFamilyChecksAreTheWholeEpoch holds the fourteen names this family compares
+// to what an epoch actually holds, so a secret added to the schedule cannot arrive without
+// a comparison.
+//
+// The secret class is derived from EpochSecrets by reflection rather than counted here: the
+// nine fields of that type are exactly the DeriveSecret outputs of one epoch, and joiner and
+// welcome are the two that sit above them. A tenth field added to EpochSecrets fails here
+// rather than leaving this family comparing thirteen of fourteen answers and reporting a
+// clean run.
+func TestKeyScheduleFamilyChecksAreTheWholeEpoch(t *testing.T) {
+	if len(keyScheduleCheckNames) != keyScheduleFamilyChecksPerEpoch {
+		t.Fatalf("this family names %d checks per epoch and the count it asserts is %d",
+			len(keyScheduleCheckNames), keyScheduleFamilyChecksPerEpoch)
+	}
+	distinct := slices.Compact(slices.Sorted(slices.Values(keyScheduleCheckNames)))
+	if len(distinct) != len(keyScheduleCheckNames) {
+		t.Fatalf("the check names hold %d distinct entries out of %d, so one is compared twice and another not at all",
+			len(distinct), len(keyScheduleCheckNames))
+	}
+	for _, name := range keyScheduleNonSecretChecks {
+		if !slices.Contains(keyScheduleCheckNames, name) {
+			t.Fatalf("%s is excluded from the secret class and is not one of the checks, so the subtraction below removes nothing",
+				name)
+		}
+	}
+	secrets := keyScheduleSecretChecks()
+	// the nine of EpochSecrets, plus joiner_secret and welcome_secret.
+	epochSecrets := reflect.TypeOf(EpochSecrets{})
+	want := epochSecrets.NumField() + 2
+	if len(secrets) != want {
+		t.Fatalf("this family compares %d KDF.Nh secrets per epoch and an epoch holds %d (%d fields of %s, plus joiner and welcome): %v",
+			len(secrets), want, epochSecrets.NumField(), epochSecrets.Name(), secrets)
+	}
+	for _, required := range []string{"joiner_secret", "welcome_secret", "init_secret", "confirmation_key"} {
+		if !slices.Contains(secrets, required) {
+			t.Fatalf("the secret class %v does not hold %s", secrets, required)
+		}
+	}
+	for _, excluded := range keyScheduleNonSecretChecks {
+		if slices.Contains(secrets, excluded) {
+			t.Fatalf("%s is in the secret class and is not a KDF.Nh secret, so the width control would refuse a correct corpus", excluded)
+		}
+	}
+}
+
+// TestKeyScheduleFamilyIsInstalled is the registration half of task 17.
+//
+// Registering the family and deleting its number from expectedPendingFamilies are two
+// edits, and doing only the first leaves TestVectorManifestIsComplete failing while doing
+// only the second leaves it passing with the family uninstalled. This asserts both, and
+// asserts the runner installed is this file's.
+func TestKeyScheduleFamilyIsInstalled(t *testing.T) {
+	family, ok := vectorManifest[5]
+	if !ok {
+		t.Fatal("family 5 is not in the manifest")
+	}
+	if family.File != keyScheduleKatFile {
+		t.Fatalf("family 5 names %s, this runner reads %s", family.File, keyScheduleKatFile)
+	}
+	if family.Verify == nil {
+		t.Fatal("family 5 has no Verify, so TestVectorFamiliesVerify runs one family fewer and says nothing about it")
+	}
+	if family.Generate == nil {
+		t.Fatal("family 5 has no Generate, so the generate direction of spec A section 4.2.1 is unexercised for it")
+	}
+	if slices.Contains(expectedPendingFamilies, 5) {
+		t.Fatal("family 5 is installed and expectedPendingFamilies still names it as pending")
+	}
+	if got := reflect.ValueOf(family.Verify).Pointer(); got != reflect.ValueOf(verifyKeyScheduleVector).Pointer() {
+		t.Fatal("family 5 is installed with a verifier that is not verifyKeyScheduleVector")
+	}
+	if got := reflect.ValueOf(family.Generate).Pointer(); got != reflect.ValueOf(generateKeyScheduleVector).Pointer() {
+		t.Fatal("family 5 is installed with a generator that is not generateKeyScheduleVector")
+	}
+}
+
+// TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept is the control the runner
+// cannot be: it hands the comparator vectors that are wrong in each of the ways the corpus
+// is not, and requires the matching refusal.
+//
+// Why this test rather than more assertions in the runner. Every comparison the runner
+// makes is over a corpus that agrees with this implementation, so a comparator that
+// accepted everything and a comparator that checked everything produce identical runs
+// there. The only way to see the difference is to disagree with it on purpose.
+//
+// The unmodified vector is checked first and is the reason the refusals mean anything: a
+// comparator that refused everything would satisfy all of them.
+func TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
+	base := keyScheduleVector{}
+	found := false
+	for _, raw := range LoadVectorFile(t, keyScheduleKatFile) {
+		candidate := keyScheduleVector{}
+		if err := json.Unmarshal(raw, &candidate); err != nil {
+			t.Fatalf("parse a key-schedule entry: %v", err)
+		}
+		if _, ok := implementedSuite(candidate.CipherSuite); ok && len(candidate.Epochs) >= 2 {
+			base, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no published entry at a registered suite carries two or more epochs, so this control has nothing to corrupt")
+	}
+
+	encode := func(vector keyScheduleVector) json.RawMessage {
+		body, err := json.Marshal(vector)
+		if err != nil {
+			t.Fatalf("marshal the vector under test: %v", err)
+		}
+		return body
+	}
+	// the epoch slice is copied before it is edited, so a case cannot see the previous
+	// case's corruption through the shared backing array.
+	corrupt := func(index int, edit func(*keyScheduleEpoch)) keyScheduleVector {
+		copied := base
+		copied.Epochs = slices.Clone(base.Epochs)
+		epoch := copied.Epochs[index]
+		edit(&epoch)
+		copied.Epochs[index] = epoch
+		return copied
+	}
+	flipHex := func(text string) string {
+		octets := MustHex(t, text)
+		if len(octets) == 0 {
+			t.Fatalf("nothing to flip in %q", text)
+		}
+		octets[0] ^= 0x01
+		return HexOf(octets)
+	}
+
+	evidence, err := compareKeyScheduleVector(t, encode(base))
+	if err != nil {
+		t.Fatalf("the unmodified published vector was refused: %v", err)
+	}
+	if !evidence.inScope || len(evidence.checks) == 0 {
+		t.Fatalf("the unmodified published vector produced %+v, which carries no comparison", evidence)
+	}
+	if want := len(base.Epochs) * keyScheduleFamilyChecksPerEpoch; len(evidence.checks) != want {
+		t.Fatalf("the unmodified published vector produced %d comparisons over %d epochs, want %d",
+			len(evidence.checks), len(base.Epochs), want)
+	}
+
+	noEpochs := base
+	noEpochs.Epochs = nil
+	otherGroup := base
+	otherGroup.GroupId = flipHex(base.GroupId)
+	otherStart := base
+	otherStart.InitialInitSecret = flipHex(base.InitialInitSecret)
+
+	for _, corrupted := range []struct {
+		name   string
+		vector keyScheduleVector
+		want   error
+	}{
+		{"one flipped octet of a published init_secret", corrupt(1, func(e *keyScheduleEpoch) {
+			e.InitSecret = flipHex(e.InitSecret)
+		}), errKeyScheduleMismatch},
+		{"one flipped octet of a published group_context", corrupt(0, func(e *keyScheduleEpoch) {
+			e.GroupContext = flipHex(e.GroupContext)
+		}), errKeyScheduleMismatch},
+		{"one flipped octet of the published external_pub", corrupt(0, func(e *keyScheduleEpoch) {
+			e.ExternalPub = flipHex(e.ExternalPub)
+		}), errKeyScheduleMismatch},
+		{"one flipped octet of the published exporter answer", corrupt(0, func(e *keyScheduleEpoch) {
+			e.Exporter.Secret = flipHex(e.Exporter.Secret)
+		}), errKeyScheduleMismatch},
+		{"an exporter label that is not the one the answer was computed under", corrupt(0, func(e *keyScheduleEpoch) {
+			e.Exporter.Label = e.Exporter.Label + "x"
+		}), errKeyScheduleMismatch},
+		{"an exporter context that is not the one the answer was computed under", corrupt(0, func(e *keyScheduleEpoch) {
+			e.Exporter.Context = flipHex(e.Exporter.Context)
+		}), errKeyScheduleMismatch},
+		{"a published joiner_secret one octet short of KDF.Nh", corrupt(0, func(e *keyScheduleEpoch) {
+			e.JoinerSecret = e.JoinerSecret[:len(e.JoinerSecret)-2]
+		}), errKeyScheduleWidth},
+		{"the confirmation key published as the membership key", corrupt(0, func(e *keyScheduleEpoch) {
+			e.MembershipKey = e.ConfirmationKey
+		}), errKeyScheduleAliased},
+		{"a tree hash the group context was not built over", corrupt(0, func(e *keyScheduleEpoch) {
+			e.TreeHash = flipHex(e.TreeHash)
+		}), errKeyScheduleMismatch},
+		{"a psk secret the epoch was not advanced on", corrupt(0, func(e *keyScheduleEpoch) {
+			e.PskSecret = flipHex(e.PskSecret)
+		}), errKeyScheduleMismatch},
+		{"a vector with no epochs at all", noEpochs, errKeyScheduleIncomplete},
+		{"a group id that is not the one the answers were computed for", otherGroup, errKeyScheduleMismatch},
+		{"an initial init secret that is not the one the chain starts from", otherStart, errKeyScheduleMismatch},
+	} {
+		_, err := compareKeyScheduleVector(t, encode(corrupted.vector))
+		if err == nil {
+			t.Errorf("%s was accepted; the comparator is not comparing", corrupted.name)
+			continue
+		}
+		if !errors.Is(err, corrupted.want) {
+			t.Errorf("%s was refused as %v, want %v; a refusal for the wrong reason is a comparator checking something else",
+				corrupted.name, err, corrupted.want)
+		}
+	}
+}
+
+// TestKeyScheduleComparisonCannotReportAComparisonItDidNotMake is the control on the
+// evidence struct itself: a return that skipped the work must be refused on every caller's
+// path rather than counted as a comparison that agreed.
+func TestKeyScheduleComparisonCannotReportAComparisonItDidNotMake(t *testing.T) {
+	octets := func(seed byte) []byte { return bytes.Repeat([]byte{seed}, sha256.Size) }
+	full := keyScheduleComparison{
+		inScope:   true,
+		hashSize:  sha256.Size,
+		epochs:    1,
+		joiner:    octets(0x01),
+		perturbed: octets(0x02),
+	}
+	for index, name := range keyScheduleCheckNames {
+		body := octets(byte(0x10 + index))
+		full.checks = append(full.checks, keyScheduleCheck{epoch: 0, name: name, got: body, want: body})
+	}
+	if err := full.verdict(); err != nil {
+		t.Fatalf("a complete and agreeing comparison was refused: %v; every case below would then pass for the wrong reason", err)
+	}
+
+	without := func(edit func(*keyScheduleComparison)) keyScheduleComparison {
+		partial := full
+		partial.checks = slices.Clone(full.checks)
+		for i, check := range partial.checks {
+			check.got = bytes.Clone(check.got)
+			check.want = bytes.Clone(check.want)
+			partial.checks[i] = check
+		}
+		partial.joiner = bytes.Clone(full.joiner)
+		partial.perturbed = bytes.Clone(full.perturbed)
+		edit(&partial)
+		return partial
+	}
+	for _, missing := range []struct {
+		name string
+		edit func(*keyScheduleComparison)
+	}{
+		{"a comparison that returned before anything was set", func(c *keyScheduleComparison) { *c = keyScheduleComparison{} }},
+		{"in scope and nothing else", func(c *keyScheduleComparison) { *c = keyScheduleComparison{inScope: true} }},
+		{"no KDF.Nh read from the provider", func(c *keyScheduleComparison) { c.hashSize = 0 }},
+		{"no epoch advanced through", func(c *keyScheduleComparison) { c.epochs = 0 }},
+		{"one comparison short of the epoch", func(c *keyScheduleComparison) { c.checks = c.checks[:len(c.checks)-1] }},
+		{"one comparison made twice in place of another", func(c *keyScheduleComparison) { c.checks[1] = c.checks[0] }},
+		{"a computed value that was never derived", func(c *keyScheduleComparison) { c.checks[3].got = nil }},
+		{"a published value that decoded to nothing", func(c *keyScheduleComparison) { c.checks[3].want = nil }},
+		{"no flipped octet control", func(c *keyScheduleComparison) { c.perturbed = nil }},
+		{"a comparison filed under an epoch the run never reached", func(c *keyScheduleComparison) { c.checks[2].epoch = 9 }},
+	} {
+		partial := without(missing.edit)
+		err := partial.verdict()
+		if err == nil {
+			t.Errorf("%s was accepted as a comparison", missing.name)
+			continue
+		}
+		if !errors.Is(err, errKeyScheduleIncomplete) {
+			t.Errorf("%s was refused as %v, want an incompleteness", missing.name, err)
+		}
+	}
+
+	// and the correctness half, which incompleteness must not be standing in for.
+	disagreeing := without(func(c *keyScheduleComparison) { c.checks[5].got[0] ^= 0x01 })
+	if err := disagreeing.verdict(); !errors.Is(err, errKeyScheduleMismatch) {
+		t.Errorf("a complete comparison whose computed value disagrees was judged %v, want a mismatch", err)
+	}
+	narrow := without(func(c *keyScheduleComparison) { c.checks[5].want = c.checks[5].want[:sha256.Size-1] })
+	if err := narrow.verdict(); !errors.Is(err, errKeyScheduleWidth) {
+		t.Errorf("a published secret one octet short of KDF.Nh was judged %v, want a width refusal", err)
+	}
+	aliased := without(func(c *keyScheduleComparison) { c.checks[8].want = bytes.Clone(c.checks[7].want) })
+	if err := aliased.verdict(); !errors.Is(err, errKeyScheduleAliased) {
+		t.Errorf("two published secrets of one epoch holding one value was judged %v, want an aliasing refusal", err)
+	}
+	stuck := without(func(c *keyScheduleComparison) { c.perturbed = bytes.Clone(c.joiner) })
+	if err := stuck.verdict(); !errors.Is(err, errKeyScheduleDidNotMove) {
+		t.Errorf("a comparison whose flipped octet control did not move was judged %v, want that refusal", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// family 5's generate direction, answered by the hand written derivation
+// ---------------------------------------------------------------------------
+
+// keyScheduleRfcLabels is the DeriveSecret label RFC 9420 section 8 names for each of the
+// nine secrets an epoch_secret expands into, keyed by the json field the corpus publishes
+// the answer under.
+//
+// Transcribed from the RFC's own key schedule diagram and NOT from newKeyScheduleFromParts,
+// which is the point of the whole file below: all nine are KDF.Nh octets of apparent
+// random, so a label copied from the line above produces a perfectly well formed secret
+// that agrees with nobody, and the only thing that can see it is a second transcription
+// of the text. TestTheIndependentKeyScheduleCoversEverySecretTheEpochHolds holds this map
+// to the field count of EpochSecrets so a tenth secret cannot arrive unlabelled here.
+var keyScheduleRfcLabels = map[string]string{
+	"sender_data_secret":  "sender data",
+	"encryption_secret":   "encryption",
+	"exporter_secret":     "exporter",
+	"external_secret":     "external",
+	"confirmation_key":    "confirm",
+	"membership_key":      "membership",
+	"resumption_psk":      "resumption",
+	"epoch_authenticator": "authentication",
+	"init_secret":         "init",
+}
+
+// keyScheduleGeneratedSuites is the two ciphersuites the generator emits at, as constants
+// rather than as a read of the registry.
+//
+// A generator that asked the registry which suites to cover would cover whatever the
+// registry answered and could never report that it had stopped covering it.
+// TestGeneratedKeyScheduleVectorsCoverEveryRegisteredSuite is what fails on the day a third
+// suite is registered and this list stops matching.
+var keyScheduleGeneratedSuites = []uint16{
+	uint16(CipherSuiteX25519AesGcm128Sha256Ed25519),
+	uint16(CipherSuiteX25519ChaCha20Sha256Ed25519),
+}
+
+// How many epochs each generated vector carries, and what the generate direction therefore
+// owes in comparisons.
+//
+// Three rather than one, because the chain is where the interesting failure lives: an
+// implementation that carried the wrong secret forward, or re-seeded from the vector
+// instead of from its own init_secret, answers epoch 0 perfectly.
+const (
+	keyScheduleGeneratedEpochs = 3
+	// every check of an epoch except group_context, whose second opinion is the hand
+	// written group context encoder rather than a kdf derivation, and external_pub, which
+	// is DeriveKeyPair over external_secret and is HPKE rather than kdf.
+	keyScheduleIndependentChecksPerEpoch = keyScheduleFamilyChecksPerEpoch - 2
+)
+
+// independentKdfLabel is RFC 9420 section 5.1's KDFLabel, serialized by hand:
+//
+//	struct {
+//	    uint16 length;
+//	    opaque label<V>;
+//	    opaque context<V>;
+//	} KDFLabel;
+//
+// with the label carrying the "MLS 1.0 " prefix and length being the number of octets
+// ExpandWithLabel was asked to produce. So for the 19 octet label "MLS 1.0 derived psk"
+// and a 71 octet context the bytes are
+//
+//	00 20      the requested output length, 32, big endian uint16
+//	13         label<V> byte length 19; 19 < 64 so one octet, prefix bits 0b00
+//	4d 4c ..   the 19 label octets
+//	40 47      context<V> byte length 71; 71 > 63 so two octets: 0x40|(71>>8), 71&0xff
+//	01 20 ..   the 71 context octets
+//
+// This is the one encoder in this file that has no other witness on this side, and every
+// way of getting it wrong produces a well formed answer: a length field holding the label's
+// size instead of the output's, a label without the prefix, the two opaque fields
+// transposed, or a one octet length written where two are owed all give 32 octets of
+// apparent random. Nothing separates them except a value somebody else published, which is
+// what the two corpora this encoder is held against supply.
+//
+// There is exactly ONE hand written KDFLabel encoder in this package's tests and this is
+// it: independentExpandWithLabel calls it, so the psk_secret corpus pins these bytes over
+// "derived psk" and the key schedule corpus pins them over the eleven labels of section 8.
+// A second hand encoder would be a second opinion nothing checks.
+func independentKdfLabel(t *testing.T, label string, context []byte, length int) []byte {
+	t.Helper()
+	encoded := binary.BigEndian.AppendUint16(nil, uint16(length))
+	encoded = append(encoded, independentOpaqueV(t, []byte("MLS 1.0 "+label))...)
+	return append(encoded, independentOpaqueV(t, context)...)
+}
+
+// independentExtract is RFC 5869 section 2.2's HKDF-Extract:
+//
+//	HKDF-Extract(salt, IKM) = HMAC-Hash(key = salt, data = IKM)
+//
+// The salt goes in the KEY position and the input keying material in the DATA position,
+// and that is the whole reason this exists as a named function rather than as two lines at
+// each call site. Every Extract in the key schedule takes two KDF.Nh pseudorandom secrets,
+// so transposing them compiles, returns 32 octets, and satisfies every property either
+// side could assert about its own output.
+// TestTheIndependentKeyScheduleSeesATransposedExtract requires this derivation to disagree
+// with its own transposition, so it cannot agree with a transposed implementation by being
+// transposed the same way.
+func independentExtract(salt []byte, ikm []byte) []byte {
+	extract := hmac.New(sha256.New, salt)
+	extract.Write(ikm)
+	return extract.Sum(nil)
+}
+
+// independentDeriveSecret is RFC 9420 section 8's DeriveSecret:
+//
+//	DeriveSecret(Secret, Label) = ExpandWithLabel(Secret, Label, "", KDF.Nh)
+//
+// The context is the EMPTY string and not an absent field, so the KDFLabel still carries a
+// context<V> and that vector's length octet is 0x00. A derivation that omitted the octet
+// entirely would be one byte short of every peer's preimage.
+func independentDeriveSecret(t *testing.T, secret []byte, label string) []byte {
+	t.Helper()
+	return independentExpandWithLabel(t, secret, label, nil, sha256.Size)
+}
+
+// independentGroupContext is RFC 9420 section 8.1's GroupContext, serialized by hand:
+//
+//	struct {
+//	    ProtocolVersion version = mls10;
+//	    CipherSuite cipher_suite;
+//	    opaque group_id<V>;
+//	    uint64 epoch;
+//	    opaque tree_hash<V>;
+//	    opaque confirmed_transcript_hash<V>;
+//	    Extension extensions<V>;
+//	} GroupContext;
+//
+// The version is written as the literal 1 rather than read from ProtocolVersionMls10, and
+// the extension vector is written as its own empty length prefix rather than routed
+// through WriteExtensions, because this is meant to be a second opinion about the encoding
+// and a second opinion that reads its constants off the code under test is not one.
+// TestProtocolVersionMls10IsTheCodePointRfc9420Registers is where the literal is held to
+// the package's own constant.
+//
+// The two opaque fields and the group id take the MLS varint prefix. The record layer's
+// fixed 32 bit prefix encodes the same 32 byte tree hash and is never interchangeable with
+// it: only one of the two is what a peer will hash.
+func independentGroupContext(t *testing.T, suite uint16, groupId []byte, epoch uint64, treeHash []byte, confirmedTranscriptHash []byte) []byte {
+	t.Helper()
+	// ProtocolVersion mls10 is 1, RFC 9420 section 17.1.
+	encoded := binary.BigEndian.AppendUint16(nil, 1)
+	encoded = binary.BigEndian.AppendUint16(encoded, suite)
+	encoded = append(encoded, independentOpaqueV(t, groupId)...)
+	encoded = binary.BigEndian.AppendUint64(encoded, epoch)
+	encoded = append(encoded, independentOpaqueV(t, treeHash)...)
+	encoded = append(encoded, independentOpaqueV(t, confirmedTranscriptHash)...)
+	// extensions<V>, empty: the vector's own length prefix and no elements.
+	return append(encoded, independentOpaqueV(t, nil)...)
+}
+
+// independentKeyScheduleSecrets is RFC 9420 section 8's epoch derivation, written from the
+// RFC text with crypto/hmac and reaching nothing this package declares:
+//
+//	init_secret_[n-1] + commit_secret -> KDF.Extract -> ExpandWithLabel(., "joiner",
+//	                                                       GroupContext_[n], KDF.Nh)
+//	                                                 = joiner_secret
+//	joiner_secret + psk_secret        -> KDF.Extract = member_secret
+//	member_secret                     -> DeriveSecret(., "welcome") = welcome_secret
+//	member_secret                     -> ExpandWithLabel(., "epoch", GroupContext_[n],
+//	                                                       KDF.Nh) = epoch_secret
+//	epoch_secret                      -> DeriveSecret(., <label>) for each of the nine
+//
+// The answers come back keyed by the json field key-schedule.json publishes each under, so
+// a caller comparing them against a vector is comparing like with like and a name this
+// derivation does not answer for is a missing key rather than a silent zero value.
+//
+// Both Extract calls take the previous secret as the SALT and the new material as the IKM,
+// which is the one place a second opinion is worth having: guardrail 1 is that
+// crypto/hkdf.Extract takes them the other way round, so a transposition compiles, returns
+// 32 octets and satisfies everything either side could assert about its own output.
+//
+// sha256 is written in rather than read off a provider, for the reason
+// independentPskSecret gives: both registered suites are HKDF-SHA256 at KDF.Nh 32, and
+// reading the width off the code under test is how a second opinion stops being one.
+// TestBothRegisteredSuitesAreSha256AtThisWidth is what fails on the day that stops
+// being true.
+func independentKeyScheduleSecrets(t *testing.T, initSecretPrev []byte, commitSecret []byte, pskSecret []byte, groupContext []byte) map[string][]byte {
+	t.Helper()
+	answers := map[string][]byte{}
+	// joiner_secret = ExpandWithLabel(Extract(init_secret_[n-1], commit_secret), "joiner",
+	// GroupContext_[n], KDF.Nh)
+	joiner := independentExpandWithLabel(
+		t, independentExtract(initSecretPrev, commitSecret), "joiner", groupContext, sha256.Size)
+	answers["joiner_secret"] = joiner
+	// member_secret = Extract(joiner_secret, psk_secret)
+	member := independentExtract(joiner, pskSecret)
+	answers["welcome_secret"] = independentDeriveSecret(t, member, "welcome")
+	epochSecret := independentExpandWithLabel(t, member, "epoch", groupContext, sha256.Size)
+	for field, label := range keyScheduleRfcLabels {
+		answers[field] = independentDeriveSecret(t, epochSecret, label)
+	}
+	return answers
+}
+
+// independentKeyScheduleSecretsTransposed is the same derivation with both Extract calls
+// the wrong way round. It exists only to be disagreed with: a hand written derivation
+// giving the same answer either way could not see the defect guardrail 1 names, and would
+// agree with a transposed implementation while looking like a second opinion.
+func independentKeyScheduleSecretsTransposed(t *testing.T, initSecretPrev []byte, commitSecret []byte, pskSecret []byte, groupContext []byte) map[string][]byte {
+	t.Helper()
+	answers := map[string][]byte{}
+	joiner := independentExpandWithLabel(
+		t, independentExtract(commitSecret, initSecretPrev), "joiner", groupContext, sha256.Size)
+	answers["joiner_secret"] = joiner
+	member := independentExtract(pskSecret, joiner)
+	answers["welcome_secret"] = independentDeriveSecret(t, member, "welcome")
+	epochSecret := independentExpandWithLabel(t, member, "epoch", groupContext, sha256.Size)
+	for field, label := range keyScheduleRfcLabels {
+		answers[field] = independentDeriveSecret(t, epochSecret, label)
+	}
+	return answers
+}
+
+// independentExporter is RFC 9420 section 8.5's MLS-Exporter:
+//
+//	MLS-Exporter(Label, Context, Length) =
+//	    ExpandWithLabel(DeriveSecret(exporter_secret, Label), "exported",
+//	                    Hash(Context), Length)
+//
+// The caller's context is HASHED and not passed through, which is what lets it be any
+// length; a derivation that passed it through would agree for a 32 octet context and
+// disagree for every other one, and the corpus publishes only 32 octet contexts. And the
+// per label secret is DeriveSecret over exporter_secret, not exporter_secret itself: an
+// implementation that skipped that hop hands every label one secret.
+func independentExporter(t *testing.T, exporterSecret []byte, label string, context []byte, length int) []byte {
+	t.Helper()
+	hashed := sha256.Sum256(context)
+	return independentExpandWithLabel(
+		t, independentDeriveSecret(t, exporterSecret, label), "exported", hashed[:], length)
+}
+
+// generatedKeyScheduleOctets is deterministic filler for the generate direction, over the
+// same digest generatedPskOctets uses.
+//
+// Deterministic rather than crypto.Random, for the reason task 16 gives: a generated case
+// that fails is then the same case on the next run. It also keeps the generator's own call
+// closure clear of the provider, which is what lets the disjointness gate say something
+// about it.
+func generatedKeyScheduleOctets(field string, index int) []byte {
+	return generatedPskOctets("key schedule "+field, index)
+}
+
+// generateKeyScheduleCases builds fresh key-schedule entries whose every kdf answer is
+// computed by the hand written derivation above.
+//
+// This is the shape that makes the generate direction worth running, and it is not the
+// shape the obvious version has. A generator that computed its answers with NewKeySchedule
+// and a verifier that checked them with NewKeySchedule round trip perfectly and say
+// nothing about conformance at all -- they prove this code agrees with itself, which it
+// would whatever it computed. Every published answer below except external_pub comes from
+// independentKeyScheduleSecrets, independentExporter or independentGroupContext, so
+// feeding these entries back through verifyKeyScheduleVector compares two implementations.
+//
+// external_pub is the exception and it is named as one: it is DeriveKeyPair over
+// external_secret, which is HPKE rather than kdf, and there is no second X25519 in this
+// tree to derive it with. It is taken from the schedule this generator builds alongside,
+// and the vendored corpus is what checks it -- see the family runner, which compares it at
+// every one of its ten epochs.
+//
+// wrongLabel, when set, derives membership_key under it instead of under "membership".
+// That is how the generate to verify loop is shown to be able to FAIL: every entry this
+// generator emits agrees with the implementation, so a loop that checked nothing and a
+// loop that checked everything produce identical runs over them.
+func generateKeyScheduleCases(t *testing.T, wrongLabel string) []keyScheduleVector {
+	t.Helper()
+	generated := []keyScheduleVector{}
+	for _, suite := range keyScheduleGeneratedSuites {
+		provider, err := NewCryptoProvider(CipherSuite(suite))
+		if err != nil {
+			t.Fatalf("NewCryptoProvider(%#04x): %v", suite, err)
+		}
+		tag := fmt.Sprintf("suite %d", suite)
+		groupId := generatedKeyScheduleOctets(tag+" group id", 0)[:16]
+		initSecret := generatedKeyScheduleOctets(tag+" initial init secret", 0)
+		vector := keyScheduleVector{
+			CipherSuite:       suite,
+			GroupId:           HexOf(groupId),
+			InitialInitSecret: HexOf(initSecret),
+		}
+		for n := 0; n < keyScheduleGeneratedEpochs; n++ {
+			treeHash := generatedKeyScheduleOctets(tag+" tree hash", n)
+			commitSecret := generatedKeyScheduleOctets(tag+" commit secret", n)
+			pskSecret := generatedKeyScheduleOctets(tag+" psk secret", n)
+			confirmedTranscriptHash := generatedKeyScheduleOctets(tag+" confirmed transcript hash", n)
+			exporterContext := generatedKeyScheduleOctets(tag+" exporter context", n)
+			// a label that is not hex, unlike every label the vendored corpus publishes,
+			// so an implementation that hex decoded it would refuse this vector outright.
+			exporterLabel := fmt.Sprintf("urmessage generated exporter %d", n)
+
+			groupContext := independentGroupContext(
+				t, suite, groupId, uint64(n), treeHash, confirmedTranscriptHash)
+			answers := independentKeyScheduleSecrets(t, initSecret, commitSecret, pskSecret, groupContext)
+			if wrongLabel != "" {
+				epochSecret := independentExpandWithLabel(
+					t, independentExtract(answers["joiner_secret"], pskSecret), "epoch", groupContext, sha256.Size)
+				answers["membership_key"] = independentDeriveSecret(t, epochSecret, wrongLabel)
+			}
+			exported := independentExporter(
+				t, answers["exporter_secret"], exporterLabel, exporterContext, sha256.Size)
+
+			// the one production call: external_pub is HPKE and has no second opinion
+			// here. Building the schedule also means a generated entry whose group
+			// context this file encoded differently from the codec fails loudly rather
+			// than quietly, because the secrets below would then be derived over
+			// different bytes.
+			schedule, err := NewKeySchedule(provider, initSecret, commitSecret, pskSecret, &GroupContext{
+				Version:                 ProtocolVersionMls10,
+				CipherSuite:             CipherSuite(suite),
+				GroupId:                 groupId,
+				Epoch:                   uint64(n),
+				TreeHash:                treeHash,
+				ConfirmedTranscriptHash: confirmedTranscriptHash,
+				Extensions:              nil,
+			})
+			if err != nil {
+				t.Fatalf("suite %#04x epoch %d: NewKeySchedule: %v", suite, n, err)
+			}
+			_, externalPub, err := schedule.ExternalKeyPair()
+			if err != nil {
+				t.Fatalf("suite %#04x epoch %d: ExternalKeyPair: %v", suite, n, err)
+			}
+
+			vector.Epochs = append(vector.Epochs, keyScheduleEpoch{
+				TreeHash:                HexOf(treeHash),
+				CommitSecret:            HexOf(commitSecret),
+				PskSecret:               HexOf(pskSecret),
+				ConfirmedTranscriptHash: HexOf(confirmedTranscriptHash),
+				GroupContext:            HexOf(groupContext),
+				JoinerSecret:            HexOf(answers["joiner_secret"]),
+				WelcomeSecret:           HexOf(answers["welcome_secret"]),
+				InitSecret:              HexOf(answers["init_secret"]),
+				SenderDataSecret:        HexOf(answers["sender_data_secret"]),
+				EncryptionSecret:        HexOf(answers["encryption_secret"]),
+				ExporterSecret:          HexOf(answers["exporter_secret"]),
+				EpochAuthenticator:      HexOf(answers["epoch_authenticator"]),
+				ExternalSecret:          HexOf(answers["external_secret"]),
+				ConfirmationKey:         HexOf(answers["confirmation_key"]),
+				MembershipKey:           HexOf(answers["membership_key"]),
+				ResumptionPsk:           HexOf(answers["resumption_psk"]),
+				ExternalPub:             HexOf(externalPub),
+				Exporter: labelKatExporter{
+					Label:   exporterLabel,
+					Context: HexOf(exporterContext),
+					Length:  sha256.Size,
+					Secret:  HexOf(exported),
+				},
+			})
+			// the chain advances on the derivation's own init_secret, which is what the
+			// consume direction does too.
+			initSecret = bytes.Clone(answers["init_secret"])
+		}
+		generated = append(generated, vector)
+	}
+	return generated
+}
+
+// generateKeyScheduleVector is the Generate half of family 5: fresh entries in the mlswg
+// format, answered by the hand written derivation, for the registry to feed back through
+// verifyKeyScheduleVector.
+func generateKeyScheduleVector(t *testing.T) json.RawMessage {
+	t.Helper()
+	body, err := json.Marshal(generateKeyScheduleCases(t, ""))
+	if err != nil {
+		t.Fatalf("marshal the generated key schedule cases: %v", err)
+	}
+	return body
+}
+
+// TestVectorKeyScheduleGenerate is the generate direction of family 5.
+//
+// What it closes that verification alone cannot: a pinned vector never passes through our
+// own encoder, so an encoder and a decoder that are wrong in the same direction verify
+// perfectly. Generating a case and feeding it back sees that -- but only if the generator
+// is not the verifier under another name, and that is the trap this task's name states.
+// The answers below are computed by the hand written derivation and the KDFLabel they are
+// expanded under is the hand written encoder, so consuming them with NewKeySchedule
+// compares two implementations rather than one implementation with itself.
+//
+// Four things stand against the loop passing vacuously. The generated entries are
+// re-derived here and the comparison count is asserted. They are then consumed by the real
+// comparator, whose full verdict must accept them. A case with ONE secret derived under
+// the wrong label must be REFUSED, so a consume direction that checked nothing fails here.
+// And the entries are required to carry every field the family compares, because a
+// generator that emitted a shorter entry would have the consume direction comparing an
+// empty published answer against an empty computed one and agreeing.
+func TestVectorKeyScheduleGenerate(t *testing.T) {
+	serialized := generateKeyScheduleVector(t)
+	readBack := []keyScheduleVector{}
+	if err := json.Unmarshal(serialized, &readBack); err != nil {
+		t.Fatalf("the generated cases do not parse: %v", err)
+	}
+	if len(readBack) != len(keyScheduleGeneratedSuites) {
+		t.Fatalf("generated %d suites, want %d", len(readBack), len(keyScheduleGeneratedSuites))
+	}
+
+	compared, epochs := 0, 0
+	answers := map[string]int{}
+	for _, vector := range readBack {
+		suite, ok := implementedSuite(vector.CipherSuite)
+		if !ok {
+			t.Fatalf("generated a vector at unimplemented suite %#04x", vector.CipherSuite)
+		}
+		if len(vector.Epochs) != keyScheduleGeneratedEpochs {
+			t.Fatalf("suite %#04x: the round trip carries %d epochs, want %d",
+				uint16(suite), len(vector.Epochs), keyScheduleGeneratedEpochs)
+		}
+		groupId := MustHex(t, vector.GroupId)
+		// the chain is carried on the derivation's own init_secret, so a divergence
+		// surfaces at the epoch that caused it rather than at the next reseed.
+		initSecret := MustHex(t, vector.InitialInitSecret)
+		for n, epoch := range vector.Epochs {
+			epochs++
+			groupContext := independentGroupContext(
+				t, vector.CipherSuite, groupId, uint64(n),
+				MustHex(t, epoch.TreeHash), MustHex(t, epoch.ConfirmedTranscriptHash))
+			if got := HexOf(groupContext); got != epoch.GroupContext {
+				t.Fatalf("suite %#04x epoch %d: the hand written group context is %s and the case carries %s",
+					uint16(suite), n, got, epoch.GroupContext)
+			}
+			derived := independentKeyScheduleSecrets(
+				t, initSecret, MustHex(t, epoch.CommitSecret), MustHex(t, epoch.PskSecret), groupContext)
+			derived["exporter.secret"] = independentExporter(
+				t, derived["exporter_secret"], epoch.Exporter.Label,
+				MustHex(t, epoch.Exporter.Context), epoch.Exporter.Length)
+			// addressed by the family's own check names, so a name the family compares
+			// and this derivation does not answer for is a failure rather than a
+			// comparison silently not made.
+			published := map[string]json.RawMessage{}
+			marshalled, err := json.Marshal(epoch)
+			if err != nil {
+				t.Fatalf("re-marshal a generated epoch: %v", err)
+			}
+			if err := json.Unmarshal(marshalled, &published); err != nil {
+				t.Fatalf("re-read a generated epoch: %v", err)
+			}
+			for _, name := range keyScheduleCheckNames {
+				if slices.Contains(keyScheduleNonSecretChecks, name) && name != "exporter.secret" {
+					continue
+				}
+				want := keyScheduleCorpusField(t, published, name)
+				got, answered := derived[name]
+				if !answered {
+					t.Fatalf("the hand written derivation answers nothing for %s, so this family compares one answer nothing independent produced",
+						name)
+				}
+				if HexOf(got) != want {
+					t.Fatalf("suite %#04x epoch %d: the hand written derivation gives %s for %s, the generated case carries %s",
+						uint16(suite), n, HexOf(got), name, want)
+				}
+				answers[want]++
+				compared++
+			}
+			initSecret = bytes.Clone(derived["init_secret"])
+		}
+	}
+
+	want := len(keyScheduleGeneratedSuites) * keyScheduleGeneratedEpochs
+	if epochs != want {
+		t.Fatalf("re-derived %d epochs, want %d", epochs, want)
+	}
+	if got := want * keyScheduleIndependentChecksPerEpoch; compared != got {
+		t.Fatalf("re-derived %d answers over %d epochs, want %d", compared, epochs, got)
+	}
+	if len(answers) != compared {
+		t.Fatalf("the %d re-derivations were made against %d distinct answers; a generator emitting one repeated value would compare that many times and pin one answer",
+			compared, len(answers))
+	}
+
+	// and the consume direction, which is the half that makes any of this a statement
+	// about conformance: NewKeySchedule must reproduce every one of these answers.
+	consumed := 0
+	for _, vector := range readBack {
+		body, err := json.Marshal(vector)
+		if err != nil {
+			t.Fatalf("marshal a generated case: %v", err)
+		}
+		evidence, err := compareKeyScheduleVector(t, body)
+		if err != nil {
+			t.Fatalf("the consume direction refused a generated case: %v", err)
+		}
+		if err := evidence.verdict(); err != nil {
+			t.Fatalf("the consume direction refused a generated case: %v", err)
+		}
+		if evidence.epochs != keyScheduleGeneratedEpochs {
+			t.Fatalf("the consume direction advanced through %d epochs of a generated case", evidence.epochs)
+		}
+		consumed += len(evidence.checks)
+	}
+	if got := want * keyScheduleFamilyChecksPerEpoch; consumed != got {
+		t.Fatalf("the consume direction made %d comparisons over the generated cases, want %d", consumed, got)
+	}
+
+	if out := os.Getenv("URMESSAGE_MLS_VECTOR_OUT"); out != "" {
+		path := filepath.Join(out, "key-schedule-generated.json")
+		if err := os.WriteFile(path, serialized, 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		t.Logf("wrote %s for the OpenMLS cross-check job", path)
+	}
+	t.Logf("key-schedule generate: %d epochs re-derived by hand over %d comparisons, %d consumed by the implementation",
+		epochs, compared, consumed)
+}
+
+// TestTheConsumeDirectionRefusesAGeneratedVectorDerivedUnderTheWrongLabel is the control
+// the test above needs.
+//
+// Every case the generator emits agrees with the implementation, so a consume direction
+// that compared nothing and one that compared everything produce identical runs over them
+// -- which is exactly the failure task 16 shipped. One secret derived under a label RFC
+// 9420 does not name is a case the loop MUST refuse, and it must refuse it as a mismatch:
+// the answer is a perfectly well formed KDF.Nh secret and nothing about the value itself
+// says which label produced it.
+//
+// Two labels, for two different refusals. A label nothing else uses is a mismatch. The
+// label of the secret NEXT to it in the schedule is the copy-paste defect the RFC's nine
+// near-identical DeriveSecret lines invite, and it publishes one value under two names,
+// which the aliasing control refuses first.
+func TestTheConsumeDirectionRefusesAGeneratedVectorDerivedUnderTheWrongLabel(t *testing.T) {
+	for _, wrong := range []struct {
+		label string
+		want  error
+	}{
+		{"membershipp", errKeyScheduleMismatch},
+		{"membership ", errKeyScheduleMismatch},
+		{"confirm", errKeyScheduleAliased},
+	} {
+		cases := generateKeyScheduleCases(t, wrong.label)
+		if len(cases) == 0 {
+			t.Fatalf("the generator produced no case under %q", wrong.label)
+		}
+		refused := 0
+		for _, vector := range cases {
+			body, err := json.Marshal(vector)
+			if err != nil {
+				t.Fatalf("marshal the case under test: %v", err)
+			}
+			_, err = compareKeyScheduleVector(t, body)
+			if err == nil {
+				t.Errorf("a case whose membership_key was derived under %q was accepted; the consume direction is not comparing",
+					wrong.label)
+				continue
+			}
+			if !errors.Is(err, wrong.want) {
+				t.Errorf("a case whose membership_key was derived under %q was refused as %v, want %v",
+					wrong.label, err, wrong.want)
+				continue
+			}
+			refused++
+		}
+		if refused != len(cases) {
+			t.Errorf("%d of %d generated cases under %q were refused", refused, len(cases), wrong.label)
+		}
+	}
+}
+
+// TestTheIndependentKeyScheduleMatchesEveryUpstreamVector pins the hand written derivation
+// to the published corpus.
+//
+// This is what makes the generate direction worth running at all. A generator agreeing
+// with the verifier proves two spellings of one algorithm agree; a generator that
+// reproduces every answer mlswg published, computed with crypto/hmac from the RFC text, is
+// a second implementation, and the round trip through it is then a statement about
+// conformance.
+//
+// The comparison count is asserted for the reason the runner's is. So is the count of
+// distinct answers: 120 of the corpus's 140 published values are reachable from the kdf
+// alone, and a derivation compared against one repeated answer would satisfy the total.
+func TestTheIndependentKeyScheduleMatchesEveryUpstreamVector(t *testing.T) {
+	compared, epochs := 0, 0
+	answers := map[string]int{}
+	for index, raw := range LoadVectorFile(t, keyScheduleKatFile) {
+		vector := keyScheduleVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("vector %d: %v", index, err)
+		}
+		if _, ok := implementedSuite(vector.CipherSuite); !ok {
+			continue
+		}
+		groupId := MustHex(t, vector.GroupId)
+		initSecret := MustHex(t, vector.InitialInitSecret)
+		for n, epoch := range vector.Epochs {
+			epochs++
+			groupContext := independentGroupContext(
+				t, vector.CipherSuite, groupId, uint64(n),
+				MustHex(t, epoch.TreeHash), MustHex(t, epoch.ConfirmedTranscriptHash))
+			if got := HexOf(groupContext); got != epoch.GroupContext {
+				t.Fatalf("vector %d epoch %d: the hand written group context is %s, the corpus publishes %s",
+					index, n, got, epoch.GroupContext)
+			}
+			answers[epoch.GroupContext]++
+			compared++
+
+			derived := independentKeyScheduleSecrets(
+				t, initSecret, MustHex(t, epoch.CommitSecret), MustHex(t, epoch.PskSecret), groupContext)
+			derived["exporter.secret"] = independentExporter(
+				t, derived["exporter_secret"], epoch.Exporter.Label,
+				MustHex(t, epoch.Exporter.Context), epoch.Exporter.Length)
+			published := map[string]json.RawMessage{}
+			body, err := json.Marshal(epoch)
+			if err != nil {
+				t.Fatalf("re-marshal a published epoch: %v", err)
+			}
+			if err := json.Unmarshal(body, &published); err != nil {
+				t.Fatalf("re-read a published epoch: %v", err)
+			}
+			for _, name := range keyScheduleCheckNames {
+				got, answered := derived[name]
+				if !answered {
+					continue
+				}
+				want := keyScheduleCorpusField(t, published, name)
+				if HexOf(got) != want {
+					t.Fatalf("vector %d epoch %d: the hand written derivation gives %s for %s, the corpus publishes %s",
+						index, n, HexOf(got), name, want)
+				}
+				answers[want]++
+				compared++
+			}
+			initSecret = bytes.Clone(derived["init_secret"])
+		}
+	}
+	if epochs != keyScheduleFamilyEpochs {
+		t.Fatalf("the hand written derivation ran over %d epochs, want %d", epochs, keyScheduleFamilyEpochs)
+	}
+	// group_context plus the twelve kdf answers of each epoch; external_pub is HPKE and
+	// has no hand written twin.
+	if want := epochs * (keyScheduleIndependentChecksPerEpoch + 1); compared != want {
+		t.Fatalf("the hand written derivation was compared against %d published answers, want %d", compared, want)
+	}
+	if len(answers) != compared {
+		t.Fatalf("the %d comparisons were made against %d distinct published answers", compared, len(answers))
+	}
+	t.Logf("the hand written key schedule reproduced %d published answers over %d epochs", compared, epochs)
+}
+
+// TestTheIndependentKeyScheduleSeesATransposedExtract is the control the test above needs.
+// A derivation that answers the same with its Extract arguments the wrong way round agrees
+// with a transposed implementation and pins nothing about guardrail 1.
+//
+// Every one of the twelve answers must move, not merely one of them: joiner_secret is the
+// output of the first transposed Extract and everything below it is expanded from the
+// second, so a control that only looked at joiner_secret would be satisfied by a
+// derivation that transposed one of the two.
+func TestTheIndependentKeyScheduleSeesATransposedExtract(t *testing.T) {
+	checked := 0
+	for index, raw := range LoadVectorFile(t, keyScheduleKatFile) {
+		vector := keyScheduleVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("vector %d: %v", index, err)
+		}
+		if _, ok := implementedSuite(vector.CipherSuite); !ok {
+			continue
+		}
+		groupId := MustHex(t, vector.GroupId)
+		initSecret := MustHex(t, vector.InitialInitSecret)
+		for n, epoch := range vector.Epochs {
+			groupContext := independentGroupContext(
+				t, vector.CipherSuite, groupId, uint64(n),
+				MustHex(t, epoch.TreeHash), MustHex(t, epoch.ConfirmedTranscriptHash))
+			commitSecret := MustHex(t, epoch.CommitSecret)
+			pskSecret := MustHex(t, epoch.PskSecret)
+			straight := independentKeyScheduleSecrets(t, initSecret, commitSecret, pskSecret, groupContext)
+			transposed := independentKeyScheduleSecretsTransposed(t, initSecret, commitSecret, pskSecret, groupContext)
+			if len(straight) != len(transposed) || len(straight) == 0 {
+				t.Fatalf("the two derivations answer %d and %d fields", len(straight), len(transposed))
+			}
+			for field, answer := range straight {
+				if bytes.Equal(answer, transposed[field]) {
+					t.Fatalf("vector %d epoch %d: %s is the same for both Extract orders, so this derivation cannot see a transposition",
+						index, n, field)
+				}
+				checked++
+			}
+			initSecret = bytes.Clone(straight["init_secret"])
+		}
+	}
+	if want := keyScheduleFamilyEpochs * (keyScheduleIndependentChecksPerEpoch - 1); checked != want {
+		t.Fatalf("the transposition control ran over %d answers, want %d", checked, want)
+	}
+}
+
+// TestTheIndependentKeyScheduleCoversEverySecretTheEpochHolds holds the hand written label
+// table to what an epoch actually derives.
+//
+// Derived from EpochSecrets by reflection rather than counted here. A tenth secret added to
+// the schedule with no label transcribed for it would leave this derivation answering nine
+// of ten while every count above still balanced, which is the shape of failure a written
+// list produces.
+func TestTheIndependentKeyScheduleCoversEverySecretTheEpochHolds(t *testing.T) {
+	epochSecrets := reflect.TypeOf(EpochSecrets{})
+	if len(keyScheduleRfcLabels) != epochSecrets.NumField() {
+		t.Fatalf("the hand written derivation transcribes %d labels and %s holds %d secrets",
+			len(keyScheduleRfcLabels), epochSecrets.Name(), epochSecrets.NumField())
+	}
+	// the nine labels must be nine distinct strings, or two secrets share a preimage.
+	labels := slices.Compact(slices.Sorted(maps.Values(keyScheduleRfcLabels)))
+	if len(labels) != len(keyScheduleRfcLabels) {
+		t.Fatalf("the %d transcribed labels hold %d distinct strings: %v",
+			len(keyScheduleRfcLabels), len(labels), labels)
+	}
+	// and every field it answers for must be one this family compares, or it is an answer
+	// nothing is held against.
+	answered := slices.Sorted(maps.Keys(keyScheduleRfcLabels))
+	for _, field := range answered {
+		if !slices.Contains(keyScheduleCheckNames, field) {
+			t.Errorf("the derivation answers %s and this family compares nothing under that name", field)
+		}
+	}
+	// the twelve the derivation owes: the nine, plus joiner and welcome, plus the exporter
+	// answer the caller asks for separately.
+	if want := keyScheduleIndependentChecksPerEpoch; len(keyScheduleRfcLabels)+3 != want {
+		t.Fatalf("the derivation answers %d of the %d checks this family makes independently",
+			len(keyScheduleRfcLabels)+3, want)
+	}
+}
+
+// TestGeneratedKeyScheduleVectorsCoverEveryRegisteredSuite holds the generator's own list
+// of code points to the registry, which is the check the generator cannot make about
+// itself without calling into the package it is meant to stay clear of.
+func TestGeneratedKeyScheduleVectorsCoverEveryRegisteredSuite(t *testing.T) {
+	entries := []keyScheduleVector{}
+	if err := json.Unmarshal(generateKeyScheduleVector(t), &entries); err != nil {
+		t.Fatalf("the generated cases do not parse: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("the generator produced no cases")
+	}
+	covered := map[CipherSuite]int{}
+	for _, entry := range entries {
+		covered[CipherSuite(entry.CipherSuite)]++
+		if len(entry.Epochs) != keyScheduleGeneratedEpochs {
+			t.Errorf("a generated vector carries %d epochs, want %d", len(entry.Epochs), keyScheduleGeneratedEpochs)
+		}
+		// every field the family compares must be carried, or the consume direction is
+		// comparing an empty published answer against an empty computed one.
+		for n, epoch := range entry.Epochs {
+			published := map[string]json.RawMessage{}
+			body, err := json.Marshal(epoch)
+			if err != nil {
+				t.Fatalf("re-marshal a generated epoch: %v", err)
+			}
+			if err := json.Unmarshal(body, &published); err != nil {
+				t.Fatalf("re-read a generated epoch: %v", err)
+			}
+			for _, name := range keyScheduleCheckNames {
+				if keyScheduleCorpusField(t, published, name) == "" {
+					t.Errorf("suite %#04x epoch %d carries no %s, so the consume direction compares nothing there",
+						entry.CipherSuite, n, name)
+				}
+			}
+		}
+	}
+	if got := slices.Sorted(maps.Keys(covered)); !slices.Equal(got, Suites()) {
+		t.Fatalf("the generator covers %v and the registry holds %v; widen keyScheduleGeneratedSuites", got, Suites())
+	}
+	t.Logf("%d generated key schedules over suites %v, %d epochs each",
+		len(entries), slices.Sorted(maps.Keys(covered)), keyScheduleGeneratedEpochs)
+}
+
+// TestProtocolVersionMls10IsTheCodePointRfc9420Registers is the assumption
+// independentGroupContext makes when it writes the version in as a literal rather than
+// reading the package's own constant.
+func TestProtocolVersionMls10IsTheCodePointRfc9420Registers(t *testing.T) {
+	if uint16(ProtocolVersionMls10) != 1 {
+		t.Fatalf("ProtocolVersionMls10 is %#04x and RFC 9420 section 17.1 registers mls10 as 1; the hand written group context encoder writes the literal",
+			uint16(ProtocolVersionMls10))
+	}
+}
+
+// TestTheKdfLabelThisPackageWritesIsTheOneRfc9420Describes holds the KDFLabel bytes this
+// package expands under to the bytes the hand written encoder produces.
+//
+// The package never hands its KDFLabel out, so the comparison is made through the only
+// door it leaves open: Expand over the hand written label must equal ExpandWithLabel over
+// the same label, context and length. HKDF-Expand is deterministic in its info string, so
+// two equal outputs over one PRK and one length is the statement that the two info strings
+// are equal -- which is the KDFLabel byte comparison, at one remove.
+//
+// The controls come first and they are what stop this holding vacuously. Four deliberately
+// wrong encodings -- the length field holding the label's size, the "MLS 1.0 " prefix
+// dropped, the two opaque fields transposed, and a fixed 16 bit length written where the
+// MLS varint is owed -- must each DISAGREE, or the comparison is not sensitive to the
+// thing it claims to check.
+func TestTheKdfLabelThisPackageWritesIsTheOneRfc9420Describes(t *testing.T) {
+	secret := generatedKeyScheduleOctets("kdf label secret", 0)
+	context := generatedKeyScheduleOctets("kdf label context", 0)
+	// every label the key schedule expands under, plus the psk one, so this is the class
+	// the two corpora between them pin rather than one example.
+	labels := []string{"joiner", "epoch", "welcome", "exported", "derived psk"}
+	labels = append(labels, slices.Sorted(maps.Values(keyScheduleRfcLabels))...)
+
+	for _, suite := range Suites() {
+		provider, err := NewCryptoProvider(suite)
+		if err != nil {
+			t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
+		}
+		nh := provider.HashSize()
+		for _, label := range labels {
+			for _, ctx := range [][]byte{nil, context, bytes.Repeat(context, 4)} {
+				kdfLabel := independentKdfLabel(t, label, ctx, nh)
+				if len(kdfLabel) == 0 {
+					t.Fatalf("the hand written KDFLabel for %q is empty, so every comparison below is over nothing", label)
+				}
+				want := provider.ExpandWithLabel(secret, label, ctx, nh)
+				if got := provider.Expand(secret, kdfLabel, nh); !bytes.Equal(got, want) {
+					t.Fatalf("suite %#04x label %q over a %d octet context: this package expands under a KDFLabel that is not %x",
+						uint16(suite), label, len(ctx), kdfLabel)
+				}
+			}
+		}
+
+		// and the controls, over one label and one context, so the agreement above is a
+		// statement about these bytes and not about Expand ignoring its info.
+		full := []byte("MLS 1.0 " + "joiner")
+		for _, wrong := range []struct {
+			name  string
+			label []byte
+		}{
+			{"the length field holding the label's size", append(
+				binary.BigEndian.AppendUint16(nil, uint16(len(full))),
+				append(independentOpaqueV(t, full), independentOpaqueV(t, context)...)...)},
+			{"the MLS 1.0 prefix dropped", append(
+				binary.BigEndian.AppendUint16(nil, uint16(nh)),
+				append(independentOpaqueV(t, []byte("joiner")), independentOpaqueV(t, context)...)...)},
+			{"the label and context transposed", append(
+				binary.BigEndian.AppendUint16(nil, uint16(nh)),
+				append(independentOpaqueV(t, context), independentOpaqueV(t, full)...)...)},
+			{"a fixed 16 bit length where the MLS varint is owed", append(
+				binary.BigEndian.AppendUint16(nil, uint16(nh)),
+				append(binary.BigEndian.AppendUint16(nil, uint16(len(full))),
+					append(full, independentOpaqueV(t, context)...)...)...)},
+		} {
+			want := provider.ExpandWithLabel(secret, "joiner", context, nh)
+			if bytes.Equal(provider.Expand(secret, wrong.label, nh), want) {
+				t.Fatalf("suite %#04x: %s expands to the same answer, so the comparison above sees nothing",
+					uint16(suite), wrong.name)
+			}
+		}
+	}
 }
