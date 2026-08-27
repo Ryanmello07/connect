@@ -6365,10 +6365,29 @@ func returnsNotRoutedThroughMacVerify(parsed parsedSource, function *ast.FuncDec
 	return offending, viaMacVerify
 }
 
-// tagVerifierRoutingControl declares one of each shape the rule above has to tell apart: the
-// sanctioned body, the four comparators a ban list would have to have thought of, the byte loop
-// that carries no comparator at all, the verifier that decides nothing, the one that reaches a
-// provider it was not given, and an unexported one that is outside the class.
+// tagVerifierRoutingControl declares one of each shape the two rules either side of it have to
+// tell apart: the sanctioned body, the four comparators a ban list would have to have thought
+// of, the byte loop that carries no comparator at all, the verifier that decides nothing, the
+// one that reaches a provider it was not given, and an unexported one that is outside the class.
+//
+// Six of these are here because a control that does not DISCRIMINATE its own rule is a control
+// that issues a broken matcher the clean bill a working one issues. Every half of every rule
+// has to be the only thing reporting some member of this fixture, or that half can be deleted
+// outright with the control still matching exactly what it wants:
+//
+//   - RefusesEverything answers the literal false and nothing else, so its offending list is
+//     empty and only "answers no MacVerify of its own" reports it.
+//   - VerifiesThroughTheProviderAfterAFastPath answers a real MacVerify AND something else, so
+//     only the offending list reports it. Without it that whole accumulation can be replaced by
+//     a discard and the control goes on matching, which is measured rather than supposed.
+//   - RewritesTheTagAheadOfTheProvider and ComparesByteByByteAheadOfTheProvider answer the
+//     sanctioned call and, besides it, nothing but false. That is the ROUTING rule's blind spot
+//     and the whole reason the parameter rule exists: the first is a total authentication
+//     bypass and the second is the guardrail 8 timing leak, and the routing rule is silent on
+//     both. They sit in the routing gate's own wants as shapes it must be seen NOT to report.
+//   - VerifiesTheTagAgainstItself and VerifiesAPrefixOfTheTagThroughTheProvider answer the
+//     sanctioned call over bytes that are not the ones they were handed, and touch no parameter
+//     outside it, so only the argument half of the parameter rule reports them.
 //
 // hmac.Equal is in here deliberately. It is constant time and it is still wrong, because
 // guardrail 8 names crypto/subtle.ConstantTimeCompare reached through CryptoProvider.MacVerify
@@ -6423,13 +6442,76 @@ const tagVerifierRoutingControl = "package control\n" +
 	"\treturn true\n" +
 	"}\n" +
 	"\n" +
+	"func (self *Holder) RefusesEverything(data []byte, tag []byte) bool {\n" +
+	"\t_ = self.secrets.Confirmation\n" +
+	"\treturn false\n" +
+	"}\n" +
+	"\n" +
 	"func (self *Holder) VerifiesThroughAProviderItWasNotGiven(data []byte, tag []byte) bool {\n" +
 	"\treturn elsewhere.MacVerify(self.secrets.Confirmation, data, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesThroughTheProviderAfterAFastPath(data []byte, tag []byte) bool {\n" +
+	"\tif len(tag) == 64 {\n" +
+	"\t\treturn true\n" +
+	"\t}\n" +
+	"\treturn self.crypto.MacVerify(self.secrets.Confirmation, data, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) RewritesTheTagAheadOfTheProvider(data []byte, tag []byte) bool {\n" +
+	"\tif bytes.HasSuffix(data, chosenSuffix) {\n" +
+	"\t\ttag = self.crypto.Mac(self.secrets.Confirmation, data)\n" +
+	"\t}\n" +
+	"\treturn self.crypto.MacVerify(self.secrets.Confirmation, data, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) ComparesByteByByteAheadOfTheProvider(data []byte, tag []byte) bool {\n" +
+	"\texpected := self.crypto.Mac(self.secrets.Confirmation, data)\n" +
+	"\tif len(tag) != len(expected) {\n" +
+	"\t\treturn false\n" +
+	"\t}\n" +
+	"\tfor i := range expected {\n" +
+	"\t\tif expected[i] != tag[i] {\n" +
+	"\t\t\treturn false\n" +
+	"\t\t}\n" +
+	"\t}\n" +
+	"\treturn self.crypto.MacVerify(self.secrets.Confirmation, data, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesTheTagAgainstItself(data []byte, tag []byte) bool {\n" +
+	"\treturn self.crypto.MacVerify(self.secrets.Confirmation, tag, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesAPrefixOfTheTagThroughTheProvider(data []byte, tag []byte) bool {\n" +
+	"\treturn self.crypto.MacVerify(self.secrets.Confirmation, data, tag[:8])\n" +
 	"}\n" +
 	"\n" +
 	"func (self *Holder) verifiesBadlyAndIsUnexported(data []byte, tag []byte) bool {\n" +
 	"\treturn bytes.Equal(self.crypto.Mac(self.secrets.Confirmation, data), tag)\n" +
 	"}\n"
+
+// tagVerifierRoutingControlClass is exactly what boolAnsweringDerivations must read out of the
+// fixture above, and both gates over that fixture assert it before they assert anything else.
+//
+// Exact rather than a floor. A class that widened to take in the unexported member, or narrowed
+// to drop one of the bad shapes, would go on to read the real source the same wrong way and
+// report the clean bill a working one reports.
+var tagVerifierRoutingControlClass = []string{
+	"AcceptsEverything",
+	"ComparesByteByByteAheadOfTheProvider",
+	"RefusesEverything",
+	"RewritesTheTagAheadOfTheProvider",
+	"VerifiesAPrefixOfTheTagThroughTheProvider",
+	"VerifiesTheTagAgainstItself",
+	"VerifiesThroughAProviderItWasNotGiven",
+	"VerifiesThroughTheProvider",
+	"VerifiesThroughTheProviderAfterAFastPath",
+	"VerifiesWithAByteLoop",
+	"VerifiesWithAPrefix",
+	"VerifiesWithASubtleCallOfItsOwn",
+	"VerifiesWithBytesEqual",
+	"VerifiesWithHmacEqual",
+}
 
 // TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse is guardrail 8 over this task's two
 // bools, read as a shape rather than as a word list.
@@ -6453,16 +6535,7 @@ func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
 	control := mustParseText(t, "the tag verifier routing control", tagVerifierRoutingControl)
 	controlDeclared := declaredIn(control)
 	controlClass := boolAnsweringDerivations(controlDeclared, "secrets")
-	wantClass := []string{
-		"AcceptsEverything",
-		"VerifiesThroughAProviderItWasNotGiven",
-		"VerifiesThroughTheProvider",
-		"VerifiesWithAByteLoop",
-		"VerifiesWithAPrefix",
-		"VerifiesWithASubtleCallOfItsOwn",
-		"VerifiesWithBytesEqual",
-		"VerifiesWithHmacEqual",
-	}
+	wantClass := tagVerifierRoutingControlClass
 	if !slices.Equal(controlClass, wantClass) {
 		t.Fatalf("the class read %v out of the control, want %v; it is not intersecting a bool result with a read of one of the nine, or it is reading the unexported one",
 			controlClass, wantClass)
@@ -6474,9 +6547,15 @@ func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
 			reported = append(reported, name)
 		}
 	}
+	// the four the routing rule must be seen NOT to report are absent on purpose: each of them
+	// answers the sanctioned call and, besides it, nothing but false. They are this rule's blind
+	// spot, they are caught by the parameter gate below, and naming them here is what keeps a
+	// reader from believing this rule covers them.
 	wantReported := []string{
 		"AcceptsEverything",
+		"RefusesEverything",
 		"VerifiesThroughAProviderItWasNotGiven",
+		"VerifiesThroughTheProviderAfterAFastPath",
 		"VerifiesWithAByteLoop",
 		"VerifiesWithAPrefix",
 		"VerifiesWithASubtleCallOfItsOwn",
@@ -6489,6 +6568,40 @@ func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
 	}
 
 	// then this package's own source
+	for _, verifier := range theTagVerifiersOfThisPackage(t) {
+		offending, viaMacVerify := returnsNotRoutedThroughMacVerify(verifier.host, verifier.function)
+		if len(offending) != 0 {
+			t.Errorf("%s can answer %v, and guardrail 8 says a tag comparison answers CryptoProvider.MacVerify and nothing else: that is where crypto/subtle.ConstantTimeCompare and the length refusal ahead of it live",
+				verifier.name, offending)
+		}
+		if viaMacVerify == 0 {
+			t.Errorf("%s never answers a call to MacVerify on its own provider, so whatever it decides with is not the sanctioned comparison",
+				verifier.name)
+		}
+	}
+}
+
+// tagVerifierSourceDeclaration is one member of the verifier class together with the parsed file
+// it was read out of, because every rule below renders nodes of it back to source and a node
+// rendered against the wrong file set gives the wrong positions.
+type tagVerifierSourceDeclaration struct {
+	name     string
+	host     parsedSource
+	function *ast.FuncDecl
+}
+
+// theTagVerifiersOfThisPackage is the class both gates over this surface run, derived twice and
+// required to agree.
+//
+// Off the SOURCE it is the exported bool answering declarations that reach past the storage
+// holding the epoch's nine secrets and into one of them. Off the COMPILED type it is the verify
+// half of every (compute, verify) pair *KeySchedule's own method set produces. Either derivation
+// on its own can go quiet — the source one if a verifier is declared in a file this scan does not
+// read, the compiled one if a verifier stops following the naming — and a gate that has gone
+// quiet issues the real source exactly the clean bill a working one issues. So the difference
+// between the two is a failure rather than a smaller class.
+func theTagVerifiersOfThisPackage(t *testing.T) []tagVerifierSourceDeclaration {
+	t.Helper()
 	files := []parsedSource{}
 	structs := map[string]*ast.StructType{}
 	for _, path := range packageLevelFunctions(t).files {
@@ -6500,14 +6613,10 @@ func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
 	if len(holders) != 1 {
 		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
 	}
-	declared := declaredAcross(files)
-	class := boolAnsweringDerivations(declared, epochSecretsStorageFieldIn(t, structs, holders[0]))
+	class := boolAnsweringDerivations(declaredAcross(files), epochSecretsStorageFieldIn(t, structs, holders[0]))
 	if len(class) == 0 {
 		t.Fatalf("no exported declaration of this package answers a bool off one of the nine, and this task lands two, so this gate is demanding nothing")
 	}
-
-	// and the source reading covers exactly the verifiers the compiled type has, so a verifier
-	// declared somewhere this scan does not read is a failure rather than a silence
 	compiled := []string{}
 	for _, pair := range tagVerifierPairs(t) {
 		compiled = append(compiled, pair.verify)
@@ -6518,29 +6627,236 @@ func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
 			class, compiled)
 	}
 	t.Logf("%d exported declarations answer a bool off one of the nine: %v", len(class), class)
-
+	verifiers := []tagVerifierSourceDeclaration{}
 	for _, name := range class {
-		function := (*ast.FuncDecl)(nil)
-		host := parsedSource{}
+		one := tagVerifierSourceDeclaration{name: name}
 		for _, parsed := range files {
-			for _, one := range parsed.file.Decls {
-				candidate, isFunction := one.(*ast.FuncDecl)
+			for _, declaration := range parsed.file.Decls {
+				candidate, isFunction := declaration.(*ast.FuncDecl)
 				if isFunction && candidate.Name.Name == name && candidate.Body != nil {
-					function, host = candidate, parsed
+					one.host, one.function = parsed, candidate
 				}
 			}
 		}
-		if function == nil {
+		if one.function == nil {
 			t.Fatalf("%s is in the class and no file of this package declares it, so this gate cannot read it", name)
 		}
-		offending, viaMacVerify := returnsNotRoutedThroughMacVerify(host, function)
-		if len(offending) != 0 {
-			t.Errorf("%s can answer %v, and guardrail 8 says a tag comparison answers CryptoProvider.MacVerify and nothing else: that is where crypto/subtle.ConstantTimeCompare and the length refusal ahead of it live",
-				name, offending)
+		verifiers = append(verifiers, one)
+	}
+	return verifiers
+}
+
+// tagVerifierParameterUse is what one verifier does with the bytes it was handed.
+type tagVerifierParameterUse struct {
+	// the parameter identifiers, in the order the signature writes them
+	declared []string
+	// every mention of one of them that is not a bare argument of the sanctioned call, with the
+	// position, because the failure has to say where to look
+	touched []string
+	// the trailing arguments of the first sanctioned call, as they are written
+	answered []string
+	// how many calls to MacVerify on this receiver's own provider the body holds
+	sanctioned int
+}
+
+// answersOverWhatItWasGivenUntouched is the whole rule in one line: the parameters are mentioned
+// in exactly one place, that place is the argument list of the one MacVerify call on this
+// receiver's own provider, and they are in the order the signature handed them over.
+func (self tagVerifierParameterUse) answersOverWhatItWasGivenUntouched() bool {
+	return len(self.touched) == 0 && self.sanctioned == 1 && slices.Equal(self.answered, self.declared)
+}
+
+// howTheVerifierUsesItsParameters reads one declaration for every mention of its own parameters,
+// and for the arguments the sanctioned comparison is answered over.
+//
+// OCCURRENCE rather than a list of the ways a slice can be written to, because that list cannot
+// be written: `tag = x` is an assignment, `tag[0] = 1` is an index, `copy(tag, x)`
+// and `io.ReadFull(r, tag)` rewrite the same array through a call that assigns nothing, and
+// a closure can do it with the parameter named nowhere near the write. A rule that had to name
+// those shapes is the hand written class this repository has understated fourteen times. One
+// mention outside the comparison covers every one of them at once, and it covers the READ half
+// in the same stroke: a byte loop over the tag writes nothing at all and hands the index of the
+// first differing octet to anyone who can time the call.
+//
+// Nothing is excused for looking like something else. A field or a composite literal key that
+// shares a parameter's name is reported, because the alternative is a rule that can be walked
+// past by choosing names, and a spurious report is a loud failure while a masked one is silence.
+//
+// The sanctioned mention has to be the BARE identifier. `MacVerify(key, data, tag[:8])`
+// mentions the parameter and compares a prefix of it, which accepts every truncation of a valid
+// tag; a slice expression is not the identifier, so it is reported.
+func howTheVerifierUsesItsParameters(parsed parsedSource, function *ast.FuncDecl) tagVerifierParameterUse {
+	receiver := ""
+	if function.Recv != nil && len(function.Recv.List) == 1 && len(function.Recv.List[0].Names) == 1 {
+		receiver = function.Recv.List[0].Names[0].Name
+	}
+	sanctioned := receiver + ".crypto.MacVerify"
+	use := tagVerifierParameterUse{declared: []string{}, touched: []string{}}
+	if function.Type.Params != nil {
+		for _, field := range function.Type.Params.List {
+			for _, name := range field.Names {
+				if name.Name != "_" {
+					use.declared = append(use.declared, name.Name)
+				}
+			}
 		}
-		if viaMacVerify == 0 {
-			t.Errorf("%s never answers a call to MacVerify on its own provider, so whatever it decides with is not the sanctioned comparison",
-				name)
+	}
+	// the one place a parameter is allowed to be written: a bare argument of the sanctioned
+	// call. Identity rather than name, so a second identifier spelled the same elsewhere in the
+	// body is still a mention.
+	allowed := map[*ast.Ident]bool{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall || parsed.render(call.Fun) != sanctioned {
+			return true
+		}
+		use.sanctioned++
+		for _, argument := range call.Args {
+			if bare, isIdent := argument.(*ast.Ident); isIdent {
+				allowed[bare] = true
+			}
+		}
+		// the TRAILING arguments, so the rule does not have to know how many arguments ahead of
+		// the data and the tag the key takes
+		if use.sanctioned == 1 && len(call.Args) >= len(use.declared) {
+			for _, argument := range call.Args[len(call.Args)-len(use.declared):] {
+				use.answered = append(use.answered, parsed.render(argument))
+			}
+		}
+		return true
+	})
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		identifier, isIdent := node.(*ast.Ident)
+		if !isIdent || allowed[identifier] || !slices.Contains(use.declared, identifier.Name) {
+			return true
+		}
+		use.touched = append(use.touched,
+			identifier.Name+" at "+parsed.fileSet.Position(identifier.Pos()).String())
+		return true
+	})
+	return use
+}
+
+// TestEveryTagVerifierAnswersOverTheBytesItWasGivenUntouched is the half of guardrail 8 the
+// routing gate above cannot reach.
+//
+// That gate reads returned VALUES, so it sees every way a verifier can hand back the wrong
+// answer. What it cannot see is a verifier that hands back the RIGHT call over the wrong bytes.
+// Two shapes live in exactly that gap, and both were measured leaving the whole suite green:
+//
+//   - the bypass. `if bytes.HasSuffix(data, chosen) { tag = self.crypto.Mac(key, data) }`
+//     written ahead of an untouched `return self.crypto.MacVerify(key, data, tag)` replaces
+//     the tag with the one that is about to verify. Every return is still the sanctioned call, so
+//     the routing rule reports nothing; every behavioural sweep still watches a verifier refuse
+//     altered tags, because the rewrite fires only on data the forger chose. It is a total
+//     authentication bypass on both verifiers at once, proved live against all ten corpus epochs.
+//   - the leak. A byte by byte comparison written AHEAD of the sanctioned call answers exactly
+//     what MacVerify answers, so no vector, no bit flip sweep and no KAT can see it, and it hands
+//     the index of the first differing octet to anyone who can time the call. Its returns are the
+//     literal false and the sanctioned call, so the routing rule reports nothing there either.
+//     That is the timing leak guardrail 8 exists for.
+//
+// What the two have in common is not a shape of statement. It is that the verifier TOUCHED the
+// bytes it was handed. So that is the rule: a verifier mentions each of its parameters exactly
+// once, as a bare argument of the one MacVerify call on its own provider, in the order it was
+// handed them, and does nothing else with them at all. No list of the ways to write to a slice
+// has to be right for that to hold, which is the point of writing it this way round.
+//
+// A length check of the verifier's own is refused by this too, and deliberately: MacVerify
+// refuses a length mismatch ahead of the comparison, so a check up here is a second place that
+// refusal can be dropped and the first statement a prefix comparison would grow out of.
+func TestEveryTagVerifierAnswersOverTheBytesItWasGivenUntouched(t *testing.T) {
+	// the control first, and on each half SEPARATELY, because a half no member of the fixture
+	// is the only witness for is a half that can be deleted with the control still matching
+	// exactly — which is how the routing gate beside this one came to carry a dead one
+	control := mustParseText(t, "the tag verifier routing control", tagVerifierRoutingControl)
+	controlClass := boolAnsweringDerivations(declaredIn(control), "secrets")
+	if !slices.Equal(controlClass, tagVerifierRoutingControlClass) {
+		t.Fatalf("the class read %v out of the control, want %v; it is not intersecting a bool result with a read of one of the nine, or it is reading the unexported one",
+			controlClass, tagVerifierRoutingControlClass)
+	}
+	touching, answeringOverSomethingElse, reported := []string{}, []string{}, []string{}
+	for _, name := range controlClass {
+		use := howTheVerifierUsesItsParameters(control, control.declarationOf(t, "*Holder", name))
+		if len(use.touched) != 0 {
+			touching = append(touching, name)
+		}
+		if use.sanctioned != 1 || !slices.Equal(use.answered, use.declared) {
+			answeringOverSomethingElse = append(answeringOverSomethingElse, name)
+		}
+		if !use.answersOverWhatItWasGivenUntouched() {
+			reported = append(reported, name)
+		}
+	}
+	// three of these are the ones the OTHER half never sees: the rewrite, the byte loop and the
+	// fast path all answer the sanctioned call over the right identifiers in the right order,
+	// and get at the bytes on the way
+	wantTouching := []string{
+		"ComparesByteByByteAheadOfTheProvider",
+		"RewritesTheTagAheadOfTheProvider",
+		"VerifiesAPrefixOfTheTagThroughTheProvider",
+		"VerifiesThroughAProviderItWasNotGiven",
+		"VerifiesThroughTheProviderAfterAFastPath",
+		"VerifiesWithAByteLoop",
+		"VerifiesWithAPrefix",
+		"VerifiesWithASubtleCallOfItsOwn",
+		"VerifiesWithBytesEqual",
+		"VerifiesWithHmacEqual",
+	}
+	if !slices.Equal(touching, wantTouching) {
+		t.Fatalf("the touch half reported %v out of the control, want %v; a mention it lets through is a statement the real verifiers can be written with",
+			touching, wantTouching)
+	}
+	// and three of these are the ones the touch half never sees: the two that decide without
+	// comparing anything, and the one that verifies the tag against itself, all touch nothing
+	// outside the call and none of them compares what it was handed
+	wantAnsweringOverSomethingElse := []string{
+		"AcceptsEverything",
+		"RefusesEverything",
+		"VerifiesAPrefixOfTheTagThroughTheProvider",
+		"VerifiesTheTagAgainstItself",
+		"VerifiesThroughAProviderItWasNotGiven",
+		"VerifiesWithAByteLoop",
+		"VerifiesWithAPrefix",
+		"VerifiesWithASubtleCallOfItsOwn",
+		"VerifiesWithBytesEqual",
+		"VerifiesWithHmacEqual",
+	}
+	if !slices.Equal(answeringOverSomethingElse, wantAnsweringOverSomethingElse) {
+		t.Fatalf("the argument half reported %v out of the control, want %v; a comparison it lets through is a comparison over bytes the caller never handed in",
+			answeringOverSomethingElse, wantAnsweringOverSomethingElse)
+	}
+	// and exactly one member of that fixture obeys the whole rule: the sanctioned body
+	wantReported := []string{}
+	for _, name := range controlClass {
+		if name != "VerifiesThroughTheProvider" {
+			wantReported = append(wantReported, name)
+		}
+	}
+	if !slices.Equal(reported, wantReported) {
+		t.Fatalf("the rule reported %v out of the control, want %v; the one body it must clear is the sanctioned one, and every other shape in there is a way this surface has been broken",
+			reported, wantReported)
+	}
+
+	// then this package's own source
+	for _, verifier := range theTagVerifiersOfThisPackage(t) {
+		use := howTheVerifierUsesItsParameters(verifier.host, verifier.function)
+		if len(use.declared) < 2 {
+			t.Errorf("%s declares the parameters %v, and a tag verifier is handed the data and the tag, so this gate has nothing to hold it to",
+				verifier.name, use.declared)
+			continue
+		}
+		if len(use.touched) != 0 {
+			t.Errorf("%s mentions the bytes it was handed at %v, outside the comparison that is supposed to decide its answer; a statement that can reach the data or the tag ahead of MacVerify can rewrite either one into the pair that verifies, or read the tag an octet at a time",
+				verifier.name, use.touched)
+		}
+		if use.sanctioned != 1 {
+			t.Errorf("%s holds %d calls to MacVerify on its own provider and this gate holds it to exactly one; none is no sanctioned comparison at all, and a second one is a second answer this rule cannot tell from the first",
+				verifier.name, use.sanctioned)
+		}
+		if !slices.Equal(use.answered, use.declared) {
+			t.Errorf("%s answers MacVerify over %v and was handed %v; the comparison decides the answer only if what it compares is what the caller gave it, unaltered and in that order",
+				verifier.name, use.answered, use.declared)
 		}
 	}
 }
