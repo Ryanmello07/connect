@@ -3128,6 +3128,24 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{interim}
 		}},
+		// the secret tree's constructor. encryption_secret is one of the nine secrets an
+		// epoch holds and zeroizes on its own schedule, and this tree erases what IT holds,
+		// so a constructor that seeded the root with the caller's array rather than with a
+		// copy of it would destroy the epoch's encryption_secret the first time any leaf was
+		// taken -- and every correctness test in this package would still pass, because the
+		// tree itself would be right. The answer read is the leaf secret rather than the
+		// constructor's own, which is a struct.
+		{name: "NewSecretTree", call: func(take func([]byte) []byte) [][]byte {
+			tree, treeErr := NewSecretTree(crypto, 8, take(initSecretPrev))
+			if treeErr != nil {
+				t.Fatalf("NewSecretTree: %v", treeErr)
+			}
+			leafSecret, takeErr := tree.takeLeafSecret(6)
+			if takeErr != nil {
+				t.Fatalf("takeLeafSecret: %v", takeErr)
+			}
+			return [][]byte{leafSecret}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3529,6 +3547,7 @@ var providerConstructionValues = map[string]any{
 	"EmptyPskSecret":                EmptyPskSecret,
 	"ConfirmedTranscriptHash":       ConfirmedTranscriptHash,
 	"InterimTranscriptHash":         InterimTranscriptHash,
+	"NewSecretTree":                 NewSecretTree,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3786,10 +3805,18 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 				Secret: ascendingBytes(0xb3, params.Nh),
 			},
 		},
-		"label":      "stub gate label",
-		"length":     32,
-		"n":          32,
-		"generation": uint32(7),
+		"label":  "stub gate label",
+		"length": 32,
+		"n":      32,
+		// the secret tree's two. The count is a full tree because tree math refuses every
+		// other shape, and the secret is exactly KDF.Nh because the constructor refuses
+		// every other length -- and a refused call is a row that observed nothing. The
+		// count is written as a LeafCount and not as an untyped 8: the two are one uint32
+		// to the compiler, and a construction that took an index where a count belongs
+		// would be handed the right number by an untyped literal and never show it.
+		"leafCount":        LeafCount(8),
+		"encryptionSecret": ascendingBytes(0xcc, params.Nh),
+		"generation":       uint32(7),
 	}
 	// the keys and the answers the receiving operations are handed, computed over a
 	// provider of this gate's own so that the operation under test still draws from a
@@ -3971,6 +3998,41 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 	return nil
 }
 
+// Whether a provider perturbation that did not move the answer is evidence of anything.
+//
+// The perturbation of a provider parameter is the tagging provider, which flips the bytes
+// of every answer that HAS bytes and passes a value method -- HashSize, KeySize, NonceSize,
+// Suite -- through unchanged, because a size has no bytes to flip. So a construction whose
+// whole use of the provider is a length is one this wrapper CANNOT move, and reporting it
+// as "does not read the crypto it was handed" says something false about a body that read
+// the provider on every call it made. NewSecretTree is that shape: it validates
+// encryption_secret against KDF.Nh and then stores it, and the first value derived THROUGH
+// the provider exists only once a leaf has been taken.
+//
+// A construction that reached the provider not at all has an EMPTY call log and is still
+// reported, which is the case that report exists for. And this is not a licence to hardcode
+// a length: what separates a read HashSize from a written 32 is a provider whose Nh is not
+// 32, which is what key_schedule_test.go's wide kdf differential and the secret tree's own
+// synthetic suite row are for.
+//
+// The class is providerValueMethods, read rather than written out again here, so a method
+// that stops being a value method stops being excused by this.
+func providerReachedOnlyValueMethods(perturbed reflect.Value) bool {
+	if !perturbed.IsValid() || !perturbed.CanInterface() {
+		return false
+	}
+	tagging, isTagging := perturbed.Interface().(*taggingCryptoProvider)
+	if !isTagging || len(tagging.calls) == 0 {
+		return false
+	}
+	for _, call := range tagging.calls {
+		if !slices.Contains(providerValueMethods, call) {
+			return false
+		}
+	}
+	return true
+}
+
 // One call, with a panic caught rather than taken. A method that still refuses to be
 // called is exactly what this gate is looking for, and a test binary that died on the
 // first one would report nothing about the operations after it.
@@ -4007,6 +4069,35 @@ func providerStubCall(call reflect.Value, arguments []reflect.Value) (results []
 // The bytes are copied out one at a time because reflect refuses Bytes and Interface on
 // a value reached through an unexported field. Uint on an element is permitted, is a
 // read and not a handle, and needs no unsafe.
+// One entry of a map of byte slices, with the text its key sorts by, so a map answer
+// renders in one order rather than in go's randomised one.
+type providerMapEntry struct {
+	order   string
+	carried []byte
+}
+
+// providerMapKeyOrder renders one map key for sorting, using only the reads reflect
+// permits on a value reached through an unexported field: Interface panics on one of
+// those, so fmt.Sprint is not available here and the kinds are switched on directly.
+//
+// An unhandled kind renders as its type name, which puts every key of that kind in one
+// group and leaves their order to the byte tie break beside the call rather than to map
+// iteration. That is deterministic, which is all this ordering has to be -- it is a
+// rendering for comparison against another rendering of the same type, never a claim
+// about which node a secret belonged to.
+func providerMapKeyOrder(key reflect.Value) string {
+	switch key.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return fmt.Sprintf("%020d", key.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return fmt.Sprintf("%020d", key.Uint())
+	case reflect.String:
+		return key.String()
+	default:
+		return key.Type().String()
+	}
+}
+
 func providerStructByteFields(value reflect.Value) [][]byte {
 	carried := [][]byte{}
 	for i := range value.NumField() {
@@ -4020,6 +4111,39 @@ func providerStructByteFields(value reflect.Value) [][]byte {
 			carried = append(carried, out)
 		case field.Kind() == reflect.Struct:
 			carried = append(carried, providerStructByteFields(field)...)
+		case field.Kind() == reflect.Map && field.Type().Elem().Kind() == reflect.Slice &&
+			field.Type().Elem().Elem().Kind() == reflect.Uint8:
+			// a type that holds its secrets in a MAP holds them no less, and the secret
+			// tree holds every undelivered node secret in one. Without this case the whole
+			// of that type renders as no bytes at all -- which is the answer a stub gives,
+			// so the report above would fire on a complete implementation while an actual
+			// stub of it sat here indistinguishable. The file comment's rule is unchanged:
+			// a secret is bytes, and this is where a second kind of container of them is
+			// read rather than stopped at.
+			//
+			// Sorted, because go randomises map iteration on purpose. An unsorted walk
+			// renders one tree two different ways, and the repeat control above -- the one
+			// that fails a row whose two identical calls answered differently -- would then
+			// fire on every row of every construction answering a map, for a reason that is
+			// not the code under test.
+			held := []providerMapEntry{}
+			for _, key := range field.MapKeys() {
+				entry := field.MapIndex(key)
+				out := make([]byte, entry.Len())
+				for at := range out {
+					out[at] = byte(entry.Index(at).Uint())
+				}
+				held = append(held, providerMapEntry{order: providerMapKeyOrder(key), carried: out})
+			}
+			slices.SortFunc(held, func(a, b providerMapEntry) int {
+				if by := strings.Compare(a.order, b.order); by != 0 {
+					return by
+				}
+				return bytes.Compare(a.carried, b.carried)
+			})
+			for _, entry := range held {
+				carried = append(carried, entry.carried)
+			}
 		}
 	}
 	return carried
@@ -4397,7 +4521,7 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 						// observed stays where it is, which is what routes the operation to
 						// the registry comparison below, and that comparison is the stricter
 						// of the two readings.
-						if !answersARegistryValue {
+						if !answersARegistryValue && !providerReachedOnlyValueMethods(perturbations[at].value) {
 							t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
 								where, parameter.name, perturbations[at].where, parameter.name)
 						}
@@ -4710,10 +4834,17 @@ func Exported(secret []byte) []byte {
 // spelling keeps the excuse alive after the real one has found its caller. Measured in both
 // directions before the key was widened. This is the base name exemption this project keeps
 // rediscovering, transposed from file names onto symbol names.
-// It is empty, and that is the entry it held expiring exactly as it was written to: p4
-// task 5 landed key_schedule.go, DeriveJoinerSecret erases its pseudorandom key through
+// It held one entry before this one, and that entry expired exactly as it was written to:
+// p4 task 5 landed key_schedule.go, DeriveJoinerSecret erases its pseudorandom key through
 // zeroizeSecret, and the excuse died with the condition it named rather than outliving it.
-var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{}
+var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
+	// p4 task 21 lands the secret tree, its descent and its deletions; task 22 lands the
+	// handshake and application ratchets that take its leaves. Until that commit the only
+	// thing naming takeLeafSecret is secret_tree_test.go, which is exactly the condition
+	// this table is for: a complete body whose caller is written next, not a placeholder.
+	// It expires by failing the moment ratchetFor names it.
+	"./takeLeafSecret": "p4 task 22's ratchetFor is its first production caller",
+}
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
 // the package directory the gate grouped a file under, then the declaration's name. It is
@@ -5763,6 +5894,13 @@ func cryptoSourcePaths(t *testing.T) []string {
 // by an explicit caller. Nothing here can consult the environment, and the constraint gate
 // below says nothing here can be swapped out by a build tag either, so the only way to a
 // provider over a caller's reader is to call the constructor that takes one.
+//
+// math/bits and sync arrived with the two files that need them and are written down here
+// on the same terms as fmt. math/bits is tree math's log2 and its count of trailing ones:
+// integer arithmetic over a uint32, no allocation, nothing platform specific, and no way
+// to reach anything outside the function. sync is the secret tree's stateLock, which is
+// the shape the interface registry gives that type -- a mutex guarding the node secrets a
+// concurrent sender would otherwise consume twice.
 var cryptoImportPaths = []string{
 	`"bytes"`,
 	`"crypto/aes"`,
@@ -5781,8 +5919,10 @@ var cryptoImportPaths = []string{
 	`"golang.org/x/crypto/chacha20poly1305"`,
 	`"io"`,
 	`"math"`,
+	`"math/bits"`,
 	`"slices"`,
 	`"strconv"`,
+	`"sync"`,
 }
 
 // The crypto is built from the packages above and no others.

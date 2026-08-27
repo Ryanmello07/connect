@@ -3985,6 +3985,24 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{key, nonce}
 		}},
+		// the secret tree's descent. Every node secret of the tree is KDF.Nh wide at either
+		// width, and the encryption secret it is seeded with is read off the provider under
+		// test rather than written 32, so this row exercises the constructor's own length
+		// refusal as well: a body comparing against a literal 32 refuses the wide provider's
+		// secret outright and is reported as a panic rather than as a length. The leaf is
+		// what is read because the constructor's answer is a struct, and a leaf three levels
+		// down is read rather than the root's own copy so the expansions are in the answer.
+		{name: "NewSecretTree", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			tree, treeErr := NewSecretTree(crypto, 8, bytes.Repeat([]byte{0x7e}, crypto.HashSize()))
+			if treeErr != nil {
+				t.Fatalf("NewSecretTree over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), treeErr)
+			}
+			leafSecret, takeErr := tree.takeLeafSecret(3)
+			if takeErr != nil {
+				t.Fatalf("takeLeafSecret: %v", takeErr)
+			}
+			return [][]byte{leafSecret}
+		}},
 		// the two transcript hash arithmetics, which answer the provider's hash and nothing
 		// else, so both are KDF.Nh wide at either width. What this equivalence reads here is
 		// a truncation: a body ending in [:32], or one that built its answer into a written

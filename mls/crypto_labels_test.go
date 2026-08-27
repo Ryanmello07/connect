@@ -1432,6 +1432,24 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 			}
 			return interim
 		}},
+		// the secret tree's constructor and the first descent under it. It reaches the
+		// provider for a hash size and for one labelled expansion per level, and none of
+		// that is visible in the answer: a leaf secret derived with a provider of its own
+		// is a well formed 32 bytes that agrees with mlswg's whole secret-tree corpus,
+		// because that corpus is at the suite it would have hardcoded. The leaf is what is
+		// read rather than the constructor's own answer, which is a struct: the value a
+		// hardcoded provider would betray itself in only exists once a leaf has been taken.
+		{name: "NewSecretTree", call: func(crypto CryptoProvider) []byte {
+			tree, treeErr := NewSecretTree(crypto, 8, value[:crypto.HashSize()])
+			if treeErr != nil {
+				t.Fatalf("NewSecretTree: %v", treeErr)
+			}
+			leafSecret, takeErr := tree.takeLeafSecret(5)
+			if takeErr != nil {
+				t.Fatalf("takeLeafSecret: %v", takeErr)
+			}
+			return leafSecret
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		tagging := &taggingCryptoProvider{inner: plain}

@@ -157,6 +157,38 @@ var (
 	_ func(*testing.T) json.RawMessage  = VectorFamily{}.Generate
 )
 
+// p3 tree math — the index surface registry section 4 gives this plan, pinned at the
+// shapes convention C3 fixes: counts are LeafCount and indices are LeafIndex/NodeIndex,
+// NodeWidth answers a uint32, Root is two valued, and Level is a METHOD. The secret tree
+// descends by these and by nothing else, so a Root that lost its error or a Level that
+// became a free function has to stop compiling here rather than be absorbed by a shim at
+// the one call site — a shim turning Root's error into node zero builds a tree whose
+// descent never terminates, which is the exact failure C3 was written against.
+//
+// Left and Right are pinned separately and identically on purpose. Their signatures
+// cannot tell them apart, so what this block holds is that both exist at that shape; the
+// secret tree's own test is what holds that the descent calls the one it means.
+var (
+	_ func(LeafCount) (NodeIndex, error) = Root
+	_ func(NodeIndex) (NodeIndex, error) = Left
+	_ func(NodeIndex) (NodeIndex, error) = Right
+	_ func(LeafCount) uint32             = NodeWidth
+
+	// method expressions, so the receiver is pinned with the signature. A NodeIndex.Level
+	// respelled as a free function Level(NodeIndex) would satisfy neither line.
+	_ func(LeafIndex) NodeIndex = LeafIndex.NodeIndex
+	_ func(NodeIndex) uint32    = NodeIndex.Level
+
+	// the three index types are uint32 underneath and nothing narrower. The 0xffffffff
+	// conversion is the pin: it is a compile error the moment one is retyped to a uint16,
+	// and an assignment of a small constant would not catch that. It is NOT a claim the
+	// value is in range — MaxLeafCount is half of it — only that the width is the one
+	// every downstream index computation was written against.
+	_ LeafIndex = LeafIndex(0xffffffff)
+	_ NodeIndex = NodeIndex(0xffffffff)
+	_ LeafCount = LeafCount(0xffffffff)
+)
+
 // pinnedCodec exists only to carry the C1 method set. Declaring the two methods and then
 // asserting the interface is what pins their signatures: syntax.Codec satisfied by a
 // type this file wrote means MarshalMLS still takes *syntax.Writer and returns error,
@@ -413,15 +445,6 @@ func readVectorManifest(t *testing.T) map[string]string {
 // map's detector used to be blind to, and the fix is in the scan rather than here — a name
 // that lands test-only is landed, and owes its pin.
 var crossPlanSymbolsNotYetLanded = map[string]string{
-	"LeafIndex":              "p3 tree math",
-	"NodeIndex":              "p3 tree math",
-	"LeafCount":              "p3 tree math",
-	"NodeWidth":              "p3 tree math",
-	"Root":                   "p3 tree math",
-	"Left":                   "p3 tree math",
-	"Right":                  "p3 tree math",
-	"LeafIndex.NodeIndex":    "p3 tree math",
-	"NodeIndex.Level":        "p3 tree math",
 	"ContentType":            "p6 framing",
 	"ContentTypeApplication": "p6 framing",
 	"ContentTypeProposal":    "p6 framing",
@@ -449,8 +472,8 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 	// removes the only thing that will notice its symbol landing, and deleting it is the
 	// cheapest way to quieten this test. answering an entry properly is a pin written
 	// above, the entry deleted, and this number decremented in the same commit.
-	if len(crossPlanSymbolsNotYetLanded) != 21 {
-		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 21 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
+	if len(crossPlanSymbolsNotYetLanded) != 12 {
+		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 12 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
 			len(crossPlanSymbolsNotYetLanded))
 	}
 	fileSet := token.NewFileSet()
@@ -628,7 +651,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 53,
+	"key_schedule_deps_test.go": 62,
 	"pins_test.go":              8,
 }
 
