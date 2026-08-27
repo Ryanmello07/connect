@@ -1,12 +1,13 @@
-// The RFC 9420 section 8.4 pre shared key identifier, and the two validation rules that
-// are about the value rather than about the proposal carrying it.
+// The RFC 9420 section 8.4 pre shared key identifier, the three validation rules that are
+// about the value rather than about the proposal carrying it, and the psk_secret
+// recurrence those rules stand in front of.
 //
 // The v1 profile refuses PreSharedKey proposals outright (spec A section 3.1), one layer
 // above this one, at proposal parse. So it is fair to ask why the codec exists at all.
 // It exists because a refusal you cannot parse is a refusal you cannot make correctly:
-// ValSem401 and ValSem402 are rules ABOUT a PreSharedKeyId, and a rule cannot be checked
-// against a structure the implementation declines to decode. It exists because the
-// psk_secret vector family has to pass in both directions, and those vectors are not
+// ValSem401, ValSem402 and ValSem403 are rules ABOUT a PreSharedKeyId, and a rule cannot
+// be checked against a structure the implementation declines to decode. It exists because
+// the psk_secret vector family has to pass in both directions, and those vectors are not
 // empty. And it exists because the empty psk secret is an input to every epoch this
 // product does derive, so a defect in the non empty case is invisible from here and
 // surfaces at the first interop test.
@@ -18,14 +19,16 @@ package mls
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
 
-// The two refusals this file makes are ValSem401 and ValSem402 in the validation plan's
-// catalogue, and that plan owns the single declaration site for ErrPskNonceLength and
-// ErrPskType. Neither those names nor ValSem itself has landed in this package yet, so
-// the refusals are carried by the two unexported values below until they do.
+// The three refusals this file makes are ValSem401, ValSem402 and ValSem403 in the
+// validation plan's catalogue, and that plan owns the single declaration site for
+// ErrPskNonceLength, ErrPskType and ErrDuplicatePsk. Neither those names nor ValSem itself
+// has landed in this package yet, so the refusals are carried by the three unexported
+// values below until they do.
 //
 // Unexported is the whole point of the shape. An exported ErrPskNonceLength declared
 // here would be a second public declaration site for a name the validation plan also
@@ -35,12 +38,13 @@ import (
 // depended on from outside it either, so the swap costs nobody else anything.
 //
 // The swap itself is mechanical: wrap each detail in ValSem(ValSem401, ...) or
-// ValSem(ValSem402, ...) with the catalogue's sentinel as the detail, which is what the
-// plan's body says and what makes errors.Is and CodeOf both hold. The messages here are
-// the catalogue's own reason strings so that the text does not move either.
+// ValSem(ValSem402, ...) or ValSem(ValSem403, ...) with the catalogue's sentinel as the
+// detail, which is what the plan's body says and what makes errors.Is and CodeOf both
+// hold. The messages here are the catalogue's own reason strings so that the text does
+// not move either.
 //
 // The moment that swap is owed is not left to anybody's memory. ValSem, ValSem401,
-// ValSem402, ErrPskNonceLength and ErrPskType are all listed in
+// ValSem402, ValSem403, ErrPskNonceLength, ErrPskType and ErrDuplicatePsk are all listed in
 // crossPlanSymbolsNotYetLanded in key_schedule_deps_test.go, and that gate fails on the
 // commit that lands them, naming each one.
 var (
@@ -55,6 +59,13 @@ var (
 	// they are one refusal from the receiver's point of view: this is not a
 	// PreSharedKeyId it is willing to act on.
 	errPskType = errors.New("mls: psk: resumption usage is not permitted here")
+
+	// errDuplicatePsk is ValSem403. RFC 9420 section 12.2 invalidates a list that
+	// "contains multiple PreSharedKey proposals that reference the same
+	// PreSharedKeyID", and the same condition covers a GroupSecrets psks<V> vector.
+	// A repeated id is one key mixed into the epoch twice, under two indices, by
+	// members who each believe they are following the sender.
+	errDuplicatePsk = errors.New("mls: psk: the list names the same PreSharedKeyID twice")
 )
 
 // PskType is the RFC 9420 section 8.4 PSKType enum. Zero is reserved and every value
@@ -218,4 +229,181 @@ func (self *PreSharedKeyId) Validate(crypto CryptoProvider) error {
 		return nil
 	}
 	return fmt.Errorf("%w: psktype %d", errPskType, self.PskType)
+}
+
+// ---------------------------------------------------------------------------
+// ValSem403: the same PreSharedKeyID named twice
+// ---------------------------------------------------------------------------
+
+// CheckNoDuplicatePsks is ValSem403. RFC 9420 section 12.2 makes a proposal list invalid
+// when "it contains multiple PreSharedKey proposals that reference the same
+// PreSharedKeyID", and the rule reaches the psks<V> vector of a GroupSecrets too, because
+// section 8.4 folds both lists through one recurrence and a repeated entry is a psk mixed
+// in twice under two indices.
+//
+// What "the same PreSharedKeyID" means is the whole of this rule, and it is decided over
+// the SERIALIZED id rather than over a hand written list of fields. Two independent
+// reasons point the same way.
+//
+// psk_nonce is a field of PreSharedKeyID and section 8.4 requires a fresh one on every
+// injection, so two ids sharing a psk_id and differing in nonce are two different ids and
+// refusing them would be stricter than the RFC -- a refusal of something a conformant
+// peer may legitimately send, which is an interop break rather than a safety margin. The
+// select() arms cut the other way: the external arm does not encode usage, psk_group_id
+// or psk_epoch at all, so two external ids differing only in those are ONE id on the
+// wire, contribute one psk_input, and are a duplicate whatever the go struct happens to
+// hold. A field by field comparison gets one of those two backwards by construction, and
+// gets every field added to the struct later wrong as well. The encoding is what the
+// protocol agrees on, so the encoding is what is compared.
+//
+// An id this package cannot encode is refused rather than skipped. Marshal's one semantic
+// refusal is an unregistered psktype, and treating that as "not a duplicate" would let a
+// list carry two copies of an id nobody can name past the only check that looks at it.
+//
+// ValSem403 is untested in OpenMLS (openmls#1335), so differential agreement proves
+// nothing here and the RFC text above is the only authority.
+//
+// The lookup is a map rather than the pairwise sweep this task was drafted with. The list
+// is attacker supplied -- the psks<V> of a Welcome, or a commit's proposal list -- and a
+// pairwise sweep over the 65535 entries the uint16 count admits is four billion
+// comparisons whose length the peer chooses. Nothing compared here is secret: a
+// PreSharedKeyID travels in the clear in the proposal that names it, and the secret it
+// names is not in this structure at all. Guardrail 8's constant time rule is about tag
+// comparisons, which this is not.
+func CheckNoDuplicatePsks(ids []PreSharedKeyId) error {
+	firstAt := make(map[string]int, len(ids))
+	for i := range ids {
+		encoded, err := syntax.Marshal(&ids[i])
+		if err != nil {
+			return fmt.Errorf("psk %d: %w", i, err)
+		}
+		if previous, seen := firstAt[string(encoded)]; seen {
+			return fmt.Errorf("%w: entries %d and %d", errDuplicatePsk, previous, i)
+		}
+		firstAt[string(encoded)] = i
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// section 8.4: PSKLabel and psk_secret
+// ---------------------------------------------------------------------------
+
+// PreSharedKeyInput pairs an id with the secret bytes that id names.
+//
+// The secret is deliberately not a field of PreSharedKeyId. The id is the half that
+// travels on the wire and the secret is the half that never does, and a single structure
+// holding both would leave key material one careless syntax.Marshal away from a proposal.
+type PreSharedKeyInput struct {
+	Id     PreSharedKeyId
+	Secret []byte
+}
+
+// marshalPskLabel encodes RFC 9420 section 8.4's
+//
+//	struct {
+//	    PreSharedKeyID id;
+//	    uint16 index;
+//	    uint16 count;
+//	} PSKLabel;
+//
+// The id is written inline through its own MarshalMLS with no framing of its own, which is
+// why that method takes a writer rather than returning bytes: a length prefix added here
+// would be invisible to a reader of this preimage and fatal to the psk_secret every member
+// derives from it.
+//
+// index and count are what domain separate one psk's contribution from the same psk's
+// contribution somewhere else. The chain in PskSecret already makes the fold order
+// dependent on its own, so what these two fields add is narrower and worth stating
+// exactly: a psk_input computed for position i of an n entry list is not the psk_input for
+// any other position, or for the same position in a list of another length, so a
+// contribution cannot be lifted out of one list and spliced into another.
+func marshalPskLabel(id *PreSharedKeyId, index uint16, count uint16) ([]byte, error) {
+	w := syntax.NewWriter()
+	if err := id.MarshalMLS(w); err != nil {
+		return nil, err
+	}
+	w.WriteUint16(index)
+	w.WriteUint16(count)
+	return w.Bytes()
+}
+
+// PskSecret is the RFC 9420 section 8.4 recurrence, over the list in the order given:
+//
+//	psk_extracted_[i] = KDF.Extract(0, psk_[i])
+//	psk_input_[i]     = ExpandWithLabel(psk_extracted_[i], "derived psk", PSKLabel_[i], KDF.Nh)
+//	psk_secret_[0]    = 0
+//	psk_secret_[i]    = KDF.Extract(psk_input_[i-1], psk_secret_[i-1])
+//	psk_secret        = psk_secret_[n]
+//
+// where 0 is the KDF.Nh all zero string.
+//
+// Extract takes (salt, ikm) here, in the order the spec text writes it: the zero string is
+// the SALT of the first line and psk_input is the SALT of the last. Either transposition
+// compiles, returns KDF.Nh bytes and passes everything that is not compared against a
+// published answer, which is why the corpus sweep over psk_secret.json is the check that
+// matters and not any property this file could assert about its own output.
+//
+// The empty list is not a skipped contribution: it is psk_secret_[0], the all zero string,
+// and it is what every epoch this product derives actually mixes in. See EmptyPskSecret.
+//
+// Validation and the duplicate check both happen here rather than being left to the
+// caller, so there is no order of calls that reaches a psk_secret over a list ValSem401,
+// ValSem402 or ValSem403 refuses.
+func PskSecret(crypto CryptoProvider, psks []PreSharedKeyInput) ([]byte, error) {
+	pskSecret := ZeroSecret(crypto)
+	if len(psks) == 0 {
+		return pskSecret, nil
+	}
+	// the uint16 count field cannot describe a longer list. truncating the length into it
+	// would not be a smaller list, it would be every member labelling the same psk
+	// differently, so this is a refusal rather than a wrap.
+	if len(psks) > math.MaxUint16 {
+		return nil, fmt.Errorf("%w: %d", ErrPskCount, len(psks))
+	}
+	ids := make([]PreSharedKeyId, 0, len(psks))
+	for i := range psks {
+		ids = append(ids, psks[i].Id)
+	}
+	if err := CheckNoDuplicatePsks(ids); err != nil {
+		return nil, err
+	}
+	// the all zero salt of psk_extracted_[i]. hoisted because it is public constant data
+	// rather than a secret, and kept distinct from the accumulator below, which is erased
+	// on every step.
+	zero := ZeroSecret(crypto)
+	count := uint16(len(psks))
+	for i := range psks {
+		if err := psks[i].Id.Validate(crypto); err != nil {
+			return nil, fmt.Errorf("psk %d: %w", i, err)
+		}
+		label, err := marshalPskLabel(&psks[i].Id, uint16(i), count)
+		if err != nil {
+			return nil, fmt.Errorf("psk %d: %w", i, err)
+		}
+		extracted := crypto.Extract(zero, psks[i].Secret)
+		input := crypto.ExpandWithLabel(extracted, "derived psk", label, crypto.HashSize())
+		next := crypto.Extract(input, pskSecret)
+		zeroizeSecret(extracted)
+		zeroizeSecret(input)
+		zeroizeSecret(pskSecret)
+		pskSecret = next
+	}
+	return pskSecret, nil
+}
+
+// EmptyPskSecret is psk_secret for an epoch with no pre shared keys: the KDF.Nh all zero
+// string that section 8.4 calls psk_secret_[0].
+//
+// It exists because that case is not a skipped step. Every v1 epoch of this product has no
+// PSKs, so NewGroup, Commit and JoinFromWelcome all mix this value into the key schedule,
+// and an implementation that omitted the psk contribution instead would derive a different
+// epoch from the same inputs and agree with nobody. Making it total rather than fallible is
+// the other half: PskSecret(crypto, nil) cannot fail, and a caller forced to handle an
+// error that cannot occur will eventually handle it wrongly.
+//
+// A fresh slice on every call, for the reason ZeroSecret gives: the key schedule erases
+// what it has finished with, and a shared constant would come back cleared.
+func EmptyPskSecret(crypto CryptoProvider) []byte {
+	return ZeroSecret(crypto)
 }

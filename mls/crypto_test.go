@@ -3501,6 +3501,8 @@ var providerConstructionValues = map[string]any{
 	"NewKeyScheduleFromEpochSecret": NewKeyScheduleFromEpochSecret,
 	"newKeyScheduleFromParts":       newKeyScheduleFromParts,
 	"WelcomeKeyNonce":               WelcomeKeyNonce,
+	"PskSecret":                     PskSecret,
+	"EmptyPskSecret":                EmptyPskSecret,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3716,6 +3718,32 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 				{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: ascendingBytes(0x04, 8)},
 			},
 		},
+		// the psk list psk_secret folds. Two entries and not one, because the recurrence
+		// only has an accumulator from the second step and a single entry list would let
+		// a fold that dropped it past every row here. One entry per arm, so a field only
+		// the resumption arm encodes has somewhere to be moved; the ids are distinct or
+		// ValSem403 refuses the list before anything is derived, and the nonces are
+		// exactly KDF.Nh or ValSem401 does.
+		"psks": []PreSharedKeyInput{
+			{
+				Id: PreSharedKeyId{
+					PskType:  PskTypeExternal,
+					PskId:    ascendingBytes(0xa1, 16),
+					PskNonce: ascendingBytes(0xa2, params.Nh),
+				},
+				Secret: ascendingBytes(0xa3, params.Nh),
+			},
+			{
+				Id: PreSharedKeyId{
+					PskType:    PskTypeResumption,
+					Usage:      ResumptionPskUsageApplication,
+					PskGroupId: ascendingBytes(0xb1, 12),
+					PskEpoch:   9,
+					PskNonce:   ascendingBytes(0xb2, params.Nh),
+				},
+				Secret: ascendingBytes(0xb3, params.Nh),
+			},
+		},
 		"label":      "stub gate label",
 		"length":     32,
 		"n":          32,
@@ -3829,6 +3857,11 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 	moved := []providerPerturbation{}
 	switch argument.Kind() {
 	case reflect.Slice:
+		// the psk list is a slice of structs rather than of bytes, so the byte rule below
+		// cannot reach into it. Its rule lives beside the structure it moves, in psk_test.go.
+		if argument.Type() == reflect.TypeOf([]PreSharedKeyInput(nil)) {
+			return providerPskInputPerturbations(t, operation, parameter, argument)
+		}
 		if argument.Type().Elem().Kind() != reflect.Uint8 {
 			break
 		}
@@ -4085,6 +4118,14 @@ var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
 	// TheProvider holds this construction to. Both registered suites fix Nh at 32, so
 	// nothing registered here separates a literal from a provider read.
 	"ZeroSecret": func(params *SuiteParams) any { return strings.Repeat("00", params.Nh) },
+	// and psk_secret for an epoch with no pre shared keys, which RFC 9420 section 8.4
+	// defines as that same all zero string. Same shape as ZeroSecret and the same
+	// reason: the only argument is a provider carrying a length, and the tagging
+	// provider passes a length through unchanged, so there is nothing here for a
+	// perturbation to move. What separates it from a constant is this comparison, plus
+	// the published empty vector in psk_test.go and the wide kdf differential in
+	// key_schedule_test.go.
+	"EmptyPskSecret": func(params *SuiteParams) any { return strings.Repeat("00", params.Nh) },
 }
 
 // The positions of a structured answer that are empty on purpose, named with the reason.

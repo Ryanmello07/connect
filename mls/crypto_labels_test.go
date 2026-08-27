@@ -559,6 +559,17 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// two are reachable, and a helper would move the decision rather than remove it.
 		"key_schedule.go: syntax.Marshal(groupContext)",
 		"key_schedule.go: syntax.Marshal(groupContext)",
+		// ValSem403's duplicate test, which decides identity over the serialized
+		// PreSharedKeyID rather than over a field list. The default limit and not the
+		// ratchet tree one: a PreSharedKeyID is an MLS structure whose every field is
+		// capped at MaxVectorLength, and an id encoded past that would be one this
+		// check compared and no peer running the default limit could have sent.
+		"psk.go: syntax.Marshal(&ids[i])",
+		// the PSKLabel preimage of section 8.4. Same reason again, and here it is the
+		// stricter one: this writer's bytes are expanded into psk_input, so a raised
+		// limit would be a psk_secret derived over a label no member with the default
+		// limit could construct.
+		"psk.go: syntax.NewWriter()",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
@@ -1216,6 +1227,15 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// registry, TestNoStubShapesRemainInSource requires its body to read the parameter,
 	// and key_schedule_test.go sweeps every registered suite.
 	"ZeroSecret": "answers a length from the provider and no bytes, so the tagging provider cannot separate it from a constant",
+
+	// EmptyPskSecret is ZeroSecret under another name and carries the same limit for
+	// the same reason: psk_secret_[0] is KDF.Nh zero bytes, so there is nothing in the
+	// answer for a provider that flips every byte it returns to flip. It is not unheld
+	// either -- TestProviderHasNoRemainingStubs holds it to the registry's Nh zero
+	// bytes, TestEveryConstructionHandedAProviderReadsKdfNhFromIt holds its LENGTH to
+	// the provider's Nh over a wider kdf, and TestEmptyPskSecretMatchesTheUpstream-
+	// EmptyVector holds the value itself to a published vector.
+	"EmptyPskSecret": "answers KDF.Nh zero bytes, so the tagging provider has no byte of the answer to flip",
 }
 
 // A construction handed a provider computes with that provider and not with one of its
@@ -1352,6 +1372,40 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("WelcomeKeyNonce: %v", welcomeErr)
 			}
 			return slices.Concat(key, nonce)
+		}},
+		// the psk_secret recurrence, which reaches the provider three times per entry:
+		// the extract of psk_extracted, the labelled expand of psk_input and the extract
+		// that folds it in. None of that is visible in the answer -- a psk_secret computed
+		// with a provider of its own is a well formed 32 bytes that agrees with the whole
+		// psk_secret corpus, because every vector this package can run is at the suite it
+		// would have hardcoded. Two entries rather than one, so the fold is exercised as
+		// well as the first step.
+		{name: "PskSecret", call: func(crypto CryptoProvider) []byte {
+			nh := crypto.HashSize()
+			secret, pskErr := PskSecret(crypto, []PreSharedKeyInput{
+				{
+					Id: PreSharedKeyId{
+						PskType:  PskTypeExternal,
+						PskId:    bytes.Repeat([]byte{0x7e}, 16),
+						PskNonce: bytes.Repeat([]byte{0x7f}, nh),
+					},
+					Secret: bytes.Repeat([]byte{0x80}, nh),
+				},
+				{
+					Id: PreSharedKeyId{
+						PskType:    PskTypeResumption,
+						Usage:      ResumptionPskUsageApplication,
+						PskGroupId: bytes.Repeat([]byte{0x81}, 12),
+						PskEpoch:   9,
+						PskNonce:   bytes.Repeat([]byte{0x82}, nh),
+					},
+					Secret: bytes.Repeat([]byte{0x83}, nh),
+				},
+			})
+			if pskErr != nil {
+				t.Fatalf("PskSecret: %v", pskErr)
+			}
+			return secret
 		}},
 	} {
 		covered = append(covered, testCase.name)

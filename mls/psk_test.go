@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -1218,8 +1219,10 @@ type pskSecretVector struct {
 	CipherSuite uint16 `json:"cipher_suite"`
 	Psks        []struct {
 		PskId    string `json:"psk_id"`
+		Psk      string `json:"psk"`
 		PskNonce string `json:"psk_nonce"`
 	} `json:"psks"`
+	PskSecret string `json:"psk_secret"`
 }
 
 // loadPskSecretVectors reads the pinned psk_secret corpus.
@@ -1491,4 +1494,917 @@ func TestPreSharedKeyIdValidateReportsTheNonceBeforeTheType(t *testing.T) {
 	if errors.Is(err, errPskType) {
 		t.Fatal("the refusal answers to both sentinels, so the order it reports is not observable")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ValSem403: the same PreSharedKeyID twice
+// ---------------------------------------------------------------------------
+
+// pskTestId builds an external id with a distinguishable psk_id and a nonce of the
+// provider's KDF.Nh, so nothing this section builds is refused by ValSem401 for a reason
+// that has nothing to do with what is being asserted.
+func pskTestId(t *testing.T, idByte byte, nonceByte byte) PreSharedKeyId {
+	t.Helper()
+	return PreSharedKeyId{
+		PskType:  PskTypeExternal,
+		PskId:    []byte{idByte},
+		PskNonce: repeatByte(nonceByte, pskTestCrypto(t).HashSize()),
+	}
+}
+
+// TestCheckNoDuplicatePsksRefusesARepeatedId asserts an exactly repeated id is refused,
+// and that the pair reported is the pair that repeated. The two copies are not adjacent,
+// which is the case an implementation comparing only neighbours gets wrong.
+func TestCheckNoDuplicatePsksRefusesARepeatedId(t *testing.T) {
+	ids := []PreSharedKeyId{pskTestId(t, 1, 0xa1), pskTestId(t, 2, 0xa2), pskTestId(t, 1, 0xa1)}
+	err := CheckNoDuplicatePsks(ids)
+	if !errors.Is(err, errDuplicatePsk) {
+		t.Fatalf("err = %v, want errDuplicatePsk", err)
+	}
+	if want := "entries 0 and 2"; !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %q, want it to name %q; a refusal that cannot say which two entries collided is a refusal nobody can act on", err, want)
+	}
+}
+
+// TestCheckNoDuplicatePsksAcceptsDistinctIds asserts the check does not over reject. Two
+// ids that share a psk_id but carry different nonces are different PreSharedKeyIDs by RFC
+// 9420 section 8.4's own definition -- the nonce is a field of the structure and a fresh
+// one is required on every injection -- so refusing them would be an interop break rather
+// than a safety margin.
+func TestCheckNoDuplicatePsksAcceptsDistinctIds(t *testing.T) {
+	ids := []PreSharedKeyId{pskTestId(t, 1, 0xa1), pskTestId(t, 1, 0xa2), pskTestId(t, 2, 0xa1)}
+	if err := CheckNoDuplicatePsks(ids); err != nil {
+		t.Fatalf("distinct ids were refused: %v", err)
+	}
+}
+
+// TestCheckNoDuplicatePsksAcceptsEmptyAndSingleton asserts the degenerate cases are
+// accepted. The singleton is the case that catches the classic shape of this bug, an id
+// compared against itself because it was recorded before the comparison rather than after.
+func TestCheckNoDuplicatePsksAcceptsEmptyAndSingleton(t *testing.T) {
+	if err := CheckNoDuplicatePsks(nil); err != nil {
+		t.Fatalf("empty list refused: %v", err)
+	}
+	if err := CheckNoDuplicatePsks([]PreSharedKeyId{}); err != nil {
+		t.Fatalf("zero length list refused: %v", err)
+	}
+	if err := CheckNoDuplicatePsks([]PreSharedKeyId{pskTestId(t, 1, 0xa1)}); err != nil {
+		t.Fatalf("singleton refused: %v", err)
+	}
+}
+
+// TestCheckNoDuplicatePsksBindsTheEpochField asserts the epoch participates, so the same
+// resumption group at two epochs is two ids and the same one twice is one.
+func TestCheckNoDuplicatePsksBindsTheEpochField(t *testing.T) {
+	nonce := repeatByte(0x5e, pskTestCrypto(t).HashSize())
+	first := PreSharedKeyId{
+		PskType:    PskTypeResumption,
+		Usage:      ResumptionPskUsageApplication,
+		PskGroupId: []byte{9},
+		PskEpoch:   1,
+		PskNonce:   nonce,
+	}
+	second := first
+	second.PskEpoch = 2
+	if err := CheckNoDuplicatePsks([]PreSharedKeyId{first, second}); err != nil {
+		t.Fatalf("different epochs refused: %v", err)
+	}
+	if err := CheckNoDuplicatePsks([]PreSharedKeyId{first, first}); !errors.Is(err, errDuplicatePsk) {
+		t.Fatalf("err = %v, want errDuplicatePsk", err)
+	}
+}
+
+// TestCheckNoDuplicatePsksAgreesWithTheEncodingOnEveryFieldOfEveryArm is the rule 5 gate on
+// ValSem403, and it is the test a field added to PreSharedKeyId later cannot slip past.
+//
+// The RFC's rule is over PreSharedKeyIDs -- "multiple PreSharedKey proposals that reference
+// the same PreSharedKeyID" -- and a PreSharedKeyID is what its serialization says it is. So
+// the property asserted here is exactly that equivalence, in BOTH directions, for every
+// field of the struct against every hand derived arm: two ids that encode to the same bytes
+// must be a duplicate, and two that do not must not be.
+//
+// Both directions are load bearing and they fail differently. A check that compared only
+// psk_id would wave through a repeat that differs in the nonce -- no, worse: it would REFUSE
+// two legitimately distinct ids, a V2 interop break. A check that compared the go fields
+// would call two external ids differing only in psk_group_id distinct, when the external arm
+// does not encode psk_group_id at all and the two are one id on the wire contributing one
+// psk_input.
+//
+// Neither the field list nor the arm list is written down here. The fields come off the
+// struct by reflection and the arms are the hand derived goldens, whose psktype coverage is
+// itself checked against the registry read out of the package's own constant declarations.
+func TestCheckNoDuplicatePsksAgreesWithTheEncodingOnEveryFieldOfEveryArm(t *testing.T) {
+	structType := reflect.TypeOf(PreSharedKeyId{})
+	if structType.NumField() == 0 {
+		t.Fatal("PreSharedKeyId declares no fields, so this gate walked nothing")
+	}
+	goldens := goldenPskIds()
+	if len(goldens) == 0 {
+		t.Fatal("there are no hand derived goldens, so this gate has no arm to run against")
+	}
+	armsSeen := map[uint64]bool{}
+	for _, golden := range goldens {
+		armsSeen[uint64(golden.id.PskType)] = true
+	}
+	for value := range registeredPskTypes(t) {
+		if !armsSeen[value] {
+			t.Fatalf("no golden carries psktype %d, so this sweep never asked the check about that arm; the registry is read from the package's own declarations, so a new arm arrives here on the commit that declares it",
+				value)
+		}
+	}
+
+	identical, distinct, unencodable := 0, 0, 0
+	for armName, golden := range goldens {
+		for i := 0; i < structType.NumField(); i++ {
+			fieldName := structType.Field(i).Name
+			at := armName + "/" + fieldName
+
+			base := clonePreSharedKeyId(golden.id)
+			varied := clonePreSharedKeyId(golden.id)
+			varyPreSharedKeyIdField(t, at, reflect.ValueOf(varied).Elem().Field(i))
+
+			baseBytes, baseErr := syntax.Marshal(base)
+			variedBytes, variedErr := syntax.Marshal(varied)
+			answer := CheckNoDuplicatePsks([]PreSharedKeyId{*base, *varied})
+
+			switch {
+			case baseErr != nil || variedErr != nil:
+				// an id this package cannot encode is one it cannot compare either, and
+				// answering "not a duplicate" would put a pair it never looked at past the
+				// only check that looks at them.
+				if answer == nil || errors.Is(answer, errDuplicatePsk) {
+					t.Errorf("%s: one of the pair does not encode (%v / %v) and the check answered %v, want a refusal that is not the duplicate one",
+						at, baseErr, variedErr, answer)
+				}
+				unencodable++
+			case bytes.Equal(baseBytes, variedBytes):
+				if !errors.Is(answer, errDuplicatePsk) {
+					t.Errorf("%s: varying the field left the encoding identical (%x), so the two are ONE PreSharedKeyID on the wire and contribute one psk_input, and the check answered %v",
+						at, baseBytes, answer)
+				}
+				identical++
+			default:
+				if answer != nil {
+					t.Errorf("%s: varying the field changed the encoding (%x -> %x), so the two are different PreSharedKeyIDs, and the check refused them: %v",
+						at, baseBytes, variedBytes, answer)
+				}
+				distinct++
+			}
+		}
+	}
+
+	// a one sided sweep is the failure this whole file exists to avoid: if every pair came
+	// out identical, an implementation that refused everything would pass, and if every pair
+	// came out distinct, one that accepted everything would.
+	if identical == 0 {
+		t.Fatal("no field left any arm's encoding unchanged, so this sweep never asked the check to answer duplicate and an accept-everything implementation passes it")
+	}
+	if distinct == 0 {
+		t.Fatal("no field changed any arm's encoding, so this sweep never asked the check to answer distinct and a refuse-everything implementation passes it")
+	}
+	t.Logf("%d field/arm pairs are one id on the wire, %d are two, %d cannot be encoded", identical, distinct, unencodable)
+}
+
+// TestCheckNoDuplicatePsksRefusesAnIdItCannotEncode asserts the marshal refusal is
+// propagated rather than read as "not a duplicate". An unregistered psktype has no arm, so
+// nothing can say where the id ends or whether two of them are the same, and a check that
+// swallowed the error would report a clean list holding two copies of an unnamable id.
+func TestCheckNoDuplicatePsksRefusesAnIdItCannotEncode(t *testing.T) {
+	registered := registeredPskTypes(t)
+	unregistered := PskType(0)
+	for value := 0; value <= 0xff; value++ {
+		if !registered[uint64(value)] {
+			unregistered = PskType(value)
+			break
+		}
+	}
+	if registered[uint64(unregistered)] {
+		t.Fatal("every psktype octet is registered, so there is no unencodable id to build")
+	}
+	bad := PreSharedKeyId{
+		PskType:  unregistered,
+		PskId:    []byte{1},
+		PskNonce: repeatByte(0xaa, pskTestCrypto(t).HashSize()),
+	}
+	for _, ids := range [][]PreSharedKeyId{
+		{bad},
+		{bad, bad},
+		{pskTestId(t, 1, 0xa1), bad},
+		{bad, pskTestId(t, 1, 0xa1)},
+	} {
+		if err := CheckNoDuplicatePsks(ids); !errors.Is(err, errPskType) {
+			t.Errorf("%d ids containing psktype %d: err = %v, want errPskType", len(ids), unregistered, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task 15: PSKLabel, psk_secret and the empty case
+// ---------------------------------------------------------------------------
+
+// TestMarshalPskLabelMatchesTheHandDerivedGolden pins the PSKLabel preimage byte for byte.
+//
+// PSKLabel is a serialized structure and owes what every other one in this package owes: a
+// golden written out from the RFC rather than captured from this encoder. It is
+//
+//	struct { PreSharedKeyID id; uint16 index; uint16 count; } PSKLabel;
+//
+// so the id goes in with no framing of its own, and index and count follow as two bare big
+// endian uint16s in that order. Every one of those is a decision that changes psk_input and
+// none of them is visible to a round trip: an index written at one octet, a count written
+// before the index, a length prefix added around the id, or the index dropped entirely all
+// produce a preimage this package agrees with itself about and nobody else does.
+//
+// The index and count values chosen are 0x0102 and 0x0304, not 0 and 1, because a two octet
+// big endian field is indistinguishable from a one octet one, from a little endian one and
+// from a uint32 when its value is 0 or 1.
+func TestMarshalPskLabelMatchesTheHandDerivedGolden(t *testing.T) {
+	for name, expected := range map[string]struct {
+		id      *PreSharedKeyId
+		index   uint16
+		count   uint16
+		encoded []byte
+	}{
+		// 8 octets of external id, then 01 02, then 03 04 -> 12 octets.
+		"external at a wide index": {
+			handDerivedExternalGoldenId(), 0x0102, 0x0304,
+			joinBytes(handDerivedExternalGolden(), []byte{0x01, 0x02}, []byte{0x03, 0x04}),
+		},
+		// the singleton shape a one psk list uses: index 0 of a count of 1. Both fields are
+		// still two octets, which is the whole of what this case adds -- 00 00 00 01 and not
+		// 00 01.
+		"external singleton": {
+			handDerivedExternalGoldenId(), 0, 1,
+			joinBytes(handDerivedExternalGolden(), []byte{0x00, 0x00}, []byte{0x00, 0x01}),
+		},
+		// 14 octets of resumption id, then 00 01, then 00 02 -> 18 octets. The resumption arm
+		// is here because the id is written inline: an arm whose length the label encoder
+		// assumed would move index and count without moving anything else.
+		"resumption second of two": {
+			handDerivedResumptionGoldenId(), 1, 2,
+			joinBytes(handDerivedResumptionGolden(), []byte{0x00, 0x01}, []byte{0x00, 0x02}),
+		},
+	} {
+		got, err := marshalPskLabel(expected.id, expected.index, expected.count)
+		if err != nil {
+			t.Errorf("%s: marshalPskLabel: %v", name, err)
+			continue
+		}
+		if want := len(expected.encoded); len(got) != want {
+			t.Errorf("%s: label is %d octets, want %d", name, len(got), want)
+		}
+		if !bytes.Equal(got, expected.encoded) {
+			t.Errorf("%s: label = %x, want %x", name, got, expected.encoded)
+		}
+		// and the id really is inline rather than prefixed: the label starts with exactly the
+		// id's own encoding and is four octets longer.
+		idBytes, idErr := syntax.Marshal(expected.id)
+		if idErr != nil {
+			t.Errorf("%s: syntax.Marshal of the id: %v", name, idErr)
+			continue
+		}
+		if len(got) != len(idBytes)+4 {
+			t.Errorf("%s: label is %d octets and the id alone is %d; PSKLabel adds two uint16s and nothing else",
+				name, len(got), len(idBytes))
+		}
+	}
+}
+
+// TestMarshalPskLabelCarriesIndexAndCountInSeparateFields asserts the two fields are two
+// fields. A label that dropped either, wrote them into one octet each, or summed them would
+// still be a plausible preimage, and psk_secret would still be 32 bytes of apparent random.
+func TestMarshalPskLabelCarriesIndexAndCountInSeparateFields(t *testing.T) {
+	id := handDerivedExternalGoldenId()
+	label := func(index uint16, count uint16) []byte {
+		t.Helper()
+		encoded, err := marshalPskLabel(id, index, count)
+		if err != nil {
+			t.Fatalf("marshalPskLabel(%d, %d): %v", index, count, err)
+		}
+		return encoded
+	}
+	base := label(1, 3)
+	if bytes.Equal(base, label(2, 3)) {
+		t.Error("the index does not reach the label, so every psk of a list has the same preimage")
+	}
+	if bytes.Equal(base, label(1, 4)) {
+		t.Error("the count does not reach the label, so a contribution can be lifted into a list of another length")
+	}
+	// the pair swapped: equal bytes here would mean the two are written into one field, or
+	// combined, rather than kept apart.
+	if bytes.Equal(label(1, 3), label(3, 1)) {
+		t.Error("index and count are interchangeable in the label, so they are not two distinct fields")
+	}
+	// and the widths: 0x0100 differs from 0x0001 only above the first octet.
+	if bytes.Equal(label(0x0001, 3), label(0x0100, 3)) {
+		t.Error("an index of 0x0001 and one of 0x0100 produce the same label, so the field is not two octets wide")
+	}
+}
+
+// TestPskSecretMatchesEveryUpstreamVector is the check that matters for this task.
+//
+// Every wrong fold returns KDF.Nh bytes of apparent random, so nothing this package can
+// assert about its own output separates the recurrence of section 8.4 from a plausible one:
+// not the length, not the avalanche, not that reordering changes it. A published answer
+// computed by another implementation is the only thing that can, and psk_secret.json carries
+// one for every list length from zero to ten at seven ciphersuites.
+//
+// What each accounting assertion below is protecting against, since a sweep that ran nothing
+// reports exactly what a clean one reports: no vector at all means a corpus or registry
+// regression; a single suite means the derivation could be pinned to one Nh; no empty list
+// means the case every epoch of this product actually takes is unchecked; no singleton means
+// the "derived psk" label and the PSKLabel encoding are unchecked; and no list of two or more
+// means the recurrence was never folded, which is where the accumulator and the index live.
+func TestPskSecretMatchesEveryUpstreamVector(t *testing.T) {
+	ran, skipped := 0, 0
+	suitesSeen := map[uint16]int{}
+	countsSeen := map[int]int{}
+	for index, vector := range loadPskSecretVectors(t) {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			skipped++
+			continue
+		}
+		crypto, err := NewCryptoProvider(suite)
+		if err != nil {
+			t.Fatalf("vector %d: NewCryptoProvider(%#04x): %v", index, vector.CipherSuite, err)
+		}
+		psks := make([]PreSharedKeyInput, 0, len(vector.Psks))
+		for position, entry := range vector.Psks {
+			at := fmt.Sprintf("vector %d psk %d", index, position)
+			psks = append(psks, PreSharedKeyInput{
+				Id: PreSharedKeyId{
+					PskType:  PskTypeExternal,
+					PskId:    mustDecodeHex(t, at+" psk_id", entry.PskId),
+					PskNonce: mustDecodeHex(t, at+" psk_nonce", entry.PskNonce),
+				},
+				Secret: mustDecodeHex(t, at+" psk", entry.Psk),
+			})
+		}
+		want := mustDecodeHex(t, fmt.Sprintf("vector %d psk_secret", index), vector.PskSecret)
+		if len(want) != crypto.HashSize() {
+			t.Fatalf("vector %d: the published psk_secret is %d octets and the suite's KDF.Nh is %d, so this comparison is not the one the corpus intends",
+				index, len(want), crypto.HashSize())
+		}
+		got, err := PskSecret(crypto, psks)
+		if err != nil {
+			t.Errorf("vector %d (suite %#04x, %d psks): PskSecret: %v", index, vector.CipherSuite, len(psks), err)
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("vector %d (suite %#04x, %d psks): psk_secret = %x, want %x",
+				index, vector.CipherSuite, len(psks), got, want)
+		}
+		ran++
+		suitesSeen[vector.CipherSuite]++
+		countsSeen[len(psks)]++
+	}
+
+	if ran == 0 {
+		t.Fatalf("no psk_secret vector ran (%d skipped at unimplemented suites), so this test compared against nothing", skipped)
+	}
+	if len(suitesSeen) < 2 {
+		t.Fatalf("every vector that ran was at one ciphersuite (%v), so nothing here can tell the derivation from one pinned to a single KDF", suitesSeen)
+	}
+	if countsSeen[0] == 0 {
+		t.Fatal("no vector with an empty psk list ran, so the empty answer is pinned against nothing but this package's own opinion of it")
+	}
+	if countsSeen[1] == 0 {
+		t.Fatal("no vector with exactly one psk ran, so the \"derived psk\" label and the PSKLabel encoding are unchecked")
+	}
+	folded := 0
+	for count, seen := range countsSeen {
+		if count >= 2 {
+			folded += seen
+		}
+	}
+	if folded == 0 {
+		t.Fatal("no vector with two or more psks ran, so the recurrence was never folded and the accumulator is unchecked")
+	}
+	t.Logf("psk_secret: %d vectors ran, %d skipped at unimplemented suites; suites %v; %d of the runs folded two psks or more",
+		ran, skipped, suitesSeen, folded)
+}
+
+// TestEmptyPskSecretMatchesTheUpstreamEmptyVector pins the empty answer against the corpus
+// rather than against this package's own ZeroSecret.
+//
+// This is the case that matters most and is the easiest to fake. Every v1 epoch has no PSKs,
+// so this value goes into every key schedule this product derives; and "KDF.Nh zero bytes"
+// is a claim a test written from the implementation would make whatever the implementation
+// did, because an implementation that hashed nothing would be compared against a hash of
+// nothing. The published vector is written by somebody who was not looking at this code.
+func TestEmptyPskSecretMatchesTheUpstreamEmptyVector(t *testing.T) {
+	checked := 0
+	for index, vector := range loadPskSecretVectors(t) {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) || len(vector.Psks) != 0 {
+			continue
+		}
+		crypto, err := NewCryptoProvider(suite)
+		if err != nil {
+			t.Fatalf("vector %d: NewCryptoProvider(%#04x): %v", index, vector.CipherSuite, err)
+		}
+		want := mustDecodeHex(t, fmt.Sprintf("vector %d psk_secret", index), vector.PskSecret)
+		if got := EmptyPskSecret(crypto); !bytes.Equal(got, want) {
+			t.Errorf("vector %d (suite %#04x): EmptyPskSecret = %x, want %x", index, vector.CipherSuite, got, want)
+		}
+		general, err := PskSecret(crypto, nil)
+		if err != nil {
+			t.Fatalf("vector %d: PskSecret(nil): %v", index, err)
+		}
+		if !bytes.Equal(general, want) {
+			t.Errorf("vector %d (suite %#04x): PskSecret(nil) = %x, want %x", index, vector.CipherSuite, general, want)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("the corpus carries no empty psk list at a registered suite, so the empty answer was compared against nothing")
+	}
+	t.Logf("%d published empty psk_secret vectors matched", checked)
+}
+
+// TestEmptyPskSecretMatchesPskSecretOfNil pins the convenience form against the general one.
+// The lifecycle plan calls EmptyPskSecret at every epoch boundary, so a divergence between
+// the two would be a group whose members disagree from epoch 0 and whose only symptom is that
+// nothing decrypts.
+func TestEmptyPskSecretMatchesPskSecretOfNil(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto, err := NewCryptoProvider(suite)
+		if err != nil {
+			t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
+		}
+		general, err := PskSecret(crypto, nil)
+		if err != nil {
+			t.Fatalf("suite %#04x: PskSecret(nil): %v", uint16(suite), err)
+		}
+		empty := EmptyPskSecret(crypto)
+		if !bytes.Equal(empty, general) {
+			t.Errorf("suite %#04x: EmptyPskSecret = %x, PskSecret(nil) = %x", uint16(suite), empty, general)
+		}
+		if len(empty) != crypto.HashSize() {
+			t.Errorf("suite %#04x: len = %d, want KDF.Nh = %d", uint16(suite), len(empty), crypto.HashSize())
+		}
+		// the key schedule erases what it has finished with, so a shared array would come
+		// back cleared on the next epoch with nothing to say why.
+		empty[0] = 1
+		if EmptyPskSecret(crypto)[0] != 0 {
+			t.Errorf("suite %#04x: EmptyPskSecret returns a shared slice", uint16(suite))
+		}
+		general[0] = 1
+		if again, _ := PskSecret(crypto, nil); again[0] != 0 {
+			t.Errorf("suite %#04x: PskSecret(nil) returns a shared slice", uint16(suite))
+		}
+	}
+}
+
+// pskSecretTwoInputs returns the two psk inputs of the first two entry vector at a registered
+// suite, together with that suite's provider. Reading them out of the corpus rather than
+// writing two constants here keeps the fixtures for the tests below the same bytes the KAT
+// runs on.
+func pskSecretTwoInputs(t *testing.T) (CryptoProvider, []PreSharedKeyInput) {
+	t.Helper()
+	for index, vector := range loadPskSecretVectors(t) {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) || len(vector.Psks) != 2 {
+			continue
+		}
+		crypto, err := NewCryptoProvider(suite)
+		if err != nil {
+			t.Fatalf("vector %d: NewCryptoProvider(%#04x): %v", index, vector.CipherSuite, err)
+		}
+		psks := []PreSharedKeyInput{}
+		for position, entry := range vector.Psks {
+			at := fmt.Sprintf("vector %d psk %d", index, position)
+			psks = append(psks, PreSharedKeyInput{
+				Id: PreSharedKeyId{
+					PskType:  PskTypeExternal,
+					PskId:    mustDecodeHex(t, at+" psk_id", entry.PskId),
+					PskNonce: mustDecodeHex(t, at+" psk_nonce", entry.PskNonce),
+				},
+				Secret: mustDecodeHex(t, at+" psk", entry.Psk),
+			})
+		}
+		return crypto, psks
+	}
+	t.Fatal("the corpus carries no two entry psk list at a registered suite")
+	return nil, nil
+}
+
+// TestPskSecretChangesWhenTheListIsReordered asserts the fold is not order independent, so a
+// peer that reorders the psks of a commit derives a different epoch and is detected.
+//
+// What this observes and what it does NOT observe are worth separating, because the obvious
+// reading of it is wrong. The chain psk_secret_[i] = Extract(psk_input_[i-1], psk_secret_[i-1])
+// is already non commutative on its own, so this test would still pass against a PSKLabel
+// carrying no index at all. Index and count binding is pinned by the hand derived label golden
+// and by the published corpus above; this one is the weaker, separate statement that the
+// caller's order reaches the answer.
+func TestPskSecretChangesWhenTheListIsReordered(t *testing.T) {
+	crypto, psks := pskSecretTwoInputs(t)
+	forward, err := PskSecret(crypto, []PreSharedKeyInput{psks[0], psks[1]})
+	if err != nil {
+		t.Fatalf("PskSecret forward: %v", err)
+	}
+	reversed, err := PskSecret(crypto, []PreSharedKeyInput{psks[1], psks[0]})
+	if err != nil {
+		t.Fatalf("PskSecret reversed: %v", err)
+	}
+	if bytes.Equal(forward, reversed) {
+		t.Fatal("psk_secret is order independent, so the caller's order does not reach the answer")
+	}
+}
+
+// TestPskSecretRejectsInvalidEntries asserts ValSem401, ValSem402 and ValSem403 all fire from
+// inside the computation, so no caller reaches a psk_secret over an invalid list by skipping a
+// separate validation step it did not know it owed.
+func TestPskSecretRejectsInvalidEntries(t *testing.T) {
+	crypto, psks := pskSecretTwoInputs(t)
+	base := psks[0]
+
+	shortNonce := base
+	shortNonce.Id = *clonePreSharedKeyId(&base.Id)
+	shortNonce.Id.PskNonce = shortNonce.Id.PskNonce[:crypto.HashSize()-1]
+	if _, err := PskSecret(crypto, []PreSharedKeyInput{shortNonce}); !errors.Is(err, errPskNonceLength) {
+		t.Errorf("short nonce err = %v, want errPskNonceLength", err)
+	}
+
+	reinit := base
+	reinit.Id = PreSharedKeyId{
+		PskType:    PskTypeResumption,
+		Usage:      ResumptionPskUsageReInit,
+		PskGroupId: []byte{1},
+		PskNonce:   base.Id.PskNonce,
+	}
+	if _, err := PskSecret(crypto, []PreSharedKeyInput{reinit}); !errors.Is(err, errPskType) {
+		t.Errorf("reinit usage err = %v, want errPskType", err)
+	}
+
+	if _, err := PskSecret(crypto, []PreSharedKeyInput{base, base}); !errors.Is(err, errDuplicatePsk) {
+		t.Errorf("duplicate err = %v, want errDuplicatePsk", err)
+	}
+
+	// and the refusals are refusals: none of them returns a secret alongside the error, which
+	// a caller ignoring the error would then mix into an epoch.
+	for name, bad := range map[string][]PreSharedKeyInput{
+		"short nonce": {shortNonce},
+		"reinit":      {reinit},
+		"duplicate":   {base, base},
+	} {
+		if secret, err := PskSecret(crypto, bad); err != nil && secret != nil {
+			t.Errorf("%s: PskSecret returned %d bytes alongside %v", name, len(secret), err)
+		}
+	}
+}
+
+// TestPskSecretLeavesTheCallersInputsAlone asserts the erasure of the intermediates does not
+// reach the caller's psks. PskSecret zeroizes what it derived, and a zeroize aimed one slice
+// too far would clear the caller's own psk secrets in place -- which looks like nothing at all
+// until the second call over the same list returns a different answer.
+func TestPskSecretLeavesTheCallersInputsAlone(t *testing.T) {
+	crypto, psks := pskSecretTwoInputs(t)
+	before := make([]PreSharedKeyInput, 0, len(psks))
+	for _, psk := range psks {
+		before = append(before, PreSharedKeyInput{Id: *clonePreSharedKeyId(&psk.Id), Secret: cloneBytes(psk.Secret)})
+	}
+	first, err := PskSecret(crypto, psks)
+	if err != nil {
+		t.Fatalf("PskSecret: %v", err)
+	}
+	for i := range psks {
+		if !preSharedKeyIdsAgree(&psks[i].Id, &before[i].Id) {
+			t.Errorf("psk %d: the id was modified, now %s, was %s",
+				i, describePreSharedKeyId(&psks[i].Id), describePreSharedKeyId(&before[i].Id))
+		}
+		if !bytes.Equal(psks[i].Secret, before[i].Secret) {
+			t.Errorf("psk %d: the secret was modified, now %x, was %x", i, psks[i].Secret, before[i].Secret)
+		}
+	}
+	second, err := PskSecret(crypto, psks)
+	if err != nil {
+		t.Fatalf("PskSecret again: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Errorf("two calls over one list gave %x then %x", first, second)
+	}
+}
+
+// TestPskSecretRefusesAListLongerThanTheUint16Count pins the boundary of the count field at
+// the value it actually is. The list length is written into PSKLabel.count as a uint16, so
+// 65535 entries is the largest list that can be labelled and 65536 is not a slightly awkward
+// case, it is a list every member labels differently from the sender.
+//
+// Both sides are asserted. A gate written as >= would refuse a list the protocol permits, and
+// nothing but the accepted side of the boundary can see that.
+func TestPskSecretRefusesAListLongerThanTheUint16Count(t *testing.T) {
+	crypto := pskTestCrypto(t)
+	nonce := repeatByte(0x5a, crypto.HashSize())
+	secret := repeatByte(0x6b, crypto.HashSize())
+	build := func(n int) []PreSharedKeyInput {
+		psks := make([]PreSharedKeyInput, n)
+		for i := range psks {
+			psks[i] = PreSharedKeyInput{
+				Id: PreSharedKeyId{
+					PskType:  PskTypeExternal,
+					PskId:    []byte{byte(i), byte(i >> 8), byte(i >> 16)},
+					PskNonce: nonce,
+				},
+				Secret: secret,
+			}
+		}
+		return psks
+	}
+
+	if _, err := PskSecret(crypto, build(math.MaxUint16+1)); !errors.Is(err, ErrPskCount) {
+		t.Errorf("a list of %d: err = %v, want ErrPskCount", math.MaxUint16+1, err)
+	}
+	accepted, err := PskSecret(crypto, build(math.MaxUint16))
+	if err != nil {
+		t.Fatalf("a list of %d was refused: %v", math.MaxUint16, err)
+	}
+	if len(accepted) != crypto.HashSize() {
+		t.Errorf("a list of %d gave %d octets, want KDF.Nh = %d", math.MaxUint16, len(accepted), crypto.HashSize())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the psk list's rule for the provider stub gate
+// ---------------------------------------------------------------------------
+
+// providerPskInputBytePaths is every byte slice one PreSharedKeyInput reaches, as the field
+// index path that locates it and the words that name it, in declaration order.
+//
+// Read off the type by reflection rather than written down, for rule 5's reason: a field
+// added to PreSharedKeyInput or to PreSharedKeyId later is moved by the stub gate on the
+// commit that adds it, rather than on the commit somebody remembers to widen a list. A list
+// would understate the class exactly the way the ones this project keeps rewriting did.
+func providerPskInputBytePaths(structType reflect.Type, prefix string) ([][]int, []string) {
+	paths := [][]int{}
+	names := []string{}
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		switch {
+		case field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() == reflect.Uint8:
+			paths = append(paths, []int{i})
+			names = append(names, prefix+field.Name)
+		case field.Type.Kind() == reflect.Struct:
+			nested, nestedNames := providerPskInputBytePaths(field.Type, prefix+field.Name+".")
+			for at, path := range nested {
+				paths = append(paths, append([]int{i}, path...))
+				names = append(names, nestedNames[at])
+			}
+		}
+	}
+	return paths, names
+}
+
+// providerClonedPskInputs copies a psk list deeply enough that a perturbation of one byte
+// cannot write through into the base argument every other row of the stub gate is built
+// from. The byte fields are the only thing shared by a shallow copy, and they are the only
+// thing moved, so copying those is copying everything that matters.
+func providerClonedPskInputs(argument reflect.Value) reflect.Value {
+	clone := reflect.MakeSlice(argument.Type(), argument.Len(), argument.Len())
+	reflect.Copy(clone, argument)
+	paths, _ := providerPskInputBytePaths(argument.Type().Elem(), "")
+	for entry := 0; entry < clone.Len(); entry++ {
+		for _, path := range paths {
+			field := clone.Index(entry).FieldByIndex(path)
+			if field.Len() == 0 {
+				continue
+			}
+			copied := make([]byte, field.Len())
+			reflect.Copy(reflect.ValueOf(copied), field)
+			field.Set(reflect.ValueOf(copied))
+		}
+	}
+	return clone
+}
+
+// providerPskInputContributes answers whether two entries differ in anything psk_secret is
+// computed over: the entry's serialized PreSharedKeyID, or its secret bytes.
+//
+// The serialization rather than the fields, because the select() arms mean the two are not
+// the same question. A psk_group_id set on an external id is not part of that id -- the
+// external arm does not encode it -- so an implementation that read every byte it was handed
+// still answers identically with that field moved, and a stub gate row over it would report a
+// defect that is not there.
+func providerPskInputContributes(t *testing.T, before reflect.Value, after reflect.Value) bool {
+	t.Helper()
+	first, ok := before.Interface().(PreSharedKeyInput)
+	if !ok {
+		t.Fatalf("the base psk entry is a %s rather than a PreSharedKeyInput", before.Type())
+	}
+	second := after.Interface().(PreSharedKeyInput)
+	if !bytes.Equal(first.Secret, second.Secret) {
+		return true
+	}
+	firstId, err := syntax.Marshal(&first.Id)
+	if err != nil {
+		t.Fatalf("the base psk entry does not encode: %v", err)
+	}
+	secondId, err := syntax.Marshal(&second.Id)
+	if err != nil {
+		t.Fatalf("the moved psk entry does not encode: %v", err)
+	}
+	return !bytes.Equal(firstId, secondId)
+}
+
+// providerPskInputPerturbations is the stub gate's rule for a psk list: one byte of one field
+// of one entry moved, everything else identical, the list's length and every field's length
+// preserved for the reason providerPerturbations gives about shape.
+//
+// Only the byte fields are moved, and only where moving one changes what that entry
+// contributes. Both restrictions are about not asking a question this gate is not about. A
+// psktype or a usage moved takes the list from accepted to refused, which is ValSem402's
+// question rather than "was the argument read", and it would be answered by a refusal from a
+// function that had not looked at anything else. And a field the entry's own arm does not
+// encode is not part of that id at all, so it cannot reach the answer however completely the
+// implementation reads its inputs; providerPskInputContributes decides that from the wire
+// format rather than from this file's opinion of it.
+//
+// A base argument nothing can be moved in is fatal, not empty: a psk list whose entries carry
+// no encodable difference would leave PskSecret with an argument the gate calls twice with the
+// identical value, and report it as observed.
+func providerPskInputPerturbations(t *testing.T, operation string, parameter providerParameter, argument reflect.Value) []providerPerturbation {
+	t.Helper()
+	if argument.Len() == 0 {
+		t.Fatalf("the base argument for %s.%s is empty, so perturbing it changes nothing", operation, parameter.name)
+	}
+	paths, names := providerPskInputBytePaths(argument.Type().Elem(), "")
+	if len(paths) == 0 {
+		t.Fatalf("PreSharedKeyInput reaches no byte field, so nothing in %s.%s can be moved", operation, parameter.name)
+	}
+	moved := []providerPerturbation{}
+	for entry := 0; entry < argument.Len(); entry++ {
+		for at, path := range paths {
+			if argument.Index(entry).FieldByIndex(path).Len() == 0 {
+				continue
+			}
+			for _, position := range perturbedPositions(argument.Index(entry).FieldByIndex(path).Len()) {
+				perturbed := providerClonedPskInputs(argument)
+				target := perturbed.Index(entry).FieldByIndex(path)
+				replacement := make([]byte, target.Len())
+				reflect.Copy(reflect.ValueOf(replacement), target)
+				replacement[position] ^= 0xff
+				target.Set(reflect.ValueOf(replacement))
+				if !providerPskInputContributes(t, argument.Index(entry), perturbed.Index(entry)) {
+					continue
+				}
+				moved = append(moved, providerPerturbation{
+					where: fmt.Sprintf("byte %d of %d of psk %d's %s", position, target.Len(), entry, names[at]),
+					value: perturbed,
+				})
+			}
+		}
+	}
+	if len(moved) == 0 {
+		t.Fatalf("no byte of the base argument for %s.%s changes what an entry contributes, so the gate would call it twice with the same value",
+			operation, parameter.name)
+	}
+	return moved
+}
+
+// TestProviderPskInputPerturbationsMovesEveryEncodedFieldOfBothArms is the positive control on
+// the rule above, and it is here because the rule can go quiet in two directions and a quiet
+// one issues the stub gate exactly the clean bill a working one issues.
+//
+// Too few: a rule that skipped a field, or that produced nothing at all, leaves PskSecret's
+// only movable argument unprobed and the stub gate silent about it. Too many: a rule that
+// moved a field the arm does not encode would report a correct PskSecret as one that ignores
+// its input, because no implementation can answer differently to a byte the wire format does
+// not carry.
+//
+// Both fixtures are run, and the second is what makes the first direction's opposite testable
+// at all. The stub gate's own psks argument is canonical -- each arm leaves the other arm's
+// fields at their zero values -- so every byte field it carries reaches its encoding, and a
+// rule that dropped the contributes filter entirely passes over it. The loaded fixture puts a
+// psk_group_id on an external id and a psk_id on a resumption one, so the filter has something
+// to remove and its absence is a perturbation that does not move psk_secret.
+//
+// Neither the field list nor the set of encoded fields is written down: the fields come off the
+// struct by reflection and which of them an arm carries is decided by re-encoding.
+func TestProviderPskInputPerturbationsMovesEveryEncodedFieldOfBothArms(t *testing.T) {
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("look up the suite the fixture is built at: %v", err)
+	}
+	arguments := providerStubArguments(t, params, pskTestCrypto(t))
+	canonical, resolved := arguments["psks"].([]PreSharedKeyInput)
+	if !resolved {
+		t.Fatal("the stub gate's base arguments hold no psks entry, so PskSecret cannot be called by it")
+	}
+	if len(canonical) < 2 {
+		t.Fatalf("the psks fixture holds %d entries; the recurrence has no accumulator before the second, so a fold that dropped it would not be moved by any perturbation of a shorter list",
+			len(canonical))
+	}
+	paths, names := providerPskInputBytePaths(reflect.TypeOf(PreSharedKeyInput{}), "")
+	if len(paths) == 0 {
+		t.Fatal("PreSharedKeyInput reaches no byte field, so this control walked nothing")
+	}
+	crypto := pskTestCrypto(t)
+
+	check := func(label string, base []PreSharedKeyInput) {
+		argument := reflect.ValueOf(base)
+		perturbations := providerPskInputPerturbations(t, "PskSecret",
+			providerParameter{name: "psks", typeName: "[]PreSharedKeyInput"}, argument)
+		if len(perturbations) == 0 {
+			t.Errorf("%s: the rule produced no perturbation", label)
+			return
+		}
+		answer, answerErr := PskSecret(crypto, base)
+		if answerErr != nil {
+			t.Errorf("%s: PskSecret over the fixture: %v", label, answerErr)
+			return
+		}
+
+		// every perturbation really does move psk_secret, which is the property the stub gate
+		// reads out of this rule. A perturbation that did not is the false failure the
+		// contributes filter exists to prevent.
+		for _, perturbation := range perturbations {
+			moved, movedErr := PskSecret(crypto, perturbation.value.Interface().([]PreSharedKeyInput))
+			if movedErr != nil {
+				t.Errorf("%s: %s: PskSecret refused the moved list: %v", label, perturbation.where, movedErr)
+				continue
+			}
+			if bytes.Equal(moved, answer) {
+				t.Errorf("%s: %s: psk_secret did not move, so the stub gate would read this row as an argument PskSecret ignores",
+					label, perturbation.where)
+			}
+		}
+		// and no perturbation wrote through into the fixture every other row is built from
+		if again, againErr := PskSecret(crypto, base); againErr != nil || !bytes.Equal(again, answer) {
+			t.Errorf("%s: the fixture answered %x and then %x (%v), so a perturbation wrote through into it",
+				label, answer, again, againErr)
+		}
+
+		// the coverage half, in both directions: exactly the byte fields that reach an arm's
+		// encoding, no more and no fewer.
+		want := map[string]bool{}
+		for entry := 0; entry < argument.Len(); entry++ {
+			for at, path := range paths {
+				if argument.Index(entry).FieldByIndex(path).Len() == 0 {
+					continue
+				}
+				probe := providerClonedPskInputs(argument)
+				target := probe.Index(entry).FieldByIndex(path)
+				replacement := make([]byte, target.Len())
+				reflect.Copy(reflect.ValueOf(replacement), target)
+				replacement[0] ^= 0xff
+				target.Set(reflect.ValueOf(replacement))
+				if providerPskInputContributes(t, argument.Index(entry), probe.Index(entry)) {
+					want[fmt.Sprintf("psk %d's %s", entry, names[at])] = true
+				}
+			}
+		}
+		if len(want) == 0 {
+			t.Errorf("%s: no field of either arm reaches its encoding, so the rule has nothing it must cover", label)
+			return
+		}
+		got := map[string]bool{}
+		for _, perturbation := range perturbations {
+			got[pskPerturbationField(t, perturbation.where)] = true
+		}
+		for field := range want {
+			if !got[field] {
+				t.Errorf("%s: %s reaches the encoding and the rule never moves it, so the stub gate probes PskSecret with that field held constant",
+					label, field)
+			}
+		}
+		for field := range got {
+			if !want[field] {
+				t.Errorf("%s: the rule moves %s, which does not reach the encoding, so a correct PskSecret is reported as ignoring its input",
+					label, field)
+			}
+		}
+		t.Logf("%s: %d perturbations over %d encoded fields", label, len(perturbations), len(want))
+	}
+
+	check("the stub gate's own fixture", canonical)
+
+	// each arm loaded with the other arm's fields. Neither is encoded, so neither may be
+	// moved, and without this fixture the filter that decides so is never exercised.
+	loaded := providerClonedPskInputs(reflect.ValueOf(canonical)).Interface().([]PreSharedKeyInput)
+	loaded[0].Id.PskGroupId = repeatByte(0xc1, 12)
+	loaded[0].Id.PskEpoch = 5
+	loaded[1].Id.PskId = repeatByte(0xc2, 16)
+	if loaded[0].Id.PskType == loaded[1].Id.PskType {
+		t.Fatalf("both fixture entries are psktype %d, so loading each with the other arm's fields loads nothing",
+			uint8(loaded[0].Id.PskType))
+	}
+	check("both arms loaded with the other's fields", loaded)
+}
+
+// pskPerturbationField reads the field a perturbation's words name back out of them, so the
+// coverage comparison above is over what the rule actually reported rather than over a second
+// enumeration of what it should have.
+func pskPerturbationField(t *testing.T, where string) string {
+	t.Helper()
+	_, after, found := strings.Cut(where, " of ")
+	if !found {
+		t.Fatalf("a perturbation is described as %q, which this control cannot attribute to a field", where)
+	}
+	_, field, found := strings.Cut(after, " of ")
+	if !found {
+		t.Fatalf("a perturbation is described as %q, which this control cannot attribute to a field", where)
+	}
+	return field
 }

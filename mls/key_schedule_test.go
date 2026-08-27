@@ -3880,6 +3880,44 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 		{name: "ZeroSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			return [][]byte{ZeroSecret(crypto)}
 		}},
+		// psk_secret for an epoch with no pre shared keys, which is that same all zero
+		// string. The row is here rather than excused because the LENGTH is exactly what
+		// this gate compares, and a body that answered a hardcoded 32 zero bytes reads as
+		// correct at every registered suite and fails here.
+		{name: "EmptyPskSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return [][]byte{EmptyPskSecret(crypto)}
+		}},
+		// and the non empty recurrence, whose answer is KDF.Nh because ExpandWithLabel was
+		// asked for the provider's Nh at every step. Two entries, so the fold is exercised
+		// and not only the first step; the nonces are the provider's Nh or ValSem401 refuses
+		// the list, which is itself a KDF.Nh read that would fail under a wider kdf.
+		{name: "PskSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nh := crypto.HashSize()
+			secret, pskErr := PskSecret(crypto, []PreSharedKeyInput{
+				{
+					Id: PreSharedKeyId{
+						PskType:  PskTypeExternal,
+						PskId:    bytes.Repeat([]byte{0x7e}, 16),
+						PskNonce: bytes.Repeat([]byte{0x7f}, nh),
+					},
+					Secret: bytes.Repeat([]byte{0x80}, nh),
+				},
+				{
+					Id: PreSharedKeyId{
+						PskType:    PskTypeResumption,
+						Usage:      ResumptionPskUsageApplication,
+						PskGroupId: bytes.Repeat([]byte{0x81}, 12),
+						PskEpoch:   9,
+						PskNonce:   bytes.Repeat([]byte{0x82}, nh),
+					},
+					Secret: bytes.Repeat([]byte{0x83}, nh),
+				},
+			})
+			if pskErr != nil {
+				t.Fatalf("PskSecret: %v", pskErr)
+			}
+			return [][]byte{secret}
+		}},
 		{name: "DeriveJoinerSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			nh := crypto.HashSize()
 			joiner, joinerErr := DeriveJoinerSecret(crypto,
