@@ -376,9 +376,18 @@ func (self *KeySchedule) GroupContextBytes() []byte {
 // format needs — and not one this package fixes. CryptoProvider.Expand panics on the same
 // condition, which is correct for the call sites that ask for a length their suite fixes
 // and wrong for this one.
+//
+// An epoch whose exporter_secret has been erased is refused with ErrEpochErased rather than
+// exported from. See secretIsLive: the erase leaves KDF.Nh zero bytes behind, and MLS-Exporter
+// over KDF.Nh zero bytes is a value anyone can compute with no knowledge of the group. Since
+// URmessage wraps seed recovery to this answer, an export taken from an aged out epoch would
+// be wrapped to a key the attacker also holds, and a length check alone would report nothing.
 func (self *KeySchedule) Export(label string, context []byte, length int) ([]byte, error) {
 	if length < 0 || length > 255*self.crypto.HashSize() {
 		return nil, fmt.Errorf("%w: %d", ErrExportLength, length)
+	}
+	if !self.secretIsLive(self.secrets.Exporter) {
+		return nil, ErrEpochErased
 	}
 	derived := self.crypto.DeriveSecret(self.secrets.Exporter, label)
 	exported := self.crypto.ExpandWithLabel(derived, "exported", self.crypto.Hash(context), length)
@@ -405,6 +414,41 @@ func (self *KeySchedule) Export(label string, context []byte, length int) ([]byt
 // Any other secret of the epoch is the same length and derives a perfectly well formed
 // key pair, so what separates the right one from the wrong one is the published
 // external_pub and nothing about the value itself.
+//
+// An epoch whose external_secret has been erased is refused with ErrEpochErased, for the
+// reason Export gives: DeriveKeyPair over KDF.Nh zero bytes answers a key pair whose private
+// half every party can recompute, and it would come back with err == nil.
 func (self *KeySchedule) ExternalKeyPair() (HpkePrivateKey, HpkePublicKey, error) {
+	if !self.secretIsLive(self.secrets.External) {
+		return nil, nil, ErrEpochErased
+	}
 	return self.crypto.DeriveKeyPair(self.secrets.External)
+}
+
+// secretIsLive answers whether one of this epoch's own secrets is still the secret it was
+// derived as, rather than the run of zeros an erase leaves behind.
+//
+// Every method that DERIVES from one of the nine has to ask, and the reason is not that a
+// zero secret is a weak one. It is that a derivation over KDF.Nh zero bytes is publicly
+// computable: an epoch that has left PastEpochWindow is zeroized in place — the type
+// comment says so, and Secrets() hands out the pointer that lets it happen — and an export
+// taken afterwards is a value the attacker derives too, handed back with err == nil. The
+// length alone cannot see that, because the erase leaves the header exactly as it was.
+//
+// The whole slice is read whatever the first byte holds, so an erased epoch's refusal takes
+// the same time as a live epoch's answer and nothing about this epoch's own key is readable
+// from how long the check ran.
+//
+// This is deliberately not an exported predicate. "Is this epoch still usable" asked and
+// answered separately from the derivation is a race the caller cannot win, and the refusals
+// above are the same question asked at the moment it is acted on.
+func (self *KeySchedule) secretIsLive(secret []byte) bool {
+	if len(secret) != self.crypto.HashSize() {
+		return false
+	}
+	live := byte(0)
+	for _, b := range secret {
+		live |= b
+	}
+	return live != 0
 }

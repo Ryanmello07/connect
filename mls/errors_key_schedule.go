@@ -29,6 +29,16 @@ var (
 	// is the most HKDF-Expand can produce.
 	ErrExportLength = errors.New("mls: exporter length out of range")
 
+	// ErrEpochErased is returned when a derivation is asked for over an epoch whose
+	// secrets have already been erased. An epoch leaving PastEpochWindow has all nine
+	// zeroized in place, and a derivation over KDF.Nh zero bytes is not a weak secret,
+	// it is a PUBLIC one: any party can compute it with no knowledge of the group. So
+	// this is a refusal rather than an answer, for the reason WelcomeSecret returns nil
+	// rather than a zero secret — a caller that wrapped a recovery blob to an aged out
+	// epoch's export would be wrapping it to a key the attacker also holds, and nothing
+	// would report an error.
+	ErrEpochErased = errors.New("mls: the epoch's secrets have been erased")
+
 	// ErrGroupContextTrailingBytes names the condition where a serialized GroupContext
 	// carries bytes after its extensions vector. syntax.Unmarshal is what enforces full
 	// consumption, so this wraps that package's sentinel and a caller matching either

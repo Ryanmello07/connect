@@ -505,8 +505,9 @@ func TestEveryEraseHelperCarriesTheNoInlineDirective(t *testing.T) {
 // difference between sweeping the class and sweeping a copy of it.
 const keyScheduleErrorsFile = "errors_key_schedule.go"
 
-// keyScheduleOwnedErrors is registry section 5.6's ten plus ErrNilGroupContext, keyed by
-// the name each is declared under so the derivation below can compare the two sets by name.
+// keyScheduleOwnedErrors is registry section 5.6's ten plus ErrNilGroupContext and
+// ErrEpochErased, keyed by the name each is declared under so the derivation below can
+// compare the two sets by name.
 // ErrPskNonceLength, ErrPskType and ErrDuplicatePsk are deliberately absent — they are
 // ValSem401, ValSem402 and ValSem403 and belong to the validation plan's errors.go.
 //
@@ -521,6 +522,7 @@ const keyScheduleErrorsFile = "errors_key_schedule.go"
 var keyScheduleOwnedErrors = map[string]error{
 	"ErrSecretLength":                 ErrSecretLength,
 	"ErrExportLength":                 ErrExportLength,
+	"ErrEpochErased":                  ErrEpochErased,
 	"ErrGroupContextTrailingBytes":    ErrGroupContextTrailingBytes,
 	"ErrNilGroupContext":              ErrNilGroupContext,
 	"ErrTranscriptHashLength":         ErrTranscriptHashLength,
@@ -587,12 +589,14 @@ func TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile(t *testing.T) {
 // deliberately, in the same commit, with a reason. What stops the list shrinking, and what
 // stops it lagging behind the file, is the derivation above rather than this number.
 //
-// Eleven rather than the ten of registry section 5.6: ErrNilGroupContext is the twelfth
-// name this file could have carried and the first one added here that the registry does not
-// list, because it names an argument that was missing rather than a protocol condition.
+// Twelve rather than the ten of registry section 5.6. ErrNilGroupContext names an argument
+// that was missing rather than a protocol condition, and ErrEpochErased names a state of the
+// epoch itself: both are refusals this package makes for reasons the registry never had to
+// write down, and both are declared beside the ten because a second declaration site is how
+// two sentinels for one condition happen.
 func TestKeyScheduleErrorsAreDistinct(t *testing.T) {
-	if len(keyScheduleOwnedErrors) != 11 {
-		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext", len(keyScheduleOwnedErrors))
+	if len(keyScheduleOwnedErrors) != 12 {
+		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext and ErrEpochErased", len(keyScheduleOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(keyScheduleOwnedErrors))
 	for i, name := range names {
@@ -2675,6 +2679,340 @@ func TestNoExportedFunctionOfThisPackageHandsOutTheEpochSecret(t *testing.T) {
 		if !slices.ContainsFunc(readAcrossTheRows, func(b []byte) bool { return bytes.Equal(b, known) }) {
 			t.Fatalf("%s: the sweep read %d byte slices off %v and init_secret is not among them, so it is not reading what it claims to",
 				epoch.at, len(readAcrossTheRows), surface)
+		}
+	}
+}
+
+// sourceDeclaration is one function or method this package's own source declares, with the
+// receiver it is written on and the shapes a scan below reads.
+//
+// Methods travel with functions because the class these build is "what can reach the epoch
+// secret", and a method reaches it through a helper function exactly as a function reaches it
+// through a helper method. A scan that read only one of the two would report a leak spelled
+// through the other as absent.
+type sourceDeclaration struct {
+	receiver string
+	name     string
+	exported bool
+	params   []string
+	results  []string
+	body     *ast.BlockStmt
+}
+
+// declaredIn is every function and method of one parsed file, with its parameter and result
+// types rendered.
+//
+// Rendered rather than compared as syntax, for the reason packageLevelFunctionsIn renders:
+// func f(a, b []byte) and func f(a []byte, b []byte) are the same signature to the compiler
+// and a filter over either spelling has to read them the same way.
+func declaredIn(parsed parsedSource) []sourceDeclaration {
+	declared := []sourceDeclaration{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction {
+			continue
+		}
+		one := sourceDeclaration{
+			receiver: parsed.receiverOf(function),
+			name:     function.Name.Name,
+			exported: function.Name.IsExported(),
+			params:   []string{},
+			results:  []string{},
+			body:     function.Body,
+		}
+		if function.Type.Params != nil {
+			for _, field := range function.Type.Params.List {
+				one.params = append(one.params,
+					slices.Repeat([]string{parsed.render(field.Type)}, max(len(field.Names), 1))...)
+			}
+		}
+		if function.Type.Results != nil {
+			for _, field := range function.Type.Results.List {
+				one.results = append(one.results,
+					slices.Repeat([]string{parsed.render(field.Type)}, max(len(field.Names), 1))...)
+			}
+		}
+		declared = append(declared, one)
+	}
+	return declared
+}
+
+// declaredAcross is the same over several files.
+func declaredAcross(files []parsedSource) []sourceDeclaration {
+	declared := []sourceDeclaration{}
+	for _, parsed := range files {
+		declared = append(declared, declaredIn(parsed)...)
+	}
+	return declared
+}
+
+// theNamesReachingTheEpochSecret is every declared name whose body can reach the storage
+// epochSecretStorageField names: the ones that mention it, closed over the names they call.
+//
+// One identifier check covers every spelling go has for that storage. ast.Inspect descends
+// into a selector's own Sel and into a composite literal's key, so self.epochSecret, the
+// epochSecret field of a literal and a local or parameter carrying it are all an *ast.Ident of
+// that name. A matcher written against the selector alone would read the first and miss the
+// other two.
+//
+// The closure is over NAMES rather than over resolved callees, which over-approximates: a call
+// x.Foo() joins whatever Foo this package declares, on whichever receiver. That is the safe
+// direction for a gate -- it can demand too much, and says so by failing with the name it
+// objected to -- where a call graph that resolved too little reports exactly the clean run a
+// complete one reports. A method value taken without a call is an identifier too, so
+// f := self.leak handed somewhere else is read by the same pass.
+func theNamesReachingTheEpochSecret(declared []sourceDeclaration) []string {
+	mentions := func(body *ast.BlockStmt, wanted map[string]bool) bool {
+		if body == nil {
+			return false
+		}
+		found := false
+		ast.Inspect(body, func(node ast.Node) bool {
+			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && wanted[identifier.Name] {
+				found = true
+			}
+			return !found
+		})
+		return found
+	}
+	reaching := map[string]bool{epochSecretStorageField: true}
+	for {
+		grew := false
+		for _, one := range declared {
+			if reaching[one.name] {
+				continue
+			}
+			if mentions(one.body, reaching) {
+				reaching[one.name] = true
+				grew = true
+			}
+		}
+		if !grew {
+			delete(reaching, epochSecretStorageField)
+			return slices.Sorted(maps.Keys(reaching))
+		}
+	}
+}
+
+// theExportedMethodsHandingOutWhatTheyReach is every exported method of the parsed files that
+// can reach the epoch secret AND has somewhere to put it: a result that is not an error, or a
+// byte slice parameter it could write through.
+//
+// The second half is what makes this a property rather than a list of allowed names. An epoch
+// has one legitimate reason for an exported method to touch its parent secret -- erasing it --
+// and such a method answers nothing and is handed nothing, so it falls outside this class by
+// its own shape rather than by an exemption somebody wrote. Everything else that reaches the
+// storage is a way out for it.
+//
+// The receiver travels with the name because the closure resolves callees by name: two types
+// declaring a method of one spelling are reported together, and a reader who is told "Export"
+// cannot tell which. That over-report is the price of the safe direction, and naming both is
+// what keeps it readable rather than mysterious.
+func theExportedMethodsHandingOutWhatTheyReach(declared []sourceDeclaration, byteSlices []string) []string {
+	reaching := theNamesReachingTheEpochSecret(declared)
+	handingOut := []string{}
+	for _, one := range declared {
+		if one.receiver == "" || !one.exported || !slices.Contains(reaching, one.name) {
+			continue
+		}
+		somewhereToPutIt := slices.ContainsFunc(one.results, func(result string) bool { return result != "error" })
+		for _, parameter := range one.params {
+			if slices.Contains(byteSlices, parameter) {
+				somewhereToPutIt = true
+			}
+		}
+		if somewhereToPutIt {
+			handingOut = append(handingOut, "("+one.receiver+")."+one.name)
+		}
+	}
+	slices.Sort(handingOut)
+	return handingOut
+}
+
+// epochSecretMethodControl declares one of each shape the derivation has to tell apart: a
+// method that reads the storage outright, one that reads it through an unexported method of
+// its own, one that reads it through a package level function, one that writes it into an
+// array the caller handed in, the erase shape that reaches it and answers nothing, one that
+// reaches it and answers an error alone, one that reaches nothing, and an unexported one that
+// reads it.
+//
+// Without it a derivation that had stopped deriving -- a seed that no longer matched, a
+// closure that never followed a call -- would report an empty class, and an empty class is
+// exactly the clean run a complete one produces.
+const epochSecretMethodControl = "package control\n" +
+	"\n" +
+	"type Holder struct {\n" +
+	"\tepochSecret []byte\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksItDirectly() []byte {\n" +
+	"\treturn self.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksItThroughAMethod() []byte {\n" +
+	"\treturn self.reader()\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) reader() []byte {\n" +
+	"\treturn self.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksItThroughAFunction() ([]byte, error) {\n" +
+	"\treturn theSecretOf(self), nil\n" +
+	"}\n" +
+	"\n" +
+	"func theSecretOf(holder *Holder) []byte {\n" +
+	"\treturn holder.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksItIntoTheCallersArray(out []byte) {\n" +
+	"\tcopy(out, self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) Zeroize() {\n" +
+	"\tfor i := range self.epochSecret {\n" +
+	"\t\tself.epochSecret[i] = 0\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) AnswersAnErrorAlone() error {\n" +
+	"\tif len(self.epochSecret) == 0 {\n" +
+	"\t\treturn nil\n" +
+	"\t}\n" +
+	"\treturn nil\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) ReachesNothing() []byte {\n" +
+	"\treturn nil\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) leaksItAndIsUnexported() []byte {\n" +
+	"\treturn self.epochSecret\n" +
+	"}\n"
+
+// epochSecretHolderTypes is the compiled type behind each source type that keeps the epoch
+// secret, so a source reading of a holder's surface can be compared against a reflection of
+// the same type. It is checked against the derived closure in both directions, like
+// epochSecretHolderSweeps, so a second holder cannot land here unread.
+var epochSecretHolderTypes = map[string]reflect.Type{
+	"KeySchedule": reflect.TypeOf((*KeySchedule)(nil)),
+}
+
+// TestNoExportedMethodOfThisPackageCanReachTheEpochSecret is the half of guardrail G6 that
+// covers a method whose ARGUMENTS a sweep cannot exhaust.
+//
+// The two gates above read what a call ANSWERS and compare it against epoch_secret. For a
+// method that takes no arguments that is complete: reflection calls it the one way it can be
+// called and there is no second way. The moment Export joined them it stopped being complete,
+// because "the exporter cannot be made to answer epoch_secret" is a claim over every (label,
+// context, length) a caller may choose and keyScheduleMethodArgumentRows supplies three of
+// them. Measured, not supposed: with
+//
+//	if label == "recovery" { return bytes.Clone(self.epochSecret), nil }
+//
+// inserted at the top of Export, the whole of mls and message was green, and a direct probe
+// confirmed Export("recovery", nil, 32) then answered epoch_secret verbatim. Sampling an
+// unbounded argument space is Standing Rule 5's shape one level in: the class is the
+// arguments, and seventeen of them had been enumerated.
+//
+// So this gate reads the SOURCE, where the argument space does not appear at all. An exported
+// method that never mentions the storage cannot answer it under any label, and the class of
+// "mentions the storage" is derived by closure over the package's own call graph rather than
+// written down -- a leak spelled through a helper is a leak.
+//
+// It covers every exported method of the package rather than the holder's own, because a
+// method on some other type that takes a *KeySchedule reaches the same unexported field and is
+// nowhere in a reflection over (*KeySchedule). The two behavioural gates stay: this one says
+// the bytes cannot travel, and they say the bytes that DO travel are not the secret.
+func TestNoExportedMethodOfThisPackageCanReachTheEpochSecret(t *testing.T) {
+	// the control first, on both halves: the closure follows a call into a method and into a
+	// function, and the shape filter tells a method with somewhere to put the secret from the
+	// erase that has nowhere
+	control := []parsedSource{mustParseText(t, "the epoch secret method control", epochSecretMethodControl)}
+	controlDeclarations := declaredAcross(control)
+	wantReaching := []string{
+		"AnswersAnErrorAlone",
+		"LeaksItDirectly",
+		"LeaksItIntoTheCallersArray",
+		"LeaksItThroughAFunction",
+		"LeaksItThroughAMethod",
+		"Zeroize",
+		"leaksItAndIsUnexported",
+		"reader",
+		"theSecretOf",
+	}
+	if reaching := theNamesReachingTheEpochSecret(controlDeclarations); !slices.Equal(reaching, wantReaching) {
+		t.Fatalf("the closure read %v out of the control as reaching the epoch secret, want %v; it is not seeding on the storage or not following a call",
+			reaching, wantReaching)
+	}
+	wantHandingOut := []string{
+		"(*Holder).LeaksItDirectly",
+		"(*Holder).LeaksItIntoTheCallersArray",
+		"(*Holder).LeaksItThroughAFunction",
+		"(*Holder).LeaksItThroughAMethod",
+	}
+	if handingOut := theExportedMethodsHandingOutWhatTheyReach(controlDeclarations, []string{"[]byte"}); !slices.Equal(handingOut, wantHandingOut) {
+		t.Fatalf("the shape filter read %v out of the control, want %v; it is not telling an answer from an erase, or not telling exported from not",
+			handingOut, wantHandingOut)
+	}
+
+	// then this package's own source
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		files = append(files, mustParseSource(t, path))
+	}
+	declared := declaredAcross(files)
+	reaching := theNamesReachingTheEpochSecret(declared)
+	// the positive control on the real source: this package certainly assembles an epoch out
+	// of a parent secret, and a derivation that had stopped deriving would say it does not
+	if len(reaching) == 0 {
+		t.Fatalf("no declaration of this package's source mentions %s, so the class below is empty and this gate demands nothing; if the storage was renamed, rename it in epochSecretStorageField too",
+			epochSecretStorageField)
+	}
+	byteSlices := slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t))
+	if handingOut := theExportedMethodsHandingOutWhatTheyReach(declared, byteSlices); len(handingOut) != 0 {
+		t.Errorf("%v are exported methods that can reach %s and have somewhere to put it -- a result that is not an error, or a byte slice to write through; G6 says no exported symbol of this package returns the parent secret, and no sweep over a method's arguments can rule out the label it answers under",
+			handingOut, epochSecretStorageField)
+	}
+	t.Logf("%d declarations of this package reach %s: %v", len(reaching), epochSecretStorageField, reaching)
+
+	// and the source reading covers every exported method the compiled holder has. An embedded
+	// field's methods are promoted onto the type and declared somewhere else entirely, so a
+	// holder that grew an embedded surface would be swept by the reflection gate next door and
+	// invisible to this one.
+	structs := map[string]*ast.StructType{}
+	for _, parsed := range files {
+		structTypesIn(parsed, structs)
+	}
+	holders := theTypesHoldingTheEpochSecret(structs)
+	for _, holder := range holders {
+		if _, known := epochSecretHolderTypes[holder]; !known {
+			t.Fatalf("%s keeps the epoch secret and epochSecretHolderTypes has no compiled type for it, so this gate cannot check that its source reading is complete",
+				holder)
+		}
+	}
+	for name := range epochSecretHolderTypes {
+		if !slices.Contains(holders, name) {
+			t.Errorf("epochSecretHolderTypes names a %s and no struct of this package keeps the epoch secret under that name", name)
+		}
+	}
+	for _, holder := range holders {
+		compiled := epochSecretHolderTypes[holder]
+		reflected := []string{}
+		for i := range compiled.NumMethod() {
+			reflected = append(reflected, compiled.Method(i).Name)
+		}
+		slices.Sort(reflected)
+		inSource := []string{}
+		for _, one := range declared {
+			if one.exported && (one.receiver == holder || one.receiver == "*"+holder) {
+				inSource = append(inSource, one.name)
+			}
+		}
+		slices.Sort(inSource)
+		if !slices.Equal(reflected, inSource) {
+			t.Errorf("%s has exported methods %v compiled and %v declared in this package's source; the difference is promoted from an embedded field and this source gate never reads it",
+				holder, reflected, inSource)
 		}
 	}
 }
@@ -4786,6 +5124,348 @@ func TestKeyScheduleExternalKeyPairIsDeterministicAndItsTwoHalvesAgree(t *testin
 		if len(external) != 0 && &external[0] == &firstPriv[0] {
 			t.Errorf("%s: the external private key is a view over external_secret, which the epoch erases when it ages out of PastEpochWindow",
 				epoch.at)
+		}
+	}
+}
+
+// deriveSecretCapturingProvider keeps every secret DeriveSecret answers, so a test can read
+// that storage back after the call that computed it has returned.
+//
+// The slice is returned unchanged rather than copied, and that is the whole mechanism:
+// zeroizeSecret writes through the backing array its argument points at, so a wrapper handing
+// the caller a clone would be handing it a different array the erase never reaches, and the
+// property would read as absent however the production code behaved. This is
+// extractCapturingProvider one derivation over.
+type deriveSecretCapturingProvider struct {
+	CryptoProvider
+	derived [][]byte
+}
+
+func (self *deriveSecretCapturingProvider) DeriveSecret(secret []byte, label string) []byte {
+	answer := self.CryptoProvider.DeriveSecret(secret, label)
+	self.derived = append(self.derived, answer)
+	return answer
+}
+
+// TestKeyScheduleExportErasesThePerLabelSecret observes the sentence key_schedule.go writes
+// inside Export: "the per label secret is one HKDF-Expand away from every export under that
+// label and nothing downstream needs it, so the storage it was computed into is erased rather
+// than left for the collector."
+//
+// Nothing observed it. Measured, not supposed: deleting the zeroizeSecret(derived) line left
+// the whole of mls and message green, while the package tests every other erase it performs --
+// TestNewKeyScheduleErasesTheMemberSecret, TestNewKeyScheduleErasesTheJoinerSecretItDerived
+// and TestDeriveJoinerSecretErasesThePseudorandomKey. A claim the code makes in prose that no
+// test observes is a claim the next edit deletes for free.
+//
+// What that secret is worth to whoever finds it: DeriveSecret(exporter_secret, Label) is the
+// parent of every export under that label, at every length and over every context, so a reader
+// of it reproduces the seed recovery key URmessage wraps to this epoch without ever seeing the
+// epoch.
+//
+// The nine the constructor derived are dropped before the call, because they are the epoch's
+// own and stay; what this reads is the one derivation Export itself makes. The control is the
+// one TestDeriveJoinerSecretErasesThePseudorandomKey carries: an all zero reading only means
+// something if the secret was not already zero, and an export that came back zero would
+// satisfy the loop for the wrong reason.
+func TestKeyScheduleExportErasesThePerLabelSecret(t *testing.T) {
+	const label = "URmessage/v1/storage"
+	for _, epoch := range ksVectorEpochs(t) {
+		crypto := &deriveSecretCapturingProvider{CryptoProvider: epoch.crypto}
+		schedule, err := NewKeySchedule(
+			crypto, epoch.initPrev, epoch.commitSecret, epoch.pskSecret, epoch.groupContext)
+		if err != nil {
+			t.Fatalf("%s: NewKeySchedule: %v", epoch.at, err)
+		}
+		// the control: the secret this call will erase is not zero to begin with
+		fresh := epoch.crypto.DeriveSecret(schedule.Secrets().Exporter, label)
+		if !slices.ContainsFunc(fresh, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("%s: DeriveSecret over exporter_secret under %q is already %d zero bytes, so an all zero reading below would say nothing",
+				epoch.at, label, len(fresh))
+		}
+
+		crypto.derived = nil
+		exported, err := schedule.Export(label, exportSweepContext, epoch.crypto.HashSize())
+		if err != nil {
+			t.Fatalf("%s: Export: %v", epoch.at, err)
+		}
+		if len(crypto.derived) != 1 {
+			t.Fatalf("%s: Export made %d DeriveSecret calls, want 1; this gate reads the secret that one call answered",
+				epoch.at, len(crypto.derived))
+		}
+		derived := crypto.derived[0]
+		if len(derived) != epoch.crypto.HashSize() {
+			t.Fatalf("%s: the per label secret is %d bytes, want %d",
+				epoch.at, len(derived), epoch.crypto.HashSize())
+		}
+		for i, b := range derived {
+			if b != 0 {
+				t.Errorf("%s: byte %d of the per label secret is %#02x after Export returned, want 0; it is one HKDF-Expand away from every export under %q and nothing downstream needs it",
+					epoch.at, i, b, label)
+				break
+			}
+		}
+		// and the erase reached that secret rather than the answer: an export that came back
+		// zero would satisfy the loop above for the wrong reason
+		if !slices.ContainsFunc(exported, func(b byte) bool { return b != 0 }) {
+			t.Errorf("%s: Export answered %d zero bytes, so the erase reached the value that was returned",
+				epoch.at, len(exported))
+		}
+		// and exporter_secret itself is the epoch's and stays, which is what Export's own
+		// comment says one line further on
+		if !slices.ContainsFunc(schedule.Secrets().Exporter, func(b byte) bool { return b != 0 }) {
+			t.Errorf("%s: exporter_secret is all zero after one Export, so the erase reached the epoch's own secret rather than the per label one",
+				epoch.at)
+		}
+	}
+}
+
+// epochSecretsStorageFieldIn is the field of a holder that carries the nine derived secrets,
+// found rather than written down: the field whose declared type is the compiled name of
+// EpochSecrets.
+//
+// Both halves are derived. The type name comes off reflection, so renaming the type moves this
+// with it, and the field name comes off the holder's own declaration, so renaming the field
+// does too. A gate anchored on the spelling "secrets" would go on reading nothing after either
+// rename and would report the clean run a working one reports.
+func epochSecretsStorageFieldIn(t *testing.T, structs map[string]*ast.StructType, holder string) string {
+	t.Helper()
+	wanted := reflect.TypeOf(EpochSecrets{}).Name()
+	declared, isDeclared := structs[holder]
+	if !isDeclared {
+		t.Fatalf("this package's source declares no struct named %s", holder)
+	}
+	for _, field := range declared.Fields.List {
+		if !slices.Contains(identifiersNamedIn(field.Type), wanted) {
+			continue
+		}
+		for _, name := range field.Names {
+			return name.Name
+		}
+	}
+	t.Fatalf("no field of %s is declared as a %s, so the class below would be empty and this gate would demand nothing",
+		holder, wanted)
+	return ""
+}
+
+// theMethodsDerivingFromOneOfTheNine is every exported method of the parsed files whose body
+// reaches PAST the storage that carries the epoch's nine secrets and into one of them.
+//
+// One selector down is the whole distinction. Secrets() answers the struct and derives nothing
+// from it — a caller that erased what it was handed did that to itself — while Export and
+// ExternalKeyPair read a named secret out of it and expand something over the value. Only the
+// second kind can answer a derivation of a secret that is no longer there, so only the second
+// kind is what the gate below holds.
+func theMethodsDerivingFromOneOfTheNine(declared []sourceDeclaration, storage string) []string {
+	deriving := []string{}
+	for _, one := range declared {
+		if !one.exported || one.body == nil {
+			continue
+		}
+		found := false
+		ast.Inspect(one.body, func(node ast.Node) bool {
+			outer, isSelector := node.(*ast.SelectorExpr)
+			if !isSelector {
+				return true
+			}
+			if inner, isNested := outer.X.(*ast.SelectorExpr); isNested && inner.Sel.Name == storage {
+				found = true
+			}
+			return !found
+		})
+		if found {
+			deriving = append(deriving, one.name)
+		}
+	}
+	slices.Sort(deriving)
+	return deriving
+}
+
+// erasedEpochControl declares one of each shape that derivation has to tell apart: a method
+// that reads a named secret out of the storage, one that answers the storage whole, one that
+// reads something else entirely, and an unexported one that reads a named secret.
+const erasedEpochControl = "package control\n" +
+	"\n" +
+	"type EpochSecrets struct {\n" +
+	"\tExporter []byte\n" +
+	"}\n" +
+	"\n" +
+	"type Holder struct {\n" +
+	"\tsecrets EpochSecrets\n" +
+	"\tother   []byte\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) DerivesFromOneOfThem() []byte {\n" +
+	"\treturn expand(self.secrets.Exporter)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) AnswersTheStorageWhole() *EpochSecrets {\n" +
+	"\treturn &self.secrets\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) ReadsSomethingElse() []byte {\n" +
+	"\treturn self.other\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) derivesButIsUnexported() []byte {\n" +
+	"\treturn expand(self.secrets.Exporter)\n" +
+	"}\n" +
+	"\n" +
+	"func expand(secret []byte) []byte {\n" +
+	"\treturn secret\n" +
+	"}\n"
+
+// scheduleMethodResults calls one exported method of *KeySchedule with every row the sweeps
+// drive it by — or once with no arguments if it takes none — and splits each answer into the
+// bytes a caller can read and the error beside them.
+//
+// The rows are keyScheduleMethodArgumentRows, the same ones guardrail 6 is driven through, so
+// a method that gains an argument is driven here by writing that row once rather than twice.
+func scheduleMethodResults(t *testing.T, at string, schedule *KeySchedule, name string) [][][]byte {
+	t.Helper()
+	method, found := reflect.TypeOf(schedule).MethodByName(name)
+	if !found {
+		t.Fatalf("%s: *KeySchedule declares no method %s", at, name)
+	}
+	rows := [][]reflect.Value{nil}
+	if method.Type.NumIn() != 1 {
+		build, driven := keyScheduleMethodArgumentRows[name]
+		if !driven {
+			t.Fatalf("%s: %s takes arguments and keyScheduleMethodArgumentRows has no rows for it, so this gate cannot call it",
+				at, name)
+		}
+		rows = build(schedule)
+	}
+	errorInterface := reflect.TypeOf((*error)(nil)).Elem()
+	answers := [][][]byte{}
+	for _, row := range rows {
+		read := [][]byte{}
+		refused := false
+		for _, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(schedule)}, row...)) {
+			if result.Type() == errorInterface {
+				if !result.IsNil() {
+					refused = true
+					if !errors.Is(result.Interface().(error), ErrEpochErased) {
+						t.Errorf("%s: %s answered %v, and the only refusal this gate expects is ErrEpochErased",
+							at, name, result.Interface())
+					}
+				}
+				continue
+			}
+			read = append(read, exposedBytes(exposedByteSlices(t, "(*KeySchedule)."+name, result))...)
+		}
+		if refused {
+			// a refusal that came back with bytes beside it is the leak this gate is about,
+			// wearing an error
+			for _, secret := range read {
+				if len(secret) != 0 {
+					t.Errorf("%s: %s refused and %d bytes came back beside the refusal", at, name, len(secret))
+				}
+			}
+			answers = append(answers, nil)
+			continue
+		}
+		answers = append(answers, read)
+	}
+	return answers
+}
+
+// TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch is the erased epoch read as
+// behaviour, over the class of methods that can hit it rather than over the one that was found
+// hitting it.
+//
+// An epoch leaving PastEpochWindow has its nine secrets zeroized in place — key_schedule.go
+// says so, and Secrets() hands out the pointer that makes it reachable today. A derivation over
+// KDF.Nh zero bytes is not a weakened secret, it is a PUBLIC one: measured, not supposed, with
+// the nine erased in place Export("URmessage/v1/storage", nil, 32) returned err == nil and a
+// value byte identical to MLS-Exporter over 32 zero bytes. URmessage wraps seed recovery to
+// each epoch's export, so a recovery blob taken from an aged out epoch would be wrapped to a
+// key the attacker also holds and nothing would report an error.
+//
+// The class is every exported method whose body reads one of the nine by name, derived off the
+// package's own source. Enumerating it would be the mistake this project has paid for
+// repeatedly: the defect was reported against Export, and ExternalKeyPair — which derives an
+// HPKE key pair from external_secret and would answer a key pair whose private half every party
+// can recompute — is the same defect one method over and was in no report.
+//
+// Both directions are asserted. A live epoch must answer, or a method that refused everything
+// would satisfy the erased half for the wrong reason; and the nine really are zero after the
+// erase, or the refusal would be about some other condition.
+func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.T) {
+	// the control first: the matcher tells a read of a named secret from an answer of the
+	// storage whole, and exported from not
+	control := mustParseText(t, "the erased epoch control", erasedEpochControl)
+	controlStructs := map[string]*ast.StructType{}
+	structTypesIn(control, controlStructs)
+	if storage := epochSecretsStorageFieldIn(t, controlStructs, "Holder"); storage != "secrets" {
+		t.Fatalf("the storage field scan read %q out of the control, want \"secrets\"", storage)
+	}
+	controlDeriving := theMethodsDerivingFromOneOfTheNine(declaredIn(control), "secrets")
+	if want := []string{"DerivesFromOneOfThem"}; !slices.Equal(controlDeriving, want) {
+		t.Fatalf("the matcher read %v out of the control as deriving from one of the nine, want %v; it is not telling a read of a named secret from an answer of the storage whole",
+			controlDeriving, want)
+	}
+
+	// then this package's own source
+	structs := map[string]*ast.StructType{}
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		files = append(files, parsed)
+		structTypesIn(parsed, structs)
+	}
+	holders := theTypesHoldingTheEpochSecret(structs)
+	if len(holders) != 1 {
+		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
+	}
+	storage := epochSecretsStorageFieldIn(t, structs, holders[0])
+	deriving := theMethodsDerivingFromOneOfTheNine(declaredAcross(files), storage)
+	if len(deriving) == 0 {
+		t.Fatalf("no exported method of this package reads %s.<one of the nine>, and this package declares Export and ExternalKeyPair, so the scan is reading nothing",
+			storage)
+	}
+	for _, name := range deriving {
+		if _, found := reflect.TypeOf(&KeySchedule{}).MethodByName(name); !found {
+			t.Fatalf("%s derives from one of the nine and *KeySchedule does not declare it, so this gate cannot call it", name)
+		}
+	}
+	t.Logf("%d exported methods derive from one of the nine: %v", len(deriving), deriving)
+
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		// the live control: every one of them answers bytes before the erase, so a refusal
+		// afterwards is the erase and not a method that refuses everything
+		for _, name := range deriving {
+			for index, answer := range scheduleMethodResults(t, epoch.at, schedule, name) {
+				if !slices.ContainsFunc(answer, func(b []byte) bool { return len(b) != 0 }) {
+					t.Fatalf("%s: %s row %d answered no bytes over a live epoch, so a refusal after the erase would say nothing",
+						epoch.at, name, index)
+				}
+			}
+		}
+
+		// the erase the epoch performs on itself when it leaves PastEpochWindow, over the nine
+		// read by reflection rather than named here
+		secrets := reflect.ValueOf(schedule.Secrets()).Elem()
+		for i := range secrets.NumField() {
+			zeroizeSecret(secrets.Field(i).Bytes())
+		}
+		for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
+			if slices.ContainsFunc(secret, func(b byte) bool { return b != 0 }) {
+				t.Fatalf("%s: EpochSecrets.%s is not zero after the erase, so what the calls below answer is not an erased epoch",
+					epoch.at, name)
+			}
+		}
+
+		for _, name := range deriving {
+			for index, answer := range scheduleMethodResults(t, epoch.at, schedule, name) {
+				for _, secret := range answer {
+					if len(secret) != 0 {
+						t.Errorf("%s: %s row %d answered %d bytes over an epoch whose secrets are erased; a derivation over KDF.Nh zero bytes is publicly computable, so this is a secret handed out with err == nil",
+							epoch.at, name, index, len(secret))
+					}
+				}
+			}
 		}
 	}
 }
