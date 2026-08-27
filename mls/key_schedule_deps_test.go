@@ -4,11 +4,18 @@
 // that pins the wrong shape catches the drift by failing, which is the whole point of
 // the file.
 //
-// Only two of the producing plans have landed in this package: syntax and the crypto
+// Only two of the producing plans have landed in this package whole: syntax and the crypto
 // provider. Tree math, the registry enums and extensions, framing's ContentType and the
-// validation plan's ValSem and vector helpers are all still elsewhere, so they cannot be
-// pinned yet — an undefined name is a build failure, not a red test, and a build failure
-// takes the whole package down including everything already green.
+// validation plan's ValSem codes are all still elsewhere, so they cannot be pinned yet — an
+// undefined name is a build failure, not a red test, and a build failure takes the whole
+// package down including everything already green.
+//
+// p8's vector harness is the exception and is pinned below. It landed in vectors_test.go
+// rather than in a production file, which is where the detector that should have noticed
+// had a hole: the scan behind TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere read only
+// non test files, so a test-only surface — and the vector harness is test-only by design —
+// could land under any plan with all five of its names still listed here as pending. The
+// scan reads every go file of the package now.
 //
 // What stands in for them is TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere. It reads
 // this package's own source and fails the moment one of those symbols appears, which is
@@ -21,6 +28,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -123,6 +131,30 @@ var (
 	_ []byte             = PreSharedKeyId{}.PskGroupId
 	_ uint64             = PreSharedKeyId{}.PskEpoch
 	_ []byte             = PreSharedKeyId{}.PskNonce
+)
+
+// p8 validation and interop, task 7 — the vector family harness. These five landed in
+// vectors_test.go, so they are pinned at the signatures the interface registry gives them
+// exactly as a production surface would be: this plan's task 16 runner registers against
+// RegisterVectorFamily and reads its corpus through LoadVectorFile, and p8's own landing
+// replaces that file rather than adding a second registry beside it.
+//
+// The struct is pinned field by field for the same reason GroupContext is: a field added is
+// a line missing here, and the two function fields are what the registry actually calls, so
+// a Verify that grew a return or a Generate that lost its *testing.T stops compiling here
+// rather than at the one call site that happens to be written today.
+var (
+	_ func(VectorFamily)                         = RegisterVectorFamily
+	_ func(*testing.T, string) []json.RawMessage = LoadVectorFile
+	_ func(*testing.T, string) []byte            = MustHex
+	_ func([]byte) string                        = HexOf
+
+	_ int                               = VectorFamily{}.Number
+	_ string                            = VectorFamily{}.Name
+	_ string                            = VectorFamily{}.File
+	_ string                            = VectorFamily{}.Slice
+	_ func(*testing.T, json.RawMessage) = VectorFamily{}.Verify
+	_ func(*testing.T) json.RawMessage  = VectorFamily{}.Generate
 )
 
 // pinnedCodec exists only to carry the C1 method set. Declaring the two methods and then
@@ -375,6 +407,11 @@ func readVectorManifest(t *testing.T) map[string]string {
 // now landed and been answered with the var _ syntax.Codec pin the plan's task 1 block
 // carries plus a field by field pin above. They were in this list for the same reason
 // every cross plan name is: the moment a type exists, this file owes it that pin.
+//
+// p8's five vector harness names left this map the same way and on the same terms: they
+// landed in vectors_test.go, so they are pinned above. Landing in a TEST file is what this
+// map's detector used to be blind to, and the fix is in the scan rather than here — a name
+// that lands test-only is landed, and owes its pin.
 var crossPlanSymbolsNotYetLanded = map[string]string{
 	"LeafIndex":              "p3 tree math",
 	"NodeIndex":              "p3 tree math",
@@ -397,11 +434,6 @@ var crossPlanSymbolsNotYetLanded = map[string]string{
 	"ErrPskNonceLength":      "p8 validation and interop",
 	"ErrPskType":             "p8 validation and interop",
 	"ErrDuplicatePsk":        "p8 validation and interop",
-	"VectorFamily":           "p8 validation and interop",
-	"RegisterVectorFamily":   "p8 validation and interop",
-	"LoadVectorFile":         "p8 validation and interop",
-	"MustHex":                "p8 validation and interop",
-	"HexOf":                  "p8 validation and interop",
 }
 
 // TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere fails when a producing plan merges
@@ -417,12 +449,25 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 	// removes the only thing that will notice its symbol landing, and deleting it is the
 	// cheapest way to quieten this test. answering an entry properly is a pin written
 	// above, the entry deleted, and this number decremented in the same commit.
-	if len(crossPlanSymbolsNotYetLanded) != 26 {
-		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 26 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
+	if len(crossPlanSymbolsNotYetLanded) != 21 {
+		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 21 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
 			len(crossPlanSymbolsNotYetLanded))
 	}
+	fileSet := token.NewFileSet()
+	control, err := parser.ParseFile(fileSet, "map_literal_control.go", mapLiteralDeclarationControl,
+		parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	fromControl := map[string]string{}
+	declarationsIn(control, "map_literal_control.go", fromControl)
+	if got := slices.Sorted(maps.Keys(fromControl)); !slices.Equal(got, []string{"DeclaredFunc", "DeclaredType", "declaredVar"}) {
+		t.Fatalf("the collector read %v out of the control; it must report the three declarations and none of the three map literal keys, or reading test files would report every entry of the map below as landed",
+			got)
+	}
+
 	declared := packageLevelDeclarations(t, ".")
-	t.Logf("%d package level declarations read from this package's source", len(declared))
+	t.Logf("%d package level declarations read from this package's source, test files included", len(declared))
 
 	for _, control := range []string{
 		"CryptoProvider",                         // a type
@@ -432,6 +477,8 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 		"ErrSecretLength",                        // a var, from this task
 		"zeroizeSecret",                          // an unexported func, from this task
 		"suiteCryptoProvider.Suite",              // a method, the shape the two tree math methods have
+		"RegisterVectorFamily",                   // a func declared in a TEST file, the case the scan used to be blind to
+		"VectorFamily",                           // and a type declared in one
 	} {
 		if _, ok := declared[control]; !ok {
 			t.Fatalf("the scan did not find %s, which this package certainly declares, so it is reporting every symbol below as pending having read nothing useful", control)
@@ -450,11 +497,19 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 	t.Logf("%d cross plan symbols still pending a pin", len(crossPlanSymbolsNotYetLanded))
 }
 
-// packageLevelDeclarations reads every non test go file of a directory and returns the
-// package level names it declares, mapped to the file that declares them. Methods appear
-// as Receiver.Name, because that is the shape the two tree math methods the registry pins
-// have. Test files are excluded: this file is a test file and names every pending symbol
-// in a map literal, so including them would report all of them as landed.
+// packageLevelDeclarations reads every go file of a directory, test files included, and
+// returns the package level names it declares, mapped to the file that declares them.
+// Methods appear as Receiver.Name, because that is the shape the two tree math methods the
+// registry pins have.
+//
+// Test files were excluded here once, on the stated grounds that this file is a test file
+// and names every pending symbol in a map literal, so including it would report them all as
+// landed. That reason is not true -- declarationsIn reads declared NAMES and a map literal's
+// keys are values, which mapLiteralDeclarationControl below is the proof of -- and the
+// exclusion cost something real: p8's vector harness landed in vectors_test.go with all five
+// of its names still listed as pending, and nothing could ever have reported it, because a
+// test-only surface is invisible to a scan that skips test files. A symbol declared in a
+// test file of package mls has landed in package mls.
 func packageLevelDeclarations(t *testing.T, dir string) map[string]string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -466,7 +521,7 @@ func packageLevelDeclarations(t *testing.T, dir string) map[string]string {
 	fileSet := token.NewFileSet()
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
 			continue
 		}
 		parsed, err := parser.ParseFile(fileSet, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
@@ -474,35 +529,66 @@ func packageLevelDeclarations(t *testing.T, dir string) map[string]string {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 		files++
-		for _, declaration := range parsed.Decls {
-			switch typed := declaration.(type) {
-			case *ast.FuncDecl:
-				if typed.Recv == nil || len(typed.Recv.List) == 0 {
-					declared[typed.Name.Name] = name
-					continue
-				}
-				declared[receiverTypeName(typed.Recv.List[0].Type)+"."+typed.Name.Name] = name
-			case *ast.GenDecl:
-				for _, spec := range typed.Specs {
-					switch typedSpec := spec.(type) {
-					case *ast.TypeSpec:
-						declared[typedSpec.Name.Name] = name
-					case *ast.ValueSpec:
-						for _, ident := range typedSpec.Names {
-							if ident.Name != "_" {
-								declared[ident.Name] = name
-							}
+		declarationsIn(parsed, name, declared)
+	}
+	if files == 0 {
+		t.Fatalf("no go file found in %s, so this scan proves nothing", dir)
+	}
+	return declared
+}
+
+// declarationsIn collects one parsed file's package level declarations into declared. It is
+// split out from the directory walk so a synthetic control can be run through the same code
+// the real scan uses rather than through a second copy of it.
+func declarationsIn(parsed *ast.File, name string, declared map[string]string) {
+	for _, declaration := range parsed.Decls {
+		switch typed := declaration.(type) {
+		case *ast.FuncDecl:
+			if typed.Recv == nil || len(typed.Recv.List) == 0 {
+				declared[typed.Name.Name] = name
+				continue
+			}
+			declared[receiverTypeName(typed.Recv.List[0].Type)+"."+typed.Name.Name] = name
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				switch typedSpec := spec.(type) {
+				case *ast.TypeSpec:
+					declared[typedSpec.Name.Name] = name
+				case *ast.ValueSpec:
+					for _, ident := range typedSpec.Names {
+						if ident.Name != "_" {
+							declared[ident.Name] = name
 						}
 					}
 				}
 			}
 		}
 	}
-	if files == 0 {
-		t.Fatalf("no non test go file found in %s, so this scan proves nothing", dir)
-	}
-	return declared
 }
+
+// mapLiteralDeclarationControl is the control on the scan's one debatable claim: that a name
+// appearing only as a map literal key, which is how every entry of
+// crossPlanSymbolsNotYetLanded appears, is not a declaration. If that were false, reading
+// test files would report every pending symbol as landed and this file would be unusable.
+//
+// It names a declared type, a declared func, a declared var, a blank pin that must not be
+// collected, and three keys that are declared nowhere.
+var mapLiteralDeclarationControl = strings.Join([]string{
+	"package control",
+	"",
+	"type DeclaredType struct{}",
+	"",
+	"func DeclaredFunc() {}",
+	"",
+	"var _ int = 1",
+	"",
+	"var declaredVar = map[string]string{",
+	"\t" + "\"NamedOnlyAsAKey\": \"p3 tree math\",",
+	"\t" + "\"AlsoOnlyAKey\": \"p6 framing\",",
+	"\t" + "\"AndAThird\": \"p8 validation and interop\",",
+	"}",
+	"",
+}, "\n")
 
 // receiverTypeName reduces a method receiver to the bare type name, so *T, T and a
 // generic T[P] all report T.
@@ -542,7 +628,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 43,
+	"key_schedule_deps_test.go": 53,
 	"pins_test.go":              8,
 }
 

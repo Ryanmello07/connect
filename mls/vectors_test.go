@@ -12,6 +12,27 @@
 // one returns nil, one returns an empty slice, and a family whose vector carries an absent
 // field then verifies under one runner and not the other. There is one of each here.
 //
+// Where this file diverges from p8 task 7's literal text, so that landing is a REPLACEMENT
+// and not a reconciliation of two half-registries. Five differences, each deliberate:
+//
+//  1. vectorManifest is a variable initializer over baseVectorManifest() rather than a map
+//     literal populated from init(). p8's spelling is an ordering hazard: init() functions
+//     run in file name order, so every *_kat_test.go that sorts before vectors_test.go
+//     registers first and is then overwritten by the runnerless declarations. The registry
+//     ends up with sixteen nil runners and a green gate. See the note on vectorManifest.
+//  2. LoadVectorFile is split over vectorFileEntries, which returns the error instead of
+//     reporting it, so the unreadable-corpus path is reachable from a test.
+//  3. RegisterVectorFamily keeps the manifest's own Number, Name, File and Slice, so a
+//     runner cannot rename its family or repoint it at another corpus file on the way in.
+//  4. expectedPendingFamilies omits 6, which p4 task 16 installs from
+//     key_schedule_kat_test.go; p8 task 7's list is 1..15.
+//  5. TestVectorGenerateThenVerify is p8 task 9's and is pulled forward to here, because
+//     family 6 ships a generator in the same commit that installs it and an uninvoked
+//     Generate is an unexercised one.
+//
+// The manifest rows follow p8 rather than the p4 plan's own task 16 snippet where the two
+// disagree: family 6 is Slice A3 and Name "Pre-shared keys", not Slice A2 and "psk_secret".
+//
 // The failure this whole file exists to make impossible is a runner that ran nothing
 // reporting exactly what a runner that passed everything reports. Three things stand
 // against it: a family with no Verify must be named in expectedPendingFamilies, so a
@@ -227,13 +248,22 @@ func TestVectorManifestIsComplete(t *testing.T) {
 	}
 }
 
-// TestVectorFamiliesVerify runs every installed family over every case of its pinned file.
+// TestVectorFamiliesVerify offers every installed family every case of its pinned file.
 //
 // The number of families run is asserted rather than left implicit: this loop over a
 // manifest of sixteen nil Verify funcs completes instantly and reports PASS, which is the
 // shape gate 1 has to be unable to reach.
+//
+// What this loop counts is cases OFFERED, and the log line says so. It cannot count cases
+// compared: Verify returns nothing, so a family that declined every case it was handed --
+// because the case is at a ciphersuite it does not implement, which is the normal
+// condition for five of the seven suites the mlswg files publish -- is indistinguishable
+// here from one that checked all of them. Family 6 is offered 77 cases and compares 22 of
+// them. The honest number is each family's own, asserted in each family's own runner
+// against a written count; this number is an upper bound and reading it as coverage
+// overstates the run by whatever the suite filter dropped.
 func TestVectorFamiliesVerify(t *testing.T) {
-	families, cases := 0, 0
+	families, offered := 0, 0
 	for number := 1; number <= 16; number++ {
 		family := vectorManifest[number]
 		if family.Verify == nil {
@@ -253,7 +283,7 @@ func TestVectorFamiliesVerify(t *testing.T) {
 				}()
 				family.Verify(t, raw)
 			}()
-			cases++
+			offered++
 		}
 	}
 	if want := 16 - len(expectedPendingFamilies); families != want {
@@ -263,7 +293,8 @@ func TestVectorFamiliesVerify(t *testing.T) {
 	if families == 0 {
 		t.Fatal("no family is installed, so gate 1 is green with nothing behind it")
 	}
-	t.Logf("%d families verified over %d published cases", families, cases)
+	t.Logf("%d families verified; %d published cases offered to them, of which each family's own runner asserts how many it compared",
+		families, offered)
 }
 
 // TestVectorGenerateThenVerify closes the loop verification alone cannot: a pinned vector

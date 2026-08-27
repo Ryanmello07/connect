@@ -8,15 +8,21 @@
 //
 // What this file is defending against, stated once because every assertion below is an
 // instance of it: a vector runner that ran nothing reports exactly what a vector runner
-// that passed everything reports. Four separate things stand in the way.
+// that passed everything reports. Five separate things stand in the way.
 //
-//   - The number of comparisons is counted where the comparison happens, not where the
-//     loop iterates, and the count is asserted against a written number. Counting at the
-//     loop is the version of this that does not work: a verifier that returned early for
-//     every case would still be counted once per case.
+//   - The comparator returns the values it derived rather than a bool, and its callers
+//     judge those values. This is the one that had to be rewritten. A bool whose last
+//     statement is `return true` reports that control reached the bottom of the function,
+//     not that a comparison happened, so an early return anywhere above it left the count
+//     reading 22 with PskSecret never called; and moving that bool one stack frame out of
+//     the loop, which the first fix did, keeps the shape and only changes where it lies.
+//     A value that must be KDF.Nh octets wide, must have moved when the corpus's own psk
+//     moved, and must equal the published answer cannot be produced by skipping the work.
 //   - The suites the filter matched are compared against the ciphersuite registry rather
 //     than against a list written here, so a filter that matched nothing, and a filter
-//     that matched all seven published suites, both fail.
+//     that matched all seven published suites, both fail. The per suite split is checked
+//     too, against what the corpus itself publishes at each suite, so 21 comparisons at
+//     one registered suite and one at the other is a failure rather than a total of 22.
 //   - The corpus is loaded through LoadVectorFile, which is fatal and never skipping, and
 //     no runner file may name a skip at all; TestNoVectorRunnerCanSkip derives the skip
 //     class from the testing package rather than listing it.
@@ -24,6 +30,12 @@
 //     non-empty list must differ from the empty answer, and one flipped octet of the
 //     corpus's own psk must move the value this package computes. Both fail if the
 //     corpus data never reached the derivation.
+//   - The comparator is required to REFUSE. Every case in the vendored corpus agrees with
+//     this implementation, so a comparator that checked everything and a comparator that
+//     checked nothing produce identical runs over it; the only way to tell them apart is
+//     to hand the comparator an answer that is wrong on purpose and require the matching
+//     refusal, which is what TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept
+//     does over four defect classes.
 //
 // And the generate direction. The published corpus never passes through our own encoder,
 // so verification alone cannot see an encoder and a decoder that are wrong in the same
@@ -33,6 +45,10 @@
 // independentPskSecret, written from RFC 5869 and RFC 9420 with crypto/hmac and nothing
 // this package declares, held against the published corpus, and held structurally to
 // touching no production function by TestTheGenerateDirectionSharesNoCodePathWithVerify.
+// That gate walks the closure over EVERY test file of this package, not the vector runner
+// files alone: a function it cannot see is a leaf whose body it never enters, so a narrower
+// file class is an escape hatch one hop wide -- route the answer through a helper declared
+// in psk_test.go and the whole production closure is laundered.
 package mls
 
 import (
@@ -40,6 +56,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -128,21 +145,147 @@ func init() {
 	})
 }
 
+// The refusals comparePskSecretVector makes, as sentinels rather than as formatted
+// strings, so a test can require a specific refusal rather than "some error".
+//
+// They are what makes the comparison observable. A comparator that reports its verdict by
+// calling t.Fatalf can only be judged by a corpus that happens to disagree with it, and
+// the corpus in this tree agrees with everything; a comparator that RETURNS its verdict
+// can be handed a deliberately wrong answer and required to refuse it, which is what
+// TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept does.
+var (
+	errPskSecretPublishedWidth = errors.New("the published psk_secret is not the suite's KDF.Nh")
+	errPskSecretIsEmptyAnswer  = errors.New("the published answer for a non-empty list is the empty answer")
+	errPskSecretMismatch       = errors.New("psk_secret does not match the published answer")
+	errPskSecretDidNotMove     = errors.New("flipping one octet of the published psk left psk_secret unchanged")
+	errPskSecretIncomplete     = errors.New("the comparison reports values it cannot have computed")
+)
+
+// pskSecretComparison is what one run of comparePskSecretVector PRODUCED, and it is the
+// only thing its callers are allowed to judge it by.
+//
+// This shape is the fix for the defect the first version of this file had. That version
+// returned a bool, and the bool was the last statement of the function, so what it
+// reported was "control reached the bottom" and not "a comparison happened": an early
+// return inserted anywhere above it left the runner counting 22 comparisons that never
+// called PskSecret at all, and the run stayed green. A bool cannot be told apart from a
+// literal. These fields can: every one of them is written at the point the work that
+// produces it happens, so a return that skipped the work reports the zero value, and a
+// caller that looks at the values rather than at the fact of returning sees that.
+//
+// published is decoded by the comparator and computed is produced by PskSecret, and the
+// runner re-derives the published half from the corpus text it parsed itself before
+// comparing the two. That is deliberate duplication: the comparator's own bytes.Equal and
+// the runner's hex string comparison are two expressions of one predicate over two
+// independent decodes, and neutralising either one leaves the other standing.
+type pskSecretComparison struct {
+	// inScope is true when the vector's ciphersuite is one this package registers. A
+	// false here is not a failure and not a skip: it is a case with no provider.
+	inScope bool
+	// psks is how many pre-shared keys reached the derivation, which is what decides
+	// whether the two non-empty controls below apply.
+	psks int
+	// hashSize is the suite's KDF.Nh, read off the provider rather than assumed.
+	hashSize int
+	// published is the corpus's own answer, decoded.
+	published []byte
+	// computed is what PskSecret answered for this case.
+	computed []byte
+	// empty is EmptyPskSecret for this suite: the answer an implementation that ignored
+	// the list entirely would give.
+	empty []byte
+	// perturbed is what PskSecret answers with one octet of the last psk flipped. Nil
+	// where there is no non-empty psk to flip, which the two callers both allow for.
+	perturbed []byte
+}
+
+// incomplete reports whether the fields a compared case must carry are missing or
+// inconsistent, without looking at whether the answer was right.
+//
+// This is the vacuity half, split out from the correctness half on purpose. A comparison
+// that produced no computed value, or a computed value of the wrong width, or an empty
+// control it never derived, has not compared anything whatever bytes.Equal would say
+// about it -- and bytes.Equal over two empty slices says they agree.
+func (self pskSecretComparison) incomplete() error {
+	switch {
+	case !self.inScope:
+		return fmt.Errorf("%w: the case is out of scope and carries no comparison", errPskSecretIncomplete)
+	case self.hashSize == 0:
+		return fmt.Errorf("%w: no KDF.Nh was read from the provider", errPskSecretIncomplete)
+	case len(self.computed) != self.hashSize:
+		return fmt.Errorf("%w: PskSecret produced %d octets and the suite's KDF.Nh is %d",
+			errPskSecretIncomplete, len(self.computed), self.hashSize)
+	case len(self.published) != self.hashSize:
+		return fmt.Errorf("%w: the published answer is %d octets and the suite's KDF.Nh is %d",
+			errPskSecretIncomplete, len(self.published), self.hashSize)
+	case len(self.empty) != self.hashSize:
+		return fmt.Errorf("%w: the empty answer control was never derived", errPskSecretIncomplete)
+	case self.psks > 0 && len(self.perturbed) != self.hashSize:
+		return fmt.Errorf("%w: %d psks reached the derivation and the flipped octet control was never run",
+			errPskSecretIncomplete, self.psks)
+	}
+	return nil
+}
+
+// verdict is the whole judgement over one compared case: it must be complete, it must
+// agree with the corpus, and both vacuity controls must have moved.
+//
+// Both callers of the comparator run this, and the runner then runs its own comparison
+// over the same evidence from the corpus text it decoded itself. One caller would be
+// enough for a correct tree and is not enough for this one: the registry shim reaches
+// this comparator over all 77 published cases and over every generated case, and the
+// runner reaches it over the 22 in scope, so a defect that only the generated cases
+// expose has to be refused on the shim's path too.
+func (self pskSecretComparison) verdict() error {
+	if err := self.incomplete(); err != nil {
+		return err
+	}
+	if self.psks > 0 && bytes.Equal(self.published, self.empty) {
+		return fmt.Errorf("%w: a list of %d psks answers %s, which is what an implementation that ignored the list would answer",
+			errPskSecretIsEmptyAnswer, self.psks, HexOf(self.empty))
+	}
+	if !bytes.Equal(self.computed, self.published) {
+		return fmt.Errorf("%w: %d psks give %s, the corpus publishes %s",
+			errPskSecretMismatch, self.psks, HexOf(self.computed), HexOf(self.published))
+	}
+	if self.psks > 0 && bytes.Equal(self.perturbed, self.computed) {
+		return fmt.Errorf("%w: %d psks, so the corpus data never reached the derivation",
+			errPskSecretDidNotMove, self.psks)
+	}
+	return nil
+}
+
 // verifyPskSecretVector is the registry's shim: the signature RegisterVectorFamily needs,
-// over the function that does the work and reports whether it did any.
+// over the comparator that does the work and reports what it produced.
 //
 // The split is the whole point. Verify cannot return anything, so a runner that counted
 // calls to it would count a case it declined to check exactly as it counts a case it
-// compared. comparePskSecretVector returns that fact and TestVectorPskSecret counts it.
+// compared. comparePskSecretVector returns the values it derived and TestVectorPskSecret
+// judges them.
 func verifyPskSecretVector(t *testing.T, raw json.RawMessage) {
 	t.Helper()
-	comparePskSecretVector(t, "", raw)
+	evidence, err := comparePskSecretVector(t, raw)
+	if err != nil {
+		t.Fatalf("psk_secret: %v", err)
+	}
+	if !evidence.inScope {
+		return
+	}
+	if err := evidence.verdict(); err != nil {
+		t.Fatalf("psk_secret: %v", err)
+	}
 }
 
-// comparePskSecretVector checks one entry of psk_secret.json and reports whether it
-// compared anything. A vector at a ciphersuite v1 does not implement is not a failure and
-// not a skip: it is a case this package has no provider for, and the accounting in
-// TestVectorPskSecret is what makes sure that is not every case.
+// comparePskSecretVector runs one entry of psk_secret.json and returns what the run
+// produced. A vector at a ciphersuite v1 does not implement is not a failure and not a
+// skip: it is a case this package has no provider for, and it comes back with inScope
+// false and nothing else set.
+//
+// A corpus that will not parse or will not hex decode is fatal here rather than returned,
+// because it is not a verdict about this implementation -- it is the evidence itself being
+// unreadable, and every family in this package treats that as the loudest failure there
+// is. Everything that IS a verdict about this implementation is returned, so a caller can
+// require a refusal instead of hoping the corpus disagrees with a defect.
 //
 // The two controls carried per comparison are here rather than in the runner because they
 // need the vector's own bytes. A published answer for a non-empty list that equalled the
@@ -151,19 +294,19 @@ func verifyPskSecretVector(t *testing.T, raw json.RawMessage) {
 // returning nothing -- then flipping an octet of the corpus's own psk would leave the
 // answer where it was. Both are the shape that has caught this before: install the
 // corpus's own data and refuse to proceed unless the value moves.
-func comparePskSecretVector(t *testing.T, at string, raw json.RawMessage) bool {
+func comparePskSecretVector(t *testing.T, raw json.RawMessage) (pskSecretComparison, error) {
 	t.Helper()
 	vector := pskSecretKatVector{}
 	if err := json.Unmarshal(raw, &vector); err != nil {
-		t.Fatalf("%sparse psk_secret entry: %v", at, err)
+		t.Fatalf("parse psk_secret entry: %v", err)
 	}
 	suite, ok := implementedSuite(vector.CipherSuite)
 	if !ok {
-		return false
+		return pskSecretComparison{}, nil
 	}
 	crypto, err := NewCryptoProvider(suite)
 	if err != nil {
-		t.Fatalf("%sNewCryptoProvider(%#04x): %v", at, uint16(suite), err)
+		t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
 	}
 	psks := make([]PreSharedKeyInput, 0, len(vector.Psks))
 	for _, entry := range vector.Psks {
@@ -177,25 +320,25 @@ func comparePskSecretVector(t *testing.T, at string, raw json.RawMessage) bool {
 		})
 	}
 	if len(psks) != len(vector.Psks) {
-		t.Fatalf("%sthe entry carries %d psks and %d reached the derivation", at, len(vector.Psks), len(psks))
+		t.Fatalf("the entry carries %d psks and %d reached the derivation", len(vector.Psks), len(psks))
 	}
-	want := MustHex(t, vector.PskSecret)
-	if len(want) != crypto.HashSize() {
-		t.Fatalf("%sthe published psk_secret is %d octets and the suite's KDF.Nh is %d, so this is not the comparison the corpus intends",
-			at, len(want), crypto.HashSize())
+	evidence := pskSecretComparison{
+		inScope:   true,
+		psks:      len(psks),
+		hashSize:  crypto.HashSize(),
+		published: MustHex(t, vector.PskSecret),
+		empty:     EmptyPskSecret(crypto),
 	}
-	if len(psks) > 0 && bytes.Equal(want, EmptyPskSecret(crypto)) {
-		t.Fatalf("%sthe published answer for a list of %d psks is the empty answer, so an implementation that ignored the list would match it",
-			at, len(psks))
+	if len(evidence.published) != evidence.hashSize {
+		return evidence, fmt.Errorf("%w: %d octets against a KDF.Nh of %d, so this is not the comparison the corpus intends",
+			errPskSecretPublishedWidth, len(evidence.published), evidence.hashSize)
 	}
-	got, err := PskSecret(crypto, psks)
+	computed, err := PskSecret(crypto, psks)
 	if err != nil {
-		t.Fatalf("%s%d psks: PskSecret: %v", at, len(psks), err)
+		return evidence, fmt.Errorf("%d psks: PskSecret: %w", len(psks), err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("%s%d psks at suite %#04x: psk_secret = %s, want %s",
-			at, len(psks), vector.CipherSuite, HexOf(got), vector.PskSecret)
-	}
+	evidence.computed = computed
+
 	// the vacuity control: one octet of the corpus's own psk, flipped, must move the
 	// answer. An agreement that survives this was not computed from the corpus.
 	if len(psks) > 0 && len(psks[len(psks)-1].Secret) > 0 {
@@ -208,23 +351,25 @@ func comparePskSecretVector(t *testing.T, at string, raw json.RawMessage) bool {
 		moved[len(moved)-1] = last
 		perturbed, err := PskSecret(crypto, moved)
 		if err != nil {
-			t.Fatalf("%sPskSecret over the perturbed list: %v", at, err)
+			return evidence, fmt.Errorf("PskSecret over the perturbed list: %w", err)
 		}
-		if bytes.Equal(perturbed, got) {
-			t.Fatalf("%sflipping one octet of the published psk left psk_secret unchanged, so the corpus data never reached the derivation",
-				at)
-		}
+		evidence.perturbed = perturbed
 	}
-	return true
+	return evidence, evidence.verdict()
 }
 
 // TestVectorPskSecret is vector family 6 over the published corpus.
 //
 // Every assertion after the loop exists because the loop can be made to run zero times
 // without anything else in this package noticing. A filter that matched nothing, a filter
-// that matched all seven suites, a corpus that parsed to an empty array, a verifier that
-// declined every case: each of those is a green run of this test with the assertions
-// removed, and a failure with them.
+// that matched all seven published suites, a corpus that parsed to an empty array, a
+// comparator that declined every case: each of those is a green run of this test with the
+// assertions removed, and a failure with them.
+//
+// What the loop counts is the part that had to be rewritten. It does not count calls that
+// returned; it counts cases whose returned evidence the runner itself checked against the
+// corpus text it decoded, so a comparator that answered without computing anything is a
+// failure here rather than a number that looks right.
 func TestVectorPskSecret(t *testing.T) {
 	entries := LoadVectorFile(t, pskSecretKatFile)
 	if len(entries) == 0 {
@@ -233,6 +378,12 @@ func TestVectorPskSecret(t *testing.T) {
 
 	compared, skipped := 0, 0
 	matched := map[CipherSuite]int{}
+	// published counts every entry by its ciphersuite, in scope or not. The per suite
+	// split below is derived from it rather than written here: the corpus is a grid of
+	// one list length series per published suite, so what each registered suite owes is
+	// what the corpus holds for it, and a run that compared all 22 at one suite fails
+	// against that without anyone having to transcribe eleven.
+	published := map[uint16]int{}
 	answers := map[string]int{}
 	for index, raw := range entries {
 		header := struct {
@@ -242,14 +393,28 @@ func TestVectorPskSecret(t *testing.T) {
 		if err := json.Unmarshal(raw, &header); err != nil {
 			t.Fatalf("vector %d: %v", index, err)
 		}
+		published[header.CipherSuite]++
 		suite, ok := implementedSuite(header.CipherSuite)
 		if !ok {
 			skipped++
 			continue
 		}
-		if !comparePskSecretVector(t, fmt.Sprintf("vector %d: ", index), raw) {
-			t.Fatalf("vector %d is at suite %#04x, which this package registers, and the verifier compared nothing",
+		evidence, err := comparePskSecretVector(t, raw)
+		if err != nil {
+			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
+		}
+		if !evidence.inScope {
+			t.Fatalf("vector %d is at suite %#04x, which this package registers, and the comparator declined it",
 				index, header.CipherSuite)
+		}
+		if err := evidence.verdict(); err != nil {
+			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
+		}
+		// and the runner's own half of the comparison, against the answer it decoded
+		// out of the corpus itself rather than against the comparator's copy of it.
+		if got := HexOf(evidence.computed); got != header.PskSecret {
+			t.Fatalf("vector %d (suite %#04x, %d psks): this package computes %s, the corpus publishes %s",
+				index, header.CipherSuite, evidence.psks, got, header.PskSecret)
 		}
 		compared++
 		matched[suite]++
@@ -270,12 +435,208 @@ func TestVectorPskSecret(t *testing.T) {
 	if got := slices.Sorted(maps.Keys(matched)); !slices.Equal(got, Suites()) {
 		t.Fatalf("the corpus answered for %v and this package registers %v", got, Suites())
 	}
+	// the per suite split, which the key set above says nothing about: 21 comparisons at
+	// one registered suite and 1 at the other satisfies both the count and the key set,
+	// and is a run that covered one suite.
+	perSuite := map[int]bool{}
+	for _, count := range published {
+		perSuite[count] = true
+	}
+	if len(perSuite) != 1 {
+		t.Fatalf("the corpus publishes %v cases per suite; this family's file is a grid of one series per suite and the split below assumes it",
+			published)
+	}
+	for _, suite := range Suites() {
+		want := published[uint16(suite)]
+		if want == 0 {
+			t.Fatalf("the corpus publishes nothing at suite %#04x, which this package registers", uint16(suite))
+		}
+		if matched[suite] != want {
+			t.Fatalf("suite %#04x was compared %d times and the corpus publishes %d cases at it",
+				uint16(suite), matched[suite], want)
+		}
+	}
 	if len(answers) != pskSecretKatDistinctAnswers {
 		t.Fatalf("the %d comparisons were made against %d distinct published answers, want %d; a corpus read as one repeated value would compare that many times and pin one answer",
 			compared, len(answers), pskSecretKatDistinctAnswers)
 	}
-	t.Logf("psk_secret: compared %d over %d distinct published answers at suites %v, skipped %d at unimplemented suites",
-		compared, len(answers), slices.Sorted(maps.Keys(matched)), skipped)
+	t.Logf("psk_secret: compared %d over %d distinct published answers, %d at each of the suites %v, skipped %d at unimplemented suites",
+		compared, len(answers), published[uint16(Suites()[0])], slices.Sorted(maps.Keys(matched)), skipped)
+}
+
+// TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept is the control the runner
+// cannot be: it hands the comparator answers that are wrong in each of the ways the corpus
+// is not, and requires the matching refusal.
+//
+// Why this test rather than more assertions in the runner. Every comparison the runner
+// makes is over a corpus that agrees with this implementation, so a comparator that
+// accepted everything and a comparator that checked everything produce identical runs
+// there. The only way to see the difference is to disagree with it on purpose. Each case
+// below is a real defect class -- a wrong answer, an answer of the wrong width, a
+// non-empty list published with the empty answer, a psk list that never reached the
+// derivation -- and each names the sentinel it owes, so a refusal for the wrong reason is
+// a failure too.
+//
+// The unmodified case is checked first and is the reason the four refusals mean anything:
+// a comparator that refused everything would satisfy them all.
+func TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
+	entries := LoadVectorFile(t, pskSecretKatFile)
+	base := pskSecretKatVector{}
+	found := false
+	for _, raw := range entries {
+		candidate := pskSecretKatVector{}
+		if err := json.Unmarshal(raw, &candidate); err != nil {
+			t.Fatalf("parse a psk_secret entry: %v", err)
+		}
+		// a case with at least two psks, so the flipped octet control has something to
+		// flip and the index and count fields of PSKLabel are both exercised.
+		if _, ok := implementedSuite(candidate.CipherSuite); ok && len(candidate.Psks) >= 2 {
+			base, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no published case at a registered suite carries two or more psks, so this control has nothing to corrupt")
+	}
+
+	encode := func(vector pskSecretKatVector) json.RawMessage {
+		body, err := json.Marshal(vector)
+		if err != nil {
+			t.Fatalf("marshal the case under test: %v", err)
+		}
+		return body
+	}
+
+	evidence, err := comparePskSecretVector(t, encode(base))
+	if err != nil {
+		t.Fatalf("the unmodified published case was refused: %v", err)
+	}
+	if !evidence.inScope || len(evidence.computed) == 0 {
+		t.Fatalf("the unmodified published case produced %+v, which carries no comparison", evidence)
+	}
+	if HexOf(evidence.computed) != base.PskSecret {
+		t.Fatalf("the unmodified published case computed %s against a published %s", HexOf(evidence.computed), base.PskSecret)
+	}
+
+	wrongAnswer := base
+	flipped := MustHex(t, base.PskSecret)
+	flipped[0] ^= 0x01
+	wrongAnswer.PskSecret = HexOf(flipped)
+
+	wrongWidth := base
+	wrongWidth.PskSecret = base.PskSecret[:len(base.PskSecret)-2]
+
+	emptyAnswer := base
+	crypto, err := NewCryptoProvider(CipherSuite(base.CipherSuite))
+	if err != nil {
+		t.Fatalf("NewCryptoProvider(%#04x): %v", base.CipherSuite, err)
+	}
+	emptyAnswer.PskSecret = HexOf(EmptyPskSecret(crypto))
+
+	// a psk list that decodes to nothing while the published answer stays the non-empty
+	// one: the shape a renamed json field or a struct tag typo produces, and the one the
+	// flipped octet control exists for.
+	noPsks := base
+	noPsks.Psks = nil
+
+	for _, corrupted := range []struct {
+		name   string
+		vector pskSecretKatVector
+		want   error
+	}{
+		{"one flipped octet of the published answer", wrongAnswer, errPskSecretMismatch},
+		{"a published answer one octet short of KDF.Nh", wrongWidth, errPskSecretPublishedWidth},
+		{"the empty answer published for a non-empty list", emptyAnswer, errPskSecretIsEmptyAnswer},
+		{"the psk list dropped and the answer kept", noPsks, errPskSecretMismatch},
+	} {
+		_, err := comparePskSecretVector(t, encode(corrupted.vector))
+		if err == nil {
+			t.Errorf("%s was accepted; the comparator is not comparing", corrupted.name)
+			continue
+		}
+		if !errors.Is(err, corrupted.want) {
+			t.Errorf("%s was refused as %v, want %v; a refusal for the wrong reason is a comparator checking something else",
+				corrupted.name, err, corrupted.want)
+		}
+	}
+}
+
+// TestPskSecretComparisonCannotReportAComparisonItDidNotMake is the control on the
+// evidence struct itself.
+//
+// The defect this whole shape replaces was a comparator whose "I compared" signal was the
+// last statement of the function. The signal is now the values it produced, and this is
+// what says those values cannot be faked by omission: a zero comparison, a computed value
+// of the wrong width, a missing empty control and a missing flipped octet control are each
+// required to be refused as incomplete, so a return that skipped the work is a failure on
+// every caller's path rather than a count that still reads 22.
+func TestPskSecretComparisonCannotReportAComparisonItDidNotMake(t *testing.T) {
+	full := pskSecretComparison{
+		inScope:   true,
+		psks:      2,
+		hashSize:  sha256.Size,
+		published: bytes.Repeat([]byte{0xaa}, sha256.Size),
+		computed:  bytes.Repeat([]byte{0xaa}, sha256.Size),
+		empty:     make([]byte, sha256.Size),
+		perturbed: bytes.Repeat([]byte{0xbb}, sha256.Size),
+	}
+	if err := full.verdict(); err != nil {
+		t.Fatalf("a complete and agreeing comparison was refused: %v; every case below would then pass for the wrong reason", err)
+	}
+
+	without := func(edit func(*pskSecretComparison)) pskSecretComparison {
+		partial := full
+		partial.published = bytes.Clone(full.published)
+		partial.computed = bytes.Clone(full.computed)
+		partial.empty = bytes.Clone(full.empty)
+		partial.perturbed = bytes.Clone(full.perturbed)
+		edit(&partial)
+		return partial
+	}
+	for _, missing := range []struct {
+		name string
+		edit func(*pskSecretComparison)
+	}{
+		{"a comparison that returned before anything was set", func(c *pskSecretComparison) { *c = pskSecretComparison{} }},
+		{"in scope and nothing else", func(c *pskSecretComparison) { *c = pskSecretComparison{inScope: true} }},
+		{"no computed value", func(c *pskSecretComparison) { c.computed = nil }},
+		{"a computed value of the wrong width", func(c *pskSecretComparison) { c.computed = c.computed[:len(c.computed)-1] }},
+		{"no published value", func(c *pskSecretComparison) { c.published = nil }},
+		{"no empty answer control", func(c *pskSecretComparison) { c.empty = nil }},
+		{"no flipped octet control over a non-empty list", func(c *pskSecretComparison) { c.perturbed = nil }},
+		{"no KDF.Nh read from the provider", func(c *pskSecretComparison) { c.hashSize = 0 }},
+	} {
+		partial := without(missing.edit)
+		err := partial.verdict()
+		if err == nil {
+			t.Errorf("%s was accepted as a comparison", missing.name)
+			continue
+		}
+		if !errors.Is(err, errPskSecretIncomplete) {
+			t.Errorf("%s was refused as %v, want an incompleteness", missing.name, err)
+		}
+	}
+
+	// and the correctness half, which incompleteness must not be standing in for.
+	disagreeing := without(func(c *pskSecretComparison) { c.computed[0] ^= 0x01 })
+	if err := disagreeing.verdict(); !errors.Is(err, errPskSecretMismatch) {
+		t.Errorf("a complete comparison whose computed value disagrees was judged %v, want a mismatch", err)
+	}
+	stuck := without(func(c *pskSecretComparison) { c.perturbed = bytes.Clone(c.computed) })
+	if err := stuck.verdict(); !errors.Is(err, errPskSecretDidNotMove) {
+		t.Errorf("a comparison whose flipped octet control did not move was judged %v, want that refusal", err)
+	}
+	// the empty list arm: no flipped octet control is owed, and the empty answer control
+	// does not apply, so an agreeing empty case must be accepted.
+	empty := without(func(c *pskSecretComparison) {
+		c.psks = 0
+		c.perturbed = nil
+		c.computed = bytes.Clone(c.empty)
+		c.published = bytes.Clone(c.empty)
+	})
+	if err := empty.verdict(); err != nil {
+		t.Fatalf("an agreeing empty list case was refused: %v; the 2 empty cases of the corpus would fail for the wrong reason", err)
+	}
 }
 
 // TestImplementedSuiteIsTheRegistryAndNotAList sweeps every uint16 code point and requires
@@ -689,6 +1050,51 @@ func TestGeneratedVectorsCoverEveryRegisteredSuite(t *testing.T) {
 // the structural gates over the runner files themselves
 // ---------------------------------------------------------------------------
 
+// packageTestFiles parses every test file of this package, keyed by base name.
+//
+// Every test file, and that is the load bearing word. The call graph gate below walks the
+// functions these files declare, and a function it cannot see is a leaf: its name is
+// collected and its body is never entered, so anything it calls is invisible. Narrowing
+// this set to the files that mention the vector harness is therefore not an optimisation,
+// it is an escape hatch one hop wide -- a generator routed through a helper declared in
+// psk_test.go, crypto_test.go or any other test file would launder the entire production
+// closure and the gate would report clean. That is exactly the shape of the first version
+// of this file, and it is why the class here is "is a test file of this package" and
+// nothing narrower.
+//
+// The count is asserted against the directory listing so a filter added later cannot
+// quietly shrink it.
+func packageTestFiles(t *testing.T) map[string]*ast.File {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	files := map[string]*ast.File{}
+	onDisk := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		onDisk++
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files[name] = parsed
+	}
+	if onDisk == 0 {
+		t.Fatal("no test file was read from the package directory, so every gate over this set would hold vacuously")
+	}
+	if len(files) != onDisk {
+		t.Fatalf("%d test files are on disk and %d were kept; a filter here is an escape hatch for the call graph gate below",
+			onDisk, len(files))
+	}
+	return files
+}
+
 // vectorRunnerFiles is every test file of this package that takes part in the vector
 // harness, derived rather than listed: a file that installs a family or reads the corpus
 // through the harness loader is one, and nothing else is.
@@ -696,36 +1102,23 @@ func TestGeneratedVectorsCoverEveryRegisteredSuite(t *testing.T) {
 // Derived because the class grows. Tasks 17, 18, 20 and 25 add runners to this file, and
 // p2, p3, p5, p6 and p7 add runner files of their own; a written list would cover the files
 // that existed when it was written and silently exempt every one that arrived after.
+//
+// This is the class for the skip gate, which is a question about a file: may THIS file
+// decline to run. It is not the class for the call graph gate, which is a question about a
+// closure and needs every test file -- see packageTestFiles.
 func vectorRunnerFiles(t *testing.T) map[string]*ast.File {
 	t.Helper()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read the package directory: %v", err)
-	}
-	fileSet := token.NewFileSet()
+	all := packageTestFiles(t)
 	runners := map[string]*ast.File{}
-	read := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		read++
+	for name, parsed := range all {
 		if namesMentionedIn(parsed)["RegisterVectorFamily"] || namesMentionedIn(parsed)["LoadVectorFile"] {
 			runners[name] = parsed
 		}
 	}
-	if read == 0 {
-		t.Fatal("no test file was read from the package directory, so the gates below would hold vacuously")
-	}
 	for _, required := range []string{"key_schedule_kat_test.go", "vectors_test.go"} {
 		if _, found := runners[required]; !found {
 			t.Fatalf("%s takes part in the vector harness and the derivation did not find it, so it is matching nothing useful over %d test files",
-				required, read)
+				required, len(all))
 		}
 	}
 	return runners
@@ -875,21 +1268,86 @@ func productionFunctionNames(t *testing.T) map[string]bool {
 	return names
 }
 
+// oneHopLaunderingRoot and oneHopLaunderingHelper are the control on the call graph walk:
+// a generator in one file, and the helper it calls declared in another, with the code under
+// test reached only from the helper.
+//
+// This is the exact evasion the first version of this gate was open to. The walk followed
+// calls only into functions declared in the vector runner files, so every other test file
+// of the package was a leaf, and moving one line -- the answer -- into a helper declared in
+// psk_test.go laundered the whole production closure while the gate reported clean. The
+// control is written as two sources rather than as two real files because a real one would
+// have to be a function nothing calls, and the point is the file boundary, not the code.
+var (
+	oneHopLaunderingRoot = strings.Join([]string{
+		"package control",
+		"",
+		"func generateControl() []byte {",
+		"\treturn launderControl()",
+		"}",
+		"",
+	}, "\n")
+
+	oneHopLaunderingHelper = strings.Join([]string{
+		"package control",
+		"",
+		"func launderControl() []byte {",
+		"\tout, _ := PskSecret(nil, nil)",
+		"\treturn out",
+		"}",
+		"",
+	}, "\n")
+)
+
 // TestTheGenerateDirectionSharesNoCodePathWithVerify is the gate that makes the generate
 // direction worth having.
 //
 // The trap it closes: a generator that computes its answer with PskSecret and a verifier
 // that checks it with PskSecret round trip perfectly and say nothing at all about
-// conformance. The property asserted is the strongest form of the fix, and it is derived
-// rather than described -- the production function class is read out of this package's own
-// non test source, and the closure of the generate direction is read out of its call graph,
-// so a call added later to any production function fails here.
+// conformance. The property asserted is the strongest form of the fix, and BOTH of its
+// classes are derived rather than described -- the production function class is read out of
+// this package's own non test source, and the closure of the generate direction is walked
+// over every test file of the package, so neither a production function added later nor a
+// helper hidden in another test file evades it.
 //
-// The verify direction is required to reach PskSecret, so the disjointness below cannot
-// hold by the collector having read nothing.
+// Two controls stand in front of the gate. The verify direction is required to reach
+// PskSecret, so the disjointness cannot hold by the collector having read nothing; and the
+// walk is required to cross a file boundary, so it cannot hold by the walk stopping at the
+// first hop.
 func TestTheGenerateDirectionSharesNoCodePathWithVerify(t *testing.T) {
+	fileSet := token.NewFileSet()
+	control := func(name, source string) *ast.File {
+		parsed, err := parser.ParseFile(fileSet, name, source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		return parsed
+	}
+	rootOnly := map[string]*ast.File{"root_test.go": control("root_test.go", oneHopLaunderingRoot)}
+	if reachableNames(t, testFileFunctions(rootOnly), "generateControl")["PskSecret"] {
+		t.Fatal("the walk reports PskSecret from a file that only names launderControl, so it is matching text rather than following calls")
+	}
+	bothFiles := map[string]*ast.File{
+		"root_test.go":   control("root_test.go", oneHopLaunderingRoot),
+		"helper_test.go": control("helper_test.go", oneHopLaunderingHelper),
+	}
+	if !reachableNames(t, testFileFunctions(bothFiles), "generateControl")["PskSecret"] {
+		t.Fatal("the walk did not follow a call into a function declared in another file, so the gate below is evadable by one hop through any test file")
+	}
+
+	// the class the real walk runs over: every test file, strictly more than the vector
+	// runner files, or the control above is describing a walk this gate does not make.
+	all := packageTestFiles(t)
 	runners := vectorRunnerFiles(t)
-	declared := testFileFunctions(runners)
+	if len(all) <= len(runners) {
+		t.Fatalf("the package has %d test files and %d of them are vector runners; the closure below must be walked over every test file and there is nothing here to widen",
+			len(all), len(runners))
+	}
+	declared := testFileFunctions(all)
+	if len(declared) <= len(testFileFunctions(runners)) {
+		t.Fatalf("the walk sees %d functions over every test file and %d over the runner files alone; it is not reading the wider class",
+			len(declared), len(testFileFunctions(runners)))
+	}
 	production := productionFunctionNames(t)
 
 	verifyReaches := reachableNames(t, declared, "comparePskSecretVector")
@@ -910,6 +1368,8 @@ func TestTheGenerateDirectionSharesNoCodePathWithVerify(t *testing.T) {
 				root, shared)
 		}
 	}
+	t.Logf("the generate direction was walked over %d functions declared across %d test files, against %d production function names",
+		len(declared), len(all), len(production))
 }
 
 // TestNoVectorRunnerCanSkip holds every vector harness file to failing rather than skipping.
