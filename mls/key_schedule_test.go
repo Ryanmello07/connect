@@ -3887,10 +3887,25 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 		{name: "EmptyPskSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			return [][]byte{EmptyPskSecret(crypto)}
 		}},
-		// and the non empty recurrence, whose answer is KDF.Nh because ExpandWithLabel was
-		// asked for the provider's Nh at every step. Two entries, so the fold is exercised
-		// and not only the first step; the nonces are the provider's Nh or ValSem401 refuses
-		// the list, which is itself a KDF.Nh read that would fail under a wider kdf.
+		// and the recurrence, in both of the shapes whose LENGTH this gate can hold.
+		//
+		// Not the expansion, and the distinction is the whole reason this comment is long.
+		// psk_secret is Extract's output and Extract answers the provider's Nh whatever
+		// width psk_input was expanded to, so a psk_input pinned to a literal 32 moves the
+		// value of every non empty psk_secret and moves no length at all -- this gate would
+		// report it clean, and did. What holds that width is
+		// TestPskSecretReadsKdfNhFromTheProvider, which reads the requested expansion
+		// lengths off the provider rather than the answer's.
+		//
+		// The two answers here are the folded list and psk_secret_[0] for the empty one.
+		// The empty case is a row of its own under EmptyPskSecret, and it is here as well
+		// because PskSecret writes that value at its own line rather than calling that
+		// function: a literal in either is invisible from the other, and the two then
+		// disagree at the first suite whose hash is not sha256.
+		//
+		// Two entries, so the fold is exercised and not only the first step; the nonces are
+		// the provider's Nh or ValSem401 refuses the list, which is itself a KDF.Nh read
+		// that would fail under a wider kdf.
 		{name: "PskSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			nh := crypto.HashSize()
 			secret, pskErr := PskSecret(crypto, []PreSharedKeyInput{
@@ -3916,7 +3931,11 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			if pskErr != nil {
 				t.Fatalf("PskSecret: %v", pskErr)
 			}
-			return [][]byte{secret}
+			overTheEmptyList, emptyErr := PskSecret(crypto, nil)
+			if emptyErr != nil {
+				t.Fatalf("PskSecret over the empty list: %v", emptyErr)
+			}
+			return [][]byte{secret, overTheEmptyList}
 		}},
 		{name: "DeriveJoinerSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			nh := crypto.HashSize()

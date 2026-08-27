@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1811,13 +1812,15 @@ func TestMarshalPskLabelCarriesIndexAndCountInSeparateFields(t *testing.T) {
 //
 // What each accounting assertion below is protecting against, since a sweep that ran nothing
 // reports exactly what a clean one reports: no vector at all means a corpus or registry
-// regression; a single suite means the derivation could be pinned to one Nh; no empty list
+// regression; a single suite means a registry or corpus regression dropped one, which is a
+// weaker statement than it looks and the accounting below says why; no empty list
 // means the case every epoch of this product actually takes is unchecked; no singleton means
 // the "derived psk" label and the PSKLabel encoding are unchecked; and no list of two or more
 // means the recurrence was never folded, which is where the accumulator and the index live.
 func TestPskSecretMatchesEveryUpstreamVector(t *testing.T) {
 	ran, skipped := 0, 0
 	suitesSeen := map[uint16]int{}
+	nhSeen := map[int]int{}
 	countsSeen := map[int]int{}
 	for index, vector := range loadPskSecretVectors(t) {
 		suite := CipherSuite(vector.CipherSuite)
@@ -1857,6 +1860,7 @@ func TestPskSecretMatchesEveryUpstreamVector(t *testing.T) {
 		}
 		ran++
 		suitesSeen[vector.CipherSuite]++
+		nhSeen[crypto.HashSize()]++
 		countsSeen[len(psks)]++
 	}
 
@@ -1864,7 +1868,18 @@ func TestPskSecretMatchesEveryUpstreamVector(t *testing.T) {
 		t.Fatalf("no psk_secret vector ran (%d skipped at unimplemented suites), so this test compared against nothing", skipped)
 	}
 	if len(suitesSeen) < 2 {
-		t.Fatalf("every vector that ran was at one ciphersuite (%v), so nothing here can tell the derivation from one pinned to a single KDF", suitesSeen)
+		t.Fatalf("every vector that ran was at one ciphersuite (%v), so a registry or corpus regression that dropped one would leave this sweep reporting exactly what a complete one reports", suitesSeen)
+	}
+	// and what more than one suite does NOT buy, recorded rather than assumed. Both registered
+	// suites are HKDF-SHA256, so every vector that runs here is at KDF.Nh 32 and nothing in
+	// this sweep separates the recurrence from one pinned to sha256 -- the corpus does carry
+	// SHA-384 and SHA-512 suites and every one of those vectors is skipped above. The
+	// differential that covers that is TestPskSecretReadsKdfNhFromTheProvider, over a provider
+	// whose whole hash and kdf surface is one width up; this stops being a limitation on the
+	// day a wider suite is registered, which is why the width is counted rather than asserted.
+	if len(nhSeen) < 2 {
+		t.Logf("every vector that ran was at KDF.Nh %v, so this sweep cannot tell the recurrence from one pinned to that width; TestPskSecretReadsKdfNhFromTheProvider is what does",
+			nhSeen)
 	}
 	if countsSeen[0] == 0 {
 		t.Fatal("no vector with an empty psk list ran, so the empty answer is pinned against nothing but this package's own opinion of it")
@@ -1881,8 +1896,8 @@ func TestPskSecretMatchesEveryUpstreamVector(t *testing.T) {
 	if folded == 0 {
 		t.Fatal("no vector with two or more psks ran, so the recurrence was never folded and the accumulator is unchecked")
 	}
-	t.Logf("psk_secret: %d vectors ran, %d skipped at unimplemented suites; suites %v; %d of the runs folded two psks or more",
-		ran, skipped, suitesSeen, folded)
+	t.Logf("psk_secret: %d vectors ran, %d skipped at unimplemented suites; suites %v at KDF.Nh %v; %d of the runs folded two psks or more",
+		ran, skipped, suitesSeen, nhSeen, folded)
 }
 
 // TestEmptyPskSecretMatchesTheUpstreamEmptyVector pins the empty answer against the corpus
@@ -1957,6 +1972,106 @@ func TestEmptyPskSecretMatchesPskSecretOfNil(t *testing.T) {
 	}
 }
 
+// TestPskSecretReadsKdfNhFromTheProvider is the input the registered suites cannot supply.
+//
+// KDF.Nh governs four separate things in this recurrence, and both registered suites fix it at
+// 32, so a literal 32 answers all four correctly for every input already in this tree: the
+// width of psk_secret_[0], the nonce length ValSem401 requires, the number of bytes
+// psk_input_[i] is expanded to, and the width of the answer.
+//
+// Three of the four are lengths a caller can see. The expansion is not, and it is the one that
+// hides: psk_secret_[i] = Extract(psk_input_[i-1], psk_secret_[i-1]) answers the provider's Nh
+// whatever width psk_input happened to be, so an expansion pinned to a literal moves the VALUE
+// of every non empty psk_secret and moves no length at all. The package wide gate in
+// key_schedule_test.go compares lengths and is structurally blind to that, which is why the
+// requested expansion widths are read here instead. Measured, not supposed: crypto.HashSize()
+// -> 32 at that call survived the whole of this package, and ZeroSecret(crypto) ->
+// make([]byte, 32) at psk_secret_[0] survived it too.
+//
+// The provider is the coherent wide one -- SHA-384 and HKDF-SHA384 throughout, not a fake
+// answering a bigger number out of HashSize -- because psk_secret is Extract's output, and a
+// provider whose declared Nh disagreed with its own kdf would report a width nothing derived.
+// pskHashSizeProvider above is the other kind and is deliberately not used here.
+func TestPskSecretReadsKdfNhFromTheProvider(t *testing.T) {
+	inner := pskTestCrypto(t)
+	crypto := &wideKdfProvider{CryptoProvider: inner}
+	if inner.HashSize() == crypto.HashSize() {
+		t.Fatalf("both providers answer KDF.Nh %d, so nothing below separates a width read off the provider from one written down",
+			inner.HashSize())
+	}
+	nh := crypto.HashSize()
+
+	// psk_secret_[0], and the two spellings of it held against each other at a width where a
+	// literal is visible at all. TestEmptyPskSecretMatchesPskSecretOfNil pins the same pair
+	// over Suites(), where both entries are Nh 32 and the two agree however either is written.
+	empty, err := PskSecret(crypto, nil)
+	if err != nil {
+		t.Fatalf("PskSecret(nil) over a provider whose KDF.Nh is %d: %v", nh, err)
+	}
+	if len(empty) != nh {
+		t.Errorf("PskSecret(nil) answered %d bytes over a provider whose KDF.Nh is %d", len(empty), nh)
+	}
+	if convenience := EmptyPskSecret(crypto); !bytes.Equal(convenience, empty) {
+		t.Errorf("over a provider whose KDF.Nh is %d, EmptyPskSecret = %x and PskSecret(nil) = %x; a group whose members take the two different spellings of psk_secret_[0] disagrees from epoch 0 and nothing decrypts",
+			nh, convenience, empty)
+	}
+	if slices.ContainsFunc(empty, func(b byte) bool { return b != 0 }) {
+		t.Errorf("psk_secret_[0] is %x, which is not the all zero string", empty)
+	}
+
+	// the non empty recurrence. Two entries, so the fold runs and not only its first step,
+	// and both arms of the select() so neither encoding is the only one expanded over.
+	psks := []PreSharedKeyInput{
+		{
+			Id: PreSharedKeyId{
+				PskType:  PskTypeExternal,
+				PskId:    repeatByte(0x11, 16),
+				PskNonce: repeatByte(0x22, nh),
+			},
+			Secret: repeatByte(0x33, nh),
+		},
+		{
+			Id: PreSharedKeyId{
+				PskType:    PskTypeResumption,
+				Usage:      ResumptionPskUsageApplication,
+				PskGroupId: repeatByte(0x44, 12),
+				PskEpoch:   7,
+				PskNonce:   repeatByte(0x55, nh),
+			},
+			Secret: repeatByte(0x66, nh),
+		},
+	}
+	crypto.expandedLengths = nil
+	secret, err := PskSecret(crypto, psks)
+	if err != nil {
+		t.Fatalf("PskSecret over a provider whose KDF.Nh is %d: %v", nh, err)
+	}
+	if len(secret) != nh {
+		t.Errorf("psk_secret is %d bytes over a provider whose KDF.Nh is %d", len(secret), nh)
+	}
+	// one expansion per entry, each asked for THIS provider's Nh. The count is derived from
+	// the list rather than written down, so a recurrence that grew a step has to say so here.
+	wantExpansions := make([]int, len(psks))
+	for i := range wantExpansions {
+		wantExpansions[i] = nh
+	}
+	if !slices.Equal(crypto.expandedLengths, wantExpansions) {
+		t.Errorf("psk_input was expanded to %v over a provider whose KDF.Nh is %d, want %v; that width is written down rather than read off the provider, and Extract answers Nh either way so no length in the answer can show it",
+			crypto.expandedLengths, nh, wantExpansions)
+	}
+
+	// and the refusal direction, because a body that read the provider for the expansion and
+	// wrote 32 down for ValSem401 passes everything above: a nonce of the NARROW provider's Nh
+	// is the wrong length for this one and has to be refused as such.
+	narrowNonce := psks[0]
+	narrowNonce.Id = *clonePreSharedKeyId(&psks[0].Id)
+	narrowNonce.Id.PskNonce = repeatByte(0x22, inner.HashSize())
+	if _, err := PskSecret(crypto, []PreSharedKeyInput{narrowNonce}); !errors.Is(err, errPskNonceLength) {
+		t.Errorf("a %d byte nonce over a provider whose KDF.Nh is %d gave err = %v, want errPskNonceLength",
+			inner.HashSize(), nh, err)
+	}
+}
+
 // pskSecretTwoInputs returns the two psk inputs of the first two entry vector at a registered
 // suite, together with that suite's provider. Reading them out of the corpus rather than
 // writing two constants here keeps the fixtures for the tests below the same bytes the KAT
@@ -2017,16 +2132,25 @@ func TestPskSecretChangesWhenTheListIsReordered(t *testing.T) {
 // TestPskSecretRejectsInvalidEntries asserts ValSem401, ValSem402 and ValSem403 all fire from
 // inside the computation, so no caller reaches a psk_secret over an invalid list by skipping a
 // separate validation step it did not know it owed.
+//
+// Every POSITION of the list is swept rather than the head. The two per entry rules are stated
+// per entry, and the loop that checks them is one character away from a loop that checks
+// psks[0] on every turn -- which refuses a bad first entry, folds a ValSem401 nonce or a
+// ValSem402 ReInit resumption into the answer at every other position, and is indistinguishable
+// from the shipped body over a list of one. Measured, not supposed: psks[i].Id.Validate ->
+// psks[0].Id.Validate survived the whole of this package while all three cases below were
+// singletons.
+//
+// The positions are derived from the list the sweep builds rather than written down, so a
+// wider list carries the rules to its new positions by construction rather than by somebody
+// remembering to add a row.
 func TestPskSecretRejectsInvalidEntries(t *testing.T) {
-	crypto, psks := pskSecretTwoInputs(t)
-	base := psks[0]
+	crypto, good := pskSecretTwoInputs(t)
+	base := good[0]
 
 	shortNonce := base
 	shortNonce.Id = *clonePreSharedKeyId(&base.Id)
 	shortNonce.Id.PskNonce = shortNonce.Id.PskNonce[:crypto.HashSize()-1]
-	if _, err := PskSecret(crypto, []PreSharedKeyInput{shortNonce}); !errors.Is(err, errPskNonceLength) {
-		t.Errorf("short nonce err = %v, want errPskNonceLength", err)
-	}
 
 	reinit := base
 	reinit.Id = PreSharedKeyId{
@@ -2035,24 +2159,79 @@ func TestPskSecretRejectsInvalidEntries(t *testing.T) {
 		PskGroupId: []byte{1},
 		PskNonce:   base.Id.PskNonce,
 	}
-	if _, err := PskSecret(crypto, []PreSharedKeyInput{reinit}); !errors.Is(err, errPskType) {
-		t.Errorf("reinit usage err = %v, want errPskType", err)
-	}
 
-	if _, err := PskSecret(crypto, []PreSharedKeyInput{base, base}); !errors.Is(err, errDuplicatePsk) {
-		t.Errorf("duplicate err = %v, want errDuplicatePsk", err)
-	}
-
-	// and the refusals are refusals: none of them returns a secret alongside the error, which
-	// a caller ignoring the error would then mix into an epoch.
-	for name, bad := range map[string][]PreSharedKeyInput{
-		"short nonce": {shortNonce},
-		"reinit":      {reinit},
-		"duplicate":   {base, base},
+	// the per entry rules, threaded through every position of a list whose other entries are
+	// valid and distinct. Distinct matters: a repeat would be refused by ValSem403 before the
+	// per entry loop is reached, and every row here would then pass for the wrong reason.
+	for _, invalid := range []struct {
+		name  string
+		entry PreSharedKeyInput
+		want  error
+	}{
+		{name: "short nonce", entry: shortNonce, want: errPskNonceLength},
+		{name: "reinit usage", entry: reinit, want: errPskType},
 	} {
-		if secret, err := PskSecret(crypto, bad); err != nil && secret != nil {
-			t.Errorf("%s: PskSecret returned %d bytes alongside %v", name, len(secret), err)
+		for position := 0; position <= len(good); position++ {
+			list := make([]PreSharedKeyInput, 0, len(good)+1)
+			list = append(list, good[:position]...)
+			list = append(list, invalid.entry)
+			list = append(list, good[position:]...)
+
+			secret, err := PskSecret(crypto, list)
+			if !errors.Is(err, invalid.want) {
+				t.Errorf("%s at position %d of %d: err = %v, want %v",
+					invalid.name, position, len(list), err, invalid.want)
+			}
+			// and the refusal is a refusal: nothing comes back beside the error for a caller
+			// that ignored it to mix into an epoch.
+			if secret != nil {
+				t.Errorf("%s at position %d of %d: %d bytes came back beside %v",
+					invalid.name, position, len(list), len(secret), err)
+			}
+			// and it names the entry it refused. A body that read the head every turn and
+			// reported the index of the turn would answer the right sentinel about the wrong
+			// psk, and the operator chasing the refusal would be looking at a valid one.
+			if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("psk %d:", position)) {
+				t.Errorf("%s at position %d of %d was refused with %q, which does not name the entry that was refused",
+					invalid.name, position, len(list), err)
+			}
 		}
+	}
+
+	// ValSem403 at every PAIR of positions rather than at the adjacent first two. The
+	// duplicate check is a sweep of its own, and a body comparing only neighbours -- or only
+	// against the head -- takes a list whose repeat is at the far end.
+	const width = 3
+	pairs := 0
+	for first := 0; first < width; first++ {
+		for second := first + 1; second < width; second++ {
+			list := make([]PreSharedKeyInput, width)
+			for at := range list {
+				if at == first || at == second {
+					list[at] = base
+				} else {
+					list[at] = good[1]
+				}
+			}
+			pairs++
+
+			secret, err := PskSecret(crypto, list)
+			if !errors.Is(err, errDuplicatePsk) {
+				t.Errorf("one id at positions %d and %d of %d: err = %v, want errDuplicatePsk",
+					first, second, width, err)
+			}
+			if secret != nil {
+				t.Errorf("one id at positions %d and %d of %d: %d bytes came back beside %v",
+					first, second, width, len(secret), err)
+			}
+			if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("entries %d and %d", first, second)) {
+				t.Errorf("one id at positions %d and %d of %d was refused with %q, which does not name the pair that repeated",
+					first, second, width, err)
+			}
+		}
+	}
+	if pairs != width*(width-1)/2 {
+		t.Errorf("%d pairs of positions were swept over a list of %d, want %d", pairs, width, width*(width-1)/2)
 	}
 }
 
