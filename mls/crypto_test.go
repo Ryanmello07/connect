@@ -2871,6 +2871,9 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 	pskSecret := bytes.Repeat([]byte{0x73}, params.Nh)
 	joinerSecret := bytes.Repeat([]byte{0x74}, params.Nh)
 	epochSecret := bytes.Repeat([]byte{0x75}, params.Nh)
+	// and the welcome secret, at KDF.Nh and distinct from all five above for the same
+	// reason
+	welcomeSecret := bytes.Repeat([]byte{0x76}, params.Nh)
 	// a second provider over a constant reader, for the one construction here that
 	// encapsulates. EncryptWithLabel draws its ephemeral key through the provider it is
 	// handed, so over a fixed stream it answers the same twice and the determinism half of
@@ -3087,6 +3090,19 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 				t.Fatalf("NewKeyScheduleFromEpochSecret: %v", scheduleErr)
 			}
 			return [][]byte{schedule.Secrets().InitSecret, schedule.GroupContextBytes()}
+		}},
+		// the welcome key and nonce. What it is handed is welcome_secret read straight off a
+		// live epoch -- (*KeySchedule).WelcomeSecret() answers the schedule's own storage --
+		// so a body that wrote into that array would erase a secret the epoch still holds,
+		// and one that answered a view over it would hand the caller an aead key that goes
+		// to zeros the moment the epoch ages out. Both answers are read: the key and the
+		// nonce are cut from one secret, so a defect in either is a defect in the pair.
+		{name: "WelcomeKeyNonce", call: func(take func([]byte) []byte) [][]byte {
+			key, nonce, welcomeErr := WelcomeKeyNonce(crypto, take(welcomeSecret))
+			if welcomeErr != nil {
+				t.Fatalf("WelcomeKeyNonce: %v", welcomeErr)
+			}
+			return [][]byte{key, nonce}
 		}},
 	} {
 		covered = append(covered, testCase.name)
@@ -3484,6 +3500,7 @@ var providerConstructionValues = map[string]any{
 	"NewKeyScheduleFromJoiner":      NewKeyScheduleFromJoiner,
 	"NewKeyScheduleFromEpochSecret": NewKeyScheduleFromEpochSecret,
 	"newKeyScheduleFromParts":       newKeyScheduleFromParts,
+	"WelcomeKeyNonce":               WelcomeKeyNonce,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a

@@ -1337,6 +1337,22 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				bytes.Repeat([]byte{0x79}, 32), bytes.Repeat([]byte{0x7a}, 32),
 				bytes.Repeat([]byte{0x7b}, 32)).Secrets().InitSecret
 		}},
+		// the welcome key and nonce, which reach the provider three times: once for the
+		// length it refuses a wrong secret against and once for each labelled expansion.
+		// None of that is visible in the answer either -- a key and a nonce computed with a
+		// provider of its own are Nk and Nn well formed bytes that agree with every corpus
+		// in this package, because the corpora are all the suite it would have hardcoded.
+		// Both halves are read rather than the key alone: a body that routed the key
+		// through the provider it was handed and the nonce through one of its own is a
+		// nonce every group in the world derives identically, and one answer would not see
+		// it.
+		{name: "WelcomeKeyNonce", call: func(crypto CryptoProvider) []byte {
+			key, nonce, welcomeErr := WelcomeKeyNonce(crypto, bytes.Repeat([]byte{0x7d}, crypto.HashSize()))
+			if welcomeErr != nil {
+				t.Fatalf("WelcomeKeyNonce: %v", welcomeErr)
+			}
+			return slices.Concat(key, nonce)
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		tagging := &taggingCryptoProvider{inner: plain}

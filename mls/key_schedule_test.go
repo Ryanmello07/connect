@@ -3468,6 +3468,21 @@ func TestNewKeyScheduleFromEpochSecretHasNoJoinerOrWelcomeSecret(t *testing.T) {
 		if schedule.WelcomeSecret() != nil {
 			t.Errorf("%s: WelcomeSecret = %x, want nil on the creation path", at, schedule.WelcomeSecret())
 		}
+		// and the consequence the nil is FOR, which is what makes the two assertions above
+		// about a Welcome rather than about a struct field. Task 6a could not assert this
+		// because WelcomeKeyNonce did not exist yet; it does now. A creation path that
+		// answered KDF.Nh zero bytes instead of nil would satisfy this construction's length
+		// check and seal encrypted_group_info under an expansion of a run of zeros -- a key
+		// every party can recompute -- and nothing would report an error.
+		welcomeKey, welcomeNonce, welcomeErr := WelcomeKeyNonce(crypto, schedule.WelcomeSecret())
+		if !errors.Is(welcomeErr, ErrSecretLength) {
+			t.Errorf("%s: WelcomeKeyNonce over the creation path's welcome secret answered err = %v, want %v",
+				at, welcomeErr, ErrSecretLength)
+		}
+		if welcomeKey != nil || welcomeNonce != nil {
+			t.Errorf("%s: the creation path derived a %d byte welcome key and a %d byte welcome nonce out of a welcome secret it does not have",
+				at, len(welcomeKey), len(welcomeNonce))
+		}
 		// and the nine are there, so the nils above are the two that are undefined rather
 		// than a schedule that derived nothing at all
 		for _, name := range slices.Sorted(maps.Keys(epochSecretsByField(t, schedule.Secrets()))) {
@@ -3571,6 +3586,14 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 	// not make an X25519 public key wider. Its other answer is the ciphertext, which is
 	// the plaintext plus the aead tag and is not a kdf length either.
 	"EncryptWithLabel": "answers a KEM output at Nenc and a ciphertext at Nt, neither of which is KDF.Nh; Nenc coincides with Nh at 32 under the narrow suite",
+	// its two answers are the aead key at Nk and the aead nonce at Nn. Nk is 32 under the
+	// narrow suite and KDF.Nh is 32 there too, so the equality is that suite's coincidence
+	// rather than anything this construction did -- and a kdf getting wider does not widen
+	// a ChaCha20-Poly1305 key, which is why the wide provider deliberately leaves KeySize
+	// and NonceSize alone. What holds these two lengths to the provider instead is
+	// TestWelcomeKeyNonceReadsBothLengthsOffTheProviderItWasHanded, whose provider moves Nk
+	// and Nn rather than Nh.
+	"WelcomeKeyNonce": "answers an aead key at Nk and an aead nonce at Nn, neither of which is KDF.Nh; Nk coincides with Nh at 32 under the narrow suite",
 }
 
 // scheduleAnswersThatAreNotKdfLengths names one ANSWER of an exported method of *KeySchedule
@@ -3801,6 +3824,18 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 				bytes.Repeat([]byte{0x79}, nh), bytes.Repeat([]byte{0x7a}, nh),
 				bytes.Repeat([]byte{0x7b}, nh))
 			return scheduleAnswers(t, "newKeyScheduleFromParts", schedule, nil)
+		}},
+		// the welcome key and nonce. The secret it is handed is KDF.Nh bytes off the
+		// provider under test rather than 32 written down, so this row also exercises the
+		// refusal: a body that compared against a literal 32 refuses the wide provider's
+		// secret outright and is reported as a panic rather than as a length.
+		{name: "WelcomeKeyNonce", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			key, nonce, welcomeErr := WelcomeKeyNonce(crypto,
+				bytes.Repeat([]byte{0x7d}, crypto.HashSize()))
+			if welcomeErr != nil {
+				t.Fatalf("WelcomeKeyNonce over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), welcomeErr)
+			}
+			return [][]byte{key, nonce}
 		}},
 	} {
 		covered = append(covered, testCase.name)
@@ -6857,6 +6892,590 @@ func TestEveryTagVerifierAnswersOverTheBytesItWasGivenUntouched(t *testing.T) {
 		if !slices.Equal(use.answered, use.declared) {
 			t.Errorf("%s answers MacVerify over %v and was handed %v; the comparison decides the answer only if what it compares is what the caller gave it, unaltered and in that order",
 				verifier.name, use.answered, use.declared)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: welcome_key and welcome_nonce.
+//
+// The hazard here is nonce reuse and it does not look like a bug. A key and a nonce derived
+// together out of one secret are two byte slices that both look like random, and every cheap
+// assertion passes for a wrong pair: the lengths are right, the values are non zero, the
+// derivation is deterministic, the round trip round trips. This project has already shipped a
+// nonce defect that passed 69 tests, because nothing observed the property the names claimed.
+//
+// One shape is deliberately NOT asserted below, and it is worth writing down because it is the
+// obvious one. "The nonce is not the key's first Nn bytes" reads like the collision check this
+// pair needs and is a comparison no implementation can fail: ExpandWithLabel binds the requested
+// LENGTH into its own preimage, so a body that expanded both halves under ONE label answers a
+// nonce that is not the key's prefix either, and two unrelated 12 byte pseudorandom values
+// collide at 2^-96. What stands in its place is the published Welcome the pair has to open and
+// the hand written expansion, which can tell one label from another.
+// ---------------------------------------------------------------------------
+
+// ksWelcomeVector is one entry of the mlswg welcome.json corpus.
+//
+// init_priv is the field labelKatWelcome does not carry and the one this section needs: it
+// opens the EncryptedGroupSecrets the Welcome is addressed to, and joiner_secret is inside it.
+type ksWelcomeVector struct {
+	CipherSuite uint16 `json:"cipher_suite"`
+	InitPriv    string `json:"init_priv"`
+	KeyPackage  string `json:"key_package"`
+	SignerPub   string `json:"signer_pub"`
+	Welcome     string `json:"welcome"`
+}
+
+// ksWelcomeGroupSecrets is one EncryptedGroupSecrets of a published Welcome, decoded:
+//
+//	struct { KeyPackageRef new_member; HPKECiphertext encrypted_group_secrets; }
+//	struct { opaque kem_output<V>; opaque ciphertext<V>; } HPKECiphertext
+type ksWelcomeGroupSecrets struct {
+	newMember  []byte
+	kemOutput  []byte
+	ciphertext []byte
+}
+
+// ksWelcomeWireFormat is mls_welcome, RFC 9420 section 6.1.
+const ksWelcomeWireFormat = uint16(0x0003)
+
+// ksWelcomeKatVectors is how many published Welcomes this package's registered suites account
+// for. Asserted rather than assumed, for the reason keyScheduleKatEpochs is: a filter that
+// stopped matching turns the sweep below into a loop that runs zero times and reports the clean
+// run a complete sweep reports.
+const ksWelcomeKatVectors = 2
+
+// ksWelcomeMessage decodes a published Welcome far enough to reach the two things this section
+// needs: the group secrets addressed to each new member, and the encrypted_group_info that
+// welcome_key and welcome_nonce protect.
+//
+//	MLSMessage = version | wire_format | Welcome
+//	Welcome    = cipher_suite | EncryptedGroupSecrets secrets<V> | opaque encrypted_group_info<V>
+//
+// Decoded by hand rather than through a Welcome type, because p7 owns that type and this task
+// must not grow one. Every field goes through the syntax reader and the whole message is
+// required to be consumed, so a mis-slicing is reported here rather than surfacing as an aead
+// failure that would read as a defect in the derivation under test. The version, the wire format
+// and the cipher suite are all checked for the same reason.
+func ksWelcomeMessage(t *testing.T, at string, suite CipherSuite, encoded []byte) ([]ksWelcomeGroupSecrets, []byte) {
+	t.Helper()
+	reader := syntax.NewReader(encoded)
+	version, err := reader.ReadUint16()
+	if err != nil {
+		t.Fatalf("%s: read the protocol version of the published welcome: %v", at, err)
+	}
+	if ProtocolVersion(version) != ProtocolVersionMls10 {
+		t.Fatalf("%s: the published welcome opens at version %#04x, want mls10", at, version)
+	}
+	wireFormat, err := reader.ReadUint16()
+	if err != nil {
+		t.Fatalf("%s: read the wire format of the published welcome: %v", at, err)
+	}
+	if wireFormat != ksWelcomeWireFormat {
+		t.Fatalf("%s: the published message is wire format %#04x, want mls_welcome %#04x",
+			at, wireFormat, ksWelcomeWireFormat)
+	}
+	onTheWire, err := reader.ReadUint16()
+	if err != nil {
+		t.Fatalf("%s: read the welcome's cipher suite: %v", at, err)
+	}
+	if CipherSuite(onTheWire) != suite {
+		t.Fatalf("%s: the published welcome names suite %#04x, so this row is decoding a message for another suite",
+			at, onTheWire)
+	}
+	secrets, err := syntax.ReadVector(reader, func(r *syntax.Reader) (ksWelcomeGroupSecrets, error) {
+		one := ksWelcomeGroupSecrets{}
+		var readErr error
+		if one.newMember, readErr = r.ReadOpaque(); readErr != nil {
+			return one, readErr
+		}
+		if one.kemOutput, readErr = r.ReadOpaque(); readErr != nil {
+			return one, readErr
+		}
+		one.ciphertext, readErr = r.ReadOpaque()
+		return one, readErr
+	})
+	if err != nil {
+		t.Fatalf("%s: read the encrypted group secrets: %v", at, err)
+	}
+	if len(secrets) == 0 {
+		t.Fatalf("%s: the published welcome carries no encrypted group secrets", at)
+	}
+	encryptedGroupInfo, err := reader.ReadOpaque()
+	if err != nil {
+		t.Fatalf("%s: read encrypted_group_info: %v", at, err)
+	}
+	if err := reader.Done(); err != nil {
+		t.Fatalf("%s: the published welcome has bytes left after encrypted_group_info: %v", at, err)
+	}
+	return secrets, encryptedGroupInfo
+}
+
+// ksWelcomeGroupSecretsJoiner reads joiner_secret out of a decrypted GroupSecrets, and reports
+// how many bytes its psks vector carries:
+//
+//	struct { opaque joiner_secret<V>; optional<PathSecret> path_secret; PreSharedKeyID psks<V>; }
+//
+// The psks vector is MEASURED rather than decoded. PreSharedKeyID is a discriminated union this
+// plan's task 13 owns and this section must not grow one either; all the caller needs to know is
+// whether the epoch's psk_secret is the zero secret, and a vector with bytes in it is reported
+// rather than assumed empty.
+func ksWelcomeGroupSecretsJoiner(t *testing.T, at string, groupSecrets []byte) ([]byte, int) {
+	t.Helper()
+	reader := syntax.NewReader(groupSecrets)
+	joinerSecret, err := reader.ReadOpaque()
+	if err != nil {
+		t.Fatalf("%s: read joiner_secret out of the decrypted group secrets: %v", at, err)
+	}
+	if _, err := reader.ReadOptional(func(r *syntax.Reader) error {
+		_, pathErr := r.ReadOpaque()
+		return pathErr
+	}); err != nil {
+		t.Fatalf("%s: read the optional path_secret: %v", at, err)
+	}
+	psks, err := reader.ReadSub()
+	if err != nil {
+		t.Fatalf("%s: read the psks vector: %v", at, err)
+	}
+	if err := reader.Done(); err != nil {
+		t.Fatalf("%s: the group secrets have bytes left after the psks vector: %v", at, err)
+	}
+	return joinerSecret, psks.Remaining()
+}
+
+// ksFlippedFirstByte is one bit out, in storage of its own so the caller's slice is unmoved.
+//
+// An empty argument answers one byte rather than indexing into nothing. It is reached from a
+// negative control over a key and a nonce a DEFECTIVE derivation produced, so "the derivation
+// answered nothing" is one of the inputs it has to survive: a panic here would take the test
+// binary down and every gate declared after it would report nothing at all.
+func ksFlippedFirstByte(value []byte) []byte {
+	if len(value) == 0 {
+		return []byte{0x01}
+	}
+	wrong := bytes.Clone(value)
+	wrong[0] ^= 0x01
+	return wrong
+}
+
+// TestWelcomeKeyNonceOpensThePublishedWelcomes is the known answer this task rests on.
+//
+// Every other assertion in this section compares the derivation with itself or with this file's
+// own reference. This one does not: the pair is used to open an encrypted_group_info that
+// mlswg's generator sealed, and an aead tag verifies only if the key and the nonce are exactly
+// the bytes that generator derived. A label misspelled, the two labels swapped, either label
+// used for both halves, either length wrong by one, the nonce truncated, the key and the nonce
+// cut from one expansion -- every one of those moves the key or the nonce, and every one of them
+// fails the tag. Nothing this package could compute for itself can say that.
+//
+// The walk down to welcome_secret is this file's HAND WRITTEN reference rather than the key
+// schedule, so a failure here names WelcomeKeyNonce rather than the twelve derivations in front
+// of it: joiner_secret is decrypted out of the published Welcome with the published init_priv,
+// and member_secret and welcome_secret are the two hand written steps that
+// TestTheHandWrittenSectionEightDerivationReproducesThePublishedEpochs already anchors on the
+// corpus.
+func TestWelcomeKeyNonceOpensThePublishedWelcomes(t *testing.T) {
+	vectors := []ksWelcomeVector{}
+	loadLabelKat(t, "welcome.json", &vectors)
+	opened := 0
+	for _, vector := range vectors {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		at := fmt.Sprintf("suite %#04x", uint16(suite))
+		crypto := mustProvider(t, suite)
+		secrets, encryptedGroupInfo := ksWelcomeMessage(
+			t, at, suite, mustDecodeHex(t, "the published welcome "+at, vector.Welcome))
+
+		// the entry this Welcome is addressed to, found by the reference of the published key
+		// package rather than by taking the first. A Welcome to two joiners carries two, and
+		// opening the wrong one with this init key fails in a way that would read as a defect
+		// in the derivation under test.
+		message := mustDecodeHex(t, "the published key package "+at, vector.KeyPackage)
+		if !bytes.HasPrefix(message, mlsMessageKeyPackageHeader) {
+			t.Fatalf("%s: the published key package is not headed with the mls10 key package header %x",
+				at, mlsMessageKeyPackageHeader)
+		}
+		reference := MakeKeyPackageRef(crypto, message[len(mlsMessageKeyPackageHeader):])
+		addressed := -1
+		for i, one := range secrets {
+			if bytes.Equal(one.newMember, reference) {
+				addressed = i
+			}
+		}
+		if addressed < 0 {
+			t.Fatalf("%s: none of the %d encrypted group secrets is addressed to the published key package",
+				at, len(secrets))
+		}
+
+		// EncryptWithLabel(init_key, "Welcome", encrypted_group_info, GroupSecrets), RFC 9420
+		// section 12.4.3.1: the context is the ciphertext this test is about to open, which is
+		// what binds the two halves of a Welcome together.
+		groupSecrets, err := DecryptWithLabel(crypto,
+			HpkePrivateKey(mustDecodeHex(t, "init_priv "+at, vector.InitPriv)),
+			"Welcome", encryptedGroupInfo, secrets[addressed].kemOutput, secrets[addressed].ciphertext)
+		if err != nil {
+			t.Fatalf("%s: open the encrypted group secrets with the published init_priv: %v", at, err)
+		}
+		joinerSecret, pskBytes := ksWelcomeGroupSecretsJoiner(t, at, groupSecrets)
+		if pskBytes != 0 {
+			t.Fatalf("%s: the published welcome carries a %d byte psks vector, so psk_secret is not the zero secret and this row cannot reach welcome_secret",
+				at, pskBytes)
+		}
+		if len(joinerSecret) != crypto.HashSize() {
+			t.Fatalf("%s: the decrypted joiner_secret is %d bytes, want KDF.Nh = %d",
+				at, len(joinerSecret), crypto.HashSize())
+		}
+
+		// the two hand written steps. psk_secret is KDF.Nh zero bytes because the Welcome names
+		// no psks, which the measurement above is what establishes.
+		memberSecret := ksHandExtract(joinerSecret, make([]byte, sha256.Size))
+		welcomeSecret := ksHandDeriveSecret(t, memberSecret, "welcome")
+		key, nonce, err := WelcomeKeyNonce(crypto, welcomeSecret)
+		if err != nil {
+			t.Fatalf("%s: WelcomeKeyNonce over the welcome secret of a published welcome: %v", at, err)
+		}
+		groupInfo, err := crypto.AeadOpen(key, nonce, nil, encryptedGroupInfo)
+		if err != nil {
+			t.Fatalf("%s: the published encrypted_group_info does not open under the derived welcome key and nonce: %v",
+				at, err)
+		}
+
+		// and what came out is a GroupInfo rather than a nil error taken on trust: its first
+		// field is the GroupContext, whose version and cipher suite are both fixed and neither
+		// of which this test supplied to the decoder
+		context := &GroupContext{}
+		if err := context.UnmarshalMLS(syntax.NewReader(groupInfo)); err != nil {
+			t.Errorf("%s: the opened group info does not begin with a group context: %v", at, err)
+		} else if context.Version != ProtocolVersionMls10 || context.CipherSuite != suite {
+			t.Errorf("%s: the opened group info carries version %#04x and suite %#04x",
+				at, uint16(context.Version), uint16(context.CipherSuite))
+		}
+
+		// the control on the comparison itself. What decides this row is the aead tag, so a key
+		// or a nonce one bit out has to be refused; without this, the open above is satisfied by
+		// an aead that ignored both of them.
+		for _, wrong := range []struct {
+			what  string
+			key   []byte
+			nonce []byte
+		}{
+			{what: "a welcome key one bit out", key: ksFlippedFirstByte(key), nonce: nonce},
+			{what: "a welcome nonce one bit out", key: key, nonce: ksFlippedFirstByte(nonce)},
+		} {
+			if _, err := crypto.AeadOpen(wrong.key, wrong.nonce, nil, encryptedGroupInfo); err == nil {
+				t.Errorf("%s: the published encrypted_group_info opened under %s, so the open above pins nothing",
+					at, wrong.what)
+			}
+		}
+		opened++
+	}
+	if opened != ksWelcomeKatVectors {
+		t.Fatalf("opened %d published welcomes, want %d", opened, ksWelcomeKatVectors)
+	}
+}
+
+// ksWelcomeKatComparisons is two answers -- the key and the nonce -- for every epoch of the
+// published key schedule corpus.
+const ksWelcomeKatComparisons = 2 * keyScheduleKatEpochs
+
+// TestWelcomeKeyNonceReproducesTheHandWrittenExpansion is the differential, over every
+// welcome_secret mlswg published rather than over one this test invented.
+//
+// The reference shares nothing with the implementation: it spells the "MLS 1.0 " prefix itself,
+// writes its own length prefixes and expands with hmac directly, so it can be wrong in a
+// different way. What it separates that a self comparison cannot: the two LABELS, since a body
+// that expanded both halves under one of them agrees with itself perfectly; and Nk, since the
+// two registered suites disagree there -- 16 for the aes suite, 32 for the chacha one -- so a
+// written down 32 is a key twice the length the aes suite fixes.
+//
+// What it cannot separate is Nn, because both suites fix it at 12. That is what
+// TestWelcomeKeyNonceReadsBothLengthsOffTheProviderItWasHanded is for.
+func TestWelcomeKeyNonceReproducesTheHandWrittenExpansion(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		params, err := LookupSuite(epoch.suite)
+		if err != nil {
+			t.Fatalf("%s: look up the suite the lengths are read from: %v", epoch.at, err)
+		}
+		welcomeSecret := mustDecodeHex(t, "welcome_secret"+epoch.at, epoch.published.WelcomeSecret)
+		// the reference can tell one label from another, at one length so the length is not
+		// what separates them. A reference that answered the same under both would agree with
+		// an implementation that expanded both halves under one label while looking like an
+		// independent opinion.
+		if bytes.Equal(ksHandExpandWithLabel(t, welcomeSecret, "key", nil, params.Nn),
+			ksHandExpandWithLabel(t, welcomeSecret, "nonce", nil, params.Nn)) {
+			t.Fatalf("%s: the hand written expansion answers the same under key and under nonce, so it cannot see the two labels collapsed into one",
+				epoch.at)
+		}
+		wantKey := ksHandExpandWithLabel(t, welcomeSecret, "key", nil, params.Nk)
+		wantNonce := ksHandExpandWithLabel(t, welcomeSecret, "nonce", nil, params.Nn)
+		key, nonce, err := WelcomeKeyNonce(epoch.crypto, welcomeSecret)
+		if err != nil {
+			t.Fatalf("%s: WelcomeKeyNonce over the published welcome_secret: %v", epoch.at, err)
+		}
+		if !bytes.Equal(key, wantKey) {
+			t.Errorf("%s: welcome_key = %x, want %x", epoch.at, key, wantKey)
+		}
+		if !bytes.Equal(nonce, wantNonce) {
+			t.Errorf("%s: welcome_nonce = %x, want %x", epoch.at, nonce, wantNonce)
+		}
+		compared += 2
+	}
+	if compared != ksWelcomeKatComparisons {
+		t.Fatalf("compared %d hand written answers, want %d", compared, ksWelcomeKatComparisons)
+	}
+}
+
+// ksWelcomeSyntheticParams is a suite whose Nk and Nn are numbers no registered suite has.
+//
+// Both registered suites fix Nn at 12, and one of them fixes Nk at 32 -- which is also KDF.Nh and
+// also the literal a body would have written down. So inside this registry a written down 12 and
+// a read of NonceSize() are the same number, and nothing already in this tree separates them.
+// Measured, not supposed: with crypto.NonceSize() replaced by 12 in WelcomeKeyNonce, every other
+// test of this package passed. This is the input that separates them, and it is the same device
+// labelKatSyntheticParams is, one field over.
+//
+// Nh is moved as well so the same provider also separates a written down 32 in the length check.
+// The kdf underneath is still sha256, which is incoherent with an Nh of 48 -- that is deliberate
+// and harmless here, because what this provider is asked for is LENGTHS and never a value
+// compared against a published one.
+var ksWelcomeSyntheticParams = SuiteParams{
+	Suite:       CipherSuite(0xfffd),
+	Name:        "synthetic_nk20_nn7",
+	KemId:       HpkeKemX25519HkdfSha256,
+	KdfId:       HpkeKdfHkdfSha256,
+	AeadId:      HpkeAeadChaCha20Poly1305,
+	SignatureId: SignatureSchemeEd25519,
+	Nh:          48,
+	Nk:          20,
+	Nn:          7,
+	Nt:          16,
+	Nsecret:     17,
+	Nenc:        18,
+	Npk:         19,
+	Nsk:         21,
+	NsigPub:     22,
+	NsigPriv:    23,
+}
+
+// TestWelcomeKeyNonceReadsBothLengthsOffTheProviderItWasHanded is the differential the registry
+// cannot supply, for the two lengths this construction reads and for the one it refuses against.
+func TestWelcomeKeyNonceReadsBothLengthsOffTheProviderItWasHanded(t *testing.T) {
+	crypto := &suiteCryptoProvider{params: &ksWelcomeSyntheticParams, random: constantReader{value: 0x40}}
+	// the substitutions this provider has to be able to see. A length here that coincided with
+	// Nk or Nn would leave every assertion below satisfied by the very literal it exists to
+	// catch, which is how a differential goes quiet without failing.
+	for _, other := range []struct {
+		name  string
+		value int
+	}{
+		{name: "this suite's Nh", value: ksWelcomeSyntheticParams.Nh},
+		{name: "this suite's Nt", value: ksWelcomeSyntheticParams.Nt},
+		{name: "the aes suite's Nk", value: 16},
+		{name: "the chacha suite's Nk", value: 32},
+		{name: "the registry's Nn", value: 12},
+		{name: "the registry's KDF.Nh", value: sha256.Size},
+	} {
+		if other.value == ksWelcomeSyntheticParams.Nk {
+			t.Errorf("%s is %d, the same as this suite's Nk, so a body writing it down would pass here",
+				other.name, other.value)
+		}
+		if other.value == ksWelcomeSyntheticParams.Nn {
+			t.Errorf("%s is %d, the same as this suite's Nn, so a body writing it down would pass here",
+				other.name, other.value)
+		}
+	}
+	if ksWelcomeSyntheticParams.Nk == ksWelcomeSyntheticParams.Nn {
+		t.Fatalf("this suite's Nk and Nn are both %d, so the two assertions below are one",
+			ksWelcomeSyntheticParams.Nk)
+	}
+
+	secret := bytes.Repeat([]byte{0x5b}, ksWelcomeSyntheticParams.Nh)
+	key, nonce, err := WelcomeKeyNonce(crypto, secret)
+	if err != nil {
+		t.Fatalf("WelcomeKeyNonce over a suite whose KDF.Nh is %d: %v", ksWelcomeSyntheticParams.Nh, err)
+	}
+	if len(key) != ksWelcomeSyntheticParams.Nk {
+		t.Errorf("welcome_key is %d bytes for a suite whose Nk is %d",
+			len(key), ksWelcomeSyntheticParams.Nk)
+	}
+	if len(nonce) != ksWelcomeSyntheticParams.Nn {
+		t.Errorf("welcome_nonce is %d bytes for a suite whose Nn is %d",
+			len(nonce), ksWelcomeSyntheticParams.Nn)
+	}
+
+	// the third length: the secret is measured against the provider's KDF.Nh and not against 32
+	if _, _, err := WelcomeKeyNonce(crypto, bytes.Repeat([]byte{0x5b}, sha256.Size)); !errors.Is(err, ErrSecretLength) {
+		t.Errorf("a %d byte secret was accepted by a suite whose KDF.Nh is %d: err = %v",
+			sha256.Size, ksWelcomeSyntheticParams.Nh, err)
+	}
+
+	// and the same defect one level down, which the two length assertions above cannot see: a
+	// body that asked the kdf for a written down length and TRUNCATED to the provider's answers
+	// Nk and Nn bytes either way. ExpandWithLabel binds the requested length into its own
+	// preimage, so the truncation is a different value and this is what separates them.
+	// each comparison is skipped when the answer is LONGER than the written down expansion it
+	// would have been cut from, because there is then nothing to cut and the length assertions
+	// above have already reported it. Indexing anyway would panic, and a panic in a test takes
+	// the whole binary down along with every gate declared after it -- which is the shape
+	// recoveringRow exists for elsewhere in this file.
+	if truncated := crypto.ExpandWithLabel(secret, "key", nil, 32); len(key) <= len(truncated) &&
+		bytes.Equal(key, truncated[:len(key)]) {
+		t.Errorf("welcome_key is the first %d bytes of a 32 byte expansion rather than an expansion of %d",
+			len(key), ksWelcomeSyntheticParams.Nk)
+	}
+	if truncated := crypto.ExpandWithLabel(secret, "nonce", nil, 12); len(nonce) <= len(truncated) &&
+		bytes.Equal(nonce, truncated[:len(nonce)]) {
+		t.Errorf("welcome_nonce is the first %d bytes of a 12 byte expansion rather than an expansion of %d",
+			len(nonce), ksWelcomeSyntheticParams.Nn)
+	}
+}
+
+// ksSharesStorage answers whether two byte slices overlap anywhere in their backing arrays.
+//
+// Written as a WRITE rather than as a pointer comparison, because the pointer comparison this
+// package can write without unsafe -- &first[0] == &second[0] -- sees only a shared FIRST byte,
+// and the shape that matters for a key and a nonce cut from one expansion is two windows that
+// overlap at an end. Complementing every byte of the first slice makes the observation exact: an
+// overlapping byte necessarily changes and a byte that is not overlapped necessarily does not,
+// whatever either of them held. The first slice is restored before returning.
+func ksSharesStorage(first []byte, second []byte) bool {
+	before := bytes.Clone(second)
+	for i := range first {
+		first[i] ^= 0xff
+	}
+	shared := !bytes.Equal(second, before)
+	for i := range first {
+		first[i] ^= 0xff
+	}
+	return shared
+}
+
+// TestWelcomeKeyNonceAnswersTwoArraysThatDoNotOverlap is the aliasing half.
+//
+// Deriving both halves from one expansion and slicing one backing array is the natural
+// implementation and is fine; handing the caller two HEADERS over those bytes is not. The
+// difference is invisible everywhere else -- the values are right, the lengths are right, the
+// corpus opens -- and it surfaces the first time a caller erases its welcome key, which zeroes
+// the nonce it is about to seal the next Welcome under.
+func TestWelcomeKeyNonceAnswersTwoArraysThatDoNotOverlap(t *testing.T) {
+	// the detector first, on a pair that really does overlap and on a pair that really does
+	// not. A detector that cannot fire reports two independent arrays exactly as it reports two
+	// views over one, which is the whole finding this test exists to make.
+	backing := bytes.Repeat([]byte{0x11}, 40)
+	if !ksSharesStorage(backing[:32], backing[28:40]) {
+		t.Fatal("the overlap detector reported two headers over one array as separate storage, so every row below passes for an implementation that aliases")
+	}
+	if ksSharesStorage(bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x11}, 12)) {
+		t.Fatal("the overlap detector reported two separate arrays as shared storage")
+	}
+	for _, one := range backing {
+		if one != 0x11 {
+			t.Fatal("the overlap detector did not restore the slice it wrote into")
+		}
+	}
+
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		at := fmt.Sprintf("suite %#04x", uint16(suite))
+		key, nonce, err := WelcomeKeyNonce(crypto, crypto.Random(crypto.HashSize()))
+		if err != nil {
+			t.Fatalf("%s: WelcomeKeyNonce: %v", at, err)
+		}
+		if len(key) == 0 || len(nonce) == 0 {
+			t.Fatalf("%s: welcome_key is %d bytes and welcome_nonce is %d, so this row observed nothing",
+				at, len(key), len(nonce))
+		}
+		if ksSharesStorage(key, nonce) {
+			t.Errorf("%s: welcome_key and welcome_nonce are two headers over one array; erasing the key erases the nonce",
+				at)
+		}
+	}
+}
+
+// TestWelcomeKeyNonceMovesBothHalvesWithTheSecret asserts a different welcome_secret gives a
+// different key AND a different nonce.
+//
+// Both, not either. A body whose nonce did not depend on the secret it was handed -- a package
+// level constant, an expansion of the label alone, a second read of a variable that never moved
+// -- answers a key that moves and a nonce that does not, and an assertion that reported "the pair
+// changed" would pass over it. That is one nonce for every group in the world, under a key that
+// is different per group, which is exactly the reuse this section exists for.
+//
+// One bit at a time rather than a fresh random secret, so a body that reads only part of the
+// secret is caught wherever the part it ignores happens to be.
+func TestWelcomeKeyNonceMovesBothHalvesWithTheSecret(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		at := fmt.Sprintf("suite %#04x", uint16(suite))
+		base := make([]byte, crypto.HashSize())
+		baseKey, baseNonce, err := WelcomeKeyNonce(crypto, base)
+		if err != nil {
+			t.Fatalf("%s: WelcomeKeyNonce over the all zero secret: %v", at, err)
+		}
+		moved := 0
+		for bit := 0; bit < 8*len(base); bit += 7 {
+			changed := bytes.Clone(base)
+			changed[bit/8] ^= 1 << (bit % 8)
+			key, nonce, err := WelcomeKeyNonce(crypto, changed)
+			if err != nil {
+				t.Fatalf("%s: WelcomeKeyNonce with bit %d of welcome_secret set: %v", at, bit, err)
+			}
+			if bytes.Equal(key, baseKey) {
+				t.Errorf("%s: welcome_key did not move when bit %d of welcome_secret did", at, bit)
+			}
+			if bytes.Equal(nonce, baseNonce) {
+				t.Errorf("%s: welcome_nonce did not move when bit %d of welcome_secret did", at, bit)
+			}
+			moved++
+		}
+		// a sweep whose inner loop stopped producing rows reports the clean run a full one
+		// reports
+		if moved == 0 {
+			t.Fatalf("%s: no bit of welcome_secret was moved, so this row compared nothing", at)
+		}
+	}
+}
+
+// TestWelcomeKeyNonceRefusesASecretThatIsNotKdfNh is the refusal the group creation path needs.
+//
+// HKDF-Expand takes a pseudorandom key of any length at or above the hash and answers a perfectly
+// well formed key and nonce, so nothing downstream of a short welcome_secret can see that it was
+// short. The caller this exists for is a group being created: WelcomeSecret() is nil there
+// because the group was never joined, and a nil stretched into a Welcome key seals
+// encrypted_group_info under an expansion every party can recompute, with err == nil.
+func TestWelcomeKeyNonceRefusesASecretThatIsNotKdfNh(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		at := fmt.Sprintf("suite %#04x", uint16(suite))
+		for _, length := range []int{0, 1, nh / 2, nh - 1, nh + 1, 2 * nh, 255} {
+			if length == nh {
+				t.Fatalf("%s: the refusal sweep includes KDF.Nh itself, which is the one length that must be accepted", at)
+			}
+			key, nonce, err := WelcomeKeyNonce(crypto, bytes.Repeat([]byte{0x2c}, length))
+			if !errors.Is(err, ErrSecretLength) {
+				t.Errorf("%s: a %d byte welcome secret answered err = %v, want %v", at, length, err, ErrSecretLength)
+			}
+			if key != nil || nonce != nil {
+				t.Errorf("%s: a %d byte welcome secret was refused and answered a %d byte key and a %d byte nonce alongside the refusal",
+					at, length, len(key), len(nonce))
+			}
+		}
+		// nil is the shape the creation path produces, and it is the one this refusal is for
+		key, nonce, err := WelcomeKeyNonce(crypto, nil)
+		if !errors.Is(err, ErrSecretLength) {
+			t.Errorf("%s: a nil welcome secret answered err = %v, want %v", at, err, ErrSecretLength)
+		}
+		if key != nil || nonce != nil {
+			t.Errorf("%s: a nil welcome secret answered a %d byte key and a %d byte nonce", at, len(key), len(nonce))
+		}
+		// and the control: KDF.Nh is accepted, so the sweep above is not satisfied by a body
+		// that refuses everything
+		if _, _, err := WelcomeKeyNonce(crypto, bytes.Repeat([]byte{0x2c}, nh)); err != nil {
+			t.Errorf("%s: a KDF.Nh welcome secret was refused with %v, so every refusal above is vacuous", at, err)
 		}
 	}
 }

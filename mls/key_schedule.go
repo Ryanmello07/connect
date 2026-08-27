@@ -564,3 +564,47 @@ func (self *KeySchedule) VerifyMembershipTag(authenticatedContentTbm []byte, tag
 	}
 	return self.crypto.MacVerify(self.secrets.Membership, authenticatedContentTbm, tag)
 }
+
+// WelcomeKeyNonce derives the AEAD key and nonce that protect a Welcome's
+// encrypted_group_info, RFC 9420 section 12.4.3.1:
+//
+//	welcome_key   = ExpandWithLabel(welcome_secret, "key", "", AEAD.Nk)
+//	welcome_nonce = ExpandWithLabel(welcome_secret, "nonce", "", AEAD.Nn)
+//
+// The pair is one aead key and one aead nonce for one sealing, and everything that sealing
+// promises rests on the pair being used once. Two properties carry that and neither is
+// visible in the bytes.
+//
+// They are expanded under DIFFERENT labels. What that is worth cannot be measured by
+// comparing the two answers: ExpandWithLabel binds the requested length into its own
+// preimage, so ExpandWithLabel(s, "key", "", 32) and ExpandWithLabel(s, "key", "", 12) are
+// already unrelated values — a body that expanded both halves under one label produces a
+// nonce that is not the key's first Nn bytes and passes every comparison the two answers
+// admit. Only a published answer separates the two labels, which is what the corpus tests
+// hold this to.
+//
+// And they are two separate expansions into two separate arrays. A body that answered two
+// headers over one backing array reads identically at every call site until the first one
+// that erases its key, and then the nonce it seals the next Welcome under is zeros.
+//
+// Both lengths are read off the provider rather than written down. The registered suites
+// disagree on Nk — 16 for AES-128-GCM, 32 for ChaCha20-Poly1305 — and agree on Nn at 12, so
+// within this registry a hardcoded 12 is indistinguishable from a read one; the input that
+// separates them is a provider whose Nn is neither, which is what
+// TestWelcomeKeyNonceReadsBothLengthsOffTheProviderItWasHanded supplies.
+//
+// A welcome_secret of the wrong length is refused rather than expanded, and the caller that
+// refusal exists for is the group creation path. HKDF-Expand takes a pseudorandom key of any
+// length at or above the hash and would answer a perfectly well formed key and nonce, and
+// (*KeySchedule).WelcomeSecret() is nil there because a group that was created was never
+// joined — so without this the creator would seal encrypted_group_info under an expansion of
+// nothing, which every party can recompute, and get err == nil for it.
+func WelcomeKeyNonce(crypto CryptoProvider, welcomeSecret []byte) (key []byte, nonce []byte, err error) {
+	nh := crypto.HashSize()
+	if len(welcomeSecret) != nh {
+		return nil, nil, fmt.Errorf("%w: welcome secret is %d bytes, want %d", ErrSecretLength, len(welcomeSecret), nh)
+	}
+	key = crypto.ExpandWithLabel(welcomeSecret, "key", nil, crypto.KeySize())
+	nonce = crypto.ExpandWithLabel(welcomeSecret, "nonce", nil, crypto.NonceSize())
+	return key, nonce, nil
+}
