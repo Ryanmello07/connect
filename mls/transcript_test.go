@@ -511,18 +511,23 @@ func trPublishedEntries(t *testing.T) []trPublishedEntry {
 // two, so a literal here is right for both registered suites and wrong for the first SHA-512
 // one.
 //
-// It is checked twice rather than assumed. publishedTagAtTheTail refuses a tail whose
-// preceding octet is not the varint length of what is being read, and the caller then
+// It is checked twice rather than assumed. splitTrailingOpaqueTag refuses a tail whose
+// preceding octets are not the varint length of what is being read, and the caller then
 // verifies the recovered tag as MAC(confirmation_key, confirmed_transcript_hash_after) --
 // the corpus's own stated verification step. A wrong split fails that MAC. When p6 lands
 // (*AuthenticatedContent).UnmarshalMLS this is replaced by the parse and the MAC check
 // stays.
+//
+// The split itself is in vectors_runner_test.go, shared with the family 7 runner that reads
+// this same file through the vector registry: two implementations of one offset is how the
+// two stop agreeing, and only one of them is checked by a MAC.
 func trSplitPublishedCommit(t *testing.T, at string, crypto CryptoProvider, blob []byte) (confirmedInput []byte, confirmationTag []byte) {
 	t.Helper()
-	nh := crypto.HashSize()
-	confirmationTag = publishedTagAtTheTail(t, at+" authenticated_content", blob, nh)
-	prefix := publishedVectorPrefix(t, at+" authenticated_content", nh)
-	return blob[:len(blob)-nh-len(prefix)], confirmationTag
+	confirmedInput, confirmationTag, err := splitTrailingOpaqueTag(blob, crypto.HashSize())
+	if err != nil {
+		t.Fatalf("%s authenticated_content: %v", at, err)
+	}
+	return confirmedInput, confirmationTag
 }
 
 // TestTranscriptHashesMatchTheMlswgTranscriptHashes is the known answer test for both

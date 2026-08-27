@@ -364,31 +364,18 @@ func comparePskSecretVector(t *testing.T, raw json.RawMessage) (pskSecretCompari
 
 // TestVectorPskSecret is vector family 6 over the published corpus.
 //
-// Every assertion after the loop exists because the loop can be made to run zero times
-// without anything else in this package noticing. A filter that matched nothing, a filter
-// that matched all seven published suites, a corpus that parsed to an empty array, a
-// comparator that declined every case: each of those is a green run of this test with the
-// assertions removed, and a failure with them.
+// Every assertion vectorRunTally makes after the loop exists because the loop can be made to
+// run zero times without anything else in this package noticing. A filter that matched
+// nothing, a filter that matched all seven published suites, a corpus that parsed to an empty
+// array, a comparator that declined every case: each of those is a green run of this test
+// with the accounting removed, and a failure with it.
 //
 // What the loop counts is the part that had to be rewritten. It does not count calls that
 // returned; it counts cases whose returned evidence the runner itself checked against the
-// corpus text it decoded, so a comparator that answered without computing anything is a
-// failure here rather than a number that looks right.
+// corpus text it decoded itself, so a comparator that answered without computing anything is
+// a failure here rather than a number that looks right.
 func TestVectorPskSecret(t *testing.T) {
-	entries := LoadVectorFile(t, pskSecretKatFile)
-	if len(entries) == 0 {
-		t.Fatalf("%s parsed to no entries, so every comparison below would be against nothing", pskSecretKatFile)
-	}
-
-	compared, skipped := 0, 0
-	matched := map[CipherSuite]int{}
-	// published counts every entry by its ciphersuite, in scope or not. The per suite
-	// split below is derived from it rather than written here: the corpus is a grid of
-	// one list length series per published suite, so what each registered suite owes is
-	// what the corpus holds for it, and a run that compared all 22 at one suite fails
-	// against that without anyone having to transcribe eleven.
-	published := map[uint16]int{}
-	answers := map[string]int{}
+	tally, entries := newVectorRunTally(t, pskSecretKatFile)
 	for index, raw := range entries {
 		header := struct {
 			CipherSuite uint16 `json:"cipher_suite"`
@@ -397,20 +384,15 @@ func TestVectorPskSecret(t *testing.T) {
 		if err := json.Unmarshal(raw, &header); err != nil {
 			t.Fatalf("vector %d: %v", index, err)
 		}
-		published[header.CipherSuite]++
-		suite, ok := implementedSuite(header.CipherSuite)
-		if !ok {
-			skipped++
+		suite, inScope := tally.filter(header.CipherSuite)
+		if !inScope {
 			continue
 		}
 		evidence, err := comparePskSecretVector(t, raw)
 		if err != nil {
 			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
 		}
-		if !evidence.inScope {
-			t.Fatalf("vector %d is at suite %#04x, which this package registers, and the comparator declined it",
-				index, header.CipherSuite)
-		}
+		tally.requireCompared(t, index, suite, evidence.inScope)
 		if err := evidence.verdict(); err != nil {
 			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
 		}
@@ -420,52 +402,24 @@ func TestVectorPskSecret(t *testing.T) {
 			t.Fatalf("vector %d (suite %#04x, %d psks): this package computes %s, the corpus publishes %s",
 				index, header.CipherSuite, evidence.psks, got, header.PskSecret)
 		}
-		compared++
-		matched[suite]++
-		answers[header.PskSecret]++
+		tally.answer(header.PskSecret)
 	}
 
-	if compared+skipped != len(entries) {
-		t.Fatalf("%d compared and %d skipped over %d entries; an entry took neither branch",
-			compared, skipped, len(entries))
-	}
-	if compared != pskSecretKatComparisons {
-		t.Fatalf("compared %d published psk_secrets, want %d; the filter matched %v",
-			compared, pskSecretKatComparisons, matched)
-	}
-	if skipped != pskSecretKatSkipped {
-		t.Fatalf("skipped %d entries at unimplemented suites, want %d", skipped, pskSecretKatSkipped)
-	}
-	if got := slices.Sorted(maps.Keys(matched)); !slices.Equal(got, Suites()) {
-		t.Fatalf("the corpus answered for %v and this package registers %v", got, Suites())
-	}
-	// the per suite split, which the key set above says nothing about: 21 comparisons at
-	// one registered suite and 1 at the other satisfies both the count and the key set,
-	// and is a run that covered one suite.
+	// the shape of this family's file, which the per suite split inside assertRun reads off
+	// the corpus rather than transcribing: a grid of one list length series per published
+	// suite, so every suite carries the same number of cases and what each registered suite
+	// owes is what the corpus holds for it. A file that grew a case at one suite alone would
+	// leave that split holding against a grid it is no longer reading.
 	perSuite := map[int]bool{}
-	for _, count := range published {
+	for _, count := range tally.published {
 		perSuite[count] = true
 	}
 	if len(perSuite) != 1 {
-		t.Fatalf("the corpus publishes %v cases per suite; this family's file is a grid of one series per suite and the split below assumes it",
-			published)
+		t.Fatalf("the corpus publishes %v cases per suite; this family's file is a grid of one series per suite and the split assumes it",
+			tally.published)
 	}
-	for _, suite := range Suites() {
-		want := published[uint16(suite)]
-		if want == 0 {
-			t.Fatalf("the corpus publishes nothing at suite %#04x, which this package registers", uint16(suite))
-		}
-		if matched[suite] != want {
-			t.Fatalf("suite %#04x was compared %d times and the corpus publishes %d cases at it",
-				uint16(suite), matched[suite], want)
-		}
-	}
-	if len(answers) != pskSecretKatDistinctAnswers {
-		t.Fatalf("the %d comparisons were made against %d distinct published answers, want %d; a corpus read as one repeated value would compare that many times and pin one answer",
-			compared, len(answers), pskSecretKatDistinctAnswers)
-	}
-	t.Logf("psk_secret: compared %d over %d distinct published answers, %d at each of the suites %v, skipped %d at unimplemented suites",
-		compared, len(answers), published[uint16(Suites()[0])], slices.Sorted(maps.Keys(matched)), skipped)
+	tally.assertRun(t, pskSecretKatComparisons, pskSecretKatSkipped,
+		pskSecretKatComparisons, pskSecretKatDistinctAnswers)
 }
 
 // TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept is the control the runner
@@ -481,8 +435,11 @@ func TestVectorPskSecret(t *testing.T) {
 // derivation -- and each names the sentinel it owes, so a refusal for the wrong reason is
 // a failure too.
 //
-// The unmodified case is checked first and is the reason the four refusals mean anything:
-// a comparator that refused everything would satisfy them all.
+// The driver is assertComparatorRefuses, shared with every other family: it checks the
+// unmodified case FIRST, which is the reason the four refusals mean anything, since a
+// comparator that refused everything would satisfy them all. The evidence the unmodified
+// case carries is checked here first as well, because "returned no error" and "compared
+// something" are not the same claim.
 func TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
 	entries := LoadVectorFile(t, pskSecretKatFile)
 	base := pskSecretKatVector{}
@@ -543,26 +500,18 @@ func TestComparePskSecretVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
 	noPsks := base
 	noPsks.Psks = nil
 
-	for _, corrupted := range []struct {
-		name   string
-		vector pskSecretKatVector
-		want   error
-	}{
-		{"one flipped octet of the published answer", wrongAnswer, errPskSecretMismatch},
-		{"a published answer one octet short of KDF.Nh", wrongWidth, errPskSecretPublishedWidth},
-		{"the empty answer published for a non-empty list", emptyAnswer, errPskSecretIsEmptyAnswer},
-		{"the psk list dropped and the answer kept", noPsks, errPskSecretMismatch},
-	} {
-		_, err := comparePskSecretVector(t, encode(corrupted.vector))
-		if err == nil {
-			t.Errorf("%s was accepted; the comparator is not comparing", corrupted.name)
-			continue
-		}
-		if !errors.Is(err, corrupted.want) {
-			t.Errorf("%s was refused as %v, want %v; a refusal for the wrong reason is a comparator checking something else",
-				corrupted.name, err, corrupted.want)
-		}
-	}
+	assertComparatorRefuses(t, "psk_secret",
+		func(t *testing.T, raw json.RawMessage) error {
+			_, err := comparePskSecretVector(t, raw)
+			return err
+		},
+		encode(base),
+		[]comparatorRefusal{
+			{"one flipped octet of the published answer", encode(wrongAnswer), errPskSecretMismatch},
+			{"a published answer one octet short of KDF.Nh", encode(wrongWidth), errPskSecretPublishedWidth},
+			{"the empty answer published for a non-empty list", encode(emptyAnswer), errPskSecretIsEmptyAnswer},
+			{"the psk list dropped and the answer kept", encode(noPsks), errPskSecretMismatch},
+		})
 }
 
 // TestPskSecretComparisonCannotReportAComparisonItDidNotMake is the control on the
@@ -695,31 +644,11 @@ func TestImplementedSuiteIsTheRegistryAndNotAList(t *testing.T) {
 //
 // Registering the family and deleting its number from expectedPendingFamilies are two
 // edits, and doing only the first leaves TestVectorManifestIsComplete failing while doing
-// only the second leaves it passing with the family uninstalled. This asserts both, and
-// asserts the runner installed is this file's, so a row that kept the number and lost the
-// function fails here.
+// only the second leaves it passing with the family uninstalled. assertVectorFamilyIsInstalled
+// asserts both, and asserts the runner and generator installed are this file's, so a row
+// that kept the number and lost the function fails there.
 func TestPskSecretFamilyIsInstalled(t *testing.T) {
-	family, ok := vectorManifest[6]
-	if !ok {
-		t.Fatal("family 6 is not in the manifest")
-	}
-	if family.File != pskSecretKatFile {
-		t.Fatalf("family 6 names %s, this runner reads %s", family.File, pskSecretKatFile)
-	}
-	if family.Verify == nil {
-		t.Fatal("family 6 has no Verify, so TestVectorFamiliesVerify runs one family fewer and says nothing about it")
-	}
-	if family.Generate == nil {
-		t.Fatal("family 6 has no Generate, so the generate direction of spec A section 4.2.1 is unexercised for it")
-	}
-	if slices.Contains(expectedPendingFamilies, 6) {
-		t.Fatal("family 6 is installed and expectedPendingFamilies still names it as pending")
-	}
-	// and the runner really is this file's, not some other row that happens to be non-nil.
-	installed := reflect.ValueOf(family.Verify).Pointer()
-	if want := reflect.ValueOf(verifyPskSecretVector).Pointer(); installed != want {
-		t.Fatal("family 6 is installed with a verifier that is not verifyPskSecretVector")
-	}
+	assertVectorFamilyIsInstalled(t, 6, pskSecretKatFile, verifyPskSecretVector, generatePskSecretVectors)
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,63 +1918,27 @@ func compareKeyScheduleVector(t *testing.T, raw json.RawMessage) (keyScheduleCom
 	return evidence, evidence.verdict()
 }
 
-// keyScheduleCorpusField reads one published answer out of an epoch decoded as a GENERIC
-// json object, addressed by the same dotted json path the comparator files its check
-// under.
-//
-// Generic on purpose. The comparator reads the corpus through keyScheduleEpoch's struct
-// tags and this reads the same bytes with no struct involved, so the two are independent
-// decodes of one file: a tag misspelled, renamed, or pointed at a key the corpus does not
-// publish decodes to the empty string on the comparator's side and is a missing key here,
-// which is a failure rather than a comparison of nothing against nothing.
-func keyScheduleCorpusField(t *testing.T, epoch map[string]json.RawMessage, name string) string {
-	t.Helper()
-	key, nested, isNested := strings.Cut(name, ".")
-	raw, published := epoch[key]
-	if !published {
-		t.Fatalf("the corpus epoch does not publish %q, so whatever decodes it decodes to nothing and every comparison over it is vacuous", key)
-	}
-	if isNested {
-		inner := map[string]json.RawMessage{}
-		if err := json.Unmarshal(raw, &inner); err != nil {
-			t.Fatalf("the published %s is not a json object: %v", key, err)
-		}
-		raw, published = inner[nested]
-		if !published {
-			t.Fatalf("the published %s does not carry %q", key, nested)
-		}
-	}
-	text := ""
-	if err := json.Unmarshal(raw, &text); err != nil {
-		t.Fatalf("the published %s is not a json string: %v", name, err)
-	}
-	return text
-}
+// The generic decode this family reads its published answers back through is
+// publishedCorpusField in vectors_runner_test.go, shared with every other family for the
+// reason the comment there gives: one decoder over one corpus, so two of them cannot end up
+// disagreeing about which json key an answer lives at. The dotted path this family addresses
+// it with -- exporter.secret -- is why that helper takes one.
 
 // TestVectorKeySchedule is vector family 5 over the published corpus.
 //
-// Every assertion after the loop exists because the loop can be made to run zero times
-// without anything else in this package noticing. A filter that matched nothing, a filter
-// that matched all seven published suites, a corpus that parsed to an empty array, a
-// comparator that declined every vector: each of those is a green run of this test with
-// the assertions removed, and a failure with them.
+// Every assertion vectorRunTally makes after the loop exists because the loop can be made to
+// run zero times without anything else in this package noticing. A filter that matched
+// nothing, a filter that matched all seven published suites, a corpus that parsed to an empty
+// array, a comparator that declined every vector: each of those is a green run of this test
+// with the accounting removed, and a failure with it.
 //
 // What the loop counts is not calls that returned. It counts comparisons whose evidence
 // this runner itself re-checked against a generic decode of the corpus text, so a
 // comparator that answered without computing anything is a failure here rather than a
 // number that looks right.
 func TestVectorKeySchedule(t *testing.T) {
-	entries := LoadVectorFile(t, keyScheduleKatFile)
-	if len(entries) == 0 {
-		t.Fatalf("%s parsed to no entries, so every comparison below would be against nothing", keyScheduleKatFile)
-	}
-
-	vectors, skipped, epochs, compared := 0, 0, 0, 0
-	matched := map[CipherSuite]int{}
-	// published counts every entry by its ciphersuite, in scope or not, so the per suite
-	// split below is derived from the corpus rather than transcribed here.
-	published := map[uint16]int{}
-	answers := map[string]int{}
+	tally, entries := newVectorRunTally(t, keyScheduleKatFile)
+	epochs := 0
 	for index, raw := range entries {
 		header := struct {
 			CipherSuite uint16                       `json:"cipher_suite"`
@@ -2054,20 +1947,15 @@ func TestVectorKeySchedule(t *testing.T) {
 		if err := json.Unmarshal(raw, &header); err != nil {
 			t.Fatalf("vector %d: %v", index, err)
 		}
-		published[header.CipherSuite]++
-		suite, ok := implementedSuite(header.CipherSuite)
-		if !ok {
-			skipped++
+		suite, inScope := tally.filter(header.CipherSuite)
+		if !inScope {
 			continue
 		}
 		evidence, err := compareKeyScheduleVector(t, raw)
 		if err != nil {
 			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
 		}
-		if !evidence.inScope {
-			t.Fatalf("vector %d is at suite %#04x, which this package registers, and the comparator declined it",
-				index, header.CipherSuite)
-		}
+		tally.requireCompared(t, index, suite, evidence.inScope)
 		if err := evidence.verdict(); err != nil {
 			t.Fatalf("vector %d (suite %#04x): %v", index, header.CipherSuite, err)
 		}
@@ -2078,62 +1966,27 @@ func TestVectorKeySchedule(t *testing.T) {
 		// and this runner's own half of the comparison, against the answers it read out
 		// of the corpus text itself with no struct tag in the way.
 		for _, check := range evidence.checks {
-			want := keyScheduleCorpusField(t, header.Epochs[check.epoch], check.name)
+			want := publishedCorpusField(t, header.Epochs[check.epoch], check.name)
 			if got := HexOf(check.got); got != want {
 				t.Fatalf("vector %d (suite %#04x) epoch %d: this package computes %s for %s, the corpus publishes %s",
 					index, header.CipherSuite, check.epoch, got, check.name, want)
 			}
-			answers[want]++
-			compared++
+			tally.answer(want)
 		}
-		vectors++
 		epochs += evidence.epochs
-		matched[suite]++
 	}
 
-	if vectors+skipped != len(entries) {
-		t.Fatalf("%d compared and %d skipped over %d entries; an entry took neither branch",
-			vectors, skipped, len(entries))
-	}
-	if vectors != keyScheduleFamilyVectors {
-		t.Fatalf("compared %d published key schedules, want %d; the filter matched %v",
-			vectors, keyScheduleFamilyVectors, matched)
-	}
-	if skipped != keyScheduleFamilySkipped {
-		t.Fatalf("skipped %d entries at unimplemented suites, want %d", skipped, keyScheduleFamilySkipped)
-	}
+	// the epoch count is this family's own and not the tally's: the corpus is entries of
+	// five epochs each, so a run that advanced through one epoch of each entry satisfies
+	// every count the tally holds and covers a fifth of the schedule.
 	if epochs != keyScheduleFamilyEpochs {
 		t.Fatalf("advanced through %d epochs, want %d", epochs, keyScheduleFamilyEpochs)
 	}
-	if compared != keyScheduleFamilyComparisons {
-		t.Fatalf("made %d comparisons over %d epochs, want %d", compared, epochs, keyScheduleFamilyComparisons)
-	}
-	if got := slices.Sorted(maps.Keys(matched)); !slices.Equal(got, Suites()) {
-		t.Fatalf("the corpus answered for %v and this package registers %v", got, Suites())
-	}
-	// the per suite split, which the key set above says nothing about: a corpus that grew
-	// a second entry at one registered suite would satisfy the key set and the total while
-	// leaving the other suite covered by one entry instead of two.
-	for _, suite := range Suites() {
-		want := published[uint16(suite)]
-		if want == 0 {
-			t.Fatalf("the corpus publishes nothing at suite %#04x, which this package registers", uint16(suite))
-		}
-		if matched[suite] != want {
-			t.Fatalf("suite %#04x was compared %d times and the corpus publishes %d entries at it",
-				uint16(suite), matched[suite], want)
-		}
-	}
 	// the corpus publishes 140 distinct answers for the 140 comparisons, so a file read as
 	// one repeated value -- every field decoding to the same string, every epoch decoding
-	// as epoch 0 -- compares the right number of times against the wrong number of answers
-	// and fails here.
-	if len(answers) != keyScheduleFamilyComparisons {
-		t.Fatalf("the %d comparisons were made against %d distinct published answers, want %d",
-			compared, len(answers), keyScheduleFamilyComparisons)
-	}
-	t.Logf("key-schedule: %d vectors over %d epochs, %d comparisons against %d distinct published answers, %d entries skipped at unimplemented suites",
-		vectors, epochs, compared, len(answers), skipped)
+	// as epoch 0 -- compares the right number of times against the wrong number of answers.
+	tally.assertRun(t, keyScheduleFamilyVectors, keyScheduleFamilySkipped,
+		keyScheduleFamilyComparisons, keyScheduleFamilyComparisons)
 }
 
 // TestKeyScheduleFamilyChecksAreTheWholeEpoch holds the fourteen names this family compares
@@ -2185,31 +2038,10 @@ func TestKeyScheduleFamilyChecksAreTheWholeEpoch(t *testing.T) {
 //
 // Registering the family and deleting its number from expectedPendingFamilies are two
 // edits, and doing only the first leaves TestVectorManifestIsComplete failing while doing
-// only the second leaves it passing with the family uninstalled. This asserts both, and
-// asserts the runner installed is this file's.
+// only the second leaves it passing with the family uninstalled. assertVectorFamilyIsInstalled
+// asserts both, and asserts the runner and generator installed are this file's.
 func TestKeyScheduleFamilyIsInstalled(t *testing.T) {
-	family, ok := vectorManifest[5]
-	if !ok {
-		t.Fatal("family 5 is not in the manifest")
-	}
-	if family.File != keyScheduleKatFile {
-		t.Fatalf("family 5 names %s, this runner reads %s", family.File, keyScheduleKatFile)
-	}
-	if family.Verify == nil {
-		t.Fatal("family 5 has no Verify, so TestVectorFamiliesVerify runs one family fewer and says nothing about it")
-	}
-	if family.Generate == nil {
-		t.Fatal("family 5 has no Generate, so the generate direction of spec A section 4.2.1 is unexercised for it")
-	}
-	if slices.Contains(expectedPendingFamilies, 5) {
-		t.Fatal("family 5 is installed and expectedPendingFamilies still names it as pending")
-	}
-	if got := reflect.ValueOf(family.Verify).Pointer(); got != reflect.ValueOf(verifyKeyScheduleVector).Pointer() {
-		t.Fatal("family 5 is installed with a verifier that is not verifyKeyScheduleVector")
-	}
-	if got := reflect.ValueOf(family.Generate).Pointer(); got != reflect.ValueOf(generateKeyScheduleVector).Pointer() {
-		t.Fatal("family 5 is installed with a generator that is not generateKeyScheduleVector")
-	}
+	assertVectorFamilyIsInstalled(t, 5, keyScheduleKatFile, verifyKeyScheduleVector, generateKeyScheduleVector)
 }
 
 // TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept is the control the runner
@@ -2221,8 +2053,11 @@ func TestKeyScheduleFamilyIsInstalled(t *testing.T) {
 // accepted everything and a comparator that checked everything produce identical runs
 // there. The only way to see the difference is to disagree with it on purpose.
 //
-// The unmodified vector is checked first and is the reason the refusals mean anything: a
-// comparator that refused everything would satisfy all of them.
+// The driver is assertComparatorRefuses, shared with every other family: it checks the
+// unmodified vector FIRST, which is the reason the refusals mean anything, since a
+// comparator that refused everything would satisfy all of them. The evidence the unmodified
+// vector carries is checked here first as well, because "returned no error" and "compared
+// something" are not the same claim.
 func TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
 	base := keyScheduleVector{}
 	found := false
@@ -2285,6 +2120,7 @@ func TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) 
 	otherStart := base
 	otherStart.InitialInitSecret = flipHex(base.InitialInitSecret)
 
+	refusals := []comparatorRefusal{}
 	for _, corrupted := range []struct {
 		name   string
 		vector keyScheduleVector
@@ -2324,16 +2160,14 @@ func TestCompareKeyScheduleVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) 
 		{"a group id that is not the one the answers were computed for", otherGroup, errKeyScheduleMismatch},
 		{"an initial init secret that is not the one the chain starts from", otherStart, errKeyScheduleMismatch},
 	} {
-		_, err := compareKeyScheduleVector(t, encode(corrupted.vector))
-		if err == nil {
-			t.Errorf("%s was accepted; the comparator is not comparing", corrupted.name)
-			continue
-		}
-		if !errors.Is(err, corrupted.want) {
-			t.Errorf("%s was refused as %v, want %v; a refusal for the wrong reason is a comparator checking something else",
-				corrupted.name, err, corrupted.want)
-		}
+		refusals = append(refusals, comparatorRefusal{corrupted.name, encode(corrupted.vector), corrupted.want})
 	}
+	assertComparatorRefuses(t, "key-schedule",
+		func(t *testing.T, raw json.RawMessage) error {
+			_, err := compareKeyScheduleVector(t, raw)
+			return err
+		},
+		encode(base), refusals)
 }
 
 // TestKeyScheduleComparisonCannotReportAComparisonItDidNotMake is the control on the
@@ -2856,7 +2690,7 @@ func TestVectorKeyScheduleGenerate(t *testing.T) {
 				if slices.Contains(keyScheduleNonSecretChecks, name) && name != "exporter.secret" {
 					continue
 				}
-				want := keyScheduleCorpusField(t, published, name)
+				want := publishedCorpusField(t, published, name)
 				got, answered := derived[name]
 				if !answered {
 					t.Fatalf("the hand written derivation answers nothing for %s, so this family compares one answer nothing independent produced",
@@ -3027,7 +2861,7 @@ func TestTheIndependentKeyScheduleMatchesEveryUpstreamVector(t *testing.T) {
 				if !answered {
 					continue
 				}
-				want := keyScheduleCorpusField(t, published, name)
+				want := publishedCorpusField(t, published, name)
 				if HexOf(got) != want {
 					t.Fatalf("vector %d epoch %d: the hand written derivation gives %s for %s, the corpus publishes %s",
 						index, n, HexOf(got), name, want)
@@ -3162,7 +2996,7 @@ func TestGeneratedKeyScheduleVectorsCoverEveryRegisteredSuite(t *testing.T) {
 				t.Fatalf("re-read a generated epoch: %v", err)
 			}
 			for _, name := range keyScheduleCheckNames {
-				if keyScheduleCorpusField(t, published, name) == "" {
+				if publishedCorpusField(t, published, name) == "" {
 					t.Errorf("suite %#04x epoch %d carries no %s, so the consume direction compares nothing there",
 						entry.CipherSuite, n, name)
 				}

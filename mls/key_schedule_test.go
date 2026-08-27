@@ -5944,28 +5944,19 @@ func mustLoadAuthenticatedCorpus(t *testing.T, name string, into any) {
 	loadLabelKat(t, name, into)
 }
 
-// publishedVectorPrefix is the length prefix a <V> vector of n octets carries, spelled by the
-// codec rather than written out here.
+// publishedVectorPrefix is vectorLengthPrefix with this file's fatal error policy: the
+// length prefix a <V> vector of n octets carries, spelled by the codec rather than written
+// out here, and a corpus this package cannot read is a failure rather than a verdict.
 //
-// RFC 9420 section 2.1.2 writes 0..63 as one octet and 64..16383 as two, so a helper that
-// assumed a single octet is right for both registered suites -- KDF.Nh is 32 and 32 <= 63 --
-// and stops being right at the first suite whose hash is SHA-512, where Nh is 64 and the
-// prefix is 0x40 0x40. It would stop being right loudly, which is better than silently, but
-// loudly in the two helpers that read it rather than in the one line that is actually wrong.
-// So the width is derived: the codec is asked to encode a vector of that length and the
-// prefix is whatever it wrote in front of the content.
+// The derivation itself moved to vectors_runner_test.go when the transcript-hashes runner
+// landed and became the third reader of these published structures. Two implementations of
+// "how wide is the prefix" is how the two stop agreeing at the first SHA-512 suite, which is
+// the exact failure the derivation exists to prevent.
 func publishedVectorPrefix(t *testing.T, what string, n int) []byte {
 	t.Helper()
-	w := syntax.NewWriter()
-	w.WriteOpaque(make([]byte, n))
-	encoded, err := w.Bytes()
+	prefix, err := vectorLengthPrefix(n)
 	if err != nil {
-		t.Fatalf("%s: encode the length prefix a %d octet <V> vector carries: %v", what, n, err)
-	}
-	prefix := encoded[:len(encoded)-n]
-	if len(prefix) == 0 {
-		t.Fatalf("%s: a %d octet opaque<V> encodes to %d octets and therefore carries no length prefix, so nothing separates the tail below from the field in front of it",
-			what, n, len(encoded))
+		t.Fatalf("%s: %v", what, err)
 	}
 	return prefix
 }
@@ -6003,25 +5994,17 @@ func TestThePublishedVectorPrefixWidensWithTheVector(t *testing.T) {
 
 // publishedTagAtTheTail reads the mac one of these serialized structures ends with.
 //
-// Both a FramedContentAuthData's confirmation_tag and a PublicMessage's membership_tag are the
-// LAST field of their structure and both are an opaque<V> of exactly KDF.Nh octets, so the tail
-// is the tag and what sits in front of it is the vector's own length prefix. That prefix is
-// asserted rather than skipped over: if the octets found there are not the encoded length of
-// the tail being read, then what is being read is not a tag, and a comparison against it would
-// be a comparison against the wrong bytes rather than a failure.
+// splitTrailingOpaqueTag with this file's fatal error policy. The split, and the assertion on
+// the length prefix in front of the tail that makes it a tag rather than whatever bytes sit
+// there, are in vectors_runner_test.go because family 5, family 7 and the transcript known
+// answer tests all read the same shape.
 func publishedTagAtTheTail(t *testing.T, what string, blob []byte, nh int) []byte {
 	t.Helper()
-	prefix := publishedVectorPrefix(t, what, nh)
-	if len(blob) < nh+len(prefix) {
-		t.Fatalf("%s is %d bytes and a %d byte tag with its %d byte length prefix does not fit in it",
-			what, len(blob), nh, len(prefix))
+	_, tag, err := splitTrailingOpaqueTag(blob, nh)
+	if err != nil {
+		t.Fatalf("%s: %v, so the tail this reads is not a tag", what, err)
 	}
-	at := len(blob) - nh - len(prefix)
-	if found := blob[at : at+len(prefix)]; !bytes.Equal(found, prefix) {
-		t.Fatalf("%s: the %d octets before its last %d bytes are %x, and a <V> vector of %d octets is written %x, so the tail this reads is not a tag",
-			what, len(prefix), nh, found, nh, prefix)
-	}
-	return blob[len(blob)-nh:]
+	return tag
 }
 
 // ksScheduleForSuite builds a real key schedule for one registered suite out of the published

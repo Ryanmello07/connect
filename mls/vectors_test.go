@@ -87,12 +87,12 @@ var vectorManifest = baseVectorManifest()
 // expectedPendingFamilies is every family with no runner yet, ascending. It shrinks to the
 // empty slice by the end of slice A4 and never grows.
 //
-// 5 and 6 are absent because p4 tasks 17 and 16 register them from key_schedule_kat_test.go.
-// 16 is still
+// 5 and 6 are absent because p4 tasks 17 and 16 register them from key_schedule_kat_test.go,
+// and 7 because p4 task 20 registers it from transcript_kat_test.go. 16 is still
 // here even though package syntax ships a working runner for it: that runner is not
 // installed in this manifest, and a family verified somewhere this registry cannot see is,
 // as far as this gate is concerned, a family nothing runs. p8 task 8 is the shim.
-var expectedPendingFamilies = []int{1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+var expectedPendingFamilies = []int{1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 // RegisterVectorFamily installs a family runner. Registering a number twice, or a number
 // outside 1 to 16, is a programming error rather than a condition to report: both mean the
