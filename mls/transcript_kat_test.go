@@ -33,6 +33,15 @@
 //     writes. Both free functions can be right while Update reads the wrong field of the
 //     receiver or writes them back transposed, so the stateful path is compared separately
 //     rather than assumed to follow.
+//   - the epoch-0 base case. Section 8.2 starts the chain at an interim_transcript_hash_before
+//     that is the ZERO LENGTH octet string -- exactly what transcript.go's
+//     InitialTranscriptHashes hands out -- so the width rule here holds the two ANSWERS to
+//     KDF.Nh and lets that one input be empty. What is refused instead is the key being ABSENT,
+//     read off a generic decode: an empty value and a missing one decode identically through a
+//     struct and only one of them is a vacuous comparison. The vendored corpus publishes no
+//     such case at any suite, which is exactly why the rule has to be derived from the section
+//     rather than transcribed from the file: transcribed, it refused the one case the whole
+//     chain starts from.
 //
 // What this runner adds over TestTranscriptHashesMatchTheMlswgTranscriptHashes next door,
 // stated because a runner that adds no protection of its own is better replaced by a comment.
@@ -82,9 +91,14 @@ const (
 // field count of TranscriptHashes plus the two free functions, so a third field added to the
 // pair cannot arrive without a comparison.
 //
-// The order is the order the comparator emits them in, and incomplete() requires each name
-// exactly once per case, so a comparison dropped from the middle cannot be made up for by
-// another one made twice.
+// The order is the order the comparator emits them in, and incomplete() holds a run to it
+// POSITION BY POSITION as well as requiring each name exactly once. Both halves are load
+// bearing and for different reasons: the multiset is what stops a comparison dropped from the
+// middle being made up for by another one made twice, and the order is what keeps verdict()'s
+// two vacuity controls aimed at the pair they are about. A multiset alone permits a reorder,
+// and a reorder is what nothing here refused -- the first two rows were swapped, every name
+// still appeared exactly once, and the whole package stayed green with both controls
+// permanently pointed at the wrong answers.
 var transcriptHashCheckNames = []string{
 	"ConfirmedTranscriptHash",
 	"InterimTranscriptHash",
@@ -158,9 +172,16 @@ type transcriptHashComparison struct {
 	hashSize int
 	// the corpus's own three hashes, decoded. All three are held rather than only the two
 	// that are answers, because the aliasing refusal is about the three together.
-	before         []byte
-	confirmedAfter []byte
-	interimAfter   []byte
+	//
+	// before may legitimately be EMPTY: section 8.2's epoch-0 interim hash is the zero-length
+	// octet string. publishesBefore is the separate question of whether the corpus published
+	// the key at all, read off a generic decode of the same case with no struct tag in the
+	// way, because an absent key and an empty value decode to the same []byte through the
+	// struct and only one of the two is a comparison that read nothing.
+	before          []byte
+	publishesBefore bool
+	confirmedAfter  []byte
+	interimAfter    []byte
 	// split is the offset the ConfirmedTranscriptHashInput / confirmation_tag split was
 	// taken at, and tag is what was recovered from the tail. A zero split is a comparison
 	// that never divided the published blob.
@@ -199,21 +220,31 @@ func (self transcriptHashComparison) incomplete() error {
 	case len(self.tag) != self.hashSize:
 		return fmt.Errorf("%w: the recovered confirmation tag is %d octets and the suite's KDF.Nh is %d",
 			errTranscriptHashIncomplete, len(self.tag), self.hashSize)
-	case len(self.before) == 0 || len(self.confirmedAfter) == 0 || len(self.interimAfter) == 0:
-		return fmt.Errorf("%w: the case publishes %d, %d and %d octets for its three hashes, and an empty comparison agrees with anything",
-			errTranscriptHashIncomplete, len(self.before), len(self.confirmedAfter), len(self.interimAfter))
-	case len(self.checks) != transcriptHashKatChecks:
+	case !self.publishesBefore:
+		return fmt.Errorf("%w: the case publishes no interim_transcript_hash_before key at all, so whatever decodes it decodes to nothing and the chain was seeded from a value the corpus never gave",
+			errTranscriptHashIncomplete)
+	case len(self.confirmedAfter) == 0 || len(self.interimAfter) == 0:
+		return fmt.Errorf("%w: the case publishes %d and %d octets for the two hashes it answers, and an empty comparison agrees with anything",
+			errTranscriptHashIncomplete, len(self.confirmedAfter), len(self.interimAfter))
+	case len(self.checks) != len(transcriptHashCheckNames):
 		return fmt.Errorf("%w: the run made %d comparisons and this family owes %d per case",
-			errTranscriptHashIncomplete, len(self.checks), transcriptHashKatChecks)
+			errTranscriptHashIncomplete, len(self.checks), len(transcriptHashCheckNames))
 	case len(self.withoutChain) != self.hashSize:
 		return fmt.Errorf("%w: the flipped interim_transcript_hash_before control was never run", errTranscriptHashIncomplete)
 	case len(self.withoutTag) != self.hashSize:
 		return fmt.Errorf("%w: the flipped confirmation tag control was never run", errTranscriptHashIncomplete)
 	}
-	// every name exactly once, so a comparison dropped from the middle of a case cannot be
-	// made up for by another one made twice.
+	// every name exactly once AND in transcriptHashCheckNames' own order. The count case above
+	// makes the index safe. Order because verdict()'s vacuity controls are about a particular
+	// answer, and a swap of two rows that leaves every name present exactly once is a swap a
+	// multiset cannot see -- it was applied, nothing refused it, and the controls then compared
+	// the wrong answer against the wrong perturbation.
 	seen := map[string]int{}
-	for _, check := range self.checks {
+	for index, check := range self.checks {
+		if check.name != transcriptHashCheckNames[index] {
+			return fmt.Errorf("%w: comparison %d is %s and this family emits %s there; the vacuity controls are read out of that order",
+				errTranscriptHashIncomplete, index, check.name, transcriptHashCheckNames[index])
+		}
 		if len(check.got) == 0 || len(check.want) == 0 {
 			return fmt.Errorf("%w: %s compared %d computed octets against %d published ones, and an empty comparison agrees with anything",
 				errTranscriptHashIncomplete, check.name, len(check.got), len(check.want))
@@ -251,14 +282,23 @@ func (self transcriptHashComparison) verdict() error {
 	if err := self.incomplete(); err != nil {
 		return err
 	}
+	// the two ANSWERS are Hash outputs and are KDF.Nh octets or they are not what the corpus
+	// means. The chained INPUT has a second legal width and only one: section 8.2 starts the
+	// chain at the zero-length octet string, which is what InitialTranscriptHashes hands out,
+	// so a group-creation case is the base case and not a defect. Anything between the two is
+	// neither, and is still refused.
 	for _, published := range []struct {
-		name string
-		body []byte
+		name       string
+		body       []byte
+		mayBeEmpty bool
 	}{
-		{"interim_transcript_hash_before", self.before},
-		{"confirmed_transcript_hash_after", self.confirmedAfter},
-		{"interim_transcript_hash_after", self.interimAfter},
+		{"interim_transcript_hash_before", self.before, true},
+		{"confirmed_transcript_hash_after", self.confirmedAfter, false},
+		{"interim_transcript_hash_after", self.interimAfter, false},
 	} {
+		if published.mayBeEmpty && len(published.body) == 0 {
+			continue
+		}
 		if len(published.body) != self.hashSize {
 			return fmt.Errorf("%w: %s is %d octets against a KDF.Nh of %d, so this is not the comparison the corpus intends",
 				errTranscriptHashPublishedWidth, published.name, len(published.body), self.hashSize)
@@ -299,15 +339,57 @@ func (self transcriptHashComparison) verdict() error {
 	// recomputed to match a defective derivation: an implementation that dropped the chained
 	// interim hash, or that hashed the confirmed hash without the tag, answers the same value
 	// whatever those two inputs hold.
-	if bytes.Equal(self.withoutChain, self.checks[0].got) {
+	//
+	// Addressed BY NAME and not by position. self.checks[0] is the confirmed hash only while
+	// the emit order holds, and an order nothing refuses points both controls at the wrong pair
+	// permanently. incomplete() now holds the order and this holds the name, so neither one
+	// alone is what keeps these two aimed.
+	confirmedAnswer := self.answerNamed("ConfirmedTranscriptHash")
+	interimAnswer := self.answerNamed("InterimTranscriptHash")
+	if len(confirmedAnswer) == 0 || len(interimAnswer) == 0 {
+		return fmt.Errorf("%w: the vacuity controls are read out of ConfirmedTranscriptHash and InterimTranscriptHash and the run compared %d and %d octets for them",
+			errTranscriptHashIncomplete, len(confirmedAnswer), len(interimAnswer))
+	}
+	if bytes.Equal(self.withoutChain, confirmedAnswer) {
 		return fmt.Errorf("%w: one flipped octet of interim_transcript_hash_before left the confirmed hash at %s, so the chained value never reached ConfirmedTranscriptHash",
 			errTranscriptHashDidNotMove, HexOf(self.withoutChain))
 	}
-	if bytes.Equal(self.withoutTag, self.checks[1].got) {
+	if bytes.Equal(self.withoutTag, interimAnswer) {
 		return fmt.Errorf("%w: one flipped octet of the confirmation tag left the interim hash at %s, so the tag never reached InterimTranscriptHash",
 			errTranscriptHashDidNotMove, HexOf(self.withoutTag))
 	}
 	return nil
+}
+
+// answerNamed is the computed half of one of this case's comparisons, addressed by the name of
+// what produced it, or nothing if this run made no such comparison.
+//
+// By name because the callers are ABOUT a particular answer. A positional read is only that
+// answer while the emit order holds, and holding the order in one place and reading positions in
+// another is how the two come apart without either one failing.
+func (self transcriptHashComparison) answerNamed(name string) []byte {
+	for _, check := range self.checks {
+		if check.name == name {
+			return check.got
+		}
+	}
+	return nil
+}
+
+// perturbedChainValue is the corpus's own interim_transcript_hash_before with one bit changed --
+// or, for the group-creation base case whose published value is the zero-length octet string
+// section 8.2 starts the chain from, a one octet value where the corpus publishes none.
+//
+// The control is "an input this derivation must depend on, changed", and at epoch 0 there is no
+// octet to flip. Refusing that case instead, which is what this runner did, reports the one case
+// the whole chain starts from as an incomplete comparison rather than verifying it.
+func perturbedChainValue(before []byte) []byte {
+	if len(before) == 0 {
+		return []byte{0x00}
+	}
+	flipped := bytes.Clone(before)
+	flipped[0] ^= 0x01
+	return flipped
 }
 
 // verifyTranscriptHashVector is the registry's shim: the signature RegisterVectorFamily needs,
@@ -362,12 +444,24 @@ func compareTranscriptHashVector(t *testing.T, raw json.RawMessage) (transcriptH
 		t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
 	}
 
+	// whether the chained interim hash was PUBLISHED, read off a generic decode of the same
+	// bytes with no struct tag in the way, and under the key the struct tag itself names rather
+	// than a second spelling of it. An absent key and an empty value decode identically through
+	// the struct: the empty octet string is section 8.2's epoch-0 value and the absent key is
+	// what a renamed field or a struct tag typo produces, and only the second is vacuous.
+	published := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &published); err != nil {
+		t.Fatalf("parse transcript-hashes case as a json object: %v", err)
+	}
+	_, publishesBefore := published[theJsonKeyOf(t, trPublishedEntry{}, "InterimTranscriptHashBefore")]
+
 	evidence := transcriptHashComparison{
-		inScope:        true,
-		hashSize:       crypto.HashSize(),
-		before:         MustHex(t, entry.InterimTranscriptHashBefore),
-		confirmedAfter: MustHex(t, entry.ConfirmedTranscriptHashAfter),
-		interimAfter:   MustHex(t, entry.InterimTranscriptHashAfter),
+		inScope:         true,
+		hashSize:        crypto.HashSize(),
+		before:          MustHex(t, entry.InterimTranscriptHashBefore),
+		publishesBefore: publishesBefore,
+		confirmedAfter:  MustHex(t, entry.ConfirmedTranscriptHashAfter),
+		interimAfter:    MustHex(t, entry.InterimTranscriptHashAfter),
 	}
 	confirmationKey := MustHex(t, entry.ConfirmationKey)
 	blob := MustHex(t, entry.AuthenticatedContent)
@@ -396,7 +490,8 @@ func compareTranscriptHashVector(t *testing.T, raw json.RawMessage) (transcriptH
 		return evidence, fmt.Errorf("TranscriptHashes.Update: %w", err)
 	}
 
-	// the order here is transcriptHashCheckNames' order, which incomplete() holds it to.
+	// the order here is transcriptHashCheckNames' order, position by position, which
+	// incomplete() holds it to.
 	for _, check := range []transcriptHashCheck{
 		{"ConfirmedTranscriptHash", "confirmed_transcript_hash_after", confirmed, evidence.confirmedAfter},
 		{"InterimTranscriptHash", "interim_transcript_hash_after", interim, evidence.interimAfter},
@@ -408,13 +503,7 @@ func compareTranscriptHashVector(t *testing.T, raw json.RawMessage) (transcriptH
 	}
 
 	// the two vacuity controls, over the corpus's own bytes.
-	if len(evidence.before) == 0 {
-		return evidence, fmt.Errorf("%w: the case publishes no interim_transcript_hash_before to perturb",
-			errTranscriptHashIncomplete)
-	}
-	flippedBefore := bytes.Clone(evidence.before)
-	flippedBefore[0] ^= 0x01
-	evidence.withoutChain = ConfirmedTranscriptHash(crypto, flippedBefore, confirmedInput)
+	evidence.withoutChain = ConfirmedTranscriptHash(crypto, perturbedChainValue(evidence.before), confirmedInput)
 
 	flippedTag := bytes.Clone(confirmationTag)
 	flippedTag[0] ^= 0x01
@@ -641,6 +730,11 @@ func TestCompareTranscriptHashVectorRefusesAnAnswerItShouldNotAccept(t *testing.
 	narrow := base
 	narrow.ConfirmedTranscriptHashAfter = base.ConfirmedTranscriptHashAfter[:len(base.ConfirmedTranscriptHashAfter)-2]
 
+	// the chained input has two legal widths -- KDF.Nh, or empty at epoch 0 -- and this is
+	// neither, so it is still a width refusal and not a mismatch.
+	narrowBefore := base
+	narrowBefore.InterimTranscriptHashBefore = base.InterimTranscriptHashBefore[:len(base.InterimTranscriptHashBefore)-2]
+
 	wrongConfirmed := base
 	wrongConfirmed.ConfirmedTranscriptHashAfter = flipHex(base.ConfirmedTranscriptHashAfter)
 
@@ -672,6 +766,7 @@ func TestCompareTranscriptHashVectorRefusesAnAnswerItShouldNotAccept(t *testing.
 			{"an authenticated_content with nothing in front of its tag", encode(tooShort), errVectorTagTail},
 			{"the confirmed hash published as the interim hash", encode(aliased), errTranscriptHashAliased},
 			{"a published confirmed_transcript_hash_after one octet short of KDF.Nh", encode(narrow), errTranscriptHashPublishedWidth},
+			{"a published interim_transcript_hash_before that is neither KDF.Nh nor the empty epoch-0 value", encode(narrowBefore), errTranscriptHashPublishedWidth},
 		})
 }
 
@@ -682,14 +777,15 @@ func TestTranscriptHashComparisonCannotReportAComparisonItDidNotMake(t *testing.
 	const nh = 32
 	octets := func(seed byte) []byte { return bytes.Repeat([]byte{seed}, nh) }
 	full := transcriptHashComparison{
-		inScope:        true,
-		hashSize:       nh,
-		before:         octets(0x01),
-		confirmedAfter: octets(0x02),
-		interimAfter:   octets(0x03),
-		split:          7,
-		tag:            octets(0x04),
-		verified:       true,
+		inScope:         true,
+		hashSize:        nh,
+		before:          octets(0x01),
+		publishesBefore: true,
+		confirmedAfter:  octets(0x02),
+		interimAfter:    octets(0x03),
+		split:           7,
+		tag:             octets(0x04),
+		verified:        true,
 		checks: []transcriptHashCheck{
 			{"ConfirmedTranscriptHash", "confirmed_transcript_hash_after", octets(0x02), octets(0x02)},
 			{"InterimTranscriptHash", "interim_transcript_hash_after", octets(0x03), octets(0x03)},
@@ -720,6 +816,15 @@ func TestTranscriptHashComparisonCannotReportAComparisonItDidNotMake(t *testing.
 		edit(&partial)
 		return partial
 	}
+	// the group-creation base case, which must be ACCEPTED and not counted among the vacuous
+	// ones below: section 8.2's epoch-0 interim_transcript_hash_before IS the zero-length octet
+	// string, and a comparison whose only difference from an accepted one is that it sits at
+	// epoch 0 is a comparison, not an absence.
+	base := without(func(c *transcriptHashComparison) { c.before = []byte{} })
+	if err := base.verdict(); err != nil {
+		t.Fatalf("the group-creation base case was refused: %v; the one case the chain starts from is not a defect", err)
+	}
+
 	for _, missing := range []struct {
 		name string
 		edit func(*transcriptHashComparison)
@@ -738,6 +843,12 @@ func TestTranscriptHashComparisonCannotReportAComparisonItDidNotMake(t *testing.
 		{"a comparison naming no published field", func(c *transcriptHashComparison) { c.checks[3].field = "" }},
 		{"no flipped interim_transcript_hash_before control", func(c *transcriptHashComparison) { c.withoutChain = nil }},
 		{"no flipped confirmation tag control", func(c *transcriptHashComparison) { c.withoutTag = nil }},
+		{"a case that does not publish interim_transcript_hash_before at all", func(c *transcriptHashComparison) {
+			c.publishesBefore = false
+		}},
+		{"the four comparisons emitted in some other order", func(c *transcriptHashComparison) {
+			c.checks[0], c.checks[1] = c.checks[1], c.checks[0]
+		}},
 	} {
 		partial := without(missing.edit)
 		err := partial.verdict()
@@ -758,6 +869,9 @@ func TestTranscriptHashComparisonCannotReportAComparisonItDidNotMake(t *testing.
 	}{
 		{"a published hash one octet short of KDF.Nh", func(c *transcriptHashComparison) {
 			c.confirmedAfter = c.confirmedAfter[:nh-1]
+		}, errTranscriptHashPublishedWidth},
+		{"a published interim_transcript_hash_before that is neither KDF.Nh nor empty", func(c *transcriptHashComparison) {
+			c.before = c.before[:nh-1]
 		}, errTranscriptHashPublishedWidth},
 		{"the interim hash published as the confirmed hash", func(c *transcriptHashComparison) {
 			c.interimAfter = bytes.Clone(c.confirmedAfter)
@@ -783,5 +897,106 @@ func TestTranscriptHashComparisonCannotReportAComparisonItDidNotMake(t *testing.
 		if !errors.Is(err, wrong.want) {
 			t.Errorf("%s was judged %v, want %v", wrong.name, err, wrong.want)
 		}
+	}
+}
+
+// TestCompareTranscriptHashVectorRunsTheGroupCreationBaseCase is the epoch-0 half of this
+// family, end to end, over a case the vendored corpus does not publish.
+//
+// Section 8.2 starts the chain at an interim_transcript_hash_before that is the ZERO LENGTH
+// octet string -- transcript.go's InitialTranscriptHashes hands out exactly that -- and this
+// runner used to refuse that case twice over. incomplete() read an empty published hash as a
+// vacuous decode, and verdict() held all three published hashes to KDF.Nh. Both rules were
+// transcribed from the corpus that happens to be vendored -- all seven of its cases publish a
+// full width value -- rather than derived from the section, so the one case the whole chain
+// starts from would have been reported as an incomplete comparison rather than verified.
+//
+// The case is CONSTRUCTED here, and constructing it is honest in a way generating a corpus case
+// would not be: nothing about this implementation's answers is asserted from this implementation.
+// What is asserted is that a case whose only difference from a published one is the epoch it sits
+// at is COMPARED -- four comparisons, both vacuity controls run -- rather than refused. The head
+// of the blob is opaque octets on purpose: what section 8.2 hashes is the serialized
+// ConfirmedTranscriptHashInput and this runner never parses it, so the framing p6 owns is not
+// what is under test here.
+//
+// The absent-key half is asserted beside it, because permitting the empty value is only safe if
+// "published as empty" and "not published at all" stay two different things.
+func TestCompareTranscriptHashVectorRunsTheGroupCreationBaseCase(t *testing.T) {
+	suite := Suites()[0]
+	crypto, err := NewCryptoProvider(suite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
+	}
+	nh := crypto.HashSize()
+	prefix, err := vectorLengthPrefix(nh)
+	if err != nil {
+		t.Fatalf("the length prefix a %d octet tag carries: %v", nh, err)
+	}
+	confirmationKey := bytes.Repeat([]byte{0x5a}, nh)
+	confirmedInput := []byte{0x01, 0x02, 0x03, 0x04}
+
+	confirmed := ConfirmedTranscriptHash(crypto, []byte{}, confirmedInput)
+	tag := crypto.Mac(confirmationKey, confirmed)
+	interim, err := InterimTranscriptHash(crypto, confirmed, tag)
+	if err != nil {
+		t.Fatalf("InterimTranscriptHash: %v", err)
+	}
+	entry := trPublishedEntry{
+		CipherSuite:                  uint16(suite),
+		ConfirmationKey:              HexOf(confirmationKey),
+		AuthenticatedContent:         HexOf(slices.Concat(confirmedInput, prefix, tag)),
+		InterimTranscriptHashBefore:  "",
+		ConfirmedTranscriptHashAfter: HexOf(confirmed),
+		InterimTranscriptHashAfter:   HexOf(interim),
+	}
+	body, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal the base case: %v", err)
+	}
+
+	evidence, err := compareTranscriptHashVector(t, json.RawMessage(body))
+	if err != nil {
+		t.Fatalf("the group-creation base case was refused: %v", err)
+	}
+	if !evidence.inScope {
+		t.Fatal("the group-creation base case came back out of scope")
+	}
+	if len(evidence.before) != 0 || !evidence.publishesBefore {
+		t.Fatalf("the base case was read with %d octets of chained interim hash and publishesBefore=%v, want 0 and true",
+			len(evidence.before), evidence.publishesBefore)
+	}
+	if len(evidence.checks) != transcriptHashKatChecks || !evidence.verified {
+		t.Fatalf("the base case produced %d comparisons and verified=%v, want %d and true",
+			len(evidence.checks), evidence.verified, transcriptHashKatChecks)
+	}
+	// the chained control ran and MOVED, which is the assertion the width refusal used to
+	// stand in for: an empty published value is still an input the derivation must depend on.
+	if len(evidence.withoutChain) != nh || bytes.Equal(evidence.withoutChain, evidence.answerNamed("ConfirmedTranscriptHash")) {
+		t.Fatalf("the chained control over an empty interim_transcript_hash_before answered %s against a confirmed hash of %s",
+			HexOf(evidence.withoutChain), HexOf(evidence.answerNamed("ConfirmedTranscriptHash")))
+	}
+	if err := evidence.verdict(); err != nil {
+		t.Fatalf("the group-creation base case was judged %v", err)
+	}
+
+	// and the same case with the key REMOVED rather than published empty. It decodes to the
+	// same []byte through the struct and it is not the same thing: this is what a renamed field
+	// or a struct tag typo produces, and it is still refused as a comparison that read nothing.
+	generic := map[string]json.RawMessage{}
+	if err := json.Unmarshal(body, &generic); err != nil {
+		t.Fatalf("decode the base case generically: %v", err)
+	}
+	key := theJsonKeyOf(t, trPublishedEntry{}, "InterimTranscriptHashBefore")
+	if _, published := generic[key]; !published {
+		t.Fatalf("the base case does not publish %q, so removing it below removes nothing", key)
+	}
+	delete(generic, key)
+	absent, err := json.Marshal(generic)
+	if err != nil {
+		t.Fatalf("re-encode the base case without %q: %v", key, err)
+	}
+	if _, err := compareTranscriptHashVector(t, json.RawMessage(absent)); !errors.Is(err, errTranscriptHashIncomplete) {
+		t.Fatalf("a case publishing no %q was judged %v, want an incompleteness; an absent key and an empty value are not the same claim",
+			key, err)
 	}
 }

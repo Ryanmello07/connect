@@ -41,12 +41,17 @@
 package mls
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/token"
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -105,6 +110,12 @@ func vectorLengthPrefix(n int) ([]byte, error) {
 // rather than assumed -- a split taken one octet out recovers bytes the MAC refuses. When p6
 // lands (*AuthenticatedContent).UnmarshalMLS this is replaced by the parse and the MAC check
 // stays.
+//
+// bytes.Equal and not a loop of this file's own. The comparison is over a PUBLIC opaque<V>
+// length prefix and not over a tag, so guardrail 8 has nothing to say about it either way --
+// but a byte loop spelled out here is a comparator living in this package outside the class
+// every derived gate can see, and one edit away from being pointed at a tag. The library call
+// is inside that class; the loop was not.
 func splitTrailingOpaqueTag(blob []byte, nh int) (head []byte, tag []byte, err error) {
 	prefix, err := vectorLengthPrefix(nh)
 	if err != nil {
@@ -115,27 +126,11 @@ func splitTrailingOpaqueTag(blob []byte, nh int) (head []byte, tag []byte, err e
 			errVectorTagTail, len(blob), nh, len(prefix))
 	}
 	at := len(blob) - nh - len(prefix)
-	if found := blob[at : at+len(prefix)]; !equalOctets(found, prefix) {
+	if found := blob[at : at+len(prefix)]; !bytes.Equal(found, prefix) {
 		return nil, nil, fmt.Errorf("%w: the %d octets before its last %d are %x, and a <V> vector of %d octets is written %x",
 			errVectorTagTail, len(prefix), nh, found, nh, prefix)
 	}
 	return blob[:at], blob[len(blob)-nh:], nil
-}
-
-// equalOctets is a length-checked octet comparison for the length prefix above, spelled out
-// rather than imported so this file needs no comparator a reader has to check against
-// guardrail 8 on the way past. Nothing here compares a tag: the split reads a length prefix,
-// and every tag comparison in this package goes through CryptoProvider.MacVerify.
-func equalOctets(left []byte, right []byte) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
 }
 
 // vectorRunTally is the accounting one family's runner does over its corpus: how the suite
@@ -320,6 +315,26 @@ func publishedCorpusField(t *testing.T, published map[string]json.RawMessage, na
 	return text
 }
 
+// theJsonKeyOf is the json key one field of a corpus row is published under, read off that
+// field's own struct tag rather than typed out a second time.
+//
+// Two spellings of one key in one package is how the two end up disagreeing about which key the
+// corpus actually uses, and the disagreement is silent in the worst direction: the second
+// spelling looks up nothing, the lookup answers "absent", and whatever that absence means is
+// then reported about a corpus that publishes the key perfectly well.
+func theJsonKeyOf(t *testing.T, row any, field string) string {
+	t.Helper()
+	found, ok := reflect.TypeOf(row).FieldByName(field)
+	if !ok {
+		t.Fatalf("%T has no field %s, so nothing names the key it decodes", row, field)
+	}
+	key, _, _ := strings.Cut(found.Tag.Get("json"), ",")
+	if key == "" {
+		t.Fatalf("%T.%s carries no json key, so it decodes under its go name and this lookup would miss it", row, field)
+	}
+	return key
+}
+
 // comparatorRefusal is one deliberately wrong case a family's comparator must refuse, and
 // the sentinel it must refuse it as.
 type comparatorRefusal struct {
@@ -392,6 +407,14 @@ func assertComparatorRefuses(
 // generate nil means the family has no generate direction, and it is asserted as an absence
 // rather than ignored: a family that grew a generator without this call being updated is a
 // generator nothing here says anything about.
+//
+// And the installed Verify is DRIVEN, not merely identified. Pointer identity says the manifest
+// holds this function; it says nothing about the function doing anything. Measured rather than
+// supposed: the body of each of the three registered verifiers was replaced by a discard of its
+// argument and the package still reported 411 passes, with TestVectorFamiliesVerify still logging
+// "3 families verified; 91 published cases offered to them" and TestVectorGenerateThenVerify --
+// whose whole stated property rests on Verify -- still logging its generated cases as verified.
+// assertInstalledVerifierRefusesAWrongCase closes that, once, here, for every family.
 func assertVectorFamilyIsInstalled(
 	t *testing.T,
 	number int,
@@ -416,6 +439,7 @@ func assertVectorFamilyIsInstalled(
 	if got := reflect.ValueOf(family.Verify).Pointer(); got != reflect.ValueOf(verify).Pointer() {
 		t.Fatalf("family %d is installed with a verifier that is not this runner's", number)
 	}
+	assertInstalledVerifierRefusesAWrongCase(t, number, family)
 	if generate == nil {
 		if family.Generate != nil {
 			t.Fatalf("family %d is installed with a generator and this runner declares none, so nothing holds that generator to anything", number)
@@ -427,5 +451,526 @@ func assertVectorFamilyIsInstalled(
 	}
 	if got := reflect.ValueOf(family.Generate).Pointer(); got != reflect.ValueOf(generate).Pointer() {
 		t.Fatalf("family %d is installed with a generator that is not this runner's", number)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// driving the shared machinery, rather than asserting about it
+// ---------------------------------------------------------------------------
+
+// probeAssertion runs one assertion against a probe *testing.T of its own and reports whether
+// that assertion reported a failure.
+//
+// On its own goroutine because t.Fatalf leaves through runtime.Goexit: called on the caller's
+// goroutine it would end the test doing the probing rather than the probe. A panic is recovered
+// and returned rather than taken, for the reason recoveringRow in key_schedule_test.go records
+// -- a panic here takes the whole test binary down, and the run then reports one failure
+// somewhere else and nothing at all about every test declared after it.
+//
+// The probe has no parent, so what it records is recorded nowhere else and the caller decides
+// what it means. mls/syntax/vectors_test.go drives its own family 16 runner the same way.
+func probeAssertion(run func(probe *testing.T)) (failed bool, raised any) {
+	probe := &testing.T{}
+	done := make(chan struct{})
+	go func() {
+		// LIFO, so the recover runs first and close(done) last: a caller reading raised
+		// after <-done reads it after it was written
+		defer close(done)
+		defer func() { raised = recover() }()
+		run(probe)
+	}()
+	<-done
+	return probe.Failed(), raised
+}
+
+// aCaseAtARegisteredSuite is the first case of a corpus at a ciphersuite this package has a
+// provider for.
+//
+// The only kind of case a verifier can be driven with. A case at an unimplemented suite is
+// DECLINED -- the normal condition for five of the seven suites the mlswg files publish -- and a
+// verifier that declined everything is indistinguishable from one that checked everything, which
+// is the whole failure this file exists to make impossible.
+func aCaseAtARegisteredSuite(t *testing.T, file string) (json.RawMessage, bool) {
+	t.Helper()
+	for _, raw := range LoadVectorFile(t, file) {
+		header := struct {
+			CipherSuite uint16 `json:"cipher_suite"`
+		}{}
+		if err := json.Unmarshal(raw, &header); err != nil {
+			t.Fatalf("parse a %s case: %v", file, err)
+		}
+		if _, ok := implementedSuite(header.CipherSuite); ok {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+// flipEveryPublishedOctet rewrites one corpus case so every hex string it publishes, at any
+// depth, differs from the published one in a single bit, and reports how many it changed.
+//
+// DERIVED and not supplied by the family, which is the point. A per family hand written wrong
+// case is a list, and a list is the shape this project has watched understate its own class
+// fourteen times: the family that landed without one would be driven by nothing and would still
+// read as installed. One flipped bit of every hex field is wrong wherever the family reads,
+// without this function knowing what any family reads.
+//
+// Numbers are decoded as json.Number and written back as they were read, so the ciphersuite the
+// case sits at survives untouched: a case rewritten to an unimplemented suite would be declined
+// rather than refused, and every verifier alive or dead would satisfy the control by not running.
+//
+// Only non-empty valid hex is touched. A label or a name is left alone, since corrupting one
+// tests a decoder rather than a comparison -- and a label that happens to read as hex being
+// flipped anyway is harmless, because the case is meant to be wrong.
+func flipEveryPublishedOctet(t *testing.T, raw json.RawMessage) (json.RawMessage, int) {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var tree any
+	if err := decoder.Decode(&tree); err != nil {
+		t.Fatalf("parse the case to corrupt: %v", err)
+	}
+	flipped := 0
+	var walk func(node any) any
+	walk = func(node any) any {
+		switch value := node.(type) {
+		case map[string]any:
+			for key, held := range value {
+				value[key] = walk(held)
+			}
+			return value
+		case []any:
+			for index, held := range value {
+				value[index] = walk(held)
+			}
+			return value
+		case string:
+			octets, err := hex.DecodeString(value)
+			if err != nil || len(octets) == 0 {
+				return value
+			}
+			octets[0] ^= 0x01
+			flipped++
+			return hex.EncodeToString(octets)
+		}
+		return node
+	}
+	body, err := json.Marshal(walk(tree))
+	if err != nil {
+		t.Fatalf("re-encode the corrupted case: %v", err)
+	}
+	return body, flipped
+}
+
+// assertInstalledVerifierRefusesAWrongCase drives the Verify a family registered instead of
+// asserting about it.
+//
+// The unmodified case is required to be ACCEPTED first, and that is not a formality: a Verify
+// that fataled on everything would satisfy the refusal below while comparing nothing, which is
+// the same lesson assertComparatorRefuses records one screen up.
+func assertInstalledVerifierRefusesAWrongCase(t *testing.T, number int, family VectorFamily) {
+	t.Helper()
+	accepted, found := aCaseAtARegisteredSuite(t, family.File)
+	if !found {
+		t.Fatalf("family %d publishes no case at a suite this package registers, so nothing drives the verifier it installed", number)
+	}
+	refused, flipped := flipEveryPublishedOctet(t, accepted)
+	if flipped == 0 {
+		t.Fatalf("family %d's case publishes no hex field to corrupt, so the refusal below would be over an unmodified case", number)
+	}
+	if failed, raised := probeAssertion(func(probe *testing.T) { family.Verify(probe, accepted) }); raised != nil {
+		t.Fatalf("family %d's installed verifier panicked over a published case at a registered suite: %v", number, raised)
+	} else if failed {
+		t.Fatalf("family %d's installed verifier refused a published case at a registered suite; a verifier that refuses everything satisfies the refusal below",
+			number)
+	}
+	if failed, raised := probeAssertion(func(probe *testing.T) { family.Verify(probe, refused) }); raised != nil {
+		t.Fatalf("family %d's installed verifier panicked over a case with all %d of its published hex fields changed: %v",
+			number, flipped, raised)
+	} else if !failed {
+		t.Fatalf("family %d's installed verifier accepted a case with all %d of its published hex fields changed, so it is installed and compares nothing",
+			number, flipped)
+	}
+}
+
+// TestProbeAssertionSeesBothOutcomes is the control on the probe every control below is read
+// through.
+//
+// A probe stuck at "did not report" turns every row below into a green run over an assertion
+// that reports nothing, and a probe stuck at "reported" turns every baseline into one. Both
+// directions are asserted, and so is the panic path, because a probe that took a panic rather
+// than returning it would take the binary down instead of reporting one row.
+func TestProbeAssertionSeesBothOutcomes(t *testing.T) {
+	if failed, raised := probeAssertion(func(probe *testing.T) {}); failed || raised != nil {
+		t.Errorf("an assertion that reported nothing came back failed=%v raised=%v", failed, raised)
+	}
+	if failed, raised := probeAssertion(func(probe *testing.T) { probe.Errorf("reported") }); !failed || raised != nil {
+		t.Errorf("an assertion that reported came back failed=%v raised=%v", failed, raised)
+	}
+	reached := false
+	if failed, raised := probeAssertion(func(probe *testing.T) {
+		probe.Fatalf("reported and stopped")
+		reached = true
+	}); !failed || raised != nil {
+		t.Errorf("an assertion that raised a fatal came back failed=%v raised=%v", failed, raised)
+	}
+	if reached {
+		t.Error("a probe's t.Fatalf returned to its caller rather than ending it")
+	}
+	if failed, raised := probeAssertion(func(probe *testing.T) { panic("the assertion panicked") }); raised == nil {
+		t.Errorf("an assertion that panicked came back failed=%v with no panic reported", failed)
+	} else if raised != "the assertion panicked" {
+		t.Errorf("the probe reported %v rather than what was raised", raised)
+	}
+}
+
+// theSourceDeclaring finds the file of this package that declares one function, or one method on
+// a named receiver, rather than being told which file to read.
+//
+// Found rather than named for the reason sourceDeclaringPackageFunction records: a gate told
+// which file to read goes on issuing a clean bill after the thing it guards moves next door. A
+// subject in no file, or in two, is fatal rather than clean.
+func theSourceDeclaring(t *testing.T, receiver string, name string) parsedSource {
+	t.Helper()
+	found := []parsedSource{}
+	declaring := []string{}
+	for _, path := range packageSourcePaths(t) {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != name || parsed.receiverOf(function) != receiver {
+				continue
+			}
+			found = append(found, parsed)
+			declaring = append(declaring, path)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%q %s is declared in %v, want exactly one file of this package", receiver, name, declaring)
+	}
+	return found[0]
+}
+
+// theReportsOf is every failure one declaration can raise, read as the format strings it hands
+// t.Errorf, t.Error, t.Fatalf and t.Fatal.
+//
+// Derived from the source rather than listed, for guardrail 5's reason. A control table that
+// enumerates the failures somebody remembered understates its class the moment a tenth assertion
+// lands beside the nine it was written against, and the table then reports full coverage of a
+// function it covers less of than it did yesterday. t.Logf is not a failure and is not collected.
+//
+// A report whose first argument is not a string literal is fatal rather than skipped: it is a
+// report no row can be bound to, and skipping it would silently shrink the class again.
+func theReportsOf(t *testing.T, parsed parsedSource, receiver string, name string) []string {
+	t.Helper()
+	reports := []string{}
+	ast.Inspect(parsed.declarationOf(t, receiver, name), func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		selector, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector || !slices.Contains([]string{"Error", "Errorf", "Fatal", "Fatalf"}, selector.Sel.Name) {
+			return true
+		}
+		if len(call.Args) == 0 {
+			t.Fatalf("%s reports through %s with no argument at all, so nothing names it", name, selector.Sel.Name)
+		}
+		literal, isLiteral := call.Args[0].(*ast.BasicLit)
+		if !isLiteral || literal.Kind != token.STRING {
+			t.Fatalf("%s reports through %s with a first argument that is not a string literal, so no control row can be bound to it",
+				name, selector.Sel.Name)
+		}
+		text, err := strconv.Unquote(literal.Value)
+		if err != nil {
+			t.Fatalf("unquote a report of %s: %v", name, err)
+		}
+		reports = append(reports, text)
+		return true
+	})
+	if len(reports) == 0 {
+		t.Fatalf("%s raises no report at all, so the control table over it controls nothing", name)
+	}
+	return reports
+}
+
+// assertEveryReportIsControlled binds a control table to the reports of the function it controls:
+// one row per report, one report per row, and neither list allowed to be the longer.
+//
+// This is what makes the tables below a derived class rather than a list. A row keyed on a
+// message that has been reworded matches nothing and fails here; an assertion added without a row
+// leaves a report unclaimed and fails here; two rows aimed at one report leave another unclaimed
+// and fail here.
+func assertEveryReportIsControlled(t *testing.T, name string, reports []string, keys []string) {
+	t.Helper()
+	if len(keys) != len(reports) {
+		t.Fatalf("%s can raise %d reports and this control offers %d rows; the rows name %v",
+			name, len(reports), len(keys), keys)
+	}
+	claimed := map[int]string{}
+	for _, key := range keys {
+		matched := []int{}
+		for index, report := range reports {
+			if strings.Contains(report, key) {
+				matched = append(matched, index)
+			}
+		}
+		if len(matched) != 1 {
+			t.Fatalf("%s: the control row %q names %d of its reports, want exactly one", name, key, len(matched))
+		}
+		if already, taken := claimed[matched[0]]; taken {
+			t.Fatalf("%s: %q and %q both name the report %q, so some other report is named by nothing",
+				name, already, key, reports[matched[0]])
+		}
+		claimed[matched[0]] = key
+	}
+}
+
+// The two sentinels the comparator control refuses with. Two, because a refusal for the wrong
+// reason is one of the things assertComparatorRefuses reports, and a control with one sentinel
+// cannot produce it.
+var (
+	errComparatorControl      = errors.New("the control comparator's own refusal")
+	errComparatorControlOther = errors.New("some other refusal entirely")
+)
+
+// theComparatorControl has the shape every family's comparator has: it accepts the case that
+// says it is the right one and refuses every other, naming its own sentinel.
+func theComparatorControl(t *testing.T, raw json.RawMessage) error {
+	t.Helper()
+	entry := struct {
+		Right bool `json:"right"`
+	}{}
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return fmt.Errorf("%w: the case will not parse: %v", errComparatorControl, err)
+	}
+	if entry.Right {
+		return nil
+	}
+	return fmt.Errorf("%w: the case is not the right one", errComparatorControl)
+}
+
+// comparatorControlFixture is one whole call of assertComparatorRefuses: the comparator, the case
+// it must accept, and the table of cases it must refuse.
+type comparatorControlFixture struct {
+	compare  func(t *testing.T, raw json.RawMessage) error
+	accepted json.RawMessage
+	refusals []comparatorRefusal
+}
+
+func (self comparatorControlFixture) run(probe *testing.T) {
+	assertComparatorRefuses(probe, "control", self.compare, self.accepted, self.refusals)
+}
+
+// aPassingComparatorControl is the fixture assertComparatorRefuses must accept, and it is what
+// makes every row below mean anything: a driver that reported everything would satisfy a table of
+// failures and say nothing whatever about the driver.
+func aPassingComparatorControl() comparatorControlFixture {
+	return comparatorControlFixture{
+		compare:  theComparatorControl,
+		accepted: json.RawMessage("{\"right\":true}"),
+		refusals: []comparatorRefusal{
+			{"a case that is not the right one", json.RawMessage("{\"right\":false}"), errComparatorControl},
+		},
+	}
+}
+
+// TestAssertComparatorRefusesFlagsTheControlFixture is the control the shared refusal driver owes
+// and has never had.
+//
+// Three families read their refusal tables through this one function now, and the extraction that
+// put them there raised the blast radius of a single deletion inside it from one family to three:
+// the one t.Errorf that reports a comparator accepting a deliberately wrong case was deleted, all
+// three tables stopped meaning anything, and the package reported 411 passes. Measured, not
+// supposed. The rows are bound to the function's own reports, so a seventh assertion cannot land
+// here uncontrolled.
+func TestAssertComparatorRefusesFlagsTheControlFixture(t *testing.T) {
+	if failed, raised := probeAssertion(aPassingComparatorControl().run); failed || raised != nil {
+		t.Fatalf("a correct comparator was reported: failed=%v raised=%v; every row below would then pass for the wrong reason",
+			failed, raised)
+	}
+	rows := []struct {
+		// names is the substring of the report this row must provoke. The bijection
+		// against the function's own reports is asserted below.
+		names string
+		edit  func(*comparatorControlFixture)
+	}{
+		{"no deliberately wrong case was offered", func(f *comparatorControlFixture) {
+			f.refusals = nil
+		}},
+		{"is offered twice", func(f *comparatorControlFixture) {
+			f.refusals = append(f.refusals, f.refusals[0])
+		}},
+		{"names no sentinel", func(f *comparatorControlFixture) {
+			f.refusals[0].want = nil
+		}},
+		{"the unmodified published case was refused", func(f *comparatorControlFixture) {
+			f.compare = func(t *testing.T, raw json.RawMessage) error { return errComparatorControl }
+		}},
+		{"the comparator is not comparing", func(f *comparatorControlFixture) {
+			f.compare = func(t *testing.T, raw json.RawMessage) error { return nil }
+		}},
+		{"a refusal for the wrong reason", func(f *comparatorControlFixture) {
+			f.compare = func(t *testing.T, raw json.RawMessage) error {
+				if err := theComparatorControl(t, raw); err != nil {
+					return errComparatorControlOther
+				}
+				return nil
+			}
+		}},
+	}
+	keys := []string{}
+	for _, row := range rows {
+		keys = append(keys, row.names)
+	}
+	assertEveryReportIsControlled(t, "assertComparatorRefuses",
+		theReportsOf(t, theSourceDeclaring(t, "", "assertComparatorRefuses"), "", "assertComparatorRefuses"), keys)
+	for _, row := range rows {
+		fixture := aPassingComparatorControl()
+		fixture.refusals = slices.Clone(fixture.refusals)
+		row.edit(&fixture)
+		failed, raised := probeAssertion(fixture.run)
+		if raised != nil {
+			t.Errorf("%s: the driver panicked: %v", row.names, raised)
+			continue
+		}
+		if !failed {
+			t.Errorf("%s: the driver reported nothing, so that report can be deleted with all three families' refusal tables still reading green",
+				row.names)
+		}
+	}
+}
+
+// vectorRunControlFixture is one whole call of assertRun: the tally, and the four counts the
+// family wrote down.
+type vectorRunControlFixture struct {
+	tally       *vectorRunTally
+	covered     int
+	skipped     int
+	comparisons int
+	distinct    int
+}
+
+func (self vectorRunControlFixture) run(probe *testing.T) {
+	self.tally.assertRun(probe, self.covered, self.skipped, self.comparisons, self.distinct)
+}
+
+// aPassingVectorRun is a run assertRun must accept, built over the suites this package actually
+// registers rather than over invented ones, so a suite added to the registry cannot leave this
+// control asserting over a registry that no longer exists.
+func aPassingVectorRun(t *testing.T) vectorRunControlFixture {
+	t.Helper()
+	suites := Suites()
+	if len(suites) == 0 {
+		t.Fatal("this package registers no ciphersuite, so assertRun has nothing to be controlled over")
+	}
+	// a code point outside the registry, so this run has a skipped half as every real run
+	// does. Checked rather than assumed: a registry that grew to hold it would turn the
+	// skipped case into a covered one and every row below would drift.
+	if _, ok := implementedSuite(unregisteredControlSuite); ok {
+		t.Fatalf("suite %#04x is registered, so the skipped case of this control is not skipped", unregisteredControlSuite)
+	}
+	tally := &vectorRunTally{
+		file:        "control.json",
+		matched:     map[CipherSuite]int{},
+		published:   map[uint16]int{unregisteredControlSuite: 1},
+		answers:     map[string]int{"00": 1, "01": 1},
+		comparisons: 2,
+		skipped:     1,
+	}
+	for _, suite := range suites {
+		tally.published[uint16(suite)]++
+		tally.matched[suite]++
+		tally.covered++
+	}
+	tally.entries = tally.covered + tally.skipped
+	return vectorRunControlFixture{
+		tally:       tally,
+		covered:     tally.covered,
+		skipped:     tally.skipped,
+		comparisons: tally.comparisons,
+		distinct:    len(tally.answers),
+	}
+}
+
+// Two code points this package does not register: one for the skipped half of a control run, one
+// for the row that widens the covered key set. Both are asserted unregistered where they are used
+// rather than assumed, because a registry that grew to hold either would make that row silently
+// stop being the edit it is named after.
+const (
+	unregisteredControlSuite = uint16(0xffff)
+	alienControlSuite        = uint16(0xfffe)
+)
+
+// TestAssertRunFlagsTheControlFixture is the control the shared accounting owes and has never had.
+//
+// Every count assertion three families make about their own runs lives in assertRun, and an
+// `if true { return }` inserted after its t.Helper() disarmed all three at once with the package
+// still reporting 411 passes. Measured, not supposed. Each row below is one minimal edit of a run
+// assertRun accepts, and the rows are bound to the function's own reports, so an assertion added
+// without a row fails here rather than arriving uncontrolled.
+func TestAssertRunFlagsTheControlFixture(t *testing.T) {
+	if failed, raised := probeAssertion(aPassingVectorRun(t).run); failed || raised != nil {
+		t.Fatalf("a complete and consistent run was reported: failed=%v raised=%v; every row below would then pass for the wrong reason",
+			failed, raised)
+	}
+	first := Suites()[0]
+	if _, ok := implementedSuite(alienControlSuite); ok {
+		t.Fatalf("suite %#04x is registered, so the row below does not widen the covered key set", alienControlSuite)
+	}
+	rows := []struct {
+		// names is the substring of the report this row must provoke; the bijection
+		// against assertRun's own reports is asserted below.
+		names string
+		edit  func(*vectorRunControlFixture)
+	}{
+		{"a case took neither branch", func(f *vectorRunControlFixture) {
+			f.tally.entries++
+		}},
+		{"matched no case at all", func(f *vectorRunControlFixture) {
+			f.tally.matched = map[CipherSuite]int{}
+			f.tally.covered = 0
+			f.tally.entries = f.tally.skipped
+		}},
+		{"covered %d cases, want", func(f *vectorRunControlFixture) {
+			f.covered++
+		}},
+		{"skipped %d cases at unimplemented suites", func(f *vectorRunControlFixture) {
+			f.skipped++
+		}},
+		{"the corpus answered for", func(f *vectorRunControlFixture) {
+			f.tally.matched[CipherSuite(alienControlSuite)] = 1
+		}},
+		{"publishes nothing at suite", func(f *vectorRunControlFixture) {
+			delete(f.tally.published, uint16(first))
+		}},
+		{"was covered %d times", func(f *vectorRunControlFixture) {
+			f.tally.published[uint16(first)] = f.tally.matched[first] + 1
+		}},
+		{"made %d comparisons over", func(f *vectorRunControlFixture) {
+			f.comparisons++
+		}},
+		{"distinct published answers, want", func(f *vectorRunControlFixture) {
+			f.distinct++
+		}},
+	}
+	keys := []string{}
+	for _, row := range rows {
+		keys = append(keys, row.names)
+	}
+	assertEveryReportIsControlled(t, "assertRun",
+		theReportsOf(t, theSourceDeclaring(t, "*vectorRunTally", "assertRun"), "*vectorRunTally", "assertRun"), keys)
+	for _, row := range rows {
+		fixture := aPassingVectorRun(t)
+		row.edit(&fixture)
+		failed, raised := probeAssertion(fixture.run)
+		if raised != nil {
+			t.Errorf("%s: assertRun panicked: %v", row.names, raised)
+			continue
+		}
+		if !failed {
+			t.Errorf("%s: assertRun reported nothing, so that assertion can be deleted with all three families' counts still reading green",
+				row.names)
+		}
 	}
 }
