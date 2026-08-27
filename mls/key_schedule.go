@@ -319,14 +319,35 @@ func NewKeyScheduleFromEpochSecret(
 
 // JoinerSecret is the joiner_secret a Welcome carries to a new member, or nil on the group
 // creation path, where the group was never joined and no such secret exists.
+//
+// Nil also for an epoch whose secrets have been erased, and that second nil is the one worth
+// the check. An erase leaves KDF.Nh ZERO bytes behind rather than a short slice, and that is
+// exactly the length NewKeyScheduleFromJoiner requires, so a caller handed those would rebuild
+// the whole epoch out of a secret every party can compute — with err == nil, because nothing
+// downstream is in a position to notice. The nine are protected at each derivation instead,
+// since the nine are consumed inside this type where secretIsLive can be asked; joiner_secret
+// is consumed by a package level function that is handed bytes and has no epoch to ask, so for
+// this one the refusal has to be here.
 func (self *KeySchedule) JoinerSecret() []byte {
+	if !self.secretIsLive(self.joinerSecret) {
+		return nil
+	}
 	return self.joinerSecret
 }
 
 // WelcomeSecret is the input to the Welcome AEAD key and nonce, or nil on the group
 // creation path. Nil rather than a zero secret, so a caller that seals a Welcome with it
 // fails a length check instead of sealing under KDF.Nh zero bytes.
+//
+// An erased epoch answers nil for that same sentence read the other way round. WelcomeKeyNonce
+// refuses a welcome_secret of the wrong length and an erase leaves the length exactly as it
+// was, so without this the one caller the sentence was written for — a creator holding nil —
+// is protected, while a caller holding an aged out epoch seals encrypted_group_info under an
+// expansion of KDF.Nh zero bytes that every party can recompute.
 func (self *KeySchedule) WelcomeSecret() []byte {
+	if !self.secretIsLive(self.welcomeSecret) {
+		return nil
+	}
 	return self.welcomeSecret
 }
 
@@ -607,4 +628,45 @@ func WelcomeKeyNonce(crypto CryptoProvider, welcomeSecret []byte) (key []byte, n
 	key = crypto.ExpandWithLabel(welcomeSecret, "key", nil, crypto.KeySize())
 	nonce = crypto.ExpandWithLabel(welcomeSecret, "nonce", nil, crypto.NonceSize())
 	return key, nonce, nil
+}
+
+// Zeroize erases every secret this epoch holds, in place. The owning Group calls it when the
+// epoch leaves PastEpochWindow.
+//
+// All twelve go through zeroizeSecret rather than through a loop written here, which is what
+// keeps this inside the class TestEveryEraseHelperCarriesTheNoInlineDirective derives: an
+// erase spelled inline is one the compiler may inline and then elide, since in a caller that
+// drops the schedule immediately afterwards these stores are writes to memory nothing reads
+// again. Best effort in exactly the sense secret_zeroize.go sets out — it reaches the arrays
+// this schedule points at, and no copy anybody took off them.
+//
+// It is idempotent, and has to be: an epoch may be dropped from the window by one path and
+// released by another, and a second call over KDF.Nh zeros has to be a no-op rather than a
+// fault.
+//
+// groupContextBytes is deliberately not erased. The serialized GroupContext is not a secret —
+// every member of the group holds it, and it is the thing framing signs and MACs over — so
+// erasing it would take away nothing an attacker lacks. It is the one byte slice of this type
+// that is exempt, and it is exempt through a written row that
+// TestZeroizeErasesEveryByteSliceThisTypeDeclares checks in both directions, so a tenth secret
+// cannot join it by being forgotten.
+//
+// What the schedule does AFTERWARDS is not this function's doing and is the reason the erase
+// can be this blunt: secretIsLive is asked at every derivation, so an erased epoch refuses
+// rather than answering. Without that, every method here would go on answering — a tag, an
+// export, an HPKE key pair, all derived from KDF.Nh zero bytes, all publicly computable, all
+// the right length, and all with err == nil.
+func (self *KeySchedule) Zeroize() {
+	zeroizeSecret(self.joinerSecret)
+	zeroizeSecret(self.welcomeSecret)
+	zeroizeSecret(self.epochSecret)
+	zeroizeSecret(self.secrets.SenderData)
+	zeroizeSecret(self.secrets.Encryption)
+	zeroizeSecret(self.secrets.Exporter)
+	zeroizeSecret(self.secrets.External)
+	zeroizeSecret(self.secrets.Confirmation)
+	zeroizeSecret(self.secrets.Membership)
+	zeroizeSecret(self.secrets.ResumptionPsk)
+	zeroizeSecret(self.secrets.EpochAuthenticator)
+	zeroizeSecret(self.secrets.InitSecret)
 }

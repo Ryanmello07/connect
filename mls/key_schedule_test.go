@@ -2209,10 +2209,33 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 		}
 	}
 
+	// what the readings below are views INTO, kept so this sweep can say whether one of the
+	// calls it made rewrote a reading another of them had already taken
+	live := bytes.Clone(schedule.Secrets().InitSecret)
+
 	exposed := []exposedSlice{}
 	swept := []string{}
+	notCalled := []string{}
 	for i := range scheduleType.NumMethod() {
 		method := scheduleType.Method(i)
+		// a method handed nothing that answers nothing has nowhere to put a secret, so there
+		// is no answer here to read -- and calling it can only change what the REST of this
+		// sweep reads, since everything collected below is a view into the schedule's own
+		// arrays rather than a copy of them. Zeroize is that shape, and it sorts last of the
+		// exported methods. Measured, not supposed: with Zeroize present and called here,
+		// every slice this sweep had collected read as zeros by the time the comparison ran,
+		// and TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret went on PASSING
+		// against func (self *KeySchedule) EpochSecretLeak() []byte { return self.epochSecret }
+		// appended to key_schedule.go -- the same edit it catches at ten epochs without it.
+		//
+		// The criterion is the signature and not the name. It is the same shape filter
+		// theExportedMethodsHandingOutWhatTheyReach applies to the source, for the same
+		// reason, so the two agree about what an eraser is and a second one joins by existing.
+		// What such a method can REACH is that gate's question rather than this one's.
+		if method.Type.NumIn() == 1 && method.Type.NumOut() == 0 {
+			notCalled = append(notCalled, method.Name)
+			continue
+		}
 		// one row of no arguments for an accessor, and whatever
 		// keyScheduleMethodArgumentRows supplies for a method that takes some
 		rows := [][]reflect.Value{nil}
@@ -2274,6 +2297,16 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 		if _, found := scheduleType.MethodByName(name); !found {
 			t.Errorf("keyScheduleMethodArgumentRows drives %s, which *KeySchedule does not declare", name)
 		}
+	}
+	// and no call this sweep made rewrote a reading another of them had already taken. The
+	// skip above is what keeps that true today; this is what says so if it stops being, and
+	// it is the difference between a sweep that read nothing and a sweep that read zeros.
+	if !bytes.Equal(schedule.Secrets().InitSecret, live) {
+		t.Fatalf("%s: init_secret changed while this sweep ran, so what it collected is not what those methods answered and every comparison over it runs against the rewrite",
+			at)
+	}
+	if len(notCalled) != 0 {
+		t.Logf("%s: %v are handed nothing and answer nothing, so this sweep recorded them rather than calling them", at, notCalled)
 	}
 	return exposed, swept
 }
@@ -2884,6 +2917,24 @@ func theNamesReachingTheEpochSecret(declared []sourceDeclaration) []string {
 // declaring a method of one spelling are reported together, and a reader who is told "Export"
 // cannot tell which. That over-report is the price of the safe direction, and naming both is
 // what keeps it readable rather than mysterious.
+// hasSomewhereToPutASecret is the shape half of both G6's method gate and the erased epoch
+// gate, written once because the two ask the same question of the same declarations.
+//
+// A declaration can only hand a secret OUT through a result that is not an error, or through a
+// byte slice its caller handed in and it can write over. An eraser reaches every secret the
+// epoch holds -- reaching them is what erasing IS -- and is handed nothing and answers
+// nothing, so it falls outside both classes by its own shape rather than by a name written
+// down anywhere. Zeroize is the first declaration of this package in that position, and a
+// second spelling of this rule would be a second thing that could stop agreeing with the first.
+func hasSomewhereToPutASecret(one sourceDeclaration, byteSlices []string) bool {
+	if slices.ContainsFunc(one.results, func(result string) bool { return result != "error" }) {
+		return true
+	}
+	return slices.ContainsFunc(one.params, func(parameter string) bool {
+		return slices.Contains(byteSlices, parameter)
+	})
+}
+
 func theExportedMethodsHandingOutWhatTheyReach(declared []sourceDeclaration, byteSlices []string) []string {
 	reaching := theNamesReachingTheEpochSecret(declared)
 	handingOut := []string{}
@@ -2891,13 +2942,7 @@ func theExportedMethodsHandingOutWhatTheyReach(declared []sourceDeclaration, byt
 		if one.receiver == "" || !one.exported || !slices.Contains(reaching, one.name) {
 			continue
 		}
-		somewhereToPutIt := slices.ContainsFunc(one.results, func(result string) bool { return result != "error" })
-		for _, parameter := range one.params {
-			if slices.Contains(byteSlices, parameter) {
-				somewhereToPutIt = true
-			}
-		}
-		if somewhereToPutIt {
+		if hasSomewhereToPutASecret(one, byteSlices) {
 			handingOut = append(handingOut, "("+one.receiver+")."+one.name)
 		}
 	}
@@ -5382,10 +5427,18 @@ func epochSecretsStorageFieldIn(t *testing.T, structs map[string]*ast.StructType
 // ExternalKeyPair read a named secret out of it and expand something over the value. Only the
 // second kind can answer a derivation of a secret that is no longer there, so only the second
 // kind is what the gate below holds.
-func theMethodsDerivingFromOneOfTheNine(declared []sourceDeclaration, storage string) []string {
+func theMethodsDerivingFromOneOfTheNine(declared []sourceDeclaration, storage string, byteSlices []string) []string {
 	deriving := []string{}
 	for _, one := range declared {
 		if !one.exported || one.body == nil {
+			continue
+		}
+		// an eraser reads every one of the nine BY NAME and derives from none of them: it is
+		// handed nothing and answers nothing, so there is no value for an erased epoch to
+		// refuse and nothing for the live control below to observe. Zeroize is that shape.
+		// Told apart by the shape rather than by the name, through the same predicate G6's
+		// method gate uses, so the two cannot come to disagree about what an eraser is.
+		if !hasSomewhereToPutASecret(one, byteSlices) {
 			continue
 		}
 		found := false
@@ -5409,7 +5462,13 @@ func theMethodsDerivingFromOneOfTheNine(declared []sourceDeclaration, storage st
 
 // erasedEpochControl declares one of each shape that derivation has to tell apart: a method
 // that reads a named secret out of the storage, one that answers the storage whole, one that
-// reads something else entirely, and an unexported one that reads a named secret.
+// reads something else entirely, an unexported one that reads a named secret, and an ERASER,
+// which reads every one of them by name and is handed nothing and answers nothing.
+//
+// The eraser is the shape this class has to DROP rather than demand a refusal from. Zeroize is
+// it. Without this row the filter that drops it could be deleted with the control still
+// matching exactly, and the gate would then ask a method that answers nothing at all to satisfy
+// a live control it cannot satisfy.
 const erasedEpochControl = "package control\n" +
 	"\n" +
 	"type EpochSecrets struct {\n" +
@@ -5435,6 +5494,16 @@ const erasedEpochControl = "package control\n" +
 	"\n" +
 	"func (self *Holder) derivesButIsUnexported() []byte {\n" +
 	"\treturn expand(self.secrets.Exporter)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) ErasesOneOfThem() {\n" +
+	"\tzero(self.secrets.Exporter)\n" +
+	"}\n" +
+	"\n" +
+	"func zero(secret []byte) {\n" +
+	"\tfor i := range secret {\n" +
+	"\t\tsecret[i] = 0\n" +
+	"\t}\n" +
 	"}\n" +
 	"\n" +
 	"func expand(secret []byte) []byte {\n" +
@@ -5556,7 +5625,7 @@ func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.
 	if storage := epochSecretsStorageFieldIn(t, controlStructs, "Holder"); storage != "secrets" {
 		t.Fatalf("the storage field scan read %q out of the control, want \"secrets\"", storage)
 	}
-	controlDeriving := theMethodsDerivingFromOneOfTheNine(declaredIn(control), "secrets")
+	controlDeriving := theMethodsDerivingFromOneOfTheNine(declaredIn(control), "secrets", []string{"[]byte"})
 	if want := []string{"DerivesFromOneOfThem"}; !slices.Equal(controlDeriving, want) {
 		t.Fatalf("the matcher read %v out of the control as deriving from one of the nine, want %v; it is not telling a read of a named secret from an answer of the storage whole",
 			controlDeriving, want)
@@ -5575,7 +5644,8 @@ func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.
 		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
 	}
 	storage := epochSecretsStorageFieldIn(t, structs, holders[0])
-	deriving := theMethodsDerivingFromOneOfTheNine(declaredAcross(files), storage)
+	deriving := theMethodsDerivingFromOneOfTheNine(declaredAcross(files), storage,
+		slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t)))
 	if len(deriving) == 0 {
 		t.Fatalf("no exported method of this package reads %s.<one of the nine>, and this package declares Export and ExternalKeyPair, so the scan is reading nothing",
 			storage)
@@ -6340,8 +6410,8 @@ func TestTheTagsRefuseAnEpochWhoseSecretsHaveBeenErased(t *testing.T) {
 // under an epoch key without reading one of the nine, and a method that answers anything but a
 // bool is not answering a comparison. Deriving it beats naming the two verifiers for the reason
 // standing rule 5 gives: a third one lands inside the class rather than beside it.
-func boolAnsweringDerivations(declared []sourceDeclaration, storage string) []string {
-	deriving := theMethodsDerivingFromOneOfTheNine(declared, storage)
+func boolAnsweringDerivations(declared []sourceDeclaration, storage string, byteSlices []string) []string {
+	deriving := theMethodsDerivingFromOneOfTheNine(declared, storage, byteSlices)
 	names := []string{}
 	for _, one := range declared {
 		if !one.exported || one.body == nil {
@@ -6569,7 +6639,7 @@ func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
 	// the control first, on both halves
 	control := mustParseText(t, "the tag verifier routing control", tagVerifierRoutingControl)
 	controlDeclared := declaredIn(control)
-	controlClass := boolAnsweringDerivations(controlDeclared, "secrets")
+	controlClass := boolAnsweringDerivations(controlDeclared, "secrets", []string{"[]byte"})
 	wantClass := tagVerifierRoutingControlClass
 	if !slices.Equal(controlClass, wantClass) {
 		t.Fatalf("the class read %v out of the control, want %v; it is not intersecting a bool result with a read of one of the nine, or it is reading the unexported one",
@@ -6648,7 +6718,8 @@ func theTagVerifiersOfThisPackage(t *testing.T) []tagVerifierSourceDeclaration {
 	if len(holders) != 1 {
 		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
 	}
-	class := boolAnsweringDerivations(declaredAcross(files), epochSecretsStorageFieldIn(t, structs, holders[0]))
+	class := boolAnsweringDerivations(declaredAcross(files), epochSecretsStorageFieldIn(t, structs, holders[0]),
+		slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t)))
 	if len(class) == 0 {
 		t.Fatalf("no exported declaration of this package answers a bool off one of the nine, and this task lands two, so this gate is demanding nothing")
 	}
@@ -6805,7 +6876,7 @@ func TestEveryTagVerifierAnswersOverTheBytesItWasGivenUntouched(t *testing.T) {
 	// is the only witness for is a half that can be deleted with the control still matching
 	// exactly — which is how the routing gate beside this one came to carry a dead one
 	control := mustParseText(t, "the tag verifier routing control", tagVerifierRoutingControl)
-	controlClass := boolAnsweringDerivations(declaredIn(control), "secrets")
+	controlClass := boolAnsweringDerivations(declaredIn(control), "secrets", []string{"[]byte"})
 	if !slices.Equal(controlClass, tagVerifierRoutingControlClass) {
 		t.Fatalf("the class read %v out of the control, want %v; it is not intersecting a bool result with a read of one of the nine, or it is reading the unexported one",
 			controlClass, tagVerifierRoutingControlClass)
@@ -7477,5 +7548,676 @@ func TestWelcomeKeyNonceRefusesASecretThatIsNotKdfNh(t *testing.T) {
 		if _, _, err := WelcomeKeyNonce(crypto, bytes.Repeat([]byte{0x2c}, nh)); err != nil {
 			t.Errorf("%s: a KDF.Nh welcome secret was refused with %v, so every refusal above is vacuous", at, err)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 12: Zeroize, and the shape of G6 the three gates above leave open
+// ---------------------------------------------------------------------------
+//
+// The plan's own task 12 supplies TestKeyScheduleDoesNotExportEpochSecret, which reflects over
+// KeySchedule for an exported field, checks the exported method names against a list written
+// beside it, and checks that EpochSecrets declares no field spelled EpochSecret. Every one of
+// those three is already covered here and covered harder, so it is not copied in:
+//
+//   - the exported field check is bytesTheScheduleHandsOut's own first act, and it is fatal
+//     there;
+//   - an allowlist of method names is standing rule 5's mistake written out. The three gates
+//     above sweep the methods that exist and compare what each ANSWERS against an independent
+//     statement of epoch_secret, so a method added later is read rather than merely noticed,
+//     and one that leaks under a single label -- which is what a signature cannot show -- is
+//     caught by the source reachability gate;
+//   - "no field named EpochSecret" is a NAME. The sweep compares the bytes of every field of
+//     EpochSecrets against the real epoch secret, so a field carrying it under any other
+//     spelling fails, which is the property the name was standing in for.
+//
+// What the three do NOT cover is the shape they each, for their own reason, have to let past:
+// a declaration that reaches the parent secret and puts it somewhere the call does not end.
+// TestNoExportedMethodOfThisPackageCanReachTheEpochSecret says so in its own comment -- an
+// eraser reaches every secret the epoch holds and is exempt because it "answers nothing and is
+// handed nothing" -- and until Zeroize landed, that exemption covered nothing at all. It now
+// covers a method, so the exemption has to be worth what it claims: the two gates below are
+// what makes it so.
+
+// zeroizeSourceControl declares one of each shape the byte slice class has to tell apart: a
+// field the erase reaches, a field it does not, a byte slice one struct hop away that it does
+// reach, and storage that is not a byte slice at all.
+//
+// Without it a derivation that had stopped deriving -- a parse that read no structs, a walk
+// that never followed the nested type -- would report an empty class, the gate reading it
+// would demand nothing of Zeroize, and the run would look exactly like the run of a complete
+// one. The forgotten field is the load bearing row: a class that reported only what the erase
+// already touches is a class that can never fail.
+const zeroizeSourceControl = "package control\n" +
+	"\n" +
+	"type Inner struct {\n" +
+	"\tnested []byte\n" +
+	"}\n" +
+	"\n" +
+	"type Holder struct {\n" +
+	"\tprovider  int\n" +
+	"\terased    []byte\n" +
+	"\tforgotten []byte\n" +
+	"\tinner     Inner\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) Zeroize() {\n" +
+	"\twipe(self.erased)\n" +
+	"\twipe(self.inner.nested)\n" +
+	"}\n" +
+	"\n" +
+	"func wipe(secret []byte) {\n" +
+	"\tfor i := range secret {\n" +
+	"\t\tsecret[i] = 0\n" +
+	"\t}\n" +
+	"}\n"
+
+// theByteSlicesHeldBy is every byte slice a named struct type reaches: the ones it declares
+// itself, and the ones declared by every named struct type it holds a field of.
+//
+// The walk is what makes this the class rather than a copy of it. The nine live one hop away
+// inside EpochSecrets, so a scan that read KeySchedule's own fields would report three secrets
+// out of twelve and pass Zeroize with the nine untouched -- and the batch B report's point
+// about this plan's three nine row tables is that a tenth secret has to drop out of the class
+// by ARRIVING, not by somebody remembering to add a row for it.
+//
+// A named byte slice type counts as a byte slice, for the reason exposedByteSlices reads kinds
+// rather than spellings: HpkePrivateKey is the same array to the compiler, and a secret held
+// under one would be exempted by a comparison against the literal []byte alone.
+func theByteSlicesHeldBy(structs map[string]*ast.StructType, root string, named []string) []string {
+	held := []string{}
+	seen := map[string]bool{}
+	var walk func(name string)
+	walk = func(name string) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		structure, isDeclared := structs[name]
+		if !isDeclared {
+			return
+		}
+		for _, field := range structure.Fields.List {
+			isByteSlice := false
+			if slice, isSlice := field.Type.(*ast.ArrayType); isSlice && slice.Len == nil {
+				if element, isIdentifier := slice.Elt.(*ast.Ident); isIdentifier && element.Name == "byte" {
+					isByteSlice = true
+				}
+			}
+			if identifier, isIdentifier := field.Type.(*ast.Ident); isIdentifier && slices.Contains(named, identifier.Name) {
+				isByteSlice = true
+			}
+			if isByteSlice {
+				for _, declared := range field.Names {
+					held = append(held, declared.Name)
+				}
+			}
+			for _, mentioned := range identifiersNamedIn(field.Type) {
+				walk(mentioned)
+			}
+		}
+	}
+	walk(root)
+	slices.Sort(held)
+	return slices.Compact(held)
+}
+
+// theByteSlicesErasedBy is the field names one declaration hands to one of this package's erase
+// helpers.
+//
+// It reads the ARGUMENT of a call to a helper rather than any mention of the field, which is
+// the difference between an erase and a read. A body that merely named every secret -- a length
+// check over each, a log line -- would satisfy a mention count while erasing nothing, and that
+// is precisely the shape "make Zeroize a no-op" takes once the calls are gone.
+//
+// The helpers are derived by eraseHelpersIn rather than named here, so an erase spelled through
+// a second helper counts -- and that second helper is held to the noinline directive by
+// TestEveryEraseHelperCarriesTheNoInlineDirective, which is what makes delegating to one an
+// erase at all.
+func theByteSlicesErasedBy(parsed parsedSource, function *ast.FuncDecl, helpers []string) []string {
+	erased := []string{}
+	if function == nil || function.Body == nil {
+		return erased
+	}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		if !slices.Contains(helpers, parsed.render(call.Fun)) {
+			return true
+		}
+		for _, argument := range call.Args {
+			if selector, isSelector := argument.(*ast.SelectorExpr); isSelector {
+				erased = append(erased, selector.Sel.Name)
+			}
+		}
+		return true
+	})
+	slices.Sort(erased)
+	return slices.Compact(erased)
+}
+
+// declarationByName is the parsed declaration of one function or method, with the file it was
+// read out of, so a scan can render its expressions in the right token.FileSet.
+func declarationByName(files []parsedSource, name string) (parsedSource, *ast.FuncDecl) {
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if isFunction && function.Name.Name == name {
+				return parsed, function
+			}
+		}
+	}
+	return parsedSource{}, nil
+}
+
+// scheduleByteSlicesThatAreNotSecrets is the storage of the key schedule that Zeroize is not
+// required to erase, with the reason written out for each.
+//
+// The CLASS is derived off the type's own source and this table is checked against it in both
+// directions, so a field cannot fall outside the erase by being forgotten and a row cannot
+// outlive the field it excuses. That is the shape standing rule 5 asks for: derive the members,
+// and make every exception carry a sentence somebody had to write.
+var scheduleByteSlicesThatAreNotSecrets = map[string]string{
+	"groupContextBytes": "the serialized GroupContext is not a secret. Every member of the group holds it, " +
+		"it is what framing signs and MACs over, and it is public the moment a Welcome is sent, so erasing " +
+		"it would take away nothing an attacker lacks while leaving GroupContextBytes() answering a run of " +
+		"zeros that a caller could frame under",
+}
+
+// TestZeroizeErasesEveryByteSliceThisTypeDeclares is the completeness half of the erase, read
+// off the source because the behavioural half cannot see all of it.
+//
+// epoch_secret is unreachable through every exported symbol of this package -- that is G6, and
+// three gates above hold it -- so no test can observe whether Zeroize erased it. That leaves
+// exactly one way to know, which is to read the erase. And the same reading is what turns "a
+// tenth secret is added to EpochSecrets" from a silent omission into a failure: the class is
+// walked off the struct declarations, so the tenth joins it by arriving and Zeroize fails until
+// it is erased.
+func TestZeroizeErasesEveryByteSliceThisTypeDeclares(t *testing.T) {
+	// the control first: the walk crosses a struct hop, the erase reading tells a call from a
+	// mention, and the difference between the two is the field nobody erased
+	control := mustParseText(t, "the zeroize source control", zeroizeSourceControl)
+	controlStructs := map[string]*ast.StructType{}
+	structTypesIn(control, controlStructs)
+	controlHeld := theByteSlicesHeldBy(controlStructs, "Holder", []string{})
+	if want := []string{"erased", "forgotten", "nested"}; !slices.Equal(controlHeld, want) {
+		t.Fatalf("the byte slice walk read %v out of the control, want %v; it is not reading the type's own fields or not following the struct it holds",
+			controlHeld, want)
+	}
+	_, controlZeroize := declarationByName([]parsedSource{control}, "Zeroize")
+	if controlZeroize == nil {
+		t.Fatal("the control declares no Zeroize, so the erase reading below is over nothing")
+	}
+	controlErased := theByteSlicesErasedBy(control, controlZeroize, []string{"wipe"})
+	if want := []string{"erased", "nested"}; !slices.Equal(controlErased, want) {
+		t.Fatalf("the erase reading read %v out of the control, want %v; it is not reading the argument of a call to an erase helper",
+			controlErased, want)
+	}
+
+	// then this package's own source
+	files := []parsedSource{}
+	structs := map[string]*ast.StructType{}
+	helpers := []string{}
+	named := packageByteSliceTypeNames(t)
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		files = append(files, parsed)
+		structTypesIn(parsed, structs)
+		declared, _ := eraseHelpersIn(mustReadCommented(t, path), named)
+		helpers = append(helpers, declared...)
+	}
+	if len(helpers) == 0 {
+		t.Fatal("this package's source declares no erase helper, so the reading below finds no erase however Zeroize is written")
+	}
+	holders := theTypesHoldingTheEpochSecret(structs)
+	if len(holders) != 1 {
+		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
+	}
+	held := theByteSlicesHeldBy(structs, holders[0], named)
+	// the positive control on the real source. The nine live one struct hop away, so a walk
+	// that had stopped crossing that hop reports three and passes an erase that touches none
+	// of them -- which is the clean run a complete walk also reports.
+	if len(held) < reflect.TypeOf(EpochSecrets{}).NumField()+3 {
+		t.Fatalf("the walk read %d byte slices off %s and the type reaches %d fields of EpochSecrets alone, so it is not reading what it claims to",
+			len(held), holders[0], reflect.TypeOf(EpochSecrets{}).NumField())
+	}
+
+	parsed, zeroize := declarationByName(files, "Zeroize")
+	if zeroize == nil {
+		t.Fatal("this package declares no Zeroize, and an epoch that leaves PastEpochWindow has to have one")
+	}
+	erased := theByteSlicesErasedBy(parsed, zeroize, helpers)
+	t.Logf("%s reaches %d byte slices %v; Zeroize erases %v through %v", holders[0], len(held), held, erased, helpers)
+
+	for _, field := range held {
+		if slices.Contains(erased, field) {
+			if reason, excused := scheduleByteSlicesThatAreNotSecrets[field]; excused {
+				t.Errorf("Zeroize erases %s and scheduleByteSlicesThatAreNotSecrets excuses it as %q; one of the two is wrong and which one holds cannot be read off either",
+					field, reason)
+			}
+			continue
+		}
+		if _, excused := scheduleByteSlicesThatAreNotSecrets[field]; excused {
+			continue
+		}
+		t.Errorf("%s reaches byte slice %s and Zeroize hands it to none of %v; an epoch that leaves PastEpochWindow with a secret still in it is the whole of what this erase is for, and a secret that is not a secret needs a row in scheduleByteSlicesThatAreNotSecrets saying why",
+			holders[0], field, helpers)
+	}
+	for field := range scheduleByteSlicesThatAreNotSecrets {
+		if !slices.Contains(held, field) {
+			t.Errorf("scheduleByteSlicesThatAreNotSecrets excuses %s, which is not a byte slice %s reaches; a row that outlived its field excuses nothing and hides that it does",
+				field, holders[0])
+		}
+	}
+}
+
+// TestZeroizeLeavesNothingReadableOfWhatTheScheduleHeld is the behavioural half: every secret a
+// live epoch hands out reads as zeros afterwards, through the same slice the caller was given.
+//
+// The field set is read off EpochSecrets by reflection rather than written out, for the reason
+// epochSecretsByField exists at all: this plan supplies three separate nine row tables, and a
+// tenth secret or a renamed field drops out of all three at once while every one of them goes
+// on reporting the clean run a complete sweep reports.
+//
+// Two controls, and each is the difference between observing the erase and observing nothing.
+// Every secret is read before the call and required to be non zero, or "all zero afterwards"
+// would be satisfied by a secret that was already zero; and the erase is required to reach the
+// slice the CALLER holds rather than some copy, which is the property (*KeySchedule).Secrets'
+// own comment rests on and the one a schedule that erased a clone of its storage would fail
+// while every length and every value check still passed.
+func TestZeroizeLeavesNothingReadableOfWhatTheScheduleHeld(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		held := map[string][]byte{
+			"joiner_secret":  schedule.JoinerSecret(),
+			"welcome_secret": schedule.WelcomeSecret(),
+		}
+		for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
+			held["EpochSecrets."+name] = secret
+		}
+		if len(held) != reflect.TypeOf(EpochSecrets{}).NumField()+2 {
+			t.Fatalf("%s: this sweep collected %d secrets and the epoch holds %d reachable ones",
+				epoch.at, len(held), reflect.TypeOf(EpochSecrets{}).NumField()+2)
+		}
+		// the live control: each of them is KDF.Nh bytes and none of them is already zero, so
+		// an all zero reading afterwards is the erase and not the state they started in
+		for name, secret := range held {
+			if len(secret) != epoch.crypto.HashSize() {
+				t.Fatalf("%s: %s is %d bytes before the erase and KDF.Nh is %d, so it is not a secret this reading covers",
+					epoch.at, name, len(secret), epoch.crypto.HashSize())
+			}
+			if !slices.ContainsFunc(secret, func(b byte) bool { return b != 0 }) {
+				t.Fatalf("%s: %s is already %d zero bytes before Zeroize, so an all zero reading after it would say nothing",
+					epoch.at, name, len(secret))
+			}
+		}
+
+		schedule.Zeroize()
+
+		for name, secret := range held {
+			for i, b := range secret {
+				if b != 0 {
+					t.Errorf("%s: byte %d of %s is %#02x after Zeroize, want 0; the slice a caller was handed is a view into the epoch's own array and the erase has to reach it there",
+						epoch.at, i, name, b)
+					break
+				}
+			}
+		}
+
+		// and a second call is a no-op rather than a fault. An epoch may be dropped from the
+		// window by one path and released by another, and a Zeroize that panicked the second
+		// time would turn an ordinary double release into a crash on the message path.
+		schedule.Zeroize()
+	}
+}
+
+// scheduleMethodsThatStillAnswerAfterAnErase is every exported method of *KeySchedule that goes
+// on answering over an erased epoch, with the reason written out for each.
+//
+// The class is the type's exported surface read by reflection and this table is checked against
+// it in both directions, so a method cannot go on answering an erased epoch by being forgotten,
+// and a row cannot outlive the method it excuses.
+var scheduleMethodsThatStillAnswerAfterAnErase = map[string]string{
+	"GroupContextBytes": "the serialized GroupContext is not a secret and Zeroize does not erase it, " +
+		"for the reason scheduleByteSlicesThatAreNotSecrets gives",
+	"Secrets": "this is the pointer the erase is performed THROUGH -- the type comment says an aged out " +
+		"epoch is zeroized in place and Secrets() is what makes that reachable -- so it cannot refuse on " +
+		"the state it exists to create. What it answers afterwards is nine runs of zeros, and every method " +
+		"of this type that DERIVES from one of them refuses instead: see " +
+		"TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch",
+}
+
+// TestAnErasedScheduleRefusesRatherThanAnsweringFromZeros is what the schedule DOES after
+// Zeroize, over the whole exported surface rather than over the six methods that read one of
+// the nine by name.
+//
+// TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch already covers those six, and
+// it erases the nine by hand through Secrets(). This one differs in the two ways that matter.
+// It erases through the production call, so the refusals are held to the erase the Group will
+// actually perform rather than to a test's imitation of it. And its class is every exported
+// method, which is what reaches the two secrets that are NOT among the nine: joiner_secret and
+// welcome_secret are the schedule's own storage and no method reads them out of the nine, so
+// they sit outside that gate's derivation entirely.
+//
+// Measured, not supposed. With the liveness checks removed from JoinerSecret and WelcomeSecret,
+// the whole of mls and message was green while WelcomeSecret() answered KDF.Nh zero bytes --
+// which is the length WelcomeKeyNonce requires, so a creator holding an aged out epoch seals
+// encrypted_group_info under an expansion of a secret every party can compute, and
+// NewKeyScheduleFromJoiner rebuilds the entire epoch from the other one. Neither has an epoch to
+// ask secretIsLive, because both are package level functions handed bare bytes.
+func TestAnErasedScheduleRefusesRatherThanAnsweringFromZeros(t *testing.T) {
+	scheduleType := reflect.TypeOf(&KeySchedule{})
+	class := []string{}
+	for i := range scheduleType.NumMethod() {
+		method := scheduleType.Method(i)
+		// an eraser answers nothing over a live epoch either, so there is no refusal for it
+		// to make and nothing for the live control to observe. Told apart by the shape, which
+		// is the same rule hasSomewhereToPutASecret states for the source.
+		if method.Type.NumOut() == 0 {
+			continue
+		}
+		class = append(class, method.Name)
+	}
+	if len(class) < 4 {
+		t.Fatalf("this gate reads %d exported methods of *KeySchedule (%v) and the type declares four accessors at least, so it is not reading what it claims to",
+			len(class), class)
+	}
+	for name := range scheduleMethodsThatStillAnswerAfterAnErase {
+		if !slices.Contains(class, name) {
+			t.Errorf("scheduleMethodsThatStillAnswerAfterAnErase excuses %s, which is not an exported method of *KeySchedule that answers anything",
+				name)
+		}
+	}
+
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		// the live control first: every one of them hands something back before the erase, so
+		// a refusal afterwards is the erase rather than a method that refuses everything
+		for _, name := range class {
+			for index, answer := range scheduleMethodResults(t, epoch.at, schedule, name) {
+				if !answer.handedSomethingBack() {
+					t.Fatalf("%s: %s row %d answered nothing over a LIVE epoch -- no bytes and no acceptance -- so a refusal after Zeroize would say nothing",
+						epoch.at, name, index)
+				}
+			}
+		}
+
+		schedule.Zeroize()
+
+		for _, name := range class {
+			reason, excused := scheduleMethodsThatStillAnswerAfterAnErase[name]
+			answered := false
+			for index, answer := range scheduleMethodResults(t, epoch.at, schedule, name) {
+				if excused {
+					if answer.handedSomethingBack() {
+						answered = true
+					}
+					continue
+				}
+				for _, secret := range answer.read {
+					if len(secret) != 0 {
+						t.Errorf("%s: %s row %d answered %d bytes over an epoch Zeroize has erased; every derivation left is over KDF.Nh zero bytes, which any party can compute with no knowledge of the group, so this is a publicly computable value handed back with err == nil",
+							epoch.at, name, index, len(secret))
+					}
+				}
+				for _, accepted := range answer.accepted {
+					if accepted {
+						t.Errorf("%s: %s row %d ACCEPTED over an epoch Zeroize has erased; the key it verified under is KDF.Nh zero bytes, so what it accepted is a tag anybody could have forged",
+							epoch.at, name, index)
+					}
+				}
+			}
+			// an excuse that stopped being true is a row that hides a refusal nobody asked
+			// for, so it is checked rather than trusted
+			if excused && !answered {
+				t.Errorf("%s: scheduleMethodsThatStillAnswerAfterAnErase excuses %s as %q and it answered nothing over an erased epoch, so the row excuses a refusal",
+					epoch.at, name, reason)
+			}
+		}
+	}
+}
+
+// epochSecretEscapeControl declares one of each shape the escape scan has to tell apart: the
+// secret written into an exported package level variable, into an unexported one, sent down a
+// channel, handed to a callback the caller supplied -- and the three legitimate shapes, which
+// are handing it to a function of this package, cutting a local from it, and writing it back
+// into the receiver's own storage.
+//
+// The three legitimate rows are what stop this from being a scan that objects to Zeroize. An
+// eraser hands the storage to zeroizeSecret and every constructor here cuts locals from it, so
+// a matcher that read any of those as an escape would fail on the real source at once and be
+// weakened until it read nothing.
+const epochSecretEscapeControl = "package control\n" +
+	"\n" +
+	"type Holder struct {\n" +
+	"\tepochSecret []byte\n" +
+	"\tkept        []byte\n" +
+	"}\n" +
+	"\n" +
+	"var Escaped []byte\n" +
+	"\n" +
+	"var escapedUnexported []byte\n" +
+	"\n" +
+	"var escapeChannel = make(chan []byte, 1)\n" +
+	"\n" +
+	"func (self *Holder) LeaksIntoAnExportedVariable() {\n" +
+	"\tEscaped = self.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksIntoAnUnexportedVariable() {\n" +
+	"\tescapedUnexported = self.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksIntoAChannel() {\n" +
+	"\tescapeChannel <- self.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksThroughACallback(hand func([]byte)) {\n" +
+	"\thand(self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) Zeroize() {\n" +
+	"\twipeControl(self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) CutsALocalFromIt() int {\n" +
+	"\tlocal := self.epochSecret\n" +
+	"\treturn len(local)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) KeepsItInItsOwnStorage() {\n" +
+	"\tself.kept = self.epochSecret\n" +
+	"}\n" +
+	"\n" +
+	"func wipeControl(secret []byte) {\n" +
+	"\tfor i := range secret {\n" +
+	"\t\tsecret[i] = 0\n" +
+	"\t}\n" +
+	"}\n"
+
+// packageLevelValueNames is every var and const one set of parsed files declares at file scope.
+//
+// Names alone, because what matters is whether a write inside a declaration lands in storage
+// that is still there when the call returns, and a package level variable is exactly that
+// whether or not it is exported: an unexported one is readable by every exported symbol of this
+// package, none of which would then mention epochSecret at all and so none of which any gate
+// here would look at.
+func packageLevelValueNames(files []parsedSource) []string {
+	names := []string{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			values, isValueDeclaration := declaration.(*ast.GenDecl)
+			if !isValueDeclaration || (values.Tok != token.VAR && values.Tok != token.CONST) {
+				continue
+			}
+			for _, specification := range values.Specs {
+				value, isValue := specification.(*ast.ValueSpec)
+				if !isValue {
+					continue
+				}
+				for _, declared := range value.Names {
+					names = append(names, declared.Name)
+				}
+			}
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// theDeclarationsPuttingWhatTheyReachBeyondTheCall answers, of the declarations named in
+// reaching, the ones that put what they reach somewhere that outlives the call and that the
+// caller did not hand in.
+//
+// Three shapes, and each is a way past the two filters the gates above apply. A write to a
+// package level variable is storage with no signature at all, so neither the shape filter nor
+// the reflection sweep has anything to read. A channel send is the same escape wearing a
+// different verb. A call to a func typed PARAMETER hands the bytes to code this package never
+// declared, and the parameter renders as func([]byte) rather than as []byte, so the byte slice
+// half of hasSomewhereToPutASecret does not see it.
+//
+// Handing the storage to a function this package declares is NOT one of them, which is what
+// keeps Zeroize outside this class: zeroizeSecret is a name the closure has already followed,
+// so what that function does with the bytes is answered by the same scan run over IT.
+func theDeclarationsPuttingWhatTheyReachBeyondTheCall(files []parsedSource, reaching []string, packageValues []string) []string {
+	escaping := []string{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil || !slices.Contains(reaching, function.Name.Name) {
+				continue
+			}
+			callbacks := []string{}
+			if function.Type.Params != nil {
+				for _, field := range function.Type.Params.List {
+					if _, isFunctionType := field.Type.(*ast.FuncType); !isFunctionType {
+						continue
+					}
+					for _, declared := range field.Names {
+						callbacks = append(callbacks, declared.Name)
+					}
+				}
+			}
+			escaped := ""
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if escaped != "" {
+					return false
+				}
+				switch typed := node.(type) {
+				case *ast.AssignStmt:
+					for _, target := range typed.Lhs {
+						if root := rootIdentifierOf(target); slices.Contains(packageValues, root) {
+							escaped = "writes to package level " + root
+						}
+					}
+				case *ast.SendStmt:
+					escaped = "sends on " + parsed.render(typed.Chan)
+				case *ast.CallExpr:
+					if callee, isIdentifier := typed.Fun.(*ast.Ident); isIdentifier && slices.Contains(callbacks, callee.Name) {
+						escaped = "calls the caller's " + callee.Name
+					}
+				}
+				return escaped == ""
+			})
+			if escaped != "" {
+				escaping = append(escaping, function.Name.Name+": "+escaped)
+			}
+		}
+	}
+	slices.Sort(escaping)
+	return escaping
+}
+
+// TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall is the half of guardrail G6 the
+// three gates above each have to let past, and which Zeroize is the first declaration of this
+// package to land inside.
+//
+// TestNoExportedMethodOfThisPackageCanReachTheEpochSecret exempts a declaration that "answers
+// nothing and is handed nothing" on the ground that it has nowhere to put the secret. That is
+// true of a signature and false of a body: a package level variable is somewhere to put it that
+// no signature mentions, a channel is the same escape with a different verb, and a func typed
+// parameter is somewhere to put it that the byte slice filter reads as func([]byte) and lets
+// through. Until Zeroize landed the exemption covered no declaration at all and the gap was
+// theoretical; it now covers one, so the gap is the thing that has to be closed.
+//
+// Neither of the two behavioural gates can see any of the three either, for the same reason
+// they cannot see an argument conditioned leak: they read what a CALL ANSWERS, and none of
+// these three answers anything.
+//
+// packageLevelValuesNaming next door is the nearest thing that existed, and it is a different
+// question -- it reads a package level value whose TYPE or initialiser names a holder, so
+// var TheSchedule *KeySchedule is caught and var Escaped []byte, filled in by a method that
+// reaches the storage, is not.
+func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
+	// the control first, on both halves: the value scan reads a package level variable however
+	// it is declared, and the escape scan tells the three ways out from the three legitimate
+	// shapes that look like them
+	control := []parsedSource{mustParseText(t, "the epoch secret escape control", epochSecretEscapeControl)}
+	controlValues := packageLevelValueNames(control)
+	if want := []string{"Escaped", "escapeChannel", "escapedUnexported"}; !slices.Equal(controlValues, want) {
+		t.Fatalf("the package level value scan read %v out of the control, want %v", controlValues, want)
+	}
+	controlReaching := theNamesReachingTheEpochSecret(declaredAcross(control))
+	wantReaching := []string{
+		"CutsALocalFromIt",
+		"KeepsItInItsOwnStorage",
+		"LeaksIntoAChannel",
+		"LeaksIntoAnExportedVariable",
+		"LeaksIntoAnUnexportedVariable",
+		"LeaksThroughACallback",
+		"Zeroize",
+	}
+	if !slices.Equal(controlReaching, wantReaching) {
+		t.Fatalf("the closure read %v out of the control as reaching the epoch secret, want %v",
+			controlReaching, wantReaching)
+	}
+	controlEscaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(control, controlReaching, controlValues)
+	wantEscaping := []string{
+		"LeaksIntoAChannel: sends on escapeChannel",
+		"LeaksIntoAnExportedVariable: writes to package level Escaped",
+		"LeaksIntoAnUnexportedVariable: writes to package level escapedUnexported",
+		"LeaksThroughACallback: calls the caller's hand",
+	}
+	if !slices.Equal(controlEscaping, wantEscaping) {
+		t.Fatalf("the escape scan read %v out of the control, want %v; it is not telling a write that outlives the call from one that does not, or it is reading an erase as an escape",
+			controlEscaping, wantEscaping)
+	}
+
+	// then this package's own source
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		files = append(files, mustParseSource(t, path))
+	}
+	reaching := theNamesReachingTheEpochSecret(declaredAcross(files))
+	if len(reaching) == 0 {
+		t.Fatalf("no declaration of this package's source mentions %s, so the class below is empty and this gate demands nothing; if the storage was renamed, rename it in epochSecretStorageField too",
+			epochSecretStorageField)
+	}
+	values := packageLevelValueNames(files)
+	if len(values) == 0 {
+		t.Fatal("this package's source declares no package level value at all, so the first half of the scan below can never object to anything")
+	}
+	// the shape this gate exists for has to be present, or it is a gate over an empty
+	// exemption again: an eraser is a declaration that reaches the storage and answers
+	// nothing, and it is the one the two gates above let past by design.
+	byteSlices := slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t))
+	exempt := []string{}
+	for _, one := range declaredAcross(files) {
+		if one.exported && slices.Contains(reaching, one.name) && !hasSomewhereToPutASecret(one, byteSlices) {
+			exempt = append(exempt, one.name)
+		}
+	}
+	if len(exempt) == 0 {
+		t.Fatalf("no exported declaration of this package reaches %s and is exempted by its shape from TestNoExportedMethodOfThisPackageCanReachTheEpochSecret, so this gate is holding an exemption that covers nothing; Zeroize is that shape and it should be here",
+			epochSecretStorageField)
+	}
+	t.Logf("%d declarations reach %s (%v); %v are exempt from the shape gate and covered here",
+		len(reaching), epochSecretStorageField, reaching, exempt)
+
+	if escaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(files, reaching, values); len(escaping) != 0 {
+		t.Errorf("%v reach %s and put it somewhere the call does not end -- package level storage, a channel, or a function the caller supplied; G6 says no exported symbol of this package hands out the parent secret, and none of the three shapes appears in a signature for the gates above to read",
+			escaping, epochSecretStorageField)
 	}
 }
