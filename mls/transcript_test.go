@@ -53,15 +53,30 @@ func trTestCrypto(t *testing.T) CryptoProvider {
 	return crypto
 }
 
-// TestInitialTranscriptHashesAreEmpty asserts the group-creation base case: both
-// hashes are the zero-length octet string, not a hash of nothing.
-func TestInitialTranscriptHashesAreEmpty(t *testing.T) {
+// TestInitialTranscriptHashesAreTheEmptyOctetStringRatherThanNil asserts the
+// group-creation base case: both hashes are the zero-length octet string, not a hash of
+// nothing, and the zero-length octet string rather than nil.
+//
+// The length half is the RFC's. The nil half is this file's own doc comment, which says the
+// two start as "the zero-length octet string, and NOT the hash of nothing", and Clone's,
+// which reaches for cloneBytes rather than append precisely so that distinction survives a
+// copy. Nothing hashes or encodes the two differently today, so a constructor that answered
+// nil passes every other test in this package; what it changes is which of the two values
+// every caller holds, and a base case that is one thing in the constructor and another after
+// a Clone is a base case nothing can be compared against.
+func TestInitialTranscriptHashesAreTheEmptyOctetStringRatherThanNil(t *testing.T) {
 	hashes := InitialTranscriptHashes()
 	if len(hashes.Confirmed) != 0 {
 		t.Fatalf("Confirmed = %x, want empty", hashes.Confirmed)
 	}
 	if len(hashes.Interim) != 0 {
 		t.Fatalf("Interim = %x, want empty", hashes.Interim)
+	}
+	if hashes.Confirmed == nil {
+		t.Error("the base case answers nil for Confirmed, and it is documented as the zero-length octet string")
+	}
+	if hashes.Interim == nil {
+		t.Error("the base case answers nil for Interim, and it is documented as the zero-length octet string")
 	}
 }
 
@@ -166,6 +181,67 @@ func TestTranscriptHashesUpdateChains(t *testing.T) {
 	}
 }
 
+// TestUpdateLeavesTheEpochWhereItWasWhenTheInterimWriterFails asserts the atomicity
+// Update's own comment promises: "Neither field is written until both values exist, so a
+// writer failure leaves the epoch where it was rather than half advanced."
+//
+// A half advanced epoch is the worst shape this type can be left in. It holds epoch n's
+// confirmed hash beside epoch n-1's interim hash, which is a pair no member of the group has
+// and which no length check, no encoding and no comparison against a published vector can
+// see: both values are well formed hashes of the right width. The next commit is chained from
+// it, and from there the member disagrees with everyone forever -- a permanent fork rather
+// than an operation that failed and can be retried.
+//
+// The failure is reached through the codec rather than through a stub provider, because the
+// codec is where Update's only error comes from: InterimTranscriptHashInput carries the
+// confirmation tag as an opaque<V>, and syntax refuses a vector longer than MaxVectorLength.
+// Nothing off the wire can be that long -- the Reader caps opaque<V> at the same limit -- so
+// what this holds is the boundary a caller synthesising a tag would cross, and it holds it
+// against the real writer rather than against an injected error that a different code path
+// could answer.
+func TestUpdateLeavesTheEpochWhereItWasWhenTheInterimWriterFails(t *testing.T) {
+	crypto := trTestCrypto(t)
+	nh := crypto.HashSize()
+	hashes := InitialTranscriptHashes()
+	if err := hashes.Update(crypto, []byte("commit one"), crypto.Mac(make([]byte, nh), []byte("one"))); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	before := hashes.Clone()
+
+	// one octet past what an opaque<V> may carry. The control is read first, so a limit that
+	// moved is reported here rather than turning the refusal below into a success and this
+	// whole test into a comparison of an epoch against itself.
+	oversized := make([]byte, syntax.MaxVectorLength+1)
+	control := syntax.NewWriter()
+	control.WriteOpaque(oversized)
+	if _, err := control.Bytes(); err == nil {
+		t.Fatalf("a %d octet opaque<V> encodes, so the tag below does not reach Update's writer failure and nothing here is about atomicity",
+			len(oversized))
+	}
+
+	if err := hashes.Update(crypto, []byte("commit two"), oversized); err == nil {
+		t.Fatal("Update accepted a confirmation tag no opaque<V> can carry")
+	}
+	if !bytes.Equal(hashes.Confirmed, before.Confirmed) {
+		t.Errorf("a failed Update left Confirmed = %x and the epoch held %x; the epoch is half advanced and the next commit would chain from a pair nobody else has",
+			hashes.Confirmed, before.Confirmed)
+	}
+	if !bytes.Equal(hashes.Interim, before.Interim) {
+		t.Errorf("a failed Update left Interim = %x and the epoch held %x",
+			hashes.Interim, before.Interim)
+	}
+
+	// and the control on the two comparisons above: the same commit under a tag the codec
+	// accepts DOES move both fields, so an Update that had stopped writing anything at all
+	// would be reported rather than reading as the atomicity this test is named for
+	if err := hashes.Update(crypto, []byte("commit two"), crypto.Mac(make([]byte, nh), []byte("two"))); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if bytes.Equal(hashes.Confirmed, before.Confirmed) || bytes.Equal(hashes.Interim, before.Interim) {
+		t.Fatal("a successful Update left the epoch where it was, so the comparisons above hold for an Update that writes neither field")
+	}
+}
+
 // TestTranscriptHashesCloneIsDeep asserts a retained past epoch cannot be mutated.
 func TestTranscriptHashesCloneIsDeep(t *testing.T) {
 	crypto := trTestCrypto(t)
@@ -181,6 +257,43 @@ func TestTranscriptHashesCloneIsDeep(t *testing.T) {
 	}
 	if bytes.Equal(clone.Interim, hashes.Interim) {
 		t.Fatal("Interim is shared")
+	}
+}
+
+// TestCloneAnswersTheEmptyOctetStringRatherThanNil asserts a Clone does not change which of
+// the two empty values a caller holds.
+//
+// Clone's own comment gives the reason it spells the copy cloneBytes rather than append:
+// append to a nil slice collapses the empty non nil slices InitialTranscriptHashes hands out
+// into nil, "and a clone that changed which of the two a caller holds changed the value".
+// The pair run over here is therefore the base case, which is the only pair where the two
+// spellings differ at all -- a clone of a post-Update epoch is non empty and every copier
+// agrees on it, which is why TestTranscriptHashesCloneIsDeep cannot see this.
+//
+// Both directions are held. A copier that answered an empty slice where it was handed nil is
+// the same substitution written the other way round and changes what a caller holds just as
+// much, and a gate that read only the first direction is satisfied by a Clone that answers
+// an empty slice for everything.
+func TestCloneAnswersTheEmptyOctetStringRatherThanNil(t *testing.T) {
+	clone := InitialTranscriptHashes().Clone()
+	if len(clone.Confirmed) != 0 || len(clone.Interim) != 0 {
+		t.Fatalf("a clone of the base case holds (%x, %x), want two zero-length values",
+			clone.Confirmed, clone.Interim)
+	}
+	if clone.Confirmed == nil {
+		t.Error("a clone of the base case answers nil for Confirmed, and the base case is the zero-length octet string")
+	}
+	if clone.Interim == nil {
+		t.Error("a clone of the base case answers nil for Interim, and the base case is the zero-length octet string")
+	}
+	// the other direction, over the pair a zero value carries: a TranscriptHashes nothing has
+	// seeded holds nil, and a copier that answered an empty slice for it changed that value
+	absent := (&TranscriptHashes{}).Clone()
+	if absent.Confirmed != nil {
+		t.Errorf("a clone of a nil Confirmed answers %v, want nil", absent.Confirmed)
+	}
+	if absent.Interim != nil {
+		t.Errorf("a clone of a nil Interim answers %v, want nil", absent.Interim)
 	}
 }
 
@@ -270,6 +383,84 @@ func TestSetFromGroupInfoRejectsWrongLengths(t *testing.T) {
 	}
 }
 
+// TestSetFromGroupInfoCopiesTheGroupInfoRatherThanRetainingIt asserts the joiner's
+// confirmed transcript hash is storage of its own.
+//
+// This is the one long lived retention of somebody else's bytes in this file, and the
+// argument has the worst possible provenance for one: a GroupInfo is a decoded Welcome, the
+// confirmed transcript hash is a field of the GroupContext inside it, and the caller that
+// decoded it still owns the whole message. It goes on reading later fields out of that array,
+// it may hand it back to a pool, and it may erase it once the Welcome is processed. A joiner
+// that retained the slice holds a transcript that changes underneath it with no error path
+// anywhere: the next commit is chained from bytes no peer has, and the group forks at the
+// first commit after the welcome.
+//
+// The array is REUSED after the call rather than the two pointers being compared, because
+// identity is only one of the two ways to share storage -- a copy taken by appending into a
+// slice that still has the caller's capacity behind it aliases exactly as a retained slice
+// does. Both readings are here, and the reuse is checked to have changed the field first, so
+// a test whose overwrite had stopped overwriting is reported rather than reading as proof of
+// a copy.
+func TestSetFromGroupInfoCopiesTheGroupInfoRatherThanRetainingIt(t *testing.T) {
+	crypto := trTestCrypto(t)
+	nh := crypto.HashSize()
+	// the decode buffer, longer than the field, because what the caller owns is the whole
+	// GroupInfo and the argument is a window into it
+	groupInfo := bytes.Repeat([]byte{0x5a}, 4*nh)
+	confirmedTranscriptHash := groupInfo[nh : 2*nh]
+	tag := crypto.Mac(make([]byte, nh), []byte("the welcome's confirmation tag"))
+
+	joiner := InitialTranscriptHashes()
+	if err := joiner.SetFromGroupInfo(crypto, confirmedTranscriptHash, tag); err != nil {
+		t.Fatalf("SetFromGroupInfo: %v", err)
+	}
+	seededConfirmed := bytes.Clone(joiner.Confirmed)
+	seededInterim := bytes.Clone(joiner.Interim)
+	if !bytes.Equal(seededConfirmed, confirmedTranscriptHash) {
+		t.Fatalf("the joiner seeded to %x and the GroupInfo carried %x", seededConfirmed, confirmedTranscriptHash)
+	}
+
+	// what a caller does next: reuse the array. A pooled decode buffer, a zeroize of a
+	// processed Welcome and a second message read into the same storage all look like this.
+	for i := range groupInfo {
+		groupInfo[i] = 0x00
+	}
+	if bytes.Equal(seededConfirmed, confirmedTranscriptHash) {
+		t.Fatal("reusing the caller's array did not change the field the joiner was seeded from, so nothing below separates a copy from a retained slice")
+	}
+
+	if !bytes.Equal(joiner.Confirmed, seededConfirmed) {
+		t.Errorf("the joiner's confirmed hash is %x after its caller reused the GroupInfo buffer and was %x when it was seeded; the transcript aliases somebody else's array",
+			joiner.Confirmed, seededConfirmed)
+	}
+	if !bytes.Equal(joiner.Interim, seededInterim) {
+		t.Errorf("the joiner's interim hash is %x after its caller reused the GroupInfo buffer and was %x when it was seeded",
+			joiner.Interim, seededInterim)
+	}
+
+	// and the same property read as storage rather than as a value: no byte the joiner holds
+	// is a byte of the caller's array. Every offset is compared and not just the first, so a
+	// slice cut from the middle of the buffer is as visible as one cut from its front.
+	for _, held := range []struct {
+		name    string
+		content []byte
+	}{
+		{name: "Confirmed", content: joiner.Confirmed},
+		{name: "Interim", content: joiner.Interim},
+	} {
+		if len(held.content) == 0 {
+			t.Errorf("the joiner holds no %s, so that half of this gate observed nothing", held.name)
+			continue
+		}
+		for i := range groupInfo {
+			if &groupInfo[i] == &held.content[0] {
+				t.Errorf("the joiner's %s is cut from the caller's GroupInfo buffer at offset %d", held.name, i)
+				break
+			}
+		}
+	}
+}
+
 // trPublishedEntry is one entry of mlswg's transcript-hashes.json, whole.
 //
 // p4 task 10 reads four of these six fields for the confirmation tag it holds
@@ -315,7 +506,10 @@ func trPublishedEntries(t *testing.T) []trPublishedEntry {
 // commit the auth data is signature<V> followed by confirmation_tag, a MAC, which is an
 // opaque<V> of exactly KDF.Nh octets. ConfirmedTranscriptHashInput is
 // wire_format || FramedContent || signature<V>, which is precisely the prefix. So the split
-// sits at len(ac) - (1 + Nh).
+// sits at len(ac) - (Nh + the width of that vector's own length prefix), and that width is
+// read off the codec rather than written as 1: section 2.1.2 spells 32 as one octet and 64 as
+// two, so a literal here is right for both registered suites and wrong for the first SHA-512
+// one.
 //
 // It is checked twice rather than assumed. publishedTagAtTheTail refuses a tail whose
 // preceding octet is not the varint length of what is being read, and the caller then
@@ -327,7 +521,8 @@ func trSplitPublishedCommit(t *testing.T, at string, crypto CryptoProvider, blob
 	t.Helper()
 	nh := crypto.HashSize()
 	confirmationTag = publishedTagAtTheTail(t, at+" authenticated_content", blob, nh)
-	return blob[:len(blob)-nh-1], confirmationTag
+	prefix := publishedVectorPrefix(t, at+" authenticated_content", nh)
+	return blob[:len(blob)-nh-len(prefix)], confirmationTag
 }
 
 // TestTranscriptHashesMatchTheMlswgTranscriptHashes is the known answer test for both

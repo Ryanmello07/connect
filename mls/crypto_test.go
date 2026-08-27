@@ -2603,6 +2603,13 @@ type packageLevelScan struct {
 
 // The package level functions of one parsed file.
 //
+// A declaration carrying a receiver is skipped, and that skip is the class boundary rather
+// than an oversight: a construction is called by name and a method is called on a receiver,
+// so the two need different tables. The other half of the partition is held in
+// provider_methods_test.go, and TestEveryDeclarationTakingAProviderIsHeldByExactlyOneOfTheTwo-
+// Classes compares both halves against the whole of what the type checker reads, so a
+// declaration cannot fall between the two.
+//
 // Parameter types come back rendered and one per name, so a signature written
 // func f(a, b []byte) reads the same here as one written func f(a []byte, b []byte). A
 // gate that filters on a type is then filtering on what the compiler sees rather than on
@@ -3598,6 +3605,12 @@ func assertNoProviderArrivesUncallable(t *testing.T, function declaredFunction) 
 }
 
 // The package level constructions handed a provider, by the same reading.
+//
+// A method is skipped here for the reason the comment on declaredFunction.method gives, and
+// the methods this package hands a provider are held by provider_methods_test.go instead.
+// That file's TestEveryDeclarationTakingAProviderIsHeldByExactlyOneOfTheTwoClasses compares
+// the two classes against the whole, so a method taking a provider that nothing runs is a
+// failure there rather than a shorter class here.
 //
 // A construction here cannot be called through a name the way a method can, so each one
 // needs a value written down. That list is not what decides the class: the class is read

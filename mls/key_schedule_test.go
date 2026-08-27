@@ -5944,23 +5944,82 @@ func mustLoadAuthenticatedCorpus(t *testing.T, name string, into any) {
 	loadLabelKat(t, name, into)
 }
 
+// publishedVectorPrefix is the length prefix a <V> vector of n octets carries, spelled by the
+// codec rather than written out here.
+//
+// RFC 9420 section 2.1.2 writes 0..63 as one octet and 64..16383 as two, so a helper that
+// assumed a single octet is right for both registered suites -- KDF.Nh is 32 and 32 <= 63 --
+// and stops being right at the first suite whose hash is SHA-512, where Nh is 64 and the
+// prefix is 0x40 0x40. It would stop being right loudly, which is better than silently, but
+// loudly in the two helpers that read it rather than in the one line that is actually wrong.
+// So the width is derived: the codec is asked to encode a vector of that length and the
+// prefix is whatever it wrote in front of the content.
+func publishedVectorPrefix(t *testing.T, what string, n int) []byte {
+	t.Helper()
+	w := syntax.NewWriter()
+	w.WriteOpaque(make([]byte, n))
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("%s: encode the length prefix a %d octet <V> vector carries: %v", what, n, err)
+	}
+	prefix := encoded[:len(encoded)-n]
+	if len(prefix) == 0 {
+		t.Fatalf("%s: a %d octet opaque<V> encodes to %d octets and therefore carries no length prefix, so nothing separates the tail below from the field in front of it",
+			what, n, len(encoded))
+	}
+	return prefix
+}
+
+// TestThePublishedVectorPrefixWidensWithTheVector is the control on the helper above.
+//
+// The whole point of asking the codec is that the prefix is not always one octet, and the
+// registered suites cannot show that: KDF.Nh is 32 for both and 32 <= 63, so a helper that
+// answered a single octet holding the length agrees with the codec on every input this
+// package has and disagrees at the first suite whose hash is SHA-512. Both widths are read
+// here, and the boundary is read from both sides, so a helper that had gone back to writing
+// one octet -- or that widened one value too early -- fails rather than waiting for the suite
+// registry to grow.
+//
+// The expected bytes are RFC 9420 section 2.1.2's own spelling, written out rather than taken
+// from the codec: a control built by the thing it controls holds for any encoding at all.
+func TestThePublishedVectorPrefixWidensWithTheVector(t *testing.T) {
+	for _, testCase := range []struct {
+		n    int
+		want []byte
+	}{
+		{n: 0, want: []byte{0x00}},
+		{n: 32, want: []byte{0x20}},
+		{n: 63, want: []byte{0x3f}},
+		{n: 64, want: []byte{0x40, 0x40}},
+		{n: 48, want: []byte{0x30}},
+		{n: 16383, want: []byte{0x7f, 0xff}},
+	} {
+		if found := publishedVectorPrefix(t, "the vector prefix control", testCase.n); !bytes.Equal(found, testCase.want) {
+			t.Errorf("a <V> vector of %d octets carries the prefix %x, and RFC 9420 section 2.1.2 writes %x",
+				testCase.n, found, testCase.want)
+		}
+	}
+}
+
 // publishedTagAtTheTail reads the mac one of these serialized structures ends with.
 //
 // Both a FramedContentAuthData's confirmation_tag and a PublicMessage's membership_tag are the
 // LAST field of their structure and both are an opaque<V> of exactly KDF.Nh octets, so the tail
-// is the tag and the octet in front of it is the vector's own length prefix. That prefix is
-// asserted rather than skipped over: KDF.Nh is 32 for both registered suites and 32 <= 63, so
-// RFC 9420 section 2.1.2 writes it as the single octet 0x20 — and if the octet found there is
-// not the length of the tail being read, then what is being read is not a tag, and a comparison
-// against it would be a comparison against the wrong bytes rather than a failure.
+// is the tag and what sits in front of it is the vector's own length prefix. That prefix is
+// asserted rather than skipped over: if the octets found there are not the encoded length of
+// the tail being read, then what is being read is not a tag, and a comparison against it would
+// be a comparison against the wrong bytes rather than a failure.
 func publishedTagAtTheTail(t *testing.T, what string, blob []byte, nh int) []byte {
 	t.Helper()
-	if len(blob) < nh+1 {
-		t.Fatalf("%s is %d bytes and a %d byte tag with its length prefix does not fit in it", what, len(blob), nh)
+	prefix := publishedVectorPrefix(t, what, nh)
+	if len(blob) < nh+len(prefix) {
+		t.Fatalf("%s is %d bytes and a %d byte tag with its %d byte length prefix does not fit in it",
+			what, len(blob), nh, len(prefix))
 	}
-	if prefix := blob[len(blob)-nh-1]; int(prefix) != nh {
-		t.Fatalf("%s: the octet before its last %d bytes is %#02x, and a <V> vector of %d octets is written as the one octet varint %#02x, so the tail this reads is not a tag",
-			what, nh, prefix, nh, nh)
+	at := len(blob) - nh - len(prefix)
+	if found := blob[at : at+len(prefix)]; !bytes.Equal(found, prefix) {
+		t.Fatalf("%s: the %d octets before its last %d bytes are %x, and a <V> vector of %d octets is written %x, so the tail this reads is not a tag",
+			what, len(prefix), nh, found, nh, prefix)
 	}
 	return blob[len(blob)-nh:]
 }
