@@ -3377,3 +3377,578 @@ func TestPastEpochWindowIsThePromisedThirtyTwoEpochs(t *testing.T) {
 			PastEpochWindow)
 	}
 }
+
+// Task 7: the committer's path and the joiner's path reach one epoch.
+//
+// This is the first property in this file about two derivations rather than one, and the
+// shape it invites cannot fail. The two paths share code -- NewKeySchedule is
+// DeriveJoinerSecret followed by NewKeyScheduleFromJoiner -- so
+//
+//	committer, _ := NewKeySchedule(crypto, initPrev, commitSecret, pskSecret, groupContext)
+//	joiner, _ := NewKeyScheduleFromJoiner(crypto, committer.JoinerSecret(), pskSecret, groupContext)
+//
+// compares one deterministic function against itself on one argument. It reports PASS
+// against every implementation of NewKeyScheduleFromJoiner there is, including one that
+// derives the epoch from the joiner secret rather than the member secret, one that drops
+// psk_secret, and one that returns nine copies of the same byte. That is the shape the plan
+// hands this task, and it is written down here rather than fixed silently because the same
+// shape will be reachable again in p5 and p6 wherever a joiner is checked against a
+// committer.
+//
+// What separates the two paths is a third derivation neither of them performs: RFC 9420
+// section 8 written out below in terms of crypto/hmac, which this package does not derive
+// with. The joiner is handed a joiner_secret that reference produced rather than one the
+// committer produced, and both schedules are compared against the reference as well as
+// against each other -- so an epoch reached by the wrong route disagrees with it even when
+// both paths take that route together.
+//
+// The reference is admissible only because it is anchored outside this tree:
+// TestTheHandWrittenSectionEightDerivationReproducesThePublishedEpochs requires it to
+// reproduce all 110 answers mlswg published before any comparison below rests on it. A
+// second copy of the same mistake agrees with the first, and only somebody else's numbers
+// separate them.
+
+// ksGeneratedEpochCases is how many generated epochs each registered suite contributes to
+// the space the two paths are compared over.
+//
+// A worked example pins the epoch it was taken from. What the RFC lets vary here is the
+// previous init secret, the commit secret, the psk secret and every field of the
+// GroupContext -- and the published corpus holds four of the context's seven fixed across
+// all ten of its epochs, so the space below is where an epoch number in the high half, an
+// unregistered version, a non empty extensions vector and a group id of another length
+// reach the joiner path at all.
+const ksGeneratedEpochCases = 24
+
+// ksStream is the deterministic byte source the generated space is drawn from: sha256 over
+// a seed and a counter.
+//
+// Deterministic rather than random, because a failing case has to reproduce. A generated
+// space drawn from crypto/rand finds the defect once, on somebody's machine, and the next
+// run is a different space that says nothing about whether the fix worked.
+type ksStream struct {
+	seed    string
+	counter uint64
+	buffer  []byte
+}
+
+// take answers the next n bytes of the stream. Blocks are consumed in order and a partial
+// block is carried, so the same seed yields the same bytes whatever sizes the caller asks
+// for them in.
+func (self *ksStream) take(n int) []byte {
+	out := make([]byte, 0, n)
+	for len(out) < n {
+		if len(self.buffer) == 0 {
+			block := sha256.Sum256(fmt.Appendf(nil, "%s/%d", self.seed, self.counter))
+			self.counter++
+			self.buffer = block[:]
+		}
+		taken := min(n-len(out), len(self.buffer))
+		out = append(out, self.buffer[:taken]...)
+		self.buffer = self.buffer[taken:]
+	}
+	return out
+}
+
+// ksHandVarint is the RFC 9420 section 2.1.2 variable length prefix, written here rather
+// than reached through syntax so the preimages below owe nothing to the encoder this
+// package derives with.
+//
+// Only the one and two octet forms are written and a longer field is fatal rather than
+// truncated. A prefix written at the wrong width produces a perfectly well formed secret
+// that no peer derives, which is the failure mode this file exists to catch, and a
+// reference that could commit it silently would agree with an implementation that had.
+func ksHandVarint(t *testing.T, what string, length int) []byte {
+	t.Helper()
+	switch {
+	case length < 64:
+		return []byte{byte(length)}
+	case length < 16384:
+		return []byte{0x40 | byte(length>>8), byte(length)}
+	default:
+		t.Fatalf("%s is %d octets, past the two octet prefix this hand written encoder writes", what, length)
+		return nil
+	}
+}
+
+// ksHandExtract is HKDF-Extract: HMAC with the salt as the key and the input keying
+// material as the message, in the (salt, ikm) order every spec text writes.
+//
+// Written out rather than delegated to crypto/hkdf, which takes those two the other way
+// round. That transposition is guardrail 1 and it is the one mistake in this package a
+// self consistent implementation reproduces perfectly, so a reference that called the
+// library would reproduce it too and report agreement.
+func ksHandExtract(salt []byte, ikm []byte) []byte {
+	extract := hmac.New(sha256.New, salt)
+	extract.Write(ikm)
+	return extract.Sum(nil)
+}
+
+// ksHandExpandWithLabel is ExpandWithLabel: HKDF-Expand over the serialized
+// struct { uint16 length; opaque label<V>; opaque context<V> }, with the "MLS 1.0 " prefix
+// spelled out here rather than read from MlsLabelPrefix.
+//
+// One output block only. Every expansion section 8 performs asks for KDF.Nh bytes and
+// KDF.Nh is one sha256 output, so the RFC 5869 counter loop would be untested code in a
+// reference whose only job is to be obviously right; a longer request is refused instead.
+func ksHandExpandWithLabel(t *testing.T, secret []byte, label string, context []byte, length int) []byte {
+	t.Helper()
+	if length <= 0 || length > sha256.Size {
+		t.Fatalf("the hand written expansion was asked for %d octets and writes one sha256 block of %d",
+			length, sha256.Size)
+	}
+	labelled := "MLS 1.0 " + label
+	info := []byte{byte(length >> 8), byte(length)}
+	info = append(info, ksHandVarint(t, "the label "+labelled, len(labelled))...)
+	info = append(info, labelled...)
+	info = append(info, ksHandVarint(t, "the context", len(context))...)
+	info = append(info, context...)
+	expand := hmac.New(sha256.New, secret)
+	expand.Write(info)
+	expand.Write([]byte{0x01})
+	return expand.Sum(nil)[:length]
+}
+
+// ksHandDeriveSecret is DeriveSecret: ExpandWithLabel at KDF.Nh over an EMPTY context,
+// which is one zero length prefix octet and not an absent field. The difference is one
+// byte of preimage and nothing but a published answer can see it.
+func ksHandDeriveSecret(t *testing.T, secret []byte, label string) []byte {
+	t.Helper()
+	return ksHandExpandWithLabel(t, secret, label, nil, sha256.Size)
+}
+
+// ksHandJoinerSecret is the half of the section 8 chain only a committer performs:
+//
+//	joiner_secret = ExpandWithLabel(
+//	    KDF.Extract(init_secret_[n-1], commit_secret), "joiner", GroupContext_[n], KDF.Nh)
+func ksHandJoinerSecret(t *testing.T, initSecretPrev []byte, commitSecret []byte, groupContext []byte) []byte {
+	t.Helper()
+	return ksHandExpandWithLabel(
+		t, ksHandExtract(initSecretPrev, commitSecret), "joiner", groupContext, sha256.Size)
+}
+
+// ksHandEpochLabels is the RFC 9420 section 8 label each field of EpochSecrets is expanded
+// under, keyed by the field name so the map is comparable with the type rather than with a
+// reading of key_schedule.go.
+//
+// This is a transcription and it is meant to be one: it is a SECOND independent reading of
+// the RFC, which is what a differential comparison is made of. What stops it drifting into
+// a copy of the implementation's list is that neither side reads the other, and that both
+// are held to the published corpus by the anchor test below. What stops it going stale is
+// ksHandEpochSecrets, which requires the two key sets to match exactly in both directions.
+var ksHandEpochLabels = map[string]string{
+	"SenderData":         "sender data",
+	"Encryption":         "encryption",
+	"Exporter":           "exporter",
+	"External":           "external",
+	"Confirmation":       "confirm",
+	"Membership":         "membership",
+	"ResumptionPsk":      "resumption",
+	"EpochAuthenticator": "authentication",
+	"InitSecret":         "init",
+}
+
+// ksHandEpoch is one epoch derived by hand: the welcome secret and every derived secret,
+// keyed by the EpochSecrets field the answer belongs to.
+//
+// epoch_secret is deliberately not a field, for the reason EpochSecrets does not carry one
+// (guardrail 6). The reference has no more need to hand it out than the implementation
+// does.
+type ksHandEpoch struct {
+	welcomeSecret []byte
+	secrets       map[string][]byte
+}
+
+// ksHandEpochSecrets is the half of the section 8 chain a member added by Welcome
+// performs, and the only half it can:
+//
+//	member_secret  = KDF.Extract(joiner_secret, psk_secret)
+//	welcome_secret = DeriveSecret(member_secret, "welcome")
+//	epoch_secret   = ExpandWithLabel(member_secret, "epoch", GroupContext_[n], KDF.Nh)
+//
+// The nine are driven by the field names reflection read off EpochSecrets, and a field
+// with no label here is fatal rather than skipped: a tenth secret added to the type would
+// otherwise fall outside every comparison below while all of them still reported PASS. The
+// count is checked in the other direction too, because a label left behind by a field that
+// was renamed is a derivation nothing compares against anything.
+func ksHandEpochSecrets(t *testing.T, joinerSecret []byte, pskSecret []byte, groupContext []byte) ksHandEpoch {
+	t.Helper()
+	memberSecret := ksHandExtract(joinerSecret, pskSecret)
+	epochSecret := ksHandExpandWithLabel(t, memberSecret, "epoch", groupContext, sha256.Size)
+	epoch := ksHandEpoch{
+		welcomeSecret: ksHandDeriveSecret(t, memberSecret, "welcome"),
+		secrets:       map[string][]byte{},
+	}
+	for _, field := range epochSecretFieldNames(t) {
+		label, written := ksHandEpochLabels[field]
+		if !written {
+			t.Fatalf("EpochSecrets.%s has no label in ksHandEpochLabels, so the hand written derivation answers nothing for it and every comparison below would pass over the field in silence",
+				field)
+		}
+		epoch.secrets[field] = ksHandDeriveSecret(t, epochSecret, label)
+	}
+	if len(epoch.secrets) != len(ksHandEpochLabels) {
+		t.Fatalf("EpochSecrets declares %d secrets and ksHandEpochLabels holds %d labels; a label with no field is a derivation nothing is compared against",
+			len(epoch.secrets), len(ksHandEpochLabels))
+	}
+	return epoch
+}
+
+// epochSecretFieldNames is the set of secrets an epoch holds, read off the type in sorted
+// order so a sweep runs over the class rather than over a list of it. A tenth secret joins
+// every sweep that calls this by existing.
+func epochSecretFieldNames(t *testing.T) []string {
+	t.Helper()
+	return slices.Sorted(maps.Keys(epochSecretsByField(t, &EpochSecrets{})))
+}
+
+// TestTheHandWrittenSectionEightDerivationReproducesThePublishedEpochs is what makes the
+// reference admissible as a second opinion, and it runs before anything rests on it.
+//
+// A hand written derivation is only a second opinion if it can be wrong in a different way
+// from the implementation. Anchoring it on the mlswg corpus is what says it is not a
+// paraphrase of key_schedule.go: it reproduces all 110 answers somebody else published, or
+// no comparison in the two tests below means anything.
+//
+// Both Extract calls are checked for symmetry first. A reference that answered the same for
+// (a, b) and (b, a) could not see the transposition guardrail 1 exists for, and would agree
+// with a swapped implementation while looking like an independent opinion.
+func TestTheHandWrittenSectionEightDerivationReproducesThePublishedEpochs(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		publishedContext := mustDecodeHex(t, "group_context"+epoch.at, epoch.published.GroupContext)
+		joinerSecret := ksHandJoinerSecret(t, epoch.initPrev, epoch.commitSecret, publishedContext)
+		if swapped := ksHandJoinerSecret(t, epoch.commitSecret, epoch.initPrev, publishedContext); bytes.Equal(swapped, joinerSecret) {
+			t.Fatalf("%s: the hand written joiner derivation answers the same for both Extract argument orders, so it cannot see a transposition",
+				epoch.at)
+		}
+		assertLabelKat(t, "the hand written joiner_secret"+epoch.at, joinerSecret, epoch.published.JoinerSecret)
+		compared++
+
+		hand := ksHandEpochSecrets(t, joinerSecret, epoch.pskSecret, publishedContext)
+		swapped := ksHandEpochSecrets(t, epoch.pskSecret, joinerSecret, publishedContext)
+		if bytes.Equal(swapped.welcomeSecret, hand.welcomeSecret) {
+			t.Fatalf("%s: the hand written member derivation answers the same for both Extract argument orders, so it cannot see a transposition",
+				epoch.at)
+		}
+		assertLabelKat(t, "the hand written welcome_secret"+epoch.at, hand.welcomeSecret, epoch.published.WelcomeSecret)
+		compared++
+
+		for _, field := range epochSecretFieldNames(t) {
+			assertLabelKat(t, "the hand written EpochSecrets."+field+epoch.at,
+				hand.secrets[field], publishedEpochSecret(t, field, epoch.published))
+			compared++
+		}
+	}
+	if compared != keyScheduleKatEpochComparisons {
+		t.Fatalf("compared %d published answers, want %d", compared, keyScheduleKatEpochComparisons)
+	}
+}
+
+// One generated epoch: the inputs both paths are given, and the encoding of the group
+// context they must both expand over.
+//
+// The encoding is carried rather than re-derived at each use, because the hand written
+// reference and the implementation have to be handed the same context bytes for the
+// comparison to be about the key schedule. syntax.Marshal is the one thing the reference
+// shares with the code under test, and deliberately: the section 8.1 codec has its own
+// known answer tests, and a second hand written encoder here would report a codec
+// disagreement as a key schedule failure in the wrong file.
+type ksGeneratedEpoch struct {
+	at           string
+	crypto       CryptoProvider
+	groupContext *GroupContext
+	encoded      []byte
+	initPrev     []byte
+	commitSecret []byte
+	pskSecret    []byte
+}
+
+// ksGeneratedEpochs is the space the two paths are compared over: every registered suite,
+// crossed with ksGeneratedEpochCases epochs whose secrets and whose whole group context are
+// drawn from the deterministic stream.
+//
+// The suites are taken from the registry rather than named, and the one assumption the
+// hand written reference makes -- that the suite's kdf is HKDF-SHA256 at Nh 32 -- is
+// asserted against each suite's own parameters. A third suite with another kdf fails here
+// and says what to do about it, rather than being compared against a reference computing a
+// different primitive.
+//
+// Two vacuity controls travel with the space. Every case's inputs are required to be
+// distinct from every other's, since a generator that had stopped advancing would run the
+// same epoch 48 times and report the clean run a varied space reports. And each epoch's two
+// Extract arguments are required to differ, because Extract(a, b) and Extract(b, a) agree
+// exactly when a == b, so a case whose init and commit secrets coincided would pin nothing
+// about the argument order.
+func ksGeneratedEpochs(t *testing.T) []ksGeneratedEpoch {
+	t.Helper()
+	epochs := []ksGeneratedEpoch{}
+	for _, suite := range Suites() {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("look up suite %#04x: %v", uint16(suite), err)
+		}
+		if params.KdfId != HpkeKdfHkdfSha256 || params.Nh != sha256.Size {
+			t.Fatalf("suite %#04x names kdf %#04x at KDF.Nh %d and the hand written derivation these epochs are compared against is HKDF-SHA256 at %d; teach the reference the new kdf rather than letting the suite go unjudged",
+				uint16(suite), uint16(params.KdfId), params.Nh, sha256.Size)
+		}
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		stream := &ksStream{seed: fmt.Sprintf("mls/key_schedule/task7/%#04x", uint16(suite))}
+		for index := range ksGeneratedEpochCases {
+			// the epoch number, big endian off the stream, with the three the corpus can
+			// never reach written in: zero, one, and one whose high half is not zero
+			epochNumber := uint64(0)
+			for _, b := range stream.take(8) {
+				epochNumber = epochNumber<<8 | uint64(b)
+			}
+			switch index {
+			case 0:
+				epochNumber = 0
+			case 1:
+				epochNumber = 1
+			case 2:
+				epochNumber = ^uint64(0)
+			}
+			// an unregistered version and an unregistered suite code point on some cases:
+			// the context carries what it was given, and a preimage that normalised either
+			// would still match every published vector, all of which are 0x0001 and 0x0003
+			version := ProtocolVersionMls10
+			if index%5 == 4 {
+				version = ProtocolVersion(0xfafb)
+			}
+			contextSuite := suite
+			if index%7 == 3 {
+				contextSuite = CipherSuite(0xf00d)
+			}
+			// absent, empty, one and two extensions. Every published key schedule vector
+			// carries an empty extensions vector, so this is the only place the extension
+			// codec reaches an epoch derivation at all.
+			var extensions []Extension
+			switch index % 4 {
+			case 1:
+				extensions = []Extension{}
+			case 2:
+				extensions = []Extension{
+					{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: stream.take(1 + index%9)},
+				}
+			case 3:
+				extensions = []Extension{
+					{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: stream.take(index % 5)},
+					{ExtensionType: ExtensionType(0xf00d), ExtensionData: stream.take(1 + index%13)},
+				}
+			}
+			groupContext := &GroupContext{
+				Version:                 version,
+				CipherSuite:             contextSuite,
+				GroupId:                 stream.take(1 + index%23),
+				Epoch:                   epochNumber,
+				TreeHash:                stream.take(nh),
+				ConfirmedTranscriptHash: stream.take(nh),
+				Extensions:              extensions,
+			}
+			encoded, err := syntax.Marshal(groupContext)
+			if err != nil {
+				t.Fatalf("suite %#04x generated epoch %d: marshal the group context: %v",
+					uint16(suite), index, err)
+			}
+			epochs = append(epochs, ksGeneratedEpoch{
+				at:           fmt.Sprintf(" suite %#04x generated epoch %d", uint16(suite), index),
+				crypto:       crypto,
+				groupContext: groupContext,
+				encoded:      encoded,
+				initPrev:     stream.take(nh),
+				commitSecret: stream.take(nh),
+				pskSecret:    stream.take(nh),
+			})
+		}
+	}
+	if want := len(Suites()) * ksGeneratedEpochCases; len(epochs) != want {
+		t.Fatalf("the generated space holds %d epochs, want %d", len(epochs), want)
+	}
+	seen := map[string]string{}
+	for _, epoch := range epochs {
+		if bytes.Equal(epoch.initPrev, epoch.commitSecret) {
+			t.Fatalf("%s: init_secret_[n-1] and commit_secret are the same bytes, so this case agrees with a transposed Extract and pins nothing about the argument order",
+				epoch.at)
+		}
+		key := fmt.Sprintf("%x/%x/%x/%x", epoch.encoded, epoch.initPrev, epoch.commitSecret, epoch.pskSecret)
+		if first, repeated := seen[key]; repeated {
+			t.Fatalf("%s and %s were generated with identical inputs, so this space is smaller than the count above says",
+				first, epoch.at)
+		}
+		seen[key] = epoch.at
+	}
+	return epochs
+}
+
+// TestTheJoinerPathAndTheCommitterPathReachOneEpoch is the deliverable of this task: a
+// member who was in the group at the commit and a member who arrived by Welcome hold the
+// same nine secrets, over a generated space rather than at one worked example.
+//
+// The joiner is handed a joiner_secret the hand written reference produced, NOT the one the
+// committer's schedule carries. That is the difference between this test and one that
+// cannot fail: NewKeySchedule ends in NewKeyScheduleFromJoiner, so feeding the joiner the
+// committer's own answer runs one deterministic function twice on one argument and compares
+// the results.
+//
+// Three comparisons are made per secret and they fail on different mistakes. Committer
+// against joiner is the property in the name. Joiner against the reference is what sees a
+// mistake INSIDE the shared constructor -- a parent that is not member_secret, a psk secret
+// dropped, a label pasted from the line above -- which both paths would otherwise commit
+// together and agree about. Committer against the reference is the same for the half of the
+// chain only the committer runs, so a joiner derivation that agreed with the reference
+// while the committer reached it by another route is still reported.
+//
+// The nine are driven by the field names reflection read off EpochSecrets rather than by a
+// list, so a tenth secret is compared by existing rather than by somebody remembering to
+// add it here. The number of comparisons is counted against that field count and against
+// the size of the space, because a sweep whose inner loop stopped producing rows reports
+// exactly what a complete one reports.
+func TestTheJoinerPathAndTheCommitterPathReachOneEpoch(t *testing.T) {
+	names := epochSecretFieldNames(t)
+	if len(names) == 0 {
+		t.Fatal("EpochSecrets read as no fields, so this sweep compares nothing")
+	}
+	generated := ksGeneratedEpochs(t)
+	compared := 0
+	for _, epoch := range generated {
+		joinerSecret := ksHandJoinerSecret(t, epoch.initPrev, epoch.commitSecret, epoch.encoded)
+		if len(joinerSecret) != epoch.crypto.HashSize() {
+			t.Fatalf("%s: the hand written joiner secret is %d bytes and KDF.Nh is %d",
+				epoch.at, len(joinerSecret), epoch.crypto.HashSize())
+		}
+		committer, err := NewKeySchedule(
+			epoch.crypto, epoch.initPrev, epoch.commitSecret, epoch.pskSecret, epoch.groupContext)
+		if err != nil {
+			t.Fatalf("%s: NewKeySchedule: %v", epoch.at, err)
+		}
+		// the joiner is given its own copy of the context, as a real one would be: it
+		// decodes the GroupInfo it was sent rather than sharing the committer's struct
+		joiner, err := NewKeyScheduleFromJoiner(
+			epoch.crypto, joinerSecret, epoch.pskSecret, epoch.groupContext.Clone())
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromJoiner: %v", epoch.at, err)
+		}
+		hand := ksHandEpochSecrets(t, joinerSecret, epoch.pskSecret, epoch.encoded)
+
+		// the committer must have derived the very joiner secret the joiner was handed, or
+		// the agreement below would be two schedules agreeing about different epochs
+		if !bytes.Equal(committer.JoinerSecret(), joinerSecret) {
+			t.Fatalf("%s: the committer derived joiner_secret %x and section 8 gives %x, so the schedules compared below are not two paths into one epoch",
+				epoch.at, committer.JoinerSecret(), joinerSecret)
+		}
+		if !bytes.Equal(committer.WelcomeSecret(), joiner.WelcomeSecret()) {
+			t.Errorf("%s: welcome_secret differs between the paths: committer %x, joiner %x",
+				epoch.at, committer.WelcomeSecret(), joiner.WelcomeSecret())
+		}
+		if !bytes.Equal(joiner.WelcomeSecret(), hand.welcomeSecret) {
+			t.Errorf("%s: the joiner path derived welcome_secret %x and section 8 gives %x",
+				epoch.at, joiner.WelcomeSecret(), hand.welcomeSecret)
+		}
+		// both paths must have expanded over the same context bytes, and over the ones the
+		// codec produces for the context they were given: two schedules that agreed on nine
+		// secrets derived over two different preimages would be a coincidence worth hearing
+		// about rather than the property in the name
+		if !bytes.Equal(committer.GroupContextBytes(), joiner.GroupContextBytes()) {
+			t.Errorf("%s: the two paths expanded over different group context bytes: %x and %x",
+				epoch.at, committer.GroupContextBytes(), joiner.GroupContextBytes())
+		}
+		if !bytes.Equal(joiner.GroupContextBytes(), epoch.encoded) {
+			t.Errorf("%s: the joiner expanded over %x and the context encodes to %x",
+				epoch.at, joiner.GroupContextBytes(), epoch.encoded)
+		}
+
+		committerSecrets := epochSecretsByField(t, committer.Secrets())
+		joinerSecrets := epochSecretsByField(t, joiner.Secrets())
+		for _, name := range names {
+			want, derived := hand.secrets[name]
+			if !derived {
+				t.Fatalf("%s: the hand written derivation answers nothing for EpochSecrets.%s", epoch.at, name)
+			}
+			if !bytes.Equal(committerSecrets[name], joinerSecrets[name]) {
+				t.Errorf("%s: %s differs between the paths: committer %x, joiner %x",
+					epoch.at, name, committerSecrets[name], joinerSecrets[name])
+			}
+			if !bytes.Equal(joinerSecrets[name], want) {
+				t.Errorf("%s: the joiner path derived %s = %x and section 8 gives %x",
+					epoch.at, name, joinerSecrets[name], want)
+			}
+			if !bytes.Equal(committerSecrets[name], want) {
+				t.Errorf("%s: the committer path derived %s = %x and section 8 gives %x",
+					epoch.at, name, committerSecrets[name], want)
+			}
+			compared++
+		}
+	}
+	if want := len(generated) * len(names); compared != want {
+		t.Fatalf("compared %d secrets, want %d", compared, want)
+	}
+}
+
+// TestTheJoinerPathBindsEveryFieldOfTheGroupContext walks what the corpus cannot: a joiner
+// handed the right joiner_secret and a group context that differs in one field must derive
+// a different epoch.
+//
+// This is the failure a joiner cannot detect for itself. It has no previous epoch to
+// compare against and no commit to reprocess; the GroupInfo it was sent is the whole of
+// what it knows about the group. If a field of that context is not in the preimage, a
+// joiner handed a swapped tree hash or a stale epoch number derives the epoch anyway, is
+// admitted, and reads traffic from a group whose membership it never verified.
+//
+// The fields come from mutatedGroupContexts, which builds one case per declared field, so a
+// field added to GroupContext by a later plan is judged by existing. Each is required to
+// move ALL nine secrets rather than one of them, since epoch_secret is the parent of all
+// nine and a field that moved only some of them would mean something stranger than an
+// unbound field.
+//
+// welcome_secret is required NOT to move, which is the same claim from the other side.
+// member_secret is Extract(joiner_secret, psk_secret) and the group context enters only at
+// the epoch expansion, so a welcome secret that followed the context would be a Welcome no
+// peer could open -- and mixing the context in "for safety" is exactly the shape that would
+// pass a test asserting only that things change.
+func TestTheJoinerPathBindsEveryFieldOfTheGroupContext(t *testing.T) {
+	names := epochSecretFieldNames(t)
+	fields := reflect.TypeOf(GroupContext{}).NumField()
+	if fields == 0 {
+		t.Fatal("GroupContext declares no field, so this gate compares nothing")
+	}
+	generated := ksGeneratedEpochs(t)
+	observed := 0
+	for _, epoch := range generated {
+		joinerSecret := ksHandJoinerSecret(t, epoch.initPrev, epoch.commitSecret, epoch.encoded)
+		base, err := NewKeyScheduleFromJoiner(
+			epoch.crypto, joinerSecret, epoch.pskSecret, epoch.groupContext)
+		if err != nil {
+			t.Fatalf("%s: NewKeyScheduleFromJoiner over the base context: %v", epoch.at, err)
+		}
+		baseSecrets := epochSecretsByField(t, base.Secrets())
+		cases := mutatedGroupContexts(t, epoch.groupContext)
+		if len(cases) != fields {
+			t.Fatalf("%s: GroupContext declares %d fields and this gate built %d cases",
+				epoch.at, fields, len(cases))
+		}
+		for _, field := range slices.Sorted(maps.Keys(cases)) {
+			changed, err := NewKeyScheduleFromJoiner(
+				epoch.crypto, joinerSecret, epoch.pskSecret, cases[field])
+			if err != nil {
+				t.Errorf("%s: GroupContext.%s changed: NewKeyScheduleFromJoiner: %v", epoch.at, field, err)
+				continue
+			}
+			changedSecrets := epochSecretsByField(t, changed.Secrets())
+			for _, name := range names {
+				if bytes.Equal(changedSecrets[name], baseSecrets[name]) {
+					t.Errorf("%s: changing GroupContext.%s left %s unchanged, so a joiner handed a swapped %s derives the epoch anyway and joins a group it never agreed to",
+						epoch.at, field, name, field)
+				}
+				observed++
+			}
+			if !bytes.Equal(changed.WelcomeSecret(), base.WelcomeSecret()) {
+				t.Errorf("%s: changing GroupContext.%s moved welcome_secret from %x to %x; member_secret is Extract(joiner_secret, psk_secret) and the context enters only at the epoch expansion, so a Welcome sealed under this key opens for nobody",
+					epoch.at, field, base.WelcomeSecret(), changed.WelcomeSecret())
+			}
+		}
+	}
+	if want := len(generated) * fields * len(names); observed != want {
+		t.Fatalf("observed %d field comparisons, want %d", observed, want)
+	}
+}
