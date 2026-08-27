@@ -249,26 +249,33 @@ func TestConsumedSyntaxWriterShape(t *testing.T) {
 	}
 }
 
-// keyScheduleVectorFamilies is the four mlswg families this plan gates, transcribed from
-// its file structure table. Nothing in the tree derives this set today — the runners that
-// would name it are later tasks — so the count assertion in the test below is what stops
-// the list shrinking, since a deleted entry would otherwise leave a shorter list that
-// still passes every per file check.
+// keyScheduleVectorFamilies is the mlswg families this plan gates: the four of its file
+// structure table, and message-protection.json, which task 10 reads. Nothing in the tree
+// derives this set today — the runners that would name it are later tasks — so the count
+// assertion in the test below is what stops the list shrinking, since a deleted entry would
+// otherwise leave a shorter list that still passes every per file check.
+//
+// message-protection.json is here because the membership tag's known answer comes out of it:
+// that corpus publishes an epoch's membership_key and the public messages framed under it, and
+// no other family carries a membership_tag at all. A family this plan READS and does not gate
+// is a family whose absence would be reported as a decode failure in the middle of a known
+// answer test rather than as the missing vendoring it is.
 var keyScheduleVectorFamilies = []string{
 	"key-schedule.json",
 	"psk_secret.json",
 	"transcript-hashes.json",
 	"secret-tree.json",
+	"message-protection.json",
 }
 
-// TestVectorFilesPresent asserts the four vector families this plan gates were vendored
+// TestVectorFilesPresent asserts the vector families this plan gates were vendored
 // by the validation plan's single vendoring task, are not empty, and are covered by the
 // digest manifest beside them. This plan reads them and never writes them.
 //
 // The manifest half matters more than the presence half: a file that is present but
 // unlisted is a file nothing pins, and a file whose digest disagrees with the manifest is
 // a file that changed after it was pinned. TestVectorFilesArePinned in vectors_pin_test.go
-// checks all sixteen families; this checks the four this plan cannot run without, so a
+// checks all sixteen families; this checks the five this plan cannot run without, so a
 // change to that file's list cannot quietly drop one of them.
 //
 // The manifest half is worth exactly what the manifest is worth, and on its own that is
@@ -285,8 +292,8 @@ var keyScheduleVectorFamilies = []string{
 // Normalised, all sixteen match, so no KAT is wrong; re-vendoring at LF belongs to the task
 // that vendored them.
 func TestVectorFilesPresent(t *testing.T) {
-	if len(keyScheduleVectorFamilies) != 4 {
-		t.Fatalf("this plan gates %d vector families, want the 4 of its file structure table",
+	if len(keyScheduleVectorFamilies) != 5 {
+		t.Fatalf("this plan gates %d vector families, want the 4 of its file structure table and the message protection corpus task 10 reads",
 			len(keyScheduleVectorFamilies))
 	}
 	manifest := readVectorManifest(t)

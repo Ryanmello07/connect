@@ -452,3 +452,115 @@ func (self *KeySchedule) secretIsLive(secret []byte) bool {
 	}
 	return live != 0
 }
+
+// ConfirmationTag is MAC(confirmation_key, confirmed_transcript_hash): the value every
+// Commit carries and every member who processes that Commit recomputes for itself.
+//
+// It is the fork detector, and it is the only one the protocol has. Two members whose
+// transcripts diverged hold different confirmed_transcript_hash values, so they produce
+// different tags and each of them can say so; without it a member that missed a proposal
+// would go on encrypting to a group that had stopped listening, with every message it
+// received still decrypting.
+//
+// The key is confirmation_key and NOT membership_key. The two are adjacent DeriveSecret
+// calls over one parent under two labels, so they are the same length and the same shape,
+// and swapping them yields a perfectly well formed KDF.Nh tag that this implementation
+// would also accept back from itself. Nothing about the value separates them, which is why
+// what holds this is the tag mlswg published in transcript-hashes.json rather than any
+// round trip this package could write.
+//
+// The confirmed transcript hash is the caller's, and its length is not checked here. A hash
+// that is not KDF.Nh bytes produces a tag no peer agrees with, and that failure lands on the
+// RECEIVER, which recomputes over its own transcript and refuses — so the wrong length fails
+// closed rather than authenticating anything. There is also no channel to report it through:
+// the signature answers bytes, and a second meaning for nil would be indistinguishable from
+// the erased epoch below.
+//
+// An epoch whose confirmation_key has been erased answers nil rather than a tag, for the
+// reason Export refuses one: the erase leaves KDF.Nh zero bytes behind, and a MAC under
+// KDF.Nh zero bytes is not a weak tag, it is a PUBLIC one that any party can compute with no
+// knowledge of the group. A caller that framed it would be sending a Commit whose fork
+// detector authenticates nobody, and a length check on the answer would report nothing.
+func (self *KeySchedule) ConfirmationTag(confirmedTranscriptHash []byte) []byte {
+	if !self.secretIsLive(self.secrets.Confirmation) {
+		return nil
+	}
+	return self.crypto.Mac(self.secrets.Confirmation, confirmedTranscriptHash)
+}
+
+// VerifyConfirmationTag is RFC 9420 ValSem205: the confirmation_tag a Commit carries is the
+// one this member's own confirmed_transcript_hash produces under this epoch's
+// confirmation_key.
+//
+// A false answer is FATAL TO THE MESSAGE and the caller must return on it (spec A section
+// 5.9, guardrail 7). It is not a warning to log beside a message that then goes on being
+// processed: the whole content of a false here is that the sender's view of the group and
+// this member's view of the group are not the same, so the commit must not be applied, the
+// epoch must not be advanced, and nothing the message carries may be trusted. p7 is where
+// that return is written; this sentence is here because the obligation belongs to the
+// function that answers the bool, and a bool is the one result shape a caller can ignore by
+// not looking at it.
+//
+// The comparison is CryptoProvider.MacVerify and nothing else, which is guardrail 8: it
+// reaches crypto/subtle.ConstantTimeCompare, it refuses a length mismatch ahead of the
+// comparison rather than comparing a prefix, and it is the only spelling this package
+// permits. bytes.Equal, hmac.Equal and bytes.HasPrefix all answer the same bool for the
+// tags that matter and none of them is this.
+//
+// A tag of the wrong length is refused rather than compared against as much of itself as
+// fits — MacVerify checks the length first — because a prefix comparison accepts every
+// truncation of a valid tag, and a receiver that accepted a one byte tag would be accepting
+// a forgery an attacker finds in 256 tries.
+//
+// An epoch whose confirmation_key has been erased refuses everything, for the reason
+// ConfirmationTag answers nil: the key is publicly computable once it is zero, so every
+// party could forge a tag this would otherwise accept.
+func (self *KeySchedule) VerifyConfirmationTag(confirmedTranscriptHash []byte, tag []byte) bool {
+	if !self.secretIsLive(self.secrets.Confirmation) {
+		return false
+	}
+	return self.crypto.MacVerify(self.secrets.Confirmation, confirmedTranscriptHash, tag)
+}
+
+// MembershipTag is MAC(membership_key, AuthenticatedContentTBM): what says a PublicMessage
+// came from a member of this group rather than from anybody who can reach the transport.
+//
+// The caller serializes AuthenticatedContentTBM and passes the bytes — p6's
+// AuthenticatedContentTBMBytes(authContent, groupContext), registry section 7.3 — because
+// this plan owns the key schedule and never sees framing types. The consequence is that the
+// binding of the GroupContext into the tag lives in the CALLER: this function authenticates
+// exactly the bytes it is handed, so a TBM assembled without the group context would be a
+// tag that verifies in any epoch of any group whose membership_key it was taken under.
+//
+// The key is membership_key and NOT confirmation_key, for the reason ConfirmationTag gives
+// in the other direction. What holds this is the membership_tag mlswg published in
+// message-protection.json.
+//
+// An epoch whose membership_key has been erased answers nil, for the reason ConfirmationTag
+// answers nil.
+func (self *KeySchedule) MembershipTag(authenticatedContentTbm []byte) []byte {
+	if !self.secretIsLive(self.secrets.Membership) {
+		return nil
+	}
+	return self.crypto.Mac(self.secrets.Membership, authenticatedContentTbm)
+}
+
+// VerifyMembershipTag is RFC 9420 ValSem008: the membership_tag a PublicMessage carries is
+// the one this epoch's membership_key produces over the AuthenticatedContentTBM the receiver
+// reassembled.
+//
+// A false answer is FATAL TO THE MESSAGE and the caller must return on it (spec A section
+// 5.9, guardrail 7). Everything VerifyConfirmationTag says about that applies here and one
+// thing more: this is the ONLY authentication a PublicMessage from a member carries besides
+// the signature, so a caller that logged a false and went on would be applying a proposal or
+// a commit that no member of the group sent.
+//
+// The comparison is CryptoProvider.MacVerify and nothing else, for the reasons
+// VerifyConfirmationTag gives: constant time, and a length mismatch refused ahead of the
+// comparison rather than a prefix compared.
+func (self *KeySchedule) VerifyMembershipTag(authenticatedContentTbm []byte, tag []byte) bool {
+	if !self.secretIsLive(self.secrets.Membership) {
+		return false
+	}
+	return self.crypto.MacVerify(self.secrets.Membership, authenticatedContentTbm, tag)
+}

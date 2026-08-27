@@ -1938,11 +1938,15 @@ func TestEveryEpochSecretIsDerivedFromOneParentUnderItsOwnLabel(t *testing.T) {
 // secret sweep below cannot call, with the reason. It is empty at this task: all four
 // accessors take the receiver and nothing else.
 //
-// It exists so that a later task adding an argument taking method — Export and the two tag
-// verifiers are in this plan — has to write down why that method cannot be swept, rather
-// than have it silently fall outside a gate whose whole subject is what this type is
-// allowed to hand out. The map is checked against the type, so an entry cannot outlive the
-// method it excuses.
+// It exists so that a later task adding an argument taking method has to write down why that
+// method cannot be swept, rather than have it silently fall outside a gate whose whole subject
+// is what this type is allowed to hand out. The map is checked against the type, so an entry
+// cannot outlive the method it excuses.
+//
+// It is STILL empty after the five argument taking methods this plan has landed — Export, the
+// two tag computations and the two tag verifiers — because every one of them is driven through
+// keyScheduleMethodArgumentRows instead. That is the direction to prefer: an excuse buys
+// nothing but silence, and each of those five answers something a sweep can compare.
 var keyScheduleMethodsTakingArguments = map[string]string{}
 
 // exportSweepContext is the exporter context the argument rows below carry.
@@ -1985,7 +1989,46 @@ var keyScheduleMethodArgumentRows = map[string]func(schedule *KeySchedule) [][]r
 			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
 		}
 	},
+	// the two tag computations and the two verifiers, driven rather than excused for the
+	// reason Export is. A tag is KDF.Nh bytes — exactly the length guardrail 6 is looking
+	// for — so a ConfirmationTag that answered the parent secret rather than a mac over it
+	// would be an answer of exactly the right size, and an excuse here would be a refusal to
+	// look at the four methods of this type most likely to be handed one.
+	//
+	// The verifier rows carry the tag the schedule itself computes for the same data, and
+	// that is what makes a verifier observable at all: driven with an arbitrary tag a
+	// verifier answers false however it is written, so a row that can only answer false says
+	// nothing about one that answers true unconditionally. The rows are rebuilt from the
+	// schedule on every call, so over an erased epoch the tag they carry is the nil one an
+	// erased ConfirmationTag answers — and the verifier still has to refuse it.
+	"ConfirmationTag": func(schedule *KeySchedule) [][]reflect.Value {
+		return [][]reflect.Value{{reflect.ValueOf(tagSweepTranscriptHash(schedule))}}
+	},
+	"MembershipTag": func(schedule *KeySchedule) [][]reflect.Value {
+		return [][]reflect.Value{{reflect.ValueOf(tagSweepTbm)}}
+	},
+	"VerifyConfirmationTag": func(schedule *KeySchedule) [][]reflect.Value {
+		hash := tagSweepTranscriptHash(schedule)
+		return [][]reflect.Value{{reflect.ValueOf(hash), reflect.ValueOf(schedule.ConfirmationTag(hash))}}
+	},
+	"VerifyMembershipTag": func(schedule *KeySchedule) [][]reflect.Value {
+		return [][]reflect.Value{{reflect.ValueOf(tagSweepTbm), reflect.ValueOf(schedule.MembershipTag(tagSweepTbm))}}
+	},
 }
+
+// tagSweepTranscriptHash is the confirmed_transcript_hash the sweeps drive the confirmation
+// tag with. KDF.Nh octets read off the schedule's own provider rather than written down, so a
+// suite with a wider hash is driven with a transcript hash of its own length rather than with
+// this file's opinion of one.
+func tagSweepTranscriptHash(schedule *KeySchedule) []byte {
+	return bytes.Repeat([]byte{0x3b}, schedule.crypto.HashSize())
+}
+
+// tagSweepTbm stands in for the serialized AuthenticatedContentTBM p6 will hand the membership
+// tag. Deliberately not KDF.Nh octets: the membership tag is taken over a framed message of
+// whatever length it happens to be, and a sweep input that was a kdf length would make an
+// answer of that length a coincidence of this test's own choosing.
+var tagSweepTbm = []byte("AuthenticatedContentTBM sweep bytes, deliberately not a kdf length")
 
 // exposedAnswerAt names one answer of one method: the method, and the position of the result
 // it came out of.
@@ -2055,6 +2098,15 @@ func exposedByteSlices(t *testing.T, what string, result reflect.Value) []expose
 	}
 	if result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Uint8 {
 		return []exposedSlice{{path: what, bytes: result.Bytes()}}
+	}
+	if result.Kind() == reflect.Bool {
+		// a verifier answers a question rather than a value, and one bit cannot be KDF.Nh
+		// bytes of epoch secret however it is set — so it contributes nothing to guardrail
+		// 6's class. It is not nothing to every sweep that reads this: the erased epoch gate
+		// reads the bit itself through scheduleAnswer, because a verifier that ACCEPTS over
+		// an epoch whose key has become publicly computable is the same defect as a
+		// derivation that answers over one.
+		return nil
 	}
 	if result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct {
 		if result.IsNil() {
@@ -5354,13 +5406,32 @@ const erasedEpochControl = "package control\n" +
 	"\treturn secret\n" +
 	"}\n"
 
+// scheduleAnswer is what one row of one exported method handed back: the byte slices a caller
+// can read, and the bits a verifier answered with.
+//
+// The two travel together because the gate below asks one question of both kinds of method.
+// "Did this call hand something back that a caller can act on" is BYTES for a derivation and an
+// ACCEPTANCE for a verifier, and a reading that saw only the bytes would report a verifier
+// which accepts over an erased epoch as a call that answered nothing at all — which is exactly
+// the reading a correctly refusing verifier produces, and so exactly the clean run.
+type scheduleAnswer struct {
+	read     [][]byte
+	accepted []bool
+}
+
+// handedSomethingBack is whether this row produced anything a caller could act on.
+func (self scheduleAnswer) handedSomethingBack() bool {
+	return slices.ContainsFunc(self.read, func(one []byte) bool { return len(one) != 0 }) ||
+		slices.Contains(self.accepted, true)
+}
+
 // scheduleMethodResults calls one exported method of *KeySchedule with every row the sweeps
 // drive it by — or once with no arguments if it takes none — and splits each answer into the
-// bytes a caller can read and the error beside them.
+// bytes a caller can read, the bits a verifier answered, and the error beside them.
 //
 // The rows are keyScheduleMethodArgumentRows, the same ones guardrail 6 is driven through, so
 // a method that gains an argument is driven here by writing that row once rather than twice.
-func scheduleMethodResults(t *testing.T, at string, schedule *KeySchedule, name string) [][][]byte {
+func scheduleMethodResults(t *testing.T, at string, schedule *KeySchedule, name string) []scheduleAnswer {
 	t.Helper()
 	method, found := reflect.TypeOf(schedule).MethodByName(name)
 	if !found {
@@ -5376,9 +5447,9 @@ func scheduleMethodResults(t *testing.T, at string, schedule *KeySchedule, name 
 		rows = build(schedule)
 	}
 	errorInterface := reflect.TypeOf((*error)(nil)).Elem()
-	answers := [][][]byte{}
+	answers := []scheduleAnswer{}
 	for _, row := range rows {
-		read := [][]byte{}
+		answer := scheduleAnswer{read: [][]byte{}, accepted: []bool{}}
 		refused := false
 		for _, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(schedule)}, row...)) {
 			if result.Type() == errorInterface {
@@ -5391,20 +5462,24 @@ func scheduleMethodResults(t *testing.T, at string, schedule *KeySchedule, name 
 				}
 				continue
 			}
-			read = append(read, exposedBytes(exposedByteSlices(t, "(*KeySchedule)."+name, result))...)
+			if result.Kind() == reflect.Bool {
+				answer.accepted = append(answer.accepted, result.Bool())
+				continue
+			}
+			answer.read = append(answer.read, exposedBytes(exposedByteSlices(t, "(*KeySchedule)."+name, result))...)
 		}
 		if refused {
 			// a refusal that came back with bytes beside it is the leak this gate is about,
 			// wearing an error
-			for _, secret := range read {
+			for _, secret := range answer.read {
 				if len(secret) != 0 {
 					t.Errorf("%s: %s refused and %d bytes came back beside the refusal", at, name, len(secret))
 				}
 			}
-			answers = append(answers, nil)
+			answers = append(answers, scheduleAnswer{})
 			continue
 		}
-		answers = append(answers, read)
+		answers = append(answers, answer)
 	}
 	return answers
 }
@@ -5430,6 +5505,13 @@ func scheduleMethodResults(t *testing.T, at string, schedule *KeySchedule, name 
 // Both directions are asserted. A live epoch must answer, or a method that refused everything
 // would satisfy the erased half for the wrong reason; and the nine really are zero after the
 // erase, or the refusal would be about some other condition.
+//
+// A VERIFIER is in the same class and for the same reason, which is why what a row answered is
+// read as bytes and as acceptances together. ConfirmationTag and MembershipTag hand back a mac
+// under a key that has become publicly computable; VerifyConfirmationTag and VerifyMembershipTag
+// hand back TRUE for a tag anybody could have forged under that same key. The second is the
+// worse half — a caller reading the bool has been told the message is authentic — and it is
+// invisible to a gate that only counts bytes, because a bool is not one.
 func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.T) {
 	// the control first: the matcher tells a read of a named secret from an answer of the
 	// storage whole, and exported from not
@@ -5476,8 +5558,8 @@ func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.
 		// afterwards is the erase and not a method that refuses everything
 		for _, name := range deriving {
 			for index, answer := range scheduleMethodResults(t, epoch.at, schedule, name) {
-				if !slices.ContainsFunc(answer, func(b []byte) bool { return len(b) != 0 }) {
-					t.Fatalf("%s: %s row %d answered no bytes over a live epoch, so a refusal after the erase would say nothing",
+				if !answer.handedSomethingBack() {
+					t.Fatalf("%s: %s row %d answered nothing over a live epoch — no bytes and no acceptance — so a refusal after the erase would say nothing",
 						epoch.at, name, index)
 				}
 			}
@@ -5498,13 +5580,947 @@ func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.
 
 		for _, name := range deriving {
 			for index, answer := range scheduleMethodResults(t, epoch.at, schedule, name) {
-				for _, secret := range answer {
+				for _, secret := range answer.read {
 					if len(secret) != 0 {
 						t.Errorf("%s: %s row %d answered %d bytes over an epoch whose secrets are erased; a derivation over KDF.Nh zero bytes is publicly computable, so this is a secret handed out with err == nil",
 							epoch.at, name, index, len(secret))
 					}
 				}
+				for _, accepted := range answer.accepted {
+					if accepted {
+						t.Errorf("%s: %s row %d ACCEPTED over an epoch whose secrets are erased; the key it verified under is KDF.Nh zero bytes, which every party can compute, so what it accepted is a tag anybody could have forged",
+							epoch.at, name, index)
+					}
+				}
 			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: the confirmation tag and the membership tag
+// ---------------------------------------------------------------------------
+//
+// Two of the four functions this task adds return a bool, and this project has already
+// shipped a total authentication bypass behind that shape twice, both times with everything
+// green: a write_auth whose tag error was discarded returned the ZERO tag for a wrong length
+// key — and an all zero write_auth is the normal state of every record on the read path — and
+// a truncated comparison reached through a comparator no ban list held.
+//
+// So the tests below are deliberately not "the tag is KDF.Nh bytes" and not "verify accepts
+// what compute produced". Both of those pass against a verifier that returns true
+// unconditionally, which is a one line edit and the whole of the bypass. What is asserted
+// instead is the class of things that must be REFUSED, derived over the length rather than
+// sampled at a position somebody chose, and the identity of the KEY, which no round trip can
+// see because the two keys this task uses are adjacent DeriveSecret calls of the same length.
+//
+// The key identity is held to known answers nobody here computed:
+//
+//   - the confirmation_tag mlswg published in transcript-hashes.json, which that corpus
+//     defines as MAC(confirmation_key, confirmed_transcript_hash_after);
+//   - the membership_tag mlswg published inside the public messages of
+//     message-protection.json, taken over the AuthenticatedContentTBM rebuilt from that
+//     entry's own bytes.
+//
+// Both corpora are authenticated against upstream's git object store before a byte of either
+// is read, for the reason keyScheduleKatVectors gives: a known answer test that compares
+// against a file an edit can change is a known answer test that can be made to agree with
+// anything.
+
+// The two further mlswg families this task reads, and how many comparisons each contributes
+// once the entries for suites this package does not register are dropped: one confirmation
+// tag per registered suite, and one membership tag per registered suite per public message.
+//
+// The counts are asserted rather than assumed, for the reason keyScheduleKatJoinerComparisons
+// is: a filter that stopped matching — a suite renumbered, a json field renamed so every
+// string decodes empty — turns a known answer test into a loop that runs zero times and
+// reports PASS, which is the one outcome a known answer test must not be able to reach.
+const (
+	transcriptHashKatFile      = "transcript-hashes.json"
+	messageProtectionKatFile   = "message-protection.json"
+	confirmationTagComparisons = 2
+	membershipTagComparisons   = 4
+)
+
+// transcriptHashKatEntry is the part of one transcript-hashes.json entry this file reads.
+//
+// authenticated_content is the serialized AuthenticatedContent of a Commit, and the last field
+// of its FramedContentAuthData is the confirmation_tag — which is where the published answer
+// is read from, since that corpus carries no separate confirmation_tag field.
+type transcriptHashKatEntry struct {
+	CipherSuite                  uint16 `json:"cipher_suite"`
+	ConfirmationKey              string `json:"confirmation_key"`
+	AuthenticatedContent         string `json:"authenticated_content"`
+	ConfirmedTranscriptHashAfter string `json:"confirmed_transcript_hash_after"`
+}
+
+// messageProtectionKatEntry is the part of one message-protection.json entry this file reads:
+// the membership_key of the epoch, the four GroupContext fields that epoch was framed under,
+// and the two public messages with the bare proposal and commit bodies that sit inside them.
+type messageProtectionKatEntry struct {
+	CipherSuite             uint16 `json:"cipher_suite"`
+	GroupId                 string `json:"group_id"`
+	Epoch                   uint64 `json:"epoch"`
+	TreeHash                string `json:"tree_hash"`
+	ConfirmedTranscriptHash string `json:"confirmed_transcript_hash"`
+	MembershipKey           string `json:"membership_key"`
+	Proposal                string `json:"proposal"`
+	ProposalPub             string `json:"proposal_pub"`
+	Commit                  string `json:"commit"`
+	CommitPub               string `json:"commit_pub"`
+}
+
+// mustLoadAuthenticatedCorpus decodes one vendored mlswg family, having first checked that the
+// bytes on disk are the blob mlswg published at the commit interop/PINS.md pins.
+//
+// This is keyScheduleKatVectors' provenance check, written once for the families this task
+// adds. The check is made here rather than left to vectors_upstream_test.go for the reason
+// that file gives about VECTORS.sha256: a manifest computed over the local bytes verifies a
+// rewritten corpus the moment the manifest is rewritten with it, and that test failing does
+// not stop this one running. The digest compared against is the one read out of upstream's git
+// object store.
+func mustLoadAuthenticatedCorpus(t *testing.T, name string, into any) {
+	t.Helper()
+	want, anchored := mlswgVectorUpstreamSha256[name]
+	if !anchored {
+		t.Fatalf("%s carries no upstream digest, so the answers below would be compared against an unauthenticated file",
+			name)
+	}
+	raw, err := os.ReadFile(filepath.Join(mlswgVectorDirectory, name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	digest := sha256.Sum256(normalisedLineEndings(raw))
+	if got := hex.EncodeToString(digest[:]); got != want {
+		t.Fatalf("%s hashes to %s with its line endings normalised; %s/%s at %s published %s. These are not the answers mlswg published, so nothing below is a known answer test",
+			name, got, mlswgVectorUpstreamRepository, mlswgVectorUpstreamDirectory,
+			mlswgVectorUpstreamCommit, want)
+	}
+	loadLabelKat(t, name, into)
+}
+
+// publishedTagAtTheTail reads the mac one of these serialized structures ends with.
+//
+// Both a FramedContentAuthData's confirmation_tag and a PublicMessage's membership_tag are the
+// LAST field of their structure and both are an opaque<V> of exactly KDF.Nh octets, so the tail
+// is the tag and the octet in front of it is the vector's own length prefix. That prefix is
+// asserted rather than skipped over: KDF.Nh is 32 for both registered suites and 32 <= 63, so
+// RFC 9420 section 2.1.2 writes it as the single octet 0x20 — and if the octet found there is
+// not the length of the tail being read, then what is being read is not a tag, and a comparison
+// against it would be a comparison against the wrong bytes rather than a failure.
+func publishedTagAtTheTail(t *testing.T, what string, blob []byte, nh int) []byte {
+	t.Helper()
+	if len(blob) < nh+1 {
+		t.Fatalf("%s is %d bytes and a %d byte tag with its length prefix does not fit in it", what, len(blob), nh)
+	}
+	if prefix := blob[len(blob)-nh-1]; int(prefix) != nh {
+		t.Fatalf("%s: the octet before its last %d bytes is %#02x, and a <V> vector of %d octets is written as the one octet varint %#02x, so the tail this reads is not a tag",
+			what, nh, prefix, nh, nh)
+	}
+	return blob[len(blob)-nh:]
+}
+
+// ksScheduleForSuite builds a real key schedule for one registered suite out of the published
+// key schedule corpus.
+//
+// A real one, rather than a hand assembled struct, because everything the tag methods reach —
+// the provider, the nine secrets, the storage Secrets() answers into — has to be the thing
+// under test and not a fixture that resembles it.
+func ksScheduleForSuite(t *testing.T, epochs []ksVectorEpoch, suite CipherSuite) *KeySchedule {
+	t.Helper()
+	for _, epoch := range epochs {
+		if epoch.suite == suite {
+			return epoch.schedule(t)
+		}
+	}
+	t.Fatalf("the key schedule corpus carries no epoch for suite %#04x, so no schedule can be built for it",
+		uint16(suite))
+	return nil
+}
+
+// installTheCorpusKey writes one of the corpus's own keys into a schedule's storage, having
+// first established that doing so changes the answer.
+//
+// The write goes through the pointer Secrets() answers, which key_schedule.go documents as
+// being into the schedule's own storage. That is what lets a published (key, data, tag) triple
+// be put through the real type: a key schedule derives its own confirmation_key from its own
+// epoch and cannot be asked to derive somebody else's.
+//
+// The two refusals are the controls, and they matter more than they look. If the schedule's own
+// secret already equalled the corpus key, or if the tag it produced before the write already
+// equalled the published one, then the comparison that follows would hold whichever key the
+// method under test actually read — including the other one of the two adjacent secrets this
+// whole file exists to tell apart. A comparison that would have passed without the installation
+// is not a comparison against the corpus at all.
+func installTheCorpusKey(t *testing.T, at string, storage *[]byte, key []byte, before []byte, want []byte) {
+	t.Helper()
+	if bytes.Equal(*storage, key) {
+		t.Fatalf("%s: the schedule's own secret already equals the corpus key, so installing it changes nothing and the comparison below holds for either one",
+			at)
+	}
+	if bytes.Equal(before, want) {
+		t.Fatalf("%s: the tag over this schedule's own secret already equals the published one, so the comparison below holds whichever key the method reads",
+			at)
+	}
+	*storage = key
+}
+
+// TestConfirmationTagMatchesTheMlswgTranscriptHashes is the known answer test for
+// ConfirmationTag, against a value this package did not compute.
+//
+// mlswg's transcript-hashes corpus defines the confirmation_tag carried by the
+// authenticated_content of each entry as MAC(confirmation_key, confirmed_transcript_hash_after),
+// and publishes the key, the hash and the AuthenticatedContent the tag sits in. All three are
+// somebody else's numbers, which is the only thing that can separate a tag keyed by
+// confirmation_key from one keyed by membership_key: the two are adjacent DeriveSecret calls
+// over one parent, so they are the same length and indistinguishable from random, and an
+// implementation that swapped them returns a perfectly well formed KDF.Nh tag that it would
+// also accept back from itself.
+//
+// Three things stop this passing vacuously. The corpus is authenticated against upstream before
+// it is read. The number of comparisons is counted and the suites the loop matched are compared
+// against the registry, so a filter that stopped matching is loud rather than green. And the tag
+// the schedule's OWN confirmation_key produces over the same hash is computed first and required
+// to differ from the published one, so a comparison that would have held without the corpus key
+// being installed is reported instead of passing.
+func TestConfirmationTagMatchesTheMlswgTranscriptHashes(t *testing.T) {
+	entries := []transcriptHashKatEntry{}
+	mustLoadAuthenticatedCorpus(t, transcriptHashKatFile, &entries)
+	if len(entries) == 0 {
+		t.Fatalf("%s parsed to no entries, so every comparison below would run over nothing", transcriptHashKatFile)
+	}
+	epochs := ksVectorEpochs(t)
+	compared := 0
+	matched := []CipherSuite{}
+	for _, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		matched = append(matched, suite)
+		at := fmt.Sprintf("%s suite %#04x", transcriptHashKatFile, uint16(suite))
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		confirmationKey := mustDecodeHex(t, at+" confirmation_key", entry.ConfirmationKey)
+		transcriptHash := mustDecodeHex(t, at+" confirmed_transcript_hash_after", entry.ConfirmedTranscriptHashAfter)
+		authenticatedContent := mustDecodeHex(t, at+" authenticated_content", entry.AuthenticatedContent)
+		if len(confirmationKey) != nh {
+			t.Fatalf("%s: the published confirmation_key is %d bytes and this suite's KDF.Nh is %d",
+				at, len(confirmationKey), nh)
+		}
+		if len(transcriptHash) != nh {
+			t.Fatalf("%s: the published confirmed_transcript_hash_after is %d bytes and this suite's KDF.Nh is %d",
+				at, len(transcriptHash), nh)
+		}
+		want := publishedTagAtTheTail(t, at+" authenticated_content", authenticatedContent, nh)
+
+		schedule := ksScheduleForSuite(t, epochs, suite)
+		installTheCorpusKey(t, at, &schedule.Secrets().Confirmation, confirmationKey,
+			schedule.ConfirmationTag(transcriptHash), want)
+		got := schedule.ConfirmationTag(transcriptHash)
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: ConfirmationTag = %x, and mlswg published %x. The tag is MAC(confirmation_key, confirmed_transcript_hash) and nothing else; membership_key is the same length and produces an answer just as well formed",
+				at, got, want)
+		}
+		if !schedule.VerifyConfirmationTag(transcriptHash, want) {
+			t.Errorf("%s: VerifyConfirmationTag refused the tag mlswg published for this key and this transcript hash",
+				at)
+		}
+		compared++
+	}
+	if compared != confirmationTagComparisons {
+		t.Fatalf("%d confirmation tags were compared against %s, want %d; the loop matched %v",
+			compared, transcriptHashKatFile, confirmationTagComparisons, matched)
+	}
+	if got := slices.Sorted(slices.Values(matched)); !slices.Equal(got, Suites()) {
+		t.Fatalf("%s answered for %v and this package registers %v", transcriptHashKatFile, got, Suites())
+	}
+}
+
+// authenticatedContentTbm rebuilds the AuthenticatedContentTBM bytes RFC 9420 section 6.1 takes
+// the membership tag over, out of one message-protection.json public message.
+//
+// This plan owns no framing types — p6 does — so the structure is not decoded. It does not have
+// to be. RFC 9420 writes
+//
+//	FramedContentTBS   = version || wire_format || FramedContent || GroupContext
+//	AuthenticatedContentTBM = FramedContentTBS || FramedContentAuthData
+//	PublicMessage      = FramedContent || FramedContentAuthData || membership_tag
+//
+// and the corpus hands over an MLSMessage whose first four octets are exactly version and
+// wire_format, followed by that PublicMessage. So the only thing needed is where FramedContent
+// ends, and the corpus publishes that too: the bare `proposal` and `commit` fields are the
+// serialized bodies that sit at the END of the FramedContent of the matching public message.
+// Locating those bytes gives the boundary, the GroupContext is spliced in there, and the auth
+// data is what is left over once the trailing membership_tag is removed.
+//
+// The splice is required to be unambiguous rather than assumed to be: the body must occur
+// exactly once in the message, or the boundary this reads is a guess. And nothing here is
+// circular — the reconstruction is a function of published bytes alone, and a reconstruction
+// that were wrong would make the comparison FAIL rather than pass, since only the right
+// preimage under the right key reproduces a mac somebody else published.
+//
+// The GroupContext is encoded by this package's own codec, which the group context task already
+// holds to this same corpus family; if it disagreed, this test would fail rather than pass.
+func authenticatedContentTbm(
+	t *testing.T,
+	at string,
+	mlsMessage []byte,
+	framedBody []byte,
+	groupContext []byte,
+	nh int,
+) []byte {
+	t.Helper()
+	if !bytes.HasPrefix(mlsMessage, mlsMessagePublicMessageHeader) {
+		t.Fatalf("%s: the message opens with %x and an MLSMessage carrying a PublicMessage opens with %x, so the first four octets are not the version and wire format this splices",
+			at, mlsMessage[:min(len(mlsMessage), len(mlsMessagePublicMessageHeader))], mlsMessagePublicMessageHeader)
+	}
+	found := bytes.Index(mlsMessage, framedBody)
+	if found < 0 {
+		t.Fatalf("%s: the published body of %d bytes is not inside the public message, so where FramedContent ends cannot be read off it",
+			at, len(framedBody))
+	}
+	if bytes.Index(mlsMessage[found+1:], framedBody) >= 0 {
+		t.Fatalf("%s: the published body occurs more than once in the public message, so the boundary this reads is a guess", at)
+	}
+	endOfFramedContent := found + len(framedBody)
+	membershipTagWithPrefix := nh + 1
+	if endOfFramedContent+membershipTagWithPrefix > len(mlsMessage) {
+		t.Fatalf("%s: FramedContent ends %d bytes into a %d byte message, leaving no room for the auth data and the membership tag",
+			at, endOfFramedContent, len(mlsMessage))
+	}
+	authData := mlsMessage[endOfFramedContent : len(mlsMessage)-membershipTagWithPrefix]
+	if len(authData) == 0 {
+		t.Fatalf("%s: the FramedContentAuthData between the content and the membership tag is empty, and it carries a signature at least",
+			at)
+	}
+	return joinBytes(mlsMessage[:endOfFramedContent], groupContext, authData)
+}
+
+// TestMembershipTagMatchesTheMlswgMessageProtection is the known answer test for MembershipTag,
+// against a value this package did not compute.
+//
+// mlswg's message-protection corpus publishes an epoch's membership_key and two PublicMessages
+// framed under it, and the membership_tag each of those carries is MAC(membership_key,
+// AuthenticatedContentTBM). Rebuilding that preimage out of the corpus's own bytes and comparing
+// is what separates a membership tag keyed by membership_key from one keyed by confirmation_key,
+// for the reason the confirmation tag's own known answer test gives: the two are adjacent
+// DeriveSecret calls over one parent, the same length, and a swap is well formed.
+//
+// Two public messages per suite rather than one, because they differ in the shape of what they
+// authenticate: a proposal's FramedContentAuthData is a signature alone and a commit's is a
+// signature followed by a confirmation_tag. A tag taken over a truncated preimage — the content
+// without the auth data, say — would reproduce neither.
+func TestMembershipTagMatchesTheMlswgMessageProtection(t *testing.T) {
+	entries := []messageProtectionKatEntry{}
+	mustLoadAuthenticatedCorpus(t, messageProtectionKatFile, &entries)
+	if len(entries) == 0 {
+		t.Fatalf("%s parsed to no entries, so every comparison below would run over nothing", messageProtectionKatFile)
+	}
+	epochs := ksVectorEpochs(t)
+	compared := 0
+	matched := []CipherSuite{}
+	for _, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		matched = append(matched, suite)
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		suiteAt := fmt.Sprintf("%s suite %#04x", messageProtectionKatFile, uint16(suite))
+		membershipKey := mustDecodeHex(t, suiteAt+" membership_key", entry.MembershipKey)
+		if len(membershipKey) != nh {
+			t.Fatalf("%s: the published membership_key is %d bytes and this suite's KDF.Nh is %d",
+				suiteAt, len(membershipKey), nh)
+		}
+		groupContext, err := syntax.Marshal(&GroupContext{
+			Version:                 ProtocolVersionMls10,
+			CipherSuite:             suite,
+			GroupId:                 mustDecodeHex(t, suiteAt+" group_id", entry.GroupId),
+			Epoch:                   entry.Epoch,
+			TreeHash:                mustDecodeHex(t, suiteAt+" tree_hash", entry.TreeHash),
+			ConfirmedTranscriptHash: mustDecodeHex(t, suiteAt+" confirmed_transcript_hash", entry.ConfirmedTranscriptHash),
+			Extensions:              nil,
+		})
+		if err != nil {
+			t.Fatalf("%s: encode the group context these messages were framed under: %v", suiteAt, err)
+		}
+		for _, message := range []struct {
+			what string
+			body string
+			pub  string
+		}{
+			{what: "proposal_pub", body: entry.Proposal, pub: entry.ProposalPub},
+			{what: "commit_pub", body: entry.Commit, pub: entry.CommitPub},
+		} {
+			at := suiteAt + " " + message.what
+			publicMessage := mustDecodeHex(t, at, message.pub)
+			tbm := authenticatedContentTbm(t, at, publicMessage,
+				mustDecodeHex(t, at+" body", message.body), groupContext, nh)
+			want := publishedTagAtTheTail(t, at, publicMessage, nh)
+
+			schedule := ksScheduleForSuite(t, epochs, suite)
+			installTheCorpusKey(t, at, &schedule.Secrets().Membership, membershipKey,
+				schedule.MembershipTag(tbm), want)
+			got := schedule.MembershipTag(tbm)
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s: MembershipTag = %x, and mlswg published %x. The tag is MAC(membership_key, AuthenticatedContentTBM) and nothing else; confirmation_key is the same length and produces an answer just as well formed",
+					at, got, want)
+			}
+			if !schedule.VerifyMembershipTag(tbm, want) {
+				t.Errorf("%s: VerifyMembershipTag refused the tag mlswg published for this key and this message", at)
+			}
+			compared++
+		}
+	}
+	if compared != membershipTagComparisons {
+		t.Fatalf("%d membership tags were compared against %s, want %d; the loop matched %v",
+			compared, messageProtectionKatFile, membershipTagComparisons, matched)
+	}
+	if got := slices.Sorted(slices.Values(matched)); !slices.Equal(got, Suites()) {
+		t.Fatalf("%s answered for %v and this package registers %v", messageProtectionKatFile, got, Suites())
+	}
+}
+
+// tagPair is one (compute, verify) pair of the key schedule's tag surface, with the sweep
+// input the other gates already drive that pair by.
+type tagPair struct {
+	compute    string
+	verify     string
+	tagOf      func(schedule *KeySchedule, data []byte) []byte
+	verifiedBy func(schedule *KeySchedule, data []byte, tag []byte) bool
+	dataFor    func(schedule *KeySchedule) []byte
+}
+
+// tagVerifierPairs derives the tag surface off *KeySchedule's own method set rather than
+// listing it: an exported method named Verify<X> answering a bool over two byte slices, whose
+// <X> is an exported method answering a byte slice over one. A third tag added to this type
+// joins every sweep below by existing, which is the shape this repository has understated
+// fourteen times when it was written as a list.
+//
+// The derivation also has to ACCOUNT FOR every exported method of the type that answers a bool,
+// and reports one it cannot pair rather than skipping it. Guardrail 7 is that these verifiers
+// are among the only functions in this package permitted to return one at all, so a bool
+// answering method that is not a verifier — or a verifier that did not follow the naming — is
+// either a new thing to reason about or a way out of every sweep below, and both are worth a
+// failure. The sweep input is read out of keyScheduleMethodArgumentRows, the same rows guardrail
+// 6 and the erased epoch gate are driven through, so a pair is described in one place.
+func tagVerifierPairs(t *testing.T) []tagPair {
+	t.Helper()
+	scheduleType := reflect.TypeOf((*KeySchedule)(nil))
+	byteSlice := reflect.TypeOf([]byte(nil))
+	pairs := []tagPair{}
+	answeringABool := []string{}
+	for i := range scheduleType.NumMethod() {
+		verify := scheduleType.Method(i)
+		if verify.Type.NumOut() != 1 || verify.Type.Out(0).Kind() != reflect.Bool {
+			continue
+		}
+		answeringABool = append(answeringABool, verify.Name)
+		if !strings.HasPrefix(verify.Name, "Verify") {
+			t.Errorf("(*KeySchedule).%s answers a bool and is not named Verify<something>, so it is outside the tag verifier class every sweep below is derived from; guardrail 7 says a bool is a shape this package uses only where a caller must return on false",
+				verify.Name)
+			continue
+		}
+		if verify.Type.NumIn() != 3 || verify.Type.In(1) != byteSlice || verify.Type.In(2) != byteSlice {
+			t.Errorf("(*KeySchedule).%s is %s and a tag verifier takes the data and the tag, both byte slices",
+				verify.Name, verify.Type)
+			continue
+		}
+		name := strings.TrimPrefix(verify.Name, "Verify")
+		compute, declared := scheduleType.MethodByName(name)
+		if !declared {
+			t.Errorf("(*KeySchedule).%s verifies a tag and this type declares no %s to compute one, so nothing pins the two against each other",
+				verify.Name, name)
+			continue
+		}
+		if compute.Type.NumIn() != 2 || compute.Type.In(1) != byteSlice ||
+			compute.Type.NumOut() != 1 || compute.Type.Out(0) != byteSlice {
+			t.Errorf("(*KeySchedule).%s is %s and the computing half of a tag pair takes the data and answers the tag",
+				name, compute.Type)
+			continue
+		}
+		rows, driven := keyScheduleMethodArgumentRows[name]
+		if !driven {
+			t.Errorf("keyScheduleMethodArgumentRows has no rows for (*KeySchedule).%s, so the sweeps below have no data to drive the pair with",
+				name)
+			continue
+		}
+		pairs = append(pairs, tagPair{
+			compute: name,
+			verify:  verify.Name,
+			tagOf: func(schedule *KeySchedule, data []byte) []byte {
+				answered := compute.Func.Call([]reflect.Value{reflect.ValueOf(schedule), reflect.ValueOf(data)})
+				return answered[0].Bytes()
+			},
+			verifiedBy: func(schedule *KeySchedule, data []byte, tag []byte) bool {
+				answered := verify.Func.Call([]reflect.Value{
+					reflect.ValueOf(schedule), reflect.ValueOf(data), reflect.ValueOf(tag)})
+				return answered[0].Bool()
+			},
+			dataFor: func(schedule *KeySchedule) []byte {
+				built := rows(schedule)
+				if len(built) == 0 {
+					t.Fatalf("keyScheduleMethodArgumentRows drives (*KeySchedule).%s with no rows, so this sweep has no input", name)
+				}
+				return built[0][0].Bytes()
+			},
+		})
+	}
+	if len(pairs) < 2 {
+		t.Fatalf("the tag surface derived to %d pairs out of the bool answering methods %v, and this task lands two",
+			len(pairs), answeringABool)
+	}
+	return pairs
+}
+
+// TestEveryTagVerifierRefusesEveryAlterationOfWhatItWasGiven is the half of this task that a
+// verifier returning true unconditionally cannot survive.
+//
+// "The tag verifies" is not a property worth asserting on its own: it holds for a verifier that
+// looks at nothing, and that verifier is a one line edit and a total authentication bypass. The
+// property is the REFUSALS, and every class of them here is derived over the length rather than
+// sampled at a position somebody picked — because the two defects this project has actually
+// shipped were a comparison that stopped early and a comparison that never happened, and both
+// are invisible to a test that flips byte zero.
+//
+// Five classes, each satisfiable by a different wrong implementation:
+//
+//   - every single bit of the tag, all 8*len of them, because a comparison that ignores the
+//     tail accepts every alteration in it;
+//   - every single bit of the data, because a verifier that macs the wrong bytes — or a fixed
+//     string — accepts a tag over content nobody sent;
+//   - every truncation of the tag from empty upwards, because a prefix comparison accepts a one
+//     byte tag an attacker finds in 256 tries, and because a length mismatch must be a refusal
+//     rather than a panic;
+//   - the tag lengthened by one octet, and the all zero tag, which is what an uninitialised or
+//     erased tag field arrives as;
+//   - the tag another EPOCH produces over the same data, and the tag the other PAIR produces
+//     over the same data. The second is what says confirmation_key and membership_key have not
+//     been made the same key: a verifier reading the wrong one of the two accepts its sibling's
+//     tag, and every length and shape assertion in this file goes on holding.
+func TestEveryTagVerifierRefusesEveryAlterationOfWhatItWasGiven(t *testing.T) {
+	epochs := ksVectorEpochs(t)
+	if len(epochs) < 2 {
+		t.Fatalf("the corpus answered for %d epochs and the wrong key row here needs two", len(epochs))
+	}
+	pairs := tagVerifierPairs(t)
+	for index, epoch := range epochs {
+		schedule := epoch.schedule(t)
+		otherEpoch := epochs[(index+1)%len(epochs)].schedule(t)
+		for _, pair := range pairs {
+			at := fmt.Sprintf("%s %s", epoch.at, pair.verify)
+			data := pair.dataFor(schedule)
+			tag := pair.tagOf(schedule, data)
+			if len(tag) != epoch.crypto.HashSize() {
+				t.Fatalf("%s: %s answered %d bytes and the mac of this suite is %d, so the sweeps below would run over the wrong thing",
+					at, pair.compute, len(tag), epoch.crypto.HashSize())
+			}
+			// the control: without it every refusal below is satisfied by a verifier that
+			// refuses everything, which authenticates nothing and breaks no test that only
+			// looks for false
+			if !pair.verifiedBy(schedule, data, tag) {
+				t.Fatalf("%s: the tag this schedule just computed did not verify, so every refusal below says nothing", at)
+			}
+
+			refused := 0
+			for i := range tag {
+				for bit := range 8 {
+					altered := bytes.Clone(tag)
+					altered[i] ^= 1 << bit
+					if !pair.verifiedBy(schedule, data, altered) {
+						refused++
+					}
+				}
+			}
+			if want := 8 * len(tag); refused != want {
+				t.Errorf("%s: %d of %d single bit alterations of the TAG were refused; a comparison that stops early accepts every alteration past where it stopped",
+					at, refused, want)
+			}
+
+			refused = 0
+			for i := range data {
+				for bit := range 8 {
+					altered := bytes.Clone(data)
+					altered[i] ^= 1 << bit
+					if !pair.verifiedBy(schedule, altered, tag) {
+						refused++
+					}
+				}
+			}
+			if want := 8 * len(data); refused != want {
+				t.Errorf("%s: %d of %d single bit alterations of the DATA were refused; a verifier that macs anything but the bytes it was handed authenticates content nobody sent",
+					at, refused, want)
+			}
+
+			for n := range len(tag) {
+				if pair.verifiedBy(schedule, data, tag[:n]) {
+					t.Errorf("%s: the first %d bytes of a %d byte tag verified; a prefix comparison accepts every truncation of a valid tag",
+						at, n, len(tag))
+				}
+			}
+			for _, extra := range []byte{0x00, 0xff} {
+				if pair.verifiedBy(schedule, data, append(bytes.Clone(tag), extra)) {
+					t.Errorf("%s: a tag with a trailing %#02x verified, so the length is not part of the comparison", at, extra)
+				}
+			}
+			if pair.verifiedBy(schedule, data, nil) {
+				t.Errorf("%s: a nil tag verified", at)
+			}
+			if pair.verifiedBy(schedule, data, []byte{}) {
+				t.Errorf("%s: an empty tag verified", at)
+			}
+			if pair.verifiedBy(schedule, data, make([]byte, len(tag))) {
+				t.Errorf("%s: an all zero tag verified, which is what an unset tag field arrives as", at)
+			}
+
+			// the wrong key, from two directions
+			fromAnotherEpoch := pair.tagOf(otherEpoch, data)
+			if bytes.Equal(fromAnotherEpoch, tag) {
+				t.Fatalf("%s: another epoch's schedule produced the same tag over the same data, so the row below pins nothing about the key", at)
+			}
+			if pair.verifiedBy(schedule, data, fromAnotherEpoch) {
+				t.Errorf("%s: a tag another epoch's key produced verified in this one", at)
+			}
+			for _, other := range pairs {
+				if other.compute == pair.compute {
+					continue
+				}
+				sibling := other.tagOf(schedule, data)
+				if bytes.Equal(sibling, tag) {
+					t.Errorf("%s: %s and %s answer the same tag over the same data, so the two are keyed by one secret; confirmation_key and membership_key are adjacent DeriveSecret calls and collapsing them is a one line edit",
+						at, pair.compute, other.compute)
+					continue
+				}
+				if pair.verifiedBy(schedule, data, sibling) {
+					t.Errorf("%s: the tag %s produced over the same data verified as a %s, so the two are not keyed apart",
+						at, other.compute, pair.compute)
+				}
+			}
+		}
+	}
+}
+
+// TestTheTagsAreKeyedByTheSecretsTheyName pins WHICH of the nine each tag is taken under, at
+// every epoch of the corpus rather than at the two the published tags cover.
+//
+// The two known answer tests above hold the key identity against somebody else's numbers, and
+// they are the anchor. This is the same claim at every epoch and stated as the derivation: the
+// confirmation tag is the mac under EpochSecrets.Confirmation and the membership tag is the mac
+// under EpochSecrets.Membership, and each of those secrets is itself held to the published
+// corpus by TestKeyScheduleMatchesTheMlswgKeySchedule. A swap keeps both answers KDF.Nh bytes
+// and keeps both verifiers agreeing with their own computation.
+func TestTheTagsAreKeyedByTheSecretsTheyName(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		secrets := schedule.Secrets()
+		transcriptHash := tagSweepTranscriptHash(schedule)
+		if bytes.Equal(secrets.Confirmation, secrets.Membership) {
+			t.Fatalf("%s: confirmation_key and membership_key are the same bytes, so nothing below can tell the two apart", epoch.at)
+		}
+		if got, want := schedule.ConfirmationTag(transcriptHash),
+			epoch.crypto.Mac(secrets.Confirmation, transcriptHash); !bytes.Equal(got, want) {
+			t.Errorf("%s: ConfirmationTag = %x and MAC(confirmation_key, hash) = %x", epoch.at, got, want)
+		}
+		if got, want := schedule.MembershipTag(tagSweepTbm),
+			epoch.crypto.Mac(secrets.Membership, tagSweepTbm); !bytes.Equal(got, want) {
+			t.Errorf("%s: MembershipTag = %x and MAC(membership_key, tbm) = %x", epoch.at, got, want)
+		}
+	}
+}
+
+// TestTheTagsRefuseAnEpochWhoseSecretsHaveBeenErased states the refusal in its own terms, beside
+// the derived gate that also covers it.
+//
+// An epoch leaving PastEpochWindow is zeroized in place. A mac under KDF.Nh zero bytes is not a
+// weak tag, it is a PUBLIC one: every party can compute it with no knowledge of the group. So a
+// tag taken from an erased epoch authenticates nobody while looking exactly like a tag, and a
+// verifier that still compares accepts a forgery anybody could have produced — with err == nil,
+// because these signatures have no error to carry.
+//
+// TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch derives this class off the
+// package's own source and covers all four of these methods. This is the same property written
+// where a reader of the tag surface will find it, and it does not rest on that derivation still
+// including them.
+func TestTheTagsRefuseAnEpochWhoseSecretsHaveBeenErased(t *testing.T) {
+	pairs := tagVerifierPairs(t)
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		live := map[string][]byte{}
+		for _, pair := range pairs {
+			data := pair.dataFor(schedule)
+			live[pair.compute] = pair.tagOf(schedule, data)
+			if len(live[pair.compute]) == 0 {
+				t.Fatalf("%s: %s answered nothing over a LIVE epoch, so a refusal after the erase would say nothing",
+					epoch.at, pair.compute)
+			}
+		}
+		secrets := reflect.ValueOf(schedule.Secrets()).Elem()
+		for i := range secrets.NumField() {
+			zeroizeSecret(secrets.Field(i).Bytes())
+		}
+		for _, pair := range pairs {
+			data := pair.dataFor(schedule)
+			if answered := pair.tagOf(schedule, data); len(answered) != 0 {
+				t.Errorf("%s: %s answered %d bytes over an erased epoch; a mac under KDF.Nh zero bytes is a value every party can compute, so it is a tag that authenticates nobody",
+					epoch.at, pair.compute, len(answered))
+			}
+			if pair.verifiedBy(schedule, data, live[pair.compute]) {
+				t.Errorf("%s: %s accepted over an erased epoch", epoch.at, pair.verify)
+			}
+			if pair.verifiedBy(schedule, data, epoch.crypto.Mac(make([]byte, epoch.crypto.HashSize()), data)) {
+				t.Errorf("%s: %s accepted the tag anybody can compute under KDF.Nh zero bytes, which is what the erase leaves the key as",
+					epoch.at, pair.verify)
+			}
+		}
+	}
+}
+
+// boolAnsweringDerivations is the intersection of two classes this file already derives: an
+// exported declaration that reaches PAST the storage holding the nine and into one of them, and
+// one whose single result is a bool.
+//
+// That intersection is what "compares a tag" is, mechanically. A method cannot compare a tag
+// under an epoch key without reading one of the nine, and a method that answers anything but a
+// bool is not answering a comparison. Deriving it beats naming the two verifiers for the reason
+// standing rule 5 gives: a third one lands inside the class rather than beside it.
+func boolAnsweringDerivations(declared []sourceDeclaration, storage string) []string {
+	deriving := theMethodsDerivingFromOneOfTheNine(declared, storage)
+	names := []string{}
+	for _, one := range declared {
+		if !one.exported || one.body == nil {
+			continue
+		}
+		if len(one.results) != 1 || one.results[0] != "bool" {
+			continue
+		}
+		if !slices.Contains(deriving, one.name) {
+			continue
+		}
+		names = append(names, one.name)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// returnsNotRoutedThroughMacVerify reads one declaration for every value it can hand back, and
+// answers the ones that are neither the literal false nor a call to MacVerify on this receiver's
+// own provider, together with how many of the sanctioned calls it found.
+//
+// A return statement rather than a token search, because guardrail 8 is about what the answer IS
+// and not about which words appear. The three shapes a token list misses are all returns: `return
+// true` inserted at the top of the body carries no banned comparator at all; a byte loop that
+// leaks the position of the first differing byte carries none either and ends in `return true`;
+// and a comparison made by some helper of this package's own is a call the list was never written
+// for. All three are a returned value that is not the sanctioned call.
+//
+// The provider is required to be the RECEIVER's, spelled through its own field, because a
+// MacVerify reached on anything else is a mac under a key this epoch did not choose.
+func returnsNotRoutedThroughMacVerify(parsed parsedSource, function *ast.FuncDecl) ([]string, int) {
+	receiver := ""
+	if function.Recv != nil && len(function.Recv.List) == 1 && len(function.Recv.List[0].Names) == 1 {
+		receiver = function.Recv.List[0].Names[0].Name
+	}
+	sanctioned := receiver + ".crypto.MacVerify"
+	offending := []string{}
+	viaMacVerify := 0
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		returns, isReturn := node.(*ast.ReturnStmt)
+		if !isReturn {
+			return true
+		}
+		for _, result := range returns.Results {
+			if parsed.render(result) == "false" {
+				continue
+			}
+			if call, isCall := result.(*ast.CallExpr); isCall && parsed.render(call.Fun) == sanctioned {
+				viaMacVerify++
+				continue
+			}
+			offending = append(offending, parsed.render(result))
+		}
+		return true
+	})
+	return offending, viaMacVerify
+}
+
+// tagVerifierRoutingControl declares one of each shape the rule above has to tell apart: the
+// sanctioned body, the four comparators a ban list would have to have thought of, the byte loop
+// that carries no comparator at all, the verifier that decides nothing, the one that reaches a
+// provider it was not given, and an unexported one that is outside the class.
+//
+// hmac.Equal is in here deliberately. It is constant time and it is still wrong, because
+// guardrail 8 names crypto/subtle.ConstantTimeCompare reached through CryptoProvider.MacVerify
+// specifically: a second comparison site is a second place the length check can be dropped, and
+// this package has already shipped a comparator outside a ban list once.
+const tagVerifierRoutingControl = "package control\n" +
+	"\n" +
+	"type EpochSecrets struct {\n" +
+	"\tConfirmation []byte\n" +
+	"}\n" +
+	"\n" +
+	"type Holder struct {\n" +
+	"\tcrypto  CryptoProvider\n" +
+	"\tsecrets EpochSecrets\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesThroughTheProvider(data []byte, tag []byte) bool {\n" +
+	"\tif !self.live(self.secrets.Confirmation) {\n" +
+	"\t\treturn false\n" +
+	"\t}\n" +
+	"\treturn self.crypto.MacVerify(self.secrets.Confirmation, data, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesWithBytesEqual(data []byte, tag []byte) bool {\n" +
+	"\treturn bytes.Equal(self.crypto.Mac(self.secrets.Confirmation, data), tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesWithHmacEqual(data []byte, tag []byte) bool {\n" +
+	"\treturn hmac.Equal(self.crypto.Mac(self.secrets.Confirmation, data), tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesWithAPrefix(data []byte, tag []byte) bool {\n" +
+	"\treturn bytes.HasPrefix(self.crypto.Mac(self.secrets.Confirmation, data), tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesWithASubtleCallOfItsOwn(data []byte, tag []byte) bool {\n" +
+	"\treturn subtle.ConstantTimeCompare(self.crypto.Mac(self.secrets.Confirmation, data), tag) == 1\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesWithAByteLoop(data []byte, tag []byte) bool {\n" +
+	"\texpected := self.crypto.Mac(self.secrets.Confirmation, data)\n" +
+	"\tfor i := range expected {\n" +
+	"\t\tif expected[i] != tag[i] {\n" +
+	"\t\t\treturn false\n" +
+	"\t\t}\n" +
+	"\t}\n" +
+	"\treturn true\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) AcceptsEverything(data []byte, tag []byte) bool {\n" +
+	"\t_ = self.secrets.Confirmation\n" +
+	"\treturn true\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) VerifiesThroughAProviderItWasNotGiven(data []byte, tag []byte) bool {\n" +
+	"\treturn elsewhere.MacVerify(self.secrets.Confirmation, data, tag)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) verifiesBadlyAndIsUnexported(data []byte, tag []byte) bool {\n" +
+	"\treturn bytes.Equal(self.crypto.Mac(self.secrets.Confirmation, data), tag)\n" +
+	"}\n"
+
+// TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse is guardrail 8 over this task's two
+// bools, read as a shape rather than as a word list.
+//
+// The behavioural sweep next door catches a comparison that stops early, because a truncated
+// comparison ACCEPTS things. It cannot catch a comparison that answers correctly and leaks where
+// the first difference was: a byte loop written ahead of, or instead of, MacVerify refuses
+// exactly what MacVerify refuses and returns sooner on a tag that differs early. No behavioural
+// test in go can see that, and a timing measurement over a 32 byte comparison on this machine is
+// noise. So what is asserted is what was actually verified — by inspection, mechanically, so it
+// survives an edit nobody reruns this for.
+//
+// Both halves are derived rather than listed. The class is the intersection two other gates in
+// this file already produce, so a third verifier joins it by existing; and the rule is over
+// returned VALUES, so it holds against a comparison spelled as control flow, as a helper of this
+// package's own, or as a comparator nobody thought to ban. The control fixture commits every one
+// of those shapes and each must be reported, because a matcher that had stopped matching issues
+// the real source exactly the clean bill a correct one issues.
+func TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse(t *testing.T) {
+	// the control first, on both halves
+	control := mustParseText(t, "the tag verifier routing control", tagVerifierRoutingControl)
+	controlDeclared := declaredIn(control)
+	controlClass := boolAnsweringDerivations(controlDeclared, "secrets")
+	wantClass := []string{
+		"AcceptsEverything",
+		"VerifiesThroughAProviderItWasNotGiven",
+		"VerifiesThroughTheProvider",
+		"VerifiesWithAByteLoop",
+		"VerifiesWithAPrefix",
+		"VerifiesWithASubtleCallOfItsOwn",
+		"VerifiesWithBytesEqual",
+		"VerifiesWithHmacEqual",
+	}
+	if !slices.Equal(controlClass, wantClass) {
+		t.Fatalf("the class read %v out of the control, want %v; it is not intersecting a bool result with a read of one of the nine, or it is reading the unexported one",
+			controlClass, wantClass)
+	}
+	reported := []string{}
+	for _, name := range controlClass {
+		offending, viaMacVerify := returnsNotRoutedThroughMacVerify(control, control.declarationOf(t, "*Holder", name))
+		if len(offending) != 0 || viaMacVerify == 0 {
+			reported = append(reported, name)
+		}
+	}
+	wantReported := []string{
+		"AcceptsEverything",
+		"VerifiesThroughAProviderItWasNotGiven",
+		"VerifiesWithAByteLoop",
+		"VerifiesWithAPrefix",
+		"VerifiesWithASubtleCallOfItsOwn",
+		"VerifiesWithBytesEqual",
+		"VerifiesWithHmacEqual",
+	}
+	if !slices.Equal(reported, wantReported) {
+		t.Fatalf("the rule reported %v out of the control, want %v; a shape it lets through is a shape the real source can be written in",
+			reported, wantReported)
+	}
+
+	// then this package's own source
+	files := []parsedSource{}
+	structs := map[string]*ast.StructType{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		files = append(files, parsed)
+		structTypesIn(parsed, structs)
+	}
+	holders := theTypesHoldingTheEpochSecret(structs)
+	if len(holders) != 1 {
+		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
+	}
+	declared := declaredAcross(files)
+	class := boolAnsweringDerivations(declared, epochSecretsStorageFieldIn(t, structs, holders[0]))
+	if len(class) == 0 {
+		t.Fatalf("no exported declaration of this package answers a bool off one of the nine, and this task lands two, so this gate is demanding nothing")
+	}
+
+	// and the source reading covers exactly the verifiers the compiled type has, so a verifier
+	// declared somewhere this scan does not read is a failure rather than a silence
+	compiled := []string{}
+	for _, pair := range tagVerifierPairs(t) {
+		compiled = append(compiled, pair.verify)
+	}
+	slices.Sort(compiled)
+	if !slices.Equal(class, compiled) {
+		t.Errorf("this gate reads %v out of the source and *KeySchedule compiles the verifiers %v; the difference is a comparison this gate never looked at",
+			class, compiled)
+	}
+	t.Logf("%d exported declarations answer a bool off one of the nine: %v", len(class), class)
+
+	for _, name := range class {
+		function := (*ast.FuncDecl)(nil)
+		host := parsedSource{}
+		for _, parsed := range files {
+			for _, one := range parsed.file.Decls {
+				candidate, isFunction := one.(*ast.FuncDecl)
+				if isFunction && candidate.Name.Name == name && candidate.Body != nil {
+					function, host = candidate, parsed
+				}
+			}
+		}
+		if function == nil {
+			t.Fatalf("%s is in the class and no file of this package declares it, so this gate cannot read it", name)
+		}
+		offending, viaMacVerify := returnsNotRoutedThroughMacVerify(host, function)
+		if len(offending) != 0 {
+			t.Errorf("%s can answer %v, and guardrail 8 says a tag comparison answers CryptoProvider.MacVerify and nothing else: that is where crypto/subtle.ConstantTimeCompare and the length refusal ahead of it live",
+				name, offending)
+		}
+		if viaMacVerify == 0 {
+			t.Errorf("%s never answers a call to MacVerify on its own provider, so whatever it decides with is not the sanctioned comparison",
+				name)
 		}
 	}
 }
