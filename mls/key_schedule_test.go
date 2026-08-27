@@ -537,6 +537,7 @@ var keyScheduleOwnedErrors = map[string]error{
 	"ErrRatchetGenerationConsumed":             ErrRatchetGenerationConsumed,
 	"ErrRatchetGenerationTooFarAhead":          ErrRatchetGenerationTooFarAhead,
 	"ErrRatchetExhausted":                      ErrRatchetExhausted,
+	"errRatchetTypeHasNoRoot":                  errRatchetTypeHasNoRoot,
 }
 
 // TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile derives the class the two sweeps
@@ -598,14 +599,16 @@ func TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile(t *testing.T) {
 // reason: a second declaration site is how two sentinels for one condition happen.
 // ErrNilGroupContext and ErrNilCryptoProvider name an argument that was missing rather than a
 // protocol condition. ErrEpochErased names a state of the epoch itself.
-// errSecretTreeDescentDidNotStoreTheTarget is the one unexported name of the file, and it is
-// unexported on purpose: it is wrapped alongside ErrSecretTreeConsumed so no caller has to
-// know it exists, and it exists so a test can tell takeLeafSecret's two consumed returns
-// apart. Unexported or not, it is judged by the sweeps below like every other declaration of
-// that file, which is what the derivation above is for.
+// errSecretTreeDescentDidNotStoreTheTarget and errRatchetTypeHasNoRoot are the file's two
+// unexported names, and both are unexported on purpose: each is wrapped alongside an exported
+// sentinel so no caller has to know it exists, and each exists so a test can tell one
+// function's two same-sentinel returns apart -- takeLeafSecret's two consumed returns, and
+// ratchetFor's two refusals of a ratchet type. Unexported or not, both are judged by the
+// sweeps below like every other declaration of that file, which is what the derivation above
+// is for.
 func TestKeyScheduleErrorsAreDistinct(t *testing.T) {
-	if len(keyScheduleOwnedErrors) != 14 {
-		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext, ErrEpochErased, ErrNilCryptoProvider and errSecretTreeDescentDidNotStoreTheTarget", len(keyScheduleOwnedErrors))
+	if len(keyScheduleOwnedErrors) != 15 {
+		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext, ErrEpochErased, ErrNilCryptoProvider and the two unexported invariant names errSecretTreeDescentDidNotStoreTheTarget and errRatchetTypeHasNoRoot", len(keyScheduleOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(keyScheduleOwnedErrors))
 	for i, name := range names {

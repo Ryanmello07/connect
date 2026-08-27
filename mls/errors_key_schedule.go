@@ -93,6 +93,19 @@ var (
 	errSecretTreeDescentDidNotStoreTheTarget = errors.New(
 		"mls: the secret tree descent did not store the leaf it descended to")
 
+	// errRatchetTypeHasNoRoot names the secret tree invariant that ratchetFor stores a root
+	// for every ratchet type it admits, and is what the one refusal reachable only by
+	// breaking that invariant wraps.
+	//
+	// Unexported for the reason errSecretTreeDescentDidNotStoreTheTarget is: no caller
+	// should branch on it, because it is wrapped alongside ErrSecretTreeLeafOutOfRange and
+	// a caller asking "was this ratchet type refused" still gets yes. It exists so a TEST
+	// can tell ratchetFor's two refusals of an unknown ratchet type apart. Without it they
+	// are indistinguishable, and the type check at the top of ratchetFor can be replaced
+	// by a constant false with every test in this package still passing -- measured, on
+	// the commit that added the second one.
+	errRatchetTypeHasNoRoot = errors.New("mls: the secret tree stored no root for this ratchet type")
+
 	// ErrRatchetGenerationConsumed is returned for a generation already used and erased.
 	ErrRatchetGenerationConsumed = errors.New("mls: ratchet generation already consumed")
 

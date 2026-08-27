@@ -2841,7 +2841,28 @@ func TestZeroizeIsIdempotentAndRefusesEveryLaterDerivation(t *testing.T) {
 // A default would be the worst kind of correct: a ContentType decoded one layer up that fell
 // through to "handshake" would put an application message on the handshake ratchet, and both
 // streams would then draw from one keystream while every individual derivation stayed right.
+//
+// It holds every refusal to the FIRST of ratchetFor's two, the way
+// TestSecretTreeASecondTakeIsAlwaysTheConsumedRefusalAndNeverTheInvariantOne does next door.
+// The second -- reached when the type check admitted a kind the stores below do not write --
+// is unreachable, and it exists because the bare map read that stood in its place answered a
+// nil ratchet and a NIL ERROR, which the caller then steps. Measured, on the commit that
+// added it: with the type check replaced by a constant false and the two refusals
+// indistinguishable, this test passed, because the invariant refusal caught what the type
+// check no longer did and answered the same sentinel. Two guards over one property with no
+// way to tell which fired is one guard that can be deleted silently.
 func TestRatchetForRefusesAnUnknownRatchetType(t *testing.T) {
+	// the control on the matcher: the two refusals differ only in the sentinel the second
+	// wraps, so an errors.Is that could not see it through the wrapping would report every
+	// refusal as the ordinary one no matter which return produced it.
+	both := fmt.Errorf("%w: ratchet type 9: %w", ErrSecretTreeLeafOutOfRange, errRatchetTypeHasNoRoot)
+	if !errors.Is(both, ErrSecretTreeLeafOutOfRange) || !errors.Is(both, errRatchetTypeHasNoRoot) {
+		t.Fatalf("the two sentinels are not both visible through %v, so this test cannot tell the two refusals apart", both)
+	}
+	if errors.Is(fmt.Errorf("%w: ratchet type 9", ErrSecretTreeLeafOutOfRange), errRatchetTypeHasNoRoot) {
+		t.Fatal("the ordinary refusal answers to the invariant sentinel, so every refusal below would read as the invariant one")
+	}
+
 	known := stRatchetKinds()
 	refused := 0
 	for probe := 0; probe < 256; probe++ {
@@ -2856,6 +2877,12 @@ func TestRatchetForRefusesAnUnknownRatchetType(t *testing.T) {
 		}
 		if err == nil {
 			t.Fatalf("ratchet type %d was accepted, so a decoded content type that fell through has a keystream to share", kind)
+		}
+		if !errors.Is(err, ErrSecretTreeLeafOutOfRange) {
+			t.Fatalf("ratchet type %d was refused with %v, want ErrSecretTreeLeafOutOfRange", kind, err)
+		}
+		if errors.Is(err, errRatchetTypeHasNoRoot) {
+			t.Fatalf("ratchet type %d was refused by the post store return, which is reachable only if the type check above it stopped admitting exactly the kinds the stores write: %v", kind, err)
 		}
 		refused++
 	}

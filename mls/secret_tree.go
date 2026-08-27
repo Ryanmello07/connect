@@ -550,7 +550,21 @@ func (self *SecretTree) ratchetFor(leaf LeafIndex, kind RatchetType) (*ratchet, 
 	// the leaf secret has produced both roots and is now the one value that could regenerate
 	// either of them, so it stops existing here.
 	zeroizeSecret(leafSecret)
-	return self.ratchets[key], nil
+	created, ok := self.ratchets[key]
+	if !ok {
+		// measured redundant behind the type check at the top, which admits only the two
+		// kinds the two stores above write. It is a REFUSAL rather than the bare map read
+		// that stood here, because a bare read answers a NIL RATCHET AND A NIL ERROR for any
+		// kind that check ever stopped catching, and the caller then steps a nil ratchet.
+		// Measured: with the type check replaced by a constant false, the bare read makes
+		// the whole test binary panic on a nil dereference, so the run reports one aborted
+		// test instead of the test written for exactly that mutation --
+		// TestRatchetForRefusesAnUnknownRatchetType never gets to run. A refusal here is what
+		// makes that mutation observable rather than fatal.
+		return nil, fmt.Errorf("%w: ratchet type %d has no root for leaf %d: %w",
+			ErrSecretTreeLeafOutOfRange, kind, leaf, errRatchetTypeHasNoRoot)
+	}
+	return created, nil
 }
 
 const (
