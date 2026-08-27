@@ -523,18 +523,20 @@ const keyScheduleErrorsFile = "errors_key_schedule.go"
 // Nothing here is trusted: TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile holds
 // this map to what errors_key_schedule.go actually declares, in both directions.
 var keyScheduleOwnedErrors = map[string]error{
-	"ErrSecretLength":                 ErrSecretLength,
-	"ErrExportLength":                 ErrExportLength,
-	"ErrEpochErased":                  ErrEpochErased,
-	"ErrGroupContextTrailingBytes":    ErrGroupContextTrailingBytes,
-	"ErrNilGroupContext":              ErrNilGroupContext,
-	"ErrTranscriptHashLength":         ErrTranscriptHashLength,
-	"ErrPskCount":                     ErrPskCount,
-	"ErrSecretTreeLeafOutOfRange":     ErrSecretTreeLeafOutOfRange,
-	"ErrSecretTreeConsumed":           ErrSecretTreeConsumed,
-	"ErrRatchetGenerationConsumed":    ErrRatchetGenerationConsumed,
-	"ErrRatchetGenerationTooFarAhead": ErrRatchetGenerationTooFarAhead,
-	"ErrRatchetExhausted":             ErrRatchetExhausted,
+	"ErrSecretLength":                          ErrSecretLength,
+	"ErrExportLength":                          ErrExportLength,
+	"ErrEpochErased":                           ErrEpochErased,
+	"ErrGroupContextTrailingBytes":             ErrGroupContextTrailingBytes,
+	"ErrNilGroupContext":                       ErrNilGroupContext,
+	"ErrNilCryptoProvider":                     ErrNilCryptoProvider,
+	"ErrTranscriptHashLength":                  ErrTranscriptHashLength,
+	"ErrPskCount":                              ErrPskCount,
+	"ErrSecretTreeLeafOutOfRange":              ErrSecretTreeLeafOutOfRange,
+	"ErrSecretTreeConsumed":                    ErrSecretTreeConsumed,
+	"errSecretTreeDescentDidNotStoreTheTarget": errSecretTreeDescentDidNotStoreTheTarget,
+	"ErrRatchetGenerationConsumed":             ErrRatchetGenerationConsumed,
+	"ErrRatchetGenerationTooFarAhead":          ErrRatchetGenerationTooFarAhead,
+	"ErrRatchetExhausted":                      ErrRatchetExhausted,
 }
 
 // TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile derives the class the two sweeps
@@ -592,14 +594,18 @@ func TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile(t *testing.T) {
 // deliberately, in the same commit, with a reason. What stops the list shrinking, and what
 // stops it lagging behind the file, is the derivation above rather than this number.
 //
-// Twelve rather than the ten of registry section 5.6. ErrNilGroupContext names an argument
-// that was missing rather than a protocol condition, and ErrEpochErased names a state of the
-// epoch itself: both are refusals this package makes for reasons the registry never had to
-// write down, and both are declared beside the ten because a second declaration site is how
-// two sentinels for one condition happen.
+// Fourteen rather than the ten of registry section 5.6, and all four extras are here for one
+// reason: a second declaration site is how two sentinels for one condition happen.
+// ErrNilGroupContext and ErrNilCryptoProvider name an argument that was missing rather than a
+// protocol condition. ErrEpochErased names a state of the epoch itself.
+// errSecretTreeDescentDidNotStoreTheTarget is the one unexported name of the file, and it is
+// unexported on purpose: it is wrapped alongside ErrSecretTreeConsumed so no caller has to
+// know it exists, and it exists so a test can tell takeLeafSecret's two consumed returns
+// apart. Unexported or not, it is judged by the sweeps below like every other declaration of
+// that file, which is what the derivation above is for.
 func TestKeyScheduleErrorsAreDistinct(t *testing.T) {
-	if len(keyScheduleOwnedErrors) != 12 {
-		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext and ErrEpochErased", len(keyScheduleOwnedErrors))
+	if len(keyScheduleOwnedErrors) != 14 {
+		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext, ErrEpochErased, ErrNilCryptoProvider and errSecretTreeDescentDidNotStoreTheTarget", len(keyScheduleOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(keyScheduleOwnedErrors))
 	for i, name := range names {

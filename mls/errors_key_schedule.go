@@ -57,6 +57,14 @@ var (
 	// way this arrives.
 	ErrNilGroupContext = errors.New("mls: no group context was supplied")
 
+	// ErrNilCryptoProvider is returned when a construction that derives every one of its
+	// secrets from a CryptoProvider is handed none. It is deliberately not ErrSecretLength,
+	// which is what the secret tree's constructor used to answer here: a caller branching on
+	// a length failure re-derives and re-passes the secret it supplied, which is the wrong
+	// repair for an argument that was never supplied at all, and every other refusal these
+	// constructors make names its own condition rather than borrowing one.
+	ErrNilCryptoProvider = errors.New("mls: no crypto provider was supplied")
+
 	// ErrTranscriptHashLength is returned when a transcript hash is not KDF.Nh bytes.
 	ErrTranscriptHashLength = errors.New("mls: transcript hash has the wrong length")
 
@@ -71,6 +79,19 @@ var (
 	// ErrSecretTreeConsumed is returned when the node secrets covering a leaf have
 	// already been deleted. It is the forward secrecy property working, not a fault.
 	ErrSecretTreeConsumed = errors.New("mls: secret tree node already consumed")
+
+	// errSecretTreeDescentDidNotStoreTheTarget names the secret tree invariant that a
+	// descent stores the leaf it descended to, and is what the one refusal reachable only
+	// by breaking that invariant wraps.
+	//
+	// Unexported, because no caller should branch on it: it is wrapped alongside
+	// ErrSecretTreeConsumed, so a caller asking "was this leaf already taken" still gets
+	// yes. It exists so a TEST can tell takeLeafSecret's two ErrSecretTreeConsumed returns
+	// apart -- they were otherwise indistinguishable, which is how the second one came to
+	// be reclassified to an unrelated sentinel with every test in this package still
+	// passing.
+	errSecretTreeDescentDidNotStoreTheTarget = errors.New(
+		"mls: the secret tree descent did not store the leaf it descended to")
 
 	// ErrRatchetGenerationConsumed is returned for a generation already used and erased.
 	ErrRatchetGenerationConsumed = errors.New("mls: ratchet generation already consumed")

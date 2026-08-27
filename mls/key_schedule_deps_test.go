@@ -173,11 +173,25 @@ var (
 	_ func(NodeIndex) (NodeIndex, error) = Left
 	_ func(NodeIndex) (NodeIndex, error) = Right
 	_ func(LeafCount) uint32             = NodeWidth
+	_ func(LeafCount) uint32             = TreeDepth
+	_ func(LeafCount) bool               = IsFullLeafCount
+
+	// the four p3 entry points the secret tree's own tests descend and account by. They are
+	// pinned for the same reason the descent's four are: a test that re-implements one of
+	// them locally is a second definition of the tree's shape, and this file has watched
+	// exactly that happen -- a node to leaf step written as node/2 agrees with p3 on every
+	// even index and disagrees on every odd one, where p3 REFUSES a parent index and a local
+	// division silently truncates it. DirectPath supplies the independent ancestry every
+	// expected node secret is replayed from, and SubtreeSpan supplies the size of the subtree
+	// a retained node roots, which the forward secrecy closure counts itself against.
+	_ func(NodeIndex, LeafCount) ([]NodeIndex, error) = DirectPath
+	_ func(NodeIndex) (NodeIndex, NodeIndex)          = SubtreeSpan
 
 	// method expressions, so the receiver is pinned with the signature. A NodeIndex.Level
 	// respelled as a free function Level(NodeIndex) would satisfy neither line.
-	_ func(LeafIndex) NodeIndex = LeafIndex.NodeIndex
-	_ func(NodeIndex) uint32    = NodeIndex.Level
+	_ func(LeafIndex) NodeIndex          = LeafIndex.NodeIndex
+	_ func(NodeIndex) uint32             = NodeIndex.Level
+	_ func(NodeIndex) (LeafIndex, error) = NodeIndex.LeafIndex
 
 	// the three index types are uint32 underneath and nothing narrower. The 0xffffffff
 	// conversion is the pin: it is a compile error the moment one is retyped to a uint16,
@@ -187,6 +201,14 @@ var (
 	_ LeafIndex = LeafIndex(0xffffffff)
 	_ NodeIndex = NodeIndex(0xffffffff)
 	_ LeafCount = LeafCount(0xffffffff)
+
+	// the two p3 sentinels the secret tree's constructor wraps and its tests match on. A
+	// sentinel replaced by a value of another type still compiles at the call site and
+	// changes what errors.Is answers, which is the whole of what the constructor promises
+	// here: a caller can ask either "is this a secret tree range failure" or "was the leaf
+	// count not a power of two" and get the true answer.
+	_ error = ErrLeafCountRange
+	_ error = ErrLeafCountNotFull
 )
 
 // pinnedCodec exists only to carry the C1 method set. Declaring the two methods and then
@@ -651,7 +673,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 62,
+	"key_schedule_deps_test.go": 69,
 	"pins_test.go":              8,
 }
 

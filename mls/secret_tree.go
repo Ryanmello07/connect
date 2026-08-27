@@ -58,7 +58,7 @@ type SecretTree struct {
 // range failure" or "was the leaf count not a power of two" and get the true answer.
 func NewSecretTree(crypto CryptoProvider, leafCount LeafCount, encryptionSecret []byte) (*SecretTree, error) {
 	if crypto == nil {
-		return nil, fmt.Errorf("%w: no crypto provider", ErrSecretLength)
+		return nil, fmt.Errorf("%w: the secret tree derives every node secret through it", ErrNilCryptoProvider)
 	}
 	// measured redundant, and kept anyway: Root refuses zero with ErrLeafCountRange and this
 	// constructor wraps that in the same ErrSecretTreeLeafOutOfRange, so deleting these three
@@ -157,6 +157,15 @@ func (self *SecretTree) pathToLeaf(leaf LeafIndex) ([]NodeIndex, error) {
 		current = next
 		path = append(path, current)
 	}
+	// measured redundant, and labelled here rather than defended silently: the loop leaves
+	// current at a level 0 node, and for a full tree the comparison rule reaches the leaf it
+	// was aimed at, so replacing this condition with a constant false leaves every test in
+	// this package passing. What makes it redundant is asserted rather than argued --
+	// TestSecretTreePathToLeafLandsOnTheTargetOfEveryLeafOfEveryWidth walks every leaf of
+	// every swept width and holds the last node of the path to leaf.NodeIndex(). The check
+	// stays because a descent that went wrong and a missing landing check are two separate
+	// edits, and this is the one that turns the first into a refusal rather than into
+	// another leaf's secret handed to the wrong sender.
 	if current != target {
 		return nil, fmt.Errorf("%w: descent reached node %d, want %d",
 			ErrSecretTreeLeafOutOfRange, current, target)
@@ -193,9 +202,21 @@ func (self *SecretTree) takeLeafSecret(leaf LeafIndex) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// the deepest node still held, not the first: the ancestors above it have already been
-	// expanded and erased on behalf of an earlier leaf, and starting from the root would
-	// need a secret that no longer exists.
+	// the deepest node still held, not the first.
+	//
+	// Held nodes form an antichain: expanding a node deletes it and stores both of its
+	// children, so no two nodes still held ever sit on one root-leaf path. That means the
+	// two rules name the same node and no sequence of calls on this type can tell them
+	// apart, which is why the invariant is asserted rather than left as an argument here --
+	// TestSecretTreeHeldNodesNeverShareARootLeafPath walks every take order of every swept
+	// width and holds it.
+	//
+	// The rule is the deepest one anyway, because that is the safe answer if the invariant
+	// ever broke. Starting from a shallower ancestor would re-derive and OVERWRITE a subtree
+	// from a secret this tree has already promised to destroy, replacing live node secrets
+	// with ones an attacker holding the erased ancestor can compute;
+	// TestSecretTreeTakesTheDeepestHeldAncestorAndNotTheShallowest plants exactly that state
+	// and holds the answer to the deeper node.
 	deepest := -1
 	for i, node := range path {
 		if _, ok := self.nodes[node]; ok {
@@ -217,21 +238,43 @@ func (self *SecretTree) takeLeafSecret(leaf LeafIndex) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: right child of node %d: %w", ErrSecretTreeLeafOutOfRange, parent, err)
 		}
+		// measured redundant for a full tree, and labelled: section 7.7 makes a valid leaf
+		// count a power of two, Root refuses every other, and
+		// TestSecretTreeEveryParentOnEveryPathHasBothChildrenInsideTheNodeArray holds that
+		// for every swept width, so this cannot fire.
+		//
+		// It is a REFUSAL and not the two ifs that stood here, because the two ifs failed
+		// SILENTLY in the direction that matters: a child store skipped leaves every leaf
+		// under that child answering ErrSecretTreeConsumed, which tells the caller forward
+		// secrecy did its job when what actually happened is that the tree dropped a
+		// subtree. A width that OVERSTATES the node array -- the direction no guard of this
+		// shape can see at all -- is caught before any leaf is taken, by
+		// TestSecretTreeCachedGeometryIsDerivedFromTheLeafCount.
+		if uint32(left) >= self.width || uint32(right) >= self.width {
+			return nil, fmt.Errorf("%w: children %d and %d of node %d lie outside a node array of width %d",
+				ErrSecretTreeLeafOutOfRange, left, right, parent, self.width)
+		}
 		// ExpandWithLabel returns a fresh slice, so the parent can be zeroized after both
 		// stores without touching either child.
-		if uint32(left) < self.width {
-			self.nodes[left] = self.crypto.ExpandWithLabel(parentSecret, "tree", []byte("left"), nh)
-		}
-		if uint32(right) < self.width {
-			self.nodes[right] = self.crypto.ExpandWithLabel(parentSecret, "tree", []byte("right"), nh)
-		}
+		self.nodes[left] = self.crypto.ExpandWithLabel(parentSecret, "tree", []byte("left"), nh)
+		self.nodes[right] = self.crypto.ExpandWithLabel(parentSecret, "tree", []byte("right"), nh)
 		zeroizeSecret(parentSecret)
 		delete(self.nodes, parent)
 	}
 	target := path[len(path)-1]
 	secret, ok := self.nodes[target]
 	if !ok {
-		return nil, fmt.Errorf("%w: leaf %d", ErrSecretTreeConsumed, leaf)
+		// measured redundant, and reachable only by breaking an invariant: the loop above
+		// stores both children of every node it expands and its last iteration expands
+		// path[len(path)-2], so the target is held whenever the loop ran -- and when it did
+		// not run, deepest already named the target. Reclassifying this return to an
+		// unrelated sentinel left every test in this package passing, which is why it now
+		// wraps one of its own: errSecretTreeDescentDidNotStoreTheTarget says an invariant
+		// broke rather than "this leaf was already taken", and
+		// TestSecretTreeASecondTakeIsAlwaysTheConsumedRefusalAndNeverTheInvariantOne holds
+		// every legitimate second take to the OTHER return.
+		return nil, fmt.Errorf("%w: leaf %d: %w", ErrSecretTreeConsumed, leaf,
+			errSecretTreeDescentDidNotStoreTheTarget)
 	}
 	delete(self.nodes, target)
 	return secret, nil
