@@ -36,6 +36,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"maps"
 	"os"
 	"path/filepath"
@@ -192,6 +193,8 @@ func rootIdentifierOf(expr ast.Expr) string {
 	case *ast.SliceExpr:
 		return rootIdentifierOf(typed.X)
 	case *ast.SelectorExpr:
+		return rootIdentifierOf(typed.X)
+	case *ast.StarExpr:
 		return rootIdentifierOf(typed.X)
 	}
 	return ""
@@ -1781,10 +1784,18 @@ func TestEpochSecretsDoNotAliasEachOther(t *testing.T) {
 	for _, epoch := range ksVectorEpochs(t) {
 		fields := epochSecretsByField(t, epoch.schedule(t).Secrets())
 		names := slices.Sorted(maps.Keys(fields))
-		for i, first := range names {
-			if len(fields[first]) == 0 {
-				t.Fatalf("%s: EpochSecrets.%s is empty, so it has no storage to compare", epoch.at, first)
+		// every field is checked for storage BEFORE any pair is compared, because the
+		// comparison reads the address of a first element and an empty field has none.
+		// Written as a guard on the outer name alone it fired too late: a field left empty
+		// by a later task was reached as the INNER name first and indexing it took the whole
+		// test binary down, which is every other gate of this package reporting nothing
+		// instead of one gate reporting the empty field.
+		for _, name := range names {
+			if len(fields[name]) == 0 {
+				t.Fatalf("%s: EpochSecrets.%s is empty, so it has no storage to compare", epoch.at, name)
 			}
+		}
+		for i, first := range names {
 			for _, second := range names[i+1:] {
 				if &fields[first][0] == &fields[second][0] {
 					t.Errorf("%s: EpochSecrets.%s and EpochSecrets.%s start in the same array, so erasing one erases the other",
@@ -2059,6 +2070,12 @@ type exposedSlice struct {
 	result int
 	path   string
 	bytes  []byte
+	// taken is what bytes held at the moment it was read, and bytes is a VIEW into the
+	// schedule's own array rather than a copy of it. The pair is how the sweep says whether
+	// a later call rewrote a reading an earlier one had already taken -- one witness per
+	// reading, because a sweep collects eleven of them and any one of the eleven can be the
+	// one that gets rewritten.
+	taken []byte
 }
 
 // at is the address the excuse tables below are keyed by.
@@ -2209,10 +2226,6 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 		}
 	}
 
-	// what the readings below are views INTO, kept so this sweep can say whether one of the
-	// calls it made rewrote a reading another of them had already taken
-	live := bytes.Clone(schedule.Secrets().InitSecret)
-
 	exposed := []exposedSlice{}
 	swept := []string{}
 	notCalled := []string{}
@@ -2279,6 +2292,7 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 				for _, one := range exposedByteSlices(t, "(*KeySchedule)."+method.Name, result) {
 					one.method = method.Name
 					one.result = index
+					one.taken = bytes.Clone(one.bytes)
 					exposed = append(exposed, one)
 				}
 			}
@@ -2301,9 +2315,41 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 	// and no call this sweep made rewrote a reading another of them had already taken. The
 	// skip above is what keeps that true today; this is what says so if it stops being, and
 	// it is the difference between a sweep that read nothing and a sweep that read zeros.
-	if !bytes.Equal(schedule.Secrets().InitSecret, live) {
-		t.Fatalf("%s: init_secret changed while this sweep ran, so what it collected is not what those methods answered and every comparison over it runs against the rewrite",
-			at)
+	//
+	// Two witnesses, because a rewrite lands on one side or the other of the reading it
+	// spoils and neither witness sees both. A call made AFTER a reading was taken leaves the
+	// reading disagreeing with the clone taken with it, since every reading is a view into
+	// the schedule's own array rather than a copy of it. A call made BEFORE it leaves nothing
+	// to disagree with -- the reading was zeros when it was read -- so what says so is the
+	// reading itself: every secret this type hands out is KDF output over inputs no party can
+	// steer to a fixed point, and a run of zeros where one belongs is an erase rather than a
+	// secret.
+	//
+	// A clone taken before the loop and compared after it is what this replaced, and it was
+	// neither of the two. It watched init_secret alone out of eleven readings, so a call that
+	// rewrote any of the other ten said nothing; and reading the accessors up front to widen
+	// it does not work, because an accessor with the side effect is called by that pass too
+	// and erases what a later accessor of the same pass then reads as its baseline.
+	//
+	// One limit, measured rather than supposed. An erase landing before an accessor that
+	// REFUSES rather than answering zeros is invisible to both: JoinerSecret and
+	// WelcomeSecret ask secretIsLive and answer nil, and an empty reading is legitimate here
+	// -- the group creation path has neither secret. Closing that would need a witness over
+	// the STORAGE rather than over the readings, and the storage is unexported, which is
+	// exactly what puts it outside reflection.
+	for _, one := range exposed {
+		if !bytes.Equal(one.bytes, one.taken) {
+			t.Fatalf("%s: %s changed after this sweep read it, so what it collected is not what those methods answered and every comparison over it runs against the rewrite",
+				at, one.path)
+		}
+		// bytes.Clone(nil) is nil and bytes.Equal(nil, nil) is true, so the comparison above
+		// says nothing at all about an empty reading. An empty one is legitimate -- the
+		// group creation path has no joiner_secret and no welcome_secret -- and it is a
+		// RUN of zeros that cannot be a secret.
+		if len(one.taken) != 0 && !slices.ContainsFunc(one.taken, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("%s: %s answered %d zero bytes; every secret this type hands out is KDF output, so a run of zeros is an erase that happened before this sweep read it and every comparison over these readings runs against that erase",
+				at, one.path, len(one.taken))
+		}
 	}
 	if len(notCalled) != 0 {
 		t.Logf("%s: %v are handed nothing and answer nothing, so this sweep recorded them rather than calling them", at, notCalled)
@@ -2388,11 +2434,11 @@ const epochSecretStorageField = "epochSecret"
 // structTypesIn adds the named struct types one parsed file declares.
 func structTypesIn(parsed parsedSource, into map[string]*ast.StructType) {
 	for _, declaration := range parsed.file.Decls {
-		types, isTypeDeclaration := declaration.(*ast.GenDecl)
-		if !isTypeDeclaration || types.Tok != token.TYPE {
+		typeDeclaration, isTypeDeclaration := declaration.(*ast.GenDecl)
+		if !isTypeDeclaration || typeDeclaration.Tok != token.TYPE {
 			continue
 		}
-		for _, specification := range types.Specs {
+		for _, specification := range typeDeclaration.Specs {
 			named, isNamed := specification.(*ast.TypeSpec)
 			if !isNamed {
 				continue
@@ -7979,21 +8025,36 @@ func TestAnErasedScheduleRefusesRatherThanAnsweringFromZeros(t *testing.T) {
 	}
 }
 
-// epochSecretEscapeControl declares one of each shape the escape scan has to tell apart: the
-// secret written into an exported package level variable, into an unexported one, sent down a
-// channel, handed to a callback the caller supplied -- and the three legitimate shapes, which
-// are handing it to a function of this package, cutting a local from it, and writing it back
-// into the receiver's own storage.
+// epochSecretEscapeControl declares one of each shape the escape scan has to tell apart.
 //
-// The three legitimate rows are what stop this from being a scan that objects to Zeroize. An
-// eraser hands the storage to zeroizeSecret and every constructor here cuts locals from it, so
-// a matcher that read any of those as an escape would fail on the real source at once and be
-// weakened until it read nothing.
+// Eight ways out, and every one of them is the SAME leak written differently: the secret put
+// into an exported package level variable and into an unexported one, sent down a channel,
+// copied into package level storage by the copy builtin rather than by an assignment, handed
+// to a callback the caller supplied, to one held in a package level variable, to one held in a
+// field of the holder itself, and handed to a goroutine that outlives the call that started
+// it. The first version of this scan matched three of the eight by shape and the other five
+// walked past it.
+//
+// And four legitimate shapes, which are what stop this from being a scan that objects to
+// Zeroize: handing the storage to a function this package declares, cutting a local from it,
+// writing it back into the receiver's own storage, and refusing with a sentinel error. The
+// last of those is the nearest legitimate shape to the copy row -- it mentions a package level
+// value and hands it to an imported function -- and it is here because a scan that read it as
+// an escape would fail on this package's own constructors on the first run and be weakened
+// until it read nothing.
 const epochSecretEscapeControl = "package control\n" +
+	"\n" +
+	"import (\n" +
+	"\t\"errors\"\n" +
+	"\t\"fmt\"\n" +
+	")\n" +
+	"\n" +
+	"var ErrControl = errors.New(\"control\")\n" +
 	"\n" +
 	"type Holder struct {\n" +
 	"\tepochSecret []byte\n" +
 	"\tkept        []byte\n" +
+	"\tobserver    func([]byte)\n" +
 	"}\n" +
 	"\n" +
 	"var Escaped []byte\n" +
@@ -8001,6 +8062,10 @@ const epochSecretEscapeControl = "package control\n" +
 	"var escapedUnexported []byte\n" +
 	"\n" +
 	"var escapeChannel = make(chan []byte, 1)\n" +
+	"\n" +
+	"var stashed = make([]byte, 32)\n" +
+	"\n" +
+	"var packageObserver func([]byte)\n" +
 	"\n" +
 	"func (self *Holder) LeaksIntoAnExportedVariable() {\n" +
 	"\tEscaped = self.epochSecret\n" +
@@ -8014,8 +8079,24 @@ const epochSecretEscapeControl = "package control\n" +
 	"\tescapeChannel <- self.epochSecret\n" +
 	"}\n" +
 	"\n" +
-	"func (self *Holder) LeaksThroughACallback(hand func([]byte)) {\n" +
+	"func (self *Holder) LeaksByCopyingIntoPackageStorage() {\n" +
+	"\tcopy(stashed, self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksThroughACallerCallback(hand func([]byte)) {\n" +
 	"\thand(self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksThroughAPackageCallback() {\n" +
+	"\tpackageObserver(self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksThroughAFieldCallback() {\n" +
+	"\tself.observer(self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LeaksIntoAGoroutine() {\n" +
+	"\tgo wipeControl(self.epochSecret)\n" +
 	"}\n" +
 	"\n" +
 	"func (self *Holder) Zeroize() {\n" +
@@ -8031,57 +8112,348 @@ const epochSecretEscapeControl = "package control\n" +
 	"\tself.kept = self.epochSecret\n" +
 	"}\n" +
 	"\n" +
+	"func (self *Holder) RefusesWithASentinel() error {\n" +
+	"\treturn fmt.Errorf(\"%w: %d bytes\", ErrControl, len(self.epochSecret))\n" +
+	"}\n" +
+	"\n" +
 	"func wipeControl(secret []byte) {\n" +
 	"\tfor i := range secret {\n" +
 	"\t\tsecret[i] = 0\n" +
 	"\t}\n" +
 	"}\n"
 
-// packageLevelValueNames is every var and const one set of parsed files declares at file scope.
+// declaredNames is what the escape scan needs in order to tell code this package wrote from
+// code it did not.
 //
-// Names alone, because what matters is whether a write inside a declaration lands in storage
-// that is still there when the call returns, and a package level variable is exactly that
-// whether or not it is exported: an unexported one is readable by every exported symbol of this
-// package, none of which would then mention epochSecret at all and so none of which any gate
-// here would look at.
-func packageLevelValueNames(files []parsedSource) []string {
-	names := []string{}
+// Four sets, each read off the source rather than written down. functions is every func and
+// method declaration plus every method an interface of this package names, because a call
+// landing in one of those lands in a body this same scan can be run over. types is every named
+// type, because Foo(x) with Foo a type is a conversion and not a call at all. imports is every
+// package the files import, under the name they refer to it by, because subtle.ConstantTimeCompare
+// is not a function value somebody handed in. funcFields is every struct field of func type,
+// because self.observer(x) is a call into code this package never declared however much it
+// reads like a method.
+type declaredNames struct {
+	functions  map[string]bool
+	types      map[string]bool
+	imports    map[string]bool
+	funcFields map[string]bool
+}
+
+// fieldsOf is a nil safe read of a field list, since a struct with no fields and an interface
+// with no methods both carry a nil one.
+func fieldsOf(list *ast.FieldList) []*ast.Field {
+	if list == nil {
+		return nil
+	}
+	return list.List
+}
+
+func namesTheseFilesDeclare(files []parsedSource) declaredNames {
+	names := declaredNames{
+		functions:  map[string]bool{},
+		types:      map[string]bool{},
+		imports:    map[string]bool{},
+		funcFields: map[string]bool{},
+	}
 	for _, parsed := range files {
-		for _, declaration := range parsed.file.Decls {
-			values, isValueDeclaration := declaration.(*ast.GenDecl)
-			if !isValueDeclaration || (values.Tok != token.VAR && values.Tok != token.CONST) {
+		for _, imported := range parsed.file.Imports {
+			if imported.Name != nil {
+				names.imports[imported.Name.Name] = true
 				continue
 			}
-			for _, specification := range values.Specs {
-				value, isValue := specification.(*ast.ValueSpec)
-				if !isValue {
-					continue
+			path := strings.Trim(imported.Path.Value, "\"")
+			names.imports[path[strings.LastIndex(path, "/")+1:]] = true
+		}
+		// ast.Inspect rather than a walk over file.Decls, because a struct type declared
+		// inside a function body carries a func typed field exactly as a package level one
+		// does, and the leak through it reads the same
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.FuncDecl:
+				names.functions[typed.Name.Name] = true
+			case *ast.TypeSpec:
+				names.types[typed.Name.Name] = true
+			case *ast.InterfaceType:
+				for _, method := range fieldsOf(typed.Methods) {
+					if _, isFunctionType := method.Type.(*ast.FuncType); !isFunctionType {
+						continue
+					}
+					for _, declared := range method.Names {
+						names.functions[declared.Name] = true
+					}
 				}
-				for _, declared := range value.Names {
-					names = append(names, declared.Name)
+			case *ast.StructType:
+				for _, field := range fieldsOf(typed.Fields) {
+					if _, isFunctionType := field.Type.(*ast.FuncType); !isFunctionType {
+						continue
+					}
+					for _, declared := range field.Names {
+						names.funcFields[declared.Name] = true
+					}
 				}
+			}
+			return true
+		})
+	}
+	return names
+}
+
+// namesBoundInside is every name one declaration introduces: its receiver, its parameters and
+// its results, and everything its body declares.
+//
+// The COMPLEMENT is what the scan is after, which is why this is written as the set of names
+// the declaration created rather than as a list of package level names. Storage a declaration
+// did not introduce was there before the call and is there after it, so a write that lands
+// there is the secret put somewhere the call does not end -- and derived this way the class
+// covers a package level name in a file the scan was never pointed at, and covers
+// otherPackage.Global, neither of which any list of THIS package's own values holds.
+func namesBoundInside(function *ast.FuncDecl) map[string]bool {
+	bound := map[string]bool{}
+	add := func(list *ast.FieldList) {
+		for _, field := range fieldsOf(list) {
+			for _, declared := range field.Names {
+				bound[declared.Name] = true
 			}
 		}
 	}
-	slices.Sort(names)
-	return slices.Compact(names)
+	add(function.Recv)
+	add(function.Type.Params)
+	add(function.Type.Results)
+	if function.Body == nil {
+		return bound
+	}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.AssignStmt:
+			if typed.Tok != token.DEFINE {
+				break
+			}
+			for _, target := range typed.Lhs {
+				if declared, isIdentifier := target.(*ast.Ident); isIdentifier {
+					bound[declared.Name] = true
+				}
+			}
+		case *ast.ValueSpec:
+			for _, declared := range typed.Names {
+				bound[declared.Name] = true
+			}
+		case *ast.TypeSpec:
+			bound[typed.Name.Name] = true
+		case *ast.RangeStmt:
+			for _, over := range []ast.Expr{typed.Key, typed.Value} {
+				if declared, isIdentifier := over.(*ast.Ident); isIdentifier {
+					bound[declared.Name] = true
+				}
+			}
+		case *ast.FuncLit:
+			add(typed.Type.Params)
+			add(typed.Type.Results)
+		}
+		return true
+	})
+	return bound
+}
+
+// theAliasesOfWhatItReaches is every name inside one declaration that carries the storage: the
+// storage itself, and every local a chain of assignments has put it in.
+//
+// Only a plain name joins, never a field of one. self.kept = self.epochSecret puts the secret
+// in the receiver's own storage, which is the holder this gate is about rather than somewhere
+// beyond it, and reading the receiver as an alias would make every later mention of any of its
+// fields read as the secret.
+func theAliasesOfWhatItReaches(function *ast.FuncDecl, storage string) map[string]bool {
+	aliases := map[string]bool{storage: true}
+	if function.Body == nil {
+		return aliases
+	}
+	for {
+		grew := false
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			assignment, isAssignment := node.(*ast.AssignStmt)
+			if !isAssignment {
+				return true
+			}
+			for at, right := range assignment.Rhs {
+				if at >= len(assignment.Lhs) || !carriesWhatItReaches(right, aliases) {
+					continue
+				}
+				target, isIdentifier := assignment.Lhs[at].(*ast.Ident)
+				if !isIdentifier || aliases[target.Name] {
+					continue
+				}
+				aliases[target.Name] = true
+				grew = true
+			}
+			return true
+		})
+		if !grew {
+			return aliases
+		}
+	}
+}
+
+// carriesWhatItReaches answers whether one expression evaluates to the storage or to a view
+// into it.
+//
+// It walks the selector, index, slice, star and unary chain, because self.epochSecret,
+// epochSecret, self.epochSecret[:8] and &self.epochSecret all name the same array. It walks
+// INTO a call's arguments, because bytes.Clone(self.epochSecret) is the secret in a second
+// array and handing THAT on is the same escape -- with one exception, a call to a function the
+// language predeclares, which is where len and cap live. len(self.epochSecret) is an int the
+// secret cannot be recovered from, and reading it as the secret would make every length check
+// in this package's constructors an escape.
+func carriesWhatItReaches(expr ast.Expr, aliases map[string]bool) bool {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return aliases[typed.Name]
+	case *ast.ParenExpr:
+		return carriesWhatItReaches(typed.X, aliases)
+	case *ast.StarExpr:
+		return carriesWhatItReaches(typed.X, aliases)
+	case *ast.UnaryExpr:
+		return carriesWhatItReaches(typed.X, aliases)
+	case *ast.IndexExpr:
+		return carriesWhatItReaches(typed.X, aliases)
+	case *ast.SliceExpr:
+		return carriesWhatItReaches(typed.X, aliases)
+	case *ast.SelectorExpr:
+		return aliases[typed.Sel.Name] || carriesWhatItReaches(typed.X, aliases)
+	case *ast.CallExpr:
+		if callee, isIdentifier := typed.Fun.(*ast.Ident); isIdentifier && types.Universe.Lookup(callee.Name) != nil {
+			return false
+		}
+		return slices.ContainsFunc(typed.Args, func(argument ast.Expr) bool {
+			return carriesWhatItReaches(argument, aliases)
+		})
+	}
+	return false
+}
+
+// theForeignCallee names the callee of one call when that callee is code this package did not
+// write, and answers the empty string otherwise.
+//
+// Four things a callee can be that are NOT foreign, and each is a question the source answers.
+// A name the language predeclares is copy or len or append. A name this package declares as a
+// func, a method or an interface method is a body this same scan runs over. A name this
+// package declares as a TYPE is a conversion rather than a call. A selector rooted at an
+// imported package name is that package's function.
+//
+// Everything else is a function value: a func typed parameter, a package level func variable,
+// a func typed field, an element of a map or slice of funcs, a local holding any of those.
+// Those are one class and not four, they are the class the three reflection sweeps next door
+// cannot see -- none of them appears in a signature -- and a scan that named the parameter
+// form alone let the other three past.
+//
+// The field case is asked FIRST, ahead of the method case, because a func typed field named
+// the same as some method of this package would otherwise read as that method and the leak
+// through it would be invisible.
+func theForeignCallee(parsed parsedSource, callee ast.Expr, names declaredNames) string {
+	switch typed := callee.(type) {
+	case *ast.ParenExpr:
+		return theForeignCallee(parsed, typed.X, names)
+	case *ast.IndexExpr:
+		return theForeignCallee(parsed, typed.X, names)
+	case *ast.IndexListExpr:
+		return theForeignCallee(parsed, typed.X, names)
+	case *ast.FuncLit:
+		return ""
+	case *ast.Ident:
+		if types.Universe.Lookup(typed.Name) != nil || names.functions[typed.Name] || names.types[typed.Name] {
+			return ""
+		}
+		return "calls " + typed.Name + ", which this package does not declare"
+	case *ast.SelectorExpr:
+		if names.funcFields[typed.Sel.Name] {
+			return "calls " + parsed.render(callee) + ", a function value this package does not declare"
+		}
+		if names.imports[rootIdentifierOf(typed.X)] || names.functions[typed.Sel.Name] {
+			return ""
+		}
+		return "calls " + parsed.render(callee) + ", which this package does not declare"
+	}
+	return ""
+}
+
+// whereOneDeclarationPutsIt is the derivation itself, over one declaration.
+//
+// A value inside a go call has exactly three kinds of destination that outlive the call, and
+// each is a question about the source that can be asked without naming any spelling of it:
+//
+//   - storage the declaration did not introduce. Read as a write whose target is rooted at a
+//     name namesBoundInside did not report: a package level variable of this package or of
+//     another. The VERB does not matter, which is the whole lesson of the copy row in the
+//     control -- an assignment is one spelling of that write and the copy builtin is another,
+//     so a call handed BOTH what the declaration reaches and storage it did not introduce is
+//     the same escape as the assignment.
+//   - another goroutine. A channel send, and the go statement that starts one.
+//   - code this package did not write, which is theForeignCallee above.
+//
+// Handing the storage to a function this package DECLARES is none of the three, and that is
+// what keeps Zeroize outside the class: zeroizeSecret is a body, and what that body does with
+// the bytes is answered by running this same scan over IT.
+func whereOneDeclarationPutsIt(parsed parsedSource, function *ast.FuncDecl, names declaredNames, storage string) []string {
+	bound := namesBoundInside(function)
+	aliases := theAliasesOfWhatItReaches(function, storage)
+	// outlivesTheCall answers, of one expression, the name it is rooted at when that name is
+	// storage this declaration did not introduce, and the empty string otherwise. A
+	// predeclared name is nil or true rather than storage, and an imported name is a package.
+	outlivesTheCall := func(expr ast.Expr) string {
+		root := rootIdentifierOf(expr)
+		if root == "" || root == "_" || bound[root] || types.Universe.Lookup(root) != nil || names.imports[root] {
+			return ""
+		}
+		return root
+	}
+	put := []string{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.SendStmt:
+			put = append(put, "sends on "+parsed.render(typed.Chan))
+		case *ast.GoStmt:
+			put = append(put, "starts a goroutine, which outlives the call that started it")
+		case *ast.AssignStmt:
+			// a define introduces a local, and a local is gone when the call returns
+			if typed.Tok == token.DEFINE {
+				break
+			}
+			for _, target := range typed.Lhs {
+				if outlivesTheCall(target) != "" {
+					put = append(put, "writes to "+parsed.render(target)+", which outlives it")
+				}
+			}
+		case *ast.CallExpr:
+			if why := theForeignCallee(parsed, typed.Fun, names); why != "" {
+				put = append(put, why)
+			}
+			if !slices.ContainsFunc(typed.Args, func(argument ast.Expr) bool {
+				return carriesWhatItReaches(argument, aliases)
+			}) {
+				break
+			}
+			for _, argument := range typed.Args {
+				if root := outlivesTheCall(argument); root != "" {
+					put = append(put, "hands "+parsed.render(typed.Fun)+" both what it reaches and "+root+", which outlives it")
+				}
+			}
+		}
+		return true
+	})
+	slices.Sort(put)
+	return slices.Compact(put)
 }
 
 // theDeclarationsPuttingWhatTheyReachBeyondTheCall answers, of the declarations named in
-// reaching, the ones that put what they reach somewhere that outlives the call and that the
-// caller did not hand in.
+// reaching, the ones that put what they reach somewhere the call does not end.
 //
-// Three shapes, and each is a way past the two filters the gates above apply. A write to a
-// package level variable is storage with no signature at all, so neither the shape filter nor
-// the reflection sweep has anything to read. A channel send is the same escape wearing a
-// different verb. A call to a func typed PARAMETER hands the bytes to code this package never
-// declared, and the parameter renders as func([]byte) rather than as []byte, so the byte slice
-// half of hasSomewhereToPutASecret does not see it.
-//
-// Handing the storage to a function this package declares is NOT one of them, which is what
-// keeps Zeroize outside this class: zeroizeSecret is a name the closure has already followed,
-// so what that function does with the bytes is answered by the same scan run over IT.
-func theDeclarationsPuttingWhatTheyReachBeyondTheCall(files []parsedSource, reaching []string, packageValues []string) []string {
+// The class is DERIVED by whereOneDeclarationPutsIt from where a value can go, rather than
+// written down as a list of shapes. The list this replaced held three -- an assignment to a
+// package level name, a channel send, and a call to a func typed PARAMETER -- and each of the
+// three was defeated by writing the same leak a different way: copy() instead of =, a package
+// level func variable instead of a parameter, a func typed field instead of either. All three
+// mutants passed the gate that advertised catching exactly those shapes.
+func theDeclarationsPuttingWhatTheyReachBeyondTheCall(files []parsedSource, reaching []string, storage string) []string {
+	names := namesTheseFilesDeclare(files)
 	escaping := []string{}
 	for _, parsed := range files {
 		for _, declaration := range parsed.file.Decls {
@@ -8089,45 +8461,13 @@ func theDeclarationsPuttingWhatTheyReachBeyondTheCall(files []parsedSource, reac
 			if !isFunction || function.Body == nil || !slices.Contains(reaching, function.Name.Name) {
 				continue
 			}
-			callbacks := []string{}
-			if function.Type.Params != nil {
-				for _, field := range function.Type.Params.List {
-					if _, isFunctionType := field.Type.(*ast.FuncType); !isFunctionType {
-						continue
-					}
-					for _, declared := range field.Names {
-						callbacks = append(callbacks, declared.Name)
-					}
-				}
-			}
-			escaped := ""
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				if escaped != "" {
-					return false
-				}
-				switch typed := node.(type) {
-				case *ast.AssignStmt:
-					for _, target := range typed.Lhs {
-						if root := rootIdentifierOf(target); slices.Contains(packageValues, root) {
-							escaped = "writes to package level " + root
-						}
-					}
-				case *ast.SendStmt:
-					escaped = "sends on " + parsed.render(typed.Chan)
-				case *ast.CallExpr:
-					if callee, isIdentifier := typed.Fun.(*ast.Ident); isIdentifier && slices.Contains(callbacks, callee.Name) {
-						escaped = "calls the caller's " + callee.Name
-					}
-				}
-				return escaped == ""
-			})
-			if escaped != "" {
-				escaping = append(escaping, function.Name.Name+": "+escaped)
+			for _, why := range whereOneDeclarationPutsIt(parsed, function, names, storage) {
+				escaping = append(escaping, function.Name.Name+": "+why)
 			}
 		}
 	}
 	slices.Sort(escaping)
-	return escaping
+	return slices.Compact(escaping)
 }
 
 // TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall is the half of guardrail G6 the
@@ -8136,52 +8476,52 @@ func theDeclarationsPuttingWhatTheyReachBeyondTheCall(files []parsedSource, reac
 //
 // TestNoExportedMethodOfThisPackageCanReachTheEpochSecret exempts a declaration that "answers
 // nothing and is handed nothing" on the ground that it has nowhere to put the secret. That is
-// true of a signature and false of a body: a package level variable is somewhere to put it that
-// no signature mentions, a channel is the same escape with a different verb, and a func typed
-// parameter is somewhere to put it that the byte slice filter reads as func([]byte) and lets
-// through. Until Zeroize landed the exemption covered no declaration at all and the gap was
-// theoretical; it now covers one, so the gap is the thing that has to be closed.
-//
-// Neither of the two behavioural gates can see any of the three either, for the same reason
-// they cannot see an argument conditioned leak: they read what a CALL ANSWERS, and none of
-// these three answers anything.
+// true of a SIGNATURE and false of a BODY, and the body is what this reads. Neither of the two
+// behavioural gates can see any of it either, for the same reason they cannot see an argument
+// conditioned leak: they read what a CALL ANSWERS, and a declaration of this shape answers
+// nothing.
 //
 // packageLevelValuesNaming next door is the nearest thing that existed, and it is a different
 // question -- it reads a package level value whose TYPE or initialiser names a holder, so
 // var TheSchedule *KeySchedule is caught and var Escaped []byte, filled in by a method that
 // reaches the storage, is not.
 func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
-	// the control first, on both halves: the value scan reads a package level variable however
-	// it is declared, and the escape scan tells the three ways out from the three legitimate
-	// shapes that look like them
+	// the control first: the closure reads the shapes that reach the storage, and the escape
+	// scan tells the eight ways out from the four legitimate shapes that look like them
 	control := []parsedSource{mustParseText(t, "the epoch secret escape control", epochSecretEscapeControl)}
-	controlValues := packageLevelValueNames(control)
-	if want := []string{"Escaped", "escapeChannel", "escapedUnexported"}; !slices.Equal(controlValues, want) {
-		t.Fatalf("the package level value scan read %v out of the control, want %v", controlValues, want)
-	}
 	controlReaching := theNamesReachingTheEpochSecret(declaredAcross(control))
 	wantReaching := []string{
 		"CutsALocalFromIt",
 		"KeepsItInItsOwnStorage",
+		"LeaksByCopyingIntoPackageStorage",
 		"LeaksIntoAChannel",
+		"LeaksIntoAGoroutine",
 		"LeaksIntoAnExportedVariable",
 		"LeaksIntoAnUnexportedVariable",
-		"LeaksThroughACallback",
+		"LeaksThroughACallerCallback",
+		"LeaksThroughAFieldCallback",
+		"LeaksThroughAPackageCallback",
+		"RefusesWithASentinel",
 		"Zeroize",
 	}
 	if !slices.Equal(controlReaching, wantReaching) {
 		t.Fatalf("the closure read %v out of the control as reaching the epoch secret, want %v",
 			controlReaching, wantReaching)
 	}
-	controlEscaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(control, controlReaching, controlValues)
+	controlEscaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(
+		control, controlReaching, epochSecretStorageField)
 	wantEscaping := []string{
+		"LeaksByCopyingIntoPackageStorage: hands copy both what it reaches and stashed, which outlives it",
 		"LeaksIntoAChannel: sends on escapeChannel",
-		"LeaksIntoAnExportedVariable: writes to package level Escaped",
-		"LeaksIntoAnUnexportedVariable: writes to package level escapedUnexported",
-		"LeaksThroughACallback: calls the caller's hand",
+		"LeaksIntoAGoroutine: starts a goroutine, which outlives the call that started it",
+		"LeaksIntoAnExportedVariable: writes to Escaped, which outlives it",
+		"LeaksIntoAnUnexportedVariable: writes to escapedUnexported, which outlives it",
+		"LeaksThroughACallerCallback: calls hand, which this package does not declare",
+		"LeaksThroughAFieldCallback: calls self.observer, a function value this package does not declare",
+		"LeaksThroughAPackageCallback: calls packageObserver, which this package does not declare",
 	}
 	if !slices.Equal(controlEscaping, wantEscaping) {
-		t.Fatalf("the escape scan read %v out of the control, want %v; it is not telling a write that outlives the call from one that does not, or it is reading an erase as an escape",
+		t.Fatalf("the escape scan read\n%v\nout of the control, want\n%v\nit is not telling a write that outlives the call from one that does not, or it is reading an erase or a length check as an escape",
 			controlEscaping, wantEscaping)
 	}
 
@@ -8195,9 +8535,13 @@ func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
 		t.Fatalf("no declaration of this package's source mentions %s, so the class below is empty and this gate demands nothing; if the storage was renamed, rename it in epochSecretStorageField too",
 			epochSecretStorageField)
 	}
-	values := packageLevelValueNames(files)
-	if len(values) == 0 {
-		t.Fatal("this package's source declares no package level value at all, so the first half of the scan below can never object to anything")
+	// the four sets the scan tells this package's own code by have to be populated out of
+	// this package's own source, or every callee below reads as foreign and what this gate
+	// reports is noise a reader would learn to ignore
+	names := namesTheseFilesDeclare(files)
+	if len(names.functions) == 0 || len(names.types) == 0 || len(names.imports) == 0 {
+		t.Fatalf("the scan read %d functions, %d types and %d imports out of this package's source; it is not reading the source it is about to judge",
+			len(names.functions), len(names.types), len(names.imports))
 	}
 	// the shape this gate exists for has to be present, or it is a gate over an empty
 	// exemption again: an eraser is a declaration that reaches the storage and answers
@@ -8213,11 +8557,15 @@ func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
 		t.Fatalf("no exported declaration of this package reaches %s and is exempted by its shape from TestNoExportedMethodOfThisPackageCanReachTheEpochSecret, so this gate is holding an exemption that covers nothing; Zeroize is that shape and it should be here",
 			epochSecretStorageField)
 	}
-	t.Logf("%d declarations reach %s (%v); %v are exempt from the shape gate and covered here",
+	// every declaration in reaching is scanned, exempt or not. exempt is logged rather than
+	// filtered on, because it names the declarations the OTHER gates cannot see and so the
+	// ones this scan is the only cover for.
+	t.Logf("%d declarations reach %s (%v); of those %v answer nothing and are handed nothing, so the scan below is the only gate over them",
 		len(reaching), epochSecretStorageField, reaching, exempt)
 
-	if escaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(files, reaching, values); len(escaping) != 0 {
-		t.Errorf("%v reach %s and put it somewhere the call does not end -- package level storage, a channel, or a function the caller supplied; G6 says no exported symbol of this package hands out the parent secret, and none of the three shapes appears in a signature for the gates above to read",
-			escaping, epochSecretStorageField)
+	escaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(files, reaching, epochSecretStorageField)
+	for _, one := range escaping {
+		t.Errorf("%s -- it reaches %s and puts it somewhere the call does not end: storage this package's own call did not introduce, another goroutine, or code this package did not write. G6 says no exported symbol of this package hands out the parent secret, and none of those appears in a signature for the gates above to read",
+			one, epochSecretStorageField)
 	}
 }
