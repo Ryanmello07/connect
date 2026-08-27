@@ -344,3 +344,67 @@ func (self *KeySchedule) Secrets() *EpochSecrets {
 func (self *KeySchedule) GroupContextBytes() []byte {
 	return self.groupContextBytes
 }
+
+// Export is MLS-Exporter of RFC 9420 section 8.5:
+//
+//	MLS-Exporter(Label, Context, Length) =
+//	    ExpandWithLabel(DeriveSecret(exporter_secret, Label),
+//	                    "exported", Hash(Context), Length)
+//
+// This is the only epoch bound key material connect/message obtains from an epoch, and it
+// carries more than the protocol: URmessage layers seed recovery on it, wrapping each
+// epoch's exported secret to the member's recovery key, so a defect here is a defect in
+// the ability to restore an account from a seedphrase. The nine named secrets are not
+// reachable this way — they are the epoch's own and Secrets() is where they live.
+//
+// Three separations have to hold and each is a different mistake. The label separates one
+// caller's exports from another's, and a body that ignored it would hand two subsystems
+// one secret while both believed they had their own. The context separates one call from
+// the next under a single label, and a body that ignored it would do the same thing one
+// level down — every "different" export the same bytes. The length is bound into the
+// preimage by ExpandWithLabel, so two lengths under one label and context are unrelated
+// secrets rather than one truncated to two sizes.
+//
+// The caller's context is HASHED rather than passed through, which is what lets a caller
+// pass a context of any length: the expansion's own context field is then always KDF.Nh
+// octets, well under the two byte vector length the label encoding writes.
+//
+// The length is refused rather than clamped above 255*KDF.Nh, which is all HKDF-Expand
+// can produce. The ceiling is read off the provider rather than written down, so a suite
+// with a wider hash gets its own ceiling; and it is a typed error rather than a panic
+// because the length here is a CALLER's number — connect/message asks for what its own
+// format needs — and not one this package fixes. CryptoProvider.Expand panics on the same
+// condition, which is correct for the call sites that ask for a length their suite fixes
+// and wrong for this one.
+func (self *KeySchedule) Export(label string, context []byte, length int) ([]byte, error) {
+	if length < 0 || length > 255*self.crypto.HashSize() {
+		return nil, fmt.Errorf("%w: %d", ErrExportLength, length)
+	}
+	derived := self.crypto.DeriveSecret(self.secrets.Exporter, label)
+	exported := self.crypto.ExpandWithLabel(derived, "exported", self.crypto.Hash(context), length)
+	// the per label secret is one HKDF-Expand away from every export under that label and
+	// nothing downstream needs it, so the storage it was computed into is erased rather
+	// than left for the collector. exporter_secret itself is the epoch's and stays.
+	zeroizeSecret(derived)
+	return exported, nil
+}
+
+// ExternalKeyPair derives the epoch's external HPKE key pair from external_secret.
+//
+// v1 refuses external commits, so this key pair is never advertised in a GroupInfo and
+// never used to accept an ExternalInit. It exists because key-schedule.json checks
+// external_pub, and because a suite whose DeriveKeyPair disagrees here disagrees
+// everywhere else it is used too. Keeping the derivation here rather than leaving it
+// unwritten is also what makes v2 a policy change rather than a key schedule change.
+//
+// This is the one place in the key schedule that reaches into HPKE, and deliberately the
+// only one: everything else in this file is arithmetic over byte slices, which is what
+// keeps it auditable against RFC 9420 section 8 line by line.
+//
+// external_secret is passed as the input keying material and nothing else is mixed in.
+// Any other secret of the epoch is the same length and derives a perfectly well formed
+// key pair, so what separates the right one from the wrong one is the published
+// external_pub and nothing about the value itself.
+func (self *KeySchedule) ExternalKeyPair() (HpkePrivateKey, HpkePublicKey, error) {
+	return self.crypto.DeriveKeyPair(self.secrets.External)
+}

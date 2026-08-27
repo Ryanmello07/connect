@@ -1941,20 +1941,99 @@ func TestEveryEpochSecretIsDerivedFromOneParentUnderItsOwnLabel(t *testing.T) {
 // method it excuses.
 var keyScheduleMethodsTakingArguments = map[string]string{}
 
+// exportSweepContext is the exporter context the argument rows below carry.
+//
+// Deliberately not KDF.Nh octets and not empty: it travels into the sweeps as one of the
+// things the exporter is handed, and a context that happened to be a kdf length would make
+// the differential next door report a coincidence belonging to this test's own choice.
+var exportSweepContext = bytes.Repeat([]byte{0x5c}, 19)
+
+// keyScheduleMethodArgumentRows drives an exported method of *KeySchedule that takes
+// arguments through the sweeps that read what this type hands out.
+//
+// A method with arguments cannot be called by a reflection sweep that has none, and the two
+// ways out of that buy opposite things. Give it arguments and every byte it answers joins
+// guardrail 6 exactly as an accessor's does; write it into
+// keyScheduleMethodsTakingArguments instead and it joins nothing, which is only honest for
+// a method whose arguments a test cannot supply. Export is driven rather than excused,
+// because "the exporter cannot be made to answer epoch_secret" is a claim about the label,
+// the context and the length a CALLER chooses, and an excuse is precisely a refusal to try
+// any of them.
+//
+// The rows are built from the schedule rather than written out as constants, and that is
+// load bearing twice over. One row asks for KDF.Nh bytes read off the provider, so the
+// answer is the same size as the secret guardrail 6 is looking for and the comparison can
+// mean something — an export of some other length can never equal epoch_secret whatever the
+// implementation does. Another asks for a length that is not KDF.Nh, so the differential in
+// TestEveryConstructionHandedAProviderReadsKdfNhFromIt sees an exporter length follow the
+// caller's number rather than the provider's. Three rows rather than one, because an
+// exporter that ignored its label or its context would answer one secret however it was
+// called and a single row could not tell.
+var keyScheduleMethodArgumentRows = map[string]func(schedule *KeySchedule) [][]reflect.Value{
+	"Export": func(schedule *KeySchedule) [][]reflect.Value {
+		nh := schedule.crypto.HashSize()
+		return [][]reflect.Value{
+			// the MASTER section 7 storage call: the seed recovery label, no context
+			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf([]byte(nil)), reflect.ValueOf(nh)},
+			// the same label with a context, so the pair differs only in the context
+			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh)},
+			// a different label at a length that is not KDF.Nh
+			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
+		}
+	},
+}
+
+// exposedSlice is one byte slice a sweep read off an exported surface, with the method it
+// came out of and the path inside that method's answer.
+//
+// The provenance travels with the bytes because the sweeps reading these want different
+// subsets of them: guardrail 6 asks about every one, and the KDF.Nh differential next door
+// has to leave out the answers that are not kdf lengths at all. Carrying the name is what
+// lets that second sweep say what it dropped instead of dropping by position.
+type exposedSlice struct {
+	method string
+	path   string
+	bytes  []byte
+}
+
+// exposedBytes is the byte slices alone, in order, for a sweep that does not care where each
+// of them came from.
+func exposedBytes(exposed []exposedSlice) [][]byte {
+	raw := make([][]byte, 0, len(exposed))
+	for _, one := range exposed {
+		raw = append(raw, one.bytes)
+	}
+	return raw
+}
+
 // exposedByteSlices flattens everything one call handed back into the byte slices a caller
-// can read. A []byte result is one; a pointer to a struct is each of its exported byte
-// slice fields, which is the shape Secrets() has.
-func exposedByteSlices(t *testing.T, what string, result reflect.Value) [][]byte {
+// can read. A byte slice result is one; a pointer to a struct is each of its exported byte
+// slice fields, which is the shape Secrets() has; a nil error contributes nothing.
+//
+// A byte slice is recognised by KIND rather than by the spelling []byte. HpkePublicKey and
+// HpkePrivateKey are byte slices under names of their own — registry section 3.2, which
+// TestConsumedHpkePublicKeyIsASlice holds them to — so a comparison against the unnamed type
+// drops exactly the two results ExternalKeyPair answers out of guardrail 6's class, and a
+// gate that demands less reports what a complete one reports.
+func exposedByteSlices(t *testing.T, what string, result reflect.Value) []exposedSlice {
 	t.Helper()
-	byteSlice := reflect.TypeOf([]byte(nil))
-	if result.Type() == byteSlice {
-		return [][]byte{result.Bytes()}
+	errorInterface := reflect.TypeOf((*error)(nil)).Elem()
+	if result.Type() == errorInterface {
+		// every row these sweeps are built from succeeds, so a failure here is the sweep's
+		// own bug rather than a place a secret hides
+		if !result.IsNil() {
+			t.Fatalf("%s answered %v, and the rows this sweep is built from succeed", what, result.Interface())
+		}
+		return nil
+	}
+	if result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Uint8 {
+		return []exposedSlice{{path: what, bytes: result.Bytes()}}
 	}
 	if result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct {
 		if result.IsNil() {
 			return nil
 		}
-		exposed := [][]byte{}
+		exposed := []exposedSlice{}
 		element := result.Elem()
 		for i := range element.NumField() {
 			if !element.Type().Field(i).IsExported() {
@@ -2040,7 +2119,7 @@ func epochSecretOfTheEpoch(t *testing.T, epoch ksVectorEpoch) []byte {
 // written here, so a method added later joins by existing. The exported fields are refused
 // outright: storage reachable without going through a method is storage this sweep would
 // never call for.
-func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([][]byte, []string) {
+func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([]exposedSlice, []string) {
 	t.Helper()
 	scheduleType := reflect.TypeOf(schedule)
 	valueType := scheduleType.Elem()
@@ -2051,28 +2130,69 @@ func bytesTheScheduleHandsOut(t *testing.T, at string, schedule *KeySchedule) ([
 		}
 	}
 
-	exposed := [][]byte{}
+	exposed := []exposedSlice{}
 	swept := []string{}
 	for i := range scheduleType.NumMethod() {
 		method := scheduleType.Method(i)
+		// one row of no arguments for an accessor, and whatever
+		// keyScheduleMethodArgumentRows supplies for a method that takes some
+		rows := [][]reflect.Value{nil}
 		if method.Type.NumIn() != 1 {
-			if reason, excused := keyScheduleMethodsTakingArguments[method.Name]; !excused {
-				t.Fatalf("%s: (*KeySchedule).%s takes arguments and this sweep calls with none; give it arguments here or write down in keyScheduleMethodsTakingArguments why it cannot surface epoch_secret",
-					at, method.Name)
-			} else {
-				t.Logf("%s: (*KeySchedule).%s not swept: %s", at, method.Name, reason)
+			build, driven := keyScheduleMethodArgumentRows[method.Name]
+			if !driven {
+				if reason, excused := keyScheduleMethodsTakingArguments[method.Name]; !excused {
+					t.Fatalf("%s: (*KeySchedule).%s takes arguments and this sweep calls with none; give it rows in keyScheduleMethodArgumentRows or write down in keyScheduleMethodsTakingArguments why it cannot surface epoch_secret",
+						at, method.Name)
+				} else {
+					t.Logf("%s: (*KeySchedule).%s not swept: %s", at, method.Name, reason)
+				}
+				continue
 			}
-			continue
+			rows = build(schedule)
+			if len(rows) == 0 {
+				t.Fatalf("%s: keyScheduleMethodArgumentRows drives (*KeySchedule).%s with no rows at all, so it is swept in name only",
+					at, method.Name)
+			}
+			// the arity and the types are checked rather than left to reflect.Call, whose
+			// answer to a row that does not fit is a panic naming neither the method nor
+			// the row that did not fit it
+			for _, row := range rows {
+				if len(row)+1 != method.Type.NumIn() {
+					t.Fatalf("%s: keyScheduleMethodArgumentRows drives (*KeySchedule).%s with %d arguments and it takes %d",
+						at, method.Name, len(row), method.Type.NumIn()-1)
+				}
+				for argument, value := range row {
+					if want := method.Type.In(argument + 1); !value.Type().AssignableTo(want) {
+						t.Fatalf("%s: keyScheduleMethodArgumentRows hands (*KeySchedule).%s a %s in argument %d, which takes %s",
+							at, method.Name, value.Type(), argument, want)
+					}
+				}
+			}
+		} else if _, driven := keyScheduleMethodArgumentRows[method.Name]; driven {
+			t.Errorf("keyScheduleMethodArgumentRows drives %s, which takes no arguments", method.Name)
 		}
 		swept = append(swept, method.Name)
-		for _, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)}) {
-			exposed = append(exposed,
-				exposedByteSlices(t, "(*KeySchedule)."+method.Name, result)...)
+		for _, row := range rows {
+			for _, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(schedule)}, row...)) {
+				for _, one := range exposedByteSlices(t, "(*KeySchedule)."+method.Name, result) {
+					one.method = method.Name
+					exposed = append(exposed, one)
+				}
+			}
 		}
 	}
 	for name := range keyScheduleMethodsTakingArguments {
 		if _, found := scheduleType.MethodByName(name); !found {
 			t.Errorf("keyScheduleMethodsTakingArguments excuses %s, which *KeySchedule does not declare", name)
+		}
+		if _, driven := keyScheduleMethodArgumentRows[name]; driven {
+			t.Errorf("%s is both excused from this sweep and driven through it, so which one holds depends on the order these two maps are read",
+				name)
+		}
+	}
+	for name := range keyScheduleMethodArgumentRows {
+		if _, found := scheduleType.MethodByName(name); !found {
+			t.Errorf("keyScheduleMethodArgumentRows drives %s, which *KeySchedule does not declare", name)
 		}
 	}
 	return exposed, swept
@@ -2119,16 +2239,25 @@ func TestNoExportedSurfaceOfTheKeyScheduleReturnsTheEpochSecret(t *testing.T) {
 				epoch.at, len(exposed), len(fields))
 		}
 		for _, known := range [][]byte{schedule.JoinerSecret(), schedule.Secrets().InitSecret} {
-			if !slices.ContainsFunc(exposed, func(b []byte) bool { return bytes.Equal(b, known) }) {
+			if !slices.ContainsFunc(exposed, func(one exposedSlice) bool { return bytes.Equal(one.bytes, known) }) {
 				t.Fatalf("%s: the sweep did not find a secret the type certainly exposes, so a secret it must not expose would be missed too",
 					epoch.at)
 			}
 		}
+		// and an answer of KDF.Nh bytes really did go through it. The comparison below is
+		// against a secret that is KDF.Nh long, so a sweep in which no answer was ever that
+		// length could not have found epoch_secret however this type handed it out.
+		if !slices.ContainsFunc(exposed, func(one exposedSlice) bool {
+			return len(one.bytes) == epoch.crypto.HashSize()
+		}) {
+			t.Fatalf("%s: no answer the sweep read is KDF.Nh bytes long, so none of them could equal epoch_secret whatever this type did",
+				epoch.at)
+		}
 
-		for index, secret := range exposed {
-			if bytes.Equal(secret, epochSecret) {
-				t.Errorf("%s: the exported surface hands out epoch_secret at position %d of %d; it is the parent of every secret of this epoch and G6 says no exported symbol returns it",
-					epoch.at, index, len(exposed))
+		for index, one := range exposed {
+			if bytes.Equal(one.bytes, epochSecret) {
+				t.Errorf("%s: the exported surface hands out epoch_secret through %s at position %d of %d; it is the parent of every secret of this epoch and G6 says no exported symbol returns it",
+					epoch.at, one.path, index, len(exposed))
 			}
 		}
 	}
@@ -2358,7 +2487,7 @@ var epochSecretHolderSweeps = map[string]func(t *testing.T, at string, value ref
 			t.Fatalf("%s: the sweep was handed a %s where a *KeySchedule belongs", at, value.Type())
 		}
 		exposed, _ := bytesTheScheduleHandsOut(t, at, schedule)
-		return exposed
+		return exposedBytes(exposed)
 	},
 }
 
@@ -2389,7 +2518,7 @@ func bytesTheAnswerHandsOut(t *testing.T, at string, name string, results []refl
 			exposed = append(exposed, sweep(t, at, result)...)
 			continue
 		}
-		exposed = append(exposed, exposedByteSlices(t, name+at, result)...)
+		exposed = append(exposed, exposedBytes(exposedByteSlices(t, name+at, result))...)
 	}
 	return exposed
 }
@@ -3030,6 +3159,19 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 	"EncryptWithLabel": "answers a KEM output at Nenc and a ciphertext at Nt, neither of which is KDF.Nh; Nenc coincides with Nh at 32 under the narrow suite",
 }
 
+// scheduleAnswersThatAreNotKdfLengths names an exported method of *KeySchedule whose answer
+// the KDF.Nh equivalence below cannot hold, with the reason. It is the same excuse
+// constructionsWhoseAnswerOnlyCoincidesWithKdfNh carries for a package level construction,
+// one level down: the schedule's answers reach that gate through the rows that build a
+// schedule, so a method answering something that is not a kdf length cannot be excused by
+// naming the construction without excusing the whole epoch with it.
+//
+// It is checked against the type in both directions and against the sweep's own output, so
+// an entry cannot outlive the method it excuses and cannot sit here excusing nothing.
+var scheduleAnswersThatAreNotKdfLengths = map[string]string{
+	"ExternalKeyPair": "answers an hpke private key at Nsk and a public key at Npk, neither of which is KDF.Nh; X25519 fixes both at 32 and the narrow suite's KDF.Nh is also 32, so the equality is that suite's coincidence rather than anything this method did, and a kdf getting wider does not make an X25519 key wider",
+}
+
 // scheduleStorageReaders is how this gate reads each byte slice a *KeySchedule keeps behind
 // its accessors.
 //
@@ -3074,7 +3216,29 @@ func bytesTheScheduleKeeps(t *testing.T, at string, schedule *KeySchedule) [][]b
 		}
 	}
 	slices.Sort(fields)
-	kept, _ := bytesTheScheduleHandsOut(t, at, schedule)
+	handedOut, _ := bytesTheScheduleHandsOut(t, at, schedule)
+	kept := [][]byte{}
+	dropped := map[string]bool{}
+	for _, one := range handedOut {
+		if _, notAKdfLength := scheduleAnswersThatAreNotKdfLengths[one.method]; notAKdfLength {
+			dropped[one.method] = true
+			continue
+		}
+		kept = append(kept, one.bytes)
+	}
+	for name, reason := range scheduleAnswersThatAreNotKdfLengths {
+		if _, found := reflect.TypeOf(schedule).MethodByName(name); !found {
+			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s, which *KeySchedule does not declare", name)
+			continue
+		}
+		// an excuse that dropped nothing is an excuse for a method the sweep is no longer
+		// reading, which is the shape that leaves this gate looking complete while covering
+		// less than it did
+		if !dropped[name] {
+			t.Errorf("scheduleAnswersThatAreNotKdfLengths excuses %s (%s) and the sweep read no answer of that method to drop",
+				name, reason)
+		}
+	}
 	for _, name := range fields {
 		kept = append(kept, scheduleStorageReaders[name](schedule))
 	}
@@ -3950,5 +4114,605 @@ func TestTheJoinerPathBindsEveryFieldOfTheGroupContext(t *testing.T) {
 	}
 	if want := len(generated) * fields * len(names); observed != want {
 		t.Fatalf("observed %d field comparisons, want %d", observed, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 8: MLS-Exporter, RFC 9420 section 8.5.
+//
+// This is the one primitive of the key schedule that carries a PRODUCT feature rather than
+// only the protocol. MLS specifies no delivery service and no long term storage, so
+// URmessage layers seed recovery on the exporter: each epoch's exported secret is wrapped to
+// the member's recovery key, and a defect here is a defect in the ability to restore an
+// account from a seedphrase. Its known answer therefore matters exactly as much as the key
+// schedule's own, and the three separations it rests on — the label, the context and the
+// length — are each observed on their own below, because each is a different mistake and
+// each is invisible to the other two.
+//
+// The corpus pins one exporter answer per epoch, at a length that IS KDF.Nh for both
+// registered suites. So the known answer alone cannot see a body that hands back KDF.Nh
+// bytes whatever it was asked for, and TestKeyScheduleExportHonoursTheRequestedLengthExactly
+// is what does.
+// ---------------------------------------------------------------------------
+
+// exporterOf is the corpus's published exporter question and its answer for one epoch.
+//
+// The label is read as the ASCII STRING the mlswg format documents it to be. It happens to be
+// spelled in hex digits and every sibling field of it is hex, so reading it as hex is the
+// natural mistake; it builds a different preimage and matches nothing.
+// TestKeyScheduleExportReadsTheVectorLabelAsAStringAndNotAsHex is what says the two readings
+// really do differ, rather than leaving that to this comment.
+//
+// Both halves of the question are checked as they are decoded. An epoch whose label were
+// empty would agree with an implementation that ignored the label, and one whose context were
+// empty would be weaker against an implementation that ignored the context, so a corpus that
+// stopped carrying either is reported here rather than quietly making the sweep below softer.
+func exporterOf(t *testing.T, epoch ksVectorEpoch) (label string, context []byte, length int, want string) {
+	t.Helper()
+	published := epoch.published.Exporter
+	if published.Label == "" {
+		t.Fatalf("%s: the corpus exporter label is empty, so an implementation that ignored the label would agree with this epoch",
+			epoch.at)
+	}
+	if published.Length <= 0 {
+		t.Fatalf("%s: the corpus exporter length is %d, so this epoch pins nothing about how many bytes are produced",
+			epoch.at, published.Length)
+	}
+	// mustDecodeHex refuses a context that decodes to nothing, which is the other half of
+	// the same vacuity check
+	return published.Label,
+		mustDecodeHex(t, "exporter context"+epoch.at, published.Context),
+		published.Length,
+		published.Secret
+}
+
+// TestKeyScheduleExportMatchesTheMlswgKeySchedule is the deliverable of this task: the
+// exporter answer mlswg published for every epoch of the corpus, through the KeySchedule type
+// rather than through the primitives.
+//
+// crypto_labels_test.go already holds the same answers to the primitives. This is a different
+// claim: that the type wires them together in the right order, over the right one of its nine
+// secrets, with the caller's context hashed and the inner "exported" label supplied. Every one
+// of those is a change of two characters or fewer that produces a perfectly well formed
+// secret, and the only thing that separates the right one from the wrong one is a value
+// somebody else published.
+func TestKeyScheduleExportMatchesTheMlswgKeySchedule(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		label, context, length, want := exporterOf(t, epoch)
+		exported, err := epoch.schedule(t).Export(label, context, length)
+		if err != nil {
+			t.Fatalf("%s: Export: %v", epoch.at, err)
+		}
+		assertLabelKat(t, "exporter"+epoch.at, exported, want)
+		compared++
+	}
+	if compared != keyScheduleKatEpochs {
+		t.Fatalf("compared %d published exporter answers, want %d", compared, keyScheduleKatEpochs)
+	}
+}
+
+// TestKeyScheduleExportReadsTheVectorLabelAsAStringAndNotAsHex is what makes the known answer
+// above mean something.
+//
+// The corpus label is 64 ASCII characters that are all hex digits, sitting in a json object
+// where every other string is hex. An implementation — or a test — that decoded it would build
+// a 32 byte label, expand over a different preimage and get a different answer, and the whole
+// weight of the vector rests on which of the two readings is the right one. This asserts they
+// really are different answers, so a KAT that passed under one reading could not also have
+// passed under the other.
+func TestKeyScheduleExportReadsTheVectorLabelAsAStringAndNotAsHex(t *testing.T) {
+	rows := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		label, context, length, _ := exporterOf(t, epoch)
+		decoded, err := hex.DecodeString(label)
+		if err != nil {
+			t.Fatalf("%s: the corpus label %q does not decode as hex at all, so this gate separates nothing; it exists because the label IS spelled in hex digits",
+				epoch.at, label)
+		}
+		schedule := epoch.schedule(t)
+		asString, err := schedule.Export(label, context, length)
+		if err != nil {
+			t.Fatalf("%s: Export under the label as a string: %v", epoch.at, err)
+		}
+		asHex, err := schedule.Export(string(decoded), context, length)
+		if err != nil {
+			t.Fatalf("%s: Export under the hex decoded label: %v", epoch.at, err)
+		}
+		if bytes.Equal(asString, asHex) {
+			t.Errorf("%s: the label read as a string and the same label hex decoded produce one answer, so the label is not reaching the derivation and the published exporter value pins nothing",
+				epoch.at)
+		}
+		rows++
+	}
+	if rows == 0 {
+		t.Fatal("no epoch reached the comparison, so this gate held nothing")
+	}
+}
+
+// exportGridLabels and exportGridContexts are the grid the separation gate below sweeps.
+//
+// The labels include a pair differing in one character and a pair where one is a prefix of the
+// other, because ExpandWithLabel length prefixes its fields and a body that concatenated them
+// instead would collide exactly on the second pair. The contexts include one byte, two bytes
+// and ninety seven bytes for the same reason on the other side, and a one byte difference so
+// the property is not satisfied by a body that only reads the context's length.
+var (
+	exportGridLabels = []string{
+		"",
+		"URmessage/v1/storage",
+		"URmessage/v1/storagf",
+		"URmessage/v1/storage/",
+	}
+	exportGridContexts = [][]byte{
+		{0x00},
+		{0x01},
+		{0x01, 0x00},
+		bytes.Repeat([]byte{0xa5}, 97),
+	}
+)
+
+// TestKeyScheduleExportSeparatesItsLabelAndItsContextIndependently observes the property the
+// known answer cannot: that BOTH inputs reach the derivation, and each on its own.
+//
+// A body that ignored the context hands every caller under one label the same secret however
+// they varied it, which is a set of exports that look distinct at every call site and are one
+// key. A body that ignored the label does the same thing one level up. Neither shows up in a
+// vector that varies both at once, and neither shows up in a round trip, a length check or a
+// distinctness check over a single call — which is why the grid varies one at a time and every
+// pair is compared.
+//
+// The nil and empty contexts are asserted to AGREE rather than to differ, because the context
+// is hashed: Hash(nil) and Hash([]byte{}) are one value, so a caller writing the MASTER
+// section 7 storage call either way gets one secret. A body that passed the context through
+// instead of hashing it would separate those two, which is the opposite failure.
+func TestKeyScheduleExportSeparatesItsLabelAndItsContextIndependently(t *testing.T) {
+	type gridKey struct {
+		label   int
+		context int
+	}
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		length := epoch.crypto.HashSize()
+		exported := map[gridKey][]byte{}
+		for i, label := range exportGridLabels {
+			for j, context := range exportGridContexts {
+				answer, err := schedule.Export(label, context, length)
+				if err != nil {
+					t.Fatalf("%s: Export(%q, %x, %d): %v", epoch.at, label, context, length, err)
+				}
+				if len(answer) != length {
+					t.Fatalf("%s: Export(%q, %x, %d) answered %d bytes",
+						epoch.at, label, context, length, len(answer))
+				}
+				exported[gridKey{label: i, context: j}] = answer
+			}
+		}
+		for first, firstAnswer := range exported {
+			for second, secondAnswer := range exported {
+				if first == second {
+					continue
+				}
+				compared++
+				if !bytes.Equal(firstAnswer, secondAnswer) {
+					continue
+				}
+				switch {
+				case first.label == second.label:
+					t.Errorf("%s: two exports under label %q with contexts %x and %x are the same secret, so the context is not reaching the derivation and every 'different' export under this label is one key",
+						epoch.at, exportGridLabels[first.label],
+						exportGridContexts[first.context], exportGridContexts[second.context])
+				case first.context == second.context:
+					t.Errorf("%s: two exports under labels %q and %q with one context are the same secret, so the label is not reaching the derivation",
+						epoch.at, exportGridLabels[first.label], exportGridLabels[second.label])
+				default:
+					t.Errorf("%s: Export(%q, %x) and Export(%q, %x) are the same secret",
+						epoch.at, exportGridLabels[first.label], exportGridContexts[first.context],
+						exportGridLabels[second.label], exportGridContexts[second.context])
+				}
+			}
+		}
+
+		// the other direction: the context is HASHED, so its two spellings of "no context"
+		// are one context
+		none, err := schedule.Export("URmessage/v1/storage", nil, length)
+		if err != nil {
+			t.Fatalf("%s: Export over a nil context: %v", epoch.at, err)
+		}
+		empty, err := schedule.Export("URmessage/v1/storage", []byte{}, length)
+		if err != nil {
+			t.Fatalf("%s: Export over an empty context: %v", epoch.at, err)
+		}
+		if !bytes.Equal(none, empty) {
+			t.Errorf("%s: a nil context and an empty one answered different secrets, so the context is being passed through rather than hashed and the MASTER section 7 storage call depends on which spelling its caller used",
+				epoch.at)
+		}
+	}
+	// the grid really ran: a sweep whose inner loops produced no pair reports the clean run a
+	// full one reports
+	if want := keyScheduleKatEpochs * len(exportGridLabels) * len(exportGridContexts) *
+		(len(exportGridLabels)*len(exportGridContexts) - 1); compared != want {
+		t.Fatalf("compared %d pairs of exports, want %d", compared, want)
+	}
+}
+
+// TestKeyScheduleExportHonoursTheRequestedLengthExactly is the property the corpus cannot
+// hold, because both registered suites publish their exporter answer at exactly KDF.Nh bytes.
+//
+// So a body that expanded at KDF.Nh whatever it was asked for reproduces all ten published
+// answers, passes every separation above, and hands a caller asking for 64 bytes of key
+// material 32 bytes of it — or, spelled the other way, truncates a longer request to the hash
+// size and returns short. URmessage's seed recovery asks for what its own format needs, which
+// is a caller's number and not the suite's.
+//
+// The lengths are read off the provider so the row set moves with the suite, and they
+// deliberately straddle KDF.Nh in both directions and include the 255*KDF.Nh ceiling, which is
+// the largest HKDF-Expand can produce.
+//
+// The prefix comparison at the end is a separate claim: MLS binds the length INTO the
+// expansion's preimage, so two lengths under one label and context are unrelated secrets
+// rather than one stream cut to two sizes. A body that expanded once at the ceiling and
+// sliced would satisfy every length check above and disagree with every peer.
+func TestKeyScheduleExportHonoursTheRequestedLengthExactly(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		nh := epoch.crypto.HashSize()
+		if nh < 4 {
+			t.Fatalf("%s: KDF.Nh is %d, and the rows below assume a hash with room either side of it", epoch.at, nh)
+		}
+		answers := map[int][]byte{}
+		for _, length := range []int{0, 1, nh - 1, nh, nh + 1, 2 * nh, 2*nh + 7, 255 * nh} {
+			exported, err := schedule.Export("URmessage/v1/storage", exportSweepContext, length)
+			if err != nil {
+				t.Fatalf("%s: Export at %d bytes: %v", epoch.at, length, err)
+			}
+			if len(exported) != length {
+				t.Errorf("%s: Export asked for %d bytes answered %d; a caller of the exporter gets the length it asked for or an error, never a different length",
+					epoch.at, length, len(exported))
+			}
+			answers[length] = exported
+			compared++
+		}
+		short, long := answers[nh], answers[2*nh]
+		if len(short) != nh || len(long) != 2*nh {
+			continue
+		}
+		if bytes.Equal(long[:nh], short) {
+			t.Errorf("%s: the %d byte export is the first %d bytes of the %d byte one, so the length is not bound into the expansion's preimage and two lengths under one label are one secret",
+				epoch.at, nh, nh, 2*nh)
+		}
+	}
+	if want := keyScheduleKatEpochs * 8; compared != want {
+		t.Fatalf("compared %d lengths, want %d", compared, want)
+	}
+}
+
+// TestKeyScheduleExportRefusesALengthOutsideTheKdfRange asserts the two ends of the range are
+// typed refusals rather than a panic out of the provider or a silently different length.
+//
+// CryptoProvider.Expand panics on both, which is right for the call sites that ask for a length
+// their suite fixes and wrong for this one: the exporter's length is a CALLER's number, so it
+// arrives as an error a caller can handle. The negative side matters as much as the positive
+// one — crypto/hkdf reaches make([]byte, 0, keyLen) before any check of its own, so a negative
+// length that got past here is a makeslice panic from inside the standard library.
+func TestKeyScheduleExportRefusesALengthOutsideTheKdfRange(t *testing.T) {
+	refused := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		nh := epoch.crypto.HashSize()
+		for _, length := range []int{-1, -nh, 255*nh + 1, 1 << 30} {
+			exported, err := schedule.Export("URmessage/v1/storage", exportSweepContext, length)
+			if !errors.Is(err, ErrExportLength) {
+				t.Errorf("%s: Export at %d bytes answered %v, want ErrExportLength", epoch.at, length, err)
+			}
+			if exported != nil {
+				t.Errorf("%s: Export at %d bytes refused and answered %d bytes as well",
+					epoch.at, length, len(exported))
+			}
+			refused++
+		}
+		// and the boundary itself is inside the range rather than one past it
+		if exported, err := schedule.Export("URmessage/v1/storage", exportSweepContext, 255*nh); err != nil {
+			t.Errorf("%s: Export at 255*KDF.Nh = %d bytes was refused with %v, and that is exactly what HKDF-Expand can produce",
+				epoch.at, 255*nh, err)
+		} else if len(exported) != 255*nh {
+			t.Errorf("%s: Export at 255*KDF.Nh answered %d bytes, want %d", epoch.at, len(exported), 255*nh)
+		}
+	}
+	if want := keyScheduleKatEpochs * 4; refused != want {
+		t.Fatalf("%d lengths were refused, want %d", refused, want)
+	}
+}
+
+// TestKeyScheduleExportReadsItsCeilingFromTheProvider is the input the registered suites
+// cannot supply: both fix KDF.Nh at 32, so 255*KDF.Nh is 8160 for both and a body that wrote
+// 8160 down — or wrote 32 down and multiplied — answers correctly for every suite this package
+// registers and incorrectly for the first one it does not.
+//
+// Both directions are asserted, because either alone is satisfiable by a different mistake. A
+// length inside the wide provider's range and outside the narrow one's must be ACCEPTED over
+// the wide provider, which a written down 8160 refuses; and the wide provider's own ceiling
+// must still be refused one past it, so the number moved rather than disappearing.
+func TestKeyScheduleExportReadsItsCeilingFromTheProvider(t *testing.T) {
+	narrow := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	wide := &wideKdfProvider{CryptoProvider: narrow}
+	if narrow.HashSize() == wide.HashSize() {
+		t.Fatalf("both providers answer KDF.Nh %d, so this gate separates nothing", narrow.HashSize())
+	}
+	groupContext := ksVectorEpoch0GroupContext(t)
+	narrowSchedule, err := NewKeyScheduleFromEpochSecret(
+		narrow, bytes.Repeat([]byte{0x61}, narrow.HashSize()), groupContext)
+	if err != nil {
+		t.Fatalf("build the schedule over the narrow provider: %v", err)
+	}
+	wideSchedule, err := NewKeyScheduleFromEpochSecret(
+		wide, bytes.Repeat([]byte{0x62}, wide.HashSize()), groupContext)
+	if err != nil {
+		t.Fatalf("build the schedule over the wide provider: %v", err)
+	}
+
+	beyondTheNarrowCeiling := 255*narrow.HashSize() + 1
+	if _, err := narrowSchedule.Export("URmessage/v1/storage", nil, beyondTheNarrowCeiling); !errors.Is(err, ErrExportLength) {
+		t.Errorf("a provider whose KDF.Nh is %d accepted %d bytes, which is past its own 255*KDF.Nh, answering %v",
+			narrow.HashSize(), beyondTheNarrowCeiling, err)
+	}
+	exported, err := wideSchedule.Export("URmessage/v1/storage", nil, beyondTheNarrowCeiling)
+	if err != nil {
+		t.Errorf("a provider whose KDF.Nh is %d refused %d bytes with %v, and that is inside its own 255*KDF.Nh of %d; the ceiling is written down rather than read off the provider",
+			wide.HashSize(), beyondTheNarrowCeiling, err, 255*wide.HashSize())
+	} else if len(exported) != beyondTheNarrowCeiling {
+		t.Errorf("the wide provider answered %d bytes for a request of %d", len(exported), beyondTheNarrowCeiling)
+	}
+	if _, err := wideSchedule.Export("URmessage/v1/storage", nil, 255*wide.HashSize()+1); !errors.Is(err, ErrExportLength) {
+		t.Errorf("a provider whose KDF.Nh is %d accepted %d bytes, one past its own 255*KDF.Nh, answering %v; the ceiling moved with the provider in one direction and disappeared in the other",
+			wide.HashSize(), 255*wide.HashSize()+1, err)
+	}
+}
+
+// TestKeyScheduleExportLeavesItsContextAloneAndAnswersStorageOfItsOwn covers the three
+// aliasing claims the package wide gate next door cannot make about this one, because that
+// gate's class is package level FUNCTIONS handed a caller's bytes and Export is a method.
+//
+// Each is a different wrong implementation. A context written through is a caller's buffer
+// changed by a read only operation. Two calls answering out of one array is an earlier export
+// overwritten by a later one, which a caller holding both would discover as a key that changed
+// under it. An answer that aliased one of the epoch's own secrets would be handed to a caller
+// that then owns storage the epoch erases when it ages out of PastEpochWindow.
+func TestKeyScheduleExportLeavesItsContextAloneAndAnswersStorageOfItsOwn(t *testing.T) {
+	epochs := ksVectorEpochs(t)
+	epoch := epochs[0]
+	schedule := epoch.schedule(t)
+	length := epoch.crypto.HashSize()
+	context := bytes.Repeat([]byte{0x3d}, 40)
+	handed := bytes.Clone(context)
+
+	first, err := schedule.Export("URmessage/v1/storage", context, length)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if !bytes.Equal(context, handed) {
+		t.Errorf("Export changed the storage behind the context it was handed: %x, was %x", context, handed)
+	}
+	second, err := schedule.Export("URmessage/v1/storage", context, length)
+	if err != nil {
+		t.Fatalf("Export a second time: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Errorf("two calls with one label, context and length answered %x and %x", first, second)
+	}
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatal("Export answered nothing, so the aliasing checks below observe nothing")
+	}
+	if &first[0] == &second[0] {
+		t.Error("two calls to Export answered out of one array, so a caller holding an earlier export has it overwritten by a later one")
+	}
+	if &context[0] == &first[0] {
+		t.Error("Export answered over the context it was handed")
+	}
+	for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
+		if len(secret) != 0 && &secret[0] == &first[0] {
+			t.Errorf("Export answered over EpochSecrets.%s, which the epoch erases when it ages out of PastEpochWindow", name)
+		}
+	}
+}
+
+// TestKeyScheduleExportNeverAnswersASecretTheEpochKeeps is guardrail G6 read at the one
+// exported surface a caller controls the arguments of.
+//
+// The sweep in bytesTheScheduleHandsOut drives Export through rows this file chose and holds
+// its answers to G6 alongside the accessors'. This is the complement: a wider set of labels and
+// contexts, compared against the whole of what the epoch holds rather than against epoch_secret
+// alone. Both are needed — a body that answered self.epochSecret is caught by either, and one
+// that answered confirmation_key under some particular label is caught only here.
+//
+// The length is KDF.Nh so the comparisons can bite at all: every secret compared against is
+// KDF.Nh bytes, and an export of any other length could not equal one however wrong the body
+// was.
+func TestKeyScheduleExportNeverAnswersASecretTheEpochKeeps(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		length := epoch.crypto.HashSize()
+		forbidden := map[string][]byte{
+			"epoch_secret":   epochSecretOfTheEpoch(t, epoch),
+			"joiner_secret":  schedule.JoinerSecret(),
+			"welcome_secret": schedule.WelcomeSecret(),
+		}
+		for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
+			forbidden["EpochSecrets."+name] = secret
+		}
+		if len(forbidden) < 12 {
+			t.Fatalf("%s: the epoch reads as %d secrets, and it keeps the nine derived ones plus three more",
+				epoch.at, len(forbidden))
+		}
+		for _, label := range []string{"", "exported", "exporter", "epoch", "URmessage/v1/storage"} {
+			for _, context := range [][]byte{nil, {}, exportSweepContext} {
+				exported, err := schedule.Export(label, context, length)
+				if err != nil {
+					t.Fatalf("%s: Export(%q, %x, %d): %v", epoch.at, label, context, length, err)
+				}
+				for name, secret := range forbidden {
+					if len(secret) == 0 {
+						continue
+					}
+					compared++
+					if bytes.Equal(exported, secret) {
+						t.Errorf("%s: Export(%q, %x, %d) answered %s itself; the exporter hands out material derived FROM the epoch and never the epoch's own secrets",
+							epoch.at, label, context, length, name)
+					}
+				}
+			}
+		}
+	}
+	if compared == 0 {
+		t.Fatal("no export was compared against any secret, so this gate held nothing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: the external key pair.
+//
+// This is the only place in the key schedule that reaches into HPKE, and deliberately the only
+// one: everything else in key_schedule.go is arithmetic over byte slices, which is what keeps
+// it auditable against RFC 9420 section 8 line by line.
+//
+// v1 refuses external commits, so this key pair is never advertised in a GroupInfo and never
+// used to accept an ExternalInit. It is derived anyway because key-schedule.json checks
+// external_pub, and because a DeriveKeyPair that disagrees here disagrees everywhere else it is
+// used. p7's TestExternalPubIsNotAdvertised is the counterpart assertion, on the other side of
+// the boundary.
+// ---------------------------------------------------------------------------
+
+// TestKeyScheduleExternalKeyPairMatchesTheMlswgKeySchedule pins external_pub against the
+// answer mlswg published for every epoch of the corpus.
+//
+// external_secret is 32 pseudorandom bytes and so is every other secret of the epoch, so
+// DeriveKeyPair over the wrong one answers a perfectly well formed public key of the right
+// length. Nothing about the value says which secret it came from, which is why the published
+// answer is what holds this.
+func TestKeyScheduleExternalKeyPairMatchesTheMlswgKeySchedule(t *testing.T) {
+	compared := 0
+	for _, epoch := range ksVectorEpochs(t) {
+		_, pub, err := epoch.schedule(t).ExternalKeyPair()
+		if err != nil {
+			t.Fatalf("%s: ExternalKeyPair: %v", epoch.at, err)
+		}
+		assertLabelKat(t, "external_pub"+epoch.at, pub, epoch.published.ExternalPub)
+		compared++
+	}
+	if compared != keyScheduleKatEpochs {
+		t.Fatalf("compared %d published external_pub answers, want %d", compared, keyScheduleKatEpochs)
+	}
+}
+
+// TestKeyScheduleExternalKeyPairIsDerivedFromTheExternalSecretAndNothingElse states the same
+// claim independently of the corpus, and states it as an exclusion rather than as an equality.
+//
+// The candidate set is read off the type by reflection — the nine derived secrets, plus the
+// three other byte slices the epoch keeps — so a tenth secret joins by existing rather than by
+// somebody remembering to add it here. Exactly one candidate may reproduce the answered public
+// key, and it must be external_secret. That is what a KAT alone cannot say: a KAT compares one
+// value and is silent about which of twelve equally well formed inputs produced it, so on the
+// day the corpus is re-vendored or a suite is added, this is the statement that still holds.
+func TestKeyScheduleExternalKeyPairIsDerivedFromTheExternalSecretAndNothingElse(t *testing.T) {
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		_, pub, err := schedule.ExternalKeyPair()
+		if err != nil {
+			t.Fatalf("%s: ExternalKeyPair: %v", epoch.at, err)
+		}
+		candidates := map[string][]byte{
+			"epoch_secret":        epochSecretOfTheEpoch(t, epoch),
+			"joiner_secret":       schedule.JoinerSecret(),
+			"welcome_secret":      schedule.WelcomeSecret(),
+			"group_context_bytes": schedule.GroupContextBytes(),
+		}
+		for name, secret := range epochSecretsByField(t, schedule.Secrets()) {
+			candidates["EpochSecrets."+name] = secret
+		}
+		if len(candidates) < 13 {
+			t.Fatalf("%s: the epoch reads as %d candidate inputs, and it keeps the nine derived secrets plus four more",
+				epoch.at, len(candidates))
+		}
+		matched := []string{}
+		for name, ikm := range candidates {
+			if len(ikm) == 0 {
+				continue
+			}
+			_, candidatePub, deriveErr := epoch.crypto.DeriveKeyPair(ikm)
+			if deriveErr != nil {
+				t.Fatalf("%s: DeriveKeyPair over %s: %v", epoch.at, name, deriveErr)
+			}
+			if bytes.Equal(candidatePub, pub) {
+				matched = append(matched, name)
+			}
+		}
+		if want := []string{"EpochSecrets.External"}; !slices.Equal(slices.Sorted(slices.Values(matched)), want) {
+			t.Errorf("%s: external_pub is DeriveKeyPair of %v, and RFC 9420 section 8 derives it from external_secret and nothing else",
+				epoch.at, matched)
+		}
+	}
+}
+
+// TestKeyScheduleExternalKeyPairIsDeterministicAndItsTwoHalvesAgree covers the half of this
+// method the corpus is silent about.
+//
+// key-schedule.json publishes external_pub and no private key, so a body that answered the
+// right public key beside an unrelated private one passes every comparison above. What says the
+// two halves are halves of one pair is a seal to the public key opened with the private one,
+// and that is not a round trip of this function — it goes out through HPKE and comes back.
+//
+// Determinism is the other claim and it is not implied by the first: a body that sampled a
+// fresh pair per call would still seal and open, and would answer a different external_pub
+// every time it was asked. Nothing in this derivation may read entropy.
+func TestKeyScheduleExternalKeyPairIsDeterministicAndItsTwoHalvesAgree(t *testing.T) {
+	info := []byte("the info every external key pair row carries")
+	aad := []byte("the aad every external key pair row carries")
+	plaintext := []byte("sealed to external_pub, opened with the half nobody published")
+	for _, epoch := range ksVectorEpochs(t) {
+		schedule := epoch.schedule(t)
+		firstPriv, firstPub, err := schedule.ExternalKeyPair()
+		if err != nil {
+			t.Fatalf("%s: ExternalKeyPair: %v", epoch.at, err)
+		}
+		secondPriv, secondPub, err := schedule.ExternalKeyPair()
+		if err != nil {
+			t.Fatalf("%s: ExternalKeyPair a second time: %v", epoch.at, err)
+		}
+		if !bytes.Equal(firstPub, secondPub) || !bytes.Equal(firstPriv, secondPriv) {
+			t.Errorf("%s: two calls answered different key pairs, so something in this derivation reads entropy and every member of the epoch would hold a different external_pub",
+				epoch.at)
+			continue
+		}
+		if len(firstPriv) == 0 || len(firstPub) == 0 {
+			t.Fatalf("%s: ExternalKeyPair answered a %d byte private key and a %d byte public key",
+				epoch.at, len(firstPriv), len(firstPub))
+		}
+		// the private half is the private half OF THAT public key
+		kemOutput, ciphertext, err := epoch.crypto.HpkeSeal(firstPub, info, aad, plaintext)
+		if err != nil {
+			t.Fatalf("%s: seal to external_pub: %v", epoch.at, err)
+		}
+		opened, err := epoch.crypto.HpkeOpen(secondPriv, kemOutput, info, aad, ciphertext)
+		if err != nil {
+			t.Errorf("%s: the private key this method answered does not open a message sealed to the public key it answered beside it: %v",
+				epoch.at, err)
+			continue
+		}
+		if !bytes.Equal(opened, plaintext) {
+			t.Errorf("%s: opening with the answered private key produced %x, want %x", epoch.at, opened, plaintext)
+		}
+		// and DeriveKeyPair was applied rather than external_secret handed back under a
+		// different name
+		external := schedule.Secrets().External
+		if bytes.Equal(firstPriv, external) {
+			t.Errorf("%s: the external private key IS external_secret, so DeriveKeyPair is not being applied to it", epoch.at)
+		}
+		if len(external) != 0 && &external[0] == &firstPriv[0] {
+			t.Errorf("%s: the external private key is a view over external_secret, which the epoch erases when it ages out of PastEpochWindow",
+				epoch.at)
+		}
 	}
 }

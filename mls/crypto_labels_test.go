@@ -179,9 +179,14 @@ type labelKatSchedule struct {
 	Epochs            []labelKatEpoch `json:"epochs"`
 }
 
-// One epoch of the key schedule. Only the fields reachable with this task's own
-// primitives are read: the joiner and epoch secrets are ExpandWithLabel over the 112 byte
-// group context, and the rest are DeriveSecret over the epoch secret.
+// One epoch of the key schedule. Nearly every field is reachable with this task's own
+// primitives: the joiner and epoch secrets are ExpandWithLabel over the 112 byte group
+// context, and the named secrets are DeriveSecret over the epoch secret.
+//
+// ExternalPub is the exception and is read here rather than in a file of its own. It is the
+// only field of the epoch that is not a kdf output at all -- it is DeriveKeyPair over
+// external_secret, which is HPKE -- so the primitives sweep below leaves it alone and the key
+// schedule's own TestKeyScheduleExternalKeyPairMatchesTheMlswgKeySchedule is what compares it.
 type labelKatEpoch struct {
 	GroupContext       string           `json:"group_context"`
 	CommitSecret       string           `json:"commit_secret"`
@@ -197,6 +202,7 @@ type labelKatEpoch struct {
 	MembershipKey      string           `json:"membership_key"`
 	ResumptionPsk      string           `json:"resumption_psk"`
 	EpochAuthenticator string           `json:"epoch_authenticator"`
+	ExternalPub        string           `json:"external_pub"`
 	Exporter           labelKatExporter `json:"exporter"`
 }
 
