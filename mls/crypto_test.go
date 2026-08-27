@@ -3104,6 +3104,23 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{key, nonce}
 		}},
+		// the two transcript hash arithmetics. Every argument either one is handed is read
+		// again after the call: the previous epoch's interim hash is the group's own and is
+		// still needed if the commit turns out to be invalid, the serialized
+		// ConfirmedTranscriptHashInput is the framed commit the caller goes on to verify a
+		// signature over, and the confirmation tag is compared against a freshly computed one
+		// afterwards. An answer cut from an argument would be worse still -- it would alias
+		// the transcript the group carries into every later epoch.
+		{name: "ConfirmedTranscriptHash", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{ConfirmedTranscriptHash(crypto, take(initSecretPrev), take(plaintext))}
+		}},
+		{name: "InterimTranscriptHash", call: func(take func([]byte) []byte) [][]byte {
+			interim, interimErr := InterimTranscriptHash(crypto, take(initSecretPrev), take(commitSecret))
+			if interimErr != nil {
+				t.Fatalf("InterimTranscriptHash: %v", interimErr)
+			}
+			return [][]byte{interim}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3503,6 +3520,8 @@ var providerConstructionValues = map[string]any{
 	"WelcomeKeyNonce":               WelcomeKeyNonce,
 	"PskSecret":                     PskSecret,
 	"EmptyPskSecret":                EmptyPskSecret,
+	"ConfirmedTranscriptHash":       ConfirmedTranscriptHash,
+	"InterimTranscriptHash":         InterimTranscriptHash,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3704,6 +3723,16 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		// It is stored and handed back rather than expanded over, so any bytes will do,
 		// and a length no MLS field has keeps it from being read as anything else.
 		"encodedGroupContext": ascendingBytes(0x77, 37),
+		// the section 8.2 transcript arithmetic's four. The two hashes and the tag are at
+		// exactly KDF.Nh because that is what an interim transcript hash and a MAC are, and
+		// the serialized ConfirmedTranscriptHashInput at a length no other row carries so a
+		// construction that read the wrong one of them is not answered by its neighbour.
+		// All four distinct, on the rule the epoch's four secrets are held to: a hash taken
+		// over the right number of bytes from the wrong argument is a fork, not an error.
+		"interimBefore":                ascendingBytes(0x88, params.Nh),
+		"confirmedAfter":               ascendingBytes(0x99, params.Nh),
+		"confirmationTag":              ascendingBytes(0xaa, params.Nh),
+		"confirmedTranscriptHashInput": ascendingBytes(0xbb, 41),
 		// the epoch binding the joiner derivation expands over. Every field carries
 		// something, so the perturbation below has a field to move and an encoder that
 		// dropped one is not hidden by that field being empty to begin with.

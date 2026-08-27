@@ -570,6 +570,13 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// limit would be a psk_secret derived over a label no member with the default
 		// limit could construct.
 		"psk.go: syntax.NewWriter()",
+		// the InterimTranscriptHashInput preimage of section 8.2, whose one field is the
+		// confirmation tag written as an opaque<V>. The default limit and not the ratchet
+		// tree one: a MAC is KDF.Nh octets, and an interim transcript hash taken over a tag
+		// that had been allowed past MaxVectorLength is a transcript no peer running the
+		// default limit could have computed -- which is the one disagreement in MLS a group
+		// does not recover from, since every confirmation tag afterwards is taken over it.
+		"transcript.go: syntax.NewWriter()",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
@@ -1406,6 +1413,24 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("PskSecret: %v", pskErr)
 			}
 			return secret
+		}},
+		// the two transcript hash arithmetics. Each reaches the provider once, for the hash,
+		// and that call is invisible in the answer: a transcript hash computed with a
+		// provider of its own is a well formed 32 bytes that agrees with mlswg's whole
+		// transcript-hashes corpus, because that corpus is at the suite it would have
+		// hardcoded. It matters more here than anywhere else in this table -- the transcript
+		// is the one value a group cannot disagree about and recover from, so a hash taken
+		// under a suite of the construction's own choosing is a permanent fork rather than a
+		// retryable failure.
+		{name: "ConfirmedTranscriptHash", call: func(crypto CryptoProvider) []byte {
+			return ConfirmedTranscriptHash(crypto, value, []byte("a serialized ConfirmedTranscriptHashInput"))
+		}},
+		{name: "InterimTranscriptHash", call: func(crypto CryptoProvider) []byte {
+			interim, interimErr := InterimTranscriptHash(crypto, value, bytes.Repeat([]byte{0x84}, 32))
+			if interimErr != nil {
+				t.Fatalf("InterimTranscriptHash: %v", interimErr)
+			}
+			return interim
 		}},
 	} {
 		covered = append(covered, testCase.name)

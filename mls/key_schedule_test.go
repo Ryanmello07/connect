@@ -3985,6 +3985,23 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{key, nonce}
 		}},
+		// the two transcript hash arithmetics, which answer the provider's hash and nothing
+		// else, so both are KDF.Nh wide at either width. What this equivalence reads here is
+		// a truncation: a body ending in [:32], or one that built its answer into a written
+		// down 32 byte array, answers 32 over both providers. A truncated transcript hash is
+		// not a weak hash -- it is a shorter preimage that every member of the group would
+		// agree on and no other implementation would.
+		{name: "ConfirmedTranscriptHash", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return [][]byte{ConfirmedTranscriptHash(crypto, value, plaintext)}
+		}},
+		{name: "InterimTranscriptHash", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			interim, interimErr := InterimTranscriptHash(crypto, value,
+				bytes.Repeat([]byte{0x84}, crypto.HashSize()))
+			if interimErr != nil {
+				t.Fatalf("InterimTranscriptHash over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), interimErr)
+			}
+			return [][]byte{interim}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })
