@@ -3111,6 +3111,20 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{key, nonce}
 		}},
+		// the sender data key and nonce. The CIPHERTEXT is the argument that matters here
+		// and it is why this row exists at all: it is the framing layer's outgoing
+		// message, which the caller goes on to write into the wire format after this
+		// call, and this construction takes a SLICE of it as the kdf context. A body that
+		// reused that slice as scratch would corrupt the message it is protecting, and an
+		// answer cut from it would be an aead key aliasing bytes that go out on the wire.
+		// Both answers are read for the reason WelcomeKeyNonce's row reads both.
+		{name: "SenderDataKeyNonce", call: func(take func([]byte) []byte) [][]byte {
+			key, nonce, senderErr := SenderDataKeyNonce(crypto, take(welcomeSecret), take(value))
+			if senderErr != nil {
+				t.Fatalf("SenderDataKeyNonce: %v", senderErr)
+			}
+			return [][]byte{key, nonce}
+		}},
 		// the two transcript hash arithmetics. Every argument either one is handed is read
 		// again after the call: the previous epoch's interim hash is the group's own and is
 		// still needed if the commit turns out to be invalid, the serialized
@@ -3548,6 +3562,7 @@ var providerConstructionValues = map[string]any{
 	"ConfirmedTranscriptHash":       ConfirmedTranscriptHash,
 	"InterimTranscriptHash":         InterimTranscriptHash,
 	"NewSecretTree":                 NewSecretTree,
+	"SenderDataKeyNonce":            SenderDataKeyNonce,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3817,6 +3832,22 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		"leafCount":        LeafCount(8),
 		"encryptionSecret": ascendingBytes(0xcc, params.Nh),
 		"generation":       uint32(7),
+		// the sender data pair's two, scoped to the operation so a second construction
+		// with a ciphertext parameter cannot be served these bytes by accident. The secret
+		// is exactly KDF.Nh because the construction refuses every other length, and a
+		// refused call is a row that observed nothing.
+		//
+		// The CIPHERTEXT is exactly KDF.Nh as well, which is a choice this gate has to make
+		// rather than one it can avoid. RFC 9420 section 6.3.2 samples the first KDF.Nh
+		// bytes and no more, so a longer ciphertext would put this gate's middle and last
+		// perturbations outside the sample -- where an answer that does not move is the RFC
+		// working rather than a stub, and would be reported as "does not read the ciphertext
+		// it was handed". At exactly KDF.Nh every byte of the argument enters the
+		// derivation, which is the property this gate states. Where the sample BOUNDARY is
+		// held instead is TestSenderDataKeyNonceSamplesExactlyTheFirstNhBytes, which sweeps
+		// every byte of three ciphertext lengths in both directions.
+		"SenderDataKeyNonce.senderDataSecret": ascendingBytes(0xdd, params.Nh),
+		"SenderDataKeyNonce.ciphertext":       ascendingBytes(0xee, params.Nh),
 	}
 	// the keys and the answers the receiving operations are handed, computed over a
 	// provider of this gate's own so that the operation under test still draws from a

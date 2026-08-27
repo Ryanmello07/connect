@@ -118,4 +118,13 @@ var (
 	// ErrRatchetExhausted is returned when a ratchet has produced generation 2^32-1 and
 	// has no successor to step to.
 	ErrRatchetExhausted = errors.New("mls: ratchet generation space exhausted")
+
+	// ErrUnknownContentType is returned when a framing ContentType has no ratchet: RFC 9420
+	// registers three, and 0 is reserved. It is a refusal rather than a default because a
+	// default arm would hand an unregistered code point generation 0 of a real ratchet, so a
+	// peer could consume a leaf's handshake generations by naming a content type nobody has
+	// defined. The framing layer decodes the octet off the wire, so this is the shape an
+	// attacker chosen header arrives in and the caller has to be able to tell it from a key
+	// that no longer exists.
+	ErrUnknownContentType = errors.New("mls: no ratchet for this content type")
 )

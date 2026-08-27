@@ -538,6 +538,7 @@ var keyScheduleOwnedErrors = map[string]error{
 	"ErrRatchetGenerationTooFarAhead":          ErrRatchetGenerationTooFarAhead,
 	"ErrRatchetExhausted":                      ErrRatchetExhausted,
 	"errRatchetTypeHasNoRoot":                  errRatchetTypeHasNoRoot,
+	"ErrUnknownContentType":                    ErrUnknownContentType,
 }
 
 // TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile derives the class the two sweeps
@@ -595,10 +596,13 @@ func TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile(t *testing.T) {
 // deliberately, in the same commit, with a reason. What stops the list shrinking, and what
 // stops it lagging behind the file, is the derivation above rather than this number.
 //
-// Fourteen rather than the ten of registry section 5.6, and all four extras are here for one
+// Sixteen rather than the ten of registry section 5.6, and all six extras are here for one
 // reason: a second declaration site is how two sentinels for one condition happen.
 // ErrNilGroupContext and ErrNilCryptoProvider name an argument that was missing rather than a
-// protocol condition. ErrEpochErased names a state of the epoch itself.
+// protocol condition. ErrEpochErased names a state of the epoch itself. ErrUnknownContentType
+// names a framing code point with no ratchet behind it, and is declared here rather than
+// beside the ContentType it refuses for the same reason: this file is the secret tree's
+// declaration site, and the refusal is the secret tree's.
 // errSecretTreeDescentDidNotStoreTheTarget and errRatchetTypeHasNoRoot are the file's two
 // unexported names, and both are unexported on purpose: each is wrapped alongside an exported
 // sentinel so no caller has to know it exists, and each exists so a test can tell one
@@ -607,8 +611,8 @@ func TestKeyScheduleOwnedErrorsIsEveryDeclarationOfItsFile(t *testing.T) {
 // sweeps below like every other declaration of that file, which is what the derivation above
 // is for.
 func TestKeyScheduleErrorsAreDistinct(t *testing.T) {
-	if len(keyScheduleOwnedErrors) != 15 {
-		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext, ErrEpochErased, ErrNilCryptoProvider and the two unexported invariant names errSecretTreeDescentDidNotStoreTheTarget and errRatchetTypeHasNoRoot", len(keyScheduleOwnedErrors))
+	if len(keyScheduleOwnedErrors) != 16 {
+		t.Fatalf("this plan owns %d errors, want the 10 of registry section 5.6 plus ErrNilGroupContext, ErrEpochErased, ErrNilCryptoProvider, ErrUnknownContentType and the two unexported invariant names errSecretTreeDescentDidNotStoreTheTarget and errRatchetTypeHasNoRoot", len(keyScheduleOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(keyScheduleOwnedErrors))
 	for i, name := range names {
@@ -3694,6 +3698,12 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 	// TestWelcomeKeyNonceReadsBothLengthsOffTheProviderItWasHanded, whose provider moves Nk
 	// and Nn rather than Nh.
 	"WelcomeKeyNonce": "answers an aead key at Nk and an aead nonce at Nn, neither of which is KDF.Nh; Nk coincides with Nh at 32 under the narrow suite",
+	// the same two answers under the same coincidence, and the same remedy: what holds
+	// these lengths to the provider is
+	// TestSenderDataKeyNonceReadsBothLengthsOffTheProviderItWasHanded, whose provider
+	// moves Nk and Nn rather than Nh. That test also holds the length this one cannot
+	// reach at all -- the ciphertext SAMPLE is KDF.Nh bytes and appears in no answer.
+	"SenderDataKeyNonce": "answers an aead key at Nk and an aead nonce at Nn, neither of which is KDF.Nh; Nk coincides with Nh at 32 under the narrow suite",
 }
 
 // scheduleAnswersThatAreNotKdfLengths names one ANSWER of an exported method of *KeySchedule
@@ -4011,6 +4021,21 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 				t.Fatalf("takeLeafSecret: %v", takeErr)
 			}
 			return [][]byte{leafSecret}
+		}},
+		// the sender data key and nonce. Its secret is read off the provider under test
+		// rather than written 32, so this row exercises the length refusal as well: a body
+		// comparing against a literal 32 refuses the wide provider's secret outright and is
+		// reported as a panic rather than as a length. The two ANSWERS are Nk and Nn and
+		// are excused from the equivalence below for the reason WelcomeKeyNonce is; what
+		// this row still holds is that the construction survives the wider kdf at all,
+		// which a written down sample length does not.
+		{name: "SenderDataKeyNonce", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			key, nonce, senderErr := SenderDataKeyNonce(crypto,
+				bytes.Repeat([]byte{0x85}, crypto.HashSize()), value)
+			if senderErr != nil {
+				t.Fatalf("SenderDataKeyNonce over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), senderErr)
+			}
+			return [][]byte{key, nonce}
 		}},
 		// the two transcript hash arithmetics, which answer the provider's hash and nothing
 		// else, so both are KDF.Nh wide at either width. What this equivalence reads here is

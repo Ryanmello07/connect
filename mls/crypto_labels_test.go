@@ -1450,6 +1450,20 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 			}
 			return leafSecret
 		}},
+		// the sender data key and nonce. Both halves are read rather than the key alone,
+		// for the reason WelcomeKeyNonce's row reads both: a body that routed the key
+		// through the provider it was handed and the nonce through one of its own is a
+		// nonce every group in the world derives identically, and one answer would not
+		// see it. The ciphertext is longer than any registered KDF.Nh so the sample is a
+		// real cut rather than the whole argument.
+		{name: "SenderDataKeyNonce", call: func(crypto CryptoProvider) []byte {
+			key, nonce, senderErr := SenderDataKeyNonce(crypto,
+				bytes.Repeat([]byte{0x85}, crypto.HashSize()), value)
+			if senderErr != nil {
+				t.Fatalf("SenderDataKeyNonce: %v", senderErr)
+			}
+			return slices.Concat(key, nonce)
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		tagging := &taggingCryptoProvider{inner: plain}

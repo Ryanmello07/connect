@@ -55,6 +55,7 @@ package mls
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -4055,5 +4056,816 @@ func TestNoTwoCallersAreHandedOneGenerationUnderConcurrentSenders(t *testing.T) 
 					one.leaf, one.kind, generation)
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task 23a: the MessageKeySource surface, and task 24: the sender data key
+// ---------------------------------------------------------------------------
+
+// stContentTypeCodePoints is every value a ContentType can hold, derived from the width of
+// the underlying type rather than from a written 256, for the reason stRatchetTypeCodePoints
+// is: a type widened sweeps the wider space with nothing here to edit.
+func stContentTypeCodePoints() int {
+	return int(^ContentType(0)) + 1
+}
+
+// stRatchetTypeOfContentType is the mapping RFC 9420 section 9.1 states, written here so the
+// sweeps below compare the implementation against the RFC rather than against itself. A table
+// derived from ratchetTypeOf would agree with every possible ratchetTypeOf.
+var stRatchetTypeOfContentType = map[ContentType]RatchetType{
+	ContentTypeApplication: RatchetApplication,
+	ContentTypeProposal:    RatchetHandshake,
+	ContentTypeCommit:      RatchetHandshake,
+}
+
+// TestContentTypeCarriesTheWireValuesTheRegistryGivesIt holds the three code points, which the
+// compile time pins in key_schedule_deps_test.go cannot: a constant retyped is a build failure
+// there, and a constant whose VALUE moved is a number that still compiles everywhere.
+//
+// It matters because this package declares ContentType on p6's behalf. Two declarations of one
+// wire enum that disagree by a number are the exact drift that arrangement risks, and this is
+// the assertion that turns it into a failure -- a p6 that lands with ContentTypeApplication at
+// 0 collides with this file rather than quietly re-routing every application message.
+//
+// The set is DERIVED off the type through the package's own type checker rather than listed,
+// so a fourth code point added to content_type.go and left out of stRatchetTypeOfContentType
+// is reported here instead of being skipped by every sweep below.
+func TestContentTypeCarriesTheWireValuesTheRegistryGivesIt(t *testing.T) {
+	if got := stContentTypeCodePoints(); got != 256 {
+		t.Fatalf("ContentType holds %d code points, and RFC 9420 gives it one octet", got)
+	}
+	derived := registryConstantsOfType(t, "ContentType")
+	want := map[string]uint64{
+		"ContentTypeApplication": 1,
+		"ContentTypeProposal":    2,
+		"ContentTypeCommit":      3,
+	}
+	if len(derived) != len(want) {
+		t.Errorf("the derivation read %v off ContentType, and RFC 9420 section 6 registers %v",
+			derived, want)
+	}
+	for name, value := range want {
+		got, declared := derived[name]
+		if !declared {
+			t.Errorf("this package declares no %s, which the interface registry names", name)
+			continue
+		}
+		if got != value {
+			t.Errorf("%s = %d, want %d; a code point that moved re-routes every message of that type",
+				name, got, value)
+		}
+	}
+	// and the reserved zero is not one of them, which is what makes an unparsed header a
+	// refusal rather than generation 0 of a real ratchet.
+	for name, value := range derived {
+		if value == 0 {
+			t.Errorf("%s is 0, and 0 is the reserved content type", name)
+		}
+	}
+	// the mapping table this file's sweeps run over covers exactly the declared set.
+	for name := range derived {
+		found := false
+		for contentType := range stRatchetTypeOfContentType {
+			if uint64(contentType) == derived[name] {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s is declared and stRatchetTypeOfContentType has no row for it, so every sweep below skips it",
+				name)
+		}
+	}
+	if len(stRatchetTypeOfContentType) != len(derived) {
+		t.Errorf("stRatchetTypeOfContentType holds %d rows and ContentType declares %d code points",
+			len(stRatchetTypeOfContentType), len(derived))
+	}
+}
+
+// TestNextMessageKeyMapsContentTypeToRatchet asserts application content reaches the
+// application ratchet and both handshake content types reach the handshake ratchet.
+//
+// Getting this mapping wrong would encrypt a commit under an application key that a receiver
+// looks up in the other ratchet, and the failure would read as a bad tag -- that is, as
+// tampering rather than as a bug.
+//
+// Two halves. The first compares NextMessageKey against NextSenderKey at the ratchet type the
+// RFC names, over a second tree at the same encryption secret; it is the plan's own test and
+// it catches every rerouting of the mapping that was tried against it -- application onto the
+// handshake ratchet, the handshake pair onto the application one, and proposal split off
+// alone. Measured, not assumed: the plan's version of this test is a real one.
+//
+// The second half states the sharing DIRECTLY rather than through the ratchet type name. All
+// three content types go to ONE leaf, so proposal and commit have to come back as consecutive
+// generations of a single keystream -- read off an independent tree -- and application has to
+// come back different. That is what "proposals and commits share the handshake ratchet"
+// means, and it is a stronger statement than "both name RatchetHandshake": two ratchet types
+// seeded from one root would satisfy the first half and hand two senders one keystream. No
+// single edit of secret_tree.go separates the two, which is why this is written as the
+// property rather than left to the mapping -- the shape it guards against arrives as a THIRD
+// ratchet type, and a third ratchet type is how stRatchetKinds came to be derived rather than
+// listed.
+func TestNextMessageKeyMapsContentTypeToRatchet(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+
+	viaContentType, err := NewSecretTree(crypto, LeafCount(8), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	viaRatchetType, err := NewSecretTree(crypto, LeafCount(8), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+
+	leaf := LeafIndex(0)
+	for _, contentType := range slices.Sorted(maps.Keys(stRatchetTypeOfContentType)) {
+		kind := stRatchetTypeOfContentType[contentType]
+		gotKey, gotNonce, gotGeneration, err := viaContentType.NextMessageKey(contentType, leaf)
+		if err != nil {
+			t.Fatalf("NextMessageKey(%d): %v", contentType, err)
+		}
+		wantGeneration, wantKey, wantNonce, err := viaRatchetType.NextSenderKey(leaf, kind)
+		if err != nil {
+			t.Fatalf("NextSenderKey: %v", err)
+		}
+		if gotGeneration != wantGeneration {
+			t.Fatalf("content type %d: generation = %d, want %d", contentType, gotGeneration, wantGeneration)
+		}
+		if !bytes.Equal(gotKey, wantKey) || !bytes.Equal(gotNonce, wantNonce) {
+			t.Fatalf("content type %d does not map to ratchet type %d", contentType, kind)
+		}
+		leaf++
+	}
+
+	// the second half, on one leaf: which content types SHARE a ratchet.
+	shared := stNewTree(t, 8)
+	const onOneLeaf = LeafIndex(5)
+	type drawn struct {
+		key        []byte
+		nonce      []byte
+		generation uint32
+	}
+	answers := map[ContentType]drawn{}
+	for _, contentType := range slices.Sorted(maps.Keys(stRatchetTypeOfContentType)) {
+		key, nonce, generation, err := shared.NextMessageKey(contentType, onOneLeaf)
+		if err != nil {
+			t.Fatalf("NextMessageKey(%d) on one leaf: %v", contentType, err)
+		}
+		answers[contentType] = drawn{key: key, nonce: nonce, generation: generation}
+	}
+	if answers[ContentTypeApplication].generation != 0 {
+		t.Errorf("application content drew generation %d of its own ratchet, want 0",
+			answers[ContentTypeApplication].generation)
+	}
+	if answers[ContentTypeProposal].generation != 0 || answers[ContentTypeCommit].generation != 1 {
+		t.Errorf("proposal drew generation %d and commit drew %d off one leaf; sharing the handshake ratchet means consecutive generations of it, and two 0s would mean two ratchets",
+			answers[ContentTypeProposal].generation, answers[ContentTypeCommit].generation)
+	}
+	// and the keys themselves, so a shared generation COUNTER over two separate keystreams
+	// does not read as a shared ratchet. The commit's key has to be the handshake ratchet's
+	// generation 1, which this reads independently off a second tree.
+	independent := stNewTree(t, 8)
+	if _, _, _, err := independent.NextSenderKey(onOneLeaf, RatchetHandshake); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	wantGeneration, wantKey, wantNonce, err := independent.NextSenderKey(onOneLeaf, RatchetHandshake)
+	if err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	if wantGeneration != 1 {
+		t.Fatalf("the independent handshake ratchet is at generation %d, want 1", wantGeneration)
+	}
+	if !bytes.Equal(answers[ContentTypeCommit].key, wantKey) ||
+		!bytes.Equal(answers[ContentTypeCommit].nonce, wantNonce) {
+		t.Error("a commit sent after a proposal on one leaf did not draw generation 1 of that leaf's handshake ratchet, so the two content types are not sharing one keystream")
+	}
+	if bytes.Equal(answers[ContentTypeApplication].key, answers[ContentTypeProposal].key) {
+		t.Error("application and proposal content drew the same key off one leaf, which is one keystream protecting two message streams")
+	}
+}
+
+// TestNextMessageKeyAndMessageKeyAgreeOnTheGenerationTheSenderSent is the round trip the
+// framing layer actually makes: one member encrypts at the generation NextMessageKey returns,
+// another looks that generation up with MessageKey, and the two have to be the same key and
+// nonce or the AEAD refuses a message nobody tampered with.
+//
+// It is the assertion that fails if the two wrappers ever disagree about the ContentType to
+// RatchetType mapping -- each is self consistent under a wrong shared mapping, and neither of
+// the mapping tests above compares the encrypt path against the decrypt path.
+func TestNextMessageKeyAndMessageKeyAgreeOnTheGenerationTheSenderSent(t *testing.T) {
+	crypto := stTestCrypto(t)
+	encryptionSecret := MustHex(t, stVectorEncryptionSecret)
+	sender, err := NewSecretTree(crypto, LeafCount(8), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	receiver, err := NewSecretTree(crypto, LeafCount(8), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	const leaf = LeafIndex(2)
+	for _, contentType := range slices.Sorted(maps.Keys(stRatchetTypeOfContentType)) {
+		for range 3 {
+			key, nonce, generation, err := sender.NextMessageKey(contentType, leaf)
+			if err != nil {
+				t.Fatalf("NextMessageKey(%d): %v", contentType, err)
+			}
+			gotKey, gotNonce, err := receiver.MessageKey(contentType, leaf, generation)
+			if err != nil {
+				t.Fatalf("MessageKey(%d, %d): %v", contentType, generation, err)
+			}
+			if !bytes.Equal(key, gotKey) || !bytes.Equal(nonce, gotNonce) {
+				t.Fatalf("content type %d generation %d: the receiver looked up a different key than the sender used",
+					contentType, generation)
+			}
+			receiver.EraseMessageKey(contentType, leaf, generation)
+		}
+	}
+}
+
+// TestNextMessageKeyRefusesEveryContentTypeWithNoRatchet sweeps the WHOLE code point space
+// rather than the two values the plan's version probed.
+//
+// The class is derived twice over and the two derivations are compared: the code points come
+// from the width of the type, and which of them is legal comes from the constants the package
+// declares. A fourth content type wired into ratchetTypeOf and left out of content_type.go is
+// reported here, and so is a content type declared and not wired in -- the plan's version,
+// which probed 0 and 9, would report neither.
+//
+// Both wrappers are swept and so is the erase, because "refused" has to mean the same thing on
+// all three: a NextMessageKey that refused and a MessageKey that answered would let a peer draw
+// a real ratchet's generation 0 by naming a code point nobody has defined.
+func TestNextMessageKeyRefusesEveryContentTypeWithNoRatchet(t *testing.T) {
+	legal := map[ContentType]bool{}
+	for name, value := range registryConstantsOfType(t, "ContentType") {
+		if value >= uint64(stContentTypeCodePoints()) {
+			t.Fatalf("%s = %d does not fit the type's own width", name, value)
+		}
+		legal[ContentType(value)] = true
+	}
+	if len(legal) == 0 {
+		t.Fatal("no ContentType constant was derived, so this sweep would refuse every code point and pass")
+	}
+	refused, accepted := 0, 0
+	for point := range stContentTypeCodePoints() {
+		contentType := ContentType(point)
+		tree := stNewTree(t, 8)
+		_, _, _, nextErr := tree.NextMessageKey(contentType, 0)
+		_, _, lookupErr := tree.MessageKey(contentType, 1, 0)
+		if legal[contentType] {
+			if nextErr != nil {
+				t.Errorf("content type %d is declared and NextMessageKey refused it: %v", contentType, nextErr)
+			}
+			if lookupErr != nil {
+				t.Errorf("content type %d is declared and MessageKey refused it: %v", contentType, lookupErr)
+			}
+			accepted++
+			continue
+		}
+		if !errors.Is(nextErr, ErrUnknownContentType) {
+			t.Errorf("NextMessageKey(%d) answered %v, want ErrUnknownContentType", contentType, nextErr)
+		}
+		if !errors.Is(lookupErr, ErrUnknownContentType) {
+			t.Errorf("MessageKey(%d) answered %v, want ErrUnknownContentType", contentType, lookupErr)
+		}
+		// and the erase, which cannot report and must therefore be observed by what it does
+		// NOT do: build a ratchet for a content type that has none.
+		erasing := stNewTree(t, 8)
+		erasing.EraseMessageKey(contentType, 3, 0)
+		if len(erasing.ratchets) != 0 {
+			t.Errorf("EraseMessageKey(%d) built %d ratchets for a content type with none",
+				contentType, len(erasing.ratchets))
+		}
+		refused++
+	}
+	if accepted != len(legal) {
+		t.Errorf("%d of the %d declared content types were accepted", accepted, len(legal))
+	}
+	if refused != stContentTypeCodePoints()-len(legal) {
+		t.Errorf("%d code points were refused, want %d", refused, stContentTypeCodePoints()-len(legal))
+	}
+}
+
+// TestMessageKeyDoesNotConsumeUntilErased asserts a lookup can be repeated until the caller
+// erases it.
+//
+// The framing layer opens the AEAD between the two calls, so a MessageKey that consumed would
+// lose a real message every time a forged one arrived first: one packet from anyone who can
+// write to the network, and the generation the honest sender used is gone.
+func TestMessageKeyDoesNotConsumeUntilErased(t *testing.T) {
+	tree := stNewTree(t, 8)
+	first, firstNonce, err := tree.MessageKey(ContentTypeApplication, 3, 2)
+	if err != nil {
+		t.Fatalf("MessageKey: %v", err)
+	}
+	if stAllZero(first) || stAllZero(firstNonce) {
+		t.Fatal("the first lookup answered zeros, so the comparison below would hold against an implementation that answers nothing")
+	}
+	second, secondNonce, err := tree.MessageKey(ContentTypeApplication, 3, 2)
+	if err != nil {
+		t.Fatalf("second MessageKey: %v", err)
+	}
+	if !bytes.Equal(first, second) || !bytes.Equal(firstNonce, secondNonce) {
+		t.Fatal("two lookups of one generation disagreed")
+	}
+
+	tree.EraseMessageKey(ContentTypeApplication, 3, 2)
+	if _, _, err := tree.MessageKey(ContentTypeApplication, 3, 2); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("err after erase = %v, want ErrRatchetGenerationConsumed", err)
+	}
+	// the erase is scoped to the generation it names: the neighbours a repeated lookup would
+	// also have retained are still there, so an erase that cleared the window would be caught
+	// here rather than read as forward secrecy.
+	if _, _, err := tree.MessageKey(ContentTypeApplication, 3, 1); err != nil {
+		t.Errorf("erasing generation 2 also took generation 1: %v", err)
+	}
+	// and ReceiverKey, which shares the ratchet, keeps its single use semantics across the
+	// split that made MessageKey repeatable.
+	if _, _, err := tree.ReceiverKey(3, RatchetApplication, 0); err != nil {
+		t.Fatalf("ReceiverKey: %v", err)
+	}
+	if _, _, err := tree.ReceiverKey(3, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Errorf("ReceiverKey answered generation 0 twice: %v", err)
+	}
+}
+
+// TestEraseMessageKeyZeroizesTheEntry asserts the erase clears the BYTES rather than only
+// dropping the map entry, which is the whole point of it existing.
+//
+// The three guards before the erase are what stop this from holding against an implementation
+// that answers nothing: a key of the wrong width, a key that was already zeros, or a key and a
+// nonce that are one array would all satisfy a pair of "is every byte zero" loops.
+func TestEraseMessageKeyZeroizesTheEntry(t *testing.T) {
+	crypto := stTestCrypto(t)
+	tree := stNewTree(t, 8)
+	key, nonce, err := tree.MessageKey(ContentTypeCommit, 4, 1)
+	if err != nil {
+		t.Fatalf("MessageKey: %v", err)
+	}
+	if len(key) != crypto.KeySize() || len(nonce) != crypto.NonceSize() {
+		t.Fatalf("MessageKey answered a %d byte key and a %d byte nonce, want %d and %d",
+			len(key), len(nonce), crypto.KeySize(), crypto.NonceSize())
+	}
+	if stAllZero(key) || stAllZero(nonce) {
+		t.Fatal("the key or nonce was already all zeros before the erase, so the assertions below hold against an implementation that never derived anything")
+	}
+	if ksSharesStorage(key, nonce) {
+		t.Fatal("the key and the nonce share storage, so one erase would read as two")
+	}
+	tree.EraseMessageKey(ContentTypeCommit, 4, 1)
+	for i, b := range key {
+		if b != 0 {
+			t.Fatalf("key byte %d = %d after erase, want 0", i, b)
+		}
+	}
+	for i, b := range nonce {
+		if b != 0 {
+			t.Fatalf("nonce byte %d = %d after erase, want 0", i, b)
+		}
+	}
+}
+
+// TestEraseMessageKeyIsTotal asserts erasing something that was never derived, a leaf no tree
+// holds, or a content type that does not exist is a no-op.
+//
+// The framing layer calls this on every open path including the failing ones, so it must never
+// panic and must never build a ratchet -- building one takes the leaf secret out of the tree,
+// and taking it is what destroys it, so an erase that created would destroy a leaf's whole
+// epoch on behalf of a message that did not open.
+func TestEraseMessageKeyIsTotal(t *testing.T) {
+	tree := stNewTree(t, 8)
+	tree.EraseMessageKey(ContentTypeApplication, 5, 7)
+	tree.EraseMessageKey(ContentType(0), 5, 7)
+	tree.EraseMessageKey(ContentTypeApplication, 1<<20, 0)
+	tree.EraseMessageKey(ContentTypeCommit, 0, ^uint32(0))
+	if len(tree.ratchets) != 0 {
+		t.Fatalf("erase built %d ratchets; it must not touch the tree", len(tree.ratchets))
+	}
+	if held := secretTreeRetainedBytes(t, tree); len(held) == 0 {
+		t.Fatal("the tree holds nothing after four erases that were all supposed to be no-ops")
+	}
+	// and it is a no-op for a leaf whose ratchet DOES exist, at a generation that was never
+	// retained: the neighbouring generations survive.
+	if _, _, err := tree.MessageKey(ContentTypeApplication, 5, 2); err != nil {
+		t.Fatalf("MessageKey: %v", err)
+	}
+	tree.EraseMessageKey(ContentTypeApplication, 5, 9)
+	if _, _, err := tree.MessageKey(ContentTypeApplication, 5, 2); err != nil {
+		t.Errorf("erasing a generation that was never derived took one that was: %v", err)
+	}
+}
+
+// TestAnErasedEpochOutranksAnUnknownContentType states the precedence between the two
+// refusals these wrappers can make, which no other test here names.
+//
+// It is the order ratchetFor already keeps and it exists for ratchetFor's reason: an erased
+// tree holds KDF.Nh zero bytes where every secret was, so what the caller has to hear is that
+// the epoch is gone. "Your content type is wrong" sends it back to re-read a header that was
+// fine, and a caller that trusted that answer would go on presenting the same message to the
+// same dead epoch.
+//
+// The whole code point space is swept, so the precedence holds for the legal content types
+// and the reserved ones alike rather than for the one value a zero argument happens to reach.
+func TestAnErasedEpochOutranksAnUnknownContentType(t *testing.T) {
+	tree := stNewTree(t, 8)
+	if _, _, _, err := tree.NextSenderKey(0, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	tree.Zeroize()
+	swept := 0
+	for point := range stContentTypeCodePoints() {
+		contentType := ContentType(point)
+		if _, _, _, err := tree.NextMessageKey(contentType, 1); !errors.Is(err, ErrEpochErased) {
+			t.Errorf("NextMessageKey(%d) on an erased tree answered %v, want ErrEpochErased", contentType, err)
+		}
+		if _, _, err := tree.MessageKey(contentType, 1, 0); !errors.Is(err, ErrEpochErased) {
+			t.Errorf("MessageKey(%d) on an erased tree answered %v, want ErrEpochErased", contentType, err)
+		}
+		swept++
+	}
+	if swept != stContentTypeCodePoints() {
+		t.Fatalf("swept %d code points, want %d", swept, stContentTypeCodePoints())
+	}
+	// the control: on a LIVE tree the two refusals are the other way round, so the sweep above
+	// is not satisfied by a build that answers ErrEpochErased to everything.
+	live := stNewTree(t, 8)
+	if _, _, _, err := live.NextMessageKey(ContentType(0), 1); !errors.Is(err, ErrUnknownContentType) {
+		t.Errorf("NextMessageKey(0) on a live tree answered %v, want ErrUnknownContentType", err)
+	}
+	if _, _, _, err := live.NextMessageKey(ContentTypeApplication, 1); err != nil {
+		t.Errorf("NextMessageKey on a live tree answered %v, want a key", err)
+	}
+}
+
+// TestMessageKeyHoldsTheWholeTreesRetainedKeysToOneBound is the decrypt path's half of the
+// bound SecretTree.pruneRetained exists for.
+//
+// ReceiverKey applies it and MessageKey has to as well, because the two reach the same
+// retention from the same place: a leaf index and a generation number in a header nobody
+// authenticated. Without it the retained key memory is RatchetWindowSize multiplied by the
+// number of ratchets, and the number of ratchets is the other members' choice rather than this
+// receiver's -- which is a number an attacker picks, not a bound.
+//
+// The sequence below asks a modest skip of every ratchet of an eight leaf tree. What it
+// retains without a tree wide bound is written out and checked against the bound first, so a
+// run in which the requests were too small to overflow reports that rather than passing.
+func TestMessageKeyHoldsTheWholeTreesRetainedKeysToOneBound(t *testing.T) {
+	tree := stNewTree(t, 8)
+	leaves := stLeavesOf(t, 8)
+	kinds := stRatchetKinds(t)
+	const skip = uint32(200)
+
+	withoutABound := len(leaves) * len(kinds) * int(skip+1)
+	if withoutABound <= MaxRetainedWindowKeys {
+		t.Fatalf("this sequence retains at most %d keys and the tree wide bound is %d, so it could not observe the bound",
+			withoutABound, MaxRetainedWindowKeys)
+	}
+	for _, leaf := range leaves {
+		for _, contentType := range []ContentType{ContentTypeApplication, ContentTypeCommit} {
+			if _, _, err := tree.MessageKey(contentType, leaf, skip); err != nil {
+				t.Fatalf("MessageKey(%d, %d, %d): %v", contentType, leaf, skip, err)
+			}
+		}
+	}
+	retained := 0
+	for _, r := range tree.ratchets {
+		retained += len(r.window)
+	}
+	// the bound is applied on the way IN, so what stands afterwards is at most the bound plus
+	// the one ratchet the last call advanced. That is a constant: it does not grow with the
+	// group, which is the whole property.
+	if ceiling := MaxRetainedWindowKeys + RatchetWindowSize + 1; retained > ceiling {
+		t.Fatalf("the tree retains %d generation keys after %d lookups, want at most %d; without the tree wide bound this sequence retains %d and the figure is linear in the group size",
+			retained, len(leaves)*2, ceiling, withoutABound)
+	}
+	if retained == 0 {
+		t.Fatal("the tree retains nothing at all, so this bound held against a lookup path that never retained anything")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task 24: sender data
+// ---------------------------------------------------------------------------
+
+// stSenderDataKatComparisons is two answers -- the key and the nonce -- for every entry of
+// mlswg's secret-tree corpus at a suite this package registers.
+//
+// It is a constant rather than a count taken from the sweep, because a sweep that matched no
+// entry compares nothing and reports the same clean run a complete one reports. Three entries
+// per registered suite, two registered suites.
+const stSenderDataKatComparisons = 2 * 3 * 2
+
+// TestSenderDataKeyNonceMatchesTheMlswgSecretTreeCorpus is the known answer test, taken from
+// the published corpus rather than from this implementation.
+//
+// It runs through SenderDataKeyNonce rather than through an ExpandWithLabel written out here.
+// That distinction is the point of task 24 existing at all: the same section 6.3.2 derivation
+// written twice, with only one of the two covered by a vector, is how a wrong ciphertext_sample
+// ships -- a wrong sample is real ciphertext, so it derives a key of exactly the right width
+// that opens nothing, and against a peer with the same mistake it even interoperates.
+func TestSenderDataKeyNonceMatchesTheMlswgSecretTreeCorpus(t *testing.T) {
+	vectors := []labelKatSecretTree{}
+	loadLabelKat(t, "secret-tree.json", &vectors)
+	if len(vectors) == 0 {
+		t.Fatal("secret-tree.json decoded to no entries")
+	}
+	compared := 0
+	for _, vector := range vectors {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		at := fmt.Sprintf(" suite %#04x", uint16(suite))
+		key, nonce, err := SenderDataKeyNonce(crypto,
+			mustDecodeHex(t, "sender_data_secret", vector.SenderData.SenderDataSecret),
+			mustDecodeHex(t, "ciphertext", vector.SenderData.Ciphertext))
+		if err != nil {
+			t.Errorf("SenderDataKeyNonce%s: %v", at, err)
+			continue
+		}
+		assertLabelKat(t, "sender_data_key"+at, key, vector.SenderData.Key)
+		assertLabelKat(t, "sender_data_nonce"+at, nonce, vector.SenderData.Nonce)
+		compared += 2
+	}
+	if compared != stSenderDataKatComparisons {
+		t.Fatalf("compared %d published sender data answers, want %d", compared, stSenderDataKatComparisons)
+	}
+}
+
+// TestSenderDataKeyNonceSamplesExactlyTheFirstNhBytes reads the sample boundary off the
+// derivation in both directions, one byte at a time and at three ciphertext lengths.
+//
+// Every byte below KDF.Nh has to change the answer and every byte at or above it has to leave
+// it alone, which locates the sample's offset AND its length exactly rather than inferring
+// them from three whole-answer comparisons.
+//
+// The three lengths are the half that a single length cannot do, and the reason is measured
+// rather than supposed. A sample rule whose BOUND is wrong -- one that cuts at Nh only once
+// the ciphertext is past 2*Nh, say -- behaves correctly at a long ciphertext and takes the
+// whole of a short one, so a sweep at one long length reports it clean and so does the plan's
+// version of this test, which compares a 77 byte ciphertext against its own first 32 bytes.
+// Nh+1 is the shortest input the rule applies to at all, and it is where that family of
+// defect is visible.
+//
+// What the plan's version does catch, measured against the mutants rather than assumed: a
+// sample one byte short and a sample taken from offset one both fail it, because the
+// truncated arm of that test is a ciphertext of exactly Nh bytes, which the rule leaves alone,
+// while the full arm is cut. It is a real test. This one is stricter in where it puts the
+// boundary and in how many ciphertext lengths it puts it at.
+func TestSenderDataKeyNonceSamplesExactlyTheFirstNhBytes(t *testing.T) {
+	crypto := stTestCrypto(t)
+	nh := crypto.HashSize()
+	secret := bytes.Repeat([]byte{0x5c}, nh)
+	swept := 0
+	for _, length := range []int{nh + 1, nh + nh/2, 3 * nh} {
+		if length <= nh {
+			t.Fatalf("a ciphertext of %d bytes is not past KDF.Nh (%d), so this row observes no boundary",
+				length, nh)
+		}
+		ciphertext := make([]byte, length)
+		for i := range ciphertext {
+			ciphertext[i] = byte(i%251) + 1
+		}
+		baseKey, baseNonce, err := SenderDataKeyNonce(crypto, secret, ciphertext)
+		if err != nil {
+			t.Fatalf("SenderDataKeyNonce over %d bytes: %v", length, err)
+		}
+		inside, outside := 0, 0
+		for i := range ciphertext {
+			altered := bytes.Clone(ciphertext)
+			altered[i] ^= 0xff
+			key, nonce, err := SenderDataKeyNonce(crypto, secret, altered)
+			if err != nil {
+				t.Fatalf("SenderDataKeyNonce with byte %d of %d flipped: %v", i, length, err)
+			}
+			changed := !bytes.Equal(key, baseKey) || !bytes.Equal(nonce, baseNonce)
+			if i < nh {
+				if !changed {
+					t.Errorf("ciphertext of %d bytes: flipping byte %d changed nothing, and the sample is ciphertext[0..%d]; the sample is shorter than KDF.Nh or starts past the front",
+						length, i, nh-1)
+				}
+				inside++
+				continue
+			}
+			if changed {
+				t.Errorf("ciphertext of %d bytes: flipping byte %d changed the answer, and the sample ends at %d; the sample is longer than KDF.Nh, or the rule that cuts it does not fire at this length",
+					length, i, nh-1)
+			}
+			outside++
+		}
+		if inside != nh || outside != length-nh {
+			t.Fatalf("ciphertext of %d bytes: the sweep read %d bytes inside the sample and %d outside, want %d and %d",
+				length, inside, outside, nh, length-nh)
+		}
+		swept += length
+	}
+	if swept == 0 {
+		t.Fatal("no ciphertext length was swept, so this gate located no boundary")
+	}
+}
+
+// TestSenderDataKeyNonceUsesAShortCiphertextWhole holds the other end of the sample rule: a
+// ciphertext shorter than KDF.Nh enters the derivation as it is.
+//
+// Padding it to Nh is the plausible mistake and it is a real one -- two short ciphertexts that
+// differ only in length would then sample identically, which is one key and nonce pair for two
+// messages, the reuse the sample exists to prevent reintroduced at the short end. So the
+// assertion is that a short ciphertext and the same bytes zero padded to Nh disagree, and that
+// two short ciphertexts of different lengths disagree with each other.
+func TestSenderDataKeyNonceUsesAShortCiphertextWhole(t *testing.T) {
+	crypto := stTestCrypto(t)
+	nh := crypto.HashSize()
+	secret := bytes.Repeat([]byte{0x5d}, nh)
+	short := bytes.Repeat([]byte{0x2a}, nh/2)
+
+	shortKey, _, err := SenderDataKeyNonce(crypto, secret, short)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over a short ciphertext: %v", err)
+	}
+	padded := make([]byte, nh)
+	copy(padded, short)
+	paddedKey, _, err := SenderDataKeyNonce(crypto, secret, padded)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over the padded ciphertext: %v", err)
+	}
+	if bytes.Equal(shortKey, paddedKey) {
+		t.Error("a short ciphertext derives the same key as itself zero padded to KDF.Nh, so it is being padded rather than used whole")
+	}
+	shorterKey, _, err := SenderDataKeyNonce(crypto, secret, short[:len(short)-1])
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over a shorter ciphertext: %v", err)
+	}
+	if bytes.Equal(shortKey, shorterKey) {
+		t.Error("two short ciphertexts of different lengths derive one key, which is one keystream over two messages")
+	}
+	// and the empty ciphertext is answered rather than refused or panicked on: it is a
+	// degenerate input the framing layer can reach, and ExpandWithLabel takes an empty context.
+	emptyKey, emptyNonce, err := SenderDataKeyNonce(crypto, secret, nil)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over an empty ciphertext: %v", err)
+	}
+	if len(emptyKey) != crypto.KeySize() || len(emptyNonce) != crypto.NonceSize() {
+		t.Errorf("the empty ciphertext answered %d and %d bytes, want %d and %d",
+			len(emptyKey), len(emptyNonce), crypto.KeySize(), crypto.NonceSize())
+	}
+}
+
+// stRefusalOf calls a construction and answers its error, turning a PANIC into a reported
+// failure rather than letting it end the run.
+//
+// It exists because the refusals these tests assert are the only thing standing between a
+// wrong length and a provider that raises on one. Measured, not supposed: with
+// SenderDataKeyNonce's length check deleted, the provider panics with "pseudorandom key of 32
+// bytes is shorter than the 48 byte hash", and an uncaught panic takes the whole test BINARY
+// down -- the run reports one aborted test and every test declared after it never runs, which
+// is how a mutation hides the tests that would have caught it. Eight tests went unrun that
+// way before this existed.
+//
+// A caught panic is reported here and answered as the refusal, so the caller's own assertion
+// does not fire a second, less accurate message about the same defect.
+func stRefusalOf(t *testing.T, what string, call func() error) (err error) {
+	t.Helper()
+	defer func() {
+		if raised := recover(); raised != nil {
+			t.Errorf("%s panicked with %v rather than refusing", what, raised)
+			err = ErrSecretLength
+		}
+	}()
+	return call()
+}
+
+// TestSenderDataKeyNonceRefusesEveryWrongSecretLength sweeps the lengths around KDF.Nh rather
+// than probing one.
+//
+// A secret of the wrong length expands into a well formed key that no peer agrees with, which
+// surfaces later as an undecryptable message rather than as the length mistake it is -- so the
+// refusal is the whole of what a caller gets, and it has to fire on both sides of Nh.
+func TestSenderDataKeyNonceRefusesEveryWrongSecretLength(t *testing.T) {
+	crypto := stTestCrypto(t)
+	nh := crypto.HashSize()
+	for _, length := range []int{0, 1, nh / 2, nh - 1, nh + 1, 2 * nh} {
+		if length == nh {
+			t.Fatalf("length %d is KDF.Nh, so this row would require a refusal of the legal length", length)
+		}
+		err := stRefusalOf(t, fmt.Sprintf("a %d byte sender data secret", length), func() error {
+			_, _, refusal := SenderDataKeyNonce(crypto, bytes.Repeat([]byte{0x5e}, length), []byte{1})
+			return refusal
+		})
+		if !errors.Is(err, ErrSecretLength) {
+			t.Errorf("a %d byte sender data secret answered %v, want ErrSecretLength", length, err)
+		}
+	}
+	if _, _, err := SenderDataKeyNonce(crypto, bytes.Repeat([]byte{0x5e}, nh), []byte{1}); err != nil {
+		t.Errorf("a KDF.Nh byte secret was refused: %v", err)
+	}
+}
+
+// TestSenderDataKeyNonceAnswersTwoArraysThatDoNotOverlap is the aliasing half.
+//
+// A key and a nonce cut from one expansion, or returned as one slice twice, would satisfy every
+// value assertion above -- the KAT compares each against its own published bytes and both would
+// be right if the two expansions happened to be written into one array in the right order. What
+// it would not be is safe: erasing the key would erase the nonce, and a caller that overwrote
+// one would silently move the other.
+func TestSenderDataKeyNonceAnswersTwoArraysThatDoNotOverlap(t *testing.T) {
+	crypto := stTestCrypto(t)
+	key, nonce, err := SenderDataKeyNonce(crypto, bytes.Repeat([]byte{0x5f}, crypto.HashSize()),
+		bytes.Repeat([]byte{0x60}, 96))
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce: %v", err)
+	}
+	if len(key) == 0 || len(nonce) == 0 {
+		t.Fatal("one of the two answers is empty, so the overlap check below observes nothing")
+	}
+	if ksSharesStorage(key, nonce) {
+		t.Error("the sender data key and nonce share backing storage, so erasing one erases the other")
+	}
+	if bytes.HasPrefix(key, nonce) || bytes.HasPrefix(nonce, key) {
+		t.Error("the sender data key and nonce are one expansion cut in two, so the pair carries the entropy of one")
+	}
+}
+
+// TestSenderDataKeyNonceReadsBothLengthsOffTheProviderItWasHanded is the differential the
+// registry cannot supply, for the two lengths this construction reads and the one it refuses
+// against.
+//
+// Both registered suites fix Nn at 12 and one of them fixes Nk at 32, which is also KDF.Nh and
+// also the literal a body would have written down, so inside this registry a written down 12
+// and a read of NonceSize() are the same number -- and every assertion in this file, the
+// published corpus included, is satisfied by either. The synthetic suite is what separates
+// them, and it is ksWelcomeSyntheticParams rather than a second one declared here: that suite
+// already carries the argument that its Nk and Nn coincide with nothing in the registry, and
+// two synthetic suites for one property is two lists that can drift.
+func TestSenderDataKeyNonceReadsBothLengthsOffTheProviderItWasHanded(t *testing.T) {
+	crypto := &suiteCryptoProvider{params: &ksWelcomeSyntheticParams, random: constantReader{value: 0x41}}
+	if crypto.KeySize() == crypto.NonceSize() {
+		t.Fatalf("this suite's Nk and Nn are both %d, so the two assertions below are one", crypto.KeySize())
+	}
+	for _, other := range []struct {
+		name  string
+		value int
+	}{
+		{name: "this suite's KDF.Nh", value: ksWelcomeSyntheticParams.Nh},
+		{name: "the chacha suite's Nk", value: 32},
+		{name: "the aes suite's Nk", value: 16},
+		{name: "the registry's Nn", value: 12},
+	} {
+		if other.value == crypto.KeySize() || other.value == crypto.NonceSize() {
+			t.Errorf("%s is %d, which is this suite's Nk or Nn, so a body writing it down would pass here",
+				other.name, other.value)
+		}
+	}
+
+	secret := bytes.Repeat([]byte{0x62}, ksWelcomeSyntheticParams.Nh)
+	ciphertext := bytes.Repeat([]byte{0x63}, 3*ksWelcomeSyntheticParams.Nh)
+	key, nonce, err := SenderDataKeyNonce(crypto, secret, ciphertext)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over a suite whose KDF.Nh is %d: %v", ksWelcomeSyntheticParams.Nh, err)
+	}
+	if len(key) != ksWelcomeSyntheticParams.Nk {
+		t.Errorf("sender_data_key is %d bytes for a suite whose Nk is %d", len(key), ksWelcomeSyntheticParams.Nk)
+	}
+	if len(nonce) != ksWelcomeSyntheticParams.Nn {
+		t.Errorf("sender_data_nonce is %d bytes for a suite whose Nn is %d", len(nonce), ksWelcomeSyntheticParams.Nn)
+	}
+
+	// the third length: the secret is measured against the provider's KDF.Nh and not against 32
+	shortSecret := stRefusalOf(t, "a secret at the registry's KDF.Nh", func() error {
+		_, _, refusal := SenderDataKeyNonce(crypto, bytes.Repeat([]byte{0x62}, sha256.Size), ciphertext)
+		return refusal
+	})
+	if err := shortSecret; !errors.Is(err, ErrSecretLength) {
+		t.Errorf("a %d byte secret was accepted by a suite whose KDF.Nh is %d: err = %v",
+			sha256.Size, ksWelcomeSyntheticParams.Nh, err)
+	}
+	// and the fourth, which is this construction's own: the SAMPLE is KDF.Nh bytes of the
+	// ciphertext and not 32 of them. A body that wrote 32 down here answers a key of exactly
+	// the right width off a sample sixteen bytes short of the one the RFC names.
+	sample := ciphertext[:ksWelcomeSyntheticParams.Nh]
+	if want := crypto.ExpandWithLabel(secret, "key", sample, ksWelcomeSyntheticParams.Nk); !bytes.Equal(key, want) {
+		wrong := crypto.ExpandWithLabel(secret, "key", ciphertext[:sha256.Size], ksWelcomeSyntheticParams.Nk)
+		if bytes.Equal(key, wrong) {
+			t.Errorf("the sample is the first %d bytes of the ciphertext for a suite whose KDF.Nh is %d",
+				sha256.Size, ksWelcomeSyntheticParams.Nh)
+		} else {
+			t.Errorf("sender_data_key is not ExpandWithLabel over the first %d bytes of the ciphertext",
+				ksWelcomeSyntheticParams.Nh)
+		}
+	}
+	// and the same defect one level down, which the length assertions cannot see: a body that
+	// asked the kdf for a written down length and TRUNCATED to the provider's answers Nk and Nn
+	// bytes either way. ExpandWithLabel binds the requested length into its own preimage, so
+	// the truncation is a different value and this is what separates them.
+	if truncated := crypto.ExpandWithLabel(secret, "key", sample, 32); len(key) <= len(truncated) &&
+		bytes.Equal(key, truncated[:len(key)]) {
+		t.Errorf("sender_data_key is the first %d bytes of a 32 byte expansion rather than an expansion of %d",
+			len(key), ksWelcomeSyntheticParams.Nk)
+	}
+	if truncated := crypto.ExpandWithLabel(secret, "nonce", sample, 12); len(nonce) <= len(truncated) &&
+		bytes.Equal(nonce, truncated[:len(nonce)]) {
+		t.Errorf("sender_data_nonce is the first %d bytes of a 12 byte expansion rather than an expansion of %d",
+			len(nonce), ksWelcomeSyntheticParams.Nn)
 	}
 }

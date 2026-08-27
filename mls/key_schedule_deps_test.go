@@ -5,12 +5,19 @@
 // the file.
 //
 // Only two of the producing plans have landed in this package whole: syntax and the crypto
-// provider. Tree math, the registry enums and extensions, framing's ContentType and the
-// validation plan's ValSem codes are all still elsewhere, so they cannot be pinned yet — an
-// undefined name is a build failure, not a red test, and a build failure takes the whole
-// package down including everything already green.
+// provider. Tree math, the registry enums and extensions and the validation plan's ValSem
+// codes are all still elsewhere, so they cannot be pinned yet — an undefined name is a
+// build failure, not a red test, and a build failure takes the whole package down including
+// everything already green.
 //
-// p8's vector harness is the exception and is pinned below. It landed in vectors_test.go
+// Framing's ContentType is the second exception and is pinned below for a different reason
+// from p8's: it did not land from p6 at all, it landed HERE, because this plan's secret tree
+// implements the MessageKeySource interface p6 declares and that interface is keyed on it.
+// content_type.go is the declaration and p6's own landing deletes that file rather than
+// adding a second one beside it. The pin is owed either way: the rule this file runs on is
+// that a name package mls declares is a name this file pins, whichever plan wrote it.
+//
+// p8's vector harness is the other exception and is pinned below. It landed in vectors_test.go
 // rather than in a production file, which is where the detector that should have noticed
 // had a hole: the scan behind TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere read only
 // non test files, so a test-only surface — and the vector harness is test-only by design —
@@ -155,6 +162,28 @@ var (
 	_ string                            = VectorFamily{}.Slice
 	_ func(*testing.T, json.RawMessage) = VectorFamily{}.Verify
 	_ func(*testing.T) json.RawMessage  = VectorFamily{}.Generate
+)
+
+// p6 framing, task 1 — ContentType and the three code points it registers. This is the one
+// name of p6 the secret tree reaches, because the MessageKeySource interface p6 declares is
+// keyed on it, and it is the second cross plan surface to land in package mls ahead of its
+// owner. The terms are p8's vector harness's: content_type.go declares it at the signature
+// the interface registry gives it, p6's own landing deletes that file rather than adding a
+// second declaration beside it, and until then this block is what makes a p6 that arrives
+// with a different shape a build failure here.
+//
+// The width is pinned through a 0xff conversion, which is a compile error the moment the type
+// is widened past the octet the wire format gives it -- an assignment of a small constant
+// would not catch that, and a content type read at two octets moves every field after it in a
+// PrivateMessage header. The three constants are pinned as members of the type, which holds
+// their spelling and their type but NOT their values: a code point that moved is a number and
+// not a type error, so TestContentTypeCarriesTheWireValuesTheRegistryGivesIt is what holds
+// those, and it derives them off the type rather than reading this block.
+var (
+	_ ContentType = ContentType(0xff)
+	_ ContentType = ContentTypeApplication
+	_ ContentType = ContentTypeProposal
+	_ ContentType = ContentTypeCommit
 )
 
 // p3 tree math — the index surface registry section 4 gives this plan, pinned at the
@@ -466,19 +495,23 @@ func readVectorManifest(t *testing.T) map[string]string {
 // landed in vectors_test.go, so they are pinned above. Landing in a TEST file is what this
 // map's detector used to be blind to, and the fix is in the scan rather than here — a name
 // that lands test-only is landed, and owes its pin.
+//
+// Framing's ContentType and its three code points left it on stricter terms still: they were
+// declared BY this plan, in content_type.go, because task 23a implements the interface p6
+// declares and that interface names them. "Not landed" was never a reason to leave the
+// wrapper unwritten and it was never a licence to spell a private copy either — a second
+// declaration of one wire enum disagrees by a NUMBER rather than by a type error, which is
+// the one kind of drift nothing in this file could see. One declaration, pinned above,
+// deleted by p6 when it arrives.
 var crossPlanSymbolsNotYetLanded = map[string]string{
-	"ContentType":            "p6 framing",
-	"ContentTypeApplication": "p6 framing",
-	"ContentTypeProposal":    "p6 framing",
-	"ContentTypeCommit":      "p6 framing",
-	"ValSemCode":             "p8 validation and interop",
-	"ValSem":                 "p8 validation and interop",
-	"ValSem401":              "p8 validation and interop",
-	"ValSem402":              "p8 validation and interop",
-	"ValSem403":              "p8 validation and interop",
-	"ErrPskNonceLength":      "p8 validation and interop",
-	"ErrPskType":             "p8 validation and interop",
-	"ErrDuplicatePsk":        "p8 validation and interop",
+	"ValSemCode":        "p8 validation and interop",
+	"ValSem":            "p8 validation and interop",
+	"ValSem401":         "p8 validation and interop",
+	"ValSem402":         "p8 validation and interop",
+	"ValSem403":         "p8 validation and interop",
+	"ErrPskNonceLength": "p8 validation and interop",
+	"ErrPskType":        "p8 validation and interop",
+	"ErrDuplicatePsk":   "p8 validation and interop",
 }
 
 // TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere fails when a producing plan merges
@@ -494,8 +527,8 @@ func TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere(t *testing.T) {
 	// removes the only thing that will notice its symbol landing, and deleting it is the
 	// cheapest way to quieten this test. answering an entry properly is a pin written
 	// above, the entry deleted, and this number decremented in the same commit.
-	if len(crossPlanSymbolsNotYetLanded) != 12 {
-		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 12 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
+	if len(crossPlanSymbolsNotYetLanded) != 8 {
+		t.Fatalf("crossPlanSymbolsNotYetLanded holds %d symbols, this plan's consumes section names 8 that have not landed; if a producing plan landed, write the pin and decrement this number, and if one was added, increment it",
 			len(crossPlanSymbolsNotYetLanded))
 	}
 	fileSet := token.NewFileSet()
@@ -673,7 +706,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 69,
+	"key_schedule_deps_test.go": 73,
 	"pins_test.go":              8,
 }
 

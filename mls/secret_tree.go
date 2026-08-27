@@ -417,27 +417,40 @@ func (self *ratchet) step() (uint32, *generationKeys, error) {
 	return generation, keys, nil
 }
 
-// keyFor returns the keys for one generation, ratcheting forward and retaining the
-// generations it passes so an out of order delivery is a delay and not a lost message.
+// peekFor returns the keys for one generation, ratcheting forward and retaining every
+// generation it passes -- INCLUDING the target.
 //
-// Single use: a generation already handed out is deleted from the window as it is returned,
-// so a replayed message cannot be decrypted a second time out of the retained keys. That
-// deletion is the only thing standing between the window and a real key and nonce reuse,
-// because unlike every other path here the window can hand the SAME pair back twice.
+// It does not consume. That is the whole difference from keyFor and it is what the framing
+// layer's decrypt path needs: it looks a generation up, opens the AEAD, and erases only when
+// the open succeeded. A lookup that consumed would burn the key on every forged ciphertext,
+// so one bad packet from anyone who can write to the network would permanently lose the real
+// message at that generation.
 //
-// The order of the three refusals matters. A generation below the head is consumed, which is
-// a fact about this receiver; a generation far above it is a bound, which is a fact about
-// what a sender is allowed to ask for. Reversing them would report an old generation as "too
-// far ahead" whenever the head had run past the bound.
+// The three refusals and their order are keyFor's, because keyFor is now this plus a delete
+// and there is one copy of them rather than two that can drift. A generation below the head
+// is consumed, which is a fact about this receiver; a generation far above it is a bound,
+// which is a fact about what a sender is allowed to ask for. Reversing them would report an
+// old generation as "too far ahead" whenever the head had run past the bound. The exhausted
+// arm is the second half of the first: head does not advance past 2^32-1, so the last
+// generation of an epoch is the one value "below the head" cannot classify.
 //
-// The noinline directive is the one this package's erase-helper gate derives: prune erases
-// through storage that outlives this call, and the directive is what keeps those stores
-// across a boundary the compiler cannot see through.
+// The target is stored in the window and is deliberately NOT pruned against. Two reasons.
+// The bound is on SKIPPED keys -- keys retained for a message that has not arrived -- and the
+// target is the one key in use, so counting it would evict a skipped key that is still wanted
+// to make room for one that is about to be returned. And pruning after the store would
+// ZEROIZE what it evicts, so a target evicted by its own arrival would come back as a well
+// formed Nk zero bytes with a nil error: a key every party in the world can compute, handed
+// to the framing layer as this sender's. The cost is that one ratchet's window can hold
+// RatchetWindowSize+1 entries between a peek and its erase, which is one entry and not a
+// multiple of anything a peer chooses.
+//
+// The noinline directive is the erase-helper class's: prune erases through storage that
+// outlives this call, and the directive is what keeps those stores across a boundary the
+// compiler cannot see through.
 //
 //go:noinline
-func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
+func (self *ratchet) peekFor(generation uint32) (*generationKeys, error) {
 	if keys, ok := self.window[generation]; ok {
-		delete(self.window, generation)
 		return keys, nil
 	}
 	// every generation this ratchet has already produced is a replay, and that includes the
@@ -449,9 +462,9 @@ func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
 	// asking "is this a replay" has to get one answer across the whole range of the counter,
 	// not two that depend on which end of it the epoch reached.
 	//
-	// Exhaustion stays the SENDER's sentinel: NextSenderKey reaches step directly and still
-	// answers ErrRatchetExhausted, which is the fact that party needs -- there is no next
-	// generation, rekey.
+	// Exhaustion stays the SENDER's sentinel: nextSenderKeyLocked reaches step directly and
+	// still answers ErrRatchetExhausted, which is the fact that party needs -- there is no
+	// next generation, rekey.
 	if generation < self.head || (self.exhausted && generation == self.head) {
 		return nil, fmt.Errorf("%w: generation %d, head %d", ErrRatchetGenerationConsumed, generation, self.head)
 	}
@@ -482,11 +495,62 @@ func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
 			return nil, err
 		}
 		if stepped == generation {
+			self.window[stepped] = keys
 			return keys, nil
 		}
 		self.window[stepped] = keys
 		self.prune()
 	}
+}
+
+// keyFor is peekFor plus consumption: a generation already handed out is deleted from the
+// window as it is returned, so a replayed message cannot be decrypted a second time out of
+// the retained keys. That deletion is the only thing standing between the window and a real
+// key and nonce reuse, because unlike every other path here the window can hand the SAME
+// pair back twice.
+//
+// ReceiverKey uses this rather than peekFor because it has no erase counterpart: there is no
+// second call in which the caller says the message opened, so the consumption has to happen
+// at the only moment this path has. MessageKey is the other half of that trade and pays for
+// its repeatability with EraseMessageKey.
+//
+// The delete leaves the window exactly as the pre-split keyFor left it -- the target was
+// never counted against the bound there either -- so the retention this file's window tests
+// pin is unchanged by the split.
+func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
+	keys, err := self.peekFor(generation)
+	if err != nil {
+		return nil, err
+	}
+	delete(self.window, generation)
+	return keys, nil
+}
+
+// eraseKey zeroizes one retained generation and drops it.
+//
+// Total by design: erasing a generation that was never derived is a no-op, because the
+// framing layer calls it on paths that never found a key. It must never be the thing that
+// creates one.
+//
+// It is the single erase site for a window entry -- evictOldest chooses WHICH generation goes
+// and then comes here -- because the erasure is the half a caller omits silently. A bare
+// delete leaves live AEAD keys wherever the allocator puts them next, nothing the tree still
+// reaches can see the difference, and this package has already measured that shape passing
+// every test it had.
+//
+// The noinline directive is this package's erase-helper class: the window map outlives the
+// call, and the directive keeps the store inside zeroizeSecret across a boundary the compiler
+// cannot see through.
+//
+//go:noinline
+func (self *ratchet) eraseKey(generation uint32) {
+	keys, ok := self.window[generation]
+	if !ok {
+		return
+	}
+	zeroizeSecret(keys.key)
+	zeroizeSecret(keys.nonce)
+	delete(self.window, generation)
 }
 
 // evictOldest drops the oldest retained generation, erasing its key material in place.
@@ -499,11 +563,12 @@ func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
 // the allocator puts them next, nothing the tree still reaches can see the difference, and
 // this package has already measured that shape passing every test it had. Both the per
 // ratchet bound and the tree wide one evict through here, so the erasure cannot be present
-// on one path and missing on the other.
+// on one path and missing on the other -- and both reach it through eraseKey, so the third
+// way an entry leaves the window cannot be present on one path and missing there either.
 //
-// The noinline directive is this package's erase-helper class: the window map outlives the
-// call, and the directive keeps the store inside zeroizeSecret across a boundary the
-// compiler cannot see through.
+// The noinline directive is this package's erase-helper class, carried here and on eraseKey
+// both: the window map outlives either call, and the directive keeps the store inside
+// zeroizeSecret across a boundary the compiler cannot see through.
 //
 //go:noinline
 func (self *ratchet) evictOldest() {
@@ -516,10 +581,10 @@ func (self *ratchet) evictOldest() {
 			oldest = generation
 		}
 	}
-	keys := self.window[oldest]
-	zeroizeSecret(keys.key)
-	zeroizeSecret(keys.nonce)
-	delete(self.window, oldest)
+	// the erase itself is eraseKey's, so the two ways an entry leaves the window -- evicted
+	// because the bound was reached, erased because its message was opened -- zeroize
+	// through one body. Choosing WHICH generation goes is all this function does.
+	self.eraseKey(oldest)
 }
 
 // prune evicts the oldest retained generations once THIS ratchet is over its own bound.
@@ -699,6 +764,17 @@ const (
 func (self *SecretTree) NextSenderKey(leaf LeafIndex, kind RatchetType) (generation uint32, key []byte, nonce []byte, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.nextSenderKeyLocked(leaf, kind)
+}
+
+// nextSenderKeyLocked is the encrypt path itself, split out so NextSenderKey and
+// NextMessageKey are one derivation reached by two names rather than two derivations that
+// can drift. It has to be split: this type's lock is not reentrant, so the ContentType
+// keyed wrapper cannot simply call the RatchetType keyed method, and a wrapper that took no
+// lock at all would be an exported path to guarded state without one.
+//
+// The caller holds stateLock; this function does not take it.
+func (self *SecretTree) nextSenderKeyLocked(leaf LeafIndex, kind RatchetType) (generation uint32, key []byte, nonce []byte, err error) {
 	r, err := self.ratchetFor(leaf, kind)
 	if err != nil {
 		return 0, nil, nil, err
@@ -730,8 +806,10 @@ func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation
 	// success path is one a peer walks around by always failing.
 	//
 	// The keys just handed out are not at risk from this: keyFor deletes the generation it
-	// returns from the window before returning it, and a generation it stepped to is never
-	// put in the window at all.
+	// returns from the window before returning it, so by the time the bound is applied the
+	// answer is no longer an entry anything can evict. That holds across the peekFor split --
+	// peekFor now stores the target as well, and keyFor's delete is what takes it back out
+	// again before this line runs.
 	self.pruneRetained()
 	if err != nil {
 		return nil, nil, err
@@ -770,4 +848,182 @@ func (self *SecretTree) Zeroize() {
 		r.zeroize()
 	}
 	self.erased = true
+}
+
+// ---------------------------------------------------------------------------
+// the MessageKeySource surface the framing plan calls: RFC 9420 section 9.1
+// ---------------------------------------------------------------------------
+
+// ratchetTypeOf maps the wire ContentType a PrivateMessage header carries to the ratchet it
+// draws from. RFC 9420 section 9.1: application content uses the application ratchet, and
+// proposals and commits share the handshake one.
+//
+// It exists so no caller of the framing layer has to remember that mapping. A caller that got
+// it wrong would encrypt a commit under an application key that the receiver looks up in the
+// other ratchet, and the failure would arrive as a bad AEAD tag -- indistinguishable from
+// tampering, and therefore diagnosed as an attack rather than as the bug it is.
+//
+// Anything outside the three is refused rather than defaulted. RFC 9420 reserves 0, and a
+// default arm would route every unregistered code point onto the handshake ratchet: a peer
+// could then draw generation 0 of a real ratchet by sending a content type nobody has
+// defined, and every later handshake message of that leaf would come back consumed.
+func ratchetTypeOf(contentType ContentType) (RatchetType, error) {
+	switch contentType {
+	case ContentTypeApplication:
+		return RatchetApplication, nil
+	case ContentTypeProposal, ContentTypeCommit:
+		return RatchetHandshake, nil
+	}
+	return 0, fmt.Errorf("%w: content type %d", ErrUnknownContentType, contentType)
+}
+
+// refuseIfErased answers the epoch's own state, and is asked BEFORE any argument of the call
+// is looked at.
+//
+// The order is ratchetFor's, for ratchetFor's reason, and it is not a style choice. An erased
+// tree holds KDF.Nh zero bytes where every secret was, and expanding a run of zeros is not a
+// weak derivation but a PUBLIC one, so what a caller needs to hear is "this epoch is gone" --
+// a fact it acts on by going to the current epoch -- and not "your content type is wrong",
+// which sends it back to re-read a header that was fine. The wrappers below reached
+// ratchetTypeOf first and answered the second; the gate that caught it sweeps every exported
+// method of this type with ZERO arguments, which is exactly the shape that arrives at an
+// argument check before it arrives at the epoch.
+//
+// The caller holds stateLock; this function does not take it.
+func (self *SecretTree) refuseIfErased(leaf LeafIndex) error {
+	if self.erased {
+		return fmt.Errorf("%w: leaf %d", ErrEpochErased, leaf)
+	}
+	return nil
+}
+
+// NextMessageKey is the encrypt half of the framing layer's message key source: the next
+// generation's key and nonce for our own leaf, keyed on the ContentType the header carries.
+//
+// It is NextSenderKey under the framing layer's own key, and it consumes for the same reason
+// that one does: there is no way to ask for the same generation twice, so a caller that
+// dropped the answer and called again gets the next generation rather than the one it lost.
+func (self *SecretTree) NextMessageKey(contentType ContentType, leaf LeafIndex) (key []byte, nonce []byte, generation uint32, err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if err := self.refuseIfErased(leaf); err != nil {
+		return nil, nil, 0, err
+	}
+	kind, err := ratchetTypeOf(contentType)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	generation, key, nonce, err = self.nextSenderKeyLocked(leaf, kind)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return key, nonce, generation, nil
+}
+
+// MessageKey is the decrypt half. It does NOT consume the generation: the caller opens the
+// AEAD and then calls EraseMessageKey, so a forged ciphertext cannot destroy the key the real
+// message needs. ReceiverKey is the consuming form and keeps its single use semantics,
+// because it has no erase counterpart.
+//
+// The tree wide retained bound is applied on the way IN rather than on the way out, which is
+// the one place this differs from ReceiverKey. Both paths retain every generation they step
+// past, and both are reachable by anyone who can put a leaf index and a generation number in
+// a header, so neither may leave the aggregate unbounded -- without it a peer materialises
+// every leaf's two ratchets and fills every one of their windows from headers that never had
+// to be authentic, which is a number multiplied by the group size rather than a bound. But
+// the answer here STAYS in the window until the caller erases it, and pruneRetained zeroizes
+// what it evicts, so a bound applied afterwards could hand back Nk zero bytes with a nil
+// error. Applied first, the eviction cannot reach a key that does not exist yet, and what the
+// receiver retains is at most MaxRetainedWindowKeys plus the single ratchet this call
+// advanced -- a constant, and still not a multiple of the group size.
+func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte, err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if err := self.refuseIfErased(leaf); err != nil {
+		return nil, nil, err
+	}
+	kind, err := ratchetTypeOf(contentType)
+	if err != nil {
+		return nil, nil, err
+	}
+	self.pruneRetained()
+	r, err := self.ratchetFor(leaf, kind)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := r.peekFor(generation)
+	if err != nil {
+		return nil, nil, err
+	}
+	return keys.key, keys.nonce, nil
+}
+
+// EraseMessageKey is the forward secrecy erase the framing layer's replay guard is built on:
+// once a message at this generation has been opened, its key stops existing. It is what makes
+// MessageKey's non consuming lookup safe -- the pair is "look up, open, erase", and the erase
+// is the step that turns a repeatable lookup back into a single use key.
+//
+// Total by design. It is called on paths that never derived a key, so an unknown content
+// type, a leaf outside the tree and a generation nobody asked for are all no-ops. None of
+// them builds a ratchet: the table is read directly rather than through ratchetFor, because
+// ratchetFor CREATES, and an erase that created would take a leaf secret out of the tree --
+// destroying it, since taking it is what erases it -- on behalf of a message that failed to
+// open.
+//
+// It carries no refuseIfErased of its own, and does not need one: Zeroize erases every
+// window entry of every ratchet and DELETES it, so an erased tree holds nothing this could
+// find and the map read below already answers no. It has nothing to report through either
+// way -- being unable to report is what "total" means here.
+func (self *SecretTree) EraseMessageKey(contentType ContentType, leaf LeafIndex, generation uint32) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	kind, err := ratchetTypeOf(contentType)
+	if err != nil {
+		return
+	}
+	r, ok := self.ratchets[ratchetKey{leaf: leaf, kind: kind}]
+	if !ok {
+		return
+	}
+	r.eraseKey(generation)
+}
+
+// SenderDataKeyNonce derives the AEAD key and nonce protecting a PrivateMessage's sender
+// data, per RFC 9420 section 6.3.2:
+//
+//	ciphertext_sample = ciphertext[0..KDF.Nh-1]   (all of it when it is shorter)
+//	sender_data_key   = ExpandWithLabel(sender_data_secret, "key",   ciphertext_sample, AEAD.Nk)
+//	sender_data_nonce = ExpandWithLabel(sender_data_secret, "nonce", ciphertext_sample, AEAD.Nn)
+//
+// The sample is what stops one sender_data_secret from producing one key and nonce for every
+// message of the epoch. That secret does not ratchet -- every member holds the same one for
+// the whole epoch -- so without the sample every sender_data header would be sealed under a
+// single key and nonce pair, which is a keystream reused across every message anyone sends.
+//
+// Two things about the sample are values rather than failures, which is why they are stated
+// here and pinned against the published corpus rather than left to a length check. A sample
+// taken at the wrong length, or from the wrong offset, is still real ciphertext, so it derives
+// a well formed key of exactly the right width that simply does not open anything -- and
+// against a peer that made the same mistake it interoperates. And a ciphertext shorter than
+// Nh is used WHOLE rather than padded: padding would make two different short ciphertexts
+// sample identically, which is the reuse the sample exists to prevent, reintroduced at the
+// short end.
+//
+// Every length is read off the provider. Both registered suites fix Nn at 12 and one of them
+// fixes Nk at 32, which is also Nh, so inside this registry a written down number and a read
+// of the provider are indistinguishable -- which is what the synthetic suite in this
+// construction's own width test exists to separate.
+func SenderDataKeyNonce(crypto CryptoProvider, senderDataSecret []byte, ciphertext []byte) (key []byte, nonce []byte, err error) {
+	nh := crypto.HashSize()
+	if len(senderDataSecret) != nh {
+		return nil, nil, fmt.Errorf("%w: sender data secret is %d bytes, want %d",
+			ErrSecretLength, len(senderDataSecret), nh)
+	}
+	sample := ciphertext
+	if len(sample) > nh {
+		sample = sample[:nh]
+	}
+	key = crypto.ExpandWithLabel(senderDataSecret, "key", sample, crypto.KeySize())
+	nonce = crypto.ExpandWithLabel(senderDataSecret, "nonce", sample, crypto.NonceSize())
+	return key, nonce, nil
 }
