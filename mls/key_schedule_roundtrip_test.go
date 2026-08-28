@@ -3,12 +3,17 @@
 // round trip stability. MLS signs over serialized forms, so a decoder that accepts two
 // encodings of one object is a signature bypass primitive rather than a leniency.
 //
-// The randomized form of these properties is p8's FuzzGroupContextRoundTrip and
-// FuzzPreSharedKeyIdRoundTrip. p8 owns all nine Gate 4 targets (registry section 9.5) and
-// declaring one here would be a second declaration of a name it already has in package
-// mls, so what this file contributes is the part only it can: the committed seed corpus
-// those targets read, and the deterministic form of the same two properties on every run
-// rather than only when the fuzzer runs.
+// The randomized form of these properties is FuzzGroupContextRoundTrip and
+// FuzzPreSharedKeyIdRoundTrip, declared at the foot of this file. They are declared here, and
+// this is the correction of a real defect rather than a preference: the interface registry's
+// nine Gate 4 targets cover the five wire structures p8 owns -- extension, key package, mls
+// message, proposal, welcome -- and neither of these two is among them. Committing a corpus
+// under a target name no plan declares gives you 287 files no fuzz engine ever opens, every
+// property below stated over bytes nothing consumes, and a verification step that cannot be
+// run. The gate that keeps that from coming back is
+// TestEveryCommittedCorpusFolderIsReadByAFuzzTarget.
+//
+// So this file owns both halves: the committed seed corpus, and the two targets that read it.
 //
 // The corpus is the load bearing half, and p1 measured why. Uniform random bytes reach the
 // round trip property 14 times in 4096 -- 0.34 percent -- against the SIMPLEST type in the
@@ -29,9 +34,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -269,7 +278,11 @@ func seedPreSharedKeyIds(t *testing.T) []*PreSharedKeyId {
 // property is written once over both structures rather than twice over one, which is how the
 // second copy comes to assert less than the first.
 type seedCodec struct {
-	target         string
+	target string
+	// structure is a fresh zero value of the structure this codec encodes. It is what the
+	// coverage gates derive their class from: the registries reachable on the wire and the
+	// fields the corpus has to vary both come off this type rather than off a list.
+	structure      func() any
 	values         func(t *testing.T) []any
 	decode         func(bs []byte) (any, error)
 	encode         func(value any) ([]byte, error)
@@ -280,7 +293,8 @@ type seedCodec struct {
 func seedCodecs() []seedCodec {
 	return []seedCodec{
 		{
-			target: groupContextSeedTarget,
+			target:    groupContextSeedTarget,
+			structure: func() any { return &GroupContext{} },
 			values: func(t *testing.T) []any {
 				values := []any{}
 				for _, value := range seedGroupContexts(t) {
@@ -297,7 +311,8 @@ func seedCodecs() []seedCodec {
 			describe:       func(value any) string { return describeGroupContext(value.(*GroupContext)) },
 		},
 		{
-			target: preSharedKeyIdSeedTarget,
+			target:    preSharedKeyIdSeedTarget,
+			structure: func() any { return &PreSharedKeyId{} },
 			values: func(t *testing.T) []any {
 				values := []any{}
 				for _, value := range seedPreSharedKeyIds(t) {
@@ -352,7 +367,7 @@ func generatedSeedFiles(t *testing.T, codec seedCodec) map[string][]byte {
 // subdirectory, and an empty folder are all failures rather than fallbacks: the corpus is
 // committed so that a crasher is reproducible from a clean checkout, and a target that
 // silently fell back to no seeds is a target that reports green having decoded nothing.
-func readSeedCorpus(t *testing.T, target string) ([]string, map[string][]byte) {
+func readSeedCorpus(t testing.TB, target string) ([]string, map[string][]byte) {
 	t.Helper()
 	directory := seedCorpusDirectory(target)
 	entries, err := os.ReadDir(directory)
@@ -566,7 +581,13 @@ func TestEverySeedInTheCommittedCorpusReEncodesToItsOwnBytes(t *testing.T) {
 // so a field dropped by both halves round tripped byte exact.
 //
 // The comparison walks the struct definition rather than naming fields, so a field added to
-// either structure later is covered by the commit that adds it.
+// either structure later is VISITED by the commit that adds it. It is not thereby COVERED, and
+// the difference is the whole of what this test cannot do on its own: the generator's per field
+// axes are hand written, so a newly added field is generated at its zero value in every seed and
+// this walk then compares zero against zero. Confirmed by mutation, twice: an opaque field added
+// to GroupContext and carried by both halves left every property in this file green, and
+// dropping it from both halves again left them green.
+// TestEveryFieldOfBothStructuresVariesAcrossTheCommittedCorpus states the missing half.
 func TestEveryGeneratedSeedValueIsRecoveredByDecodingItsEncoding(t *testing.T) {
 	for _, codec := range seedCodecs() {
 		values := codec.values(t)
@@ -599,93 +620,346 @@ func TestEveryGeneratedSeedValueIsRecoveredByDecodingItsEncoding(t *testing.T) {
 	}
 }
 
-// TestTheCommittedSeedCorpusCoversEveryRegistryCodePointAndEveryBoundary is the rule 5 gate
-// on the corpus itself, and it reads the SEEDS ON DISK rather than the generator's output.
-//
-// The class is derived from the package's own constant declarations, so a code point added to
-// any of these five registries turns this red until the corpus catches up -- which is the
-// only mechanism that keeps a committed corpus from ageing into a list of the code points
-// that existed when somebody wrote it. The length and epoch boundaries are asserted the same
-// way, against the axes rather than against a second copy of them.
-func TestTheCommittedSeedCorpusCoversEveryRegistryCodePointAndEveryBoundary(t *testing.T) {
-	observed := map[string]map[uint64]bool{
-		"ProtocolVersion":    {},
-		"CipherSuite":        {},
-		"ExtensionType":      {},
-		"PskType":            {},
-		"ResumptionPskUsage": {},
-	}
-	lengths := map[string]map[int]bool{
-		groupContextSeedTarget:   {},
-		preSharedKeyIdSeedTarget: {},
-	}
-	epochs := map[string]map[uint64]bool{
-		groupContextSeedTarget:   {},
-		preSharedKeyIdSeedTarget: {},
-	}
+// ---------------------------------------------------------------------------
+// what the corpus was seen to carry, derived rather than listed
+// ---------------------------------------------------------------------------
 
-	groupContextNames, groupContextSeeds := readSeedCorpus(t, groupContextSeedTarget)
-	for _, name := range groupContextNames {
-		parsed := &GroupContext{}
-		if err := syntax.Unmarshal(groupContextSeeds[name], parsed); err != nil {
-			t.Fatalf("%s/%s: %v", groupContextSeedTarget, name, err)
-		}
-		observed["ProtocolVersion"][uint64(parsed.Version)] = true
-		observed["CipherSuite"][uint64(parsed.CipherSuite)] = true
-		epochs[groupContextSeedTarget][parsed.Epoch] = true
-		for _, field := range [][]byte{parsed.GroupId, parsed.TreeHash, parsed.ConfirmedTranscriptHash} {
-			lengths[groupContextSeedTarget][len(field)] = true
-		}
-		for _, extension := range parsed.Extensions {
-			observed["ExtensionType"][uint64(extension.ExtensionType)] = true
-			lengths[groupContextSeedTarget][len(extension.ExtensionData)] = true
+// seedMlsPackagePath is this package's import path, read off a type in it rather than typed
+// out, so the derivations below cannot drift from the package they are about.
+var seedMlsPackagePath = reflect.TypeOf(GroupContext{}).PkgPath()
+
+// seedRegistryTypeName answers whether a type is one of this package's registries: a NAMED
+// integer declared in package mls. That is the derivation, and it is the whole point of it --
+// the previous version of the gate below held a hand written list of five type names, and a
+// sixth registry declared in this package and carried by GroupContext was invisible to every
+// property in this file. The corpus carried its zero code point in all 146 seeds, every test
+// stayed green, and the fuzzer would have started blind to every arm the new enum selects.
+// That is the table-holding-five-of-six shape rule 5 names, in the one file whose whole subject
+// is derived coverage.
+func seedRegistryTypeName(candidate reflect.Type) (string, bool) {
+	if candidate.PkgPath() != seedMlsPackagePath || candidate.Name() == "" {
+		return "", false
+	}
+	switch candidate.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return candidate.Name(), true
+	}
+	return "", false
+}
+
+// seedCodePoint reads a registry value as the unsigned code point the wire carries.
+func seedCodePoint(value reflect.Value) (uint64, bool) {
+	switch value.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return value.Uint(), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return uint64(value.Int()), true
+	}
+	return 0, false
+}
+
+// seedRegistryTypesReachable collects the registry class of one structure: every named integer
+// this package declares that a value of that structure can carry on the wire. It walks the TYPE
+// rather than the values, because a registry no seed happens to reach is exactly the case the
+// gate has to fail on.
+func seedRegistryTypesReachable(structure reflect.Type, into map[string]bool, seen map[reflect.Type]bool) {
+	if seen[structure] {
+		return
+	}
+	seen[structure] = true
+	if name, isRegistry := seedRegistryTypeName(structure); isRegistry {
+		into[name] = true
+		return
+	}
+	switch structure.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		seedRegistryTypesReachable(structure.Elem(), into, seen)
+	case reflect.Map:
+		seedRegistryTypesReachable(structure.Key(), into, seen)
+		seedRegistryTypesReachable(structure.Elem(), into, seen)
+	case reflect.Struct:
+		for index := 0; index < structure.NumField(); index++ {
+			seedRegistryTypesReachable(structure.Field(index).Type, into, seen)
 		}
 	}
+}
 
-	pskNames, pskSeeds := readSeedCorpus(t, preSharedKeyIdSeedTarget)
-	for _, name := range pskNames {
-		parsed := &PreSharedKeyId{}
-		if err := syntax.Unmarshal(pskSeeds[name], parsed); err != nil {
-			t.Fatalf("%s/%s: %v", preSharedKeyIdSeedTarget, name, err)
+// seedFieldPathsOf is the same walk over the type, collecting the field paths a walk over a
+// VALUE of it will visit. The two walks have to agree on the spelling of a path, which is why
+// they are written beside each other: a path the type walk names and the value walk never
+// produces reads as an unreached field, and the gate below says so rather than passing.
+func seedFieldPathsOf(structure reflect.Type, at string, into *[]string, seen map[reflect.Type]bool) {
+	switch structure.Kind() {
+	case reflect.Pointer:
+		if seen[structure] {
+			return
 		}
-		observed["PskType"][uint64(parsed.PskType)] = true
-		for _, field := range [][]byte{parsed.PskId, parsed.PskGroupId, parsed.PskNonce} {
-			lengths[preSharedKeyIdSeedTarget][len(field)] = true
+		seen[structure] = true
+		seedFieldPathsOf(structure.Elem(), at, into, seen)
+	case reflect.Struct:
+		if seen[structure] {
+			return
 		}
-		if parsed.PskType != PskTypeResumption {
-			// the external arm encodes neither field, so a value read back from one is
-			// the decoder's zero rather than something the corpus carried.
-			continue
-		}
-		observed["ResumptionPskUsage"][uint64(parsed.Usage)] = true
-		epochs[preSharedKeyIdSeedTarget][parsed.PskEpoch] = true
-	}
-
-	for _, typeName := range slices.Sorted(maps.Keys(observed)) {
-		derived := registryConstantsOfType(t, typeName)
-		for _, name := range slices.Sorted(maps.Keys(derived)) {
-			if !observed[typeName][derived[name]] {
-				t.Errorf("no committed seed carries %s = %#x; a registry member the corpus does not encode is a decoder arm the fuzzer starts blind to, and regenerating with %s=1 is the fix",
-					name, derived[name], seedCorpusWriteEnv)
+		seen[structure] = true
+		for index := 0; index < structure.NumField(); index++ {
+			field := structure.Field(index)
+			if !field.IsExported() {
+				continue
 			}
+			seedFieldPathsOf(field.Type, at+"."+field.Name, into, seen)
 		}
-		t.Logf("%s: %d code points declared, all present among the %d distinct values the corpus carries",
-			typeName, len(derived), len(observed[typeName]))
+	case reflect.Slice:
+		*into = append(*into, at)
+		if structure.Elem().Kind() == reflect.Uint8 {
+			return
+		}
+		seedFieldPathsOf(structure.Elem(), at+"[]", into, seen)
+	default:
+		*into = append(*into, at)
 	}
+}
 
-	for _, target := range []string{groupContextSeedTarget, preSharedKeyIdSeedTarget} {
+// seedObservations is what a walk over the committed corpus actually saw, keyed by the field
+// path it saw it at rather than by a name somebody wrote down.
+type seedObservations struct {
+	// fieldValues maps a field path to the DISTINCT decoded values the corpus carries there.
+	// The count is the load bearing part rather than the values: a field the codec does not
+	// carry decodes to one value across the whole corpus, whatever the generator meant to put
+	// in it.
+	fieldValues map[string]map[string]bool
+	// registryValues maps a registry type name to the code points the corpus carries.
+	registryValues map[string]map[uint64]bool
+	// opaqueLengths and epochValues are the varint width and uint64 boundary axes, collected
+	// from every []byte and every unnamed uint64 field the walk reaches rather than from a
+	// list of the three fields per structure somebody remembered.
+	opaqueLengths map[int]bool
+	epochValues   map[uint64]bool
+}
+
+func newSeedObservations() *seedObservations {
+	return &seedObservations{
+		fieldValues:    map[string]map[string]bool{},
+		registryValues: map[string]map[uint64]bool{},
+		opaqueLengths:  map[int]bool{},
+		epochValues:    map[uint64]bool{},
+	}
+}
+
+func (self *seedObservations) record(fieldPath string, value string) {
+	values, seen := self.fieldValues[fieldPath]
+	if !seen {
+		values = map[string]bool{}
+		self.fieldValues[fieldPath] = values
+	}
+	values[value] = true
+}
+
+// observe walks one decoded seed and records every field it holds.
+//
+// An unexported field is fatal rather than skipped, for the same reason it is fatal in
+// seedValuesAgree: a field this walk cannot read is a field it would report covered whatever
+// the corpus put in it.
+func (self *seedObservations) observe(t *testing.T, fieldPath string, value reflect.Value) {
+	t.Helper()
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if value.IsNil() {
+			self.record(fieldPath, "nil")
+			return
+		}
+		self.observe(t, fieldPath, value.Elem())
+	case reflect.Struct:
+		if value.NumField() == 0 {
+			t.Fatalf("%s: %s declares no field, so this walk observed nothing", fieldPath, value.Type())
+		}
+		for index := 0; index < value.NumField(); index++ {
+			field := value.Type().Field(index)
+			if !field.IsExported() {
+				t.Fatalf("%s.%s is unexported, so this walk cannot read it and would report a field the corpus never varies as covered",
+					fieldPath, field.Name)
+			}
+			self.observe(t, fieldPath+"."+field.Name, value.Field(index))
+		}
+	case reflect.Slice:
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			self.record(fieldPath, fmt.Sprintf("%x", value.Bytes()))
+			self.opaqueLengths[value.Len()] = true
+			return
+		}
+		// a vector is observed by its arity as well as by its entries: the length prefix counts
+		// BYTES rather than elements, and those two readings agree on every one entry vector
+		// and part company at the first two entry one.
+		self.record(fieldPath, fmt.Sprintf("arity %d", value.Len()))
+		for index := 0; index < value.Len(); index++ {
+			self.observe(t, fieldPath+"[]", value.Index(index))
+		}
+	default:
+		if !value.CanInterface() {
+			t.Fatalf("%s: this walk cannot read a %s", fieldPath, value.Type())
+		}
+		self.record(fieldPath, fmt.Sprintf("%v", value.Interface()))
+		if registry, isRegistry := seedRegistryTypeName(value.Type()); isRegistry {
+			code, readable := seedCodePoint(value)
+			if !readable {
+				t.Fatalf("%s: %s is a registry type this walk cannot read as a code point", fieldPath, value.Type())
+			}
+			if self.registryValues[registry] == nil {
+				self.registryValues[registry] = map[uint64]bool{}
+			}
+			self.registryValues[registry][code] = true
+		}
+		if value.Kind() == reflect.Uint64 && value.Type().PkgPath() == "" {
+			self.epochValues[value.Uint()] = true
+		}
+	}
+}
+
+// observeCommittedCorpus decodes every committed seed of one target and returns what they hold.
+func observeCommittedCorpus(t *testing.T, codec seedCodec) ([]string, *seedObservations) {
+	t.Helper()
+	names, onDisk := readSeedCorpus(t, codec.target)
+	observations := newSeedObservations()
+	for _, name := range names {
+		parsed, err := codec.decode(onDisk[name])
+		if err != nil {
+			t.Fatalf("%s/%s: the committed seed did not decode, so nothing below observed it: %v", codec.target, name, err)
+		}
+		observations.observe(t, codec.target, reflect.ValueOf(parsed))
+	}
+	if len(observations.fieldValues) == 0 {
+		t.Fatalf("%s: the walk over %d committed seeds recorded no field at all", codec.target, len(names))
+	}
+	return names, observations
+}
+
+// TestTheCommittedSeedCorpusCoversEveryRegistryCodePoint is the rule 5 gate on the corpus
+// itself, and it reads the SEEDS ON DISK rather than the generator's output.
+//
+// Both sides are derived. The class of registries is every named integer this package declares
+// that the structure can carry on the wire, taken from the structure's own type; the code points
+// of each are taken from the package's own constant declarations. So a code point added to any
+// registry, and a whole new registry added to either structure, both turn this red until the
+// corpus catches up -- which is the only mechanism that keeps a committed corpus from ageing
+// into a list of the code points that existed when somebody wrote it.
+func TestTheCommittedSeedCorpusCoversEveryRegistryCodePoint(t *testing.T) {
+	for _, codec := range seedCodecs() {
+		names, observations := observeCommittedCorpus(t, codec)
+
+		structure := reflect.TypeOf(codec.structure())
+		registries := map[string]bool{}
+		seedRegistryTypesReachable(structure, registries, map[reflect.Type]bool{})
+		if len(registries) == 0 {
+			t.Fatalf("%s: no registry type is reachable from %s, so this gate would assert nothing over %d seeds",
+				codec.target, structure, len(names))
+		}
+		for _, typeName := range slices.Sorted(maps.Keys(registries)) {
+			derived := namedTypeConstants(t, typeCheckedPackage(t), typeName)
+			if len(derived) == 0 {
+				// a named integer on the wire that declares no code point is not a registry, so
+				// there is nothing here to cover. It is logged rather than passed over in
+				// silence, and the field gate below is what keeps the corpus honest about it.
+				t.Logf("%s carries %s, which declares no code point", codec.target, typeName)
+				continue
+			}
+			for _, name := range slices.Sorted(maps.Keys(derived)) {
+				if !observations.registryValues[typeName][derived[name]] {
+					t.Errorf("no committed %s seed carries %s = %#x; a registry member the corpus does not encode is a decoder arm the fuzzer starts blind to, and regenerating with %s=1 is the fix",
+						codec.target, name, derived[name], seedCorpusWriteEnv)
+				}
+			}
+			t.Logf("%s: %s declares %d code points, all present among the %d distinct values the corpus carries",
+				codec.target, typeName, len(derived), len(observations.registryValues[typeName]))
+		}
+	}
+}
+
+// TestTheCommittedSeedCorpusCoversEveryVarintWidthAndEpochBoundary asserts the two non registry
+// axes over the seeds on disk: the lengths the varint prefix branches on, and the uint64
+// boundaries a narrowed or signed epoch would move.
+//
+// The fields it collects them from are derived too -- every []byte and every unnamed uint64 the
+// walk reaches -- rather than the three opaque fields per structure the previous version named.
+func TestTheCommittedSeedCorpusCoversEveryVarintWidthAndEpochBoundary(t *testing.T) {
+	for _, codec := range seedCodecs() {
+		names, observations := observeCommittedCorpus(t, codec)
 		for _, length := range append(seedOpaqueLengths(), seedWideOpaqueLength) {
-			if !lengths[target][length] {
+			if !observations.opaqueLengths[length] {
 				t.Errorf("%s: no committed seed carries a variable length field of %d octets, which is one of the widths the varint prefix branches on",
-					target, length)
+					codec.target, length)
 			}
 		}
 		for _, epoch := range seedEpochs() {
-			if !epochs[target][epoch] {
-				t.Errorf("%s: no committed seed carries the epoch boundary %#016x", target, epoch)
+			if !observations.epochValues[epoch] {
+				t.Errorf("%s: no committed seed carries the epoch boundary %#016x", codec.target, epoch)
 			}
 		}
+		t.Logf("%s: %d distinct field lengths and %d distinct uint64 values across %d seeds",
+			codec.target, len(observations.opaqueLengths), len(observations.epochValues), len(names))
 	}
+}
+
+// TestEveryFieldOfBothStructuresVariesAcrossTheCommittedCorpus is the gate the derived
+// comparison in seedValuesAgree cannot be, and the distinction is worth stating because that
+// comparison's own doc comment used to overstate it.
+//
+// seedValuesAgree walks the struct definition, so it VISITS a field added later. It compares
+// that field's value in the original against its value in the decode of its encoding -- and the
+// generator's axes are hand written, so a newly added field is generated at its zero value in
+// every seed, the walk compares zero against zero, and the mutation this whole file exists to
+// catch (drop the field from BOTH halves of the codec) is fully green. Both halves of that were
+// confirmed by mutation on this file: a new opaque field added to GroupContext and encoded left
+// every property here passing, and dropping it from both halves again left them passing too.
+//
+// This states the missing half as a property of the CORPUS rather than of the generator: every
+// field of these structures takes at least two distinct values across the committed seeds. A
+// field the codec does not carry decodes to one value in every seed. A field the codec carries
+// and the generator never varies decodes to one value in every seed. Those are the same defect
+// seen from the fuzzer, which is handed an axis it can never move, and both are one count away
+// here. The class of fields is derived from the structure, so the field added tomorrow is in it.
+func TestEveryFieldOfBothStructuresVariesAcrossTheCommittedCorpus(t *testing.T) {
+	for _, codec := range seedCodecs() {
+		names, observations := observeCommittedCorpus(t, codec)
+
+		fieldPaths := []string{}
+		seedFieldPathsOf(reflect.TypeOf(codec.structure()), codec.target, &fieldPaths, map[reflect.Type]bool{})
+		if len(fieldPaths) == 0 {
+			t.Fatalf("%s: the field derivation named no field of %s, so this gate would assert nothing",
+				codec.target, reflect.TypeOf(codec.structure()))
+		}
+		varying := 0
+		for _, fieldPath := range fieldPaths {
+			values, reached := observations.fieldValues[fieldPath]
+			if !reached {
+				t.Errorf("%s: %s is a field of the structure and the walk over %d committed seeds never reached it, so nothing here says what the corpus puts in it",
+					codec.target, fieldPath, len(names))
+				continue
+			}
+			if len(values) < 2 {
+				t.Errorf("%s: all %d committed seeds decode to the same %s (%s). a field the corpus never varies is a field the codec could drop from BOTH halves without moving one committed byte, which is the mutation this corpus exists to catch; give it an axis in the generator and regenerate with %s=1",
+					codec.target, len(names), fieldPath, describeSoleSeedValue(values), seedCorpusWriteEnv)
+				continue
+			}
+			varying++
+		}
+		t.Logf("%s: %d of %d derived fields carry at least two distinct values across %d seeds",
+			codec.target, varying, len(fieldPaths), len(names))
+	}
+}
+
+// describeSoleSeedValue names the one value a field was found to hold, truncated, so the failure
+// above says WHICH constant the corpus is stuck on rather than only that it is stuck.
+func describeSoleSeedValue(values map[string]bool) string {
+	for _, value := range slices.Sorted(maps.Keys(values)) {
+		if value == "" {
+			return "the empty value"
+		}
+		if len(value) > 64 {
+			return value[:64] + "..."
+		}
+		return value
+	}
+	return "no value at all"
 }
 
 // TestEverySeedInTheCommittedCorpusRefusesEveryTruncationAndAnyExtension is gate 4 property 1
@@ -821,59 +1095,416 @@ func TestCheckRoundTripReportsTheViolationsItIsHanded(t *testing.T) {
 	}
 }
 
-// TestTheCommittedSeedCorpusIsPinnedAsBinary is the one property in this file that is not
-// about the codec, and it is here because the corpus stops being evidence the moment a
-// checkout is allowed to rewrite it.
+// ---------------------------------------------------------------------------
+// the pin that keeps the corpus the bytes that were committed
+// ---------------------------------------------------------------------------
+
+// gitAttributesTextRule is one .gitattributes line that has an opinion about the text attribute:
+// the pattern, and whether it turns text OFF. `-text` and the `binary` macro both do; `text`
+// and `text eol=lf` both turn it on. A line that says nothing about text is not a rule here at
+// all, which is why the type carries no third state.
+type gitAttributesTextRule struct {
+	line    string
+	pattern string
+	pinned  bool
+}
+
+// gitAttributesTextRules reads the rules in FILE ORDER, because order is the whole of the
+// semantics: git resolves an attribute by the LAST matching line, so a scan that stopped at the
+// first match would report a pin a later line had already undone.
+func gitAttributesTextRules(body string) []gitAttributesTextRule {
+	rules := []gitAttributesTextRule{}
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		for _, attribute := range fields[1:] {
+			switch {
+			case attribute == "-text" || attribute == "binary":
+				rules = append(rules, gitAttributesTextRule{line: strings.TrimSpace(line), pattern: fields[0], pinned: true})
+			case attribute == "text" || strings.HasPrefix(attribute, "text="):
+				rules = append(rules, gitAttributesTextRule{line: strings.TrimSpace(line), pattern: fields[0], pinned: false})
+			}
+		}
+	}
+	return rules
+}
+
+// gitAttributesPinsAsBinary answers, for one repository relative path, whether the rule set
+// leaves end of line conversion off for it, and names the line that decided.
+func gitAttributesPinsAsBinary(rules []gitAttributesTextRule, filePath string) (bool, string) {
+	pinned, decidedBy := false, ""
+	for _, rule := range rules {
+		if gitAttributesPatternMatches(rule.pattern, filePath) {
+			pinned, decidedBy = rule.pinned, rule.line
+		}
+	}
+	return pinned, decidedBy
+}
+
+// gitAttributesPatternMatches answers gitattributes' own question -- does this pattern apply to
+// this path -- rather than the question a prefix comparison answers, which is whether somebody
+// spelled the pattern the way this test's author expected.
 //
-// core.autocrlf=true is set at system scope on the windows boxes that build this repository,
-// and git decides text from binary by looking for a NUL octet in a file's first 8000. Every
-// seed committed today holds one, so nothing is being converted right now -- but the corpus
-// is REGENERATED whenever an axis moves, and a seed that happens to hold no NUL and does hold
-// an 0x0a would be rewritten on checkout into bytes no decoder accepts. That failure arrives
-// as a corpus that stops decoding on somebody else's machine, which reads as a codec bug.
+// That distinction was a real false positive here. The gate used to accept a rule only when its
+// pattern string started with "mls/testdata/corpus", so `/mls/testdata/corpus/** -text`, which
+// is the same rule to git and arguably the more correct spelling of it, failed. A gate that
+// fails on a correct spelling is a gate that will one day be silenced by rewriting the rule
+// instead of by fixing what it is complaining about.
+//
+// The semantics implemented are gitignore's, which gitattributes borrows: a pattern holding no
+// slash matches the base name at any depth; any other pattern is anchored at the directory
+// holding the .gitattributes file, and a leading slash carries no meaning beyond that anchoring;
+// `*`, `?` and a character class match within one path component; `**` stands for any number of
+// components, including none.
+func gitAttributesPatternMatches(pattern string, filePath string) bool {
+	pattern = strings.TrimSuffix(pattern, "/")
+	if pattern == "" {
+		return false
+	}
+	anchored := strings.HasPrefix(pattern, "/") || strings.Contains(strings.TrimPrefix(pattern, "/"), "/")
+	pattern = strings.TrimPrefix(pattern, "/")
+	segments := strings.Split(filePath, "/")
+	if !anchored {
+		for _, segment := range segments {
+			if matched, err := path.Match(pattern, segment); err == nil && matched {
+				return true
+			}
+		}
+		return false
+	}
+	return gitAttributesSegmentsMatch(strings.Split(pattern, "/"), segments)
+}
+
+// gitAttributesSegmentsMatch is the anchored half, component by component so that `*` cannot
+// cross a separator and `**` can.
+func gitAttributesSegmentsMatch(patternSegments []string, pathSegments []string) bool {
+	if len(patternSegments) == 0 {
+		return len(pathSegments) == 0
+	}
+	if patternSegments[0] == "**" {
+		// any number of components, including none, so every suffix of the remaining path is a
+		// candidate.
+		for skip := 0; skip <= len(pathSegments); skip++ {
+			if gitAttributesSegmentsMatch(patternSegments[1:], pathSegments[skip:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(pathSegments) == 0 {
+		return false
+	}
+	matched, err := path.Match(patternSegments[0], pathSegments[0])
+	if err != nil || !matched {
+		return false
+	}
+	return gitAttributesSegmentsMatch(patternSegments[1:], pathSegments[1:])
+}
+
+// TestTheGitAttributesPatternMatcherAnswersGitsQuestion is the control on the matcher, and it is
+// not optional: a matcher that returned true for everything would report the whole corpus pinned
+// by whatever line happened to be last, and a matcher that returned false for everything would
+// fail the gate below on a repository that is correctly configured. Both halves are stated.
+func TestTheGitAttributesPatternMatcherAnswersGitsQuestion(t *testing.T) {
+	const seed = "mls/testdata/corpus/FuzzGroupContextRoundTrip/seed001"
+	for _, probe := range []struct {
+		pattern string
+		path    string
+		matches bool
+		why     string
+	}{
+		{"mls/testdata/corpus/**", seed, true, "the spelling this repository uses"},
+		{"/mls/testdata/corpus/**", seed, true, "the same rule anchored at the root, which is what the old prefix comparison rejected"},
+		{"**/corpus/**", seed, true, "a leading ** skips any number of components"},
+		{"mls/testdata/corpus/*", seed, false, "a single star does not cross a separator, so this rule reaches the folders and not the seeds"},
+		{"mls/testdata/corpus/", seed, false, "a directory pattern does not recursively cover the paths inside it"},
+		{"message/testdata/corpus/**", seed, false, "another package's corpus"},
+		{"seed001", seed, true, "a pattern with no slash matches the base name at any depth"},
+		{"seed001", "mls/testdata/corpus/FuzzGroupContextRoundTrip/seed002", false, "and only that base name"},
+		{"*.proto", "protocol/message.proto", true, "the repository's other rule, on a path it covers"},
+		{"*.proto", "protocol/message.pb.go", false, "and one it does not"},
+	} {
+		if matched := gitAttributesPatternMatches(probe.pattern, probe.path); matched != probe.matches {
+			t.Errorf("%q against %q answered %v, want %v: %s", probe.pattern, probe.path, matched, probe.matches, probe.why)
+		}
+	}
+}
+
+// TestTheCommittedSeedCorpusIsPinnedAsBinary is the one property in this file that is not about
+// the codec, and it is here because the corpus stops being evidence the moment a checkout is
+// allowed to rewrite it.
+//
+// core.autocrlf=true is set at system scope on the windows boxes that build this repository, and
+// git decides text from binary by looking for a NUL octet in a file's first 8000. The corpus is
+// REGENERATED whenever an axis moves, and a seed that happens to hold no NUL and does hold an
+// 0x0a would be rewritten on checkout into bytes no decoder accepts. That failure arrives as a
+// corpus that stops decoding on somebody else's machine, which reads as a codec bug.
+//
+// The question is asked once per COMMITTED SEED rather than once about the folder they live in,
+// because those are different questions and only the first one is the one that matters: a rule
+// that names the folder and does not reach the files inside it pins nothing at all, and
+// `mls/testdata/corpus/*` is exactly such a rule.
 func TestTheCommittedSeedCorpusIsPinnedAsBinary(t *testing.T) {
 	attributes := filepath.Join("..", ".gitattributes")
 	body, err := os.ReadFile(attributes)
 	if err != nil {
 		t.Fatalf("read %s: %v", attributes, err)
 	}
-	pinned := ""
-	for _, line := range strings.Split(string(body), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
-			continue
-		}
-		if !strings.HasPrefix(fields[0], filepath.ToSlash(filepath.Join("mls", "testdata", "corpus"))) {
-			continue
-		}
-		for _, attribute := range fields[1:] {
-			if attribute == "-text" || attribute == "binary" {
-				pinned = line
-			}
-		}
-	}
-	if pinned == "" {
-		t.Fatalf("%s carries no rule marking mls/testdata/corpus as binary; with core.autocrlf on, a seed git reads as text is rewritten on checkout and the committed corpus stops being what was committed",
-			attributes)
+	rules := gitAttributesTextRules(string(body))
+	if len(rules) == 0 {
+		t.Fatalf("%s carries no rule that mentions the text attribute at all", attributes)
 	}
 
-	// measured rather than asserted, so the log says whether the rule above is currently
-	// carrying weight or is prophylactic.
-	convertible := 0
-	seeds := 0
+	unpinned := []string{}
+	pins := map[string]bool{}
+	convertible, seeds := 0, 0
 	for _, codec := range seedCodecs() {
 		names, onDisk := readSeedCorpus(t, codec.target)
 		for _, name := range names {
 			seeds++
-			body := onDisk[name]
-			head := body
+			seedPath := strings.Join([]string{"mls", "testdata", "corpus", codec.target, name}, "/")
+			isPinned, decidedBy := gitAttributesPinsAsBinary(rules, seedPath)
+			if !isPinned {
+				unpinned = append(unpinned, seedPath)
+				continue
+			}
+			pins[decidedBy] = true
+
+			// measured rather than asserted, so the log says whether the pin is currently
+			// carrying weight or is prophylactic.
+			seed := onDisk[name]
+			head := seed
 			if len(head) > 8000 {
 				head = head[:8000]
 			}
-			if !bytes.Contains(head, []byte{0x00}) && bytes.ContainsAny(body, "\r\n") {
+			if !bytes.Contains(head, []byte{0x00}) && bytes.ContainsAny(seed, "\r\n") {
 				convertible++
 			}
 		}
 	}
-	t.Logf("%q pins the corpus; %d of %d seeds would otherwise be eligible for end of line conversion", pinned, convertible, seeds)
+	if len(unpinned) > 0 {
+		t.Fatalf("%d of %d committed seeds are not left binary by %s (%s is one); with core.autocrlf on, a seed git reads as text is rewritten on checkout and the committed corpus stops being what was committed",
+			len(unpinned), seeds, attributes, unpinned[0])
+	}
+
+	// the negative control on the rule set as it actually stands. A .gitattributes that marked
+	// everything binary would satisfy the loop above having said nothing about the corpus, and
+	// this package's own source is the nearest file that must NOT be pinned.
+	if isPinned, decidedBy := gitAttributesPinsAsBinary(rules, "mls/key_schedule_roundtrip_test.go"); isPinned {
+		t.Errorf("%s marks this package's own source binary as well (%q), so the assertion above holds for a reason that has nothing to do with the corpus",
+			attributes, decidedBy)
+	}
+
+	t.Logf("%d seeds pinned by %d rule(s) %v; %d of them would otherwise be eligible for end of line conversion",
+		seeds, len(pins), slices.Sorted(maps.Keys(pins)), convertible)
+}
+
+// ---------------------------------------------------------------------------
+// the targets that read the corpus
+// ---------------------------------------------------------------------------
+
+// seedCorpusLoader is the name of the function below, as a string, because the gate that checks
+// a corpus folder has a reader looks for a call to it in the target's body and a literal spelled
+// twice is a literal that drifts.
+const seedCorpusLoader = "addSeedCorpus"
+
+// addSeedCorpus hands one target's committed seeds to the fuzzing engine.
+//
+// Go's own corpus directory is testdata/fuzz/<Target>, and these seeds deliberately do not live
+// there: testdata/fuzz is where the engine WRITES the inputs it finds, and a directory the tool
+// rewrites is not a directory a corpus can be evidence in. Seeds committed under
+// testdata/corpus/<Target> are read into the target explicitly instead.
+func addSeedCorpus(f *testing.F, target string) {
+	f.Helper()
+	names, bodies := readSeedCorpus(f, target)
+	added := 0
+	for _, name := range names {
+		f.Add(bodies[name])
+		added++
+	}
+	// readSeedCorpus already refuses an empty folder. This says the same thing about the hand
+	// off, because a loop that read 287 files and added none reports exactly what a loop that
+	// added every one reports, and the whole defect this file was reviewed for was a corpus
+	// nothing consumed.
+	if added == 0 {
+		f.Fatalf("%s: not one committed seed reached the fuzzing corpus", target)
+	}
+	f.Logf("%s: %d committed seeds added", target, added)
+}
+
+// FuzzGroupContextRoundTrip is gate 4 properties 1 and 2 on the section 8.1 group context in
+// their randomized form: no panic on adversarial input, and an encoding that decodes must
+// re-encode to the bytes it came from.
+//
+// The property is stated through syntax.CheckRoundTrip rather than open coded, which is
+// deliberate: that helper is the one every Gate 4 target in this tree reaches its codec through,
+// TestCheckRoundTripReportsTheViolationsItIsHanded below is the positive control on it, and a
+// target that restated the comparison locally would be green against a helper that had stopped
+// making it.
+//
+// Seeds that do not decode are not failures. A fuzzer spends most of its budget on inputs no
+// decoder accepts, and an obligation on those would drown the one that matters.
+func FuzzGroupContextRoundTrip(f *testing.F) {
+	addSeedCorpus(f, groupContextSeedTarget)
+	f.Fuzz(func(t *testing.T, encoded []byte) {
+		if err := syntax.CheckRoundTrip[GroupContext, *GroupContext](encoded); err != nil {
+			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
+		}
+	})
+}
+
+// FuzzPreSharedKeyIdRoundTrip is the same two properties on the section 8.4 pre shared key id.
+// It is a separate target rather than a second case of one, because the fuzzing engine keeps its
+// coverage feedback and its found corpus per target, and one target over two grammars spends
+// half its budget on each while reporting one.
+func FuzzPreSharedKeyIdRoundTrip(f *testing.F) {
+	addSeedCorpus(f, preSharedKeyIdSeedTarget)
+	f.Fuzz(func(t *testing.T, encoded []byte) {
+		if err := syntax.CheckRoundTrip[PreSharedKeyId, *PreSharedKeyId](encoded); err != nil {
+			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
+		}
+	})
+}
+
+// declaredFuzzTargets reads this package's test source and returns, for every fuzz target it
+// declares, the set of identifiers that target's body names.
+//
+// The target set is derived from the SIGNATURE rather than from the name, because that is what
+// the go tool derives it from: a func(*testing.F) is a fuzz target and nothing else is, whatever
+// it is called.
+func declaredFuzzTargets(t *testing.T, directory string) map[string]map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read %s: %v", directory, err)
+	}
+	fileSet := token.NewFileSet()
+	targets := map[string]map[string]bool{}
+	read := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, filepath.Join(directory, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		read++
+		for _, declaration := range parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || !isFuzzTargetSignature(function) {
+				continue
+			}
+			identifiers := map[string]bool{}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
+					identifiers[identifier.Name] = true
+				}
+				return true
+			})
+			targets[function.Name.Name] = identifiers
+		}
+	}
+	if read == 0 {
+		t.Fatalf("no _test.go file was read from %s, so this derivation proves nothing", directory)
+	}
+	return targets
+}
+
+// isFuzzTargetSignature holds the go tool's definition: a top level function taking exactly one
+// *testing.F and returning nothing.
+func isFuzzTargetSignature(function *ast.FuncDecl) bool {
+	if function.Recv != nil || function.Body == nil || function.Type.Params == nil {
+		return false
+	}
+	if len(function.Type.Params.List) != 1 || len(function.Type.Params.List[0].Names) != 1 {
+		return false
+	}
+	if function.Type.Results != nil && len(function.Type.Results.List) != 0 {
+		return false
+	}
+	pointer, isPointer := function.Type.Params.List[0].Type.(*ast.StarExpr)
+	if !isPointer {
+		return false
+	}
+	selector, isSelector := pointer.X.(*ast.SelectorExpr)
+	if !isSelector || selector.Sel.Name != "F" {
+		return false
+	}
+	packageName, isIdentifier := selector.X.(*ast.Ident)
+	return isIdentifier && packageName.Name == "testing"
+}
+
+// TestEveryCommittedCorpusFolderIsReadByAFuzzTarget is why the corpus is evidence rather than
+// 287 files.
+//
+// The first version of this file committed both folders and declared neither target, on the
+// belief that another plan owned the two names. It did not: no plan in the tree named either, so
+// no fuzz engine had ever opened one seed, the verification step written for it could not be
+// run, and every property stated over the corpus was stated over bytes nothing consumed. That is
+// invisible from every other property in this file, all of which read the folder directly and
+// none of which cares whether a fuzz target exists.
+//
+// Both sides are derived -- the folders that are on disk, and the func(*testing.F) declarations
+// this package's test source actually holds -- because a table naming "the targets we have" is
+// the enumeration rule 5 forbids, and it is a table that stays green after the target it names
+// has been deleted.
+func TestEveryCommittedCorpusFolderIsReadByAFuzzTarget(t *testing.T) {
+	targets := declaredFuzzTargets(t, ".")
+	if len(targets) == 0 {
+		t.Fatal("this package's test source declares no func(*testing.F) at all, so this gate cannot tell a corpus with a reader from a corpus without one")
+	}
+
+	root := filepath.Join("testdata", "corpus")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read %s: %v", root, err)
+	}
+	folders := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			t.Errorf("%s holds the file %q; every seed lives under a folder named for the target that reads it", root, entry.Name())
+			continue
+		}
+		folders++
+		body, declared := targets[entry.Name()]
+		if !declared {
+			t.Errorf("%s/%s holds committed seeds and this package declares no func %s(f *testing.F); a corpus no target names is a corpus no fuzz engine ever reads, and every property stated over it is stated over files nothing consumes",
+				root, entry.Name(), entry.Name())
+			continue
+		}
+		if !seedFolderHoldsFilesDirectly(t, filepath.Join(root, entry.Name())) {
+			// a folder of folders belongs to a loader with its own layout, and the one in this
+			// file refuses to recurse; there is nothing here for this half of the gate to say.
+			continue
+		}
+		if !body[seedCorpusLoader] {
+			t.Errorf("%s/%s holds seeds directly and func %s does not call %s, so those seeds reach the fuzzing engine by no route this gate can see",
+				root, entry.Name(), entry.Name(), seedCorpusLoader)
+		}
+	}
+	if folders == 0 {
+		t.Fatalf("%s holds no corpus folder, so this gate asserted nothing", root)
+	}
+	t.Logf("%d committed corpus folders, each read by a declared fuzz target; %d fuzz targets in the package",
+		folders, len(targets))
+}
+
+// seedFolderHoldsFilesDirectly reports whether a corpus folder holds seeds itself rather than
+// holding further folders that do.
+func seedFolderHoldsFilesDirectly(t *testing.T, directory string) bool {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read %s: %v", directory, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			return true
+		}
+	}
+	return false
 }
