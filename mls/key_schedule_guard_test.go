@@ -139,6 +139,137 @@ func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string) []stri
 	return found
 }
 
+// mlsStructuresIn is the class the shape rule below is over: the types of the scanned source
+// that are MLS structures, read off the source as the types that DECLARE a sanctioned hook.
+//
+// This is what convention C1 is actually about. A GroupContext has a wire encoding because it
+// goes on the wire, and a KeySchedule does not; the difference is not a name and not a field
+// list, it is whether the type implements the codec interfaces mls/syntax declares. Derived
+// this way, a structure added later is covered by the commit that gives it MarshalMLS, and a
+// type that is not on the wire is left alone -- which is what keeps this from reporting every
+// accessor in the package that happens to answer a byte run.
+func mlsStructuresIn(files []parsedSource, sanctioned []string) []string {
+	structures := []string{}
+	for _, parsed := range files {
+		for _, one := range declaredIn(parsed) {
+			if one.receiver != "" && slices.Contains(sanctioned, one.name) {
+				structures = append(structures, strings.TrimPrefix(one.receiver, "*"))
+			}
+		}
+	}
+	slices.Sort(structures)
+	return slices.Compact(structures)
+}
+
+// keyScheduleStructFieldsIn is the field names of every struct type the scanned source
+// declares, which is what tells a codec from an accessor below.
+func keyScheduleStructFieldsIn(files []parsedSource) map[string][]string {
+	fields := map[string][]string{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			named, isNamed := node.(*ast.TypeSpec)
+			if !isNamed {
+				return true
+			}
+			structure, isStruct := named.Type.(*ast.StructType)
+			if !isStruct {
+				return true
+			}
+			for _, field := range fieldsOf(structure.Fields) {
+				for _, declared := range field.Names {
+					fields[named.Name.Name] = append(fields[named.Name.Name], declared.Name)
+				}
+			}
+			return true
+		})
+	}
+	return fields
+}
+
+// keyScheduleIsByteRun answers whether one rendered type is a run of bytes: []byte itself, or
+// a type the scanned source declares as one.
+func keyScheduleIsByteRun(rendered string, named []string) bool {
+	return rendered == "[]byte" || slices.Contains(named, rendered)
+}
+
+// keyScheduleSecondCodecsIn is the half of this rule that reads SHAPE rather than spelling:
+// every declaration that converts an MLS structure to or from a byte run under a name
+// carrying no codec verb at all.
+//
+// The verb rule next door is a prefix match, so a hand rolled codec written as
+// groupContextFromBytes and encodeToWire is invisible to it -- confirmed by adding exactly
+// that pair to group_context.go and watching the gate pass. Shape is the half that does not
+// depend on what somebody called it.
+//
+// Two shapes, and each carries the discriminator that keeps it off legitimate code, because a
+// signature test alone was measured to report JoinerSecret, WelcomeSecret, GroupContextBytes
+// and (*HpkeContext).nonce:
+//
+//   - an ENCODER answers a byte run, is reached on an MLS structure, and names MORE THAN ONE
+//     of that structure's fields. The field count is the discriminator and it is the property
+//     itself: what makes a second encoder dangerous is that it lays several fields out in an
+//     order, and what an accessor does is hand back one. (*GroupContext).treeHash is the
+//     second shape and must not be reported; a method that reads the group id AND the tree
+//     hash to build bytes is the first.
+//   - a DECODER takes ONE byte run and nothing else, and answers an MLS structure. The arity
+//     is the discriminator: a decoder is handed one opaque run and takes it apart, where a
+//     constructor is handed the fields already separated. NewGroupContext(groupId, epoch,
+//     treeHash) is a constructor by that reading and is not reported.
+//
+// What this still cannot see is a decoder that takes a byte run AND something else -- a
+// provider, a version -- under a name with no verb in it. That shape is left uncovered rather
+// than bought with a rule that reports every constructor in the package, and it is written
+// here rather than left for the next reader to rediscover.
+func keyScheduleSecondCodecsIn(parsed parsedSource, structures []string, byteRuns []string, fields map[string][]string) []string {
+	namesAnMlsStructure := func(rendered string) bool {
+		return slices.ContainsFunc(structures, func(one string) bool {
+			return rendered == one || rendered == "*"+one || rendered == "[]"+one || rendered == "[]*"+one
+		})
+	}
+	found := []string{}
+	for _, one := range declaredIn(parsed) {
+		answers := []string{}
+		for _, result := range one.results {
+			if result != "error" {
+				answers = append(answers, result)
+			}
+		}
+		if len(answers) != 1 {
+			continue
+		}
+		receiver := strings.TrimPrefix(one.receiver, "*")
+		encodes := slices.Contains(structures, receiver) &&
+			keyScheduleIsByteRun(answers[0], byteRuns) &&
+			keyScheduleFieldsNamedIn(one.body, fields[receiver]) > 1
+		decodes := len(one.params) == 1 && keyScheduleIsByteRun(one.params[0], byteRuns) &&
+			namesAnMlsStructure(answers[0])
+		if !encodes && !decodes {
+			continue
+		}
+		if one.receiver != "" {
+			found = append(found, "("+one.receiver+")."+one.name)
+			continue
+		}
+		found = append(found, one.name)
+	}
+	return found
+}
+
+// keyScheduleFieldsNamedIn counts how many DISTINCT fields of a type one body mentions.
+func keyScheduleFieldsNamedIn(body *ast.BlockStmt, fields []string) int {
+	if body == nil {
+		return 0
+	}
+	named := map[string]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && slices.Contains(fields, identifier.Name) {
+			named[identifier.Name] = true
+		}
+		return true
+	})
+	return len(named)
+}
+
 // keyScheduleCodecControl declares one of each shape the rule has to tell apart: the two
 // sanctioned hooks, the free constructor and the per type wrapper convention C1 bans, the two
 // extension vector spellings that do not exist -- the codec is WriteExtensions/ReadExtensions
@@ -150,7 +281,11 @@ func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string) []stri
 // accessor as a decoder and a reader learns to ignore the gate.
 const keyScheduleCodecControl = `package control
 
-type GroupContext struct{}
+type GroupContext struct {
+	GroupId  []byte
+	Epoch    uint64
+	TreeHash []byte
+}
 
 type PreSharedKeyId struct{}
 
@@ -174,6 +309,23 @@ func ParseExtensions(b []byte) ([]Extension, error) { return nil, nil }
 
 // a verb in the middle of a name, which is not a codec entry point
 func (self *GroupContext) ConfirmedTranscriptHashParsedElsewhere() []byte { return nil }
+
+// the same two shapes again under names carrying no verb at all, which is what the prefix
+// match cannot see and the shape rule is for
+func groupContextFromBytes(b []byte) (*GroupContext, error) { return nil, nil }
+
+func (self *GroupContext) encodeToWire() []byte {
+	out := append([]byte(nil), self.GroupId...)
+	return append(out, self.TreeHash...)
+}
+
+// a one field accessor on the same structure, which answers a byte run and is not a codec
+func (self *GroupContext) treeHash() []byte { return self.TreeHash }
+
+// a constructor: the fields already separated, and a structure out
+func NewGroupContext(groupId []byte, epoch uint64, treeHash []byte) *GroupContext {
+	return &GroupContext{GroupId: groupId, Epoch: epoch, TreeHash: treeHash}
+}
 `
 
 // What the rule must read out of the control, exactly. Exact rather than a floor in both
@@ -182,10 +334,12 @@ func (self *GroupContext) ConfirmedTranscriptHashParsedElsewhere() []byte { retu
 // issues.
 var keyScheduleCodecControlWrappers = []string{
 	"(*GroupContext).Marshal",
+	"(*GroupContext).encodeToWire",
 	"MarshalExtensions",
 	"ParseExtensions",
 	"ParseGroupContext",
 	"ParsePreSharedKeyId",
+	"groupContextFromBytes",
 }
 
 // The p4-owned production files, held as a FLOOR on what the scan reads rather than as its
@@ -218,13 +372,30 @@ var keyScheduleOwnedFiles = []string{
 //
 // It is over every non test file of the package rather than over the seven the plan named,
 // and the sanctioned exemption is read off mls/syntax rather than written here.
+//
+// TWO rules, unioned, because each sees what the other cannot. The verb rule reads the NAME
+// and catches a wrapper over any type at all, including the free vector codecs no structure
+// owns. The shape rule reads the SIGNATURE and the BODY and catches a codec written under a
+// name that carries no verb -- groupContextFromBytes and encodeToWire were added to
+// group_context.go and the verb rule alone passed. Neither is a superset of the other and
+// both run over every file.
 func TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn(t *testing.T) {
 	sanctioned := syntaxCodecHooks(t)
+	codecsIn := func(parsed parsedSource, files []parsedSource) []string {
+		found := slices.Concat(
+			keyScheduleCodecWrappersIn(parsed, sanctioned),
+			keyScheduleSecondCodecsIn(parsed, mlsStructuresIn(files, sanctioned),
+				packageByteSliceTypeNamesIn(parsed), keyScheduleStructFieldsIn(files)),
+		)
+		slices.Sort(found)
+		return slices.Compact(found)
+	}
 
-	// the control first, on both halves: the rule must report every banned shape and must
-	// report neither hook nor the accessor.
+	// the control first, on both halves of both rules: every banned shape reported, and
+	// neither the hooks, nor the one field accessor, nor the constructor, nor the name with a
+	// verb in the middle of it.
 	control := mustParseText(t, "the byte level codec control", keyScheduleCodecControl)
-	if reported := keyScheduleCodecWrappersIn(control, sanctioned); !slices.Equal(reported, keyScheduleCodecControlWrappers) {
+	if reported := codecsIn(control, []parsedSource{control}); !slices.Equal(reported, keyScheduleCodecControlWrappers) {
 		t.Fatalf("the rule reported %v out of the control, want %v; a shape it lets through is a shape this package can be written in, and a shape it adds is one a reader will learn to ignore",
 			reported, keyScheduleCodecControlWrappers)
 	}
@@ -237,8 +408,21 @@ func TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn(t *testing.T) {
 				scanned, owned)
 		}
 	}
+	files := []parsedSource{}
 	for _, path := range scanned {
-		for _, wrapper := range keyScheduleCodecWrappersIn(mustParseSource(t, path), sanctioned) {
+		files = append(files, mustParseSource(t, path))
+	}
+	// the shape rule's class, derived, and checked for having derived something. An empty
+	// structure set makes that half of the gate demand nothing, and a gate that demands
+	// nothing reports exactly what a complete one reports.
+	structures := mlsStructuresIn(files, sanctioned)
+	if len(structures) == 0 {
+		t.Fatalf("no type of this package declares any of %v, so the shape half of this gate is over an empty class and only the name half is running",
+			sanctioned)
+	}
+	t.Logf("the MLS structures of this package, by the hooks they declare: %v", structures)
+	for at, path := range scanned {
+		for _, wrapper := range codecsIn(files[at], files) {
 			t.Errorf("%s declares %s, and convention C1 says the byte level codec of an MLS structure is syntax.Marshal and syntax.Unmarshal reached through %v: a second encoder agrees with the first until it does not, and no round trip property can see the disagreement",
 				path, wrapper, sanctioned)
 		}

@@ -8438,6 +8438,10 @@ const epochSecretEscapeControl = "package control\n" +
 	"\tepochSecret bytes.Buffer\n" +
 	"}\n" +
 	"\n" +
+	"type TableHolder struct {\n" +
+	"\tepochSecret map[string][]byte\n" +
+	"}\n" +
+	"\n" +
 	"var Escaped []byte\n" +
 	"\n" +
 	"var escapedUnexported []byte\n" +
@@ -8517,6 +8521,34 @@ const epochSecretEscapeControl = "package control\n" +
 	"\treturn fmt.Errorf(\"%w: %d bytes\", ErrControl, len(self.epochSecret))\n" +
 	"}\n" +
 	"\n" +
+	"func (self *TableHolder) LeaksARangeValueThroughAForeignCall() {\n" +
+	"\tfor _, one := range self.epochSecret {\n" +
+	"\t\tpackageObserver(one)\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"func (self *TableHolder) LeaksARangeKeyThroughAForeignCall() {\n" +
+	"\tfor named := range self.epochSecret {\n" +
+	"\t\tpackageObserver([]byte(named))\n" +
+	"\t}\n" +
+	"}\n" +
+	"\n" +
+	"func (self *TableHolder) CountsWhatARangeYields() int {\n" +
+	"\ttotal := 0\n" +
+	"\tfor _, one := range self.epochSecret {\n" +
+	"\t\ttotal += len(one)\n" +
+	"\t}\n" +
+	"\treturn total\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) RangesOverSomethingElseWhileItReadsIt(other [][]byte) int {\n" +
+	"\ttotal := len(self.epochSecret)\n" +
+	"\tfor _, one := range other {\n" +
+	"\t\tpackageObserver(one)\n" +
+	"\t}\n" +
+	"\treturn total\n" +
+	"}\n" +
+	"\n" +
 	"func wipeControl(secret []byte) {\n" +
 	"\tfor i := range secret {\n" +
 	"\t\tsecret[i] = 0\n" +
@@ -8539,8 +8571,11 @@ const epochSecretEscapeControl = "package control\n" +
 // clean bill a working one issues.
 var (
 	epochSecretEscapeControlReaching = []string{
+		"CountsWhatARangeYields",
 		"CutsALocalFromIt",
 		"KeepsItInItsOwnStorage",
+		"LeaksARangeKeyThroughAForeignCall",
+		"LeaksARangeValueThroughAForeignCall",
 		"LeaksByCopyingIntoPackageStorage",
 		"LeaksIntoAChannel",
 		"LeaksIntoAGoroutine",
@@ -8552,11 +8587,14 @@ var (
 		"LeaksThroughAMethodOnWhatItReaches",
 		"LeaksThroughAPackageCallback",
 		"LocksWhileItReadsIt",
+		"RangesOverSomethingElseWhileItReadsIt",
 		"RefusesWithASentinel",
 		"Zeroize",
 	}
 
 	epochSecretEscapeControlEscaping = []string{
+		"LeaksARangeKeyThroughAForeignCall: calls packageObserver, which this package does not declare",
+		"LeaksARangeValueThroughAForeignCall: calls packageObserver, which this package does not declare",
 		"LeaksByCopyingIntoPackageStorage: hands copy both what it reaches and stashed, which outlives it",
 		"LeaksIntoAChannel: sends on escapeChannel",
 		"LeaksIntoAGoroutine: starts a goroutine, which outlives the call that started it",
@@ -8704,34 +8742,59 @@ func namesBoundInside(function *ast.FuncDecl) map[string]bool {
 }
 
 // theAliasesOfWhatItReaches is every name inside one declaration that carries the storage: the
-// storage itself, and every local a chain of assignments has put it in.
+// storage itself, and every local an assignment or a RANGE has put it in.
 //
 // Only a plain name joins, never a field of one. self.kept = self.epochSecret puts the secret
 // in the receiver's own storage, which is the holder this gate is about rather than somewhere
 // beyond it, and reading the receiver as an alias would make every later mention of any of its
 // fields read as the secret.
+//
+// The range half is not a second spelling of the assignment half, it is a second STATEMENT
+// that binds a name to the storage, and leaving it out was a one-sided hole. namesBoundInside
+// next door already has a *ast.RangeStmt case, so a range variable was correctly local for the
+// rule about writes and invisible to the rule about aliases -- and the shape that fell through
+// is the erase loop, which is what this whole scan is pointed at:
+//
+//	for _, secret := range self.nodes {
+//		foreign(secret)
+//	}
+//
+// hands code this package did not write a node secret with no name the alias set had ever
+// seen. Measured: that exact shape in SecretTree.Zeroize survived all 824 tests of this
+// package and ../message, while the same callee handed self.nodes[0] on the line above it was
+// reported. The KEY is bound as well as the value, because the byte walk this package's other
+// gates are built on reads a map's keys as secret bearing for the reason its comment gives --
+// a table that remembered a destroyed secret by keying on it holds that secret exactly as much
+// as one that stored it -- and go gives no syntax to tell ranging a map from ranging a slice.
 func theAliasesOfWhatItReaches(function *ast.FuncDecl, storage string) map[string]bool {
 	aliases := map[string]bool{storage: true}
 	if function.Body == nil {
 		return aliases
 	}
+	join := func(target ast.Expr, grew *bool) {
+		identifier, isIdentifier := target.(*ast.Ident)
+		if !isIdentifier || identifier.Name == "_" || aliases[identifier.Name] {
+			return
+		}
+		aliases[identifier.Name] = true
+		*grew = true
+	}
 	for {
 		grew := false
 		ast.Inspect(function.Body, func(node ast.Node) bool {
-			assignment, isAssignment := node.(*ast.AssignStmt)
-			if !isAssignment {
-				return true
-			}
-			for at, right := range assignment.Rhs {
-				if at >= len(assignment.Lhs) || !carriesWhatItReaches(right, aliases) {
-					continue
+			switch typed := node.(type) {
+			case *ast.AssignStmt:
+				for at, right := range typed.Rhs {
+					if at < len(typed.Lhs) && carriesWhatItReaches(right, aliases) {
+						join(typed.Lhs[at], &grew)
+					}
 				}
-				target, isIdentifier := assignment.Lhs[at].(*ast.Ident)
-				if !isIdentifier || aliases[target.Name] {
-					continue
+			case *ast.RangeStmt:
+				if !carriesWhatItReaches(typed.X, aliases) {
+					break
 				}
-				aliases[target.Name] = true
-				grew = true
+				join(typed.Key, &grew)
+				join(typed.Value, &grew)
 			}
 			return true
 		})
@@ -9049,12 +9112,21 @@ func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
 	// the shape this gate exists for has to be present, or it is a gate over an empty
 	// exemption again: an eraser is a declaration that reaches the storage and answers
 	// nothing, and it is the one the two gates above let past by design.
+	// the receiver travels with the name, because two types of this package declare a Zeroize
+	// and this list is collected across files by name. Reported bare, it read "[Zeroize
+	// Zeroize]" -- one entry per declaration, both spelled the same, and a reader has no way
+	// to tell a genuine pair from a bug that counted one declaration twice.
 	byteSlices := slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t))
 	exempt := []string{}
 	for _, one := range declaredAcross(files) {
-		if one.exported && slices.Contains(reaching, one.name) && !hasSomewhereToPutASecret(one, byteSlices) {
-			exempt = append(exempt, one.name)
+		if !one.exported || !slices.Contains(reaching, one.name) || hasSomewhereToPutASecret(one, byteSlices) {
+			continue
 		}
+		if one.receiver != "" {
+			exempt = append(exempt, "("+one.receiver+")."+one.name)
+			continue
+		}
+		exempt = append(exempt, one.name)
 	}
 	if len(exempt) == 0 {
 		t.Fatalf("no exported declaration of this package reaches %s and is exempted by its shape from TestNoExportedMethodOfThisPackageCanReachTheEpochSecret, so this gate is holding an exemption that covers nothing; Zeroize is that shape and it should be here",

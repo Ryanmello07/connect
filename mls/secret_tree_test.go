@@ -177,10 +177,25 @@ func stExpectedNodeSecret(t *testing.T, crypto CryptoProvider, encryptionSecret 
 // what the tree still holds, derived from its type rather than from a field name
 // ---------------------------------------------------------------------------
 
+// secretTreeHop is one step the byte walk took through a struct: the type that DECLARES the
+// field, and the field's own name.
+//
+// The pair is what a gate over this walk needs and the rendered path cannot give it. A gate
+// that reads this walk and then enforces over SOURCE has to enforce over the spelling the
+// source uses, and the source spells a field of an inner type by that type's own field name:
+// the ratchet secret is self.secret in every one of its seven methods and the word ratchets
+// appears in none of them. Recording only where a path STARTS is how a class derived at the
+// byte level ends up enforced one type short of the bytes it was derived from.
+type secretTreeHop struct {
+	holder string
+	field  string
+}
+
 // secretTreeHeld is one byte bearing value a SecretTree still reaches, named by the path
-// reflect walked to get to it.
+// reflect walked to get to it and by every struct hop that path took.
 type secretTreeHeld struct {
 	where   string
+	path    []secretTreeHop
 	carried []byte
 }
 
@@ -243,7 +258,7 @@ func secretTreeIntegerRun(value reflect.Value) ([]byte, bool) {
 // func, an unsafe pointer -- is REPORTED rather than skipped, so a field of a kind this walk
 // was not written for fails the gate instead of quietly leaving the walk smaller than the
 // type it is meant to cover.
-func (self *secretTreeByteWalk) at(where string, value reflect.Value, depth int) {
+func (self *secretTreeByteWalk) at(where string, path []secretTreeHop, value reflect.Value, depth int) {
 	if depth > secretTreeWalkDepthLimit {
 		self.unwalked = append(self.unwalked, where+" is deeper than this walk goes")
 		return
@@ -254,17 +269,24 @@ func (self *secretTreeByteWalk) at(where string, value reflect.Value, depth int)
 			return
 		}
 		if run, ok := secretTreeIntegerRun(value); ok {
-			self.held = append(self.held, secretTreeHeld{where: where, carried: run})
+			self.held = append(self.held, secretTreeHeld{where: where, path: path, carried: run})
 			return
 		}
 		for at := range value.Len() {
-			self.at(fmt.Sprintf("%s[%d]", where, at), value.Index(at), depth+1)
+			self.at(fmt.Sprintf("%s[%d]", where, at), path, value.Index(at), depth+1)
 		}
 	case reflect.String:
-		self.held = append(self.held, secretTreeHeld{where: where, carried: []byte(value.String())})
+		self.held = append(self.held, secretTreeHeld{where: where, path: path, carried: []byte(value.String())})
 	case reflect.Struct:
 		for at := range value.NumField() {
-			self.at(where+"."+value.Type().Field(at).Name, value.Field(at), depth+1)
+			field := value.Type().Field(at)
+			// the hop is recorded as the pair (declaring type, field name), and the slice is
+			// clipped so the append allocates rather than writing into a sibling's backing
+			// array. Two paths off one struct share this slice's array otherwise, and the
+			// second field walked overwrites the first field's last hop.
+			self.at(where+"."+field.Name,
+				append(slices.Clip(path), secretTreeHop{holder: value.Type().String(), field: field.Name}),
+				value.Field(at), depth+1)
 		}
 	case reflect.Pointer, reflect.Interface:
 		if value.IsNil() {
@@ -276,7 +298,7 @@ func (self *secretTreeByteWalk) at(where string, value reflect.Value, depth int)
 			}
 			self.seen[value.Pointer()] = true
 		}
-		self.at(where+"->", value.Elem(), depth+1)
+		self.at(where+"->", path, value.Elem(), depth+1)
 	case reflect.Map:
 		if value.IsNil() {
 			return
@@ -296,8 +318,8 @@ func (self *secretTreeByteWalk) at(where string, value reflect.Value, depth int)
 		})
 		for _, key := range keys {
 			rendered := secretTreeMapKeyOrder(key)
-			self.at(where+"{"+rendered+"}", key, depth+1)
-			self.at(where+"["+rendered+"]", value.MapIndex(key), depth+1)
+			self.at(where+"{"+rendered+"}", path, key, depth+1)
+			self.at(where+"["+rendered+"]", path, value.MapIndex(key), depth+1)
 		}
 	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
@@ -334,7 +356,7 @@ func secretTreeMapKeyOrder(key reflect.Value) string {
 // secretTreeWalkOf reads every byte a value reaches, and reports what it could not walk.
 func secretTreeWalkOf(value reflect.Value) ([]secretTreeHeld, []string) {
 	walk := &secretTreeByteWalk{seen: map[uintptr]bool{}}
-	walk.at(value.Type().String(), value, 0)
+	walk.at(value.Type().String(), nil, value, 0)
 	return walk.held, walk.unwalked
 }
 
@@ -847,33 +869,32 @@ func secretTreeExercised(t *testing.T, encryptionSecret []byte) *SecretTree {
 			t.Fatalf("NextSenderKey(1, %d): %v", kind, err)
 		}
 	}
+	// and a receive of a SKIPPED generation, which is the only thing that leaves a ratchet's
+	// retention window holding anything. Without it every window of the exercised tree is
+	// empty, the walk reports no location under one, and a class derived by differencing this
+	// state is silent about the AEAD key and nonce a window holds -- which is the storage
+	// eraseKey zeroizes and the storage EraseMessageKey exists to destroy. A generation ahead
+	// of the head is what peekFor retains the skipped ones for.
+	if _, _, err := tree.MessageKey(ContentTypeApplication, 2, 3); err != nil {
+		t.Fatalf("MessageKey(application, leaf 2, generation 3): %v", err)
+	}
 	return tree
 }
 
-// secretTreeStorageFieldOf reads the top level field name out of one location the byte walk
-// reports.
+// secretTreeSecretStorage is the class the gate below is over, in the two halves a SOURCE
+// scan needs it in: the field spellings a secret bearing location hangs off, and the types of
+// this package that declare them.
 //
-// The type's own name is asked of the type rather than written down, so a rename leaves this
-// reading a field name rather than trimming nothing and answering a whole path. The cut is at
-// the first of the four characters the walk descends with -- a field, an index, a map key, a
-// pointer -- because what is wanted is the field the location hangs off, whatever shape the
-// rest of it took.
-func secretTreeStorageFieldOf(t *testing.T, where string) string {
-	t.Helper()
-	prefix := reflect.TypeOf((*SecretTree)(nil)).Elem().String() + "."
-	trimmed, found := strings.CutPrefix(where, prefix)
-	if !found {
-		t.Fatalf("the byte walk reported %q, which does not begin with %q, so no field name can be read out of it",
-			where, prefix)
-	}
-	if cut := strings.IndexAny(trimmed, ".[{-"); cut >= 0 {
-		return trimmed[:cut]
-	}
-	return trimmed
+// Both halves come off the same differing paths. fields is what the source names the storage
+// by -- every hop of the path, not the first one -- and holders is what tells a declaration
+// that can hold one of those fields from one that merely shares a spelling with it.
+type secretTreeSecretStorage struct {
+	fields  []string
+	holders []string
 }
 
-// secretTreeSecretBearingFields is the class the gate below is over: the fields of
-// *SecretTree whose retained bytes are a FUNCTION OF the encryption secret.
+// secretTreeSecretBearingStorage is the storage a *SecretTree still reaches whose retained
+// bytes are a FUNCTION OF the encryption secret.
 //
 // Derived by differencing two trees rather than named, and differenced rather than merely
 // walked, because the walk on its own over-reports. crypto reaches the suite's parameters,
@@ -886,13 +907,22 @@ func secretTreeStorageFieldOf(t *testing.T, where string) string {
 //
 // A field added later that holds derived key material joins this class on the run that adds
 // it, with no edit here. One that holds a constant does not, and should not.
-func secretTreeSecretBearingFields(t *testing.T) []string {
+//
+// EVERY HOP of a differing path is read, and that is the correction this function is. The
+// version it replaces cut each path at the first field off *SecretTree, so a location inside
+// a *ratchet was reported under the spelling "ratchets" -- a word that appears in none of
+// that type's seven methods. The class was derived at the byte level and enforced at the
+// identifier level and the two did not meet: those seven methods, holding six of the nine
+// erase sites in secret_tree.go, sat outside a class the byte walk had already put inside it.
+// The holders are read off the same hops, because without them the deep spellings collide
+// with unrelated parameters elsewhere in the package.
+func secretTreeSecretBearingStorage(t *testing.T) secretTreeSecretStorage {
 	t.Helper()
 	nh := stTestCrypto(t).HashSize()
-	carriedBy := func(fill byte) map[string][]byte {
-		held := map[string][]byte{}
+	carriedBy := func(fill byte) map[string]secretTreeHeld {
+		held := map[string]secretTreeHeld{}
 		for _, one := range secretTreeRetainedBytes(t, secretTreeExercised(t, bytes.Repeat([]byte{fill}, nh))) {
-			held[one.where] = one.carried
+			held[one.where] = one
 		}
 		return held
 	}
@@ -901,20 +931,119 @@ func secretTreeSecretBearingFields(t *testing.T) []string {
 		t.Fatalf("the two exercised trees retained %d and %d locations; they are driven identically and must agree on WHERE they hold bytes",
 			len(first), len(second))
 	}
-	fields := []string{}
+	// the package qualifier the walk renders a type with, asked of a type rather than written
+	// down, so a package rename leaves this trimming a qualifier rather than trimming nothing
+	qualifier := strings.TrimSuffix(reflect.TypeOf((*SecretTree)(nil)).Elem().String(), "SecretTree")
+	storage := secretTreeSecretStorage{}
 	for where, held := range first {
 		other, alsoHeld := second[where]
 		if !alsoHeld {
 			t.Fatalf("the second tree holds nothing at %s and the first one does, so the two runs are not the same sequence and what differs below would be about the driving rather than about the secret",
 				where)
 		}
-		if bytes.Equal(held, other) {
+		if bytes.Equal(held.carried, other.carried) {
 			continue
 		}
-		fields = append(fields, secretTreeStorageFieldOf(t, where))
+		if len(held.path) == 0 {
+			t.Fatalf("the byte walk reported %s with no struct hop on it, so no field name can be read out of it and the class below would be missing this location",
+				where)
+		}
+		for _, hop := range held.path {
+			storage.fields = append(storage.fields, hop.field)
+			// a hop through a type of ANOTHER package is not storage this package's source
+			// can be scanned for. None exists today; a field of an imported struct type
+			// holding derived key material would be one, and leaving it out here is what
+			// keeps the holder set to types whose declarations this scan can actually read.
+			if name, ofThisPackage := strings.CutPrefix(hop.holder, qualifier); ofThisPackage {
+				storage.holders = append(storage.holders, name)
+			}
+		}
 	}
-	slices.Sort(fields)
-	return slices.Compact(fields)
+	slices.Sort(storage.fields)
+	storage.fields = slices.Compact(storage.fields)
+	slices.Sort(storage.holders)
+	storage.holders = slices.Compact(storage.holders)
+	return storage
+}
+
+// theDeclarationsThatCanHoldTheseTypes is every declaration of this package's source that can
+// hold a value of one of the named types, and everything those declarations run.
+//
+// It is the other half of "can this declaration reach the tree's storage", and the half
+// theNamesReachingTheStorage cannot supply. That closure runs CALLER-ward over a spelling, so
+// seeding it with a field of an inner type pulls in every unrelated parameter of that name in
+// the package: measured, suiteCryptoProvider.Mac comes back as leaking the secret tree's key,
+// because its own key parameter is spelled the same and it hands what it reaches to hmac.
+// This closure runs CALLEE-ward from the values instead, and the intersection of the two is
+// the honest reading of the question -- a declaration that can neither be handed one of these
+// values nor be run by something that was cannot put one beyond its call.
+//
+// The seed is a SIGNATURE test rather than a receiver test, because a constructor holds the
+// value it is about to answer with and never has it as a receiver: NewSecretTree is what puts
+// the encryption secret into the node map, and a seed of methods alone leaves it outside
+// every scan. Receiver, parameters and results are all read, so a free function handed a
+// *ratchet is inside it too.
+func theDeclarationsThatCanHoldTheseTypes(declared []sourceDeclaration, holders []string) []string {
+	inside := map[string]bool{}
+	for _, one := range declared {
+		rendered := slices.Concat([]string{one.receiver}, one.params, one.results)
+		if slices.ContainsFunc(holders, func(holder string) bool {
+			return slices.ContainsFunc(rendered, func(one string) bool { return secretTreeNamesType(one, holder) })
+		}) {
+			inside[one.name] = true
+		}
+	}
+	declares := map[string]bool{}
+	for _, one := range declared {
+		declares[one.name] = true
+	}
+	for {
+		grew := false
+		for _, one := range declared {
+			if !inside[one.name] || one.body == nil {
+				continue
+			}
+			ast.Inspect(one.body, func(node ast.Node) bool {
+				identifier, isIdentifier := node.(*ast.Ident)
+				if isIdentifier && declares[identifier.Name] && !inside[identifier.Name] {
+					inside[identifier.Name] = true
+					grew = true
+				}
+				return true
+			})
+		}
+		if !grew {
+			return slices.Sorted(maps.Keys(inside))
+		}
+	}
+}
+
+// secretTreeNamesType answers whether one rendered type expression names a given type.
+//
+// A WHOLE WORD match over the rendering, because map[ratchetKey]*ratchet names two types and
+// a substring test cannot tell ratchet from ratchetKey. The rendering is walked rather than
+// compared, because a type appears inside a map, a slice, a pointer and a variadic without
+// being the whole of what was written.
+func secretTreeNamesType(rendered string, wanted string) bool {
+	for at := 0; at+len(wanted) <= len(rendered); at++ {
+		found := strings.Index(rendered[at:], wanted)
+		if found < 0 {
+			return false
+		}
+		at += found
+		before := at == 0 || !secretTreeIsIdentifierByte(rendered[at-1])
+		after := at+len(wanted) == len(rendered) || !secretTreeIsIdentifierByte(rendered[at+len(wanted)])
+		if before && after {
+			return true
+		}
+	}
+	return false
+}
+
+// secretTreeIsIdentifierByte answers whether one byte can appear inside a go identifier,
+// which is what the whole-word match above needs and strings has no test for.
+func secretTreeIsIdentifierByte(b byte) bool {
+	return b == '_' || ('0' <= b && b <= '9') || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
 }
 
 // TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall is section 9's forward
@@ -938,6 +1067,18 @@ func secretTreeSecretBearingFields(t *testing.T) []string {
 // the scan read ANY call to a foreign callee as an escape, which is right for a key schedule
 // that calls nothing it does not declare and reports eight false positives on a secret tree,
 // whose stateLock's Lock and Unlock are foreign, are handed nothing and can carry nothing.
+//
+// WHICH DECLARATIONS ARE SCANNED is two closures intersected, and the first version of this
+// gate had only one of them. The class is derived at the BYTE level, by a walk that follows
+// the tree's map of pointers down into *ratchet and on into *generationKeys; it was then
+// enforced at the IDENTIFIER level over the single spelling "ratchets", a word that appears in
+// none of that inner type's seven methods. Six of the nine erase sites in secret_tree.go were
+// outside the class the walk had already put inside it, and three archive mutants -- one on
+// the ratchet secret in step, one in zeroize, one on the AEAD key in eraseKey -- survived all
+// 824 tests of this package and ../message. Reading every hop of the path closes it, and the
+// second closure is what makes reading every hop affordable: the deep spellings collide with
+// unrelated parameters across the package, and a caller-ward closure over "key" alone reports
+// suiteCryptoProvider.Mac handing an hmac what it reaches.
 func TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall(t *testing.T) {
 	// the shared analysis first, over the shared control, on both halves. Without it the
 	// refinement that made this gate possible is also the thing that could make it vacuous.
@@ -954,16 +1095,31 @@ func TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall(t *testing
 			controlEscaping, epochSecretEscapeControlEscaping)
 	}
 
-	storages := secretTreeSecretBearingFields(t)
-	// the derivation's own positive control. These two are named as members the differential
-	// certainly has -- the node secrets and the per sender ratchets are what a secret tree IS
-	// -- and not as the class: the class is whatever differs, and a third secret bearing field
-	// is gated by existing rather than by an edit here.
-	for _, known := range []string{"nodes", "ratchets"} {
-		if !slices.Contains(storages, known) {
+	storage := secretTreeSecretBearingStorage(t)
+	// the derivation's own positive control: a FLOOR on each half, not the class.
+	//
+	// nodes and ratchets are what a secret tree IS. secret is what a ratchet is, and window is
+	// where a ratchet holds the message keys the receive path retains -- both of them one type
+	// down, and both of them absent from this gate's first version, which cut every path at
+	// its first hop. Naming them is what stops it going back: the mutation that reads
+	// held.path[:1] again derives [nodes ratchets] and fails here rather than passing over a
+	// *ratchet nothing scans. window is also the one member the exercise has to work for, so a
+	// tree driven without a skipped receive fails here too.
+	//
+	// ratchet is the same floor on the other half: the type the walk has to descend INTO to
+	// reach any of it.
+	//
+	// None of these is the class. The class is whatever differs, and a fifth field or a fourth
+	// type joins it by existing rather than by an edit here.
+	for _, known := range []string{"nodes", "ratchets", "secret", "window"} {
+		if !slices.Contains(storage.fields, known) {
 			t.Fatalf("the differential derived %v as the secret bearing storage of a secret tree and %s is not among them, so this gate is over a class that has stopped deriving",
-				storages, known)
+				storage.fields, known)
 		}
+	}
+	if !slices.Contains(storage.holders, "ratchet") {
+		t.Fatalf("the differential crossed %v on its way to the secret bearing bytes of a secret tree and ratchet is not among them, so the walk is no longer descending past the tree's own fields and every spelling below it is outside this gate",
+			storage.holders)
 	}
 
 	files := []parsedSource{}
@@ -971,16 +1127,59 @@ func TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall(t *testing
 		files = append(files, mustParseSource(t, path))
 	}
 	declared := declaredAcross(files)
-	for _, storage := range storages {
-		reaching := theNamesReachingTheStorage(declared, storage)
+	holding := theDeclarationsThatCanHoldTheseTypes(declared, storage.holders)
+	t.Logf("%d declarations can hold one of %v, or are run by one that can: %v",
+		len(holding), storage.holders, holding)
+	// and the scope's own floor, one member for each of the two things it does. NewSecretTree
+	// has no receiver and is the declaration that puts the encryption secret into the node
+	// map, so a seed narrowed to receivers loses it and every archive written there stops
+	// being scanned. zeroizeSecret names no type of this package at all and is inside only
+	// because something that holds one runs it, so a closure that stopped closing loses it --
+	// and it is where every erase in this file ends up.
+	for _, known := range []string{"NewSecretTree", "zeroizeSecret"} {
+		if !slices.Contains(holding, known) {
+			t.Fatalf("the scope read %v as the declarations that can hold one of %v, and %s is not among them, so it is no longer reading both the values a signature names and the bodies those declarations run",
+				holding, storage.holders, known)
+		}
+	}
+
+	scanned := map[string]bool{}
+	escaping := map[string][]string{}
+	for _, field := range storage.fields {
+		reaching := theNamesReachingTheStorage(declared, field)
 		if len(reaching) == 0 {
 			t.Fatalf("no declaration of this package's source mentions %s, so the class below is empty and this gate demands nothing for it",
-				storage)
+				field)
 		}
-		t.Logf("%d declarations reach the secret tree's %s: %v", len(reaching), storage, reaching)
-		for _, one := range theDeclarationsPuttingWhatTheyReachBeyondTheCall(files, reaching, storage) {
+		scoped := []string{}
+		for _, one := range reaching {
+			if slices.Contains(holding, one) {
+				scoped = append(scoped, one)
+				scanned[one] = true
+			}
+		}
+		if len(scoped) == 0 {
+			t.Fatalf("%d declarations mention %s and none of them can hold one of %v, so this gate scans nothing for that storage; the two closures are no longer meeting",
+				len(reaching), field, storage.holders)
+		}
+		t.Logf("%d declarations reach the secret tree's %s and can hold one: %v", len(scoped), field, scoped)
+		escaping[field] = theDeclarationsPuttingWhatTheyReachBeyondTheCall(files, scoped, field)
+	}
+
+	// what the two closures together ended up covering, logged rather than asserted on. It is
+	// the reader's check that the finding this gate was rewritten for is closed: every method
+	// of *ratchet is here, and none of them was in the version that read the first hop of each
+	// path. It is not written as an assertion because there is no non-circular one to write --
+	// a method that names a class field is in the caller-ward closure by naming it and in the
+	// scope by its receiver, so any test over the class's own members passes by construction.
+	// The floors above are what actually hold the derivation in place.
+	t.Logf("%d declarations are scanned for at least one of %v: %v",
+		len(scanned), storage.fields, slices.Sorted(maps.Keys(scanned)))
+
+	for _, field := range storage.fields {
+		for _, one := range escaping[field] {
 			t.Errorf("%s -- it reaches the secret tree's %s and puts what it reaches somewhere the call does not end: storage this package's own call did not introduce, another goroutine, or code this package did not write. Section 9's forward secrecy is that a consumed secret is gone from the PROCESS, and a copy parked outside the tree is invisible to every gate that reads the tree",
-				one, storage)
+				one, field)
 		}
 	}
 }
