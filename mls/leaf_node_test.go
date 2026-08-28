@@ -548,6 +548,256 @@ func TestLeafNodeRoundTripEverySource(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the decoded leaf is a function of its bytes and of nothing the receiver held
+// ---------------------------------------------------------------------------
+
+// leafNodePriorContents is every state a receiver can arrive in that this file can build: the
+// zero leaf, and a leaf of every source the package declares.
+//
+// Derived over the source class rather than over the one prior somebody picks, because the
+// failure this is about is per PAIR -- only a receiver that already held a source carrying a
+// variant field can leave that field standing under a source that does not carry it, and which
+// pairs those are is the variant table's business rather than a test author's guess.
+func leafNodePriorContents(t *testing.T) []*LeafNode {
+	t.Helper()
+	priors := []*LeafNode{{}}
+	for _, source := range leafNodeSources(t) {
+		priors = append(priors, testLeafNodeOfSource(source))
+	}
+	return priors
+}
+
+// TestALeafNodeDecodesToTheSameValueWhateverItsReceiverHeld is the property every comparison of
+// two leaves in this package rests on, and it is not a round trip property.
+//
+// The variant arms of the decoder assign only the field their own source carries, so a decoder
+// that writes through its receiver as it reads leaves the PREVIOUS leaf's ParentHash or Lifetime
+// standing under a source that does not carry it. The bytes are unaffected -- the stale field is
+// not written under the new source -- so the encoding round trips, re-encodes byte exact, and
+// agrees with every golden in this file. What it disagrees with is the same bytes decoded into a
+// fresh receiver, and that is a leaf comparing unequal to itself depending on where it was
+// decoded.
+func TestALeafNodeDecodesToTheSameValueWhateverItsReceiverHeld(t *testing.T) {
+	priors := leafNodePriorContents(t)
+	for _, source := range leafNodeSources(t) {
+		encoded := handDerivedLeafNodeGolden(source)
+		fresh := &LeafNode{}
+		if err := syntax.Unmarshal(encoded, fresh); err != nil {
+			t.Fatalf("source %d: Unmarshal into a fresh receiver: %v", source, err)
+		}
+		for at, prior := range priors {
+			reused := prior.Clone()
+			if err := syntax.Unmarshal(encoded, reused); err != nil {
+				t.Fatalf("source %d: Unmarshal into a receiver holding prior %d: %v", source, at, err)
+			}
+			if !sameLeafNode(reused, fresh) {
+				t.Errorf("source %d: decoding into a receiver that held\n %s\ngave a leaf differing at %v from the same bytes decoded fresh:\n %s\nwant\n %s",
+					source, describeLeafNode(prior), leafNodeLocationsDifferingBetween(reused, fresh),
+					describeLeafNode(reused), describeLeafNode(fresh))
+			}
+		}
+	}
+	t.Logf("%d prior receiver contents over %d sources", len(priors), len(leafNodeSources(t)))
+}
+
+// leafNodeRefusedEncodingsOf is every input this file can build that a decode of one source's
+// leaf must refuse: every proper prefix of that source's encoding, and that encoding under every
+// source octet the registry does not name.
+//
+// Derived over the length and over the octet rather than written as the field boundaries
+// somebody thought of, for the same reason the truncation sweep below is: the boundaries this
+// codec actually has are the ones a sweep over the length finds, and every one of them is a
+// place a decode can stop half way through the receiver.
+func leafNodeRefusedEncodingsOf(t *testing.T, source LeafNodeSource) [][]byte {
+	t.Helper()
+	declared := leafNodeSources(t)
+	encoded := handDerivedLeafNodeGolden(source)
+	inputs := [][]byte{}
+	for cut := 0; cut < len(encoded); cut += 1 {
+		inputs = append(inputs, encoded[:cut])
+	}
+	for candidate := 0; candidate <= 0xff; candidate += 1 {
+		if slices.Contains(declared, LeafNodeSource(candidate)) {
+			continue
+		}
+		altered := bytes.Clone(encoded)
+		altered[len(handDerivedLeafNodeCommon(source))-1] = byte(candidate)
+		inputs = append(inputs, altered)
+	}
+	return inputs
+}
+
+// TestARefusedLeafNodeDecodeLeavesItsReceiverUntouched is the discipline Credential.UnmarshalMLS
+// already keeps, stated for the leaf as well so the two decoders of this commit do not disagree
+// about it with only one of them tested.
+//
+// Credential refuses the credential type before it reads the identity, so no certificate chain
+// is ever allocated on this package's behalf, and credential_test.go asserts it. A leaf decoder
+// that wrote its fields as it read them would leave a receiver holding an encryption key, a
+// signature key and a source octet out of a leaf this package REFUSED -- which is a value that
+// never existed anywhere, assembled out of half of somebody else's bytes, sitting in a variable
+// the caller may well reuse. Nothing about the refusal tells the caller that happened.
+func TestARefusedLeafNodeDecodeLeavesItsReceiverUntouched(t *testing.T) {
+	priors := leafNodePriorContents(t)
+	refused, accepted := 0, 0
+	for _, source := range leafNodeSources(t) {
+		for _, input := range leafNodeRefusedEncodingsOf(t, source) {
+			for _, prior := range priors {
+				held := prior.Clone()
+				before := prior.Clone()
+				if err := syntax.Unmarshal(input, held); err == nil {
+					accepted += 1
+					continue
+				}
+				refused += 1
+				if sameLeafNode(held, before) {
+					continue
+				}
+				// one report is the whole statement: there are thousands of refusals here
+				// and a receiver written through by any of them is the same defect
+				t.Errorf("source %d: a refused decode of %d octets into a receiver that held\n %s\nwrote through it at %v, leaving\n %s",
+					source, len(input), describeLeafNode(before),
+					leafNodeLocationsDifferingBetween(held, before), describeLeafNode(held))
+				return
+			}
+		}
+	}
+	if accepted != 0 {
+		t.Errorf("%d of the inputs this sweep built decoded rather than being refused, so the property above was never stated over them", accepted)
+	}
+	if refused == 0 {
+		t.Fatal("no input was refused, so this observed nothing")
+	}
+	t.Logf("%d refused decodes over %d prior receiver contents left the receiver exactly as they found it", refused, len(priors))
+}
+
+// ---------------------------------------------------------------------------
+// a nil vector and an empty one are one leaf
+// ---------------------------------------------------------------------------
+
+// leafNodeVectorPaths is every variable length field the leaf's encoding carries, derived off
+// the type: it descends into the structures LeafNode holds by value and stops AT the vector,
+// since an element of a vector is not a field of the leaf.
+//
+// Derived rather than listed, and the finding that produced this test is exactly what a list
+// costs: the nil versus empty asymmetry was disclosed for Capabilities and not for Extensions,
+// which carries it too, because a disclosure is written from the fields somebody had in mind.
+func leafNodeVectorPaths(t *testing.T) []string {
+	t.Helper()
+	paths := leafNodeVectorPathsOf(reflect.TypeOf(LeafNode{}), "")
+	if len(paths) == 0 {
+		t.Fatal("the type walk found no vector on LeafNode, so the sweep below runs over nothing")
+	}
+	return paths
+}
+
+func leafNodeVectorPathsOf(valueType reflect.Type, prefix string) []string {
+	switch valueType.Kind() {
+	case reflect.Struct:
+		paths := []string{}
+		for i := 0; i < valueType.NumField(); i += 1 {
+			name := valueType.Field(i).Name
+			if prefix != "" {
+				name = prefix + "." + name
+			}
+			paths = append(paths, leafNodeVectorPathsOf(valueType.Field(i).Type, name)...)
+		}
+		return paths
+	case reflect.Slice:
+		return []string{prefix}
+	default:
+		return nil
+	}
+}
+
+// TestANilVectorAndAnEmptyOneAreOneLeafOnTheWire states the asymmetry rather than leaving it to
+// be rediscovered, over every vector of the structure rather than the one the builder disclosed.
+//
+// The wire has ONE spelling for a zero length vector, and Go has two values that produce it. So
+// a leaf built by hand with a nil vector encodes exactly like the same leaf with an empty one,
+// and the decode of those bytes answers the empty one -- syntax.ReadOpaque allocates and
+// syntax.ReadVector allocates, and neither ever answers nil. The consequence is that a hand
+// built leaf carrying a nil does not survive a round trip under reflect.DeepEqual even though
+// its ENCODING does, which is a trap for every later task that compares two leaves as values:
+// one off the wire and one built in a test are unequal for a reason neither the bytes nor the
+// protocol knows about.
+//
+// Both directions are asserted, so this is a pin and not a floor. If the codec is ever changed
+// to answer nil for an absent vector, this fails, and the comment on LeafNode that describes the
+// asymmetry has to be changed in the same commit.
+func TestANilVectorAndAnEmptyOneAreOneLeafOnTheWire(t *testing.T) {
+	paths := leafNodeVectorPaths(t)
+	variant := map[string]LeafNodeSource{}
+	for source, named := range leafNodeVariantPaths {
+		for _, path := range named {
+			variant[path] = source
+		}
+	}
+	for _, source := range leafNodeSources(t) {
+		for _, path := range paths {
+			withNil := testLeafNodeOfSource(source)
+			nilField := leafNodeFieldAt(withNil, path)
+			nilField.Set(reflect.Zero(nilField.Type()))
+			withEmpty := testLeafNodeOfSource(source)
+			emptyField := leafNodeFieldAt(withEmpty, path)
+			emptyField.Set(reflect.MakeSlice(emptyField.Type(), 0, 0))
+
+			nilBytes, err := syntax.Marshal(withNil)
+			if err != nil {
+				t.Fatalf("source %d: Marshal with %s nil: %v", source, path, err)
+			}
+			emptyBytes, err := syntax.Marshal(withEmpty)
+			if err != nil {
+				t.Fatalf("source %d: Marshal with %s empty: %v", source, path, err)
+			}
+			if !bytes.Equal(nilBytes, emptyBytes) {
+				t.Errorf("source %d: %s nil encodes to\n %x\nand %s empty encodes to\n %x; the wire has one spelling for a zero length vector and this codec has two",
+					source, path, nilBytes, path, emptyBytes)
+				continue
+			}
+			fromNil, fromEmpty := &LeafNode{}, &LeafNode{}
+			if err := syntax.Unmarshal(nilBytes, fromNil); err != nil {
+				t.Fatalf("source %d: Unmarshal the %s nil encoding: %v", source, path, err)
+			}
+			if err := syntax.Unmarshal(emptyBytes, fromEmpty); err != nil {
+				t.Fatalf("source %d: Unmarshal the %s empty encoding: %v", source, path, err)
+			}
+			if !sameLeafNode(fromNil, fromEmpty) {
+				t.Errorf("source %d: %s: one encoding decoded to two leaves differing at %v, so the decode is reading something besides its bytes",
+					source, path, leafNodeLocationsDifferingBetween(fromNil, fromEmpty))
+				continue
+			}
+			decoded := leafNodeFieldAt(fromNil, path)
+			carried := true
+			if owner, isVariant := variant[path]; isVariant {
+				carried = owner == source
+			}
+			if !carried {
+				if !decoded.IsNil() {
+					t.Errorf("source %d: %s is a variant field this source does not carry and the decode answered a non nil vector of %d, so it is not left at its zero value",
+						source, path, decoded.Len())
+				}
+				continue
+			}
+			if decoded.IsNil() || decoded.Len() != 0 {
+				t.Errorf("source %d: %s was encoded as a zero length vector and decoded to nil=%v len=%d, want a non nil empty one",
+					source, path, decoded.IsNil(), decoded.Len())
+				continue
+			}
+			if !sameLeafNode(fromEmpty, decodedFormOf(t, withEmpty)) {
+				t.Errorf("source %d: the leaf carrying an empty %s did not survive its own round trip, differing at %v",
+					source, path, leafNodeLocationsDifferingBetween(fromEmpty, decodedFormOf(t, withEmpty)))
+			}
+			if sameLeafNode(fromNil, decodedFormOf(t, withNil)) {
+				t.Errorf("source %d: a leaf carrying a nil %s now round trips to a value equal to what went in, so the asymmetry disclosed on LeafNode is gone and that comment is stale",
+					source, path)
+			}
+		}
+	}
+	t.Logf("%d vectors swept over %d sources", len(paths), len(leafNodeSources(t)))
+}
+
+// ---------------------------------------------------------------------------
 // the unknown source, refused by both halves
 // ---------------------------------------------------------------------------
 
@@ -805,6 +1055,27 @@ func upstreamLeafNodesOfRatchetTree(blob []byte) []upstreamLeafNode {
 	return found
 }
 
+// upstreamLeafNodeFloor is how many distinct leaf encodings the PINNED corpus yields, less a
+// margin, and it is the only coverage claim the comparison below is able to make about how much
+// of that corpus it actually read.
+//
+// A floor is stated at all because "more than one encoding" is not one. The leaves this reads
+// come from two shapes -- the ratchet_tree extension bodies, which the treekem and passive
+// client families carry in bulk, and the bare LeafNode an Update proposal's body is -- and a
+// re-vendor that dropped the ratchet tree families would leave the comparison passing on a
+// handful of Update leaves while reading none of the trees. That is the degradation a floor
+// catches and a "more than one" does not.
+//
+// It is a number rather than a derivation because there is nothing here to derive it from: the
+// corpus is somebody else's, and what makes the number safe is that it is pinned by digest in
+// vectors_pin_test.go, so it moves only in a commit that changes VECTORS.sha256. This number
+// moving in that same commit is the point of it. The margin is for the reader half rather than
+// the corpus half -- a stricter parse that recognises fewer blobs is a change to this file and
+// should be visible here without being brittle about single leaves.
+//
+// Measured: 2689 leaves read, 2528 distinct encodings, sources {1: 931, 2: 301, 3: 1296}.
+const upstreamLeafNodeFloor = 2400
+
 // upstreamLeafNodes is every distinct LeafNode encoding the vendored mlswg vectors contain.
 //
 // The selection is strict parsing rather than a list of upstream's field names, for the reason
@@ -843,6 +1114,10 @@ func upstreamLeafNodes(t *testing.T) map[string]upstreamLeafNode {
 	if read == 0 {
 		t.Fatal("no leaf node was read out of the vendored vectors, so every upstream comparison below is against an empty set")
 	}
+	if len(found) < upstreamLeafNodeFloor {
+		t.Fatalf("%d distinct leaf encodings were read out of the pinned corpus and the floor is %d; either a family this reads from is gone from testdata, or the reader above stopped recognising one, and both leave every comparison below passing on whatever is left",
+			len(found), upstreamLeafNodeFloor)
+	}
 	t.Logf("%d upstream leaf nodes read, %d distinct encodings", read, len(found))
 	return found
 }
@@ -856,10 +1131,6 @@ func upstreamLeafNodes(t *testing.T) map[string]upstreamLeafNode {
 // the field it put in the wrong place.
 func TestLeafNodeAssignsEveryFieldTheUpstreamVectorsPutWhereItIs(t *testing.T) {
 	upstream := upstreamLeafNodes(t)
-	if len(upstream) < 2 {
-		t.Fatalf("the vendored vectors yielded %d distinct leaf encodings; a single one cannot show that two fields are read the same way twice",
-			len(upstream))
-	}
 	sources := map[uint8]int{}
 	for _, name := range slices.Sorted(maps.Keys(upstream)) {
 		leaf := upstream[name]
@@ -920,8 +1191,16 @@ func TestLeafNodeAssignsEveryFieldTheUpstreamVectorsPutWhereItIs(t *testing.T) {
 			t.Errorf("%s: re-encode =\n %x\nwant\n %x", name[:16], reencoded, leaf.raw)
 		}
 	}
-	if len(sources) < 2 {
-		t.Errorf("every upstream leaf carried source %v, so the variant this comparison is worth most for was never reached", sources)
+	// every source the package DECLARES, not two of however many there are. The variant is
+	// what this comparison is worth most for -- a Lifetime read where a parent hash sits is
+	// only visible on a leaf that carries one -- so a source with no upstream leaf behind it
+	// is a source whose field assignment nothing here checked. Derived off the constants, so a
+	// fourth source declared later is owed a vector on the commit that declares it.
+	for _, declared := range leafNodeSources(t) {
+		if sources[uint8(declared)] == 0 {
+			t.Errorf("no upstream leaf carried source %d; the corpus yielded %v, so the fields that source carries were never compared against anybody else's bytes",
+				declared, sources)
+		}
 	}
 	t.Logf("upstream leaf sources: %v", sources)
 }
@@ -929,6 +1208,59 @@ func TestLeafNodeAssignsEveryFieldTheUpstreamVectorsPutWhereItIs(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Clone
 // ---------------------------------------------------------------------------
+
+// testLeafNodeOfSourceWithEveryVectorOccupied is the template under one source with no empty
+// vector left anywhere in it, which is the value every clone property below is stated over.
+//
+// An empty vector cannot show that a clone shares storage, and that is a fact about empty
+// slices rather than about this codec: an empty header has no array behind it, so a Clone that
+// assigned the field straight across shares nothing observable, appending to the copy allocates
+// a new array, and no amount of writing through it reaches the original. The emptiness has to
+// be gone BEFORE the clone is taken.
+//
+// It is grown here rather than filled in the template because the template's one empty vector
+// is Capabilities.Proposals and it is empty on purpose -- an empty vector in the middle of the
+// five is what separates their order in the hand derived golden, and a template that filled it
+// would leave the five capability vectors interchangeable. Both properties are kept by growing
+// a copy.
+func testLeafNodeOfSourceWithEveryVectorOccupied(t *testing.T, source LeafNodeSource) *LeafNode {
+	t.Helper()
+	leaf := testLeafNodeOfSource(source)
+	growEveryEmptySlice(reflect.ValueOf(leaf).Elem(), "")
+	// the grower's own control, stated as the property rather than as the name of the field
+	// that happens to be empty today: a second pass has nothing left to grow.
+	if again := growEveryEmptySlice(reflect.ValueOf(leaf).Elem(), ""); len(again) != 0 {
+		t.Fatalf("source %d: growing twice grew %v the second time, so the first pass left an empty vector behind and a clone sharing it would be unobservable",
+			source, again)
+	}
+	return leaf
+}
+
+// growEveryEmptySlice puts one zero element into every empty slice reachable from v, at every
+// depth, and answers the paths it grew.
+//
+// Derived off the value rather than told which field to grow, so a field added to LeafNode
+// later that is empty in the template is occupied by the commit that adds it rather than on the
+// day somebody notices. It grows nil slices too: a nil header and an empty one are equally
+// unobservable, and which of the two a field holds is the template's business.
+func growEveryEmptySlice(v reflect.Value, prefix string) []string {
+	grown := []string{}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i += 1 {
+			grown = append(grown, growEveryEmptySlice(v.Field(i), prefix+"."+v.Type().Field(i).Name)...)
+		}
+	case reflect.Slice:
+		if v.Len() == 0 {
+			v.Set(reflect.Append(v, reflect.Zero(v.Type().Elem())))
+			grown = append(grown, prefix)
+		}
+		for i := 0; i < v.Len(); i += 1 {
+			grown = append(grown, growEveryEmptySlice(v.Index(i), fmt.Sprintf("%s[%d]", prefix, i))...)
+		}
+	}
+	return grown
+}
 
 // TestLeafNodeCloneSharesNoStorageAtAnyDepth walks the structure rather than checking the three
 // fields the plan's version named.
@@ -938,10 +1270,14 @@ func TestLeafNodeAssignsEveryFieldTheUpstreamVectorsPutWhereItIs(t *testing.T) {
 // encryption key is the same defect as one that missed the parent hash. The walk finds every
 // slice at every depth off the type, writes through the clone's copy of it, and reads the
 // original back -- so a field added to LeafNode later is covered without anybody editing this.
+//
+// Over a leaf with every vector occupied, because a vector that is empty in the template is one
+// this cannot observe at all: Clone sharing Capabilities.Proposals survived the whole suite
+// while that was the value under test.
 func TestLeafNodeCloneSharesNoStorageAtAnyDepth(t *testing.T) {
 	for _, source := range leafNodeSources(t) {
-		original := testLeafNodeOfSource(source)
-		reference := testLeafNodeOfSource(source)
+		original := testLeafNodeOfSourceWithEveryVectorOccupied(t, source)
+		reference := testLeafNodeOfSourceWithEveryVectorOccupied(t, source)
 		clone := original.Clone()
 		if !sameLeafNode(clone, reference) {
 			t.Fatalf("source %d: Clone gave\n %s\nwant\n %s", source, describeLeafNode(clone), describeLeafNode(reference))
@@ -951,18 +1287,62 @@ func TestLeafNodeCloneSharesNoStorageAtAnyDepth(t *testing.T) {
 			t.Fatalf("source %d: the walk wrote through no slice, so this observed nothing", source)
 		}
 		if sameLeafNode(original, reference) {
-			t.Logf("source %d: %d slices written through, none reached the original", source, len(written))
+			t.Logf("source %d: %d locations written through, none reached the original", source, len(written))
 			continue
 		}
-		t.Errorf("source %d: writing through %v on the clone changed the original to\n %s",
-			source, written, describeLeafNode(original))
+		// the locations rather than the whole structure: what a reader needs is which field
+		// Clone copied one level short, and a dump of a leaf with 176 scalars in it does not
+		// say
+		t.Errorf("source %d: writing through the clone reached the original at %v, so Clone shares that storage with the leaf it was made from",
+			source, leafNodeLocationsDifferingBetween(original, reference))
 	}
 }
 
-// writeThroughEverySlice writes a distinguishable octet into every slice element reachable from
-// v, at every depth, and returns the paths it wrote. A slice the walk cannot write into -- an
-// empty one -- is grown first, since a clone that shared a nil header shares nothing and a clone
-// that shared an empty one has nothing to observe.
+// leafNodeScalarsOf reads every scalar reachable from v, by the same path spelling the walk
+// above writes, so that two leaves can be compared location by location.
+func leafNodeScalarsOf(v reflect.Value, prefix string) map[string]uint64 {
+	scalars := map[string]uint64{}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i += 1 {
+			maps.Copy(scalars, leafNodeScalarsOf(v.Field(i), prefix+"."+v.Type().Field(i).Name))
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i += 1 {
+			maps.Copy(scalars, leafNodeScalarsOf(v.Index(i), fmt.Sprintf("%s[%d]", prefix, i)))
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		scalars[prefix] = v.Uint()
+	}
+	return scalars
+}
+
+// leafNodeLocationsDifferingBetween is where two leaves disagree, by path. A location present
+// in one and not the other counts, since a vector that grew is a difference too.
+func leafNodeLocationsDifferingBetween(a *LeafNode, b *LeafNode) []string {
+	left := leafNodeScalarsOf(reflect.ValueOf(a).Elem(), "")
+	right := leafNodeScalarsOf(reflect.ValueOf(b).Elem(), "")
+	differing := []string{}
+	for path, value := range left {
+		if other, held := right[path]; !held || other != value {
+			differing = append(differing, path)
+		}
+	}
+	for path := range right {
+		if _, held := left[path]; !held {
+			differing = append(differing, path)
+		}
+	}
+	slices.Sort(differing)
+	return differing
+}
+
+// writeThroughEverySlice writes a distinguishable octet into every scalar reachable from v, at
+// every depth, and returns the paths it wrote.
+//
+// It does NOT grow anything, and cannot: by the time it runs, the clone under test has already
+// been made, and a slice grown on the copy allocates an array the original never had. Growing
+// is testLeafNodeOfSourceWithEveryVectorOccupied's job and it happens before the clone.
 func writeThroughEverySlice(v reflect.Value, prefix string) []string {
 	written := []string{}
 	switch v.Kind() {
@@ -986,32 +1366,70 @@ func writeThroughEverySlice(v reflect.Value, prefix string) []string {
 // reports, so it is run against a shallow copy known to share every slice it has.
 func TestTheCloneWalkCanSeeASharedArray(t *testing.T) {
 	for _, source := range leafNodeSources(t) {
-		original := testLeafNodeOfSource(source)
+		original := testLeafNodeOfSourceWithEveryVectorOccupied(t, source)
 		shallow := *original
 		written := writeThroughEverySlice(reflect.ValueOf(&shallow).Elem(), "")
 		if len(written) == 0 {
 			t.Fatalf("source %d: the walk wrote through nothing", source)
 		}
-		if sameLeafNode(original, testLeafNodeOfSource(source)) {
+		if sameLeafNode(original, testLeafNodeOfSourceWithEveryVectorOccupied(t, source)) {
 			t.Errorf("source %d: a shallow copy was written through at %v and the original is unchanged, so this walk cannot see a shared array",
 				source, written)
 		}
 	}
 }
 
+// leafNodeWritablePathsOf is every location a complete walk of a value of this type must reach,
+// derived off the TYPE: every scalar the structure holds, and one element of every vector, at
+// every depth.
+//
+// Derived and not listed, and this one is the rule 5 shape caught red handed. What this
+// replaced was ten names typed out by hand, and the walk it was controlling reached nine of
+// them: .Capabilities.Proposals[0] was absent from the walk AND from the list, because the
+// template's Proposals is empty and nobody thinks of the case they did not think of. A list
+// written from the same understanding as the code it controls reports exactly what a complete
+// one reports.
+//
+// The paths use index 0 because the walk is run over a leaf whose every vector is occupied, so
+// element zero exists in all of them; a vector with more elements is written through further
+// and containment is the assertion rather than equality.
+func leafNodeWritablePathsOf(valueType reflect.Type, prefix string) []string {
+	switch valueType.Kind() {
+	case reflect.Struct:
+		paths := []string{}
+		for i := 0; i < valueType.NumField(); i += 1 {
+			paths = append(paths, leafNodeWritablePathsOf(valueType.Field(i).Type, prefix+"."+valueType.Field(i).Name)...)
+		}
+		return paths
+	case reflect.Slice:
+		return leafNodeWritablePathsOf(valueType.Elem(), prefix+"[0]")
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return []string{prefix}
+	default:
+		return nil
+	}
+}
+
 // TestTheCloneWalkReachesEverySliceOfTheStructure states the walk's coverage against the type,
-// since a walk that reached three of the eight slices would pass the control above.
+// since a walk that reached three of the eight vectors would pass the control above.
 func TestTheCloneWalkReachesEverySliceOfTheStructure(t *testing.T) {
-	leaf := testLeafNodeOfSource(LeafNodeSourceCommit)
-	written := writeThroughEverySlice(reflect.ValueOf(leaf).Elem(), "")
-	for _, want := range []string{
-		".EncryptionKey[0]", ".SignatureKey[0]", ".Credential.Identity[0]",
-		".Capabilities.Versions[0]", ".Capabilities.CipherSuites[0]",
-		".Capabilities.Extensions[0]", ".Capabilities.Credentials[0]",
-		".ParentHash[0]", ".Extensions[0].ExtensionData[0]", ".Signature[0]",
-	} {
-		if !slices.Contains(written, want) {
-			t.Errorf("the clone walk wrote %v and did not reach %s", written, want)
+	want := leafNodeWritablePathsOf(reflect.TypeOf(LeafNode{}), "")
+	if len(want) == 0 {
+		t.Fatal("the type walk derived no writable location, so this control demands nothing of the value walk")
+	}
+	for _, source := range leafNodeSources(t) {
+		leaf := testLeafNodeOfSourceWithEveryVectorOccupied(t, source)
+		written := writeThroughEverySlice(reflect.ValueOf(leaf).Elem(), "")
+		missed := []string{}
+		for _, one := range want {
+			if !slices.Contains(written, one) {
+				missed = append(missed, one)
+			}
+		}
+		if len(missed) != 0 {
+			t.Errorf("source %d: the clone walk wrote %d locations and did not reach %v, which the type says are there; a location the walk cannot reach is one a shared array hides behind",
+				source, len(written), missed)
 		}
 	}
+	t.Logf("%d writable locations derived off the type: %v", len(want), want)
 }

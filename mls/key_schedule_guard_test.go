@@ -32,7 +32,9 @@
 package mls
 
 import (
+	"fmt"
 	"go/ast"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -315,8 +317,13 @@ func keyScheduleSecondCodecsIn(parsed parsedSource, structures []string, byteRun
 // that INTERPRETING an opaque run requires, as opposed to storing it.
 //
 // This is the half of the decoder shape that is not the signature, and it exists because the
-// signature stopped separating a decoder from a constructor. Three signals, any one of which is
-// enough, and each is a thing reading a run somebody else wrote actually needs:
+// signature stopped separating a decoder from a constructor. It is stated as ONE property with
+// four signals and not as three symptoms with a hole under them, because the first three were
+// measured to leave one: a straight line body carrying no error, no branch and no subscript can
+// still take a run apart, by handing it to something else that does the interpreting.
+//
+// Three of the signals are things reading a run somebody else wrote needs, any one of which is
+// enough:
 //
 //   - an error result. A run arriving from the wire can be malformed and a decoder has to be
 //     able to say so; convention C2 is that it says so by returning. Every hand rolled decoder
@@ -325,7 +332,15 @@ func keyScheduleSecondCodecsIn(parsed parsedSource, structures []string, byteRun
 //     deciding something about its content.
 //   - a subscript or a slice expression. That is a field being cut out of the run by offset,
 //     which is the straight line spelling of a decoder that reports nothing and branches on
-//     nothing, and it would otherwise be the hole this predicate opens.
+//     nothing.
+//
+// The fourth is the COMPLEMENT of the exemption rather than another symptom, and it is what
+// closes the hole the other three leave: unless the declaration stores its run whole, it is
+// taking it apart. Two shapes walked past the first three and are declared in the control
+// below -- Credential{CredentialType: binary.BigEndian.Uint16(b), Identity: b}, which reads a
+// field out of the front of a run somebody else wrote while carrying none of the three, and a
+// body that hands the run to syntax.Unmarshal and drops the error, which mentions the run once
+// and stores nothing.
 //
 // A body this scan cannot read counts as taking the run apart, which is the safe direction: an
 // unreadable body is reported rather than waved through.
@@ -342,7 +357,94 @@ func keyScheduleTakesItsRunApart(one sourceDeclaration) bool {
 		}
 		return true
 	})
-	return apart
+	return apart || !keyScheduleStoresItsRunWhole(one)
+}
+
+// keyScheduleStoresItsRunWhole answers whether the ONLY use one declaration makes of the byte
+// run it was handed is to put that run, whole, into a single field of a structure it builds.
+//
+// That is what BasicCredential does, and it is the entire reason the exemption exists: a
+// structure whose one variable field IS a byte run has a constructor with a decoder's exact
+// signature. Stating the exemption as what a constructor DOES, rather than as the absence of
+// the ways somebody thought a decode could be spelled, is the difference between a class and a
+// list -- there is no fourth and fifth symptom to keep adding here, because everything that is
+// not storing the run whole is reported.
+//
+// Two clauses, and each is the property rather than a proxy for it:
+//
+//   - the run reaches at most ONE field. A run landing in two fields is being laid out across
+//     them, which is a decode however it is spelled, and it is the mirror of the encoder half's
+//     "names more than one of that structure's fields".
+//   - every mention of the run in the body is inside that field's value. A mention anywhere
+//     else is the run going somewhere this scan cannot follow -- into a call whose result is
+//     dropped, into a second structure, into a local assembled by hand -- and none of those is
+//     storing it.
+//
+// A run that is never mentioned stores nothing AND interprets nothing, so it is not taking its
+// run apart: a declaration that ignores the bytes it was handed is not a decoder of them,
+// whatever else it may be.
+//
+// The deliberate over report: a constructor that assembles its field from the run by hand, a
+// make and a copy rather than this package's cloneBytes, mentions the run outside the field's
+// value and is reported. That direction is correct and is not a wart. Nothing this scan can
+// read separates such a constructor from a decoder that assembles a field from the run by
+// hand, and the house spelling -- cloneBytes(run) as the field's value, which is what
+// BasicCredential is written as -- is exempt, so the report is a request to write it the way
+// this package already writes it.
+func keyScheduleStoresItsRunWhole(one sourceDeclaration) bool {
+	if len(one.paramNames) != 1 {
+		return false
+	}
+	run := one.paramNames[0]
+	if run == "" || run == "_" {
+		// never named and therefore never used: nothing is taken apart
+		return true
+	}
+	mentions := map[token.Pos]bool{}
+	ast.Inspect(one.body, func(node ast.Node) bool {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && identifier.Name == run {
+			mentions[identifier.Pos()] = true
+		}
+		return true
+	})
+	if len(mentions) == 0 {
+		return true
+	}
+	// the composite literal fields whose value mentions the run, and the mentions those values
+	// account for. A field is keyed by the literal it belongs to as well as by its name, so a
+	// run stored into two different structures counts as two fields rather than collapsing into
+	// one when both spell the field the same way.
+	fields := map[string]bool{}
+	stored := map[token.Pos]bool{}
+	ast.Inspect(one.body, func(node ast.Node) bool {
+		literal, isLiteral := node.(*ast.CompositeLit)
+		if !isLiteral {
+			return true
+		}
+		for at, element := range literal.Elts {
+			name := fmt.Sprintf("%d", at)
+			value := element
+			if pair, isPair := element.(*ast.KeyValueExpr); isPair {
+				if key, isIdentifier := pair.Key.(*ast.Ident); isIdentifier {
+					name = key.Name
+				}
+				value = pair.Value
+			}
+			mentioned := false
+			ast.Inspect(value, func(inner ast.Node) bool {
+				if identifier, isIdentifier := inner.(*ast.Ident); isIdentifier && identifier.Name == run {
+					stored[identifier.Pos()] = true
+					mentioned = true
+				}
+				return true
+			})
+			if mentioned {
+				fields[fmt.Sprintf("%d.%s", literal.Pos(), name)] = true
+			}
+		}
+		return true
+	})
+	return len(fields) <= 1 && len(stored) == len(mentions)
 }
 
 // keyScheduleFieldsNamedIn counts how many DISTINCT fields of a type one body mentions.
@@ -433,10 +535,24 @@ func NewBasicCredential(identity []byte) Credential {
 	return Credential{CredentialType: 1, Identity: identity}
 }
 
-// and the three near misses that constructor must not cover, all under names carrying no verb
-// and all answering the same structure from one byte run: one that can report a malformed run,
-// one that branches on its content, and one that cuts a field out of it by offset. Every one of
-// them is a second decoder and all three are reported.
+// the same constructor written the way this package actually writes it: the run is copied
+// before it is stored, because the caller's array is usually a slice of a buffer it goes on
+// writing into. A defensive copy is still storing the run whole, so this is not reported
+// either -- and pinning it here is what keeps a refinement of the exemption from quietly
+// making BasicCredential itself a reported shape.
+func NewBasicCredentialCopying(identity []byte) Credential {
+	return Credential{CredentialType: 1, Identity: cloneBytes(identity)}
+}
+
+// and the near misses that constructor must not cover, all under names carrying no verb and
+// all answering the same structure from one byte run. Every one of them is a second decoder
+// and all of them are reported.
+//
+// The first three carry one of the decode symptoms each: one can report a malformed run, one
+// branches on its content, one cuts a field out of it by offset. The two after them carry NONE
+// of the three and are the reason the exemption is stated as what a constructor does rather
+// than as the absence of those symptoms -- they were measured walking past the symptom-only
+// version of this rule.
 func credentialFromBytes(b []byte) (Credential, error) { return Credential{}, nil }
 
 func credentialFromBytesBranching(b []byte) Credential {
@@ -448,6 +564,34 @@ func credentialFromBytesBranching(b []byte) Credential {
 
 func credentialFromBytesSlicing(b []byte) Credential {
 	return Credential{CredentialType: 1, Identity: b[2:]}
+}
+
+// a run read apart by somebody else's arithmetic: the first two octets of a run this package
+// did not write become a field, and the rest becomes another. No error, no branch, no
+// subscript -- the interpretation is inside a call -- and the run reaches two fields, which is
+// laying a structure out and is exactly what a second decoder is.
+func credentialFromBytesDecoding(b []byte) Credential {
+	return Credential{CredentialType: binary.BigEndian.Uint16(b), Identity: b}
+}
+
+// a decode wrapper with the error swallowed: the run is handed to the real codec and the
+// structure comes back through the argument, so the body mentions the run once, stores it
+// nowhere, and carries none of the three symptoms. Swallowing the error is what removes the
+// first of them, which is why the error result cannot be the whole rule.
+func credentialFromBytesSwallowing(b []byte) *GroupContext {
+	out := &GroupContext{}
+	syntax.Unmarshal(b, out)
+	return out
+}
+
+// the declared over report, kept here so the boundary is measured rather than remembered: a
+// constructor that assembles its one field from the run by hand mentions the run outside the
+// field's value and is reported, because nothing this scan can read separates it from a
+// decoder that assembles a field by hand. cloneBytes is the spelling that is exempt.
+func credentialFromBytesAssembling(b []byte) Credential {
+	identity := make([]byte, len(b))
+	copy(identity, b)
+	return Credential{CredentialType: 1, Identity: identity}
 }
 
 // the second sanctioned exception: an extension body, whose Encode answers the whole
@@ -504,8 +648,11 @@ var keyScheduleCodecControlWrappers = []string{
 	"ParseOwnerSuccessorExtension",
 	"ParsePreSharedKeyId",
 	"credentialFromBytes",
+	"credentialFromBytesAssembling",
 	"credentialFromBytesBranching",
+	"credentialFromBytesDecoding",
 	"credentialFromBytesSlicing",
+	"credentialFromBytesSwallowing",
 	"groupContextFromBytes",
 }
 

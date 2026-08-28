@@ -37,7 +37,19 @@ type Lifetime struct {
 // Lifetime and ParentHash are variant fields and are meaningful only under the source that
 // carries them. A value holding both is not malformed -- it is what a struct with no sum type
 // looks like in Go -- but only the one the source selects is encoded, and a decode leaves the
-// others at their zero value.
+// others at their zero value. That last part is a property of UnmarshalMLS rather than of the
+// switch inside it: the decode is staged and assigned whole, so it holds for a receiver that
+// already held a leaf of another source as well as for a fresh one.
+//
+// A NIL vector and an EMPTY one are the same leaf. Every variable length field here --
+// EncryptionKey, SignatureKey, Credential.Identity, the five Capabilities vectors, ParentHash,
+// Extensions and Signature -- is written with a length prefix that has one spelling for zero,
+// so nil and empty encode to identical bytes, and a decode of those bytes answers the EMPTY
+// one: syntax.ReadOpaque allocates and syntax.ReadVector allocates, and neither ever answers
+// nil. A leaf built by hand with a nil vector therefore does not survive a round trip under
+// reflect.DeepEqual even though its encoding does, which matters wherever two leaves are
+// compared as values rather than as bytes. TestANilVectorAndAnEmptyOneAreOneLeafOnTheWire
+// states it over every vector of the structure, derived off the type.
 type LeafNode struct {
 	EncryptionKey  HpkePublicKey
 	SignatureKey   SignaturePublicKey
@@ -95,6 +107,15 @@ func (self *LeafNode) MarshalMLS(w *syntax.Writer) error {
 
 // unmarshalCore reads the same fields in the same order as marshalCore, so that LeafNodeTBS and
 // LeafNode cannot come apart at the one place it would not be noticed.
+//
+// It writes into its receiver AS IT READS, and the variant arms assign only the field their own
+// source carries, so it must be called on a value nobody else holds and that holds nothing:
+// UnmarshalMLS below stages a fresh LeafNode for exactly that reason, and task 6's LeafNodeTBS
+// owes the same. Called on a receiver that already held a leaf, this leaves the previous value's
+// ParentHash or Lifetime standing under a source that does not carry it, and called on a
+// receiver whose decode is then refused, it leaves that receiver half written. Both make the
+// decoded value depend on something besides the bytes it was read from, which is the assumption
+// every comparison of two leaves and every parent hash computed off one rests on.
 func (self *LeafNode) unmarshalCore(r *syntax.Reader) error {
 	encryptionKey, err := r.ReadOpaque()
 	if err != nil {
@@ -143,15 +164,34 @@ func (self *LeafNode) unmarshalCore(r *syntax.Reader) error {
 
 // UnmarshalMLS decodes the whole leaf. It consumes exactly its own fields, because a LeafNode is
 // also read inside a ratchet tree and inside a KeyPackage, where the bytes after it are not its.
+//
+// The decode is STAGED and assigned whole, and that is the property rather than a tidiness: the
+// leaf this answers is a function of the bytes it read and of nothing the receiver arrived
+// holding. Two things follow from it, and neither holds if the fields are written as they are
+// read:
+//
+//   - a refused decode leaves the receiver untouched. Credential.UnmarshalMLS already keeps
+//     that discipline -- it refuses the credential type before it reads the identity, so no
+//     certificate chain is ever allocated on this package's behalf -- and two decoders of the
+//     same commit disagreeing about it is how a caller comes to rely on the wrong one. Every
+//     truncation and every unrecognised source is a refusal, and there are more of the first
+//     than there are field boundaries.
+//   - a receiver decoded into twice answers the second encoding both times. The variant arms
+//     assign only the field their own source carries, so a commit leaf decoded into a receiver
+//     that held a key_package leaf would otherwise come back carrying the previous leaf's
+//     Lifetime. Nothing in the bytes says so, and the value compares unequal to the same bytes
+//     decoded fresh.
 func (self *LeafNode) UnmarshalMLS(r *syntax.Reader) error {
-	if err := self.unmarshalCore(r); err != nil {
+	staged := LeafNode{}
+	if err := staged.unmarshalCore(r); err != nil {
 		return err
 	}
 	signature, err := r.ReadOpaque()
 	if err != nil {
 		return err
 	}
-	self.Signature = signature
+	staged.Signature = signature
+	*self = staged
 	return nil
 }
 

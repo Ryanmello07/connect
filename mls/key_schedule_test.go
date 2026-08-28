@@ -3069,8 +3069,13 @@ type sourceDeclaration struct {
 	name     string
 	exported bool
 	params   []string
-	results  []string
-	body     *ast.BlockStmt
+	// paramNames travels beside params because a scan that reads what a declaration DOES with
+	// an argument has to be able to find that argument in the body, and a rendered type cannot
+	// be found there. An unnamed or blank parameter is carried as the empty string, so a caller
+	// can tell "named and unused" from "not named at all" rather than guessing.
+	paramNames []string
+	results    []string
+	body       *ast.BlockStmt
 }
 
 // declaredIn is every function and method of one parsed file, with its parameter and result
@@ -3087,17 +3092,25 @@ func declaredIn(parsed parsedSource) []sourceDeclaration {
 			continue
 		}
 		one := sourceDeclaration{
-			receiver: parsed.receiverOf(function),
-			name:     function.Name.Name,
-			exported: function.Name.IsExported(),
-			params:   []string{},
-			results:  []string{},
-			body:     function.Body,
+			receiver:   parsed.receiverOf(function),
+			name:       function.Name.Name,
+			exported:   function.Name.IsExported(),
+			params:     []string{},
+			paramNames: []string{},
+			results:    []string{},
+			body:       function.Body,
 		}
 		if function.Type.Params != nil {
 			for _, field := range function.Type.Params.List {
 				one.params = append(one.params,
 					slices.Repeat([]string{parsed.render(field.Type)}, max(len(field.Names), 1))...)
+				if len(field.Names) == 0 {
+					one.paramNames = append(one.paramNames, "")
+					continue
+				}
+				for _, named := range field.Names {
+					one.paramNames = append(one.paramNames, named.Name)
+				}
 			}
 		}
 		if function.Type.Results != nil {
