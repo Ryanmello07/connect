@@ -815,6 +815,128 @@ func TestFindExtensionAnswersBothDirections(t *testing.T) {
 	}
 }
 
+// TestFindExtensionReturnsTheFirstOfARepeatedType is the selection rule FindExtension's comment
+// argues for at length, stated where it can fail.
+//
+// extensions<V> is a vector and the wire permits two entries of one type. FindExtension returns
+// the FIRST rather than refusing, deliberately: ValSem209 and the group context extension rules
+// are what refuse a repeated type, and a lookup answering "not found" for a vector holding two
+// would hide the input that refusal is stated over. Which of the two it returns is therefore a
+// wire visible choice. If a peer sends two required_capabilities bodies, the body this
+// implementation enforces is chosen by the sender, and choosing the last would mean enforcing a
+// different one from every implementation that chooses the first.
+//
+// The sweep above builds no vector holding two entries of one type -- it puts exactly one entry
+// per declared type into `present` -- so first and last are never distinguished there. This
+// builds exactly that vector, for every extension type the package declares plus the ones it
+// declares for nothing, with the repeated pair bracketed by other entries so a lookup that
+// always returned exts[0], or always exts[len-1], fails here too.
+func TestFindExtensionReturnsTheFirstOfARepeatedType(t *testing.T) {
+	types := []ExtensionType{}
+	for _, value := range sortedValues(registryConstantsOfType(t, "ExtensionType")) {
+		types = append(types, ExtensionType(value))
+	}
+	for _, probe := range unregisteredProbes {
+		types = append(types, ExtensionType(probe))
+	}
+	if len(types) < 3 {
+		t.Fatalf("the derivation found %d extension types, so this sweep states almost nothing", len(types))
+	}
+	for _, extensionType := range types {
+		// some other type, so the repeated pair sits neither at the head of the vector nor at
+		// its tail and neither end can be returned by accident
+		other := types[0]
+		if other == extensionType {
+			other = types[1]
+		}
+		first := []byte{byte(extensionType >> 8), byte(extensionType), 0x01}
+		second := []byte{byte(extensionType >> 8), byte(extensionType), 0x02}
+		exts := []Extension{
+			{ExtensionType: other, ExtensionData: []byte{0xff}},
+			{ExtensionType: extensionType, ExtensionData: first},
+			{ExtensionType: extensionType, ExtensionData: second},
+			{ExtensionType: other, ExtensionData: []byte{0xfe}},
+		}
+		body, ok := FindExtension(exts, extensionType)
+		if !ok {
+			t.Errorf("%#04x: FindExtension over a vector holding it twice reported absent; a lookup that refuses a repeated type hides the input ValSem209 is stated over",
+				uint16(extensionType))
+			continue
+		}
+		if !bytes.Equal(body, first) {
+			t.Errorf("%#04x: FindExtension over a vector holding it twice returned %x, want the FIRST entry's body %x; which body a peer gets to have enforced is otherwise chosen by the peer",
+				uint16(extensionType), body, first)
+		}
+	}
+}
+
+// TestReadExtensionsReturnsAnEmptySliceRatherThanNil is the one property ReadExtensions' own
+// comment states that nothing else in this file can observe.
+//
+// The wire has a single spelling for an empty extensions vector, so no encoding round trip can
+// distinguish nil from empty: sameRegistryVectors, which every generated round trip property
+// here goes through, treats the two as equal by deliberate design. The distinction is a Go one
+// and it is the one the comment argues is load bearing -- an absent extensions field and a
+// present but empty one are different statements about a group, and a caller that has to tell
+// them apart has only the nilness of this slice to do it with.
+//
+// Stated over an arity sweep rather than over the empty case alone, so "never nil" is a property
+// of the function rather than an assertion about one input.
+func TestReadExtensionsReturnsAnEmptySliceRatherThanNil(t *testing.T) {
+	for count := range 4 {
+		exts := []Extension{}
+		for i := range count {
+			exts = append(exts, Extension{
+				ExtensionType: ExtensionType(0xF001 + i),
+				ExtensionData: repeatByte(byte(i), i),
+			})
+		}
+		w := syntax.NewWriter()
+		if err := WriteExtensions(w, exts); err != nil {
+			t.Fatalf("%d entries: WriteExtensions: %v", count, err)
+		}
+		encoded, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%d entries: Bytes: %v", count, err)
+		}
+		out, err := ReadExtensions(syntax.NewReader(encoded))
+		if err != nil {
+			t.Fatalf("%d entries: ReadExtensions: %v", count, err)
+		}
+		if out == nil {
+			t.Errorf("%d entries: ReadExtensions returned a nil slice; an empty extensions vector and an absent one are then the same nil in Go and different bytes on the wire",
+				count)
+		}
+		if len(out) != count {
+			t.Errorf("%d entries: ReadExtensions returned %d entries", count, len(out))
+		}
+	}
+
+	// and the empty vector spelled from the encoder's own side: a nil the caller passes in is
+	// one octet on the wire, and what comes back from those bytes must still be non nil
+	w := syntax.NewWriter()
+	if err := WriteExtensions(w, nil); err != nil {
+		t.Fatalf("WriteExtensions(nil): %v", err)
+	}
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	if want := []byte{0x00}; !bytes.Equal(encoded, want) {
+		t.Fatalf("WriteExtensions(nil) = %x, want %x", encoded, want)
+	}
+	out, err := ReadExtensions(syntax.NewReader(encoded))
+	if err != nil {
+		t.Fatalf("ReadExtensions: %v", err)
+	}
+	if out == nil {
+		t.Error("ReadExtensions over the empty vector returned nil, want an empty non nil slice")
+	}
+	if len(out) != 0 {
+		t.Errorf("ReadExtensions over the empty vector returned %d entries", len(out))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the refusal properties
 // ---------------------------------------------------------------------------
@@ -1450,20 +1572,37 @@ func carveOutKey(registryName string, code uint64) string {
 	return fmt.Sprintf("%s/%#04x", registryName, code)
 }
 
-// capabilityProbes is the code point set each requirement is exercised over: every constant the
-// package declares for that registry, plus one the package declares for nothing.
+// unregisteredProbes are the code points these sweeps use that no registry in this package
+// declares, and they come in a pair for a reason the single one they replaced could not serve.
 //
-// The GREASE probe is not decoration. The declared constants are small and dense, so a
+// One probe closes only the constant-range shape: a predicate answering true for everything
+// below 0x0010 is caught by any probe above the declared block. It cannot close an ORDERING
+// shape on a registry that declares a single constant -- CredentialType declares only basic --
+// because with one declared value and one probe, every pair the sweep can build sits on the
+// same side of the comparison and `<=` or `>=` answers exactly as `==` does. Two probes
+// straddling the declared block make both directions visible on every registry, which is what
+// TestEverySupportsPredicateReadsBothOfItsOperands needs to be able to state.
+//
+// 0x0bad sits above the dense low block every registry declares and below the 0xF00x private
+// use values; 0xbeef sits above both.
+var unregisteredProbes = []uint64{0x0bad, 0xbeef}
+
+// capabilityProbes is the code point set each requirement is exercised over: every constant the
+// package declares for that registry, plus the two the package declares for nothing.
+//
+// The GREASE probes are not decoration. The declared constants are small and dense, so a
 // predicate comparing on a range rather than on equality -- everything below 0x0010 supported,
 // say -- answers correctly for all of them.
 func capabilityProbes(t *testing.T, typeName string) []uint64 {
 	t.Helper()
 	probes := sortedValues(registryConstantsOfType(t, typeName))
-	const grease = 0xbeef
-	if slices.Contains(probes, uint64(grease)) {
-		t.Fatalf("%s declares %#04x, so it is not the unregistered probe this sweep needs", typeName, grease)
+	for _, grease := range unregisteredProbes {
+		if slices.Contains(probes, grease) {
+			t.Fatalf("%s declares %#04x, so it is not an unregistered probe this sweep can use", typeName, grease)
+		}
+		probes = append(probes, grease)
 	}
-	return append(probes, grease)
+	return probes
 }
 
 // buildCapabilities returns a Capabilities whose named field holds exactly the given code
@@ -1482,12 +1621,20 @@ func buildCapabilities(fieldName string, codes []uint64) *Capabilities {
 }
 
 // buildRequiredCapabilities returns a RequiredCapabilities whose named field requires exactly
-// the given code point and which requires nothing else.
-func buildRequiredCapabilities(fieldName string, code uint64) *RequiredCapabilities {
+// the given code points and which requires nothing else.
+//
+// Variadic rather than one code point, because the arity of a requirement vector is itself an
+// axis a sweep can leave fixed. Every requirement this file used to build carried exactly one
+// entry, so Supports' three loops each ran their body exactly once and a loop truncated to its
+// first element was indistinguishable from a whole one -- the group naming two required
+// extensions has one of them enforced, at full width and in silence.
+func buildRequiredCapabilities(fieldName string, codes ...uint64) *RequiredCapabilities {
 	value := &RequiredCapabilities{}
 	field := reflect.ValueOf(value).Elem().FieldByName(fieldName)
-	slice := reflect.MakeSlice(field.Type(), 1, 1)
-	slice.Index(0).SetUint(code)
+	slice := reflect.MakeSlice(field.Type(), len(codes), len(codes))
+	for i, code := range codes {
+		slice.Index(i).SetUint(code)
+	}
 	field.Set(slice)
 	return value
 }
@@ -1619,18 +1766,36 @@ func TestSupportsAcceptsAMemberThatHasEverythingAndRefusesOneShortOfAnything(t *
 	}
 }
 
-// TestEverySupportsPredicateAnswersBothDirections states the five leaf predicates the way the
-// whole check is stated, because two of them -- versions and ciphersuites -- are not reachable
-// through RequiredCapabilities at all and would otherwise be judged by nothing.
+// capabilityPredicate pairs one field of Capabilities with the Supports predicate that answers
+// for its registry, and carries the registry type so a probe of the right type can be built.
+type capabilityPredicate struct {
+	field     string
+	registry  reflect.Type
+	predicate reflect.Method
+}
+
+// ask runs the predicate over one member and one code point. It exists so the two sweeps below
+// cannot spell the reflect call differently, which is the shape in which one of them comes to
+// be asking a different question from the one its name claims.
+func (self capabilityPredicate) ask(member *Capabilities, code uint64) bool {
+	probe := reflect.New(self.registry).Elem()
+	probe.SetUint(code)
+	return self.predicate.Func.Call([]reflect.Value{reflect.ValueOf(member), probe})[0].Bool()
+}
+
+// capabilityPredicates derives the (field, predicate) pairing from Capabilities' own fields:
+// each field is a slice of one registry, and the predicate for it is the method taking that
+// registry's type. A sixth field added to Capabilities without a predicate fails here rather
+// than being quietly unjudged, and so does a predicate that starts taking two arguments.
 //
-// The predicates are derived from Capabilities' own fields: each field is a slice of one
-// registry, and the predicate for it is the method taking that registry's type. A sixth field
-// added to Capabilities without a predicate fails here rather than being quietly unjudged.
-func TestEverySupportsPredicateAnswersBothDirections(t *testing.T) {
+// One derivation site and two sweeps over it, because both of the sweeps below are claims about
+// the SAME class -- every predicate the type carries -- and a second copy of the pairing is the
+// second place for that class to be understated.
+func capabilityPredicates(t *testing.T) []capabilityPredicate {
+	t.Helper()
 	capabilitiesType := reflect.TypeOf(Capabilities{})
 	pointerType := reflect.TypeOf(&Capabilities{})
-	derivedCarveOuts := map[string]bool{}
-	judged := 0
+	pairs := []capabilityPredicate{}
 	for i := 0; i < capabilitiesType.NumField(); i++ {
 		field := capabilitiesType.Field(i)
 		registry := field.Type.Elem()
@@ -1648,17 +1813,33 @@ func TestEverySupportsPredicateAnswersBothDirections(t *testing.T) {
 			t.Fatalf("Capabilities.%s is a slice of %s and %d Supports predicates take that type (%v); one field, one predicate",
 				field.Name, registry.Name(), len(predicates), predicates)
 		}
-		predicate := predicates[0]
-		for _, code := range capabilityProbes(t, registry.Name()) {
-			probe := reflect.New(registry).Elem()
-			probe.SetUint(code)
-			holder := buildCapabilities(field.Name, []uint64{code})
-			if !predicate.Func.Call([]reflect.Value{reflect.ValueOf(holder), probe})[0].Bool() {
-				t.Errorf("%s(%#04x) over a member listing it = false", predicate.Name, code)
+		pairs = append(pairs, capabilityPredicate{field: field.Name, registry: registry, predicate: predicates[0]})
+	}
+	if len(pairs) != capabilitiesType.NumField() {
+		t.Fatalf("%d of Capabilities' %d fields were paired with a predicate", len(pairs), capabilitiesType.NumField())
+	}
+	return pairs
+}
+
+// TestEverySupportsPredicateAnswersBothDirections states the five leaf predicates the way the
+// whole check is stated, because two of them -- versions and ciphersuites -- are not reachable
+// through RequiredCapabilities at all and would otherwise be judged by nothing.
+//
+// This is the has-it / has-nothing axis only. The has-something-else axis is
+// TestEverySupportsPredicateReadsBothOfItsOperands below, and neither subsumes the other: this
+// one owns the carve out comparison, that one owns the shape of the comparison itself.
+func TestEverySupportsPredicateAnswersBothDirections(t *testing.T) {
+	derivedCarveOuts := map[string]bool{}
+	judged := 0
+	for _, entry := range capabilityPredicates(t) {
+		for _, code := range capabilityProbes(t, entry.registry.Name()) {
+			holder := buildCapabilities(entry.field, []uint64{code})
+			if !entry.ask(holder, code) {
+				t.Errorf("%s(%#04x) over a member listing it = false", entry.predicate.Name, code)
 			}
-			without := buildCapabilities(field.Name, nil)
-			if predicate.Func.Call([]reflect.Value{reflect.ValueOf(without), probe})[0].Bool() {
-				derivedCarveOuts[carveOutKey(registry.Name(), code)] = true
+			without := buildCapabilities(entry.field, nil)
+			if entry.ask(without, code) {
+				derivedCarveOuts[carveOutKey(entry.registry.Name(), code)] = true
 			}
 			judged++
 		}
@@ -1675,6 +1856,137 @@ func TestEverySupportsPredicateAnswersBothDirections(t *testing.T) {
 	}
 	t.Logf("%d (predicate, code point) pairs judged in both directions, %d carve outs",
 		judged, len(derivedCarveOuts))
+}
+
+// TestEverySupportsPredicateReadsBothOfItsOperands states each predicate over the PAIR it is a
+// function of: the code point the member holds, and the code point it is asked about.
+//
+// The sweep above varies only one of the two. Every member it builds either holds exactly the
+// code point it is then asked about or holds nothing at all, so a predicate answering x >= t
+// instead of x == t -- or x <= t -- satisfies every case it produces, in BOTH directions, and
+// every other property in this file stays green while Supports admits a member whose vector
+// lists nothing the group requires. Under >= a member listing only
+// ExtensionTypeUrmessageOwnerSuccessor is reported as supporting ratchet_tree and
+// required_capabilities. That is exactly the permissive-in-the-wrong-direction defect this
+// file's header says it exists to close, and the has-it / has-nothing axis cannot see it,
+// because a comparison is a function of two operands and that axis holds one of them equal to
+// the other.
+//
+// So the class here is the CROSS PRODUCT of the probe set with itself, derived twice over --
+// the predicates off the type, the code points off the type checker -- and the answer is
+// required to depend on both operands: true exactly when the member holds what it is asked
+// about, false for every other pair, unless the code point asked about is one the mandatory to
+// implement table argues for.
+//
+// Two member shapes per code point, because arity is an axis too. The singleton holder is the
+// smallest member that can tell the operands apart; the complement holder -- every probe the
+// registry has EXCEPT the one being asked about -- is the shape a real leaf has, and it is what
+// catches a predicate answering from the length of the vector rather than from its contents.
+func TestEverySupportsPredicateReadsBothOfItsOperands(t *testing.T) {
+	answers, crossPairs := 0, 0
+	for _, entry := range capabilityPredicates(t) {
+		registry := entry.registry.Name()
+		probes := capabilityProbes(t, registry)
+		if len(probes) < 2 {
+			t.Fatalf("%s yielded %d probe(s), so no (holds A, asked B) pair with A != B exists for it and this sweep would state nothing about %s",
+				registry, len(probes), entry.predicate.Name)
+		}
+		for _, asked := range probes {
+			// the one carve out the specification argues for is the only code point a member
+			// may be reported as supporting without listing it
+			carveOut := mandatoryToImplement[carveOutKey(registry, asked)]
+			for _, held := range probes {
+				want := held == asked || carveOut
+				if got := entry.ask(buildCapabilities(entry.field, []uint64{held}), asked); got != want {
+					t.Errorf("%s(%#04x) over a member listing only %#04x = %v, want %v; the answer has to read both operands rather than their order",
+						entry.predicate.Name, asked, held, got, want)
+				}
+				answers++
+				if held != asked {
+					crossPairs++
+				}
+			}
+			complement := slices.DeleteFunc(slices.Clone(probes), func(code uint64) bool { return code == asked })
+			if got := entry.ask(buildCapabilities(entry.field, complement), asked); got != carveOut {
+				t.Errorf("%s(%#04x) over a member listing every other probe (%#04x) = %v, want %v; a predicate answering from the length of the vector rather than from its contents fails here",
+					entry.predicate.Name, asked, complement, got, carveOut)
+			}
+			answers++
+		}
+	}
+	if crossPairs == 0 {
+		t.Fatal("no (holds A, asked B) pair with A != B was built, so this sweep only restates the axis the sweep above already owns")
+	}
+	t.Logf("%d predicate answers judged, %d of them over a member holding something other than what it was asked about",
+		answers, crossPairs)
+}
+
+// TestSupportsEnforcesEveryEntryOfEveryRequirementVector states the whole check over the axis
+// every other sweep in this file leaves fixed: how many code points one requirement carries.
+//
+// Every RequiredCapabilities built anywhere else here holds exactly one entry per field, so each
+// of Supports' three loops runs its body exactly once and a loop truncated to its first element
+// is indistinguishable from a whole one. A group whose required_capabilities names two
+// extensions would then have one of them enforced and the other not: a member who cannot read
+// what the group sends is admitted, silently, at full width, and nothing reports an error until
+// that member cannot decrypt.
+//
+// So each requirement is built holding EVERY code point the package declares for its registry
+// plus the unregistered probes, and the member is given all of them but one -- sweeping which
+// one, so the LAST entry of the vector is dropped as well as the first. The refusal has to name
+// the code point that was dropped, because a refusal naming a different one is a loop reading
+// the wrong index, which passes an assertion that only checks the sentinel.
+func TestSupportsEnforcesEveryEntryOfEveryRequirementVector(t *testing.T) {
+	pairs := requiredCapabilityFields(t)
+	requiredType := reflect.TypeOf(RequiredCapabilities{})
+	refused, carvedOut := 0, 0
+	for _, requirement := range slices.Sorted(maps.Keys(pairs)) {
+		field, found := requiredType.FieldByName(requirement)
+		if !found {
+			t.Fatalf("RequiredCapabilities declares no field %s", requirement)
+		}
+		registry := field.Type.Elem().Name()
+		probes := capabilityProbes(t, registry)
+		if len(probes) < 2 {
+			t.Fatalf("%s's registry %s yielded %d probe(s), so the requirement vector this builds has no second entry and a loop truncated to its first would still pass",
+				requirement, registry, len(probes))
+		}
+		rc := buildRequiredCapabilities(requirement, probes...)
+
+		// the member holding all of them is accepted, so every refusal below is attributable to
+		// the one code point that was dropped rather than to the arity of the requirement
+		if err := buildCapabilities(pairs[requirement], probes).Supports(rc); err != nil {
+			t.Fatalf("%s: a member listing all %d required code points was refused with %v",
+				requirement, len(probes), err)
+		}
+		for dropped, code := range probes {
+			held := slices.Concat(probes[:dropped], probes[dropped+1:])
+			err := buildCapabilities(pairs[requirement], held).Supports(rc)
+			if mandatoryToImplement[carveOutKey(registry, code)] {
+				if err != nil {
+					t.Errorf("%s: dropping %#04x, which is mandatory to implement, was refused with %v",
+						requirement, code, err)
+				}
+				carvedOut++
+				continue
+			}
+			if !errors.Is(err, errMissingRequiredCapability) {
+				t.Errorf("%s: a member holding every required %s except %#04x (entry %d of %d) gave err = %v, want errMissingRequiredCapability; a loop that stops before its last entry is a requirement nobody enforces",
+					requirement, registry, code, dropped, len(probes), err)
+				continue
+			}
+			if want := fmt.Sprintf("%#04x", code); !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: dropping %#04x was refused with %q, which does not name it; a refusal naming a different entry is a loop reading the wrong index",
+					requirement, code, err)
+			}
+			refused++
+		}
+	}
+	if refused == 0 {
+		t.Fatal("no dropped requirement entry was refused, so this gate states nothing about the loops it exists to hold")
+	}
+	t.Logf("%d dropped requirement entries refused, %d passed over as mandatory to implement",
+		refused, carvedOut)
 }
 
 // ---------------------------------------------------------------------------
