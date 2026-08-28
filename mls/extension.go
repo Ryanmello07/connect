@@ -12,19 +12,56 @@
 // registries stay p5's, and when p5 task 3 lands it extends this file rather than
 // writing its own.
 //
+// p5 task 3 has now landed and done exactly that. The proposal and credential registries,
+// Capabilities, RequiredCapabilities and the extensions lookup are below, beside the two
+// registries p4 needed first. Credential itself is still owed, by p5 task 4A, and is the one
+// declaration named in the paragraph above that this file does not yet carry.
+//
 // None of these registries is a closed set. A GREASE value, or a code point
 // registered after this was written, has to parse and be carried unchanged rather
 // than error: refusing an unknown extension type at the codec layer would make the
 // decoder the thing that decides policy, and policy belongs to validation.
 package mls
 
-import "github.com/urnetwork/connect/mls/syntax"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/urnetwork/connect/mls/syntax"
+)
 
 // ProtocolVersion is a code point from the RFC 9420 section 17.1 protocol version
 // registry. It is the first field of GroupContext and so of every epoch binding.
 type ProtocolVersion uint16
 
 const ProtocolVersionMls10 ProtocolVersion = 0x0001
+
+// CredentialType is a code point from the RFC 9420 section 17.4 credential type
+// registry. Only basic is declared because only basic is a credential this profile
+// constructs; x509 and every later registration still have to PARSE and be carried, which
+// is why the type is a bare uint16 and not an enum with a closed switch behind it.
+type CredentialType uint16
+
+const CredentialTypeBasic CredentialType = 0x0001
+
+// ProposalType is a code point from the RFC 9420 section 17.5 proposal type registry.
+//
+// All eight are declared, including the ones the v1 profile refuses. A refusal you cannot
+// name is a refusal you cannot make correctly: ValSem106 and ValSem109 are stated over a
+// member's proposal capabilities, and a proposals<V> vector naming external_init has to be
+// decoded and compared before anything can decide it is not permitted here.
+type ProposalType uint16
+
+const (
+	ProposalTypeReserved               ProposalType = 0x0000
+	ProposalTypeAdd                    ProposalType = 0x0001
+	ProposalTypeUpdate                 ProposalType = 0x0002
+	ProposalTypeRemove                 ProposalType = 0x0003
+	ProposalTypePreSharedKey           ProposalType = 0x0004
+	ProposalTypeReInit                 ProposalType = 0x0005
+	ProposalTypeExternalInit           ProposalType = 0x0006
+	ProposalTypeGroupContextExtensions ProposalType = 0x0007
+)
 
 // ExtensionType is a code point from the RFC 9420 section 17.3 extension type
 // registry. The three 0xF00x values are this project's own, from the private use
@@ -115,3 +152,296 @@ func readOneExtension(r *syntax.Reader) (Extension, error) {
 	err := ext.UnmarshalMLS(r)
 	return ext, err
 }
+
+// errMissingRequiredCapability is ValSem106 and ValSem109 in the validation plan's catalogue,
+// and that plan owns the single declaration site for ErrMissingRequiredCapability. Neither
+// that name nor ValSem itself has landed in this package yet, so the refusal is carried by
+// this unexported value until they do.
+//
+// Unexported is the whole point of the shape, and the argument is psk.go's, made for the three
+// ValSem401 to ValSem403 sentinels it carries the same way. An exported
+// ErrMissingRequiredCapability declared here would be a second public declaration site for a
+// name the validation plan also declares, the two would not be the same value, and a caller
+// matching one would silently stop matching the other. A name that cannot be reached from
+// outside this package cannot be depended on from outside it either, so the swap costs nobody
+// else anything -- and every consumer of this refusal in the tasks after this one is inside
+// package mls.
+//
+// It would also be an exported error in a file that no class in
+// TestEveryExportedErrorOfThisPackageIsInAMaintainedClass holds, which is that gate's loud
+// case -- but that is the right answer to the wrong question. The reason not to export it is
+// that the name is somebody else's, not that a sweep would notice.
+//
+// The swap is mechanical: wrap each detail in ValSem(ValSem106, ...) or ValSem(ValSem109, ...)
+// with the catalogue's sentinel as the detail. The moment it is owed is not left to anybody's
+// memory either -- TestNoValidationOwnedNameHasLandedBesideItsStandIn derives the owed pair
+// from this file's own declarations and fails on the commit that lands the real name.
+var errMissingRequiredCapability = errors.New("mls: leaf does not support a required capability")
+
+// FindExtension returns the body of the first entry carrying t, and whether one was found.
+//
+// First rather than only, and no duplicate check here: extensions<V> is a vector and the wire
+// permits two entries of one type. Which of them wins is a validation question -- ValSem209
+// and the group context extension rules are where a repeated type is refused -- and a lookup
+// that answered "not found" for a vector holding two would make that refusal unreachable by
+// hiding the input it is stated over.
+//
+// The bool is separate from a nil body because an extension present with an empty body is a
+// different statement from an extension that is absent: required_capabilities carrying three
+// empty vectors requires nothing of a member, and no required_capabilities at all is what a
+// group that never set one looks like. Those are the same nil in Go and different bytes on the
+// wire, and the wire is what everything downstream is signed over.
+func FindExtension(exts []Extension, t ExtensionType) ([]byte, bool) {
+	for i := range exts {
+		if exts[i].ExtensionType == t {
+			return exts[i].ExtensionData, true
+		}
+	}
+	return nil, false
+}
+
+// The four uint16 registries all encode as one length prefixed vector of uint16, so the pair
+// below is written once over ~uint16 rather than eight times by hand. Eight hand written
+// copies is eight chances to write the prefix as an element count instead of the byte count
+// syntax.WriteVector writes; the two are the same number only for a fixed width element, which
+// these happen to be, so seven of the eight could be wrong in a way the eighth's test would
+// never see.
+func writeUint16Vec[T ~uint16](w *syntax.Writer, values []T) error {
+	return syntax.WriteVector(w, values, writeOneUint16[T])
+}
+
+// writeOneUint16 is WriteVector's element encoder, named rather than written as a closure for
+// the reason writeOneExtension is: the codec entry gate in crypto_labels_test.go pins every
+// syntax call this package makes by its source text, and a closure carries its whole body into
+// that pin.
+func writeOneUint16[T ~uint16](w *syntax.Writer, v T) error {
+	w.WriteUint16(uint16(v))
+	return nil
+}
+
+func readUint16Vec[T ~uint16](r *syntax.Reader) ([]T, error) {
+	return syntax.ReadVector(r, readOneUint16[T])
+}
+
+// readOneUint16 is ReadVector's element decoder, named for the reason its encode twin is. An
+// unregistered code point is converted and carried, never refused: the codec does not decide
+// policy, and a GREASE value in a peer's capabilities is one that has to survive being read
+// and written back, or every signature over the leaf carrying it stops verifying here and
+// nowhere else.
+func readOneUint16[T ~uint16](r *syntax.Reader) (T, error) {
+	v, err := r.ReadUint16()
+	return T(v), err
+}
+
+// Capabilities is RFC 9420 section 7.2: what the client behind a leaf node understands.
+//
+// It is a validation surface rather than a record. Every field is read to answer one of two
+// questions -- may this member join, and is this commit acceptable -- and both are wrong in a
+// way nobody sees at the time if a comparison is permissive in the wrong direction. A check
+// that accepts a member missing a required extension admits a member who cannot process the
+// group's messages; a check that rejects a member who has everything is a group nobody can
+// join. Neither surfaces as an error at the point of the mistake, which is why the predicates
+// below are tested in both directions over a class derived from the type.
+type Capabilities struct {
+	Versions     []ProtocolVersion
+	CipherSuites []CipherSuite
+	Extensions   []ExtensionType
+	Proposals    []ProposalType
+	Credentials  []CredentialType
+}
+
+// MarshalMLS encodes the five vectors in the section 7.2 field order, inline, into a writer
+// the caller owns: Capabilities is never a standalone message, it is the fourth field of a
+// LeafNode, and the LeafNode's signature covers these bytes where they sit.
+//
+// The field order is essentially the whole content of this encoding, since all five fields
+// have the same shape. Two of them swapped round trips perfectly, agrees with itself and
+// disagrees with every other implementation, so what holds it is the golden in the test file
+// taken from another implementation's output rather than any symmetry property.
+func (self *Capabilities) MarshalMLS(w *syntax.Writer) error {
+	if err := writeUint16Vec(w, self.Versions); err != nil {
+		return err
+	}
+	if err := writeUint16Vec(w, self.CipherSuites); err != nil {
+		return err
+	}
+	if err := writeUint16Vec(w, self.Extensions); err != nil {
+		return err
+	}
+	if err := writeUint16Vec(w, self.Proposals); err != nil {
+		return err
+	}
+	return writeUint16Vec(w, self.Credentials)
+}
+
+// UnmarshalMLS decodes the five vectors, consuming exactly its own fields, because it runs
+// inside a LeafNode whose remaining bytes are that leaf's source, extensions and signature.
+//
+// Each field is assigned as it is read rather than all at the end, which is the opposite of
+// what GroupContext does and is safe for the reason GroupContext's is not: these are five
+// independent slices, the caller is handed the error, and there is no composite of old and new
+// fields here that describes a leaf which never existed. What a partly filled Capabilities
+// describes is a member supporting fewer things, and every predicate below answers false for
+// what is missing.
+func (self *Capabilities) UnmarshalMLS(r *syntax.Reader) error {
+	var err error
+	if self.Versions, err = readUint16Vec[ProtocolVersion](r); err != nil {
+		return err
+	}
+	if self.CipherSuites, err = readUint16Vec[CipherSuite](r); err != nil {
+		return err
+	}
+	if self.Extensions, err = readUint16Vec[ExtensionType](r); err != nil {
+		return err
+	}
+	if self.Proposals, err = readUint16Vec[ProposalType](r); err != nil {
+		return err
+	}
+	self.Credentials, err = readUint16Vec[CredentialType](r)
+	return err
+}
+
+// the C1 pin: drift between this type and the one codec convention fails at build.
+var _ syntax.Codec = (*Capabilities)(nil)
+
+// SupportsVersion reports whether the leaf listed this protocol version.
+func (self *Capabilities) SupportsVersion(v ProtocolVersion) bool {
+	for _, x := range self.Versions {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// SupportsCipherSuite reports whether the leaf listed this ciphersuite.
+func (self *Capabilities) SupportsCipherSuite(s CipherSuite) bool {
+	for _, x := range self.CipherSuites {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// SupportsExtension reports whether the leaf listed this extension type. It answers for the
+// leaf's own extensions and for the group's required ones, which are the same question asked
+// from two sides.
+func (self *Capabilities) SupportsExtension(t ExtensionType) bool {
+	for _, x := range self.Extensions {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+// SupportsProposal reports whether the leaf listed this proposal type.
+func (self *Capabilities) SupportsProposal(t ProposalType) bool {
+	for _, x := range self.Proposals {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+// SupportsCredential reports whether the leaf can act on this credential type.
+//
+// The basic credential is mandatory to implement (RFC 9420 section 7.2), so it counts as
+// supported whether or not the leaf lists it. Every leaf this profile builds carries a
+// BasicCredential and several implementations leave 0x0001 out of the vector as redundant, so
+// a strict reading here would let a required_capabilities naming credential type 0x0001
+// reject members who are, in fact, using exactly that credential.
+//
+// This is the one place any of the five predicates answers true for something its vector does
+// not contain, which is why it is written out here rather than folded into the loop.
+func (self *Capabilities) SupportsCredential(t CredentialType) bool {
+	if t == CredentialTypeBasic {
+		return true
+	}
+	for _, x := range self.Credentials {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+// Supports is the whole required_capabilities check in one call, so the group lifecycle plan's
+// ValSem106 and ValSem109 sites cannot each spell the three loops differently -- which is how
+// one of them comes to be missing a loop, and a missing loop here is a member admitted who
+// cannot read what the group sends.
+//
+// A nil rc is "no requirement" and is satisfied by anything: a group carrying no
+// required_capabilities extension requires nothing, and that differs from a group requiring
+// nothing only in Go. On the wire the two are one encoding and both accept.
+//
+// Three loops and no fourth. Section 11.1 states required_capabilities over extension,
+// proposal and credential types only; versions and ciphersuites are agreed by the GroupContext
+// rather than required of a member, so a fourth loop here would enforce a rule nobody wrote.
+// The detail names the code point that failed, because a caller told only that some capability
+// is missing has to diff two vectors to find out which.
+func (self *Capabilities) Supports(rc *RequiredCapabilities) error {
+	if rc == nil {
+		return nil
+	}
+	for _, t := range rc.ExtensionTypes {
+		if !self.SupportsExtension(t) {
+			return fmt.Errorf("%w: extension type %#04x", errMissingRequiredCapability, uint16(t))
+		}
+	}
+	for _, t := range rc.ProposalTypes {
+		if !self.SupportsProposal(t) {
+			return fmt.Errorf("%w: proposal type %#04x", errMissingRequiredCapability, uint16(t))
+		}
+	}
+	for _, t := range rc.CredentialTypes {
+		if !self.SupportsCredential(t) {
+			return fmt.Errorf("%w: credential type %#04x", errMissingRequiredCapability, uint16(t))
+		}
+	}
+	return nil
+}
+
+// RequiredCapabilities is the body of the required_capabilities extension, type 0x0003,
+// carried in the group context. Every member of the group must support everything it names,
+// which is what makes the three vectors a membership rule rather than a hint.
+type RequiredCapabilities struct {
+	ExtensionTypes  []ExtensionType
+	ProposalTypes   []ProposalType
+	CredentialTypes []CredentialType
+}
+
+// MarshalMLS encodes the three vectors in the section 11.1 field order. These bytes are an
+// extension_data<V> inside the group context, so they are covered by the confirmed transcript
+// hash and by every epoch secret derived after it: a field order disagreement here is a group
+// that splits, rather than a message that fails to parse.
+func (self *RequiredCapabilities) MarshalMLS(w *syntax.Writer) error {
+	if err := writeUint16Vec(w, self.ExtensionTypes); err != nil {
+		return err
+	}
+	if err := writeUint16Vec(w, self.ProposalTypes); err != nil {
+		return err
+	}
+	return writeUint16Vec(w, self.CredentialTypes)
+}
+
+// UnmarshalMLS decodes the three vectors and consumes exactly them. It makes no trailing byte
+// check of its own: syntax.Unmarshal is the byte level entry point and is what raises
+// ErrTrailingBytes, and a second check here would be a second place for one rule to be spelled
+// two ways.
+func (self *RequiredCapabilities) UnmarshalMLS(r *syntax.Reader) error {
+	var err error
+	if self.ExtensionTypes, err = readUint16Vec[ExtensionType](r); err != nil {
+		return err
+	}
+	if self.ProposalTypes, err = readUint16Vec[ProposalType](r); err != nil {
+		return err
+	}
+	self.CredentialTypes, err = readUint16Vec[CredentialType](r)
+	return err
+}
+
+// the C1 pin: drift between this type and the one codec convention fails at build.
+var _ syntax.Codec = (*RequiredCapabilities)(nil)

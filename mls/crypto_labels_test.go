@@ -545,7 +545,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// which is the default one everywhere until a ratchet tree encode exists to
 		// raise it, and this line is where that decision would have to be written down.
 		"extension.go: syntax.ReadVector(r, readOneExtension)",
+		// the four uint16 registry vectors -- Capabilities' five fields and
+		// RequiredCapabilities' three, which are the same encoding eight times over.
+		// Writer and Reader taking for the reason the pair above is, so they run under
+		// whichever limit the LeafNode or GroupContext encode opened, and one entry each
+		// rather than eight because the pair is generic over ~uint16. A registry that
+		// needed a raised limit would be a registry whose vector held more than a
+		// megabyte of code points.
+		"extension.go: syntax.ReadVector(r, readOneUint16[T])",
 		"extension.go: syntax.WriteVector(w, exts, writeOneExtension)",
+		"extension.go: syntax.WriteVector(w, values, writeOneUint16[T])",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
@@ -577,6 +586,14 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// default limit could have computed -- which is the one disagreement in MLS a group
 		// does not recover from, since every confirmation tag afterwards is taken over it.
 		"transcript.go: syntax.NewWriter()",
+		// marshalBytes, the preimage encoder every signature content and hash input of the
+		// TreeKEM plan is assembled through. The default limit and not the ratchet tree
+		// one, which is the distinction the helper exists to hold: a LeafNodeTBS and a
+		// KeyPackageTBS are ordinary MLS structures whose every field is capped at
+		// MaxVectorLength, and a signature taken over one that had been allowed past that
+		// is a signature no peer running the default limit could verify. The ratchet tree
+		// encode that does need the raised bound is not this call and will say so here.
+		"tree_adapt.go: syntax.NewWriter()",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)

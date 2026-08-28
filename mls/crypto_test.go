@@ -4869,10 +4869,23 @@ func Exported(secret []byte) []byte {
 // p4 task 5 landed key_schedule.go, DeriveJoinerSecret erases its pseudorandom key through
 // zeroizeSecret, and the excuse died with the condition it named rather than outliving it.
 var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
-	// empty, and that is the state to keep it in. Its one entry was takeLeafSecret, excused
-	// between p4 task 21 landing the secret tree's descent and p4 task 22 landing the
+	// It was empty, and that was the state to keep it in. Its one entry was takeLeafSecret,
+	// excused between p4 task 21 landing the secret tree's descent and p4 task 22 landing the
 	// ratchetFor that calls it, and it expired by FAILING the moment ratchetFor named it,
 	// which is the only way an excuse of this kind ever comes back off.
+	//
+	// The six below are p5 task 3's tree_adapt.go, which is the same shape one plan later: the
+	// task lands the shared helpers and the tasks after it land the callers. Each entry names
+	// the task that will call it, so an entry still here when that task has landed is a line
+	// that fails rather than a line somebody has to remember. All six are held by
+	// tree_adapt_test.go, which is what separates "no caller yet" from the placeholder this
+	// gate is about.
+	"./marshalBytes": "p5 task 4, ParseLeafKeysExtension, is the first to assemble a preimage through it",
+	"./directPathOf": "p5 task 8, the RatchetTree container, takes a leaf's direct path through it",
+	"./rootOf":       "p5 task 10, node resolution, resolves at the root through it",
+	"./leftOf":       "p5 task 12, the tree hash, descends through it",
+	"./rightOf":      "p5 task 12, the tree hash, descends through it",
+	"./leafIndexOf":  "p5 task 12, the tree hash, tells a leaf slot from a parent slot through it",
 }
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
