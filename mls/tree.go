@@ -99,7 +99,7 @@ const maxUnmergedLeaves = syntax.MaxVectorLength / 4
 // to every nested read and WriteVector builds its scratch at the outer limit, which is what lets
 // a ratchet_tree running at MaxRatchetTreeLength carry a structure whose fields are larger than
 // one ordinary field may be. That inheritance is right for the ARRAY and wrong for this vector.
-// The ratchet_tree of RFC 9420 section 12.4.3.1 is raised because it is a whole tree; a single
+// The ratchet_tree of RFC 9420 section 12.4.3.3 is raised because it is a whole tree; a single
 // parent node's unmerged list is bounded by the group's leaf count, and one past MaxVectorLength
 // is one no peer running the default limit could have sent -- which matters here because those
 // bytes are covered by the parent hash and the tree hash, so a vector this implementation
@@ -513,7 +513,7 @@ func (self *RatchetTree) EncryptionKeyInUse(key HpkePublicKey) bool {
 }
 
 // HasTrailingBlankNodes reports whether the array ends in a blank, which RFC 9420 section
-// 12.4.3.1 forbids of an exported ratchet_tree and which ValSem300 refuses.
+// 12.4.3.3 forbids of an exported ratchet_tree and which ValSem300 refuses.
 //
 // The LAST node and not a scan, because the node width of any tree is odd and the last index of
 // an odd width array is even: the final position is always a leaf, so "the array ends in a
@@ -787,44 +787,91 @@ func (self *RatchetTree) MarshalMLS(w *syntax.Writer) error {
 	return syntax.WriteVector(w, self.nodes[:end], writeOneOptionalNode)
 }
 
+// positionedNode is one PRESENT entry of a ratchet_tree array together with the index it
+// arrived at, and it is what the decode below collects instead of one slot per entry.
+//
+// The reason is an amplification that is a fact about the FORMAT rather than about this
+// container: an absent entry is a single presence octet, so a body at p1's raised sixteen
+// mebibyte bound declares up to 16,777,212 of them, and a decoder that appended a slot per
+// entry as it read grew a 134 megabyte pointer array -- through every doubling on the way to
+// it, and with a heap allocated OptionalNode per entry beside it -- before ANY of the refusals
+// below had run. Measured on this package: 827 MB allocated to REFUSE an all-blank body of
+// 16 MiB, 961 MB to accept a legal one, 49x and 57x the bytes that arrived. The path is
+// reachable before any authentication, since a ratchet_tree extension arrives in a Welcome
+// from a sender nothing has verified yet.
+//
+// Keeping only the present entries makes every refusal cost what the body actually CARRIED
+// rather than what it claimed: an all-blank body of any length is now refused out of a count
+// and an empty slice. The one array this decode builds is the accepted tree's own, allocated
+// once at its final width, which is the tree the peer described and not a multiple of it.
+// TestARefusedRatchetTreeBodyIsNotFirstMaterialised is what holds it.
+type positionedNode struct {
+	at   NodeIndex
+	node *Node
+}
+
 // UnmarshalMLS reads the ratchet_tree extension body, refuses ValSem300's trailing blank and a
 // node whose type contradicts its position, and extends the array to the next complete tree.
 //
-// The sub-reader is taken directly rather than through syntax.ReadVector, and that is the one
-// structural choice here worth stating: the element decoder needs the node INDEX to check type
-// against position, and ReadVector's element callback does not carry it. This is the sanctioned
-// form for a heterogeneous vector, and it takes on ReadVector's own obligation -- Done on the
-// sub-reader -- rather than dropping it, because an element decoder that had a read fail,
-// ignored its own error and returned successfully with the region happening to end there is
-// exactly the shape nothing else here would see.
+// The region is taken with ReadNested rather than with ReadSub and a Done of this decoder's
+// own. Both run the region to empty; what differs is where the obligation lives, and what
+// happens to the CALLER's Reader when the tree is refused.
 //
-// Staged into a local and assigned whole for the reason every other decoder in this file is: a
-// refused tree leaves the receiver exactly as it found it, which for a container a caller may
-// be decoding INTO over a live epoch's tree is the difference between a rejected Welcome and a
-// half replaced group.
+// ReadSub hands the completion obligation back, so a Done spelled here is a line no test in
+// this package can observe -- the loop below ends only when the region is empty, and every
+// element decoder propagates the reader's latched error, so it can answer nothing but nil, and
+// it duly survived being deleted. ReadNested discharges the same obligation inside syntax,
+// where a sub reader CAN be left short because decodeOne is arbitrary there, and where syntax's
+// own tests exercise exactly that.
+//
+// The half with teeth here is the LATCH. ReadSub advances the caller's Reader past the whole
+// region before the first entry is read, so with the hand rolled form a refused tree left that
+// Reader clean, positioned at the next field and reporting nil from Done -- and Done is exactly
+// the check a caller makes instead of checking every return. ReadNested latches the refusal
+// onto it, which is why every refusal of this body is decided inside readNodeArray rather than
+// after ReadNested has returned. TestARefusedRatchetTreeLatchesTheReaderItWasReadFrom is what
+// holds it.
 func (self *RatchetTree) UnmarshalMLS(r *syntax.Reader) error {
-	body, err := r.ReadSub()
-	if err != nil {
-		return err
-	}
-	nodes := []*Node{}
+	return r.ReadNested(self.readNodeArray)
+}
+
+// readNodeArray is ReadNested's decoder for the optional<Node> array, named rather than written
+// as a closure for the reason writeOneUnmergedLeaf is, and holding every refusal of the body so
+// that ReadNested latches all of them and not only the ones a read raised.
+//
+// Staged into locals and assigned whole at the end for the reason every other decoder in this
+// file is: a refused tree leaves the receiver exactly as it found it, which for a container a
+// caller may be decoding INTO over a live epoch's tree is the difference between a rejected
+// Welcome and a half replaced group.
+//
+// The array is walked here rather than through syntax.ReadVector because the element decoder
+// needs the node INDEX to check type against position and ReadVector's element callback does
+// not carry one. That is the sanctioned form for a heterogeneous vector.
+func (self *RatchetTree) readNodeArray(body *syntax.Reader) error {
+	present := []positionedNode{}
+	entries := 0
+	// ONE OptionalNode for the whole array rather than one per entry. Its own UnmarshalMLS is
+	// staged and assigns both fields whole, so a reused receiver carries nothing forward from
+	// the entry before it -- that method's comment states the property as its own, which is
+	// what makes the reuse a decision here rather than a shortcut that depends on how it
+	// happens to be written today.
+	optional := OptionalNode{}
 	for !body.Empty() {
-		x := NodeIndex(len(nodes))
-		optional := &OptionalNode{}
+		x := NodeIndex(entries)
 		if err := optional.UnmarshalMLS(body); err != nil {
 			return err
 		}
+		entries += 1
 		if !optional.Present {
-			nodes = append(nodes, nil)
 			continue
 		}
 		node := optional.Node
 		switch node.NodeType {
 		case NodeTypeLeaf:
-			// RFC 9420 section 12.4.3.3: "The leaves of the tree are stored in even-numbered
-			// entries in the array". A LeafNode at an odd index is refused and never coerced,
-			// because coercing would let a sender decide which of two structures every later
-			// tree hash and parent hash is computed over.
+			// RFC 9420 section 12.4.3.3: "The leaves of the tree are stored in
+			// even-numbered entries in the array". A LeafNode at an odd index is refused
+			// and never coerced, because coercing would let a sender decide which of two
+			// structures every later tree hash and parent hash is computed over.
 			if !x.IsLeaf() {
 				return ErrNodeTypeMismatch
 			}
@@ -835,19 +882,20 @@ func (self *RatchetTree) UnmarshalMLS(r *syntax.Reader) error {
 		default:
 			return ErrTreeMalformed
 		}
-		nodes = append(nodes, &node)
-	}
-	if err := body.Done(); err != nil {
-		return err
+		present = append(present, positionedNode{at: x, node: &node})
 	}
 	// the empty array, which is NOT the one leaf tree -- see the header above. Checked before
 	// the trailing blank rather than folded into it, because a guard of the form
-	// len(nodes) > 0 && ... reads as the same rule and skips it for exactly this input.
-	if len(nodes) == 0 {
+	// entries > 0 && ... reads as the same rule and skips it for exactly this input.
+	if entries == 0 {
 		return ErrTreeMalformed
 	}
 	// ValSem300: "The receiver MUST check that the last node in ratchet_tree is non-blank".
-	if nodes[len(nodes)-1] == nil {
+	// Asked of the last entry that CARRIED a node rather than of a materialised array, which
+	// is the same question -- an array ends in a blank exactly when its last index is not the
+	// index of its last present entry -- answered without having built one. An array with no
+	// present entry anywhere ends in a blank by that same reading.
+	if len(present) == 0 || uint32(present[len(present)-1].at) != uint32(entries-1) {
 		return errTrailingBlankNodes
 	}
 	// "and then extend the tree to the right until it has a length of the form 2^(d+1) - 1,
@@ -855,15 +903,30 @@ func (self *RatchetTree) UnmarshalMLS(r *syntax.Reader) error {
 	// doubling and it is what refuses to run past MaxLeafCount on a hostile length, so the bound
 	// is not re-derived here.
 	leafWidth := LeafCount(1)
-	for NodeWidth(leafWidth) < uint32(len(nodes)) {
+	for NodeWidth(leafWidth) < uint32(entries) {
 		extended, err := ExtendedLeafCount(leafWidth)
 		if err != nil {
 			return err
 		}
 		leafWidth = extended
 	}
-	padded := make([]*Node, NodeWidth(leafWidth))
-	copy(padded, nodes)
+	width := NodeWidth(leafWidth)
+	// an extension is only an extension while it is WIDER than what arrived, and that is
+	// asserted rather than assumed. The loop above exits with NodeWidth(leafWidth) >= entries
+	// so it cannot fire today; what it replaces is a make-and-copy, and copy's answer to a
+	// destination shorter than its source is to drop the tail SILENTLY -- after which
+	// LeafCountFromNodeWidth and IsFullLeafCount both pass on the truncated array and the tree
+	// is accepted short. A refusal costs one comparison and has no such quiet direction.
+	if width < uint32(entries) {
+		return ErrTreeMalformed
+	}
+	// the ONE array this decode builds: the accepted tree's own, at its final width and
+	// allocated once. The present entries are scattered into it by index rather than copied in
+	// as a block, which is what lets a blank cost nothing at all before this line.
+	padded := make([]*Node, width)
+	for _, one := range present {
+		padded[one.at] = one.node
+	}
 	// the shape, DERIVED from the arithmetic rather than trusted from the loop above. A node
 	// array is a tree only if its width is 2n-1 for a leaf count that is a power of two, and
 	// both halves are asked because neither implies the other: a decoder that skipped the
@@ -871,11 +934,11 @@ func (self *RatchetTree) UnmarshalMLS(r *syntax.Reader) error {
 	// nodes, three leaves -- and every round trip of it is byte exact, every member count
 	// correct, and every direct path, copath and tree hash computed against a root that is not
 	// where the group's is. TestEveryDecodedRatchetTreeIsACompleteTree is what holds it.
-	width, err := LeafCountFromNodeWidth(uint32(len(padded)))
+	shape, err := LeafCountFromNodeWidth(uint32(len(padded)))
 	if err != nil {
 		return err
 	}
-	if !IsFullLeafCount(width) {
+	if !IsFullLeafCount(shape) {
 		return ErrTreeMalformed
 	}
 	self.nodes = padded

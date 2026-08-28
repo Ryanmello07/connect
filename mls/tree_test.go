@@ -28,6 +28,7 @@ import (
 	"go/types"
 	"maps"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -1281,7 +1282,7 @@ func TestRatchetTreeIsTheNodeShapeTheTreeMathWalks(t *testing.T) {
 	}
 }
 
-// TestHasTrailingBlankNodesIsTheLastPositionAndNotAnyBlank. RFC 9420 section 12.4.3.1 forbids
+// TestHasTrailingBlankNodesIsTheLastPositionAndNotAnyBlank. RFC 9420 section 12.4.3.3 forbids
 // an exported ratchet_tree ending in a blank; it says nothing about blanks in the middle, and a
 // predicate that reported "any blank" would refuse almost every real tree.
 func TestHasTrailingBlankNodesIsTheLastPositionAndNotAnyBlank(t *testing.T) {
@@ -3756,5 +3757,274 @@ func TestValSem300sSentinelIsStillCarriedByThisPackage(t *testing.T) {
 		if errors.Is(errTrailingBlankNodes, other) || errors.Is(other, errTrailingBlankNodes) {
 			t.Errorf("the ValSem300 refusal and %s answer for each other, so a caller branching on the pair reads one as the other", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what a hostile ratchet_tree body costs to refuse, and what a legal one costs to accept
+// ---------------------------------------------------------------------------
+
+// ratchetTreeBodyOf builds a ratchet_tree extension body by hand: the RFC 9420 section 2.1.2
+// varint length prefix, then absent entries, then whatever tail is handed in.
+//
+// By hand and not through MarshalMLS, because every shape below is one this package's own
+// encoder refuses to produce -- an array of nothing but blanks, an array whose only node is a
+// parent -- and those are exactly the shapes a peer puts on the wire. A fixture that can only
+// be built by the encoder under test measures the encoder rather than the decoder.
+func ratchetTreeBodyOf(t testing.TB, absent int, tail []byte) []byte {
+	t.Helper()
+	w := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
+	w.WriteVarint(uint32(absent + len(tail)))
+	prefix, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("the length prefix for %d entries: %v", absent+len(tail), err)
+	}
+	body := make([]byte, 0, len(prefix)+absent+len(tail))
+	body = append(body, prefix...)
+	body = append(body, make([]byte, absent)...)
+	return append(body, tail...)
+}
+
+// oneParentNodeEntry is a single PRESENT optional<Node> carrying the smallest ParentNode this
+// codec writes, which is what turns an all blank array into a legal one: ValSem300 asks that
+// the LAST entry be non-blank and asks nothing else of the rest.
+func oneParentNodeEntry(t testing.TB) []byte {
+	t.Helper()
+	w := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
+	if err := writeOneOptionalNode(w, &Node{
+		NodeType: NodeTypeParent,
+		Parent:   &ParentNode{EncryptionKey: HpkePublicKey{0x01}, ParentHash: []byte{0x02}},
+	}); err != nil {
+		t.Fatalf("encoding one present parent node: %v", err)
+	}
+	entry, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("one present parent node: %v", err)
+	}
+	return entry
+}
+
+// bytesAllocatedBy is everything f asked the allocator for while it ran.
+//
+// TotalAlloc and not HeapAlloc, which is the half worth reading twice: what an attacker makes
+// the process pay is every byte handed out, including the buffers a doubling slice abandoned
+// on the way and which a later collection would have reclaimed. A peak-heap measurement reads
+// a decoder that allocated a gigabyte in eight steps as though it had allocated the last one.
+func bytesAllocatedBy(t testing.TB, f func()) uint64 {
+	t.Helper()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestARefusedRatchetTreeBodyIsNotFirstMaterialised is the decode side of the amplification
+// bound, over the shape that costs the most to refuse: an array of nothing but blanks, at the
+// full sixteen mebibyte bound p1 raised for this structure and no other.
+//
+// ValSem300 refuses it -- the last node of an exported ratchet_tree must be non-blank and every
+// node of this one is blank -- and the property here is WHEN, not whether. A decoder that grew
+// one array slot per entry as it read, with a heap allocated OptionalNode beside each, reached
+// that refusal having already asked the allocator for 827 MB against a 16 MiB input: 49 times
+// the bytes that arrived, on a path that runs before anything has authenticated the sender,
+// since a ratchet_tree extension travels in a Welcome and in a GroupInfo.
+//
+// The bound is stated against the BODY rather than as a byte count, because that is the
+// statement that survives the limit being changed: refusing a body must not cost more than the
+// body itself is long. What the decoder actually spends is the entry count and an empty slice,
+// measured at 208 bytes for every length below.
+func TestARefusedRatchetTreeBodyIsNotFirstMaterialised(t *testing.T) {
+	for _, entries := range []int{1 << 20, syntax.MaxRatchetTreeLength - 4} {
+		body := ratchetTreeBodyOf(t, entries, nil)
+		var err error
+		allocated := bytesAllocatedBy(t, func() {
+			_, err = UnmarshalRatchetTree(body)
+		})
+		if !errors.Is(err, errTrailingBlankNodes) {
+			t.Fatalf("an all blank array of %d entries answered %v, want the ValSem300 refusal; the bound below is about the refusal path and nothing else",
+				entries, err)
+		}
+		t.Logf("refusing %d blank entries (%d wire bytes) allocated %d bytes", entries, len(body), allocated)
+		if allocated >= uint64(len(body)) {
+			t.Errorf("refusing a %d byte all blank ratchet_tree allocated %d bytes, want less than the body itself; a refusal that costs more than its input is an amplifier a Welcome hands to an unauthenticated sender",
+				len(body), allocated)
+		}
+	}
+}
+
+// TestAnAcceptedRatchetTreeCostsOnePointerPerNodeOfTheTreeItDescribes is the other half of the
+// same bound, over the array a hostile body can make this decoder ACCEPT.
+//
+// The shape is legal and the RFC says to take it: absent entries up to an odd index, then one
+// real ParentNode, which ValSem300 accepts because the last entry is non-blank and which
+// section 12.4.3.3 then extends to the enclosing complete tree. So the tree really is that
+// wide, and holding it really does cost one pointer per slot. What is NOT owed is a multiple
+// of that -- the earlier decoder spent 961 MB to build a 134 MB array, because it grew the
+// array by doubling and allocated an OptionalNode per entry on the way.
+//
+// The floor is measured rather than written down, by allocating the same array this tree IS.
+// A stated byte count would be a second copy of unsafe.Sizeof that goes stale on a target with
+// a different pointer width, and the comparison is a ratio in any case.
+func TestAnAcceptedRatchetTreeCostsOnePointerPerNodeOfTheTreeItDescribes(t *testing.T) {
+	entry := oneParentNodeEntry(t)
+	// the present node has to land on an ODD index: a ParentNode at an even one is
+	// ErrNodeTypeMismatch, which is a different path from the one being measured
+	absent := (4 << 20) - len(entry)
+	if absent%2 == 0 {
+		absent -= 1
+	}
+	body := ratchetTreeBodyOf(t, absent, entry)
+	var tree *RatchetTree
+	var err error
+	allocated := bytesAllocatedBy(t, func() {
+		tree, err = UnmarshalRatchetTree(body)
+	})
+	if err != nil {
+		t.Fatalf("a legal truncated array of %d entries: %v; RFC 9420 section 12.4.3.3 accepts it and extends it",
+			absent+1, err)
+	}
+	var array []*Node
+	floor := bytesAllocatedBy(t, func() {
+		array = make([]*Node, tree.NodeWidth())
+	})
+	if len(array) != int(tree.NodeWidth()) {
+		t.Fatalf("the floor measurement built %d slots for a %d node tree", len(array), tree.NodeWidth())
+	}
+	t.Logf("accepting %d wire bytes built a %d node tree and allocated %d bytes; the array alone is %d",
+		len(body), tree.NodeWidth(), allocated, floor)
+	if allocated > floor+floor/2 {
+		t.Errorf("decoding a %d byte ratchet_tree into a %d node tree allocated %d bytes, want no more than half again the %d the array itself costs; the excess is the decoder's own bookkeeping multiplying an attacker's input",
+			len(body), tree.NodeWidth(), allocated, floor)
+	}
+}
+
+// TestARefusedRatchetTreeLatchesTheReaderItWasReadFrom is the obligation the hand rolled
+// ReadSub-and-Done form did not discharge.
+//
+// ReadSub advances the CALLER's Reader past the whole region before the element decode begins,
+// so a refusal inside the region is invisible to it: the caller is left holding a Reader
+// positioned at the next field of the enclosing structure, reporting nil from Done, having
+// skipped a ratchet tree nothing accepted. A caller that dropped this error -- and Done is
+// exactly the check a caller uses instead of checking every return -- would go on to decode the
+// rest of a GroupInfo as though the tree in it had been read. ReadNested latches, so it cannot.
+func TestARefusedRatchetTreeLatchesTheReaderItWasReadFrom(t *testing.T) {
+	body := ratchetTreeBodyOf(t, 4, nil)
+	r := syntax.NewReaderLimit(body, syntax.MaxRatchetTreeLength)
+	tree := &RatchetTree{}
+	if err := tree.UnmarshalMLS(r); !errors.Is(err, errTrailingBlankNodes) {
+		t.Fatalf("an all blank array answered %v, want the ValSem300 refusal", err)
+	}
+	if err := r.Done(); !errors.Is(err, errTrailingBlankNodes) {
+		t.Errorf("the Reader the refused tree was read from reports %v from Done, want the refusal latched onto it; without the latch a caller that checks only Done is told the region it skipped was fine",
+			err)
+	}
+}
+
+// TestTheExtensionToACompleteTreeMovesNoNodeAndDropsNone pins where the nodes of a truncated
+// array land after RFC 9420 section 12.4.3.3's extension.
+//
+// It is here because the extension used to be a make-and-copy, and copy's answer to a
+// destination shorter than its source is to drop the tail SILENTLY: the array would be
+// accepted short, LeafCountFromNodeWidth and IsFullLeafCount would both pass on what was left,
+// and the tree would be a complete tree of the wrong width with a member missing. The widths
+// below straddle a power of two in both directions, so a scatter that put a node anywhere but
+// at the index it arrived at fails here rather than in a tree hash three tasks later.
+func TestTheExtensionToACompleteTreeMovesNoNodeAndDropsNone(t *testing.T) {
+	entry := oneParentNodeEntry(t)
+	// odd indices only: a ParentNode at an even one is refused by position
+	for _, at := range []int{1, 3, 5, 7, 9, 15, 17, 31, 33, 63, 65} {
+		body := ratchetTreeBodyOf(t, at, entry)
+		tree, err := UnmarshalRatchetTree(body)
+		if err != nil {
+			t.Fatalf("a %d entry array whose last node sits at index %d: %v", at+1, at, err)
+		}
+		occupied := []NodeIndex{}
+		for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+			if !tree.IsBlank(NodeIndex(x)) {
+				occupied = append(occupied, NodeIndex(x))
+			}
+		}
+		if !slices.Equal(occupied, []NodeIndex{NodeIndex(at)}) {
+			t.Errorf("an array carrying one node at index %d decoded to a %d node tree occupied at %v, want exactly [%d]",
+				at, tree.NodeWidth(), occupied, at)
+		}
+		if uint32(at) >= tree.NodeWidth() {
+			t.Errorf("the node at index %d is outside the %d node tree it decoded to", at, tree.NodeWidth())
+		}
+	}
+}
+
+// TestTheRatchetTreeExtensionNeedsTheRaisedLimitAroundItToo is the caller obligation Encode's
+// own doc comment states, measured rather than left as prose.
+//
+// Encode answers an Extension whose body is written at MaxRatchetTreeLength, and that is as far
+// as this package's decision reaches: Extension.MarshalMLS writes ExtensionData through
+// whichever Writer the caller opened, and WriteExtensions and ReadExtensions do the same. So at
+// this product's own group size -- 500 members, two devices each, a 1216 byte X-Wing key per
+// leaf -- the entry Encode produces cannot be put into an extensions<V> vector by any caller
+// running the default limit, and the failure is syntax.ErrLengthExceedsMax, which reads as a
+// corrupt structure rather than as a limit.
+//
+// Both directions are asserted separately, because a caller can get either half wrong on its
+// own: a GroupInfo written at the raised bound and read back at the default one refuses a tree
+// it just wrote.
+func TestTheRatchetTreeExtensionNeedsTheRaisedLimitAroundItToo(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, productGroupLeafCount)
+	ext, err := tree.Encode()
+	if err != nil {
+		t.Fatalf("Encode at %d leaves: %v", productGroupLeafCount, err)
+	}
+	if len(ext.ExtensionData) <= syntax.MaxVectorLength {
+		t.Fatalf("the extension body is %d bytes, which the default limit of %d accepts, so nothing below can tell the two limits apart",
+			len(ext.ExtensionData), syntax.MaxVectorLength)
+	}
+
+	// the entry on its own, and the vector around it, both refused at the default limit
+	if _, err := syntax.Marshal(&ext); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("syntax.Marshal of the ratchet_tree extension answered %v, want syntax.ErrLengthExceedsMax", err)
+	}
+	if err := WriteExtensions(syntax.NewWriter(), []Extension{ext}); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("WriteExtensions at the default limit answered %v, want syntax.ErrLengthExceedsMax; a caller that writes a GroupInfo through an ordinary Writer cannot carry this product's own tree",
+			err)
+	}
+
+	// and carried by a Writer opened at the bound the body was encoded under
+	w := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
+	if err := WriteExtensions(w, []Extension{ext}); err != nil {
+		t.Fatalf("WriteExtensions at MaxRatchetTreeLength: %v", err)
+	}
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("the extensions vector: %v", err)
+	}
+	t.Logf("a %d leaf tree is a %d byte extension body and a %d byte extensions vector; MaxVectorLength is %d",
+		productGroupLeafCount, len(ext.ExtensionData), len(encoded), syntax.MaxVectorLength)
+
+	// the read side fails on its own, at the default limit, over bytes this package just wrote
+	if _, err := ReadExtensions(syntax.NewReader(encoded)); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("ReadExtensions at the default limit answered %v over an extensions vector this package wrote, want syntax.ErrLengthExceedsMax",
+			err)
+	}
+	back, err := ReadExtensions(syntax.NewReaderLimit(encoded, syntax.MaxRatchetTreeLength))
+	if err != nil {
+		t.Fatalf("ReadExtensions at MaxRatchetTreeLength: %v", err)
+	}
+	if len(back) != 1 || back[0].ExtensionType != ExtensionTypeRatchetTree {
+		t.Fatalf("read back %d entries, first tagged 0x%04x, want one ratchet_tree entry",
+			len(back), uint16(back[0].ExtensionType))
+	}
+	out, err := ParseRatchetTreeFrom(back[0])
+	if err != nil {
+		t.Fatalf("ParseRatchetTreeFrom the entry that survived the round trip: %v", err)
+	}
+	if out.MemberCount() != productGroupLeafCount {
+		t.Errorf("the tree that came back out of the extensions vector has %d members, want %d",
+			out.MemberCount(), productGroupLeafCount)
 	}
 }

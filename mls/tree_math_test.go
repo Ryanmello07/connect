@@ -385,7 +385,7 @@ func TestFullLeafCountAndDepth(t *testing.T) {
 // this pair is deliberately total over counts that are not powers of two,
 // because the ratchet_tree extension carries an array with its trailing blank
 // nodes stripped: six non-blank leaves encode as eleven nodes, and the receiver
-// extends that to the enclosing full tree of eight (RFC 9420 section 12.4.3.1).
+// extends that to the enclosing full tree of eight (RFC 9420 section 12.4.3.3).
 // the plan's table jumped from width 11 to width 1023, and the odd widths in
 // between are exactly the ones a stripped array actually has.
 func TestLeafCountFromNodeWidth(t *testing.T) {

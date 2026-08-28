@@ -530,49 +530,54 @@ func syntaxCodecEntryPoints(t *testing.T) []string {
 // one of those entry points, rendered the way the two rules above render what they report so
 // the two sets can be subtracted.
 //
-// Four clauses, and each is a way of NOT delegating rather than a symptom of delegating, which
+// Three clauses, and each is a way of NOT delegating rather than a symptom of delegating, which
 // is the difference between an exemption and a hole:
 //
-//   - it calls one of the entry points. A declaration that never reaches syntax is doing the
-//     encoding itself whatever it is called, which is every hand rolled codec the control
-//     declares.
-//   - it reports. The entry points answer an error and a delegation that dropped it would be
-//     accepting whatever the codec refused, which is credentialFromBytesSwallowing in the
-//     control -- reported there before this exemption existed and still reported now.
-//   - it cuts nothing out of its arguments. A body carrying an index or a slice expression is
-//     framing bytes on its own account: data[4:] handed to syntax.Unmarshal is a second length
-//     prefix, agreed with by nobody, and no round trip sees it.
+//   - it calls EXACTLY ONE of the entry points. A declaration that never reaches syntax is
+//     doing the encoding itself whatever it is called, which is every hand rolled codec the
+//     control declares. Two reaches is not a delegation either: a declaration that decodes one
+//     run as two structures, or lays two encoded bodies into one output, has decided where the
+//     second one begins, and a layout decided outside a codec is the whole of what C1 is about.
+//   - it does nothing to the bytes but PLUMB them, on either side of the call. This is the
+//     clause with the history, and it is stated as its COMPLEMENT for that reason. It was
+//     first written as "carries no index and no slice expression", a lexical scan of the
+//     declaration's own body, and one level of indirection walked straight past it:
+//     syntax.Unmarshal(afterHeader(data), out) with func afterHeader(b []byte) []byte
+//     { return b[4:] } next door is bit for bit the control's own reported near miss with the
+//     slice moved one call away. It also said nothing about the ENCODE side at all -- a body
+//     that comes back from syntax.Marshal and is then wrapped in a header of this
+//     declaration's own carries an ellipsis rather than a slice expression, and framing an
+//     encoder's output is the same defect as framing a decoder's input. So what is recognised
+//     here is the set of things that MOVE a value without doing anything to it, and every
+//     other node is reported. There is no fifth spelling of a cut to remember to add: a call
+//     this declaration makes on its own account is not plumbing whatever it computes, and a
+//     value it computes and throws away is not plumbing either -- which is the reporting half
+//     of the rule, since the value a delegation must not throw away is the codec's refusal.
 //   - it names no field of any MLS structure. Reading or writing a field around a delegation
 //     is the structure being laid out or patched up outside its own codec, which is the
 //     encoder half's own discriminator read the other way.
 //
-// The class the fourth clause is over is the MLS structures' fields and not every field of the
-// package, because the property is about the structures whose codec C1 protects.
+// The over report this is stated to accept: a delegation that legitimately calls something
+// else -- a length check, a logger, a second helper -- is reported. That direction is correct
+// and is not a wart. Nothing this scan can read separates such a call from one that frames the
+// bytes, and the house spelling of a raised limit pair, which is the shape the exemption
+// exists for, calls nothing at all.
+//
+// What this still cannot see is a delegation that checks the codec's error and then answers
+// nil anyway. Separating that from a delegation that reports needs the value flow rather than
+// the shape, and it is left uncovered here rather than bought with a rule that reports the
+// sanctioned pair, which is written down rather than left for the next reader to rediscover.
 func keyScheduleDelegationsIn(parsed parsedSource, entryPoints []string, structureFields []string) []string {
 	delegating := []string{}
 	for _, one := range declaredIn(parsed) {
 		if one.body == nil || !slices.Contains(one.results, "error") {
 			continue
 		}
-		reaches, cuts := false, false
-		ast.Inspect(one.body, func(node ast.Node) bool {
-			switch typed := node.(type) {
-			case *ast.IndexExpr, *ast.SliceExpr:
-				cuts = true
-			case *ast.CallExpr:
-				selector, isSelector := typed.Fun.(*ast.SelectorExpr)
-				if !isSelector {
-					return true
-				}
-				base, isIdentifier := selector.X.(*ast.Ident)
-				if isIdentifier && base.Name == keyScheduleCodecPackageDir &&
-					slices.Contains(entryPoints, selector.Sel.Name) {
-					reaches = true
-				}
-			}
-			return true
-		})
-		if !reaches || cuts || keyScheduleFieldsNamedIn(one.body, structureFields) > 0 {
+		reaches := keyScheduleEntryPointCallsIn(one.body, entryPoints)
+		if len(reaches) != 1 || !keyScheduleOnlyPlumbsAround(one.body, reaches[0]) {
+			continue
+		}
+		if keyScheduleFieldsNamedIn(one.body, structureFields) > 0 {
 			continue
 		}
 		if one.receiver != "" {
@@ -583,6 +588,93 @@ func keyScheduleDelegationsIn(parsed parsedSource, entryPoints []string, structu
 	}
 	slices.Sort(delegating)
 	return delegating
+}
+
+// keyScheduleEntryPointCallsIn is every call one body makes to a sanctioned syntax entry point,
+// the calls themselves rather than a count, because the clause below has to be able to tell the
+// one delegation apart from everything else in the same body.
+func keyScheduleEntryPointCallsIn(body *ast.BlockStmt, entryPoints []string) []*ast.CallExpr {
+	calls := []*ast.CallExpr{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		selector, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+		base, isIdentifier := selector.X.(*ast.Ident)
+		if isIdentifier && base.Name == keyScheduleCodecPackageDir &&
+			slices.Contains(entryPoints, selector.Sel.Name) {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	return calls
+}
+
+// keyScheduleOnlyPlumbsAround answers whether everything one body does APART from the entry
+// point call is plumbing: moving a value without doing anything to it.
+//
+// The recognised set is the plumbing and everything else is reported, which is what makes this
+// a class rather than a list -- the failure mode of the clause it replaces was that a list of
+// the ways somebody had thought a cut could be spelled understated the ways it can be. Each
+// entry is here because a delegation cannot be written without it:
+//
+//   - the statements a delegation is made of: a block, an if, a return, an assignment, and the
+//     declarations an assignment may be spelled as. NOT an expression statement, which is a
+//     value computed and dropped on the floor -- and the value dropped by the one call that
+//     matters here is the codec's refusal.
+//   - the expressions that NAME something: an identifier, a selector, a literal, parentheses,
+//     a pointer or array type. The blank identifier is not among them, since assigning to it
+//     is the other spelling of dropping a value.
+//   - & applied to a composite literal with NO elements, which is how a decode target is made.
+//     A literal with elements is a structure being laid out around the delegation, and every
+//     other prefix operator computes something.
+//   - == and != , which is the error check a delegation reports through. Every other binary
+//     operator combines two values into a third, which is arithmetic on somebody's bytes.
+//
+// An index, a slice expression, an append, a helper call, a closure and a type conversion all
+// fall through to the report, and none of them had to be named to get there.
+func keyScheduleOnlyPlumbsAround(body *ast.BlockStmt, entry *ast.CallExpr) bool {
+	plumbs := true
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case nil:
+			return false
+		case *ast.BlockStmt, *ast.IfStmt, *ast.ReturnStmt, *ast.AssignStmt, *ast.DeclStmt,
+			*ast.GenDecl, *ast.ValueSpec, *ast.BasicLit, *ast.SelectorExpr, *ast.ParenExpr,
+			*ast.StarExpr, *ast.ArrayType:
+			return true
+		case *ast.Ident:
+			// the blank identifier is a value being discarded, which is what the reporting
+			// half of this rule is about
+			if typed.Name == "_" {
+				plumbs = false
+			}
+		case *ast.UnaryExpr:
+			if typed.Op != token.AND {
+				plumbs = false
+			}
+		case *ast.BinaryExpr:
+			if typed.Op != token.EQL && typed.Op != token.NEQ {
+				plumbs = false
+			}
+		case *ast.CompositeLit:
+			if len(typed.Elts) != 0 {
+				plumbs = false
+			}
+		case *ast.CallExpr:
+			if typed != entry {
+				plumbs = false
+			}
+		default:
+			plumbs = false
+		}
+		return plumbs
+	})
+	return plumbs
 }
 
 // keyScheduleStructureFieldsOf is the union of the field names of the MLS structures of the
@@ -813,6 +905,77 @@ func ParseGroupContextByHand(data []byte) (*GroupContext, error) {
 	}
 	return &GroupContext{}, nil
 }
+
+// and the near misses the same exemption must not cover once a clause is read as a class
+// rather than as a list of spellings. Every one of them reaches the sanctioned entry point,
+// answers an error, and carries no index, no slice expression and no field of any MLS
+// structure -- which is the whole of what the first version of the exemption asked. All
+// reported.
+//
+// The first is ParseGroupContextAfterItsOwnHeader with the cut moved ONE CALL AWAY, which is
+// the shape that measured the old clause: a lexical scan of the delegating declaration's own
+// body cannot see b[4:] when b[4:] is next door. afterHeader itself is not reported and must
+// not be -- it answers a byte run and no MLS structure, so it is not a codec by either rule --
+// which is exactly why the delegation is the only place this can be caught.
+func afterHeader(b []byte) []byte { return b[4:] }
+
+func ParseGroupContextAfterItsOwnHeaderIndirect(data []byte) (*GroupContext, error) {
+	out := &GroupContext{}
+	if err := syntax.Unmarshal(afterHeader(data), out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// the ENCODE side of the same thing, and the direction the exemption had no near miss for at
+// all. A body that comes back from the sanctioned encoder and is then wrapped in a header of
+// this declaration's own is a second framing agreed with by nobody, and it is invisible to a
+// round trip because the matching read side would agree with it. body... is an ellipsis rather
+// than a slice expression, so the clause that scanned for cuts never saw this shape even
+// spelled out in one body.
+func ownHeader() []byte { return []byte{0, 0, 0, 0} }
+
+func MarshalGroupContextWithItsOwnHeader(v *GroupContext) ([]byte, error) {
+	body, err := syntax.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return append(ownHeader(), body...), nil
+}
+
+// two delegations where a delegation is one. Decoding one run twice is this declaration
+// deciding that the run holds two structures, which is a layout, and a layout decided outside
+// a codec is what C1 is about. It cuts nothing, names no field and reports what either half
+// refused, so the count is the only clause that separates it from the sanctioned pair.
+func ParseTwoGroupContexts(data []byte) (*GroupContext, error) {
+	first := &GroupContext{}
+	if err := syntax.Unmarshal(data, first); err != nil {
+		return nil, err
+	}
+	second := &GroupContext{}
+	if err := syntax.Unmarshal(data, second); err != nil {
+		return nil, err
+	}
+	return first, nil
+}
+
+// and the two spellings of a delegation that does not REPORT. Both reach the sanctioned
+// decoder, plumb their run into it untouched and name no field; both answer an error that is
+// always nil, so whatever the codec refused is accepted here. credentialFromBytesSwallowing
+// above is the same defect under a declaration that carries no error result at all, and it is
+// caught by a different clause -- these two are what say the reporting clause is about the
+// CALL rather than about the signature.
+func ParseGroupContextDroppingTheRefusal(data []byte) (*GroupContext, error) {
+	out := &GroupContext{}
+	syntax.Unmarshal(data, out)
+	return out, nil
+}
+
+func ParseGroupContextBlankingTheRefusal(data []byte) (*GroupContext, error) {
+	out := &GroupContext{}
+	_ = syntax.Unmarshal(data, out)
+	return out, nil
+}
 `
 
 // What the rule must read out of the control, exactly. Exact rather than a floor in both
@@ -823,15 +986,20 @@ var keyScheduleCodecControlWrappers = []string{
 	"(*GroupContext).Marshal",
 	"(*GroupContext).encodeToWire",
 	"MarshalExtensions",
+	"MarshalGroupContextWithItsOwnHeader",
 	"ParseExtensions",
 	"ParseGroupContext",
 	"ParseGroupContextAfterItsOwnHeader",
+	"ParseGroupContextAfterItsOwnHeaderIndirect",
+	"ParseGroupContextBlankingTheRefusal",
 	"ParseGroupContextByHand",
+	"ParseGroupContextDroppingTheRefusal",
 	"ParseGroupContextFrom",
 	"ParseGroupContextPatchingAField",
 	"ParseGroupPolicyExtension",
 	"ParseOwnerSuccessorExtension",
 	"ParsePreSharedKeyId",
+	"ParseTwoGroupContexts",
 	"credentialFromBytes",
 	"credentialFromBytesAssembling",
 	"credentialFromBytesBranching",

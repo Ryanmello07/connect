@@ -608,7 +608,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// and Reader taking rather than building one, so the pair runs under whichever limit
 		// the caller opened, which since task 11 includes a ratchet tree encode running at the
 		// raised bound -- and this pair is still not it. The raised bound belongs to the
-		// ratchet_tree ARRAY of section 12.4.3.1, whose whole point is that it is larger than
+		// ratchet_tree ARRAY of section 12.4.3.3, whose whole point is that it is larger than
 		// one MLS structure; a single parent node's unmerged list is bounded by the group's
 		// leaf count, and one allowed past MaxVectorLength is one no peer running the default
 		// limit could have sent, which matters here because those bytes are covered by the

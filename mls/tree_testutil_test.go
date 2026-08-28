@@ -214,7 +214,7 @@ func testTreeFaults(crypto CryptoProvider, tree *RatchetTree, members []*testMem
 	// section 7.7 keeps a group at the narrowest complete width its members fit in, a doubling
 	// adds a new root ABOVE the old one, and moving the root changes every direct path, every
 	// copath, every parent hash and every tree hash that twenty later tasks compute against this
-	// fixture. Section 12.4.3.1 additionally refuses an exported tree that ends in a blank, which
+	// fixture. Section 12.4.3.3 additionally refuses an exported tree that ends in a blank, which
 	// such a tree always does.
 	if expected := testTreeExpectedWidth(members); width != expected {
 		faults = append(faults, fmt.Errorf("%w: %d leaves over %d members, want %d",
