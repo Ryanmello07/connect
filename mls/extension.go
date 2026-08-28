@@ -445,3 +445,147 @@ func (self *RequiredCapabilities) UnmarshalMLS(r *syntax.Reader) error {
 
 // the C1 pin: drift between this type and the one codec convention fails at build.
 var _ syntax.Codec = (*RequiredCapabilities)(nil)
+
+// AlgIdXwing is the wrap KEM code point urmessage_leaf_keys carries: 0x0014, X-Wing
+// (X25519 + ML-KEM-768), MASTER section 7.1. It is the only one this profile implements.
+//
+// 0x0012 and 0x0013 are registered in that section for other hybrids and are unimplemented in
+// v1, so both are refused rather than carried, on the encode side and the decode side alike.
+// That is the opposite of what this file does for every registry above it, and the difference
+// is what the code point is FOR. An unknown extension type is carried because something else
+// decides what to do with it; an alg_id names the KEM a sender must wrap a commit secret to,
+// so a leaf carrying one this package cannot wrap to is a device nothing can ever send to.
+// Refusing it at the codec makes that a parse failure at the leaf, which names the leaf, and
+// not an unexplained failure at the first Commit after it joined.
+const AlgIdXwing uint16 = 0x0014
+
+// XwingPublicKeyLen is the X-Wing encapsulation key size: 1216 bytes, being the 1184 byte
+// ML-KEM-768 encapsulation key followed by the 32 byte X25519 public key.
+//
+// draft-connolly-cfrg-xwing-kem-06 section 5.1, "Encoding and sizes", gives the number
+// directly, and Spec A A-ASSUME-3 pins this project to that draft. It is checked against the
+// standard library rather than against either document by
+// TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded, because both documents are prose
+// this package could copy a digit wrong out of and neither fails when it does.
+//
+// It is duplicated from message.XwingPublicKeySize on purpose and in one direction only,
+// because mls must not import message. The crypto plan carries the compile assertion that the
+// two agree; nothing in THIS package can see a disagreement, which is why the derivation above
+// is here rather than left to that assertion.
+const XwingPublicKeyLen = 1216
+
+// LeafKeysExtension is the body of urmessage_leaf_keys, extension type 0xF002, MASTER
+// section 5.3:
+//
+//	struct {
+//	    uint16 alg_id;                  // 0x0014, X-Wing
+//	    opaque device_xwing_pub<V>;     // XwingPublicKeyLen bytes
+//	} UrmessageLeafKeys;
+//
+// It rides in the LeafNode, so it is covered by the leaf signature and by the tree hash, it is
+// validated by RFC 9420 section 7.3 along with the rest of the leaf, and Remove takes it away
+// with the leaf rather than leaving a stale wrap target behind.
+//
+// FOR THE READER ARRIVING WITH wrap.go IN HAND. This is where a device's X-Wing wrap target
+// comes from, and there are four things to know before reading one off a leaf:
+//
+//   - Get the bytes with FindExtension(leaf.Extensions, ExtensionTypeUrmessageLeafKeys) and
+//     hand them to ParseLeafKeysExtension. FindExtension answers the FIRST entry of that type
+//     and a vector may legally hold two; refusing a repeat is ValSem209's job at validation,
+//     not this codec's, so found does not mean unique.
+//   - A parsed DeviceXwingPub is a fresh copy, never a view into the leaf's bytes, so wrapping
+//     to it cannot be perturbed by whoever owns that buffer. The reverse also holds: a
+//     DeviceXwingPub handed to Encode is copied into the extension body, so mutating that
+//     slice afterwards does not change an Extension already produced.
+//   - Every value that comes back has already been refused unless alg_id is AlgIdXwing and
+//     len(DeviceXwingPub) is exactly XwingPublicKeyLen. Neither needs re-checking, and a
+//     length check written against a different constant is how the two come to drift. What is
+//     still owed is the KEM's own validation of the key: a 1216 byte string is not necessarily
+//     a well formed X-Wing encapsulation key.
+//   - There is no way to get the body bytes on their own. Encode returns the whole Extension,
+//     tag and all, so no call site can pair this body with another extension's type.
+//
+// Extension.ExtensionData is opaque, so a concrete extension body converts bytes to and from a
+// struct rather than implementing MarshalMLS and UnmarshalMLS. That is one of the two
+// sanctioned exceptions to convention C1, and the sanctioned spelling is exactly this pair:
+// Encode returning an Extension, and ParseXExtension taking the bytes.
+// TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn derives the exception from the Encode
+// method's own signature rather than exempting this file, so a second extension body written
+// to this shape is sanctioned by being written to it, and one written to any other shape is
+// not.
+type LeafKeysExtension struct {
+	AlgId          uint16
+	DeviceXwingPub []byte
+}
+
+// Encode returns the whole Extension: the 0xF002 tag and the encoded body together.
+//
+// Returning the Extension rather than the body's bytes is the guarantee this shape exists to
+// give, and it is a guarantee rather than a convention because the alternative is reachable by
+// accident. A body returned as a byte slice is a value a caller pairs with a tag of its own
+// choosing, and that choice is one identifier away from ExtensionTypeUrmessageGroupPolicy --
+// which encodes, signs and travels, and is refused by the first peer that tries to read a
+// group policy out of an X-Wing key. Handing back the pair already assembled removes the
+// choice. TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn is what keeps a
+// later convenience from adding it back.
+//
+// Both refusals are ErrLeafKeysExtensionInvalid and both are made before anything is written,
+// so a refused body never reaches a Writer and can never be half encoded into one the caller
+// shares.
+func (self *LeafKeysExtension) Encode() (Extension, error) {
+	if self.AlgId != AlgIdXwing {
+		return Extension{}, fmt.Errorf("%w: alg_id %#04x is not X-Wing", ErrLeafKeysExtensionInvalid, self.AlgId)
+	}
+	if len(self.DeviceXwingPub) != XwingPublicKeyLen {
+		return Extension{}, fmt.Errorf("%w: device_xwing_pub is %d bytes, want %d",
+			ErrLeafKeysExtensionInvalid, len(self.DeviceXwingPub), XwingPublicKeyLen)
+	}
+	body, err := marshalBytes(func(w *syntax.Writer) error {
+		w.WriteUint16(self.AlgId)
+		w.WriteOpaque(self.DeviceXwingPub)
+		return nil
+	})
+	if err != nil {
+		return Extension{}, err
+	}
+	return Extension{
+		ExtensionType: ExtensionTypeUrmessageLeafKeys,
+		ExtensionData: body,
+	}, nil
+}
+
+// ParseLeafKeysExtension decodes an urmessage_leaf_keys body: the bytes of one entry's
+// ExtensionData, not the entry itself.
+//
+// It consumes them in full. An extension body is the last thing on this path that a length
+// prefix delimits, so a decoder here that ignored a tail would accept two encodings of one
+// leaf's wrap target -- and the leaf signature and the tree hash are taken over the bytes,
+// which makes two accepted spellings two groups that agree they are one.
+//
+// The alg_id and length refusals come after the full consumption check rather than before it,
+// so a body that is both malformed and unimplemented is reported as malformed. That ordering
+// is deliberate: ErrTrailingBytes says the sender and this package disagree about the
+// encoding, ErrLeafKeysExtensionInvalid says they agree about it and this profile cannot act
+// on what it says, and the second is only meaningful once the first has been ruled out.
+func ParseLeafKeysExtension(data []byte) (*LeafKeysExtension, error) {
+	r := syntax.NewReader(data)
+	algId, err := r.ReadUint16()
+	if err != nil {
+		return nil, err
+	}
+	pub, err := r.ReadOpaque()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.Done(); err != nil {
+		return nil, err
+	}
+	if algId != AlgIdXwing {
+		return nil, fmt.Errorf("%w: alg_id %#04x is not X-Wing", ErrLeafKeysExtensionInvalid, algId)
+	}
+	if len(pub) != XwingPublicKeyLen {
+		return nil, fmt.Errorf("%w: device_xwing_pub is %d bytes, want %d",
+			ErrLeafKeysExtensionInvalid, len(pub), XwingPublicKeyLen)
+	}
+	return &LeafKeysExtension{AlgId: algId, DeviceXwingPub: pub}, nil
+}

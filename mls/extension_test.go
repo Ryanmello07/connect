@@ -23,16 +23,22 @@ package mls
 
 import (
 	"bytes"
+	"crypto/ecdh"
+	"crypto/mlkem"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/token"
 	"go/types"
 	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -2049,4 +2055,582 @@ func TestSupportsRefusalAnswersOnlyItsOwnSentinel(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// urmessage_leaf_keys, extension type 0xF002
+// ---------------------------------------------------------------------------
+
+// The X-Wing encapsulation key size taken from the standard library instead of from this
+// package, so that the 1216 has something to be wrong against.
+//
+// Every other statement of that number in this tree is prose or a copy of prose:
+// draft-connolly-cfrg-xwing-kem-06 section 5.1 says 1216, Spec A section 3.4 says 1216, the
+// interface registry says 1216, and p2 task 22 will assert that message.XwingPublicKeySize
+// says 1216 too. A digit copied wrong out of any of them is invisible to all of the others,
+// and it is invisible to every round trip and length test in this file as well, because those
+// build their inputs out of XwingPublicKeyLen and would agree with a constant of 1217 exactly
+// as well as with one of 1216. Measured rather than argued: with the constant set to 1217,
+// every test the plan supplied for this task still passes.
+//
+// So the number is reassembled here out of its two halves as the draft defines them --
+// X-Wing's public key is the ML-KEM-768 encapsulation key followed by the X25519 public key --
+// and both halves come from crypto/mlkem and crypto/ecdh rather than from a literal. Neither
+// is reachable from this package's non test source, so this import pair is confined to the
+// test binary and TestTheCryptoIsBuiltFromExactlyThesePackages is unaffected by it.
+//
+// What this cannot check is the ORDER of the two halves, which is a property of the KEM and
+// not of a length, and the KEM is p2's. It also cannot check the parameter set: an X-Wing over
+// ML-KEM-1024 would be 1600 bytes and this would say so, but nothing here says 768 is the
+// right choice. draft-connolly-cfrg-xwing-kem-06 fixes it, and A-ASSUME-3 pins this project to
+// that draft.
+func xwingPublicKeyLenFromTheStandardLibrary(t *testing.T) int {
+	t.Helper()
+	classical, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate an X25519 key to measure its public half: %v", err)
+	}
+	classicalLen := len(classical.PublicKey().Bytes())
+	if classicalLen == 0 {
+		t.Fatal("crypto/ecdh answered a zero length X25519 public key, so the sum below is the ML-KEM half alone")
+	}
+	if mlkem.EncapsulationKeySize768 == 0 {
+		t.Fatal("crypto/mlkem gives ML-KEM-768 a zero length encapsulation key, so the sum below is the X25519 half alone")
+	}
+	return mlkem.EncapsulationKeySize768 + classicalLen
+}
+
+// TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded holds the one number in this file
+// that nothing else in this package can check.
+//
+// p2 task 22 is titled "Pin message.XwingPublicKeySize against mls.XwingPublicKeyLen", so the
+// cross package agreement is somebody else's task and it has not landed. Until it does, and
+// after it does, this is what says the agreed number is the right one rather than the same
+// mistake written twice.
+func TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded(t *testing.T) {
+	derived := xwingPublicKeyLenFromTheStandardLibrary(t)
+	if XwingPublicKeyLen != derived {
+		t.Errorf("XwingPublicKeyLen is %d and ML-KEM-768's encapsulation key (%d) plus X25519's public key (%d) is %d; draft-connolly-cfrg-xwing-kem-06 section 5.1 gives 1216 and one of these has a digit wrong",
+			XwingPublicKeyLen, mlkem.EncapsulationKeySize768, derived-mlkem.EncapsulationKeySize768, derived)
+	}
+}
+
+// One urmessage_leaf_keys body assembled field by field, so a body this package's own encoder
+// refuses can still be handed to its own decoder.
+//
+// Every refusal on the decode side is otherwise untestable: Encode will not produce a body
+// carrying alg 0x0013 or a 1215 byte key, so a decoder that had lost its own copy of those two
+// checks would be exercised only by inputs that cannot reach it. This is the peer that does
+// not run this profile, written out.
+//
+// It goes through syntax rather than through Encode on purpose. syntax is a different package
+// with its own tests, so an input built with it is not built by the thing under test.
+func leafKeysBodyBytes(t *testing.T, algId uint16, pub []byte) []byte {
+	t.Helper()
+	w := syntax.NewWriter()
+	w.WriteUint16(algId)
+	w.WriteOpaque(pub)
+	body, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("assemble a leaf keys body of alg %#04x over %d bytes: %v", algId, len(pub), err)
+	}
+	return body
+}
+
+// A device key of the length this profile requires, filled with a pattern rather than zeroes
+// so a body that dropped or reordered it does not still compare equal.
+func leafKeysTestKey() []byte {
+	pub := make([]byte, XwingPublicKeyLen)
+	for i := range pub {
+		pub[i] = byte(i)
+	}
+	return pub
+}
+
+func TestLeafKeysExtensionRoundTrip(t *testing.T) {
+	pub := leafKeysTestKey()
+	in := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: pub}
+	ext, err := in.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if ext.ExtensionType != ExtensionTypeUrmessageLeafKeys {
+		t.Fatalf("Encode tagged %#x, want %#x", ext.ExtensionType, ExtensionTypeUrmessageLeafKeys)
+	}
+	// the wire layout, written out by hand rather than captured from the encoder. A golden
+	// taken from the thing under test pins nothing: alg_id written little endian, or the
+	// device key written raw with no length prefix, round trips through this package
+	// perfectly and disagrees with every peer.
+	//
+	//	uint16 alg_id                 -> 00 14
+	//	opaque device_xwing_pub<V>    -> varint(1216) then the bytes
+	//
+	// 1216 is 0x04c0, which is above 63 and below 16384, so section 2.1.2's two octet form
+	// applies: the top two bits of the first octet carry the log2 of the octet count, giving
+	// 0x04|0x40 = 0x44 and then 0xc0.
+	want := append([]byte{0x00, 0x14, 0x44, 0xc0}, pub...)
+	if !bytes.Equal(ext.ExtensionData, want) {
+		t.Fatalf("body is %d bytes beginning %x, want %d bytes beginning %x",
+			len(ext.ExtensionData), ext.ExtensionData[:min(8, len(ext.ExtensionData))], len(want), want[:8])
+	}
+	out, err := ParseLeafKeysExtension(ext.ExtensionData)
+	if err != nil {
+		t.Fatalf("ParseLeafKeysExtension: %v", err)
+	}
+	if out.AlgId != AlgIdXwing {
+		t.Fatalf("alg_id = %#x, want %#x", out.AlgId, AlgIdXwing)
+	}
+	if !bytes.Equal(out.DeviceXwingPub, pub) {
+		t.Fatalf("device_xwing_pub mismatch")
+	}
+	again, err := out.Encode()
+	if err != nil {
+		t.Fatalf("re-Encode: %v", err)
+	}
+	if !bytes.Equal(again.ExtensionData, ext.ExtensionData) {
+		t.Fatalf("re-encode differs")
+	}
+	if again.ExtensionType != ext.ExtensionType {
+		t.Fatalf("re-encode tagged %#x, want %#x", again.ExtensionType, ext.ExtensionType)
+	}
+}
+
+func TestLeafKeysExtensionRejectsWrongLength(t *testing.T) {
+	short := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: make([]byte, XwingPublicKeyLen-1)}
+	if _, err := short.Encode(); !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+		t.Fatalf("Encode short key err = %v, want ErrLeafKeysExtensionInvalid", err)
+	}
+	good := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: make([]byte, XwingPublicKeyLen)}
+	ext, err := good.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	encoded := ext.ExtensionData
+	if _, err := ParseLeafKeysExtension(encoded[:len(encoded)-1]); err == nil {
+		t.Fatalf("ParseLeafKeysExtension(truncated) = nil error, want failure")
+	}
+	trailing := append(append([]byte{}, encoded...), 0x00)
+	if _, err := ParseLeafKeysExtension(trailing); !errors.Is(err, syntax.ErrTrailingBytes) {
+		t.Fatalf("ParseLeafKeysExtension(trailing) err = %v, want ErrTrailingBytes", err)
+	}
+	// the decode side's own length check, which the two cases above do not reach. A body
+	// truncated by one byte is refused by the reader for declaring more than it carries, and
+	// a body with a byte appended is refused for not being consumed in full; neither is a
+	// body that decodes cleanly and then carries the wrong number of key octets, which is
+	// what a peer running a different profile sends and what the check exists for.
+	for _, wrong := range []int{XwingPublicKeyLen - 1, XwingPublicKeyLen + 1} {
+		body := leafKeysBodyBytes(t, AlgIdXwing, make([]byte, wrong))
+		if _, err := ParseLeafKeysExtension(body); !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+			t.Errorf("ParseLeafKeysExtension over a well formed body carrying %d key bytes err = %v, want ErrLeafKeysExtensionInvalid",
+				wrong, err)
+		}
+	}
+}
+
+func TestLeafKeysExtensionRejectsUnimplementedAlg(t *testing.T) {
+	// 0x0013 is reserved for hybrid X25519 + ML-KEM-1024 and is not implemented in
+	// v1. MASTER section 7.1. it must be refused, not carried.
+	in := &LeafKeysExtension{AlgId: 0x0013, DeviceXwingPub: make([]byte, XwingPublicKeyLen)}
+	if _, err := in.Encode(); !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+		t.Fatalf("Encode alg 0x0013 err = %v, want ErrLeafKeysExtensionInvalid", err)
+	}
+	// and the same refusal on the decode side, which the encode side cannot reach: a peer
+	// that implements 0x0013 sends this body, and a decoder without its own copy of the check
+	// carries it into a LeafNode nothing in this profile can wrap a commit secret to.
+	body := leafKeysBodyBytes(t, 0x0013, make([]byte, XwingPublicKeyLen))
+	if _, err := ParseLeafKeysExtension(body); !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+		t.Fatalf("ParseLeafKeysExtension alg 0x0013 err = %v, want ErrLeafKeysExtensionInvalid", err)
+	}
+}
+
+// TestLeafKeysExtensionAcceptsExactlyOneAlgIdOnBothSides sweeps the whole code point space
+// rather than the two reserved values MASTER section 7.1 happens to name today.
+//
+// The class here is EVERY uint16, which is the one class over this field that cannot be
+// understated. A test naming 0x0012 and 0x0013 says nothing about 0x0015, about a GREASE value
+// a peer sends to keep the field exercised, or about the zero an uninitialised struct carries
+// -- and the zero is the one a caller reaches by forgetting to set AlgId at all, which is the
+// likeliest way this field is ever wrong.
+//
+// Both directions, because the two checks are separate lines of code and this project has
+// twice shipped a refusal that existed on one side only.
+func TestLeafKeysExtensionAcceptsExactlyOneAlgIdOnBothSides(t *testing.T) {
+	pub := leafKeysTestKey()
+	// one body, whose first two octets are the alg_id, patched in place rather than
+	// reassembled 65536 times
+	body := leafKeysBodyBytes(t, 0, pub)
+	acceptedByEncode := []uint16{}
+	acceptedByParse := []uint16{}
+	for value := 0; value <= 0xffff; value++ {
+		algId := uint16(value)
+		in := &LeafKeysExtension{AlgId: algId, DeviceXwingPub: pub}
+		if _, err := in.Encode(); err == nil {
+			acceptedByEncode = append(acceptedByEncode, algId)
+		} else if !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+			t.Fatalf("Encode alg %#04x err = %v, want ErrLeafKeysExtensionInvalid", algId, err)
+		}
+		body[0], body[1] = byte(algId>>8), byte(algId)
+		out, err := ParseLeafKeysExtension(body)
+		switch {
+		case err == nil:
+			acceptedByParse = append(acceptedByParse, algId)
+			if out.AlgId != algId {
+				t.Fatalf("ParseLeafKeysExtension accepted alg %#04x and reported %#04x", algId, out.AlgId)
+			}
+		case !errors.Is(err, ErrLeafKeysExtensionInvalid):
+			t.Fatalf("ParseLeafKeysExtension alg %#04x err = %v, want ErrLeafKeysExtensionInvalid", algId, err)
+		}
+	}
+	want := []uint16{AlgIdXwing}
+	if !slices.Equal(acceptedByEncode, want) {
+		t.Errorf("Encode accepted alg ids %#04x, want %#04x", acceptedByEncode, want)
+	}
+	if !slices.Equal(acceptedByParse, want) {
+		t.Errorf("ParseLeafKeysExtension accepted alg ids %#04x, want %#04x", acceptedByParse, want)
+	}
+}
+
+// leafKeysSweptLengths is the length class the test below is over: every length from nothing
+// up to twice the X-Wing key, which covers the zero a caller reaches by forgetting the field,
+// the off by ones either side, both halves of the hybrid on their own (32 and 1184), and the
+// doubling a concatenation bug produces.
+//
+// A range rather than a list of interesting values, because the interesting values are the
+// ones nobody thought of. It is the widest class this can be stated over that still runs in
+// well under a second.
+const leafKeysSweptLengths = 2 * XwingPublicKeyLen
+
+// TestLeafKeysExtensionAcceptsExactlyOneKeyLengthOnBothSides says which length is accepted by
+// naming the number independently, not by naming the constant the code under test reads.
+//
+// That is the whole difference between this and the length test the plan supplied. A test that
+// builds its key as make([]byte, XwingPublicKeyLen) and expects that to be accepted passes
+// under any value of the constant, so it cannot see the one mistake in this task that reaches
+// the wire: a device key length this package and its peers disagree about.
+func TestLeafKeysExtensionAcceptsExactlyOneKeyLengthOnBothSides(t *testing.T) {
+	derived := xwingPublicKeyLenFromTheStandardLibrary(t)
+	acceptedByEncode := []int{}
+	acceptedByParse := []int{}
+	for n := 0; n <= leafKeysSweptLengths; n++ {
+		in := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: make([]byte, n)}
+		if _, err := in.Encode(); err == nil {
+			acceptedByEncode = append(acceptedByEncode, n)
+		} else if !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+			t.Fatalf("Encode over %d key bytes err = %v, want ErrLeafKeysExtensionInvalid", n, err)
+		}
+		body := leafKeysBodyBytes(t, AlgIdXwing, make([]byte, n))
+		out, err := ParseLeafKeysExtension(body)
+		switch {
+		case err == nil:
+			acceptedByParse = append(acceptedByParse, n)
+			if len(out.DeviceXwingPub) != n {
+				t.Fatalf("ParseLeafKeysExtension accepted %d key bytes and reported %d", n, len(out.DeviceXwingPub))
+			}
+		case !errors.Is(err, ErrLeafKeysExtensionInvalid):
+			t.Fatalf("ParseLeafKeysExtension over %d key bytes err = %v, want ErrLeafKeysExtensionInvalid", n, err)
+		}
+	}
+	want := []int{derived}
+	if !slices.Equal(acceptedByEncode, want) {
+		t.Errorf("Encode accepted key lengths %v, want %v", acceptedByEncode, want)
+	}
+	if !slices.Equal(acceptedByParse, want) {
+		t.Errorf("ParseLeafKeysExtension accepted key lengths %v, want %v", acceptedByParse, want)
+	}
+}
+
+// TestLeafKeysExtensionSharesNoStorageWithItsCallerOrItsInput holds the two aliasing claims
+// the doc comment on LeafKeysExtension makes to wrap.go's reader.
+//
+// Both matter to that reader specifically. A DeviceXwingPub that viewed the leaf's own buffer
+// would make a wrap target something the owner of that buffer can change after the leaf was
+// validated and before the commit secret is wrapped to it, and the change would be invisible
+// to every signature over the leaf because the leaf's bytes are what was signed. The encode
+// direction is the same hazard read backwards: an Extension whose body aliased the caller's
+// key would be a signed structure whose meaning changes after it was signed.
+func TestLeafKeysExtensionSharesNoStorageWithItsCallerOrItsInput(t *testing.T) {
+	pub := leafKeysTestKey()
+	in := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: pub}
+	ext, err := in.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	held := bytes.Clone(ext.ExtensionData)
+	for i := range pub {
+		pub[i] ^= 0xff
+	}
+	if !bytes.Equal(ext.ExtensionData, held) {
+		t.Errorf("mutating the caller's key changed an Extension already produced, so Encode kept a view of it")
+	}
+	for i := range pub {
+		pub[i] ^= 0xff
+	}
+
+	body := bytes.Clone(ext.ExtensionData)
+	out, err := ParseLeafKeysExtension(body)
+	if err != nil {
+		t.Fatalf("ParseLeafKeysExtension: %v", err)
+	}
+	parsed := bytes.Clone(out.DeviceXwingPub)
+	for i := range body {
+		body[i] ^= 0xff
+	}
+	if !bytes.Equal(out.DeviceXwingPub, parsed) {
+		t.Errorf("mutating the body changed the parsed key, so ParseLeafKeysExtension returned a view of its input")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the sanctioned exception to C1, stated as the guarantee rather than as a spelling
+// ---------------------------------------------------------------------------
+
+// extensionBodyTypesIn derives the extension body class: the types of the scanned source that
+// declare Encode() (Extension, error).
+//
+// Derived off that signature rather than off a name, a file or a table, because the signature
+// IS the property. Extension.ExtensionData is opaque, so an extension body has to convert
+// bytes to and from a struct somewhere; what makes this package's spelling of that safe is not
+// the word Encode but the fact that what comes back is the whole Extension, tag and all, so
+// there is no loose body for a call site to pair with the wrong type. A second extension body
+// written to that signature is covered by having been written to it, and one written to any
+// other signature -- Encode answering []byte, say -- is outside the class and is refused by
+// TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn as the second codec it is.
+//
+// The receiver is reported without its pointer star, since that is the spelling a type name is
+// compared under everywhere else in these gates.
+func extensionBodyTypesIn(files []parsedSource) []string {
+	bodies := []string{}
+	for _, parsed := range files {
+		for _, one := range declaredIn(parsed) {
+			if one.receiver == "" || one.name != "Encode" {
+				continue
+			}
+			if !slices.Equal(one.results, []string{"Extension", "error"}) {
+				continue
+			}
+			bodies = append(bodies, strings.TrimPrefix(one.receiver, "*"))
+		}
+	}
+	slices.Sort(bodies)
+	return slices.Compact(bodies)
+}
+
+// A file declaring one of each shape the rule below has to tell apart, so a matcher that
+// stopped matching fails here rather than issuing this package a clean bill.
+//
+// The last two are the negative halves. SomeUnrelatedBytes is the shape this reading cannot
+// see and the prose says so; leafKeysBodyBytesInternal is unexported and so outside the class
+// on purpose, because the package taking its own body apart internally is not a call site that
+// can pair it with a tag.
+const extensionBodySurfaceControl = `package control
+
+type LeafKeysExtension struct {
+	AlgId          uint16
+	DeviceXwingPub []byte
+}
+
+func (self *LeafKeysExtension) Encode() (Extension, error) { return Extension{}, nil }
+
+func ParseLeafKeysExtension(data []byte) (*LeafKeysExtension, error) { return nil, nil }
+
+// the shape the rule exists to report: the body handed back on its own, for a caller to pair
+// with whatever tag it likes
+func (self *LeafKeysExtension) Bytes() ([]byte, error) { return nil, nil }
+
+func LeafKeysBodyOf(body *LeafKeysExtension) []byte { return nil }
+
+// exported, answers a byte run, and mentions no extension body at all
+func SomeUnrelatedBytes(n int) []byte { return nil }
+
+// unexported, so outside the class
+func leafKeysBodyBytesInternal(body *LeafKeysExtension) []byte { return nil }
+`
+
+// What the rule must read out of the control, exactly rather than as a floor: a rule that
+// widened to report ParseLeafKeysExtension would ban the sanctioned spelling, and one that
+// narrowed to miss the method would issue this package the clean bill a working one issues.
+var extensionBodySurfaceControlReports = []string{
+	"(*LeafKeysExtension).Bytes",
+	"LeafKeysBodyOf",
+}
+
+// exportedSymbolsHandingOutABodyIn is every exported declaration of one file that mentions an
+// extension body type in its receiver or its parameters and answers a byte run.
+//
+// The honest limit, written here rather than left for the next reader: this reads the
+// SIGNATURE, so an exported function that assembles the same bytes without naming the type --
+// LeafKeysBody(algId uint16, pub []byte) []byte -- is invisible to it. That shape is left
+// uncovered rather than bought with a rule that reports every exported function in the package
+// answering a byte slice, which is most of the crypto. What closes it in practice is that a
+// body assembled that way has to duplicate the encoder, and duplicating the encoder is what
+// TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn reports.
+func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byteRuns []string) []string {
+	mentionsABody := func(rendered string) bool {
+		return slices.ContainsFunc(bodies, func(one string) bool {
+			return rendered == one || rendered == "*"+one || rendered == "[]"+one || rendered == "[]*"+one
+		})
+	}
+	found := []string{}
+	for _, one := range declaredIn(parsed) {
+		if !one.exported {
+			continue
+		}
+		reaches := mentionsABody(strings.TrimPrefix(one.receiver, "*")) || mentionsABody(one.receiver)
+		for _, parameter := range one.params {
+			reaches = reaches || mentionsABody(parameter)
+		}
+		if !reaches {
+			continue
+		}
+		if !slices.ContainsFunc(one.results, func(result string) bool {
+			return keyScheduleIsByteRun(result, byteRuns)
+		}) {
+			continue
+		}
+		if one.receiver != "" {
+			found = append(found, "("+one.receiver+")."+one.name)
+			continue
+		}
+		found = append(found, one.name)
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn is the guarantee the
+// sanctioned exception exists to give, stated as a rule rather than as a naming convention.
+//
+// Encode returning the whole Extension is only worth anything while it is the ONLY way out. An
+// exported (*LeafKeysExtension).Bytes added next to it for somebody's convenience puts the
+// choice of tag back in the caller's hands, and the wrong choice there -- 0xF001 rather than
+// 0xF002, one identifier apart in this file -- encodes, is covered by the leaf signature, and
+// is refused by the first peer that tries to read a group policy out of an X-Wing key. Nothing
+// about that failure points back at the call site that made it.
+//
+// The class is derived from the Encode signature, so a second extension body type is covered
+// by the commit that adds it.
+func TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn(t *testing.T) {
+	control := mustParseText(t, "the extension body surface control", extensionBodySurfaceControl)
+	controlBodies := extensionBodyTypesIn([]parsedSource{control})
+	if !slices.Equal(controlBodies, []string{"LeafKeysExtension"}) {
+		t.Fatalf("the derivation read %v out of the control, want [LeafKeysExtension]; a derivation that reads nothing exempts nothing and demands nothing",
+			controlBodies)
+	}
+	if reported := exportedSymbolsHandingOutABodyIn(control, controlBodies,
+		packageByteSliceTypeNamesIn(control)); !slices.Equal(reported, extensionBodySurfaceControlReports) {
+		t.Fatalf("the rule reported %v out of the control, want %v", reported, extensionBodySurfaceControlReports)
+	}
+
+	scanned := packageLevelFunctions(t).files
+	files := []parsedSource{}
+	for _, path := range scanned {
+		files = append(files, mustParseSource(t, path))
+	}
+	bodies := extensionBodyTypesIn(files)
+	if !slices.Contains(bodies, "LeafKeysExtension") {
+		t.Fatalf("the derivation read %v out of %v and LeafKeysExtension is not among them, so this gate is over a class that does not include the one extension body this package has",
+			bodies, scanned)
+	}
+	t.Logf("the extension bodies of this package, by the Encode signature they declare: %v", bodies)
+	byteRuns := packageByteSliceTypeNames(t)
+	for at, path := range scanned {
+		for _, handed := range exportedSymbolsHandingOutABodyIn(files[at], bodies, byteRuns) {
+			t.Errorf("%s exports %s, which hands an extension body out as bytes; Encode answers the whole Extension so that no call site can pair a body with another extension's type, and a byte run out of this package is exactly that pairing waiting to be made",
+				path, handed)
+		}
+	}
+}
+
+// The tag each extension body of this package stamps, and a value of it to ask.
+//
+// A table, and the derived class above is what stops it being the enumeration this project has
+// been walked past fourteen times: the test below requires the two to be equal, so an
+// extension body added without an entry here fails rather than going unchecked.
+var extensionBodyTagsToStamp = map[string]struct {
+	tag   ExtensionType
+	build func() (Extension, error)
+}{
+	"LeafKeysExtension": {
+		tag: ExtensionTypeUrmessageLeafKeys,
+		build: func() (Extension, error) {
+			body := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: make([]byte, XwingPublicKeyLen)}
+			return body.Encode()
+		},
+	},
+}
+
+// TestEveryExtensionBodyEncodeStampsTheTagOfItsOwnType is the behavioural half of the same
+// guarantee: the tag that comes back is this body's own, and is not any other extension type
+// this package declares.
+//
+// The second half is not redundant with the first. ExtensionTypeUrmessageGroupPolicy and
+// ExtensionTypeUrmessageOwnerSuccessor are declared eleven lines from the one this stamps and
+// differ from it by one digit, so "the tag is 0xF002" and "the tag is not one of its
+// neighbours" fail on different edits, and the second is the one an eye reading a diff misses.
+func TestEveryExtensionBodyEncodeStampsTheTagOfItsOwnType(t *testing.T) {
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		files = append(files, mustParseSource(t, path))
+	}
+	bodies := extensionBodyTypesIn(files)
+	if covered := slices.Sorted(maps.Keys(extensionBodyTagsToStamp)); !slices.Equal(covered, bodies) {
+		t.Fatalf("this package declares extension bodies %v and this table covers %v; an extension body with no entry is one nothing holds to its own tag",
+			bodies, covered)
+	}
+	declared := everyExtensionTypeThisPackageDeclares(t)
+	if len(declared) < 2 {
+		t.Fatalf("this package declares %v extension types, so the neighbour half of this gate compares against nothing", declared)
+	}
+	for _, name := range bodies {
+		entry := extensionBodyTagsToStamp[name]
+		ext, err := entry.build()
+		if err != nil {
+			t.Errorf("%s.Encode over a valid body: %v", name, err)
+			continue
+		}
+		if ext.ExtensionType != entry.tag {
+			t.Errorf("%s.Encode tagged %#04x, want %#04x", name, uint16(ext.ExtensionType), uint16(entry.tag))
+		}
+		for _, other := range declared {
+			if other != entry.tag && ext.ExtensionType == other {
+				t.Errorf("%s.Encode tagged %#04x, which is another extension type this package declares", name, uint16(other))
+			}
+		}
+	}
+}
+
+// Every ExtensionType code point this package's non test source declares, read off the const
+// declarations rather than listed, so the neighbour comparison above grows with the registry.
+func everyExtensionTypeThisPackageDeclares(t *testing.T) []ExtensionType {
+	t.Helper()
+	found := []ExtensionType{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			declaration, isDeclaration := node.(*ast.GenDecl)
+			if !isDeclaration || declaration.Tok != token.CONST {
+				return true
+			}
+			for _, specification := range declaration.Specs {
+				valued, isValued := specification.(*ast.ValueSpec)
+				if !isValued || valued.Type == nil || parsed.render(valued.Type) != "ExtensionType" {
+					continue
+				}
+				for _, value := range valued.Values {
+					literal, isLiteral := value.(*ast.BasicLit)
+					if !isLiteral {
+						continue
+					}
+					parsedValue, err := strconv.ParseUint(literal.Value, 0, 16)
+					if err != nil {
+						t.Fatalf("%s declares an ExtensionType of %s, which is not a uint16 literal", path, literal.Value)
+					}
+					found = append(found, ExtensionType(parsedValue))
+				}
+			}
+			return true
+		})
+	}
+	slices.Sort(found)
+	return slices.Compact(found)
 }

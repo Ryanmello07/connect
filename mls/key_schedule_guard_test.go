@@ -119,7 +119,32 @@ func keyScheduleIsCodecEntryPoint(name string) bool {
 // keyScheduleCodecWrappersIn is every declaration of one file that is a byte level codec
 // entry point and is not one of the sanctioned hooks, named with its receiver so a reader is
 // told which type grew one.
-func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string) []string {
+//
+// bodies is the second sanctioned exemption, and it is DERIVED rather than written down: the
+// extension body types of the same source, read off the Encode() (Extension, error) signature
+// by extensionBodyTypesIn. Extension.ExtensionData is opaque, so a concrete extension body has
+// to convert bytes to and from a struct somewhere, and the spelling this package sanctions for
+// that is Encode answering the whole Extension paired with ParseXExtension taking the bytes.
+//
+// The exemption is over the PAIR and not over the Parse name, which is the difference between
+// a guarantee and a naming convention. A ParseFooExtension is waved through only when Foo's own
+// Encode answers an Extension -- tag and body together, so no call site can pair that body with
+// another extension's type -- and only when the Parse names the type it answers and takes
+// nothing but the bytes. An Encode answering []byte hands the tag choice back to the caller and
+// exempts nothing; a Parse whose name does not name its own result is not the pair either. The
+// control below declares one of each, so an exemption that widened to cover them fails there
+// rather than in a review.
+func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string, bodies []string) []string {
+	exempt := map[string]bool{}
+	for _, one := range declaredIn(parsed) {
+		if one.receiver != "" || !slices.Contains(bodies, strings.TrimPrefix(one.name, "Parse")) {
+			continue
+		}
+		body := strings.TrimPrefix(one.name, "Parse")
+		if slices.Equal(one.params, []string{"[]byte"}) && slices.Equal(one.results, []string{"*" + body, "error"}) {
+			exempt[one.name] = true
+		}
+	}
 	found := []string{}
 	for _, declaration := range parsed.file.Decls {
 		function, isFunction := declaration.(*ast.FuncDecl)
@@ -127,6 +152,9 @@ func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string) []stri
 			continue
 		}
 		if slices.Contains(sanctioned, function.Name.Name) {
+			continue
+		}
+		if function.Recv == nil && exempt[function.Name.Name] {
 			continue
 		}
 		if receiver := parsed.receiverOf(function); receiver != "" {
@@ -326,6 +354,36 @@ func (self *GroupContext) treeHash() []byte { return self.TreeHash }
 func NewGroupContext(groupId []byte, epoch uint64, treeHash []byte) *GroupContext {
 	return &GroupContext{GroupId: groupId, Epoch: epoch, TreeHash: treeHash}
 }
+
+// the second sanctioned exception: an extension body, whose Encode answers the whole
+// Extension rather than the body's bytes, paired with the Parse spelling that names the
+// type it answers. Neither of these two may be reported.
+type LeafKeysExtension struct{}
+
+func (self *LeafKeysExtension) Encode() (Extension, error) { return Extension{}, nil }
+
+func ParseLeafKeysExtension(data []byte) (*LeafKeysExtension, error) { return nil, nil }
+
+// the near miss the exemption must not cover: an Encode that answers the body's bytes
+// instead of the Extension, which is the tag choice handed back to the caller and is the
+// whole thing the exception is written to prevent. Its Parse is a second codec like any
+// other and must be reported.
+type GroupPolicyExtension struct{}
+
+func (self *GroupPolicyExtension) Encode() ([]byte, error) { return nil, nil }
+
+func ParseGroupPolicyExtension(data []byte) (*GroupPolicyExtension, error) { return nil, nil }
+
+// and the pair broken on the other side: the Encode is the sanctioned one and the Parse
+// takes something besides the body's bytes, so what it decodes is not one extension body
+// and the exemption's shape does not describe it. Reported.
+type OwnerSuccessorExtension struct{}
+
+func (self *OwnerSuccessorExtension) Encode() (Extension, error) { return Extension{}, nil }
+
+func ParseOwnerSuccessorExtension(data []byte, version uint16) (*OwnerSuccessorExtension, error) {
+	return nil, nil
+}
 `
 
 // What the rule must read out of the control, exactly. Exact rather than a floor in both
@@ -338,6 +396,8 @@ var keyScheduleCodecControlWrappers = []string{
 	"MarshalExtensions",
 	"ParseExtensions",
 	"ParseGroupContext",
+	"ParseGroupPolicyExtension",
+	"ParseOwnerSuccessorExtension",
 	"ParsePreSharedKeyId",
 	"groupContextFromBytes",
 }
@@ -383,7 +443,7 @@ func TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn(t *testing.T) {
 	sanctioned := syntaxCodecHooks(t)
 	codecsIn := func(parsed parsedSource, files []parsedSource) []string {
 		found := slices.Concat(
-			keyScheduleCodecWrappersIn(parsed, sanctioned),
+			keyScheduleCodecWrappersIn(parsed, sanctioned, extensionBodyTypesIn(files)),
 			keyScheduleSecondCodecsIn(parsed, mlsStructuresIn(files, sanctioned),
 				packageByteSliceTypeNamesIn(parsed), keyScheduleStructFieldsIn(files)),
 		)

@@ -540,6 +540,15 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
+		// the urmessage_leaf_keys body decode. Extension.ExtensionData is opaque, so a
+		// concrete extension body is the one place in this package that opens a Reader over
+		// bytes it was handed rather than decoding inside a caller's. The default limit and
+		// not the ratchet tree one: this body is two fields of an MLS structure, its device
+		// key is fixed at XwingPublicKeyLen, and a leaf keys body that had been allowed past
+		// MaxVectorLength is one no peer running the default limit could have sent -- which
+		// would make the raised limit an acceptance rule rather than a capacity, since the
+		// bytes it accepted are covered by the leaf signature and the tree hash.
+		"extension.go: syntax.NewReader(data)",
 		// the extensions<V> pair. Both take the caller's Writer or Reader rather than
 		// building one, so the limit they run under is whichever the caller opened —
 		// which is the default one everywhere until a ratchet tree encode exists to

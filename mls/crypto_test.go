@@ -2930,6 +2930,24 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		{name: "MakeProposalRef", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{MakeProposalRef(crypto, take(value))}
 		}},
+		// the one codec entry in this class, and it is here for a reason beyond covering the
+		// class: connect/message reads a device wrap target off every leaf through this call, so
+		// a DeviceXwingPub that VIEWED the leaf bytes it was decoded out of would be a wrap
+		// target whoever owns that buffer can change after the leaf carrying it was validated
+		// and before a commit secret is wrapped to it -- with every signature over the leaf still
+		// verifying, because the signature is over the bytes and not over what was read out of
+		// them.
+		{name: "ParseLeafKeysExtension", call: func(take func([]byte) []byte) [][]byte {
+			ext, encodeErr := (&LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: leafKeysTestKey()}).Encode()
+			if encodeErr != nil {
+				t.Fatalf("Encode a leaf keys body to parse: %v", encodeErr)
+			}
+			parsed, parseErr := ParseLeafKeysExtension(take(ext.ExtensionData))
+			if parseErr != nil {
+				t.Fatalf("ParseLeafKeysExtension: %v", parseErr)
+			}
+			return [][]byte{parsed.DeviceXwingPub}
+		}},
 		{name: "hpkeLabeledExtract", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{hpkeLabeledExtract(take(kemSuiteId), take(ikm), "eae_prk", take(sharedSecret))}
 		}},
@@ -4874,13 +4892,17 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// ratchetFor that calls it, and it expired by FAILING the moment ratchetFor named it,
 	// which is the only way an excuse of this kind ever comes back off.
 	//
-	// The six below are p5 task 3's tree_adapt.go, which is the same shape one plan later: the
+	// The five below are p5 task 3's tree_adapt.go, which is the same shape one plan later: the
 	// task lands the shared helpers and the tasks after it land the callers. Each entry names
 	// the task that will call it, so an entry still here when that task has landed is a line
-	// that fails rather than a line somebody has to remember. All six are held by
+	// that fails rather than a line somebody has to remember. All five are held by
 	// tree_adapt_test.go, which is what separates "no caller yet" from the placeholder this
 	// gate is about.
-	"./marshalBytes": "p5 task 4, ParseLeafKeysExtension, is the first to assemble a preimage through it",
+	//
+	// There were six. marshalBytes was excused for p5 task 4 and that task has landed:
+	// (*LeafKeysExtension).Encode assembles the urmessage_leaf_keys body through it, so the
+	// entry expired by FAILING on the commit that gave it a caller, which is the only way an
+	// excuse of this kind ever comes back off.
 	"./directPathOf": "p5 task 8, the RatchetTree container, takes a leaf's direct path through it",
 	"./rootOf":       "p5 task 10, node resolution, resolves at the root through it",
 	"./leftOf":       "p5 task 12, the tree hash, descends through it",
