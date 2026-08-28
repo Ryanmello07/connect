@@ -2566,6 +2566,9 @@ func (self *LeafKeysExtension) Bytes() ([]byte, error) { return nil, nil }
 
 func LeafKeysBodyOf(body *LeafKeysExtension) []byte { return nil }
 
+// the same shape one level of slicing out, which is what the class used to stop short of
+func (self *LeafKeysExtension) EveryBody() ([][]byte, error) { return nil, nil }
+
 // exported, answers a byte run, and mentions no extension body at all
 func SomeUnrelatedBytes(n int) []byte { return nil }
 
@@ -2578,7 +2581,32 @@ func leafKeysBodyBytesInternal(body *LeafKeysExtension) []byte { return nil }
 // narrowed to miss the method would issue this package the clean bill a working one issues.
 var extensionBodySurfaceControlReports = []string{
 	"(*LeafKeysExtension).Bytes",
+	"(*LeafKeysExtension).EveryBody",
 	"LeafKeysBodyOf",
+}
+
+// extensionBodyAnswersByteRuns is keyScheduleIsByteRun widened by the one step both rules
+// below need: a result that is a SLICE of byte runs hands out byte runs too, and so does a
+// slice of those, which is why this unwraps rather than spelling the two levels it has seen.
+//
+// The narrowing this replaced was measured and not supposed. (*RatchetTree).TreeHashes answers
+// [][]byte, reaches the extension body encoder exactly as TreeHash and NodeTreeHash do -- all
+// three go through marshalBytes -- and was outside the class of BOTH rules for the single
+// reason that its result is a slice of runs rather than a run. What that cost is not the tree
+// hash, which is exempt on its merits; it is that the exemption table could hold two of the
+// three tree hash methods and its expiry check could never hold the third, so the table read as
+// covering a class it was outside of. A rule whose class stops at one level of slicing is a
+// rule a loose body is handed out through by answering two of them.
+func extensionBodyAnswersByteRuns(rendered string, byteRuns []string) bool {
+	for {
+		if keyScheduleIsByteRun(rendered, byteRuns) {
+			return true
+		}
+		if !strings.HasPrefix(rendered, "[]") {
+			return false
+		}
+		rendered = strings.TrimPrefix(rendered, "[]")
+	}
 }
 
 // exportedSymbolsHandingOutABodyIn is every exported declaration of one file that mentions an
@@ -2627,7 +2655,7 @@ func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byte
 			continue
 		}
 		if !slices.ContainsFunc(one.results, func(result string) bool {
-			return keyScheduleIsByteRun(result, byteRuns)
+			return extensionBodyAnswersByteRuns(result, byteRuns)
 		}) {
 			continue
 		}
@@ -2662,6 +2690,7 @@ func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byte
 var extensionBodyByteRunsThatAreNotBodies = map[string]string{
 	"(*RatchetTree).NodeTreeHash": "answers the RFC 9420 section 7.8 tree hash of one subtree, which is KDF.Nh octets of digest and not a ratchet_tree body; the TreeHashInput preimage the encoder assembles is hashed and discarded inside the call, and no tag exists that would make a bare digest readable as any extension of this package",
 	"(*RatchetTree).TreeHash":     "answers the section 7.8 tree hash of the whole tree, which is what GroupContext.TreeHash is set from; the same argument as NodeTreeHash, and the signature is the one the key schedule and the group lifecycle plans compile against rather than one this package is free to change",
+	"(*RatchetTree).TreeHashes":   "answers the section 7.8 tree hash of every node, which is the column the tree-validation corpus publishes and the one a parent hash check reads; the same argument as the two above, one level of slicing out -- KDF.Nh octets of digest per node, and a slice of digests is no more a body than one of them is",
 }
 
 // extensionBodyByteRunsReportedByEitherRule is the union of what the two rules below report
@@ -3206,7 +3235,7 @@ func exportedSymbolsAssemblingABodyIn(parsed parsedSource, reaching []string, bo
 			continue
 		}
 		if !slices.ContainsFunc(one.results, func(result string) bool {
-			return keyScheduleIsByteRun(result, byteRuns)
+			return extensionBodyAnswersByteRuns(result, byteRuns)
 		}) {
 			continue
 		}
@@ -3261,6 +3290,12 @@ func leafKeysBodyHelper() []byte {
 	return body
 }
 
+// and the same one level of slicing out, assembled through the same encoder
+func LeafKeysBodies(count int) [][]byte {
+	body, _ := marshalBytes(func(w *syntax.Writer) error { return nil })
+	return [][]byte{body}
+}
+
 // unexported, so outside the class
 func leafKeysBodyInternal() []byte {
 	body, _ := marshalBytes(func(w *syntax.Writer) error { return nil })
@@ -3273,6 +3308,7 @@ func SomeUnrelatedBytes(n int) []byte { return make([]byte, n) }
 
 // What the rule must read out of the control, exactly.
 var extensionBodyAssemblyControlReports = []string{
+	"LeafKeysBodies",
 	"LeafKeysBody",
 	"LeafKeysBodyIndirect",
 }

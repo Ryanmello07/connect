@@ -24,7 +24,10 @@ package mls
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"testing"
 )
 
@@ -32,11 +35,93 @@ import (
 // the plan's three: the hash moves when the tree moves
 // ---------------------------------------------------------------------------
 
-func TestTreeHashChangesWithEveryObservableChange(t *testing.T) {
-	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
-	if err != nil {
-		t.Fatalf("NewCryptoProvider: %v", err)
+// treeHashObservableVariants is the family the sweep below runs over: this tree, and every one
+// step change to it the container can make, DERIVED from the tree's own width rather than
+// written out here.
+//
+// The five hand written mutations this replaced -- blank a leaf, swap two leaves, set a
+// parent, add an unmerged, grow the tree -- were a list, and a list is the thing this project
+// keeps finding to be narrower than the class it names. Those five blanked node 2 and no other
+// node, set a parent at node 1 and no other position, and never moved a leaf that was not leaf
+// 0 or leaf 2, so a hash that read one arm of the recursion and not another had nowhere to
+// fail. What is derived here is every node of the tree for the blanking, every parent position
+// for the parent node, every parent position crossed with every leaf for the unmerged entry,
+// every PAIR of leaves for the swap, and the growth, off NodeWidth and LeafWidth rather than
+// off a number typed beside them.
+func treeHashObservableVariants(t *testing.T, tree *RatchetTree) map[string]*RatchetTree {
+	t.Helper()
+	variants := map[string]*RatchetTree{"the tree itself": tree.Clone()}
+	add := func(what string, change func(clone *RatchetTree) error) {
+		t.Helper()
+		if _, taken := variants[what]; taken {
+			t.Fatalf("two rows of the derived family are named %q, so one of them is not being hashed", what)
+		}
+		clone := tree.Clone()
+		if err := change(clone); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		variants[what] = clone
 	}
+	width := uint32(tree.LeafWidth())
+	parentKey := HpkePublicKey(bytes.Repeat([]byte{0x01}, 32))
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		add(fmt.Sprintf("blank node %d", x), func(clone *RatchetTree) error {
+			return clone.Blank(NodeIndex(x))
+		})
+		if NodeIndex(x).IsLeaf() {
+			continue
+		}
+		add(fmt.Sprintf("a parent node at %d", x), func(clone *RatchetTree) error {
+			return clone.SetParent(NodeIndex(x), &ParentNode{EncryptionKey: parentKey})
+		})
+		for i := uint32(0); i < width; i += 1 {
+			add(fmt.Sprintf("leaf %d unmerged at node %d", i, x), func(clone *RatchetTree) error {
+				return clone.SetParent(NodeIndex(x), &ParentNode{
+					EncryptionKey:  parentKey,
+					UnmergedLeaves: []LeafIndex{LeafIndex(i)},
+				})
+			})
+		}
+	}
+	for i := uint32(0); i < width; i += 1 {
+		for j := i + 1; j < width; j += 1 {
+			add(fmt.Sprintf("swap leaves %d and %d", i, j), func(clone *RatchetTree) error {
+				at, other := tree.Leaf(LeafIndex(i)), tree.Leaf(LeafIndex(j))
+				if at == nil || other == nil {
+					t.Fatalf("leaf %d or leaf %d is blank in the base tree, so this row is not the change it is named for", i, j)
+				}
+				if err := clone.SetLeaf(LeafIndex(i), other); err != nil {
+					return err
+				}
+				return clone.SetLeaf(LeafIndex(j), at)
+			})
+		}
+	}
+	add("a leaf past the current width", func(clone *RatchetTree) error {
+		return clone.SetLeaf(LeafIndex(width), tree.Leaf(LeafIndex(0)).Clone())
+	})
+	return variants
+}
+
+// TestTreeHashChangesWithEveryObservableChange states the claim its name makes as INJECTIVITY
+// over that derived family: two trees that are different on the wire never share a tree hash.
+//
+// "Observable" is read off the tree's own encoder rather than decided in this file, which is
+// what makes the name honest. The converse is deliberately NOT asserted, and must not be:
+// MarshalMLS truncates trailing blank nodes, so a four leaf tree whose last leaf is blank
+// encodes as the three leaf array does and hashes differently, and that is a property of the
+// wire format rather than a defect of the hash.
+//
+// What an inequality still cannot see is written here so nobody reads this test as more than
+// it is. A hash that reads every input in the WRONG ORDER is injective too: left before right,
+// the leaf index before the leaf node, the presence octet on a blank -- flipping any of those
+// keeps every tree in this family separate and changes the group. Measured, not supposed: the
+// version this replaced passed under a left/right swap in parentHashInput, under a deleted
+// leaf index, under a deleted node type octet and under a swap of two fields of
+// LeafNode.marshalCore. Those are held by the hand derived goldens below and by the published
+// corpus at the end of this file, which is the whole weighting this file's header describes.
+func TestTreeHashChangesWithEveryObservableChange(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	tree, _ := newTestTree(t, crypto, 4)
 	base, err := tree.TreeHash(crypto)
 	if err != nil {
@@ -45,34 +130,49 @@ func TestTreeHashChangesWithEveryObservableChange(t *testing.T) {
 	if len(base) != crypto.HashSize() {
 		t.Fatalf("tree hash length = %d, want %d", len(base), crypto.HashSize())
 	}
-
-	mutations := map[string]func(tree *RatchetTree){
-		"blank a leaf":    func(tree *RatchetTree) { _ = tree.Blank(NodeIndex(2)) },
-		"swap two leaves": func(tree *RatchetTree) { tree.nodes[0], tree.nodes[2] = tree.nodes[2], tree.nodes[0] },
-		"set a parent": func(tree *RatchetTree) {
-			_ = tree.SetParent(NodeIndex(1), &ParentNode{EncryptionKey: HpkePublicKey(bytes.Repeat([]byte{0x01}, 32))})
-		},
-		"add an unmerged": func(tree *RatchetTree) {
-			_ = tree.SetParent(NodeIndex(1), &ParentNode{
-				EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x01}, 32)),
-				UnmergedLeaves: []LeafIndex{1},
-			})
-		},
-		"grow the tree": func(tree *RatchetTree) { _ = tree.SetLeaf(LeafIndex(4), tree.Leaf(LeafIndex(0)).Clone()) },
+	variants := treeHashObservableVariants(t, tree)
+	// the size is the derivation restated in arithmetic: the tree itself, one row per node for
+	// the blanking, one per parent position, one per parent position and leaf for the unmerged
+	// entry, one per unordered pair of leaves for the swap, and the growth. a family that came
+	// back smaller than this is a derivation that read the width wrong, and it would report a
+	// clean sweep having compared almost nothing.
+	nodes, leaves := tree.NodeWidth(), uint32(tree.LeafWidth())
+	parents := nodes - leaves
+	if want := 1 + nodes + parents + parents*leaves + leaves*(leaves-1)/2 + 1; uint32(len(variants)) != want {
+		t.Fatalf("the derived family holds %d trees, want %d over a %d node %d leaf tree",
+			len(variants), want, nodes, leaves)
 	}
-	seen := map[string]string{string(base): "base"}
-	for name, mutate := range mutations {
-		clone := tree.Clone()
-		mutate(clone)
-		got, err := clone.TreeHash(crypto)
+	byHash := map[string]string{}
+	byEncoding := map[string]string{}
+	encoded := map[string]string{}
+	for _, name := range slices.Sorted(maps.Keys(variants)) {
+		wire, err := marshalRatchetTree(variants[name])
 		if err != nil {
-			t.Fatalf("%s TreeHash: %v", name, err)
+			t.Fatalf("%s: marshalRatchetTree: %v", name, err)
 		}
-		if prior, ok := seen[string(got)]; ok {
-			t.Fatalf("%s produced the same tree hash as %s", name, prior)
+		hash, err := variants[name].TreeHash(crypto)
+		if err != nil {
+			t.Fatalf("%s: TreeHash: %v", name, err)
 		}
-		seen[string(got)] = name
+		encoded[name] = string(wire)
+		if prior, seen := byHash[string(hash)]; seen && encoded[prior] != string(wire) {
+			t.Errorf("%q and %q are different trees on the wire and share the tree hash %x", name, prior, hash)
+		}
+		byHash[string(hash)] = name
+		byEncoding[string(wire)] = name
 	}
+	// the pairwise check above only ever compares a collision against the LAST tree that hashed
+	// to it, so the counts are the half that cannot be walked past: every distinct encoding owes
+	// a distinct hash, and fewer hashes than encodings is a collision whichever pair it was.
+	if len(byHash) < len(byEncoding) {
+		t.Errorf("the family holds %d trees that differ on the wire and only %d distinct tree hashes",
+			len(byEncoding), len(byHash))
+	}
+	if len(byEncoding) < 2 {
+		t.Fatalf("every tree in the family encodes the same, so no pair of them could have failed above")
+	}
+	t.Logf("%d derived trees, %d distinct on the wire, %d distinct tree hashes",
+		len(variants), len(byEncoding), len(byHash))
 }
 
 func TestTreeHashesIndexedByNode(t *testing.T) {
@@ -110,28 +210,73 @@ func TestTreeHashesIndexedByNode(t *testing.T) {
 	}
 }
 
+// TestBlankLeafStillHashesAtItsIndex says both halves of its own name as BYTES: a blank
+// position is HASHED rather than skipped -- the zero presence octet is in the preimage -- and
+// what it is hashed with is ITS OWN index.
+//
+// It used to say only that two blanks at different indices differ, and that was measured to be
+// a claim the implementation can break while keeping. With leafHashInput returning early for a
+// nil leaf, so a blank writes no presence octet at all, leaf 0 hashed 01 00000000 and leaf 1
+// hashed 01 00000001: still different, still passing, and a different group from every other
+// implementation. An inequality cannot see what is IN a preimage.
+//
+// So the preimage is written out here octet by octet, the two rows the corpus of this file
+// already holds digests for are checked against those digests -- computed outside this
+// repository, which is what makes the spelling section 7.8's rather than this file's -- and
+// the tree is asked about EVERY leaf it has rather than about two of them.
 func TestBlankLeafStillHashesAtItsIndex(t *testing.T) {
-	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
-	if err != nil {
-		t.Fatalf("NewCryptoProvider: %v", err)
-	}
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	tree, _ := newTestTree(t, crypto, 4)
-	if err := tree.Blank(NodeIndex(0)); err != nil {
-		t.Fatalf("Blank(0): %v", err)
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		if err := tree.Blank(NodeIndex(x)); err != nil {
+			t.Fatalf("Blank(%d): %v", x, err)
+		}
 	}
-	a, err := tree.NodeTreeHash(crypto, NodeIndex(0))
-	if err != nil {
-		t.Fatalf("NodeTreeHash(0): %v", err)
+	// the goldens this file carries for leaf 0 and leaf 1 are the same two blank leaf
+	// preimages, so the sweep below is anchored at both ends of a uint32 low octet rather than
+	// hashing a spelling only this file has ever agreed with.
+	published := map[uint32]string{
+		0: blankTwoLeafTreeLeafZeroHash,
+		1: blankTwoLeafTreeLeafOneHash,
 	}
-	if err := tree.Blank(NodeIndex(2)); err != nil {
-		t.Fatalf("Blank(2): %v", err)
+	anchored := 0
+	seen := map[string]uint32{}
+	width := uint32(tree.LeafWidth())
+	if width < 2 {
+		t.Fatalf("the tree is %d leaves wide, so no two indices could differ here", width)
 	}
-	b, err := tree.NodeTreeHash(crypto, NodeIndex(2))
-	if err != nil {
-		t.Fatalf("NodeTreeHash(2): %v", err)
+	for i := uint32(0); i < width; i += 1 {
+		//	01 <leaf index as uint32> 00
+		//	node_type=leaf(1), the index this position has and no other, and the presence
+		//	octet that spells "there is no leaf here" rather than nothing at all
+		want := crypto.Hash(treeHashTestConcat(
+			[]byte{byte(NodeTypeLeaf)},
+			[]byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)},
+			[]byte{0x00},
+		))
+		if golden, isPublished := published[i]; isPublished {
+			if got := fmt.Sprintf("%x", want); got != golden {
+				t.Fatalf("the hand written blank preimage for leaf %d hashes to %s, want %s; the preimage above and the golden no longer agree",
+					i, got, golden)
+			}
+			anchored += 1
+		}
+		got, err := tree.NodeTreeHash(crypto, LeafIndex(i).NodeIndex())
+		if err != nil {
+			t.Fatalf("NodeTreeHash(leaf %d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("blank leaf %d hashes to %x, want %x -- node_type, the leaf index as a uint32, then the zero presence octet",
+				i, got, want)
+		}
+		if prior, collided := seen[string(got)]; collided {
+			t.Errorf("blank leaf %d hashes the same as blank leaf %d", i, prior)
+		}
+		seen[string(got)] = i
 	}
-	if bytes.Equal(a, b) {
-		t.Fatalf("two blank leaves at different indices hash the same")
+	if anchored != len(published) {
+		t.Errorf("%d of the %d published blank leaf digests were reached, so the sweep is hashing a spelling nothing outside this repository has checked",
+			anchored, len(published))
 	}
 }
 
@@ -610,5 +755,297 @@ func TestThePublishedTreeHashComparisonCanSayNo(t *testing.T) {
 	}
 	if checked != treeValidationImplementedEntries {
 		t.Errorf("the control ran over %d entries, want %d", checked, treeValidationImplementedEntries)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the original tree hash, RFC 9420 section 7.9
+// ---------------------------------------------------------------------------
+
+// originalTreeHashReference builds the tree section 7.9 DESCRIBES -- the one the excluded
+// leaves were never added to -- and hashes it through the ordinary section 7.8 walk.
+//
+// treeHash folds that construction into the same recursion, on purpose and for the reason its
+// doc gives, and the cost of folding it is that the exclude arm has no second opinion
+// anywhere: a test that asked the recursion to check itself would agree with any reading of
+// it. This is that second opinion, and it is worth what it is because the arm it compares
+// against -- exclude nil -- is the one the 908 published node hashes at the end of this file
+// check. So a defect in the shared encoder fails there, and a defect in what exclude does to
+// the tree fails here.
+//
+// Every excluded leaf is BLANKED and every parent node's unmerged_leaves has those leaves
+// struck out, both through the container's own surface, so what is hashed is a tree any other
+// caller could have built.
+func originalTreeHashReference(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	exclude map[LeafIndex]bool) []byte {
+	t.Helper()
+	without := tree.Clone()
+	for i := uint32(0); i < uint32(without.LeafWidth()); i += 1 {
+		if !exclude[LeafIndex(i)] {
+			continue
+		}
+		if without.Leaf(LeafIndex(i)) == nil {
+			t.Fatalf("leaf %d is already blank in the tree this reference is built from, so excluding it is not a change", i)
+		}
+		if err := without.Blank(LeafIndex(i).NodeIndex()); err != nil {
+			t.Fatalf("Blank(leaf %d): %v", i, err)
+		}
+	}
+	for x := uint32(0); x < without.NodeWidth(); x += 1 {
+		parent := without.ParentAt(NodeIndex(x))
+		if parent == nil {
+			continue
+		}
+		kept := []LeafIndex{}
+		for _, leaf := range parent.UnmergedLeaves {
+			if !exclude[leaf] {
+				kept = append(kept, leaf)
+			}
+		}
+		filtered := parent.Clone()
+		filtered.UnmergedLeaves = kept
+		if err := without.SetParent(NodeIndex(x), filtered); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	root, err := rootOf(without.LeafWidth())
+	if err != nil {
+		t.Fatalf("rootOf: %v", err)
+	}
+	hash, err := without.treeHash(crypto, root, nil)
+	if err != nil {
+		t.Fatalf("the reference tree hash: %v", err)
+	}
+	return hash
+}
+
+// TestTheOriginalTreeHashIsTheTreeHashOfTheTreeWithoutThoseLeaves is section 7.9's definition,
+// over EVERY subset of a four leaf tree's leaves rather than over a subset somebody picked.
+//
+// The subsets are derived from the width, which is what puts all three arms of the exclusion
+// under assertion at once: a subset naming a leaf under the root's left child and one under
+// its right says the set reaches both descendants, a subset naming a leaf that appears in a
+// parent's unmerged_leaves says the list is filtered, and the EMPTY subset says a non nil
+// exclusion naming nobody changes nothing -- which is the row that fails when the filter keeps
+// what it should drop.
+//
+// All three arms shipped with no behavioural assertion at all, and three separate mutations of
+// them survived the whole package: inverting the unmerged filter, dropping the blanking of an
+// excluded leaf, and passing nil to the two recursive calls so the exclusion never reached a
+// descendant. Each of the three fails here now.
+func TestTheOriginalTreeHashIsTheTreeHashOfTheTreeWithoutThoseLeaves(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 4)
+	// unmerged lists at BOTH depths and at the root: an exclusion that reached only the node it
+	// was handed would still filter the root's own list, so a tree whose only unmerged entries
+	// were at the root could not tell the two readings apart.
+	for _, one := range []struct {
+		x        NodeIndex
+		unmerged []LeafIndex
+	}{
+		{NodeIndex(1), []LeafIndex{0, 1}},
+		{NodeIndex(5), []LeafIndex{3}},
+		{NodeIndex(3), []LeafIndex{1, 2, 3}},
+	} {
+		if err := tree.SetParent(one.x, &ParentNode{
+			EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{byte(one.x)}, 32)),
+			UnmergedLeaves: one.unmerged,
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", one.x, err)
+		}
+	}
+	plain, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	root, err := rootOf(tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("rootOf: %v", err)
+	}
+	width := uint32(tree.LeafWidth())
+	if width != 4 {
+		t.Fatalf("this sweep is written for a four leaf tree and the builder handed back %d leaves", width)
+	}
+	answers := map[string]string{}
+	for bits := uint32(0); bits < 1<<width; bits += 1 {
+		exclude := map[LeafIndex]bool{}
+		named := []LeafIndex{}
+		for i := uint32(0); i < width; i += 1 {
+			if bits&(1<<i) != 0 {
+				exclude[LeafIndex(i)] = true
+				named = append(named, LeafIndex(i))
+			}
+		}
+		got, err := tree.treeHash(crypto, root, exclude)
+		if err != nil {
+			t.Fatalf("excluding %v: %v", named, err)
+		}
+		want := originalTreeHashReference(t, crypto, tree, exclude)
+		if !bytes.Equal(got, want) {
+			t.Errorf("the original tree hash excluding %v is %x, and the tree those leaves were never added to hashes to %x",
+				named, got, want)
+		}
+		// the two controls that stop sixteen rows from being sixteen readings of one answer: an
+		// exclusion naming nobody must leave the hash where it was, and every other one must
+		// move it, or the reference is agreeing with the implementation about a change neither
+		// of them made.
+		if len(named) == 0 {
+			if !bytes.Equal(got, plain) {
+				t.Errorf("an exclusion naming no leaf answers %x and the ordinary tree hash is %x", got, plain)
+			}
+		} else if bytes.Equal(got, plain) {
+			t.Errorf("excluding %v leaves the tree hash at the ordinary %x", named, plain)
+		}
+		if prior, collided := answers[string(got)]; collided {
+			t.Errorf("excluding %v hashes the same as excluding %s", named, prior)
+		}
+		answers[string(got)] = fmt.Sprintf("%v", named)
+	}
+	if len(answers) != 1<<width {
+		t.Errorf("%d of the %d subsets of the leaves produced a distinct hash", len(answers), 1<<width)
+	}
+}
+
+// TestTheOriginalTreeHashOfAnExcludedLeafIsTheHandDerivedBlankGolden pins what the exclusion
+// does to a leaf as BYTES rather than as a difference.
+//
+// The sweep above holds the exclude arm against the nil arm, which is the right second opinion
+// about what exclusion MEANS and says nothing about the octets either arm writes. This says the
+// octets: an excluded leaf is hashed exactly as a blank one is -- node type, index, presence
+// octet zero -- and the digest it must reach is one this repository did not compute. The tree
+// is chosen so the exclusion is the only thing that can turn it into the all blank tree those
+// goldens were derived for.
+func TestTheOriginalTreeHashOfAnExcludedLeafIsTheHandDerivedBlankGolden(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 2)
+	for _, x := range []NodeIndex{1, 2} {
+		if err := tree.Blank(x); err != nil {
+			t.Fatalf("Blank(%d): %v", x, err)
+		}
+	}
+	if tree.Leaf(LeafIndex(0)) == nil {
+		t.Fatalf("leaf 0 is blank before the exclusion, so nothing here could see one")
+	}
+	plain, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	if got := fmt.Sprintf("%x", plain); got == blankTwoLeafTreeRootHash {
+		t.Fatalf("the tree hashes to the all blank golden with nobody excluded, so this test cannot fail")
+	}
+	exclude := map[LeafIndex]bool{0: true}
+	for _, one := range []struct {
+		x    NodeIndex
+		want string
+		what string
+	}{
+		{LeafIndex(0).NodeIndex(), blankTwoLeafTreeLeafZeroHash, "the excluded leaf itself"},
+		{NodeIndex(1), blankTwoLeafTreeRootHash, "the root above it"},
+	} {
+		got, err := tree.treeHash(crypto, one.x, exclude)
+		if err != nil {
+			t.Fatalf("%s: treeHash(%d): %v", one.what, one.x, err)
+		}
+		if fmt.Sprintf("%x", got) != one.want {
+			t.Errorf("%s hashes to %x with leaf 0 excluded, want %s -- an excluded leaf is written as an ABSENT one: node_type, index, zero presence octet",
+				one.what, got, one.want)
+		}
+	}
+	// the walk READS the tree and never edits it: the exclusion is a question asked about a
+	// live tree during a parent hash check, and a caller left holding a tree the question had
+	// blanked would commit it.
+	after, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash after the excluded walk: %v", err)
+	}
+	if !bytes.Equal(after, plain) {
+		t.Errorf("the tree hash moved from %x to %x across an original tree hash walk, so the walk wrote into the tree it read", plain, after)
+	}
+}
+
+// TestTheOriginalTreeHashStrikesTheExcludedLeafOutOfUnmergedLeaves is the same statement for
+// the parent arm, and it is the one the sweep above cannot make in bytes: the filtered list is
+// what is hashed, as the shorter vector, rather than the list the tree still holds.
+//
+// The golden is the one TestAParentNodeHashesInTheHandDerivedOrder spells octet by octet --
+// unmerged_leaves = [1] over two blank leaves -- reached here from a tree whose list is [0, 1]
+// by excluding leaf 0. So a filter that kept the excluded entry, or struck out the wrong one,
+// hashes a four octet vector of the other index and fails against a digest computed outside
+// this repository.
+func TestTheOriginalTreeHashStrikesTheExcludedLeafOutOfUnmergedLeaves(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree := twoLeafBlankTree(t, crypto)
+	if err := tree.SetParent(NodeIndex(1), &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x01}, 32)),
+		UnmergedLeaves: []LeafIndex{0, 1},
+	}); err != nil {
+		t.Fatalf("SetParent(1): %v", err)
+	}
+	plain, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	if got := fmt.Sprintf("%x", plain); got == parentTwoLeafTreeRootHash {
+		t.Fatalf("the unfiltered tree already hashes to the golden the filtered one must reach")
+	}
+	got, err := tree.treeHash(crypto, NodeIndex(1), map[LeafIndex]bool{0: true})
+	if err != nil {
+		t.Fatalf("treeHash(1, {0}): %v", err)
+	}
+	if fmt.Sprintf("%x", got) != parentTwoLeafTreeRootHash {
+		t.Errorf("with leaf 0 excluded the root hashes to %x, want %s -- unmerged_leaves is [1] and not [0], [0 1] or []",
+			got, parentTwoLeafTreeRootHash)
+	}
+	// and the tree's own list is untouched, which is what the Clone in the filter is for: this
+	// walk runs over a live tree, and a filter applied in place would leave the caller holding a
+	// tree the exclusion had eaten.
+	parent := tree.ParentAt(NodeIndex(1))
+	if parent == nil {
+		t.Fatalf("the parent node is gone after the excluded walk")
+	}
+	if !slices.Equal(parent.UnmergedLeaves, []LeafIndex{0, 1}) {
+		t.Errorf("the tree's own unmerged_leaves is %v after the excluded walk, want [0 1]", parent.UnmergedLeaves)
+	}
+}
+
+// TestTheTreeHashEntryPointsRefuseATreeWithNoLeavesAlike closes a disagreement between the two
+// entry points that nothing in this package asked about.
+//
+// TreeHash asks rootOf, which refuses a leaf count of zero, so a zero valued RatchetTree
+// answers ErrTreeMalformed. TreeHashes used to allocate a column of NodeWidth entries and never
+// enter the loop, so the SAME receiver answered an empty slice and a nil error. A parent hash
+// check reads that column, and a caller that trusted the error would read "this tree has no
+// nodes" out of a tree that is not a tree.
+func TestTheTreeHashEntryPointsRefuseATreeWithNoLeavesAlike(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	empty := &RatchetTree{}
+	if empty.NodeWidth() != 0 || empty.LeafWidth() != 0 {
+		t.Fatalf("a zero valued tree is %d nodes and %d leaves wide, so it is not the receiver this test is about",
+			empty.NodeWidth(), empty.LeafWidth())
+	}
+	whole, wholeErr := empty.TreeHash(crypto)
+	column, columnErr := empty.TreeHashes(crypto)
+	if !errors.Is(wholeErr, ErrTreeMalformed) {
+		t.Errorf("TreeHash of a tree with no leaves answered %v, want %v", wholeErr, ErrTreeMalformed)
+	}
+	if !errors.Is(columnErr, ErrTreeMalformed) {
+		t.Errorf("TreeHashes of a tree with no leaves answered %v and the column %v, want %v",
+			columnErr, column, ErrTreeMalformed)
+	}
+	if whole != nil || column != nil {
+		t.Errorf("a refusal handed back a hash %x and a column of %d entries", whole, len(column))
+	}
+	// and the one leaf tree, which IS the narrowest tree there is, still answers both: a guard
+	// that refused every tree would satisfy the two clauses above and nothing else.
+	one := NewRatchetTree()
+	if _, err := one.TreeHash(crypto); err != nil {
+		t.Errorf("TreeHash of the one leaf tree: %v", err)
+	}
+	hashes, err := one.TreeHashes(crypto)
+	if err != nil {
+		t.Errorf("TreeHashes of the one leaf tree: %v", err)
+	}
+	if uint32(len(hashes)) != one.NodeWidth() {
+		t.Errorf("TreeHashes of the one leaf tree is %d entries over a %d node tree", len(hashes), one.NodeWidth())
 	}
 }

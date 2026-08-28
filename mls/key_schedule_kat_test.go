@@ -1082,9 +1082,23 @@ func namesMentionedIn(node ast.Node) map[string]bool {
 	return mentioned
 }
 
-// namesBoundBy is every name the node introduces as a local: a parameter, a named result, a
-// receiver, a short variable declaration, a var or const spec, a range variable, a type switch
-// binding.
+// opensAScope answers whether a node introduces a scope a binding can be confined to. Every
+// construct Go scopes on is here rather than a subset of them: the body of anything is a block,
+// but an if, a for, a range, a switch, a type switch and a select each scope their own
+// initialiser, and a case or a comm clause scopes its statements with no block around them.
+func opensAScope(node ast.Node) bool {
+	switch node.(type) {
+	case *ast.FuncDecl, *ast.FuncLit, *ast.BlockStmt, *ast.IfStmt, *ast.ForStmt,
+		*ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt,
+		*ast.CaseClause, *ast.CommClause:
+		return true
+	}
+	return false
+}
+
+// localUsesIn is every identifier NODE of one function that a binding the function itself
+// introduces is in scope for: a parameter, a named result, a receiver, a short variable
+// declaration, a var or const spec, a range variable, a type switch binding.
 //
 // It is the other half of the exclusion namesInvokedBy already makes for a field DECLARATION.
 // Excluding the declaration and not the USES reads a parameter named treeHash as a call to a
@@ -1094,24 +1108,64 @@ func namesMentionedIn(node ast.Node) map[string]bool {
 // implementation it exists to be a second opinion about. The same collision reached the
 // extension body closure through the treeHash local of (*GroupContext).UnmarshalMLS.
 //
-// It is a per FUNCTION set and not a per scope one, which is the approximation worth stating:
-// a name bound in an inner block is treated as bound throughout. What keeps that from hiding a
-// real edge is that namesInvokedBy drops a bound name only where it is NOT in call position --
-// a body that binds a local x and elsewhere calls x() still reports x.
-func namesBoundBy(node ast.Node) map[string]bool {
-	bound := map[string]bool{}
+// What this answers about is one identifier NODE rather than a name, and that is the whole
+// difference from the per FUNCTION set it replaces. That set treated a name bound anywhere in a
+// body as bound throughout it, so a name bound in an inner block and NAMED AS A VALUE in an
+// outer scope -- where the binding does not reach -- was dropped, and every gate reading this
+// matcher lost that edge. The doc this replaces admitted the case and nothing held it; the
+// control below holds it now, and holds the other direction too, because a scope walk that
+// popped too eagerly would read an ordinary local as an invocation and widen every gate rather
+// than narrow it.
+//
+// One approximation is left and it is the conservative direction: the left hand side of a short
+// variable declaration is bound before the right hand side is walked, so the second x of x := x
+// reads as the local. That drops an edge rather than inventing one, and the call position
+// escape in namesInvokedBy is what keeps a dropped edge from hiding a call.
+func localUsesIn(node ast.Node) map[*ast.Ident]bool {
+	uses := map[*ast.Ident]bool{}
+	scopes := []map[string]bool{}
+	path := []ast.Node{}
+	bind := func(name string) {
+		if len(scopes) == 0 || name == "" || name == "_" {
+			return
+		}
+		scopes[len(scopes)-1][name] = true
+	}
 	take := func(expressions []ast.Expr) {
 		for _, one := range expressions {
 			if ident, isIdent := one.(*ast.Ident); isIdent {
-				bound[ident.Name] = true
+				bind(ident.Name)
 			}
 		}
 	}
+	inScope := func(name string) bool {
+		for at := len(scopes) - 1; at >= 0; at -= 1 {
+			if scopes[at][name] {
+				return true
+			}
+		}
+		return false
+	}
 	ast.Inspect(node, func(current ast.Node) bool {
+		// ast.Inspect calls back with nil after the children of every node it descended into,
+		// which is what pops the scope stack in step with the walk rather than at a depth
+		// counted here.
+		if current == nil {
+			last := path[len(path)-1]
+			path = path[:len(path)-1]
+			if opensAScope(last) {
+				scopes = scopes[:len(scopes)-1]
+			}
+			return false
+		}
+		path = append(path, current)
+		if opensAScope(current) {
+			scopes = append(scopes, map[string]bool{})
+		}
 		switch typed := current.(type) {
 		case *ast.Field:
 			for _, name := range typed.Names {
-				bound[name.Name] = true
+				bind(name.Name)
 			}
 		case *ast.AssignStmt:
 			if typed.Tok == token.DEFINE {
@@ -1119,16 +1173,20 @@ func namesBoundBy(node ast.Node) map[string]bool {
 			}
 		case *ast.ValueSpec:
 			for _, name := range typed.Names {
-				bound[name.Name] = true
+				bind(name.Name)
 			}
 		case *ast.RangeStmt:
 			if typed.Tok == token.DEFINE {
 				take([]ast.Expr{typed.Key, typed.Value})
 			}
+		case *ast.Ident:
+			if inScope(typed.Name) {
+				uses[typed] = true
+			}
 		}
 		return true
 	})
-	return bound
+	return uses
 }
 
 // namesInvokedBy returns the names a function reaches as code rather than as data: every
@@ -1141,14 +1199,14 @@ func namesBoundBy(node ast.Node) map[string]bool {
 // psk.nonce contributes psk, not nonce, and this package does declare a method called
 // nonce. A composite literal key names a field of the type being built. A field
 // declaration, which is also how parameter names are spelled, names a local. And a USE of a
-// name the function itself bound is that local rather than the package level declaration of
-// the same spelling -- namesBoundBy is where the argument for the fourth is written, along
-// with the one case it deliberately does not cover.
+// name the function itself bound, IN THE SCOPE THAT BINDING REACHES, is that local rather than
+// the package level declaration of the same spelling -- localUsesIn is where the argument for
+// the fourth is written.
 func namesInvokedBy(node ast.Node) map[string]bool {
 	invoked := map[string]bool{}
 	positional := map[*ast.Ident]bool{}
 	called := map[string]bool{}
-	bound := namesBoundBy(node)
+	local := localUsesIn(node)
 	ast.Inspect(node, func(current ast.Node) bool {
 		switch typed := current.(type) {
 		case *ast.SelectorExpr:
@@ -1178,7 +1236,7 @@ func namesInvokedBy(node ast.Node) map[string]bool {
 		if !isIdent || positional[ident] {
 			return true
 		}
-		if bound[ident.Name] && !called[ident.Name] {
+		if local[ident] && !called[ident.Name] {
 			return true
 		}
 		invoked[ident.Name] = true
@@ -1209,6 +1267,22 @@ func readsAFieldOfTheSameSpelling(context *someContext) []byte {
 
 func namesAPackageFunctionAsAValue() func() []byte {
 	return marshalBytes
+}
+
+func bindsALocalInABlockAndNamesTheFunctionOutside() func() []byte {
+	if true {
+		marshalBytes := []byte{}
+		_ = marshalBytes
+	}
+	return marshalBytes
+}
+
+func readsAnOuterLocalInsideABlock(treeHash []byte) []byte {
+	out := []byte{}
+	if len(treeHash) > 0 {
+		out = append(out, treeHash...)
+	}
+	return out
 }
 
 func callsAPackageFunction() []byte {
@@ -1246,6 +1320,13 @@ func TestTheInvocationMatcherReadsCallsAndNotLocalsOfTheSameSpelling(t *testing.
 		{"readsAFieldOfTheSameSpelling", "TreeHash", false},
 		{"namesAPackageFunctionAsAValue", "marshalBytes", true},
 		{"callsAPackageFunction", "marshalBytes", true},
+		// the two halves of the scope walk, and they fail in opposite directions: the first is
+		// the hole the per function set left open -- a binding in an inner block swallowed the
+		// package level function named in an outer scope, where that binding does not reach --
+		// and the second is what a walk that popped a scope too eagerly would break, reading an
+		// ordinary use of an outer local as an invocation.
+		{"bindsALocalInABlockAndNamesTheFunctionOutside", "marshalBytes", true},
+		{"readsAnOuterLocalInsideABlock", "treeHash", false},
 	} {
 		function, declared := byName[row.function]
 		if !declared {

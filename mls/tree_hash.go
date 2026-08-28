@@ -169,6 +169,16 @@ func (self *RatchetTree) TreeHashes(crypto CryptoProvider) ([][]byte, error) {
 	if crypto == nil {
 		return nil, fmt.Errorf("%w: every node's hash is taken through it", ErrNilCryptoProvider)
 	}
+	// the width is refused through the SAME arithmetic TreeHash asks, and asked before the loop
+	// for the same reason: a tree with no leaves never enters the loop, so without this the two
+	// entry points answer one receiver differently -- TreeHash refuses it as malformed and
+	// TreeHashes hands back an empty column and a nil error. A caller that checks the column it
+	// got rather than the error would then read "this tree has no nodes" out of a tree that is
+	// not a tree, at a parent hash check, which is where an empty answer is indistinguishable
+	// from a passing one.
+	if _, err := rootOf(self.LeafWidth()); err != nil {
+		return nil, err
+	}
 	out := make([][]byte, self.NodeWidth())
 	for x := uint32(0); x < self.NodeWidth(); x += 1 {
 		hash, err := self.treeHash(crypto, NodeIndex(x), nil)
