@@ -361,6 +361,20 @@ func (self *RatchetTree) SetLeaf(i LeafIndex, leaf *LeafNode) error {
 // It does NOT grow. A parent node above a leaf that is not in the tree is not a position the
 // tree has, and growing on its behalf would invent a subtree nobody added a member to. A nil
 // parent is refused for SetLeaf's reason, and the payload is copied for SetLeaf's reason.
+//
+// An unmerged leaf outside the tree is refused HERE, and that is the whole of what keeps
+// Resolution's dropped error sound. RFC 9420 section 7.5 refuses a node whose unmerged list
+// leaves the tree, and RatchetTree.Resolution answers the EMPTY list for every refusal --
+// which is the same answer an accepted blank subtree gives. A resolution is the list a path
+// secret is sealed to, so one out-of-range unmerged leaf turns "seal to everyone under this
+// node" into "seal to nobody" at that node, at the ROOT as readily as at a leaf's parent, and
+// no shape assertion, round trip, member count or tree hash of this container can see it. The
+// codec cannot make this refusal on its own account -- checkUnmergedLeavesSorted and
+// checkUnmergedLeavesBounded see one parent node and not the tree it is going into, so neither
+// knows the width -- so the container is the only layer that holds the width and the list at
+// the same time. Only the RANGE half of section 7.9 is decided here; the subtree half and the
+// non-blank half need x's own subtree and the rest of the tree, and belong to whole tree
+// validation.
 func (self *RatchetTree) SetParent(x NodeIndex, parent *ParentNode) error {
 	if x.IsLeaf() {
 		return ErrNodeTypeMismatch
@@ -370,6 +384,11 @@ func (self *RatchetTree) SetParent(x NodeIndex, parent *ParentNode) error {
 	}
 	if uint32(x) >= self.NodeWidth() {
 		return ErrNodeIndexOutOfRange
+	}
+	for _, leaf := range parent.UnmergedLeaves {
+		if LeafCount(leaf) >= self.LeafWidth() {
+			return ErrLeafIndexOutOfRange
+		}
 	}
 	self.setNode(x, &Node{NodeType: NodeTypeParent, Parent: parent.Clone()})
 	return nil
@@ -552,15 +571,29 @@ var _ NodeShape = (*RatchetTree)(nil)
 // notices.
 //
 // The error is dropped, and dropping it is a decision about the CALLERS rather than about the
-// error. Resolution's single failure is an x outside the node width -- its other refusals are
-// unreachable from a real tree, since a shape held by a RatchetTree always has a leaf count in
-// range and an unmerged leaf inside it -- and every call site of this method has already bounded
-// x, because it came out of a direct path, a copath or a root of this same tree. What comes back
-// for an out-of-range x is the EMPTY list rather than a nil, which is the same shape an accepted
-// empty resolution has, so the two are deliberately not distinguishable here: a caller that needs
-// to tell them apart is a caller that has not bounded its index, and it must call the free
-// Resolution(self, x) and answer the error. Task 16's EncryptionTargets and FilteredDirectPath
-// are exactly those callers.
+// error. What comes back for a refused x is the EMPTY list rather than a nil, which is the same
+// shape an accepted empty resolution has, so the two are deliberately not distinguishable here:
+// a caller that needs to tell them apart is a caller that has not bounded its index, and it must
+// call the free Resolution(self, x) and answer the error. Task 16's EncryptionTargets and
+// FilteredDirectPath are exactly those callers.
+//
+// That is only sound while the one refusal a tree built through this container can produce is an
+// x outside the node width, which every call site of this method has already bounded because x
+// came out of a direct path, a copath or a root of this same tree. The other two refusals are
+// held unreachable by this container rather than assumed unreachable, which is the correction a
+// review made here: the earlier text asserted that a RatchetTree "always has a leaf count in
+// range and an unmerged leaf inside it" and only the first half was enforced anywhere.
+//
+//   - the leaf count. The array is only ever built by NewRatchetTree and grown by growTo, and
+//     growTo doubles through ExtendedLeafCount, so the width is a power of two inside
+//     MaxLeafCount and checkLeafCount cannot refuse it.
+//   - the unmerged leaves. SetParent refuses a list holding a leaf the tree does not have, and
+//     the width only ever grows, so a list in range when it was stored stays in range. Without
+//     that refusal this method answered the empty list for a NON-BLANK node, root included,
+//     which reads as "seal this path secret to nobody" -- see SetParent's own comment.
+//
+// TestTheOnlyResolutionRefusalAContainerBuiltTreeCanProduceIsAnOutOfRangeIndex is what holds
+// both, over every door into the node array rather than over the two somebody remembered.
 func (self *RatchetTree) Resolution(x NodeIndex) []NodeIndex {
 	out, err := Resolution(self, x)
 	if err != nil {

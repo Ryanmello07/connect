@@ -11,9 +11,15 @@
 // So the builder checks its own output, on every call, against measures that are not itself:
 //
 //   - the shape, against the tree math of p3. NodeWidth and IsFullLeafCount decide what a
-//     complete tree of this leaf width is, and TestTheTestTreeIsATreeTheTreeMathAgreesWith
-//     holds every leaf's direct path, copath and root against the same arithmetic. Neither
-//     reads anything this file wrote.
+//     complete tree of this leaf width is, FullLeafCount decides how wide a tree this many
+//     members belongs in, and TestTheTestTreeIsATreeTheTreeMathAgreesWith holds every leaf's
+//     direct path, copath and root against the same arithmetic. None of the three reads
+//     anything this file wrote. The width against the MEMBERSHIP is the half a review had to
+//     add, and it is the sharpest thing in this list: a node array that is internally
+//     self-consistent is self-consistent at EVERY power of two, so a builder handing back a
+//     tree one doubling too wide -- every extra leaf blank, every member still at its own leaf
+//     -- satisfied both other shape rules, moved the root, changed every direct path and every
+//     future tree hash, and no test in this package said a word.
 //   - the leaves, against section 7.3 validation. LeafNode.Validate is task 7's, written
 //     before this file and tested against the RFC's own rules, so a leaf this builder produces
 //     that no validator would accept is caught at the builder rather than in task 15's tree
@@ -58,8 +64,24 @@ func testGroupId() []byte {
 	return []byte(testGroupIdString)
 }
 
-// newTestTree answers an n-member tree whose parent nodes are all blank, which is the shape a
-// group has immediately after every member has been added and nobody has committed a path.
+// newTestTree answers an n-member tree whose parent nodes are all blank, at the narrowest
+// complete width n members fit in.
+//
+// That is the SHAPE a group has immediately after every member has been added and nobody has
+// committed a path. It is not that group's LEAVES, and the difference is written down here
+// because the description is what a later task reads. Every leaf below carries
+// LeafNodeSourceUpdate; a leaf that entered by Add carries key_package, and in this package the
+// two are not interchangeable -- leaf_node.go's signature preimage splits key_package from
+// update and commit, and key_package is the source that does NOT bind group_id and leaf_index
+// into the signature.
+//
+// Update is the deliberate choice, because the builder's own sign-at-index check is only worth
+// making under a source that binds the index: a key_package leaf verifies at every index, so a
+// builder that signed member 3's leaf at index 5 would be invisible to it. What that costs is
+// that this fixture never holds a key_package-sourced leaf, so task 23's whole tree validation
+// and task 18's signing are exercised here only against the source that carries group context.
+// A task that needs the other source needs a fixture of its own and must not read this one as
+// covering it.
 //
 // It takes testing.TB rather than *testing.T so the task 28 benchmarks can build trees without
 // faking a *testing.T, which is also why the well-formedness check reports through t.Errorf on
@@ -100,7 +122,15 @@ func newTestTree(t testing.TB, crypto CryptoProvider, n uint32) (*RatchetTree, [
 					ExtensionTypeUrmessageLeafKeys,
 					ExtensionTypeUrmessageOwnerSuccessor,
 				},
-				Proposals:   []ProposalType{ProposalTypeAdd, ProposalTypeUpdate, ProposalTypeRemove},
+				// no proposal types, and empty is the CONFORMING answer rather than a gap in
+				// the fixture. Add, update and remove are RFC 9420 section 7.2 "default"
+				// types, which section 7.2 forbids a leaf to list; leaf_node_test.go's
+				// required capabilities table states the same rule from the other side, that
+				// a row requiring ProposalTypeAdd would be asserting a conforming leaf is
+				// refused. LeafNode.Validate does not enforce it today, which is exactly why
+				// listing them here was free -- and why the twenty tasks reading this fixture
+				// would have inherited a non-conforming leaf the day one of them did.
+				Proposals:   nil,
 				Credentials: []CredentialType{CredentialTypeBasic},
 			},
 			LeafNodeSource: LeafNodeSourceUpdate,
@@ -137,6 +167,7 @@ const testTreeFaultPrefix = "errTestTree"
 var (
 	errTestTreeLeafWidthNotFull          = errors.New("the leaf width is not a power of two")
 	errTestTreeNodeWidthNotDerived       = errors.New("the node array is not the node width of its own leaf width")
+	errTestTreeWidthNotTheMembershipsOwn = errors.New("the leaf width is not the narrowest complete tree this membership fits in")
 	errTestTreeMemberNotAtItsOwnLeaf     = errors.New("member i does not carry leaf index i")
 	errTestTreeMemberLeafBlank           = errors.New("a member's leaf is blank")
 	errTestTreeStrayLeaf                 = errors.New("a leaf outside the membership is occupied")
@@ -146,6 +177,22 @@ var (
 	errTestTreeSignatureKeyPairMismatch  = errors.New("a member's signature private key is not the one its leaf publishes")
 	errTestTreeEncryptionKeyPairMismatch = errors.New("a member's encryption private key is not the one its leaf publishes")
 )
+
+// testTreeExpectedWidth is the leaf width a tree holding exactly this membership must have.
+//
+// DERIVED from the container and the arithmetic rather than restated: FullLeafCount is this
+// package's own "narrowest complete tree that holds n leaves", and NewRatchetTree's width is
+// this package's own floor -- the one leaf tree every group starts as, which is what a tree
+// with no members still is, and which FullLeafCount answers zero for on its own. Neither rule
+// is rewritten here, so a change to either moves this check with it rather than leaving it
+// agreeing with a shape the container no longer builds.
+func testTreeExpectedWidth(members []*testMember) LeafCount {
+	width := FullLeafCount(LeafCount(len(members)))
+	if floor := NewRatchetTree().LeafWidth(); width < floor {
+		width = floor
+	}
+	return width
+}
 
 // testTreeFaults is every way this tree and this membership disagree with what newTestTree
 // promises, as a list rather than as reports, so the control below can drive it and read back
@@ -159,6 +206,19 @@ func testTreeFaults(crypto CryptoProvider, tree *RatchetTree, members []*testMem
 	if NodeWidth(width) != tree.NodeWidth() {
 		faults = append(faults, fmt.Errorf("%w: %d nodes over %d leaves, want %d",
 			errTestTreeNodeWidthNotDerived, tree.NodeWidth(), width, NodeWidth(width)))
+	}
+	// the width against the MEMBERSHIP, which is the question neither clause above asks. Both of
+	// them are answered yes by a complete tree of ANY power-of-two width, so the tree this
+	// builder returns could be one doubling too wide -- every extra leaf blank, every member
+	// still at its own leaf -- and satisfy both. That tree is not a cosmetic difference: RFC 9420
+	// section 7.7 keeps a group at the narrowest complete width its members fit in, a doubling
+	// adds a new root ABOVE the old one, and moving the root changes every direct path, every
+	// copath, every parent hash and every tree hash that twenty later tasks compute against this
+	// fixture. Section 12.4.3.1 additionally refuses an exported tree that ends in a blank, which
+	// such a tree always does.
+	if expected := testTreeExpectedWidth(members); width != expected {
+		faults = append(faults, fmt.Errorf("%w: %d leaves over %d members, want %d",
+			errTestTreeWidthNotTheMembershipsOwn, width, len(members), expected))
 	}
 
 	// the membership this builder promises: member i at leaf i, and nobody anywhere else. The
@@ -175,7 +235,16 @@ func testTreeFaults(crypto CryptoProvider, tree *RatchetTree, members []*testMem
 	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
 		node := NodeIndex(x)
 		if !node.IsLeaf() {
-			if tree.ParentAt(node) != nil {
+			// asked as IsBlank and not as ParentAt(node) != nil, which is one member of the
+			// class rather than the class. This sentinel's own message is about a parent
+			// position that is not BLANK, and blank is the ABSENCE of a node; ParentAt answers
+			// only for a parent-TYPED one, so a leaf-typed *Node stored at an odd index has a
+			// nil Parent, ParentAt says nil and the clause says nothing -- while the tree's own
+			// IsBlank says false and Resolution therefore EMITS that node into the list a path
+			// secret is sealed to. IsBlank is the tree's own definition of the property, read in
+			// the same container the resolution walk reads it from, so the clause asks the tree
+			// instead of restating one of the ways a position can be occupied.
+			if !tree.IsBlank(node) {
 				faults = append(faults, fmt.Errorf("%w: node %d", errTestTreeParentNotBlank, x))
 			}
 			continue
@@ -283,8 +352,12 @@ func TestNewTestTreeShape(t *testing.T) {
 		if uint32(len(members)) != n {
 			t.Fatalf("n=%d members = %d", n, len(members))
 		}
+		if width := testTreeExpectedWidth(members); tree.LeafWidth() != width {
+			t.Fatalf("n=%d the tree is %d leaves wide and %d members belong in %d", n, tree.LeafWidth(), n, width)
+		}
 		for x := uint32(1); x < tree.NodeWidth(); x += 2 {
-			if tree.ParentAt(NodeIndex(x)) != nil {
+			// !IsBlank and not ParentAt != nil, for the reason testTreeFaults' own clause gives
+			if !tree.IsBlank(NodeIndex(x)) {
 				t.Fatalf("n=%d parent %d is not blank in a fresh test tree", n, x)
 			}
 		}
@@ -433,6 +506,21 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			// wide, so this fixture separates them the other way
 			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
 				return &RatchetTree{nodes: make([]*Node, 4)}, nil
+			},
+		},
+		"errTestTreeWidthNotTheMembershipsOwn": {
+			sentinel: errTestTreeWidthNotTheMembershipsOwn,
+			text:     "the leaf width is not the narrowest complete tree this membership fits in",
+			// one doubling too wide and nothing else touched. Every member is still at its own
+			// leaf holding its own keys, every added leaf is blank and every added parent is
+			// blank, so this fixture separates the width clause from every other clause of the
+			// checker: it is the only one with anything to say about it.
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+				tree, members := newTestTree(t, crypto, 4)
+				if err := tree.growTo(tree.LeafWidth() * 2); err != nil {
+					t.Fatalf("growTo: %v", err)
+				}
+				return tree, members
 			},
 		},
 		"errTestTreeMemberNotAtItsOwnLeaf": {
@@ -668,6 +756,108 @@ func TestTheTestTreeCheckerFlagsEveryFaultItNames(t *testing.T) {
 				}
 			}
 			t.Fatalf("the tree broken for %s reports %v and none of them is %v", name, faults, row.sentinel)
+		})
+	}
+}
+
+// testTreeNodeKinds is one *Node of every kind this package's Node union can hold, keyed by the
+// NodeType constant it carries, each ready to be dropped at a parent position.
+//
+// A table rather than two cases written out, so the control below can be held to the class the
+// package DECLARES: a third NodeType landing beside these two fails
+// TestTheParentClauseFlagsAParentPositionWhateverKindOfNodeOccupiesIt rather than quietly
+// leaving the checker with a kind of occupied node it does not name.
+func testTreeNodeKinds() map[string]func(tree *RatchetTree) *Node {
+	return map[string]func(tree *RatchetTree) *Node{
+		"NodeTypeLeaf": func(tree *RatchetTree) *Node {
+			return &Node{NodeType: NodeTypeLeaf, Leaf: tree.Leaf(LeafIndex(0))}
+		},
+		"NodeTypeParent": func(tree *RatchetTree) *Node {
+			return &Node{NodeType: NodeTypeParent, Parent: &ParentNode{
+				EncryptionKey: HpkePublicKey(repeatByte(0x33, 32)),
+			}}
+		},
+	}
+}
+
+// testTreeNodeTypeNamesInSource is every NodeType constant this package declares, read off the
+// declaration rather than listed, for the reason testTreeFaultNamesInSource gives.
+func testTreeNodeTypeNamesInSource(t *testing.T) []string {
+	t.Helper()
+	found := []string{}
+	for _, path := range packageSourcePaths(t) {
+		parsed := mustParseSource(t, path)
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			spec, isSpec := node.(*ast.ValueSpec)
+			if !isSpec {
+				return true
+			}
+			ident, isIdent := spec.Type.(*ast.Ident)
+			if !isIdent || ident.Name != "NodeType" {
+				return true
+			}
+			for _, name := range spec.Names {
+				found = append(found, name.Name)
+			}
+			return true
+		})
+	}
+	if len(found) == 0 {
+		t.Fatalf("this package declares no NodeType constant, so the table above controls nothing")
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestTheParentClauseFlagsAParentPositionWhateverKindOfNodeOccupiesIt is the control on the one
+// clause of this checker that is about a POSITION rather than about a node.
+//
+// errTestTreeParentNotBlank says "a parent node of a fresh test tree is not blank", and blank is
+// the absence of a node -- so every kind of node the union can hold, at an odd index, violates
+// it. The clause was written as ParentAt(node) != nil, which answers nil for a leaf-typed node
+// stored at a parent index and reported nothing, while the tree's own IsBlank said false and
+// Resolution emitted that node; the row below for NodeTypeLeaf is that exact tree, and it is
+// what the clause is now asked with. The kinds are held against the NodeType constants the
+// package declares, so the class cannot narrow without failing here.
+func TestTheParentClauseFlagsAParentPositionWhateverKindOfNodeOccupiesIt(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	kinds := testTreeNodeKinds()
+	declared := testTreeNodeTypeNamesInSource(t)
+	controlled := slices.Sorted(maps.Keys(kinds))
+	if !slices.Equal(declared, controlled) {
+		t.Fatalf("this package declares the node types %v and this table occupies a parent position with %v",
+			declared, controlled)
+	}
+	for _, name := range declared {
+		t.Run(name, func(t *testing.T) {
+			tree, members := newTestTree(t, crypto, 4)
+			// written into the node array and not through SetLeaf or SetParent, because both
+			// of those refuse a node whose type does not match its position -- and a fixture
+			// the container refuses proves nothing about the checker. What this is about is a
+			// tree that ALREADY holds such a node, which is what task 11's ratchet_tree
+			// decoder can hand this package from a peer's bytes.
+			tree.nodes[1] = kinds[name](tree)
+			if tree.IsBlank(NodeIndex(1)) {
+				t.Fatalf("node 1 holding a %s still reports blank, so this row breaks nothing", name)
+			}
+			// and the consequence, stated where it can be seen rather than asserted in a
+			// comment: the occupied parent is emitted into the resolution of its own subtree,
+			// so a fixture carrying one seals every path secret at that node to a different
+			// set of nodes than the tree the membership describes.
+			if got := tree.Resolution(NodeIndex(1)); len(got) == 0 || got[0] != NodeIndex(1) {
+				t.Fatalf("node 1 holding a %s resolves to %v, so the fault is not observable here", name, got)
+			}
+			faults := testTreeFaults(crypto, tree, members)
+			for _, fault := range faults {
+				if errors.Is(fault, errTestTreeParentNotBlank) {
+					return
+				}
+			}
+			t.Fatalf("a parent position holding a %s reports %v and none of them is %v",
+				name, faults, errTestTreeParentNotBlank)
 		})
 	}
 }

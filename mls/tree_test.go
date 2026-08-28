@@ -26,6 +26,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -54,6 +55,32 @@ func testParentNodeTemplate() *ParentNode {
 		ParentHash:     repeatByte(0xb2, 32),
 		UnmergedLeaves: []LeafIndex{1, 2, 5},
 	}
+}
+
+// testParentNodeInside is the template with its unmerged list narrowed to the leaves the given
+// tree actually has.
+//
+// The template names leaf 5 because its own subject is the CODEC, where a strictly ascending
+// list with a gap is the vector worth encoding and no tree is involved at all. SetParent refuses
+// an unmerged leaf outside the tree it is installing into -- for the reason written on it, that
+// such a list makes the resolution of a non-blank node the empty list, which is the list a path
+// secret would be sealed to -- so a test installing the template into a narrow tree has to hand
+// it a list that tree can hold.
+//
+// Narrowed rather than the refusal being routed around: every property the tests below measure
+// through the template is about storage, aliasing and copying, and none of them is about which
+// leaves the list names. Derived from the tree's own width so it stays right as those tests
+// change the tree they build.
+func testParentNodeInside(tree *RatchetTree) *ParentNode {
+	parent := testParentNodeTemplate()
+	kept := []LeafIndex{}
+	for _, leaf := range parent.UnmergedLeaves {
+		if LeafCount(leaf) < tree.LeafWidth() {
+			kept = append(kept, leaf)
+		}
+	}
+	parent.UnmergedLeaves = kept
+	return parent
 }
 
 // testTreeLeaf is one leaf whose keys are a function of its index, so that a tree built below
@@ -518,10 +545,18 @@ func treeWithOccupancy(t *testing.T, leafWidth uint32, isOccupied func(NodeIndex
 			continue
 		}
 		// every occupied parent carries an unmerged leaf, so a sweep that asks a parent for
-		// its unmerged list is asking one that has something to answer
+		// its unmerged list is asking one that has something to answer.
+		//
+		// The leaf is the first of the node's OWN subtree, and it was the node index reused as a
+		// leaf index -- which is a leaf the tree does not have at every parent above level one:
+		// node 5 of a four leaf tree named leaf 5, and node 13 of an eight leaf tree named leaf
+		// 13. RFC 9420 section 7.9 required a leaf of the node's subtree all along and nothing
+		// here refused it, so these fixtures carried a shape no validator accepts into three
+		// structural sweeps; SetParent's range check is what surfaced it.
+		firstLeaf, _ := SubtreeLeaves(index)
 		if err := tree.SetParent(index, &ParentNode{
 			EncryptionKey:  HpkePublicKey(repeatByte(byte(0xc0+x), 32)),
-			UnmergedLeaves: []LeafIndex{LeafIndex(x)},
+			UnmergedLeaves: []LeafIndex{firstLeaf},
 		}); err != nil {
 			t.Fatalf("SetParent(%d): %v", x, err)
 		}
@@ -957,7 +992,7 @@ func TestGrowingDoesNotMoveTheNodesAlreadyThere(t *testing.T) {
 			t.Fatalf("SetLeaf(%d): %v", i, err)
 		}
 	}
-	if err := tree.SetParent(NodeIndex(1), testParentNodeTemplate()); err != nil {
+	if err := tree.SetParent(NodeIndex(1), testParentNodeInside(tree)); err != nil {
 		t.Fatalf("SetParent(1): %v", err)
 	}
 	leafZero, leafOne, parentOne := tree.Get(NodeIndex(0)), tree.Get(NodeIndex(2)), tree.Get(NodeIndex(1))
@@ -1089,7 +1124,7 @@ func TestRatchetTreeBlankDirectPath(t *testing.T) {
 // shared backing array is how a rejected commit mutates a tree that never accepted it.
 func TestRatchetTreeCloneIsIndependent(t *testing.T) {
 	tree, _ := treeUnderTest(t, 4)
-	if err := tree.SetParent(NodeIndex(3), testParentNodeTemplate()); err != nil {
+	if err := tree.SetParent(NodeIndex(3), testParentNodeInside(tree)); err != nil {
 		t.Fatalf("SetParent: %v", err)
 	}
 
@@ -1354,7 +1389,7 @@ func TestInstallingANodeCopiesItAndTheAccessorsHandBackTheStoredOne(t *testing.T
 		t.Error("writing through Leaf did not reach the tree, so the tree hands out a copy and cannot be edited at all")
 	}
 
-	installedParent := testParentNodeTemplate()
+	installedParent := testParentNodeInside(tree)
 	if err := tree.SetParent(NodeIndex(1), installedParent); err != nil {
 		t.Fatalf("SetParent: %v", err)
 	}
@@ -1393,10 +1428,16 @@ func TestInstallingANodeCopiesItAndTheAccessorsHandBackTheStoredOne(t *testing.T
 // directions, so a later task could have flipped it back silently.
 func TestNodeShapeUnmergedLeavesHandsBackACopyAndNotTheTreesOwnList(t *testing.T) {
 	tree, _ := treeUnderTest(t, 4)
-	if err := tree.SetParent(NodeIndex(3), testParentNodeTemplate()); err != nil {
+	installed := testParentNodeInside(tree)
+	if err := tree.SetParent(NodeIndex(3), installed); err != nil {
 		t.Fatalf("SetParent: %v", err)
 	}
-	stored := []LeafIndex{1, 2, 5}
+	// read off what was installed rather than written out again, so the narrowing
+	// testParentNodeInside does cannot leave this comparing against a list the tree never held
+	stored := slices.Clone(installed.UnmergedLeaves)
+	if len(stored) < 2 {
+		t.Fatalf("the installed unmerged list is %v and what follows needs at least two entries", stored)
+	}
 	var shape NodeShape = tree
 	if got := shape.UnmergedLeaves(NodeIndex(3)); !reflect.DeepEqual(got, stored) {
 		t.Fatalf("UnmergedLeaves(3) = %v, want %v, so what follows measures the wrong list", got, stored)
@@ -2394,6 +2435,321 @@ func TestTheResolutionMethodDropsTheErrorOnlyWhereTheFreeFunctionRefuses(t *test
 	if refused != 4 {
 		t.Fatalf("the free function refused %d of the indices past the width, want 4", refused)
 	}
+
+	// the free function's OTHER refusal, and the reason this test's name is a statement about the
+	// whole method rather than about its range arm. An unmerged leaf outside the tree makes the
+	// free function refuse a node that is perfectly in range, and the method would then answer
+	// the empty list for a NON-BLANK node -- the root as readily as any other -- which reads as
+	// sealing that node's path secret to nobody. The loop above never reaches that arm: its
+	// fixture's list is [1 3] on an eight leaf tree, so every index it walks is in range. The arm
+	// is unreachable because the container refuses the list at the door, and this is where that
+	// is observed rather than assumed.
+	if err := tree.SetParent(NodeIndex(3), &ParentNode{
+		EncryptionKey:  HpkePublicKey(repeatByte(0x91, 32)),
+		UnmergedLeaves: []LeafIndex{LeafIndex(tree.LeafWidth())},
+	}); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("a parent carrying a leaf one past the width was accepted with err = %v", err)
+	}
+}
+
+// TestSetParentRefusesAnUnmergedLeafTheTreeDoesNotHave is the door RatchetTree.Resolution's
+// dropped error rests on.
+//
+// RFC 9420 section 7.5 refuses a node whose unmerged list reaches past the tree, and the method
+// answers the EMPTY list for every refusal -- which is the answer an accepted blank subtree
+// gives, so the two are not distinguishable through it. A tree holding one out-of-range unmerged
+// leaf therefore turns "seal this path secret to everyone under this node" into "seal it to
+// nobody", and no shape assertion, member count, round trip or tree hash of this container can
+// see the difference. Before this refusal existed SetParent accepted such a list on a four leaf
+// tree without a word, and the comment on Resolution asserted it could not happen.
+//
+// Every parent index of every width, and the boundary from BOTH sides: the widest list the tree
+// can hold is accepted at the same position that refuses the next leaf along, so what is pinned
+// here is a range check rather than a door that has stopped working.
+func TestSetParentRefusesAnUnmergedLeafTheTreeDoesNotHave(t *testing.T) {
+	for _, leafCount := range []uint32{1, 2, 3, 4, 5, 8} {
+		tree, _ := treeUnderTest(t, leafCount)
+		width := tree.LeafWidth()
+		for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+			node := NodeIndex(x)
+			if err := tree.Blank(node); err != nil {
+				t.Fatalf("Blank(%d): %v", x, err)
+			}
+			// one past the width, two past it, and the largest value a leaf index holds, which
+			// is what a truncated or hostile ratchet_tree is likeliest to carry
+			for _, outside := range []LeafIndex{LeafIndex(width), LeafIndex(width) + 1, LeafIndex(0xffffffff)} {
+				parent := &ParentNode{
+					EncryptionKey:  HpkePublicKey(repeatByte(0x71, 32)),
+					UnmergedLeaves: []LeafIndex{outside},
+				}
+				if err := tree.SetParent(node, parent); !errors.Is(err, ErrLeafIndexOutOfRange) {
+					t.Fatalf("%d leaves: SetParent(%d, unmerged %d) err = %v, want ErrLeafIndexOutOfRange",
+						leafCount, x, outside, err)
+				}
+				// and the tree math's own sentinel underneath it, because tree_errors.go's header
+				// makes the wrap the thing a caller may ask either way about
+				if err := tree.SetParent(node, parent); !errors.Is(err, ErrLeafOutOfRange) {
+					t.Fatalf("%d leaves: SetParent(%d, unmerged %d) does not answer the tree math sentinel: %v",
+						leafCount, x, outside, err)
+				}
+				if !tree.IsBlank(node) {
+					t.Fatalf("%d leaves: node %d was occupied by a SetParent that reported a refusal", leafCount, x)
+				}
+			}
+			// and every leaf the tree HAS, at the same position, is accepted
+			inside := []LeafIndex{}
+			for leaf := uint32(0); leaf < uint32(width); leaf += 1 {
+				inside = append(inside, LeafIndex(leaf))
+			}
+			if err := tree.SetParent(node, &ParentNode{
+				EncryptionKey:  HpkePublicKey(repeatByte(0x72, 32)),
+				UnmergedLeaves: inside,
+			}); err != nil {
+				t.Fatalf("%d leaves: SetParent(%d) refused a list of every leaf the tree has: %v", leafCount, x, err)
+			}
+		}
+		// the check is against the CURRENT width and the array only ever grows, so a leaf refused
+		// before a doubling is accepted after it. That is the direction that keeps a stored list
+		// from going out of range behind the check's back, and it is observed rather than argued.
+		refused := LeafIndex(width)
+		if err := tree.SetLeaf(LeafIndex(uint32(width)*2-1), testTreeLeaf(0)); err != nil {
+			t.Fatalf("%d leaves: SetLeaf to grow: %v", leafCount, err)
+		}
+		if err := tree.SetParent(NodeIndex(1), &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(0x73, 32)),
+			UnmergedLeaves: []LeafIndex{refused},
+		}); err != nil {
+			t.Fatalf("%d leaves: leaf %d is inside the grown tree and SetParent refused it: %v", leafCount, refused, err)
+		}
+	}
+}
+
+// ratchetTreeParentNodeDoorRow is one door a ParentNode reaches this container through, and what
+// the container can and cannot promise at it.
+type ratchetTreeParentNodeDoorRow struct {
+	// copies says whether this door takes a *ParentNode the container copies on the way in,
+	// which is the only kind of door a refusal can live on. A door that hands out the tree's OWN
+	// node is documented to do exactly that, so a caller writing an out-of-range leaf through it
+	// has built a tree this container never accepted -- which is the boundary Resolution's
+	// comment draws, and the reason it draws it there instead of claiming a guarantee that is
+	// not there to claim.
+	copies bool
+	// drive puts an unmerged leaf the tree does not have through this door and answers whether
+	// the door refused it.
+	drive func(t *testing.T, tree *RatchetTree, outside LeafIndex) bool
+}
+
+func ratchetTreeParentNodeDoorRows() map[string]ratchetTreeParentNodeDoorRow {
+	return map[string]ratchetTreeParentNodeDoorRow{
+		"SetParent": {
+			copies: true,
+			drive: func(t *testing.T, tree *RatchetTree, outside LeafIndex) bool {
+				err := tree.SetParent(NodeIndex(3), &ParentNode{
+					EncryptionKey:  HpkePublicKey(repeatByte(0x81, 32)),
+					UnmergedLeaves: []LeafIndex{outside},
+				})
+				if err != nil && !errors.Is(err, ErrLeafIndexOutOfRange) {
+					t.Fatalf("SetParent refused with %v, which is not the unmerged range refusal", err)
+				}
+				return err != nil
+			},
+		},
+		"ParentAt": {
+			copies: false,
+			drive: func(t *testing.T, tree *RatchetTree, outside LeafIndex) bool {
+				installLegalParent(t, tree)
+				tree.ParentAt(NodeIndex(3)).UnmergedLeaves = []LeafIndex{outside}
+				return false
+			},
+		},
+		"Get": {
+			copies: false,
+			drive: func(t *testing.T, tree *RatchetTree, outside LeafIndex) bool {
+				installLegalParent(t, tree)
+				tree.Get(NodeIndex(3)).Parent.UnmergedLeaves = []LeafIndex{outside}
+				return false
+			},
+		},
+	}
+}
+
+// installLegalParent puts a parent node the container accepts at node 3, so that a door which
+// EDITS the tree's own storage has something of the tree's own to edit.
+func installLegalParent(t *testing.T, tree *RatchetTree) {
+	t.Helper()
+	if err := tree.SetParent(NodeIndex(3), &ParentNode{
+		EncryptionKey:  HpkePublicKey(repeatByte(0x82, 32)),
+		UnmergedLeaves: []LeafIndex{0},
+	}); err != nil {
+		t.Fatalf("installing a legal parent at node 3: %v", err)
+	}
+}
+
+// ratchetTreeParentNodeDoorsInSource is every exported method of *RatchetTree a ParentNode -- and
+// therefore an unmerged list -- can enter or be edited through, read off this package's source.
+//
+// Derived by SIGNATURE rather than listed, for guardrail 5's reason and for one specific to what
+// is being claimed: RatchetTree.Resolution's comment now makes a statement about every tree this
+// container ACCEPTED, and a table of the doors somebody remembered is a statement about those
+// doors. A method is a door when the Node union or a ParentNode appears among its parameters or
+// its results -- the first is how a list is installed, the second is how a caller reaches the
+// tree's own list and writes through it -- so a later task adding either kind of method has to
+// answer for it here rather than quietly widening the surface the claim is made over.
+func ratchetTreeParentNodeDoorsInSource(t *testing.T) []string {
+	t.Helper()
+	found := []string{}
+	for _, path := range packageSourcePaths(t) {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || parsed.receiverOf(function) != "*RatchetTree" || !function.Name.IsExported() {
+				continue
+			}
+			carries := false
+			ast.Inspect(function.Type, func(node ast.Node) bool {
+				ident, isIdent := node.(*ast.Ident)
+				if isIdent && (ident.Name == "Node" || ident.Name == "ParentNode") {
+					carries = true
+				}
+				return true
+			})
+			if carries {
+				found = append(found, function.Name.Name)
+			}
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("no exported method of *RatchetTree carries a Node or a ParentNode, so the table above controls nothing")
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestEveryDoorAParentNodeReachesTheRatchetTreeThroughIsHeldToTheUnmergedRange is the whole of
+// what makes RatchetTree.Resolution's dropped error sound, said over the derived class of doors
+// rather than over the one the fix was written at.
+//
+// The comment this replaced claimed a RatchetTree "always has ... an unmerged leaf inside it",
+// and nothing anywhere enforced it. Two things are true instead, and both are stated here: every
+// door that COPIES what it is handed refuses a leaf the tree does not have, and every door that
+// hands out the tree's own node cannot -- it is documented to hand out live storage so a caller
+// can edit what it installed. For the second kind this test shows the consequence rather than
+// describing it, so the boundary Resolution's comment draws is a thing a reader can see.
+func TestEveryDoorAParentNodeReachesTheRatchetTreeThroughIsHeldToTheUnmergedRange(t *testing.T) {
+	rows := ratchetTreeParentNodeDoorRows()
+	declared := ratchetTreeParentNodeDoorsInSource(t)
+	controlled := slices.Sorted(maps.Keys(rows))
+	if !slices.Equal(declared, controlled) {
+		t.Fatalf("*RatchetTree carries a parent node through %v and this table drives %v", declared, controlled)
+	}
+	for _, name := range declared {
+		row := rows[name]
+		t.Run(name, func(t *testing.T) {
+			tree, _ := treeUnderTest(t, 4)
+			outside := LeafIndex(tree.LeafWidth())
+			if row.copies != row.drive(t, tree, outside) {
+				t.Fatalf("%s copies=%v and a copying door must refuse an unmerged leaf outside the tree while a door handing out the tree's own node cannot",
+					name, row.copies)
+			}
+			if row.copies {
+				if !tree.IsBlank(NodeIndex(3)) {
+					t.Fatalf("%s reported a refusal and stored the node anyway", name)
+				}
+				return
+			}
+			// the door that cannot refuse, and the consequence spelled where it can be watched:
+			// the tree now holds a node that is NOT blank whose resolution the free function
+			// refuses, and the method answers the empty list for it -- which is the list a path
+			// secret would be sealed to. That is the tree this container never accepted, and it
+			// is why Resolution's comment draws its guarantee at the trees it did.
+			if tree.IsBlank(NodeIndex(3)) {
+				t.Fatalf("writing through %s did not reach the tree, so nothing below is about that door", name)
+			}
+			if _, err := Resolution(tree, NodeIndex(3)); !errors.Is(err, ErrLeafOutOfRange) {
+				t.Fatalf("after writing through %s the free Resolution answered err = %v", name, err)
+			}
+			if got := tree.Resolution(NodeIndex(3)); len(got) != 0 {
+				t.Fatalf("after writing through %s the method answered %v", name, got)
+			}
+		})
+	}
+}
+
+// assertResolutionRefusesOnlyPastTheNodeWidth holds the free function's refusals over the WHOLE
+// node array rather than at the one index a caller happened to ask about, and holds the method
+// to the free function everywhere the free function accepts.
+func assertResolutionRefusesOnlyPastTheNodeWidth(t *testing.T, tree *RatchetTree, where string) {
+	t.Helper()
+	for x := uint32(0); x < tree.NodeWidth()+4; x += 1 {
+		free, err := Resolution(tree, NodeIndex(x))
+		if outside := x >= tree.NodeWidth(); outside != (err != nil) {
+			t.Fatalf("%s: Resolution(%d) of a %d node tree answered err = %v", where, x, tree.NodeWidth(), err)
+		}
+		method := tree.Resolution(NodeIndex(x))
+		if err != nil {
+			if !errors.Is(err, ErrNodeOutOfRange) {
+				t.Fatalf("%s: Resolution(%d) refused with %v, and an out of range index is the only refusal a tree this container accepted may produce",
+					where, x, err)
+			}
+			if method == nil || len(method) != 0 {
+				t.Fatalf("%s: the free function refused index %d and the method answered %v", where, x, method)
+			}
+			continue
+		}
+		if !equalNodeIndices(method, free) {
+			t.Fatalf("%s: at node %d the method answered %v and the free function %v", where, x, method, free)
+		}
+	}
+}
+
+// TestTheOnlyResolutionRefusalATreeThisContainerAcceptedCanProduceIsAnOutOfRangeIndex is the
+// property RatchetTree.Resolution's dropped error is sound under, driven rather than argued.
+//
+// Every copying door is exercised with the widest argument it accepts and the invariant is
+// re-read after each one, because the two failures worth catching are asymmetric: storing a list
+// the width does not cover is what SetParent now refuses, and WIDENING the tree under a list
+// already stored is a thing SetLeaf does on purpose and no refusal defends against. The second
+// is sound only because the array grows and never shrinks, which is an argument worth watching
+// hold rather than believing.
+func TestTheOnlyResolutionRefusalATreeThisContainerAcceptedCanProduceIsAnOutOfRangeIndex(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	for _, n := range []uint32{1, 2, 3, 4, 5, 8} {
+		tree, members := newTestTree(t, crypto, n)
+		assertResolutionRefusesOnlyPastTheNodeWidth(t, tree, fmt.Sprintf("n=%d as built", n))
+
+		every := []LeafIndex{}
+		for leaf := uint32(0); leaf < uint32(tree.LeafWidth()); leaf += 1 {
+			every = append(every, LeafIndex(leaf))
+		}
+		for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+			if err := tree.SetParent(NodeIndex(x), &ParentNode{
+				EncryptionKey:  HpkePublicKey(repeatByte(byte(0x90+x), 32)),
+				UnmergedLeaves: every,
+			}); err != nil {
+				t.Fatalf("n=%d SetParent(%d) refused every leaf of the tree: %v", n, x, err)
+			}
+		}
+		assertResolutionRefusesOnlyPastTheNodeWidth(t, tree, fmt.Sprintf("n=%d every parent full", n))
+
+		// the door that changes the width UNDER every list already stored
+		if err := tree.SetLeaf(LeafIndex(uint32(tree.LeafWidth())+1), testTreeLeaf(1)); err != nil {
+			t.Fatalf("n=%d SetLeaf past the width: %v", n, err)
+		}
+		assertResolutionRefusesOnlyPastTheNodeWidth(t, tree, fmt.Sprintf("n=%d after growing", n))
+
+		for _, member := range members {
+			if err := tree.BlankDirectPath(member.LeafIndex); err != nil {
+				t.Fatalf("n=%d BlankDirectPath(%d): %v", n, member.LeafIndex, err)
+			}
+		}
+		if err := tree.Blank(LeafIndex(0).NodeIndex()); err != nil {
+			t.Fatalf("n=%d Blank(0): %v", n, err)
+		}
+		assertResolutionRefusesOnlyPastTheNodeWidth(t, tree, fmt.Sprintf("n=%d after blanking", n))
+	}
 }
 
 // resolutionUnmergedRule is one way of hanging an unmerged list on every parent of a sweep tree.
@@ -2522,13 +2878,27 @@ func resolutionSweep(t *testing.T, leafWidth uint32, rule resolutionUnmergedRule
 // every answer was the empty list.
 func TestResolutionAgreesWithTheRfcRecursionOverEveryBlankingPattern(t *testing.T) {
 	rules := resolutionUnmergedRules()
+	// eight leaves is 32,768 patterns per rule, so two of the four run there rather than all
+	// four: the rule with no unmerged list at all and the rule with the widest one, which are the
+	// pair that brackets the unmerged clause.
+	//
+	// Chosen by NAME and refused if a name is gone, which is the correction a review made here.
+	// This was written as "ruleIndex != 0 && ruleIndex != 1" under a comment calling those two
+	// "the first and the last rule" -- rule 1 is the second of four -- and an index pair is a
+	// description of the table's current ORDER rather than of the two rules this is about, so
+	// reordering resolutionUnmergedRules would have swept eight leaves under two rules nobody
+	// chose while the comment went on naming the two it was written for.
+	wideSweepRules := []string{"no unmerged leaves", "every leaf of the subtree"}
+	for _, name := range wideSweepRules {
+		if !slices.ContainsFunc(rules, func(rule resolutionUnmergedRule) bool { return rule.name == name }) {
+			t.Fatalf("the eight leaf sweep runs the rule %q and resolutionUnmergedRules declares no rule of that name", name)
+		}
+	}
 	compared := 0
 	nonEmpty := 0
 	for _, leafWidth := range []uint32{1, 2, 4, 8} {
-		for ruleIndex, rule := range rules {
-			// eight leaves is 32,768 patterns per rule, so it runs the first and the last rule
-			// -- the empty list and the widest one -- rather than all four
-			if leafWidth == 8 && ruleIndex != 0 && ruleIndex != 1 {
+		for _, rule := range rules {
+			if leafWidth == 8 && !slices.Contains(wideSweepRules, rule.name) {
 				continue
 			}
 			nodeWidth := NodeWidth(LeafCount(leafWidth))
