@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
@@ -1432,4 +1433,1134 @@ func TestTheCloneWalkReachesEverySliceOfTheStructure(t *testing.T) {
 		}
 	}
 	t.Logf("%d writable locations derived off the type: %v", len(want), want)
+}
+
+// ---------------------------------------------------------------------------
+// LeafNodeTBS, signing and signature verification
+// ---------------------------------------------------------------------------
+
+// leafNodeTestSigner is one provider and one signature key pair, for the sweeps below.
+//
+// The provider draws from the process entropy source rather than a scripted one, deliberately:
+// nothing here asserts a byte of the key, and a key pair that is different on every run is what
+// keeps a signature test from being satisfied by a value somebody wrote down.
+func leafNodeTestSigner(t *testing.T) (CryptoProvider, SignaturePrivateKey, SignaturePublicKey) {
+	t.Helper()
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	return crypto, priv, pub
+}
+
+// leafNodeSignedUnder is the template leaf under one source, carrying the signer's public key
+// and signed in the context it was handed.
+func leafNodeSignedUnder(t *testing.T, crypto CryptoProvider, priv SignaturePrivateKey,
+	pub SignaturePublicKey, source LeafNodeSource, groupId []byte, leafIndex LeafIndex) *LeafNode {
+	t.Helper()
+	leaf := testLeafNodeOfSource(source)
+	leaf.SignatureKey = pub
+	if err := leaf.Sign(crypto, priv, groupId, leafIndex); err != nil {
+		t.Fatalf("source %d: Sign: %v", source, err)
+	}
+	return leaf
+}
+
+// leafNodeContextBoundSources is the RFC 9420 section 7.2 select's SECOND arm, written as the
+// sources whose LeafNodeTBS carries the group id and the leaf index.
+//
+// It is a statement about the protocol and cannot be derived from the Go type, exactly as
+// leafNodeVariantPaths is not -- and like that table it is checked against the derived source
+// class rather than trusted, by TestEveryLeafNodeSourceIsEitherBoundToItsGroupAndPositionOrNot.
+// A fourth source added later fails there rather than silently inheriting the unbound arm,
+// which is the arm that verifies anywhere.
+var leafNodeContextBoundSources = map[LeafNodeSource]bool{
+	LeafNodeSourceKeyPackage: false,
+	LeafNodeSourceUpdate:     true,
+	LeafNodeSourceCommit:     true,
+}
+
+// TestEveryLeafNodeSourceIsEitherBoundToItsGroupAndPositionOrNot holds the table above to the
+// package's own constants, in both directions, so neither half can go stale in silence.
+func TestEveryLeafNodeSourceIsEitherBoundToItsGroupAndPositionOrNot(t *testing.T) {
+	sources := leafNodeSources(t)
+	if got := slices.Sorted(maps.Keys(leafNodeContextBoundSources)); !slices.Equal(got, sources) {
+		t.Fatalf("leafNodeContextBoundSources names sources %v and this package declares %v; a source with no row inherits whichever arm the switch falls through to, and one of the two verifies in any group at any position",
+			got, sources)
+	}
+	// and the table is not all of one answer, or every sweep reading it asserts one arm
+	bound, unbound := 0, 0
+	for _, source := range sources {
+		if leafNodeContextBoundSources[source] {
+			bound += 1
+			continue
+		}
+		unbound += 1
+	}
+	if bound == 0 || unbound == 0 {
+		t.Fatalf("the table reads %d bound and %d unbound sources; the section 7.2 select has both arms and a table with one is one no sweep can tell apart from a switch that ignores the source",
+			bound, unbound)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the hand derived LeafNodeTBS
+// ---------------------------------------------------------------------------
+
+// handDerivedLeafNodeExtensions is the extensions<V> field alone, which is where the TBS ends
+// and the wire form goes on to the signature:
+//
+//	extensions<V>  one entry: f002 + 01 "k" = 4 octets -> 04 f002 016b   5
+//
+// It is split out of handDerivedLeafNodeTail rather than written twice, and
+// TestTheHandDerivedTailIsItsExtensionsFollowedByItsSignature holds the split to the whole.
+func handDerivedLeafNodeExtensions() []byte {
+	return joinBytes([]byte{0x04}, []byte{0xf0, 0x02}, []byte{0x01}, []byte("k"))
+}
+
+// handDerivedLeafNodeTbs is the RFC 9420 section 7.2 LeafNodeTBS for the template leaf, written
+// out from the RFC rather than read back through signatureContent:
+//
+//	the common prefix                            88
+//	the variant the source selects        0 | 16 | 33
+//	extensions<V>                                 5
+//	then, for update and commit only:
+//	  group_id<V>            n octets -> prefix + n
+//	  leaf_index             uint32   ->          4
+//
+// The group id is length prefixed and the leaf index is NOT: the structure fixes the index at
+// four octets and leaves the group id variable, so the prefix is the thing that separates a
+// group id ending where the index begins from one an octet longer. The index is written big
+// endian, which is the presentation language's only integer order.
+//
+// This is the statement of the preimage that owes nothing to this package's encoder. A field
+// order swapped in signatureContent, an index written as a uint16, a group id written raw and a
+// context appended under key_package are each invisible to signing and verifying against this
+// implementation, and each moves these bytes.
+func handDerivedLeafNodeTbs(source LeafNodeSource, groupId []byte, leafIndex LeafIndex) []byte {
+	variant := []byte{}
+	switch source {
+	case LeafNodeSourceKeyPackage:
+		variant = joinBytes(
+			[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xe8},
+			[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xd0},
+		)
+	case LeafNodeSourceUpdate:
+	case LeafNodeSourceCommit:
+		variant = joinBytes([]byte{0x20}, repeatByte(0x44, 32))
+	}
+	context := []byte{}
+	if leafNodeContextBoundSources[source] {
+		// the section 2.1.2 vector header, written out for the two widths this test reaches:
+		// 0..63 octets is one octet, 64..16383 is two with the top bits 01
+		prefix := []byte{byte(len(groupId))}
+		if len(groupId) >= 0x40 {
+			prefix = []byte{byte(0x40 | len(groupId)>>8), byte(len(groupId))}
+		}
+		context = joinBytes(prefix, groupId, []byte{
+			byte(leafIndex >> 24), byte(leafIndex >> 16), byte(leafIndex >> 8), byte(leafIndex),
+		})
+	}
+	return joinBytes(handDerivedLeafNodeCommon(source), variant,
+		handDerivedLeafNodeExtensions(), context)
+}
+
+// TestTheHandDerivedTailIsItsExtensionsFollowedByItsSignature holds the split above to the
+// whole it was cut out of. Two derivations of one field drift, and a split taken one octet out
+// would make the TBS golden below compare against bytes neither the RFC nor this file states.
+func TestTheHandDerivedTailIsItsExtensionsFollowedByItsSignature(t *testing.T) {
+	want := joinBytes(handDerivedLeafNodeExtensions(), []byte{0x40, 0x40}, repeatByte(0x33, 64))
+	if got := handDerivedLeafNodeTail(); !bytes.Equal(got, want) {
+		t.Errorf("the hand derived tail is\n %x\nand its extensions followed by its signature are\n %x", got, want)
+	}
+}
+
+// TestLeafNodeSignatureContentMatchesTheHandDerivedTbs is the field order and prefix width pin
+// for the preimage, and it is the one test here that a symmetric edit cannot survive.
+//
+// Everything else in this file signs with this package and verifies with this package, so a
+// preimage this implementation builds wrongly in a way it also reads wrongly agrees with itself
+// on every input. What separates those is a statement of the structure written without
+// reference to the code, which is what handDerivedLeafNodeTbs is.
+//
+// Three group ids and four indices, because the two fields fail in different ways. The 64 octet
+// group id is the first length whose vector prefix is two octets rather than one, so a fixed one
+// octet prefix moves the total by one and a WriteOpaqueLP moves it by two; the empty group id is
+// the case a raw concatenation is indistinguishable from; and the indices reach past a uint8 and
+// past a uint16, so an index written narrow collides with a smaller one instead of being caught.
+func TestLeafNodeSignatureContentMatchesTheHandDerivedTbs(t *testing.T) {
+	groupIds := [][]byte{{}, []byte("group"), repeatByte(0x5a, 64)}
+	indices := []LeafIndex{0, 3, 300, 70000}
+	compared := 0
+	for _, source := range leafNodeSources(t) {
+		for _, groupId := range groupIds {
+			for _, index := range indices {
+				content, err := testLeafNodeOfSource(source).signatureContent(groupId, index)
+				if err != nil {
+					t.Fatalf("source %d: signatureContent: %v", source, err)
+				}
+				want := handDerivedLeafNodeTbs(source, groupId, index)
+				if !bytes.Equal(content, want) {
+					t.Errorf("source %d, group id %x, index %d: the preimage is\n %x\nand the hand derivation is\n %x",
+						source, groupId, index, content, want)
+				}
+				compared += 1
+			}
+		}
+	}
+	if compared != len(groupIds)*len(indices)*3 {
+		t.Fatalf("%d preimages compared, want %d", compared, len(groupIds)*len(indices)*3)
+	}
+	// and the preimage is NOT the wire form: the signature is the one field of the leaf that
+	// the structure it signs does not carry, and an implementation that signed over the
+	// encoded LeafNode would sign over its own previous signature
+	encoded, err := syntax.Marshal(testLeafNodeOfSource(LeafNodeSourceCommit))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	content, err := testLeafNodeOfSource(LeafNodeSourceCommit).signatureContent([]byte("group"), 3)
+	if err != nil {
+		t.Fatalf("signatureContent: %v", err)
+	}
+	if bytes.Contains(content, repeatByte(0x33, 64)) {
+		t.Errorf("the preimage carries the leaf's own signature, so what is signed is the encoded leaf rather than its LeafNodeTBS")
+	}
+	if bytes.Equal(content, encoded) {
+		t.Errorf("the preimage and the wire form are the same bytes")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// signing, verifying, and what the context is bound to
+// ---------------------------------------------------------------------------
+
+// TestALeafNodeSignatureVerifiesUnderEverySource is the positive control the negative sweeps
+// below rest on. A verifier that refused everything satisfies every "must not verify" property
+// in this file, and only this separates it from one that works.
+func TestALeafNodeSignatureVerifiesUnderEverySource(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	for _, source := range leafNodeSources(t) {
+		leaf := leafNodeSignedUnder(t, crypto, priv, pub, source, []byte("group"), 3)
+		if len(leaf.Signature) == 0 {
+			t.Errorf("source %d: Sign left no signature behind", source)
+			continue
+		}
+		if err := leaf.VerifySignature(crypto, []byte("group"), 3); err != nil {
+			t.Errorf("source %d: VerifySignature after Sign: %v", source, err)
+		}
+		// and signing twice over one leaf answers the same bytes, which is the property that
+		// says the signature field is not part of what is signed
+		first := bytes.Clone(leaf.Signature)
+		if err := leaf.Sign(crypto, priv, []byte("group"), 3); err != nil {
+			t.Fatalf("source %d: Sign a second time: %v", source, err)
+		}
+		if !bytes.Equal(first, leaf.Signature) {
+			t.Errorf("source %d: signing one leaf twice answered %x and then %x, so the signature is an input to itself",
+				source, first, leaf.Signature)
+		}
+	}
+}
+
+// TestALeafNodeSignatureIsBoundToItsGroupAndPositionExactlyWhereTheSourceSaysSo is the member
+// substitution property, over every source rather than over the one the plan names.
+//
+// The defect it exists for signs and verifies perfectly against this package: a LeafNodeTBS
+// built without the group id lets a leaf lifted out of one group verify in another, and one
+// built without the leaf index lets a leaf verify at whatever position of the tree it is moved
+// to. Both are a member substitution and neither changes a byte of the wire form.
+//
+// The other direction is asserted too, and it is not decoration: a key_package leaf that
+// REFUSED to verify outside the context it was signed in would be a leaf no joiner could
+// validate, since a KeyPackage is minted before there is a group or a position at all.
+//
+// The indices are swept pairwise rather than at index+1, because an index written narrower than
+// a uint32 collides with a smaller one rather than being ignored: 300 against 44 and 70000
+// against 4464 are the pairs a uint8 and a uint16 write identically.
+func TestALeafNodeSignatureIsBoundToItsGroupAndPositionExactlyWhereTheSourceSaysSo(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	groupIds := [][]byte{{}, []byte("group"), []byte("groups"), []byte("other"), repeatByte(0x5a, 64)}
+	indices := []LeafIndex{0, 3, 44, 300, 4464, 70000}
+	bound, unbound := 0, 0
+	for _, source := range leafNodeSources(t) {
+		isBound := leafNodeContextBoundSources[source]
+		for _, signedGroup := range groupIds {
+			for _, signedIndex := range indices {
+				leaf := leafNodeSignedUnder(t, crypto, priv, pub, source, signedGroup, signedIndex)
+				for _, group := range groupIds {
+					for _, index := range indices {
+						same := bytes.Equal(group, signedGroup) && index == signedIndex
+						err := leaf.VerifySignature(crypto, group, index)
+						switch {
+						case same || !isBound:
+							if err != nil {
+								t.Errorf("source %d: signed at group %x index %d, verifying at group %x index %d: %v",
+									source, signedGroup, signedIndex, group, index, err)
+							}
+						case !errors.Is(err, errBadSignature):
+							t.Errorf("source %d: signed at group %x index %d and verified at group %x index %d, err = %v, want errBadSignature",
+								source, signedGroup, signedIndex, group, index, err)
+						}
+						if isBound {
+							bound += 1
+							continue
+						}
+						unbound += 1
+					}
+				}
+			}
+		}
+	}
+	if bound == 0 || unbound == 0 {
+		t.Fatalf("the sweep made %d bound comparisons and %d unbound ones, so one of the two arms was never reached", bound, unbound)
+	}
+	t.Logf("%d context comparisons over bound sources, %d over unbound ones", bound, unbound)
+}
+
+// TestEveryLeafNodeFieldTheTbsCarriesBreaksItsSignature is the field coverage the plan's five
+// entry mutation list cannot state.
+//
+// The class is derived off the struct and the source class off the package's constants, and the
+// same variant table the encoding sweep is checked against decides which fields each source
+// carries -- so a field added to LeafNode, or a source added to the enum, is swept on the commit
+// that lands it rather than when somebody remembers to extend a list.
+//
+// Both directions, which is what makes it a statement about the PREIMAGE rather than about the
+// signature: a field the source carries must break the signature when it changes, and a field
+// the source does not carry must not. The second is what catches a preimage that wrote a variant
+// under the wrong source -- a parent hash folded into an update leaf's TBS is a leaf whose
+// signature depends on a field the wire form does not carry, so it verifies for the sender and
+// for nobody who decoded it.
+//
+// Signature is in the carried class under every source, and it breaks verification as the
+// signature rather than as content. What says it is not IN the preimage is
+// TestLeafNodeSignatureContentMatchesTheHandDerivedTbs, which reads the bytes.
+func TestEveryLeafNodeFieldTheTbsCarriesBreaksItsSignature(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	sources := leafNodeSources(t)
+	paths := leafNodeCodecFieldPaths(t)
+	if !slices.Contains(paths, "Signature") {
+		t.Fatalf("the field walk read %v and LeafNode certainly has a Signature, so the class below is read off something else", paths)
+	}
+	variant := map[string]LeafNodeSource{}
+	for _, source := range sources {
+		for _, path := range leafNodeVariantPaths[source] {
+			variant[path] = source
+		}
+	}
+	covered := map[string]bool{}
+	for _, source := range sources {
+		base := leafNodeSignedUnder(t, crypto, priv, pub, source, []byte("group"), 3)
+		for _, path := range paths {
+			carried := true
+			if owner, isVariant := variant[path]; isVariant {
+				carried = owner == source
+			}
+			edits := leafNodeEditsOf(path, leafNodeFieldAt(base, path), sources)
+			if len(edits) == 0 {
+				t.Errorf("no edit was derived for %s, so nothing below observed it", path)
+				continue
+			}
+			observed := false
+			verifiable := 0
+			for _, edit := range edits {
+				mutated := base.Clone()
+				edit.apply(leafNodeFieldAt(mutated, path))
+				err := mutated.VerifySignature(crypto, []byte("group"), 3)
+				if err != nil && !errors.Is(err, errBadSignature) {
+					// a structural refusal rather than a signature that stopped verifying:
+					// the credential type outside the profile is the one edit here that
+					// produces one, and a preimage that cannot be built is not a preimage
+					// that ignored the field
+					continue
+				}
+				verifiable += 1
+				if err != nil {
+					observed = true
+					covered[path] = true
+				}
+			}
+			if verifiable == 0 {
+				t.Errorf("source %d: every edit to %s was refused before a signature was checked, so this field was never observed", source, path)
+				continue
+			}
+			if carried && !observed {
+				t.Errorf("source %d: %d edits to %s all left the signature verifying, so the leaf is authenticated without that field",
+					source, verifiable, path)
+			}
+			if !carried && observed {
+				t.Errorf("source %d: an edit to %s broke the signature, and source %d does not carry that field, so its preimage covers something its encoding does not",
+					source, path, source)
+			}
+		}
+	}
+	for _, path := range paths {
+		if !covered[path] {
+			t.Errorf("%s broke no signature under any of the %d sources, so nothing this package signs depends on it",
+				path, len(sources))
+		}
+	}
+	t.Logf("%d field paths swept against the signature over %d sources", len(paths), len(sources))
+}
+
+// TestALeafNodeSignatureIsRefusedAtEveryFlippedBit sweeps the signature over its own length
+// rather than sampling it.
+//
+// A comparison that stopped at the first byte, at 32 bytes, or anywhere short of the whole
+// accepts a forgery whose prefix matches, and a sampled sweep tests the offsets somebody chose.
+// The length is read off the signature, so a scheme with a different signature size is swept
+// whole on the commit that lands it.
+func TestALeafNodeSignatureIsRefusedAtEveryFlippedBit(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	leaf := leafNodeSignedUnder(t, crypto, priv, pub, LeafNodeSourceCommit, []byte("group"), 3)
+	if len(leaf.Signature) == 0 {
+		t.Fatal("the signed leaf carries no signature, so this sweep runs over nothing")
+	}
+	refused := 0
+	for at := range leaf.Signature {
+		for bit := 0; bit < 8; bit += 1 {
+			flipped := leaf.Clone()
+			flipped.Signature[at] ^= 1 << bit
+			if err := flipped.VerifySignature(crypto, []byte("group"), 3); !errors.Is(err, errBadSignature) {
+				t.Errorf("byte %d bit %d flipped: err = %v, want errBadSignature", at, bit, err)
+				continue
+			}
+			refused += 1
+		}
+	}
+	if want := 8 * len(leaf.Signature); refused != want {
+		t.Fatalf("%d of the %d single bit forgeries were refused", refused, want)
+	}
+	t.Logf("%d single bit forgeries refused over a %d byte signature", refused, len(leaf.Signature))
+}
+
+// TestALeafNodeSignatureOfTheWrongLengthIsRefusedAndNeverPanics is the other half of the
+// comparison contract: a length mismatch is a refusal, never a panic and never a comparison over
+// whichever of the two is shorter.
+//
+// nil and empty are swept separately even though they encode alike, because they are different
+// values in Go and the read path produces both -- a leaf built by hand carries nil and a decoded
+// one carries an allocated slice. Every truncation and every over long length is swept rather
+// than a chosen few, derived off the real signature's own length.
+func TestALeafNodeSignatureOfTheWrongLengthIsRefusedAndNeverPanics(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	leaf := leafNodeSignedUnder(t, crypto, priv, pub, LeafNodeSourceCommit, []byte("group"), 3)
+	full := len(leaf.Signature)
+	if full == 0 {
+		t.Fatal("the signed leaf carries no signature, so this sweep runs over nothing")
+	}
+	cases := map[string][]byte{"nil": nil}
+	for n := 0; n <= 2*full; n += 1 {
+		if n == full {
+			continue
+		}
+		short := bytes.Clone(leaf.Signature)
+		for len(short) < n {
+			short = append(short, byte(len(short)))
+		}
+		cases[fmt.Sprintf("%d bytes", n)] = short[:n]
+	}
+	refused := 0
+	for name, signature := range cases {
+		wrong := leaf.Clone()
+		wrong.Signature = signature
+		err := func() (err error) {
+			defer func() {
+				if raised := recover(); raised != nil {
+					t.Errorf("a %s signature panicked with %v rather than being refused", name, raised)
+					err = errBadSignature
+				}
+			}()
+			return wrong.VerifySignature(crypto, []byte("group"), 3)
+		}()
+		if !errors.Is(err, errBadSignature) {
+			t.Errorf("a %s signature: err = %v, want errBadSignature", name, err)
+			continue
+		}
+		refused += 1
+	}
+	if refused != len(cases) {
+		t.Fatalf("%d of the %d wrong length signatures were refused", refused, len(cases))
+	}
+	t.Logf("%d wrong length signatures refused, against a real one of %d bytes", refused, full)
+}
+
+// TestALeafNodeSignatureUnderAnotherKeyIsRefused covers the third way a leaf can be
+// unauthentic: the content and the context are right and the key is not.
+//
+// Both directions are swept. A leaf signed by one key and carrying another's signature_key is
+// the substitution an attacker makes; a leaf carrying a signature_key of the wrong LENGTH is the
+// one that reaches ed25519.Verify, which panics on any length but 32, so a refusal here is also
+// the statement that the length gate in front of it is doing its job.
+func TestALeafNodeSignatureUnderAnotherKeyIsRefused(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	otherPriv, otherPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	if bytes.Equal(pub, otherPub) {
+		t.Fatal("two key pairs came back with one public key, so this test compares a key against itself")
+	}
+	for _, source := range leafNodeSources(t) {
+		// signed by the right key, verified against somebody else's public key
+		leaf := leafNodeSignedUnder(t, crypto, priv, pub, source, []byte("group"), 3)
+		leaf.SignatureKey = otherPub
+		if err := leaf.VerifySignature(crypto, []byte("group"), 3); !errors.Is(err, errBadSignature) {
+			t.Errorf("source %d: verified under another public key, err = %v, want errBadSignature", source, err)
+		}
+		// signed by somebody else, carrying the public key it claims to be
+		signedByAnother := leafNodeSignedUnder(t, crypto, otherPriv, pub, source, []byte("group"), 3)
+		if err := signedByAnother.VerifySignature(crypto, []byte("group"), 3); !errors.Is(err, errBadSignature) {
+			t.Errorf("source %d: signed by another private key, err = %v, want errBadSignature", source, err)
+		}
+		// and a signature key of a length ed25519 cannot verify against
+		for _, length := range []int{0, 1, 31, 33, 64} {
+			short := leafNodeSignedUnder(t, crypto, priv, pub, source, []byte("group"), 3)
+			short.SignatureKey = SignaturePublicKey(repeatByte(0x7e, length))
+			err := func() (err error) {
+				defer func() {
+					if raised := recover(); raised != nil {
+						t.Errorf("source %d: a %d byte signature key panicked with %v rather than being refused",
+							source, length, raised)
+						err = errBadSignature
+					}
+				}()
+				return short.VerifySignature(crypto, []byte("group"), 3)
+			}()
+			if !errors.Is(err, errBadSignature) {
+				t.Errorf("source %d: a %d byte signature key, err = %v, want errBadSignature", source, length, err)
+			}
+		}
+	}
+}
+
+// TestVerifySignatureRefusesAnUnknownSourceAsItself is the one refusal that is NOT a signature
+// failure, and it is separated on purpose: a leaf whose leaf_node_source is not one this package
+// reads has no preimage at all, so reporting it as a bad signature would send a caller looking
+// for a forgery over a structure nobody could have signed.
+func TestVerifySignatureRefusesAnUnknownSourceAsItself(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	known := leafNodeSources(t)
+	unknown := []LeafNodeSource{}
+	for candidate := 0; candidate < 256 && len(unknown) < 4; candidate += 1 {
+		if !slices.Contains(known, LeafNodeSource(candidate)) {
+			unknown = append(unknown, LeafNodeSource(candidate))
+		}
+	}
+	if len(unknown) == 0 {
+		t.Fatal("every one of the 256 source octets is a declared source, so this test has nothing to refuse")
+	}
+	for _, source := range unknown {
+		leaf := leafNodeSignedUnder(t, crypto, priv, pub, LeafNodeSourceCommit, []byte("group"), 3)
+		leaf.LeafNodeSource = source
+		if err := leaf.VerifySignature(crypto, []byte("group"), 3); !errors.Is(err, ErrTreeMalformed) {
+			t.Errorf("source %d: err = %v, want ErrTreeMalformed", source, err)
+		}
+		if err := leaf.Sign(crypto, priv, []byte("group"), 3); !errors.Is(err, ErrTreeMalformed) {
+			t.Errorf("source %d: Sign err = %v, want ErrTreeMalformed", source, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the published corpus
+// ---------------------------------------------------------------------------
+
+// leafNodeTreeValidationVector reads the two columns this file needs out of the mlswg
+// tree-validation family: the ratchet tree and the group id its leaves are bound to.
+//
+// tree_math_test.go reads the same file for its resolutions column and declares its own view of
+// it. Two views of one corpus rather than one shared struct, because the two tests want
+// different columns and a struct that carried both would make a change to either one a change to
+// both.
+type leafNodeTreeValidationVector struct {
+	CipherSuite uint16 `json:"cipher_suite"`
+	Tree        string `json:"tree"`
+	GroupId     string `json:"group_id"`
+}
+
+// publishedLeafNodes answers every leaf of one published ratchet tree, keyed by the leaf index
+// it sits at, decoded through this package's own LeafNode codec.
+//
+// The WALK is tree_math_test.go's presentation reader rather than a codec of this package,
+// which is what keeps the oracle independent of the thing it judges: only the leaf's own bytes
+// are handed to this package, and where each leaf starts and ends is decided by a reader that
+// skips every field by its length prefix.
+func publishedLeafNodes(t *testing.T, label string, tree []byte) map[LeafIndex]*LeafNode {
+	t.Helper()
+	reader := &presentationReader{body: tree}
+	total := reader.readLength()
+	if reader.failed || reader.offset+total != len(tree) {
+		t.Fatalf("%s: the ratchet tree is not one presentation-language vector", label)
+	}
+	end := reader.offset + total
+	leaves := map[LeafIndex]*LeafNode{}
+	node := 0
+	for reader.offset < end && !reader.failed {
+		if reader.readUint8() != 0 {
+			switch reader.readUint8() {
+			case 1:
+				at := reader.offset
+				reader.skipLeafNode()
+				if reader.failed {
+					break
+				}
+				if node%2 != 0 {
+					t.Fatalf("%s: node %d is a leaf at an odd node index", label, node)
+				}
+				leaf := &LeafNode{}
+				if err := syntax.Unmarshal(tree[at:reader.offset], leaf); err != nil {
+					t.Fatalf("%s: node %d: decode the published leaf: %v", label, node, err)
+				}
+				leaves[LeafIndex(node/2)] = leaf
+			case 2:
+				reader.readParentNodeUnmerged()
+			default:
+				t.Fatalf("%s: node %d is neither a leaf nor a parent", label, node)
+			}
+		}
+		node += 1
+	}
+	if reader.failed || reader.offset != end {
+		t.Fatalf("%s: the ratchet tree did not decode to a whole number of nodes", label)
+	}
+	return leaves
+}
+
+// The counts the sweep below confirms, so a walk that quietly found nothing fails here rather
+// than reporting a clean run over an empty corpus. They are measured off the vendored file and
+// are its property rather than this implementation's: a decoder that stopped early, a suite
+// filter that matched nothing and a verifier that refused everything all move one of them.
+const (
+	leafNodeKatSignatureCount  = 322
+	leafNodeKatKeyPackageLeafs = 34
+	leafNodeKatBoundLeafs      = 288
+)
+
+// TestPublishedLeafNodeSignaturesVerifyAgainstTheirGroupAndPosition is the known answer test,
+// and it is the only assertion in this file whose signatures this package did not compute.
+//
+// Everything else here signs with this implementation and verifies with it, so a LeafNodeTBS
+// this package builds wrongly and reads wrongly is invisible to all of it. These signatures were
+// made by the working group's own implementations over their own reading of section 7.2, so a
+// preimage that omitted the group id, omitted the leaf index, ordered a field differently or
+// wrote a prefix at the wrong width fails here and nowhere else in this package.
+//
+// The published trees carry both arms of the select -- leaves whose source is key_package and
+// leaves whose source is commit -- and the counts below require both, because a corpus of one
+// arm would say nothing about the conditional at all.
+//
+// The negative control runs beside it. Every case of a vendored corpus agrees with this
+// implementation, so a verifier that answered nil for everything passes the whole run; what
+// separates it is asking the same leaves the wrong question. A context bound leaf must refuse
+// its own signature at another group and at another position, and an unbound one must accept
+// both, which is the conditional stated over bytes this package did not produce.
+func TestPublishedLeafNodeSignaturesVerifyAgainstTheirGroupAndPosition(t *testing.T) {
+	entries := LoadVectorFile(t, treeValidationVectorFile)
+	if len(entries) != treeValidationEntryCount {
+		t.Fatalf("tree-validation entries: %d, want %d", len(entries), treeValidationEntryCount)
+	}
+	verified := 0
+	declined := 0
+	bySource := map[LeafNodeSource]int{}
+	substitutionsRefused := 0
+	for entry, raw := range entries {
+		vector := leafNodeTreeValidationVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("entry %d: %v", entry, err)
+		}
+		suite, implemented := implementedSuite(vector.CipherSuite)
+		if !implemented {
+			declined += 1
+			continue
+		}
+		label := fmt.Sprintf("tree-validation entry %d", entry)
+		crypto := mustProvider(t, suite)
+		tree := mustDecodeHex(t, label+" ratchet tree", vector.Tree)
+		groupId := mustDecodeHex(t, label+" group id", vector.GroupId)
+		if len(groupId) == 0 {
+			t.Fatalf("%s publishes no group id, so the binding this reads has nothing to be bound to", label)
+		}
+		leaves := publishedLeafNodes(t, label, tree)
+		if len(leaves) == 0 {
+			t.Fatalf("%s: the walk found no leaf in a published ratchet tree", label)
+		}
+		for index, leaf := range leaves {
+			if err := leaf.VerifySignature(crypto, groupId, index); err != nil {
+				t.Errorf("%s: the published leaf at index %d does not verify: %v", label, index, err)
+				continue
+			}
+			bySource[leaf.LeafNodeSource] += 1
+			verified += 1
+			// the same leaf, asked the wrong question
+			otherGroup := bytes.Clone(groupId)
+			otherGroup[0] ^= 0xff
+			atOtherGroup := leaf.VerifySignature(crypto, otherGroup, index)
+			atOtherIndex := leaf.VerifySignature(crypto, groupId, index+1)
+			if !leafNodeContextBoundSources[leaf.LeafNodeSource] {
+				if atOtherGroup != nil || atOtherIndex != nil {
+					t.Errorf("%s: the published leaf at index %d has source %d, which binds no context, and refused another group (%v) or another position (%v)",
+						label, index, leaf.LeafNodeSource, atOtherGroup, atOtherIndex)
+				}
+				continue
+			}
+			if !errors.Is(atOtherGroup, errBadSignature) {
+				t.Errorf("%s: the published leaf at index %d verified in another group, err = %v",
+					label, index, atOtherGroup)
+				continue
+			}
+			if !errors.Is(atOtherIndex, errBadSignature) {
+				t.Errorf("%s: the published leaf at index %d verified at index %d, err = %v",
+					label, index, index+1, atOtherIndex)
+				continue
+			}
+			substitutionsRefused += 1
+		}
+	}
+	if declined == len(entries) {
+		t.Fatal("every published entry was declined by the suite filter, so this ran over nothing")
+	}
+	if verified != leafNodeKatSignatureCount {
+		t.Errorf("%d published leaf signatures verified, want %d", verified, leafNodeKatSignatureCount)
+	}
+	if bySource[LeafNodeSourceKeyPackage] != leafNodeKatKeyPackageLeafs {
+		t.Errorf("%d published leaves carry the key_package source, want %d",
+			bySource[LeafNodeSourceKeyPackage], leafNodeKatKeyPackageLeafs)
+	}
+	bound := 0
+	for source, count := range bySource {
+		if leafNodeContextBoundSources[source] {
+			bound += count
+		}
+	}
+	if bound != leafNodeKatBoundLeafs {
+		t.Errorf("%d published leaves carry a context bound source, want %d", bound, leafNodeKatBoundLeafs)
+	}
+	if substitutionsRefused != bound {
+		t.Errorf("%d of the %d context bound leaves refused a substitution", substitutionsRefused, bound)
+	}
+	t.Logf("%d published leaf signatures verified over %d entries (%d declined), by source %v",
+		verified, len(entries)-declined, declined, bySource)
+}
+
+// ---------------------------------------------------------------------------
+// NewLeafNode
+// ---------------------------------------------------------------------------
+
+// leafNodeTestCapabilities is a capabilities set carrying the extension the leaf below uses, so
+// nothing here is refused for a reason that is not this task's.
+func leafNodeTestCapabilities() Capabilities {
+	return Capabilities{
+		Versions:     []ProtocolVersion{ProtocolVersionMls10},
+		CipherSuites: []CipherSuite{CipherSuiteX25519ChaCha20Sha256Ed25519},
+		Extensions:   []ExtensionType{ExtensionTypeUrmessageLeafKeys},
+		Credentials:  []CredentialType{CredentialTypeBasic},
+	}
+}
+
+// TestNewLeafNodeSignsAKeyPackageSourceLeaf is the constructor's own contract: the source, the
+// signature key, the lifetime window and a signature that verifies in any context.
+func TestNewLeafNodeSignsAKeyPackageSourceLeaf(t *testing.T) {
+	crypto, priv, pub := leafNodeTestSigner(t)
+	_, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	exts := []Extension{{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte("k")}}
+	leaf, err := NewLeafNode(crypto, priv, BasicCredential([]byte("alice")), encPub,
+		leafNodeTestCapabilities(), exts)
+	if err != nil {
+		t.Fatalf("NewLeafNode: %v", err)
+	}
+	if leaf.LeafNodeSource != LeafNodeSourceKeyPackage {
+		t.Errorf("source = %d, want key_package", leaf.LeafNodeSource)
+	}
+	// the public key it installed is the one belonging to the private key it was handed, and
+	// not a fresh pair of its own: a leaf signed by a key nobody holds verifies against itself
+	// and is refused by every later Update the member sends
+	if !bytes.Equal(leaf.SignatureKey, pub) {
+		t.Errorf("signature key = %x, want the public half %x of the signer it was handed", leaf.SignatureKey, pub)
+	}
+	now := uint64(time.Now().Unix())
+	if leaf.Lifetime.NotBefore > now || leaf.Lifetime.NotAfter <= now {
+		t.Errorf("lifetime = %+v, and the current second is %d, which it must contain", leaf.Lifetime, now)
+	}
+	if leaf.Lifetime.NotAfter <= leaf.Lifetime.NotBefore {
+		t.Errorf("lifetime = %+v, want a non empty window", leaf.Lifetime)
+	}
+	// a key_package leaf is bound to no group and no position, so any context verifies
+	for _, group := range [][]byte{nil, {}, []byte("any group"), repeatByte(0x5a, 64)} {
+		for _, index := range []LeafIndex{0, 9, 70000} {
+			if err := leaf.VerifySignature(crypto, group, index); err != nil {
+				t.Errorf("VerifySignature at group %x index %d: %v", group, index, err)
+			}
+		}
+	}
+}
+
+// TestNewLeafNodeRefusesASignerItCannotDeriveAPublicKeyFrom is the refusal that would otherwise
+// be a panic. ed25519.NewKeyFromSeed panics on any length but 32, so a constructor handed a
+// truncated or an already expanded private key would take the process down rather than answering
+// an error -- and an expanded key is exactly what a caller reaching for go's own key type holds.
+func TestNewLeafNodeRefusesASignerItCannotDeriveAPublicKeyFrom(t *testing.T) {
+	crypto, priv, _ := leafNodeTestSigner(t)
+	_, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	for _, length := range []int{0, 1, 31, 33, 64} {
+		leaf, err := func() (leaf *LeafNode, err error) {
+			defer func() {
+				if raised := recover(); raised != nil {
+					t.Errorf("a %d byte signer panicked with %v rather than being refused", length, raised)
+					err = ErrBadSignatureKey
+				}
+			}()
+			return NewLeafNode(crypto, SignaturePrivateKey(repeatByte(0x7e, length)),
+				BasicCredential([]byte("alice")), encPub, leafNodeTestCapabilities(), nil)
+		}()
+		if !errors.Is(err, ErrBadSignatureKey) {
+			t.Errorf("a %d byte signer: err = %v, want ErrBadSignatureKey", length, err)
+		}
+		if leaf != nil {
+			t.Errorf("a %d byte signer answered a leaf alongside %v", length, err)
+		}
+	}
+	// and the control: the right length is not refused, or the rows above are satisfied by a
+	// constructor that refuses everything
+	if _, err := NewLeafNode(crypto, priv, BasicCredential([]byte("alice")), encPub,
+		leafNodeTestCapabilities(), nil); err != nil {
+		t.Errorf("NewLeafNode refused a signer of the right length: %v", err)
+	}
+}
+
+// TestNewLeafNodeKeepsNothingTheCallerCanStillWriteInto is the retention property, stated over
+// the leaf rather than over one field.
+//
+// The leaf outlives the call and every one of its vectors came from the caller, who usually
+// holds a longer buffer it goes on writing into. A retained slice is a leaf that changes after
+// it was signed: the signature verified when it was made and does not afterwards, and there is
+// nothing in between to point at. Every vector reachable from the value is written through
+// after the call, which is the walk TestTheCloneWalkReachesEverySliceOfTheStructure already
+// derives off the type.
+func TestNewLeafNodeKeepsNothingTheCallerCanStillWriteInto(t *testing.T) {
+	crypto, priv, _ := leafNodeTestSigner(t)
+	_, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	identity := []byte("alice")
+	encKey := HpkePublicKey(bytes.Clone(encPub))
+	caps := leafNodeTestCapabilities()
+	exts := []Extension{{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte("k")}}
+	leaf, err := NewLeafNode(crypto, priv, Credential{CredentialType: CredentialTypeBasic, Identity: identity},
+		encKey, caps, exts)
+	if err != nil {
+		t.Fatalf("NewLeafNode: %v", err)
+	}
+	before, err := syntax.Marshal(leaf)
+	if err != nil {
+		t.Fatalf("Marshal the leaf before the caller writes: %v", err)
+	}
+	// the caller writes through every array it still holds
+	for i := range identity {
+		identity[i] ^= 0xff
+	}
+	for i := range encKey {
+		encKey[i] ^= 0xff
+	}
+	for i := range caps.Versions {
+		caps.Versions[i] += 1
+	}
+	for i := range caps.CipherSuites {
+		caps.CipherSuites[i] += 1
+	}
+	for i := range caps.Extensions {
+		caps.Extensions[i] += 1
+	}
+	for i := range caps.Credentials {
+		caps.Credentials[i] += 1
+	}
+	for i := range exts {
+		exts[i].ExtensionType += 1
+		for j := range exts[i].ExtensionData {
+			exts[i].ExtensionData[j] ^= 0xff
+		}
+	}
+	after, err := syntax.Marshal(leaf)
+	if err != nil {
+		t.Fatalf("Marshal the leaf after the caller writes: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("the leaf encoded to\n %x\nbefore the caller wrote through its own arrays and to\n %x\nafterwards",
+			before, after)
+	}
+	if err := leaf.VerifySignature(crypto, nil, 0); err != nil {
+		t.Errorf("the leaf stopped verifying after the caller wrote through its own arrays: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what the package wide provider gates need in order to call NewLeafNode
+// ---------------------------------------------------------------------------
+
+// The three structured arguments NewLeafNode takes, each built fresh on every call.
+//
+// Fresh storage is the load bearing part rather than tidiness: the perturbation rule below
+// edits a value IN PLACE, and an edit reaching a slice element through a shallow copy writes
+// into the base argument every other row of the gate is built from -- which would move the
+// answer the gate is comparing against and report a defect in whichever row ran next.
+//
+// Every field carries something and no two carry the same octets, so an edit to any one of
+// them has somewhere to move and a constructor that read one field where it meant another is
+// not answered by its neighbour.
+func leafNodeStubCredential() Credential {
+	return Credential{CredentialType: CredentialTypeBasic, Identity: ascendingBytes(0x12, 9)}
+}
+
+func leafNodeStubCapabilities() Capabilities {
+	return Capabilities{
+		Versions:     []ProtocolVersion{ProtocolVersionMls10},
+		CipherSuites: []CipherSuite{CipherSuiteX25519ChaCha20Sha256Ed25519},
+		Extensions:   []ExtensionType{ExtensionTypeUrmessageLeafKeys},
+		Proposals:    []ProposalType{},
+		Credentials:  []CredentialType{CredentialTypeBasic},
+	}
+}
+
+func leafNodeStubExtensions() []Extension {
+	return []Extension{{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: ascendingBytes(0x13, 6)}}
+}
+
+// leafNodeStubArgumentSources is the type of each of the three, with the constructor that
+// answers it, so the dispatch and the base arguments cannot name different values.
+func leafNodeStubArgumentSources() map[reflect.Type]func() any {
+	return map[reflect.Type]func() any{
+		reflect.TypeOf(Credential{}):     func() any { return leafNodeStubCredential() },
+		reflect.TypeOf(Capabilities{}):   func() any { return leafNodeStubCapabilities() },
+		reflect.TypeOf([]Extension(nil)): func() any { return leafNodeStubExtensions() },
+	}
+}
+
+// providerLeafNodeArgumentPerturbations is the stub gate's rule for those three.
+//
+// The gate's own rules reach a run of bytes, a string, an integer, a *GroupContext and a
+// provider, and a leaf's credential, capabilities and extensions are none of those: a rule
+// that is missing is fatal there rather than silent, which is what brought this here.
+//
+// The moves are DERIVED off the value with leafNodeEditsOf, the same derivation the codec
+// sweeps in this file run on, rather than written per field. A written list understates the
+// class the moment a field is added to any of the three structures, and a gate reading a stale
+// list reports exactly what a complete one reports. Every edit it derives changes the encoding
+// of the leaf, and therefore the signature NewLeafNode answers -- including the one that
+// changes the credential type, which NewLeafNode refuses outright, and a refusal is as much an
+// observation of the argument as a different signature is.
+//
+// Each perturbed value is built from a FRESH base rather than copied from the one it was
+// handed, because the edits write in place and a shallow copy shares every slice.
+func providerLeafNodeArgumentPerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) ([]providerPerturbation, bool) {
+	t.Helper()
+	fresh, handled := leafNodeStubArgumentSources()[argument.Type()]
+	if !handled {
+		return nil, false
+	}
+	// the base the gate handed in has to be what the constructor answers, or every move below
+	// is a move away from a value nothing was ever called with
+	if !reflect.DeepEqual(argument.Interface(), fresh()) {
+		t.Fatalf("the base argument for %s.%s is %v and the constructor for that type answers %v, so the perturbations move away from a value the gate did not call with",
+			operation, parameter.name, argument.Interface(), fresh())
+	}
+	moved := []providerPerturbation{}
+	for _, edit := range leafNodeEditsOf(parameter.name, argument, leafNodeSources(t)) {
+		box := reflect.New(argument.Type()).Elem()
+		box.Set(reflect.ValueOf(fresh()))
+		edit.apply(box)
+		if reflect.DeepEqual(box.Interface(), argument.Interface()) {
+			t.Fatalf("the edit %q left %s.%s equal to the base argument, so the gate would call it twice with the same value",
+				edit.name, operation, parameter.name)
+		}
+		moved = append(moved, providerPerturbation{where: edit.name, value: box})
+	}
+	if len(moved) == 0 {
+		t.Fatalf("no edit was derived for %s.%s, declared %s, so nothing moves it",
+			operation, parameter.name, parameter.typeName)
+	}
+	return moved, true
+}
+
+// TestTheLeafNodeStubArgumentsAreFreshStorageEveryCall is the control on the sentence above.
+// A constructor answering a package level value would hand every perturbation the same slices,
+// the in place edits would accumulate, and the gate reading them would compare a base argument
+// that had already been written through.
+func TestTheLeafNodeStubArgumentsAreFreshStorageEveryCall(t *testing.T) {
+	for at, fresh := range leafNodeStubArgumentSources() {
+		first := reflect.ValueOf(fresh())
+		second := reflect.ValueOf(fresh())
+		if !reflect.DeepEqual(first.Interface(), second.Interface()) {
+			t.Errorf("the constructor for %s answered %v and then %v", at, first.Interface(), second.Interface())
+			continue
+		}
+		edits := leafNodeEditsOf("value", first, leafNodeSources(t))
+		if len(edits) == 0 {
+			t.Errorf("no edit was derived for %s, so this control observed nothing", at)
+			continue
+		}
+		box := reflect.New(at).Elem()
+		box.Set(first)
+		edits[0].apply(box)
+		if reflect.DeepEqual(second.Interface(), fresh()) {
+			continue
+		}
+		t.Errorf("editing one %s answered by the constructor changed what the constructor answers next, so the two share storage", at)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what the package wide stub gate cannot hold NewLeafNode to
+// ---------------------------------------------------------------------------
+
+// leafNodeWithoutItsClock is one leaf encoded with its Lifetime replaced by a fixed window.
+//
+// The lifetime is the one field of a key_package leaf that is not a function of what
+// NewLeafNode was handed -- it is a wall clock stamp -- so two leaves built a second apart
+// differ in it and, because the lifetime is inside the LeafNodeTBS, in their signatures too.
+// Normalising it is what makes two calls comparable at all, and it is exactly why the package
+// wide stub gate excuses this constructor from every comparison it makes across calls.
+//
+// The whole leaf is encoded rather than a chosen field, so an argument that reached any part of
+// the structure is observed. The SIGNATURE is dropped with the lifetime, because it covers the
+// lifetime and would carry the clock straight back in; what holds the signature to depending on
+// each of these fields is TestEveryLeafNodeFieldTheTbsCarriesBreaksItsSignature, over the same
+// derived field class.
+func leafNodeWithoutItsClock(t *testing.T, leaf *LeafNode) string {
+	t.Helper()
+	normalised := leaf.Clone()
+	normalised.Lifetime = Lifetime{NotBefore: 1, NotAfter: 2}
+	normalised.Signature = nil
+	encoded, err := syntax.Marshal(normalised)
+	if err != nil {
+		t.Fatalf("encode a leaf with its clock normalised out: %v", err)
+	}
+	return hex.EncodeToString(encoded)
+}
+
+// TestNewLeafNodeReadsEveryArgumentItWasHanded is the half of the package wide stub gate that
+// the wall clock exemption takes away, put back over the arguments this constructor has.
+//
+// The property is the gate's: an argument that changes must change the answer, or the
+// constructor is a function of fewer things than its signature says. Two differences. The
+// answer is read with the lifetime normalised out, which is what makes the comparison stable
+// across a second boundary; and the moves are DERIVED off each argument with the same
+// leafNodeEditsOf the codec sweeps in this file use, so an argument that grows a field is swept
+// on the commit that lands it rather than when somebody remembers to extend a list.
+//
+// A refusal counts as an observation, for the reason the stub gate gives: an argument that
+// moved a call from accepted to rejected has been read just as surely as one that moved the
+// bytes.
+func TestNewLeafNodeReadsEveryArgumentItWasHanded(t *testing.T) {
+	crypto, priv, _ := leafNodeTestSigner(t)
+	_, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	// every argument in one place, so the sweep below is over the constructor's whole
+	// parameter list rather than over the ones this test thought of
+	arguments := func() []any {
+		return []any{
+			SignaturePrivateKey(bytes.Clone(priv)),
+			leafNodeStubCredential(),
+			HpkePublicKey(bytes.Clone(encPub)),
+			leafNodeStubCapabilities(),
+			leafNodeStubExtensions(),
+		}
+	}
+	names := []string{"signer", "cred", "encKey", "caps", "exts"}
+	build := func(with []any) string {
+		leaf, buildErr := NewLeafNode(crypto, with[0].(SignaturePrivateKey), with[1].(Credential),
+			with[2].(HpkePublicKey), with[3].(Capabilities), with[4].([]Extension))
+		if buildErr != nil {
+			return "refused: " + buildErr.Error()
+		}
+		return leafNodeWithoutItsClock(t, leaf)
+	}
+	base := build(arguments())
+	if strings.HasPrefix(base, "refused") {
+		t.Fatalf("NewLeafNode refused this test's own arguments (%s), so every row below compares two refusals", base)
+	}
+	// the control on the normalisation: two calls with one argument list answer the same
+	// thing, or every "it moved" below is the clock rather than the argument
+	if repeated := build(arguments()); repeated != base {
+		t.Fatalf("NewLeafNode answered\n %s\nand then\n %s\nfor one argument list with the clock normalised out",
+			base, repeated)
+	}
+	moved := 0
+	for at, name := range names {
+		box := reflect.New(reflect.TypeOf(arguments()[at])).Elem()
+		box.Set(reflect.ValueOf(arguments()[at]))
+		edits := leafNodeEditsOf(name, box, leafNodeSources(t))
+		if len(edits) == 0 {
+			t.Errorf("no edit was derived for %s, so nothing below observed it", name)
+			continue
+		}
+		for _, edit := range edits {
+			with := arguments()
+			edited := reflect.New(reflect.TypeOf(with[at])).Elem()
+			edited.Set(reflect.ValueOf(with[at]))
+			edit.apply(edited)
+			with[at] = edited.Interface()
+			if answer := build(with); answer == base {
+				t.Errorf("NewLeafNode answered the same leaf with %s, so it does not read the %s it was handed",
+					edit.name, name)
+				continue
+			}
+			moved += 1
+		}
+	}
+	if moved == 0 {
+		t.Fatal("no edit to any argument changed the leaf, so this sweep observed nothing")
+	}
+	t.Logf("%d derived edits across %d arguments each changed the leaf", moved, len(names))
+}
+
+// TestNewLeafNodeRoutesThroughTheProviderItWasHanded is the other half the exemption takes
+// away: the provider argument itself.
+//
+// A constructor that reached for ed25519 directly, or built a provider of its own out of a
+// hardcoded suite, answers a leaf that verifies against every leaf in this package and against
+// every published ratchet tree -- both registered suites and every corpus here are Ed25519,
+// which is the scheme it would have hardcoded. What separates the two is a provider that
+// answers differently, and the refusal it produces here is the observation: a provider whose
+// signing half flips the signature it answers cannot satisfy this constructor's own verify.
+func TestNewLeafNodeRoutesThroughTheProviderItWasHanded(t *testing.T) {
+	crypto, priv, _ := leafNodeTestSigner(t)
+	_, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	overTheRealProvider, err := NewLeafNode(crypto, priv, leafNodeStubCredential(), encPub,
+		leafNodeStubCapabilities(), leafNodeStubExtensions())
+	if err != nil {
+		t.Fatalf("NewLeafNode: %v", err)
+	}
+	tagging := &taggingCryptoProvider{inner: crypto}
+	overTheTaggingProvider, err := NewLeafNode(tagging, priv, leafNodeStubCredential(), encPub,
+		leafNodeStubCapabilities(), leafNodeStubExtensions())
+	if err == nil {
+		t.Fatalf("NewLeafNode answered a leaf whose signature is %x over a provider that flips every signature it answers, and one whose signature is %x over the real one; it called %v",
+			overTheTaggingProvider.Signature, overTheRealProvider.Signature, tagging.calls)
+	}
+	if overTheTaggingProvider != nil {
+		t.Errorf("NewLeafNode answered a leaf alongside %v", err)
+	}
+	if !errors.Is(err, errBadSignature) {
+		t.Errorf("NewLeafNode over a provider that flips every signature answered %v, want the refusal its own verify makes", err)
+	}
+	// and the call really did go through the provider rather than past it
+	if len(tagging.calls) == 0 {
+		t.Error("NewLeafNode reached the provider it was handed not at all")
+	}
 }

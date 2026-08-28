@@ -4273,6 +4273,21 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{interim}
 		}},
+		// the key_package leaf constructor. It reads no length off the provider at all --
+		// what it takes from one is a signature and a verification -- so what this row
+		// states is the other half of the equivalence: the constructor must WORK over a
+		// provider whose KDF.Nh is not 32, and a body that had cut anything to a written
+		// down 32 would refuse there. The signature is the answer read, and at 64 octets it
+		// is neither provider's Nh, so it reports no coincidence belonging to a length this
+		// gate chose.
+		{name: "NewLeafNode", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			leaf, leafErr := NewLeafNode(crypto, SignaturePrivateKey(bytes.Repeat([]byte{0x5c}, 32)),
+				BasicCredential([]byte("alice")), pub, leafNodeStubCapabilities(), nil)
+			if leafErr != nil {
+				t.Fatalf("NewLeafNode over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), leafErr)
+			}
+			return [][]byte{leaf.Signature}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })

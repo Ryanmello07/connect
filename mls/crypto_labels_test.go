@@ -577,6 +577,15 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// two are reachable, and a helper would move the decision rather than remove it.
 		"key_schedule.go: syntax.Marshal(groupContext)",
 		"key_schedule.go: syntax.Marshal(groupContext)",
+		// the LeafNodeTBS preimage of section 7.2. It opens its own Writer rather than
+		// going through marshalBytes for the reason signatureContent writes down -- the
+		// placeholder gate cannot see a parameter that is read only inside a closure, and
+		// the group id and the leaf index are exactly the two parameters whose being read
+		// is the security property. Same default limit and the same argument for it: a
+		// LeafNodeTBS is one leaf and never a ratchet tree, and a signature taken over a
+		// preimage allowed past MaxVectorLength is one no peer running the default limit
+		// could verify.
+		"leaf_node.go: syntax.NewWriter()",
 		// ValSem403's duplicate test, which decides identity over the serialized
 		// PreSharedKeyID rather than over a field list. The default limit and not the
 		// ratchet tree one: a PreSharedKeyID is an MLS structure whose every field is
@@ -1489,6 +1498,26 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("SenderDataKeyNonce: %v", senderErr)
 			}
 			return slices.Concat(key, nonce)
+		}},
+		// the key_package leaf constructor. It reaches the provider twice, to sign the
+		// LeafNodeTBS and to verify what it just signed, and neither is visible in the
+		// answer: a leaf signed with a provider of its own carries a signature that verifies
+		// against every leaf in this package and against every published ratchet tree,
+		// because both registered suites and every corpus here are Ed25519 -- the scheme it
+		// would have hardcoded.
+		//
+		// A REFUSAL is the answer over the tagging provider, and that is the observation
+		// rather than a way around one: a provider whose signing half flips the signature it
+		// answers cannot satisfy this constructor's own verify, so a constructor that routed
+		// through the provider it was handed refuses here and one that computed the
+		// signature itself hands back the same bytes it handed back over the real provider.
+		{name: "NewLeafNode", call: func(crypto CryptoProvider) []byte {
+			leaf, leafErr := NewLeafNode(crypto, SignaturePrivateKey(bytes.Repeat([]byte{0x5b}, 32)),
+				BasicCredential([]byte("alice")), pub, leafNodeStubCapabilities(), nil)
+			if leafErr != nil {
+				return []byte("refused: " + leafErr.Error())
+			}
+			return leaf.Signature
 		}},
 	} {
 		covered = append(covered, testCase.name)
@@ -3561,6 +3590,11 @@ func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, 
 var labelPackageFunctions = []string{
 	"DecryptWithLabel", "EncryptWithLabel", "MakeKeyPackageRef", "MakeProposalRef", "RefHash",
 	"mlsEncryptContext", "mlsKdfLabel", "mlsLabelBytes", "mlsSignContent",
+	// the public half of a signature key pair this package was handed. It is a derivation
+	// rather than a labelled construction, and it lives in this file because doc.go names
+	// four files as the whole cryptographic surface and ed25519.NewKeyFromSeed is a
+	// cryptographic operation wherever it is written.
+	"signaturePublicKeyOf",
 }
 
 // The labelled encryption is its own EncryptContext and nothing else.

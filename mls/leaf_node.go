@@ -9,7 +9,12 @@
 // this code.
 package mls
 
-import "github.com/urnetwork/connect/mls/syntax"
+import (
+	"fmt"
+	"time"
+
+	"github.com/urnetwork/connect/mls/syntax"
+)
 
 // LeafNodeSource is RFC 9420 section 7.2: which of the three ways this leaf entered the tree,
 // and therefore which variant fields are present and what the signature covers.
@@ -241,4 +246,215 @@ func (self *LeafNode) Clone() *LeafNode {
 		out.Extensions[i].ExtensionData = cloneBytes(self.Extensions[i].ExtensionData)
 	}
 	return &out
+}
+
+// The RFC 9420 section 7.2 signature label, written once because a label spelled one way in
+// the signing half and another in the verifying half agrees with itself perfectly: ed25519
+// signs whatever preimage it is handed, and only a peer can tell "LeafNodeTBS" from
+// "LeafNodeTbs". The label is what keeps a leaf signature from being a valid signature over
+// some other structure the same key signed.
+const leafNodeSignatureLabel = "LeafNodeTBS"
+
+// errBadSignature is ErrBadSignature in the validation plan's catalogue, where it is ValSem010,
+// and that plan owns the single declaration site for the exported name. It has not landed in
+// this package yet, so the refusal is carried by this unexported value until it does -- the
+// shape credential.go's errProfileCredentialType and extension.go's
+// errMissingRequiredCapability already take, and the stand in gate fails on the commit that
+// lands the exported twin beside it.
+//
+// It WRAPS ErrCryptoBadSignature, which is the pairing crypto_errors.go's own header already
+// describes for the exported name: the crypto layer says the primitive refused, this layer says
+// the leaf is not authentic, and a caller may ask either question rather than having to guess
+// which of two sentinels for one condition it will be handed. Standing the wrap up now rather
+// than when errors.go lands means no errors.Is answer this package gives changes under that
+// commit.
+var errBadSignature = fmt.Errorf("mls: leaf node signature does not verify: %w", ErrCryptoBadSignature)
+
+// signatureContent is RFC 9420 section 7.2's LeafNodeTBS: the leaf's fields down to and
+// including extensions, followed -- for the update and commit sources ONLY -- by the group id
+// and the leaf index.
+//
+// That trailing select is the whole security value of this preimage, and it is the part an
+// implementation can drop while agreeing with itself perfectly. A leaf signed without its group
+// id verifies in whatever group it is pasted into. A leaf signed without its leaf index
+// verifies at whatever position of the tree it is moved to. Both are member substitutions,
+// both sign and verify against this package, and neither is visible to a round trip, to a
+// golden taken off this encoder, or to any sign then verify test. What sees them is a corpus
+// another implementation signed and the two binding tests beside it.
+//
+// The key_package arm carries NEITHER, and that is the section 7.2 structure rather than a
+// shortcut: the select's key_package case is an empty struct, because a KeyPackage is minted
+// before there is a group to bind it to or a position to put it in. Section 7.2's prose says
+// only that "the group ID of the group is added as context"; the STRUCTURE adds the leaf index
+// as well, and the prose is the half an implementation must not be written from. Section 7.3,
+// which is where the leaf validation rules live, restates none of it -- it says only that the
+// signature is verified using signature_key -- so the conditional binding is section 7.2's
+// alone. groupId and leafIndex are therefore IGNORED under key_package rather than refused: a
+// caller holding a group cannot tell from the leaf alone which arm applies, and refusing would
+// push that switch into every call site.
+//
+// LeafNodeTBS is a preimage and never a message, so it does not go through syntax.Marshal:
+// nothing decodes these bytes, and the trailing byte contract Marshal carries belongs to a
+// wire type.
+//
+// It opens the Writer itself rather than handing an encoder to marshalBytes, and that is not a
+// style choice. TestNoStubShapesRemainInSource reads a declaration's own body for the
+// parameters it uses and deliberately does not descend into a function literal, so a preimage
+// whose group id and leaf index were touched only inside a closure reads there exactly like one
+// that ignored them -- and ignoring them IS the substitution this suffix exists to prevent.
+// What is given up is a name: marshalBytes is a fresh Writer, the caller's encoder and Bytes,
+// which is these three statements with the section 7.2 select written between them, under the
+// same default vector limit for the same reason -- a LeafNodeTBS is one leaf and never a
+// ratchet tree.
+func (self *LeafNode) signatureContent(groupId []byte, leafIndex LeafIndex) ([]byte, error) {
+	w := syntax.NewWriter()
+	// the same call MarshalMLS makes, and that shared call is what stops the two from coming
+	// apart: a field written in the wire form and not in the preimage is a signature over a
+	// structure nobody sent, and it is invisible to both halves of a round trip
+	if err := self.marshalCore(w); err != nil {
+		return nil, err
+	}
+	switch self.LeafNodeSource {
+	case LeafNodeSourceKeyPackage:
+		// the empty struct arm of the section 7.2 select
+	case LeafNodeSourceUpdate, LeafNodeSourceCommit:
+		w.WriteOpaque(groupId)
+		w.WriteUint32(uint32(leafIndex))
+	default:
+		// unreachable while marshalCore refuses an unknown source first, and written anyway
+		// rather than left to fall through. A fall through would make an unrecognised source
+		// the third spelling of "no context bound", which is exactly the key_package arm --
+		// so a fourth source added later would inherit the unbound preimage in silence
+		// instead of failing here.
+		return nil, ErrTreeMalformed
+	}
+	// the Writer's sticky error, surfaced here the way marshalBytes surfaces it: a preimage
+	// that came back short is a signature over bytes nobody agreed to
+	return w.Bytes()
+}
+
+// Sign replaces this leaf's signature with one over its LeafNodeTBS.
+//
+// The signature field itself is NOT part of what is signed -- marshalCore stops above it --
+// so signing twice over one leaf answers the same bytes, and a stale signature left on the
+// receiver cannot feed into the new one.
+//
+// groupId and leafIndex are the context the update and commit sources bind and the key_package
+// source ignores; see signatureContent.
+func (self *LeafNode) Sign(crypto CryptoProvider, signer SignaturePrivateKey,
+	groupId []byte, leafIndex LeafIndex) error {
+	if crypto == nil {
+		return fmt.Errorf("%w: the signature over the LeafNodeTBS is made through it", ErrNilCryptoProvider)
+	}
+	content, err := self.signatureContent(groupId, leafIndex)
+	if err != nil {
+		return err
+	}
+	signature, err := crypto.SignWithLabel(signer, leafNodeSignatureLabel, content)
+	if err != nil {
+		return err
+	}
+	self.Signature = signature
+	return nil
+}
+
+// VerifySignature answers nil only if this leaf's signature is a signature by this leaf's own
+// signature_key over this leaf's LeafNodeTBS in the context it was handed.
+//
+// Every way the primitive can say no becomes errBadSignature, and the detail is dropped on
+// purpose: a wrong length key, a wrong length signature and a signature over other content all
+// arrived from the network, and which of them it was is not something a peer gets to learn from
+// the error. The refusal is never a nil error and never a partial comparison -- a length
+// mismatch is refused inside VerifyWithLabel before anything is compared, which is why nil,
+// empty, truncated and over long signatures all reach this line as a refusal rather than as a
+// panic.
+//
+// A failure to BUILD the preimage is returned as itself rather than as a signature failure. An
+// unknown leaf_node_source or a credential outside the profile is a structural refusal no
+// signature could have repaired, and collapsing it into errBadSignature would send a caller
+// looking for a forgery over a leaf that is simply not one this package reads.
+func (self *LeafNode) VerifySignature(crypto CryptoProvider,
+	groupId []byte, leafIndex LeafIndex) error {
+	if crypto == nil {
+		return fmt.Errorf("%w: the signature over the LeafNodeTBS is checked through it", ErrNilCryptoProvider)
+	}
+	content, err := self.signatureContent(groupId, leafIndex)
+	if err != nil {
+		return err
+	}
+	if err := crypto.VerifyWithLabel(self.SignatureKey, leafNodeSignatureLabel,
+		content, self.Signature); err != nil {
+		return errBadSignature
+	}
+	return nil
+}
+
+// Spec A section 3.1: a fresh KeyPackage leaf is valid from now, back dated by the clock skew
+// allowance, for the default lifetime.
+const (
+	leafLifetimeSkewSeconds    uint64 = 3600
+	leafLifetimeDefaultSeconds uint64 = 90 * 24 * 3600
+)
+
+// NewLeafNode builds and signs the key_package source leaf -- the only source a leaf can carry
+// before it is in a tree -- which is signed with no group id and no leaf index, and is why this
+// takes neither.
+//
+// The signature key is DERIVED from the private key it was handed and never generated here.
+// Calling SignatureKeyPair inside a constructor that was already given a key pair is how a leaf
+// ends up signed by a key nobody holds: the leaf verifies against itself, the caller stores the
+// private half it passed in, and every later Update by that member is refused by the group with
+// nothing to point at.
+//
+// Every vector the caller supplied is COPIED before the leaf keeps it. This is the property
+// BasicCredential already states for the identity, and it applies to the encryption key, to the
+// five capability vectors and to every extension body for the same reason: the leaf outlives
+// the call and the caller usually holds a longer buffer it goes on writing into, so a retained
+// slice is a leaf that changes after it was signed -- a signature that verified when it was
+// made and does not afterwards, with nothing in between to point at. Clone does the copying
+// rather than a field list written here, so a field added to LeafNode is copied on the commit
+// that adds it.
+func NewLeafNode(crypto CryptoProvider, signer SignaturePrivateKey, cred Credential,
+	encKey HpkePublicKey, caps Capabilities, exts []Extension) (*LeafNode, error) {
+	// the provider is refused before any argument is judged, which is the only order that
+	// does not dereference it: a length check that reached the provider for a width first
+	// would take the caller's process rather than its call
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the leaf is signed and verified through it", ErrNilCryptoProvider)
+	}
+	signatureKey, err := signaturePublicKeyOf(signer)
+	if err != nil {
+		return nil, err
+	}
+	// the clock is read as a SIGNED unix second and clamped before it is widened.
+	// time.Now().Unix() is negative on a machine whose clock is not set, and uint64 of a
+	// negative second is about 1.8e19 -- a not_before no peer is ever past, carried by a leaf
+	// that is otherwise perfectly well formed and correctly signed. Clamping answers a
+	// lifetime that is merely wrong, which the receiver's section 7.3 lifetime check refuses.
+	now := max(time.Now().Unix(), 0)
+	leaf := &LeafNode{
+		EncryptionKey:  encKey,
+		SignatureKey:   signatureKey,
+		Credential:     cred,
+		Capabilities:   caps,
+		LeafNodeSource: LeafNodeSourceKeyPackage,
+		Lifetime: Lifetime{
+			NotBefore: uint64(max(now-int64(leafLifetimeSkewSeconds), 0)),
+			NotAfter:  uint64(now) + leafLifetimeDefaultSeconds,
+		},
+		Extensions: exts,
+	}
+	// everything above is still the caller's storage; from here it is the leaf's own
+	leaf = leaf.Clone()
+	if err := leaf.Sign(crypto, signer, nil, 0); err != nil {
+		return nil, err
+	}
+	// one ed25519 verify per key package, which buys a failure HERE rather than a leaf every
+	// peer refuses later: a provider whose signing half and verifying half disagree, or a
+	// preimage that cannot be rebuilt from what was just written, is a leaf nobody can use and
+	// there is nothing in the returned value that would say so.
+	if err := leaf.VerifySignature(crypto, nil, 0); err != nil {
+		return nil, err
+	}
+	return leaf, nil
 }

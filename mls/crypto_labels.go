@@ -267,6 +267,41 @@ func (self *suiteCryptoProvider) SignatureKeyPair() (SignaturePrivateKey, Signat
 	return SignaturePrivateKey(seed), SignaturePublicKey(bytes.Clone(expanded[ed25519.SeedSize:])), nil
 }
 
+// The public half of a signature key pair this package was HANDED rather than one it drew.
+//
+// It lives here, in one of the four files doc.go names as the whole cryptographic surface,
+// and not beside its caller. ed25519.NewKeyFromSeed is a cryptographic operation whatever
+// file it is written in, and the sentence doc.go makes -- that an audit reads four files
+// and a test substitutes a deterministic provider for all of it at once -- stops being true
+// the moment a fifth file expands a private key. The plan for p5 task 6 writes this
+// function into leaf_node.go; that placement is the only part of it not followed.
+//
+// It is not a CryptoProvider method, and that is the other half of the placement. The
+// interface is pinned by a gate that reads it off the type, every stub and wrapper in the
+// test tree writes out every method by hand, and a plan that has not landed yet compiles
+// against the set as it stands. A package level derivation reaches the same primitive
+// without moving that surface.
+//
+// The length is checked against ed25519.SeedSize rather than against a suite's NsigPriv,
+// because there is no suite here to read: the caller holds a CryptoProvider and this is not
+// one of its methods. That is the weaker of the two statements and it is written down
+// rather than glossed -- what makes it sufficient is
+// TestEverySuiteNamesTheSignatureSchemeTheProviderComputes holding every registered suite to
+// ed25519 and to 32 and 32. The check itself is load bearing whichever constant it reads:
+// ed25519.NewKeyFromSeed PANICS on any other length, and a constructor handed a truncated
+// key would take the process down rather than refusing.
+//
+// The public half is COPIED out of the expanded key rather than sliced from it, for the
+// reason SignatureKeyPair gives: a window onto the expanded key keeps the secret seed --
+// its first 32 octets -- reachable from something the caller was told is a public key.
+func signaturePublicKeyOf(priv SignaturePrivateKey) (SignaturePublicKey, error) {
+	if len(priv) != ed25519.SeedSize {
+		return nil, ErrBadSignatureKey
+	}
+	expanded := ed25519.NewKeyFromSeed(priv)
+	return SignaturePublicKey(bytes.Clone(expanded[ed25519.SeedSize:])), nil
+}
+
 // struct { opaque label<V>; opaque context<V> } EncryptContext, serialized, with the
 // "MLS 1.0 " prefix on the label.
 //

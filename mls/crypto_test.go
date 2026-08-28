@@ -3189,6 +3189,42 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			credential := BasicCredential(take([]byte("the identity a basic credential carries")))
 			return [][]byte{credential.Identity}
 		}},
+		// the public half of a signature key pair this package was handed. The seed is the
+		// caller's secret and is read again -- it is what the caller goes on signing with --
+		// and the answer must not be a window onto the expanded key, whose first 32 octets
+		// ARE that seed: a caller holding what it was told is a public key would be holding
+		// the private one as well.
+		{name: "signaturePublicKeyOf", call: func(take func([]byte) []byte) [][]byte {
+			signaturePub, keyErr := signaturePublicKeyOf(SignaturePrivateKey(take(bytes.Repeat([]byte{0x53}, 32))))
+			if keyErr != nil {
+				t.Fatalf("signaturePublicKeyOf: %v", keyErr)
+			}
+			return [][]byte{signaturePub}
+		}},
+		// the key_package leaf constructor. Every vector it is handed ends up INSIDE the
+		// value it answers and is covered by that value's signature, so a leaf that aliased
+		// any of them changes after it was signed the next time its caller writes into its
+		// own buffer -- a signature that verified when it was made and does not afterwards,
+		// with nothing in between to point at.
+		//
+		// The signature is deliberately not among the results. It covers a Lifetime stamped
+		// off the wall clock, so two calls a second apart answer different signatures and the
+		// determinism half of this gate would report a defect that is not there a few times
+		// in a hundred runs. What is read instead is every array the constructor was handed
+		// and kept, which is the aliasing property this gate exists for;
+		// TestNewLeafNodeReadsEveryArgumentItWasHanded is what holds the leaf to depending on
+		// all of them.
+		{name: "NewLeafNode", call: func(take func([]byte) []byte) [][]byte {
+			leaf, leafErr := NewLeafNode(crypto, SignaturePrivateKey(take(bytes.Repeat([]byte{0x54}, 32))),
+				Credential{CredentialType: CredentialTypeBasic, Identity: take([]byte("alice"))},
+				HpkePublicKey(take(pub)), leafNodeStubCapabilities(),
+				[]Extension{{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: take([]byte("k"))}})
+			if leafErr != nil {
+				t.Fatalf("NewLeafNode: %v", leafErr)
+			}
+			return [][]byte{leaf.EncryptionKey, leaf.SignatureKey, leaf.Credential.Identity,
+				leaf.Extensions[0].ExtensionData}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3592,6 +3628,7 @@ var providerConstructionValues = map[string]any{
 	"InterimTranscriptHash":         InterimTranscriptHash,
 	"NewSecretTree":                 NewSecretTree,
 	"SenderDataKeyNonce":            SenderDataKeyNonce,
+	"NewLeafNode":                   NewLeafNode,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3877,6 +3914,12 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		// every byte of three ciphertext lengths in both directions.
 		"SenderDataKeyNonce.senderDataSecret": ascendingBytes(0xdd, params.Nh),
 		"SenderDataKeyNonce.ciphertext":       ascendingBytes(0xee, params.Nh),
+		// the leaf constructor's three structured arguments, answered by the constructors
+		// the perturbation rule for them is built out of, so the base value and the values
+		// it is moved away from cannot be written twice and drift.
+		"cred": leafNodeStubCredential(),
+		"caps": leafNodeStubCapabilities(),
+		"exts": leafNodeStubExtensions(),
 	}
 	// the keys and the answers the receiving operations are handed, computed over a
 	// provider of this gate's own so that the operation under test still draws from a
@@ -3984,6 +4027,13 @@ func perturbedPositions(length int) []int {
 func providerPerturbations(t *testing.T, operation string, parameter providerParameter, argument reflect.Value) []providerPerturbation {
 	t.Helper()
 	moved := []providerPerturbation{}
+	// the leaf constructor's credential, capabilities and extensions. Two of the three are
+	// structures and the third is a slice of them, so none of the rules below reaches into
+	// any of them; the rule lives beside the structures it moves, in leaf_node_test.go, and
+	// derives its moves off the value rather than off a field list.
+	if perturbations, handled := providerLeafNodeArgumentPerturbations(t, operation, parameter, argument); handled {
+		return perturbations
+	}
 	switch argument.Kind() {
 	case reflect.Slice:
 		// the psk list is a slice of structs rather than of bytes, so the byte rule below
@@ -4370,6 +4420,33 @@ var providerRegistryAnswers = map[string]func(params *SuiteParams) any{
 // an exemption stops outliving the design it was written for.
 var providerConstructionsWithUndefinedResults = map[string][]string{
 	"NewKeyScheduleFromEpochSecret": {"result 0 field 1 is empty", "result 0 field 2 is empty"},
+	// the key_package leaf's parent hash. RFC 9420 section 7.2 makes parent_hash the COMMIT
+	// arm of the leaf's variant, so a leaf built by NewLeafNode carries none and cannot: a
+	// key package is minted before there is a tree to hash a path through. Empty is the
+	// correct answer here rather than a stub, and it stops being correct the moment this
+	// constructor starts producing some other source, at which point the entry fails.
+	"NewLeafNode": {"result 0 field 3 is empty"},
+}
+
+// A construction whose answer is not a function of its arguments alone, named with the reason
+// and with what holds it instead.
+//
+// Every comparison the stub gate makes -- the repeat control, the second stream, and each
+// perturbation -- reads one call's answer against another's, and all of them rest on two calls
+// with the same arguments answering the same bytes. A construction that stamps a wall clock
+// reading into what it signs breaks that, and breaks it INTERMITTENTLY: two calls agree
+// whenever they fall inside one second and disagree when they straddle one. Measured on the
+// shape rather than supposed -- NewLeafNode is called some thirty times per suite here, each
+// call an ed25519 derive, sign and verify, so the span the comparisons cover is milliseconds
+// and a second boundary lands in it a few times in a hundred runs. A gate that reports a
+// defect that is not there a few times in a hundred is worse than an exempted one: it is the
+// one failure mode that teaches a reader to re-run instead of to look.
+//
+// The exemption is narrow. Everything above the comparisons still runs for a name here -- the
+// call itself, its refusals, and the zero value reading that is what "no stub shapes remain"
+// actually means -- and what is skipped is held elsewhere, named per entry.
+var providerConstructionsAnsweringOffTheWallClock = map[string]string{
+	"NewLeafNode": "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
 }
 
 // Every operation on both surfaces is covered, with nothing skipped and nothing excused.
@@ -4488,6 +4565,11 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 			}
 			if len(zero) != 0 && !answersARegistryValue {
 				t.Errorf("%s answered %s, which is what a stub answers", where, strings.Join(zero, ", "))
+			}
+			if reason, offTheClock := providerConstructionsAnsweringOffTheWallClock[operation.name]; offTheClock {
+				t.Logf("%s: no answer of this row is compared against another call's, because it %s", where, reason)
+				probed = append(probed, operation.name)
+				continue
 			}
 			answer := providerStubAnswer(results)
 			// the control: nothing about this row means anything if the same call twice
@@ -4617,6 +4699,14 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 			// when its row has run, and one that stopped at a refusal above is reported
 			// as unreached rather than as probed
 			probed = append(probed, operation.name)
+		}
+		// and the wall clock exemption names operations this surface really has, so an entry
+		// cannot outlive the construction it excuses
+		for name := range providerConstructionsAnsweringOffTheWallClock {
+			if !slices.Contains(probed, name) {
+				t.Errorf("the gate excuses %s from every comparison across calls, and no operation of this surface is called %s",
+					name, name)
+			}
 		}
 		assertCoversEveryProviderOperation(t, "TestProviderHasNoRemainingStubs", probed)
 		slices.Sort(drawing)
@@ -5998,6 +6088,12 @@ var cryptoImportPaths = []string{
 	`"slices"`,
 	`"strconv"`,
 	`"sync"`,
+	// leaf_node.go's clock. NewLeafNode has to stamp a Lifetime, which is a wall clock
+	// reading and cannot come from anywhere else, and RFC 9420 section 7.2 fixes it as
+	// seconds since the unix epoch. time.Now().Unix() is the whole of what is reached: no
+	// timer, no location database, nothing that consults the environment, and nothing
+	// platform specific -- which is the property this list exists to keep true.
+	`"time"`,
 }
 
 // The crypto is built from the packages above and no others.

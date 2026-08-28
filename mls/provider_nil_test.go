@@ -55,6 +55,17 @@ func providerNilMethodRows() []providerNilMethodRow {
 			hashes := InitialTranscriptHashes()
 			return hashes.SetFromGroupInfo(nil, nil, nil)
 		}},
+		// the leaf's two signature methods, on a zero valued receiver. The zero LeafNode
+		// carries source 0, which is not a source this package reads, so a body that built
+		// its preimage before it looked at the provider would answer ErrTreeMalformed here
+		// -- a refusal for a reason the caller did not cause, over a provider it never
+		// passed. The provider comes first in both, and this is what says so.
+		{name: "(*LeafNode).Sign", call: func() error {
+			return (&LeafNode{}).Sign(nil, nil, nil, 0)
+		}},
+		{name: "(*LeafNode).VerifySignature", call: func() error {
+			return (&LeafNode{}).VerifySignature(nil, nil, 0)
+		}},
 	}
 }
 

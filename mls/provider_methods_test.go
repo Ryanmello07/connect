@@ -136,6 +136,53 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				{name: "Interim", content: joiner.Interim},
 			}, nil
 		}},
+		// the leaf's signing half. What it leaves behind is the signature, which is a
+		// signature over the LeafNodeTBS taken through the provider it was handed -- a body
+		// that reached for ed25519 itself would answer a signature that verifies against
+		// every leaf in this package and against every published tree, because the corpora
+		// are all Ed25519, which is the scheme it would have hardcoded.
+		//
+		// The private key is a fixed 32 octets rather than one drawn through the provider,
+		// so this row does not consume a stream some other row is positioned in, and the
+		// group id is taken through the recorder because it is the caller's.
+		{name: "(*LeafNode).Sign", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			leaf := testLeafNodeOfSource(LeafNodeSourceCommit)
+			err := leaf.Sign(crypto, SignaturePrivateKey(take(bytes.Repeat([]byte{0x51}, 32))),
+				take([]byte("the group this leaf sits in")), 3)
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{{name: "Signature", content: leaf.Signature}}, nil
+		}},
+		// the leaf's verifying half, whose whole answer is a yes or a no. The tagging
+		// provider passes VerifyWithLabel through unchanged -- there is nothing in a refusal
+		// for a flip to change -- so a row reading a value the verifier left behind could
+		// not be separated from a constant, and this row reads the VERDICT instead.
+		//
+		// The leaf is signed through the same provider it is then verified against, which is
+		// what makes the verdict move: over a provider whose signing half flips its answer, a
+		// verifier that routed through that provider refuses, and one that reached for
+		// ed25519 on its own accepts exactly as it did over the real provider. The receiver
+		// carries the signer's own public key, so nothing here fails for a reason that is not
+		// the routing.
+		{name: "(*LeafNode).VerifySignature", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			signer := SignaturePrivateKey(bytes.Repeat([]byte{0x52}, 32))
+			signaturePub, err := signaturePublicKeyOf(signer)
+			if err != nil {
+				return nil, err
+			}
+			leaf := testLeafNodeOfSource(LeafNodeSourceCommit)
+			leaf.SignatureKey = signaturePub
+			groupId := take([]byte("the group this leaf sits in"))
+			if err := leaf.Sign(crypto, signer, groupId, 3); err != nil {
+				return nil, err
+			}
+			verdict := []byte("the leaf verifies")
+			if refused := leaf.VerifySignature(crypto, groupId, 3); refused != nil {
+				verdict = []byte("the leaf is refused: " + refused.Error())
+			}
+			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
+		}},
 	}
 }
 
