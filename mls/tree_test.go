@@ -21,7 +21,13 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -459,112 +465,349 @@ func TestNodeTypeHasNoZeroValuedMember(t *testing.T) {
 	}
 }
 
-// TestBlankPositionsAreExactlyTheUnsetOnesAtEveryWidth sweeps every node index of every width
-// and requires blankness to agree, at every accessor, with the set of positions that were
-// actually filled.
+// ---------------------------------------------------------------------------
+// the trees every structural sweep judges
+// ---------------------------------------------------------------------------
+
+// treeCase is one tree a caller can be holding, together with the exact set of node indices
+// occupied in it. build answers a FRESH tree per use, so a sweep that blanks or installs cannot
+// reach the next assertion through a tree it shared.
+type treeCase struct {
+	name      string
+	leafWidth uint32
+	nodeWidth uint32
+	occupied  map[NodeIndex]bool
+	build     func(t *testing.T) *RatchetTree
+}
+
+// treeWithOccupancy answers the tree of this leaf width whose occupied positions are exactly the
+// ones the predicate accepts.
 //
-// Derived from the width rather than from a handful of named indices, because the defect this
-// is about -- a blank materialised into an occupied position holding a zero valued node -- can
-// hide at any index a test does not visit, and a tree that round trips against itself will not
-// report it anywhere else.
-func TestBlankPositionsAreExactlyTheUnsetOnesAtEveryWidth(t *testing.T) {
-	blankLeaves, blankParents, occupiedParents := 0, 0, 0
-	for _, leafCount := range []uint32{1, 2, 3, 5, 8} {
-		tree, occupied := treeUnderTest(t, leafCount)
-		if uint32(len(occupied)) == 0 {
-			t.Fatalf("%d leaves: nothing was filled, so this sweep judged an empty tree", leafCount)
+// The width is reached by installing the rightmost leaf and blanking it again, because the
+// container grows only through SetLeaf and RFC 9420 section 7.7 grows it by doubling. That is
+// the only route a caller has to a wide tree whose leftmost positions are blank -- which is what
+// a group whose first members left is -- and reaching in past the accessors to build one would
+// put this helper's own idea of a blank into the trees the sweeps then judge.
+func treeWithOccupancy(t *testing.T, leafWidth uint32, isOccupied func(NodeIndex) bool) *RatchetTree {
+	t.Helper()
+	tree := NewRatchetTree()
+	rightmost := LeafIndex(leafWidth - 1)
+	if err := tree.SetLeaf(rightmost, testTreeLeaf(leafWidth-1)); err != nil {
+		t.Fatalf("SetLeaf(%d) growing to %d leaves: %v", rightmost, leafWidth, err)
+	}
+	if err := tree.Blank(rightmost.NodeIndex()); err != nil {
+		t.Fatalf("Blank(%d): %v", rightmost.NodeIndex(), err)
+	}
+	if tree.LeafWidth() != LeafCount(leafWidth) {
+		t.Fatalf("growing to %d leaves produced a %d leaf tree", leafWidth, tree.LeafWidth())
+	}
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		index := NodeIndex(x)
+		if !isOccupied(index) {
+			continue
 		}
-		for x := uint32(0); x < tree.NodeWidth(); x += 1 {
-			index := NodeIndex(x)
-			wantBlank := !occupied[index]
-			if tree.IsBlank(index) != wantBlank {
-				t.Errorf("%d leaves: IsBlank(%d) = %v, want %v", leafCount, x, tree.IsBlank(index), wantBlank)
+		if index.IsLeaf() {
+			leafIndex, err := index.LeafIndex()
+			if err != nil {
+				t.Fatalf("LeafIndex(%d): %v", x, err)
 			}
-			if (tree.Get(index) == nil) != wantBlank {
-				t.Errorf("%d leaves: Get(%d) == nil is %v, want %v", leafCount, x, tree.Get(index) == nil, wantBlank)
+			if err := tree.SetLeaf(leafIndex, testTreeLeaf(uint32(leafIndex))); err != nil {
+				t.Fatalf("SetLeaf(%d): %v", leafIndex, err)
 			}
-			if index.IsLeaf() {
-				leafIndex, err := index.LeafIndex()
-				if err != nil {
-					t.Fatalf("%d leaves: LeafIndex(%d): %v", leafCount, x, err)
-				}
-				if (tree.Leaf(leafIndex) == nil) != wantBlank {
-					t.Errorf("%d leaves: Leaf(%d) == nil is %v, want %v", leafCount, leafIndex, tree.Leaf(leafIndex) == nil, wantBlank)
-				}
-				if wantBlank {
-					blankLeaves += 1
-				}
-				continue
+			continue
+		}
+		// every occupied parent carries an unmerged leaf, so a sweep that asks a parent for
+		// its unmerged list is asking one that has something to answer
+		if err := tree.SetParent(index, &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(byte(0xc0+x), 32)),
+			UnmergedLeaves: []LeafIndex{LeafIndex(x)},
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	return tree
+}
+
+// The name of the one member of the family that is the constructor's own answer, so the
+// coverage gate can say it judged that tree rather than a rebuild of it.
+const constructedTreeCaseName = "the constructor's answer"
+
+// treeCasesUnderTest is every tree the structural sweeps below judge, derived from the widths the
+// container can hold rather than from the handful one helper happens to build.
+//
+// The family this replaced was one tree per width and every one of them came out of
+// treeUnderTest, which fills leaf 0 first. So no sweep in this file had ever seen a tree whose
+// leaf 0 was blank, and none of them had ever seen the tree the constructor hands back: a
+// NewRatchetTree answering a one leaf tree that held a zero valued *Node rather than an absent
+// entry -- occupied and empty at once, the conflation tree.go's file header says SetLeaf and
+// SetParent refuse to create -- passed the whole suite. The blank sweep derived its POSITIONS
+// from the node width and did not derive its TREES.
+//
+// So the trees are derived as well, and the derivation is stated as coverage rather than as a
+// list: every position of every width has to be seen blank in one member of the family and
+// occupied in another, which the gate below asserts of this family before any sweep uses it.
+// Exhaustively over every occupancy at the two widths small enough to afford it, and by the
+// single occupied and single blank families above that, which is what makes the coverage claim
+// true at fifteen positions without thirty two thousand trees.
+//
+// The constructor's own answer is a member in its own right, and it is the one member no builder
+// here reproduces: every other tree in the family has been through SetLeaf.
+func treeCasesUnderTest(t *testing.T) []treeCase {
+	t.Helper()
+	cases := []treeCase{{
+		name:      constructedTreeCaseName,
+		leafWidth: 1,
+		nodeWidth: 1,
+		occupied:  map[NodeIndex]bool{},
+		build:     func(t *testing.T) *RatchetTree { return NewRatchetTree() },
+	}}
+	add := func(name string, leafWidth uint32, isOccupied func(NodeIndex) bool) {
+		nodeWidth := 2*leafWidth - 1
+		occupied := map[NodeIndex]bool{}
+		for x := uint32(0); x < nodeWidth; x += 1 {
+			if isOccupied(NodeIndex(x)) {
+				occupied[NodeIndex(x)] = true
 			}
-			if (tree.ParentAt(index) == nil) != wantBlank {
-				t.Errorf("%d leaves: ParentAt(%d) == nil is %v, want %v", leafCount, x, tree.ParentAt(index) == nil, wantBlank)
+		}
+		cases = append(cases, treeCase{
+			name:      name,
+			leafWidth: leafWidth,
+			nodeWidth: nodeWidth,
+			occupied:  occupied,
+			build: func(t *testing.T) *RatchetTree {
+				return treeWithOccupancy(t, leafWidth, isOccupied)
+			},
+		})
+	}
+	// the leaf widths are the powers of two, because RFC 9420 section 7.7 grows and shrinks by
+	// doubling and halving and no other width is reachable
+	for _, leafWidth := range []uint32{1, 2, 4, 8} {
+		nodeWidth := 2*leafWidth - 1
+		if nodeWidth <= 3 {
+			for mask := uint32(0); mask < 1<<nodeWidth; mask += 1 {
+				occupancy := mask
+				add(fmt.Sprintf("%d leaves, occupancy %0*b", leafWidth, nodeWidth, occupancy), leafWidth,
+					func(x NodeIndex) bool { return occupancy&(1<<uint32(x)) != 0 })
 			}
-			if wantBlank {
-				blankParents += 1
+			continue
+		}
+		add(fmt.Sprintf("%d leaves, every position blank", leafWidth), leafWidth,
+			func(x NodeIndex) bool { return false })
+		add(fmt.Sprintf("%d leaves, every position occupied", leafWidth), leafWidth,
+			func(x NodeIndex) bool { return true })
+		for x := uint32(0); x < nodeWidth; x += 1 {
+			only := NodeIndex(x)
+			add(fmt.Sprintf("%d leaves, only node %d occupied", leafWidth, x), leafWidth,
+				func(candidate NodeIndex) bool { return candidate == only })
+			add(fmt.Sprintf("%d leaves, only node %d blank", leafWidth, x), leafWidth,
+				func(candidate NodeIndex) bool { return candidate != only })
+		}
+	}
+	return cases
+}
+
+// assertTheTreeAgreesWithItsOccupancy asks every accessor of the container about every position
+// of one tree and holds the answers against the set of positions that were actually filled.
+//
+// One helper rather than one assertion per test, because the property is the same at every entry
+// point: a position is either ABSENT -- nil from Get, blank from IsBlank, nothing from Leaf or
+// ParentAt, outside Members -- or it holds a node, and there is no third state. Occupied and
+// empty at once is the blank as zero valued node conflation, and it reaches a tree through
+// whichever accessor nobody thought to ask.
+func assertTheTreeAgreesWithItsOccupancy(t *testing.T, label string, tree *RatchetTree, occupied map[NodeIndex]bool, nodeWidth uint32) {
+	t.Helper()
+	if tree.NodeWidth() != nodeWidth {
+		t.Errorf("%s: node width %d, want %d", label, tree.NodeWidth(), nodeWidth)
+		return
+	}
+	members := []LeafIndex{}
+	for x := uint32(0); x < nodeWidth; x += 1 {
+		index := NodeIndex(x)
+		wantBlank := !occupied[index]
+		if tree.IsBlank(index) != wantBlank {
+			t.Errorf("%s: IsBlank(%d) = %v, want %v", label, x, tree.IsBlank(index), wantBlank)
+		}
+		if (tree.Get(index) == nil) != wantBlank {
+			t.Errorf("%s: Get(%d) == nil is %v, want %v", label, x, tree.Get(index) == nil, wantBlank)
+		}
+		if index.IsLeaf() {
+			leafIndex, err := index.LeafIndex()
+			if err != nil {
+				t.Fatalf("%s: LeafIndex(%d): %v", label, x, err)
+			}
+			if (tree.Leaf(leafIndex) == nil) != wantBlank {
+				t.Errorf("%s: Leaf(%d) == nil is %v, want %v", label, leafIndex, tree.Leaf(leafIndex) == nil, wantBlank)
+			}
+			if !wantBlank {
+				members = append(members, leafIndex)
+			}
+			continue
+		}
+		if (tree.ParentAt(index) == nil) != wantBlank {
+			t.Errorf("%s: ParentAt(%d) == nil is %v, want %v", label, x, tree.ParentAt(index) == nil, wantBlank)
+		}
+	}
+	if tree.MemberCount() != uint32(len(members)) {
+		t.Errorf("%s: MemberCount = %d, want %d", label, tree.MemberCount(), len(members))
+	}
+	if got := tree.Members(); !reflect.DeepEqual(got, members) {
+		t.Errorf("%s: Members = %v, want %v", label, got, members)
+	}
+}
+
+// assertEveryOccupiedPositionCarriesItsType derives the node type from the index parity and
+// answers how many leaves and how many parents it examined, so a caller can say what it judged.
+func assertEveryOccupiedPositionCarriesItsType(t *testing.T, label string, tree *RatchetTree, occupied map[NodeIndex]bool) (int, int) {
+	t.Helper()
+	leaves, parents := 0, 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		index := NodeIndex(x)
+		node := tree.Get(index)
+		if node == nil {
+			if occupied[index] {
+				t.Errorf("%s: node %d was filled and reads blank", label, x)
+			}
+			continue
+		}
+		want := NodeTypeParent
+		if index.IsLeaf() {
+			want = NodeTypeLeaf
+		}
+		if node.NodeType != want {
+			t.Errorf("%s: node %d carries type %d, want %d", label, x, node.NodeType, want)
+		}
+		if index.IsLeaf() {
+			leaves += 1
+			if node.Leaf == nil || node.Parent != nil {
+				t.Errorf("%s: node %d is a leaf index holding leaf=%v parent=%v", label, x, node.Leaf != nil, node.Parent != nil)
+			}
+			continue
+		}
+		parents += 1
+		if node.Parent == nil || node.Leaf != nil {
+			t.Errorf("%s: node %d is a parent index holding leaf=%v parent=%v", label, x, node.Leaf != nil, node.Parent != nil)
+		}
+	}
+	return leaves, parents
+}
+
+// TestTheFamilyOfTreesTheSweepsJudgeCoversEveryPositionInBothStates is the derivation's own
+// gate, and it runs before any sweep uses the family.
+//
+// A sweep is worth exactly what it was pointed at. The family this replaced covered every
+// position of every width in the OCCUPIED state and covered position 0 in the blank state at no
+// width at all, which is how a constructor handing back an occupied position where the whole
+// file says there is a blank one passed the package. So the claim the sweeps rest on is made
+// here and made mechanically: at every width, every position appears blank in some member of
+// the family and occupied in some other, some member holds nothing at all, and the constructor's
+// own answer is one of the members.
+func TestTheFamilyOfTreesTheSweepsJudgeCoversEveryPositionInBothStates(t *testing.T) {
+	cases := treeCasesUnderTest(t)
+	if len(cases) == 0 {
+		t.Fatal("the family is empty, so every sweep over it judges nothing")
+	}
+	seenBlank := map[uint32]map[uint32]bool{}
+	seenOccupied := map[uint32]map[uint32]bool{}
+	widths := []uint32{}
+	constructed, allBlank := 0, 0
+	for _, one := range cases {
+		if seenBlank[one.nodeWidth] == nil {
+			seenBlank[one.nodeWidth] = map[uint32]bool{}
+			seenOccupied[one.nodeWidth] = map[uint32]bool{}
+			widths = append(widths, one.nodeWidth)
+		}
+		for x := uint32(0); x < one.nodeWidth; x += 1 {
+			if one.occupied[NodeIndex(x)] {
+				seenOccupied[one.nodeWidth][x] = true
 			} else {
-				occupiedParents += 1
+				seenBlank[one.nodeWidth][x] = true
 			}
 		}
-		// and a clone keeps exactly the same set blank, which is where a deep copy that
-		// materialises a zero valued node in place of a nil would show up
-		clone := tree.Clone()
-		if clone.NodeWidth() != tree.NodeWidth() {
-			t.Fatalf("%d leaves: the clone is %d nodes wide, the original is %d", leafCount, clone.NodeWidth(), tree.NodeWidth())
+		if len(one.occupied) == 0 {
+			allBlank += 1
 		}
-		for x := uint32(0); x < tree.NodeWidth(); x += 1 {
-			if clone.IsBlank(NodeIndex(x)) != tree.IsBlank(NodeIndex(x)) {
-				t.Errorf("%d leaves: the clone reports node %d blank = %v, the original %v",
-					leafCount, x, clone.IsBlank(NodeIndex(x)), tree.IsBlank(NodeIndex(x)))
+		if one.name == constructedTreeCaseName {
+			constructed += 1
+		}
+	}
+	slices.Sort(widths)
+	for _, nodeWidth := range widths {
+		for x := uint32(0); x < nodeWidth; x += 1 {
+			if !seenBlank[nodeWidth][x] {
+				t.Errorf("no tree of node width %d in the family has node %d blank, so no sweep over it can tell a blank there from a node", nodeWidth, x)
+			}
+			if !seenOccupied[nodeWidth][x] {
+				t.Errorf("no tree of node width %d in the family has node %d occupied, so no sweep over it can tell a node there from a blank", nodeWidth, x)
 			}
 		}
 	}
-	// the sweep is only worth what it visited: a run that never saw a blank leaf, never saw a
-	// blank parent, or never saw an occupied parent would pass against an implementation that
-	// answered blank for everything or for nothing
-	if blankLeaves == 0 || blankParents == 0 || occupiedParents == 0 {
-		t.Fatalf("the sweep saw %d blank leaves, %d blank parents and %d occupied parents; it needs all three to separate anything",
-			blankLeaves, blankParents, occupiedParents)
+	if allBlank == 0 {
+		t.Error("no member of the family holds nothing at all, which is the shape a constructor hands back and the shape every sweep here used to miss")
 	}
+	if constructed != 1 {
+		t.Errorf("%d members of the family are %q; the constructor's answer is the one tree no builder here reproduces and it has to be judged as itself", constructed, constructedTreeCaseName)
+	}
+	t.Logf("%d trees over %d widths, %d of them holding nothing", len(cases), len(widths), allBlank)
+}
+
+// TestBlankPositionsAreExactlyTheUnsetOnesAtEveryWidth sweeps every node index of every tree in
+// the derived family and requires blankness to agree, at every accessor, with the set of
+// positions that were actually filled.
+//
+// Derived from the width AND from the family rather than from a handful of named indices in a
+// handful of trees, because the defect this is about -- a blank materialised into an occupied
+// position holding a zero valued node -- can hide at any index of any tree a sweep does not
+// visit, and a tree that round trips against itself will not report it anywhere else. The tree
+// the constructor hands back is where it hid last time.
+//
+// Every case is judged twice: as built, and cloned. A deep copy that turned a nil entry into an
+// occupied position holding a zero valued node is the same conflation arriving through the copy
+// constructor, and every provisional tree in TreeKEM is a clone.
+func TestBlankPositionsAreExactlyTheUnsetOnesAtEveryWidth(t *testing.T) {
+	judged := 0
+	for _, one := range treeCasesUnderTest(t) {
+		tree := one.build(t)
+		assertTheTreeAgreesWithItsOccupancy(t, one.name, tree, one.occupied, one.nodeWidth)
+		assertTheTreeAgreesWithItsOccupancy(t, one.name+", cloned", tree.Clone(), one.occupied, one.nodeWidth)
+		judged += 2
+	}
+	if judged == 0 {
+		t.Fatal("no tree was judged")
+	}
+	t.Logf("%d trees judged, originals and clones", judged)
 }
 
 // TestEveryOccupiedPositionCarriesTheNodeTypeItsIndexRequires derives the type from the index
 // parity rather than checking a couple of positions.
 //
-// The wire format carries the type as an octet, so a leaf at an odd index is the shape a
-// hostile ratchet_tree extension arrives in; a container that stored the wrong type would hand
-// the tree hash a different structure at that position while every accessor still worked.
+// The wire format carries the type as an octet, so a leaf at an odd index is the shape a hostile
+// ratchet_tree extension arrives in; a container that stored the wrong type would hand the tree
+// hash a different structure at that position while every accessor still worked.
+//
+// The CLONE of every tree is walked as well as the tree, and that half is not symmetry. Every
+// provisional tree in TreeKEM is built through RatchetTree.Clone, so a Node.Clone that dropped
+// the node type would make every node of every provisional tree a node of no type -- the value
+// TestNodeTypeHasNoZeroValuedMember exists to make unwritable and undecodable. That mutation
+// passed the whole suite, because this sweep walked only the original and the clone was checked
+// for blankness and for key material independence and never for the types it carried.
 func TestEveryOccupiedPositionCarriesTheNodeTypeItsIndexRequires(t *testing.T) {
-	checked := 0
-	for _, leafCount := range []uint32{1, 3, 5, 8} {
-		tree, occupied := treeUnderTest(t, leafCount)
-		for x := uint32(0); x < tree.NodeWidth(); x += 1 {
-			index := NodeIndex(x)
-			node := tree.Get(index)
-			if node == nil {
-				if occupied[index] {
-					t.Errorf("%d leaves: node %d was filled and reads blank", leafCount, x)
-				}
-				continue
-			}
-			checked += 1
-			want := NodeTypeParent
-			if index.IsLeaf() {
-				want = NodeTypeLeaf
-			}
-			if node.NodeType != want {
-				t.Errorf("%d leaves: node %d carries type %d, want %d", leafCount, x, node.NodeType, want)
-			}
-			if index.IsLeaf() && (node.Leaf == nil || node.Parent != nil) {
-				t.Errorf("%d leaves: node %d is a leaf index holding leaf=%v parent=%v", leafCount, x, node.Leaf != nil, node.Parent != nil)
-			}
-			if !index.IsLeaf() && (node.Parent == nil || node.Leaf != nil) {
-				t.Errorf("%d leaves: node %d is a parent index holding leaf=%v parent=%v", leafCount, x, node.Leaf != nil, node.Parent != nil)
-			}
-		}
+	leaves, parents, clonedLeaves, clonedParents := 0, 0, 0, 0
+	for _, one := range treeCasesUnderTest(t) {
+		tree := one.build(t)
+		leafCount, parentCount := assertEveryOccupiedPositionCarriesItsType(t, one.name, tree, one.occupied)
+		leaves += leafCount
+		parents += parentCount
+		leafCount, parentCount = assertEveryOccupiedPositionCarriesItsType(t, one.name+", cloned", tree.Clone(), one.occupied)
+		clonedLeaves += leafCount
+		clonedParents += parentCount
 	}
-	if checked == 0 {
-		t.Fatal("no occupied position was examined, so this gate judged nothing")
+	if leaves == 0 || parents == 0 {
+		t.Fatalf("the sweep examined %d occupied leaves and %d occupied parents; it needs both to separate anything", leaves, parents)
 	}
+	if clonedLeaves == 0 || clonedParents == 0 {
+		t.Fatalf("the sweep examined %d cloned leaves and %d cloned parents; a clone that carried no node type is what this half is here for", clonedLeaves, clonedParents)
+	}
+	t.Logf("%d leaves and %d parents examined, %d and %d of them in clones", leaves, parents, clonedLeaves, clonedParents)
 }
 
 // TestBlankingAPositionMakesItAbsentAndNotOccupiedAndEmpty walks every occupied position of a
@@ -1067,6 +1310,893 @@ func TestTheAccessorsRefuseAnIndexPastTheWidthRatherThanWrapping(t *testing.T) {
 		}
 		if tree.ParentAt(x) != nil {
 			t.Errorf("ParentAt(%d) past the end is not nil", x)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what the container owns and what it hands back
+// ---------------------------------------------------------------------------
+
+// TestInstallingANodeCopiesItAndTheAccessorsHandBackTheStoredOne states the ownership contract
+// in the one direction it has, in both halves.
+//
+// It was unpinned in BOTH directions before: SetLeaf adopting the caller's pointer passed, and
+// SetLeaf storing a copy passed, so a later task could flip it with nothing failing. The
+// direction chosen is the one RatchetTree.Clone's own comment requires -- nothing may alias
+// between two epochs' trees -- because an install that adopted would make
+// tree.SetLeaf(i, other.Leaf(j)) put one *LeafNode in two of them, after which a commit computed
+// against one epoch and later rejected has already written through the other.
+//
+// The second half is the part that makes the first usable: the accessors hand back the tree's
+// OWN node, so a caller that means to keep editing reads it back rather than holding on to what
+// it passed in. A container that copied on the way in and on the way out would pass the first
+// half of this and leave no way to edit a tree at all.
+func TestInstallingANodeCopiesItAndTheAccessorsHandBackTheStoredOne(t *testing.T) {
+	tree, _ := treeUnderTest(t, 4)
+
+	installed := testTreeLeaf(9)
+	if err := tree.SetLeaf(LeafIndex(1), installed); err != nil {
+		t.Fatalf("SetLeaf: %v", err)
+	}
+	if stored := tree.Leaf(LeafIndex(1)); stored == installed {
+		t.Error("SetLeaf stored the caller's own *LeafNode, so the caller and the tree share one node")
+	}
+	installed.SignatureKey[0] ^= 0xff
+	if tree.Leaf(LeafIndex(1)).SignatureKey[0] == installed.SignatureKey[0] {
+		t.Error("writing through the leaf that was installed reached the tree, so SetLeaf adopted it rather than copying it")
+	}
+	// and the accessor is the way in: this is how a caller edits a leaf it has installed
+	before := tree.Leaf(LeafIndex(1)).SignatureKey[0]
+	tree.Leaf(LeafIndex(1)).SignatureKey[0] ^= 0xff
+	if tree.Leaf(LeafIndex(1)).SignatureKey[0] == before {
+		t.Error("writing through Leaf did not reach the tree, so the tree hands out a copy and cannot be edited at all")
+	}
+
+	installedParent := testParentNodeTemplate()
+	if err := tree.SetParent(NodeIndex(1), installedParent); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	if stored := tree.ParentAt(NodeIndex(1)); stored == installedParent {
+		t.Error("SetParent stored the caller's own *ParentNode")
+	}
+	installedParent.EncryptionKey[0] ^= 0xff
+	if tree.ParentAt(NodeIndex(1)).EncryptionKey[0] == installedParent.EncryptionKey[0] {
+		t.Error("writing through the parent node that was installed reached the tree")
+	}
+	installedParent.UnmergedLeaves[0] = 0xffff
+	if tree.ParentAt(NodeIndex(1)).UnmergedLeaves[0] == installedParent.UnmergedLeaves[0] {
+		t.Error("the installed parent node shares its unmerged leaf list with the tree")
+	}
+
+	// the aliasing this closes, spelled as the operation that would have produced it: one leaf
+	// taken out of one tree and installed in another
+	other := NewRatchetTree()
+	if err := other.SetLeaf(LeafIndex(0), tree.Leaf(LeafIndex(1))); err != nil {
+		t.Fatalf("SetLeaf on the second tree: %v", err)
+	}
+	other.Leaf(LeafIndex(0)).SignatureKey[0] ^= 0xff
+	if tree.Leaf(LeafIndex(1)).SignatureKey[0] == other.Leaf(LeafIndex(0)).SignatureKey[0] {
+		t.Error("one leaf is installed in two trees at once, which is the aliasing between two epochs' trees that Clone exists to prevent")
+	}
+}
+
+// TestNodeShapeUnmergedLeavesHandsBackACopyAndNotTheTreesOwnList is the same contract at the one
+// accessor whose answer leaves the package.
+//
+// This is the NodeShape method the tree math walks, so its answer reaches code that has no idea
+// it is holding a tree's own storage. Measured before this was pinned: the ordinary go idiom for
+// narrowing a list -- kept := answer[:0] followed by append, which is the spelling the tree hash
+// task uses -- rewrote a real parent node's unmerged list in place, which is a different parent
+// hash at that node and a different tree hash from every peer. It was unpinned in both
+// directions, so a later task could have flipped it back silently.
+func TestNodeShapeUnmergedLeavesHandsBackACopyAndNotTheTreesOwnList(t *testing.T) {
+	tree, _ := treeUnderTest(t, 4)
+	if err := tree.SetParent(NodeIndex(3), testParentNodeTemplate()); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	stored := []LeafIndex{1, 2, 5}
+	var shape NodeShape = tree
+	if got := shape.UnmergedLeaves(NodeIndex(3)); !reflect.DeepEqual(got, stored) {
+		t.Fatalf("UnmergedLeaves(3) = %v, want %v, so what follows measures the wrong list", got, stored)
+	}
+
+	// narrowing the answer in place, which is what a caller filtering the list writes
+	kept := shape.UnmergedLeaves(NodeIndex(3))[:0]
+	kept = append(kept, LeafIndex(9))
+	if got := shape.UnmergedLeaves(NodeIndex(3)); !reflect.DeepEqual(got, stored) {
+		t.Errorf("a caller that narrowed the answer in place rewrote the tree: the node now holds %v, want %v", got, stored)
+	}
+	// and writing through an element of it
+	answer := shape.UnmergedLeaves(NodeIndex(3))
+	answer[0] = 0xffff
+	if got := shape.UnmergedLeaves(NodeIndex(3)); !reflect.DeepEqual(got, stored) {
+		t.Errorf("a caller that wrote through the answer rewrote the tree: the node now holds %v, want %v", got, stored)
+	}
+	// two answers do not share storage with each other either, which is the same statement made
+	// where a caller holds both
+	first, second := shape.UnmergedLeaves(NodeIndex(3)), shape.UnmergedLeaves(NodeIndex(3))
+	first[0] = 0xeeee
+	if second[0] == first[0] {
+		t.Error("two answers from UnmergedLeaves share one backing array")
+	}
+	// the parent node itself is still reachable and still editable through ParentAt, which is
+	// the accessor that hands out the tree's own storage on purpose
+	tree.ParentAt(NodeIndex(3)).UnmergedLeaves[0] = 0xabcd
+	if got := shape.UnmergedLeaves(NodeIndex(3))[0]; got != 0xabcd {
+		t.Errorf("an edit through ParentAt did not reach the answer: got %d", got)
+	}
+	// a blank position and a leaf answer nothing, which is where an implementation reaching
+	// through a nil parent would panic rather than report
+	if got := shape.UnmergedLeaves(NodeIndex(5)); len(got) != 0 {
+		t.Errorf("a blank parent answered %v", got)
+	}
+	if got := shape.UnmergedLeaves(NodeIndex(0)); len(got) != 0 {
+		t.Errorf("a leaf answered %v", got)
+	}
+}
+
+// TestFindLeafBySignatureKeyAnswersTheLowestMatchingLeaf pins the tie break, which neither the
+// code nor any case in this file stated before: every leaf of the test tree carries a distinct
+// signature key, so an implementation answering the LAST match rather than the first passed.
+//
+// A tie is reachable. This is how a member locates its own leaf in a tree a peer supplied, which
+// happens before ValSem101's duplicate signature key refusal has necessarily run over that tree,
+// and two members answering different positions for one key would each sign and decrypt as a
+// different leaf.
+func TestFindLeafBySignatureKeyAnswersTheLowestMatchingLeaf(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		duplicate []uint32
+		blank     []uint32
+		want      LeafIndex
+	}{
+		// the answer is the first of the run, not the last
+		{name: "leaves 0 and 2 share a key", duplicate: []uint32{0, 2}, want: 0},
+		{name: "leaves 0, 1 and 3 share a key", duplicate: []uint32{0, 1, 3}, want: 0},
+		// and it is the first MATCH and not merely leaf zero: blanking the lowest holder moves
+		// the answer, which an implementation hard wired to 0 fails
+		{name: "the lowest holder is blank", duplicate: []uint32{0, 1, 3}, blank: []uint32{0}, want: 1},
+		{name: "the two lowest holders are blank", duplicate: []uint32{0, 1, 3}, blank: []uint32{0, 1}, want: 3},
+	} {
+		tree, _ := treeUnderTest(t, 4)
+		shared := SignaturePublicKey(repeatByte(0x7e, 32))
+		for _, i := range testCase.duplicate {
+			leaf := testTreeLeaf(i)
+			leaf.SignatureKey = SignaturePublicKey(repeatByte(0x7e, 32))
+			if err := tree.SetLeaf(LeafIndex(i), leaf); err != nil {
+				t.Fatalf("%s: SetLeaf(%d): %v", testCase.name, i, err)
+			}
+		}
+		for _, i := range testCase.blank {
+			if err := tree.Blank(LeafIndex(i).NodeIndex()); err != nil {
+				t.Fatalf("%s: Blank(%d): %v", testCase.name, i, err)
+			}
+		}
+		got, ok := tree.FindLeafBySignatureKey(shared)
+		if !ok || got != testCase.want {
+			t.Errorf("%s: FindLeafBySignatureKey = (%d, %v), want (%d, true)", testCase.name, got, ok, testCase.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the ParentNode encoding, octet by octet
+// ---------------------------------------------------------------------------
+
+// TestATruncatedOrExtendedParentNodeEncodingIsRefused is the counterpart of leaf_node_test.go's
+// TestEveryOctetOfALeafNodeEncodingIsLoadBearing, which this structure had none of: the goldens
+// were only ever decoded whole.
+//
+// Every proper prefix of every golden must be refused, and so must every golden with an octet
+// added. What holds it today is syntax.Unmarshal's whole buffer requirement rather than anything
+// in this file, and that is exactly why it is worth stating here: a ParentNode.UnmarshalMLS that
+// stopped consuming its last field would still refuse the whole golden -- the leftover octets
+// fail Done -- and would ACCEPT the prefix that ends where its reading stopped, which is a second
+// decoder for a structure the parent hash and the tree hash are taken over.
+func TestATruncatedOrExtendedParentNodeEncodingIsRefused(t *testing.T) {
+	prefixes, extensions := 0, 0
+	for _, golden := range parentNodeGoldenCases() {
+		if len(golden.bytes) != golden.size {
+			t.Fatalf("%s: the golden is %d octets and its stated size is %d", golden.name, len(golden.bytes), golden.size)
+		}
+		// the whole thing decodes, so a refusal below is the truncation and not the golden
+		if err := syntax.Unmarshal(golden.bytes, &ParentNode{}); err != nil {
+			t.Fatalf("%s: the complete golden was refused: %v", golden.name, err)
+		}
+		for cut := 0; cut < len(golden.bytes); cut += 1 {
+			prefixes += 1
+			if err := syntax.Unmarshal(golden.bytes[:cut], &ParentNode{}); err == nil {
+				t.Errorf("%s: the first %d of %d octets decoded as a whole parent node", golden.name, cut, len(golden.bytes))
+			}
+		}
+		for _, extra := range []byte{0x00, 0xff} {
+			extensions += 1
+			extended := append(bytes.Clone(golden.bytes), extra)
+			if err := syntax.Unmarshal(extended, &ParentNode{}); err == nil {
+				t.Errorf("%s: the golden with a trailing %#02x decoded as a whole parent node", golden.name, extra)
+			}
+		}
+	}
+	if prefixes == 0 || extensions == 0 {
+		t.Fatalf("the sweep judged %d prefixes and %d extensions", prefixes, extensions)
+	}
+	t.Logf("%d prefixes and %d extended encodings refused", prefixes, extensions)
+}
+
+// TestOneParentNodesUnmergedLeavesStayAtTheDefaultLimitUnderARaisedOne is the mechanism behind
+// the argument the codec table writes down beside this pair's entries.
+//
+// The syntax package inherits its vector limit downwards on purpose -- subReader hands the
+// parent's limit to every nested read, WriteVector builds its scratch at the outer limit -- which
+// is what lets a ratchet_tree running at MaxRatchetTreeLength carry fields larger than one
+// ordinary structure may. So an entry arguing that unmerged_leaves runs at MaxVectorLength is an
+// argument that becomes FALSE, with nothing failing, the moment a ratchet tree codec opens a
+// raised writer: sixteen mebibytes is 4,194,304 unmerged leaves at one parent node.
+//
+// The bound is therefore applied by the codec itself and asserted here through a raised limit,
+// which is the only place the difference is visible. Both halves, because an encoder that wrote
+// what its decoder refuses is an implementation that cannot read what it sends.
+func TestOneParentNodesUnmergedLeavesStayAtTheDefaultLimitUnderARaisedOne(t *testing.T) {
+	// the bound is a function of the encoding rather than a number: an unmerged leaf is a
+	// uint32, so a vector of exactly this many is exactly MaxVectorLength octets
+	if maxUnmergedLeaves != syntax.MaxVectorLength/4 {
+		t.Fatalf("maxUnmergedLeaves is %d and the default limit holds %d uint32", maxUnmergedLeaves, syntax.MaxVectorLength/4)
+	}
+	if syntax.MaxRatchetTreeLength <= syntax.MaxVectorLength {
+		t.Fatalf("the ratchet tree limit is %d and the default is %d, so a raised limit proves nothing here",
+			syntax.MaxRatchetTreeLength, syntax.MaxVectorLength)
+	}
+	ascending := func(n int) []LeafIndex {
+		out := make([]LeafIndex, n)
+		for i := range out {
+			out[i] = LeafIndex(i)
+		}
+		return out
+	}
+	atTheBound := &ParentNode{
+		EncryptionKey:  HpkePublicKey(repeatByte(0xa1, 32)),
+		ParentHash:     repeatByte(0xb2, 32),
+		UnmergedLeaves: ascending(maxUnmergedLeaves),
+	}
+	pastTheBound := &ParentNode{
+		EncryptionKey:  HpkePublicKey(repeatByte(0xa1, 32)),
+		ParentHash:     repeatByte(0xb2, 32),
+		UnmergedLeaves: ascending(maxUnmergedLeaves + 1),
+	}
+
+	// the encode half. At the bound it encodes under the raised limit and under the default
+	// one, so the refusal below is the bound and not the size of the buffer.
+	if _, err := syntax.MarshalLimit(atTheBound, syntax.MaxRatchetTreeLength); err != nil {
+		t.Fatalf("a vector at the bound was refused at the raised limit: %v", err)
+	}
+	if _, err := syntax.Marshal(atTheBound); err != nil {
+		t.Fatalf("a vector at the bound was refused at the default limit: %v", err)
+	}
+	if _, err := syntax.MarshalLimit(pastTheBound, syntax.MaxRatchetTreeLength); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("encoding %d unmerged leaves at the raised limit answered %v, want ErrLengthExceedsMax: the ratchet tree's raised bound belongs to the ARRAY and not to one parent node's unmerged list",
+			maxUnmergedLeaves+1, err)
+	}
+	if _, err := syntax.Marshal(pastTheBound); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("encoding %d unmerged leaves at the default limit answered %v, want ErrLengthExceedsMax", maxUnmergedLeaves+1, err)
+	}
+
+	// the decode half, over bytes built through the vector encoder directly so that a codec
+	// which refuses to WRITE the over long vector can still be handed one
+	overLong := func() []byte {
+		writer := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
+		writer.WriteOpaque(pastTheBound.EncryptionKey)
+		writer.WriteOpaque(pastTheBound.ParentHash)
+		if err := syntax.WriteVector(writer, pastTheBound.UnmergedLeaves, writeOneUnmergedLeaf); err != nil {
+			t.Fatalf("building the over long encoding: %v", err)
+		}
+		encoded, err := writer.Bytes()
+		if err != nil {
+			t.Fatalf("building the over long encoding: %v", err)
+		}
+		return encoded
+	}()
+	if err := syntax.UnmarshalLimit(overLong, &ParentNode{}, syntax.MaxRatchetTreeLength); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("decoding %d unmerged leaves at the raised limit answered %v, want ErrLengthExceedsMax", maxUnmergedLeaves+1, err)
+	}
+	// and the same decode at the bound is accepted, so the refusal above is the bound and not
+	// a decoder that gave up on a large vector
+	encodedAtTheBound, err := syntax.MarshalLimit(atTheBound, syntax.MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("encoding at the bound: %v", err)
+	}
+	decoded := &ParentNode{}
+	if err := syntax.UnmarshalLimit(encodedAtTheBound, decoded, syntax.MaxRatchetTreeLength); err != nil {
+		t.Fatalf("a vector at the bound was refused on the way in: %v", err)
+	}
+	if len(decoded.UnmergedLeaves) != maxUnmergedLeaves {
+		t.Errorf("decoding a vector at the bound produced %d leaves, want %d", len(decoded.UnmergedLeaves), maxUnmergedLeaves)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// guardrail 8 over the ratchet tree's own key comparisons
+// ---------------------------------------------------------------------------
+
+// The comparison guardrail 8 names, split into the two identifiers a call to it is written from
+// so that the rules below can match it without rendering a node against a file set that is not
+// its own.
+const (
+	sanctionedComparisonPackage = "subtle"
+	sanctionedComparisonName    = "ConstantTimeCompare"
+	ratchetTreeTypeName         = "RatchetTree"
+)
+
+func theSanctionedComparison() string {
+	return sanctionedComparisonPackage + "." + sanctionedComparisonName
+}
+
+// keyShapedTypesOf is every named type these files declare whose underlying type is a slice of
+// octets: SignaturePublicKey, HpkePublicKey and their private twins today.
+//
+// Read off the declarations rather than listed, so a key type a later task declares is under the
+// rule the day it is declared rather than the day somebody remembers. A key is what a caller
+// probes a tree with, and it is the argument whose comparison the guardrail is about.
+func keyShapedTypesOf(files []parsedSource) map[string]bool {
+	found := map[string]bool{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			spec, isType := node.(*ast.TypeSpec)
+			if !isType {
+				return true
+			}
+			slice, isSlice := spec.Type.(*ast.ArrayType)
+			if !isSlice || slice.Len != nil {
+				return true
+			}
+			if element, isIdent := slice.Elt.(*ast.Ident); isIdent && (element.Name == "byte" || element.Name == "uint8") {
+				found[spec.Name.Name] = true
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// keyQuestion is one member of the class the guardrail runs over, carrying the file it was read
+// out of because every rule renders nodes back to source and a node rendered against the wrong
+// file set reports the wrong text.
+type keyQuestion struct {
+	name     string
+	host     parsedSource
+	function *ast.FuncDecl
+}
+
+// qualifiedName is how a member is named in the expectations below: the receiver as it is
+// written, then the method name, so a method and a plain function of the same name stay apart.
+func (self parsedSource) qualifiedName(function *ast.FuncDecl) string {
+	if receiver := self.receiverOf(function); receiver != "" {
+		return receiver + "." + function.Name.Name
+	}
+	return function.Name.Name
+}
+
+// parameterTypesOf is one type per parameter, with a group like (a, b []byte) counted twice.
+func parameterTypesOf(parsed parsedSource, function *ast.FuncDecl) []string {
+	found := []string{}
+	if function.Type.Params == nil {
+		return found
+	}
+	for _, field := range function.Type.Params.List {
+		rendered := parsed.render(field.Type)
+		for range max(len(field.Names), 1) {
+			found = append(found, rendered)
+		}
+	}
+	return found
+}
+
+// keyQuestionsIn is every declaration in these files that answers a question about a key it was
+// handed, over a ratchet tree.
+//
+// Three conditions and each of them a shape rather than a name: a parameter whose type is one of
+// the key types derived above; a bool somewhere in the results, which is what makes the answer a
+// yes or no an attacker can probe for rather than a value it computes; and a ratchet tree in the
+// receiver or the parameters, which is the scope.
+//
+// The scope is where it is deliberately. The crypto provider answers questions about keys too and
+// is guardrail 8's own subject next door, held by TestMacVerifyComparesInConstantTime and by
+// TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse; those verifiers reach ed25519.Verify
+// and the HPKE primitives, which is what their gates sanction and what the rule below forbids.
+// What had no gate at all was the container. Its two comparisons are over PUBLIC keys, so nothing
+// aimed at secrets reaches them, and both survived being rewritten as ordinary go equality with
+// the whole package green.
+func keyQuestionsIn(files []parsedSource) []keyQuestion {
+	keyTypes := keyShapedTypesOf(files)
+	found := []keyQuestion{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			takesAKey, mentionsTheTree := false, strings.Contains(parsed.receiverOf(function), ratchetTreeTypeName)
+			for _, one := range parameterTypesOf(parsed, function) {
+				if keyTypes[strings.TrimPrefix(one, "*")] {
+					takesAKey = true
+				}
+				if strings.Contains(one, ratchetTreeTypeName) {
+					mentionsTheTree = true
+				}
+			}
+			if !takesAKey || !mentionsTheTree {
+				continue
+			}
+			answers := false
+			for _, field := range fieldsOf(function.Type.Results) {
+				if parsed.render(field.Type) == "bool" {
+					answers = true
+				}
+			}
+			if !answers {
+				continue
+			}
+			found = append(found, keyQuestion{name: parsed.qualifiedName(function), host: parsed, function: function})
+		}
+	}
+	slices.SortFunc(found, func(a keyQuestion, b keyQuestion) int { return strings.Compare(a.name, b.name) })
+	return found
+}
+
+// namesOfKeyQuestions is the class as a sorted list of names, which is what the expectations
+// below are stated in.
+func namesOfKeyQuestions(class []keyQuestion) []string {
+	names := []string{}
+	for _, one := range class {
+		names = append(names, one.name)
+	}
+	return names
+}
+
+// packageLevelConstantsOf is every name these files declare as a constant, which is what lets the
+// equality rule tell a control flow decision from a decision about data.
+func packageLevelConstantsOf(files []parsedSource) map[string]bool {
+	found := map[string]bool{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			declaration, isGeneric := node.(*ast.GenDecl)
+			if !isGeneric || declaration.Tok != token.CONST {
+				return true
+			}
+			for _, spec := range declaration.Specs {
+				if value, isValue := spec.(*ast.ValueSpec); isValue {
+					for _, name := range value.Names {
+						found[name.Name] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// isConstantExpression is whether one side of a comparison is a constant as far as the rule is
+// concerned: a literal, nil, true, false, a composite literal, or a constant this package
+// declares.
+func isConstantExpression(expr ast.Expr, constants map[string]bool) bool {
+	switch typed := expr.(type) {
+	case *ast.BasicLit:
+		return true
+	case *ast.CompositeLit:
+		return true
+	case *ast.ParenExpr:
+		return isConstantExpression(typed.X, constants)
+	case *ast.UnaryExpr:
+		return isConstantExpression(typed.X, constants)
+	case *ast.Ident:
+		return typed.Name == "nil" || typed.Name == "true" || typed.Name == "false" || constants[typed.Name]
+	}
+	return false
+}
+
+// variableTimeEqualitiesIn is every == or != in one body with a value on both sides.
+//
+// This is the shape no class of function names ever sees: string(a) == string(b) mentions no
+// comparator at all and is exactly the rewrite that survived here, and a [32]byte compared with
+// == is a variable time comparison the language performs for free. A comparison with a constant
+// on one side is a control flow decision -- err != nil, a node type against its constant, the
+// == 1 that reads the answer out of the sanctioned comparison -- and is not reported.
+//
+// A length comparison IS reported, because len(a) != len(b) has a value on both sides. That is
+// the direction this fails in on purpose: the sanctioned comparison refuses a length mismatch
+// itself, so a key question that writes one has put a decision in front of the comparison the
+// guardrail put there.
+func variableTimeEqualitiesIn(parsed parsedSource, function *ast.FuncDecl, constants map[string]bool) []string {
+	found := []string{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		binary, isBinary := node.(*ast.BinaryExpr)
+		if !isBinary || (binary.Op != token.EQL && binary.Op != token.NEQ) {
+			return true
+		}
+		if isConstantExpression(binary.X, constants) || isConstantExpression(binary.Y, constants) {
+			return true
+		}
+		found = append(found, parsed.render(binary))
+		return true
+	})
+	slices.Sort(found)
+	return slices.Compact(found)
+}
+
+// callsOutOfThisPackageIn is every call in one body that leaves this package for anything other
+// than the sanctioned comparison.
+//
+// This is the comparator ban with its bounds taken off, and it is here because a class derived
+// from signatures still has a shape and anything outside that shape is outside it: bytes.Cut
+// answers "does this key begin with that one" through three results, and a helper in a package
+// nobody has classified answers it however it likes. So for a function whose answer is about a
+// key, the rule is not that no comparator is called -- it is that nothing outside this package
+// is called at all, with one exception, and the exception is the comparison the guardrail names.
+//
+// A method on a value is not a call out of the package: the receiver had to come from somewhere,
+// and everything that could produce one here is either a call this rule already sees or a value
+// of this package's own. A conversion through a predeclared or package level type name is not a
+// call at all.
+func callsOutOfThisPackageIn(parsed parsedSource, function *ast.FuncDecl, declared declaredNames) []string {
+	found := []string{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		switch callee := call.Fun.(type) {
+		case *ast.Ident:
+			if declared.functions[callee.Name] || declared.types[callee.Name] || types.Universe.Lookup(callee.Name) != nil {
+				return true
+			}
+			found = append(found, callee.Name)
+		case *ast.SelectorExpr:
+			rendered := parsed.render(call.Fun)
+			if rendered == theSanctionedComparison() {
+				return true
+			}
+			qualifier, isIdent := callee.X.(*ast.Ident)
+			if !isIdent || !declared.imports[qualifier.Name] {
+				return true
+			}
+			found = append(found, rendered)
+		}
+		return true
+	})
+	slices.Sort(found)
+	return slices.Compact(found)
+}
+
+// functionsByNameIn is every declaration these files carry, keyed by the name a call to it is
+// written with -- the function name, or the method name for a method, since a call site spells
+// self.Leaf and not (*RatchetTree).Leaf.
+func functionsByNameIn(files []parsedSource) map[string][]*ast.FuncDecl {
+	found := map[string][]*ast.FuncDecl{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			if function, isFunction := declaration.(*ast.FuncDecl); isFunction && function.Body != nil {
+				found[function.Name.Name] = append(found[function.Name.Name], function)
+			}
+		}
+	}
+	return found
+}
+
+// reachesTheConstantTimeComparison walks this package's own call graph from one declaration and
+// reports whether the sanctioned comparison is anywhere in it.
+//
+// The transitive half is what says the requirement is about the ANSWER and not about the text of
+// one function: a key question that moved its comparison into a helper still satisfies this, and
+// one that moved it into a helper written as a byte loop does not. Banning the wrong comparison
+// is not the same as requiring the right one -- a function that compared nothing at all passes
+// every ban above and fails here.
+func reachesTheConstantTimeComparison(function *ast.FuncDecl, byName map[string][]*ast.FuncDecl) bool {
+	pending := []*ast.FuncDecl{function}
+	seen := map[*ast.FuncDecl]bool{function: true}
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		sanctioned, called := false, []string{}
+		ast.Inspect(current.Body, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			switch callee := call.Fun.(type) {
+			case *ast.Ident:
+				called = append(called, callee.Name)
+			case *ast.SelectorExpr:
+				called = append(called, callee.Sel.Name)
+				qualifier, isIdent := callee.X.(*ast.Ident)
+				if isIdent && qualifier.Name == sanctionedComparisonPackage && callee.Sel.Name == sanctionedComparisonName {
+					sanctioned = true
+				}
+			}
+			return true
+		})
+		if sanctioned {
+			return true
+		}
+		for _, name := range called {
+			for _, next := range byName[name] {
+				if !seen[next] {
+					seen[next] = true
+					pending = append(pending, next)
+				}
+			}
+		}
+	}
+	return false
+}
+
+// parsedProductionSourcesOfThisPackage is every non test file of this package, parsed. The rule
+// reads the directory rather than a file name, so a key question a later task puts in
+// tree_sync.go is under the guardrail without an edit here.
+func parsedProductionSourcesOfThisPackage(t *testing.T) []parsedSource {
+	t.Helper()
+	files := []parsedSource{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		files = append(files, mustParseSource(t, path))
+	}
+	if len(files) == 0 {
+		t.Fatal("no production file was parsed, so the guardrail below judged nothing")
+	}
+	return files
+}
+
+// A fixture declaring one of every shape the three rules have to tell apart, so a matcher that
+// stopped matching fails here rather than issuing the real source the clean bill a working one
+// issues.
+//
+// Every member is here because some half of some rule has to be the only thing reporting it:
+//
+//   - ComparesWithBytesEqual and ComparesWithAPrefix are the comparators a ban list would have
+//     had to think of, and only the foreign call rule reports them. bytes.HasPrefix leaks
+//     strictly more than bytes.Equal does and was outside the six name list this project shipped.
+//   - ComparesByConvertingToString names no comparator at all and is the rewrite that actually
+//     survived in this file, so only the equality rule reports it.
+//   - ComparesAfterALengthFastPath keeps the sanctioned comparison and puts a decision in front
+//     of it, so only the equality rule reports it, and it is what says that rule is not merely
+//     the foreign call rule spelled differently.
+//   - ComparesNothingAtAll answers without comparing, so only the reachability rule reports it.
+//   - ComparesThroughAHelperThatLoops and loops are the comparison moved out of the function
+//     that answers: the helper carries the byte loop, so the equality rule reports the HELPER and
+//     the reachability rule reports the caller, and neither reports the other.
+//   - FindsInATreeItWasHanded is a plain function rather than a method, which is what says the
+//     class is not "the methods of one type".
+//   - FindsInConstantTime, FindsThroughAHelperOfItsOwn and holds are the clean half: one
+//     comparing directly and one through a helper, which is what makes the reachability
+//     requirement really transitive.
+//   - TakesAKeyAndAnswersNoQuestion, AnswersAQuestionAboutNoKey and ComparesKeysWithNoTreeInSight
+//     are outside the class on one condition each, and every one of them would be reported if it
+//     were inside, so a class that widened fails as loudly as one that narrowed.
+const ratchetTreeKeyComparisonControl = `package control
+
+import (
+	"bytes"
+	"crypto/subtle"
+)
+
+type SignaturePublicKey []byte
+
+type RatchetTree struct {
+	keys []SignaturePublicKey
+}
+
+func (self *RatchetTree) FindsInConstantTime(key SignaturePublicKey) (int, bool) {
+	for i, held := range self.keys {
+		if subtle.ConstantTimeCompare(held, key) == 1 {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (self *RatchetTree) FindsThroughAHelperOfItsOwn(key SignaturePublicKey) bool {
+	return self.holds(key)
+}
+
+func (self *RatchetTree) holds(key SignaturePublicKey) bool {
+	return subtle.ConstantTimeCompare(self.keys[0], key) == 1
+}
+
+func (self *RatchetTree) ComparesWithBytesEqual(key SignaturePublicKey) bool {
+	return bytes.Equal(self.keys[0], key)
+}
+
+func (self *RatchetTree) ComparesWithAPrefix(key SignaturePublicKey) bool {
+	return bytes.HasPrefix(self.keys[0], key)
+}
+
+func (self *RatchetTree) ComparesByConvertingToString(key SignaturePublicKey) bool {
+	return string(self.keys[0]) == string(key)
+}
+
+func (self *RatchetTree) ComparesAfterALengthFastPath(key SignaturePublicKey) bool {
+	if len(key) != len(self.keys[0]) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(self.keys[0], key) == 1
+}
+
+func (self *RatchetTree) ComparesNothingAtAll(key SignaturePublicKey) bool {
+	_ = key
+	return true
+}
+
+func (self *RatchetTree) ComparesThroughAHelperThatLoops(key SignaturePublicKey) bool {
+	return self.loops(key)
+}
+
+func (self *RatchetTree) loops(key SignaturePublicKey) bool {
+	held := self.keys[0]
+	for i := range held {
+		if held[i] != key[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func FindsInATreeItWasHanded(tree *RatchetTree, key SignaturePublicKey) bool {
+	return bytes.Equal(tree.keys[0], key)
+}
+
+func (self *RatchetTree) TakesAKeyAndAnswersNoQuestion(key SignaturePublicKey) []byte {
+	return bytes.Clone(key)
+}
+
+func (self *RatchetTree) AnswersAQuestionAboutNoKey(a []byte, b []byte) bool {
+	return bytes.Equal(a, b)
+}
+
+func ComparesKeysWithNoTreeInSight(a SignaturePublicKey, b SignaturePublicKey) bool {
+	return bytes.Equal(a, b)
+}
+`
+
+// What the class must read out of the fixture, exactly rather than as a floor. A class that
+// widened to take in the three members outside it, or narrowed to drop one of the bad shapes,
+// would go on to read the real source the same wrong way and report the same clean bill.
+var ratchetTreeKeyComparisonControlClass = []string{
+	"*RatchetTree.ComparesAfterALengthFastPath",
+	"*RatchetTree.ComparesByConvertingToString",
+	"*RatchetTree.ComparesNothingAtAll",
+	"*RatchetTree.ComparesThroughAHelperThatLoops",
+	"*RatchetTree.ComparesWithAPrefix",
+	"*RatchetTree.ComparesWithBytesEqual",
+	"*RatchetTree.FindsInConstantTime",
+	"*RatchetTree.FindsThroughAHelperOfItsOwn",
+	"*RatchetTree.holds",
+	"*RatchetTree.loops",
+	"FindsInATreeItWasHanded",
+}
+
+// The two the class must be seen to LEAVE OUT, named so a reader can tell a deliberate boundary
+// from an oversight. ComparesKeysWithNoTreeInSight is the third and is left out by the scope
+// rather than by the shape: it compares keys in variable time and is somebody else's guardrail.
+var ratchetTreeKeyComparisonControlOutsideTheClass = []string{
+	"*RatchetTree.AnswersAQuestionAboutNoKey",
+	"*RatchetTree.TakesAKeyAndAnswersNoQuestion",
+	"ComparesKeysWithNoTreeInSight",
+}
+
+var (
+	// the equality rule: a value on both sides of an == or a !=
+	ratchetTreeControlVariableTimeEqualities = []string{
+		"*RatchetTree.ComparesAfterALengthFastPath",
+		"*RatchetTree.ComparesByConvertingToString",
+		"*RatchetTree.loops",
+	}
+	// the foreign call rule: anything outside the package that is not the sanctioned comparison
+	ratchetTreeControlForeignCalls = []string{
+		"*RatchetTree.ComparesWithAPrefix",
+		"*RatchetTree.ComparesWithBytesEqual",
+		"FindsInATreeItWasHanded",
+	}
+	// the reachability rule: the sanctioned comparison is nowhere in the call graph
+	ratchetTreeControlUnreached = []string{
+		"*RatchetTree.ComparesByConvertingToString",
+		"*RatchetTree.ComparesNothingAtAll",
+		"*RatchetTree.ComparesThroughAHelperThatLoops",
+		"*RatchetTree.ComparesWithAPrefix",
+		"*RatchetTree.ComparesWithBytesEqual",
+		"*RatchetTree.loops",
+		"FindsInATreeItWasHanded",
+	}
+)
+
+// TestTheKeyComparisonGateFlagsItsControlFixture is the matcher's own control, and it runs before
+// the gate over the real source so that a rule which stopped matching fails here rather than
+// issuing this package a clean bill.
+func TestTheKeyComparisonGateFlagsItsControlFixture(t *testing.T) {
+	control := mustParseText(t, "the ratchet tree key comparison control", ratchetTreeKeyComparisonControl)
+	files := []parsedSource{control}
+	class := keyQuestionsIn(files)
+	if got := namesOfKeyQuestions(class); !slices.Equal(got, ratchetTreeKeyComparisonControlClass) {
+		t.Fatalf("the class read %v out of the control, want %v", got, ratchetTreeKeyComparisonControlClass)
+	}
+	// the members outside it are outside it, said by name rather than left implied
+	for _, outside := range ratchetTreeKeyComparisonControlOutsideTheClass {
+		if slices.Contains(ratchetTreeKeyComparisonControlClass, outside) {
+			t.Errorf("%s is named as being outside the class and is inside it", outside)
+		}
+	}
+	declared := namesTheseFilesDeclare(files)
+	constants := packageLevelConstantsOf(files)
+	byName := functionsByNameIn(files)
+	equalities, foreign, unreached := []string{}, []string{}, []string{}
+	for _, one := range class {
+		if len(variableTimeEqualitiesIn(one.host, one.function, constants)) != 0 {
+			equalities = append(equalities, one.name)
+		}
+		if len(callsOutOfThisPackageIn(one.host, one.function, declared)) != 0 {
+			foreign = append(foreign, one.name)
+		}
+		if !reachesTheConstantTimeComparison(one.function, byName) {
+			unreached = append(unreached, one.name)
+		}
+	}
+	if !slices.Equal(equalities, ratchetTreeControlVariableTimeEqualities) {
+		t.Errorf("the equality rule reported %v out of the control, want %v", equalities, ratchetTreeControlVariableTimeEqualities)
+	}
+	if !slices.Equal(foreign, ratchetTreeControlForeignCalls) {
+		t.Errorf("the foreign call rule reported %v out of the control, want %v", foreign, ratchetTreeControlForeignCalls)
+	}
+	if !slices.Equal(unreached, ratchetTreeControlUnreached) {
+		t.Errorf("the reachability rule reported %v out of the control, want %v", unreached, ratchetTreeControlUnreached)
+	}
+}
+
+// TestEveryKeyQuestionTheRatchetTreeAnswersComparesInConstantTime is guardrail 8 over the two
+// comparisons this file makes, which no gate in this package reached.
+//
+// Both of them were rewritten as ordinary go equality -- string(leaf.SignatureKey) == string(key)
+// at one and both comparisons at the other -- and the whole package stayed green. The comparison
+// is constant time for the reason FindLeafBySignatureKey's own comment gives, and what says so
+// today is that comment; no behavioural test in go can see the difference, and a timing
+// measurement over a 32 octet comparison on this machine is noise. So what is asserted is what
+// was actually verified: mechanically, over the source, so it survives an edit nobody reruns this
+// for.
+//
+// The blind spot is worth naming, because it is the same one the tag verifier gate next door
+// documents: the equality rule reads each member's own body, so a byte loop written inside a
+// helper is caught by the reachability rule -- the helper is not the sanctioned comparison -- and
+// not by the equality rule, unless the helper is itself a member of the class.
+func TestEveryKeyQuestionTheRatchetTreeAnswersComparesInConstantTime(t *testing.T) {
+	files := parsedProductionSourcesOfThisPackage(t)
+	class := keyQuestionsIn(files)
+	names := namesOfKeyQuestions(class)
+	t.Logf("%d key questions under the gate: %v", len(names), names)
+	if len(class) == 0 {
+		t.Fatal("the gate found no key question at all, so it is reporting clean having read nothing")
+	}
+	// the coverage claim, checked rather than assumed: the two this file is about have to be
+	// among the ones being judged
+	for _, want := range []string{"*RatchetTree.FindLeafBySignatureKey", "*RatchetTree.EncryptionKeyInUse"} {
+		if !slices.Contains(names, want) {
+			t.Fatalf("the gate is judging %v, which does not include %s", names, want)
+		}
+	}
+	declared := namesTheseFilesDeclare(files)
+	constants := packageLevelConstantsOf(files)
+	byName := functionsByNameIn(files)
+	for _, one := range class {
+		for _, equality := range variableTimeEqualitiesIn(one.host, one.function, constants) {
+			t.Errorf("%s decides %s, which is a comparison of two values in variable time; every comparison of a key here goes through %s",
+				one.name, equality, theSanctionedComparison())
+		}
+		for _, foreign := range callsOutOfThisPackageIn(one.host, one.function, declared) {
+			t.Errorf("%s calls %s; a key question's answer is decided by %s and by nothing else, and what it needs from elsewhere belongs behind a function of this package",
+				one.name, foreign, theSanctionedComparison())
+		}
+		if !reachesTheConstantTimeComparison(one.function, byName) {
+			t.Errorf("%s reaches no %s; a function that answers a question about a key without comparing it in constant time is not answering it safely",
+				one.name, theSanctionedComparison())
 		}
 	}
 }

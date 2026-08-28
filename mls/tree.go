@@ -83,7 +83,44 @@ func checkUnmergedLeavesSorted(leaves []LeafIndex) error {
 	return nil
 }
 
+// maxUnmergedLeaves is the longest unmerged_leaves vector this codec writes or accepts, in
+// ELEMENTS, derived from the byte bound rather than written down: an unmerged leaf is a uint32,
+// so the default vector limit divided by four is the longest list a peer running that limit
+// could have sent.
+const maxUnmergedLeaves = syntax.MaxVectorLength / 4
+
+// checkUnmergedLeavesBounded holds one parent node's unmerged_leaves at the DEFAULT vector limit
+// whatever limit the surrounding encode or decode happens to be running at.
+//
+// It has to be applied here, and not left to the writer or the reader the caller opened, because
+// the syntax package inherits its limit DOWNWARDS on purpose: subReader hands the parent's limit
+// to every nested read and WriteVector builds its scratch at the outer limit, which is what lets
+// a ratchet_tree running at MaxRatchetTreeLength carry a structure whose fields are larger than
+// one ordinary field may be. That inheritance is right for the ARRAY and wrong for this vector.
+// The ratchet_tree of RFC 9420 section 12.4.3.1 is raised because it is a whole tree; a single
+// parent node's unmerged list is bounded by the group's leaf count, and one past MaxVectorLength
+// is one no peer running the default limit could have sent -- which matters here because those
+// bytes are covered by the parent hash and the tree hash, so a vector this implementation
+// accepted and a peer refused is a tree only this implementation hashes.
+//
+// Without the check the argument written beside this pair's entry in the codec table is true
+// only until the first ratchet tree codec opens a raised writer, and it becomes false with
+// nothing failing. The bound is sixteen times smaller than the one it would inherit there.
+//
+// The decode side checks AFTER ReadVector rather than before, because the element count is not
+// something a decoder can know without reading the region; what that costs is one allocation
+// already bounded by the outer limit, on an input that had to carry those bytes anyway.
+func checkUnmergedLeavesBounded(leaves []LeafIndex) error {
+	if len(leaves) > maxUnmergedLeaves {
+		return syntax.ErrLengthExceedsMax
+	}
+	return nil
+}
+
 func (self *ParentNode) MarshalMLS(w *syntax.Writer) error {
+	if err := checkUnmergedLeavesBounded(self.UnmergedLeaves); err != nil {
+		return err
+	}
 	if err := checkUnmergedLeavesSorted(self.UnmergedLeaves); err != nil {
 		return err
 	}
@@ -116,6 +153,9 @@ func (self *ParentNode) UnmarshalMLS(r *syntax.Reader) error {
 	}
 	unmerged, err := syntax.ReadVector(r, readOneUnmergedLeaf)
 	if err != nil {
+		return err
+	}
+	if err := checkUnmergedLeavesBounded(unmerged); err != nil {
 		return err
 	}
 	if err := checkUnmergedLeavesSorted(unmerged); err != nil {
@@ -294,6 +334,14 @@ func (self *RatchetTree) ParentAt(x NodeIndex) *ParentNode {
 // empty at once -- IsBlank would answer false, Leaf would answer nil -- which is exactly the
 // blank as zero valued node conflation this file exists to prevent, and the encoder would then
 // have a present node with nothing to write. Blank is how a position is emptied.
+//
+// What is stored is a COPY, so the tree owns every node in it and the caller keeps whatever it
+// handed in. That is the same statement Clone makes, made at the other door: Clone's comment says
+// nothing may alias between two epochs' trees, and an install that adopted the caller's pointer
+// would let tree.SetLeaf(i, other.Leaf(j)) put one *LeafNode in two of them -- after which a
+// commit computed against one epoch and later rejected has already written through the other. A
+// caller that means to keep editing the node reads it back through Leaf, which is the accessor
+// that hands out the tree's own pointer on purpose.
 func (self *RatchetTree) SetLeaf(i LeafIndex, leaf *LeafNode) error {
 	if leaf == nil {
 		return ErrTreeMalformed
@@ -304,7 +352,7 @@ func (self *RatchetTree) SetLeaf(i LeafIndex, leaf *LeafNode) error {
 	if err := self.growTo(LeafCount(i) + 1); err != nil {
 		return err
 	}
-	self.setNode(i.NodeIndex(), &Node{NodeType: NodeTypeLeaf, Leaf: leaf})
+	self.setNode(i.NodeIndex(), &Node{NodeType: NodeTypeLeaf, Leaf: leaf.Clone()})
 	return nil
 }
 
@@ -312,7 +360,7 @@ func (self *RatchetTree) SetLeaf(i LeafIndex, leaf *LeafNode) error {
 //
 // It does NOT grow. A parent node above a leaf that is not in the tree is not a position the
 // tree has, and growing on its behalf would invent a subtree nobody added a member to. A nil
-// parent is refused for SetLeaf's reason.
+// parent is refused for SetLeaf's reason, and the payload is copied for SetLeaf's reason.
 func (self *RatchetTree) SetParent(x NodeIndex, parent *ParentNode) error {
 	if x.IsLeaf() {
 		return ErrNodeTypeMismatch
@@ -323,7 +371,7 @@ func (self *RatchetTree) SetParent(x NodeIndex, parent *ParentNode) error {
 	if uint32(x) >= self.NodeWidth() {
 		return ErrNodeIndexOutOfRange
 	}
-	self.setNode(x, &Node{NodeType: NodeTypeParent, Parent: parent})
+	self.setNode(x, &Node{NodeType: NodeTypeParent, Parent: parent.Clone()})
 	return nil
 }
 
@@ -400,6 +448,14 @@ func (self *RatchetTree) MemberCount() uint32 {
 // what is being protected is not the key but the ANSWER: this runs over every member of a group
 // on a path a peer can trigger, and a comparison that returned early would leak how far a
 // probed key matched a member's.
+//
+// The LOWEST matching index wins, and that is a decision rather than a consequence of the loop.
+// A tree is not guaranteed free of duplicate signature keys when this runs: it is how a member
+// locates its own leaf in a tree a peer supplied, which happens before ValSem101's duplicate
+// signature key refusal has necessarily run over that tree. Two members answering different
+// positions for one key would each sign and decrypt as a different leaf, so the tie break is
+// stated here and pinned by TestFindLeafBySignatureKeyAnswersTheLowestMatchingLeaf rather than
+// left to whichever direction a later rewrite happens to scan in.
 func (self *RatchetTree) FindLeafBySignatureKey(key SignaturePublicKey) (LeafIndex, bool) {
 	for i := uint32(0); i < uint32(self.LeafWidth()); i += 1 {
 		leaf := self.Leaf(LeafIndex(i))
@@ -459,18 +515,27 @@ func (self *RatchetTree) IsBlank(x NodeIndex) bool {
 	return self.Get(x) == nil
 }
 
-// UnmergedLeaves answers the node's STORED list in stored order.
+// UnmergedLeaves answers a COPY of the node's stored list, in stored order.
 //
 // Stored order and not sorted order: tree_math.go's NodeShape contract says so, and the reason
 // is that a repair here would hide the tree that needs rejecting. Sortedness is refused at the
 // codec boundary, where the bytes a tree hash is taken over are decided, and checked again by
 // whole tree validation; it is not something a resolution walk silently fixes up.
+//
+// A copy and not the live slice, which is the half a reader has to be told because it costs an
+// allocation. This is the NodeShape method the tree math walks, so its answer reaches code that
+// has no idea it is holding a tree's own storage, and the ordinary way to narrow a list in go --
+// kept := answer[:0] followed by append -- writes through the backing array. Measured on this
+// tree that rewrote a real parent node's unmerged list in place, which is a different parent
+// hash at that node and a fork at the next tree hash. The tree math only ranges over the answer
+// today; a copy is what keeps the day it does something else from being a silent one. The empty
+// case allocates nothing, since cloneSlice answers nil for nil.
 func (self *RatchetTree) UnmergedLeaves(x NodeIndex) []LeafIndex {
 	parent := self.ParentAt(x)
 	if parent == nil {
 		return nil
 	}
-	return parent.UnmergedLeaves
+	return cloneSlice(parent.UnmergedLeaves)
 }
 
 var _ NodeShape = (*RatchetTree)(nil)

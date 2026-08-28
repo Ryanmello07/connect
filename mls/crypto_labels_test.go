@@ -613,6 +613,18 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// leaf count, and one allowed past MaxVectorLength is one no peer running the default
 		// limit could have sent, which matters here because those bytes are covered by the
 		// parent hash and the tree hash.
+		//
+		// That last sentence is a decision and NOT a consequence of these two calls, which is
+		// the thing to read twice here. The syntax package inherits its limit downwards on
+		// purpose -- subReader hands the parent's limit to every nested read, WriteVector
+		// builds its scratch at the outer one -- so the day a ratchet tree codec opens a
+		// writer at MaxRatchetTreeLength, this pair inherits it and one parent node's
+		// unmerged list may run to sixteen mebibytes, four million leaves, sixteen times the
+		// bound argued for above, with nothing failing. So tree.go's checkUnmergedLeavesBounded
+		// applies the default bound to this vector itself, in both halves, whatever limit the
+		// caller opened, and TestOneParentNodesUnmergedLeavesStayAtTheDefaultLimitUnderARaised
+		// One is what holds it. A limit decision recorded only in a comment is a limit
+		// decision the next task moves without noticing.
 		"tree.go: syntax.ReadVector(r, readOneUnmergedLeaf)",
 		"tree.go: syntax.WriteVector(w, self.UnmergedLeaves, writeOneUnmergedLeaf)",
 		// marshalBytes, the preimage encoder every signature content and hash input of the
