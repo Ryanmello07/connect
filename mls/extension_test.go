@@ -202,6 +202,35 @@ func handDerivedExtensionsVectorGolden() []byte {
 	return joinBytes([]byte{0x06}, handDerivedRequiredCapabilitiesExtensionGolden())
 }
 
+// handDerivedMultiEntryExtensionsVectorGolden is the same vector carrying three entries whose
+// bodies differ in the way that matters:
+//
+//	0003 03 000000        -> 06 octets
+//	f001 06 "policy"      -> 09 octets
+//	f002 00               -> 03 octets
+//
+// 6 + 9 + 3 = 18 = 0x12, which is the vector's own prefix, and 19 octets in all. The third
+// entry is the one worth having: an absent body and an empty body are one encoding, so an
+// implementation that wrote nothing at all for a nil body would produce a two entry vector and
+// a length prefix that no longer describes it.
+func handDerivedMultiEntryExtensionsVectorGolden() []byte {
+	return joinBytes(
+		[]byte{0x12},
+		[]byte{0x00, 0x03}, []byte{0x03}, []byte{0x00, 0x00, 0x00},
+		[]byte{0xf0, 0x01}, []byte{0x06}, []byte("policy"),
+		[]byte{0xf0, 0x02}, []byte{0x00},
+	)
+}
+
+// multiEntryExtensionsGoldenValue is the vector those octets describe.
+func multiEntryExtensionsGoldenValue() []Extension {
+	return []Extension{
+		{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x00, 0x00, 0x00}},
+		{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte("policy")},
+		{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: nil},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the upstream corpus
 // ---------------------------------------------------------------------------
@@ -661,6 +690,37 @@ func TestExtensionMarshalMatchesTheHandDerivedGoldens(t *testing.T) {
 		!bytes.Equal(out[0].ExtensionData, []byte{0x00, 0x00, 0x00}) {
 		t.Fatalf("ReadExtensions = %+v", out)
 	}
+
+	// three entries, an absent body among them, and the vector's byte count over all of them
+	many := syntax.NewWriter()
+	if err := WriteExtensions(many, multiEntryExtensionsGoldenValue()); err != nil {
+		t.Fatalf("WriteExtensions: %v", err)
+	}
+	manyEncoded, err := many.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	want := handDerivedMultiEntryExtensionsVectorGolden()
+	if len(want) != 19 {
+		t.Fatalf("the hand derivation is %d octets, the arithmetic in its comment says 19", len(want))
+	}
+	if !bytes.Equal(manyEncoded, want) {
+		t.Fatalf("WriteExtensions =\n %x\nwant\n %x", manyEncoded, want)
+	}
+	back, err := ReadExtensions(syntax.NewReader(want))
+	if err != nil {
+		t.Fatalf("ReadExtensions: %v", err)
+	}
+	if len(back) != 3 {
+		t.Fatalf("ReadExtensions returned %d entries, want 3: %+v", len(back), back)
+	}
+	for i, entry := range multiEntryExtensionsGoldenValue() {
+		if back[i].ExtensionType != entry.ExtensionType || !bytes.Equal(back[i].ExtensionData, entry.ExtensionData) {
+			t.Errorf("entry %d = {%#04x %x}, want {%#04x %x}",
+				i, uint16(back[i].ExtensionType), back[i].ExtensionData,
+				uint16(entry.ExtensionType), entry.ExtensionData)
+		}
+	}
 }
 
 // TestExtensionCarriesAnUnregisteredTypeUnchanged is the codec-decides-no-policy rule stated
@@ -854,8 +914,101 @@ func checkCodecRefusals[T any, PT interface {
 	t.Logf("%d corruptions accepted and re-encoded exactly, %d refused", acceptedCorruptions, refusedCorruptions)
 }
 
+// checkTruncatedRegistryVectorReportsTruncation states which refusal a registry vector whose
+// region ends mid code point produces, over every field of one structure.
+//
+// The condition is narrow and the reason it is stated at all is not. readOneUint16 returns the
+// Reader's error, and an element decoder that dropped it instead would still be refused --
+// syntax.ReadVector notices that the element consumed nothing and raises ErrZeroLengthElement
+// -- so the swallowed error is invisible to every round trip, golden and corruption property in
+// this file. It was measured: dropping it changes nothing any other test here can see. What it
+// does change is what the caller is told, from "the input is truncated", which is true and says
+// where to look, to "a vector element consumed zero bytes", which describes a decoder fault the
+// input did not cause.
+//
+// The encoding is built rather than corrupted so the failing field is the one chosen: every
+// other region is present and empty, and only the field under test declares an odd body.
+func checkTruncatedRegistryVectorReportsTruncation[T any, PT interface {
+	*T
+	syntax.Codec
+}](t *testing.T) {
+	t.Helper()
+	fields := reflect.TypeOf((*T)(nil)).Elem().NumField()
+	if fields == 0 {
+		t.Fatalf("%T declares no field, so this states nothing", *new(T))
+	}
+	for i := range fields {
+		encoded := []byte{}
+		for j := range fields {
+			switch {
+			case j == i:
+				// a one octet body, which is half a code point
+				encoded = append(encoded, 0x01, 0x00)
+			default:
+				encoded = append(encoded, 0x00)
+			}
+		}
+		err := syntax.Unmarshal(encoded, PT(new(T)))
+		if !errors.Is(err, syntax.ErrTruncated) {
+			t.Errorf("field %d of %T: a one octet region gave err = %v, want ErrTruncated; the element decoder has to surface the reader's own failure rather than leave the vector guard to name a different condition",
+				i, *new(T), err)
+		}
+	}
+}
+
 func TestExtensionRefusesTrailingTruncatedAndNonCanonicalInput(t *testing.T) {
 	checkCodecRefusals[Extension](t, goldenExtensionEncodings())
+}
+
+// TestExtensionsVectorReportsTheEntryDecodersOwnFailure states which refusal an extensions
+// vector produces when its region is well formed and the ENTRY inside it is not.
+//
+// Same shape as the code point truncation above and the same reason for existing.
+// readOneExtension returns the entry decoder's error, and one that dropped it would still be
+// refused: syntax.ReadVector notices either that the element consumed nothing or, at the end
+// of the region, that the sub reader is latched. That was measured exhaustively over every
+// octet string of four bytes or fewer, and the accept set is identical to the byte -- 16908545
+// of them accepted with the error dropped and with it kept -- so no other property in this
+// package can see the difference. What does change, for 33554688 of those inputs, is what the
+// caller is told: "vector element consumed zero bytes", which describes a decoder fault, in
+// place of the truncation or overlong length the input actually carried.
+//
+// The family is derived from the entry goldens: a vector whose declared region is exactly the
+// first k octets of a valid entry, for every k short of the whole, so the region is intact and
+// only the entry inside it is cut.
+func TestExtensionsVectorReportsTheEntryDecodersOwnFailure(t *testing.T) {
+	checked := 0
+	for name, entry := range goldenExtensionEncodings() {
+		for k := 1; k < len(entry); k++ {
+			if k > 60 {
+				// the region prefix below is written as one octet, which expresses 63
+				break
+			}
+			encoded := append([]byte{byte(k)}, entry[:k]...)
+			out, err := ReadExtensions(syntax.NewReader(encoded))
+			if err == nil {
+				t.Errorf("%s: a %d octet region holding a cut entry was accepted as %v", name, k, out)
+				continue
+			}
+			if errors.Is(err, syntax.ErrZeroLengthElement) {
+				t.Errorf("%s: a %d octet region holding a cut entry reported %v; that names a decoder fault rather than the truncation the input carries, which is what dropping the entry decoder's error looks like from outside",
+					name, k, err)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no cut entry was built, so this states nothing")
+	}
+	t.Logf("%d cut entries refused with the entry decoder's own condition", checked)
+}
+
+func TestCapabilitiesReportsTruncationForEveryHalfReadCodePoint(t *testing.T) {
+	checkTruncatedRegistryVectorReportsTruncation[Capabilities](t)
+}
+
+func TestRequiredCapabilitiesReportsTruncationForEveryHalfReadCodePoint(t *testing.T) {
+	checkTruncatedRegistryVectorReportsTruncation[RequiredCapabilities](t)
 }
 
 func TestCapabilitiesRefusesTrailingTruncatedAndNonCanonicalInput(t *testing.T) {
