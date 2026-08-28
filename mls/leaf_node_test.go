@@ -2564,3 +2564,816 @@ func TestNewLeafNodeRoutesThroughTheProviderItWasHanded(t *testing.T) {
 		t.Error("NewLeafNode reached the provider it was handed not at all")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// p5 task 7: RFC 9420 section 7.3 leaf node validation, and erratum 8745
+// ---------------------------------------------------------------------------
+
+// The group and the position every leaf below is signed into, written once because the leaf
+// signature of the update and commit sources is BOUND to both: a leaf signed under one group id
+// and validated under another is the member substitution section 7.2's select exists to
+// prevent, and a helper that spelled the two differently would report that as a signature bug.
+const leafValidationGroupId = "group"
+
+const leafValidationLeafIndex = LeafIndex(1)
+
+// leafValidationLeafKeysEntry is a WELL FORMED urmessage_leaf_keys entry.
+//
+// The template leaf's own 0xF002 entry carries the body []byte("k"), which is one octet and
+// cannot be a uint16 alg_id followed by anything. That is deliberate in the codec tests --
+// nothing there parses the body -- and it is fatal to a validation test, because Validate range
+// checks every leaf keys body it finds and every leaf built on the raw template is refused for
+// that before any rule under test is reached. Building the entry through Encode rather than by
+// hand means the body this suite validates against is the body this package emits.
+func leafValidationLeafKeysEntry(t *testing.T) Extension {
+	t.Helper()
+	entry, err := (&LeafKeysExtension{
+		AlgId:          AlgIdXwing,
+		DeviceXwingPub: repeatByte(0x55, XwingPublicKeyLen),
+	}).Encode()
+	if err != nil {
+		t.Fatalf("LeafKeysExtension.Encode: %v", err)
+	}
+	return entry
+}
+
+// leafValidationCrypto is one provider for the profile's one ciphersuite.
+func leafValidationCrypto(t *testing.T) CryptoProvider {
+	t.Helper()
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	return crypto
+}
+
+// leafValidationSignedLeaf is a leaf that Validate accepts, under one source, with mutate given
+// the chance to break exactly one thing about it before it is signed.
+//
+// Before rather than after, so that a mutation is a leaf somebody could actually have SENT: a
+// field changed after signing is refused by the signature check whatever else is wrong with it,
+// which would make every case below a signature test wearing another case's name. The tests
+// that do want a post-signature edit make it themselves and say so.
+func leafValidationSignedLeaf(t *testing.T, crypto CryptoProvider, source LeafNodeSource,
+	mutate func(leaf *LeafNode)) *LeafNode {
+	t.Helper()
+	signerPriv, signerPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair: %v", err)
+	}
+	leaf := testLeafNodeTemplate()
+	leaf.SignatureKey = signerPub
+	leaf.LeafNodeSource = source
+	leaf.Extensions = []Extension{leafValidationLeafKeysEntry(t)}
+	switch source {
+	case LeafNodeSourceKeyPackage:
+		leaf.Lifetime = Lifetime{NotBefore: 0, NotAfter: 1 << 40}
+	case LeafNodeSourceCommit:
+		leaf.ParentHash = repeatByte(0x44, 32)
+	}
+	if mutate != nil {
+		mutate(leaf)
+	}
+	if err := leaf.Sign(crypto, signerPriv, []byte(leafValidationGroupId), leafValidationLeafIndex); err != nil {
+		t.Fatalf("source %d: Sign: %v", source, err)
+	}
+	return leaf
+}
+
+// leafValidationContextFor is the context that accepts the leaf above, and every case below is
+// that context with one thing changed. Fresh storage every call, so a case that edits what it
+// was handed cannot reach the next one.
+func leafValidationContextFor(crypto CryptoProvider, source LeafNodeSource) *LeafValidationContext {
+	return &LeafValidationContext{
+		Crypto:         crypto,
+		Suite:          CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:        []byte(leafValidationGroupId),
+		LeafIndex:      leafValidationLeafIndex,
+		ExpectedSource: source,
+		RequiredCaps: &RequiredCapabilities{
+			ExtensionTypes:  []ExtensionType{ExtensionTypeUrmessageLeafKeys},
+			CredentialTypes: []CredentialType{CredentialTypeBasic},
+		},
+		GroupExtensions: []Extension{
+			{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte("x")},
+		},
+		NowMs:       1000,
+		ClockSkewMs: 3600000,
+	}
+}
+
+// The accepting case, over every source rather than over one.
+//
+// It is the control the whole file rests on: every refusal below is stated as "this leaf, with
+// one thing changed, is refused", and that says nothing at all unless the unchanged leaf is
+// accepted. Over every source because two of the eight rules are conditioned on the source, and
+// a validator that accepted only commit leaves would satisfy a one-source control.
+func TestLeafNodeValidateAcceptsAGoodLeafUnderEverySource(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	sources := leafNodeSources(t)
+	for _, source := range sources {
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+		if err := leaf.Validate(leafValidationContextFor(crypto, source)); err != nil {
+			t.Errorf("source %d: Validate: %v", source, err)
+		}
+	}
+}
+
+// Section 7.3's leaf_node_source rule over the WHOLE cross product, not over a pair.
+//
+// The expected side sweeps the entire uint8 space rather than the three registered sources,
+// because the defect this rule exists to stop is a caller's expectation being ignored, and a
+// comparison that had been written as a membership test -- "the source is one this package
+// reads" -- would agree with the real one on every registered pairing and disagree on every
+// other. The actual side is the three that can be signed at all.
+func TestLeafNodeValidateRefusesEveryPairingOfActualAndExpectedSource(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	accepted, refused := 0, 0
+	for _, actual := range leafNodeSources(t) {
+		leaf := leafValidationSignedLeaf(t, crypto, actual, nil)
+		for expected := 0; expected <= 0xFF; expected++ {
+			ctx := leafValidationContextFor(crypto, actual)
+			ctx.ExpectedSource = LeafNodeSource(expected)
+			err := leaf.Validate(ctx)
+			if LeafNodeSource(expected) == actual {
+				if err != nil {
+					t.Errorf("source %d expected %d: Validate: %v", actual, expected, err)
+				}
+				accepted++
+				continue
+			}
+			if !errors.Is(err, ErrLeafNodeSourceMismatch) {
+				t.Errorf("source %d expected %d: err = %v, want ErrLeafNodeSourceMismatch",
+					actual, expected, err)
+			}
+			refused++
+		}
+	}
+	if accepted != len(leafNodeSources(t)) || refused == 0 {
+		t.Fatalf("the sweep accepted %d pairings and refused %d; with either side empty it is holding one rule rather than two",
+			accepted, refused)
+	}
+}
+
+// A nil context and a context with no provider in it are one condition and get one refusal.
+//
+// Validate reaches its provider through a structure rather than through a parameter, so the
+// package's nil provider gate -- which derives its class off the signatures that take a
+// CryptoProvider -- cannot see this one. That is why it is stated here by hand: without it,
+// Validate(nil) is a nil pointer dereference out of a library, which takes the caller's process
+// rather than its call and says nothing about which input was missing.
+func TestLeafNodeValidateRefusesANilContextAndANilProvider(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil)
+	for _, row := range []struct {
+		name string
+		ctx  *LeafValidationContext
+	}{
+		{name: "a nil context", ctx: nil},
+		{name: "a zero context", ctx: &LeafValidationContext{}},
+		{name: "a context whose provider was cleared", ctx: func() *LeafValidationContext {
+			ctx := leafValidationContextFor(crypto, LeafNodeSourceCommit)
+			ctx.Crypto = nil
+			return ctx
+		}()},
+	} {
+		err := func() (answered error) {
+			defer func() {
+				if panicked := recover(); panicked != nil {
+					t.Errorf("%s: Validate panicked with %v", row.name, panicked)
+					answered = nil
+				}
+			}()
+			return leaf.Validate(row.ctx)
+		}()
+		if !errors.Is(err, ErrNilCryptoProvider) {
+			t.Errorf("%s: err = %v, want ErrNilCryptoProvider", row.name, err)
+		}
+	}
+}
+
+// Section 7.3's signature rule, observed rather than assumed.
+//
+// The edit is made AFTER signing on purpose, which is the one place in this file that is the
+// right way round: what is under test is that Validate checks the signature at all, and a leaf
+// whose bytes changed under a signature that no longer covers them is exactly the input a
+// validator that skipped the check would accept.
+func TestLeafNodeValidateRefusesALeafEditedAfterItWasSigned(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	for _, source := range leafNodeSources(t) {
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+		leaf.Credential.Identity = []byte("mallory")
+		if err := leaf.Validate(leafValidationContextFor(crypto, source)); !errors.Is(err, ErrCryptoBadSignature) {
+			t.Errorf("source %d: err = %v, want a bad signature", source, err)
+		}
+	}
+}
+
+// The context the signature is bound to is the context Validate checks it in, and only for the
+// two sources whose LeafNodeTBS carries it.
+//
+// The table is not written here: leafNodeContextBoundSources is the package's own statement of
+// section 7.2's select, held to the derived source class by its own gate. A key_package leaf
+// verifies in any group at any position BY DESIGN -- it is minted before either exists -- and a
+// validator that refused it under a group id would refuse every KeyPackage ever downloaded.
+func TestLeafNodeValidateCarriesTheGroupAndPositionBindingExactlyWhereTheSourceHasOne(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	for _, source := range leafNodeSources(t) {
+		bound := leafNodeContextBoundSources[source]
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+
+		wrongGroup := leafValidationContextFor(crypto, source)
+		wrongGroup.GroupId = []byte("another group")
+		if err := leaf.Validate(wrongGroup); bound != (err != nil) {
+			t.Errorf("source %d under another group id: err = %v, bound = %v", source, err, bound)
+		}
+
+		wrongIndex := leafValidationContextFor(crypto, source)
+		wrongIndex.LeafIndex = leafValidationLeafIndex + 1
+		if err := leaf.Validate(wrongIndex); bound != (err != nil) {
+			t.Errorf("source %d at another leaf index: err = %v, bound = %v", source, err, bound)
+		}
+	}
+}
+
+// Section 7.2: "the credential type used in the LeafNode MUST be included in the credentials
+// field of the capabilities field", and section 5.3: this profile reads basic and nothing else.
+//
+// Both halves are stated because they are enforced in two different places and one of them can
+// hide the other. The credential type is edited after signing for the reason the file cannot
+// avoid: Credential.MarshalMLS refuses an x509 credential, so a leaf carrying one cannot be
+// signed at all and there is no other way to build the input.
+func TestLeafNodeValidateRefusesACredentialTheLeafOrTheProfileDoesNotAdmit(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+
+	// the leaf does not list the credential type it carries: section 7.2's rule, and the only
+	// order of checks under which it can fire at all.
+	unlisted := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil)
+	unlisted.Credential.CredentialType = CredentialType(0x0002)
+	if err := unlisted.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); !errors.Is(err, errMissingRequiredCapability) {
+		t.Errorf("an unlisted credential type: err = %v, want errMissingRequiredCapability", err)
+	}
+
+	// the leaf lists it and the profile still refuses it, from inside the signature preimage.
+	listed := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+		leaf.Capabilities.Credentials = []CredentialType{CredentialTypeBasic, CredentialType(0x0002)}
+	})
+	listed.Credential.CredentialType = CredentialType(0x0002)
+	if err := listed.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); !errors.Is(err, errProfileCredentialType) {
+		t.Errorf("an x509 credential the leaf claims to support: err = %v, want errProfileCredentialType", err)
+	}
+}
+
+// Section 11.1: "At a minimum, all members of the group need to support the cipher suite and
+// protocol version in use."
+//
+// The refusing half sweeps every ciphersuite the package declares rather than picking one, so
+// the assertion is "the group's suite has to be in the leaf's list" and not "this one suite is".
+func TestLeafNodeValidateRefusesALeafThatDoesNotListTheGroupsCiphersuite(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	suites := sortedValues(registryConstantsOfType(t, "CipherSuite"))
+	if len(suites) == 0 {
+		t.Fatal("no CipherSuite constant was derived, so this sweep runs over nothing")
+	}
+	swept := 0
+	for _, value := range suites {
+		suite := CipherSuite(value)
+		leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+			leaf.Capabilities.CipherSuites = []CipherSuite{}
+		})
+		ctx := leafValidationContextFor(crypto, LeafNodeSourceCommit)
+		ctx.Suite = suite
+		if err := leaf.Validate(ctx); !errors.Is(err, errMissingRequiredCapability) {
+			t.Errorf("suite %#04x absent from the leaf: err = %v, want errMissingRequiredCapability", suite, err)
+		}
+		listing := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+			leaf.Capabilities.CipherSuites = []CipherSuite{suite}
+		})
+		if err := listing.Validate(ctx); err != nil {
+			t.Errorf("suite %#04x listed by the leaf: Validate: %v", suite, err)
+		}
+		swept++
+	}
+	if swept == 0 {
+		t.Fatal("the ciphersuite sweep ran over nothing")
+	}
+}
+
+// The RFC 9420 section 7.2 default extension class, held over the whole uint16 space.
+//
+// The class in leaf_node.go is a RANGE, and the argument for the range is that section 17.3's
+// initial registry happens to be contiguous. That argument is exactly the kind that stays true
+// by luck, so it is checked here against the five code points section 7.2 names one at a time.
+// If a later document registers 0x0006 and somebody widens the range to match, this fails --
+// which is correct, because a code point registered outside RFC 9420 is not default and MUST be
+// listed.
+func TestTheDefaultExtensionTypeClassIsExactlyTheFiveRfc9420Section72Names(t *testing.T) {
+	// "The following proposal and extension types are considered "default" and MUST NOT be
+	// listed: ... Extension types: 0x0001 - application_id, 0x0002 - ratchet_tree,
+	// 0x0003 - required_capabilities, 0x0004 - external_pub, 0x0005 - external_senders"
+	// -- RFC 9420 section 7.2.
+	named := map[ExtensionType]bool{
+		0x0001: true, // application_id
+		0x0002: true, // ratchet_tree
+		0x0003: true, // required_capabilities
+		0x0004: true, // external_pub
+		0x0005: true, // external_senders
+	}
+	disagreements := []string{}
+	for value := 0; value <= 0xFFFF; value++ {
+		extensionType := ExtensionType(value)
+		if isDefaultExtensionType(extensionType) != named[extensionType] {
+			disagreements = append(disagreements, fmt.Sprintf("%#04x", value))
+		}
+	}
+	if len(disagreements) != 0 {
+		t.Errorf("isDefaultExtensionType disagrees with section 7.2 at %v", disagreements)
+	}
+	// this package's own private use points are NOT default and every leaf has to list them.
+	for name, value := range registryConstantsOfType(t, "ExtensionType") {
+		if value < 0xF000 {
+			continue
+		}
+		if isDefaultExtensionType(ExtensionType(value)) {
+			t.Errorf("%s is %#04x, a private use point, and is being treated as an RFC 9420 default", name, value)
+		}
+	}
+}
+
+// leafValidationExtensionTypeSweep is the class both extension rules are stated over: every
+// extension type this package declares, plus the two octets either side of the default range.
+//
+// Derived from the package's own registry and from the range constants rather than typed out,
+// so a code point added to either lands in this sweep on the commit that adds it. The
+// boundaries are what separates "the default types are exempt" from "types below six are
+// exempt": 0x0000 and 0x0006 are one step outside and must be demanded.
+func leafValidationExtensionTypeSweep(t *testing.T) []ExtensionType {
+	t.Helper()
+	seen := map[ExtensionType]bool{}
+	sweep := []ExtensionType{}
+	add := func(extensionType ExtensionType) {
+		if seen[extensionType] {
+			return
+		}
+		seen[extensionType] = true
+		sweep = append(sweep, extensionType)
+	}
+	for value := defaultExtensionTypeLow - 1; value <= defaultExtensionTypeHigh+1; value++ {
+		add(ExtensionType(value))
+	}
+	for _, value := range sortedValues(registryConstantsOfType(t, "ExtensionType")) {
+		add(ExtensionType(value))
+	}
+	if len(sweep) < 8 {
+		t.Fatalf("the extension type sweep is %d wide, which is too few to hold both sides of the rule", len(sweep))
+	}
+	return sweep
+}
+
+// leafValidationEntryOf is one extensions<V> entry of the given type whose body this package
+// would accept, which for urmessage_leaf_keys is not an arbitrary one.
+func leafValidationEntryOf(t *testing.T, extensionType ExtensionType) Extension {
+	t.Helper()
+	if extensionType == ExtensionTypeUrmessageLeafKeys {
+		return leafValidationLeafKeysEntry(t)
+	}
+	return Extension{ExtensionType: extensionType, ExtensionData: []byte("x")}
+}
+
+// Section 7.3's own-extension rule, narrowed by section 7.2 to the NON-DEFAULT types.
+//
+// Both directions over the same sweep, which is what makes it a rule rather than a refusal: a
+// type the leaf does not list is refused unless section 7.2 forbids listing it, and the same
+// type listed is accepted. A validator that demanded every type would fail the default rows; one
+// that demanded none would fail every other row.
+func TestLeafNodeValidateDemandsEveryNonDefaultExtensionTheLeafCarriesAndNoDefaultOne(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	demanded, exempt := 0, 0
+	for _, extensionType := range leafValidationExtensionTypeSweep(t) {
+		unlisted := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+			leaf.Capabilities.Extensions = []ExtensionType{ExtensionTypeUrmessageLeafKeys}
+			leaf.Extensions = []Extension{leafValidationLeafKeysEntry(t), leafValidationEntryOf(t, extensionType)}
+		})
+		err := unlisted.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit))
+		if isDefaultExtensionType(extensionType) || extensionType == ExtensionTypeUrmessageLeafKeys {
+			if err != nil {
+				t.Errorf("the leaf carries %#04x, which it need not list: Validate: %v", extensionType, err)
+			}
+			exempt++
+			continue
+		}
+		if !errors.Is(err, errMissingRequiredCapability) {
+			t.Errorf("the leaf carries %#04x and does not list it: err = %v, want errMissingRequiredCapability",
+				extensionType, err)
+		}
+		demanded++
+
+		listed := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+			leaf.Capabilities.Extensions = []ExtensionType{ExtensionTypeUrmessageLeafKeys, extensionType}
+			leaf.Extensions = []Extension{leafValidationLeafKeysEntry(t), leafValidationEntryOf(t, extensionType)}
+		})
+		if err := listed.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); err != nil {
+			t.Errorf("the leaf carries %#04x and lists it: Validate: %v", extensionType, err)
+		}
+	}
+	if demanded == 0 || exempt == 0 {
+		t.Fatalf("the sweep demanded %d extension types and exempted %d; with either side empty it holds one rule rather than two",
+			demanded, exempt)
+	}
+}
+
+// RFC 9420 erratum 8745, over the whole source class and in both directions.
+//
+// The erratum's correction to section 13.4 is that a client "updating a leaf node in the group
+// MUST verify that the new LeafNode is compatible with the group's extensions", and that this
+// "applies both to Update proposals and LeafNode objects in the update_path in a Commit". The
+// pre-erratum text requires it of a client ADDING a member, which is the key_package leaf alone.
+//
+// So the failing half runs over every source rather than over key_package: an implementation
+// written from the uncorrected text passes the key_package row and fails the other two, which is
+// the whole content of the erratum. The accepting half runs over every source as well, because
+// a validator that refused unconditionally would pass a test made only of refusals.
+func TestErrata8745(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	groupExtension := ExtensionTypeUrmessageGroupPolicy
+	sources := leafNodeSources(t)
+	for _, source := range sources {
+		unsupported := leafValidationSignedLeaf(t, crypto, source, func(leaf *LeafNode) {
+			leaf.Capabilities.Extensions = []ExtensionType{ExtensionTypeUrmessageLeafKeys}
+		})
+		ctx := leafValidationContextFor(crypto, source)
+		ctx.RequiredCaps = nil
+		ctx.GroupExtensions = []Extension{{ExtensionType: groupExtension, ExtensionData: []byte("p")}}
+		if err := unsupported.Validate(ctx); !errors.Is(err, errMissingRequiredCapability) {
+			t.Errorf("source %d: err = %v, want errMissingRequiredCapability (erratum 8745: the uncorrected section 13.4 requires this of key_package alone)",
+				source, err)
+		}
+
+		supported := leafValidationSignedLeaf(t, crypto, source, func(leaf *LeafNode) {
+			leaf.Capabilities.Extensions = []ExtensionType{ExtensionTypeUrmessageLeafKeys, groupExtension}
+		})
+		accepting := leafValidationContextFor(crypto, source)
+		accepting.RequiredCaps = nil
+		accepting.GroupExtensions = []Extension{{ExtensionType: groupExtension, ExtensionData: []byte("p")}}
+		if err := supported.Validate(accepting); err != nil {
+			t.Errorf("source %d: a leaf that does list %#04x was refused: %v", source, groupExtension, err)
+		}
+	}
+	if len(sources) < 2 {
+		t.Fatalf("the erratum sweep ran over %d sources; with fewer than two it cannot tell the corrected reading from the uncorrected one", len(sources))
+	}
+}
+
+// The group context rule over the same swept class as the leaf's own extensions, and with the
+// same exemption.
+//
+// This is the half of the erratum that is easy to get wrong in the other direction. Section 7.2
+// forbids a leaf from listing required_capabilities or external_senders, and both are GroupContext
+// extensions, so a group extension loop with no exemption refuses every conforming member of any
+// group that uses either.
+func TestLeafNodeValidateDemandsEveryNonDefaultGroupContextExtensionAndNoDefaultOne(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	demanded, exempt := 0, 0
+	for _, extensionType := range leafValidationExtensionTypeSweep(t) {
+		leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+			leaf.Capabilities.Extensions = []ExtensionType{ExtensionTypeUrmessageLeafKeys}
+		})
+		ctx := leafValidationContextFor(crypto, LeafNodeSourceCommit)
+		ctx.RequiredCaps = nil
+		ctx.GroupExtensions = []Extension{{ExtensionType: extensionType, ExtensionData: []byte("g")}}
+		err := leaf.Validate(ctx)
+		if isDefaultExtensionType(extensionType) || extensionType == ExtensionTypeUrmessageLeafKeys {
+			if err != nil {
+				t.Errorf("the group context carries %#04x, which no leaf may list: Validate: %v", extensionType, err)
+			}
+			exempt++
+			continue
+		}
+		if !errors.Is(err, errMissingRequiredCapability) {
+			t.Errorf("the group context carries %#04x and the leaf does not list it: err = %v, want errMissingRequiredCapability",
+				extensionType, err)
+		}
+		demanded++
+	}
+	if demanded == 0 || exempt == 0 {
+		t.Fatalf("the group context sweep demanded %d extension types and exempted %d; with either side empty it holds one rule rather than two",
+			demanded, exempt)
+	}
+}
+
+// leafValidationRequiredCapabilitiesRow is one vector of RequiredCapabilities, the requirement
+// that a leaf built from the template does NOT meet, and the capability edit that meets it.
+type leafValidationRequiredCapabilitiesRow struct {
+	field   string
+	require func(rc *RequiredCapabilities)
+	support func(caps *Capabilities)
+}
+
+// One row per vector, held against the structure's own fields by the test below.
+//
+// The requirements are private use code points on purpose. The registered proposal types are
+// section 7.2 "default" and MUST NOT be listed by a leaf, so a row that required ProposalTypeAdd
+// would be asserting that a conforming leaf is refused; the credential row uses 0x0002 because
+// SupportsCredential answers true for basic whatever the vector holds.
+func leafValidationRequiredCapabilitiesRows() []leafValidationRequiredCapabilitiesRow {
+	return []leafValidationRequiredCapabilitiesRow{
+		{
+			field: "ExtensionTypes",
+			require: func(rc *RequiredCapabilities) {
+				rc.ExtensionTypes = []ExtensionType{ExtensionTypeUrmessageOwnerSuccessor}
+			},
+			support: func(caps *Capabilities) {
+				caps.Extensions = append(caps.Extensions, ExtensionTypeUrmessageOwnerSuccessor)
+			},
+		},
+		{
+			field:   "ProposalTypes",
+			require: func(rc *RequiredCapabilities) { rc.ProposalTypes = []ProposalType{ProposalType(0xF001)} },
+			support: func(caps *Capabilities) { caps.Proposals = append(caps.Proposals, ProposalType(0xF001)) },
+		},
+		{
+			field:   "CredentialTypes",
+			require: func(rc *RequiredCapabilities) { rc.CredentialTypes = []CredentialType{CredentialType(0x0002)} },
+			support: func(caps *Capabilities) { caps.Credentials = append(caps.Credentials, CredentialType(0x0002)) },
+		},
+	}
+}
+
+// Section 7.3: "If the GroupContext has a required_capabilities extension, then the required
+// extensions, proposals, and credential types MUST be listed in the LeafNode's capabilities
+// field" -- over every vector of the structure, and not over the one somebody remembered.
+//
+// The class is read off RequiredCapabilities itself, so a fourth vector added to that structure
+// fails here rather than going unenforced. That is the shape this project has been bitten by
+// fourteen times: a table named for a whole rule holding all but one of it.
+func TestLeafNodeValidateEnforcesEveryRequiredCapabilitiesVector(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	rows := leafValidationRequiredCapabilitiesRows()
+	structure := reflect.TypeOf(RequiredCapabilities{})
+	byField := map[string]leafValidationRequiredCapabilitiesRow{}
+	for _, row := range rows {
+		if _, repeated := byField[row.field]; repeated {
+			t.Fatalf("two rows name %s, so one of them is never run", row.field)
+		}
+		byField[row.field] = row
+	}
+	for i := 0; i < structure.NumField(); i++ {
+		name := structure.Field(i).Name
+		row, written := byField[name]
+		if !written {
+			t.Errorf("RequiredCapabilities.%s has no row, so nothing holds Validate to it", name)
+			continue
+		}
+		delete(byField, name)
+
+		refusing := leafValidationContextFor(crypto, LeafNodeSourceCommit)
+		refusing.RequiredCaps = &RequiredCapabilities{}
+		row.require(refusing.RequiredCaps)
+		leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil)
+		if err := leaf.Validate(refusing); !errors.Is(err, errMissingRequiredCapability) {
+			t.Errorf("%s: err = %v, want errMissingRequiredCapability", name, err)
+		}
+
+		accepting := leafValidationContextFor(crypto, LeafNodeSourceCommit)
+		accepting.RequiredCaps = &RequiredCapabilities{}
+		row.require(accepting.RequiredCaps)
+		supporting := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+			row.support(&leaf.Capabilities)
+		})
+		if err := supporting.Validate(accepting); err != nil {
+			t.Errorf("%s: a leaf that meets the requirement was refused: %v", name, err)
+		}
+	}
+	for name := range byField {
+		t.Errorf("a row names %s, and RequiredCapabilities has no such vector", name)
+	}
+
+	// a group with no required_capabilities requires nothing.
+	nothing := leafValidationContextFor(crypto, LeafNodeSourceCommit)
+	nothing.RequiredCaps = nil
+	if err := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil).Validate(nothing); err != nil {
+		t.Errorf("a nil RequiredCapabilities refused a leaf: %v", err)
+	}
+}
+
+// leafValidationMalformedLeafKeysBodies is every way an urmessage_leaf_keys body can be one this
+// profile must not act on, derived from the two range checks the parser makes plus the two ways
+// the decode itself can fail.
+func leafValidationMalformedLeafKeysBodies(t *testing.T) map[string][]byte {
+	t.Helper()
+	good := leafValidationLeafKeysEntry(t).ExtensionData
+	wrongAlg, err := marshalBytes(func(w *syntax.Writer) error {
+		w.WriteUint16(0x0013)
+		w.WriteOpaque(repeatByte(0x55, XwingPublicKeyLen))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("marshalBytes: %v", err)
+	}
+	shortKey, err := marshalBytes(func(w *syntax.Writer) error {
+		w.WriteUint16(AlgIdXwing)
+		w.WriteOpaque(repeatByte(0x55, XwingPublicKeyLen-1))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("marshalBytes: %v", err)
+	}
+	return map[string][]byte{
+		"an alg_id this profile does not implement": wrongAlg,
+		"a device key one octet short":              shortKey,
+		"a body with a byte after it":               append(append([]byte{}, good...), 0x00),
+		"a body truncated to one octet":             good[:1],
+		"an empty body":                             {},
+	}
+}
+
+// Every urmessage_leaf_keys entry is range checked, and not only the first one a lookup finds.
+//
+// extensions<V> legally holds two entries of one type -- refusing a repeat is somebody else's
+// rule -- and a body checked through FindExtension is the first of them. The second row of this
+// table is the p4 ValSem401 shape written out: a rule applied to element zero, with the elements
+// after it carried into an accepted leaf unlooked at.
+func TestLeafNodeValidateRangeChecksEveryUrmessageLeafKeysEntry(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	good := leafValidationLeafKeysEntry(t)
+	swept := 0
+	for name, body := range leafValidationMalformedLeafKeysBodies(t) {
+		bad := Extension{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: body}
+		for position, entries := range map[string][]Extension{
+			"first":  {bad, good},
+			"second": {good, bad},
+			"alone":  {bad},
+		} {
+			leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+				leaf.Extensions = entries
+			})
+			if err := leaf.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+				t.Errorf("%s, %s: err = %v, want ErrLeafKeysExtensionInvalid", name, position, err)
+			}
+			swept++
+		}
+	}
+	// the control: two well formed entries are accepted, so the rows above are refused for what
+	// their bodies hold and not for there being two of them.
+	both := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+		leaf.Extensions = []Extension{good, good}
+	})
+	if err := both.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); err != nil {
+		t.Errorf("two well formed leaf keys entries were refused: %v", err)
+	}
+	if swept == 0 {
+		t.Fatal("the malformed body sweep ran over nothing")
+	}
+}
+
+// leafValidationLifetimeRow is one lifetime, one clock, one tolerance and the answer.
+type leafValidationLifetimeRow struct {
+	name       string
+	notBefore  uint64
+	notAfter   uint64
+	nowMs      uint64
+	skewMs     uint64
+	wantAccept bool
+}
+
+// The lifetime table: both ends, at the boundary and one second either side of it, with the skew
+// at zero and non-zero, plus the degenerate intervals.
+//
+// The rows either side of each boundary are the whole point. A leaf whose lifetime is
+// comfortably in range is accepted by a comparison in either direction, by a skew applied to
+// either end, and by no check at all, so a table made of comfortable rows states nothing. What
+// separates the four is which row flips:
+//
+//   - a comparison inverted at the near end flips "one second before not_before".
+//   - a comparison inverted at the far end flips "one second after not_after".
+//   - a skew applied only to the far end flips "exactly the skew before not_before".
+//   - a skew applied only to the near end flips "exactly the skew after not_after".
+//   - no check at all flips every refusing row.
+func leafValidationLifetimeRows() []leafValidationLifetimeRow {
+	const nb = 1000
+	const na = 2000
+	const skew = 100
+	return []leafValidationLifetimeRow{
+		{name: "a second before not_before, no skew", notBefore: nb, notAfter: na, nowMs: (nb - 1) * 1000, wantAccept: false},
+		{name: "exactly not_before, no skew", notBefore: nb, notAfter: na, nowMs: nb * 1000, wantAccept: true},
+		{name: "a second after not_before, no skew", notBefore: nb, notAfter: na, nowMs: (nb + 1) * 1000, wantAccept: true},
+		{name: "a second before not_after, no skew", notBefore: nb, notAfter: na, nowMs: (na - 1) * 1000, wantAccept: true},
+		{name: "exactly not_after, no skew", notBefore: nb, notAfter: na, nowMs: na * 1000, wantAccept: true},
+		{name: "a second after not_after, no skew", notBefore: nb, notAfter: na, nowMs: (na + 1) * 1000, wantAccept: false},
+
+		{name: "a second past the skew before not_before", notBefore: nb, notAfter: na, nowMs: (nb - skew - 1) * 1000, skewMs: skew * 1000, wantAccept: false},
+		{name: "exactly the skew before not_before", notBefore: nb, notAfter: na, nowMs: (nb - skew) * 1000, skewMs: skew * 1000, wantAccept: true},
+		{name: "inside the skew before not_before", notBefore: nb, notAfter: na, nowMs: (nb - skew + 1) * 1000, skewMs: skew * 1000, wantAccept: true},
+		{name: "inside the skew after not_after", notBefore: nb, notAfter: na, nowMs: (na + skew - 1) * 1000, skewMs: skew * 1000, wantAccept: true},
+		{name: "exactly the skew after not_after", notBefore: nb, notAfter: na, nowMs: (na + skew) * 1000, skewMs: skew * 1000, wantAccept: true},
+		{name: "a second past the skew after not_after", notBefore: nb, notAfter: na, nowMs: (na + skew + 1) * 1000, skewMs: skew * 1000, wantAccept: false},
+
+		// the endpoints are seconds and the clock is milliseconds, so the last millisecond of
+		// not_after is still inside and the first of the second after it is not.
+		{name: "the last millisecond of not_after", notBefore: nb, notAfter: na, nowMs: na*1000 + 999, wantAccept: true},
+		{name: "the first millisecond after not_after", notBefore: nb, notAfter: na, nowMs: (na + 1) * 1000, wantAccept: false},
+
+		// an interval with no instants in it, which a wide enough skew makes both comparisons
+		// accept.
+		{name: "not_after before not_before", notBefore: na, notAfter: nb, nowMs: 1500 * 1000, skewMs: 3600 * 1000, wantAccept: false},
+
+		// the two ends of the uint64 range. A validator that widened by ADDING the skew to
+		// not_after wraps here and refuses a leaf that never expires.
+		{name: "a not_after at the top of the range", notBefore: 0, notAfter: ^uint64(0), nowMs: 1_000_000_000, skewMs: 3600 * 1000, wantAccept: true},
+		{name: "a not_before at the top of the range", notBefore: ^uint64(0), notAfter: ^uint64(0), nowMs: 1_000_000_000, skewMs: 3600 * 1000, wantAccept: false},
+
+		// a clock smaller than the tolerance, which is the guard on the near-end subtraction.
+		{name: "a clock inside the skew of the epoch", notBefore: 0, notAfter: 10, nowMs: 11_000, skewMs: 3600 * 1000, wantAccept: true},
+	}
+}
+
+// The lifetime rule at every boundary of both ends, with and without skew.
+func TestLeafNodeValidateChecksTheLifetimeAtBothEndsOfTheInterval(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	rows := leafValidationLifetimeRows()
+	accepted, refused := 0, 0
+	for _, row := range rows {
+		leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceKeyPackage, func(leaf *LeafNode) {
+			leaf.Lifetime = Lifetime{NotBefore: row.notBefore, NotAfter: row.notAfter}
+		})
+		ctx := leafValidationContextFor(crypto, LeafNodeSourceKeyPackage)
+		ctx.NowMs = row.nowMs
+		ctx.ClockSkewMs = row.skewMs
+		err := leaf.Validate(ctx)
+		if row.wantAccept {
+			if err != nil {
+				t.Errorf("%s: Validate: %v", row.name, err)
+			}
+			accepted++
+			continue
+		}
+		if !errors.Is(err, ErrLeafNodeLifetime) {
+			t.Errorf("%s: err = %v, want ErrLeafNodeLifetime", row.name, err)
+		}
+		refused++
+	}
+	if accepted == 0 || refused == 0 {
+		t.Fatalf("the lifetime table accepted %d rows and refused %d; with either side empty it holds one rule rather than two",
+			accepted, refused)
+	}
+}
+
+// The lifetime is a variant field of the key_package source, so every row of the table above is
+// accepted under the two sources that do not carry one.
+//
+// Nothing in an update or commit leaf's encoding or signature covers Lifetime, so a validator
+// that read it would be refusing a leaf for bytes nobody sent -- and the Go field is populated
+// on the template under every source, which is exactly the value it would read.
+func TestLeafNodeValidateReadsNoLifetimeUnderASourceThatCarriesNone(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	swept := 0
+	for _, source := range leafNodeSources(t) {
+		if source == LeafNodeSourceKeyPackage {
+			continue
+		}
+		for _, row := range leafValidationLifetimeRows() {
+			leaf := leafValidationSignedLeaf(t, crypto, source, func(leaf *LeafNode) {
+				leaf.Lifetime = Lifetime{NotBefore: row.notBefore, NotAfter: row.notAfter}
+			})
+			ctx := leafValidationContextFor(crypto, source)
+			ctx.NowMs = row.nowMs
+			ctx.ClockSkewMs = row.skewMs
+			if err := leaf.Validate(ctx); err != nil {
+				t.Errorf("source %d, %s: Validate: %v", source, row.name, err)
+			}
+			swept++
+		}
+	}
+	if swept == 0 {
+		t.Fatal("no source without a lifetime was swept")
+	}
+}
+
+// A zero NowMs is the documented opt out, and it is pinned here so that nobody discovers it by
+// accident.
+//
+// It is the one place this validator accepts by not looking. Section 7.3 makes the lifetime
+// check a MUST only for a leaf a client is SENDING and a RECOMMENDED for one it is receiving --
+// a leaf can expire in flight -- so a receiver with no trustworthy clock has to be able to say
+// so. A test that did not state it would leave the next reader unable to tell the opt out from a
+// lifetime check that had quietly stopped working.
+func TestLeafNodeValidateTreatsAZeroClockAsAnOptOutOfTheLifetimeCheck(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	leaf := leafValidationSignedLeaf(t, crypto, LeafNodeSourceKeyPackage, func(leaf *LeafNode) {
+		leaf.Lifetime = Lifetime{NotBefore: 1000, NotAfter: 2000}
+	})
+	optedOut := leafValidationContextFor(crypto, LeafNodeSourceKeyPackage)
+	optedOut.NowMs = 0
+	optedOut.ClockSkewMs = 0
+	if err := leaf.Validate(optedOut); err != nil {
+		t.Errorf("a zero clock: Validate: %v", err)
+	}
+	// and one millisecond of clock is enough to bring the check back, so the opt out is the
+	// zero and not a range around it.
+	checking := leafValidationContextFor(crypto, LeafNodeSourceKeyPackage)
+	checking.NowMs = 1
+	checking.ClockSkewMs = 0
+	if err := leaf.Validate(checking); !errors.Is(err, ErrLeafNodeLifetime) {
+		t.Errorf("a one millisecond clock: err = %v, want ErrLeafNodeLifetime", err)
+	}
+}

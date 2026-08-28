@@ -10,6 +10,7 @@
 package mls
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -457,4 +458,312 @@ func NewLeafNode(crypto CryptoProvider, signer SignaturePrivateKey, cred Credent
 		return nil, err
 	}
 	return leaf, nil
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9420 section 7.3: leaf node validation
+// ---------------------------------------------------------------------------
+
+// The RFC 9420 section 7.2 "default" extension types, as a RANGE rather than as a list.
+//
+// Section 7.2 says of the capabilities field: "The following proposal and extension types are
+// considered 'default' and MUST NOT be listed", and names 0x0001 application_id, 0x0002
+// ratchet_tree, 0x0003 required_capabilities, 0x0004 external_pub and 0x0005 external_senders.
+// Those five are exactly the extension types RFC 9420 registers for itself -- section 17.3's
+// initial registry is 0x0001 to 0x0005 and nothing else -- and that is what makes the class a
+// contiguous range and not five identifiers somebody typed out. A code point registered by a
+// later document is NOT default and has to be listed; this profile's own 0xF001 to 0xF003
+// private use points are not default either, and are listed by every leaf this package builds.
+//
+// This matters in both directions, and the plan that specified this file got both wrong, in
+// opposite ways, by naming two of the five:
+//
+//   - Section 7.2's own sentence is "The types of any NON-DEFAULT extensions that appear in the
+//     extensions field of a LeafNode MUST be included in the extensions field of the
+//     capabilities field." A check that demanded it of every extension would refuse a leaf
+//     carrying application_id (0x0001), which is the most common LeafNode extension there is,
+//     for doing exactly what section 7.2 tells it to do.
+//   - Section 13.4 says a member's capabilities "MUST indicate support for each extension in
+//     the GroupContext". external_senders and required_capabilities are both GroupContext
+//     extensions, and section 7.2 forbids listing either. The only reading under which the two
+//     sentences are not in direct contradiction is that section 13.4's requirement is
+//     discharged for the default types by their being default: they are assumed of every
+//     implementation, which is section 11.1's "The 'default' proposal and extension types
+//     defined in this document are assumed to be implemented by all clients".
+//
+// So the exemption is not a convenience. Without it this validator refuses every conforming
+// leaf of any group whose GroupContext carries external_senders, and every conforming leaf
+// that carries an application_id.
+// The two bounds are deliberately UNTYPED and not ExtensionType, which looks like a slip and is
+// not. This package's registry gates derive their class off the type checker: every package
+// level constant whose type is ExtensionType is taken to name a code point the extension
+// registry assigns, and TestEveryRegistryDeclaredHereHoldsTheCodePointsTheRfcAssigns and the
+// seed corpus generators are all written on that premise. A bound is not a registry member --
+// nothing encodes it, no decoder has an arm for it -- so typing it ExtensionType would put two
+// values that are not code points into every derivation that enumerates them, and the corpus
+// would grow two seeds standing for extensions nobody can send. Untyped keeps the comparison
+// below exact and the class honest.
+const (
+	defaultExtensionTypeLow  = 0x0001
+	defaultExtensionTypeHigh = 0x0005
+)
+
+// isDefaultExtensionType reports whether section 7.2 forbids listing t in a capabilities
+// vector, and therefore whether asking a leaf to list it is a refusal of a conforming leaf.
+func isDefaultExtensionType(t ExtensionType) bool {
+	return defaultExtensionTypeLow <= t && t <= defaultExtensionTypeHigh
+}
+
+// LeafValidationContext is everything RFC 9420 section 7.3 checks about ONE leaf that does not
+// come from the leaf itself.
+//
+// A structure and not eight positional parameters, and the reason is NowMs and ClockSkewMs:
+// two adjacent uint64 milliseconds in a positional signature are two arguments the compiler
+// cannot tell apart, and swapping them is a validator that treats the clock as the tolerance.
+//
+// What is NOT here is as much of section 7.3 as is. Four of its rules are properties of a SET
+// of leaves, or of an application policy, rather than of one leaf, and none of them can be
+// answered from this structure:
+//
+//   - "Verify that the following fields are unique among the members of the group:
+//     signature_key, encryption_key" needs every other leaf. It is the ratchet tree's, in
+//     tree_sync.go.
+//   - "Verify that the credential type is supported by all members of the group ... and that
+//     the capabilities field of this LeafNode indicates support for all the credential types
+//     currently in use by other members" needs every other leaf's capabilities and credential.
+//     Also the ratchet tree's.
+//   - The update arm of the leaf_node_source rule -- "encryption_key represents a different
+//     public key than the encryption_key in the leaf node being replaced" -- needs the leaf
+//     being replaced. It is proposal validation's, in the group lifecycle plan.
+//   - Section 7.2's "Applications MUST define a maximum total lifetime that is acceptable for
+//     a LeafNode, and reject any LeafNode where the total lifetime is longer than this
+//     duration" is an application policy this profile has not fixed a number for. Until it
+//     does, a key_package leaf may declare a not_after a thousand years out and be current.
+//
+// Each is stated here rather than left out silently, because a validator's dangerous failure
+// is the check that accepts by never having looked, and a reader who finds most of a section
+// implemented has no way to tell a deliberate hand-off from an omission.
+type LeafValidationContext struct {
+	// Crypto verifies the leaf's signature. A nil one is refused before anything else.
+	Crypto CryptoProvider
+
+	// Suite is the group's ciphersuite. Section 11.1: "At a minimum, all members of the group
+	// need to support the cipher suite and protocol version in use." The version half cannot
+	// be decided from here -- this structure carries no ProtocolVersion and section 7.3 does
+	// not restate the rule -- so the ciphersuite half is checked and the version half is owed.
+	Suite CipherSuite
+
+	// GroupId and LeafIndex are the context the update and commit sources bind their signature
+	// to and the key_package source ignores; see signatureContent. Both are meaningless under
+	// key_package and are passed anyway, because a caller holding a group cannot tell from the
+	// leaf alone which arm applies.
+	GroupId   []byte
+	LeafIndex LeafIndex
+
+	// ExpectedSource is section 7.3's leaf_node_source rule, and it is a REQUIRED input rather
+	// than a defaulted one. The same Validate is reached from three places -- key_package.go
+	// with key_package, proposal validation with update, the tree and the update path with
+	// commit -- and a validator that did not compare against an expectation would accept a
+	// key_package leaf, lifetime and all, exactly where an update leaf belongs.
+	ExpectedSource LeafNodeSource
+
+	// RequiredCaps is the group's required_capabilities extension body, or nil for a group
+	// that carries none. Nil is "no requirement" and is satisfied by anything.
+	RequiredCaps *RequiredCapabilities
+
+	// GroupExtensions is the GroupContext's extensions vector: section 13.4's rule, as
+	// corrected by erratum 8745. See ERRATA.md and the comment on the loop below.
+	GroupExtensions []Extension
+
+	// NowMs is the validating client's clock in unix milliseconds, and ZERO IS AN OPT OUT: a
+	// caller that passes 0 gets no lifetime check at all.
+	//
+	// That is the one place this validator accepts by not looking, and it is deliberate.
+	// Section 7.3 makes the lifetime check a MUST only for a leaf "in a message being sent by
+	// the client" and a RECOMMENDED for one "being received", because a leaf can expire in
+	// flight; a receiver with no trustworthy clock has to be able to say so. Every SENDING
+	// path -- a KeyPackage this client mints, a proposal it builds -- must pass a real clock,
+	// and a real clock is never 0.
+	NowMs uint64
+
+	// ClockSkewMs widens the lifetime interval at BOTH ends by this many milliseconds. It is
+	// applied to the lifetime rather than to the clock so that the two ends cannot come to
+	// have different tolerances by accident.
+	ClockSkewMs uint64
+}
+
+// Validate answers nil only if this leaf satisfies every RFC 9420 section 7.3 rule that can be
+// decided from the leaf and this context alone. The ones that cannot are named on
+// LeafValidationContext.
+//
+// The order is refusal-cheapest-and-most-specific first, and two positions in it are load
+// bearing rather than tidy:
+//
+//   - the provider is refused before any field of the leaf is judged, which is the only order
+//     that does not dereference it. It is the order Sign and VerifySignature already take.
+//   - the source is compared before the signature is checked. The source SELECTS what the
+//     signature covers -- a key_package leaf's preimage carries a lifetime and no group id, an
+//     update leaf's carries a group id and no lifetime -- so verifying first would report a
+//     signature failure for a leaf whose real fault is that it is the wrong kind of leaf.
+//
+// Section 7.3's "Verify that the credential in the LeafNode is valid, as described in
+// Section 5.3.1" is discharged in two halves and neither is a check written here. The half this
+// profile can decide -- is the credential type one this implementation reads at all -- is
+// Credential.MarshalMLS's, which refuses everything but basic, and the signature preimage is
+// built through it: a leaf carrying an x509 credential comes back as errProfileCredentialType
+// from VerifySignature, which returns a preimage failure as itself rather than collapsing it
+// into a signature failure. The half this profile cannot decide -- does the identity in the
+// credential actually belong to the signature key, which section 5.3.1 hands to an
+// Authentication Service -- has no AS in this profile and is NOT performed. One spelling of
+// each rule and not two, and the second is written down because a reader who found seven of
+// section 7.3's eight bullets here would otherwise take the eighth for an oversight.
+func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
+	// a nil context is a context whose provider is nil, and it gets the refusal a nil provider
+	// gets, so Validate(nil) and Validate(&LeafValidationContext{}) cannot answer two
+	// different things about the same missing thing
+	if ctx == nil || ctx.Crypto == nil {
+		return fmt.Errorf("%w: the leaf's signature is verified through it", ErrNilCryptoProvider)
+	}
+	if self.LeafNodeSource != ctx.ExpectedSource {
+		return fmt.Errorf("%w: leaf_node_source is %d and this position takes %d",
+			ErrLeafNodeSourceMismatch, uint8(self.LeafNodeSource), uint8(ctx.ExpectedSource))
+	}
+	// section 7.2: "the credential type used in the LeafNode MUST be included in the
+	// credentials field of the capabilities field". There is no default credential type --
+	// section 11.1 says so in as many words, "Note that this is not true for credential types"
+	// -- so this one has no exemption to make.
+	//
+	// It is checked BEFORE the signature, which is section 7.3's own order -- the credential
+	// rule is its first bullet and the signature rule its second -- and is also the only order
+	// under which this check can ever fire. Credential.MarshalMLS refuses every credential type
+	// outside this profile and the signature preimage is built through it, so a leaf carrying an
+	// x509 credential never reaches a line below VerifySignature: put this check after the
+	// signature and it becomes a branch no input can take, which is indistinguishable from a
+	// check nobody wrote.
+	if !self.Capabilities.SupportsCredential(self.Credential.CredentialType) {
+		return fmt.Errorf("%w: the leaf's own credential type %#04x is not in its capabilities",
+			errMissingRequiredCapability, uint16(self.Credential.CredentialType))
+	}
+	if err := self.VerifySignature(ctx.Crypto, ctx.GroupId, ctx.LeafIndex); err != nil {
+		return err
+	}
+	// section 11.1: "At a minimum, all members of the group need to support the cipher suite
+	// and protocol version in use." This is the half that can be decided here, and it is what
+	// makes Suite an input rather than a field nothing reads: a member whose capabilities do
+	// not list the group's ciphersuite cannot do the group's crypto, whatever else verifies.
+	if !self.Capabilities.SupportsCipherSuite(ctx.Suite) {
+		return fmt.Errorf("%w: the group's ciphersuite %#04x is not in the leaf's capabilities",
+			errMissingRequiredCapability, uint16(ctx.Suite))
+	}
+	// section 7.3: "Verify that the extensions in the LeafNode are supported by checking that
+	// the ID for each extension in the extensions field is listed in the capabilities.extensions
+	// field of the LeafNode", narrowed by section 7.2 to the non-default types.
+	//
+	// EVERY entry, and the urmessage_leaf_keys body of every entry that carries one. A lookup
+	// answers the FIRST entry of a type and extensions<V> legally holds two, so a body checked
+	// through FindExtension would leave a second, malformed leaf keys entry inside an accepted
+	// leaf -- signed, tree hashed, and read by whichever consumer happened to iterate rather
+	// than look up. That is the p4 ValSem401 shape exactly: a rule applied to element zero
+	// while the loop that reaches the rest never runs it.
+	for i := range self.Extensions {
+		extensionType := self.Extensions[i].ExtensionType
+		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {
+			return fmt.Errorf("%w: the leaf carries extension type %#04x and does not list it",
+				errMissingRequiredCapability, uint16(extensionType))
+		}
+		if extensionType != ExtensionTypeUrmessageLeafKeys {
+			continue
+		}
+		// MASTER section 5.3: the body is range checked HERE because this is the last point
+		// before the leaf is trusted by the tree and by connect/message's wrap path. The whole
+		// entry goes to ParseLeafKeysFrom rather than its body to ParseLeafKeysExtension, so
+		// the tag is checked by the only one of the two that is given it.
+		if _, err := ParseLeafKeysFrom(self.Extensions[i]); err != nil {
+			if errors.Is(err, ErrLeafKeysExtensionInvalid) {
+				return err
+			}
+			// a truncated body, or bytes after it. ErrLeafKeysExtensionInvalid's own
+			// declaration names trailing bytes as one of the things it stands for, so it is
+			// the sentinel a caller asks with; the decoder's error is kept underneath it so a
+			// caller can still ask the narrower question.
+			return fmt.Errorf("%w: %w", ErrLeafKeysExtensionInvalid, err)
+		}
+	}
+	// RFC 9420 section 13.4, as corrected by erratum 8745 (see ERRATA.md): "A client adding a
+	// new member to a group MUST verify that the LeafNode for the new member is compatible
+	// with the group's extensions. The capabilities field MUST indicate support for each
+	// extension in the GroupContext" -- plus, per the erratum, the same of a leaf that arrives
+	// by an Update proposal or in a commit's update_path.
+	//
+	// So this loop is NOT conditioned on the source. The pre-erratum reading applies it to
+	// key_package leaves alone, which leaves an existing member free to update itself into a
+	// leaf that no longer supports an extension the group is using -- and section 13.4's own
+	// note is that "all MLS GroupContext extensions are mandatory, in the sense that an
+	// extension in use by the group MUST be supported by all members of the group", which is a
+	// statement about members and not about joiners.
+	//
+	// The default types are exempt for the reason isDefaultExtensionType gives: section 7.2
+	// forbids listing them, so demanding them here would refuse every conforming leaf of any
+	// group whose GroupContext carries external_senders or required_capabilities.
+	for i := range ctx.GroupExtensions {
+		extensionType := ctx.GroupExtensions[i].ExtensionType
+		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {
+			return fmt.Errorf("%w: the group context carries extension type %#04x and the leaf does not list it",
+				errMissingRequiredCapability, uint16(extensionType))
+		}
+	}
+	// section 7.3: "If the GroupContext has a required_capabilities extension, then the
+	// required extensions, proposals, and credential types MUST be listed in the LeafNode's
+	// capabilities field."
+	if err := self.Capabilities.Supports(ctx.RequiredCaps); err != nil {
+		return err
+	}
+	return self.validateLifetime(ctx)
+}
+
+// validateLifetime is section 7.3's lifetime rule, and it is a body of its own because it is
+// the one rule of the eight whose two ends are symmetric enough to be swapped without anything
+// noticing: a leaf comfortably inside its lifetime is accepted by a comparison in either
+// direction and by a skew applied to either end.
+//
+// The interval is widened by the skew at BOTH ends -- accepted when
+// not_before - skew <= now <= not_after + skew -- rather than the clock being moved, because
+// moving the clock is how one end comes to be widened and the other narrowed. Both widenings
+// are written as guarded SUBTRACTIONS from the side that cannot wrap: not_after + skew
+// overflows uint64 for an attacker-chosen not_after near the top of the range, and the wrapped
+// sum then refuses a leaf that a slightly SMALLER not_after would have accepted, which is a
+// validator that is not monotone in the field it is reading.
+//
+// The lifetime is a variant field carried only under key_package, so it is checked only there.
+// Under update and commit the Go field still holds whatever the value was built with and none
+// of it was encoded or signed, so reading it would be judging a leaf by bytes nobody sent.
+func (self *LeafNode) validateLifetime(ctx *LeafValidationContext) error {
+	if self.LeafNodeSource != LeafNodeSourceKeyPackage {
+		return nil
+	}
+	// the documented opt out; see NowMs.
+	if ctx.NowMs == 0 {
+		return nil
+	}
+	// an interval whose end precedes its start contains no instant at all, so no clock and no
+	// tolerance can make it current. Refused as itself rather than left to the two comparisons
+	// below, which a skew wider than the inversion makes both accept.
+	if self.Lifetime.NotAfter < self.Lifetime.NotBefore {
+		return fmt.Errorf("%w: not_after %d precedes not_before %d",
+			ErrLeafNodeLifetime, self.Lifetime.NotAfter, self.Lifetime.NotBefore)
+	}
+	// section 7.2: the endpoints are absolute times in SECONDS since the unix epoch, and this
+	// context carries milliseconds, so both are divided down. Truncation costs at most a
+	// second at each end and the skew is orders of magnitude larger.
+	nowSeconds := ctx.NowMs / 1000
+	skewSeconds := ctx.ClockSkewMs / 1000
+	if self.Lifetime.NotBefore > skewSeconds && nowSeconds < self.Lifetime.NotBefore-skewSeconds {
+		return fmt.Errorf("%w: not_before is %d and now is %d, tolerating %d seconds of skew",
+			ErrLeafNodeLifetime, self.Lifetime.NotBefore, nowSeconds, skewSeconds)
+	}
+	if nowSeconds > skewSeconds && self.Lifetime.NotAfter < nowSeconds-skewSeconds {
+		return fmt.Errorf("%w: not_after is %d and now is %d, tolerating %d seconds of skew",
+			ErrLeafNodeLifetime, self.Lifetime.NotAfter, nowSeconds, skewSeconds)
+	}
+	return nil
 }
