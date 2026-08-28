@@ -33,9 +33,19 @@
 // pair keeps its own identity for the callers that care which layer refused. The precedent is
 // this package's, twice over: ErrGroupContextTrailingBytes wraps syntax.ErrTrailingBytes for
 // this reason, and crypto_errors.go's header describes errors.go's ErrBadSignature wrapping
-// ErrCryptoBadSignature for it. TestOnlyTheTreeIndexErrorsAnswerToTheTreeMathSentinels is the
-// half with teeth: wrapping is useful only while it stays exclusive, and a third error of this
-// file answering to ErrLeafOutOfRange would make "was this a leaf index problem" mean nothing.
+// ErrCryptoBadSignature for it. TestOnlyTheTreeIndexErrorsAnswerToATreeMathSentinel is the
+// half with teeth: wrapping is useful only while it stays exclusive, and a third error
+// answering to ErrLeafOutOfRange would make "was this a leaf index problem" mean nothing.
+//
+// A third error ANYWHERE in this package, which is worth spelling out because the sweep it
+// names judges only this file and the property callers depend on is not about files. A review
+// wrote that third error into a new file of its own and the whole package stayed green.
+// TestEveryExportedErrorOfThisPackageIsInAMaintainedClass and
+// TestOnlyTheSanctionedWrapsHoldAcrossThisPackagesErrorClasses are what close that: every
+// exported error of every non-test file has to belong to a class derived from its own file,
+// and no pair of any two of those classes may answer for each other outside treeIndexWraps.
+// The twenty-five tasks after this one add tree.go, leaf_node.go and update_path.go, and
+// nothing obliges their errors to land here.
 //
 // ErrNodeTypeMismatch is deliberately NOT wrapped onto tree_math's ErrNodeIsParent, though the
 // two read alike. ErrNodeIsParent is arithmetic -- this index is not a leaf index -- and is

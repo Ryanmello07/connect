@@ -28,6 +28,8 @@ package mls
 import (
 	"errors"
 	"maps"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -270,12 +272,16 @@ func TestOnlyTheTreeIndexErrorsAnswerToATreeMathSentinel(t *testing.T) {
 // sixteen and this plan's thirteen name conditions from different layers, and an errors.Is
 // holding across them would mean one of the two files had grown a wrap nobody argued for.
 //
-// crypto_errors.go is deliberately NOT swept, and this is the note that says so rather than
-// letting the absence look like coverage: it has no map held to its own declarations, and
-// adding a written one here would be an eleventh-name-shaped hole of exactly the kind the
-// header of this file objects to. Its names share no condition with these thirteen, and a
-// wrap onto one of them would have to be written in tree_errors.go, where the file gate above
-// makes it a declaration this file's class has to account for.
+// crypto_errors.go used to be excluded here, on the grounds that it had no map held to its own
+// declarations and that a written one would be a hole of the kind the header of this file
+// objects to, and that a wrap onto one of its names would have to be written in tree_errors.go
+// where the file gate above accounts for it. The first two are answered by deriving
+// cryptoOwnedErrors from that file the way this class is derived from its own. The third was
+// measured and is false where it matters: the wrap IS written in tree_errors.go, on a
+// declaration the file gate already knows about, and nothing looked at what it answers to.
+// TestOnlyTheSanctionedWrapsHoldAcrossThisPackagesErrorClasses now judges that pair and every
+// other, so this test is the narrow, named half of a sweep that no longer depends on somebody
+// remembering to write it.
 func TestNoTreeErrorAnswersToAKeyScheduleSentinel(t *testing.T) {
 	if len(keyScheduleOwnedErrors) == 0 {
 		t.Fatal("the key schedule's error class is empty, so this sweep compares against nothing")
@@ -287,5 +293,266 @@ func TestNoTreeErrorAnswersToAKeyScheduleSentinel(t *testing.T) {
 					name, other)
 			}
 		}
+	}
+}
+
+// cryptoErrorsFile is the crypto layer's error file. Its class is derived from it below for
+// the reason tree math's is: the two sweeps at the bottom of this file judge every pair of
+// this package's maintained error classes, and a class that stopped growing with its file
+// reports a clean bill over the sentinel it had never heard of.
+const cryptoErrorsFile = "crypto_errors.go"
+
+// cryptoOwnedErrors is every error crypto_errors.go declares.
+//
+// It is here rather than absent, and that is a reversal of what the header of tree_errors.go
+// argued when this file landed. The argument was that crypto_errors.go has no maintained map,
+// that adding a written one would be a hole of the same shape this file objects to, and that a
+// wrap onto one of its names would have to be written in tree_errors.go where the file gate
+// catches it. The first two are answered by holding the map to the file, exactly as the other
+// three classes are held. The third was measured and is false in the direction that matters:
+// `ErrTreeMalformed = fmt.Errorf("mls: ratchet tree is malformed: %w", ErrCryptoBadSignature)`
+// IS written in tree_errors.go, the file gate sees a declaration it already knows about, and
+// every test in the package passed -- after which errors.Is(ErrTreeMalformed,
+// ErrCryptoBadSignature) is true and a caller telling "the signature did not verify" from
+// "this is not a tree" reads one as the other. The adjacency is not hypothetical: the tasks
+// after this one return ErrBadSignature and ErrLeafNodeSourceMismatch out of one validator.
+var cryptoOwnedErrors = map[string]error{
+	"ErrUnknownCipherSuite": ErrUnknownCipherSuite,
+	"ErrInvalidPoint":       ErrInvalidPoint,
+	"ErrBadKeyLength":       ErrBadKeyLength,
+	"ErrNilRandomSource":    ErrNilRandomSource,
+	"ErrBadNonceLength":     ErrBadNonceLength,
+	"ErrBadKemOutput":       ErrBadKemOutput,
+	"ErrBadSignatureKey":    ErrBadSignatureKey,
+	"ErrCryptoBadSignature": ErrCryptoBadSignature,
+	"ErrAeadOpen":           ErrAeadOpen,
+	"ErrSequenceOverflow":   ErrSequenceOverflow,
+}
+
+// mlsErrorClasses is every maintained error class of this package, keyed by the file each is
+// derived from.
+//
+// This is the class the two sweeps at the bottom of this file run over, and keying it by FILE
+// is what lets it be checked against the package rather than against itself:
+// TestEveryExportedErrorOfThisPackageIsInAMaintainedClass walks every Err-prefixed package
+// level declaration of every non-test file and requires the class held for that declaration's
+// file to list it. A fourteenth error of this plan declared in a new file is then a failure
+// naming the file, rather than a name every sweep in this package runs past.
+//
+// Four entries and not three. crypto_errors.go joined when a review declared a fourteenth p5
+// error in a file of its own and watched the entire package stay green.
+var mlsErrorClasses = map[string]map[string]error{
+	treeErrorsFile:        treeOwnedErrors,
+	treeMathErrorsFile:    treeMathOwnedErrors,
+	keyScheduleErrorsFile: keyScheduleOwnedErrors,
+	cryptoErrorsFile:      cryptoOwnedErrors,
+}
+
+// TestCryptoOwnedErrorsIsEveryErrorItsFileDeclares is the same derivation the other three
+// classes get, over the fourth.
+//
+// Err-prefixed rather than every declaration, because crypto_errors.go is one var block and
+// the prefix is its own naming convention; the positive control names one of the ten
+// explicitly, since a scan reading the wrong file and a prefix filter matching nothing report
+// the same clean bill a complete one reports.
+func TestCryptoOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) {
+	declared := packageLevelDeclarations(t, ".")
+	fromFile := map[string]bool{}
+	for name, file := range declared {
+		if file == cryptoErrorsFile && strings.HasPrefix(name, "Err") {
+			fromFile[name] = true
+		}
+	}
+	if !fromFile["ErrCryptoBadSignature"] {
+		t.Fatalf("the scan did not find ErrCryptoBadSignature among the Err declarations of %s, which certainly declares it, so it is reading something other than that file",
+			cryptoErrorsFile)
+	}
+	if got, want := slices.Sorted(maps.Keys(fromFile)), slices.Sorted(maps.Keys(cryptoOwnedErrors)); !slices.Equal(got, want) {
+		t.Fatalf("%s declares %v and cryptoOwnedErrors holds %v; the sweeps below run over the second, so a sentinel missing from it is one no error of this package is held against",
+			cryptoErrorsFile, got, want)
+	}
+}
+
+// TestEveryExportedErrorOfThisPackageIsInAMaintainedClass is the answer to the class this file
+// derived from a FILE when the property is about the PACKAGE.
+//
+// treeOwnedErrors is derived from tree_errors.go, which makes it complete for that file and
+// silent about everywhere else. A review measured what that costs: a new file declaring
+// `ErrTreeShapeOutOfRange = fmt.Errorf("...: %w", ErrLeafOutOfRange)` is a third error
+// answering to the leaf index sentinel -- the exact condition the exclusivity sweep exists to
+// forbid, and the condition tree_errors.go's header says would make "was this a leaf index
+// problem" mean nothing -- and the whole package stayed green, because every sweep here judges
+// only what lives in the one file. This plan has some twenty-five tasks left, adding tree.go,
+// leaf_node.go and update_path.go among others, and nothing forces their errors into
+// tree_errors.go.
+//
+// So the class is the package's: every Err-prefixed package level declaration of every
+// non-test file must be listed in the class held for the file it is declared in, and every
+// exported name of every class must be a declaration this scan actually found. A file with no
+// class at all is the loud case, because that is the shape the mutation took.
+//
+// Test files are excluded on purpose and this is the note that says why rather than leaving
+// the filter looking arbitrary: the runner files of this package declare unexported errKat*
+// sentinels by the dozen for their comparator controls, they are Err-prefixed only in the
+// lowercase, and they are the private business of the test that raises them. What is swept
+// here is the surface a CALLER can branch on.
+func TestEveryExportedErrorOfThisPackageIsInAMaintainedClass(t *testing.T) {
+	declared := packageLevelDeclarations(t, ".")
+	swept := 0
+	for _, name := range slices.Sorted(maps.Keys(declared)) {
+		file := declared[name]
+		if strings.HasSuffix(file, "_test.go") || !strings.HasPrefix(name, "Err") {
+			continue
+		}
+		swept++
+		class, held := mlsErrorClasses[file]
+		if !held {
+			t.Errorf("%s declares %s and mlsErrorClasses holds no class for that file, so every exclusivity sweep of this package runs past it; give the file a class or move the error into one that has one",
+				file, name)
+			continue
+		}
+		if _, listed := class[name]; !listed {
+			t.Errorf("%s declares %s and the class held for that file does not list it, so no sweep judges what it answers to",
+				file, name)
+		}
+	}
+	if swept == 0 {
+		t.Fatal("the scan found no exported error in any non-test file of this package, which cannot be true, so it read something other than the package")
+	}
+	for _, file := range slices.Sorted(maps.Keys(mlsErrorClasses)) {
+		for _, name := range slices.Sorted(maps.Keys(mlsErrorClasses[file])) {
+			if !strings.HasPrefix(name, "Err") {
+				// the key schedule's two unexported invariant names, which are that
+				// plan's own and are held to their file by its own gate
+				continue
+			}
+			if declared[name] != file {
+				t.Errorf("the class for %s lists %s and the package declares that name in %q, so the sweeps run over a name that file does not own",
+					file, name, declared[name])
+			}
+		}
+	}
+}
+
+// TestOnlyTheSanctionedWrapsHoldAcrossThisPackagesErrorClasses is the exclusivity sweep run
+// over the package rather than over one pair of files.
+//
+// TestOnlyTheTreeIndexErrorsAnswerToATreeMathSentinel judges tree_errors.go against
+// tree_math.go, which is the pair the file header argues about and leaves every other pair
+// unjudged. Two of them were measured and both are silent: a tree error wrapping
+// ErrCryptoBadSignature, and an error of this plan declared in a file of its own wrapping
+// ErrLeafOutOfRange. This sweep is every ordered pair of every maintained class, so a wrap
+// between any two of the four files is a failure naming both names.
+//
+// Sanctioned by treeIndexWraps and nothing else, deliberately. That table is two entries with
+// an argument each in the header of tree_errors.go, and it is the same table
+// TestTheTwoTreeIndexErrorsWrapTheTreeMathSentinels asserts the positive half of, so a wrap
+// cannot be excused here without also being required there. If a later plan argues for a
+// third, it goes in that table with its reason and both halves move together.
+func TestOnlyTheSanctionedWrapsHoldAcrossThisPackagesErrorClasses(t *testing.T) {
+	swept := map[string]error{}
+	for _, file := range slices.Sorted(maps.Keys(mlsErrorClasses)) {
+		for name, value := range mlsErrorClasses[file] {
+			if already, seen := swept[name]; seen {
+				t.Fatalf("%s is held by two classes (%v and %v), so one of them is judging a name it does not own",
+					name, already, value)
+			}
+			swept[name] = value
+		}
+	}
+	if len(swept) < len(treeOwnedErrors)+len(treeMathOwnedErrors) {
+		t.Fatalf("the sweep runs over %d errors, fewer than the two classes the file header argues about hold between them; it is reading something other than mlsErrorClasses",
+			len(swept))
+	}
+	matched := 0
+	for _, name := range slices.Sorted(maps.Keys(swept)) {
+		for _, other := range slices.Sorted(maps.Keys(swept)) {
+			if name == other || !errors.Is(swept[name], swept[other]) {
+				continue
+			}
+			if treeIndexWraps[name] != other {
+				t.Errorf("%s answers to %s and the only sanctioned wraps are %v; two sentinels for one condition is how a caller comes to read the wrong one as the right one",
+					name, other, treeIndexWraps)
+				continue
+			}
+			matched++
+		}
+	}
+	if matched != len(treeIndexWraps) {
+		t.Fatalf("%d sanctioned wraps hold and %d are written down; a sweep over values that stopped answering to each other reports what an exclusive one reports",
+			matched, len(treeIndexWraps))
+	}
+}
+
+// The two patterns the citation gate below reads a file's prose with. A citation is a Test
+// name written anywhere in the file; the wrap pattern rejoins a name these files split across
+// two comment lines with a trailing hyphen, which is a real spelling here and would otherwise
+// be reported as two names that do not exist.
+var (
+	testNameCitation = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*`)
+	commentLineWrap  = regexp.MustCompile(`-\r?\n[ \t]*//[ \t]*`)
+)
+
+// treePlanSourceFiles is the files of this package this plan writes, derived from where the
+// names it owns are declared rather than listed.
+//
+// Derived because a list of three file names is the same defect one level up: a fourth file of
+// this plan lands, the gate below never reads it, and the gate goes on reporting a clean bill
+// over prose it has not seen. The anchors are names this plan certainly owns -- its two class
+// tables, its vector run table, and every error of its own file -- and a missing one is fatal
+// rather than a smaller file set.
+func treePlanSourceFiles(t *testing.T) []string {
+	t.Helper()
+	declared := packageLevelDeclarations(t, ".")
+	anchors := []string{"treeOwnedErrors", "treeIndexWraps", "treeVectorRuns"}
+	anchors = append(anchors, slices.Sorted(maps.Keys(treeOwnedErrors))...)
+	files := map[string]bool{}
+	for _, name := range anchors {
+		file, held := declared[name]
+		if !held {
+			t.Fatalf("package mls declares no %s, so this file set is derived from a name this plan no longer owns", name)
+		}
+		files[file] = true
+	}
+	if !files[treeErrorsFile] {
+		t.Fatalf("the derivation did not reach %s, which declares this plan's thirteen errors, so it is reading something other than the package",
+			treeErrorsFile)
+	}
+	return slices.Sorted(maps.Keys(files))
+}
+
+// TestThisPlansFilesCiteNoTestThatDoesNotExist holds this plan's prose to naming tests that
+// are there.
+//
+// A file header that says which test has the teeth is doing real work -- it is the only place
+// the argument for a design decision and the thing enforcing it are joined -- and it does that
+// work only while the name resolves. tree_errors.go named its own exclusivity sweep in the
+// plural, one letter off from the singular the function is declared under, and the sentence
+// read exactly as it would have if the enforcement existed and had been deleted.
+//
+// This plan's files and NOT the package, which is a narrowing with a reason rather than a
+// convenience. Six comments elsewhere in package mls cite a test another plan has not landed
+// yet and say so in the same sentence -- the validation plan's ValSem401 refusal, p7's
+// counterpart to the external key pair, a task 12 test whose three properties this package
+// already covers harder -- and a forward reference to scheduled work is prose doing its job.
+// This plan makes no such reference and owes the stronger rule.
+func TestThisPlansFilesCiteNoTestThatDoesNotExist(t *testing.T) {
+	declared := packageLevelDeclarations(t, ".")
+	cited := 0
+	for _, file := range treePlanSourceFiles(t) {
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		for _, name := range testNameCitation.FindAllString(commentLineWrap.ReplaceAllString(string(body), ""), -1) {
+			cited++
+			if _, found := declared[name]; !found {
+				t.Errorf("%s names %s and package mls declares no test under that name, so the enforcement that sentence points at cannot be followed to anything",
+					file, name)
+			}
+		}
+	}
+	if cited == 0 {
+		t.Fatal("this plan's files name no test at all, which cannot be true of files that are all gates, so the scan read something other than them")
 	}
 }

@@ -247,6 +247,20 @@ func (self *vectorRunTally) assertRun(t *testing.T, wantCovered int, wantSkipped
 	if self.covered == 0 {
 		t.Fatalf("%s: the suite filter matched no case at all, so this family ran nothing and reported it as a pass", self.file)
 	}
+	// the floor under the two counts the family writes down for itself, and the reason it is
+	// here rather than assumed. Every assertion above is satisfied by a run that partitioned
+	// the corpus perfectly and then compared NOTHING: covered and skipped add up, the key set
+	// is the registry's, the per suite split matches the corpus census, and comparisons and
+	// answers are held only against numbers the family supplied. A family that supplies zero
+	// for both therefore passes having verified nothing at all, which is the single outcome
+	// this whole accounting exists to be unable to reach -- and it is a two character edit,
+	// smaller than deleting the comparison loop it describes. Measured on family 10: deleting
+	// the answer() call and writing 0 down produced "0 comparisons against 0 distinct
+	// published answers" under a green PASS.
+	if wantComparisons < 1 || wantDistinct < 1 {
+		t.Fatalf("%s: this family wrote down %d comparisons against %d distinct answers; a run that compares nothing reports what a run that compared everything reports, so neither count may be zero",
+			self.file, wantComparisons, wantDistinct)
+	}
 	if self.covered != wantCovered {
 		t.Fatalf("%s: covered %d cases, want %d; the filter matched %v", self.file, self.covered, wantCovered, self.matched)
 	}
@@ -1000,6 +1014,14 @@ func TestAssertRunFlagsTheControlFixture(t *testing.T) {
 		}},
 		{"made %d comparisons over", func(f *vectorRunControlFixture) {
 			f.comparisons++
+		}},
+		// the family writing zero down for both, which every other row leaves reachable:
+		// nothing above this one looks at the magnitude of the counts a family supplies,
+		// only at whether the run matched them, and a run that compared nothing matches
+		// zero exactly.
+		{"so neither count may be zero", func(f *vectorRunControlFixture) {
+			f.comparisons = 0
+			f.distinct = 0
 		}},
 		{"distinct published answers, want", func(f *vectorRunControlFixture) {
 			f.distinct++

@@ -36,24 +36,98 @@
 // invisibly: every count below would still add up, over a run that covered one of the two
 // registered suites. assertRun holds the matched key set against Suites(), so the singleton
 // version fails there.
+//
+// treeVectorsOfSuite's SIGNATURE departs from the plan's too, in two more ways, and they are
+// written down here because the tasks that call it are not written yet and will hit them. The
+// plan spells it `func treeVectorsOfSuite[T any](t *testing.T, file string, suiteOf func(v *T)
+// CipherSuite) []T`. What is here returns `(*vectorRunTally, []treeVectorCase[T])` and takes a
+// suiteOf answering `uint16`.
+//
+// Both are consequences of routing the partition through the shared tally rather than a second
+// copy of it. The tally has to reach the caller, because the counts a family writes down are
+// that family's to assert and deriving them inside the helper with the filter under test is
+// how a filter matching nothing agrees with itself; and the corpus publishes a code point, not
+// a CipherSuite, so a suiteOf returning CipherSuite would have to convert an unregistered code
+// point into the registered type before the filter had decided whether it is one. The case
+// wrapper carries the raw text alongside the decoded value, which is what lets a runner read
+// every answer twice.
+//
+// The cost is at the call sites: the plan's Task 25 writes `vectors := treeVectorsOfSuite(t,
+// "treekem.json", ...)`, a single-value assignment that does not compile against this, and a
+// caller reads one.Value where the plan reads the bare T. Tasks 24 and 25 own that edit.
 package mls
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-// treeVectorFamilies is the two section 4.2.1 rows this plan gates on, by number.
+// treeVectorRun is one family's whole run: the four counts assertRun holds that family's
+// partition of its corpus against.
+//
+// A named type rather than an anonymous row inside the partition test, because the family
+// NUMBERS and the family COUNTS have to be one table. They were two -- a slice of numbers here
+// and a row table down in the test -- and a review measured what the second spelling costs:
+// shrinking the slice to a single family took the other family out of three of the five tests
+// in this file, left the partition test still covering it because its rows were the other
+// spelling, and the package reported nothing at all.
+type treeVectorRun struct {
+	// covered and skipped are the two halves of the suite filter's partition of the file.
+	covered int
+	skipped int
+	// comparisons is how many published answers were compared against and distinct is how
+	// many of those answers differed from each other. A corpus read as one repeated value
+	// compares the right number of times against the wrong number of answers.
+	comparisons int
+	distinct    int
+}
+
+// treeVectorRuns is the two section 4.2.1 rows this plan gates on, keyed by number.
 //
 // Numbers and not file names, because the number is what the registry keys on and the file
 // name is what treeVectorFile derives from it. A list of two names here and a manifest over
 // there is two spellings of one fact, and the second one goes stale silently.
-var treeVectorFamilies = []int{10, 11}
+//
+// The counts are written down rather than derived, for the reason assertRun records: a count
+// derived with the filter that is under test agrees with itself whatever the filter does. 14
+// cases per suite over the seven published suites is tree-validation's 98, and 11 per suite is
+// TreeKEM's 77; this package registers two of the seven.
+var treeVectorRuns = map[int]treeVectorRun{
+	10: {covered: 28, skipped: 70, comparisons: 28, distinct: 2},
+	11: {covered: 22, skipped: 55, comparisons: 22, distinct: 2},
+}
+
+// treeVectorFamilies is the numbers of treeVectorRuns, ascending, and is the only list of them
+// this file has.
+//
+// Derived and not written, so a family can leave this plan's gates only by leaving the table
+// above -- and TestTreeVectorFamiliesAreEveryTreeFamilyTheRegistryNames refuses that too, by
+// holding the table to the manifest rows that name a tree.
+var treeVectorFamilies = slices.Sorted(maps.Keys(treeVectorRuns))
+
+// treeVectorFamiliesElsewhere is every family whose manifest row names a tree and that this
+// plan does NOT gate, with the argument for each.
+//
+// An exemption table and not a filter, for the same reason treeIndexWraps is one: which plan
+// owns a family is a judgement about that family and not a property its manifest row carries.
+// What makes an exemption table safe is that it is held in both directions --
+// TestTreeVectorFamiliesAreEveryTreeFamilyTheRegistryNames refuses an exemption for a family no
+// row names, refuses a family that is both exempt and gated, and refuses a tree family that is
+// neither -- so the only way a family leaves this file is somebody writing down here who has it
+// and why.
+var treeVectorFamiliesElsewhere = map[int]string{
+	1: "tree math, wave 1's; tree_math_kat_test.go installs it and it is no longer pending",
+	3: "the secret tree, p4's; a different tree entirely, the key schedule's ratchets rather than the ratchet tree",
+	9: "tree operations, the group lifecycle plan's, because its vector carries a serialized Proposal",
+}
 
 // treeVectorFile is one family's corpus basename, read off the shared manifest.
 //
@@ -78,10 +152,17 @@ func treeVectorFile(t *testing.T, number int) string {
 // treeVectorHeader is the one field families 10 and 11 have in common and the only field this
 // task reads: the ciphersuite the case is published at.
 //
-// Its json key is never typed out a second time. theJsonKeyOf reads it off this tag, so the
-// generic decode below and the struct decode above address the same key by construction --
-// two spellings of one key in one package is how the two end up disagreeing about which key
+// Its json key is not typed out a second time in this file. theJsonKeyOf reads it off this
+// tag, so the generic decode below and the struct decode above address the same key by
+// construction -- two spellings of one key is how the two end up disagreeing about which key
 // the corpus uses, and the disagreement is silent in the worst direction.
+//
+// In this FILE, and the distinction is not pedantry. The shared aCaseAtARegisteredSuite, which
+// this file's comparator control gets its accepted case from, carries a literal tag of its
+// own, so within the package there are two spellings whatever this file does.
+// TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey reads that literal off its source and
+// holds it to this tag, which is the difference between the claim being true and the claim
+// being checked.
 type treeVectorHeader struct {
 	CipherSuite uint16 `json:"cipher_suite"`
 }
@@ -236,6 +317,25 @@ func TestTreeVectorFilesAreVendored(t *testing.T) {
 	}
 }
 
+// requireTreeVectorSuiteAgrees holds one case's two independent decodes of its ciphersuite
+// equal: the suite the shared filter kept it at, and the answer read out of the case's own
+// json text.
+//
+// A function rather than four lines inline in the loop below, and the reason is a measurement
+// rather than a preference. Inline, this comparison could be DELETED with all five tests of
+// this file still reporting green: nothing drove it with a case where the two decodes
+// disagree, because every case of both vendored corpora agrees. An assertion no control can
+// reach is an assertion whose absence looks exactly like its presence.
+// TestTreeVectorSuiteAgreementFlagsADisagreement drives this one now, so deleting it fails
+// there.
+func requireTreeVectorSuiteAgrees(t *testing.T, file string, index int, kept CipherSuite, published string) {
+	t.Helper()
+	if published != strconv.Itoa(int(kept)) {
+		t.Fatalf("%s case %d was kept at suite %#04x and its own text publishes %s, so the struct this runner decodes with is not reading the field it addresses",
+			file, index, uint16(kept), published)
+	}
+}
+
 // TestTreeVectorCorporaPartitionByTheRegistry is the run this file can hold today, and the
 // only comparison it has an answer for before the ratchet tree exists: every case's
 // ciphersuite, read twice.
@@ -246,23 +346,15 @@ func TestTreeVectorFilesAreVendored(t *testing.T) {
 // what is handed to the tally, so a comparator that answered without reading the corpus moves
 // neither the comparison count nor the distinct-answer count.
 //
-// The four counts are written down rather than derived, for the reason assertRun records: a
-// count derived with the filter that is under test agrees with itself whatever the filter
-// does. 14 cases per suite over the seven published suites is tree-validation's 98, and 11
-// per suite is TreeKEM's 77; this package registers two of the seven.
+// The families and their counts are read off treeVectorRuns, which is the whole of this
+// plan's family class and the same table the other four tests of this file loop over. This
+// test used to carry its own row table -- a second spelling of the family numbers -- and a
+// review shrank the other spelling to one family and watched this test go on covering both.
 func TestTreeVectorCorporaPartitionByTheRegistry(t *testing.T) {
 	key := theJsonKeyOf(t, treeVectorHeader{}, "CipherSuite")
-	for _, row := range []struct {
-		number      int
-		covered     int
-		skipped     int
-		comparisons int
-		distinct    int
-	}{
-		{number: 10, covered: 28, skipped: 70, comparisons: 28, distinct: 2},
-		{number: 11, covered: 22, skipped: 55, comparisons: 22, distinct: 2},
-	} {
-		file := treeVectorFile(t, row.number)
+	for _, number := range treeVectorFamilies {
+		row := treeVectorRuns[number]
+		file := treeVectorFile(t, number)
 		t.Run(file, func(t *testing.T) {
 			tally, kept := treeVectorsOfSuite(t, file, func(v *treeVectorHeader) uint16 {
 				return v.CipherSuite
@@ -277,10 +369,7 @@ func TestTreeVectorCorporaPartitionByTheRegistry(t *testing.T) {
 				// matched is the filter and the comparator disagreeing about what runs,
 				// and the counts below would then read correct over a smaller run.
 				tally.requireCompared(t, one.Index, one.Suite, err == nil)
-				if published != strconv.Itoa(int(one.Suite)) {
-					t.Fatalf("%s case %d was kept at suite %#04x and its own text publishes %s, so the struct this runner decodes with is not reading the field it addresses",
-						file, one.Index, uint16(one.Suite), published)
-				}
+				requireTreeVectorSuiteAgrees(t, file, one.Index, one.Suite, published)
 				tally.answer(published)
 			}
 			tally.assertRun(t, row.covered, row.skipped, row.comparisons, row.distinct)
@@ -409,5 +498,159 @@ func TestTreeVectorFamiliesAreStillPending(t *testing.T) {
 			t.Errorf("family %d (%s) has a Verify; replace this test with assertVectorFamilyIsInstalled for it and delete %d from expectedPendingFamilies",
 				number, family.Name, number)
 		}
+	}
+}
+
+// TestTreeVectorFamiliesAreEveryTreeFamilyTheRegistryNames derives this plan's family class
+// from the registry instead of trusting the table that spells it.
+//
+// treeVectorRuns is a written list, and a written list of a class is the defect this project
+// has paid for fourteen times: it fails when a family is added and the list is remembered, and
+// says nothing when a family is dropped. A review dropped one and measured the result -- the
+// dropped family lost its vendoring check, lost its comparator control and lost the gate that
+// notices it gaining a Verify, and every test in the package still passed.
+//
+// So the class is derived: every manifest row whose family name or corpus file names a tree.
+// That set is {tree math, secret tree, tree operations, tree validation, TreeKEM} today, and
+// three of the five are somebody else's -- which is a judgement about those families rather
+// than anything their rows carry, so it is written down in treeVectorFamiliesElsewhere with a
+// reason each. The two tables together must be exactly the derived set, in both directions.
+func TestTreeVectorFamiliesAreEveryTreeFamilyTheRegistryNames(t *testing.T) {
+	if len(treeVectorRuns) == 0 {
+		t.Fatal("this plan gates no vector family, so every loop of this file reads nothing")
+	}
+	named := map[int]bool{}
+	for number, family := range vectorManifest {
+		if strings.Contains(strings.ToLower(family.Name), "tree") || strings.Contains(strings.ToLower(family.File), "tree") {
+			named[number] = true
+		}
+	}
+	// the positive control, and TreeKEM specifically: its row spells the word inside a longer
+	// one, so a matcher looking for a WORD rather than a substring reports the same clean bill
+	// a complete one reports, over a class missing the family this plan reads second.
+	if !named[11] {
+		t.Fatalf("the scan did not find family 11 (%s), whose row certainly names a tree, so it is matching something other than the manifest's rows",
+			vectorManifest[11].Name)
+	}
+	if len(named) == len(vectorManifest) {
+		t.Fatalf("all %d families of the manifest matched, so this rule selects nothing and the two tables below are held against everything",
+			len(vectorManifest))
+	}
+	for _, number := range slices.Sorted(maps.Keys(named)) {
+		_, gated := treeVectorRuns[number]
+		reason, excused := treeVectorFamiliesElsewhere[number]
+		switch {
+		case gated && excused:
+			t.Errorf("family %d (%s) is gated by this file and also excused to somebody else as %q; one of the two is wrong and a reader cannot tell which",
+				number, vectorManifest[number].Name, reason)
+		case !gated && !excused:
+			t.Errorf("family %d (%s) names a tree and this file neither gates it nor says who has it; a family that left treeVectorRuns silently is a corpus three tests of this file stopped reading",
+				number, vectorManifest[number].Name)
+		}
+	}
+	for _, number := range slices.Sorted(maps.Keys(treeVectorFamiliesElsewhere)) {
+		if !named[number] {
+			t.Errorf("family %d is excused to another plan and no manifest row of that number names a tree, so the exemption covers a family this rule never selected",
+				number)
+		}
+		if strings.TrimSpace(treeVectorFamiliesElsewhere[number]) == "" {
+			t.Errorf("family %d is excused with no reason written down, which is the exemption reading as a filter", number)
+		}
+	}
+	for _, number := range treeVectorFamilies {
+		if !named[number] {
+			t.Errorf("this file gates family %d and its manifest row (%s, %s) names no tree, so the derived class above is not the class this file runs over",
+				number, vectorManifest[number].Name, vectorManifest[number].File)
+		}
+	}
+}
+
+// TestTreeVectorSuiteAgreementFlagsADisagreement drives the per case equality the partition
+// test makes, rather than asserting about it.
+//
+// It is the assertion that says the struct this runner filters with and the text the tally is
+// answered from are reading one field. Every case of both vendored corpora agrees with it, so
+// the real run cannot separate an assertion that holds from an assertion that is not there --
+// measured: deleted, all five tests of this file still passed. The row below is the case the
+// corpora do not contain.
+func TestTreeVectorSuiteAgreementFlagsADisagreement(t *testing.T) {
+	suites := Suites()
+	if len(suites) == 0 {
+		t.Fatal("this package registers no ciphersuite, so the agreement below is over nothing")
+	}
+	kept := suites[0]
+	agreeing := strconv.Itoa(int(kept))
+	if failed, raised := probeAssertion(func(probe *testing.T) {
+		requireTreeVectorSuiteAgrees(probe, "control.json", 0, kept, agreeing)
+	}); failed || raised != nil {
+		t.Fatalf("two decodes that agree were reported: failed=%v raised=%v; the row below would then pass for the wrong reason",
+			failed, raised)
+	}
+	rows := []struct {
+		// names is the substring of the report this row must provoke; the bijection against
+		// the function's own reports is asserted below.
+		names     string
+		published string
+	}{
+		{"is not reading the field it addresses", agreeing + "0"},
+	}
+	keys := []string{}
+	for _, row := range rows {
+		keys = append(keys, row.names)
+	}
+	assertEveryReportIsControlled(t, "requireTreeVectorSuiteAgrees",
+		theReportsOf(t, theSourceDeclaring(t, "", "requireTreeVectorSuiteAgrees"), "", "requireTreeVectorSuiteAgrees"), keys)
+	for _, row := range rows {
+		failed, raised := probeAssertion(func(probe *testing.T) {
+			requireTreeVectorSuiteAgrees(probe, "control.json", 0, kept, row.published)
+		})
+		if raised != nil {
+			t.Errorf("%s: the assertion panicked: %v", row.names, raised)
+			continue
+		}
+		if !failed {
+			t.Errorf("%s: the assertion reported nothing, so it can be deleted with this file's whole run still reading green",
+				row.names)
+		}
+	}
+}
+
+// TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey holds the one place outside this file
+// that types the corpus's ciphersuite key out to the key this file derives.
+//
+// The header of this file used to claim the key "is never typed out a second time". Within
+// this file that was true; within the package it was not, and the second spelling sits on the
+// path this file's own comparator control runs through: aCaseAtARegisteredSuite decodes with a
+// literal tag of its own and hands back the case whose key
+// TestTreeVectorPublishedSuiteRefusesAWrongCase then derives with theJsonKeyOf. Two spellings
+// that disagreed would leave that control driving the comparator with a case selected at a
+// field the comparator never reads, and the refusal table would go on passing.
+//
+// The literal is read out of the shared helper's own source rather than repeated here, so this
+// gate cannot become the third spelling.
+func TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey(t *testing.T) {
+	key := theJsonKeyOf(t, treeVectorHeader{}, "CipherSuite")
+	parsed := theSourceDeclaring(t, "", "aCaseAtARegisteredSuite")
+	found := []string{}
+	ast.Inspect(parsed.declarationOf(t, "", "aCaseAtARegisteredSuite"), func(node ast.Node) bool {
+		field, isField := node.(*ast.Field)
+		if !isField || field.Tag == nil {
+			return true
+		}
+		text, err := strconv.Unquote(field.Tag.Value)
+		if err != nil {
+			t.Fatalf("unquote a struct tag of aCaseAtARegisteredSuite: %v", err)
+		}
+		if tag, _, _ := strings.Cut(reflect.StructTag(text).Get("json"), ","); tag != "" {
+			found = append(found, tag)
+		}
+		return true
+	})
+	if len(found) != 1 {
+		t.Fatalf("aCaseAtARegisteredSuite carries %v json keys and this gate is written for the one it decodes the ciphersuite with", found)
+	}
+	if found[0] != key {
+		t.Errorf("aCaseAtARegisteredSuite decodes %q and %T addresses %q, so the case that drives this file's comparator control is selected at a field the comparator never reads",
+			found[0], treeVectorHeader{}, key)
 	}
 }
