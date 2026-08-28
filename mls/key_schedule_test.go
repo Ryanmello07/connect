@@ -8419,8 +8419,10 @@ func TestAnErasedScheduleRefusesRatherThanAnsweringFromZeros(t *testing.T) {
 const epochSecretEscapeControl = "package control\n" +
 	"\n" +
 	"import (\n" +
+	"\t\"bytes\"\n" +
 	"\t\"errors\"\n" +
 	"\t\"fmt\"\n" +
+	"\t\"sync\"\n" +
 	")\n" +
 	"\n" +
 	"var ErrControl = errors.New(\"control\")\n" +
@@ -8429,6 +8431,11 @@ const epochSecretEscapeControl = "package control\n" +
 	"\tepochSecret []byte\n" +
 	"\tkept        []byte\n" +
 	"\tobserver    func([]byte)\n" +
+	"\tguard       sync.Mutex\n" +
+	"}\n" +
+	"\n" +
+	"type BufferedHolder struct {\n" +
+	"\tepochSecret bytes.Buffer\n" +
 	"}\n" +
 	"\n" +
 	"var Escaped []byte\n" +
@@ -8440,6 +8447,10 @@ const epochSecretEscapeControl = "package control\n" +
 	"var stashed = make([]byte, 32)\n" +
 	"\n" +
 	"var packageObserver func([]byte)\n" +
+	"\n" +
+	"var registerControl func(func() []byte)\n" +
+	"\n" +
+	"var theControlSink = &bytes.Buffer{}\n" +
 	"\n" +
 	"func (self *Holder) LeaksIntoAnExportedVariable() {\n" +
 	"\tEscaped = self.epochSecret\n" +
@@ -8473,6 +8484,22 @@ const epochSecretEscapeControl = "package control\n" +
 	"\tgo wipeControl(self.epochSecret)\n" +
 	"}\n" +
 	"\n" +
+	"func (self *Holder) LeaksThroughAClosureHandedToAForeignCall() {\n" +
+	"\tregisterControl(func() []byte {\n" +
+	"\t\treturn self.epochSecret\n" +
+	"\t})\n" +
+	"}\n" +
+	"\n" +
+	"func (self *BufferedHolder) LeaksThroughAMethodOnWhatItReaches() {\n" +
+	"\tself.epochSecret.WriteTo(theControlSink)\n" +
+	"}\n" +
+	"\n" +
+	"func (self *Holder) LocksWhileItReadsIt() int {\n" +
+	"\tself.guard.Lock()\n" +
+	"\tdefer self.guard.Unlock()\n" +
+	"\treturn len(self.epochSecret)\n" +
+	"}\n" +
+	"\n" +
 	"func (self *Holder) Zeroize() {\n" +
 	"\twipeControl(self.epochSecret)\n" +
 	"}\n" +
@@ -8495,6 +8522,53 @@ const epochSecretEscapeControl = "package control\n" +
 	"\t\tsecret[i] = 0\n" +
 	"\t}\n" +
 	"}\n"
+
+// epochSecretEscapeControlReaching and epochSecretEscapeControlEscaping are what the closure
+// and the escape scan must read out of the fixture above, exactly.
+//
+// They are package level rather than local to the gate that owns the fixture because the
+// SECRET TREE's gate reads them too. Both gates run the same two functions, over different
+// storage, and a refinement made for one of them silently weakens the other: the whole reason
+// the secret tree could not be gated until now is that the scan reported eight false positives
+// on correct code, and the fix for that was a change to this shared machinery. One committed
+// set read by both is what makes "the analysis still reports every way out" a thing each gate
+// asserts for itself rather than a thing a reader has to check by hand.
+//
+// Exact rather than a floor, in both directions. A scan that widened to report a legitimate
+// shape would be weakened until it reported nothing, and a scan that narrowed would issue the
+// clean bill a working one issues.
+var (
+	epochSecretEscapeControlReaching = []string{
+		"CutsALocalFromIt",
+		"KeepsItInItsOwnStorage",
+		"LeaksByCopyingIntoPackageStorage",
+		"LeaksIntoAChannel",
+		"LeaksIntoAGoroutine",
+		"LeaksIntoAnExportedVariable",
+		"LeaksIntoAnUnexportedVariable",
+		"LeaksThroughACallerCallback",
+		"LeaksThroughAClosureHandedToAForeignCall",
+		"LeaksThroughAFieldCallback",
+		"LeaksThroughAMethodOnWhatItReaches",
+		"LeaksThroughAPackageCallback",
+		"LocksWhileItReadsIt",
+		"RefusesWithASentinel",
+		"Zeroize",
+	}
+
+	epochSecretEscapeControlEscaping = []string{
+		"LeaksByCopyingIntoPackageStorage: hands copy both what it reaches and stashed, which outlives it",
+		"LeaksIntoAChannel: sends on escapeChannel",
+		"LeaksIntoAGoroutine: starts a goroutine, which outlives the call that started it",
+		"LeaksIntoAnExportedVariable: writes to Escaped, which outlives it",
+		"LeaksIntoAnUnexportedVariable: writes to escapedUnexported, which outlives it",
+		"LeaksThroughACallerCallback: calls hand, which this package does not declare",
+		"LeaksThroughAClosureHandedToAForeignCall: calls registerControl, which this package does not declare",
+		"LeaksThroughAFieldCallback: calls self.observer, a function value this package does not declare",
+		"LeaksThroughAMethodOnWhatItReaches: calls self.epochSecret.WriteTo, which this package does not declare",
+		"LeaksThroughAPackageCallback: calls packageObserver, which this package does not declare",
+	}
+)
 
 // declaredNames is what the escape scan needs in order to tell code this package wrote from
 // code it did not.
@@ -8700,8 +8774,44 @@ func carriesWhatItReaches(expr ast.Expr, aliases map[string]bool) bool {
 		return slices.ContainsFunc(typed.Args, func(argument ast.Expr) bool {
 			return carriesWhatItReaches(argument, aliases)
 		})
+	case *ast.FuncLit:
+		// a literal carries whatever its body CAPTURES, and the capture is the one thing an
+		// argument walk cannot see: register(func() []byte { return self.epochSecret })
+		// names no alias at the argument position at all, and handing that literal to code
+		// this package did not write hands over the secret just as directly as passing the
+		// slice would. Any mention of a name the storage reaches is enough, in the same
+		// safe direction the reaching closure next door over-approximates in.
+		captured := false
+		ast.Inspect(typed.Body, func(node ast.Node) bool {
+			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && aliases[identifier.Name] {
+				captured = true
+			}
+			return !captured
+		})
+		return captured
 	}
 	return false
+}
+
+// handsAForeignCalleeWhatItReaches answers whether one call puts what the declaration reaches
+// inside the callee's reach, which is the question "is this an escape" reduces to once the
+// callee is known to be code this package did not write.
+//
+// Two ways in, because a go call has two: an argument, and the receiver the callee is reached
+// on. The receiver half is not decoration -- self.nodes.Store(index, secret) hands a foreign
+// method the whole storage without any argument of the call carrying it -- and it is the half
+// that keeps this refinement from being a hole where the storage is a value of a foreign type.
+//
+// What is deliberately NOT here is the callee's own package qualifier: subtle in
+// subtle.ConstantTimeCompare is an *ast.Ident that names an import, and theForeignCallee has
+// already answered that such a call is not foreign, so this is never asked about one.
+func handsAForeignCalleeWhatItReaches(call *ast.CallExpr, aliases map[string]bool) bool {
+	if selector, isSelector := call.Fun.(*ast.SelectorExpr); isSelector && carriesWhatItReaches(selector.X, aliases) {
+		return true
+	}
+	return slices.ContainsFunc(call.Args, func(argument ast.Expr) bool {
+		return carriesWhatItReaches(argument, aliases)
+	})
 }
 
 // theForeignCallee names the callee of one call when that callee is code this package did not
@@ -8797,8 +8907,17 @@ func whereOneDeclarationPutsIt(parsed parsedSource, function *ast.FuncDecl, name
 				}
 			}
 		case *ast.CallExpr:
-			if why := theForeignCallee(parsed, typed.Fun, names); why != "" {
-				put = append(put, why)
+			// a callee this package did not write carries the storage out only when it is
+			// HANDED it: as one of the arguments, or as the receiver it is reached on. The
+			// rule this replaced read "calls something foreign" and had no notion of what
+			// the call was given, which is right for a holder that calls nothing it does
+			// not declare and wrong the moment one holds a lock: sync.Mutex's Lock and
+			// Unlock are foreign, are handed nothing, answer nothing and can carry nothing,
+			// and they put every locked method of the secret tree in the report.
+			if handsAForeignCalleeWhatItReaches(typed, aliases) {
+				if why := theForeignCallee(parsed, typed.Fun, names); why != "" {
+					put = append(put, why)
+				}
 			}
 			if !slices.ContainsFunc(typed.Args, func(argument ast.Expr) bool {
 				return carriesWhatItReaches(argument, aliases)
@@ -8896,36 +9015,14 @@ func TestNoDeclarationReachingTheEpochSecretPutsItBeyondTheCall(t *testing.T) {
 	// scan tells the eight ways out from the four legitimate shapes that look like them
 	control := []parsedSource{mustParseText(t, "the epoch secret escape control", epochSecretEscapeControl)}
 	controlReaching := theNamesReachingTheStorage(declaredAcross(control), epochSecretStorageField)
-	wantReaching := []string{
-		"CutsALocalFromIt",
-		"KeepsItInItsOwnStorage",
-		"LeaksByCopyingIntoPackageStorage",
-		"LeaksIntoAChannel",
-		"LeaksIntoAGoroutine",
-		"LeaksIntoAnExportedVariable",
-		"LeaksIntoAnUnexportedVariable",
-		"LeaksThroughACallerCallback",
-		"LeaksThroughAFieldCallback",
-		"LeaksThroughAPackageCallback",
-		"RefusesWithASentinel",
-		"Zeroize",
-	}
+	wantReaching := epochSecretEscapeControlReaching
 	if !slices.Equal(controlReaching, wantReaching) {
 		t.Fatalf("the closure read %v out of the control as reaching the epoch secret, want %v",
 			controlReaching, wantReaching)
 	}
 	controlEscaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(
 		control, controlReaching, epochSecretStorageField)
-	wantEscaping := []string{
-		"LeaksByCopyingIntoPackageStorage: hands copy both what it reaches and stashed, which outlives it",
-		"LeaksIntoAChannel: sends on escapeChannel",
-		"LeaksIntoAGoroutine: starts a goroutine, which outlives the call that started it",
-		"LeaksIntoAnExportedVariable: writes to Escaped, which outlives it",
-		"LeaksIntoAnUnexportedVariable: writes to escapedUnexported, which outlives it",
-		"LeaksThroughACallerCallback: calls hand, which this package does not declare",
-		"LeaksThroughAFieldCallback: calls self.observer, a function value this package does not declare",
-		"LeaksThroughAPackageCallback: calls packageObserver, which this package does not declare",
-	}
+	wantEscaping := epochSecretEscapeControlEscaping
 	if !slices.Equal(controlEscaping, wantEscaping) {
 		t.Fatalf("the escape scan read\n%v\nout of the control, want\n%v\nit is not telling a write that outlives the call from one that does not, or it is reading an erase or a length check as an escape",
 			controlEscaping, wantEscaping)

@@ -823,6 +823,168 @@ func TestSecretTreeParentSecretIsGoneOnceBothChildrenExist(t *testing.T) {
 	}
 }
 
+// secretTreeExercised builds one tree and drives it through each thing the type does, so a
+// derivation over the state it is then in reads every storage the type HAS rather than the
+// one a freshly constructed tree happens to have filled.
+//
+// A tree straight out of the constructor holds node secrets and no ratchets, and a class
+// derived from that state would be one field wide -- which is the shape of the defect this
+// whole gate exists for, one level up: a question answered about the state somebody looked
+// at rather than about the type.
+func secretTreeExercised(t *testing.T, encryptionSecret []byte) *SecretTree {
+	t.Helper()
+	tree, err := NewSecretTree(stTestCrypto(t), LeafCount(8), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	// a descent, which leaves the node map holding the antichain the take did not consume
+	if _, err := tree.takeLeafSecret(0); err != nil {
+		t.Fatalf("takeLeafSecret(0): %v", err)
+	}
+	// and a sender step of each kind, which is what creates a leaf's two ratchets
+	for _, kind := range []RatchetType{RatchetHandshake, RatchetApplication} {
+		if _, _, _, err := tree.NextSenderKey(1, kind); err != nil {
+			t.Fatalf("NextSenderKey(1, %d): %v", kind, err)
+		}
+	}
+	return tree
+}
+
+// secretTreeStorageFieldOf reads the top level field name out of one location the byte walk
+// reports.
+//
+// The type's own name is asked of the type rather than written down, so a rename leaves this
+// reading a field name rather than trimming nothing and answering a whole path. The cut is at
+// the first of the four characters the walk descends with -- a field, an index, a map key, a
+// pointer -- because what is wanted is the field the location hangs off, whatever shape the
+// rest of it took.
+func secretTreeStorageFieldOf(t *testing.T, where string) string {
+	t.Helper()
+	prefix := reflect.TypeOf((*SecretTree)(nil)).Elem().String() + "."
+	trimmed, found := strings.CutPrefix(where, prefix)
+	if !found {
+		t.Fatalf("the byte walk reported %q, which does not begin with %q, so no field name can be read out of it",
+			where, prefix)
+	}
+	if cut := strings.IndexAny(trimmed, ".[{-"); cut >= 0 {
+		return trimmed[:cut]
+	}
+	return trimmed
+}
+
+// secretTreeSecretBearingFields is the class the gate below is over: the fields of
+// *SecretTree whose retained bytes are a FUNCTION OF the encryption secret.
+//
+// Derived by differencing two trees rather than named, and differenced rather than merely
+// walked, because the walk on its own over-reports. crypto reaches the suite's parameters,
+// whose Name is a run of bytes no walk can tell from a key, and putting the provider in this
+// class would drag every method that touches self.crypto into the reaching set and turn the
+// report into noise a reader learns to ignore. Two trees built from two different encryption
+// secrets and driven through the same sequence differ in exactly the storage that carries key
+// material and agree everywhere else, which is what "holds a secret" actually means -- asked
+// of the implementation rather than guessed from a field name.
+//
+// A field added later that holds derived key material joins this class on the run that adds
+// it, with no edit here. One that holds a constant does not, and should not.
+func secretTreeSecretBearingFields(t *testing.T) []string {
+	t.Helper()
+	nh := stTestCrypto(t).HashSize()
+	carriedBy := func(fill byte) map[string][]byte {
+		held := map[string][]byte{}
+		for _, one := range secretTreeRetainedBytes(t, secretTreeExercised(t, bytes.Repeat([]byte{fill}, nh))) {
+			held[one.where] = one.carried
+		}
+		return held
+	}
+	first, second := carriedBy(0x11), carriedBy(0x22)
+	if len(first) == 0 || len(first) != len(second) {
+		t.Fatalf("the two exercised trees retained %d and %d locations; they are driven identically and must agree on WHERE they hold bytes",
+			len(first), len(second))
+	}
+	fields := []string{}
+	for where, held := range first {
+		other, alsoHeld := second[where]
+		if !alsoHeld {
+			t.Fatalf("the second tree holds nothing at %s and the first one does, so the two runs are not the same sequence and what differs below would be about the driving rather than about the secret",
+				where)
+		}
+		if bytes.Equal(held, other) {
+			continue
+		}
+		fields = append(fields, secretTreeStorageFieldOf(t, where))
+	}
+	slices.Sort(fields)
+	return slices.Compact(fields)
+}
+
+// TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall is section 9's forward
+// secrecy asked about the PROCESS rather than about the type.
+//
+// TestSecretTreeParentSecretIsGoneOnceBothChildrenExist above asks what remains reachable
+// through *SecretTree. That is the right question about the type and it is only about the
+// type: a copy taken on the way past and parked in a PACKAGE LEVEL variable answers it
+// exactly as a correct tree does. The map no longer names the parent, the bytes at that
+// address are zero, the walk over the type finds nothing -- and the secret is still in the
+// process for as long as the program runs. Measured rather than supposed: a two line archive
+// beside the zeroize, with the archive declared at package scope, passes all 750 tests of
+// this package.
+//
+// So this gate reads the SOURCE, and asks of every declaration that can reach the tree's key
+// storage whether it puts what it reaches somewhere the call does not end. It is the same
+// scan guardrail 6 runs over the key schedule's epoch secret, pointed at different storage,
+// and that is why the control it runs first is that gate's control: the two share the
+// machinery, so a refinement made for either one that stopped reporting a way out would leave
+// both of them green. The machinery could not be pointed here until that refinement landed --
+// the scan read ANY call to a foreign callee as an escape, which is right for a key schedule
+// that calls nothing it does not declare and reports eight false positives on a secret tree,
+// whose stateLock's Lock and Unlock are foreign, are handed nothing and can carry nothing.
+func TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall(t *testing.T) {
+	// the shared analysis first, over the shared control, on both halves. Without it the
+	// refinement that made this gate possible is also the thing that could make it vacuous.
+	control := []parsedSource{mustParseText(t, "the epoch secret escape control", epochSecretEscapeControl)}
+	controlReaching := theNamesReachingTheStorage(declaredAcross(control), epochSecretStorageField)
+	if !slices.Equal(controlReaching, epochSecretEscapeControlReaching) {
+		t.Fatalf("the closure read %v out of the shared control, want %v",
+			controlReaching, epochSecretEscapeControlReaching)
+	}
+	controlEscaping := theDeclarationsPuttingWhatTheyReachBeyondTheCall(
+		control, controlReaching, epochSecretStorageField)
+	if !slices.Equal(controlEscaping, epochSecretEscapeControlEscaping) {
+		t.Fatalf("the escape scan read\n%v\nout of the shared control, want\n%v\na way out it no longer reports there is a way out it no longer reports over the secret tree either",
+			controlEscaping, epochSecretEscapeControlEscaping)
+	}
+
+	storages := secretTreeSecretBearingFields(t)
+	// the derivation's own positive control. These two are named as members the differential
+	// certainly has -- the node secrets and the per sender ratchets are what a secret tree IS
+	// -- and not as the class: the class is whatever differs, and a third secret bearing field
+	// is gated by existing rather than by an edit here.
+	for _, known := range []string{"nodes", "ratchets"} {
+		if !slices.Contains(storages, known) {
+			t.Fatalf("the differential derived %v as the secret bearing storage of a secret tree and %s is not among them, so this gate is over a class that has stopped deriving",
+				storages, known)
+		}
+	}
+
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		files = append(files, mustParseSource(t, path))
+	}
+	declared := declaredAcross(files)
+	for _, storage := range storages {
+		reaching := theNamesReachingTheStorage(declared, storage)
+		if len(reaching) == 0 {
+			t.Fatalf("no declaration of this package's source mentions %s, so the class below is empty and this gate demands nothing for it",
+				storage)
+		}
+		t.Logf("%d declarations reach the secret tree's %s: %v", len(reaching), storage, reaching)
+		for _, one := range theDeclarationsPuttingWhatTheyReachBeyondTheCall(files, reaching, storage) {
+			t.Errorf("%s -- it reaches the secret tree's %s and puts what it reaches somewhere the call does not end: storage this package's own call did not introduce, another goroutine, or code this package did not write. Section 9's forward secrecy is that a consumed secret is gone from the PROCESS, and a copy parked outside the tree is invisible to every gate that reads the tree",
+				one, storage)
+		}
+	}
+}
+
 // TestSecretTreeDeletedSecretsAreNotDerivableFromWhatRemains is the property the deletion
 // exists for: after a leaf has been taken, no sequence of derivations over the secrets the
 // tree still holds reaches any secret it destroyed.

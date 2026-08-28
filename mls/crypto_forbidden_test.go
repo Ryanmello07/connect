@@ -29,6 +29,10 @@ package mls
 
 import (
 	"fmt"
+	"go/ast"
+	"go/build"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -59,7 +63,11 @@ var forbiddenPrimitiveTokens = []string{
 // second, the reverse of the HKDF-Extract(salt, ikm) every spec text in this project
 // writes, so every wrapper here swaps. Confining the call keeps the swap in two
 // reviewable files instead of scattering a silent argument transposition.
-const hkdfExtractNeedle = "hkdf.Extract("
+//
+// The needle this sentence used to name was a const holding that one spelling.
+// hkdfEntryPointNeedles below derives the whole class off crypto/hkdf instead, because the
+// same transposition is available through hkdf.Expand and through hkdf.Key, and neither of
+// those was confined by anything.
 
 // The two files that may make the call, as PATHS relative to this package's directory --
 // which is the key scanSources collects a file under -- and not as base names.
@@ -247,6 +255,68 @@ func forbiddenTokensIn(text string, tokens []string) []string {
 	return found
 }
 
+// hkdfEntryPointNeedles is guardrail 1's class: a call site needle for every exported
+// function crypto/hkdf declares, read out of that package's own source under the toolchain
+// this repository pins.
+//
+// It is derived because the enumeration it replaced held ONE name. The gate banned
+// "hkdf.Extract(" outside two reviewed files while crypto/hkdf declares three entry points,
+// and the other two carry the same trap: Expand and Key take the secret before the salt, the
+// reverse of the KDF.Extract(salt, ikm) every spec text in this project writes. hkdf.Key is
+// the worse of the two -- it is Extract and Expand in one call, so a transposition there
+// produces a whole key schedule that is internally consistent, 32 bytes long, and wrong, and
+// nothing but a vector from another implementation can see it. A file calling hkdf.Key
+// compiled clean and passed every gate in this tree.
+//
+// That is standing rule 5 exactly: fourteen times on this project a hand written list has
+// understated the class it named. Reading the class off crypto/hkdf means a fourth entry
+// point added by a later go release is confined by the release that adds it.
+//
+// The needle keeps the trailing parenthesis the single name gate used, so a mention of
+// hkdf.Extract in prose is not a call site. Comments are stripped ahead of the match anyway,
+// which is belt and braces of the same claim.
+func hkdfEntryPointNeedles(t *testing.T) []string {
+	t.Helper()
+	dir := filepath.Join(build.Default.GOROOT, "src", "crypto", "hkdf")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s, where the confined class is derived from: %v", dir, err)
+	}
+	fileSet := token.NewFileSet()
+	names := []string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fileSet, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s of crypto/hkdf: %v", name, err)
+		}
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil || !function.Name.IsExported() {
+				continue
+			}
+			names = append(names, "hkdf."+function.Name.Name+"(")
+		}
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	// the derivation's own positive control, in both directions. Extract is the call this
+	// package actually makes and the one the guardrail is named for, so a derivation that
+	// stopped deriving reports an empty class and clears every file; and a class of one is
+	// the enumeration this replaced, which is the state the gate was in when hkdf.Expand and
+	// hkdf.Key were outside it.
+	if !slices.Contains(names, "hkdf.Extract(") {
+		t.Fatalf("the derivation read %v out of %s and hkdf.Extract is not among them, so this gate confines nothing", names, dir)
+	}
+	if len(names) < 2 {
+		t.Fatalf("the derivation read %v out of %s; crypto/hkdf declares Extract, Expand and Key, and a class of one is the enumeration this gate replaced", names, dir)
+	}
+	return names
+}
+
 // The scanned paths whose code contains needle and whose PATH is not allowed, sorted so a
 // failure reads the same twice and a control can compare an exact set.
 //
@@ -352,13 +422,63 @@ func TestForbiddenPrimitivesAreAbsent(t *testing.T) {
 	}
 }
 
-// The gate on guardrail 1. The allowed names are read out of the list the check itself
-// uses, so a message cannot outlive the rule it describes.
+// hkdfExtraCallSites is the reviewed call site of one entry point OUTSIDE the crypto's two
+// KDF files, by the path the scan collects a file under.
+//
+// One entry today. connect/message derives the group's write and read keys as
+// HKDF-Expand(storage_root, "write/v1"|"read/v1", 32) of master section 9.2, which is that
+// package's own derivation and not one of mls's labelled expansions -- there is no KDFLabel
+// to have a second implementation of. It is exempt from the confinement and it is NOT exempt
+// from being read: the gate below refuses an entry here that does not make the call, so a
+// path that stops calling it stops being excused.
+//
+// Expand is the entry point with no salt argument, so it does not carry the transposition
+// this guardrail is named for. Extract and Key do, and neither has an entry here.
+//
+// A needle the derived class holds and this map does not name is allowed in the crypto's two
+// KDF files and NOWHERE else, which is the safe default: a fourth entry point added by a
+// later go release is confined the moment it exists rather than exempted by nobody having
+// thought of it. hkdf.Key -- Extract and Expand in one call, and the worst of the three to
+// transpose, because the whole schedule it produces is internally consistent and wrong -- is
+// in exactly that position.
+var hkdfExtraCallSites = map[string][]string{
+	"hkdf.Expand(": {"../message/writeauth.go"},
+}
+
+// The paths one entry point may be called from: the crypto's two reviewed KDF files, plus
+// whatever the map above reviews for that entry point specifically.
+func hkdfAllowedPathsFor(needle string) []string {
+	return slices.Concat(hkdfExtractAllowedPaths, hkdfExtraCallSites[needle])
+}
+
+// The gate on guardrail 1, over every entry point crypto/hkdf declares rather than over the
+// one the const above used to name. The allowed names are read out of the list the check
+// itself uses, so a message cannot outlive the rule it describes.
+//
+// Each exemption outside the two KDF files is required to COVER something -- the path has to
+// be scanned, and it has to make the call it is excused for. An allow list entry that names a
+// file which no longer calls the function is a hole standing open for the next person to
+// write one into, and it reads as coverage.
 func TestHkdfExtractHasOnlyTwoCallSites(t *testing.T) {
 	scan := mustScanSources(t, forbiddenScanRoots)
 	sources := productionSources(sourcesUnderGate(t, scan))
-	for _, path := range confinementViolations(sources, hkdfExtractNeedle, hkdfExtractAllowedPaths) {
-		t.Errorf("%s calls %s; only %s may", path, hkdfExtractNeedle, strings.Join(hkdfExtractAllowedPaths, " and "))
+	for _, needle := range hkdfEntryPointNeedles(t) {
+		allowed := hkdfAllowedPathsFor(needle)
+		for _, path := range hkdfExtraCallSites[needle] {
+			text, scanned := sources[path]
+			if !scanned {
+				t.Errorf("%s is excused for %s and the scan of %v did not read it, so the exemption covers nothing",
+					path, needle, forbiddenScanRoots)
+				continue
+			}
+			if !strings.Contains(codeOf(text), needle) {
+				t.Errorf("%s is excused for %s and does not call it; an exemption that covers nothing is a hole with a name on it",
+					path, needle)
+			}
+		}
+		for _, path := range confinementViolations(sources, needle, allowed) {
+			t.Errorf("%s calls %s; only %s may", path, needle, strings.Join(allowed, " and "))
+		}
 	}
 }
 
@@ -404,15 +524,22 @@ func TestForbiddenTokenMatcherFlagsTheControlFixture(t *testing.T) {
 }
 
 // The positive control for the guardrail 1 confinement, run through the allowed list the
-// gate itself uses. Every fixture file is checked to contain the call before the report
-// is compared, so an unreported file means the path was allowed rather than that the
-// fixture forgot to make the call.
+// gate itself uses and over every entry point the derived class holds. Every fixture file is
+// checked to contain each call before the report is compared, so an unreported file means the
+// path was allowed rather than that the fixture forgot to make the call.
 //
-// The nested twins are the half that says the exemption is by path. Each is the base name
-// of an allowed path in a directory no allowed path names, so a base name reading excuses
-// every one of them and reports only violations.go -- which is exactly what this gate did
-// before, and exactly what the expectation below refuses. The twins are derived from the
-// allowed list rather than listed, so a third allowed path cannot land without one.
+// Per NEEDLE and not once over the class, which is what makes the widening real: the fixture
+// commits a call to each of crypto/hkdf's entry points in each of the five files, so a class
+// that dropped back to Extract alone fails here rather than reporting a clean tree. A go
+// release adding a fourth entry point fails this control -- "the fixture does not call it" --
+// which is the intended detection rather than a false alarm: it is the sentence that says the
+// new call is unconfined until somebody looks at it.
+//
+// The nested twins are the half that says the exemption is by path. Each is the base name of
+// an allowed path in a directory no allowed path names, so a base name reading excuses every
+// one of them and reports only violations.go -- which is exactly what this gate did before,
+// and exactly what the expectation below refuses. The twins are derived from the allowed list
+// rather than listed, so a third allowed path cannot land without one.
 func TestHkdfConfinementFlagsTheControlFixture(t *testing.T) {
 	control := mustScanSources(t, []string{forbiddenControlRoot})
 	allowed := underControlRoot(hkdfExtractAllowedPaths)
@@ -422,16 +549,18 @@ func TestHkdfConfinementFlagsTheControlFixture(t *testing.T) {
 			len(hkdfExtractAllowedPaths), len(twins))
 	}
 	violating := []string{forbiddenControlRoot + "/violations.go"}
-	for _, path := range slices.Concat(violating, allowed, twins) {
-		if !strings.Contains(codeOf(controlFileAt(t, control, path)), hkdfExtractNeedle) {
-			t.Fatalf("control fixture %s does not call %s, so it controls nothing", path, hkdfExtractNeedle)
-		}
-	}
-	violations := confinementViolations(control.sourceTexts, hkdfExtractNeedle, allowed)
 	want := slices.Concat(violating, twins)
 	slices.Sort(want)
-	if !slices.Equal(violations, want) {
-		t.Errorf("the confinement check reported %v, want %v", violations, want)
+	for _, needle := range hkdfEntryPointNeedles(t) {
+		for _, path := range slices.Concat(violating, allowed, twins) {
+			if !strings.Contains(codeOf(controlFileAt(t, control, path)), needle) {
+				t.Fatalf("control fixture %s does not call %s, so it controls nothing for that entry point", path, needle)
+			}
+		}
+		violations := confinementViolations(control.sourceTexts, needle, allowed)
+		if !slices.Equal(violations, want) {
+			t.Errorf("the confinement check reported %v for %s, want %v", violations, needle, want)
+		}
 	}
 }
 
