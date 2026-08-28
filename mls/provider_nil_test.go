@@ -89,6 +89,25 @@ func providerNilMethodRows() []providerNilMethodRow {
 			_, err := (&RatchetTree{}).TreeHashes(nil)
 			return err
 		}},
+		// section 7.9's three, on the same zero valued tree and for the same reason. The
+		// receiver separates the two orders more sharply here than it does above, because
+		// every one of these three has a range check or a blank-node refusal that answers a
+		// tree-shaped error: ParentHash refuses a parent index outside the tree with
+		// ErrNodeIndexOutOfRange, and VerifyParentHashes refuses a leaf width of zero with
+		// ErrTreeMalformed. A body that read its receiver first would answer either of those
+		// to a caller whose actual mistake was passing no provider, and node 0 of a tree with
+		// no nodes reaches both of them.
+		{name: "(*RatchetTree).ParentHash", call: func() error {
+			_, err := (&RatchetTree{}).ParentHash(nil, 0, 0)
+			return err
+		}},
+		{name: "(*RatchetTree).parentHashClaimsUnder", call: func() error {
+			_, err := (&RatchetTree{}).parentHashClaimsUnder(nil, &ParentNode{}, 0, 0, 0)
+			return err
+		}},
+		{name: "(*RatchetTree).VerifyParentHashes", call: func() error {
+			return (&RatchetTree{}).VerifyParentHashes(nil)
+		}},
 	}
 }
 

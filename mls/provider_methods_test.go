@@ -251,7 +251,105 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return values, nil
 		}},
+		// section 7.9's three. ParentHash answers a digest, which both differentials read the
+		// way they read the four above it.
+		{name: "(*RatchetTree).ParentHash", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowRatchetTree(t)
+			// both copath children of node 1, because "with respect to the copath child" is
+			// the whole mechanism of a parent hash and a row reading one of the two would
+			// pass over a body that hashed the same subtree whichever child it was handed
+			withRight, err := tree.ParentHash(crypto, NodeIndex(1), NodeIndex(2))
+			if err != nil {
+				return nil, err
+			}
+			withLeft, err := tree.ParentHash(crypto, NodeIndex(1), NodeIndex(0))
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{
+				{name: "the parent hash of node 1 with copath child 2", content: withRight},
+				{name: "the parent hash of node 1 with copath child 0", content: withLeft},
+			}, nil
+		}},
+		// the other two answer a verdict and a count rather than bytes, so what they leave
+		// behind is rendered. Both are driven over a tree whose chain was built through a
+		// provider FIXED in the fixture rather than through the row's, which is what makes the
+		// answer move: a body that took its hashes from somewhere other than the provider it
+		// was handed reproduces that fixed chain under every provider and answers "verifies"
+		// to all of them.
+		//
+		// The renderings are deliberately neither 32 nor 64 octets long, so the KDF.Nh
+		// differential reads them as the non-digests they are rather than as a width that
+		// failed to follow the provider.
+		{name: "(*RatchetTree).parentHashClaimsUnder", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowChainedRatchetTree(t)
+			claims, err := tree.parentHashClaimsUnder(crypto, tree.ParentAt(NodeIndex(1)),
+				NodeIndex(1), NodeIndex(0), NodeIndex(2))
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{
+				{name: "the claim count", content: []byte(fmt.Sprintf("claimants: %d", claims))},
+			}, nil
+		}},
+		{name: "(*RatchetTree).VerifyParentHashes", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowChainedRatchetTree(t)
+			verdict := []byte("the parent hashes verify")
+			if refused := tree.VerifyParentHashes(crypto); refused != nil {
+				verdict = []byte("the parent hashes are refused")
+			}
+			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
+		}},
 	}
+}
+
+// providerRowChainedRatchetTree is providerRowRatchetTree's two leaf cousin, carrying one valid
+// RFC 9420 section 7.9.1 parent hash chain.
+//
+// The chain is computed through a provider fixed HERE and not through the one the row is being
+// driven with, and that is the whole point of the fixture. A tree whose chain was built with the
+// row's own provider chains under every provider, so the verdict it produces is the same over
+// the real one and over the tagging one, and the routing differential would have nothing to
+// read. Built once against a fixed provider, the verdict is "verifies" for a body that hashes
+// through the provider it was handed and "verifies" for one that hardcoded SHA-256 only when
+// those two providers agree -- which is exactly the separation the gate is after.
+func providerRowChainedRatchetTree(t *testing.T) *RatchetTree {
+	t.Helper()
+	fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree := NewRatchetTree()
+	for _, i := range []LeafIndex{0, 1} {
+		leaf := testLeafNodeOfSource(LeafNodeSourceUpdate)
+		leaf.EncryptionKey = HpkePublicKey(bytes.Repeat([]byte{0x60 + byte(i)}, 32))
+		leaf.SignatureKey = SignaturePublicKey(bytes.Repeat([]byte{0x70 + byte(i)}, 32))
+		if err := tree.SetLeaf(i, leaf); err != nil {
+			t.Fatalf("SetLeaf(%d): %v", i, err)
+		}
+	}
+	// node 1 is the root of a two leaf tree, so section 7.9 gives it the zero-length
+	// parent_hash field and the chain is one link long.
+	if err := tree.SetParent(NodeIndex(1), &ParentNode{
+		EncryptionKey: HpkePublicKey(bytes.Repeat([]byte{0x61}, 32)),
+		ParentHash:    []byte{},
+	}); err != nil {
+		t.Fatalf("SetParent(1): %v", err)
+	}
+	hash, err := tree.ParentHash(fixed, NodeIndex(1), NodeIndex(2))
+	if err != nil {
+		t.Fatalf("ParentHash: %v", err)
+	}
+	claimant := testLeafNodeOfSource(LeafNodeSourceCommit)
+	claimant.EncryptionKey = HpkePublicKey(bytes.Repeat([]byte{0x60}, 32))
+	claimant.SignatureKey = SignaturePublicKey(bytes.Repeat([]byte{0x70}, 32))
+	claimant.ParentHash = hash
+	if err := tree.SetLeaf(LeafIndex(0), claimant); err != nil {
+		t.Fatalf("SetLeaf(0): %v", err)
+	}
+	// the fixture's own claim, so a row driven over this tree cannot be reading a refusal that
+	// was already there before the provider was varied
+	if err := tree.VerifyParentHashes(fixed); err != nil {
+		t.Fatalf("the row's tree does not verify under the provider its chain was built with: %v", err)
+	}
+	return tree
 }
 
 // providerRowRatchetTree is the tree the four tree hash rows run over, built without touching a

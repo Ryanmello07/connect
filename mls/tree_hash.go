@@ -13,6 +13,8 @@
 package mls
 
 import (
+	"crypto/subtle"
+	"errors"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -188,4 +190,301 @@ func (self *RatchetTree) TreeHashes(crypto CryptoProvider) ([][]byte, error) {
 		out[x] = hash
 	}
 	return out, nil
+}
+
+// errCopathChildIsNotAChildOfTheParent names the one argument mistake this method could not
+// otherwise report.
+//
+// ParentHash(P, S) is defined only for S a CHILD of P: RFC 9420 section 7.9 states it as "the
+// parent hash of P with copath child S", S being the child of P that is not on the path being
+// updated. Handed any other node, the walk below would hash that node's subtree quite happily
+// and answer a well formed digest of the right width over the wrong tree, which no length
+// check, round trip or comparison against this implementation can see. So the two children are
+// DERIVED from the index here and the argument is held against them, rather than the caller
+// being trusted to have picked one of them -- the whole security of the chain is that the hash
+// covers the OTHER subtree, and a hash that covered something else would still chain.
+//
+// Unexported because it is a caller's bug and not a protocol condition: nothing arriving off
+// the wire reaches it, so no caller outside this package has a branch to write for it. A blank
+// parent node is the other refusal and answers ErrParentHashMismatch instead, because that one
+// IS a question about a tree somebody else sent.
+var errCopathChildIsNotAChildOfTheParent = errors.New(
+	"mls: the copath child is not a child of the node whose parent hash was asked for")
+
+// ParentHash is RFC 9420 section 7.9: the parent hash of the node at parent, taken with respect
+// to the copath child -- the child of parent that is NOT on the path being updated.
+//
+//	struct { HPKEPublicKey encryption_key;
+//	         opaque parent_hash<V>;
+//	         opaque original_sibling_tree_hash<V>; } ParentHashInput;
+//
+// "With respect to" is the entire mechanism, and it is why the copath child is an argument
+// rather than something this method chooses. The hash covers the OTHER subtree, so a member
+// cannot rewrite its own side of the tree without moving the parent hash of every node above
+// it -- which is what the signature a leaf makes over its parent_hash field then pins.
+//
+// original_sibling_tree_hash is the ORIGINAL tree hash of that subtree, not its tree hash:
+// section 7.9 says to blank every leaf in parent.unmerged_leaves and strike those leaves out of
+// every descendant's unmerged_leaves before hashing it. That is treeHash's exclude arm, and it
+// is the half of this function that is invisible until somebody has been added since the last
+// commit -- over a parent with no unmerged leaves the original tree hash and the plain tree
+// hash of the same subtree are the same bytes, so every fixture without an unmerged leaf agrees
+// with an implementation that never heard of the exclusion.
+// What holds the exclusion arm today is the section 7.8 pair beside it --
+// TestTheOriginalTreeHashIsTheTreeHashOfTheTreeWithoutThoseLeaves and
+// TestTheOriginalTreeHashStrikesTheExcludedLeafOutOfUnmergedLeaves -- and, for this
+// function's own bytes, TestVerifyParentHashesAcceptsThePublishedTreeValidationCorpus:
+// the 290 non-blank parents of the working group's own trees chain through this
+// preimage, and several of those parents carry unmerged leaves inside the sibling
+// subtree, so a version that skipped the blanking fails there. A parent hash of this
+// node's own with no such corpus behind it would still be owed the RFC's worked
+// example from appendix B, which this package does not yet hold.
+func (self *RatchetTree) ParentHash(crypto CryptoProvider,
+	parent, copathChild NodeIndex) ([]byte, error) {
+	// before anything is read off the receiver, for TreeHash's reason: a caller that passed no
+	// provider is told that, rather than being sent to look at a tree that is not the problem.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the parent hash input is hashed through it", ErrNilCryptoProvider)
+	}
+	if uint32(parent) >= self.NodeWidth() {
+		return nil, ErrNodeIndexOutOfRange
+	}
+	left, leftOk := leftOf(parent)
+	right, rightOk := rightOf(parent)
+	if !leftOk || !rightOk {
+		// an even index is a leaf, and a leaf has no children for a copath child to be one of.
+		// SetParent answers the same sentinel to the same mistake.
+		return nil, ErrNodeTypeMismatch
+	}
+	if copathChild != left && copathChild != right {
+		return nil, errCopathChildIsNotAChildOfTheParent
+	}
+	node := self.ParentAt(parent)
+	if node == nil {
+		return nil, fmt.Errorf("%w: node %d is blank, so it publishes no encryption_key and carries no parent_hash",
+			ErrParentHashMismatch, parent)
+	}
+	exclude := map[LeafIndex]bool{}
+	for _, leaf := range node.UnmergedLeaves {
+		exclude[leaf] = true
+	}
+	siblingHash, err := self.treeHash(crypto, copathChild, exclude)
+	if err != nil {
+		return nil, err
+	}
+	input, err := marshalBytes(func(w *syntax.Writer) error {
+		w.WriteOpaque(node.EncryptionKey)
+		w.WriteOpaque(node.ParentHash)
+		w.WriteOpaque(siblingHash)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return crypto.Hash(input), nil
+}
+
+// nodeParentHashField is the parent_hash a node CARRIES, whatever kind of node it is, and a
+// bool for whether it carries one at all.
+//
+// RFC 9420 section 7.9.1: a ParentNode always has the field, and a LeafNode has it only under
+// leaf_node_source = commit. A key_package or update leaf has no parent_hash at all, and its
+// zero valued Go field read as an empty one would let a chain check compare a parent hash
+// against nothing and call the two equal -- which is the shape that makes every leaf that never
+// committed look like a valid start of a chain. So "no field" is the bool and never an empty
+// slice, and the two are not the same answer.
+func nodeParentHashField(node *Node) ([]byte, bool) {
+	if node == nil {
+		return nil, false
+	}
+	if node.Parent != nil {
+		return node.Parent.ParentHash, true
+	}
+	if node.Leaf != nil && node.Leaf.LeafNodeSource == LeafNodeSourceCommit {
+		return node.Leaf.ParentHash, true
+	}
+	return nil, false
+}
+
+// ---- RFC 9420 section 7.9.2, parent hash validity over the whole tree.
+//
+// This is the check that stops a member handing a joiner a tree in which they have substituted
+// themselves for somebody else. A parent node's encryption key is only trustworthy because some
+// member signed a leaf whose parent_hash chains up to it; drop the check and a forged tree is
+// adopted and its author reads the group.
+//
+// The rule is stated in section 7.9.2 and it is worth being exact about which reading this
+// implements, because the plan this task came from restates it as a two armed disjunction while
+// the RFC's own text is a three condition conjunction inside a disjunction. Section 7.9.2 in
+// full: the parent hash in a node D is valid with respect to a parent P, whose children are C
+// (the one on D's direct path) and S (the other), when
+//
+//  1. D is a descendant of P,
+//  2. D's parent_hash field equals the parent hash of P with copath child S, and
+//  3. D is in the resolution of C, and the intersection of P's unmerged_leaves with the subtree
+//     under C equals the resolution of C with D removed.
+//
+// and then: "the new member MUST authenticate that each non-blank parent node P is parent-hash
+// valid ... top down by verifying that there is EXACTLY ONE descendant of each non-blank parent
+// node for which the parent node is parent-hash valid".
+//
+// Condition 3 is the half a restatement drops, and dropping it is not conservative. Without it
+// the question is only "does SOMETHING under this child carry the right hash", which a forger
+// satisfies by leaving the legitimate chain in place and splicing an extra subtree in beside it
+// -- the spliced nodes are then in the resolution, so the next commit seals a path secret to
+// keys the forger chose, while every parent still chains. Condition 3 is what says the
+// resolution of C holds the one claimant and NOTHING else except the leaves added since P was
+// last set, which is the only set allowed to be there.
+// TestVerifyParentHashesRefusesACoTenantInTheResolutionOfTheClaimant is the pair of trees that
+// differ in exactly that and nothing else.
+//
+// The count is over BOTH arms together and not one per arm. "Exactly one descendant" is a single
+// number for the node, so neither zero -- P was never legitimately written -- nor two -- two
+// update paths spliced together, or a claimant manufactured on each side -- is accepted.
+
+// unmergedLeavesUnder is the intersection of the parent's unmerged_leaves with the subtree under
+// child, as the NODE indices a resolution is made of, counted rather than set-flagged so a
+// repeated entry cannot be matched twice.
+//
+// The conversion is the point. unmerged_leaves is a list of LEAF indices and a resolution is a
+// list of NODE indices, and condition 3 equates the two, so one of them has to be carried into
+// the other's space. Carrying the leaves up is the direction that cannot lose information, since
+// every leaf has a node index and not every node index is a leaf.
+func (self *RatchetTree) unmergedLeavesUnder(parent *ParentNode, child NodeIndex) map[NodeIndex]int {
+	firstLeaf, lastLeaf := SubtreeLeaves(child)
+	under := map[NodeIndex]int{}
+	for _, leaf := range parent.UnmergedLeaves {
+		if leaf >= firstLeaf && leaf <= lastLeaf {
+			under[leaf.NodeIndex()] += 1
+		}
+	}
+	return under
+}
+
+// resolutionIsTheClaimantAndTheUnmergedLeaves is condition 3: the resolution of the child, with
+// the claimant struck out, is exactly the parent's unmerged leaves under that child.
+//
+// Equality of SETS and not of ordered lists, which departs from how every other comparison of a
+// resolution in this package is written and so is stated here rather than left to be noticed.
+// Resolution order is a contract where two resolutions are compared to EACH OTHER, because
+// TreeKEM pairs a resolution positionally with an UpdatePath's ciphertexts. Here a resolution is
+// compared against an unmerged_leaves vector, a different object with an order of its own --
+// ascending, which the codec enforces -- and section 7.9.2 relates the two with "is equal to"
+// over an intersection, which is a statement about membership. An elementwise comparison would
+// additionally demand that a non-blank child's own unmerged leaves sort after the child itself,
+// which holds for a child sitting left of its unmerged leaves and fails for one sitting right of
+// them, so it would refuse legal trees on one side of the tree only.
+func (self *RatchetTree) resolutionIsTheClaimantAndTheUnmergedLeaves(parent *ParentNode,
+	child NodeIndex, resolution []NodeIndex, claimant NodeIndex) bool {
+	under := self.unmergedLeavesUnder(parent, child)
+	struck := false
+	for _, node := range resolution {
+		if node == claimant && !struck {
+			struck = true
+			continue
+		}
+		if under[node] == 0 {
+			return false
+		}
+		under[node] -= 1
+	}
+	// the claimant has to have BEEN in the resolution, which is the first clause of condition 3
+	// and is not implied by the arithmetic above: a claimant absent from the resolution leaves
+	// it one entry longer than the unmerged set, which the loop only reports if that surplus
+	// entry is also absent from the set.
+	if !struck {
+		return false
+	}
+	for _, remaining := range under {
+		if remaining != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// parentHashClaimsUnder counts the descendants under child that are parent-hash valid with
+// respect to the parent at p, over the arm whose copath child is sibling.
+//
+// It counts rather than answering a bool, because the rule above it is "exactly one" and a bool
+// per arm cannot tell one claimant from two on the same side. Two claimants under one child is
+// the shape a forger produces who kept the real chain and added a node of their own beside it.
+func (self *RatchetTree) parentHashClaimsUnder(crypto CryptoProvider, parent *ParentNode,
+	p NodeIndex, child NodeIndex, sibling NodeIndex) (int, error) {
+	hash, err := self.ParentHash(crypto, p, sibling)
+	if err != nil {
+		return 0, err
+	}
+	// condition 1 comes free of the walk: every entry of the resolution of a child of p is a
+	// descendant of p, so there is no separate descendant test here to get wrong.
+	resolution := self.Resolution(child)
+	claims := 0
+	for _, node := range resolution {
+		field, carries := nodeParentHashField(self.Get(node))
+		if !carries {
+			continue
+		}
+		// condition 2, through subtle rather than bytes.Equal for guardrail 8's reason: a parent
+		// hash is a public value, but every comparison in this package that decides whether a
+		// tree is adopted is written the one way, so no later reader has to work out which of
+		// them were the safe ones.
+		if subtle.ConstantTimeCompare(field, hash) != 1 {
+			continue
+		}
+		// condition 3.
+		if !self.resolutionIsTheClaimantAndTheUnmergedLeaves(parent, child, resolution, node) {
+			continue
+		}
+		claims += 1
+	}
+	return claims, nil
+}
+
+// VerifyParentHashes is RFC 9420 section 7.9.2's join-time obligation: every non-blank parent
+// node of this tree is parent-hash valid.
+//
+// A tree whose parent nodes are all blank passes, and that is the rule rather than a hole in it,
+// because such a tree publishes no parent key for anybody to have forged.
+func (self *RatchetTree) VerifyParentHashes(crypto CryptoProvider) error {
+	// both refusals ahead of the sweep and not inside it, for the reason TreeHashes states at
+	// the same spot: a tree with no leaves never enters the loop, so without this the answer for
+	// a receiver that is not a tree would be nil -- "no parent failed" -- which at a parent hash
+	// check is the same answer a sound tree gets.
+	if crypto == nil {
+		return fmt.Errorf("%w: every parent hash on this tree is taken through it", ErrNilCryptoProvider)
+	}
+	if _, err := rootOf(self.LeafWidth()); err != nil {
+		return err
+	}
+	// every odd index and no even one: the odd slots are exactly the parents (RFC 9420 appendix
+	// C), so which nodes are swept is derived from the tree's own width rather than from a list
+	// of the parents somebody expected to find non-blank.
+	for x := uint32(1); x < self.NodeWidth(); x += 2 {
+		p := NodeIndex(x)
+		parent := self.ParentAt(p)
+		if parent == nil {
+			continue
+		}
+		left, leftOk := leftOf(p)
+		right, rightOk := rightOf(p)
+		if !leftOk || !rightOk {
+			return ErrTreeMalformed
+		}
+		claims := 0
+		// both arms, because section 7.9.2's C is "the child that is on the direct path of D"
+		// and which child that is depends on where the committer's leaf sits. A version that
+		// looked at one of them refuses every tree committed from the other side of it.
+		for _, arm := range [2][2]NodeIndex{{left, right}, {right, left}} {
+			armClaims, err := self.parentHashClaimsUnder(crypto, parent, p, arm[0], arm[1])
+			if err != nil {
+				return err
+			}
+			claims += armClaims
+		}
+		if claims != 1 {
+			return fmt.Errorf("%w: node %d is claimed by %d of its descendants and RFC 9420 section 7.9.2 requires exactly one",
+				ErrParentHashMismatch, p, claims)
+		}
+	}
+	return nil
 }
