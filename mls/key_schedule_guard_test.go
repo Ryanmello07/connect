@@ -18,7 +18,12 @@
 //     comparator at all is reported too; and connect/message's G8 gate derives its comparator
 //     class from the imports of the code it scans and finds eighteen, bytes.HasPrefix and
 //     hmac.Equal among them.
-//   - a redeclared ValSem sentinel: TestPskSentinelsBelongToTheValidationPlan.
+//   - a redeclared ValSem sentinel: two things, neither of them a scan. psk.go carries the
+//     three refusals as UNEXPORTED values precisely so the exported names stay p8's, and a
+//     second declaration of an exported one in this package is a compile error the day p8
+//     lands it. Until then all seven names sit in crossPlanSymbolsNotYetLanded, and
+//     TestEveryCrossPlanSymbolThatHasLandedIsPinnedHere fails on the merge that lands any of
+//     them rather than on somebody remembering.
 //   - w.WriteBytes: TestConsumedSyntaxWriterShape pins syntax.Writer's method set, and a call
 //     to a method that does not exist is a compile error either way.
 //
