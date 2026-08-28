@@ -271,6 +271,28 @@ const leafNodeSignatureLabel = "LeafNodeTBS"
 // commit.
 var errBadSignature = fmt.Errorf("mls: leaf node signature does not verify: %w", ErrCryptoBadSignature)
 
+// The four rules of Validate that all mean "the leaf does not list a capability it must",
+// each with an identity of its own and each WRAPPING errMissingRequiredCapability so that a
+// caller which only wants that broader question keeps being answered it.
+//
+// Four values rather than one, because a test can state only what an error can be asked. With
+// one sentinel behind five return sites -- these four plus Capabilities.Supports' three loops
+// -- every assertion in this area reads errors.Is(err, errMissingRequiredCapability), which
+// any of the five satisfies, so no test can say that the rule it is named for is the rule that
+// fired. That is not hypothetical here: the erratum 8745 group context rule had no identity of
+// its own, TestErrata8745 asked only the broad question, and the case that would have caught
+// that loop being applied to element zero was missing for exactly as long. An error a test
+// cannot distinguish is a rule a test cannot observe.
+//
+// They are stand ins in the same sense errMissingRequiredCapability is -- the validation plan
+// owns the exported catalogue -- and the stand in gate watches them for an exported twin.
+var (
+	errCredentialTypeNotListed        = fmt.Errorf("%w: credential type", errMissingRequiredCapability)
+	errCipherSuiteNotListed           = fmt.Errorf("%w: ciphersuite", errMissingRequiredCapability)
+	errLeafExtensionNotListed         = fmt.Errorf("%w: leaf extension", errMissingRequiredCapability)
+	errGroupContextExtensionNotListed = fmt.Errorf("%w: group context extension", errMissingRequiredCapability)
+)
+
 // signatureContent is RFC 9420 section 7.2's LeafNodeTBS: the leaf's fields down to and
 // including extensions, followed -- for the update and commit sources ONLY -- by the group id
 // and the leaf index.
@@ -540,6 +562,24 @@ func isDefaultExtensionType(t ExtensionType) bool {
 //     duration" is an application policy this profile has not fixed a number for. Until it
 //     does, a key_package leaf may declare a not_after a thousand years out and be current.
 //
+// A fifth rule is absent for a different reason and is written down for the same one. Section
+// 7.2's other half -- "The following proposal and extension types are considered "default" and
+// MUST NOT be listed" -- is a rule about what a capabilities vector may CONTAIN. It is a
+// property of one leaf, so unlike the four above this structure could answer it. It
+// deliberately does not, on two grounds:
+//
+//   - Section 7.3's list of what a leaf validator verifies does not restate it. Refusing a leaf
+//     for it would be a refusal this profile invented: a peer whose leaf harmlessly lists
+//     ratchet_tree would be turned away by this implementation and by no other.
+//   - It changes no decision made here. isDefaultExtensionType is used as an EXEMPTION and
+//     never as a prohibition, so every rule that reads capabilities.extensions has already let
+//     the default class through before it looks at what is listed. A leaf that lists a default
+//     type is accepted or refused on exactly the same grounds as one that does not.
+//
+// TestLeafNodeValidateDoesNotRefuseALeafThatListsADefaultExtensionType states that decision
+// over the derived default class, so enforcing the MUST NOT later is a commit that has to
+// change this paragraph too rather than one that quietly contradicts it.
+//
 // Each is stated here rather than left out silently, because a validator's dangerous failure
 // is the check that accepts by never having looked, and a reader who finds most of a section
 // implemented has no way to tell a deliberate hand-off from an omission.
@@ -642,7 +682,7 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 	// check nobody wrote.
 	if !self.Capabilities.SupportsCredential(self.Credential.CredentialType) {
 		return fmt.Errorf("%w: the leaf's own credential type %#04x is not in its capabilities",
-			errMissingRequiredCapability, uint16(self.Credential.CredentialType))
+			errCredentialTypeNotListed, uint16(self.Credential.CredentialType))
 	}
 	if err := self.VerifySignature(ctx.Crypto, ctx.GroupId, ctx.LeafIndex); err != nil {
 		return err
@@ -653,7 +693,7 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 	// not list the group's ciphersuite cannot do the group's crypto, whatever else verifies.
 	if !self.Capabilities.SupportsCipherSuite(ctx.Suite) {
 		return fmt.Errorf("%w: the group's ciphersuite %#04x is not in the leaf's capabilities",
-			errMissingRequiredCapability, uint16(ctx.Suite))
+			errCipherSuiteNotListed, uint16(ctx.Suite))
 	}
 	// section 7.3: "Verify that the extensions in the LeafNode are supported by checking that
 	// the ID for each extension in the extensions field is listed in the capabilities.extensions
@@ -669,7 +709,7 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 		extensionType := self.Extensions[i].ExtensionType
 		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {
 			return fmt.Errorf("%w: the leaf carries extension type %#04x and does not list it",
-				errMissingRequiredCapability, uint16(extensionType))
+				errLeafExtensionNotListed, uint16(extensionType))
 		}
 		if extensionType != ExtensionTypeUrmessageLeafKeys {
 			continue
@@ -705,11 +745,22 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 	// The default types are exempt for the reason isDefaultExtensionType gives: section 7.2
 	// forbids listing them, so demanding them here would refuse every conforming leaf of any
 	// group whose GroupContext carries external_senders or required_capabilities.
+	//
+	// EVERY entry, for the same reason the loop over the leaf's own extensions reads every one
+	// of those. A GroupContext carries a vector and a real one carries several -- and the
+	// entries a real group carries are led by exactly the ones the exemption above lets
+	// through, required_capabilities and external_senders. So a loop that answered element
+	// zero would step over an exempt entry, never reach the non-default extension behind it,
+	// and admit -- or let a member update into -- a leaf that does not support an extension the
+	// group is using, which is the consequence section 13.4 and ERRATA.md are about. That is
+	// the p4 ValSem401 shape again, and it is why
+	// TestLeafNodeValidateReadsEveryGroupContextExtensionAndNotOnlyTheFirst puts the offender
+	// at every position of the vector rather than at the only position a one entry vector has.
 	for i := range ctx.GroupExtensions {
 		extensionType := ctx.GroupExtensions[i].ExtensionType
 		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {
 			return fmt.Errorf("%w: the group context carries extension type %#04x and the leaf does not list it",
-				errMissingRequiredCapability, uint16(extensionType))
+				errGroupContextExtensionNotListed, uint16(extensionType))
 		}
 	}
 	// section 7.3: "If the GroupContext has a required_capabilities extension, then the

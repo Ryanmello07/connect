@@ -80,16 +80,49 @@ Update proposals or update paths.
 Also see this thread on the mailing list: https://mailarchive.ietf.org/arch/msg/mls/k18P4FP7dfS2cBmP0kL6Uh50-ok/
 ```
 
-### The "Section 13.4 says" quotation was checked against the RFC
+### What has been checked against the source, and what has not
 
-The four lines the erratum quotes are the fifth bullet of RFC 9420 section 13.4's list of things
-"implementations MUST correctly handle", and they are reproduced exactly. The paragraph the
-Notes quote — "Note that the latter two requirements mean that all MLS GroupContext extensions
-are mandatory, in the sense that an extension in use by the group MUST be supported by all
-members of the group" — follows two bullets later in the same section. Neither is misquoted, and
-the inconsistency the erratum describes is present in the published text: section 13.4 imposes
-the group-extension compatibility check on the client *adding* a member and on the client
-*joining*, and on nobody else, while asserting a conclusion about *all members of the group*.
+Re-checked on **2026-08-28**. The result is split deliberately, because "checked" with no scope
+on it is the failure mode this file exists to prevent: a record that looks checked and is not is
+worse than an admitted gap.
+
+**Verified against the errata page, <https://errata.rfc-editor.org/eid8745>.** The metadata table
+above — errata ID, RFC, section, status `Reported`, type Technical, reporter, date reported — and
+both quoted blocks. The status is still `Reported`. None of the transcription above is the plan's
+reading of the erratum; it is the erratum.
+
+**Verified against RFC 9420 itself: section 7.2's default extension type list**, quoted in full
+further down this file — `0x0001` application_id, `0x0002` ratchet_tree, `0x0003`
+required_capabilities, `0x0004` external_pub, `0x0005` external_senders. That check earned its
+keep. `mls/extension.go` had declared `ExtensionTypeExternalSenders` at `0x0004`, which is
+external_pub's code point, while this file quoted the correct assignment a few lines away, and
+the enum pin in `extension_test.go` had been transcribed from the same misreading — so a green
+suite defended the wrong value and this implementation would have disagreed with every peer about
+the external_senders GroupContext extension. It is corrected, and
+`TestEveryRfc9420DefaultExtensionTypeIsDeclaredAtTheCodePointItAssigns` now joins the package's
+declared constants to the section 7.2 list BY NAME, so two transcriptions can no longer agree
+wrongly.
+
+**NOT re-verified: where in section 13.4 the quoted bullet sits.** An earlier version of this
+paragraph said the erratum's quotation is "the fifth bullet" of section 13.4's list of things
+"implementations MUST correctly handle", and that the Notes' paragraph "follows two bullets
+later". Neither ordinal could be re-derived on 2026-08-28: the retrieval available here truncates
+RFC 9420 well before section 13, and a summarising fetch of the same page returned a *different*
+section 13.4 bullet — the one about `required_capabilities` — when asked for this one. Restating
+the ordinals on that evidence would be exactly the thing the two rules at the top of this file
+forbid, so they are withdrawn rather than repeated.
+
+What is asserted is narrower and is what this package acts on: the erratum reproduces the
+sentence pair quoted above, and its own Notes cite the "all MLS GroupContext extensions are
+mandatory, in the sense that an extension in use by the group MUST be supported by all members of
+the group" paragraph at `https://www.rfc-editor.org/rfc/rfc9420.html#section-13.4-6`, which is
+inside section 13.4. Whether that bullet is the fifth of its list is not something this file
+knows, and the inconsistency the erratum describes does not depend on it: the published text
+imposes the group-extension compatibility check on the client *adding* a member, and on nobody
+updating one, while asserting a conclusion about *all members of the group*.
+
+Anyone revisiting this should re-read the erratum page rather than trust the table above, which
+is a snapshot of one day, and should treat the paragraph withdrawn here as still open.
 
 ### What this package does
 
@@ -99,6 +132,23 @@ not conditioned on the source. `TestErrata8745` states both halves over the deri
 a leaf that does not list a non-default GroupContext extension is refused under every source, and
 a leaf that does list it is accepted under every source. An implementation written from the
 uncorrected text passes the `key_package` row and fails the other two.
+
+The loop is not conditioned on the POSITION of the extension in the GroupContext's vector
+either, and that half needed a case of its own. Every `GroupExtensions` value in the tree held
+exactly one entry, so restricting the loop to its first element passed the entire suite — the
+rule was observed at index zero and nowhere else. A real GroupContext carries several
+extensions, and the ones it carries first are exactly the ones section 7.2 exempts, so a
+first-element-only loop steps over the exempt entry, never reaches the non-default extension
+behind it, and admits — or lets a member update into — a leaf that does not support an extension
+the group is using. That is this erratum's own security consequence, arriving by a different
+route. `TestLeafNodeValidateReadsEveryGroupContextExtensionAndNotOnlyTheFirst` walks the
+offending extension across every index of a four-entry vector, under every source, behind both
+kinds of entry the loop must pass over.
+
+The refusal both tests assert is `errGroupContextExtensionNotListed`, a sentinel this rule now
+owns. It used to answer only `errMissingRequiredCapability`, which four other rules also answer,
+and an assertion that cannot tell which rule fired cannot state that this one fired at all —
+which is how the gap above stayed invisible.
 
 **This is stricter than the published RFC, deliberately, and the erratum is only `Reported`.**
 The consequences are worth being explicit about, because a reader who finds this later should not

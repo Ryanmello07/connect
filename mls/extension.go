@@ -69,10 +69,20 @@ const (
 // same vector and are subject to the same rules.
 type ExtensionType uint16
 
+// All five of RFC 9420's initial registrations are declared, including the two this profile
+// never constructs, and the reason is the defect this block carried for three tasks: it named
+// external_senders at 0x0004, which is external_pub's code point, and the only thing holding
+// the value was a hand transcribed table written from the same misreading. A code point with
+// no name is a code point nothing can cross check. With all five named, section 7.2's default
+// list is transcribed as NAMES and the declared constants are held against it, which is a
+// check the swapped pair fails; see
+// TestEveryRfc9420DefaultExtensionTypeIsDeclaredAtTheCodePointItAssigns.
 const (
+	ExtensionTypeApplicationId           ExtensionType = 0x0001
 	ExtensionTypeRatchetTree             ExtensionType = 0x0002
 	ExtensionTypeRequiredCapabilities    ExtensionType = 0x0003
-	ExtensionTypeExternalSenders         ExtensionType = 0x0004
+	ExtensionTypeExternalPub             ExtensionType = 0x0004
+	ExtensionTypeExternalSenders         ExtensionType = 0x0005
 	ExtensionTypeUrmessageGroupPolicy    ExtensionType = 0xF001
 	ExtensionTypeUrmessageLeafKeys       ExtensionType = 0xF002
 	ExtensionTypeUrmessageOwnerSuccessor ExtensionType = 0xF003

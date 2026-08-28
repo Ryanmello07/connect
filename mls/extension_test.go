@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
@@ -1451,13 +1452,120 @@ var registryCodePoints = map[string]map[string]uint64{
 		"ProposalTypeGroupContextExtensions": 0x0007,
 	},
 	"ExtensionType": {
+		"ExtensionTypeApplicationId":           0x0001,
 		"ExtensionTypeRatchetTree":             0x0002,
 		"ExtensionTypeRequiredCapabilities":    0x0003,
-		"ExtensionTypeExternalSenders":         0x0004,
+		"ExtensionTypeExternalPub":             0x0004,
+		"ExtensionTypeExternalSenders":         0x0005,
 		"ExtensionTypeUrmessageGroupPolicy":    0xF001,
 		"ExtensionTypeUrmessageLeafKeys":       0xF002,
 		"ExtensionTypeUrmessageOwnerSuccessor": 0xF003,
 	},
+}
+
+// rfc9420Section72DefaultExtensionTypes is RFC 9420 section 7.2's default extension type list,
+// transcribed as NAMES against code points:
+//
+//	The following proposal and extension types are considered "default" and MUST NOT be
+//	listed:
+//	...
+//	*  Extension types:
+//	   -  0x0001 - application_id
+//	   -  0x0002 - ratchet_tree
+//	   -  0x0003 - required_capabilities
+//	   -  0x0004 - external_pub
+//	   -  0x0005 - external_senders
+//
+// It is a SECOND transcription of the same five assignments the table above holds, and that is
+// the point of it. registryCodePoints is one person reading section 17.3 and typing values
+// beside Go identifiers; this is the same registry read out of section 7.2, where the RFC
+// writes the code point beside the RFC's own name for it. The gate below joins the two on the
+// name rather than on the value, so a constant declared at its neighbour's code point -- which
+// is exactly what ExtensionTypeExternalSenders was, at external_pub's 0x0004, defended by a
+// registryCodePoints entry written from the same misreading -- fails here. A pin transcribed
+// once is a pin that agrees with whatever the transcriber believed.
+var rfc9420Section72DefaultExtensionTypes = map[string]uint64{
+	"application_id":        0x0001,
+	"ratchet_tree":          0x0002,
+	"required_capabilities": 0x0003,
+	"external_pub":          0x0004,
+	"external_senders":      0x0005,
+}
+
+// rfcNameOfRegistryConstant turns a declared constant's Go name into the RFC's own spelling of
+// the same code point: the registry type prefix comes off and the CamelCase remainder becomes
+// snake_case. ExtensionTypeExternalSenders is external_senders.
+//
+// Derived rather than a second map from Go name to RFC name, because a hand written join table
+// can carry the very error the join exists to find: pair ExtensionTypeExternalSenders with
+// "external_pub" and the gate passes at the wrong code point, which is the state this package
+// was in.
+func rfcNameOfRegistryConstant(typeName string, constantName string) string {
+	remainder := strings.TrimPrefix(constantName, typeName)
+	out := []rune{}
+	for i, r := range remainder {
+		if i > 0 && unicode.IsUpper(r) {
+			out = append(out, '_')
+		}
+		out = append(out, unicode.ToLower(r))
+	}
+	return string(out)
+}
+
+// TestEveryRfc9420DefaultExtensionTypeIsDeclaredAtTheCodePointItAssigns joins the package's
+// declared ExtensionType constants to section 7.2's list BY NAME, in both directions.
+//
+// Both directions, because the two failures are different and neither implies the other. A
+// section 7.2 name this package declares nothing for is a default code point no gate here can
+// cross check -- 0x0004 and 0x0005 were both in that state, which is how they came to be
+// swapped -- and a declared constant whose RFC name sits at a different code point is the swap
+// itself. isDefaultExtensionType is a numeric RANGE, so it is blind to both: it exempts
+// 0x0001..0x0005 whatever this package calls them.
+func TestEveryRfc9420DefaultExtensionTypeIsDeclaredAtTheCodePointItAssigns(t *testing.T) {
+	declared := registryConstantsOfType(t, "ExtensionType")
+	byRfcName := map[string]uint64{}
+	for name, value := range declared {
+		rfcName := rfcNameOfRegistryConstant("ExtensionType", name)
+		if other, repeated := byRfcName[rfcName]; repeated {
+			t.Fatalf("two declared constants spell the RFC name %s, at %#04x and %#04x, so the join below is ambiguous",
+				rfcName, other, value)
+		}
+		byRfcName[rfcName] = value
+	}
+	for _, rfcName := range slices.Sorted(maps.Keys(rfc9420Section72DefaultExtensionTypes)) {
+		assigned := rfc9420Section72DefaultExtensionTypes[rfcName]
+		got, present := byRfcName[rfcName]
+		if !present {
+			t.Errorf("RFC 9420 section 7.2 names %s at %#04x and this package declares no ExtensionType constant spelling it; an unnamed code point is one nothing cross checks",
+				rfcName, assigned)
+			continue
+		}
+		if got != assigned {
+			t.Errorf("this package declares %s at %#04x and RFC 9420 section 7.2 assigns it %#04x", rfcName, got, assigned)
+		}
+	}
+	// and the other direction: a declared constant whose RFC name is one of the five must hold
+	// that code point, which the loop above states, plus no declared constant may sit ON a
+	// section 7.2 code point under a name section 7.2 does not give it.
+	byValue := map[uint64]string{}
+	for rfcName, value := range rfc9420Section72DefaultExtensionTypes {
+		byValue[value] = rfcName
+	}
+	for _, name := range slices.Sorted(maps.Keys(declared)) {
+		value := declared[name]
+		rfcName, isDefaultPoint := byValue[value]
+		if !isDefaultPoint {
+			continue
+		}
+		if got := rfcNameOfRegistryConstant("ExtensionType", name); got != rfcName {
+			t.Errorf("%s is declared at %#04x, which RFC 9420 section 7.2 assigns to %s, and its own name spells %s",
+				name, value, rfcName, got)
+		}
+	}
+	if len(rfc9420Section72DefaultExtensionTypes) != int(defaultExtensionTypeHigh-defaultExtensionTypeLow+1) {
+		t.Errorf("section 7.2 names %d default extension types and leaf_node.go's range spans %d code points",
+			len(rfc9420Section72DefaultExtensionTypes), defaultExtensionTypeHigh-defaultExtensionTypeLow+1)
+	}
 }
 
 // registryTypesDeclaredIn is every registry type extension.go declares, derived as every named
