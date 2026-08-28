@@ -27,6 +27,7 @@ package mls
 
 import (
 	"bytes"
+	"fmt"
 	"go/types"
 	"slices"
 	"testing"
@@ -183,7 +184,109 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
 		}},
+		// tree_hash.go's four, RFC 9420 section 7.8. All four build their tree the same way and
+		// none of them touches the provider to do it: newTestTree signs every leaf through the
+		// provider it is handed, so a row built on it would be reporting the signer's routing
+		// as the hash's. What each row leaves behind is a digest, and a digest is exactly what
+		// both differentials can read -- it moves under a provider that flips every answer, and
+		// it is KDF.Nh wide under a provider whose hash is one width up.
+		{name: "(*RatchetTree).treeHash", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowRatchetTree(t)
+			root, err := rootOf(tree.LeafWidth())
+			if err != nil {
+				return nil, err
+			}
+			// the exclusion arm rather than the nil one, so the row drives the parameter the
+			// three exported methods never pass and that the section 7.9 parent hash will
+			hash, err := tree.treeHash(crypto, root, map[LeafIndex]bool{LeafIndex(1): true})
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{{name: "the original tree hash at the root", content: hash}}, nil
+		}},
+		{name: "(*RatchetTree).NodeTreeHash", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowRatchetTree(t)
+			leaf, err := tree.NodeTreeHash(crypto, NodeIndex(0))
+			if err != nil {
+				return nil, err
+			}
+			parent, err := tree.NodeTreeHash(crypto, NodeIndex(1))
+			if err != nil {
+				return nil, err
+			}
+			// a leaf and a parent, because the two arms of the section 7.8 select are two
+			// separate preimages and a method that routed one of them through its parameter
+			// is the defect a single value cannot see
+			return []providerDrivenMethodValue{
+				{name: "the hash of leaf node 0", content: leaf},
+				{name: "the hash of parent node 1", content: parent},
+			}, nil
+		}},
+		{name: "(*RatchetTree).TreeHash", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowRatchetTree(t)
+			hash, err := tree.TreeHash(crypto)
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{{name: "the whole tree's hash", content: hash}}, nil
+		}},
+		{name: "(*RatchetTree).TreeHashes", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowRatchetTree(t)
+			hashes, err := tree.TreeHashes(crypto)
+			if err != nil {
+				return nil, err
+			}
+			if uint32(len(hashes)) != tree.NodeWidth() {
+				t.Fatalf("TreeHashes answered %d entries for a %d node tree", len(hashes), tree.NodeWidth())
+			}
+			// every entry, not the root alone: this method's whole content is that it answers
+			// one hash per node, and a row reading one of them would pass over an
+			// implementation that computed the rest through a provider of its own
+			values := []providerDrivenMethodValue{}
+			for x, hash := range hashes {
+				values = append(values, providerDrivenMethodValue{
+					name:    fmt.Sprintf("the hash of node %d", x),
+					content: hash,
+				})
+			}
+			return values, nil
+		}},
 	}
+}
+
+// providerRowRatchetTree is the tree the four tree hash rows run over, built without touching a
+// provider at all.
+//
+// Three occupied leaves in a four wide tree with one parent node set, which is the smallest
+// shape that reaches both arms of the section 7.8 select and both kinds of position on each:
+// an occupied leaf, a blank leaf, an occupied parent and a blank parent. The leaves carry
+// filler key material because nothing here verifies them -- what these rows read is a digest --
+// and signing them through the provider under test is exactly what would make the routing
+// differential report the signer rather than the hash.
+func providerRowRatchetTree(t *testing.T) *RatchetTree {
+	tree := NewRatchetTree()
+	for _, i := range []LeafIndex{0, 1, 3} {
+		// this file's own encodable leaf, with its two keys moved apart per index so no two
+		// leaves of the tree hash alike for a reason that is their position rather than their
+		// content. The source is update because that arm carries neither a lifetime nor a
+		// parent hash, so the leaf encodes with nothing that has to be made up.
+		leaf := testLeafNodeOfSource(LeafNodeSourceUpdate)
+		leaf.EncryptionKey = HpkePublicKey(bytes.Repeat([]byte{0x20 + byte(i)}, 32))
+		leaf.SignatureKey = SignaturePublicKey(bytes.Repeat([]byte{0x30 + byte(i)}, 32))
+		if err := tree.SetLeaf(i, leaf); err != nil {
+			t.Fatalf("SetLeaf(%d): %v", i, err)
+		}
+	}
+	if err := tree.SetParent(NodeIndex(1), &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x51}, 32)),
+		UnmergedLeaves: []LeafIndex{1},
+	}); err != nil {
+		t.Fatalf("SetParent(1): %v", err)
+	}
+	if tree.NodeWidth() != 7 {
+		t.Fatalf("the row's tree is %d nodes wide, want 7", tree.NodeWidth())
+	}
+	return tree
 }
 
 // providerDrivenMethods is every method this package's non test source declares whose

@@ -2641,6 +2641,75 @@ func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byte
 	return found
 }
 
+// extensionBodyByteRunsThatAreNotBodies is every exported declaration the two rules below
+// report whose byte run is NOT an extension body, with the argument for each.
+//
+// An exemption table and not a filter, for the reason tree_kat_test.go's
+// treeVectorFamiliesElsewhere gives: whether a byte run is an extension body is a judgement
+// about that byte run, and neither rule can read it. One rule reads a SIGNATURE -- a
+// declaration whose receiver is a type that has an Encode, answering bytes -- and the other
+// reads a call graph -- a declaration that reaches the encoder those bodies are assembled
+// with. A tree hash satisfies both and is neither: the preimage the encoder assembles is
+// hashed and thrown away, and what leaves is Nh octets of digest.
+//
+// What makes an exemption table safe is that it is held in BOTH directions, which is three
+// checks and not one. Each rule refuses a report with no entry here, so a genuine loose body
+// added tomorrow fails rather than being waved through; and
+// TestEveryExtensionBodyByteRunExemptionIsStillReported refuses an entry that neither rule
+// reports any more, so an entry cannot outlive the declaration it excuses or the rule that
+// made it necessary. This is the base name exemption this project keeps rediscovering, kept
+// off by keying on the qualified name and by expiring on failure.
+var extensionBodyByteRunsThatAreNotBodies = map[string]string{
+	"(*RatchetTree).NodeTreeHash": "answers the RFC 9420 section 7.8 tree hash of one subtree, which is KDF.Nh octets of digest and not a ratchet_tree body; the TreeHashInput preimage the encoder assembles is hashed and discarded inside the call, and no tag exists that would make a bare digest readable as any extension of this package",
+	"(*RatchetTree).TreeHash":     "answers the section 7.8 tree hash of the whole tree, which is what GroupContext.TreeHash is set from; the same argument as NodeTreeHash, and the signature is the one the key schedule and the group lifecycle plans compile against rather than one this package is free to change",
+}
+
+// extensionBodyByteRunsReportedByEitherRule is the union of what the two rules below report
+// over this package, before the table above is subtracted.
+//
+// It exists so the expiry check reads the RULES rather than a third opinion about them: an
+// entry stops being needed exactly when neither rule reports it, and that is a question only
+// the rules can answer.
+func extensionBodyByteRunsReportedByEitherRule(t *testing.T) []string {
+	t.Helper()
+	scanned := packageLevelFunctions(t).files
+	files := []parsedSource{}
+	for _, path := range scanned {
+		files = append(files, mustParseSource(t, path))
+	}
+	bodies := extensionBodyTypesIn(files)
+	helpers := extensionBodyEncoderHelpersIn(files, bodies)
+	reaching := theNamesReachingTheExtensionBodyEncoder(declaredAcross(files), helpers)
+	byteRuns := packageByteSliceTypeNames(t)
+	reported := []string{}
+	for at := range scanned {
+		reported = append(reported, exportedSymbolsHandingOutABodyIn(files[at], bodies, byteRuns)...)
+		reported = append(reported, exportedSymbolsAssemblingABodyIn(files[at], reaching, bodies, byteRuns)...)
+	}
+	slices.Sort(reported)
+	return slices.Compact(reported)
+}
+
+// TestEveryExtensionBodyByteRunExemptionIsStillReported is the expiry half of the table above.
+//
+// An exemption that covers nothing is a hole with a name on it -- the same argument
+// TestHkdfExtractHasOnlyTwoCallSites makes about its own allow list -- and the way this one
+// stops covering something is either the declaration going away or a rule being narrowed until
+// it no longer reports it. Both are changes somebody should have to notice, so both fail here.
+func TestEveryExtensionBodyByteRunExemptionIsStillReported(t *testing.T) {
+	reported := extensionBodyByteRunsReportedByEitherRule(t)
+	if len(reported) == 0 {
+		t.Fatal("neither rule reports anything at all over this package, so the table below is holding nothing and both gates are reporting clean having read nothing")
+	}
+	for name, why := range extensionBodyByteRunsThatAreNotBodies {
+		if !slices.Contains(reported, name) {
+			t.Errorf("%s is exempted as %q and neither rule reports it any more; delete the entry", name, why)
+		}
+	}
+	t.Logf("the two rules report %v, of which %d are exempted as byte runs that are not bodies",
+		reported, len(extensionBodyByteRunsThatAreNotBodies))
+}
+
 // TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn is ONE HALF of what the
 // sanctioned exception is worth, stated as a rule rather than as a naming convention: this
 // package does not hand out a loose extension body.
@@ -2684,6 +2753,9 @@ func TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn(t *testing
 	byteRuns := packageByteSliceTypeNames(t)
 	for at, path := range scanned {
 		for _, handed := range exportedSymbolsHandingOutABodyIn(files[at], bodies, byteRuns) {
+			if _, isExcused := extensionBodyByteRunsThatAreNotBodies[handed]; isExcused {
+				continue
+			}
 			t.Errorf("%s exports %s, which hands an extension body out as bytes; Encode answers the whole Extension so that no call site can pair a body with another extension's type, and a byte run out of this package is exactly that pairing waiting to be made",
 				path, handed)
 		}
@@ -3042,18 +3114,59 @@ func extensionBodyEncoderHelpersIn(files []parsedSource, bodies []string) []stri
 	return slices.Compact(helpers)
 }
 
-// theNamesReachingTheExtensionBodyEncoder is every declared name that can reach one of those
+// theNamesInvokingTheStorage is theNamesReachingTheStorage's twin for a seed that is a
+// FUNCTION rather than a field, and the difference between the two is the whole reason there
+// are two.
+//
+// theNamesReachingTheStorage asks whether a declaration MENTIONS the name, which is the right
+// question about a field: reading epochSecret is the entire risk that gate is about, and a
+// read is a mention and not a call. Asking that question about a function name answers yes to
+// every declaration that happens to spell it, whatever it spells it for -- and the collision
+// is not hypothetical. (*RatchetTree).TreeHash is a method of this package and TreeHash is a
+// FIELD of GroupContext, so with the mention reading, (*GroupContext).MarshalMLS reached the
+// extension body encoder by writing self.TreeHash, every declaration that marshals anything
+// reached it through that, and the rule below reported thirty exported symbols including
+// SignWithLabel and PskSecret. A rule that reports thirty is a rule this package would learn
+// to ignore, which the doc on exportedSymbolsAssemblingABodyIn already says about a seed that
+// is too wide; the same is true of a closure that is.
+//
+// So this one asks whether a declaration INVOKES the name -- calls it, or names it as a value
+// -- which is namesInvokedBy, the matcher key_schedule_kat_test.go's disjointness gate is
+// built on and which carries its own control. A function is reached by being called or by
+// being passed; a field of another type that happens to share its spelling is neither.
+func theNamesInvokingTheStorage(declared []sourceDeclaration, storage string) []string {
+	reaching := map[string]bool{storage: true}
+	for {
+		grew := false
+		for _, one := range declared {
+			if one.body == nil || reaching[one.name] {
+				continue
+			}
+			for name := range namesInvokedBy(one.body) {
+				if reaching[name] {
+					reaching[one.name] = true
+					grew = true
+					break
+				}
+			}
+		}
+		if !grew {
+			delete(reaching, storage)
+			return slices.Sorted(maps.Keys(reaching))
+		}
+	}
+}
+
+// theNamesReachingTheExtensionBodyEncoder is every declared name that can invoke one of those
 // helpers, plus the helpers themselves.
 //
-// The closure is theNamesReachingTheStorage, reused rather than written a second time: it is
-// the same question -- which declarations can reach this name -- and a second copy of a
-// reachability walk is a second thing that can stop agreeing with the first. It answers for one
-// seed at a time and reachability is a union over seeds, so the loop is sound: every name in the
-// closure of a set is reachable through a chain ending at exactly one member of it.
+// It answers for one seed at a time and reachability is a union over seeds, so the loop is
+// sound: every name in the closure of a set is reachable through a chain ending at exactly one
+// member of it.
 func theNamesReachingTheExtensionBodyEncoder(declared []sourceDeclaration, helpers []string) []string {
 	reaching := slices.Clone(helpers)
 	for _, helper := range helpers {
-		reaching = append(reaching, theNamesReachingTheStorage(declared, helper)...)
+		reaching = append(reaching, theNamesInvokingTheStorage(declared, helper)...)
 	}
 	slices.Sort(reaching)
 	return slices.Compact(reaching)
@@ -3217,6 +3330,9 @@ func TestNoExportedSymbolOfThisPackageAssemblesAnExtensionBodyThroughItsOwnEncod
 	byteRuns := packageByteSliceTypeNames(t)
 	for at, path := range scanned {
 		for _, handed := range exportedSymbolsAssemblingABodyIn(files[at], reaching, bodies, byteRuns) {
+			if _, isExcused := extensionBodyByteRunsThatAreNotBodies[handed]; isExcused {
+				continue
+			}
 			t.Errorf("%s exports %s, which reaches %v -- the encoder this package's extension bodies are built with -- and answers a byte run; an extension body handed out loose is a tag choice handed to the caller, and 0xF001 rather than 0xF002 encodes, signs and travels",
 				path, handed, helpers)
 		}

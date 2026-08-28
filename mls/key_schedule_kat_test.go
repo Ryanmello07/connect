@@ -1082,19 +1082,73 @@ func namesMentionedIn(node ast.Node) map[string]bool {
 	return mentioned
 }
 
+// namesBoundBy is every name the node introduces as a local: a parameter, a named result, a
+// receiver, a short variable declaration, a var or const spec, a range variable, a type switch
+// binding.
+//
+// It is the other half of the exclusion namesInvokedBy already makes for a field DECLARATION.
+// Excluding the declaration and not the USES reads a parameter named treeHash as a call to a
+// package level treeHash at every line that passes it on, which is not a hole in the abstract:
+// independentGroupContext takes a treeHash []byte, (*RatchetTree).treeHash is a method of this
+// package, and the disjointness gate below reported the hand written generator as reaching the
+// implementation it exists to be a second opinion about. The same collision reached the
+// extension body closure through the treeHash local of (*GroupContext).UnmarshalMLS.
+//
+// It is a per FUNCTION set and not a per scope one, which is the approximation worth stating:
+// a name bound in an inner block is treated as bound throughout. What keeps that from hiding a
+// real edge is that namesInvokedBy drops a bound name only where it is NOT in call position --
+// a body that binds a local x and elsewhere calls x() still reports x.
+func namesBoundBy(node ast.Node) map[string]bool {
+	bound := map[string]bool{}
+	take := func(expressions []ast.Expr) {
+		for _, one := range expressions {
+			if ident, isIdent := one.(*ast.Ident); isIdent {
+				bound[ident.Name] = true
+			}
+		}
+	}
+	ast.Inspect(node, func(current ast.Node) bool {
+		switch typed := current.(type) {
+		case *ast.Field:
+			for _, name := range typed.Names {
+				bound[name.Name] = true
+			}
+		case *ast.AssignStmt:
+			if typed.Tok == token.DEFINE {
+				take(typed.Lhs)
+			}
+		case *ast.ValueSpec:
+			for _, name := range typed.Names {
+				bound[name.Name] = true
+			}
+		case *ast.RangeStmt:
+			if typed.Tok == token.DEFINE {
+				take([]ast.Expr{typed.Key, typed.Value})
+			}
+		}
+		return true
+	})
+	return bound
+}
+
 // namesInvokedBy returns the names a function reaches as code rather than as data: every
 // call's callee by bare name, so crypto.Extract(...) contributes Extract; plus every
 // identifier used as a value or as a type, so a function passed by name and a parameter
 // typed CryptoProvider are both seen.
 //
-// Three positions are excluded, and each exclusion is the difference between a gate and a
+// Four positions are excluded, and each exclusion is the difference between a gate and a
 // name collision. The selected half of a selector that is not a call is a field read:
 // psk.nonce contributes psk, not nonce, and this package does declare a method called
 // nonce. A composite literal key names a field of the type being built. A field
-// declaration, which is also how parameter names are spelled, names a local.
+// declaration, which is also how parameter names are spelled, names a local. And a USE of a
+// name the function itself bound is that local rather than the package level declaration of
+// the same spelling -- namesBoundBy is where the argument for the fourth is written, along
+// with the one case it deliberately does not cover.
 func namesInvokedBy(node ast.Node) map[string]bool {
 	invoked := map[string]bool{}
 	positional := map[*ast.Ident]bool{}
+	called := map[string]bool{}
+	bound := namesBoundBy(node)
 	ast.Inspect(node, func(current ast.Node) bool {
 		switch typed := current.(type) {
 		case *ast.SelectorExpr:
@@ -1111,19 +1165,96 @@ func namesInvokedBy(node ast.Node) map[string]bool {
 			switch callee := typed.Fun.(type) {
 			case *ast.Ident:
 				invoked[callee.Name] = true
+				called[callee.Name] = true
 			case *ast.SelectorExpr:
 				invoked[callee.Sel.Name] = true
+				called[callee.Sel.Name] = true
 			}
 		}
 		return true
 	})
 	ast.Inspect(node, func(current ast.Node) bool {
-		if ident, isIdent := current.(*ast.Ident); isIdent && !positional[ident] {
-			invoked[ident.Name] = true
+		ident, isIdent := current.(*ast.Ident)
+		if !isIdent || positional[ident] {
+			return true
 		}
+		if bound[ident.Name] && !called[ident.Name] {
+			return true
+		}
+		invoked[ident.Name] = true
 		return true
 	})
 	return invoked
+}
+
+// The control for namesInvokedBy, held by the test below: one function per row, and each row
+// states what the matcher must say about one name in it.
+const invocationMatcherControl = `
+package control
+
+type someContext struct{ TreeHash []byte }
+
+func readsALocalOfTheSameSpelling(treeHash []byte) []byte {
+	return append([]byte(nil), treeHash...)
+}
+
+func bindsALocalAndStillCallsTheFunctionOfThatName() []byte {
+	marshalBytes := []byte{}
+	return append(marshalBytes, marshalBytes()...)
+}
+
+func readsAFieldOfTheSameSpelling(context *someContext) []byte {
+	return context.TreeHash
+}
+
+func namesAPackageFunctionAsAValue() func() []byte {
+	return marshalBytes
+}
+
+func callsAPackageFunction() []byte {
+	return marshalBytes()
+}
+`
+
+// TestTheInvocationMatcherReadsCallsAndNotLocalsOfTheSameSpelling is namesInvokedBy's own
+// control, and it runs the two directions that matter: a local or a field named like a
+// package level declaration is NOT an invocation of it, and a name in call position IS one
+// even when the same function also binds that spelling.
+//
+// Without the second half the exclusion would be a way to hide a call from every gate that
+// reads this matcher -- declare a local of the name and the edge disappears -- which is the
+// one outcome a narrowing of a gate must not be able to produce. The control is parsed and
+// not compiled, so what is read off it is the shape and nothing has to type check.
+func TestTheInvocationMatcherReadsCallsAndNotLocalsOfTheSameSpelling(t *testing.T) {
+	parsed, err := parser.ParseFile(token.NewFileSet(), "control.go", invocationMatcherControl, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("the invocation matcher control does not parse: %v", err)
+	}
+	byName := map[string]*ast.FuncDecl{}
+	for _, declaration := range parsed.Decls {
+		if function, isFunction := declaration.(*ast.FuncDecl); isFunction {
+			byName[function.Name.Name] = function
+		}
+	}
+	for _, row := range []struct {
+		function string
+		name     string
+		invoked  bool
+	}{
+		{"readsALocalOfTheSameSpelling", "treeHash", false},
+		{"bindsALocalAndStillCallsTheFunctionOfThatName", "marshalBytes", true},
+		{"readsAFieldOfTheSameSpelling", "TreeHash", false},
+		{"namesAPackageFunctionAsAValue", "marshalBytes", true},
+		{"callsAPackageFunction", "marshalBytes", true},
+	} {
+		function, declared := byName[row.function]
+		if !declared {
+			t.Fatalf("the control declares %v and not %s", slices.Sorted(maps.Keys(byName)), row.function)
+		}
+		if got := namesInvokedBy(function)[row.name]; got != row.invoked {
+			t.Errorf("namesInvokedBy(%s)[%q] = %v, want %v", row.function, row.name, got, row.invoked)
+		}
+	}
 }
 
 // reachableNames returns every identifier a function names, following calls to functions

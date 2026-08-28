@@ -66,6 +66,29 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*LeafNode).VerifySignature", call: func() error {
 			return (&LeafNode{}).VerifySignature(nil, nil, 0)
 		}},
+		// the four tree hashes, on the ZERO valued tree rather than on NewRatchetTree's one
+		// leaf tree. A tree of no nodes is the receiver that separates the two orders these
+		// bodies could be written in: rootOf refuses a leaf width of zero with
+		// ErrTreeMalformed and the node loop of TreeHashes never runs at all, so a body that
+		// looked at its receiver before it looked at its provider answers "your tree is
+		// malformed", or an empty slice and no error, to a caller whose actual mistake was
+		// passing no provider.
+		{name: "(*RatchetTree).treeHash", call: func() error {
+			_, err := (&RatchetTree{}).treeHash(nil, 0, nil)
+			return err
+		}},
+		{name: "(*RatchetTree).NodeTreeHash", call: func() error {
+			_, err := (&RatchetTree{}).NodeTreeHash(nil, 0)
+			return err
+		}},
+		{name: "(*RatchetTree).TreeHash", call: func() error {
+			_, err := (&RatchetTree{}).TreeHash(nil)
+			return err
+		}},
+		{name: "(*RatchetTree).TreeHashes", call: func() error {
+			_, err := (&RatchetTree{}).TreeHashes(nil)
+			return err
+		}},
 	}
 }
 
