@@ -9,3 +9,12 @@
 # and-diff check honest: after this, a diff in a .pb.go is a real change.
 *.proto text eol=lf
 *.pb.go text eol=lf
+
+# The committed fuzz seed corpus is bytes, not text. core.autocrlf=true is set at
+# system scope on the Windows boxes that build this repo, and git decides text
+# versus binary by looking for a NUL octet in the first 8000: a seed that happens
+# to hold no NUL and does hold an 0x0a is rewritten on checkout, which silently
+# turns a valid encoding into one no decoder accepts. Marking the folder binary is
+# the only thing between "the corpus is evidence" and "the corpus is whatever the
+# checkout left behind".
+mls/testdata/corpus/** -text
