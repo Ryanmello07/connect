@@ -3178,6 +3178,17 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{leafSecret}
 		}},
+		// the leaf credential constructor. It is not a cryptographic construction, and it is in
+		// this class for exactly the reason the class is derived rather than listed: it is handed
+		// a caller's array and it KEEPS what it is handed. A credential that aliased the identity
+		// would change under the leaf carrying it the next time that caller wrote into its own
+		// buffer, which is a signature that verified when it was made and does not afterwards,
+		// with nothing in between to point at. The answer read is the identity, since the
+		// constructor's own answer is a struct.
+		{name: "BasicCredential", call: func(take func([]byte) []byte) [][]byte {
+			credential := BasicCredential(take([]byte("the identity a basic credential carries")))
+			return [][]byte{credential.Identity}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}

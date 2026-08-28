@@ -261,10 +261,16 @@ func keyScheduleIsByteRun(rendered string, named []string) bool {
 //     order, and what an accessor does is hand back one. (*GroupContext).treeHash is the
 //     second shape and must not be reported; a method that reads the group id AND the tree
 //     hash to build bytes is the first.
-//   - a DECODER takes ONE byte run and nothing else, and answers an MLS structure. The arity
-//     is the discriminator: a decoder is handed one opaque run and takes it apart, where a
-//     constructor is handed the fields already separated. NewGroupContext(groupId, epoch,
-//     treeHash) is a constructor by that reading and is not reported.
+//   - a DECODER takes ONE byte run and nothing else, answers an MLS structure, and TAKES THE
+//     RUN APART. The arity was the whole discriminator until p5 task 5: a decoder is handed
+//     one opaque run where a constructor is handed the fields already separated, and
+//     NewGroupContext(groupId, epoch, treeHash) is a constructor by that reading. Arity alone
+//     stopped separating them the moment a structure arrived whose one variable field IS a
+//     byte run: BasicCredential(identity) stores what it is handed and interprets nothing, and
+//     it has the decoder's exact signature. keyScheduleTakesItsRunApart is the second half,
+//     and it is three derived signals rather than a name: an error result, a branch, or a
+//     subscript of the argument. Interpreting a run somebody else wrote requires at least one
+//     of the three, and storing it whole matches none.
 //
 // What this still cannot see is a decoder that takes a byte run AND something else -- a
 // provider, a version -- under a name with no verb in it. That shape is left uncovered rather
@@ -292,7 +298,7 @@ func keyScheduleSecondCodecsIn(parsed parsedSource, structures []string, byteRun
 			keyScheduleIsByteRun(answers[0], byteRuns) &&
 			keyScheduleFieldsNamedIn(one.body, fields[receiver]) > 1
 		decodes := len(one.params) == 1 && keyScheduleIsByteRun(one.params[0], byteRuns) &&
-			namesAnMlsStructure(answers[0])
+			namesAnMlsStructure(answers[0]) && keyScheduleTakesItsRunApart(one)
 		if !encodes && !decodes {
 			continue
 		}
@@ -303,6 +309,40 @@ func keyScheduleSecondCodecsIn(parsed parsedSource, structures []string, byteRun
 		found = append(found, one.name)
 	}
 	return found
+}
+
+// keyScheduleTakesItsRunApart answers whether one declaration does something with its argument
+// that INTERPRETING an opaque run requires, as opposed to storing it.
+//
+// This is the half of the decoder shape that is not the signature, and it exists because the
+// signature stopped separating a decoder from a constructor. Three signals, any one of which is
+// enough, and each is a thing reading a run somebody else wrote actually needs:
+//
+//   - an error result. A run arriving from the wire can be malformed and a decoder has to be
+//     able to say so; convention C2 is that it says so by returning. Every hand rolled decoder
+//     the control below declares returns one.
+//   - a branch -- an if, a for, a range, a switch. Taking a structure out of a run means
+//     deciding something about its content.
+//   - a subscript or a slice expression. That is a field being cut out of the run by offset,
+//     which is the straight line spelling of a decoder that reports nothing and branches on
+//     nothing, and it would otherwise be the hole this predicate opens.
+//
+// A body this scan cannot read counts as taking the run apart, which is the safe direction: an
+// unreadable body is reported rather than waved through.
+func keyScheduleTakesItsRunApart(one sourceDeclaration) bool {
+	if slices.Contains(one.results, "error") || one.body == nil {
+		return true
+	}
+	apart := false
+	ast.Inspect(one.body, func(node ast.Node) bool {
+		switch node.(type) {
+		case *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt,
+			*ast.IndexExpr, *ast.SliceExpr:
+			apart = true
+		}
+		return true
+	})
+	return apart
 }
 
 // keyScheduleFieldsNamedIn counts how many DISTINCT fields of a type one body mentions.
@@ -377,6 +417,39 @@ func NewGroupContext(groupId []byte, epoch uint64, treeHash []byte) *GroupContex
 	return &GroupContext{GroupId: groupId, Epoch: epoch, TreeHash: treeHash}
 }
 
+// a constructor whose one variable field IS the byte run, so it has the decoder's exact
+// signature and interprets nothing: no error to report a malformed run with, no branch on its
+// content, no offset cut out of it. Not reported.
+type Credential struct {
+	CredentialType uint16
+	Identity       []byte
+}
+
+func (self *Credential) MarshalMLS(w *syntax.Writer) error { return nil }
+
+func (self *Credential) UnmarshalMLS(r *syntax.Reader) error { return nil }
+
+func NewBasicCredential(identity []byte) Credential {
+	return Credential{CredentialType: 1, Identity: identity}
+}
+
+// and the three near misses that constructor must not cover, all under names carrying no verb
+// and all answering the same structure from one byte run: one that can report a malformed run,
+// one that branches on its content, and one that cuts a field out of it by offset. Every one of
+// them is a second decoder and all three are reported.
+func credentialFromBytes(b []byte) (Credential, error) { return Credential{}, nil }
+
+func credentialFromBytesBranching(b []byte) Credential {
+	if len(b) == 0 {
+		return Credential{}
+	}
+	return Credential{CredentialType: 1, Identity: b}
+}
+
+func credentialFromBytesSlicing(b []byte) Credential {
+	return Credential{CredentialType: 1, Identity: b[2:]}
+}
+
 // the second sanctioned exception: an extension body, whose Encode answers the whole
 // Extension rather than the body's bytes, paired with the two Parse spellings that read it
 // back -- the one handed the body's bytes, and the one handed the whole entry so that it
@@ -430,6 +503,9 @@ var keyScheduleCodecControlWrappers = []string{
 	"ParseGroupPolicyExtension",
 	"ParseOwnerSuccessorExtension",
 	"ParsePreSharedKeyId",
+	"credentialFromBytes",
+	"credentialFromBytesBranching",
+	"credentialFromBytesSlicing",
 	"groupContextFromBytes",
 }
 

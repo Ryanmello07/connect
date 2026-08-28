@@ -2009,30 +2009,48 @@ func TestSupportsEnforcesEveryEntryOfEveryRequirementVector(t *testing.T) {
 // no caller outside the package can match, and errors.Is in the commit path reports false with
 // nothing to say about it.
 //
-// The owed pair is derived from extension.go rather than listed. Every unexported err-prefixed
-// declaration of that file is a stand in for the exported name of the same spelling, so a
-// second one added by a later task is watched without anybody editing this.
+// The owed pair is derived from the package rather than listed. Every unexported err-prefixed
+// declaration of every NON TEST file is a stand in for the exported name of the same spelling,
+// so a second one added by a later task is watched without anybody editing this.
+//
+// The scan read extension.go alone until p5 task 5, which is the shortfall rule 5 names: the
+// stand in shape is the package's convention and nothing confines it to one file. Task 5 landed
+// credential.go carrying errProfileCredentialType for the same reason extension.go carries
+// errMissingRequiredCapability, and under the narrower scan that second stand in would have been
+// watched by nothing at all. Widening it took the watched set from one name to seven -- five of
+// which psk.go and secret_tree.go had been carrying, unwatched, since before this gate existed.
+//
+// Not every one of those seven is a stand in for a name somebody else owns; some are internal
+// invariants that simply happen to be spelled err-something. The property is the same either
+// way and that is why the widened class is the right one: two values of one spelling, one
+// exported and one not, is a pair errors.Is answers false for with nothing to say about it. What
+// differs is the fix, so the message names both.
+//
+// Test files stay out: their errKat* comparator sentinels are the private business of the test
+// that raises them, and there are dozens of them.
 func TestNoValidationOwnedNameHasLandedBesideItsStandIn(t *testing.T) {
 	declared := packageLevelDeclarations(t, ".")
 	standIns := []string{}
+	standInFiles := map[string]string{}
 	for name, file := range declared {
-		if file != "extension.go" || !strings.HasPrefix(name, "err") {
+		if strings.HasSuffix(file, "_test.go") || !strings.HasPrefix(name, "err") {
 			continue
 		}
 		standIns = append(standIns, name)
+		standInFiles[name] = file
 	}
 	slices.Sort(standIns)
-	if len(standIns) == 0 {
-		t.Fatal("extension.go declares no unexported error stand in, and it certainly declares errMissingRequiredCapability, so this scan read something other than that file")
+	if !slices.Contains(standIns, "errMissingRequiredCapability") {
+		t.Fatalf("the scan read the stand ins %v, and extension.go certainly declares errMissingRequiredCapability, so it read something other than this package", standIns)
 	}
 	for _, name := range standIns {
 		owed := "Err" + strings.TrimPrefix(name, "err")
 		if file, landed := declared[owed]; landed {
-			t.Errorf("%s has landed in %s and extension.go still carries the stand in %s; replace every use with the validation plan's sentinel and delete the stand in in the same commit",
-				owed, file, name)
+			t.Errorf("%s has landed in %s and %s still carries %s; if that is the stand in for it, replace every use with the landed sentinel and delete the stand in in the same commit, and if it is a different error then rename it -- errors.Is cannot tell two values of one spelling apart",
+				owed, file, standInFiles[name], name)
 		}
 	}
-	t.Logf("%d stand in(s) still owed to the validation plan: %v", len(standIns), standIns)
+	t.Logf("%d unexported error name(s) watched for an exported twin: %v", len(standIns), standIns)
 }
 
 // TestSupportsRefusalAnswersOnlyItsOwnSentinel keeps the stand in from being read as something
