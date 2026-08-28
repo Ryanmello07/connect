@@ -994,8 +994,18 @@ func UnmarshalRatchetTree(data []byte) (*RatchetTree, error) {
 // caller then has to tag.
 //
 // It is spelled Encode() (Extension, error) and NOT Encode() ([]byte, error), which is the
-// signature the interface registry retired on this type in favour of syntax.Marshal. The two
-// are not the same method: a []byte answer hands the tag choice back to the caller, and
+// signature the interface registry retired on this type in favour of syntax.Marshal --
+// slice1-interface-registry's dead name table, "Encode (p7) -> syntax.Marshal". Re-animating a
+// retired name is a decision and it is recorded here rather than left to be rediscovered: the
+// reconciliation owed to those plans is that syntax.Marshal is the resolution for a group
+// SMALLER than this product's own sizing and refuses this one, that p8's text still instructs
+// "encoding is syntax.Marshal(tree)" and must become syntax.MarshalLimit or this method, and
+// that ParseRatchetTreeFrom and marshalRatchetTree are surfaces neither the registry nor p5's
+// own Produces list names. The different SIGNATURE is what makes this the loud direction: a
+// caller written against the retired spelling gets a compile error rather than bytes refused
+// at the wrong limit.
+//
+// The two are not the same method: a []byte answer hands the tag choice back to the caller, and
 // extension_test.go's extensionBodyTypesIn derives the sanctioned extension body class off
 // exactly this signature, so this spelling is what makes ParseRatchetTreeFrom a sanctioned
 // read side rather than a second codec. A caller that wanted the retired method wants

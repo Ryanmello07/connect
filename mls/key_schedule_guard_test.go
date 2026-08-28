@@ -533,12 +533,14 @@ func syntaxCodecEntryPoints(t *testing.T) []string {
 // Three clauses, and each is a way of NOT delegating rather than a symptom of delegating, which
 // is the difference between an exemption and a hole:
 //
-//   - it calls EXACTLY ONE of the entry points. A declaration that never reaches syntax is
+//   - it reaches one of the entry points at all. A declaration that never reaches syntax is
 //     doing the encoding itself whatever it is called, which is every hand rolled codec the
-//     control declares. Two reaches is not a delegation either: a declaration that decodes one
-//     run as two structures, or lays two encoded bodies into one output, has decided where the
-//     second one begins, and a layout decided outside a codec is the whole of what C1 is about.
-//   - it does nothing to the bytes but PLUMB them, on either side of the call. This is the
+//     control declares.
+//   - it does nothing to the bytes but PLUMB them, on either side of THE call it delegates to.
+//     A SECOND entry point call is caught by this same clause rather than by a count of its
+//     own, and that is measured rather than assumed: spelled as a separate "exactly one"
+//     clause it was a clause nothing could make fail, since a declaration that decodes one run
+//     as two structures still has a call in it that is not the delegation. This is the
 //     clause with the history, and it is stated as its COMPLEMENT for that reason. It was
 //     first written as "carries no index and no slice expression", a lexical scan of the
 //     declaration's own body, and one level of indirection walked straight past it:
@@ -574,7 +576,7 @@ func keyScheduleDelegationsIn(parsed parsedSource, entryPoints []string, structu
 			continue
 		}
 		reaches := keyScheduleEntryPointCallsIn(one.body, entryPoints)
-		if len(reaches) != 1 || !keyScheduleOnlyPlumbsAround(one.body, reaches[0]) {
+		if len(reaches) == 0 || !keyScheduleOnlyPlumbsAround(one.body, reaches[0]) {
 			continue
 		}
 		if keyScheduleFieldsNamedIn(one.body, structureFields) > 0 {
@@ -946,7 +948,8 @@ func MarshalGroupContextWithItsOwnHeader(v *GroupContext) ([]byte, error) {
 // two delegations where a delegation is one. Decoding one run twice is this declaration
 // deciding that the run holds two structures, which is a layout, and a layout decided outside
 // a codec is what C1 is about. It cuts nothing, names no field and reports what either half
-// refused, so the count is the only clause that separates it from the sanctioned pair.
+// refused; what reports it is that whichever call is read as the delegation, the OTHER one is
+// a call this declaration makes on its own account, and that is not plumbing.
 func ParseTwoGroupContexts(data []byte) (*GroupContext, error) {
 	first := &GroupContext{}
 	if err := syntax.Unmarshal(data, first); err != nil {
