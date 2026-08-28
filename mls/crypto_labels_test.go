@@ -604,6 +604,17 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// default limit could have computed -- which is the one disagreement in MLS a group
 		// does not recover from, since every confirmation tag afterwards is taken over it.
 		"transcript.go: syntax.NewWriter()",
+		// the ratchet tree's unmerged_leaves<V>, the one vector a ParentNode carries. Writer
+		// and Reader taking rather than building one, so the pair runs under whichever limit
+		// the caller opened, which is the default one everywhere until a ratchet tree encode
+		// exists to raise it -- and this pair is not it. The raised bound belongs to the
+		// ratchet_tree ARRAY of section 12.4.3.1, whose whole point is that it is larger than
+		// one MLS structure; a single parent node's unmerged list is bounded by the group's
+		// leaf count, and one allowed past MaxVectorLength is one no peer running the default
+		// limit could have sent, which matters here because those bytes are covered by the
+		// parent hash and the tree hash.
+		"tree.go: syntax.ReadVector(r, readOneUnmergedLeaf)",
+		"tree.go: syntax.WriteVector(w, self.UnmergedLeaves, writeOneUnmergedLeaf)",
 		// marshalBytes, the preimage encoder every signature content and hash input of the
 		// TreeKEM plan is assembled through. The default limit and not the ratchet tree
 		// one, which is the distinction the helper exists to hold: a LeafNodeTBS and a

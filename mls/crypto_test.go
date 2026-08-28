@@ -4993,18 +4993,19 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// ratchetFor that calls it, and it expired by FAILING the moment ratchetFor named it,
 	// which is the only way an excuse of this kind ever comes back off.
 	//
-	// The five below are p5 task 3's tree_adapt.go, which is the same shape one plan later: the
+	// The four below are p5 task 3's tree_adapt.go, which is the same shape one plan later: the
 	// task lands the shared helpers and the tasks after it land the callers. Each entry names
 	// the task that will call it, so an entry still here when that task has landed is a line
-	// that fails rather than a line somebody has to remember. All five are held by
+	// that fails rather than a line somebody has to remember. All four are held by
 	// tree_adapt_test.go, which is what separates "no caller yet" from the placeholder this
 	// gate is about.
 	//
 	// There were six. marshalBytes was excused for p5 task 4 and that task has landed:
 	// (*LeafKeysExtension).Encode assembles the urmessage_leaf_keys body through it, so the
 	// entry expired by FAILING on the commit that gave it a caller, which is the only way an
-	// excuse of this kind ever comes back off.
-	"./directPathOf": "p5 task 8, the RatchetTree container, takes a leaf's direct path through it",
+	// excuse of this kind ever comes back off. directPathOf went the same way one task later:
+	// p5 task 8 landed tree.go, (*RatchetTree).BlankDirectPath walks a leaf's direct path
+	// through it, and that entry failed on the commit that gave it its caller too.
 	"./rootOf":       "p5 task 10, node resolution, resolves at the root through it",
 	"./leftOf":       "p5 task 12, the tree hash, descends through it",
 	"./rightOf":      "p5 task 12, the tree hash, descends through it",
