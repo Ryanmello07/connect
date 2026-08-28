@@ -2925,12 +2925,15 @@ func theNamesReachingTheExtensionBodyEncoder(declared []sourceDeclaration, helpe
 //
 // The limit that remains, stated rather than left: a body assembled by taking a syntax Writer
 // directly, without going through the helper Encode goes through, is not in this class. Seeding
-// the closure with the syntax writer instead was measured and reports GroupContextBytes,
-// PskSecret and InterimTranscriptHash, which are wire encodings of things that are not
-// extension bodies -- a rule this package would learn to ignore. What reports that shape today
-// is TestEveryConstructionInThisPackageLeavesItsInputAlone, whose coverage table is derived
-// from every package level function handed a caller's bytes and demands a row for each: an
-// assembler of a body is handed the device key, so it needs a row and does not have one.
+// the closure with syntax.NewWriter instead of with what Encode calls was MEASURED, and reports
+// twenty declarations -- (*KeySchedule).Export, (*HpkeContext).Export, PskSecret,
+// InterimTranscriptHash, RefHash, MakeProposalRef, WelcomeKeyNonce and thirteen more -- every
+// one of them a key schedule output or a wire preimage that is not an extension body. That is a
+// rule this package would learn to ignore, which is worse than a rule with a stated hole. What
+// reports the uncovered shape today is TestEveryConstructionInThisPackageLeavesItsInputAlone,
+// whose coverage table is derived from every package level function handed a caller's bytes and
+// demands a row for each: an assembler of a body is handed the device key, so it needs a row
+// and does not have one.
 func exportedSymbolsAssemblingABodyIn(parsed parsedSource, reaching []string, bodies []string, byteRuns []string) []string {
 	found := []string{}
 	for _, one := range declaredIn(parsed) {
