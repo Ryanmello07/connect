@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"maps"
@@ -2457,13 +2458,30 @@ var extensionBodySurfaceControlReports = []string{
 // exportedSymbolsHandingOutABodyIn is every exported declaration of one file that mentions an
 // extension body type in its receiver or its parameters and answers a byte run.
 //
-// The honest limit, written here rather than left for the next reader: this reads the
-// SIGNATURE, so an exported function that assembles the same bytes without naming the type --
-// LeafKeysBody(algId uint16, pub []byte) []byte -- is invisible to it. That shape is left
-// uncovered rather than bought with a rule that reports every exported function in the package
-// answering a byte slice, which is most of the crypto. What closes it in practice is that a
-// body assembled that way has to duplicate the encoder, and duplicating the encoder is what
-// TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn reports.
+// TWO honest limits, both measured rather than supposed, and both written here rather than
+// left for the next reader to rediscover.
+//
+// The first is that this reads the SIGNATURE, so an exported function that assembles the same
+// bytes without naming the type -- LeafKeysBody(algId uint16, pub []byte) []byte -- is
+// invisible to it. That shape is left uncovered HERE rather than bought with a rule that
+// reports every exported function in the package answering a byte slice, which is most of the
+// crypto. It is covered next door instead, by
+// TestNoExportedSymbolOfThisPackageAssemblesAnExtensionBodyThroughItsOwnEncoder, whose class is
+// reachability of the encoder an extension body's Encode actually calls rather than the shape
+// of a signature. The claim this comment used to carry -- that a body assembled that way has to
+// duplicate the encoder and that duplicating the encoder is what
+// TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn reports -- was wrong, and was measured
+// to be wrong: adding exactly that function left C1 green, because a free function answering a
+// byte run is neither of the two shapes C1 reads.
+//
+// The second is that this reads FUNCTIONS AND METHODS, so a struct FIELD is outside the class
+// altogether. Extension.ExtensionData is an exported field of an exported struct and hands out
+// a body with no declaration for any signature rule to read; ext.ExtensionData is the shortest
+// route to a loose body there is, and no derivation over declarations can ever report it.
+// Nothing here can close that, because the codec needs those fields exported. What closes the
+// harm it is a route to is on the read side: ParseLeafKeysFrom refuses a body arriving under
+// another type's tag. This rule is the half that keeps the package from PRODUCING a loose body,
+// and it is worth exactly that much and no more.
 func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byteRuns []string) []string {
 	mentionsABody := func(rendered string) bool {
 		return slices.ContainsFunc(bodies, func(one string) bool {
@@ -2497,15 +2515,20 @@ func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byte
 	return found
 }
 
-// TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn is the guarantee the
-// sanctioned exception exists to give, stated as a rule rather than as a naming convention.
+// TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn is ONE HALF of what the
+// sanctioned exception is worth, stated as a rule rather than as a naming convention: this
+// package does not hand out a loose extension body.
 //
-// Encode returning the whole Extension is only worth anything while it is the ONLY way out. An
-// exported (*LeafKeysExtension).Bytes added next to it for somebody's convenience puts the
-// choice of tag back in the caller's hands, and the wrong choice there -- 0xF001 rather than
-// 0xF002, one identifier apart in this file -- encodes, is covered by the leaf signature, and
-// is refused by the first peer that tries to read a group policy out of an X-Wing key. Nothing
-// about that failure points back at the call site that made it.
+// It is not a guarantee that a body and a tag cannot come apart, and the doc on Encode no
+// longer says it is. Extension carries two exported fields, so ext.ExtensionData is a field
+// access and the mismatched pair is a three line composite literal built out of exported API;
+// that route is outside every rule a declaration scan can state, and it is closed on the read
+// side instead, by ParseLeafKeysFrom. What this rule is worth is the OTHER route: an exported
+// (*LeafKeysExtension).Bytes added next to Encode for somebody's convenience puts the choice of
+// tag back in the caller's hands on the ordinary path, and the wrong choice there -- 0xF001
+// rather than 0xF002, one identifier apart in this file -- encodes, is covered by the leaf
+// signature, and is refused by the first peer that tries to read a group policy out of an
+// X-Wing key. Nothing about that failure points back at the call site that made it.
 //
 // The class is derived from the Encode signature, so a second extension body type is covered
 // by the commit that adds it.
@@ -2541,14 +2564,24 @@ func TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn(t *testing
 	}
 }
 
-// The tag each extension body of this package stamps, and a value of it to ask.
+// The tag each extension body of this package stamps, a value of it to ask, the tag checked
+// entry point that reads one back, and the sentinel that entry point refuses with.
 //
 // A table, and the derived class above is what stops it being the enumeration this project has
-// been walked past fourteen times: the test below requires the two to be equal, so an
-// extension body added without an entry here fails rather than going unchecked.
+// been walked past fourteen times: the two tests below both require the table and the derived
+// class to be EQUAL, so an extension body added without an entry here fails rather than going
+// unchecked, and an entry left here for a body that no longer exists fails too.
+//
+// readBack is written as a call into this package's exported surface rather than as a tag
+// comparison spelled here, because a comparison spelled here would pass while the package
+// shipped no tag checked entry point at all.
+// TestEveryExtensionBodyDeclaresATagCheckedReadSideBesideItsEncode is what says the entry point
+// exists; this row is what says it works.
 var extensionBodyTagsToStamp = map[string]struct {
-	tag   ExtensionType
-	build func() (Extension, error)
+	tag      ExtensionType
+	build    func() (Extension, error)
+	readBack func(Extension) error
+	refusal  error
 }{
 	"LeafKeysExtension": {
 		tag: ExtensionTypeUrmessageLeafKeys,
@@ -2556,6 +2589,11 @@ var extensionBodyTagsToStamp = map[string]struct {
 			body := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: make([]byte, XwingPublicKeyLen)}
 			return body.Encode()
 		},
+		readBack: func(ext Extension) error {
+			_, err := ParseLeafKeysFrom(ext)
+			return err
+		},
+		refusal: ErrLeafKeysExtensionInvalid,
 	},
 }
 
@@ -2633,4 +2671,577 @@ func everyExtensionTypeThisPackageDeclares(t *testing.T) []ExtensionType {
 	}
 	slices.Sort(found)
 	return slices.Compact(found)
+}
+
+// ---------------------------------------------------------------------------
+// the read side of the sanctioned exception: the entry point that is given the tag
+// ---------------------------------------------------------------------------
+
+// extensionBodyTagCheckedParsersIn is the read side counterpart of extensionBodyTypesIn: for
+// each derived extension body, every exported package level function that is handed a whole
+// Extension and answers that body.
+//
+// Being handed the Extension rather than the body's bytes is the whole property.
+// ParseLeafKeysExtension takes bytes, so it is never told what tag they arrived under and
+// cannot refuse a wrong one -- a body lifted out of a urmessage_group_policy entry parses there
+// exactly as cleanly as one lifted out of its own, and answers a wrap target either way. The
+// SIGNATURE is what separates the two, so the signature is what this reads: the body is taken
+// off the result and the name after "Parse" is left free, because what sanctions this shape is
+// that the tag is in its hands and not what somebody called it.
+func extensionBodyTagCheckedParsersIn(files []parsedSource, bodies []string) map[string][]string {
+	found := map[string][]string{}
+	for _, parsed := range files {
+		for _, one := range declaredIn(parsed) {
+			if one.receiver != "" || !one.exported {
+				continue
+			}
+			if !slices.Equal(one.params, []string{"Extension"}) {
+				continue
+			}
+			if len(one.results) != 2 || one.results[1] != "error" || !strings.HasPrefix(one.results[0], "*") {
+				continue
+			}
+			body := strings.TrimPrefix(one.results[0], "*")
+			if !slices.Contains(bodies, body) {
+				continue
+			}
+			found[body] = append(found[body], one.name)
+		}
+	}
+	for body := range found {
+		slices.Sort(found[body])
+	}
+	return found
+}
+
+// A file declaring one of each shape the read side rule has to tell apart, so a matcher that
+// stopped matching fails here rather than issuing this package a clean bill.
+//
+// Three extension bodies and one tag checked parser between them. The two that go without are
+// the near misses: the bytes taking half of the pair, which is a real and sanctioned entry
+// point but has no tag to check and so does not stand in for this one, and the same shape as
+// the real thing answering something that is not an extension body. The unexported twin is
+// there because the surface this is about is the one a caller outside the package can reach
+// for.
+const extensionBodyReadSideControl = `package control
+
+type LeafKeysExtension struct{}
+
+func (self *LeafKeysExtension) Encode() (Extension, error) { return Extension{}, nil }
+
+// the shape the rule is looking for: handed the whole entry, so the tag is in its hands
+func ParseLeafKeysFrom(ext Extension) (*LeafKeysExtension, error) { return nil, nil }
+
+type GroupPolicyExtension struct{}
+
+func (self *GroupPolicyExtension) Encode() (Extension, error) { return Extension{}, nil }
+
+// the first near miss: handed the body's bytes, so there is no tag for it to check
+func ParseGroupPolicyExtension(data []byte) (*GroupPolicyExtension, error) { return nil, nil }
+
+type OwnerSuccessorExtension struct{}
+
+func (self *OwnerSuccessorExtension) Encode() (Extension, error) { return Extension{}, nil }
+
+// the second near miss: handed the whole entry and answering something that is not the body
+func ParseOwnerSuccessorFrom(ext Extension) (*Extension, error) { return nil, nil }
+
+// unexported, so outside the surface a caller reaches for
+func parseOwnerSuccessorFrom(ext Extension) (*OwnerSuccessorExtension, error) { return nil, nil }
+`
+
+// What the rule must read out of the control, exactly rather than as a floor: a rule that
+// widened to accept the bytes taking half would report this package compliant while the tag was
+// checked by nothing, and one that narrowed to miss the real shape would demand a parser that
+// exists.
+var extensionBodyReadSideControlReports = map[string][]string{
+	"LeafKeysExtension": {"ParseLeafKeysFrom"},
+}
+
+// TestEveryExtensionBodyDeclaresATagCheckedReadSideBesideItsEncode is the half of the tag
+// pairing that Encode cannot give on its own.
+//
+// Encode stamps the tag. Nothing about a Go return type stops a caller taking the body back out
+// of the Extension -- ExtensionData is an exported field of an exported struct -- and pairing it
+// with 0xF001, and nothing on the read side objects either, because ParseLeafKeysExtension is
+// handed bytes and has no tag to compare. So the encode side guarantee has to have a read side
+// counterpart or it is a statement about tidiness rather than about safety, and this is what
+// says the counterpart is there.
+//
+// The class is derived from the Encode signature, the same derivation the encode side gate uses,
+// so a second extension body type is owed a tag checked entry point by the commit that adds it.
+func TestEveryExtensionBodyDeclaresATagCheckedReadSideBesideItsEncode(t *testing.T) {
+	control := mustParseText(t, "the extension body read side control", extensionBodyReadSideControl)
+	controlBodies := extensionBodyTypesIn([]parsedSource{control})
+	wantBodies := []string{"GroupPolicyExtension", "LeafKeysExtension", "OwnerSuccessorExtension"}
+	if !slices.Equal(controlBodies, wantBodies) {
+		t.Fatalf("the derivation read %v out of the control, want %v; a derivation that reads nothing demands nothing",
+			controlBodies, wantBodies)
+	}
+	reported := extensionBodyTagCheckedParsersIn([]parsedSource{control}, controlBodies)
+	sameNames := func(left []string, right []string) bool { return slices.Equal(left, right) }
+	if !maps.EqualFunc(reported, extensionBodyReadSideControlReports, sameNames) {
+		t.Fatalf("the rule read %v out of the control, want %v", reported, extensionBodyReadSideControlReports)
+	}
+
+	scanned := packageLevelFunctions(t).files
+	files := []parsedSource{}
+	for _, path := range scanned {
+		files = append(files, mustParseSource(t, path))
+	}
+	bodies := extensionBodyTypesIn(files)
+	if !slices.Contains(bodies, "LeafKeysExtension") {
+		t.Fatalf("the derivation read %v out of %v and LeafKeysExtension is not among them, so this gate is over a class that does not include the one extension body this package has",
+			bodies, scanned)
+	}
+	parsers := extensionBodyTagCheckedParsersIn(files, bodies)
+	for _, name := range bodies {
+		if len(parsers[name]) == 0 {
+			t.Errorf("%s declares Encode() (Extension, error) and this package exports nothing that takes an Extension and answers a *%s, so the tag Encode stamps is checked by nothing on the way back in: a body lifted out of one entry and read back through another parses clean and answers a wrap target",
+				name, name)
+			continue
+		}
+		t.Logf("%s is read back through %v", name, parsers[name])
+	}
+}
+
+// TestEveryExtensionBodyRefusesAnEntryCarryingAnyTagButItsOwn is the behavioural half: the
+// entry point the gate above requires actually refuses every tag but this body's.
+//
+// Over the whole uint16 space rather than over the two neighbours this file declares eleven
+// lines apart. The neighbours are the likeliest mistake and they are covered by being in the
+// space, but they are not the class: a tag a peer GREASEs, a code point registered after this
+// was written, and the zero an uninitialised Extension carries are all bodies read back under
+// something that is not urmessage_leaf_keys, and the zero is the one a caller reaches by
+// building the Extension by hand and forgetting the field.
+func TestEveryExtensionBodyRefusesAnEntryCarryingAnyTagButItsOwn(t *testing.T) {
+	files := []parsedSource{}
+	for _, path := range packageLevelFunctions(t).files {
+		files = append(files, mustParseSource(t, path))
+	}
+	bodies := extensionBodyTypesIn(files)
+	if covered := slices.Sorted(maps.Keys(extensionBodyTagsToStamp)); !slices.Equal(covered, bodies) {
+		t.Fatalf("this package declares extension bodies %v and this table covers %v; an extension body with no entry is one nothing holds to its own tag",
+			bodies, covered)
+	}
+	for _, name := range bodies {
+		entry := extensionBodyTagsToStamp[name]
+		if entry.readBack == nil || entry.refusal == nil {
+			t.Errorf("%s has no tag checked read side in extensionBodyTagsToStamp, so nothing here says its body cannot be read back under another extension type's tag",
+				name)
+			continue
+		}
+		ext, err := entry.build()
+		if err != nil {
+			t.Errorf("%s.Encode over a valid body: %v", name, err)
+			continue
+		}
+		accepted := []ExtensionType{}
+		for value := 0; value <= 0xffff; value++ {
+			tag := ExtensionType(value)
+			err := entry.readBack(Extension{ExtensionType: tag, ExtensionData: ext.ExtensionData})
+			switch {
+			case err == nil:
+				accepted = append(accepted, tag)
+			case !errors.Is(err, entry.refusal):
+				t.Fatalf("%s read back under tag %#04x err = %v, want %v", name, uint16(tag), err, entry.refusal)
+			}
+		}
+		if want := []ExtensionType{entry.tag}; !slices.Equal(accepted, want) {
+			t.Errorf("%s is read back under tags %#04x, want %#04x", name, accepted, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the blind spot the signature rule leaves, closed by reachability instead
+// ---------------------------------------------------------------------------
+
+// extensionBodyEncoderHelpersIn is the seed of the reachability rule below: the package level
+// functions of the scanned source that an extension body's Encode calls.
+//
+// Derived off the Encode bodies rather than written down, because "the encoder an extension
+// body goes through" is a fact about this package that changes when the package does, and a
+// name typed out here would go on naming the old one. Today that reads marshalBytes and nothing
+// else; the point is that it will read whatever Encode calls tomorrow.
+//
+// Package level functions only. A method name would drag every receiver that declares one into
+// the closure, and what this is trying to follow is the free encoder a free function can reach.
+func extensionBodyEncoderHelpersIn(files []parsedSource, bodies []string) []string {
+	packageLevel := map[string]bool{}
+	for _, one := range declaredAcross(files) {
+		if one.receiver == "" {
+			packageLevel[one.name] = true
+		}
+	}
+	helpers := []string{}
+	for _, one := range declaredAcross(files) {
+		if one.name != "Encode" || !slices.Contains(bodies, strings.TrimPrefix(one.receiver, "*")) {
+			continue
+		}
+		if one.body == nil {
+			continue
+		}
+		ast.Inspect(one.body, func(node ast.Node) bool {
+			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && packageLevel[identifier.Name] {
+				helpers = append(helpers, identifier.Name)
+			}
+			return true
+		})
+	}
+	slices.Sort(helpers)
+	return slices.Compact(helpers)
+}
+
+// theNamesReachingTheExtensionBodyEncoder is every declared name that can reach one of those
+// helpers, plus the helpers themselves.
+//
+// The closure is theNamesReachingTheStorage, reused rather than written a second time: it is
+// the same question -- which declarations can reach this name -- and a second copy of a
+// reachability walk is a second thing that can stop agreeing with the first. It answers for one
+// seed at a time and reachability is a union over seeds, so the loop is sound: every name in the
+// closure of a set is reachable through a chain ending at exactly one member of it.
+func theNamesReachingTheExtensionBodyEncoder(declared []sourceDeclaration, helpers []string) []string {
+	reaching := slices.Clone(helpers)
+	for _, helper := range helpers {
+		reaching = append(reaching, theNamesReachingTheStorage(declared, helper)...)
+	}
+	slices.Sort(reaching)
+	return slices.Compact(reaching)
+}
+
+// exportedSymbolsAssemblingABodyIn is every exported declaration of one file that can reach the
+// extension body encoder and answers a byte run.
+//
+// This is the shape the signature rule next door cannot see: LeafKeysBody(algId uint16, pub
+// []byte) []byte names no extension body anywhere in its signature, so nothing about its types
+// says what those bytes are. What says it is that they came out of the same encoder the
+// sanctioned Encode goes through, and reaching that encoder is a property of the BODY rather
+// than of the signature.
+//
+// The sanctioned Encode is excluded by name and by class rather than by file, because it is the
+// one declaration that must reach the encoder -- reaching it is what it is for -- and what it
+// answers is the tag and the body together rather than a byte run.
+//
+// The limit that remains, stated rather than left: a body assembled by taking a syntax Writer
+// directly, without going through the helper Encode goes through, is not in this class. Seeding
+// the closure with the syntax writer instead was measured and reports GroupContextBytes,
+// PskSecret and InterimTranscriptHash, which are wire encodings of things that are not
+// extension bodies -- a rule this package would learn to ignore. What reports that shape today
+// is TestEveryConstructionInThisPackageLeavesItsInputAlone, whose coverage table is derived
+// from every package level function handed a caller's bytes and demands a row for each: an
+// assembler of a body is handed the device key, so it needs a row and does not have one.
+func exportedSymbolsAssemblingABodyIn(parsed parsedSource, reaching []string, bodies []string, byteRuns []string) []string {
+	found := []string{}
+	for _, one := range declaredIn(parsed) {
+		if !one.exported || !slices.Contains(reaching, one.name) {
+			continue
+		}
+		if one.name == "Encode" && slices.Contains(bodies, strings.TrimPrefix(one.receiver, "*")) {
+			continue
+		}
+		if !slices.ContainsFunc(one.results, func(result string) bool {
+			return keyScheduleIsByteRun(result, byteRuns)
+		}) {
+			continue
+		}
+		if one.receiver != "" {
+			found = append(found, "("+one.receiver+")."+one.name)
+			continue
+		}
+		found = append(found, one.name)
+	}
+	slices.Sort(found)
+	return found
+}
+
+// A file declaring one of each shape the reachability rule has to tell apart.
+//
+// The indirect one is why this is a closure and not a check of Encode's own callers: a
+// convenience wrapper one hop away from the encoder hands out the same bytes and mentions
+// nothing this rule seeds on. The unexported pair are outside the class on purpose -- the
+// package assembling its own body is not a call site that can pair it with a tag -- and the
+// unrelated one is the negative half that keeps this from being "every exported function
+// answering a byte slice".
+const extensionBodyAssemblyControl = `package control
+
+type LeafKeysExtension struct {
+	AlgId          uint16
+	DeviceXwingPub []byte
+}
+
+// the sanctioned encoder, which is what the seed is read out of and which must not be reported
+func (self *LeafKeysExtension) Encode() (Extension, error) {
+	body, err := marshalBytes(func(w *syntax.Writer) error { return nil })
+	if err != nil {
+		return Extension{}, err
+	}
+	return Extension{ExtensionData: body}, nil
+}
+
+func marshalBytes(encode func(w *syntax.Writer) error) ([]byte, error) { return nil, nil }
+
+// the shape this rule exists to report: the body assembled through the same encoder and handed
+// back loose, under a name and a signature that mention no extension body at all
+func LeafKeysBody(algId uint16, pub []byte) []byte {
+	body, _ := marshalBytes(func(w *syntax.Writer) error { return nil })
+	return body
+}
+
+// and the same one hop further out, which is what makes this a closure
+func LeafKeysBodyIndirect(algId uint16, pub []byte) []byte { return leafKeysBodyHelper() }
+
+func leafKeysBodyHelper() []byte {
+	body, _ := marshalBytes(func(w *syntax.Writer) error { return nil })
+	return body
+}
+
+// unexported, so outside the class
+func leafKeysBodyInternal() []byte {
+	body, _ := marshalBytes(func(w *syntax.Writer) error { return nil })
+	return body
+}
+
+// exported, answers a byte run, and reaches the encoder through nothing
+func SomeUnrelatedBytes(n int) []byte { return make([]byte, n) }
+`
+
+// What the rule must read out of the control, exactly.
+var extensionBodyAssemblyControlReports = []string{
+	"LeafKeysBody",
+	"LeafKeysBodyIndirect",
+}
+
+// TestNoExportedSymbolOfThisPackageAssemblesAnExtensionBodyThroughItsOwnEncoder closes the
+// blind spot the signature rule admits to and used to name the wrong catcher for.
+//
+// The doc on exportedSymbolsHandingOutABodyIn said the uncovered shape -- an exported free
+// function assembling the body without naming the type -- was closed in practice because
+// duplicating the encoder is what TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn
+// reports. It is not: adding exactly that function was measured to leave C1 green, because a
+// free function answering a byte run is neither of the two shapes C1 reads. C1's encoder shape
+// wants a receiver on an MLS structure and its decoder shape wants a single byte run in and a
+// structure out, and LeafKeysBody(algId uint16, pub []byte) []byte is neither.
+//
+// So the shape is covered here instead, by what it actually has in common with the sanctioned
+// encoder: it goes through the encoder. That is a property of the body rather than of the
+// signature, which is exactly the half the rule next door cannot read.
+func TestNoExportedSymbolOfThisPackageAssemblesAnExtensionBodyThroughItsOwnEncoder(t *testing.T) {
+	control := mustParseText(t, "the extension body assembly control", extensionBodyAssemblyControl)
+	controlFiles := []parsedSource{control}
+	controlBodies := extensionBodyTypesIn(controlFiles)
+	if !slices.Equal(controlBodies, []string{"LeafKeysExtension"}) {
+		t.Fatalf("the derivation read %v out of the control, want [LeafKeysExtension]", controlBodies)
+	}
+	controlHelpers := extensionBodyEncoderHelpersIn(controlFiles, controlBodies)
+	if !slices.Equal(controlHelpers, []string{"marshalBytes"}) {
+		t.Fatalf("the seed read %v out of the control, want [marshalBytes]; a seed that reads nothing leaves the closure empty and the rule demands nothing",
+			controlHelpers)
+	}
+	controlReaching := theNamesReachingTheExtensionBodyEncoder(declaredAcross(controlFiles), controlHelpers)
+	if reported := exportedSymbolsAssemblingABodyIn(control, controlReaching, controlBodies,
+		packageByteSliceTypeNamesIn(control)); !slices.Equal(reported, extensionBodyAssemblyControlReports) {
+		t.Fatalf("the rule reported %v out of the control, want %v; the closure reached %v",
+			reported, extensionBodyAssemblyControlReports, controlReaching)
+	}
+
+	scanned := packageLevelFunctions(t).files
+	files := []parsedSource{}
+	for _, path := range scanned {
+		files = append(files, mustParseSource(t, path))
+	}
+	bodies := extensionBodyTypesIn(files)
+	if !slices.Contains(bodies, "LeafKeysExtension") {
+		t.Fatalf("the derivation read %v out of %v and LeafKeysExtension is not among them, so this gate is over a class that does not include the one extension body this package has",
+			bodies, scanned)
+	}
+	helpers := extensionBodyEncoderHelpersIn(files, bodies)
+	if len(helpers) == 0 {
+		t.Fatalf("no extension body's Encode in %v calls a package level function of this package, so the closure below is empty and this gate demands nothing",
+			scanned)
+	}
+	reaching := theNamesReachingTheExtensionBodyEncoder(declaredAcross(files), helpers)
+	t.Logf("the extension body encoder of this package is %v, and %v reach it", helpers, reaching)
+	byteRuns := packageByteSliceTypeNames(t)
+	for at, path := range scanned {
+		for _, handed := range exportedSymbolsAssemblingABodyIn(files[at], reaching, bodies, byteRuns) {
+			t.Errorf("%s exports %s, which reaches %v -- the encoder this package's extension bodies are built with -- and answers a byte run; an extension body handed out loose is a tag choice handed to the caller, and 0xF001 rather than 0xF002 encodes, signs and travels",
+				path, handed, helpers)
+		}
+	}
+}
+
+// TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes holds the aliasing claim over the
+// whole path the doc on LeafKeysExtension sends wrap.go's reader down, and not over the parse
+// alone.
+//
+// The parse's own two claims are held next door, over a body handed to it directly. This is the
+// same property stated where the reader will actually meet it: an extensions vector decoded off
+// the wire, the lookup in front of the parse, and then a mutation of the leaf's own bytes. The
+// lookup is the step that is easy to read as safe and is not -- FindExtension answers a VIEW --
+// so a reader who kept the []byte instead of the parsed structure would be holding a wrap
+// target the owner of the leaf can still change, invisibly to every signature over it.
+func TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes(t *testing.T) {
+	pub := leafKeysTestKey()
+	in := &LeafKeysExtension{AlgId: AlgIdXwing, DeviceXwingPub: pub}
+	ext, err := in.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	// the leaf's extensions vector, written and read back, so what the lookup runs over is a
+	// decoded vector rather than the one this test built
+	w := syntax.NewWriter()
+	if err := WriteExtensions(w, []Extension{ext}); err != nil {
+		t.Fatalf("WriteExtensions: %v", err)
+	}
+	wire, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("the extensions vector would not encode: %v", err)
+	}
+	exts, err := ReadExtensions(syntax.NewReader(wire))
+	if err != nil {
+		t.Fatalf("ReadExtensions: %v", err)
+	}
+	if len(exts) != 1 {
+		t.Fatalf("the vector decoded to %d entries, want 1", len(exts))
+	}
+
+	found, ok := FindExtension(exts, ExtensionTypeUrmessageLeafKeys)
+	if !ok {
+		t.Fatalf("FindExtension did not find the entry this test just wrote")
+	}
+	// the documented behaviour of the lookup, held here so the doc and the code cannot drift
+	// apart in silence. If this ever fails because FindExtension started copying, that is a
+	// safer lookup and a stale comment: change both.
+	found[0] ^= 0xff
+	if exts[0].ExtensionData[0] != found[0] {
+		t.Errorf("FindExtension answered a copy of the body, and its doc says a view; one of the two is wrong")
+	}
+	found[0] ^= 0xff
+
+	out, err := ParseLeafKeysFrom(exts[0])
+	if err != nil {
+		t.Fatalf("ParseLeafKeysFrom: %v", err)
+	}
+	if !bytes.Equal(out.DeviceXwingPub, pub) {
+		t.Fatalf("the wrap target read back off the leaf is not the key that went in")
+	}
+	held := bytes.Clone(out.DeviceXwingPub)
+	for i := range exts[0].ExtensionData {
+		exts[0].ExtensionData[i] ^= 0xff
+	}
+	if !bytes.Equal(out.DeviceXwingPub, held) {
+		t.Errorf("mutating the leaf's own extension bytes changed the wrap target already read off it, so the parse kept a view of the leaf")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the one number nothing in this tree pins across a package boundary
+// ---------------------------------------------------------------------------
+
+// messagePackageDir is the sibling package the X-Wing key size will eventually be stated in a
+// second time. It is the same directory mls's other cross package guardrails scan, and the
+// relative path is this package's directory to that one.
+const messagePackageDir = "../message"
+
+// xwingNamedDeclarationsIn is every package level declaration of one directory's non test
+// source whose name mentions X-Wing.
+//
+// Over the NAME rather than over the value, because the failure this is watching for is a
+// second declaration of the same quantity and the two would agree on the value on the day it
+// lands -- and disagree later, silently, when one of them is corrected. A name is what a reader
+// greps for and what a reviewer sees in a diff.
+//
+// Non test files only. A test helper named for the thing it measures is not a second statement
+// of it, and this package has two.
+func xwingNamedDeclarationsIn(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s, which this gate scans for a second statement of the X-Wing key size: %v", dir, err)
+	}
+	declared := map[string]string{}
+	fileSet := token.NewFileSet()
+	read := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(dir, name))
+		parsed, err := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		read++
+		declarationsIn(parsed, path, declared)
+	}
+	if read == 0 {
+		t.Fatalf("no non test go file was read out of %s, so this gate scanned nothing and would report a clean bill over any declaration at all",
+			dir)
+	}
+	found := map[string]string{}
+	for name, file := range declared {
+		if strings.Contains(strings.ToLower(name), "xwing") {
+			found[name] = file
+		}
+	}
+	return found
+}
+
+// Every X-Wing named declaration of this package and of ../message, with what each one is.
+//
+// This is a table and it is held to the derived set in BOTH directions below, which is what
+// makes it a classification rather than a list: a new one cannot land without being written
+// down here, and one written down here cannot survive the declaration going away.
+//
+// The reason it is worth a gate at all is that XwingPublicKeyLen has no compile time pin across
+// the package boundary and will not have one until p2 task 22 lands message.XwingPublicKeySize
+// and the assertion that the two agree. Until then the only thing holding the number is the
+// derivation against crypto/mlkem and crypto/ecdh in
+// TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded, which is real but says nothing about
+// a second copy. So the commit that lands the second copy fails here, and the message it fails
+// with is what to do about it.
+var xwingNamedDeclarationsOfBothPackages = map[string]string{
+	"AlgIdXwing":        "the wrap KEM code point, 0x0014, and not a size",
+	"XwingPublicKeyLen": "the encapsulation key size, derived against crypto/mlkem and crypto/ecdh by TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded",
+}
+
+// TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere fails on the commit
+// that lands a second statement of the X-Wing key size, which is the commit where the pin
+// between the two has to be written.
+//
+// It is the shape TestNoValidationOwnedNameHasLandedBesideItsStandIn uses for the same problem:
+// something is owed by another plan, nothing in this package can see whether it has arrived, and
+// the reminder has to fail rather than log. A gate that logged "still owed" would go on logging
+// it after the copy landed with a digit wrong.
+//
+// What a reader of a failure here should do: if the new name states the X-Wing encapsulation key
+// size, it is p2 task 22's subject -- write the compile assertion that it equals
+// XwingPublicKeyLen, in the package that may import both, and then classify it here. If it
+// states something else about X-Wing -- a ciphertext size, a shared secret size, another code
+// point -- classify it here and it is no longer this gate's business.
+func TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere(t *testing.T) {
+	found := map[string]string{}
+	for _, dir := range []string{".", messagePackageDir} {
+		for name, file := range xwingNamedDeclarationsIn(t, dir) {
+			found[name] = file
+		}
+	}
+	if file, declared := found["XwingPublicKeyLen"]; !declared || file != "extension.go" {
+		t.Fatalf("the scan of . and %s read %v, and XwingPublicKeyLen is not in extension.go among them; it certainly is, so this scan is reading something other than these two packages",
+			messagePackageDir, slices.Sorted(maps.Keys(found)))
+	}
+	for _, name := range slices.Sorted(maps.Keys(found)) {
+		if _, classified := xwingNamedDeclarationsOfBothPackages[name]; !classified {
+			t.Errorf("%s declares %s and xwingNamedDeclarationsOfBothPackages does not classify it. If it states the X-Wing encapsulation key size, this is the commit that owes the compile assertion pinning it to mls.XwingPublicKeyLen (%d) -- p2 task 22 -- because nothing in this tree checks the two against each other. If it states something else about X-Wing, classify it there and this gate is done with it",
+				found[name], name, XwingPublicKeyLen)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(xwingNamedDeclarationsOfBothPackages)) {
+		if _, declared := found[name]; !declared {
+			t.Errorf("xwingNamedDeclarationsOfBothPackages classifies %s and neither this package nor %s declares it, so this table is describing a tree that no longer exists",
+				name, messagePackageDir)
+		}
+	}
 }

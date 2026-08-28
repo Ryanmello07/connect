@@ -191,6 +191,17 @@ var errMissingRequiredCapability = errors.New("mls: leaf does not support a requ
 // empty vectors requires nothing of a member, and no required_capabilities at all is what a
 // group that never set one looks like. Those are the same nil in Go and different bytes on the
 // wire, and the wire is what everything downstream is signed over.
+//
+// What comes back is a VIEW of the entry's body and not a copy of it, so it shares storage
+// with the vector the caller handed in and changes when that vector changes. That is the right
+// default for a lookup -- copying every body on the way past charges every caller for the one
+// that keeps its answer -- but it means the []byte this hands back is not safe to hold across
+// a mutation of the leaf it was read out of. The copy happens one step later: every
+// ParseXExtension of this package copies what it keeps out of the bytes it was given, so the
+// PARSED structure is the thing that is safe to hold.
+// TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes states that over the whole
+// documented path rather than over the parse alone, because the doc on LeafKeysExtension sends
+// its reader through this lookup first.
 func FindExtension(exts []Extension, t ExtensionType) ([]byte, bool) {
 	for i := range exts {
 		if exts[i].ExtensionType == t {
@@ -468,10 +479,18 @@ const AlgIdXwing uint16 = 0x0014
 // TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded, because both documents are prose
 // this package could copy a digit wrong out of and neither fails when it does.
 //
-// It is duplicated from message.XwingPublicKeySize on purpose and in one direction only,
-// because mls must not import message. The crypto plan carries the compile assertion that the
-// two agree; nothing in THIS package can see a disagreement, which is why the derivation above
-// is here rather than left to that assertion.
+// It will be duplicated in ../message on purpose and in one direction only, because mls must
+// not import message. That copy has NOT landed: no XwingPublicKeySize is declared anywhere in
+// this tree, and neither is the compile assertion p2 task 22 is titled after, so at this
+// moment there is no cross package pin on this number at all. Which is exactly why the
+// derivation above is stated here, against crypto/mlkem and crypto/ecdh, rather than left to
+// an assertion nobody has written yet.
+//
+// The pin is not left to anybody's memory either.
+// TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere derives every
+// X-Wing named declaration of this package and of ../message and fails on the commit that
+// lands a second statement of this size, which is the commit where the assertion has to be
+// written.
 const XwingPublicKeyLen = 1216
 
 // LeafKeysExtension is the body of urmessage_leaf_keys, extension type 0xF002, MASTER
@@ -489,21 +508,36 @@ const XwingPublicKeyLen = 1216
 // FOR THE READER ARRIVING WITH wrap.go IN HAND. This is where a device's X-Wing wrap target
 // comes from, and there are four things to know before reading one off a leaf:
 //
-//   - Get the bytes with FindExtension(leaf.Extensions, ExtensionTypeUrmessageLeafKeys) and
-//     hand them to ParseLeafKeysExtension. FindExtension answers the FIRST entry of that type
-//     and a vector may legally hold two; refusing a repeat is ValSem209's job at validation,
-//     not this codec's, so found does not mean unique.
+//   - Find the ENTRY with FindExtension(leaf.Extensions, ExtensionTypeUrmessageLeafKeys) and
+//     hand the whole Extension to ParseLeafKeysFrom. Not its body to ParseLeafKeysExtension:
+//     ParseLeafKeysFrom is the only one of the two that is given the tag and so the only one
+//     that can check it. FindExtension answers the FIRST entry of that type and a vector may
+//     legally hold two; refusing a repeat is ValSem209's job at validation, not this codec's,
+//     so found does not mean unique.
 //   - A parsed DeviceXwingPub is a fresh copy, never a view into the leaf's bytes, so wrapping
 //     to it cannot be perturbed by whoever owns that buffer. The reverse also holds: a
 //     DeviceXwingPub handed to Encode is copied into the extension body, so mutating that
-//     slice afterwards does not change an Extension already produced.
+//     slice afterwards does not change an Extension already produced. The LOOKUP in front of
+//     the parse copies nothing, though -- FindExtension answers a view of the caller's vector
+//     -- so what is safe to hold is the parsed structure and not the []byte it came from.
 //   - Every value that comes back has already been refused unless alg_id is AlgIdXwing and
 //     len(DeviceXwingPub) is exactly XwingPublicKeyLen. Neither needs re-checking, and a
 //     length check written against a different constant is how the two come to drift. What is
 //     still owed is the KEM's own validation of the key: a 1216 byte string is not necessarily
 //     a well formed X-Wing encapsulation key.
-//   - There is no way to get the body bytes on their own. Encode returns the whole Extension,
-//     tag and all, so no call site can pair this body with another extension's type.
+//   - The tag and the body are paired by this package on both sides, and neither pairing is
+//     enforced by the type system. Extension is a plain struct with two exported fields, so
+//     ext.ExtensionData is one field access away and
+//     Extension{ExtensionTypeUrmessageGroupPolicy, thatBody} is a composite literal built out
+//     of exported API alone -- it encodes, it signs, it travels, and it decodes at the far end
+//     as a group policy nobody can read. No result type prevents that. What this package
+//     promises is narrower and is what is actually worth relying on: it never HANDS OUT a
+//     loose body, since Encode answers the tag and the body already assembled and
+//     TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn keeps a later
+//     convenience from adding one; and it refuses to READ a body back under any other tag,
+//     which is ParseLeafKeysFrom. Pull an untagged body out of an Extension yourself and both
+//     promises are off, because ParseLeafKeysExtension parses whatever it is handed and never
+//     sees a tag at all.
 //
 // Extension.ExtensionData is opaque, so a concrete extension body converts bytes to and from a
 // struct rather than implementing MarshalMLS and UnmarshalMLS. That is one of the two
@@ -520,14 +554,22 @@ type LeafKeysExtension struct {
 
 // Encode returns the whole Extension: the 0xF002 tag and the encoded body together.
 //
-// Returning the Extension rather than the body's bytes is the guarantee this shape exists to
-// give, and it is a guarantee rather than a convention because the alternative is reachable by
-// accident. A body returned as a byte slice is a value a caller pairs with a tag of its own
-// choosing, and that choice is one identifier away from ExtensionTypeUrmessageGroupPolicy --
-// which encodes, signs and travels, and is refused by the first peer that tries to read a
-// group policy out of an X-Wing key. Handing back the pair already assembled removes the
-// choice. TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn is what keeps a
-// later convenience from adding it back.
+// Returning the Extension rather than the body's bytes is what this shape exists to give, and
+// the reason is that the alternative is reachable by ACCIDENT. A body returned as a byte slice
+// is a value a caller pairs with a tag of its own choosing, and that choice is one identifier
+// away from ExtensionTypeUrmessageGroupPolicy -- which encodes, signs and travels, and is
+// refused by the first peer that tries to read a group policy out of an X-Wing key. Handing
+// back the pair already assembled keeps that mistake off the path of a caller doing the
+// ordinary thing, and TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn keeps a
+// later convenience from putting it back on that path.
+//
+// It is not, and cannot be, a guarantee that the two never come apart. Extension's fields are
+// exported because the codec needs them to be, so the loose body is a field access and the
+// mismatched pair is a three line composite literal; a result type cannot prevent that and
+// this one does not. What closes the loop is the read side refusing what the write side would
+// never produce: ParseLeafKeysFrom is handed the whole Extension and refuses every tag but
+// this one, and TestEveryExtensionBodyRefusesAnEntryCarryingAnyTagButItsOwn holds it to that
+// over the whole uint16 space rather than over the neighbours somebody thought of.
 //
 // Both refusals are ErrLeafKeysExtensionInvalid and both are made before anything is written,
 // so a refused body never reaches a Writer and can never be half encoded into one the caller
@@ -567,6 +609,14 @@ func (self *LeafKeysExtension) Encode() (Extension, error) {
 // is deliberate: ErrTrailingBytes says the sender and this package disagree about the
 // encoding, ErrLeafKeysExtensionInvalid says they agree about it and this profile cannot act
 // on what it says, and the second is only meaningful once the first has been ruled out.
+//
+// It is handed the body and not the entry, so it never sees the extension type those bytes
+// arrived under and cannot refuse a wrong one: a urmessage_group_policy entry whose body
+// happens to be a well formed leaf keys body parses cleanly here and answers a wrap target.
+// That is what ParseLeafKeysFrom is for, and why the briefing on LeafKeysExtension sends its
+// reader there instead. This entry point stays exported because the decode side's own two
+// refusals have to be reachable from a body a PEER sent -- which arrives as bytes, from a
+// profile this one does not implement, and not as an Extension this package built.
 func ParseLeafKeysExtension(data []byte) (*LeafKeysExtension, error) {
 	r := syntax.NewReader(data)
 	algId, err := r.ReadUint16()
@@ -588,4 +638,32 @@ func ParseLeafKeysExtension(data []byte) (*LeafKeysExtension, error) {
 			ErrLeafKeysExtensionInvalid, len(pub), XwingPublicKeyLen)
 	}
 	return &LeafKeysExtension{AlgId: algId, DeviceXwingPub: pub}, nil
+}
+
+// ParseLeafKeysFrom decodes one extensions<V> entry as an urmessage_leaf_keys body, refusing
+// any entry that is not tagged ExtensionTypeUrmessageLeafKeys.
+//
+// This is the read side counterpart to Encode, and the pair is the whole of what this package
+// can say about the tag: Encode never emits a body without its own tag on it, and this never
+// accepts a body under anybody else's. Neither half is enforced by the type system -- Extension
+// carries two exported fields and a caller can assemble any pair it likes -- so what the pair
+// buys is that the mistake cannot be made by a caller using the package as documented, and
+// cannot survive being read back by one.
+//
+// ParseLeafKeysExtension is the half with no tag to check, and a caller who reaches for it with
+// bytes it pulled out of an Extension itself has stepped outside both halves. What that
+// produces is not a parse error anywhere: it is a wrap target read out of whatever extension
+// happened to be sitting in that slot, and a commit secret wrapped to it goes to nobody.
+//
+// The refusal is ErrLeafKeysExtensionInvalid, the same sentinel the body's own two refusals
+// carry, because every caller here is asking one question -- is there a leaf keys body I can
+// act on -- and an entry of the wrong type answers it exactly as an alg_id this profile cannot
+// wrap to does. The detail names the type that was found, since a caller told only that the
+// entry was wrong has to go and look.
+func ParseLeafKeysFrom(ext Extension) (*LeafKeysExtension, error) {
+	if ext.ExtensionType != ExtensionTypeUrmessageLeafKeys {
+		return nil, fmt.Errorf("%w: extension type %#04x is not urmessage_leaf_keys",
+			ErrLeafKeysExtensionInvalid, uint16(ext.ExtensionType))
+	}
+	return ParseLeafKeysExtension(ext.ExtensionData)
 }

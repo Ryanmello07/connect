@@ -128,20 +128,42 @@ func keyScheduleIsCodecEntryPoint(name string) bool {
 //
 // The exemption is over the PAIR and not over the Parse name, which is the difference between
 // a guarantee and a naming convention. A ParseFooExtension is waved through only when Foo's own
-// Encode answers an Extension -- tag and body together, so no call site can pair that body with
-// another extension's type -- and only when the Parse names the type it answers and takes
-// nothing but the bytes. An Encode answering []byte hands the tag choice back to the caller and
-// exempts nothing; a Parse whose name does not name its own result is not the pair either. The
-// control below declares one of each, so an exemption that widened to cover them fails there
-// rather than in a review.
+// Encode answers an Extension -- tag and body together, so the package never hands a loose body
+// to a call site that could pair it with another extension's type -- and only when the Parse
+// names the type it answers and takes nothing but the bytes. An Encode answering []byte hands
+// the tag choice back to the caller and exempts nothing; a Parse whose name does not name its
+// own result is not the pair either. The control below declares one of each, so an exemption
+// that widened to cover them fails there rather than in a review.
+//
+// There are TWO sanctioned read side spellings and not one, and the second is exempt on a
+// stricter reading than the first. ParseLeafKeysFrom is handed the whole Extension and answers
+// the body, so the tag is in its hands and it is the only entry point that can refuse a body
+// arriving under the wrong one. That shape carries no byte run in its signature at all, so it
+// is not a byte level codec by any reading and only the NAME rule here was ever going to
+// object to it. The body it belongs to is therefore read off its RESULT rather than off its
+// name -- what sanctions the shape is the types, not what somebody called it -- and the near
+// miss the control declares is the same shape answering a structure that is not an extension
+// body, which is a second decoder for something whose codec is syntax.Unmarshal.
 func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string, bodies []string) []string {
 	exempt := map[string]bool{}
 	for _, one := range declaredIn(parsed) {
-		if one.receiver != "" || !slices.Contains(bodies, strings.TrimPrefix(one.name, "Parse")) {
+		if one.receiver != "" || !strings.HasPrefix(one.name, "Parse") {
 			continue
 		}
-		body := strings.TrimPrefix(one.name, "Parse")
-		if slices.Equal(one.params, []string{"[]byte"}) && slices.Equal(one.results, []string{"*" + body, "error"}) {
+		// the bytes taking half: the name states the body it answers, and it is handed
+		// nothing but that body's bytes
+		if body := strings.TrimPrefix(one.name, "Parse"); slices.Contains(bodies, body) &&
+			slices.Equal(one.params, []string{"[]byte"}) &&
+			slices.Equal(one.results, []string{"*" + body, "error"}) {
+			exempt[one.name] = true
+			continue
+		}
+		// the tag checked half: handed the whole entry and answering one of the derived
+		// body types, with no byte run anywhere in the signature
+		if len(one.results) == 2 && one.results[1] == "error" &&
+			slices.Equal(one.params, []string{"Extension"}) &&
+			strings.HasPrefix(one.results[0], "*") &&
+			slices.Contains(bodies, strings.TrimPrefix(one.results[0], "*")) {
 			exempt[one.name] = true
 		}
 	}
@@ -356,13 +378,21 @@ func NewGroupContext(groupId []byte, epoch uint64, treeHash []byte) *GroupContex
 }
 
 // the second sanctioned exception: an extension body, whose Encode answers the whole
-// Extension rather than the body's bytes, paired with the Parse spelling that names the
-// type it answers. Neither of these two may be reported.
+// Extension rather than the body's bytes, paired with the two Parse spellings that read it
+// back -- the one handed the body's bytes, and the one handed the whole entry so that it
+// has the tag to check. None of these three may be reported.
 type LeafKeysExtension struct{}
 
 func (self *LeafKeysExtension) Encode() (Extension, error) { return Extension{}, nil }
 
 func ParseLeafKeysExtension(data []byte) (*LeafKeysExtension, error) { return nil, nil }
+
+func ParseLeafKeysFrom(ext Extension) (*LeafKeysExtension, error) { return nil, nil }
+
+// the near miss the tag checked exemption must not cover: the same shape answering a
+// structure that is not an extension body at all, which is a second decoder for a type
+// whose codec is syntax.Unmarshal. Reported.
+func ParseGroupContextFrom(ext Extension) (*GroupContext, error) { return nil, nil }
 
 // the near miss the exemption must not cover: an Encode that answers the body's bytes
 // instead of the Extension, which is the tag choice handed back to the caller and is the
@@ -396,6 +426,7 @@ var keyScheduleCodecControlWrappers = []string{
 	"MarshalExtensions",
 	"ParseExtensions",
 	"ParseGroupContext",
+	"ParseGroupContextFrom",
 	"ParseGroupPolicyExtension",
 	"ParseOwnerSuccessorExtension",
 	"ParsePreSharedKeyId",

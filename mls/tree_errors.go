@@ -128,6 +128,13 @@ var (
 	// XwingPublicKeyLen bytes, or trailing bytes after the body. The length is the part that
 	// matters most -- a short X-Wing key is not a weaker key, it is a key the KEM will refuse
 	// or, worse, one whose classical half was truncated away.
+	//
+	// It is also what ParseLeafKeysFrom answers for an extensions vector entry carrying some
+	// other type's tag. One sentinel and not two, because the question every caller of that
+	// entry point is asking is "is there a leaf keys body here I can wrap to", and an entry
+	// tagged urmessage_group_policy answers it exactly as an unimplemented alg_id does. A
+	// second sentinel would split one refusal across two names and leave every caller that
+	// matched the wrong one silently accepting the other.
 	ErrLeafKeysExtensionInvalid = errors.New("mls: urmessage_leaf_keys extension is invalid")
 
 	// ErrNoPathSecret is returned when a TreeKEMPrivate holds no path secret for a node it is
