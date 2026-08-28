@@ -539,3 +539,32 @@ func (self *RatchetTree) UnmergedLeaves(x NodeIndex) []LeafIndex {
 }
 
 var _ NodeShape = (*RatchetTree)(nil)
+
+// Resolution is RFC 9420 section 7.5, delegated to the tree math plan against this tree's own
+// NodeShape. A non-blank node resolves to itself followed by its unmerged leaves, a blank leaf
+// to nothing at all, and a blank parent to its left child's resolution followed by its right
+// child's.
+//
+// This is a convenience and not a second algorithm. There is exactly one resolution walk in this
+// implementation and it lives in tree_math.go, because the answer decides WHO a path secret is
+// encrypted to: a second walk that agreed with the first about most trees would put a member who
+// was removed back into the list a secret is sealed to, which no round trip and no tree hash
+// notices.
+//
+// The error is dropped, and dropping it is a decision about the CALLERS rather than about the
+// error. Resolution's single failure is an x outside the node width -- its other refusals are
+// unreachable from a real tree, since a shape held by a RatchetTree always has a leaf count in
+// range and an unmerged leaf inside it -- and every call site of this method has already bounded
+// x, because it came out of a direct path, a copath or a root of this same tree. What comes back
+// for an out-of-range x is the EMPTY list rather than a nil, which is the same shape an accepted
+// empty resolution has, so the two are deliberately not distinguishable here: a caller that needs
+// to tell them apart is a caller that has not bounded its index, and it must call the free
+// Resolution(self, x) and answer the error. Task 16's EncryptionTargets and FilteredDirectPath
+// are exactly those callers.
+func (self *RatchetTree) Resolution(x NodeIndex) []NodeIndex {
+	out, err := Resolution(self, x)
+	if err != nil {
+		return []NodeIndex{}
+	}
+	return out
+}

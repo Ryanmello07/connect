@@ -20,6 +20,7 @@ package mls
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -2198,5 +2199,542 @@ func TestEveryKeyQuestionTheRatchetTreeAnswersComparesInConstantTime(t *testing.
 			t.Errorf("%s reaches no %s; a function that answers a question about a key without comparing it in constant time is not answering it safely",
 				one.name, theSanctionedComparison())
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// node resolution -- RFC 9420 section 7.5
+// ---------------------------------------------------------------------------
+//
+// Resolution decides WHO a path secret is encrypted to, so the two directions it can be wrong in
+// are not symmetric. Too small and a member who should have been sent the secret is not, which
+// is loud -- that member cannot decrypt the next commit and says so. Too large and a member who
+// should NOT have been sent it is, which is silent, and the member reading it is one the group
+// removed. The clause that produces the silent direction is the unmerged-leaf clause, and the
+// clause that produces the quiet-until-interop direction is the ORDER: TreeKEM pairs the entries
+// of a resolution positionally with the ciphertexts of an UpdatePath, so a permuted resolution
+// seals every secret to the wrong member while having exactly the right members in it.
+//
+// So nothing below compares two resolutions as sets, and nothing sorts one before comparing.
+// equalNodeIndices is elementwise and length-first, and the sweeps compare against a recursion
+// written from the RFC's own words rather than against a second reading of the code under test.
+
+// equalNodeIndices is elementwise and never a set comparison, for the reason above: the order of
+// a resolution is the contract and not a detail of it, and reflect.DeepEqual over a sorted copy
+// -- or a subset test -- passes every permutation there is.
+func equalNodeIndices(a, b []NodeIndex) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// rfcResolution is RFC 9420 section 7.5 written as the recursion the RFC states, as the
+// independent second reading every sweep below compares against.
+//
+// A different SHAPE and not a paraphrase. The implementation under test walks an explicit stack
+// so a deep tree cannot become deep Go stack, and the subtle part of that version is the push
+// order -- right child pushed first so the left is popped first -- which a recursion states
+// directly and cannot get wrong the same way. A reference transcribed from the implementation
+// would agree with it about a reversed descent, a dropped unmerged list and an inverted blank
+// test alike, which is the whole of what these sweeps are for.
+//
+// The unreachable arms panic rather than answering an empty list. A node that is not a leaf has
+// both children at every representable index, so a refusal from Left or Right here is this
+// helper being asked something it was never given -- and an empty answer would be a resolution
+// that silently lost a whole subtree, which is the exact defect the sweep is looking for.
+func rfcResolution(shape NodeShape, x NodeIndex) []NodeIndex {
+	if !shape.IsBlank(x) {
+		out := []NodeIndex{x}
+		for _, leaf := range shape.UnmergedLeaves(x) {
+			out = append(out, leaf.NodeIndex())
+		}
+		return out
+	}
+	if x.IsLeaf() {
+		return []NodeIndex{}
+	}
+	left, err := Left(x)
+	if err != nil {
+		panic("rfcResolution: a parent node with no left child: " + err.Error())
+	}
+	right, err := Right(x)
+	if err != nil {
+		panic("rfcResolution: a parent node with no right child: " + err.Error())
+	}
+	return append(rfcResolution(shape, left), rfcResolution(shape, right)...)
+}
+
+func TestResolutionRules(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 4)
+	root, err := rootOf(tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("rootOf: %v", err)
+	}
+
+	// all parents blank: the root resolves to the four leaves, left to right.
+	got := tree.Resolution(root)
+	want := []NodeIndex{0, 2, 4, 6}
+	if !equalNodeIndices(got, want) {
+		t.Fatalf("blank-parent root resolution = %v, want %v", got, want)
+	}
+
+	// a blank leaf contributes nothing.
+	if err := tree.Blank(NodeIndex(2)); err != nil {
+		t.Fatalf("Blank: %v", err)
+	}
+	got = tree.Resolution(root)
+	want = []NodeIndex{0, 4, 6}
+	if !equalNodeIndices(got, want) {
+		t.Fatalf("with leaf 1 blank, root resolution = %v, want %v", got, want)
+	}
+	if len(tree.Resolution(NodeIndex(2))) != 0 {
+		t.Fatalf("a blank leaf must resolve to the empty list")
+	}
+
+	// a non-blank parent resolves to itself, then its unmerged leaves in order.
+	if err := tree.SetParent(NodeIndex(1), &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x77}, 32)),
+		UnmergedLeaves: []LeafIndex{0},
+	}); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	got = tree.Resolution(NodeIndex(1))
+	want = []NodeIndex{1, 0}
+	if !equalNodeIndices(got, want) {
+		t.Fatalf("non-blank parent resolution = %v, want %v", got, want)
+	}
+	got = tree.Resolution(root)
+	want = []NodeIndex{1, 0, 4, 6}
+	if !equalNodeIndices(got, want) {
+		t.Fatalf("root resolution = %v, want %v", got, want)
+	}
+
+	// the unmerged half again with a list of more than one, and with a stored order that is not
+	// the ascending one. RFC 9420 section 7.9.2 requires the vector ascending and both halves of
+	// the parent node codec refuse anything else, but the resolution walk reads STORED order and
+	// must not be the place that quietly repairs it: a walk that sorted here would answer a
+	// resolution no peer computes, over a tree every peer would have rejected outright.
+	if err := tree.SetParent(NodeIndex(5), &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x88}, 32)),
+		UnmergedLeaves: []LeafIndex{3, 2},
+	}); err != nil {
+		t.Fatalf("SetParent(5): %v", err)
+	}
+	got = tree.Resolution(NodeIndex(5))
+	want = []NodeIndex{5, 6, 4}
+	if !equalNodeIndices(got, want) {
+		t.Fatalf("a parent carrying two unmerged leaves resolved to %v, want %v", got, want)
+	}
+
+	// the method and the free function the tree math plan owns agree, and the free
+	// one is where an out-of-range node index is an error rather than an empty list.
+	got = tree.Resolution(root)
+	free, err := Resolution(tree, root)
+	if err != nil {
+		t.Fatalf("Resolution(tree, root): %v", err)
+	}
+	if !equalNodeIndices(free, got) {
+		t.Fatalf("the method and the free function disagree: %v vs %v", got, free)
+	}
+	if _, err := Resolution(tree, NodeIndex(tree.NodeWidth())); err == nil {
+		t.Fatalf("Resolution past the node width returned no error")
+	}
+}
+
+// TestTheResolutionMethodDropsTheErrorOnlyWhereTheFreeFunctionRefuses pins the one decision this
+// task's method makes.
+//
+// The method answers the empty list for an out-of-range index, and an accepted empty resolution
+// is also the empty list, so the two are not distinguishable through it -- that is the whole of
+// what dropping the error costs, and it is only sound if the method and the free function agree
+// everywhere the free function accepts. A method that had quietly grown a second opinion about
+// any in-range node would be a second resolution algorithm, which is the thing this section's
+// header says must not exist.
+func TestTheResolutionMethodDropsTheErrorOnlyWhereTheFreeFunctionRefuses(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 5)
+	if err := tree.SetParent(NodeIndex(3), &ParentNode{
+		EncryptionKey:  HpkePublicKey(repeatByte(0x91, 32)),
+		UnmergedLeaves: []LeafIndex{1, 3},
+	}); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	refused := 0
+	// past the width as well as inside it, so both arms of the method are taken
+	for x := uint32(0); x < tree.NodeWidth()+4; x += 1 {
+		free, err := Resolution(tree, NodeIndex(x))
+		method := tree.Resolution(NodeIndex(x))
+		if err != nil {
+			refused += 1
+			if method == nil {
+				t.Errorf("the method answered nil rather than the empty list for the refused index %d", x)
+			}
+			if len(method) != 0 {
+				t.Errorf("the free function refused index %d and the method answered %v", x, method)
+			}
+			continue
+		}
+		if !equalNodeIndices(method, free) {
+			t.Errorf("at node %d the method answered %v and the free function %v", x, method, free)
+		}
+	}
+	if refused != 4 {
+		t.Fatalf("the free function refused %d of the indices past the width, want 4", refused)
+	}
+}
+
+// resolutionUnmergedRule is one way of hanging an unmerged list on every parent of a sweep tree.
+//
+// The rules are DERIVED from each node's own subtree rather than written out as literal lists,
+// so the same rule applies at every node of every width and the sweep does not depend on somebody
+// having remembered which nodes to decorate. RFC 9420 section 7.9 requires a node's unmerged
+// leaves to be non-blank leaves inside its own subtree; the sweep respects the subtree half,
+// since a leaf outside it would be a tree no validator accepts, and deliberately does not
+// respect the non-blank half, because whether an unmerged leaf happens to be blank changes
+// nothing about section 7.5's rule and a resolution walk that started caring would be a walk
+// doing section 7.9's job in the wrong place.
+type resolutionUnmergedRule struct {
+	name  string
+	apply func(x NodeIndex) []LeafIndex
+}
+
+func resolutionUnmergedRules() []resolutionUnmergedRule {
+	return []resolutionUnmergedRule{
+		{
+			// the half of the class every "nobody has been added since the last commit" test
+			// lives in, and the half a walk that forgot unmerged leaves entirely still passes
+			name:  "no unmerged leaves",
+			apply: func(x NodeIndex) []LeafIndex { return nil },
+		},
+		{
+			// the widest list a node can carry, so the resolution of a non-blank parent is
+			// longer than the resolution of the whole subtree below it
+			name:  "every leaf of the subtree",
+			apply: func(x NodeIndex) []LeafIndex { return subtreeLeavesWhere(x, 1, 0) },
+		},
+		{
+			// a list that is neither empty nor everything, and whose entries interleave with
+			// the nodes a blank descent would have produced
+			name:  "every other leaf of the subtree",
+			apply: func(x NodeIndex) []LeafIndex { return subtreeLeavesWhere(x, 2, 0) },
+		},
+		{
+			// the one entry list, and the one entry chosen so the resolution is NOT in
+			// ascending node index order: the first leaf of a subtree sits below the node
+			// heading it, so a node carrying it resolves to [x, something smaller]. That is
+			// figure 10 of RFC 9420, whose [X, B] is [3, 2], and it is the shape a comparison
+			// that sorted before comparing would stop being able to see. The LAST leaf of a
+			// subtree has a node index above its head and would have made every answer here
+			// ascending, which is worth writing down because it is the version this rule was
+			// first written as.
+			name: "the first leaf of the subtree",
+			apply: func(x NodeIndex) []LeafIndex {
+				first, _ := SubtreeLeaves(x)
+				return []LeafIndex{first}
+			},
+		},
+	}
+}
+
+// subtreeLeavesWhere is every leaf under x whose offset within the subtree is congruent to
+// offset modulo step, ascending -- which is what RFC 9420 section 7.9.2 requires an
+// unmerged_leaves vector to be.
+func subtreeLeavesWhere(x NodeIndex, step uint32, offset uint32) []LeafIndex {
+	first, last := SubtreeLeaves(x)
+	out := []LeafIndex{}
+	for leaf := uint32(first); leaf <= uint32(last); leaf += 1 {
+		if (leaf-uint32(first))%step == offset {
+			out = append(out, LeafIndex(leaf))
+		}
+	}
+	return out
+}
+
+// resolutionSweep builds one tree of the given leaf width and walks every blanking pattern of
+// its node array, handing each pattern to visit.
+//
+// EVERY pattern and not a sample: a resolution defect lives in the relationship between a node's
+// blankness and its children's, so which positions are blank is the input, and a sweep that
+// picked a few trees would be picking a few of exactly the thing under test. Two to the node
+// width is 32,768 at eight leaves, which is the whole space at every width this runs at.
+//
+// The node array is written directly rather than through SetLeaf and SetParent. Those copy the
+// node they are handed, deliberately and for a reason recorded on them, and this sweep would
+// spend two million clones on it; what the resolution walk reads is IsBlank, LeafCount and
+// UnmergedLeaves, and all three read this array. The nodes are built once per rule.
+func resolutionSweep(t *testing.T, leafWidth uint32, rule resolutionUnmergedRule,
+	visit func(tree *RatchetTree, pattern uint32)) {
+	t.Helper()
+	nodeWidth := NodeWidth(LeafCount(leafWidth))
+	if nodeWidth == 0 || nodeWidth > 20 {
+		t.Fatalf("a sweep over %d leaves is %d nodes, which is not a space to enumerate", leafWidth, nodeWidth)
+	}
+	filled := make([]*Node, nodeWidth)
+	for x := uint32(0); x < nodeWidth; x += 1 {
+		node := NodeIndex(x)
+		if node.IsLeaf() {
+			filled[x] = &Node{NodeType: NodeTypeLeaf, Leaf: testTreeLeaf(x / 2)}
+			continue
+		}
+		filled[x] = &Node{NodeType: NodeTypeParent, Parent: &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(byte(0xd0+x), 32)),
+			UnmergedLeaves: rule.apply(node),
+		}}
+	}
+	tree := &RatchetTree{nodes: make([]*Node, nodeWidth)}
+	for pattern := uint32(0); pattern < uint32(1)<<nodeWidth; pattern += 1 {
+		for x := uint32(0); x < nodeWidth; x += 1 {
+			if pattern>>x&1 == 1 {
+				tree.nodes[x] = filled[x]
+			} else {
+				tree.nodes[x] = nil
+			}
+		}
+		visit(tree, pattern)
+	}
+}
+
+// TestResolutionAgreesWithTheRfcRecursionOverEveryBlankingPattern is the derived half of this
+// task: every blanking pattern of every node of every small tree, under four rules for the
+// unmerged lists, against the recursion RFC 9420 section 7.5 states.
+//
+// Derived over the blank positions rather than sampled, because the blank positions ARE the
+// input to a resolution: which node is blank decides whether the walk emits it or descends past
+// it, and a test that blanked three positions somebody chose is a test of those three. At one,
+// two and four leaves this is the entire space; at eight leaves it is the entire space of the
+// two rules that bracket the unmerged clause -- none at all, and the widest list a node can
+// carry -- which is what keeps the run inside a few seconds while still covering every shape.
+//
+// A resolution longer than one is counted, and required, so this cannot pass over a run in which
+// every answer was the empty list.
+func TestResolutionAgreesWithTheRfcRecursionOverEveryBlankingPattern(t *testing.T) {
+	rules := resolutionUnmergedRules()
+	compared := 0
+	nonEmpty := 0
+	for _, leafWidth := range []uint32{1, 2, 4, 8} {
+		for ruleIndex, rule := range rules {
+			// eight leaves is 32,768 patterns per rule, so it runs the first and the last rule
+			// -- the empty list and the widest one -- rather than all four
+			if leafWidth == 8 && ruleIndex != 0 && ruleIndex != 1 {
+				continue
+			}
+			nodeWidth := NodeWidth(LeafCount(leafWidth))
+			resolutionSweep(t, leafWidth, rule, func(tree *RatchetTree, pattern uint32) {
+				for x := uint32(0); x < nodeWidth; x += 1 {
+					got := tree.Resolution(NodeIndex(x))
+					want := rfcResolution(tree, NodeIndex(x))
+					compared += 1
+					if len(got) > 0 {
+						nonEmpty += 1
+					}
+					if !equalNodeIndices(got, want) {
+						t.Fatalf("%d leaves, %s, pattern %0*b: Resolution(%d) = %v, and the RFC recursion says %v",
+							leafWidth, rule.name, int(nodeWidth), pattern, x, got, want)
+					}
+				}
+			})
+		}
+	}
+	// the space, written down rather than derived from the loop that walked it: one leaf is 1
+	// node over 2 patterns, two leaves 3 over 8 and four leaves 7 over 128, each under all four
+	// rules, which is 3,688; eight leaves is 15 nodes over 32,768 patterns under two rules,
+	// which is 983,040.
+	if compared != 986728 {
+		t.Fatalf("the sweep made %d comparisons and the space it walks is 986728", compared)
+	}
+	if nonEmpty*4 < compared {
+		t.Fatalf("only %d of %d resolutions were non-empty, so most of this sweep compared nothing against nothing",
+			nonEmpty, compared)
+	}
+}
+
+// TestAResolutionIsOftenNotInAscendingNodeOrder is the guard that makes every comparison in this
+// file worth making.
+//
+// A resolution ascends by node index everywhere EXCEPT at an unmerged leaf, which follows
+// immediately behind the node carrying it and is often below it -- figure 10 of RFC 9420 has
+// [X, B], which is [3, 2]. If that never happened, a test comparing two resolutions as sets, or
+// sorting them before comparing, would be indistinguishable from one comparing them elementwise,
+// and the sweep above would pass every permutation there is. So the case is counted rather than
+// assumed, and a sweep that stopped producing it fails here.
+func TestAResolutionIsOftenNotInAscendingNodeOrder(t *testing.T) {
+	rules := resolutionUnmergedRules()
+	rule := rules[len(rules)-1]
+	if rule.name != "the first leaf of the subtree" {
+		t.Fatalf("this test is written against the one entry rule and the last rule is %q", rule.name)
+	}
+	nodeWidth := NodeWidth(LeafCount(4))
+	longEnough := 0
+	outOfOrder := 0
+	resolutionSweep(t, 4, rule, func(tree *RatchetTree, pattern uint32) {
+		for x := uint32(0); x < nodeWidth; x += 1 {
+			got := tree.Resolution(NodeIndex(x))
+			if len(got) < 2 {
+				continue
+			}
+			longEnough += 1
+			if slices.IsSorted(got) {
+				continue
+			}
+			outOfOrder += 1
+			// and the consequence stated rather than implied: the sorted copy is a DIFFERENT
+			// list, so a comparison that sorted first would have accepted an answer that seals
+			// each path secret to the wrong member
+			sorted := slices.Clone(got)
+			slices.Sort(sorted)
+			if equalNodeIndices(sorted, got) {
+				t.Fatalf("pattern %0*b: %v is reported out of order and equals its own sorted form",
+					int(nodeWidth), pattern, got)
+			}
+		}
+	})
+	if longEnough == 0 {
+		t.Fatal("no resolution in the sweep held more than one node, so order was never observable")
+	}
+	if outOfOrder == 0 {
+		t.Fatal("every resolution in the sweep was in ascending node order, so a set comparison would pass this file")
+	}
+}
+
+// corpusTreeOfShape builds a RatchetTree that is blank exactly where a decoded corpus tree is
+// blank and carries exactly the unmerged lists it carries.
+//
+// Through the shape the tree math plan's decoder already produced, and NOT through a second
+// reading of the corpus bytes. There is one decoder of a published ratchet_tree in this package's
+// tests -- decodeRatchetTreeShape in tree_math_test.go, which walks the presentation language by
+// hand and is independent of this package's own codecs -- and task 11 will add the production
+// one. A third would be two of them able to disagree about a truncation, and the disagreement
+// would show up as this container failing a corpus it actually reproduces.
+//
+// The node CONTENTS are placeholders, because resolution reads three things about a tree and
+// none of them is a key: whether a position is blank, what a parent's unmerged_leaves holds, and
+// how many leaves there are. What this therefore compares is the container's NodeShape against
+// the corpus, which is the seam this task adds and the one seam
+// TestResolutionAgainstPublishedTreeValidationVectors does not cross -- that test runs the same
+// corpus against the decoder's own shape struct, so a RatchetTree whose IsBlank or UnmergedLeaves
+// answered wrongly would pass it and fail here.
+func corpusTreeOfShape(t *testing.T, label string, shape *ratchetTreeShape, width int) *RatchetTree {
+	t.Helper()
+	tree := &RatchetTree{nodes: make([]*Node, width)}
+	for x := uint32(0); x < uint32(width); x += 1 {
+		node := NodeIndex(x)
+		if shape.IsBlank(node) {
+			continue
+		}
+		if node.IsLeaf() {
+			tree.nodes[x] = &Node{NodeType: NodeTypeLeaf, Leaf: testTreeLeaf(x / 2)}
+			continue
+		}
+		tree.nodes[x] = &Node{NodeType: NodeTypeParent, Parent: &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(byte(0xe0+x), 32)),
+			UnmergedLeaves: shape.UnmergedLeaves(node),
+		}}
+	}
+	// the container derives its leaf count from the array it was given and the decoder derived
+	// its own from the wire form, so this is two independent readings of one tree's width rather
+	// than one value compared against itself
+	if tree.LeafCount() != shape.LeafCount() {
+		t.Fatalf("%s: the container reads %d leaves out of a %d node array and the decoder read %d",
+			label, tree.LeafCount(), width, shape.LeafCount())
+	}
+	for x := uint32(0); x < uint32(width); x += 1 {
+		node := NodeIndex(x)
+		if tree.IsBlank(node) != shape.IsBlank(node) {
+			t.Fatalf("%s: node %d is blank=%v in the container and blank=%v in the decoded shape",
+				label, x, tree.IsBlank(node), shape.IsBlank(node))
+		}
+		if !slices.Equal(tree.UnmergedLeaves(node), shape.UnmergedLeaves(node)) {
+			t.Fatalf("%s: node %d carries %v in the container and %v in the decoded shape",
+				label, x, tree.UnmergedLeaves(node), shape.UnmergedLeaves(node))
+		}
+	}
+	return tree
+}
+
+// TestTheRatchetTreeReproducesEveryPublishedResolution is the independent half of this task: the
+// resolution of every node of every tree the mlswg publishes, computed through the real container
+// and compared against the answer the mlswg publishes for it.
+//
+// Independent in the way the sweeps are not. This implementation and the recursion the sweeps
+// compare against were both written from one reading of section 7.5, so a misreading shared by
+// the two of them survives every sweep in this file; the corpus was produced by implementations
+// that never saw either. Twenty-one of its published resolutions are a node followed by leaves
+// merged into it, so the unmerged clause is exercised by the corpus and not only by fixtures of
+// this file's own making, and seven of them are not in ascending node index order, so an
+// implementation that sorted its answer fails here as well as in the sweep above.
+//
+// Every entry and not only the ciphersuites this package registers, because nothing here does any
+// crypto: a resolution is a function of the tree's SHAPE, so the corpus's seven suites are seven
+// more trees rather than seven key formats, and skipping five of them would be throwing evidence
+// away for no reason. The counts are written down rather than derived from the loop that produced
+// them, and three of the four are the constants the tree math plan already pinned this corpus
+// with, so a corpus update moves one number in one place.
+func TestTheRatchetTreeReproducesEveryPublishedResolution(t *testing.T) {
+	entries := LoadVectorFile(t, treeValidationVectorFile)
+	if len(entries) != treeValidationEntryCount {
+		t.Fatalf("tree-validation entries: %d, want %d", len(entries), treeValidationEntryCount)
+	}
+	compared := 0
+	withUnmerged := 0
+	notAscending := 0
+	for entry, raw := range entries {
+		vector := treeValidationVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("entry %d: %v", entry, err)
+		}
+		label := fmt.Sprintf("tree-validation entry %d", entry)
+		shape, width := decodeRatchetTreeShape(t, label, MustHex(t, vector.Tree))
+		if width != len(vector.Resolutions) {
+			t.Fatalf("%s: node width %d from the tree, %d published resolutions",
+				label, width, len(vector.Resolutions))
+		}
+		tree := corpusTreeOfShape(t, label, shape, width)
+		for x, published := range vector.Resolutions {
+			want := make([]NodeIndex, 0, len(published))
+			for _, node := range published {
+				want = append(want, NodeIndex(node))
+			}
+			got := tree.Resolution(NodeIndex(x))
+			if !equalNodeIndices(got, want) {
+				t.Fatalf("%s: Resolution(%d) = %v, and the corpus publishes %v", label, x, got, want)
+			}
+			compared += 1
+			if len(want) > 1 && want[0] == NodeIndex(x) {
+				withUnmerged += 1
+			}
+			if !slices.IsSorted(want) {
+				notAscending += 1
+			}
+		}
+	}
+	if compared != treeValidationResolutionCount {
+		t.Errorf("compared %d published resolutions, want %d", compared, treeValidationResolutionCount)
+	}
+	// the unmerged half of section 7.5, counted rather than assumed. An implementation that
+	// appended no unmerged leaves at all produces a resolution that is a strict SUBSET of the
+	// right one, and every case where nobody has been added since the last commit still passes
+	// -- so a run of this corpus that reached none of these would be reporting a clean bill over
+	// the one clause that fails silently. The count is the tree math plan's own pin on this
+	// corpus, so the two readings of it have to agree.
+	if withUnmerged != treeValidationUnmergedCount {
+		t.Errorf("%d published resolutions carry a node's unmerged leaves, want %d",
+			withUnmerged, treeValidationUnmergedCount)
+	}
+	if notAscending != 7 {
+		t.Errorf("%d published resolutions are not in ascending node order, want 7; an implementation that sorted its answer would pass a run with none",
+			notAscending)
 	}
 }
