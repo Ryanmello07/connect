@@ -251,8 +251,29 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return values, nil
 		}},
-		// section 7.9's three. ParentHash answers a digest, which both differentials read the
-		// way they read the four above it.
+		// section 7.9's three. ParentHash answers a digest, which the KDF.Nh differential reads
+		// the way it reads the four above it -- and which the ROUTING differential does NOT
+		// read the way it reads them. That is a limit of this row rather than a property of the
+		// method, and it is written down because a row that looks like the four above it will
+		// otherwise be trusted to hold what they hold.
+		//
+		// The preimage a parent hash is taken over already carries a provider-derived value:
+		// the original tree hash of the sibling subtree. So this row's output moves across the
+		// two providers whether the FINAL crypto.Hash call routed or not, and a body that took
+		// that last digest with crypto/sha256 directly passes the routing gate. Measured, not
+		// supposed -- `return crypto.Hash(input), nil` replaced by sha256.Sum256 left
+		// TestEveryMethodHandedAProviderRoutesThroughIt green. The routing differential still
+		// holds everything UNDER the final call, which is most of the method, and that is what
+		// this row is worth.
+		//
+		// What holds the final call is the KDF.Nh row below -- sha256 answers 32 octets over a
+		// provider whose Nh is 48 -- together with
+		// TestTheParentHashIsTheProvidersHashOfTheHandDerivedParentHashInput, which compares
+		// this method's answer against the tagging provider's own hash of the same hand written
+		// octets. Neither is redundant with the other, and the difference is what each reads:
+		// the Nh row reads a WIDTH, over a provider whose Nh is not 32 and which the golden does
+		// not install; the golden reads the BYTES, which the Nh row never compares. A digest of
+		// the right width taken outside the provider is visible only to the golden.
 		{name: "(*RatchetTree).ParentHash", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
 			tree := providerRowRatchetTree(t)
 			// both copath children of node 1, because "with respect to the copath child" is

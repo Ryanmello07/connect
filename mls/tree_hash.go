@@ -288,11 +288,30 @@ func (self *RatchetTree) ParentHash(crypto CryptoProvider,
 // bool for whether it carries one at all.
 //
 // RFC 9420 section 7.9.1: a ParentNode always has the field, and a LeafNode has it only under
-// leaf_node_source = commit. A key_package or update leaf has no parent_hash at all, and its
-// zero valued Go field read as an empty one would let a chain check compare a parent hash
-// against nothing and call the two equal -- which is the shape that makes every leaf that never
-// committed look like a valid start of a chain. So "no field" is the bool and never an empty
-// slice, and the two are not the same answer.
+// leaf_node_source = commit. What is read is the SOURCE and not the field, and the reason is the
+// SIGNATURE rather than the comparison. marshalCore writes parent_hash into the bytes a leaf is
+// signed over under the commit arm alone, so on a key_package or an update leaf the Go field is
+// covered by nothing its member signed: an attacker holding somebody else's signed update leaf
+// can hang any parent hash on it, that leaf still verifies at its own index in its own group,
+// and a chain check that read the field regardless would take it as the one descendant claiming
+// a parent node the attacker wrote. So "no field" is the bool and never an empty slice, and the
+// two are not the same answer.
+//
+// It is NOT that an empty field would compare equal to a parent hash. subtle.ConstantTimeCompare
+// answers 0 on a length mismatch, so a zero valued field never matches a 32 octet hash, and an
+// earlier version of this comment justified the predicate with a mechanism this package does not
+// have. The predicate is right and the reason it was given for was wrong, which is the more
+// dangerous of the two to leave standing: a later reader who checked the stated reason would
+// find it false and delete the line.
+//
+// Off the wire the predicate is defence in depth today. unmarshalCore stages a fresh LeafNode and
+// assigns ParentHash under the commit arm alone, so a leaf decoded from bytes cannot arrive
+// carrying one under another source. It is load bearing for the leaves this package CONSTRUCTS
+// in memory, where the field outlives the source that put it there -- an update written over a
+// leaf that had committed keeps the bytes unless somebody clears them, and nothing in the type
+// makes that impossible. TestOnlyACommitSourcedLeafCarriesAParentHashField holds this function
+// over the sources the package declares, and
+// TestVerifyParentHashesRefusesAClaimantWhoseSourceDoesNotCarryAParentHash holds the tree.
 func nodeParentHashField(node *Node) ([]byte, bool) {
 	if node == nil {
 		return nil, false
@@ -392,6 +411,14 @@ func (self *RatchetTree) resolutionIsTheClaimantAndTheUnmergedLeaves(parent *Par
 	// and is not implied by the arithmetic above: a claimant absent from the resolution leaves
 	// it one entry longer than the unmerged set, which the loop only reports if that surplus
 	// entry is also absent from the set.
+	//
+	// No CALLER reaches this line, and saying so is the point of writing it down.
+	// parentHashClaimsUnder draws the claimant out of the very resolution it then hands in, so
+	// struck is true on every call this package makes and condition 3's first clause is carried
+	// by that loop rather than by this clause. What this holds is the HELPER's own contract, for
+	// the next caller that asks about a claimant it did not take out of the resolution -- and it
+	// is held by TestConditionThreeRefusesAClaimantThatIsNotInTheResolution, which drives the
+	// helper directly, because driving it through the sweep is not possible.
 	if !struck {
 		return false
 	}

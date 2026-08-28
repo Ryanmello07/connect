@@ -780,6 +780,28 @@ func TestThePublishedTreeHashComparisonCanSayNo(t *testing.T) {
 func originalTreeHashReference(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	exclude map[LeafIndex]bool) []byte {
 	t.Helper()
+	without := treeWithoutTheExcludedLeaves(t, tree, exclude)
+	root, err := rootOf(without.LeafWidth())
+	if err != nil {
+		t.Fatalf("rootOf: %v", err)
+	}
+	hash, err := without.treeHash(crypto, root, nil)
+	if err != nil {
+		t.Fatalf("the reference tree hash: %v", err)
+	}
+	return hash
+}
+
+// treeWithoutTheExcludedLeaves is the construction half of the reference above, split out
+// because section 7.9's original tree hash is asked for over a SUBTREE and not only over the
+// whole tree: ParentHash takes it of the copath child.
+//
+// It is the same second opinion either way -- the tree the excluded leaves were never added to,
+// built through the container's own surface -- and splitting it is what stops the parent hash
+// preimage test below from needing a second copy of it.
+func treeWithoutTheExcludedLeaves(t *testing.T, tree *RatchetTree,
+	exclude map[LeafIndex]bool) *RatchetTree {
+	t.Helper()
 	without := tree.Clone()
 	for i := uint32(0); i < uint32(without.LeafWidth()); i += 1 {
 		if !exclude[LeafIndex(i)] {
@@ -809,15 +831,7 @@ func originalTreeHashReference(t *testing.T, crypto CryptoProvider, tree *Ratche
 			t.Fatalf("SetParent(%d): %v", x, err)
 		}
 	}
-	root, err := rootOf(without.LeafWidth())
-	if err != nil {
-		t.Fatalf("rootOf: %v", err)
-	}
-	hash, err := without.treeHash(crypto, root, nil)
-	if err != nil {
-		t.Fatalf("the reference tree hash: %v", err)
-	}
-	return hash
+	return without
 }
 
 // TestTheOriginalTreeHashIsTheTreeHashOfTheTreeWithoutThoseLeaves is section 7.9's definition,
@@ -1052,6 +1066,175 @@ func TestTheTreeHashEntryPointsRefuseATreeWithNoLeavesAlike(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// RFC 9420 section 7.9, the ParentHashInput preimage and the field a node carries
+// ---------------------------------------------------------------------------
+
+// TestTheParentHashIsTheProvidersHashOfTheHandDerivedParentHashInput writes section 7.9's
+// preimage out field by field and takes its digest through the provider, which are two claims
+// nothing else in this file makes and the corpus makes only together.
+//
+// The ORDER first. ParentHashInput is encryption_key, then parent_hash, then
+// original_sibling_tree_hash, and an implementation that wrote the sibling hash before the
+// parent hash agrees with itself forever, chains forever, and forks from everybody else. What
+// sees that today is the published tree-validation corpus alone, and the corpus reaches this
+// preimage through this package's own decoder; octets written out here do not.
+//
+// The DIGEST second, and that half is the one the provider gates cannot reach.
+// TestEveryMethodHandedAProviderRoutesThroughIt compares ParentHash's answer over the real
+// provider against its answer over one that flips every byte, and those two differ whatever the
+// final hash call is, because the preimage already carries a sibling tree hash that moved. So a
+// body that hashed this preimage with crypto/sha256 directly passes that gate -- measured, not
+// supposed: the final crypto.Hash call replaced by sha256.Sum256 left the routing gate green.
+// Under the tagging provider the expected value below is THAT provider's hash of the same
+// octets, and sha256 of them is not it.
+//
+// The original sibling tree hash is built by treeWithoutTheExcludedLeaves and hashed through
+// NodeTreeHash -- the entry point the 908 published node hashes check -- so the preimage is
+// assembled out of a construction the corpus agrees with, rather than out of the exclusion arm
+// this test would otherwise be checking against itself.
+func TestTheParentHashIsTheProvidersHashOfTheHandDerivedParentHashInput(t *testing.T) {
+	plain := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, plain, 4)
+	const p = NodeIndex(3)
+	// all three fields of the preimage non-empty, and an unmerged leaf under EACH child, so
+	// neither copath child's ORIGINAL tree hash is the plain tree hash of the same subtree and
+	// an implementation that skipped the blanking fails on both rows rather than on neither
+	if err := tree.SetParent(p, &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0xB3}, 32)),
+		ParentHash:     bytes.Repeat([]byte{0xB4}, 32),
+		UnmergedLeaves: []LeafIndex{1, 2},
+	}); err != nil {
+		t.Fatalf("SetParent(%d): %v", p, err)
+	}
+	node := tree.ParentAt(p)
+	exclude := map[LeafIndex]bool{}
+	for _, leaf := range node.UnmergedLeaves {
+		exclude[leaf] = true
+	}
+	without := treeWithoutTheExcludedLeaves(t, tree, exclude)
+	// the two copath children are DERIVED from the index rather than typed, for the reason
+	// errCopathChildIsNotAChildOfTheParent gives: a hash taken over the wrong subtree is a well
+	// formed digest of the right width, and nothing else in this test would see it
+	left, leftOk := leftOf(p)
+	right, rightOk := rightOf(p)
+	if !leftOk || !rightOk {
+		t.Fatalf("node %d has no children, so it is not the parent this test is about", p)
+	}
+	for _, one := range []struct {
+		name   string
+		crypto CryptoProvider
+	}{
+		{"the registered suite", plain},
+		// a provider whose Hash is not the suite's, which is what a digest taken outside the
+		// provider fails against and what the routing differential cannot supply here
+		{"a provider whose hash is not sha256", &taggingCryptoProvider{inner: plain}},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			for _, copath := range []NodeIndex{left, right} {
+				sibling, err := without.NodeTreeHash(one.crypto, copath)
+				if err != nil {
+					t.Fatalf("NodeTreeHash(%d) over the tree the unmerged leaves were never added to: %v",
+						copath, err)
+				}
+				want := one.crypto.Hash(treeHashTestConcat(
+					treeHashTestOpaque(t, node.EncryptionKey),
+					treeHashTestOpaque(t, node.ParentHash),
+					treeHashTestOpaque(t, sibling)))
+				got, err := tree.ParentHash(one.crypto, p, copath)
+				if err != nil {
+					t.Fatalf("ParentHash(%d, %d): %v", p, copath, err)
+				}
+				if !bytes.Equal(got, want) {
+					t.Errorf("the parent hash of node %d with copath child %d is %x, and this provider's hash of the hand written ParentHashInput is %x",
+						p, copath, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestOnlyACommitSourcedLeafCarriesAParentHashField is section 7.9.1's "a LeafNode has a
+// parent_hash field only when its leaf_node_source is commit", asked of nodeParentHashField.
+//
+// The class is derived at both ends and typed at neither. leafNodeSources reads every
+// LeafNodeSource this package declares off the declarations, and leafNodeVariantPaths -- the
+// table leaf_node_test.go holds against the struct AND against those same constants -- is what
+// says which source carries the field. A fourth source therefore arrives here already swept and
+// already carrying its own expectation.
+//
+// Every leaf below is handed a parent_hash that is present and 32 octets wide, which is what
+// makes this an assertion rather than a restatement of the zero value: the answer has to come
+// from the SOURCE. That is not a hypothetical shape. Clone copies the field across a source
+// change, so a leaf built in memory out of one that had committed keeps bytes its new source
+// does not cover -- and under a non-commit source those bytes are covered by no signature at
+// all, because marshalCore writes parent_hash into the signed preimage under the commit arm
+// alone.
+func TestOnlyACommitSourcedLeafCarriesAParentHashField(t *testing.T) {
+	sources := leafNodeSources(t)
+	if len(sources) < 2 {
+		t.Fatalf("%d leaf node source is declared, and a sweep over fewer than two cannot separate a function that reads the source from one that ignores it",
+			len(sources))
+	}
+	carrying := []LeafNodeSource{}
+	for _, source := range sources {
+		leaf := &LeafNode{LeafNodeSource: source, ParentHash: bytes.Repeat([]byte{0x7C}, 32)}
+		got, carries := nodeParentHashField(&Node{NodeType: NodeTypeLeaf, Leaf: leaf})
+		want := slices.Contains(leafNodeVariantPaths[source], "ParentHash")
+		if carries != want {
+			t.Errorf("a leaf of source %d holding %x is reported as carrying a parent_hash field: %v, want %v",
+				uint8(source), leaf.ParentHash, carries, want)
+			continue
+		}
+		if !carries {
+			if got != nil {
+				t.Errorf("a leaf of source %d carries no parent_hash field and %x came back beside the bool",
+					uint8(source), got)
+			}
+			continue
+		}
+		carrying = append(carrying, source)
+		if !bytes.Equal(got, leaf.ParentHash) {
+			t.Errorf("a leaf of source %d answered %x, want its own field %x",
+				uint8(source), got, leaf.ParentHash)
+		}
+	}
+	// the derived table held against the RFC rather than against itself: section 7.9.1 gives the
+	// field to commit and to no other source, so a table that grew a second carrier would be
+	// wrong about the protocol and the sweep above would agree with it.
+	if len(carrying) != 1 || carrying[0] != LeafNodeSourceCommit {
+		t.Errorf("the sources carrying a parent_hash field are %v of the %d declared, and section 7.9.1 gives it to commit alone",
+			carrying, len(sources))
+	}
+	// a ParentNode always carries the field, the root included, where it is the zero-length
+	// octet string. "present and empty" and "absent" are different answers and this is the one
+	// place both are spelled.
+	for _, one := range []struct {
+		name  string
+		value []byte
+	}{
+		{"a parent node below the root", bytes.Repeat([]byte{0x7D}, 32)},
+		{"the root, whose parent_hash is the zero-length string", []byte{}},
+	} {
+		got, carries := nodeParentHashField(&Node{
+			NodeType: NodeTypeParent,
+			Parent:   &ParentNode{ParentHash: one.value},
+		})
+		if !carries {
+			t.Errorf("%s is reported as carrying no parent_hash field", one.name)
+			continue
+		}
+		if !bytes.Equal(got, one.value) {
+			t.Errorf("%s answered %x, want %x", one.name, got, one.value)
+		}
+	}
+	// and a blank position carries nothing, which is what keeps a blank out of the claimant loop
+	// rather than into it holding an empty field.
+	if got, carries := nodeParentHashField(nil); carries || got != nil {
+		t.Errorf("a blank node answered %x and %v, want no field at all", got, carries)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // RFC 9420 section 7.9.2, parent hash validity over the whole tree
 // ---------------------------------------------------------------------------
 //
@@ -1247,19 +1430,23 @@ func TestVerifyParentHashesRejectsATamperedChain(t *testing.T) {
 	}
 }
 
-// giveTheSiblingACommitLeaf writes leaf 1 of the two leaf fixture as a commit-sourced leaf
-// carrying the given parent_hash, which is what the two tests below vary.
-func giveTheSiblingACommitLeaf(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
-	members []*testMember, hash []byte) {
+// giveTheLeafACommitParentHash rewrites one leaf of a fixture as a commit-sourced leaf carrying
+// the given parent_hash, signed at its own index, which is what the tests below vary.
+//
+// It takes the leaf INDEX rather than being written against leaf 1, because the same edit is
+// what makes a second claimant, a stale claimant and no claimant at all, and those tests sit on
+// different leaves of different fixtures.
+func giveTheLeafACommitParentHash(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	members []*testMember, i LeafIndex, hash []byte) {
 	t.Helper()
-	leaf := tree.Leaf(LeafIndex(1)).Clone()
+	leaf := tree.Leaf(i).Clone()
 	leaf.LeafNodeSource = LeafNodeSourceCommit
 	leaf.ParentHash = hash
-	if err := leaf.Sign(crypto, members[1].SignaturePriv, testGroupId(), LeafIndex(1)); err != nil {
-		t.Fatalf("Sign: %v", err)
+	if err := leaf.Sign(crypto, members[i].SignaturePriv, testGroupId(), i); err != nil {
+		t.Fatalf("Sign(%d): %v", i, err)
 	}
-	if err := tree.SetLeaf(LeafIndex(1), leaf); err != nil {
-		t.Fatalf("SetLeaf: %v", err)
+	if err := tree.SetLeaf(i, leaf); err != nil {
+		t.Fatalf("SetLeaf(%d): %v", i, err)
 	}
 }
 
@@ -1294,7 +1481,7 @@ func TestVerifyParentHashesFollowsTheClaimToWhicheverChildHoldsIt(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ParentHash: %v", err)
 	}
-	giveTheSiblingACommitLeaf(t, crypto, tree, members, mirrored)
+	giveTheLeafACommitParentHash(t, crypto, tree, members, LeafIndex(1), mirrored)
 
 	// the claim really has moved, observed on both sides rather than assumed: leaf 1 now holds
 	// the live value and leaf 0's is stale, because the sibling hash it was taken over moved.
@@ -1324,7 +1511,8 @@ func TestVerifyParentHashesFollowsTheClaimToWhicheverChildHoldsIt(t *testing.T) 
 func TestVerifyParentHashesRefusesAParentNoDescendantClaims(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	tree, members := buildParentHashChain(t, crypto)
-	giveTheSiblingACommitLeaf(t, crypto, tree, members, bytes.Repeat([]byte{0xAB}, crypto.HashSize()))
+	giveTheLeafACommitParentHash(t, crypto, tree, members, LeafIndex(1),
+		bytes.Repeat([]byte{0xAB}, crypto.HashSize()))
 
 	// neither child holds the value its side would have to hold, asked of the tree before the
 	// refusal is asked for, so a pass cannot be some other refusal wearing this test's name.
@@ -1613,5 +1801,310 @@ func TestVerifyParentHashesRefusesATreeThatIsNotATree(t *testing.T) {
 	// clauses above and nothing else.
 	if err := one.VerifyParentHashes(crypto); err != nil {
 		t.Errorf("VerifyParentHashes of the one leaf tree: %v", err)
+	}
+}
+
+// TestVerifyParentHashesRefusesAClaimantWhoseSourceDoesNotCarryAParentHash is section 7.9.1 read
+// as a refusal: a leaf that did not enter the tree by committing has no parent_hash field, so it
+// cannot be the descendant that claims a parent node.
+//
+// The forgery this refuses is a real one rather than a tidiness. marshalCore writes parent_hash
+// into the bytes a leaf is signed over under the commit arm ALONE, so the field on a
+// key_package or update leaf is covered by no signature at all: anybody holding a member's
+// signed update leaf can hang the parent hash of their own forged node on it without a signing
+// key, and that leaf still verifies at its own index in its own group. Every one of those
+// facts is asserted below rather than argued, so the refusal cannot be some other refusal
+// wearing this test's name -- the rewritten leaf verifies, and it holds the exact bytes node 1
+// answers with copath child 2.
+//
+// The sources are DERIVED, and which of them is the accepting direction is derived too, off the
+// same leafNodeVariantPaths table TestOnlyACommitSourcedLeafCarriesAParentHashField reads. The
+// mutation this exists for is nodeParentHashField dropping the source test altogether, which
+// left twenty tests green.
+func TestVerifyParentHashesRefusesAClaimantWhoseSourceDoesNotCarryAParentHash(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	swept := 0
+	for _, source := range leafNodeSources(t) {
+		if slices.Contains(leafNodeVariantPaths[source], "ParentHash") {
+			// the carrying source is the ACCEPTING direction, which
+			// TestVerifyParentHashesAcceptsAValidChain holds over this same fixture
+			continue
+		}
+		swept += 1
+		t.Run(fmt.Sprintf("leaf_node_source %d", uint8(source)), func(t *testing.T) {
+			tree, members := buildParentHashChain(t, crypto)
+			if err := tree.VerifyParentHashes(crypto); err != nil {
+				t.Fatalf("the chain before its claimant's source is moved: %v", err)
+			}
+			claimed, carries := nodeParentHashField(tree.Get(LeafIndex(0).NodeIndex()))
+			if !carries {
+				t.Fatal("the fixture's claimant carries no parent_hash field, so there is nothing to move the source of")
+			}
+			// the SOURCE moves and the bytes stay, which is the whole of the edit
+			leaf := tree.Leaf(LeafIndex(0)).Clone()
+			leaf.LeafNodeSource = source
+			leaf.ParentHash = claimed
+			if err := leaf.Sign(crypto, members[0].SignaturePriv, testGroupId(), LeafIndex(0)); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			if err := tree.SetLeaf(LeafIndex(0), leaf); err != nil {
+				t.Fatalf("SetLeaf: %v", err)
+			}
+			written := tree.Leaf(LeafIndex(0))
+			if err := written.VerifySignature(crypto, testGroupId(), LeafIndex(0)); err != nil {
+				t.Fatalf("the rewritten leaf does not verify at its own index, so a refusal below need not be about its source: %v", err)
+			}
+			live, err := tree.ParentHash(crypto, NodeIndex(1), NodeIndex(2))
+			if err != nil {
+				t.Fatalf("ParentHash: %v", err)
+			}
+			if !bytes.Equal(written.ParentHash, live) {
+				t.Fatalf("the rewritten leaf holds %x and the parent hash of node 1 with copath child 2 is %x, so a refusal would be condition 2's rather than section 7.9.1's",
+					written.ParentHash, live)
+			}
+			if err := tree.VerifyParentHashes(crypto); !errors.Is(err, ErrParentHashMismatch) {
+				t.Fatalf("err = %v, want ErrParentHashMismatch: leaf 0's source is %d, which carries no parent_hash field for it to claim node 1 with",
+					err, uint8(source))
+			}
+		})
+	}
+	if swept == 0 {
+		t.Fatal("every declared leaf node source carries a parent_hash field, so this test swept nothing")
+	}
+}
+
+// TestConditionThreeRefusesAClaimantThatIsNotInTheResolution drives
+// resolutionIsTheClaimantAndTheUnmergedLeaves directly, because the sweep cannot drive it.
+//
+// Condition 3 is two clauses -- "D is in the resolution of C", and "the intersection of P's
+// unmerged_leaves with the subtree under C is equal to the resolution of C with D removed" --
+// and the helper implements both. Only the second is reachable from parentHashClaimsUnder,
+// which draws its claimant out of the very resolution it then hands in, so the first clause has
+// no call site that can make it fire: replacing it with a constant false left the whole package
+// green.
+//
+// The clause is still the helper's contract and the next caller will not be that loop, so what
+// holds it is a direct call rather than a deletion. The shape below is the one that separates
+// the two clauses: every entry of the resolution is accounted for by an unmerged leaf and
+// nothing is left over, so the arithmetic clause has nothing to say and only the claimant clause
+// can refuse it. The outsiders are swept off the tree's own width rather than chosen, so the
+// claimant clause has to hold for every position that is not in the resolution and not for one
+// somebody picked.
+func TestConditionThreeRefusesAClaimantThatIsNotInTheResolution(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 4)
+	const child = NodeIndex(1)
+	resolution := tree.Resolution(child)
+	if want := []NodeIndex{LeafIndex(0).NodeIndex(), LeafIndex(1).NodeIndex()}; !slices.Equal(resolution, want) {
+		t.Fatalf("the resolution below node %d is %v, want %v", child, resolution, want)
+	}
+	// the accepting control, so a refusal below is the claimant clause rather than a helper that
+	// refuses everything: leaf 0 claims, and leaf 1 is recorded as added since the parent was set.
+	accepted := &ParentNode{UnmergedLeaves: []LeafIndex{1}}
+	if !tree.resolutionIsTheClaimantAndTheUnmergedLeaves(accepted, child, resolution, LeafIndex(0).NodeIndex()) {
+		t.Fatal("condition 3 refuses a claimant that IS in the resolution, so nothing below separates its two clauses")
+	}
+	// and the same arithmetic with the claimant outside it: BOTH entries of the resolution are
+	// unmerged leaves now, so the loop consumes the whole set and leaves nothing over.
+	whole := &ParentNode{UnmergedLeaves: []LeafIndex{0, 1}}
+	outsiders := 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		outsider := NodeIndex(x)
+		if slices.Contains(resolution, outsider) {
+			continue
+		}
+		outsiders += 1
+		if tree.resolutionIsTheClaimantAndTheUnmergedLeaves(whole, child, resolution, outsider) {
+			t.Errorf("node %d is not in the resolution %v of node %d, and condition 3 accepted it as the claimant",
+				outsider, resolution, child)
+		}
+	}
+	if outsiders == 0 {
+		t.Fatalf("every node of a %d node tree is in the resolution %v, so this sweep ran over nothing",
+			tree.NodeWidth(), resolution)
+	}
+}
+
+// TestVerifyParentHashesRefusesAnUnmergedLeafThatIsNotInTheResolutionOfItsChild is the OTHER
+// containment of condition 3's set equality.
+//
+// Section 7.9.2 says the intersection of P's unmerged_leaves with the subtree under C "is equal
+// to" the resolution of C with the claimant removed, and equality is two inclusions.
+// TestVerifyParentHashesRefusesACoTenantInTheResolutionOfTheClaimant reaches one of them -- a
+// node in the resolution that the unmerged set does not account for -- and nothing reached the
+// other: neutering the leftover loop that reports an unmerged leaf with no resolution entry to
+// match left twenty tests green.
+//
+// The pair below differs in one unmerged_leaves entry and nothing else, as that test's pair
+// does, and the entry names a leaf that is BLANK. A blank leaf contributes nothing to a
+// resolution, so naming it puts it in the unmerged set and out of the resolution at once, which
+// is the surplus this half refuses. The claimed parent hash is asserted equal across the pair,
+// because unmerged_leaves reaches a parent hash only through the SIBLING's original tree hash
+// and this leaf is not under the sibling -- so the refusal is condition 3's and not condition
+// 2's.
+//
+// What a tree like this actually is: a parent whose unmerged list names somebody who is not
+// there. It carries no forgery leverage on its own -- padding the list moves no hash the
+// claimant has to match -- and it is the same tree the plan's task 22 refuses from the other
+// direction, by requiring every unmerged leaf to point at a non-blank descendant. It is refused
+// here because half of a stated RFC condition being enforced with nothing observing it is how
+// the other half comes to be deleted.
+func TestVerifyParentHashesRefusesAnUnmergedLeafThatIsNotInTheResolutionOfItsChild(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	const root, child, copath = NodeIndex(3), NodeIndex(1), NodeIndex(5)
+	const absent = LeafIndex(1)
+
+	legal, members := newTestTree(t, crypto, 4)
+	if err := legal.Blank(absent.NodeIndex()); err != nil {
+		t.Fatalf("Blank(leaf %d): %v", absent, err)
+	}
+	if err := legal.SetParent(root, &ParentNode{
+		EncryptionKey: HpkePublicKey(bytes.Repeat([]byte{0xD0}, 32)),
+		ParentHash:    []byte{},
+	}); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	hash, err := legal.ParentHash(crypto, root, copath)
+	if err != nil {
+		t.Fatalf("ParentHash: %v", err)
+	}
+	giveTheLeafACommitParentHash(t, crypto, legal, members, LeafIndex(0), hash)
+	// the shape, asked of the tree rather than assumed of it: the claimant is alone in the
+	// resolution below the child, and the leaf the forgery will name is inside that child's
+	// subtree and is not in that resolution.
+	if resolution := legal.Resolution(child); !slices.Equal(resolution, []NodeIndex{LeafIndex(0).NodeIndex()}) {
+		t.Fatalf("the resolution below node %d is %v, and this test needs the claimant alone in it",
+			child, resolution)
+	}
+	if first, last := SubtreeLeaves(child); absent < first || absent > last {
+		t.Fatalf("leaf %d is not under node %d, so naming it in unmerged_leaves is not the surplus this test is about",
+			absent, child)
+	}
+	if err := legal.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("the tree whose unmerged list is empty: %v", err)
+	}
+
+	// the same tree with one unmerged entry ADDED, naming a leaf that is not in the resolution.
+	forged := legal.Clone()
+	padded := forged.ParentAt(root).Clone()
+	padded.UnmergedLeaves = []LeafIndex{absent}
+	if err := forged.SetParent(root, padded); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	forgedHash, err := forged.ParentHash(crypto, root, copath)
+	if err != nil {
+		t.Fatalf("ParentHash: %v", err)
+	}
+	if !bytes.Equal(hash, forgedHash) {
+		t.Fatalf("the pair does not differ in unmerged_leaves alone: the claimed parent hash moved from %x to %x",
+			hash, forgedHash)
+	}
+	claimant, carries := nodeParentHashField(forged.Get(LeafIndex(0).NodeIndex()))
+	if !carries || !bytes.Equal(claimant, forgedHash) {
+		t.Fatalf("the forged tree's claimant carries %x (present: %v) and the parent hash is %x, so a refusal would be condition 2's and not condition 3's",
+			claimant, carries, forgedHash)
+	}
+	if err := forged.VerifyParentHashes(crypto); !errors.Is(err, ErrParentHashMismatch) {
+		t.Fatalf("err = %v, want ErrParentHashMismatch: node %d names leaf %d as unmerged and the resolution below node %d does not hold it",
+			err, root, absent, child)
+	}
+}
+
+// collidingHashProvider is the registered suite with its Hash collapsed onto one answer.
+//
+// It exists for one assertion and is documented rather than reached for casually: a hash that is
+// not collision resistant is the ONLY input that reaches the upper half of section 7.9.2's
+// "exactly one descendant". Two claimants under ONE child are impossible by arithmetic --
+// condition 3 gives a claimant D the equation resolution(C) minus D equals U, and two distinct
+// claimants in the same resolution would each have to appear in the other's U, which forces
+// resolution(C) to equal U and contradicts |U| = |resolution(C)| - 1. Two claimants across the
+// two ARMS need each side's stored parent_hash to be a hash of the subtree the other one sits
+// in, which is a cycle in the hash. This provider is that cycle, supplied.
+//
+// Only Hash is overridden; everything else is the registered suite's, so nothing driven over it
+// fails for a reason belonging to a fake.
+type collidingHashProvider struct {
+	CryptoProvider
+	answer []byte
+}
+
+// Cloned rather than handed out, for the reason the tagging provider gives: the real provider
+// hands every caller storage nobody else writes into, and a wrapper that returned the same array
+// to all of them would break that invariant from the test side.
+func (self *collidingHashProvider) Hash(data []byte) []byte {
+	return bytes.Clone(self.answer)
+}
+
+// TestVerifyParentHashesRefusesAParentTwoDescendantsClaim is the UPPER half of section 7.9.2's
+// "exactly one descendant", which no tree over a real hash can reach.
+//
+// TestVerifyParentHashesFollowsTheClaimToWhicheverChildHoldsIt records why the fixture is not
+// constructible: writing the second claimant kills the first, because each claimant's stored
+// value is a hash of the subtree the other one sits in. The consequence is that "claims != 1"
+// and "claims < 1" are the same function over every fixture in this file and over the published
+// corpus -- measured, not supposed, the two are indistinguishable under the whole package. The
+// clause is a real requirement of the RFC, and the only way to observe it is to supply the
+// collision the impossibility argument turns on.
+//
+// What this buys is not a defence against a broken SHA-256. It is that the count cannot be
+// weakened to "at least one" -- or to a bool per arm, which is the same weakening spelled
+// differently -- without a test going red, on the line whose whole content is that two update
+// paths spliced into one parent are refused.
+func TestVerifyParentHashesRefusesAParentTwoDescendantsClaim(t *testing.T) {
+	suite := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	colliding := &collidingHashProvider{
+		CryptoProvider: suite,
+		answer:         bytes.Repeat([]byte{0x9C}, suite.HashSize()),
+	}
+	tree, members := newTestTree(t, suite, 2)
+	if err := tree.SetParent(NodeIndex(1), &ParentNode{
+		EncryptionKey: HpkePublicKey(bytes.Repeat([]byte{0xE1}, 32)),
+		ParentHash:    []byte{},
+	}); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	// the fixture's own claim, both ways round. Under the registered suite the two arms of node 1
+	// answer different parent hashes, which is what makes two claimants unconstructible; under
+	// this provider they answer the same one, which is what makes them constructible.
+	realRight, err := tree.ParentHash(suite, NodeIndex(1), NodeIndex(2))
+	if err != nil {
+		t.Fatalf("ParentHash(1, 2): %v", err)
+	}
+	realLeft, err := tree.ParentHash(suite, NodeIndex(1), NodeIndex(0))
+	if err != nil {
+		t.Fatalf("ParentHash(1, 0): %v", err)
+	}
+	if bytes.Equal(realRight, realLeft) {
+		t.Fatalf("the two arms of node 1 already collide under the registered suite, so this test is not about the provider it installs")
+	}
+	withRight, err := tree.ParentHash(colliding, NodeIndex(1), NodeIndex(2))
+	if err != nil {
+		t.Fatalf("ParentHash(1, 2) under the colliding provider: %v", err)
+	}
+	withLeft, err := tree.ParentHash(colliding, NodeIndex(1), NodeIndex(0))
+	if err != nil {
+		t.Fatalf("ParentHash(1, 0) under the colliding provider: %v", err)
+	}
+	if !bytes.Equal(withRight, withLeft) {
+		t.Fatalf("the two arms of node 1 answer %x and %x under the colliding provider, so this fixture cannot hold two claimants",
+			withRight, withLeft)
+	}
+
+	// one claimant under that same provider is ACCEPTED. Without this the refusal below could be
+	// the colliding provider breaking the check in some way that has nothing to do with a count.
+	giveTheLeafACommitParentHash(t, suite, tree, members, LeafIndex(0), withRight)
+	if err := tree.VerifyParentHashes(colliding); err != nil {
+		t.Fatalf("one claimant under the colliding provider: %v", err)
+	}
+	// and the second, on the other arm: two, which is neither zero nor one.
+	giveTheLeafACommitParentHash(t, suite, tree, members, LeafIndex(1), withLeft)
+	err = tree.VerifyParentHashes(colliding)
+	if !errors.Is(err, ErrParentHashMismatch) {
+		t.Fatalf("err = %v, want ErrParentHashMismatch: both children of node 1 claim it", err)
+	}
+	// the refusal is about the COUNT and names it, so a check that read "at least one" and
+	// refused for some other reason fails here rather than passing.
+	if !strings.Contains(err.Error(), "claimed by 2") {
+		t.Errorf("node 1 is claimed by both of its children and the refusal does not say so: %v", err)
 	}
 }
