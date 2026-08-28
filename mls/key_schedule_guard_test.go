@@ -462,6 +462,140 @@ func keyScheduleFieldsNamedIn(body *ast.BlockStmt, fields []string) int {
 	return len(named)
 }
 
+
+// syntaxCodecEntryPoints is the third sanctioned exemption to convention C1, and like the
+// first two it is DERIVED: the top level functions mls/syntax declares that are handed a
+// Marshaler or an Unmarshaler.
+//
+// It exists because the rule next door reads "byte level codec entry point" off a name and a
+// shape, and both of those describe a function that is not a codec at all. p5 task 11's
+// UnmarshalRatchetTree is the case that surfaced it: the ratchet_tree array of RFC 9420
+// section 12.4.3.3 is the one structure p1 allows past MaxVectorLength, so its two entry
+// points are syntax.MarshalLimit and syntax.UnmarshalLimit with the limit fixed -- one
+// argument, chosen once, so no caller has to remember it. That is the sanctioned codec called
+// correctly, and reporting it as a second one would leave the only alternatives a raised limit
+// spelled out at every call site or a gate switched off.
+//
+// Derived off the SIGNATURE rather than off a list of four names, for syntaxCodecHooks'
+// reason: if syntax grows or renames a top level entry point, the delegations to it move with
+// the declaration rather than with somebody remembering to come back here. Marshaler and
+// Unmarshaler are the interfaces a structure of this package implements, so a syntax function
+// taking one of them is by construction a function that runs THIS package's own MarshalMLS or
+// UnmarshalMLS, which is the whole of what C1 asks for.
+func syntaxCodecEntryPoints(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(keyScheduleCodecPackageDir)
+	if err != nil {
+		t.Fatalf("read %s, where the sanctioned entry points are derived from: %v", keyScheduleCodecPackageDir, err)
+	}
+	points := []string{}
+	read := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		read += 1
+		parsed := mustParseSource(t, filepath.Join(keyScheduleCodecPackageDir, name))
+		for _, one := range declaredIn(parsed) {
+			if one.receiver != "" || !one.exported {
+				continue
+			}
+			if slices.ContainsFunc(one.params, func(rendered string) bool {
+				return rendered == "Marshaler" || rendered == "Unmarshaler"
+			}) {
+				points = append(points, one.name)
+			}
+		}
+	}
+	if read == 0 {
+		t.Fatalf("no non test file of %s was read, so the delegation exemption is over an empty set",
+			keyScheduleCodecPackageDir)
+	}
+	slices.Sort(points)
+	points = slices.Compact(points)
+	// the derivation's own positive control: these two certainly take a Marshaler and an
+	// Unmarshaler, and a derivation that stopped deriving would exempt nothing and report
+	// exactly what a complete one reports on this package as it stands today.
+	for _, entry := range []string{"Marshal", "Unmarshal"} {
+		if !slices.Contains(points, entry) {
+			t.Fatalf("the derivation read %v out of %s and %s is not among them, so it is reading no signature at all",
+				points, keyScheduleCodecPackageDir, entry)
+		}
+	}
+	return points
+}
+
+// keyScheduleDelegationsIn is every declaration of one file that reaches the wire ONLY through
+// one of those entry points, rendered the way the two rules above render what they report so
+// the two sets can be subtracted.
+//
+// Four clauses, and each is a way of NOT delegating rather than a symptom of delegating, which
+// is the difference between an exemption and a hole:
+//
+//   - it calls one of the entry points. A declaration that never reaches syntax is doing the
+//     encoding itself whatever it is called, which is every hand rolled codec the control
+//     declares.
+//   - it reports. The entry points answer an error and a delegation that dropped it would be
+//     accepting whatever the codec refused, which is credentialFromBytesSwallowing in the
+//     control -- reported there before this exemption existed and still reported now.
+//   - it cuts nothing out of its arguments. A body carrying an index or a slice expression is
+//     framing bytes on its own account: data[4:] handed to syntax.Unmarshal is a second length
+//     prefix, agreed with by nobody, and no round trip sees it.
+//   - it names no field of any MLS structure. Reading or writing a field around a delegation
+//     is the structure being laid out or patched up outside its own codec, which is the
+//     encoder half's own discriminator read the other way.
+//
+// The class the fourth clause is over is the MLS structures' fields and not every field of the
+// package, because the property is about the structures whose codec C1 protects.
+func keyScheduleDelegationsIn(parsed parsedSource, entryPoints []string, structureFields []string) []string {
+	delegating := []string{}
+	for _, one := range declaredIn(parsed) {
+		if one.body == nil || !slices.Contains(one.results, "error") {
+			continue
+		}
+		reaches, cuts := false, false
+		ast.Inspect(one.body, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.IndexExpr, *ast.SliceExpr:
+				cuts = true
+			case *ast.CallExpr:
+				selector, isSelector := typed.Fun.(*ast.SelectorExpr)
+				if !isSelector {
+					return true
+				}
+				base, isIdentifier := selector.X.(*ast.Ident)
+				if isIdentifier && base.Name == keyScheduleCodecPackageDir &&
+					slices.Contains(entryPoints, selector.Sel.Name) {
+					reaches = true
+				}
+			}
+			return true
+		})
+		if !reaches || cuts || keyScheduleFieldsNamedIn(one.body, structureFields) > 0 {
+			continue
+		}
+		if one.receiver != "" {
+			delegating = append(delegating, "("+one.receiver+")."+one.name)
+			continue
+		}
+		delegating = append(delegating, one.name)
+	}
+	slices.Sort(delegating)
+	return delegating
+}
+
+// keyScheduleStructureFieldsOf is the union of the field names of the MLS structures of the
+// scanned source, which is the class the delegation exemption's fourth clause is over.
+func keyScheduleStructureFieldsOf(structures []string, fields map[string][]string) []string {
+	names := []string{}
+	for _, structure := range structures {
+		names = append(names, fields[structure]...)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
 // keyScheduleCodecControl declares one of each shape the rule has to tell apart: the two
 // sanctioned hooks, the free constructor and the per type wrapper convention C1 bans, the two
 // extension vector spellings that do not exist -- the codec is WriteExtensions/ReadExtensions
@@ -631,6 +765,54 @@ func (self *OwnerSuccessorExtension) Encode() (Extension, error) { return Extens
 func ParseOwnerSuccessorExtension(data []byte, version uint16) (*OwnerSuccessorExtension, error) {
 	return nil, nil
 }
+
+// the third sanctioned exception: the raised limit pair. The ratchet_tree array of RFC 9420
+// section 12.4.3.3 is the one structure p1 allows past MaxVectorLength, so its two entry
+// points are syntax.MarshalLimit and syntax.UnmarshalLimit with that limit fixed once. Both
+// reach the wire only through syntax, report what it refused, cut nothing out of their
+// arguments and name no field, so neither is a second codec. Not reported.
+func MarshalGroupContextAtTheRaisedLimit(v *GroupContext) ([]byte, error) {
+	return syntax.MarshalLimit(v, 1)
+}
+
+func UnmarshalGroupContextAtTheRaisedLimit(data []byte) (*GroupContext, error) {
+	out := &GroupContext{}
+	if err := syntax.UnmarshalLimit(data, out, 1); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// and the three near misses that exemption must not cover, one per clause it is stated in.
+//
+// The first frames on its own account: four octets cut off the front before the sanctioned
+// decoder ever sees the run is a second length prefix, agreed with by nobody, and invisible
+// to every round trip because both halves of it would agree. The second lays the structure
+// out around the delegation, which is the field patched up outside its own codec. The third
+// never reaches syntax at all and merely looks like it does. All three reported.
+func ParseGroupContextAfterItsOwnHeader(data []byte) (*GroupContext, error) {
+	out := &GroupContext{}
+	if err := syntax.Unmarshal(data[4:], out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func ParseGroupContextPatchingAField(data []byte) (*GroupContext, error) {
+	out := &GroupContext{}
+	if err := syntax.Unmarshal(data, out); err != nil {
+		return nil, err
+	}
+	out.TreeHash = nil
+	return out, nil
+}
+
+func ParseGroupContextByHand(data []byte) (*GroupContext, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	return &GroupContext{}, nil
+}
 `
 
 // What the rule must read out of the control, exactly. Exact rather than a floor in both
@@ -643,7 +825,10 @@ var keyScheduleCodecControlWrappers = []string{
 	"MarshalExtensions",
 	"ParseExtensions",
 	"ParseGroupContext",
+	"ParseGroupContextAfterItsOwnHeader",
+	"ParseGroupContextByHand",
 	"ParseGroupContextFrom",
+	"ParseGroupContextPatchingAField",
 	"ParseGroupPolicyExtension",
 	"ParseOwnerSuccessorExtension",
 	"ParsePreSharedKeyId",
@@ -695,14 +880,27 @@ var keyScheduleOwnedFiles = []string{
 // both run over every file.
 func TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn(t *testing.T) {
 	sanctioned := syntaxCodecHooks(t)
+	entryPoints := syntaxCodecEntryPoints(t)
 	codecsIn := func(parsed parsedSource, files []parsedSource) []string {
+		fields := keyScheduleStructFieldsIn(files)
+		structures := mlsStructuresIn(files, sanctioned)
 		found := slices.Concat(
 			keyScheduleCodecWrappersIn(parsed, sanctioned, extensionBodyTypesIn(files)),
-			keyScheduleSecondCodecsIn(parsed, mlsStructuresIn(files, sanctioned),
-				packageByteSliceTypeNamesIn(parsed), keyScheduleStructFieldsIn(files)),
+			keyScheduleSecondCodecsIn(parsed, structures,
+				packageByteSliceTypeNamesIn(parsed), fields),
 		)
-		slices.Sort(found)
-		return slices.Compact(found)
+		// the third exemption, subtracted from both rules at once because it is a fact
+		// about the declaration rather than about which rule noticed it
+		delegating := keyScheduleDelegationsIn(parsed, entryPoints,
+			keyScheduleStructureFieldsOf(structures, fields))
+		kept := []string{}
+		for _, one := range found {
+			if !slices.Contains(delegating, one) {
+				kept = append(kept, one)
+			}
+		}
+		slices.Sort(kept)
+		return slices.Compact(kept)
 	}
 
 	// the control first, on both halves of both rules: every banned shape reported, and

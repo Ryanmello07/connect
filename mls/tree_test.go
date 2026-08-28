@@ -3108,3 +3108,653 @@ func TestTheRatchetTreeReproducesEveryPublishedResolution(t *testing.T) {
 			notAscending)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the ratchet_tree extension codec of RFC 9420 section 12.4.3.3, and ValSem300
+// ---------------------------------------------------------------------------
+
+// productGroupLeafCount is the group MASTER sizes this product for: 500 members with two
+// devices each, one leaf per device.
+//
+// It is here as a named constant rather than inline because the size test below is the only
+// thing in this package that can tell MaxVectorLength from MaxRatchetTreeLength, and it can do
+// that only while the fixture is big enough to exceed the first. A number that quietly shrank
+// would leave that test passing against either limit.
+const productGroupLeafCount = 1000
+
+// the same encoding as syntax.Marshal(tree) but with one absent node appended, which is exactly
+// what ValSem300 forbids.
+//
+// Rebuilt through the codec rather than patched into the bytes, because the vector's length
+// prefix moves when the body grows and a hand patched prefix would produce a truncation rather
+// than the padded array this is meant to be.
+func marshalRatchetTreeWithTrailingBlank(tree *RatchetTree) ([]byte, error) {
+	canonical, err := syntax.Marshal(tree)
+	if err != nil {
+		return nil, err
+	}
+	body, err := syntax.NewReader(canonical).ReadSub()
+	if err != nil {
+		return nil, err
+	}
+	inner := syntax.NewWriter()
+	for !body.Empty() {
+		node := &OptionalNode{}
+		if err := node.UnmarshalMLS(body); err != nil {
+			return nil, err
+		}
+		if err := node.MarshalMLS(inner); err != nil {
+			return nil, err
+		}
+	}
+	if err := (&OptionalNode{}).MarshalMLS(inner); err != nil {
+		return nil, err
+	}
+	payload, err := inner.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	w := syntax.NewWriter()
+	w.WriteOpaque(payload)
+	return w.Bytes()
+}
+
+// handWrittenVarint is the RFC 9420 section 2.1.2 length prefix, written out here rather than
+// taken from the codec, so the golden below states the framing instead of agreeing with it.
+func handWrittenVarint(t *testing.T, n int) []byte {
+	t.Helper()
+	switch {
+	case n < 1<<6:
+		return []byte{byte(n)}
+	case n < 1<<14:
+		return []byte{byte(n>>8) | 0x40, byte(n)}
+	case n < 1<<30:
+		return []byte{byte(n>>24) | 0x80, byte(n >> 16), byte(n >> 8), byte(n)}
+	}
+	t.Fatalf("no RFC 9420 varint encodes %d", n)
+	return nil
+}
+
+// TestRatchetTreeMarshalMatchesAHandDerivedGolden states the array encoding from the RFC
+// without reference to the encoder, which is the only thing in this file that separates it
+// from its mirror images.
+//
+// Four of them, and none is visible to a round trip: the presence octet written AFTER the node
+// type rather than before, the node type octet dropped from both halves, the parents emitted
+// before the leaves rather than interleaved in array order, and the trailing blanks left in.
+// Each of those encodes, decodes, re-encodes byte exact against itself and hashes a tree no
+// peer computes.
+//
+// The leaf and parent bodies come from their own codecs, deliberately: what this golden pins is
+// THIS layer -- the vector prefix, the presence octet, the type octet, the array order and the
+// truncation -- and those two structures have hand derived goldens of their own above.
+func TestRatchetTreeMarshalMatchesAHandDerivedGolden(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 3)
+	parent := &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x88}, 32)),
+		ParentHash:     bytes.Repeat([]byte{0x99}, 32),
+		UnmergedLeaves: []LeafIndex{1},
+	}
+	if err := tree.SetParent(NodeIndex(1), parent); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+
+	// the array of a three member group in a four leaf tree: leaves at 0, 2, 4, the parent
+	// this test installed at 1, a blank at 3, and nodes 5 and 6 -- the right hand parent and
+	// the fourth leaf -- stripped because they are trailing blanks.
+	body := []byte{}
+	for _, entry := range []struct {
+		present bool
+		kind    NodeType
+		value   syntax.Marshaler
+	}{
+		{present: true, kind: NodeTypeLeaf, value: tree.Leaf(LeafIndex(0))},
+		{present: true, kind: NodeTypeParent, value: parent},
+		{present: true, kind: NodeTypeLeaf, value: tree.Leaf(LeafIndex(1))},
+		{present: false},
+		{present: true, kind: NodeTypeLeaf, value: tree.Leaf(LeafIndex(2))},
+	} {
+		if !entry.present {
+			body = append(body, 0x00)
+			continue
+		}
+		encoded, err := syntax.Marshal(entry.value)
+		if err != nil {
+			t.Fatalf("marshal a golden node: %v", err)
+		}
+		body = append(body, 0x01, byte(entry.kind))
+		body = append(body, encoded...)
+	}
+	want := append(handWrittenVarint(t, len(body)), body...)
+
+	got, err := syntax.Marshal(tree)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("the ratchet_tree encoding is %d bytes beginning %x, and the hand derived array is %d bytes beginning %x",
+			len(got), got[:min(len(got), 24)], len(want), want[:min(len(want), 24)])
+	}
+	// and the truncation is a fact about the ARRAY rather than about these bytes: a four leaf
+	// tree has seven nodes and this encoding carries five entries.
+	if tree.NodeWidth() != 7 {
+		t.Fatalf("the fixture is %d nodes wide, and this golden is written for the seven node tree a three member group sits in", tree.NodeWidth())
+	}
+	entries := 0
+	scan, err := syntax.NewReader(got).ReadSub()
+	if err != nil {
+		t.Fatalf("ReadSub: %v", err)
+	}
+	for !scan.Empty() {
+		if err := (&OptionalNode{}).UnmarshalMLS(scan); err != nil {
+			t.Fatalf("scan entry %d: %v", entries, err)
+		}
+		entries += 1
+	}
+	if entries != 5 {
+		t.Fatalf("the encoding carries %d entries over a seven node tree, want the five the trailing blank rule leaves", entries)
+	}
+}
+
+func TestRatchetTreeMarshalRoundTrip(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	for _, n := range []uint32{1, 2, 3, 5, 8} {
+		tree, _ := newTestTree(t, crypto, n)
+		if err := tree.SetParent(NodeIndex(1), &ParentNode{
+			EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x88}, 32)),
+			ParentHash:     bytes.Repeat([]byte{0x99}, 32),
+			UnmergedLeaves: []LeafIndex{1},
+		}); n >= 2 && err != nil {
+			t.Fatalf("n=%d SetParent: %v", n, err)
+		}
+		encoded, err := syntax.Marshal(tree)
+		if err != nil {
+			t.Fatalf("n=%d Marshal: %v", n, err)
+		}
+		out, err := UnmarshalRatchetTree(encoded)
+		if err != nil {
+			t.Fatalf("n=%d UnmarshalRatchetTree: %v", n, err)
+		}
+		if out.MemberCount() != n {
+			t.Fatalf("n=%d decoded member count = %d", n, out.MemberCount())
+		}
+		reencoded, err := syntax.Marshal(out)
+		if err != nil {
+			t.Fatalf("n=%d re-Marshal: %v", n, err)
+		}
+		if !bytes.Equal(reencoded, encoded) {
+			t.Fatalf("n=%d re-encode differs", n)
+		}
+		// the decoded VALUE and not only the bytes, which is the half a dropped field is
+		// invisible to: a codec that lost the parent node from both halves re-encodes byte
+		// exact and hands back a tree with a blank where the parent stood.
+		if n >= 2 {
+			decodedParent := out.ParentAt(NodeIndex(1))
+			if decodedParent == nil {
+				t.Fatalf("n=%d the parent at node 1 did not survive the round trip", n)
+			}
+			if !bytes.Equal(decodedParent.EncryptionKey, bytes.Repeat([]byte{0x88}, 32)) ||
+				!bytes.Equal(decodedParent.ParentHash, bytes.Repeat([]byte{0x99}, 32)) ||
+				!slices.Equal(decodedParent.UnmergedLeaves, []LeafIndex{1}) {
+				t.Fatalf("n=%d the decoded parent is %+v", n, decodedParent)
+			}
+		}
+		for i := uint32(0); i < n; i += 1 {
+			before, after := tree.Leaf(LeafIndex(i)), out.Leaf(LeafIndex(i))
+			if after == nil {
+				t.Fatalf("n=%d leaf %d is blank after the round trip", n, i)
+			}
+			if !bytes.Equal(after.SignatureKey, before.SignatureKey) ||
+				!bytes.Equal(after.EncryptionKey, before.EncryptionKey) {
+				t.Fatalf("n=%d leaf %d came back holding another leaf's keys", n, i)
+			}
+		}
+		// and the tree the decoder built is the same shape, not merely the same members
+		if out.LeafWidth() != tree.LeafWidth() || out.NodeWidth() != tree.NodeWidth() {
+			t.Fatalf("n=%d decoded a %d leaf / %d node tree out of a %d leaf / %d node one",
+				n, out.LeafWidth(), out.NodeWidth(), tree.LeafWidth(), tree.NodeWidth())
+		}
+	}
+}
+
+// TestEveryDecodedRatchetTreeIsACompleteTree is the half of the decode the round trip cannot
+// see.
+//
+// RFC 9420 section 12.4.3.3 has the receiver "extend the tree to the right until it has a
+// length of the form 2^(d+1) - 1", and a decoder that skipped that step is invisible to every
+// symmetry property this file holds: the truncated array of a three member group is five nodes,
+// which is 2n-1 for n=3, so it round trips byte exact, reports three members, and puts the root
+// at node 3 where the group's root is node 3 of a SEVEN node tree. Every direct path, copath,
+// parent hash and tree hash computed against it is then taken over a different tree.
+//
+// So the property is the shape and not the bytes, asked through the arithmetic the container
+// itself is built on rather than through a table of widths: the leaf count must be one
+// IsFullLeafCount accepts, the node width must be NodeWidth of that count, and the width must
+// be the one the encoder's own tree had.
+func TestEveryDecodedRatchetTreeIsACompleteTree(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	for _, n := range []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 17} {
+		tree, _ := newTestTree(t, crypto, n)
+		encoded, err := syntax.Marshal(tree)
+		if err != nil {
+			t.Fatalf("n=%d Marshal: %v", n, err)
+		}
+		out, err := UnmarshalRatchetTree(encoded)
+		if err != nil {
+			t.Fatalf("n=%d UnmarshalRatchetTree: %v", n, err)
+		}
+		if !IsFullLeafCount(out.LeafWidth()) {
+			t.Errorf("n=%d decoded a tree of %d leaves, which is not a complete tree", n, out.LeafWidth())
+		}
+		if got := NodeWidth(out.LeafWidth()); got != out.NodeWidth() {
+			t.Errorf("n=%d decoded %d nodes over %d leaves, and a complete tree of that many leaves is %d nodes",
+				n, out.NodeWidth(), out.LeafWidth(), got)
+		}
+		if _, err := LeafCountFromNodeWidth(out.NodeWidth()); err != nil {
+			t.Errorf("n=%d decoded a %d node array, which is not 2n-1 for any n: %v", n, out.NodeWidth(), err)
+		}
+		if out.LeafWidth() != tree.LeafWidth() {
+			t.Errorf("n=%d decoded a %d leaf tree out of a %d leaf one, so the root moved",
+				n, out.LeafWidth(), tree.LeafWidth())
+		}
+		// the padding is BLANK and not something the decoder invented, and it is where the
+		// encoder's own tree had blanks
+		for x := uint32(0); x < out.NodeWidth(); x += 1 {
+			if out.IsBlank(NodeIndex(x)) != tree.IsBlank(NodeIndex(x)) {
+				t.Errorf("n=%d node %d is blank=%v after the round trip and blank=%v before it",
+					n, x, out.IsBlank(NodeIndex(x)), tree.IsBlank(NodeIndex(x)))
+			}
+		}
+	}
+}
+
+// TestTheRatchetTreeCodecIsHandedTheRaisedLimitAtTheProductsGroupSize is the only test in this
+// package that can tell MaxVectorLength from MaxRatchetTreeLength.
+//
+// p1 caps every vector at MaxVectorLength, one mebibyte, EXCEPT the ratchet tree, which gets
+// MaxRatchetTreeLength, sixteen. That exception exists for this structure, and it is not a
+// margin: MASTER sizes the product at 500 members with two devices each, and every leaf of this
+// profile carries a 1216 byte X-Wing key in an urmessage_leaf_keys extension, so the thousand
+// leaf tree that group sits in encodes to about 1.33 MiB. A codec handed the default limit
+// refuses that tree -- at ErrLengthExceedsMax, which reads as a corrupt Welcome rather than as
+// a limit.
+//
+// An eight leaf tree cannot see any of this, which is why the size is asserted before anything
+// else: a fixture that shrank below the default limit would leave every assertion below passing
+// against either bound, and the test would go on reporting a clean bill over the one decision it
+// exists to make. The two directions are then failed SEPARATELY, because a raise wired into the
+// decode alone still refuses to publish this product's own group.
+func TestTheRatchetTreeCodecIsHandedTheRaisedLimitAtTheProductsGroupSize(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, productGroupLeafCount)
+	encoded, err := marshalRatchetTree(tree)
+	if err != nil {
+		t.Fatalf("marshalRatchetTree at %d leaves: %v; this is the encode the raised bound exists for",
+			productGroupLeafCount, err)
+	}
+	t.Logf("a %d leaf tree (%d members x 2 devices) encodes to %d bytes; MaxVectorLength is %d and MaxRatchetTreeLength is %d",
+		productGroupLeafCount, productGroupLeafCount/2, len(encoded), syntax.MaxVectorLength, syntax.MaxRatchetTreeLength)
+	if len(encoded) <= syntax.MaxVectorLength {
+		t.Fatalf("the fixture encodes to %d bytes, which the default limit of %d accepts, so nothing below can tell the two limits apart",
+			len(encoded), syntax.MaxVectorLength)
+	}
+	if len(encoded) > syntax.MaxRatchetTreeLength {
+		t.Fatalf("the fixture encodes to %d bytes and the ratchet tree bound is %d, so this product's own group does not fit the limit p1 raised for it",
+			len(encoded), syntax.MaxRatchetTreeLength)
+	}
+
+	// the ENCODE at the default limit refuses it, which is what makes marshalRatchetTree's
+	// existence a decision rather than a convenience wrapper
+	if _, err := syntax.Marshal(tree); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("syntax.Marshal of a %d leaf tree answered %v, want syntax.ErrLengthExceedsMax; if the default limit encodes this tree the raised one is not load bearing",
+			productGroupLeafCount, err)
+	}
+	// and the DECODE at the default limit refuses it
+	if err := syntax.Unmarshal(encoded, &RatchetTree{}); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("syntax.Unmarshal of the same bytes answered %v, want syntax.ErrLengthExceedsMax", err)
+	}
+
+	out, err := UnmarshalRatchetTree(encoded)
+	if err != nil {
+		t.Fatalf("UnmarshalRatchetTree at %d leaves: %v; this is the decode the raised bound exists for",
+			productGroupLeafCount, err)
+	}
+	if out.MemberCount() != productGroupLeafCount {
+		t.Fatalf("decoded %d members out of a %d member tree", out.MemberCount(), productGroupLeafCount)
+	}
+	reencoded, err := marshalRatchetTree(out)
+	if err != nil {
+		t.Fatalf("re-marshalRatchetTree: %v", err)
+	}
+	if !bytes.Equal(reencoded, encoded) {
+		t.Fatalf("the re-encoding of a %d leaf tree differs from its encoding", productGroupLeafCount)
+	}
+	// the extension a GroupInfo carries is these same bytes under this extension's own tag
+	ext, err := tree.Encode()
+	if err != nil {
+		t.Fatalf("Encode at %d leaves: %v", productGroupLeafCount, err)
+	}
+	if !bytes.Equal(ext.ExtensionData, encoded) {
+		t.Errorf("the extension body is not the tree encoding")
+	}
+}
+
+func TestRatchetTreeRefusesTrailingBlankNodes(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 3)
+	encoded, err := syntax.Marshal(tree)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// append one more optional<Node> that is absent. the length prefix moves, so rebuild it
+	// rather than patching bytes.
+	padded, err := marshalRatchetTreeWithTrailingBlank(tree)
+	if err != nil {
+		t.Fatalf("marshalRatchetTreeWithTrailingBlank: %v", err)
+	}
+	if bytes.Equal(padded, encoded) {
+		t.Fatalf("the padded encoding is identical to the canonical one")
+	}
+	// the padded array is a legal ENCODING that this decoder must refuse, and not merely one
+	// that fails to parse: everything up to the last entry decodes, which is what makes the
+	// refusal a rule rather than a syntax error.
+	if _, err := UnmarshalRatchetTree(encoded); err != nil {
+		t.Fatalf("the canonical encoding of the same tree does not decode: %v", err)
+	}
+	if _, err := UnmarshalRatchetTree(padded); !errors.Is(err, errTrailingBlankNodes) {
+		t.Fatalf("err = %v, want the ValSem300 refusal", err)
+	}
+	// an array that is nothing BUT blanks is the same refusal, which is the case a check
+	// written over the first entry rather than the last would report differently
+	allBlank := syntax.NewWriter()
+	allBlank.WriteOpaque([]byte{0x00, 0x00, 0x00})
+	blanks, err := allBlank.Bytes()
+	if err != nil {
+		t.Fatalf("build the all blank array: %v", err)
+	}
+	if _, err := UnmarshalRatchetTree(blanks); !errors.Is(err, errTrailingBlankNodes) {
+		t.Fatalf("an array of three absent nodes answered %v, want the ValSem300 refusal", err)
+	}
+	// the same fact through the accessor the group lifecycle and validation plans call, so a
+	// tree that was built rather than decoded is caught too.
+	if !tree.HasTrailingBlankNodes() {
+		t.Fatalf("a width-4 tree holding three leaves has trailing blank nodes")
+	}
+}
+
+// TestRatchetTreeRefusesAnEmptyNodeArray is the case ValSem300 accepts without ever looking.
+//
+// The rule is naturally written "if the array is non-empty and its last entry is blank, refuse",
+// and the guard is what makes it wrong: a vector of ZERO entries carries no non-blank last node,
+// so RFC 9420 section 12.4.3.3's "the receiver MUST check that the last node in ratchet_tree is
+// non-blank" is failed by it exactly as it is failed by a padded one -- and the guarded form
+// skips the whole rule for it. What the earlier reading produced was the one leaf blank tree,
+// which is a tree HasTrailingBlankNodes reports true for: the decoder would have answered with
+// a tree the rule it had just applied forbids.
+//
+// The refusal is ErrTreeMalformed rather than the ValSem300 one, because a node array of width
+// zero is not 2n-1 for any n, which is the same reason NewRatchetTree's floor is one leaf and
+// not nothing.
+func TestRatchetTreeRefusesAnEmptyNodeArray(t *testing.T) {
+	// one zero length prefix octet: a legal syntax encoding of a ratchet_tree carrying no node
+	empty := syntax.NewWriter()
+	empty.WriteOpaque(nil)
+	encoded, err := empty.Bytes()
+	if err != nil {
+		t.Fatalf("build the empty array: %v", err)
+	}
+	if !bytes.Equal(encoded, []byte{0x00}) {
+		t.Fatalf("the empty ratchet_tree is %x, want a single zero length prefix", encoded)
+	}
+	out, err := UnmarshalRatchetTree(encoded)
+	if !errors.Is(err, ErrTreeMalformed) {
+		t.Fatalf("the empty array answered (%v, %v), want ErrTreeMalformed", out, err)
+	}
+	// and what the unchecked reading would have handed back is a tree that fails the rule
+	if !NewRatchetTree().HasTrailingBlankNodes() {
+		t.Fatalf("the one leaf blank tree does not report a trailing blank, so the case above is not the one this test is about")
+	}
+	// the encode half of the same fact: a tree with no non-blank node is refused rather than
+	// written as the empty array, so this implementation never sends what it will not accept
+	if _, err := marshalRatchetTree(NewRatchetTree()); !errors.Is(err, ErrTreeMalformed) {
+		t.Errorf("encoding a wholly blank tree answered %v, want ErrTreeMalformed", err)
+	}
+}
+
+func TestRatchetTreeRejectsNodeTypeInWrongPosition(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 2)
+	// put a parent node at node index 0, which is a leaf position.
+	tree.nodes[0] = &Node{NodeType: NodeTypeParent, Parent: &ParentNode{
+		EncryptionKey: HpkePublicKey(bytes.Repeat([]byte{0xAA}, 32)),
+	}}
+	encoded, err := syntax.Marshal(tree)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if _, err := UnmarshalRatchetTree(encoded); !errors.Is(err, ErrNodeTypeMismatch) {
+		t.Fatalf("err = %v, want ErrNodeTypeMismatch", err)
+	}
+	// the mirror image, which a check written for one parity alone accepts: a LeafNode at an
+	// odd index. Node 1 is the parent position of a two leaf tree.
+	other, _ := newTestTree(t, crypto, 2)
+	other.nodes[1] = &Node{NodeType: NodeTypeLeaf, Leaf: other.Leaf(LeafIndex(0))}
+	encoded, err = syntax.Marshal(other)
+	if err != nil {
+		t.Fatalf("Marshal a leaf at a parent index: %v", err)
+	}
+	if _, err := UnmarshalRatchetTree(encoded); !errors.Is(err, ErrNodeTypeMismatch) {
+		t.Fatalf("a LeafNode at node index 1 answered %v, want ErrNodeTypeMismatch", err)
+	}
+	// and an octet naming neither arm is refused rather than defaulted to one of them
+	third, _ := newTestTree(t, crypto, 2)
+	third.nodes[0] = &Node{NodeType: NodeType(7), Leaf: third.Leaf(LeafIndex(0))}
+	if _, err := syntax.Marshal(third); !errors.Is(err, ErrTreeMalformed) {
+		t.Fatalf("encoding a node of no type answered %v, want ErrTreeMalformed", err)
+	}
+}
+
+func TestRatchetTreeRejectsABadPresenceOctet(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 2)
+	encoded, err := syntax.Marshal(tree)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// the first octet of the vector body is the first node's presence octet. the length prefix
+	// is variable-width, so find its length by decoding rather than by assuming an offset.
+	body, err := syntax.NewReader(encoded).ReadSub()
+	if err != nil {
+		t.Fatalf("ReadSub: %v", err)
+	}
+	prefixLen := len(encoded) - body.Remaining()
+	if encoded[prefixLen] != 0x01 {
+		t.Fatalf("the octet at %d is %#x and the first entry of this tree is present, so the offset is not the presence octet",
+			prefixLen, encoded[prefixLen])
+	}
+	mutated := append([]byte{}, encoded...)
+	mutated[prefixLen] = 0x02
+	if _, err := UnmarshalRatchetTree(mutated); !errors.Is(err, syntax.ErrOptionalPresence) {
+		t.Fatalf("err = %v, want ErrOptionalPresence", err)
+	}
+}
+
+// TestUnmarshalRatchetTreeRefusesBytesAfterTheVector is the full consumption half, which
+// syntax.UnmarshalLimit carries and a hand rolled reader would not.
+//
+// A ratchet_tree extension body with anything after the array is a body whose sender and
+// receiver disagree about where the structure ends, and every byte of it is covered by the
+// GroupInfo signature the extension travels under.
+func TestUnmarshalRatchetTreeRefusesBytesAfterTheVector(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 3)
+	encoded, err := syntax.Marshal(tree)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if _, err := UnmarshalRatchetTree(encoded); err != nil {
+		t.Fatalf("the encoding without a tail does not decode: %v", err)
+	}
+	for _, tail := range [][]byte{{0x00}, {0x01}, bytes.Repeat([]byte{0xff}, 16)} {
+		trailing := append(append([]byte{}, encoded...), tail...)
+		if _, err := UnmarshalRatchetTree(trailing); !errors.Is(err, syntax.ErrTrailingBytes) {
+			t.Errorf("a %d byte tail answered %v, want syntax.ErrTrailingBytes", len(tail), err)
+		}
+	}
+	// and a truncated array is refused rather than read as a shorter tree
+	if _, err := UnmarshalRatchetTree(encoded[:len(encoded)-1]); err == nil {
+		t.Errorf("an encoding one byte short decoded without complaint")
+	}
+}
+
+// TestEveryRatchetTreeExtensionThisPackageBuildsCarriesItsOwnTag is the guarantee the
+// Encode/Parse pair exists for: no call site can pair a ratchet_tree body with another
+// extension's code point.
+//
+// Extension.ExtensionData is opaque, so nothing in the type system holds that, and an
+// extensions vector carrying a tree body under some other tag is a structure that encodes,
+// signs and travels. Task 4's review found this guarantee claimed and not held, and the fix was
+// a read side that checks the tag rather than a restated claim -- so both halves are asserted
+// here: the write side produces only the right tag, and the read side refuses every other one.
+//
+// The refusal is swept over the WHOLE uint16 tag space rather than over the code points this
+// package happens to declare. A list of seven names is the shape that understates the class: an
+// extension registered later, or a private code point a peer chose, is exactly the tag nobody
+// would have written down.
+func TestEveryRatchetTreeExtensionThisPackageBuildsCarriesItsOwnTag(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 3)
+	ext, err := tree.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if ext.ExtensionType != ExtensionTypeRatchetTree {
+		t.Fatalf("Encode tagged the body 0x%04x, want ratchet_tree 0x%04x",
+			uint16(ext.ExtensionType), uint16(ExtensionTypeRatchetTree))
+	}
+	back, err := ParseRatchetTreeFrom(ext)
+	if err != nil {
+		t.Fatalf("ParseRatchetTreeFrom its own Encode: %v", err)
+	}
+	if back.MemberCount() != 3 || back.NodeWidth() != tree.NodeWidth() {
+		t.Fatalf("the extension carried a %d member / %d node tree out of a 3 member / %d node one",
+			back.MemberCount(), back.NodeWidth(), tree.NodeWidth())
+	}
+
+	// the whole tag space, with a body short enough that 65536 refusals cost nothing. Exactly
+	// one code point may get past the tag check, and every other must be refused BEFORE the
+	// body is looked at, which is what the sentinel separates.
+	probe := []byte{0x01, 0x01}
+	past := []ExtensionType{}
+	for tag := 0; tag < 1<<16; tag += 1 {
+		_, err := ParseRatchetTreeFrom(Extension{
+			ExtensionType: ExtensionType(tag),
+			ExtensionData: probe,
+		})
+		if err == nil {
+			t.Fatalf("tag 0x%04x parsed %x as a ratchet tree", tag, probe)
+		}
+		if !errors.Is(err, ErrRatchetTreeExtensionTag) {
+			past = append(past, ExtensionType(tag))
+		}
+	}
+	if !slices.Equal(past, []ExtensionType{ExtensionTypeRatchetTree}) {
+		t.Fatalf("the tag check let %v past, want exactly ratchet_tree 0x%04x",
+			past, uint16(ExtensionTypeRatchetTree))
+	}
+
+	// a refusal of the BODY keeps its own sentinel rather than being folded into the tag one,
+	// which is what lets a caller tell "you handed me the wrong entry" from "this peer's tree
+	// is not one I may adopt"
+	padded, err := marshalRatchetTreeWithTrailingBlank(tree)
+	if err != nil {
+		t.Fatalf("marshalRatchetTreeWithTrailingBlank: %v", err)
+	}
+	_, err = ParseRatchetTreeFrom(Extension{
+		ExtensionType: ExtensionTypeRatchetTree,
+		ExtensionData: padded,
+	})
+	if !errors.Is(err, errTrailingBlankNodes) {
+		t.Errorf("a padded body under the right tag answered %v, want the ValSem300 refusal", err)
+	}
+	if errors.Is(err, ErrRatchetTreeExtensionTag) {
+		t.Errorf("a body refusal answers to the tag sentinel, so the two conditions are no longer distinguishable")
+	}
+
+	// and the entry FindExtension hands a caller out of a real extensions vector is the one
+	// this pair accepts, which is the shape the group lifecycle plan uses
+	body, found := FindExtension([]Extension{ext}, ExtensionTypeRatchetTree)
+	if !found {
+		t.Fatalf("FindExtension did not find the entry Encode built")
+	}
+	if !bytes.Equal(body, ext.ExtensionData) {
+		t.Fatalf("FindExtension answered a different body")
+	}
+}
+
+// TestValSem300sSentinelIsStillCarriedByThisPackage is the swap gate psk.go's header describes,
+// written for ValSem300.
+//
+// The validation plan owns the single declaration site for ErrTrailingBlankNodes and for
+// ValSem itself; until that plan lands, tree.go carries the refusal as the unexported
+// errTrailingBlankNodes. The moment the exported name arrives, this fails and names what is
+// owed: wrap the detail in ValSem(ValSem300, ...) with the catalogue's sentinel and delete the
+// unexported one.
+//
+// A scan that read nothing would report every name as still pending and pass, so the positive
+// and negative controls below are what separate "not landed" from "not looked".
+func TestValSem300sSentinelIsStillCarriedByThisPackage(t *testing.T) {
+	declared := packageLevelDeclarations(t, ".")
+	if _, ok := declared["ErrTreeMalformed"]; !ok {
+		t.Fatal("the scan did not find ErrTreeMalformed, which this package certainly declares, so it is reporting every name below as pending having read nothing")
+	}
+	if _, ok := declared["ThisSymbolDoesNotExistAnywhereInPackageMls"]; ok {
+		t.Fatal("the scan reports a symbol that cannot exist, so it is matching text rather than declarations")
+	}
+	for _, name := range []string{"ErrTrailingBlankNodes", "ValSem", "ValSem300"} {
+		if file, ok := declared[name]; ok {
+			t.Errorf("%s has landed in %s, so the unexported errTrailingBlankNodes in tree.go is now a second declaration site for one refusal; wrap the detail in ValSem(ValSem300, ...) and delete it",
+				name, file)
+		}
+	}
+	if errTrailingBlankNodes == nil || !strings.HasPrefix(errTrailingBlankNodes.Error(), "mls: ") {
+		t.Fatalf("errTrailingBlankNodes reads %v; every typed error of this package names the package it came from", errTrailingBlankNodes)
+	}
+	// and it is its own condition rather than an alias of one of the tree's structural refusals
+	for name, other := range map[string]error{
+		"ErrTreeMalformed":    ErrTreeMalformed,
+		"ErrNodeTypeMismatch": ErrNodeTypeMismatch,
+	} {
+		if errors.Is(errTrailingBlankNodes, other) || errors.Is(other, errTrailingBlankNodes) {
+			t.Errorf("the ValSem300 refusal and %s answer for each other, so a caller branching on the pair reads one as the other", name)
+		}
+	}
+}

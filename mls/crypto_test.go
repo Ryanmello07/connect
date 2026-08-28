@@ -2948,6 +2948,40 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{parsed.DeviceXwingPub}
 		}},
+		// the ratchet_tree extension body, in this class for the row above's reason one level
+		// up. A whole tree of leaves is decoded here and the group derives its epoch over the
+		// result, so a leaf key that VIEWED the buffer it arrived in is a key whoever owns that
+		// buffer can change after the tree was validated and before anything is sealed to it --
+		// with the tree hash still matching, because the hash is over the bytes and not over
+		// what was read out of them. The raised limit does not change the question: it is the
+		// same bytes, sixteen times as many of them.
+		{name: "UnmarshalRatchetTree", call: func(take func([]byte) []byte) [][]byte {
+			leaf, leafErr := NewLeafNode(crypto, SignaturePrivateKey(bytes.Repeat([]byte{0x54}, 32)),
+				Credential{CredentialType: CredentialTypeBasic, Identity: []byte("alice")},
+				HpkePublicKey(pub), leafNodeStubCapabilities(), nil)
+			if leafErr != nil {
+				t.Fatalf("NewLeafNode for a tree to decode: %v", leafErr)
+			}
+			tree := NewRatchetTree()
+			if setErr := tree.SetLeaf(LeafIndex(0), leaf); setErr != nil {
+				t.Fatalf("SetLeaf: %v", setErr)
+			}
+			encoded, encodeErr := marshalRatchetTree(tree)
+			if encodeErr != nil {
+				t.Fatalf("marshalRatchetTree: %v", encodeErr)
+			}
+			out, parseErr := UnmarshalRatchetTree(take(encoded))
+			if parseErr != nil {
+				t.Fatalf("UnmarshalRatchetTree: %v", parseErr)
+			}
+			decoded := out.Leaf(LeafIndex(0))
+			if decoded == nil {
+				t.Fatalf("the decoded tree has no leaf at index 0")
+			}
+			// the signature is left out for NewLeafNode's reason: it covers a Lifetime
+			// stamped off the wall clock, so two calls a second apart carry different ones
+			return [][]byte{decoded.EncryptionKey, decoded.SignatureKey, decoded.Credential.Identity}
+		}},
 		{name: "hpkeLabeledExtract", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{hpkeLabeledExtract(take(kemSuiteId), take(ikm), "eae_prk", take(sharedSecret))}
 		}},

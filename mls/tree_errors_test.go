@@ -44,8 +44,9 @@ const treeErrorsFile = "tree_errors.go"
 // errors wrap. Its error class is derived from it for the same reason.
 const treeMathErrorsFile = "tree_math.go"
 
-// treeOwnedErrors is the thirteen the interface registry names as this plan's, keyed by the
-// name each is declared under so the derivation below can compare the two sets by name.
+// treeOwnedErrors is the thirteen the interface registry names as this plan's plus the one
+// task 11 added, keyed by the name each is declared under so the derivation below can
+// compare the two sets by name.
 //
 // Nothing here is trusted: TestTreeOwnedErrorsIsEveryDeclarationOfItsFile holds this map to
 // what tree_errors.go actually declares, in both directions.
@@ -63,6 +64,7 @@ var treeOwnedErrors = map[string]error{
 	"ErrLeafKeysExtensionInvalid": ErrLeafKeysExtensionInvalid,
 	"ErrNoPathSecret":             ErrNoPathSecret,
 	"ErrPathSecretMismatch":       ErrPathSecretMismatch,
+	"ErrRatchetTreeExtensionTag":  ErrRatchetTreeExtensionTag,
 }
 
 // treeMathOwnedErrors is every error tree_math.go declares, which is the class the
@@ -171,8 +173,8 @@ func TestTreeMathOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) {
 // same commit, with a reason. What stops the list shrinking, and what stops it lagging behind
 // the file, is TestTreeOwnedErrorsIsEveryDeclarationOfItsFile rather than this number.
 func TestTreeErrorsAreDistinctAndNamed(t *testing.T) {
-	if len(treeOwnedErrors) != 13 {
-		t.Fatalf("this plan owns %d errors and the interface registry's tree_errors.go block names 13; if one landed or left, say so here in the same commit",
+	if len(treeOwnedErrors) != 14 {
+		t.Fatalf("this plan owns %d errors and the interface registry's tree_errors.go block names 13, plus ErrRatchetTreeExtensionTag which task 11 added; if one landed or left, say so here in the same commit",
 			len(treeOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(treeOwnedErrors))
@@ -515,7 +517,7 @@ func treePlanSourceFiles(t *testing.T) []string {
 		files[file] = true
 	}
 	if !files[treeErrorsFile] {
-		t.Fatalf("the derivation did not reach %s, which declares this plan's thirteen errors, so it is reading something other than the package",
+		t.Fatalf("the derivation did not reach %s, which declares this plan's fourteen errors, so it is reading something other than the package",
 			treeErrorsFile)
 	}
 	return slices.Sorted(maps.Keys(files))

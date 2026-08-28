@@ -3,18 +3,26 @@
 // Kept out of errors.go for the reason errors_key_schedule.go gives: every ValSem-numbered
 // sentinel and every ErrProfile* is the validation plan's, declared once there, and two
 // plans editing one file during parallel waves is a merge conflict rather than a design
-// boundary but is a real one. The thirteen names below are reserved by this plan and
+// boundary but is a real one. The fourteen names below are reserved by this plan and
 // errors.go must not redeclare any of them -- package mls is one package, so a second
 // declaration is a compile error, which is the loud half; the quiet half is a shape where
 // both compiled, in two packages, and an errors.Is somewhere in the commit path stopped
 // matching without saying so.
 //
-// None of the thirteen is owed to another plan, which is the question p4's task 13 had to
+// None of the fourteen is owed to another plan, which is the question p4's task 13 had to
 // answer differently: ErrPskNonceLength, ErrPskType and ErrDuplicatePsk are ValSem401 to
 // ValSem403, so psk.go carries them unexported until the validation plan lands the real
-// names. Nothing here is in that position. The interface registry names all thirteen as this
-// plan's own and the validation plan's errors.go block declares none of them, so they are
-// exported here and the later tasks of this plan return them directly.
+// names. Nothing here is in that position. The interface registry names thirteen of the
+// fourteen as this plan's own and the validation plan's errors.go block declares none of
+// them, so they are exported here and the later tasks of this plan return them directly.
+//
+// The fourteenth, ErrRatchetTreeExtensionTag, is the one the registry does not name, and it
+// landed with task 11 rather than with this file. It is here and not in tree.go for the
+// reason the paragraph below gives -- an exported error in a file with no maintained class
+// is one no sweep of this package judges -- and it is exported rather than carried
+// unexported because no other plan declares it: the ValSem-numbered refusal task 11 owes
+// the validation plan is ValSem300, and THAT one is carried unexported in tree.go on
+// psk.go's terms.
 //
 // Two of them WRAP a sentinel this package already declares, and that is the only thing in
 // this file worth reading twice.
@@ -148,4 +156,18 @@ var (
 	// decrypt failure, because a secret that decrypted cleanly and then derives the wrong key
 	// means the sender's path and the tree disagree, which no retry and no re-fetch repairs.
 	ErrPathSecretMismatch = errors.New("mls: path secret does not derive the node public key in the tree")
+
+	// ErrRatchetTreeExtensionTag names an extensions<V> entry handed to ParseRatchetTreeFrom
+	// under some other extension type's code point. Extension.ExtensionData is opaque, so a
+	// ratchet_tree body under the external_senders tag is a structure that encodes, signs and
+	// travels, and the only thing that can refuse it is a read side that was given the tag.
+	//
+	// It answers for the TAG alone, which is the deliberate difference from
+	// ErrLeafKeysExtensionInvalid above, where one sentinel covers the tag and every refusal
+	// of the body. The leaf keys body has no refusals of its own to tell apart; the ratchet
+	// tree body has four -- ValSem300's trailing blank, ErrNodeTypeMismatch, ErrTreeMalformed
+	// and syntax.ErrLengthExceedsMax -- a caller repairing each does something different, and
+	// folding them into one name would hand a caller who passed the wrong entry a tree's
+	// repair.
+	ErrRatchetTreeExtensionTag = errors.New("mls: the extension is not tagged ratchet_tree")
 )

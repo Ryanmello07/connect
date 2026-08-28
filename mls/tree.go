@@ -28,6 +28,8 @@ package mls
 
 import (
 	"crypto/subtle"
+	"errors"
+	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
@@ -600,4 +602,386 @@ func (self *RatchetTree) Resolution(x NodeIndex) []NodeIndex {
 		return []NodeIndex{}
 	}
 	return out
+}
+
+// ---- the ratchet_tree extension body of RFC 9420 section 12.4.3.3, and ValSem300.
+//
+// Three things about this codec are decisions rather than transcription, and none of the three
+// is visible to a round trip.
+//
+// The SIZE. Every other field of this package is capped at syntax.MaxVectorLength, one
+// mebibyte, and this one is not: the ratchet_tree array is a whole tree rather than one MLS
+// structure, and p1 raised MaxRatchetTreeLength to sixteen mebibytes for this structure and no
+// other. It is not a theoretical margin. MASTER sizes the product at 500 members with two
+// devices each, which is a thousand occupied leaves in a 1024 leaf tree, and every leaf of this
+// profile carries an urmessage_leaf_keys extension holding a 1216 byte X-Wing key; that tree
+// encodes to about 1.33 MiB, which the default limit refuses. So both halves are wired to the
+// raised bound HERE, once, rather than left to a caller to remember --
+// TestTheRatchetTreeCodecIsHandedTheRaisedLimitAtTheProductsGroupSize is what holds it, and it
+// fails the encode and the decode separately, because either one at the default limit refuses a
+// legal group and reports it as a corrupt Welcome.
+//
+// The TRAILING BLANK. RFC 9420 section 12.4.3.3: "the sender MUST NOT include blank nodes after
+// the last non-blank node. The receiver MUST check that the last node in ratchet_tree is
+// non-blank, and then extend the tree to the right until it has a length of the form
+// 2^(d+1) - 1". That is ValSem300, and it is a refusal on the decode side and a truncation on
+// the encode side, so this implementation neither sends nor accepts the padded form.
+//
+// The EMPTY array, which is the branch a trailing blank check written as
+// len(nodes) > 0 && nodes[len(nodes)-1] == nil never looks at. A vector of zero entries carries
+// no non-blank last node, so it fails the RFC's requirement as surely as a padded one does, and
+// reading it as the one leaf blank tree would have the decoder answer with a tree that
+// HasTrailingBlankNodes reports true for -- the rule refused on the line above. It is
+// ErrTreeMalformed and not the ValSem300 refusal, because a zero width node array is not 2n-1
+// for any n, which is the same reason NewRatchetTree's floor is one leaf and not nothing.
+
+// errTrailingBlankNodes is ValSem300, carried unexported on psk.go's terms and for psk.go's
+// reason.
+//
+// The validation plan's catalogue numbers this refusal ValSem300 and owns the single
+// declaration site for ErrTrailingBlankNodes. Neither that name nor ValSem itself has landed in
+// this package, so the refusal is carried by the unexported value below until they do, and the
+// swap is then mechanical: ValSem(ValSem300, ...) with the catalogue's sentinel as the detail.
+//
+// Unexported is the whole point of the shape. An exported ErrTrailingBlankNodes declared here
+// would be a second public declaration site for a name the validation plan also declares, the
+// two would not be the same value, and a caller matching one would silently stop matching the
+// other. Every caller of this refusal is inside package mls until that plan lands -- the group
+// lifecycle plan's tree adoption and the validation plan's own ValSem300 entry point are both
+// package mls -- so a name that cannot be reached from outside this package costs nobody
+// outside it anything.
+//
+// The moment the swap is owed is not left to anybody's memory:
+// TestValSem300sSentinelIsStillCarriedByThisPackage fails on the commit that lands the exported
+// name.
+var errTrailingBlankNodes = errors.New("mls: the exported ratchet tree ends in a blank node")
+
+// MarshalMLS writes the node union of RFC 9420 section 12.4.3.3: the type octet, then the arm
+// the octet names.
+//
+// A Node whose type and payload disagree is ErrTreeMalformed rather than a nil write, because
+// the alternative is an encoding that says "leaf" and carries nothing, which a peer decodes as
+// a truncated structure and this implementation would have taken a tree hash over.
+func (self *Node) MarshalMLS(w *syntax.Writer) error {
+	switch self.NodeType {
+	case NodeTypeLeaf:
+		if self.Leaf == nil {
+			return ErrTreeMalformed
+		}
+		w.WriteUint8(uint8(self.NodeType))
+		return self.Leaf.MarshalMLS(w)
+	case NodeTypeParent:
+		if self.Parent == nil {
+			return ErrTreeMalformed
+		}
+		w.WriteUint8(uint8(self.NodeType))
+		return self.Parent.MarshalMLS(w)
+	default:
+		return ErrTreeMalformed
+	}
+}
+
+// UnmarshalMLS is position-agnostic on purpose: whether this node type is legal at the index it
+// was read from is the TREE decoder's check, because only the tree knows the index. What is
+// decided here is that the octet names an arm at all -- NodeType has no zero valued member, so
+// a Node that was never filled in cannot be mistaken for either kind.
+//
+// STAGED and assigned whole, for ParentNode.UnmarshalMLS's reason: the value this answers is a
+// function of the bytes it read and of nothing the receiver arrived holding, so a refused
+// decode leaves the receiver exactly as it found it rather than half written.
+func (self *Node) UnmarshalMLS(r *syntax.Reader) error {
+	nodeType, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	switch NodeType(nodeType) {
+	case NodeTypeLeaf:
+		leaf := &LeafNode{}
+		if err := leaf.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		self.NodeType, self.Leaf, self.Parent = NodeTypeLeaf, leaf, nil
+	case NodeTypeParent:
+		parent := &ParentNode{}
+		if err := parent.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		self.NodeType, self.Leaf, self.Parent = NodeTypeParent, nil, parent
+	default:
+		return ErrTreeMalformed
+	}
+	return nil
+}
+
+// the C1 pin: drift between this type and the one codec convention fails at build.
+var _ syntax.Codec = (*Node)(nil)
+
+// MarshalMLS writes optional<Node>: the presence octet, then the node when present.
+//
+// WriteOptional and ReadOptional own the octet, so a value that is neither 0 nor 1 is
+// syntax.ErrOptionalPresence and never has to be re-spelled in this package's own error set --
+// which matters more here than anywhere else in this package, because "any non-zero means
+// present" would give one blank many encodings and MLS signs over serialized forms.
+func (self *OptionalNode) MarshalMLS(w *syntax.Writer) error {
+	return w.WriteOptional(self.Present, func(w *syntax.Writer) error {
+		return self.Node.MarshalMLS(w)
+	})
+}
+
+// UnmarshalMLS reads optional<Node>, staged for Node.UnmarshalMLS's reason and for one of its
+// own: an absent entry must leave the receiver holding NO node rather than whatever it arrived
+// with, since a reused OptionalNode would otherwise report Present false while carrying the
+// previous entry's payload, and every reader of this type reaches Node only after asking
+// Present.
+func (self *OptionalNode) UnmarshalMLS(r *syntax.Reader) error {
+	node := Node{}
+	present, err := r.ReadOptional(func(r *syntax.Reader) error {
+		return node.UnmarshalMLS(r)
+	})
+	if err != nil {
+		return err
+	}
+	self.Present, self.Node = present, node
+	return nil
+}
+
+var _ syntax.Codec = (*OptionalNode)(nil)
+
+// writeOneOptionalNode is WriteVector's element encoder, named rather than written as a closure
+// for the reason writeOneUnmergedLeaf is: the codec entry gate in crypto_labels_test.go pins
+// every syntax call this package makes by its source text, and a closure carries its whole body
+// into that pin.
+//
+// A nil entry is an ABSENT optional and never a zero valued Node, which is the distinction this
+// whole file exists to keep: see the file header.
+func writeOneOptionalNode(w *syntax.Writer, node *Node) error {
+	optional := OptionalNode{Present: node != nil}
+	if node != nil {
+		optional.Node = *node
+	}
+	return optional.MarshalMLS(w)
+}
+
+// MarshalMLS writes the ratchet_tree extension body of RFC 9420 section 12.4.3.3:
+// optional<Node> ratchet_tree<V>, with every trailing blank stripped.
+//
+// The truncation is the sender half of ValSem300 and it is not an optimisation: the section
+// says the sender MUST NOT include blank nodes after the last non-blank one, so an encoder that
+// wrote the full width would produce an array every conforming receiver refuses, this
+// implementation's own decoder included.
+//
+// A tree with no non-blank node at all is refused rather than written as the empty array, for
+// the reason the header above gives: the empty array is not a ratchet_tree any receiver
+// accepts, so emitting it would make this the peer whose encode nobody -- itself included --
+// can decode. The container cannot reach that state through SetLeaf, so the refusal is about
+// the tree a later task builds by blanking every leaf rather than about anything reachable
+// today.
+func (self *RatchetTree) MarshalMLS(w *syntax.Writer) error {
+	end := len(self.nodes)
+	for end > 0 && self.nodes[end-1] == nil {
+		end -= 1
+	}
+	if end == 0 {
+		return ErrTreeMalformed
+	}
+	return syntax.WriteVector(w, self.nodes[:end], writeOneOptionalNode)
+}
+
+// UnmarshalMLS reads the ratchet_tree extension body, refuses ValSem300's trailing blank and a
+// node whose type contradicts its position, and extends the array to the next complete tree.
+//
+// The sub-reader is taken directly rather than through syntax.ReadVector, and that is the one
+// structural choice here worth stating: the element decoder needs the node INDEX to check type
+// against position, and ReadVector's element callback does not carry it. This is the sanctioned
+// form for a heterogeneous vector, and it takes on ReadVector's own obligation -- Done on the
+// sub-reader -- rather than dropping it, because an element decoder that had a read fail,
+// ignored its own error and returned successfully with the region happening to end there is
+// exactly the shape nothing else here would see.
+//
+// Staged into a local and assigned whole for the reason every other decoder in this file is: a
+// refused tree leaves the receiver exactly as it found it, which for a container a caller may
+// be decoding INTO over a live epoch's tree is the difference between a rejected Welcome and a
+// half replaced group.
+func (self *RatchetTree) UnmarshalMLS(r *syntax.Reader) error {
+	body, err := r.ReadSub()
+	if err != nil {
+		return err
+	}
+	nodes := []*Node{}
+	for !body.Empty() {
+		x := NodeIndex(len(nodes))
+		optional := &OptionalNode{}
+		if err := optional.UnmarshalMLS(body); err != nil {
+			return err
+		}
+		if !optional.Present {
+			nodes = append(nodes, nil)
+			continue
+		}
+		node := optional.Node
+		switch node.NodeType {
+		case NodeTypeLeaf:
+			// RFC 9420 section 12.4.3.3: "The leaves of the tree are stored in even-numbered
+			// entries in the array". A LeafNode at an odd index is refused and never coerced,
+			// because coercing would let a sender decide which of two structures every later
+			// tree hash and parent hash is computed over.
+			if !x.IsLeaf() {
+				return ErrNodeTypeMismatch
+			}
+		case NodeTypeParent:
+			if x.IsLeaf() {
+				return ErrNodeTypeMismatch
+			}
+		default:
+			return ErrTreeMalformed
+		}
+		nodes = append(nodes, &node)
+	}
+	if err := body.Done(); err != nil {
+		return err
+	}
+	// the empty array, which is NOT the one leaf tree -- see the header above. Checked before
+	// the trailing blank rather than folded into it, because a guard of the form
+	// len(nodes) > 0 && ... reads as the same rule and skips it for exactly this input.
+	if len(nodes) == 0 {
+		return ErrTreeMalformed
+	}
+	// ValSem300: "The receiver MUST check that the last node in ratchet_tree is non-blank".
+	if nodes[len(nodes)-1] == nil {
+		return errTrailingBlankNodes
+	}
+	// "and then extend the tree to the right until it has a length of the form 2^(d+1) - 1,
+	// adding the minimum number of blank values possible". ExtendedLeafCount is this package's
+	// doubling and it is what refuses to run past MaxLeafCount on a hostile length, so the bound
+	// is not re-derived here.
+	leafWidth := LeafCount(1)
+	for NodeWidth(leafWidth) < uint32(len(nodes)) {
+		extended, err := ExtendedLeafCount(leafWidth)
+		if err != nil {
+			return err
+		}
+		leafWidth = extended
+	}
+	padded := make([]*Node, NodeWidth(leafWidth))
+	copy(padded, nodes)
+	// the shape, DERIVED from the arithmetic rather than trusted from the loop above. A node
+	// array is a tree only if its width is 2n-1 for a leaf count that is a power of two, and
+	// both halves are asked because neither implies the other: a decoder that skipped the
+	// extension entirely answers 2n-1 for the truncated array of a three member group -- five
+	// nodes, three leaves -- and every round trip of it is byte exact, every member count
+	// correct, and every direct path, copath and tree hash computed against a root that is not
+	// where the group's is. TestEveryDecodedRatchetTreeIsACompleteTree is what holds it.
+	width, err := LeafCountFromNodeWidth(uint32(len(padded)))
+	if err != nil {
+		return err
+	}
+	if !IsFullLeafCount(width) {
+		return ErrTreeMalformed
+	}
+	self.nodes = padded
+	return nil
+}
+
+var _ syntax.Codec = (*RatchetTree)(nil)
+
+// marshalRatchetTree encodes the tree at the sixteen mebibyte ratchet_tree bound rather than at
+// the one mebibyte default every other field of this package gets.
+//
+// It exists because the decode side alone is not enough. syntax.Marshal caps the vector at
+// MaxVectorLength, and the tree this product is sized for exceeds that: a thousand leaves each
+// carrying a 1216 byte X-Wing key encode to about 1.33 MiB, so syntax.Marshal(tree) refuses a
+// legal group at syntax.ErrLengthExceedsMax and reports it as though the tree were malformed.
+// The interface registry resolves the group lifecycle plan's retired Encode() to
+// syntax.Marshal, and that resolution is right only for a group smaller than this product's
+// own sizing.
+//
+// UNEXPORTED, which is the half worth reading twice, because the obvious shape is the exported
+// twin of UnmarshalRatchetTree. A ratchet tree is an extension BODY, and
+// TestNoExportedSymbolOfThisPackageHandsOutAnExtensionBodyOnItsOwn says this package does not
+// hand one out loose: a byte run leaving here is a tag choice handed back to the caller, and
+// 0x0005 rather than 0x0002 encodes, is covered by the GroupInfo signature, and travels. Encode
+// is the way out, tag and body together. A caller inside this package that wants the bytes at
+// the raised bound for something that is NOT an extension -- local group state, say -- calls
+// this; one outside it has no business with a loose body.
+//
+// RatchetTree still implements syntax.Codec, so it stays a CheckRoundTrip target and an entry
+// in the validation plan's codec table, and the plain MarshalMLS simply carries whatever limit
+// the caller's Writer was opened at.
+func marshalRatchetTree(tree *RatchetTree) ([]byte, error) {
+	return syntax.MarshalLimit(tree, syntax.MaxRatchetTreeLength)
+}
+
+// UnmarshalRatchetTree decodes a ratchet_tree extension body at the sixteen mebibyte bound.
+//
+// This and marshalRatchetTree are the only two places in this package that raise the vector
+// limit. Decoding through plain syntax.Unmarshal would refuse a large group at
+// syntax.ErrLengthExceedsMax, which reads as a corrupt Welcome rather than as a limit, so the
+// raised limit is wired here once and no caller has to remember it. syntax.UnmarshalLimit also
+// enforces full consumption, so there is no separate trailing-bytes check: a body with anything
+// after the vector is syntax.ErrTrailingBytes.
+func UnmarshalRatchetTree(data []byte) (*RatchetTree, error) {
+	tree := &RatchetTree{}
+	if err := syntax.UnmarshalLimit(data, tree, syntax.MaxRatchetTreeLength); err != nil {
+		return nil, err
+	}
+	return tree, nil
+}
+
+// Encode answers the whole extensions<V> entry, tagged ratchet_tree, rather than a body a
+// caller then has to tag.
+//
+// It is spelled Encode() (Extension, error) and NOT Encode() ([]byte, error), which is the
+// signature the interface registry retired on this type in favour of syntax.Marshal. The two
+// are not the same method: a []byte answer hands the tag choice back to the caller, and
+// extension_test.go's extensionBodyTypesIn derives the sanctioned extension body class off
+// exactly this signature, so this spelling is what makes ParseRatchetTreeFrom a sanctioned
+// read side rather than a second codec. A caller that wanted the retired method wants
+// marshalRatchetTree.
+//
+// This is the Encode/Parse pair extension.go describes for urmessage_leaf_keys, and it is here
+// for the same reason: Extension.ExtensionData is opaque, so nothing in the type system stops a
+// call site pairing this body with some other extension's code point, and an extensions vector
+// carrying a ratchet_tree body under the external_senders tag is a structure that encodes,
+// signs and travels. The guarantee is that no call site can build the pairing wrong, and the
+// only spelling that holds it is one where the tag and the body are produced together --
+// TestEveryRatchetTreeExtensionThisPackageBuildsCarriesItsOwnTag is the half with teeth, and
+// ParseRatchetTreeFrom is the read side that refuses the pairing this side cannot produce.
+//
+// The body is encoded at the raised bound, so a group at this product's sizing has an extension
+// to put in a GroupInfo. Whether the GroupInfo ENCODE around it is also running at that bound
+// is the caller's decision and not one this call can make: Extension.MarshalMLS writes
+// ExtensionData through the caller's Writer, which caps it at whatever limit that Writer was
+// opened with.
+func (self *RatchetTree) Encode() (Extension, error) {
+	data, err := marshalRatchetTree(self)
+	if err != nil {
+		return Extension{}, err
+	}
+	return Extension{
+		ExtensionType: ExtensionTypeRatchetTree,
+		ExtensionData: data,
+	}, nil
+}
+
+// ParseRatchetTreeFrom decodes one extensions<V> entry as a ratchet_tree body, refusing any
+// entry that is not tagged ExtensionTypeRatchetTree.
+//
+// This is the half of the pair that has a tag to check, and it is the one a caller holding an
+// entry out of an extensions vector wants. UnmarshalRatchetTree is the half with no tag -- it
+// parses whatever it is handed -- and a caller who reaches for it with an Extension in hand,
+// pulling .ExtensionData out to pass it, has taken the guarantee off: it will decode an
+// external_senders body as a tree if the bytes happen to fit.
+//
+// Only the TAG answers ErrRatchetTreeExtensionTag. Every refusal of the body itself keeps its
+// own sentinel -- errTrailingBlankNodes for ValSem300, ErrNodeTypeMismatch, ErrTreeMalformed,
+// syntax.ErrLengthExceedsMax -- which is the deliberate difference from
+// ErrLeafKeysExtensionInvalid, where one sentinel covers both. The leaf keys body had no
+// refusals of its own to tell apart; this one has four, a caller repairing each does something
+// different, and collapsing them into one name would hand a wrong-tag caller a tree's repair.
+func ParseRatchetTreeFrom(ext Extension) (*RatchetTree, error) {
+	if ext.ExtensionType != ExtensionTypeRatchetTree {
+		return nil, fmt.Errorf("%w: extension type 0x%04x",
+			ErrRatchetTreeExtensionTag, uint16(ext.ExtensionType))
+	}
+	return UnmarshalRatchetTree(ext.ExtensionData)
 }

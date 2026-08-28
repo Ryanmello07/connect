@@ -606,8 +606,8 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"transcript.go: syntax.NewWriter()",
 		// the ratchet tree's unmerged_leaves<V>, the one vector a ParentNode carries. Writer
 		// and Reader taking rather than building one, so the pair runs under whichever limit
-		// the caller opened, which is the default one everywhere until a ratchet tree encode
-		// exists to raise it -- and this pair is not it. The raised bound belongs to the
+		// the caller opened, which since task 11 includes a ratchet tree encode running at the
+		// raised bound -- and this pair is still not it. The raised bound belongs to the
 		// ratchet_tree ARRAY of section 12.4.3.1, whose whole point is that it is larger than
 		// one MLS structure; a single parent node's unmerged list is bounded by the group's
 		// leaf count, and one allowed past MaxVectorLength is one no peer running the default
@@ -617,7 +617,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// That last sentence is a decision and NOT a consequence of these two calls, which is
 		// the thing to read twice here. The syntax package inherits its limit downwards on
 		// purpose -- subReader hands the parent's limit to every nested read, WriteVector
-		// builds its scratch at the outer one -- so the day a ratchet tree codec opens a
+		// builds its scratch at the outer one -- so now that a ratchet tree codec opens a
 		// writer at MaxRatchetTreeLength, this pair inherits it and one parent node's
 		// unmerged list may run to sixteen mebibytes, four million leaves, sixteen times the
 		// bound argued for above, with nothing failing. So tree.go's checkUnmergedLeavesBounded
@@ -625,8 +625,24 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// caller opened, and TestOneParentNodesUnmergedLeavesStayAtTheDefaultLimitUnderARaised
 		// One is what holds it. A limit decision recorded only in a comment is a limit
 		// decision the next task moves without noticing.
+		// the ratchet_tree extension body of section 12.4.3.3, which IS the raised one. This is
+		// the entry the comment above said would have to say so here, and both halves of it are
+		// wired to MaxRatchetTreeLength rather than only the decode side. The bound is not a
+		// margin: MASTER sizes this product at 500 members with two devices each, every leaf of
+		// this profile carries a 1216 byte X-Wing key in an urmessage_leaf_keys extension, and
+		// the resulting thousand leaf tree encodes to about 1.33 MiB -- so an encode or a decode
+		// left at MaxVectorLength refuses a legal group and reports it as a corrupt Welcome.
+		// TestTheRatchetTreeCodecIsHandedTheRaisedLimitAtTheProductsGroupSize is what separates
+		// the two limits, and it fails the two directions separately.
+		"tree.go: syntax.MarshalLimit(tree, syntax.MaxRatchetTreeLength)",
 		"tree.go: syntax.ReadVector(r, readOneUnmergedLeaf)",
+		"tree.go: syntax.UnmarshalLimit(data, tree, syntax.MaxRatchetTreeLength)",
 		"tree.go: syntax.WriteVector(w, self.UnmergedLeaves, writeOneUnmergedLeaf)",
+		// the ratchet_tree ARRAY itself. It takes the caller's Writer, so it runs at whichever
+		// limit that Writer was opened at -- the raised one when the caller is
+		// MarshalRatchetTree above, the default one for a caller that reached MarshalMLS through
+		// syntax.Marshal, which is the call that cannot carry this product's own group.
+		"tree.go: syntax.WriteVector(w, self.nodes[:end], writeOneOptionalNode)",
 		// marshalBytes, the preimage encoder every signature content and hash input of the
 		// TreeKEM plan is assembled through. The default limit and not the ratchet tree
 		// one, which is the distinction the helper exists to hold: a LeafNodeTBS and a

@@ -2721,6 +2721,29 @@ var extensionBodyTagsToStamp = map[string]struct {
 		},
 		refusal: ErrLeafKeysExtensionInvalid,
 	},
+	// the ratchet_tree body of RFC 9420 section 12.4.3.3, whose Encode is the raised limit
+	// encode with the tag stamped on. One occupied leaf and nothing else, because what the
+	// two tests below ask about is the TAG: a wider tree costs 65536 read backs each.
+	//
+	// The refusal is ErrRatchetTreeExtensionTag and not the tree's own structural sentinels,
+	// which is the one difference from the row above and is deliberate: the tree body has four
+	// refusals of its own that a caller repairs differently, so only the wrong TAG answers
+	// here. The sweep below is what says nothing else does.
+	"RatchetTree": {
+		tag: ExtensionTypeRatchetTree,
+		build: func() (Extension, error) {
+			tree := NewRatchetTree()
+			if err := tree.SetLeaf(LeafIndex(0), &LeafNode{Credential: BasicCredential([]byte("a")), LeafNodeSource: LeafNodeSourceUpdate}); err != nil {
+				return Extension{}, err
+			}
+			return tree.Encode()
+		},
+		readBack: func(ext Extension) error {
+			_, err := ParseRatchetTreeFrom(ext)
+			return err
+		},
+		refusal: ErrRatchetTreeExtensionTag,
+	},
 }
 
 // TestEveryExtensionBodyEncodeStampsTheTagOfItsOwnType is the behavioural half of the same

@@ -62,6 +62,15 @@ var (
 	_ func(syntax.Marshaler) ([]byte, error) = syntax.Marshal
 	_ func([]byte, syntax.Unmarshaler) error = syntax.Unmarshal
 
+	// the same pair at a caller chosen bound, which p5 task 11 is the first of this
+	// package to reach: the ratchet_tree array of RFC 9420 section 12.4.3.3 is the one
+	// structure p1 allows past MaxVectorLength, and marshalRatchetTree and
+	// UnmarshalRatchetTree are these two with MaxRatchetTreeLength fixed. The limit is
+	// the last parameter of each and it is an int, so the pin is what fails if either
+	// grows an argument or takes the bound as something else.
+	_ func(syntax.Marshaler, int) ([]byte, error) = syntax.MarshalLimit
+	_ func([]byte, syntax.Unmarshaler, int) error = syntax.UnmarshalLimit
+
 	// registry section 2 again, the vector pair. extensions<V> is the first structure in
 	// this package to reach them, and they are generic, so the pin instantiates them at
 	// the element type this package actually uses: a callback shape that moved would
@@ -87,6 +96,9 @@ var (
 // changes what errors.Is answers.
 var (
 	_ int   = syntax.MaxVectorLength
+	// the ratchet tree exception, and the only raised bound in this package. A constant
+	// retyped here would compile at both call sites and change which trees decode.
+	_ int   = syntax.MaxRatchetTreeLength
 	_ error = syntax.ErrTrailingBytes
 	_ error = syntax.ErrLengthExceedsMax
 
@@ -724,7 +736,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
-	"key_schedule_deps_test.go": 74,
+	"key_schedule_deps_test.go": 77,
 	"pins_test.go":              8,
 }
 
