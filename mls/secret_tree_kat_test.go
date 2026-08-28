@@ -26,12 +26,19 @@
 //     which node a leaf's secret comes from, were vendored and uncovered. That is what this
 //     runner adds and it is why it is worth having: a left/right swap in pathToLeaf is
 //     invisible to every other test in this package that reads this file.
-//   - both paths to one generation. A generation is reachable two ways -- NextSenderKey,
-//     which hands out the next one and cannot be asked twice, and ReceiverKey, which looks
-//     one up and consumes it -- and the corpus answers for both. They are compared separately
-//     rather than one assumed to follow the other, because step() and keyFor() are different
-//     code and an asymmetry between them is exactly a message this group can send and cannot
-//     read.
+//   - EVERY path to one generation, derived. A generation is reachable by four exported
+//     methods -- NextSenderKey and ReceiverKey, keyed on the ratchet type, and NextMessageKey
+//     and MessageKey, keyed on the ContentType the framing layer carries -- and the corpus
+//     answers for all of them. They are compared separately rather than one assumed to follow
+//     another, because step(), keyFor() and peekFor() are different code and an asymmetry
+//     between them is exactly a message this group can send and cannot read. The class is not
+//     written down here: it is stMethodsAnsweringBytes in secret_tree_test.go, the exported
+//     methods of *SecretTree that answer a []byte read off the compiled type, and every member
+//     of it must have a driver in this file. What this replaces named two of the four and
+//     called them "the two exported ways", which was false when it was written -- MessageKey
+//     answers exactly that question, through peekFor rather than keyFor. Measured: a third
+//     exported key source added to secret_tree.go passed every test in this file while the
+//     class was that list.
 //   - the aliasing refusal, over every answer one case publishes. All of them are AEAD key
 //     and nonce material of apparent random, and any two holding one value would be a corpus
 //     that cannot tell a handshake key from an application key, or leaf 3's from leaf 4's --
@@ -48,8 +55,12 @@
 // one that is missing: the deletions. Forward secrecy is the half of section 9 no known
 // answer test can observe -- a tree that kept every parent secret forever answers every
 // published question identically -- so the erasure gates stay secret_tree_test.go's. That was
-// measured rather than assumed: a zeroizeSecret deleted from takeLeafSecret passes this whole
-// file, and TestRatchetForErasesTheLeafSecretInPlaceOnceBothRootsExist next door is what fails.
+// measured rather than assumed, once per deletion, each paired with the test that is actually
+// the one to fail: zeroizeSecret(parentSecret) deleted from takeLeafSecret passes this whole
+// file and fails TestSecretTreeParentSecretIsGoneOnceBothChildrenExist, and
+// zeroizeSecret(leafSecret) deleted from ratchetFor passes this whole file and fails
+// TestRatchetForErasesTheLeafSecretInPlaceOnceBothRootsExist. The sentence this replaces named
+// the first function with the second test: both halves were true and the join was not.
 package mls
 
 import (
@@ -59,6 +70,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -84,19 +96,21 @@ const (
 	secretTreeKatGenerations = 2
 	// the sender data header does not ratchet: one key and one nonce for the whole case.
 	secretTreeKatSenderDataChecks = 2
-	// eight per published generation: two ratchet types, a key and a nonce each, reached once
-	// through the sender path and once through the receiver path. Held to the DERIVED ratchet
-	// type class by TestSecretTreeFamilyChecksAreEveryPathToAGeneration.
-	secretTreeKatChecksPerGeneration = 8
+	// sixteen per published generation: two ratchet types, a key and a nonce each, reached
+	// once through each of the four exported paths to a leaf's key material. Both factors are
+	// DERIVED and this transcription is held to them by
+	// TestSecretTreeFamilyChecksAreEveryPathToAGeneration.
+	secretTreeKatChecksPerGeneration = 16
 	secretTreeKatComparisons         = secretTreeKatCovered*secretTreeKatSenderDataChecks +
 		secretTreeKatLeaves*secretTreeKatGenerations*secretTreeKatChecksPerGeneration
 	// the distinct published answers those comparisons are made against: each leaf answer is
-	// compared twice, once per path, and each sender data answer once.
+	// compared once per path, and each sender data answer once.
 	secretTreeKatDistinct = secretTreeKatCovered*secretTreeKatSenderDataChecks +
-		secretTreeKatLeaves*secretTreeKatGenerations*(secretTreeKatChecksPerGeneration/2)
-	// the two paths a generation is reachable by, which is the factor above that is about this
-	// package's own surface rather than about the corpus.
-	secretTreeKatKeyPaths = 2
+		secretTreeKatLeaves*secretTreeKatGenerations*(secretTreeKatChecksPerGeneration/secretTreeKatKeyPaths)
+	// the paths a generation is reachable by, which is the factor above that is about this
+	// package's own surface rather than about the corpus. Written down for the reason the
+	// counts above are, and held to the class stMethodsAnsweringBytes derives.
+	secretTreeKatKeyPaths = 4
 	// a key and a nonce.
 	secretTreeKatAnswersPerRatchet = 2
 )
@@ -160,6 +174,7 @@ var (
 	errSecretTreeMismatch        = errors.New("a secret tree key or nonce does not match the published one")
 	errSecretTreeDidNotMove      = errors.New("perturbing one of the corpus's own inputs left the answer unchanged")
 	errSecretTreeIncomplete      = errors.New("the comparison reports values it cannot have computed")
+	errSecretTreeRetained        = errors.New("a driven tree is not holding the skipped keys the corpus's own gaps come to")
 )
 
 // secretTreeCheck is one answer this package computed held against one answer the corpus
@@ -196,24 +211,209 @@ var secretTreeSenderDataCheckNames = []string{
 	"SenderDataKeyNonce/nonce",
 }
 
-// secretTreeKeyPaths is the two exported ways this package answers "what are the key and nonce
-// of generation g of leaf l", in the order the comparator emits them.
-var secretTreeKeyPaths = []string{"SecretTree.NextSenderKey", "SecretTree.ReceiverKey"}
+// secretTreeKeyPathDriver is how this family asks ONE exported key source for the answers a leaf
+// publishes, over a tree of that path's own.
+type secretTreeKeyPathDriver struct {
+	// collect answers this leaf's key and nonce at every generation the case publishes, keyed
+	// on the generation number. The published generations are handed in rather than a range
+	// because the receiver side paths must be walked in the ascending order the case publishes
+	// them in -- a corpus that published them descending would otherwise be reported as this
+	// implementation refusing a replay.
+	collect func(t *testing.T, tree *SecretTree, leaf LeafIndex, kind RatchetType,
+		published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error)
+	// retainsSkipped is whether walking this path leaves the generations it stepped past in the
+	// tree's retained windows. The sender paths reach step() directly and retain nothing; the
+	// receiver side paths reach peekFor and retain every gap. It is what turns the retained key
+	// headroom from a sentence in a comment into a number this runner measures.
+	retainsSkipped bool
+}
+
+// secretTreeKeyPathDrivers is one driver per exported key source, keyed on the method name the
+// derived class hands back.
+//
+// A map keyed on the derived name rather than a list of names, so the two cannot drift:
+// secretTreeKeyPaths is fatal on a member of the class with no driver here. The list this
+// replaces held NextSenderKey and ReceiverKey and called them the only two ways to ask; there
+// were four, and adding a fifth changed nothing about what this family compared.
+var secretTreeKeyPathDrivers = map[string]secretTreeKeyPathDriver{
+	"NextSenderKey": {
+		collect: func(t *testing.T, tree *SecretTree, leaf LeafIndex, kind RatchetType,
+			published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error) {
+			return secretTreeWalkTheSenderRatchet(t, published, func() (uint32, []byte, []byte, error) {
+				return tree.NextSenderKey(leaf, kind)
+			})
+		},
+	},
+	"NextMessageKey": {
+		collect: func(t *testing.T, tree *SecretTree, leaf LeafIndex, kind RatchetType,
+			published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error) {
+			contentType := secretTreeContentTypeFor(t, kind)
+			return secretTreeWalkTheSenderRatchet(t, published, func() (uint32, []byte, []byte, error) {
+				key, aeadNonce, generation, err := tree.NextMessageKey(contentType, leaf)
+				return generation, key, aeadNonce, err
+			})
+		},
+	},
+	"ReceiverKey": {
+		retainsSkipped: true,
+		collect: func(t *testing.T, tree *SecretTree, leaf LeafIndex, kind RatchetType,
+			published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error) {
+			collected := map[uint32]secretTreeAnswer{}
+			for _, want := range published {
+				key, aeadNonce, err := tree.ReceiverKey(leaf, kind, want.Generation)
+				if err != nil {
+					return nil, fmt.Errorf("generation %d: %w", want.Generation, err)
+				}
+				collected[want.Generation] = secretTreeAnswer{
+					key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
+			}
+			return collected, nil
+		},
+	},
+	"MessageKey": {
+		retainsSkipped: true,
+		collect: func(t *testing.T, tree *SecretTree, leaf LeafIndex, kind RatchetType,
+			published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error) {
+			contentType := secretTreeContentTypeFor(t, kind)
+			collected := map[uint32]secretTreeAnswer{}
+			for _, want := range published {
+				key, aeadNonce, err := tree.MessageKey(contentType, leaf, want.Generation)
+				if err != nil {
+					return nil, fmt.Errorf("generation %d: %w", want.Generation, err)
+				}
+				collected[want.Generation] = secretTreeAnswer{
+					key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
+				// the pair this path comes on is "look up, open, erase". The lookup does not
+				// consume, so a walk that never erased would hold the published generations as
+				// well as the gaps and would stand at a retention no other path reaches -- and
+				// the erase is what turns a repeatable lookup back into a single use key.
+				tree.EraseMessageKey(contentType, leaf, want.Generation)
+			}
+			return collected, nil
+		},
+	},
+}
+
+// secretTreeWalkTheSenderRatchet drives a sender path from the start of the epoch to the highest
+// generation the case publishes, keeping the ones it publishes.
+//
+// From generation 0 rather than by lookup, because neither sender path can be asked for one
+// generation twice -- and the walk holds the generation NUMBERS handed out to 0, 1, 2, ..., the
+// half a lookup by number cannot see.
+func secretTreeWalkTheSenderRatchet(t *testing.T, published []secretTreeGeneration,
+	next func() (uint32, []byte, []byte, error)) (map[uint32]secretTreeAnswer, error) {
+	t.Helper()
+	wanted := map[uint32]bool{}
+	highest := uint32(0)
+	for _, generation := range published {
+		wanted[generation.Generation] = true
+		highest = generation.Generation
+	}
+	collected := map[uint32]secretTreeAnswer{}
+	for want := uint32(0); ; want++ {
+		generation, key, aeadNonce, err := next()
+		if err != nil {
+			return nil, fmt.Errorf("at generation %d: %w", want, err)
+		}
+		if generation != want {
+			return nil, fmt.Errorf("%w: the sender path answered generation %d where the epoch stands at %d",
+				errSecretTreeGenerationOrder, generation, want)
+		}
+		if wanted[generation] {
+			collected[generation] = secretTreeAnswer{
+				key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
+		}
+		if want == highest {
+			return collected, nil
+		}
+	}
+}
+
+// secretTreeContentTypeFor is a content type that reaches one ratchet type, taken from the RFC's
+// own mapping rather than from the implementation's.
+//
+// stRatchetTypeOfContentType is the section 9.1 table written down in secret_tree_test.go
+// independently of ratchetTypeOf, and reading it here is what keeps the two ContentType keyed
+// paths from being a derivation that agrees with itself: a table taken from ratchetTypeOf would
+// route the question and the answer through one swapped mapping and compare it against itself.
+func secretTreeContentTypeFor(t *testing.T, kind RatchetType) ContentType {
+	t.Helper()
+	for _, contentType := range slices.Sorted(maps.Keys(stRatchetTypeOfContentType)) {
+		if stRatchetTypeOfContentType[contentType] == kind {
+			return contentType
+		}
+	}
+	t.Fatalf("ratchet type %d reaches a keystream and RFC 9420 section 9.1 routes no content type to it, so this family cannot ask the ContentType keyed paths about it",
+		kind)
+	return 0
+}
+
+// secretTreeKeyPaths is every exported way this package answers "what are the key and nonce of
+// generation g of leaf l", DERIVED off the compiled method set and named SecretTree.Method, in
+// the order the comparator emits them.
+//
+// The class is stMethodsAnsweringBytes in secret_tree_test.go -- every exported method of
+// *SecretTree whose results include a []byte, read off the type rather than typed out -- and
+// this function's whole job is to hold this family's drivers to it. A member with no driver is
+// fatal and not skipped: a path nothing drives is a path to every published generation that goes
+// uncompared while the run reports a count that looks complete.
+func secretTreeKeyPaths(t *testing.T) []string {
+	t.Helper()
+	name := reflect.TypeOf(&SecretTree{}).Elem().Name()
+	paths := []string{}
+	for _, method := range stMethodsAnsweringBytes(t) {
+		if _, driven := secretTreeKeyPathDrivers[method]; !driven {
+			t.Fatalf("%s.%s answers key material and this family has no driver for it, so one exported path to every published generation is compared by nothing while the run counts %d checks per generation",
+				name, method, secretTreeKatChecksPerGeneration)
+		}
+		paths = append(paths, name+"."+method)
+	}
+	return paths
+}
+
+// secretTreeDriverFor is the driver of one derived path, fatal on a path with none.
+func secretTreeDriverFor(t *testing.T, path string) secretTreeKeyPathDriver {
+	t.Helper()
+	method, isMethod := strings.CutPrefix(path, reflect.TypeOf(&SecretTree{}).Elem().Name()+".")
+	if !isMethod {
+		t.Fatalf("the key path %q is not named for a method of SecretTree", path)
+	}
+	driver, driven := secretTreeKeyPathDrivers[method]
+	if !driven {
+		t.Fatalf("this family has no driver for %s", path)
+	}
+	return driver
+}
+
+// secretTreeRetainedKeys is how many skipped generation keys one tree is holding, summed over
+// every ratchet it has built.
+//
+// It reads the windows directly, because that is the only way an eviction can be seen at all:
+// pruneRetained zeroizes what it drops and reports nothing, so a tree that has been pruned
+// answers every question this family asks exactly as one that has not.
+func secretTreeRetainedKeys(tree *SecretTree) int {
+	retained := 0
+	for _, r := range tree.ratchets {
+		retained += len(r.window)
+	}
+	return retained
+}
 
 // secretTreeCheckNamesFor is every answer this runner compares for one published generation of
 // one leaf, named by the path that produced it, in the order the comparator emits them.
 //
-// DERIVED from the live ratchet type class and not written out, for guardrail 5's reason. The
-// class is stRatchetKinds, which sweeps the ratchet type code point space and keeps the ones
-// that actually reach a keystream, and the section 9 label of each is stRatchetLabelOf; a third
-// ratchet type added to secret_tree.go therefore changes this list, and the written down
+// BOTH factors are derived and neither is written out, for guardrail 5's reason. The ratchet
+// type class is stRatchetKinds, which sweeps the ratchet type code point space and keeps the
+// ones that actually reach a keystream, and the section 9 label of each is stRatchetLabelOf; the
+// path class is secretTreeKeyPaths above. A third ratchet type or a third key source added to
+// secret_tree.go therefore changes this list, and the written down
 // secretTreeKatChecksPerGeneration then disagrees with it, which is
 // TestSecretTreeFamilyChecksAreEveryPathToAGeneration failing rather than this family quietly
-// comparing two ratchets of three.
-func secretTreeCheckNamesFor(t *testing.T, kinds []RatchetType) []string {
+// comparing two ratchets of three, or two paths of five.
+func secretTreeCheckNamesFor(t *testing.T, kinds []RatchetType, paths []string) []string {
 	t.Helper()
 	names := []string{}
-	for _, path := range secretTreeKeyPaths {
+	for _, path := range paths {
 		for _, kind := range kinds {
 			label := stRatchetLabel(t, kind)
 			names = append(names, path+"/"+label+"/key", path+"/"+label+"/nonce")
@@ -501,12 +701,22 @@ type secretTreeAnswer struct {
 // because a corpus that published them descending would otherwise be reported as this
 // implementation refusing a replay.
 //
-// One tree serves both ratchet types on the receiver side rather than one per type, because that
-// is the shape a real epoch has: ratchetFor takes the leaf secret ONCE and expands both roots
-// out of it, and a per-type tree would take it twice and never exercise that. The retained key
-// bound is not reached by it -- the largest published case is 32 leaves reaching generation 15,
-// which stands at 896 skipped keys against MaxRetainedWindowKeys of 1024 -- and would not change
-// an answer if it were, since keyFor deletes the generation it returns before pruneRetained runs.
+// One tree per PATH, because each of the four consumes: the sender paths cannot be asked for one
+// generation twice and the receiver side paths consume or erase what they answer, so a shared
+// tree would make the second path to arrive a replay rather than a second opinion. Within a path
+// one tree serves both ratchet types rather than one per type, because that is the shape a real
+// epoch has: ratchetFor takes the leaf secret ONCE and expands both roots out of it, and a
+// per-type tree would take it twice and never exercise that.
+//
+// The retained key bound is not reached by either receiver side tree, and that is MEASURED here
+// rather than asserted in this comment. Both of them step past every generation the corpus skips
+// and keep it, so what a case retains is the case's own gaps: the largest published case is 32
+// leaves reaching generation 15, which is 32 x 2 ratchets x 14 skipped generations = 896 against
+// MaxRetainedWindowKeys of 1024, or 12.5% of headroom. pruneRetained evicts SILENTLY, so a
+// corpus update that raised the published generation numbers, or a fall in RatchetWindowSize,
+// would start dropping retained key material with nothing to say about it. The arithmetic is
+// therefore checked against the bound before any tree is driven, and what each tree actually
+// retained is checked against those same gaps once they have been.
 func compareSecretTreeVector(t *testing.T, raw json.RawMessage) (secretTreeComparison, error) {
 	t.Helper()
 	vector := secretTreeVector{}
@@ -532,6 +742,7 @@ func compareSecretTreeVector(t *testing.T, raw json.RawMessage) (secretTreeCompa
 	_, publishesEncryptionSecret := published[theJsonKeyOf(t, secretTreeVector{}, "EncryptionSecret")]
 
 	kinds := stRatchetKinds(t)
+	paths := secretTreeKeyPaths(t)
 	evidence := secretTreeComparison{
 		inScope:                   true,
 		hashSize:                  crypto.HashSize(),
@@ -539,7 +750,7 @@ func compareSecretTreeVector(t *testing.T, raw json.RawMessage) (secretTreeCompa
 		nonceSize:                 crypto.NonceSize(),
 		leaves:                    len(vector.Leaves),
 		publishesEncryptionSecret: publishesEncryptionSecret,
-		names:                     secretTreeCheckNamesFor(t, kinds),
+		names:                     secretTreeCheckNamesFor(t, kinds, paths),
 	}
 	if evidence.leaves == 0 {
 		return evidence, fmt.Errorf("%w: the case publishes no leaf, so there is no ratchet to compare",
@@ -604,71 +815,55 @@ func compareSecretTreeVector(t *testing.T, raw json.RawMessage) (secretTreeCompa
 
 	encryptionSecret := MustHex(t, vector.EncryptionSecret)
 	leafCount := LeafCount(evidence.leaves)
-	sender, err := NewSecretTree(crypto, leafCount, encryptionSecret)
-	if err != nil {
-		return evidence, fmt.Errorf("NewSecretTree for the sender path: %w", err)
+	// the retained key headroom this case needs, from the corpus and BEFORE a tree is driven.
+	// Both receiver side paths step past every generation the case skips and retain it, and
+	// pruneRetained evicts without reporting, so a corpus whose gaps outgrew the tree wide bound
+	// would quietly be compared against key material that had been zeroized.
+	skipped := 0
+	for _, generations := range vector.Leaves {
+		skipped += int(generations[len(generations)-1].Generation) + 1 - len(generations)
 	}
-	receiver, err := NewSecretTree(crypto, leafCount, encryptionSecret)
-	if err != nil {
-		return evidence, fmt.Errorf("NewSecretTree for the receiver path: %w", err)
+	skipped *= len(kinds)
+	if skipped > MaxRetainedWindowKeys {
+		return evidence, fmt.Errorf("%w: this case's own gaps come to %d retained keys against a tree wide bound of %d, so a receiver side path here is answered out of a window that has been evicted",
+			errSecretTreeRetained, skipped, MaxRetainedWindowKeys)
+	}
+	trees := map[string]*SecretTree{}
+	for _, path := range paths {
+		tree, err := NewSecretTree(crypto, leafCount, encryptionSecret)
+		if err != nil {
+			return evidence, fmt.Errorf("NewSecretTree for %s: %w", path, err)
+		}
+		trees[path] = tree
 	}
 	leavesField := theJsonKeyOf(t, secretTreeVector{}, "Leaves")
 
 	for leaf, generations := range vector.Leaves {
 		index := LeafIndex(leaf)
-		highest := generations[len(generations)-1].Generation
-		// the sender path. NextSenderKey cannot be asked for a generation twice, so the ratchet
-		// is walked from the start of the epoch and read at the generations the case publishes
-		// -- which also holds the generation NUMBERS it hands out to 0, 1, 2, ..., the half a
-		// lookup by number cannot see.
-		senderAnswers := map[RatchetType]map[uint32]secretTreeAnswer{}
-		for _, kind := range kinds {
-			collected := map[uint32]secretTreeAnswer{}
-			for want := uint32(0); ; want++ {
-				generation, key, aeadNonce, err := sender.NextSenderKey(index, kind)
+		// every derived path to this leaf's key material, each over the tree of its own.
+		answers := map[string]map[RatchetType]map[uint32]secretTreeAnswer{}
+		for _, path := range paths {
+			collect := secretTreeDriverFor(t, path).collect
+			perKind := map[RatchetType]map[uint32]secretTreeAnswer{}
+			for _, kind := range kinds {
+				collected, err := collect(t, trees[path], index, kind, generations)
 				if err != nil {
-					return evidence, fmt.Errorf("NextSenderKey(leaf %d, ratchet %d) at generation %d: %w",
-						leaf, kind, want, err)
+					return evidence, fmt.Errorf("%s(leaf %d, ratchet %d): %w", path, leaf, kind, err)
 				}
-				if generation != want {
-					return evidence, fmt.Errorf("%w: NextSenderKey answered generation %d where the epoch stands at %d",
-						errSecretTreeGenerationOrder, generation, want)
-				}
-				collected[generation] = secretTreeAnswer{key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
-				if want == highest {
-					break
-				}
+				perKind[kind] = collected
 			}
-			senderAnswers[kind] = collected
-		}
-		// the receiver path over the same epoch, in the ascending order the case publishes.
-		receiverAnswers := map[RatchetType]map[uint32]secretTreeAnswer{}
-		for _, kind := range kinds {
-			collected := map[uint32]secretTreeAnswer{}
-			for _, want := range generations {
-				key, aeadNonce, err := receiver.ReceiverKey(index, kind, want.Generation)
-				if err != nil {
-					return evidence, fmt.Errorf("ReceiverKey(leaf %d, ratchet %d, generation %d): %w",
-						leaf, kind, want.Generation, err)
-				}
-				collected[want.Generation] = secretTreeAnswer{key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
-			}
-			receiverAnswers[kind] = collected
+			answers[path] = perKind
 		}
 
 		// the emit order is secretTreeCheckNamesFor's order, position by position, which
 		// incomplete() holds it to.
 		for position, want := range generations {
-			for pathIndex, path := range secretTreeKeyPaths {
-				answers := senderAnswers
-				if pathIndex == 1 {
-					answers = receiverAnswers
-				}
+			for _, path := range paths {
 				for _, kind := range kinds {
 					label := stRatchetLabel(t, kind)
 					publishedKey, publishedNonce, keyField, nonceField := secretTreePublishedAnswer(t, want, kind)
 					at := fmt.Sprintf("%s.%d.%d.", leavesField, leaf, position)
-					got := answers[kind][want.Generation]
+					got := answers[path][kind][want.Generation]
 					evidence.checks = append(evidence.checks,
 						secretTreeCheck{
 							name: path + "/" + label + "/key", field: at + keyField,
@@ -685,6 +880,21 @@ func compareSecretTreeVector(t *testing.T, raw json.RawMessage) (secretTreeCompa
 		}
 	}
 
+	// what each tree actually retained, against what the corpus's gaps say it should hold. Fewer
+	// than the gaps is pruneRetained having fired, which it does silently; more is a receiver
+	// side path that stopped consuming or erasing what it answers, which is a key a replay can
+	// be opened with. The sender paths reach step() and must hold nothing at all.
+	for _, path := range paths {
+		want := 0
+		if secretTreeDriverFor(t, path).retainsSkipped {
+			want = skipped
+		}
+		if got := secretTreeRetainedKeys(trees[path]); got != want {
+			return evidence, fmt.Errorf("%w: %s left %d retained keys over this case and the gaps it stepped past come to %d",
+				errSecretTreeRetained, path, got, want)
+		}
+	}
+
 	// the two vacuity controls, over the corpus's own bytes. The first is about the whole tree: a
 	// leaf key that does not move when the epoch's encryption secret moves was derived from
 	// something other than the epoch.
@@ -694,14 +904,18 @@ func compareSecretTreeVector(t *testing.T, raw json.RawMessage) (secretTreeCompa
 	if err != nil {
 		return evidence, fmt.Errorf("NewSecretTree over a perturbed encryption secret: %w", err)
 	}
+	// driven through the first derived path and that path's own driver rather than through a
+	// call written out here, so the control cannot come to name a path this family no longer
+	// compares -- which is a control whose baseline is nil and whose comparison verdict() skips.
+	controlPath, controlKind := paths[0], kinds[0]
 	evidence.controlLeaf = 0
 	evidence.controlGeneration = vector.Leaves[0][0].Generation
-	evidence.controlName = secretTreeKeyPaths[1] + "/" + stRatchetLabel(t, kinds[0]) + "/key"
-	perturbedKey, _, err := perturbedTree.ReceiverKey(0, kinds[0], evidence.controlGeneration)
+	evidence.controlName = controlPath + "/" + stRatchetLabel(t, controlKind) + "/key"
+	perturbed, err := secretTreeDriverFor(t, controlPath).collect(t, perturbedTree, 0, controlKind, vector.Leaves[0])
 	if err != nil {
-		return evidence, fmt.Errorf("ReceiverKey over a perturbed encryption secret: %w", err)
+		return evidence, fmt.Errorf("%s over a perturbed encryption secret: %w", controlPath, err)
 	}
-	evidence.withoutEncryptionSecret = bytes.Clone(perturbedKey)
+	evidence.withoutEncryptionSecret = bytes.Clone(perturbed[evidence.controlGeneration].key)
 
 	perturbedCiphertext := bytes.Clone(ciphertext)
 	if len(perturbedCiphertext) == 0 {
@@ -792,18 +1006,26 @@ func TestSecretTreeFamilyIsInstalled(t *testing.T) {
 	assertVectorFamilyIsInstalled(t, 3, secretTreeKatFile, verifySecretTreeVector, generateSecretTreeVector)
 }
 
-// TestSecretTreeFamilyChecksAreEveryPathToAGeneration holds the eight answers this family
+// TestSecretTreeFamilyChecksAreEveryPathToAGeneration holds the sixteen answers this family
 // compares per published generation to the number of ways this package can produce one.
 //
-// Both factors are DERIVED. The ratchet type class is stRatchetKinds, which sweeps the code point
-// space and keeps the types that reach a keystream, so a third ratchet type fails here rather
-// than leaving this family comparing two of three and reporting a clean run. The path class is
-// secretTreeKeyPaths, and each of its members is required to be a real exported method of
-// SecretTree, so a path renamed out from under this family is a failure rather than a check name
-// that no longer describes anything.
+// Both factors are DERIVED, and the path half of that is what this test exists for now. The
+// ratchet type class is stRatchetKinds, which sweeps the code point space and keeps the types
+// that reach a keystream, so a third ratchet type fails here rather than leaving this family
+// comparing two of three and reporting a clean run. The path class is stMethodsAnsweringBytes --
+// the exported methods of *SecretTree that answer a []byte, read off the compiled type in
+// secret_tree_test.go -- and this family's drivers are held to it in BOTH directions: a key
+// source with no driver is a path to every published generation that nothing compares, and a
+// driver for a method that no longer exists is a check name that describes nothing.
+//
+// Measured, and the reason the class is no longer a list: with the two names that list held, a
+// third exported key source added to secret_tree.go -- ProbeKey, delegating to ReceiverKey --
+// left every test in this file green. It was caught only by the two gates in secret_tree_test.go
+// that derive the same class, one file away and unused here.
 func TestSecretTreeFamilyChecksAreEveryPathToAGeneration(t *testing.T) {
 	kinds := stRatchetKinds(t)
-	names := secretTreeCheckNamesFor(t, kinds)
+	paths := secretTreeKeyPaths(t)
+	names := secretTreeCheckNamesFor(t, kinds, paths)
 	if want := len(kinds) * secretTreeKatAnswersPerRatchet * secretTreeKatKeyPaths; len(names) != want {
 		t.Fatalf("this family compares %d answers per generation and there are %d ratchet types, %d answers each and %d paths: %v",
 			len(names), len(kinds), secretTreeKatAnswersPerRatchet, secretTreeKatKeyPaths, names)
@@ -817,11 +1039,19 @@ func TestSecretTreeFamilyChecksAreEveryPathToAGeneration(t *testing.T) {
 		t.Fatalf("the check names hold %d distinct entries out of %d, so one is compared twice and another not at all",
 			len(distinct), len(names))
 	}
-	if len(secretTreeKeyPaths) != secretTreeKatKeyPaths {
-		t.Fatalf("this family names %d key paths and asserts %d", len(secretTreeKeyPaths), secretTreeKatKeyPaths)
+	if len(paths) != secretTreeKatKeyPaths {
+		t.Fatalf("this package answers a leaf's key material by %d exported paths and this family asserts %d: %v",
+			len(paths), secretTreeKatKeyPaths, paths)
+	}
+	// the class, both directions. secretTreeKeyPaths is fatal on a member with no driver, and
+	// this is the other half: a driver naming a method the type no longer has.
+	driven := slices.Sorted(maps.Keys(secretTreeKeyPathDrivers))
+	if class := stMethodsAnsweringBytes(t); !slices.Equal(driven, class) {
+		t.Fatalf("this family drives %v and the exported methods of *SecretTree answering key material are %v; a key source with no driver here is an exported path to every published generation that this runner compares nothing for",
+			driven, class)
 	}
 	tree := reflect.TypeOf(&SecretTree{})
-	for _, path := range secretTreeKeyPaths {
+	for _, path := range paths {
 		method, isMethod := strings.CutPrefix(path, tree.Elem().Name()+".")
 		if !isMethod {
 			t.Fatalf("the key path %q is not named for a method of %s", path, tree.Elem().Name())
@@ -1039,7 +1269,8 @@ func TestSecretTreeComparisonCannotReportAComparisonItDidNotMake(t *testing.T) {
 	const nk, nn, nh = 16, 12, 32
 	octets := func(seed byte, width int) []byte { return bytes.Repeat([]byte{seed}, width) }
 	names := []string{}
-	for _, path := range secretTreeKeyPaths {
+	paths := secretTreeKeyPaths(t)
+	for _, path := range paths {
 		for _, label := range []string{"handshake", "application"} {
 			names = append(names, path+"/"+label+"/key", path+"/"+label+"/nonce")
 		}
@@ -1066,7 +1297,7 @@ func TestSecretTreeComparisonCannotReportAComparisonItDidNotMake(t *testing.T) {
 		names: names, checks: checks,
 		withoutEncryptionSecret: octets(0xa1, nk),
 		withoutSample:           octets(0xa2, nk),
-		controlName:             secretTreeKeyPaths[1] + "/handshake/key",
+		controlName:             paths[0] + "/handshake/key",
 		controlLeaf:             0,
 		controlGeneration:       0,
 	}

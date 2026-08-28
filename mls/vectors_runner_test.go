@@ -325,27 +325,45 @@ func publishedCorpusField(t *testing.T, published map[string]json.RawMessage, na
 // past the end, or a key the case does not carry -- for publishedCorpusField's own reason:
 // the whole point of this second decode is that a path which addresses nothing is loud here
 // rather than an empty string compared against an empty string somewhere else.
+//
+// Which arm applies is read off the SHAPE OF THE PUBLISHED VALUE and never off the spelling of
+// the segment. The version this replaces asked strconv.Atoi about the segment first, so a
+// corpus that published an object key spelled as a decimal -- "0" -- would have had that object
+// decoded as a json array and reported as a path that addresses nothing, at a path that is
+// exactly right. No vendored corpus publishes such a key today, which is what makes the order a
+// defect that arrives with a corpus update rather than with a change to any family: every
+// family in this package now walks this one function, so the arm that fires has to be a
+// question about the corpus and not about how a family spelled its path.
 func publishedCorpusSegment(t *testing.T, raw json.RawMessage, walked string, segment string) json.RawMessage {
 	t.Helper()
-	if index, err := strconv.Atoi(segment); err == nil {
-		elements := []json.RawMessage{}
-		if err := json.Unmarshal(raw, &elements); err != nil {
-			t.Fatalf("the published %s is addressed by index %d and is not a json array: %v", walked, index, err)
+	object := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &object); err == nil {
+		nested, found := object[segment]
+		if !found {
+			t.Fatalf("the published %s is a json object and does not carry %q", walked, segment)
 		}
-		if index < 0 || index >= len(elements) {
-			t.Fatalf("the published %s holds %d elements and index %d was asked for", walked, len(elements), index)
-		}
-		return elements[index]
+		return nested
 	}
-	inner := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &inner); err != nil {
-		t.Fatalf("the published %s is not a json object: %v", walked, err)
+	elements := []json.RawMessage{}
+	if err := json.Unmarshal(raw, &elements); err != nil {
+		t.Fatalf("the published %s is neither a json object nor a json array, so the segment %q addresses nothing in it: %v",
+			walked, segment, err)
 	}
-	nested, found := inner[segment]
-	if !found {
-		t.Fatalf("the published %s does not carry %q", walked, segment)
+	index, err := strconv.Atoi(segment)
+	if err != nil {
+		t.Fatalf("the published %s is a json array and the segment %q is not a decimal index: %v", walked, segment, err)
 	}
-	return nested
+	// the canonical spelling, because "00" and "+1" parse to elements 0 and 1 while naming
+	// something else. A path that addresses one element and reads as another is the same silent
+	// mis-addressing this whole second decode exists to make loud.
+	if strconv.Itoa(index) != segment {
+		t.Fatalf("the published %s was addressed by the segment %q, which is index %d spelled another way",
+			walked, segment, index)
+	}
+	if index < 0 || index >= len(elements) {
+		t.Fatalf("the published %s holds %d elements and index %d was asked for", walked, len(elements), index)
+	}
+	return elements[index]
 }
 
 // theJsonKeyOf is the json key one field of a corpus row is published under, read off that
@@ -1003,6 +1021,111 @@ func TestAssertRunFlagsTheControlFixture(t *testing.T) {
 		}
 		if !failed {
 			t.Errorf("%s: assertRun reported nothing, so that assertion can be deleted with all three families' counts still reading green",
+				row.names)
+		}
+	}
+}
+
+// publishedCorpusSegmentFixture is one whole call of publishedCorpusSegment: the published value,
+// the dotted path already walked to reach it, and the segment to step by.
+type publishedCorpusSegmentFixture struct {
+	raw     json.RawMessage
+	walked  string
+	segment string
+	// want is the value the step must answer when it answers at all, so a row that reached the
+	// wrong element is a failure rather than a step that returned something.
+	want string
+}
+
+func (self publishedCorpusSegmentFixture) run(probe *testing.T) {
+	if got := publishedCorpusSegment(probe, self.raw, self.walked, self.segment); string(got) != self.want {
+		probe.Errorf("the step answered %s, want %s", got, self.want)
+	}
+}
+
+// aPassingCorpusSegment is the step publishedCorpusSegment must take, and the shape every row
+// below is one edit of: an array of objects addressed by index, which is what family 3's
+// leaves.N.M.field paths walk.
+func aPassingCorpusSegment() publishedCorpusSegmentFixture {
+	return publishedCorpusSegmentFixture{
+		raw:     json.RawMessage(`[{"handshake_key":"00"},{"handshake_key":"01"}]`),
+		walked:  "leaves.0",
+		segment: "1",
+		want:    `{"handshake_key":"01"}`,
+	}
+}
+
+// TestPublishedCorpusSegmentStepsIntoTheShapeThePublishedValueHas is the control the walk every
+// family reads its second decode through has never had.
+//
+// It was exercised only through family 3's leaves.N.M.field paths, and only in the direction
+// where those paths are right: nothing asked it what it does with a segment that addresses
+// nothing, and nothing at all pinned WHICH ARM it takes. The arm is the reason this test
+// exists. It used to be chosen by asking strconv.Atoi about the segment, so an object key
+// spelled as a decimal -- which no vendored corpus publishes today and any corpus update may --
+// was decoded as an array and reported as a broken path at a path that is correct. The first
+// assertion below is that case, and it is the one that fails against the order this replaces.
+//
+// The rows are bound to the function's own reports, so a sixth refusal cannot land here
+// uncontrolled -- and a refusal deleted from it leaves a row naming nothing and fails here
+// rather than turning a path that addresses nothing into an empty string compared against an
+// empty string somewhere else.
+func TestPublishedCorpusSegmentStepsIntoTheShapeThePublishedValueHas(t *testing.T) {
+	if failed, raised := probeAssertion(aPassingCorpusSegment().run); failed || raised != nil {
+		t.Fatalf("the step every family's second decode is made of was reported: failed=%v raised=%v; every row below would then pass for the wrong reason",
+			failed, raised)
+	}
+	// the arm itself: a json object whose keys are spelled as decimals takes a KEY. Read off the
+	// value's shape, this is an ordinary object lookup; read off the segment's spelling, it is an
+	// array index into something that is not an array.
+	decimalKeys := publishedCorpusSegmentFixture{
+		raw:     json.RawMessage(`{"0":"beef","1":"cafe"}`),
+		walked:  "sender_data",
+		segment: "1",
+		want:    `"cafe"`,
+	}
+	if failed, raised := probeAssertion(decimalKeys.run); failed || raised != nil {
+		t.Errorf("a json object whose keys are spelled as decimals was not walked as an object: failed=%v raised=%v",
+			failed, raised)
+	}
+	rows := []struct {
+		// names is the substring of the report this row must provoke; the bijection against
+		// publishedCorpusSegment's own reports is asserted below.
+		names string
+		edit  func(*publishedCorpusSegmentFixture)
+	}{
+		{"is a json object and does not carry", func(f *publishedCorpusSegmentFixture) {
+			f.raw, f.segment = json.RawMessage(`{"handshake_key":"00"}`), "application_key"
+		}},
+		{"neither a json object nor a json array", func(f *publishedCorpusSegmentFixture) {
+			f.raw = json.RawMessage(`"00"`)
+		}},
+		{"is not a decimal index", func(f *publishedCorpusSegmentFixture) {
+			f.segment = "handshake_key"
+		}},
+		{"spelled another way", func(f *publishedCorpusSegmentFixture) {
+			f.segment = "01"
+		}},
+		{"elements and index", func(f *publishedCorpusSegmentFixture) {
+			f.segment = "2"
+		}},
+	}
+	keys := []string{}
+	for _, row := range rows {
+		keys = append(keys, row.names)
+	}
+	assertEveryReportIsControlled(t, "publishedCorpusSegment",
+		theReportsOf(t, theSourceDeclaring(t, "", "publishedCorpusSegment"), "", "publishedCorpusSegment"), keys)
+	for _, row := range rows {
+		fixture := aPassingCorpusSegment()
+		row.edit(&fixture)
+		failed, raised := probeAssertion(fixture.run)
+		if raised != nil {
+			t.Errorf("%s: the step panicked: %v", row.names, raised)
+			continue
+		}
+		if !failed {
+			t.Errorf("%s: the step reported nothing, so a path that addresses nothing comes back as a value every family compares against",
 				row.names)
 		}
 	}
