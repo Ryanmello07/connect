@@ -216,6 +216,20 @@ func framingTestCommitContent() *FramedContent {
 // The table runs every content type and both group context arms rather than one row, because
 // the layout is where the arms differ: the version and wire format are two uint16s, the content
 // is whatever its own codec writes, and the context is either the whole of the tail or absent.
+//
+// The byte equality is the WHOLE of each row and nothing stands after it, which is a deletion
+// from the version this task was handed rather than an omission. That version closed with
+// bytes.HasSuffix(tbs, groupContext) after the equality had already passed, and an assertion
+// reached only once the bytes are known to equal an encoding that ends in those same bytes is
+// an assertion no implementation can fail -- decoration that reads as a second check. The same
+// went for every restatement tried here: once a preimage is compared against a full independent
+// encoding, every property of it is settled.
+//
+// What that equality cannot do is notice a hand written encoder in this file that is wrong the
+// same way the implementation is wrong. Nothing in this package can; what can is
+// TestTheFramedContentSignatureIsTheOneMlswgPublished, which compares against signatures
+// somebody else made. The two are meant to be read together -- this one localises a failure to
+// a field, and that one is the reason to believe the layout at all.
 func TestFramedContentTBSInlinesGroupContextWithoutLengthPrefix(t *testing.T) {
 	groupContext := framingTestGroupContext(t)
 	external := framingTestProposalContent()
@@ -255,34 +269,8 @@ func TestFramedContentTBSInlinesGroupContextWithoutLengthPrefix(t *testing.T) {
 		}
 		if !bytes.Equal(tbs, want) {
 			t.Errorf("%s: tbs %x, want %x", testCase.name, tbs, want)
-			continue
-		}
-		if len(testCase.groupContext) == 0 {
-			if bytes.Contains(tbs, groupContext) {
-				t.Errorf("%s: the group context is inside a preimage that carries none", testCase.name)
-			}
-			continue
-		}
-		if !bytes.HasSuffix(tbs, testCase.groupContext) {
-			t.Errorf("%s: the group context is not the trailing bytes of the preimage", testCase.name)
-		}
-		// and the bytes in front of it are the content's own encoding with nothing between,
-		// which is what a length prefix inserted here would break
-		if prefix := tbs[:len(tbs)-len(testCase.groupContext)]; !bytes.HasSuffix(prefix, mustMarshalFramedContent(t, testCase.content)) {
-			t.Errorf("%s: something stands between the framed content and the group context", testCase.name)
 		}
 	}
-}
-
-// mustMarshalFramedContent is the content's own encoding, which the layout test uses to find
-// where the content ends and the context begins.
-func mustMarshalFramedContent(t *testing.T, content *FramedContent) []byte {
-	t.Helper()
-	encoded, err := syntax.Marshal(content)
-	if err != nil {
-		t.Fatalf("encode a framed content: %v", err)
-	}
-	return encoded
 }
 
 func TestFramedContentTBSOmitsGroupContextForExternalSender(t *testing.T) {
