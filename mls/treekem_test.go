@@ -5659,3 +5659,58 @@ func TestMergeUpdatePathBlanksTheWholeDirectPathAndNotOnlyTheFilteredOne(t *test
 		}
 	}
 }
+
+// TestMergeUpdatePathRefusesALeafClaimingAParentInAGroupThatHasNone is the one place the
+// commit-time comparison is not subsumed by the sweep that follows it.
+//
+// Everywhere else in this file the two refusals coincide, and they coincide for a reason worth
+// writing down rather than leaving as a coincidence: the lowest node of a filtered direct path has
+// the sender's own leaf as the ONLY entry in the resolution of the child on that path -- every
+// node between them was dropped precisely because its copath child resolved to nothing -- so
+// section 7.9.2's second condition at that node IS the comparison of the recomputed chain against
+// the leaf's field, and a tampered path fails both. Which is why deleting the comparison passes
+// every other test here.
+//
+// A group of ONE has no parent node at all. filteredPathSteps is empty, the recomputed chain is
+// still the zero-length octet string section 7.9 gives the top of a path, and VerifyParentHashes
+// sweeps no node and answers nil -- so the whole of what stands between a commit leaf carrying a
+// signed claim about a parent that does not exist and the tree is this comparison. It is the
+// state every group starts in and the one CreateUpdatePathSecrets' own comment names.
+func TestMergeUpdatePathRefusesALeafClaimingAParentInAGroupThatHasNone(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 1)
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	// the fixture's premise: this really is a commit over a tree with no parent to claim.
+	if len(path.Nodes) != 0 {
+		t.Fatalf("the one member commit published %d path nodes, and a group of one has no filtered direct path",
+			len(path.Nodes))
+	}
+	if len(path.LeafNode.ParentHash) != 0 {
+		t.Fatalf("the one member commit leaf carries a %d octet parent hash, and section 7.9 gives the top of a path the zero-length octet string",
+			len(path.LeafNode.ParentHash))
+	}
+	// the control: the conforming commit merges.
+	control := tree.Clone()
+	if err := control.MergeUpdatePath(crypto, members[0].LeafIndex, path); err != nil {
+		t.Fatalf("the one member commit was refused: %v", err)
+	}
+	// and the sweep alone cannot tell the two apart, which is what makes this fixture the
+	// separator: there is no non-blank parent for it to judge either way.
+	if err := control.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("the merged one member tree does not pass section 7.9.2: %v", err)
+	}
+	claiming := &UpdatePath{LeafNode: *path.LeafNode.Clone(), Nodes: append([]UpdatePathNode{}, path.Nodes...)}
+	claiming.LeafNode.ParentHash = bytes.Repeat([]byte{0x5A}, crypto.HashSize())
+	forged := tree.Clone()
+	if err := forged.SetLeaf(members[0].LeafIndex, claiming.LeafNode.Clone()); err != nil {
+		t.Fatalf("SetLeaf: %v", err)
+	}
+	if err := forged.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("section 7.9.2 refuses the forged tree on its own, so this fixture does not separate the two refusals: %v", err)
+	}
+	mergeMustNotTouchTheTree(t, crypto, tree.Clone(), members[0].LeafIndex, claiming,
+		ErrParentHashMismatch, "a one member commit whose leaf claims a parent hash")
+}
