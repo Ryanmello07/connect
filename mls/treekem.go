@@ -258,6 +258,16 @@ type UpdatePathPlan struct {
 //
 // CommitSecret is the rung PAST the root, section 8.1, which is why DerivePathSecrets answers one
 // more value than there are nodes.
+//
+// It is ATOMIC. Every mutation is made on a working copy and the receiver adopts it in a single
+// assignment at the end, so a call that answers an error leaves the caller's tree exactly as it
+// found it. Ordering the refusals ahead of the mutation is not enough on its own and this is not
+// a hypothetical: leaf.Sign is reachable only after the direct path has been blanked, the new
+// public keys installed and the parent hash chain written, so a signature private key that does
+// not match the ciphersuite used to answer an error over a tree whose tree hash had already moved
+// and which VerifyParentHashes then refused. A caller cannot repair that -- the previous epoch's
+// keys are gone -- so the only safe contract is that a failure is a no-op, and task 20 is a
+// caller that would otherwise have to know to throw the tree away.
 func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender LeafIndex,
 	signer SignaturePrivateKey, groupId []byte) (*UpdatePathPlan, error) {
 	// before anything is read off the receiver, for the reason the nil provider gate states:
@@ -270,14 +280,26 @@ func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender L
 	if crypto == nil {
 		return nil, ErrNilCryptoProvider
 	}
-	current := self.Leaf(sender)
-	if current == nil {
+	// the two ways a sender has no leaf here are two different faults and are answered as two,
+	// which is the range check's whole reason for being written out rather than left to Leaf's
+	// nil. An index past the width is a caller that computed an index wrong and repairs it by
+	// recomputing one; a blank slot inside the tree is a member committing from a position the
+	// group REMOVED, whose index was right the whole time and whose repair is to rejoin. One
+	// sentinel for both told the second to fix the thing that was not broken.
+	if LeafCount(sender) >= self.LeafWidth() {
 		return nil, ErrLeafIndexOutOfRange
+	}
+	// the working copy the atomicity note above is about. Everything below mutates this and the
+	// receiver adopts it in one assignment once the last thing that can fail has succeeded.
+	working := self.Clone()
+	current := working.Leaf(sender)
+	if current == nil {
+		return nil, ErrLeafBlank
 	}
 	// computed before the direct path is blanked: blanking the sender's own direct path cannot
 	// change any copath child's resolution, so the filtered path is the same either way, and
 	// computing it first keeps the failure ahead of the mutation.
-	steps, err := self.filteredPathSteps(sender)
+	steps, err := working.filteredPathSteps(sender)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +331,7 @@ func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender L
 	}
 	private.EncryptionPriv = cloneBytes(leafPriv)
 
-	if err := self.BlankDirectPath(sender); err != nil {
+	if err := working.BlankDirectPath(sender); err != nil {
 		return nil, err
 	}
 	// installed BEFORE the parent hashes are taken, and the order is load bearing twice over.
@@ -317,7 +339,7 @@ func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender L
 	// against the blanked tree would refuse outright; and the tree hash the caller reads after
 	// this call is the new epoch's only because these keys are in it.
 	for i, x := range path {
-		if err := self.SetParent(x, &ParentNode{EncryptionKey: publicKeys[i]}); err != nil {
+		if err := working.SetParent(x, &ParentNode{EncryptionKey: publicKeys[i]}); err != nil {
 			return nil, err
 		}
 	}
@@ -326,12 +348,12 @@ func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender L
 	// and it starts as the zero-length octet string section 7.9 gives the top of the path.
 	carried := []byte{}
 	for i := len(steps) - 1; i >= 0; i -= 1 {
-		parent := self.ParentAt(steps[i].Node)
+		parent := working.ParentAt(steps[i].Node)
 		if parent == nil {
 			return nil, ErrTreeMalformed
 		}
 		parent.ParentHash = carried
-		hash, err := self.ParentHash(crypto, steps[i].Node, steps[i].CopathChild)
+		hash, err := working.ParentHash(crypto, steps[i].Node, steps[i].CopathChild)
 		if err != nil {
 			return nil, err
 		}
@@ -349,9 +371,13 @@ func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender L
 	if err := leaf.Sign(crypto, signer, groupId, sender); err != nil {
 		return nil, err
 	}
-	if err := self.SetLeaf(sender, leaf); err != nil {
+	if err := working.SetLeaf(sender, leaf); err != nil {
 		return nil, err
 	}
+
+	// the adoption, and the last statement that can be reached by a failure is above it. A
+	// caller holding this tree sees the previous epoch or the new one and never a half of both.
+	self.nodes = working.nodes
 
 	return &UpdatePathPlan{
 		Path:         path,

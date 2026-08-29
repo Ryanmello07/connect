@@ -3,7 +3,7 @@
 // Kept out of errors.go for the reason errors_key_schedule.go gives: every ValSem-numbered
 // sentinel and every ErrProfile* is the validation plan's, declared once there, and two
 // plans editing one file during parallel waves is a merge conflict rather than a design
-// boundary but is a real one. The fourteen names below are reserved by this plan and
+// boundary but is a real one. The fifteen names below are reserved by this plan and
 // errors.go must not redeclare any of them -- package mls is one package, so a second
 // declaration is a compile error, which is the loud half; the quiet half is a shape where
 // both compiled, in two packages, and an errors.Is somewhere in the commit path stopped
@@ -13,7 +13,7 @@
 // answer differently: ErrPskNonceLength, ErrPskType and ErrDuplicatePsk are ValSem401 to
 // ValSem403, so psk.go carries them unexported until the validation plan lands the real
 // names. Nothing here is in that position. The interface registry names thirteen of the
-// fourteen as this plan's own and the validation plan's errors.go block declares none of
+// fifteen as this plan's own and the validation plan's errors.go block declares none of
 // them, so they are exported here and the later tasks of this plan return them directly.
 //
 // The fourteenth, ErrRatchetTreeExtensionTag, is the one the registry does not name, and it
@@ -23,6 +23,12 @@
 // unexported because no other plan declares it: the ValSem-numbered refusal task 11 owes
 // the validation plan is ValSem300, and THAT one is carried unexported in tree.go on
 // psk.go's terms.
+//
+// The fifteenth, ErrLeafBlank, is the registry's other omission and it is a SPLIT rather
+// than an addition: the plan gave one sentinel to two conditions, and task 18 shipped with a
+// sender whose slot the group had removed being told its leaf index was out of range. It is
+// declared here on ErrRatchetTreeExtensionTag's terms and it deliberately does not wrap
+// ErrLeafIndexOutOfRange -- see its own comment.
 //
 // Two of them WRAP a sentinel this package already declares, and that is the only thing in
 // this file worth reading twice.
@@ -77,6 +83,25 @@ var (
 	// ErrNodeIndexOutOfRange is returned for a node index outside the ratchet tree's node
 	// array. It wraps tree_math's ErrNodeOutOfRange for the reason above.
 	ErrNodeIndexOutOfRange = fmt.Errorf("mls: node index out of range: %w", ErrNodeOutOfRange)
+
+	// ErrLeafBlank names a leaf index that is INSIDE the tree and whose slot is empty: a
+	// member operating from a position the group removed, or from one that has never been
+	// filled. RatchetTree.Leaf answers nil for that and for an index past the width alike,
+	// and an operation that let the nil decide answered ErrLeafIndexOutOfRange for both.
+	//
+	// Two sentinels because the two repairs are opposite. An index past the width is a
+	// caller that computed an index wrong and fixes it by recomputing one; a blank slot is a
+	// caller whose index was correct the whole time and whose position no longer exists, and
+	// the only thing it can do is rejoin the group. Telling the second to check its index
+	// sends it to look at the one thing that is not the problem, which is the same failure
+	// tree_errors.go's header describes ErrNodeTypeMismatch avoiding.
+	//
+	// It deliberately does NOT wrap ErrLeafIndexOutOfRange. The two index errors wrap a tree
+	// math sentinel because they are the same QUESTION asked at two layers; this is a
+	// different question about the same argument, so a caller asking "was my index out of
+	// range" must get no from it. TestOnlyTheSanctionedWrapsHoldAcrossThisPackagesErrorClasses
+	// is what holds that.
+	ErrLeafBlank = errors.New("mls: the leaf at this index is blank")
 
 	// ErrTreeMalformed names a ratchet tree whose stored shape is not a tree: a node array
 	// whose width is not 2*n-1 for any n, a decode that produced a different number of nodes

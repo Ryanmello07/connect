@@ -53,6 +53,7 @@ const treeMathErrorsFile = "tree_math.go"
 var treeOwnedErrors = map[string]error{
 	"ErrLeafIndexOutOfRange":      ErrLeafIndexOutOfRange,
 	"ErrNodeIndexOutOfRange":      ErrNodeIndexOutOfRange,
+	"ErrLeafBlank":                ErrLeafBlank,
 	"ErrTreeMalformed":            ErrTreeMalformed,
 	"ErrNodeTypeMismatch":         ErrNodeTypeMismatch,
 	"ErrUnmergedLeavesNotSorted":  ErrUnmergedLeavesNotSorted,
@@ -173,8 +174,8 @@ func TestTreeMathOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) {
 // same commit, with a reason. What stops the list shrinking, and what stops it lagging behind
 // the file, is TestTreeOwnedErrorsIsEveryDeclarationOfItsFile rather than this number.
 func TestTreeErrorsAreDistinctAndNamed(t *testing.T) {
-	if len(treeOwnedErrors) != 14 {
-		t.Fatalf("this plan owns %d errors and the interface registry's tree_errors.go block names 13, plus ErrRatchetTreeExtensionTag which task 11 added; if one landed or left, say so here in the same commit",
+	if len(treeOwnedErrors) != 15 {
+		t.Fatalf("this plan owns %d errors and the interface registry's tree_errors.go block names 13, plus ErrRatchetTreeExtensionTag which task 11 added and ErrLeafBlank which split task 18's blank-leaf refusal off ErrLeafIndexOutOfRange; if one landed or left, say so here in the same commit",
 			len(treeOwnedErrors))
 	}
 	names := slices.Sorted(maps.Keys(treeOwnedErrors))

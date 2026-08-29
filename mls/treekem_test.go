@@ -30,9 +30,13 @@ package mls
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -1127,4 +1131,739 @@ func TestTheUpdatePathParentHashChainMovesEverythingBelowANodeAndNothingAbove(t 
 	}
 	t.Logf("%d senders, %d must-move and %d must-hold observations, %d paths too short to have an above and a below",
 		senders, moved, held, tooShort)
+}
+
+// ---------------------------------------------------------------------------
+// task 18: the four mutants a review found this file could not see
+// ---------------------------------------------------------------------------
+//
+// Everything above this line compares two derivations of the same commit against each other:
+// the public key at a node against the key its own path secret derives, the commit secret
+// against DeriveSecret of the last rung, the installed chain against a recomputation of it.
+// Every one of those holds over a commit whose entropy is a constant. A sender that seeded its
+// leaf key pair from thirty two zero octets installs the SAME leaf private key in every group
+// in the world, agrees with itself at every node, satisfies Consistent, verifies its parent
+// hashes and passed all of it -- measured, not supposed. So do a path secret ladder seeded from
+// a constant, a private state whose leaf key has no relationship to the leaf key the tree
+// publishes, and a filtered direct path published root-first.
+//
+// What separates those four from a correct commit is never a comparison inside one run. It is a
+// second run: against a different entropy stream, against the tree's own filtered path, or
+// against the HPKE round trip the private state exists to perform. That is what the four tests
+// below are.
+
+// octetStringsUnder is every non-empty octet string reachable from a value: any slice or array
+// of octets, and any named type spelled over one, found through pointers, structs, slices,
+// arrays and maps.
+//
+// Reflective rather than a list of fields, which is the whole reason it is worth writing. The
+// property the freshness test asserts is about EVERY octet string a commit produces, and a
+// field added to UpdatePathPlan or to a node by a later task is under that property the day it
+// is declared rather than the day somebody remembers to add it here. The octets are read one at
+// a time through Uint rather than through Bytes because the walk descends into RatchetTree's
+// unexported node array, and a value obtained that way refuses to be handed out whole.
+//
+// Zero-length strings are skipped. The topmost node of a filtered path carries the zero-length
+// octet string section 7.9 gives it, which is a value with no entropy in it either way, and a
+// walk that reported it would make every run share one member with every other.
+func octetStringsUnder(value reflect.Value) [][]byte {
+	found := [][]byte{}
+	var walk func(reflect.Value)
+	walk = func(at reflect.Value) {
+		if !at.IsValid() {
+			return
+		}
+		switch at.Kind() {
+		case reflect.Pointer, reflect.Interface:
+			if !at.IsNil() {
+				walk(at.Elem())
+			}
+		case reflect.Slice, reflect.Array:
+			if at.Kind() == reflect.Slice && at.IsNil() {
+				return
+			}
+			if at.Type().Elem().Kind() == reflect.Uint8 {
+				if at.Len() == 0 {
+					return
+				}
+				octets := make([]byte, at.Len())
+				for i := range octets {
+					octets[i] = byte(at.Index(i).Uint())
+				}
+				found = append(found, octets)
+				return
+			}
+			for i := 0; i < at.Len(); i += 1 {
+				walk(at.Index(i))
+			}
+		case reflect.Map:
+			for _, key := range at.MapKeys() {
+				walk(key)
+				walk(at.MapIndex(key))
+			}
+		case reflect.Struct:
+			for i := 0; i < at.NumField(); i += 1 {
+				walk(at.Field(i))
+			}
+		}
+	}
+	walk(value)
+	return found
+}
+
+// hexSetOf is a set of octet strings keyed by their hex, which is how the sweep below asks
+// whether two runs produced one value without caring where in either structure it sat.
+func hexSetOf(values [][]byte) map[string]bool {
+	found := map[string]bool{}
+	for _, value := range values {
+		found[hex.EncodeToString(value)] = true
+	}
+	return found
+}
+
+// TestCreateUpdatePathSecretsDrawsEveryOctetStringItPublishesFromFreshEntropy is the property
+// no comparison inside one commit can make.
+//
+// A commit that seeds its leaf key pair, or its whole path secret ladder, from a constant is
+// self-consistent at every point this file otherwise checks: each public key is the one its
+// path secret derives, the commit secret is the rung past the root, the private state is
+// Consistent with the tree, the parent hashes verify. It is also the same leaf private key, the
+// same path_secret[0] and the same commit secret in every group that implementation ever runs
+// -- so the copath of any one commit anywhere holds the sender's leaf key everywhere. Both
+// mutants were applied and the whole package stayed green.
+//
+// The instrument is two entropy streams over ONE tree. Everything about the two runs is
+// identical except the octets the provider hands out, so an octet string that comes back the
+// same from both was not drawn: it was carried out of the tree, or it is a constant. The
+// carried half is derived from the input tree itself rather than listed, so a credential, a
+// signature key or an extension body the fixture happens to hold is excused by being IN it and
+// nothing else is.
+//
+// The class of values judged is derived too, by walking the plan and the tree the call left
+// behind for every octet string in them. A field a later task adds to either is under this
+// property without an edit here, which is the half a named list of five secrets would lose.
+//
+// Two controls, because a differential test's failure mode is having no difference to see.
+// Running the SAME stream twice must reproduce the run exactly, which is what says a difference
+// between the two streams is the entropy rather than incidental nondeterminism; and the values
+// the RFC makes secret are looked up by name in the drawn set, which is what says the walk
+// found them at all. A walker that returned nothing would satisfy the intersection property and
+// nothing else.
+func TestCreateUpdatePathSecretsDrawsEveryOctetStringItPublishesFromFreshEntropy(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	fixture, members := newTestTree(t, crypto, 8)
+	const at = 3
+	sender := members[at].LeafIndex
+
+	// what the call may answer without having drawn it: every octet string the tree it was
+	// handed already held, plus the group id the caller passes in
+	carried := hexSetOf(octetStringsUnder(reflect.ValueOf(fixture)))
+	carried[hex.EncodeToString(testGroupId())] = true
+	if len(carried) < 8 {
+		t.Fatalf("the input tree walked to %d octet strings, and an eight member tree holds a key, a credential and an extension body per leaf; the walk is not reading it",
+			len(carried))
+	}
+
+	// one commit over a copy of that tree, under a provider whose entropy the caller chose
+	run := func(first byte) (map[string]bool, map[string][]byte) {
+		tree := fixture.Clone()
+		drawn := mustProviderOver(t, CipherSuiteX25519ChaCha20Sha256Ed25519, providerStubStream(first))
+		plan, err := tree.CreateUpdatePathSecrets(drawn, sender, members[at].SignaturePriv, testGroupId())
+		if err != nil {
+			t.Fatalf("stream %#02x: CreateUpdatePathSecrets: %v", first, err)
+		}
+		produced := append(octetStringsUnder(reflect.ValueOf(plan)), octetStringsUnder(reflect.ValueOf(tree))...)
+		drew := map[string]bool{}
+		for value := range hexSetOf(produced) {
+			if !carried[value] {
+				drew[value] = true
+			}
+		}
+		named := map[string][]byte{
+			"the sender's new leaf encryption key, as the tree publishes it": tree.Leaf(sender).EncryptionKey,
+			"the leaf private key the plan's private state keeps":            plan.Private.EncryptionPriv,
+			"path_secret[0]":                                                 plan.PathSecrets[0],
+			"the commit secret":                                              plan.CommitSecret,
+		}
+		for i, x := range plan.Path {
+			named[fmt.Sprintf("the public key published at node %d", x)] = plan.PublicKeys[i]
+			named[fmt.Sprintf("the path secret the private state holds for node %d", x)] = plan.Private.PathSecrets[x]
+		}
+		return drew, named
+	}
+
+	first, named := run(0x11)
+	second, _ := run(0xa4)
+	again, _ := run(0x11)
+
+	// the control: one stream is one run, so a value that survives below survives because the
+	// entropy did not reach it and not because the fixture wandered
+	if !maps.Equal(first, again) {
+		t.Fatalf("two commits over one tree under one entropy stream drew %d and %d octet strings and the sets differ; this test cannot tell a constant from a value that varies for some other reason",
+			len(first), len(again))
+	}
+	if len(first) == 0 {
+		t.Fatal("the walk found no octet string in the plan or the tree that the input tree did not already hold, so the sweep below compares two empty sets")
+	}
+
+	// the coverage claim, checked rather than assumed: the values the RFC makes secret have to
+	// be among the ones being judged
+	for what, octets := range named {
+		if len(octets) == 0 {
+			t.Errorf("%s is empty", what)
+			continue
+		}
+		if !first[hex.EncodeToString(octets)] {
+			t.Errorf("%s is not among the octet strings this commit drew, so the sweep below is not judging it", what)
+		}
+	}
+
+	// the property. Nothing a commit produces that its tree did not already hold may repeat
+	// across two entropy streams.
+	repeated := []string{}
+	for value := range first {
+		if second[value] {
+			repeated = append(repeated, value)
+		}
+	}
+	slices.Sort(repeated)
+	for _, value := range repeated {
+		what := "an octet string"
+		for name, octets := range named {
+			if hex.EncodeToString(octets) == value {
+				what = name
+			}
+		}
+		t.Errorf("two commits over one tree under two different entropy streams both produced %s = %s; it is a constant of this implementation rather than something this commit drew, which is the sender's own secret handed to every group it ever runs in",
+			what, value)
+	}
+	t.Logf("%d octet strings drawn per commit, %d of them named, none shared across two entropy streams",
+		len(first), len(named))
+}
+
+// encryptionKeyAt is the HPKE public key a tree carries at one node, whichever kind of node it
+// is. A blank position is fatal rather than an empty key: every caller below reads a position
+// the commit it just made installed.
+func encryptionKeyAt(t *testing.T, tree *RatchetTree, x NodeIndex) HpkePublicKey {
+	t.Helper()
+	node := tree.Get(x)
+	if node == nil {
+		t.Fatalf("node %d is blank", x)
+	}
+	if node.Leaf != nil {
+		return node.Leaf.EncryptionKey
+	}
+	if node.Parent != nil {
+		return node.Parent.EncryptionKey
+	}
+	t.Fatalf("node %d holds neither a leaf nor a parent", x)
+	return nil
+}
+
+// TestThePrivateStateOpensEverythingSealedToTheKeysThisCommitInstalls is the round trip the
+// plan's private half exists to perform, made at the one place both halves are in scope.
+//
+// TreeKEMPrivate.Consistent deliberately does not check the leaf pair -- the provider surface
+// has no private-to-public operation, and its own comment defers it to task 22's decrypt, where
+// the UpdatePath carries the public key to compare against. That leaves task 18 as the only
+// call in the package where the private key it stores and the public key it installs are both
+// present, and before this test nothing related them: the plan's leaf private key could be
+// drawn from a second, independent key pair and every test in this file passed, including the
+// one named for the leaf's independence, which asserted only that the field was not empty. The
+// sender would then hold a private state that cannot open anything sealed to its own published
+// leaf key, and would find that out one epoch later as a decryption failure.
+//
+// So the assertion is the operation itself, through HpkeSeal and HpkeOpen, which the provider
+// surface has had since task 15. The class is DERIVED from the commit: the sender's own leaf,
+// plus every node of the path the plan publishes, read out of the tree the call left behind
+// rather than out of the plan, because what a peer will seal to is what the TREE carries. Both
+// arms of NodePrivateKey are exercised by that class without being named -- the leaf is the
+// stored-key arm and every path node is the derived arm.
+//
+// The negative control is per node rather than once. A round trip that succeeded for a reason
+// other than the key -- a provider that ignored the private key, say -- would pass every line
+// above, so an unrelated private key is required to fail at each of the same positions.
+func TestThePrivateStateOpensEverythingSealedToTheKeysThisCommitInstalls(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	info := []byte("urmessage: the info an update path seals under")
+	aad := []byte("urmessage: the aad")
+	plaintext := []byte("a path secret sized plaintext, thirty two octets.")
+	opened, refused, senders := 0, 0, 0
+	for _, n := range []uint32{2, 3, 4, 7, 8} {
+		for at := uint32(0); at < n; at += 1 {
+			tree, members := newTestTree(t, crypto, n)
+			sender := members[at].LeafIndex
+			plan, err := tree.CreateUpdatePathSecrets(crypto, sender, members[at].SignaturePriv, testGroupId())
+			if err != nil {
+				t.Fatalf("n=%d sender=%d CreateUpdatePathSecrets: %v", n, sender, err)
+			}
+			senders += 1
+			// the class: the leaf this commit re-keyed, and every node it published a key at
+			installed := append([]NodeIndex{sender.NodeIndex()}, plan.Path...)
+			for _, x := range installed {
+				public := encryptionKeyAt(t, tree, x)
+				private, held, err := plan.Private.NodePrivateKey(crypto, x)
+				if err != nil {
+					t.Fatalf("n=%d sender=%d NodePrivateKey(%d): %v", n, sender, x, err)
+				}
+				if !held {
+					t.Errorf("n=%d sender=%d the commit installed a key at node %d and its own private state holds nothing for it",
+						n, sender, x)
+					continue
+				}
+				kemOutput, ciphertext, err := crypto.HpkeSeal(public, info, aad, plaintext)
+				if err != nil {
+					t.Fatalf("n=%d sender=%d HpkeSeal to node %d: %v", n, sender, x, err)
+				}
+				got, err := crypto.HpkeOpen(private, kemOutput, info, aad, ciphertext)
+				if err != nil {
+					t.Errorf("n=%d sender=%d the private state cannot open what was sealed to the key this commit installed at node %d: %v",
+						n, sender, x, err)
+					continue
+				}
+				if !bytes.Equal(got, plaintext) {
+					t.Errorf("n=%d sender=%d node %d opened to %x, want %x", n, sender, x, got, plaintext)
+					continue
+				}
+				opened += 1
+				// the control, at the same node: an unrelated private key must not open it
+				other, _, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+				if err != nil {
+					t.Fatalf("DeriveKeyPair: %v", err)
+				}
+				if _, err := crypto.HpkeOpen(other, kemOutput, info, aad, ciphertext); err == nil {
+					t.Fatalf("n=%d sender=%d a private key unrelated to node %d opened its ciphertext, so the round trip above says nothing about which key was used",
+						n, sender, x)
+				}
+				refused += 1
+			}
+		}
+	}
+	if senders == 0 || opened == 0 || refused == 0 {
+		t.Fatalf("the sweep ran %d senders, %d round trips and %d controls; a zero in any of the three is a direction this test did not reach",
+			senders, opened, refused)
+	}
+	t.Logf("%d senders, %d keys installed and opened through the plan's own private state, %d unrelated keys refused",
+		senders, opened, refused)
+}
+
+// TestTheUpdatePathIsPublishedLeafFirstAlongTheFilteredDirectPath is the order contract, which
+// nothing held.
+//
+// FilteredDirectPath's own doc states it: "The order is the contract and not a detail of it ...
+// That is why the tests compare elementwise through equalNodeIndices and never as sets." The
+// plan built the same slice and no test compared it against anything -- the two that touch it
+// check that it is not empty and that it has the same LENGTH as the filtered path -- so
+// publishing it root-first left the whole package green. That reversal is entirely
+// self-consistent inside this task, because publicKeys[i] is installed at path[i] and the
+// private state is keyed by path[i] too: the topmost node ends up carrying the key derived from
+// the LOWEST rung, which inverts the one-way asymmetry this file's header says the security
+// argument rests on, and task 19's wire type and task 20's ciphertexts pair positionally with
+// exactly this slice.
+//
+// Two readings, deliberately not one. Elementwise against the tree's own FilteredDirectPath is
+// the contract as this package states it; and against tree math's unfiltered direct path, which
+// is bottom-up by construction, is the same statement made without the filter in it -- every
+// published node is on the sender's direct path and their positions along it strictly ascend.
+// A filter that reversed its own answer would satisfy the first and fail the second.
+//
+// The ladder pairing is here too, because it is the same positional claim about the other half
+// of the plan: rung i+1 is DeriveSecret of rung i under "path", and it derives the key
+// published one node higher.
+//
+// Every width from two to eight and every member of each as the sender, since which senders
+// have a filtered path shorter than the direct path is a property of the filter.
+func TestTheUpdatePathIsPublishedLeafFirstAlongTheFilteredDirectPath(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	senders, published, placed, rungs := 0, 0, 0, 0
+	for width := uint32(2); width <= 8; width += 1 {
+		for at := uint32(0); at < width; at += 1 {
+			tree, members := newTestTree(t, crypto, width)
+			sender := members[at].LeafIndex
+			before := tree.Clone()
+			want, err := before.FilteredDirectPath(sender)
+			if err != nil {
+				t.Fatalf("width=%d sender=%d FilteredDirectPath: %v", width, sender, err)
+			}
+			plan, err := tree.CreateUpdatePathSecrets(crypto, sender, members[at].SignaturePriv, testGroupId())
+			if err != nil {
+				t.Fatalf("width=%d sender=%d CreateUpdatePathSecrets: %v", width, sender, err)
+			}
+			senders += 1
+			// the contract as this package states it, elementwise and never as a set
+			if !equalNodeIndices(plan.Path, want) {
+				t.Errorf("width=%d sender=%d the plan publishes %v and the filtered direct path of the tree it committed over is %v",
+					width, sender, plan.Path, want)
+			}
+			// and over the tree the call left behind, which is the one task 20 hands on
+			after, err := tree.FilteredDirectPath(sender)
+			if err != nil {
+				t.Fatalf("width=%d sender=%d FilteredDirectPath after the commit: %v", width, sender, err)
+			}
+			if !equalNodeIndices(plan.Path, after) {
+				t.Errorf("width=%d sender=%d the plan publishes %v and the filtered direct path of the tree it left behind is %v",
+					width, sender, plan.Path, after)
+			}
+			published += len(plan.Path)
+
+			// the same claim without the filter in it: tree math's direct path is bottom-up by
+			// construction, so a published path that is leaf-first visits its positions in
+			// strictly ascending order
+			direct, err := directPathOf(sender.NodeIndex(), before.LeafWidth())
+			if err != nil {
+				t.Fatalf("width=%d sender=%d directPathOf: %v", width, sender, err)
+			}
+			height := map[NodeIndex]int{}
+			for rung, x := range direct {
+				height[x] = rung
+			}
+			last := -1
+			for i, x := range plan.Path {
+				rung, on := height[x]
+				if !on {
+					t.Errorf("width=%d sender=%d the plan publishes node %d at position %d, and that node is not on the sender's direct path %v",
+						width, sender, x, i, direct)
+					continue
+				}
+				if rung <= last {
+					t.Errorf("width=%d sender=%d the plan publishes node %d (rung %d of the direct path) at position %d, after a node at rung %d; the filtered direct path is published leaf-first and this one runs the other way",
+						width, sender, x, rung, i, last)
+				}
+				last = rung
+				placed += 1
+			}
+
+			// the ladder, paired with the path the same way: rung i+1 is one DeriveSecret above
+			// rung i, and it is the secret the node one position higher was keyed from
+			for i := 0; i+1 < len(plan.PathSecrets); i += 1 {
+				next := crypto.DeriveSecret(plan.PathSecrets[i], "path")
+				if !bytes.Equal(next, plan.PathSecrets[i+1]) {
+					t.Errorf("width=%d sender=%d path secret %d is not DeriveSecret of path secret %d under the label \"path\"",
+						width, sender, i+1, i)
+					continue
+				}
+				_, derived, err := DeriveNodeKeyPair(crypto, next)
+				if err != nil {
+					t.Fatalf("DeriveNodeKeyPair: %v", err)
+				}
+				if !bytes.Equal(derived, plan.PublicKeys[i+1]) {
+					t.Errorf("width=%d sender=%d the rung above path secret %d does not derive the key published at position %d (node %d)",
+						width, sender, i, i+1, plan.Path[i+1])
+				}
+				rungs += 1
+			}
+		}
+	}
+	if senders == 0 || published == 0 || placed == 0 || rungs == 0 {
+		t.Fatalf("the sweep ran %d senders, %d published nodes, %d of them placed against the unfiltered direct path and %d ladder steps; a zero in any of the four is a direction this test did not reach",
+			senders, published, placed, rungs)
+	}
+	t.Logf("%d senders, %d published nodes, %d placed against the unfiltered direct path, %d ladder steps",
+		senders, published, placed, rungs)
+}
+
+// ---------------------------------------------------------------------------
+// task 18: what a failed commit must leave behind, and which fault it names
+// ---------------------------------------------------------------------------
+
+// errInjectedProviderFault is what the sweep below makes exactly one provider call answer, so
+// a refusal produced by the injection is never mistaken for one the tree raised on its own.
+var errInjectedProviderFault = errors.New("mls: injected provider fault")
+
+// faultInjectingProvider fails the nth call to a CryptoProvider method that has an error to
+// fail with, and passes every other call straight through to the provider it embeds.
+//
+// The embedded interface is what makes the passthrough total: a method this type does not
+// override is answered by the real provider, so the sweep only ever perturbs the one call it
+// means to. Which methods it MUST override is not a judgement made here --
+// TestTheFaultInjectingProviderCoversEveryProviderCallThatCanFail derives that class off the
+// interface itself and calls each member, so a fallible method added to CryptoProvider by a
+// later task fails that gate rather than quietly becoming a failure this sweep cannot inject.
+type faultInjectingProvider struct {
+	CryptoProvider
+	failAt int
+	calls  int
+}
+
+// faults counts this call and answers whether it is the one to fail. Counting happens on every
+// fallible call whether or not it fails, which is what makes a run with failAt of zero a census
+// of how many injection points the operation has.
+func (self *faultInjectingProvider) faults() bool {
+	self.calls += 1
+	return self.calls == self.failAt
+}
+
+func (self *faultInjectingProvider) AeadSeal(key []byte, nonce []byte, aad []byte, plaintext []byte) ([]byte, error) {
+	if self.faults() {
+		return nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.AeadSeal(key, nonce, aad, plaintext)
+}
+
+func (self *faultInjectingProvider) AeadOpen(key []byte, nonce []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	if self.faults() {
+		return nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.AeadOpen(key, nonce, aad, ciphertext)
+}
+
+func (self *faultInjectingProvider) SignWithLabel(priv SignaturePrivateKey, label string, content []byte) ([]byte, error) {
+	if self.faults() {
+		return nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.SignWithLabel(priv, label, content)
+}
+
+func (self *faultInjectingProvider) VerifyWithLabel(pub SignaturePublicKey, label string, content []byte, sig []byte) error {
+	if self.faults() {
+		return errInjectedProviderFault
+	}
+	return self.CryptoProvider.VerifyWithLabel(pub, label, content, sig)
+}
+
+func (self *faultInjectingProvider) HpkeSeal(pub HpkePublicKey, info []byte, aad []byte, plaintext []byte) ([]byte, []byte, error) {
+	if self.faults() {
+		return nil, nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.HpkeSeal(pub, info, aad, plaintext)
+}
+
+func (self *faultInjectingProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	if self.faults() {
+		return nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.HpkeOpen(priv, kemOutput, info, aad, ciphertext)
+}
+
+func (self *faultInjectingProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
+	if self.faults() {
+		return nil, nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.DeriveKeyPair(ikm)
+}
+
+func (self *faultInjectingProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
+	if self.faults() {
+		return nil, nil, errInjectedProviderFault
+	}
+	return self.CryptoProvider.SignatureKeyPair()
+}
+
+// fallibleProviderMethods is every method of CryptoProvider whose results include an error,
+// read off the interface type rather than written out.
+//
+// This is the class the injecting provider has to cover, and it is derived for the reason
+// standing rule 5 gives: a hand written list of eight names understates the class the moment a
+// ninth fallible method lands, and the sweep that uses it would then report a clean bill over a
+// failure it never injected.
+func fallibleProviderMethods() []string {
+	surface := reflect.TypeOf((*CryptoProvider)(nil)).Elem()
+	failure := reflect.TypeOf((*error)(nil)).Elem()
+	found := []string{}
+	for i := 0; i < surface.NumMethod(); i += 1 {
+		method := surface.Method(i)
+		for at := 0; at < method.Type.NumOut(); at += 1 {
+			if method.Type.Out(at) == failure {
+				found = append(found, method.Name)
+				break
+			}
+		}
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestTheFaultInjectingProviderCoversEveryProviderCallThatCanFail holds the fixture to the
+// class above, in the only way that cannot go quiet: by CALLING each member.
+//
+// A structural check -- does this type declare a method of that name -- would be satisfied by
+// an override that forgot to consult the counter. So each fallible method is invoked with the
+// fault armed at the first call and is required to answer the injected fault: a method the
+// fixture does not override reaches the embedded provider and answers something else, or
+// panics on the zero arguments, and either way is reported here rather than silently becoming
+// a failure the atomicity sweep cannot reach.
+func TestTheFaultInjectingProviderCoversEveryProviderCallThatCanFail(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	names := fallibleProviderMethods()
+	if len(names) == 0 {
+		t.Fatal("no method of CryptoProvider was read as having an error result, so this gate is judging an empty class")
+	}
+	for _, name := range names {
+		armed := CryptoProvider(&faultInjectingProvider{CryptoProvider: crypto, failAt: 1})
+		method := reflect.ValueOf(armed).MethodByName(name)
+		if !method.IsValid() {
+			t.Errorf("CryptoProvider declares %s and the fault injecting provider has no such method", name)
+			continue
+		}
+		arguments := make([]reflect.Value, method.Type().NumIn())
+		for i := range arguments {
+			arguments[i] = reflect.New(method.Type().In(i)).Elem()
+		}
+		results := []reflect.Value{}
+		if panicked := recoveredPanic(func() { results = method.Call(arguments) }); panicked != nil {
+			t.Errorf("%s panicked with %v instead of answering the armed fault, so the fault injecting provider does not override it and the atomicity sweep can never fail that call",
+				name, panicked)
+			continue
+		}
+		var answered error
+		for _, result := range results {
+			if failure, isError := result.Interface().(error); isError && failure != nil {
+				answered = failure
+			}
+		}
+		if !errors.Is(answered, errInjectedProviderFault) {
+			t.Errorf("%s answered %v with the fault armed at its first call; the fault injecting provider does not override it, so a failure there is one the atomicity sweep cannot inject",
+				name, answered)
+		}
+	}
+	t.Logf("%d fallible provider methods, every one of them injectable: %v", len(names), names)
+}
+
+// TestCreateUpdatePathSecretsLeavesTheTreeExactlyAsItFoundItWhenItFails is the atomicity
+// contract, and it is here because the shipped body did not have one.
+//
+// Every refusal this call makes was placed ahead of the mutation on purpose -- the nil
+// provider, the leaf index, the filtered path -- except one. leaf.Sign is reachable only after
+// the direct path has been blanked, the new public keys installed and the parent hash chain
+// written, so a signature private key that does not match the ciphersuite used to answer an
+// error over a caller's tree whose tree hash had already moved and which VerifyParentHashes
+// then refused. Measured on the shipped source, not supposed: the tree hash moved and
+// VerifyParentHashes answered "node 1 is claimed by 0 of its descendants". The previous epoch's
+// keys are gone at that point, so there is nothing the caller can do with what it is left
+// holding, and task 20 would have had to know to throw the tree away.
+//
+// The failure positions are DERIVED rather than picked. A census run counts how many fallible
+// provider calls one commit makes, and the sweep then fails each of them in turn, so a call
+// this operation gains or loses moves the sweep with it. On top of that sits the one failure no
+// provider fault can produce -- a signature key of the wrong length, which is refused inside
+// the provider rather than by failing it -- because that is the exact shape the review found.
+//
+// The instrument is checked before it is used. Clone is what the snapshot is taken with and
+// what the operation works on, so a Clone that normalised anything would make DeepEqual either
+// blind or permanently red; requiring a fresh clone to compare equal to its original says which.
+func TestCreateUpdatePathSecretsLeavesTheTreeExactlyAsItFoundItWhenItFails(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	fixture, members := newTestTree(t, crypto, 8)
+	const at = 3
+	sender := members[at].LeafIndex
+	if !reflect.DeepEqual(fixture, fixture.Clone()) {
+		t.Fatal("a fresh clone of the fixture does not compare equal to it, so DeepEqual cannot say whether a failed call changed a tree")
+	}
+
+	// the census: how many fallible provider calls a SUCCESSFUL commit makes, which is the
+	// range the sweep covers. failAt of zero never matches, so nothing is injected here.
+	census := &faultInjectingProvider{CryptoProvider: crypto}
+	probe := fixture.Clone()
+	if _, err := probe.CreateUpdatePathSecrets(census, sender, members[at].SignaturePriv, testGroupId()); err != nil {
+		t.Fatalf("the census run failed: %v", err)
+	}
+	if census.calls == 0 {
+		t.Fatal("a successful commit made no fallible provider call, so the sweep below has no failure to inject")
+	}
+
+	refused := 0
+	for point := 1; point <= census.calls; point += 1 {
+		tree := fixture.Clone()
+		before := tree.Clone()
+		faulty := &faultInjectingProvider{CryptoProvider: crypto, failAt: point}
+		plan, err := tree.CreateUpdatePathSecrets(faulty, sender, members[at].SignaturePriv, testGroupId())
+		if err == nil {
+			t.Errorf("failing provider call %d of %d was accepted and answered a plan over %d nodes; a fault the operation swallows is one it built a commit on top of",
+				point, census.calls, len(plan.Path))
+			continue
+		}
+		if !errors.Is(err, errInjectedProviderFault) {
+			t.Errorf("failing provider call %d of %d answered %v, which is not the injected fault", point, census.calls, err)
+		}
+		refused += 1
+		if !reflect.DeepEqual(tree, before) {
+			t.Errorf("failing provider call %d of %d left the caller's tree changed; a commit that answers an error must be a no-op, because the epoch it half-installed cannot be undone",
+				point, census.calls)
+		}
+	}
+	if refused != census.calls {
+		t.Errorf("%d of the %d fallible provider calls were refused; the sweep is meant to reach every one", refused, census.calls)
+	}
+
+	// the failure the injection cannot make, which is the one the review actually found: a
+	// signature private key that does not match the ciphersuite, refused INSIDE SignWithLabel
+	// and therefore after the whole mutation has happened
+	tree := fixture.Clone()
+	before := tree.Clone()
+	wanted := treeHashOf(t, crypto, before)
+	if _, err := tree.CreateUpdatePathSecrets(crypto, sender, SignaturePrivateKey{1, 2, 3}, testGroupId()); err == nil {
+		t.Fatal("a signature private key of three octets was accepted, so this half of the test asserts nothing")
+	}
+	if !reflect.DeepEqual(tree, before) {
+		t.Error("a commit refused for a signature key that does not match the ciphersuite left the caller's tree changed")
+	}
+	// spelled again at the two boundaries a caller actually reads, because those are what the
+	// next epoch is built out of
+	if got := treeHashOf(t, crypto, tree); !bytes.Equal(got, wanted) {
+		t.Errorf("the tree hash moved from %x to %x across a commit that answered an error, so the caller would bind the next epoch to a tree no commit produced",
+			wanted, got)
+	}
+	if err := tree.VerifyParentHashes(crypto); err != nil {
+		t.Errorf("a commit that answered an error left the caller's tree failing section 7.9.2: %v", err)
+	}
+	t.Logf("%d fallible provider calls in one commit, every one of them refused and every one of them a no-op", census.calls)
+}
+
+// TestCreateUpdatePathSecretsTellsABlankLeafApartFromAnIndexOutsideTheTree is the split the
+// review asked for while the sentinel was still cheap to move.
+//
+// RatchetTree.Leaf answers nil for a leaf index past the width and for an occupied position
+// that has been blanked alike, and a body that let that nil decide answered
+// ErrLeafIndexOutOfRange for both. The two callers are opposite: one computed an index wrong
+// and repairs it by recomputing one, the other is a member committing from a slot the group
+// REMOVED, whose index was right the whole time and whose only repair is to rejoin. Telling the
+// second to check its index sends it to look at the one thing that is not the problem.
+//
+// The blank positions are derived from the tree rather than picked -- every member of an eight
+// member tree is blanked in turn -- because which leaf indices are blankable is a property of
+// the tree and not of a fixture. The out of range half sweeps from the first index past the
+// width, which is the boundary, rather than a number chosen to be obviously too large.
+//
+// The exclusivity is the half with teeth. The two sentinels are useless if either answers for
+// the other, so each refusal is required to match its own and to NOT match the other's, which
+// is what a wrap between them would break.
+func TestCreateUpdatePathSecretsTellsABlankLeafApartFromAnIndexOutsideTheTree(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	fixture, members := newTestTree(t, crypto, 8)
+	width := uint32(fixture.LeafWidth())
+	blanked, outside := 0, 0
+	for at := uint32(0); at < width; at += 1 {
+		tree := fixture.Clone()
+		sender := LeafIndex(at)
+		if err := tree.Blank(sender.NodeIndex()); err != nil {
+			t.Fatalf("Blank(leaf %d): %v", sender, err)
+		}
+		_, err := tree.CreateUpdatePathSecrets(crypto, sender, members[at].SignaturePriv, testGroupId())
+		if !errors.Is(err, ErrLeafBlank) {
+			t.Errorf("a commit from blanked leaf %d, which is inside an %d leaf tree, answered %v; want %v",
+				sender, width, err, ErrLeafBlank)
+		}
+		if errors.Is(err, ErrLeafIndexOutOfRange) {
+			t.Errorf("a commit from blanked leaf %d answered %v, which also matches ErrLeafIndexOutOfRange; the member is being told to fix an index that was correct",
+				sender, err)
+		}
+		blanked += 1
+	}
+	for _, sender := range []LeafIndex{LeafIndex(width), LeafIndex(width + 1), LeafIndex(width + 97)} {
+		tree := fixture.Clone()
+		_, err := tree.CreateUpdatePathSecrets(crypto, sender, members[0].SignaturePriv, testGroupId())
+		if !errors.Is(err, ErrLeafIndexOutOfRange) {
+			t.Errorf("a commit from leaf %d, which is outside an %d leaf tree, answered %v; want %v",
+				sender, width, err, ErrLeafIndexOutOfRange)
+		}
+		if errors.Is(err, ErrLeafBlank) {
+			t.Errorf("a commit from leaf %d, which is outside the tree, answered %v, which also matches ErrLeafBlank; the caller is being told a position exists and is empty when it does not exist",
+				sender, err)
+		}
+		outside += 1
+	}
+	if blanked == 0 || outside == 0 {
+		t.Fatalf("the sweep made %d blank-leaf calls and %d out of range calls; a zero in either is an arm this test did not reach", blanked, outside)
+	}
+	t.Logf("%d blanked leaves and %d indices past the width, each answered by its own sentinel and by neither the other", blanked, outside)
 }
