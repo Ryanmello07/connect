@@ -655,14 +655,48 @@ const updatePathNodeLabel = "UpdatePathNode"
 // It names a disagreement about HOW MANY nodes the path has, and this is the sending side of
 // the rule ValSem202 makes a receiver enforce. There are two ways to reach it here and they are
 // one condition: the tree this call was made over gives the sender a filtered direct path of a
-// different length than the plan was built against -- the tree moved under the plan, or the
-// sender argument is not the leaf the plan was made for -- or the plan disagrees with itself,
-// carrying a different number of secrets or public keys than nodes. Either way the positional
-// pairing this whole construction rests on has no meaning, so it is refused before a single
-// secret is sealed rather than being sealed to whatever the shorter of the two runs out at.
+// different length than the plan was built against -- the tree moved under the plan -- or the
+// plan disagrees with itself, carrying a different number of secrets or public keys than nodes.
+// Either way the positional pairing this whole construction rests on has no meaning, so it is
+// refused before a single secret is sealed rather than being sealed to whatever the shorter of
+// the two runs out at.
+//
+// It does NOT name a plan published under the wrong leaf, and the sentence that used to say it
+// did was wrong for a reason that was measured rather than argued: every leaf of a full tree has
+// a filtered direct path of the same length as every other, so a length comparison accepted leaf
+// 0's plan published as leaf 4 and sealed leaf 0's path secrets to leaf 4's copath resolution.
+// errPlanNotThisSenders is that refusal, and its own comment is why it has to be a second one.
 var errPathLength = errors.New("mls: the update path is not the length of the sender's filtered direct path")
 
-// errNilUpdatePathPlan is EncryptUpdatePath handed no plan, or one carrying no leaf.
+// errPlanNotThisSenders is EncryptUpdatePath asked to publish one leaf's plan under another
+// leaf's index.
+//
+// The sender argument is a SECOND source of truth for an identity the plan already carries.
+// CreateUpdatePathSecrets generated this plan for one leaf and recorded it in
+// plan.Private.LeafIndex, and until this refusal nothing made the two agree -- the length
+// agreement next door cannot, because in a full tree every leaf's filtered direct path is the
+// same length as every other's. What that accepted is not a shape error: leaf 0's plan published
+// as leaf 4 seals path_secret[0] to the resolution of leaf 4's copath, so leaves 5 and 6 receive
+// secrets for nodes on leaf 0's direct path and leaves 1, 2 and 3 receive nothing at all.
+//
+// A receiver does reject that commit -- plan.LeafNode was signed over the index the plan was
+// made for, so the leaf signature fails -- and that is exactly why the refusal belongs HERE. The
+// signature is checked by a peer that has already received the ciphertexts; the secret is on the
+// wire, sealed to a subtree that never generated it, before anyone is in a position to reject
+// anything. A refusal that arrives after the send is not a refusal of this fault.
+//
+// Unexported for errNilUpdatePathPlan's reason in this same file: nothing outside this package
+// can reach the condition, so it is not a refusal any exclusivity sweep should have to judge.
+var errPlanNotThisSenders = errors.New("mls: the update path plan was built for a leaf other than the sender publishing it")
+
+// errNilUpdatePathPlan is EncryptUpdatePath handed no plan, or one carrying no leaf, or one
+// carrying no private state.
+//
+// The private half is REQUIRED and not merely used when present, because it is where the plan
+// records the leaf it was generated for and that is what errPlanNotThisSenders is decided
+// against. A plan without it is a plan whose sender cannot be checked at all, and the
+// alternative -- checking only when it happens to be there -- is a refusal any caller switches
+// off by handing over less.
 //
 // Unexported and an error rather than the nil dereference the shorter body would take, which is
 // errNilHpkeCiphertext's argument in this same file: nothing outside this package can produce
@@ -712,12 +746,19 @@ func (self *RatchetTree) EncryptUpdatePath(crypto CryptoProvider, plan *UpdatePa
 	if crypto == nil {
 		return nil, ErrNilCryptoProvider
 	}
-	if plan == nil || plan.LeafNode == nil {
+	if plan == nil || plan.LeafNode == nil || plan.Private == nil {
 		return nil, errNilUpdatePathPlan
 	}
 	targets, err := self.EncryptionTargets(sender, exclude)
 	if err != nil {
 		return nil, err
+	}
+	// WHOSE plan this is, decided before its lengths, because a plan belonging to another leaf
+	// makes every length below meaningless: two leaves of a full tree agree on the count of
+	// their filtered direct paths and on nothing else. errPlanNotThisSenders' own comment is
+	// what this costs to get wrong.
+	if !updatePathPlanWasBuiltFor(plan, sender) {
+		return nil, errPlanNotThisSenders
 	}
 	if !updatePathPlanMatchesTargets(plan, targets) {
 		return nil, errPathLength
@@ -768,6 +809,29 @@ func updatePathPlanMatchesTargets(plan *UpdatePathPlan, targets [][]NodeIndex) b
 	return len(targets) == len(plan.Path) &&
 		len(plan.PathSecrets) == len(plan.Path) &&
 		len(plan.PublicKeys) == len(plan.Path)
+}
+
+// updatePathPlanWasBuiltFor is the identity agreement EncryptUpdatePath rests on beside the
+// length one: the leaf this plan was generated for is the leaf publishing it.
+//
+// Derived from the PLAN and not from the tree, and that is the whole of why it holds. A leaf's
+// direct path is a function of its index and the tree's width alone, so two SIBLING leaves have
+// the same filtered direct path node for node -- an elementwise comparison of plan.Path against
+// FilteredDirectPath(sender) accepts leaf 0's plan published as leaf 1, because the only thing
+// that differs between the two is the COPATH, which no node of the path names. The plan's own
+// recorded index is the one value that separates every leaf from every other.
+//
+// It is also why nothing here compares plan.Path elementwise against the tree as well. Once the
+// leaf index agrees, the length agreement above decides the nodes too: the filtered direct path
+// of a fixed leaf is an ordered subsequence of that leaf's direct path, so two of them of the
+// same length over the same tree are the same list. A comparison no edit can make fail is not a
+// second check, it is a line that reads like one.
+//
+// A function of its own for updatePathPlanMatchesTargets' reason one declaration up: the
+// decision is an equality over indices, and a body that takes no key is not a member of the
+// class TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime reads bodies for.
+func updatePathPlanWasBuiltFor(plan *UpdatePathPlan, sender LeafIndex) bool {
+	return plan.Private.LeafIndex == sender
 }
 
 // nodeEncryptionKey is the HPKE public key a tree carries at one node, whichever kind of node

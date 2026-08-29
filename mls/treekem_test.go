@@ -3570,7 +3570,7 @@ func updatePathOpeningsTheResolutionRequires(t *testing.T, targets []NodeIndex) 
 // in its Welcome and must not get it here as well.
 func TestEncryptUpdatePathPairsEachCiphertextWithItsOwnResolutionEntry(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
-	nodes, ciphertexts, openings := 0, 0, 0
+	nodes, ciphertexts, openings, vacant := 0, 0, 0, 0
 	for _, n := range []uint32{2, 3, 4, 7, 8} {
 		fixture, members := newTestTree(t, crypto, n)
 		for _, member := range members {
@@ -3615,6 +3615,21 @@ func TestEncryptUpdatePathPairsEachCiphertextWithItsOwnResolutionEntry(t *testin
 					nodes++
 					ciphertexts += len(path.Nodes[i].EncryptedPathSecret)
 					want := updatePathOpeningsTheResolutionRequires(t, targets[i])
+					// the per case floor. The totals at the end are satisfied by one node of
+					// one tree, and at a position an exclusion has emptied the comparison
+					// below is [] against [], which is correct and is an assertion about
+					// nothing. With nobody excluded there is no such position, and that is a
+					// RULE rather than an observation about this fixture: a node reaches the
+					// filtered direct path only because its copath child resolves to
+					// something. So the empty positions are counted, and with no exclusion in
+					// force there may be none.
+					if len(want) == 0 {
+						vacant++
+						if exclude == nil {
+							t.Errorf("%s: path node %d published no ciphertext with nobody excluded, and a node is on the filtered direct path only when its copath child resolves to something",
+								at, i)
+						}
+					}
 					got := updatePathOpenings(t, crypto, members, groupContext,
 						path.Nodes[i], plan.PathSecrets[i])
 					openings += len(got)
@@ -3630,8 +3645,8 @@ func TestEncryptUpdatePathPairsEachCiphertextWithItsOwnResolutionEntry(t *testin
 		t.Fatalf("the sweep read %d path nodes, %d ciphertexts and %d openings; with any of the three at zero it compared two empty sets",
 			nodes, ciphertexts, openings)
 	}
-	t.Logf("%d path nodes, %d ciphertexts, %d openings, each paired with its own resolution entry",
-		nodes, ciphertexts, openings)
+	t.Logf("%d path nodes, %d ciphertexts, %d openings, each paired with its own resolution entry; %d of the nodes had their whole resolution excluded and compared two empty sets",
+		nodes, ciphertexts, openings, vacant)
 }
 
 // TestEncryptUpdatePathSealsUnderTheContextOfTheEpochTheCommitOpens is the other thing about
@@ -3815,15 +3830,28 @@ func TestEncryptUpdatePathRefusesAPlanWhoseLengthsDoNotAgree(t *testing.T) {
 
 // TestEncryptUpdatePathRefusesAPlanItWasNotGiven is the nil arm, an error rather than the panic
 // the shorter body would take, for errNilHpkeCiphertext's reason in the same file.
+//
+// The private half is one of the three, and it is the one that is not merely defensive. It is
+// where the plan records the leaf it was generated for, which is what errPlanNotThisSenders is
+// decided against, so a plan reaching the seal without it is a plan whose sender nothing can
+// check -- and a body that used the private state only when it happened to be there would let
+// any caller switch that refusal off by handing over less.
 func TestEncryptUpdatePathRefusesAPlanItWasNotGiven(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	tree, members := newTestTree(t, crypto, 4)
+	standing := tree.Leaf(members[0].LeafIndex)
+	if standing == nil {
+		t.Fatalf("the fixture carries no leaf at %d, so the case below is not the one it names",
+			members[0].LeafIndex)
+	}
 	for _, missing := range []struct {
 		name string
 		plan *UpdatePathPlan
 	}{
 		{name: "no plan at all", plan: nil},
 		{name: "a plan carrying no leaf", plan: &UpdatePathPlan{}},
+		{name: "a plan carrying a leaf and no private state",
+			plan: &UpdatePathPlan{LeafNode: standing.Clone()}},
 	} {
 		_, err := tree.EncryptUpdatePath(crypto, missing.plan, members[0].LeafIndex,
 			[]byte("context"), nil)
@@ -3874,6 +3902,334 @@ func TestEncryptUpdatePathAnswersStorageOfItsOwnRatherThanThePlansArrays(t *test
 		if &pair[0][0] == &pair[1][0] {
 			t.Errorf("the published path and the plan share the storage of %s; the plan is the sender's live state and the path is what the framing layer keeps",
 				what)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task 20 review: the sender argument, the parent arm, and the two refusals
+// ---------------------------------------------------------------------------
+
+// TestEncryptUpdatePathRefusesAPlanPublishedUnderAnotherLeaf holds the sender argument against
+// the identity the plan already carries, over EVERY ordered pair of leaves rather than a chosen
+// one.
+//
+// The pair SWEEP is the property and not thoroughness for its own sake. sender was a second,
+// unchecked source of truth, and all that stood between it and the plan was a comparison of
+// lengths -- which over a full tree is no comparison at all, because every leaf's filtered direct
+// path is the same three nodes long. So the class refused here is "every leaf that is not the
+// plan's own", and it is enumerated out of the tree rather than sampled: a check written against
+// the tree's PATH instead of against the plan's own index refuses most of these pairs and accepts
+// the sibling ones, where the two filtered direct paths are equal node for node and only the
+// copath differs. Those pairs are counted, so a fixture that stopped holding any would say so
+// instead of quietly covering less.
+//
+// What the acceptance is for: a plan published under its own leaf has to succeed, or the
+// refusals below would be reporting a fixture that refuses everything.
+func TestEncryptUpdatePathRefusesAPlanPublishedUnderAnotherLeaf(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	fixture, members := newTestTree(t, crypto, 8)
+	refused, accepted, sharingAPath := 0, 0, 0
+	for _, owner := range members {
+		for _, publisher := range members {
+			at := fmt.Sprintf("a plan built for leaf %d and published as leaf %d",
+				owner.LeafIndex, publisher.LeafIndex)
+			tree := fixture.Clone()
+			plan, err := tree.CreateUpdatePathSecrets(crypto, owner.LeafIndex,
+				owner.SignaturePriv, testGroupId())
+			if err != nil {
+				t.Fatalf("%s: CreateUpdatePathSecrets: %v", at, err)
+			}
+			treeHash, err := tree.TreeHash(crypto)
+			if err != nil {
+				t.Fatalf("%s: TreeHash: %v", at, err)
+			}
+			groupContext := testUpdatePathContext(t, treeHash)
+			// held in names of its own, because the two path lookups below overwrite an err
+			// this assertion is about and a sweep reading the wrong one reports nothing
+			path, refusal := tree.EncryptUpdatePath(crypto, plan, publisher.LeafIndex,
+				groupContext, nil)
+			if publisher.LeafIndex == owner.LeafIndex {
+				if refusal != nil {
+					t.Fatalf("%s: the plan's own leaf was refused with %v, so every refusal below says nothing about the sender",
+						at, refusal)
+				}
+				accepted += 1
+				continue
+			}
+			refused += 1
+			if !errors.Is(refusal, errPlanNotThisSenders) {
+				t.Errorf("%s: EncryptUpdatePath err = %v, want errPlanNotThisSenders; accepted, the plan's path secrets go out sealed to the publishing leaf's copath resolution, which is a subtree that never generated them",
+					at, refusal)
+			}
+			if path != nil {
+				t.Errorf("%s: EncryptUpdatePath refused and answered a path of %d nodes anyway",
+					at, len(path.Nodes))
+			}
+			// the pairs a check derived from the tree cannot tell apart, counted so the sweep
+			// says whether it covered them rather than leaving it to this comment
+			ownersPath, err := tree.FilteredDirectPath(owner.LeafIndex)
+			if err != nil {
+				t.Fatalf("%s: FilteredDirectPath(%d): %v", at, owner.LeafIndex, err)
+			}
+			publishersPath, err := tree.FilteredDirectPath(publisher.LeafIndex)
+			if err != nil {
+				t.Fatalf("%s: FilteredDirectPath(%d): %v", at, publisher.LeafIndex, err)
+			}
+			if equalNodeIndices(ownersPath, publishersPath) {
+				sharingAPath += 1
+			}
+		}
+	}
+	if want := len(members) * (len(members) - 1); refused != want {
+		t.Fatalf("the sweep refused %d pairs and the fixture has %d ordered pairs of distinct leaves",
+			refused, want)
+	}
+	if accepted != len(members) {
+		t.Fatalf("the sweep accepted %d plans published under their own leaf and the fixture has %d leaves",
+			accepted, len(members))
+	}
+	if sharingAPath == 0 {
+		t.Fatalf("no pair in this sweep had two leaves sharing a filtered direct path, so it never covered the sibling case a check against the tree's own path cannot see")
+	}
+	t.Logf("%d ordered pairs refused, %d of them sibling pairs whose filtered direct paths are equal node for node, %d plans accepted under their own leaf",
+		refused, sharingAPath, accepted)
+}
+
+// TestEncryptUpdatePathSealsToTheKeyOfANonLeafResolutionEntry is the parent arm of
+// nodeEncryptionKey, which nothing in this file reached.
+//
+// Every resolution this task ever saw was a list of LEAVES, and that is a property of the fixture
+// rather than of the code: newTestTree fills leaves and leaves every parent blank, and
+// CreateUpdatePathSecrets fills only the sender's own direct path, which is never a copath child
+// of itself. So a resolution entry that is a parent needs a tree where somebody has ALREADY
+// committed -- and until then the arm carrying the majority of resolution entries in any real
+// group after the first commit was dead code from the suite's point of view.
+//
+// Two members commit in turn. Leaf 2's commit fills node 5, and node 5 is leaf 0's copath child
+// at the root, so leaf 0's second path node seals to that PARENT rather than to the two leaves
+// beneath it. The assertion is an OPEN and not a shape: the ciphertext is opened with the private
+// key leaf 2 derives for node 5 and has to be the path secret leaf 0 published at that position,
+// which says the key the tree carries at that parent is the key the seal actually used.
+//
+// The over-wide direction is asserted beside it. No member's own leaf key may open that
+// ciphertext -- a resolution names a parent instead of its subtree precisely because the parent's
+// key is the one that subtree shares -- and a seal that reached for a leaf's key instead would
+// still open, still round trip and still publish exactly these counts.
+func TestEncryptUpdatePathSealsToTheKeyOfANonLeafResolutionEntry(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, members := newTestTree(t, crypto, 4)
+	first, err := tree.CreateUpdatePathSecrets(crypto, members[2].LeafIndex,
+		members[2].SignaturePriv, testGroupId())
+	if err != nil {
+		t.Fatalf("CreateUpdatePathSecrets(leaf 2): %v", err)
+	}
+	plan, err := tree.CreateUpdatePathSecrets(crypto, members[0].LeafIndex,
+		members[0].SignaturePriv, testGroupId())
+	if err != nil {
+		t.Fatalf("CreateUpdatePathSecrets(leaf 0): %v", err)
+	}
+	treeHash, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	groupContext := testUpdatePathContext(t, treeHash)
+	path, err := tree.EncryptUpdatePath(crypto, plan, members[0].LeafIndex, groupContext, nil)
+	if err != nil {
+		t.Fatalf("EncryptUpdatePath: %v", err)
+	}
+	targets, err := tree.EncryptionTargets(members[0].LeafIndex, nil)
+	if err != nil {
+		t.Fatalf("EncryptionTargets: %v", err)
+	}
+	parents := 0
+	for i, list := range targets {
+		for j, y := range list {
+			if _, isALeaf := y.LeafIndex(); isALeaf == nil {
+				// the leaf entries are the pairing sweep's, next door
+				continue
+			}
+			parents += 1
+			priv, held, err := first.Private.NodePrivateKey(crypto, y)
+			if err != nil {
+				t.Fatalf("NodePrivateKey(%d): %v", y, err)
+			}
+			if !held {
+				t.Fatalf("the first committer's private state holds no secret for node %d, so this test has nothing to open what was sealed there with",
+					y)
+			}
+			ct := path.Nodes[i].EncryptedPathSecret[j]
+			opened, err := OpenWithLabel(crypto, priv, updatePathNodeLabel, groupContext, &ct)
+			if err != nil {
+				t.Fatalf("path node %d ciphertext %d did not open with the private key of node %d, the parent standing at that position of the resolution: %v",
+					i, j, y, err)
+			}
+			if !bytes.Equal(opened, plan.PathSecrets[i]) {
+				t.Fatalf("path node %d ciphertext %d opened to %x and the secret published at that node is %x",
+					i, j, opened, plan.PathSecrets[i])
+			}
+			for _, member := range members {
+				if _, err := OpenWithLabel(crypto, member.EncryptionPriv, updatePathNodeLabel,
+					groupContext, &ct); err == nil {
+					t.Errorf("leaf %d's own key opens the ciphertext sealed to parent node %d; that position of the resolution is the parent precisely because the parent's key is the one its subtree shares",
+						member.LeafIndex, y)
+				}
+			}
+		}
+	}
+	if parents == 0 {
+		t.Fatalf("every entry of %v is a leaf, so this test never reached the arm of nodeEncryptionKey it is named for",
+			targets)
+	}
+	t.Logf("%d non-leaf resolution entries, each sealed to and opened with the key the tree carries at that parent",
+		parents)
+}
+
+// TestNodeEncryptionKeyTellsAnIndexOutsideTheTreeApartFromABlankInsideIt is the claim
+// nodeEncryptionKey's own comment makes, turned into assertions.
+//
+// The comment argues that the two ways there is no key here are different faults with different
+// repairs -- an index past the width is a caller that computed one wrong and repairs it by
+// recomputing, a blank node reached through a resolution is a tree whose walk and whose storage
+// disagree and no re-derived index repairs that -- and nothing observed either arm or the
+// distinction between them. Both refusals and the third, a stored node holding neither half, were
+// dead code from the suite's point of view, and one sentinel for both would have read the same.
+//
+// The two ANSWERS are asserted alongside, because a refusal test over a function nothing ever
+// asks a successful question of is an error path with no path beside it.
+func TestNodeEncryptionKeyTellsAnIndexOutsideTheTreeApartFromABlankInsideIt(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, members := newTestTree(t, crypto, 4)
+	// a non-blank parent to ask about, which newTestTree has none of on its own: leaf 2's
+	// commit fills nodes 5 and 3, and node 1 stays blank for the refusal below.
+	if _, err := tree.CreateUpdatePathSecrets(crypto, members[2].LeafIndex,
+		members[2].SignaturePriv, testGroupId()); err != nil {
+		t.Fatalf("CreateUpdatePathSecrets: %v", err)
+	}
+	leaf := tree.Leaf(members[1].LeafIndex)
+	if leaf == nil {
+		t.Fatalf("the fixture carries no leaf at %d", members[1].LeafIndex)
+	}
+	atTheLeaf, err := tree.nodeEncryptionKey(members[1].LeafIndex.NodeIndex())
+	if err != nil {
+		t.Fatalf("nodeEncryptionKey at a leaf: %v", err)
+	}
+	if len(atTheLeaf) == 0 || !bytes.Equal(atTheLeaf, leaf.EncryptionKey) {
+		t.Errorf("nodeEncryptionKey at leaf %d answered %x and the tree carries %x there",
+			members[1].LeafIndex, atTheLeaf, leaf.EncryptionKey)
+	}
+	parent := tree.ParentAt(NodeIndex(5))
+	if parent == nil {
+		t.Fatalf("node 5 is blank after leaf 2's commit, so this test has no parent to ask about")
+	}
+	atTheParent, err := tree.nodeEncryptionKey(NodeIndex(5))
+	if err != nil {
+		t.Fatalf("nodeEncryptionKey at a parent: %v", err)
+	}
+	if len(atTheParent) == 0 || !bytes.Equal(atTheParent, parent.EncryptionKey) {
+		t.Errorf("nodeEncryptionKey at parent node 5 answered %x and the tree carries %x there",
+			atTheParent, parent.EncryptionKey)
+	}
+	if tree.Get(NodeIndex(1)) != nil {
+		t.Fatalf("node 1 is occupied in this fixture and the blank refusal below needs it blank")
+	}
+	// the third arm needs a position that is occupied and holds neither half, which no walk of
+	// this package produces and only a hand written node reaches
+	occupied := tree.Clone()
+	occupied.nodes[1] = &Node{NodeType: NodeTypeParent}
+	for _, refusal := range []struct {
+		name string
+		tree *RatchetTree
+		at   NodeIndex
+		want error
+	}{
+		{name: "the first index past the width of the tree", tree: tree,
+			at: NodeIndex(tree.NodeWidth()), want: ErrNodeIndexOutOfRange},
+		{name: "an index well past the width of the tree", tree: tree,
+			at: NodeIndex(tree.NodeWidth() + 8), want: ErrNodeIndexOutOfRange},
+		{name: "a blank position inside the tree", tree: tree,
+			at: NodeIndex(1), want: ErrTreeMalformed},
+		{name: "an occupied position holding neither a leaf nor a parent", tree: occupied,
+			at: NodeIndex(1), want: ErrTreeMalformed},
+	} {
+		key, err := refusal.tree.nodeEncryptionKey(refusal.at)
+		if !errors.Is(err, refusal.want) {
+			t.Errorf("%s: nodeEncryptionKey(%d) err = %v, want %v; one sentinel for two faults sends the second to repair the thing that was not broken",
+				refusal.name, refusal.at, err, refusal.want)
+		}
+		if key != nil {
+			t.Errorf("%s: nodeEncryptionKey(%d) refused and answered %x anyway",
+				refusal.name, refusal.at, key)
+		}
+	}
+}
+
+// TestEncryptUpdatePathPairsAgainstAHandDerivedResolution states the pairing INDEPENDENTLY of
+// EncryptionTargets.
+//
+// The sweep above reads its expectation out of the same EncryptionTargets call the implementation
+// uses, so what it proves is that EncryptUpdatePath agrees with task 16 -- not what the
+// resolution of a four member tree is. An error inside EncryptionTargets moves both sides of that
+// comparison at once and the sweep goes on passing. This table is written from the tree's
+// GEOMETRY instead: four leaves at nodes 0, 2, 4 and 6 with every parent blank, so the resolution
+// of a blank node is its subtree's leaves left to right and the resolution of a leaf is itself.
+//
+// It is small on purpose. The sweep above is the one that covers five tree sizes and every
+// exclusion; this exists so that the two of them are not one function's answer read back to
+// itself.
+func TestEncryptUpdatePathPairsAgainstAHandDerivedResolution(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	fixture, members := newTestTree(t, crypto, 4)
+	// leaves 0 and 1 are siblings under node 1, so their first copath child is the other one
+	// and their second is node 5, which is blank and resolves to leaves 2 and 3 in that order;
+	// leaves 2 and 3 are siblings under node 5 whose second copath child is node 1, resolving
+	// to leaves 0 and 1.
+	handDerived := map[LeafIndex][][]LeafIndex{
+		0: {{1}, {2, 3}},
+		1: {{0}, {2, 3}},
+		2: {{3}, {0, 1}},
+		3: {{2}, {0, 1}},
+	}
+	if len(handDerived) != len(members) {
+		t.Fatalf("the table names %d leaves and the fixture has %d", len(handDerived), len(members))
+	}
+	for _, member := range members {
+		want, named := handDerived[member.LeafIndex]
+		if !named {
+			t.Fatalf("the table names no resolution for leaf %d and the fixture has one",
+				member.LeafIndex)
+		}
+		tree := fixture.Clone()
+		plan, err := tree.CreateUpdatePathSecrets(crypto, member.LeafIndex,
+			member.SignaturePriv, testGroupId())
+		if err != nil {
+			t.Fatalf("leaf %d: CreateUpdatePathSecrets: %v", member.LeafIndex, err)
+		}
+		treeHash, err := tree.TreeHash(crypto)
+		if err != nil {
+			t.Fatalf("leaf %d: TreeHash: %v", member.LeafIndex, err)
+		}
+		groupContext := testUpdatePathContext(t, treeHash)
+		path, err := tree.EncryptUpdatePath(crypto, plan, member.LeafIndex, groupContext, nil)
+		if err != nil {
+			t.Fatalf("leaf %d: EncryptUpdatePath: %v", member.LeafIndex, err)
+		}
+		if len(path.Nodes) != len(want) {
+			t.Fatalf("leaf %d published %d path nodes and the geometry of a four member tree gives it %d",
+				member.LeafIndex, len(path.Nodes), len(want))
+		}
+		for i := range want {
+			expected := []string{}
+			for j, opener := range want[i] {
+				expected = append(expected, fmt.Sprintf("leaf %d opens ciphertext %d", opener, j))
+			}
+			slices.Sort(expected)
+			got := updatePathOpenings(t, crypto, members, groupContext, path.Nodes[i],
+				plan.PathSecrets[i])
+			if !slices.Equal(got, expected) {
+				t.Errorf("leaf %d at path node %d: the ciphertexts open as %v and the hand derived resolution of that node's copath child is %v",
+					member.LeafIndex, i, got, expected)
+			}
 		}
 	}
 }
