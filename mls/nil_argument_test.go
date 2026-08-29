@@ -1,0 +1,577 @@
+// The gate over what this package does when a declaration is handed nil at a POINTER argument it
+// is going to read.
+//
+// provider_nil_test.go holds this rule for one argument TYPE and records what it was worth:
+// ErrNilCryptoProvider was returned by ONE of the twenty one declarations that take a provider,
+// and the other twenty raised a nil pointer dereference out of whatever line first read a width
+// off it. A panic out of a library is not a refusal. It takes the caller's process rather than its
+// call, and it says nothing about which argument was wrong.
+//
+// A provider is one argument of many, and two refusals of the framing layer sat outside that gate
+// and outside everything else. errNilAuthenticatedContent and errNilFramedContent were declared,
+// documented, and raised by code no test executed: deleting either guard -- which turns
+// VerifyAuthenticatedContent(crypto, pub, nil, gc) and FramedContentTBSBytes(wf, nil, gc) from
+// refusals into nil dereferences -- left every one of the 6339 tests of ./mls/... and
+// ./message/... passing.
+//
+// The class is read off the source rather than listed. nilArgumentRefusalsIn finds every
+// declaration that refuses a nil PARAMETER by answering a variable this package declares, and the
+// row table below is held against it in BOTH directions, so a refusal with no row fails here
+// rather than being quietly left out of the sweep. ErrNilCryptoProvider is the single exclusion,
+// by name and with its reason: that whole class has the derived gate next door, and every row it
+// would add here would be a second copy of one that already runs.
+package mls
+
+import (
+	"bytes"
+	"crypto/rand"
+	"errors"
+	"go/ast"
+	"go/token"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
+)
+
+// The one sentinel this class excludes, named rather than filtered out by shape.
+//
+// Excluded because it is covered and not because it is uninteresting:
+// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt derives the provider
+// class twice over -- off the type checker for the constructions and off the method set for the
+// methods -- and runs every member. A row here for each would restate that gate's twenty one
+// rows in a table this one keeps by hand, which is the worse of the two ways to hold it.
+const nilArgumentProviderSentinel = "ErrNilCryptoProvider"
+
+// nilArgumentRefusal is one parameter of one declaration that this package refuses a nil at,
+// together with the sentinel its own source answers.
+type nilArgumentRefusal struct {
+	declaration string
+	parameter   string
+	sentinel    string
+}
+
+// key names the refusal the way the row table below is keyed.
+func (self nilArgumentRefusal) key() string {
+	return self.declaration + "(" + self.parameter + ")"
+}
+
+// nilArgumentGuardedParameters collects the identifiers an if condition compares against nil.
+//
+// It walks && and || rather than matching a single comparison, because a guard that refuses two
+// arguments at once is one a matcher written for the bare shape does not see -- and this package
+// writes them: EncryptUpdatePath's is `plan == nil || plan.LeafNode == nil || plan.Private == nil`
+// and Consistent's is `tree == nil || tree.Leaf(self.LeafIndex) == nil`. A class that cannot see a
+// compound guard is a class the next one drops out of without saying so.
+//
+// Only a bare identifier on the left is collected. `self.field == nil` is a fact about a value the
+// CALLER assembled and not about the argument it passed, and a local compared against nil is a
+// fact about what the body derived; neither is this gate's subject, and the parameter filter below
+// is what keeps them out.
+func nilArgumentGuardedParameters(condition ast.Expr, found *[]string) {
+	switch node := condition.(type) {
+	case *ast.ParenExpr:
+		nilArgumentGuardedParameters(node.X, found)
+	case *ast.BinaryExpr:
+		if node.Op != token.EQL {
+			nilArgumentGuardedParameters(node.X, found)
+			nilArgumentGuardedParameters(node.Y, found)
+			return
+		}
+		right, isIdentifier := node.Y.(*ast.Ident)
+		if !isIdentifier || right.Name != "nil" {
+			return
+		}
+		if left, isIdentifier := node.X.(*ast.Ident); isIdentifier {
+			*found = append(*found, left.Name)
+		}
+	}
+}
+
+// nilArgumentSentinelsReturned answers the package level variables a return statement names, at
+// ANY depth of the expressions it returns.
+//
+// At any depth rather than as a bare identifier, because half of this package's nil refusals are
+// wrapped: CheckUpdatePathKeyUniqueness answers fmt.Errorf("%w: ...", ErrTreeMalformed) and
+// ValidateAgainstContext answers fmt.Errorf("%w: ...", ErrTreeHashMismatch). A reader matching
+// only `return ErrX` sees neither, and the members it does see are the ones whose sentence
+// happened to be short enough to fit on the return -- a class whose membership is decided by
+// formatting.
+func nilArgumentSentinelsReturned(statement *ast.ReturnStmt, declared []string) []string {
+	named := []string{}
+	for _, result := range statement.Results {
+		ast.Inspect(result, func(node ast.Node) bool {
+			identifier, isIdentifier := node.(*ast.Ident)
+			if isIdentifier && slices.Contains(declared, identifier.Name) &&
+				!slices.Contains(named, identifier.Name) {
+				named = append(named, identifier.Name)
+			}
+			return true
+		})
+	}
+	return named
+}
+
+// packageLevelVarNamesIn is every package level variable one parsed file declares.
+//
+// Every one, rather than the ones whose name reads like an error. What makes a returned
+// identifier a sentinel is that this package declares it -- nil and false do not, and neither
+// does a local -- and a filter on the spelling "err" would drop a refusal named any other way and
+// shrink this class without anybody editing it.
+func packageLevelVarNamesIn(parsed parsedSource) []string {
+	names := []string{}
+	for _, declaration := range parsed.file.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || generic.Tok != token.VAR {
+			continue
+		}
+		for _, specification := range generic.Specs {
+			value, isValue := specification.(*ast.ValueSpec)
+			if !isValue {
+				continue
+			}
+			for _, name := range value.Names {
+				if name.Name != "_" {
+					names = append(names, name.Name)
+				}
+			}
+		}
+	}
+	return names
+}
+
+// packageSentinelTextsIn is the message of every sentinel one file declares as errors.New of a
+// literal, keyed by name.
+//
+// This is the join between the two halves of the gate. The derived class carries a sentinel's
+// NAME and the row table carries a VALUE, and without something holding those together a row
+// naming errNilUpdatePath while asserting errNilTreeKEMPrivate passes on any declaration that
+// answers either -- the shape assertIsTheFunctionNamed exists for one file over.
+// errors.New of a literal is the form every sentinel this class reaches is declared in, and one
+// declared some other way is reported by the gate rather than silently unjoined.
+func packageSentinelTextsIn(parsed parsedSource) map[string]string {
+	texts := map[string]string{}
+	for _, declaration := range parsed.file.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || generic.Tok != token.VAR {
+			continue
+		}
+		for _, specification := range generic.Specs {
+			value, isValue := specification.(*ast.ValueSpec)
+			if !isValue || len(value.Names) != 1 || len(value.Values) != 1 {
+				continue
+			}
+			call, isCall := value.Values[0].(*ast.CallExpr)
+			if !isCall || len(call.Args) != 1 || parsed.render(call.Fun) != "errors.New" {
+				continue
+			}
+			literal, isLiteral := call.Args[0].(*ast.BasicLit)
+			if !isLiteral || literal.Kind != token.STRING {
+				continue
+			}
+			unquoted, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				continue
+			}
+			texts[value.Names[0].Name] = unquoted
+		}
+	}
+	return texts
+}
+
+// nilArgumentRefusalsIn reads one parsed file for the refusals it declares.
+func nilArgumentRefusalsIn(parsed parsedSource, declared []string) []nilArgumentRefusal {
+	found := []nilArgumentRefusal{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		parameters := []string{}
+		if function.Type.Params != nil {
+			for _, field := range function.Type.Params.List {
+				for _, name := range field.Names {
+					parameters = append(parameters, name.Name)
+				}
+			}
+		}
+		name := function.Name.Name
+		if function.Recv != nil && len(function.Recv.List) == 1 {
+			name = "(" + parsed.render(function.Recv.List[0].Type) + ")." + name
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			branch, isBranch := node.(*ast.IfStmt)
+			if !isBranch {
+				return true
+			}
+			guarded := []string{}
+			nilArgumentGuardedParameters(branch.Cond, &guarded)
+			for _, parameter := range guarded {
+				if !slices.Contains(parameters, parameter) {
+					continue
+				}
+				for _, statement := range branch.Body.List {
+					returned, isReturn := statement.(*ast.ReturnStmt)
+					if !isReturn {
+						continue
+					}
+					for _, sentinel := range nilArgumentSentinelsReturned(returned, declared) {
+						if sentinel == nilArgumentProviderSentinel {
+							continue
+						}
+						refusal := nilArgumentRefusal{
+							declaration: name, parameter: parameter, sentinel: sentinel}
+						if !slices.Contains(found, refusal) {
+							found = append(found, refusal)
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// nilArgumentRefusalsDeclared is the class over the whole package, sorted.
+//
+// The variable roster is collected over every file before any file is read for refusals, because
+// a sentinel is regularly declared in one file and answered in another -- ErrTreeMalformed is
+// tree.go's and CheckUpdatePathKeyUniqueness answers it from tree_sync.go. A per file roster would
+// read those refusals as returning an unknown identifier and drop them, which is the silent
+// shrink every derivation in this package is written against.
+func nilArgumentRefusalsDeclared(t *testing.T) []nilArgumentRefusal {
+	t.Helper()
+	names := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		names = append(names, packageLevelVarNamesIn(mustParseSource(t, path))...)
+	}
+	if len(names) == 0 {
+		t.Fatal("this package's non test source declares no package level variable, so every sentinel below reads as an unknown identifier and the class is empty")
+	}
+	found := []nilArgumentRefusal{}
+	for _, path := range packageLevelFunctions(t).files {
+		found = append(found, nilArgumentRefusalsIn(mustParseSource(t, path), names)...)
+	}
+	if len(found) == 0 {
+		t.Fatal("no declaration of this package refuses a nil argument, so the gate below demands nothing")
+	}
+	slices.SortFunc(found, func(first nilArgumentRefusal, second nilArgumentRefusal) int {
+		return strings.Compare(first.key(), second.key())
+	})
+	return found
+}
+
+// nilArgumentSentinelTexts is the same roster of messages over the whole package.
+func nilArgumentSentinelTexts(t *testing.T) map[string]string {
+	t.Helper()
+	texts := map[string]string{}
+	for _, path := range packageLevelFunctions(t).files {
+		for name, text := range packageSentinelTextsIn(mustParseSource(t, path)) {
+			texts[name] = text
+		}
+	}
+	if len(texts) == 0 {
+		t.Fatal("no sentinel of this package was read as errors.New of a literal, so nothing joins a row's value to the name the class carries")
+	}
+	return texts
+}
+
+// nilArgumentRow is one member of the class, with a call that hands it nil at that parameter and
+// something VALID everywhere else.
+//
+// Valid everywhere else is the whole of what separates this from the provider gate next door.
+// That one hands the zero value at every position, and can, because the provider is refused
+// before any other argument is judged so nothing else is reachable. Here the nil argument is
+// never the first thing checked -- the provider is, wherever there is one -- so a row that zeroed
+// its neighbours would be answered about one of THEM and would report a refusal it did not ask
+// for.
+type nilArgumentRow struct {
+	sentinel error
+	call     func(t *testing.T) error
+}
+
+// nilArgumentRows is the table, keyed the way nilArgumentRefusal.key spells a member.
+//
+// It is not what decides the class: the sweep holds it against the derived refusals in both
+// directions, so a declaration with no row fails rather than being left out, and a row naming a
+// refusal this package no longer makes fails rather than outliving it.
+//
+// One provider and one tree for the whole table, cloned by every row that mutates. A row that
+// built its own would pay for four leaves of key generation each time, and two of these
+// declarations -- SetLeaf and MergeUpdatePath -- write into the receiver they are handed, so a
+// shared fixture that was not cloned would leave a later row running against a tree an earlier
+// row had already changed.
+func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
+	t.Helper()
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, members := newTestTree(t, crypto, 4)
+	secret := bytes.Repeat([]byte{0x5c}, crypto.HashSize())
+	return map[string]nilArgumentRow{
+		"(*RatchetTree).SetLeaf(leaf)": {sentinel: ErrTreeMalformed, call: func(t *testing.T) error {
+			return tree.Clone().SetLeaf(members[0].LeafIndex, nil)
+		}},
+		// an ODD index, because SetParent refuses a leaf position before it looks at the
+		// node it was handed and this row is about the node
+		"(*RatchetTree).SetParent(parent)": {sentinel: ErrTreeMalformed, call: func(t *testing.T) error {
+			return tree.Clone().SetParent(NodeIndex(1), nil)
+		}},
+		"(*RatchetTree).ValidateAgainstContext(gc)": {sentinel: ErrTreeHashMismatch, call: func(t *testing.T) error {
+			return tree.ValidateAgainstContext(&TreeValidationContext{
+				Crypto: crypto, Suite: crypto.Suite(), GroupId: testGroupId()}, nil)
+		}},
+		"(*TreeKEMPrivate).Consistent(tree)": {sentinel: ErrPathSecretMismatch, call: func(t *testing.T) error {
+			return NewTreeKEMPrivate(members[0].LeafIndex, members[0].EncryptionPriv).Consistent(crypto, nil)
+		}},
+		"(*RatchetTree).EncryptUpdatePath(plan)": {sentinel: errNilUpdatePathPlan, call: func(t *testing.T) error {
+			_, err := tree.Clone().EncryptUpdatePath(crypto, nil, members[0].LeafIndex,
+				[]byte("context"), nil)
+			return err
+		}},
+		"(*RatchetTree).MergeUpdatePath(path)": {sentinel: errNilUpdatePath, call: func(t *testing.T) error {
+			return tree.Clone().MergeUpdatePath(crypto, members[0].LeafIndex, nil)
+		}},
+		"(*RatchetTree).DecryptUpdatePath(path)": {sentinel: errNilUpdatePath, call: func(t *testing.T) error {
+			_, err := tree.Clone().DecryptUpdatePath(crypto, members[0].LeafIndex, nil,
+				[]byte("context"), NewTreeKEMPrivate(members[1].LeafIndex, members[1].EncryptionPriv), nil)
+			return err
+		}},
+		"(*RatchetTree).DecryptUpdatePath(priv)": {sentinel: errNilTreeKEMPrivate, call: func(t *testing.T) error {
+			_, err := tree.Clone().DecryptUpdatePath(crypto, members[0].LeafIndex, &UpdatePath{},
+				[]byte("context"), nil, nil)
+			return err
+		}},
+		"CheckUpdatePathKeyUniqueness(path)": {sentinel: errNilUpdatePath, call: func(t *testing.T) error {
+			return CheckUpdatePathKeyUniqueness(tree, nil)
+		}},
+		"CheckUpdatePathKeyUniqueness(tree)": {sentinel: ErrTreeMalformed, call: func(t *testing.T) error {
+			return CheckUpdatePathKeyUniqueness(nil, &UpdatePath{})
+		}},
+		"DeriveJoinerSecret(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			_, err := DeriveJoinerSecret(crypto, secret, secret, nil)
+			return err
+		}},
+		"NewKeyScheduleFromJoiner(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			_, err := NewKeyScheduleFromJoiner(crypto, secret, secret, nil)
+			return err
+		}},
+		"NewKeyScheduleFromEpochSecret(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			_, err := NewKeyScheduleFromEpochSecret(crypto, secret, nil)
+			return err
+		}},
+		"OpenWithLabel(ct)": {sentinel: errNilHpkeCiphertext, call: func(t *testing.T) error {
+			priv, _, err := crypto.DeriveKeyPair(secret)
+			if err != nil {
+				t.Fatalf("a key pair for the open row: %v", err)
+			}
+			_, err = OpenWithLabel(crypto, priv, "Welcome", []byte("context"), nil)
+			return err
+		}},
+		// the framing pair, which is what this file was written for
+		"FramedContentTBSBytes(content)": {sentinel: errNilFramedContent, call: func(t *testing.T) error {
+			_, err := FramedContentTBSBytes(WireFormatPrivateMessage, nil, framingTestGroupContext(t))
+			return err
+		}},
+		"VerifyAuthenticatedContent(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
+			_, pub, err := crypto.SignatureKeyPair()
+			if err != nil {
+				t.Fatalf("a key pair for the verify row: %v", err)
+			}
+			return VerifyAuthenticatedContent(crypto, pub, nil, framingTestGroupContext(t))
+		}},
+		"NewCryptoProviderWithRandom(random)": {sentinel: ErrNilRandomSource, call: func(t *testing.T) error {
+			_, err := NewCryptoProviderWithRandom(CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
+			return err
+		}},
+		"X25519GenerateKey(random)": {sentinel: ErrNilRandomSource, call: func(t *testing.T) error {
+			_, err := X25519GenerateKey(nil)
+			return err
+		}},
+		"X25519DH(priv)": {sentinel: ErrBadKeyLength, call: func(t *testing.T) error {
+			standing, err := X25519GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("a key pair for the dh rows: %v", err)
+			}
+			_, err = X25519DH(nil, standing.PublicKey())
+			return err
+		}},
+		"X25519DH(pub)": {sentinel: ErrBadKeyLength, call: func(t *testing.T) error {
+			standing, err := X25519GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("a key pair for the dh rows: %v", err)
+			}
+			_, err = X25519DH(standing, nil)
+			return err
+		}},
+		// the epoch really carrying a required_capabilities, which is the arm whose nil
+		// half is a refusal. With no such extension in the list the nil is legal and the
+		// row would be observing the other branch entirely.
+		"reconcileRequiredCapabilities(required)": {sentinel: errGroupContextDisagreement, call: func(t *testing.T) error {
+			encoded, err := syntax.Marshal(&RequiredCapabilities{})
+			if err != nil {
+				t.Fatalf("encode the required capabilities the epoch carries: %v", err)
+			}
+			return reconcileRequiredCapabilities(nil, []Extension{{
+				ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: encoded}})
+		}},
+	}
+}
+
+// nilArgumentRefusalOf runs one row and turns a panic into the error it should have been, so one
+// member dereferencing its argument is a failure of its own row rather than the end of the sweep.
+func nilArgumentRefusalOf(t *testing.T, key string, row nilArgumentRow) (answered error) {
+	t.Helper()
+	defer func() {
+		if panicked := recover(); panicked != nil {
+			t.Errorf("%s panicked with %v when handed nil; a panic out of a library takes the caller's process rather than its call, and says nothing about which argument was wrong",
+				key, panicked)
+			answered = nil
+		}
+	}()
+	return row.call(t)
+}
+
+// TestEveryDeclarationRefusingANilArgumentAnswersItsOwnSentinel sweeps the derived class.
+//
+// Three things per member, and they are different claims. The call must not PANIC, which is the
+// whole difference between a refusal and taking the caller's process. It must answer the sentinel
+// its own source names, and not merely some error: a length refusal reached because a nil
+// argument's width came back zero satisfies err != nil while having dereferenced the argument on
+// the way. And the sentinel the row asserts must be the one the class read off the declaration,
+// held by the message the source declares it with, so a row cannot cover one refusal while naming
+// another.
+func TestEveryDeclarationRefusingANilArgumentAnswersItsOwnSentinel(t *testing.T) {
+	declared := nilArgumentRefusalsDeclared(t)
+	texts := nilArgumentSentinelTexts(t)
+	rows := nilArgumentRows(t)
+	joined := 0
+	keys := []string{}
+	for _, refusal := range declared {
+		keys = append(keys, refusal.key())
+		row, written := rows[refusal.key()]
+		if !written {
+			t.Errorf("%s refuses a nil %s with %s and has no row, so nothing here runs it",
+				refusal.declaration, refusal.parameter, refusal.sentinel)
+			continue
+		}
+		if row.sentinel == nil {
+			t.Errorf("the row for %s holds no sentinel", refusal.key())
+			continue
+		}
+		// the row's value against the name the source answers, wherever the sentinel is
+		// declared in the form that can be read
+		if text, readable := texts[refusal.sentinel]; readable {
+			joined++
+			if row.sentinel.Error() != text {
+				t.Errorf("%s answers %s, which reads %q, and its row holds %q",
+					refusal.key(), refusal.sentinel, text, row.sentinel.Error())
+			}
+		} else {
+			t.Logf("%s answers %s, which is not declared as errors.New of a literal, so this row's value is joined to that name by nothing",
+				refusal.key(), refusal.sentinel)
+		}
+		answered := nilArgumentRefusalOf(t, refusal.key(), row)
+		if !errors.Is(answered, row.sentinel) {
+			t.Errorf("%s handed a nil %s answered %v, want %v",
+				refusal.declaration, refusal.parameter, answered, row.sentinel)
+		}
+	}
+	if joined == 0 {
+		t.Error("no row was joined to the sentinel its declaration names, so the value half of this gate is held by nothing")
+	}
+	for key := range rows {
+		if !slices.Contains(keys, key) {
+			t.Errorf("nilArgumentRows names %s, and no declaration of this package refuses a nil argument under that name",
+				key)
+		}
+	}
+}
+
+// nilArgumentDerivationControl is a body carrying every shape the reader must see and every shape
+// it must not.
+//
+// The control is what says the class above is derived rather than merely non empty. A reader that
+// had lost the wrapped form reports four of these five, a reader that had lost the compound form
+// reports four, and a reader that had stopped filtering on the parameter list reports the receiver
+// field and the local as well -- and all four of those readers report a clean run against the real
+// package, because the real package's rows would still have their tables.
+const nilArgumentDerivationControl = `package control
+
+import "fmt"
+
+var errPlain = fmt.Errorf("plain")
+var errWrapped = fmt.Errorf("wrapped")
+var errCompound = fmt.Errorf("compound")
+var ErrNilCryptoProvider = fmt.Errorf("the provider")
+
+type holder struct{ field *int }
+
+func Plain(argument *int) error {
+	if argument == nil {
+		return errPlain
+	}
+	return nil
+}
+
+func Wrapped(argument *int) error {
+	if argument == nil {
+		return fmt.Errorf("%w: with a reason", errWrapped)
+	}
+	return nil
+}
+
+func Compound(first *int, second *int) error {
+	if first == nil || second == nil {
+		return errCompound
+	}
+	return nil
+}
+
+func Provider(crypto *int) error {
+	if crypto == nil {
+		return ErrNilCryptoProvider
+	}
+	return nil
+}
+
+func (self *holder) Method(argument *int) error {
+	if self.field == nil {
+		return errPlain
+	}
+	local := argument
+	if local == nil {
+		return errPlain
+	}
+	if argument == nil {
+		return errWrapped
+	}
+	return nil
+}
+`
+
+// TestTheNilArgumentDerivationReadsEveryShapeThisPackageWrites runs the reader over that control.
+func TestTheNilArgumentDerivationReadsEveryShapeThisPackageWrites(t *testing.T) {
+	parsed := mustParseText(t, "control.go", nilArgumentDerivationControl)
+	declared := packageLevelVarNamesIn(parsed)
+	slices.Sort(declared)
+	if want := []string{"ErrNilCryptoProvider", "errCompound", "errPlain", "errWrapped"}; !slices.Equal(declared, want) {
+		t.Fatalf("the control declares %v and the reader found %v", want, declared)
+	}
+	found := []string{}
+	for _, refusal := range nilArgumentRefusalsIn(parsed, declared) {
+		found = append(found, refusal.key()+" -> "+refusal.sentinel)
+	}
+	slices.Sort(found)
+	want := []string{
+		"(*holder).Method(argument) -> errWrapped",
+		"Compound(first) -> errCompound",
+		"Compound(second) -> errCompound",
+		"Plain(argument) -> errPlain",
+		"Wrapped(argument) -> errWrapped",
+	}
+	if !slices.Equal(found, want) {
+		t.Errorf("the reader found\n %v\nand the control declares\n %v", found, want)
+	}
+}

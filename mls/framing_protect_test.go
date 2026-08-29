@@ -158,6 +158,37 @@ func providerAuthenticatedContentPerturbations(t *testing.T, operation string, p
 // the preimage
 // ---------------------------------------------------------------------------
 
+// emptyByteSpelling is one way a caller can hand this package a byte slice of length zero.
+type emptyByteSpelling struct {
+	what  string
+	value []byte
+}
+
+// emptyByteSpellings is EVERY such way, which is three and not the one a guard's author
+// pictures.
+//
+// A rule about an absent value has to be written on the LENGTH, and these three separate it
+// from the two things it can be written on by mistake. nil is the zero value a fresh struct
+// field carries; the empty literal is non nil with no capacity, which is what syntax.Marshal
+// of nothing and a caller's []byte{} both answer; and a slice re-sliced to nothing out of a
+// longer buffer is non nil WITH capacity, which is what a decoder hands back after reading an
+// empty opaque<V>. A guard spelled == nil accepts the last two and one spelled on cap accepts
+// the first two; only one spelled on len refuses all three.
+//
+// Measured rather than supposed. With the preimage's binding guard rewritten from
+// len(self.GroupContext) == 0 to self.GroupContext == nil -- which signs an epoch UNBOUND
+// preimage for a member handed an empty non nil context, the signature valid in every epoch
+// of the group that senderBindsGroupContext names as the most expensive omission available
+// here -- and with ValSem009's tag guard rewritten the same way, this package's whole suite
+// passed both times.
+func emptyByteSpellings() []emptyByteSpelling {
+	return []emptyByteSpelling{
+		{what: "nil", value: nil},
+		{what: "the empty literal", value: []byte{}},
+		{what: "re-sliced to nothing out of a longer buffer", value: make([]byte, 0, 8)},
+	}
+}
+
 // framingTestGroupContext is a real serialized GroupContext, built the way every caller must
 // build one: syntax.Marshal over the key schedule's structure. The preimage inlines these bytes
 // verbatim, with no length prefix.
@@ -290,10 +321,15 @@ func TestFramedContentTBSOmitsGroupContextForExternalSender(t *testing.T) {
 	}
 }
 
+// Over every spelling of an absent group context rather than the nil one alone, which is what
+// this test's name claims and what a guard written on the pointer does not hold: a member
+// handed an empty non nil context would sign a preimage carrying no epoch at all.
 func TestFramedContentTBSRequiresGroupContextForMember(t *testing.T) {
-	_, err := FramedContentTBSBytes(WireFormatPrivateMessage, framingTestMemberContent(), nil)
-	if !errors.Is(err, ErrMissingGroupContext) {
-		t.Fatalf("got %v, want ErrMissingGroupContext", err)
+	for _, empty := range emptyByteSpellings() {
+		_, err := FramedContentTBSBytes(WireFormatPrivateMessage, framingTestMemberContent(), empty.value)
+		if !errors.Is(err, ErrMissingGroupContext) {
+			t.Fatalf("a group context that is %s: got %v, want ErrMissingGroupContext", empty.what, err)
+		}
 	}
 }
 
@@ -337,14 +373,27 @@ func TestEverySenderTypeBindsTheGroupContextSection61GivesIt(t *testing.T) {
 		content := framingTestProposalContent()
 		content.Sender = Sender{SenderType: senderType}
 		_, withContext := FramedContentTBSBytes(WireFormatPublicMessage, content, framingTestGroupContext(t))
-		_, withoutContext := FramedContentTBSBytes(WireFormatPublicMessage, content, nil)
-		if binds && (withContext != nil || !errors.Is(withoutContext, ErrMissingGroupContext)) {
-			t.Errorf("%s binds the group context and the preimage answered %v with one and %v without",
-				name, withContext, withoutContext)
+		if binds && withContext != nil {
+			t.Errorf("%s binds the group context and the preimage refused one: %v", name, withContext)
 		}
-		if !binds && (withoutContext != nil || !errors.Is(withContext, ErrUnexpectedGroupContext)) {
-			t.Errorf("%s binds no group context and the preimage answered %v with one and %v without",
-				name, withContext, withoutContext)
+		if !binds && !errors.Is(withContext, ErrUnexpectedGroupContext) {
+			t.Errorf("%s binds no group context and the preimage answered %v to one", name, withContext)
+		}
+		// the absent direction over EVERY spelling of absent rather than over nil alone.
+		// The two arms do not cost the same thing when a guard is spelled on the pointer:
+		// a sender that binds the context and was handed an empty non nil one would sign a
+		// preimage with no epoch in it, which is a signature valid in every epoch this
+		// group ever has.
+		for _, empty := range emptyByteSpellings() {
+			_, withoutContext := FramedContentTBSBytes(WireFormatPublicMessage, content, empty.value)
+			if binds && !errors.Is(withoutContext, ErrMissingGroupContext) {
+				t.Errorf("%s binds the group context and the preimage answered %v to one that is %s",
+					name, withoutContext, empty.what)
+			}
+			if !binds && withoutContext != nil {
+				t.Errorf("%s binds no group context and the preimage refused one that is %s: %v",
+					name, empty.what, withoutContext)
+			}
 		}
 	}
 	if !maps.Equal(measured, rfc9420SendersThatBindTheGroupContext) {
@@ -669,26 +718,92 @@ var framingFieldMoves = map[string]func(t *testing.T) (framingPreimageInput, fra
 		return framingPreimageInput{WireFormatPublicMessage, framingTestCommitContent(), framingTestGroupContext(t)},
 			framingPreimageInput{WireFormatPublicMessage, moved, framingTestGroupContext(t)}
 	},
+	// the sender's own three fields. FramedContent.Sender above moves the whole value and
+	// moves the leaf index inside it, which is one field of three: these three are what the
+	// walk reaches now that it descends into a structure held by value, and each of them
+	// decides WHO a message is attributed to.
+	//
+	// The sender type is moved between the two arms that bind the group context, so the row
+	// separates the discriminant rather than the binding rule -- which is
+	// TestEverySenderTypeBindsTheGroupContextSection61GivesIt's subject and not this sweep's.
+	// A preimage that dropped it is a member's commit accepted as an external joiner's.
+	"Sender.SenderType": func(t *testing.T) (framingPreimageInput, framingPreimageInput) {
+		joining := framingTestCommitContent()
+		joining.Sender = Sender{SenderType: SenderTypeNewMemberCommit}
+		return framingPreimageInput{WireFormatPublicMessage, framingTestCommitContent(), framingTestGroupContext(t)},
+			framingPreimageInput{WireFormatPublicMessage, joining, framingTestGroupContext(t)}
+	},
+	"Sender.LeafIndex": func(t *testing.T) (framingPreimageInput, framingPreimageInput) {
+		moved := framingTestMemberContent()
+		moved.Sender = Sender{SenderType: SenderTypeMember, LeafIndex: 5}
+		return framingPreimageInput{WireFormatPrivateMessage, framingTestMemberContent(), framingTestGroupContext(t)},
+			framingPreimageInput{WireFormatPrivateMessage, moved, framingTestGroupContext(t)}
+	},
+	// the external sender's index, which is the arm of Sender the leaf index is not. It binds
+	// no group context, so both inputs of this row carry none -- and a preimage that dropped
+	// it is one external sender's proposal accepted as any other's.
+	"Sender.SenderIndex": func(t *testing.T) (framingPreimageInput, framingPreimageInput) {
+		base := framingTestProposalContent()
+		base.Sender = Sender{SenderType: SenderTypeExternal, SenderIndex: 0}
+		moved := framingTestProposalContent()
+		moved.Sender = Sender{SenderType: SenderTypeExternal, SenderIndex: 5}
+		return framingPreimageInput{WireFormatPublicMessage, base, nil},
+			framingPreimageInput{WireFormatPublicMessage, moved, nil}
+	},
 }
 
-// framingPreimageFieldNames is every field of the two structures the preimage is assembled
-// from, read off the types rather than written down.
+// framingPreimageStructTypes is every structure the preimage is assembled from, WALKED out of
+// framedContentTBS rather than listed beside it.
+//
+// The walk descends through a field held by VALUE and stops at a pointer, and that rule is the
+// whole of the class. A structure held by value is present in every preimage this type can
+// produce, so its fields are as much of what gets signed as its parent's are; a pointer to one
+// is an ARM the content type selects, is absent from most preimages, and is moved as a whole
+// by the row that names it -- FramedContent.Proposal and FramedContent.Commit are exactly
+// those two.
+//
+// Listed, this was framedContentTBS and FramedContent and stopped there, which is one level
+// shallower than this sweep's own prose ("every field of the preimage"). Sender's three fields
+// sat under a single FramedContent.Sender row that moves the leaf index alone, so a field
+// added to Sender entered no sweep and failed nothing.
+func framingPreimageStructTypes(t *testing.T) []reflect.Type {
+	t.Helper()
+	found := []reflect.Type{}
+	queue := []reflect.Type{reflect.TypeOf(framedContentTBS{})}
+	for len(queue) != 0 {
+		declared := queue[0]
+		queue = queue[1:]
+		if slices.Contains(found, declared) {
+			continue
+		}
+		if declared.Name() == "" {
+			t.Fatal("the walk reached an unnamed struct type, which no row of this sweep can be keyed by")
+		}
+		if declared.NumField() == 0 {
+			t.Fatalf("%s declares no fields, so the sweep below runs over less than the preimage",
+				declared.Name())
+		}
+		found = append(found, declared)
+		for i := range declared.NumField() {
+			if field := declared.Field(i).Type; field.Kind() == reflect.Struct {
+				queue = append(queue, field)
+			}
+		}
+	}
+	if len(found) < 2 {
+		t.Fatalf("the walk reached %d structure, so it descended into nothing and this sweep is one type wide", len(found))
+	}
+	return found
+}
+
+// framingPreimageFieldNames is every field of every one of those structures, read off the types
+// rather than written down.
 func framingPreimageFieldNames(t *testing.T) []string {
 	t.Helper()
 	names := []string{}
-	for _, one := range []struct {
-		typeName string
-		value    any
-	}{
-		{typeName: "framedContentTBS", value: framedContentTBS{}},
-		{typeName: "FramedContent", value: FramedContent{}},
-	} {
-		declared := reflect.TypeOf(one.value)
-		if declared.NumField() == 0 {
-			t.Fatalf("%s declares no fields, so the sweep below runs over less than the preimage", one.typeName)
-		}
+	for _, declared := range framingPreimageStructTypes(t) {
 		for i := range declared.NumField() {
-			names = append(names, one.typeName+"."+declared.Field(i).Name)
+			names = append(names, declared.Name()+"."+declared.Field(i).Name)
 		}
 	}
 	slices.Sort(names)
@@ -830,8 +945,15 @@ func TestVerifyRefusesACommitWithNoConfirmationTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign a commit: %v", err)
 	}
-	if err := VerifyAuthenticatedContent(crypto, pub, signed, groupContext); !errors.Is(err, errMissingConfirmationTag) {
-		t.Fatalf("a commit carrying no confirmation tag: got %v, want the ValSem009 sentinel", err)
+	// every spelling of an absent tag and not the nil one a fresh signature happens to
+	// carry. ValSem009 written on the pointer accepts a commit whose tag is an empty non
+	// nil slice, which is a commit binding itself to no transcript at all.
+	for _, empty := range emptyByteSpellings() {
+		untagged := *signed
+		untagged.Auth.ConfirmationTag = empty.value
+		if err := VerifyAuthenticatedContent(crypto, pub, &untagged, groupContext); !errors.Is(err, errMissingConfirmationTag) {
+			t.Fatalf("a commit whose confirmation tag is %s: got %v, want the ValSem009 sentinel", empty.what, err)
+		}
 	}
 	tagged := *signed
 	tagged.Auth.ConfirmationTag = bytes.Repeat([]byte{0x5a}, crypto.HashSize())
@@ -1097,5 +1219,161 @@ func TestTheFramingRefusalsAnswerTheirOwnSentinels(t *testing.T) {
 	// wants that keeps being answered by it.
 	if !errors.Is(errFramedContentBadSignature, errBadSignature) {
 		t.Error("the framing signature refusal does not answer the package's ValSem010 stand in, so a caller matching that name stops matching this layer")
+	}
+}
+
+// framingUnregisteredCodePoint is the smallest code point of a registry's width that the
+// registry does not hold.
+//
+// Derived rather than written down, so a later task that registers 0x0006 as a wire format does
+// not leave a row below building "the unknown one" over a code point that has since become
+// known. That row would go on passing while asserting the opposite of what it says.
+func framingUnregisteredCodePoint(t *testing.T, typeName string, width uint64) uint64 {
+	t.Helper()
+	registered := registryConstantsOfType(t, typeName)
+	for candidate := uint64(1); candidate <= width; candidate++ {
+		taken := false
+		for _, value := range registered {
+			if value == candidate {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			return candidate
+		}
+	}
+	t.Fatalf("every code point of %s up to %d is registered, so this gate has no unknown one to build",
+		typeName, width)
+	return 0
+}
+
+// TestVerifyAnswersThePreimagesRefusalVerbatimAndCollapsesEverySignatureFailure states which of
+// the two rules each refusal of VerifyAuthenticatedContent falls under.
+//
+// The function's documentation used to say every failure collapses into
+// errFramedContentBadSignature, and four sentinels travel out of it unchanged -- three of them
+// reachable from a message a PEER sent, because the arm they select on is the sender type
+// inside that message. Nothing observed the claim in either direction, so the prose and the
+// code disagreed silently, and a later ValSem code mapper keyed on the sentinel would have had
+// no code for those inputs.
+//
+// Both halves are derived. The structural half runs the group context arm each REGISTERED
+// sender type forbids, plus a code point neither registry holds, and asserts the verifier hands
+// back the preimage builder's own error -- compared by message, so a row cannot pass by
+// answering some other value that happens to wrap the same sentinel. The signature half runs
+// every way this package can produce a signature that does not verify and asserts each answers
+// the ONE value by identity rather than by errors.Is, which is what "and nothing narrower"
+// means.
+func TestVerifyAnswersThePreimagesRefusalVerbatimAndCollapsesEverySignatureFailure(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	signature := signed.authContent.Auth.Signature
+	if len(signature) == 0 {
+		t.Fatal("the fixture carries no signature, so every row below is refused before it is reached")
+	}
+
+	// the structural half: inputs no preimage can be assembled from at all
+	structural := map[string]framingPreimageInput{}
+	for name, code := range registryConstantsOfType(t, "SenderType") {
+		senderType := SenderType(code)
+		binds, err := senderBindsGroupContext(senderType)
+		if err != nil {
+			t.Errorf("%s is a registered sender type and senderBindsGroupContext refused it: %v", name, err)
+			continue
+		}
+		content := framingTestProposalContent()
+		content.Sender = Sender{SenderType: senderType}
+		// the arm this sender type forbids: one that binds the epoch handed no context, one
+		// that binds none handed a context
+		forbidden := framingTestGroupContext(t)
+		if binds {
+			forbidden = nil
+		}
+		structural[name+" handed the group context arm it forbids"] =
+			framingPreimageInput{WireFormatPublicMessage, content, forbidden}
+	}
+	if len(structural) == 0 {
+		t.Fatal("no registered sender type produced a row, so this half of the gate runs over the empty set")
+	}
+	unknownSender := framingTestProposalContent()
+	unknownSender.Sender = Sender{SenderType: SenderType(framingUnregisteredCodePoint(t, "SenderType", 0xff))}
+	structural["a sender type no registry holds"] =
+		framingPreimageInput{WireFormatPublicMessage, unknownSender, framingTestGroupContext(t)}
+	structural["a wire format no registry holds"] = framingPreimageInput{
+		WireFormat(framingUnregisteredCodePoint(t, "WireFormat", 0xffff)),
+		framingTestMemberContent(), framingTestGroupContext(t)}
+
+	for _, name := range slices.Sorted(maps.Keys(structural)) {
+		one := structural[name]
+		_, preimage := FramedContentTBSBytes(one.wireFormat, one.content, one.groupContext)
+		if preimage == nil {
+			t.Errorf("%s: the preimage was assembled, so this row states nothing about a refusal", name)
+			continue
+		}
+		answered := VerifyAuthenticatedContent(signed.crypto, signed.pub, &AuthenticatedContent{
+			WireFormat: one.wireFormat,
+			Content:    *one.content,
+			Auth:       FramedContentAuthData{Signature: signature},
+		}, one.groupContext)
+		if answered == nil || answered.Error() != preimage.Error() {
+			t.Errorf("%s: the preimage refused with %v and the verifier answered %v; a structural refusal travels out of the verifier unchanged",
+				name, preimage, answered)
+		}
+		if errors.Is(answered, errBadSignature) {
+			t.Errorf("%s: a message no preimage could be built for was answered as a signature that does not verify (%v), which sends the caller to check a signature nothing checked",
+				name, answered)
+		}
+	}
+
+	// the signature half: every way this package can produce one that does not verify
+	type framingForgery struct {
+		what        string
+		authContent *AuthenticatedContent
+		against     []byte
+	}
+	forged := []framingForgery{}
+	flipped := *signed.authContent
+	flipped.Auth.Signature = bytes.Clone(signature)
+	flipped.Auth.Signature[0] ^= 0x01
+	forged = append(forged, framingForgery{"a signature with one bit flipped", &flipped, signed.groupContext})
+	truncated := *signed.authContent
+	truncated.Auth.Signature = bytes.Clone(signature)[:len(signature)-1]
+	forged = append(forged, framingForgery{"a signature one octet short", &truncated, signed.groupContext})
+	for _, empty := range emptyByteSpellings() {
+		zero := *signed.authContent
+		zero.Auth.Signature = empty.value
+		forged = append(forged, framingForgery{"a signature that is " + empty.what, &zero, signed.groupContext})
+	}
+	// a signature over another epoch's preimage, which is the replay the group context is in
+	// the preimage to stop, and a signature by a key that is not this one. Both are real
+	// signatures: what fails is the preimage they cover and the key that made them.
+	otherEpoch := bytes.Clone(signed.groupContext)
+	otherEpoch[len(otherEpoch)-1] ^= 0xff
+	elsewhere, err := SignAuthenticatedContent(signed.crypto, signed.priv, WireFormatPrivateMessage,
+		framingTestMemberContent(), otherEpoch)
+	if err != nil {
+		t.Fatalf("sign under another epoch: %v", err)
+	}
+	forged = append(forged, framingForgery{"a signature over another epoch's preimage", elsewhere, signed.groupContext})
+	strangerPriv, _, err := signed.crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("a second key pair: %v", err)
+	}
+	stranger, err := SignAuthenticatedContent(signed.crypto, strangerPriv, WireFormatPrivateMessage,
+		framingTestMemberContent(), signed.groupContext)
+	if err != nil {
+		t.Fatalf("sign under another key: %v", err)
+	}
+	forged = append(forged, framingForgery{"a signature by a key that is not this one", stranger, signed.groupContext})
+
+	for _, one := range forged {
+		answered := VerifyAuthenticatedContent(signed.crypto, signed.pub, one.authContent, one.against)
+		if answered != errFramedContentBadSignature {
+			t.Errorf("%s: the verifier answered %v, want errFramedContentBadSignature itself; a caller that can tell these apart learns which of its guesses was closest",
+				one.what, answered)
+		}
+	}
+	if len(forged) < 5 {
+		t.Fatalf("%d ways of failing the signature were run, and the empty spellings alone are three", len(forged))
 	}
 }

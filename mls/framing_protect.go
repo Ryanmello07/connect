@@ -109,8 +109,23 @@ func SignAuthenticatedContent(crypto CryptoProvider, priv SignaturePrivateKey,
 // says is that the refusal does not depend on the provider agreeing: a provider whose
 // VerifyWithLabel accepted an empty signature would still not get one past here.
 //
-// Every failure answers errFramedContentBadSignature and nothing narrower, for the reason
-// that value's own comment gives.
+// Every failure OF THE SIGNATURE answers errFramedContentBadSignature and nothing narrower,
+// for the reason that value's own comment gives.
+//
+// A refusal of the PREIMAGE travels out of here verbatim, and that is the deliberate other
+// half of the rule rather than a leak in it. FramedContentTBSBytes answers
+// ErrUnknownWireFormat, ErrUnknownSenderType, ErrMissingGroupContext or
+// ErrUnexpectedGroupContext for a message this function could not assemble a preimage out of
+// at all: there is no verification to have failed, so there is no verification answer to
+// collapse them into, and errFramedContentBadSignature would tell a caller that a signature
+// nothing ever checked did not verify. None of the four separates a right key from a wrong
+// one -- three of them are the sender type's own select on the group context the RECEIVER
+// supplied -- so the thing an unauthenticated message must not learn is not in any of them.
+// What it must not learn is which of ValSem010 and ValSem009 it failed, and that is the
+// ordering below.
+//
+// TestVerifyAnswersThePreimagesRefusalVerbatimAndCollapsesEverySignatureFailure holds both
+// halves, over the two registries rather than over three inputs somebody picked.
 func VerifyAuthenticatedContent(crypto CryptoProvider, pub SignaturePublicKey,
 	authContent *AuthenticatedContent, groupContext []byte) error {
 

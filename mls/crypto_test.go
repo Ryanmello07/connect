@@ -4330,22 +4330,55 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 // rather than adding a name is what keeps the two rosters from drifting: a method that stops
 // being passed through starts being held here on the commit that tags it.
 func providerReachedOnlyUnflippableAnswers(perturbed reflect.Value) bool {
+	return len(providerUnflippableAnswersReached(perturbed)) != 0
+}
+
+// The same reading, answering WHICH methods excused the construction rather than only that some
+// did, so the gate can report the exemption it granted instead of applying it silently.
+//
+// One roster and not two: the bool above is this function, so a method that stops being
+// unflippable stops excusing and stops being reportable in the same edit. The answer is the
+// distinct calls in log order, sorted, and it is empty for a construction that reached a method
+// the wrapper CAN move and for one that reached the provider not at all -- the second being the
+// case the routing report exists for.
+func providerUnflippableAnswersReached(perturbed reflect.Value) []string {
 	if !perturbed.IsValid() || !perturbed.CanInterface() {
-		return false
+		return nil
 	}
 	tagging, isTagging := perturbed.Interface().(*taggingCryptoProvider)
 	if !isTagging || len(tagging.calls) == 0 {
-		return false
+		return nil
 	}
+	excusing := []string{}
 	for _, call := range tagging.calls {
-		if _, unflippable := taggingProviderPassesThrough[call]; unflippable {
-			continue
+		_, unflippable := taggingProviderPassesThrough[call]
+		if !unflippable && !slices.Contains(providerValueMethods, call) {
+			return nil
 		}
-		if !slices.Contains(providerValueMethods, call) {
-			return false
+		if !slices.Contains(excusing, call) {
+			excusing = append(excusing, call)
 		}
 	}
-	return true
+	slices.Sort(excusing)
+	return excusing
+}
+
+// The constructions this gate excuses from the routing claim, each named with the answer the
+// tagging wrapper cannot move for it.
+//
+// The table does not DECIDE the exemption -- providerUnflippableAnswersReached decides it off
+// the two rosters, which is what keeps those rosters and this reading from drifting. What the
+// table does is make each exemption visible: the set actually excused is compared against these
+// keys in both directions at the end of every suite, so a construction that starts being
+// excused, or stops being, fails here rather than passing quietly.
+//
+// That is worth having most for the half of the union that is not a size. VerifyWithLabel and
+// MacVerify answer an error and a bool, so a later construction whose entire use of the provider
+// is a MAC comparison would be excused from the routing claim by a union nobody edited and by a
+// gate that reported a clean run. It lands here instead, as a row nothing declares.
+var providerExcusedFromTheRoutingClaim = map[string]string{
+	"NewSecretTree reaches the provider only through HashSize": "validates encryption_secret against KDF.Nh and stores it, and the first value derived THROUGH the provider exists only once a leaf has been taken",
+	"VerifyAuthenticatedContent reaches the provider only through VerifyWithLabel": "answers an error, and a wrapper that flips bytes has nothing to change in a refusal; TestProviderHasNoRemainingStubs still holds it by input perturbation, and a verify made to accept unconditionally fails that half",
 }
 
 // One call, with a panic caught rather than taken. A method that still refuses to be
@@ -4767,6 +4800,7 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 		probed := []string{}
 		drawing := []string{}
 		unobserved := []string{}
+		excused := []string{}
 		for _, operation := range providerOperations(t) {
 			where := fmt.Sprintf("suite %#04x %s", uint16(suite), operation.name)
 			subject := newProvider(0x80)
@@ -4899,9 +4933,15 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 						// observed stays where it is, which is what routes the operation to
 						// the registry comparison below, and that comparison is the stricter
 						// of the two readings.
-						if !answersARegistryValue && !providerReachedOnlyUnflippableAnswers(perturbations[at].value) {
-							t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
-								where, parameter.name, perturbations[at].where, parameter.name)
+						if !answersARegistryValue {
+							excusing := providerUnflippableAnswersReached(perturbations[at].value)
+							if len(excusing) == 0 {
+								t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
+									where, parameter.name, perturbations[at].where, parameter.name)
+							} else if report := fmt.Sprintf("%s reaches the provider only through %s",
+								operation.name, strings.Join(excusing, " and ")); !slices.Contains(excused, report) {
+								excused = append(excused, report)
+							}
 						}
 						continue
 					}
@@ -4945,6 +4985,16 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 			}
 		}
 		assertCoversEveryProviderOperation(t, "TestProviderHasNoRemainingStubs", probed)
+		slices.Sort(excused)
+		declaredExcuses := []string{}
+		for report := range providerExcusedFromTheRoutingClaim {
+			declaredExcuses = append(declaredExcuses, report)
+		}
+		slices.Sort(declaredExcuses)
+		if !slices.Equal(excused, declaredExcuses) {
+			t.Errorf("suite %#04x excused %v from the routing claim and this file declares %v; an exemption granted by the unflippable union is one nobody has to edit a list to get",
+				uint16(suite), excused, declaredExcuses)
+		}
 		slices.Sort(drawing)
 		if !slices.Equal(drawing, providerStreamDependentOperations) {
 			t.Errorf("suite %#04x draws randomness in %v, want %v", uint16(suite), drawing, providerStreamDependentOperations)
