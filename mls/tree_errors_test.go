@@ -342,13 +342,16 @@ var cryptoOwnedErrors = map[string]error{
 // file to list it. A fourteenth error of this plan declared in a new file is then a failure
 // naming the file, rather than a name every sweep in this package runs past.
 //
-// Four entries and not three. crypto_errors.go joined when a review declared a fourteenth p5
-// error in a file of its own and watched the entire package stay green.
+// Five entries and not three. crypto_errors.go joined when a review declared a fourteenth p5
+// error in a file of its own and watched the entire package stay green, and framing_errors.go
+// joined the same way -- p6 task 1 landed ten structural framing errors in a file of its own,
+// and this gate is what said so in the same run rather than a plan later.
 var mlsErrorClasses = map[string]map[string]error{
 	treeErrorsFile:        treeOwnedErrors,
 	treeMathErrorsFile:    treeMathOwnedErrors,
 	keyScheduleErrorsFile: keyScheduleOwnedErrors,
 	cryptoErrorsFile:      cryptoOwnedErrors,
+	framingErrorsFile:     framingOwnedErrors,
 }
 
 // TestCryptoOwnedErrorsIsEveryErrorItsFileDeclares is the same derivation the other three

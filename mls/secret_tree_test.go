@@ -4450,7 +4450,7 @@ var stRatchetTypeOfContentType = map[ContentType]RatchetType{
 // 0 collides with this file rather than quietly re-routing every application message.
 //
 // The set is DERIVED off the type through the package's own type checker rather than listed,
-// so a fourth code point added to content_type.go and left out of stRatchetTypeOfContentType
+// so a fourth code point added to framing.go and left out of stRatchetTypeOfContentType
 // is reported here instead of being skipped by every sweep below.
 func TestContentTypeCarriesTheWireValuesTheRegistryGivesIt(t *testing.T) {
 	if got := stContentTypeCodePoints(); got != 256 {
@@ -4650,7 +4650,7 @@ func TestNextMessageKeyAndMessageKeyAgreeOnTheGenerationTheSenderSent(t *testing
 //
 // The class is derived twice over and the two derivations are compared: the code points come
 // from the width of the type, and which of them is legal comes from the constants the package
-// declares. A fourth content type wired into ratchetTypeOf and left out of content_type.go is
+// declares. A fourth content type wired into ratchetTypeOf and left out of framing.go is
 // reported here, and so is a content type declared and not wired in -- the plan's version,
 // which probed 0 and 9, would report neither.
 //

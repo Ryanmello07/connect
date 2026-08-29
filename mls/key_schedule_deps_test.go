@@ -13,9 +13,10 @@
 // Framing's ContentType is the second exception and is pinned below for a different reason
 // from p8's: it did not land from p6 at all, it landed HERE, because this plan's secret tree
 // implements the MessageKeySource interface p6 declares and that interface is keyed on it.
-// content_type.go is the declaration and p6's own landing deletes that file rather than
-// adding a second one beside it. The pin is owed either way: the rule this file runs on is
-// that a name package mls declares is a name this file pins, whichever plan wrote it.
+// content_type.go was the declaration, on the standing agreement that p6's own landing would
+// delete that file rather than add a second one beside it. p6 task 1 has landed and did that:
+// the declaration is framing.go's now. The pin is owed either way, because the rule this file
+// runs on is that a name package mls declares is a name this file pins, whichever plan wrote it.
 //
 // p8's vector harness is the other exception and is pinned below. It landed in vectors_test.go
 // rather than in a production file, which is where the detector that should have noticed
@@ -179,10 +180,10 @@ var (
 // p6 framing, task 1 — ContentType and the three code points it registers. This is the one
 // name of p6 the secret tree reaches, because the MessageKeySource interface p6 declares is
 // keyed on it, and it is the second cross plan surface to land in package mls ahead of its
-// owner. The terms are p8's vector harness's: content_type.go declares it at the signature
-// the interface registry gives it, p6's own landing deletes that file rather than adding a
-// second declaration beside it, and until then this block is what makes a p6 that arrives
-// with a different shape a build failure here.
+// owner. The terms were p8's vector harness's: content_type.go declared it at the signature
+// the interface registry gives it, and p6's own landing was to delete that file rather than add
+// a second declaration beside it. p6 task 1 has landed and framing.go carries the declaration,
+// so this block is now what makes a p6 edit that changes its shape a build failure here.
 //
 // The width takes two lines, and the 0xff conversion is only one of them. That conversion says
 // that 255 FITS, which rules out a signed octet and nothing else: ContentType(0xff) compiles
@@ -531,8 +532,8 @@ func readVectorManifest(t *testing.T) map[string]string {
 // declares and that interface names them. "Not landed" was never a reason to leave the
 // wrapper unwritten and it was never a licence to spell a private copy either — a second
 // declaration of one wire enum disagrees by a NUMBER rather than by a type error, which is
-// the one kind of drift nothing in this file could see. One declaration, pinned above,
-// deleted by p6 when it arrives.
+// the one kind of drift nothing in this file could see. One declaration, pinned above, and
+// p6 task 1 has now moved it into framing.go and deleted content_type.go, exactly as agreed.
 var crossPlanSymbolsNotYetLanded = map[string]string{
 	"ValSemCode":        "p8 validation and interop",
 	"ValSem":            "p8 validation and interop",
@@ -736,6 +737,11 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
+	// the three framing registry widths, p6 task 1. Each is a conversion of ^T(0) to the
+	// octet or the pair of octets RFC 9420 gives that registry, which is the only form that
+	// can say a type is no WIDER than its wire field; a literal conversion the other way
+	// says only that the value fits and compiles unchanged at every wider type.
+	"framing_test.go":           3,
 	"key_schedule_deps_test.go": 77,
 	"pins_test.go":              8,
 	// keyRecordingCryptoProvider, the wrapper the update path erasure gate reads private
