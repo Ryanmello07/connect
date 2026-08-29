@@ -3212,41 +3212,143 @@ func framingDecodersThatPublishWhole(t *testing.T) []string {
 	return found
 }
 
-// framingWholeReceiverProbe hands one of those decoders input it must refuse, over a receiver
-// that already holds a value, and answers what that receiver held before and what it holds
-// after.
+// framingReceiverProbe is one decoder of the class: what a caller's receiver already holds, a
+// complete encoding that decoder accepts, the decode itself, and the refusals it has that are
+// not a matter of running out of input.
+//
+// The refusal POSITIONS are deliberately not listed. The gate below truncates the complete
+// encoding at EVERY length short of the whole, which refuses once at every field boundary the
+// decoder has and several times inside each -- so a receiver stamped anywhere along the decode
+// is seen, wherever along it that is. A hand written list of refusal points is not the same
+// claim and this project has the measurement: the first version of this gate handed each
+// decoder one refused input, taken from inside the FramedContent, and reported green against
+// `*self = decoded` inserted one field LATER, ahead of the auth data read. Every stamp that
+// gate could see was a stamp somebody had already thought to look for.
 //
 // The prior contents matter as much as the refusal. A receiver left holding its own zero value
-// is not "untouched" -- it is a decoder that wiped a caller's value on the way to refusing --
-// and a probe starting from the zero value could not tell the two apart.
-type framingWholeReceiverProbe func(t *testing.T) (before any, after any, err error)
+// is not untouched -- it is a decoder that wiped a caller's value on the way to refusing -- and
+// a probe starting from the zero value cannot tell the two apart. The gate checks that the
+// complete encoding decodes to something DIFFERENT from what the receiver held, so "stamped" and
+// "left alone" are distinguishable states before any refusal is tried.
+type framingReceiverProbe struct {
+	prior  func() any
+	valid  func(t *testing.T) []byte
+	decode func(into any, bs []byte) error
+	// other is every refusal this decoder has that a truncation cannot produce: an unregistered
+	// code point, or a discriminant handed in rather than read. Each is a whole decode rather
+	// than an input, because two of these decoders take their discriminant as a PARAMETER and a
+	// refusal of it is not expressible as bytes.
+	other func(t *testing.T) []func(into any) error
+}
 
-var framingWholeReceiverProbes = map[string]framingWholeReceiverProbe{
-	"Sender.UnmarshalMLS": func(t *testing.T) (any, any, error) {
-		refused := []byte{byte(undeclaredCodePointsOf(t, "SenderType")[0]), 0x00, 0x00, 0x00, 0x00}
-		before, after := testSenderOfType(SenderTypeMember), testSenderOfType(SenderTypeMember)
-		err := after.UnmarshalMLS(syntax.NewReader(refused))
-		return *before, *after, err
+// framingProbeCommit is a second authenticated commit, differing from testAuthenticatedCommit in
+// every field a stamp could copy across. It is what the two wide probes below decode, so that a
+// receiver holding the first and stamped with any part of the second is visibly not the first.
+func framingProbeCommit() AuthenticatedContent {
+	other := testAuthenticatedCommit()
+	other.WireFormat = WireFormatPrivateMessage
+	other.Content.GroupId = []byte{0x5a, 0x5b}
+	other.Content.Epoch = 9
+	other.Content.Sender = Sender{SenderType: SenderTypeExternal, SenderIndex: 4}
+	other.Auth.Signature = []byte{0x11, 0x22, 0x33}
+	other.Auth.ConfirmationTag = []byte{0x44}
+	return other
+}
+
+// framingProbeEncoding is that value's encoding. It is produced by the encoder under test, which
+// is right here and wrong in the goldens above: nothing is being claimed about these octets --
+// they are a supply of prefixes -- and the gate's own control refuses to proceed unless the
+// decoder accepts the whole of them.
+func framingProbeEncoding(t *testing.T, codec syntax.Codec) []byte {
+	t.Helper()
+	encoded, err := syntax.Marshal(codec)
+	if err != nil {
+		t.Fatalf("encode the value this probe truncates: %v", err)
+	}
+	return encoded
+}
+
+var framingWholeReceiverProbes = map[string]framingReceiverProbe{
+	"Sender.UnmarshalMLS": {
+		prior:  func() any { return testSenderOfType(SenderTypeMember) },
+		valid:  func(t *testing.T) []byte { return handDerivedSenderGolden(SenderTypeExternal) },
+		decode: func(into any, bs []byte) error { return into.(*Sender).UnmarshalMLS(syntax.NewReader(bs)) },
+		other: func(t *testing.T) []func(into any) error {
+			refused := []byte{byte(undeclaredCodePointsOf(t, "SenderType")[0]), 0x00, 0x00, 0x00, 0x00}
+			return []func(into any) error{
+				func(into any) error { return into.(*Sender).UnmarshalMLS(syntax.NewReader(refused)) },
+			}
+		},
 	},
-	"FramedContentAuthData.UnmarshalMLS": func(t *testing.T) (any, any, error) {
-		unregistered := ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
-		before, after := testAuthData(), testAuthData()
-		err := after.UnmarshalMLS(syntax.NewReader(handDerivedAuthDataGolden(ContentTypeCommit)), unregistered)
-		return *before, *after, err
+	"FramedContentAuthData.UnmarshalMLS": {
+		prior: func() any { return emptySignatureAuthData([]byte{0x7a}) },
+		valid: func(t *testing.T) []byte { return handDerivedAuthDataGolden(ContentTypeCommit) },
+		decode: func(into any, bs []byte) error {
+			return into.(*FramedContentAuthData).UnmarshalMLS(syntax.NewReader(bs), ContentTypeCommit)
+		},
+		other: func(t *testing.T) []func(into any) error {
+			unregistered := ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
+			return []func(into any) error{
+				// the discriminant this codec is HANDED rather than reads, which no truncation
+				// of the input can produce
+				func(into any) error {
+					return into.(*FramedContentAuthData).UnmarshalMLS(
+						syntax.NewReader(handDerivedAuthDataGolden(ContentTypeCommit)), unregistered)
+				},
+				// and a commit whose confirmation tag is present, wire legal and empty
+				func(into any) error {
+					return into.(*FramedContentAuthData).UnmarshalMLS(
+						syntax.NewReader([]byte{0x01, 0xaa, 0x00}), ContentTypeCommit)
+				},
+			}
+		},
 	},
-	"AuthenticatedContent.UnmarshalMLS": func(t *testing.T) (any, any, error) {
-		// a REGISTERED wire format over content that cannot be read: the refusal has to come
-		// from BEHIND the field the receiver would be stamped with, or a decoder that stamped
-		// it early would have refused before it ever reached the assignment
-		before, after := testAuthenticatedCommit(), testAuthenticatedCommit()
-		err := after.UnmarshalMLS(syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
-		return before, after, err
+	"AuthenticatedContent.UnmarshalMLS": {
+		prior: func() any { value := testAuthenticatedCommit(); return &value },
+		valid: func(t *testing.T) []byte {
+			value := framingProbeCommit()
+			return framingProbeEncoding(t, &value)
+		},
+		decode: func(into any, bs []byte) error {
+			return into.(*AuthenticatedContent).UnmarshalMLS(syntax.NewReader(bs))
+		},
+		other: func(t *testing.T) []func(into any) error {
+			return []func(into any) error{
+				// an unregistered wire format, refused at the first field
+				func(into any) error {
+					return into.(*AuthenticatedContent).UnmarshalMLS(syntax.NewReader(append(
+						[]byte{0x00, 0x00}, handDerivedCommitTail()...)))
+				},
+				// and a registered one over a content type no registry declares, refused from
+				// strictly behind the octets a wire format decoder would stamp
+				func(into any) error {
+					return into.(*AuthenticatedContent).UnmarshalMLS(
+						syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
+				},
+			}
+		},
 	},
-	"confirmedTranscriptHashInput.UnmarshalMLS": func(t *testing.T) (any, any, error) {
-		priorCommit, decodedInto := testAuthenticatedCommit(), testAuthenticatedCommit()
-		before, after := priorCommit.transcriptHashInput(), decodedInto.transcriptHashInput()
-		err := after.UnmarshalMLS(syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
-		return *before, *after, err
+	"confirmedTranscriptHashInput.UnmarshalMLS": {
+		prior: func() any { commit := testAuthenticatedCommit(); return commit.transcriptHashInput() },
+		valid: func(t *testing.T) []byte {
+			commit := framingProbeCommit()
+			return framingProbeEncoding(t, commit.transcriptHashInput())
+		},
+		decode: func(into any, bs []byte) error {
+			return into.(*confirmedTranscriptHashInput).UnmarshalMLS(syntax.NewReader(bs))
+		},
+		other: func(t *testing.T) []func(into any) error {
+			return []func(into any) error{
+				func(into any) error {
+					return into.(*confirmedTranscriptHashInput).UnmarshalMLS(syntax.NewReader(append(
+						[]byte{0x00, 0x00}, handDerivedTranscriptInputTail()...)))
+				},
+				func(into any) error {
+					return into.(*confirmedTranscriptHashInput).UnmarshalMLS(
+						syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
+				},
+			}
+		},
 	},
 }
 
@@ -3261,7 +3363,8 @@ func framingRefusedContentBehind(t *testing.T, wireFormat WireFormat) []byte {
 }
 
 // TestEveryFramingDecodeThatPublishesItsReceiverWholeLeavesItUntouchedWhenItRefuses sweeps the
-// class rather than the two members of it somebody wrote a test for.
+// class rather than the two members of it somebody wrote a test for, and sweeps every refusal
+// point of each rather than the one somebody thought of.
 //
 // What a violation costs is not a mangled struct anybody would notice. It is a well formed value
 // describing a message nobody sent: a caller that reused its receiver and checked the error is
@@ -3274,18 +3377,52 @@ func TestEveryFramingDecodeThatPublishesItsReceiverWholeLeavesItUntouchedWhenItR
 		t.Fatalf("this package publishes its receiver whole in %v and this file probes %v; a decoder nothing probes is a promise nobody has ever held it to",
 			derived, probed)
 	}
+	observed := 0
 	for _, method := range probed {
-		before, after, err := framingWholeReceiverProbes[method](t)
-		if err == nil {
-			t.Errorf("%s accepted the input this probe hands it, so what it left in the receiver states nothing", method)
+		probe := framingWholeReceiverProbes[method]
+		valid := probe.valid(t)
+		// the two controls this sweep owes, both before any refusal is tried. The complete
+		// encoding must be ACCEPTED, or every truncation of it below refuses something this
+		// probe broke rather than a short input; and it must decode to something OTHER than
+		// what the receiver already held, or a stamped receiver and an untouched one are the
+		// same value and nothing below could separate them.
+		accepted := probe.prior()
+		if err := probe.decode(accepted, valid); err != nil {
+			t.Errorf("%s refused the complete encoding this sweep truncates: %v", method, err)
 			continue
 		}
-		if !reflect.DeepEqual(before, after) {
-			t.Errorf("%s refused with %v and left its receiver holding %+v rather than the %+v it held going in; a refused decode that writes the receiver hands the caller a well formed value assembled out of bytes this package would not accept",
-				method, err, after, before)
+		if reflect.DeepEqual(probe.prior(), accepted) {
+			t.Errorf("%s decoded the complete encoding to the value its receiver already held, so this probe cannot tell a stamped receiver from an untouched one",
+				method)
+			continue
+		}
+		refusals := []func(into any) error{}
+		for at := 0; at < len(valid); at += 1 {
+			short := valid[:at]
+			refusals = append(refusals, func(into any) error { return probe.decode(into, short) })
+		}
+		refusals = append(refusals, probe.other(t)...)
+		for index, refuse := range refusals {
+			before, after := probe.prior(), probe.prior()
+			err := refuse(after)
+			if err == nil {
+				t.Errorf("%s: refusal %d of %d was accepted, so what it left in the receiver states nothing",
+					method, index, len(refusals))
+				continue
+			}
+			if !reflect.DeepEqual(before, after) {
+				t.Errorf("%s: refusal %d of %d answered %v and left its receiver holding %+v rather than the %+v it held going in; a refused decode that writes the receiver hands the caller a well formed value assembled out of bytes this package would not accept",
+					method, index, len(refusals), err, after, before)
+				continue
+			}
+			observed += 1
 		}
 	}
-	t.Logf("%d framing decoders publishing their receiver whole, each leaving it untouched when it refuses", len(probed))
+	if observed == 0 {
+		t.Fatal("no refusal was observed, so this gate states nothing")
+	}
+	t.Logf("%d framing decoders publishing their receiver whole, %d refusals swept, each leaving the receiver untouched",
+		len(probed), observed)
 }
 
 // ---------------------------------------------------------------------------
