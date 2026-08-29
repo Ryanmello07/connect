@@ -49,6 +49,7 @@ import (
 	"go/ast"
 	"go/token"
 	"maps"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -305,6 +306,14 @@ func (self *vectorRunTally) assertRun(t *testing.T, wantCovered int, wantSkipped
 // one file: a tag misspelled, renamed, or pointed at a key the corpus does not publish
 // decodes to the empty string on the comparator's side and is a missing key here, which is a
 // failure rather than a comparison of nothing against nothing.
+//
+// ONE reader and not one per answer shape. Every family before family 10 compares a json
+// string, and family 10's resolutions column publishes an array of node indices per node, so
+// there was for a while a second copy of this walk in tree_kat_test.go whose only difference
+// was its tail. Two readers of one thing is what this file's shared machinery exists to
+// prevent -- the two decode the same corpus and can come apart about it silently -- so the
+// array shape lives in the tail below and there is one walk again. Nothing about the array
+// arm is family 10's: any later family publishing a structured answer needs it.
 func publishedCorpusField(t *testing.T, published map[string]json.RawMessage, name string) string {
 	t.Helper()
 	key, rest, isNested := strings.Cut(name, ".")
@@ -325,10 +334,22 @@ func publishedCorpusField(t *testing.T, published map[string]json.RawMessage, na
 		walked += "." + segment
 	}
 	text := ""
-	if err := json.Unmarshal(raw, &text); err != nil {
-		t.Fatalf("the published %s is not a json string: %v", name, err)
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
 	}
-	return text
+	// the structured arm. The corpus's own bytes are rendered with their whitespace removed
+	// rather than decoded into anything: a second read that went through a []uint32 would be
+	// the comparator's own struct decode a second time, which is the one decode this whole
+	// function exists to be independent of.
+	//
+	// Still a FAILURE and never an empty answer where the addressed value is not well formed
+	// json, for the reason above: a path that addresses nothing has to be loud here rather
+	// than an empty string compared against an empty string somewhere else.
+	compacted := bytes.Buffer{}
+	if err := json.Compact(&compacted, raw); err != nil {
+		t.Fatalf("the published %s is neither a json string nor well formed json: %v", name, err)
+	}
+	return compacted.String()
 }
 
 // publishedCorpusSegment steps one segment of a dotted path into a published value: a json
@@ -1150,5 +1171,69 @@ func TestPublishedCorpusSegmentStepsIntoTheShapeThePublishedValueHas(t *testing.
 			t.Errorf("%s: the step reported nothing, so a path that addresses nothing comes back as a value every family compares against",
 				row.names)
 		}
+	}
+}
+
+// TestThePackageSourceIsOneLineEndingThroughout refuses a working tree in which some file of this
+// package disagrees with the rest about how a line ends.
+//
+// Not a style rule. Every gate in this file and in the family runners reads this package's own
+// source, and every repair to this package is made as an exact-string edit over it -- and an edit
+// anchored on one line ending matches nothing at all in a file that uses the other. It edits
+// nothing, the suite then passes, and that reads as "the change was made and was harmless". Three
+// wrong conclusions on this tree came from exactly that, and one of them also rewrote a whole
+// file's endings while its own substitution matched nothing, so the evidence pointed two ways at
+// once.
+//
+// DERIVED and pinned to NEITHER ending, because which one is right belongs to the checkout and
+// not to this package: a clone with core.autocrlf off is LF throughout, one with it on is CRLF
+// throughout, and both are fine to work in. What is refused is the mixture. Written as a
+// derivation rather than as the one file somebody noticed, for guardrail 5's reason and with the
+// usual result -- the review that raised this named a single file, and reading the class off the
+// directory found sixteen.
+//
+// A file carrying no line ending at all belongs to neither class and is counted apart, so an
+// empty file cannot make a mixed package look uniform, and a file mixed WITHIN itself is its own
+// report: that one is never a checkout and is always a tool that wrote part of a file.
+func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
+	byEnding := map[string][]string{}
+	empty := 0
+	for _, path := range packageSourcePaths(t) {
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		lines := bytes.Count(source, []byte("\n"))
+		carried := bytes.Count(source, []byte("\r\n"))
+		switch {
+		case lines == 0:
+			empty += 1
+		case carried == lines:
+			byEnding["crlf"] = append(byEnding["crlf"], path)
+		case carried == 0:
+			byEnding["lf"] = append(byEnding["lf"], path)
+		default:
+			t.Errorf("%s holds %d lines of which %d end crlf, so the file is mixed within itself and no anchored edit over it can be trusted either way",
+				path, lines, carried)
+		}
+	}
+	if len(byEnding) == 0 {
+		t.Fatalf("none of this package's source files carries a line ending at all (%d were empty), so this gate read nothing", empty)
+	}
+	if len(byEnding) > 1 {
+		// the smaller class is named rather than the larger, because bringing those files over is
+		// the repair.
+		smaller := ""
+		for ending := range byEnding {
+			if smaller == "" || len(byEnding[ending]) < len(byEnding[smaller]) {
+				smaller = ending
+			}
+		}
+		t.Errorf("this package's source is not one line ending throughout: %v end their lines %s and the other %d files do not; an exact-string edit anchored on one ending matches nothing in a file using the other and reports the change as made",
+			byEnding[smaller], smaller, len(packageSourcePaths(t))-len(byEnding[smaller])-empty)
+		return
+	}
+	for ending, paths := range byEnding {
+		t.Logf("all %d source files of this package end their lines %s, and %d carry no line ending", len(paths), ending, empty)
 	}
 }

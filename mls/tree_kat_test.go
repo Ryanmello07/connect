@@ -13,8 +13,12 @@
 // answers -- resolutions, tree hashes, the section 7.9 chain, the leaf signatures -- are each
 // swept somewhere else in this package already, over the same corpus. What is new is that they
 // are asked of ONE case together and reported as one verdict, that the family is offered its
-// corpus by TestVectorFamiliesVerify, and that the comparator is held to REFUSING seven
-// classes of wrong case, which no sweep over a corpus that agrees with everything can be.
+// corpus by TestVectorFamiliesVerify, and that the comparator is held to REFUSING every class
+// of wrong case it names, which no sweep over a corpus that agrees with everything can be. The
+// word EVERY is the gate TestTheTreeComparatorsRefuseEveryClassTheyName makes true: each
+// family's class is read off its own comparator and verdict, and a class no control row reaches
+// and no written exemption excuses fails there. It replaces a count, and the count is what let
+// two arms be deleted with the package green.
 // Family 11 adds the same three plus a generate direction: a sender built here, a receiver
 // that is not the sender, and a commit secret re-derived from the RFC text with crypto/hmac.
 //
@@ -72,6 +76,8 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"reflect"
 	"slices"
@@ -709,7 +715,7 @@ var (
 	errTreeValidationTreeHash    = errors.New("a node's tree hash is not the published one")
 	errTreeValidationParentHash  = errors.New("the published ratchet tree fails the section 7.9 parent hash check")
 	errTreeValidationLeafRefused = errors.New("a published leaf node's signature does not verify at its own group id and index")
-	errTreeValidationLeafUnbound = errors.New("a context bound leaf node verified at a group id it was not signed under")
+	errTreeValidationLeafUnbound = errors.New("a context bound leaf node's signature verified at a group id that is not the case's own")
 )
 
 // The two answers this family compares at every node, named by what produced them. The order is
@@ -769,10 +775,11 @@ type treeValidationComparison struct {
 	// parentHashError is what section 7.9's whole-tree check answered, nil where it accepted.
 	parentHashError error
 	// refusedLeaf is the first published leaf whose signature did not verify at its own group
-	// and index, and acceptedLeaf the first CONTEXT BOUND leaf that verified at a group id it
-	// was not signed under. The second is the vacuity control on the first: every published
-	// signature verifies, so a VerifySignature that answered nil for everything passes the
-	// whole sweep and only the wrong question separates it.
+	// and index, and acceptedLeaf the first CONTEXT BOUND leaf that verified at a group id one
+	// octet away from the case's own. The second is the vacuity control on the first: every
+	// published signature verifies, so a VerifySignature that answered nil for everything passes
+	// the whole sweep and only the wrong question separates it. verdict reports acceptedLeaf
+	// FIRST, and the argument for that order is written where the arms are.
 	refusedLeaf  error
 	acceptedLeaf error
 }
@@ -830,7 +837,7 @@ func (self treeValidationComparison) incomplete() error {
 // verdict is the whole judgement over one compared case: it must be complete, every published
 // resolution and every published tree hash must agree, the tree must pass section 7.9's
 // whole-tree parent hash check, and every occupied leaf must verify at its own group id and
-// index while a context bound one refuses a group id it was not signed under.
+// index while a context bound one refuses a group id that is not the case's own.
 //
 // The order puts the two columns ahead of the parent hash check on purpose. Section 7.9's check
 // is stated over tree hashes of copath subtrees, so a defect in the tree hash breaks BOTH, and
@@ -854,11 +861,20 @@ func (self treeValidationComparison) verdict() error {
 	if self.parentHashError != nil {
 		return fmt.Errorf("%w: %v", errTreeValidationParentHash, self.parentHashError)
 	}
-	if self.refusedLeaf != nil {
-		return fmt.Errorf("%w: %v", errTreeValidationLeafRefused, self.refusedLeaf)
-	}
+	// the accepted-elsewhere arm AHEAD of the refused-here one, and the order is what makes the
+	// first of them reachable at all. A bound leaf carries one signature, so every case whose
+	// published group id is not its leaves' produces BOTH -- the leaves fail at the case's own
+	// group id and pass at the one octet flipped from it -- and reporting the refusal first left
+	// errTreeValidationLeafUnbound unreachable from any comparator run, driven only over evidence
+	// a control built by hand. Measured: with the wrong-group question deleted outright the whole
+	// package stayed green. The defect the arm exists for -- a VerifySignature answering nil for
+	// everything -- sets acceptedLeaf and leaves refusedLeaf nil, so it is reported the same way
+	// under either order.
 	if self.acceptedLeaf != nil {
 		return fmt.Errorf("%w: %v", errTreeValidationLeafUnbound, self.acceptedLeaf)
+	}
+	if self.refusedLeaf != nil {
+		return fmt.Errorf("%w: %v", errTreeValidationLeafRefused, self.refusedLeaf)
 	}
 	return nil
 }
@@ -1022,53 +1038,16 @@ func treeResolutionText(resolution []NodeIndex) string {
 // runner's own struct, in the same spelling.
 //
 // This is the COMPARATOR's half and is deliberately not the runner's second read: the runner
-// re-reads the same answer out of a generic decode of the case text through
-// publishedTreeVectorAnswer, which touches no struct tag of this file at all, and the two are
-// held equal there. A struct tag pointing at a key the corpus does not publish decodes to an
-// empty column here and is a missing key there.
+// re-reads the same answer out of a generic decode of the case text through the shared
+// publishedCorpusField, which touches no struct tag of this file at all, and the two are held
+// equal there. A struct tag pointing at a key the corpus does not publish decodes to an empty
+// column here and is a missing key there.
 func publishedNodeIndexListText(published []uint32) string {
 	indices := make([]NodeIndex, 0, len(published))
 	for _, x := range published {
 		indices = append(indices, NodeIndex(x))
 	}
 	return treeResolutionText(indices)
-}
-
-// publishedTreeVectorAnswer reads one published answer out of a case decoded as a GENERIC json
-// object, addressed by a dotted json path, and renders it as text.
-//
-// publishedCorpusField next door answers for a json STRING, which is every answer the four
-// families before these two compare. Family 10's resolutions column publishes a json ARRAY of
-// node indices per node, so the string arm alone would be fatal over half of this family's
-// answers. The array arm renders the corpus's own bytes with their whitespace removed rather
-// than decoding into anything: a second read that went through a []uint32 would be this
-// runner's own struct decode a second time.
-//
-// The walk into the case is publishedCorpusSegment's, shared with publishedCorpusField, so a
-// path that addresses nothing is loud in both places for one reason.
-func publishedTreeVectorAnswer(t *testing.T, published map[string]json.RawMessage, path string) string {
-	t.Helper()
-	key, rest, isNested := strings.Cut(path, ".")
-	raw, found := published[key]
-	if !found {
-		t.Fatalf("the corpus case does not publish %q, so whatever decodes it decodes to nothing and every comparison over it is vacuous", key)
-	}
-	walked := key
-	for isNested {
-		var segment string
-		segment, rest, isNested = strings.Cut(rest, ".")
-		raw = publishedCorpusSegment(t, raw, walked, segment)
-		walked += "." + segment
-	}
-	text := ""
-	if err := json.Unmarshal(raw, &text); err == nil {
-		return text
-	}
-	compacted := bytes.Buffer{}
-	if err := json.Compact(&compacted, raw); err != nil {
-		t.Fatalf("the published %s is neither a json string nor well formed json: %v", walked, err)
-	}
-	return compacted.String()
 }
 
 // Family 10 is installed here, and 10 is deleted from expectedPendingFamilies in the same
@@ -1135,7 +1114,7 @@ func TestVectorTreeValidation(t *testing.T) {
 			t.Fatalf("%s case %d (suite %#04x): %v", file, index, header.CipherSuite, err)
 		}
 		for _, answer := range evidence.answers {
-			want := publishedTreeVectorAnswer(t, published, answer.field)
+			want := publishedCorpusField(t, published, answer.field)
 			if answer.got != want {
 				t.Fatalf("%s case %d (suite %#04x): %s answered %s and the corpus text publishes %s at %s",
 					file, index, header.CipherSuite, answer.name, answer.got, want, answer.field)
@@ -1304,14 +1283,36 @@ func aTreeValidationCaseWhoseParentHashChainIsBroken(t *testing.T, base treeVali
 // the WRONG reason is reported too, and assertComparatorRefuses requires the unmodified case to
 // be accepted first so a comparator that refused everything does not satisfy the table.
 func TestCompareTreeValidationVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
-	base, brokenChain := tvKatBaseCase(t)
-	compare := func(t *testing.T, raw json.RawMessage) error {
-		evidence, err := compareTreeValidationVector(t, raw)
-		if err != nil {
-			return err
-		}
-		return evidence.verdict()
+	accepted, refusals := treeValidationRefusals(t)
+	assertComparatorRefuses(t, treeVectorFile(t, 10), compareTreeValidationVerdict, accepted, refusals)
+}
+
+// compareTreeValidationVerdict is one run of family 10's comparator reported as a single error,
+// which is the shape assertComparatorRefuses and the class gate below both drive it through.
+//
+// One declaration rather than a closure inside each caller: two callers building the same
+// adapter is two chances for one of them to judge the evidence differently from the other, and
+// the whole of what a refusal row means is that the comparator and the verdict together said no.
+func compareTreeValidationVerdict(t *testing.T, raw json.RawMessage) error {
+	t.Helper()
+	evidence, err := compareTreeValidationVector(t, raw)
+	if err != nil {
+		return err
 	}
+	return evidence.verdict()
+}
+
+// treeValidationRefusals is family 10's control table: the unmodified published case every row
+// is judged against, and one deliberately wrong case per defect class this family's comparator
+// and verdict can reach from a corpus.
+//
+// A function rather than a table declared inside the test that drives it, because the class gate
+// below has to read the sentinels these rows ACTUALLY name. A second list of those sentinels
+// written beside the table would be the shape rule 5 is about: it would agree with itself while
+// the table under it lost a row.
+func treeValidationRefusals(t *testing.T) (json.RawMessage, []comparatorRefusal) {
+	t.Helper()
+	base, brokenChain := tvKatBaseCase(t)
 	flipHex := func(text string) string {
 		octets := MustHex(t, text)
 		if len(octets) == 0 {
@@ -1320,12 +1321,27 @@ func TestCompareTreeValidationVectorRefusesAnAnswerItShouldNotAccept(t *testing.
 		octets[0] ^= 0x01
 		return HexOf(octets)
 	}
+	// the LAST octet, which is the one the comparator's wrong-group question does not touch.
+	// That question flips octet zero, so a case whose group id differs from its leaves' THERE has
+	// its original group id offered back to every bound leaf and is refused as the unbound class;
+	// a case that differs anywhere else is refused as the leaf class and nothing else. The two
+	// rows below are those two cases, and they are what makes both arms of the verdict reachable
+	// from a corpus rather than only from evidence built by hand.
+	flipLastHex := func(text string) string {
+		octets := MustHex(t, text)
+		if len(octets) < 2 {
+			t.Fatalf("%q is %d octets and the two group id rows below need a first and a last that differ",
+				text, len(octets))
+		}
+		octets[len(octets)-1] ^= 0x01
+		return HexOf(octets)
+	}
 	if len(base.Resolutions) < 2 || len(base.TreeHashes) < 2 {
 		t.Fatalf("the base case publishes %d resolutions and %d tree hashes, and the rows below need two of each",
 			len(base.Resolutions), len(base.TreeHashes))
 	}
 	accepted := rewriteTreeValidationCase(t, base, func(corrupted *treeValidationVector) {})
-	assertComparatorRefuses(t, treeVectorFile(t, 10), compare, accepted, []comparatorRefusal{
+	return accepted, []comparatorRefusal{
 		{
 			name:   "a case whose published ratchet tree does not decode",
 			vector: rewriteTreeValidationCase(t, base, func(c *treeValidationVector) { c.Tree = "00" }),
@@ -1365,13 +1381,25 @@ func TestCompareTreeValidationVectorRefusesAnAnswerItShouldNotAccept(t *testing.
 			want:   errTreeValidationParentHash,
 		},
 		{
-			name: "a case whose group id is not the one its leaves were signed under",
+			name: "a case whose group id is not its leaves own, in an octet the wrong-group question does not flip",
 			vector: rewriteTreeValidationCase(t, base, func(c *treeValidationVector) {
-				c.GroupId = flipHex(c.GroupId)
+				c.GroupId = flipLastHex(c.GroupId)
 			}),
 			want: errTreeValidationLeafRefused,
 		},
-	})
+		{
+			// the row the wrong-group question exists for, and the only one that reaches it from
+			// a corpus: this case's group id is its leaves own with octet zero flipped, so the
+			// question hands every bound leaf the group id it really was signed under and the
+			// signature verifies there. A comparator that stopped asking reports this case as the
+			// row above's class instead, which is a refusal for the wrong reason.
+			name: "a case whose group id differs from its leaves own in exactly the octet the wrong-group question flips",
+			vector: rewriteTreeValidationCase(t, base, func(c *treeValidationVector) {
+				c.GroupId = flipHex(c.GroupId)
+			}),
+			want: errTreeValidationLeafUnbound,
+		},
+	}
 }
 
 // treeValidationSentinels is this family's refusals addressed by the identifier they are
@@ -1659,7 +1687,7 @@ var (
 	errTreeKemDecrypt        = errors.New("a leaf the case says can decrypt did not")
 	errTreeKemPathSecret     = errors.New("the recovered path secret is not the published one")
 	errTreeKemCommitSecret   = errors.New("the recovered commit secret is not the published one")
-	errTreeKemContextIgnored = errors.New("an update path opened under a group context it was not sealed under")
+	errTreeKemContextIgnored = errors.New("an update path opened under a group context that is not the case's own")
 )
 
 // The three answers this family compares, named by what the corpus publishes them as. The order
@@ -1852,9 +1880,16 @@ func compareTreeKemVector(t *testing.T, raw json.RawMessage) (treeKemComparison,
 	// merged. Without this a case whose private half was replaced wholesale would be reported as
 	// a decrypt that failed, which sends a reader to the ladder rather than to the state.
 	for _, entry := range vector.LeavesPrivate {
+		// a HARNESS invariant and not a verdict about the case, which is why it is fatal rather
+		// than a refusal. private searches the very slice this loop walks, so the miss it reports
+		// is unreachable here; the class errTreeKemMissingPrivate names -- a path secret published
+		// for a leaf the case carries no private state for -- is reachable only in the decrypt
+		// loop below, where the leaf index comes off the update path instead. Written as a refusal
+		// this read as a checked condition and was not one.
 		priv, found := vector.private(t, entry.Index)
 		if !found {
-			return evidence, fmt.Errorf("%w: leaf %d", errTreeKemMissingPrivate, entry.Index)
+			t.Fatalf("leaf %d is published in the case's own private state and the lookup over that same slice does not find it",
+				entry.Index)
 		}
 		if err := priv.Consistent(crypto, base); err != nil {
 			return evidence, fmt.Errorf("%w: leaf %d: %v", errTreeKemPrivateState, entry.Index, err)
@@ -1913,6 +1948,23 @@ func compareTreeKemVector(t *testing.T, raw json.RawMessage) (treeKemComparison,
 			if entry != LeafIndex(leafIndex).NodeIndex() {
 				evidence.deep += 1
 			}
+			// the control, per decrypt rather than once, and AHEAD of the decrypt that is meant to
+			// succeed. Every published case opens, so a DecryptUpdatePath that checked the context
+			// and one that ignored it produce identical runs, and only an input that must be
+			// refused separates them. The ORDER is what makes that input expressible: a case whose
+			// path was sealed under some other context refuses the real decrypt too, so a probe
+			// that ran second would never be reached and this class would be reportable only over
+			// evidence built by hand. Measured: with the probe's refusal deleted outright the whole
+			// package stayed green.
+			wrongContext := bytes.Clone(groupContext)
+			wrongContext[0] ^= 0x01
+			fresh, _ := vector.private(t, uint32(leafIndex))
+			if _, err := merged.DecryptUpdatePath(crypto, LeafIndex(update.Sender), path,
+				wrongContext, fresh, nil); err == nil {
+				return evidence, fmt.Errorf("%w: path %d, leaf %d", errTreeKemContextIgnored, at, leafIndex)
+			}
+			evidence.refusals += 1
+
 			result, err := merged.DecryptUpdatePath(crypto, LeafIndex(update.Sender), path,
 				groupContext, priv, nil)
 			if err != nil {
@@ -1936,17 +1988,6 @@ func compareTreeKemVector(t *testing.T, raw json.RawMessage) (treeKemComparison,
 					got:   HexOf(result.CommitSecret),
 					want:  update.CommitSecret,
 				})
-			// the control, per decrypt rather than once: every published case opens, so a
-			// DecryptUpdatePath that checked the context and one that ignored it produce
-			// identical runs, and only an input that must be refused separates them.
-			wrongContext := bytes.Clone(groupContext)
-			wrongContext[0] ^= 0x01
-			fresh, _ := vector.private(t, uint32(leafIndex))
-			if _, err := merged.DecryptUpdatePath(crypto, LeafIndex(update.Sender), path,
-				wrongContext, fresh, nil); err == nil {
-				return evidence, fmt.Errorf("%w: path %d, leaf %d", errTreeKemContextIgnored, at, leafIndex)
-			}
-			evidence.refusals += 1
 			opened += 1
 		}
 		evidence.perPath = append(evidence.perPath, opened)
@@ -2019,7 +2060,7 @@ func TestVectorTreeKEM(t *testing.T) {
 			t.Fatalf("%s case %d (suite %#04x): %v", file, index, header.CipherSuite, err)
 		}
 		for _, answer := range evidence.answers {
-			want := publishedTreeVectorAnswer(t, published, answer.field)
+			want := publishedCorpusField(t, published, answer.field)
 			if answer.got != want {
 				t.Fatalf("%s case %d (suite %#04x): %s answered %s and the corpus text publishes %s at %s",
 					file, index, header.CipherSuite, answer.name, answer.got, want, answer.field)
@@ -2159,6 +2200,24 @@ func generateTreeKemVectors(t *testing.T) json.RawMessage {
 func generateOneTreeKemCase(t *testing.T, crypto CryptoProvider, base treekemReceiverVector,
 	tree *RatchetTree, sender treekemLeafPrivateVector) treekemReceiverVector {
 	t.Helper()
+	return generateOneTreeKemCaseSealedUnder(t, crypto, base, tree, sender, nil)
+}
+
+// generateOneTreeKemCaseSealedUnder is the same commit with the group context every ciphertext
+// is sealed under handed to a caller, and the whole reason it is a parameter is the control that
+// uses it.
+//
+// sealUnder nil is the case's own context, which is every generated case the registry or the
+// generate sweep ever asks for. A control that answers something else produces the one case
+// family 11's wrong-context refusal can be driven by: a path that opens under a context this
+// case does not publish. That case cannot be written by editing a published one, because every
+// corpus field the context is built out of also feeds the decrypt that must succeed -- edit any
+// of them and the case is refused as a decrypt that did not open, which is a true statement
+// about a class this arm is not.
+func generateOneTreeKemCaseSealedUnder(t *testing.T, crypto CryptoProvider, base treekemReceiverVector,
+	tree *RatchetTree, sender treekemLeafPrivateVector,
+	sealUnder func(groupContext []byte) []byte) treekemReceiverVector {
+	t.Helper()
 	senderTree := tree.Clone()
 	plan, err := senderTree.CreateUpdatePathSecrets(crypto, LeafIndex(sender.Index),
 		SignaturePrivateKey(MustHex(t, sender.SignaturePriv)), MustHex(t, base.GroupId))
@@ -2170,6 +2229,9 @@ func generateOneTreeKemCase(t *testing.T, crypto CryptoProvider, base treekemRec
 		t.Fatalf("sender %d TreeHash: %v", sender.Index, err)
 	}
 	groupContext := base.groupContext(t, treeHash)
+	if sealUnder != nil {
+		groupContext = sealUnder(groupContext)
+	}
 	path, err := senderTree.EncryptUpdatePath(crypto, plan, LeafIndex(sender.Index), groupContext, nil)
 	if err != nil {
 		t.Fatalf("sender %d EncryptUpdatePath: %v", sender.Index, err)
@@ -2433,7 +2495,7 @@ func tkFirstDecryptingLeaf(vector treekemReceiverVector, path int) (int, bool) {
 //
 // The nested halves are cloned before the mutation runs, because a row that edited
 // UpdatePaths[0] in place would edit the base every later row is built from, and the rows would
-// then be a sequence of corruptions rather than seven independent ones.
+// then be a sequence of corruptions rather than independent ones.
 func tkRewrite(t *testing.T, base treekemReceiverVector,
 	mutate func(corrupted *treekemReceiverVector)) json.RawMessage {
 	t.Helper()
@@ -2461,14 +2523,32 @@ func tkRewrite(t *testing.T, base treekemReceiverVector,
 // runs; only a case that is wrong on purpose separates them. Each row names the sentinel it owes,
 // so a refusal for the WRONG reason is reported too.
 func TestCompareTreeKemVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
-	base := tkKatBaseCase(t)
-	compare := func(t *testing.T, raw json.RawMessage) error {
-		evidence, err := compareTreeKemVector(t, raw)
-		if err != nil {
-			return err
-		}
-		return evidence.verdict()
+	accepted, refusals := treeKemRefusals(t)
+	assertComparatorRefuses(t, treeVectorFile(t, 11), compareTreeKemVerdict, accepted, refusals)
+}
+
+// compareTreeKemVerdict is one run of family 11's comparator reported as a single error, which
+// is the shape assertComparatorRefuses and the class gate below both drive it through. See
+// compareTreeValidationVerdict next door for why it is one declaration and not two closures.
+func compareTreeKemVerdict(t *testing.T, raw json.RawMessage) error {
+	t.Helper()
+	evidence, err := compareTreeKemVector(t, raw)
+	if err != nil {
+		return err
 	}
+	return evidence.verdict()
+}
+
+// treeKemRefusals is family 11's control table: the unmodified published case every row is
+// judged against, and one deliberately wrong case per defect class this family's comparator and
+// verdict can reach from a corpus.
+//
+// A function for treeValidationRefusals' reason: the class gate below reads the sentinels these
+// rows actually name, rather than a second list of them that would agree with itself while the
+// table under it lost a row.
+func treeKemRefusals(t *testing.T) (json.RawMessage, []comparatorRefusal) {
+	t.Helper()
+	base := tkKatBaseCase(t)
 	// the octet that is flipped is the SECOND and not the first, and that is not arbitrary. An
 	// X25519 private key is clamped before use -- the low three bits of its first octet are
 	// cleared -- so a private key whose first octet was flipped in bit 0 derives the very same
@@ -2495,7 +2575,7 @@ func TestCompareTreeKemVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
 	if rung < 0 {
 		t.Fatal("no published member of the base case holds a path secret, so the private-state row corrupts nothing")
 	}
-	assertComparatorRefuses(t, treeVectorFile(t, 11), compare, tkRewrite(t, base, func(*treekemReceiverVector) {}),
+	return tkRewrite(t, base, func(*treekemReceiverVector) {}),
 		[]comparatorRefusal{
 			{
 				name:   "a case whose published ratchet tree does not decode",
@@ -2563,7 +2643,92 @@ func TestCompareTreeKemVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
 				}),
 				want: errTreeKemMissingPrivate,
 			},
+			{
+				// a path that still DECODES and no longer fits the tree it is a commit over, which
+				// is the class between those two: a node dropped leaves the update path one rung
+				// short of the sender's filtered direct path and ValSem202 refuses it.
+				name:   "a case whose published update path decodes and does not fit the tree it commits over",
+				vector: aTreeKemCaseWhoseUpdatePathDoesNotFitTheTree(t, base),
+				want:   errTreeKemMerge,
+			},
+			{
+				// the row the per-decrypt wrong-context question exists for, and the only one that
+				// reaches it: the path is sealed under the case's own context with the octet that
+				// question flips already flipped, so the question hands it the context it really was
+				// sealed under and it opens. A comparator that stopped asking reports this case as a
+				// decrypt that did not open, which is a refusal for the wrong reason.
+				name:   "a case whose published update path opens under a group context the case does not publish",
+				vector: aTreeKemCaseSealedUnderAnotherGroupContext(t, base),
+				want:   errTreeKemContextIgnored,
+			},
+		}
+}
+
+// aTreeKemCaseWhoseUpdatePathDoesNotFitTheTree is the base case with one node dropped from its
+// first published update path and the path re-encoded.
+//
+// Re-encoded through this package's own marshaller rather than by cutting the hex, so the case
+// is refused for the length and not for the decode: a truncated hex string is refused a step
+// earlier as a path that does not decode, which is a true refusal for the class the row above
+// this one owns.
+func aTreeKemCaseWhoseUpdatePathDoesNotFitTheTree(t *testing.T, base treekemReceiverVector) json.RawMessage {
+	t.Helper()
+	path := &UpdatePath{}
+	if err := syntax.Unmarshal(MustHex(t, base.UpdatePaths[0].UpdatePath), path); err != nil {
+		t.Fatalf("decode the base case's first update path: %v", err)
+	}
+	if len(path.Nodes) == 0 {
+		t.Fatal("the base case's first update path carries no node, so dropping one changes nothing")
+	}
+	path.Nodes = path.Nodes[:len(path.Nodes)-1]
+	encoded, err := syntax.Marshal(path)
+	if err != nil {
+		t.Fatalf("re-encode the shortened update path: %v", err)
+	}
+	return tkRewrite(t, base, func(c *treekemReceiverVector) {
+		c.UpdatePaths[0].UpdatePath = HexOf(encoded)
+	})
+}
+
+// aTreeKemCaseSealedUnderAnotherGroupContext is one member's commit over the base case's epoch,
+// sealed under the base case's own group context with the octet the comparator's wrong-context
+// question flips already flipped.
+//
+// Generated rather than edited, and that is the whole point. The context is built out of the
+// case's group id, epoch, confirmed transcript hash and the tree hash of the MERGED tree, and
+// every one of those either is a published field the decrypt also depends on or is computed by
+// the comparator itself -- so there is no edit of a published case that leaves the real decrypt
+// working and the wrong-context probe opening. A path sealed under the probe's own context is
+// the only case that separates a DecryptUpdatePath which checks the context from one which does
+// not, which is the whole reason the arm is there.
+func aTreeKemCaseSealedUnderAnotherGroupContext(t *testing.T, base treekemReceiverVector) json.RawMessage {
+	t.Helper()
+	suite, ok := implementedSuite(base.CipherSuite)
+	if !ok {
+		t.Fatalf("the base case is at suite %#04x, which this package does not register", base.CipherSuite)
+	}
+	crypto := mustProvider(t, suite)
+	tree, err := UnmarshalRatchetTree(MustHex(t, base.RatchetTree))
+	if err != nil {
+		t.Fatalf("decode the base case's ratchet tree: %v", err)
+	}
+	if len(base.LeavesPrivate) == 0 {
+		t.Fatal("the base case publishes no member, so nothing here can commit")
+	}
+	generated := generateOneTreeKemCaseSealedUnder(t, crypto, base, tree, base.LeavesPrivate[0],
+		func(groupContext []byte) []byte {
+			// the same octet compareTreeKemVector's own question flips, so the two contexts are
+			// each other's. Written here as the flip of the context the comparator will compute
+			// rather than as a constant, because what has to hold is that the two agree.
+			sealed := bytes.Clone(groupContext)
+			sealed[0] ^= 0x01
+			return sealed
 		})
+	body, err := json.Marshal(generated)
+	if err != nil {
+		t.Fatalf("marshal the case sealed under another group context: %v", err)
+	}
+	return body
 }
 
 // treeKemSentinels is this family's refusals addressed by the identifier they are declared under.
@@ -2681,4 +2846,356 @@ func TestTreeKemVerdictReportsEveryClassItNames(t *testing.T) {
 				err, row.names)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the joints: each arm of a comparator held to a control that reaches it
+// ---------------------------------------------------------------------------
+
+// The refusals of each tree family that NO corpus case can express, with the argument for each.
+//
+// An exemption table and not a filter, for treeVectorFamiliesElsewhere's reason: whether a class
+// is reachable from a corpus is a judgement about that class and not a property its declaration
+// carries. What makes an exemption table safe is that it is held in BOTH directions -- the gate
+// below refuses an exemption for a sentinel no declaration of the family names, refuses a
+// sentinel that is both exempt and claimed by a control row, and refuses a sentinel that is
+// neither -- so the only way a class leaves the corpus tables is somebody writing down here why
+// no corpus case can put it there.
+var treeValidationClassElsewhere = map[string]string{
+	"errTreeValidationIncomplete": "an incomplete comparison is one whose comparator returned early or emitted its answers out of order, and no corpus case can ask for that; TestTreeValidationVerdictReportsEveryClassItNames drives it over evidence built by hand",
+}
+
+var treeKemClassElsewhere = map[string]string{
+	"errTreeKemIncomplete": "an incomplete comparison is one whose comparator returned early or emitted its answers out of order, and no corpus case can ask for that; TestTreeKemVerdictReportsEveryClassItNames drives it over evidence built by hand",
+	"errTreeKemParentHash": "the group context every ciphertext of a path is sealed under carries the tree hash of the MERGED tree, so any edit leaving that tree's section 7.9 chain broken also moves the hash the context is built over and the case is refused as a decrypt that did not open, a rung before the chain is judged; TestTreeKemVerdictReportsEveryClassItNames drives it over evidence built by hand",
+}
+
+// TestTheTreeComparatorsRefuseEveryClassTheyName holds each family's CORPUS control table to the
+// class its own comparator and verdict name, derived from their source.
+//
+// The gap this closes was measured twice. Family 10's wrong-group question and family 11's
+// per-decrypt wrong-context question could each be deleted outright with all 1181 tests of this
+// package still passing, because the sentinel each of them raises was named by no row of any
+// control table and reachable from no corpus case at all. The two verdict gates next door derive
+// the same class and satisfy it over evidence built BY HAND, which says the verdict reports the
+// class and says nothing whatever about the comparator ever producing it -- so the join between
+// the two halves was missing, and both arms were deletable in silence.
+//
+// The class is DERIVED from three declarations per family and not listed: the comparator, and
+// the two methods that judge what it produced. A sentinel any of them names owes either a row of
+// that family's corpus table or a written exemption, and the exemption tables above are held in
+// both directions, so neither an arm added without a control nor an exemption for an arm that no
+// longer exists can pass here.
+func TestTheTreeComparatorsRefuseEveryClassTheyName(t *testing.T) {
+	acceptedValidation, validationRows := treeValidationRefusals(t)
+	acceptedKem, kemRows := treeKemRefusals(t)
+	if len(acceptedValidation) == 0 || len(acceptedKem) == 0 {
+		t.Fatal("a control table answered no accepted case, so the rows it carries were never judged against anything")
+	}
+	for _, family := range []struct {
+		number int
+		// prefix is how this family spells its refusals, which is what the derivation filters
+		// the names of each declaration by.
+		prefix string
+		// comparator is the plain function that runs one case, and receiver the type whose
+		// verdict and incomplete judge what it produced.
+		comparator string
+		receiver   string
+		// sentinels resolves an identifier the source names back to the value a row carries.
+		sentinels map[string]error
+		exempt    map[string]string
+		rows      []comparatorRefusal
+	}{
+		{10, "errTreeValidation", "compareTreeValidationVector", "treeValidationComparison",
+			treeValidationSentinels, treeValidationClassElsewhere, validationRows},
+		{11, "errTreeKem", "compareTreeKemVector", "treeKemComparison",
+			treeKemSentinels, treeKemClassElsewhere, kemRows},
+	} {
+		mentioned := map[string]bool{}
+		collect := func(declaration *ast.FuncDecl) {
+			for name := range namesMentionedIn(declaration) {
+				if strings.HasPrefix(name, family.prefix) {
+					mentioned[name] = true
+				}
+			}
+		}
+		comparatorSource := theSourceDeclaring(t, "", family.comparator)
+		collect(comparatorSource.declarationOf(t, "", family.comparator))
+		verdictSource := theSourceDeclaring(t, family.receiver, "verdict")
+		for _, method := range []string{"verdict", "incomplete"} {
+			collect(verdictSource.declarationOf(t, family.receiver, method))
+		}
+		if len(mentioned) == 0 {
+			t.Fatalf("family %d: %s and %s's verdict name no %s sentinel at all, so the class below was derived from nothing",
+				family.number, family.comparator, family.receiver, family.prefix)
+		}
+		if len(family.rows) == 0 {
+			t.Fatalf("family %d: the corpus control table is empty, so every class below would be reported unclaimed for one reason", family.number)
+		}
+		claimed := map[string]bool{}
+		for _, row := range family.rows {
+			if row.want == nil {
+				t.Fatalf("family %d: the row %q names no sentinel, so any refusal at all would satisfy it", family.number, row.name)
+			}
+			found := ""
+			for name, sentinel := range family.sentinels {
+				if sentinel == row.want {
+					found = name
+				}
+			}
+			if found == "" {
+				t.Fatalf("family %d: the row %q owes %v and this file's sentinel table resolves no identifier to it",
+					family.number, row.name, row.want)
+			}
+			if !mentioned[found] {
+				t.Errorf("family %d: the row %q owes %s and neither %s nor %s's verdict names that class, so the row is aimed at an arm that no longer exists",
+					family.number, row.name, found, family.comparator, family.receiver)
+			}
+			claimed[found] = true
+		}
+		for _, name := range slices.Sorted(maps.Keys(family.exempt)) {
+			if family.exempt[name] == "" {
+				t.Errorf("family %d: %s is exempted from the corpus table with no argument written down", family.number, name)
+			}
+			if !mentioned[name] {
+				t.Errorf("family %d: %s is exempted from the corpus table and no declaration of this family names it", family.number, name)
+			}
+			if claimed[name] {
+				t.Errorf("family %d: %s is exempted from the corpus table as unreachable and a row of that table is refused as it; one of the two is wrong",
+					family.number, name)
+			}
+		}
+		for _, name := range slices.Sorted(maps.Keys(mentioned)) {
+			if _, known := family.sentinels[name]; !known {
+				t.Errorf("family %d: %s is a class this family names and its sentinel table resolves no value for it", family.number, name)
+				continue
+			}
+			if claimed[name] {
+				continue
+			}
+			if _, exempt := family.exempt[name]; exempt {
+				continue
+			}
+			t.Errorf("family %d: %s is a class %s or %s's verdict names, no row of the corpus control table is refused as it, and no exemption says why no corpus case can express it; an arm nothing reaches can be deleted with this package green",
+				family.number, name, family.comparator, family.receiver)
+		}
+		t.Logf("family %d: %d classes derived from %s and %s's verdict, %d claimed by corpus control rows, %d exempted as unreachable from a corpus",
+			family.number, len(mentioned), family.comparator, family.receiver, len(claimed), len(family.exempt))
+	}
+}
+
+// theCallsReachableFrom is every function name reached from one declaration by CALLS alone,
+// following a call into a function the same set declares.
+//
+// Calls alone, and that is the whole difference from reachableNames in key_schedule_kat_test.go,
+// which collects every identifier a body names in ANY position because the question it answers
+// -- does this reach the code under test -- is one that over-approximating costs nothing on. The
+// question here is the opposite shape and a mention is exactly what has to fail it: a call
+// replaced by a discard of the same identifier still names it, so the wider walk would go on
+// reporting a derivation as reached over a generator that no longer runs it. That edit was
+// measured on this file's generator and left the whole package green.
+func theCallsReachableFrom(t *testing.T, declared map[string]*ast.FuncDecl, root string) map[string]bool {
+	t.Helper()
+	start, ok := declared[root]
+	if !ok {
+		t.Fatalf("%s is not declared in the files scanned, so its call closure would be empty", root)
+	}
+	reached := map[string]bool{}
+	pending := []*ast.FuncDecl{start}
+	visited := map[string]bool{root: true}
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		ast.Inspect(current, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			name := ""
+			switch callee := call.Fun.(type) {
+			case *ast.Ident:
+				name = callee.Name
+			case *ast.SelectorExpr:
+				name = callee.Sel.Name
+			}
+			if name == "" {
+				return true
+			}
+			reached[name] = true
+			if next, isLocal := declared[name]; isLocal && !visited[name] {
+				visited[name] = true
+				pending = append(pending, next)
+			}
+			return true
+		})
+	}
+	return reached
+}
+
+// TestTheTreeKemGeneratorReachesAnIndependentDerivation is the other half of the claim family
+// 11's generate direction makes about itself.
+//
+// TestTheGenerateDirectionSharesNoCodePathWithVerify holds every function whose name claims
+// independence to touching no production code, which says the derivation IS independent. Nothing
+// said the generator runs one. Measured: replacing the single call to
+// assertGeneratedCommitSecretIsTheRungPastTheRoot with a discard of its name left all 1181 tests
+// passing, because the generator's own answers are then compared only against a receiver in the
+// same package -- and a sender and a receiver that made the same section 8.1 transposition agree
+// with each other perfectly.
+//
+// The class of derivations is DERIVED, the same way that gate derives it: every function these
+// test files declare whose name claims independence. A list would name the ones that existed
+// when it was written.
+func TestTheTreeKemGeneratorReachesAnIndependentDerivation(t *testing.T) {
+	control := func(source string) map[string]*ast.FuncDecl {
+		fileSet := token.NewFileSet()
+		parsed, err := parser.ParseFile(fileSet, "control_test.go", source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse the control: %v", err)
+		}
+		return testFileFunctions(map[string]*ast.File{"control_test.go": parsed})
+	}
+	// the walk must separate a CALL from a MENTION, or the gate below is satisfied by the very
+	// edit it exists to refuse.
+	mentions := control("package control\n\nfunc independentControl() {}\n\nfunc generateControl() { _ = independentControl }\n")
+	if theCallsReachableFrom(t, mentions, "generateControl")["independentControl"] {
+		t.Fatal("the walk reports a derivation a control only MENTIONS, so it would pass over a generator whose call was replaced by a discard")
+	}
+	calls := control("package control\n\nfunc independentControl() {}\n\nfunc generateControl() { independentControl() }\n")
+	if !theCallsReachableFrom(t, calls, "generateControl")["independentControl"] {
+		t.Fatal("the walk does not report a derivation a control CALLS, so the gate below would be reporting on nothing")
+	}
+	// and it must follow a call through a hop, because the real generator reaches its derivation
+	// through the assertion that owns it rather than directly.
+	hops := control("package control\n\nfunc independentControl() {}\n\nfunc assertControl() { independentControl() }\n\nfunc generateControl() { assertControl() }\n")
+	if !theCallsReachableFrom(t, hops, "generateControl")["independentControl"] {
+		t.Fatal("the walk does not follow a call through a second function, so the gate below reads one hop of a generator that takes two")
+	}
+
+	declared := testFileFunctions(packageTestFiles(t))
+	roots := []string{}
+	for name := range declared {
+		if strings.HasPrefix(name, "independent") {
+			roots = append(roots, name)
+		}
+	}
+	slices.Sort(roots)
+	if len(roots) == 0 {
+		t.Fatalf("no function this package's %d declared test functions name claims independence, so the derivation below is over an empty class", len(declared))
+	}
+	// the generator the registry installs has to reach the case builder, or what is held below
+	// is a function nothing runs.
+	if !theCallsReachableFrom(t, declared, "generateTreeKemVectors")["generateOneTreeKemCase"] {
+		t.Fatal("generateTreeKemVectors does not call generateOneTreeKemCase, so the derivation held below is not on the registered generator's path")
+	}
+	reached := theCallsReachableFrom(t, declared, "generateOneTreeKemCase")
+	found := []string{}
+	for _, root := range roots {
+		if reached[root] {
+			found = append(found, root)
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("generateOneTreeKemCase calls none of the %d independent derivations these test files declare (%v); family 11's generate direction then answers with this package's own code on both sides, and a sender and a receiver wrong in the same direction agree perfectly",
+			len(roots), roots)
+	}
+	t.Logf("generateOneTreeKemCase reaches %v of the %d independent derivations declared across this package's test files", found, len(roots))
+}
+
+// aPublishedLeafNode is the first occupied leaf of the first tree-validation case at a suite this
+// package registers.
+//
+// The corpus's own leaf and not one built here, because what the gate below asks of it is
+// whether production's preimage MOVES, and a leaf assembled by this test would answer that
+// question about a structure no other implementation ever signed.
+func aPublishedLeafNode(t *testing.T) *LeafNode {
+	t.Helper()
+	for _, raw := range LoadVectorFile(t, treeVectorFile(t, 10)) {
+		vector := treeValidationVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("parse a tree-validation case: %v", err)
+		}
+		if _, ok := implementedSuite(vector.CipherSuite); !ok {
+			continue
+		}
+		tree, err := UnmarshalRatchetTree(MustHex(t, vector.Tree))
+		if err != nil {
+			t.Fatalf("decode a tree-validation case's ratchet tree: %v", err)
+		}
+		for x := uint32(0); x < uint32(tree.LeafWidth()); x += 1 {
+			if leaf := tree.Leaf(LeafIndex(x)); leaf != nil {
+				return leaf
+			}
+		}
+	}
+	t.Fatal("no published tree-validation case at a registered suite carries an occupied leaf")
+	return nil
+}
+
+// TestLeafNodeSourceBindsItsPositionIsWhatSignatureContentActuallyBinds derives the predicate's
+// class from production instead of holding it to a second reading of the RFC.
+//
+// leafNodeSourceBindsItsPosition is a hand written second spelling of section 7.2's select, and
+// the corpus pins it in one direction only. Widening it IS caught: add key_package and
+// TestVectorTreeValidation refuses a leaf on the spot. Narrowing it is not -- measured, dropping
+// its update arm left the whole package green, because every one of the 288 context bound leaves
+// those 28 trees publish is commit-source and treeValidationKatBound did not move. So the pinned
+// count says the wrong-group control ran over something and says nothing about the predicate
+// that chose what it ran over.
+//
+// The class is therefore asked of signatureContent itself, over every octet a source can be
+// rather than the three the RFC names today: a source binds its position when the preimage moves
+// as the group id and the leaf index move, and a source production refuses outright has no
+// preimage at all and binds nothing. Both halves of the select are required to be non-empty, so
+// a signatureContent that answered one arm for everything fails here rather than agreeing with
+// whatever the predicate says.
+func TestLeafNodeSourceBindsItsPositionIsWhatSignatureContentActuallyBinds(t *testing.T) {
+	leaf := aPublishedLeafNode(t)
+	here := []byte{0x01, 0x02, 0x03, 0x04}
+	elsewhere := []byte{0x05, 0x06, 0x07, 0x08}
+	bound, unbound, refused := []int{}, []int{}, []int{}
+	for source := 0; source <= 0xff; source += 1 {
+		probe := *leaf
+		probe.LeafNodeSource = LeafNodeSource(source)
+		signed, err := probe.signatureContent(here, LeafIndex(0))
+		if err != nil {
+			refused = append(refused, source)
+			if leafNodeSourceBindsItsPosition(LeafNodeSource(source)) {
+				t.Errorf("signatureContent refuses source %d outright, so it has no LeafNodeTBS to bind anything, and the predicate calls it context bound",
+					source)
+			}
+			continue
+		}
+		atAnotherGroup, err := probe.signatureContent(elsewhere, LeafIndex(0))
+		if err != nil {
+			t.Fatalf("source %d: signatureContent answered for one group id and refused another: %v", source, err)
+		}
+		atAnotherIndex, err := probe.signatureContent(here, LeafIndex(1))
+		if err != nil {
+			t.Fatalf("source %d: signatureContent answered at one leaf index and refused another: %v", source, err)
+		}
+		movesWithGroupId := !bytes.Equal(signed, atAnotherGroup)
+		movesWithLeafIndex := !bytes.Equal(signed, atAnotherIndex)
+		// both or neither, because section 7.2's select puts the group id and the leaf index in
+		// one arm: a preimage carrying one of them is a structure the RFC does not describe.
+		if movesWithGroupId != movesWithLeafIndex {
+			t.Errorf("source %d: the preimage moves with the group id (%v) and with the leaf index (%v), and section 7.2 puts both in one arm of the select",
+				source, movesWithGroupId, movesWithLeafIndex)
+		}
+		if movesWithGroupId {
+			bound = append(bound, source)
+		} else {
+			unbound = append(unbound, source)
+		}
+		if got := leafNodeSourceBindsItsPosition(LeafNodeSource(source)); got != movesWithGroupId {
+			t.Errorf("signatureContent binds the position for source %d (%v) and leafNodeSourceBindsItsPosition answers %v",
+				source, movesWithGroupId, got)
+		}
+	}
+	if len(bound) == 0 || len(unbound) == 0 || len(refused) == 0 {
+		t.Fatalf("the derivation found %d sources binding their position, %d not binding it and %d production refuses; a predicate held against a class with an empty half is held against nothing",
+			len(bound), len(unbound), len(refused))
+	}
+	t.Logf("signatureContent binds the position for source(s) %v, ignores it for %v, and refuses %d of the 256 octets a source can be",
+		bound, unbound, len(refused))
 }
