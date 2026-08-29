@@ -5422,3 +5422,240 @@ func TestEveryPublishedUpdatePathDecryptsToItsPublishedSecrets(t *testing.T) {
 	t.Logf("%d published paths, %d published (leaf, path secret, commit secret) triples reproduced, %d of them entering above the receiver's own leaf",
 		paths, decrypts, deep)
 }
+
+// parentHashEqualityAloneAccepts is section 7.9.2 stated the way a one-condition reading of it
+// states it: every non-blank parent has SOME descendant whose parent_hash field is the parent hash
+// of that node taken over the other child.
+//
+// It is the whole of the second condition and none of the rest -- no "D is in the resolution of C
+// with only P's unmerged leaves beside it", no "exactly one". It exists so the test below can say
+// what a merge that re-derived the rule from that reading would accept, rather than leaving the
+// difference as a sentence in a comment. Nothing in this package calls it and nothing should: it
+// is a MODEL of the weaker rule, kept next to the fixture that separates it from the real one.
+func parentHashEqualityAloneAccepts(t *testing.T, crypto CryptoProvider, tree *RatchetTree) bool {
+	t.Helper()
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		p := NodeIndex(x)
+		if tree.ParentAt(p) == nil {
+			continue
+		}
+		left, leftOk := leftOf(p)
+		right, rightOk := rightOf(p)
+		if !leftOk || !rightOk {
+			t.Fatalf("node %d is an odd index with no children", p)
+		}
+		claimed := false
+		for _, arm := range [2][2]NodeIndex{{left, right}, {right, left}} {
+			hash, err := tree.ParentHash(crypto, p, arm[1])
+			if err != nil {
+				t.Fatalf("ParentHash(%d, %d): %v", p, arm[1], err)
+			}
+			for _, node := range tree.Resolution(arm[0]) {
+				field, carries := nodeParentHashField(tree.Get(node))
+				if carries && bytes.Equal(field, hash) {
+					claimed = true
+				}
+			}
+		}
+		if !claimed {
+			return false
+		}
+	}
+	return true
+}
+
+// TestMergeUpdatePathHoldsSection792sThirdConditionAndNotOnlyItsParentHashEquality is the fixture
+// that separates the rule the merge CALLS from the rule a one-condition reading of section 7.9.2
+// would have it restate.
+//
+// The tree is one add that was never recorded. Leaf 0 committed node 3 at an epoch when leaf 1's
+// slot was empty, and leaf 1 was then put into the tree WITHOUT being added to node 3's
+// unmerged_leaves. Everything a parent_hash equality can see is still right: leaf 0's signed field
+// is exactly the parent hash of node 3 over node 5, so the chain from leaf 0 to node 3 verifies
+// link for link, and parentHashEqualityAloneAccepts above says so out loud for both halves of this
+// fixture. What has changed is the RESOLUTION: leaf 1 now stands in the resolution of node 1
+// beside leaf 0, so every secret any later commit seals to that resolution reaches a key node 3's
+// chain never accounted for.
+//
+// Section 7.9.2's third condition is the rule that refuses it, and it is the condition the plan's
+// text omits. The two halves of the loop are the same tree with and without the add recorded, so
+// what separates them is the unmerged_leaves vector and nothing else: with leaf 1 recorded the
+// resolution of node 1 with the claimant removed is exactly node 3's unmerged leaves under node 1
+// and the merge proceeds, and without it the same commit over the same shape is refused. A merge
+// that restated the second condition alone accepts both, which is what the assertion above the
+// refusal says.
+func TestMergeUpdatePathHoldsSection792sThirdConditionAndNotOnlyItsParentHashEquality(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	for _, recorded := range []bool{true, false} {
+		tree, members := newTestTree(t, crypto, 8)
+		// the node whose key the forger holds. It sits above leaves 0 to 3 and, being non-blank,
+		// IS the resolution of the copath child of the root for every commit from the other half
+		// of the tree -- which is what makes this worth refusing rather than merely irregular.
+		forgedPriv, forgedPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+		if err != nil {
+			t.Fatalf("DeriveKeyPair: %v", err)
+		}
+		unmerged := []LeafIndex{}
+		if recorded {
+			unmerged = []LeafIndex{1}
+		}
+		if err := tree.SetParent(3, &ParentNode{
+			EncryptionKey:  forgedPub,
+			ParentHash:     []byte{},
+			UnmergedLeaves: unmerged,
+		}); err != nil {
+			t.Fatalf("SetParent(3): %v", err)
+		}
+		// leaf 0 is the claimant, and its claim is HONEST: this is the parent hash of node 3 over
+		// node 5, which is what a member that had committed node 3 would have signed.
+		claim, err := tree.ParentHash(crypto, 3, 5)
+		if err != nil {
+			t.Fatalf("ParentHash(3, 5): %v", err)
+		}
+		claimant := tree.Leaf(members[0].LeafIndex).Clone()
+		claimant.LeafNodeSource = LeafNodeSourceCommit
+		claimant.ParentHash = claim
+		if err := claimant.Sign(crypto, members[0].SignaturePriv, testGroupId(), members[0].LeafIndex); err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		if err := tree.SetLeaf(members[0].LeafIndex, claimant); err != nil {
+			t.Fatalf("SetLeaf: %v", err)
+		}
+		// the one-condition reading accepts BOTH halves, which is the whole point of the fixture:
+		// the difference between them is invisible to it.
+		if !parentHashEqualityAloneAccepts(t, crypto, tree) {
+			t.Fatalf("recorded=%v: the parent hash equality alone already refuses this tree, so it cannot separate the two rules",
+				recorded)
+		}
+
+		// an honest commit from the other half of the tree, which is what carries the payoff.
+		_, path, plan, groupContext := createAndEncryptPath(t, crypto, tree, members[4], nil)
+		steps, err := tree.filteredPathSteps(members[4].LeafIndex)
+		if err != nil {
+			t.Fatalf("filteredPathSteps: %v", err)
+		}
+		targets, err := tree.EncryptionTargets(members[4].LeafIndex, nil)
+		if err != nil {
+			t.Fatalf("EncryptionTargets: %v", err)
+		}
+		sealed := false
+		for i, step := range steps {
+			if step.CopathChild != 3 {
+				continue
+			}
+			for j, y := range targets[i] {
+				if y != 3 {
+					continue
+				}
+				ct := path.Nodes[i].EncryptedPathSecret[j]
+				opened, err := OpenWithLabel(crypto, forgedPriv, updatePathNodeLabel, groupContext, &ct)
+				if err == nil && bytes.Equal(opened, plan.PathSecrets[i]) {
+					sealed = true
+				}
+			}
+		}
+		if !sealed {
+			t.Fatalf("recorded=%v: the forged node did not receive the commit's path secret, so this fixture is not the attack the third condition is about",
+				recorded)
+		}
+
+		receiver := tree.Clone()
+		if recorded {
+			// the add is recorded, condition 3 holds, and the commit merges.
+			if err := receiver.MergeUpdatePath(crypto, members[4].LeafIndex, path); err != nil {
+				t.Fatalf("the tree whose add IS recorded was refused: %v", err)
+			}
+			continue
+		}
+		mergeMustNotTouchTheTree(t, crypto, receiver, members[4].LeafIndex, path,
+			ErrParentHashMismatch,
+			"a commit over a tree where a leaf entered the resolution of node 1 without node 3 recording it")
+	}
+}
+
+// TestMergeUpdatePathBlanksTheWholeDirectPathAndNotOnlyTheFilteredOne is the difference between
+// the two paths, which is invisible over a full tree.
+//
+// A filtered direct path drops every node whose copath child resolves to nothing, and over the
+// complete trees the rest of this file uses nothing is ever dropped -- so a merge that refilled the
+// filtered path without blanking the direct one reproduces the sender's tree exactly, and every
+// other test here passes. The shape that separates them needs blank leaves under a copath child:
+// in a five member group leaf 4's copath children at nodes 9 and 11 cover leaves 5, 6 and 7, all
+// empty, so both nodes are dropped from the path the commit publishes.
+//
+// They are non-blank BEFORE the commit here, which is what makes the omission observable at all: a
+// node dropped from a filtered path carries a key from an earlier epoch that this commit does not
+// replace and must not leave standing, because the sender blanked it and the two trees have to be
+// the same tree. What a merge that skipped the blanking leaves behind is a receiver whose tree hash
+// is not the group's -- and, since nothing claims those stale nodes any more, a tree section 7.9.2
+// also refuses.
+func TestMergeUpdatePathBlanksTheWholeDirectPathAndNotOnlyTheFilteredOne(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 5)
+	// the previous epoch's keys at the two nodes this commit will drop.
+	stale := []NodeIndex{9, 11}
+	for _, x := range stale {
+		_, pub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+		if err != nil {
+			t.Fatalf("DeriveKeyPair: %v", err)
+		}
+		if err := tree.SetParent(x, &ParentNode{EncryptionKey: pub, ParentHash: []byte{}}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	// the fixture's premise, derived from the tree math rather than written down: the sender's
+	// filtered path is strictly shorter than its direct path, and the nodes it is short by are
+	// exactly the ones carrying a stale key.
+	filtered, err := tree.FilteredDirectPath(members[4].LeafIndex)
+	if err != nil {
+		t.Fatalf("FilteredDirectPath: %v", err)
+	}
+	direct, err := directPathOf(members[4].LeafIndex.NodeIndex(), tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf: %v", err)
+	}
+	dropped := []NodeIndex{}
+	for _, x := range direct {
+		if !slices.Contains(filtered, x) {
+			dropped = append(dropped, x)
+		}
+	}
+	if !equalNodeIndices(dropped, stale) {
+		t.Fatalf("this commit drops %v of the direct path %v, and the fixture put stale keys at %v",
+			dropped, direct, stale)
+	}
+
+	senderTree, path, _, _ := createAndEncryptPath(t, crypto, tree, members[4], nil)
+	// what the sender did with those nodes, read off task 18 rather than asserted here, so this
+	// test states "the receiver ends up where the sender did" and not a second opinion about what
+	// blanking means.
+	for _, x := range stale {
+		if senderTree.ParentAt(x) != nil {
+			t.Fatalf("the sender left node %d occupied, so the expectation below is not task 18's", x)
+		}
+	}
+	receiver := tree.Clone()
+	if err := receiver.MergeUpdatePath(crypto, members[4].LeafIndex, path); err != nil {
+		t.Fatalf("MergeUpdatePath: %v", err)
+	}
+	for _, x := range stale {
+		if receiver.ParentAt(x) != nil {
+			t.Fatalf("node %d was dropped from the filtered path and still carries the previous epoch's key after the merge", x)
+		}
+	}
+	got, want := treeSnapshot(receiver), treeSnapshot(senderTree)
+	if len(got) != len(want) {
+		t.Fatalf("the merged tree holds %d nodes and the sender's holds %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("node %d after the merge is\n %s\nand the sender has\n %s", i, got[i], want[i])
+		}
+	}
+}
