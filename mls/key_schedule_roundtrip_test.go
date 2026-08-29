@@ -283,6 +283,17 @@ type seedCodec struct {
 	// coverage gates derive their class from: the registries reachable on the wire and the
 	// fields the corpus has to vary both come off this type rather than off a list.
 	structure      func() any
+	// project, when non-nil, answers the exported values the derived walks read in place of the
+	// decoded structure itself.
+	//
+	// It exists for one structure and it is not a general escape hatch. RatchetTree's node array is
+	// UNEXPORTED, and every walk below fails rather than skips on a field it cannot read -- on
+	// purpose, since a field a comparison cannot read is one it reports equal whatever it holds --
+	// so without this the tree codec would fail every gate for a reason that has nothing to do with
+	// its corpus. What a projection hands over is what the container already publishes through its
+	// own accessor, one element per node, and nothing else; it is a READING of the value and never a
+	// second codec, which is why encode and decode still go through the container's own pair.
+	project        func(value any) []any
 	values         func(t *testing.T) []any
 	decode         func(bs []byte) (any, error)
 	encode         func(value any) ([]byte, error)
@@ -290,7 +301,15 @@ type seedCodec struct {
 	describe       func(value any) string
 }
 
+// seedCodecs is every structure this package states the corpus properties over. p4's two are here
+// and p5's two are in tree_roundtrip_test.go, joined rather than kept in a second table: each
+// property below is written once over the table, and a second table is a second place for the same
+// property to be stated more weakly.
 func seedCodecs() []seedCodec {
+	return append(keyScheduleSeedCodecs(), treeSeedCodecs()...)
+}
+
+func keyScheduleSeedCodecs() []seedCodec {
 	return []seedCodec{
 		{
 			target:    groupContextSeedTarget,
@@ -465,6 +484,175 @@ func seedValuesAgree(t *testing.T, path string, left reflect.Value, right reflec
 }
 
 // ---------------------------------------------------------------------------
+// reading a value through its codec's projection
+// ---------------------------------------------------------------------------
+
+// seedCodecParts is what a walk over one decoded value reads: the value itself, or the codec's
+// projection of it.
+func seedCodecParts(codec seedCodec, value any) []any {
+	if codec.project == nil {
+		return []any{value}
+	}
+	return codec.project(value)
+}
+
+// seedCodecValuesAgree compares an original value with the decode of its encoding, through the
+// projection where the codec has one.
+//
+// The projection's LENGTH is compared before its elements, and for the ratchet tree that comparison
+// is load bearing rather than defensive: the node width is the one property of that structure the
+// wire does not carry explicitly -- readNodeArray derives it by extending the entry count to the
+// next complete tree -- so a decode that lost or gained a node is a tree with a different root, a
+// different direct path for every leaf and a different tree hash, and an elementwise comparison
+// over the entries that survived would report the two equal.
+func seedCodecValuesAgree(t *testing.T, codec seedCodec, left any, right any) bool {
+	t.Helper()
+	if codec.project == nil {
+		return seedValuesAgree(t, codec.target, reflect.ValueOf(left), reflect.ValueOf(right))
+	}
+	leftParts, rightParts := codec.project(left), codec.project(right)
+	if len(leftParts) == 0 {
+		t.Fatalf("%s: the projection of %s is empty, so this comparison walked nothing",
+			codec.target, codec.describe(left))
+	}
+	if len(leftParts) != len(rightParts) {
+		return false
+	}
+	for index := range leftParts {
+		at := fmt.Sprintf("%s[%d]", codec.target, index)
+		if !seedValuesAgree(t, at, reflect.ValueOf(leftParts[index]), reflect.ValueOf(rightParts[index])) {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// asking the codec whether a field CAN vary
+// ---------------------------------------------------------------------------
+
+// seedFieldIsPinnedByTheCodec answers whether a field the corpus never varies is one the CODEC will
+// not let it vary, and it is what keeps the variation gate below from needing a table of
+// exceptions.
+//
+// The distinction is real rather than a loophole. That gate's claim about a single valued field is
+// that the codec could drop it from BOTH halves without moving one committed byte -- true of a
+// field the generator never varied, and false of one the codec pins to a constant.
+// Credential.CredentialType is the second kind: both halves of credential.go refuse anything but
+// CredentialTypeBasic, so no decodable seed can carry another value and no generator can produce
+// one. Dropping that field WOULD move every committed byte, and the corpus comparison says so.
+//
+// DERIVED by running the codec rather than by naming the field, which is rule 5 and is the whole
+// point: a field that stops being pinned -- a second credential type admitted to the v1 profile,
+// say -- rejoins the gate in the commit that admits it, with nobody having to remember to delete a
+// name from a list. The probe is to decode one committed seed, move that one field to a different
+// value, and re-encode: if the encoder or the decoder refuses the result, the codec admits no other
+// value there. If both accept it, the field is carried on the wire and the corpus is simply not
+// varying it, which is exactly what the gate says.
+//
+// Conservative in the one direction that matters: a field this cannot move at all -- an unsupported
+// kind, or one that is nil in every seed -- is reported NOT pinned, so the gate's error stands and
+// somebody has to look at it.
+func seedFieldIsPinnedByTheCodec(t *testing.T, codec seedCodec, fieldPath string) (bool, string) {
+	t.Helper()
+	names, onDisk := readSeedCorpus(t, codec.target)
+	for _, name := range names {
+		value, err := codec.decode(onDisk[name])
+		if err != nil {
+			continue
+		}
+		moved := false
+		for _, part := range seedCodecParts(codec, value) {
+			if seedMoveFieldAt(reflect.ValueOf(part), codec.target, fieldPath) {
+				moved = true
+				break
+			}
+		}
+		if !moved {
+			continue
+		}
+		encoded, err := codec.encode(value)
+		if err != nil {
+			return true, fmt.Sprintf("the encoder refuses any other value: %v", err)
+		}
+		if _, err := codec.decode(encoded); err != nil {
+			return true, fmt.Sprintf("the decoder refuses any other value: %v", err)
+		}
+		return false, ""
+	}
+	return false, ""
+}
+
+// seedMoveFieldAt walks a value to one field path and moves the value it finds there, answering
+// whether it moved anything.
+//
+// The walk mirrors seedObservations.observe step for step, including how a path is spelled, because
+// the path it is handed came out of that walk: a walk that named a slice element ".Nodes[0]" while
+// observe named it ".Nodes[]" would find nothing, report every field unmovable, and
+// seedFieldIsPinnedByTheCodec would read that as "not pinned" for every field in the package.
+func seedMoveFieldAt(value reflect.Value, at string, want string) bool {
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if value.IsNil() {
+			return false
+		}
+		return seedMoveFieldAt(value.Elem(), at, want)
+	case reflect.Struct:
+		for index := 0; index < value.NumField(); index++ {
+			field := value.Type().Field(index)
+			if !field.IsExported() {
+				continue
+			}
+			if seedMoveFieldAt(value.Field(index), at+"."+field.Name, want) {
+				return true
+			}
+		}
+		return false
+	case reflect.Slice:
+		if at == want {
+			return seedMoveValue(value)
+		}
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return false
+		}
+		for index := 0; index < value.Len(); index++ {
+			if seedMoveFieldAt(value.Index(index), at+"[]", want) {
+				return true
+			}
+		}
+		return false
+	default:
+		if at == want {
+			return seedMoveValue(value)
+		}
+		return false
+	}
+}
+
+// seedMoveValue changes one value to a different one of the same type. An unsupported kind answers
+// false rather than being coerced, so the probe above says "no answer" instead of "pinned".
+func seedMoveValue(value reflect.Value) bool {
+	if !value.CanSet() {
+		return false
+	}
+	switch value.Kind() {
+	case reflect.Bool:
+		value.SetBool(!value.Bool())
+		return true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		value.SetUint(value.Uint() + 1)
+		return true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		value.SetInt(value.Int() + 1)
+		return true
+	case reflect.Slice:
+		value.Set(reflect.Append(value, reflect.Zero(value.Type().Elem())))
+		return true
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
 // the properties
 // ---------------------------------------------------------------------------
 
@@ -608,7 +796,7 @@ func TestEveryGeneratedSeedValueIsRecoveredByDecodingItsEncoding(t *testing.T) {
 				continue
 			}
 			compared++
-			if !seedValuesAgree(t, codec.target, reflect.ValueOf(value), reflect.ValueOf(parsed)) {
+			if !seedCodecValuesAgree(t, codec, value, parsed) {
 				t.Errorf("%s: value %d %s decoded as %s", codec.target, index,
 					codec.describe(value), codec.describe(parsed))
 			}
@@ -825,7 +1013,9 @@ func observeCommittedCorpus(t *testing.T, codec seedCodec) ([]string, *seedObser
 		if err != nil {
 			t.Fatalf("%s/%s: the committed seed did not decode, so nothing below observed it: %v", codec.target, name, err)
 		}
-		observations.observe(t, codec.target, reflect.ValueOf(parsed))
+		for _, part := range seedCodecParts(codec, parsed) {
+			observations.observe(t, codec.target, reflect.ValueOf(part))
+		}
 	}
 	if len(observations.fieldValues) == 0 {
 		t.Fatalf("%s: the walk over %d committed seeds recorded no field at all", codec.target, len(names))
@@ -928,6 +1118,7 @@ func TestEveryFieldOfBothStructuresVariesAcrossTheCommittedCorpus(t *testing.T) 
 				codec.target, reflect.TypeOf(codec.structure()))
 		}
 		varying := 0
+		pinned := []string{}
 		for _, fieldPath := range fieldPaths {
 			values, reached := observations.fieldValues[fieldPath]
 			if !reached {
@@ -936,14 +1127,20 @@ func TestEveryFieldOfBothStructuresVariesAcrossTheCommittedCorpus(t *testing.T) 
 				continue
 			}
 			if len(values) < 2 {
-				t.Errorf("%s: all %d committed seeds decode to the same %s (%s). a field the corpus never varies is a field the codec could drop from BOTH halves without moving one committed byte, which is the mutation this corpus exists to catch; give it an axis in the generator and regenerate with %s=1",
+				if isPinned, why := seedFieldIsPinnedByTheCodec(t, codec, fieldPath); isPinned {
+					// not a gap: this codec admits no other value here, so the corpus not varying
+					// it is a property of the format rather than a thinness in the generator.
+					pinned = append(pinned, fmt.Sprintf("%s (%s)", fieldPath, why))
+					continue
+				}
+				t.Errorf("%s: all %d committed seeds decode to the same %s (%s), and the codec accepts other values there. a field the corpus never varies is a field the codec could drop from BOTH halves without moving one committed byte, which is the mutation this corpus exists to catch; give it an axis in the generator and regenerate with %s=1",
 					codec.target, len(names), fieldPath, describeSoleSeedValue(values), seedCorpusWriteEnv)
 				continue
 			}
 			varying++
 		}
-		t.Logf("%s: %d of %d derived fields carry at least two distinct values across %d seeds",
-			codec.target, varying, len(fieldPaths), len(names))
+		t.Logf("%s: %d of %d derived fields carry at least two distinct values across %d seeds; %d are pinned to one value by the codec itself %v",
+			codec.target, varying, len(fieldPaths), len(names), len(pinned), pinned)
 	}
 }
 
