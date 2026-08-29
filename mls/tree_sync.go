@@ -596,11 +596,50 @@ func (self *RatchetTree) ValidateAgainstContext(ctx *TreeValidationContext, gc *
 // then, so no key is exempt and every key in it must be new -- including one copied from the
 // leaf the stranger is pretending to be.
 //
+// THE EXEMPTION IS ONE KEY AT ONE POSITION, and both halves of that are load bearing.
+//
+// The key is the committer's outgoing leaf key, and the leaf it sits at is located by NODE
+// index: leaf L lives at node 2L, so an exemption comparing against L raw points at somebody
+// else's node for every committer except leaf 0 -- exempting a leaf whose key was NOT replaced
+// while refusing the honest commit of the leaf that was. A fixture whose committer is always the
+// group's first member cannot tell the two apart, because for leaf 0 the two numbers are equal,
+// and this function shipped with that blind spot for exactly that reason.
+// TestUpdatePathKeyUniquenessExemptsTheCommittersLeafAndNoOther commits from every occupied leaf
+// of its tree rather than from one.
+//
+// The position is the path's LEAF NODE, which is the only position that replaces anything. A
+// path NODE is a parent position: it installs nothing at the committer's leaf, so the outgoing
+// key appearing there is a retired key republished somewhere it never lived, and it is refused
+// like any other collision. That is why the exemption is written at the COMPARISON rather than
+// as a hole in the tree sweep -- a hole in the sweep takes the key out of the set entirely, so
+// it silently exempts the path's other len(Nodes) positions too, and no errors.Is assertion
+// anywhere can see the difference. TestUpdatePathKeyUniquenessExemptsOnlyThePathsLeafPosition is
+// the half that names it.
+//
 // Both halves are sweeps over a SET, in the shape this file's header argues for: the tree side
 // reads every occupied position, leaf and parent alike, and the path side reads every node it
 // publishes rather than its first. A version of either bounded to the first element accepts a
 // path whose only stolen key sits anywhere else, which is the defect this project has shipped
 // four times.
+//
+// The tree side reading PARENTS is wider than Spec A's own wording for these two rows, which say
+// "unique among proposals and members", and the widening is deliberate: a path key that is
+// already some parent's is the one-private-key-two-positions defect the paragraph above
+// describes, and refusing it costs an honest commit nothing, since every key a path publishes
+// was derived from a fresh path secret. The PROPOSALS axis is not visible from in here at all --
+// this function sees one tree and no proposal list. It is the CALLER that puts the proposals in
+// range, by handing over the post-proposal tree, which is what the group lifecycle plan's call
+// site does. So the class stated here is "every key in the tree it was given", and the caller's
+// choice of tree is what makes that the spec's class.
+//
+// THREE SENTINELS come out of here and they are deliberately not one: errDuplicateEncryptionKey
+// for a collision, ErrTreeMalformed for a missing tree, ErrNodeTypeMismatch for an occupied node
+// carrying no body. The last two are faults of the TREE and the first is a fault of the PATH, so
+// a caller funnelling this into a ValSem-named error must wrap the inner error with %w and not
+// %v: %v flattens the chain, and then a malformed tree is reported to the group as a commit that
+// duplicated an encryption key, which names the wrong party for a fault that is not the
+// committer's. TestUpdatePathKeyUniquenessKeepsItsRefusalsDistinct derives the set of sentinels
+// from this function's own body and holds them apart.
 func CheckUpdatePathKeyUniqueness(tree *RatchetTree, path *UpdatePath) error {
 	// refused rather than dereferenced, so a missing argument cannot read as "nothing collided".
 	// The tree is what the path is judged AGAINST, and a nil one has not passed this check, it
@@ -615,8 +654,12 @@ func CheckUpdatePathKeyUniqueness(tree *RatchetTree, path *UpdatePath) error {
 	}
 	replaced, isMember := tree.FindLeafBySignatureKey(path.LeafNode.SignatureKey)
 	// keyed by the key BYTES rather than by an index, which is validateKeyUniqueness' spelling
-	// and makes this a sweep over every pair without being written as one.
-	existing := map[string]uint32{}
+	// and makes this a sweep over every pair without being written as one. The value is EVERY
+	// node holding that key rather than the last one to write it: a tree that already carries a
+	// duplicate would otherwise hide one occurrence behind the other, and the hidden one could
+	// be the occurrence the exemption below does not cover -- so a stolen key would ride into
+	// the group behind the committer's own leaf.
+	existing := map[string][]uint32{}
 	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
 		node := tree.Get(NodeIndex(x))
 		if node == nil {
@@ -625,12 +668,6 @@ func CheckUpdatePathKeyUniqueness(tree *RatchetTree, path *UpdatePath) error {
 		var encryptionKey []byte
 		switch {
 		case node.Leaf != nil:
-			// the one exemption, and it is one LEAF rather than the leaves: the committer's
-			// outgoing key. Skipping every leaf here would let a commit steal any member's
-			// encryption key, and skipping none would refuse every honest commit.
-			if isMember && NodeIndex(x) == replaced.NodeIndex() {
-				continue
-			}
 			encryptionKey = node.Leaf.EncryptionKey
 		case node.Parent != nil:
 			encryptionKey = node.Parent.EncryptionKey
@@ -641,16 +678,23 @@ func CheckUpdatePathKeyUniqueness(tree *RatchetTree, path *UpdatePath) error {
 			return fmt.Errorf("%w: node %d is occupied and holds neither a leaf nor a parent",
 				ErrNodeTypeMismatch, x)
 		}
-		existing[string(encryptionKey)] = x
+		existing[string(encryptionKey)] = append(existing[string(encryptionKey)], x)
 	}
 	// the leaf first and then the path nodes in published order, so the position a refusal names
-	// is the position the encoder wrote rather than an index into a reordered copy.
+	// is the position the encoder wrote rather than an index into a reordered copy. atTheLeaf
+	// rather than a comparison against the where string, because the exemption below is a rule
+	// about a POSITION and a rule keyed on prose breaks silently the day the prose is reworded.
 	type introducedKey struct {
-		where string
-		key   []byte
+		where     string
+		atTheLeaf bool
+		key       []byte
 	}
 	introduced := make([]introducedKey, 0, len(path.Nodes)+1)
-	introduced = append(introduced, introducedKey{where: "the path's leaf node", key: path.LeafNode.EncryptionKey})
+	introduced = append(introduced, introducedKey{
+		where:     "the path's leaf node",
+		atTheLeaf: true,
+		key:       path.LeafNode.EncryptionKey,
+	})
 	for i := range path.Nodes {
 		introduced = append(introduced, introducedKey{
 			where: fmt.Sprintf("path node %d", i),
@@ -659,7 +703,15 @@ func CheckUpdatePathKeyUniqueness(tree *RatchetTree, path *UpdatePath) error {
 	}
 	seen := map[string]string{}
 	for _, one := range introduced {
-		if at, inTree := existing[string(one.key)]; inTree {
+		// every node holding this key, ascending, so the refusal names the lowest position the
+		// key really sits at rather than whichever one happened to be written last.
+		for _, at := range existing[string(one.key)] {
+			// the one exemption, decided here rather than while the tree was read so that it
+			// covers exactly the pair it is an exemption for: the path's leaf node
+			// republishing the key at the committer's own leaf.
+			if isMember && one.atTheLeaf && NodeIndex(at) == replaced.NodeIndex() {
+				continue
+			}
 			return fmt.Errorf("%w: %s publishes the key already at node %d",
 				errDuplicateEncryptionKey, one.where, at)
 		}
