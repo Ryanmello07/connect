@@ -6,6 +6,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"maps"
 	"reflect"
 	"slices"
@@ -34,11 +38,252 @@ const (
 	_ = uint16(^WireFormat(0))
 )
 
+// ---------------------------------------------------------------------------
+// the class every table in this file is a claim about
+// ---------------------------------------------------------------------------
+
+// framingFile and framingTestFile are the two files the derivations below read. Named rather
+// than spelled at each call site, because a gate whose file no longer exists derives the empty
+// set, and the empty set agrees with an empty table.
+const (
+	framingFile     = "framing.go"
+	framingTestFile = "framing_test.go"
+)
+
+// framingRegistryTypesDeclaredIn is every framing registry the named file declares, derived as
+// every named type of that file whose underlying type is an unsigned integer.
+//
+// Derived and not listed, and the hole it closes is measured rather than supposed. Every table
+// in this file -- the code points, the section 6.1 arm order, the widths, the compile time pins
+// -- is a claim about a SET, and each of the gates joining them iterated the keys of its OWN
+// table, so the set of registries was the hand written half of all four at once. A fourth
+// registry type declared in framing.go was therefore joined to the RFC by nothing at all: a
+// ProposalOrRefType with a deliberately WRONG reference code point, added to framing.go with no
+// entry in any table here, left ./mls/... and ./message/... byte identically green.
+//
+// Unsigned integer rather than extension.go's uint16 exactly, because framing's registries are
+// not one width -- WireFormat is the pair of octets section 17 gives it and the other two are
+// single octets -- so a filter naming one width would drop two of the three it exists to find.
+// Sender is a struct and is not one of these, which is the right cut: a registry is the scalar
+// a discriminant is read at, and that is the thing a code point can be wrong about.
+func framingRegistryTypesDeclaredIn(t *testing.T, file string) []string {
+	t.Helper()
+	declared := packageLevelDeclarations(t, ".")
+	pkg := typeCheckedPackage(t)
+	names := []string{}
+	for name, declaredIn := range declared {
+		if declaredIn != file {
+			continue
+		}
+		typeName, isType := pkg.Scope().Lookup(name).(*types.TypeName)
+		if !isType {
+			continue
+		}
+		basic, isBasic := typeName.Type().Underlying().(*types.Basic)
+		if !isBasic || basic.Info()&types.IsUnsigned == 0 {
+			continue
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// framingRegistries is that derivation plus the control every caller owes it. An empty result
+// is fatal here rather than at each call site: framing.go certainly declares three, so a
+// derivation that found none is a reader that broke, and a set join against the empty set is a
+// gate reporting green having read nothing.
+func framingRegistries(t *testing.T) []string {
+	t.Helper()
+	declared := framingRegistryTypesDeclaredIn(t, framingFile)
+	if len(declared) == 0 {
+		t.Fatalf("no registry type was derived from %s, which declares three, so every set join below would compare against nothing",
+			framingFile)
+	}
+	return declared
+}
+
+// framingRegistryBits is the width the type checker reads off a registry's own declaration. It
+// is what the compile time pin is held to below, so the pin is joined to the type rather than
+// to a fourth transcription of the RFC's octet counts.
+func framingRegistryBits(t *testing.T, typeName string) int {
+	t.Helper()
+	declared, isType := typeCheckedPackage(t).Scope().Lookup(typeName).(*types.TypeName)
+	if !isType {
+		t.Fatalf("%s is not a type of package mls, so it has no width to read", typeName)
+	}
+	basic, isBasic := declared.Type().Underlying().(*types.Basic)
+	if !isBasic {
+		t.Fatalf("%s does not have a basic underlying type, so it is not a registry", typeName)
+	}
+	switch basic.Kind() {
+	case types.Uint8:
+		return 8
+	case types.Uint16:
+		return 16
+	case types.Uint32:
+		return 32
+	case types.Uint64:
+		return 64
+	}
+	t.Fatalf("%s is declared as %s, which is not one of the sized unsigned integers a wire registry can be read at",
+		typeName, basic)
+	return 0
+}
+
+// sizedUnsignedConversionBits is the whole of Go's sized unsigned integer conversions against
+// the width each one states. Closed by the language rather than by anybody's judgement, which
+// is why it can be written out: uint and uintptr are deliberately absent, since a conversion to
+// a platform width bounds a registry at nothing portable.
+var sizedUnsignedConversionBits = map[string]int{"uint8": 8, "uint16": 16, "uint32": 32, "uint64": 64}
+
+// widthPinOf recognises exactly the form a width pin has -- uintN(^T(0)) -- and reports T and
+// N. Anything else, a bare literal included, is not a pin and is reported as not one.
+func widthPinOf(expression ast.Expr) (string, int, bool) {
+	conversion, isCall := expression.(*ast.CallExpr)
+	if !isCall || len(conversion.Args) != 1 {
+		return "", 0, false
+	}
+	target, isName := conversion.Fun.(*ast.Ident)
+	if !isName {
+		return "", 0, false
+	}
+	bits, isSizedUnsigned := sizedUnsignedConversionBits[target.Name]
+	if !isSizedUnsigned {
+		return "", 0, false
+	}
+	complement, isUnary := conversion.Args[0].(*ast.UnaryExpr)
+	if !isUnary || complement.Op != token.XOR {
+		return "", 0, false
+	}
+	maximum, isInnerCall := complement.X.(*ast.CallExpr)
+	if !isInnerCall || len(maximum.Args) != 1 {
+		return "", 0, false
+	}
+	registry, isRegistryName := maximum.Fun.(*ast.Ident)
+	if !isRegistryName {
+		return "", 0, false
+	}
+	zero, isLiteral := maximum.Args[0].(*ast.BasicLit)
+	if !isLiteral || zero.Kind != token.INT || zero.Value != "0" {
+		return "", 0, false
+	}
+	return registry.Name, bits, true
+}
+
+// framingWidthPins reads a test file's own source and returns, for each registry it bounds, the
+// width that registry's compile time pin converts to.
+//
+// Read as a SHAPE rather than counted, and that distinction is this reader's whole reason to
+// exist. The package wide guard on the pin block, key_schedule_deps_test.go's
+// TestNoPinBlockShrinksWithoutFailing, counts blank identifiers: pinBlockSizes says this file
+// holds three and three is what it counts. Rewriting the WireFormat pin to a bare `_ = 0` keeps
+// that count at three and leaves the whole package green with the upper bound statement gone --
+// measured, not supposed. A pin is its conversion or it is nothing, so this reads the
+// conversion.
+func framingWidthPins(t *testing.T, file string) map[string]int {
+	t.Helper()
+	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	pins := map[string]int{}
+	for _, declaration := range parsed.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || (generic.Tok != token.CONST && generic.Tok != token.VAR) {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, isValue := spec.(*ast.ValueSpec)
+			if !isValue || len(value.Names) != 1 || value.Names[0].Name != "_" || len(value.Values) != 1 {
+				continue
+			}
+			registry, bits, isWidthPin := widthPinOf(value.Values[0])
+			if !isWidthPin {
+				continue
+			}
+			if other, repeated := pins[registry]; repeated {
+				t.Fatalf("%s pins %s twice, at uint%d and at uint%d, so neither line is the statement about its width",
+					file, registry, other, bits)
+			}
+			pins[registry] = bits
+		}
+	}
+	return pins
+}
+
+// TestTheWidthPinReaderReadsTheFormAndNotThePresence is the control on that reader. One that
+// recognised everything would report three pins out of a file whose pins had all been neutered,
+// and one that recognised nothing would report none out of the real file and fail loudly for
+// the wrong reason, so both halves are stated over expressions written here.
+func TestTheWidthPinReaderReadsTheFormAndNotThePresence(t *testing.T) {
+	for _, one := range []struct {
+		source   string
+		registry string
+		bits     int
+		isPin    bool
+	}{
+		{"uint8(^ContentType(0))", "ContentType", 8, true},
+		{"uint16(^WireFormat(0))", "WireFormat", 16, true},
+		{"uint32(^Something(0))", "Something", 32, true},
+		// the neutered pin, which is the survivor this reader exists for
+		{"0", "", 0, false},
+		// the conversion written the other way round, which says only that the value fits
+		{"ContentType(0xff)", "", 0, false},
+		{"uint8(^ContentType(1))", "", 0, false},
+		{"uint(^ContentType(0))", "", 0, false},
+		{"uint8(ContentType(0))", "", 0, false},
+		{"^ContentType(0)", "", 0, false},
+	} {
+		expression, err := parser.ParseExpr(one.source)
+		if err != nil {
+			t.Fatalf("parse %q: %v", one.source, err)
+		}
+		registry, bits, isPin := widthPinOf(expression)
+		if isPin != one.isPin || registry != one.registry || bits != one.bits {
+			t.Errorf("%q read as (%q, %d, %v), want (%q, %d, %v)",
+				one.source, registry, bits, isPin, one.registry, one.bits, one.isPin)
+		}
+	}
+}
+
+// TestEveryFramingRegistryCarriesTheCompileTimeWidthPinThatBoundsIt is the derived half of the
+// pin block at the top of this file, and it states two things nothing else did.
+//
+// A registry declared in framing.go with no pin at all is the shape a NEW registry takes, and
+// the package wide count cannot see it: pinBlockSizes is one number per file, so a fourth
+// registry landing unpinned leaves that number correct. And a pin neutered in place -- the
+// conversion replaced by a bare literal -- keeps the count too, which is a survivor this file
+// was measured to have rather than a hypothesis about one.
+//
+// The pin's target width is held to the registry's OWN width rather than to another reading of
+// the RFC, because the two ends are already joined:
+// TestTheFramingRegistriesAreTheWidthsTheWireFormatGivesThem holds the type's width to the
+// number RFC 9420 gives it, and this holds the pin to the type. A pin converting to a width
+// wider than its type compiles, says only that the maximum FITS, and goes on compiling through
+// the widening it exists to refuse.
+func TestEveryFramingRegistryCarriesTheCompileTimeWidthPinThatBoundsIt(t *testing.T) {
+	declared := framingRegistries(t)
+	pins := framingWidthPins(t, framingTestFile)
+	if got := slices.Sorted(maps.Keys(pins)); !slices.Equal(got, declared) {
+		t.Fatalf("%s pins the widths of %v and %s declares the registries %v; a registry with no pin is one a widening does not stop compiling, and a pin naming a type that is no registry here is a pin on nothing",
+			framingTestFile, got, framingFile, declared)
+	}
+	for _, name := range declared {
+		if want := framingRegistryBits(t, name); pins[name] != want {
+			t.Errorf("%s is declared %d bits wide and its compile time pin converts to uint%d; a pin no tighter than its own type still compiles after the widening it exists to refuse",
+				name, want, pins[name])
+		}
+	}
+	t.Logf("%d framing registries, each bounded above by a pin of its own width", len(declared))
+}
+
 // TestTheFramingRegistriesAreTheWidthsTheWireFormatGivesThem is the lower half, which the
 // conversions above cannot give: they hold that the type is no WIDER, and this holds that it is
 // no narrower. A registry read at fewer octets than the encoding writes moves every field after
 // it in the message.
 func TestTheFramingRegistriesAreTheWidthsTheWireFormatGivesThem(t *testing.T) {
+	measured := []string{}
 	for _, one := range []struct {
 		name       string
 		codePoints int
@@ -48,10 +293,20 @@ func TestTheFramingRegistriesAreTheWidthsTheWireFormatGivesThem(t *testing.T) {
 		{"SenderType", int(^SenderType(0)) + 1, 256},
 		{"WireFormat", int(^WireFormat(0)) + 1, 65536},
 	} {
+		measured = append(measured, one.name)
 		if one.codePoints != one.want {
 			t.Errorf("%s holds %d code points and RFC 9420 section 6 gives it %d",
 				one.name, one.codePoints, one.want)
 		}
+	}
+	// the sweep above has to name its types, because int(^T(0)) is a conversion the compiler
+	// resolves and there is no writing it over a name derived at run time. What CAN be derived
+	// is the set it was supposed to cover, so the enumeration is joined to it here: a fourth
+	// registry declared in framing.go fails this rather than being a width nothing measures.
+	slices.Sort(measured)
+	if declared := framingRegistries(t); !slices.Equal(measured, declared) {
+		t.Errorf("this sweep measures the widths of %v and %s declares the registries %v; a registry it does not measure is one nothing holds to a lower bound",
+			measured, framingFile, declared)
 	}
 }
 
@@ -111,7 +366,15 @@ func rfcNameOfFramingConstant(typeName string, constantName string) string {
 // which is how a swapped pair survives -- and a swapped pair is not a type error, is not a
 // round trip failure, and is byte exact against any corpus this implementation produced.
 func TestEveryFramingRegistryHoldsTheCodePointsRfc9420Assigns(t *testing.T) {
-	for _, typeName := range slices.Sorted(maps.Keys(rfc9420FramingCodePoints)) {
+	// the set of registries first, because the table's KEYS were the hand written part of this
+	// gate and a registry absent from them was joined to the RFC by nothing. That is the loud
+	// case, in extension_test.go's words, because it is the shape a new registry takes.
+	declared := framingRegistries(t)
+	if got := slices.Sorted(maps.Keys(rfc9420FramingCodePoints)); !slices.Equal(got, declared) {
+		t.Fatalf("rfc9420FramingCodePoints holds %v and %s declares the registries %v; a registry with no entry is one whose code points nothing here reads",
+			got, framingFile, declared)
+	}
+	for _, typeName := range declared {
 		derived := registryConstantsOfType(t, typeName)
 		byRfcName := map[string]uint64{}
 		for _, name := range slices.Sorted(maps.Keys(derived)) {
@@ -153,9 +416,45 @@ var rfc9420SelectArmOrder = map[string][]string{
 	"ContentType": {"application", "proposal", "commit"},
 }
 
+// framingRegistriesWithNoSelectArmOrder is the registries section 6.1 states no ordering for,
+// each against the reason there is none.
+//
+// A waiver rather than an omission, and written where a derivation can see it. The set this
+// second reading covered used to be the keys of rfc9420SelectArmOrder alone, so "SenderType is
+// deliberately absent" was a sentence in a comment and nothing more -- and a FOURTH registry
+// absent for no reason at all read exactly the same to every gate in this file. The two lists
+// together must be every registry framing.go declares, which makes leaving one out a sentence
+// somebody has to write rather than a line somebody does not.
+var framingRegistriesWithNoSelectArmOrder = map[string]string{
+	"SenderType": "section 6 writes the Sender select's arms member, external, new_member_commit, " +
+		"new_member_proposal, which is not the enum's order, so there is no ordering statement to " +
+		"join; rfc9420SenderSelectPayloads is SenderType's second reading instead",
+}
+
 // TestTheFramingRegistriesRunInTheOrderSection61WritesTheirArms is that join.
 func TestTheFramingRegistriesRunInTheOrderSection61WritesTheirArms(t *testing.T) {
-	for _, typeName := range slices.Sorted(maps.Keys(rfc9420SelectArmOrder)) {
+	declared := framingRegistries(t)
+	ordered := slices.Sorted(maps.Keys(rfc9420SelectArmOrder))
+	waived := slices.Sorted(maps.Keys(framingRegistriesWithNoSelectArmOrder))
+	for _, typeName := range ordered {
+		if _, alsoWaived := framingRegistriesWithNoSelectArmOrder[typeName]; alsoWaived {
+			t.Fatalf("%s is both given an arm order and waived from having one, so the two lists do not partition the registries",
+				typeName)
+		}
+	}
+	for _, typeName := range waived {
+		if strings.TrimSpace(framingRegistriesWithNoSelectArmOrder[typeName]) == "" {
+			t.Errorf("%s is waived from this join with no reason written; a waiver nobody had to justify is an omission wearing a table entry",
+				typeName)
+		}
+	}
+	accounted := slices.Concat(ordered, waived)
+	slices.Sort(accounted)
+	if !slices.Equal(accounted, declared) {
+		t.Fatalf("%s declares the registries %v; section 6.1's arm order is joined for %v and waived for %v, and a registry in neither list is one this second reading never sees",
+			framingFile, declared, ordered, waived)
+	}
+	for _, typeName := range ordered {
 		arms := rfc9420SelectArmOrder[typeName]
 		derived := registryConstantsOfType(t, typeName)
 		byRfcName := map[string]uint64{}
@@ -614,6 +913,43 @@ func TestSenderRejectsATruncatedArm(t *testing.T) {
 		t.Fatal("no truncation was built, so this observed nothing")
 	}
 	t.Logf("%d truncations refused", cuts)
+}
+
+// TestSenderRefusesTrailingBytes is the full consumption half, and Sender was the one codec
+// landed in this package with no statement of it: LeafNode, GroupContext, Extension,
+// Capabilities and RequiredCapabilities each have one and this file had none.
+//
+// Neither refusal already here says it. TestSenderRejectsATruncatedArm runs over proper
+// PREFIXES, which is the other side of the length; and the four octet tail in
+// TestSenderRejectsReservedAndUnknownType is offered only under UNDECLARED discriminants, where
+// the decoder's own default arm answers before full consumption is ever reached. What was left
+// unstated is the case with teeth: a VALID sender followed by a stray octet. The sender type
+// and its arm are inside every signature preimage this layer builds, so a decoder tolerating a
+// tail accepts two encodings of one sender while a signature covers only one of them.
+//
+// The refusal comes from syntax.UnmarshalLimit joining r.Done() rather than from anything in
+// framing.go, which is exactly why it is worth stating here: dropping that join left this
+// file's seventeen tests green and failed four OTHER codecs' -- so this layer was being carried
+// by tests that name somebody else's type.
+func TestSenderRefusesTrailingBytes(t *testing.T) {
+	stated := 0
+	for _, senderType := range senderTypes(t) {
+		golden := handDerivedSenderGolden(senderType)
+		for _, tail := range [][]byte{{0x00}, {0xff}, {0x00, 0x00}, repeatByte(0x5a, 17)} {
+			longer := joinBytes(golden, tail)
+			decoded := &Sender{}
+			if err := syntax.Unmarshal(longer, decoded); !errors.Is(err, syntax.ErrTrailingBytes) {
+				t.Errorf("sender type %d with %d trailing octets (%x): err = %v, want syntax.ErrTrailingBytes",
+					senderType, len(tail), longer, err)
+				continue
+			}
+			stated += 1
+		}
+	}
+	if stated == 0 {
+		t.Fatal("no tailed encoding was refused, so this observed nothing")
+	}
+	t.Logf("%d tailed encodings refused over %d sender types", stated, len(senderTypes(t)))
 }
 
 // senderPriorContents is every state a receiver can arrive in that this file can build: the
