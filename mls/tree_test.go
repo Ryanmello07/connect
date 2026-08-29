@@ -4886,3 +4886,255 @@ func TestEveryTreeOperationLeavesATreeThisPackageStillAgreesWith(t *testing.T) {
 			accepted, refused)
 	}
 }
+
+// TestAddLeafMarksEveryNonBlankParentAboveABlankOne is the clause of the marking loop that a
+// stop-at-the-first-blank gets wrong, and that nothing else in this package can see.
+//
+// The loop SKIPS a blank parent rather than stopping at one, and the two are the same loop on
+// every fixture whose direct path is either wholly occupied or wholly blank -- which is every
+// fixture here before this one. The arrangement that separates them is a blank node LOW on the
+// path with an occupied node ABOVE it, and that is not a corner case: it is the ordinary state a
+// Remove leaves behind. RemoveLeaf(2) on an eight leaf tree blanks 5, 3 and 7; a later commit
+// from leaf 0 repopulates 1, 3 and 7 and leaves 5 standing blank; and the next Add lands on leaf
+// 2 with the path [5, 3, 7]. So the blank set is swept over the whole family of patterns the path
+// can hold rather than drawn once, and what is expected at each level is read off the pattern.
+//
+// The consequence of stopping is not a short list. Section 4.2 builds a node's resolution from
+// its unmerged_leaves, so an ancestor that never recorded the joiner seals no path secret to
+// them, and section 7.9.2 condition 3 then fails at the NEXT join -- at nodes the loop is not
+// even in.
+func TestAddLeafMarksEveryNonBlankParentAboveABlankOne(t *testing.T) {
+	separating := 0
+	for _, width := range []uint32{4, 8, 16} {
+		for target := uint32(0); target < width; target += 1 {
+			occupied := func(i LeafIndex) bool { return uint32(i) != target }
+			shape := treeWithOccupiedLeaves(t, width, occupied)
+			path, err := directPathOf(LeafIndex(target).NodeIndex(), shape.LeafWidth())
+			if err != nil {
+				t.Fatalf("width %d leaf %d: directPathOf: %v", width, target, err)
+			}
+			for pattern := uint32(0); pattern < (uint32(1) << uint32(len(path))); pattern += 1 {
+				blankAt := func(level int) bool { return pattern&(uint32(1)<<uint32(level)) != 0 }
+				// derived from the pattern rather than listed: a blank at one level with an
+				// occupied node anywhere above it is the only arrangement in which skipping and
+				// stopping part company, and the counter at the end refuses a sweep that never
+				// reaches one.
+				for low := 0; low < len(path); low += 1 {
+					if !blankAt(low) {
+						continue
+					}
+					reached := false
+					for high := low + 1; high < len(path); high += 1 {
+						if !blankAt(high) {
+							reached = true
+						}
+					}
+					if reached {
+						separating += 1
+					}
+					break
+				}
+				tree := treeWithOccupiedLeaves(t, width, occupied)
+				for level, x := range path {
+					if !blankAt(level) {
+						continue
+					}
+					if err := tree.Blank(x); err != nil {
+						t.Fatalf("width %d leaf %d: Blank(%d): %v", width, target, x, err)
+					}
+				}
+				where := fmt.Sprintf("width %d, leaf %d, path %v with %b blanked", width, target, path, pattern)
+				got, err := tree.AddLeaf(testTreeLeaf(target + 0x50))
+				if err != nil {
+					t.Fatalf("%s: AddLeaf: %v", where, err)
+				}
+				if got != LeafIndex(target) {
+					t.Fatalf("%s: AddLeaf = %d, want the only blank leaf %d", where, got, target)
+				}
+				for level, x := range path {
+					parent := tree.ParentAt(x)
+					if blankAt(level) {
+						// a blank node publishes no key and so owes no debt, and Add must not
+						// fill it either: filling it is a commit's job and not an add's.
+						if parent != nil {
+							t.Fatalf("%s: AddLeaf put a node at %d, which was blank", where, x)
+						}
+						continue
+					}
+					if parent == nil {
+						t.Fatalf("%s: AddLeaf blanked node %d, and Add never blanks", where, x)
+					}
+					if !slices.Contains(parent.UnmergedLeaves, got) {
+						t.Fatalf("%s: node %d is a non-blank node of leaf %d's direct path and does not list it unmerged: %v",
+							where, x, got, parent.UnmergedLeaves)
+					}
+				}
+				assertStillATree(t, where, tree)
+			}
+		}
+	}
+	if separating == 0 {
+		t.Fatalf("no pattern in this sweep puts a blank node below an occupied one, so nothing here separates a loop that skips a blank from one that stops at it")
+	}
+}
+
+// TestATruncationLeavesNothingOfTheOldTreeReachable is the half of the shrink that is not about
+// width at all.
+//
+// A slice reaches its CAPACITY and not its length, so self.nodes[:w] leaves the whole old array
+// alive behind a shorter tree: the parent keys of the half that went away, and every node the
+// removal did not itself empty, stay hanging off this container for as long as it lives. Every
+// width, member count, hash and round trip property in this file agrees with a reslice, because
+// none of them can look past the length -- which is exactly why the statement has to be made in
+// the terms that can be false, over the tree's own storage.
+//
+// The two counters are what stop it going quiet: a sweep in which nothing shrinks, or in which
+// every dropped node had already been blanked by the removal itself, has nothing to leak and
+// would report the same clean run a complete one does.
+func TestATruncationLeavesNothingOfTheOldTreeReachable(t *testing.T) {
+	const width = 8
+	shrank, carrying := 0, 0
+	for pattern := uint32(1); pattern < (uint32(1) << width); pattern += 1 {
+		occupied := func(i LeafIndex) bool { return pattern&(uint32(1)<<uint32(i)) != 0 }
+		for removed := uint32(0); removed < width; removed += 1 {
+			if !occupied(LeafIndex(removed)) {
+				continue
+			}
+			tree := treeWithOccupiedLeaves(t, width, occupied)
+			before := tree.NodeWidth()
+			// what the removal empties on its own account, derived from the tree math rather
+			// than assumed, so the non-vacuity counter below cannot be satisfied by a node the
+			// blanking had already cleared.
+			emptied := map[NodeIndex]bool{LeafIndex(removed).NodeIndex(): true}
+			path, err := directPathOf(LeafIndex(removed).NodeIndex(), tree.LeafWidth())
+			if err != nil {
+				t.Fatalf("occupancy %b: directPathOf(%d): %v", pattern, removed, err)
+			}
+			for _, x := range path {
+				emptied[x] = true
+			}
+			was := make([]*Node, before)
+			copy(was, tree.nodes)
+			if err := tree.RemoveLeaf(LeafIndex(removed)); err != nil {
+				t.Fatalf("occupancy %b: RemoveLeaf(%d): %v", pattern, removed, err)
+			}
+			if tree.NodeWidth() >= before {
+				continue
+			}
+			shrank += 1
+			where := fmt.Sprintf("occupancy %b minus leaf %d", pattern, removed)
+			reachable := tree.nodes[:cap(tree.nodes)]
+			for x := tree.NodeWidth(); x < uint32(len(reachable)); x += 1 {
+				if reachable[x] != nil {
+					t.Fatalf("%s: the tree is %d nodes wide and node %d of the tree it used to be is still reachable through its own storage",
+						where, tree.NodeWidth(), x)
+				}
+			}
+			if cap(tree.nodes) != len(tree.nodes) {
+				t.Fatalf("%s: the node array is %d long and %d wide, so the array the old tree lived in is still alive behind it",
+					where, len(tree.nodes), cap(tree.nodes))
+			}
+			for x := tree.NodeWidth(); x < before; x += 1 {
+				if was[x] != nil && !emptied[NodeIndex(x)] {
+					carrying += 1
+					break
+				}
+			}
+		}
+	}
+	if shrank == 0 || carrying == 0 {
+		t.Fatalf("the sweep saw %d truncations, %d of which dropped a node the removal had not already emptied, and a zero in either is a sweep with nothing to leak",
+			shrank, carrying)
+	}
+}
+
+// TestRemoveLeafDropsEveryUnmergedEntryNamingABlankLeafAndNotOnlyTheRemovedOne is the second
+// condition the sweep's derived predicate is wider by.
+//
+// "The leaf this entry names is blank" and "the leaf that was just removed" pick out the same set
+// on a well formed tree, so the difference is only visible on a tree that is already wrong -- and
+// a tree that is already wrong is precisely what this sweep is for, because the entries it plants
+// are the ones no operation of this package would have written and every operation of it will
+// later read. Each parent carries the whole blank set AND every member of its own subtree that is
+// not the one leaving, so "drops the entries naming a blank" and "clears the list" are not the
+// same assertion.
+//
+// The third counter is the shrink flavour, and it is the one the ordering of RemoveLeaf's two
+// closing steps is argued from: an entry left standing on a node the truncation KEEPS, naming a
+// leaf the truncation puts outside the new width, is a node SetParent would have refused and
+// Resolution answers the empty list for -- "seal to everyone under this node" quietly becoming
+// "seal to nobody". What is pinned is that POSTCONDITION and not the order the two steps run in:
+// swapping them leaves this sweep green, because a truncation never puts an occupied leaf outside
+// the tree and so every entry a shrink moves out of range was already naming a blank before it.
+// The reason that is a coincidence rather than a hole is recorded at
+// dropUnmergedLeavesNamingABlankLeaf, where it belongs.
+func TestRemoveLeafDropsEveryUnmergedEntryNamingABlankLeafAndNotOnlyTheRemovedOne(t *testing.T) {
+	const width = 8
+	surviving, withASurvivor, pastTheNewWidth := 0, 0, 0
+	for pattern := uint32(0); pattern < (uint32(1) << width); pattern += 1 {
+		occupied := func(i LeafIndex) bool { return pattern&(uint32(1)<<uint32(i)) != 0 }
+		blanks := []LeafIndex{}
+		for i := uint32(0); i < width; i += 1 {
+			if !occupied(LeafIndex(i)) {
+				blanks = append(blanks, LeafIndex(i))
+			}
+		}
+		if len(blanks) == 0 {
+			continue
+		}
+		for removed := uint32(0); removed < width; removed += 1 {
+			if !occupied(LeafIndex(removed)) {
+				continue
+			}
+			tree := treeWithOccupiedLeaves(t, width, occupied)
+			want := map[NodeIndex][]LeafIndex{}
+			for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+				first, last := SubtreeLeaves(NodeIndex(x))
+				keep := []LeafIndex{}
+				for i := first; i <= last; i += 1 {
+					if occupied(i) && uint32(i) != removed {
+						keep = append(keep, i)
+					}
+				}
+				entries := append(append([]LeafIndex{}, keep...), blanks...)
+				slices.Sort(entries)
+				if err := tree.SetParent(NodeIndex(x), &ParentNode{
+					EncryptionKey:  HpkePublicKey(repeatByte(byte(0xa0+x), 32)),
+					UnmergedLeaves: entries,
+				}); err != nil {
+					t.Fatalf("occupancy %b: SetParent(%d) with %v: %v", pattern, x, entries, err)
+				}
+				want[NodeIndex(x)] = keep
+			}
+			if err := tree.RemoveLeaf(LeafIndex(removed)); err != nil {
+				t.Fatalf("occupancy %b: RemoveLeaf(%d): %v", pattern, removed, err)
+			}
+			where := fmt.Sprintf("occupancy %b minus leaf %d", pattern, removed)
+			for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+				parent := tree.ParentAt(NodeIndex(x))
+				if parent == nil {
+					continue
+				}
+				surviving += 1
+				if !slices.Equal(parent.UnmergedLeaves, want[NodeIndex(x)]) {
+					t.Fatalf("%s: node %d unmerged = %v, want %v: every entry naming a leaf the tree does not have goes, and every entry naming a member stays",
+						where, x, parent.UnmergedLeaves, want[NodeIndex(x)])
+				}
+				if len(want[NodeIndex(x)]) > 0 {
+					withASurvivor += 1
+				}
+				for _, blank := range blanks {
+					if LeafCount(blank) >= tree.LeafWidth() {
+						pastTheNewWidth += 1
+						break
+					}
+				}
+			}
+			assertStillATree(t, where, tree)
+		}
+	}
+	if surviving == 0 || withASurvivor == 0 || pastTheNewWidth == 0 {
+		t.Fatalf("the sweep reached %d surviving parents, %d of them carrying an entry that had to stay and %d of them carrying one the shrink put outside the tree, and a zero in any of the three is a sweep that says less than it claims",
+			surviving, withASurvivor, pastTheNewWidth)
+	}
+}

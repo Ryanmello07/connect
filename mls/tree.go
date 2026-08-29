@@ -1259,6 +1259,16 @@ func (self *RatchetTree) truncate() error {
 // stored, so a shrink that left them standing would leave this container holding a tree it would
 // itself have refused.
 //
+// The ORDER is what that second condition is argued from, and the two orders are in fact the same
+// sweep on this path -- which is worth saying out loud rather than leaving as a claim no test can
+// hold. TruncatedLeafCount answers 1 << TreeDepth(rightmost+1), which is strictly greater than the
+// rightmost occupied leaf, so a truncation never puts an OCCUPIED leaf outside the tree: every
+// entry the shrink moves out of range was already naming a blank before the shrink, and the
+// derived predicate was already true of it. Running AFTER the truncation is still the order to
+// keep, because it is the one that measures the entries against the width the tree ends up with
+// instead of the one it started with, and the coincidence is a property of today's truncation
+// rather than of this sweep.
+//
 // It repairs nothing an interoperable peer computes differently. On any tree whose every unmerged
 // entry names an occupied leaf inside its own node's subtree -- which is every tree section 7.9.2
 // accepts -- the predicate is false at every entry and this changes nothing at all.
