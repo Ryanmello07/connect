@@ -556,8 +556,21 @@ func seedCodecValuesAgree(t *testing.T, codec seedCodec, left any, right any) bo
 func seedFieldIsPinnedByTheCodec(t *testing.T, codec seedCodec, fieldPath string) (bool, string) {
 	t.Helper()
 	names, onDisk := readSeedCorpus(t, codec.target)
+	seeds := make([][]byte, 0, len(names))
 	for _, name := range names {
-		value, err := codec.decode(onDisk[name])
+		seeds = append(seeds, onDisk[name])
+	}
+	return seedFieldIsPinnedOverSeeds(codec, seeds, fieldPath)
+}
+
+// seedFieldIsPinnedOverSeeds is the probe itself, over seeds a caller supplies rather than over the
+// corpus on disk. Split out so TestTheFieldPinProbeSeparatesAPinnedFieldFromAFreeOne can drive it
+// against two structures built to differ in exactly the thing it claims to detect -- which is the
+// only control that can tell this helper from one that answers "pinned" to everything, since the
+// gate that consults it only ever asks about fields that are already single valued.
+func seedFieldIsPinnedOverSeeds(codec seedCodec, seeds [][]byte, fieldPath string) (bool, string) {
+	for _, seed := range seeds {
+		value, err := codec.decode(seed)
 		if err != nil {
 			continue
 		}

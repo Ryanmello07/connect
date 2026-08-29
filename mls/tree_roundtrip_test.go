@@ -53,8 +53,10 @@ package mls
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -749,4 +751,181 @@ func FuzzUpdatePathDecode(f *testing.F) {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
 	})
+}
+// ---------------------------------------------------------------------------
+// the controls on the two things this plan added to the shared harness
+// ---------------------------------------------------------------------------
+
+// errSeedProbePinned is the refusal a codec that pins a field answers with.
+var errSeedProbePinned = errors.New("mls: this probe codec carries only one code point")
+
+// pinnedSeedProbe is a structure whose first field the codec refuses to carry as anything but 1,
+// and whose second it carries freely. Credential is that shape and so is nothing else in this
+// package, which is why the control below needs a structure of its own.
+type pinnedSeedProbe struct {
+	Code uint16
+	Body []byte
+}
+
+func (self *pinnedSeedProbe) MarshalMLS(w *syntax.Writer) error {
+	if self.Code != 1 {
+		return errSeedProbePinned
+	}
+	w.WriteUint16(self.Code)
+	w.WriteOpaque(self.Body)
+	return nil
+}
+
+func (self *pinnedSeedProbe) UnmarshalMLS(r *syntax.Reader) error {
+	code, err := r.ReadUint16()
+	if err != nil {
+		return err
+	}
+	if code != 1 {
+		return errSeedProbePinned
+	}
+	body, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	self.Code, self.Body = code, body
+	return nil
+}
+
+// freeSeedProbe is the same two fields with nothing pinned. It is the half that makes the control a
+// control: a probe helper that answered "pinned" unconditionally passes every assertion about
+// pinnedSeedProbe and fails every one about this.
+type freeSeedProbe struct {
+	Code uint16
+	Body []byte
+}
+
+func (self *freeSeedProbe) MarshalMLS(w *syntax.Writer) error {
+	w.WriteUint16(self.Code)
+	w.WriteOpaque(self.Body)
+	return nil
+}
+
+func (self *freeSeedProbe) UnmarshalMLS(r *syntax.Reader) error {
+	code, err := r.ReadUint16()
+	if err != nil {
+		return err
+	}
+	body, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	self.Code, self.Body = code, body
+	return nil
+}
+
+func seedProbeCodec[T any, PT interface {
+	*T
+	syntax.Codec
+}](name string) seedCodec {
+	return seedCodec{
+		target:    name,
+		structure: func() any { return PT(new(T)) },
+		decode: func(bs []byte) (any, error) {
+			parsed := PT(new(T))
+			return parsed, syntax.Unmarshal(bs, parsed)
+		},
+		encode:   func(value any) ([]byte, error) { return syntax.Marshal(value.(PT)) },
+		describe: func(value any) string { return fmt.Sprintf("%+v", value) },
+	}
+}
+
+// TestTheFieldPinProbeSeparatesAPinnedFieldFromAFreeOne is the positive control on
+// seedFieldIsPinnedByTheCodec, and it is here because that helper is an EXEMPTION: it decides which
+// single valued fields TestEveryFieldOfBothStructuresVariesAcrossTheCommittedCorpus stops
+// reporting, so a version of it that answered "pinned" to everything would retire that gate
+// silently.
+//
+// Nothing else can see that. The gate consults the probe only for fields that are ALREADY single
+// valued, and there is exactly one of those per codec today, so a probe stuck at yes agrees with a
+// working one on every question the gate asks it -- which is precisely what mutation testing found:
+// making the helper return true unconditionally left the whole package green.
+//
+// So the control drives it against two structures built to differ in the one thing it claims to
+// detect, and asserts all four corners: the pinned field of the pinned codec, the free field of the
+// SAME codec -- so "pinned" is a statement about the field and not about the structure -- and both
+// fields of a codec that pins nothing.
+func TestTheFieldPinProbeSeparatesAPinnedFieldFromAFreeOne(t *testing.T) {
+	pinnedCodec := seedProbeCodec[pinnedSeedProbe]("pinnedSeedProbe")
+	freeCodec := seedProbeCodec[freeSeedProbe]("freeSeedProbe")
+
+	pinnedSeed, err := pinnedCodec.encode(&pinnedSeedProbe{Code: 1, Body: []byte{0x0a}})
+	if err != nil {
+		t.Fatalf("encode the pinned probe: %v", err)
+	}
+	freeSeed, err := freeCodec.encode(&freeSeedProbe{Code: 1, Body: []byte{0x0a}})
+	if err != nil {
+		t.Fatalf("encode the free probe: %v", err)
+	}
+	if !bytes.Equal(pinnedSeed, freeSeed) {
+		t.Fatalf("the two probes encode differently (%x against %x), so they are not the same structure with and without the pin",
+			pinnedSeed, freeSeed)
+	}
+
+	for _, row := range []struct {
+		name      string
+		codec     seedCodec
+		seed      []byte
+		fieldPath string
+		want      bool
+	}{
+		{"the pinned field of the pinned codec", pinnedCodec, pinnedSeed, "pinnedSeedProbe.Code", true},
+		{"the free field of the pinned codec", pinnedCodec, pinnedSeed, "pinnedSeedProbe.Body", false},
+		{"the code point of the codec that pins nothing", freeCodec, freeSeed, "freeSeedProbe.Code", false},
+		{"the body of the codec that pins nothing", freeCodec, freeSeed, "freeSeedProbe.Body", false},
+	} {
+		got, why := seedFieldIsPinnedOverSeeds(row.codec, [][]byte{row.seed}, row.fieldPath)
+		if got != row.want {
+			t.Errorf("%s: the probe answered pinned=%v (%s), want %v", row.name, got, why, row.want)
+		}
+	}
+}
+
+// TestTheProjectedComparisonRefusesTwoTreesOfDifferentWidth is the control on the length check in
+// seedCodecValuesAgree.
+//
+// The node width is the one property of a ratchet tree the wire does not carry: readNodeArray
+// derives it by extending the entry count to the next complete tree, so a decoder that stopped
+// short answers a tree with a different root, a different direct path for every leaf and a
+// different tree hash -- and every node it did decode is identical. An elementwise comparison over
+// the shorter of the two reports them equal, which is why the length is compared first.
+//
+// Nothing in the corpus exercises that branch, because no seed round trips to a different width;
+// mutation confirmed it, by deleting the check and leaving the package green. The two trees below
+// are built from the same builder at the same offset, so they agree node for node over the narrow
+// one's whole width and differ in nothing but how many nodes there are.
+func TestTheProjectedComparisonRefusesTwoTreesOfDifferentWidth(t *testing.T) {
+	codec := treeSeedCodecs()[0]
+	if codec.target != ratchetTreeSeedTarget {
+		t.Fatalf("this control reads the ratchet tree codec off the table by position and found %s", codec.target)
+	}
+	leaves := seedNarrowLeafVariants()
+	narrow := seedRatchetTreeFromShape(t, "LPL", 0, leaves)
+	wide := seedRatchetTreeFromShape(t, "LPLPLPL", 0, leaves)
+
+	if narrow.NodeWidth() >= wide.NodeWidth() {
+		t.Fatalf("the two trees are %d and %d nodes wide, so this control has no width difference to see",
+			narrow.NodeWidth(), wide.NodeWidth())
+	}
+	// the premise: over the narrow tree's own width the two agree node for node, so the only thing
+	// left for the comparison to notice is the count.
+	for x := uint32(0); x < narrow.NodeWidth(); x += 1 {
+		at := fmt.Sprintf("control[%d]", x)
+		if !seedValuesAgree(t, at, reflect.ValueOf(narrow.Get(NodeIndex(x))), reflect.ValueOf(wide.Get(NodeIndex(x)))) {
+			t.Fatalf("node %d already differs between the two trees, so a refusal below would say nothing about the width", x)
+		}
+	}
+
+	if !seedCodecValuesAgree(t, codec, narrow, narrow.Clone()) {
+		t.Fatal("the comparison refuses a tree against its own clone, so its answer below is not about the width either")
+	}
+	if seedCodecValuesAgree(t, codec, narrow, wide) {
+		t.Fatalf("a %d node tree compared equal to a %d node one that agrees with it everywhere it reaches; the node width is the one property of a ratchet tree the wire does not carry, so a comparison that does not check it cannot see a decoder that stopped short",
+			narrow.NodeWidth(), wide.NodeWidth())
+	}
 }
