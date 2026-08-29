@@ -119,6 +119,16 @@ func providerNilMethodRows() []providerNilMethodRow {
 			_, err := (&RatchetTree{}).CreateUpdatePathSecrets(nil, 0, nil, nil)
 			return err
 		}},
+		// task 20's sealing, on the same zero valued tree. A tree with no nodes gives leaf 0
+		// no filtered direct path to read, so EncryptionTargets refuses it with
+		// ErrLeafIndexOutOfRange, and the nil plan one argument along is errNilUpdatePathPlan:
+		// a body that looked at either before its provider would answer one of those to a
+		// caller whose actual mistake was passing no provider, and send it to fix an index or a
+		// plan that was never the problem.
+		{name: "(*RatchetTree).EncryptUpdatePath", call: func() error {
+			_, err := (&RatchetTree{}).EncryptUpdatePath(nil, nil, 0, nil, nil)
+			return err
+		}},
 		// treekem.go's two, on the zero valued private state, which is the receiver that
 		// separates the two orders these bodies could be written in. A zero TreeKEMPrivate has
 		// leaf index 0, so node 0 IS its own leaf: a NodePrivateKey that looked at its receiver

@@ -364,6 +364,63 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				{name: "the leaf's parent hash", content: plan.LeafNode.ParentHash},
 			}, nil
 		}},
+		// task 20's sealing, over the same tree and the plan task 18's row above answers.
+		//
+		// The plan is built through the ROW'S provider and not through a fixed one, which is
+		// this table's own rule: every value a row is built out of is cut to the provider's
+		// KDF.Nh. A plan cut to a fixed 32 octet ladder would seal 32 octet plaintexts under a
+		// provider whose Nh is 48, and the differential below would read the ciphertext that
+		// came back as a width written down rather than as the plaintext plus tag it is.
+		//
+		// The values are CIPHERTEXTS and never kem outputs. A kem output is Nenc, which X25519
+		// fixes at 32 whatever the kdf does, so reporting one would hand the KDF.Nh gate exactly
+		// the coincidence constructionsWhoseAnswerOnlyCoincidesWithKdfNh records for
+		// SealWithLabel. A ciphertext is the path secret plus the aead tag, so it is Nh+Nt over
+		// both providers and is Nh under neither.
+		//
+		// The ROUTING differential is weak over this row for CreateUpdatePathSecrets' reason
+		// one row up -- every value here descends from a plan the same provider produced, so all
+		// of them move whether or not the seal routed through the parameter. What holds the seal
+		// itself is TestEncryptUpdatePathPairsEachCiphertextWithItsOwnResolutionEntry, which
+		// opens every ciphertext with the private key of the resolution entry standing at its
+		// own index, and TestEncryptUpdatePathSealsUnderTheContextOfTheEpochTheCommitOpens,
+		// which says which bytes went into the hpke info.
+		//
+		// The group context is the one caller array this method is handed, so it is the one
+		// thing taken through the recorder; the signer and the group id belong to the call above
+		// it and are held by that row.
+		{name: "(*RatchetTree).EncryptUpdatePath", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+			signer, _, err := fixed.SignatureKeyPair()
+			if err != nil {
+				return nil, err
+			}
+			tree := providerRowRatchetTree(t)
+			plan, err := tree.CreateUpdatePathSecrets(crypto, LeafIndex(0),
+				SignaturePrivateKey(signer), []byte("provider-row-group-id"))
+			if err != nil {
+				return nil, err
+			}
+			path, err := tree.EncryptUpdatePath(crypto, plan, LeafIndex(0),
+				take([]byte("provider-row-group-context")), nil)
+			if err != nil {
+				return nil, err
+			}
+			values := []providerDrivenMethodValue{}
+			for i := range path.Nodes {
+				if len(path.Nodes[i].EncryptedPathSecret) == 0 {
+					return nil, fmt.Errorf("path node %d published no ciphertext, so this row observes nothing there", i)
+				}
+				values = append(values, providerDrivenMethodValue{
+					name:    fmt.Sprintf("the ciphertext sealed at path node %d", i),
+					content: path.Nodes[i].EncryptedPathSecret[0].Ciphertext,
+				})
+			}
+			if len(values) == 0 {
+				return nil, fmt.Errorf("the row's tree gave leaf 0 an empty filtered direct path, so this row observes nothing")
+			}
+			return values, nil
+		}},
 		// treekem.go's two. NodePrivateKey has both arms driven, because they are two
 		// different answers and only one of them is derived: the node key comes back through
 		// the provider and moves, and the member's own leaf key is STORED and must not. The

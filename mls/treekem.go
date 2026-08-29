@@ -635,3 +635,167 @@ func (self *UpdatePath) UnmarshalMLS(r *syntax.Reader) error {
 }
 
 var _ syntax.Codec = (*UpdatePath)(nil)
+
+// ---------------------------------------------------------------------------
+// task 20: sealing the path secrets to the copath resolutions
+// ---------------------------------------------------------------------------
+
+// RFC 9420 section 7.6's label for every path secret encryption. One constant and not a
+// literal at the call site, because the label is the whole of what stops a ciphertext sealed
+// for one purpose from opening under another -- crypto_labels.go's own header argues that --
+// and task 22's open has to spell the same string. Two literals agreeing today is two literals.
+const updatePathNodeLabel = "UpdatePathNode"
+
+// errPathLength is ValSem202, carried unexported on psk.go's terms and for psk.go's reason: the
+// validation plan owns the exported ErrPathLength and declares it in errors.go, and two plans
+// declaring one name in one package is a compile error at merge. The swap is mechanical -- this
+// name for that one, wrapped in ValSem(ValSem202, ...) -- and it is owed by tasks 21 and 22 as
+// well as by this one.
+//
+// It names a disagreement about HOW MANY nodes the path has, and this is the sending side of
+// the rule ValSem202 makes a receiver enforce. There are two ways to reach it here and they are
+// one condition: the tree this call was made over gives the sender a filtered direct path of a
+// different length than the plan was built against -- the tree moved under the plan, or the
+// sender argument is not the leaf the plan was made for -- or the plan disagrees with itself,
+// carrying a different number of secrets or public keys than nodes. Either way the positional
+// pairing this whole construction rests on has no meaning, so it is refused before a single
+// secret is sealed rather than being sealed to whatever the shorter of the two runs out at.
+var errPathLength = errors.New("mls: the update path is not the length of the sender's filtered direct path")
+
+// errNilUpdatePathPlan is EncryptUpdatePath handed no plan, or one carrying no leaf.
+//
+// Unexported and an error rather than the nil dereference the shorter body would take, which is
+// errNilHpkeCiphertext's argument in this same file: nothing outside this package can produce
+// the condition, so it is not a refusal any exclusivity sweep should have to judge, and a panic
+// out of a library takes the caller's process rather than its call.
+var errNilUpdatePathPlan = errors.New("mls: no update path plan was supplied")
+
+// EncryptUpdatePath is the public half of RFC 9420 section 7.6: each path secret of the plan,
+// sealed once per node of the resolution of that node's copath child, in resolution order.
+//
+// The PAIRING is positional and it is the contract, not an implementation detail. A receiver
+// finds its own ciphertext by index into the resolution it computes for itself, so ciphertext j
+// of node i belongs to entry j of EncryptionTargets(sender, exclude)[i] and to nothing else. A
+// permutation of either vector still hands every member a ciphertext of exactly the right
+// shape, still publishes the right number of them, and is invisible until a decrypt fails one
+// task later -- where it reads as a decryption bug rather than as an ordering one. That is why
+// the loop walks targets[i] in the order EncryptionTargets answered and never a set, a map or a
+// sorted copy, and why TestEncryptUpdatePathPairsEachCiphertextWithItsOwnResolutionEntry opens
+// every ciphertext with the key of the resolution entry standing at its own index.
+//
+// groupContext is []byte rather than *GroupContext because the serialized form is what goes
+// into the HPKE info, and taking bytes keeps this call from having to know how the key schedule
+// plan encodes a GroupContext (C4). Callers pass syntax.Marshal(gc).
+//
+// It is the NEW epoch's context, and that is the whole reason task 18 and this call are two
+// calls. The context's tree_hash covers the public keys and the commit leaf this path installs,
+// so it does not exist until CreateUpdatePathSecrets has mutated the tree; a context built from
+// the tree hash the sender started with is a context every peer computes differently, which
+// makes every ciphertext here undecryptable for all of them at once. Nothing in a self
+// consistent seal-and-open can see the difference, so
+// TestEncryptUpdatePathSealsUnderTheContextOfTheEpochTheCommitOpens is what distinguishes the
+// two contexts and says which one was used.
+//
+// exclude is forwarded to EncryptionTargets unchanged. A member this commit ADDS receives the
+// path secret in its Welcome and must not receive it here as well, and the exclusion is applied
+// to the resolution rather than to the tree for the reason that function's own comment gives.
+//
+// The tree is NOT mutated. Task 18 already installed everything this publishes; here the tree is
+// read for the encryption keys of the resolution nodes and for nothing else.
+func (self *RatchetTree) EncryptUpdatePath(crypto CryptoProvider, plan *UpdatePathPlan,
+	sender LeafIndex, groupContext []byte, exclude []LeafIndex) (*UpdatePath, error) {
+	// the provider before anything else is read, which is what
+	// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt demands of every
+	// declaration taking one and is the right order anyway: a caller that passed no provider
+	// passed nothing this function could have sealed with, and answering it about its plan or
+	// its sender index sends it to look at the argument that is not the problem.
+	if crypto == nil {
+		return nil, ErrNilCryptoProvider
+	}
+	if plan == nil || plan.LeafNode == nil {
+		return nil, errNilUpdatePathPlan
+	}
+	targets, err := self.EncryptionTargets(sender, exclude)
+	if err != nil {
+		return nil, err
+	}
+	if !updatePathPlanMatchesTargets(plan, targets) {
+		return nil, errPathLength
+	}
+	nodes := make([]UpdatePathNode, 0, len(plan.Path))
+	for i := range plan.Path {
+		ciphertexts := make([]HpkeCiphertext, 0, len(targets[i]))
+		for _, y := range targets[i] {
+			pub, err := self.nodeEncryptionKey(y)
+			if err != nil {
+				return nil, err
+			}
+			ct, err := SealWithLabel(crypto, pub, updatePathNodeLabel, groupContext, plan.PathSecrets[i])
+			if err != nil {
+				return nil, err
+			}
+			ciphertexts = append(ciphertexts, *ct)
+		}
+		nodes = append(nodes, UpdatePathNode{
+			// CLONED, for DerivePathSecrets' reason one direction over. The plan is the
+			// sender's live state for as long as the commit is in flight and may be thrown
+			// away wholesale if the commit is rejected; what this answers is a wire value that
+			// is about to be serialized and may be held by the framing layer for longer. Two
+			// structures over one array make either one's disposal the other's corruption.
+			EncryptionKey:       HpkePublicKey(cloneBytes(plan.PublicKeys[i])),
+			EncryptedPathSecret: ciphertexts,
+		})
+	}
+	// the leaf is deep copied for the same reason, and it is the half that matters more: it
+	// carries a signature over its own encryption key and parent hash, so a value sharing those
+	// arrays with the plan is a published leaf whose signature stops covering it if anything
+	// touches either side.
+	return &UpdatePath{LeafNode: *plan.LeafNode.Clone(), Nodes: nodes}, nil
+}
+
+// updatePathPlanMatchesTargets is the one length agreement EncryptUpdatePath rests on: the
+// plan's path, its secrets, its public keys and the target lists all count the same nodes.
+//
+// A function of its own rather than three clauses in the body above, because
+// TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime's equality rule reads a body
+// for == and != with a value on both sides and has no type information to tell a length from a
+// key. Any later edit that gives EncryptUpdatePath a key shaped parameter would put it in that
+// class, and a length comparison written inline would then be reported as a variable time
+// comparison of data. Behind a helper that takes no key, answers a bool and is therefore not
+// itself a member of the class, the decision is where that gate's own file comment says a path
+// builder's index and length comparisons belong.
+func updatePathPlanMatchesTargets(plan *UpdatePathPlan, targets [][]NodeIndex) bool {
+	return len(targets) == len(plan.Path) &&
+		len(plan.PathSecrets) == len(plan.Path) &&
+		len(plan.PublicKeys) == len(plan.Path)
+}
+
+// nodeEncryptionKey is the HPKE public key a tree carries at one node, whichever kind of node
+// it is.
+//
+// The two ways there is no key here are told apart, which is ErrLeafBlank's argument at the
+// node level: an index outside the node array is a caller that computed an index wrong and
+// repairs it by recomputing one, and a BLANK node inside the array reached through a resolution
+// is a tree whose resolution walk and whose node storage disagree -- Resolution answers only
+// non-blank nodes by definition, so a blank one arriving here is structural and no re-derived
+// index repairs it. Get answers nil for both alike, so the range check is written out rather
+// than left to it.
+func (self *RatchetTree) nodeEncryptionKey(x NodeIndex) (HpkePublicKey, error) {
+	if uint32(x) >= self.NodeWidth() {
+		return nil, ErrNodeIndexOutOfRange
+	}
+	node := self.Get(x)
+	if node == nil {
+		return nil, ErrTreeMalformed
+	}
+	if node.Leaf != nil {
+		return node.Leaf.EncryptionKey, nil
+	}
+	if node.Parent != nil {
+		return node.Parent.EncryptionKey, nil
+	}
+	// a Node is one occupied position and exactly one of its two halves is set, so a stored
+	// node holding neither is the same structural fault as a blank one reached through a
+	// resolution.
+	return nil, ErrTreeMalformed
+}
