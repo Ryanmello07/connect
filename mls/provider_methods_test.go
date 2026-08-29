@@ -52,6 +52,21 @@ type providerDrivenMethodValue struct {
 	// a carried value to being identical across the two providers and every other value to
 	// being different, so a flag set on the wrong value fails rather than exempting it.
 	carried bool
+	// storage is the array the RETENTION gate reads for this value, when content is a
+	// rendering rather than the value itself.
+	//
+	// The two halves exist because the three gates want opposite things from one value. A
+	// KEM key is 32 octets whatever the kdf does, so the KDF.Nh differential reads a raw one
+	// as a length written down -- which is why this file renders keys as hex before
+	// reporting them, and NodePrivateKey's row already does. But a rendering is a fresh
+	// array, so the aliasing question the retention gate asks answers "shares nothing" for
+	// every possible implementation once a value is rendered. Naming the storage alongside
+	// the rendering is what lets one value answer both: the differentials read content, the
+	// aliasing reads storage, and they are the same value read two ways rather than two
+	// values that could drift apart.
+	//
+	// A row leaving this nil is read raw, which is the ordinary case.
+	storage []byte
 }
 
 // One method of this package that is handed a provider, and how to drive it.
@@ -304,7 +319,22 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		// failed to follow the provider.
 		{name: "(*RatchetTree).parentHashClaimsUnder", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
 			tree := providerRowChainedRatchetTree(t)
-			claims, err := tree.parentHashClaimsUnder(crypto, tree.ParentAt(NodeIndex(1)),
+			// the *ParentNode is the caller's, so the arrays it carries go through the
+			// recorder -- installed into the node itself rather than handed to SetParent,
+			// which copies what it is given and would leave the recorder watching an array
+			// this method never sees. The claimant's parent_hash is taken for the same
+			// reason: it is the field the walk compares against.
+			parent := tree.ParentAt(NodeIndex(1))
+			if parent == nil {
+				return nil, fmt.Errorf("node 1 of the row's tree is blank, so this row has no parent node to hand over")
+			}
+			parent.EncryptionKey = HpkePublicKey(take(parent.EncryptionKey))
+			claimant := tree.Leaf(LeafIndex(0))
+			if claimant == nil {
+				return nil, fmt.Errorf("leaf 0 of the row's tree is blank, so this row observes no claim")
+			}
+			claimant.ParentHash = take(claimant.ParentHash)
+			claims, err := tree.parentHashClaimsUnder(crypto, parent,
 				NodeIndex(1), NodeIndex(0), NodeIndex(2))
 			if err != nil {
 				return nil, err
@@ -434,9 +464,16 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		// the tree hash of the merged tree is read as the second value. Both are Hash outputs and
 		// so are KDF.Nh wide under either provider.
 		//
-		// It is handed no caller array at all -- a provider, a leaf index and a decoded path --
-		// so it is outside the retention gate's derived class by its signature, which is that
-		// gate's own rule rather than an excuse.
+		// Every array of the decoded path goes through the recorder, and that is the correction
+		// this row carries. The first reading of the retention class asked whether a parameter
+		// WAS a byte slice, so this method -- whose only caller arrays arrive inside the
+		// *UpdatePath -- sat outside the gate by its signature, and the row said so as though
+		// it were principled. It is not: path.Nodes[i].EncryptionKey, path.LeafNode.ParentHash
+		// and path.LeafNode.Signature are decoded straight off the wire, the caller still owns
+		// the buffer they were cut from, and what the merge keeps is state cut from them that
+		// outlives the call. reachesByteSliceType is the reading that holds it, and the
+		// encryption keys the merge INSTALLED are read below alongside the hashes it computes,
+		// because those are the values a merge that skipped the copy would alias.
 		{name: "(*RatchetTree).MergeUpdatePath", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
 			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 			signer, _, err := fixed.SignatureKeyPair()
@@ -458,6 +495,22 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				return nil, fmt.Errorf("the row's tree gave leaf 0 a filtered direct path of %d nodes, and this row needs one below the root to read",
 					len(plan.Path))
 			}
+			// the caller's storage, replaced in place with arrays the recorder watches. The
+			// bytes are the same ones, so nothing the merge checks answers differently; what
+			// changes is that the arrays now belong to a caller this test can ask about.
+			for i := range path.Nodes {
+				path.Nodes[i].EncryptionKey = HpkePublicKey(take(path.Nodes[i].EncryptionKey))
+				for j := range path.Nodes[i].EncryptedPathSecret {
+					sealed := &path.Nodes[i].EncryptedPathSecret[j]
+					sealed.KemOutput = take(sealed.KemOutput)
+					sealed.Ciphertext = take(sealed.Ciphertext)
+				}
+			}
+			path.LeafNode.EncryptionKey = HpkePublicKey(take(path.LeafNode.EncryptionKey))
+			path.LeafNode.SignatureKey = SignaturePublicKey(take(path.LeafNode.SignatureKey))
+			path.LeafNode.Credential.Identity = take(path.LeafNode.Credential.Identity)
+			path.LeafNode.ParentHash = take(path.LeafNode.ParentHash)
+			path.LeafNode.Signature = take(path.LeafNode.Signature)
 			receiver := providerRowRatchetTree(t)
 			if err := receiver.MergeUpdatePath(crypto, LeafIndex(0), path); err != nil {
 				return nil, err
@@ -473,6 +526,32 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 					content: parent.ParentHash,
 				})
 			}
+			// the keys the merge COPIED, one per node of the path including the topmost. An
+			// X25519 public key is 32 octets whatever the kdf does, so the content is a
+			// rendering and the array itself is named as storage -- see
+			// providerDrivenMethodValue.storage. They still move across the two providers,
+			// because the path they were copied from was built through the row's provider,
+			// so the routing differential reads them as the derived values they descend from.
+			for _, x := range plan.Path {
+				parent := receiver.ParentAt(x)
+				if parent == nil {
+					return nil, fmt.Errorf("node %d is blank after the merge, so this row observes nothing there", x)
+				}
+				values = append(values, providerDrivenMethodValue{
+					name:    fmt.Sprintf("the encryption key the merge installed at node %d", x),
+					content: []byte(fmt.Sprintf("node %d encryption key: %s", x, HexOf(parent.EncryptionKey))),
+					storage: parent.EncryptionKey,
+				})
+			}
+			// and the leaf the merge installed, whose signature is 64 octets -- neither
+			// provider's KDF.Nh, so it is read raw rather than rendered
+			merged := receiver.Leaf(LeafIndex(0))
+			if merged == nil {
+				return nil, fmt.Errorf("leaf 0 is blank after the merge, so this row observes nothing there")
+			}
+			values = append(values, providerDrivenMethodValue{
+				name: "the signature of the leaf the merge installed", content: merged.Signature,
+			})
 			treeHash, err := receiver.TreeHash(crypto)
 			if err != nil {
 				return nil, err
@@ -495,9 +574,14 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		// cut to the provider's own digest width. Neither is a key, so neither carries the X25519
 		// coincidence constructionsWhoseAnswerOnlyCoincidesWithKdfNh records for DeriveKeyPair.
 		//
-		// The group context is the one array the caller still owns, so it is the one thing taken
-		// through the recorder, and the same slice goes into the seal and the open so the
-		// retention gate reads exactly one array.
+		// The caller still owns the group context, the decoded path and the private state it
+		// hands in, and all three go through the recorder. The path's arrays are taken AFTER
+		// the merge, so a defect this row reports is the decrypt's rather than the merge's --
+		// that method has a row of its own one entry up. The state's leaf key is the sharpest
+		// of the three: NodePrivateKey answers a COPY of it precisely so the decrypt can erase
+		// the copy after opening with it, and an arm that answered the live array instead
+		// would have this call zeroing a key the caller is still using, which the recorder
+		// reads as an argument that came back changed.
 		{name: "(*RatchetTree).DecryptUpdatePath", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
 			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 			signer, _, err := fixed.SignatureKeyPair()
@@ -539,7 +623,18 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			if err := receiver.MergeUpdatePath(crypto, LeafIndex(0), path); err != nil {
 				return nil, err
 			}
+			for i := range path.Nodes {
+				path.Nodes[i].EncryptionKey = HpkePublicKey(take(path.Nodes[i].EncryptionKey))
+				for j := range path.Nodes[i].EncryptedPathSecret {
+					sealed := &path.Nodes[i].EncryptedPathSecret[j]
+					sealed.KemOutput = take(sealed.KemOutput)
+					sealed.Ciphertext = take(sealed.Ciphertext)
+				}
+			}
+			// installed into the state rather than handed to the constructor, which copies what
+			// it is given and would leave the recorder watching an array this call never sees
 			state := NewTreeKEMPrivate(LeafIndex(1), receiverPriv)
+			state.EncryptionPriv = HpkePrivateKey(take(receiverPriv))
 			got, err := receiver.DecryptUpdatePath(crypto, LeafIndex(0), path, groupContext, state, nil)
 			if err != nil {
 				// the refusal IS the answer over a provider whose key pairs do not meet, and it
@@ -548,6 +643,7 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				return []providerDrivenMethodValue{
 					{name: "the commit secret", content: refused},
 					{name: "the path secret recovered at the entry point", content: refused},
+					{name: "the leaf private key the answered state carries", content: refused},
 				}, nil
 			}
 			recovered, held := got.Private.PathSecrets[plan.Path[0]]
@@ -558,6 +654,17 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			return []providerDrivenMethodValue{
 				{name: "the commit secret", content: got.CommitSecret},
 				{name: "the path secret recovered at the entry point", content: recovered},
+				// the answered state's own leaf key, which must be a copy of the one handed in
+				// and not a window onto it: a state cut from the caller's is a rejected commit
+				// that has already replaced the epoch the group is still running on. Rendered
+				// for the KDF.Nh gate's sake -- an X25519 private key is 32 octets whatever the
+				// kdf does -- with the array named as storage so the aliasing question still
+				// has something raw to ask about. NOT marked carried, because over the tagging
+				// provider this row answers a refusal rather than the key, which is the same
+				// reason the two values above it move.
+				{name: "the leaf private key the answered state carries",
+					content: []byte("leaf private key: " + HexOf(got.Private.EncryptionPriv)),
+					storage: got.Private.EncryptionPriv},
 			}, nil
 		}},
 		// treekem.go's two. NodePrivateKey has both arms driven, because they are two
@@ -614,6 +721,21 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			if err := tree.SetParent(NodeIndex(1), &ParentNode{EncryptionKey: pub}); err != nil {
 				return nil, err
 			}
+			// the tree is the caller's, so the arrays this method actually reads off it go
+			// through the recorder -- installed into the nodes rather than handed to SetParent,
+			// which copies what it is given and would leave the recorder watching an array this
+			// method never sees. The parent's encryption key is the one the comparison is
+			// against; the leaf's is what the blank-leaf clause reads the node for.
+			installed := tree.ParentAt(NodeIndex(1))
+			if installed == nil {
+				return nil, fmt.Errorf("node 1 of the row's tree is blank, so this row observes nothing there")
+			}
+			installed.EncryptionKey = HpkePublicKey(take(installed.EncryptionKey))
+			leaf := tree.Leaf(LeafIndex(0))
+			if leaf == nil {
+				return nil, fmt.Errorf("leaf 0 of the row's tree is blank, so this row observes nothing there")
+			}
+			leaf.EncryptionKey = HpkePublicKey(take(leaf.EncryptionKey))
 			state := NewTreeKEMPrivate(LeafIndex(0), HpkePrivateKey(bytes.Repeat([]byte{0x94}, 32)))
 			state.PathSecrets[NodeIndex(1)] = pathSecret
 			verdict := []byte("Consistent: the path secret derives the key the tree carries")
@@ -764,18 +886,74 @@ func isByteSliceType(of types.Type) bool {
 	return isBasic && element.Kind() == types.Uint8
 }
 
+// reachesByteSliceType reports whether a value of this type can hold a caller's array: itself,
+// or through any pointer, slice, array, map or struct field it is built out of.
+//
+// The DEPTH is what this adds over isByteSliceType, and it is a correction rather than a
+// refinement. "Handed a caller's array" is a property of what a parameter REACHES and not of
+// how its outermost type is spelled. An *UpdatePath is a struct pointer whose fields are the
+// encryption keys, the parent hash and the signature a caller decoded off the wire, so a
+// method taking one is handed exactly as much of somebody else's storage as a method taking
+// the []byte directly -- and the first version of this filter, reading only the outermost
+// type, left MergeUpdatePath outside the retention gate for that reason alone. Measured, not
+// supposed: with the merge installing the caller's own EncryptionKey array into the tree
+// instead of a copy of it, the whole of mls and message stayed green.
+//
+// Interfaces are not descended into, and that is a decision rather than an omission. An
+// interface value's storage belongs to whatever implements it, the type checker cannot say
+// what that is, and descending into method signatures would put every method here in the
+// class by way of the CryptoProvider itself -- the one argument in all of these signatures
+// that is NOT a caller's array.
+//
+// The walk is bounded by the types already on it, because a type may refer to itself: a Node
+// holds a *LeafNode and this package's tree types are mutually recursive. A type already
+// being visited answers no, which is the ordinary reading of reachability -- whatever it can
+// reach is reachable through the visit that is still open.
+func reachesByteSliceType(of types.Type, visiting map[types.Type]bool) bool {
+	if of == nil || visiting[of] {
+		return false
+	}
+	visiting[of] = true
+	if isByteSliceType(of) {
+		return true
+	}
+	switch under := of.Underlying().(type) {
+	case *types.Pointer:
+		return reachesByteSliceType(under.Elem(), visiting)
+	case *types.Slice:
+		return reachesByteSliceType(under.Elem(), visiting)
+	case *types.Array:
+		return reachesByteSliceType(under.Elem(), visiting)
+	case *types.Chan:
+		return reachesByteSliceType(under.Elem(), visiting)
+	case *types.Map:
+		return reachesByteSliceType(under.Key(), visiting) ||
+			reachesByteSliceType(under.Elem(), visiting)
+	case *types.Struct:
+		for i := 0; i < under.NumFields(); i++ {
+			if reachesByteSliceType(under.Field(i).Type(), visiting) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // providerDrivenMethodNamesTakingCallerBytes is the subset of the class above that is handed
 // an array the caller still owns.
 //
-// Derived rather than listed, and derived as the property itself: a method handed no byte
-// slice cannot write into a caller's array and cannot keep one, so it is outside the
-// retention gate by what its signature is rather than by an excuse somebody wrote.
+// Derived rather than listed, and derived as the property itself: a method that can reach no
+// byte slice through any of its parameters cannot write into a caller's array and cannot keep
+// one, so it is outside the retention gate by what its signature is rather than by an excuse
+// somebody wrote. The reading is reachesByteSliceType's rather than isByteSliceType's, which
+// is the whole of the difference between this gate holding the methods that take wire-decoded
+// structures and this gate skipping them.
 func providerDrivenMethodNamesTakingCallerBytes(t *testing.T) []string {
 	t.Helper()
 	names := []string{}
 	for _, method := range providerDrivenMethods(t) {
 		for i := 0; i < method.signature.Params().Len(); i++ {
-			if isByteSliceType(method.signature.Params().At(i).Type()) {
+			if reachesByteSliceType(method.signature.Params().At(i).Type(), map[types.Type]bool{}) {
 				names = append(names, method.name)
 				break
 			}
@@ -1049,7 +1227,20 @@ func TestNoMethodHandedAProviderRetainsOrRewritesTheCallerBytes(t *testing.T) {
 				t.Errorf("%s left nothing behind in %s, so that value observed nothing", row.name, value.name)
 				continue
 			}
-			if recorder.aliases(value.content) {
+			// the ARRAY the value stands for, which is the rendering's own storage unless the
+			// row named a separate one. See providerDrivenMethodValue.storage: a rendering is
+			// a fresh array, so a gate reading renderings answers "shares nothing" for every
+			// possible implementation and holds nothing at all.
+			observed := value.content
+			if value.storage != nil {
+				if len(value.storage) == 0 {
+					t.Errorf("%s names storage for %s and it is empty, so nothing reads that value raw",
+						row.name, value.name)
+					continue
+				}
+				observed = value.storage
+			}
+			if recorder.aliases(observed) {
 				t.Errorf("%s kept %s over the storage of one of the arrays it was handed; that array is its caller's and the state outlives the call",
 					row.name, value.name)
 			}
@@ -1060,6 +1251,10 @@ func TestNoMethodHandedAProviderRetainsOrRewritesTheCallerBytes(t *testing.T) {
 		t.Fatalf("%d of the %d methods handed a %s and a caller's array were run through the recorder",
 			compared, len(class), providerInterfaceName)
 	}
+	// the size of the class, logged rather than asserted: what holds the class to the package is
+	// the derivation, and what a number here is worth is a reader seeing the gate shrink.
+	t.Logf("%d of the %d methods handed a %s can reach a caller's array: %v",
+		len(class), len(providerDrivenMethodNames(t)), providerInterfaceName, class)
 }
 
 // TestEveryDeclarationTakingAProviderIsHeldByExactlyOneOfTheTwoClasses is what records the

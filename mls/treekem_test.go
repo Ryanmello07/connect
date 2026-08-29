@@ -4538,6 +4538,16 @@ func TestMergeUpdatePathRefusesASplicedSubtreeThatTheChainAloneAccepts(t *testin
 	if err := spliced.SetParent(5, &ParentNode{EncryptionKey: splicedPub}); err != nil {
 		t.Fatalf("SetParent(5): %v", err)
 	}
+	// what this fixture cannot separate, recorded where the fixture is built rather than left for
+	// a reader to discover. The splice makes the RECEIVER's tree section 7.9.2 invalid too, so the
+	// refusal at the end of this test arrives whether the merge sweeps the tree it is about to
+	// adopt or the one it is about to replace -- measured, not supposed: with
+	// provisional.VerifyParentHashes written as self.VerifyParentHashes this test passed. The
+	// placement is held by TestMergeUpdatePathJudgesTheMergedTreeAndNotTheOneItReplaces, from the
+	// only direction that can reach it, and by the two refusals whose base tree is valid.
+	if err := spliced.VerifyParentHashes(crypto); err == nil {
+		t.Fatal("the spliced tree satisfies section 7.9.2 on its own, so the paragraph above is no longer true and this test now claims more than it holds")
+	}
 	// the commit an honest member 1 publishes over the spliced tree. Node 5 is now non-blank, so
 	// it IS the resolution of the copath child of node 3, and this commit seals node 3's path
 	// secret to the splicer's key.
@@ -5308,6 +5318,9 @@ func TestDecryptUpdatePathUsesAHeldPathSecretWhenItHasOne(t *testing.T) {
 	if _, holds := first.Private.PathSecrets[entry]; !holds {
 		t.Fatalf("member 5 does not hold a path secret for node %d, which is where its ciphertext stands", entry)
 	}
+	// the caller's state recorded WHOLE before the call, because what says a decrypt did not
+	// write through is the values and the key set together. See treeKEMPrivateSnapshot.
+	beforeTheDecrypt := treeKEMPrivateSnapshot(first.Private)
 	second, err := receiverTree.DecryptUpdatePath(crypto, members[0].LeafIndex, secondPath,
 		secondContext, first.Private, nil)
 	if err != nil {
@@ -5319,9 +5332,417 @@ func TestDecryptUpdatePathUsesAHeldPathSecretWhenItHasOne(t *testing.T) {
 	if err := second.Private.Consistent(crypto, receiverTree); err != nil {
 		t.Fatalf("the state after the second commit does not agree with the tree: %v", err)
 	}
-	// the state handed in is not written through: the caller may still throw this commit away.
-	if _, moved := first.Private.PathSecrets[entry]; !moved {
-		t.Fatal("the decrypt mutated the private state it was handed")
+	// the state handed in is not written through: the caller may still throw this commit away,
+	// and the epoch it is still running on is the one that state describes.
+	//
+	// Every field is compared, in both directions, and that is the correction rather than a
+	// flourish. What stood here read only that the key at the entry point was still IN the map --
+	// which the decrypt satisfies whether it clones the caller's state or edits it in place,
+	// because it assigns into PathSecrets and never deletes from it. The difference between the
+	// two implementations is the VALUE under that key, which the aliasing version has already
+	// replaced with the next epoch's rung, and the keys the map has GAINED for every node above
+	// the entry point. Measured, not supposed: with `out := priv.Clone()` written as `out := priv`
+	// the whole of mls and message stayed green against the assertion this replaces.
+	if changed := treeKEMPrivateDifference(beforeTheDecrypt, treeKEMPrivateSnapshot(first.Private)); changed != "" {
+		t.Fatalf("the decrypt mutated the private state it was handed: %s", changed)
+	}
+	// and the answer is a different state rather than the same one handed back, which is the same
+	// defect read from the other end: a decrypt returning its argument reports no difference above
+	// only because there is nothing left to compare against.
+	if second.Private == first.Private {
+		t.Fatalf("the decrypt answered the very state it was handed rather than a new one")
+	}
+	// the rungs really did land somewhere, so the comparison above ran over a decrypt that had
+	// something to write rather than over one that wrote nothing at all
+	if _, wrote := second.Private.PathSecrets[entry]; !wrote {
+		t.Fatalf("the answered state holds no path secret at node %d, so nothing above observed a decrypt that wrote",
+			entry)
+	}
+}
+
+// treeKEMPrivateSnapshot is the WHOLE of a private state, rendered so two of them compare as
+// values rather than as pointers.
+//
+// It exists because the assertion it replaced could not fail. "The decrypt did not write through
+// the state it was handed" was written as "the key at the entry point is still in the map", and
+// DecryptUpdatePath assigns into PathSecrets and never deletes from it -- so that key survives
+// both the implementation that clones the caller's state and the implementation that edits it in
+// place, and the whole of the difference between them is in the VALUE under the key and in the
+// keys the map GAINED. Both are here, along with the leaf index and the leaf private key, because
+// a state is all three and a comparison over one field is the same shape of claim as the one it
+// replaces.
+func treeKEMPrivateSnapshot(priv *TreeKEMPrivate) []string {
+	out := []string{
+		fmt.Sprintf("leaf %d", priv.LeafIndex),
+		fmt.Sprintf("encryption_priv %x", priv.EncryptionPriv),
+	}
+	for _, x := range slices.Sorted(maps.Keys(priv.PathSecrets)) {
+		out = append(out, fmt.Sprintf("path_secret %d %x", x, priv.PathSecrets[x]))
+	}
+	return out
+}
+
+// The first way two snapshots differ, named, or the empty string when they do not differ at all.
+//
+// The length is compared before the entries so that a map which GAINED a rung is reported as the
+// gain it is rather than as whatever line happens to have shifted underneath it.
+func treeKEMPrivateDifference(before []string, after []string) string {
+	if len(before) != len(after) {
+		return fmt.Sprintf("it held %d fields before the call and holds %d after:\n before %v\n after  %v",
+			len(before), len(after), before, after)
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			return fmt.Sprintf("%q became %q", before[i], after[i])
+		}
+	}
+	return ""
+}
+
+// everyByteIsZero reads a slice as erased, and answers no for an empty one on purpose: a loop
+// over a zero length slice finds no non-zero byte and so reports "erased" for a key that was
+// never there, which is the reading that would let an assertion pass over a recorder that
+// captured nothing.
+func everyByteIsZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return len(b) != 0
+}
+
+// keyRecordingCryptoProvider keeps the SLICE HEADER of every private key that crossed the
+// boundary between it and the code under test: the private half of every key pair it derived, and
+// every private key it was handed to open with.
+//
+// It is how an erasure of a LOCAL becomes observable from outside the body that made it.
+// zeroizeSecret writes into the backing array, and secret_zeroize.go's header says that is
+// precisely the part go lets a test see -- every other live slice over the same array observes
+// the zeros. So a recorder holding a second slice over the array a decrypt derived reads zeros
+// when the decrypt erased it and reads the key when the decrypt merely dropped the reference.
+//
+// The class it records is DERIVED and never listed: it is every private key that passes through
+// the provider interface during one call, whatever the body did to reach it. A rung added to the
+// ladder, a second resolution entry tried, or an entry point that turns out to be the member's own
+// leaf rather than a node above it are all recorded without this type being touched, which is the
+// difference between this and a test naming the two calls that happen to be there today.
+type keyRecordingCryptoProvider struct {
+	CryptoProvider
+	derived [][]byte
+	opened  [][]byte
+}
+
+var _ CryptoProvider = (*keyRecordingCryptoProvider)(nil)
+
+func (self *keyRecordingCryptoProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
+	priv, pub, err := self.CryptoProvider.DeriveKeyPair(ikm)
+	if err == nil {
+		self.derived = append(self.derived, priv)
+	}
+	return priv, pub, err
+}
+
+// Recorded before the call rather than after it, and recorded whatever the open answers: the
+// contract DecryptUpdatePath's own comment states is that the key is "erased whether or not the
+// open succeeded", so the arm that must not escape this recorder is the failing one.
+func (self *keyRecordingCryptoProvider) HpkeOpen(priv HpkePrivateKey, kemOutput []byte, info []byte,
+	aad []byte, ciphertext []byte) ([]byte, error) {
+	self.opened = append(self.opened, priv)
+	return self.CryptoProvider.HpkeOpen(priv, kemOutput, info, aad, ciphertext)
+}
+
+// TestDecryptUpdatePathErasesEveryPrivateKeyThatCrossedTheProviderBoundary is the erasure
+// DecryptUpdatePath's header states twice, observed instead of read.
+//
+// Both statements were prose and nothing held either of them: zeroizeSecret(nodePriv) and
+// zeroizeSecret(derivedPriv) were each replaced by a discard and the whole of mls and message
+// stayed green. What the erasure is worth is the paragraph the method header gives -- the
+// comparison at every rung needs the PUBLIC half, DeriveNodeKeyPair answers both, and the private
+// halves of every node between the entry point and the root are otherwise left on the heap of a
+// member that has no further use for them -- and a contract nothing observes is a comment.
+//
+// Both arms of the entry point are driven, because they reach the erasure by different routes and
+// a fixture with one of them holds only half of it. When the entry point is the member's own leaf
+// the key is a COPY of the leaf key it holds, made by NodePrivateKey precisely so this call can
+// erase it, and it reaches the provider only as an argument to the open; when the entry point is a
+// node above the member the key is DERIVED through the provider and never handed back to it. So
+// the recorder reads both directions of the boundary, and a run whose fixture reached only one of
+// them is a failure here rather than a pass over half the property.
+func TestDecryptUpdatePathErasesEveryPrivateKeyThatCrossedTheProviderBoundary(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	erased := func(what string, tree *RatchetTree, sender LeafIndex, path *UpdatePath,
+		groupContext []byte, priv *TreeKEMPrivate, ownLeaf bool) {
+		entryStep, entry, _, found := updatePathEntryFor(t, crypto, tree, sender, priv, nil)
+		if !found {
+			t.Fatalf("%s: the receiver has no entry point in this path, so the fixture decrypts nothing", what)
+		}
+		// the fixture's premise, asserted rather than assumed: which arm of NodePrivateKey this
+		// run reaches is the whole reason there are two of them here.
+		if isOwn := entry == priv.LeafIndex.NodeIndex(); isOwn != ownLeaf {
+			t.Fatalf("%s: the entry point is node %d at step %d and this fixture is meant to enter at %s",
+				what, entry, entryStep, map[bool]string{true: "the member's own leaf", false: "a node above it"}[ownLeaf])
+		}
+		recorder := &keyRecordingCryptoProvider{CryptoProvider: crypto}
+		if _, err := tree.DecryptUpdatePath(recorder, sender, path, groupContext, priv, nil); err != nil {
+			t.Fatalf("%s: DecryptUpdatePath: %v", what, err)
+		}
+		if len(recorder.derived) == 0 {
+			t.Fatalf("%s: the decrypt derived no key pair through its provider, so the ladder half of this test observed nothing", what)
+		}
+		if len(recorder.opened) == 0 {
+			t.Fatalf("%s: the decrypt opened nothing through its provider, so the entry point half of this test observed nothing", what)
+		}
+		for i, key := range recorder.derived {
+			if !everyByteIsZero(key) {
+				t.Errorf("%s: the private half of key pair %d of the %d this decrypt derived reads %x when it returned, so it was dropped rather than erased",
+					what, i, len(recorder.derived), key)
+			}
+		}
+		for i, key := range recorder.opened {
+			if !everyByteIsZero(key) {
+				t.Errorf("%s: private key %d of the %d this decrypt opened with reads %x when it returned, so it was dropped rather than erased",
+					what, i, len(recorder.opened), key)
+			}
+		}
+	}
+
+	// the entry point that is the member's own leaf: member 1 stands in the resolution of the
+	// copath child of member 0's lowest path node, as itself.
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, groupContext := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	receiverTree := tree.Clone()
+	if err := receiverTree.MergeUpdatePath(crypto, members[0].LeafIndex, path); err != nil {
+		t.Fatalf("MergeUpdatePath: %v", err)
+	}
+	erased("the entry point is the member's own leaf", receiverTree, members[0].LeafIndex, path,
+		groupContext, NewTreeKEMPrivate(members[1].LeafIndex, members[1].EncryptionPriv), true)
+
+	// and the entry point that is a node above the member, which takes two commits to reach for
+	// TestDecryptUpdatePathUsesAHeldPathSecretWhenItHasOne's reason: a member holds a secret for a
+	// node above it only after some earlier commit sealed one to it.
+	wide, wideMembers := newTestTree(t, crypto, 8)
+	_, firstPath, _, firstContext := createAndEncryptPath(t, crypto, wide, wideMembers[4], nil)
+	wideReceiver := wide.Clone()
+	if err := wideReceiver.MergeUpdatePath(crypto, wideMembers[4].LeafIndex, firstPath); err != nil {
+		t.Fatalf("first MergeUpdatePath: %v", err)
+	}
+	first, err := wideReceiver.DecryptUpdatePath(crypto, wideMembers[4].LeafIndex, firstPath,
+		firstContext, NewTreeKEMPrivate(wideMembers[5].LeafIndex, wideMembers[5].EncryptionPriv), nil)
+	if err != nil {
+		t.Fatalf("first DecryptUpdatePath: %v", err)
+	}
+	_, secondPath, _, secondContext := createAndEncryptPath(t, crypto, wideReceiver, wideMembers[0], nil)
+	if err := wideReceiver.MergeUpdatePath(crypto, wideMembers[0].LeafIndex, secondPath); err != nil {
+		t.Fatalf("second MergeUpdatePath: %v", err)
+	}
+	erased("the entry point is a node the member holds a secret for", wideReceiver,
+		wideMembers[0].LeafIndex, secondPath, secondContext, first.Private, false)
+}
+
+// TestMergeUpdatePathJudgesTheMergedTreeAndNotTheOneItReplaces is the half of section 7.9.2's
+// PLACEMENT that the spliced-subtree fixture cannot state.
+//
+// That fixture refuses, and it refuses under a merge that swept the tree it was about to REPLACE
+// just as readily as under one that swept the tree it is about to adopt, because the splice makes
+// both of them section 7.9.2 invalid. So it says the sweep happens and says nothing about which
+// tree it happens over -- and the placement is the whole of what makes a commit judgeable at all,
+// since the tree a commit has to satisfy is the one it produces.
+//
+// This is the other direction, and it is the direction only a positive case can reach: a receiver
+// whose CURRENT tree fails the rule at a node the incoming commit repairs. A merge sweeping the
+// old tree refuses a perfectly good commit here and leaves the member unable to follow the group;
+// a merge sweeping the merged tree accepts it. The stale node is put on the sender's own direct
+// path deliberately, because that is the path the merge blanks and refills, and it is what makes
+// the repair a consequence of the commit rather than of anything this test does afterwards.
+func TestMergeUpdatePathJudgesTheMergedTreeAndNotTheOneItReplaces(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, unclaimed, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	// node 1 is the parent of leaves 0 and 1 and is on the sender's direct path. Nothing in this
+	// tree is parent-hash valid with respect to it, so section 7.9.2's exactly-one requirement
+	// refuses the tree as it stands.
+	stale := tree.Clone()
+	if err := stale.SetParent(NodeIndex(1), &ParentNode{EncryptionKey: unclaimed}); err != nil {
+		t.Fatalf("SetParent(1): %v", err)
+	}
+	// the fixture's premise, asserted rather than assumed. Without it a later change that made
+	// this tree valid would leave the test passing while comparing two trees that both verify,
+	// which is exactly the shape it is written to avoid.
+	if err := stale.VerifyParentHashes(crypto); err == nil {
+		t.Fatal("the receiver's tree satisfies section 7.9.2, so the merge below is not being asked to tell two trees apart")
+	}
+	_, path, _, _ := createAndEncryptPath(t, crypto, stale, members[0], nil)
+	merged := stale.Clone()
+	if err := merged.MergeUpdatePath(crypto, members[0].LeafIndex, path); err != nil {
+		t.Fatalf("the merge refused a commit that repairs the very node the receiver's tree fails at, so it is judging the tree it was about to replace: %v", err)
+	}
+	// and the tree it adopted really is the repaired one, so the acceptance above is not a sweep
+	// that was skipped
+	if err := merged.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("the tree the merge adopted does not satisfy section 7.9.2: %v", err)
+	}
+}
+
+// TestDecryptUpdatePathCarriesForwardASecretForANodeTheMergeBlanked is the boundary
+// DecryptUpdatePath's header states, held here so a later pass that decides to prune has to come
+// and say so.
+//
+// The decrypt copies the caller's whole state and writes the new rungs into the copy. It prunes
+// nothing, and it cannot: it knows the merged tree and the caller's secrets and has no way to tell
+// a secret that is stale from one for a node it simply did not walk. So a secret for a node this
+// commit BLANKED -- a node on the sender's direct path that the filtered path drops, because its
+// copath child resolves to nothing -- travels into the answered state, where
+// TreeKEMPrivate.Consistent refuses the whole state for it.
+//
+// The refusal is the right one and the input was already stale, which is why this is a boundary
+// and not a defect: the state handed in agreed with the tree it was built against, and what made
+// it stale is the commit, an epoch after the removal that emptied the subtree. What this pins is
+// that the condition arrives as ErrPathSecretMismatch out of Consistent rather than as a silently
+// wrong state or as a refusal from the decrypt, so the layer above chooses knowing which it is.
+func TestDecryptUpdatePathCarriesForwardASecretForANodeTheMergeBlanked(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 8)
+	// leaves 2 and 3 leave the group, which empties the resolution of node 5 -- the copath child
+	// of node 3 for a sender at leaf 0. Node 3 is on that sender's DIRECT path and is dropped from
+	// its FILTERED path, which is the one shape that gets a node blanked and not refilled.
+	stale := tree.Clone()
+	for _, gone := range []LeafIndex{2, 3} {
+		if err := stale.Blank(gone.NodeIndex()); err != nil {
+			t.Fatalf("Blank(leaf %d): %v", gone, err)
+		}
+	}
+	// the secret the receiver holds for node 3, and the key node 3 carries because of it. Built
+	// this way round so the state below agrees with the tree it is about to be handed: what makes
+	// it stale is the commit and not the fixture.
+	staleSecret := crypto.Random(crypto.HashSize())
+	_, stalePub, err := DeriveNodeKeyPair(crypto, staleSecret)
+	if err != nil {
+		t.Fatalf("DeriveNodeKeyPair: %v", err)
+	}
+	if err := stale.SetParent(NodeIndex(3), &ParentNode{EncryptionKey: stalePub}); err != nil {
+		t.Fatalf("SetParent(3): %v", err)
+	}
+	priv := NewTreeKEMPrivate(members[1].LeafIndex, members[1].EncryptionPriv)
+	priv.PathSecrets[NodeIndex(3)] = cloneBytes(staleSecret)
+	if err := priv.Consistent(crypto, stale); err != nil {
+		t.Fatalf("the state does not agree with the tree it was built against, so this fixture is stale before the commit rather than because of it: %v", err)
+	}
+
+	_, path, _, groupContext := createAndEncryptPath(t, crypto, stale, members[0], nil)
+	receiverTree := stale.Clone()
+	if err := receiverTree.MergeUpdatePath(crypto, members[0].LeafIndex, path); err != nil {
+		t.Fatalf("MergeUpdatePath: %v", err)
+	}
+	// the premise: the commit really did blank node 3 and really did not refill it
+	if receiverTree.ParentAt(NodeIndex(3)) != nil {
+		t.Fatal("node 3 is occupied after the commit, so this fixture no longer reaches the shape it is named for")
+	}
+	got, err := receiverTree.DecryptUpdatePath(crypto, members[0].LeafIndex, path, groupContext,
+		priv, nil)
+	if err != nil {
+		t.Fatalf("DecryptUpdatePath refused a commit that is well formed: %v", err)
+	}
+	// carried forward, VALUE and all, rather than dropped
+	carried, held := got.Private.PathSecrets[NodeIndex(3)]
+	if !held {
+		t.Fatal("the decrypt pruned the secret for the blanked node; that is a defensible choice and it is not the one this test was written against, so move the boundary paragraph on DecryptUpdatePath in the same commit")
+	}
+	if !bytes.Equal(carried, staleSecret) {
+		t.Fatalf("the secret carried forward for node 3 is %x and the state held %x", carried, staleSecret)
+	}
+	// and the state the caller is handed is refused against the tree it belongs to, by the
+	// sentinel that names the condition
+	if err := got.Private.Consistent(crypto, receiverTree); !errors.Is(err, ErrPathSecretMismatch) {
+		t.Fatalf("the answered state gave Consistent err = %v, want ErrPathSecretMismatch", err)
+	}
+}
+
+// TestDecryptUpdatePathRefusesARecoveredSecretThatIsNotAKdfWidth is errPathSecretLength, over
+// every width around the one the provider answers rather than over one wrong number.
+//
+// A sender is free to seal a plaintext of any length, and nothing downstream of the open objects:
+// DeriveNodeKeyPair derives a key pair from a secret of any width, and the ValSem204 comparison at
+// every rung is against a key that same sender announced, so a sender-controlled pair agrees with
+// itself all the way to the root. The two ends then hold different commit secrets, and what
+// separates them is the key schedule's confirmation tag, an epoch later and two layers up.
+//
+// The control at the end is what says the refusal is about the WIDTH: a secret of the right width
+// that is simply the wrong secret is refused too, and refused as errPathKeyMismatch. Without it a
+// check that had degenerated into "any resealed ciphertext is refused" would pass this.
+func TestDecryptUpdatePathRefusesARecoveredSecretThatIsNotAKdfWidth(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, groupContext := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	receiverTree := tree.Clone()
+	if err := receiverTree.MergeUpdatePath(crypto, members[0].LeafIndex, path); err != nil {
+		t.Fatalf("MergeUpdatePath: %v", err)
+	}
+	probe := NewTreeKEMPrivate(members[1].LeafIndex, members[1].EncryptionPriv)
+	step, entry, position, found := updatePathEntryFor(t, crypto, receiverTree, members[0].LeafIndex,
+		probe, nil)
+	if !found {
+		t.Fatal("no entry point for member 1")
+	}
+	// the key this member's own ciphertext is sealed to, read off the tree rather than assumed, so
+	// every reseal below is one this member really does open
+	entryNode := receiverTree.Get(entry)
+	if entryNode == nil || entryNode.Leaf == nil {
+		t.Fatalf("the entry point at node %d is not an occupied leaf, so the reseal below cannot address it", entry)
+	}
+	entryPub := entryNode.Leaf.EncryptionKey
+
+	reseal := func(plaintext []byte) *UpdatePath {
+		sealed, err := SealWithLabel(crypto, entryPub, updatePathNodeLabel, groupContext, plaintext)
+		if err != nil {
+			t.Fatalf("SealWithLabel: %v", err)
+		}
+		tampered := &UpdatePath{LeafNode: path.LeafNode,
+			Nodes: append([]UpdatePathNode{}, path.Nodes...)}
+		tampered.Nodes[step].EncryptedPathSecret = append([]HpkeCiphertext{},
+			tampered.Nodes[step].EncryptedPathSecret...)
+		tampered.Nodes[step].EncryptedPathSecret[position] = *sealed
+		return tampered
+	}
+
+	nh := crypto.HashSize()
+	widths := 0
+	for _, width := range []int{0, 1, nh - 1, nh + 1, 2 * nh} {
+		fresh := NewTreeKEMPrivate(members[1].LeafIndex, members[1].EncryptionPriv)
+		if _, err := receiverTree.DecryptUpdatePath(crypto, members[0].LeafIndex,
+			reseal(bytes.Repeat([]byte{0x7e}, width)), groupContext, fresh,
+			nil); !errors.Is(err, errPathSecretLength) {
+			t.Errorf("a path secret of %d octets under a provider whose KDF.Nh is %d gave err = %v, want errPathSecretLength",
+				width, nh, err)
+		}
+		widths += 1
+	}
+	if widths < 2 {
+		t.Fatalf("only %d width was swept, so a check written against one number would pass this", widths)
+	}
+	// the control: the same reseal at the width the provider answers is not this refusal. It is
+	// still refused -- the rung does not derive the announced key -- and by the other sentinel,
+	// which is what says this check reads a length rather than reading "resealed".
+	fresh := NewTreeKEMPrivate(members[1].LeafIndex, members[1].EncryptionPriv)
+	if _, err := receiverTree.DecryptUpdatePath(crypto, members[0].LeafIndex,
+		reseal(bytes.Repeat([]byte{0x7e}, nh)), groupContext, fresh,
+		nil); !errors.Is(err, errPathKeyMismatch) {
+		t.Fatalf("a wrong path secret of the right width gave err = %v, want errPathKeyMismatch", err)
 	}
 }
 

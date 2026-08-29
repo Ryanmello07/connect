@@ -1068,6 +1068,20 @@ var errPathDecrypt = errors.New("mls: the update path ciphertext addressed to th
 // it would otherwise be accepted.
 var errPathKeyMismatch = errors.New("mls: an update path node's announced key is not the one its path secret derives")
 
+// errPathSecretLength is the recovered path secret arriving at a width the suite's kdf does not
+// answer, carried unexported for errPathDecrypt's reason.
+//
+// A sender seals a plaintext of whatever length it likes, and every check this decrypt makes
+// afterwards agrees with a sender that agrees with itself: DeriveNodeKeyPair derives a key pair
+// from a secret of any width, and the ValSem204 comparison is against a key that same sender
+// announced. So a short or a long rung reaches the root with nothing here objecting, and the two
+// ends of the group walk away holding different commit secrets -- which the key schedule's
+// confirmation tag does separate, two layers up and one epoch later, with nothing left to say
+// which octets were wrong. RFC 9420 section 7.6 does not spell this check at this layer; it is
+// here because the width IS knowable here, from the provider the caller handed in, and a refusal
+// that names the path is worth more than a confirmation tag that names the epoch.
+var errPathSecretLength = errors.New("mls: the recovered update path secret is not the width of the suite's kdf")
+
 // updatePathCiphertextsMatchTheTargets is the section 7.6 relation UpdatePathNode's own comment
 // names as the boundary this layer owns: one ciphertext per node of the resolution of that node's
 // copath child, at every node of the path.
@@ -1153,10 +1167,23 @@ type PathDecryptResult struct {
 //
 // Every rung is checked against the announced key (ValSem204) before it is kept, and the count of
 // ciphertexts is checked against the resolution at every node of the path (section 7.6) before
-// anything is opened. What each of the three refusals means is written on the sentinels:
+// anything is opened. What each of the four refusals means is written on the sentinels:
 // errPathLength is a path of the wrong shape for this tree, errPathDecrypt is our own ciphertext
-// failing to open, ErrNoPathSecret is the ordinary condition of a member this commit did not seal
-// to.
+// failing to open, errPathSecretLength is our own ciphertext opening to something that is not a
+// rung of this suite's ladder, ErrNoPathSecret is the ordinary condition of a member this commit
+// did not seal to.
+//
+// What the answered state carries forward is the WHOLE of what the caller's state held, plus the
+// rungs from the entry point up. Nothing is pruned, and that is a BOUNDARY worth stating rather
+// than an oversight. This method knows the merged tree and the caller's secrets and has no way to
+// tell a secret that is stale from one for a node it simply did not walk, so it keeps both. A
+// caller whose state held a secret for a node this commit BLANKED therefore carries that secret
+// into the answer, and TreeKEMPrivate.Consistent is what refuses the result: a held secret whose
+// node is blank answers ErrPathSecretMismatch there. Reachable only from a state that was already
+// stale before this commit arrived -- the blanking happens at the proposal that removed the
+// subtree, one epoch earlier -- so it is garbage in and a named refusal out rather than a fault
+// introduced here. TestDecryptUpdatePathCarriesForwardASecretForANodeTheMergeBlanked is what
+// holds it, so a later pass that decides to prune has to say so there.
 //
 // The private half of every node key from the entry point up is derived, compared and ERASED. The
 // comparison needs the public half alone and DeriveNodeKeyPair answers both, so leaving the
@@ -1216,6 +1243,13 @@ func (self *RatchetTree) DecryptUpdatePath(crypto CryptoProvider, sender LeafInd
 		zeroizeSecret(nodePriv)
 		if err != nil {
 			return nil, errPathDecrypt
+		}
+		// the width, checked here rather than left for the ladder. See errPathSecretLength:
+		// everything below this line agrees with a sender that agrees with itself, so this is
+		// the last place a wrong width is a statement about a message rather than about an
+		// epoch. The comparison is a length and carries no secret, so it is a plain one.
+		if len(opened) != crypto.HashSize() {
+			return nil, errPathSecretLength
 		}
 		secret = opened
 		break

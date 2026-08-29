@@ -738,6 +738,11 @@ var pinBlockSizes = map[string]int{
 	"crypto_test.go":            1,
 	"key_schedule_deps_test.go": 77,
 	"pins_test.go":              8,
+	// keyRecordingCryptoProvider, the wrapper the update path erasure gate reads private
+	// keys through. It is written out method by method for taggingCryptoProvider's reason
+	// and carries the same pin: drift between the interface and the wrapper has to fail at
+	// build rather than at the gate reading it.
+	"treekem_test.go": 1,
 }
 
 // blankPinControl holds two package level pins and one blank assignment inside a function
