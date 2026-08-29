@@ -18,6 +18,7 @@
 package mls
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -163,4 +164,149 @@ func (self *AuthenticatedContent) ProposalRef(crypto CryptoProvider) (ProposalRe
 		return nil, err
 	}
 	return ProposalRef(MakeProposalRef(crypto, encoded)), nil
+}
+
+// ---------------------------------------------------------------------------
+// FramedContentTBS
+// ---------------------------------------------------------------------------
+
+// errNilFramedContent is what FramedContentTBSBytes answers a caller that passed no content
+// at all.
+//
+// A refusal rather than a dereference, for ErrNilCryptoProvider's reason one layer over: a
+// panic out of a library takes the caller's process rather than its call, and says nothing
+// about which argument was wrong. It is unexported because no sibling plan owns an exported
+// twin -- the validation catalogue's ten are structural framing errors and this is an
+// argument check -- and the stand in gate watches it for one landing beside it.
+var errNilFramedContent = errors.New("mls: framed content tbs requires a framed content")
+
+// senderBindsGroupContext reports whether the FramedContentTBS of a sender of this type
+// inlines the group context, which is RFC 9420 section 6.1's select on sender_type.
+//
+// It is a function rather than two lines inside MarshalMLS because the rule is a fact about
+// the SENDER TYPE and is asked twice about one preimage -- once to refuse a caller that
+// supplied the wrong thing, once to decide what to write -- and two spellings of "does this
+// sender bind the epoch" are exactly the pair that can disagree. A preimage built on one
+// answer and validated against the other verifies against itself and against nobody.
+//
+// The two arms do not cost the same thing when they are wrong, which is why neither is a
+// default. member and new_member_commit bind the group context, so a preimage that omitted it
+// is a signature valid in EVERY epoch of the group -- a message a peer replays into a later
+// epoch and every implementation accepts. external and new_member_proposal do not, so a
+// preimage that added one is a signature no other implementation computes.
+func senderBindsGroupContext(senderType SenderType) (bool, error) {
+	switch senderType {
+	case SenderTypeMember, SenderTypeNewMemberCommit:
+		return true, nil
+	case SenderTypeExternal, SenderTypeNewMemberProposal:
+		return false, nil
+	}
+	return false, fmt.Errorf("%w: %d", ErrUnknownSenderType, senderType)
+}
+
+// framedContentTBS is RFC 9420 section 6.1's structure of that name:
+//
+//	struct {
+//	    ProtocolVersion version = mls10;
+//	    WireFormat wire_format;
+//	    FramedContent content;
+//	    select (FramedContentTBS.content.sender.sender_type) {
+//	        case member:
+//	        case new_member_commit:
+//	            GroupContext context;
+//	        case external:
+//	        case new_member_proposal:
+//	            struct{};
+//	    };
+//	} FramedContentTBS;
+//
+// It is unexported for confirmedTranscriptHashInput's reason: every caller wants the
+// serialized BYTES and takes them through FramedContentTBSBytes, while what this needs to BE
+// is a type with a codec, so that the preimage is written by one encoder rather than by a
+// second hand rolled layout of fields FramedContent already knows how to write.
+//
+// GroupContext is the ALREADY SERIALIZED context rather than a *GroupContext, which is the one
+// place this structure departs from the RFC's spelling and is worth being exact about. The
+// presentation language writes a GroupContext STRUCT here, so the bytes are inlined with no
+// length prefix of their own -- and every caller in this package already holds the encoded
+// form, because the key schedule expands over exactly those bytes. Taking the struct instead
+// would be a second encode of a value the caller has already encoded, and two encodes of one
+// value agree until the day one of them changes.
+type framedContentTBS struct {
+	WireFormat   WireFormat
+	Content      FramedContent
+	GroupContext []byte
+}
+
+// MarshalMLS refuses an unregistered wire format before it writes, for the reason
+// confirmedTranscriptHashInput.MarshalMLS does and one degree more sharply: the wire format is
+// in this preimage precisely so that a PublicMessage cannot be replayed as a PrivateMessage or
+// the reverse, and a signature over a code point no registry declares is one no peer can
+// attribute to either.
+//
+// The group context goes through WriteRaw and NOT WriteOpaque, and that is this preimage's
+// second trap. An opaque<V> here puts a varint length prefix in front of the context, which
+// produces a signature this package verifies perfectly against itself and every other
+// implementation rejects. Nothing round trips through this structure, so no symmetry property
+// in the package can see the substitution; what sees it is the published corpus.
+func (self *framedContentTBS) MarshalMLS(w *syntax.Writer) error {
+	switch self.WireFormat {
+	case WireFormatPublicMessage, WireFormatPrivateMessage, WireFormatWelcome,
+		WireFormatGroupInfo, WireFormatKeyPackage:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownWireFormat, self.WireFormat)
+	}
+	binds, err := senderBindsGroupContext(self.Content.Sender.SenderType)
+	if err != nil {
+		return err
+	}
+	// both directions are refusals rather than corrections, and both happen before an octet
+	// is written. A caller that passed a context believes it is being covered, and a preimage
+	// one field shorter than the caller thinks is what a cross epoch replay is built out of;
+	// a caller that passed none for a sender type that binds one would otherwise sign a
+	// message that is valid in every epoch this group ever has.
+	switch {
+	case binds && len(self.GroupContext) == 0:
+		return ErrMissingGroupContext
+	case !binds && len(self.GroupContext) != 0:
+		return ErrUnexpectedGroupContext
+	}
+	w.WriteUint16(uint16(ProtocolVersionMls10))
+	w.WriteUint16(uint16(self.WireFormat))
+	if err := self.Content.MarshalMLS(w); err != nil {
+		return err
+	}
+	w.WriteRaw(self.GroupContext)
+	return nil
+}
+
+// The signature registry section 7.2 fixes for this codec, as a compile time statement rather
+// than a sentence.
+//
+// A signature pin and not the var _ syntax.Codec line every other structure in this file
+// carries, because this type deliberately has no UnmarshalMLS and cannot satisfy that
+// interface. A FramedContentTBS appears on no wire: it is assembled by a signer and
+// reassembled by a verifier out of a message that was decoded through AuthenticatedContent's
+// own codec, and the group context inside it carries no length prefix, so a decoder would have
+// to read to the end of its reader and could not tell a truncated context from a whole one. A
+// later task that "completes" this codec by adding one stops compiling here.
+var _ func(*framedContentTBS, *syntax.Writer) error = (*framedContentTBS).MarshalMLS
+
+// FramedContentTBSBytes is the byte string RFC 9420 section 6.1 signs under the label
+// "FramedContentTBS", and the byte string a verifier rebuilds in order to check one.
+//
+// groupContext is an ALREADY SERIALIZED GroupContext, inlined with no length prefix, present
+// only for the two sender types whose signatures are bound to an epoch. Supplying it for the
+// other two is refused rather than ignored -- senderBindsGroupContext says what each direction
+// costs.
+func FramedContentTBSBytes(wireFormat WireFormat, content *FramedContent, groupContext []byte) ([]byte, error) {
+	if content == nil {
+		return nil, errNilFramedContent
+	}
+	tbs := &framedContentTBS{
+		WireFormat:   wireFormat,
+		Content:      *content,
+		GroupContext: groupContext,
+	}
+	return syntax.Marshal(tbs)
 }

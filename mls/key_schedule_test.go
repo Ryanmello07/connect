@@ -4338,6 +4338,41 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{nodePriv, nodePub}
 		}},
+		// section 6.1's framed content signature and its verify. Neither reads a length off the
+		// provider at all -- what they take from one is a signature and a verification -- so
+		// what these two rows state is the other half of the equivalence: both must WORK over a
+		// provider whose KDF.Nh is not 32. The group context they are built over carries hashes
+		// at the provider's own width, so a body that had cut anything about the preimage to a
+		// written down 32 refuses here. The signature is the answer read, and at 64 octets it
+		// is neither provider's Nh, so it reports no coincidence belonging to a length this
+		// gate chose; the verify answers no bytes at all and is named as such.
+		{name: "SignAuthenticatedContent", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), framingStubGroupContext(t, crypto))
+			if signErr != nil {
+				t.Fatalf("SignAuthenticatedContent over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), signErr)
+			}
+			return [][]byte{authContent.Auth.Signature}
+		}},
+		{name: "VerifyAuthenticatedContent", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the verify row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), signErr)
+			}
+			verifyPub, keyErr := signaturePublicKeyOf(framingStubSignaturePriv())
+			if keyErr != nil {
+				t.Fatalf("the public half of the key the verify row is built over: %v", keyErr)
+			}
+			if verifyErr := VerifyAuthenticatedContent(crypto, verifyPub, authContent, groupContext); verifyErr != nil {
+				t.Fatalf("VerifyAuthenticatedContent over a provider whose KDF.Nh is %d refused a signature made over the same one: %v",
+					crypto.HashSize(), verifyErr)
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })
@@ -4355,6 +4390,18 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			t.Errorf("%s answered %d results at KDF.Nh %d and %d at KDF.Nh %d",
 				testCase.name, len(overTheNarrowProvider), narrow.HashSize(),
 				len(overTheWideProvider), wide.HashSize())
+			continue
+		}
+		// a construction that answers no bytes has no length for this differential to read, and
+		// the class of those is packageConstructionsAnsweringNoBytes rather than a second list:
+		// the aliasing gate already holds that table to the package's own declarations in both
+		// directions, so a name cannot be here without being a construction that really answers
+		// none. What this row still states is that the call WORKS at either width.
+		if _, answersNoBytes := packageConstructionsAnsweringNoBytes[testCase.name]; answersNoBytes {
+			if len(overTheNarrowProvider) != 0 {
+				t.Errorf("%s is named as answering no bytes and answered %d results",
+					testCase.name, len(overTheNarrowProvider))
+			}
 			continue
 		}
 		if len(overTheNarrowProvider) == 0 {
@@ -6245,6 +6292,7 @@ type messageProtectionKatEntry struct {
 	TreeHash                string `json:"tree_hash"`
 	ConfirmedTranscriptHash string `json:"confirmed_transcript_hash"`
 	MembershipKey           string `json:"membership_key"`
+	SignaturePub            string `json:"signature_pub"`
 	Proposal                string `json:"proposal"`
 	ProposalPub             string `json:"proposal_pub"`
 	Commit                  string `json:"commit"`

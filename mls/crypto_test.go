@@ -2789,6 +2789,12 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	"HpkeSetupBaseR":   "answers an *HpkeContext, the recipient half having no wire output",
 	"X25519PrivateKey": "answers an *ecdh.PrivateKey, which is the library's own storage",
 	"X25519PublicKey":  "answers an *ecdh.PublicKey, which is the library's own storage",
+	// framing's ValSem010, whose whole answer is whether the signature verified. The aliasing
+	// and fresh storage halves have nothing to read; the "leaves its input alone" half still
+	// runs, and it is the half that matters for a verifier, since every array it is handed --
+	// the public key, the message and the group context -- is read again by the caller after
+	// the call.
+	"VerifyAuthenticatedContent": "answers an error and no bytes; what it produces is a verdict",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -3310,6 +3316,51 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 				HpkePrivateKey(take(bytes.Repeat([]byte{0x88}, 32))))
 			return [][]byte{state.EncryptionPriv}
 		}},
+		// section 6.1's signature preimage and the two operations over it. Every array these
+		// are handed -- the signing key, the group context, and the byte fields of the content
+		// -- is read again by the caller after the call, and a preimage or a signature that was
+		// a WINDOW onto one of them changes the next time that caller writes into its own
+		// buffer: a message that verified when it was built and does not afterwards, with
+		// nothing in between to point at.
+		//
+		// The signature is the answer read and not the content beside it in the
+		// AuthenticatedContent, which is deliberate and is why the row names it: that content
+		// IS the caller's own, carried through by design, so reading it here would be holding
+		// this constructor to not doing its job. What must be fresh is what it produces.
+		{name: "FramedContentTBSBytes", call: func(take func([]byte) []byte) [][]byte {
+			tbs, tbsErr := FramedContentTBSBytes(WireFormatPrivateMessage,
+				framingStubFramedContentOver(take), take(framingStubGroupContext(t, crypto)))
+			if tbsErr != nil {
+				t.Fatalf("FramedContentTBSBytes: %v", tbsErr)
+			}
+			return [][]byte{tbs}
+		}},
+		{name: "SignAuthenticatedContent", call: func(take func([]byte) []byte) [][]byte {
+			authContent, signErr := SignAuthenticatedContent(crypto,
+				SignaturePrivateKey(take(framingStubSignaturePriv())), WireFormatPrivateMessage,
+				framingStubFramedContentOver(take), take(framingStubGroupContext(t, crypto)))
+			if signErr != nil {
+				t.Fatalf("SignAuthenticatedContent: %v", signErr)
+			}
+			return [][]byte{authContent.Auth.Signature}
+		}},
+		{name: "VerifyAuthenticatedContent", call: func(take func([]byte) []byte) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the verify row reads: %v", signErr)
+			}
+			verifyPub, keyErr := signaturePublicKeyOf(framingStubSignaturePriv())
+			if keyErr != nil {
+				t.Fatalf("the public half of the key the verify row is built over: %v", keyErr)
+			}
+			if verifyErr := VerifyAuthenticatedContent(crypto, SignaturePublicKey(take(verifyPub)),
+				authContent, take(groupContext)); verifyErr != nil {
+				t.Fatalf("VerifyAuthenticatedContent refused a signature made over the same message: %v", verifyErr)
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3718,6 +3769,8 @@ var providerConstructionValues = map[string]any{
 	"NewLeafNode":                   NewLeafNode,
 	"DerivePathSecrets":             DerivePathSecrets,
 	"DeriveNodeKeyPair":             DeriveNodeKeyPair,
+	"SignAuthenticatedContent":      SignAuthenticatedContent,
+	"VerifyAuthenticatedContent":    VerifyAuthenticatedContent,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -4038,6 +4091,11 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 	}
 	arguments["SignaturePrivateKey"] = signaturePriv
 	arguments["SignaturePublicKey"] = signaturePub
+	// the framing preimage's arguments. They live beside the structures they are built out of,
+	// in framing_protect_test.go, for the reason the psk list's and the leaf's do: nothing
+	// here knows how to build a FramedContent that encodes, and the verify row needs one that
+	// has actually been signed rather than one that resembles it.
+	providerStubFramingArguments(t, fixture, signaturePriv, arguments["groupContext"].(*GroupContext), arguments)
 	arguments["HpkePrivateKey"] = hpkePriv
 	arguments["HpkePublicKey"] = hpkePub
 	arguments["MacVerify.tag"] = fixture.Mac(arguments["key"].([]byte), arguments["data"].([]byte))
@@ -4192,7 +4250,24 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		value := reflect.New(argument.Type()).Elem()
 		value.SetUint(argument.Uint() + 1)
 		return append(moved, providerPerturbation{where: "one higher", value: value})
+	// the framing registries are sixteen bits wide, which is the width the wire format gives
+	// them, and moving one to its neighbour moves it to another REGISTERED code point rather
+	// than off the registry -- so a preimage that dropped the wire format answers identically
+	// here and one that kept it cannot.
+	case reflect.Uint16:
+		value := reflect.New(argument.Type()).Elem()
+		value.SetUint(argument.Uint() + 1)
+		return append(moved, providerPerturbation{where: "one higher", value: value})
 	case reflect.Pointer:
+		// framing's two structured arguments, whose rules live beside the structures they move,
+		// in framing_protect_test.go, which is where psk_test.go, leaf_node_test.go and
+		// treekem_test.go keep theirs.
+		if argument.Type() == reflect.TypeOf((*FramedContent)(nil)) && !argument.IsNil() {
+			return providerFramedContentPerturbations(t, operation, parameter, argument)
+		}
+		if argument.Type() == reflect.TypeOf((*AuthenticatedContent)(nil)) && !argument.IsNil() {
+			return providerAuthenticatedContentPerturbations(t, operation, parameter, argument)
+		}
 		// the labelled open's ciphertext, whose two fields are byte slices this rule cannot
 		// reach through a pointer to a struct. Its rule lives beside the structure it moves,
 		// in treekem_test.go, which is where psk_test.go and leaf_node_test.go keep theirs.
@@ -4242,9 +4317,19 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 // 32, which is what key_schedule_test.go's wide kdf differential and the secret tree's own
 // synthetic suite row are for.
 //
-// The class is providerValueMethods, read rather than written out again here, so a method
-// that stops being a value method stops being excused by this.
-func providerReachedOnlyValueMethods(perturbed reflect.Value) bool {
+// The class is providerValueMethods TOGETHER WITH taggingProviderPassesThrough, both read
+// rather than written out again here, so a method that stops being either stops being excused
+// by this.
+//
+// The second half of that union arrived with framing's ValSem010, and enumerating only the
+// four size methods understated the class by exactly the two entries the tagging provider
+// itself declares. A construction whose whole use of the provider is VerifyWithLabel reaches a
+// method the wrapper ALREADY names as unflippable -- "answers an error, and flipping has
+// nothing to change in a refusal" -- so reporting it as "does not read the crypto it was
+// handed" says something false about a body that routed every call it made. Deriving the union
+// rather than adding a name is what keeps the two rosters from drifting: a method that stops
+// being passed through starts being held here on the commit that tags it.
+func providerReachedOnlyUnflippableAnswers(perturbed reflect.Value) bool {
 	if !perturbed.IsValid() || !perturbed.CanInterface() {
 		return false
 	}
@@ -4253,6 +4338,9 @@ func providerReachedOnlyValueMethods(perturbed reflect.Value) bool {
 		return false
 	}
 	for _, call := range tagging.calls {
+		if _, unflippable := taggingProviderPassesThrough[call]; unflippable {
+			continue
+		}
 		if !slices.Contains(providerValueMethods, call) {
 			return false
 		}
@@ -4568,6 +4656,12 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 	// correct answer here rather than a stub, and it stops being correct the moment this
 	// constructor starts producing some other source, at which point the entry fails.
 	"NewLeafNode": {"result 0 field 3 is empty"},
+	// the FramedContentAuthData's confirmation tag. RFC 9420 section 8.2 takes the confirmed
+	// transcript hash over this very signature and the tag is a MAC over that hash, so the tag
+	// cannot exist at the moment the signature is made: a commit's caller sets it afterwards.
+	// Empty is the correct answer here rather than a stub, and it stops being correct the day
+	// this constructor starts producing one, at which point this entry fails.
+	"SignAuthenticatedContent": {"result 0 field 4 is empty"},
 }
 
 // A construction whose answer is not a function of its arguments alone, named with the reason
@@ -4805,7 +4899,7 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 						// observed stays where it is, which is what routes the operation to
 						// the registry comparison below, and that comparison is the stricter
 						// of the two readings.
-						if !answersARegistryValue && !providerReachedOnlyValueMethods(perturbations[at].value) {
+						if !answersARegistryValue && !providerReachedOnlyUnflippableAnswers(perturbations[at].value) {
 							t.Errorf("%s answers the same with %s moved at %s, so it does not read the %s it was handed",
 								where, parameter.name, perturbations[at].where, parameter.name)
 						}

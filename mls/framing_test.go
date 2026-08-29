@@ -2836,6 +2836,21 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 		return (&confirmedTranscriptHashInput{}).UnmarshalMLS(syntax.NewReader(append(
 			[]byte{byte(codePoint >> 8), byte(codePoint)}, handDerivedTranscriptInputTail()...)))
 	},
+	// framing_preimage.go's section 6.1 signature preimage, which reads the same wire format
+	// registry the two above do. The encoder is handed nothing but the code point, because it
+	// refuses the wire format before it looks at anything else -- which is the order this row
+	// depends on and the order that body is written in.
+	"framedContentTBS.MarshalMLS": func(codePoint uint64) error {
+		return (&framedContentTBS{WireFormat: WireFormat(codePoint)}).MarshalMLS(syntax.NewWriter())
+	},
+	// the sender type switch that decides whether a FramedContentTBS inlines the group
+	// context. It is not a codec either, and it is swept here for the reason ratchetTypeOf is:
+	// the class is every place in this package that discriminates on a framing registry, and a
+	// peer reaches this one by sending a sender type nobody has defined.
+	"senderBindsGroupContext": func(codePoint uint64) error {
+		_, err := senderBindsGroupContext(SenderType(codePoint))
+		return err
+	},
 	// secret_tree.go's content type switch. It is not a codec and it is swept here for the
 	// same reason the two above are: the class is every place in this package that
 	// discriminates on a framing registry, and a peer reaches this one by sending a content

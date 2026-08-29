@@ -586,6 +586,14 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// has forked.
 		"framing_preimage.go: syntax.Marshal(self)",
 		"framing_preimage.go: syntax.Marshal(self.transcriptHashInput())",
+		// section 6.1's FramedContentTBS, the third preimage of that file and the one every
+		// framing signature is taken over. The default limit and not the ratchet tree one, on
+		// the strictest reading in the package: this preimage inlines an already serialized
+		// GroupContext into a FramedContent, every field of both is an MLS structure capped at
+		// MaxVectorLength, and a signature over a preimage allowed past that is one no peer
+		// running the default limit could verify -- which for a commit is a message the group
+		// cannot apply and cannot advance its transcript without.
+		"framing_preimage.go: syntax.Marshal(tbs)",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
@@ -1363,6 +1371,20 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// the provider's Nh over a wider kdf, and TestEmptyPskSecretMatchesTheUpstream-
 	// EmptyVector holds the value itself to a published vector.
 	"EmptyPskSecret": "answers KDF.Nh zero bytes, so the tagging provider has no byte of the answer to flip",
+
+	// framing's ValSem010. It answers an error and nothing else, so there is no byte of an
+	// answer for a provider that flips every byte to flip -- and the one provider method it
+	// reaches, VerifyWithLabel, is one taggingProviderPassesThrough already names as
+	// unflippable for the same reason. A row here would report "did not route through its
+	// provider" for every possible implementation.
+	//
+	// It is not unheld. TestProviderHasNoRemainingStubs moves its public key, its message and
+	// its group context and requires each to change the verdict, which no verifier that
+	// reached for a provider of its own could satisfy at another suite; the KDF.Nh gate runs it
+	// over a provider whose hash is 48 and requires it to work there; and
+	// TestTheFramedContentSignatureIsTheOneMlswgPublished holds it to signatures this package
+	// did not compute, which is the reading a provider of its own cannot pass at all.
+	"VerifyAuthenticatedContent": "answers an error and no bytes, so the tagging provider has nothing in the answer to flip",
 }
 
 // A construction handed a provider computes with that provider and not with one of its
@@ -1650,6 +1672,21 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("DeriveNodeKeyPair: %v", keyErr)
 			}
 			return slices.Concat([]byte(nodePriv), []byte(nodePub))
+		}},
+		// section 6.1's framed content signature. It reaches the provider once, to sign the
+		// FramedContentTBS, and that call is invisible in the answer for every other row's
+		// reason: a signature made with a provider of its own verifies against every message
+		// this package produces, because both registered suites and every corpus here are
+		// Ed25519 -- the scheme it would have hardcoded. The signature is what is read, since
+		// it is the only thing this construction produces; everything else in its answer is
+		// the caller's own content carried through.
+		{name: "SignAuthenticatedContent", call: func(crypto CryptoProvider) []byte {
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), framingStubGroupContext(t, crypto))
+			if signErr != nil {
+				t.Fatalf("SignAuthenticatedContent: %v", signErr)
+			}
+			return authContent.Auth.Signature
 		}},
 	} {
 		covered = append(covered, testCase.name)
