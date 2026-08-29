@@ -104,6 +104,70 @@ func TestProposalPreservesUnknownTypeVerbatim(t *testing.T) {
 	}
 }
 
+// TestAnUnregisteredProposalConsumesNothingOutsideItsOwnVectorRegion is the bound on the one
+// decision in proposal_wire.go that reads to the end of its reader.
+//
+// Proposal.UnmarshalMLS keeps an unregistered type's body verbatim with ReadRaw(Remaining()),
+// which is what makes GREASE round trip, and that is a real consumption: inside a Commit's
+// proposals<V> the body ABSORBS the elements standing after it. A receiver applies one proposal
+// where a peer that registered the type applies two, and because the absorbed bytes are
+// re-emitted verbatim the commit re-encodes byte identically -- so no round trip and no
+// canonicality property in this package can see it. Nothing here can fix that: a Proposal
+// carries no length of its own, so an implementation that does not know the type does not know
+// where it ends. The first half of this test states the consequence so that it is a decision
+// somebody reads rather than a surprise somebody rediscovers.
+//
+// The second half is the part that CAN be lost. syntax.ReadVector hands its element decoder a
+// ReadSub over exactly the declared region, so the blast radius is bounded by the vector's own
+// length prefix and the commit's path -- the field standing after the vector -- is read from
+// where it actually is. A change to how vectors are read could widen a swallowed proposal into
+// a swallowed path with everything else in this package still green, which is why the bound is
+// asserted here rather than assumed from the shape of ReadVector.
+func TestAnUnregisteredProposalConsumesNothingOutsideItsOwnVectorRegion(t *testing.T) {
+	commit := Commit{
+		Proposals: []ProposalOrRef{
+			{Type: ProposalOrRefTypeProposal, Proposal: &Proposal{
+				ProposalType: ProposalType(0x0a0a),
+				UnknownType:  ProposalType(0x0a0a),
+				UnknownBody:  []byte{0xff},
+			}},
+			{Type: ProposalOrRefTypeReference, Reference: ProposalRef{0x01, 0x02, 0x03}},
+		},
+		Path: &UpdatePath{LeafNode: *testLeafNodeOfSource(LeafNodeSourceCommit)},
+	}
+	encoded, err := syntax.Marshal(&commit)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded := Commit{}
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(decoded.Proposals) != 1 {
+		t.Fatalf("an unregistered proposal standing before a reference decoded to %d elements; how far an unregistered body reads has changed and the note above no longer describes this codec",
+			len(decoded.Proposals))
+	}
+
+	if decoded.Path == nil {
+		t.Fatal("the commit decoded with no path at all; the unregistered proposal body read past its own vector and took the presence octet with it")
+	}
+	if !bytes.Equal(decoded.Path.LeafNode.Signature, commit.Path.LeafNode.Signature) {
+		t.Fatalf("the decoded path's leaf signature is %x and the commit was built with %x; the field after proposals<V> was not read from where that vector's own length prefix says it ends",
+			decoded.Path.LeafNode.Signature, commit.Path.LeafNode.Signature)
+	}
+
+	// and the verbatim half: what was swallowed is re-emitted, which is exactly why nothing
+	// else in this package can see the swallowing
+	reencoded, err := syntax.Marshal(&decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(reencoded, encoded) {
+		t.Fatalf("re-encoded %x, want %x", reencoded, encoded)
+	}
+}
+
 // The forge's malformed arm: a registered body under an unregistered discriminant, which is what
 // the validation plan's ValSem tests need and what stops a second encoder being written to
 // produce it.
