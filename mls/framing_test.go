@@ -11,8 +11,10 @@ import (
 	"go/token"
 	"go/types"
 	"maps"
+	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1738,10 +1740,19 @@ func TestFramedContentAuthDataRequiresAConfirmationTagOnACommit(t *testing.T) {
 		t.Errorf("decoding %x as a commit gave %v, want errMissingConfirmationTag", emptyTag, err)
 	}
 	// and the neighbouring refusal, so the one above cannot be passing for a truncation: a
-	// commit with no tag field at all ends the input early.
+	// commit with no tag field at all ends the input early, which is the SYNTAX layer's refusal
+	// and not this one. Asserting only that it was refused states nothing about the difference
+	// this case exists to draw -- a decoder that answered errMissingConfirmationTag to every
+	// short commit passes that form -- so both directions are named.
 	noTagAtAll := []byte{0x03, 0x11, 0x22, 0x33}
-	if _, err := decodeAuthData(noTagAtAll, ContentTypeCommit); err == nil {
-		t.Errorf("decoding %x as a commit was accepted; the tag field is absent entirely", noTagAtAll)
+	_, truncated := decodeAuthData(noTagAtAll, ContentTypeCommit)
+	if errors.Is(truncated, errMissingConfirmationTag) {
+		t.Errorf("decoding %x as a commit gave errMissingConfirmationTag; the input ends before the tag field, so this is a truncation, and a caller told otherwise is told a sender omitted a field it did send",
+			noTagAtAll)
+	}
+	if !errors.Is(truncated, syntax.ErrTruncated) {
+		t.Errorf("decoding %x as a commit gave %v, want syntax.ErrTruncated; the tag field is absent entirely",
+			noTagAtAll, truncated)
 	}
 }
 
@@ -1945,23 +1956,57 @@ func TestAnAuthDataDecodesToTheSameValueWhateverItsReceiverHeld(t *testing.T) {
 // TestFramedContentAuthDataRefusesATruncatedEncoding runs over every proper prefix of every
 // golden rather than over the boundaries somebody thought of, and the bound is derived from the
 // encoding's own length.
+//
+// WHICH refusal each prefix earns is derived too, off the field boundaries of the golden it was
+// cut from, and that half is not decoration. A prefix ending exactly where a field begins took
+// that field's length prefix away entirely, so the read runs out of input: syntax.ErrTruncated.
+// A prefix ending inside a field leaves a length declaring more than remains:
+// syntax.ErrLengthExceedsInput. Neither of them is errMissingConfirmationTag, and pinning that
+// is the point. Every other refusal in this file is pinned exactly -- ErrTrailingBytes, the
+// unregistered content type, the missing tag -- and truncation was the one class stated as a
+// bare non-nil, which left the commit arm free to report every short message as a commit
+// carrying no tag: a transport failure handed to the caller as ValSem009, about a field the
+// sender did send. Measured rather than supposed: dropping the error check on the confirmation
+// tag's own read left this package green.
 func TestFramedContentAuthDataRefusesATruncatedEncoding(t *testing.T) {
-	cuts := 0
+	cuts, atAFieldStart, insideAField := 0, 0, 0
 	for _, contentType := range contentTypes(t) {
-		golden := handDerivedAuthDataGolden(contentType)
-		for cut := 0; cut < len(golden); cut += 1 {
-			if _, err := decodeAuthData(golden[:cut], contentType); err == nil {
-				t.Errorf("content type %d: %d of %d octets decoded rather than being refused",
-					contentType, cut, len(golden))
-				continue
+		for _, golden := range authDataGoldens(t, contentType) {
+			starts := authDataFieldStarts(t, golden)
+			for cut := 0; cut < len(golden); cut += 1 {
+				want := syntax.ErrLengthExceedsInput
+				if slices.Contains(starts, cut) {
+					want = syntax.ErrTruncated
+					atAFieldStart += 1
+				} else {
+					insideAField += 1
+				}
+				_, err := decodeAuthData(golden[:cut], contentType)
+				if err == nil {
+					t.Errorf("content type %d: %d of the %d octets of %x decoded rather than being refused",
+						contentType, cut, len(golden), golden)
+					continue
+				}
+				if errors.Is(err, errMissingConfirmationTag) {
+					t.Errorf("content type %d: %d of the %d octets of %x was refused as a commit carrying no confirmation tag; the input ended before that field, and a truncation reported as a missing field is a transport failure the caller reads as a structural one",
+						contentType, cut, len(golden), golden)
+					continue
+				}
+				if !errors.Is(err, want) {
+					t.Errorf("content type %d: %d of the %d octets of %x was refused with %v, want %v",
+						contentType, cut, len(golden), golden, err, want)
+					continue
+				}
+				cuts += 1
 			}
-			cuts += 1
 		}
 	}
-	if cuts == 0 {
-		t.Fatal("no truncation was built, so this observed nothing")
+	if atAFieldStart == 0 || insideAField == 0 {
+		t.Fatalf("the sweep built %d prefixes ending at a field start and %d ending inside a field; both are needed, or one of the two refusals is stated by nothing",
+			atAFieldStart, insideAField)
 	}
-	t.Logf("%d truncations refused", cuts)
+	t.Logf("%d truncations refused, %d of them cut at a field start and the rest inside a field",
+		cuts, atAFieldStart)
 }
 
 // TestFramedContentAuthDataRefusesTrailingBytes is the full consumption half, stated through
@@ -2054,4 +2099,829 @@ func TestFramedContentAuthDataIsDeliberatelyNotASyntaxCodec(t *testing.T) {
 	if !reflect.TypeOf((*Sender)(nil)).Implements(codec) {
 		t.Fatal("*Sender does not satisfy syntax.Codec, so the assertion above is reading the wrong interface")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the signature field at length zero
+// ---------------------------------------------------------------------------
+
+// handDerivedEmptySignatureAuthDataGolden is section 6's FramedContentAuthData with an EMPTY
+// signature, written from the wire format rather than read back out of framing.go.
+//
+// It is here because signature is an opaque<V> like any other, so "no signature" is a length of
+// zero and a body of nothing -- a field that is still THERE, occupying the one octet its length
+// prefix takes. Every golden above carries a three octet signature, so an encoder that wrote the
+// field only when it had something to put in it agrees with all three of them and with every
+// property derived from them. That is measured rather than supposed: both WriteOpaque calls for
+// this field wrapped in a length test left ./mls/... and ./message/... green.
+//
+// What such an encoder produces is not a shorter message, it is a DIFFERENT one. Under
+// application the whole structure becomes zero octets, which the enclosing decode meets as the
+// end of its input; under commit the confirmation tag's length prefix moves to offset zero,
+// where a decoder takes it for the signature's -- a commit whose tag is read as its signature
+// and whose signature is gone, with every field after it shifted by one.
+//
+//	signature<V> over nothing       length 0 -> 1 octet 0x00, body 0 octets = 1
+//	confirmation_tag<V> over 44 55  length 2 -> 1 octet 0x02, body 2 octets = 3
+//
+//	application  1 + 0 = 1
+//	proposal     1 + 0 = 1
+//	commit       1 + 3 = 4
+func handDerivedEmptySignatureAuthDataGolden(contentType ContentType) []byte {
+	switch contentType {
+	case ContentTypeApplication:
+		return []byte{0x00}
+	case ContentTypeProposal:
+		return []byte{0x00}
+	case ContentTypeCommit:
+		return []byte{0x00, 0x02, 0x44, 0x55}
+	}
+	return nil
+}
+
+// handDerivedEmptySignatureAuthDataSizes is the arithmetic of the comment above, stated
+// separately for handDerivedAuthDataSizes' reason: a derivation edited without its comment then
+// fails rather than redefining what it is compared against.
+var handDerivedEmptySignatureAuthDataSizes = map[ContentType]int{
+	ContentTypeApplication: 1,
+	ContentTypeProposal:    1,
+	ContentTypeCommit:      4,
+}
+
+// emptySignatureAuthData is the value those goldens encode: the given signature, which is the
+// absent one in both of its spellings, beside the confirmation tag every other sweep here uses.
+// The tag is kept so the commit arm still has one to write and its encoding still differs from
+// the application arm's by exactly that field.
+func emptySignatureAuthData(signature []byte) *FramedContentAuthData {
+	return &FramedContentAuthData{Signature: signature, ConfirmationTag: testAuthData().ConfirmationTag}
+}
+
+// TestTheAuthDataSignatureFieldIsWrittenAtEveryLengthIncludingZero states the one length no
+// other sweep in this file offers either half of the codec.
+//
+// The signature of testAuthData is three octets, every golden above carries it, and the one
+// value here holding an empty signature is only ever a receiver and never an encode input -- so
+// the wire shape of this field at length zero was a claim nothing made. It is not an exotic
+// input: a signature is opaque<V>, the empty one is legal, and which of "0x00" and "nothing at
+// all" it encodes to is the difference between a decoder finding the confirmation tag where it
+// belongs and finding it one field early.
+//
+// The nil and the empty slice are both offered because they are ONE statement on the wire and
+// two different values in Go: a presence test written as a nil check passes for one of them and
+// not for the other. The decode half then pins which of the two comes back, because that pair
+// does not round trip to an equal VALUE -- only to equal bytes -- and describeOptionalOctets
+// exists in this file precisely to keep the two apart, so which one a decode produces is a fact
+// this file owes a reader rather than one it leaves to whoever reads syntax/decode.go.
+func TestTheAuthDataSignatureFieldIsWrittenAtEveryLengthIncludingZero(t *testing.T) {
+	declared := contentTypes(t)
+	for _, contentType := range declared {
+		want := handDerivedEmptySignatureAuthDataGolden(contentType)
+		if want == nil {
+			t.Fatalf("content type %d has no empty signature golden, so nothing states what this codec writes when the signature is absent",
+				contentType)
+		}
+		size, stated := handDerivedEmptySignatureAuthDataSizes[contentType]
+		if !stated {
+			t.Fatalf("content type %d has no empty signature size, so its golden is compared only against itself",
+				contentType)
+		}
+		if len(want) != size {
+			t.Fatalf("content type %d: the empty signature derivation is %d octets and the arithmetic in its comment says %d",
+				contentType, len(want), size)
+		}
+		for _, signature := range [][]byte{nil, {}} {
+			encoded, err := encodeAuthData(emptySignatureAuthData(signature), contentType)
+			if err != nil {
+				t.Fatalf("content type %d: marshalling a signature of %s: %v",
+					contentType, describeOptionalOctets(signature), err)
+			}
+			if !bytes.Equal(encoded, want) {
+				t.Errorf("content type %d: a signature of %s encoded to\n %x\nwant\n %x\nthe signature is an opaque<V>, so a signature of length zero is a length prefix of zero and not a field left out",
+					contentType, describeOptionalOctets(signature), encoded, want)
+			}
+		}
+		decoded, err := decodeAuthData(want, contentType)
+		if err != nil {
+			t.Fatalf("content type %d: decoding %x: %v", contentType, want, err)
+		}
+		if expected := decodedFormOfAuthData(t, emptySignatureAuthData([]byte{}), contentType); !sameAuthData(decoded, expected) {
+			t.Errorf("content type %d: %x decoded to\n %s\nwant\n %s",
+				contentType, want, describeAuthData(decoded), describeAuthData(expected))
+		}
+		if decoded.Signature == nil {
+			t.Errorf("content type %d: %x decoded to a nil signature; every arm carries the field, so a nil here would be the decoder saying the field was absent and no encoding of this structure can say that",
+				contentType, want)
+		}
+		reencoded, err := encodeAuthData(decoded, contentType)
+		if err != nil {
+			t.Fatalf("content type %d: re-marshalling %s: %v", contentType, describeAuthData(decoded), err)
+		}
+		if !bytes.Equal(reencoded, want) {
+			t.Errorf("content type %d: re-encode =\n %x\nwant\n %x", contentType, reencoded, want)
+		}
+	}
+	if len(handDerivedEmptySignatureAuthDataSizes) != len(declared) {
+		t.Errorf("the empty signature size table holds %d entries and the package declares %d content types",
+			len(handDerivedEmptySignatureAuthDataSizes), len(declared))
+	}
+}
+
+// authDataGoldens is every hand derived encoding this file holds for one content type: the
+// populated one and the one whose signature is empty. Swept together where a property is about
+// the LAYOUT rather than about the values, because the two families put their field boundaries
+// in different places and a boundary rule stated over one of them is stated over one shape.
+func authDataGoldens(t *testing.T, contentType ContentType) [][]byte {
+	t.Helper()
+	found := [][]byte{}
+	for _, golden := range [][]byte{
+		handDerivedAuthDataGolden(contentType),
+		handDerivedEmptySignatureAuthDataGolden(contentType),
+	} {
+		if golden == nil {
+			t.Fatalf("content type %d is missing one of its hand derived goldens, so a sweep meant to run over both families ran over one",
+				contentType)
+		}
+		found = append(found, golden)
+	}
+	return found
+}
+
+// authDataFieldStarts derives the offsets a golden's length prefixed fields begin at, by walking
+// the prefixes rather than by transcribing the layout a second time.
+//
+// Every field of this structure is an opaque<V> and every length in these goldens is below 64,
+// so each prefix is the single octet holding its own body length -- which makes this a reading
+// of the encoding rather than a second claim about it. Landing exactly on the end is checked
+// rather than assumed: a golden this walk could not account for would hand its caller a set of
+// boundaries that are not boundaries, and every expectation derived from them would be arbitrary
+// while still looking derived.
+func authDataFieldStarts(t *testing.T, golden []byte) []int {
+	t.Helper()
+	starts := []int{}
+	for at := 0; at < len(golden); {
+		if golden[at] >= 0x40 {
+			t.Fatalf("the octet %#02x at offset %d of %x is not a single octet varint length prefix, so this walk cannot read that golden's layout",
+				golden[at], at, golden)
+		}
+		starts = append(starts, at)
+		next := at + 1 + int(golden[at])
+		if next > len(golden) {
+			t.Fatalf("the field beginning at offset %d of %x declares %d octets and runs past its end",
+				at, golden, golden[at])
+		}
+		at = next
+	}
+	if len(starts) == 0 {
+		t.Fatalf("no field was read out of %x, so no boundary was derived from it", golden)
+	}
+	return starts
+}
+
+// ---------------------------------------------------------------------------
+// the refusals that name the code point they refused
+// ---------------------------------------------------------------------------
+
+// framingRegistrySwitch is one switch over a framing registry in framing.go, together with the
+// refusal it reaches when none of its cases matched.
+//
+// The class is derived from the file rather than listed, because framing.go's own package
+// comment makes the claim about ALL of them -- "the refusal paths therefore name the offending
+// value numerically" -- and a list of the ones somebody remembered is how three come to be held
+// and the fourth not. That is this project's most repeated failure and it is why the behavioural
+// sweep below is keyed on this derivation rather than standing beside it.
+type framingRegistrySwitch struct {
+	method   string
+	registry string
+	tag      string
+	refusal  ast.Expr
+}
+
+// registryOfSwitch names the framing registry a switch discriminates on, read off its CASE
+// expressions rather than off its tag.
+//
+// The cases are the better evidence and they are also the only evidence available. A tag is a
+// parameter or a field selector, and typing either needs the function bodies the package type
+// check deliberately skips; the cases are package level constants, whose types that check
+// already holds. They are the code points themselves, which is the thing being claimed about.
+func registryOfSwitch(t *testing.T, statement *ast.SwitchStmt, registries []string) string {
+	t.Helper()
+	scope := typeCheckedPackage(t).Scope()
+	found := ""
+	for _, clause := range statement.Body.List {
+		caseClause, isCase := clause.(*ast.CaseClause)
+		if !isCase {
+			continue
+		}
+		for _, expression := range caseClause.List {
+			name, isName := expression.(*ast.Ident)
+			if !isName {
+				continue
+			}
+			constant, isConstant := scope.Lookup(name.Name).(*types.Const)
+			if !isConstant {
+				continue
+			}
+			named, isNamed := types.Unalias(constant.Type()).(*types.Named)
+			if !isNamed || !slices.Contains(registries, named.Obj().Name()) {
+				continue
+			}
+			if found != "" && found != named.Obj().Name() {
+				t.Fatalf("one switch in %s names constants of both %s and %s, so which registry it discriminates on cannot be derived",
+					framingFile, found, named.Obj().Name())
+			}
+			found = named.Obj().Name()
+		}
+	}
+	return found
+}
+
+// returnedExpression is the single value a return statement returns, or nil for anything that is
+// not one. A `return nil` is reported as none, so a search for the refusal a switch falls
+// through to does not stop at the success path of a case clause.
+func returnedExpression(statement ast.Stmt) ast.Expr {
+	returned, isReturn := statement.(*ast.ReturnStmt)
+	if !isReturn || len(returned.Results) != 1 {
+		return nil
+	}
+	if name, isName := returned.Results[0].(*ast.Ident); isName && name.Name == "nil" {
+		return nil
+	}
+	return returned.Results[0]
+}
+
+// defaultClauseRefusal is the error a switch returns from its default clause, if it has one.
+// Both spellings of an exhaustive refusal are read by the caller -- a default clause, and a
+// return standing after the switch -- because framing.go uses one of each and the difference is
+// a matter of taste rather than of what is being refused.
+func defaultClauseRefusal(statement *ast.SwitchStmt) ast.Expr {
+	for _, clause := range statement.Body.List {
+		caseClause, isCase := clause.(*ast.CaseClause)
+		if !isCase || caseClause.List != nil {
+			continue
+		}
+		for _, inner := range caseClause.Body {
+			if expression := returnedExpression(inner); expression != nil {
+				return expression
+			}
+		}
+	}
+	return nil
+}
+
+// framingRegistrySwitches derives every registry switch of framing.go, keyed by the method that
+// holds it.
+func framingRegistrySwitches(t *testing.T) map[string]framingRegistrySwitch {
+	t.Helper()
+	registries := framingRegistries(t)
+	parsed, err := parser.ParseFile(token.NewFileSet(), framingFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", framingFile, err)
+	}
+	found := map[string]framingRegistrySwitch{}
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		method := function.Name.Name
+		if function.Recv != nil && len(function.Recv.List) > 0 {
+			method = receiverTypeName(function.Recv.List[0].Type) + "." + method
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			block, isBlock := node.(*ast.BlockStmt)
+			if !isBlock {
+				return true
+			}
+			for at, statement := range block.List {
+				switched, isSwitch := statement.(*ast.SwitchStmt)
+				if !isSwitch || switched.Tag == nil {
+					continue
+				}
+				registry := registryOfSwitch(t, switched, registries)
+				if registry == "" {
+					continue
+				}
+				// the refusal is the default clause where there is one, and otherwise the
+				// statement the switch falls through to, which is where a switch written
+				// without a default puts it.
+				refusal := defaultClauseRefusal(switched)
+				if refusal == nil && at+1 < len(block.List) {
+					refusal = returnedExpression(block.List[at+1])
+				}
+				if other, repeated := found[method]; repeated {
+					t.Fatalf("%s holds a switch over %s and another over %s; this derivation keys one switch per method and cannot say which refusal belongs to which",
+						method, other.registry, registry)
+				}
+				found[method] = framingRegistrySwitch{
+					method:   method,
+					registry: registry,
+					tag:      types.ExprString(switched.Tag),
+					refusal:  refusal,
+				}
+			}
+			return true
+		})
+	}
+	if len(found) == 0 {
+		t.Fatalf("no switch over a framing registry was derived from %s, which holds one in every codec method it declares, so every gate reading this would run over the empty set",
+			framingFile)
+	}
+	return found
+}
+
+// framingCodecMethods is every MarshalMLS and UnmarshalMLS framing.go declares, derived off the
+// package's declarations rather than listed, so a third codec landing in that file is judged by
+// the two gates below on the commit that lands it.
+func framingCodecMethods(t *testing.T) []string {
+	t.Helper()
+	declared := packageLevelDeclarations(t, ".")
+	found := []string{}
+	for name, file := range declared {
+		if file != framingFile {
+			continue
+		}
+		_, method, isMethod := strings.Cut(name, ".")
+		if !isMethod || (method != "MarshalMLS" && method != "UnmarshalMLS") {
+			continue
+		}
+		found = append(found, name)
+	}
+	slices.Sort(found)
+	if len(found) == 0 {
+		t.Fatalf("no codec method was derived from %s, which declares two codecs, so every gate reading this would run over the empty set",
+			framingFile)
+	}
+	return found
+}
+
+// expressionMentions reports whether an expression holds a sub expression written exactly as the
+// given source text. Text rather than object identity because both ends come out of one file and
+// one parse: the tag of the switch and the arguments of its refusal are the same source.
+func expressionMentions(expression ast.Expr, text string) bool {
+	found := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		inner, isExpression := node.(ast.Expr)
+		if isExpression && types.ExprString(inner) == text {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// TestTheRegistrySwitchReaderSeparatesARefusalThatNamesItsTagFromOneThatDoesNot is the control
+// on that reader, and it is the same control the width pin reader carries. One that recognised
+// everything would report every refusal as naming its code point, including the bare sentinel
+// this gate exists to catch; one that recognised nothing would fail against the real file for
+// the wrong reason. Both halves are stated over expressions written here.
+func TestTheRegistrySwitchReaderSeparatesARefusalThatNamesItsTagFromOneThatDoesNot(t *testing.T) {
+	for _, one := range []struct {
+		source   string
+		tag      string
+		mentions bool
+	}{
+		{`fmt.Errorf("%w: %d", ErrUnknownContentType, contentType)`, "contentType", true},
+		{`fmt.Errorf("%w: %d", ErrUnknownSenderType, self.SenderType)`, "self.SenderType", true},
+		{`fmt.Errorf("%w: content type %d", ErrUnknownContentType, contentType)`, "contentType", true},
+		// the survivor: a refusal that has stopped saying which code point it refused
+		{`ErrUnknownContentType`, "contentType", false},
+		{`fmt.Errorf("%w", ErrUnknownContentType)`, "contentType", false},
+		// and a refusal naming something else, which is the shape a copied arm produces
+		{`fmt.Errorf("%w: %d", ErrUnknownContentType, self.SenderType)`, "contentType", false},
+	} {
+		expression, err := parser.ParseExpr(one.source)
+		if err != nil {
+			t.Fatalf("parse %q: %v", one.source, err)
+		}
+		if got := expressionMentions(expression, one.tag); got != one.mentions {
+			t.Errorf("%q read against the tag %s as %v, want %v", one.source, one.tag, got, one.mentions)
+		}
+	}
+}
+
+// TestEveryFramingRegistrySwitchRefusesByNamingTheCodePointItRefused holds framing.go's package
+// comment to framing.go.
+//
+// That comment states the decision this file's registries turn on: none of them declares its
+// reserved zero, so an unparsed header is a refusal rather than a real code point, and "the
+// refusal paths therefore name the offending value numerically, which is what they have off the
+// wire anyway". Nothing counted those paths. Both of the content type refusals could be reduced
+// to a bare sentinel with the whole package green -- measured -- which leaves a caller holding
+// an error that says only that SOMETHING in the header was unregistered, about a header they
+// cannot re-read because the decode refused it.
+//
+// The class is the switches themselves, and the control is the other direction: every codec
+// method framing.go declares must hold one, so a codec that discriminates on a registry without
+// refusing the rest of it is reported here rather than being outside the sweep.
+func TestEveryFramingRegistrySwitchRefusesByNamingTheCodePointItRefused(t *testing.T) {
+	switches := framingRegistrySwitches(t)
+	for _, method := range framingCodecMethods(t) {
+		if _, held := switches[method]; !held {
+			t.Errorf("%s declares %s and no switch over a framing registry was derived from it; every codec in that file discriminates on one, so either this method refuses no unregistered code point at all or the derivation has stopped seeing its switch",
+				framingFile, method)
+		}
+	}
+	for _, method := range slices.Sorted(maps.Keys(switches)) {
+		each := switches[method]
+		if each.refusal == nil {
+			t.Errorf("%s switches on %s and reaches no refusal where none of its cases match, so an unregistered code point leaves that switch by falling out of the bottom of it",
+				method, each.registry)
+			continue
+		}
+		if !expressionMentions(each.refusal, each.tag) {
+			t.Errorf("%s refuses an unregistered %s with %s, which does not name %s; %s says these paths name the offending value numerically, and one that does not tells the caller only that something in the header was unregistered",
+				method, each.registry, types.ExprString(each.refusal), each.tag, framingFile)
+		}
+	}
+	t.Logf("%d registry switches, each refusing by naming its own discriminant", len(switches))
+}
+
+// framingCodePointRefusals invokes each of those refusals with a code point its registry does
+// not declare. It is a table, which is the shape this file distrusts, so the gate below holds
+// its keys to the switches DERIVED from framing.go in both directions: a codec added to that
+// file with no entry here is a refusal nothing invokes, and an entry here for a method that no
+// longer switches on a registry is a sweep running over a claim the file has stopped making.
+//
+// Each invocation reaches the refusal and nothing else. The two decoders are handed input the
+// arm would have consumed had the code point been registered -- a sender arm's octet, a whole
+// commit auth data -- so a refusal that was really a truncation cannot pass for a refusal of
+// the code point.
+var framingCodePointRefusals = map[string]func(codePoint uint64) error{
+	"Sender.MarshalMLS": func(codePoint uint64) error {
+		return (&Sender{SenderType: SenderType(codePoint)}).MarshalMLS(syntax.NewWriter())
+	},
+	"Sender.UnmarshalMLS": func(codePoint uint64) error {
+		return (&Sender{}).UnmarshalMLS(syntax.NewReader([]byte{byte(codePoint), 0x00, 0x00, 0x00, 0x00}))
+	},
+	"FramedContentAuthData.MarshalMLS": func(codePoint uint64) error {
+		return testAuthData().MarshalMLS(syntax.NewWriter(), ContentType(codePoint))
+	},
+	"FramedContentAuthData.UnmarshalMLS": func(codePoint uint64) error {
+		return (&FramedContentAuthData{}).UnmarshalMLS(
+			syntax.NewReader(handDerivedAuthDataGolden(ContentTypeCommit)), ContentType(codePoint))
+	},
+}
+
+// undeclaredCodePointsOf is every code point of a framing registry's width that the registry
+// does not declare, derived off the constants the package holds and off the type's own width
+// rather than off either one alone. The reserved zero is one of them and is not special.
+func undeclaredCodePointsOf(t *testing.T, registry string) []uint64 {
+	t.Helper()
+	bits := framingRegistryBits(t, registry)
+	if bits > 16 {
+		t.Fatalf("%s is %d bits wide, and sweeping its whole code point space is not what this helper is for", registry, bits)
+	}
+	held := map[uint64]bool{}
+	for _, value := range registryConstantsOfType(t, registry) {
+		held[value] = true
+	}
+	found := []uint64{}
+	for candidate := uint64(0); candidate < uint64(1)<<bits; candidate += 1 {
+		if held[candidate] {
+			continue
+		}
+		found = append(found, candidate)
+	}
+	if len(found)+len(held) != 1<<bits {
+		t.Fatalf("the derivation split the %d code points of %s into %d declared and %d undeclared",
+			1<<bits, registry, len(held), len(found))
+	}
+	return found
+}
+
+// namesTheNumber reports whether a message spells value as a decimal number standing on its own
+// rather than as part of a longer one.
+//
+// The boundary check is what makes this an assertion. A plain substring search for "1" is
+// answered by a message naming 13, 21 or 100, so a refusal reporting the WRONG code point --
+// which is what a loop reading the wrong index produces, and the failure extension_test.go
+// already guards its own registry against -- would pass it. The format is deliberately not
+// pinned: naming the value is the property, and "%d" against "content type %d" is a difference
+// of prose rather than of what the caller is told.
+func namesTheNumber(message string, value uint64) bool {
+	want := strconv.FormatUint(value, 10)
+	for at := 0; at+len(want) <= len(message); at += 1 {
+		found := strings.Index(message[at:], want)
+		if found < 0 {
+			return false
+		}
+		found += at
+		before := found == 0 || !isDecimalDigit(message[found-1])
+		after := found+len(want) == len(message) || !isDecimalDigit(message[found+len(want)])
+		if before && after {
+			return true
+		}
+		at = found
+	}
+	return false
+}
+
+func isDecimalDigit(octet byte) bool {
+	return octet >= '0' && octet <= '9'
+}
+
+// TestTheNumberNamingReaderReadsAWholeNumberAndNotASubstring is that reader's control, in both
+// directions for the reason every reader in this file carries one.
+func TestTheNumberNamingReaderReadsAWholeNumberAndNotASubstring(t *testing.T) {
+	for _, one := range []struct {
+		message string
+		value   uint64
+		names   bool
+	}{
+		{"mls: unknown sender type: 5", 5, true},
+		{"mls: no ratchet for this content type: content type 0", 0, true},
+		{"5", 5, true},
+		{"mls: 5 is not a sender type", 5, true},
+		// the refusal that names a neighbouring code point rather than the one it refused
+		{"mls: unknown sender type: 15", 5, false},
+		{"mls: unknown sender type: 51", 5, false},
+		{"mls: unknown sender type: 155", 5, false},
+		// and the refusal that has stopped naming any of them
+		{"mls: unknown sender type", 5, false},
+	} {
+		if got := namesTheNumber(one.message, one.value); got != one.names {
+			t.Errorf("%q read against %d as %v, want %v", one.message, one.value, got, one.names)
+		}
+	}
+}
+
+// TestEveryFramingCodePointRefusalNamesTheCodePointItRefused is the behavioural half of the gate
+// above, swept over every code point each registry does not declare rather than over the one
+// somebody thought of.
+//
+// The two halves are different claims and this project has been caught by the gap between them.
+// The derived gate reads the SOURCE and says the refusal mentions its own discriminant; this one
+// reads the MESSAGE the caller actually receives, which is where a format verb dropped from one
+// of the two, or an argument naming a stale copy of the code point, shows up.
+func TestEveryFramingCodePointRefusalNamesTheCodePointItRefused(t *testing.T) {
+	switches := framingRegistrySwitches(t)
+	derived, invoked := slices.Sorted(maps.Keys(switches)), slices.Sorted(maps.Keys(framingCodePointRefusals))
+	if !slices.Equal(derived, invoked) {
+		t.Fatalf("%s refuses an unregistered code point in %v and this file invokes %v; a refusal nothing invokes is a message nobody has ever read",
+			framingFile, derived, invoked)
+	}
+	refused := 0
+	for _, method := range invoked {
+		registry := switches[method].registry
+		for _, codePoint := range undeclaredCodePointsOf(t, registry) {
+			err := framingCodePointRefusals[method](codePoint)
+			if err == nil {
+				t.Fatalf("%s accepted the %s code point %d, which the registry does not declare", method, registry, codePoint)
+			}
+			if !namesTheNumber(err.Error(), codePoint) {
+				t.Fatalf("%s refused the unregistered %s %d with %q, which does not name it; the octet is what the caller has off the wire, and a refusal that will not repeat it leaves a rejected header nobody can attribute to a value",
+					method, registry, codePoint, err)
+			}
+			refused += 1
+		}
+	}
+	if refused == 0 {
+		t.Fatal("no unregistered code point was refused, so this observed nothing")
+	}
+	t.Logf("%d unregistered code point refusals over %d methods, each naming the value it refused", refused, len(invoked))
+}
+
+// ---------------------------------------------------------------------------
+// the compile time pins framing.go carries
+// ---------------------------------------------------------------------------
+
+// framingPin is one package level blank declaration of framing.go: the type it declares and the
+// value assigned to it, as source text, and whether that type is a signature.
+type framingPin struct {
+	declared string
+	value    string
+	isFunc   bool
+}
+
+// framingPins reads them off the file.
+//
+// A blank declaration with no declared TYPE is not collected, and that exclusion is the reader's
+// whole point. `var _ = (*T).MarshalMLS` states nothing whatever -- it compiles for every
+// signature that method could ever have -- so collecting it would let the gate below report a
+// pin present where the statement inside it had been emptied out, which is the same survivor
+// the width pin reader was written to close one section up.
+func framingPins(t *testing.T) []framingPin {
+	t.Helper()
+	parsed, err := parser.ParseFile(token.NewFileSet(), framingFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", framingFile, err)
+	}
+	found := []framingPin{}
+	for _, declaration := range parsed.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || (generic.Tok != token.VAR && generic.Tok != token.CONST) {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, isValue := spec.(*ast.ValueSpec)
+			if !isValue || value.Type == nil || len(value.Values) != len(value.Names) {
+				continue
+			}
+			_, isFunc := value.Type.(*ast.FuncType)
+			for at, name := range value.Names {
+				if name.Name != "_" {
+					continue
+				}
+				found = append(found, framingPin{
+					declared: types.ExprString(value.Type),
+					value:    types.ExprString(value.Values[at]),
+					isFunc:   isFunc,
+				})
+			}
+		}
+	}
+	return found
+}
+
+// syntaxCodecInterface is syntax.Codec as the type checker sees it, reached through this
+// package's own import of it. Read through go/types rather than through reflect because the gate
+// below asks about types NAMED in framing.go, which it has as strings off the syntax tree and
+// cannot turn into values.
+func syntaxCodecInterface(t *testing.T) *types.Interface {
+	t.Helper()
+	for _, imported := range typeCheckedPackage(t).Imports() {
+		if imported.Path() != "github.com/urnetwork/connect/mls/syntax" {
+			continue
+		}
+		declared, isType := imported.Scope().Lookup("Codec").(*types.TypeName)
+		if !isType {
+			t.Fatal("package syntax declares no Codec, so the pin gate cannot say which codecs can satisfy it")
+		}
+		asInterface, isInterface := declared.Type().Underlying().(*types.Interface)
+		if !isInterface {
+			t.Fatal("syntax.Codec is not an interface")
+		}
+		return asInterface
+	}
+	t.Fatal("package mls does not import package syntax, so syntax.Codec cannot be read from the type check")
+	return nil
+}
+
+// TestEveryFramingCodecCarriesTheCompileTimePinItsShapeAllows is the presence guard framing.go's
+// own pins never had.
+//
+// key_schedule_deps_test.go's TestNoPinBlockShrinksWithoutFailing is this package's guard against
+// a detector being deleted along with the thing it detected, and its class is TEST files: it
+// skips every name that does not end in _test.go. framing.go's pins are production source, one
+// file type outside that class, so the two lines standing in for the var _ syntax.Codec this
+// codec cannot have were counted by nothing and could both be deleted with the package green.
+// That is measured, not supposed.
+//
+// What is required of each codec is derived from its own SHAPE rather than from a count. A type
+// whose methods fit syntax.Codec owes the one interface pin. A type whose methods cannot fit it
+// -- because the content type is a PARAMETER, which is registry section 7.2's decision and the
+// reason this codec exists in the form it does -- owes a signature pin per method, that being
+// the only remaining form a narrowing to Codec's shape stops compiling against.
+func TestEveryFramingCodecCarriesTheCompileTimePinItsShapeAllows(t *testing.T) {
+	pins := framingPins(t)
+	codec := syntaxCodecInterface(t)
+	scope := typeCheckedPackage(t).Scope()
+	held := 0
+	for _, method := range framingCodecMethods(t) {
+		receiver, name, _ := strings.Cut(method, ".")
+		declared, isType := scope.Lookup(receiver).(*types.TypeName)
+		if !isType {
+			t.Fatalf("%s declares the method %s and package mls holds no type %s", framingFile, method, receiver)
+		}
+		if types.Implements(types.NewPointer(declared.Type()), codec) {
+			want := fmt.Sprintf("(*%s)(nil)", receiver)
+			if !slices.ContainsFunc(pins, func(pin framingPin) bool {
+				return pin.value == want && pin.declared == "syntax.Codec"
+			}) {
+				t.Errorf("*%s satisfies syntax.Codec and %s declares no `var _ syntax.Codec = %s`, so the day its methods drift out of that interface nothing says so at build time",
+					receiver, framingFile, want)
+				continue
+			}
+			held += 1
+			continue
+		}
+		want := fmt.Sprintf("(*%s).%s", receiver, name)
+		if !slices.ContainsFunc(pins, func(pin framingPin) bool { return pin.value == want && pin.isFunc }) {
+			t.Errorf("*%s cannot satisfy syntax.Codec -- %s takes the discriminant registry section 7.2 keeps out of the struct -- and %s declares no blank pin of a signature type assigned %s, so a later task that stores that discriminant in a field and narrows this method to one argument compiles clean",
+				receiver, name, framingFile, want)
+			continue
+		}
+		held += 1
+	}
+	if held == 0 {
+		t.Fatal("no codec pin was matched, so this gate states nothing")
+	}
+	t.Logf("%d codec methods, each pinned in the form its own shape allows", held)
+}
+
+// ---------------------------------------------------------------------------
+// the sentinel this file's codec borrows
+// ---------------------------------------------------------------------------
+
+// filesRaising is every production file of this package whose SYNTAX TREE names a symbol, less
+// the file that declares it.
+//
+// Read as a tree rather than as text, so a file that only discusses the name in prose is not
+// counted as a raiser of it -- framing_errors.go's package comment spends nine lines on
+// ErrUnknownContentType and returns it nowhere, which is exactly the false positive a grep would
+// report.
+func filesRaising(t *testing.T, name string) []string {
+	t.Helper()
+	declaredIn := packageLevelDeclarations(t, ".")[name]
+	if declaredIn == "" {
+		t.Fatalf("package mls declares no %s, so where it is raised cannot be derived", name)
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	found := []string{}
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		fileName := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(fileName, ".go") ||
+			strings.HasSuffix(fileName, "_test.go") || fileName == declaredIn {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, fileName, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", fileName, err)
+		}
+		raises := false
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			if identifier, isName := node.(*ast.Ident); isName && identifier.Name == name {
+				raises = true
+			}
+			return !raises
+		})
+		if raises {
+			found = append(found, fileName)
+		}
+	}
+	slices.Sort(found)
+	return found
+}
+
+// docCommentOfDeclaration is the comment written above one package level declaration, taken from
+// the spec where a grouped block gives each name its own comment and from the block otherwise.
+func docCommentOfDeclaration(t *testing.T, file string, name string) string {
+	t.Helper()
+	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	for _, declaration := range parsed.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, isValue := spec.(*ast.ValueSpec)
+			if !isValue || !slices.ContainsFunc(value.Names, func(each *ast.Ident) bool { return each.Name == name }) {
+				continue
+			}
+			if value.Doc != nil {
+				return value.Doc.Text()
+			}
+			if generic.Doc != nil {
+				return generic.Doc.Text()
+			}
+			return ""
+		}
+	}
+	t.Fatalf("%s declares no %s", file, name)
+	return ""
+}
+
+// TestTheBorrowedSentinelIsDocumentedByEveryLayerThatRaisesIt is the other half of
+// TestEveryStructuralFramingErrorHasExactlyOneDeclarationSite.
+//
+// That gate says ErrUnknownContentType has ONE declaration site and names it, which is the
+// decision this task took rather than shadowing the secret tree's sentinel. It says nothing
+// about what that single site TELLS a reader. The declaration was written when the ratchet
+// lookup was the only thing that raised it, and the framing codec now raises it off the wire
+// where there is no ratchet in view at all -- so the comment a reader arrives at, and the
+// message a caller logs, described one of the two layers and not the other.
+//
+// The class is derived: every production file whose syntax tree names the sentinel must be named
+// by the comment on its declaration. A third layer that starts raising it fails here on the
+// commit that does so, which is the only moment anybody has the reason in their head.
+func TestTheBorrowedSentinelIsDocumentedByEveryLayerThatRaisesIt(t *testing.T) {
+	const borrowed = "ErrUnknownContentType"
+	declaredIn := packageLevelDeclarations(t, ".")[borrowed]
+	raisers := filesRaising(t, borrowed)
+	if len(raisers) < 2 {
+		t.Fatalf("%s is declared in %s and raised from %v; this gate exists because it is raised from more than one layer, and a derivation finding fewer is reading the wrong thing",
+			borrowed, declaredIn, raisers)
+	}
+	doc := docCommentOfDeclaration(t, declaredIn, borrowed)
+	if doc == "" {
+		t.Fatalf("%s is declared in %s with no comment at all", borrowed, declaredIn)
+	}
+	for _, file := range raisers {
+		if !strings.Contains(doc, file) {
+			t.Errorf("%s raises %s and the comment on its declaration in %s does not name %s, so a reader arriving at the sentinel is told about some of the layers that return it and not this one",
+				file, borrowed, declaredIn, file)
+		}
+	}
+	t.Logf("%s is declared in %s and raised from %v, each of them named by its declaration", borrowed, declaredIn, raisers)
 }

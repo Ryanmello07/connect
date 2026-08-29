@@ -131,12 +131,23 @@ var (
 	// has no successor to step to.
 	ErrRatchetExhausted = errors.New("mls: ratchet generation space exhausted")
 
-	// ErrUnknownContentType is returned when a framing ContentType has no ratchet: RFC 9420
-	// registers three, and 0 is reserved. It is a refusal rather than a default because a
-	// default arm would hand an unregistered code point generation 0 of a real ratchet, so a
-	// peer could consume a leaf's handshake generations by naming a content type nobody has
-	// defined. The framing layer decodes the octet off the wire, so this is the shape an
-	// attacker chosen header arrives in and the caller has to be able to tell it from a key
-	// that no longer exists.
-	ErrUnknownContentType = errors.New("mls: no ratchet for this content type")
+	// ErrUnknownContentType is returned for a framing ContentType outside the three RFC 9420
+	// section 6 registers, the reserved zero included, by both of the layers that meet one.
+	// One declaration for one condition, rather than two sentinels a caller would have to
+	// match separately: framing_errors.go states that arrangement in full and
+	// TestEveryStructuralFramingErrorHasExactlyOneDeclarationSite holds it.
+	//
+	// secret_tree.go raises it at the ratchet lookup, where the refusal is what keeps an
+	// unregistered code point off a real ratchet. A default arm there would hand it generation
+	// 0 of one, so a peer could consume a leaf's handshake generations by naming a content
+	// type nobody has defined, and the caller has to be able to tell that from a key that no
+	// longer exists.
+	//
+	// framing.go raises it at the codec, off the wire, where there is no ratchet in view at
+	// all: the content type selects which arm of a FramedContentAuthData the remaining bytes
+	// are, and an unregistered one has no arm to put them in. That is the shape an attacker
+	// chosen header arrives in, and it is refused before any ratchet is asked for -- so the
+	// message says what is wrong with the code point rather than what could not be found for
+	// it, and each raiser names the offending value itself.
+	ErrUnknownContentType = errors.New("mls: unregistered content type")
 )
