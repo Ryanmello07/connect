@@ -49,14 +49,34 @@
 //     refuse anything but CredentialTypeBasic, so no decodable seed can carry another value. The
 //     variation gate now asks the codec rather than holding a list of exceptions -- see
 //     seedFieldIsPinnedByTheCodec.
+//
+// WHAT THIS HARNESS CANNOT SEE, MEASURED RATHER THAN REASONED ABOUT. A wire format change that is
+// regenerated into the golden corpus in the same commit is invisible to every property here. Both
+// halves of UpdatePath's codec were swapped to write and to read the nodes vector before the leaf,
+// all 43 update_path seeds were regenerated with URMSG_MLS_WRITE_CORPUS=1, and every corpus property
+// in this file stayed green: the committed corpus is exactly the generated one, every seed
+// re-encodes to its own bytes, every generated value is recovered by decoding its encoding, and all
+// four derived coverage gates pass. The 14 tests that did fail are the vendored vector and hand
+// derived golden ones elsewhere in the package -- TestUpdatePathMarshalMatchesTheHandDerivedGolden,
+// TestVectorTreeKEM, TestVectorFamiliesVerify,
+// TestEveryPublishedUpdatePathDecodesAndReEncodesExactly and ten others. So the thing that catches a
+// silent format change is the KAT layer and not this harness, and a structure with no published
+// vector would have none of that protection: a corpus is evidence about a DECODER against yesterday's
+// bytes, and a corpus rewritten in the same commit is yesterday's bytes no longer. It is written down
+// here so the next plan does not expect this file to carry a property it cannot. One thing the same
+// run did show working: TestTheCommittedSeedCorpusIsExactlyTheGeneratedCorpus fails its own rewrite
+// invocation rather than reporting success.
 package mls
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
 	"math"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -548,6 +568,24 @@ func describeRatchetTree(tree *RatchetTree) string {
 // for an input that does not decode is to return nil. A ratchet tree target built on the default
 // bound would be not merely mostly vacuous but entirely so, and indistinguishable from one that
 // found nothing wrong.
+// checkRatchetTreeRoundTrip is the round-trip property for a ratchet tree, at the raised bound, in
+// the ONE place this package spells it.
+//
+// It was spelled twice -- once in the codec table below and once in FuzzRatchetTreeDecode -- and
+// nothing kept the two in step. Both dropped to syntax.CheckRoundTrip's default bound without a
+// single test moving, because the substitution has no observable behaviour to catch: for a body the
+// default bound cannot decode, CheckRoundTrip's contract is to return nil, so the vacuous form and
+// the working form answer the same thing on every input. What it costs is the whole large-tree
+// region -- above one mebibyte the target stops decoding anything at all -- and
+// TestTheRatchetTreeCodecIsHandedTheRaisedLimitAtTheProductsGroupSize in tree_test.go is where that
+// region is shown to be this product's own group rather than a hypothetical one.
+//
+// Since no input can tell the two apart, the pin is over the SOURCE and it is
+// TestEveryRatchetTreeCodecCallInThisPackageRunsAtTheRaisedBound below.
+func checkRatchetTreeRoundTrip(bs []byte) error {
+	return syntax.CheckRoundTripLimit[RatchetTree, *RatchetTree](bs, syntax.MaxRatchetTreeLength)
+}
+
 func treeSeedCodecs() []seedCodec {
 	return []seedCodec{
 		{
@@ -565,10 +603,8 @@ func treeSeedCodecs() []seedCodec {
 				return UnmarshalRatchetTree(bs)
 			},
 			encode: func(value any) ([]byte, error) { return marshalRatchetTree(value.(*RatchetTree)) },
-			checkRoundTrip: func(bs []byte) error {
-				return syntax.CheckRoundTripLimit[RatchetTree, *RatchetTree](bs, syntax.MaxRatchetTreeLength)
-			},
-			describe: func(value any) string { return describeRatchetTree(value.(*RatchetTree)) },
+			checkRoundTrip: checkRatchetTreeRoundTrip,
+			describe:       func(value any) string { return describeRatchetTree(value.(*RatchetTree)) },
 		},
 		{
 			target:    updatePathSeedTarget,
@@ -728,13 +764,13 @@ func TestUpdatePathDecodeIsRoundTripStable(t *testing.T) {
 // their randomized form: no panic on adversarial input, and an encoding that decodes must re-encode
 // to the bytes it came from.
 //
-// Through CheckRoundTripLimit at MaxRatchetTreeLength rather than the default entry point, and that
-// is the whole difference between this target and a vacuous one -- see treeSeedCodecs above.
+// Through checkRatchetTreeRoundTrip, which is CheckRoundTripLimit at MaxRatchetTreeLength and is
+// the whole difference between this target and a vacuous one. It is a call to the shared helper
+// rather than a second spelling of the bound for the reason that helper's comment gives: this was
+// the second spelling, and both copies dropped the bound with the suite still green.
 func FuzzRatchetTreeDecode(f *testing.F) {
-	addSeedCorpus(f, ratchetTreeSeedTarget)
-	f.Fuzz(func(t *testing.T, encoded []byte) {
-		if err := syntax.CheckRoundTripLimit[RatchetTree, *RatchetTree](encoded,
-			syntax.MaxRatchetTreeLength); err != nil {
+	fuzzTheCommittedSeedCorpus(f, ratchetTreeSeedTarget, func(t *testing.T, encoded []byte) {
+		if err := checkRatchetTreeRoundTrip(encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
 	})
@@ -745,13 +781,172 @@ func FuzzRatchetTreeDecode(f *testing.F) {
 // feedback and its found corpus per target, so one target over two grammars spends half its budget
 // on each while reporting one.
 func FuzzUpdatePathDecode(f *testing.F) {
-	addSeedCorpus(f, updatePathSeedTarget)
-	f.Fuzz(func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, updatePathSeedTarget, func(t *testing.T, encoded []byte) {
 		if err := syntax.CheckRoundTrip[UpdatePath, *UpdatePath](encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
 	})
 }
+
+// syntaxInstantiationsAt answers every place this file instantiates a generic entry point of the
+// syntax package at the given type: rendered as the whole CALL where it is called, and as the bare
+// instantiation where it is used as a value.
+//
+// Type arguments rather than value arguments, because the type argument is what selects the codec
+// and the bound is an ordinary argument -- and an ordinary argument going missing is the whole
+// failure this exists to find.
+//
+// Both forms, and that is not thoroughness for its own sake: it is what a mutation found. The first
+// version of this matcher looked only at a CallExpr's Fun, and the codec table entry below is not a
+// call -- it is `checkRoundTrip: checkRatchetTreeRoundTrip`, a function VALUE -- so substituting
+// syntax.CheckRoundTrip[RatchetTree, *RatchetTree] for it left this gate green over exactly the
+// spelling it exists to pin. A bare instantiation can carry no bound argument at all, so it belongs
+// to the class rather than being excused from it.
+//
+// It is a second matcher beside callsToPackage rather than a widening of it, and the reason is the
+// reason these sites were never pinned: callsToPackage matches a call whose Fun is a SelectorExpr,
+// while an instantiated generic's Fun is an IndexExpr or an IndexListExpr, so
+// TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit -- whose list is otherwise every way this
+// package enters the codec -- has never seen one.
+func (self parsedSource) syntaxInstantiationsAt(typeName string) []string {
+	// which instantiations are a call's function, so that a called one is reported as the call
+	// that carries its bound rather than as the half of it that cannot.
+	enclosing := map[ast.Node]*ast.CallExpr{}
+	ast.Inspect(self.file, func(node ast.Node) bool {
+		if call, isCall := node.(*ast.CallExpr); isCall {
+			enclosing[call.Fun] = call
+		}
+		return true
+	})
+	found := []string{}
+	ast.Inspect(self.file, func(node ast.Node) bool {
+		var instantiated ast.Expr
+		var arguments []ast.Expr
+		switch generic := node.(type) {
+		case *ast.IndexExpr:
+			instantiated, arguments = generic.X, []ast.Expr{generic.Index}
+		case *ast.IndexListExpr:
+			instantiated, arguments = generic.X, generic.Indices
+		default:
+			return true
+		}
+		selector, isSelector := instantiated.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+		if base, isIdentifier := selector.X.(*ast.Ident); !isIdentifier || base.Name != "syntax" {
+			return true
+		}
+		if !expressionsName(arguments, typeName) {
+			return true
+		}
+		if call, isCalled := enclosing[node]; isCalled {
+			found = append(found, self.render(call))
+			return true
+		}
+		found = append(found, self.render(node))
+		return true
+	})
+	slices.Sort(found)
+	return found
+}
+
+// expressionsName reports whether any of these expressions mentions the named identifier, which
+// asked of a type argument list is the question "is this instantiated at that type".
+func expressionsName(expressions []ast.Expr, name string) bool {
+	for _, expression := range expressions {
+		named := false
+		ast.Inspect(expression, func(inner ast.Node) bool {
+			if identifier, isIdentifier := inner.(*ast.Ident); isIdentifier && identifier.Name == name {
+				named = true
+			}
+			return true
+		})
+		if named {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEveryRatchetTreeCodecCallInThisPackageRunsAtTheRaisedBound is the pin on the one fact about
+// this plan's ratchet tree target that no input can observe.
+//
+// A ratchet tree is the only structure in this package whose codec runs above MaxVectorLength, and
+// this product's own group is in the region that raise buys: a thousand leaves each carrying a 1216
+// byte X-Wing key encode to about 1.33 MiB. Below that boundary the raised bound and the default one
+// agree on every byte string, and above it CheckRoundTrip does not decode and so -- by its own
+// documented contract for an input that does not decode -- returns nil. So the difference between
+// this plan's target and one that checks nothing at all is invisible to every behavioural test that
+// could be written, which is exactly why the bound was dropped from both of its spellings with 6242
+// tests still passing.
+//
+// The class is DERIVED and the derivation is over type arguments: every call anywhere in this
+// package, test source included, to a generic syntax entry point instantiated at RatchetTree. A
+// list of the two call sites that exist today is the enumeration rule 5 forbids -- the two that
+// existed were exactly the two nobody kept in step -- and a third spelled tomorrow joins this gate
+// in the commit that writes it.
+func TestEveryRatchetTreeCodecCallInThisPackageRunsAtTheRaisedBound(t *testing.T) {
+	found, unbounded := []string{}, []string{}
+	for _, path := range packageSourcePaths(t) {
+		for _, entry := range mustParseSource(t, path).syntaxInstantiationsAt("RatchetTree") {
+			found = append(found, path+": "+entry)
+			if !strings.Contains(entry, "syntax.MaxRatchetTreeLength") {
+				unbounded = append(unbounded, path+": "+entry)
+			}
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("this package instantiates no generic syntax entry point at RatchetTree at all, so this gate read nothing; the codec table entry and the round trip helper are both such instantiations, and a gate that has stopped finding its subject must fail rather than report it clean")
+	}
+	if len(unbounded) > 0 {
+		t.Errorf("%d of %d ratchet tree codec instantiations do not name syntax.MaxRatchetTreeLength (%s); at the default bound a body larger than MaxVectorLength does not decode, and the round trip property's answer for an input that does not decode is nil, so what that site states is nothing",
+			len(unbounded), len(found), unbounded[0])
+	}
+
+	// the matcher on a control, because a matcher that had stopped matching reports the real
+	// source clean. Every direction it has to get right: the raised call accepted, the default
+	// call refused, the default VALUE refused -- that is the form the codec table uses and the
+	// form the first version of this matcher could not see -- and an instantiation over another
+	// structure left alone, since it is not this gate's business.
+	control := mustParseText(t, "the ratchet tree bound control", ratchetTreeBoundControl)
+	entries := control.syntaxInstantiationsAt("RatchetTree")
+	if len(entries) != 3 {
+		t.Fatalf("the matcher read %v out of a control holding one raised ratchet tree call, one default call, one default value and one instantiation over another structure", entries)
+	}
+	raised := 0
+	for _, entry := range entries {
+		if strings.Contains(entry, "syntax.MaxRatchetTreeLength") {
+			raised += 1
+		}
+	}
+	if raised != 1 {
+		t.Errorf("the matcher read %d of the control's three ratchet tree sites as carrying the raised bound, want 1: %v", raised, entries)
+	}
+	// the count of raised ones rather than the word "all", because this line prints on the way out
+	// of a failure too and a log that contradicts the error above it is worse than no log.
+	t.Logf("%d ratchet tree codec instantiations, %d of them at the raised bound: %v",
+		len(found), len(found)-len(unbounded), found)
+}
+
+// A file entering the ratchet tree codec at both bounds, plus one generic syntax call over another
+// structure. Every matcher above runs on this as well as on the real source.
+const ratchetTreeBoundControl = `package mls
+
+func checkRaised(bs []byte) error {
+	return syntax.CheckRoundTripLimit[RatchetTree, *RatchetTree](bs, syntax.MaxRatchetTreeLength)
+}
+
+func checkDefault(bs []byte) error {
+	return syntax.CheckRoundTrip[RatchetTree, *RatchetTree](bs)
+}
+
+func checkAnother(bs []byte) error {
+	return syntax.CheckRoundTrip[UpdatePath, *UpdatePath](bs)
+}
+
+var checkAsAValue = syntax.CheckRoundTrip[RatchetTree, *RatchetTree]
+`
 // ---------------------------------------------------------------------------
 // the controls on the two things this plan added to the shared harness
 // ---------------------------------------------------------------------------

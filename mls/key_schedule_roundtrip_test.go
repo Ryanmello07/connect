@@ -33,6 +33,7 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -1515,18 +1516,28 @@ func TestTheCommittedSeedCorpusIsPinnedAsBinary(t *testing.T) {
 // the targets that read the corpus
 // ---------------------------------------------------------------------------
 
-// seedCorpusLoader is the name of the function below, as a string, because the gate that checks
+// seedCorpusRunner is the name of the function below, as a string, because the gate that checks
 // a corpus folder has a reader looks for a call to it in the target's body and a literal spelled
 // twice is a literal that drifts.
-const seedCorpusLoader = "addSeedCorpus"
+//
+// It names the RUNNER rather than the loader it wraps, and that is the correction: a target that
+// loaded the seeds and then ran the engine itself would satisfy a gate looking for the loader while
+// handing nothing over, which is the defect fuzzTheCommittedSeedCorpus exists to observe.
+const seedCorpusRunner = "fuzzTheCommittedSeedCorpus"
 
-// addSeedCorpus hands one target's committed seeds to the fuzzing engine.
+// addSeedCorpus hands one target's committed seeds to the fuzzing engine and answers how many it
+// handed over.
 //
 // Go's own corpus directory is testdata/fuzz/<Target>, and these seeds deliberately do not live
 // there: testdata/fuzz is where the engine WRITES the inputs it finds, and a directory the tool
 // rewrites is not a directory a corpus can be evidence in. Seeds committed under
 // testdata/corpus/<Target> are read into the target explicitly instead.
-func addSeedCorpus(f *testing.F, target string) {
+//
+// The count below is NOT the check that the hand off happened, and reading it as one is the defect
+// that was found here: it is incremented in the same loop body as the f.Add it would be guarding,
+// so replacing that call with a discard leaves the counter at 141 and this function silent. What
+// observes the hand off is the caller, from the far side, by counting what the ENGINE ran.
+func addSeedCorpus(f *testing.F, target string) int {
 	f.Helper()
 	names, bodies := readSeedCorpus(f, target)
 	added := 0
@@ -1534,14 +1545,75 @@ func addSeedCorpus(f *testing.F, target string) {
 		f.Add(bodies[name])
 		added++
 	}
-	// readSeedCorpus already refuses an empty folder. This says the same thing about the hand
-	// off, because a loop that read 287 files and added none reports exactly what a loop that
-	// added every one reports, and the whole defect this file was reviewed for was a corpus
-	// nothing consumed.
+	// readSeedCorpus already refuses an empty folder, so this fires only for a folder that held
+	// files none of which were read -- which is a different failure and still a silent one.
 	if added == 0 {
 		f.Fatalf("%s: not one committed seed reached the fuzzing corpus", target)
 	}
-	f.Logf("%s: %d committed seeds added", target, added)
+	return added
+}
+
+// fuzzTheCommittedSeedCorpus is the whole hand off, and every target in this package with a
+// committed corpus goes through it: load the seeds, give them to the engine, state the property
+// over whatever the engine hands back, and then assert that the engine ACTUALLY RAN them.
+//
+// The last clause is the one that was missing, and its absence was invisible from everywhere. With
+// f.Add replaced by a discard the whole committed corpus stopped reaching any engine: all 401 seed
+// subtests across the four targets vanished, addSeedCorpus's own zero check stayed silent because
+// its counter lives in the same loop body, TestEveryCommittedCorpusFolderIsReadByAFuzzTarget stayed
+// green because it asks whether a target NAMES its loader rather than whether a seed moved, and the
+// only trace in the whole suite was a pass count falling from 6242 to 5841 that nothing asserts on.
+//
+// So the number is taken from the far side of the engine. go test runs each seed of a target as a
+// subtest of it -- testing.F.Fuzz's default arm is that loop -- so the property below is called once
+// per seed, and a run that called it fewer times than seeds were handed over is a run in which the
+// hand off did not happen. That is the same fact the 401 vanishing subtests were, asserted where a
+// plain go test run reaches it.
+func fuzzTheCommittedSeedCorpus(f *testing.F, target string, property func(t *testing.T, encoded []byte)) {
+	f.Helper()
+	added := addSeedCorpus(f, target)
+	// a plain counter and not an atomic: the default arm runs the seeds one at a time and joins
+	// each before starting the next, and nothing here calls t.Parallel.
+	executed := 0
+	f.Fuzz(func(t *testing.T, encoded []byte) {
+		executed += 1
+		property(t, encoded)
+	})
+	if !seedCorpusExecutionIsObservable() {
+		return
+	}
+	// fewer rather than not equal, because testdata/fuzz may hold inputs the engine FOUND, and
+	// those are executions this hand off did not supply.
+	if executed < added {
+		f.Errorf("%s: %d committed seeds were handed to the engine and it ran the property %d times; the corpus is reaching no engine, and every property this package states over it is stated over bytes nothing consumes",
+			target, added, executed)
+	}
+	f.Logf("%s: %d committed seeds handed over, %d engine executions", target, added, executed)
+}
+
+// seedCorpusExecutionIsObservable reports whether THIS invocation of go test is one in which the
+// engine runs every committed seed in this process, which is the only invocation the count above
+// can be asserted on.
+//
+// Two invocations are not. Under -fuzz the corpus is fanned out to worker PROCESSES and the arm of
+// testing.F.Fuzz that runs seeds in the caller's process is not the arm taken, so the coordinator
+// and each worker would both count zero. And a -run pattern carrying a subtest element selects
+// individual seeds by name, which makes a partial count the correct outcome rather than a defect.
+//
+// Both are read off the test binary's own flags rather than guessed, and both are the narrowest
+// thing that can be said: a -run pattern without a separator selects whole targets, and every seed
+// of a selected target runs.
+func seedCorpusExecutionIsObservable() bool {
+	if fuzzing := flag.Lookup("test.fuzz"); fuzzing != nil && fuzzing.Value.String() != "" {
+		return false
+	}
+	if worker := flag.Lookup("test.fuzzworker"); worker != nil && worker.Value.String() == "true" {
+		return false
+	}
+	if run := flag.Lookup("test.run"); run != nil && strings.Contains(run.Value.String(), "/") {
+		return false
+	}
+	return true
 }
 
 // FuzzGroupContextRoundTrip is gate 4 properties 1 and 2 on the section 8.1 group context in
@@ -1557,8 +1629,7 @@ func addSeedCorpus(f *testing.F, target string) {
 // Seeds that do not decode are not failures. A fuzzer spends most of its budget on inputs no
 // decoder accepts, and an obligation on those would drown the one that matters.
 func FuzzGroupContextRoundTrip(f *testing.F) {
-	addSeedCorpus(f, groupContextSeedTarget)
-	f.Fuzz(func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, groupContextSeedTarget, func(t *testing.T, encoded []byte) {
 		if err := syntax.CheckRoundTrip[GroupContext, *GroupContext](encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
@@ -1570,8 +1641,7 @@ func FuzzGroupContextRoundTrip(f *testing.F) {
 // coverage feedback and its found corpus per target, and one target over two grammars spends
 // half its budget on each while reporting one.
 func FuzzPreSharedKeyIdRoundTrip(f *testing.F) {
-	addSeedCorpus(f, preSharedKeyIdSeedTarget)
-	f.Fuzz(func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, preSharedKeyIdSeedTarget, func(t *testing.T, encoded []byte) {
 		if err := syntax.CheckRoundTrip[PreSharedKeyId, *PreSharedKeyId](encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
@@ -1691,9 +1761,9 @@ func TestEveryCommittedCorpusFolderIsReadByAFuzzTarget(t *testing.T) {
 			// file refuses to recurse; there is nothing here for this half of the gate to say.
 			continue
 		}
-		if !body[seedCorpusLoader] {
-			t.Errorf("%s/%s holds seeds directly and func %s does not call %s, so those seeds reach the fuzzing engine by no route this gate can see",
-				root, entry.Name(), entry.Name(), seedCorpusLoader)
+		if !body[seedCorpusRunner] {
+			t.Errorf("%s/%s holds seeds directly and func %s does not call %s, so those seeds reach the fuzzing engine by no route this gate can see and nothing counts what the engine ran",
+				root, entry.Name(), entry.Name(), seedCorpusRunner)
 		}
 	}
 	if folders == 0 {
