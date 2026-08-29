@@ -1208,3 +1208,850 @@ func TestEveryStructuralFramingErrorHasExactlyOneDeclarationSite(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FramedContentAuthData
+// ---------------------------------------------------------------------------
+
+// contentTypes is the class every auth data sweep below runs over, derived off the type
+// through the package's own type checker rather than listed.
+//
+// Derived for the reason senderTypes is: a fourth content type declared and left out of a hand
+// written list is a content type nothing here judges. It matters more here than it does there,
+// because the content type is not carried inside a FramedContentAuthData at all -- it is the
+// parameter that decides whether a confirmation tag is read -- so an arm nothing sweeps is an
+// arm whose tag handling nothing states.
+func contentTypes(t *testing.T) []ContentType {
+	t.Helper()
+	derived := registryConstantsOfType(t, "ContentType")
+	found := []ContentType{}
+	for _, value := range derived {
+		found = append(found, ContentType(value))
+	}
+	if len(found) == 0 {
+		t.Fatal("no ContentType constant was derived, so every sweep below would run over the empty set")
+	}
+	slices.Sort(found)
+	return found
+}
+
+// undeclaredContentTypeOctets is every octet the ContentType registry does not name, derived
+// over the width of the type against the declared set. The reserved zero is one of them and is
+// not special.
+func undeclaredContentTypeOctets(t *testing.T) []ContentType {
+	t.Helper()
+	declared := contentTypes(t)
+	found := []ContentType{}
+	for candidate := 0; candidate <= 0xff; candidate += 1 {
+		if slices.Contains(declared, ContentType(candidate)) {
+			continue
+		}
+		found = append(found, ContentType(candidate))
+	}
+	if len(found)+len(declared) != int(^ContentType(0))+1 {
+		t.Fatalf("the derivation split %d code points into %d declared and %d undeclared",
+			int(^ContentType(0))+1, len(declared), len(found))
+	}
+	return found
+}
+
+// testAuthData is the value every sweep below encodes, populated in BOTH fields under EVERY
+// content type.
+//
+// Both halves of that are load bearing. Signature and ConfirmationTag are the same Go type and
+// adjacent, which is the shape no round trip property can see: swapped in both halves of the
+// codec they round trip perfectly, re-encode byte exact and agree with every structural test
+// here. What separates them is the hand derivation below, and it can only separate them because
+// the two values have DIFFERENT LENGTHS -- three octets against two -- so a swap moves the
+// length prefixes as well as the bodies.
+//
+// Populating the tag under application and proposal is what the "written under an arm that does
+// not carry it" mutation needs: under those two content types this value holds a confirmation
+// tag that must not reach the wire at all.
+func testAuthData() *FramedContentAuthData {
+	return &FramedContentAuthData{
+		Signature:       []byte{0x11, 0x22, 0x33},
+		ConfirmationTag: []byte{0x44, 0x55},
+	}
+}
+
+// handDerivedAuthDataGolden is RFC 9420 section 6's FramedContentAuthData written from the wire
+// format, not read back out of framing.go.
+//
+//	struct {
+//	    opaque signature<V>;
+//	    select (FramedContentAuthData.content_type) {
+//	        case commit:
+//	            MAC confirmation_tag;   /* opaque<V> */
+//	        case application:
+//	        case proposal:
+//	    };
+//	} FramedContentAuthData;
+//
+// The octet arithmetic, from the varint length prefix p1 implements: a length below 64 has
+// prefix bits 00 and occupies one octet.
+//
+//	signature<V> over 11 22 33   length 3 -> 1 octet 0x03, body 3 octets = 4
+//	confirmation_tag<V> over 44 55  length 2 -> 1 octet 0x02, body 2 octets = 3
+//
+//	application  4 + 0 = 4
+//	proposal     4 + 0 = 4
+//	commit       4 + 3 = 7
+//
+// This is the one statement here that a symmetric edit cannot survive, and this structure needs
+// it more than Sender did: there is no discriminant octet in these bytes at all, so a codec
+// that read the wrong arm produces no type error anywhere and the ONLY thing separating a
+// commit's encoding from a proposal's is the three octets at the end.
+func handDerivedAuthDataGolden(contentType ContentType) []byte {
+	switch contentType {
+	case ContentTypeApplication:
+		return []byte{0x03, 0x11, 0x22, 0x33}
+	case ContentTypeProposal:
+		return []byte{0x03, 0x11, 0x22, 0x33}
+	case ContentTypeCommit:
+		return []byte{0x03, 0x11, 0x22, 0x33, 0x02, 0x44, 0x55}
+	}
+	return nil
+}
+
+// handDerivedAuthDataSizes is the arithmetic in the comment above, stated separately so a
+// derivation edited without its comment fails rather than redefining what it is compared to.
+var handDerivedAuthDataSizes = map[ContentType]int{
+	ContentTypeApplication: 4,
+	ContentTypeProposal:    4,
+	ContentTypeCommit:      7,
+}
+
+// authDataVariantPaths is the section 6 select above, written as the fields each arm carries.
+//
+// Unlike senderVariantPaths this table has no discriminant field to exclude, and that absence
+// is the whole design of the type: the content type is a parameter of the codec rather than a
+// field of the struct, so there is nothing in these bytes that says which arm they are.
+var authDataVariantPaths = map[ContentType][]string{
+	ContentTypeApplication: {"Signature"},
+	ContentTypeProposal:    {"Signature"},
+	ContentTypeCommit:      {"Signature", "ConfirmationTag"},
+}
+
+// registrySection72AuthDataFields is the field list registry section 7.2 fixes, in wire order.
+//
+// A transcription rather than a derivation, deliberately, because it is a claim ABOUT the
+// registry and there is nothing in this tree to derive it from. It is the one place the two
+// fields the validation plan asked for and the registry REFUSED -- MembershipTag, which belongs
+// to PublicMessage, and HasConfirmationTag, whose answer is derived from the content type -- can
+// be kept out by something other than memory.
+var registrySection72AuthDataFields = []string{"Signature", "ConfirmationTag"}
+
+// decodedFormOfAuthData is what a decode of this value under this content type must produce:
+// the same value with the fields this content type's arm does not carry left at their zero.
+// Derived off the variant table the test below holds to the type, so a decoder that filled a
+// field its arm does not carry fails without anybody writing a case for it.
+func decodedFormOfAuthData(t *testing.T, auth *FramedContentAuthData, contentType ContentType) *FramedContentAuthData {
+	t.Helper()
+	out := *auth
+	value := reflect.ValueOf(&out).Elem()
+	carried := authDataVariantPaths[contentType]
+	for i := 0; i < value.NumField(); i += 1 {
+		name := value.Type().Field(i).Name
+		if slices.Contains(carried, name) {
+			continue
+		}
+		value.Field(i).Set(reflect.Zero(value.Field(i).Type()))
+	}
+	return &out
+}
+
+func sameAuthData(a *FramedContentAuthData, b *FramedContentAuthData) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+// describeAuthData separates a nil field from an empty one, because the two are different
+// statements here -- an absent confirmation tag against one this codec refuses -- and %x spells
+// both as the empty string.
+func describeAuthData(auth *FramedContentAuthData) string {
+	return fmt.Sprintf("signature=%s confirmation_tag=%s",
+		describeOptionalOctets(auth.Signature), describeOptionalOctets(auth.ConfirmationTag))
+}
+
+func describeOptionalOctets(bs []byte) string {
+	if bs == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%x(len %d)", bs, len(bs))
+}
+
+// encodeAuthData is the whole encode: a fresh Writer, the codec, and Bytes.
+func encodeAuthData(auth *FramedContentAuthData, contentType ContentType) ([]byte, error) {
+	w := syntax.NewWriter()
+	if err := auth.MarshalMLS(w, contentType); err != nil {
+		return nil, err
+	}
+	return w.Bytes()
+}
+
+// decodeAuthData is the whole decode: the codec, and then the full consumption rule.
+//
+// Done() is part of acceptance rather than an extra assertion at some call sites, and that is
+// the decision this structure turns on. A FramedContentAuthData is the tail of every structure
+// that carries it, so a tail this codec leaves behind is a tail the enclosing decode refuses --
+// and "accepted" has to mean the same thing in the wrong-content-type sweep as it does in the
+// round trip, or that sweep would report a commit's confirmation tag silently dropped by a
+// proposal decode as a success.
+func decodeAuthData(bs []byte, contentType ContentType) (*FramedContentAuthData, error) {
+	decoded := &FramedContentAuthData{}
+	r := syntax.NewReader(bs)
+	if err := decoded.UnmarshalMLS(r, contentType); err != nil {
+		return nil, err
+	}
+	if err := r.Done(); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+// TestTheAuthDataVariantTableCoversTheTypeAndTheRegistry holds the table to the two things it
+// is a claim about: the declared content types, and the fields FramedContentAuthData has.
+//
+// Without this the table is a list, and a list is the exemption shape this project keeps
+// rediscovering -- a fourth content type, or a third field, silently outside every sweep that
+// runs off it. The union clause is the one that matters here: there is no discriminant field to
+// carve out, so every field of this struct must be carried by some arm, and a field carried by
+// none is a field nothing on the wire is a function of.
+func TestTheAuthDataVariantTableCoversTheTypeAndTheRegistry(t *testing.T) {
+	declared := contentTypes(t)
+	tabled := []ContentType{}
+	for contentType := range authDataVariantPaths {
+		tabled = append(tabled, contentType)
+	}
+	slices.Sort(tabled)
+	if !slices.Equal(declared, tabled) {
+		t.Fatalf("the package declares the content types %v and the auth data variant table covers %v",
+			declared, tabled)
+	}
+	structType := reflect.TypeOf(FramedContentAuthData{})
+	fields := []string{}
+	for i := 0; i < structType.NumField(); i += 1 {
+		fields = append(fields, structType.Field(i).Name)
+	}
+	if !slices.Equal(fields, registrySection72AuthDataFields) {
+		t.Fatalf("FramedContentAuthData has the fields %v and registry section 7.2 fixes %v; MembershipTag belongs to PublicMessage and HasConfirmationTag is derived from the content type, so neither may land here",
+			fields, registrySection72AuthDataFields)
+	}
+	claimed := map[string]bool{}
+	for contentType, paths := range authDataVariantPaths {
+		for _, path := range paths {
+			if !slices.Contains(fields, path) {
+				t.Errorf("content type %d claims the field %s and FramedContentAuthData has no such field",
+					contentType, path)
+			}
+			claimed[path] = true
+		}
+	}
+	for _, name := range fields {
+		if !claimed[name] {
+			t.Errorf("%s is carried by no arm of the variant table, so nothing on the wire is a function of it",
+				name)
+		}
+	}
+	// the goldens are the other half of the table and are checked here rather than at each
+	// call site, so an arm added to the table without one is not swept against nothing.
+	for _, contentType := range declared {
+		if handDerivedAuthDataGolden(contentType) == nil {
+			t.Errorf("content type %d has no hand derived golden, so nothing states its encoding", contentType)
+		}
+		if _, stated := handDerivedAuthDataSizes[contentType]; !stated {
+			t.Errorf("content type %d has no hand derived size, so its golden is compared only against itself",
+				contentType)
+		}
+	}
+	if len(handDerivedAuthDataSizes) != len(declared) {
+		t.Errorf("the size table holds %d entries and the package declares %d content types",
+			len(handDerivedAuthDataSizes), len(declared))
+	}
+}
+
+// TestFramedContentAuthDataMarshalMatchesTheHandDerivedGoldens is the field order, the field
+// width and the arm selection pin, all three at once.
+func TestFramedContentAuthDataMarshalMatchesTheHandDerivedGoldens(t *testing.T) {
+	for _, contentType := range contentTypes(t) {
+		want := handDerivedAuthDataGolden(contentType)
+		if want == nil {
+			t.Fatalf("content type %d has no hand derived golden", contentType)
+		}
+		size, stated := handDerivedAuthDataSizes[contentType]
+		if !stated {
+			t.Fatalf("content type %d has no hand derived size", contentType)
+		}
+		if len(want) != size {
+			t.Fatalf("content type %d: the hand derivation is %d octets and the arithmetic in its comment says %d",
+				contentType, len(want), size)
+		}
+		encoded, err := encodeAuthData(testAuthData(), contentType)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+		if !bytes.Equal(encoded, want) {
+			t.Errorf("content type %d: marshal =\n %x\nwant\n %x", contentType, encoded, want)
+		}
+		decoded, err := decodeAuthData(want, contentType)
+		if err != nil {
+			t.Fatalf("content type %d: decoding the golden: %v", contentType, err)
+		}
+		if expected := decodedFormOfAuthData(t, testAuthData(), contentType); !sameAuthData(decoded, expected) {
+			t.Errorf("content type %d: the golden decoded to\n %s\nwant\n %s",
+				contentType, describeAuthData(decoded), describeAuthData(expected))
+		}
+	}
+}
+
+// TestFramedContentAuthDataRoundTripsEveryContentType compares the WHOLE decoded value against
+// the derived expected form rather than the one or two fields a hand written case would list,
+// and then re-encodes.
+//
+// The whole-value half is what a field dropped from BOTH halves of the codec needs: that drop
+// re-encodes byte exact against itself and is simply lost, and only a comparison that names no
+// field can see it.
+func TestFramedContentAuthDataRoundTripsEveryContentType(t *testing.T) {
+	for _, contentType := range contentTypes(t) {
+		encoded, err := encodeAuthData(testAuthData(), contentType)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+		decoded, err := decodeAuthData(encoded, contentType)
+		if err != nil {
+			t.Fatalf("content type %d: unmarshal: %v", contentType, err)
+		}
+		if want := decodedFormOfAuthData(t, testAuthData(), contentType); !sameAuthData(decoded, want) {
+			t.Errorf("content type %d: round trip gave\n %s\nwant\n %s",
+				contentType, describeAuthData(decoded), describeAuthData(want))
+		}
+		reencoded, err := encodeAuthData(decoded, contentType)
+		if err != nil {
+			t.Fatalf("content type %d: re-marshal: %v", contentType, err)
+		}
+		if !bytes.Equal(reencoded, encoded) {
+			t.Errorf("content type %d: re-encode =\n %x\nwant\n %x", contentType, reencoded, encoded)
+		}
+	}
+}
+
+// TestTheAuthDataCodecWritesEveryFieldItsContentTypeCarriesAndNoOther sweeps the fields off the
+// TYPE and the carriage off the variant table, so neither is a list somebody kept up to date.
+//
+// This is the property a golden cannot state on its own: the golden says what the bytes are for
+// one value, and this says that each field is what those bytes are a function of. It is where
+// two of this task's named mutations land for every arm at once -- a confirmation tag written
+// under proposal, and a confirmation tag omitted under commit -- because both are exactly
+// "varying this field changed the encoding when the arm says it should not", or the reverse.
+func TestTheAuthDataCodecWritesEveryFieldItsContentTypeCarriesAndNoOther(t *testing.T) {
+	structType := reflect.TypeOf(FramedContentAuthData{})
+	replacement := []byte{0x7e, 0x7f, 0x80, 0x81}
+	observed := map[string]bool{}
+	for _, contentType := range contentTypes(t) {
+		base, err := encodeAuthData(testAuthData(), contentType)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+		for i := 0; i < structType.NumField(); i += 1 {
+			name := structType.Field(i).Name
+			varied := testAuthData()
+			field := reflect.ValueOf(varied).Elem().Field(i)
+			if bytes.Equal(field.Bytes(), replacement) {
+				t.Fatalf("%s already holds the replacement value, so varying it varies nothing", name)
+			}
+			field.SetBytes(bytes.Clone(replacement))
+			encoded, err := encodeAuthData(varied, contentType)
+			if err != nil {
+				t.Fatalf("content type %d: marshal with %s varied: %v", contentType, name, err)
+			}
+			changed := !bytes.Equal(encoded, base)
+			carried := slices.Contains(authDataVariantPaths[contentType], name)
+			if carried && !changed {
+				t.Errorf("content type %d carries %s and varying it left the encoding at %x, so nothing writes it",
+					contentType, name, encoded)
+			}
+			if !carried && changed {
+				t.Errorf("content type %d does not carry %s and varying it changed the encoding to %x, so this codec writes a field the select does not give that arm",
+					contentType, name, encoded)
+			}
+			observed[name] = observed[name] || changed
+		}
+	}
+	for i := 0; i < structType.NumField(); i += 1 {
+		name := structType.Field(i).Name
+		if !observed[name] {
+			t.Errorf("%s changed no encoding under any declared content type, so nothing in this package writes it",
+				name)
+		}
+	}
+}
+
+// TestTheAuthDataGoldensSeparateExactlyTheArmsThatDifferOnTheWire is the premise the
+// wrong-content-type sweep below rests on, stated rather than assumed.
+//
+// Application and proposal are the SAME encoding of this structure -- section 6's select gives
+// both of them the empty arm -- so no decoder can be asked to tell one from the other, and a
+// sweep demanding that every wrong content type be refused would be demanding something false.
+// Commit is the arm that differs. Deriving the partition off the hand written goldens rather
+// than off framing.go is what keeps it a statement about the RFC: a codec that stopped writing
+// the confirmation tag would make all three goldens equal, and this fails before the sweep
+// below gets the chance to pass vacuously.
+func TestTheAuthDataGoldensSeparateExactlyTheArmsThatDifferOnTheWire(t *testing.T) {
+	declared := contentTypes(t)
+	distinct := map[string][]ContentType{}
+	for _, contentType := range declared {
+		key := fmt.Sprintf("%x", handDerivedAuthDataGolden(contentType))
+		distinct[key] = append(distinct[key], contentType)
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("all %d content types encode this value identically, so no wrong content type could ever be refused and the sweep below states nothing",
+			len(declared))
+	}
+	if !bytes.Equal(handDerivedAuthDataGolden(ContentTypeApplication), handDerivedAuthDataGolden(ContentTypeProposal)) {
+		t.Error("application and proposal are given different encodings here; RFC 9420 section 6 gives both of them the empty arm")
+	}
+	if bytes.Equal(handDerivedAuthDataGolden(ContentTypeCommit), handDerivedAuthDataGolden(ContentTypeProposal)) {
+		t.Error("commit and proposal are given the same encoding here; the confirmation tag is what separates them")
+	}
+	t.Logf("%d content types over %d distinct encodings", len(declared), len(distinct))
+}
+
+// TestAnAuthDataUnderTheWrongContentTypeIsRefusedRatherThanMisParsed is this structure's
+// signature failure mode, swept over every ordered pair.
+//
+// FramedContentAuthData carries no discriminant, so the content type handed to the decoder is
+// the only thing that says which arm the bytes are. Two ways of getting that wrong are two
+// different bugs and both are here. A commit's bytes read as a proposal must NOT quietly stop
+// after the signature and report success -- that is a confirmation tag dropped on the floor,
+// which is a commit accepted with its binding to the epoch unread. A proposal's bytes read as a
+// commit must not manufacture a tag out of whatever follows.
+//
+// The expectation is derived from the goldens rather than listed: where two content types share
+// an encoding the decode must SUCCEED and give the same value, and where they do not it must be
+// refused. A test that demanded refusal everywhere would be false for application against
+// proposal; a test that demanded it nowhere would be this bug.
+func TestAnAuthDataUnderTheWrongContentTypeIsRefusedRatherThanMisParsed(t *testing.T) {
+	declared := contentTypes(t)
+	refused, shared := 0, 0
+	for _, encodedUnder := range declared {
+		golden := handDerivedAuthDataGolden(encodedUnder)
+		for _, decodedUnder := range declared {
+			if encodedUnder == decodedUnder {
+				continue
+			}
+			decoded, err := decodeAuthData(golden, decodedUnder)
+			sameEncoding := bytes.Equal(golden, handDerivedAuthDataGolden(decodedUnder))
+			if !sameEncoding {
+				if err == nil {
+					t.Errorf("the content type %d encoding %x decoded under content type %d as\n %s\nand the two arms do not share an encoding, so it must be refused",
+						encodedUnder, golden, decodedUnder, describeAuthData(decoded))
+					continue
+				}
+				refused += 1
+				continue
+			}
+			if err != nil {
+				t.Errorf("content types %d and %d share one encoding and decoding %x under %d was refused: %v",
+					encodedUnder, decodedUnder, golden, decodedUnder, err)
+				continue
+			}
+			want, wantErr := decodeAuthData(golden, encodedUnder)
+			if wantErr != nil {
+				t.Fatalf("content type %d could not decode its own golden: %v", encodedUnder, wantErr)
+			}
+			if !sameAuthData(decoded, want) {
+				t.Errorf("content types %d and %d share one encoding and it decoded to\n %s\nunder one and\n %s\nunder the other",
+					encodedUnder, decodedUnder, describeAuthData(want), describeAuthData(decoded))
+			}
+			shared += 1
+		}
+	}
+	if refused == 0 {
+		t.Fatal("no cross content type decode was refused, so this observed nothing")
+	}
+	t.Logf("%d cross content type decodes refused, %d passed as arms sharing one encoding", refused, shared)
+}
+
+// TestANonCommitAuthDataDecodeNeverProducesAConfirmationTag is the half of the sweep above that
+// survives even where the arms share an encoding.
+//
+// Stated separately because it is the property with the sharpest failure: a decoder that read a
+// tag whenever bytes happened to remain would be caught above only by the r.Done() clause, and a
+// later task that gave this codec a bounded sub-Reader -- which is what an enclosing structure
+// with fields after the auth data would need -- would remove that clause's teeth without
+// touching this file. The value is what is asserted here, not the tail.
+func TestANonCommitAuthDataDecodeNeverProducesAConfirmationTag(t *testing.T) {
+	inputs := [][]byte{}
+	for _, contentType := range contentTypes(t) {
+		inputs = append(inputs, handDerivedAuthDataGolden(contentType))
+	}
+	inputs = append(inputs, joinBytes(handDerivedAuthDataGolden(ContentTypeCommit), repeatByte(0x5a, 9)))
+	stated := 0
+	for _, contentType := range contentTypes(t) {
+		if slices.Contains(authDataVariantPaths[contentType], "ConfirmationTag") {
+			continue
+		}
+		for _, input := range inputs {
+			decoded := &FramedContentAuthData{ConfirmationTag: []byte{0xde, 0xad}}
+			r := syntax.NewReader(input)
+			if err := decoded.UnmarshalMLS(r, contentType); err != nil {
+				continue
+			}
+			if decoded.ConfirmationTag != nil {
+				t.Errorf("content type %d decoded %x and produced the confirmation tag %x; that arm carries none",
+					contentType, input, decoded.ConfirmationTag)
+			}
+			stated += 1
+		}
+	}
+	if stated == 0 {
+		t.Fatal("no non-commit decode succeeded, so this observed nothing")
+	}
+	t.Logf("%d non-commit decodes left the confirmation tag absent", stated)
+}
+
+// TestFramedContentAuthDataRequiresAConfirmationTagOnACommit states ValSem009's structural half
+// on BOTH halves of the codec.
+//
+// The encode half is not decoration. The confirmation tag is what binds a commit to the epoch it
+// creates, so an encoder that wrote a commit's auth data without one would produce a message
+// every peer rejects having verified its signature first -- and an encoder whose commit arm fell
+// through to the signature-only write is exactly the shape a decode-only test cannot see.
+//
+// The empty tag is here beside the nil one because they are the same statement on the wire and
+// a length check written as a nil check would let one of them through.
+func TestFramedContentAuthDataRequiresAConfirmationTagOnACommit(t *testing.T) {
+	for _, missing := range []*FramedContentAuthData{
+		{Signature: []byte{0x11, 0x22, 0x33}},
+		{Signature: []byte{0x11, 0x22, 0x33}, ConfirmationTag: []byte{}},
+	} {
+		if _, err := encodeAuthData(missing, ContentTypeCommit); !errors.Is(err, errMissingConfirmationTag) {
+			t.Errorf("marshalling a commit whose confirmation tag is %s gave %v, want errMissingConfirmationTag",
+				describeOptionalOctets(missing.ConfirmationTag), err)
+		}
+	}
+	// the decode half: a wire legal zero length tag is the encoding of "no tag", and what the
+	// encoder refuses to write the decoder must refuse to read, or a round trip through this
+	// package would produce a value this package will not re-encode.
+	emptyTag := []byte{0x03, 0x11, 0x22, 0x33, 0x00}
+	if _, err := decodeAuthData(emptyTag, ContentTypeCommit); !errors.Is(err, errMissingConfirmationTag) {
+		t.Errorf("decoding %x as a commit gave %v, want errMissingConfirmationTag", emptyTag, err)
+	}
+	// and the neighbouring refusal, so the one above cannot be passing for a truncation: a
+	// commit with no tag field at all ends the input early.
+	noTagAtAll := []byte{0x03, 0x11, 0x22, 0x33}
+	if _, err := decodeAuthData(noTagAtAll, ContentTypeCommit); err == nil {
+		t.Errorf("decoding %x as a commit was accepted; the tag field is absent entirely", noTagAtAll)
+	}
+}
+
+// TestFramedContentAuthDataRejectsAnUnregisteredContentType sweeps the whole octet space rather
+// than the value somebody thought of, and states the refusal on both halves.
+//
+// The encode half matters for the reason Sender's does: a content type outside the registry has
+// no arm, so an encoder whose default fell through to writing the signature alone would emit a
+// commit's auth data shorn of its tag under a content type nothing can parse.
+//
+// The decode half is offered against the full commit golden, which has bytes to spare, so a
+// refusal that was really a truncation cannot pass for a refusal of the TYPE.
+func TestFramedContentAuthDataRejectsAnUnregisteredContentType(t *testing.T) {
+	undeclared := undeclaredContentTypeOctets(t)
+	if !slices.Contains(undeclared, ContentType(0)) {
+		t.Fatal("0 is declared as a content type, and RFC 9420 section 6 reserves it")
+	}
+	for _, contentType := range undeclared {
+		if _, err := encodeAuthData(testAuthData(), contentType); !errors.Is(err, ErrUnknownContentType) {
+			t.Fatalf("marshalling under content type %d gave %v, want ErrUnknownContentType", contentType, err)
+		}
+		for _, input := range [][]byte{
+			nil,
+			handDerivedAuthDataGolden(ContentTypeApplication),
+			handDerivedAuthDataGolden(ContentTypeCommit),
+		} {
+			decoded := &FramedContentAuthData{}
+			r := syntax.NewReader(input)
+			if err := decoded.UnmarshalMLS(r, contentType); !errors.Is(err, ErrUnknownContentType) {
+				t.Fatalf("decoding %x under content type %d gave %v, want ErrUnknownContentType",
+					input, contentType, err)
+			}
+			// refused before a single octet is consumed, so an unregistered content type does
+			// not half consume the caller's Reader on its way to being refused.
+			if r.Offset() != 0 {
+				t.Fatalf("decoding under content type %d consumed %d octets before refusing",
+					contentType, r.Offset())
+			}
+		}
+	}
+	t.Logf("%d unregistered content type octets refused on both halves of the codec", len(undeclared))
+}
+
+// TestARefusedAuthDataMarshalWritesNothing is the encoder's other half of the same discipline.
+//
+// There is no syntax.Marshal for this codec -- that entry point takes a one argument Marshaler
+// and this one needs the content type -- so the Writer belongs to the CALLER and survives the
+// refusal. An encoder that wrote the signature and then refused would leave a caller holding a
+// four octet prefix of a seven octet structure with no sticky error on the Writer to say so,
+// which for this structure is precisely "the confirmation tag is gone".
+//
+// The marker byte written first is what separates "wrote nothing" from "was handed an empty
+// Writer": a length compared against zero would pass for an encoder that had truncated
+// everything.
+func TestARefusedAuthDataMarshalWritesNothing(t *testing.T) {
+	type refusal struct {
+		auth        *FramedContentAuthData
+		contentType ContentType
+	}
+	refusals := []refusal{{auth: &FramedContentAuthData{Signature: []byte{0x11}}, contentType: ContentTypeCommit}}
+	for _, contentType := range undeclaredContentTypeOctets(t) {
+		refusals = append(refusals, refusal{auth: testAuthData(), contentType: contentType})
+	}
+	for _, each := range refusals {
+		w := syntax.NewWriter()
+		w.WriteUint8(0xa5)
+		before := w.Len()
+		if err := each.auth.MarshalMLS(w, each.contentType); err == nil {
+			t.Fatalf("content type %d: the marshal this sweep expects to be refused was accepted",
+				each.contentType)
+		}
+		if w.Len() != before {
+			encoded, _ := w.Bytes()
+			t.Fatalf("content type %d: a refused marshal left the Writer holding %x, %d octets past the %d it was handed",
+				each.contentType, encoded, w.Len()-before, before)
+		}
+	}
+	t.Logf("%d refused marshals wrote nothing", len(refusals))
+}
+
+// authDataRefusedDecode is one input this file can build that the CODEC ITSELF must refuse,
+// against the content type it is offered under. The tail rule is deliberately not in here: a
+// decode that succeeded and left bytes over is refused by r.Done() rather than by this method,
+// and the receiver discipline below is a statement about the method.
+type authDataRefusedDecode struct {
+	input       []byte
+	contentType ContentType
+}
+
+// authDataRefusedDecodes is every such input: every proper prefix of every golden, the commit
+// encoding whose tag length is zeroed, and every golden under every unregistered content type.
+func authDataRefusedDecodes(t *testing.T) []authDataRefusedDecode {
+	t.Helper()
+	found := []authDataRefusedDecode{}
+	for _, contentType := range contentTypes(t) {
+		golden := handDerivedAuthDataGolden(contentType)
+		for cut := 0; cut < len(golden); cut += 1 {
+			// a proper prefix is a refusal only where the arm needs the octets it lost.
+			// application and proposal are four octets and every prefix of those is short; the
+			// commit golden's four octet prefix is a whole signature and is refused because the
+			// tag field is then absent entirely.
+			found = append(found, authDataRefusedDecode{input: bytes.Clone(golden[:cut]), contentType: contentType})
+		}
+		for _, unregistered := range undeclaredContentTypeOctets(t) {
+			found = append(found, authDataRefusedDecode{input: bytes.Clone(golden), contentType: unregistered})
+		}
+	}
+	found = append(found, authDataRefusedDecode{
+		input:       []byte{0x03, 0x11, 0x22, 0x33, 0x00},
+		contentType: ContentTypeCommit,
+	})
+	return found
+}
+
+// authDataPriorContents is every state a receiver can arrive in that this file can build.
+// Derived over the class rather than over the one prior somebody picks, because the failure is
+// per PAIR: only a receiver that already held a confirmation tag can leave that tag standing
+// under an arm that carries none.
+func authDataPriorContents(t *testing.T) []*FramedContentAuthData {
+	t.Helper()
+	priors := []*FramedContentAuthData{{}, testAuthData()}
+	for _, contentType := range contentTypes(t) {
+		priors = append(priors, decodedFormOfAuthData(t, testAuthData(), contentType))
+	}
+	return priors
+}
+
+// TestARefusedAuthDataDecodeLeavesItsReceiverUntouched is the discipline Sender, Credential and
+// LeafNode already keep, stated for this codec because it has an edge those three do not.
+//
+// The commit arm reads TWO fields. A decoder that assigned as it read would leave a caller's
+// value holding the signature out of a message this package REFUSED -- one whose confirmation
+// tag was truncated, or empty -- beside a confirmation tag left over from whatever the value
+// held before. That pair is a signature and a tag nothing ever carried together, sitting in a
+// variable the caller may well reuse, with nothing in the returned error saying so.
+func TestARefusedAuthDataDecodeLeavesItsReceiverUntouched(t *testing.T) {
+	priors := authDataPriorContents(t)
+	refused, accepted := 0, 0
+	for _, each := range authDataRefusedDecodes(t) {
+		for _, prior := range priors {
+			held := *prior
+			before := *prior
+			if err := held.UnmarshalMLS(syntax.NewReader(each.input), each.contentType); err == nil {
+				accepted += 1
+				continue
+			}
+			refused += 1
+			if sameAuthData(&held, &before) {
+				continue
+			}
+			t.Fatalf("content type %d: a refused decode of %x into a receiver that held\n %s\nwrote through it, leaving\n %s",
+				each.contentType, each.input, describeAuthData(&before), describeAuthData(&held))
+		}
+	}
+	if accepted != 0 {
+		t.Errorf("%d of the inputs this sweep built decoded rather than being refused, so the property was never stated over them",
+			accepted)
+	}
+	if refused == 0 {
+		t.Fatal("no input was refused, so this observed nothing")
+	}
+	t.Logf("%d refused decodes over %d prior receiver contents left the receiver exactly as they found it",
+		refused, len(priors))
+}
+
+// TestAnAuthDataDecodesToTheSameValueWhateverItsReceiverHeld is not a round trip property.
+//
+// The application and proposal arms assign only the signature, so a decoder that wrote through
+// its receiver rather than replacing it leaves the PREVIOUS value's confirmation tag standing
+// under an arm that carries none. The bytes are unaffected -- the stale tag is not written under
+// that arm -- so it round trips, re-encodes byte exact and agrees with every golden here. What
+// it disagrees with is the same bytes decoded into a fresh receiver, which is a proposal's
+// authenticators comparing unequal to themselves depending on where they were decoded, and one
+// of the two carrying a confirmation tag a later confirmation check would happily consume.
+func TestAnAuthDataDecodesToTheSameValueWhateverItsReceiverHeld(t *testing.T) {
+	priors := authDataPriorContents(t)
+	for _, contentType := range contentTypes(t) {
+		encoded := handDerivedAuthDataGolden(contentType)
+		fresh, err := decodeAuthData(encoded, contentType)
+		if err != nil {
+			t.Fatalf("content type %d: decoding into a fresh receiver: %v", contentType, err)
+		}
+		for at, prior := range priors {
+			reused := *prior
+			r := syntax.NewReader(encoded)
+			if err := reused.UnmarshalMLS(r, contentType); err != nil {
+				t.Fatalf("content type %d: decoding into a receiver holding prior %d: %v", contentType, at, err)
+			}
+			if err := r.Done(); err != nil {
+				t.Fatalf("content type %d: prior %d: %v", contentType, at, err)
+			}
+			if !sameAuthData(&reused, fresh) {
+				t.Errorf("content type %d: decoding into a receiver that held\n %s\ngave\n %s\nand the same bytes decoded fresh give\n %s",
+					contentType, describeAuthData(prior), describeAuthData(&reused), describeAuthData(fresh))
+			}
+		}
+	}
+	t.Logf("%d prior receiver contents over %d content types", len(priors), len(contentTypes(t)))
+}
+
+// TestFramedContentAuthDataRefusesATruncatedEncoding runs over every proper prefix of every
+// golden rather than over the boundaries somebody thought of, and the bound is derived from the
+// encoding's own length.
+func TestFramedContentAuthDataRefusesATruncatedEncoding(t *testing.T) {
+	cuts := 0
+	for _, contentType := range contentTypes(t) {
+		golden := handDerivedAuthDataGolden(contentType)
+		for cut := 0; cut < len(golden); cut += 1 {
+			if _, err := decodeAuthData(golden[:cut], contentType); err == nil {
+				t.Errorf("content type %d: %d of %d octets decoded rather than being refused",
+					contentType, cut, len(golden))
+				continue
+			}
+			cuts += 1
+		}
+	}
+	if cuts == 0 {
+		t.Fatal("no truncation was built, so this observed nothing")
+	}
+	t.Logf("%d truncations refused", cuts)
+}
+
+// TestFramedContentAuthDataRefusesTrailingBytes is the full consumption half, stated through
+// r.Done() because this codec is handed the caller's Reader rather than reached through
+// syntax.Unmarshal.
+//
+// It has teeth of its own here rather than being a copy of Sender's. This structure has no
+// discriminant, so a tolerated tail is not merely a second encoding of one object: it is
+// exactly how a commit's confirmation tag gets read as somebody else's trailing garbage.
+func TestFramedContentAuthDataRefusesTrailingBytes(t *testing.T) {
+	stated := 0
+	for _, contentType := range contentTypes(t) {
+		golden := handDerivedAuthDataGolden(contentType)
+		for _, tail := range [][]byte{{0x00}, {0xff}, {0x00, 0x00}, repeatByte(0x5a, 17)} {
+			longer := joinBytes(golden, tail)
+			if _, err := decodeAuthData(longer, contentType); !errors.Is(err, syntax.ErrTrailingBytes) {
+				t.Errorf("content type %d with %d trailing octets (%x): err = %v, want syntax.ErrTrailingBytes",
+					contentType, len(tail), longer, err)
+				continue
+			}
+			stated += 1
+		}
+	}
+	if stated == 0 {
+		t.Fatal("no tailed encoding was refused, so this observed nothing")
+	}
+	t.Logf("%d tailed encodings refused over %d content types", stated, len(contentTypes(t)))
+}
+
+// TestEverySingleOctetCorruptionOfAnAuthDataIsRefusedOrReEncodesToItself is the other half of
+// the length sweep: every input one octet away from a golden, at every position, over every
+// value that octet could hold.
+//
+// The property is the one Gate 4 states over the whole codec table: an accepted input has
+// exactly one encoding. Anything else is a second encoding of one object, and MLS signs over
+// serialized forms -- so two byte strings this package accepts as the same value are a
+// signature that covers one of them and a peer that acted on the other.
+func TestEverySingleOctetCorruptionOfAnAuthDataIsRefusedOrReEncodesToItself(t *testing.T) {
+	refused, accepted := 0, 0
+	for _, contentType := range contentTypes(t) {
+		golden := handDerivedAuthDataGolden(contentType)
+		for at := 0; at < len(golden); at += 1 {
+			for value := 0; value <= 0xff; value += 1 {
+				if byte(value) == golden[at] {
+					continue
+				}
+				corrupted := bytes.Clone(golden)
+				corrupted[at] = byte(value)
+				decoded, err := decodeAuthData(corrupted, contentType)
+				if err != nil {
+					refused += 1
+					continue
+				}
+				accepted += 1
+				reencoded, err := encodeAuthData(decoded, contentType)
+				if err != nil {
+					t.Fatalf("content type %d: %x was accepted and then would not re-encode: %v",
+						contentType, corrupted, err)
+				}
+				if !bytes.Equal(reencoded, corrupted) {
+					t.Fatalf("content type %d: %x was accepted as\n %s\nand re-encodes to %x, so this codec holds two encodings of one value",
+						contentType, corrupted, describeAuthData(decoded), reencoded)
+				}
+			}
+		}
+	}
+	if refused == 0 || accepted == 0 {
+		t.Fatalf("the sweep refused %d and accepted %d single octet corruptions; both halves must be exercised or it states only one of them",
+			refused, accepted)
+	}
+	t.Logf("%d single octet corruptions refused, %d accepted and byte exact on re-encode", refused, accepted)
+}
+
+// TestFramedContentAuthDataIsDeliberatelyNotASyntaxCodec is registry section 7.2's shape, held
+// at run time beside the compile time pins framing.go carries.
+//
+// The registry refuses this type a discriminant field, which is what makes syntax.Codec
+// unreachable for it: both methods need the content type, and Codec's do not take one. A later
+// task that "tidied" the two argument methods into Codec's shape would have to store the content
+// type somewhere, and that copy would then be what decided which arm was read -- the failure the
+// parameter exists to prevent. That change stops compiling in framing.go; this is what states
+// why, where a reader will find it.
+func TestFramedContentAuthDataIsDeliberatelyNotASyntaxCodec(t *testing.T) {
+	codec := reflect.TypeOf((*syntax.Codec)(nil)).Elem()
+	if reflect.TypeOf((*FramedContentAuthData)(nil)).Implements(codec) {
+		t.Error("*FramedContentAuthData satisfies syntax.Codec, so it has one argument MarshalMLS/UnmarshalMLS methods and is carrying a content type of its own somewhere")
+	}
+	// the control: the sibling codec of this file does satisfy it, so a false above cannot be
+	// an interface this test failed to look up.
+	if !reflect.TypeOf((*Sender)(nil)).Implements(codec) {
+		t.Fatal("*Sender does not satisfy syntax.Codec, so the assertion above is reading the wrong interface")
+	}
+}

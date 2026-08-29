@@ -26,6 +26,7 @@
 package mls
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -146,3 +147,137 @@ func (self *Sender) UnmarshalMLS(r *syntax.Reader) error {
 }
 
 var _ syntax.Codec = (*Sender)(nil)
+
+// ---------------------------------------------------------------------------
+// FramedContentAuthData
+// ---------------------------------------------------------------------------
+
+// errMissingConfirmationTag is ValSem009 in the validation plan's catalogue, and that plan owns
+// the single declaration site for ErrMissingConfirmationTag. Neither that name nor ValSem
+// itself has landed in this package yet, so the refusal is carried by this unexported value
+// until they do.
+//
+// The shape is extension.go's errMissingRequiredCapability and psk.go's three ValSem401 to
+// ValSem403 stand ins, for the reason those files give. An exported ErrMissingConfirmationTag
+// declared here would be a second public declaration site for a name the validation plan also
+// declares, the two would not be the same value, and a caller matching one would silently stop
+// matching the other; a name that cannot be reached from outside this package cannot be
+// depended on from outside it either, so the swap costs nobody else anything, and every
+// consumer of this refusal until then is inside package mls.
+//
+// The swap is mechanical and it is not left to anybody's memory:
+// TestNoValidationOwnedNameHasLandedBesideItsStandIn derives the owed pair from this package's
+// own declarations and fails on the commit that lands the real name. When it does, each return
+// below becomes ValSem(ValSem009, ErrMissingConfirmationTag) -- the code CodeOf reads, with the
+// sentinel still reachable through (*ValidationError).Unwrap.
+var errMissingConfirmationTag = errors.New("mls: commit carries no confirmation tag")
+
+// FramedContentAuthData is the pair of authenticators over a FramedContent: the signature every
+// content type carries, and the confirmation tag only a commit does.
+//
+// The content type is a PARAMETER of both codec methods rather than a field of this struct, and
+// that is why this type is deliberately NOT a syntax.Codec and carries no var _ assertion.
+// RFC 9420 section 6 writes FramedContentAuthData as a select() on the ENCLOSING
+// FramedContent's content_type, so it carries no discriminant of its own on the wire. A copy
+// stored here would be a second statement of one fact, the two could disagree, and the copy
+// rather than the message would be what decided which arm was read -- which is a receiver
+// verifying a confirmation tag the sender never sent, or skipping one it did.
+//
+// It is also why the validation plan's requested HasConfirmationTag field is refused: tag
+// presence is DERIVED from the content type, not carried beside it. Its requested MembershipTag
+// field is refused on the neighbouring ground, that the membership tag lives on PublicMessage
+// where RFC 9420 puts it. Registry section 7.2 fixes exactly the two signatures below.
+type FramedContentAuthData struct {
+	Signature       []byte
+	ConfirmationTag []byte
+}
+
+// MarshalMLS writes the signature, and then the confirmation tag when the content type is
+// commit and only then.
+//
+// Every refusal happens before a single octet is written, which is Sender.MarshalMLS's
+// discipline and is load bearing for the same reason. This method is handed the CALLER's
+// Writer -- there is no syntax.Marshal here, because that entry point takes a one argument
+// Marshaler and this codec needs the content type -- so a refusal that had already written the
+// signature would leave a caller that ignored the return value holding a shorter encoding with
+// no sticky error on the Writer to say so. A FramedContentAuthData is the tail of every
+// structure that carries it, so "shorter" means precisely "the confirmation tag is gone".
+//
+// A commit with no confirmation tag is refused rather than written short for the same reason
+// the arm check on FramedContent is a refusal: the tag is what binds a commit to the epoch it
+// creates, and a commit that encoded without one would be a message every peer rejects at
+// ValSem009 having verified its signature first.
+func (self *FramedContentAuthData) MarshalMLS(w *syntax.Writer, contentType ContentType) error {
+	switch contentType {
+	case ContentTypeApplication, ContentTypeProposal:
+		w.WriteOpaque(self.Signature)
+		return nil
+	case ContentTypeCommit:
+		if len(self.ConfirmationTag) == 0 {
+			return errMissingConfirmationTag
+		}
+		w.WriteOpaque(self.Signature)
+		w.WriteOpaque(self.ConfirmationTag)
+		return nil
+	}
+	return fmt.Errorf("%w: %d", ErrUnknownContentType, contentType)
+}
+
+// UnmarshalMLS reads the arm the content type selects and only then writes the receiver.
+//
+// The staging is Sender's and Credential's and LeafNode's, and it has one extra edge here. The
+// commit arm reads two fields, so a decoder that assigned as it read would leave a caller's
+// value holding the signature out of a message this package REFUSED -- one whose confirmation
+// tag was truncated or empty -- beside a confirmation tag from whatever the value held before.
+// Nothing in the returned error says so, and the pair is a signature and a tag that were never
+// carried together by anything.
+//
+// The content type is checked before any octet is consumed, so an unregistered one does not
+// half consume the caller's Reader on its way to being refused.
+//
+// This codec cannot tell a commit's bytes from a proposal's on its own and does not try: under
+// application and proposal it reads the signature and stops, which leaves a commit's tag
+// unconsumed rather than silently swallowing it, and the enclosing decode refuses that tail at
+// r.Done(). Guessing here is the failure this shape exists to prevent -- a receiver that read a
+// commit's confirmation tag off a proposal's bytes would succeed by accident and authenticate
+// the wrong structure.
+func (self *FramedContentAuthData) UnmarshalMLS(r *syntax.Reader, contentType ContentType) error {
+	switch contentType {
+	case ContentTypeApplication, ContentTypeProposal:
+		signature, err := r.ReadOpaque()
+		if err != nil {
+			return err
+		}
+		*self = FramedContentAuthData{Signature: signature}
+		return nil
+	case ContentTypeCommit:
+		signature, err := r.ReadOpaque()
+		if err != nil {
+			return err
+		}
+		confirmationTag, err := r.ReadOpaque()
+		if err != nil {
+			return err
+		}
+		// an empty tag is wire legal and is the encoding of "no tag". accepting it would put a
+		// commit past the presence check with nothing for MacVerify to compare, so the two
+		// halves of this codec agree about it: what the encoder refuses to write, the decoder
+		// refuses to read.
+		if len(confirmationTag) == 0 {
+			return errMissingConfirmationTag
+		}
+		*self = FramedContentAuthData{Signature: signature, ConfirmationTag: confirmationTag}
+		return nil
+	}
+	return fmt.Errorf("%w: %d", ErrUnknownContentType, contentType)
+}
+
+// The two signatures registry section 7.2 fixes, as a compile time statement rather than a
+// sentence. syntax.Codec cannot express either of them -- both take the content type -- so the
+// var _ syntax.Codec line every other codec in this file carries is absent here on purpose, and
+// these two are what stands in its place: a later task that "fixes" this type by storing a
+// content type field and narrowing the methods to one argument stops COMPILING here.
+var (
+	_ func(*FramedContentAuthData, *syntax.Writer, ContentType) error = (*FramedContentAuthData).MarshalMLS
+	_ func(*FramedContentAuthData, *syntax.Reader, ContentType) error = (*FramedContentAuthData).UnmarshalMLS
+)
