@@ -759,6 +759,21 @@ func TestCreateUpdatePathSecretsInstallsAChainThatVerifies(t *testing.T) {
 // TestCreateUpdatePathSecretsGivesTheLeafAnIndependentKey is the plan's second: the leaf key is
 // rotated, it is NOT derivable from path_secret[0], and the private state the call answers is
 // consistent with the tree it left behind.
+//
+// Its name promises more than its body observes, and the two halves it does NOT observe are
+// named here rather than left for the next reader to discover the way this one was. "Independent"
+// has two more meanings past "not derived from path_secret[0]", and a constant satisfies both of
+// the assertions below: a leaf key pair seeded from thirty two zero octets is not the old key and
+// is not DeriveNodeKeyPair(path_secret[0]), so it passes here while being the same leaf private
+// key in every group in the world. And the private key this checks is only checked for being
+// non-empty, so a state whose EncryptionPriv came from a second, independent key pair -- one that
+// cannot open anything sealed to the leaf key the tree publishes -- passes too. Both were applied
+// and the whole package stayed green.
+//
+// TestCreateUpdatePathSecretsDrawsEveryOctetStringItPublishesFromFreshEntropy holds the first and
+// TestThePrivateStateOpensEverythingSealedToTheKeysThisCommitInstalls holds the second. What is
+// left here is worth keeping: the rotation and the one derivation the RFC forbids are the two
+// things a reader looks for under this name, and they are stated where they are easiest to read.
 func TestCreateUpdatePathSecretsGivesTheLeafAnIndependentKey(t *testing.T) {
 	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
