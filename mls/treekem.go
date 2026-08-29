@@ -132,12 +132,23 @@ func (self *TreeKEMPrivate) Clone() *TreeKEMPrivate {
 // leaf key pair is NOT a rung of the ladder (see the file header), so there is no path secret it
 // could be derived from, and a body that fell through to the map for it would answer "not
 // available" for the one key every member always has.
+//
+// Both arms answer FRESH storage, and the own-leaf arm is the one that has to be made to. The
+// derived arm hands back what DeriveKeyPair just produced and shares nothing by construction;
+// the own-leaf arm is reading a field, and returning it directly hands the caller the state's
+// live leaf key. That makes one function answer two different ownership contracts, which is a
+// caller that cannot have a policy: this package ships zeroizeSecret for exactly this material
+// and task 22 is the consumer, so "erase the private key when the decrypt is done" -- the right
+// thing to do with every OTHER answer this function gives -- would erase the member's own leaf
+// key and leave it unable to decrypt anything again, with every rung still deriving and nothing
+// to point at. NewTreeKEMPrivate and Clone both copy this same array for the mirror of this
+// reason; the exit door owes the entry doors their contract.
 func (self *TreeKEMPrivate) NodePrivateKey(crypto CryptoProvider, x NodeIndex) (HpkePrivateKey, bool, error) {
 	if crypto == nil {
 		return nil, false, ErrNilCryptoProvider
 	}
 	if x == self.LeafIndex.NodeIndex() {
-		return self.EncryptionPriv, true, nil
+		return cloneBytes(self.EncryptionPriv), true, nil
 	}
 	secret, ok := self.PathSecrets[x]
 	if !ok {
@@ -161,9 +172,17 @@ func (self *TreeKEMPrivate) NodePrivateKey(crypto CryptoProvider, x NodeIndex) (
 //
 // The comparison is crypto/subtle.ConstantTimeCompare and not bytes.Equal. What is compared here
 // is public -- both halves are encryption keys the tree publishes -- so nothing leaks either
-// way, and the reason is the class rather than this line: this package's derived comparator
-// gates read every comparison in the source, and a variable time comparator written here is one
-// edit away from being pointed at a secret.
+// way, and the reason is the class rather than this line: a variable time comparator written
+// here is one edit away from being pointed at a secret.
+//
+// Two gates read this line, and which ones is written down because the sentence that used to
+// stand here claimed a coverage nothing provided -- this function was under no comparator gate
+// at all, and bytes.Equal here left the whole tree green.
+// TestNothingThisPackageShipsComparesDataOutsideConstantTime bans the derived comparator class
+// in every function of every production file, which is the half that reads EVERY call site;
+// TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime is the narrower half that also
+// bans the shape naming no comparator at all, string(a) == string(b), and this function is in
+// its class because it holds a key of its own and answers over a tree.
 //
 // It deliberately does NOT re-derive the leaf public key from EncryptionPriv. The CryptoProvider
 // surface has no private-to-public operation, and the leaf key pair is checked where both halves

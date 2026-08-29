@@ -1701,6 +1701,57 @@ func keyShapedTypesOf(files []parsedSource) map[string]bool {
 	return found
 }
 
+// keyHoldingTypesOf is every struct these files declare that carries a key of its OWN: a field
+// whose type is one of the key shaped types above, or a pointer, slice, array or map spelled
+// over one.
+//
+// This is the clause that was missing. The class below used to require a key PARAMETER, which
+// is how a tree is asked about a key it was handed and is not how the private half of the tree
+// compares one: TreeKEMPrivate.Consistent takes a provider and a tree, holds the keys it
+// compares in its own fields, and sat outside a gate whose own comment said it was inside one.
+// A predicate fitted to the two functions it was written for reads the third as clean.
+//
+// Directly declared and not transitively. A type holding a container that holds a key is not a
+// key holder here, and *RatchetTree is exactly that -- its one field is a slice of nodes and the
+// keys are two declarations further down. A transitive rule would put every bool or error
+// answering method of the tree under the guardrail, most of them deciding an index, a width or a
+// blank, and a gate carrying that many exemptions is a gate the next contributor deletes. It
+// costs nothing here: the tree's own key comparisons are asked ABOUT a key and enter through the
+// parameter clause, which is the clause that was already there.
+func keyHoldingTypesOf(files []parsedSource, keyTypes map[string]bool) map[string]bool {
+	found := map[string]bool{}
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			spec, isType := node.(*ast.TypeSpec)
+			if !isType {
+				return true
+			}
+			structure, isStruct := spec.Type.(*ast.StructType)
+			if !isStruct || structure.Fields == nil {
+				return true
+			}
+			for _, field := range structure.Fields.List {
+				if keyTypes[elementTypeNameOf(parsed.render(field.Type))] {
+					found[spec.Name.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// elementTypeNameOf is the name a spelled type carries values OF: the type itself, or the element
+// of the pointer, slice, array or map written over it. A key one indirection down is held all the
+// same, and the spelling is where the indirection is.
+func elementTypeNameOf(rendered string) string {
+	name := rendered
+	if at := strings.LastIndex(name, "]"); at >= 0 {
+		name = name[at+1:]
+	}
+	return strings.TrimPrefix(name, "*")
+}
+
 // keyQuestion is one member of the class the guardrail runs over, carrying the file it was read
 // out of because every rule renders nodes back to source and a node rendered against the wrong
 // file set reports the wrong text.
@@ -1734,23 +1785,32 @@ func parameterTypesOf(parsed parsedSource, function *ast.FuncDecl) []string {
 	return found
 }
 
-// keyQuestionsIn is every declaration in these files that answers a question about a key it was
-// handed, over a ratchet tree.
+// keyQuestionsIn is every declaration in these files that has a key, answers rather than computes,
+// and does it over a ratchet tree.
 //
-// Three conditions and each of them a shape rather than a name: a parameter whose type is one of
-// the key types derived above; a bool somewhere in the results, which is what makes the answer a
-// yes or no an attacker can probe for rather than a value it computes; and a ratchet tree in the
-// receiver or the parameters, which is the scope.
+// Three conditions and each of them a shape rather than a name:
+//
+//   - a key of its own. A parameter whose type is one of the key types derived above, a receiver
+//     that IS one, or a receiver whose struct declares a field of one. Three spellings of one
+//     thing, and the third is the one this class was missing: a function does not have to be
+//     HANDED a key to compare one, and the private half of the tree holds the keys it compares.
+//   - a bool or an error somewhere in the results, which is what makes the answer a yes or no an
+//     attacker can probe for rather than a value it computes. An error is the same answer spelled
+//     as a refusal -- Consistent returns ErrPathSecretMismatch where FindLeafBySignatureKey
+//     returns false -- and a class reading only bool judges whichever of the two happened to be
+//     written first.
+//   - a ratchet tree in the receiver or the parameters, which is the scope.
 //
 // The scope is where it is deliberately. The crypto provider answers questions about keys too and
 // is guardrail 8's own subject next door, held by TestMacVerifyComparesInConstantTime and by
 // TestEveryTagVerifierComparesThroughMacVerifyAndNothingElse; those verifiers reach ed25519.Verify
 // and the HPKE primitives, which is what their gates sanction and what the rule below forbids.
-// What had no gate at all was the container. Its two comparisons are over PUBLIC keys, so nothing
-// aimed at secrets reaches them, and both survived being rewritten as ordinary go equality with
-// the whole package green.
+// What had no gate at all was the container. Its comparisons are over PUBLIC keys, so nothing
+// aimed at secrets reaches them, and all three survived being rewritten as ordinary go equality
+// with the whole package green.
 func keyQuestionsIn(files []parsedSource) []keyQuestion {
 	keyTypes := keyShapedTypesOf(files)
+	holders := keyHoldingTypesOf(files, keyTypes)
 	found := []keyQuestion{}
 	for _, parsed := range files {
 		for _, declaration := range parsed.file.Decls {
@@ -1758,21 +1818,23 @@ func keyQuestionsIn(files []parsedSource) []keyQuestion {
 			if !isFunction || function.Body == nil {
 				continue
 			}
-			takesAKey, mentionsTheTree := false, strings.Contains(parsed.receiverOf(function), ratchetTreeTypeName)
+			receiver := elementTypeNameOf(parsed.receiverOf(function))
+			hasAKey := keyTypes[receiver] || holders[receiver]
+			mentionsTheTree := strings.Contains(receiver, ratchetTreeTypeName)
 			for _, one := range parameterTypesOf(parsed, function) {
 				if keyTypes[strings.TrimPrefix(one, "*")] {
-					takesAKey = true
+					hasAKey = true
 				}
 				if strings.Contains(one, ratchetTreeTypeName) {
 					mentionsTheTree = true
 				}
 			}
-			if !takesAKey || !mentionsTheTree {
+			if !hasAKey || !mentionsTheTree {
 				continue
 			}
 			answers := false
 			for _, field := range fieldsOf(function.Type.Results) {
-				if parsed.render(field.Type) == "bool" {
+				if rendered := parsed.render(field.Type); rendered == "bool" || rendered == "error" {
 					answers = true
 				}
 			}
@@ -2014,20 +2076,39 @@ func parsedProductionSourcesOfThisPackage(t *testing.T) []parsedSource {
 //   - FindsInConstantTime, FindsThroughAHelperOfItsOwn and holds are the clean half: one
 //     comparing directly and one through a helper, which is what makes the reachability
 //     requirement really transitive.
-//   - TakesAKeyAndAnswersNoQuestion, AnswersAQuestionAboutNoKey and ComparesKeysWithNoTreeInSight
-//     are outside the class on one condition each, and every one of them would be reported if it
-//     were inside, so a class that widened fails as loudly as one that narrowed.
+//   - the three AgreesWithTheTree methods are the HOLDER route, which is TreeKEMPrivate.Consistent
+//     in the real source and which no version of this fixture had: PrivateHalf is handed no key
+//     and answers no bool, it holds a key in a field and refuses with an error, and each of the
+//     three commits one of the three shapes -- the sanctioned comparison, a named comparator, and
+//     the conversion to string that names none. RatchetTree's own field is [][]byte and not a key
+//     type on purpose, so the tree stays outside the holder clause exactly as the real one is and
+//     its members go on entering through the parameter clause.
+//   - TakesAKeyAndAnswersNoQuestion, AnswersAQuestionAboutNoKey, RewritesAgainstTheTree,
+//     AgreesWithNoTreeAtAll and ComparesKeysWithNoTreeInSight are outside the class on one
+//     condition each -- no question, no key, no question, no tree, no tree -- and every one of
+//     them would be reported if it were inside, so a class that widened fails as loudly as one
+//     that narrowed.
 const ratchetTreeKeyComparisonControl = `package control
 
 import (
 	"bytes"
 	"crypto/subtle"
+	"errors"
 )
+
+var errControlMismatch = errors.New("control: mismatch")
 
 type SignaturePublicKey []byte
 
+type SignaturePrivateKey []byte
+
 type RatchetTree struct {
-	keys []SignaturePublicKey
+	keys [][]byte
+}
+
+type PrivateHalf struct {
+	leafKey SignaturePrivateKey
+	rungs   map[int][]byte
 }
 
 func (self *RatchetTree) FindsInConstantTime(key SignaturePublicKey) (int, bool) {
@@ -2089,6 +2170,38 @@ func FindsInATreeItWasHanded(tree *RatchetTree, key SignaturePublicKey) bool {
 	return bytes.Equal(tree.keys[0], key)
 }
 
+func (self *PrivateHalf) AgreesWithTheTreeInConstantTime(tree *RatchetTree) error {
+	if subtle.ConstantTimeCompare(self.leafKey, tree.keys[0]) != 1 {
+		return errControlMismatch
+	}
+	return nil
+}
+
+func (self *PrivateHalf) AgreesWithTheTreeWithBytesEqual(tree *RatchetTree) error {
+	if !bytes.Equal(self.leafKey, tree.keys[0]) {
+		return errControlMismatch
+	}
+	return nil
+}
+
+func (self *PrivateHalf) AgreesWithTheTreeByConvertingToString(tree *RatchetTree) error {
+	if string(self.leafKey) != string(tree.keys[0]) {
+		return errControlMismatch
+	}
+	return nil
+}
+
+func (self *PrivateHalf) RewritesAgainstTheTree(tree *RatchetTree) []byte {
+	return bytes.Clone(tree.keys[0])
+}
+
+func (self *PrivateHalf) AgreesWithNoTreeAtAll() error {
+	if !bytes.Equal(self.leafKey, self.rungs[0]) {
+		return errControlMismatch
+	}
+	return nil
+}
+
 func (self *RatchetTree) TakesAKeyAndAnswersNoQuestion(key SignaturePublicKey) []byte {
 	return bytes.Clone(key)
 }
@@ -2106,6 +2219,9 @@ func ComparesKeysWithNoTreeInSight(a SignaturePublicKey, b SignaturePublicKey) b
 // widened to take in the three members outside it, or narrowed to drop one of the bad shapes,
 // would go on to read the real source the same wrong way and report the same clean bill.
 var ratchetTreeKeyComparisonControlClass = []string{
+	"*PrivateHalf.AgreesWithTheTreeByConvertingToString",
+	"*PrivateHalf.AgreesWithTheTreeInConstantTime",
+	"*PrivateHalf.AgreesWithTheTreeWithBytesEqual",
 	"*RatchetTree.ComparesAfterALengthFastPath",
 	"*RatchetTree.ComparesByConvertingToString",
 	"*RatchetTree.ComparesNothingAtAll",
@@ -2119,10 +2235,14 @@ var ratchetTreeKeyComparisonControlClass = []string{
 	"FindsInATreeItWasHanded",
 }
 
-// The two the class must be seen to LEAVE OUT, named so a reader can tell a deliberate boundary
-// from an oversight. ComparesKeysWithNoTreeInSight is the third and is left out by the scope
-// rather than by the shape: it compares keys in variable time and is somebody else's guardrail.
+// The five the class must be seen to LEAVE OUT, named so a reader can tell a deliberate boundary
+// from an oversight. ComparesKeysWithNoTreeInSight and AgreesWithNoTreeAtAll are left out by the
+// scope rather than by the shape: both compare keys in variable time and both are somebody else's
+// guardrail -- the package wide ban in constant_time_test.go reports them, which is the gate that
+// has no scope at all.
 var ratchetTreeKeyComparisonControlOutsideTheClass = []string{
+	"*PrivateHalf.AgreesWithNoTreeAtAll",
+	"*PrivateHalf.RewritesAgainstTheTree",
 	"*RatchetTree.AnswersAQuestionAboutNoKey",
 	"*RatchetTree.TakesAKeyAndAnswersNoQuestion",
 	"ComparesKeysWithNoTreeInSight",
@@ -2131,18 +2251,22 @@ var ratchetTreeKeyComparisonControlOutsideTheClass = []string{
 var (
 	// the equality rule: a value on both sides of an == or a !=
 	ratchetTreeControlVariableTimeEqualities = []string{
+		"*PrivateHalf.AgreesWithTheTreeByConvertingToString",
 		"*RatchetTree.ComparesAfterALengthFastPath",
 		"*RatchetTree.ComparesByConvertingToString",
 		"*RatchetTree.loops",
 	}
 	// the foreign call rule: anything outside the package that is not the sanctioned comparison
 	ratchetTreeControlForeignCalls = []string{
+		"*PrivateHalf.AgreesWithTheTreeWithBytesEqual",
 		"*RatchetTree.ComparesWithAPrefix",
 		"*RatchetTree.ComparesWithBytesEqual",
 		"FindsInATreeItWasHanded",
 	}
 	// the reachability rule: the sanctioned comparison is nowhere in the call graph
 	ratchetTreeControlUnreached = []string{
+		"*PrivateHalf.AgreesWithTheTreeByConvertingToString",
+		"*PrivateHalf.AgreesWithTheTreeWithBytesEqual",
 		"*RatchetTree.ComparesByConvertingToString",
 		"*RatchetTree.ComparesNothingAtAll",
 		"*RatchetTree.ComparesThroughAHelperThatLoops",
@@ -2195,10 +2319,10 @@ func TestTheKeyComparisonGateFlagsItsControlFixture(t *testing.T) {
 	}
 }
 
-// TestEveryKeyQuestionTheRatchetTreeAnswersComparesInConstantTime is guardrail 8 over the two
-// comparisons this file makes, which no gate in this package reached.
+// TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime is guardrail 8 over the key
+// comparisons made against the ratchet tree, which no gate in this package reached.
 //
-// Both of them were rewritten as ordinary go equality -- string(leaf.SignatureKey) == string(key)
+// The tree's two were rewritten as ordinary go equality -- string(leaf.SignatureKey) == string(key)
 // at one and both comparisons at the other -- and the whole package stayed green. The comparison
 // is constant time for the reason FindLeafBySignatureKey's own comment gives, and what says so
 // today is that comment; no behavioural test in go can see the difference, and a timing
@@ -2206,11 +2330,18 @@ func TestTheKeyComparisonGateFlagsItsControlFixture(t *testing.T) {
 // was actually verified: mechanically, over the source, so it survives an edit nobody reruns this
 // for.
 //
+// The name says OVER the tree rather than what the tree answers, because the class is no longer
+// the tree's own methods. TreeKEMPrivate.Consistent compares a derived public key against the one
+// the tree carries and is not a method of the tree at all; the predicate that missed it required
+// a key parameter and a bool, and it missed it while treekem.go's own comment said this gate held
+// it. Measured: subtle.ConstantTimeCompare there rewritten as bytes.Equal left every one of this
+// package's tests passing.
+//
 // The blind spot is worth naming, because it is the same one the tag verifier gate next door
 // documents: the equality rule reads each member's own body, so a byte loop written inside a
 // helper is caught by the reachability rule -- the helper is not the sanctioned comparison -- and
 // not by the equality rule, unless the helper is itself a member of the class.
-func TestEveryKeyQuestionTheRatchetTreeAnswersComparesInConstantTime(t *testing.T) {
+func TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime(t *testing.T) {
 	files := parsedProductionSourcesOfThisPackage(t)
 	class := keyQuestionsIn(files)
 	names := namesOfKeyQuestions(class)
@@ -2218,9 +2349,11 @@ func TestEveryKeyQuestionTheRatchetTreeAnswersComparesInConstantTime(t *testing.
 	if len(class) == 0 {
 		t.Fatal("the gate found no key question at all, so it is reporting clean having read nothing")
 	}
-	// the coverage claim, checked rather than assumed: the two this file is about have to be
-	// among the ones being judged
-	for _, want := range []string{"*RatchetTree.FindLeafBySignatureKey", "*RatchetTree.EncryptionKeyInUse"} {
+	// the coverage claim, checked rather than assumed: the three comparisons this gate is about
+	// have to be among the ones being judged. A derived class can go quiet, and a quiet class
+	// reports the clean bill a working one reports -- which is exactly what happened to
+	// Consistent, so it is named here beside the two that were.
+	for _, want := range []string{"*RatchetTree.FindLeafBySignatureKey", "*RatchetTree.EncryptionKeyInUse", "*TreeKEMPrivate.Consistent"} {
 		if !slices.Contains(names, want) {
 			t.Fatalf("the gate is judging %v, which does not include %s", names, want)
 		}

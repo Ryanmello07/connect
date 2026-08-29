@@ -431,13 +431,27 @@ func TestTreeKEMPrivateNodePrivateKeyAndConsistency(t *testing.T) {
 }
 
 // TestTheStateSharesNoStorageWithItsCallerOrItsClone is the aliasing half, over every door into
-// the state rather than the one the plan's golden happens to open.
+// and OUT OF the state rather than the one the plan's golden happens to open.
 //
-// A rejected commit is the case. The caller works on a clone, the commit loses a race and is
-// dropped, and a clone that shared one array with its parent has already written through to the
-// state the group is still running on -- with every key still deriving and nothing to point at.
-// The plan's golden holds the path secret map; the leaf key and the map's own membership are the
-// other two, and neither is visible from it.
+// A rejected commit is the case for the entry doors. The caller works on a clone, the commit
+// loses a race and is dropped, and a clone that shared one array with its parent has already
+// written through to the state the group is still running on -- with every key still deriving and
+// nothing to point at. The plan's golden holds the path secret map; the leaf key and the map's
+// own membership are the other two, and neither is visible from it.
+//
+// The EXIT door is the last section and it was the door this test's name promised and did not
+// cover. NodePrivateKey has two arms: the derived arm hands back what DeriveKeyPair just made
+// and shares nothing, and the own-leaf arm used to hand back the state's live field. One
+// function answering two ownership contracts is a caller that cannot have a policy, and the
+// policy this package ships for this material is zeroizeSecret -- so "erase the private key when
+// the decrypt is done", which is right for every other answer the function gives, erased the
+// member's own leaf key and left it unable to decrypt again. Measured, before the fix: zeroizing
+// the own-leaf answer wiped TreeKEMPrivate.EncryptionPriv, 0x11 x32 to zeros, and no test saw it.
+//
+// The exit door is swept rather than sampled. The doors are derived from the tree -- the member's
+// own leaf node plus every node it holds a rung for -- so an arm added later is swept the day it
+// is added, and both arms are covered by the same assertion rather than by one that happens to
+// open the right one.
 func TestTheStateSharesNoStorageWithItsCallerOrItsClone(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	callersLeafKey := bytes.Repeat([]byte{0x11}, 32)
@@ -472,6 +486,47 @@ func TestTheStateSharesNoStorageWithItsCallerOrItsClone(t *testing.T) {
 	if state.LeafIndex != clone.LeafIndex {
 		t.Fatalf("Clone answered leaf %d for a state at leaf %d", clone.LeafIndex, state.LeafIndex)
 	}
+
+	// and the exit door, over every node this member can answer for.
+	tree, members := newTestTree(t, crypto, 8)
+	path, secrets := installPathSecrets(t, crypto, tree, members[0].LeafIndex,
+		crypto.Random(crypto.HashSize()))
+	holder := NewTreeKEMPrivate(members[5].LeafIndex, members[5].EncryptionPriv)
+	for at, node := range path {
+		holder.PathSecrets[node] = secrets[at]
+	}
+	ownLeafKey := bytes.Clone(holder.EncryptionPriv)
+	doors := append([]NodeIndex{holder.LeafIndex.NodeIndex()}, path...)
+	for _, x := range doors {
+		answer, held, err := holder.NodePrivateKey(crypto, x)
+		if err != nil || !held {
+			t.Fatalf("NodePrivateKey(%d) = (_, %v, %v), and every door in this sweep is one the member holds", x, held, err)
+		}
+		kept := bytes.Clone(answer)
+		if len(kept) == 0 {
+			t.Fatalf("NodePrivateKey(%d) answered an empty key, so erasing it observes nothing", x)
+		}
+		// the policy task 22 is entitled to have: erase the private key once it is spent.
+		zeroizeSecret(answer)
+		again, held, err := holder.NodePrivateKey(crypto, x)
+		if err != nil || !held {
+			t.Fatalf("NodePrivateKey(%d) after erasing its own previous answer = (_, %v, %v)", x, held, err)
+		}
+		if !bytes.Equal(again, kept) {
+			t.Fatalf("erasing the key NodePrivateKey answered for node %d changed what it answers next time, %x then %x: the answer aliases the state",
+				x, kept, again)
+		}
+	}
+	// the same statement made against the field directly, because the leaf key is the one the
+	// re-ask above would also have been able to answer from a wiped array.
+	if !bytes.Equal(holder.EncryptionPriv, ownLeafKey) {
+		t.Fatalf("the state's own leaf key is %x after the sweep and was %x: an answer this member handed out aliased it",
+			holder.EncryptionPriv, ownLeafKey)
+	}
+	if err := holder.Consistent(crypto, tree); err != nil {
+		t.Fatalf("the state stopped agreeing with its tree after its own answers were erased: %v", err)
+	}
+	t.Logf("%d doors out of the state swept, 1 own leaf and %d derived rungs", len(doors), len(path))
 }
 
 // ---------------------------------------------------------------------------
