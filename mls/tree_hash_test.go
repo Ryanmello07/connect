@@ -2252,14 +2252,68 @@ func appendixBCommit(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	}
 }
 
+// appendixBOriginalTreeHash is the osth of appendix B's H(P, ph, osth): RFC 9420 section 7.9's
+// ORIGINAL tree hash of the subtree at sibling, taken with respect to the unmerged leaves of the
+// parent whose hash is being written.
+//
+// Section 7.9's sentence, done to a copy of the tree rather than passed as a parameter, which is
+// what makes this a separate reading from tree_hash.go's. That file computes the original hash
+// by threading an exclude set through the one section 7.8 recursion -- deliberately, so the two
+// hashes cannot encode a node differently -- and a helper that called the same recursion with
+// the same set would be checking that function against itself. Here the leaves are BLANKED and
+// struck out for real and then the ordinary tree hash is taken, so the two agree only if the
+// exclude arm means what the RFC says it means.
+//
+// The striking is over every parent of the tree and not only the ones under the sibling. An
+// unmerged leaf is listed at every non-blank node of its own direct path, so a leaf blanked out
+// of the subtree while still named in some descendant's unmerged_leaves vector is a tree that
+// hashes a member it does not have.
+func appendixBOriginalTreeHash(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	parent *ParentNode, sibling NodeIndex) []byte {
+	t.Helper()
+	without := tree.Clone()
+	excluded := map[LeafIndex]bool{}
+	for _, leaf := range parent.UnmergedLeaves {
+		excluded[leaf] = true
+		if LeafCount(leaf) >= without.LeafWidth() {
+			t.Fatalf("node's unmerged_leaves names leaf %d and the tree has %d leaves", leaf, without.LeafWidth())
+		}
+		if err := without.Blank(leaf.NodeIndex()); err != nil {
+			t.Fatalf("Blank(leaf %d): %v", leaf, err)
+		}
+	}
+	for x := uint32(0); x < without.NodeWidth(); x += 1 {
+		node := without.ParentAt(NodeIndex(x))
+		if node == nil {
+			continue
+		}
+		kept := []LeafIndex{}
+		for _, leaf := range node.UnmergedLeaves {
+			if !excluded[leaf] {
+				kept = append(kept, leaf)
+			}
+		}
+		node.UnmergedLeaves = kept
+	}
+	hash, err := without.NodeTreeHash(crypto, sibling)
+	if err != nil {
+		t.Fatalf("NodeTreeHash(%d) over the tree without the unmerged leaves: %v", sibling, err)
+	}
+	return hash
+}
+
 // appendixBParentHash writes out appendix B's own H(P, ph=..., osth=th(S)) from the RFC's
 // notation rather than from this package's ParentHash, so the two are separate readings.
 //
-// It refuses a parent carrying unmerged leaves, because appendix B's osth is the ORIGINAL
-// sibling tree hash and this helper takes the plain one: over a parent with an empty unmerged
-// list the two are the same bytes, and over any other parent they are not. A helper that
-// silently took the plain hash there would agree with an implementation that had never heard of
-// the blanking.
+// It used to REFUSE a parent carrying unmerged leaves, on the grounds that appendix B's osth is
+// the original sibling tree hash and this helper took the plain one. That was honest about the
+// helper and left the example weaker than it read: the four steps of appendix B never produce a
+// parent with an unmerged leaf -- A adds B before X exists, and B adds C and D while both of
+// their direct paths are blank -- so the refusal never fired and every osth in the worked
+// example was a plain tree hash, which is a value an implementation that had never heard of
+// section 7.9's blanking computes too. The exclusion is written out here now, and
+// TestEveryParentHashOverATreeWithUnmergedLeavesTakesTheOriginalSiblingTreeHash drives this same
+// notation over a tree that has one.
 func appendixBParentHash(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	p NodeIndex, ph []byte, sibling NodeIndex) []byte {
 	t.Helper()
@@ -2267,18 +2321,10 @@ func appendixBParentHash(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	if node == nil {
 		t.Fatalf("node %d is blank, so appendix B's H(P, ...) has no encryption_key to write", p)
 	}
-	if len(node.UnmergedLeaves) != 0 {
-		t.Fatalf("node %d carries %d unmerged leaves, so the tree hash of node %d is not the ORIGINAL sibling tree hash appendix B's osth names",
-			p, len(node.UnmergedLeaves), sibling)
-	}
-	th, err := tree.NodeTreeHash(crypto, sibling)
-	if err != nil {
-		t.Fatalf("NodeTreeHash(%d): %v", sibling, err)
-	}
 	return crypto.Hash(treeHashTestConcat(
 		treeHashTestOpaque(t, node.EncryptionKey),
 		treeHashTestOpaque(t, ph),
-		treeHashTestOpaque(t, th)))
+		treeHashTestOpaque(t, appendixBOriginalTreeHash(t, crypto, tree, node, sibling))))
 }
 
 // TestTheParentHashChainOfRfc9420AppendixBsWorkedExample is the RFC's own worked example, run.
@@ -2468,4 +2514,109 @@ func TestTheParentHashChainOfRfc9420AppendixBsWorkedExample(t *testing.T) {
 	if err := tree.VerifyParentHashes(crypto); err != nil {
 		t.Fatalf("appendix B states this tree is parent-hash valid, and this package refuses it: %v", err)
 	}
+}
+
+// TestEveryParentHashOverATreeWithUnmergedLeavesTakesTheOriginalSiblingTreeHash is the arm
+// appendix B's worked example cannot reach, driven through the same hand written preimage.
+//
+// Appendix B's four steps never leave a parent carrying an unmerged leaf: A adds B while X does
+// not exist yet, and B adds C and D while both of their direct paths are blank, so every osth in
+// that example is a plain tree hash and the example agrees with an implementation that never
+// heard of section 7.9's blanking. That is a property of the example rather than an omission in
+// it, and the way to hold the other arm through the same reading is a tree where a member was
+// ADDED since the last commit -- which is exactly when the two hashes differ, and exactly the
+// state a joiner validates.
+//
+// The fixture makes one: a commit sets a node, and a later Add lands under it and is listed
+// there as unmerged. Then the sweep is over the tree rather than over the node the fixture
+// happens to have produced. Every non-blank parent, with each of its two children as the
+// sibling, is compared against appendixBParentHash -- and the run is required to contain both
+// kinds of case, a parent whose unmerged leaves fall inside the sibling subtree, where the
+// blanking moves the hash, and one where it does not and the two readings must agree. A fixture
+// that stopped producing an unmerged leaf would fail the count rather than quietly going back
+// to hashing only the arm appendix B already covers.
+func TestEveryParentHashOverATreeWithUnmergedLeavesTakesTheOriginalSiblingTreeHash(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, members := newTestTree(t, crypto, 8)
+	// a member leaves, which blanks its own direct path up to the root
+	if err := tree.RemoveLeaf(LeafIndex(4)); err != nil {
+		t.Fatalf("RemoveLeaf(4): %v", err)
+	}
+	// and a commit from the other side of the tree puts the root and the nodes below it back
+	if _, err := tree.CreateUpdatePathSecrets(crypto, members[0].LeafIndex,
+		members[0].SignaturePriv, testGroupId()); err != nil {
+		t.Fatalf("CreateUpdatePathSecrets(leaf 0): %v", err)
+	}
+	// so the next member to join lands under a node that already carries a key, and is listed
+	// there as unmerged: it has not been given that node's secret and is not in its subtree as
+	// far as every hash taken before this Add is concerned
+	joiner, _ := newTestTree(t, crypto, 1)
+	at, err := tree.AddLeaf(joiner.Leaf(LeafIndex(0)).Clone())
+	if err != nil {
+		t.Fatalf("AddLeaf: %v", err)
+	}
+	carriers := 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		if node := tree.ParentAt(NodeIndex(x)); node != nil && len(node.UnmergedLeaves) != 0 {
+			carriers += 1
+		}
+	}
+	if carriers == 0 {
+		t.Fatalf("adding a member at leaf %d left no parent carrying an unmerged leaf, so this test is running over the arm appendix B already covers",
+			at)
+	}
+
+	// the sweep: every non-blank parent, each of its children as the sibling
+	agreed, moved, held := 0, 0, 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		p := NodeIndex(x)
+		node := tree.ParentAt(p)
+		if node == nil {
+			continue
+		}
+		for _, child := range []func(NodeIndex) (NodeIndex, bool){leftOf, rightOf} {
+			sibling, isParent := child(p)
+			if !isParent {
+				t.Fatalf("node %d holds a parent node and tree math says it has no children", p)
+			}
+			want := appendixBParentHash(t, crypto, tree, p, node.ParentHash, sibling)
+			got, err := tree.ParentHash(crypto, p, sibling)
+			if err != nil {
+				t.Fatalf("ParentHash(%d, %d): %v", p, sibling, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("ParentHash(%d, %d) is %x and section 7.9's own notation gives %x",
+					p, sibling, got, want)
+				continue
+			}
+			agreed += 1
+			// which arm this case exercised, decided by the bytes rather than by the shape:
+			// the same preimage with the PLAIN tree hash of the sibling in place of the
+			// original one. Equal means the blanking had nothing to do here; different means
+			// this case is one an implementation that skipped section 7.9's exclusion fails.
+			plain, err := tree.NodeTreeHash(crypto, sibling)
+			if err != nil {
+				t.Fatalf("NodeTreeHash(%d): %v", sibling, err)
+			}
+			naive := crypto.Hash(treeHashTestConcat(
+				treeHashTestOpaque(t, node.EncryptionKey),
+				treeHashTestOpaque(t, node.ParentHash),
+				treeHashTestOpaque(t, plain)))
+			if bytes.Equal(naive, want) {
+				held += 1
+				continue
+			}
+			moved += 1
+			if bytes.Equal(got, naive) {
+				t.Errorf("ParentHash(%d, %d) is the hash taken over the PLAIN tree hash of node %d; section 7.9 takes it over the original tree hash, with the parent's unmerged leaves blanked out",
+					p, sibling, sibling)
+			}
+		}
+	}
+	if agreed == 0 || moved == 0 || held == 0 {
+		t.Fatalf("the sweep agreed on %d parent hashes, %d of them over a sibling subtree the blanking changes and %d over one it does not; a zero in any of the three is an arm this test did not reach",
+			agreed, moved, held)
+	}
+	t.Logf("%d parent hashes agreed with section 7.9's own notation, %d of them over a sibling subtree the unmerged-leaf blanking moves, %d over one it leaves alone",
+		agreed, moved, held)
 }

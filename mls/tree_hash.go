@@ -230,15 +230,19 @@ var errCopathChildIsNotAChildOfTheParent = errors.New(
 // commit -- over a parent with no unmerged leaves the original tree hash and the plain tree
 // hash of the same subtree are the same bytes, so every fixture without an unmerged leaf agrees
 // with an implementation that never heard of the exclusion.
-// What holds the exclusion arm today is the section 7.8 pair beside it --
+// What holds the exclusion arm is the section 7.8 pair beside it --
 // TestTheOriginalTreeHashIsTheTreeHashOfTheTreeWithoutThoseLeaves and
 // TestTheOriginalTreeHashStrikesTheExcludedLeafOutOfUnmergedLeaves -- and, for this
 // function's own bytes, TestVerifyParentHashesAcceptsThePublishedTreeValidationCorpus:
 // the 290 non-blank parents of the working group's own trees chain through this
 // preimage, and several of those parents carry unmerged leaves inside the sibling
-// subtree, so a version that skipped the blanking fails there. A parent hash of this
-// node's own with no such corpus behind it would still be owed the RFC's worked
-// example from appendix B, which this package does not yet hold.
+// subtree, so a version that skipped the blanking fails there. Since task 18 it is also
+// held against the RFC's own notation, spelled out by hand:
+// TestTheParentHashChainOfRfc9420AppendixBsWorkedExample runs appendix B's four steps and
+// TestEveryParentHashOverATreeWithUnmergedLeavesTakesTheOriginalSiblingTreeHash runs the
+// same notation over a tree where a member joined after the last commit, which is the one
+// state appendix B's own example never reaches and the only one where the original hash
+// and the plain one differ.
 func (self *RatchetTree) ParentHash(crypto CryptoProvider,
 	parent, copathChild NodeIndex) ([]byte, error) {
 	// before anything is read off the receiver, for TreeHash's reason: a caller that passed no

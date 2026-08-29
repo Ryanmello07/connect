@@ -2104,6 +2104,7 @@ type SignaturePrivateKey []byte
 
 type RatchetTree struct {
 	keys [][]byte
+	at   int
 }
 
 type PrivateHalf struct {
@@ -2170,6 +2171,22 @@ func FindsInATreeItWasHanded(tree *RatchetTree, key SignaturePublicKey) bool {
 	return bytes.Equal(tree.keys[0], key)
 }
 
+func (self *RatchetTree) BuildsAPathAndComparesNoKey(key SignaturePublicKey) error {
+	_ = key
+	for i := range self.keys {
+		if i == self.at {
+			return errControlMismatch
+		}
+	}
+	return nil
+}
+
+func (self *RatchetTree) BuildsAPathThroughAForeignHelper(key SignaturePublicKey) error {
+	_ = key
+	self.keys[0] = bytes.Clone(self.keys[0])
+	return nil
+}
+
 func (self *PrivateHalf) AgreesWithTheTreeInConstantTime(tree *RatchetTree) error {
 	if subtle.ConstantTimeCompare(self.leafKey, tree.keys[0]) != 1 {
 		return errControlMismatch
@@ -2222,6 +2239,8 @@ var ratchetTreeKeyComparisonControlClass = []string{
 	"*PrivateHalf.AgreesWithTheTreeByConvertingToString",
 	"*PrivateHalf.AgreesWithTheTreeInConstantTime",
 	"*PrivateHalf.AgreesWithTheTreeWithBytesEqual",
+	"*RatchetTree.BuildsAPathAndComparesNoKey",
+	"*RatchetTree.BuildsAPathThroughAForeignHelper",
 	"*RatchetTree.ComparesAfterALengthFastPath",
 	"*RatchetTree.ComparesByConvertingToString",
 	"*RatchetTree.ComparesNothingAtAll",
@@ -2252,6 +2271,7 @@ var (
 	// the equality rule: a value on both sides of an == or a !=
 	ratchetTreeControlVariableTimeEqualities = []string{
 		"*PrivateHalf.AgreesWithTheTreeByConvertingToString",
+		"*RatchetTree.BuildsAPathAndComparesNoKey",
 		"*RatchetTree.ComparesAfterALengthFastPath",
 		"*RatchetTree.ComparesByConvertingToString",
 		"*RatchetTree.loops",
@@ -2259,6 +2279,7 @@ var (
 	// the foreign call rule: anything outside the package that is not the sanctioned comparison
 	ratchetTreeControlForeignCalls = []string{
 		"*PrivateHalf.AgreesWithTheTreeWithBytesEqual",
+		"*RatchetTree.BuildsAPathThroughAForeignHelper",
 		"*RatchetTree.ComparesWithAPrefix",
 		"*RatchetTree.ComparesWithBytesEqual",
 		"FindsInATreeItWasHanded",
@@ -2267,6 +2288,8 @@ var (
 	ratchetTreeControlUnreached = []string{
 		"*PrivateHalf.AgreesWithTheTreeByConvertingToString",
 		"*PrivateHalf.AgreesWithTheTreeWithBytesEqual",
+		"*RatchetTree.BuildsAPathAndComparesNoKey",
+		"*RatchetTree.BuildsAPathThroughAForeignHelper",
 		"*RatchetTree.ComparesByConvertingToString",
 		"*RatchetTree.ComparesNothingAtAll",
 		"*RatchetTree.ComparesThroughAHelperThatLoops",
@@ -2336,6 +2359,26 @@ func TestTheKeyComparisonGateFlagsItsControlFixture(t *testing.T) {
 // class; and an excused member that DOES reach the sanctioned comparison fails too, because that
 // is an excuse which has outlived what it named. Every name is held against the derived class, so
 // an entry cannot survive the declaration it excuses.
+//
+// That paragraph used to be a claim and is now a test. Nothing verified that the two surviving
+// rules survive -- the control fixture had no excused member at all -- so the sentence that says
+// the excuse is safe was exactly the shape this file's own header keeps citing: a comment
+// claiming a coverage nothing provided. TestTheExcuseForAKeyQuestionThatComparesNoKeyLiftsOnly-
+// Reachability excuses every member of the control and requires the equality and foreign call
+// rules to go on reporting the same members they report unexcused.
+//
+// What that costs the members of this class is worth writing down, because it is a real
+// constraint on the tasks that will join it and not a formality. The equality rule reads a body
+// for == and != with a value on both sides and cannot tell a NodeIndex from a key -- the gate is
+// over source and there is no type information in it -- so a path builder that needs to compare
+// two indices, two lengths or two positions cannot write the comparison inline. It puts the
+// decision behind a function that is not itself a member of this class, which any helper over
+// indices alone is: the class needs a key AND a tree AND a bool or an error, and a comparison of
+// two node indices has none of them. That route is not an escape from the guardrail, because a
+// helper that compared KEYS that way would leave its caller reaching no sanctioned comparison,
+// which is the reachability rule, and would be reported by the package wide comparator ban next
+// door in either case. The control fixture holds both halves: BuildsAPathAndComparesNoKey writes
+// exactly that inline index comparison and is reported, and it is reported while excused.
 var keyQuestionsThatCompareNoKey = map[string]string{
 	"*RatchetTree.CreateUpdatePathSecrets": "is handed the committer's signature private key so it can sign a leaf and answers an error, which is the class's shape; it derives a fresh key pair for every node of the path and compares none of them",
 }
@@ -2383,23 +2426,23 @@ func TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime(t *testing.T
 	constants := packageLevelConstantsOf(files)
 	byName := functionsByNameIn(files)
 	for _, one := range class {
-		for _, equality := range variableTimeEqualitiesIn(one.host, one.function, constants) {
-			t.Errorf("%s decides %s, which is a comparison of two values in variable time; every comparison of a key here goes through %s",
+		verdict := judgeKeyQuestion(one, declared, constants, byName, keyQuestionsThatCompareNoKey)
+		for _, equality := range verdict.equalities {
+			t.Errorf("%s decides %s, which is a comparison of two values in variable time; every comparison of a key here goes through %s. An entry in keyQuestionsThatCompareNoKey does not lift this rule and is not meant to: a member of this class with an index, a length or a position to compare puts that decision behind a function that is not itself a key question, which any helper over indices alone is",
 				one.name, equality, theSanctionedComparison())
 		}
-		for _, foreign := range callsOutOfThisPackageIn(one.host, one.function, declared) {
+		for _, foreign := range verdict.foreign {
 			t.Errorf("%s calls %s; a key question's answer is decided by %s and by nothing else, and what it needs from elsewhere belongs behind a function of this package",
 				one.name, foreign, theSanctionedComparison())
 		}
-		reaches := reachesTheConstantTimeComparison(one.function, byName)
-		if _, excused := keyQuestionsThatCompareNoKey[one.name]; excused {
-			if reaches {
+		if verdict.excused {
+			if verdict.reaches {
 				t.Errorf("%s is excused from the reachability rule as a member that compares no key, and it reaches %s; the excuse has outlived what it named",
 					one.name, theSanctionedComparison())
 			}
 			continue
 		}
-		if !reaches {
+		if !verdict.reaches {
 			t.Errorf("%s reaches no %s; a function that answers a question about a key without comparing it in constant time is not answering it safely",
 				one.name, theSanctionedComparison())
 		}
@@ -2412,6 +2455,117 @@ func TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime(t *testing.T
 				name, reason)
 		}
 	}
+}
+
+// keyQuestionVerdict is everything the three rules decide about one member of the class, in one
+// value, so the gate over the real source and the control below read the rules through one body
+// rather than through two copies of it.
+//
+// A copy is what this was, and the copy is why the excuse's own claim went unchecked: the gate
+// applied the excuse and the control test ran the three rules with no excuse in sight, so the
+// sentence saying an excuse lifts only reachability was asserted by neither.
+type keyQuestionVerdict struct {
+	equalities []string
+	foreign    []string
+	reaches    bool
+	excused    bool
+}
+
+// judgeKeyQuestion runs the three rules over one member, with the excuse table as an argument
+// rather than as a global, which is what lets the control fixture be judged under an excuse.
+func judgeKeyQuestion(one keyQuestion, declared declaredNames, constants map[string]bool,
+	byName map[string][]*ast.FuncDecl, excuses map[string]string) keyQuestionVerdict {
+	_, excused := excuses[one.name]
+	return keyQuestionVerdict{
+		equalities: variableTimeEqualitiesIn(one.host, one.function, constants),
+		foreign:    callsOutOfThisPackageIn(one.host, one.function, declared),
+		reaches:    reachesTheConstantTimeComparison(one.function, byName),
+		excused:    excused,
+	}
+}
+
+// TestTheExcuseForAKeyQuestionThatComparesNoKeyLiftsOnlyReachability is the claim
+// keyQuestionsThatCompareNoKey makes about itself, made into an assertion.
+//
+// The excuse exists because the class is a SHAPE, and a shape wide enough to find
+// TreeKEMPrivate.Consistent also takes in a declaration that is handed a key so it can sign
+// with it and derives every other key it touches -- task 18's path generation was the first,
+// and tasks 20 to 22 add more path builders to the same class. What makes an entry safe is that
+// it lifts the reachability rule alone: a comparison written into an excused member still fails
+// the equality rule and a call out of the package still fails the foreign call rule. Nothing
+// checked that. The control fixture had no excused member, so both rules were only ever run
+// unexcused, and an excuse that had grown into a pass would have read exactly the same.
+//
+// So the control is judged with EVERY one of its members excused, which is the strongest form
+// of the question, and the two surviving rules are required to report exactly the members they
+// report with no excuse at all. The two shapes a path builder actually writes are named on top
+// of that: an inline comparison of two indices, and a call to a helper outside the package.
+// Both are things a member of this class may not write, excused or not, and both are in the
+// fixture so that the constraint tasks 20 to 22 inherit is a test rather than a paragraph.
+func TestTheExcuseForAKeyQuestionThatComparesNoKeyLiftsOnlyReachability(t *testing.T) {
+	control := mustParseText(t, "the ratchet tree key comparison control", ratchetTreeKeyComparisonControl)
+	files := []parsedSource{control}
+	class := keyQuestionsIn(files)
+	if len(class) == 0 {
+		t.Fatal("the class read nothing out of the control, so this test judges an empty set")
+	}
+	declared := namesTheseFilesDeclare(files)
+	constants := packageLevelConstantsOf(files)
+	byName := functionsByNameIn(files)
+	// every member excused, which is the excuse at its widest
+	excuses := map[string]string{}
+	for _, one := range class {
+		excuses[one.name] = "the control excuses every member, so what the two surviving rules report here is what they report under an excuse"
+	}
+	equalities, foreign, lifted := []string{}, []string{}, []string{}
+	for _, one := range class {
+		verdict := judgeKeyQuestion(one, declared, constants, byName, excuses)
+		if !verdict.excused {
+			t.Fatalf("%s was excused and the verdict says it was not, so this test is not reading the excuse at all", one.name)
+		}
+		if len(verdict.equalities) != 0 {
+			equalities = append(equalities, one.name)
+		}
+		if len(verdict.foreign) != 0 {
+			foreign = append(foreign, one.name)
+		}
+		if !verdict.reaches {
+			lifted = append(lifted, one.name)
+		}
+	}
+	// the two rules an excuse does not touch report exactly what they report unexcused
+	if !slices.Equal(equalities, ratchetTreeControlVariableTimeEqualities) {
+		t.Errorf("under an excuse the equality rule reported %v, and unexcused it reports %v; the excuse is lifting a rule it is documented not to lift",
+			equalities, ratchetTreeControlVariableTimeEqualities)
+	}
+	if !slices.Equal(foreign, ratchetTreeControlForeignCalls) {
+		t.Errorf("under an excuse the foreign call rule reported %v, and unexcused it reports %v; the excuse is lifting a rule it is documented not to lift",
+			foreign, ratchetTreeControlForeignCalls)
+	}
+	// and the rule it does lift is the one that had something to lift
+	if !slices.Equal(lifted, ratchetTreeControlUnreached) {
+		t.Errorf("the reachability rule found %v not reaching %s, and the control expects %v",
+			lifted, theSanctionedComparison(), ratchetTreeControlUnreached)
+	}
+	if len(lifted) == 0 {
+		t.Error("no member of the control fails the reachability rule, so this test cannot see that an excuse lifts it")
+	}
+	// the two shapes a path builder writes, named rather than left to the lists above. A member
+	// of this class may write neither, whatever it is excused for.
+	for _, want := range []string{"*RatchetTree.BuildsAPathAndComparesNoKey"} {
+		if !slices.Contains(equalities, want) {
+			t.Errorf("%s compares two indices inline and the equality rule did not report it under an excuse; a path builder joining this class would be told that is allowed",
+				want)
+		}
+	}
+	for _, want := range []string{"*RatchetTree.BuildsAPathThroughAForeignHelper"} {
+		if !slices.Contains(foreign, want) {
+			t.Errorf("%s calls out of the package and the foreign call rule did not report it under an excuse; a path builder joining this class would be told that is allowed",
+				want)
+		}
+	}
+	t.Logf("%d members judged under an excuse: %d still reported by the equality rule, %d by the foreign call rule, %d lifted from the reachability rule",
+		len(class), len(equalities), len(foreign), len(lifted))
 }
 
 // ---------------------------------------------------------------------------
