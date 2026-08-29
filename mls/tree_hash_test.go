@@ -2108,3 +2108,364 @@ func TestVerifyParentHashesRefusesAParentTwoDescendantsClaim(t *testing.T) {
 		t.Errorf("node 1 is claimed by both of its children and the refusal does not say so: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// task 13's debt: what ParentHash refuses, and the RFC's own worked example
+// ---------------------------------------------------------------------------
+
+// TestParentHashRefusesEveryArgumentItCannotAnswerFor is the half of task 13 that never landed.
+//
+// Task 13's implementer was lost mid-response and ParentHash arrived with no behavioural test of
+// its own; task 14 committed it because task 14 does not compile without it. What held it after
+// that was TestVerifyParentHashesAcceptsThePublishedTreeValidationCorpus, which is real coverage
+// of the PREIMAGE -- 290 non-blank parents of the working group's own trees, several with
+// unmerged leaves inside the sibling subtree -- and no coverage at all of what the method does
+// with an argument it cannot answer for. Every one of those refusals is a caller's bug rather
+// than a protocol condition, so nothing off the wire reaches them and no corpus can.
+//
+// Each of the three argument classes is DERIVED from the tree rather than sampled, because each
+// of them has the same failure mode: a hash taken over the wrong subtree is a well formed digest
+// of the right width, it chains, and nothing a length check or a comparison against this
+// implementation can see separates it from the right one.
+//
+//   - the copath child class is every node index of the tree that is not one of the parent's two
+//     children, plus two past the end. A sampled version would take the grandparent and the
+//     sibling and miss the parent's own index, or take those and miss a node in another subtree.
+//   - the node type class is every EVEN index of the tree, swept against every copath child, so
+//     a body that judged the child before the parity is visible.
+//   - the out of range class is taken at BOTH parities, which is what pins the ORDER of the two
+//     checks: with the range check removed an odd index past the end still has arithmetic
+//     children and answers the copath refusal, and an even one answers the type mismatch. Both
+//     send a caller to look at an argument that is not the problem.
+//
+// The blank parent is the fourth refusal and the one that is NOT a caller's bug -- it is a
+// question about a tree somebody else sent -- so it answers ErrParentHashMismatch and is
+// asserted separately.
+func TestParentHashRefusesEveryArgumentItCannotAnswerFor(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 4)
+	// every parent position occupied, so no refusal swept below is the blank node's refusal
+	// wearing another name
+	for _, x := range []NodeIndex{1, 3, 5} {
+		if err := tree.SetParent(x, &ParentNode{
+			EncryptionKey: HpkePublicKey(bytes.Repeat([]byte{0x40 + byte(x)}, 32)),
+			ParentHash:    bytes.Repeat([]byte{0x50 + byte(x)}, crypto.HashSize()),
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	width := tree.NodeWidth()
+	if width != 7 {
+		t.Fatalf("the fixture is %d nodes wide, and the sweeps below are written for the 7 node tree of four members", width)
+	}
+	accepted, notAChild, typeMismatch, outOfRange := 0, 0, 0, 0
+	for x := uint32(0); x < width; x += 1 {
+		p := NodeIndex(x)
+		left, leftOk := leftOf(p)
+		right, rightOk := rightOf(p)
+		if !leftOk || !rightOk {
+			// an even index is a leaf position and a leaf has no children, so there is no
+			// copath child it could be handed. every one is swept anyway: the parity is what
+			// decides this refusal and the child must not be able to change it.
+			for y := uint32(0); y < width; y += 1 {
+				if _, err := tree.ParentHash(crypto, p, NodeIndex(y)); !errors.Is(err, ErrNodeTypeMismatch) {
+					t.Errorf("ParentHash(%d, %d) over a leaf position answered %v, want %v",
+						p, y, err, ErrNodeTypeMismatch)
+				}
+				typeMismatch += 1
+			}
+			continue
+		}
+		// the positive control, at both children. Without it every assertion below is
+		// satisfiable by a method that refuses everything.
+		for _, child := range []NodeIndex{left, right} {
+			hash, err := tree.ParentHash(crypto, p, child)
+			if err != nil {
+				t.Fatalf("ParentHash(%d, %d) over a child of that node: %v", p, child, err)
+			}
+			if len(hash) != crypto.HashSize() {
+				t.Errorf("ParentHash(%d, %d) answered %d bytes, want the provider's %d",
+					p, child, len(hash), crypto.HashSize())
+			}
+			accepted += 1
+		}
+		// and the refusal class, every node of this tree that is not one of the two children
+		for y := uint32(0); y < width; y += 1 {
+			if NodeIndex(y) == left || NodeIndex(y) == right {
+				continue
+			}
+			if _, err := tree.ParentHash(crypto, p, NodeIndex(y)); !errors.Is(err, errCopathChildIsNotAChildOfTheParent) {
+				t.Errorf("ParentHash(%d, %d) answered %v, and node %d is not a child of node %d; want %v",
+					p, y, err, y, p, errCopathChildIsNotAChildOfTheParent)
+			}
+			notAChild += 1
+		}
+		// plus the two past the end, which no enumeration over the tree's own indices reaches
+		for _, y := range []NodeIndex{NodeIndex(width), NodeIndex(width + 1)} {
+			if _, err := tree.ParentHash(crypto, p, y); !errors.Is(err, errCopathChildIsNotAChildOfTheParent) {
+				t.Errorf("ParentHash(%d, %d) answered %v for a copath child outside the tree, want %v",
+					p, y, err, errCopathChildIsNotAChildOfTheParent)
+			}
+			notAChild += 1
+		}
+	}
+	// the parent index outside the tree, at both parities and with both a valid looking and an
+	// out of range copath child. The range check runs before the parity check and before the
+	// copath check, and this is what says so.
+	for _, p := range []NodeIndex{NodeIndex(width), NodeIndex(width + 1), NodeIndex(width + 8)} {
+		for _, child := range []NodeIndex{NodeIndex(0), NodeIndex(width)} {
+			if _, err := tree.ParentHash(crypto, p, child); !errors.Is(err, ErrNodeIndexOutOfRange) {
+				t.Errorf("ParentHash(%d, %d) over a %d node tree answered %v, want %v",
+					p, child, width, err, ErrNodeIndexOutOfRange)
+			}
+			outOfRange += 1
+		}
+	}
+	// and the one refusal that is about the tree rather than about the arguments
+	blanked := tree.Clone()
+	if err := blanked.Blank(NodeIndex(1)); err != nil {
+		t.Fatalf("Blank(1): %v", err)
+	}
+	blankRefusals := 0
+	for _, child := range []NodeIndex{NodeIndex(0), NodeIndex(2)} {
+		if _, err := blanked.ParentHash(crypto, NodeIndex(1), child); !errors.Is(err, ErrParentHashMismatch) {
+			t.Errorf("ParentHash(1, %d) over a blank node 1 answered %v, want %v",
+				child, err, ErrParentHashMismatch)
+		}
+		blankRefusals += 1
+	}
+	if accepted == 0 || notAChild == 0 || typeMismatch == 0 || outOfRange == 0 || blankRefusals == 0 {
+		t.Fatalf("the sweep made %d accepted calls, %d copath refusals, %d type refusals, %d range refusals and %d blank refusals; a zero in any of them is a class this test did not reach",
+			accepted, notAChild, typeMismatch, outOfRange, blankRefusals)
+	}
+	t.Logf("%d accepted, %d copath refusals, %d type refusals, %d range refusals, %d blank refusals",
+		accepted, notAChild, typeMismatch, outOfRange, blankRefusals)
+}
+
+// appendixBCommit is one member sending a full Commit over the tree, which is the operation
+// appendix B's four steps are written in terms of.
+func appendixBCommit(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	sender LeafIndex, signer SignaturePrivateKey) {
+	t.Helper()
+	if _, err := tree.CreateUpdatePathSecrets(crypto, sender, signer, testGroupId()); err != nil {
+		t.Fatalf("CreateUpdatePathSecrets(leaf %d): %v", sender, err)
+	}
+}
+
+// appendixBParentHash writes out appendix B's own H(P, ph=..., osth=th(S)) from the RFC's
+// notation rather than from this package's ParentHash, so the two are separate readings.
+//
+// It refuses a parent carrying unmerged leaves, because appendix B's osth is the ORIGINAL
+// sibling tree hash and this helper takes the plain one: over a parent with an empty unmerged
+// list the two are the same bytes, and over any other parent they are not. A helper that
+// silently took the plain hash there would agree with an implementation that had never heard of
+// the blanking.
+func appendixBParentHash(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	p NodeIndex, ph []byte, sibling NodeIndex) []byte {
+	t.Helper()
+	node := tree.ParentAt(p)
+	if node == nil {
+		t.Fatalf("node %d is blank, so appendix B's H(P, ...) has no encryption_key to write", p)
+	}
+	if len(node.UnmergedLeaves) != 0 {
+		t.Fatalf("node %d carries %d unmerged leaves, so the tree hash of node %d is not the ORIGINAL sibling tree hash appendix B's osth names",
+			p, len(node.UnmergedLeaves), sibling)
+	}
+	th, err := tree.NodeTreeHash(crypto, sibling)
+	if err != nil {
+		t.Fatalf("NodeTreeHash(%d): %v", sibling, err)
+	}
+	return crypto.Hash(treeHashTestConcat(
+		treeHashTestOpaque(t, node.EncryptionKey),
+		treeHashTestOpaque(t, ph),
+		treeHashTestOpaque(t, th)))
+}
+
+// TestTheParentHashChainOfRfc9420AppendixBsWorkedExample is the RFC's own worked example, run.
+//
+// This is the strongest anchor available for both halves of the chain -- the values task 18
+// assigns and the values task 14 verifies -- and before this test it was held nowhere. Appendix
+// B is a worked example rather than a vector file: it gives no octets, so what it pins is the
+// SHAPE of every parent hash in a four member tree after a stated sequence of commits, plus
+// table 15's verdict on each. That shape is what an implementation gets wrong. A chain computed
+// leaf-upward, a leaf that carries the wrong node's hash, a root that carries something other
+// than the zero-length octet string and an osth taken over the wrong child all produce a full
+// set of well formed digests, and only a comparison against a preimage written from the RFC's
+// own notation separates them.
+//
+// The tree GROWS through the example rather than starting at four leaves, because that is where
+// the example's content is. X is the root of a two leaf tree and X' is a node of a four leaf
+// one; the whole point of table 15's "No, Y and Z changed" is that X' still carries a hash taken
+// against a Y that no longer exists. A fixture that started at four leaves would compute a
+// different X, agree with itself, and hold none of it.
+//
+// The preimages come from appendixBParentHash, which spells opaque<V> by hand for the reason
+// TestABlankSubtreeHashesToTheHandDerivedGolden gives: a preimage assembled with the encoder
+// under test is wrong in the same way the encoder is.
+func TestTheParentHashChainOfRfc9420AppendixBsWorkedExample(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	// four well formed members borrowed from the shared builder, re-installed one at a time
+	// below so the tree grows the way figure 30's does
+	full, members := newTestTree(t, crypto, 4)
+	leaves := [4]*LeafNode{}
+	for i := range leaves {
+		leaves[i] = full.Leaf(LeafIndex(i)).Clone()
+	}
+	const (
+		a = LeafIndex(0)
+		b = LeafIndex(1)
+		c = LeafIndex(2)
+		d = LeafIndex(3)
+	)
+	// figure 30's node labels. X and X' are one position, as are Y and Y', and as are the blank
+	// Z and Z'; the primes are epochs of the same node and not different nodes.
+	const (
+		x = NodeIndex(1)
+		y = NodeIndex(3)
+		z = NodeIndex(5)
+	)
+
+	// 1. A initializes a new group.
+	tree := NewRatchetTree()
+	if err := tree.SetLeaf(a, leaves[0]); err != nil {
+		t.Fatalf("SetLeaf(A): %v", err)
+	}
+
+	// 2. A adds B to the group with a full Commit: set X.
+	if at, err := tree.AddLeaf(leaves[1]); err != nil || at != b {
+		t.Fatalf("AddLeaf(B) = %d, %v; want leaf %d and no error", at, err, b)
+	}
+	appendixBCommit(t, crypto, tree, a, members[0].SignaturePriv)
+	xNode := tree.ParentAt(x)
+	if xNode == nil {
+		t.Fatalf("A's full commit did not set X")
+	}
+	if len(xNode.ParentHash) != 0 {
+		t.Errorf("X is the root of the two leaf tree, so section 7.9 gives its parent_hash field the zero-length octet string; it carries %d bytes",
+			len(xNode.ParentHash))
+	}
+	// A.parent_hash = ph(X) = H(X, ph="", osth=th(B))
+	aField := cloneBytes(tree.Leaf(a).ParentHash)
+	wantA := appendixBParentHash(t, crypto, tree, x, nil, b.NodeIndex())
+	if !bytes.Equal(aField, wantA) {
+		t.Errorf("after step 2 A.parent_hash is %x, and appendix B's H(X, ph=\"\", osth=th(B)) is %x", aField, wantA)
+	}
+
+	// 3. B adds C and D to the group with a full Commit: set B', X' and Y.
+	if at, err := tree.AddLeaf(leaves[2]); err != nil || at != c {
+		t.Fatalf("AddLeaf(C) = %d, %v; want leaf %d and no error", at, err, c)
+	}
+	if at, err := tree.AddLeaf(leaves[3]); err != nil || at != d {
+		t.Fatalf("AddLeaf(D) = %d, %v; want leaf %d and no error", at, err, d)
+	}
+	appendixBCommit(t, crypto, tree, b, members[1].SignaturePriv)
+	if tree.ParentAt(z) != nil {
+		t.Errorf("figure 30 has Z blank at this step -- th(Z) covers (C, _, D) -- and node %d is occupied", z)
+	}
+	if yNode := tree.ParentAt(y); yNode == nil {
+		t.Fatalf("B's full commit did not set Y")
+	} else if len(yNode.ParentHash) != 0 {
+		t.Errorf("Y is the root, so its parent_hash field is the zero-length octet string; it carries %d bytes",
+			len(yNode.ParentHash))
+	}
+	// X'.parent_hash = ph(Y) = H(Y, ph="", osth=th(Z))
+	xPrimeField := cloneBytes(tree.ParentAt(x).ParentHash)
+	wantXPrime := appendixBParentHash(t, crypto, tree, y, nil, z)
+	if !bytes.Equal(xPrimeField, wantXPrime) {
+		t.Errorf("after step 3 X'.parent_hash is %x, and appendix B's H(Y, ph=\"\", osth=th(Z)) is %x",
+			xPrimeField, wantXPrime)
+	}
+	// B'.parent_hash = ph(X') = H(X', ph=X'.parent_hash, osth=th(A))
+	bField := cloneBytes(tree.Leaf(b).ParentHash)
+	wantB := appendixBParentHash(t, crypto, tree, x, xPrimeField, a.NodeIndex())
+	if !bytes.Equal(bField, wantB) {
+		t.Errorf("after step 3 B'.parent_hash is %x, and appendix B's H(X', ph=X'.parent_hash, osth=th(A)) is %x",
+			bField, wantB)
+	}
+
+	// 4. C sends an empty Commit: set C', Z' and Y'.
+	appendixBCommit(t, crypto, tree, c, members[2].SignaturePriv)
+	if yPrime := tree.ParentAt(y); yPrime == nil {
+		t.Fatalf("C's commit did not set Y'")
+	} else if len(yPrime.ParentHash) != 0 {
+		t.Errorf("Y' is the root, so its parent_hash field is the zero-length octet string; it carries %d bytes",
+			len(yPrime.ParentHash))
+	}
+	// Z'.parent_hash = ph(Y') = H(Y', ph="", osth=th(X'))
+	zPrimeField := cloneBytes(tree.ParentAt(z).ParentHash)
+	wantZPrime := appendixBParentHash(t, crypto, tree, y, nil, x)
+	if !bytes.Equal(zPrimeField, wantZPrime) {
+		t.Errorf("after step 4 Z'.parent_hash is %x, and appendix B's H(Y', ph=\"\", osth=th(X')) is %x",
+			zPrimeField, wantZPrime)
+	}
+	// C'.parent_hash = ph(Z') = H(Z', ph=Z'.parent_hash, osth=th(D))
+	cField := cloneBytes(tree.Leaf(c).ParentHash)
+	wantC := appendixBParentHash(t, crypto, tree, z, zPrimeField, d.NodeIndex())
+	if !bytes.Equal(cField, wantC) {
+		t.Errorf("after step 4 C'.parent_hash is %x, and appendix B's H(Z', ph=Z'.parent_hash, osth=th(D)) is %x",
+			cField, wantC)
+	}
+	// the two values set higher up the tree in an earlier epoch are still the ones their epoch
+	// wrote. That is what "the part of the chain closer to the root can be overwritten" means
+	// from the other side: A and X' were not touched by steps 3 and 4, and it is precisely
+	// because they were not that table 15 reads them as invalid.
+	if held := tree.Leaf(a).ParentHash; !bytes.Equal(held, aField) {
+		t.Errorf("A.parent_hash moved from %x to %x across two commits that did not traverse A", aField, held)
+	}
+	if held := tree.ParentAt(x).ParentHash; !bytes.Equal(held, xPrimeField) {
+		t.Errorf("X'.parent_hash moved from %x to %x across a commit that did not traverse X'", xPrimeField, held)
+	}
+
+	// table 15, recomputed over the final tree. Each row names the node whose field is read,
+	// the parent that field is read against, and the copath child of that parent.
+	valid, invalid, absent := 0, 0, 0
+	for _, row := range []struct {
+		name    string
+		node    NodeIndex
+		parent  NodeIndex
+		copath  NodeIndex
+		carries bool
+		want    bool
+		why     string
+	}{
+		{name: "A", node: a.NodeIndex(), parent: x, copath: b.NodeIndex(), carries: true, want: false, why: "B changed"},
+		{name: "B'", node: b.NodeIndex(), parent: x, copath: a.NodeIndex(), carries: true, want: true},
+		{name: "C'", node: c.NodeIndex(), parent: z, copath: d.NodeIndex(), carries: true, want: true},
+		{name: "D", node: d.NodeIndex(), carries: false, why: "never sent an UpdatePath"},
+		{name: "X'", node: x, parent: y, copath: z, carries: true, want: false, why: "Y and Z changed"},
+		{name: "Z'", node: z, parent: y, copath: x, carries: true, want: true},
+	} {
+		field, carries := nodeParentHashField(tree.Get(row.node))
+		if carries != row.carries {
+			t.Errorf("table 15 has %s carrying a parent hash = %v, and this tree answers %v (%s)",
+				row.name, row.carries, carries, row.why)
+			continue
+		}
+		if !carries {
+			absent += 1
+			continue
+		}
+		live, err := tree.ParentHash(crypto, row.parent, row.copath)
+		if err != nil {
+			t.Fatalf("ParentHash(%d, %d) for table 15's %s row: %v", row.parent, row.copath, row.name, err)
+		}
+		if got := bytes.Equal(field, live); got != row.want {
+			t.Errorf("table 15 says %s's parent hash is valid = %v (%s), and this tree answers %v: the field is %x and the parent hash of node %d with copath child %d is %x",
+				row.name, row.want, row.why, got, field, row.parent, row.copath, live)
+		}
+		if row.want {
+			valid += 1
+		} else {
+			invalid += 1
+		}
+	}
+	if valid != 3 || invalid != 2 || absent != 1 {
+		t.Fatalf("table 15 has three valid rows, two invalid ones and one node carrying no field; this run read %d, %d and %d",
+			valid, invalid, absent)
+	}
+	// and the sentence the table is there to support: those chains cover every non-blank parent,
+	// so the tree is parent-hash valid even though it holds two invalid links.
+	if err := tree.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("appendix B states this tree is parent-hash valid, and this package refuses it: %v", err)
+	}
+}

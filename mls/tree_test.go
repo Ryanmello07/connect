@@ -2319,6 +2319,27 @@ func TestTheKeyComparisonGateFlagsItsControlFixture(t *testing.T) {
 	}
 }
 
+// keyQuestionsThatCompareNoKey names a declaration the class's SHAPE takes in and whose body has
+// no key comparison for the reachability rule to hold, with the reason it has none.
+//
+// The class is three shapes and not a list -- a key of its own, an answer spelled as a bool or an
+// error, and a ratchet tree in scope -- and that is what makes it worth having: it found
+// TreeKEMPrivate.Consistent, which a hand written list had missed while a comment claimed it was
+// covered. A shape wide enough to find that one also takes in a declaration that is HANDED a key
+// and answers an error without ever comparing anything, and task 18's path generation is the
+// first of those: it is given the committer's signature private key so it can sign a leaf, and
+// every key it touches it DERIVES.
+//
+// The entry is a narrower rule rather than a pass, which is the whole of why it is safe. The
+// equality rule and the foreign call rule still run over an excused member, so a comparison
+// written into it in either of those spellings fails exactly as it would anywhere else in the
+// class; and an excused member that DOES reach the sanctioned comparison fails too, because that
+// is an excuse which has outlived what it named. Every name is held against the derived class, so
+// an entry cannot survive the declaration it excuses.
+var keyQuestionsThatCompareNoKey = map[string]string{
+	"*RatchetTree.CreateUpdatePathSecrets": "is handed the committer's signature private key so it can sign a leaf and answers an error, which is the class's shape; it derives a fresh key pair for every node of the path and compares none of them",
+}
+
 // TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime is guardrail 8 over the key
 // comparisons made against the ratchet tree, which no gate in this package reached.
 //
@@ -2370,9 +2391,25 @@ func TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime(t *testing.T
 			t.Errorf("%s calls %s; a key question's answer is decided by %s and by nothing else, and what it needs from elsewhere belongs behind a function of this package",
 				one.name, foreign, theSanctionedComparison())
 		}
-		if !reachesTheConstantTimeComparison(one.function, byName) {
+		reaches := reachesTheConstantTimeComparison(one.function, byName)
+		if _, excused := keyQuestionsThatCompareNoKey[one.name]; excused {
+			if reaches {
+				t.Errorf("%s is excused from the reachability rule as a member that compares no key, and it reaches %s; the excuse has outlived what it named",
+					one.name, theSanctionedComparison())
+			}
+			continue
+		}
+		if !reaches {
 			t.Errorf("%s reaches no %s; a function that answers a question about a key without comparing it in constant time is not answering it safely",
 				one.name, theSanctionedComparison())
+		}
+	}
+	// and the excuse is held to the derived class in the other direction, so an entry cannot
+	// outlive the declaration it names
+	for name, reason := range keyQuestionsThatCompareNoKey {
+		if !slices.Contains(names, name) {
+			t.Errorf("the gate excuses %s as %q, and no key question of this package is called that",
+				name, reason)
 		}
 	}
 }

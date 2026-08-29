@@ -210,3 +210,155 @@ func (self *TreeKEMPrivate) Consistent(crypto CryptoProvider, tree *RatchetTree)
 	}
 	return nil
 }
+
+// UpdatePathPlan is everything the sender computed before any encryption happened: the filtered
+// direct path it is about to publish, one path secret and one public key per node of it, the
+// re-signed leaf, the epoch's commit secret, and the private state the sender keeps.
+//
+// It exists because generation is SPLIT, and the split is an ordering constraint rather than a
+// style. The HPKE encryption context task 20 seals each path secret under is the serialized
+// GroupContext of the epoch the commit OPENS, whose tree_hash is the hash of the tree with these
+// public keys and this leaf already installed. So the public half has to land in the tree before
+// the context exists, and a single call that did both would either encrypt under the previous
+// epoch's context -- ciphertexts every peer rejects, and invisible to any test that does not
+// distinguish the two contexts -- or have to compute a tree hash over a tree it had not finished
+// mutating.
+//
+// Nothing here is serialized. UpdatePath, the wire type, is task 19's and carries the public keys
+// and the ciphertexts alone; the path secrets in this structure never leave the sender.
+type UpdatePathPlan struct {
+	Path         []NodeIndex
+	PathSecrets  [][]byte
+	PublicKeys   []HpkePublicKey
+	LeafNode     *LeafNode
+	CommitSecret []byte
+	Private      *TreeKEMPrivate
+}
+
+// CreateUpdatePathSecrets is the secret and public half of RFC 9420 section 7.5's UpdatePath
+// generation. It MUTATES the tree: it blanks the sender's direct path, installs the fresh public
+// keys and the parent hash chain on the filtered path, and installs the re-signed leaf. After it
+// returns, TreeHash is the NEW epoch's tree hash and the caller can build the GroupContext task
+// 20 encrypts under.
+//
+// The parent hashes are assigned from the ROOT DOWN, which is the order section 7.9 requires and
+// not a preference. The parent hash of a node is taken over that node's own parent_hash field, so
+// the value at the top of the filtered path -- the zero-length octet string section 7.9 gives the
+// root -- has to be final before the node below it can be hashed, and so on down to the leaf. A
+// loop that ran the other way would hash a placeholder field at every level and produce a chain
+// that is full length, stable, self-consistent and rejected by every joiner. Each node's copath
+// child comes from the PathStep rather than being re-derived here, so this walk and task 21's
+// receiving walk are provably over the same children.
+//
+// The leaf's own key pair is sampled independently and is NOT the first rung of the ladder.
+// Everyone who can open the first ciphertext of the UpdatePath learns path_secret[0], so a leaf
+// key derived from it is the sender's leaf private key handed to its whole copath -- and the two
+// versions are indistinguishable to any test that only checks that the private state's public
+// halves agree with the tree.
+//
+// CommitSecret is the rung PAST the root, section 8.1, which is why DerivePathSecrets answers one
+// more value than there are nodes.
+func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender LeafIndex,
+	signer SignaturePrivateKey, groupId []byte) (*UpdatePathPlan, error) {
+	// before anything is read off the receiver, for the reason the nil provider gate states:
+	// every secret, key and hash below comes through this provider, and a caller that passed
+	// none is told that rather than being sent to look at a tree that is not the problem.
+	// bare rather than wrapped with a reason, which is DeriveNodeKeyPair's spelling two
+	// declarations up and is not a style choice here: the shape of this signature puts it inside
+	// TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime's derived class, and that
+	// gate bans every call out of this package from a member of it.
+	if crypto == nil {
+		return nil, ErrNilCryptoProvider
+	}
+	current := self.Leaf(sender)
+	if current == nil {
+		return nil, ErrLeafIndexOutOfRange
+	}
+	// computed before the direct path is blanked: blanking the sender's own direct path cannot
+	// change any copath child's resolution, so the filtered path is the same either way, and
+	// computing it first keeps the failure ahead of the mutation.
+	steps, err := self.filteredPathSteps(sender)
+	if err != nil {
+		return nil, err
+	}
+	path := make([]NodeIndex, 0, len(steps))
+	for _, step := range steps {
+		path = append(path, step.Node)
+	}
+	// the ladder: one secret per filtered node, plus the rung past the root.
+	ladder := DerivePathSecrets(crypto, crypto.Random(crypto.HashSize()), len(path))
+	pathSecrets := ladder[:len(path)]
+	commitSecret := ladder[len(ladder)-1]
+
+	publicKeys := make([]HpkePublicKey, len(path))
+	private := NewTreeKEMPrivate(sender, nil)
+	for i := range path {
+		_, pub, err := DeriveNodeKeyPair(crypto, pathSecrets[i])
+		if err != nil {
+			return nil, err
+		}
+		publicKeys[i] = pub
+		private.PathSecrets[path[i]] = cloneBytes(pathSecrets[i])
+	}
+
+	// the leaf key pair is sampled independently: deriving it from path_secret[0] would hand the
+	// sender's leaf private key to everyone who decrypts that secret.
+	leafPriv, leafPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		return nil, err
+	}
+	private.EncryptionPriv = cloneBytes(leafPriv)
+
+	if err := self.BlankDirectPath(sender); err != nil {
+		return nil, err
+	}
+	// installed BEFORE the parent hashes are taken, and the order is load bearing twice over.
+	// The parent hash of a node is a hash of that node's encryption_key, so a chain computed
+	// against the blanked tree would refuse outright; and the tree hash the caller reads after
+	// this call is the new epoch's only because these keys are in it.
+	for i, x := range path {
+		if err := self.SetParent(x, &ParentNode{EncryptionKey: publicKeys[i]}); err != nil {
+			return nil, err
+		}
+	}
+
+	// the chain, root down. carried is the parent hash of the node ABOVE the one being written,
+	// and it starts as the zero-length octet string section 7.9 gives the top of the path.
+	carried := []byte{}
+	for i := len(steps) - 1; i >= 0; i -= 1 {
+		parent := self.ParentAt(steps[i].Node)
+		if parent == nil {
+			return nil, ErrTreeMalformed
+		}
+		parent.ParentHash = carried
+		hash, err := self.ParentHash(crypto, steps[i].Node, steps[i].CopathChild)
+		if err != nil {
+			return nil, err
+		}
+		carried = hash
+	}
+
+	// the leaf carries the parent hash of the LOWEST node of the filtered path, section 7.9.1,
+	// and it is a commit leaf so that the field is inside what the signature covers. In a group
+	// of one the path is empty and carried is still the zero-length octet string, which is the
+	// conforming answer rather than an omission: there is no parent node for the leaf to claim.
+	leaf := current.Clone()
+	leaf.EncryptionKey = leafPub
+	leaf.LeafNodeSource = LeafNodeSourceCommit
+	leaf.ParentHash = carried
+	if err := leaf.Sign(crypto, signer, groupId, sender); err != nil {
+		return nil, err
+	}
+	if err := self.SetLeaf(sender, leaf); err != nil {
+		return nil, err
+	}
+
+	return &UpdatePathPlan{
+		Path:         path,
+		PathSecrets:  pathSecrets,
+		PublicKeys:   publicKeys,
+		LeafNode:     leaf,
+		CommitSecret: commitSecret,
+		Private:      private,
+	}, nil
+}

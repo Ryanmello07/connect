@@ -321,6 +321,49 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
 		}},
+		// task 18's path generation, which is the one member of this class that mutates its
+		// receiver and the one that samples entropy.
+		//
+		// The three values are all KDF.Nh wide and none of them is a public key, which is this
+		// row's whole shape. X25519 fixes an HPKE public key at 32 octets whatever the kdf does,
+		// so a row reporting one of the path's public keys would be read by the KDF.Nh
+		// differential as a length written down rather than as the key it is -- the same
+		// coincidence constructionsWhoseAnswerOnlyCoincidesWithKdfNh names for DeriveKeyPair.
+		//
+		// The ROUTING differential is weak over this row, and that is written down rather than
+		// left to be discovered by somebody who reads it as one of the rows above. Every value
+		// here descends from crypto.Random, so all three move across a provider that flips every
+		// answer whether or not the ladder, the key derivation or the hash routed through the
+		// parameter. What holds those instead is the KDF.Nh row -- a commit secret or a parent
+		// hash taken outside the provider stays 32 octets over a provider whose Nh is 48 -- and
+		// TestTheParentHashChainOfRfc9420AppendixBsWorkedExample, which compares the BYTES of the
+		// chain this method writes against preimages spelled out from the RFC's own notation.
+		//
+		// The signer comes from a provider FIXED in the row rather than from the one under test,
+		// because it is a caller's array here: what this method does with it is hand it to
+		// SignWithLabel, and generating it through the parameter would make the retention gate
+		// read a key the method never received from its caller.
+		{name: "(*RatchetTree).CreateUpdatePathSecrets", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+			signer, _, err := fixed.SignatureKeyPair()
+			if err != nil {
+				return nil, err
+			}
+			tree := providerRowRatchetTree(t)
+			plan, err := tree.CreateUpdatePathSecrets(crypto, LeafIndex(0),
+				SignaturePrivateKey(take(signer)), take([]byte("provider-row-group-id")))
+			if err != nil {
+				return nil, err
+			}
+			if len(plan.PathSecrets) == 0 {
+				return nil, fmt.Errorf("the row's tree gave leaf 0 an empty filtered direct path, so this row observes nothing")
+			}
+			return []providerDrivenMethodValue{
+				{name: "the commit secret", content: plan.CommitSecret},
+				{name: "the path secret of the topmost node", content: plan.PathSecrets[len(plan.PathSecrets)-1]},
+				{name: "the leaf's parent hash", content: plan.LeafNode.ParentHash},
+			}, nil
+		}},
 		// treekem.go's two. NodePrivateKey has both arms driven, because they are two
 		// different answers and only one of them is derived: the node key comes back through
 		// the provider and moves, and the member's own leaf key is STORED and must not. The

@@ -34,6 +34,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // ---------------------------------------------------------------------------
@@ -677,4 +679,452 @@ func TestEveryPublishedPathSecretDerivesTheNodeKeyItsRatchetTreeCarries(t *testi
 	}
 	t.Logf("%d of %d entries at a registered suite: %d private leaf states, %d path secrets, %d of the states holding more than one",
 		matched, len(entries), leaves, secrets, deep)
+}
+
+// ---------------------------------------------------------------------------
+// task 18: the secrets, keys and parent hashes of an UpdatePath
+// ---------------------------------------------------------------------------
+
+// TestCreateUpdatePathSecretsInstallsAChainThatVerifies is the plan's own sweep: the shapes
+// agree, every public key is the one its path secret derives, the commit secret is the rung past
+// the root, the leaf is a re-signed commit leaf, and the tree the call leaves behind passes
+// section 7.9.2.
+func TestCreateUpdatePathSecretsInstallsAChainThatVerifies(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	for _, n := range []uint32{2, 3, 4, 7, 8} {
+		tree, members := newTestTree(t, crypto, n)
+		plan, err := tree.CreateUpdatePathSecrets(crypto, members[0].LeafIndex,
+			members[0].SignaturePriv, testGroupId())
+		if err != nil {
+			t.Fatalf("n=%d CreateUpdatePathSecrets: %v", n, err)
+		}
+		if len(plan.Path) == 0 {
+			t.Fatalf("n=%d the filtered direct path is empty in a group of more than one", n)
+		}
+		if len(plan.PathSecrets) != len(plan.Path) {
+			t.Fatalf("n=%d %d path secrets for %d nodes", n, len(plan.PathSecrets), len(plan.Path))
+		}
+		if len(plan.PublicKeys) != len(plan.Path) {
+			t.Fatalf("n=%d %d public keys for %d nodes", n, len(plan.PublicKeys), len(plan.Path))
+		}
+		if len(plan.CommitSecret) != crypto.HashSize() {
+			t.Fatalf("n=%d commit secret length = %d", n, len(plan.CommitSecret))
+		}
+		want := crypto.DeriveSecret(plan.PathSecrets[len(plan.PathSecrets)-1], "path")
+		if !bytes.Equal(plan.CommitSecret, want) {
+			t.Fatalf("n=%d commit secret is not the rung past the root", n)
+		}
+		for i, x := range plan.Path {
+			parent := tree.ParentAt(x)
+			if parent == nil {
+				t.Fatalf("n=%d node %d was not installed", n, x)
+			}
+			if !bytes.Equal(parent.EncryptionKey, plan.PublicKeys[i]) {
+				t.Fatalf("n=%d node %d carries a different key from the plan", n, x)
+			}
+			if len(parent.UnmergedLeaves) != 0 {
+				t.Fatalf("n=%d node %d kept unmerged leaves across a fresh path", n, x)
+			}
+			_, derived, err := DeriveNodeKeyPair(crypto, plan.PathSecrets[i])
+			if err != nil {
+				t.Fatalf("n=%d DeriveNodeKeyPair: %v", n, err)
+			}
+			if !bytes.Equal(derived, plan.PublicKeys[i]) {
+				t.Fatalf("n=%d node %d public key is not derived from its path secret", n, x)
+			}
+		}
+		leaf := tree.Leaf(members[0].LeafIndex)
+		if leaf.LeafNodeSource != LeafNodeSourceCommit {
+			t.Fatalf("n=%d leaf source = %d, want commit", n, leaf.LeafNodeSource)
+		}
+		if len(leaf.ParentHash) != crypto.HashSize() {
+			t.Fatalf("n=%d leaf parent hash length = %d", n, len(leaf.ParentHash))
+		}
+		if err := leaf.VerifySignature(crypto, testGroupId(), members[0].LeafIndex); err != nil {
+			t.Fatalf("n=%d the re-signed leaf does not verify: %v", n, err)
+		}
+		if err := tree.VerifyParentHashes(crypto); err != nil {
+			t.Fatalf("n=%d VerifyParentHashes after a fresh path: %v", n, err)
+		}
+	}
+}
+
+// TestCreateUpdatePathSecretsGivesTheLeafAnIndependentKey is the plan's second: the leaf key is
+// rotated, it is NOT derivable from path_secret[0], and the private state the call answers is
+// consistent with the tree it left behind.
+func TestCreateUpdatePathSecretsGivesTheLeafAnIndependentKey(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	before := cloneBytes(tree.Leaf(members[0].LeafIndex).EncryptionKey)
+	plan, err := tree.CreateUpdatePathSecrets(crypto, members[0].LeafIndex,
+		members[0].SignaturePriv, testGroupId())
+	if err != nil {
+		t.Fatalf("CreateUpdatePathSecrets: %v", err)
+	}
+	after := tree.Leaf(members[0].LeafIndex).EncryptionKey
+	if bytes.Equal(before, after) {
+		t.Fatalf("the leaf encryption key was not rotated")
+	}
+	// the leaf key must NOT be derivable from path_secret[0]: everyone who decrypts
+	// that secret would otherwise hold the sender's leaf private key.
+	_, fromPathSecret, err := DeriveNodeKeyPair(crypto, plan.PathSecrets[0])
+	if err != nil {
+		t.Fatalf("DeriveNodeKeyPair: %v", err)
+	}
+	if bytes.Equal(after, fromPathSecret) {
+		t.Fatalf("the leaf key is derived from path_secret[0]")
+	}
+	if len(plan.Private.EncryptionPriv) == 0 {
+		t.Fatalf("the plan's private state carries no leaf private key")
+	}
+	if plan.Private.LeafIndex != members[0].LeafIndex {
+		t.Fatalf("private state leaf index = %d", plan.Private.LeafIndex)
+	}
+	for i, x := range plan.Path {
+		if !bytes.Equal(plan.Private.PathSecrets[x], plan.PathSecrets[i]) {
+			t.Fatalf("private state is missing the path secret for node %d", x)
+		}
+	}
+	if err := plan.Private.Consistent(crypto, tree); err != nil {
+		t.Fatalf("Consistent: %v", err)
+	}
+}
+
+// TestCreateUpdatePathSecretsInASingleMemberGroup is the plan's third: a lone member's filtered
+// direct path is empty, so there is no node to claim and the commit leaf's parent_hash field is
+// the zero-length octet string rather than a digest of nothing.
+func TestCreateUpdatePathSecretsInASingleMemberGroup(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 1)
+	plan, err := tree.CreateUpdatePathSecrets(crypto, members[0].LeafIndex,
+		members[0].SignaturePriv, testGroupId())
+	if err != nil {
+		t.Fatalf("CreateUpdatePathSecrets: %v", err)
+	}
+	if len(plan.Path) != 0 {
+		t.Fatalf("path = %v, want empty", plan.Path)
+	}
+	if len(plan.CommitSecret) != crypto.HashSize() {
+		t.Fatalf("commit secret length = %d", len(plan.CommitSecret))
+	}
+	leaf := tree.Leaf(members[0].LeafIndex)
+	if leaf.LeafNodeSource != LeafNodeSourceCommit || len(leaf.ParentHash) != 0 {
+		t.Fatalf("a lone member's leaf must be a commit leaf with a zero-length parent hash, got source %d and %d bytes",
+			leaf.LeafNodeSource, len(leaf.ParentHash))
+	}
+}
+
+// treeHashOf is the section 7.8 hash of a whole tree, taken through the provider.
+func treeHashOf(t *testing.T, crypto CryptoProvider, tree *RatchetTree) []byte {
+	t.Helper()
+	hash, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	return hash
+}
+
+// testGroupContextOver is the serialized GroupContext of an epoch whose tree hashes to this,
+// which is the shape of the HPKE info task 20 seals every path secret under.
+//
+// Everything but the tree hash is fixed, so two contexts built by this helper differ only where
+// the trees they were taken over differ. That is the whole instrument: the ordering defect this
+// file is about is invisible unless the two contexts are distinguishable, and a helper that
+// varied an epoch number as well would make them differ for a reason that is not the tree's.
+func testGroupContextOver(t *testing.T, treeHash []byte) []byte {
+	t.Helper()
+	context := &GroupContext{
+		Version:                 ProtocolVersionMls10,
+		CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:                 testGroupId(),
+		Epoch:                   7,
+		TreeHash:                treeHash,
+		ConfirmedTranscriptHash: bytes.Repeat([]byte{0x77}, 32),
+	}
+	encoded, err := syntax.Marshal(context)
+	if err != nil {
+		t.Fatalf("Marshal(GroupContext): %v", err)
+	}
+	return encoded
+}
+
+// aFreshEncryptionKeyOtherThan is a well formed HPKE public key that is not the one handed in.
+func aFreshEncryptionKeyOtherThan(t *testing.T, crypto CryptoProvider, key HpkePublicKey) HpkePublicKey {
+	t.Helper()
+	for attempt := 0; attempt < 8; attempt += 1 {
+		_, other, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+		if err != nil {
+			t.Fatalf("DeriveKeyPair: %v", err)
+		}
+		if !bytes.Equal(other, key) {
+			return other
+		}
+	}
+	t.Fatalf("eight draws from the provider all answered the key they were meant to differ from")
+	return nil
+}
+
+// TestCreateUpdatePathSecretsLeavesTheTreeAtTheEpochItOpens is the ordering constraint the
+// architecture note names, asserted at the boundary task 18 owns.
+//
+// UpdatePath generation is split in two because the HPKE encryption context task 20 seals each
+// path secret under is the serialized GroupContext of the epoch the commit OPENS, and that
+// context's tree_hash is only computable once the path's public keys are in the tree. So what
+// this half owes its caller is a tree that has already moved: after this call, TreeHash is the
+// new epoch's tree hash and the GroupContext built from it is the one every peer will decrypt
+// against.
+//
+// An implementation that left the caller holding the previous epoch's tree -- one that worked on
+// a clone, or that answered the plan before installing what it had computed -- produces
+// ciphertexts every peer rejects, and it is invisible to any test where the two contexts are not
+// distinguished. So both are built here and compared, and the THIRD tree is built too: the
+// half-mutated one, direct path blanked and nothing put back, which is what a caller would hash
+// if the install had been left to it.
+//
+// The last sweep is what says the keys are actually inside that hash rather than merely
+// alongside it. Its positions come from the plan's own path rather than being picked, because a
+// sampled node is a node the defect can be at.
+func TestCreateUpdatePathSecretsLeavesTheTreeAtTheEpochItOpens(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, members := newTestTree(t, crypto, 8)
+	sender := members[3].LeafIndex
+
+	previous := tree.Clone()
+	// the tree mid-operation: the sender's own direct path blanked and nothing installed yet
+	halfway := tree.Clone()
+	if err := halfway.BlankDirectPath(sender); err != nil {
+		t.Fatalf("BlankDirectPath: %v", err)
+	}
+
+	plan, err := tree.CreateUpdatePathSecrets(crypto, sender, members[3].SignaturePriv, testGroupId())
+	if err != nil {
+		t.Fatalf("CreateUpdatePathSecrets: %v", err)
+	}
+	opened := treeHashOf(t, crypto, tree)
+	if stale := treeHashOf(t, crypto, previous); bytes.Equal(opened, stale) {
+		t.Fatalf("the tree hash after the call is the one it had before it, so the caller would build the new epoch's GroupContext out of the previous epoch's tree")
+	}
+	if mid := treeHashOf(t, crypto, halfway); bytes.Equal(opened, mid) {
+		t.Fatalf("the tree hash after the call is the hash of the blanked path with nothing installed, so the public keys this call computed are not in the tree it left behind")
+	}
+	// the two contexts task 20 has to tell apart, spelled out
+	if bytes.Equal(testGroupContextOver(t, opened), testGroupContextOver(t, treeHashOf(t, crypto, previous))) {
+		t.Fatalf("the GroupContext over the new tree and the one over the old tree serialize alike, so this test cannot see which of them an encryption used")
+	}
+
+	// every public key of the path is inside the hash the caller binds the epoch to
+	swept, hashed := 0, 0
+	for i, x := range plan.Path {
+		held := tree.ParentAt(x)
+		if held == nil {
+			t.Fatalf("node %d was not installed", x)
+		}
+		swapped := tree.Clone()
+		if err := swapped.SetParent(x, &ParentNode{
+			EncryptionKey: aFreshEncryptionKeyOtherThan(t, crypto, plan.PublicKeys[i]),
+			ParentHash:    cloneBytes(held.ParentHash),
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+		if bytes.Equal(treeHashOf(t, crypto, swapped), opened) {
+			t.Errorf("node %d's public key is not inside the tree hash the caller binds this epoch to", x)
+		}
+		swept += 1
+		// and so is the parent hash it carries, wherever there is one to move. The node at the
+		// top of the path carries the zero-length octet string, which is a value with no byte
+		// to flip rather than an exemption, so it is skipped and counted.
+		if len(held.ParentHash) == 0 {
+			continue
+		}
+		rehung := tree.Clone()
+		field := cloneBytes(held.ParentHash)
+		field[0] ^= 0xff
+		if err := rehung.SetParent(x, &ParentNode{
+			EncryptionKey: cloneBytes(held.EncryptionKey),
+			ParentHash:    field,
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+		if bytes.Equal(treeHashOf(t, crypto, rehung), opened) {
+			t.Errorf("node %d's parent hash is not inside the tree hash the caller binds this epoch to", x)
+		}
+		hashed += 1
+	}
+	// and the re-signed leaf, which is the other thing this call installed
+	releafed := tree.Clone()
+	leaf := tree.Leaf(sender).Clone()
+	leaf.EncryptionKey = aFreshEncryptionKeyOtherThan(t, crypto, leaf.EncryptionKey)
+	if err := releafed.SetLeaf(sender, leaf); err != nil {
+		t.Fatalf("SetLeaf: %v", err)
+	}
+	if bytes.Equal(treeHashOf(t, crypto, releafed), opened) {
+		t.Errorf("the sender's new leaf key is not inside the tree hash the caller binds this epoch to")
+	}
+	if swept == 0 || hashed == 0 {
+		t.Fatalf("the sweep read %d path nodes and %d parent hash fields; a zero in either is a direction this test did not reach",
+			swept, hashed)
+	}
+	t.Logf("%d path nodes and %d parent hash fields held inside the new epoch's tree hash", swept, hashed)
+}
+
+// updatePathChainOf reads the parent hash chain a tree CARRIES along one filtered direct path,
+// rung by rung: rung 0 is the leaf's field and rung i+1 is the field at steps[i].
+func updatePathChainOf(t *testing.T, tree *RatchetTree, sender LeafIndex, steps []PathStep) [][]byte {
+	t.Helper()
+	chain := make([][]byte, len(steps)+1)
+	leaf := tree.Leaf(sender)
+	if leaf == nil {
+		t.Fatalf("leaf %d is blank", sender)
+	}
+	chain[0] = cloneBytes(leaf.ParentHash)
+	for i, step := range steps {
+		parent := tree.ParentAt(step.Node)
+		if parent == nil {
+			t.Fatalf("node %d of the filtered path is blank", step.Node)
+		}
+		chain[i+1] = cloneBytes(parent.ParentHash)
+	}
+	return chain
+}
+
+// recomputeUpdatePathChain writes section 7.9's chain over the tree it is given and answers it in
+// updatePathChainOf's rungs.
+//
+// From the RFC's sentence rather than from treekem.go: "If P is the root, then the parent_hash
+// field is set to a zero-length octet string. Otherwise, parent_hash is the parent hash of the
+// next node after P on the filtered direct path", and section 7.9.1's "the parent_hash field of
+// D is equal to the parent hash of P with copath child S. This is the case even when the node D
+// is a leaf node." That is a recurrence from the top down, and it MUTATES the tree it walks --
+// each node's field has to be final before the node below it can be hashed -- so every caller
+// below hands it a clone.
+func recomputeUpdatePathChain(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	steps []PathStep) [][]byte {
+	t.Helper()
+	chain := make([][]byte, len(steps)+1)
+	carried := []byte{}
+	for i := len(steps) - 1; i >= 0; i -= 1 {
+		parent := tree.ParentAt(steps[i].Node)
+		if parent == nil {
+			t.Fatalf("node %d of the filtered path is blank", steps[i].Node)
+		}
+		parent.ParentHash = carried
+		chain[i+1] = cloneBytes(carried)
+		hash, err := tree.ParentHash(crypto, steps[i].Node, steps[i].CopathChild)
+		if err != nil {
+			t.Fatalf("ParentHash(%d, %d): %v", steps[i].Node, steps[i].CopathChild, err)
+		}
+		carried = hash
+	}
+	chain[0] = cloneBytes(carried)
+	return chain
+}
+
+// TestTheUpdatePathParentHashChainMovesEverythingBelowANodeAndNothingAbove is the dependency
+// structure of the chain, swept.
+//
+// Two properties, and the second is what makes the first worth stating. The chain a commit
+// installs is the one section 7.9's recurrence produces from the root down -- that is asserted
+// elementwise, so a chain computed in the other direction, or one that stopped short of the
+// leaf, is a mismatch at a named rung rather than a verdict. And the recurrence really is a
+// chain: a fresh key at one node of the path moves the parent hash of every rung BELOW it and no
+// rung at or above it, because the hash at a rung above covers the OTHER child's subtree.
+//
+// The second half is the one that separates a real chain from a set of digests that merely
+// verify. An implementation that hashed each node against a constant instead of against the node
+// above it produces a full length chain over which VerifyParentHashes has nothing to say at the
+// nodes it never links -- and every rung of it would be insensitive to a change higher up, which
+// is exactly what this sweep counts.
+//
+// Both the positions and the senders are DERIVED. Every width from two to eight, every member of
+// each as the sender, and every rung of each path as the node that changes; a sender whose
+// filtered path is shorter than two nodes has no above and below to separate and is SKIPPED with
+// a counter rather than excluded by a width, because which senders those are is a property of
+// the filter and changes when the filter does.
+func TestTheUpdatePathParentHashChainMovesEverythingBelowANodeAndNothingAbove(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	senders, moved, held, tooShort := 0, 0, 0, 0
+	for width := uint32(2); width <= 8; width += 1 {
+		for at := uint32(0); at < width; at += 1 {
+			tree, members := newTestTree(t, crypto, width)
+			sender := members[at].LeafIndex
+			plan, err := tree.CreateUpdatePathSecrets(crypto, sender, members[at].SignaturePriv, testGroupId())
+			if err != nil {
+				t.Fatalf("width=%d sender=%d CreateUpdatePathSecrets: %v", width, sender, err)
+			}
+			steps, err := tree.filteredPathSteps(sender)
+			if err != nil {
+				t.Fatalf("width=%d sender=%d filteredPathSteps: %v", width, sender, err)
+			}
+			if len(steps) != len(plan.Path) {
+				t.Fatalf("width=%d sender=%d the plan carries %d nodes and the tree's filtered path has %d",
+					width, sender, len(plan.Path), len(steps))
+			}
+			if len(steps) < 2 {
+				tooShort += 1
+				continue
+			}
+			senders += 1
+			// the chain as installed is the chain section 7.9's recurrence produces
+			installed := updatePathChainOf(t, tree, sender, steps)
+			original := recomputeUpdatePathChain(t, crypto, tree.Clone(), steps)
+			for rung := range original {
+				if !bytes.Equal(installed[rung], original[rung]) {
+					t.Fatalf("width=%d sender=%d rung %d of the installed chain is %x and section 7.9's recurrence gives %x",
+						width, sender, rung, installed[rung], original[rung])
+				}
+			}
+			if len(original[len(steps)]) != 0 {
+				t.Errorf("width=%d sender=%d the node at the top of the filtered path carries %d bytes, and section 7.9 gives it the zero-length octet string",
+					width, sender, len(original[len(steps)]))
+			}
+			for k := range steps {
+				changed := tree.Clone()
+				node := changed.ParentAt(steps[k].Node)
+				if node == nil {
+					t.Fatalf("width=%d sender=%d node %d is blank", width, sender, steps[k].Node)
+				}
+				if err := changed.SetParent(steps[k].Node, &ParentNode{
+					EncryptionKey: aFreshEncryptionKeyOtherThan(t, crypto, node.EncryptionKey),
+					ParentHash:    cloneBytes(node.ParentHash),
+				}); err != nil {
+					t.Fatalf("SetParent(%d): %v", steps[k].Node, err)
+				}
+				after := recomputeUpdatePathChain(t, crypto, changed, steps)
+				for rung := range after {
+					// rung k is the parent hash OF node steps[k], so it and every rung under
+					// it are downstream of that node's key and every rung above it is not
+					shouldMove := rung <= k
+					same := bytes.Equal(original[rung], after[rung])
+					if shouldMove && same {
+						t.Errorf("width=%d sender=%d a fresh key at node %d (rung %d of the path) left rung %d of the chain unchanged, and rung %d is below it",
+							width, sender, steps[k].Node, k, rung, rung)
+					}
+					if !shouldMove && !same {
+						t.Errorf("width=%d sender=%d a fresh key at node %d (rung %d of the path) moved rung %d of the chain, and rung %d is at or above it",
+							width, sender, steps[k].Node, k, rung, rung)
+					}
+					if shouldMove {
+						moved += 1
+					} else {
+						held += 1
+					}
+				}
+			}
+		}
+	}
+	if senders == 0 || moved == 0 || held == 0 {
+		t.Fatalf("the sweep ran %d senders and made %d must-move and %d must-hold observations, with %d paths too short; a zero in any of the three is a direction this test did not reach",
+			senders, moved, held, tooShort)
+	}
+	t.Logf("%d senders, %d must-move and %d must-hold observations, %d paths too short to have an above and a below",
+		senders, moved, held, tooShort)
 }

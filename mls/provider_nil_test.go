@@ -108,6 +108,17 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*RatchetTree).VerifyParentHashes", call: func() error {
 			return (&RatchetTree{}).VerifyParentHashes(nil)
 		}},
+		// task 18's path generation, on the same zero valued tree and for the same reason. A
+		// tree with no nodes has no leaf 0, so Leaf(sender) answers nil and a body that read its
+		// receiver before its provider would answer ErrLeafIndexOutOfRange -- which sends the
+		// caller to re-derive an index that was never the problem, over a provider it never
+		// passed. It is also the one member of this class that MUTATES its receiver, so an order
+		// that reached the tree first would blank a member's direct path on the way to reporting
+		// a fault the caller could not have caused.
+		{name: "(*RatchetTree).CreateUpdatePathSecrets", call: func() error {
+			_, err := (&RatchetTree{}).CreateUpdatePathSecrets(nil, 0, nil, nil)
+			return err
+		}},
 		// treekem.go's two, on the zero valued private state, which is the receiver that
 		// separates the two orders these bodies could be written in. A zero TreeKEMPrivate has
 		// leaf index 0, so node 0 IS its own leaf: a NodePrivateKey that looked at its receiver
