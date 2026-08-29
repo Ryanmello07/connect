@@ -153,3 +153,113 @@ func VerifyAuthenticatedContent(crypto CryptoProvider, pub SignaturePublicKey,
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// the membership tag, RFC 9420 section 6.2
+// ---------------------------------------------------------------------------
+
+// errMissingMembershipTag is ValSem007 in the validation plan's catalogue, and it is a stand
+// in on exactly errFramedContentBadSignature's terms: that plan owns the single declaration
+// site for the exported ErrMissingMembershipTag, the name has not landed in this package yet,
+// and TestNoValidationOwnedNameHasLandedBesideItsStandIn fails on the commit that lands the
+// exported twin beside this one. When it lands, this becomes ValSem(ValSem007,
+// ErrMissingMembershipTag) and every stand in of this file goes in that same commit.
+//
+// It is its own value rather than a spelling of errBadMembershipTag, and the separation is the
+// rule rather than a nicety: "the sender sent no tag" and "the tag does not verify" are two
+// different messages to a receiver -- the first is a message no member of any group could have
+// produced, the second is a message some member of some group produced under another key -- and
+// RFC 9420 gives them two codes because a validator that collapsed them cannot say which of its
+// rules refused. What a caller does about either is the same and is not the point.
+var errMissingMembershipTag = errors.New("mls: public message carries no membership tag")
+
+// errBadMembershipTag is ValSem008, on the same terms.
+//
+// Every failure of the comparison collapses into this one value, for the reason
+// errFramedContentBadSignature's comment gives: a caller that could tell a wrong key from a
+// wrong preimage from a tag of the wrong length learns which of its guesses was closest, and
+// has no branch to take on any of the three other than rejecting the message.
+var errBadMembershipTag = errors.New("mls: membership tag does not verify")
+
+// ComputeMembershipTag is MAC(membership_key, AuthenticatedContentTBM), RFC 9420 section 6.2:
+// the tag a member attaches to a PublicMessage to say that it came from inside the group.
+//
+// The key is membership_key and NOT confirmation_key. The two are adjacent DeriveSecret calls
+// over one epoch secret, so they are the same length and indistinguishable from random, and a
+// swap produces a perfectly well formed tag that this implementation would also accept back
+// from itself -- there is no input to this function that separates them. What separates them is
+// the membership_tag mlswg published in message-protection.json, which
+// TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver compares against.
+//
+// The preimage is AuthenticatedContentTBMBytes' and is not rebuilt here, so everything that
+// function's comment says about the wire format, the auth data and the group context is the
+// property of this tag too.
+//
+// The provider is checked before anything else is read, which is SignAuthenticatedContent's
+// discipline: a body that built its preimage first would answer ErrUnknownSenderType or
+// ErrMissingGroupContext to a caller whose actual mistake was passing no provider.
+func ComputeMembershipTag(crypto CryptoProvider, membershipKey []byte,
+	authContent *AuthenticatedContent, groupContext []byte) ([]byte, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the tag is the provider's mac", ErrNilCryptoProvider)
+	}
+	tbm, err := AuthenticatedContentTBMBytes(authContent, groupContext)
+	if err != nil {
+		return nil, err
+	}
+	return crypto.Mac(membershipKey, tbm), nil
+}
+
+// verifyMembershipTag is ValSem007 and ValSem008: the membership_tag a PublicMessage carries is
+// present, and it is the one this epoch's membership_key produces over the
+// AuthenticatedContentTBM the RECEIVER reassembled.
+//
+// It answers an error and never a bool, and that is guardrail G7 rather than a house style. A
+// false membership tag is FATAL TO THE MESSAGE: this is the only authentication a member's
+// PublicMessage carries besides the signature, so a caller that logged the refusal and carried
+// on would be applying a proposal or a commit that no member of the group sent. p7 is the
+// caller -- it is where ValSem008 is raised on the receive path -- and the obligation it
+// inherits is written here because this is the function it will reach:
+//
+//	p7 MUST RETURN on this refusal rather than logging it and continuing.
+//
+// The obligation is stated rather than only enforced because p7 has a second door into the same
+// rule. (*KeySchedule).VerifyMembershipTag answers a BOOL, by design, since p4 owns the key
+// schedule and never sees a framing type; a p7 that reaches for that one instead is handed the
+// one result shape a caller can ignore by not looking at it, and this package has shipped three
+// authentication bypasses whose common shape was exactly that. Whichever door p7 uses, a
+// membership tag that does not verify ends the message.
+//
+// The comparison is CryptoProvider.MacVerify and nothing else, which is guardrail G8: it
+// reaches crypto/subtle.ConstantTimeCompare, and it refuses a length mismatch AHEAD of the
+// comparison rather than comparing as much of the tag as fits -- a prefix comparison accepts
+// every truncation of a valid tag, which is a forgery an attacker finds in 256 tries.
+// bytes.Equal, hmac.Equal and bytes.HasPrefix all answer the same bool here and none of them is
+// this; the package's derived comparator gate reads every comparison in this file's source and
+// finds eighteen such names, so there is no spelling that routes around it. The bool MacVerify
+// answers is converted in the same expression that produces it and never leaves this function.
+//
+// The absent tag is refused before the preimage is built, and the refusal is written on the
+// LENGTH rather than on == nil, which is emptyByteSpellings' rule: a decoder that read an empty
+// opaque<V> hands back a slice that is non nil and has capacity, and a guard spelled == nil
+// accepts it. That input is a PublicMessage whose membership_tag field is present and empty --
+// wire legal, and a message no member could have produced.
+func verifyMembershipTag(crypto CryptoProvider, membershipKey []byte,
+	authContent *AuthenticatedContent, groupContext []byte, tag []byte) error {
+
+	if crypto == nil {
+		return fmt.Errorf("%w: the comparison is the provider's", ErrNilCryptoProvider)
+	}
+	if len(tag) == 0 {
+		return errMissingMembershipTag
+	}
+	tbm, err := AuthenticatedContentTBMBytes(authContent, groupContext)
+	if err != nil {
+		return err
+	}
+	if !crypto.MacVerify(membershipKey, tbm, tag) {
+		return errBadMembershipTag
+	}
+	return nil
+}

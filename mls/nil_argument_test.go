@@ -375,6 +375,12 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err := FramedContentTBSBytes(WireFormatPrivateMessage, nil, framingTestGroupContext(t))
 			return err
 		}},
+		// the membership tag preimage, which dereferences its message at its first statement
+		// and so is the same shape one layer over
+		"AuthenticatedContentTBMBytes(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
+			_, err := AuthenticatedContentTBMBytes(nil, framingTestGroupContext(t))
+			return err
+		}},
 		"VerifyAuthenticatedContent(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
 			_, pub, err := crypto.SignatureKeyPair()
 			if err != nil {

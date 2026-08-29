@@ -594,6 +594,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// running the default limit could verify -- which for a commit is a message the group
 		// cannot apply and cannot advance its transcript without.
 		"framing_preimage.go: syntax.Marshal(tbs)",
+		// section 6.2's AuthenticatedContentTBM, the fourth preimage of that file and the one
+		// the membership tag is taken over. It is the only writer opened in that file rather
+		// than a structure handed to syntax.Marshal, and AuthenticatedContentTBMBytes' own
+		// comment says why: its first half IS the FramedContentTBS above, already serialized,
+		// so a structure here would assemble that preimage a second time. Same default limit
+		// and the same argument for it -- the TBS it inlines was built under the default, the
+		// auth data it appends is a signature and a MAC, and a membership tag taken over a
+		// preimage allowed past MaxVectorLength is one no peer running the default limit could
+		// have computed, which for a member's PublicMessage is a message the group drops.
+		"framing_preimage.go: syntax.NewWriter()",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
@@ -1385,6 +1395,15 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// TestTheFramedContentSignatureIsTheOneMlswgPublished holds it to signatures this package
 	// did not compute, which is the reading a provider of its own cannot pass at all.
 	"VerifyAuthenticatedContent": "answers an error and no bytes, so the tagging provider has nothing in the answer to flip",
+
+	// framing's ValSem007 and ValSem008, on exactly those terms. It answers an error, and the
+	// one provider method it reaches is MacVerify, which answers a bool the tagging wrapper has
+	// nothing to flip in. It is not unheld: TestProviderHasNoRemainingStubs moves its key, its
+	// message, its group context and its tag and requires each to change the verdict; and
+	// TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver puts tags mlswg
+	// published through it, which a verifier reaching for a provider of its own could not pass
+	// at a suite whose mac is not this one.
+	"verifyMembershipTag": "answers an error and no bytes, and reaches only MacVerify, which the tagging provider passes through",
 }
 
 // A construction handed a provider computes with that provider and not with one of its
@@ -1687,6 +1706,24 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("SignAuthenticatedContent: %v", signErr)
 			}
 			return authContent.Auth.Signature
+		}},
+		// section 6.2's membership tag. Its whole answer is one mac through the provider, so a
+		// body that computed the hmac itself hands back the same bytes over a wrapper that
+		// flips every answer -- which is exactly the defect the key schedule's two tag methods
+		// are held to next door, at the layer that owns the key rather than the preimage.
+		{name: "ComputeMembershipTag", call: func(crypto CryptoProvider) []byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the membership tag row reads: %v", signErr)
+			}
+			tag, tagErr := ComputeMembershipTag(crypto,
+				bytes.Repeat([]byte{0x6b}, crypto.HashSize()), authContent, groupContext)
+			if tagErr != nil {
+				t.Fatalf("ComputeMembershipTag: %v", tagErr)
+			}
+			return tag
 		}},
 	} {
 		covered = append(covered, testCase.name)

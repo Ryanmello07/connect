@@ -14,6 +14,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/token"
 	"maps"
 	"reflect"
 	"slices"
@@ -111,6 +113,27 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 		t.Fatalf("sign the message the VerifyAuthenticatedContent row reads: %v", err)
 	}
 	arguments["VerifyAuthenticatedContent.authContent"] = signed
+
+	// the membership tag pair. The key is at the provider's own hash width rather than a
+	// written down 32 octets, for framingStubGroupContext's reason: a key whose length was a
+	// constant would be the same bytes over a provider whose KDF.Nh is 48, and the rows built
+	// on it would state nothing about the width the caller is running at.
+	membershipKey := bytes.Repeat([]byte{0x6b}, fixture.HashSize())
+	arguments["ComputeMembershipTag.membershipKey"] = membershipKey
+	arguments["ComputeMembershipTag.authContent"] = signed
+	arguments["ComputeMembershipTag.groupContext"] = encodedGroupContext
+	arguments["verifyMembershipTag.membershipKey"] = membershipKey
+	arguments["verifyMembershipTag.authContent"] = signed
+	arguments["verifyMembershipTag.groupContext"] = encodedGroupContext
+	// the tag the verify row is handed has to be a REAL one over these arguments, for the
+	// reason the signature above is: a base call that refused would leave every perturbation
+	// below it comparing one refusal against another and reporting a verifier that reads none
+	// of its inputs as observing all of them.
+	tag, err := ComputeMembershipTag(fixture, membershipKey, signed, encodedGroupContext)
+	if err != nil {
+		t.Fatalf("compute the membership tag the verify row reads: %v", err)
+	}
+	arguments["verifyMembershipTag.tag"] = tag
 }
 
 // providerFramedContentPerturbations moves the epoch of a framed content and nothing else.
@@ -1199,6 +1222,16 @@ func TestTheFramingRefusalsAnswerTheirOwnSentinels(t *testing.T) {
 				errNilAuthenticatedContent}},
 		{name: "errMissingConfirmationTag", value: errMissingConfirmationTag,
 			other: []error{errFramedContentBadSignature, errBadSignature, ErrCryptoBadSignature}},
+		// ValSem007 and ValSem008. Each names the other, because "the sender sent no tag" and
+		// "the tag does not verify" are the pair a validator has to keep apart, and each names
+		// the signature refusal next door, because a caller branching on ValSem010 must not be
+		// answered yes by a membership tag that failed.
+		{name: "errMissingMembershipTag", value: errMissingMembershipTag,
+			other: []error{errBadMembershipTag, errFramedContentBadSignature, errBadSignature,
+				errMissingConfirmationTag, ErrCryptoBadSignature, ErrSenderNotMember}},
+		{name: "errBadMembershipTag", value: errBadMembershipTag,
+			other: []error{errMissingMembershipTag, errFramedContentBadSignature, errBadSignature,
+				errMissingConfirmationTag, ErrCryptoBadSignature, ErrSenderNotMember}},
 	} {
 		if one.value == nil || one.value.Error() == "" {
 			t.Fatalf("%s is nil or has an empty message", one.name)
@@ -1376,4 +1409,768 @@ func TestVerifyAnswersThePreimagesRefusalVerbatimAndCollapsesEverySignatureFailu
 	if len(forged) < 5 {
 		t.Fatalf("%d ways of failing the signature were run, and the empty spellings alone are three", len(forged))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// AuthenticatedContentTBM and the membership tag
+// ---------------------------------------------------------------------------
+
+// framingSignedOfEveryContentType signs one message per REGISTERED content type and answers
+// them keyed by it, with a commit's confirmation tag filled in the way its committer would.
+//
+// Derived against the registry rather than written as three rows, which is this package's rule
+// after fourteen hand written class lists understated the class they named. The arms are not
+// interchangeable here: a commit's FramedContentAuthData is a signature FOLLOWED BY a
+// confirmation tag and every other arm's is a signature alone, so a preimage that stopped at
+// the signature is invisible from an application message and visible from a commit. A fourth
+// content type registered by a later task joins every sweep below by existing, and until
+// somebody builds a message for it these fail rather than covering part of the registry
+// quietly.
+func framingSignedOfEveryContentType(t *testing.T, signed framingSigned) map[ContentType]*AuthenticatedContent {
+	t.Helper()
+	contents := map[ContentType]*FramedContent{
+		ContentTypeApplication: framingTestMemberContent(),
+		ContentTypeProposal:    framingTestProposalContent(),
+		ContentTypeCommit:      framingTestCommitContent(),
+	}
+	registered := map[ContentType]string{}
+	for name, code := range registryConstantsOfType(t, "ContentType") {
+		registered[ContentType(code)] = name
+	}
+	built := map[ContentType]*AuthenticatedContent{}
+	for contentType, name := range registered {
+		content, held := contents[contentType]
+		if !held {
+			t.Fatalf("%s is a registered content type and no message is built for it, so every sweep reading this runs over a subset of the registry",
+				name)
+		}
+		if content.ContentType != contentType {
+			t.Fatalf("the message built for %s carries content type %d", name, content.ContentType)
+		}
+		authContent, err := SignAuthenticatedContent(signed.crypto, signed.priv,
+			WireFormatPublicMessage, content, signed.groupContext)
+		if err != nil {
+			t.Fatalf("sign a %s: %v", name, err)
+		}
+		// a commit's auth data carries a confirmation tag as well as a signature, and the
+		// encoder refuses to write one without it. The committer fills it in once it has
+		// advanced the transcript; here it is a value of the provider's own tag width and
+		// nothing more, because what these sweeps are about is that it is COVERED.
+		if contentType == ContentTypeCommit {
+			authContent.Auth.ConfirmationTag = bytes.Repeat([]byte{0x77}, signed.crypto.HashSize())
+		}
+		built[contentType] = authContent
+	}
+	for contentType := range contents {
+		if _, isRegistered := registered[contentType]; !isRegistered {
+			t.Fatalf("a message is built for content type %d, which no registry of this package holds", contentType)
+		}
+	}
+	return built
+}
+
+// TestTheMembershipTagPreimageIsTheSignaturePreimageFollowedByTheAuthData holds the layout of
+// AuthenticatedContentTBM at every registered content type.
+//
+// The two halves are asserted separately rather than as one byte comparison, because they fail
+// for different reasons and a reader has to be told which. A preimage that does not BEGIN with
+// the FramedContentTBS is one whose membership tag covers a different message than its
+// signature does; a preimage whose tail is not the auth data is one whose membership tag does
+// not cover the authenticators, which for a commit means the confirmation tag is outside the
+// MAC and a tag can be lifted from one commit onto another.
+//
+// The auth data is required to be non empty, and that line is not decoration. Without it a
+// preimage that stopped at the FramedContentTBS satisfies the prefix half, satisfies the tail
+// half against an empty expectation, and reports PASS.
+func TestTheMembershipTagPreimageIsTheSignaturePreimageFollowedByTheAuthData(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	for contentType, authContent := range framingSignedOfEveryContentType(t, signed) {
+		at := fmt.Sprintf("content type %d", contentType)
+		tbm, err := AuthenticatedContentTBMBytes(authContent, signed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: the tag preimage: %v", at, err)
+		}
+		tbs, err := FramedContentTBSBytes(authContent.WireFormat, &authContent.Content, signed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: the signature preimage: %v", at, err)
+		}
+		w := syntax.NewWriter()
+		if err := authContent.Auth.MarshalMLS(w, contentType); err != nil {
+			t.Fatalf("%s: encode the auth data: %v", at, err)
+		}
+		auth, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("%s: the auth data bytes: %v", at, err)
+		}
+		if len(auth) == 0 {
+			t.Fatalf("%s: the auth data encoded to nothing, so the tail comparison below holds for a preimage that stops at the signature preimage",
+				at)
+		}
+		if !bytes.HasPrefix(tbm, tbs) {
+			t.Errorf("%s: the tag preimage is %x and does not begin with the signature preimage %x; a membership tag over a preimage that is not the signature's own covers a different message than the signature does",
+				at, tbm, tbs)
+			continue
+		}
+		if tail := tbm[len(tbs):]; !bytes.Equal(tail, auth) {
+			t.Errorf("%s: the tag preimage carries %x after the signature preimage and the auth data is %x; RFC 9420 section 6.1 puts the FramedContentAuthData there, so a commit's confirmation tag is inside what the membership tag authenticates",
+				at, tail, auth)
+		}
+	}
+}
+
+// TestTheMembershipTagPreimageBindsEveryByteOfTheGroupContext is the epoch binding, derived
+// over the LENGTH of the context rather than sampled at a position somebody chose.
+//
+// What it refuses is the omission senderBindsGroupContext calls the most expensive one
+// available here, one layer up: a TBM assembled without the group context is a membership tag
+// that verifies in EVERY epoch of the group, so a proposal a member sent in epoch 4 is a
+// proposal any peer can replay into epoch 9 and every receiver accepts. That preimage is well
+// formed, it agrees with itself in both directions, and no round trip property in this package
+// can see it.
+//
+// Every byte and not the epoch field alone, because the group id, the tree hash and the
+// confirmed transcript hash are in there for reasons of their own -- two groups, two trees and
+// two histories -- and a preimage that inlined a truncated context binds only some of them.
+func TestTheMembershipTagPreimageBindsEveryByteOfTheGroupContext(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	if len(signed.groupContext) == 0 {
+		t.Fatal("the fixture's group context is empty, so the sweep below runs over nothing")
+	}
+	base, err := AuthenticatedContentTBMBytes(signed.authContent, signed.groupContext)
+	if err != nil {
+		t.Fatalf("the tag preimage: %v", err)
+	}
+	for at := range signed.groupContext {
+		moved := bytes.Clone(signed.groupContext)
+		moved[at] ^= 0xff
+		tbm, err := AuthenticatedContentTBMBytes(signed.authContent, moved)
+		if err != nil {
+			t.Fatalf("byte %d of %d moved: %v", at, len(signed.groupContext), err)
+		}
+		if bytes.Equal(tbm, base) {
+			t.Errorf("byte %d of the %d byte group context does not reach the tag preimage, so a membership tag taken under this epoch is a valid tag under a group context that differs there",
+				at, len(signed.groupContext))
+		}
+	}
+	// and the same statement in the direction a caller reaches by passing nothing: a member's
+	// preimage cannot be built without one at all, rather than being built one field shorter.
+	for _, empty := range emptyByteSpellings() {
+		if _, err := AuthenticatedContentTBMBytes(signed.authContent, empty.value); !errors.Is(err, ErrMissingGroupContext) {
+			t.Errorf("a member's tag preimage was built over a group context that is %s: got %v, want ErrMissingGroupContext",
+				empty.what, err)
+		}
+	}
+}
+
+// TestTheMembershipTagPreimageBindsEveryByteOfTheAuthData is the other half, derived over the
+// lengths of the authenticators the message actually carries.
+//
+// The fields are read off the VALUE rather than listed per content type: whatever a
+// FramedContentAuthData is carrying at this arm is swept, so a task that gives that structure a
+// third authenticator joins this sweep by filling it in. What the sweep refuses is a TBM built
+// from the FramedContent rather than from the AuthenticatedContent -- the shape that reads like
+// the obvious one, since the tag travels beside the content on the wire -- which authenticates
+// neither the signature nor the confirmation tag.
+//
+// The commit arm is required to have been swept, because it is the only one that carries a
+// confirmation tag and it is the arm the whole property is about.
+func TestTheMembershipTagPreimageBindsEveryByteOfTheAuthData(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	for contentType, authContent := range framingSignedOfEveryContentType(t, signed) {
+		at := fmt.Sprintf("content type %d", contentType)
+		base, err := AuthenticatedContentTBMBytes(authContent, signed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: the tag preimage: %v", at, err)
+		}
+		swept := map[string]int{}
+		for name, field := range map[string]*[]byte{
+			"the signature":        &authContent.Auth.Signature,
+			"the confirmation tag": &authContent.Auth.ConfirmationTag,
+		} {
+			original := bytes.Clone(*field)
+			for position := range original {
+				moved := bytes.Clone(original)
+				moved[position] ^= 0xff
+				*field = moved
+				tbm, err := AuthenticatedContentTBMBytes(authContent, signed.groupContext)
+				*field = original
+				if err != nil {
+					t.Fatalf("%s: byte %d of %s moved: %v", at, position, name, err)
+				}
+				if bytes.Equal(tbm, base) {
+					t.Errorf("%s: byte %d of %s does not reach the tag preimage, so the membership tag does not cover it",
+						at, position, name)
+				}
+				swept[name]++
+			}
+		}
+		if swept["the signature"] == 0 {
+			t.Fatalf("%s: the fixture carries no signature, so this sweep ran over nothing", at)
+		}
+		if contentType == ContentTypeCommit && swept["the confirmation tag"] == 0 {
+			t.Fatalf("%s: the commit fixture carries no confirmation tag, so the one arm this sweep exists for was never run", at)
+		}
+	}
+}
+
+// TestTheMembershipTagPreimageBindsTheWireFormat runs the whole registry rather than the two
+// code points a reader pictures, and asks for the preimages to be pairwise distinct.
+//
+// Distinctness rather than a layout assertion, because what the wire format is in the preimage
+// FOR is that no two of them produce the same authenticated bytes: a PublicMessage replayed as
+// a PrivateMessage is the substitution section 6.1 puts the field there to refuse. A TBM built
+// under a wire format the caller named, or under a constant, is the same bytes for every entry
+// of the registry and fails here.
+func TestTheMembershipTagPreimageBindsTheWireFormat(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	registered := registryConstantsOfType(t, "WireFormat")
+	seen := map[string]string{}
+	for name, code := range registered {
+		lifted := *signed.authContent
+		lifted.WireFormat = WireFormat(code)
+		tbm, err := AuthenticatedContentTBMBytes(&lifted, signed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: the tag preimage: %v", name, err)
+		}
+		if other, collided := seen[string(tbm)]; collided {
+			t.Errorf("the tag preimage under %s is byte for byte the one under %s, so a membership tag over a %s is a valid membership tag over the same content sent as a %s",
+				name, other, other, name)
+			continue
+		}
+		seen[string(tbm)] = name
+	}
+	if len(seen) != len(registered) {
+		t.Errorf("%d of the %d registered wire formats produced a distinct tag preimage", len(seen), len(registered))
+	}
+}
+
+// TestVerifyMembershipTagRefusesEveryTagButItsOwn is ValSem007 and ValSem008, with every
+// refusal derived over the length or the shape of the thing it alters.
+//
+// The sampled version of this test is the one this project has already been burned by twice: a
+// suite that flips bit zero of byte zero is satisfied by a verifier that reads byte zero and
+// stops, and a suite with no length case in it at all is satisfied by a verifier that accepts
+// every truncation of a valid tag -- a forgery an attacker finds by trying tags one octet long.
+// So the bit sweep is every bit of every byte, and the length sweep is every length shorter
+// than its own as well as several longer.
+//
+// The absent tag is swept over all three spellings of absent, for emptyByteSpellings' reason: a
+// guard written on == nil accepts the empty non nil slice a decoder hands back after reading an
+// empty opaque<V>, which is a PublicMessage whose membership_tag field is present and empty.
+func TestVerifyMembershipTagRefusesEveryTagButItsOwn(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	membershipKey := bytes.Repeat([]byte{0x5a}, signed.crypto.HashSize())
+	tag, err := ComputeMembershipTag(signed.crypto, membershipKey, signed.authContent, signed.groupContext)
+	if err != nil {
+		t.Fatalf("compute the tag: %v", err)
+	}
+	if len(tag) != signed.crypto.HashSize() {
+		t.Fatalf("the tag is %d bytes and this provider's mac is %d", len(tag), signed.crypto.HashSize())
+	}
+	// the positive first: without it every refusal below is satisfied by a verifier that
+	// refuses everything, which is the shape a suite of nothing but negatives cannot see.
+	if err := verifyMembershipTag(signed.crypto, membershipKey, signed.authContent,
+		signed.groupContext, tag); err != nil {
+		t.Fatalf("the verifier refused the tag ComputeMembershipTag produced over the same message under the same key: %v", err)
+	}
+	for _, empty := range emptyByteSpellings() {
+		if err := verifyMembershipTag(signed.crypto, membershipKey, signed.authContent,
+			signed.groupContext, empty.value); !errors.Is(err, errMissingMembershipTag) {
+			t.Errorf("a tag that is %s answered %v, want the ValSem007 sentinel", empty.what, err)
+		}
+	}
+	for at := range tag {
+		for bit := 0; bit < 8; bit++ {
+			flipped := bytes.Clone(tag)
+			flipped[at] ^= 1 << bit
+			if err := verifyMembershipTag(signed.crypto, membershipKey, signed.authContent,
+				signed.groupContext, flipped); !errors.Is(err, errBadMembershipTag) {
+				t.Errorf("bit %d of byte %d of the tag flipped answered %v, want the ValSem008 sentinel", bit, at, err)
+			}
+		}
+	}
+	for n := 1; n < len(tag); n++ {
+		if err := verifyMembershipTag(signed.crypto, membershipKey, signed.authContent,
+			signed.groupContext, bytes.Clone(tag)[:n]); !errors.Is(err, errBadMembershipTag) {
+			t.Errorf("a tag truncated to %d of %d bytes answered %v; a prefix comparison accepts every truncation of a valid tag",
+				n, len(tag), err)
+		}
+	}
+	// longer as well as shorter, and over a CLONE rather than an append onto the tag itself:
+	// append on a slice with spare capacity writes through into the caller's array, which turns
+	// a refusal row into a row that also moved the value every other row is built from.
+	for n := 1; n <= 4; n++ {
+		extended := append(bytes.Clone(tag), bytes.Repeat([]byte{0x00}, n)...)
+		if err := verifyMembershipTag(signed.crypto, membershipKey, signed.authContent,
+			signed.groupContext, extended); !errors.Is(err, errBadMembershipTag) {
+			t.Errorf("a tag %d bytes longer than its own answered %v", n, err)
+		}
+	}
+	// the neighbouring key, over every byte of it. confirmation_key and membership_key are
+	// adjacent DeriveSecret calls over one parent, so they are the same width and a swap
+	// produces a tag just as well formed; nothing about the SHAPE of an answer separates them.
+	for at := range membershipKey {
+		other := bytes.Clone(membershipKey)
+		other[at] ^= 0xff
+		if err := verifyMembershipTag(signed.crypto, other, signed.authContent,
+			signed.groupContext, tag); !errors.Is(err, errBadMembershipTag) {
+			t.Errorf("the tag verified under a key differing at byte %d of %d: %v", at, len(membershipKey), err)
+		}
+	}
+	// the neighbouring epoch, which is what the group context is in the preimage for
+	otherEpoch := bytes.Clone(signed.groupContext)
+	otherEpoch[len(otherEpoch)-1] ^= 0xff
+	if err := verifyMembershipTag(signed.crypto, membershipKey, signed.authContent,
+		otherEpoch, tag); !errors.Is(err, errBadMembershipTag) {
+		t.Errorf("the tag verified under another epoch's group context: %v", err)
+	}
+	// and a message no preimage can be assembled for is answered by the PREIMAGE's refusal
+	// rather than by ValSem008, for VerifyAuthenticatedContent's reason: there is no comparison
+	// to have failed, so telling the caller its tag did not verify sends it to check a tag
+	// nothing checked.
+	external := framingTestProposalContent()
+	external.Sender = Sender{SenderType: SenderTypeExternal}
+	lifted := &AuthenticatedContent{
+		WireFormat: WireFormatPublicMessage,
+		Content:    *external,
+		Auth:       signed.authContent.Auth,
+	}
+	if err := verifyMembershipTag(signed.crypto, membershipKey, lifted,
+		signed.groupContext, tag); !errors.Is(err, ErrUnexpectedGroupContext) {
+		t.Errorf("a sender type that binds no group context answered %v, want the preimage's own refusal", err)
+	}
+	if err := verifyMembershipTag(signed.crypto, membershipKey, nil,
+		signed.groupContext, tag); !errors.Is(err, errNilAuthenticatedContent) {
+		t.Errorf("a nil message answered %v, want the nil message refusal", err)
+	}
+}
+
+// TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver is the known answer test
+// for this task, and it is the join nothing on this project had made.
+//
+// Everything else in this file is this package agreeing with itself. A preimage that inlined
+// the group context with a length prefix, that omitted the wire format, that ordered its two
+// halves the other way round, or that stopped at the FramedContent, computes a tag and verifies
+// it back perfectly and fails only against another implementation. mlswg's message-protection
+// corpus is that other implementation: it publishes an epoch's membership_key, the four
+// GroupContext fields the epoch was framed under, and two PublicMessages whose membership_tag
+// is MAC(membership_key, AuthenticatedContentTBM).
+//
+// Three separate things are compared here and each catches what the others do not.
+//
+// The bytes this task builds are held against the SPLICE p4's own known answer test rebuilds
+// out of the published message -- version, wire format and FramedContent taken verbatim from
+// the corpus, the group context inserted at the boundary the published body locates, the auth
+// data taken from what is left once the trailing membership tag is removed. That reconstruction
+// is a function of published bytes alone and shares no code with this one, so a disagreement
+// names the preimage rather than the key.
+//
+// The tag is compared against the published one through THIS plan's ComputeMembershipTag and
+// through p4's (*KeySchedule).MembershipTag, over the same preimage. That pair is the cross
+// plan property nobody had checked: p5's note says p6 builds the TBM and passes the bytes, the
+// two halves were written by different plans against a prose description of one structure, and
+// until now nothing had put one into the other. A key schedule that verified its own tags and a
+// framing layer that verified its own would both have been green.
+//
+// And the published tag is required to be REFUSED under the neighbouring epoch's context, so
+// what passed above is the binding rather than a verifier that accepts what it is handed.
+func TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver(t *testing.T) {
+	entries := []messageProtectionKatEntry{}
+	mustLoadAuthenticatedCorpus(t, messageProtectionKatFile, &entries)
+	if len(entries) == 0 {
+		t.Fatalf("%s parsed to no entries, so every comparison below would run over nothing", messageProtectionKatFile)
+	}
+	epochs := ksVectorEpochs(t)
+	compared := 0
+	matched := []CipherSuite{}
+	for _, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		matched = append(matched, suite)
+		crypto := mustProvider(t, suite)
+		nh := crypto.HashSize()
+		suiteAt := fmt.Sprintf("%s suite %#04x", messageProtectionKatFile, uint16(suite))
+		membershipKey := mustDecodeHex(t, suiteAt+" membership_key", entry.MembershipKey)
+		if len(membershipKey) != nh {
+			t.Fatalf("%s: the published membership_key is %d bytes and this suite's KDF.Nh is %d",
+				suiteAt, len(membershipKey), nh)
+		}
+		context := func(epoch uint64) []byte {
+			t.Helper()
+			encoded, err := syntax.Marshal(&GroupContext{
+				Version:                 ProtocolVersionMls10,
+				CipherSuite:             suite,
+				GroupId:                 mustDecodeHex(t, suiteAt+" group_id", entry.GroupId),
+				Epoch:                   epoch,
+				TreeHash:                mustDecodeHex(t, suiteAt+" tree_hash", entry.TreeHash),
+				ConfirmedTranscriptHash: mustDecodeHex(t, suiteAt+" confirmed_transcript_hash", entry.ConfirmedTranscriptHash),
+			})
+			if err != nil {
+				t.Fatalf("%s: encode the group context these messages were framed under: %v", suiteAt, err)
+			}
+			return encoded
+		}
+		groupContext := context(entry.Epoch)
+		for _, message := range []struct {
+			what string
+			body string
+			pub  string
+		}{
+			{what: "proposal_pub", body: entry.Proposal, pub: entry.ProposalPub},
+			{what: "commit_pub", body: entry.Commit, pub: entry.CommitPub},
+		} {
+			at := suiteAt + " " + message.what
+			publicMessage := mustDecodeHex(t, at, message.pub)
+			authContent := framingPublishedPublicMessage(t, at, publicMessage)
+			tbm, err := AuthenticatedContentTBMBytes(authContent, groupContext)
+			if err != nil {
+				t.Fatalf("%s: the tag preimage: %v", at, err)
+			}
+			spliced := authenticatedContentTbm(t, at, publicMessage,
+				mustDecodeHex(t, at+" body", message.body), groupContext, nh)
+			if !bytes.Equal(tbm, spliced) {
+				t.Errorf("%s: AuthenticatedContentTBMBytes built %x, and splicing the published message at the boundary its own body locates gives %x. These are the bytes p4's tag functions consume, and the two plans wrote them from one prose description of section 6.1 without ever comparing them",
+					at, tbm, spliced)
+			}
+			want := publishedTagAtTheTail(t, at, publicMessage, nh)
+			got, err := ComputeMembershipTag(crypto, membershipKey, authContent, groupContext)
+			if err != nil {
+				t.Fatalf("%s: compute the tag: %v", at, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s: ComputeMembershipTag = %x, and mlswg published %x. The tag is MAC(membership_key, AuthenticatedContentTBM) and nothing else; a preimage that agrees with itself agrees with no other implementation",
+					at, got, want)
+			}
+			if err := verifyMembershipTag(crypto, membershipKey, authContent, groupContext, want); err != nil {
+				t.Errorf("%s: the verifier refused the tag mlswg published for this key and this message: %v", at, err)
+			}
+			// p4's half of the join, over the preimage this task built
+			schedule := ksScheduleForSuite(t, epochs, suite)
+			installTheCorpusKey(t, at, &schedule.Secrets().Membership, membershipKey,
+				schedule.MembershipTag(tbm), want)
+			if fromSchedule := schedule.MembershipTag(tbm); !bytes.Equal(fromSchedule, want) {
+				t.Errorf("%s: (*KeySchedule).MembershipTag over the preimage this task builds = %x, and mlswg published %x",
+					at, fromSchedule, want)
+			}
+			if !schedule.VerifyMembershipTag(tbm, want) {
+				t.Errorf("%s: (*KeySchedule).VerifyMembershipTag refused the published tag over the preimage this task builds", at)
+			}
+			if err := verifyMembershipTag(crypto, membershipKey, authContent,
+				context(entry.Epoch+1), want); !errors.Is(err, errBadMembershipTag) {
+				t.Errorf("%s: the published tag verified under the next epoch's group context: got %v, want the ValSem008 sentinel",
+					at, err)
+			}
+			compared++
+		}
+	}
+	if compared != membershipTagComparisons {
+		t.Fatalf("%d published membership tags were reproduced, want %d; the loop matched %v",
+			compared, membershipTagComparisons, matched)
+	}
+	if got := slices.Sorted(slices.Values(matched)); !slices.Equal(got, Suites()) {
+		t.Fatalf("%s answered for %v and this package registers %v", messageProtectionKatFile, got, Suites())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// guardrail 8 over the membership tag refusal
+// ---------------------------------------------------------------------------
+
+// membershipTagRefusal is one declaration that can answer a membership tag refusal, together
+// with the parsed file it was read out of, because every rule below renders nodes of it back to
+// source and a node rendered against the wrong file set gives the wrong positions.
+type membershipTagRefusal struct {
+	name     string
+	host     parsedSource
+	function *ast.FuncDecl
+}
+
+// membershipTagRefusalReturns is every return of one sentinel inside a node, rendered.
+func membershipTagRefusalReturns(parsed parsedSource, node ast.Node, sentinel string) []string {
+	found := []string{}
+	ast.Inspect(node, func(inner ast.Node) bool {
+		returns, isReturn := inner.(*ast.ReturnStmt)
+		if !isReturn {
+			return true
+		}
+		for _, result := range returns.Results {
+			if parsed.render(result) == sentinel {
+				found = append(found, parsed.render(returns))
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// membershipTagRefusalsIn is the class over one parsed file: every declaration that can answer
+// the ValSem008 refusal.
+//
+// Derived off the SENTINEL rather than off a name, which is the whole of why this is a class.
+// The rule below is about how that refusal is REACHED, so its members are the declarations that
+// can reach one, and p7's receive path joins this sweep by returning the same value rather than
+// by somebody remembering to add it here. The one shape that escapes the derivation -- a
+// verifier that stopped refusing at all -- empties the class rather than passing it, and an
+// empty class is fatal below.
+func membershipTagRefusalsIn(parsed parsedSource, path string, sentinel string) []membershipTagRefusal {
+	found := []membershipTagRefusal{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		if len(membershipTagRefusalReturns(parsed, function.Body, sentinel)) == 0 {
+			continue
+		}
+		found = append(found, membershipTagRefusal{
+			name:     path + ": " + function.Name.Name,
+			host:     parsed,
+			function: function,
+		})
+	}
+	return found
+}
+
+// membershipTagRoutingFaults reads one declaration for every way it can decide a membership tag
+// other than the one guardrail 8 permits, each answered as "kind: detail".
+//
+// The KIND is what the control compares, so each half of the rule has to be the only thing
+// reporting some member of that fixture. A rule whose halves cannot be told apart is a rule that
+// can have a half deleted with its control still matching exactly what it wants.
+//
+// The loop clause is the one that is not about a comparator name, and it is here because
+// constant_time_test.go's own header says what that gate cannot see: "a comparison written as a
+// byte loop in this package's own source names no comparator and is in no class derived from
+// imports". That blind spot is closed for this refusal by refusing the loop itself, which a
+// decision written as one cannot do without.
+func membershipTagRoutingFaults(parsed parsedSource, function *ast.FuncDecl, sentinel string) []string {
+	parameters := []string{}
+	if function.Type.Params != nil {
+		for _, field := range function.Type.Params.List {
+			for _, name := range field.Names {
+				parameters = append(parameters, name.Name)
+			}
+		}
+	}
+	faults := []string{}
+	refusals := len(membershipTagRefusalReturns(parsed, function.Body, sentinel))
+	guarded := 0
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		branch, isIf := node.(*ast.IfStmt)
+		if !isIf {
+			return true
+		}
+		inside := len(membershipTagRefusalReturns(parsed, branch.Body, sentinel))
+		if inside == 0 {
+			return true
+		}
+		guarded += inside
+		faults = append(faults, membershipTagGuardFaults(parsed, branch.Cond, parameters)...)
+		return true
+	})
+	if guarded < refusals {
+		faults = append(faults, fmt.Sprintf("unguarded: %d of its %d refusals are reached from no condition at all",
+			refusals-guarded, refusals))
+	}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch node.(type) {
+		case *ast.ForStmt, *ast.RangeStmt:
+			faults = append(faults, "loop: it walks the bytes itself, and a comparison written as a loop names no comparator for any import derived gate to find")
+		}
+		return true
+	})
+	return faults
+}
+
+// membershipTagGuardFaults reads the condition one refusal is reached from.
+func membershipTagGuardFaults(parsed parsedSource, condition ast.Expr, parameters []string) []string {
+	negated, isUnary := condition.(*ast.UnaryExpr)
+	if !isUnary || negated.Op != token.NOT {
+		return []string{"guard: it refuses on " + parsed.render(condition) +
+			" rather than on a MacVerify that answered false"}
+	}
+	call, isCall := negated.X.(*ast.CallExpr)
+	if !isCall {
+		return []string{"guard: it refuses on " + parsed.render(condition) +
+			" rather than on a MacVerify that answered false"}
+	}
+	selector, isSelector := call.Fun.(*ast.SelectorExpr)
+	if !isSelector || selector.Sel.Name != "MacVerify" {
+		return []string{"guard: it refuses on " + parsed.render(condition) +
+			", and guardrail 8 says a tag comparison is CryptoProvider.MacVerify and nothing else"}
+	}
+	faults := []string{}
+	base, isIdentifier := selector.X.(*ast.Ident)
+	if !isIdentifier || !slices.Contains(parameters, base.Name) {
+		faults = append(faults, "provider: it verifies through "+parsed.render(selector.X)+
+			", which is not a provider it was handed")
+	}
+	if len(call.Args) != 3 {
+		return append(faults, fmt.Sprintf("arity: it calls MacVerify with %d arguments", len(call.Args)))
+	}
+	for at, argument := range call.Args {
+		if _, isWhole := argument.(*ast.Ident); !isWhole {
+			faults = append(faults, fmt.Sprintf("argument: it passes %s at MacVerify position %d, which is not the whole of a value it holds",
+				parsed.render(argument), at))
+		}
+	}
+	if parsed.render(call.Args[1]) == parsed.render(call.Args[2]) {
+		faults = append(faults, "self: it compares the tag against itself rather than against a mac over the preimage")
+	}
+	return faults
+}
+
+// membershipTagRoutingControl declares one of each shape the rule above has to tell apart: the
+// sanctioned body, the two comparators a ban list would have had to think of, the byte loop that
+// carries no comparator at all, a prefix of the tag pushed through the sanctioned call, a tag
+// compared against itself, a provider the function was never handed, and a refusal reached from
+// no condition.
+//
+// Seven of these are here because a control that does not DISCRIMINATE its own rule issues a
+// broken matcher exactly the clean bill a working one issues. hmac.Equal is in the fixture
+// deliberately: it is constant time and it is still wrong, because guardrail 8 names
+// crypto/subtle.ConstantTimeCompare reached through CryptoProvider.MacVerify specifically, and a
+// second comparison site is a second place the length refusal can be dropped.
+const membershipTagRoutingControl = `package control
+
+func VerifiesThroughTheProvider(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if !crypto.MacVerify(key, data, tag) {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func VerifiesWithBytesEqual(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if !bytes.Equal(crypto.Mac(key, data), tag) {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func VerifiesWithHmacEqual(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if !hmac.Equal(crypto.Mac(key, data), tag) {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func VerifiesWithAByteLoop(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	mine := crypto.Mac(key, data)
+	same := len(mine) == len(tag)
+	for at := range tag {
+		if at < len(mine) && mine[at] != tag[at] {
+			same = false
+		}
+	}
+	if !same {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func VerifiesAPrefixOfTheTag(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if !crypto.MacVerify(key, data, tag[:1]) {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func VerifiesTheTagAgainstItself(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if !crypto.MacVerify(key, tag, tag) {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func VerifiesThroughAProviderItWasNotGiven(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if !elsewhere.MacVerify(key, data, tag) {
+		return errBadMembershipTag
+	}
+	return nil
+}
+
+func RefusesWithNoConditionAtAll(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	crypto.MacVerify(key, data, tag)
+	return errBadMembershipTag
+}
+`
+
+// membershipTagRoutingControlFaults is the kind of fault each control declaration must draw,
+// written out here rather than derived, because a control is the one thing in a derived gate
+// that cannot be derived from the rule it controls.
+var membershipTagRoutingControlFaults = map[string][]string{
+	"VerifiesThroughTheProvider":            {},
+	"VerifiesWithBytesEqual":                {"guard"},
+	"VerifiesWithHmacEqual":                 {"guard"},
+	"VerifiesWithAByteLoop":                 {"guard", "loop"},
+	"VerifiesAPrefixOfTheTag":               {"argument"},
+	"VerifiesTheTagAgainstItself":           {"self"},
+	"VerifiesThroughAProviderItWasNotGiven": {"provider"},
+	"RefusesWithNoConditionAtAll":           {"unguarded"},
+}
+
+// TestEveryMembershipTagRefusalIsDecidedByMacVerifyAndNothingElse is guardrail 8 over this
+// task's refusal, read off the source rather than off an input.
+//
+// No behavioural test in this file can see this. A verifier that compared with bytes.Equal, or
+// with a byte loop of its own, answers exactly what this one answers for every input above: the
+// timing leak and the dropped length refusal are properties of HOW the answer was reached, and
+// the answer is identical. constant_time_test.go reads every comparison in this package's source
+// against a class derived from its imports and catches the named comparators; what its own header
+// says it cannot catch is the loop, and this is where that is closed for the one refusal that
+// decides whether a message no member sent is applied to the group.
+func TestEveryMembershipTagRefusalIsDecidedByMacVerifyAndNothingElse(t *testing.T) {
+	const sentinel = "errBadMembershipTag"
+	// the control first: a rule that has stopped matching issues the real source exactly the
+	// clean bill a working one issues
+	control := mustParseText(t, "the membership tag routing control", membershipTagRoutingControl)
+	reported := map[string][]string{}
+	for _, member := range membershipTagRefusalsIn(control, "control", sentinel) {
+		kinds := []string{}
+		for _, fault := range membershipTagRoutingFaults(control, member.function, sentinel) {
+			kind, _, named := strings.Cut(fault, ": ")
+			if !named {
+				t.Fatalf("the rule answered %q, which carries no kind for the control to compare", fault)
+			}
+			if !slices.Contains(kinds, kind) {
+				kinds = append(kinds, kind)
+			}
+		}
+		slices.Sort(kinds)
+		reported[member.function.Name.Name] = kinds
+	}
+	if len(reported) != len(membershipTagRoutingControlFaults) {
+		t.Fatalf("the class read %v out of the control and the control declares %d bodies that refuse; a body it does not read is a shape the real source can be written in",
+			slices.Sorted(maps.Keys(reported)), len(membershipTagRoutingControlFaults))
+	}
+	for _, name := range slices.Sorted(maps.Keys(membershipTagRoutingControlFaults)) {
+		got, read := reported[name]
+		if !read {
+			t.Errorf("the class did not read %s out of the control", name)
+			continue
+		}
+		if want := membershipTagRoutingControlFaults[name]; !slices.Equal(got, want) {
+			t.Errorf("the rule reports %s with %v, want %v; a half of it that reports nothing of its own can be deleted with this control still matching",
+				name, got, want)
+		}
+	}
+
+	// and then this package's own source
+	class := []membershipTagRefusal{}
+	for _, path := range packageLevelFunctions(t).files {
+		class = append(class, membershipTagRefusalsIn(mustParseSource(t, path), path, sentinel)...)
+	}
+	if len(class) == 0 {
+		t.Fatalf("no declaration of this package's non test source answers %s, and this task lands one, so this gate is demanding nothing",
+			sentinel)
+	}
+	for _, member := range class {
+		for _, fault := range membershipTagRoutingFaults(member.host, member.function, sentinel) {
+			t.Errorf("%s: %s", member.name, fault)
+		}
+	}
+	t.Logf("%d declaration(s) can answer %s, and each decides through CryptoProvider.MacVerify alone",
+		len(class), sentinel)
 }

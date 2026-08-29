@@ -2795,6 +2795,8 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	// the public key, the message and the group context -- is read again by the caller after
 	// the call.
 	"VerifyAuthenticatedContent": "answers an error and no bytes; what it produces is a verdict",
+	// framing's ValSem007 and ValSem008, on the same terms and for the same reason.
+	"verifyMembershipTag": "answers an error and no bytes; what it produces is a verdict",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -3361,6 +3363,55 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return nil
 		}},
+		// section 6.1's membership tag preimage and the two operations over it. All three read
+		// the caller's group context and the arrays inside the caller's own FramedContent, and
+		// every one of those is read again after the call: the message is about to be
+		// serialized and sent.
+		{name: "AuthenticatedContentTBMBytes", call: func(take func([]byte) []byte) [][]byte {
+			groupContext := take(framingStubGroupContext(t, crypto))
+			signed, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContentOver(take), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the tag preimage row reads: %v", signErr)
+			}
+			tbm, tbmErr := AuthenticatedContentTBMBytes(signed, groupContext)
+			if tbmErr != nil {
+				t.Fatalf("AuthenticatedContentTBMBytes: %v", tbmErr)
+			}
+			return [][]byte{tbm}
+		}},
+		{name: "ComputeMembershipTag", call: func(take func([]byte) []byte) [][]byte {
+			groupContext := take(framingStubGroupContext(t, crypto))
+			signed, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContentOver(take), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the membership tag row reads: %v", signErr)
+			}
+			tag, tagErr := ComputeMembershipTag(crypto,
+				take(bytes.Repeat([]byte{0x6b}, crypto.HashSize())), signed, groupContext)
+			if tagErr != nil {
+				t.Fatalf("ComputeMembershipTag: %v", tagErr)
+			}
+			return [][]byte{tag}
+		}},
+		{name: "verifyMembershipTag", call: func(take func([]byte) []byte) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			membershipKey := bytes.Repeat([]byte{0x6b}, crypto.HashSize())
+			signed, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the membership verify row reads: %v", signErr)
+			}
+			tag, tagErr := ComputeMembershipTag(crypto, membershipKey, signed, groupContext)
+			if tagErr != nil {
+				t.Fatalf("the tag the membership verify row reads: %v", tagErr)
+			}
+			if verifyErr := verifyMembershipTag(crypto, take(membershipKey), signed,
+				take(groupContext), take(tag)); verifyErr != nil {
+				t.Fatalf("verifyMembershipTag refused a tag taken over the same message: %v", verifyErr)
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3771,6 +3822,8 @@ var providerConstructionValues = map[string]any{
 	"DeriveNodeKeyPair":             DeriveNodeKeyPair,
 	"SignAuthenticatedContent":      SignAuthenticatedContent,
 	"VerifyAuthenticatedContent":    VerifyAuthenticatedContent,
+	"ComputeMembershipTag":          ComputeMembershipTag,
+	"verifyMembershipTag":           verifyMembershipTag,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -4379,6 +4432,7 @@ func providerUnflippableAnswersReached(perturbed reflect.Value) []string {
 var providerExcusedFromTheRoutingClaim = map[string]string{
 	"NewSecretTree reaches the provider only through HashSize": "validates encryption_secret against KDF.Nh and stores it, and the first value derived THROUGH the provider exists only once a leaf has been taken",
 	"VerifyAuthenticatedContent reaches the provider only through VerifyWithLabel": "answers an error, and a wrapper that flips bytes has nothing to change in a refusal; TestProviderHasNoRemainingStubs still holds it by input perturbation, and a verify made to accept unconditionally fails that half",
+	"verifyMembershipTag reaches the provider only through MacVerify":              "answers an error over a comparison, and MacVerify is the second half of the union that is not a size: a wrapper that flips bytes has nothing to change in a bool. It is the construction that comment above warned would land here, and it is not unheld -- TestProviderHasNoRemainingStubs moves its key, its message, its group context and its tag and requires each to change the verdict, TestVerifyMembershipTagRefusesEveryTagButItsOwn sweeps every bit and every length, and TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver holds it to tags mlswg published",
 }
 
 // One call, with a panic caught rather than taken. A method that still refuses to be
@@ -5292,6 +5346,15 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// leafIndexOf. rootOf's entry named task 10 and outlived it by two tasks, which is the one
 	// thing an excuse of this kind is allowed to do: it names the task that was EXPECTED to
 	// call it, and what takes it off is a caller arriving, not the task number passing.
+	//
+	// And it is not empty again. p6 task 6 lands verifyMembershipTag, which is ValSem007 and
+	// ValSem008 on the receive path, and p6 task 7's PublicMessage open is the first thing that
+	// has a membership tag to check. The declaration lands with this task rather than with that
+	// one because the guardrail is about the SHAPE the refusal has -- an error and never a bool
+	// -- and a task that landed the tag computation without its verifier would leave the shape
+	// to whoever needed it first. This entry comes off by FAILING on the commit that gives it a
+	// caller.
+	"./verifyMembershipTag": "p6 task 6 lands the ValSem007/ValSem008 verifier beside the tag it checks; p6 task 7's PublicMessage open is the first caller with a membership tag in hand",
 }
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:

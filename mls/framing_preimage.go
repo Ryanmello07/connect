@@ -310,3 +310,70 @@ func FramedContentTBSBytes(wireFormat WireFormat, content *FramedContent, groupC
 	}
 	return syntax.Marshal(tbs)
 }
+
+// ---------------------------------------------------------------------------
+// AuthenticatedContentTBM
+// ---------------------------------------------------------------------------
+
+// AuthenticatedContentTBMBytes is the byte string RFC 9420 section 6.1 takes the membership
+// tag over:
+//
+//	struct {
+//	    FramedContentTBS content_tbs;
+//	    FramedContentAuthData auth;
+//	} AuthenticatedContentTBM;
+//
+// The membership tag is MAC(membership_key, these bytes), and it is the whole of what says a
+// PublicMessage came from a member of this group rather than from anybody who can reach the
+// transport. p4's (*KeySchedule).MembershipTag and VerifyMembershipTag consume exactly this,
+// AS BYTES, because that plan owns the key schedule and never sees a framing type -- so the
+// binding of the epoch and of the authenticators into the tag lives HERE and nowhere else,
+// and a TBM assembled a field short is a tag that verifies in a place it should not.
+//
+// It is a concatenation of a preimage and a structure rather than a third structure with a
+// codec of its own, which is this file's one departure from the rule its header states, and
+// the reason is the one that makes framedContentTBS take an ALREADY SERIALIZED GroupContext.
+// The first half of this preimage IS another preimage. A structure declared here would hold a
+// framedContentTBS, and whoever built it would assemble those three fields a second time,
+// beside the assembly FramedContentTBSBytes already makes -- two assemblies of one preimage,
+// agreeing until the day one of them changes, which is exactly the drift this file exists to
+// prevent. Written this way there is ONE assembly of the section 6.1 preimage, and "the TBM
+// begins with the bytes the signature was checked against" is true by construction rather
+// than by a test that has to keep being true.
+//
+// The auth data is written under the content type of the message's OWN FramedContent, so a
+// commit's membership tag covers that commit's confirmation_tag and a proposal's covers its
+// signature alone. That is what stops a membership tag being lifted off one commit onto
+// another: the confirmation tag is inside what the tag authenticates, and a TBM taken over
+// the FramedContent alone -- the shape that reads like the obvious one, since the tag travels
+// beside the content on the wire -- authenticates neither authenticator.
+//
+// Every field is read off the MESSAGE rather than off the caller, the group context excepted:
+// that one is the receiver's own epoch and not something an unauthenticated message gets to
+// assert. A TBM built under a wire format the caller named rather than the message's own
+// would be a tag that survives a PublicMessage replayed as a PrivateMessage, which is the
+// substitution the wire format is in the preimage to refuse.
+func AuthenticatedContentTBMBytes(authContent *AuthenticatedContent, groupContext []byte) ([]byte, error) {
+	// a refusal rather than a dereference, for errNilFramedContent's reason: a panic out of a
+	// library takes the caller's process rather than its call, and says nothing about which
+	// argument was wrong.
+	if authContent == nil {
+		return nil, errNilAuthenticatedContent
+	}
+	tbs, err := FramedContentTBSBytes(authContent.WireFormat, &authContent.Content, groupContext)
+	if err != nil {
+		return nil, err
+	}
+	w := syntax.NewWriter()
+	// WriteRaw and NOT WriteOpaque, for the reason framedContentTBS.MarshalMLS gives about the
+	// group context one layer down. The presentation language writes a FramedContentTBS STRUCT
+	// here, so its octets are inlined with no length prefix of their own; an opaque<V> would
+	// produce a tag this package verifies perfectly against itself and every other
+	// implementation rejects, and nothing round trips through this preimage, so no symmetry
+	// property in the package could see it. What sees it is the published corpus.
+	w.WriteRaw(tbs)
+	if err := authContent.Auth.MarshalMLS(w, authContent.Content.ContentType); err != nil {
+		return nil, err
+	}
+	return w.Bytes()
+}

@@ -4373,6 +4373,54 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return nil
 		}},
+		// section 6.2's membership tag and its verifier. AuthenticatedContentTBMBytes is not
+		// here and must not be: it takes no provider, so it is outside the class this gate reads
+		// off the package, and a row for it would be a name the coverage comparison at the end
+		// cannot account for.
+		//
+		// The tag is the row this gate is really for. A mac IS KDF.Nh octets, so a body that cut
+		// its answer to a written down 32 is indistinguishable from a correct one at both
+		// registered suites and separates only here, over a provider whose hash is wider: the
+		// tag has to come back Nh long over each, and those two lengths differ. The verifier
+		// answers no bytes and is named as such, so what its row states is the other half --
+		// that it WORKS at a width neither registered suite has.
+		{name: "ComputeMembershipTag", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the membership tag row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), signErr)
+			}
+			tag, tagErr := ComputeMembershipTag(crypto,
+				bytes.Repeat([]byte{0x6b}, crypto.HashSize()), authContent, groupContext)
+			if tagErr != nil {
+				t.Fatalf("ComputeMembershipTag over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), tagErr)
+			}
+			return [][]byte{tag}
+		}},
+		{name: "verifyMembershipTag", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			membershipKey := bytes.Repeat([]byte{0x6b}, crypto.HashSize())
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPrivateMessage, framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the membership verify row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), signErr)
+			}
+			tag, tagErr := ComputeMembershipTag(crypto, membershipKey, authContent, groupContext)
+			if tagErr != nil {
+				t.Fatalf("the tag the membership verify row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), tagErr)
+			}
+			if verifyErr := verifyMembershipTag(crypto, membershipKey, authContent,
+				groupContext, tag); verifyErr != nil {
+				t.Fatalf("verifyMembershipTag over a provider whose KDF.Nh is %d refused a tag taken over the same message: %v",
+					crypto.HashSize(), verifyErr)
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })
