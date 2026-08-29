@@ -1524,6 +1524,7 @@ var treeVectorInstalledRunners = map[int]struct {
 	generate func(t *testing.T) json.RawMessage
 }{
 	10: {verify: verifyTreeValidationVector},
+	11: {verify: verifyTreeKemVector, generate: generateTreeKemVectors},
 }
 
 // TestTreeVectorFamiliesAreInstalledOrPending is the registration half both of this file's
@@ -1597,6 +1598,1087 @@ func TestTreeVectorFamilyFilesAreTheRegistrysFiles(t *testing.T) {
 		}
 		if got := treeVectorFile(t, number); got != spelled {
 			t.Errorf("family %d is registered against %s and this file spells %s", number, got, spelled)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task 25: family 11, TreeKEM, both directions
+// ---------------------------------------------------------------------------
+
+// The accounting that makes family 11's runner unable to pass having compared nothing.
+//
+// Transcriptions of what testdata/vectors/treekem.json holds at the pinned mlswg commit,
+// counted off the corpus text with a json reader and not off this implementation: 77 cases, 11
+// at each of the seven published ciphersuites, of which the two this package registers account
+// for 22. Those 22 cases publish 124 update paths between them, and 656 (path, leaf) pairs where
+// the file says that leaf can decrypt.
+//
+// Three answers are compared: the tree hash after the path is merged, once per path; and the
+// path secret the leaf recovers and the commit secret the epoch reaches, once per decrypting
+// leaf. So 124 + 2*656 = 1436 comparisons against 94 distinct published answers.
+//
+// 94 is a small number against 1436 and it is the corpus's own property rather than a defect in
+// this run: the two registered suites are both HKDF-SHA256 over X25519 and Ed25519 and the mlswg
+// generator seeds them identically, so every answer at suite 0x0001 is the same octet string as
+// the one at 0x0003 -- 62 distinct tree hashes for 124 paths, exactly half. The generator also
+// reuses one group's secrets across the entries of growing size, which is why 62 paths carry
+// only 19 distinct commit secrets and 656 published path secrets only 24 distinct values; and 11
+// of the 24 are also published as a commit secret somewhere, which is why the union is 94 rather
+// than 105. The number is checked because a corpus read as ONE repeated value compares the right
+// number of times against one answer, and 94 separates that from this.
+const (
+	treeKemKatCovered     = 22
+	treeKemKatSkipped     = 55
+	treeKemKatPaths       = 124
+	treeKemKatDecrypts    = 656
+	treeKemKatComparisons = treeKemKatPaths + 2*treeKemKatDecrypts
+	treeKemKatDistinct    = 94
+	// the published leaf private states those 22 cases carry, one per member of each epoch.
+	treeKemKatPrivateStates = 124
+	// how many of the 656 decrypts enter the sender's path ABOVE the receiver's own leaf, so
+	// that the receiver opens a ciphertext addressed to an ancestor and ratchets down to it.
+	// A structural property of the corpus's tree shapes and not of any secret, so it is stable
+	// across runs -- and it is pinned rather than merely required non-zero, because a receiver
+	// that had lost the held-path-secret arm entirely would still enter above its own leaf for
+	// SOME case and satisfy a floor of one.
+	treeKemKatDeep = 476
+)
+
+// The refusals compareTreeKemVector makes. Sentinels rather than formatted strings, so a control
+// can require a SPECIFIC refusal and a refusal for the wrong reason is reported too.
+var (
+	errTreeKemIncomplete     = errors.New("the treekem comparison reports answers it cannot have computed")
+	errTreeKemTreeUndecoded  = errors.New("the published ratchet tree does not decode")
+	errTreeKemPathUndecoded  = errors.New("a published update path does not decode")
+	errTreeKemPrivateState   = errors.New("a published leaf private state does not agree with the published tree")
+	errTreeKemMerge          = errors.New("a published update path does not merge into the published tree")
+	errTreeKemTreeHash       = errors.New("the merged tree's hash is not the published tree_hash_after")
+	errTreeKemParentHash     = errors.New("the merged tree fails the section 7.9 parent hash check")
+	errTreeKemMissingPrivate = errors.New("the case publishes a path secret for a leaf it publishes no private state for")
+	errTreeKemDecrypt        = errors.New("a leaf the case says can decrypt did not")
+	errTreeKemPathSecret     = errors.New("the recovered path secret is not the published one")
+	errTreeKemCommitSecret   = errors.New("the recovered commit secret is not the published one")
+	errTreeKemContextIgnored = errors.New("an update path opened under a group context it was not sealed under")
+)
+
+// The three answers this family compares, named by what the corpus publishes them as. The order
+// is the order the comparator emits them in and incomplete() rebuilds that order from the run's
+// own shape and holds it position by position.
+const (
+	treeKemAnswerTreeHash     = "tree_hash_after"
+	treeKemAnswerPathSecret   = "path_secret"
+	treeKemAnswerCommitSecret = "commit_secret"
+)
+
+// treeKemAnswer is one answer this package computed held against one answer the corpus published,
+// as hex, together with the dotted json path the runner re-reads the published half at.
+type treeKemAnswer struct {
+	name  string
+	field string
+	got   string
+	want  string
+}
+
+// treeKemComparison is what one run of compareTreeKemVector PRODUCED.
+//
+// The same shape family 10 next door has and for the same reason: a comparator that returns
+// nothing lets its caller count calls, and a call that returned is not a comparison that
+// happened. Every field is written where the work that produces it happens.
+type treeKemComparison struct {
+	// inScope is true when the case's ciphersuite is one this package registers.
+	inScope bool
+	// hashSize is the suite's KDF.Nh, read off the provider.
+	hashSize int
+	// leafWidth is the decoded tree's own width.
+	leafWidth uint32
+	// privateStates is how many published leaf private states were checked against the
+	// published tree before any path was touched.
+	privateStates int
+	// perPath is how many leaves decrypted each path, in path order. The SHAPE of the run, from
+	// which incomplete() rebuilds the answer order: a comparison dropped from the middle and
+	// another made twice leave the total untouched.
+	perPath []int
+	// deep counts the decrypts whose entry point into the path is ABOVE the receiver's own
+	// leaf, which is the arm a receiver that only ever opened its own leaf's ciphertext never
+	// reaches.
+	deep int
+	// refusals is how many decrypts were also offered the same path under a group context one
+	// octet different and refused it. One per decrypt, or the wrong-context control ran over
+	// fewer cases than the run.
+	refusals int
+	// answers is every comparison the run made, in emit order.
+	answers []treeKemAnswer
+	// parentHashError is what section 7.9's whole-tree check answered over the merged tree.
+	parentHashError error
+}
+
+// incomplete reports whether the evidence a compared case must carry is missing or inconsistent,
+// without looking at whether any answer was right.
+func (self treeKemComparison) incomplete() error {
+	switch {
+	case !self.inScope:
+		return fmt.Errorf("%w: the case is out of scope and carries no comparison", errTreeKemIncomplete)
+	case self.hashSize == 0:
+		return fmt.Errorf("%w: no KDF.Nh was read from the provider", errTreeKemIncomplete)
+	case self.leafWidth == 0:
+		return fmt.Errorf("%w: the decoded tree is %d leaves wide", errTreeKemIncomplete, self.leafWidth)
+	case self.privateStates == 0:
+		return fmt.Errorf("%w: the case publishes no leaf private state, so nothing decrypted anything",
+			errTreeKemIncomplete)
+	case len(self.perPath) == 0:
+		return fmt.Errorf("%w: the case publishes no update path", errTreeKemIncomplete)
+	}
+	// the answer order, rebuilt from the run's own shape: one tree hash per path, then a path
+	// secret and a commit secret per leaf that decrypted it.
+	expected := []string{}
+	decrypts := 0
+	for at, opened := range self.perPath {
+		if opened == 0 {
+			return fmt.Errorf("%w: no leaf decrypted path %d, so this path contributed one tree hash and nothing else",
+				errTreeKemIncomplete, at)
+		}
+		decrypts += opened
+		expected = append(expected, treeKemAnswerTreeHash)
+		for i := 0; i < opened; i += 1 {
+			expected = append(expected, treeKemAnswerPathSecret, treeKemAnswerCommitSecret)
+		}
+	}
+	if len(self.answers) != len(expected) {
+		return fmt.Errorf("%w: the run made %d comparisons over %d paths and %d decrypts, which owe %d",
+			errTreeKemIncomplete, len(self.answers), len(self.perPath), decrypts, len(expected))
+	}
+	for at, answer := range self.answers {
+		if answer.name != expected[at] {
+			return fmt.Errorf("%w: comparison %d is %s and the shape of this run puts %s there",
+				errTreeKemIncomplete, at, answer.name, expected[at])
+		}
+		if answer.got == "" || answer.want == "" {
+			return fmt.Errorf("%w: %s at %s compared %q against %q, and an empty comparison agrees with anything",
+				errTreeKemIncomplete, answer.name, answer.field, answer.got, answer.want)
+		}
+		if answer.field == "" {
+			return fmt.Errorf("%w: %s names no published field, so nothing independent of this comparator's own decode can re-read it",
+				errTreeKemIncomplete, answer.name)
+		}
+	}
+	if self.refusals != decrypts {
+		return fmt.Errorf("%w: %d of %d decrypts were also offered the path under a group context one octet different",
+			errTreeKemIncomplete, self.refusals, decrypts)
+	}
+	return nil
+}
+
+// verdict is the whole judgement over one compared case.
+//
+// The tree hash comes ahead of the secrets because it is the input the secrets were sealed
+// under: the group context every ciphertext of a path is opened with carries the tree hash of the
+// tree AFTER that path is merged, so a merge that landed anywhere else makes every decrypt below
+// fail, and reporting those failures first would hide the one thing that moved.
+func (self treeKemComparison) verdict() error {
+	if err := self.incomplete(); err != nil {
+		return err
+	}
+	for _, answer := range self.answers {
+		if answer.got == answer.want {
+			continue
+		}
+		sentinel := errTreeKemTreeHash
+		switch answer.name {
+		case treeKemAnswerPathSecret:
+			sentinel = errTreeKemPathSecret
+		case treeKemAnswerCommitSecret:
+			sentinel = errTreeKemCommitSecret
+		}
+		return fmt.Errorf("%w: %s answered %s and the corpus publishes %s at %s",
+			sentinel, answer.name, answer.got, answer.want, answer.field)
+	}
+	if self.parentHashError != nil {
+		return fmt.Errorf("%w: %v", errTreeKemParentHash, self.parentHashError)
+	}
+	return nil
+}
+
+// verifyTreeKemVector is the registry's shim: the signature RegisterVectorFamily needs, over the
+// comparator that does the work and reports what it produced.
+func verifyTreeKemVector(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	evidence, err := compareTreeKemVector(t, raw)
+	if err != nil {
+		t.Fatalf("treekem: %v", err)
+	}
+	if !evidence.inScope {
+		return
+	}
+	if err := evidence.verdict(); err != nil {
+		t.Fatalf("treekem: %v", err)
+	}
+}
+
+// compareTreeKemVector runs one case of treekem.json and returns what the run produced. A case at
+// a ciphersuite this package does not register comes back with inScope false and nothing else
+// set, which is not a failure and not a skip.
+//
+// The receiver is driven exactly as a member processing a commit drives it and in that order:
+// merge the path into the tree, take the tree hash of the RESULT, build the group context over
+// that hash, and only then open. A caller that decrypted first would be checking a path against
+// the epoch it closed, and a context built over the tree hash the epoch STARTED from is one every
+// other implementation computes differently -- which nothing in a self consistent seal and open
+// can see, and is why the corpus is where it has to be said.
+func compareTreeKemVector(t *testing.T, raw json.RawMessage) (treeKemComparison, error) {
+	t.Helper()
+	// treekemReceiverVector is treekem_test.go's row for this same corpus, with its groupContext
+	// and private helpers, reused rather than declared again: task 21 landed that decode and a
+	// second one here would be two readings of one file, silent in the worst direction when they
+	// disagree about a json key.
+	vector := treekemReceiverVector{}
+	if err := json.Unmarshal(raw, &vector); err != nil {
+		t.Fatalf("parse treekem case: %v", err)
+	}
+	suite, ok := implementedSuite(vector.CipherSuite)
+	if !ok {
+		return treeKemComparison{}, nil
+	}
+	crypto := mustProvider(t, suite)
+	evidence := treeKemComparison{inScope: true, hashSize: crypto.HashSize()}
+
+	base, err := UnmarshalRatchetTree(MustHex(t, vector.RatchetTree))
+	if err != nil {
+		return evidence, fmt.Errorf("%w: %v", errTreeKemTreeUndecoded, err)
+	}
+	evidence.leafWidth = uint32(base.LeafWidth())
+
+	// the supplied private state must already agree with the supplied tree, before any path is
+	// merged. Without this a case whose private half was replaced wholesale would be reported as
+	// a decrypt that failed, which sends a reader to the ladder rather than to the state.
+	for _, entry := range vector.LeavesPrivate {
+		priv, found := vector.private(t, entry.Index)
+		if !found {
+			return evidence, fmt.Errorf("%w: leaf %d", errTreeKemMissingPrivate, entry.Index)
+		}
+		if err := priv.Consistent(crypto, base); err != nil {
+			return evidence, fmt.Errorf("%w: leaf %d: %v", errTreeKemPrivateState, entry.Index, err)
+		}
+		evidence.privateStates += 1
+	}
+
+	pathsKey := theJsonKeyOf(t, treekemReceiverVector{}, "UpdatePaths")
+	hashKey := theJsonKeyOf(t, treekemReceivedUpdatePath{}, "TreeHashAfter")
+	secretsKey := theJsonKeyOf(t, treekemReceivedUpdatePath{}, "PathSecrets")
+	commitKey := theJsonKeyOf(t, treekemReceivedUpdatePath{}, "CommitSecret")
+
+	for at, update := range vector.UpdatePaths {
+		path := &UpdatePath{}
+		if err := syntax.Unmarshal(MustHex(t, update.UpdatePath), path); err != nil {
+			return evidence, fmt.Errorf("%w: path %d: %v", errTreeKemPathUndecoded, at, err)
+		}
+		merged := base.Clone()
+		if err := merged.MergeUpdatePath(crypto, LeafIndex(update.Sender), path); err != nil {
+			return evidence, fmt.Errorf("%w: path %d from leaf %d: %v", errTreeKemMerge, at, update.Sender, err)
+		}
+		treeHash, err := merged.TreeHash(crypto)
+		if err != nil {
+			return evidence, fmt.Errorf("path %d TreeHash: %w", at, err)
+		}
+		evidence.answers = append(evidence.answers, treeKemAnswer{
+			name:  treeKemAnswerTreeHash,
+			field: fmt.Sprintf("%s.%d.%s", pathsKey, at, hashKey),
+			got:   HexOf(treeHash),
+			want:  update.TreeHashAfter,
+		})
+		if evidence.parentHashError == nil {
+			evidence.parentHashError = merged.VerifyParentHashes(crypto)
+		}
+		groupContext := vector.groupContext(t, treeHash)
+		opened := 0
+		for leafIndex, wantSecret := range update.PathSecrets {
+			if wantSecret == nil {
+				continue
+			}
+			priv, found := vector.private(t, uint32(leafIndex))
+			if !found {
+				return evidence, fmt.Errorf("%w: path %d, leaf %d", errTreeKemMissingPrivate, at, leafIndex)
+			}
+			// WHERE this member enters the path, taken from the tree math before the decrypt
+			// rather than from the decrypt's own answer. It is the classification the deep
+			// counter is about, and it is not the common ancestor: the common ancestor of two
+			// distinct leaves is always a parent, so a counter written over that is true for
+			// every case and counts nothing. updatePathEntryFor is treekem_test.go's, reused
+			// rather than copied.
+			_, entry, _, entered := updatePathEntryFor(t, crypto, merged, LeafIndex(update.Sender), priv, nil)
+			if !entered {
+				return evidence, fmt.Errorf("%w: path %d, leaf %d: the case says this leaf decrypts and the tree math finds it no entry point",
+					errTreeKemDecrypt, at, leafIndex)
+			}
+			if entry != LeafIndex(leafIndex).NodeIndex() {
+				evidence.deep += 1
+			}
+			result, err := merged.DecryptUpdatePath(crypto, LeafIndex(update.Sender), path,
+				groupContext, priv, nil)
+			if err != nil {
+				return evidence, fmt.Errorf("%w: path %d, leaf %d: %v", errTreeKemDecrypt, at, leafIndex, err)
+			}
+			// the node the recovered secret belongs at is COMPUTED and not searched for: it is
+			// the lowest node of the sender's filtered direct path that covers this leaf, which
+			// is the common ancestor of the two. A run that took whatever secret the state ended
+			// up holding would agree with a receiver that entered the path at the wrong rung.
+			lowest := CommonAncestor(LeafIndex(update.Sender).NodeIndex(), LeafIndex(leafIndex).NodeIndex())
+			evidence.answers = append(evidence.answers,
+				treeKemAnswer{
+					name:  treeKemAnswerPathSecret,
+					field: fmt.Sprintf("%s.%d.%s.%d", pathsKey, at, secretsKey, leafIndex),
+					got:   HexOf(result.Private.PathSecrets[lowest]),
+					want:  *wantSecret,
+				},
+				treeKemAnswer{
+					name:  treeKemAnswerCommitSecret,
+					field: fmt.Sprintf("%s.%d.%s", pathsKey, at, commitKey),
+					got:   HexOf(result.CommitSecret),
+					want:  update.CommitSecret,
+				})
+			// the control, per decrypt rather than once: every published case opens, so a
+			// DecryptUpdatePath that checked the context and one that ignored it produce
+			// identical runs, and only an input that must be refused separates them.
+			wrongContext := bytes.Clone(groupContext)
+			wrongContext[0] ^= 0x01
+			fresh, _ := vector.private(t, uint32(leafIndex))
+			if _, err := merged.DecryptUpdatePath(crypto, LeafIndex(update.Sender), path,
+				wrongContext, fresh, nil); err == nil {
+				return evidence, fmt.Errorf("%w: path %d, leaf %d", errTreeKemContextIgnored, at, leafIndex)
+			}
+			evidence.refusals += 1
+			opened += 1
+		}
+		evidence.perPath = append(evidence.perPath, opened)
+	}
+
+	return evidence, evidence.verdict()
+}
+
+// Family 11 is installed here with BOTH directions, and 11 is deleted from
+// expectedPendingFamilies in the same commit.
+//
+// Generate is not nil for this family and is not decoration. A treekem case is a tree, an update
+// path over it and the secrets that path delivers, and the sender and the receiver are two
+// different code paths in this package -- CreateUpdatePathSecrets and EncryptUpdatePath on one
+// side, MergeUpdatePath and DecryptUpdatePath on the other -- so a generated case fed back
+// through the installed verifier closes a loop the published corpus cannot: the corpus never
+// passes through this package's ENCODER, so an encoder and a decoder wrong in the same direction
+// verify perfectly against it.
+//
+// A generate/consume pair sharing a code path would prove only that the code agrees with itself,
+// so the generator carries one answer that came from neither side: the commit secret is
+// re-derived from RFC 9420 section 7.4 with crypto/hmac through independentDeriveSecret, which is
+// the single hand written expander this package's tests have.
+func init() {
+	RegisterVectorFamily(VectorFamily{
+		Number:   11,
+		Name:     "TreeKEM",
+		File:     treekemVectorFile,
+		Slice:    "A4",
+		Verify:   verifyTreeKemVector,
+		Generate: generateTreeKemVectors,
+	})
+}
+
+// TestVectorTreeKEM is vector family 11 over the published corpus, in the verify direction.
+//
+// The accounting after the loop is what stops a run that compared nothing from reporting what a
+// run that compared everything reports, and every one of its assertions is reachable: a filter
+// that matched nothing, a corpus that parsed to an empty array, a comparator that declined every
+// case and a comparator that answered without computing are each a green run of this test with it
+// removed.
+//
+// The published half of every comparison is re-read here out of a GENERIC decode of the case
+// text, addressed by the dotted path the comparator recorded, so a struct tag of treekem_test.go
+// pointing at a key this corpus does not publish is a failure here rather than an empty string
+// compared against an empty string.
+func TestVectorTreeKEM(t *testing.T) {
+	file := treeVectorFile(t, 11)
+	tally, entries := newVectorRunTally(t, file)
+	paths, decrypts, deep, states := 0, 0, 0, 0
+	for index, raw := range entries {
+		published := map[string]json.RawMessage{}
+		if err := json.Unmarshal(raw, &published); err != nil {
+			t.Fatalf("%s case %d: %v", file, index, err)
+		}
+		header := treeVectorHeader{}
+		if err := json.Unmarshal(raw, &header); err != nil {
+			t.Fatalf("%s case %d: %v", file, index, err)
+		}
+		suite, inScope := tally.filter(header.CipherSuite)
+		if !inScope {
+			continue
+		}
+		evidence, err := compareTreeKemVector(t, raw)
+		if err != nil {
+			t.Fatalf("%s case %d (suite %#04x): %v", file, index, header.CipherSuite, err)
+		}
+		tally.requireCompared(t, index, suite, evidence.inScope)
+		if err := evidence.verdict(); err != nil {
+			t.Fatalf("%s case %d (suite %#04x): %v", file, index, header.CipherSuite, err)
+		}
+		for _, answer := range evidence.answers {
+			want := publishedTreeVectorAnswer(t, published, answer.field)
+			if answer.got != want {
+				t.Fatalf("%s case %d (suite %#04x): %s answered %s and the corpus text publishes %s at %s",
+					file, index, header.CipherSuite, answer.name, answer.got, want, answer.field)
+			}
+			tally.answer(want)
+		}
+		paths += len(evidence.perPath)
+		for _, opened := range evidence.perPath {
+			decrypts += opened
+		}
+		deep += evidence.deep
+		states += evidence.privateStates
+	}
+	tally.assertRun(t, treeKemKatCovered, treeKemKatSkipped, treeKemKatComparisons, treeKemKatDistinct)
+	if paths != treeKemKatPaths || decrypts != treeKemKatDecrypts {
+		t.Fatalf("%s: %d published paths merged and %d leaves decrypted them, want %d and %d",
+			file, paths, decrypts, treeKemKatPaths, treeKemKatDecrypts)
+	}
+	if states != treeKemKatPrivateStates {
+		t.Fatalf("%s: %d published leaf private states were checked against their tree, want %d",
+			file, states, treeKemKatPrivateStates)
+	}
+	// the deep arm, which the comparison count says nothing about: a receiver that only ever
+	// opened the ciphertext standing at its own leaf answers every case where the sender is its
+	// sibling and no other, and the count above would be short rather than wrong.
+	if deep != treeKemKatDeep {
+		t.Fatalf("%s: %d of %d decrypts entered the sender's path above the receiver's own leaf, want %d",
+			file, deep, decrypts, treeKemKatDeep)
+	}
+	t.Logf("%s: %d published update paths merged and hashed, %d leaf decrypts reproducing a published path secret and commit secret, %d of them entering above the receiver's own leaf; %d private states checked against their tree",
+		file, paths, decrypts, deep, states)
+}
+
+// The shape of the generate direction over the published corpus, transcribed from the file: 22
+// cases at a registered suite publishing 124 leaf private states between them, so 124 senders,
+// and every OTHER published member of the same case receives what that sender publishes -- which
+// is 656 receipts, since the entries carry 2, 3, 4, 5, 6, 7, 8, 7, 5, 8 and 7 members and n
+// members make n*(n-1) ordered pairs.
+//
+// The generated corpus the registry is handed is smaller on purpose: TestVectorGenerateThenVerify
+// runs the installed verifier over every case of it and the verifier decrypts, so one base per
+// registered suite is the loop-closing that costs a fixed amount rather than a quadratic one. The
+// sweep below is where the quadratic coverage lives.
+const (
+	treeKemGeneratedSenders   = 124
+	treeKemGeneratedReceipts  = 656
+	treeKemGeneratedBaseCases = 2
+)
+
+// treeKemGeneratorBases is the published case at each registered suite that the generated corpus
+// is built over: the one with the most published members, so the generated paths are the deepest
+// the corpus can supply and every generated case has a receiver that enters the path above its
+// own leaf.
+//
+// Derived off the corpus rather than an index written down here, so a corpus update that reorders
+// the file cannot leave this reading a two-member case and reporting a clean generate direction
+// over paths one node long.
+func treeKemGeneratorBases(t *testing.T) []treekemReceiverVector {
+	t.Helper()
+	widest := map[CipherSuite]treekemReceiverVector{}
+	for _, raw := range LoadVectorFile(t, treeVectorFile(t, 11)) {
+		vector := treekemReceiverVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("parse a treekem case: %v", err)
+		}
+		suite, ok := implementedSuite(vector.CipherSuite)
+		if !ok {
+			continue
+		}
+		if held, found := widest[suite]; found && len(held.LeavesPrivate) >= len(vector.LeavesPrivate) {
+			continue
+		}
+		widest[suite] = vector
+	}
+	bases := []treekemReceiverVector{}
+	for _, suite := range Suites() {
+		base, found := widest[suite]
+		if !found {
+			t.Fatalf("the corpus publishes no case at suite %#04x, which this package registers", uint16(suite))
+		}
+		if len(base.LeavesPrivate) < 3 {
+			t.Fatalf("the widest case at suite %#04x publishes %d members, and a generated path needs three before any receiver enters it above its own leaf",
+				uint16(suite), len(base.LeavesPrivate))
+		}
+		bases = append(bases, base)
+	}
+	if len(bases) != treeKemGeneratedBaseCases {
+		t.Fatalf("%d generator bases were found and this package registers %d suites", len(bases), treeKemGeneratedBaseCases)
+	}
+	return bases
+}
+
+// generateTreeKemVectors is family 11's generate direction: for every member of a published
+// epoch, the update path that member would publish committing over it, written back out in the
+// corpus's own format so the installed verifier can be run over it.
+//
+// The tree, the group id, the epoch and the confirmed transcript hash are the published case's;
+// what is generated is the path, the secrets it delivers and the tree hash of the epoch it opens.
+// The ratchet_tree of a generated case is therefore the tree the path is a commit OVER, which is
+// what the verifier merges into -- and the published private states stay valid against it,
+// because CreateUpdatePathSecrets mutates a clone.
+func generateTreeKemVectors(t *testing.T) json.RawMessage {
+	t.Helper()
+	generated := []treekemReceiverVector{}
+	for _, base := range treeKemGeneratorBases(t) {
+		suite, ok := implementedSuite(base.CipherSuite)
+		if !ok {
+			t.Fatalf("a generator base is at suite %#04x, which this package does not register", base.CipherSuite)
+		}
+		crypto := mustProvider(t, suite)
+		tree, err := UnmarshalRatchetTree(MustHex(t, base.RatchetTree))
+		if err != nil {
+			t.Fatalf("decode a generator base's ratchet tree: %v", err)
+		}
+		for _, sender := range base.LeavesPrivate {
+			generated = append(generated, generateOneTreeKemCase(t, crypto, base, tree, sender))
+		}
+	}
+	if len(generated) == 0 {
+		t.Fatal("the generate direction produced no case at all")
+	}
+	body, err := json.Marshal(generated)
+	if err != nil {
+		t.Fatalf("marshal the generated treekem cases: %v", err)
+	}
+	return body
+}
+
+// generateOneTreeKemCase is one member's commit over one published epoch, in the corpus's format.
+//
+// The two calls are separate here for the reason EncryptUpdatePath's own comment gives and it is
+// the whole reason this family has a generate direction worth having: the group context every
+// ciphertext is sealed under carries the tree hash of the tree AFTER this path is installed, so
+// the context does not exist until the secrets have been created and the tree mutated. A
+// generator that built the context from the tree hash it started with produces a path that opens
+// for nobody, and a seal-and-open that shared that context would not notice.
+func generateOneTreeKemCase(t *testing.T, crypto CryptoProvider, base treekemReceiverVector,
+	tree *RatchetTree, sender treekemLeafPrivateVector) treekemReceiverVector {
+	t.Helper()
+	senderTree := tree.Clone()
+	plan, err := senderTree.CreateUpdatePathSecrets(crypto, LeafIndex(sender.Index),
+		SignaturePrivateKey(MustHex(t, sender.SignaturePriv)), MustHex(t, base.GroupId))
+	if err != nil {
+		t.Fatalf("sender %d CreateUpdatePathSecrets: %v", sender.Index, err)
+	}
+	treeHash, err := senderTree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("sender %d TreeHash: %v", sender.Index, err)
+	}
+	groupContext := base.groupContext(t, treeHash)
+	path, err := senderTree.EncryptUpdatePath(crypto, plan, LeafIndex(sender.Index), groupContext, nil)
+	if err != nil {
+		t.Fatalf("sender %d EncryptUpdatePath: %v", sender.Index, err)
+	}
+	if err := senderTree.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("sender %d published a tree its own section 7.9 chain refuses: %v", sender.Index, err)
+	}
+	assertGeneratedCommitSecretIsTheRungPastTheRoot(t, plan)
+	encoded, err := syntax.Marshal(path)
+	if err != nil {
+		t.Fatalf("sender %d Marshal(UpdatePath): %v", sender.Index, err)
+	}
+
+	// one entry per LEAF INDEX and null where that leaf cannot decrypt, which is the corpus's own
+	// shape: the sender's own index, and every leaf whose private state the case does not carry.
+	secrets := make([]*string, int(tree.LeafWidth()))
+	for _, other := range base.LeavesPrivate {
+		if other.Index == sender.Index {
+			continue
+		}
+		lowest := CommonAncestor(LeafIndex(sender.Index).NodeIndex(), LeafIndex(other.Index).NodeIndex())
+		secret, held := plan.Private.PathSecrets[lowest]
+		if !held {
+			t.Fatalf("sender %d holds no path secret at node %d, which is where leaf %d enters its path",
+				sender.Index, lowest, other.Index)
+		}
+		text := HexOf(secret)
+		secrets[other.Index] = &text
+	}
+
+	return treekemReceiverVector{
+		CipherSuite:             base.CipherSuite,
+		GroupId:                 base.GroupId,
+		Epoch:                   base.Epoch,
+		ConfirmedTranscriptHash: base.ConfirmedTranscriptHash,
+		RatchetTree:             base.RatchetTree,
+		LeavesPrivate:           base.LeavesPrivate,
+		UpdatePaths: []treekemReceivedUpdatePath{{
+			Sender:        sender.Index,
+			UpdatePath:    HexOf(encoded),
+			PathSecrets:   secrets,
+			CommitSecret:  HexOf(plan.CommitSecret),
+			TreeHashAfter: HexOf(treeHash),
+		}},
+	}
+}
+
+// assertGeneratedCommitSecretIsTheRungPastTheRoot is the one answer of the generate direction
+// that came from neither side of this package.
+//
+// RFC 9420 section 7.4 makes the ladder path_secret[n+1] = DeriveSecret(path_secret[n], "path"),
+// and section 8.1 makes the commit secret the rung PAST the root -- so the commit secret is
+// DeriveSecret of the secret at the last node of the filtered direct path and not that secret
+// itself. Both spellings are 32 octets of apparent random and both are stable, so a sender and a
+// receiver that made the same mistake agree with each other perfectly; p4 task 18 shipped an
+// "independent" verifier that called the production provider and could not have seen the
+// analogous transposition at all.
+//
+// So it is re-derived here through independentDeriveSecret, which is written from the RFC text
+// with crypto/hmac and reaches nothing this package declares --
+// TestTheGenerateDirectionSharesNoCodePathWithVerify is the gate that keeps it that way. sha256
+// is written into that derivation rather than read off a provider for the same reason, and
+// TestBothRegisteredSuitesAreSha256AtThisWidth is what fails on the day that stops being true.
+//
+// A group of one has an empty filtered direct path and no last node; that case is answered as
+// "nothing to check" rather than as a failure, and treeKemGeneratorBases requires three members,
+// so no base this generator runs over is in it.
+func assertGeneratedCommitSecretIsTheRungPastTheRoot(t *testing.T, plan *UpdatePathPlan) {
+	t.Helper()
+	if len(plan.Path) == 0 {
+		return
+	}
+	top := plan.Path[len(plan.Path)-1]
+	secret, held := plan.Private.PathSecrets[top]
+	if !held {
+		t.Fatalf("the plan holds no path secret at node %d, the last node of its own filtered direct path", top)
+	}
+	want := independentDeriveSecret(t, secret, "path")
+	if !bytes.Equal(want, plan.CommitSecret) {
+		t.Fatalf("the commit secret is %s and DeriveSecret(path_secret[last], \"path\") written from the RFC is %s",
+			HexOf(plan.CommitSecret), HexOf(want))
+	}
+}
+
+// TestVectorTreeKEMGenerate is family 11's generate direction over every published epoch, rather
+// than over the two the registry is handed.
+//
+// Every published member of every in-scope case commits, and every OTHER published member of the
+// same case receives it: 124 senders and 656 receipts. The receiver is not the sender -- it holds
+// only the private state the corpus published and the octets the sender emitted -- so a commit
+// secret both of them reach is a statement about two code paths agreeing rather than about one
+// agreeing with itself, and the independent derivation inside the generator is what says the
+// value they agree on is the one the RFC names.
+//
+// The tree the receiver merges into is the corpus's, which no part of this package built.
+func TestVectorTreeKEMGenerate(t *testing.T) {
+	file := treeVectorFile(t, 11)
+	tally, entries := newVectorRunTally(t, file)
+	senders, receipts, deep := 0, 0, 0
+	for index, raw := range entries {
+		header := treeVectorHeader{}
+		if err := json.Unmarshal(raw, &header); err != nil {
+			t.Fatalf("%s case %d: %v", file, index, err)
+		}
+		suite, inScope := tally.filter(header.CipherSuite)
+		if !inScope {
+			continue
+		}
+		vector := treekemReceiverVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("%s case %d: %v", file, index, err)
+		}
+		crypto := mustProvider(t, suite)
+		base, err := UnmarshalRatchetTree(MustHex(t, vector.RatchetTree))
+		if err != nil {
+			t.Fatalf("%s case %d: UnmarshalRatchetTree: %v", file, index, err)
+		}
+		compared := 0
+		for _, sender := range vector.LeavesPrivate {
+			senders += 1
+			generated := generateOneTreeKemCase(t, crypto, vector, base, sender)
+			update := generated.UpdatePaths[0]
+			path := &UpdatePath{}
+			if err := syntax.Unmarshal(MustHex(t, update.UpdatePath), path); err != nil {
+				t.Fatalf("%s case %d sender %d: the generated update path does not decode: %v",
+					file, index, sender.Index, err)
+			}
+			groupContext := vector.groupContext(t, MustHex(t, update.TreeHashAfter))
+			for _, other := range vector.LeavesPrivate {
+				if other.Index == sender.Index {
+					continue
+				}
+				receiverTree := base.Clone()
+				if err := receiverTree.MergeUpdatePath(crypto, LeafIndex(sender.Index), path); err != nil {
+					t.Fatalf("%s case %d sender %d receiver %d: MergeUpdatePath: %v",
+						file, index, sender.Index, other.Index, err)
+				}
+				// the receiver recomputes the tree hash rather than taking the sender's, because
+				// the sender's is the one value both ends would agree on for the wrong reason if
+				// the merge and the create disagreed about what the epoch looks like.
+				treeHash, err := receiverTree.TreeHash(crypto)
+				if err != nil {
+					t.Fatalf("%s case %d sender %d receiver %d: TreeHash: %v",
+						file, index, sender.Index, other.Index, err)
+				}
+				if got := HexOf(treeHash); got != update.TreeHashAfter {
+					t.Fatalf("%s case %d sender %d receiver %d: the merged tree hashes to %s and the sender published %s",
+						file, index, sender.Index, other.Index, got, update.TreeHashAfter)
+				}
+				priv, found := vector.private(t, other.Index)
+				if !found {
+					t.Fatalf("%s case %d: leaf %d publishes no private state", file, index, other.Index)
+				}
+				result, err := receiverTree.DecryptUpdatePath(crypto, LeafIndex(sender.Index), path,
+					groupContext, priv, nil)
+				if err != nil {
+					t.Fatalf("%s case %d sender %d receiver %d: DecryptUpdatePath: %v",
+						file, index, sender.Index, other.Index, err)
+				}
+				if got := HexOf(result.CommitSecret); got != update.CommitSecret {
+					t.Fatalf("%s case %d sender %d receiver %d: the receiver reached commit secret %s and the sender published %s",
+						file, index, sender.Index, other.Index, got, update.CommitSecret)
+				}
+				lowest := CommonAncestor(LeafIndex(sender.Index).NodeIndex(), LeafIndex(other.Index).NodeIndex())
+				// where this member entered, and not the common ancestor: the common ancestor of
+				// two distinct leaves is always a parent, so a counter over that is true for
+				// every case and counts nothing.
+				if _, entry, _, entered := updatePathEntryFor(t, crypto, receiverTree,
+					LeafIndex(sender.Index), priv, nil); !entered {
+					t.Fatalf("%s case %d sender %d receiver %d: the decrypt succeeded and the tree math finds it no entry point",
+						file, index, sender.Index, other.Index)
+				} else if entry != LeafIndex(other.Index).NodeIndex() {
+					deep += 1
+				}
+				if got := HexOf(result.Private.PathSecrets[lowest]); update.PathSecrets[other.Index] == nil ||
+					got != *update.PathSecrets[other.Index] {
+					t.Fatalf("%s case %d sender %d receiver %d: the receiver recovered %s at node %d and the sender published %v",
+						file, index, sender.Index, other.Index, got, lowest, update.PathSecrets[other.Index])
+				}
+				// the commit secret is one value the whole run agrees on, so it is also the one
+				// value a sender and a receiver that are wrong in the same direction agree on.
+				// tally.answer is fed the SENDER's published text and the comparison above is
+				// what earns it, so a run that stopped generating moves this count.
+				tally.answer(update.CommitSecret)
+				receipts += 1
+				compared += 1
+			}
+		}
+		tally.requireCompared(t, index, suite, compared > 0)
+	}
+	// the tally's own accounting, over a corpus whose answers this run produced rather than read:
+	// covered and skipped are the same partition the verify direction makes, and the comparisons
+	// are the receipts.
+	// the distinct count is the SENDERS and not the receipts: every sender samples a fresh ladder,
+	// so the 656 answers are 124 distinct commit secrets, each agreed on by every member that
+	// received that sender's path. A generator answering one value for every sender would make the
+	// same 656 comparisons against one answer, which is what this separates.
+	tally.assertRun(t, treeKemKatCovered, treeKemKatSkipped, treeKemGeneratedReceipts, treeKemGeneratedSenders)
+	if senders != treeKemGeneratedSenders || receipts != treeKemGeneratedReceipts {
+		t.Fatalf("%d members committed and %d members received, want %d and %d",
+			senders, receipts, treeKemGeneratedSenders, treeKemGeneratedReceipts)
+	}
+	// the same structural count the verify direction pins, over the same trees: a generated path
+	// installs the sender's own direct path and touches no copath child, so which node a receiver
+	// enters at is the shape of the published tree and nothing the generator sampled.
+	if deep != treeKemKatDeep {
+		t.Fatalf("%d of %d generated receipts entered the path above the receiver's own leaf, want %d",
+			deep, receipts, treeKemKatDeep)
+	}
+	t.Logf("%s: %d generated commits received by %d other members, %d of them entering the path above their own leaf",
+		file, senders, receipts, deep)
+}
+
+// tkKatBaseCase answers a published treekem case at a registered suite that every row of the
+// control below can be built out of: it must publish at least two update paths, and at least one
+// leaf that decrypts a path it is not the sender of, or the rows that corrupt a secret would
+// corrupt nothing.
+//
+// The base is the corpus's own and not a fixture: the whole of what the refusals below mean is
+// that this exact case is accepted and a one octet edit of it is not.
+func tkKatBaseCase(t *testing.T) treekemReceiverVector {
+	t.Helper()
+	for _, raw := range LoadVectorFile(t, treeVectorFile(t, 11)) {
+		vector := treekemReceiverVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("parse a treekem case: %v", err)
+		}
+		if _, ok := implementedSuite(vector.CipherSuite); !ok {
+			continue
+		}
+		if len(vector.UpdatePaths) < 2 || len(vector.LeavesPrivate) < 3 {
+			continue
+		}
+		if _, found := tkFirstDecryptingLeaf(vector, 0); !found {
+			continue
+		}
+		if _, err := compareTreeKemVector(t, tkRewrite(t, vector, func(*treekemReceiverVector) {})); err != nil {
+			t.Fatalf("a published treekem case was refused: %v", err)
+		}
+		return vector
+	}
+	t.Fatal("no published case at a registered suite publishes two update paths, three members and a leaf that decrypts the first path; the rows below need all three")
+	return treekemReceiverVector{}
+}
+
+// tkFirstDecryptingLeaf is the lowest leaf index one published path delivers a secret to, which
+// is the entry the secret-corrupting rows below move.
+func tkFirstDecryptingLeaf(vector treekemReceiverVector, path int) (int, bool) {
+	if path >= len(vector.UpdatePaths) {
+		return 0, false
+	}
+	for leaf, secret := range vector.UpdatePaths[path].PathSecrets {
+		if secret != nil {
+			return leaf, true
+		}
+	}
+	return 0, false
+}
+
+// tkRewrite re-encodes one corpus row with one thing changed, through the row's own struct.
+//
+// The nested halves are cloned before the mutation runs, because a row that edited
+// UpdatePaths[0] in place would edit the base every later row is built from, and the rows would
+// then be a sequence of corruptions rather than seven independent ones.
+func tkRewrite(t *testing.T, base treekemReceiverVector,
+	mutate func(corrupted *treekemReceiverVector)) json.RawMessage {
+	t.Helper()
+	corrupted := base
+	corrupted.LeavesPrivate = slices.Clone(base.LeavesPrivate)
+	for at := range corrupted.LeavesPrivate {
+		corrupted.LeavesPrivate[at].PathSecrets = slices.Clone(base.LeavesPrivate[at].PathSecrets)
+	}
+	corrupted.UpdatePaths = slices.Clone(base.UpdatePaths)
+	for at := range corrupted.UpdatePaths {
+		corrupted.UpdatePaths[at].PathSecrets = slices.Clone(base.UpdatePaths[at].PathSecrets)
+	}
+	mutate(&corrupted)
+	body, err := json.Marshal(corrupted)
+	if err != nil {
+		t.Fatalf("re-encode the corrupted treekem case: %v", err)
+	}
+	return body
+}
+
+// TestCompareTreeKemVectorRefusesAnAnswerItShouldNotAccept is the control the runner cannot be.
+//
+// Every case of the vendored corpus agrees with this implementation, so a comparator that
+// reproduced all three of its answers and one that returned an empty struct produce identical
+// runs; only a case that is wrong on purpose separates them. Each row names the sentinel it owes,
+// so a refusal for the WRONG reason is reported too.
+func TestCompareTreeKemVectorRefusesAnAnswerItShouldNotAccept(t *testing.T) {
+	base := tkKatBaseCase(t)
+	compare := func(t *testing.T, raw json.RawMessage) error {
+		evidence, err := compareTreeKemVector(t, raw)
+		if err != nil {
+			return err
+		}
+		return evidence.verdict()
+	}
+	// the octet that is flipped is the SECOND and not the first, and that is not arbitrary. An
+	// X25519 private key is clamped before use -- the low three bits of its first octet are
+	// cleared -- so a private key whose first octet was flipped in bit 0 derives the very same
+	// public key, and the row that means to corrupt a private state would corrupt nothing.
+	flipSecond := func(text string) string {
+		octets := MustHex(t, text)
+		if len(octets) < 2 {
+			t.Fatalf("%q is %d octets and this flip needs two", text, len(octets))
+		}
+		octets[1] ^= 0x01
+		return HexOf(octets)
+	}
+	leaf, found := tkFirstDecryptingLeaf(base, 0)
+	if !found {
+		t.Fatal("the base case's first path delivers no secret, so the secret rows below corrupt nothing")
+	}
+	rung := -1
+	for at, entry := range base.LeavesPrivate {
+		if len(entry.PathSecrets) > 0 {
+			rung = at
+			break
+		}
+	}
+	if rung < 0 {
+		t.Fatal("no published member of the base case holds a path secret, so the private-state row corrupts nothing")
+	}
+	assertComparatorRefuses(t, treeVectorFile(t, 11), compare, tkRewrite(t, base, func(*treekemReceiverVector) {}),
+		[]comparatorRefusal{
+			{
+				name:   "a case whose published ratchet tree does not decode",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) { c.RatchetTree = "00" }),
+				want:   errTreeKemTreeUndecoded,
+			},
+			{
+				name:   "a case whose published update path does not decode",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) { c.UpdatePaths[0].UpdatePath = "00" }),
+				want:   errTreeKemPathUndecoded,
+			},
+			{
+				// a PATH SECRET and not the leaf key. Consistent deliberately does not re-derive
+				// the leaf public half -- the provider surface has no private-to-public
+				// operation, and DecryptUpdatePath is where both halves of the leaf key exist --
+				// so a flipped encryption_priv is refused a path later as a decrypt that did not
+				// open, which is a true refusal for a class this row does not name.
+				name: "a case whose published path secret does not derive the key its tree announces",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
+					c.LeavesPrivate[rung].PathSecrets[0].PathSecret =
+						flipSecond(c.LeavesPrivate[rung].PathSecrets[0].PathSecret)
+				}),
+				want: errTreeKemPrivateState,
+			},
+			{
+				name: "a case whose published tree_hash_after is not the merged tree's",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
+					c.UpdatePaths[0].TreeHashAfter = flipSecond(c.UpdatePaths[0].TreeHashAfter)
+				}),
+				want: errTreeKemTreeHash,
+			},
+			{
+				name: "a case whose published path secret is not the one the leaf recovers",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
+					moved := flipSecond(*c.UpdatePaths[0].PathSecrets[leaf])
+					c.UpdatePaths[0].PathSecrets[leaf] = &moved
+				}),
+				want: errTreeKemPathSecret,
+			},
+			{
+				name: "a case whose published commit secret is not the one the epoch reaches",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
+					c.UpdatePaths[0].CommitSecret = flipSecond(c.UpdatePaths[0].CommitSecret)
+				}),
+				want: errTreeKemCommitSecret,
+			},
+			{
+				name: "a case whose confirmed transcript hash is not the one the path was sealed under",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
+					c.ConfirmedTranscriptHash = flipSecond(c.ConfirmedTranscriptHash)
+				}),
+				want: errTreeKemDecrypt,
+			},
+			{
+				name: "a case publishing a path secret for a leaf it publishes no private state for",
+				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
+					kept := []treekemLeafPrivateVector{}
+					for _, entry := range c.LeavesPrivate {
+						if int(entry.Index) == leaf {
+							continue
+						}
+						kept = append(kept, entry)
+					}
+					c.LeavesPrivate = kept
+				}),
+				want: errTreeKemMissingPrivate,
+			},
+		})
+}
+
+// treeKemSentinels is this family's refusals addressed by the identifier they are declared under.
+// See treeValidationSentinels next door for why the gate below does not read this AS the class.
+var treeKemSentinels = map[string]error{
+	"errTreeKemIncomplete":     errTreeKemIncomplete,
+	"errTreeKemTreeUndecoded":  errTreeKemTreeUndecoded,
+	"errTreeKemPathUndecoded":  errTreeKemPathUndecoded,
+	"errTreeKemPrivateState":   errTreeKemPrivateState,
+	"errTreeKemMerge":          errTreeKemMerge,
+	"errTreeKemTreeHash":       errTreeKemTreeHash,
+	"errTreeKemParentHash":     errTreeKemParentHash,
+	"errTreeKemMissingPrivate": errTreeKemMissingPrivate,
+	"errTreeKemDecrypt":        errTreeKemDecrypt,
+	"errTreeKemPathSecret":     errTreeKemPathSecret,
+	"errTreeKemCommitSecret":   errTreeKemCommitSecret,
+	"errTreeKemContextIgnored": errTreeKemContextIgnored,
+}
+
+// TestTreeKemVerdictReportsEveryClassItNames drives family 11's verdict over evidence built here.
+//
+// Two of the classes it names cannot be reached from a corpus. A comparison that is INCOMPLETE is
+// one whose comparator returned early or emitted its answers in the wrong order, and no corpus
+// case asks for that; a merged tree that fails section 7.9 while every published answer still
+// agrees is a DEFECT in the merge, and no corpus publishes one. Both are the arms that hold the
+// sweep honest, so both are driven here.
+//
+// The class is derived from the two methods' own source: every errTreeKem sentinel either of them
+// names owes exactly one row.
+func TestTreeKemVerdictReportsEveryClassItNames(t *testing.T) {
+	complete := func() treeKemComparison {
+		return treeKemComparison{
+			inScope:       true,
+			hashSize:      32,
+			leafWidth:     4,
+			privateStates: 2,
+			perPath:       []int{1},
+			refusals:      1,
+			answers: []treeKemAnswer{
+				{name: treeKemAnswerTreeHash, field: "update_paths.0.tree_hash_after", got: "aa", want: "aa"},
+				{name: treeKemAnswerPathSecret, field: "update_paths.0.path_secrets.1", got: "bb", want: "bb"},
+				{name: treeKemAnswerCommitSecret, field: "update_paths.0.commit_secret", got: "cc", want: "cc"},
+			},
+		}
+	}
+	if err := complete().verdict(); err != nil {
+		t.Fatalf("a complete and agreeing comparison was refused: %v", err)
+	}
+	rows := []struct {
+		names error
+		spoil func(evidence *treeKemComparison)
+	}{
+		{errTreeKemIncomplete, func(e *treeKemComparison) { e.refusals = 0 }},
+		{errTreeKemTreeHash, func(e *treeKemComparison) { e.answers[0].got = "dd" }},
+		{errTreeKemPathSecret, func(e *treeKemComparison) { e.answers[1].got = "dd" }},
+		{errTreeKemCommitSecret, func(e *treeKemComparison) { e.answers[2].got = "dd" }},
+		{errTreeKemParentHash, func(e *treeKemComparison) {
+			e.parentHashError = errors.New("a copath child claimed nothing")
+		}},
+	}
+	claimed := map[string]bool{}
+	for _, row := range rows {
+		if row.names == nil {
+			t.Fatal("a row names no sentinel, so any refusal at all would satisfy it")
+		}
+		found := ""
+		for name, sentinel := range treeKemSentinels {
+			if sentinel == row.names {
+				found = name
+			}
+		}
+		if found == "" {
+			t.Fatalf("a row names %v and treeKemSentinels resolves no identifier to it", row.names)
+		}
+		if claimed[found] {
+			t.Fatalf("%s is claimed by two rows, so some class this verdict names is claimed by none", found)
+		}
+		claimed[found] = true
+	}
+	declared := theSourceDeclaring(t, "treeKemComparison", "verdict")
+	mentioned := map[string]bool{}
+	for _, method := range []string{"verdict", "incomplete"} {
+		for name := range namesMentionedIn(declared.declarationOf(t, "treeKemComparison", method)) {
+			if strings.HasPrefix(name, "errTreeKem") {
+				mentioned[name] = true
+			}
+		}
+	}
+	if len(mentioned) == 0 {
+		t.Fatal("the verdict and its completeness check name no errTreeKem sentinel at all, so the class below was derived from nothing")
+	}
+	if len(mentioned) != len(rows) {
+		t.Fatalf("the verdict names %v and this control offers %d rows for %v",
+			slices.Sorted(maps.Keys(mentioned)), len(rows), slices.Sorted(maps.Keys(claimed)))
+	}
+	for _, name := range slices.Sorted(maps.Keys(mentioned)) {
+		if _, known := treeKemSentinels[name]; !known {
+			t.Errorf("%s is a class the verdict reports and treeKemSentinels does not resolve it", name)
+			continue
+		}
+		if !claimed[name] {
+			t.Errorf("%s is a class the verdict reports and no row here drives it", name)
+		}
+	}
+	for _, row := range rows {
+		evidence := complete()
+		row.spoil(&evidence)
+		err := evidence.verdict()
+		if err == nil {
+			t.Errorf("%v: the spoiled comparison was accepted, so this arm of the verdict reports nothing", row.names)
+			continue
+		}
+		if !errors.Is(err, row.names) {
+			t.Errorf("the spoiled comparison was refused as %v, want %v; a refusal for the wrong reason is the verdict checking something else",
+				err, row.names)
 		}
 	}
 }

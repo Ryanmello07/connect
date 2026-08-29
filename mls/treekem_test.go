@@ -588,9 +588,15 @@ type treekemPrivateVector struct {
 	LeavesPrivate []treekemLeafPrivateVector `json:"leaves_private"`
 }
 
+// signature_priv is read even though nothing in THIS file signs anything: family 11's
+// generate direction in tree_kat_test.go re-commits from every published member and has to
+// sign the commit leaf with the key that member's own leaf announces. It is here rather than
+// in a second struct over there for this file's own stated reason -- two declarations of one
+// corpus row is how two of them end up disagreeing about which json key a field lives at.
 type treekemLeafPrivateVector struct {
 	Index          uint32                    `json:"index"`
 	EncryptionPriv string                    `json:"encryption_priv"`
+	SignaturePriv  string                    `json:"signature_priv"`
 	PathSecrets    []treekemPathSecretVector `json:"path_secrets"`
 }
 
