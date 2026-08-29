@@ -535,6 +535,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		}
 	}
 	want := []string{
+		// the proposals<V> vector of a Commit. Both halves take the caller's Writer or Reader
+		// rather than building one, so each runs under whichever limit the caller opened. The
+		// default is the right one for this vector and the raised ratchet tree bound is not: a
+		// commit's proposal list is bounded by the group's own size, and one allowed past
+		// MaxVectorLength is one no peer running the default limit could have sent -- which
+		// matters here more than almost anywhere, because these bytes are inside the confirmed
+		// transcript hash and a disagreement about them is a permanent fork rather than a
+		// rejected message.
+		"commit_wire.go: syntax.ReadVector(r, readOneProposalOrRef)",
+		"commit_wire.go: syntax.WriteVector(w, self.Proposals, writeOneProposalOrRef)",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
@@ -564,6 +574,18 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"extension.go: syntax.ReadVector(r, readOneUint16[T])",
 		"extension.go: syntax.WriteVector(w, exts, writeOneExtension)",
 		"extension.go: syntax.WriteVector(w, values, writeOneUint16[T])",
+		// the two preimages of framing_preimage.go, each reached as syntax.Marshal over the
+		// structure the RFC writes rather than as a Writer opened here and filled by hand.
+		// syntax.Marshal(self) is the serialized AuthenticatedContent a ProposalRef is taken
+		// over; syntax.Marshal(self.transcriptHashInput()) is section 8.2's
+		// ConfirmedTranscriptHashInput. The default limit and not the ratchet tree one, and for
+		// this pair that is the strictest reading in the package: a proposal reference or a
+		// transcript entry taken over a structure allowed past MaxVectorLength is one no peer
+		// running the default limit could have computed, and both of those disagreements are
+		// permanent -- a commit naming a ref nobody else derives, and a transcript chain that
+		// has forked.
+		"framing_preimage.go: syntax.Marshal(self)",
+		"framing_preimage.go: syntax.Marshal(self.transcriptHashInput())",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded

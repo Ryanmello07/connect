@@ -109,6 +109,37 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				{name: "PskNonce", content: id.PskNonce, carried: true},
 			}, nil
 		}},
+		// framing's proposal reference of section 5.2: the identity a commit names a proposal
+		// by, and the one value in this package whose whole job is to be the same on every peer
+		// that sees the same proposal. The bytes it hashes are the RECEIVER's, so nothing goes
+		// through the recorder and this row is outside the retention gate's derived class by the
+		// same reading that puts it inside the other two: the method is handed no caller array
+		// at all, only a provider.
+		//
+		// The ref is a derived value rather than a carried one, so the routing differential
+		// requires it to MOVE over a provider that flips every answer: a reference computed
+		// through crypto/sha256 directly, or through a provider built here out of a hardcoded
+		// suite, agrees with every corpus in this package because they are all SHA-256 -- and it
+		// is a commit naming a proposal nobody else can look up the moment a group runs at
+		// another suite.
+		{name: "(*AuthenticatedContent).ProposalRef", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			authContent := &AuthenticatedContent{
+				WireFormat: WireFormatPublicMessage,
+				Content: FramedContent{
+					GroupId:     bytes.Repeat([]byte{0x41}, 4),
+					Epoch:       7,
+					Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: 1},
+					ContentType: ContentTypeProposal,
+					Proposal:    &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}},
+				},
+				Auth: FramedContentAuthData{Signature: bytes.Repeat([]byte{0x42}, 64)},
+			}
+			ref, err := authContent.ProposalRef(crypto)
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{{name: "ProposalRef", content: ref}}, nil
+		}},
 		// the transcript's own advance. Both arguments are the caller's -- the serialized
 		// ConfirmedTranscriptHashInput is the framed commit it goes on to verify a signature
 		// over, and the confirmation tag is compared against a freshly computed one

@@ -2550,12 +2550,78 @@ func TestEveryFramingRegistrySwitchRefusesByNamingTheCodePointItRefused(t *testi
 // arm would have consumed had the code point been registered -- a sender arm's octet, a whole
 // commit auth data -- so a refusal that was really a truncation cannot pass for a refusal of
 // the code point.
+// handDerivedCommitTail is a valid AuthenticatedContent carrying an empty commit, MINUS its two
+// octet wire format, written out here rather than produced by the encoder under test.
+//
+// The octets are the RFC's structure read off section 6: an empty group_id<V>, an eight octet
+// epoch, a member sender at leaf 0, an empty authenticated_data<V>, the commit content type, an
+// empty proposals<V>, an absent optional path, an empty signature<V> and a one octet
+// confirmation tag. Hand derived because the decoder refusal it stands behind is being asked to
+// refuse the wire format rather than to run out of input, and bytes produced by the encoder
+// under test would make that a statement about the encoder.
+func handDerivedCommitTail() []byte {
+	return []byte{
+		0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00,
+		0x03,
+		0x00,
+		0x00,
+		0x00,
+		0x01, 0xaa,
+	}
+}
+
+// handDerivedFramedContentHeader is the five fields every FramedContent opens with, ending in
+// the content type the caller names, followed by two octets an arm would have consumed.
+//
+// The trailing octets are the point: without them a decoder that refused nothing would run out
+// of input and report a truncation, which reads as a refusal of the code point and is not one.
+func handDerivedFramedContentHeader(contentType ContentType) []byte {
+	return []byte{
+		0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00,
+		byte(contentType),
+		0x00, 0x00,
+	}
+}
+
 var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 	"Sender.MarshalMLS": func(codePoint uint64) error {
 		return (&Sender{SenderType: SenderType(codePoint)}).MarshalMLS(syntax.NewWriter())
 	},
 	"Sender.UnmarshalMLS": func(codePoint uint64) error {
 		return (&Sender{}).UnmarshalMLS(syntax.NewReader([]byte{byte(codePoint), 0x00, 0x00, 0x00, 0x00}))
+	},
+	// framing.go's wire format registry, which had no raiser in production source until the
+	// authenticated content codec grew one. The encoder is handed nothing but the code point,
+	// because it refuses before it writes; the decoder is handed the whole of a valid commit's
+	// authenticated content behind the two octets it refuses, so a refusal that was really a
+	// truncation cannot pass for a refusal of the code point.
+	"AuthenticatedContent.MarshalMLS": func(codePoint uint64) error {
+		return (&AuthenticatedContent{WireFormat: WireFormat(codePoint)}).MarshalMLS(syntax.NewWriter())
+	},
+	"AuthenticatedContent.UnmarshalMLS": func(codePoint uint64) error {
+		return (&AuthenticatedContent{}).UnmarshalMLS(syntax.NewReader(append(
+			[]byte{byte(codePoint >> 8), byte(codePoint)}, handDerivedCommitTail()...)))
+	},
+	// the content type registry, at all three of the places framing.go discriminates on it.
+	// checkArms is reached on its own as well as through the encoder, because the encoder
+	// refuses through it and a reader arriving at either has to be told the same number.
+	"FramedContent.checkArms": func(codePoint uint64) error {
+		return (&FramedContent{ContentType: ContentType(codePoint)}).checkArms()
+	},
+	"FramedContent.MarshalMLS": func(codePoint uint64) error {
+		return (&FramedContent{
+			Sender:      Sender{SenderType: SenderTypeMember},
+			ContentType: ContentType(codePoint),
+		}).MarshalMLS(syntax.NewWriter())
+	},
+	"FramedContent.UnmarshalMLS": func(codePoint uint64) error {
+		return (&FramedContent{}).UnmarshalMLS(syntax.NewReader(handDerivedFramedContentHeader(ContentType(codePoint))))
 	},
 	"FramedContentAuthData.MarshalMLS": func(codePoint uint64) error {
 		return testAuthData().MarshalMLS(syntax.NewWriter(), ContentType(codePoint))
@@ -2924,4 +2990,783 @@ func TestTheBorrowedSentinelIsDocumentedByEveryLayerThatRaisesIt(t *testing.T) {
 		}
 	}
 	t.Logf("%s is declared in %s and raised from %v, each of them named by its declaration", borrowed, declaredIn, raisers)
+}
+
+// ---------------------------------------------------------------------------
+// FramedContent
+// ---------------------------------------------------------------------------
+
+func TestFramedContentRoundTripApplication(t *testing.T) {
+	content := FramedContent{
+		GroupId:           []byte{0xaa, 0xbb},
+		Epoch:             5,
+		Sender:            Sender{SenderType: SenderTypeMember, LeafIndex: 1},
+		AuthenticatedData: []byte{0x01, 0x02, 0x03},
+		ContentType:       ContentTypeApplication,
+		ApplicationData:   []byte("hello"),
+	}
+	encoded, err := syntax.Marshal(&content)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	decoded := FramedContent{}
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	reencoded, err := syntax.Marshal(&decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("re-encoded %x, want %x", reencoded, encoded)
+	}
+	if !bytes.Equal(decoded.ApplicationData, []byte("hello")) {
+		t.Fatalf("application data %q", decoded.ApplicationData)
+	}
+}
+
+func TestFramedContentRoundTripProposal(t *testing.T) {
+	content := FramedContent{
+		GroupId:     []byte{0x01},
+		Epoch:       0,
+		Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: 3},
+		ContentType: ContentTypeProposal,
+		Proposal: &Proposal{
+			ProposalType: ProposalTypeRemove,
+			Remove:       &Remove{Removed: 2},
+		},
+	}
+	encoded, err := syntax.Marshal(&content)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded := FramedContent{}
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Proposal == nil || decoded.Proposal.Remove == nil ||
+		decoded.Proposal.Remove.Removed != 2 {
+		t.Fatalf("decoded proposal %+v", decoded.Proposal)
+	}
+}
+
+func TestFramedContentRejectsArmMismatch(t *testing.T) {
+	content := FramedContent{
+		GroupId:         []byte{0x01},
+		Sender:          Sender{SenderType: SenderTypeMember},
+		ContentType:     ContentTypeApplication,
+		ApplicationData: []byte("x"),
+		Commit:          &Commit{},
+	}
+	// the refusal must survive syntax.Marshal, which joins the semantic error from MarshalMLS
+	// with the Writer's sticky error
+	if _, err := syntax.Marshal(&content); !errors.Is(err, ErrContentArmMismatch) {
+		t.Fatalf("got %v, want ErrContentArmMismatch", err)
+	}
+}
+
+func TestFramedContentRejectsUnknownContentType(t *testing.T) {
+	content := FramedContent{
+		GroupId:     []byte{0x01},
+		Sender:      Sender{SenderType: SenderTypeMember},
+		ContentType: ContentType(9),
+	}
+	if _, err := syntax.Marshal(&content); !errors.Is(err, ErrUnknownContentType) {
+		t.Fatalf("got %v, want ErrUnknownContentType", err)
+	}
+}
+
+// The encoder refuses before it writes, which framing.go argues for at length and which nothing
+// else in this file observes for FramedContent.
+//
+// A FramedContent is the signature preimage and the transcript hash preimage, so a half written
+// one that a caller ignored the error from is a preimage shorter than the message it claims to
+// describe. The Writer is handed to the codec directly rather than through syntax.Marshal,
+// because syntax.Marshal builds its own Writer and hands back nothing when it refuses -- which
+// is precisely the octets this test is about.
+func TestFramedContentWritesNothingBeforeItRefuses(t *testing.T) {
+	content := FramedContent{
+		GroupId:         bytes.Repeat([]byte{0xaa}, 8),
+		Epoch:           5,
+		Sender:          Sender{SenderType: SenderTypeMember, LeafIndex: 1},
+		ContentType:     ContentTypeApplication,
+		ApplicationData: []byte("x"),
+		Commit:          &Commit{},
+	}
+	w := syntax.NewWriter()
+	if err := content.MarshalMLS(w); !errors.Is(err, ErrContentArmMismatch) {
+		t.Fatalf("got %v, want ErrContentArmMismatch", err)
+	}
+	if w.Len() != 0 {
+		t.Fatalf("the refusal left %d octets on the caller's Writer; a FramedContent is the tail of nothing, so those octets are the front of a preimage that describes no message",
+			w.Len())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AuthenticatedContent, the transcript hash input and the proposal reference
+// ---------------------------------------------------------------------------
+
+// newTestCrypto is one crypto provider constructor for this file's framing tests.
+//
+// It delegates to crypto_test.go's mustProvider rather than calling NewCryptoProvider again:
+// two spellings of "the provider these tests run at" is two places for the suite to be chosen,
+// and the suite is what decides KDF.Nh and therefore the width of every reference below.
+func newTestCrypto(t *testing.T) CryptoProvider {
+	t.Helper()
+	return mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+}
+
+// testAuthenticatedCommit is a commit carrying AuthenticatedContent, built once so the tests
+// below vary one thing each rather than each declaring a slightly different value.
+func testAuthenticatedCommit() AuthenticatedContent {
+	return AuthenticatedContent{
+		WireFormat: WireFormatPublicMessage,
+		Content: FramedContent{
+			GroupId:     []byte{0x07},
+			Epoch:       2,
+			Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: 1},
+			ContentType: ContentTypeCommit,
+			Commit:      &Commit{},
+		},
+		Auth: FramedContentAuthData{
+			Signature:       []byte{0xde, 0xad},
+			ConfirmationTag: []byte{0xbe, 0xef},
+		},
+	}
+}
+
+// testAuthenticatedProposal is a proposal carrying AuthenticatedContent, for the reference tests.
+func testAuthenticatedProposal() AuthenticatedContent {
+	return AuthenticatedContent{
+		WireFormat: WireFormatPublicMessage,
+		Content: FramedContent{
+			GroupId:     []byte{0x07},
+			Epoch:       2,
+			Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: 1},
+			ContentType: ContentTypeProposal,
+			Proposal:    &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}},
+		},
+		Auth: FramedContentAuthData{Signature: []byte{0xde, 0xad}},
+	}
+}
+
+func TestAuthenticatedContentRoundTrip(t *testing.T) {
+	authContent := testAuthenticatedCommit()
+	encoded, err := syntax.Marshal(&authContent)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if encoded[0] != 0x00 || encoded[1] != 0x01 {
+		t.Fatalf("wire format prefix %x, want 0001", encoded[0:2])
+	}
+
+	decoded := AuthenticatedContent{}
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	reencoded, err := syntax.Marshal(&decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("re-encoded %x, want %x", reencoded, encoded)
+	}
+}
+
+func TestConfirmedTranscriptHashInputOmitsConfirmationTag(t *testing.T) {
+	authContent := testAuthenticatedCommit()
+	authContent.WireFormat = WireFormatPrivateMessage
+	input, err := authContent.ConfirmedTranscriptHashInput()
+	if err != nil {
+		t.Fatalf("input: %v", err)
+	}
+
+	w := syntax.NewWriter()
+	w.WriteUint16(uint16(WireFormatPrivateMessage))
+	if err := authContent.Content.MarshalMLS(w); err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	w.WriteOpaque(authContent.Auth.Signature)
+	want, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("bytes: %v", err)
+	}
+	if !bytes.Equal(input, want) {
+		t.Fatalf("input %x, want %x", input, want)
+	}
+	if bytes.Contains(input, authContent.Auth.ConfirmationTag) {
+		t.Fatal("confirmation tag leaked into ConfirmedTranscriptHashInput")
+	}
+}
+
+func TestConfirmedTranscriptHashInputRefusesNonCommit(t *testing.T) {
+	authContent := AuthenticatedContent{
+		WireFormat: WireFormatPrivateMessage,
+		Content: FramedContent{
+			GroupId:         []byte{0x07},
+			Sender:          Sender{SenderType: SenderTypeMember},
+			ContentType:     ContentTypeApplication,
+			ApplicationData: []byte("x"),
+		},
+		Auth: FramedContentAuthData{Signature: []byte{0x01}},
+	}
+	if _, err := authContent.ConfirmedTranscriptHashInput(); !errors.Is(err, ErrContentArmMismatch) {
+		t.Fatalf("got %v, want ErrContentArmMismatch", err)
+	}
+}
+
+// TestConfirmedTranscriptHashInputPrefixesTheSignatureAsAnMlsVector separates the two length
+// prefixes this package can write, over the one input where the substitution is invisible.
+//
+// The signature enters the section 8.2 input as opaque<V>, section 2.1.2's varint: for a two
+// octet signature that is the single octet 0x02. syntax's WriteOpaqueLP is the record layer's
+// fixed thirty two bit prefix and would write 0x00000002 -- four octets where one belongs, three
+// of them zero. Every member of a group running that code agrees with every other, the corpus is
+// the only thing that disagrees, and the disagreement arrives as a permanent fork at the first
+// commit shared with anybody else.
+//
+// The assertion is over the OCTETS between the framed content and the signature rather than over
+// a golden blob, so it says which of the two prefixes was written rather than that the answer
+// changed.
+func TestConfirmedTranscriptHashInputPrefixesTheSignatureAsAnMlsVector(t *testing.T) {
+	authContent := testAuthenticatedCommit()
+	input, err := authContent.ConfirmedTranscriptHashInput()
+	if err != nil {
+		t.Fatalf("input: %v", err)
+	}
+	w := syntax.NewWriter()
+	w.WriteUint16(uint16(authContent.WireFormat))
+	if err := authContent.Content.MarshalMLS(w); err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	head, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("bytes: %v", err)
+	}
+	if !bytes.HasPrefix(input, head) {
+		t.Fatalf("the input %x does not open with the wire format and framed content %x", input, head)
+	}
+	signature := authContent.Auth.Signature
+
+	varint := syntax.NewWriter()
+	varint.WriteOpaque(signature)
+	wantTail, err := varint.Bytes()
+	if err != nil {
+		t.Fatalf("varint bytes: %v", err)
+	}
+	recordLayer := syntax.NewWriter()
+	recordLayer.WriteOpaqueLP(signature)
+	unwantedTail, err := recordLayer.Bytes()
+	if err != nil {
+		t.Fatalf("record layer bytes: %v", err)
+	}
+	if bytes.Equal(wantTail, unwantedTail) {
+		t.Fatalf("both prefixes wrote %x for a %d octet signature, so this test cannot separate them",
+			wantTail, len(signature))
+	}
+	if tail := input[len(head):]; !bytes.Equal(tail, wantTail) {
+		t.Fatalf("the signature was written as %x; the MLS opaque<V> is %x and the record layer's fixed prefix is %x",
+			tail, wantTail, unwantedTail)
+	}
+}
+
+// TestConfirmedTranscriptHashInputIsWhatThePublishedTranscriptChainConsumes is the assertion
+// nothing in this package was making: that the input THIS plan builds is the input the key
+// schedule plan's ConfirmedTranscriptHash was written to consume.
+//
+// The two halves were written by different plans against the same section and never met. p4 read
+// transcript-hashes.json by SPLITTING the published AuthenticatedContent at a byte offset --
+// len(blob) - (Nh + the width of that vector's own length prefix) -- because no framing type
+// existed to parse it with, and both transcript_test.go and the family 7 runner say in as many
+// words that when p6 lands (*AuthenticatedContent).UnmarshalMLS the offset is replaced by the
+// parse. This is that landing, and this is the test that holds the two readings to each other
+// before the offset stops being computed anywhere.
+//
+// Four things are compared per case, and they fail differently:
+//
+//   - the codec's ConfirmedTranscriptHashInput is byte for byte the offset split's head. A
+//     preimage one octet longer or shorter than p4's is a transcript that forks.
+//   - the confirmation tag the codec recovered is the offset split's tail, verified as
+//     MAC(confirmation_key, confirmed_transcript_hash_after) -- the corpus's own step, which is
+//     what makes the split honest rather than assumed.
+//   - p4's own ConfirmedTranscriptHash over this plan's input is the PUBLISHED confirmed hash,
+//     which is the end to end statement: this input, that function, the mlswg's answer.
+//   - the serialized AuthenticatedContent re-encodes to the corpus's own octets, which is what
+//     says the codec is canonical over bytes it did not produce -- and which drives Commit,
+//     ProposalOrRef and the whole FramedContent decode over real published input rather than
+//     over values this file built.
+func TestConfirmedTranscriptHashInputIsWhatThePublishedTranscriptChainConsumes(t *testing.T) {
+	entries := trPublishedEntries(t)
+	reached := map[CipherSuite]int{}
+	compared := 0
+	for index, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		at := fmt.Sprintf("%s entry %d suite %#04x", transcriptHashKatFile, index, uint16(suite))
+		crypto := mustProvider(t, suite)
+		blob := MustHex(t, entry.AuthenticatedContent)
+
+		authContent := AuthenticatedContent{}
+		if err := syntax.Unmarshal(blob, &authContent); err != nil {
+			t.Fatalf("%s: the published authenticated_content did not decode: %v", at, err)
+		}
+		reencoded, err := syntax.Marshal(&authContent)
+		if err != nil {
+			t.Fatalf("%s: re-marshal: %v", at, err)
+		}
+		if !bytes.Equal(reencoded, blob) {
+			t.Fatalf("%s: re-encoded %x, want the corpus's own %x", at, reencoded, blob)
+		}
+
+		head, tail := trSplitPublishedCommit(t, at, crypto, blob)
+		input, err := authContent.ConfirmedTranscriptHashInput()
+		if err != nil {
+			t.Fatalf("%s: ConfirmedTranscriptHashInput: %v", at, err)
+		}
+		if !bytes.Equal(input, head) {
+			t.Fatalf("%s: this plan builds the section 8.2 input as %x and the key schedule plan reads it out of the same blob as %x; the two halves of one transcript disagree",
+				at, input, head)
+		}
+		if !bytes.Equal(authContent.Auth.ConfirmationTag, tail) {
+			t.Fatalf("%s: the codec recovered the confirmation tag %x and the offset split recovered %x",
+				at, authContent.Auth.ConfirmationTag, tail)
+		}
+
+		confirmed := ConfirmedTranscriptHash(crypto, MustHex(t, entry.InterimTranscriptHashBefore), input)
+		if want := MustHex(t, entry.ConfirmedTranscriptHashAfter); !bytes.Equal(confirmed, want) {
+			t.Fatalf("%s: ConfirmedTranscriptHash over this plan's input is %x, and the corpus publishes %x",
+				at, confirmed, want)
+		}
+		// guardrail 8: the tag comparison is the provider's MacVerify and nothing spelled out
+		// here. A split taken one octet out recovers bytes this refuses.
+		if !crypto.MacVerify(MustHex(t, entry.ConfirmationKey), confirmed, authContent.Auth.ConfirmationTag) {
+			t.Fatalf("%s: the confirmation tag the codec recovered does not verify as MAC(confirmation_key, confirmed_transcript_hash_after)",
+				at)
+		}
+		reached[suite] += 1
+		compared += 1
+	}
+	if compared == 0 {
+		t.Fatalf("no case of %s was at a registered suite, so this compared nothing", transcriptHashKatFile)
+	}
+	for _, suite := range Suites() {
+		if reached[suite] == 0 {
+			t.Fatalf("%s carries no case at registered suite %#04x, so nothing above ran at it",
+				transcriptHashKatFile, uint16(suite))
+		}
+	}
+	t.Logf("%d published commits parsed, re-encoded and chained through the key schedule plan's own function", compared)
+}
+
+// TestTheSectionEightTwoInputDecodesBackToTheStructureItNames is the other direction of the
+// preimage, over the corpus's own bytes.
+//
+// A preimage that only encodes is a preimage no test can hold against bytes it did not produce:
+// the encode side is compared against the offset split next door, and both could be laying the
+// fields out in an order that agrees with itself. Reading the head back as the section 8.2
+// structure and finding the fields the corpus published is what says the layout is the RFC's.
+func TestTheSectionEightTwoInputDecodesBackToTheStructureItNames(t *testing.T) {
+	entries := trPublishedEntries(t)
+	read := 0
+	for index, entry := range entries {
+		suite := CipherSuite(entry.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		at := fmt.Sprintf("%s entry %d suite %#04x", transcriptHashKatFile, index, uint16(suite))
+		crypto := mustProvider(t, suite)
+		blob := MustHex(t, entry.AuthenticatedContent)
+		head, _ := trSplitPublishedCommit(t, at, crypto, blob)
+
+		input := confirmedTranscriptHashInput{}
+		if err := syntax.Unmarshal(head, &input); err != nil {
+			t.Fatalf("%s: the section 8.2 input did not decode: %v", at, err)
+		}
+		if input.Content.ContentType != ContentTypeCommit {
+			t.Fatalf("%s: the published transcript entry decoded with content type %d, and section 8.2 chains over commits",
+				at, input.Content.ContentType)
+		}
+		authContent := AuthenticatedContent{}
+		if err := syntax.Unmarshal(blob, &authContent); err != nil {
+			t.Fatalf("%s: authenticated_content: %v", at, err)
+		}
+		if input.WireFormat != authContent.WireFormat {
+			t.Fatalf("%s: the input decoded wire format %d and the authenticated content %d",
+				at, input.WireFormat, authContent.WireFormat)
+		}
+		if !bytes.Equal(input.Signature, authContent.Auth.Signature) {
+			t.Fatalf("%s: the input decoded the signature %x and the authenticated content %x",
+				at, input.Signature, authContent.Auth.Signature)
+		}
+		reencoded, err := syntax.Marshal(&input)
+		if err != nil {
+			t.Fatalf("%s: re-marshal: %v", at, err)
+		}
+		if !bytes.Equal(reencoded, head) {
+			t.Fatalf("%s: the section 8.2 input re-encoded to %x, want %x", at, reencoded, head)
+		}
+		read += 1
+	}
+	if read == 0 {
+		t.Fatalf("no case of %s was read back as the section 8.2 structure", transcriptHashKatFile)
+	}
+}
+
+func TestProposalRefCoversTheWholeAuthenticatedContent(t *testing.T) {
+	crypto := newTestCrypto(t)
+	authContent := testAuthenticatedProposal()
+
+	ref, err := authContent.ProposalRef(crypto)
+	if err != nil {
+		t.Fatalf("ref: %v", err)
+	}
+	if len(ref) != crypto.HashSize() {
+		t.Fatalf("ref length %d, want %d", len(ref), crypto.HashSize())
+	}
+	encoded, err := syntax.Marshal(&authContent)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Equal(ref, MakeProposalRef(crypto, encoded)) {
+		t.Fatal("ProposalRef is not MakeProposalRef over the serialized AuthenticatedContent")
+	}
+
+	// the signature is inside the ref, so re-signing changes it
+	resigned := authContent
+	resigned.Auth.Signature = []byte{0xde, 0xae}
+	other, err := resigned.ProposalRef(crypto)
+	if err != nil {
+		t.Fatalf("ref: %v", err)
+	}
+	if bytes.Equal(ref, other) {
+		t.Fatal("ProposalRef does not cover the signature")
+	}
+}
+
+func TestProposalRefRefusesNonProposal(t *testing.T) {
+	crypto := newTestCrypto(t)
+	authContent := AuthenticatedContent{
+		WireFormat: WireFormatPrivateMessage,
+		Content: FramedContent{
+			GroupId:         []byte{0x07},
+			Sender:          Sender{SenderType: SenderTypeMember},
+			ContentType:     ContentTypeApplication,
+			ApplicationData: []byte("x"),
+		},
+		Auth: FramedContentAuthData{Signature: []byte{0x01}},
+	}
+	if _, err := authContent.ProposalRef(crypto); !errors.Is(err, ErrContentArmMismatch) {
+		t.Fatalf("got %v, want ErrContentArmMismatch", err)
+	}
+}
+
+// TestProposalRefIsNotTakenOverASmallerStructureOrWithoutItsLabel is the half of "the ref is over
+// the right bytes" that no round trip and no length check can see.
+//
+// A reference taken over the FramedContent rather than the AuthenticatedContent, over the
+// Proposal alone, with the label dropped, or with the key package label instead, is a hash of
+// exactly the right width, stable across runs, self consistent, and different from what every
+// other implementation computes. The commit that names a proposal by one is a commit no peer can
+// apply, and nothing about it looks wrong from inside.
+//
+// The four wrong inputs are held against the real one rather than against each other, and each
+// is spelled out here as the input a plausible mistake would produce.
+func TestProposalRefIsNotTakenOverASmallerStructureOrWithoutItsLabel(t *testing.T) {
+	crypto := newTestCrypto(t)
+	authContent := testAuthenticatedProposal()
+	ref, err := authContent.ProposalRef(crypto)
+	if err != nil {
+		t.Fatalf("ref: %v", err)
+	}
+	wholeStructure, err := syntax.Marshal(&authContent)
+	if err != nil {
+		t.Fatalf("marshal the authenticated content: %v", err)
+	}
+	framedContent, err := syntax.Marshal(&authContent.Content)
+	if err != nil {
+		t.Fatalf("marshal the framed content: %v", err)
+	}
+	proposal, err := syntax.Marshal(authContent.Content.Proposal)
+	if err != nil {
+		t.Fatalf("marshal the proposal: %v", err)
+	}
+	for _, wrong := range []struct {
+		why   string
+		value []byte
+	}{
+		{"taken over the FramedContent, so it covers neither the wire format nor the signature",
+			MakeProposalRef(crypto, framedContent)},
+		{"taken over the Proposal alone, so two members proposing the same removal share one reference",
+			MakeProposalRef(crypto, proposal)},
+		{"taken with the label dropped, so a proposal reference and a key package reference over one blob collide",
+			RefHash(crypto, "", wholeStructure)},
+		{"taken with no RefHashInput at all, which is the digest with both length prefixes gone",
+			crypto.Hash(wholeStructure)},
+		{"taken with the key package label, which is the other half of section 5.2's domain separation",
+			MakeKeyPackageRef(crypto, wholeStructure)},
+	} {
+		if bytes.Equal(ref, wrong.value) {
+			t.Errorf("ProposalRef equals the reference %s", wrong.why)
+		}
+	}
+	if !bytes.Equal(ref, RefHash(crypto, ProposalRefLabel, wholeStructure)) {
+		t.Fatal("ProposalRef is not RefHash over the serialized AuthenticatedContent under the proposal label, so the comparisons above are against the wrong baseline")
+	}
+}
+
+// TestProposalRefIsTheProvidersWholeHash refuses a truncated reference.
+//
+// A ref cut short is still a ref: it is stable, it is the same on every run, and it collides
+// with every other proposal sharing its prefix. The width is read off the provider rather than
+// written down here, because both registered suites fix KDF.Nh at 32 and a literal 32 is right
+// for both and wrong for the first suite this package adds.
+func TestProposalRefIsTheProvidersWholeHash(t *testing.T) {
+	crypto := newTestCrypto(t)
+	authContent := testAuthenticatedProposal()
+	ref, err := authContent.ProposalRef(crypto)
+	if err != nil {
+		t.Fatalf("ref: %v", err)
+	}
+	if len(ref) != crypto.HashSize() {
+		t.Fatalf("the reference is %d octets and the provider's hash is %d", len(ref), crypto.HashSize())
+	}
+	// and a prefix of it is a different value, so a comparison against a truncated reference is
+	// a comparison that fails rather than one that happens to agree
+	if bytes.Equal(ref, ref[:len(ref)-1]) {
+		t.Fatal("a reference one octet shorter compares equal to the whole one")
+	}
+}
+
+// proposalRefFieldPath renders one field of one structure as the path this file's rows are keyed
+// by.
+func proposalRefFieldPath(structure reflect.Type, field reflect.StructField) string {
+	return structure.Name() + "." + field.Name
+}
+
+// proposalRefFieldsOf walks a VALUE and answers every field of it that a row has to account for.
+//
+// The walk is over the value rather than over the type, and that is what bounds it: it descends
+// into a struct field and into a non-nil pointer to a struct, so a proposal carrying a Remove
+// reaches AuthenticatedContent, FramedContent, Sender, FramedContentAuthData, Proposal and
+// Remove, and stops at the arms that are nil. A type walk would follow Add into KeyPackage into
+// LeafNode into Credential and answer the whole package.
+//
+// A field the walk descends INTO owes no row of its own -- its leaves carry it -- and every other
+// field owes one. So the class is what the value is made of, and an eighth field added to any of
+// those six structures arrives here without an edit.
+func proposalRefFieldsOf(value reflect.Value, found *[]string) {
+	structure := value.Type()
+	for i := 0; i < structure.NumField(); i += 1 {
+		field := structure.Field(i)
+		held := value.Field(i)
+		if held.Kind() == reflect.Struct {
+			proposalRefFieldsOf(held, found)
+			continue
+		}
+		if held.Kind() == reflect.Pointer && !held.IsNil() && held.Elem().Kind() == reflect.Struct {
+			proposalRefFieldsOf(held.Elem(), found)
+			continue
+		}
+		*found = append(*found, proposalRefFieldPath(structure, field))
+	}
+}
+
+// What one field's mutation must do to the reference.
+type proposalRefOutcome int
+
+const (
+	// the field is on the wire for this shape, so the reference must MOVE
+	proposalRefMoves proposalRefOutcome = iota
+	// the field is not written for this shape, so the reference must not move. Each row saying
+	// this names the reason, and the reason is always a select() that did not select it.
+	proposalRefUnchanged
+	// the field cannot be varied and leave an encodable proposal, so the reference cannot be
+	// computed at all
+	proposalRefRefused
+)
+
+// One field, how to vary it, and what that must do.
+type proposalRefVariation struct {
+	outcome proposalRefOutcome
+	why     string
+	vary    func(authContent *AuthenticatedContent)
+}
+
+// proposalRefVariations is the behaviour half: one row per field the walk above finds.
+//
+// The CLASS is derived and this is the classification of it, which is the division this project
+// settled on after fourteen hand written classes turned out to understate what they stood for. A
+// field with no row fails; a row naming a field the walk does not reach fails. What each row
+// asserts is a real property in both directions -- a field on the wire must move the reference,
+// and a field the select() did not select must not, which is the statement that a reference
+// covers the message rather than the struct.
+func proposalRefVariations() map[string]proposalRefVariation {
+	return map[string]proposalRefVariation{
+		"AuthenticatedContent.WireFormat": {proposalRefMoves,
+			"the wire format is the first field of the serialization",
+			func(a *AuthenticatedContent) { a.WireFormat = WireFormatPrivateMessage }},
+		"FramedContent.GroupId": {proposalRefMoves,
+			"the group id is inside the framed content",
+			func(a *AuthenticatedContent) { a.Content.GroupId = []byte{0x08} }},
+		"FramedContent.Epoch": {proposalRefMoves,
+			"the epoch is what stops a proposal being replayed into another one",
+			func(a *AuthenticatedContent) { a.Content.Epoch = 3 }},
+		"FramedContent.AuthenticatedData": {proposalRefMoves,
+			"the authenticated data is covered by the signature and therefore by the reference",
+			func(a *AuthenticatedContent) { a.Content.AuthenticatedData = []byte{0x09} }},
+		"FramedContent.ContentType": {proposalRefRefused,
+			"a reference is only taken over a proposal",
+			func(a *AuthenticatedContent) { a.Content.ContentType = ContentTypeCommit }},
+		"FramedContent.ApplicationData": {proposalRefRefused,
+			"application data beside a proposal is an arm mismatch",
+			func(a *AuthenticatedContent) { a.Content.ApplicationData = []byte{0x0a} }},
+		"FramedContent.Commit": {proposalRefRefused,
+			"a commit beside a proposal is an arm mismatch",
+			func(a *AuthenticatedContent) { a.Content.Commit = &Commit{} }},
+		"Sender.SenderType": {proposalRefMoves,
+			"the sender type selects which arm of Sender is written",
+			func(a *AuthenticatedContent) { a.Content.Sender.SenderType = SenderTypeNewMemberProposal }},
+		"Sender.LeafIndex": {proposalRefMoves,
+			"the leaf index is what makes two members' identical proposals different references",
+			func(a *AuthenticatedContent) { a.Content.Sender.LeafIndex = 9 }},
+		"Sender.SenderIndex": {proposalRefUnchanged,
+			"SenderIndex is the external arm and this sender is a member, so it is not written",
+			func(a *AuthenticatedContent) { a.Content.Sender.SenderIndex = 9 }},
+		"FramedContentAuthData.Signature": {proposalRefMoves,
+			"the signature is inside the reference, so re-signing renames the proposal",
+			func(a *AuthenticatedContent) { a.Auth.Signature = []byte{0xde, 0xae} }},
+		"FramedContentAuthData.ConfirmationTag": {proposalRefUnchanged,
+			"the confirmation tag is the commit arm of the auth data and this is a proposal, so it is not written",
+			func(a *AuthenticatedContent) { a.Auth.ConfirmationTag = []byte{0xbe, 0xef} }},
+		"Proposal.ProposalType": {proposalRefRefused,
+			"a proposal type naming an arm that is not populated is an arm mismatch",
+			func(a *AuthenticatedContent) { a.Content.Proposal.ProposalType = ProposalTypeAdd }},
+		"Proposal.Add": {proposalRefRefused,
+			"a second arm is refused rather than dropped, or the two values would share a reference",
+			func(a *AuthenticatedContent) { a.Content.Proposal.Add = &Add{} }},
+		"Proposal.Update": {proposalRefRefused,
+			"a second arm is refused rather than dropped",
+			func(a *AuthenticatedContent) { a.Content.Proposal.Update = &Update{} }},
+		"Proposal.PreSharedKey": {proposalRefRefused,
+			"a second arm is refused rather than dropped",
+			func(a *AuthenticatedContent) { a.Content.Proposal.PreSharedKey = &PreSharedKey{} }},
+		"Proposal.ReInit": {proposalRefRefused,
+			"a second arm is refused rather than dropped",
+			func(a *AuthenticatedContent) { a.Content.Proposal.ReInit = &ReInit{} }},
+		"Proposal.ExternalInit": {proposalRefRefused,
+			"a second arm is refused rather than dropped",
+			func(a *AuthenticatedContent) { a.Content.Proposal.ExternalInit = &ExternalInit{} }},
+		"Proposal.GroupContextExtensions": {proposalRefRefused,
+			"a second arm is refused rather than dropped",
+			func(a *AuthenticatedContent) { a.Content.Proposal.GroupContextExtensions = &GroupContextExtensions{} }},
+		"Proposal.UnknownType": {proposalRefMoves,
+			"UnknownType overrides the discriminant that goes on the wire",
+			func(a *AuthenticatedContent) { a.Content.Proposal.UnknownType = ProposalType(0x0a0a) }},
+		"Proposal.UnknownBody": {proposalRefRefused,
+			"a verbatim body beside a registered arm is a second arm",
+			func(a *AuthenticatedContent) { a.Content.Proposal.UnknownBody = []byte{0x00} }},
+		"Remove.Removed": {proposalRefMoves,
+			"the removed leaf is the whole content of the proposal",
+			func(a *AuthenticatedContent) { a.Content.Proposal.Remove.Removed = 5 }},
+	}
+}
+
+// TestProposalRefsAreDistinctAcrossTheGeneratedProposalSpace is the collision property, over a
+// space derived from the structures a proposal is built out of rather than from a list of the
+// fields somebody thought of.
+//
+// Two properties, and they are separate claims:
+//
+//   - every field the encoding covers moves the reference, and no two of those references
+//     collide with each other or with the base. A reference that did not move for one field is a
+//     field the proposal carries and the reference does not, which is two distinct proposals
+//     under one name.
+//   - every field the encoding does NOT cover leaves the reference alone. That direction is not
+//     a formality: it is the statement that the reference is over the MESSAGE and not over the
+//     struct, and the two rows that assert it are the two select() arms this shape does not
+//     take.
+//
+// The rows are held to the derived field set in both directions, so a field added to any of the
+// six structures a proposal reaches fails here rather than being quietly outside the sweep.
+func TestProposalRefsAreDistinctAcrossTheGeneratedProposalSpace(t *testing.T) {
+	crypto := newTestCrypto(t)
+	base := testAuthenticatedProposal()
+	fields := []string{}
+	proposalRefFieldsOf(reflect.ValueOf(base), &fields)
+	slices.Sort(fields)
+	fields = slices.Compact(fields)
+	if len(fields) < 10 {
+		t.Fatalf("the walk read %v out of a proposal carrying AuthenticatedContent, which is fewer fields than those structures have", fields)
+	}
+
+	variations := proposalRefVariations()
+	for name := range variations {
+		if !slices.Contains(fields, name) {
+			t.Errorf("this file varies %s and no field of a proposal carrying AuthenticatedContent is reached under that name", name)
+		}
+	}
+
+	baseRef, err := base.ProposalRef(crypto)
+	if err != nil {
+		t.Fatalf("the base reference: %v", err)
+	}
+	seen := map[string]string{string(baseRef): "the unvaried proposal"}
+	moved, unchanged, refused := 0, 0, 0
+	for _, name := range fields {
+		variation, written := variations[name]
+		if !written {
+			t.Errorf("%s is a field of a proposal carrying AuthenticatedContent and nothing varies it, so nothing says whether the reference covers it",
+				name)
+			continue
+		}
+		varied := base
+		varied.Content.Proposal = &Proposal{}
+		*varied.Content.Proposal = *base.Content.Proposal
+		varied.Content.Proposal.Remove = &Remove{}
+		*varied.Content.Proposal.Remove = *base.Content.Proposal.Remove
+		variation.vary(&varied)
+
+		ref, err := varied.ProposalRef(crypto)
+		switch variation.outcome {
+		case proposalRefRefused:
+			if err == nil {
+				t.Errorf("%s varied and the reference came back anyway; the row says it is refused because %s", name, variation.why)
+				continue
+			}
+			refused += 1
+			continue
+		case proposalRefUnchanged:
+			if err != nil {
+				t.Errorf("%s varied and the reference was refused with %v; the row says it is not written because %s", name, err, variation.why)
+				continue
+			}
+			if !bytes.Equal(ref, baseRef) {
+				t.Errorf("%s varied and the reference moved; the row says %s, so it is on the wire after all", name, variation.why)
+				continue
+			}
+			unchanged += 1
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s varied and the reference was refused with %v; the row says it is on the wire because %s", name, err, variation.why)
+			continue
+		}
+		if other, collided := seen[string(ref)]; collided {
+			t.Errorf("varying %s produced the same reference as %s; two distinct proposals share one name, and a commit naming that reference applies whichever of the two arrived first",
+				name, other)
+			continue
+		}
+		seen[string(ref)] = "the proposal with " + name + " varied"
+		moved += 1
+	}
+	if moved == 0 || unchanged == 0 || refused == 0 {
+		t.Fatalf("the sweep moved %d references, left %d alone and refused %d; with any of the three empty this gate holds fewer rules than it states",
+			moved, unchanged, refused)
+	}
+	t.Logf("%d fields on the wire and pairwise distinct, %d off it and unchanged, %d refused, over %d derived fields",
+		moved, unchanged, refused, len(fields))
 }

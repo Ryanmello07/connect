@@ -281,3 +281,222 @@ var (
 	_ func(*FramedContentAuthData, *syntax.Writer, ContentType) error = (*FramedContentAuthData).MarshalMLS
 	_ func(*FramedContentAuthData, *syntax.Reader, ContentType) error = (*FramedContentAuthData).UnmarshalMLS
 )
+
+// ---------------------------------------------------------------------------
+// FramedContent
+// ---------------------------------------------------------------------------
+
+// FramedContent is the body of a group message before it is authenticated. Exactly one of
+// ApplicationData, Proposal and Commit is populated, selected by ContentType.
+//
+// This is the structure the signature is taken over and the structure the confirmed transcript
+// hash is taken over, which is why the arm check below is a REFUSAL rather than a preference:
+// MLS authenticates serialized forms, so an encoder that wrote whichever arm happened to be
+// non-nil would sign bytes describing a message the caller did not build, and every peer would
+// accept it.
+type FramedContent struct {
+	GroupId           []byte
+	Epoch             uint64
+	Sender            Sender
+	AuthenticatedData []byte
+	ContentType       ContentType
+	ApplicationData   []byte
+	Proposal          *Proposal
+	Commit            *Commit
+}
+
+// checkArms reports whether exactly the arm ContentType names is populated.
+//
+// The application arm is the one that cannot be read by counting. ApplicationData is a []byte
+// and its zero value is nil, but an application message carrying no bytes is legal and encodes
+// to an empty opaque<V> -- so "populated" for that arm is not a question the other two answer
+// the same way, and what is refused there is a proposal or a commit standing beside it.
+func (self *FramedContent) checkArms() error {
+	populated := 0
+	if self.ApplicationData != nil {
+		populated += 1
+	}
+	if self.Proposal != nil {
+		populated += 1
+	}
+	if self.Commit != nil {
+		populated += 1
+	}
+	switch self.ContentType {
+	case ContentTypeApplication:
+		if self.Proposal != nil || self.Commit != nil {
+			return ErrContentArmMismatch
+		}
+	case ContentTypeProposal:
+		if self.Proposal == nil || populated != 1 {
+			return ErrContentArmMismatch
+		}
+	case ContentTypeCommit:
+		if self.Commit == nil || populated != 1 {
+			return ErrContentArmMismatch
+		}
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownContentType, self.ContentType)
+	}
+	return nil
+}
+
+// MarshalMLS refuses before it writes, which is Sender.MarshalMLS's discipline and is load
+// bearing here for a sharper reason than it is there: this structure is the signature preimage
+// and the transcript hash preimage, and a half written one that a caller ignored the error from
+// is a preimage shorter than the message it claims to describe.
+func (self *FramedContent) MarshalMLS(w *syntax.Writer) error {
+	if err := self.checkArms(); err != nil {
+		return err
+	}
+	w.WriteOpaque(self.GroupId)
+	w.WriteUint64(self.Epoch)
+	if err := self.Sender.MarshalMLS(w); err != nil {
+		return err
+	}
+	w.WriteOpaque(self.AuthenticatedData)
+	w.WriteUint8(uint8(self.ContentType))
+	switch self.ContentType {
+	case ContentTypeApplication:
+		w.WriteOpaque(self.ApplicationData)
+		return nil
+	case ContentTypeProposal:
+		return self.Proposal.MarshalMLS(w)
+	case ContentTypeCommit:
+		return self.Commit.MarshalMLS(w)
+	}
+	return fmt.Errorf("%w: %d", ErrUnknownContentType, self.ContentType)
+}
+
+// UnmarshalMLS reads the five fixed fields, resets the receiver, and reads the arm the content
+// type selects.
+//
+// The reset happens after the fixed fields and before the arm, which is Proposal's arrangement
+// and not Sender's: the three arms write three different fields, so a fully staged decode would
+// be a second FramedContent built only to be copied over the first. What the reset buys is the
+// same thing the staging buys next door -- no arm of a previous value survives into a decode of
+// bytes that do not carry one.
+func (self *FramedContent) UnmarshalMLS(r *syntax.Reader) error {
+	groupId, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	epoch, err := r.ReadUint64()
+	if err != nil {
+		return err
+	}
+	sender := Sender{}
+	if err := sender.UnmarshalMLS(r); err != nil {
+		return err
+	}
+	authenticatedData, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	contentType, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	*self = FramedContent{
+		GroupId:           groupId,
+		Epoch:             epoch,
+		Sender:            sender,
+		AuthenticatedData: authenticatedData,
+		ContentType:       ContentType(contentType),
+	}
+	switch self.ContentType {
+	case ContentTypeApplication:
+		applicationData, err := r.ReadOpaque()
+		if err != nil {
+			return err
+		}
+		self.ApplicationData = applicationData
+		return nil
+	case ContentTypeProposal:
+		proposal := &Proposal{}
+		if err := proposal.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		self.Proposal = proposal
+		return nil
+	case ContentTypeCommit:
+		commit := &Commit{}
+		if err := commit.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		self.Commit = commit
+		return nil
+	}
+	return fmt.Errorf("%w: %d", ErrUnknownContentType, self.ContentType)
+}
+
+var _ syntax.Codec = (*FramedContent)(nil)
+
+// ---------------------------------------------------------------------------
+// AuthenticatedContent
+// ---------------------------------------------------------------------------
+
+// AuthenticatedContent is a FramedContent together with the authenticators over it, independent
+// of which wire format carried it. It is the object every validation path works on and the
+// object a staged commit holds.
+//
+// The wire format is a FIELD rather than a parameter, and it is inside the serialization,
+// because it is inside two preimages: the signature's FramedContentTBS and the confirmed
+// transcript hash's input both begin with it. That is what stops one member's public message
+// being replayed as another's private one -- the two produce different preimages, so a signature
+// made for one does not verify against the other.
+//
+// FramedContentAuthData is written through the content type this structure already carries
+// rather than through a discriminant of its own, which is why the codec below reaches into
+// Content for it. A second copy of the content type stored beside the auth data would be a
+// second statement of one fact, and the copy rather than the message would decide which arm was
+// read.
+type AuthenticatedContent struct {
+	WireFormat WireFormat
+	Content    FramedContent
+	Auth       FramedContentAuthData
+}
+
+func (self *AuthenticatedContent) MarshalMLS(w *syntax.Writer) error {
+	switch self.WireFormat {
+	case WireFormatPublicMessage, WireFormatPrivateMessage, WireFormatWelcome,
+		WireFormatGroupInfo, WireFormatKeyPackage:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownWireFormat, self.WireFormat)
+	}
+	w.WriteUint16(uint16(self.WireFormat))
+	if err := self.Content.MarshalMLS(w); err != nil {
+		return err
+	}
+	return self.Auth.MarshalMLS(w, self.Content.ContentType)
+}
+
+// UnmarshalMLS reads the wire format, resets the receiver, and reads the content and then the
+// auth data the content's own type selects.
+//
+// The auth data is read with self.Content.ContentType and not with a value read separately,
+// which is the whole of what makes this codec correct: the content type came off THESE bytes,
+// so the arm the auth data is read at is the arm the sender wrote.
+func (self *AuthenticatedContent) UnmarshalMLS(r *syntax.Reader) error {
+	wireFormat, err := r.ReadUint16()
+	if err != nil {
+		return err
+	}
+	decoded := AuthenticatedContent{WireFormat: WireFormat(wireFormat)}
+	switch decoded.WireFormat {
+	case WireFormatPublicMessage, WireFormatPrivateMessage, WireFormatWelcome,
+		WireFormatGroupInfo, WireFormatKeyPackage:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownWireFormat, decoded.WireFormat)
+	}
+	if err := decoded.Content.UnmarshalMLS(r); err != nil {
+		return err
+	}
+	if err := decoded.Auth.UnmarshalMLS(r, decoded.Content.ContentType); err != nil {
+		return err
+	}
+	*self = decoded
+	return nil
+}
+
+var _ syntax.Codec = (*AuthenticatedContent)(nil)

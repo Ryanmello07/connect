@@ -55,6 +55,16 @@ func providerNilMethodRows() []providerNilMethodRow {
 			hashes := InitialTranscriptHashes()
 			return hashes.SetFromGroupInfo(nil, nil, nil)
 		}},
+		// framing's proposal reference, on a ZERO valued AuthenticatedContent, which is the
+		// receiver that separates the two orders this body could be written in. A zero
+		// AuthenticatedContent carries content type 0, which is not a content type this package
+		// registers, so a body that looked at its receiver before its provider would answer
+		// ErrContentArmMismatch -- sending the caller to fix a message whose content type was
+		// never the problem, over a provider it never passed.
+		{name: "(*AuthenticatedContent).ProposalRef", call: func() error {
+			_, err := (&AuthenticatedContent{}).ProposalRef(nil)
+			return err
+		}},
 		// the leaf's two signature methods, on a zero valued receiver. The zero LeafNode
 		// carries source 0, which is not a source this package reads, so a body that built
 		// its preimage before it looked at the provider would answer ErrTreeMalformed here
