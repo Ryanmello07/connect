@@ -165,11 +165,19 @@ var _ syntax.Codec = (*Sender)(nil)
 // depended on from outside it either, so the swap costs nobody else anything, and every
 // consumer of this refusal until then is inside package mls.
 //
+// TWO layers raise it and this comment names both, so that the swap below is not written for
+// half of them. The codec returns it for a commit whose confirmation tag is missing on the
+// wire, in either direction; framing_protect.go's VerifyAuthenticatedContent returns it as
+// ValSem009 for a commit that reached the tag rule with none. "A commit carries no confirmation
+// tag" is ONE condition however it is reached, which is why there is one value for it rather
+// than a second sentinel next door.
+//
 // The swap is mechanical and it is not left to anybody's memory:
 // TestNoValidationOwnedNameHasLandedBesideItsStandIn derives the owed pair from this package's
 // own declarations and fails on the commit that lands the real name. When it does, each return
-// below becomes ValSem(ValSem009, ErrMissingConfirmationTag) -- the code CodeOf reads, with the
-// sentinel still reachable through (*ValidationError).Unwrap.
+// in this file AND the one in framing_protect.go becomes ValSem(ValSem009,
+// ErrMissingConfirmationTag) -- the code CodeOf reads, with the sentinel still reachable
+// through (*ValidationError).Unwrap.
 var errMissingConfirmationTag = errors.New("mls: commit carries no confirmation tag")
 
 // FramedContentAuthData is the pair of authenticators over a FramedContent: the signature every
