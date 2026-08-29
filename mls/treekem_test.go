@@ -34,6 +34,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"reflect"
 	"slices"
@@ -2758,6 +2761,98 @@ func TestEveryPublishedUpdatePathHasOneCiphertextPerResolutionNode(t *testing.T)
 		paths, checked, separated)
 }
 
+// TestEveryPublishedUpdatePathCarriesACommitSourceLeaf is the SECOND cross layer relation at
+// this boundary, stated the way the ciphertext count above is and for the same reason.
+//
+// RFC 9420 section 7.6 requires the leaf_node of an UpdatePath to carry leaf_node_source =
+// commit, which is what makes it carry a parent_hash at all -- the parent hash the receiver
+// recomputes the path against. The codec cannot enforce it: it decodes whatever leaf the leaf
+// codec accepts, and a key_package source leaf inside an UpdatePath decodes here without a
+// complaint, which is the first control below. Until this test the relation was NAMED nowhere --
+// the type comment on UpdatePathNode names the ciphertext count as the deliberately unenforced
+// one and this was the other, unwritten, which is the shape the ciphertext paragraph itself
+// warns about.
+//
+// It differs from the ciphertext count in one way worth writing down: the door is already built.
+// LeafValidationContext.ExpectedSource is a REQUIRED input whose own comment names "the tree and
+// the update path with commit", and Validate answers ErrLeafNodeSourceMismatch against it. So
+// the second control drives that door from the expectation this position takes, over every
+// source the package declares, and the gap this test closes is a naming gap rather than a
+// missing capability.
+func TestEveryPublishedUpdatePathCarriesACommitSourceLeaf(t *testing.T) {
+	leaves := 0
+	forEachPublishedUpdatePath(t, func(at int, tree *RatchetTree, published treekemPublishedUpdatePath, raw []byte) {
+		decoded := &UpdatePath{}
+		if err := syntax.Unmarshal(raw, decoded); err != nil {
+			t.Fatalf("entry %d, sender %d: Unmarshal: %v", at, published.Sender, err)
+		}
+		if decoded.LeafNode.LeafNodeSource != LeafNodeSourceCommit {
+			t.Fatalf("entry %d, sender %d: the published path's leaf carries source %d and section 7.6 requires commit, which is %d",
+				at, published.Sender, decoded.LeafNode.LeafNodeSource, LeafNodeSourceCommit)
+		}
+		// and the field that source exists to carry, which is the half a receiver reads: a
+		// leaf claiming the commit source with no parent hash is a path whose chain cannot be
+		// recomputed against anything.
+		if len(decoded.LeafNode.ParentHash) == 0 {
+			t.Fatalf("entry %d, sender %d: the published path's leaf is commit sourced and carries no parent hash",
+				at, published.Sender)
+		}
+		leaves += 1
+	})
+	if leaves != treekemUpdatePathCount {
+		t.Fatalf("the run read the leaf of %d published paths, want %d", leaves, treekemUpdatePathCount)
+	}
+
+	// the first control: this layer states the relation and does NOT enforce it. Every
+	// published leaf agrees with section 7.6, so a decoder that checked the source and one
+	// that never looked at it produce identical runs above, and only a leaf that must be
+	// refused somewhere separates them -- here it is accepted, which is what says the check
+	// belongs to a layer holding an expectation rather than to the codec.
+	lenient := testUpdatePathFixture()
+	lenient.LeafNode = *testLeafNodeOfSource(LeafNodeSourceKeyPackage)
+	encoded, err := syntax.Marshal(lenient)
+	if err != nil {
+		t.Fatalf("Marshal a path whose leaf carries the key_package source: %v", err)
+	}
+	roundTripped := &UpdatePath{}
+	if err := syntax.Unmarshal(encoded, roundTripped); err != nil {
+		t.Fatalf("a path whose leaf carries the key_package source was refused by the codec: %v", err)
+	}
+	if roundTripped.LeafNode.LeafNodeSource != LeafNodeSourceKeyPackage {
+		t.Fatalf("the decode answered source %d, so the control did not carry the source it was built to carry",
+			roundTripped.LeafNode.LeafNodeSource)
+	}
+
+	// the second control: the door that does enforce it, driven from the expectation THIS
+	// position takes. Over every source the package declares rather than over the one wrong
+	// source somebody would have written, so a fourth source is refused by this on the commit
+	// that declares it.
+	crypto := leafValidationCrypto(t)
+	accepted, refused := 0, 0
+	for _, source := range leafNodeSources(t) {
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+		err := leaf.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit))
+		if source == LeafNodeSourceCommit {
+			if err != nil {
+				t.Errorf("the commit sourced leaf was refused at the update path position: %v", err)
+			}
+			accepted += 1
+			continue
+		}
+		if !errors.Is(err, ErrLeafNodeSourceMismatch) {
+			t.Errorf("a %d sourced leaf validated at the update path position gave err = %v, want ErrLeafNodeSourceMismatch",
+				source, err)
+		}
+		refused += 1
+	}
+	if accepted != 1 || refused != len(leafNodeSources(t))-1 {
+		t.Fatalf("the expectation this position takes accepted %d leaves and refused %d, over the %d sources this package declares",
+			accepted, refused, len(leafNodeSources(t)))
+	}
+	t.Logf("%d published paths carry a commit sourced leaf with a parent hash; the codec accepts a key_package sourced one and ExpectedSource refuses it",
+		leaves)
+}
+
 // forEachPublishedUpdatePath is the shared walk of treekem.json's update_paths half, so that the
 // two properties above run over provably the same set rather than over two filters that could
 // drift.
@@ -2797,5 +2892,405 @@ func forEachPublishedUpdatePath(t *testing.T, visit func(at int, tree *RatchetTr
 	}
 	if matched == 0 {
 		t.Fatal("no entry of treekem.json is at a suite this package implements, so the sweep ran over nothing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the three properties this file's own level by level tests did not reach
+// ---------------------------------------------------------------------------
+
+// Each of the three below was measured against the code it forbids before it was kept: the
+// mutation was applied, the test was watched failing, and the mutation was reverted.
+
+// TestAnUpdatePathEncodeAnswersExactlyWhatItsLeafEncoderAnswers is the propagation the whole
+// three level encoder rests on, and nothing here observed it.
+//
+// UpdatePath.MarshalMLS is the only encoder in this file that calls a FALLIBLE one. The leaf's
+// refuses a source it has no variant for as a RETURNED error rather than by latching the Writer,
+// so a body that dropped it -- `_ = self.LeafNode.MarshalMLS(w)` -- still produces bytes:
+// syntax.MarshalLimit joins the encoder's refusal with the Writer's, the Writer never latched
+// anything, the join is nil, and the caller is handed a path whose leaf carries a source octet
+// and no variant at all. That is a structure every other implementation reads differently, and
+// it is the octets a commit's confirmation tag is then taken over.
+//
+// The class is the WHOLE octet space of the source field and the verdict on each member is the
+// leaf encoder's own answer, never a list of sources written here. A fourth source moves from
+// the refused side of this sweep to the accepted side on the commit that declares it, and the
+// accepted side is compared against the package's declared constants rather than against a
+// count, so a source declared and not implemented fails here too.
+func TestAnUpdatePathEncodeAnswersExactlyWhatItsLeafEncoderAnswers(t *testing.T) {
+	nodes := testUpdatePathFixture().Nodes
+	accepted := []LeafNodeSource{}
+	refused := 0
+	for octet := 0; octet <= 0xff; octet += 1 {
+		source := LeafNodeSource(octet)
+		leaf := testLeafNodeOfSource(source)
+		leafBytes, leafErr := syntax.Marshal(leaf)
+		path := &UpdatePath{LeafNode: *testLeafNodeOfSource(source), Nodes: nodes}
+		pathBytes, pathErr := syntax.Marshal(path)
+		if leafErr != nil {
+			refused += 1
+			if pathErr == nil {
+				t.Errorf("source %d: the leaf encoder refused it with %v and the path encoded %d octets and no error, so a path publishes a leaf its own encoder would not write",
+					octet, leafErr, len(pathBytes))
+				continue
+			}
+			// the SAME failure and not merely a failure. Compared against the leaf's own
+			// answer rather than against a sentinel named here, so a leaf that learns a
+			// second refusal is covered by this on the commit that adds it, and a path
+			// encoder that answered an error of its own -- sending the caller to look at
+			// the half of the structure that is not the problem -- is reported.
+			if pathErr.Error() != leafErr.Error() {
+				t.Errorf("source %d: the leaf encoder answered %v and the path answered %v",
+					octet, leafErr, pathErr)
+			}
+			if pathBytes != nil {
+				t.Errorf("source %d: the path refused and still answered %d octets", octet, len(pathBytes))
+			}
+			continue
+		}
+		accepted = append(accepted, source)
+		if pathErr != nil {
+			t.Errorf("source %d: the leaf encoded and the path refused it with %v", octet, pathErr)
+			continue
+		}
+		// and the accepted half is not vacuous either: the octets the path published for the
+		// leaf are the leaf's own encoding, so a path that swallowed the refusal by encoding
+		// something else in the leaf's place is reported here rather than passing as a leaf
+		// that happened to encode.
+		if !bytes.HasPrefix(pathBytes, leafBytes) {
+			t.Errorf("source %d: the path's first %d octets are not the leaf's own encoding",
+				octet, len(leafBytes))
+		}
+	}
+	// both outcomes must occur, or every branch above holds over an empty set: a leaf encoder
+	// that refused everything satisfies this test exactly as one that refused nothing does.
+	if want := leafNodeSources(t); !slices.Equal(accepted, want) {
+		t.Fatalf("the leaf encoder accepted the source octets %v and this package declares %v",
+			accepted, want)
+	}
+	if refused != 0x100-len(accepted) {
+		t.Fatalf("%d source octets were refused and %d accepted, and the space is %d",
+			refused, len(accepted), 0x100)
+	}
+	t.Logf("%d of 256 source octets refused by both encoders, %d accepted by both", refused, len(accepted))
+}
+
+// TestOpenWithLabelMakesOneAttemptUnderTheCallersOwnParametersAndNoOther is the "no fallback
+// info" rule, at the layer whose comment claims it holds by construction.
+//
+// crypto_labels.go argues the rule and crypto_labels_test.go walks it for DecryptWithLabel. This
+// function forwards to that one, and the comment on it says the rule therefore holds here by
+// construction -- a construction claim with nothing that fails when the construction changes. An
+// OpenWithLabel that retried a failed open under any other parameters opens a ciphertext sealed
+// for a purpose its caller never named, and the round trip beside this cannot see it: that test
+// seals under the REAL parameters and opens under wrong ones, so a fallback attempt fails too
+// and it still passes.
+//
+// Two halves, because either alone leaves a fallback standing. The BEHAVIOURAL half is the whole
+// cross product of crypto_labels_test.go's own probe pairs -- a ciphertext sealed under one pair
+// must open under exactly the pairs framing to the same info and under no other -- which is a
+// derived class rather than the one retry somebody thought of, and it holds against a fallback
+// to the empty label, to the bare label, to any pair in the class. The STRUCTURAL half is the
+// count of calls the provider saw: an open reaches HPKE exactly once whether it succeeded or
+// failed, which is what holds against a fallback to parameters outside the class entirely.
+func TestOpenWithLabelMakesOneAttemptUnderTheCallersOwnParametersAndNoOther(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	plaintext := []byte("the sealed secret")
+	pairs := signatureProbePairs()
+	if len(pairs) < 2 {
+		t.Fatalf("the probe class holds %d pairs, so no ciphertext is ever opened under another pair's parameters", len(pairs))
+	}
+	opened := 0
+	refused := 0
+	for _, sealed := range pairs {
+		ct, err := SealWithLabel(crypto, pub, sealed.label, sealed.content, plaintext)
+		if err != nil {
+			t.Fatalf("SealWithLabel under %s: %v", sealed.name, err)
+		}
+		for _, opening := range pairs {
+			// which pairs are the same OPEN is decided by the info they frame to and not by
+			// the pair's name: two pairs that framed to one info are one parameter set, and
+			// a test that called them different would demand a refusal no correct open can
+			// give.
+			same := bytes.Equal(mlsEncryptContext(sealed.label, sealed.content),
+				mlsEncryptContext(opening.label, opening.content))
+			counter := &faultInjectingProvider{CryptoProvider: crypto}
+			got, err := OpenWithLabel(counter, priv, opening.label, opening.content, ct)
+			if same {
+				opened += 1
+				if err != nil {
+					t.Errorf("sealed under %s, opened under %s, which frames to the same info: %v",
+						sealed.name, opening.name, err)
+				} else if !bytes.Equal(got, plaintext) {
+					t.Errorf("sealed under %s, opened under %s: got %x, want %x",
+						sealed.name, opening.name, got, plaintext)
+				}
+			} else {
+				refused += 1
+				if err == nil {
+					t.Errorf("a ciphertext sealed under %s opened under %s, so the open falls back to parameters its caller never asked for",
+						sealed.name, opening.name)
+				}
+				// and never a plaintext beside the error, which is guardrail 7's half of
+				// this: a caller reading the slice rather than the error would take it.
+				if got != nil {
+					t.Errorf("sealed under %s, opened under %s: refused with %v and still answered %x",
+						sealed.name, opening.name, err, got)
+				}
+			}
+			if counter.calls != 1 {
+				t.Errorf("sealed under %s, opened under %s: the provider saw %d fallible calls, want exactly the one HpkeOpen -- a second attempt is a fallback whatever it retries under",
+					sealed.name, opening.name, counter.calls)
+			}
+		}
+	}
+	if opened == 0 || refused == 0 {
+		t.Fatalf("%d opens under the sealing parameters and %d under another pair's; both have to occur or this test forbids nothing",
+			opened, refused)
+	}
+	t.Logf("%d pairs: %d opens under the sealing info, %d refusals under another", len(pairs), opened, refused)
+}
+
+// ---------------------------------------------------------------------------
+// the staged decode, over every codec this file declares rather than two of them
+// ---------------------------------------------------------------------------
+
+// stagedDecodeProbe is one codec's pair of values for the sweep below.
+//
+// held is what a receiver already carries; other is a DIFFERENT value whose truncations are
+// decoded into it. The two must differ inside the FIRST field, because that is the only place a
+// body which assigned as it read can be caught: a difference in the last field is written only
+// by a decode that reached the end and succeeded.
+type stagedDecodeProbe struct {
+	held  syntax.Codec
+	other syntax.Codec
+	// firstFieldOctets is the cut at which other's first field is complete and its second has
+	// not started. It is a claim about the ENCODING, checked below against both encodings
+	// rather than trusted, and it is what makes the sweep contain the one cut where an
+	// unstaged body has written the first field and is about to fail.
+	firstFieldOctets int
+}
+
+// The probes, one per codec treekem.go pins. The KEYS are held to those pins by the sweep, so a
+// fourth codec declared in this file fails there until it has one here.
+func updatePathStagedDecodeProbes() map[string]stagedDecodeProbe {
+	otherPath := testUpdatePathFixture()
+	otherPath.LeafNode.ParentHash = repeatByte(0x55, 32)
+	otherNode := testUpdatePathFixture().Nodes[0]
+	return map[string]stagedDecodeProbe{
+		// 0x20 and thirty two octets of kem_output, and then the ciphertext's own prefix.
+		"HpkeCiphertext": {
+			held:             &HpkeCiphertext{KemOutput: repeatByte(0x88, 32), Ciphertext: repeatByte(0x99, 48)},
+			other:            &HpkeCiphertext{KemOutput: repeatByte(0x02, 32), Ciphertext: repeatByte(0x03, 48)},
+			firstFieldOctets: 33,
+		},
+		// 0x20 and thirty two octets of encryption_key, and then encrypted_path_secret's.
+		// This is the level nothing reached: syntax.ReadVector builds a fresh UpdatePathNode
+		// per element exactly as it builds a fresh HpkeCiphertext, so an unstaged node decode
+		// is invisible through an UpdatePath and visible only to a caller decoding into a
+		// node it already holds. Task 22's decrypt is that caller.
+		"UpdatePathNode": {
+			held: &UpdatePathNode{
+				EncryptionKey:       HpkePublicKey(repeatByte(0x88, 32)),
+				EncryptedPathSecret: []HpkeCiphertext{{KemOutput: repeatByte(0x99, 32), Ciphertext: repeatByte(0xaa, 48)}},
+			},
+			other:            &otherNode,
+			firstFieldOctets: 33,
+		},
+		// the leaf, whose own derivation counts its octets in this file.
+		"UpdatePath": {
+			held:             testUpdatePathFixture(),
+			other:            otherPath,
+			firstFieldOctets: handDerivedUpdatePathLeafSize,
+		},
+	}
+}
+
+// TestEveryCodecThisFileDeclaresStagesItsDecode is the staged decode property over the class
+// this file DECLARES rather than over the levels a test happened to reach.
+//
+// The property is leaf_node.go's: a refused decode leaves the receiver exactly as it found it.
+// It was already stated here for UpdatePath and for HpkeCiphertext -- the outer level and the
+// inner one -- and UpdatePathNode, the level between them, was covered by neither. Moving its
+// assignment above the ReadVector it precedes changed nothing any test could see, and the
+// argument for why the inner level needed its own sweep applies to it word for word: ReadVector
+// builds a fresh element per iteration, so nothing decoded through a container observes it.
+//
+// So the class is read off treekem.go's own `var _ syntax.Codec` pins instead of being written
+// out, and the probe table is required to match it in BOTH directions. A codec declared here
+// without a probe fails; a probe for a codec no longer declared fails too.
+func TestEveryCodecThisFileDeclaresStagesItsDecode(t *testing.T) {
+	pinned := codecTypesPinnedIn(t, "treekem.go", nil)
+	if len(pinned) == 0 {
+		t.Fatal("no syntax.Codec pin was read out of treekem.go, so this sweep would run over nothing")
+	}
+	probes := updatePathStagedDecodeProbes()
+	if covered := slices.Sorted(maps.Keys(probes)); !slices.Equal(covered, pinned) {
+		t.Fatalf("treekem.go pins %v as codecs and the staged decode probes cover %v", pinned, covered)
+	}
+	for _, name := range pinned {
+		probe := probes[name]
+		heldEncoded, err := syntax.Marshal(probe.held)
+		if err != nil {
+			t.Fatalf("%s: Marshal the held value: %v", name, err)
+		}
+		otherEncoded, err := syntax.Marshal(probe.other)
+		if err != nil {
+			t.Fatalf("%s: Marshal the other value: %v", name, err)
+		}
+		// the four controls, before anything is required of the decoder. Without them this
+		// sweep passes against exactly the body it exists to forbid, which is how its
+		// predecessor was first written.
+		if reflect.DeepEqual(probe.held, probe.other) {
+			t.Fatalf("%s: the two probe values are equal, so a decode writing one over the other is invisible here", name)
+		}
+		if probe.firstFieldOctets <= 0 || probe.firstFieldOctets >= len(otherEncoded) {
+			t.Fatalf("%s: the first field is said to end at octet %d of a %d octet encoding, so the cut where an unstaged body has written it is outside the sweep",
+				name, probe.firstFieldOctets, len(otherEncoded))
+		}
+		if len(heldEncoded) < probe.firstFieldOctets {
+			t.Fatalf("%s: the held value encodes to %d octets and the first field is said to be %d",
+				name, len(heldEncoded), probe.firstFieldOctets)
+		}
+		if bytes.Equal(heldEncoded[:probe.firstFieldOctets], otherEncoded[:probe.firstFieldOctets]) {
+			t.Fatalf("%s: the two probes agree over the whole first field, so a body that assigned it before reading on would write a value equal to the one already there",
+				name)
+		}
+
+		kept := reflect.ValueOf(probe.held).Elem().Interface()
+		for cut := 0; cut < len(otherEncoded); cut += 1 {
+			if err := syntax.Unmarshal(otherEncoded[:cut], probe.held); err == nil {
+				t.Fatalf("%s: the first %d octets of a %d octet encoding decoded without error",
+					name, cut, len(otherEncoded))
+			}
+			if now := reflect.ValueOf(probe.held).Elem().Interface(); !reflect.DeepEqual(now, kept) {
+				t.Fatalf("%s: a refused decode of the first %d octets wrote through to the receiver:\ngot  %+v\nwant %+v",
+					name, cut, now, kept)
+			}
+		}
+
+		// the positive control on the whole sweep: these bytes ARE acceptable to this
+		// decoder, so the refusals above are the truncation and not a value it would never
+		// have taken. And the receiver decoded into answers what a fresh one answers, which
+		// is the second half of the discipline -- a receiver decoded into twice must answer
+		// the second encoding and not a mixture of both.
+		if err := syntax.Unmarshal(otherEncoded, probe.held); err != nil {
+			t.Fatalf("%s: the whole encoding was refused by the same receiver: %v", name, err)
+		}
+		fresh, isCodec := reflect.New(reflect.TypeOf(probe.other).Elem()).Interface().(syntax.Codec)
+		if !isCodec {
+			t.Fatalf("%s: a fresh value of the probe's type is not a syntax.Codec", name)
+		}
+		if err := syntax.Unmarshal(otherEncoded, fresh); err != nil {
+			t.Fatalf("%s: the whole encoding was refused by a fresh value: %v", name, err)
+		}
+		if !reflect.DeepEqual(probe.held, fresh) {
+			t.Fatalf("%s: a receiver decoded into twice answered\n %+v\nand a fresh one answered\n %+v",
+				name, probe.held, fresh)
+		}
+		t.Logf("%s: %d truncations refused with no write through", name, len(otherEncoded))
+	}
+}
+
+// codecTypesPinnedIn is every type one file pins as a syntax.Codec, read off the pins rather
+// than listed, sorted.
+//
+// The pin is this package's convention for "this type is a codec" -- treekem.go writes one under
+// each of its three structures -- so it is the declaration to derive the class from. A list
+// written beside the sweep is the thing standing rule 5 exists about, and the omission it
+// produced here was the middle of three levels.
+func codecTypesPinnedIn(t *testing.T, path string, source any) []string {
+	t.Helper()
+	parsed, err := parser.ParseFile(token.NewFileSet(), path, source, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	names := []string{}
+	for _, declaration := range parsed.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || generic.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, isValue := spec.(*ast.ValueSpec)
+			if !isValue || len(value.Names) != 1 || value.Names[0].Name != "_" || len(value.Values) != 1 {
+				continue
+			}
+			selector, isSelector := value.Type.(*ast.SelectorExpr)
+			if !isSelector || selector.Sel.Name != "Codec" {
+				continue
+			}
+			qualifier, isIdent := selector.X.(*ast.Ident)
+			if !isIdent || qualifier.Name != "syntax" {
+				continue
+			}
+			if name := pointerConversionTypeName(value.Values[0]); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// pointerConversionTypeName reads T out of the expression (*T)(nil) and answers the empty string
+// for anything else.
+func pointerConversionTypeName(expression ast.Expr) string {
+	call, isCall := expression.(*ast.CallExpr)
+	if !isCall {
+		return ""
+	}
+	parenthesised, isParenthesised := call.Fun.(*ast.ParenExpr)
+	if !isParenthesised {
+		return ""
+	}
+	pointer, isPointer := parenthesised.X.(*ast.StarExpr)
+	if !isPointer {
+		return ""
+	}
+	named, isNamed := pointer.X.(*ast.Ident)
+	if !isNamed {
+		return ""
+	}
+	return named.Name
+}
+
+// The control for that reader. A collector that had started matching text reports the pin named
+// in the comment; one that had lost the interface filter reports the Marshaler and the untyped
+// declaration; one that had lost the blank name filter reports the named variable. All four are
+// shapes this package's source actually holds somewhere.
+const codecPinControl = `package control
+
+var _ syntax.Codec = (*Pinned)(nil)
+
+var (
+	_ syntax.Codec     = (*AlsoPinned)(nil)
+	_ syntax.Marshaler = (*NotACodec)(nil)
+	_                  = (*Untyped)(nil)
+)
+
+var namedPin syntax.Codec = (*NotBlank)(nil)
+
+// var _ syntax.Codec = (*InAComment)(nil) is prose and not a pin.
+func control() {}
+`
+
+// TestTheCodecPinReaderFindsItsControlAndNothingElse holds the derivation above to a fixture
+// whose answer is known, so a reader that had gone quiet -- and a quiet reader answers the empty
+// class, which the sweep would then compare against an empty probe table and pass -- fails here
+// instead.
+func TestTheCodecPinReaderFindsItsControlAndNothingElse(t *testing.T) {
+	got := codecTypesPinnedIn(t, "codec_pin_control.go", codecPinControl)
+	if want := []string{"AlsoPinned", "Pinned"}; !slices.Equal(got, want) {
+		t.Fatalf("the pin reader found %v in the control, want %v", got, want)
+	}
+	// and against the real file, so the sweep's class is not one only the control supports
+	if found := codecTypesPinnedIn(t, "treekem.go", nil); len(found) == 0 {
+		t.Fatal("the pin reader found no codec in treekem.go, which declares three")
 	}
 }

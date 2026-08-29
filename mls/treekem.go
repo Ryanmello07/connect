@@ -529,6 +529,12 @@ func OpenWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string,
 // task 22's decrypt walks the resolution to pick its own ciphertext out of this vector, and is
 // the first place both facts exist at once -- and the hazard worth naming is that a check both
 // sides assume the other makes is a check nobody makes.
+//
+// The relation is over EVERY node of the path and not only the one the receiver decrypts from.
+// A decrypt that checked the count at its own entry point and then walked the rest of the path
+// on trust has enforced it at one index out of the path's length, which is the same hazard one
+// step smaller.
+//
 // TestEveryPublishedUpdatePathHasOneCiphertextPerResolutionNode states the relation against the
 // published corpus, so the two halves at least agree on what the relation IS.
 type UpdatePathNode struct {
@@ -582,6 +588,15 @@ func readOneUpdatePathNode(r *syntax.Reader) (UpdatePathNode, error) {
 //
 // The path secrets themselves are NOT here and never are -- UpdatePathPlan holds those and has
 // no codec at all -- so this is the whole of what a commit publishes about the sender's path.
+//
+// Section 7.6 also requires the leaf_node here to carry leaf_node_source = commit, and this
+// codec does not enforce that either: it decodes whatever leaf the leaf codec accepts, so a
+// key_package sourced leaf inside an UpdatePath decodes cleanly. That relation differs from the
+// ciphertext count above in one way worth writing down -- its door is already built.
+// LeafValidationContext.ExpectedSource is the expectation this position sets to commit and
+// Validate answers ErrLeafNodeSourceMismatch against it, so what was missing was the sentence
+// saying so. TestEveryPublishedUpdatePathCarriesACommitSourceLeaf states the relation against
+// the published corpus and drives both halves.
 type UpdatePath struct {
 	LeafNode LeafNode
 	Nodes    []UpdatePathNode
