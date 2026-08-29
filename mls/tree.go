@@ -1302,3 +1302,121 @@ func (self *RatchetTree) dropUnmergedLeavesNamingABlankLeaf() {
 		parent.UnmergedLeaves = kept
 	}
 }
+
+// ---- RFC 9420 section 7.6, the filtered direct path and who a commit's path secrets are
+// sealed to.
+//
+// Three thin wrappers over the tree math plan's FilteredDirectPath and Resolution, and the
+// thinness is the design. The filtering rule is structure and lives once, in tree_math.go,
+// beside the resolution walk it is written in terms of; what this file adds is the container's
+// own leaf-range guard and the exclusion of the leaves a commit adds, neither of which the
+// arithmetic can see.
+//
+// Both directions of a wrong answer here are wrong, and they are not symmetric. A target list
+// that is too SHORT locks a member out of the next epoch: it receives no ciphertext it can
+// open, its next decrypt fails, and somebody reports it. A target list that is too LONG hands
+// the path secret to somebody who must not have it -- a removed member whose leaf is blank, or
+// a leaf this commit is adding that is not supposed to learn the path from the UpdatePath at
+// all -- and NOTHING reports that. Every member still receives a ciphertext, every decrypt
+// still succeeds, and the group carries on with a reader in it. So the tests below are built
+// against the second direction: they derive the positions that must be absent from the tree's
+// own state after a Remove and after an Add rather than naming indices, because an index
+// somebody picked is an index that stops meaning what it meant the moment the fixture changes.
+
+// filteredPathSteps is the tree math plan's []PathStep for a leaf of THIS tree, with the leaf
+// range checked at this container's boundary.
+//
+// The step and not the node alone, because tasks 18, 20, 21 and 22 all need the copath child
+// as well: the path secret of a step's node is encrypted to the resolution of that step's
+// copath child, and the parent hash of that node is taken over the same child. Re-deriving the
+// child from CommonAncestor at each of those four call sites would be four chances to derive
+// it differently -- and a copath child derived backwards names the child the sender's own leaf
+// descends from, which resolves to a set that already holds the secret, so the commit encrypts
+// to the wrong half of the tree and still produces a full-length, well-formed UpdatePath.
+//
+// The range check is this package's own and duplicates the arithmetic's, which is the same
+// choice rootOf and directPathOf make in tree_adapt.go: a function enforces its own
+// precondition rather than inheriting one from whatever it happens to call, and the sentinel a
+// caller of a RatchetTree gets back is the container's ErrLeafIndexOutOfRange rather than
+// tree_math's ErrLeafOutOfRange. The two answer for each other through the wrap declared in
+// tree_errors.go, so a caller matching either still matches.
+func (self *RatchetTree) filteredPathSteps(i LeafIndex) ([]PathStep, error) {
+	if LeafCount(i) >= self.LeafWidth() {
+		return nil, ErrLeafIndexOutOfRange
+	}
+	return FilteredDirectPath(self, i)
+}
+
+// FilteredDirectPath is the direct path of leaf i, bottom-up, with every node dropped whose
+// copath child resolves to nothing.
+//
+// A dropped node needs no key pair: encrypting to it would be encrypting to the child the
+// sender's own leaf descends from, which already holds the secret, so the node stays blank and
+// carries nothing. The length of this answer is the number of nodes an UpdatePath has to
+// carry, which is what ValSem202 checks, and the ORDER is the order they appear in it.
+//
+// The order is the contract and not a detail of it. The ciphertexts of an UpdatePath are paired
+// positionally with these nodes, so a permuted path seals every secret from the first
+// difference upward to the wrong subtree -- and each of those members still receives a
+// ciphertext of the right shape, so nothing looks wrong until a decrypt fails one task later.
+// That is why the tests compare elementwise through equalNodeIndices and never as sets.
+func (self *RatchetTree) FilteredDirectPath(i LeafIndex) ([]NodeIndex, error) {
+	steps, err := self.filteredPathSteps(i)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]NodeIndex, 0, len(steps))
+	for _, step := range steps {
+		out = append(out, step.Node)
+	}
+	return out, nil
+}
+
+// EncryptionTargets is one resolution per filtered-direct-path node, in the same order, each
+// already stripped of the leaves this commit adds.
+//
+// RFC 9420 section 7.6: a member added by the same commit receives the path secret in its
+// Welcome and never in the UpdatePath, so its leaf is removed from every target list here. The
+// exclusion is by NODE index and it is applied to the resolution rather than to the tree,
+// because an added leaf reaches a resolution by two different routes -- as itself, when its own
+// leaf node is the nearest non-blank node under the copath child, and as an unmerged leaf
+// appended behind whatever non-blank ancestor lists it. An exclusion that only removed the
+// first would leave the second in place and seal the secret to the new member anyway, which is
+// the failure that shows up nowhere: the member decrypts fine, and it was never supposed to be
+// able to.
+//
+// The free Resolution and not the method, and the difference is the error. RatchetTree.
+// Resolution answers the EMPTY list for a refusal, which is the same answer an accepted empty
+// resolution gives -- fine for a caller whose index came out of a direct path of this same
+// tree, and not fine here: an empty target list reads as "seal this secret to nobody", and this
+// is one of the two entry points whose index is a caller's leaf rather than one this package
+// already bounded. So the refusal is returned.
+func (self *RatchetTree) EncryptionTargets(sender LeafIndex, exclude []LeafIndex) ([][]NodeIndex, error) {
+	steps, err := self.filteredPathSteps(sender)
+	if err != nil {
+		return nil, err
+	}
+	excluded := map[NodeIndex]bool{}
+	for _, leaf := range exclude {
+		excluded[leaf.NodeIndex()] = true
+	}
+	out := make([][]NodeIndex, 0, len(steps))
+	for _, step := range steps {
+		resolution, err := Resolution(self, step.CopathChild)
+		if err != nil {
+			return nil, err
+		}
+		// a fresh slice rather than resolution[:0], because narrowing in place writes
+		// through the backing array the walk just built and would leave the kept entries
+		// followed by whatever the excluded ones were.
+		kept := make([]NodeIndex, 0, len(resolution))
+		for _, y := range resolution {
+			if excluded[y] {
+				continue
+			}
+			kept = append(kept, y)
+		}
+		out = append(out, kept)
+	}
+	return out, nil
+}

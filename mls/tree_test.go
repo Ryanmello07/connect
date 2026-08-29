@@ -5138,3 +5138,433 @@ func TestRemoveLeafDropsEveryUnmergedEntryNamingABlankLeafAndNotOnlyTheRemovedOn
 			surviving, withASurvivor, pastTheNewWidth)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// section 7.6: the filtered direct path and the copath encryption targets
+// ---------------------------------------------------------------------------
+//
+// What these tests are built against is the SILENT direction. A target list that is too short
+// locks a member out and somebody reports it within an epoch; a target list that is too long
+// hands the path secret to a member who must not have it -- a removed member whose leaf is
+// blank, or a leaf this same commit is adding -- and produces no symptom at all. Everybody
+// still receives a ciphertext, everybody still decrypts, and the group carries a reader.
+//
+// So the sweep below checks both directions of the set at once, against a reference that is not
+// this package's resolution walk: over a tree whose parents are all blank -- which is exactly
+// the shape newTestTree hands back and exactly the shape a Remove leaves behind -- the
+// resolution of a node is the ascending list of its subtree's occupied leaves, and that is
+// derivable from SubtreeLeaves and RatchetTree.Leaf alone. The filtering rule is re-derived the
+// same way: a step survives when its copath child's subtree holds an occupied leaf.
+//
+// And the ORDER, elementwise, never as sets. The ciphertexts of an UpdatePath are paired
+// positionally with these lists, so a permuted list seals each secret to the wrong member while
+// holding exactly the right members -- and every member still gets a ciphertext of the right
+// shape, so the first thing that notices is a decrypt failure one task later. The positions are
+// DERIVED from the tree in every sweep rather than picked, because an index somebody chose stops
+// meaning what it meant the moment the fixture width changes.
+
+// occupiedLeavesUnder is the reference resolution for a tree whose parents are all blank: the
+// occupied leaves of x's subtree, ascending.
+//
+// It reads SubtreeLeaves and RatchetTree.Leaf and nothing else -- not Resolution, not
+// FilteredDirectPath -- so a defect in the walk under test cannot be transcribed into the answer
+// it is compared against. It is only a resolution on an all-blank-parent tree, which is why
+// every sweep using it asserts that shape rather than assuming it.
+func occupiedLeavesUnder(tree *RatchetTree, x NodeIndex) []LeafIndex {
+	first, last := SubtreeLeaves(x)
+	out := []LeafIndex{}
+	for i := first; i <= last; i += 1 {
+		if LeafCount(i) >= tree.LeafWidth() {
+			break
+		}
+		if tree.Leaf(i) != nil {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// assertEveryParentIsBlank is the precondition occupiedLeavesUnder rests on, stated rather than
+// assumed: a non-blank parent resolves to itself followed by its unmerged leaves, which is not
+// the list above.
+func assertEveryParentIsBlank(t *testing.T, where string, tree *RatchetTree) {
+	t.Helper()
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if !tree.IsBlank(NodeIndex(x)) {
+			t.Fatalf("%s: node %d is not blank, so the reference resolution below does not apply to this tree", where, x)
+		}
+	}
+}
+
+// referenceFilteredPath is the filtered direct path and the encryption targets of leaf sender,
+// derived from the tree's occupancy rather than from the code under test.
+//
+// The FILTER is re-derived here -- a step survives when its copath child's subtree holds an
+// occupied leaf -- so a filter that kept an empty copath child or dropped a populated one
+// disagrees with this. The EXCLUSION is applied after the filter and not before it, which is the
+// RFC's order and is observable: a step whose copath child holds exactly one occupied leaf and
+// that leaf is excluded still contributes a node to the path, with an EMPTY target list, because
+// the node still needs a fresh key even though nobody is sealed to it.
+func referenceFilteredPath(t *testing.T, tree *RatchetTree, sender LeafIndex,
+	exclude []LeafIndex) (path []NodeIndex, targets [][]NodeIndex) {
+	t.Helper()
+	width := tree.LeafWidth()
+	pathNodes, err := DirectPath(sender.NodeIndex(), width)
+	if err != nil {
+		t.Fatalf("DirectPath(%d, %d): %v", sender.NodeIndex(), width, err)
+	}
+	path = []NodeIndex{}
+	targets = [][]NodeIndex{}
+	child := sender.NodeIndex()
+	for _, node := range pathNodes {
+		copathChild, err := Sibling(child, width)
+		if err != nil {
+			t.Fatalf("Sibling(%d, %d): %v", child, width, err)
+		}
+		child = node
+		under := occupiedLeavesUnder(tree, copathChild)
+		if len(under) == 0 {
+			continue
+		}
+		kept := []NodeIndex{}
+		for _, leaf := range under {
+			if slices.Contains(exclude, leaf) {
+				continue
+			}
+			kept = append(kept, leaf.NodeIndex())
+		}
+		path = append(path, node)
+		targets = append(targets, kept)
+	}
+	return path, targets
+}
+
+// TestFilteredDirectPathAndTargetsAgreeWithTheTreesOwnOccupancy sweeps every member of every
+// width this fixture builds, with every single leaf removed in turn, and holds both answers
+// against the reference above.
+//
+// The removal is a real RemoveLeaf and not a Blank, because that is the operation the silent
+// direction arrives through: after a Remove the member's leaf is blank, its direct path is
+// blank, and the tree may have TRUNCATED, so every index the assertion is written against has to
+// be re-derived from the tree afterwards rather than remembered from before.
+//
+// The counters at the end are what stop this from being a sweep that says less than it claims. A
+// run in which no step was ever filtered out proves nothing about filtering; one in which no
+// target list ever held two entries cannot see a permutation inside a list; one in which no two
+// adjacent lists ever differed cannot see a permutation of the lists themselves.
+func TestFilteredDirectPathAndTargetsAgreeWithTheTreesOwnOccupancy(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	dropped, twoDeep, orderable, senders, emptied := 0, 0, 0, 0, 0
+	for _, width := range []uint32{1, 2, 3, 4, 5, 6, 7, 8} {
+		for removed := uint32(0); removed <= width; removed += 1 {
+			tree, _ := newTestTree(t, crypto, width)
+			where := fmt.Sprintf("%d members", width)
+			if removed < width {
+				if err := tree.RemoveLeaf(LeafIndex(removed)); err != nil {
+					t.Fatalf("%s: RemoveLeaf(%d): %v", where, removed, err)
+				}
+				where = fmt.Sprintf("%s minus leaf %d", where, removed)
+			}
+			assertEveryParentIsBlank(t, where, tree)
+			for _, sender := range tree.NonBlankLeaves() {
+				senders += 1
+				// the excluded leaf is derived from the tree rather than chosen: the
+				// last occupied leaf that is not the sender stands in for one this
+				// commit is adding. A one member tree has none, which is the case
+				// that has to be allowed to have none.
+				exclude := []LeafIndex{}
+				for _, other := range tree.NonBlankLeaves() {
+					if other != sender {
+						exclude = []LeafIndex{other}
+					}
+				}
+				for _, excluded := range [][]LeafIndex{nil, exclude} {
+					wantPath, wantTargets := referenceFilteredPath(t, tree, sender, excluded)
+					gotPath, err := tree.FilteredDirectPath(sender)
+					if err != nil {
+						t.Fatalf("%s: FilteredDirectPath(%d): %v", where, sender, err)
+					}
+					if !equalNodeIndices(gotPath, wantPath) {
+						t.Fatalf("%s: FilteredDirectPath(%d) = %v, want %v",
+							where, sender, gotPath, wantPath)
+					}
+					gotTargets, err := tree.EncryptionTargets(sender, excluded)
+					if err != nil {
+						t.Fatalf("%s: EncryptionTargets(%d, %v): %v", where, sender, excluded, err)
+					}
+					if len(gotTargets) != len(wantTargets) {
+						t.Fatalf("%s: EncryptionTargets(%d, %v) = %v, want %v: one entry per filtered path node",
+							where, sender, excluded, gotTargets, wantTargets)
+					}
+					for at := range wantTargets {
+						if !equalNodeIndices(gotTargets[at], wantTargets[at]) {
+							t.Fatalf("%s: EncryptionTargets(%d, %v)[%d] = %v, want %v",
+								where, sender, excluded, at, gotTargets[at], wantTargets[at])
+						}
+						if len(wantTargets[at]) == 0 {
+							emptied += 1
+						}
+					}
+					fullPath, err := DirectPath(sender.NodeIndex(), tree.LeafWidth())
+					if err != nil {
+						t.Fatalf("%s: DirectPath(%d): %v", where, sender, err)
+					}
+					dropped += len(fullPath) - len(gotPath)
+					for at, list := range gotTargets {
+						if len(list) >= 2 {
+							twoDeep += 1
+						}
+						if at > 0 && !equalNodeIndices(list, gotTargets[at-1]) {
+							orderable += 1
+						}
+					}
+				}
+			}
+		}
+	}
+	if dropped == 0 || twoDeep == 0 || orderable == 0 || senders == 0 || emptied == 0 {
+		t.Fatalf("the sweep ran %d senders, dropped %d path nodes, saw %d target lists of two or more, %d adjacent pairs of distinct lists and %d lists the exclusion emptied; a zero in any of the five is a sweep that cannot see filtering, order, or the exclusion running after the filter",
+			senders, dropped, twoDeep, orderable, emptied)
+	}
+	t.Logf("%d senders, %d dropped path nodes, %d multi-entry target lists, %d distinguishable adjacent pairs, %d lists emptied by the exclusion",
+		senders, dropped, twoDeep, orderable, emptied)
+}
+
+// TestEncryptionTargetsNeverNameALeafThisCommitAdds is the unmerged half, which the sweep above
+// cannot reach: it runs over trees whose parents are all blank, and there an added leaf reaches
+// a resolution only as the nearest non-blank node under the copath child.
+//
+// In a committed tree it reaches one by a second route as well. RFC 9420 section 7.5 appends a
+// non-blank node's unmerged leaves to the resolution behind it, so the added leaf's node index
+// is emitted by every non-blank ancestor that lists it, at a position the walk would otherwise
+// never descend to. An exclusion that removed only the first route -- by blanking the leaf, say,
+// which is the shape that reads correct -- leaves the second in place: Resolution never asks
+// whether an unmerged leaf is blank, so the entry survives and the new member is sealed to
+// anyway. It decrypts cleanly, and it was never supposed to be able to.
+//
+// Both routes are counted and both are required, and what the exclusion removes is held to
+// EXACTLY the added leaf's own node index: the ancestor that lists it must stay, because the
+// other members under that ancestor still have to receive.
+func TestEncryptionTargetsNeverNameALeafThisCommitAdds(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _, chain := chainedTestTree(t, crypto, 5, LeafIndex(4))
+	added, err := tree.AddLeaf(tree.Leaf(LeafIndex(0)).Clone())
+	if err != nil {
+		t.Fatalf("AddLeaf: %v", err)
+	}
+	listing := []NodeIndex{}
+	for _, x := range chain {
+		if slices.Contains(tree.UnmergedLeaves(x), added) {
+			listing = append(listing, x)
+		}
+	}
+	if len(listing) == 0 {
+		t.Fatalf("no node of the committed chain %v lists the added leaf %d unmerged, so this fixture never built the unmerged route",
+			chain, added)
+	}
+	direct, unmerged, removals := 0, 0, 0
+	for _, sender := range tree.NonBlankLeaves() {
+		if sender == added {
+			continue
+		}
+		included, err := tree.EncryptionTargets(sender, nil)
+		if err != nil {
+			t.Fatalf("EncryptionTargets(%d, nil): %v", sender, err)
+		}
+		excluded, err := tree.EncryptionTargets(sender, []LeafIndex{added})
+		if err != nil {
+			t.Fatalf("EncryptionTargets(%d, [%d]): %v", sender, added, err)
+		}
+		if len(included) != len(excluded) {
+			t.Fatalf("excluding leaf %d changed the number of path steps for sender %d from %d to %d; the exclusion is applied to a resolution, never to the filter",
+				added, sender, len(included), len(excluded))
+		}
+		for at := range included {
+			want := []NodeIndex{}
+			for position, y := range included[at] {
+				if y != added.NodeIndex() {
+					want = append(want, y)
+					continue
+				}
+				removals += 1
+				if position > 0 && slices.Contains(tree.UnmergedLeaves(included[at][position-1]), added) {
+					unmerged += 1
+				} else {
+					direct += 1
+				}
+			}
+			if !equalNodeIndices(excluded[at], want) {
+				t.Fatalf("sender %d targets[%d] with leaf %d excluded = %v, want %v: the added leaf's own node index goes and nothing else does",
+					sender, at, added, excluded[at], want)
+			}
+		}
+	}
+	if direct == 0 || unmerged == 0 || removals == 0 {
+		t.Fatalf("the added leaf %d was named %d times across the members' target lists, %d of them as the nearest non-blank node and %d of them behind an ancestor that lists it unmerged; a zero in any of the three leaves one of the two routes untested",
+			added, removals, direct, unmerged)
+	}
+	t.Logf("the added leaf %d was named %d times: %d directly, %d through an unmerged list", added, removals, direct, unmerged)
+}
+
+// TestFilteredPathEntryPointsRefuseALeafOutsideTheTree holds the container's own range check.
+//
+// ErrLeafIndexOutOfRange and not merely "an error": tree math's ErrLeafOutOfRange is what comes
+// back if this package's guard is removed and the arithmetic's own is left to fire, and the wrap
+// in tree_errors.go runs one way only -- the container's sentinel answers for the arithmetic's,
+// never the reverse. So a body that dropped its guard fails this while still returning an error.
+func TestFilteredPathEntryPointsRefuseALeafOutsideTheTree(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 4)
+	outside := LeafIndex(tree.LeafWidth())
+	if _, err := tree.FilteredDirectPath(outside); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("FilteredDirectPath(%d) err = %v, want ErrLeafIndexOutOfRange", outside, err)
+	}
+	if _, err := tree.EncryptionTargets(outside, nil); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("EncryptionTargets(%d, nil) err = %v, want ErrLeafIndexOutOfRange", outside, err)
+	}
+	if _, err := tree.filteredPathSteps(outside); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("filteredPathSteps(%d) err = %v, want ErrLeafIndexOutOfRange", outside, err)
+	}
+}
+
+// TestFilteredPathStepsCarryTheCopathChildAndNotTheOtherOne is the private half, and it is here
+// because tasks 18, 20, 21 and 22 all read PathStep.CopathChild rather than re-deriving it.
+//
+// Both fields are node indices of one tree, so a body that filled them the other way round type
+// checks, round trips and produces a path of exactly the right length -- and then the commit
+// encrypts every secret to the subtree the sender's own leaf is in, which already holds it. The
+// check is structural: the sender descends from the step's node and does NOT descend from its
+// copath child, and the two are a parent and one of its children.
+func TestFilteredPathStepsCarryTheCopathChildAndNotTheOtherOne(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	steps := 0
+	for _, width := range []uint32{2, 3, 4, 5, 8} {
+		tree, _ := newTestTree(t, crypto, width)
+		for _, sender := range tree.NonBlankLeaves() {
+			got, err := tree.filteredPathSteps(sender)
+			if err != nil {
+				t.Fatalf("%d members: filteredPathSteps(%d): %v", width, sender, err)
+			}
+			for _, step := range got {
+				steps += 1
+				if !InSubtree(step.Node, sender.NodeIndex()) {
+					t.Fatalf("%d members: step %v of leaf %d has a node the sender does not descend from",
+						width, step, sender)
+				}
+				if InSubtree(step.CopathChild, sender.NodeIndex()) {
+					t.Fatalf("%d members: step %v of leaf %d names the child the sender DOES descend from, which already holds the secret",
+						width, step, sender)
+				}
+				left, err := Left(step.Node)
+				if err != nil {
+					t.Fatalf("Left(%d): %v", step.Node, err)
+				}
+				right, err := Right(step.Node)
+				if err != nil {
+					t.Fatalf("Right(%d): %v", step.Node, err)
+				}
+				if step.CopathChild != left && step.CopathChild != right {
+					t.Fatalf("%d members: step %v of leaf %d names a copath child that is neither child of its node (%d, %d)",
+						width, step, sender, left, right)
+				}
+			}
+		}
+	}
+	if steps == 0 {
+		t.Fatal("the sweep read no steps at all")
+	}
+}
+
+// TestFilteredDirectPathSkipsEmptyCopathResolutions is the plan's own golden, kept because a
+// hand written expectation over a named width is the one thing a derived sweep cannot be: it
+// states what the answer IS rather than that two derivations agree about it.
+func TestFilteredDirectPathSkipsEmptyCopathResolutions(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 4)
+	full, err := tree.FilteredDirectPath(LeafIndex(0))
+	if err != nil {
+		t.Fatalf("FilteredDirectPath: %v", err)
+	}
+	if !equalNodeIndices(full, []NodeIndex{1, 3}) {
+		t.Fatalf("filtered direct path = %v, want [1 3]", full)
+	}
+	// blank leaf 1: node 1's copath child (node 2) now resolves to nothing, so node 1
+	// drops out of the filtered path.
+	if err := tree.Blank(NodeIndex(2)); err != nil {
+		t.Fatalf("Blank: %v", err)
+	}
+	got, err := tree.FilteredDirectPath(LeafIndex(0))
+	if err != nil {
+		t.Fatalf("FilteredDirectPath: %v", err)
+	}
+	if !equalNodeIndices(got, []NodeIndex{3}) {
+		t.Fatalf("filtered direct path = %v, want [3]", got)
+	}
+	// an only member has an empty filtered direct path.
+	lone, _ := newTestTree(t, crypto, 1)
+	got, err = lone.FilteredDirectPath(LeafIndex(0))
+	if err != nil {
+		t.Fatalf("FilteredDirectPath: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("single-member filtered direct path = %v, want empty", got)
+	}
+}
+
+// TestEncryptionTargetsExcludeNewlyAddedLeaves is the plan's golden for the targets.
+func TestEncryptionTargetsExcludeNewlyAddedLeaves(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 4)
+	targets, err := tree.EncryptionTargets(LeafIndex(0), nil)
+	if err != nil {
+		t.Fatalf("EncryptionTargets: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("targets = %v, want one entry per filtered path node", targets)
+	}
+	if !equalNodeIndices(targets[0], []NodeIndex{2}) {
+		t.Fatalf("targets[0] = %v, want [2]", targets[0])
+	}
+	if !equalNodeIndices(targets[1], []NodeIndex{4, 6}) {
+		t.Fatalf("targets[1] = %v, want [4 6]", targets[1])
+	}
+	// leaf 3 was added by this commit: it gets the path secret in the Welcome, so it
+	// is not an encryption target here.
+	targets, err = tree.EncryptionTargets(LeafIndex(0), []LeafIndex{3})
+	if err != nil {
+		t.Fatalf("EncryptionTargets: %v", err)
+	}
+	if !equalNodeIndices(targets[1], []NodeIndex{4}) {
+		t.Fatalf("targets[1] with leaf 3 excluded = %v, want [4]", targets[1])
+	}
+}
+
+// TestEncryptionTargetsExcludeUnmergedNewLeaves is the plan's golden for the unmerged route.
+func TestEncryptionTargetsExcludeUnmergedNewLeaves(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 4)
+	// node 5 is non-blank and lists leaf 3 unmerged, so leaf 3 appears in the
+	// resolution both as itself and via node 5's unmerged list.
+	if err := tree.SetParent(NodeIndex(5), &ParentNode{
+		EncryptionKey:  HpkePublicKey(bytes.Repeat([]byte{0x05}, 32)),
+		UnmergedLeaves: []LeafIndex{3},
+	}); err != nil {
+		t.Fatalf("SetParent: %v", err)
+	}
+	targets, err := tree.EncryptionTargets(LeafIndex(0), []LeafIndex{3})
+	if err != nil {
+		t.Fatalf("EncryptionTargets: %v", err)
+	}
+	if !equalNodeIndices(targets[1], []NodeIndex{5}) {
+		t.Fatalf("targets[1] = %v, want [5] with the unmerged new leaf removed", targets[1])
+	}
+}
