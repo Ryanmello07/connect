@@ -349,6 +349,31 @@ func verifyMembershipTag(crypto CryptoProvider, membershipKey []byte,
 // protects nobody from a peer that does not run this code.
 var errApplicationMustBeCiphertext = errors.New("mls: an application message must be sent as a PrivateMessage")
 
+// errUnexpectedMembershipTag is what an open answers a PublicMessage carrying a membership tag
+// under a sender type RFC 9420 section 6.2 gives the field to nobody but a member.
+//
+// Refused rather than ignored, which is ErrUnexpectedGroupContext's rule one layer down and is
+// here for that sentinel's reason exactly: a caller holding a message with a tag on it believes
+// the tag was checked, and an open that read the sender type, skipped the tag and answered a
+// verified object has told that caller its message carries two authenticators when it carries
+// one. The tag on such a message can be checked against nothing -- an external sender has no
+// leaf and a new member has not joined, so neither holds a membership_key any tag could have
+// been taken under -- so there is no third option where it is verified instead.
+//
+// It is not reachable from the wire and that is not a reason to leave it out. PublicMessage's
+// section 6.2 select reads the field off the member arm alone, so a peer cannot put one here;
+// what can is this package's own caller, assembling a message in memory, which is the half of
+// the class the codec's guard does not cover. It is its own value rather than
+// errMissingMembershipTag because the two are opposite mistakes -- one message carries a tag
+// nothing can check and the other is missing the one thing that says it came from inside the
+// group -- and a caller told the wrong one is sent to fix the wrong field.
+//
+// Unexported rather than declared beside ErrUnexpectedGroupContext in framing_errors.go: that
+// file is the interface registry's section 7.6 block, its ten names are joined to the registry
+// by TestFramingErrorsAreDistinctAndNamed, and an eleventh added there would be this package
+// helping itself to a name in a roster another plan owns.
+var errUnexpectedMembershipTag = errors.New("mls: membership tag supplied for a sender type that forbids it")
+
 // errNilPublicMessage is what OpenPublicMessage answers a caller that passed no message, for
 // errNilAuthenticatedContent's reason: a nil dereference out of a library takes the caller's
 // process rather than its call, and says nothing about which argument was wrong.
@@ -425,6 +450,15 @@ func StaticSignatureKey(pub SignaturePublicKey) SignatureKeyResolver {
 // provider -- an external sender takes no membership tag -- because "does this call need a
 // provider" is not a question a caller can answer before it makes the call.
 //
+// ValSem005 stands ahead of the wire format check, and the order is stated because both refusals
+// are reachable at once -- an application message signed under some other wire format fails both
+// -- and because nothing but this sentence and a test said which one answers. It is the receive
+// path's order: OpenPublicMessage refuses ValSem005 ahead of everything it does, so a caller that
+// frames an application message in the clear is told the same rule by its own send path that
+// every peer would tell it, rather than being sent to fix a wire format and then told about the
+// content type on the next call. TestSealPublicMessageRefusesApplicationContentAheadOfEveryWireFormatMismatch
+// is what holds the order to that, over the wire format registry rather than over one row.
+//
 // The membership tag is computed for a MEMBER sender and for no other, which is RFC 9420 section
 // 6.2's select and not an optimisation. The tag says "the sender was inside the group", and the
 // three other sender types are by definition not: an external sender has no leaf and no
@@ -477,11 +511,23 @@ func SealPublicMessage(crypto CryptoProvider, membershipKey []byte,
 // signature first would be doing public key work on behalf of any party that can reach the
 // transport.
 //
+// Both of those orderings are OBSERVED and not merely stated, which they were not for a while.
+// TestOpenPublicMessageRefusesInTheOrderSectionSixTwoRequires builds a message that breaks
+// several of these rules at once and asserts which refusal answers, and it counts what the
+// provider was asked to do before the refusal came back -- so "no public key work on behalf of
+// the transport" is read off the verifications that ran rather than off the error alone. Every
+// ordering here survived the whole suite as a reversal before that gate existed.
+//
 // The tag is checked only for a MEMBER sender, for SealPublicMessage's reason: no other sender
 // type has a membership_key, and section 6.2 gives none of them the field. It is not a hole a peer
 // can walk through by claiming to be external -- the sender type is inside the signature preimage,
 // so a member's message re-labelled external does not verify, and the sender type also decides
 // whether the group context is bound into that preimage at all.
+//
+// A tag carried by one of the other three is REFUSED rather than passed over, which is the arm
+// this select used to have no answer for: it read the sender type, took the no-tag branch, and
+// left message.MembershipTag read by nothing and refused by nothing. errUnexpectedMembershipTag
+// says why that is not a nicety.
 //
 // The refusal of the tag travels out verbatim and is never collapsed into the signature's, which
 // is what keeps ValSem007 and ValSem008 distinguishable to a validator that has to say which of
@@ -508,6 +554,13 @@ func OpenPublicMessage(crypto CryptoProvider, membershipKey []byte, message *Pub
 		if err != nil {
 			return nil, err
 		}
+	} else if len(message.MembershipTag) != 0 {
+		// the other half of section 6.2's select, and it is a refusal for the reason
+		// errUnexpectedMembershipTag gives. The guard is spelled on the LENGTH and not on
+		// != nil, which is emptyByteSpellings' rule: a decoder hands back a non nil slice
+		// for an empty opaque<V> and a caller can re-slice one to nothing, and neither of
+		// those is a tag anybody attached.
+		return nil, errUnexpectedMembershipTag
 	}
 	pub, err := resolve(message.Content.Sender)
 	if err != nil {

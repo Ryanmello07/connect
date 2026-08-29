@@ -2884,6 +2884,18 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 		return (&PrivateMessage{}).UnmarshalMLS(
 			syntax.NewReader(handDerivedPrivateMessageHeader(ContentType(codePoint))))
 	},
+	// framing_preimage.go's section 6.3 sender data AAD. It is not a codec and it is swept
+	// here for senderBindsGroupContext's reason: the class is every place in this package
+	// that discriminates on a framing registry, and this one is reached with a content type
+	// that came off a PrivateMessage header. It is handed nothing but the code point, because
+	// it refuses before it writes -- and privateContentAAD is deliberately NOT a row of its
+	// own, since it holds no switch: what refuses an unregistered content type on its behalf
+	// is the single assembly it delegates to, which is
+	// TestBothSectionSixThreeAadsRefuseAContentTypeNoRegistryDeclares' subject.
+	"senderDataAAD": func(codePoint uint64) error {
+		_, err := senderDataAAD(nil, 0, ContentType(codePoint))
+		return err
+	},
 }
 
 // undeclaredCodePointsOf is every code point of a framing registry's width that the registry
@@ -4767,6 +4779,173 @@ func TestThePublicMessageViewStampsThePublicWireFormatAndCarriesNoTag(t *testing
 	}
 }
 
+// framingTestContentOfType is the member's FramedContent of a caller's content type.
+//
+// The switch is exhaustive over the registry and its default is a FATAL rather than a fallback,
+// which is what makes the sweeps below claims about the registry rather than about the arms
+// somebody wrote a fixture for. A fourth content type registered in framing.go arrives here as a
+// failure naming itself, and not as a row that quietly runs the proposal fixture a second time.
+func framingTestContentOfType(t *testing.T, contentType ContentType) *FramedContent {
+	t.Helper()
+	switch contentType {
+	case ContentTypeApplication:
+		return framingTestMemberContent()
+	case ContentTypeProposal:
+		return framingTestProposalContent()
+	case ContentTypeCommit:
+		return framingTestCommitContent()
+	}
+	t.Fatalf("content type %d is registered and this file has no FramedContent for it, so every sweep over the registry runs an arm short",
+		contentType)
+	return nil
+}
+
+// framingTestPublicMessageOfContentType is a member's PublicMessage carrying that content, with
+// every authenticator its content type selects and no other.
+//
+// The confirmation tag stands on the commit row alone, which is section 6's select: a commit
+// carries two authenticators and the other two content types carry one.
+func framingTestPublicMessageOfContentType(t *testing.T, contentType ContentType) *PublicMessage {
+	t.Helper()
+	message := framingTestPublicMessage()
+	message.Content = *framingTestContentOfType(t, contentType)
+	if contentType == ContentTypeCommit {
+		message.Auth.ConfirmationTag = []byte{0xc1, 0xc2, 0xc3, 0xc4}
+	}
+	return message
+}
+
+// TestThePublicMessageCodecCarriesEveryAuthenticatorItsContentTypeSelects sweeps the content type
+// registry through both halves of the section 6.2 codec.
+//
+// The commit row is what this exists for and it is the row this file did not have. Every other
+// public message test in this package holds the content type FIXED at proposal -- the layout
+// golden, the sender type sweep, the membership tag select, the seal and open sweeps one file
+// over -- so the confirmation_tag arm of FramedContentAuthData was reached from this codec by
+// nothing at all. Measured, not supposed: with both halves of this codec framing the auth data
+// under a hardcoded ContentTypeProposal, so that a commit carried as a PublicMessage loses its
+// confirmation tag on the wire in both directions and round trips happily without it, the whole
+// of ./mls/... and ./message/... stayed green.
+//
+// Which is why the assertion is against the layout written beside the codec and against the
+// tag's own octets, rather than against a round trip. A round trip is symmetric: both halves are
+// wrong the same way and it passes. The layout writes the auth data under the message's OWN
+// content type, so what is compared is the arm the codec picked against the arm the content type
+// selects, and the containment check states the same thing without going through that codec at
+// all.
+func TestThePublicMessageCodecCarriesEveryAuthenticatorItsContentTypeSelects(t *testing.T) {
+	registry := registryConstantsOfType(t, "ContentType")
+	swept, tagged := 0, 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		contentType := ContentType(registry[name])
+		message := framingTestPublicMessageOfContentType(t, contentType)
+		encoded, err := syntax.Marshal(message)
+		if err != nil {
+			t.Errorf("%s: marshal: %v", name, err)
+			continue
+		}
+		if want := framingPublicMessageLayout(t, message); !bytes.Equal(encoded, want) {
+			t.Errorf("%s: encoded %x, want the section 6.2 layout %x; the auth data was framed under a content type that is not this message's",
+				name, encoded, want)
+			continue
+		}
+		decoded := PublicMessage{}
+		if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+			t.Errorf("%s: unmarshal: %v", name, err)
+			continue
+		}
+		if !bytes.Equal(decoded.Auth.Signature, message.Auth.Signature) {
+			t.Errorf("%s: decoded the signature %x, want %x", name, decoded.Auth.Signature, message.Auth.Signature)
+			continue
+		}
+		if !bytes.Equal(decoded.Auth.ConfirmationTag, message.Auth.ConfirmationTag) {
+			t.Errorf("%s: decoded the confirmation tag %x, want %x; a decoder reading the auth data under some other content type reads a commit's second authenticator as something else or not at all",
+				name, decoded.Auth.ConfirmationTag, message.Auth.ConfirmationTag)
+			continue
+		}
+		if len(message.Auth.ConfirmationTag) != 0 {
+			if !bytes.Contains(encoded, message.Auth.ConfirmationTag) {
+				t.Errorf("%s: the encoding %x does not hold the confirmation tag %x, so this message went onto the wire with the authenticator that binds it to the epoch it creates missing",
+					name, encoded, message.Auth.ConfirmationTag)
+				continue
+			}
+			tagged += 1
+		} else {
+			// the other direction of the select. A tag SET on a content type that has no place
+			// for one must not reach the wire: a codec writing the field whenever it happened to
+			// be populated, rather than when the content type selected it, produces a message
+			// every peer misframes at the field after it and round trips against itself
+			// perfectly.
+			stray := *message
+			stray.Auth = FramedContentAuthData{Signature: message.Auth.Signature,
+				ConfirmationTag: []byte{0xc1, 0xc2, 0xc3, 0xc4}}
+			strayEncoded, err := syntax.Marshal(&stray)
+			if err != nil {
+				t.Errorf("%s carrying a confirmation tag it has no arm for: marshal: %v", name, err)
+				continue
+			}
+			if !bytes.Equal(strayEncoded, encoded) {
+				t.Errorf("%s: setting a confirmation tag changed the encoding to %x from %x, so the arm is selected by which field is populated rather than by the content type",
+					name, strayEncoded, encoded)
+				continue
+			}
+		}
+		swept += 1
+	}
+	if swept != len(registry) || tagged == 0 {
+		t.Fatalf("%d of the %d registered content types were carried through this codec and %d of them carried a confirmation tag; with either half short this states one arm rather than the select",
+			swept, len(registry), tagged)
+	}
+}
+
+// TestThePublicMessageViewCarriesEveryAuthenticatorItsContentTypeSelects is the same sweep over
+// the projection, which is the OTHER place a commit's second authenticator can be dropped.
+//
+// This view is not a convenience. It is the object SealPublicMessage macs and OpenPublicMessage
+// macs and verifies, so every field missing from it is a field missing from the membership tag's
+// preimage AND from the signature's. A view that answered a commit without its confirmation tag
+// would have both doors of section 6.2 authenticating a commit that carries no binding to the
+// transcript it confirms -- and it would do it with nothing in this package disagreeing, because
+// the two doors would be wrong together. Measured: the whole suite stayed green over exactly
+// that.
+//
+// The membership tag's absence from the view is the neighbouring test's claim and is not
+// restated here.
+func TestThePublicMessageViewCarriesEveryAuthenticatorItsContentTypeSelects(t *testing.T) {
+	registry := registryConstantsOfType(t, "ContentType")
+	swept := 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		contentType := ContentType(registry[name])
+		message := framingTestPublicMessageOfContentType(t, contentType)
+		view := message.AuthenticatedContent()
+		if !bytes.Equal(view.Auth.Signature, message.Auth.Signature) {
+			t.Errorf("%s: the view carries the signature %x, want the message's %x",
+				name, view.Auth.Signature, message.Auth.Signature)
+			continue
+		}
+		if !bytes.Equal(view.Auth.ConfirmationTag, message.Auth.ConfirmationTag) {
+			t.Errorf("%s: the view carries the confirmation tag %x, want the message's %x; both authenticators of section 6.2 are taken over this object, so one missing from it is one taken over a preimage it is not in",
+				name, view.Auth.ConfirmationTag, message.Auth.ConfirmationTag)
+			continue
+		}
+		encoded, err := syntax.Marshal(view)
+		if err != nil {
+			t.Errorf("%s: marshal the view: %v", name, err)
+			continue
+		}
+		if len(message.Auth.ConfirmationTag) != 0 &&
+			!bytes.Contains(encoded, message.Auth.ConfirmationTag) {
+			t.Errorf("%s: the serialized view %x does not hold the confirmation tag %x, so neither preimage taken over it covers that tag",
+				name, encoded, message.Auth.ConfirmationTag)
+			continue
+		}
+		swept += 1
+	}
+	if swept != len(registry) {
+		t.Fatalf("%d of the %d registered content types reached the view", swept, len(registry))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // PrivateMessage, the section 6.3 codec
 // ---------------------------------------------------------------------------
@@ -5212,4 +5391,380 @@ func TestSenderDataAADIsPrivateContentAADWithoutAuthenticatedData(t *testing.T) 
 	if len(contentAAD) <= len(senderAAD) {
 		t.Fatal("content aad does not extend sender aad")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the single assembly of section 6.3's shared header
+// ---------------------------------------------------------------------------
+
+// TestBothSectionSixThreeAadsRefuseAContentTypeNoRegistryDeclares is the content type guard the
+// two AADs did not have, and it is stated over BOTH of them because only one of them holds the
+// switch.
+//
+// Every other preimage of framing_preimage.go refuses an unregistered code point before it writes
+// an octet -- the section 8.2 input and the section 6.1 TBS both refuse a wire format, and the TBS
+// routes the sender type through senderBindsGroupContext -- and these two were the exception. The
+// package's own registry switch gate could not see it: that class is "codec methods that mention a
+// framing registry", and an AAD is not a codec method, which is the rule 5 shape of a class that
+// under-approximates.
+//
+// What an unregistered content type costs here is not a rejected message. Nothing downstream
+// re-reads this field, so the AAD is simply built, and the AEAD is sealed under associated data
+// no peer computes the same way; the failure arrives at the far end as a decryption that did not
+// work, with nothing in it that says which field was wrong.
+//
+// The privateContentAAD half is the second observer of the single assembly and is the reason this
+// test names both. That function holds no content type switch of its own and is not meant to grow
+// one: the only thing that can refuse an unregistered content type on its behalf is the assembly
+// it delegates to. A copy of the shared header laid out again inside it is byte for byte
+// identical at every registered input -- which is why no golden and no collision sweep can see it
+// -- and answers an AAD here where this answers ErrUnknownContentType.
+func TestBothSectionSixThreeAadsRefuseAContentTypeNoRegistryDeclares(t *testing.T) {
+	const authenticatedData = "\xa5\xa6"
+	groupId := []byte{0x01, 0x02}
+	refused := 0
+	for _, codePoint := range undeclaredCodePointsOf(t, "ContentType") {
+		contentType := ContentType(codePoint)
+		for _, aad := range []struct {
+			name string
+			take func() ([]byte, error)
+		}{
+			{name: "senderDataAAD", take: func() ([]byte, error) {
+				return senderDataAAD(groupId, 9, contentType)
+			}},
+			{name: "privateContentAAD", take: func() ([]byte, error) {
+				return privateContentAAD(groupId, 9, contentType, []byte(authenticatedData))
+			}},
+		} {
+			answer, err := aad.take()
+			if err == nil {
+				t.Fatalf("%s built the associated data %x over the content type %d, which the registry does not declare; that message is sealed under data no peer reproduces",
+					aad.name, answer, codePoint)
+			}
+			if !errors.Is(err, ErrUnknownContentType) {
+				t.Fatalf("%s refused the content type %d with %v, want ErrUnknownContentType; two sentinels for one condition is what every roster in this package exists to prevent",
+					aad.name, codePoint, err)
+			}
+			if !namesTheNumber(err.Error(), codePoint) {
+				t.Fatalf("%s refused the unregistered content type %d with %q, which does not name it",
+					aad.name, codePoint, err)
+			}
+			if answer != nil {
+				t.Fatalf("%s answered %x alongside its refusal of the content type %d; a caller that read the first result holds an associated data built out of a code point nothing declares",
+					aad.name, answer, codePoint)
+			}
+			refused += 1
+		}
+	}
+	// the control: every REGISTERED content type is still built by both, so what is being
+	// measured above is the refusal and not an AAD that has stopped answering anything.
+	registry := registryConstantsOfType(t, "ContentType")
+	built := 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		contentType := ContentType(registry[name])
+		if _, err := senderDataAAD(groupId, 9, contentType); err != nil {
+			t.Errorf("%s: senderDataAAD refused a registered content type: %v", name, err)
+			continue
+		}
+		if _, err := privateContentAAD(groupId, 9, contentType, []byte(authenticatedData)); err != nil {
+			t.Errorf("%s: privateContentAAD refused a registered content type: %v", name, err)
+			continue
+		}
+		built += 1
+	}
+	if refused == 0 || built != len(registry) {
+		t.Fatalf("%d unregistered content types were refused and %d of the %d registered ones were built; with either half short this states nothing",
+			refused, built, len(registry))
+	}
+	t.Logf("%d refusals over the two section 6.3 aads, %d registered content types still built", refused, built)
+}
+
+// section63HeaderParameterTypes is RFC 9420 section 6.3's shared header written as a Go parameter
+// list: the three fields SenderDataAAD is, in the order the presentation language writes them.
+//
+//	opaque group_id<V>;        ->  []byte
+//	uint64 epoch;              ->  uint64
+//	ContentType content_type;  ->  ContentType
+//
+// It is the RFC's structure and not a list of function names, which is the difference that makes
+// the derivation below a class rather than a roster: a function joins it by TAKING those three, so
+// a third AAD, or a helper somebody adds between the two, is judged without anybody editing this
+// file.
+var section63HeaderParameterTypes = []string{"[]byte", "uint64", "ContentType"}
+
+// section63HeaderTaker is one function whose parameter list opens with that header: its name, the
+// file that declares it, the names it knows those three fields by, how many parameters stand after
+// them, and its declaration.
+type section63HeaderTaker struct {
+	name   string
+	file   string
+	header []string
+	extra  int
+	decl   *ast.FuncDecl
+}
+
+// parameterNamesAndTypes flattens a parameter list into one entry per NAME.
+//
+// Per name and not per field, because a grouped declaration hides the difference: `func f(a, b
+// []byte)` is ONE field carrying two names, and a reader that walked fields would see one
+// parameter where the language has two and read the wrong type off every parameter after it.
+func parameterNamesAndTypes(list *ast.FieldList) ([]string, []string) {
+	names, declared := []string{}, []string{}
+	if list == nil {
+		return names, declared
+	}
+	for _, field := range list.List {
+		written := types.ExprString(field.Type)
+		if len(field.Names) == 0 {
+			names = append(names, "")
+			declared = append(declared, written)
+			continue
+		}
+		for _, name := range field.Names {
+			names = append(names, name.Name)
+			declared = append(declared, written)
+		}
+	}
+	return names, declared
+}
+
+// section63HeaderTakers derives that class out of already parsed files.
+func section63HeaderTakers(parsed map[string]*ast.File) []section63HeaderTaker {
+	found := []section63HeaderTaker{}
+	for _, file := range slices.Sorted(maps.Keys(parsed)) {
+		for _, declaration := range parsed[file].Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			names, declared := parameterNamesAndTypes(function.Type.Params)
+			if len(names) < len(section63HeaderParameterTypes) {
+				continue
+			}
+			if !slices.Equal(declared[:len(section63HeaderParameterTypes)], section63HeaderParameterTypes) {
+				continue
+			}
+			found = append(found, section63HeaderTaker{
+				name:   function.Name.Name,
+				file:   file,
+				header: names[:len(section63HeaderParameterTypes)],
+				extra:  len(names) - len(section63HeaderParameterTypes),
+				decl:   function,
+			})
+		}
+	}
+	return found
+}
+
+// headerFieldsSpentOutsideOneCall reports every way a function of that class spends one of the
+// three header fields on something other than a single call to the assembly.
+//
+// The rule is written on the PARAMETER and not on what the function returns, and that is the whole
+// of why this can see what no byte comparison can. A second layout of the shared header produces
+// the same octets as the first at every input -- that is what makes it a copy rather than a bug --
+// so the only place the duplication is visible is in what the function does with the fields it was
+// handed. A function that spends group_id, epoch and content_type on one call to the assembly has
+// no way to lay them out itself; one that reads any of them anywhere else has already got a second
+// encoder of that header, whether or not it agrees with the first today.
+//
+// The uses are counted by NODE IDENTITY against the argument subtrees of that call rather than by
+// position, so a field wrapped in a conversion or passed through an expression still counts as
+// spent there, and a field named again anywhere else in the body does not.
+func headerFieldsSpentOutsideOneCall(taker section63HeaderTaker, assembly string) []string {
+	inside := map[ast.Node]bool{}
+	calls := 0
+	ast.Inspect(taker.decl.Body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		name, isName := call.Fun.(*ast.Ident)
+		if !isName || name.Name != assembly {
+			return true
+		}
+		calls += 1
+		for _, argument := range call.Args {
+			ast.Inspect(argument, func(inner ast.Node) bool {
+				inside[inner] = true
+				return true
+			})
+		}
+		return true
+	})
+	loose := []string{}
+	if calls != 1 {
+		loose = append(loose, fmt.Sprintf("calls %s %d times, want exactly once", assembly, calls))
+	}
+	for _, field := range taker.header {
+		read, outside := 0, 0
+		ast.Inspect(taker.decl.Body, func(node ast.Node) bool {
+			name, isName := node.(*ast.Ident)
+			if !isName || name.Name != field {
+				return true
+			}
+			read += 1
+			if !inside[node] {
+				outside += 1
+			}
+			return true
+		})
+		switch {
+		case read == 0:
+			loose = append(loose, fmt.Sprintf("never reads %s, so the header field is dropped rather than delegated", field))
+		case outside != 0:
+			loose = append(loose, fmt.Sprintf("reads %s %d time(s) outside that call", field, outside))
+		}
+	}
+	return loose
+}
+
+// section63AssemblyControl is this reader's control, in both directions, which every reader in
+// this file carries. A reader that reported nothing would pass over the real duplication silently,
+// and one that reported everything would fail against the real file for the wrong reason.
+//
+// It is parsed and never type checked, so the writer it calls need not exist.
+const section63AssemblyControl = `
+package control
+
+type ContentType uint8
+
+func controlAssembly(groupId []byte, epoch uint64, contentType ContentType) ([]byte, error) {
+	w := newWriter()
+	w.WriteOpaque(groupId)
+	w.WriteUint64(epoch)
+	w.WriteUint8(uint8(contentType))
+	return w.Bytes()
+}
+
+func controlDelegates(groupId []byte, epoch uint64, contentType ContentType, extra []byte) ([]byte, error) {
+	header, err := controlAssembly(groupId, epoch, contentType)
+	if err != nil {
+		return nil, err
+	}
+	w := newWriter()
+	w.WriteRaw(header)
+	w.WriteOpaque(extra)
+	return w.Bytes()
+}
+
+func controlLaysTheHeaderAgain(groupId []byte, epoch uint64, contentType ContentType, extra []byte) ([]byte, error) {
+	w := newWriter()
+	w.WriteOpaque(groupId)
+	w.WriteUint64(epoch)
+	w.WriteUint8(uint8(contentType))
+	w.WriteOpaque(extra)
+	return w.Bytes()
+}
+
+func controlTakesSomethingElse(name string, epoch uint64, contentType ContentType) []byte {
+	return nil
+}
+`
+
+// framingParsedProductionFiles is every production file of this package, parsed, keyed by name.
+func framingParsedProductionFiles(t *testing.T) map[string]*ast.File {
+	t.Helper()
+	parsed := map[string]*ast.File{}
+	for _, file := range framingProductionFiles(t) {
+		tree, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		parsed[file] = tree
+	}
+	return parsed
+}
+
+// TestEverySectionSixThreeAadAssemblesTheSharedHeaderExactlyOnce is the structural half of the two
+// AADs' shape, and it is the half that was advisory.
+//
+// privateContentAAD's own comment says the single assembly is what makes "the content AAD begins
+// with the sender data AAD" true by construction rather than by a test that has to keep being
+// true. Nothing held it. The duplication -- the same three fields laid out again by hand inside
+// the content AAD, no call to the sender data AAD at all -- is byte for byte identical to the
+// delegation at every input, so the goldens pass, the collision sweep passes, the prefix property
+// passes and the structural pair test passes. It was caught only, and only for a while, by the
+// uncalled-declaration gate noticing that senderDataAAD had lost its one caller, and that guard
+// expires the moment task 9 gives the sender data seal a production call.
+//
+// So the property is stated where a copy cannot satisfy it: on the parameter list. Any function of
+// this package taking section 6.3's three header fields may spend them on ONE call to the function
+// that takes those three and nothing else, and may not read them anywhere else -- which leaves it
+// no way to write the header a second time. connect/message's guardrail G4 is the same rule one
+// layer down and was closed the same way: structurally, because a convention between two AADs is
+// exactly what a copy-paste does not read.
+//
+// The direction the parameter list already closes is not restated here.
+// TestNeitherSectionSixThreeAadCoversAFieldTheOtherOwns owns it: authenticated_data cannot migrate
+// into the sender data AAD because it is not a parameter of it.
+func TestEverySectionSixThreeAadAssemblesTheSharedHeaderExactlyOnce(t *testing.T) {
+	// the control first, so a reader that has stopped reading fails here rather than reporting
+	// the real file clean.
+	controlTree, err := parser.ParseFile(token.NewFileSet(), "control.go", section63AssemblyControl,
+		parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	control := section63HeaderTakers(map[string]*ast.File{"control.go": controlTree})
+	controlNames := []string{}
+	for _, taker := range control {
+		controlNames = append(controlNames, taker.name)
+	}
+	slices.Sort(controlNames)
+	if want := []string{"controlAssembly", "controlDelegates", "controlLaysTheHeaderAgain"}; !slices.Equal(controlNames, want) {
+		t.Fatalf("the class reader found %v in the control, want %v; a function taking some other three parameters is not in this class and one taking these three is",
+			controlNames, want)
+	}
+	for _, taker := range control {
+		loose := headerFieldsSpentOutsideOneCall(taker, "controlAssembly")
+		switch taker.name {
+		case "controlDelegates":
+			if len(loose) != 0 {
+				t.Fatalf("the reader reported %v against the control that delegates, so it would report the real file for the wrong reason", loose)
+			}
+		case "controlLaysTheHeaderAgain":
+			if len(loose) == 0 {
+				t.Fatal("the reader reported nothing against the control that lays the header out a second time, so it would pass over exactly the duplication it exists to find")
+			}
+		}
+	}
+
+	takers := section63HeaderTakers(framingParsedProductionFiles(t))
+	if len(takers) < 2 {
+		t.Fatalf("this package declares %d function(s) taking section 6.3's header, and it declares two; the class reader is not reading this package",
+			len(takers))
+	}
+	assemblies := []section63HeaderTaker{}
+	for _, taker := range takers {
+		if taker.extra == 0 {
+			assemblies = append(assemblies, taker)
+		}
+	}
+	if len(assemblies) != 1 {
+		names := []string{}
+		for _, taker := range assemblies {
+			names = append(names, taker.file+"'s "+taker.name)
+		}
+		t.Fatalf("%v take section 6.3's header and nothing else; exactly one of them is the assembly the others extend, and two are two layouts of one header agreeing until the day one of them changes",
+			names)
+	}
+	assembly := assemblies[0]
+	extended := 0
+	for _, taker := range takers {
+		if taker.name == assembly.name {
+			continue
+		}
+		loose := headerFieldsSpentOutsideOneCall(taker, assembly.name)
+		if len(loose) != 0 {
+			t.Errorf("%s's %s takes section 6.3's header and %v; those three fields are %s's structure, and a second layout of them here is an associated data that agrees with the first until the day one of them changes, with nothing that round trips able to see the disagreement",
+				taker.file, taker.name, loose, assembly.name)
+			continue
+		}
+		extended += 1
+	}
+	if extended == 0 {
+		t.Fatalf("no function extends %s, so this gate ran over the assembly alone and stated nothing", assembly.name)
+	}
+	t.Logf("%s is the single assembly of section 6.3's header, and %d function(s) extending it spend those fields on it and nowhere else",
+		assembly.name, extended)
 }

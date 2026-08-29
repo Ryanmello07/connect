@@ -408,7 +408,22 @@ func AuthenticatedContentTBMBytes(authContent *AuthenticatedContent, groupContex
 // giving each AAD only the fields it is allowed to see. This function cannot reach
 // authenticated_data because it is not a parameter of it. A later task that wants it here has to
 // widen the signature, which is a diff a reviewer sees.
+//
+// The content type is REFUSED before an octet is written, which is what every other preimage of
+// this file does with the code point it opens on and what this one did not do. An AAD is not a
+// decode and that is exactly why it needs the guard rather than inheriting one: nothing
+// downstream ever re-reads this field, so an unregistered content type here is not a message
+// somebody rejects later, it is an AEAD sealed under associated data no peer can reproduce --
+// which arrives at the far end as a decryption failure with nothing in it that says which field
+// was wrong. The refusal names the value for framing.go's package comment's reason: the octet is
+// what a caller has off the wire anyway. Both section 6.3 AADs are held to it, the content one
+// through the assembly below rather than through a second switch.
 func senderDataAAD(groupId []byte, epoch uint64, contentType ContentType) ([]byte, error) {
+	switch contentType {
+	case ContentTypeApplication, ContentTypeProposal, ContentTypeCommit:
+	default:
+		return nil, fmt.Errorf("%w: %d", ErrUnknownContentType, contentType)
+	}
 	w := syntax.NewWriter()
 	w.WriteOpaque(groupId)
 	w.WriteUint64(epoch)
@@ -444,6 +459,19 @@ func senderDataAAD(groupId []byte, epoch uint64, contentType ContentType) ([]byt
 // senderDataAAD cannot see it. The reverse -- widening senderDataAAD, which would put
 // authenticated_data into both -- is prevented by that function's parameter list rather than by
 // this one, and TestNeitherSectionSixThreeAadCoversAFieldTheOtherOwns is what observes both.
+//
+// The SINGLE ASSEMBLY has two observers of its own, because the paragraph above it was for a
+// while the whole of what held it. This function rewritten to lay the three shared fields out
+// again by hand is byte for byte identical to this one at every input, so no golden, no
+// collision sweep and no prefix property in this package can see the difference -- measured, the
+// duplication passed the whole suite. What sees it now is
+// TestEverySectionSixThreeAadAssemblesTheSharedHeaderExactlyOnce, which reads the parameter list
+// rather than the answer: a function of this package taking section 6.3's three header fields
+// may spend them on ONE call to the assembly below it and nowhere else. And behaviourally,
+// TestBothSectionSixThreeAadsRefuseAContentTypeNoRegistryDeclares -- the content AAD holds no
+// content type switch of its own, so the only thing that can refuse an unregistered one on its
+// behalf is the assembly it delegates to, and a hand laid copy of the header answers an AAD
+// where this answers ErrUnknownContentType.
 func privateContentAAD(groupId []byte, epoch uint64, contentType ContentType,
 	authenticatedData []byte) ([]byte, error) {
 

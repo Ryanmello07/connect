@@ -132,7 +132,7 @@ var (
 	ErrRatchetExhausted = errors.New("mls: ratchet generation space exhausted")
 
 	// ErrUnknownContentType is returned for a framing ContentType outside the three RFC 9420
-	// section 6 registers, the reserved zero included, by both of the layers that meet one.
+	// section 6 registers, the reserved zero included, by every layer that meets one.
 	// One declaration for one condition, rather than two sentinels a caller would have to
 	// match separately: framing_errors.go states that arrangement in full and
 	// TestEveryStructuralFramingErrorHasExactlyOneDeclarationSite holds it.
@@ -149,5 +149,14 @@ var (
 	// chosen header arrives in, and it is refused before any ratchet is asked for -- so the
 	// message says what is wrong with the code point rather than what could not be found for
 	// it, and each raiser names the offending value itself.
+	//
+	// framing_preimage.go raises it at the section 6.3 sender data AAD, which is a third place
+	// again and the one this comment was written without. An AAD is neither a decode nor a
+	// lookup: nothing downstream re-reads the field, so the refusal is not what stops a bad
+	// header being parsed or a bad ratchet being reached -- it is what stops a message being
+	// SEALED under associated data no peer computes the same way, which arrives at the far end
+	// as a decryption that did not work with nothing in it that says which field was wrong. The
+	// content AAD reaches this refusal through that one rather than through a switch of its
+	// own, which is the same single assembly that keeps the shared header in one place.
 	ErrUnknownContentType = errors.New("mls: unregistered content type")
 )
