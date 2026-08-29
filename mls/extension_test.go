@@ -2692,6 +2692,7 @@ var extensionBodyByteRunsThatAreNotBodies = map[string]string{
 	"(*RatchetTree).TreeHash":     "answers the section 7.8 tree hash of the whole tree, which is what GroupContext.TreeHash is set from; the same argument as NodeTreeHash, and the signature is the one the key schedule and the group lifecycle plans compile against rather than one this package is free to change",
 	"(*RatchetTree).TreeHashes":   "answers the section 7.8 tree hash of every node, which is the column the tree-validation corpus publishes and the one a parent hash check reads; the same argument as the two above, one level of slicing out -- KDF.Nh octets of digest per node, and a slice of digests is no more a body than one of them is",
 	"(*RatchetTree).ParentHash":   "answers the RFC 9420 section 7.9 parent hash of one node, which is KDF.Nh octets of digest and not a ratchet_tree body; the ParentHashInput preimage the encoder assembles is hashed and discarded inside the call, and the value that leaves is the one a LeafNode.parent_hash field and a ParentNode.parent_hash field are compared against -- the same argument as the three tree hashes above, whose preimages this one is built out of",
+	"PskSecret":                   "answers the RFC 9420 section 8.4 psk_secret, which is KDF.Nh octets of key schedule output and not an extension body; the PSKLabel preimage it assembles is built on a Writer marshalPskLabel opens for itself and never goes through the encoder this package's extension bodies are built with. It is in this table for a MECHANICAL reason rather than a judgement about what the bytes are, and that is the difference from the four above: it entered the closure on the commit that landed (*RatchetTree).Validate, because the closure is keyed by NAME and this package now declares three unrelated methods spelled Validate -- LeafNode's, PreSharedKeyId's and the ratchet tree's -- of which only the third reaches the encoder, while PskSecret calls the second. TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse holds it to exactly that account, so the entry expires the moment the reach becomes a real one",
 }
 
 // extensionBodyByteRunsReportedByEitherRule is the union of what the two rules below report
@@ -2720,6 +2721,28 @@ func extensionBodyByteRunsReportedByEitherRule(t *testing.T) []string {
 	return slices.Compact(reported)
 }
 
+// TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse is the
+// measurement behind the PskSecret entry above, so that entry is evidence and not an assertion.
+//
+// The four entries beside it are judgements about a byte run -- a digest is not a body -- and
+// there is nothing more to measure about them. This one is a claim about the CALL GRAPH: that
+// PskSecret reaches the encoder only because one name in its body is spelled the same as a method
+// of another type. A claim about the graph can be checked against the graph, and an exemption that
+// can be checked and is not is the shape this package keeps finding in other people's tables.
+//
+// Two clauses, and each expires the entry on a different change. PskSecret must invoke no encoder
+// helper of its own, so an edit that made it genuinely assemble a body fails here rather than
+// being waved through by a table entry written before that was true. And every name it invokes
+// that the closure holds must be one this package declares more than once, so a reach through an
+// UNAMBIGUOUS name -- a real edge the closure got right -- fails here too.
+//
+// What it does not do is make the closure right. The closure attributes a call on a foreign
+// expression to every declaration sharing the callee's spelling, which is the same base name
+// conflation theNamesInvokingTheStorage's own doc records being fixed once already, one level in:
+// that fix separated a field read from a method call, and what is left is method from method.
+// Fixing it properly wants the receiver at the call site, which wants the type checker, which the
+// synthetic control this gate is held by cannot be run through. So the over-approximation stays
+// and this is what keeps its one consequence honest.
 // TestEveryExtensionBodyByteRunExemptionIsStillReported is the expiry half of the table above.
 //
 // An exemption that covers nothing is a hole with a name on it -- the same argument
@@ -3548,5 +3571,67 @@ func TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere(t
 			t.Errorf("xwingNamedDeclarationsOfBothPackages classifies %s and neither this package nor %s declares it, so this table is describing a tree that no longer exists",
 				name, messagePackageDir)
 		}
+	}
+}
+
+func TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse(t *testing.T) {
+	const excused = "PskSecret"
+	if _, listed := extensionBodyByteRunsThatAreNotBodies[excused]; !listed {
+		t.Fatalf("%s is not in the exemption table, so this control is holding an entry that is not there", excused)
+	}
+	scanned := packageLevelFunctions(t).files
+	files := []parsedSource{}
+	for _, path := range scanned {
+		files = append(files, mustParseSource(t, path))
+	}
+	declared := declaredAcross(files)
+	helpers := extensionBodyEncoderHelpersIn(files, extensionBodyTypesIn(files))
+	if len(helpers) == 0 {
+		t.Fatal("the seed read no encoder helper out of this package, so both clauses below demand nothing")
+	}
+	reaching := theNamesReachingTheExtensionBodyEncoder(declared, helpers)
+	if !slices.Contains(reaching, excused) {
+		t.Fatalf("the closure no longer holds %s, so its entry in extensionBodyByteRunsThatAreNotBodies excuses nothing; delete both",
+			excused)
+	}
+	declaredTimes := map[string]int{}
+	for _, one := range declared {
+		declaredTimes[one.name] += 1
+	}
+	read := 0
+	for _, one := range declared {
+		if one.name != excused || one.receiver != "" || one.body == nil {
+			continue
+		}
+		read += 1
+		invoked := namesInvokedBy(one.body)
+		for _, helper := range helpers {
+			if invoked[helper] {
+				t.Errorf("%s invokes %s, the encoder this package's extension bodies are assembled with, in its own body; its reach is no longer a name collision and the exemption is no longer the right answer",
+					excused, helper)
+			}
+		}
+		collisions := []string{}
+		for _, name := range slices.Sorted(maps.Keys(invoked)) {
+			if !slices.Contains(reaching, name) || name == excused {
+				continue
+			}
+			if declaredTimes[name] > 1 {
+				collisions = append(collisions, name)
+				continue
+			}
+			t.Errorf("%s invokes %s, which the closure holds and this package declares exactly once, so that edge is a real one and the exemption is excusing more than a collision",
+				excused, name)
+		}
+		if len(collisions) == 0 {
+			t.Errorf("%s invokes no name the closure holds at all, so it cannot be reaching the encoder through this body; the closure is reading something other than this package",
+				excused)
+		}
+		t.Logf("%s reaches the encoder through %v, each declared %d times in this package",
+			excused, collisions, declaredTimes["Validate"])
+	}
+	if read != 1 {
+		t.Fatalf("the scan found %d package level declarations of %s, want 1, so it read something other than this package",
+			read, excused)
 	}
 }

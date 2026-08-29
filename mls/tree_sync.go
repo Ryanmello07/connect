@@ -1,0 +1,370 @@
+// Whole-tree validation: everything RFC 9420 requires of a ratchet tree that arrived from
+// somewhere other than this client's own commit -- a Welcome, the ratchet_tree extension, or a
+// connect/message epoch snapshot record. group.go calls ValidateAgainstContext on every one of
+// them.
+//
+// Three properties decide the shape of everything below, and each is here because its absence
+// is a live attack rather than a tidiness complaint.
+//
+// It is a SWEEP and never a spot check. Every rule in this file is stated over a set -- every
+// non-blank leaf, every node, every parent, every entry of an unmerged_leaves vector, every
+// intermediate between an unmerged leaf and the node listing it -- and a version of any one of
+// them applied to the first element of its set accepts a tree whose only bad element sits
+// anywhere else. That is the shape this project has shipped four times, so every sweep here is
+// held by a test whose fixture puts the single offender at a position DERIVED from the tree and
+// swept across every position the set has.
+//
+// It READS and never writes. The argument is MergeUpdatePath's, one door along: the tree handed
+// in belongs to a caller who has not agreed to anything yet, and a validator that repaired a
+// node on its way to a refusal would leave that caller holding a tree no peer sent and no epoch
+// pinned. Nothing in this file calls a mutator, and the atomicity is asserted the way task 21's
+// is -- the whole node array, before and after, on the refusing paths as well as the accepting
+// one.
+//
+// It does NOT restate section 7.9.2. The parent hash rule is VerifyParentHashes' and is called
+// rather than re-derived, because a second derivation is a second thing that can disagree --
+// and the plan this task came from states that rule with one condition where the RFC states
+// three, so the version a re-derivation here would most likely reproduce is exactly the one
+// that accepts a spliced subtree. See tree_hash.go's own header for the three conditions and
+// for what dropping the third costs.
+package mls
+
+import (
+	"crypto/subtle"
+	"errors"
+	"fmt"
+)
+
+// errDuplicateSignatureKey and errDuplicateEncryptionKey are ValSem101 and ValSem103 in the
+// validation plan's catalogue, and that plan's errors.go owns the single declaration site for
+// ErrDuplicateSignatureKey and ErrDuplicateEncryptionKey. Neither name has landed in this
+// package yet, so the two refusals are carried by these unexported values until they do.
+//
+// Unexported on extension.go's terms and for extension.go's reason, restated because this file
+// adds the sixth and seventh stand in rather than the first: an exported
+// ErrDuplicateEncryptionKey declared here would be a second public declaration site for a name
+// the validation plan also declares, the two would not be the same value, and a caller matching
+// one would silently stop matching the other. Every consumer of these two in the tasks after
+// this one -- task 24's update path key uniqueness among them -- is inside package mls, so a
+// name that cannot be reached from outside costs nobody outside anything.
+//
+// TestNoValidationOwnedNameHasLandedBesideItsStandIn derives the owed pair from this package's
+// own declarations, so it fails on the commit that lands either exported name beside its stand
+// in rather than leaving the swap to anybody's memory.
+var (
+	errDuplicateSignatureKey  = errors.New("mls: two leaves of the tree publish the same signature key")
+	errDuplicateEncryptionKey = errors.New("mls: two nodes of the tree publish the same encryption key")
+)
+
+// TreeValidationContext is everything a whole tree check needs that is not in the tree.
+//
+// It is LeafValidationContext minus the per leaf fields, because those are what this file
+// supplies: the leaf index is the position the sweep is at, and the expected source is the
+// leaf's own -- see validateLeaves for why that one is inferred rather than demanded.
+type TreeValidationContext struct {
+	// Crypto verifies every leaf signature and recomputes every parent hash and the tree hash.
+	// A nil one is refused before any node is read.
+	Crypto CryptoProvider
+
+	// Suite is the group's ciphersuite, which every member's capabilities must list.
+	Suite CipherSuite
+
+	// GroupId is what the update and commit sourced leaves bind their signature to, together
+	// with the leaf index the sweep is at.
+	GroupId []byte
+
+	// RequiredCaps is the group's required_capabilities extension body, or nil for a group
+	// carrying none. Nil is "no requirement" and is satisfied by anything.
+	RequiredCaps *RequiredCapabilities
+
+	// GroupExtensions is the GroupContext's extensions vector, for RFC 9420 section 13.4 as
+	// corrected by erratum 8745.
+	GroupExtensions []Extension
+
+	// NowMs and ClockSkewMs are the clock the key_package sourced leaves' lifetimes are judged
+	// against. Zero is LeafValidationContext's documented opt out of the lifetime check and is
+	// passed through unchanged rather than defaulted here, so a caller with no trustworthy
+	// clock says so once instead of having one invented for it.
+	NowMs       uint64
+	ClockSkewMs uint64
+}
+
+// validateStructure is check 1: the node array is 2n-1 for a power-of-two n, and every occupied
+// position holds the kind of node that position takes.
+//
+// The width is inverted through LeafCountFromNodeWidth rather than through a local %2 test,
+// because that function is the tree math plan's own inverse of NodeWidth and a second statement
+// of the same arithmetic here is a second thing that can disagree with it. It refuses a zero
+// width and an even width under one sentinel, which is why no separate zero check stands in
+// front of it: a node array of nothing is not 2n-1 for any n, so the empty tree and the
+// truncated tree are one condition and a local check for the first would be a branch no input
+// can reach.
+func (self *RatchetTree) validateStructure() error {
+	width := self.NodeWidth()
+	leafWidth, err := LeafCountFromNodeWidth(width)
+	if err != nil {
+		return fmt.Errorf("%w: a node array of %d entries is not 2n-1 for any leaf count n",
+			ErrTreeMalformed, width)
+	}
+	// fullness is a SEPARATE refusal from oddness and is not implied by it. The ratchet_tree
+	// extension travels with its trailing blanks stripped, so an array of 11 nodes inverts
+	// cleanly to 6 leaves -- odd width, honest arithmetic, and a shape no group is ever in.
+	// Every direct path, root and parent hash below is computed against this leaf width, and
+	// section 7.7 keeps a group at a power-of-two width, so a tree admitted here at width 6
+	// would surface as an arithmetic refusal attributed to whichever check reached it first.
+	if !IsFullLeafCount(leafWidth) {
+		return fmt.Errorf("%w: %d nodes describe %d leaves and a tree's leaf width is a power of two",
+			ErrTreeMalformed, width, leafWidth)
+	}
+	for x := uint32(0); x < width; x += 1 {
+		node := self.nodes[x]
+		if node == nil {
+			continue
+		}
+		// both halves of "matches its position": the declared NodeType, and which of the two
+		// bodies is present. A node carrying a parent body under a leaf type is a node every
+		// reader of this tree resolves differently depending on which field it consults, and
+		// the tree hash consults one while Resolution consults the other. Node's own comment
+		// says exactly one of Leaf and Parent is set; this is the door that holds it for a tree
+		// that was decoded rather than built through SetLeaf and SetParent.
+		if NodeIndex(x).IsLeaf() {
+			if node.NodeType != NodeTypeLeaf || node.Leaf == nil || node.Parent != nil {
+				return fmt.Errorf("%w: node %d is a leaf position", ErrNodeTypeMismatch, x)
+			}
+			continue
+		}
+		if node.NodeType != NodeTypeParent || node.Parent == nil || node.Leaf != nil {
+			return fmt.Errorf("%w: node %d is a parent position", ErrNodeTypeMismatch, x)
+		}
+	}
+	return nil
+}
+
+// validateLeaves is check 2: every non-blank leaf passes RFC 9420 section 7.3 at its own index.
+//
+// The expected source is INFERRED from the leaf rather than demanded by the caller, and that is
+// the one rule of section 7.3 this call site cannot state. A settled tree legally holds all
+// three sources at once -- key_package under a member who was added and has not committed since,
+// update under one who refreshed itself, commit under whoever last committed a path -- so there
+// is no single source a whole tree sweep could expect. What survives the inference is every
+// other rule, and in particular the signature BINDING: signatureContent puts the group id and
+// the leaf index into the preimage under update and commit, so a leaf lifted from another group,
+// or from another index of this one, is refused here whichever source it claims. An unknown
+// source is refused too, by marshalCore, which is why the self comparison is not a hole: the
+// preimage for a fourth source cannot be built at all. What is given up is the ability to say
+// "this position takes commit", which is a per position rule the update path and the proposal
+// validator state at their own doors, where the position is known.
+func (self *RatchetTree) validateLeaves(ctx *TreeValidationContext) error {
+	for i := uint32(0); i < uint32(self.LeafWidth()); i += 1 {
+		leaf := self.Leaf(LeafIndex(i))
+		if leaf == nil {
+			continue
+		}
+		err := leaf.Validate(&LeafValidationContext{
+			Crypto:          ctx.Crypto,
+			Suite:           ctx.Suite,
+			GroupId:         ctx.GroupId,
+			LeafIndex:       LeafIndex(i),
+			ExpectedSource:  leaf.LeafNodeSource,
+			RequiredCaps:    ctx.RequiredCaps,
+			GroupExtensions: ctx.GroupExtensions,
+			NowMs:           ctx.NowMs,
+			ClockSkewMs:     ctx.ClockSkewMs,
+		})
+		if err != nil {
+			return fmt.Errorf("leaf %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// validateKeyUniqueness is check 3: no encryption key appears at two nodes of the tree, leaf and
+// parent alike, and no signature key appears at two leaves.
+//
+// A repeated encryption key is not a cosmetic duplicate. A commit seals one path secret per
+// entry of a resolution, so two nodes publishing one key means one HPKE private key opens two
+// positions, and whoever holds it reads a path secret sealed to a node they are not on. A
+// repeated signature key is the same statement about identity: two leaves signing as one member
+// make "which member sent this" unanswerable, and removing one of them leaves the other still
+// speaking under that key.
+//
+// Both maps are keyed by the key BYTES rather than by an index, so this is a sweep over every
+// ordered pair of the tree without being written as one: the first repeat of a value already
+// seen is a refusal wherever in the array the two sit.
+func (self *RatchetTree) validateKeyUniqueness() error {
+	encryptionKeys := map[string]uint32{}
+	signatureKeys := map[string]uint32{}
+	for x := uint32(0); x < self.NodeWidth(); x += 1 {
+		node := self.nodes[x]
+		if node == nil {
+			continue
+		}
+		var encryptionKey []byte
+		switch {
+		case node.Leaf != nil:
+			encryptionKey = node.Leaf.EncryptionKey
+			if first, seen := signatureKeys[string(node.Leaf.SignatureKey)]; seen {
+				return fmt.Errorf("%w: nodes %d and %d", errDuplicateSignatureKey, first, x)
+			}
+			signatureKeys[string(node.Leaf.SignatureKey)] = x
+		case node.Parent != nil:
+			encryptionKey = node.Parent.EncryptionKey
+		default:
+			// an occupied position with neither body, which validateStructure refuses ahead of
+			// this. Written rather than left to a nil dereference, because this is one clause
+			// of a sweep and a later caller may reach it by another route.
+			return fmt.Errorf("%w: node %d is occupied and holds neither a leaf nor a parent",
+				ErrNodeTypeMismatch, x)
+		}
+		if first, seen := encryptionKeys[string(encryptionKey)]; seen {
+			return fmt.Errorf("%w: nodes %d and %d", errDuplicateEncryptionKey, first, x)
+		}
+		encryptionKeys[string(encryptionKey)] = x
+	}
+	return nil
+}
+
+// validateUnmergedLeaves is check 4: every unmerged_leaves vector is strictly ascending, every
+// entry is a non-blank leaf in the subtree of the node listing it, and every node strictly
+// between that leaf and that node is blank or lists the same leaf.
+//
+// The last clause is the one easiest to leave out and the one the rest depends on. A leaf is
+// unmerged AT a node when its member does not hold that node's key, and for the member's own
+// direct path that has to hold all the way up: an intermediate that is non-blank and does NOT
+// list the leaf asserts that the member holds that intermediate's key while not holding its
+// ancestor's, which no sequence of commits can produce. What a tree violating it buys an
+// attacker is a resolution that differs from the one an honest sender computes, so the next
+// commit seals a path secret to a set of keys the two sides do not agree on.
+//
+// The sweep is over every odd index and no even one, which is exactly the parent positions (RFC
+// 9420 appendix C), derived from the width rather than from a list of the parents somebody
+// expected to be non-blank -- the same derivation VerifyParentHashes uses next door.
+func (self *RatchetTree) validateUnmergedLeaves() error {
+	for x := uint32(1); x < self.NodeWidth(); x += 2 {
+		node := NodeIndex(x)
+		parent := self.ParentAt(node)
+		if parent == nil {
+			continue
+		}
+		for i, leaf := range parent.UnmergedLeaves {
+			if i > 0 && parent.UnmergedLeaves[i-1] >= leaf {
+				return fmt.Errorf("%w: node %d lists leaf %d after leaf %d",
+					ErrUnmergedLeavesNotSorted, x, leaf, parent.UnmergedLeaves[i-1])
+			}
+			if LeafCount(leaf) >= self.LeafWidth() {
+				return fmt.Errorf("%w: node %d lists leaf %d and the tree has %d leaves",
+					ErrUnmergedLeafInconsistent, x, leaf, self.LeafWidth())
+			}
+			// a blank leaf is a member who is GONE, and a node still listing them is a node
+			// whose resolution the removal was supposed to have changed. tree.go drops such
+			// entries as it blanks a leaf, so a tree carrying one was not built here.
+			if self.Leaf(leaf) == nil {
+				return fmt.Errorf("%w: node %d lists leaf %d, which is blank",
+					ErrUnmergedLeafInconsistent, x, leaf)
+			}
+			if !InSubtree(node, leaf.NodeIndex()) {
+				return fmt.Errorf("%w: node %d lists leaf %d, which is not under it",
+					ErrUnmergedLeafInconsistent, x, leaf)
+			}
+			path, err := directPathOf(leaf.NodeIndex(), self.LeafWidth())
+			if err != nil {
+				return err
+			}
+			for _, intermediate := range path {
+				if intermediate == node {
+					break
+				}
+				between := self.ParentAt(intermediate)
+				if between == nil {
+					continue
+				}
+				if !unmergedLeavesListLeaf(between.UnmergedLeaves, leaf) {
+					return fmt.Errorf("%w: node %d lists leaf %d and node %d between them does not",
+						ErrUnmergedLeafInconsistent, x, leaf, intermediate)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// unmergedLeavesListLeaf is membership in one unmerged_leaves vector, as a linear scan.
+//
+// Linear and not a binary search over the ascending order, deliberately: that order is a
+// property this file is in the middle of CHECKING, and a search that assumed it would answer
+// "absent" for a leaf that is present in an unsorted vector -- turning a sortedness failure at
+// one node into a consistency failure reported against another.
+func unmergedLeavesListLeaf(leaves []LeafIndex, leaf LeafIndex) bool {
+	for _, candidate := range leaves {
+		if candidate == leaf {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate answers nil only if this tree satisfies every RFC 9420 rule that can be decided from
+// the tree and this context alone. The one that cannot -- the binding to the epoch that pinned
+// it -- is ValidateAgainstContext's.
+//
+// The order is structural, then per node, then whole tree, and it is load bearing rather than
+// tidy. validateStructure is what makes the node array indexable and every node's body the one
+// its position takes, so every check after it may read self.nodes[x] without asking again; and
+// the parent hash sweep is LAST because it is the only check that hashes, so a tree refused for
+// any cheaper reason never pays for it.
+func (self *RatchetTree) Validate(ctx *TreeValidationContext) error {
+	// a nil context is a context whose provider is nil, and it gets the refusal a nil provider
+	// gets, for LeafNode.Validate's reason: the two must not answer differently about the same
+	// missing thing. Refused before any node is read, which is the only order that does not
+	// dereference it.
+	if ctx == nil || ctx.Crypto == nil {
+		return fmt.Errorf("%w: every leaf signature and every parent hash of this tree is taken through it",
+			ErrNilCryptoProvider)
+	}
+	if err := self.validateStructure(); err != nil {
+		return err
+	}
+	if err := self.validateLeaves(ctx); err != nil {
+		return err
+	}
+	if err := self.validateKeyUniqueness(); err != nil {
+		return err
+	}
+	if err := self.validateUnmergedLeaves(); err != nil {
+		return err
+	}
+	return self.VerifyParentHashes(ctx.Crypto)
+}
+
+// ValidateAgainstContext is Validate plus check 6: this tree is the tree the GroupContext pinned.
+//
+// The tree hash is what every epoch secret and every signature of the epoch is bound to, so a
+// tree that validates on its own and hashes to something else is a DIFFERENT group's tree,
+// however sound it is. Without this a joiner handed a well formed tree from a fork would derive
+// an epoch nobody else is in and report nothing at all.
+func (self *RatchetTree) ValidateAgainstContext(ctx *TreeValidationContext, gc *GroupContext) error {
+	// no context is no pin, and a tree with nothing to be checked against has not passed this
+	// check, it has skipped it. Refused rather than dereferenced, so a missing argument cannot
+	// read as a match.
+	if gc == nil {
+		return fmt.Errorf("%w: there is no group context for this tree to be checked against",
+			ErrTreeHashMismatch)
+	}
+	if err := self.Validate(ctx); err != nil {
+		return err
+	}
+	treeHash, err := self.TreeHash(ctx.Crypto)
+	if err != nil {
+		return err
+	}
+	// through subtle for guardrail 8's reason. A tree hash is a public value, but every
+	// comparison in this package that decides whether a structure is ADOPTED is written the one
+	// way, so no later reader has to work out which of them were the safe ones. Unequal lengths
+	// answer zero here, which is what makes an absent or truncated tree_hash a mismatch rather
+	// than a panic.
+	if subtle.ConstantTimeCompare(treeHash, gc.TreeHash) != 1 {
+		return fmt.Errorf("%w: the tree hashes to %x and the group context carries %x",
+			ErrTreeHashMismatch, treeHash, gc.TreeHash)
+	}
+	return nil
+}
