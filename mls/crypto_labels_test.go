@@ -651,6 +651,20 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// is a signature no peer running the default limit could verify. The ratchet tree
 		// encode that does need the raised bound is not this call and will say so here.
 		"tree_adapt.go: syntax.NewWriter()",
+		// the two nested vectors of RFC 9420 section 7.6's UpdatePath: the ciphertexts
+		// under one node, and the nodes under the path. All four take the caller's Writer or
+		// Reader rather than building one, so each runs under whichever limit the caller
+		// opened -- the default one for an UpdatePath encoded or decoded on its own, and the
+		// raised one wherever a decode carrying a ratchet tree opened it. The default is the
+		// right one for the structure itself: an UpdatePath is one leaf and one filtered
+		// direct path, bounded by the group's own size rather than by the tree array, and one
+		// allowed past MaxVectorLength is one no peer running the default limit could have
+		// sent -- which matters here because these are the bytes a commit's confirmation tag
+		// is taken over.
+		"treekem.go: syntax.ReadVector(r, readOneHpkeCiphertext)",
+		"treekem.go: syntax.ReadVector(r, readOneUpdatePathNode)",
+		"treekem.go: syntax.WriteVector(w, self.EncryptedPathSecret, writeOneHpkeCiphertext)",
+		"treekem.go: syntax.WriteVector(w, self.Nodes, writeOneUpdatePathNode)",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
@@ -1385,6 +1399,30 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("DecryptWithLabel: %v", decryptErr)
 			}
 			return plaintext
+		}},
+		// the HpkeCiphertext shaped forms of the pair above, which the TreeKEM and framing
+		// layers call instead. They are two lines of adaptation each and are swept anyway:
+		// an adaptation that reached for a provider of its own rather than forwarding the one
+		// it was handed answers a well formed pair that opens under itself, and every corpus
+		// in this package is at the suite it would have hardcoded.
+		//
+		// Both halves of the seal are read and concatenated, for DeriveNodeKeyPair's reason: a
+		// body that routed the KEM output through the provider it was handed and produced the
+		// ciphertext with one of its own would not move a row that read the first result only.
+		{name: "SealWithLabel", call: func(crypto CryptoProvider) []byte {
+			sealed, sealErr := SealWithLabel(crypto, pub, "UpdatePathNode", value, []byte("secret"))
+			if sealErr != nil {
+				t.Fatalf("SealWithLabel: %v", sealErr)
+			}
+			return slices.Concat(sealed.KemOutput, sealed.Ciphertext)
+		}},
+		{name: "OpenWithLabel", call: func(crypto CryptoProvider) []byte {
+			opened, openErr := OpenWithLabel(crypto, priv, "UpdatePathNode", value,
+				&HpkeCiphertext{KemOutput: sealedKemOutput, Ciphertext: sealedCiphertext})
+			if openErr != nil {
+				t.Fatalf("OpenWithLabel: %v", openErr)
+			}
+			return opened
 		}},
 		// the key schedule's first derivation. It reaches the provider twice, for the
 		// extract and for the labelled expand, and neither is visible in the answer: a

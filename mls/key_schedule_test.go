@@ -3909,6 +3909,11 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 	// not make an X25519 public key wider. Its other answer is the ciphertext, which is
 	// the plaintext plus the aead tag and is not a kdf length either.
 	"EncryptWithLabel": "answers a KEM output at Nenc and a ciphertext at Nt, neither of which is KDF.Nh; Nenc coincides with Nh at 32 under the narrow suite",
+	// the same two answers in one structure, so the same coincidence and the same excuse.
+	// What holds the two lengths instead is
+	// TestSealWithLabelPutsTheKemOutputAndTheCiphertextInTheirOwnFields, which reads Nenc and
+	// Nt off the suite registry rather than off the kdf.
+	"SealWithLabel": "answers a KEM output at Nenc and a ciphertext at Nt, neither of which is KDF.Nh; Nenc coincides with Nh at 32 under the narrow suite",
 	// its two answers are the aead key at Nk and the aead nonce at Nn. Nk is 32 under the
 	// narrow suite and KDF.Nh is 32 there too, so the equality is that suite's coincidence
 	// rather than anything this construction did -- and a kdf getting wider does not widen
@@ -4120,6 +4125,24 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 				sealedKemOutput, sealedCiphertext)
 			if openErr != nil {
 				t.Fatalf("DecryptWithLabel: %v", openErr)
+			}
+			return [][]byte{opened}
+		}},
+		// the HpkeCiphertext shaped forms of the pair above. The open is a row rather than an
+		// excuse because its answer IS the plaintext it was handed, which is not a kdf length
+		// at either width; the seal is excused below for the reason EncryptWithLabel is.
+		{name: "SealWithLabel", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			sealed, sealErr := SealWithLabel(crypto, pub, "UpdatePathNode", value, plaintext)
+			if sealErr != nil {
+				t.Fatalf("SealWithLabel: %v", sealErr)
+			}
+			return [][]byte{sealed.KemOutput, sealed.Ciphertext}
+		}},
+		{name: "OpenWithLabel", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			opened, openErr := OpenWithLabel(crypto, priv, "UpdatePathNode", value,
+				&HpkeCiphertext{KemOutput: sealedKemOutput, Ciphertext: sealedCiphertext})
+			if openErr != nil {
+				t.Fatalf("OpenWithLabel: %v", openErr)
 			}
 			return [][]byte{opened}
 		}},

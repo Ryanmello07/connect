@@ -1882,3 +1882,920 @@ func TestCreateUpdatePathSecretsTellsABlankLeafApartFromAnIndexOutsideTheTree(t 
 	}
 	t.Logf("%d blanked leaves and %d indices past the width, each answered by its own sentinel and by neither the other", blanked, outside)
 }
+
+// ---------------------------------------------------------------------------
+// task 19: the UpdatePath wire types
+// ---------------------------------------------------------------------------
+
+// The three levels of length prefix are what makes this codec different from every other one in
+// this package, and two of the shapes that got through elsewhere are exactly the shapes nesting
+// hides:
+//
+// A SYMMETRIC FIELD ORDER SWAP -- two fields exchanged in both halves -- round trips perfectly,
+// re-encodes byte exact, and is byte exact against the published corpus too, because the corpus
+// check only ever compares what this implementation decoded against what it re-encoded. The only
+// thing that separates the two orders is a statement of the encoding written from the RFC without
+// reference to the code, which is what the hand derived goldens below are.
+//
+// A FIELD DROPPED FROM BOTH HALVES round trips byte exact while being lost, because the decoder
+// never reads what the encoder never wrote. Only a comparison of the decoded VALUE against the
+// original catches it, never a comparison of bytes against re-encoded bytes.
+//
+// The third shape is this file's own and is NOT a codec property at all: a ciphertext count that
+// does not match the resolution the node was built for. The codec is handed bytes and has no
+// tree, so it cannot check it; the relation is stated here against the published corpus, so that
+// this layer and task 22's decrypt at least agree about what the relation is.
+
+// testUpdatePathFixture is the value every golden below is compared against.
+//
+// Every octet string in it is DIFFERENT from every other one, and the two fields of a
+// ciphertext have different LENGTHS as well -- 32 against 48 -- which is what makes a swap of
+// kem_output and ciphertext visible in the bytes at all. Two nodes, the first carrying two
+// ciphertexts and the second carrying none, so that the vector prefix is exercised at both a one
+// octet and a two octet width and an empty nested vector is covered by the same golden.
+func testUpdatePathFixture() *UpdatePath {
+	leaf := testLeafNodeTemplate()
+	leaf.LeafNodeSource = LeafNodeSourceCommit
+	leaf.ParentHash = repeatByte(0x44, 32)
+	return &UpdatePath{
+		LeafNode: *leaf,
+		Nodes: []UpdatePathNode{
+			{
+				EncryptionKey: HpkePublicKey(repeatByte(0x01, 32)),
+				EncryptedPathSecret: []HpkeCiphertext{
+					{KemOutput: repeatByte(0x02, 32), Ciphertext: repeatByte(0x03, 48)},
+					{KemOutput: repeatByte(0x04, 32), Ciphertext: repeatByte(0x05, 48)},
+				},
+			},
+			{
+				EncryptionKey:       HpkePublicKey(repeatByte(0x06, 32)),
+				EncryptedPathSecret: []HpkeCiphertext{},
+			},
+		},
+	}
+}
+
+// testUpdatePathDecodedForm is what a decode of that fixture must produce as a VALUE.
+//
+// It differs from the fixture in exactly one way, and it is the leaf's: the template carries a
+// lifetime under a commit source, which section 7.2's select does not encode, so a correct
+// decode answers the zero lifetime. leaf_node_test.go's decodedFormOf derives that from the
+// variant table rather than from a case written here, so a fourth source is handled by this
+// comparison on the commit that declares it.
+func testUpdatePathDecodedForm(t *testing.T) *UpdatePath {
+	t.Helper()
+	out := testUpdatePathFixture()
+	out.LeafNode = *decodedFormOf(t, &out.LeafNode)
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// the hand derived goldens
+// ---------------------------------------------------------------------------
+
+// handDerivedHpkeCiphertext is one HPKECiphertext of the fixture, written out from RFC 9420
+// section 6.1 rather than read back through the encoder:
+//
+//	kem_output<V>    32 octets -> 20 <kem>*32                              33
+//	ciphertext<V>    48 octets -> 30 <ct>*48                               49
+//	                                                                     ----
+//	                                                                       82
+//
+// Both prefixes are the ONE octet form, because section 2.1.2 gives lengths 0..63 a single octet
+// whose top two bits are zero: 32 is 0x20 and 48 is 0x30 with nothing else added. The two
+// lengths are deliberately different, so that a codec writing the two fields in the other order
+// produces 30 <ct>*48 20 <kem>*32, which is not these bytes.
+func handDerivedHpkeCiphertext(kem byte, ct byte) []byte {
+	return joinBytes([]byte{0x20}, repeatByte(kem, 32), []byte{0x30}, repeatByte(ct, 48))
+}
+
+// handDerivedUpdatePathNodeWithCiphertexts is the fixture's first node:
+//
+//	encryption_key<V>          32 octets      -> 20 01*32                  33
+//	encrypted_path_secret<V>   2 x 82 = 164   -> 40 a4 <164 octets>       166
+//	                                                                     ----
+//	                                                                      199
+//
+// The vector prefix is the TWO octet form and the value is the BODY LENGTH IN OCTETS, not the
+// element count. 164 is above 63 so section 2.1.2 gives it two octets with the prefix bits 0b01:
+// 0x40 | (164 >> 8) = 0x40, then 164 & 0xff = 0xa4. An encoder writing the element count would
+// write the single octet 0x02 here, an encoder using the four octet framing would write
+// 0x800000a4, and neither is visible to any round trip because this implementation would read
+// back whatever it wrote.
+func handDerivedUpdatePathNodeWithCiphertexts() []byte {
+	return joinBytes(
+		[]byte{0x20}, repeatByte(0x01, 32),
+		[]byte{0x40, 0xa4},
+		handDerivedHpkeCiphertext(0x02, 0x03),
+		handDerivedHpkeCiphertext(0x04, 0x05),
+	)
+}
+
+// handDerivedUpdatePathNodeWithNone is the fixture's second node:
+//
+//	encryption_key<V>          32 octets      -> 20 06*32                  33
+//	encrypted_path_secret<V>   empty          -> 00                         1
+//	                                                                     ----
+//	                                                                       34
+//
+// The empty vector is the single zero octet and nothing else, which is also what a nil vector
+// encodes to: the wire format has no representation for "absent".
+func handDerivedUpdatePathNodeWithNone() []byte {
+	return joinBytes([]byte{0x20}, repeatByte(0x06, 32), []byte{0x00})
+}
+
+// handDerivedUpdatePathGolden is the whole structure of RFC 9420 section 7.6:
+//
+//	leaf_node       a commit source leaf, leaf_node_test.go's own derivation       192
+//	nodes<V>        199 + 34 = 233 octets of body -> 40 e9 <233 octets>            235
+//	                                                                             ----
+//	                                                                              427
+//
+// The leaf comes from handDerivedLeafNodeGolden, which is derived from section 7.2 in the file
+// that owns that structure and is checked against its own arithmetic there. Reusing it rather
+// than re-deriving it here is deliberate: two hand derivations of one structure drift, and the
+// one that drifted would be the one nothing else reads.
+//
+// 233 is above 63, so its prefix is the two octet form again: 0x40 | (233 >> 8) = 0x40, then
+// 233 & 0xff = 0xe9.
+func handDerivedUpdatePathGolden() []byte {
+	return joinBytes(
+		handDerivedLeafNodeGolden(LeafNodeSourceCommit),
+		[]byte{0x40, 0xe9},
+		handDerivedUpdatePathNodeWithCiphertexts(),
+		handDerivedUpdatePathNodeWithNone(),
+	)
+}
+
+// The arithmetic of the comments above, stated separately so that a derivation edited without
+// its comment fails rather than quietly redefining what it is compared to. This is
+// leaf_node_test.go's handDerivedLeafNodeSizes at three levels instead of one.
+const (
+	handDerivedHpkeCiphertextSize          = 82
+	handDerivedUpdatePathNodeWithCtSize    = 199
+	handDerivedUpdatePathNodeWithNoneSize  = 34
+	handDerivedUpdatePathSize              = 427
+	handDerivedUpdatePathLeafSize          = 192
+	handDerivedUpdatePathNodesRegionLength = 233
+)
+
+// TestTheUpdatePathHandDerivationsAgreeWithTheirOwnArithmetic runs before the goldens are used
+// for anything, so that a derivation which no longer holds the octets its comment counts fails
+// here rather than pinning the encoder to whatever it happens to produce.
+func TestTheUpdatePathHandDerivationsAgreeWithTheirOwnArithmetic(t *testing.T) {
+	for _, one := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"HPKECiphertext", len(handDerivedHpkeCiphertext(0x02, 0x03)), handDerivedHpkeCiphertextSize},
+		{"UpdatePathNode with two ciphertexts", len(handDerivedUpdatePathNodeWithCiphertexts()), handDerivedUpdatePathNodeWithCtSize},
+		{"UpdatePathNode with none", len(handDerivedUpdatePathNodeWithNone()), handDerivedUpdatePathNodeWithNoneSize},
+		{"the commit leaf", len(handDerivedLeafNodeGolden(LeafNodeSourceCommit)), handDerivedUpdatePathLeafSize},
+		{"UpdatePath", len(handDerivedUpdatePathGolden()), handDerivedUpdatePathSize},
+	} {
+		if one.got != one.want {
+			t.Errorf("the hand derivation of %s is %d octets and the arithmetic in its comment says %d",
+				one.name, one.got, one.want)
+		}
+	}
+	// the two nested totals, stated as the sums the prefixes above declare rather than as two
+	// more constants: a prefix that says one number while the body holds another is the exact
+	// defect a golden built out of the same expression on both sides cannot see.
+	if got := handDerivedUpdatePathNodeWithCtSize + handDerivedUpdatePathNodeWithNoneSize; got != handDerivedUpdatePathNodesRegionLength {
+		t.Errorf("the two nodes are %d octets and the nodes<V> prefix in the golden declares %d",
+			got, handDerivedUpdatePathNodesRegionLength)
+	}
+	if got := handDerivedUpdatePathLeafSize + 2 + handDerivedUpdatePathNodesRegionLength; got != handDerivedUpdatePathSize {
+		t.Errorf("the leaf, the two octet prefix and the nodes region are %d octets and the whole derivation says %d",
+			got, handDerivedUpdatePathSize)
+	}
+}
+
+// TestHpkeCiphertextMarshalMatchesTheHandDerivedGolden is the field order and prefix width pin
+// for the innermost of the three structures, and it is the only test in this file that a
+// kem_output and ciphertext exchanged in BOTH halves does not survive.
+func TestHpkeCiphertextMarshalMatchesTheHandDerivedGolden(t *testing.T) {
+	in := &HpkeCiphertext{KemOutput: repeatByte(0x02, 32), Ciphertext: repeatByte(0x03, 48)}
+	want := handDerivedHpkeCiphertext(0x02, 0x03)
+	encoded, err := syntax.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Equal(encoded, want) {
+		t.Errorf("Marshal =\n %x\nwant\n %x", encoded, want)
+	}
+	out := &HpkeCiphertext{}
+	if err := syntax.Unmarshal(want, out); err != nil {
+		t.Fatalf("Unmarshal the golden: %v", err)
+	}
+	// the whole value and not the two lengths: a decoder that put the kem output in the
+	// ciphertext field agrees about both lengths in every fixture where they are equal, and
+	// this package's real ciphertexts are 32 and 48 only by accident of the plaintext.
+	if !reflect.DeepEqual(out, in) {
+		t.Errorf("the golden decoded to kem_output %x ciphertext %x, want %x and %x",
+			out.KemOutput, out.Ciphertext, in.KemOutput, in.Ciphertext)
+	}
+}
+
+// TestUpdatePathNodeMarshalMatchesTheHandDerivedGoldens is the same pin one level out, over both
+// shapes the fixture holds: a node whose ciphertext vector needs the two octet prefix, and one
+// whose empty vector needs the single zero octet.
+func TestUpdatePathNodeMarshalMatchesTheHandDerivedGoldens(t *testing.T) {
+	fixture := testUpdatePathFixture()
+	for at, want := range [][]byte{
+		handDerivedUpdatePathNodeWithCiphertexts(),
+		handDerivedUpdatePathNodeWithNone(),
+	} {
+		in := fixture.Nodes[at]
+		encoded, err := syntax.Marshal(&in)
+		if err != nil {
+			t.Fatalf("node %d: Marshal: %v", at, err)
+		}
+		if !bytes.Equal(encoded, want) {
+			t.Errorf("node %d: Marshal =\n %x\nwant\n %x", at, encoded, want)
+		}
+		out := &UpdatePathNode{}
+		if err := syntax.Unmarshal(want, out); err != nil {
+			t.Fatalf("node %d: Unmarshal the golden: %v", at, err)
+		}
+		if !reflect.DeepEqual(out, &in) {
+			t.Errorf("node %d: the golden decoded to %+v, want %+v", at, out, in)
+		}
+	}
+}
+
+// TestUpdatePathMarshalMatchesTheHandDerivedGolden is the pin over the whole three level
+// structure: the leaf, the nodes vector's byte length prefix, and every nested prefix under it.
+func TestUpdatePathMarshalMatchesTheHandDerivedGolden(t *testing.T) {
+	want := handDerivedUpdatePathGolden()
+	encoded, err := syntax.Marshal(testUpdatePathFixture())
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Equal(encoded, want) {
+		t.Errorf("Marshal =\n %x\nwant\n %x", encoded, want)
+	}
+	out := &UpdatePath{}
+	if err := syntax.Unmarshal(want, out); err != nil {
+		t.Fatalf("Unmarshal the golden: %v", err)
+	}
+	if !reflect.DeepEqual(out, testUpdatePathDecodedForm(t)) {
+		t.Errorf("the golden decoded to a value the fixture does not describe:\ngot  %s\nwant %s",
+			describeUpdatePath(out), describeUpdatePath(testUpdatePathDecodedForm(t)))
+	}
+}
+
+// describeUpdatePath spells a path out far enough that a failure above says which of the three
+// levels moved, since %+v over a structure of slices of slices prints addresses for the parts
+// that matter.
+func describeUpdatePath(path *UpdatePath) string {
+	out := fmt.Sprintf("leaf{%s} nodes=%d", describeLeafNode(&path.LeafNode), len(path.Nodes))
+	for at, node := range path.Nodes {
+		out += fmt.Sprintf(" | node %d key=%x ciphertexts=%d", at, node.EncryptionKey, len(node.EncryptedPathSecret))
+		for i, ct := range node.EncryptedPathSecret {
+			out += fmt.Sprintf(" [%d kem=%x ct=%x]", i, ct.KemOutput, ct.Ciphertext)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// the round trip, as a value rather than as bytes
+// ---------------------------------------------------------------------------
+
+// TestUpdatePathRoundTripsAsAWholeValue is the plan's round trip with the comparison it was
+// missing.
+//
+// The plan compared the re-encoded bytes, the node count, the two ciphertext counts and the
+// leaf's parent hash. A codec that dropped the kem output from BOTH halves satisfies every one
+// of those -- the bytes it does not write it does not read, so the re-encode is exact and every
+// count is right -- while losing a field the whole protocol depends on. reflect.DeepEqual
+// against the value that went in is what closes that, and it is the only assertion here that
+// could not be satisfied by an encoder and a decoder agreeing with each other about the wrong
+// thing.
+func TestUpdatePathRoundTripsAsAWholeValue(t *testing.T) {
+	in := testUpdatePathFixture()
+	encoded, err := syntax.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out := &UpdatePath{}
+	if err := syntax.Unmarshal(encoded, out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(out, testUpdatePathDecodedForm(t)) {
+		t.Fatalf("the round trip did not preserve the value:\ngot  %s\nwant %s",
+			describeUpdatePath(out), describeUpdatePath(testUpdatePathDecodedForm(t)))
+	}
+	reencoded, err := syntax.Marshal(out)
+	if err != nil {
+		t.Fatalf("re-Marshal: %v", err)
+	}
+	if !bytes.Equal(reencoded, encoded) {
+		t.Fatalf("re-encode differs:\ngot  %x\nwant %x", reencoded, encoded)
+	}
+}
+
+// TestANilAndAnEmptyCiphertextVectorAreOneUpdatePathOnTheWire states the one place the Go value
+// and the wire disagree, so that a caller comparing two paths as values knows which of the two
+// forms a decode answers.
+//
+// The wire has no representation for "absent", so both encode to the single zero octet; decoding
+// answers the empty non nil slice, because syntax.ReadVector never answers nil. A path built by
+// hand with a nil vector therefore does not survive a round trip under DeepEqual even though its
+// encoding does, which is the same statement leaf_node.go makes about its own vectors.
+func TestANilAndAnEmptyCiphertextVectorAreOneUpdatePathOnTheWire(t *testing.T) {
+	withNil := testUpdatePathFixture()
+	withNil.Nodes[1].EncryptedPathSecret = nil
+	withEmpty := testUpdatePathFixture()
+	fromNil, err := syntax.Marshal(withNil)
+	if err != nil {
+		t.Fatalf("Marshal the nil form: %v", err)
+	}
+	fromEmpty, err := syntax.Marshal(withEmpty)
+	if err != nil {
+		t.Fatalf("Marshal the empty form: %v", err)
+	}
+	if !bytes.Equal(fromNil, fromEmpty) {
+		t.Fatalf("a nil ciphertext vector encoded to\n %x\nand an empty one to\n %x", fromNil, fromEmpty)
+	}
+	out := &UpdatePath{}
+	if err := syntax.Unmarshal(fromNil, out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.Nodes[1].EncryptedPathSecret == nil {
+		t.Fatal("the decode answered a nil ciphertext vector, so an empty vector and an absent one are two values in Go for one encoding")
+	}
+	// and the whole path, which is where a nil nodes vector would show: a path with no nodes
+	// at all is what a commit in a group of one publishes.
+	alone := &UpdatePath{LeafNode: testUpdatePathFixture().LeafNode}
+	encoded, err := syntax.Marshal(alone)
+	if err != nil {
+		t.Fatalf("Marshal the single member path: %v", err)
+	}
+	decoded := &UpdatePath{}
+	if err := syntax.Unmarshal(encoded, decoded); err != nil {
+		t.Fatalf("Unmarshal the single member path: %v", err)
+	}
+	if decoded.Nodes == nil || len(decoded.Nodes) != 0 {
+		t.Fatalf("a path with no nodes decoded to %v, want an empty non nil vector", decoded.Nodes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what the decoder must refuse
+// ---------------------------------------------------------------------------
+
+// TestUpdatePathRejectsTrailingBytes is the plan's refusal, plus the truncation sweep it stated
+// for one length only.
+//
+// The trailing byte half is the one that matters most in this package and is worth the sentence:
+// MLS signs over serialized forms, so a decoder that accepts a tail accepts two encodings of one
+// object, which is a signature bypass primitive rather than a leniency. It is enforced by
+// syntax.Unmarshal's join against Done rather than by anything in this file, and this is what
+// says so.
+//
+// The truncation half runs over EVERY prefix of a valid encoding rather than the one the plan
+// cut. There are three levels of length prefix here and a truncation inside any one of them is a
+// different code path -- a varint that runs out, a declared length past the end of the input, a
+// nested region that ends mid element -- and cutting only the last octet exercises exactly one
+// of them.
+func TestUpdatePathRejectsTrailingBytes(t *testing.T) {
+	encoded, err := syntax.Marshal(testUpdatePathFixture())
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := syntax.Unmarshal(append(bytes.Clone(encoded), 0x00), &UpdatePath{}); !errors.Is(err, syntax.ErrTrailingBytes) {
+		t.Fatalf("trailing byte err = %v, want ErrTrailingBytes", err)
+	}
+	refused := 0
+	for cut := 0; cut < len(encoded); cut += 1 {
+		if err := syntax.Unmarshal(encoded[:cut], &UpdatePath{}); err == nil {
+			t.Errorf("Unmarshal of the first %d octets of a %d octet path returned no error", cut, len(encoded))
+			continue
+		}
+		refused += 1
+	}
+	if refused != len(encoded) {
+		t.Fatalf("%d of %d truncations were refused", refused, len(encoded))
+	}
+	t.Logf("%d truncations of a %d octet path all refused", refused, len(encoded))
+}
+
+// TestUpdatePathRefusesANestedVectorThatOverrunsItsParentRegion is the failure three levels of
+// length prefix make possible and one level does not: an inner vector that declares more octets
+// than the region enclosing it holds, while still declaring fewer than the whole input has left.
+//
+// Those two numbers are the whole test. A decoder that validated a declared length against the
+// bytes remaining in the INPUT rather than in the enclosing region accepts this and reads the
+// next node's octets as part of this node's ciphertext vector -- a structure the sender never
+// sent, assembled out of its own neighbours, and byte exact on re-encode because the decoder
+// would write back what it read. The fixture is built so that the two bounds disagree, and the
+// disagreement is asserted before the refusal is required: without that, this test passes
+// against exactly the decoder it exists to forbid.
+func TestUpdatePathRefusesANestedVectorThatOverrunsItsParentRegion(t *testing.T) {
+	leaf := handDerivedLeafNodeGolden(LeafNodeSourceCommit)
+	first := handDerivedUpdatePathNodeWithCiphertexts()
+	second := handDerivedUpdatePathNodeWithNone()
+
+	// the nodes<V> region is cut down to the first node alone -- 199 octets, prefix 40 c7 --
+	// and the second node's octets are left in the buffer after it. So the input still has
+	// bytes the region does not.
+	nodesRegion := handDerivedUpdatePathNodeWithCtSize
+	if nodesRegion != 199 {
+		t.Fatalf("the first node is %d octets and this fixture's prefix declares 199", nodesRegion)
+	}
+	// inside that region: 33 octets of encryption_key, then the ciphertext vector's prefix.
+	// The vector's true body is 164 octets and the region has 164 left once the key and the
+	// prefix are read, so a declared 190 overruns the region by 26 and is still 8 short of
+	// what the buffer holds.
+	const declared = 190
+	const trueBody = 164
+	overrun := joinBytes(
+		leaf,
+		[]byte{0x40, 0xc7},
+		first[:33],
+		[]byte{0x40, byte(declared)},
+		first[35:],
+		second,
+	)
+	if len(overrun) != len(handDerivedUpdatePathGolden()) {
+		t.Fatalf("the fixture is %d octets and the golden it was built from is %d, so the surgery moved something",
+			len(overrun), len(handDerivedUpdatePathGolden()))
+	}
+	afterInnerPrefix := len(leaf) + 2 + 33 + 2
+	if remainingInInput := len(overrun) - afterInnerPrefix; declared > remainingInInput {
+		t.Fatalf("the fixture declares %d octets and the input has %d left, so a decoder bounded by the input alone would refuse this too and the test would prove nothing",
+			declared, remainingInInput)
+	}
+	if declared <= trueBody {
+		t.Fatalf("the fixture declares %d octets and the enclosing region has %d left, so nothing is overrun",
+			declared, trueBody)
+	}
+	if err := syntax.Unmarshal(overrun, &UpdatePath{}); !errors.Is(err, syntax.ErrLengthExceedsInput) {
+		t.Fatalf("a ciphertext vector declaring %d octets inside a %d octet region gave err = %v, want ErrLengthExceedsInput",
+			declared, trueBody, err)
+	}
+	// the control: the same surgery with the true length restored is a well formed node
+	// followed by a tail, so it must be refused for the OTHER reason. Without it a decoder
+	// that refused every input this test builds would pass the assertion above.
+	honest := joinBytes(leaf, []byte{0x40, 0xc7}, first, second)
+	if err := syntax.Unmarshal(honest, &UpdatePath{}); !errors.Is(err, syntax.ErrTrailingBytes) {
+		t.Fatalf("the control, whose only fault is the second node sitting outside the nodes region, gave err = %v, want ErrTrailingBytes", err)
+	}
+}
+
+// TestUpdatePathDecodeIsStagedAndDoesNotWriteThroughAFailure states the two properties
+// leaf_node.go argues for, at the level where they are load bearing.
+//
+// A refused decode must leave the receiver as it found it. UpdatePath decodes a leaf and then a
+// vector, and the leaf is the half that carries a signature, an encryption key and a parent
+// hash, so a body that wrote the leaf into the receiver before reading the vector hands a caller
+// which logged the error rather than returning it a path assembled out of two different
+// messages -- one whose leaf came from the attacker's bytes and whose nodes are the previous
+// epoch's.
+//
+// And a receiver decoded into twice must answer the second encoding, not a mixture.
+func TestUpdatePathDecodeIsStagedAndDoesNotWriteThroughAFailure(t *testing.T) {
+	full, err := syntax.Marshal(testUpdatePathFixture())
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	receiver := &UpdatePath{}
+	if err := syntax.Unmarshal(full, receiver); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	before := describeUpdatePath(receiver)
+
+	// the truncations are of a DIFFERENT path from the one the receiver already holds, and
+	// that is the whole of what makes a write through observable. This test was first
+	// written sweeping truncations of the receiver's OWN encoding and it could not fail:
+	// LeafNode's own decode is staged, so a short leaf leaves the receiver untouched either
+	// way, and once the leaf is complete an unstaged body writes a leaf identical to the one
+	// already there. That version was measured against the unstaged body -- decode the leaf
+	// into self.LeafNode, then read the vector -- and it passed. So the second path differs
+	// in the leaf AND in the first node.
+	other := testUpdatePathFixture()
+	other.LeafNode.ParentHash = repeatByte(0x55, 32)
+	other.Nodes[0].EncryptionKey = HpkePublicKey(repeatByte(0x66, 32))
+	otherEncoded, err := syntax.Marshal(other)
+	if err != nil {
+		t.Fatalf("Marshal the second path: %v", err)
+	}
+	if describeUpdatePath(other) == before {
+		t.Fatal("the two paths describe identically, so one decoded over the other would be invisible here")
+	}
+	if len(otherEncoded) <= handDerivedUpdatePathLeafSize {
+		t.Fatalf("the second path is %d octets and its leaf alone is %d, so no truncation of it reaches the nodes vector -- which is the only place an unstaged body writes a complete leaf and then fails",
+			len(otherEncoded), handDerivedUpdatePathLeafSize)
+	}
+
+	// every truncation, so that a failure at any of the three levels is covered rather than
+	// the one the last octet happens to reach.
+	for cut := 0; cut < len(otherEncoded); cut += 1 {
+		if err := syntax.Unmarshal(otherEncoded[:cut], receiver); err == nil {
+			t.Fatalf("the first %d octets decoded without error", cut)
+		}
+		if got := describeUpdatePath(receiver); got != before {
+			t.Fatalf("a refused decode of the first %d octets of another path wrote through to the receiver:\ngot  %s\nwant %s",
+				cut, got, before)
+		}
+	}
+
+	// the second decode into the same receiver: a path with no nodes at all, which is what a
+	// group of one publishes. A body that appended to what it found, or that left the previous
+	// path's nodes standing, answers something no encoding describes.
+	alone := &UpdatePath{LeafNode: testUpdatePathFixture().LeafNode}
+	encoded, err := syntax.Marshal(alone)
+	if err != nil {
+		t.Fatalf("Marshal the single member path: %v", err)
+	}
+	if err := syntax.Unmarshal(encoded, receiver); err != nil {
+		t.Fatalf("Unmarshal the single member path: %v", err)
+	}
+	fresh := &UpdatePath{}
+	if err := syntax.Unmarshal(encoded, fresh); err != nil {
+		t.Fatalf("Unmarshal into a fresh value: %v", err)
+	}
+	if !reflect.DeepEqual(receiver, fresh) {
+		t.Fatalf("a receiver decoded into twice answered\n %s\nand a fresh one answered\n %s",
+			describeUpdatePath(receiver), describeUpdatePath(fresh))
+	}
+
+	// the same property one level down, which nothing above can observe: syntax.ReadVector
+	// builds a fresh HpkeCiphertext for every element, so a ciphertext decode that assigned
+	// as it read is invisible through an UpdatePath. It is visible to a caller decoding into
+	// a value it already holds, and the framing plan's Welcome is that caller.
+	held := &HpkeCiphertext{KemOutput: repeatByte(0x88, 8), Ciphertext: repeatByte(0x99, 8)}
+	kept := *held
+	one := handDerivedHpkeCiphertext(0x02, 0x03)
+	for cut := 0; cut < len(one); cut += 1 {
+		if err := syntax.Unmarshal(one[:cut], held); err == nil {
+			t.Fatalf("the first %d octets of a ciphertext decoded without error", cut)
+		}
+		if !reflect.DeepEqual(held, &kept) {
+			t.Fatalf("a refused ciphertext decode of the first %d octets wrote through: kem_output %x ciphertext %x, want %x and %x",
+				cut, held.KemOutput, held.Ciphertext, kept.KemOutput, kept.Ciphertext)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the seal and open adaptation
+// ---------------------------------------------------------------------------
+
+// TestSealAndOpenWithLabelRoundTrip is the plan's round trip: the pair agrees with itself, and
+// neither a different context nor a different label opens what was sealed.
+//
+// The two refusals are the point rather than the round trip. A label and a context that were
+// dropped on the way into the HPKE info still produce a ciphertext this same pair opens, so the
+// only thing that can see the omission is a message sealed under one and opened under the other.
+func TestSealAndOpenWithLabelRoundTrip(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	priv, pub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	ct, err := SealWithLabel(crypto, pub, "Welcome", []byte("context"), []byte("secret"))
+	if err != nil {
+		t.Fatalf("SealWithLabel: %v", err)
+	}
+	if len(ct.KemOutput) == 0 || len(ct.Ciphertext) == 0 {
+		t.Fatalf("SealWithLabel produced an empty ciphertext")
+	}
+	got, err := OpenWithLabel(crypto, priv, "Welcome", []byte("context"), ct)
+	if err != nil {
+		t.Fatalf("OpenWithLabel: %v", err)
+	}
+	if !bytes.Equal(got, []byte("secret")) {
+		t.Fatalf("OpenWithLabel = %q, want %q", got, "secret")
+	}
+	if _, err := OpenWithLabel(crypto, priv, "Welcome", []byte("other"), ct); err == nil {
+		t.Fatalf("the ciphertext opened under a different context")
+	}
+	if _, err := OpenWithLabel(crypto, priv, "GroupSecrets", []byte("context"), ct); err == nil {
+		t.Fatalf("the ciphertext opened under a different label")
+	}
+	// the two halves of the structure are not interchangeable, which is the failure a
+	// transposed adaptation produces and which the round trip above cannot see: it would seal
+	// and open transposed values consistently.
+	swapped := &HpkeCiphertext{KemOutput: ct.Ciphertext, Ciphertext: ct.KemOutput}
+	if _, err := OpenWithLabel(crypto, priv, "Welcome", []byte("context"), swapped); err == nil {
+		t.Fatal("a ciphertext whose two fields were exchanged still opened")
+	}
+	if _, err := OpenWithLabel(crypto, priv, "Welcome", []byte("context"), nil); !errors.Is(err, errNilHpkeCiphertext) {
+		t.Fatalf("OpenWithLabel(nil ciphertext) = %v, want errNilHpkeCiphertext", err)
+	}
+}
+
+// TestSealWithLabelPutsTheKemOutputAndTheCiphertextInTheirOwnFields is what separates the
+// adaptation from a transposed one.
+//
+// EncryptWithLabel answers (kemOutput, ciphertext) and both are []byte, so a transposed
+// assignment compiles and round trips through this same pair of functions perfectly. The
+// LENGTHS are what tell them apart: RFC 9180 fixes the encapsulated key at the suite's Nenc, and
+// the ciphertext is the plaintext plus the suite's Nt. Both numbers are read from the suite
+// registry rather than written here, so a suite whose KEM or AEAD differs is covered by this on
+// the commit that registers it.
+func TestSealWithLabelPutsTheKemOutputAndTheCiphertextInTheirOwnFields(t *testing.T) {
+	for _, suite := range registeredSuitesForUpdatePath(t) {
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("LookupSuite(%d): %v", suite, err)
+		}
+		crypto := mustProvider(t, suite)
+		_, pub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+		if err != nil {
+			t.Fatalf("DeriveKeyPair: %v", err)
+		}
+		// a plaintext whose length is neither Nenc nor Nenc plus Nt, so that the two fields
+		// cannot be told apart by accident of the fixture.
+		plaintext := repeatByte(0x77, 7)
+		ct, err := SealWithLabel(crypto, pub, "Welcome", []byte("context"), plaintext)
+		if err != nil {
+			t.Fatalf("SealWithLabel: %v", err)
+		}
+		if len(ct.KemOutput) != params.Nenc {
+			t.Errorf("%s: kem_output is %d octets, and the suite's Nenc is %d; the two results are transposed",
+				params.Name, len(ct.KemOutput), params.Nenc)
+		}
+		if want := len(plaintext) + params.Nt; len(ct.Ciphertext) != want {
+			t.Errorf("%s: ciphertext is %d octets, and the plaintext plus the suite's Nt is %d",
+				params.Name, len(ct.Ciphertext), want)
+		}
+	}
+}
+
+// registeredSuitesForUpdatePath is every ciphersuite this package registers, derived off the
+// registry rather than listed, so a third suite is swept by the sizes test above on the commit
+// that registers it.
+func registeredSuitesForUpdatePath(t *testing.T) []CipherSuite {
+	t.Helper()
+	suites := []CipherSuite{}
+	for _, value := range sortedValues(registryConstantsOfType(t, "CipherSuite")) {
+		suite := CipherSuite(value)
+		if _, err := LookupSuite(suite); err != nil {
+			continue
+		}
+		suites = append(suites, suite)
+	}
+	if len(suites) == 0 {
+		t.Fatal("no registered ciphersuite was derived, so the sweep over them runs over nothing")
+	}
+	return suites
+}
+
+// ---------------------------------------------------------------------------
+// the argument rule crypto_test.go's provider gates need for this file's structure
+// ---------------------------------------------------------------------------
+
+// providerHpkeCiphertextPerturbations moves an *HpkeCiphertext argument, one byte of one
+// field at a time, for the provider gates in crypto_test.go.
+//
+// The rule lives beside the structure it moves rather than in that file's switch, which is
+// where psk_test.go and leaf_node_test.go keep theirs: those gates walk every declaration of
+// the package, and a structure declared here whose perturbation is written there is one whose
+// rule stops matching when a field is added and says nothing about it.
+//
+// BOTH fields are moved, and that is the point rather than thoroughness. OpenWithLabel hands
+// its two fields to two different parameters of DecryptWithLabel, so an adaptation that passed
+// the kem output twice, or passed a constant for one of them, answers a refusal for every
+// input and moves under one of these perturbations and not the other -- and a rule that moved
+// only the first field would report the second as observed having never changed it.
+//
+// Each perturbation is a fresh structure over fresh arrays, so a moved value cannot write
+// through into the base argument every other row of those gates is built from.
+func providerHpkeCiphertextPerturbations(t *testing.T, operation string,
+	parameter providerParameter, argument reflect.Value) []providerPerturbation {
+	t.Helper()
+	base := argument.Interface().(*HpkeCiphertext)
+	moved := []providerPerturbation{}
+	for _, field := range []struct {
+		name string
+		at   func(ct *HpkeCiphertext) *[]byte
+	}{
+		{name: "kem_output", at: func(ct *HpkeCiphertext) *[]byte { return &ct.KemOutput }},
+		{name: "ciphertext", at: func(ct *HpkeCiphertext) *[]byte { return &ct.Ciphertext }},
+	} {
+		length := len(*field.at(base))
+		if length == 0 {
+			t.Fatalf("the base argument for %s.%s carries no %s, so perturbing that field changes nothing",
+				operation, parameter.name, field.name)
+		}
+		for _, position := range perturbedPositions(length) {
+			perturbed := &HpkeCiphertext{
+				KemOutput:  bytes.Clone(base.KemOutput),
+				Ciphertext: bytes.Clone(base.Ciphertext),
+			}
+			(*field.at(perturbed))[position] ^= 0xff
+			moved = append(moved, providerPerturbation{
+				where: fmt.Sprintf("byte %d of %d of the %s", position, length, field.name),
+				value: reflect.ValueOf(perturbed),
+			})
+		}
+	}
+	if len(moved) == 0 {
+		t.Fatalf("no perturbation was built for %s.%s, so that argument is called twice with one value and reported as observed",
+			operation, parameter.name)
+	}
+	return moved
+}
+
+// ---------------------------------------------------------------------------
+// the published corpus
+// ---------------------------------------------------------------------------
+
+// treekemUpdatePathVector is the other half of one entry of treekem.json: the tree an epoch
+// started from, and the UpdatePath each member would publish committing over it.
+//
+// This is the only oracle in this file that is independent of this repository. Everything above
+// compares this codec against a derivation the same reader wrote, which separates a swapped
+// field order from a correct one but cannot separate this whole family of structures from a
+// consistent misreading of section 7.6. The working group's implementations produced these
+// octets.
+type treekemUpdatePathVector struct {
+	CipherSuite uint16                       `json:"cipher_suite"`
+	RatchetTree string                       `json:"ratchet_tree"`
+	UpdatePaths []treekemPublishedUpdatePath `json:"update_paths"`
+}
+
+type treekemPublishedUpdatePath struct {
+	Sender     uint32 `json:"sender"`
+	UpdatePath string `json:"update_path"`
+}
+
+// Transcriptions of what testdata/vectors/treekem.json holds at the pinned mlswg commit, for the
+// suites this package implements. A decoder that stopped early, a filter that matched nothing and
+// a loop that read a field that is not there all report exactly what a complete run reports
+// without these.
+const (
+	treekemUpdatePathCount         = 124
+	treekemUpdatePathNodeCount     = 330
+	treekemUpdatePathCiphertexts   = 356
+	treekemUpdatePathDeepNodeCount = 26
+)
+
+// TestEveryPublishedUpdatePathDecodesAndReEncodesExactly is the corpus half of the codec: 124
+// UpdatePaths produced by other implementations, each decoded and re-encoded to the same octets.
+//
+// It catches the family the goldens above cannot: a prefix width, a field order or a nesting
+// this reader transcribed consistently wrongly in both the code and the derivation. It does NOT
+// catch a symmetric swap or a dropped field -- the comparison is against what this
+// implementation re-encoded, so both are byte exact here -- which is why it is the third test of
+// this codec and not the first.
+//
+// The two negative controls are what make the green run mean something: every published case
+// agrees, so a decoder that accepted everything and one that checked everything produce
+// identical runs, and only an input that must be refused separates them.
+func TestEveryPublishedUpdatePathDecodesAndReEncodesExactly(t *testing.T) {
+	paths, nodes, ciphertexts, deep := 0, 0, 0, 0
+	forEachPublishedUpdatePath(t, func(at int, tree *RatchetTree, published treekemPublishedUpdatePath, raw []byte) {
+		paths += 1
+		decoded := &UpdatePath{}
+		if err := syntax.Unmarshal(raw, decoded); err != nil {
+			t.Fatalf("entry %d, sender %d: Unmarshal a published update path: %v", at, published.Sender, err)
+		}
+		reencoded, err := syntax.Marshal(decoded)
+		if err != nil {
+			t.Fatalf("entry %d, sender %d: Marshal: %v", at, published.Sender, err)
+		}
+		if !bytes.Equal(reencoded, raw) {
+			t.Fatalf("entry %d, sender %d: re-encoding a published update path produced\n %x\nwant\n %x",
+				at, published.Sender, reencoded, raw)
+		}
+		nodes += len(decoded.Nodes)
+		for _, node := range decoded.Nodes {
+			ciphertexts += len(node.EncryptedPathSecret)
+			if len(node.EncryptedPathSecret) > 1 {
+				deep += 1
+			}
+		}
+		// the controls, per case rather than once. A tail must be refused, and so must the
+		// same encoding one octet short; a decoder that answered nil for both satisfies every
+		// line above.
+		if err := syntax.Unmarshal(append(bytes.Clone(raw), 0x00), &UpdatePath{}); !errors.Is(err, syntax.ErrTrailingBytes) {
+			t.Fatalf("entry %d, sender %d: a published path with one octet appended gave err = %v, want ErrTrailingBytes",
+				at, published.Sender, err)
+		}
+		if err := syntax.Unmarshal(raw[:len(raw)-1], &UpdatePath{}); err == nil {
+			t.Fatalf("entry %d, sender %d: a published path one octet short decoded without error",
+				at, published.Sender)
+		}
+	})
+	if paths != treekemUpdatePathCount || nodes != treekemUpdatePathNodeCount ||
+		ciphertexts != treekemUpdatePathCiphertexts || deep != treekemUpdatePathDeepNodeCount {
+		t.Fatalf("the run read %d published paths, %d nodes, %d ciphertexts and %d nodes carrying more than one ciphertext; want %d, %d, %d and %d",
+			paths, nodes, ciphertexts, deep,
+			treekemUpdatePathCount, treekemUpdatePathNodeCount, treekemUpdatePathCiphertexts, treekemUpdatePathDeepNodeCount)
+	}
+	t.Logf("%d published update paths, %d nodes, %d ciphertexts, %d nodes sealing to more than one resolution node",
+		paths, nodes, ciphertexts, deep)
+}
+
+// TestEveryPublishedUpdatePathHasOneCiphertextPerResolutionNode states the relation this codec
+// deliberately does not enforce, against the corpus, so that the layer which will enforce it and
+// the layer which produces it agree about what it IS.
+//
+// Section 7.6 gives an UpdatePath one node per step of the sender's filtered direct path and one
+// ciphertext per node of the resolution of that step's copath child. Neither number is available
+// to a codec -- both are properties of a tree at an epoch -- so a path whose counts are wrong is
+// perfectly well formed on the wire and is decoded here without complaint. The check belongs to
+// the layer holding the tree, which is task 22's decrypt, and it is written down in this file
+// because a cross-layer check both sides assume the other makes is a check nobody makes.
+//
+// Both numbers are recomputed from the published ratchet tree by this package's own tree walk,
+// so this is also the first thing that compares that walk against another implementation's
+// choice of resolution rather than against itself.
+func TestEveryPublishedUpdatePathHasOneCiphertextPerResolutionNode(t *testing.T) {
+	paths, checked, separated := 0, 0, 0
+	forEachPublishedUpdatePath(t, func(at int, tree *RatchetTree, published treekemPublishedUpdatePath, raw []byte) {
+		paths += 1
+		decoded := &UpdatePath{}
+		if err := syntax.Unmarshal(raw, decoded); err != nil {
+			t.Fatalf("entry %d, sender %d: Unmarshal: %v", at, published.Sender, err)
+		}
+		targets, err := tree.EncryptionTargets(LeafIndex(published.Sender), nil)
+		if err != nil {
+			t.Fatalf("entry %d, sender %d: EncryptionTargets: %v", at, published.Sender, err)
+		}
+		if len(targets) != len(decoded.Nodes) {
+			t.Fatalf("entry %d, sender %d: the published path carries %d nodes and the filtered direct path of that sender has %d steps",
+				at, published.Sender, len(decoded.Nodes), len(targets))
+		}
+		for i := range targets {
+			if len(targets[i]) != len(decoded.Nodes[i].EncryptedPathSecret) {
+				t.Fatalf("entry %d, sender %d, node %d: the published node carries %d ciphertexts and the resolution it was built for holds %d nodes",
+					at, published.Sender, i, len(decoded.Nodes[i].EncryptedPathSecret), len(targets[i]))
+			}
+			checked += 1
+		}
+		// the negative control, per case rather than once. Every published path agrees with
+		// the resolution, so a comparison that read a count off the decoded path on BOTH
+		// sides -- or that compared two numbers which are equal for every tree in this file
+		// -- produces exactly the run a correct one produces. A resolution computed with one
+		// leaf excluded is a DIFFERENT set of targets, and somewhere in the corpus it has to
+		// disagree with what the sender published, or the comparison above is reading
+		// something that cannot vary.
+		wrong, err := tree.EncryptionTargets(LeafIndex(published.Sender), []LeafIndex{0})
+		if err != nil {
+			t.Fatalf("entry %d, sender %d: EncryptionTargets with an exclusion: %v", at, published.Sender, err)
+		}
+		for i := range wrong {
+			if len(wrong[i]) != len(decoded.Nodes[i].EncryptedPathSecret) {
+				separated += 1
+			}
+		}
+	})
+	if paths != treekemUpdatePathCount || checked != treekemUpdatePathNodeCount {
+		t.Fatalf("the run compared %d published paths and %d nodes against the tree; want %d and %d",
+			paths, checked, treekemUpdatePathCount, treekemUpdatePathNodeCount)
+	}
+	if separated == 0 {
+		t.Fatal("no published node's ciphertext count differs from the resolution taken with one leaf excluded, so the comparison above is between two numbers that agree whatever the tree says")
+	}
+	t.Logf("%d published paths, %d nodes whose ciphertext count is the resolution size the tree gives, %d of them separated by the excluded-leaf control",
+		paths, checked, separated)
+}
+
+// forEachPublishedUpdatePath is the shared walk of treekem.json's update_paths half, so that the
+// two properties above run over provably the same set rather than over two filters that could
+// drift.
+//
+// Entries at a suite this package does not implement are skipped rather than failed, matching
+// TestEveryPublishedPathSecretDerivesTheNodeKeyItsRatchetTreeCarries above; the counts each
+// caller asserts are what stop the skip from swallowing the file.
+func forEachPublishedUpdatePath(t *testing.T, visit func(at int, tree *RatchetTree,
+	published treekemPublishedUpdatePath, raw []byte)) {
+	t.Helper()
+	entries := LoadVectorFile(t, "treekem.json")
+	if len(entries) != treekemEntryCount {
+		t.Fatalf("treekem.json holds %d entries, want %d", len(entries), treekemEntryCount)
+	}
+	matched, declined := 0, 0
+	for at, raw := range entries {
+		var vector treekemUpdatePathVector
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("entry %d: %v", at, err)
+		}
+		if _, ok := implementedSuite(vector.CipherSuite); !ok {
+			declined += 1
+			continue
+		}
+		matched += 1
+		tree, err := UnmarshalRatchetTree(MustHex(t, vector.RatchetTree))
+		if err != nil {
+			t.Fatalf("entry %d: UnmarshalRatchetTree: %v", at, err)
+		}
+		for _, published := range vector.UpdatePaths {
+			visit(at, tree, published, MustHex(t, published.UpdatePath))
+		}
+	}
+	if matched+declined != len(entries) {
+		t.Fatalf("%d entries matched and %d were declined, and the file holds %d",
+			matched, declined, len(entries))
+	}
+	if matched == 0 {
+		t.Fatal("no entry of treekem.json is at a suite this package implements, so the sweep ran over nothing")
+	}
+}

@@ -2921,6 +2921,31 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{opened}
 		}},
+		// the HpkeCiphertext shaped forms of the pair above. The deterministic provider for
+		// the seal, since this gate calls each row twice and requires one answer -- a seal
+		// over the process entropy is a different ciphertext every call. The two fields of
+		// the open's ciphertext go through the recorder individually, so a body that answered
+		// a plaintext over the caller's ciphertext array is caught here rather than at the
+		// moment that array is next written.
+		{name: "SealWithLabel", call: func(take func([]byte) []byte) [][]byte {
+			sealed, sealErr := SealWithLabel(deterministic, HpkePublicKey(take(pub)),
+				"UpdatePathNode", take(value), take(plaintext))
+			if sealErr != nil {
+				t.Fatalf("SealWithLabel: %v", sealErr)
+			}
+			return [][]byte{sealed.KemOutput, sealed.Ciphertext}
+		}},
+		{name: "OpenWithLabel", call: func(take func([]byte) []byte) [][]byte {
+			opened, openErr := OpenWithLabel(crypto, HpkePrivateKey(take(priv)), "UpdatePathNode",
+				take(value), &HpkeCiphertext{
+					KemOutput:  take(labelledKemOutput),
+					Ciphertext: take(labelledCiphertext),
+				})
+			if openErr != nil {
+				t.Fatalf("OpenWithLabel: %v", openErr)
+			}
+			return [][]byte{opened}
+		}},
 		{name: "RefHash", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{RefHash(crypto, "MLS 1.0 a label", take(value))}
 		}},
@@ -3675,6 +3700,8 @@ var providerConstructionValues = map[string]any{
 	"MakeProposalRef":               MakeProposalRef,
 	"EncryptWithLabel":              EncryptWithLabel,
 	"DecryptWithLabel":              DecryptWithLabel,
+	"SealWithLabel":                 SealWithLabel,
+	"OpenWithLabel":                 OpenWithLabel,
 	"ZeroSecret":                    ZeroSecret,
 	"DeriveJoinerSecret":            DeriveJoinerSecret,
 	"NewKeySchedule":                NewKeySchedule,
@@ -4039,6 +4066,14 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 	}
 	arguments["DecryptWithLabel.kemOutput"] = labelledKemOutput
 	arguments["DecryptWithLabel.ciphertext"] = labelledCiphertext
+	// the same message as the one structure OpenWithLabel takes, built out of the two
+	// answers above rather than sealed a second time: two seals of one plaintext differ,
+	// so a second one here would let the two rows open different messages while looking
+	// like one fixture.
+	arguments["OpenWithLabel.ct"] = &HpkeCiphertext{
+		KemOutput:  labelledKemOutput,
+		Ciphertext: labelledCiphertext,
+	}
 	return arguments
 }
 
@@ -4158,6 +4193,12 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		value.SetUint(argument.Uint() + 1)
 		return append(moved, providerPerturbation{where: "one higher", value: value})
 	case reflect.Pointer:
+		// the labelled open's ciphertext, whose two fields are byte slices this rule cannot
+		// reach through a pointer to a struct. Its rule lives beside the structure it moves,
+		// in treekem_test.go, which is where psk_test.go and leaf_node_test.go keep theirs.
+		if argument.Type() == reflect.TypeOf((*HpkeCiphertext)(nil)) && !argument.IsNil() {
+			return providerHpkeCiphertextPerturbations(t, operation, parameter, argument)
+		}
 		if argument.Type() != reflect.TypeOf((*GroupContext)(nil)) || argument.IsNil() {
 			break
 		}
@@ -4456,6 +4497,7 @@ var providerStreamDependentOperations = []string{
 	"EncryptWithLabel",
 	"HpkeSeal",
 	"Random",
+	"SealWithLabel",
 	"SignatureKeyPair",
 }
 
@@ -6342,6 +6384,10 @@ func (self *countingReader) Read(p []byte) (int, error) {
 var providerStreamDraws = map[string]func(params *SuiteParams) int{
 	"EncryptWithLabel": func(params *SuiteParams) int { return params.Nsk },
 	"HpkeSeal":         func(params *SuiteParams) int { return params.Nsk },
+	// the same ephemeral scalar as the call it forwards to, since it IS that call: an
+	// adaptation that drew anything of its own would be a second source of ephemeral key
+	// material in a path whose whole security rests on the one.
+	"SealWithLabel":    func(params *SuiteParams) int { return params.Nsk },
 	"SignatureKeyPair": func(params *SuiteParams) int { return params.NsigPriv },
 }
 

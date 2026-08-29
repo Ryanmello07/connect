@@ -31,6 +31,9 @@ package mls
 
 import (
 	"crypto/subtle"
+	"errors"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // DerivePathSecrets is the ladder of RFC 9420 section 7.4: path_secret[0] is the initial secret
@@ -388,3 +391,232 @@ func (self *RatchetTree) CreateUpdatePathSecrets(crypto CryptoProvider, sender L
 		Private:      private,
 	}, nil
 }
+
+// ---------------------------------------------------------------------------
+// task 19: the UpdatePath wire types
+// ---------------------------------------------------------------------------
+
+// errNilHpkeCiphertext is OpenWithLabel handed no ciphertext at all.
+//
+// Unexported, and that is a decision rather than an omission. Nothing outside this package can
+// produce the condition: an HpkeCiphertext only ever reaches an open as an element of an
+// UpdatePathNode's vector, which decoding builds by value and never as a nil pointer, so the
+// only way here is an in-package caller that lost track of a pointer. It is also what
+// TestEveryExportedErrorOfThisPackageIsInAMaintainedClass demands -- an exported Err in a file
+// with no maintained error class is one no exclusivity sweep of this package judges, and this
+// file has no class.
+//
+// An error rather than the nil dereference the plan's body would take, for guardrail 7's reason
+// one layer up: an open answers a failure as an error and never as a plaintext, and a panic in a
+// routine fed by the network is a failure no caller can answer at all.
+var errNilHpkeCiphertext = errors.New("mls: no hpke ciphertext was supplied")
+
+// HpkeCiphertext is RFC 9420 section 6.1: one HPKE encryption, the KEM output and the AEAD
+// ciphertext, in the order the RFC writes them.
+//
+//	struct { opaque kem_output<V>; opaque ciphertext<V>; } HPKECiphertext;
+//
+// ONE declaration and not two. The framing plan's Welcome encrypts its group secrets into
+// exactly this structure, and a second copy declared there would be two Go types that agree on
+// the wire today and disagree the moment either gains a field -- which is the only reason a
+// second declaration ever gets written. So Welcome consumes this one.
+//
+// The two fields are both []byte and adjacent, so a codec that wrote them in the other order
+// compiles, round trips, and re-encodes byte exact against the published corpus. Only a golden
+// derived from the RFC separates the two orders, which is what
+// TestHpkeCiphertextMarshalMatchesTheHandDerivedGolden is.
+type HpkeCiphertext struct {
+	KemOutput  []byte
+	Ciphertext []byte
+}
+
+func (self *HpkeCiphertext) MarshalMLS(w *syntax.Writer) error {
+	w.WriteOpaque(self.KemOutput)
+	w.WriteOpaque(self.Ciphertext)
+	return nil
+}
+
+// UnmarshalMLS decodes both fields before either is assigned, which is leaf_node.go's staged
+// decode at this scale and holds for the same two reasons: a refused decode leaves the receiver
+// exactly as it found it, and a receiver decoded into twice answers the second encoding rather
+// than a mixture of both.
+func (self *HpkeCiphertext) UnmarshalMLS(r *syntax.Reader) error {
+	kemOutput, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	ciphertext, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	self.KemOutput = kemOutput
+	self.Ciphertext = ciphertext
+	return nil
+}
+
+// the C1 pin: drift between this type and the one codec convention fails at build.
+var _ syntax.Codec = (*HpkeCiphertext)(nil)
+
+// The element halves of encrypted_path_secret<V>, named rather than written as closures at
+// the call site.
+//
+// That is extension.go's and tree.go's spelling for the same shape, and here it is not only
+// consistency: TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit pins every syntax entry
+// point of this package by the SOURCE TEXT of the call, so a closure written inline puts its
+// whole body into that table and every later edit to the body is a diff in a limit gate.
+func writeOneHpkeCiphertext(w *syntax.Writer, ct HpkeCiphertext) error {
+	return ct.MarshalMLS(w)
+}
+
+func readOneHpkeCiphertext(r *syntax.Reader) (HpkeCiphertext, error) {
+	var ct HpkeCiphertext
+	err := ct.UnmarshalMLS(r)
+	return ct, err
+}
+
+// SealWithLabel is the HpkeCiphertext-shaped form of crypto_labels.go's flat pair.
+//
+// It lives here rather than there because that file must not name a TreeKEM type -- the crypto
+// layer is written so it can be read without the tree -- and because this is the file that owns
+// the struct. It is an adaptation of two return values into one structure and deliberately not a
+// second HPKE implementation: everything that decides interoperability, the label framing and
+// the empty aad, stays in the one place crypto_labels.go's own corpus test holds.
+//
+// The ORDER of the two results is the whole of what can go wrong here. EncryptWithLabel answers
+// (kemOutput, ciphertext) and both are []byte, so a transposed adaptation compiles and is
+// invisible to a seal-then-open round trip through this same pair of functions. What separates
+// them is the LENGTHS -- the KEM output is the suite's Nenc and the ciphertext is the plaintext
+// plus the AEAD tag -- which is what
+// TestSealWithLabelPutsTheKemOutputAndTheCiphertextInTheirOwnFields asserts.
+func SealWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string,
+	context []byte, plaintext []byte) (*HpkeCiphertext, error) {
+	kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, label, context, plaintext)
+	if err != nil {
+		return nil, err
+	}
+	return &HpkeCiphertext{KemOutput: kemOutput, Ciphertext: ciphertext}, nil
+}
+
+// OpenWithLabel is the inverse, and it forwards to DecryptWithLabel rather than reimplementing
+// it so that the "no fallback info" rule that file argues for holds here by construction.
+func OpenWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string,
+	context []byte, ct *HpkeCiphertext) ([]byte, error) {
+	// the provider first and the ciphertext second, and the order is required rather than
+	// arbitrary. It is what TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt
+	// demands of every construction taking a provider, and it is the right order anyway: a caller
+	// that passed no provider passed nothing this function could have used, and answering it
+	// about the ciphertext sends it to look at the argument that is not the problem. Bare rather
+	// than wrapped with a reason, which is DeriveNodeKeyPair's spelling in this file.
+	if crypto == nil {
+		return nil, ErrNilCryptoProvider
+	}
+	if ct == nil {
+		return nil, errNilHpkeCiphertext
+	}
+	return DecryptWithLabel(crypto, priv, label, context, ct.KemOutput, ct.Ciphertext)
+}
+
+// UpdatePathNode is RFC 9420 section 7.6: one node of the sender's filtered direct path, its
+// fresh public key, and that node's path secret encrypted once per node in the resolution of the
+// copath child.
+//
+//	struct { HPKEPublicKey encryption_key; HPKECiphertext encrypted_path_secret<V>; } UpdatePathNode;
+//
+// Nothing in this file checks that the number of ciphertexts is the number of nodes that
+// resolution holds, and that is a BOUNDARY rather than a gap worth stating where the type is
+// declared. The resolution is a property of a ratchet tree at an epoch, and a codec has neither:
+// it is handed bytes. The check belongs to whoever holds the tree the path was built against --
+// task 22's decrypt walks the resolution to pick its own ciphertext out of this vector, and is
+// the first place both facts exist at once -- and the hazard worth naming is that a check both
+// sides assume the other makes is a check nobody makes.
+// TestEveryPublishedUpdatePathHasOneCiphertextPerResolutionNode states the relation against the
+// published corpus, so the two halves at least agree on what the relation IS.
+type UpdatePathNode struct {
+	EncryptionKey       HpkePublicKey
+	EncryptedPathSecret []HpkeCiphertext
+}
+
+func (self *UpdatePathNode) MarshalMLS(w *syntax.Writer) error {
+	w.WriteOpaque(self.EncryptionKey)
+	return syntax.WriteVector(w, self.EncryptedPathSecret, writeOneHpkeCiphertext)
+}
+
+// UnmarshalMLS reads the key and the vector before either is assigned, for the reason
+// HpkeCiphertext's decode states.
+//
+// The vector prefix counts BYTES and not elements, which is syntax.ReadVector's contract rather
+// than this file's choice, and it is the one thing about this structure a round trip cannot see:
+// an encoder writing an element count and a decoder reading an element count agree with each
+// other and with no other implementation. The hand derived goldens are what pin it.
+func (self *UpdatePathNode) UnmarshalMLS(r *syntax.Reader) error {
+	encryptionKey, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	ciphertexts, err := syntax.ReadVector(r, readOneHpkeCiphertext)
+	if err != nil {
+		return err
+	}
+	self.EncryptionKey = HpkePublicKey(encryptionKey)
+	self.EncryptedPathSecret = ciphertexts
+	return nil
+}
+
+var _ syntax.Codec = (*UpdatePathNode)(nil)
+
+// the element halves of nodes<V>, named for the reason the ciphertext pair above is.
+func writeOneUpdatePathNode(w *syntax.Writer, node UpdatePathNode) error {
+	return node.MarshalMLS(w)
+}
+
+func readOneUpdatePathNode(r *syntax.Reader) (UpdatePathNode, error) {
+	var node UpdatePathNode
+	err := node.UnmarshalMLS(r)
+	return node, err
+}
+
+// UpdatePath is RFC 9420 section 7.6, the public half of what task 18's UpdatePathPlan computed:
+// the sender's re-signed commit leaf, and one node per step of its filtered direct path.
+//
+//	struct { LeafNode leaf_node; UpdatePathNode nodes<V>; } UpdatePath;
+//
+// The path secrets themselves are NOT here and never are -- UpdatePathPlan holds those and has
+// no codec at all -- so this is the whole of what a commit publishes about the sender's path.
+type UpdatePath struct {
+	LeafNode LeafNode
+	Nodes    []UpdatePathNode
+}
+
+func (self *UpdatePath) MarshalMLS(w *syntax.Writer) error {
+	if err := self.LeafNode.MarshalMLS(w); err != nil {
+		return err
+	}
+	return syntax.WriteVector(w, self.Nodes, writeOneUpdatePathNode)
+}
+
+// UnmarshalMLS decodes into a STAGED value and assigns it whole, which is leaf_node.go's
+// discipline carried up one level, and up here it is load bearing in a way it is not inside a
+// leaf.
+//
+// The plan's body decodes the leaf straight into the receiver's own field and then reads the
+// nodes vector. A truncated or refused vector then leaves the caller holding an UpdatePath whose
+// leaf came from these bytes and whose nodes are whatever the receiver arrived with -- and the
+// leaf is the half carrying a signature, an encryption key and a parent hash, so that value is a
+// path nobody sent, assembled out of two messages, sitting behind an error the caller may well
+// have logged rather than returned. Staging makes the decoded path a function of the bytes it
+// was read from and of nothing else.
+func (self *UpdatePath) UnmarshalMLS(r *syntax.Reader) error {
+	staged := UpdatePath{}
+	if err := staged.LeafNode.UnmarshalMLS(r); err != nil {
+		return err
+	}
+	nodes, err := syntax.ReadVector(r, readOneUpdatePathNode)
+	if err != nil {
+		return err
+	}
+	staged.Nodes = nodes
+	*self = staged
+	return nil
+}
+
+var _ syntax.Codec = (*UpdatePath)(nil)
