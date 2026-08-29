@@ -129,6 +129,23 @@ func providerNilMethodRows() []providerNilMethodRow {
 			_, err := (&RatchetTree{}).EncryptUpdatePath(nil, nil, 0, nil, nil)
 			return err
 		}},
+		// tasks 21 and 22's receiving half, on the zero valued tree for the reason task 18's
+		// generating half is. A tree with no nodes gives leaf 0 no width to be inside, so
+		// MergeUpdatePath's own range check answers ErrLeafIndexOutOfRange and
+		// DecryptUpdatePath's filteredPathSteps answers the same -- and the nil path and the nil
+		// private state one and two arguments along are refusals of their own. A body that looked
+		// at any of the three before its provider would answer one of those to a caller whose
+		// actual mistake was passing no provider, and send it to fix an index, a path or a state
+		// that was never the problem. The merge is also the second member of this class that
+		// MUTATES its receiver, so an order that reached the tree first would blank a member's
+		// direct path on the way to reporting a fault the caller could not have caused.
+		{name: "(*RatchetTree).MergeUpdatePath", call: func() error {
+			return (&RatchetTree{}).MergeUpdatePath(nil, 0, nil)
+		}},
+		{name: "(*RatchetTree).DecryptUpdatePath", call: func() error {
+			_, err := (&RatchetTree{}).DecryptUpdatePath(nil, 0, nil, nil, nil, nil)
+			return err
+		}},
 		// treekem.go's two, on the zero valued private state, which is the receiver that
 		// separates the two orders these bodies could be written in. A zero TreeKEMPrivate has
 		// leaf index 0, so node 0 IS its own leaf: a NodePrivateKey that looked at its receiver

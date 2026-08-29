@@ -863,3 +863,382 @@ func (self *RatchetTree) nodeEncryptionKey(x NodeIndex) (HpkePublicKey, error) {
 	// resolution.
 	return nil, ErrTreeMalformed
 }
+
+// ---------------------------------------------------------------------------
+// task 21: merging a received UpdatePath into the public tree
+// ---------------------------------------------------------------------------
+
+// errNilUpdatePath is a merge or a decrypt handed no path at all.
+//
+// Unexported and an error rather than the nil dereference the shorter body would take, which is
+// errNilHpkeCiphertext's and errNilUpdatePathPlan's argument in this same file: nothing outside
+// this package can reach the condition -- a path arriving off the wire is decoded into a value
+// and never into a nil pointer -- so it is not a refusal any exclusivity sweep of this package
+// should have to judge, and a panic out of a library fed by the network takes the caller's
+// process rather than its call.
+var errNilUpdatePath = errors.New("mls: no update path was supplied")
+
+// errNilTreeKEMPrivate is DecryptUpdatePath handed no private state.
+//
+// Required rather than merely used when present, for errNilUpdatePathPlan's reason one task
+// over: the private state is where the RECEIVER's own leaf index is recorded, and that index is
+// what decides which ciphertext of the path is addressed to us. A decrypt without it has no
+// entry point to compute, and the alternative -- treating a nil state as leaf 0 holding nothing
+// -- answers ErrNoPathSecret to a caller whose actual mistake was passing no state at all.
+var errNilTreeKEMPrivate = errors.New("mls: no treekem private state was supplied")
+
+// updatePathCoversTheFilteredPath is ValSem202 as a predicate: the path carries exactly one node
+// per step of the sender's filtered direct path.
+//
+// A function of its own rather than a clause in either body, for updatePathPlanMatchesTargets'
+// reason one task over. The decision is a comparison of two lengths with a value on either side,
+// which is the shape TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime's equality
+// rule reports with no type information to tell a length from a key; behind a helper that takes
+// no key and answers a bool, the decision stays where that gate's own file comment says a path
+// builder's length comparisons belong, and it stays there if a later edit gives either caller a
+// key shaped parameter and moves it into the class.
+func updatePathCoversTheFilteredPath(path *UpdatePath, steps []PathStep) bool {
+	return len(path.Nodes) == len(steps)
+}
+
+// MergeUpdatePath installs the public half of a received UpdatePath: RFC 9420 section 7.6's node
+// keys on the sender's filtered direct path, and the sender's re-signed commit leaf.
+//
+// Only the ENCRYPTION KEYS travel. A parent node's parent_hash field is on no wire in section
+// 7.6, so the receiver recomputes the chain here exactly as task 18 built it, walking the same
+// PathStep list root down so that the two walks cannot differ by a copath child derived two
+// different ways. The value that walk carries out at the bottom is compared against the leaf's
+// own parent_hash field, which is inside what the leaf signature covers -- and that comparison is
+// RFC 9420 section 7.9.2's obligation for a client PROCESSING A COMMIT, spelled there as
+// "recompute the expected value of parent_hash for the committer's new leaf and verify that it
+// matches the parent_hash value in the supplied leaf_node".
+//
+// And then section 7.9.2's other obligation, over the MERGED tree, through task 14's
+// VerifyParentHashes. The chain comparison above is the RFC's second condition and only its
+// second condition: it says the node keys and the leaf agree with each other, and it says nothing
+// about the resolution those nodes sit in. Section 7.9.2's third condition -- D is in the
+// resolution of C, and P's unmerged leaves under C are the resolution of C with D removed -- is
+// what refuses a node somebody SPLICED into a subtree it never committed over, whose private key
+// that somebody holds and whose position no member's leaf attests to. Such a node is in the
+// resolution of a copath child, so the next honest commit seals a path secret straight to it, and
+// every check the chain comparison makes passes: the splice is nowhere on the sender's path and
+// the sender's own chain is perfectly self consistent. VerifyParentHashes counts the claimants of
+// every non-blank parent under all three conditions and is what sees it. It is CALLED rather than
+// restated here, for the reason the copath child is taken from the PathStep rather than
+// re-derived: a second statement of a rule is a second chance to state it weaker, and this rule
+// has already been written down once with the third condition missing.
+//
+// It is ATOMIC, which is task 18's contract at the other door and matters more here because the
+// argument is attacker controlled. Everything below mutates a clone and the receiver adopts it in
+// one assignment once the last thing that can fail has succeeded, so a refused merge leaves a
+// tree byte identical to the one it was called on. A partially merged tree is worse than a
+// rejected one: the caller is still processing the rest of a commit against it, the previous
+// epoch's keys on the sender's path are already gone, and the group is left in a state no member
+// agreed to and no caller can repair.
+//
+// What it deliberately does NOT do is verify the leaf's SIGNATURE, and saying so is the point of
+// writing it down -- a check both sides assume the other makes is a check nobody makes. The
+// signature is what makes the parent_hash comparison above mean anything, and it is verified by
+// whoever holds the group id and the sender's index, which is the commit processing layer rather
+// than the tree. What this does enforce, and enforces by DERIVATION rather than by a rule of its
+// own, is that the leaf carries a parent_hash field at all: nodeParentHashField answers "no
+// field" for every leaf whose source is not commit, so a path whose leaf claims some other source
+// leaves the node above it with no claimant and VerifyParentHashes refuses it.
+func (self *RatchetTree) MergeUpdatePath(crypto CryptoProvider, sender LeafIndex,
+	path *UpdatePath) error {
+	// the provider before anything is read off the receiver or the argument, which is what
+	// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt demands of every
+	// declaration taking one and is the right order anyway: every hash below comes through it,
+	// and answering a caller that passed none about its tree or its path sends it to look at the
+	// argument that is not the problem.
+	if crypto == nil {
+		return ErrNilCryptoProvider
+	}
+	if path == nil {
+		return errNilUpdatePath
+	}
+	// the two ways a sender has no leaf here are two different faults and are answered as two,
+	// which is CreateUpdatePathSecrets' split at the other door and is here for its reason: an
+	// index past the width is a caller that computed an index wrong and repairs it by recomputing
+	// one, and a blank slot inside the tree is a commit published from a position the group
+	// REMOVED, whose index was right the whole time and whose repair is to rejoin.
+	if LeafCount(sender) >= self.LeafWidth() {
+		return ErrLeafIndexOutOfRange
+	}
+	if self.Leaf(sender) == nil {
+		return ErrLeafBlank
+	}
+	// computed against the tree as it stands, and it is the same list the merged tree gives:
+	// blanking and refilling the sender's own direct path cannot change the resolution of any
+	// copath child, because no copath child is on that path. Computing it first keeps the length
+	// refusal ahead of every mutation.
+	steps, err := self.filteredPathSteps(sender)
+	if err != nil {
+		return err
+	}
+	// ValSem202.
+	if !updatePathCoversTheFilteredPath(path, steps) {
+		return errPathLength
+	}
+	provisional := self.Clone()
+	if err := provisional.BlankDirectPath(sender); err != nil {
+		return err
+	}
+	// the whole direct path is blanked and only the FILTERED path refilled, which is task 18's
+	// shape and not an omission: a node dropped from the filtered path is one whose copath child
+	// resolves to nothing, so it publishes no key and stays blank on the sender's tree too. A
+	// fresh ParentNode also clears unmerged_leaves at every node of the path, which is what a
+	// commit does to the members it merges.
+	for i, step := range steps {
+		if err := provisional.SetParent(step.Node, &ParentNode{
+			EncryptionKey: HpkePublicKey(cloneBytes(path.Nodes[i].EncryptionKey)),
+		}); err != nil {
+			return err
+		}
+	}
+	// the chain, root down, over the same PathStep list task 18 walked. carried is the parent
+	// hash of the node ABOVE the one being written and starts as the zero-length octet string
+	// section 7.9 gives the top of the path. The direction is required rather than preferred: the
+	// parent hash of a node is taken over that node's own parent_hash field, so a loop running
+	// the other way would hash a placeholder at every level and produce a chain that is full
+	// length, stable, self consistent and rejected by every other member.
+	carried := []byte{}
+	for i := len(steps) - 1; i >= 0; i -= 1 {
+		parent := provisional.ParentAt(steps[i].Node)
+		if parent == nil {
+			return ErrTreeMalformed
+		}
+		parent.ParentHash = carried
+		hash, err := provisional.ParentHash(crypto, steps[i].Node, steps[i].CopathChild)
+		if err != nil {
+			return err
+		}
+		carried = hash
+	}
+	// the leaf is installed before the sweep below so that the tree that sweep judges is the whole
+	// merged tree, claimant included. SetLeaf copies, so the path keeps its own value.
+	if err := provisional.SetLeaf(sender, path.LeafNode.Clone()); err != nil {
+		return err
+	}
+	// section 7.9.2's commit-time obligation, through crypto/subtle for guardrail 8's reason: a
+	// parent hash is public, and every comparison in this package that decides whether a tree is
+	// adopted is written the one way so no later reader has to work out which of them were the
+	// safe ones. A length mismatch answers 0 here, so a leaf carrying no parent hash at all is
+	// refused by this line rather than by a length clause in front of it.
+	if subtle.ConstantTimeCompare(carried, path.LeafNode.ParentHash) != 1 {
+		return ErrParentHashMismatch
+	}
+	// and section 7.9.2 in full, over the merged tree. See the header: the comparison above is
+	// the second of three conditions, and the third is the one that refuses a spliced subtree.
+	if err := provisional.VerifyParentHashes(crypto); err != nil {
+		return err
+	}
+	// the adoption, and the last statement that can be reached by a failure is above it. A caller
+	// holding this tree sees the previous epoch or the new one and never a half of both.
+	self.nodes = provisional.nodes
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// task 22: decrypting a received UpdatePath
+// ---------------------------------------------------------------------------
+
+// errPathDecrypt is ValSem203, carried unexported on errPathLength's terms and for its reason: the
+// validation plan owns the exported ErrPathDecrypt and declares it in errors.go, and two plans
+// declaring one name in one package is a compile error at merge.
+//
+// It names the ciphertext addressed to THIS member failing to open, and it is deliberately not
+// the same answer as "no ciphertext here is addressed to us". A member off the sender's path, or
+// one this commit adds, is in the ordinary condition and answers ErrNoPathSecret; a member that
+// found its own entry in the resolution, holds the key that entry names, and still could not open
+// the ciphertext standing at that entry's index has received a commit that is either corrupt or
+// sealed under a group context it does not share. The first is repaired by re-fetching it and the
+// second is not repaired at all, and one sentinel for both would tell the second to do the first.
+var errPathDecrypt = errors.New("mls: the update path ciphertext addressed to this member did not open")
+
+// errPathKeyMismatch is ValSem204, carried unexported for errPathDecrypt's reason.
+//
+// It names a node of the path whose announced encryption_key is not the key the recovered path
+// secret derives. That is the refusal with the least visible failure mode of the three: every
+// ciphertext opened, every rung of the ladder derived, and the receiver installed a private state
+// whose public halves the group does not agree with -- after which it decrypts nothing for the
+// rest of the group's life and reports a decryption failure against commits that are perfectly
+// well formed. It is checked at EVERY node from the entry point to the root rather than at the
+// entry point alone, because a path that announced one honest key and then any keys at all above
+// it would otherwise be accepted.
+var errPathKeyMismatch = errors.New("mls: an update path node's announced key is not the one its path secret derives")
+
+// updatePathCiphertextsMatchTheTargets is the section 7.6 relation UpdatePathNode's own comment
+// names as the boundary this layer owns: one ciphertext per node of the resolution of that node's
+// copath child, at every node of the path.
+//
+// At EVERY node and not only at the receiver's own entry point, which is that comment's second
+// paragraph made into a check. A decrypt that counted its own node and walked the rest of the path
+// on trust has enforced the relation at one index out of the path's length; what it accepts is a
+// path whose ciphertext vectors are the wrong size everywhere else, which is a positional pairing
+// that means nothing for every OTHER member of the group -- and the member that would notice is
+// not the one running this code.
+//
+// A function of its own for updatePathCoversTheFilteredPath's reason: it decides two lengths with
+// a value on either side, and it holds no key.
+func updatePathCiphertextsMatchTheTargets(path *UpdatePath, targets [][]NodeIndex) bool {
+	if len(path.Nodes) != len(targets) {
+		return false
+	}
+	for i := range targets {
+		if len(path.Nodes[i].EncryptedPathSecret) != len(targets[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// indexOfStep is the position of one node in a filtered direct path, or false.
+//
+// A linear scan and not a map, because the list is one entry per LEVEL of the tree -- ten of them
+// in the 500 member group task 28 benchmarks -- and a map allocated per decrypt to answer one
+// question is more work than the scan it replaces.
+//
+// A function of its own for the reason its two neighbours give: the comparison inside it has a
+// value on either side, and a helper over node indices alone holds no key and answers about no
+// tree, so it is not itself a member of the class that gate reads bodies for.
+func indexOfStep(steps []PathStep, x NodeIndex) (int, bool) {
+	for i, step := range steps {
+		if step.Node == x {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// PathDecryptResult is what a receiver ends up with after opening one UpdatePath: the epoch's
+// commit secret, and the private state it should hold against the merged tree.
+//
+// The private state is a NEW value rather than an edit of the one handed in, which is
+// TreeKEMPrivate.Clone's contract carried up one layer. A commit is processed against a candidate
+// epoch and may still be rejected -- by a validation failure further along the same commit, or by
+// losing a race with another member's -- so a decrypt that wrote the new rungs through the
+// caller's state would have replaced the epoch the group is still running on before anything got
+// the chance to refuse it.
+type PathDecryptResult struct {
+	CommitSecret []byte
+	Private      *TreeKEMPrivate
+}
+
+// DecryptUpdatePath opens the one ciphertext of a received UpdatePath that is addressed to this
+// member and ratchets the rest of the way to the root, RFC 9420 section 7.6.
+//
+// Called AFTER MergeUpdatePath and on the merged tree. The copath resolutions the pairing is read
+// out of are the same either way -- the merge touches the sender's direct path and its leaf, and
+// no copath child of that path is on it -- but the announced keys this checks against are in the
+// tree only after the merge, and the group context the ciphertexts were sealed under carries the
+// tree hash of the merged tree. A caller that decrypted first would be checking a path against
+// the epoch it closed.
+//
+// The receiver's own ciphertext is found STRUCTURALLY and never by trial decryption. The lowest
+// node of the sender's filtered direct path that covers this member is
+// CommonAncestor(senderLeaf, receiverLeaf), and it is always in the filtered path because this
+// member's own non-blank leaf keeps the relevant copath resolution non-empty. Within that node's
+// resolution the receiver takes the first entry it can derive a private key for, and the
+// ciphertext it opens is the one standing at THAT entry's index -- which is the positional
+// pairing EncryptUpdatePath's comment calls the contract, read from the other end. Trial
+// decryption over the whole vector would agree with a correct sender and would agree just as well
+// with one that permuted its ciphertexts, which is the failure with no symptom until some other
+// member cannot open the same commit.
+//
+// The entry is the first entry we hold a key for and not necessarily our own leaf, and that is
+// the case a second commit covers: a member that already holds a path secret for a node above it
+// derives that node's key, and the sender sealed to that node rather than to the leaf, because a
+// non-blank node resolves to itself and its subtree is never walked.
+//
+// Every rung is checked against the announced key (ValSem204) before it is kept, and the count of
+// ciphertexts is checked against the resolution at every node of the path (section 7.6) before
+// anything is opened. What each of the three refusals means is written on the sentinels:
+// errPathLength is a path of the wrong shape for this tree, errPathDecrypt is our own ciphertext
+// failing to open, ErrNoPathSecret is the ordinary condition of a member this commit did not seal
+// to.
+//
+// The private half of every node key from the entry point up is derived, compared and ERASED. The
+// comparison needs the public half alone and DeriveNodeKeyPair answers both, so leaving the
+// private halves of every node between here and the root on the heap is exactly the material
+// secret_zeroize.go exists for. What is kept is the path secret, which is what the state is for
+// and what re-derives them on demand.
+func (self *RatchetTree) DecryptUpdatePath(crypto CryptoProvider, sender LeafIndex,
+	path *UpdatePath, groupContext []byte, priv *TreeKEMPrivate,
+	exclude []LeafIndex) (*PathDecryptResult, error) {
+	if crypto == nil {
+		return nil, ErrNilCryptoProvider
+	}
+	if path == nil {
+		return nil, errNilUpdatePath
+	}
+	if priv == nil {
+		return nil, errNilTreeKEMPrivate
+	}
+	steps, err := self.filteredPathSteps(sender)
+	if err != nil {
+		return nil, err
+	}
+	// ValSem202, before the targets are walked: a path of the wrong length pairs nothing with
+	// anything, and the index this is about to compute would be an index into it.
+	if !updatePathCoversTheFilteredPath(path, steps) {
+		return nil, errPathLength
+	}
+	targets, err := self.EncryptionTargets(sender, exclude)
+	if err != nil {
+		return nil, err
+	}
+	if !updatePathCiphertextsMatchTheTargets(path, targets) {
+		return nil, errPathLength
+	}
+	// the lowest node of the sender's path that covers us.
+	lowest := CommonAncestor(sender.NodeIndex(), priv.LeafIndex.NodeIndex())
+	start, onThePath := indexOfStep(steps, lowest)
+	if !onThePath {
+		// the sender itself, or a member whose common ancestor with the sender was filtered out
+		// of the path, which is the ordinary condition rather than a fault.
+		return nil, ErrNoPathSecret
+	}
+	var secret []byte
+	for j, y := range targets[start] {
+		nodePriv, held, err := priv.NodePrivateKey(crypto, y)
+		if err != nil {
+			return nil, err
+		}
+		if !held {
+			continue
+		}
+		ct := path.Nodes[start].EncryptedPathSecret[j]
+		opened, err := OpenWithLabel(crypto, nodePriv, updatePathNodeLabel, groupContext, &ct)
+		// erased whether or not the open succeeded: NodePrivateKey answers fresh storage for both
+		// of its arms precisely so that this call can, and the return path that would skip the
+		// erasure is the one an error takes.
+		zeroizeSecret(nodePriv)
+		if err != nil {
+			return nil, errPathDecrypt
+		}
+		secret = opened
+		break
+	}
+	if secret == nil {
+		return nil, ErrNoPathSecret
+	}
+	out := priv.Clone()
+	for i := start; i < len(steps); i += 1 {
+		derivedPriv, derivedPub, err := DeriveNodeKeyPair(crypto, secret)
+		if err != nil {
+			return nil, err
+		}
+		zeroizeSecret(derivedPriv)
+		// ValSem204, through crypto/subtle for the reason MergeUpdatePath's comparison gives.
+		if subtle.ConstantTimeCompare(derivedPub, path.Nodes[i].EncryptionKey) != 1 {
+			return nil, errPathKeyMismatch
+		}
+		out.PathSecrets[steps[i].Node] = cloneBytes(secret)
+		// the rung PAST the last node is the epoch's commit secret, section 8.1, which is why
+		// this derives once more than there are nodes left and why the value that falls out of
+		// the loop is the answer rather than a leftover.
+		secret = crypto.DeriveSecret(secret, "path")
+	}
+	return &PathDecryptResult{CommitSecret: secret, Private: out}, nil
+}

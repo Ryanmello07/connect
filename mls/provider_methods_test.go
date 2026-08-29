@@ -421,6 +421,145 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return values, nil
 		}},
+		// task 21's merge. The path it installs is built through the ROW'S provider, so every
+		// value below descends from a plan that provider produced -- the same weakness
+		// EncryptUpdatePath's row records above it, and the same remedy: what holds the merge's
+		// own bytes is TestEveryPublishedUpdatePathMergesToItsPublishedTreeHash, over trees and
+		// paths other implementations produced.
+		//
+		// The values are what the merge COMPUTES rather than what it copies. Only the encryption
+		// keys travel in section 7.6, so the parent hash chain is the receiver's own work; the
+		// topmost node of a filtered path carries the zero-length octet string section 7.9 gives
+		// the root and is therefore not among them, which is why the loop stops one short and
+		// the tree hash of the merged tree is read as the second value. Both are Hash outputs and
+		// so are KDF.Nh wide under either provider.
+		//
+		// It is handed no caller array at all -- a provider, a leaf index and a decoded path --
+		// so it is outside the retention gate's derived class by its signature, which is that
+		// gate's own rule rather than an excuse.
+		{name: "(*RatchetTree).MergeUpdatePath", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+			signer, _, err := fixed.SignatureKeyPair()
+			if err != nil {
+				return nil, err
+			}
+			sender := providerRowRatchetTree(t)
+			plan, err := sender.CreateUpdatePathSecrets(crypto, LeafIndex(0),
+				SignaturePrivateKey(signer), []byte("provider-row-group-id"))
+			if err != nil {
+				return nil, err
+			}
+			path, err := sender.EncryptUpdatePath(crypto, plan, LeafIndex(0),
+				[]byte("provider-row-group-context"), nil)
+			if err != nil {
+				return nil, err
+			}
+			if len(plan.Path) < 2 {
+				return nil, fmt.Errorf("the row's tree gave leaf 0 a filtered direct path of %d nodes, and this row needs one below the root to read",
+					len(plan.Path))
+			}
+			receiver := providerRowRatchetTree(t)
+			if err := receiver.MergeUpdatePath(crypto, LeafIndex(0), path); err != nil {
+				return nil, err
+			}
+			values := []providerDrivenMethodValue{}
+			for _, x := range plan.Path[:len(plan.Path)-1] {
+				parent := receiver.ParentAt(x)
+				if parent == nil {
+					return nil, fmt.Errorf("node %d is blank after the merge, so this row observes nothing there", x)
+				}
+				values = append(values, providerDrivenMethodValue{
+					name:    fmt.Sprintf("the parent hash the merge installed at node %d", x),
+					content: parent.ParentHash,
+				})
+			}
+			treeHash, err := receiver.TreeHash(crypto)
+			if err != nil {
+				return nil, err
+			}
+			return append(values, providerDrivenMethodValue{
+				name: "the tree hash of the merged tree", content: treeHash,
+			}), nil
+		}},
+		// task 22's decrypt, over a two leaf tree whose receiving leaf carries a REAL key pair --
+		// derived through a provider fixed here rather than through the row's, because the
+		// tagging provider flips the two halves of a key pair independently and a leaf keyed
+		// with it would hold a private key that is not the public one's. That is not a limit of
+		// this row, it is what the routing differential reads: over the tagging provider the
+		// seal and the open no longer meet, so the answer this row leaves behind is a refusal
+		// where the real provider leaves a commit secret. A verdict that moves is what
+		// Consistent's row below records for the same shape.
+		//
+		// The two values are KDF.Nh wide under both real providers, which is what the KDF.Nh gate
+		// reads: a path secret and the commit secret are rungs of section 7.4's ladder and are
+		// cut to the provider's own digest width. Neither is a key, so neither carries the X25519
+		// coincidence constructionsWhoseAnswerOnlyCoincidesWithKdfNh records for DeriveKeyPair.
+		//
+		// The group context is the one array the caller still owns, so it is the one thing taken
+		// through the recorder, and the same slice goes into the seal and the open so the
+		// retention gate reads exactly one array.
+		{name: "(*RatchetTree).DecryptUpdatePath", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+			signer, _, err := fixed.SignatureKeyPair()
+			if err != nil {
+				return nil, err
+			}
+			receiverPriv, receiverPub, err := fixed.DeriveKeyPair(bytes.Repeat([]byte{0xa1}, fixed.HashSize()))
+			if err != nil {
+				return nil, err
+			}
+			base := NewRatchetTree()
+			for _, i := range []LeafIndex{0, 1} {
+				leaf := testLeafNodeOfSource(LeafNodeSourceUpdate)
+				leaf.EncryptionKey = HpkePublicKey(bytes.Repeat([]byte{0x40 + byte(i)}, 32))
+				leaf.SignatureKey = SignaturePublicKey(bytes.Repeat([]byte{0x50 + byte(i)}, 32))
+				if i == 1 {
+					leaf.EncryptionKey = receiverPub
+				}
+				if err := base.SetLeaf(i, leaf); err != nil {
+					return nil, err
+				}
+			}
+			groupContext := take([]byte("provider-row-group-context"))
+			sender := base.Clone()
+			plan, err := sender.CreateUpdatePathSecrets(crypto, LeafIndex(0),
+				SignaturePrivateKey(signer), []byte("provider-row-group-id"))
+			if err != nil {
+				return nil, err
+			}
+			path, err := sender.EncryptUpdatePath(crypto, plan, LeafIndex(0), groupContext, nil)
+			if err != nil {
+				return nil, err
+			}
+			if len(plan.Path) != 1 {
+				return nil, fmt.Errorf("the row's two leaf tree gave leaf 0 a filtered direct path of %d nodes, want 1",
+					len(plan.Path))
+			}
+			receiver := base.Clone()
+			if err := receiver.MergeUpdatePath(crypto, LeafIndex(0), path); err != nil {
+				return nil, err
+			}
+			state := NewTreeKEMPrivate(LeafIndex(1), receiverPriv)
+			got, err := receiver.DecryptUpdatePath(crypto, LeafIndex(0), path, groupContext, state, nil)
+			if err != nil {
+				// the refusal IS the answer over a provider whose key pairs do not meet, and it
+				// is reported as a value rather than as an error so the differential can read it
+				refused := []byte("DecryptUpdatePath refused: " + err.Error())
+				return []providerDrivenMethodValue{
+					{name: "the commit secret", content: refused},
+					{name: "the path secret recovered at the entry point", content: refused},
+				}, nil
+			}
+			recovered, held := got.Private.PathSecrets[plan.Path[0]]
+			if !held {
+				return nil, fmt.Errorf("the decrypt left no path secret at node %d, so this row observes nothing there",
+					plan.Path[0])
+			}
+			return []providerDrivenMethodValue{
+				{name: "the commit secret", content: got.CommitSecret},
+				{name: "the path secret recovered at the entry point", content: recovered},
+			}, nil
+		}},
 		// treekem.go's two. NodePrivateKey has both arms driven, because they are two
 		// different answers and only one of them is derived: the node key comes back through
 		// the provider and moves, and the member's own leaf key is STORED and must not. The
