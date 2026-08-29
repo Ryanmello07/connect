@@ -32,6 +32,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -235,64 +236,96 @@ func installPathSecrets(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 //     it was never sealed, and every one of those keys derives cleanly and looks exactly right.
 //   - Consistent agrees, which is the same statement made through the entry point the commit path
 //     actually calls.
+//
+// SWEPT rather than sampled, and the negative direction is why. One tree, one sender and one
+// receiver made three observations of the direction that carries the whole security argument --
+// a member holding rung k must be refused every node below k -- and three observations of a
+// refusal is three chances for a body that refuses for the wrong reason to look right. The sweep
+// below runs every width whose filtered path is long enough to have an above and a below at all,
+// and every member of each as the sender, with the receiver derived from the tree rather than
+// chosen.
+//
+// A sender whose filtered path holds fewer than two nodes is SKIPPED rather than excluded by a
+// width, and the skips are counted. Which senders those are is a property of the filter -- in a
+// three member tree leaf 2's step past the blank leaf 3 is filtered away and its path is one node
+// -- so a width chosen to avoid them is a width that stops avoiding them the day the filter
+// changes. There is no node below a single rung, and a run that was all one node paths would
+// report a zero in the negative direction as a pass, which is what the counters below refuse.
 func TestAPathSecretReachesEveryNodeAboveItAndNoneBelow(t *testing.T) {
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
-	tree, members := newTestTree(t, crypto, 8)
-	sender := members[0].LeafIndex
-	path, secrets := installPathSecrets(t, crypto, tree, sender,
-		crypto.Random(crypto.HashSize()))
-	// the member that receives the rungs is a different one, at a leaf that is not on the
-	// path and whose own node index is none of the path nodes.
-	receiver := members[5]
-	above, below := 0, 0
-	for from := range path {
-		state := NewTreeKEMPrivate(receiver.LeafIndex, receiver.EncryptionPriv)
-		for at, rung := range DerivePathSecrets(crypto, secrets[from], len(path)-1-from) {
-			state.PathSecrets[path[from+at]] = rung
-		}
-		if err := state.Consistent(crypto, tree); err != nil {
-			t.Fatalf("a state built from the rung at path[%d] = node %d disagrees with the tree it was derived into: %v",
-				from, path[from], err)
-		}
-		for at, node := range path {
-			key, held, err := state.NodePrivateKey(crypto, node)
+	above, below, senders, ladders, tooShort := 0, 0, 0, 0, 0
+	for width := uint32(2); width <= 8; width += 1 {
+		for at := uint32(0); at < width; at += 1 {
+			tree, members := newTestTree(t, crypto, width)
+			sender := members[at].LeafIndex
+			where := fmt.Sprintf("%d members, sender %d", width, sender)
+			filtered, err := tree.FilteredDirectPath(sender)
 			if err != nil {
-				t.Fatalf("NodePrivateKey(%d): %v", node, err)
+				t.Fatalf("%s: FilteredDirectPath: %v", where, err)
 			}
-			if at < from {
-				if held {
-					t.Fatalf("a member holding only the rung at path[%d] answered a private key for node %d, which is BELOW it; the ladder runs downward",
-						from, node)
-				}
-				below += 1
+			if len(filtered) < 2 {
+				tooShort += 1
 				continue
 			}
-			if !held {
-				t.Fatalf("a member holding the rung at path[%d] cannot derive node %d, which is at or above it",
-					from, node)
+			path, secrets := installPathSecrets(t, crypto, tree, sender,
+				crypto.Random(crypto.HashSize()))
+			senders += 1
+			// the member that receives the rungs is a different one, derived from the tree
+			// rather than chosen; its own node index is none of the path nodes because every
+			// path node is a parent.
+			receiver := members[(at+1)%width]
+			for from := range path {
+				ladders += 1
+				state := NewTreeKEMPrivate(receiver.LeafIndex, receiver.EncryptionPriv)
+				for step, rung := range DerivePathSecrets(crypto, secrets[from], len(path)-1-from) {
+					state.PathSecrets[path[from+step]] = rung
+				}
+				if err := state.Consistent(crypto, tree); err != nil {
+					t.Fatalf("%s: a state built from the rung at path[%d] = node %d disagrees with the tree it was derived into: %v",
+						where, from, path[from], err)
+				}
+				for step, node := range path {
+					key, held, err := state.NodePrivateKey(crypto, node)
+					if err != nil {
+						t.Fatalf("%s: NodePrivateKey(%d): %v", where, node, err)
+					}
+					if step < from {
+						if held {
+							t.Fatalf("%s: a member holding only the rung at path[%d] answered a private key for node %d, which is BELOW it; the ladder runs downward",
+								where, from, node)
+						}
+						below += 1
+						continue
+					}
+					if !held {
+						t.Fatalf("%s: a member holding the rung at path[%d] cannot derive node %d, which is at or above it",
+							where, from, node)
+					}
+					_, pub, err := DeriveNodeKeyPair(crypto, state.PathSecrets[node])
+					if err != nil {
+						t.Fatalf("%s: DeriveNodeKeyPair at node %d: %v", where, node, err)
+					}
+					parent := tree.ParentAt(node)
+					if parent == nil {
+						t.Fatalf("%s: node %d of the path is blank in the tree the rungs were installed into", where, node)
+					}
+					if !bytes.Equal(pub, parent.EncryptionKey) {
+						t.Fatalf("%s: the key derived at node %d is %x and the tree carries %x", where, node, pub, parent.EncryptionKey)
+					}
+					if len(key) == 0 {
+						t.Fatalf("%s: NodePrivateKey(%d) answered an empty key", where, node)
+					}
+					above += 1
+				}
 			}
-			_, pub, err := DeriveNodeKeyPair(crypto, state.PathSecrets[node])
-			if err != nil {
-				t.Fatalf("DeriveNodeKeyPair at node %d: %v", node, err)
-			}
-			parent := tree.ParentAt(node)
-			if parent == nil {
-				t.Fatalf("node %d of the path is blank in the tree the rungs were installed into", node)
-			}
-			if !bytes.Equal(pub, parent.EncryptionKey) {
-				t.Fatalf("the key derived at node %d is %x and the tree carries %x", node, pub, parent.EncryptionKey)
-			}
-			if len(key) == 0 {
-				t.Fatalf("NodePrivateKey(%d) answered an empty key", node)
-			}
-			above += 1
 		}
 	}
-	if above == 0 || below == 0 {
-		t.Fatalf("the sweep reached %d nodes at or above the rung it started from and %d below it; with either at zero this test holds one direction rather than the two it states",
-			above, below)
+	if above == 0 || below == 0 || senders == 0 {
+		t.Fatalf("the sweep ran %d senders over %d ladders, reached %d nodes at or above the rung it started from and %d below it; with either direction at zero this test holds one of the two it states",
+			senders, ladders, above, below)
 	}
-	t.Logf("%d nodes derivable from a rung at or below them, %d refused from a rung above them", above, below)
+	t.Logf("%d senders over widths 2 to 8 and %d skipped for a filtered path of fewer than two nodes, %d ladders, %d nodes derivable from a rung at or below them, %d refused from a rung above them",
+		senders, tooShort, ladders, above, below)
 }
 
 // TestConsistentRefusesAPathSecretThatDerivesTheWrongKey is the clause the plan's own test cannot

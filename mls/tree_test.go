@@ -5539,6 +5539,94 @@ func TestEncryptionTargetsNeverNameALeafThisCommitAdds(t *testing.T) {
 	t.Logf("the added leaf %d was named %d times: %d directly, %d through an unmerged list", added, removals, direct, unmerged)
 }
 
+// TestEveryCommittedTreeExcludesTheLeafItJustAddedFromEveryTargetList is the same statement as the
+// test above, swept.
+//
+// The occupancy sweep next door cannot reach the unmerged route at all -- it asserts every parent
+// is blank, and in such a tree an added leaf reaches a resolution only as the nearest non-blank
+// node under a copath child -- and the test above holds the route on ONE tree: five members, one
+// committer, one added leaf. The route it holds is the silent direction of the pair, so it is the
+// one that most needs more than a fixture: a resolution that is too small is a member who cannot
+// decrypt and says so, and one that is too large is a leaf the group did not mean to seal to,
+// reading the commit cleanly and saying nothing.
+//
+// Every width and every committer, with both routes counted across the whole sweep rather than
+// per tree. Which trees build the unmerged route is a property of the shape and not of this
+// test's choices: a full tree doubles on Add and the new leaf's whole direct path is fresh and
+// blank, so nothing lists it unmerged, while a tree with a blank leaf inside it takes the new
+// member under parents that are already occupied and every one of them lists it. Both kinds are
+// in the sweep, and the counter that says how many trees actually built the unmerged route is
+// what stops a shape change from quietly leaving the sweep holding one route.
+//
+// The leaf cloned to make the new member is never the committer's. The committer's leaf carries
+// LeafNodeSourceCommit and a parent hash bound to its own index, so cloning it would add a member
+// whose leaf is meaningless at the index it lands on, which is a fixture defect rather than a
+// case.
+func TestEveryCommittedTreeExcludesTheLeafItJustAddedFromEveryTargetList(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	trees, listing, senders, removals, direct, unmerged := 0, 0, 0, 0, 0, 0
+	for width := uint32(2); width <= 8; width += 1 {
+		for committer := uint32(0); committer < width; committer += 1 {
+			tree, _, chain := chainedTestTree(t, crypto, width, LeafIndex(committer))
+			where := fmt.Sprintf("%d members, committer %d", width, committer)
+			donor := LeafIndex((committer + 1) % width)
+			added, err := tree.AddLeaf(tree.Leaf(donor).Clone())
+			if err != nil {
+				t.Fatalf("%s: AddLeaf(a clone of leaf %d): %v", where, donor, err)
+			}
+			trees += 1
+			for _, x := range chain {
+				if slices.Contains(tree.UnmergedLeaves(x), added) {
+					listing += 1
+				}
+			}
+			for _, sender := range tree.NonBlankLeaves() {
+				if sender == added {
+					continue
+				}
+				senders += 1
+				included, err := tree.EncryptionTargets(sender, nil)
+				if err != nil {
+					t.Fatalf("%s: EncryptionTargets(%d, nil): %v", where, sender, err)
+				}
+				excluded, err := tree.EncryptionTargets(sender, []LeafIndex{added})
+				if err != nil {
+					t.Fatalf("%s: EncryptionTargets(%d, [%d]): %v", where, sender, added, err)
+				}
+				if len(included) != len(excluded) {
+					t.Fatalf("%s: excluding leaf %d changed the number of path steps for sender %d from %d to %d; the exclusion is applied to a resolution, never to the filter",
+						where, added, sender, len(included), len(excluded))
+				}
+				for at := range included {
+					want := []NodeIndex{}
+					for position, y := range included[at] {
+						if y != added.NodeIndex() {
+							want = append(want, y)
+							continue
+						}
+						removals += 1
+						if position > 0 && slices.Contains(tree.UnmergedLeaves(included[at][position-1]), added) {
+							unmerged += 1
+						} else {
+							direct += 1
+						}
+					}
+					if !equalNodeIndices(excluded[at], want) {
+						t.Fatalf("%s: sender %d targets[%d] with leaf %d excluded = %v, want %v: the added leaf's own node index goes and nothing else does",
+							where, sender, at, added, excluded[at], want)
+					}
+				}
+			}
+		}
+	}
+	if trees == 0 || listing == 0 || senders == 0 || direct == 0 || unmerged == 0 {
+		t.Fatalf("the sweep built %d committed trees, %d chain nodes listing the added leaf unmerged, %d senders, and named the added leaf %d times: %d as the nearest non-blank node and %d behind an ancestor that lists it; a zero in any of them is a sweep holding fewer routes than it states",
+			trees, listing, senders, removals, direct, unmerged)
+	}
+	t.Logf("%d committed trees over widths 2 to 8, %d chain nodes listing the added leaf unmerged, %d senders, %d namings of the added leaf: %d directly, %d through an unmerged list",
+		trees, listing, senders, removals, direct, unmerged)
+}
+
 // TestFilteredPathEntryPointsRefuseALeafOutsideTheTree holds the container's own range check.
 //
 // ErrLeafIndexOutOfRange and not merely "an error": tree math's ErrLeafOutOfRange is what comes
