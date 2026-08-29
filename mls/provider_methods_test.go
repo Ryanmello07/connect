@@ -321,6 +321,68 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
 		}},
+		// treekem.go's two. NodePrivateKey has both arms driven, because they are two
+		// different answers and only one of them is derived: the node key comes back through
+		// the provider and moves, and the member's own leaf key is STORED and must not. The
+		// carried flag on the second is a real assertion rather than an exemption -- the gate
+		// requires a carried value to be identical across the two providers -- and it is what
+		// says the leaf arm answers the key it holds rather than deriving one from a rung of
+		// the ladder, which is the confusion the file header of treekem.go is about.
+		//
+		// Both answers are RENDERED rather than returned raw. An X25519 private key is 32
+		// octets whatever the kdf is, so a row answering the key itself would report a
+		// coincidence to the KDF.Nh gate that belongs to the KEM and not to this method.
+		{name: "(*TreeKEMPrivate).NodePrivateKey", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			state := NewTreeKEMPrivate(LeafIndex(0), HpkePrivateKey(bytes.Repeat([]byte{0x91}, 32)))
+			state.PathSecrets[NodeIndex(1)] = bytes.Repeat([]byte{0x92}, crypto.HashSize())
+			derived, held, err := state.NodePrivateKey(crypto, NodeIndex(1))
+			if err != nil {
+				return nil, err
+			}
+			if !held {
+				t.Fatal("the row holds a path secret for node 1 and NodePrivateKey answered that it has none")
+			}
+			own, held, err := state.NodePrivateKey(crypto, LeafIndex(0).NodeIndex())
+			if err != nil {
+				return nil, err
+			}
+			if !held {
+				t.Fatal("NodePrivateKey answered that the member does not hold its own leaf key")
+			}
+			return []providerDrivenMethodValue{
+				{name: "the key derived from the path secret at node 1", content: []byte("derived: " + HexOf(derived))},
+				{name: "the member's own leaf key", content: []byte("own leaf: " + HexOf(own)), carried: true},
+			}, nil
+		}},
+		// the private state's agreement with the tree, driven over a tree whose node key was
+		// derived through a provider fixed HERE rather than through the row's. That is
+		// providerRowChainedRatchetTree's reason one construction along: a tree keyed with the
+		// row's own provider agrees with itself under every provider, so the verdict would be
+		// the same over the real one and the tagging one and the differential would read
+		// nothing. Built against a fixed provider, "agrees" is the answer only while the
+		// method derives through the provider it was handed.
+		//
+		// The two renderings are deliberately neither 32 nor 48 octets long, so the KDF.Nh
+		// differential reads them as the non-digests they are.
+		{name: "(*TreeKEMPrivate).Consistent", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+			pathSecret := bytes.Repeat([]byte{0x93}, fixed.HashSize())
+			_, pub, err := DeriveNodeKeyPair(fixed, pathSecret)
+			if err != nil {
+				return nil, err
+			}
+			tree := providerRowRatchetTree(t)
+			if err := tree.SetParent(NodeIndex(1), &ParentNode{EncryptionKey: pub}); err != nil {
+				return nil, err
+			}
+			state := NewTreeKEMPrivate(LeafIndex(0), HpkePrivateKey(bytes.Repeat([]byte{0x94}, 32)))
+			state.PathSecrets[NodeIndex(1)] = pathSecret
+			verdict := []byte("Consistent: the path secret derives the key the tree carries")
+			if refused := state.Consistent(crypto, tree); refused != nil {
+				verdict = []byte("Consistent: refused")
+			}
+			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
+		}},
 	}
 }
 

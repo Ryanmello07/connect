@@ -3923,6 +3923,14 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 	// moves Nk and Nn rather than Nh. That test also holds the length this one cannot
 	// reach at all -- the ciphertext SAMPLE is KDF.Nh bytes and appears in no answer.
 	"SenderDataKeyNonce": "answers an aead key at Nk and an aead nonce at Nn, neither of which is KDF.Nh; Nk coincides with Nh at 32 under the narrow suite",
+	// its two answers are the KEM private and public halves, at Nsk and Npk. X25519 fixes
+	// both at 32 and the narrow suite's KDF.Nh is 32 too, so the equality is that suite's
+	// coincidence rather than anything this construction did -- a kdf getting wider does not
+	// widen an X25519 key. What holds the node_secret in front of the KEM to KDF.Nh is the
+	// row itself, which must work at either width, together with
+	// TestTheNodeKeyPairIsTheKemKeyOfTheNodeSecretAndNotOfThePathSecret and the published
+	// TreeKEM corpus, which compare the BYTES this row only measures.
+	"DeriveNodeKeyPair": "answers a KEM private key at Nsk and a public key at Npk, neither of which is KDF.Nh; both coincide with Nh at 32 under the narrow suite",
 }
 
 // scheduleAnswersThatAreNotKdfLengths names one ANSWER of an exported method of *KeySchedule
@@ -4287,6 +4295,25 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 				t.Fatalf("NewLeafNode over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), leafErr)
 			}
 			return [][]byte{leaf.Signature}
+		}},
+		// the path secret ladder, whose every rung is DeriveSecret at KDF.Nh. A body that cut
+		// a rung to a written down 32 answers correctly at both registered suites and hands a
+		// short secret to every derivation above it at the first suite whose hash is wider.
+		{name: "DerivePathSecrets", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			return DerivePathSecrets(crypto, bytes.Repeat([]byte{0x86}, crypto.HashSize()), 3)
+		}},
+		// the node key pair, which reads no length off the provider -- what it takes from one
+		// is a derivation and a KEM key -- so what this row states is the other half of the
+		// equivalence: it must WORK over a provider whose KDF.Nh is not 32, which a body that
+		// cut its node_secret to a written down 32 would refuse or silently truncate.
+		{name: "DeriveNodeKeyPair", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nodePriv, nodePub, keyErr := DeriveNodeKeyPair(crypto,
+				bytes.Repeat([]byte{0x87}, crypto.HashSize()))
+			if keyErr != nil {
+				t.Fatalf("DeriveNodeKeyPair over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), keyErr)
+			}
+			return [][]byte{nodePriv, nodePub}
 		}},
 	} {
 		covered = append(covered, testCase.name)

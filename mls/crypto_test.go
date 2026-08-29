@@ -3259,6 +3259,32 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			return [][]byte{leaf.EncryptionKey, leaf.SignatureKey, leaf.Credential.Identity,
 				leaf.Extensions[0].ExtensionData}
 		}},
+		// the path secret ladder of RFC 9420 section 7.4. Its first rung is the caller's own
+		// array -- in task 22 it is the plaintext an HpkeOpen just produced -- and the answer
+		// becomes the private state of an epoch, so a ladder that VIEWED that buffer is a group
+		// whose path secret changes the next time its caller reuses it, with every key still
+		// deriving and nothing to point at. Every rung is read, not the last one alone: a body
+		// that aliased only the rung it was handed is invisible from the top of the ladder.
+		{name: "DerivePathSecrets", call: func(take func([]byte) []byte) [][]byte {
+			return DerivePathSecrets(crypto, take(bytes.Repeat([]byte{0x86}, params.Nh)), 3)
+		}},
+		{name: "DeriveNodeKeyPair", call: func(take func([]byte) []byte) [][]byte {
+			nodePriv, nodePub, keyErr := DeriveNodeKeyPair(crypto,
+				take(bytes.Repeat([]byte{0x87}, params.Nh)))
+			if keyErr != nil {
+				t.Fatalf("DeriveNodeKeyPair: %v", keyErr)
+			}
+			return [][]byte{nodePriv, nodePub}
+		}},
+		// the private state's constructor, which is in this class for the reason the joiner's
+		// transcript seeding is: what it keeps outlives the call by the whole life of the group.
+		// A leaf private key held over its caller's buffer is a member that stops being able to
+		// decrypt at the moment that buffer is next written, one epoch after the mistake.
+		{name: "NewTreeKEMPrivate", call: func(take func([]byte) []byte) [][]byte {
+			state := NewTreeKEMPrivate(LeafIndex(0),
+				HpkePrivateKey(take(bytes.Repeat([]byte{0x88}, 32))))
+			return [][]byte{state.EncryptionPriv}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3663,6 +3689,8 @@ var providerConstructionValues = map[string]any{
 	"NewSecretTree":                 NewSecretTree,
 	"SenderDataKeyNonce":            SenderDataKeyNonce,
 	"NewLeafNode":                   NewLeafNode,
+	"DerivePathSecrets":             DerivePathSecrets,
+	"DeriveNodeKeyPair":             DeriveNodeKeyPair,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -3954,6 +3982,20 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		"cred": leafNodeStubCredential(),
 		"caps": leafNodeStubCapabilities(),
 		"exts": leafNodeStubExtensions(),
+		// the path secret ladder of RFC 9420 section 7.4 and the node key under it. Both
+		// are exactly KDF.Nh, because a rung of that ladder IS a KDF output and every rung
+		// after the first is derived at that width -- a shorter one would still derive and
+		// would put this gate's middle perturbation outside a real secret. They are distinct
+		// from each other and from the six secrets above, so a construction that read one of
+		// them where it meant another still moves when the one it did not read is perturbed.
+		//
+		// The count is three rather than one: the ladder answers count+1 rungs, so a body
+		// that ignored the count entirely and answered the initial secret alone is separated
+		// from one that climbs, and the perturbation -- one higher -- moves the answer by a
+		// rung rather than by the whole shape of it.
+		"initial":    ascendingBytes(0x12, params.Nh),
+		"pathSecret": ascendingBytes(0x13, params.Nh),
+		"count":      3,
 	}
 	// the keys and the answers the receiving operations are handed, computed over a
 	// provider of this gate's own so that the operation under test still draws from a
@@ -4339,6 +4381,30 @@ func providerStubZeroResults(results []reflect.Value) []string {
 			}
 			if !slices.ContainsFunc(bytesOut, func(b byte) bool { return b != 0 }) {
 				zero = append(zero, position+" is "+strconv.Itoa(len(bytesOut))+" zero bytes")
+			}
+		// a LIST of byte slices, which is how the path secret ladder answers. Read one
+		// entry at a time and not as one run: a ladder that climbed correctly for its first
+		// rung and answered zeroes for the rest is a stub in every position but one, and a
+		// rule that looked for a non-zero byte anywhere in the whole answer would report it
+		// as complete. The empty outer slice is its own case, because a construction that
+		// answered no rungs at all answers no bytes at all and would otherwise pass by
+		// having nothing to inspect.
+		case result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Slice &&
+			result.Type().Elem().Elem().Kind() == reflect.Uint8:
+			if result.Len() == 0 {
+				zero = append(zero, position+" is an empty list")
+				continue
+			}
+			for at := range result.Len() {
+				entry := result.Index(at).Bytes()
+				if len(entry) == 0 {
+					zero = append(zero, position+" entry "+strconv.Itoa(at)+" is empty")
+					continue
+				}
+				if !slices.ContainsFunc(entry, func(b byte) bool { return b != 0 }) {
+					zero = append(zero, position+" entry "+strconv.Itoa(at)+" is "+
+						strconv.Itoa(len(entry))+" zero bytes")
+				}
 			}
 		case result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct:
 			if result.IsNil() {

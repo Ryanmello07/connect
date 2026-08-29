@@ -108,6 +108,20 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*RatchetTree).VerifyParentHashes", call: func() error {
 			return (&RatchetTree{}).VerifyParentHashes(nil)
 		}},
+		// treekem.go's two, on the zero valued private state, which is the receiver that
+		// separates the two orders these bodies could be written in. A zero TreeKEMPrivate has
+		// leaf index 0, so node 0 IS its own leaf: a NodePrivateKey that looked at its receiver
+		// before its provider would answer a key and no error to a caller whose actual mistake
+		// was passing no provider. Consistent reaches a nil tree at its first statement for the
+		// same reason and would answer ErrPathSecretMismatch, which sends the caller to compare
+		// an epoch it never got wrong.
+		{name: "(*TreeKEMPrivate).NodePrivateKey", call: func() error {
+			_, _, err := (&TreeKEMPrivate{}).NodePrivateKey(nil, 0)
+			return err
+		}},
+		{name: "(*TreeKEMPrivate).Consistent", call: func() error {
+			return (&TreeKEMPrivate{}).Consistent(nil, nil)
+		}},
 	}
 }
 

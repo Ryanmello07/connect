@@ -1558,6 +1558,29 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 			}
 			return leaf.Signature
 		}},
+		// the path secret ladder. Every rung after the first is a DeriveSecret through the
+		// provider, and none of that is visible in the answer: a ladder climbed with a provider
+		// of its own is well formed 32 byte rungs that agree with the published TreeKEM corpus,
+		// because that corpus is at the suite it would have hardcoded. Every rung is
+		// concatenated rather than the last one read, so a body that routed the first step and
+		// then climbed on its own is visible as well as one that never routed at all.
+		{name: "DerivePathSecrets", call: func(crypto CryptoProvider) []byte {
+			return slices.Concat(DerivePathSecrets(crypto,
+				bytes.Repeat([]byte{0x86}, crypto.HashSize()), 3)...)
+		}},
+		// the node key pair, which reaches the provider twice -- the "node" derivation and the
+		// KEM key derivation -- and neither is visible in the answer either. Both halves are
+		// read rather than the public one alone: a body that derived the public half through
+		// the provider it was handed and the private half through one of its own answers a
+		// key pair whose halves do not match, which no length or determinism check can see.
+		{name: "DeriveNodeKeyPair", call: func(crypto CryptoProvider) []byte {
+			nodePriv, nodePub, keyErr := DeriveNodeKeyPair(crypto,
+				bytes.Repeat([]byte{0x87}, crypto.HashSize()))
+			if keyErr != nil {
+				t.Fatalf("DeriveNodeKeyPair: %v", keyErr)
+			}
+			return slices.Concat([]byte(nodePriv), []byte(nodePub))
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		tagging := &taggingCryptoProvider{inner: plain}
