@@ -651,6 +651,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// is a signature no peer running the default limit could verify. The ratchet tree
 		// encode that does need the raised bound is not this call and will say so here.
 		"tree_adapt.go: syntax.NewWriter()",
+		// whole tree validation's check 0, which reconciles the required_capabilities the leaves
+		// are held to against the body the epoch's own extensions vector carries. It ENCODES the
+		// structure and compares bytes rather than decoding the body, because encoding is total
+		// and decoding is not -- see reconcileRequiredCapabilities. The default limit and not the
+		// ratchet tree one: a RequiredCapabilities is three uint16 registry vectors, it travels as
+		// an extension_data<V> inside a GroupContext that is itself capped at MaxVectorLength, and
+		// a body allowed past that is one no peer running the default limit could have sent -- so
+		// a raised limit here would be an acceptance rule rather than a capacity, over bytes that
+		// are covered by the confirmed transcript hash.
+		"tree_sync.go: syntax.Marshal(required)",
 		// the two nested vectors of RFC 9420 section 7.6's UpdatePath: the ciphertexts
 		// under one node, and the nodes under the path. All four take the caller's Writer or
 		// Reader rather than building one, so each runs under whichever limit the caller

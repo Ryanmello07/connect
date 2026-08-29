@@ -20,26 +20,124 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
-func testTreeValidationContext(crypto CryptoProvider) *TreeValidationContext {
-	return &TreeValidationContext{
-		Crypto:  crypto,
-		Suite:   CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId: testGroupId(),
-		RequiredCaps: &RequiredCapabilities{
-			ExtensionTypes:  []ExtensionType{ExtensionTypeUrmessageGroupPolicy, ExtensionTypeUrmessageLeafKeys},
-			CredentialTypes: []CredentialType{CredentialTypeBasic},
+// The clock every key_package sourced leaf in this file is judged against, and it is a REAL
+// instant rather than a small round number.
+//
+// It has to be, and the reason is measurable rather than stylistic. validateLifetime widens the
+// lifetime interval by the skew at both ends and guards each widening as a subtraction from the
+// side that cannot wrap, so the not_after comparison is reached only when now > skew. The value
+// this fixture used to carry was a clock of 1000 seconds with an hour of skew, under which
+// now - skew is not a positive instant at all and NO not_after could ever be judged expired --
+// so the not_after half of section 7.3's lifetime rule was unobservable through every context
+// this file builds, and a validator that dropped the clock entirely passed the whole suite.
+// TestValidateJudgesEveryKeyPackageLeafAgainstTheClock asserts the relation rather than trusting
+// these two numbers, so a later edit that shrinks the clock back under the skew fails there.
+const (
+	testValidationNowMs       = 1_700_000_000_000
+	testValidationClockSkewMs = 3_600_000
+)
+
+// testRequiredCapabilities is the group's required_capabilities body, and the third entry is in
+// it for a reason the other two are not.
+//
+// urmessage_group_policy is also named by the group context extensions vector below and
+// urmessage_leaf_keys is also carried by every fixture leaf's own extensions, so a leaf that
+// stopped supporting either is refused by section 13.4's clause or by section 7.3's own
+// extensions clause BEFORE Capabilities.Supports is reached -- which leaves the
+// required_capabilities clause with no input of its own and makes it unobservable at this door.
+// urmessage_owner_successor is demanded by nothing else: no fixture leaf carries the extension
+// and the group context vector does not name it, so it is the one entry whose absence only this
+// clause can refuse.
+func testRequiredCapabilities() *RequiredCapabilities {
+	return &RequiredCapabilities{
+		ExtensionTypes: []ExtensionType{
+			ExtensionTypeUrmessageGroupPolicy,
+			ExtensionTypeUrmessageLeafKeys,
+			ExtensionTypeUrmessageOwnerSuccessor,
 		},
+		CredentialTypes: []CredentialType{CredentialTypeBasic},
+	}
+}
+
+// testTreeValidationContext is the context every tree in this file is judged against.
+//
+// Its extensions vector carries required_capabilities FIRST and the group policy behind it, and
+// both halves of that are deliberate. required_capabilities is one of section 7.2's default
+// types, so isDefaultExtensionType exempts it from the section 13.4 clause -- which means the
+// clause has to step over an exempt entry to reach the one it judges, which is the exact shape
+// LeafNode.Validate's own comment says a loop answering element zero would miss. And the body it
+// carries is the encoding of the same structure RequiredCaps points at, because
+// ValidateAgainstContext's check 0 now reconciles the two: a context whose vector did not carry
+// the required capabilities it also passes separately is a caller holding one fact two ways.
+func testTreeValidationContext(t testing.TB, crypto CryptoProvider) *TreeValidationContext {
+	t.Helper()
+	required := testRequiredCapabilities()
+	body, err := syntax.Marshal(required)
+	if err != nil {
+		t.Fatalf("Marshal(required_capabilities): %v", err)
+	}
+	return &TreeValidationContext{
+		Crypto:       crypto,
+		Suite:        CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:      testGroupId(),
+		RequiredCaps: required,
 		GroupExtensions: []Extension{
+			{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: body},
 			{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte("policy")},
 		},
-		NowMs:       1_000_000,
-		ClockSkewMs: 3_600_000,
+		NowMs:       testValidationNowMs,
+		ClockSkewMs: testValidationClockSkewMs,
 	}
+}
+
+// testGroupContextFor is a GroupContext that AGREES with testTreeValidationContext about every
+// fact the two structures both carry, pinning this tree's own hash.
+//
+// Every field it shares with the tree context is read off that context rather than restated
+// beside it, which is the whole point: check 0 refuses a disagreement, so a fixture that spelled
+// the group id or the suite a second time would start failing the day the context's copy moved,
+// and the failure would look like a bug in the validator. The two copies are one copy here.
+func testGroupContextFor(t testing.TB, crypto CryptoProvider, tree *RatchetTree) *GroupContext {
+	t.Helper()
+	ctx := testTreeValidationContext(t, crypto)
+	treeHash, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	return &GroupContext{
+		Version:     ProtocolVersionMls10,
+		CipherSuite: ctx.Suite,
+		GroupId:     cloneBytes(ctx.GroupId),
+		Epoch:       1,
+		TreeHash:    treeHash,
+		Extensions:  slices.Clone(ctx.GroupExtensions),
+	}
+}
+
+// withoutExtensionType is a capabilities vector with one code point removed.
+//
+// A fresh slice and never a filter in place. Every caller here narrows a leaf CLONE, whose
+// capabilities vectors LeafNode.Clone has already made its own, so an in place filter would be
+// correct today -- and it would stop being correct the first time a caller narrowed a vector it
+// had not cloned, at which point the fixture itself would be narrowed and every later position
+// of the sweep would be judging a tree that was already broken. The shape that cannot do that
+// costs one allocation.
+func withoutExtensionType(types []ExtensionType, drop ExtensionType) []ExtensionType {
+	out := []ExtensionType{}
+	for _, one := range types {
+		if one != drop {
+			out = append(out, one)
+		}
+	}
+	return out
 }
 
 // plantNode installs a node at a raw index, past every refusal SetLeaf and SetParent make.
@@ -107,7 +205,7 @@ func TestValidateAcceptsAFreshAndACommittedTree(t *testing.T) {
 	for _, n := range []uint32{1, 2, 3, 5, 8} {
 		tree, members := newTestTree(t, crypto, n)
 		before := treeSnapshot(tree)
-		if err := tree.Validate(testTreeValidationContext(crypto)); err != nil {
+		if err := tree.Validate(testTreeValidationContext(t, crypto)); err != nil {
 			t.Fatalf("n=%d Validate on a fresh tree: %v", n, err)
 		}
 		if after := treeSnapshot(tree); !slices.Equal(before, after) {
@@ -118,7 +216,7 @@ func TestValidateAcceptsAFreshAndACommittedTree(t *testing.T) {
 		}
 		senderTree, _, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
 		before = treeSnapshot(senderTree)
-		if err := senderTree.Validate(testTreeValidationContext(crypto)); err != nil {
+		if err := senderTree.Validate(testTreeValidationContext(t, crypto)); err != nil {
 			t.Fatalf("n=%d Validate after a commit: %v", n, err)
 		}
 		if after := treeSnapshot(senderTree); !slices.Equal(before, after) {
@@ -144,7 +242,7 @@ func TestValidateRefusesANodeArrayThatIsNotTwoNMinusOne(t *testing.T) {
 		t.Fatalf("NewCryptoProvider: %v", err)
 	}
 	full, _ := newTestTree(t, crypto, 8)
-	if err := full.Validate(testTreeValidationContext(crypto)); err != nil {
+	if err := full.Validate(testTreeValidationContext(t, crypto)); err != nil {
 		t.Fatalf("the fixture this truncates does not validate, so every refusal below could be it: %v", err)
 	}
 	cases := []struct {
@@ -160,7 +258,7 @@ func TestValidateRefusesANodeArrayThatIsNotTwoNMinusOne(t *testing.T) {
 	for _, c := range cases {
 		broken := full.Clone()
 		broken.nodes = broken.nodes[:c.width]
-		err := broken.Validate(testTreeValidationContext(crypto))
+		err := broken.Validate(testTreeValidationContext(t, crypto))
 		if !errors.Is(err, ErrTreeMalformed) {
 			t.Errorf("%s: err = %v, want ErrTreeMalformed", c.name, err)
 			continue
@@ -186,7 +284,7 @@ func TestValidateJudgesTheNodeTypeAtEveryPosition(t *testing.T) {
 		t.Fatalf("NewCryptoProvider: %v", err)
 	}
 	tree, _ := newTestTree(t, crypto, 8)
-	if err := tree.Validate(testTreeValidationContext(crypto)); err != nil {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); err != nil {
 		t.Fatalf("the fixture does not validate, so every refusal below could be it: %v", err)
 	}
 	sampleLeaf := tree.Leaf(LeafIndex(0)).Clone()
@@ -199,7 +297,7 @@ func TestValidateJudgesTheNodeTypeAtEveryPosition(t *testing.T) {
 		broken := tree.Clone()
 		plantNode(t, broken, NodeIndex(x), wrong)
 		swept += 1
-		if err := broken.Validate(testTreeValidationContext(crypto)); !errors.Is(err, ErrNodeTypeMismatch) {
+		if err := broken.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, ErrNodeTypeMismatch) {
 			t.Errorf("node %d holds the body the other parity takes: err = %v, want ErrNodeTypeMismatch", x, err)
 		}
 	}
@@ -238,7 +336,7 @@ func TestValidateRefusesANodeThatIsBothKindsOrNeither(t *testing.T) {
 	for _, c := range cases {
 		broken := tree.Clone()
 		plantNode(t, broken, c.at, c.node)
-		if err := broken.Validate(testTreeValidationContext(crypto)); !errors.Is(err, ErrNodeTypeMismatch) {
+		if err := broken.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, ErrNodeTypeMismatch) {
 			t.Errorf("%s: err = %v, want ErrNodeTypeMismatch", c.name, err)
 		}
 	}
@@ -260,7 +358,7 @@ func TestValidateJudgesEveryNonBlankLeafAndNotOnlyTheFirst(t *testing.T) {
 		t.Fatalf("NewCryptoProvider: %v", err)
 	}
 	tree, _ := newTestTree(t, crypto, 8)
-	if err := tree.Validate(testTreeValidationContext(crypto)); err != nil {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); err != nil {
 		t.Fatalf("the fixture does not validate, so every refusal below could be it: %v", err)
 	}
 	leaves := tree.NonBlankLeaves()
@@ -273,7 +371,7 @@ func TestValidateJudgesEveryNonBlankLeafAndNotOnlyTheFirst(t *testing.T) {
 		leaf := broken.Leaf(i)
 		leaf.Signature = cloneBytes(leaf.Signature)
 		leaf.Signature[0] ^= 0xFF
-		err := broken.Validate(testTreeValidationContext(crypto))
+		err := broken.Validate(testTreeValidationContext(t, crypto))
 		if !errors.Is(err, errBadSignature) {
 			t.Errorf("leaf %d carries a broken signature: err = %v, want errBadSignature", i, err)
 			continue
@@ -305,9 +403,329 @@ func TestValidateJudgesALeafAtItsOwnIndexAndNotAtSomeOther(t *testing.T) {
 		if err := broken.SetLeaf(LeafIndex(i-1), moved); err != nil {
 			t.Fatalf("SetLeaf: %v", err)
 		}
-		if err := broken.Validate(testTreeValidationContext(crypto)); !errors.Is(err, errBadSignature) {
+		if err := broken.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, errBadSignature) {
 			t.Errorf("leaf %d moved to index %d: err = %v, want errBadSignature", i, i-1, err)
 		}
+	}
+}
+
+// TestValidateJudgesEveryLeafAgainstTheGroupsRequiredCapabilities is section 7.3's
+// required_capabilities clause at this door, at every occupied leaf.
+//
+// It exists because of what a signature test cannot see. validateLeaves decides two of section
+// 7.3's rules itself and PASSES THE OTHER SIX THROUGH, one field of the tree context each, and a
+// passthrough is invisible to a test that breaks a signature: RequiredCaps could be replaced by
+// nil in validateLeaves' literal and the whole of ./mls and ./message stayed green, which is the
+// state this test and the two below it were written to end. Two of the eight -- Suite and GroupId
+// -- were already observed, because a leaf that fails either fails its signature too.
+//
+// The offender is a leaf that fails NOTHING ELSE: correctly signed, at its own index, carrying
+// its own extensions, with exactly one code point removed from its capabilities. The code point
+// is urmessage_owner_successor for testRequiredCapabilities' reason, and both halves of that
+// reason are asserted here rather than trusted, from the context itself -- so a later task that
+// adds owner_successor to the group's extensions vector, or drops it from the requirement, fails
+// here instead of quietly turning this into a second copy of the test below.
+//
+// The control is the same narrowed tree judged with RequiredCaps nil. If that refuses, the leaf
+// was broken in some other way and every refusal above it is unattributable; if it accepts, the
+// refusal came from the requirement and from nothing else.
+func TestValidateJudgesEveryLeafAgainstTheGroupsRequiredCapabilities(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 8)
+	ctx := testTreeValidationContext(t, crypto)
+	if err := tree.Validate(ctx); err != nil {
+		t.Fatalf("the fixture does not validate, so every refusal below could be it: %v", err)
+	}
+	const dropped = ExtensionTypeUrmessageOwnerSuccessor
+	if ctx.RequiredCaps == nil || !slices.Contains(ctx.RequiredCaps.ExtensionTypes, dropped) {
+		t.Fatalf("the group no longer requires %#04x, so a leaf that drops it is refused by nothing and this sweep says nothing",
+			uint16(dropped))
+	}
+	for i := range ctx.GroupExtensions {
+		if ctx.GroupExtensions[i].ExtensionType == dropped {
+			t.Fatalf("the group context now carries %#04x as well, so a leaf that drops it is refused by the section 13.4 clause before this one is reached",
+				uint16(dropped))
+		}
+	}
+	leaves := tree.NonBlankLeaves()
+	if len(leaves) < 2 {
+		t.Fatalf("the fixture has %d occupied leaves, so a sweep over it says nothing about a loop that reads one",
+			len(leaves))
+	}
+	for _, i := range leaves {
+		narrowed := tree.Leaf(i).Clone()
+		narrowed.Capabilities.Extensions = withoutExtensionType(narrowed.Capabilities.Extensions, dropped)
+		if err := narrowed.Sign(crypto, members[int(i)].SignaturePriv, testGroupId(), i); err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		broken := tree.Clone()
+		if err := broken.SetLeaf(i, narrowed); err != nil {
+			t.Fatalf("SetLeaf: %v", err)
+		}
+		err := broken.Validate(testTreeValidationContext(t, crypto))
+		if !errors.Is(err, errMissingRequiredCapability) {
+			t.Errorf("leaf %d no longer supports a required capability: err = %v, want errMissingRequiredCapability", i, err)
+			continue
+		}
+		// the two wrapped spellings of the same sentinel answer errors.Is as well, and either
+		// of them here would mean the leaf was refused by a DIFFERENT clause that happens to
+		// share a base error -- which is the whole failure mode this file's derived fixtures
+		// are built to avoid
+		if errors.Is(err, errLeafExtensionNotListed) || errors.Is(err, errGroupContextExtensionNotListed) {
+			t.Errorf("leaf %d was refused as %q, which is one of the extension clauses rather than the required capabilities one", i, err)
+		}
+		if want := fmt.Sprintf("leaf %d:", i); !strings.Contains(err.Error(), want) {
+			t.Errorf("leaf %d was refused as %q, which does not name the leaf that failed", i, err)
+		}
+		if want := fmt.Sprintf("%#04x", uint16(dropped)); !strings.Contains(err.Error(), want) {
+			t.Errorf("leaf %d was refused as %q, which does not name the capability that is missing", i, err)
+		}
+		unrequired := testTreeValidationContext(t, crypto)
+		unrequired.RequiredCaps = nil
+		if err := broken.Validate(unrequired); err != nil {
+			t.Errorf("leaf %d narrowed and judged against no requirement at all: err = %v, want nil -- the refusal above was not the requirement's",
+				i, err)
+		}
+	}
+}
+
+// TestValidateJudgesEveryLeafAgainstTheGroupContextExtensions is RFC 9420 section 13.4 as
+// corrected by erratum 8745 at this door: every member's capabilities must indicate support for
+// every extension the GroupContext is using, whichever source the member's leaf carries.
+//
+// Second of the three passthroughs. GroupExtensions could be replaced by nil in validateLeaves'
+// literal and nothing failed, which meant the erratum's clause -- the one LeafNode.Validate's own
+// comment argues for at length -- was applied to no tree this file judges.
+//
+// The offending type is DERIVED from the context rather than named: the vector legally holds
+// default types, which section 7.2 exempts and this clause steps over, so the type to drop is
+// the first one the clause can actually judge. Both sweeps run, every judged type against every
+// occupied leaf, because either loop alone is the shape this file exists to refuse.
+//
+// The refusal asserted is the group context clause's OWN sentinel and not the base one it wraps.
+// That distinction is what makes this test observe its own property: the fixture's required
+// capabilities name the same code point, so a validator that stopped passing GroupExtensions
+// through would still refuse these leaves -- one clause later, under errMissingRequiredCapability
+// unwrapped -- and a test asking only "was it refused" would pass over exactly the deletion it
+// was written for.
+func TestValidateJudgesEveryLeafAgainstTheGroupContextExtensions(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 8)
+	ctx := testTreeValidationContext(t, crypto)
+	if err := tree.Validate(ctx); err != nil {
+		t.Fatalf("the fixture does not validate, so every refusal below could be it: %v", err)
+	}
+	judged := []ExtensionType{}
+	for i := range ctx.GroupExtensions {
+		if !isDefaultExtensionType(ctx.GroupExtensions[i].ExtensionType) {
+			judged = append(judged, ctx.GroupExtensions[i].ExtensionType)
+		}
+	}
+	if len(judged) == 0 {
+		t.Fatal("every entry of the group context's extensions vector is a default type, which section 7.2 exempts from this clause, so the clause has nothing to judge and the sweep below says nothing")
+	}
+	leaves := tree.NonBlankLeaves()
+	if len(leaves) < 2 {
+		t.Fatalf("the fixture has %d occupied leaves, so a sweep over it says nothing about a loop that reads one",
+			len(leaves))
+	}
+	for _, dropped := range judged {
+		for _, i := range leaves {
+			narrowed := tree.Leaf(i).Clone()
+			narrowed.Capabilities.Extensions = withoutExtensionType(narrowed.Capabilities.Extensions, dropped)
+			if err := narrowed.Sign(crypto, members[int(i)].SignaturePriv, testGroupId(), i); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			broken := tree.Clone()
+			if err := broken.SetLeaf(i, narrowed); err != nil {
+				t.Fatalf("SetLeaf: %v", err)
+			}
+			err := broken.Validate(testTreeValidationContext(t, crypto))
+			if !errors.Is(err, errGroupContextExtensionNotListed) {
+				t.Errorf("leaf %d does not support the group's extension %#04x: err = %v, want errGroupContextExtensionNotListed",
+					i, uint16(dropped), err)
+				continue
+			}
+			if want := fmt.Sprintf("leaf %d:", i); !strings.Contains(err.Error(), want) {
+				t.Errorf("leaf %d was refused as %q, which does not name the leaf that failed", i, err)
+			}
+			// the same narrowed tree with neither the group's extensions nor its requirement
+			// in hand, which is the only judgement left that can accept it. If this refuses,
+			// the narrowing broke something else and the refusal above is unattributable.
+			unjudged := testTreeValidationContext(t, crypto)
+			unjudged.GroupExtensions = nil
+			unjudged.RequiredCaps = nil
+			if err := broken.Validate(unjudged); err != nil {
+				t.Errorf("leaf %d narrowed and judged against no group extensions at all: err = %v, want nil", i, err)
+			}
+		}
+	}
+}
+
+// TestValidateJudgesEveryKeyPackageLeafAgainstTheClock is the third passthrough and the one whose
+// absence was invisible for a reason worth writing down.
+//
+// NowMs and ClockSkewMs could both be replaced by zero in validateLeaves' literal -- which is
+// LeafValidationContext's documented opt out of the lifetime check, so the whole rule stops
+// applying -- and nothing failed. Two things were true at once: no fixture in this file carried a
+// key_package sourced leaf, because newTestTree signs every leaf under update on purpose, and the
+// clock the fixture context carried could not have judged a not_after even if one had. Both are
+// fixed here, and the second is asserted rather than assumed: the guard below is the one that
+// would have caught the old clock.
+//
+// The lifetime is a variant field of the key_package arm alone, so every offender here is a leaf
+// re-sourced to key_package and re-signed. That is also the first key_package leaf this file
+// builds, and it is the fixture the binding test below reads.
+//
+// Both ends of the interval are swept, at every occupied leaf, with the endpoints DERIVED from
+// the context's own clock rather than written as constants -- an expired leaf and a leaf that is
+// not current yet are separately reachable failures of validateLifetime's two comparisons, and a
+// fixture that named its instants would stop driving either the day the clock moved. The control
+// is the same re-sourced leaf inside its lifetime: if that refuses, the refusals are about the
+// source swap rather than about the clock.
+func TestValidateJudgesEveryKeyPackageLeafAgainstTheClock(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 8)
+	ctx := testTreeValidationContext(t, crypto)
+	if err := tree.Validate(ctx); err != nil {
+		t.Fatalf("the fixture does not validate, so every refusal below could be it: %v", err)
+	}
+	// section 7.2's endpoints are seconds and this context carries milliseconds, which is the
+	// division validateLifetime makes; the relation between the two is what decides whether the
+	// not_after comparison is reachable at all
+	nowSeconds := ctx.NowMs / 1000
+	skewSeconds := ctx.ClockSkewMs / 1000
+	if nowSeconds <= skewSeconds {
+		t.Fatalf("the fixture clock is %d s with %d s of skew, so now - skew is not a positive instant and validateLifetime's not_after comparison is unreachable: no leaf this file can build is ever expired",
+			nowSeconds, skewSeconds)
+	}
+	leaves := tree.NonBlankLeaves()
+	if len(leaves) < 2 {
+		t.Fatalf("the fixture has %d occupied leaves, so a sweep over it says nothing about a loop that reads one",
+			len(leaves))
+	}
+	for _, c := range []struct {
+		name     string
+		lifetime Lifetime
+		refused  bool
+	}{
+		{"a leaf whose not_after is behind now even at full skew",
+			Lifetime{NotBefore: 0, NotAfter: nowSeconds - skewSeconds - 1}, true},
+		{"a leaf whose not_before is ahead of now even at full skew",
+			Lifetime{NotBefore: nowSeconds + skewSeconds + 1, NotAfter: nowSeconds + skewSeconds + 10_000}, true},
+		{"a leaf comfortably inside its lifetime",
+			Lifetime{NotBefore: 0, NotAfter: nowSeconds + skewSeconds + 10_000}, false},
+	} {
+		for _, i := range leaves {
+			dated := tree.Leaf(i).Clone()
+			dated.LeafNodeSource = LeafNodeSourceKeyPackage
+			dated.Lifetime = c.lifetime
+			if err := dated.Sign(crypto, members[int(i)].SignaturePriv, testGroupId(), i); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			judged := tree.Clone()
+			if err := judged.SetLeaf(i, dated); err != nil {
+				t.Fatalf("SetLeaf: %v", err)
+			}
+			err := judged.Validate(testTreeValidationContext(t, crypto))
+			if !c.refused {
+				if err != nil {
+					t.Errorf("%s at leaf %d: err = %v, want nil", c.name, i, err)
+				}
+				continue
+			}
+			if !errors.Is(err, ErrLeafNodeLifetime) {
+				t.Errorf("%s at leaf %d: err = %v, want ErrLeafNodeLifetime", c.name, i, err)
+				continue
+			}
+			if want := fmt.Sprintf("leaf %d:", i); !strings.Contains(err.Error(), want) {
+				t.Errorf("%s at leaf %d was refused as %q, which does not name the leaf that failed", c.name, i, err)
+			}
+		}
+	}
+}
+
+// TestTheIndexAndGroupBindingIsUpdateAndCommitsAndNotKeyPackages measures the sentence
+// validateLeaves' doc used to get wrong, in both directions.
+//
+// That doc claimed a leaf lifted from another group, or from another index of this one, is
+// refused here "whichever source it claims", and it is the whole argument for why inferring the
+// expected source is safe rather than a hole. It is true of update and commit and FALSE of
+// key_package: signatureContent's key_package arm is the empty struct of the section 7.2 select,
+// carrying neither the group id nor the leaf index, so a key_package leaf verifies at every index
+// of every group. That is RFC 9420 as written -- a KeyPackage is minted before its author knows
+// where it will land -- and this test asserts it rather than a refusal, so the day somebody adds
+// the binding, this fails and the doc is corrected with it instead of drifting again.
+//
+// The lifted leaf's own position is BLANKED before the copy is planted, because the two would
+// otherwise repeat a signature key and check 3 would refuse the tree for a reason that has
+// nothing to do with the binding -- which would read exactly like the binding holding.
+func TestTheIndexAndGroupBindingIsUpdateAndCommitsAndNotKeyPackages(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	ctx := testTreeValidationContext(t, crypto)
+	current := Lifetime{NotBefore: 0, NotAfter: ctx.NowMs/1000 + ctx.ClockSkewMs/1000 + 10_000}
+	elsewhere := testTreeValidationContext(t, crypto)
+	elsewhere.GroupId = []byte("a completely different group")
+
+	// the update sourced half, which is where the binding does hold. Both statements of it: the
+	// same tree under another group id, and one member's leaf at another member's index.
+	if err := tree.Validate(elsewhere); !errors.Is(err, errBadSignature) {
+		t.Errorf("an update sourced tree judged under another group id: err = %v, want errBadSignature", err)
+	}
+	moved := tree.Clone()
+	if err := moved.Blank(LeafIndex(1).NodeIndex()); err != nil {
+		t.Fatalf("Blank: %v", err)
+	}
+	if err := moved.SetLeaf(LeafIndex(2), tree.Leaf(LeafIndex(1)).Clone()); err != nil {
+		t.Fatalf("SetLeaf: %v", err)
+	}
+	if err := moved.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, errBadSignature) {
+		t.Errorf("member 1's update sourced leaf at index 2: err = %v, want errBadSignature", err)
+	}
+
+	// and the key_package half, where neither binding exists at all
+	keyPackaged := tree.Clone()
+	for _, i := range tree.NonBlankLeaves() {
+		minted := tree.Leaf(i).Clone()
+		minted.LeafNodeSource = LeafNodeSourceKeyPackage
+		minted.Lifetime = current
+		if err := minted.Sign(crypto, members[int(i)].SignaturePriv, testGroupId(), i); err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		if err := keyPackaged.SetLeaf(i, minted); err != nil {
+			t.Fatalf("SetLeaf: %v", err)
+		}
+	}
+	if err := keyPackaged.Validate(testTreeValidationContext(t, crypto)); err != nil {
+		t.Fatalf("a key_package sourced tree under its own group id: err = %v, want nil", err)
+	}
+	if err := keyPackaged.Validate(elsewhere); err != nil {
+		t.Errorf("a key_package sourced tree under ANOTHER group id: err = %v, want nil -- if this now refuses, the key_package preimage has gained a group id binding and validateLeaves' doc must stop saying it has none",
+			err)
+	}
+	lifted := keyPackaged.Clone()
+	if err := lifted.Blank(LeafIndex(1).NodeIndex()); err != nil {
+		t.Fatalf("Blank: %v", err)
+	}
+	if err := lifted.SetLeaf(LeafIndex(2), keyPackaged.Leaf(LeafIndex(1)).Clone()); err != nil {
+		t.Fatalf("SetLeaf: %v", err)
+	}
+	if err := lifted.Validate(testTreeValidationContext(t, crypto)); err != nil {
+		t.Errorf("member 1's key_package sourced leaf at index 2: err = %v, want nil -- if this now refuses, the key_package preimage has gained a leaf index binding and validateLeaves' doc must stop saying it has none",
+			err)
 	}
 }
 
@@ -330,7 +748,7 @@ func TestValidateRejectsDuplicateKeys(t *testing.T) {
 	if err := tree.SetLeaf(LeafIndex(1), duplicate); err != nil {
 		t.Fatalf("SetLeaf: %v", err)
 	}
-	if err := tree.Validate(testTreeValidationContext(crypto)); !errors.Is(err, errDuplicateEncryptionKey) {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, errDuplicateEncryptionKey) {
 		t.Fatalf("err = %v, want errDuplicateEncryptionKey", err)
 	}
 
@@ -343,7 +761,7 @@ func TestValidateRejectsDuplicateKeys(t *testing.T) {
 	if err := tree.SetLeaf(LeafIndex(1), duplicate); err != nil {
 		t.Fatalf("SetLeaf: %v", err)
 	}
-	if err := tree.Validate(testTreeValidationContext(crypto)); !errors.Is(err, errDuplicateSignatureKey) {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, errDuplicateSignatureKey) {
 		t.Fatalf("err = %v, want errDuplicateSignatureKey", err)
 	}
 }
@@ -385,7 +803,7 @@ func TestValidateFindsADuplicateKeyWhereverThePairSits(t *testing.T) {
 				t.Fatalf("SetLeaf: %v", err)
 			}
 			swept += 1
-			if err := tree.Validate(testTreeValidationContext(crypto)); !errors.Is(err, want) {
+			if err := tree.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, want) {
 				t.Errorf("leaves %d and %d share a %s key: err = %v, want %v", j-1, j, kind, err, want)
 			}
 		}
@@ -427,7 +845,7 @@ func TestValidateFindsADuplicateEncryptionKeyAmongTheParentNodes(t *testing.T) {
 			repeat := broken.ParentAt(to).Clone()
 			repeat.EncryptionKey = HpkePublicKey(cloneBytes(broken.ParentAt(from).EncryptionKey))
 			plantParent(t, broken, to, repeat)
-			if err := broken.Validate(testTreeValidationContext(crypto)); !errors.Is(err, errDuplicateEncryptionKey) {
+			if err := broken.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, errDuplicateEncryptionKey) {
 				t.Errorf("parents %d and %d share an encryption key: err = %v, want errDuplicateEncryptionKey",
 					from, to, err)
 			}
@@ -439,7 +857,7 @@ func TestValidateFindsADuplicateEncryptionKeyAmongTheParentNodes(t *testing.T) {
 		repeat := broken.ParentAt(at).Clone()
 		repeat.EncryptionKey = HpkePublicKey(cloneBytes(broken.Leaf(leaf).EncryptionKey))
 		plantParent(t, broken, at, repeat)
-		if err := broken.Validate(testTreeValidationContext(crypto)); !errors.Is(err, errDuplicateEncryptionKey) {
+		if err := broken.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, errDuplicateEncryptionKey) {
 			t.Errorf("parent %d publishes leaf %d's encryption key: err = %v, want errDuplicateEncryptionKey",
 				at, leaf, err)
 		}
@@ -478,7 +896,7 @@ func TestValidateRejectsBadUnmergedLeaves(t *testing.T) {
 			EncryptionKey:  fillerKey(NodeIndex(1)),
 			UnmergedLeaves: c.unmerged,
 		})
-		if err := tree.Validate(testTreeValidationContext(crypto)); !errors.Is(err, c.want) {
+		if err := tree.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, c.want) {
 			t.Errorf("%s: err = %v, want %v", c.name, err, c.want)
 		}
 	}
@@ -491,7 +909,7 @@ func TestValidateRejectsBadUnmergedLeaves(t *testing.T) {
 		EncryptionKey:  fillerKey(NodeIndex(1)),
 		UnmergedLeaves: []LeafIndex{1},
 	})
-	if err := tree.Validate(testTreeValidationContext(crypto)); !errors.Is(err, ErrUnmergedLeafInconsistent) {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, ErrUnmergedLeafInconsistent) {
 		t.Errorf("a node listing a blank leaf: err = %v, want ErrUnmergedLeafInconsistent", err)
 	}
 }
@@ -508,7 +926,7 @@ func TestValidateJudgesTheUnmergedLeavesOfEveryParentAndNotOnlyTheFirst(t *testi
 		t.Fatalf("NewCryptoProvider: %v", err)
 	}
 	tree, _ := newTestTree(t, crypto, 8)
-	if err := tree.Validate(testTreeValidationContext(crypto)); err != nil {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); err != nil {
 		t.Fatalf("the fixture does not validate, so every refusal below could be it: %v", err)
 	}
 	// the first leaf index this tree does not have, so the entry is wrong at EVERY parent
@@ -522,7 +940,7 @@ func TestValidateJudgesTheUnmergedLeavesOfEveryParentAndNotOnlyTheFirst(t *testi
 			UnmergedLeaves: []LeafIndex{beyond},
 		})
 		swept += 1
-		err := broken.Validate(testTreeValidationContext(crypto))
+		err := broken.Validate(testTreeValidationContext(t, crypto))
 		if !errors.Is(err, ErrUnmergedLeafInconsistent) {
 			t.Errorf("parent %d lists leaf %d and the tree has %d leaves: err = %v, want ErrUnmergedLeafInconsistent",
 				x, beyond, tree.LeafWidth(), err)
@@ -568,7 +986,7 @@ func TestValidateJudgesEveryEntryOfAnUnmergedLeavesVector(t *testing.T) {
 	}
 	control := tree.Clone()
 	plantParent(t, control, root, &ParentNode{EncryptionKey: fillerKey(root), UnmergedLeaves: everyLeaf})
-	if err := control.Validate(testTreeValidationContext(crypto)); errors.Is(err, ErrUnmergedLeafInconsistent) {
+	if err := control.Validate(testTreeValidationContext(t, crypto)); errors.Is(err, ErrUnmergedLeafInconsistent) {
 		t.Fatalf("the control vector is already inconsistent, so the sweep below proves nothing: %v", err)
 	}
 	for k := range everyLeaf {
@@ -577,7 +995,7 @@ func TestValidateJudgesEveryEntryOfAnUnmergedLeavesVector(t *testing.T) {
 			t.Fatalf("Blank(%d): %v", everyLeaf[k], err)
 		}
 		plantParent(t, broken, root, &ParentNode{EncryptionKey: fillerKey(root), UnmergedLeaves: everyLeaf})
-		err := broken.Validate(testTreeValidationContext(crypto))
+		err := broken.Validate(testTreeValidationContext(t, crypto))
 		if !errors.Is(err, ErrUnmergedLeafInconsistent) {
 			t.Errorf("entry %d of %d names leaf %d, which is blank: err = %v, want ErrUnmergedLeafInconsistent",
 				k, len(everyLeaf), everyLeaf[k], err)
@@ -649,13 +1067,13 @@ func TestValidateJudgesEveryIntermediateBetweenAnUnmergedLeafAndTheNodeListingIt
 	}
 	for _, othersCarry := range []bool{false, true} {
 		control := build(-1, othersCarry)
-		if err := control.Validate(testTreeValidationContext(crypto)); errors.Is(err, ErrUnmergedLeafInconsistent) {
+		if err := control.Validate(testTreeValidationContext(t, crypto)); errors.Is(err, ErrUnmergedLeafInconsistent) {
 			t.Fatalf("othersCarry=%v: the control is already inconsistent, so the sweep proves nothing: %v",
 				othersCarry, err)
 		}
 		for k, offender := range intermediates {
 			broken := build(k, othersCarry)
-			err := broken.Validate(testTreeValidationContext(crypto))
+			err := broken.Validate(testTreeValidationContext(t, crypto))
 			if !errors.Is(err, ErrUnmergedLeafInconsistent) {
 				t.Errorf("othersCarry=%v: node %d between leaf %d and node %d does not list it: err = %v, want ErrUnmergedLeafInconsistent",
 					othersCarry, offender, unmerged, root, err)
@@ -684,7 +1102,7 @@ func TestValidateRejectsAnUnmergedLeafThatAnIntermediateDoesNotCarry(t *testing.
 		EncryptionKey:  fillerKey(NodeIndex(3)),
 		UnmergedLeaves: []LeafIndex{0},
 	})
-	if err := tree.Validate(testTreeValidationContext(crypto)); !errors.Is(err, ErrUnmergedLeafInconsistent) {
+	if err := tree.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, ErrUnmergedLeafInconsistent) {
 		t.Fatalf("err = %v, want ErrUnmergedLeafInconsistent", err)
 	}
 }
@@ -706,7 +1124,7 @@ func TestValidateVerifiesTheParentHashOfEveryNonBlankParent(t *testing.T) {
 	}
 	tree, members := newTestTree(t, crypto, 8)
 	senderTree, _, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
-	if err := senderTree.Validate(testTreeValidationContext(crypto)); err != nil {
+	if err := senderTree.Validate(testTreeValidationContext(t, crypto)); err != nil {
 		t.Fatalf("the committed fixture does not validate, so every refusal below could be it: %v", err)
 	}
 	swept := 0
@@ -720,7 +1138,7 @@ func TestValidateVerifiesTheParentHashOfEveryNonBlankParent(t *testing.T) {
 		tampered.ParentHash = tamperParentHash(tampered.ParentHash)
 		plantParent(t, broken, NodeIndex(x), tampered)
 		swept += 1
-		if err := broken.Validate(testTreeValidationContext(crypto)); !errors.Is(err, ErrParentHashMismatch) {
+		if err := broken.Validate(testTreeValidationContext(t, crypto)); !errors.Is(err, ErrParentHashMismatch) {
 			t.Errorf("parent %d carries a tampered parent_hash: err = %v, want ErrParentHashMismatch", x, err)
 		}
 	}
@@ -751,7 +1169,7 @@ func TestValidateRefusesASplicedSubtreeThatKeepsTheHashChain(t *testing.T) {
 	}
 	tree, members := newTestTree(t, crypto, 8)
 	spliced, _, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
-	if err := spliced.Validate(testTreeValidationContext(crypto)); err != nil {
+	if err := spliced.Validate(testTreeValidationContext(t, crypto)); err != nil {
 		t.Fatalf("the committed fixture does not validate, so the refusal below could be it: %v", err)
 	}
 	// blanking node 3 widens the resolution of the root's left child from the single node 3 to
@@ -782,7 +1200,7 @@ func TestValidateRefusesASplicedSubtreeThatKeepsTheHashChain(t *testing.T) {
 		t.Fatalf("Sign: %v", err)
 	}
 
-	ctx := testTreeValidationContext(crypto)
+	ctx := testTreeValidationContext(t, crypto)
 	if err := spliced.validateStructure(); err != nil {
 		t.Fatalf("the spliced tree fails the structure check, so the refusal is not the splice: %v", err)
 	}
@@ -817,18 +1235,9 @@ func TestValidateAgainstContextChecksTheTreeHash(t *testing.T) {
 		t.Fatalf("NewCryptoProvider: %v", err)
 	}
 	tree, _ := newTestTree(t, crypto, 4)
-	treeHash, err := tree.TreeHash(crypto)
-	if err != nil {
-		t.Fatalf("TreeHash: %v", err)
-	}
-	gc := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     testGroupId(),
-		Epoch:       1,
-		TreeHash:    treeHash,
-	}
-	if err := tree.ValidateAgainstContext(testTreeValidationContext(crypto), gc); err != nil {
+	gc := testGroupContextFor(t, crypto, tree)
+	treeHash := cloneBytes(gc.TreeHash)
+	if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc); err != nil {
 		t.Fatalf("ValidateAgainstContext: %v", err)
 	}
 	// every byte of the digest and not the first one alone, so a comparison over a prefix is a
@@ -836,7 +1245,7 @@ func TestValidateAgainstContextChecksTheTreeHash(t *testing.T) {
 	for i := range treeHash {
 		gc.TreeHash = cloneBytes(treeHash)
 		gc.TreeHash[i] ^= 0xFF
-		if err := tree.ValidateAgainstContext(testTreeValidationContext(crypto), gc); !errors.Is(err, ErrTreeHashMismatch) {
+		if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc); !errors.Is(err, ErrTreeHashMismatch) {
 			t.Fatalf("byte %d of the pinned tree hash flipped: err = %v, want ErrTreeHashMismatch", i, err)
 		}
 	}
@@ -850,7 +1259,7 @@ func TestValidateAgainstContextChecksTheTreeHash(t *testing.T) {
 		{"a lengthened tree hash", append(cloneBytes(treeHash), 0)},
 	} {
 		gc.TreeHash = c.hash
-		if err := tree.ValidateAgainstContext(testTreeValidationContext(crypto), gc); !errors.Is(err, ErrTreeHashMismatch) {
+		if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc); !errors.Is(err, ErrTreeHashMismatch) {
 			t.Errorf("%s: err = %v, want ErrTreeHashMismatch", c.name, err)
 		}
 	}
@@ -875,21 +1284,252 @@ func TestValidateAgainstContextRunsEveryCheckValidateRuns(t *testing.T) {
 	if err := broken.SetLeaf(LeafIndex(1), duplicate); err != nil {
 		t.Fatalf("SetLeaf: %v", err)
 	}
-	// the group context pins the BROKEN tree honestly, so check 6 is satisfied and only the
-	// checks Validate makes can refuse it
-	treeHash, err := broken.TreeHash(crypto)
-	if err != nil {
-		t.Fatalf("TreeHash: %v", err)
-	}
-	gc := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     testGroupId(),
-		Epoch:       1,
-		TreeHash:    treeHash,
-	}
-	if err := broken.ValidateAgainstContext(testTreeValidationContext(crypto), gc); !errors.Is(err, errDuplicateEncryptionKey) {
+	// the group context pins the BROKEN tree honestly and agrees with the tree context about
+	// every fact check 0 reconciles, so checks 0 and 6 are both satisfied and only the checks
+	// Validate makes can refuse it
+	gc := testGroupContextFor(t, crypto, broken)
+	if err := broken.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc); !errors.Is(err, errDuplicateEncryptionKey) {
 		t.Fatalf("err = %v, want errDuplicateEncryptionKey", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// check 0: the facts the caller holds twice
+// ---------------------------------------------------------------------------
+
+// The pairs that share a Go type across the two structures and do NOT share a fact, each with
+// the reason it is not something ValidateAgainstContext could reconcile.
+//
+// An exemption table beside a derived class, on this package's own terms: the class below is
+// computed from the two struct types and cannot be understated by anybody's memory, and the
+// entries here are the places where the computation over-approximates. Each is expired by the
+// gate itself -- an entry naming a field the derivation no longer reaches fails there rather than
+// sitting in the table covering nothing.
+var groupContextFactsTheTreeContextDoesNotCarry = map[string]string{
+	"Epoch": "a uint64 like the two clocks, and nothing else. The tree carries no epoch and no rule " +
+		"of section 7.3 or 7.8 reads one; the epoch binding is the confirmation tag's, one door along",
+	"ConfirmedTranscriptHash": "a []byte like the group id, and nothing else. Nothing in a ratchet " +
+		"tree is derived from the transcript, and a tree validator that refused a mismatch here would " +
+		"be enforcing the key schedule's binding at the wrong door",
+}
+
+// TestEveryFactBothContextsCarryIsReconciled is check 0's class, computed rather than listed.
+//
+// ValidateAgainstContext is handed the group twice, and the two copies were compared nowhere: a
+// tree whose leaves were validated under one group id, ciphersuite or extensions vector while the
+// GroupContext pinned another was accepted with every check answering nil, because the tree hash
+// covers none of those fields and so check 6 cannot see the disagreement either.
+//
+// The class is DERIVED as every field of GroupContext whose Go type also occurs among
+// TreeValidationContext's fields, which is the widest reading of "a fact both structures carry"
+// that a program can take without being told what any field means. That over-approximates -- it
+// pairs the epoch with a clock and the transcript hash with the group id, on type alone -- and
+// the over-approximation is where the table above earns its place rather than where the gate
+// gets narrowed: every other member is DRIVEN, by moving the group context's copy away from the
+// one the leaves are judged against and requiring the tree to be refused.
+//
+// A hand written list would have held the three fields the review found and not the fourth this
+// derivation reaches; that is the failure this project has now shipped fourteen times, and it is
+// the reason the class is not written down here.
+func TestEveryFactBothContextsCarryIsReconciled(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	pinned := reflect.TypeOf(GroupContext{})
+	judged := reflect.TypeOf(TreeValidationContext{})
+	carried := map[reflect.Type]bool{}
+	for i := 0; i < judged.NumField(); i += 1 {
+		carried[judged.Field(i).Type] = true
+	}
+	class := []string{}
+	for i := 0; i < pinned.NumField(); i += 1 {
+		if carried[pinned.Field(i).Type] {
+			class = append(class, pinned.Field(i).Name)
+		}
+	}
+	t.Logf("%d group context field(s) whose type the tree context also carries: %v", len(class), class)
+	if len(class) == 0 {
+		t.Fatal("the class derived from the two struct types is empty, so nothing below is driven and this gate is reporting clean having read nothing")
+	}
+	// the expiry half, which is what keeps an exemption from outliving the thing it excuses
+	for name, why := range groupContextFactsTheTreeContextDoesNotCarry {
+		if !slices.Contains(class, name) {
+			t.Errorf("GroupContext.%s is exempted as %q and the derivation no longer reaches it; delete the entry", name, why)
+		}
+	}
+	if len(class) == len(groupContextFactsTheTreeContextDoesNotCarry) {
+		t.Fatal("every field of the derived class is exempted, so the sweep below drives nothing")
+	}
+	for _, name := range class {
+		if _, exempt := groupContextFactsTheTreeContextDoesNotCarry[name]; exempt {
+			continue
+		}
+		tree, _ := newTestTree(t, crypto, 4)
+		ctx := testTreeValidationContext(t, crypto)
+		gc := testGroupContextFor(t, crypto, tree)
+		if err := tree.ValidateAgainstContext(ctx, gc); err != nil {
+			t.Fatalf("the agreeing pair does not validate, so every refusal below could be it: %v", err)
+		}
+		field := reflect.ValueOf(gc).Elem().FieldByName(name)
+		other, ok := aValueOtherThan(field)
+		if !ok {
+			t.Errorf("GroupContext.%s is a %s and this test has no other value of that kind to move it to, so the field is being swept over rather than driven",
+				name, field.Type())
+			continue
+		}
+		field.Set(other)
+		err := tree.ValidateAgainstContext(ctx, gc)
+		if err == nil {
+			t.Errorf("the group context's %s is no longer the one the leaves were judged against and the tree was accepted anyway", name)
+			continue
+		}
+		// the two refusals this door can make about a fact the epoch does not pin. A third
+		// would mean the disagreement was reported as something else -- a leaf failure, a
+		// malformed tree -- which is a caller sent looking in the wrong place.
+		if !errors.Is(err, errGroupContextDisagreement) && !errors.Is(err, ErrTreeHashMismatch) {
+			t.Errorf("the group context's %s was moved and the tree was refused as %v, which is neither check 0's refusal nor check 6's",
+				name, err)
+		}
+	}
+}
+
+// aValueOtherThan is some value of the same type that is not the one it was handed.
+//
+// Generic over the kind rather than over the field, because naming the fields is what the gate
+// above is written not to do. A number moves by one and a vector grows by a zero element, and
+// both are enough to make two copies of one fact disagree -- what is NOT enough is a zero value,
+// which for the group id and the extensions vector is a shape a caller can legitimately hold and
+// would test the empty case instead of the disagreement.
+func aValueOtherThan(v reflect.Value) (reflect.Value, bool) {
+	switch v.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		out := reflect.New(v.Type()).Elem()
+		out.SetUint(v.Uint() + 1)
+		return out, true
+	case reflect.Slice:
+		// append rather than truncate, so a nil or empty vector moves too, and to a fresh
+		// backing array, so the copy the leaves are judged against is untouched
+		return reflect.Append(v, reflect.Zero(v.Type().Elem())), true
+	}
+	return reflect.Value{}, false
+}
+
+// TestValidateAgainstContextComparesEveryEntryOfTheExtensionsVectorAndBothHalvesOfEach is the
+// one member of check 0's class that the gate above cannot drive far enough.
+//
+// aValueOtherThan moves a vector by growing it, which is enough to make two copies disagree and
+// is caught by the LENGTH clause alone -- so the gate proves the extensions vector is reconciled
+// somehow, and says nothing about how deeply. Measured rather than reasoned: with the body
+// comparison deleted, the derived gate and every other test of this package still passed. A group
+// context whose policy body had been swapped for another of the same length, under the same code
+// point, was the tree's own vector as far as this door could tell.
+//
+// So the sweep is over every ENTRY and both HALVES of each entry, with the positions read off the
+// vector the fixture actually has rather than assumed to be one. Both halves are separately
+// reachable failures and the first entry cannot stand for the rest: entry zero is
+// required_capabilities, whose disagreement reconcileRequiredCapabilities would refuse on its own
+// account, so a test that judged only the first position would pass over a deleted type clause
+// and a deleted body clause together.
+//
+// The length halves are here too, in both directions, because they are the clause the loop stands
+// on: with the length guard gone, a vector shorter than the one the leaves were judged against is
+// walked to its own end and the entries past it are never compared at all.
+func TestValidateAgainstContextComparesEveryEntryOfTheExtensionsVectorAndBothHalvesOfEach(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 4)
+	if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), testGroupContextFor(t, crypto, tree)); err != nil {
+		t.Fatalf("the agreeing pair does not validate, so every refusal below could be it: %v", err)
+	}
+	entries := len(testTreeValidationContext(t, crypto).GroupExtensions)
+	if entries < 2 {
+		t.Fatalf("the fixture's group context carries %d extension(s), so a sweep over it says nothing about a comparison that reads one",
+			entries)
+	}
+	type move struct {
+		name  string
+		moves func(gc *GroupContext)
+	}
+	cases := []move{
+		{"a vector one entry shorter than the one the leaves were judged against", func(gc *GroupContext) {
+			gc.Extensions = gc.Extensions[:len(gc.Extensions)-1]
+		}},
+		{"a vector one entry longer than the one the leaves were judged against", func(gc *GroupContext) {
+			gc.Extensions = append(slices.Clone(gc.Extensions),
+				Extension{ExtensionType: ExtensionTypeApplicationId, ExtensionData: []byte("extra")})
+		}},
+	}
+	for at := 0; at < entries; at += 1 {
+		cases = append(cases,
+			move{fmt.Sprintf("entry %d carrying a different code point", at), func(gc *GroupContext) {
+				gc.Extensions[at].ExtensionType += 1
+			}},
+			move{fmt.Sprintf("entry %d carrying a different body", at), func(gc *GroupContext) {
+				// a fresh slice rather than a write through the one it points at, so the move
+				// cannot reach the copy the leaves are judged against
+				gc.Extensions[at].ExtensionData = append(cloneBytes(gc.Extensions[at].ExtensionData), 0x5A)
+			}})
+	}
+	for _, c := range cases {
+		gc := testGroupContextFor(t, crypto, tree)
+		c.moves(gc)
+		err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc)
+		if !errors.Is(err, errGroupContextDisagreement) {
+			t.Errorf("%s: err = %v, want errGroupContextDisagreement", c.name, err)
+		}
+	}
+}
+
+// TestValidateAgainstContextReconcilesTheRequiredCapabilitiesBody is the fourth fact both
+// structures carry and the only one that is not a field of either.
+//
+// required_capabilities is an entry INSIDE the extensions vector, and its body is what every leaf
+// of the group is held to -- ctx.RequiredCaps is the structure Capabilities.Supports is handed.
+// Pinning the vector byte for byte makes the two agree about the bytes and says nothing about the
+// structure the caller parsed them into, so the derived gate above cannot reach this one: there
+// is no GroupContext FIELD to move.
+//
+// Three ways two copies of one fact disagree, and all three are refusals a real caller can make:
+// requiring what the epoch does not carry, carrying what the leaves are not held to, and holding
+// a parse of the body that is not the body. The control is the agreeing pair, so a fixture that
+// had stopped validating cannot pass as three refusals that work.
+func TestValidateAgainstContextReconcilesTheRequiredCapabilitiesBody(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, _ := newTestTree(t, crypto, 4)
+	if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), testGroupContextFor(t, crypto, tree)); err != nil {
+		t.Fatalf("the agreeing pair does not validate, so every refusal below could be it: %v", err)
+	}
+	// the parse of the body that is not the body: one code point fewer, which is a requirement
+	// every leaf of this fixture still satisfies, so nothing but check 0 can refuse it
+	narrowed := testRequiredCapabilities()
+	narrowed.ExtensionTypes = withoutExtensionType(narrowed.ExtensionTypes, ExtensionTypeUrmessageOwnerSuccessor)
+	for _, c := range []struct {
+		name   string
+		breaks func(ctx *TreeValidationContext, gc *GroupContext)
+	}{
+		{"the leaves are held to a requirement the epoch does not carry", func(ctx *TreeValidationContext, gc *GroupContext) {
+			ctx.GroupExtensions = ctx.GroupExtensions[1:]
+			gc.Extensions = gc.Extensions[1:]
+		}},
+		{"the epoch carries a requirement the leaves are held to none of", func(ctx *TreeValidationContext, gc *GroupContext) {
+			ctx.RequiredCaps = nil
+		}},
+		{"the leaves are held to a parse of the body that is not the body", func(ctx *TreeValidationContext, gc *GroupContext) {
+			ctx.RequiredCaps = narrowed
+		}},
+	} {
+		ctx := testTreeValidationContext(t, crypto)
+		gc := testGroupContextFor(t, crypto, tree)
+		c.breaks(ctx, gc)
+		if err := tree.ValidateAgainstContext(ctx, gc); !errors.Is(err, errGroupContextDisagreement) {
+			t.Errorf("%s: err = %v, want errGroupContextDisagreement", c.name, err)
+		}
 	}
 }
 
@@ -919,7 +1559,7 @@ func TestValidateRefusesAMissingProviderAndAMissingContext(t *testing.T) {
 	if err := tree.ValidateAgainstContext(nil, &GroupContext{}); !errors.Is(err, ErrNilCryptoProvider) {
 		t.Errorf("ValidateAgainstContext(nil, gc): err = %v, want ErrNilCryptoProvider", err)
 	}
-	if err := tree.ValidateAgainstContext(testTreeValidationContext(crypto), nil); !errors.Is(err, ErrTreeHashMismatch) {
+	if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), nil); !errors.Is(err, ErrTreeHashMismatch) {
 		t.Errorf("ValidateAgainstContext with no group context: err = %v, want ErrTreeHashMismatch", err)
 	}
 }
@@ -986,7 +1626,7 @@ func TestValidateLeavesTheTreeExactlyAsItFoundIt(t *testing.T) {
 	}
 	for _, c := range cases {
 		before := treeSnapshot(c.tree)
-		err := c.tree.Validate(testTreeValidationContext(crypto))
+		err := c.tree.Validate(testTreeValidationContext(t, crypto))
 		if refused := err != nil; refused != c.refused {
 			t.Errorf("%s: err = %v, refused = %v, want refused = %v", c.name, err, refused, c.refused)
 		}
@@ -998,14 +1638,82 @@ func TestValidateLeavesTheTreeExactlyAsItFoundIt(t *testing.T) {
 				}
 			}
 		}
-		// and the same through the context door, which hashes the tree as well as walking it
-		gc := &GroupContext{TreeHash: bytes.Repeat([]byte{0x00}, 32)}
+		// and the same through the context door, which hashes the tree as well as walking it.
+		// The context AGREES with the tree context about every fact check 0 reconciles and
+		// pins a hash no tree has, so the refusal below is check 6's rather than check 0's --
+		// which is the refusal this test is about, and a disagreement here would have made
+		// every row of the table pass without the tree ever being hashed.
+		gc := testGroupContextFor(t, crypto, sound)
+		gc.TreeHash = bytes.Repeat([]byte{0x00}, 32)
 		before = treeSnapshot(c.tree)
-		if err := c.tree.ValidateAgainstContext(testTreeValidationContext(crypto), gc); err == nil {
+		if err := c.tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc); err == nil {
 			t.Errorf("%s: ValidateAgainstContext accepted a tree the group context does not pin", c.name)
 		}
 		if after := treeSnapshot(c.tree); !slices.Equal(before, after) {
 			t.Errorf("%s: ValidateAgainstContext changed the caller's tree", c.name)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the tree with nothing in it
+// ---------------------------------------------------------------------------
+
+// blankTreeOfWidth is a node array of the right shape with nothing in it.
+//
+// Built by poking the array for plantNode's reason and one more: NewRatchetTree is the one leaf
+// tree and there is no constructor for a wider EMPTY one, because no caller has a use for it --
+// which is exactly the input this test is about. Growing a real tree and then blanking every leaf
+// would go through Blank, which drops unmerged entries and is a different input.
+func blankTreeOfWidth(t testing.TB, leaves LeafCount) *RatchetTree {
+	t.Helper()
+	tree := &RatchetTree{nodes: make([]*Node, NodeWidth(leaves))}
+	if tree.LeafWidth() != leaves {
+		t.Fatalf("a %d node array is %d leaves wide, want %d", tree.NodeWidth(), tree.LeafWidth(), leaves)
+	}
+	if occupied := tree.NonBlankLeaves(); len(occupied) != 0 {
+		t.Fatalf("a freshly made blank array holds %v", occupied)
+	}
+	return tree
+}
+
+// TestValidateAcceptsATreeWithNoMembersAtEveryWidth records a decision rather than catching a bug.
+//
+// A tree with no non-blank leaf at all passes every one of the five checks, at every width, and
+// passes check 6 too against its own hash -- vacuously, each of them: the width still inverts,
+// the leaf sweep has nothing to judge, both key maps stay empty, no parent slot is occupied and
+// VerifyParentHashes has no claimant to find. Nothing in the repository said so. The commit that
+// added this file named the acceptance in its message and the message is not somewhere a later
+// task reads, so the only record of it was prose that had already scrolled past.
+//
+// It is asserted as ACCEPTANCE and not fixed as a refusal, deliberately. "A group has at least
+// one member" is a rule about a group and not about a node array; the tree a removal empties is a
+// legal intermediate, and a refusal here would surface as a decode failure at whichever door
+// reached it first. The door that owes the membership refusal is the one that turns a tree into a
+// group -- group.go's Welcome and snapshot paths -- and it does not exist yet. When it does, this
+// test is what tells whoever writes it that the tree layer will not have refused this for them.
+func TestValidateAcceptsATreeWithNoMembersAtEveryWidth(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	for _, leaves := range []LeafCount{1, 2, 4, 8} {
+		tree := blankTreeOfWidth(t, leaves)
+		if err := tree.Validate(testTreeValidationContext(t, crypto)); err != nil {
+			t.Errorf("%d leaves, none of them occupied: Validate = %v, want nil -- if the tree layer has taken on the membership rule, group.go must stop being told it owns it",
+				leaves, err)
+			continue
+		}
+		gc := testGroupContextFor(t, crypto, tree)
+		if err := tree.ValidateAgainstContext(testTreeValidationContext(t, crypto), gc); err != nil {
+			t.Errorf("%d leaves, none of them occupied, against a group context pinning its own hash: err = %v, want nil",
+				leaves, err)
+		}
+		// and the hash it is pinned by is a real one rather than an accident of the empty
+		// array, so the acceptance above is check 6 agreeing and not check 6 comparing two
+		// absent values
+		if len(gc.TreeHash) == 0 {
+			t.Errorf("%d leaves: the empty tree hashes to nothing at all, so check 6 above compared two absent values", leaves)
 		}
 	}
 }

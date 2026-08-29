@@ -33,6 +33,8 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // errDuplicateSignatureKey and errDuplicateEncryptionKey are ValSem101 and ValSem103 in the
@@ -55,6 +57,21 @@ var (
 	errDuplicateSignatureKey  = errors.New("mls: two leaves of the tree publish the same signature key")
 	errDuplicateEncryptionKey = errors.New("mls: two nodes of the tree publish the same encryption key")
 )
+
+// errGroupContextDisagreement is check 0's refusal: the caller handed ValidateAgainstContext the
+// same fact twice and the two copies do not agree.
+//
+// It is NOT one of the validation plan's catalogued names and no ValSem states it, which is why
+// it carries no stand in comment of the kind the pair above carry. The rule exists because of a
+// shape this profile's own API has rather than a shape the RFC has: no other implementation
+// hands a tree validator the group's ciphersuite, group id and extensions a second time, so
+// nobody else has two copies that can disagree. This package does, and a second copy that
+// nothing compares is a second copy that can be wrong.
+//
+// Unexported on the same terms as the two above -- every consumer of it in the tasks after this
+// one is inside package mls -- so if the validation plan ever does catalogue this rule, the swap
+// is a rename rather than a second public declaration site.
+var errGroupContextDisagreement = errors.New("mls: the tree validation context and the group context disagree about the group")
 
 // TreeValidationContext is everything a whole tree check needs that is not in the tree.
 //
@@ -99,6 +116,29 @@ type TreeValidationContext struct {
 // front of it: a node array of nothing is not 2n-1 for any n, so the empty tree and the
 // truncated tree are one condition and a local check for the first would be a branch no input
 // can reach.
+//
+// It OVERLAPS readNodeArray, and that overlap is the one the header does NOT cover: the
+// paragraph about section 7.9.2 says why a rule is not restated here, and this is the one rule
+// that is. Both doors invert the width through LeafCountFromNodeWidth and IsFullLeafCount, and
+// both refuse a leaf typed node at an odd index -- the same two shared helpers and the same
+// clause, so there is no second derivation here that can drift from the decoder's. What the two
+// do not share is the half each ADDS, and neither is the authority for the other's:
+//
+//   - this door adds the BODY half. readNodeArray reads the declared NodeType and never asks
+//     which of Leaf and Parent is populated, because it decoded the body that type selected. A
+//     tree that reached this package any other way -- built through the setters, cloned, lifted
+//     out of a connect/message snapshot record -- can hold a node whose type and body disagree,
+//     and every reader of that node resolves it differently depending on which field it
+//     consults: the tree hash reads one, Resolution the other.
+//   - readNodeArray adds ValSem300's trailing blank rule, which this door deliberately drops.
+//     That rule is stated over the ratchet_tree extension's stripped array; by the time a tree
+//     is a node array in memory it has been extended to its full width, so a trailing blank
+//     here is an ordinary blank leaf and refusing it would refuse every group whose last member
+//     was removed.
+//
+// So a tree that arrived by DECODE has been past both doors and a tree that arrived any other
+// way has been past only this one, which is why neither can be deleted in favour of the other.
+// TestValidateRefusesANodeThatIsBothKindsOrNeither is the half only this door holds.
 func (self *RatchetTree) validateStructure() error {
 	width := self.NodeWidth()
 	leafWidth, err := LeafCountFromNodeWidth(width)
@@ -146,14 +186,30 @@ func (self *RatchetTree) validateStructure() error {
 // the one rule of section 7.3 this call site cannot state. A settled tree legally holds all
 // three sources at once -- key_package under a member who was added and has not committed since,
 // update under one who refreshed itself, commit under whoever last committed a path -- so there
-// is no single source a whole tree sweep could expect. What survives the inference is every
-// other rule, and in particular the signature BINDING: signatureContent puts the group id and
-// the leaf index into the preimage under update and commit, so a leaf lifted from another group,
-// or from another index of this one, is refused here whichever source it claims. An unknown
-// source is refused too, by marshalCore, which is why the self comparison is not a hole: the
-// preimage for a fourth source cannot be built at all. What is given up is the ability to say
-// "this position takes commit", which is a per position rule the update path and the proposal
-// validator state at their own doors, where the position is known.
+// is no single source a whole tree sweep could expect.
+//
+// What survives the inference is every other rule, and the signature BINDING is the one to read
+// twice, because it is NOT uniform across the three sources. signatureContent puts the group id
+// and the leaf index into the preimage under update and commit, so a leaf of either of those
+// sources, lifted from another group or from another index of this one, is refused here. Under
+// key_package that arm of the section 7.2 select is EMPTY -- no group id and no leaf index -- so
+// a key_package leaf verifies at every index of every group, and this door accepts it wherever
+// it sits. That is RFC 9420 as written and not a defect of this file; it is written down here
+// because it is what makes the inference a COST rather than a free choice, and because a reader
+// deciding whether a per position source rule is still owed would otherwise have to reconstruct
+// it from leaf_node.go's select.
+// TestTheIndexAndGroupBindingIsUpdateAndCommitsAndNotKeyPackages measures both halves of it.
+//
+// What holds a key_package leaf in place instead is every rule that is not a signature: check 3
+// refuses a repeated signature key, so one signed leaf cannot occupy two positions at once, and
+// an expired one is refused by the lifetime clause below. What is still OWED is the per position
+// source rule -- "this position takes commit" -- which the update path and the proposal
+// validator state at their own doors, where the position's history is known and where a
+// key_package leaf turning up at a position that has just committed is refusable. This door
+// cannot state it and does not pretend to.
+//
+// An unknown source is refused too, by marshalCore, which is why the self comparison is not a
+// hole: the preimage for a fourth source cannot be built at all.
 func (self *RatchetTree) validateLeaves(ctx *TreeValidationContext) error {
 	for i := uint32(0); i < uint32(self.LeafWidth()); i += 1 {
 		leaf := self.Leaf(LeafIndex(i))
@@ -312,14 +368,20 @@ func unmergedLeavesListLeaf(leaves []LeafIndex, leaf LeafIndex) bool {
 // its position takes, so every check after it may read self.nodes[x] without asking again; and
 // the parent hash sweep is LAST because it is the only check that hashes, so a tree refused for
 // any cheaper reason never pays for it.
+//
+// A tree with NO non-blank leaf at all is ACCEPTED here, at every width, and that is recorded
+// rather than left to be found. Every check above is vacuous on it: the width still inverts, the
+// leaf sweep has nothing to judge, both key maps stay empty, no parent slot is occupied and
+// VerifyParentHashes has no claimant to find. It is not a gap in the five -- "a group has at
+// least one member" is a rule about a GROUP and not about a node array, and the tree a removal
+// empties is a legal intermediate that a refusal here would turn into a decode failure. The door
+// that owes the refusal is the one that turns a tree into a group, which is group.go's Welcome
+// and snapshot paths, and it does not exist yet.
+// TestValidateAcceptsATreeWithNoMembersAtEveryWidth is what makes that acceptance a decision
+// somebody wrote down rather than a hole nothing names.
 func (self *RatchetTree) Validate(ctx *TreeValidationContext) error {
-	// a nil context is a context whose provider is nil, and it gets the refusal a nil provider
-	// gets, for LeafNode.Validate's reason: the two must not answer differently about the same
-	// missing thing. Refused before any node is read, which is the only order that does not
-	// dereference it.
-	if ctx == nil || ctx.Crypto == nil {
-		return fmt.Errorf("%w: every leaf signature and every parent hash of this tree is taken through it",
-			ErrNilCryptoProvider)
+	if err := usableValidationContext(ctx); err != nil {
+		return err
 	}
 	if err := self.validateStructure(); err != nil {
 		return err
@@ -336,12 +398,138 @@ func (self *RatchetTree) Validate(ctx *TreeValidationContext) error {
 	return self.VerifyParentHashes(ctx.Crypto)
 }
 
-// ValidateAgainstContext is Validate plus check 6: this tree is the tree the GroupContext pinned.
+// usableValidationContext is the refusal a missing provider gets, in the one place both doors
+// reach it from.
+//
+// One spelling and not two. ValidateAgainstContext has to make this refusal BEFORE it reads
+// ctx.Suite for check 0, so it can no longer inherit Validate's; and a second copy of the
+// refusal is a second thing that can come to answer differently about the same missing thing,
+// which is exactly the failure LeafNode.Validate's own nil check is written to avoid one layer
+// down. A nil context is a context whose provider is nil and gets the same answer, so
+// Validate(nil) and Validate(&TreeValidationContext{}) cannot diverge.
+func usableValidationContext(ctx *TreeValidationContext) error {
+	if ctx == nil || ctx.Crypto == nil {
+		return fmt.Errorf("%w: every leaf signature and every parent hash of this tree is taken through it",
+			ErrNilCryptoProvider)
+	}
+	return nil
+}
+
+// reconcileWithGroupContext is check 0: the facts these two structures BOTH carry agree.
+//
+// ValidateAgainstContext is handed the group twice. GroupContext carries the group id, the
+// ciphersuite and the extensions vector; TreeValidationContext restates all three, and it is the
+// restatement the leaves are judged against -- validateLeaves passes ctx.GroupId into every
+// signature preimage, ctx.Suite into every capabilities check and ctx.GroupExtensions into
+// section 13.4's clause. Nothing compared the two copies, and the TREE HASH CANNOT: it is a hash
+// of nodes and covers none of those three fields, so the two could disagree arbitrarily and
+// check 6 would still answer nil. A tree whose leaves were validated under one group id while
+// the epoch pinned another was accepted with every check having answered yes.
+//
+// That is ValidateAgainstContext's own argument turned on the other input. Its doc says a tree
+// that validates on its own and hashes to something else is a different group's tree; a tree
+// whose leaves were judged against a different group's facts is the same statement, and this
+// function is the only place in the package holding both values at once.
+//
+// It runs BEFORE Validate, which is the order the rest of this file keeps: three comparisons and
+// one vector walk against a signature verification per leaf and a hash per parent, and a caller
+// that handed in two disagreeing structures has a bug no amount of verifying changes the answer
+// to.
+func reconcileWithGroupContext(ctx *TreeValidationContext, gc *GroupContext) error {
+	if ctx.Suite != gc.CipherSuite {
+		return fmt.Errorf("%w: the leaves are judged against ciphersuite %#04x and the epoch pins %#04x",
+			errGroupContextDisagreement, uint16(ctx.Suite), uint16(gc.CipherSuite))
+	}
+	// through subtle for the reason the tree hash comparison below is written that way: every
+	// comparison in this package that decides whether a structure is ADOPTED is spelled the one
+	// way, so no later reader has to work out which of them were the safe ones.
+	if subtle.ConstantTimeCompare(ctx.GroupId, gc.GroupId) != 1 {
+		return fmt.Errorf("%w: the leaves are judged under group id %x and the epoch pins %x",
+			errGroupContextDisagreement, ctx.GroupId, gc.GroupId)
+	}
+	// EVERY entry and in order, because ctx.GroupExtensions is not a set resembling the group's
+	// vector -- it IS that vector, and section 13.4's clause is stated over the whole of it. A
+	// comparison of lengths alone, or of the first entry, would let a swapped pair or an altered
+	// body through, and a body is what carries required_capabilities.
+	//
+	// The length refusal is also what the loop below STANDS ON: it indexes both vectors through
+	// one range, so it is in bounds because the lengths were equal three lines earlier and for
+	// no other reason. Moving or weakening this comparison is not a laxer check, it is a panic.
+	if len(ctx.GroupExtensions) != len(gc.Extensions) {
+		return fmt.Errorf("%w: the leaves are judged against %d group extension(s) and the epoch pins %d",
+			errGroupContextDisagreement, len(ctx.GroupExtensions), len(gc.Extensions))
+	}
+	for i := range gc.Extensions {
+		if ctx.GroupExtensions[i].ExtensionType != gc.Extensions[i].ExtensionType {
+			return fmt.Errorf("%w: group extension %d is %#04x to the leaves and %#04x to the epoch",
+				errGroupContextDisagreement, i, uint16(ctx.GroupExtensions[i].ExtensionType),
+				uint16(gc.Extensions[i].ExtensionType))
+		}
+		if subtle.ConstantTimeCompare(ctx.GroupExtensions[i].ExtensionData,
+			gc.Extensions[i].ExtensionData) != 1 {
+			return fmt.Errorf("%w: the body of group extension %d is %x to the leaves and %x to the epoch",
+				errGroupContextDisagreement, i, ctx.GroupExtensions[i].ExtensionData,
+				gc.Extensions[i].ExtensionData)
+		}
+	}
+	return reconcileRequiredCapabilities(ctx.RequiredCaps, gc.Extensions)
+}
+
+// reconcileRequiredCapabilities is the fourth fact both structures carry, and the only one that
+// is a BODY inside the vector rather than a field beside it.
+//
+// Pinning the extensions vector byte for byte above makes the two agree about the required
+// capabilities BYTES. It says nothing about the structure the caller parsed those bytes into,
+// and that structure is what every leaf is actually held to: ctx.RequiredCaps is what reaches
+// Capabilities.Supports, so a caller that passed nil for a group whose context requires an
+// extension gets every leaf admitted without the requirement being applied at all -- a member
+// admitted who cannot read what the group sends, which is the consequence section 11.1 states
+// the rule for.
+//
+// Reconciled by ENCODING the structure and comparing bytes rather than by decoding the body,
+// because encoding is total and decoding is not: a malformed body would otherwise turn a
+// disagreement into a decode error attributed to this check, and a required_capabilities carried
+// with an empty body -- which is not three empty vectors, it is nothing -- would need a case of
+// its own. Absence is reconciled too and in both directions: a nil rc is "requires nothing" and
+// an absent extension is the same statement, so the two must not be able to differ.
+//
+// FindExtension answers the FIRST entry of the type, which is the value section 13's consumers
+// read; a vector carrying two is refused by ValSem209 at the door that owns repeated extension
+// types, not here.
+func reconcileRequiredCapabilities(required *RequiredCapabilities, groupExtensions []Extension) error {
+	body, carried := FindExtension(groupExtensions, ExtensionTypeRequiredCapabilities)
+	if !carried {
+		if required != nil {
+			return fmt.Errorf("%w: the leaves are held to a required_capabilities the epoch does not carry",
+				errGroupContextDisagreement)
+		}
+		return nil
+	}
+	if required == nil {
+		return fmt.Errorf("%w: the epoch carries a required_capabilities and the leaves are held to none",
+			errGroupContextDisagreement)
+	}
+	encoded, err := syntax.Marshal(required)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare(encoded, body) != 1 {
+		return fmt.Errorf("%w: the leaves are held to a required_capabilities of %x and the epoch carries %x",
+			errGroupContextDisagreement, encoded, body)
+	}
+	return nil
+}
+
+// ValidateAgainstContext is Validate plus check 0 and check 6: the facts the caller holds twice
+// agree, and this tree is the tree the GroupContext pinned.
 //
 // The tree hash is what every epoch secret and every signature of the epoch is bound to, so a
 // tree that validates on its own and hashes to something else is a DIFFERENT group's tree,
 // however sound it is. Without this a joiner handed a well formed tree from a fork would derive
 // an epoch nobody else is in and report nothing at all.
+//
+// Check 0 is the same argument made about the facts rather than about the nodes, and it runs
+// first; see reconcileWithGroupContext for why the tree hash cannot stand in for it.
 func (self *RatchetTree) ValidateAgainstContext(ctx *TreeValidationContext, gc *GroupContext) error {
 	// no context is no pin, and a tree with nothing to be checked against has not passed this
 	// check, it has skipped it. Refused rather than dereferenced, so a missing argument cannot
@@ -349,6 +537,12 @@ func (self *RatchetTree) ValidateAgainstContext(ctx *TreeValidationContext, gc *
 	if gc == nil {
 		return fmt.Errorf("%w: there is no group context for this tree to be checked against",
 			ErrTreeHashMismatch)
+	}
+	if err := usableValidationContext(ctx); err != nil {
+		return err
+	}
+	if err := reconcileWithGroupContext(ctx, gc); err != nil {
+		return err
 	}
 	if err := self.Validate(ctx); err != nil {
 		return err

@@ -2721,28 +2721,6 @@ func extensionBodyByteRunsReportedByEitherRule(t *testing.T) []string {
 	return slices.Compact(reported)
 }
 
-// TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse is the
-// measurement behind the PskSecret entry above, so that entry is evidence and not an assertion.
-//
-// The four entries beside it are judgements about a byte run -- a digest is not a body -- and
-// there is nothing more to measure about them. This one is a claim about the CALL GRAPH: that
-// PskSecret reaches the encoder only because one name in its body is spelled the same as a method
-// of another type. A claim about the graph can be checked against the graph, and an exemption that
-// can be checked and is not is the shape this package keeps finding in other people's tables.
-//
-// Two clauses, and each expires the entry on a different change. PskSecret must invoke no encoder
-// helper of its own, so an edit that made it genuinely assemble a body fails here rather than
-// being waved through by a table entry written before that was true. And every name it invokes
-// that the closure holds must be one this package declares more than once, so a reach through an
-// UNAMBIGUOUS name -- a real edge the closure got right -- fails here too.
-//
-// What it does not do is make the closure right. The closure attributes a call on a foreign
-// expression to every declaration sharing the callee's spelling, which is the same base name
-// conflation theNamesInvokingTheStorage's own doc records being fixed once already, one level in:
-// that fix separated a field read from a method call, and what is left is method from method.
-// Fixing it properly wants the receiver at the call site, which wants the type checker, which the
-// synthetic control this gate is held by cannot be run through. So the over-approximation stays
-// and this is what keeps its one consequence honest.
 // TestEveryExtensionBodyByteRunExemptionIsStillReported is the expiry half of the table above.
 //
 // An exemption that covers nothing is a hole with a name on it -- the same argument
@@ -3574,6 +3552,28 @@ func TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere(t
 	}
 }
 
+// TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse is the
+// measurement behind the PskSecret entry above, so that entry is evidence and not an assertion.
+//
+// The four entries beside it are judgements about a byte run -- a digest is not a body -- and
+// there is nothing more to measure about them. This one is a claim about the CALL GRAPH: that
+// PskSecret reaches the encoder only because one name in its body is spelled the same as a method
+// of another type. A claim about the graph can be checked against the graph, and an exemption that
+// can be checked and is not is the shape this package keeps finding in other people's tables.
+//
+// Two clauses, and each expires the entry on a different change. PskSecret must invoke no encoder
+// helper of its own, so an edit that made it genuinely assemble a body fails here rather than
+// being waved through by a table entry written before that was true. And every name it invokes
+// that the closure holds must be one this package declares more than once, so a reach through an
+// UNAMBIGUOUS name -- a real edge the closure got right -- fails here too.
+//
+// What it does not do is make the closure right. The closure attributes a call on a foreign
+// expression to every declaration sharing the callee's spelling, which is the same base name
+// conflation theNamesInvokingTheStorage's own doc records being fixed once already, one level in:
+// that fix separated a field read from a method call, and what is left is method from method.
+// Fixing it properly wants the receiver at the call site, which wants the type checker, which the
+// synthetic control this gate is held by cannot be run through. So the over-approximation stays
+// and this is what keeps its one consequence honest.
 func TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse(t *testing.T) {
 	const excused = "PskSecret"
 	if _, listed := extensionBodyByteRunsThatAreNotBodies[excused]; !listed {

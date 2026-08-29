@@ -847,6 +847,24 @@ func (self *RatchetTree) UnmarshalMLS(r *syntax.Reader) error {
 // The array is walked here rather than through syntax.ReadVector because the element decoder
 // needs the node INDEX to check type against position and ReadVector's element callback does
 // not carry one. That is the sanctioned form for a heterogeneous vector.
+//
+// Two of the rules below are also stated by tree_sync.go's validateStructure, and the two doors
+// are NOT the same door. Both invert the width through LeafCountFromNodeWidth and IsFullLeafCount
+// and both refuse a leaf typed node at an odd index, through the same shared helpers rather than
+// through two derivations of the arithmetic -- so there is nothing here that can drift from the
+// validator. Where they part is the half each adds, and each half is reachable only at its own
+// door:
+//
+//   - this one adds ValSem300, the trailing blank rule, which is stated over the STRIPPED array
+//     a ratchet_tree extension travels as. It has no meaning once the array has been extended to
+//     its full width, which is why validateStructure drops it rather than restating it.
+//   - validateStructure adds the body half -- exactly one of Leaf and Parent populated, matching
+//     the declared type -- which cannot fire here because this decoder populated the body the
+//     type selected. It fires for a tree that reached the package any other way: through the
+//     setters, through Clone, or out of a connect/message snapshot record.
+//
+// So a decoded tree has been past both and every other tree has been past only the validator,
+// and neither door is the one the other can be deleted in favour of.
 func (self *RatchetTree) readNodeArray(body *syntax.Reader) error {
 	present := []positionedNode{}
 	entries := 0
