@@ -28,6 +28,7 @@ import (
 	"errors"
 	"go/ast"
 	"go/token"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -472,19 +473,26 @@ func TestEveryDeclarationRefusingANilArgumentAnswersItsOwnSentinel(t *testing.T)
 			t.Logf("%s answers %s, which is not declared as errors.New of a literal, so this row's value is joined to that name by nothing",
 				refusal.key(), refusal.sentinel)
 		}
-		answered := nilArgumentRefusalOf(t, refusal.key(), row)
-		if !errors.Is(answered, row.sentinel) {
-			t.Errorf("%s handed a nil %s answered %v, want %v",
-				refusal.declaration, refusal.parameter, answered, row.sentinel)
-		}
 	}
 	if joined == 0 {
 		t.Error("no row was joined to the sentinel its declaration names, so the value half of this gate is held by nothing")
 	}
-	for key := range rows {
+	// every row is CALLED, whether or not the class still names it. A guard deleted from the
+	// source leaves its row orphaned, and an orphan reported without being run says the table
+	// is out of date rather than that the declaration now panics -- which is the fact worth
+	// having. Measured: with the nil authenticated content guard deleted, the join alone
+	// reported an unmatched row and nothing observed the nil dereference it had become.
+	for _, key := range slices.Sorted(maps.Keys(rows)) {
+		row := rows[key]
 		if !slices.Contains(keys, key) {
 			t.Errorf("nilArgumentRows names %s, and no declaration of this package refuses a nil argument under that name",
 				key)
+		}
+		if row.sentinel == nil {
+			continue
+		}
+		if answered := nilArgumentRefusalOf(t, key, row); !errors.Is(answered, row.sentinel) {
+			t.Errorf("%s handed nil answered %v, want %v", key, answered, row.sentinel)
 		}
 	}
 }
