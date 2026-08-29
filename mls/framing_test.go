@@ -44,9 +44,20 @@ const (
 // the class every table in this file is a claim about
 // ---------------------------------------------------------------------------
 
-// framingFile and framingTestFile are the two files the derivations below read. Named rather
-// than spelled at each call site, because a gate whose file no longer exists derives the empty
-// set, and the empty set agrees with an empty table.
+// framingFile and framingTestFile are named rather than spelled at each call site, because a
+// gate whose file no longer exists derives the empty set, and the empty set agrees with an
+// empty table.
+//
+// framingFile is the file the three registry TYPES are declared in, and that is now ALL it is.
+// It used to be the derivation root of every gate below as well -- the switches, the codec
+// methods, the compile time pins -- which made each of them a claim about one FILE where the
+// claim being made is about the package. framing_preimage.go's confirmedTranscriptHashInput
+// reads and writes the same wire format registry AuthenticatedContent does, and it was outside
+// all of those gates at once: both of its registry switches could be deleted whole with
+// ./mls/... and ./message/... byte identically green, while the byte identical switch one file
+// over is caught by two of them. Measured, not supposed. The file SET is derived now, by
+// framingRegistryFunctions below, off which functions of this package's production source
+// actually compute with a framing registry.
 const (
 	framingFile     = "framing.go"
 	framingTestFile = "framing_test.go"
@@ -103,6 +114,120 @@ func framingRegistries(t *testing.T) []string {
 			framingFile)
 	}
 	return declared
+}
+
+// framingProductionFiles is every production .go file of package mls, read off the directory.
+//
+// The directory rather than a list, and it is the root of the class every gate below sweeps. A
+// class that is "the files somebody remembered" is a class a new file joins by not being
+// remembered, which is this project's most repeated failure and was this file's own.
+func framingProductionFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	found := []string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		found = append(found, name)
+	}
+	slices.Sort(found)
+	if len(found) == 0 {
+		t.Fatal("no production file was read out of the package directory, so every derivation below would run over the empty set")
+	}
+	return found
+}
+
+// framingRegistryIdentifiers is every identifier whose appearance inside a function makes that
+// function a user of a framing registry: the registry TYPE names, and every package level
+// constant declared at one of those types.
+//
+// Both halves, because either alone understates the class. A codec can name the type and no
+// constant -- a decoder that reads a uint16 and converts it -- and it can name constants and no
+// type, which is the shape of every switch in this package. The union is what these gates are
+// about.
+func framingRegistryIdentifiers(t *testing.T) map[string]bool {
+	t.Helper()
+	found := map[string]bool{}
+	for _, registry := range framingRegistries(t) {
+		found[registry] = true
+		for name := range registryConstantsOfType(t, registry) {
+			found[name] = true
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("no framing registry identifier was derived, so the function set below would be empty and every gate over it would report green having read nothing")
+	}
+	return found
+}
+
+// mentionsAnyIdentifier reports whether a syntax tree names any of the given identifiers.
+func mentionsAnyIdentifier(node ast.Node, wanted map[string]bool) bool {
+	found := false
+	ast.Inspect(node, func(inner ast.Node) bool {
+		if found {
+			return false
+		}
+		if name, isName := inner.(*ast.Ident); isName && wanted[name.Name] {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// framingRegistryFunction is one function of this package's production source that computes
+// with a framing registry: its qualified name, the file that declares it, and its declaration.
+type framingRegistryFunction struct {
+	name string
+	file string
+	decl *ast.FuncDecl
+}
+
+// framingRegistryFunctions is that class, derived over the whole package rather than over one
+// file.
+//
+// The SIGNATURE and the BODY are read and nothing else is -- not the doc comment, not the rest
+// of the file -- because what puts a function in this class is that it computes with a registry,
+// not that it sits beside something that does. framing_errors.go spends nine lines on
+// ErrUnknownContentType in prose and returns it nowhere, which is exactly the false positive a
+// file level text search reports and the one filesRaising further down is written against.
+func framingRegistryFunctions(t *testing.T) []framingRegistryFunction {
+	t.Helper()
+	wanted := framingRegistryIdentifiers(t)
+	found := []framingRegistryFunction{}
+	for _, file := range framingProductionFiles(t) {
+		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, declaration := range parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			if !mentionsAnyIdentifier(function.Type, wanted) && !mentionsAnyIdentifier(function.Body, wanted) {
+				continue
+			}
+			name := function.Name.Name
+			if function.Recv != nil && len(function.Recv.List) > 0 {
+				name = receiverTypeName(function.Recv.List[0].Type) + "." + name
+			}
+			found = append(found, framingRegistryFunction{name: name, file: file, decl: function})
+		}
+	}
+	slices.SortFunc(found, func(a framingRegistryFunction, b framingRegistryFunction) int {
+		return strings.Compare(a.name, b.name)
+	})
+	if len(found) == 0 {
+		t.Fatal("no function of this package's production source computes with a framing registry, and framing.go alone declares nine, so every gate below would run over the empty set")
+	}
+	return found
 }
 
 // framingRegistryBits is the width the type checker reads off a registry's own declaration. It
@@ -2291,6 +2416,7 @@ func authDataFieldStarts(t *testing.T, golden []byte) []int {
 // sweep below is keyed on this derivation rather than standing beside it.
 type framingRegistrySwitch struct {
 	method   string
+	file     string
 	registry string
 	tag      string
 	refusal  ast.Expr
@@ -2303,7 +2429,7 @@ type framingRegistrySwitch struct {
 // parameter or a field selector, and typing either needs the function bodies the package type
 // check deliberately skips; the cases are package level constants, whose types that check
 // already holds. They are the code points themselves, which is the thing being claimed about.
-func registryOfSwitch(t *testing.T, statement *ast.SwitchStmt, registries []string) string {
+func registryOfSwitch(t *testing.T, file string, statement *ast.SwitchStmt, registries []string) string {
 	t.Helper()
 	scope := typeCheckedPackage(t).Scope()
 	found := ""
@@ -2327,7 +2453,7 @@ func registryOfSwitch(t *testing.T, statement *ast.SwitchStmt, registries []stri
 			}
 			if found != "" && found != named.Obj().Name() {
 				t.Fatalf("one switch in %s names constants of both %s and %s, so which registry it discriminates on cannot be derived",
-					framingFile, found, named.Obj().Name())
+					file, found, named.Obj().Name())
 			}
 			found = named.Obj().Name()
 		}
@@ -2335,18 +2461,61 @@ func registryOfSwitch(t *testing.T, statement *ast.SwitchStmt, registries []stri
 	return found
 }
 
-// returnedExpression is the single value a return statement returns, or nil for anything that is
-// not one. A `return nil` is reported as none, so a search for the refusal a switch falls
-// through to does not stop at the success path of a case clause.
+// returnedExpression is the error a return statement returns, or nil for anything that is not
+// one. A `return nil` is reported as none, so a search for the refusal a switch falls through to
+// does not stop at the success path of a case clause.
+//
+// The LAST result rather than the only one, and the difference is measured. Every codec in this
+// package returns one value and a reader written for that shape found nothing in
+// ratchetTypeOf's `return 0, fmt.Errorf(...)` -- so secret_tree.go's content type refusal was
+// read as a switch that falls out of the bottom of itself, which is the failure this gate
+// exists to report and was here a failure of the reader. Every function this gate sweeps
+// returns its error last, which is the language's own convention, and `return v, nil` still
+// reports none because the last result is the nil.
 func returnedExpression(statement ast.Stmt) ast.Expr {
 	returned, isReturn := statement.(*ast.ReturnStmt)
-	if !isReturn || len(returned.Results) != 1 {
+	if !isReturn || len(returned.Results) == 0 {
 		return nil
 	}
-	if name, isName := returned.Results[0].(*ast.Ident); isName && name.Name == "nil" {
+	last := returned.Results[len(returned.Results)-1]
+	if name, isName := last.(*ast.Ident); isName && name.Name == "nil" {
 		return nil
 	}
-	return returned.Results[0]
+	return last
+}
+
+// TestTheRefusalReaderReadsTheErrorResultAndNotTheSuccessOne is that reader's control, in both
+// directions for the reason every reader in this file carries one. One that read the first
+// result would report a case clause's success path as the switch's refusal; one that insisted
+// on a single result reads a two result refusal as no refusal at all, which is what it did.
+func TestTheRefusalReaderReadsTheErrorResultAndNotTheSuccessOne(t *testing.T) {
+	for _, one := range []struct {
+		source  string
+		refusal string
+	}{
+		{"return fmt.Errorf(\"%w: %d\", ErrUnknownContentType, contentType)", "fmt.Errorf(\"%w: %d\", ErrUnknownContentType, contentType)"},
+		{"return 0, fmt.Errorf(\"%w: content type %d\", ErrUnknownContentType, contentType)", "fmt.Errorf(\"%w: content type %d\", ErrUnknownContentType, contentType)"},
+		{"return ErrContentArmMismatch", "ErrContentArmMismatch"},
+		// the success paths, which are not refusals however many results they carry
+		{"return nil", ""},
+		{"return RatchetApplication, nil", ""},
+		// and a statement that is not a return at all
+		{"self.A = 1", ""},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "control.go",
+			"package control\nfunc f() { "+one.source+" }\n", parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %q: %v", one.source, err)
+		}
+		body := parsed.Decls[0].(*ast.FuncDecl).Body
+		got := ""
+		if expression := returnedExpression(body.List[0]); expression != nil {
+			got = types.ExprString(expression)
+		}
+		if got != one.refusal {
+			t.Errorf("%q read as the refusal %q, want %q", one.source, got, one.refusal)
+		}
+	}
 }
 
 // defaultClauseRefusal is the error a switch returns from its default clause, if it has one.
@@ -2368,26 +2537,20 @@ func defaultClauseRefusal(statement *ast.SwitchStmt) ast.Expr {
 	return nil
 }
 
-// framingRegistrySwitches derives every registry switch of framing.go, keyed by the method that
-// holds it.
+// framingRegistrySwitches derives every registry switch this package's production source holds,
+// keyed by the function that holds it.
+//
+// The scan set is framingRegistryFunctions and therefore the whole package. It used to be
+// framing.go, which is what let framing_preimage.go's two wire format switches be deleted whole
+// with the suite green, and which also left secret_tree.go's content type switch -- a refusal a
+// peer reaches by sending an undefined content type -- outside every gate here.
 func framingRegistrySwitches(t *testing.T) map[string]framingRegistrySwitch {
 	t.Helper()
 	registries := framingRegistries(t)
-	parsed, err := parser.ParseFile(token.NewFileSet(), framingFile, nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", framingFile, err)
-	}
 	found := map[string]framingRegistrySwitch{}
-	for _, declaration := range parsed.Decls {
-		function, isFunction := declaration.(*ast.FuncDecl)
-		if !isFunction || function.Body == nil {
-			continue
-		}
-		method := function.Name.Name
-		if function.Recv != nil && len(function.Recv.List) > 0 {
-			method = receiverTypeName(function.Recv.List[0].Type) + "." + method
-		}
-		ast.Inspect(function.Body, func(node ast.Node) bool {
+	for _, function := range framingRegistryFunctions(t) {
+		method, file := function.name, function.file
+		ast.Inspect(function.decl.Body, func(node ast.Node) bool {
 			block, isBlock := node.(*ast.BlockStmt)
 			if !isBlock {
 				return true
@@ -2397,7 +2560,7 @@ func framingRegistrySwitches(t *testing.T) map[string]framingRegistrySwitch {
 				if !isSwitch || switched.Tag == nil {
 					continue
 				}
-				registry := registryOfSwitch(t, switched, registries)
+				registry := registryOfSwitch(t, file, switched, registries)
 				if registry == "" {
 					continue
 				}
@@ -2414,6 +2577,7 @@ func framingRegistrySwitches(t *testing.T) map[string]framingRegistrySwitch {
 				}
 				found[method] = framingRegistrySwitch{
 					method:   method,
+					file:     file,
 					registry: registry,
 					tag:      types.ExprString(switched.Tag),
 					refusal:  refusal,
@@ -2423,35 +2587,39 @@ func framingRegistrySwitches(t *testing.T) map[string]framingRegistrySwitch {
 		})
 	}
 	if len(found) == 0 {
-		t.Fatalf("no switch over a framing registry was derived from %s, which holds one in every codec method it declares, so every gate reading this would run over the empty set",
-			framingFile)
+		t.Fatal("no switch over a framing registry was derived from this package's production source, which holds one in every framing codec method it declares, so every gate reading this would run over the empty set")
 	}
 	return found
 }
 
-// framingCodecMethods is every MarshalMLS and UnmarshalMLS framing.go declares, derived off the
-// package's declarations rather than listed, so a third codec landing in that file is judged by
-// the two gates below on the commit that lands it.
-func framingCodecMethods(t *testing.T) []string {
+// framingCodecMethodFiles is every MarshalMLS and UnmarshalMLS of this package that computes
+// with a framing registry, with the file that declares it.
+//
+// The file travels with the method because it is what a failure here has to NAME. While the
+// derivation root was framingFile every message below said "framing.go", and framing.go was the
+// wrong answer for the one codec that was outside the gate -- the message would have been both
+// false and reassuring.
+func framingCodecMethodFiles(t *testing.T) map[string]string {
 	t.Helper()
-	declared := packageLevelDeclarations(t, ".")
-	found := []string{}
-	for name, file := range declared {
-		if file != framingFile {
-			continue
-		}
-		_, method, isMethod := strings.Cut(name, ".")
+	found := map[string]string{}
+	for _, function := range framingRegistryFunctions(t) {
+		_, method, isMethod := strings.Cut(function.name, ".")
 		if !isMethod || (method != "MarshalMLS" && method != "UnmarshalMLS") {
 			continue
 		}
-		found = append(found, name)
+		found[function.name] = function.file
 	}
-	slices.Sort(found)
 	if len(found) == 0 {
-		t.Fatalf("no codec method was derived from %s, which declares two codecs, so every gate reading this would run over the empty set",
-			framingFile)
+		t.Fatal("no framing codec method was derived from this package's production source, which declares several, so every gate reading this would run over the empty set")
 	}
 	return found
+}
+
+// framingCodecMethods is that class as a sorted list, which is the shape the set joins below
+// take.
+func framingCodecMethods(t *testing.T) []string {
+	t.Helper()
+	return slices.Sorted(maps.Keys(framingCodecMethodFiles(t)))
 }
 
 // expressionMentions reports whether an expression holds a sub expression written exactly as the
@@ -2519,10 +2687,11 @@ func TestTheRegistrySwitchReaderSeparatesARefusalThatNamesItsTagFromOneThatDoesN
 // refusing the rest of it is reported here rather than being outside the sweep.
 func TestEveryFramingRegistrySwitchRefusesByNamingTheCodePointItRefused(t *testing.T) {
 	switches := framingRegistrySwitches(t)
+	files := framingCodecMethodFiles(t)
 	for _, method := range framingCodecMethods(t) {
 		if _, held := switches[method]; !held {
-			t.Errorf("%s declares %s and no switch over a framing registry was derived from it; every codec in that file discriminates on one, so either this method refuses no unregistered code point at all or the derivation has stopped seeing its switch",
-				framingFile, method)
+			t.Errorf("%s declares %s and no switch over a framing registry was derived from it; every framing codec in this package discriminates on one, so either this method refuses no unregistered code point at all or the derivation has stopped seeing its switch",
+				files[method], method)
 		}
 	}
 	for _, method := range slices.Sorted(maps.Keys(switches)) {
@@ -2534,7 +2703,7 @@ func TestEveryFramingRegistrySwitchRefusesByNamingTheCodePointItRefused(t *testi
 		}
 		if !expressionMentions(each.refusal, each.tag) {
 			t.Errorf("%s refuses an unregistered %s with %s, which does not name %s; %s says these paths name the offending value numerically, and one that does not tells the caller only that something in the header was unregistered",
-				method, each.registry, types.ExprString(each.refusal), each.tag, framingFile)
+				method, each.registry, types.ExprString(each.refusal), each.tag, each.file)
 		}
 	}
 	t.Logf("%d registry switches, each refusing by naming its own discriminant", len(switches))
@@ -2589,6 +2758,29 @@ func handDerivedFramedContentHeader(contentType ContentType) []byte {
 	}
 }
 
+// handDerivedTranscriptInputTail is a valid ConfirmedTranscriptHashInput carrying an empty
+// commit, MINUS its two octet wire format.
+//
+// RFC 9420 section 8.2 writes wire_format, then the FramedContent, then opaque signature<V> --
+// and NOT the confirmation tag, which is that structure's whole design. So this is
+// handDerivedCommitTail's FramedContent followed by a signature vector and it stops where an
+// AuthenticatedContent would have carried a tag. Hand derived for handDerivedCommitTail's
+// reason: the decoder behind it is being asked to refuse a wire format rather than to run out
+// of input, and bytes produced by the encoder under test would make that a statement about the
+// encoder.
+func handDerivedTranscriptInputTail() []byte {
+	return []byte{
+		0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00,
+		0x03,
+		0x00,
+		0x00,
+		0x01, 0xaa,
+	}
+}
+
 var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 	"Sender.MarshalMLS": func(codePoint uint64) error {
 		return (&Sender{SenderType: SenderType(codePoint)}).MarshalMLS(syntax.NewWriter())
@@ -2629,6 +2821,28 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 	"FramedContentAuthData.UnmarshalMLS": func(codePoint uint64) error {
 		return (&FramedContentAuthData{}).UnmarshalMLS(
 			syntax.NewReader(handDerivedAuthDataGolden(ContentTypeCommit)), ContentType(codePoint))
+	},
+	// framing_preimage.go's section 8.2 structure, which reads and writes the same wire
+	// format registry AuthenticatedContent does. These two rows are here because the class
+	// this gate sweeps is the PACKAGE's registry switches and no longer framing.go's: while
+	// it was one file wide, both of these switches could be deleted whole with the whole of
+	// ./mls/... and ./message/... byte identically green, and a transcript preimage could
+	// then be built over a wire format no registry declares -- which is a hash every peer
+	// computes differently and a fork with no recovery path.
+	"confirmedTranscriptHashInput.MarshalMLS": func(codePoint uint64) error {
+		return (&confirmedTranscriptHashInput{WireFormat: WireFormat(codePoint)}).MarshalMLS(syntax.NewWriter())
+	},
+	"confirmedTranscriptHashInput.UnmarshalMLS": func(codePoint uint64) error {
+		return (&confirmedTranscriptHashInput{}).UnmarshalMLS(syntax.NewReader(append(
+			[]byte{byte(codePoint >> 8), byte(codePoint)}, handDerivedTranscriptInputTail()...)))
+	},
+	// secret_tree.go's content type switch. It is not a codec and it is swept here for the
+	// same reason the two above are: the class is every place in this package that
+	// discriminates on a framing registry, and a peer reaches this one by sending a content
+	// type nobody has defined.
+	"ratchetTypeOf": func(codePoint uint64) error {
+		_, err := ratchetTypeOf(ContentType(codePoint))
+		return err
 	},
 }
 
@@ -2727,8 +2941,8 @@ func TestEveryFramingCodePointRefusalNamesTheCodePointItRefused(t *testing.T) {
 	switches := framingRegistrySwitches(t)
 	derived, invoked := slices.Sorted(maps.Keys(switches)), slices.Sorted(maps.Keys(framingCodePointRefusals))
 	if !slices.Equal(derived, invoked) {
-		t.Fatalf("%s refuses an unregistered code point in %v and this file invokes %v; a refusal nothing invokes is a message nobody has ever read",
-			framingFile, derived, invoked)
+		t.Fatalf("this package's production source refuses an unregistered framing code point in %v and this file invokes %v; a refusal nothing invokes is a message nobody has ever read",
+			derived, invoked)
 	}
 	refused := 0
 	for _, method := range invoked {
@@ -2758,6 +2972,7 @@ func TestEveryFramingCodePointRefusalNamesTheCodePointItRefused(t *testing.T) {
 // framingPin is one package level blank declaration of framing.go: the type it declares and the
 // value assigned to it, as source text, and whether that type is a signature.
 type framingPin struct {
+	file     string
 	declared string
 	value    string
 	isFunc   bool
@@ -2772,31 +2987,34 @@ type framingPin struct {
 // the width pin reader was written to close one section up.
 func framingPins(t *testing.T) []framingPin {
 	t.Helper()
-	parsed, err := parser.ParseFile(token.NewFileSet(), framingFile, nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", framingFile, err)
-	}
 	found := []framingPin{}
-	for _, declaration := range parsed.Decls {
-		generic, isGeneric := declaration.(*ast.GenDecl)
-		if !isGeneric || (generic.Tok != token.VAR && generic.Tok != token.CONST) {
-			continue
+	for _, file := range slices.Compact(slices.Sorted(maps.Values(framingCodecMethodFiles(t)))) {
+		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
 		}
-		for _, spec := range generic.Specs {
-			value, isValue := spec.(*ast.ValueSpec)
-			if !isValue || value.Type == nil || len(value.Values) != len(value.Names) {
+		for _, declaration := range parsed.Decls {
+			generic, isGeneric := declaration.(*ast.GenDecl)
+			if !isGeneric || (generic.Tok != token.VAR && generic.Tok != token.CONST) {
 				continue
 			}
-			_, isFunc := value.Type.(*ast.FuncType)
-			for at, name := range value.Names {
-				if name.Name != "_" {
+			for _, spec := range generic.Specs {
+				value, isValue := spec.(*ast.ValueSpec)
+				if !isValue || value.Type == nil || len(value.Values) != len(value.Names) {
 					continue
 				}
-				found = append(found, framingPin{
-					declared: types.ExprString(value.Type),
-					value:    types.ExprString(value.Values[at]),
-					isFunc:   isFunc,
-				})
+				_, isFunc := value.Type.(*ast.FuncType)
+				for at, name := range value.Names {
+					if name.Name != "_" {
+						continue
+					}
+					found = append(found, framingPin{
+						file:     file,
+						declared: types.ExprString(value.Type),
+						value:    types.ExprString(value.Values[at]),
+						isFunc:   isFunc,
+					})
+				}
 			}
 		}
 	}
@@ -2846,29 +3064,37 @@ func TestEveryFramingCodecCarriesTheCompileTimePinItsShapeAllows(t *testing.T) {
 	pins := framingPins(t)
 	codec := syntaxCodecInterface(t)
 	scope := typeCheckedPackage(t).Scope()
+	files := framingCodecMethodFiles(t)
 	held := 0
 	for _, method := range framingCodecMethods(t) {
 		receiver, name, _ := strings.Cut(method, ".")
+		file := files[method]
 		declared, isType := scope.Lookup(receiver).(*types.TypeName)
 		if !isType {
-			t.Fatalf("%s declares the method %s and package mls holds no type %s", framingFile, method, receiver)
+			t.Fatalf("%s declares the method %s and package mls holds no type %s", file, method, receiver)
 		}
+		// the pin has to stand in the file that declares the codec and not merely somewhere
+		// in the derived set. A pin pooled across files would let one file's blank
+		// declaration answer for a codec declared in another, which is a build time
+		// statement the reader of that file cannot see.
 		if types.Implements(types.NewPointer(declared.Type()), codec) {
 			want := fmt.Sprintf("(*%s)(nil)", receiver)
 			if !slices.ContainsFunc(pins, func(pin framingPin) bool {
-				return pin.value == want && pin.declared == "syntax.Codec"
+				return pin.file == file && pin.value == want && pin.declared == "syntax.Codec"
 			}) {
-				t.Errorf("*%s satisfies syntax.Codec and %s declares no `var _ syntax.Codec = %s`, so the day its methods drift out of that interface nothing says so at build time",
-					receiver, framingFile, want)
+				t.Errorf("*%s satisfies syntax.Codec and %s declares no blank syntax.Codec pin assigned %s, so the day its methods drift out of that interface nothing says so at build time",
+					receiver, file, want)
 				continue
 			}
 			held += 1
 			continue
 		}
 		want := fmt.Sprintf("(*%s).%s", receiver, name)
-		if !slices.ContainsFunc(pins, func(pin framingPin) bool { return pin.value == want && pin.isFunc }) {
+		if !slices.ContainsFunc(pins, func(pin framingPin) bool {
+			return pin.file == file && pin.value == want && pin.isFunc
+		}) {
 			t.Errorf("*%s cannot satisfy syntax.Codec -- %s takes the discriminant registry section 7.2 keeps out of the struct -- and %s declares no blank pin of a signature type assigned %s, so a later task that stores that discriminant in a field and narrows this method to one argument compiles clean",
-				receiver, name, framingFile, want)
+				receiver, name, file, want)
 			continue
 		}
 		held += 1
@@ -2877,6 +3103,189 @@ func TestEveryFramingCodecCarriesTheCompileTimePinItsShapeAllows(t *testing.T) {
 		t.Fatal("no codec pin was matched, so this gate states nothing")
 	}
 	t.Logf("%d codec methods, each pinned in the form its own shape allows", held)
+}
+
+// ---------------------------------------------------------------------------
+// the receiver discipline every framing decoder that publishes whole owes
+// ---------------------------------------------------------------------------
+
+// publishesItsReceiverWhole reports whether a decoder writes its receiver ONLY as a whole --
+// one or more `*self = ...` and never a `self.Field = ...`.
+//
+// The cut is the assignment target and not the shape of the right hand side, because the target
+// is what the property is about. A decoder that only ever assigns the whole receiver has one
+// moment at which the caller's value changes, so "untouched unless the decode succeeded" is a
+// statement that can be true of it. FramedContent and Proposal deliberately do the other thing:
+// they reset the receiver part way through and then fill an arm into it with `self.Proposal =`,
+// because their arms write different fields and a fully staged copy would be a second value
+// built only to be copied over the first. Those two make no such promise and are not swept.
+//
+// A first pass at this cut read the right hand side instead -- a NAMED local staged into the
+// receiver -- and it split the class wrongly: FramedContentAuthData publishes
+// `*self = FramedContentAuthData{...}` after every read has succeeded, which is the property
+// exactly, and a reader looking for an identifier dropped it. What survives the mutation this
+// gate is here for is unaffected either way: an `*self = decoded` inserted ahead of the reads
+// leaves the method assigning only whole receivers, so it stays in the class and is caught by
+// the probe rather than quietly leaving it.
+func publishesItsReceiverWhole(body *ast.BlockStmt) bool {
+	whole, field := false, false
+	ast.Inspect(body, func(node ast.Node) bool {
+		assign, isAssign := node.(*ast.AssignStmt)
+		if !isAssign {
+			return true
+		}
+		for _, target := range assign.Lhs {
+			switch typed := target.(type) {
+			case *ast.StarExpr:
+				if name, isName := typed.X.(*ast.Ident); isName && name.Name == "self" {
+					whole = true
+				}
+			case *ast.SelectorExpr:
+				if name, isName := typed.X.(*ast.Ident); isName && name.Name == "self" {
+					field = true
+				}
+			}
+		}
+		return true
+	})
+	return whole && !field
+}
+
+// TestTheWholeReceiverReaderSeparatesADecodeThatPublishesOnceFromOneThatFillsFields is that
+// reader's control, in both directions for the reason every reader in this file carries one.
+// One that recognised everything would put FramedContent in the class and report the sweep
+// below as covering a decoder that never promised this; one that recognised nothing would empty
+// the class out and the sweep would report green having probed nobody.
+func TestTheWholeReceiverReaderSeparatesADecodeThatPublishesOnceFromOneThatFillsFields(t *testing.T) {
+	for _, one := range []struct {
+		source    string
+		publishes bool
+	}{
+		{"func (self *T) UnmarshalMLS(r *syntax.Reader) error { decoded := T{}; *self = decoded; return nil }", true},
+		{"func (self *T) UnmarshalMLS(r *syntax.Reader) error { *self = T{A: 1}; return nil }", true},
+		{"func (self *T) UnmarshalMLS(r *syntax.Reader) error { d := T{}; d.A = 1; *self = d; return nil }", true},
+		// the reset and fill, which is a different promise and is not this one
+		{"func (self *T) UnmarshalMLS(r *syntax.Reader) error { *self = T{A: 1}; self.B = 2; return nil }", false},
+		{"func (self *T) UnmarshalMLS(r *syntax.Reader) error { self.A = 1; return nil }", false},
+		// and a decoder that fills a local and never publishes it at all
+		{"func (self *T) UnmarshalMLS(r *syntax.Reader) error { d := T{}; d.A = 1; return nil }", false},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "control.go",
+			"package control\n"+one.source+"\n", parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %q: %v", one.source, err)
+		}
+		function, isFunction := parsed.Decls[0].(*ast.FuncDecl)
+		if !isFunction {
+			t.Fatalf("%q did not parse as a function declaration", one.source)
+		}
+		if got := publishesItsReceiverWhole(function.Body); got != one.publishes {
+			t.Errorf("%q read as publishing whole=%v, want %v", one.source, got, one.publishes)
+		}
+	}
+}
+
+// framingDecodersThatPublishWhole is that class over this package's framing decoders, derived
+// off the assignments rather than listed.
+//
+// Two of the four had a behavioural test for the property and two did not, which is rule 5's
+// exact shape: the property was observed where somebody had thought of it rather than wherever
+// it is promised. AuthenticatedContent.UnmarshalMLS could be made to assign *self BEFORE it read
+// the content -- leaving a refused decode holding a wire format out of bytes the package refused,
+// over whatever the caller's value held before -- with the whole of ./mls/... and ./message/...
+// green. Measured. confirmedTranscriptHashInput.UnmarshalMLS publishes whole, documents that it
+// does, and had nothing at all.
+func framingDecodersThatPublishWhole(t *testing.T) []string {
+	t.Helper()
+	found := []string{}
+	for _, function := range framingRegistryFunctions(t) {
+		_, method, isMethod := strings.Cut(function.name, ".")
+		if !isMethod || method != "UnmarshalMLS" || !publishesItsReceiverWhole(function.decl.Body) {
+			continue
+		}
+		found = append(found, function.name)
+	}
+	slices.Sort(found)
+	if len(found) == 0 {
+		t.Fatal("no framing decoder was read as publishing its receiver whole, and this package holds several, so the sweep below would run over the empty set")
+	}
+	return found
+}
+
+// framingWholeReceiverProbe hands one of those decoders input it must refuse, over a receiver
+// that already holds a value, and answers what that receiver held before and what it holds
+// after.
+//
+// The prior contents matter as much as the refusal. A receiver left holding its own zero value
+// is not "untouched" -- it is a decoder that wiped a caller's value on the way to refusing --
+// and a probe starting from the zero value could not tell the two apart.
+type framingWholeReceiverProbe func(t *testing.T) (before any, after any, err error)
+
+var framingWholeReceiverProbes = map[string]framingWholeReceiverProbe{
+	"Sender.UnmarshalMLS": func(t *testing.T) (any, any, error) {
+		refused := []byte{byte(undeclaredCodePointsOf(t, "SenderType")[0]), 0x00, 0x00, 0x00, 0x00}
+		before, after := testSenderOfType(SenderTypeMember), testSenderOfType(SenderTypeMember)
+		err := after.UnmarshalMLS(syntax.NewReader(refused))
+		return *before, *after, err
+	},
+	"FramedContentAuthData.UnmarshalMLS": func(t *testing.T) (any, any, error) {
+		unregistered := ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
+		before, after := testAuthData(), testAuthData()
+		err := after.UnmarshalMLS(syntax.NewReader(handDerivedAuthDataGolden(ContentTypeCommit)), unregistered)
+		return *before, *after, err
+	},
+	"AuthenticatedContent.UnmarshalMLS": func(t *testing.T) (any, any, error) {
+		// a REGISTERED wire format over content that cannot be read: the refusal has to come
+		// from BEHIND the field the receiver would be stamped with, or a decoder that stamped
+		// it early would have refused before it ever reached the assignment
+		before, after := testAuthenticatedCommit(), testAuthenticatedCommit()
+		err := after.UnmarshalMLS(syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
+		return before, after, err
+	},
+	"confirmedTranscriptHashInput.UnmarshalMLS": func(t *testing.T) (any, any, error) {
+		priorCommit, decodedInto := testAuthenticatedCommit(), testAuthenticatedCommit()
+		before, after := priorCommit.transcriptHashInput(), decodedInto.transcriptHashInput()
+		err := after.UnmarshalMLS(syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
+		return *before, *after, err
+	},
+}
+
+// framingRefusedContentBehind is a registered wire format followed by a FramedContent this
+// package will not read: the two octets a wire format decoder stamps its receiver with, and
+// then a refusal raised strictly after them.
+func framingRefusedContentBehind(t *testing.T, wireFormat WireFormat) []byte {
+	t.Helper()
+	unregistered := ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
+	return append([]byte{byte(wireFormat >> 8), byte(wireFormat)},
+		handDerivedFramedContentHeader(unregistered)...)
+}
+
+// TestEveryFramingDecodeThatPublishesItsReceiverWholeLeavesItUntouchedWhenItRefuses sweeps the
+// class rather than the two members of it somebody wrote a test for.
+//
+// What a violation costs is not a mangled struct anybody would notice. It is a well formed value
+// describing a message nobody sent: a caller that reused its receiver and checked the error is
+// left holding fields read out of input this package refused, in a value that decodes, prints
+// and re-encodes as though a peer had sent it.
+func TestEveryFramingDecodeThatPublishesItsReceiverWholeLeavesItUntouchedWhenItRefuses(t *testing.T) {
+	derived := framingDecodersThatPublishWhole(t)
+	probed := slices.Sorted(maps.Keys(framingWholeReceiverProbes))
+	if !slices.Equal(derived, probed) {
+		t.Fatalf("this package publishes its receiver whole in %v and this file probes %v; a decoder nothing probes is a promise nobody has ever held it to",
+			derived, probed)
+	}
+	for _, method := range probed {
+		before, after, err := framingWholeReceiverProbes[method](t)
+		if err == nil {
+			t.Errorf("%s accepted the input this probe hands it, so what it left in the receiver states nothing", method)
+			continue
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Errorf("%s refused with %v and left its receiver holding %+v rather than the %+v it held going in; a refused decode that writes the receiver hands the caller a well formed value assembled out of bytes this package would not accept",
+				method, err, after, before)
+		}
+	}
+	t.Logf("%d framing decoders publishing their receiver whole, each leaving it untouched when it refuses", len(probed))
 }
 
 // ---------------------------------------------------------------------------
@@ -3769,4 +4178,107 @@ func TestProposalRefsAreDistinctAcrossTheGeneratedProposalSpace(t *testing.T) {
 	}
 	t.Logf("%d fields on the wire and pairwise distinct, %d off it and unchanged, %d refused, over %d derived fields",
 		moved, unchanged, refused, len(fields))
+}
+
+// ---------------------------------------------------------------------------
+// the proposal reference, against bytes this project did not produce
+// ---------------------------------------------------------------------------
+
+// TestTheProposalReferenceOfADecodedPublishedProposalIsTheOneItsCommitNames is the only
+// assertion in this package that holds (*AuthenticatedContent).ProposalRef -- and the whole
+// codec chain underneath it -- against bytes this project did not compute.
+//
+// Every other reference test above compares the method against MakeProposalRef and RefHash over
+// syntax.Marshal of a value built HERE, which is the same two functions the method itself calls
+// over an encoding the same encoder wrote. That is self agreement, and self agreement cannot see
+// a codec and a preimage that are wrong together -- which is the entire failure mode
+// framing_preimage.go's own header says it exists to prevent: not a wrong answer, a group that
+// agrees with itself and with nobody else.
+//
+// The transcript corpus this file already reads is no help there. Every entry of it is a COMMIT
+// -- TestTheSectionEightTwoInputDecodesBackToTheStructureItNames makes a non commit fatal -- so
+// before this test no proposal shaped AuthenticatedContent had ever been held against published
+// bytes, and no computed ProposalRef against a published one.
+//
+// passive-client-handling-commit.json publishes both halves and is already vendored, already
+// loaded in this package and already sliced to exactly these bytes by crypto_labels_test.go's
+// TestProposalRefLabelMatchesThePublishedCommits. What that test cannot say is anything about
+// this package's FRAMING: it hashes the published slice directly and never decodes it. Running
+// the same slice through the codec and back out anchors four things at once against mlswg's own
+// bytes -- AuthenticatedContent's codec over a proposal, FramedContent's proposal arm, the whole
+// Proposal codec, and the reference itself.
+func TestTheProposalReferenceOfADecodedPublishedProposalIsTheOneItsCommitNames(t *testing.T) {
+	vectors := []labelKatPassiveClient{}
+	loadLabelKat(t, "passive-client-handling-commit.json", &vectors)
+	anchored := 0
+	for _, vector := range vectors {
+		suite := CipherSuite(vector.CipherSuite)
+		if !IsRegisteredSuite(suite) {
+			continue
+		}
+		crypto := mustProvider(t, suite)
+		// the membership tag is a mac of the suite's hash size carried as a vector, and at
+		// thirty two bytes its length prefix is the one octet form
+		membershipTag := 1 + crypto.HashSize()
+		for epochIndex, epoch := range vector.Epochs {
+			commit := mustDecodeHex(t, "the published commit", epoch.Commit)
+			for _, published := range epoch.Proposals {
+				at := fmt.Sprintf("suite %#04x epoch %d", uint16(suite), epochIndex)
+				message := mustDecodeHex(t, "the published proposal", published)
+				if len(message) <= len(mlsMessagePublicMessageHeader)+membershipTag ||
+					!bytes.HasPrefix(message, mlsMessagePublicMessageHeader) {
+					t.Errorf("%s: the proposal is %d bytes headed %x, want an mls10 public message",
+						at, len(message), message[:min(len(message), len(mlsMessagePublicMessageHeader))])
+					continue
+				}
+				// MLSMessage = version || AuthenticatedContent || membership_tag<V>, so the
+				// content is the message without its two octet version and without the tag
+				// (RFC 9420 sections 6.1 and 6.2). The slice is the one crypto_labels_test.go
+				// asserts its way to and is not re-derived here.
+				authenticatedContent := message[mlsMessageVersionLength : len(message)-membershipTag]
+				decoded := AuthenticatedContent{}
+				if err := syntax.Unmarshal(authenticatedContent, &decoded); err != nil {
+					t.Errorf("%s: the published authenticated content did not decode: %v", at, err)
+					continue
+				}
+				if decoded.Content.ContentType != ContentTypeProposal {
+					t.Errorf("%s: the published proposal decoded as content type %d, so this vector is not what this test believes it is",
+						at, decoded.Content.ContentType)
+					continue
+				}
+				// the codec is held to the published bytes BEFORE the reference is taken over
+				// it. A re-encoding that differed would otherwise arrive as a reference that
+				// does not appear in the commit, which reads as a label or a hash defect and is
+				// not one.
+				reencoded, err := syntax.Marshal(&decoded)
+				if err != nil {
+					t.Errorf("%s: re-encoding the published authenticated content: %v", at, err)
+					continue
+				}
+				if !bytes.Equal(reencoded, authenticatedContent) {
+					t.Errorf("%s: the published authenticated content decoded and re-encoded to %x, want the %x it was decoded from",
+						at, reencoded, authenticatedContent)
+					continue
+				}
+				reference, err := decoded.ProposalRef(crypto)
+				if err != nil {
+					t.Errorf("%s: ProposalRef over the published proposal: %v", at, err)
+					continue
+				}
+				if count := bytes.Count(commit, reference); count != 1 {
+					t.Errorf("%s: the reference %x this package computes for the published proposal appears %d times in the published commit, want once",
+						at, reference, count)
+					continue
+				}
+				anchored += 1
+			}
+		}
+	}
+	// the count is pinned to the same constant crypto_labels_test.go pins its own sweep to, so
+	// a corpus that stopped parsing, or a suite filter that stopped matching, fails here rather
+	// than reporting green having anchored nothing
+	if anchored != labelKatProposalRefs {
+		t.Fatalf("anchored %d published proposal references through this package's codec, want %d", anchored, labelKatProposalRefs)
+	}
+	t.Logf("%d published proposals decoded, re-encoded byte identically and referenced as their own commits name them", anchored)
 }

@@ -13,6 +13,7 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"maps"
 	"os"
 	"reflect"
 	"slices"
@@ -351,4 +352,229 @@ func TestKeyPackageOpensWithItsVersionAndThenItsCiphersuite(t *testing.T) {
 	if !bytes.Equal(reencoded, encoded) {
 		t.Fatalf("re-encoded %x, want %x", reencoded, encoded)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the layout RFC 9420 section 12.1 gives each registered arm
+// ---------------------------------------------------------------------------
+
+// proposalArmSample is one registered proposal arm: the field of Proposal it populates, a value
+// carrying exactly that arm, and the octets section 12.1 writes it as.
+type proposalArmSample struct {
+	field    string
+	proposal Proposal
+	golden   []byte
+}
+
+// proposalArmDelegated is the encoding of a structure a proposal arm hands over to WHOLE.
+//
+// It is the one part of a golden below that is not written out octet by octet, and what it
+// claims is a delegation and an offset rather than a layout: an Add carries a KeyPackage exactly
+// as key_package.go writes one, beginning at the octet after the discriminant, with nothing of
+// this file's own wrapped around it. Those structures' layouts are held by their own goldens --
+// TestKeyPackageOpensWithItsVersionAndThenItsCiphersuite above, leaf_node_test.go's hand derived
+// forms, psk_test.go's -- and transcribing them again here would be a second opinion that agrees
+// with whichever of the two was written later.
+func proposalArmDelegated(t *testing.T, codec syntax.Codec) []byte {
+	t.Helper()
+	encoded, err := syntax.Marshal(codec)
+	if err != nil {
+		t.Fatalf("encode the structure a proposal arm delegates to: %v", err)
+	}
+	return encoded
+}
+
+// proposalArmSamples is one Proposal per registered arm together with the octets RFC 9420
+// section 12.1 writes it as.
+//
+// The goldens are derived from the RFC and stated here rather than read back through the encoder
+// under test, and that is the whole point of the gate below. Five of the seven registered arms
+// were never encoded AND decoded by anything in this package: ReInit's Version and CipherSuite,
+// two ADJACENT uint16s, could be swapped on BOTH the encode and the decode side -- a layout that
+// round trips its own output perfectly, produces a proposal of exactly the right length, and
+// disagrees with every other implementation in the world -- and the whole of ./mls/... and
+// ./message/... stayed green. Measured, not supposed.
+//
+// It is the same defect KeyPackage's adjacent Version and CipherSuite carried, and the reason it
+// is answered here as a TABLE over the derived arm set rather than as a second one-off test is
+// that a one-off test is what the first one was. A ProposalRef is a hash of the whole encoding,
+// so two implementations disagreeing about any arm's layout compute different references for one
+// proposal -- the "stable, self consistent and wrong" fork framing_preimage.go's own comment says
+// the reference exists to prevent.
+func proposalArmSamples(t *testing.T) map[ProposalType]proposalArmSample {
+	t.Helper()
+	// one extensions<V> for the two arms that carry one, and the octets RFC 9420 section 6.3.1
+	// writes it as. The vector prefix counts BYTES and not entries, which is the single easiest
+	// thing in this encoding to get wrong and the thing a round trip cannot see.
+	extensions := []Extension{{ExtensionType: ExtensionTypeApplicationId, ExtensionData: []byte{0x42}}}
+	extensionOctets := []byte{
+		0x04,       // extensions<V>: four octets of entries follow
+		0x00, 0x01, // extension_type: application_id
+		0x01, 0x42, // extension_data<V>
+	}
+	keyPackage := KeyPackage{
+		Version:     ProtocolVersionMls10,
+		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+		InitKey:     HpkePublicKey{0xaa, 0xbb},
+		LeafNode:    *testLeafNodeOfSource(LeafNodeSourceKeyPackage),
+		Signature:   []byte{0xcc},
+	}
+	leafNode := *testLeafNodeOfSource(LeafNodeSourceUpdate)
+	psk := PreSharedKeyId{PskType: PskTypeExternal, PskId: []byte{0x51, 0x52}, PskNonce: []byte{0x61}}
+	return map[ProposalType]proposalArmSample{
+		ProposalTypeAdd: {
+			field:    "Add",
+			proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: keyPackage}},
+			golden:   append([]byte{0x00, 0x01}, proposalArmDelegated(t, &keyPackage)...),
+		},
+		ProposalTypeUpdate: {
+			field:    "Update",
+			proposal: Proposal{ProposalType: ProposalTypeUpdate, Update: &Update{LeafNode: leafNode}},
+			golden:   append([]byte{0x00, 0x02}, proposalArmDelegated(t, &leafNode)...),
+		},
+		ProposalTypeRemove: {
+			field:    "Remove",
+			proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 7}},
+			golden: []byte{
+				0x00, 0x03, // proposal_type: remove
+				0x00, 0x00, 0x00, 0x07, // removed: uint32, and not the leaf index's own width
+			},
+		},
+		ProposalTypePreSharedKey: {
+			field:    "PreSharedKey",
+			proposal: Proposal{ProposalType: ProposalTypePreSharedKey, PreSharedKey: &PreSharedKey{Psk: psk}},
+			golden:   append([]byte{0x00, 0x04}, proposalArmDelegated(t, &psk)...),
+		},
+		ProposalTypeReInit: {
+			field: "ReInit",
+			proposal: Proposal{ProposalType: ProposalTypeReInit, ReInit: &ReInit{
+				GroupId:     []byte{0x9a, 0x9b, 0x9c},
+				Version:     ProtocolVersionMls10,
+				CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+				Extensions:  extensions,
+			}},
+			// section 12.1.5: group_id<V>, then version, then cipher_suite, then extensions.
+			// The two uint16s are the pair this whole table exists for -- mls10 is 0x0001 and
+			// the suite is 0x0003, chosen to differ, because a version and a ciphersuite that
+			// happened to be equal would let the swap through.
+			golden: joinBytes(
+				[]byte{0x00, 0x05},
+				[]byte{0x03, 0x9a, 0x9b, 0x9c},
+				[]byte{0x00, 0x01},
+				[]byte{0x00, 0x03},
+				extensionOctets,
+			),
+		},
+		ProposalTypeExternalInit: {
+			field: "ExternalInit",
+			proposal: Proposal{ProposalType: ProposalTypeExternalInit,
+				ExternalInit: &ExternalInit{KemOutput: []byte{0x01, 0x02, 0x03}}},
+			golden: []byte{
+				0x00, 0x06, // proposal_type: external_init
+				0x03, 0x01, 0x02, 0x03, // kem_output<V>
+			},
+		},
+		ProposalTypeGroupContextExtensions: {
+			field: "GroupContextExtensions",
+			proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions,
+				GroupContextExtensions: &GroupContextExtensions{Extensions: extensions}},
+			golden: append([]byte{0x00, 0x07}, extensionOctets...),
+		},
+	}
+}
+
+// TestEveryRegisteredProposalArmEncodesToTheLayoutSection121Writes holds every arm of this
+// codec to the RFC, in both directions, over a class derived twice.
+//
+// The table is joined to the ProposalType registry AND to the arm fields of the struct, so an
+// eighth arm added to Proposal, or an eighth code point registered in extension.go, fails here
+// on the commit that lands it rather than shipping as an arm nothing ever encoded. Before this
+// gate only two of the seven were ever both encoded and decoded, and TestProposalCodecAccepts-
+// ProfileRefusedTypes -- the one test that reaches past Remove -- covers ExternalInit alone.
+//
+// The re-encode is not redundant with the encode. A swap present on both sides of the codec is
+// caught by the first comparison; a swap present on the DECODE side only round trips nothing and
+// is caught by the second; and an arm the decoder drops on the floor is caught by the arm check
+// between them.
+func TestEveryRegisteredProposalArmEncodesToTheLayoutSection121Writes(t *testing.T) {
+	samples := proposalArmSamples(t)
+	covered := slices.Sorted(maps.Keys(samples))
+
+	// the code point join. The reserved zero is excluded by its VALUE and not by its name: it is
+	// not an arm, because checkArm's default clause treats it as an unregistered type whose body
+	// is carried verbatim, which is the GREASE path and not a layout.
+	declared := []ProposalType{}
+	for _, value := range registryConstantsOfType(t, "ProposalType") {
+		if value == uint64(ProposalTypeReserved) {
+			continue
+		}
+		declared = append(declared, ProposalType(value))
+	}
+	slices.Sort(declared)
+	if !slices.Equal(declared, covered) {
+		t.Fatalf("package mls registers the proposal types %v and this table lays out %v; an arm with no golden is an arm no test has ever encoded and decoded, and its layout is whatever the encoder happens to do",
+			declared, covered)
+	}
+
+	// the arm join, off the same derivation TestEveryArmOfAProposalIsCountedByItsArmCheck uses.
+	// UnknownBody is excluded because it is not a registered arm: it is the verbatim body an
+	// unregistered type carries, and it has no layout of its own to be wrong about.
+	arms := []string{}
+	for _, name := range proposalArmFields(t) {
+		if name == "UnknownBody" {
+			continue
+		}
+		arms = append(arms, name)
+	}
+	laid := []string{}
+	for _, proposalType := range covered {
+		laid = append(laid, samples[proposalType].field)
+	}
+	slices.Sort(laid)
+	if !slices.Equal(arms, laid) {
+		t.Fatalf("Proposal carries the arms %v and this table populates %v; the two derivations disagree, so one of them has stopped describing the type",
+			arms, laid)
+	}
+
+	for _, proposalType := range covered {
+		sample := samples[proposalType]
+		// the row is what it says it is, before anything is read off it
+		field := reflect.ValueOf(sample.proposal).FieldByName(sample.field)
+		if !field.IsValid() || field.IsNil() {
+			t.Fatalf("the %s row does not populate the arm it names, so whatever it encodes to is not that arm", sample.field)
+		}
+		encoded, err := syntax.Marshal(&sample.proposal)
+		if err != nil {
+			t.Errorf("%s: marshal: %v", sample.field, err)
+			continue
+		}
+		if !bytes.Equal(encoded, sample.golden) {
+			t.Errorf("a %s proposal encodes to %x and RFC 9420 section 12.1 writes %x; a layout that disagrees with the RFC and agrees with itself produces a different ProposalRef for the same proposal, so every peer computes a name for it that this one does not",
+				sample.field, encoded, sample.golden)
+			continue
+		}
+		decoded := Proposal{}
+		if err := syntax.Unmarshal(sample.golden, &decoded); err != nil {
+			t.Errorf("%s: the published layout did not decode: %v", sample.field, err)
+			continue
+		}
+		if decoded.ProposalType != proposalType {
+			t.Errorf("%s: the layout decoded as proposal type %04x, want %04x", sample.field, decoded.ProposalType, proposalType)
+			continue
+		}
+		if decodedArm := reflect.ValueOf(decoded).FieldByName(sample.field); !decodedArm.IsValid() || decodedArm.IsNil() {
+			t.Errorf("%s: the layout decoded with that arm empty, so the decoder read the discriminant and dropped the body", sample.field)
+			continue
+		}
+		reencoded, err := syntax.Marshal(&decoded)
+		if err != nil {
+			t.Errorf("%s: re-marshal: %v", sample.field, err)
+			continue
+		}
+		if !bytes.Equal(reencoded, sample.golden) {
+			t.Errorf("a %s proposal decoded from %x re-encodes to %x; the two halves of this codec disagree about that arm's layout, which is the one shape a round trip over the encoder's own output cannot see",
+				sample.field, sample.golden, reencoded)
+		}
+	}
+	t.Logf("%d registered proposal arms, each encoded to and decoded from the layout section 12.1 gives it", len(covered))
 }
