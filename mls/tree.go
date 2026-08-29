@@ -594,7 +594,7 @@ var _ NodeShape = (*RatchetTree)(nil)
 //     that refusal this method answered the empty list for a NON-BLANK node, root included,
 //     which reads as "seal this path secret to nobody" -- see SetParent's own comment.
 //
-// TestTheOnlyResolutionRefusalAContainerBuiltTreeCanProduceIsAnOutOfRangeIndex is what holds
+// TestTheOnlyResolutionRefusalATreeThisContainerAcceptedCanProduceIsAnOutOfRangeIndex is what holds
 // both, over every door into the node array rather than over the two somebody remembered.
 func (self *RatchetTree) Resolution(x NodeIndex) []NodeIndex {
 	out, err := Resolution(self, x)

@@ -17,7 +17,9 @@ import (
 	"go/ast"
 	"go/token"
 	"maps"
+	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -1281,6 +1283,52 @@ func framingUnregisteredCodePoint(t *testing.T, typeName string, width uint64) u
 	return 0
 }
 
+// framingStructuralPreimageRefusals is every input this package can assemble that NO preimage can
+// be built out of, keyed by what makes it one.
+//
+// Derived over the sender type registry plus a code point neither registry holds, rather than
+// sampled: which group context arm a sender type forbids comes off senderBindsGroupContext rather
+// than off a list here, so a sender type or a wire format a later task registers joins every sweep
+// reading this by existing.
+//
+// Two gates read it and they ask opposite questions of the same rows. One asserts that a message
+// carrying a signature is answered by the preimage's own refusal verbatim; the other asserts that
+// the same message carrying NO membership tag is answered by ValSem007 instead, which is the only
+// input that separates the two orders verifyMembershipTag's first two guards can be written in.
+func framingStructuralPreimageRefusals(t *testing.T) map[string]framingPreimageInput {
+	t.Helper()
+	structural := map[string]framingPreimageInput{}
+	for name, code := range registryConstantsOfType(t, "SenderType") {
+		senderType := SenderType(code)
+		binds, err := senderBindsGroupContext(senderType)
+		if err != nil {
+			t.Errorf("%s is a registered sender type and senderBindsGroupContext refused it: %v", name, err)
+			continue
+		}
+		content := framingTestProposalContent()
+		content.Sender = Sender{SenderType: senderType}
+		// the arm this sender type forbids: one that binds the epoch handed no context, one
+		// that binds none handed a context
+		forbidden := framingTestGroupContext(t)
+		if binds {
+			forbidden = nil
+		}
+		structural[name+" handed the group context arm it forbids"] =
+			framingPreimageInput{WireFormatPublicMessage, content, forbidden}
+	}
+	if len(structural) == 0 {
+		t.Fatal("no registered sender type produced a row, so every gate reading this runs over the empty set")
+	}
+	unknownSender := framingTestProposalContent()
+	unknownSender.Sender = Sender{SenderType: SenderType(framingUnregisteredCodePoint(t, "SenderType", 0xff))}
+	structural["a sender type no registry holds"] =
+		framingPreimageInput{WireFormatPublicMessage, unknownSender, framingTestGroupContext(t)}
+	structural["a wire format no registry holds"] = framingPreimageInput{
+		WireFormat(framingUnregisteredCodePoint(t, "WireFormat", 0xffff)),
+		framingTestMemberContent(), framingTestGroupContext(t)}
+	return structural
+}
+
 // TestVerifyAnswersThePreimagesRefusalVerbatimAndCollapsesEverySignatureFailure states which of
 // the two rules each refusal of VerifyAuthenticatedContent falls under.
 //
@@ -1306,35 +1354,7 @@ func TestVerifyAnswersThePreimagesRefusalVerbatimAndCollapsesEverySignatureFailu
 	}
 
 	// the structural half: inputs no preimage can be assembled from at all
-	structural := map[string]framingPreimageInput{}
-	for name, code := range registryConstantsOfType(t, "SenderType") {
-		senderType := SenderType(code)
-		binds, err := senderBindsGroupContext(senderType)
-		if err != nil {
-			t.Errorf("%s is a registered sender type and senderBindsGroupContext refused it: %v", name, err)
-			continue
-		}
-		content := framingTestProposalContent()
-		content.Sender = Sender{SenderType: senderType}
-		// the arm this sender type forbids: one that binds the epoch handed no context, one
-		// that binds none handed a context
-		forbidden := framingTestGroupContext(t)
-		if binds {
-			forbidden = nil
-		}
-		structural[name+" handed the group context arm it forbids"] =
-			framingPreimageInput{WireFormatPublicMessage, content, forbidden}
-	}
-	if len(structural) == 0 {
-		t.Fatal("no registered sender type produced a row, so this half of the gate runs over the empty set")
-	}
-	unknownSender := framingTestProposalContent()
-	unknownSender.Sender = Sender{SenderType: SenderType(framingUnregisteredCodePoint(t, "SenderType", 0xff))}
-	structural["a sender type no registry holds"] =
-		framingPreimageInput{WireFormatPublicMessage, unknownSender, framingTestGroupContext(t)}
-	structural["a wire format no registry holds"] = framingPreimageInput{
-		WireFormat(framingUnregisteredCodePoint(t, "WireFormat", 0xffff)),
-		framingTestMemberContent(), framingTestGroupContext(t)}
+	structural := framingStructuralPreimageRefusals(t)
 
 	for _, name := range slices.Sorted(maps.Keys(structural)) {
 		one := structural[name]
@@ -1881,13 +1901,47 @@ func TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver(t *testin
 // membershipTagRefusal is one declaration that can answer a membership tag refusal, together
 // with the parsed file it was read out of, because every rule below renders nodes of it back to
 // source and a node rendered against the wrong file set gives the wrong positions.
+//
+// decides separates the half of the class that MAKES the decision from the half that carries
+// somebody else's out. Both are in the class -- a refusal is a refusal to the caller wherever it
+// was decided -- and they are held to different rules, because a rule about HOW a tag was
+// compared is a rule about a body that compared one.
 type membershipTagRefusal struct {
 	name     string
 	host     parsedSource
 	function *ast.FuncDecl
+	decides  bool
 }
 
-// membershipTagRefusalReturns is every return of one sentinel inside a node, rendered.
+// membershipTagSource is one parsed file together with the path the class reports its
+// declarations under.
+type membershipTagSource struct {
+	path   string
+	parsed parsedSource
+}
+
+// membershipTagNames answers whether one expression mentions an identifier anywhere inside it.
+//
+// ANYWHERE, rather than as the whole of the expression, and that is the difference between a
+// class and a spelling. `return errBadMembershipTag` and
+// `return fmt.Errorf("%w: ...", errBadMembershipTag)` are one refusal to every caller -- errors.Is
+// answers yes to both -- and the file this rule reads already writes its OWN refusals in the
+// second shape. Measured: with the rule rendering the result and string comparing it to the
+// sentinel's name, a declaration that decided the tag with a hand written byte loop and refused in
+// the wrapping shape entered no class here and was reported by nothing in ./mls/... or
+// ./message/....
+func membershipTagNames(expression ast.Expr, sentinel string) bool {
+	named := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && identifier.Name == sentinel {
+			named = true
+		}
+		return !named
+	})
+	return named
+}
+
+// membershipTagRefusalReturns is every return that can carry one sentinel out of a node, rendered.
 func membershipTagRefusalReturns(parsed parsedSource, node ast.Node, sentinel string) []string {
 	found := []string{}
 	ast.Inspect(node, func(inner ast.Node) bool {
@@ -1896,8 +1950,9 @@ func membershipTagRefusalReturns(parsed parsedSource, node ast.Node, sentinel st
 			return true
 		}
 		for _, result := range returns.Results {
-			if parsed.render(result) == sentinel {
+			if membershipTagNames(result, sentinel) {
 				found = append(found, parsed.render(returns))
+				break
 			}
 		}
 		return true
@@ -1905,47 +1960,121 @@ func membershipTagRefusalReturns(parsed parsedSource, node ast.Node, sentinel st
 	return found
 }
 
-// membershipTagRefusalsIn is the class over one parsed file: every declaration that can answer
-// the ValSem008 refusal.
+// membershipTagCalleeNames is every name one declaration calls, as the call site spells it: the
+// bare identifier for a function of this package and the selected name for a method.
 //
-// Derived off the SENTINEL rather than off a name, which is the whole of why this is a class.
-// The rule below is about how that refusal is REACHED, so its members are the declarations that
-// can reach one, and p7's receive path joins this sweep by returning the same value rather than
-// by somebody remembering to add it here. The one shape that escapes the derivation -- a
-// verifier that stopped refusing at all -- empties the class rather than passing it, and an
-// empty class is fatal below.
-func membershipTagRefusalsIn(parsed parsedSource, path string, sentinel string) []membershipTagRefusal {
+// The selected half over reports and is meant to. A method sharing a name with a member of the
+// class pulls its caller in, which costs that caller the propagation rule and nothing else; the
+// direction that loses a mutant is the other one.
+func membershipTagCalleeNames(function *ast.FuncDecl) []string {
+	names := []string{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		switch callee := call.Fun.(type) {
+		case *ast.Ident:
+			names = append(names, callee.Name)
+		case *ast.SelectorExpr:
+			names = append(names, callee.Sel.Name)
+		}
+		return true
+	})
+	return names
+}
+
+// membershipTagRefusalsIn is the class over a set of parsed files: every declaration that can
+// answer the ValSem008 refusal, whether it decides one or carries one out.
+//
+// Derived off the SENTINEL rather than off a name, and closed under CALLS rather than stopping at
+// the declarations that name it, which is the whole of why this is a class. The rules below are
+// about how that refusal is REACHED and about what happens to it once it exists, so the members
+// are every declaration either question can be asked of, and p7's receive path joins by refusing
+// or by calling something that refuses rather than by somebody remembering to add it here. The one
+// shape that escapes the derivation -- a verifier that stopped refusing at all -- empties the class
+// rather than passing it, and an empty class is fatal below.
+//
+// The fixed point is not decoration. p7 will reach this refusal through its own helpers, and a
+// class that read only the direct callers would drop the declaration two hops out exactly as the
+// name comparison dropped the wrapping shape.
+func membershipTagRefusalsIn(sources []membershipTagSource, sentinel string) []membershipTagRefusal {
+	candidates := []membershipTagRefusal{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			candidates = append(candidates, membershipTagRefusal{
+				name:     source.path + ": " + function.Name.Name,
+				host:     source.parsed,
+				function: function,
+				decides:  len(membershipTagRefusalReturns(source.parsed, function.Body, sentinel)) != 0,
+			})
+		}
+	}
+	inClass := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.decides {
+			inClass[candidate.function.Name.Name] = true
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, candidate := range candidates {
+			if inClass[candidate.function.Name.Name] {
+				continue
+			}
+			for _, callee := range membershipTagCalleeNames(candidate.function) {
+				if !inClass[callee] {
+					continue
+				}
+				inClass[candidate.function.Name.Name] = true
+				grew = true
+				break
+			}
+		}
+	}
 	found := []membershipTagRefusal{}
-	for _, declaration := range parsed.file.Decls {
-		function, isFunction := declaration.(*ast.FuncDecl)
-		if !isFunction || function.Body == nil {
-			continue
+	for _, candidate := range candidates {
+		if inClass[candidate.function.Name.Name] {
+			found = append(found, candidate)
 		}
-		if len(membershipTagRefusalReturns(parsed, function.Body, sentinel)) == 0 {
-			continue
-		}
-		found = append(found, membershipTagRefusal{
-			name:     path + ": " + function.Name.Name,
-			host:     parsed,
-			function: function,
-		})
 	}
 	return found
 }
 
 // membershipTagRoutingFaults reads one declaration for every way it can decide a membership tag
-// other than the one guardrail 8 permits, each answered as "kind: detail".
+// other than the one guardrail 8 permits, and for every way it can lose one it was handed, each
+// answered as "kind: detail".
 //
 // The KIND is what the control compares, so each half of the rule has to be the only thing
 // reporting some member of that fixture. A rule whose halves cannot be told apart is a rule that
 // can have a half deleted with its control still matching exactly what it wants.
+func membershipTagRoutingFaults(parsed parsedSource, function *ast.FuncDecl, sentinel string,
+	class []membershipTagRefusal) []string {
+
+	faults := []string{}
+	if len(membershipTagRefusalReturns(parsed, function.Body, sentinel)) != 0 {
+		faults = append(faults, membershipTagDecisionFaults(parsed, function, sentinel)...)
+	}
+	return append(faults, membershipTagPropagationFaults(parsed, function, class)...)
+}
+
+// membershipTagDecisionFaults judges a body that DECIDES the refusal: what it decided with, and
+// whether it walked the bytes itself.
 //
 // The loop clause is the one that is not about a comparator name, and it is here because
 // constant_time_test.go's own header says what that gate cannot see: "a comparison written as a
 // byte loop in this package's own source names no comparator and is in no class derived from
 // imports". That blind spot is closed for this refusal by refusing the loop itself, which a
 // decision written as one cannot do without.
-func membershipTagRoutingFaults(parsed parsedSource, function *ast.FuncDecl, sentinel string) []string {
+//
+// It is asked only of a decider, and that is the boundary rather than an omission. A declaration
+// that carries somebody else's refusal out compares nothing, and a receive path is a loop:
+// reporting the loop there would be a fault about a comparison that is not in the body.
+func membershipTagDecisionFaults(parsed parsedSource, function *ast.FuncDecl, sentinel string) []string {
 	parameters := []string{}
 	if function.Type.Params != nil {
 		for _, field := range function.Type.Params.List {
@@ -1981,6 +2110,114 @@ func membershipTagRoutingFaults(parsed parsedSource, function *ast.FuncDecl, sen
 		}
 		return true
 	})
+	return faults
+}
+
+// membershipTagErrorResultAt is the position an error comes back at in one declaration's results,
+// or -1 for a declaration that cannot report one.
+func membershipTagErrorResultAt(member membershipTagRefusal) int {
+	if member.function.Type.Results == nil {
+		return -1
+	}
+	at := 0
+	for _, result := range member.function.Type.Results.List {
+		if member.host.render(result.Type) == "error" {
+			return at
+		}
+		width := len(result.Names)
+		if width == 0 {
+			width = 1
+		}
+		at += width
+	}
+	return -1
+}
+
+// membershipTagPropagationFaults is guardrail 7 over the same refusal: a declaration that reaches
+// a member of the class must not lose the answer.
+//
+// This is the half the decision rules cannot state, and p7 is the caller it is written for. A
+// receive path that reaches verifyMembershipTag and throws the error away applies a proposal or a
+// commit that no member of the group sent, and it does that with a body in which the sanctioned
+// comparison is the only comparison there is -- so every rule above reports it clean. The doc
+// comment on verifyMembershipTag writes the obligation out in prose, "p7 MUST RETURN on this
+// refusal rather than logging it and continuing"; this is where the prose is measured.
+//
+// Two ways to lose it and both are syntax. A call written as a statement of its own binds no error
+// at all. A call whose error result is assigned to the blank identifier binds it to nothing, which
+// is the spelling that compiles and reads like a decision. And a declaration that reaches one of
+// these while answering no error of its own cannot carry the refusal out however the call is
+// written, so that is its own kind rather than a second report of the first.
+func membershipTagPropagationFaults(parsed parsedSource, function *ast.FuncDecl,
+	class []membershipTagRefusal) []string {
+
+	reached := func(call *ast.CallExpr) (membershipTagRefusal, bool) {
+		name := ""
+		switch callee := call.Fun.(type) {
+		case *ast.Ident:
+			name = callee.Name
+		case *ast.SelectorExpr:
+			name = callee.Sel.Name
+		}
+		for _, member := range class {
+			if member.function.Name.Name == name && member.function != function {
+				return member, true
+			}
+		}
+		return membershipTagRefusal{}, false
+	}
+	answersAnError := false
+	if function.Type.Results != nil {
+		for _, result := range function.Type.Results.List {
+			if parsed.render(result.Type) == "error" {
+				answersAnError = true
+			}
+		}
+	}
+	faults := []string{}
+	carried := []string{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch statement := node.(type) {
+		case *ast.ExprStmt:
+			call, isCall := statement.X.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			member, isMember := reached(call)
+			if !isMember || membershipTagErrorResultAt(member) < 0 {
+				return true
+			}
+			carried = append(carried, member.function.Name.Name)
+			faults = append(faults, "discarded: it calls "+member.function.Name.Name+
+				" as a statement of its own, so the refusal is bound to nothing")
+		case *ast.AssignStmt:
+			if len(statement.Rhs) != 1 {
+				return true
+			}
+			call, isCall := statement.Rhs[0].(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			member, isMember := reached(call)
+			if !isMember {
+				return true
+			}
+			at := membershipTagErrorResultAt(member)
+			if at < 0 || at >= len(statement.Lhs) {
+				return true
+			}
+			carried = append(carried, member.function.Name.Name)
+			if target, isIdentifier := statement.Lhs[at].(*ast.Ident); isIdentifier && target.Name == "_" {
+				faults = append(faults, "discarded: it assigns "+member.function.Name.Name+
+					"'s refusal to the blank identifier")
+			}
+		}
+		return true
+	})
+	if len(carried) != 0 && !answersAnError {
+		faults = append(faults, "unanswerable: it reaches "+strings.Join(slices.Compact(carried), ", ")+
+			" and answers no error of its own, so no spelling of the call could carry the refusal out")
+	}
 	return faults
 }
 
@@ -2022,17 +2259,25 @@ func membershipTagGuardFaults(parsed parsedSource, condition ast.Expr, parameter
 	return faults
 }
 
-// membershipTagRoutingControl declares one of each shape the rule above has to tell apart: the
+// membershipTagRoutingControl declares one of each shape the rules above have to tell apart: the
 // sanctioned body, the two comparators a ban list would have had to think of, the byte loop that
 // carries no comparator at all, a prefix of the tag pushed through the sanctioned call, a tag
-// compared against itself, a provider the function was never handed, and a refusal reached from
-// no condition.
+// compared against itself, a provider the function was never handed, a refusal reached from no
+// condition, and then the five shapes that are about the refusal AFTER it exists -- the byte loop
+// whose refusal is WRAPPED rather than bare, a caller that carries the refusal out, and the three
+// ways to lose one.
 //
-// Seven of these are here because a control that does not DISCRIMINATE its own rule issues a
-// broken matcher exactly the clean bill a working one issues. hmac.Equal is in the fixture
-// deliberately: it is constant time and it is still wrong, because guardrail 8 names
+// Every one is here because a control that does not DISCRIMINATE its own rule issues a broken
+// matcher exactly the clean bill a working one issues. hmac.Equal is in the fixture deliberately:
+// it is constant time and it is still wrong, because guardrail 8 names
 // crypto/subtle.ConstantTimeCompare reached through CryptoProvider.MacVerify specifically, and a
 // second comparison site is a second place the length refusal can be dropped.
+//
+// The wrapping and propagating shapes are here because they were measured to be outside the class
+// the earlier rule derived: the rule rendered each return and string compared it to the sentinel's
+// name, so `fmt.Errorf("%w: p7", errBadMembershipTag)` and `return err` were both invisible, and a
+// variable time comparison written in the first of them was caught by nothing in ./mls/... or
+// ./message/....
 const membershipTagRoutingControl = `package control
 
 func VerifiesThroughTheProvider(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
@@ -2095,6 +2340,41 @@ func RefusesWithNoConditionAtAll(crypto CryptoProvider, key []byte, data []byte,
 	crypto.MacVerify(key, data, tag)
 	return errBadMembershipTag
 }
+
+func WrapsTheSentinelAfterAByteLoop(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	mine := crypto.Mac(key, data)
+	same := len(mine) == len(tag)
+	for at := range tag {
+		if at < len(mine) && mine[at] != tag[at] {
+			same = false
+		}
+	}
+	if !same {
+		return fmt.Errorf("%w: the wrapping shape", errBadMembershipTag)
+	}
+	return nil
+}
+
+func PropagatesTheRefusal(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	if err := VerifiesThroughTheProvider(crypto, key, data, tag); err != nil {
+		return err
+	}
+	return nil
+}
+
+func DiscardsTheRefusal(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	VerifiesThroughTheProvider(crypto, key, data, tag)
+	return nil
+}
+
+func BlanksTheRefusal(crypto CryptoProvider, key []byte, data []byte, tag []byte) error {
+	_ = VerifiesThroughTheProvider(crypto, key, data, tag)
+	return nil
+}
+
+func CannotAnswerTheRefusal(crypto CryptoProvider, key []byte, data []byte, tag []byte) {
+	VerifiesThroughTheProvider(crypto, key, data, tag)
+}
 `
 
 // membershipTagRoutingControlFaults is the kind of fault each control declaration must draw,
@@ -2109,9 +2389,18 @@ var membershipTagRoutingControlFaults = map[string][]string{
 	"VerifiesTheTagAgainstItself":           {"self"},
 	"VerifiesThroughAProviderItWasNotGiven": {"provider"},
 	"RefusesWithNoConditionAtAll":           {"unguarded"},
+	// the wrapping shape, which is a member of the class only because the rule reads the whole
+	// return expression rather than its rendering
+	"WrapsTheSentinelAfterAByteLoop": {"guard", "loop"},
+	// and the four propagating shapes, which are members only because the class is closed under
+	// calls. The first must draw NOTHING, or the rule reports every caller and says nothing.
+	"PropagatesTheRefusal":   {},
+	"DiscardsTheRefusal":     {"discarded"},
+	"BlanksTheRefusal":       {"discarded"},
+	"CannotAnswerTheRefusal": {"discarded", "unanswerable"},
 }
 
-// TestEveryMembershipTagRefusalIsDecidedByMacVerifyAndNothingElse is guardrail 8 over this
+// TestEveryMembershipTagRefusalIsDecidedByMacVerifyAndNothingElse is guardrails 8 and 7 over this
 // task's refusal, read off the source rather than off an input.
 //
 // No behavioural test in this file can see this. A verifier that compared with bytes.Equal, or
@@ -2126,10 +2415,11 @@ func TestEveryMembershipTagRefusalIsDecidedByMacVerifyAndNothingElse(t *testing.
 	// the control first: a rule that has stopped matching issues the real source exactly the
 	// clean bill a working one issues
 	control := mustParseText(t, "the membership tag routing control", membershipTagRoutingControl)
+	controlClass := membershipTagRefusalsIn([]membershipTagSource{{path: "control", parsed: control}}, sentinel)
 	reported := map[string][]string{}
-	for _, member := range membershipTagRefusalsIn(control, "control", sentinel) {
+	for _, member := range controlClass {
 		kinds := []string{}
-		for _, fault := range membershipTagRoutingFaults(control, member.function, sentinel) {
+		for _, fault := range membershipTagRoutingFaults(control, member.function, sentinel, controlClass) {
 			kind, _, named := strings.Cut(fault, ": ")
 			if !named {
 				t.Fatalf("the rule answered %q, which carries no kind for the control to compare", fault)
@@ -2158,19 +2448,409 @@ func TestEveryMembershipTagRefusalIsDecidedByMacVerifyAndNothingElse(t *testing.
 	}
 
 	// and then this package's own source
-	class := []membershipTagRefusal{}
+	sources := []membershipTagSource{}
 	for _, path := range packageLevelFunctions(t).files {
-		class = append(class, membershipTagRefusalsIn(mustParseSource(t, path), path, sentinel)...)
+		sources = append(sources, membershipTagSource{path: path, parsed: mustParseSource(t, path)})
 	}
-	if len(class) == 0 {
+	class := membershipTagRefusalsIn(sources, sentinel)
+	deciders := 0
+	for _, member := range class {
+		if member.decides {
+			deciders++
+		}
+	}
+	if deciders == 0 {
 		t.Fatalf("no declaration of this package's non test source answers %s, and this task lands one, so this gate is demanding nothing",
 			sentinel)
 	}
 	for _, member := range class {
-		for _, fault := range membershipTagRoutingFaults(member.host, member.function, sentinel) {
+		for _, fault := range membershipTagRoutingFaults(member.host, member.function, sentinel, class) {
 			t.Errorf("%s: %s", member.name, fault)
 		}
 	}
-	t.Logf("%d declaration(s) can answer %s, and each decides through CryptoProvider.MacVerify alone",
-		len(class), sentinel)
+	t.Logf("%d declaration(s) can answer %s: %d decide one through CryptoProvider.MacVerify alone, and %d carry one out",
+		len(class), sentinel, deciders, len(class)-deciders)
+}
+
+// ---------------------------------------------------------------------------
+// the membership_key itself, and the order the two doors judge their arguments in
+// ---------------------------------------------------------------------------
+
+// membershipTagDoorNames is every declaration of this package's non test source that takes a
+// membership_key, read off the parameter rather than listed.
+//
+// The class is the parameter NAME because that is what the doors share and what a third one would
+// share: RFC 9420 section 6.2 has one key, and a declaration that takes it is a declaration that
+// can mac under it. A gate whose table named two functions is a gate a third door gets written
+// beside -- which is the shape of the finding this exists for, since ComputeMembershipTag and
+// verifyMembershipTag both accepted a key p4's own door refuses.
+func membershipTagDoorNames(t *testing.T) []string {
+	t.Helper()
+	names := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Type.Params == nil {
+				continue
+			}
+			for _, field := range function.Type.Params.List {
+				for _, parameter := range field.Names {
+					if parameter.Name == "membershipKey" {
+						names = append(names, function.Name.Name)
+					}
+				}
+			}
+		}
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	if len(names) == 0 {
+		t.Fatal("no declaration of this package's non test source takes a membershipKey, so this gate demands nothing")
+	}
+	return names
+}
+
+// membershipTagKeyRefusal is one shape of membership_key no tag may be taken under, with the
+// sentinel both doors must answer for it.
+type membershipTagKeyRefusal struct {
+	what     string
+	key      []byte
+	sentinel error
+}
+
+// membershipTagUnusableKeys is every such shape, derived over the provider's own KDF.Nh rather
+// than written at 32 octets.
+//
+// The width sweep is every length from nothing up to twice its own rather than one short key and
+// one long one, for TestVerifyMembershipTagRefusesEveryTagButItsOwn's reason: a guard that read
+// the first byte of the length, or that refused only what is shorter, passes a sampled sweep and
+// this project has shipped exactly that twice.
+//
+// The last row is not a length case at all and it is the row this gate exists for. An epoch that
+// has left PastEpochWindow is zeroized IN PLACE, so its membership_key is still KDF.Nh bytes and
+// every length check in the world clears it, while a mac under KDF.Nh zero bytes is publicly
+// computable: any party can forge a membership tag the receiver would accept, and that tag is the
+// only authentication a member's PublicMessage carries besides the signature.
+func membershipTagUnusableKeys(nh int) []membershipTagKeyRefusal {
+	rows := []membershipTagKeyRefusal{}
+	for _, empty := range emptyByteSpellings() {
+		rows = append(rows, membershipTagKeyRefusal{
+			what:     "a key that is " + empty.what,
+			key:      empty.value,
+			sentinel: ErrSecretLength,
+		})
+	}
+	for n := 1; n <= 2*nh; n++ {
+		if n == nh {
+			continue
+		}
+		rows = append(rows, membershipTagKeyRefusal{
+			what:     fmt.Sprintf("a key %d bytes wide and not %d", n, nh),
+			key:      bytes.Repeat([]byte{0x6b}, n),
+			sentinel: ErrSecretLength,
+		})
+	}
+	rows = append(rows, membershipTagKeyRefusal{
+		what:     fmt.Sprintf("the %d zero bytes an erased epoch leaves behind", nh),
+		key:      make([]byte, nh),
+		sentinel: ErrEpochErased,
+	})
+	return rows
+}
+
+// TestBothDoorsIntoSection62RefuseEveryKeyNoTagMayBeTakenUnder is the membership_key half of RFC
+// 9420 section 6.2, and it is the half nothing observed.
+//
+// The finding it lands: ComputeMembershipTag and verifyMembershipTag took a key of ANY length and
+// ANY content. Over the erased epoch's key -- KDF.Nh zero bytes, which is what
+// PastEpochWindow's zeroize leaves behind and what the length can never see -- p6 produced a tag
+// and accepted it back, while p4's (*KeySchedule).MembershipTag and VerifyMembershipTag refused
+// the identical key through secretIsLive. Two doors into one rule, one of them guarded, and the
+// doc comment on the unguarded one steering p7 toward it.
+//
+// Both halves are derived. The DOORS come off the parameter name, so a third one is swept by
+// existing rather than by being added to a table; and which keys are unusable comes off p4's OWN
+// predicate rather than off an opinion here -- every row is asserted to be a key secretIsLive
+// calls dead before it is asked of p6, so the two plans are held to one class rather than to two
+// lists that agree today.
+//
+// The positive row is not decoration. Without it every refusal below is satisfied by a door that
+// refuses everything, which is the shape a sweep of nothing but negatives cannot see.
+func TestBothDoorsIntoSection62RefuseEveryKeyNoTagMayBeTakenUnder(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	nh := signed.crypto.HashSize()
+	live := bytes.Repeat([]byte{0x5a}, nh)
+	tag, err := ComputeMembershipTag(signed.crypto, live, signed.authContent, signed.groupContext)
+	if err != nil {
+		t.Fatalf("compute the tag every row below is run against: %v", err)
+	}
+	doors := map[string]func(t *testing.T, key []byte) error{
+		"ComputeMembershipTag": func(t *testing.T, key []byte) error {
+			answered, err := ComputeMembershipTag(signed.crypto, key, signed.authContent, signed.groupContext)
+			// a refusal that also hands back bytes is the shape this project shipped once: the
+			// caller reads the answer, the error goes to a log, and a tag derived from nothing
+			// travels.
+			if err != nil && answered != nil {
+				t.Errorf("ComputeMembershipTag refused with %v and handed back %x anyway", err, answered)
+			}
+			return err
+		},
+		"verifyMembershipTag": func(t *testing.T, key []byte) error {
+			return verifyMembershipTag(signed.crypto, key, signed.authContent, signed.groupContext, tag)
+		},
+	}
+	if got, want := slices.Sorted(maps.Keys(doors)), membershipTagDoorNames(t); !slices.Equal(got, want) {
+		t.Fatalf("this gate runs %v and this package's non test source takes a membership key at %v; a door with no row is a door with no guard",
+			got, want)
+	}
+	// p4's own predicate is what says which keys are unusable rather than this test's opinion of
+	// them. secretIsLive is the guard (*KeySchedule).MembershipTag and VerifyMembershipTag refuse
+	// through, and the whole of the finding was that section 6.2's other door never asked.
+	schedule := &KeySchedule{crypto: signed.crypto}
+	if !schedule.secretIsLive(live) {
+		t.Fatalf("p4's predicate calls the key every positive row is taken under erased, so the rows below compare two different classes")
+	}
+	for _, name := range slices.Sorted(maps.Keys(doors)) {
+		door := doors[name]
+		if err := door(t, live); err != nil {
+			t.Errorf("%s refused a live key of the provider's own width: %v", name, err)
+		}
+		for _, refusal := range membershipTagUnusableKeys(nh) {
+			if schedule.secretIsLive(refusal.key) {
+				t.Errorf("%s: p4's secretIsLive calls %s live, so this row asks the two plans for different things",
+					name, refusal.what)
+				continue
+			}
+			answered := door(t, refusal.key)
+			if !errors.Is(answered, refusal.sentinel) {
+				t.Errorf("%s over %s answered %v, want %v", name, refusal.what, answered, refusal.sentinel)
+			}
+			// and it is refused as what it is. A key the RECEIVER got wrong answered as ValSem007
+			// or ValSem008 sends the caller to look at a message that was never the problem, and
+			// a validator mapping sentinels to codes would report a rule the sender did not fail.
+			if errors.Is(answered, errBadMembershipTag) || errors.Is(answered, errMissingMembershipTag) {
+				t.Errorf("%s over %s answered a ValSem code about the MESSAGE (%v), and what was wrong was the receiver's own key",
+					name, refusal.what, answered)
+			}
+		}
+	}
+}
+
+// TestTheAbsentMembershipTagIsRefusedAheadOfEveryPreimageThatCannotBeBuilt is the ORDER of
+// verifyMembershipTag's first two message guards, which its own comment states and which nothing
+// observed.
+//
+// The order is invisible from every other test in this file. A tagless message whose preimage
+// assembles answers ValSem007 whichever side of the AuthenticatedContentTBMBytes call the guard is
+// written on, so what separates the two orders is exactly the input that is BOTH tagless and
+// unbuildable -- and there was none. Measured: the guard moved below the preimage build left the
+// whole of ./mls/... green.
+//
+// What the order is worth. A receiver that built the preimage first answers a message carrying no
+// membership tag at all with ErrUnknownSenderType or ErrMissingGroupContext, which is the
+// preimage's complaint about a structure nobody was going to authenticate; the rule that actually
+// refused the message is ValSem007, and a validator mapping sentinels to ValSem codes would have
+// none for it. It also does the assembly for a message that could not have been accepted however
+// it assembled.
+//
+// The class is framingStructuralPreimageRefusals', so a sender type or a wire format a later task
+// registers joins by existing, and each row is run over all three spellings of an absent tag for
+// emptyByteSpellings' reason.
+func TestTheAbsentMembershipTagIsRefusedAheadOfEveryPreimageThatCannotBeBuilt(t *testing.T) {
+	signed := framingSignedMemberMessage(t)
+	membershipKey := bytes.Repeat([]byte{0x5a}, signed.crypto.HashSize())
+	tag, err := ComputeMembershipTag(signed.crypto, membershipKey, signed.authContent, signed.groupContext)
+	if err != nil {
+		t.Fatalf("compute the tag the discriminating half is run with: %v", err)
+	}
+	structural := framingStructuralPreimageRefusals(t)
+	for _, name := range slices.Sorted(maps.Keys(structural)) {
+		one := structural[name]
+		lifted := &AuthenticatedContent{
+			WireFormat: one.wireFormat,
+			Content:    *one.content,
+			Auth:       signed.authContent.Auth,
+		}
+		// the discriminator first: carrying a tag, this row has to REACH the preimage and be
+		// answered by its refusal verbatim. Without that half every assertion below is satisfied
+		// by a verifier that answers ValSem007 to everything.
+		_, preimage := AuthenticatedContentTBMBytes(lifted, one.groupContext)
+		if preimage == nil {
+			t.Errorf("%s: the preimage was assembled, so this row states nothing about an ordering", name)
+			continue
+		}
+		if answered := verifyMembershipTag(signed.crypto, membershipKey, lifted, one.groupContext,
+			tag); answered == nil || answered.Error() != preimage.Error() {
+			t.Errorf("%s carrying a tag answered %v and the preimage refused with %v", name, answered, preimage)
+		}
+		for _, empty := range emptyByteSpellings() {
+			answered := verifyMembershipTag(signed.crypto, membershipKey, lifted, one.groupContext, empty.value)
+			if !errors.Is(answered, errMissingMembershipTag) {
+				t.Errorf("%s carrying a tag that is %s answered %v, want the ValSem007 sentinel: the absent tag is refused before the preimage is built",
+					name, empty.what, answered)
+			}
+		}
+	}
+	// the nil message is the preimage's other refusal and no row above can carry it, since a nil
+	// authenticated content has no wire format to key one on.
+	for _, empty := range emptyByteSpellings() {
+		answered := verifyMembershipTag(signed.crypto, membershipKey, nil, signed.groupContext, empty.value)
+		if !errors.Is(answered, errMissingMembershipTag) {
+			t.Errorf("a nil message carrying a tag that is %s answered %v, want the ValSem007 sentinel",
+				empty.what, answered)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what the commentary claims about the gates
+// ---------------------------------------------------------------------------
+
+// The gate this package's commentary cites as the one that reads every comparison it ships. Held
+// as the string the prose writes rather than as a reference to the function, because what is being
+// checked is whether the prose names something that exists.
+const membershipTagComparatorGate = "TestNothingThisPackageShipsComparesDataOutsideConstantTime"
+
+// membershipTagCommentBlocks is every run of consecutive line comments in one file, joined.
+//
+// The BLOCK and not the line, because a claim runs across several lines and a name cited on one of
+// them is a claim of the whole block. Read out of the file's text rather than out of go/parser's
+// doc comments because this package's parse helper reads source with SkipObjectResolution and
+// without ParseComments, so a declaration's Doc is nil under it.
+func membershipTagCommentBlocks(t *testing.T, path string) []string {
+	t.Helper()
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	blocks := []string{}
+	current := []string{}
+	for _, line := range strings.Split(string(source), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") {
+			current = append(current, trimmed)
+			continue
+		}
+		if len(current) != 0 {
+			blocks = append(blocks, strings.Join(current, "\n"))
+			current = nil
+		}
+	}
+	if len(current) != 0 {
+		blocks = append(blocks, strings.Join(current, "\n"))
+	}
+	return blocks
+}
+
+// TestTheMembershipTagCommentaryNamesGatesThatExistAndAClassThatHoldsItsSpellings measures the
+// claims this package's prose makes about its own gates.
+//
+// It is here because one of them was wrong in a way no test could see. verifyMembershipTag's
+// comment said "the package's derived comparator gate reads every comparison in this file's source
+// and finds eighteen such names". Eighteen is the count the ./message gate reports over its own
+// directory -- message/writeauth_test.go scans "." and is clean over a bytes.Equal planted in
+// mls/framing_protect.go -- and the gate that does read this file derives twenty six. A number
+// stated in a comment nothing recomputes is the half of a claim that goes stale in silence, so the
+// number is gone and what is left is checked.
+//
+// Three rules, each derived. Every Test name any production comment of this package cites must be
+// a test this package declares -- that rule found a second stale citation the moment it was
+// written, tree.go naming a gate that had been renamed. Every comparator spelling cited by a
+// comment that NAMES the comparator gate must be in the class that gate derives over this
+// package's imports, and the one exempt package must be seen to be outside it. And the file that
+// declares the verifier really must be one the cited gate reads, which is the half the wrong count
+// was a symptom of.
+func TestTheMembershipTagCommentaryNamesGatesThatExistAndAClassThatHoldsItsSpellings(t *testing.T) {
+	testNames := regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*\b`)
+	qualified := regexp.MustCompile(`\b([a-z][a-z0-9_]*)\.([A-Z][A-Za-z0-9_]*)\b`)
+
+	declared := map[string]bool{}
+	for _, path := range packageSourcePaths(t) {
+		if !strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		for _, declaration := range mustParseSource(t, path).file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if isFunction && function.Recv == nil {
+				declared[function.Name.Name] = true
+			}
+		}
+	}
+	if !declared[membershipTagComparatorGate] {
+		t.Fatalf("this package declares no %s, so the rules below check prose against nothing",
+			membershipTagComparatorGate)
+	}
+
+	production := parsedProductionSourcesOfThisPackage(t)
+	class := dataComparatorsOf(t, "this package's production source", production)
+	paths := map[string]string{}
+	for _, one := range importsOfSources(production) {
+		paths[one.name] = one.path
+	}
+
+	cited, claiming, spellings := 0, 0, 0
+	for _, path := range packageLevelFunctions(t).files {
+		for _, block := range membershipTagCommentBlocks(t, path) {
+			for _, name := range testNames.FindAllString(block, -1) {
+				cited++
+				if !declared[name] {
+					t.Errorf("%s cites %s and this package declares no such test; a gate named in prose that does not exist is a claim nobody can check",
+						path, name)
+				}
+			}
+			if !strings.Contains(block, membershipTagComparatorGate) {
+				continue
+			}
+			claiming++
+			for _, spelling := range qualified.FindAllStringSubmatch(block, -1) {
+				imported, isImported := paths[spelling[1]]
+				if !isImported {
+					// a package this source does not import is a package nothing here can call,
+					// so the comment is naming it as prose rather than as a spelling of the ban
+					continue
+				}
+				if imported == theConstantTimePackagePath {
+					if slices.Contains(class, spelling[0]) {
+						t.Errorf("%s names %s as the sanctioned comparison and the derived class holds it, so the gate it cites would ban the tool guardrail 8 names",
+							path, spelling[0])
+					}
+					continue
+				}
+				spellings++
+				if !slices.Contains(class, spelling[0]) {
+					t.Errorf("%s names %s as a spelling %s catches, and the class that gate derives over this package's imports does not hold it: %v",
+						path, spelling[0], membershipTagComparatorGate, class)
+				}
+			}
+		}
+	}
+	if cited == 0 || claiming == 0 || spellings == 0 {
+		t.Fatalf("%d test names, %d comment blocks naming %s and %d comparator spellings were read out of this package's commentary, and each of the three rules above runs over one of them",
+			cited, claiming, membershipTagComparatorGate, spellings)
+	}
+
+	// and the file the claim is about really is one the cited gate reads. This is the half the
+	// wrong count was a symptom of: the eighteen name gate scans ./message and never opens this
+	// directory, so citing "the package's derived comparator gate" without saying which one made
+	// the number wrong and the coverage unstated.
+	declaring := ""
+	for _, function := range packageLevelFunctions(t).functions {
+		if function.name == "verifyMembershipTag" {
+			declaring = function.file
+		}
+	}
+	if declaring == "" {
+		t.Fatal("this package declares no verifyMembershipTag, so the commentary this gate reads has no subject")
+	}
+	read := []string{}
+	for _, parsed := range production {
+		read = append(read, parsed.fileSet.Position(parsed.file.Pos()).Filename)
+	}
+	if !slices.Contains(read, declaring) {
+		t.Errorf("%s declares the membership tag verifier and %s reads %v, which does not include it",
+			declaring, membershipTagComparatorGate, read)
+	}
+	t.Logf("%d test names and %d comparator spellings were checked against %d comparators derived over this package's imports",
+		cited, spellings, len(class))
 }

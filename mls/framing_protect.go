@@ -16,6 +16,7 @@
 package mls
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 )
@@ -198,11 +199,39 @@ var errBadMembershipTag = errors.New("mls: membership tag does not verify")
 // The provider is checked before anything else is read, which is SignAuthenticatedContent's
 // discipline: a body that built its preimage first would answer ErrUnknownSenderType or
 // ErrMissingGroupContext to a caller whose actual mistake was passing no provider.
+//
+// THE KEY IS REFUSED TWICE before any of it is macced, and both refusals are about a key that
+// is publicly known rather than about tidiness. A membership_key that is not KDF.Nh bytes is
+// ErrSecretLength, which is what the nine other raw secret parameters of this package answer
+// for the reason that sentinel gives: a short key macs perfectly and produces a tag no peer
+// agrees with, and the mistake surfaces later as an unauthenticated message rather than as the
+// length it was. A membership_key that is KDF.Nh ZERO bytes is ErrEpochErased, and that one is
+// the forgery: an epoch leaving PastEpochWindow is zeroized IN PLACE, so the erase leaves the
+// header exactly as it was and no length check can see it, and an HMAC under a run of zeros is
+// not a weak tag but a PUBLIC one that any party computes with no knowledge of the group. It
+// would come back with err == nil.
+//
+// p4's (*KeySchedule).MembershipTag refuses exactly that key through secretIsLive, and section
+// 6.2 has these two doors into it. A guard on one door only is a guard on whichever door the
+// caller happened to pick, which is how this was found: p6's door accepted the erased key, a
+// nil key and a five byte key, and answered a tag for each.
+//
+// The zero test is crypto/subtle.ConstantTimeCompare against a run of zeros rather than a loop
+// that stops at the first non zero byte, for secretIsLive's reason: the whole key is read
+// whatever the first byte holds, so an erased epoch's refusal takes the same time as a live
+// epoch's answer and nothing about this epoch's own key is readable from how long it ran.
 func ComputeMembershipTag(crypto CryptoProvider, membershipKey []byte,
 	authContent *AuthenticatedContent, groupContext []byte) ([]byte, error) {
 
 	if crypto == nil {
 		return nil, fmt.Errorf("%w: the tag is the provider's mac", ErrNilCryptoProvider)
+	}
+	if len(membershipKey) != crypto.HashSize() {
+		return nil, fmt.Errorf("%w: membership key is %d bytes, want %d",
+			ErrSecretLength, len(membershipKey), crypto.HashSize())
+	}
+	if subtle.ConstantTimeCompare(membershipKey, make([]byte, len(membershipKey))) == 1 {
+		return nil, ErrEpochErased
 	}
 	tbm, err := AuthenticatedContentTBMBytes(authContent, groupContext)
 	if err != nil {
@@ -236,20 +265,51 @@ func ComputeMembershipTag(crypto CryptoProvider, membershipKey []byte,
 // comparison rather than comparing as much of the tag as fits -- a prefix comparison accepts
 // every truncation of a valid tag, which is a forgery an attacker finds in 256 tries.
 // bytes.Equal, hmac.Equal and bytes.HasPrefix all answer the same bool here and none of them is
-// this; the package's derived comparator gate reads every comparison in this file's source and
-// finds eighteen such names, so there is no spelling that routes around it. The bool MacVerify
-// answers is converted in the same expression that produces it and never leaves this function.
+// this. What says there is no spelling of them that routes around the rule is
+// TestNothingThisPackageShipsComparesDataOutsideConstantTime, in this package's own
+// constant_time_test.go: it reads every file this package ships, this one included, against a
+// class it DERIVES from the imports of that source, so those three are in it and so is every
+// comparator of every package a later edit imports. No count is written here on purpose. The
+// number this sentence used to give was the OTHER gate's -- message/writeauth_test.go scans its
+// own directory and reports clean over a bytes.Equal planted in this file -- and a count is the
+// half of a claim like this that goes stale in silence.
+// TestTheMembershipTagCommentaryNamesGatesThatExistAndAClassThatHoldsItsSpellings is what keeps
+// the two sentences above from being prose nobody measured. The bool MacVerify answers is
+// converted in the same expression that produces it and never leaves this function.
+//
+// The KEY is refused ahead of the message, on both counts ComputeMembershipTag's comment
+// states and for the reasons it gives. The ordering is that function's and the nil provider's:
+// a receiver whose membership_key is the wrong width or has been erased has made a mistake
+// about its OWN epoch, and a body that judged the message first would answer ValSem007 or the
+// preimage's own refusal to a caller whose actual fault was the key -- sending it to look at a
+// message that was never the problem. An erased key here is the whole rule failing open:
+// HMAC-SHA256 under KDF.Nh zero bytes is publicly computable, so every tag an attacker cares to
+// write verifies, and this is the only authentication a member's PublicMessage carries besides
+// the signature.
 //
 // The absent tag is refused before the preimage is built, and the refusal is written on the
 // LENGTH rather than on == nil, which is emptyByteSpellings' rule: a decoder that read an empty
 // opaque<V> hands back a slice that is non nil and has capacity, and a guard spelled == nil
 // accepts it. That input is a PublicMessage whose membership_tag field is present and empty --
 // wire legal, and a message no member could have produced.
+//
+// That ORDERING is observed rather than only stated, by
+// TestTheAbsentMembershipTagIsRefusedAheadOfEveryPreimageThatCannotBeBuilt. Moved below the
+// AuthenticatedContentTBMBytes call this guard still refuses every tagless message whose
+// preimage assembles, so what separates the two orders is only a message that is tagless AND
+// unbuildable -- and every one of those answers ValSem007 here.
 func verifyMembershipTag(crypto CryptoProvider, membershipKey []byte,
 	authContent *AuthenticatedContent, groupContext []byte, tag []byte) error {
 
 	if crypto == nil {
 		return fmt.Errorf("%w: the comparison is the provider's", ErrNilCryptoProvider)
+	}
+	if len(membershipKey) != crypto.HashSize() {
+		return fmt.Errorf("%w: membership key is %d bytes, want %d",
+			ErrSecretLength, len(membershipKey), crypto.HashSize())
+	}
+	if subtle.ConstantTimeCompare(membershipKey, make([]byte, len(membershipKey))) == 1 {
+		return ErrEpochErased
 	}
 	if len(tag) == 0 {
 		return errMissingMembershipTag
