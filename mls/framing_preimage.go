@@ -377,3 +377,88 @@ func AuthenticatedContentTBMBytes(authContent *AuthenticatedContent, groupContex
 	}
 	return w.Bytes()
 }
+
+// ---------------------------------------------------------------------------
+// the two section 6.3 AADs
+// ---------------------------------------------------------------------------
+
+// senderDataAAD is RFC 9420 section 6.3.2's structure of that name:
+//
+//	struct {
+//	    opaque group_id<V>;
+//	    uint64 epoch;
+//	    ContentType content_type;
+//	} SenderDataAAD;
+//
+// It is the associated data the sender data of a PrivateMessage is sealed under, and it is
+// exactly the cleartext header a message server is allowed to read -- which is the point of it.
+// Those three fields travel in the clear so the server can order and prune on them; putting them
+// in the AAD is what makes altering one a decryption that fails rather than a message that
+// arrives attributed to another group or another epoch.
+//
+// It does NOT carry authenticated_data, and that omission is the whole design of the pair rather
+// than a field somebody forgot. The sender data is opened FIRST -- it is what names the leaf whose
+// ratchet holds the content key -- so an AAD here that covered a field belonging to the content
+// step would make the two steps mutually dependent, and there would be no order in which a
+// receiver could do them.
+//
+// The omission is carried by the SIGNATURE and not by this comment, which is connect/message's
+// guardrail G4 one layer down: that layer has the same two-AAD shape, found that a shared builder
+// taking every field lets a field migrate between the two preimages silently, and closed it by
+// giving each AAD only the fields it is allowed to see. This function cannot reach
+// authenticated_data because it is not a parameter of it. A later task that wants it here has to
+// widen the signature, which is a diff a reviewer sees.
+func senderDataAAD(groupId []byte, epoch uint64, contentType ContentType) ([]byte, error) {
+	w := syntax.NewWriter()
+	w.WriteOpaque(groupId)
+	w.WriteUint64(epoch)
+	w.WriteUint8(uint8(contentType))
+	return w.Bytes()
+}
+
+// privateContentAAD is RFC 9420 section 6.3.1's structure of that name:
+//
+//	struct {
+//	    opaque group_id<V>;
+//	    uint64 epoch;
+//	    ContentType content_type;
+//	    opaque authenticated_data<V>;
+//	} PrivateContentAAD;
+//
+// It is the associated data the FramedContentTBS ciphertext is sealed under, and it is the sender
+// data's AAD followed by one more field.
+//
+// It is built by CALLING senderDataAAD rather than by writing those three fields again, which is
+// AuthenticatedContentTBMBytes' arrangement and it is here for that function's reason. The first
+// three fields of section 6.3.1's structure are section 6.3.2's structure, field for field and
+// octet for octet. Written out a second time they would be two assemblies of one header, agreeing
+// until the day one of them changes -- and nothing that round trips could see the disagreement,
+// because each AAD is only ever checked against itself. Written this way there is ONE assembly of
+// the shared header, so "the content AAD begins with the sender data AAD" is true by construction
+// rather than by a test that has to keep being true, and a field added to the header lands in both
+// because there is only one place to add it.
+//
+// The direction that is NOT structural is the one that matters, and it is stated here so the next
+// reader knows which way the guard points: a field can never migrate OUT of the content AAD into
+// the sender data's by accident, since this function's extra field is written here and
+// senderDataAAD cannot see it. The reverse -- widening senderDataAAD, which would put
+// authenticated_data into both -- is prevented by that function's parameter list rather than by
+// this one, and TestNeitherSectionSixThreeAadCoversAFieldTheOtherOwns is what observes both.
+func privateContentAAD(groupId []byte, epoch uint64, contentType ContentType,
+	authenticatedData []byte) ([]byte, error) {
+
+	header, err := senderDataAAD(groupId, epoch, contentType)
+	if err != nil {
+		return nil, err
+	}
+	w := syntax.NewWriter()
+	// WriteRaw and NOT WriteOpaque, for the reason AuthenticatedContentTBMBytes gives one
+	// structure up. These octets are the FIELDS of section 6.3.1's struct and not a nested
+	// vector inside it, so a length prefix in front of them produces an AAD this package agrees
+	// with itself about perfectly -- both halves would add it -- and no other implementation
+	// computes. Nothing round trips through an AAD, so no symmetry property in this package
+	// could see it.
+	w.WriteRaw(header)
+	w.WriteOpaque(authenticatedData)
+	return w.Bytes()
+}

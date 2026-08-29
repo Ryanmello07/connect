@@ -604,6 +604,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// preimage allowed past MaxVectorLength is one no peer running the default limit could
 		// have computed, which for a member's PublicMessage is a message the group drops.
 		"framing_preimage.go: syntax.NewWriter()",
+		// section 6.3's two AADs, the fifth and sixth preimages of that file. They open writers
+		// rather than being structures handed to syntax.Marshal for the reason the TBM above does:
+		// the content AAD's first three fields ARE the sender data AAD, so it is built by calling
+		// that one and appending, and a structure for each would assemble the shared header twice.
+		// The default limit and not the ratchet tree one, on the same reading: every field of a
+		// PrivateMessage header is an MLS structure capped at MaxVectorLength, and an AAD over a
+		// header allowed past that is associated data no peer running the default limit could
+		// reproduce -- which is a decryption that fails for a reason nobody can attribute.
+		"framing_preimage.go: syntax.NewWriter()",
+		"framing_preimage.go: syntax.NewWriter()",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
@@ -1404,6 +1414,22 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// published through it, which a verifier reaching for a provider of its own could not pass
 	// at a suite whose mac is not this one.
 	"verifyMembershipTag": "answers an error and no bytes, and reaches only MacVerify, which the tagging provider passes through",
+
+	// framing's ValSem005, ValSem007, ValSem008 and ValSem010 together. Its answer is a VIEW over
+	// the message it was handed rather than bytes it produced, and the two provider methods it
+	// reaches -- MacVerify and VerifyWithLabel -- are both ones taggingProviderPassesThrough names
+	// as unflippable, because a bool and an error have nothing to flip. A row here would report
+	// "did not route through its provider" for every possible implementation.
+	//
+	// It is not unheld, and the sweeps that hold it are the ones that separate its two
+	// authenticators. TestProviderHasNoRemainingStubs moves its key, its message, its resolver and
+	// its group context and requires each to change the verdict;
+	// TestPublicMessageRefusesForgedMembershipTag sweeps every bit and every length of the tag;
+	// TestOpenPublicMessageRefusesEveryFlippedBitOfTheSignature does the same for the signature
+	// with the tag RECOMPUTED for each row, which is what makes it a statement about ValSem010
+	// rather than about the tag standing in front of it; and
+	// TestOpenPublicMessageRefusesEveryKeyButTheSendersOwn sweeps the resolver's answer.
+	"OpenPublicMessage": "answers a verdict and a view over its own argument, and reaches only MacVerify and VerifyWithLabel, both of which the tagging provider passes through",
 }
 
 // A construction handed a provider computes with that provider and not with one of its
@@ -1724,6 +1750,29 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("ComputeMembershipTag: %v", tagErr)
 			}
 			return tag
+		}},
+		// section 6.2's seal. The only thing it PRODUCES is the membership tag -- the rest of the
+		// message it answers is the caller's own content carried through -- so the tag is what is
+		// read here, on ComputeMembershipTag's terms: a seal that computed the hmac itself, or that
+		// reached for a provider of its own, hands back the same bytes over a wrapper that flips
+		// every answer.
+		{name: "SealPublicMessage", call: func(crypto CryptoProvider) []byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			content := framingStubFramedContent()
+			content.ContentType = ContentTypeProposal
+			content.ApplicationData = nil
+			content.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 5}}
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPublicMessage, content, groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the seal row reads: %v", signErr)
+			}
+			message, sealErr := SealPublicMessage(crypto,
+				bytes.Repeat([]byte{0x6b}, crypto.HashSize()), authContent, groupContext)
+			if sealErr != nil {
+				t.Fatalf("SealPublicMessage: %v", sealErr)
+			}
+			return message.MembershipTag
 		}},
 	} {
 		covered = append(covered, testCase.name)

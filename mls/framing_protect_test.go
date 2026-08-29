@@ -136,6 +136,102 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 		t.Fatalf("compute the membership tag the verify row reads: %v", err)
 	}
 	arguments["verifyMembershipTag.tag"] = tag
+
+	// section 6.2's seal and open. Both rows need a base call that SUCCEEDS, for the reason the
+	// tag above is a real one: a base call that refused would leave every perturbation below it
+	// comparing one refusal against another, and would report a construction that reads none of
+	// its inputs as one that observes all of them.
+	//
+	// The content is a PROPOSAL and not the application message the rows above are built over,
+	// because ValSem005 refuses an application message in a public frame -- that is the rule these
+	// two exist to hold, not a shape they can be measured through. It is signed under
+	// WireFormatPublicMessage, because the wire format is inside the signature preimage and the
+	// seal refuses any other; and its sender is a member, because that is the arm section 6.2
+	// gives a membership tag and therefore the only arm in which the membership key is read at all.
+	sealContent := framingStubFramedContent()
+	sealContent.ContentType = ContentTypeProposal
+	sealContent.ApplicationData = nil
+	sealContent.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 5}}
+	sealed, err := SignAuthenticatedContent(fixture, priv, WireFormatPublicMessage,
+		sealContent, encodedGroupContext)
+	if err != nil {
+		t.Fatalf("sign the message the SealPublicMessage row reads: %v", err)
+	}
+	arguments["SealPublicMessage.membershipKey"] = membershipKey
+	arguments["SealPublicMessage.authContent"] = sealed
+	arguments["SealPublicMessage.groupContext"] = encodedGroupContext
+	message, err := SealPublicMessage(fixture, membershipKey, sealed, encodedGroupContext)
+	if err != nil {
+		t.Fatalf("seal the message the OpenPublicMessage row reads: %v", err)
+	}
+	pub, isKey := arguments["SignaturePublicKey"].(SignaturePublicKey)
+	if !isKey {
+		t.Fatal("the stub arguments hold no signature public key, so the open row has no resolver to build")
+	}
+	arguments["OpenPublicMessage.membershipKey"] = membershipKey
+	arguments["OpenPublicMessage.message"] = message
+	arguments["OpenPublicMessage.resolve"] = StaticSignatureKey(pub)
+	arguments["OpenPublicMessage.groupContext"] = encodedGroupContext
+}
+
+// providerPublicMessagePerturbations moves the epoch of the message being opened.
+//
+// It is providerAuthenticatedContentPerturbations' rule and it is here for that rule's reason,
+// with one more consequence: BOTH authenticators travel with the value unchanged, so what this
+// asks is whether the open rebuilt both preimages out of the message it was handed. An open that
+// checked either authenticator against anything but a preimage over these bytes answers the same
+// thing twice.
+func providerPublicMessagePerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base := argument.Interface().(*PublicMessage)
+	if base == nil {
+		t.Fatalf("the base argument for %s.%s is a nil public message, so perturbing it changes nothing",
+			operation, parameter.name)
+	}
+	moved := *base
+	moved.Content.Epoch++
+	return []providerPerturbation{{where: "epoch one higher", value: reflect.ValueOf(&moved)}}
+}
+
+// providerSignatureKeyResolverPerturbations answers a resolver that hands back a DIFFERENT key.
+//
+// The resolver is the one argument of the open that is not bytes, and what it decides is whose
+// signature the message is checked against -- the whole of ValSem010 at this layer. An open whose
+// answer did not reach the verification would accept any member's message under any other
+// member's leaf, so what is moved is the ANSWER and not the shape: the base resolver's own key
+// with a byte flipped, which is a key nothing ever signed with.
+//
+// The positions come off the key's length rather than being written down, which is
+// perturbedPositions' rule: moving only the last byte states that the last byte is read.
+func providerSignatureKeyResolverPerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base, isResolver := argument.Interface().(SignatureKeyResolver)
+	if !isResolver || base == nil {
+		t.Fatalf("the base argument for %s.%s is not a resolver, so perturbing it changes nothing",
+			operation, parameter.name)
+	}
+	answered, err := base(Sender{SenderType: SenderTypeMember})
+	if err != nil {
+		t.Fatalf("the base resolver for %s.%s refused: %v", operation, parameter.name, err)
+	}
+	if len(answered) == 0 {
+		t.Fatalf("the base resolver for %s.%s answers no key, so a flipped one is not a different one",
+			operation, parameter.name)
+	}
+	moved := []providerPerturbation{}
+	for _, at := range perturbedPositions(len(answered)) {
+		flipped := append([]byte(nil), answered...)
+		flipped[at] ^= 0xff
+		moved = append(moved, providerPerturbation{
+			where: fmt.Sprintf("the key it answers, byte %d of %d", at, len(answered)),
+			value: reflect.ValueOf(StaticSignatureKey(SignaturePublicKey(flipped))),
+		})
+	}
+	return moved
 }
 
 // providerFramedContentPerturbations moves the epoch of a framed content and nothing else.
@@ -1234,6 +1330,24 @@ func TestTheFramingRefusalsAnswerTheirOwnSentinels(t *testing.T) {
 		{name: "errBadMembershipTag", value: errBadMembershipTag,
 			other: []error{errMissingMembershipTag, errFramedContentBadSignature, errBadSignature,
 				errMissingConfirmationTag, ErrCryptoBadSignature, ErrSenderNotMember}},
+		// ValSem005. It names both tag refusals and the signature's, because a validator that
+		// could not tell "this was framed in the clear" from "this was not authenticated" would
+		// report the wrong rule for the wrong message -- and it names the structural pair next
+		// door, because an application message in a public frame is neither an arm mismatch nor
+		// an unregistered content type.
+		{name: "errApplicationMustBeCiphertext", value: errApplicationMustBeCiphertext,
+			other: []error{errMissingMembershipTag, errBadMembershipTag, errFramedContentBadSignature,
+				errBadSignature, errMissingConfirmationTag, ErrCryptoBadSignature,
+				ErrContentArmMismatch, ErrUnknownContentType, ErrWireFormatMismatch}},
+		// the two argument refusals section 6.2's open adds. Each names the other and both name
+		// the framing layer's existing pair: "the caller passed nothing" and "no key exists for
+		// this sender" are different things to do about, and neither is a message that failed.
+		{name: "errNilPublicMessage", value: errNilPublicMessage,
+			other: []error{errNilAuthenticatedContent, errNilFramedContent, errNilSignatureKeyResolver,
+				errApplicationMustBeCiphertext, errFramedContentBadSignature}},
+		{name: "errNilSignatureKeyResolver", value: errNilSignatureKeyResolver,
+			other: []error{errNilAuthenticatedContent, errNilFramedContent, errNilPublicMessage,
+				errApplicationMustBeCiphertext, errFramedContentBadSignature}},
 	} {
 		if one.value == nil || one.value.Error() == "" {
 			t.Fatalf("%s is nil or has an empty message", one.name)
@@ -2579,7 +2693,12 @@ func membershipTagUnusableKeys(nh int) []membershipTagKeyRefusal {
 // refuses everything, which is the shape a sweep of nothing but negatives cannot see.
 func TestBothDoorsIntoSection62RefuseEveryKeyNoTagMayBeTakenUnder(t *testing.T) {
 	signed := framingSignedMemberMessage(t)
+	sealed := framingSealedMemberProposal(t)
 	nh := signed.crypto.HashSize()
+	if sealed.crypto.HashSize() != nh {
+		t.Fatalf("the two fixtures run at KDF.Nh %d and %d, so one set of key widths cannot be swept through both",
+			nh, sealed.crypto.HashSize())
+	}
 	live := bytes.Repeat([]byte{0x5a}, nh)
 	tag, err := ComputeMembershipTag(signed.crypto, live, signed.authContent, signed.groupContext)
 	if err != nil {
@@ -2593,6 +2712,34 @@ func TestBothDoorsIntoSection62RefuseEveryKeyNoTagMayBeTakenUnder(t *testing.T) 
 			// travels.
 			if err != nil && answered != nil {
 				t.Errorf("ComputeMembershipTag refused with %v and handed back %x anyway", err, answered)
+			}
+			return err
+		},
+		// section 6.2's two wire format doors, which reach the key through the two above. They are
+		// swept here because the class is the PARAMETER, not the pair somebody wrote a table for:
+		// each is a declaration a caller can hand an erased epoch's key to, and each has to refuse
+		// it rather than mac under a run of zeros any party can compute.
+		//
+		// Both rows run over a message sealed for the PUBLIC wire format and carrying a proposal,
+		// because ValSem005 refuses an application message here and the seal refuses any other wire
+		// format -- the fixture the two rows above use is a private-format application message and
+		// would be refused by the rule under test rather than by the key.
+		"SealPublicMessage": func(t *testing.T, key []byte) error {
+			message, err := SealPublicMessage(sealed.crypto, key, sealed.authContent, sealed.groupContext)
+			// a refusal that also hands back a message is ComputeMembershipTag's shape one layer
+			// out: the caller reads the answer, the error goes to a log, and a public message
+			// travels carrying a tag derived from nothing.
+			if err != nil && message != nil {
+				t.Errorf("SealPublicMessage refused with %v and handed back a message carrying %x anyway",
+					err, message.MembershipTag)
+			}
+			return err
+		},
+		"OpenPublicMessage": func(t *testing.T, key []byte) error {
+			opened, err := OpenPublicMessage(sealed.crypto, key, sealed.message,
+				StaticSignatureKey(sealed.pub), sealed.groupContext)
+			if err != nil && opened != nil {
+				t.Errorf("OpenPublicMessage refused with %v and handed back an authenticated content anyway", err)
 			}
 			return err
 		},
@@ -2853,4 +3000,472 @@ func TestTheMembershipTagCommentaryNamesGatesThatExistAndAClassThatHoldsItsSpell
 	}
 	t.Logf("%d test names and %d comparator spellings were checked against %d comparators derived over this package's imports",
 		cited, spellings, len(class))
+}
+
+// ---------------------------------------------------------------------------
+// SealPublicMessage and OpenPublicMessage, RFC 9420 section 6.2
+// ---------------------------------------------------------------------------
+
+// framingSealed is one sealed member proposal together with everything needed to open it, built
+// once per test so that each test below varies one thing rather than declaring a slightly
+// different value. It is framingSigned's arrangement one layer out.
+type framingSealed struct {
+	crypto        CryptoProvider
+	priv          SignaturePrivateKey
+	pub           SignaturePublicKey
+	groupContext  []byte
+	membershipKey []byte
+	authContent   *AuthenticatedContent
+	message       *PublicMessage
+}
+
+func framingSealedMemberProposal(t *testing.T) framingSealed {
+	t.Helper()
+	crypto := newTestCrypto(t)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("key pair: %v", err)
+	}
+	groupContext := framingTestGroupContext(t)
+	membershipKey := bytes.Repeat([]byte{0x5a}, crypto.HashSize())
+	authContent, err := SignAuthenticatedContent(crypto, priv, WireFormatPublicMessage,
+		framingTestProposalContent(), groupContext)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	message, err := SealPublicMessage(crypto, membershipKey, authContent, groupContext)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	return framingSealed{crypto: crypto, priv: priv, pub: pub, groupContext: groupContext,
+		membershipKey: membershipKey, authContent: authContent, message: message}
+}
+
+// TestPublicMessageSealOpenRoundTrip runs the whole path a peer runs: sign, seal, serialize, parse
+// somebody else's octets, open.
+//
+// The serialization in the middle is what makes this more than a seal-then-open. Every field the
+// two authenticators cover has to survive the codec for this to pass, so a codec that dropped one
+// or moved one shows up here as an authentication failure rather than as a difference nothing
+// compares.
+//
+// What it CANNOT see is stated so nobody reads it as the guard: it is a symmetry property, so an
+// open that skipped either authenticator passes it, and so does a seal that took the tag under the
+// wrong key -- both halves would be wrong the same way. The refusal sweeps below are what hold
+// those.
+func TestPublicMessageSealOpenRoundTrip(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	encoded, err := syntax.Marshal(sealed.message)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded := PublicMessage{}
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	opened, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, &decoded,
+		StaticSignatureKey(sealed.pub), sealed.groupContext)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if opened.WireFormat != WireFormatPublicMessage {
+		t.Errorf("opened under wire format %d, want %d", opened.WireFormat, WireFormatPublicMessage)
+	}
+	if opened.Content.Proposal == nil || opened.Content.Proposal.Remove == nil ||
+		opened.Content.Proposal.Remove.Removed != 3 {
+		t.Fatalf("opened %+v", opened.Content.Proposal)
+	}
+}
+
+// TestPublicMessageRefusesApplicationContent is ValSem005, in both directions.
+//
+// The receive half is the one that has to exist. A sender's guard protects nobody from a peer that
+// does not run this code, and the message it refuses is the user's own plaintext travelling in an
+// authenticated but unencrypted frame -- so a receiver that accepted one would be handing an
+// application message up to the caller having only checked that somebody signed it.
+func TestPublicMessageRefusesApplicationContent(t *testing.T) {
+	crypto := newTestCrypto(t)
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("key pair: %v", err)
+	}
+	groupContext := framingTestGroupContext(t)
+	membershipKey := bytes.Repeat([]byte{0x5a}, crypto.HashSize())
+
+	authContent, err := SignAuthenticatedContent(crypto, priv, WireFormatPublicMessage,
+		framingTestMemberContent(), groupContext)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err = SealPublicMessage(crypto, membershipKey, authContent, groupContext); !errors.Is(err, errApplicationMustBeCiphertext) {
+		t.Fatalf("seal: got %v, want errApplicationMustBeCiphertext", err)
+	}
+
+	// a hostile peer that hands us one anyway is refused on receipt, and it is refused with a
+	// tag that WOULD have verified -- so what refuses it is ValSem005 and not the tag rule
+	// standing in front of it.
+	hostile := &PublicMessage{Content: *framingTestMemberContent(), Auth: authContent.Auth}
+	tag, err := ComputeMembershipTag(crypto, membershipKey, hostile.AuthenticatedContent(), groupContext)
+	if err != nil {
+		t.Fatalf("the tag the hostile message carries: %v", err)
+	}
+	hostile.MembershipTag = tag
+	_, err = OpenPublicMessage(crypto, membershipKey, hostile, StaticSignatureKey(pub), groupContext)
+	if !errors.Is(err, errApplicationMustBeCiphertext) {
+		t.Fatalf("open: got %v, want errApplicationMustBeCiphertext", err)
+	}
+}
+
+// TestPublicMessageRefusesMissingMembershipTag is ValSem007 on the open path, over every spelling
+// of an empty byte run for emptyByteSpellings' reason.
+//
+// It is what says the open CHECKS the tag at all for a member sender. An open that never reached
+// verifyMembershipTag would answer nil here, having verified the signature of a message whose only
+// statement that its sender is inside this group is absent.
+func TestPublicMessageRefusesMissingMembershipTag(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	for _, empty := range emptyByteSpellings() {
+		stripped := *sealed.message
+		stripped.MembershipTag = empty.value
+		_, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, &stripped,
+			StaticSignatureKey(sealed.pub), sealed.groupContext)
+		if !errors.Is(err, errMissingMembershipTag) {
+			t.Errorf("a tag that is %s: got %v, want errMissingMembershipTag", empty.what, err)
+		}
+	}
+}
+
+// TestPublicMessageRefusesForgedMembershipTag is ValSem008 on the open path, over every flipped bit
+// of the tag and every key but the right one, rather than over the one corruption somebody thought
+// of.
+//
+// The derivation is rule 5's and this project has the measurement behind it: a tag verifier that
+// read the first byte of a thirty two byte tag passed a test that flipped bit zero of byte zero,
+// and a verifier that accepted every truncation passed a suite with no length case in it.
+func TestPublicMessageRefusesForgedMembershipTag(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	if len(sealed.message.MembershipTag) != sealed.crypto.HashSize() {
+		t.Fatalf("the sealed tag is %d bytes, want the provider's %d",
+			len(sealed.message.MembershipTag), sealed.crypto.HashSize())
+	}
+	for at := 0; at < len(sealed.message.MembershipTag); at += 1 {
+		for bit := 0; bit < 8; bit += 1 {
+			tampered := *sealed.message
+			tampered.MembershipTag = append([]byte(nil), sealed.message.MembershipTag...)
+			tampered.MembershipTag[at] ^= 1 << uint(bit)
+			_, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, &tampered,
+				StaticSignatureKey(sealed.pub), sealed.groupContext)
+			if !errors.Is(err, errBadMembershipTag) {
+				t.Fatalf("bit %d of tag octet %d flipped: got %v, want errBadMembershipTag", bit, at, err)
+			}
+		}
+	}
+	// and every truncation and extension of it, which is the class a prefix comparison accepts
+	for n := 0; n <= 2*len(sealed.message.MembershipTag); n += 1 {
+		if n == len(sealed.message.MembershipTag) {
+			continue
+		}
+		tampered := *sealed.message
+		resized := make([]byte, n)
+		copy(resized, sealed.message.MembershipTag)
+		tampered.MembershipTag = resized
+		want := errBadMembershipTag
+		if n == 0 {
+			want = errMissingMembershipTag
+		}
+		_, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, &tampered,
+			StaticSignatureKey(sealed.pub), sealed.groupContext)
+		if !errors.Is(err, want) {
+			t.Fatalf("a %d byte tag: got %v, want %v", n, err, want)
+		}
+	}
+	// and the tag taken under a key that is live and is not this epoch's
+	wrongKey := bytes.Repeat([]byte{0x5b}, sealed.crypto.HashSize())
+	_, err := OpenPublicMessage(sealed.crypto, wrongKey, sealed.message,
+		StaticSignatureKey(sealed.pub), sealed.groupContext)
+	if !errors.Is(err, errBadMembershipTag) {
+		t.Fatalf("wrong key: got %v, want errBadMembershipTag", err)
+	}
+}
+
+// TestOpenPublicMessageRefusesEveryFlippedBitOfTheSignature is ValSem010 on this path, and it is
+// what says the open verifies the SIGNATURE and not only the tag.
+//
+// Nothing else in this file states that. The round trip is symmetric, the tag sweep above passes
+// unchanged over an open that never reaches VerifyAuthenticatedContent, and the membership tag is
+// taken under a key every member of the group holds -- so an open that stopped at the tag would
+// accept any member's forgery of any other member's message, which is the whole distinction the
+// two authenticators exist to draw.
+//
+// Every bit rather than one, and every length, for TestPublicMessageRefusesForgedMembershipTag's
+// reason. Each row re-computes the membership tag over the tampered content, so what is being
+// refused is the signature and not the tag standing in front of it.
+func TestOpenPublicMessageRefusesEveryFlippedBitOfTheSignature(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	signature := sealed.message.Auth.Signature
+	if len(signature) == 0 {
+		t.Fatal("the sealed message carries no signature, so there is nothing here to flip")
+	}
+	forged := func(t *testing.T, what string, replacement []byte) {
+		t.Helper()
+		tampered := *sealed.message
+		tampered.Auth = FramedContentAuthData{Signature: replacement}
+		tag, err := ComputeMembershipTag(sealed.crypto, sealed.membershipKey,
+			tampered.AuthenticatedContent(), sealed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: the tag over the tampered message: %v", what, err)
+		}
+		tampered.MembershipTag = tag
+		_, err = OpenPublicMessage(sealed.crypto, sealed.membershipKey, &tampered,
+			StaticSignatureKey(sealed.pub), sealed.groupContext)
+		if !errors.Is(err, errFramedContentBadSignature) {
+			t.Fatalf("%s: got %v, want errFramedContentBadSignature", what, err)
+		}
+	}
+	for at := 0; at < len(signature); at += 1 {
+		for bit := 0; bit < 8; bit += 1 {
+			flipped := append([]byte(nil), signature...)
+			flipped[at] ^= 1 << uint(bit)
+			forged(t, fmt.Sprintf("bit %d of signature octet %d", bit, at), flipped)
+		}
+	}
+	for n := 0; n <= 2*len(signature); n += 1 {
+		if n == len(signature) {
+			continue
+		}
+		resized := make([]byte, n)
+		copy(resized, signature)
+		forged(t, fmt.Sprintf("a %d byte signature", n), resized)
+	}
+}
+
+// TestOpenPublicMessageRefusesEveryKeyButTheSendersOwn sweeps the resolver's answer.
+//
+// A signature verification that was reached but handed the wrong key answers exactly what a
+// verification that never happened answers, for a message whose signature is valid: nil. What
+// separates them is a key that is not the signer's, and the class of those is every OTHER key --
+// so this sweeps freshly generated pairs rather than one, and a truncated and an extended key too,
+// which is the length class a verifier that compares prefixes accepts.
+func TestOpenPublicMessageRefusesEveryKeyButTheSendersOwn(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	refused := 0
+	for row := 0; row < 8; row += 1 {
+		_, other, err := sealed.crypto.SignatureKeyPair()
+		if err != nil {
+			t.Fatalf("another key pair: %v", err)
+		}
+		if bytes.Equal(other, sealed.pub) {
+			t.Fatalf("the provider answered the sender's own key at row %d", row)
+		}
+		_, err = OpenPublicMessage(sealed.crypto, sealed.membershipKey, sealed.message,
+			StaticSignatureKey(other), sealed.groupContext)
+		if !errors.Is(err, errFramedContentBadSignature) {
+			t.Fatalf("row %d under another member's key: got %v, want errFramedContentBadSignature", row, err)
+		}
+		refused += 1
+	}
+	for n := 0; n <= 2*len(sealed.pub); n += 1 {
+		if n == len(sealed.pub) {
+			continue
+		}
+		resized := make([]byte, n)
+		copy(resized, sealed.pub)
+		_, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, sealed.message,
+			StaticSignatureKey(resized), sealed.groupContext)
+		if !errors.Is(err, errFramedContentBadSignature) {
+			t.Fatalf("a %d byte key: got %v, want errFramedContentBadSignature", n, err)
+		}
+		refused += 1
+	}
+	if refused == 0 {
+		t.Fatal("no wrong key was refused, so this observed nothing")
+	}
+}
+
+// TestOpenPublicMessageAnswersItsResolversRefusalVerbatim states the other half of the resolver's
+// contract.
+//
+// "No key could be found for this sender" is not a signature failure. It is what a receive path
+// answers for a message from a leaf that has been removed or was never in the tree, there is
+// nothing to verify against, and a caller has a different thing to do about it -- so it is
+// answered verbatim rather than collapsed into ValSem010.
+func TestOpenPublicMessageAnswersItsResolversRefusalVerbatim(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	own := errors.New("no key for that leaf")
+	asked := 0
+	_, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, sealed.message,
+		func(sender Sender) (SignaturePublicKey, error) {
+			asked += 1
+			if sender.SenderType != SenderTypeMember || sender.LeafIndex != sealed.message.Content.Sender.LeafIndex {
+				t.Errorf("the resolver was asked about %+v, want the message's own sender %+v",
+					sender, sealed.message.Content.Sender)
+			}
+			return nil, own
+		}, sealed.groupContext)
+	if !errors.Is(err, own) {
+		t.Fatalf("got %v, want the resolver's own refusal", err)
+	}
+	if errors.Is(err, errFramedContentBadSignature) {
+		t.Error("the resolver's refusal answers to the signature refusal, so a caller cannot tell a missing key from a forgery")
+	}
+	if asked != 1 {
+		t.Errorf("the resolver was asked %d times, want once", asked)
+	}
+}
+
+// TestOpenPublicMessageRefusesAContentSignedUnderAnotherWireFormat is what the wire format is doing
+// inside the section 6.1 preimage, observed at this layer.
+//
+// The message is a real signature over a real FramedContent, re-framed as a PublicMessage by a
+// peer that has both. Its membership tag is recomputed over the PUBLIC view, so the tag verifies
+// and what refuses the message is the signature -- which is the only thing left to refuse it, and
+// the reason the wire format is bound into the preimage rather than merely carried beside it.
+func TestOpenPublicMessageRefusesAContentSignedUnderAnotherWireFormat(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	registry := registryConstantsOfType(t, "WireFormat")
+	refused := 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		wireFormat := WireFormat(registry[name])
+		if wireFormat == WireFormatPublicMessage {
+			continue
+		}
+		elsewhere, err := SignAuthenticatedContent(sealed.crypto, sealed.priv, wireFormat,
+			framingTestProposalContent(), sealed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: sign: %v", name, err)
+		}
+		replayed := &PublicMessage{Content: elsewhere.Content, Auth: elsewhere.Auth}
+		tag, err := ComputeMembershipTag(sealed.crypto, sealed.membershipKey,
+			replayed.AuthenticatedContent(), sealed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: the tag over the replayed message: %v", name, err)
+		}
+		replayed.MembershipTag = tag
+		_, err = OpenPublicMessage(sealed.crypto, sealed.membershipKey, replayed,
+			StaticSignatureKey(sealed.pub), sealed.groupContext)
+		if !errors.Is(err, errFramedContentBadSignature) {
+			t.Fatalf("%s: got %v, want errFramedContentBadSignature", name, err)
+		}
+		refused += 1
+	}
+	if refused == 0 {
+		t.Fatal("no other wire format was replayed, so this observed nothing")
+	}
+}
+
+// TestSealPublicMessageRefusesEveryWireFormatButItsOwn is the send side of the same binding.
+//
+// A caller that signed under one format and sealed under another would ship a signature that
+// verifies against neither, and the failure would surface at every peer as ValSem010 rather than as
+// the caller's own mistake. Refused rather than re-stamped, for framedContentTBS's reason: a
+// re-stamp would sign bytes describing a message the caller did not build.
+func TestSealPublicMessageRefusesEveryWireFormatButItsOwn(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	registry := registryConstantsOfType(t, "WireFormat")
+	refused, accepted := 0, 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		wireFormat := WireFormat(registry[name])
+		authContent, err := SignAuthenticatedContent(sealed.crypto, sealed.priv, wireFormat,
+			framingTestProposalContent(), sealed.groupContext)
+		if err != nil {
+			t.Fatalf("%s: sign: %v", name, err)
+		}
+		_, err = SealPublicMessage(sealed.crypto, sealed.membershipKey, authContent, sealed.groupContext)
+		if wireFormat == WireFormatPublicMessage {
+			if err != nil {
+				t.Fatalf("%s: seal: %v", name, err)
+			}
+			accepted += 1
+			continue
+		}
+		if !errors.Is(err, ErrWireFormatMismatch) {
+			t.Fatalf("%s: got %v, want ErrWireFormatMismatch", name, err)
+		}
+		refused += 1
+	}
+	if refused == 0 || accepted != 1 {
+		t.Fatalf("the sweep refused %d wire formats and accepted %d; with either half empty this states one rule rather than two",
+			refused, accepted)
+	}
+}
+
+// TestSealAndOpenCarryEverySenderTypeSectionSixTwoAdmits sweeps the sender type registry through
+// both halves.
+//
+// The membership tag arm is the thing being swept. Section 6.2 gives the field to a member and to
+// nobody else, because nobody else has a membership_key: an external sender has no leaf, and a new
+// member has not joined. A seal that attached one anyway produces a message every other
+// implementation refuses at the field after it; a seal that attached none produces a member's
+// message with one of its two authenticators missing. A single-arm test is passed by both.
+//
+// Which sender types bind the group context comes off senderBindsGroupContext rather than off a
+// list here, so the two halves cannot drift: the preimage's own rule decides what this test
+// supplies.
+func TestSealAndOpenCarryEverySenderTypeSectionSixTwoAdmits(t *testing.T) {
+	sealed := framingSealedMemberProposal(t)
+	registry := registryConstantsOfType(t, "SenderType")
+	swept := 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		senderType := SenderType(registry[name])
+		binds, err := senderBindsGroupContext(senderType)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		groupContext := []byte(nil)
+		if binds {
+			groupContext = sealed.groupContext
+		}
+		content := framingTestProposalContent()
+		content.Sender = *testSenderOfType(senderType)
+		authContent, err := SignAuthenticatedContent(sealed.crypto, sealed.priv,
+			WireFormatPublicMessage, content, groupContext)
+		if err != nil {
+			t.Fatalf("%s: sign: %v", name, err)
+		}
+		message, err := SealPublicMessage(sealed.crypto, sealed.membershipKey, authContent, groupContext)
+		if err != nil {
+			t.Fatalf("%s: seal: %v", name, err)
+		}
+		carries := senderType == SenderTypeMember
+		if got := len(message.MembershipTag) != 0; got != carries {
+			t.Errorf("%s: the sealed message carries a membership tag = %v, want %v", name, got, carries)
+			continue
+		}
+		opened, err := OpenPublicMessage(sealed.crypto, sealed.membershipKey, message,
+			StaticSignatureKey(sealed.pub), groupContext)
+		if err != nil {
+			t.Fatalf("%s: open: %v", name, err)
+		}
+		if opened.Content.Sender.SenderType != senderType {
+			t.Errorf("%s: opened a message from sender type %d", name, opened.Content.Sender.SenderType)
+			continue
+		}
+		swept += 1
+	}
+	if swept != len(registry) {
+		t.Fatalf("%d of the %d sender types were carried through seal and open", swept, len(registry))
+	}
+}
+
+// TestStaticSignatureKeyAnswersOneKeyForEverySender states what that resolver is and, by stating
+// it, states what it must not be used for.
+//
+// It answers the same key whatever the sender says, which is right for the published vectors and
+// for a two party test and is wrong for a group: a receive path wired to this would accept any
+// member's message under any other member's leaf index. It is swept over the sender type registry
+// so that "for every sender" is the class rather than the one sender somebody passed.
+func TestStaticSignatureKeyAnswersOneKeyForEverySender(t *testing.T) {
+	pub := SignaturePublicKey(bytes.Repeat([]byte{0x7c}, 32))
+	resolve := StaticSignatureKey(pub)
+	registry := registryConstantsOfType(t, "SenderType")
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		answered, err := resolve(*testSenderOfType(SenderType(registry[name])))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if !bytes.Equal(answered, pub) {
+			t.Errorf("%s: answered %x, want %x", name, answered, pub)
+		}
+	}
 }

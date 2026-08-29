@@ -2797,6 +2797,12 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	"VerifyAuthenticatedContent": "answers an error and no bytes; what it produces is a verdict",
 	// framing's ValSem007 and ValSem008, on the same terms and for the same reason.
 	"verifyMembershipTag": "answers an error and no bytes; what it produces is a verdict",
+	// section 6.2's open, on the same terms with one difference worth naming: it DOES answer a
+	// structure, and every byte of that structure is the caller's own message carried through.
+	// There is nothing here it produced, so the aliasing and fresh storage halves have nothing to
+	// read -- and the "leaves its input alone" half still runs, which is the half that matters,
+	// since the key, the message and the group context are all read again after the call.
+	"OpenPublicMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -3412,6 +3418,87 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return nil
 		}},
+		// section 6.3's two AADs. Both are read again by the caller after the call -- the header
+		// they cover is the PrivateMessage header that is about to be serialized -- so a builder
+		// that wrote through one of its arguments would corrupt the very message it describes.
+		{name: "senderDataAAD", call: func(take func([]byte) []byte) [][]byte {
+			aad, aadErr := senderDataAAD(take([]byte{0x01, 0x02}), 9, ContentTypeApplication)
+			if aadErr != nil {
+				t.Fatalf("senderDataAAD: %v", aadErr)
+			}
+			return [][]byte{aad}
+		}},
+		{name: "privateContentAAD", call: func(take func([]byte) []byte) [][]byte {
+			aad, aadErr := privateContentAAD(take([]byte{0x01, 0x02}), 9, ContentTypeApplication,
+				take([]byte{0xa5, 0xa6}))
+			if aadErr != nil {
+				t.Fatalf("privateContentAAD: %v", aadErr)
+			}
+			return [][]byte{aad}
+		}},
+		// section 6.2's seal. The only thing it produces is the membership tag; the rest of the
+		// message it answers is the caller's own content carried through, which is the structure
+		// working rather than an alias to report.
+		{name: "SealPublicMessage", call: func(take func([]byte) []byte) [][]byte {
+			groupContext := take(framingStubGroupContext(t, crypto))
+			content := framingStubFramedContentOver(take)
+			content.ContentType = ContentTypeProposal
+			content.ApplicationData = nil
+			content.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 5}}
+			signed, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPublicMessage, content, groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the seal row reads: %v", signErr)
+			}
+			message, sealErr := SealPublicMessage(crypto,
+				take(bytes.Repeat([]byte{0x6b}, crypto.HashSize())), signed, groupContext)
+			if sealErr != nil {
+				t.Fatalf("SealPublicMessage: %v", sealErr)
+			}
+			return [][]byte{message.MembershipTag}
+		}},
+		// section 6.2's open, which answers a view over the message it was handed rather than bytes
+		// it produced and is named as answering none. What its row states is the half that matters
+		// for an open: the membership key, the message and the group context are all read again by
+		// the caller afterwards.
+		{name: "OpenPublicMessage", call: func(take func([]byte) []byte) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			membershipKey := bytes.Repeat([]byte{0x6b}, crypto.HashSize())
+			priv, pub, keyErr := crypto.SignatureKeyPair()
+			if keyErr != nil {
+				t.Fatalf("a key pair for the open row: %v", keyErr)
+			}
+			content := framingStubFramedContent()
+			content.ContentType = ContentTypeProposal
+			content.ApplicationData = nil
+			content.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 5}}
+			signed, signErr := SignAuthenticatedContent(crypto, priv, WireFormatPublicMessage,
+				content, groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the open row reads: %v", signErr)
+			}
+			message, sealErr := SealPublicMessage(crypto, membershipKey, signed, groupContext)
+			if sealErr != nil {
+				t.Fatalf("seal the message the open row reads: %v", sealErr)
+			}
+			if _, openErr := OpenPublicMessage(crypto, take(membershipKey), message,
+				StaticSignatureKey(pub), take(groupContext)); openErr != nil {
+				t.Fatalf("OpenPublicMessage refused a message it had just sealed: %v", openErr)
+			}
+			return nil
+		}},
+		// the static resolver, whose answer is a COPY of the key it was handed rather than a window
+		// onto it. The copy in its body is what this row observes: the aliasing half fails on a
+		// resolver that captured the caller's slice, and the fresh storage half fails on one that
+		// answered out of a buffer shared between calls.
+		{name: "StaticSignatureKey", call: func(take func([]byte) []byte) [][]byte {
+			resolve := StaticSignatureKey(SignaturePublicKey(take(bytes.Repeat([]byte{0x7c}, 32))))
+			answered, resolveErr := resolve(Sender{SenderType: SenderTypeMember})
+			if resolveErr != nil {
+				t.Fatalf("StaticSignatureKey: %v", resolveErr)
+			}
+			return [][]byte{answered}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}
@@ -3824,6 +3911,8 @@ var providerConstructionValues = map[string]any{
 	"VerifyAuthenticatedContent":    VerifyAuthenticatedContent,
 	"ComputeMembershipTag":          ComputeMembershipTag,
 	"verifyMembershipTag":           verifyMembershipTag,
+	"SealPublicMessage":             SealPublicMessage,
+	"OpenPublicMessage":             OpenPublicMessage,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -4321,6 +4410,9 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		if argument.Type() == reflect.TypeOf((*AuthenticatedContent)(nil)) && !argument.IsNil() {
 			return providerAuthenticatedContentPerturbations(t, operation, parameter, argument)
 		}
+		if argument.Type() == reflect.TypeOf((*PublicMessage)(nil)) && !argument.IsNil() {
+			return providerPublicMessagePerturbations(t, operation, parameter, argument)
+		}
 		// the labelled open's ciphertext, whose two fields are byte slices this rule cannot
 		// reach through a pointer to a struct. Its rule lives beside the structure it moves,
 		// in treekem_test.go, which is where psk_test.go and leaf_node_test.go keep theirs.
@@ -4338,6 +4430,12 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		perturbed := argument.Interface().(*GroupContext).Clone()
 		perturbed.Epoch++
 		return append(moved, providerPerturbation{where: "epoch one higher", value: reflect.ValueOf(perturbed)})
+	case reflect.Func:
+		// section 6.2's signature key resolver, whose rule lives beside the open that takes one,
+		// in framing_protect_test.go.
+		if argument.Type() == reflect.TypeOf(SignatureKeyResolver(nil)) && !argument.IsNil() {
+			return providerSignatureKeyResolverPerturbations(t, operation, parameter, argument)
+		}
 	case reflect.Interface:
 		if argument.Type() != reflect.TypeOf((*CryptoProvider)(nil)).Elem() {
 			break
@@ -4432,6 +4530,7 @@ func providerUnflippableAnswersReached(perturbed reflect.Value) []string {
 var providerExcusedFromTheRoutingClaim = map[string]string{
 	"NewSecretTree reaches the provider only through HashSize":                     "validates encryption_secret against KDF.Nh and stores it, and the first value derived THROUGH the provider exists only once a leaf has been taken",
 	"VerifyAuthenticatedContent reaches the provider only through VerifyWithLabel": "answers an error, and a wrapper that flips bytes has nothing to change in a refusal; TestProviderHasNoRemainingStubs still holds it by input perturbation, and a verify made to accept unconditionally fails that half",
+	"OpenPublicMessage reaches the provider only through HashSize and MacVerify and VerifyWithLabel": "answers a message it did not derive: both of its authenticators are VERDICTS, so the union of the two refusals it reaches -- MacVerify for ValSem007 and ValSem008, VerifyWithLabel for ValSem010 -- has nothing a wrapper that flips bytes can change, and HashSize is the width the membership_key is refused against. It is the exact shape the comment above warned would land here, and it is not unheld: TestProviderHasNoRemainingStubs moves its key, its message, its resolver and its group context and requires each to change the verdict; TestPublicMessageRefusesForgedMembershipTag sweeps every bit and every length of the tag; TestOpenPublicMessageRefusesEveryFlippedBitOfTheSignature does the same for the signature with the tag recomputed each time, which is what separates the two authenticators; and TestOpenPublicMessageRefusesEveryKeyButTheSendersOwn sweeps the resolver's answer",
 	"verifyMembershipTag reaches the provider only through HashSize and MacVerify": "answers an error over a comparison, and MacVerify is the second half of the union that is not a size while HashSize is the width the membership_key is refused against: a wrapper that flips bytes has nothing to change in a bool or in an int the registry fixes. It is the construction that comment above warned would land here, and it is not unheld -- TestProviderHasNoRemainingStubs moves its key, its message, its group context and its tag and requires each to change the verdict, TestVerifyMembershipTagRefusesEveryTagButItsOwn sweeps every bit and every length, TestBothDoorsIntoSection62RefuseEveryKeyNoTagMayBeTakenUnder sweeps every key width and the erased epoch's own key, and TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver holds it to tags mlswg published",
 }
 
@@ -4749,6 +4848,14 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 	// Empty is the correct answer here rather than a stub, and it stops being correct the day
 	// this constructor starts producing one, at which point this entry fails.
 	"SignAuthenticatedContent": {"result 0 field 4 is empty"},
+	// section 6.2's seal and open, whose rows are built over a PROPOSAL because ValSem005 refuses
+	// an application message in a public frame. Field 2 is the framed content's application_data
+	// and field 4 is the auth data's confirmation_tag: a proposal has neither, by RFC 9420 section
+	// 6 and section 8.2 respectively, so empty is the correct answer here rather than a stub. Both
+	// entries stop being correct the day these rows carry a commit or an application message, at
+	// which point they fail.
+	"SealPublicMessage": {"result 0 field 2 is empty", "result 0 field 4 is empty"},
+	"OpenPublicMessage": {"result 0 field 2 is empty", "result 0 field 4 is empty"},
 }
 
 // A construction whose answer is not a function of its arguments alone, named with the reason
@@ -5354,7 +5461,20 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// -- and a task that landed the tag computation without its verifier would leave the shape
 	// to whoever needed it first. This entry comes off by FAILING on the commit that gives it a
 	// caller.
-	"./verifyMembershipTag": "p6 task 6 lands the ValSem007/ValSem008 verifier beside the tag it checks; p6 task 7's PublicMessage open is the first caller with a membership tag in hand",
+	// The verifyMembershipTag entry came off on p6 task 7, by FAILING on the commit that landed
+	// OpenPublicMessage -- the caller it named, on the task it named. That is the seventh entry to
+	// expire exactly the way this gate is built to make them expire, and none has ever come off
+	// because somebody remembered it.
+	//
+	// The eighth is p6 task 8's. RFC 9420 section 6.3 has two AADs and this package builds the
+	// content one BY CALLING the sender data one, so that the header both of them cover has a
+	// single assembly; splitting the two across tasks would be two assemblies of one preimage,
+	// agreeing until the day one of them changed, and nothing that round trips could see the
+	// disagreement. So senderDataAAD has a caller from the moment it lands and privateContentAAD
+	// does not. It is not untested -- the section 6.3 goldens, the collision sweep over the header
+	// corpus, and the structural pair test all run it -- and this entry comes off by FAILING on the
+	// commit that gives it a production caller.
+	"./privateContentAAD": "p6 task 8 lands section 6.3's two AADs together because the content AAD is assembled out of the sender data AAD; p6 task 11's PrivateMessage content encryption is the first production caller",
 }
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:

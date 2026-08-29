@@ -4421,6 +4421,61 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return nil
 		}},
+		// section 6.2's seal and open, on the pair above's terms. The seal's answer is the
+		// membership tag, which is a mac and therefore KDF.Nh bytes at whatever width the provider
+		// runs at, so it is held to the equivalence rather than excused from it; the open answers a
+		// view over its own argument and is named as answering no bytes, so what its row states is
+		// the other half -- that section 6.2 WORKS at a width neither registered suite has.
+		{name: "SealPublicMessage", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			content := framingStubFramedContent()
+			content.ContentType = ContentTypeProposal
+			content.ApplicationData = nil
+			content.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 5}}
+			authContent, signErr := SignAuthenticatedContent(crypto, framingStubSignaturePriv(),
+				WireFormatPublicMessage, content, groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the seal row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), signErr)
+			}
+			message, sealErr := SealPublicMessage(crypto,
+				bytes.Repeat([]byte{0x6b}, crypto.HashSize()), authContent, groupContext)
+			if sealErr != nil {
+				t.Fatalf("SealPublicMessage over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			return [][]byte{message.MembershipTag}
+		}},
+		{name: "OpenPublicMessage", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			groupContext := framingStubGroupContext(t, crypto)
+			membershipKey := bytes.Repeat([]byte{0x6b}, crypto.HashSize())
+			priv, pub, keyErr := crypto.SignatureKeyPair()
+			if keyErr != nil {
+				t.Fatalf("a key pair for the open row, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), keyErr)
+			}
+			content := framingStubFramedContent()
+			content.ContentType = ContentTypeProposal
+			content.ApplicationData = nil
+			content.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 5}}
+			authContent, signErr := SignAuthenticatedContent(crypto, priv, WireFormatPublicMessage,
+				content, groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the open row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), signErr)
+			}
+			message, sealErr := SealPublicMessage(crypto, membershipKey, authContent, groupContext)
+			if sealErr != nil {
+				t.Fatalf("seal the message the open row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			if _, openErr := OpenPublicMessage(crypto, membershipKey, message,
+				StaticSignatureKey(pub), groupContext); openErr != nil {
+				t.Fatalf("OpenPublicMessage over a provider whose KDF.Nh is %d refused a message it had just sealed: %v",
+					crypto.HashSize(), openErr)
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })

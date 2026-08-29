@@ -2859,6 +2859,31 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 		_, err := ratchetTypeOf(ContentType(codePoint))
 		return err
 	},
+	// framing.go's section 6.3 header, which is the FIRST place a content type off the wire is
+	// seen. The encoder is handed nothing but the code point, because it refuses before it
+	// writes; the decoder is handed a whole header with two octets standing behind the content
+	// type, so a refusal that was really a truncation cannot pass for a refusal of the value.
+	// framing.go's section 6.2 select on sender_type, at both ends of it. The encoder's default
+	// is reached by this row directly, because that switch stands ahead of every write and ahead
+	// of Sender.MarshalMLS. The decoder's own default is unreachable behind Sender.UnmarshalMLS
+	// and its comment says so; what this row observes there is that the method refuses the octet
+	// and names it, which is the message a peer receives either way.
+	"PublicMessage.MarshalMLS": func(codePoint uint64) error {
+		return (&PublicMessage{Content: FramedContent{
+			Sender: Sender{SenderType: SenderType(codePoint)},
+		}}).MarshalMLS(syntax.NewWriter())
+	},
+	"PublicMessage.UnmarshalMLS": func(codePoint uint64) error {
+		return (&PublicMessage{}).UnmarshalMLS(
+			syntax.NewReader(handDerivedPublicMessageHeader(SenderType(codePoint))))
+	},
+	"PrivateMessage.MarshalMLS": func(codePoint uint64) error {
+		return (&PrivateMessage{ContentType: ContentType(codePoint)}).MarshalMLS(syntax.NewWriter())
+	},
+	"PrivateMessage.UnmarshalMLS": func(codePoint uint64) error {
+		return (&PrivateMessage{}).UnmarshalMLS(
+			syntax.NewReader(handDerivedPrivateMessageHeader(ContentType(codePoint))))
+	},
 }
 
 // undeclaredCodePointsOf is every code point of a framing registry's width that the registry
@@ -3339,6 +3364,71 @@ var framingWholeReceiverProbes = map[string]framingReceiverProbe{
 				func(into any) error {
 					return into.(*AuthenticatedContent).UnmarshalMLS(
 						syntax.NewReader(framingRefusedContentBehind(t, WireFormatPrivateMessage)))
+				},
+			}
+		},
+	},
+	// section 6.2's cleartext message, whose decode reads a field the SENDER TYPE selects. The
+	// prior value and the encoding differ in the arm as well as in every field, so a receiver
+	// stamped with either is visibly not the one it held.
+	"PublicMessage.UnmarshalMLS": {
+		prior: func() any { return framingTestPublicMessage() },
+		valid: func(t *testing.T) []byte {
+			other := framingTestPublicMessage()
+			other.Content = *framingTestCommitContent()
+			other.Content.GroupId = []byte{0x5a, 0x5b}
+			other.Content.Epoch = 9
+			other.Content.Sender = Sender{SenderType: SenderTypeMember, LeafIndex: 4}
+			other.Auth = FramedContentAuthData{Signature: []byte{0x11, 0x22, 0x33},
+				ConfirmationTag: []byte{0x44}}
+			other.MembershipTag = []byte{0x66, 0x77}
+			return framingProbeEncoding(t, other)
+		},
+		decode: func(into any, bs []byte) error {
+			return into.(*PublicMessage).UnmarshalMLS(syntax.NewReader(bs))
+		},
+		other: func(t *testing.T) []func(into any) error {
+			unregistered := ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
+			return []func(into any) error{
+				// a content type no registry declares, refused inside the framed content
+				func(into any) error {
+					return into.(*PublicMessage).UnmarshalMLS(
+						syntax.NewReader(handDerivedFramedContentHeader(unregistered)))
+				},
+				// and a member's message whose membership tag is present, wire legal and empty,
+				// which is a refusal raised at the very last field and so from behind every octet
+				// a stamp could copy across
+				func(into any) error {
+					return into.(*PublicMessage).UnmarshalMLS(
+						syntax.NewReader(framingPublicMessageWithEmptyTag(t)))
+				},
+			}
+		},
+	},
+	// section 6.3's header, whose content type refusal stands after the group id and the epoch
+	// have already been read -- which is exactly where a decoder that assigned as it read would
+	// have stamped them.
+	"PrivateMessage.UnmarshalMLS": {
+		prior: func() any { return framingTestPrivateMessage() },
+		valid: func(t *testing.T) []byte {
+			return framingProbeEncoding(t, &PrivateMessage{
+				GroupId:             []byte{0x5a, 0x5b},
+				Epoch:               21,
+				ContentType:         ContentTypeCommit,
+				AuthenticatedData:   []byte{0x11, 0x22},
+				EncryptedSenderData: []byte{0x33},
+				Ciphertext:          []byte{0x44, 0x55},
+			})
+		},
+		decode: func(into any, bs []byte) error {
+			return into.(*PrivateMessage).UnmarshalMLS(syntax.NewReader(bs))
+		},
+		other: func(t *testing.T) []func(into any) error {
+			unregistered := ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
+			return []func(into any) error{
+				func(into any) error {
+					return into.(*PrivateMessage).UnmarshalMLS(
+						syntax.NewReader(handDerivedPrivateMessageHeader(unregistered)))
 				},
 			}
 		},
@@ -4433,4 +4523,693 @@ func TestTheProposalReferenceOfADecodedPublishedProposalIsTheOneItsCommitNames(t
 		t.Fatalf("anchored %d published proposal references through this package's codec, want %d", anchored, labelKatProposalRefs)
 	}
 	t.Logf("%d published proposals decoded, re-encoded byte identically and referenced as their own commits name them", anchored)
+}
+
+// ---------------------------------------------------------------------------
+// PublicMessage, the section 6.2 codec
+// ---------------------------------------------------------------------------
+
+// handDerivedShortVector is opaque<V> written out by hand: the one octet varint the syntax
+// package spells a length under 64 as, and then the bytes.
+//
+// Hand derived rather than taken from syntax.Writer, because every golden below is being asked
+// whether the field boundaries are where RFC 9420 puts them, and a golden built by the encoder
+// under test asserts only that the encoder agrees with itself. The 64 is refused rather than
+// handled: a longer vector's prefix is two octets and this helper would silently produce the
+// wrong one.
+func handDerivedShortVector(t *testing.T, bs []byte) []byte {
+	t.Helper()
+	if len(bs) >= 64 {
+		t.Fatalf("this hand derived vector prefix is the one octet varint, and %d bytes needs two", len(bs))
+	}
+	return append([]byte{byte(len(bs))}, bs...)
+}
+
+// handDerivedUint64 is the eight octet big endian integer RFC 9420's presentation language
+// writes a uint64 as, written out by hand for handDerivedShortVector's reason.
+func handDerivedUint64(value uint64) []byte {
+	found := []byte{}
+	for shift := 56; shift >= 0; shift -= 8 {
+		found = append(found, byte(value>>uint(shift)))
+	}
+	return found
+}
+
+// framingTestPublicMessage is a member's proposal carried as a PublicMessage.
+//
+// The membership tag is a stub and its VALUE means nothing here: this file holds the codec, and
+// what the codec owns about the tag is that it is written under the member arm, framed as an
+// opaque<V>, and last. framing_protect_test.go is where the tag is a MAC.
+func framingTestPublicMessage() *PublicMessage {
+	return &PublicMessage{
+		Content:       *framingTestProposalContent(),
+		Auth:          FramedContentAuthData{Signature: []byte{0xde, 0xad}},
+		MembershipTag: []byte{0x5a, 0x5b, 0x5c},
+	}
+}
+
+// framingTestPublicMessageOfSender is that message under a caller's sender type, with the tag
+// present exactly where section 6.2 puts one.
+func framingTestPublicMessageOfSender(senderType SenderType) *PublicMessage {
+	message := framingTestPublicMessage()
+	message.Content.Sender = *testSenderOfType(senderType)
+	if senderType != SenderTypeMember {
+		message.MembershipTag = nil
+	}
+	return message
+}
+
+// framingPublicMessageLayout is the section 6.2 layout written out beside the codec: the framed
+// content, the auth data under that content's own type, and -- for a member and only for a member
+// -- the membership tag as an opaque<V>.
+//
+// The two inner encodings are reached through their own codecs rather than hand derived, and that
+// is the scope of this file's claim rather than a shortcut. FramedContent and
+// FramedContentAuthData have hand derived goldens of their own further up; what PublicMessage
+// contributes is the ORDER of the three and the framing of the third, and that is what an
+// independent layout can state.
+func framingPublicMessageLayout(t *testing.T, message *PublicMessage) []byte {
+	t.Helper()
+	w := syntax.NewWriter()
+	if err := message.Content.MarshalMLS(w); err != nil {
+		t.Fatalf("the framed content of the expected layout: %v", err)
+	}
+	if err := message.Auth.MarshalMLS(w, message.Content.ContentType); err != nil {
+		t.Fatalf("the auth data of the expected layout: %v", err)
+	}
+	if message.Content.Sender.SenderType == SenderTypeMember {
+		w.WriteRaw(handDerivedShortVector(t, message.MembershipTag))
+	}
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("the expected layout: %v", err)
+	}
+	return encoded
+}
+
+// TestThePublicMessageCodecCarriesTheMembershipTagForAMemberSenderAndForNoOther is section 6.2's
+// select, swept over the sender type registry rather than over the one arm somebody wrote a test
+// for.
+//
+// The sweep is what makes this an assertion about the SELECT. A test of the member arm alone is
+// passed by a codec that writes the tag unconditionally, which is a message every other
+// implementation rejects at the field after it; a test of one other arm alone is passed by a codec
+// that never writes it, which strips the only membership authentication a member's public message
+// carries. Both survive a round trip property, because both halves of this codec would agree.
+//
+// The byte equality is against a layout written beside the codec, so the ORDER of the three parts
+// is stated by something other than the encoder. A codec that wrote the auth data before the
+// content round trips against itself perfectly and against nobody.
+func TestThePublicMessageCodecCarriesTheMembershipTagForAMemberSenderAndForNoOther(t *testing.T) {
+	registry := registryConstantsOfType(t, "SenderType")
+	swept := 0
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		senderType := SenderType(registry[name])
+		message := framingTestPublicMessageOfSender(senderType)
+		encoded, err := syntax.Marshal(message)
+		if err != nil {
+			t.Errorf("%s: marshal: %v", name, err)
+			continue
+		}
+		if want := framingPublicMessageLayout(t, message); !bytes.Equal(encoded, want) {
+			t.Errorf("%s: encoded %x, want %x", name, encoded, want)
+			continue
+		}
+		decoded := PublicMessage{}
+		if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+			t.Errorf("%s: unmarshal: %v", name, err)
+			continue
+		}
+		carries := senderType == SenderTypeMember
+		if got := len(decoded.MembershipTag) != 0; got != carries {
+			t.Errorf("%s: the decoded message carries a membership tag = %v, want %v; section 6.2 gives the field to the member arm and to no other",
+				name, got, carries)
+			continue
+		}
+		if carries && !bytes.Equal(decoded.MembershipTag, message.MembershipTag) {
+			t.Errorf("%s: the decoded tag is %x, want %x", name, decoded.MembershipTag, message.MembershipTag)
+			continue
+		}
+		reencoded, err := syntax.Marshal(&decoded)
+		if err != nil {
+			t.Errorf("%s: re-marshal: %v", name, err)
+			continue
+		}
+		if !bytes.Equal(reencoded, encoded) {
+			t.Errorf("%s: re-encoded %x, want %x", name, reencoded, encoded)
+			continue
+		}
+		swept += 1
+	}
+	if swept != len(registry) {
+		t.Fatalf("%d of the %d sender types were swept", swept, len(registry))
+	}
+}
+
+// TestThePublicMessageEncoderRefusesAMemberMessageWithNoMembershipTagAndWritesNothing is ValSem007
+// on the send side, over every spelling of an empty byte run rather than over nil.
+//
+// The spellings are the point and emptyByteSpellings says why: a caller that re-sliced a longer
+// buffer to nothing holds a non nil slice with capacity, and a guard written on == nil accepts it
+// and emits an empty opaque<V> -- a member's public message carrying a present, wire legal,
+// zero length membership tag, which is a message no member could have produced.
+//
+// The Writer is checked as well as the error. This codec is handed the CALLER's Writer, so a
+// refusal raised after the content had been written leaves a caller that ignored the return value
+// holding the front of an encoding whose only membership authentication is missing.
+func TestThePublicMessageEncoderRefusesAMemberMessageWithNoMembershipTagAndWritesNothing(t *testing.T) {
+	for _, empty := range emptyByteSpellings() {
+		message := framingTestPublicMessage()
+		message.MembershipTag = empty.value
+		w := syntax.NewWriter()
+		if err := message.MarshalMLS(w); !errors.Is(err, errMissingMembershipTag) {
+			t.Errorf("a membership tag that is %s: got %v, want errMissingMembershipTag", empty.what, err)
+			continue
+		}
+		if w.Len() != 0 {
+			t.Errorf("a membership tag that is %s: the refusal left %d octets on the caller's Writer",
+				empty.what, w.Len())
+		}
+	}
+}
+
+// TestThePublicMessageDecoderRefusesTheEmptyTagItsEncoderRefusesToWrite is the other half of that
+// rule, and it is the half a peer reaches.
+//
+// The encoder's guard protects nobody from an implementation that does not run this code. An empty
+// opaque<V> is the wire encoding of "no tag", it is what a hostile peer sends to find out whether
+// this receiver's ValSem007 is on the codec or somewhere later, and a decoder that accepted it
+// would hand its caller a member's PublicMessage whose refusal depends on somebody downstream
+// remembering to look.
+func TestThePublicMessageDecoderRefusesTheEmptyTagItsEncoderRefusesToWrite(t *testing.T) {
+	decoded := PublicMessage{}
+	if err := syntax.Unmarshal(framingPublicMessageWithEmptyTag(t), &decoded); !errors.Is(err, errMissingMembershipTag) {
+		t.Fatalf("got %v, want errMissingMembershipTag", err)
+	}
+}
+
+// framingPublicMessageWithEmptyTag is a member's PublicMessage whose membership_tag field is
+// present, wire legal and zero length -- the encoding this package's own encoder refuses to
+// produce, which is why it is assembled field by field here.
+func framingPublicMessageWithEmptyTag(t *testing.T) []byte {
+	t.Helper()
+	message := framingTestPublicMessage()
+	w := syntax.NewWriter()
+	if err := message.Content.MarshalMLS(w); err != nil {
+		t.Fatalf("the framed content: %v", err)
+	}
+	if err := message.Auth.MarshalMLS(w, message.Content.ContentType); err != nil {
+		t.Fatalf("the auth data: %v", err)
+	}
+	w.WriteOpaque(nil)
+	encoded, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("the encoding with an empty tag: %v", err)
+	}
+	return encoded
+}
+
+// TestThePublicMessageDecoderRefusesTrailingBytes states that this codec consumes its whole input.
+// A decoder that stopped short would let a peer append anything it liked to a message whose
+// authenticators cover none of it.
+func TestThePublicMessageDecoderRefusesTrailingBytes(t *testing.T) {
+	encoded, err := syntax.Marshal(framingTestPublicMessage())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded := PublicMessage{}
+	if err := syntax.Unmarshal(append(encoded, 0x00), &decoded); err == nil {
+		t.Fatal("a public message with a trailing octet decoded")
+	}
+}
+
+// TestThePublicMessageViewStampsThePublicWireFormatAndCarriesNoTag is the AuthenticatedContent
+// projection's two claims.
+//
+// The wire format is STAMPED rather than carried, and that is what puts the section 6.1 preimage
+// under the format the bytes were actually read out of: a public message replayed through the
+// private codec is stamped with the other value and its signature does not verify. The tag is
+// absent because it is a MAC OVER that preimage and not a part of it -- a view that carried one
+// would be offering a caller an authenticator with nothing to check it against.
+func TestThePublicMessageViewStampsThePublicWireFormatAndCarriesNoTag(t *testing.T) {
+	message := framingTestPublicMessage()
+	view := message.AuthenticatedContent()
+	if view.WireFormat != WireFormatPublicMessage {
+		t.Errorf("the view carries wire format %d, want %d", view.WireFormat, WireFormatPublicMessage)
+	}
+	encoded, err := syntax.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal the view: %v", err)
+	}
+	if bytes.Contains(encoded, message.MembershipTag) {
+		t.Errorf("the serialized view %x holds the membership tag %x, so the tag is inside the preimage it is a mac over",
+			encoded, message.MembershipTag)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PrivateMessage, the section 6.3 codec
+// ---------------------------------------------------------------------------
+
+// framingTestPrivateMessage is the section 6.3 header with every field carrying something, and
+// every field carrying something DIFFERENT.
+//
+// Distinct values in distinct fields is what separates the codec's field order from a permutation
+// of it. Three opaque<V> fields stand together at the tail of this structure, so a codec that
+// wrote the ciphertext where the sender data belongs round trips against itself byte for byte; the
+// golden below is what tells them apart, and it can only do that if the two carry different bytes.
+func framingTestPrivateMessage() *PrivateMessage {
+	return &PrivateMessage{
+		GroupId:             []byte{0x01, 0x02},
+		Epoch:               9,
+		ContentType:         ContentTypeApplication,
+		AuthenticatedData:   []byte{0xaa},
+		EncryptedSenderData: []byte{0xbb, 0xcc},
+		Ciphertext:          []byte{0xdd, 0xee, 0xff},
+	}
+}
+
+// handDerivedPrivateMessageGolden is that structure's encoding read off RFC 9420 section 6.3:
+//
+//	opaque group_id<V>; uint64 epoch; ContentType content_type;
+//	opaque authenticated_data<V>; opaque encrypted_sender_data<V>; opaque ciphertext<V>;
+//
+// Hand derived, which is the only kind of golden that says anything here. The three tail vectors
+// are structurally identical on the wire, so any permutation of them is a well formed
+// PrivateMessage that this package's own encoder and decoder agree about perfectly and that every
+// other implementation reads with the fields swapped -- a receiver handed a ciphertext where the
+// sender data belongs, which is a decryption failure nobody can attribute.
+func handDerivedPrivateMessageGolden(t *testing.T, message *PrivateMessage) []byte {
+	t.Helper()
+	golden := handDerivedShortVector(t, message.GroupId)
+	golden = append(golden, handDerivedUint64(message.Epoch)...)
+	golden = append(golden, byte(message.ContentType))
+	golden = append(golden, handDerivedShortVector(t, message.AuthenticatedData)...)
+	golden = append(golden, handDerivedShortVector(t, message.EncryptedSenderData)...)
+	return append(golden, handDerivedShortVector(t, message.Ciphertext)...)
+}
+
+// handDerivedPublicMessageHeader is a FramedContent whose sender_type is the caller's, followed
+// by everything a member arm and the fields after it would have consumed.
+//
+// The tail is handDerivedFramedContentHeader's point: without it a decoder that refused nothing
+// runs out of input and reports a truncation, which reads as a refusal of the code point and is
+// not one. Four octets for a sender arm, an empty authenticated_data, the proposal content type,
+// and two octets standing where a proposal would have begun.
+func handDerivedPublicMessageHeader(senderType SenderType) []byte {
+	return append(append([]byte{0x00}, handDerivedUint64(0)...),
+		byte(senderType), 0x00, 0x00, 0x00, 0x00, 0x00, byte(ContentTypeProposal), 0x00, 0x00)
+}
+
+// handDerivedPrivateMessageHeader is the three fields every PrivateMessage opens with, ending in
+// the content type the caller names, followed by two octets a field after it would have consumed.
+//
+// The trailing octets are handDerivedFramedContentHeader's point one structure over: without them
+// a decoder that refused nothing runs out of input and reports a truncation, which reads as a
+// refusal of the code point and is not one.
+func handDerivedPrivateMessageHeader(contentType ContentType) []byte {
+	return append(append([]byte{0x00}, handDerivedUint64(0)...), byte(contentType), 0x00, 0x00)
+}
+
+func TestPrivateMessageRoundTrip(t *testing.T) {
+	message := framingTestPrivateMessage()
+	encoded, err := syntax.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded := PrivateMessage{}
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	reencoded, err := syntax.Marshal(&decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("re-encoded %x, want %x", reencoded, encoded)
+	}
+	if !reflect.DeepEqual(&decoded, message) {
+		t.Fatalf("decoded %+v, want %+v", decoded, message)
+	}
+}
+
+// TestPrivateMessageMarshalMatchesTheHandDerivedGolden is the field order, held against an
+// encoding written from the RFC rather than read back through the encoder.
+//
+// The round trip above cannot see any of this. It is a symmetry property, and every permutation of
+// the three tail vectors is symmetric.
+func TestPrivateMessageMarshalMatchesTheHandDerivedGolden(t *testing.T) {
+	message := framingTestPrivateMessage()
+	encoded, err := syntax.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := handDerivedPrivateMessageGolden(t, message); !bytes.Equal(encoded, want) {
+		t.Fatalf("encoded %x, want %x", encoded, want)
+	}
+	decoded := PrivateMessage{}
+	if err := syntax.Unmarshal(handDerivedPrivateMessageGolden(t, message), &decoded); err != nil {
+		t.Fatalf("unmarshal the golden: %v", err)
+	}
+	if !reflect.DeepEqual(&decoded, message) {
+		t.Fatalf("the golden decoded to %+v, want %+v", decoded, message)
+	}
+}
+
+// TestPrivateMessageRejectsTheReservedContentType is the reserved zero, which is the code point a
+// header nothing parsed leaves behind.
+//
+// The whole of the unregistered space is swept by
+// TestEveryFramingCodePointRefusalNamesTheCodePointItRefused, over both directions of this codec.
+// This one is here because the zero is the value with a mechanism behind it rather than a value in
+// the gap: it is the ContentType a zero valued struct carries and the one an unparsed octet run
+// produces, and a codec that admitted it would route both onto the application ratchet.
+func TestPrivateMessageRejectsTheReservedContentType(t *testing.T) {
+	message := framingTestPrivateMessage()
+	message.ContentType = ContentType(0)
+	if _, err := syntax.Marshal(message); !errors.Is(err, ErrUnknownContentType) {
+		t.Fatalf("marshal: got %v, want ErrUnknownContentType", err)
+	}
+	decoded := PrivateMessage{}
+	if err := syntax.Unmarshal(handDerivedPrivateMessageHeader(ContentType(0)), &decoded); !errors.Is(err, ErrUnknownContentType) {
+		t.Fatalf("unmarshal: got %v, want ErrUnknownContentType", err)
+	}
+}
+
+// TestARefusedPrivateMessageMarshalWritesNothing is FramedContent's and FramedContentAuthData's
+// rule for this codec: the refusal happens before an octet reaches the caller's Writer.
+func TestARefusedPrivateMessageMarshalWritesNothing(t *testing.T) {
+	message := framingTestPrivateMessage()
+	message.ContentType = ContentType(undeclaredCodePointsOf(t, "ContentType")[0])
+	w := syntax.NewWriter()
+	if err := message.MarshalMLS(w); !errors.Is(err, ErrUnknownContentType) {
+		t.Fatalf("got %v, want ErrUnknownContentType", err)
+	}
+	if w.Len() != 0 {
+		t.Fatalf("the refusal left %d octets on the caller's Writer", w.Len())
+	}
+}
+
+// TestPrivateMessageRefusesEveryTruncationAndAnyTrailingByte states that this codec consumes
+// exactly its input.
+//
+// Every prefix rather than one, for the reason every refusal in this package is derived over a
+// length rather than sampled: a decoder that read a vector's prefix and then trusted it would be
+// refused at some truncations and not at others, and the truncation somebody picked is not
+// necessarily one of them.
+func TestPrivateMessageRefusesEveryTruncationAndAnyTrailingByte(t *testing.T) {
+	encoded, err := syntax.Marshal(framingTestPrivateMessage())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for at := 0; at < len(encoded); at += 1 {
+		decoded := PrivateMessage{}
+		if err := syntax.Unmarshal(encoded[:at], &decoded); err == nil {
+			t.Errorf("the first %d of %d octets decoded as a whole private message", at, len(encoded))
+		}
+	}
+	decoded := PrivateMessage{}
+	if err := syntax.Unmarshal(append(encoded, 0x00), &decoded); err == nil {
+		t.Fatal("a private message with a trailing octet decoded")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the two section 6.3 AADs
+// ---------------------------------------------------------------------------
+
+// handDerivedSenderDataAAD is RFC 9420 section 6.3.2's SenderDataAAD written out by hand:
+// opaque group_id<V>, uint64 epoch, ContentType content_type, and nothing after it.
+func handDerivedSenderDataAAD(t *testing.T, groupId []byte, epoch uint64, contentType ContentType) []byte {
+	t.Helper()
+	golden := handDerivedShortVector(t, groupId)
+	golden = append(golden, handDerivedUint64(epoch)...)
+	return append(golden, byte(contentType))
+}
+
+// handDerivedPrivateContentAAD is section 6.3.1's PrivateContentAAD written out by hand: the same
+// three fields, and then opaque authenticated_data<V>.
+//
+// It is written as the three fields again rather than as "the sender data AAD plus a field", which
+// is the opposite of what the implementation does and is deliberate. The implementation builds one
+// out of the other so that the shared header has a single assembly; a golden that did the same
+// would agree with it about a header both of them got wrong.
+func handDerivedPrivateContentAAD(t *testing.T, groupId []byte, epoch uint64, contentType ContentType,
+	authenticatedData []byte) []byte {
+
+	t.Helper()
+	golden := handDerivedShortVector(t, groupId)
+	golden = append(golden, handDerivedUint64(epoch)...)
+	golden = append(golden, byte(contentType))
+	return append(golden, handDerivedShortVector(t, authenticatedData)...)
+}
+
+// section63AadHeader is one cleartext PrivateMessage header the two AADs are taken over.
+type section63AadHeader struct {
+	what        string
+	groupId     []byte
+	epoch       uint64
+	contentType ContentType
+}
+
+// sameHeaderAs reports whether two headers are the same three VALUES, which is what the two AADs
+// are allowed to agree about. nil and the empty slice are one value here because opaque<V> has no
+// representation for "absent" -- WriteOpaque writes the same zero length prefix for both -- so an
+// AAD that separated them would be the thing that is wrong.
+func (self section63AadHeader) sameHeaderAs(other section63AadHeader) bool {
+	return bytes.Equal(self.groupId, other.groupId) && self.epoch == other.epoch &&
+		self.contentType == other.contentType
+}
+
+// section63AadHeaders is the corpus the sweep below runs over: headers that differ in one field at
+// a time, derived over the epoch's own WIDTH and over the content type registry rather than
+// sampled.
+//
+// The epoch rows are one set bit per octet, which is what separates an AAD that dropped the field
+// from one that wrote it narrow. An epoch corpus of 0, 1 and 2 is covered identically by a
+// uint64, a uint32 and a uint8, and the third of those is a header a peer can collide by choosing
+// its epoch -- so the octets are swept rather than the values.
+//
+// The group ids differ in LENGTH as well as in content, and two of them are permutations of each
+// other, which is what separates a length prefix that is present from one that is not: without a
+// prefix, {0x01, 0x02} at epoch 0 and {0x01} at an epoch beginning 0x02 are the same octets.
+func section63AadHeaders(t *testing.T) []section63AadHeader {
+	t.Helper()
+	base := section63AadHeader{what: "the base header", groupId: []byte{0x01, 0x02}, epoch: 9,
+		contentType: ContentTypeApplication}
+	found := []section63AadHeader{base}
+	for shift := 0; shift < 64; shift += 8 {
+		found = append(found, section63AadHeader{
+			what:        fmt.Sprintf("epoch with the only set bit at %d", shift),
+			groupId:     base.groupId,
+			epoch:       uint64(1) << uint(shift),
+			contentType: base.contentType,
+		})
+	}
+	registry := registryConstantsOfType(t, "ContentType")
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		found = append(found, section63AadHeader{
+			what:        "content type " + name,
+			groupId:     base.groupId,
+			epoch:       base.epoch,
+			contentType: ContentType(registry[name]),
+		})
+	}
+	for _, groupId := range [][]byte{
+		nil, {}, {0x00}, {0x01}, {0x02}, {0x01, 0x02}, {0x02, 0x01}, {0x01, 0x02, 0x00},
+		bytes.Repeat([]byte{0x33}, 40),
+	} {
+		found = append(found, section63AadHeader{
+			what:        fmt.Sprintf("group id %x", groupId),
+			groupId:     groupId,
+			epoch:       base.epoch,
+			contentType: base.contentType,
+		})
+	}
+	return found
+}
+
+// TestTheTwoSectionSixThreeAadsAreTheHandDerivedPreimages holds both AADs against encodings written
+// from the RFC, over the whole corpus.
+//
+// This is the assertion the prefix relationship below cannot make. An implementation that dropped
+// the epoch from BOTH of them, or wrote the group id with no length prefix in both, satisfies
+// every structural property the two have with respect to each other and produces a message no
+// other implementation can open -- and, since each AAD is only ever checked against itself, no
+// round trip and no seal-then-open in this package can see it.
+func TestTheTwoSectionSixThreeAadsAreTheHandDerivedPreimages(t *testing.T) {
+	const authenticatedData = "\xa5\xa6"
+	for _, header := range section63AadHeaders(t) {
+		senderAAD, err := senderDataAAD(header.groupId, header.epoch, header.contentType)
+		if err != nil {
+			t.Errorf("%s: sender data aad: %v", header.what, err)
+			continue
+		}
+		want := handDerivedSenderDataAAD(t, header.groupId, header.epoch, header.contentType)
+		if !bytes.Equal(senderAAD, want) {
+			t.Errorf("%s: sender data aad %x, want %x", header.what, senderAAD, want)
+			continue
+		}
+		contentAAD, err := privateContentAAD(header.groupId, header.epoch, header.contentType,
+			[]byte(authenticatedData))
+		if err != nil {
+			t.Errorf("%s: private content aad: %v", header.what, err)
+			continue
+		}
+		want = handDerivedPrivateContentAAD(t, header.groupId, header.epoch, header.contentType,
+			[]byte(authenticatedData))
+		if !bytes.Equal(contentAAD, want) {
+			t.Errorf("%s: private content aad %x, want %x", header.what, contentAAD, want)
+		}
+	}
+}
+
+// TestBothSectionSixThreeAadsSeparateEveryHeaderTheRfcSeparates is the binding property, stated as
+// a collision test over the corpus rather than as a list of fields.
+//
+// A field an AAD stopped covering is a pair of headers it can no longer tell apart, which is what
+// this looks for: two headers that are not the same three values must not produce the same AAD,
+// and two that ARE the same values must. The second half is not decoration -- an AAD that hashed
+// its arguments' addresses, or that appended a counter, would separate everything and bind
+// nothing, and it would pass a test that only looked for collisions.
+//
+// What a collision costs is not a decryption failure. group_id and epoch are the two fields the
+// message server routes on and the two an attacker can rewrite in flight, so an AAD that stopped
+// separating them is a message that decrypts in a group or an epoch its sender never addressed.
+func TestBothSectionSixThreeAadsSeparateEveryHeaderTheRfcSeparates(t *testing.T) {
+	const authenticatedData = "\xa5\xa6"
+	headers := section63AadHeaders(t)
+	for _, aad := range []struct {
+		name string
+		take func(header section63AadHeader) ([]byte, error)
+	}{
+		{name: "senderDataAAD", take: func(header section63AadHeader) ([]byte, error) {
+			return senderDataAAD(header.groupId, header.epoch, header.contentType)
+		}},
+		{name: "privateContentAAD", take: func(header section63AadHeader) ([]byte, error) {
+			return privateContentAAD(header.groupId, header.epoch, header.contentType,
+				[]byte(authenticatedData))
+		}},
+	} {
+		taken := make([][]byte, len(headers))
+		for at, header := range headers {
+			answer, err := aad.take(header)
+			if err != nil {
+				t.Fatalf("%s over %s: %v", aad.name, header.what, err)
+			}
+			taken[at] = answer
+		}
+		compared := 0
+		for i := range headers {
+			for j := i + 1; j < len(headers); j += 1 {
+				same := headers[i].sameHeaderAs(headers[j])
+				if got := bytes.Equal(taken[i], taken[j]); got != same {
+					t.Errorf("%s: %s and %s are the same header = %v and produce the same aad = %v; %x against %x",
+						aad.name, headers[i].what, headers[j].what, same, got, taken[i], taken[j])
+				}
+				compared += 1
+			}
+		}
+		if compared == 0 {
+			t.Fatalf("%s: no pair of headers was compared, so this states nothing", aad.name)
+		}
+	}
+}
+
+// TestNeitherSectionSixThreeAadCoversAFieldTheOtherOwns is the structural half, and it is the one
+// the two AADs' shape exists for.
+//
+// authenticated_data belongs to the CONTENT AAD alone. The sender data is decrypted before the
+// content -- it is what names the leaf whose ratchet holds the content key -- so a sender data AAD
+// covering a field belonging to the content step would leave a receiver with no order in which to
+// do the two. connect/message has this same pair one layer down and its guardrail G4 is the same
+// rule; what that layer found is that a shared builder taking every field lets a field migrate
+// between the two preimages without a diff anybody reads, and that the defence has to be
+// structural. senderDataAAD cannot see authenticated_data because it is not a parameter of it, and
+// what this test adds is that the content AAD extends it by EXACTLY that field and by nothing else.
+//
+// The empty authenticated_data row is the one that matters most. It is the case where the two AADs
+// are closest -- the content's is the sender data's plus a single zero length prefix octet -- and
+// an implementation that dropped the field entirely when it was empty would make the two byte
+// identical, which is the collision this pair has no other separation against. RFC 9420 gives these
+// two structures no label and no domain separation tag of any kind: nothing distinguishes them but
+// the fields themselves and the key each is used with, so "the content AAD is never the sender
+// data AAD" is a property that has to hold at every input rather than at the interesting ones.
+func TestNeitherSectionSixThreeAadCoversAFieldTheOtherOwns(t *testing.T) {
+	header := section63AadHeader{groupId: []byte{0x01, 0x02}, epoch: 9, contentType: ContentTypeApplication}
+	senderAAD, err := senderDataAAD(header.groupId, header.epoch, header.contentType)
+	if err != nil {
+		t.Fatalf("sender data aad: %v", err)
+	}
+	for _, authenticatedData := range [][]byte{
+		nil, {}, {0x00}, {0xa5}, {0xa5, 0xa6}, bytes.Repeat([]byte{0xa5}, 40),
+	} {
+		contentAAD, err := privateContentAAD(header.groupId, header.epoch, header.contentType,
+			authenticatedData)
+		if err != nil {
+			t.Errorf("authenticated_data %x: private content aad: %v", authenticatedData, err)
+			continue
+		}
+		want := append(append([]byte{}, senderAAD...), handDerivedShortVector(t, authenticatedData)...)
+		if !bytes.Equal(contentAAD, want) {
+			t.Errorf("authenticated_data %x: the content aad is %x, want the sender data aad followed by exactly that field, %x",
+				authenticatedData, contentAAD, want)
+			continue
+		}
+		if bytes.Equal(contentAAD, senderAAD) {
+			t.Errorf("authenticated_data %x: the two aads are the same %d octets, and RFC 9420 gives them no label to tell them apart",
+				authenticatedData, len(senderAAD))
+		}
+		// the sender data AAD does not move when the field it must not see moves. Stated over the
+		// answer rather than over the parameter list, because a widened signature is what this is
+		// watching for and a widened signature still compiles here.
+		again, err := senderDataAAD(header.groupId, header.epoch, header.contentType)
+		if err != nil {
+			t.Errorf("authenticated_data %x: sender data aad: %v", authenticatedData, err)
+			continue
+		}
+		if !bytes.Equal(again, senderAAD) {
+			t.Errorf("authenticated_data %x: the sender data aad changed to %x from %x",
+				authenticatedData, again, senderAAD)
+		}
+		// the containment reading is meaningful only for an authenticated_data that does not occur
+		// in the header by coincidence, and {0x00} does -- seven of the epoch's eight octets are
+		// zero. The corpus is filtered against an INDEPENDENT encoding of the header rather than
+		// against the answer under test, which would filter out exactly the leak this looks for.
+		independent := handDerivedSenderDataAAD(t, header.groupId, header.epoch, header.contentType)
+		if len(authenticatedData) != 0 && !bytes.Contains(independent, authenticatedData) &&
+			bytes.Contains(senderAAD, authenticatedData) {
+			t.Errorf("authenticated_data %x leaked into the sender data aad %x", authenticatedData, senderAAD)
+		}
+	}
+}
+
+// TestSenderDataAADIsPrivateContentAADWithoutAuthenticatedData is the plan's own statement of the
+// prefix relationship, kept beside the two above because it is the shape a copy-paste breaks.
+//
+// It is the weakest of the three and it is worth saying which mutations it cannot see, so nobody
+// reads it as the guard: it passes over an implementation that dropped the epoch from both AADs,
+// over one that wrote the group id with no length prefix in both, and over one that reordered the
+// shared header, because every one of those keeps the prefix relationship exactly.
+func TestSenderDataAADIsPrivateContentAADWithoutAuthenticatedData(t *testing.T) {
+	groupId := []byte{0x01, 0x02}
+	authenticatedData := []byte{0xa5, 0xa6}
+
+	senderAAD, err := senderDataAAD(groupId, 9, ContentTypeApplication)
+	if err != nil {
+		t.Fatalf("sender aad: %v", err)
+	}
+	contentAAD, err := privateContentAAD(groupId, 9, ContentTypeApplication, authenticatedData)
+	if err != nil {
+		t.Fatalf("content aad: %v", err)
+	}
+	if !bytes.HasPrefix(contentAAD, senderAAD) {
+		t.Fatalf("content aad %x does not start with sender aad %x", contentAAD, senderAAD)
+	}
+	if bytes.Contains(senderAAD, authenticatedData) {
+		t.Fatal("authenticated_data leaked into SenderDataAAD")
+	}
+	if len(contentAAD) <= len(senderAAD) {
+		t.Fatal("content aad does not extend sender aad")
+	}
 }

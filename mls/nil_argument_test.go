@@ -423,6 +423,25 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			return reconcileRequiredCapabilities(nil, []Extension{{
 				ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: encoded}})
 		}},
+		// section 6.2's seal and open, which read their message at the first statement after the
+		// provider check. The membership key is a live one of the right width in every row, so what
+		// is being observed is the nil argument and not a key refusal standing in front of it.
+		"SealPublicMessage(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
+			_, err := SealPublicMessage(crypto, secret, nil, framingTestGroupContext(t))
+			return err
+		}},
+		"OpenPublicMessage(message)": {sentinel: errNilPublicMessage, call: func(t *testing.T) error {
+			_, err := OpenPublicMessage(crypto, secret, nil, StaticSignatureKey(nil),
+				framingTestGroupContext(t))
+			return err
+		}},
+		// the resolver, which is a func and not a pointer and is refused for the same reason: an
+		// open that called it would take the caller's process rather than its call.
+		"OpenPublicMessage(resolve)": {sentinel: errNilSignatureKeyResolver, call: func(t *testing.T) error {
+			_, err := OpenPublicMessage(crypto, secret, &PublicMessage{}, nil,
+				framingTestGroupContext(t))
+			return err
+		}},
 	}
 }
 

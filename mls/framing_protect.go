@@ -323,3 +323,198 @@ func verifyMembershipTag(crypto CryptoProvider, membershipKey []byte,
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// the PublicMessage, RFC 9420 section 6.2
+// ---------------------------------------------------------------------------
+
+// errApplicationMustBeCiphertext is ValSem005 in the validation plan's catalogue, and it is a
+// stand in on exactly errMissingMembershipTag's terms: that plan owns the single declaration site
+// for the exported ErrApplicationMustBeCiphertext, the name has not landed in this package yet,
+// and TestNoValidationOwnedNameHasLandedBesideItsStandIn fails on the commit that lands the
+// exported twin beside this one. When it lands, every return of it below becomes
+// ValSem(ValSem005, ErrApplicationMustBeCiphertext).
+//
+// The rule it carries is RFC 9420's and not this product's, and the two are worth keeping apart
+// because they refuse at different places for different reasons. ValSem005 says an APPLICATION
+// message must never be sent in the clear: application data is the user's plaintext, a
+// PublicMessage is authenticated and not encrypted, and a sender that framed one this way would
+// put the message body on the transport with a signature attached. Spec A's A-ASSUME-4 goes
+// further and refuses every PublicMessage at the group config, handshake messages included -- but
+// that is a policy the group can in principle be configured out of, and this is a rule of the
+// protocol that it cannot.
+//
+// BOTH directions raise it. A sender is stopped from building one, and a receiver refuses one a
+// hostile peer built anyway -- which is the half that has to exist, because the sender's guard
+// protects nobody from a peer that does not run this code.
+var errApplicationMustBeCiphertext = errors.New("mls: an application message must be sent as a PrivateMessage")
+
+// errNilPublicMessage is what OpenPublicMessage answers a caller that passed no message, for
+// errNilAuthenticatedContent's reason: a nil dereference out of a library takes the caller's
+// process rather than its call, and says nothing about which argument was wrong.
+var errNilPublicMessage = errors.New("mls: open requires a public message")
+
+// errNilSignatureKeyResolver is what an open answers a caller that passed no resolver.
+//
+// It is its own value rather than a resolver that answers no key, and the difference is the one
+// this package keeps everywhere: "the caller passed nothing" is a caller's mistake, and "no key
+// could be found for this sender" is a message's. Collapsing them would let a receive path whose
+// resolver wiring was never hooked up report the same refusal as a message from a leaf that has
+// been removed, and only one of those is worth retrying.
+var errNilSignatureKeyResolver = errors.New("mls: open requires a signature key resolver")
+
+// SignatureKeyResolver answers the signature public key of a message's sender.
+//
+// A key is resolved rather than supplied because of what section 6.3 does with the sender. A
+// PrivateMessage hides it: the Sender lives inside the encrypted sender data, so nothing -- not
+// the receiver, not the caller -- knows whose key to check until that data has been decrypted,
+// which happens inside the open. A caller cannot choose the key in advance because at the moment
+// it calls there is nothing to choose it by.
+//
+// Passing a resolver rather than a key is therefore what lets an open verify the signature ITSELF
+// instead of handing back an unverified object and a sender for the caller to check later, which
+// is guardrail G7. The two shapes differ in exactly one way and it is the way that matters: the
+// second one is a caller that can forget. This package has shipped three authentication bypasses
+// and every one of them was a caller handed something it could ignore.
+//
+// PublicMessage carries its sender in the clear and does not need the indirection. It takes one
+// anyway so that both wire formats present one interface to p7's receive path: a receive path
+// that took a key on one branch and a resolver on the other would have two shapes of the same
+// question, and the branch that took the key is the one somebody eventually passes the wrong key
+// to.
+//
+// A resolver that has no key for a sender says so by returning an error, and the open answers it
+// verbatim. That refusal is not a signature failure -- there is nothing to verify against -- and
+// the caller has a different thing to do about it.
+type SignatureKeyResolver func(sender Sender) (SignaturePublicKey, error)
+
+// StaticSignatureKey is a resolver that answers with one key whatever the sender says.
+//
+// For the published test vectors, which supply a single signature_pub and a single sender, and for
+// two party tests. It is deliberately NOT what a group uses: a real receive path resolves the key
+// out of the ratchet tree at the sender's own leaf, and a group that answered every sender with
+// one key would accept any member's message as any other member's.
+func StaticSignatureKey(pub SignaturePublicKey) SignatureKeyResolver {
+	// the key is COPIED out of the caller's slice rather than captured, which is this package's
+	// rule about caller bytes and has a sharper edge on a closure than it has anywhere else. A
+	// captured slice is a window onto a buffer the caller still owns: a caller that reused it --
+	// for the next member's key, say, while iterating a roster -- would silently change which key
+	// every message this resolver is ever handed to is verified under, long after the call that
+	// built it returned, and there is no moment at which that shows up as an error.
+	answered := append(SignaturePublicKey(nil), pub...)
+	return func(sender Sender) (SignaturePublicKey, error) {
+		return answered, nil
+	}
+}
+
+// SealPublicMessage wraps a signed AuthenticatedContent as a PublicMessage, computing the
+// membership tag for a member sender. It is ValSem005 on the send path.
+//
+// It does NOT sign. The signature is SignAuthenticatedContent's and is already inside the
+// authContent this is handed, which is what keeps the wire format binding honest: the wire format
+// is inside the signature preimage, so a message signed as one format and sealed as another is a
+// message whose signature verifies against neither. That is the ErrWireFormatMismatch below, and
+// it is a refusal rather than a correction for the reason framedContentTBS refuses a group context
+// it was not expecting -- a caller that re-stamped the field would be shipping a signature over a
+// preimage the caller never built.
+//
+// The provider is checked before anything else is read, which is SignAuthenticatedContent's
+// discipline: a body that judged its message first would answer ValSem005 or
+// ErrWireFormatMismatch to a caller whose actual mistake was passing no provider, and send it to
+// fix a message that was never the problem. It is checked even on the path that never reaches the
+// provider -- an external sender takes no membership tag -- because "does this call need a
+// provider" is not a question a caller can answer before it makes the call.
+//
+// The membership tag is computed for a MEMBER sender and for no other, which is RFC 9420 section
+// 6.2's select and not an optimisation. The tag says "the sender was inside the group", and the
+// three other sender types are by definition not: an external sender has no leaf and no
+// membership_key, and a new member has not joined yet. A tag attached to one of those would be a
+// claim nothing could verify, and section 6.2 gives the field no place on the wire.
+func SealPublicMessage(crypto CryptoProvider, membershipKey []byte,
+	authContent *AuthenticatedContent, groupContext []byte) (*PublicMessage, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the membership tag is the provider's mac", ErrNilCryptoProvider)
+	}
+	if authContent == nil {
+		return nil, errNilAuthenticatedContent
+	}
+	if authContent.Content.ContentType == ContentTypeApplication {
+		return nil, errApplicationMustBeCiphertext
+	}
+	if authContent.WireFormat != WireFormatPublicMessage {
+		return nil, ErrWireFormatMismatch
+	}
+	message := &PublicMessage{Content: authContent.Content, Auth: authContent.Auth}
+	if authContent.Content.Sender.SenderType == SenderTypeMember {
+		tag, err := ComputeMembershipTag(crypto, membershipKey, authContent, groupContext)
+		if err != nil {
+			return nil, err
+		}
+		message.MembershipTag = tag
+	}
+	return message, nil
+}
+
+// OpenPublicMessage is the receive half: ValSem005, then ValSem007 and ValSem008, then ValSem010
+// and ValSem009. It answers the AuthenticatedContent only once every one of them has passed.
+//
+// It answers a verified object and never an object plus a verdict, which is guardrail G7 and the
+// reason this signature has no bool in it. Both authenticators are checked here, so a caller
+// holding the answer is holding a message that came from inside the group AND from the leaf it
+// names. A shape that handed back the content and left either check to the caller would be a
+// caller that can forget, and this package has shipped three bypasses of exactly that shape.
+//
+// The APPLICATION refusal comes first, before either authenticator, and the order is deliberate.
+// ValSem005 is a fact about the message's own framing that needs no key to see: an application
+// message in a PublicMessage is one no conforming sender produces, so there is no reason to spend
+// a MAC and a signature verification on it, and no reason to let a peer learn whether this
+// receiver holds the epoch by how long the refusal took.
+//
+// The membership tag is checked BEFORE the signature, which is RFC 9420 section 6.2's order and
+// worth stating because the reverse also "works". The membership tag is the cheaper check and it
+// is the one that says the message came from inside the group at all; a receiver that verified the
+// signature first would be doing public key work on behalf of any party that can reach the
+// transport.
+//
+// The tag is checked only for a MEMBER sender, for SealPublicMessage's reason: no other sender
+// type has a membership_key, and section 6.2 gives none of them the field. It is not a hole a peer
+// can walk through by claiming to be external -- the sender type is inside the signature preimage,
+// so a member's message re-labelled external does not verify, and the sender type also decides
+// whether the group context is bound into that preimage at all.
+//
+// The refusal of the tag travels out verbatim and is never collapsed into the signature's, which
+// is what keeps ValSem007 and ValSem008 distinguishable to a validator that has to say which of
+// its rules refused. What an unauthenticated peer must not learn is which of ValSem010 and
+// ValSem009 it failed, and VerifyAuthenticatedContent's own ordering is what handles that.
+func OpenPublicMessage(crypto CryptoProvider, membershipKey []byte, message *PublicMessage,
+	resolve SignatureKeyResolver, groupContext []byte) (*AuthenticatedContent, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: both authenticators are the provider's", ErrNilCryptoProvider)
+	}
+	if message == nil {
+		return nil, errNilPublicMessage
+	}
+	if resolve == nil {
+		return nil, errNilSignatureKeyResolver
+	}
+	if message.Content.ContentType == ContentTypeApplication {
+		return nil, errApplicationMustBeCiphertext
+	}
+	authContent := message.AuthenticatedContent()
+	if message.Content.Sender.SenderType == SenderTypeMember {
+		err := verifyMembershipTag(crypto, membershipKey, authContent, groupContext, message.MembershipTag)
+		if err != nil {
+			return nil, err
+		}
+	}
+	pub, err := resolve(message.Content.Sender)
+	if err != nil {
+		return nil, err
+	}
+	if err := VerifyAuthenticatedContent(crypto, pub, authContent, groupContext); err != nil {
+		return nil, err
+	}
+	return authContent, nil
+}

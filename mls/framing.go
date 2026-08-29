@@ -508,3 +508,261 @@ func (self *AuthenticatedContent) UnmarshalMLS(r *syntax.Reader) error {
 }
 
 var _ syntax.Codec = (*AuthenticatedContent)(nil)
+
+// ---------------------------------------------------------------------------
+// PublicMessage
+// ---------------------------------------------------------------------------
+
+// PublicMessage is RFC 9420 section 6.2's cleartext wire format: a FramedContent, the
+// authenticators over it, and -- for a member sender and only for one -- the membership tag that
+// says the sender was inside the group when it wrote the message.
+//
+// v1 refuses this format by group policy. Spec A's A-ASSUME-4 puts every handshake message in a
+// PrivateMessage, and group.go's policyCheck is where that refusal lives. It is implemented in
+// full anyway, and the distinction matters to whoever reads this next: it is not dead code, it is
+// code the product policy does not reach. The interop harness's nightly -public matrix runs it,
+// and ValSem007 and ValSem008 have no other path. Which means a defect here is invisible until
+// interop rather than at the first send, so it is written as though it ships.
+//
+// The membership tag is a FIELD of this structure and not of FramedContentAuthData, which is
+// where RFC 9420 puts it and is the reason the validation plan's request to move it was refused:
+// the tag is a MAC over the auth data, so a tag stored beside the signature would be part of its
+// own preimage.
+type PublicMessage struct {
+	Content       FramedContent
+	Auth          FramedContentAuthData
+	MembershipTag []byte
+}
+
+// MarshalMLS writes the content, the auth data its content type selects, and then the membership
+// tag when the sender is a member and only then.
+//
+// The tagless member message is refused BEFORE an octet is written, which is
+// FramedContentAuthData.MarshalMLS's discipline and is load bearing for the same reason: this
+// method is handed the caller's Writer, so a refusal raised after the content had been written
+// would leave a caller that ignored the return value holding an encoding of a message whose only
+// membership authentication is gone. The tag is the tail of this structure, so "shorter" means
+// exactly that.
+//
+// It is a refusal rather than a short write for ValSem007's reason. A member's PublicMessage
+// carries two authenticators and this is one of them; an encoder that wrote the message without
+// it would produce a message every peer rejects having verified its signature first.
+//
+// The guard is spelled on the LENGTH and not on == nil, which is emptyByteSpellings' rule: a
+// caller that built its tag by re-slicing a longer buffer to nothing holds a non nil slice with
+// capacity, and a guard spelled == nil writes an empty opaque<V> for it -- wire legal, and a
+// message no member could have produced.
+func (self *PublicMessage) MarshalMLS(w *syntax.Writer) error {
+	// section 6.2's select on sender_type, ahead of every write. It is a switch and not an
+	// equality because the fourth arm is a REFUSAL: an unregistered sender type has no answer to
+	// "does this message carry a membership tag", and an encoder that guessed would either strip
+	// a member's only membership authentication or attach one to a sender that has no
+	// membership_key to have taken it under. Sender.MarshalMLS refuses the same value one field
+	// in; this stands ahead of it so that no octet has been written when the refusal is raised.
+	carriesMembershipTag := false
+	switch self.Content.Sender.SenderType {
+	case SenderTypeMember:
+		carriesMembershipTag = true
+	case SenderTypeExternal, SenderTypeNewMemberProposal, SenderTypeNewMemberCommit:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownSenderType, self.Content.Sender.SenderType)
+	}
+	if carriesMembershipTag && len(self.MembershipTag) == 0 {
+		return errMissingMembershipTag
+	}
+	if err := self.Content.MarshalMLS(w); err != nil {
+		return err
+	}
+	if err := self.Auth.MarshalMLS(w, self.Content.ContentType); err != nil {
+		return err
+	}
+	if carriesMembershipTag {
+		w.WriteOpaque(self.MembershipTag)
+	}
+	return nil
+}
+
+// UnmarshalMLS reads the content, reads the auth data under the content's OWN content type, reads
+// the membership tag the sender type selects, and only then writes the receiver.
+//
+// The staging is Sender's and AuthenticatedContent's, and it is the property
+// TestEveryFramingDecodeThatPublishesItsReceiverWholeLeavesItUntouchedWhenItRefuses holds every
+// decoder of this package that makes it. A decoder that assigned as it read would leave a caller
+// that reused its receiver holding a FramedContent out of a message this package REFUSED, beside
+// a membership tag from whatever the value held before -- a pair nothing ever carried together,
+// in a value that re-encodes as though a peer had sent it.
+//
+// The auth data is read with the content type that came off THESE bytes, which is
+// AuthenticatedContent.UnmarshalMLS's rule and the whole of what makes either codec correct.
+//
+// The empty membership tag is refused rather than accepted, so that the two halves of this codec
+// agree about it exactly as FramedContentAuthData's two halves agree about the empty confirmation
+// tag: what the encoder refuses to write, the decoder refuses to read. An empty opaque<V> is the
+// wire encoding of "no tag", and a decoder that accepted it would hand its caller a member's
+// PublicMessage whose ValSem007 refusal is deferred to whether somebody downstream remembered to
+// look.
+func (self *PublicMessage) UnmarshalMLS(r *syntax.Reader) error {
+	decoded := PublicMessage{}
+	if err := decoded.Content.UnmarshalMLS(r); err != nil {
+		return err
+	}
+	if err := decoded.Auth.UnmarshalMLS(r, decoded.Content.ContentType); err != nil {
+		return err
+	}
+	// the same select the encoder makes, and its default stands BEHIND Sender.UnmarshalMLS
+	// rather than in front of it: that codec refuses an unregistered sender type at the octet it
+	// reads it from, so nothing reaches this arm today and the refusal a peer receives is its
+	// one. It is written as a refusal anyway, for what the alternative silently does. A default
+	// that fell through to the no-tag arm would, the day anything in this package carries an
+	// unregistered sender type instead of refusing it, read a member's membership_tag as trailing
+	// bytes and a tagless sender's next field as a tag -- a message misframed rather than
+	// rejected, which is the failure this whole file is arranged to make impossible.
+	switch decoded.Content.Sender.SenderType {
+	case SenderTypeMember:
+		membershipTag, err := r.ReadOpaque()
+		if err != nil {
+			return err
+		}
+		if len(membershipTag) == 0 {
+			return errMissingMembershipTag
+		}
+		decoded.MembershipTag = membershipTag
+	case SenderTypeExternal, SenderTypeNewMemberProposal, SenderTypeNewMemberCommit:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownSenderType, decoded.Content.Sender.SenderType)
+	}
+	*self = decoded
+	return nil
+}
+
+// AuthenticatedContent is the wire format independent view of this message, which is the object
+// every validation path and every staged commit works on.
+//
+// The wire format is STAMPED as WireFormatPublicMessage rather than carried, because it is a fact
+// about the structure the bytes were read out of and not something the message asserts. That is
+// what makes the wire format's presence in the signature preimage worth having: a PublicMessage
+// replayed as a PrivateMessage arrives through the other codec, is stamped with the other value,
+// and produces a preimage the signature does not verify against.
+//
+// The membership tag is deliberately absent from the answer. It is not part of any preimage the
+// signature or the transcript is taken over -- it is a MAC over the whole of the signature's
+// preimage -- so a view that carried it would be offering a caller an authenticator with nothing
+// to check it against. OpenPublicMessage checks it before it builds this view.
+func (self *PublicMessage) AuthenticatedContent() *AuthenticatedContent {
+	return &AuthenticatedContent{
+		WireFormat: WireFormatPublicMessage,
+		Content:    self.Content,
+		Auth:       self.Auth,
+	}
+}
+
+var _ syntax.Codec = (*PublicMessage)(nil)
+
+// ---------------------------------------------------------------------------
+// PrivateMessage
+// ---------------------------------------------------------------------------
+
+// PrivateMessage is RFC 9420 section 6.3's encrypted wire format, and under A-ASSUME-4 it is the
+// only one v1 puts on the wire.
+//
+// The header is CLEARTEXT and that is the design rather than a leak: the message server orders,
+// routes and prunes on group_id and epoch, and it cannot decrypt anything. What keeps the header
+// honest is that every one of these four cleartext fields is inside an AAD -- group_id, epoch and
+// content_type inside both of section 6.3's, authenticated_data inside the content's -- so a
+// header altered in flight is a decryption that fails rather than a message that arrives
+// misattributed.
+//
+// The sender is NOT here. It lives in the encrypted sender data, which is what stops the transport
+// learning which member of a group sent which message, and it is why this format's open cannot be
+// handed a signature key by its caller: nothing knows whose key it is until the sender data has
+// been decrypted. That is the whole reason SignatureKeyResolver exists.
+//
+// ContentType is a field of the header rather than something read out of the plaintext, because it
+// selects which of a leaf's two ratchets protects the message -- so a receiver has to know it
+// before it has anything to decrypt with.
+type PrivateMessage struct {
+	GroupId             []byte
+	Epoch               uint64
+	ContentType         ContentType
+	AuthenticatedData   []byte
+	EncryptedSenderData []byte
+	Ciphertext          []byte
+}
+
+// MarshalMLS refuses an unregistered content type before it writes, which is the discipline every
+// encoder in this file keeps and which has a sharper edge here than it does elsewhere.
+//
+// This header is the AAD of two AEAD operations. An encoder that wrote a content type no registry
+// declares would produce a message whose sender data and whose content were sealed under an AAD
+// naming a ratchet that does not exist -- and since the same wrong value is read back on the
+// receiving side, the message decrypts perfectly against this implementation and against nothing
+// else. Nothing that round trips can see it.
+func (self *PrivateMessage) MarshalMLS(w *syntax.Writer) error {
+	switch self.ContentType {
+	case ContentTypeApplication, ContentTypeProposal, ContentTypeCommit:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownContentType, self.ContentType)
+	}
+	w.WriteOpaque(self.GroupId)
+	w.WriteUint64(self.Epoch)
+	w.WriteUint8(uint8(self.ContentType))
+	w.WriteOpaque(self.AuthenticatedData)
+	w.WriteOpaque(self.EncryptedSenderData)
+	w.WriteOpaque(self.Ciphertext)
+	return nil
+}
+
+// UnmarshalMLS reads the six fields, refuses an unregistered content type at the octet it was read
+// at, and only then writes the receiver.
+//
+// The content type is refused HERE and not left to the ratchet lookup, though secret_tree.go's
+// ratchetTypeOf refuses the same value: this is the first place the octet is seen, refusing it
+// here means no key is ever derived for it, and "a content type this package does not register" is
+// one condition with one sentinel however it is reached. What the two do differently is only where
+// the caller is standing when they are answered.
+//
+// The staging is Sender's and AuthenticatedContent's, for the reason PublicMessage.UnmarshalMLS
+// gives: a caller that reused its receiver must not be left holding a group_id and an epoch out of
+// a header this package refused, over ciphertext fields from whatever it held before.
+func (self *PrivateMessage) UnmarshalMLS(r *syntax.Reader) error {
+	groupId, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	epoch, err := r.ReadUint64()
+	if err != nil {
+		return err
+	}
+	contentType, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	switch ContentType(contentType) {
+	case ContentTypeApplication, ContentTypeProposal, ContentTypeCommit:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownContentType, ContentType(contentType))
+	}
+	authenticatedData, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	encryptedSenderData, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	ciphertext, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	*self = PrivateMessage{
+		GroupId:             groupId,
+		Epoch:               epoch,
+		ContentType:         ContentType(contentType),
+		AuthenticatedData:   authenticatedData,
+		EncryptedSenderData: encryptedSenderData,
+		Ciphertext:          ciphertext,
+	}
+	return nil
+}
+
+var _ syntax.Codec = (*PrivateMessage)(nil)
