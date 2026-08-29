@@ -1717,3 +1717,335 @@ func TestValidateAcceptsATreeWithNoMembersAtEveryWidth(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ValSem206 and ValSem207: the keys an UpdatePath introduces
+// ---------------------------------------------------------------------------
+//
+// The ValSem-numbered names are the validation plan's -- TestValSem206_PathLeafDuplicateEncryptionKey
+// and TestValSem207_PathNodeDuplicateEncryptionKey -- and two functions of one name in one go
+// package do not compile, so everything here is named for the behaviour it holds. What this file
+// owes that plan is the production surface those two drive, and the property sweeps a
+// table-driven ValSem row cannot make: that both loops read every element of their set.
+
+// updatePathUniquenessFixture is an eight member tree with real PARENT nodes in it, and one
+// member's freshly published path over it.
+//
+// The parents are the reason this helper exists. CheckUpdatePathKeyUniqueness reads leaves and
+// parents through two different arms of one switch, and newTestTree's parents are all blank -- so
+// a fixture built straight from it exercises the leaf arm and nothing else, and a walk that never
+// looked at a parent would pass every assertion made over it while accepting a path that steals a
+// parent's key. Two commits from members on the far side of the tree fill four parent positions
+// with real keys and leave three blank, so every sweep below runs over occupied leaves, occupied
+// parents and blank positions in one array.
+//
+// The committers are 7 and 4 and the path is member 0's, so the sender's own leaf is at node 0
+// and the keys the sweep steals are at every other position. Nothing here sits at the first
+// index of anything by accident.
+func updatePathUniquenessFixture(t *testing.T, crypto CryptoProvider) (*RatchetTree, *UpdatePath, *testMember) {
+	t.Helper()
+	tree, members := newTestTree(t, crypto, 8)
+	for _, committer := range []int{7, 4} {
+		committed, _, _, _ := createAndEncryptPath(t, crypto, tree, members[committer], nil)
+		tree = committed
+	}
+	leaves, parents, blanks := 0, 0, 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		switch node := tree.Get(NodeIndex(x)); {
+		case node == nil:
+			blanks += 1
+		case node.Leaf != nil:
+			leaves += 1
+		default:
+			parents += 1
+		}
+	}
+	// the fixture's own claim about itself, checked rather than assumed: a later change to
+	// newTestTree or to the filtered path could quietly empty one of the three populations, and
+	// every sweep below would go on passing over whatever was left.
+	if leaves < 4 || parents < 2 || blanks < 1 {
+		t.Fatalf("the fixture holds %d occupied leaves, %d occupied parents and %d blanks; a sweep over it states nothing about the arm with nothing in it",
+			leaves, parents, blanks)
+	}
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	if len(path.Nodes) < 3 {
+		t.Fatalf("the path publishes %d nodes; the position sweeps below need a middle to put an offender in", len(path.Nodes))
+	}
+	if err := CheckUpdatePathKeyUniqueness(tree, path); err != nil {
+		t.Fatalf("the fixture's own untampered path was refused: %v", err)
+	}
+	return tree, path, members[0]
+}
+
+// pathWithLeafKey and pathWithNodeKey are the two tamperings, each over a COPY, so a sweep cannot
+// carry one iteration's offender into the next. The nodes slice is cloned because UpdatePathNode
+// is a value type in it, and assigning through the original slice would rewrite the fixture every
+// later iteration reads.
+func pathWithLeafKey(path *UpdatePath, key HpkePublicKey) *UpdatePath {
+	tampered := &UpdatePath{LeafNode: *path.LeafNode.Clone(), Nodes: slices.Clone(path.Nodes)}
+	tampered.LeafNode.EncryptionKey = cloneBytes(key)
+	return tampered
+}
+
+func pathWithNodeKey(path *UpdatePath, at int, key HpkePublicKey) *UpdatePath {
+	tampered := &UpdatePath{LeafNode: *path.LeafNode.Clone(), Nodes: slices.Clone(path.Nodes)}
+	tampered.Nodes[at].EncryptionKey = cloneBytes(key)
+	return tampered
+}
+
+// TestUpdatePathLeafKeyUniqueness is ValSem206's shape: the path's own leaf node may not publish
+// a key the tree already has.
+func TestUpdatePathLeafKeyUniqueness(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	if err := CheckUpdatePathKeyUniqueness(tree, path); err != nil {
+		t.Fatalf("a fresh path must be unique: %v", err)
+	}
+	tampered := pathWithLeafKey(path, tree.Leaf(LeafIndex(2)).EncryptionKey)
+	if err := CheckUpdatePathKeyUniqueness(tree, tampered); !errors.Is(err, errDuplicateEncryptionKey) {
+		t.Fatalf("err = %v, want errDuplicateEncryptionKey", err)
+	}
+}
+
+// TestUpdatePathNodeKeyUniqueness is ValSem207's shape: a path node may not publish a key the
+// tree already has, nor one another node of the same path publishes.
+func TestUpdatePathNodeKeyUniqueness(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+
+	// a path node reusing a leaf's key that is already in the tree.
+	tampered := pathWithNodeKey(path, 0, tree.Leaf(LeafIndex(2)).EncryptionKey)
+	if err := CheckUpdatePathKeyUniqueness(tree, tampered); !errors.Is(err, errDuplicateEncryptionKey) {
+		t.Fatalf("reused tree key: err = %v, want errDuplicateEncryptionKey", err)
+	}
+
+	// two nodes of the same path sharing a key.
+	tampered = pathWithNodeKey(path, 1, path.Nodes[0].EncryptionKey)
+	if err := CheckUpdatePathKeyUniqueness(tree, tampered); !errors.Is(err, errDuplicateEncryptionKey) {
+		t.Fatalf("repeated path key: err = %v, want errDuplicateEncryptionKey", err)
+	}
+
+	// the sender's own outgoing leaf key is being replaced, so it does not count. This is the
+	// case that fails if the sender is guessed rather than recovered from the path's own
+	// signature key.
+	reused := pathWithLeafKey(path, tree.Leaf(members[0].LeafIndex).EncryptionKey)
+	if err := CheckUpdatePathKeyUniqueness(tree, reused); err != nil {
+		t.Fatalf("the sender's own leaf key must not collide with itself: %v", err)
+	}
+}
+
+// TestUpdatePathKeyUniquenessWithAnUnknownSender: a path whose leaf signature key is in no leaf
+// of the tree is not from a member, so nothing is being replaced and every key in it must be new
+// -- the one it copied from the member it is impersonating included.
+func TestUpdatePathKeyUniquenessWithAnUnknownSender(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	stranger := pathWithLeafKey(path, tree.Leaf(members[0].LeafIndex).EncryptionKey)
+	stranger.LeafNode.SignatureKey = SignaturePublicKey(bytes.Repeat([]byte{0x7E}, 32))
+	if err := CheckUpdatePathKeyUniqueness(tree, stranger); !errors.Is(err, errDuplicateEncryptionKey) {
+		t.Fatalf("err = %v, want errDuplicateEncryptionKey", err)
+	}
+}
+
+// TestUpdatePathKeyUniquenessReadsEveryOccupiedNodeOfTheTree is the sweep this file's header
+// argues for, run over the tree side of the check.
+//
+// The set is every occupied position of the node array, and the positions are DERIVED from the
+// width rather than listed, so a fixture that grows a node or loses one is swept as it stands.
+// Every one of them but the committer's own leaf has its key stolen -- once into the path's leaf
+// node, and once into each position of the path -- and each theft must be refused. A build of the
+// existing-key map bounded to the first element, or to the leaves, or to the parents, accepts
+// every theft from outside whatever it read, and this is the assertion that sees it.
+func TestUpdatePathKeyUniquenessReadsEveryOccupiedNodeOfTheTree(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, path, sender := updatePathUniquenessFixture(t, crypto)
+	before := treeSnapshot(tree)
+	senderNode := sender.LeafIndex.NodeIndex()
+	stolenFromLeaves, stolenFromParents := 0, 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		node := tree.Get(NodeIndex(x))
+		if node == nil || NodeIndex(x) == senderNode {
+			continue
+		}
+		// treekem_test.go's reader, which is fatal on a blank and on a body-less node; the
+		// sweep has already skipped the blanks and the fixture has no body-less node.
+		key := encryptionKeyAt(t, tree, NodeIndex(x))
+		if err := CheckUpdatePathKeyUniqueness(tree, pathWithLeafKey(path, key)); !errors.Is(err, errDuplicateEncryptionKey) {
+			t.Errorf("the path's leaf node publishing node %d's key: err = %v, want errDuplicateEncryptionKey",
+				x, err)
+		}
+		for i := range path.Nodes {
+			if err := CheckUpdatePathKeyUniqueness(tree, pathWithNodeKey(path, i, key)); !errors.Is(err, errDuplicateEncryptionKey) {
+				t.Errorf("path node %d of %d publishing node %d's key: err = %v, want errDuplicateEncryptionKey",
+					i, len(path.Nodes), x, err)
+			}
+		}
+		if node.Leaf != nil {
+			stolenFromLeaves += 1
+		} else {
+			stolenFromParents += 1
+		}
+	}
+	// the coverage claim, checked rather than assumed: both arms of the switch had something
+	// taken from them, so a walk reading only one of them is inside this sweep rather than beside
+	// it.
+	if stolenFromLeaves < 3 || stolenFromParents < 2 {
+		t.Fatalf("the sweep stole from %d leaves and %d parents; an arm nothing was stolen from is an arm this states nothing about",
+			stolenFromLeaves, stolenFromParents)
+	}
+	if after := treeSnapshot(tree); !slices.Equal(before, after) {
+		t.Error("CheckUpdatePathKeyUniqueness changed the caller's tree; it is a refusal surface over a tree nobody has agreed to yet")
+	}
+	t.Logf("%d occupied leaves and %d occupied parents swept, at %d path positions each",
+		stolenFromLeaves, stolenFromParents, len(path.Nodes)+1)
+}
+
+// TestUpdatePathKeyUniquenessReadsEveryPositionOfThePath is the same sweep over the other set:
+// the keys the path itself introduces, which are the leaf node's and every path node's.
+//
+// Every ORDERED PAIR of positions is tried, with the source's key written into the target, so a
+// loop bounded at the first position and a loop that stops before its last are both refused by
+// some pair. The positions come from the path's own length; nothing here names an index.
+func TestUpdatePathKeyUniquenessReadsEveryPositionOfThePath(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, path, _ := updatePathUniquenessFixture(t, crypto)
+	// position 0 is the path's leaf node and position i+1 is path.Nodes[i], which is the order
+	// the encoder writes them in and the order a refusal names them in.
+	positions := len(path.Nodes) + 1
+	keyAt := func(at int) HpkePublicKey {
+		if at == 0 {
+			return path.LeafNode.EncryptionKey
+		}
+		return path.Nodes[at-1].EncryptionKey
+	}
+	withKeyAt := func(at int, key HpkePublicKey) *UpdatePath {
+		if at == 0 {
+			return pathWithLeafKey(path, key)
+		}
+		return pathWithNodeKey(path, at-1, key)
+	}
+	pairs := 0
+	for source := 0; source < positions; source += 1 {
+		for target := 0; target < positions; target += 1 {
+			if source == target {
+				continue
+			}
+			tampered := withKeyAt(target, keyAt(source))
+			if err := CheckUpdatePathKeyUniqueness(tree, tampered); !errors.Is(err, errDuplicateEncryptionKey) {
+				t.Errorf("position %d of %d carrying position %d's key: err = %v, want errDuplicateEncryptionKey",
+					target, positions, source, err)
+			}
+			pairs += 1
+		}
+	}
+	if want := positions * (positions - 1); pairs != want {
+		t.Fatalf("the sweep tried %d ordered pairs and the path has %d positions, so it should have tried %d",
+			pairs, positions, want)
+	}
+	t.Logf("%d ordered pairs over %d path positions", pairs, positions)
+}
+
+// TestUpdatePathKeyUniquenessExemptsTheCommittersLeafAndNoOther holds the one exemption to its
+// exact width.
+//
+// Two ways to get this wrong, and each is silent. Exempt nothing and every honest commit is
+// refused, which at least fails the first time a group commits. Exempt every LEAF -- which is
+// what dropping the index comparison and keeping the arm does -- and a commit may publish any
+// member's encryption key as its own, which is a member reading path secrets sealed to somebody
+// else and nothing anywhere reporting it. So the exemption is asserted at the committer's leaf
+// and refused at every other non-blank leaf, with the leaves derived from the tree.
+func TestUpdatePathKeyUniquenessExemptsTheCommittersLeafAndNoOther(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, path, sender := updatePathUniquenessFixture(t, crypto)
+	outgoing := tree.Leaf(sender.LeafIndex).EncryptionKey
+	if err := CheckUpdatePathKeyUniqueness(tree, pathWithLeafKey(path, outgoing)); err != nil {
+		t.Fatalf("the committer's own outgoing leaf key is the key this path replaces: err = %v, want nil", err)
+	}
+	refused := 0
+	for _, i := range tree.NonBlankLeaves() {
+		if i == sender.LeafIndex {
+			continue
+		}
+		tampered := pathWithLeafKey(path, tree.Leaf(i).EncryptionKey)
+		if err := CheckUpdatePathKeyUniqueness(tree, tampered); !errors.Is(err, errDuplicateEncryptionKey) {
+			t.Errorf("the committer publishing leaf %d's encryption key: err = %v, want errDuplicateEncryptionKey",
+				i, err)
+			continue
+		}
+		refused += 1
+	}
+	if refused < 3 {
+		t.Fatalf("only %d other leaves were refused; an exemption widened to every leaf has to be visible at more than one of them", refused)
+	}
+	// the exemption is the COMMITTER'S and follows the signature key rather than the position. A
+	// path signed by a stranger replaces nothing, so the same key is a duplicate again -- which is
+	// TestUpdatePathKeyUniquenessWithAnUnknownSender's claim, restated here against the fixture
+	// that has parents in it so the two cannot drift.
+	stranger := pathWithLeafKey(path, outgoing)
+	stranger.LeafNode.SignatureKey = SignaturePublicKey(bytes.Repeat([]byte{0x7E}, 32))
+	if err := CheckUpdatePathKeyUniqueness(tree, stranger); !errors.Is(err, errDuplicateEncryptionKey) {
+		t.Errorf("a stranger publishing the committer's outgoing key: err = %v, want errDuplicateEncryptionKey", err)
+	}
+	t.Logf("the committer's leaf exempt, %d other leaves refused", refused)
+}
+
+// TestUpdatePathKeyUniquenessRefusesAnAbsentArgument: a missing tree or a missing path is a check
+// that was SKIPPED, and answering nil for it is the accept-because-it-never-looked shape every
+// ValSem on this project has failed as.
+func TestUpdatePathKeyUniquenessRefusesAnAbsentArgument(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	if err := CheckUpdatePathKeyUniqueness(nil, path); !errors.Is(err, ErrTreeMalformed) {
+		t.Errorf("no tree: err = %v, want ErrTreeMalformed", err)
+	}
+	if err := CheckUpdatePathKeyUniqueness(tree, nil); !errors.Is(err, errNilUpdatePath) {
+		t.Errorf("no path: err = %v, want errNilUpdatePath", err)
+	}
+}
+
+// TestUpdatePathKeyUniquenessRefusesAnOccupiedNodeWithNoBody covers the switch's last arm.
+//
+// validateStructure refuses this shape ahead of every caller that has validated its tree, and
+// this function is reachable from callers that have not -- the group lifecycle plan calls it over
+// a tree it has just applied proposals to, rather than over one it has just decoded. So the arm is
+// a refusal rather than a nil dereference, and the difference between those two is a panic in a
+// message handler.
+func TestUpdatePathKeyUniquenessRefusesAnOccupiedNodeWithNoBody(t *testing.T) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	tree, members := newTestTree(t, crypto, 4)
+	_, path, _, _ := createAndEncryptPath(t, crypto, tree, members[0], nil)
+	// planted at the last parent position rather than the first, so a walk that stopped early
+	// would answer nil here instead of the refusal.
+	plantNode(t, tree, NodeIndex(tree.NodeWidth()-2), &Node{NodeType: NodeTypeParent})
+	if err := CheckUpdatePathKeyUniqueness(tree, path); !errors.Is(err, ErrNodeTypeMismatch) {
+		t.Errorf("err = %v, want ErrNodeTypeMismatch", err)
+	}
+}

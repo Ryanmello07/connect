@@ -562,3 +562,112 @@ func (self *RatchetTree) ValidateAgainstContext(ctx *TreeValidationContext, gc *
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// ValSem206 and ValSem207: the keys an UpdatePath introduces
+// ---------------------------------------------------------------------------
+
+// CheckUpdatePathKeyUniqueness is ValSem206 and ValSem207 in one walk: every encryption key an
+// UpdatePath introduces -- its leaf node's and every path node's -- is new to the tree and new
+// within the path.
+//
+// Run it against the PRE-merge tree. The keys the path publishes are the keys the merge is about
+// to install, so after MergeUpdatePath every one of them is in the tree and this would refuse
+// every honest commit; before it, the tree holds exactly the keys the commit must not collide
+// with. The group lifecycle plan's call site is the one right before the merge for that reason.
+//
+// A repeated encryption key is not a cosmetic duplicate, and validateKeyUniqueness' note next
+// door is the same argument made about a whole tree: a commit seals one path secret per entry of
+// a resolution, so two nodes publishing one key means one HPKE private key opens two positions,
+// and whoever holds it reads a path secret sealed to a node they are not on. The path is where
+// that gets INTRODUCED, which is why the check is owed here and not only over a tree that has
+// already been assembled.
+//
+// The committer is RECOVERED from the path rather than passed in, and that is a safety decision
+// rather than a convenience. The sender's own outgoing leaf key is the one key the path is
+// replacing, so it must not count as a collision; a commit never changes the committer's
+// signature key, so the leaf carrying path.LeafNode.SignatureKey is the leaf being replaced.
+// Taking the sender as an argument would give every call site one more thing to get wrong, and
+// getting it wrong points the exemption at somebody ELSE's leaf -- which turns a real ValSem206
+// into a pass, silently, for exactly the leaf whose key was stolen. There is no argument here to
+// get wrong.
+//
+// A path whose signature key matches no leaf is not from a member. Nothing is being replaced
+// then, so no key is exempt and every key in it must be new -- including one copied from the
+// leaf the stranger is pretending to be.
+//
+// Both halves are sweeps over a SET, in the shape this file's header argues for: the tree side
+// reads every occupied position, leaf and parent alike, and the path side reads every node it
+// publishes rather than its first. A version of either bounded to the first element accepts a
+// path whose only stolen key sits anywhere else, which is the defect this project has shipped
+// four times.
+func CheckUpdatePathKeyUniqueness(tree *RatchetTree, path *UpdatePath) error {
+	// refused rather than dereferenced, so a missing argument cannot read as "nothing collided".
+	// The tree is what the path is judged AGAINST, and a nil one has not passed this check, it
+	// has skipped it -- ValidateAgainstContext refuses a missing group context for the same
+	// reason and answers the sentinel of the thing that was absent.
+	if tree == nil {
+		return fmt.Errorf("%w: there is no tree for this update path's keys to be checked against",
+			ErrTreeMalformed)
+	}
+	if path == nil {
+		return errNilUpdatePath
+	}
+	replaced, isMember := tree.FindLeafBySignatureKey(path.LeafNode.SignatureKey)
+	// keyed by the key BYTES rather than by an index, which is validateKeyUniqueness' spelling
+	// and makes this a sweep over every pair without being written as one.
+	existing := map[string]uint32{}
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		node := tree.Get(NodeIndex(x))
+		if node == nil {
+			continue
+		}
+		var encryptionKey []byte
+		switch {
+		case node.Leaf != nil:
+			// the one exemption, and it is one LEAF rather than the leaves: the committer's
+			// outgoing key. Skipping every leaf here would let a commit steal any member's
+			// encryption key, and skipping none would refuse every honest commit.
+			if isMember && NodeIndex(x) == replaced.NodeIndex() {
+				continue
+			}
+			encryptionKey = node.Leaf.EncryptionKey
+		case node.Parent != nil:
+			encryptionKey = node.Parent.EncryptionKey
+		default:
+			// an occupied position with neither body. validateStructure refuses it ahead of
+			// every caller that has validated its tree, and this function is reachable from
+			// callers that have not, so it is answered rather than left to a nil dereference.
+			return fmt.Errorf("%w: node %d is occupied and holds neither a leaf nor a parent",
+				ErrNodeTypeMismatch, x)
+		}
+		existing[string(encryptionKey)] = x
+	}
+	// the leaf first and then the path nodes in published order, so the position a refusal names
+	// is the position the encoder wrote rather than an index into a reordered copy.
+	type introducedKey struct {
+		where string
+		key   []byte
+	}
+	introduced := make([]introducedKey, 0, len(path.Nodes)+1)
+	introduced = append(introduced, introducedKey{where: "the path's leaf node", key: path.LeafNode.EncryptionKey})
+	for i := range path.Nodes {
+		introduced = append(introduced, introducedKey{
+			where: fmt.Sprintf("path node %d", i),
+			key:   path.Nodes[i].EncryptionKey,
+		})
+	}
+	seen := map[string]string{}
+	for _, one := range introduced {
+		if at, inTree := existing[string(one.key)]; inTree {
+			return fmt.Errorf("%w: %s publishes the key already at node %d",
+				errDuplicateEncryptionKey, one.where, at)
+		}
+		if first, repeated := seen[string(one.key)]; repeated {
+			return fmt.Errorf("%w: %s publishes the same key as %s",
+				errDuplicateEncryptionKey, one.where, first)
+		}
+		seen[string(one.key)] = one.where
+	}
+	return nil
+}
