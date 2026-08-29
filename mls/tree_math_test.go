@@ -4315,10 +4315,19 @@ func TestResolutionRandomShapesAtEveryDepth(t *testing.T) {
 // wide, so nothing above level 6 is reached, and every unmerged list in the
 // corpus holds exactly one leaf, so the ordering contract is untouched by it.
 // the sweeps above carry both and this carries the provenance.
+// every field the corpus row carries and not only the two this file reads, because
+// family 10's runner in tree_kat_test.go decodes the same rows through this same
+// struct. Three readers of tree-validation.json already live in this package and a
+// fourth declaration of one row is how two of them end up disagreeing about which
+// json key an answer lives at, which is silent in the worst direction: the second
+// spelling looks up nothing, decodes to the empty column, and every comparison over
+// it agrees with anything.
 type treeValidationVector struct {
 	CipherSuite uint16     `json:"cipher_suite"`
 	Tree        string     `json:"tree"`
+	GroupId     string     `json:"group_id"`
 	Resolutions [][]uint32 `json:"resolutions"`
+	TreeHashes  []string   `json:"tree_hashes"`
 }
 
 // the family file, named relative to testdata/vectors exactly as
