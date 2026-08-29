@@ -4028,3 +4028,861 @@ func TestTheRatchetTreeExtensionNeedsTheRaisedLimitAroundItToo(t *testing.T) {
 			out.MemberCount(), productGroupLeafCount)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// RFC 9420 section 7.7: Add, Update and Remove on the tree
+// ---------------------------------------------------------------------------
+
+// treeWithOccupiedLeaves is the cheap fixture the shape questions below sweep with: a complete
+// tree of the given leaf width, a distinguishable leaf wherever the occupancy says so, a
+// distinguishable parent node at EVERY odd index, and no cryptography anywhere.
+//
+// Every parent occupied is the half that makes a blanking observable at all. On a tree whose
+// parents are already blank -- which is what newTestTree hands back, and what three of the four
+// tests the plan supplied for this task ran against -- an operation that blanks the whole direct
+// path and one that blanks nothing above the leaf leave exactly the same tree, and no assertion
+// about a blank can tell them apart. The fixture asserts its own occupancy below for that reason.
+//
+// The leaves are filled and then blanked back rather than skipped, because a pattern with a blank
+// on the right would otherwise never reach the width it was asked for: the array grows to hold
+// the widest leaf INSTALLED, so leaving leaf 7 out of an eight leaf tree builds a four leaf one.
+func treeWithOccupiedLeaves(t *testing.T, width uint32, occupied func(LeafIndex) bool) *RatchetTree {
+	t.Helper()
+	tree := NewRatchetTree()
+	for i := uint32(0); i < width; i += 1 {
+		if err := tree.SetLeaf(LeafIndex(i), testTreeLeaf(i)); err != nil {
+			t.Fatalf("SetLeaf(%d): %v", i, err)
+		}
+	}
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if err := tree.SetParent(NodeIndex(x), &ParentNode{
+			EncryptionKey: HpkePublicKey(repeatByte(byte(0xc0+x), 32)),
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	for i := uint32(0); i < width; i += 1 {
+		if occupied(LeafIndex(i)) {
+			continue
+		}
+		if err := tree.Blank(LeafIndex(i).NodeIndex()); err != nil {
+			t.Fatalf("Blank(leaf %d): %v", i, err)
+		}
+	}
+	// the fixture's own claims, asked rather than assumed, because everything below is a
+	// statement about a change to this shape.
+	if tree.LeafWidth() != LeafCount(width) {
+		t.Fatalf("the fixture is %d leaves wide and was asked for %d", tree.LeafWidth(), width)
+	}
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if tree.IsBlank(NodeIndex(x)) {
+			t.Fatalf("node %d is blank in a fixture that fills every parent, so blanking it is not observable", x)
+		}
+	}
+	for i := uint32(0); i < width; i += 1 {
+		if occupied(LeafIndex(i)) != (tree.Leaf(LeafIndex(i)) != nil) {
+			t.Fatalf("leaf %d does not match the occupancy the fixture was asked for", i)
+		}
+	}
+	return tree
+}
+
+// assertStillATree holds every structural rule this package already owns over whatever an
+// operation left behind.
+//
+// The cheapest strong property available here, and the reason it is worth its length: an
+// operation that leaves a MALFORMED tree does not fail at the operation. It fails at a tree hash,
+// a resolution or a join three tasks later, against code that has nothing to do with the loop
+// that was wrong. So each rule below is read out of something that is not this file -- the tree
+// math's own width predicates, the container's own type-per-position rule, the codec's own
+// unmerged ordering check, the free Resolution's own refusal boundary -- and none of them is
+// restated here in a form that could drift from what the package actually enforces.
+func assertStillATree(t *testing.T, where string, tree *RatchetTree) {
+	t.Helper()
+	if !IsFullLeafCount(tree.LeafWidth()) {
+		t.Fatalf("%s: the leaf width is %d, which is not a width any tree has", where, tree.LeafWidth())
+	}
+	if NodeWidth(tree.LeafWidth()) != tree.NodeWidth() {
+		t.Fatalf("%s: %d nodes over %d leaves, want %d",
+			where, tree.NodeWidth(), tree.LeafWidth(), NodeWidth(tree.LeafWidth()))
+	}
+	if _, err := rootOf(tree.LeafWidth()); err != nil {
+		t.Fatalf("%s: the tree has no root: %v", where, err)
+	}
+	occupied := 0
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		node := tree.Get(NodeIndex(x))
+		if node == nil {
+			continue
+		}
+		occupied += 1
+		if NodeIndex(x).IsLeaf() != (node.NodeType == NodeTypeLeaf) {
+			t.Fatalf("%s: node %d carries node type %d, which is not the one its index requires", where, x, node.NodeType)
+		}
+	}
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		parent := tree.ParentAt(NodeIndex(x))
+		if parent == nil {
+			continue
+		}
+		// the codec's own rule and not a second reading of it: an unsorted vector is a tree only
+		// this implementation hashes.
+		if err := checkUnmergedLeavesSorted(parent.UnmergedLeaves); err != nil {
+			t.Fatalf("%s: node %d unmerged = %v: %v", where, x, parent.UnmergedLeaves, err)
+		}
+		first, last := SubtreeLeaves(NodeIndex(x))
+		for _, leaf := range parent.UnmergedLeaves {
+			if LeafCount(leaf) >= tree.LeafWidth() {
+				t.Fatalf("%s: node %d lists leaf %d unmerged over a %d leaf tree, and SetParent would refuse that node",
+					where, x, leaf, tree.LeafWidth())
+			}
+			if leaf < first || leaf > last {
+				t.Fatalf("%s: node %d lists leaf %d unmerged and covers only leaves %d..%d", where, x, leaf, first, last)
+			}
+			if tree.Leaf(leaf) == nil {
+				t.Fatalf("%s: node %d lists blank leaf %d unmerged", where, x, leaf)
+			}
+		}
+	}
+	assertResolutionRefusesOnlyPastTheNodeWidth(t, tree, where)
+	if occupied == 0 {
+		// a tree with nothing in it anywhere has no encoding at all: section 12.4.3.3's array may
+		// not end in a blank and every entry of this one is. That is the state the container calls
+		// the one leaf tree and the codec calls malformed, and both are right.
+		return
+	}
+	encoded, err := marshalRatchetTree(tree)
+	if err != nil {
+		t.Fatalf("%s: the tree no longer encodes: %v", where, err)
+	}
+	back, err := UnmarshalRatchetTree(encoded)
+	if err != nil {
+		t.Fatalf("%s: the tree no longer decodes: %v", where, err)
+	}
+	again, err := marshalRatchetTree(back)
+	if err != nil {
+		t.Fatalf("%s: the decoded tree does not re-encode: %v", where, err)
+	}
+	if !bytes.Equal(encoded, again) {
+		t.Fatalf("%s: the tree does not round trip through its own codec", where)
+	}
+}
+
+// TestAddLeafFillsTheLeftmostBlankAndMarksUnmerged is the plan's test for this clause with the
+// two things it could not observe put back.
+//
+// The plan's version blanked ONE leaf and then asserted Add filled it. With a single blank in the
+// tree the leftmost blank, the rightmost blank and any blank at all are the same index, so no
+// version of Add can fail that assertion -- the first mutation this task names is invisible to
+// it. And it ran on a four leaf tree, whose direct path is two nodes long, so there is no node on
+// it that is neither the first element nor the last: the interior of the marking loop is
+// unobserved. Eight leaves and two blanks fix both.
+func TestAddLeafFillsTheLeftmostBlankAndMarksUnmerged(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 8)
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if err := tree.SetParent(NodeIndex(x), &ParentNode{
+			EncryptionKey: HpkePublicKey(repeatByte(byte(0x60+x), 32)),
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	for _, blank := range []LeafIndex{2, 5} {
+		if err := tree.Blank(blank.NodeIndex()); err != nil {
+			t.Fatalf("Blank(leaf %d): %v", blank, err)
+		}
+	}
+	newLeaf := tree.Leaf(LeafIndex(0)).Clone()
+	got, err := tree.AddLeaf(newLeaf)
+	if err != nil {
+		t.Fatalf("AddLeaf: %v", err)
+	}
+	if got != LeafIndex(2) {
+		t.Fatalf("AddLeaf = %d, want the leftmost blank leaf 2 and not the rightmost blank leaf 5", got)
+	}
+	path, err := directPathOf(got.NodeIndex(), tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf(%d): %v", got.NodeIndex(), err)
+	}
+	if len(path) < 3 {
+		t.Fatalf("leaf %d's direct path is %v, and a path with no interior node observes no interior clause", got, path)
+	}
+	onPath := map[NodeIndex]bool{}
+	for _, x := range path {
+		onPath[x] = true
+		parent := tree.ParentAt(x)
+		if parent == nil {
+			t.Fatalf("AddLeaf blanked node %d; Add must never blank", x)
+		}
+		if len(parent.UnmergedLeaves) != 1 || parent.UnmergedLeaves[0] != got {
+			t.Fatalf("node %d of the direct path %v has unmerged = %v, want [%d]", x, path, parent.UnmergedLeaves, got)
+		}
+	}
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if onPath[NodeIndex(x)] {
+			continue
+		}
+		parent := tree.ParentAt(NodeIndex(x))
+		if parent == nil {
+			t.Fatalf("AddLeaf blanked node %d, which is not even on the new leaf's path", x)
+		}
+		if len(parent.UnmergedLeaves) != 0 {
+			t.Fatalf("node %d is off leaf %d's direct path %v and must not be marked unmerged, and carries %v",
+				x, got, path, parent.UnmergedLeaves)
+		}
+	}
+	// the second blank next, because Add refills every gap before it widens anything.
+	second, err := tree.AddLeaf(newLeaf.Clone())
+	if err != nil {
+		t.Fatalf("AddLeaf into the second gap: %v", err)
+	}
+	if second != LeafIndex(5) {
+		t.Fatalf("AddLeaf = %d, want the remaining blank leaf 5", second)
+	}
+	if tree.LeafWidth() != 8 {
+		t.Fatalf("leaf width = %d: Add widened a tree that still had a blank leaf", tree.LeafWidth())
+	}
+	// and with no blank left, Add grows the tree.
+	if _, err := tree.AddLeaf(newLeaf.Clone()); err != nil {
+		t.Fatalf("AddLeaf into a full tree: %v", err)
+	}
+	if tree.LeafWidth() != 16 {
+		t.Fatalf("leaf width = %d, want 16", tree.LeafWidth())
+	}
+	assertStillATree(t, "after three adds", tree)
+}
+
+// TestAddLeafPicksTheLeftmostBlankOfEveryBlankSetATreeCanHold says "leftmost" over the whole
+// family of blank sets rather than over one arrangement.
+//
+// Which is the point: leftmost, rightmost, lowest-numbered-scanning-down and "the first one the
+// loop happens to see" all agree on a tree with one blank in it, and the family is what separates
+// them. The expected answer is derived from the pattern -- and the rightmost blank derived beside
+// it, with a count that refuses to let this sweep run without a case where the two differ.
+func TestAddLeafPicksTheLeftmostBlankOfEveryBlankSetATreeCanHold(t *testing.T) {
+	separating := 0
+	for _, width := range []uint32{2, 4, 8} {
+		for pattern := uint32(0); pattern < (uint32(1) << width); pattern += 1 {
+			isBlank := func(i LeafIndex) bool { return pattern&(uint32(1)<<uint32(i)) != 0 }
+			// no blank at all means the tree grows and the new leaf lands one past the last, which
+			// is what LeafIndex(width) says here.
+			leftmost, rightmost := LeafIndex(width), LeafIndex(width)
+			for i := uint32(0); i < width; i += 1 {
+				if !isBlank(LeafIndex(i)) {
+					continue
+				}
+				if leftmost == LeafIndex(width) {
+					leftmost = LeafIndex(i)
+				}
+				rightmost = LeafIndex(i)
+			}
+			if leftmost != rightmost {
+				separating += 1
+			}
+			tree := treeWithOccupiedLeaves(t, width, func(i LeafIndex) bool { return !isBlank(i) })
+			got, err := tree.AddLeaf(testTreeLeaf(0x20))
+			if err != nil {
+				t.Fatalf("width %d blanks %b: AddLeaf: %v", width, pattern, err)
+			}
+			if got != leftmost {
+				t.Fatalf("width %d blanks %b: AddLeaf = %d, want the leftmost blank %d (the rightmost blank is %d)",
+					width, pattern, got, leftmost, rightmost)
+			}
+			if tree.Leaf(got) == nil {
+				t.Fatalf("width %d blanks %b: AddLeaf answered %d and put no leaf there", width, pattern, got)
+			}
+		}
+	}
+	if separating == 0 {
+		t.Fatalf("no pattern in this sweep holds two blanks, so nothing here separates the leftmost blank from the rightmost")
+	}
+}
+
+// TestAddLeafKeepsUnmergedLeavesAscendingSoTheTreeStillEncodes is the clause an append gets wrong.
+//
+// Section 7.9.2 requires unmerged_leaves strictly ascending and this package's own encoder refuses
+// anything else, so the consequence of an append is not a cosmetic difference: it is a tree this
+// implementation cannot publish and, if it could, one whose parent hashes no peer reproduces. The
+// arrangement that produces it is Add's main line rather than a corner of it -- a blank leaf to
+// the LEFT of a leaf a node already lists is exactly what a Remove followed by an Add leaves.
+func TestAddLeafKeepsUnmergedLeavesAscendingSoTheTreeStillEncodes(t *testing.T) {
+	tree := treeWithOccupiedLeaves(t, 8, func(i LeafIndex) bool { return i != LeafIndex(2) })
+	path, err := directPathOf(LeafIndex(2).NodeIndex(), tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf: %v", err)
+	}
+	// one entry per path node, each naming an occupied leaf under that node that sits to the RIGHT
+	// of the blank, derived from the node's own subtree rather than picked off a drawing.
+	already := map[NodeIndex]LeafIndex{}
+	for _, x := range path {
+		_, last := SubtreeLeaves(x)
+		if last <= LeafIndex(2) {
+			t.Fatalf("node %d covers up to leaf %d, so nothing under it sits right of the blank", x, last)
+		}
+		already[x] = last
+		if err := tree.SetParent(x, &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(byte(0x30+x), 32)),
+			UnmergedLeaves: []LeafIndex{last},
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	got, err := tree.AddLeaf(testTreeLeaf(0x21))
+	if err != nil {
+		t.Fatalf("AddLeaf: %v", err)
+	}
+	if got != LeafIndex(2) {
+		t.Fatalf("AddLeaf = %d, want 2", got)
+	}
+	for _, x := range path {
+		unmerged := tree.UnmergedLeaves(x)
+		if err := checkUnmergedLeavesSorted(unmerged); err != nil {
+			t.Fatalf("node %d unmerged = %v after adding leaf %d beside %d: %v",
+				x, unmerged, got, already[x], err)
+		}
+		if !slices.Equal(unmerged, []LeafIndex{got, already[x]}) {
+			t.Fatalf("node %d unmerged = %v, want %v", x, unmerged, []LeafIndex{got, already[x]})
+		}
+	}
+	// the consequence, and the reason the ordering is not a matter of taste.
+	if _, err := marshalRatchetTree(tree); err != nil {
+		t.Fatalf("the tree AddLeaf produced no longer encodes: %v", err)
+	}
+	assertStillATree(t, "after an add to the left of an unmerged leaf", tree)
+	// and a leaf already listed is not listed twice.
+	if err := tree.RemoveLeaf(got); err != nil {
+		t.Fatalf("RemoveLeaf: %v", err)
+	}
+	surviving := path[len(path)-1]
+	if err := tree.SetParent(surviving, &ParentNode{
+		EncryptionKey:  HpkePublicKey(repeatByte(0x39, 32)),
+		UnmergedLeaves: []LeafIndex{LeafIndex(2), already[surviving]},
+	}); err != nil {
+		t.Fatalf("SetParent(%d): %v", surviving, err)
+	}
+	if _, err := tree.AddLeaf(testTreeLeaf(0x23)); err != nil {
+		t.Fatalf("AddLeaf: %v", err)
+	}
+	if unmerged := tree.UnmergedLeaves(surviving); !slices.Equal(unmerged, []LeafIndex{LeafIndex(2), already[surviving]}) {
+		t.Fatalf("node %d unmerged = %v after re-adding a leaf it already lists, want %v",
+			surviving, unmerged, []LeafIndex{LeafIndex(2), already[surviving]})
+	}
+}
+
+// TestAddLeafIntoACommittedTreeLeavesEveryParentHashValid is the strongest single statement
+// available about the marking loop, and it is not an assertion about unmerged_leaves at all.
+//
+// Section 7.9.1 hashes the ORIGINAL tree hash of the sibling subtree -- the tree hash taken with
+// the parent's unmerged leaves blanked out -- and section 7.9.2 condition 3 compares the
+// resolution of the other child against the same list. Between them, a parent that was not marked
+// is a parent that no descendant can claim. So this asks nothing about the list and everything
+// about the tree: a marking loop that skips the unmerged update, that runs only its first element,
+// only its last, or only its interior, each produces a tree VerifyParentHashes refuses -- at a
+// different node in each case, none of which is where the loop is.
+//
+// The shape is chosen so that every level is load bearing. Five members in an eight leaf tree
+// committed from leaf 4 gives a chain of [9, 11, 7], and the leftmost blank leaf is 5, whose
+// direct path is the same three nodes. Three levels is the shortest path with an interior.
+func TestAddLeafIntoACommittedTreeLeavesEveryParentHashValid(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _, chain := chainedTestTree(t, crypto, 5, LeafIndex(4))
+	if err := tree.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("the fixture does not verify before the add, so nothing below is about the add: %v", err)
+	}
+	if len(chain) != 3 {
+		t.Fatalf("the chain is %v, and a chain with no interior node observes no interior clause", chain)
+	}
+	joiner := tree.Leaf(LeafIndex(0)).Clone()
+	added, err := tree.AddLeaf(joiner)
+	if err != nil {
+		t.Fatalf("AddLeaf: %v", err)
+	}
+	if added != LeafIndex(5) {
+		t.Fatalf("AddLeaf = %d, want the leftmost blank leaf 5", added)
+	}
+	path, err := directPathOf(added.NodeIndex(), tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf: %v", err)
+	}
+	if !slices.Equal(path, chain) {
+		t.Fatalf("the new leaf's direct path is %v and the committed chain is %v; this fixture only says what it claims when they are the same nodes",
+			path, chain)
+	}
+	// the marking read straight off the tree first, so a failure below can be told from a failure
+	// in the parent hash machinery next door.
+	for _, x := range chain {
+		if !slices.Contains(tree.UnmergedLeaves(x), added) {
+			t.Fatalf("node %d of the chain %v does not list the new leaf %d unmerged", x, chain, added)
+		}
+	}
+	if err := tree.VerifyParentHashes(crypto); err != nil {
+		t.Fatalf("VerifyParentHashes after the add: %v", err)
+	}
+	assertStillATree(t, "after an add into a committed tree", tree)
+}
+
+// TestUpdateLeafBlanksTheDirectPath is the plan's test on a tree deep enough for its own claim:
+// a four leaf tree has a two node direct path, so "blanks the direct path" there is two
+// assertions about the two ends of a loop and says nothing about anything between them.
+func TestUpdateLeafBlanksTheDirectPath(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 8)
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if err := tree.SetParent(NodeIndex(x), &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(byte(0x60+x), 32)),
+			UnmergedLeaves: []LeafIndex{2},
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	replacement := tree.Leaf(LeafIndex(0)).Clone()
+	replacement.EncryptionKey = HpkePublicKey(repeatByte(0xAB, 32))
+	if err := tree.UpdateLeaf(LeafIndex(0), replacement); err != nil {
+		t.Fatalf("UpdateLeaf: %v", err)
+	}
+	if !bytes.Equal(tree.Leaf(LeafIndex(0)).EncryptionKey, replacement.EncryptionKey) {
+		t.Fatalf("UpdateLeaf did not install the replacement")
+	}
+	path, err := directPathOf(LeafIndex(0).NodeIndex(), tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf: %v", err)
+	}
+	if len(path) < 3 {
+		t.Fatalf("the direct path is %v and has no interior node", path)
+	}
+	onPath := map[NodeIndex]bool{}
+	for _, x := range path {
+		onPath[x] = true
+		if tree.ParentAt(x) != nil {
+			t.Fatalf("node %d of the direct path %v survived UpdateLeaf", x, path)
+		}
+	}
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if onPath[NodeIndex(x)] {
+			continue
+		}
+		if tree.ParentAt(NodeIndex(x)) == nil {
+			t.Fatalf("node %d is off leaf 0's direct path %v and must survive", x, path)
+		}
+	}
+	// the two refusals, which is what keeps Update from being a way to install a member.
+	if err := tree.UpdateLeaf(LeafIndex(tree.LeafWidth()), replacement); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("UpdateLeaf past the width err = %v, want ErrLeafIndexOutOfRange", err)
+	}
+	if err := tree.Blank(LeafIndex(1).NodeIndex()); err != nil {
+		t.Fatalf("Blank: %v", err)
+	}
+	if err := tree.UpdateLeaf(LeafIndex(1), replacement); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("UpdateLeaf at a blank leaf err = %v, want ErrLeafIndexOutOfRange", err)
+	}
+	if tree.Leaf(LeafIndex(1)) != nil {
+		t.Fatalf("UpdateLeaf reported a refusal and installed the member anyway")
+	}
+}
+
+// TestRemoveLeafBlanksAndTruncates keeps the plan's scenario and its numbers, with the clause the
+// plan's version could not see put in front of them.
+//
+// That version ran on a fixture whose parents are all blank, so "blanks the direct path" was
+// asserted by nothing: a Remove that touched only the leaf left the same tree. And it could not
+// simply be asserted afterwards either, because leaf 4's whole direct path is OUTSIDE the
+// truncated array, where IsBlank answers yes for an index that is merely absent. So the blanking
+// is observed first, on a removal that does not truncate.
+func TestRemoveLeafBlanksAndTruncates(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+
+	// the blanking, on leaf 3 of a five member tree: the rightmost member is still leaf 4, so the
+	// width does not move and every node of the path stays inside the array to be asked about.
+	observable := treeWithOccupiedLeaves(t, 8, func(i LeafIndex) bool { return i < LeafIndex(5) })
+	path, err := directPathOf(LeafIndex(3).NodeIndex(), observable.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf: %v", err)
+	}
+	if len(path) < 3 {
+		t.Fatalf("the direct path is %v and has no interior node", path)
+	}
+	if err := observable.RemoveLeaf(LeafIndex(3)); err != nil {
+		t.Fatalf("RemoveLeaf(3): %v", err)
+	}
+	if observable.LeafWidth() != 8 {
+		t.Fatalf("leaf width = %d after removing an interior leaf, want 8", observable.LeafWidth())
+	}
+	onPath := map[NodeIndex]bool{}
+	for _, x := range path {
+		onPath[x] = true
+		if !observable.IsBlank(x) {
+			t.Fatalf("RemoveLeaf left node %d of leaf 3's direct path %v standing", x, path)
+		}
+	}
+	for x := uint32(1); x < observable.NodeWidth(); x += 2 {
+		if onPath[NodeIndex(x)] {
+			continue
+		}
+		if observable.IsBlank(NodeIndex(x)) {
+			t.Fatalf("RemoveLeaf blanked node %d, which is not on leaf 3's direct path %v", x, path)
+		}
+	}
+
+	// the plan's scenario, unchanged.
+	tree, _ := newTestTree(t, crypto, 5)
+	if tree.LeafWidth() != 8 {
+		t.Fatalf("leaf width = %d, want 8", tree.LeafWidth())
+	}
+	if err := tree.RemoveLeaf(LeafIndex(4)); err != nil {
+		t.Fatalf("RemoveLeaf: %v", err)
+	}
+	if tree.Leaf(LeafIndex(4)) != nil {
+		t.Fatalf("leaf 4 is still present")
+	}
+	// the whole right half is blank now, so the tree halves.
+	if tree.LeafWidth() != 4 {
+		t.Fatalf("leaf width after remove = %d, want 4", tree.LeafWidth())
+	}
+	if tree.MemberCount() != 4 {
+		t.Fatalf("member count = %d, want 4", tree.MemberCount())
+	}
+	if err := tree.RemoveLeaf(LeafIndex(4)); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("removing past the width err = %v, want ErrLeafIndexOutOfRange", err)
+	}
+	// removing an interior leaf leaves the width alone.
+	if err := tree.RemoveLeaf(LeafIndex(1)); err != nil {
+		t.Fatalf("RemoveLeaf(1): %v", err)
+	}
+	if tree.LeafWidth() != 4 {
+		t.Fatalf("leaf width = %d, want 4 after an interior removal", tree.LeafWidth())
+	}
+	// and a leaf that is blank rather than absent is refused with the same sentinel.
+	if err := tree.RemoveLeaf(LeafIndex(1)); !errors.Is(err, ErrLeafIndexOutOfRange) {
+		t.Fatalf("removing a blank leaf err = %v, want ErrLeafIndexOutOfRange", err)
+	}
+	assertStillATree(t, "after two removals", tree)
+}
+
+// TestRemoveLeafDropsItFromUnmergedLeaves is the plan's test with the stale entries moved off the
+// first parent the sweep visits.
+//
+// The plan's version put its one stale entry at node 1, which is the FIRST odd index, so a sweep
+// that ran a single iteration and stopped passed it. The entries are spread over every off-path
+// parent here, including the last one the sweep reaches, and each node also carries an entry that
+// must SURVIVE -- otherwise "drops the removed leaf" and "clears the list" are the same test.
+func TestRemoveLeafDropsItFromUnmergedLeaves(t *testing.T) {
+	tree := treeWithOccupiedLeaves(t, 8, func(LeafIndex) bool { return true })
+	path, err := directPathOf(LeafIndex(7).NodeIndex(), tree.LeafWidth())
+	if err != nil {
+		t.Fatalf("directPathOf: %v", err)
+	}
+	onPath := map[NodeIndex]bool{}
+	for _, x := range path {
+		onPath[x] = true
+	}
+	// every parent that is NOT on leaf 7's direct path, derived from the path rather than listed:
+	// the nodes on it are blanked by the removal and so can say nothing about a sweep.
+	keep := map[NodeIndex]LeafIndex{}
+	off := []NodeIndex{}
+	for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+		if onPath[NodeIndex(x)] {
+			continue
+		}
+		first, _ := SubtreeLeaves(NodeIndex(x))
+		keep[NodeIndex(x)] = first
+		off = append(off, NodeIndex(x))
+		if err := tree.SetParent(NodeIndex(x), &ParentNode{
+			EncryptionKey:  HpkePublicKey(repeatByte(byte(0x90+x), 32)),
+			UnmergedLeaves: []LeafIndex{first, LeafIndex(7)},
+		}); err != nil {
+			t.Fatalf("SetParent(%d): %v", x, err)
+		}
+	}
+	if len(off) < 2 {
+		t.Fatalf("only %v are off the path, so nothing here separates a sweep from its first iteration", off)
+	}
+	if err := tree.RemoveLeaf(LeafIndex(7)); err != nil {
+		t.Fatalf("RemoveLeaf: %v", err)
+	}
+	if tree.LeafWidth() != 8 {
+		t.Fatalf("leaf width = %d: this fixture only says what it claims while every off-path parent is still in the array",
+			tree.LeafWidth())
+	}
+	for _, x := range off {
+		parent := tree.ParentAt(x)
+		if parent == nil {
+			t.Fatalf("node %d is off leaf 7's direct path %v and must survive", x, path)
+		}
+		if slices.Contains(parent.UnmergedLeaves, LeafIndex(7)) {
+			t.Fatalf("removed leaf 7 is still listed unmerged on node %d: %v", x, parent.UnmergedLeaves)
+		}
+		if !slices.Contains(parent.UnmergedLeaves, keep[x]) {
+			t.Fatalf("node %d lost leaf %d, which is still a member: %v", x, keep[x], parent.UnmergedLeaves)
+		}
+	}
+}
+
+// TestUpdateAndRemoveBlankEveryNodeOfTheDirectPathAndNothingElse is the property both operations
+// share, said over a derived family of shapes rather than over one tree.
+//
+// Every leaf of every width, both operations, the path read from the tree math and the nodes off
+// it read from the tree's own width. The counters at the end are what stop the sweep going quiet:
+// a family in which no path has an interior, or in which nothing off a path survives, would report
+// the same clean run a complete one does.
+func TestUpdateAndRemoveBlankEveryNodeOfTheDirectPathAndNothingElse(t *testing.T) {
+	operations := []struct {
+		name  string
+		apply func(t *testing.T, tree *RatchetTree, i LeafIndex)
+	}{
+		{"UpdateLeaf", func(t *testing.T, tree *RatchetTree, i LeafIndex) {
+			t.Helper()
+			if err := tree.UpdateLeaf(i, testTreeLeaf(uint32(i)+0x10)); err != nil {
+				t.Fatalf("UpdateLeaf(%d): %v", i, err)
+			}
+		}},
+		{"RemoveLeaf", func(t *testing.T, tree *RatchetTree, i LeafIndex) {
+			t.Helper()
+			if err := tree.RemoveLeaf(i); err != nil {
+				t.Fatalf("RemoveLeaf(%d): %v", i, err)
+			}
+		}},
+	}
+	blanked, survived, interior := 0, 0, 0
+	for _, width := range []uint32{2, 4, 8, 16} {
+		for i := uint32(0); i < width; i += 1 {
+			for _, operation := range operations {
+				tree := treeWithOccupiedLeaves(t, width, func(LeafIndex) bool { return true })
+				path, err := directPathOf(LeafIndex(i).NodeIndex(), tree.LeafWidth())
+				if err != nil {
+					t.Fatalf("width %d leaf %d: directPathOf: %v", width, i, err)
+				}
+				onPath := map[NodeIndex]bool{}
+				for _, x := range path {
+					onPath[x] = true
+				}
+				operation.apply(t, tree, LeafIndex(i))
+				for at, x := range path {
+					if !tree.IsBlank(x) {
+						t.Fatalf("width %d leaf %d: %s left node %d -- element %d of a %d element direct path %v -- standing",
+							width, i, operation.name, x, at, len(path), path)
+					}
+					blanked += 1
+					if at > 0 && at < len(path)-1 {
+						interior += 1
+					}
+				}
+				// asked over the width the tree has NOW, because a truncation is not "leaving a
+				// node alone" -- a node that went away with the right half was dropped.
+				for x := uint32(1); x < tree.NodeWidth(); x += 2 {
+					if onPath[NodeIndex(x)] {
+						continue
+					}
+					if tree.IsBlank(NodeIndex(x)) {
+						t.Fatalf("width %d leaf %d: %s blanked node %d, which is not on the direct path %v",
+							width, i, operation.name, x, path)
+					}
+					survived += 1
+				}
+				assertStillATree(t, fmt.Sprintf("width %d leaf %d after %s", width, i, operation.name), tree)
+			}
+		}
+	}
+	if blanked == 0 || survived == 0 || interior == 0 {
+		t.Fatalf("the sweep asserted %d blanked path nodes, %d surviving off-path nodes and %d interior path nodes, and a zero in any of the three is a sweep that observed nothing",
+			blanked, survived, interior)
+	}
+}
+
+// TestBlankingTheDirectPathReachesTheInteriorNodesNeitherEndOfALoopWouldTouch names the failure
+// this project has shipped three times -- a loop that runs its first element and stops -- and asks
+// about exactly the nodes such a loop, and its last-element-only twin, both miss.
+//
+// The interior is DERIVED from the path rather than written down, so the statement follows the
+// shape instead of a pair of indices somebody read off one drawing of one tree, and the sweep
+// refuses to run at a width whose paths have no interior at all.
+func TestBlankingTheDirectPathReachesTheInteriorNodesNeitherEndOfALoopWouldTouch(t *testing.T) {
+	const width = 16
+	operations := []struct {
+		name  string
+		apply func(*RatchetTree, LeafIndex) error
+	}{
+		{"UpdateLeaf", func(tree *RatchetTree, i LeafIndex) error { return tree.UpdateLeaf(i, testTreeLeaf(0x11)) }},
+		{"RemoveLeaf", func(tree *RatchetTree, i LeafIndex) error { return tree.RemoveLeaf(i) }},
+	}
+	asserted := 0
+	for i := uint32(0); i < width; i += 1 {
+		for _, operation := range operations {
+			tree := treeWithOccupiedLeaves(t, width, func(LeafIndex) bool { return true })
+			path, err := directPathOf(LeafIndex(i).NodeIndex(), tree.LeafWidth())
+			if err != nil {
+				t.Fatalf("directPathOf(%d): %v", i, err)
+			}
+			if len(path) < 4 {
+				t.Fatalf("leaf %d's direct path is %v; with fewer than two interior nodes this test is about one node and not about the interior",
+					i, path)
+			}
+			interior := path[1 : len(path)-1]
+			if err := operation.apply(tree, LeafIndex(i)); err != nil {
+				t.Fatalf("%s(%d): %v", operation.name, i, err)
+			}
+			for _, x := range interior {
+				if !tree.IsBlank(x) {
+					t.Fatalf("%s left interior node %d of leaf %d's direct path %v standing; a loop over path[0] alone and a loop over path[len-1] alone both leave exactly %v",
+						operation.name, x, i, path, interior)
+				}
+				asserted += 1
+			}
+		}
+	}
+	if asserted == 0 {
+		t.Fatalf("no interior node was asserted about")
+	}
+}
+
+// TestRemoveLeafTruncatesToTheRightmostMemberAndNotToTheMemberCount separates the two rules that
+// agree on every tree with no gaps in it.
+//
+// A truncation derived from the member COUNT is the natural wrong answer -- three members, so four
+// leaves -- and it does not report an error when it is wrong. It drops a member out of the group.
+func TestRemoveLeafTruncatesToTheRightmostMemberAndNotToTheMemberCount(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	tree, _ := newTestTree(t, crypto, 4)
+	for _, gone := range []LeafIndex{1, 2} {
+		if err := tree.RemoveLeaf(gone); err != nil {
+			t.Fatalf("RemoveLeaf(%d): %v", gone, err)
+		}
+	}
+	if tree.MemberCount() != 2 {
+		t.Fatalf("member count = %d, want 2", tree.MemberCount())
+	}
+	if got := FullLeafCount(LeafCount(tree.MemberCount())); got >= tree.LeafWidth() {
+		t.Fatalf("the members fit a width of %d, which is not narrower than the tree's %d, so this fixture separates nothing",
+			got, tree.LeafWidth())
+	}
+	if tree.LeafWidth() != 4 {
+		t.Fatalf("leaf width = %d, want 4: two members at leaves 0 and 3 do not fit in two leaves", tree.LeafWidth())
+	}
+	if tree.Leaf(LeafIndex(3)) == nil {
+		t.Fatalf("the truncation dropped leaf 3, which is a member")
+	}
+	assertStillATree(t, "after removing into a gapped membership", tree)
+}
+
+// TestRemoveLeafShrinksToExactlyWhatTheTreeMathSays sweeps every occupancy an eight leaf tree can
+// have and holds the width after a removal against TruncatedLeafCount.
+//
+// Against the tree math and not against a halving written out here: a halving loop in the test
+// would only say that the test and the code halve the same way, and the property is that the
+// container and the arithmetic every tree hash is computed against give one answer. The two
+// counters refuse a sweep in which nothing shrinks, or in which nothing holds its width.
+func TestRemoveLeafShrinksToExactlyWhatTheTreeMathSays(t *testing.T) {
+	const width = 8
+	shrank, held := 0, 0
+	for pattern := uint32(1); pattern < (uint32(1) << width); pattern += 1 {
+		for removed := uint32(0); removed < width; removed += 1 {
+			if pattern&(uint32(1)<<removed) == 0 {
+				continue
+			}
+			tree := treeWithOccupiedLeaves(t, width, func(i LeafIndex) bool {
+				return pattern&(uint32(1)<<uint32(i)) != 0
+			})
+			if err := tree.RemoveLeaf(LeafIndex(removed)); err != nil {
+				t.Fatalf("occupancy %b: RemoveLeaf(%d): %v", pattern, removed, err)
+			}
+			left := pattern &^ (uint32(1) << removed)
+			// the one leaf tree is the floor, and it is what an empty membership shrinks to.
+			want := LeafCount(1)
+			if left != 0 {
+				rightmost := LeafIndex(0)
+				for i := uint32(0); i < width; i += 1 {
+					if left&(uint32(1)<<i) != 0 {
+						rightmost = LeafIndex(i)
+					}
+				}
+				truncated, err := TruncatedLeafCount(rightmost)
+				if err != nil {
+					t.Fatalf("TruncatedLeafCount(%d): %v", rightmost, err)
+				}
+				want = truncated
+			}
+			if tree.LeafWidth() != want {
+				t.Fatalf("occupancy %b minus leaf %d: leaf width = %d, want %d",
+					pattern, removed, tree.LeafWidth(), want)
+			}
+			if want < LeafCount(width) {
+				shrank += 1
+			} else {
+				held += 1
+			}
+			// and nothing that was a member left with the right half.
+			for i := uint32(0); i < width; i += 1 {
+				if left&(uint32(1)<<i) == 0 {
+					continue
+				}
+				if tree.Leaf(LeafIndex(i)) == nil {
+					t.Fatalf("occupancy %b minus leaf %d: leaf %d was a member and is gone", pattern, removed, i)
+				}
+			}
+		}
+	}
+	if shrank == 0 || held == 0 {
+		t.Fatalf("the sweep saw %d removals that shrank the tree and %d that did not, and a zero in either is a sweep that cannot tell a truncation from its absence",
+			shrank, held)
+	}
+}
+
+// TestEveryTreeOperationLeavesATreeThisPackageStillAgreesWith runs all three operations over every
+// occupancy of every small width and asks, after each one, whether what is left is still a tree.
+//
+// An operation that leaves a malformed tree does not fail at the operation. It fails at a tree
+// hash, a resolution or a join in a later task, against code that has nothing to do with it -- so
+// the invariants are asserted where the damage is done rather than where it surfaces. The refusals
+// are swept alongside the successes because a refusal is a claim too: a tree the operation
+// declined to change must be exactly the tree it was handed.
+func TestEveryTreeOperationLeavesATreeThisPackageStillAgreesWith(t *testing.T) {
+	operations := []struct {
+		name  string
+		apply func(*RatchetTree, LeafIndex) error
+	}{
+		{"AddLeaf", func(tree *RatchetTree, i LeafIndex) error {
+			_, err := tree.AddLeaf(testTreeLeaf(uint32(i) + 0x30))
+			return err
+		}},
+		{"UpdateLeaf", func(tree *RatchetTree, i LeafIndex) error {
+			return tree.UpdateLeaf(i, testTreeLeaf(uint32(i)+0x30))
+		}},
+		{"RemoveLeaf", func(tree *RatchetTree, i LeafIndex) error { return tree.RemoveLeaf(i) }},
+	}
+	accepted, refused := 0, 0
+	for _, width := range []uint32{1, 2, 4, 8} {
+		for pattern := uint32(0); pattern < (uint32(1) << width); pattern += 1 {
+			for i := uint32(0); i < width; i += 1 {
+				for _, operation := range operations {
+					tree := treeWithOccupiedLeaves(t, width, func(j LeafIndex) bool {
+						return pattern&(uint32(1)<<uint32(j)) != 0
+					})
+					where := fmt.Sprintf("width %d occupancy %b leaf %d after %s", width, pattern, i, operation.name)
+					// the bytes before, so a refusal can be held to changing nothing without a
+					// deep equality over structures a Clone is entitled to normalise.
+					beforeBytes, beforeErr := marshalRatchetTree(tree)
+					err := operation.apply(tree, LeafIndex(i))
+					switch {
+					case err == nil:
+						accepted += 1
+					case errors.Is(err, ErrLeafIndexOutOfRange):
+						refused += 1
+						afterBytes, afterErr := marshalRatchetTree(tree)
+						if (beforeErr == nil) != (afterErr == nil) {
+							t.Fatalf("%s: the operation reported a refusal and left a tree that encodes differently", where)
+						}
+						if beforeErr == nil && !bytes.Equal(beforeBytes, afterBytes) {
+							t.Fatalf("%s: the operation reported a refusal and changed the tree anyway", where)
+						}
+					default:
+						t.Fatalf("%s: %v", where, err)
+					}
+					assertStillATree(t, where, tree)
+				}
+			}
+		}
+	}
+	if accepted == 0 || refused == 0 {
+		t.Fatalf("the sweep saw %d operations accepted and %d refused, and a zero in either is a sweep that only exercised one branch",
+			accepted, refused)
+	}
+}

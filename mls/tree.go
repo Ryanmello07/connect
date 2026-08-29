@@ -1058,3 +1058,237 @@ func ParseRatchetTreeFrom(ext Extension) (*RatchetTree, error) {
 	}
 	return UnmarshalRatchetTree(ext.ExtensionData)
 }
+
+// ---- RFC 9420 section 7.7, the three membership changes a commit applies to the tree.
+//
+// Add, Update and Remove are the only operations that change WHO is in the tree, and section
+// 12.3 applies them in the order GroupContextExtensions, Update, Remove, Add. That order belongs
+// to the caller, but it is why Add's rule below is written against the tree as it stands AFTER
+// the removes: the leftmost blank leaf Add fills may be one a Remove in the same commit made.
+//
+// What separates the three is what happens to the DIRECT PATH, and that difference is TreeKEM's
+// forward secrecy story rather than bookkeeping:
+//
+//   - Update and Remove replace or destroy the key at a leaf, so every node above that leaf is
+//     holding a key its old occupant could derive. Those nodes are blanked.
+//   - Add introduces a member who has never held any of them, so those nodes STAY: the existing
+//     members keep their path secrets and the group does not re-key on every join. The price is
+//     that the new member cannot yet decrypt to them, and unmerged_leaves is how the tree records
+//     the debt -- section 4.2 puts every unmerged leaf of a node into that node's resolution, so
+//     the next sender seals to the new leaf separately until a commit through the node merges it.
+//
+// So Add NEVER blanks. An implementation that blanked the new leaf's direct path would be secure,
+// would be interoperable with nobody, and would be indistinguishable from this one by every test
+// that does not compute a parent hash.
+
+// AddLeaf places a new member at the leftmost blank leaf, growing the tree when there is none,
+// and records the new leaf as unmerged on every non-blank node above it. It answers the leaf the
+// member was placed at.
+//
+// LEFTMOST and not "the next index past the last member", because the two differ exactly when
+// somebody has been removed: section 7.7 refills the gaps a Remove left before it widens the
+// tree, and a version that appended instead would grow without bound over a group that churns
+// while never exceeding its size. The scan reads the node array rather than a remembered free
+// list, for the reason this container has no free list at all -- a second answer to "which leaves
+// are occupied" is a second thing that can disagree with the leaves.
+//
+// The unmerged marking is a LOOP over the whole path and each of its clauses earns its place. It
+// skips blank nodes, because a blank node publishes no key and so owes no debt. It marks every
+// LEVEL and not just the first, because section 7.9.2 condition 3 reads the resolution of one
+// child of each parent against that parent's unmerged list, so a level that was missed leaves
+// that parent with a resolution the tree cannot explain -- which surfaces as a parent hash
+// failure at the next join and not as anything an assertion about the level that WAS marked can
+// see. And it keeps the vector strictly ascending, which is the one clause an append is not.
+func (self *RatchetTree) AddLeaf(leaf *LeafNode) (LeafIndex, error) {
+	// one past the last leaf is the answer when nothing is blank, and SetLeaf is what turns that
+	// into a doubling: the container already knows how to grow and already knows the bound, so
+	// neither is re-derived here.
+	target := LeafIndex(self.LeafWidth())
+	for i := uint32(0); i < uint32(self.LeafWidth()); i += 1 {
+		if self.Leaf(LeafIndex(i)) == nil {
+			target = LeafIndex(i)
+			break
+		}
+	}
+	if err := self.SetLeaf(target, leaf); err != nil {
+		return 0, err
+	}
+	// the width is re-read AFTER the install, because a full tree has just doubled and the new
+	// leaf's direct path runs to the NEW root.
+	path, err := directPathOf(target.NodeIndex(), self.LeafWidth())
+	if err != nil {
+		return 0, err
+	}
+	for _, x := range path {
+		parent := self.ParentAt(x)
+		if parent == nil {
+			continue
+		}
+		parent.UnmergedLeaves = insertUnmergedLeaf(parent.UnmergedLeaves, target)
+	}
+	return target, nil
+}
+
+// insertUnmergedLeaf puts one leaf into an unmerged_leaves vector and keeps the vector strictly
+// ascending.
+//
+// An append is what the operation reads like, and it is not enough. Section 7.9.2 requires the
+// vector ascending, this package's own encoder refuses anything else, and the requirement is not
+// cosmetic: the vector is hashed into the parent hash, so two orderings of one set are two parent
+// hashes over one tree. The arrangement that makes an append wrong -- a blank leaf sitting to the
+// LEFT of a leaf already listed -- is the arrangement Add looks for first, so it is not a corner
+// case of this operation but its main line.
+//
+// A leaf already listed is left alone rather than listed twice, because condition 3 matches the
+// list against a resolution and a leaf appears in a resolution once.
+//
+// The result is a fresh slice rather than an insert through the backing array, for the reason
+// RatchetTree.UnmergedLeaves gives at the other door: this list is a tree's own storage, and a
+// caller that read it through ParentAt is holding the same array.
+func insertUnmergedLeaf(leaves []LeafIndex, leaf LeafIndex) []LeafIndex {
+	at := 0
+	for at < len(leaves) && leaves[at] < leaf {
+		at += 1
+	}
+	if at < len(leaves) && leaves[at] == leaf {
+		return leaves
+	}
+	out := make([]LeafIndex, 0, len(leaves)+1)
+	out = append(out, leaves[:at]...)
+	out = append(out, leaf)
+	out = append(out, leaves[at:]...)
+	return out
+}
+
+// UpdateLeaf replaces the member at i and blanks the whole path from that leaf to the root.
+//
+// The blanking is the point, and not the replacement. Every node above the leaf carries a key the
+// OLD leaf's owner could derive, so leaving any one of them standing lets a member who has just
+// updated away keep reading the group -- which is the whole of what an Update proposal is for. It
+// is a loop over every level for that reason: the topmost node is as reachable from a stale path
+// secret as the bottom one.
+//
+// A BLANK leaf is refused rather than filled in, because installing a member where there is no
+// member is Add's job and Add is the operation that leaves the path alone.
+func (self *RatchetTree) UpdateLeaf(i LeafIndex, leaf *LeafNode) error {
+	// two clauses where one would do -- Leaf answers nil past the width as readily as at a blank
+	// -- because the width clause is what the sentinel is named after, and a reader should not
+	// have to derive it from an accessor's nil.
+	if LeafCount(i) >= self.LeafWidth() || self.Leaf(i) == nil {
+		return ErrLeafIndexOutOfRange
+	}
+	if err := self.SetLeaf(i, leaf); err != nil {
+		return err
+	}
+	return self.BlankDirectPath(i)
+}
+
+// RemoveLeaf blanks the departing member's leaf and the whole path above it, then shrinks the
+// tree if the members that are left fit in a narrower one.
+//
+// Three clauses, each with its own failure mode. The path blanking is Update's, for Update's
+// reason, and it carries a second job that section 12.4.3.2 never has to state: every node whose
+// unmerged_leaves could name the departing leaf is by definition ABOVE that leaf, so blanking the
+// path is also what takes the departing member out of every unmerged list a well formed tree has.
+// The truncation is section 12.1.3, and a tree that never truncates is still CORRECT -- every
+// hash, path and resolution over it agrees with itself -- while growing without bound over a
+// group that churns. The sweep at the end is what keeps this container's own invariant true
+// across the shrink.
+func (self *RatchetTree) RemoveLeaf(i LeafIndex) error {
+	if LeafCount(i) >= self.LeafWidth() || self.Leaf(i) == nil {
+		return ErrLeafIndexOutOfRange
+	}
+	if err := self.BlankDirectPath(i); err != nil {
+		return err
+	}
+	if err := self.Blank(i.NodeIndex()); err != nil {
+		return err
+	}
+	if err := self.truncate(); err != nil {
+		return err
+	}
+	self.dropUnmergedLeavesNamingABlankLeaf()
+	return nil
+}
+
+// truncate shrinks the tree to the narrowest complete width that still holds every member.
+//
+// TruncatedLeafCount is that computation, and this does NOT re-derive it by halving. A halving
+// loop here and the tree math next door would be two answers to one question; the tree hash
+// agrees with exactly one of them, and the disagreement stays invisible until the first group
+// that churns down across a power of two.
+func (self *RatchetTree) truncate() error {
+	leaves := self.NonBlankLeaves()
+	if len(leaves) == 0 {
+		// the one leaf tree, which is NewRatchetTree's floor and the narrowest shape the
+		// arithmetic in tree_math.go will speak about at all. There is no empty tree.
+		self.nodes = make([]*Node, 1)
+		return nil
+	}
+	// the RIGHTMOST member and not the member COUNT. The two agree on every tree with no gaps in
+	// it and part company on the first tree with one: three members at leaves 0, 1 and 5 fit a
+	// count of four and need a width of eight, and a truncation to four does not report an error,
+	// it drops leaf 5 out of the group.
+	target, err := TruncatedLeafCount(leaves[len(leaves)-1])
+	if err != nil {
+		return err
+	}
+	if target >= self.LeafWidth() {
+		return nil
+	}
+	// a fresh array rather than a reslice. self.nodes[:w] keeps the whole old backing array alive
+	// behind a shorter length, so the departing member's LeafNode -- their credential and their
+	// public keys -- stays reachable from this tree for as long as it lives, and a later append
+	// through that slice hands it back.
+	shrunk := make([]*Node, NodeWidth(target))
+	copy(shrunk, self.nodes)
+	self.nodes = shrunk
+	return nil
+}
+
+// dropUnmergedLeavesNamingABlankLeaf takes every unmerged entry that names a leaf which is not
+// there out of every surviving parent.
+//
+// The predicate is DERIVED from the tree -- "the leaf this entry names is blank" -- rather than
+// written as "the leaf that was just removed", and the difference is a second condition wide. The
+// removed leaf is one way an entry comes to name a blank, and on a well formed tree it is the
+// only one, because every node that could list it sits on its direct path and has just been
+// blanked. The other way is the SHRINK. SetParent refuses an unmerged leaf outside the tree, and
+// that refusal is the whole of what makes RatchetTree.Resolution's dropped error sound, but it is
+// made against the width at INSTALL time; a truncation moves the width underneath entries already
+// stored, so a shrink that left them standing would leave this container holding a tree it would
+// itself have refused.
+//
+// It repairs nothing an interoperable peer computes differently. On any tree whose every unmerged
+// entry names an occupied leaf inside its own node's subtree -- which is every tree section 7.9.2
+// accepts -- the predicate is false at every entry and this changes nothing at all.
+func (self *RatchetTree) dropUnmergedLeavesNamingABlankLeaf() {
+	// every odd index, which is exactly the parent positions (appendix C), so the sweep is
+	// derived from the tree's own width rather than from the path anybody expected to matter.
+	for x := uint32(1); x < self.NodeWidth(); x += 2 {
+		parent := self.ParentAt(NodeIndex(x))
+		if parent == nil {
+			continue
+		}
+		drop := false
+		for _, leaf := range parent.UnmergedLeaves {
+			if self.Leaf(leaf) == nil {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			// the stored slice is left exactly as it is rather than swapped for an equal copy,
+			// because a reallocation here moves storage a caller that read this node through
+			// ParentAt is holding.
+			continue
+		}
+		kept := make([]LeafIndex, 0, len(parent.UnmergedLeaves))
+		for _, leaf := range parent.UnmergedLeaves {
+			if self.Leaf(leaf) != nil {
+				kept = append(kept, leaf)
+			}
+		}
+		parent.UnmergedLeaves = kept
+	}
+}
