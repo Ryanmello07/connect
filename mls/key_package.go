@@ -17,8 +17,12 @@
 // and not the other is a joiner nobody can add. The disagreement is invisible while the two
 // happen to write the same fields in the same order, so nothing behavioural can see it -- what
 // sees it is TestTheKeyPackageSignaturePreimageIsAssembledExactlyOnce, which derives the set of
-// declarations in this file that emit any part of the encoding and requires it to be
-// marshalCore and MarshalMLS and nothing else.
+// declarations of this PACKAGE that emit any part of an encoding and whose subject is the key
+// package, and requires it to be marshalCore and MarshalMLS and nothing else. The package and
+// not this file: package mls is one package, a second assembly declared one file over is the
+// same second opinion, and a scan told which file to read goes on reporting a clean bill while
+// the thing it guards is written next door. That was measured as well -- the file scoped version
+// of this gate passed a whole green suite with a byte identical second assembly one file over.
 //
 // Validate reads the clock it is HANDED. A validity check that never touches its now argument
 // passes every test that does not vary it, and this project has shipped that shape at another
@@ -78,6 +82,28 @@ const keyPackageSignatureLabel = "KeyPackageTBS"
 // TestNoValidationOwnedNameHasLandedBesideItsStandIn fails on the commit that lands the
 // exported twin beside it.
 var errProfileCiphersuite = errors.New("mls: ciphersuite is outside the v1 profile")
+
+// errKeyPackageProviderSuite refuses a provider that does not run the suite the caller named.
+//
+// The two arguments are ONE decision written twice. Every key in the answer and the signature
+// over the whole of it come from the PROVIDER's primitives, and suite is what the structure
+// ADVERTISES those primitives to be, so a mismatch mints a key package whose signature was made
+// under a scheme it does not name. Nothing in this tree can see that today: the two registered
+// suites share X25519, SHA-256 and Ed25519 and differ only in their AEAD, so a key package
+// minted over an 0x0001 provider and advertising 0x0003 verifies, validates, round trips and is
+// accepted by this file's own Validate -- measured on the committed tree rather than supposed.
+// It stops being invisible at the first registered suite that moves one of those primitives,
+// which p8 lands, and by then the key packages have been published.
+//
+// It is refused HERE, at the one call where both values are the same caller's in the same
+// statement, rather than at the peer that cannot verify. Validate is deliberately NOT given the
+// same rule, and the difference is a decision rather than an oversight: its suite argument is
+// the GROUP's, RFC 9420 section 10.1's comparison is the key package against the group, and a
+// third opinion taken off the validator's own provider would change the identity of a refusal a
+// caller already branches on. What closes that side is this one -- with the pairing enforced
+// where a key package is minted, a structure naming a suite its keys were not made under has to
+// have come from outside this package.
+var errKeyPackageProviderSuite = errors.New("mls: the provider does not run the ciphersuite this key package would name")
 
 // errKeyPackageBadSignature is ValSem010 for a key package, and it WRAPS leaf_node.go's
 // errBadSignature rather than being a second value for one condition, which is exactly what
@@ -209,6 +235,11 @@ func (self *KeyPackage) signedPreimage() ([]byte, error) {
 // it is the same key the leaf named as its signature_key and the group lifecycle plan reads it
 // off the value when it assembles JoinKeyMaterial.
 //
+// The provider and the suite are compared before anything is drawn, and
+// errKeyPackageProviderSuite carries the argument: they are one decision written twice, and a
+// key package advertising a suite its keys were not made under is invisible to every behavioural
+// test in this tree for as long as the registered suites share their primitives.
+//
 // The extensions are the LEAF's, not the key package's. RFC 9420 has both, and this profile
 // puts urmessage_leaf_keys (0xF002) on the leaf because it is a property of the device rather
 // than of the advertisement: it has to survive into the ratchet tree, and only the leaf does.
@@ -221,6 +252,14 @@ func NewKeyPackage(crypto CryptoProvider, suite CipherSuite, cred Credential,
 	if crypto == nil {
 		return nil, nil, nil, fmt.Errorf("%w: every key here is drawn and the key package is signed through it",
 			ErrNilCryptoProvider)
+	}
+	// before anything is drawn, so a caller's mistake costs no entropy and no key pair. The
+	// suite named and the suite run are one decision written twice, and
+	// errKeyPackageProviderSuite is where the reason a disagreement cannot be answered here is
+	// written down.
+	if crypto.Suite() != suite {
+		return nil, nil, nil, fmt.Errorf("%w: the provider runs %#04x and this key package would name %#04x",
+			errKeyPackageProviderSuite, uint16(crypto.Suite()), uint16(suite))
 	}
 	signPriv, _, err := crypto.SignatureKeyPair()
 	if err != nil {

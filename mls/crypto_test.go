@@ -5213,7 +5213,7 @@ var providerConstructionsAnsweringOffTheWallClock = map[string]string{
 	// NewLeafNode, so the Lifetime stamped there is inside the KeyPackageTBS this signs, and
 	// two calls a second apart answer different signatures for a reason that is not the
 	// arguments. Everything above the comparisons still runs for it.
-	"NewKeyPackage": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy holds it to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
+	"NewKeyPackage": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out and the parameter list derived off its own declaration, TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
 	"NewLeafNode": "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
 }
 

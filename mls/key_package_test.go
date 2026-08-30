@@ -17,8 +17,11 @@ package mls
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"go/ast"
+	"go/token"
 	"reflect"
 	"slices"
 	"strings"
@@ -557,10 +560,22 @@ func mlsEncodingEmitters(t *testing.T) map[string]bool {
 // marshalBytes as a VALUE, which is the whole point of it -- one assembly, reached rather than
 // repeated -- and a scan over mentions would read that as a second writer.
 func declarationsEmittingIn(parsed parsedSource, emitters map[string]bool) []string {
+	return declarationsEmittingWhere(parsed, emitters, func(parsedSource, *ast.FuncDecl) bool { return true })
+}
+
+// declarationsEmittingWhere is the same walk narrowed to the declarations a caller's filter
+// keeps, which is what lets one scan ask about one structure's codec across a whole package.
+//
+// The split exists because "every declaration that emits" is the right class for one file and
+// far too wide for a package: mls declares dozens of codecs and all of them emit. The narrowing
+// has to happen inside this walk rather than in a second one, or the widened gate below would be
+// a re-implementation with its own bugs, which is how a gate ends up agreeing with itself.
+func declarationsEmittingWhere(parsed parsedSource, emitters map[string]bool,
+	keep func(parsedSource, *ast.FuncDecl) bool) []string {
 	emitting := []string{}
 	for _, declaration := range parsed.file.Decls {
 		function, isFunction := declaration.(*ast.FuncDecl)
-		if !isFunction || function.Body == nil {
+		if !isFunction || function.Body == nil || !keep(parsed, function) {
 			continue
 		}
 		emits := false
@@ -585,45 +600,132 @@ func declarationsEmittingIn(parsed parsedSource, emitters map[string]bool) []str
 	return emitting
 }
 
-// The control: key_package.go with the mutation this gate exists for, written so that the two
-// assemblies agree byte for byte.
+// keyPackageOwnFieldNames is every field name the KeyPackage declares and no other structure of
+// this package's non test source does.
 //
-// signedPreimage here writes the same fields in the same order as marshalCore, so every
-// signature it produces verifies, every key package validates, every round trip round trips
-// and the whole of mls and message stays green. There is no behaviour to observe; what there
-// is, is a second declaration that emits, and that is what the scan reads.
+// It is the arm of the subject filter that a free function cannot get around by taking the
+// structure apart. A second assembly written as a package level helper over a KeyPackage names
+// the type in its signature and is caught by the first arm; one written over the fields does
+// not, but it still has to write the init key, and InitKey is a name only this structure
+// declares.
+//
+// DERIVED by walking every struct declaration of the package rather than typed out, because
+// which of this structure's names are its own changes as its neighbours grow fields: Version and
+// CipherSuite are GroupContext's too, Extensions and Signature belong to half the package, and a
+// list written today is a list of the wrong names a plan from now.
+func keyPackageOwnFieldNames(t *testing.T, sources []parsedSource) []string {
+	t.Helper()
+	subject := reflect.TypeOf(KeyPackage{}).Name()
+	mine := []string{}
+	elsewhere := map[string]bool{}
+	for _, parsed := range sources {
+		for _, declaration := range parsed.file.Decls {
+			types, isTypeDeclaration := declaration.(*ast.GenDecl)
+			if !isTypeDeclaration || types.Tok != token.TYPE {
+				continue
+			}
+			for _, specification := range types.Specs {
+				named, isNamed := specification.(*ast.TypeSpec)
+				if !isNamed {
+					continue
+				}
+				structure, isStruct := named.Type.(*ast.StructType)
+				if !isStruct {
+					continue
+				}
+				for _, field := range structure.Fields.List {
+					for _, fieldName := range field.Names {
+						if named.Name.Name == subject {
+							mine = append(mine, fieldName.Name)
+							continue
+						}
+						elsewhere[fieldName.Name] = true
+					}
+				}
+			}
+		}
+	}
+	own := []string{}
+	for _, name := range mine {
+		if !elsewhere[name] {
+			own = append(own, name)
+		}
+	}
+	slices.Sort(own)
+	if len(own) == 0 {
+		t.Fatalf("no field name is the %s's alone among this package's structures, so the subject filter below is one arm short and states less than it reads",
+			subject)
+	}
+	return own
+}
+
+// keyPackageIsTheSubjectOf answers whether one declaration's subject is the key package.
+//
+// Two arms and both derived. The first is the structure itself: a method on it, or a parameter
+// or result that names it. Rendered as TYPES and never as the text of the whole signature,
+// because crypto_labels.go's MakeKeyPackageRef takes a parameter NAMED keyPackage carrying
+// []byte, and a match on the spelling would pull the reference hash into a gate about the
+// preimage. The second is keyPackageOwnFieldNames, which is what a helper written over the
+// fields rather than over the value still has to name.
+//
+// The honest limit, stated rather than left for a reader to find. A helper declared in another
+// file that took the five fields as its own parameters, under its own spellings, and was called
+// from signedPreimage escapes both arms: it names no KeyPackage and mentions no field of one.
+// What this gate is for is the second assembly somebody writes because they did not know the
+// first existed, and that one is written over the structure. A deliberate one is not in reach of
+// a source scan at all, and the behavioural half -- that the bytes signed are the bytes
+// marshalled -- is what TestKeyPackageRefCoversTheSignatureAndNotOnlyTheSignedPrefix and the
+// tampering rows of TestKeyPackageValidateRejects hold.
+func keyPackageIsTheSubjectOf(parsed parsedSource, function *ast.FuncDecl, own []string) bool {
+	subject := reflect.TypeOf(KeyPackage{}).Name()
+	declared := []string{parsed.receiverOf(function)}
+	for _, field := range function.Type.Params.List {
+		declared = append(declared, parsed.render(field.Type))
+	}
+	if function.Type.Results != nil {
+		for _, field := range function.Type.Results.List {
+			declared = append(declared, parsed.render(field.Type))
+		}
+	}
+	for _, text := range declared {
+		if strings.Contains(text, subject) {
+			return true
+		}
+	}
+	names := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		identifier, isIdentifier := node.(*ast.Ident)
+		if isIdentifier && slices.Contains(own, identifier.Name) {
+			names = true
+		}
+		return true
+	})
+	return names
+}
+
+// The control: the mutation this gate exists for, landed as a file of its own.
+//
+// A byte identical second assembly. It writes the same fields in the same order as marshalCore,
+// so every signature it produces verifies, every key package validates, every round trip round
+// trips and the whole of mls and message stays green. There is no behaviour to observe; what
+// there is, is a second declaration that emits.
+//
+// It is a SEPARATE FILE and that is the whole point of this control. The version of this gate it
+// replaces read key_package.go by name, and a reviewer landed exactly this text in
+// mls/key_package_tbs.go, pointed signedPreimage at it, and watched 6604 tests pass. The in-file
+// form of the same mutation was caught; only the file boundary saved it. The control's file name
+// is deliberately unrelated to key_package so that a scan narrowed by a name pattern rather than
+// by a file list fails here too.
 const keyPackageSecondAssemblyControl = `package control
 
-func (self *KeyPackage) marshalCore(w *syntax.Writer) error {
+func (self *KeyPackage) keyPackageTbs(w *syntax.Writer) error {
 	w.WriteUint16(uint16(self.Version))
+	w.WriteUint16(uint16(self.CipherSuite))
 	w.WriteOpaque(self.InitKey)
-	return WriteExtensions(w, self.Extensions)
-}
-
-func (self *KeyPackage) MarshalMLS(w *syntax.Writer) error {
-	if err := self.marshalCore(w); err != nil {
+	if err := self.LeafNode.MarshalMLS(w); err != nil {
 		return err
 	}
-	w.WriteOpaque(self.Signature)
-	return nil
-}
-
-func (self *KeyPackage) signedPreimage() ([]byte, error) {
-	w := syntax.NewWriter()
-	w.WriteUint16(uint16(self.Version))
-	w.WriteOpaque(self.InitKey)
-	if err := WriteExtensions(w, self.Extensions); err != nil {
-		return nil, err
-	}
-	return w.Bytes()
-}
-
-func (self *KeyPackage) Ref(crypto CryptoProvider) ([]byte, error) {
-	encoded, err := syntax.Marshal(self)
-	if err != nil {
-		return nil, err
-	}
-	return MakeKeyPackageRef(crypto, encoded), nil
+	return WriteExtensions(w, self.Extensions)
 }
 `
 
@@ -636,23 +738,449 @@ func (self *KeyPackage) Ref(crypto CryptoProvider) ([]byte, error) {
 // at somebody else's Welcome, not here. While they agree, they agree PERFECTLY: identical
 // bytes, identical signatures, identical refs, no round trip and no verification anywhere in
 // this package or in message able to tell them apart. That is why this gate is over the source
-// and why it is derived: what it asserts is that exactly two declarations of key_package.go
-// emit any part of the encoding, and that they are the codec's own two.
+// and why it is derived.
 //
-// The control is the mutation itself, run through the same derivation, and it must be reported.
+// The subject is a PACKAGE and not a file, which is the correction this version carries. What
+// the name claims is that the preimage is assembled exactly once; what the previous version
+// checked is that key_package.go assembles it exactly once, and package mls is one package, so
+// any later task can reach signedPreimage's job from any file without knowing this gate exists.
+// A gate that derives one axis and enumerates another is not a derived gate: this one derived
+// its emitter class off *syntax.Writer's method set, with four anchors guarding the scan, and
+// then handed it one file name.
+//
+// So the scope is every non test file of the package, and the narrowing that makes that a
+// useful question is derived too -- keyPackageIsTheSubjectOf, off the type and off the field
+// names only this structure declares. Three controls, because a scan and a filter can each fail
+// silently: the mutation must be READ when it is landed one file over, the subject filter must
+// keep less than the package emits, and the anchor on the own-field derivation must hold.
 func TestTheKeyPackageSignaturePreimageIsAssembledExactlyOnce(t *testing.T) {
 	emitters := mlsEncodingEmitters(t)
+	sources := packageSources(t)
+	own := keyPackageOwnFieldNames(t, sources)
+	// the anchor on the second arm: this structure certainly declares an init key, and a
+	// derivation that read something other than this package would answer without it
+	if !slices.Contains(own, "InitKey") {
+		t.Fatalf("the struct walk read %v as the field names the key package alone declares, and it certainly declares InitKey, so it read something other than this package",
+			own)
+	}
+	scan := func(over []parsedSource) []string {
+		found := []string{}
+		for _, parsed := range over {
+			found = append(found, declarationsEmittingWhere(parsed, emitters,
+				func(in parsedSource, function *ast.FuncDecl) bool {
+					return keyPackageIsTheSubjectOf(in, function, own)
+				})...)
+		}
+		slices.Sort(found)
+		return found
+	}
 
-	control := declarationsEmittingIn(
-		mustParseText(t, "key_package_second_assembly_control.go", keyPackageSecondAssemblyControl), emitters)
-	if want := []string{"MarshalMLS", "marshalCore", "signedPreimage"}; !slices.Equal(control, want) {
-		t.Fatalf("over a control that assembles the preimage twice the scan read %v, want %v; whatever it reports about the real file, it is not reading a second assembly",
+	// the control, landed one file over rather than inside key_package.go
+	control := scan(append(slices.Clone(sources),
+		mustParseText(t, "second_assembly_control.go", keyPackageSecondAssemblyControl)))
+	if want := []string{"MarshalMLS", "keyPackageTbs", "marshalCore"}; !slices.Equal(control, want) {
+		t.Fatalf("over a package carrying a second assembly one file over, the scan read %v, want %v; whatever it reports about the real package, it is not reading a second assembly next door",
 			control, want)
 	}
 
-	emitting := declarationsEmittingIn(mustParseSource(t, "key_package.go"), emitters)
+	emitting := scan(sources)
 	if want := []string{"MarshalMLS", "marshalCore"}; !slices.Equal(emitting, want) {
-		t.Errorf("key_package.go emits the encoding from %v, want %v. marshalCore is the one assembly of the signed prefix and MarshalMLS reaches it; anything else here is a second opinion about what a key package signs, and two implementations of one preimage disagree by bytes the day one of them changes",
+		t.Errorf("this package assembles the key package encoding in %v, want %v. marshalCore is the one assembly of the signed prefix and MarshalMLS reaches it; anything else is a second opinion about what a key package signs, and two implementations of one preimage disagree by bytes the day one of them changes",
 			emitting, want)
+	}
+
+	// and the filter is separating something rather than passing the package through, which is
+	// the control on the widening itself: a filter that keeps everything it is shown, or a scan
+	// that read one file, both answer a short list and both look like this one passing
+	everything := []string{}
+	for _, parsed := range sources {
+		everything = append(everything, declarationsEmittingIn(parsed, emitters)...)
+	}
+	if len(everything) <= len(emitting) {
+		t.Fatalf("the package wide scan read %d emitting declarations in all and %d of them as the key package's; the filter is keeping everything it is shown, or the scan read one file's worth of the package",
+			len(everything), len(emitting))
+	}
+	t.Logf("%d emitting declarations across the %d non test files of this package, %d of them the key package's: %v",
+		len(everything), len(sources), len(emitting), emitting)
+}
+
+// ---------------------------------------------------------------------------
+// what the package wide stub gate cannot hold NewKeyPackage to
+// ---------------------------------------------------------------------------
+
+// keyPackageWithoutItsClock is one key package encoded with its leaf's Lifetime replaced by a
+// fixed window and both signatures dropped.
+//
+// The lifetime is the one part of this structure that is not a function of what NewKeyPackage
+// was handed -- NewLeafNode stamps it off the wall clock -- so two calls a second apart differ
+// in it, and because it sits inside the LeafNodeTBS and inside the KeyPackageTBS, in BOTH
+// signatures too. Normalising it is what makes two calls comparable at all, and it is exactly
+// why the package wide stub gate excuses this constructor from every comparison it makes across
+// calls.
+//
+// The whole structure is encoded rather than a chosen field, so an argument that reached any
+// part of it is observed. The two SIGNATURES are dropped with the lifetime because they cover it
+// and would carry the clock straight back in; what holds the key package signature to depending
+// on the fields it covers is TestKeyPackageRefIsStableAndBindsEveryField and the tampering rows
+// of TestKeyPackageValidateRejects, over the same encoding.
+func keyPackageWithoutItsClock(t *testing.T, kp *KeyPackage) string {
+	t.Helper()
+	normalised := *kp
+	normalised.LeafNode = *kp.LeafNode.Clone()
+	normalised.LeafNode.Lifetime = Lifetime{NotBefore: 1, NotAfter: 2}
+	normalised.LeafNode.Signature = nil
+	normalised.Signature = nil
+	encoded, err := syntax.Marshal(&normalised)
+	if err != nil {
+		t.Fatalf("encode a key package with its clock normalised out: %v", err)
+	}
+	return hex.EncodeToString(encoded)
+}
+
+// keyPackageCall is NewKeyPackage's whole argument list, one EXPORTED field per declared
+// parameter.
+//
+// Exported because the sweep reaches each field through reflect and reflect refuses to write an
+// unexported one. A parameter resolves to the field of its own name with the first letter
+// raised, so a parameter this list has no field for is fatal rather than swept by nothing --
+// which is the failure mode a written out argument list has, and the one three gates in this
+// package have already been caught in.
+type keyPackageCall struct {
+	Crypto CryptoProvider
+	Suite  CipherSuite
+	Cred   Credential
+	Caps   Capabilities
+	Exts   []Extension
+}
+
+func (self *keyPackageCall) fieldFor(t *testing.T, parameter string) reflect.Value {
+	t.Helper()
+	name := strings.ToUpper(parameter[:1]) + parameter[1:]
+	field := reflect.ValueOf(self).Elem().FieldByName(name)
+	if !field.IsValid() {
+		t.Fatalf("NewKeyPackage declares a parameter %s and this argument list has no %s field for it, so nothing below moves it",
+			parameter, name)
+	}
+	return field
+}
+
+// build is one call, answered as a string so that a refusal and a key package are comparable.
+//
+// The answer is the ENCODING and not the two private halves beside it, and that is a measurement
+// rather than a preference. The first version of this read the structure and both private keys,
+// on the reasoning that they are results too; dropping them from the answer altogether changed
+// no verdict of this sweep, because every argument this constructor is handed reaches the
+// encoding and the private halves move only when a public half already has. An assertion no
+// mutation can kill is weight a reader has to reason about for nothing, so it is not here. What
+// holds the two private halves to being two rather than one is
+// TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy, which opens a message under
+// each public half with the private half it was handed -- a property this sweep does not state.
+func (self keyPackageCall) build(t *testing.T) string {
+	t.Helper()
+	kp, _, _, err := NewKeyPackage(self.Crypto, self.Suite, self.Cred, self.Caps, self.Exts)
+	if err != nil {
+		return "refused: " + err.Error()
+	}
+	return keyPackageWithoutItsClock(t, kp)
+}
+
+// One well formed urmessage_leaf_keys entry, so that the extensions argument has an element to
+// move as well as a length. A slice that can only grow states a weaker property than one that
+// can also be shortened and reached into.
+func keyPackageSweepExtension(t *testing.T) Extension {
+	t.Helper()
+	entry, err := (&LeafKeysExtension{
+		AlgId:          AlgIdXwing,
+		DeviceXwingPub: repeatByte(0x55, XwingPublicKeyLen),
+	}).Encode()
+	if err != nil {
+		t.Fatalf("LeafKeysExtension.Encode: %v", err)
+	}
+	return entry
+}
+
+// keyPackageSweepArguments is one complete argument list, built fresh on every call.
+//
+// Fresh because the derived edits write IN PLACE and a shallow copy shares every slice: a row
+// built off a value an earlier row had edited moves away from something the constructor was
+// never called with.
+//
+// The provider is over a FIXED entropy script rather than the process source. NewKeyPackage
+// draws three key pairs of its own, so two calls over crypto/rand answer different bytes
+// whatever they were handed, and every row below would report an argument as observed on the
+// strength of the randomness.
+//
+// The capabilities advertise every REGISTERED suite rather than the one this file builds at, so
+// the suite move below stays inside a leaf whose capabilities cover it and a refusal there is
+// the constructor's rule rather than this test's own arguments.
+func keyPackageSweepArguments(t *testing.T) keyPackageCall {
+	t.Helper()
+	caps := testKeyPackageCapabilities()
+	caps.CipherSuites = Suites()
+	return keyPackageCall{
+		Crypto: mustProviderOver(t, keyPackageTestSuite, providerStubStream(0x80)),
+		Suite:  keyPackageTestSuite,
+		Cred:   BasicCredential([]byte("alice")),
+		Caps:   caps,
+		Exts:   []Extension{keyPackageSweepExtension(t)},
+	}
+}
+
+// keyPackageConstructorParameters is NewKeyPackage's parameter list, read off its own
+// declaration.
+//
+// Derived rather than typed out, and this is the SCOPE half of the rule the enumeration failures
+// of this project keep landing on: a sweep with five names written down goes on reporting a
+// clean run the day a sixth argument lands. The file declaring it is found rather than named,
+// for the same reason one level up.
+func keyPackageConstructorParameters(t *testing.T) []string {
+	t.Helper()
+	parsed := sourceDeclaringPackageFunction(t, "NewKeyPackage")
+	names := []string{}
+	for _, parameter := range parametersOf(t, parsed, "NewKeyPackage",
+		parsed.declarationOf(t, "", "NewKeyPackage").Type) {
+		names = append(names, parameter.name)
+	}
+	if len(names) == 0 {
+		t.Fatal("NewKeyPackage was read as taking no argument at all, so the sweep below runs over nothing")
+	}
+	return names
+}
+
+// keyPackageArgumentMove is one way of making one argument different, named for the failure
+// message and keyed by the parameter it moves.
+type keyPackageArgumentMove struct {
+	parameter string
+	name      string
+	apply     func(t *testing.T, call *keyPackageCall)
+}
+
+// keyPackageArgumentMoves is every move this sweep makes, derived off the TYPE of each declared
+// parameter rather than off its name or off a list.
+//
+// Three rules, and which one applies is decided by the parameter's type, so a parameter that is
+// renamed keeps its rule and a parameter that is retyped loses it loudly.
+//
+//   - the provider: another provider at the same suite over ANOTHER entropy script. Every key in
+//     the answer is drawn through it, so a constructor that built a provider of its own out of a
+//     hardcoded suite -- which is a WORKING constructor, because both registered suites are
+//     X25519 and Ed25519 and every corpus here is at one of them -- answers the same bytes over
+//     both scripts and is caught here.
+//   - the ciphersuite: every OTHER registered suite, WITH the provider that runs it. The two move
+//     together because NewKeyPackage refuses a provider that does not run the suite it was named,
+//     so a suite moved alone is not an accepted call at all -- and a refusal would let a body
+//     that stored a hardcoded suite pass on the strength of the guard that read the argument,
+//     which is the shape this sweep exists to catch. Moving the pair separates them: the two
+//     registered suites share X25519, SHA-256 and Ed25519 and differ only in their AEAD, so every
+//     key and both signatures come back IDENTICAL and the stored ciphersuite is the only thing
+//     that can have moved.
+//   - everything else: leafNodeEditsOf, the same derivation the leaf's codec sweeps run on, so an
+//     argument that grows a field is swept on the commit that lands it rather than when somebody
+//     remembers to extend a list.
+//
+// A refusal counts as an observation, for the stub gate's reason: an argument that moved a call
+// from accepted to rejected has been read just as surely as one that moved the bytes.
+func keyPackageArgumentMoves(t *testing.T, parameters []string) []keyPackageArgumentMove {
+	t.Helper()
+	base := keyPackageSweepArguments(t)
+	providerType := reflect.TypeOf((*CryptoProvider)(nil)).Elem()
+	suiteType := reflect.TypeOf(CipherSuite(0))
+	moves := []keyPackageArgumentMove{}
+	for _, parameter := range parameters {
+		field := base.fieldFor(t, parameter)
+		before := len(moves)
+		switch field.Type() {
+		case providerType:
+			moves = append(moves, keyPackageArgumentMove{
+				parameter: parameter,
+				name:      "a provider at the same suite over another entropy script",
+				apply: func(t *testing.T, call *keyPackageCall) {
+					call.Crypto = mustProviderOver(t, call.Suite, providerStubStream(0x40))
+				},
+			})
+		case suiteType:
+			for _, suite := range Suites() {
+				if suite == base.Suite {
+					continue
+				}
+				moves = append(moves, keyPackageArgumentMove{
+					parameter: parameter,
+					name:      fmt.Sprintf("suite %#04x, over the provider that runs it", uint16(suite)),
+					apply: func(t *testing.T, call *keyPackageCall) {
+						call.Suite = suite
+						call.Crypto = mustProviderOver(t, suite, providerStubStream(0x80))
+					},
+				})
+			}
+		default:
+			for _, edit := range leafNodeEditsOf(parameter, field, leafNodeSources(t)) {
+				moves = append(moves, keyPackageArgumentMove{
+					parameter: parameter,
+					name:      edit.name,
+					apply: func(t *testing.T, call *keyPackageCall) {
+						edit.apply(call.fieldFor(t, parameter))
+					},
+				})
+			}
+		}
+		if len(moves) == before {
+			t.Fatalf("NewKeyPackage declares %s, of type %s, and no move was derived for it, so this sweep would state nothing about that argument",
+				parameter, field.Type())
+		}
+	}
+	return moves
+}
+
+// TestNewKeyPackageReadsEveryArgumentItWasHanded is the half of the package wide stub gate that
+// the wall clock exemption takes away, put back over the arguments this constructor has.
+//
+// The exemption is real -- two calls a second apart sign different key packages for a reason
+// that is not the arguments -- and until this landed it was a HOLE. crypto_test.go's loop
+// continues before the per argument perturbation for every name in
+// providerConstructionsAnsweringOffTheWallClock, so unobserved was never populated for this
+// constructor, and NewLeafNode's twin of this test had no equivalent here. Measured on the
+// committed tree, twice by a reviewer and once by the owner: a body that replaced the credential
+// it was handed with BasicCredential("mallory"), and a body that read the suite in a guard and
+// then stored a hardcoded one, each passed 6604 tests with zero failures. Every key package in
+// the system would have been minted under an identity and a suite the caller never named.
+//
+// The property is the gate's: an argument that changes must change the answer, or the
+// constructor is a function of fewer things than its signature says. Three differences from the
+// leaf's twin. The answer is read with the lifetime normalised out, which is what makes the
+// comparison stable across a second boundary. The parameter list is DERIVED off the declaration,
+// so a sixth argument is swept on the commit that lands it or fails here. And the answer carries
+// the two private halves as well as the structure, because they are results too.
+//
+// It is not a source shape check and it must not become one. TestNoStubShapesRemainInSource
+// catches the crude form -- an argument never mentioned at all -- and records its own limit
+// where it is declared: a body which reads a parameter and then ignores the value still passes
+// it. That is exactly what both measured substitutions do, so this one drives the constructor
+// and reads the argument out of the OUTPUT.
+func TestNewKeyPackageReadsEveryArgumentItWasHanded(t *testing.T) {
+	parameters := keyPackageConstructorParameters(t)
+	answer := keyPackageSweepArguments(t).build(t)
+	if strings.HasPrefix(answer, "refused") {
+		t.Fatalf("NewKeyPackage refused this test's own arguments (%s), so every row below compares two refusals", answer)
+	}
+	// the control on the normalisation and on the fixed script: two calls with one argument
+	// list answer the same thing, or every "it moved" below is the clock or the entropy rather
+	// than the argument
+	if repeated := keyPackageSweepArguments(t).build(t); repeated != answer {
+		t.Fatalf("NewKeyPackage answered\n %s\nand then\n %s\nfor one argument list with the clock normalised out",
+			answer, repeated)
+	}
+	moves := keyPackageArgumentMoves(t, parameters)
+	moved := map[string]int{}
+	for _, move := range moves {
+		with := keyPackageSweepArguments(t)
+		move.apply(t, &with)
+		if with.build(t) == answer {
+			t.Errorf("NewKeyPackage answered the same key package with %s, so it does not read the %s it was handed",
+				move.name, move.parameter)
+			continue
+		}
+		moved[move.parameter] += 1
+	}
+	for _, parameter := range parameters {
+		if moved[parameter] == 0 {
+			t.Errorf("no derived move to %s changed what NewKeyPackage answered, so this sweep observed nothing about that argument",
+				parameter)
+		}
+	}
+	t.Logf("%d derived moves across the %d arguments NewKeyPackage declares (%v)",
+		len(moves), len(parameters), parameters)
+}
+
+// TestNewKeyPackageRefusesAProviderThatDoesNotRunTheSuiteItWasNamed pins the decision
+// errKeyPackageProviderSuite records.
+//
+// On the committed tree NewKeyPackage(NewCryptoProvider(0x0001), 0x0003, ...) answered no error,
+// produced a key package advertising 0x0003, and Validate(crypto, 0x0003, now) ACCEPTED it --
+// because Validate compares the structure's suite against its argument and never against the
+// provider. Harmless only while the two registered suites share X25519, SHA-256 and Ed25519 and
+// differ solely in their AEAD; a third suite that moves any of those makes it a key package
+// whose signature no peer can check, published before anybody finds out.
+//
+// The sweep is over every ORDERED PAIR of registered suites rather than over the one pair that
+// exists today, so the suite p8 registers is covered by the commit that registers it. The
+// matched pairs are in the sweep as well as the mismatched ones: a guard that refused
+// everything would satisfy a test that only drove mismatches, and it would be a guard nothing
+// could mint a key package through.
+func TestNewKeyPackageRefusesAProviderThatDoesNotRunTheSuiteItWasNamed(t *testing.T) {
+	suites := Suites()
+	if len(suites) < 2 {
+		t.Fatalf("this package registers %v, and a mismatch has to be made of two suites", suites)
+	}
+	caps := testKeyPackageCapabilities()
+	caps.CipherSuites = suites
+	for _, running := range suites {
+		for _, named := range suites {
+			crypto := mustProviderOver(t, running, providerStubStream(0x80))
+			kp, initPriv, encPriv, err := NewKeyPackage(crypto, named,
+				BasicCredential([]byte("alice")), caps, nil)
+			if running == named {
+				if err != nil {
+					t.Errorf("NewKeyPackage over a provider running %#04x and naming %#04x: %v",
+						uint16(running), uint16(named), err)
+				}
+				continue
+			}
+			if !errors.Is(err, errKeyPackageProviderSuite) {
+				t.Errorf("NewKeyPackage over a provider running %#04x and naming %#04x answered %v, want errKeyPackageProviderSuite",
+					uint16(running), uint16(named), err)
+			}
+			if kp != nil || initPriv != nil || encPriv != nil {
+				t.Errorf("NewKeyPackage answered a key package and %d and %d private octets alongside the refusal of a provider running %#04x named %#04x",
+					len(initPriv), len(encPriv), uint16(running), uint16(named))
+			}
+		}
+	}
+	// and the refusal comes before anything is drawn, which is what keeps a caller's mistake
+	// from costing three key pairs of entropy and what makes it reproducible
+	counting := &countingReader{inner: providerStubStream(0x80)}
+	crypto := mustProviderOver(t, suites[0], counting)
+	if _, _, _, err := NewKeyPackage(crypto, suites[1], BasicCredential([]byte("alice")), caps, nil); err == nil {
+		t.Fatalf("a provider running %#04x minted a key package naming %#04x", uint16(suites[0]), uint16(suites[1]))
+	}
+	if counting.drawn != 0 {
+		t.Errorf("NewKeyPackage drew %d octets before refusing a provider that does not run the suite it was named",
+			counting.drawn)
+	}
+}
+
+// TestTheZeroKeyPackageIsRefusedOnItsCredentialAndNotItsLeafSource is the claim
+// provider_nil_test.go's two key package rows rest on, as an assertion rather than as prose.
+//
+// Those rows drive a ZERO valued KeyPackage at a nil provider to say the provider is judged
+// before the receiver, and the comment above them has to name the refusal the receiver WOULD
+// have produced -- otherwise they state that one of two orders was taken without saying what the
+// other one answers. That comment said ErrTreeMalformed, on the leaf's source. It is
+// errProfileCredentialType, on the leaf's CREDENTIAL: Credential.MarshalMLS refuses a type that
+// is not basic before it writes an octet, and the credential is the third field of the leaf the
+// structure Ref marshals carries, so the encoder never reaches the source at all.
+//
+// This project reads a justification comment as a claim, and a claim nothing checks is exactly
+// how a wrong one survives review. This is the check.
+func TestTheZeroKeyPackageIsRefusedOnItsCredentialAndNotItsLeafSource(t *testing.T) {
+	crypto, err := NewCryptoProvider(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	ref, refErr := (&KeyPackage{}).Ref(crypto)
+	if !errors.Is(refErr, errProfileCredentialType) {
+		t.Errorf("(&KeyPackage{}).Ref answered %v, want errProfileCredentialType: the zero leaf's credential type is 0 and the encoder refuses it before it reaches the source",
+			refErr)
+	}
+	if errors.Is(refErr, ErrTreeMalformed) {
+		t.Errorf("(&KeyPackage{}).Ref answered %v, which answers ErrTreeMalformed; the reason written above provider_nil_test.go's key package rows named that refusal and it does not happen",
+			refErr)
+	}
+	if ref != nil {
+		t.Errorf("(&KeyPackage{}).Ref answered the reference %x alongside its refusal", ref)
+	}
+	// and the neighbouring row's reason, which WAS right: a zero key package names version 0,
+	// so a Validate that judged its receiver first would answer for a version nobody chose
+	if err := (&KeyPackage{}).Validate(crypto, keyPackageTestSuite, time.Now()); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Errorf("(&KeyPackage{}).Validate answered %v, want ErrUnsupportedVersion", err)
 	}
 }
