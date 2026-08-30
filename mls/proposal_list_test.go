@@ -527,13 +527,13 @@ func TestProfileGateRefusesGreaseType(t *testing.T) {
 	if !errors.Is(err, errUnregisteredProposalType) {
 		t.Fatalf("checkProposalProfile error = %v, want errUnregisteredProposalType", err)
 	}
-	// and it is refused as UNREGISTERED and not as a forgery. This is the value the collapse hid:
-	// a decoded GREASE proposal carries UnknownType equal to ProposalType, because that is how
-	// proposal_wire.go makes GREASE round trip, so a discriminant clause reading "UnknownType is
-	// set at all" accuses the peer's honest message of being a forgery this build produced. While
-	// the two rules shared one sentinel every assertion here held either way.
+	// and it is refused as UNREGISTERED and not as a forgery, which is a statement about WHICH
+	// RULE owns this input. A GREASE proposal carries UnknownType equal to ProposalType -- that is
+	// how proposal_wire.go makes it round trip -- and what is wrong with it is that nothing here
+	// knows the code point, not that anything disagrees with anything. While the two rules shared
+	// one sentinel this assertion could not be made at all.
 	if errors.Is(err, errForgedProposalDiscriminant) {
-		t.Errorf("a GREASE proposal decoded as the codec decodes one was answered %v, which names the forged discriminant rule; nothing about it disagrees with anything",
+		t.Errorf("a GREASE proposal decoded as the codec decodes one was answered %v, which names the forged discriminant rule; its discriminant is exactly the type it names",
 			err)
 	}
 	// the same refusal over a value whose UnknownType is NOT set, which is the half the plan's
@@ -731,13 +731,20 @@ func TestTheProfileGateRefusesAForgedWireDiscriminant(t *testing.T) {
 // ./mls/... and ./message/... green, while the clause's own comment and its test both CLAIMED
 // the second. So the file implemented one rule and documented another, and nothing could tell.
 //
-// The two inputs below are the ones that separate them, and each is a real value rather than a
-// probe. The first is what proposal_wire.go's own decoder produces for an unregistered code
-// point -- UnknownType is set to ProposalType, which is how a GREASE body round trips -- so
-// under the wide rule every honestly relayed GREASE proposal is refused as a forgery. The second
-// is a proposal whose discriminant and type agree on an ACCEPTED type: MarshalMLS writes the
-// same octets it would write with UnknownType unset, so there is no second reading for any
-// receiver to take, and refusing it refuses a proposal that is not wrong about anything.
+// EXACTLY ONE INPUT separates the two, and finding that out is what makes this test small and
+// makes it the whole statement. A refused or unregistered type is answered by the type rule
+// before this clause runs; a genuine disagreement is refused by both readings; so the only
+// input left is an ACCEPTED type whose UnknownType equals it, and that is the second half below.
+// MarshalMLS writes the same octets it would write with UnknownType unset, so refusing it
+// refuses a proposal that is not wrong about anything, under a message reading "add would be
+// encoded under the discriminant add".
+//
+// The first half is about ORDER rather than about the clause, and it is here because the split
+// of the sentinels is what makes it askable: a GREASE proposal off the wire carries UnknownType
+// equal to ProposalType, and the rule it breaks is the registry rule. Under the wide reading
+// this clause was a second answer to that same input, reachable whenever the type rule did not
+// run first, which is not a backstop -- it is two rules answering one message with two
+// sentinels, and the caller told the second one goes looking for a bug in its own commit path.
 func TestTheForgedDiscriminantClauseIsAboutTheDisagreementAndNotAboutUnknownTypeBeingSet(t *testing.T) {
 	crypto := testCrypto(t)
 	bob := testIdentity(t, crypto, "bob")
@@ -766,6 +773,21 @@ func TestTheForgedDiscriminantClauseIsAboutTheDisagreementAndNotAboutUnknownType
 	}
 	if errors.Is(got, errForgedProposalDiscriminant) {
 		t.Errorf("a GREASE proposal off the wire was refused as a forged discriminant; its discriminant is exactly the type it names")
+	}
+	// and the clause itself is asked directly, with the type rule taken out of the way, so this
+	// states what the CLAUSE does rather than what the ordering hides. A profile that classified
+	// the GREASE point as accepted would send it straight past rule 1 and into rule 2, and under
+	// the wide reading rule 2 answers it. The row is removed by the cleanup whether this passes
+	// or fails, because every other test in this file derives its class off the same table.
+	widened := decoded.ProposalType
+	if _, already := proposalTypeProfile[widened]; already {
+		t.Fatalf("%#04x is already classified, so this half is not modelling a profile that admits it", uint16(widened))
+	}
+	proposalTypeProfile[widened] = nil
+	t.Cleanup(func() { delete(proposalTypeProfile, widened) })
+	if err := checkProposalProfile(defaultProfile(), decoded); err != nil {
+		t.Errorf("with %#04x accepted by the profile, the gate still refused a proposal carrying it with %v; its discriminant is the type it names and its arm is the verbatim body, so nothing about it disagrees",
+			uint16(widened), err)
 	}
 
 	// and the accepted type carrying its own discriminant, which encodes to the octets a plain

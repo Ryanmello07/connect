@@ -155,22 +155,30 @@ func (self *profile) checkProposalType(proposalType ProposalType) error {
 // believes is an Add and every receiver refuses as a reinit. This plan never emits one, so it
 // refuses to act on one.
 //
-// RULE 2 IS ABOUT THE DISAGREEMENT AND NOT ABOUT UnknownType BEING SET, and the two are a
-// one-clause difference that was worth deciding rather than inheriting. When UnknownType equals
-// ProposalType the octets carry exactly the type this gate was asked about: MarshalMLS writes the
-// same discriminant either way and selects the same arm, so the encoding is indistinguishable
-// from the one a proposal with UnknownType unset produces, and there is no second reading for any
-// receiver to take. Nothing is forged, so nothing here is refused.
+// RULE 2 IS ABOUT THE DISAGREEMENT AND NOT ABOUT UnknownType BEING SET. The clause that landed
+// read "UnknownType is set at all" while this comment and the clause's own test both said "the
+// discriminant disagrees", so the file implemented one rule and documented another, and narrowing
+// it to the documented one left the whole tree green.
 //
-// What decides it is the OTHER direction. proposal_wire.go's decoder sets UnknownType to
-// ProposalType for every unregistered code point it reads -- that is how GREASE round trips -- so
-// a proposal a peer honestly sent under 0x0A0A arrives with the two EQUAL. Under "UnknownType is
-// set at all" that peer's message is refused as a forgery this build's own commit builder is
-// accused of producing, when what actually happened is that a registry we do not have was used.
-// Both readings refused it while the two rules shared one sentinel, which is why the collapse
-// hid this: now that they answer different values, the wide clause reports the wrong one for
-// every GREASE proposal that ever arrives, and the narrow one leaves that case to rule 1, which
-// is the rule it breaks.
+// It left the tree green because the two readings differ over EXACTLY ONE input: an accepted type
+// whose UnknownType equals it. Every other input is decided before this clause or by both
+// readings alike -- a refused or unregistered type is answered by rule 1 above, and a genuine
+// disagreement is refused either way -- and both fixtures in the clause's own test forge a
+// genuine disagreement, so neither could tell the two apart. Which is also why the narrow rule
+// costs the clause a backstop it used to have by accident: a decoded GREASE proposal carries
+// UnknownType equal to ProposalType, because that is how proposal_wire.go makes GREASE round
+// trip, so under the wide reading this clause refused one even with rule 1 switched off. Rule 1
+// is the rule such a proposal breaks and is stated over all 65536 code points in a test of its
+// own, and a second clause answering the same input with a different sentinel is not a backstop,
+// it is two rules a caller cannot tell apart.
+//
+// That one input is what decides it. When the two are equal MarshalMLS writes the same
+// discriminant it would write with UnknownType unset and selects the same arm, so the octets are
+// byte for byte an ordinary add's: there is no second reading for any receiver to take, nothing
+// about the value is wrong, and the refusal it earned read "add would be encoded under the
+// discriminant add", which is not a sentence about a fault. The rule this clause exists for is
+// octets carrying a type other than the one this gate judged, and the equal case carries the one
+// it judged.
 func checkProposalProfile(active *profile, proposal *Proposal) error {
 	if proposal == nil {
 		return fmt.Errorf("%w: nothing was handed to the type rule", errNilProposal)
