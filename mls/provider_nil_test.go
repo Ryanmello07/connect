@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 )
 
 // providerNilMethodRow is one method of the class, with a call that hands it no provider.
@@ -75,6 +76,20 @@ func providerNilMethodRows() []providerNilMethodRow {
 		}},
 		{name: "(*LeafNode).VerifySignature", call: func() error {
 			return (&LeafNode{}).VerifySignature(nil, nil, 0)
+		}},
+		// key_package.go's two, on a ZERO valued key package, which is the receiver that
+		// separates the two orders these bodies could be written in. A zero KeyPackage names
+		// protocol version 0, so a Validate that judged its receiver before its provider would
+		// answer ErrUnsupportedVersion -- sending the caller to fix a version it never chose,
+		// over a provider it never passed -- and it carries a leaf whose source is 0, which
+		// the encoder Ref goes through refuses with ErrTreeMalformed for the same kind of
+		// reason.
+		{name: "(*KeyPackage).Ref", call: func() error {
+			_, err := (&KeyPackage{}).Ref(nil)
+			return err
+		}},
+		{name: "(*KeyPackage).Validate", call: func() error {
+			return (&KeyPackage{}).Validate(nil, 0, time.Time{})
 		}},
 		// the four tree hashes, on the ZERO valued tree rather than on NewRatchetTree's one
 		// leaf tree. A tree of no nodes is the receiver that separates the two orders these

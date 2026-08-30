@@ -4144,6 +4144,7 @@ var providerConstructionValues = map[string]any{
 	"NewSecretTree":                 NewSecretTree,
 	"SenderDataKeyNonce":            SenderDataKeyNonce,
 	"NewLeafNode":                   NewLeafNode,
+	"NewKeyPackage":                 NewKeyPackage,
 	"DerivePathSecrets":             DerivePathSecrets,
 	"DeriveNodeKeyPair":             DeriveNodeKeyPair,
 	"SignAuthenticatedContent":      SignAuthenticatedContent,
@@ -4445,7 +4446,14 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		// the leaf constructor's three structured arguments, answered by the constructors
 		// the perturbation rule for them is built out of, so the base value and the values
 		// it is moved away from cannot be written twice and drift.
-		"cred": leafNodeStubCredential(),
+		// the key package constructor's ciphersuite, keyed by its DECLARED TYPE rather than
+		// by the parameter name, because a CipherSuite says which value belongs there and
+		// "suite" would not. It is the registry's own code point for the suite this gate is
+		// running at, so a construction that stores it and signs over it is called correctly;
+		// the uint16 rule moves it one code point higher, which is a suite the key package
+		// names and nothing else about the call changes.
+		"CipherSuite": params.Suite,
+		"cred":        leafNodeStubCredential(),
 		"caps": leafNodeStubCapabilities(),
 		"exts": leafNodeStubExtensions(),
 		// the path secret ladder of RFC 9420 section 7.4 and the node key under it. Both
@@ -5035,6 +5043,12 @@ func providerStubZeroResults(results []reflect.Value) []string {
 var providerStreamDependentOperations = []string{
 	"EncryptWithLabel",
 	"HpkeSeal",
+	// the key package constructor draws three times -- a signature key pair and two
+	// entropy draws, one for each of the two HPKE key pairs it must not derive from one
+	// seed -- so it is the first CONSTRUCTION of this package to depend on the stream
+	// rather than on what it was handed. It refusing an exhausted source is what says it
+	// does not fall back onto one of its own.
+	"NewKeyPackage",
 	"Random",
 	"SealPrivateMessage",
 	"SealWithLabel",
@@ -5109,6 +5123,13 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 	// correct answer here rather than a stub, and it stops being correct the moment this
 	// constructor starts producing some other source, at which point the entry fails.
 	"NewLeafNode": {"result 0 field 3 is empty"},
+	// the same parent hash, one structure out. A KeyPackage carries the leaf whole, so the
+	// byte fields of its answer are the init key, then the leaf's five, then the signature
+	// and the signing seed -- and field 4 is that leaf's parent_hash, empty for exactly the
+	// reason NewLeafNode's is: a key package is minted before there is a tree to hash a path
+	// through. The entry stops being correct the moment this constructor starts producing
+	// some other leaf source, at which point it fails.
+	"NewKeyPackage": {"result 0 field 4 is empty"},
 	// the FramedContentAuthData's confirmation tag. RFC 9420 section 8.2 takes the confirmed
 	// transcript hash over this very signature and the tag is a MAC over that hash, so the tag
 	// cannot exist at the moment the signature is made: a commit's caller sets it afterwards.
@@ -5149,6 +5170,11 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 // call itself, its refusals, and the zero value reading that is what "no stub shapes remain"
 // actually means -- and what is skipped is held elsewhere, named per entry.
 var providerConstructionsAnsweringOffTheWallClock = map[string]string{
+	// the key package constructor inherits the leaf's clock: it builds its leaf through
+	// NewLeafNode, so the Lifetime stamped there is inside the KeyPackageTBS this signs, and
+	// two calls a second apart answer different signatures for a reason that is not the
+	// arguments. Everything above the comparisons still runs for it.
+	"NewKeyPackage": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy holds it to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
 	"NewLeafNode": "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
 }
 
@@ -5272,6 +5298,31 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 			}
 			if reason, offTheClock := providerConstructionsAnsweringOffTheWallClock[operation.name]; offTheClock {
 				t.Logf("%s: no answer of this row is compared against another call's, because it %s", where, reason)
+				// the stream dependence is still measured for these rows, and it is measured
+				// by COUNTING what came out of the reader rather than by comparing two
+				// answers. An answer carrying a wall clock reading moves between two calls
+				// for a reason that is not the stream, so the comparison every other row
+				// uses would report such a row as stream dependent whatever it drew -- and
+				// the two ends of this gate compare that measurement against
+				// providerStreamDependentOperations, which is the same list
+				// TestEveryProviderOperationDrawsExactlyWhatItUses holds its own counted
+				// measurement to. Skipping the measurement instead would leave a
+				// construction that draws sitting outside one of the two lists that have to
+				// agree, which is how the pair stops being a pair.
+				counting := &countingReader{inner: providerStubStream(0x80)}
+				counted := mustProviderOver(t, suite, counting)
+				arguments[providerInterfaceName] = counted
+				drawn := []reflect.Value{}
+				for i, parameter := range operation.parameters {
+					drawn = append(drawn, providerStubArgument(t, arguments, operation.name, parameter, bound.Type().In(i)))
+				}
+				if _, refused := providerStubCall(operation.bind(counted), drawn); refused != nil {
+					t.Errorf("%s refused the call this gate counts its draws through: %v", where, refused)
+					continue
+				}
+				if counting.drawn != 0 {
+					drawing = append(drawing, operation.name)
+				}
 				probed = append(probed, operation.name)
 				continue
 			}
@@ -7007,6 +7058,13 @@ var providerStreamDraws = map[string]func(params *SuiteParams) int{
 	// material in a path whose whole security rests on the one.
 	"SealWithLabel":    func(params *SuiteParams) int { return params.Nsk },
 	"SignatureKeyPair": func(params *SuiteParams) int { return params.NsigPriv },
+	// the key package constructor: a signature seed, and then one KDF.Nh draw for EACH of
+	// the two HPKE key pairs it derives. The two draws are the count that matters here --
+	// a constructor that derived the init pair and the encryption pair from ONE seed draws
+	// KDF.Nh fewer bytes and answers a key package that encodes, signs, refs and validates,
+	// so this is the one place in the package where that substitution is a NUMBER rather
+	// than a property somebody has to think to compare.
+	"NewKeyPackage": func(params *SuiteParams) int { return params.NsigPriv + 2*params.Nh },
 	// section 6.3.1's reuse_guard, which is four octets whatever the suite is: RFC 9420 fixes
 	// its width in the SenderData structure rather than deriving it from the AEAD, so this is
 	// one of the two entries in this table that is not a registry field.

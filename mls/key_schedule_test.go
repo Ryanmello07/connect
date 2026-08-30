@@ -4319,6 +4319,23 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{leaf.Signature}
 		}},
+		// the key package constructor, which DOES read a length off the provider -- its two
+		// entropy draws are KDF.Nh wide -- so what this row states is the half NewLeafNode's
+		// cannot: it must WORK over a provider whose KDF.Nh is not 32, and a body that drew a
+		// written down 32 into DeriveKeyPair would key every member of every group at that
+		// suite from less entropy than the suite asks for, invisibly.
+		//
+		// The signature is the answer read and the two private halves are not, because an
+		// X25519 scalar is 32 octets at either width: reading them here would report the KEM's
+		// own fixed length as a length this constructor wrote down.
+		{name: "NewKeyPackage", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			kp, _, _, kpErr := NewKeyPackage(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+				BasicCredential([]byte("alice")), leafNodeStubCapabilities(), nil)
+			if kpErr != nil {
+				t.Fatalf("NewKeyPackage over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), kpErr)
+			}
+			return [][]byte{kp.Signature}
+		}},
 		// the path secret ladder, whose every rung is DeriveSecret at KDF.Nh. A body that cut
 		// a rung to a written down 32 answers correctly at both registered suites and hands a
 		// short secret to every derivation above it at the first suite whose hash is wider.

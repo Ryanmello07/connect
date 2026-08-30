@@ -655,6 +655,13 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"framing_protect.go: syntax.NewReader(plaintext)",
 		"framing_protect.go: syntax.NewWriter()",
 		"framing_protect.go: syntax.Unmarshal(plaintext, senderData)",
+		// the RFC 9420 section 5.2 KeyPackageRef, which is RefHash over the whole encoded
+		// key package rather than over the prefix its signature covers. The default limit
+		// and not the ratchet tree one: a key package is one joiner's advertisement, every
+		// vector in it is capped at MaxVectorLength, and a reference taken over one allowed
+		// past that names a structure no peer running the default limit could decode -- which
+		// arrives as a commit adding a joiner nobody else can read.
+		"key_package.go: syntax.Marshal(self)",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
@@ -1867,6 +1874,25 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				return []byte("refused: " + leafErr.Error())
 			}
 			return leaf.Signature
+		}},
+		// the key package constructor, which reaches the provider six times -- a signature
+		// key pair, two entropy draws, two KEM derivations, and the KeyPackageTBS signature --
+		// and none of it is visible in the answer: a key package signed and keyed with a
+		// provider of its own is a well formed key package that verifies against every peer,
+		// because both registered suites and every corpus here are X25519 and Ed25519, which
+		// is what it would have hardcoded.
+		//
+		// A REFUSAL is the answer over the tagging provider, for NewLeafNode's reason: the
+		// leaf this constructor builds verifies what it just signed, and a provider whose
+		// signing half flips its answer cannot satisfy that. A constructor that computed the
+		// signature itself hands back the same bytes it handed back over the real provider.
+		{name: "NewKeyPackage", call: func(crypto CryptoProvider) []byte {
+			kp, _, _, kpErr := NewKeyPackage(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+				BasicCredential([]byte("alice")), leafNodeStubCapabilities(), nil)
+			if kpErr != nil {
+				return []byte("refused: " + kpErr.Error())
+			}
+			return kp.Signature
 		}},
 		// the path secret ladder. Every rung after the first is a DeriveSecret through the
 		// provider, and none of that is visible in the answer: a ladder climbed with a provider

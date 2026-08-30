@@ -31,6 +31,7 @@ import (
 	"go/types"
 	"slices"
 	"testing"
+	"time"
 )
 
 // One value a method left behind, named.
@@ -227,6 +228,46 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			verdict := []byte("the leaf verifies")
 			if refused := leaf.VerifySignature(crypto, groupId, 3); refused != nil {
 				verdict = []byte("the leaf is refused: " + refused.Error())
+			}
+			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
+		}},
+		// key_package.go's reference, RFC 9420 section 5.2. It is a digest, which is what
+		// both differentials can read: it moves under a provider that flips every answer, and
+		// it is KDF.Nh wide under a provider whose hash is one width up. The receiver is
+		// built by hand rather than by NewKeyPackage, because a constructor that verifies
+		// what it signed refuses over the tagging provider and this row would then be
+		// reporting the constructor's routing instead of the reference's.
+		{name: "(*KeyPackage).Ref", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			kp := &KeyPackage{
+				Version:     ProtocolVersionMls10,
+				CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+				InitKey:     HpkePublicKey(bytes.Repeat([]byte{0x53}, 32)),
+				LeafNode:    *testLeafNodeOfSource(LeafNodeSourceKeyPackage),
+				Signature:   bytes.Repeat([]byte{0x54}, 64),
+			}
+			ref, err := kp.Ref(crypto)
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{{name: "the key package reference", content: ref}}, nil
+		}},
+		// key_package.go's section 10.1 validation, whose whole answer is a yes or a no, so
+		// this row reads the VERDICT for (*LeafNode).VerifySignature's reason. The key package
+		// is minted through the same provider it is then validated against, which is what
+		// makes the verdict move: over a provider whose signing half flips its answer the
+		// constructor's own verify refuses, and a validator that reached for ed25519 on its
+		// own would accept exactly as it did over the real provider.
+		{name: "(*KeyPackage).Validate", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			kp, _, _, err := NewKeyPackage(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+				BasicCredential([]byte("alice")), leafNodeStubCapabilities(), nil)
+			if err != nil {
+				return []providerDrivenMethodValue{
+					{name: "the verdict", content: []byte("refused at construction: " + err.Error())},
+				}, nil
+			}
+			verdict := []byte("the key package validates")
+			if refused := kp.Validate(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519, time.Now()); refused != nil {
+				verdict = []byte("the key package is refused: " + refused.Error())
 			}
 			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
 		}},
