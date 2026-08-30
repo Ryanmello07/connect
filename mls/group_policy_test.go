@@ -1579,6 +1579,7 @@ func TestNothingReachesAGroupPolicyThroughTheUnjudgedDoor(t *testing.T) {
 	if len(callers) != 0 {
 		t.Errorf("%s is reached from %v as well as from %s; that door answers a policy no rule has judged, and a policy naming two owners answers one of them to RoleOf while half the group enforces the other",
 			unjudged, callers, judges)
+		return
 	}
 	t.Logf("%d call to %s in this package, all from %s", found, unjudged, judges)
 }
