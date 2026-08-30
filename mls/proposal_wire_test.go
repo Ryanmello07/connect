@@ -1140,8 +1140,16 @@ func TestProposalAndProposalOrRefConsumeExactlyTheirOwnOctets(t *testing.T) {
 // from a stack trace in a file about something else. That is the wrong way to learn this, and it
 // is the shape p7's group lifecycle will reach, since it assembles proposals rather than
 // decoding them. So the refusal is stated here over the cross product, and the panic is caught
-// and named rather than left to take the run down, because a crash and a missing refusal are the
-// same defect and the message has to say which one happened.
+// and named, because a crash and a missing refusal are the same defect and the message has to
+// say which one happened.
+//
+// What the catch does NOT do is keep a whole package run alive, and that distinction is stated
+// because it was overclaimed once. Go runs a package's tests in file order and framing_test.go
+// sorts before this one, so with a per-case check deleted the framing test reaches the same
+// dereference FIRST, does not recover, and takes the binary down before this test executes --
+// the named message never prints. What the catch buys is that -run over this test alone reports
+// which of the two defects happened instead of a stack trace, and that a deletion this test is
+// the first to reach is reported rather than fatal.
 func TestEveryProposalTypeRefusesEveryArmThatIsNotItsOwn(t *testing.T) {
 	samples := proposalArmSamples(t)
 	registered := slices.Sorted(maps.Keys(samples))
@@ -1208,4 +1216,520 @@ func TestEveryProposalTypeRefusesEveryArmThatIsNotItsOwn(t *testing.T) {
 		t.Fatalf("%d of the %d armless proposals were refused", empty, len(registered))
 	}
 	t.Logf("%d (type, foreign arm) pairs and %d armless proposals refused", refused, empty)
+}
+
+// ---------------------------------------------------------------------------
+// the arms of a ProposalOrRef, and the code points that name them
+// ---------------------------------------------------------------------------
+
+// marshalCatchingPanic encodes and turns a panic into a value the caller can name.
+//
+// An arm check that is missing and an arm check that is wrong are the same defect and they
+// surface differently: one comes back as a nil error and one takes the process down. A test that
+// only ever sees the second learns it from a stack trace, so this hands back both and lets the
+// message say which happened.
+func marshalCatchingPanic(codec syntax.Marshaler) (encoded []byte, raised any, err error) {
+	defer func() { raised = recover() }()
+	encoded, err = syntax.Marshal(codec)
+	return
+}
+
+// proposalOrRefArmFields is every field of ProposalOrRef that carries a BODY, derived off the
+// type by the reading proposalArmFields uses one type down: a field that can hold something --
+// a pointer or a slice -- rather than a list of the two arms somebody remembered. The
+// discriminant is a ProposalOrRefType and falls out of the class by that same reading rather
+// than by name, so a discriminant renamed does not fall in and a third arm added does.
+func proposalOrRefArmFields(t *testing.T) []string {
+	t.Helper()
+	orRef := reflect.TypeOf(ProposalOrRef{})
+	found := []string{}
+	for i := 0; i < orRef.NumField(); i += 1 {
+		field := orRef.Field(i)
+		switch field.Type.Kind() {
+		case reflect.Pointer, reflect.Slice:
+			found = append(found, field.Name)
+		}
+	}
+	if len(found) < 2 {
+		t.Fatalf("the derivation read %v out of ProposalOrRef, which is fewer arms than the type has, so the sweeps below would run over almost nothing", found)
+	}
+	slices.Sort(found)
+	return found
+}
+
+// proposalOrRefArmValues populates one arm, keyed by the field it fills.
+//
+// It is written by hand and that is safe here because every gate that uses it first holds it to
+// the DERIVED arm set in both directions: an arm added to ProposalOrRef with no row here fails
+// asking for one, and a row naming a field that is no longer an arm fails too. What it may not
+// be is a source of truth about WHICH arms exist, and it is never read as one.
+func proposalOrRefArmValues() map[string]func(*ProposalOrRef) {
+	return map[string]func(*ProposalOrRef){
+		"Proposal": func(one *ProposalOrRef) {
+			one.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 1}}
+		},
+		"Reference": func(one *ProposalOrRef) {
+			one.Reference = ProposalRef{0xaa, 0xbb}
+		},
+	}
+}
+
+// proposalOrRefArmOfEachType joins the ProposalOrRefType code points that name a body to the
+// field of ProposalOrRef that holds it, BY NAME and in both directions.
+//
+// Nothing here is a hand written pair, and that is the point. RFC 9420 section 12.4 writes the
+// case "case proposal: Proposal proposal;", so the select case, the Go constant and the Go
+// field are three spellings of one name: ProposalOrRefTypeProposal folds to "proposal", the
+// field Proposal folds to "proposal", and the case IS "proposal". A pair table written beside
+// them would be a fourth place to make the very mistake the join exists to find -- which is how
+// ExtensionTypeExternalSenders came to be pinned at its neighbour's code point.
+func proposalOrRefArmOfEachType(t *testing.T) map[ProposalOrRefType]string {
+	t.Helper()
+	// the arms, folded to the RFC's spelling of the case that selects them
+	armByRfcName := map[string]string{}
+	for _, field := range proposalOrRefArmFields(t) {
+		rfcName := rfcNameOfRegistryConstant("", field)
+		if other, repeated := armByRfcName[rfcName]; repeated {
+			t.Fatalf("the arms %s and %s of ProposalOrRef both fold to the RFC name %s, so the join below is ambiguous", other, field, rfcName)
+		}
+		armByRfcName[rfcName] = field
+	}
+	// held to the select the RFC writes, in BOTH directions: an arm the section 12.4 select
+	// names no case for is an arm nothing on the wire can select, and a case with no arm is a
+	// body this package cannot carry.
+	cases := slices.Clone(rfc9420Section124ProposalOrRefSelectCases)
+	slices.Sort(cases)
+	if !slices.Equal(slices.Sorted(maps.Keys(armByRfcName)), cases) {
+		t.Fatalf("the arms of ProposalOrRef fold to %v and RFC 9420 section 12.4's select names the cases %v",
+			slices.Sorted(maps.Keys(armByRfcName)), rfc9420Section124ProposalOrRefSelectCases)
+	}
+	// and the code points, off the declared constants rather than off the transcription, so
+	// this map names what the package will actually encode under
+	armOf := map[ProposalOrRefType]string{}
+	for name, value := range registryConstantsOfType(t, "ProposalOrRefType") {
+		field, named := armByRfcName[rfcNameOfRegistryConstant("ProposalOrRefType", name)]
+		if !named {
+			continue
+		}
+		armOf[ProposalOrRefType(value)] = field
+	}
+	if len(armOf) != len(armByRfcName) {
+		t.Fatalf("%d arms of ProposalOrRef joined to %d declared code points; a constant and an arm that fold to one name is what this join is made of",
+			len(armByRfcName), len(armOf))
+	}
+	return armOf
+}
+
+// TestEveryProposalOrRefTypeRefusesEveryArmThatIsNotItsOwn is ProposalOrRef's half of the arm
+// check, over the cross product of the code points that name a body with the arms that hold one.
+//
+// checkArm one type down asks two questions and this type asked neither. The per-case half is
+// what stands between ProposalOrRef{Type: ProposalOrRefTypeProposal} and
+// self.Proposal.MarshalMLS(w) on a nil pointer -- verbatim the defect the seven per-case checks
+// of Proposal.checkArm close, on the sibling type twelve lines further down the same file, and
+// deleting it left the WHOLE of ./mls/... and ./message/... green. Measured, not supposed.
+//
+// The count is the half a per-case check does not give at all. A ProposalOrRef carrying an
+// inline proposal AND a reference encoded to the proposal alone: two distinct values wrote
+// 01000300000001, the reference the caller set was in neither encoding, and the decode of
+// either came back with Reference empty. That is checkArm's own argument for why a Proposal must
+// count EXACTLY one arm, and it was applied to Proposal and not to the type that carries the
+// reference. A ProposalOrRef sits inside a Commit inside a FramedContent that is SIGNED, so the
+// arm that is dropped is dropped out of bytes somebody put a signature over.
+//
+// The panic is caught rather than left to the runtime, because a missing refusal and a nil
+// dereference are the same defect and the message has to say which one happened.
+func TestEveryProposalOrRefTypeRefusesEveryArmThatIsNotItsOwn(t *testing.T) {
+	armOf := proposalOrRefArmOfEachType(t)
+	fields := proposalOrRefArmFields(t)
+	populate := proposalOrRefArmValues()
+	if !slices.Equal(slices.Sorted(maps.Keys(populate)), fields) {
+		t.Fatalf("this file populates %v and the arms derived off ProposalOrRef are %v; an arm with no way to fill it is an arm this sweep would skip in silence",
+			slices.Sorted(maps.Keys(populate)), fields)
+	}
+	named := slices.Sorted(maps.Keys(armOf))
+
+	// the control: each code point encodes when it and its arm agree, or every refusal below
+	// is a refusal of something this table built wrong rather than of the mismatch
+	for _, one := range named {
+		matching := ProposalOrRef{Type: one}
+		populate[armOf[one]](&matching)
+		if _, err := syntax.Marshal(&matching); err != nil {
+			t.Fatalf("a ProposalOrRef typed %#02x carrying its own %s arm did not encode: %v", one, armOf[one], err)
+		}
+	}
+
+	// the foreign arm: the count is satisfied, so the only thing that can refuse this is the
+	// per-case check for the arm the discriminant names
+	foreign := 0
+	for _, one := range named {
+		for _, field := range fields {
+			if field == armOf[one] {
+				continue
+			}
+			mismatched := ProposalOrRef{Type: one}
+			populate[field](&mismatched)
+			encoded, raised, err := marshalCatchingPanic(&mismatched)
+			if raised != nil {
+				t.Errorf("a ProposalOrRef typed %#02x carrying the %s arm panicked in the encoder: %v; the arm the discriminant names was dereferenced without being checked for",
+					one, field, raised)
+				continue
+			}
+			if !errors.Is(err, ErrContentArmMismatch) {
+				t.Errorf("a ProposalOrRef typed %#02x carrying the %s arm encoded to %x with %v, want ErrContentArmMismatch; the arm it names is absent from those bytes and from the commit that would carry them",
+					one, field, encoded, err)
+				continue
+			}
+			foreign += 1
+		}
+	}
+
+	// no arm at all, for every code point that names one rather than for the one a case would
+	// have probed
+	armless := 0
+	for _, one := range named {
+		empty := ProposalOrRef{Type: one}
+		encoded, raised, err := marshalCatchingPanic(&empty)
+		if raised != nil {
+			t.Errorf("a ProposalOrRef typed %#02x with no arm at all panicked in the encoder: %v", one, raised)
+			continue
+		}
+		if !errors.Is(err, ErrContentArmMismatch) {
+			t.Errorf("a ProposalOrRef typed %#02x with no arm at all encoded to %x with %v, want ErrContentArmMismatch", one, encoded, err)
+			continue
+		}
+		armless += 1
+	}
+
+	// and more than one arm, over every PAIR the derivation produces. This is the count, and
+	// what it prevents is two distinct values sharing one encoding: whichever arm the
+	// discriminant does not name is dropped, silently, out of bytes that get signed.
+	pairs := 0
+	for _, one := range named {
+		for i := 0; i < len(fields); i += 1 {
+			for j := i + 1; j < len(fields); j += 1 {
+				both := ProposalOrRef{Type: one}
+				populate[fields[i]](&both)
+				populate[fields[j]](&both)
+				encoded, raised, err := marshalCatchingPanic(&both)
+				if raised != nil {
+					t.Errorf("a ProposalOrRef typed %#02x carrying both the %s and the %s arm panicked in the encoder: %v", one, fields[i], fields[j], raised)
+					continue
+				}
+				if !errors.Is(err, ErrContentArmMismatch) {
+					t.Errorf("a ProposalOrRef typed %#02x carrying both the %s and the %s arm encoded to %x with %v; one of the two is nowhere in those octets, so it encodes identically to the value that never carried it and the signature over the commit covers neither",
+						one, fields[i], fields[j], encoded, err)
+					continue
+				}
+				pairs += 1
+			}
+		}
+	}
+
+	if want := len(named) * (len(fields) - 1); foreign != want {
+		t.Fatalf("%d of the %d (code point, foreign arm) pairs were refused", foreign, want)
+	}
+	if armless != len(named) {
+		t.Fatalf("%d of the %d armless ProposalOrRefs were refused", armless, len(named))
+	}
+	if want := len(named) * len(fields) * (len(fields) - 1) / 2; pairs != want {
+		t.Fatalf("%d of the %d (code point, arm pair) combinations were refused", pairs, want)
+	}
+	t.Logf("%d foreign arms, %d armless values and %d double armed values refused across %d ProposalOrRef code points",
+		foreign, armless, pairs, len(named))
+}
+
+// TestEveryProposalOrRefTypeCodePointIsPinnedByTwoIndependentReadingsOfTheRfc pins proposal(1)
+// and reference(2) against a reading that is not the enum transcription that declares them.
+//
+// ProposalType one screen up is pinned twice, by section 7.2 and by section 17.5.
+// ProposalOrRefType had ONE value reading: rfc9420Section124ProposalOrRefTypes. The list beside
+// it deliberately carries no values -- it says which members have a body -- so a hand that
+// swapped the two constants in proposal_wire.go and swapped them again in the transcription
+// that guards them agreed with itself and nothing here noticed. Measured. That is the exact
+// shape ExtensionTypeExternalSenders shipped in at external_pub's code point.
+//
+// The second reading is the select four lines below the enum on the same page. It is a
+// different construct and it carries information the values must agree with: RFC 9420 writes an
+// enum's members in ascending code point order and writes the select's cases in the enum's own
+// order, so the k-th case is the k-th assigned code point. The ORDER is a fact about the
+// document that a transcriber who mistyped the values did not also have to get wrong, and the
+// struct it is read out of is quoted verbatim above the list.
+//
+// A swapped ProposalOrRefType is not a compile error and not a bad encoding. It makes this
+// implementation write an inline proposal under the octet every peer reads as a reference, and
+// read a peer's reference as an inline proposal -- a different structure entirely, under a
+// discriminant that decides which. Nothing that round trips its own output can see it.
+func TestEveryProposalOrRefTypeCodePointIsPinnedByTwoIndependentReadingsOfTheRfc(t *testing.T) {
+	// the enum's values are the dense octet run it writes -- reserved(0), proposal(1),
+	// reference(2) -- with no gap for a name to slide through
+	assigned := slices.Sorted(maps.Values(rfc9420Section124ProposalOrRefTypes))
+	dense := []uint64{}
+	for i := range assigned {
+		dense = append(dense, uint64(i))
+	}
+	if !slices.Equal(assigned, dense) {
+		t.Fatalf("the section 12.4 enum transcription assigns %v, and section 12.4 writes reserved(0) followed by one consecutive octet per member; a gap means a member was dropped or mistyped", assigned)
+	}
+
+	// and the names, ordered by the value the enum gives them, are the order the RFC writes
+	// them in: the reserved zero the select takes no case for, then the select's cases as the
+	// struct lists them
+	byValue := slices.SortedFunc(maps.Keys(rfc9420Section124ProposalOrRefTypes), func(a string, b string) int {
+		return int(rfc9420Section124ProposalOrRefTypes[a]) - int(rfc9420Section124ProposalOrRefTypes[b])
+	})
+	written := append([]string{"reserved"}, rfc9420Section124ProposalOrRefSelectCases...)
+	if !slices.Equal(byValue, written) {
+		t.Fatalf("the section 12.4 enum transcription orders the members %v by code point and the select four lines below it writes its cases in the order %v; two readings of one page disagree about which name holds which octet",
+			byValue, written)
+	}
+
+	// the pin, joined to what the package actually declares. Both directions: a constant with
+	// no row is a code point no reading covers, and a row with no constant is a member this
+	// package cannot name.
+	byRfcName := map[string]uint64{}
+	for name, value := range registryConstantsOfType(t, "ProposalOrRefType") {
+		rfcName := rfcNameOfRegistryConstant("ProposalOrRefType", name)
+		if other, repeated := byRfcName[rfcName]; repeated {
+			t.Fatalf("two constants fold to the RFC name %s, at %d and %d", rfcName, other, value)
+		}
+		byRfcName[rfcName] = value
+	}
+	if !maps.Equal(byRfcName, rfc9420Section124ProposalOrRefTypes) {
+		t.Fatalf("package mls reads ProposalOrRefType as %v and RFC 9420 section 12.4 writes %v", byRfcName, rfc9420Section124ProposalOrRefTypes)
+	}
+	t.Logf("%d ProposalOrRefType code points pinned by the enum and by the order of the select cases that consume it", len(byRfcName))
+}
+
+// TestEveryProposalTypeThatNamesNoArmRefusesEveryRegisteredArm is checkArm's DEFAULT clause,
+// which nothing observed.
+//
+// The cross product test at the end of this file sweeps the seven registered types against the
+// seven registered arms and never pairs an UNREGISTERED type with one, so the eighth branch of
+// checkArm -- the nil check on UnknownBody that stands in for an arm a GREASE code point does
+// not have -- was unobserved: deleting it left the whole of ./mls/... and ./message/... green.
+//
+// What it prevents is this file's headline failure on the one path the verbatim sweep does not
+// reach. Proposal{ProposalType: 0x0a0a, Add: &Add{...}} passes the count with one arm, falls
+// through the marshal switch because 0x0a0a is unregistered, and emits a bare two octet
+// discriminant with the Add nowhere in the bytes. A populated arm disappears from the encoding
+// and the ProposalRef over it names a proposal that says something else.
+//
+// Both halves of the class are derived. The code points are the 16 bit space against the
+// registry's own declarations, the same reading
+// TestEveryProposalTypeWithNoArmIsCarriedVerbatimOverTheWholeSixteenBitSpace uses, so GREASE,
+// the reserved zero and every unassigned point in between are covered without being listed. The
+// arms are reflect over Proposal, less UnknownBody -- excluded by the reading the default clause
+// itself uses, since for an unregistered type UnknownBody IS the arm and that shape is the
+// verbatim one the sweep above states.
+func TestEveryProposalTypeThatNamesNoArmRefusesEveryRegisteredArm(t *testing.T) {
+	armed := map[ProposalType]bool{}
+	for _, value := range registryConstantsOfType(t, "ProposalType") {
+		// the reserved zero is excluded by its VALUE and not by its name: it names no arm, so
+		// it belongs to the class swept here rather than to the registered one
+		if value == uint64(ProposalTypeReserved) {
+			continue
+		}
+		armed[ProposalType(value)] = true
+	}
+	if len(armed) == 0 {
+		t.Fatal("no proposal type was derived as naming an arm, so this sweep would run over the whole space and say nothing")
+	}
+	arms := []string{}
+	for _, field := range proposalArmFields(t) {
+		if field == "UnknownBody" {
+			continue
+		}
+		arms = append(arms, field)
+	}
+	if len(arms) == 0 {
+		t.Fatal("the derivation left no registered arm to carry, so this sweep observed nothing")
+	}
+
+	refused, swept := 0, 0
+	for candidate := 0; candidate <= 0xffff; candidate += 1 {
+		proposalType := ProposalType(candidate)
+		if armed[proposalType] {
+			continue
+		}
+		swept += 1
+		for _, field := range arms {
+			// exactly one arm, and no UnknownBody: the count is satisfied and the only thing
+			// that can refuse this is the default clause's own check
+			carrying := Proposal{ProposalType: proposalType}
+			held := reflect.ValueOf(&carrying).Elem().FieldByName(field)
+			switch held.Kind() {
+			case reflect.Pointer:
+				held.Set(reflect.New(held.Type().Elem()))
+			case reflect.Slice:
+				held.Set(reflect.ValueOf([]byte{0x00}).Convert(held.Type()))
+			default:
+				t.Fatalf("%s came out of the derivation and is neither a pointer nor a slice", field)
+			}
+			encoded, raised, err := marshalCatchingPanic(&carrying)
+			if raised != nil {
+				t.Fatalf("a proposal typed %#04x, which names no arm, carrying the %s arm panicked in the encoder: %v", candidate, field, raised)
+			}
+			if !errors.Is(err, ErrContentArmMismatch) {
+				t.Fatalf("a proposal typed %#04x, which names no arm, carrying the %s arm encoded to %x with %v, want ErrContentArmMismatch; the arm is nowhere in those octets and the ProposalRef over them names a proposal that says something else",
+					candidate, field, encoded, err)
+			}
+			refused += 1
+		}
+	}
+	if want := swept * len(arms); refused != want {
+		t.Fatalf("%d of the %d (unregistered code point, registered arm) pairs were refused", refused, want)
+	}
+	if swept+len(armed) != 1<<16 {
+		t.Fatalf("the derivation split the %d proposal type code points into %d naming an arm and %d naming none", 1<<16, len(armed), swept)
+	}
+	t.Logf("%d registered arms refused under each of %d code points that name no arm", len(arms), swept)
+}
+
+// TestAProposalDecodeLeavesNoFieldOfThePreviousValueBehind is the property
+// Proposal.UnmarshalMLS's own comment claims for its receiver reset: no field of a previous
+// value survives into a decode of different bytes.
+//
+// Nothing asserted it. Replacing the whole-receiver reset with an assignment to ProposalType
+// alone left the whole of ./mls/... and ./message/... green, and with the reset gone a caller
+// that reuses one Proposal across decodes reads a stale arm off the decoded value -- decode a
+// Remove into a receiver that last held an Add and decoded.Add is still populated. The
+// re-encode of that value then refuses on the arm count rather than round tripping, so the
+// bytes a peer sent become a proposal this package will not write back.
+//
+// The class is the cross product of the published arm layouts with themselves, plus the
+// unregistered shape, which carries the two fields no registered arm does. The comparison is
+// against a decode of the SAME octets into a fresh receiver, so what it observes is every field
+// at once rather than the ones a table thought to name.
+func TestAProposalDecodeLeavesNoFieldOfThePreviousValueBehind(t *testing.T) {
+	goldens := map[string][]byte{}
+	for _, sample := range proposalArmSamples(t) {
+		goldens[sample.field] = sample.golden
+	}
+	// the unregistered shape belongs to the class in both directions: a receiver that last
+	// held a verbatim body must not carry UnknownType or UnknownBody into a decode of a
+	// registered arm, and a receiver that last held an arm must not carry it into this one.
+	goldens["unregistered"] = []byte{0x0a, 0x0a, 0xde, 0xad}
+	if len(goldens) < 3 {
+		t.Fatalf("the table holds %d layouts, which is too few to state anything about reuse", len(goldens))
+	}
+	names := slices.Sorted(maps.Keys(goldens))
+
+	reused := 0
+	for _, previous := range names {
+		for _, next := range names {
+			// the receiver is loaded by DECODING rather than by assignment, so what it holds
+			// when the second decode arrives is a value this codec actually produces
+			receiver := Proposal{}
+			if err := syntax.Unmarshal(goldens[previous], &receiver); err != nil {
+				t.Fatalf("%s: the golden did not decode: %v", previous, err)
+			}
+			if err := syntax.Unmarshal(goldens[next], &receiver); err != nil {
+				t.Fatalf("%s decoded into a receiver that last held %s: %v", next, previous, err)
+			}
+			fresh := Proposal{}
+			if err := syntax.Unmarshal(goldens[next], &fresh); err != nil {
+				t.Fatalf("%s: the golden did not decode into a fresh receiver: %v", next, err)
+			}
+			if !reflect.DeepEqual(receiver, fresh) {
+				t.Errorf("the %s layout decoded into a receiver that last held %s produced\n %+v\nand into a fresh receiver produced\n %+v\na field of the previous value survived the decode",
+					next, previous, receiver, fresh)
+				continue
+			}
+			// and the consequence, stated rather than left to be inferred: a value carrying a
+			// stale arm no longer re-encodes to the octets it was decoded from
+			reencoded, raised, err := marshalCatchingPanic(&receiver)
+			if raised != nil {
+				t.Errorf("%s decoded into a receiver that last held %s panicked on re-encode: %v", next, previous, raised)
+				continue
+			}
+			if err != nil || !bytes.Equal(reencoded, goldens[next]) {
+				t.Errorf("%s decoded into a receiver that last held %s re-encoded to %x with %v, want %x; the bytes a peer sent came back as something this package will not write",
+					next, previous, reencoded, err, goldens[next])
+				continue
+			}
+			reused += 1
+		}
+	}
+	if want := len(names) * len(names); reused != want {
+		t.Fatalf("%d of the %d (previous, next) reuses were clean", reused, want)
+	}
+	t.Logf("%d layouts decoded into a receiver holding each of them, %d reuses judged", len(names), reused)
+}
+
+// TestAProposalOrRefDecodeThatRefusesLeavesTheReceiverAsItFoundIt is the property
+// ProposalOrRef.UnmarshalMLS's doc comment claims when it says it stages into a local --
+// Sender's and Credential's staging, for their reason.
+//
+// Nothing asserted it. Making the receiver write eager left the targeted suite and the whole of
+// ./mls/... and ./message/... green, and what an eager write leaves behind is a caller's value
+// carrying the DISCRIMINANT of a message that was refused: Type says an inline proposal is here
+// and the arm beside it is whatever the value held before. A decoder that refuses has said the
+// octets are not a ProposalOrRef, and a caller that keeps its previous value is entitled to
+// still have it.
+//
+// The refused class is derived rather than picked: every proper prefix of every encoding the
+// arm table produces, plus every octet that names no arm, bare and with a tail so a refusal
+// that was really a truncation cannot pass for a refusal of the discriminant.
+func TestAProposalOrRefDecodeThatRefusesLeavesTheReceiverAsItFoundIt(t *testing.T) {
+	armOf := proposalOrRefArmOfEachType(t)
+	populate := proposalOrRefArmValues()
+	named := slices.Sorted(maps.Keys(armOf))
+
+	refusals := [][]byte{}
+	for _, one := range named {
+		value := ProposalOrRef{Type: one}
+		populate[armOf[one]](&value)
+		encoded, err := syntax.Marshal(&value)
+		if err != nil {
+			t.Fatalf("a ProposalOrRef typed %#02x carrying its own %s arm did not encode: %v", one, armOf[one], err)
+		}
+		for cut := 0; cut < len(encoded); cut += 1 {
+			refusals = append(refusals, encoded[:cut])
+		}
+	}
+	for candidate := 0; candidate <= 0xff; candidate += 1 {
+		if _, names := armOf[ProposalOrRefType(candidate)]; names {
+			continue
+		}
+		refusals = append(refusals, []byte{byte(candidate)}, []byte{byte(candidate), 0xde, 0xad})
+	}
+	// and the one refusal that is neither a truncation nor an unknown octet: a reference of no
+	// octets, which is wire legal and which this decoder refuses on its encoder's terms
+	refusals = append(refusals, []byte{byte(ProposalOrRefTypeReference), 0x00})
+	if len(refusals) < 4 {
+		t.Fatalf("the derivation produced %d refusable encodings, which is too few to state anything", len(refusals))
+	}
+
+	// the value the receiver is loaded with, produced by this codec rather than assembled
+	priorOctets, err := syntax.Marshal(&ProposalOrRef{Type: ProposalOrRefTypeReference, Reference: ProposalRef{0x11, 0x22}})
+	if err != nil {
+		t.Fatalf("the prior value did not encode: %v", err)
+	}
+	prior := ProposalOrRef{}
+	if err := syntax.Unmarshal(priorOctets, &prior); err != nil {
+		t.Fatalf("the prior value did not decode: %v", err)
+	}
+
+	held := 0
+	for _, encoded := range refusals {
+		receiver := ProposalOrRef{}
+		if err := syntax.Unmarshal(priorOctets, &receiver); err != nil {
+			t.Fatalf("the prior value did not decode into the receiver: %v", err)
+		}
+		if err := syntax.Unmarshal(encoded, &receiver); err == nil {
+			t.Errorf("%x decoded to %+v rather than being refused, so this row says nothing about what a refusal leaves behind", encoded, receiver)
+			continue
+		}
+		if !reflect.DeepEqual(receiver, prior) {
+			t.Errorf("the refused decode of %x left the caller's value as %+v, and it was %+v; a decoder that refuses has said these octets are not a ProposalOrRef, and the discriminant of one it refused is now on a value somebody else built",
+				encoded, receiver, prior)
+			continue
+		}
+		held += 1
+	}
+	if held != len(refusals) {
+		t.Fatalf("%d of the %d refused decodes left the receiver alone", held, len(refusals))
+	}
+	t.Logf("%d refused ProposalOrRef decodes left the caller's value untouched", held)
 }

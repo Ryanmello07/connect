@@ -321,30 +321,95 @@ type ProposalOrRef struct {
 	Reference ProposalRef
 }
 
-// MarshalMLS refuses before it writes, for Proposal.checkArm's reason: a ProposalOrRef sits
-// inside a Commit inside a FramedContent that is signed.
+// checkArm reports whether the arm Type names is populated and is the ONLY one populated.
 //
-// An empty reference is refused rather than written. A zero length opaque<V> is wire legal and
-// is the encoding of "no reference", so a commit carrying one names a proposal that cannot be
-// looked up -- and it names it identically to every other commit that made the same mistake,
-// which is worse than naming nothing.
-func (self *ProposalOrRef) MarshalMLS(w *syntax.Writer) error {
+// It is Proposal.checkArm one type up, and it is here for both of that method's reasons.
+//
+// The per-case half is what stands between a ProposalOrRef whose discriminant names an inline
+// proposal and self.Proposal.MarshalMLS(w) on a nil pointer -- the same dereference the seven
+// per-case checks one type down exist to prevent, on the sibling type twelve lines further
+// along this file.
+//
+// The COUNT is the other half and it is the one a per-case check alone does not give. Without
+// it a value carrying BOTH an inline proposal and a reference encodes to the arm its
+// discriminant names and drops the other, so two distinct ProposalOrRef values write the same
+// octets and the arm the caller set is nowhere in them. These octets go inside a Commit inside
+// a FramedContent that is SIGNED: the signer would sign a commit that does not say what it was
+// handed, and the peer would apply the one arm that survived.
+//
+// The discriminant is judged FIRST, before the count. A type outside the registry names no arm
+// at all, so a value under one is refused for its TYPE rather than for whichever arm it happens
+// to carry. That is the distinction
+// TestProposalOrRefRefusesEveryCodePointThatNamesNoArmOnBothHalves reads, sweeping the
+// unregistered octets with BOTH arms populated so a lost discriminant check cannot pass for a
+// refusal of the body.
+//
+// The count is two lines of source and the class it stands for is derived off reflect over this
+// struct by TestEveryProposalOrRefTypeRefusesEveryArmThatIsNotItsOwn, so a third arm added here
+// with no line beside it fails there rather than being dropped on the floor.
+func (self *ProposalOrRef) checkArm() error {
+	switch self.Type {
+	case ProposalOrRefTypeProposal, ProposalOrRefTypeReference:
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownProposalOrRefType, self.Type)
+	}
+	// counted on nil rather than on length, which is Proposal.checkArm's UnknownBody
+	// convention and is here for its reason: an empty but PRESENT reference is a caller who
+	// believes it set one, and counting that as absent would let it share an encoding with a
+	// value carrying no reference at all. The zero LENGTH is refused below, separately, and
+	// says something different -- that the reference names nothing.
+	populated := 0
+	for _, set := range []bool{
+		self.Proposal != nil,
+		self.Reference != nil,
+	} {
+		if set {
+			populated += 1
+		}
+	}
+	if populated != 1 {
+		return fmt.Errorf("%w: ProposalOrRef %d carries %d populated arms", ErrContentArmMismatch, self.Type, populated)
+	}
 	switch self.Type {
 	case ProposalOrRefTypeProposal:
 		if self.Proposal == nil {
-			return ErrContentArmMismatch
+			return fmt.Errorf("%w: ProposalOrRef %d names an inline proposal and the arm it carries is not one", ErrContentArmMismatch, self.Type)
 		}
-		w.WriteUint8(uint8(self.Type))
-		return self.Proposal.MarshalMLS(w)
 	case ProposalOrRefTypeReference:
+		// there is deliberately no nil check beside the length check below: one line does both
+		// jobs on this arm, because a nil Reference has zero length. The value whose
+		// discriminant names a reference and whose populated arm is the inline proposal and
+		// the value that set an empty reference are refused by the same comparison. The
+		// Proposal arm above needs its own nil check because a pointer has no length to fall
+		// through to -- and a guard that cannot fire is a guard no test can hold, which is how
+		// this one was found.
+		//
+		// An empty reference is refused rather than written. A zero length opaque<V> is wire
+		// legal and is the encoding of "no reference", so a commit carrying one names a
+		// proposal that cannot be looked up -- and it names it identically to every other
+		// commit that made the same mistake, which is worse than naming nothing.
 		if len(self.Reference) == 0 {
-			return ErrContentArmMismatch
+			return fmt.Errorf("%w: a proposal reference of no octets names nothing", ErrContentArmMismatch)
 		}
-		w.WriteUint8(uint8(self.Type))
-		w.WriteOpaque(self.Reference)
-		return nil
 	}
-	return fmt.Errorf("%w: %d", ErrUnknownProposalOrRefType, self.Type)
+	return nil
+}
+
+// MarshalMLS refuses before it writes, for Proposal.checkArm's reason: a ProposalOrRef sits
+// inside a Commit inside a FramedContent that is signed, and syntax.Marshal joins a semantic
+// refusal with whatever the Writer already holds, so an encoder that wrote its discriminant and
+// then refused would leave a caller that ignored the return value holding one octet of a
+// ProposalOrRef that does not exist.
+func (self *ProposalOrRef) MarshalMLS(w *syntax.Writer) error {
+	if err := self.checkArm(); err != nil {
+		return err
+	}
+	w.WriteUint8(uint8(self.Type))
+	if self.Type == ProposalOrRefTypeProposal {
+		return self.Proposal.MarshalMLS(w)
+	}
+	w.WriteOpaque(self.Reference)
+	return nil
 }
 
 // UnmarshalMLS reads the discriminant, reads the arm it selects, and only then writes the
