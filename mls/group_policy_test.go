@@ -393,12 +393,34 @@ func TestGroupPolicyRequiresExactlyOneOwner(t *testing.T) {
 	}
 }
 
+// TestGroupPolicyRejectsUnknownRoleByte is the plan's test with the reason its refusal names
+// asserted, and the assertion is not a nicety.
+//
+// As the plan wrote it the policy held ONE entry carrying role byte 9 and no owner at all, so
+// Encode refused it with ErrNoOwner and "err != nil" was satisfied by the missing owner. Measured:
+// with Role.valid rewritten to answer true for every byte -- the whole role gate, both sides of
+// the wire, deleted -- the plan's test still passed. So the policy here carries a real owner
+// beside the undefined byte, and the sentinel and the clause are both named.
 func TestGroupPolicyRejectsUnknownRoleByte(t *testing.T) {
 	crypto := testCrypto(t)
 	a := testIdentity(t, crypto, "a")
-	policy := &GroupPolicyExtension{Roles: []RoleEntry{{MemberId: a.IdentityPub, Role: Role(9)}}}
-	if _, err := policy.Encode(); err == nil {
+	b := testIdentity(t, crypto, "b")
+	policy := &GroupPolicyExtension{Roles: []RoleEntry{
+		{MemberId: a.IdentityPub, Role: RoleOwner},
+		{MemberId: b.IdentityPub, Role: Role(9)},
+	}}
+	if err := policy.Canonicalize(); err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	_, err := policy.Encode()
+	if err == nil {
 		t.Fatal("Encode accepted role byte 9")
+	}
+	if !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("Encode answered %v, want ErrMalformedExtension", err)
+	}
+	if !strings.Contains(err.Error(), "role byte 9") {
+		t.Fatalf("Encode answered %q, which does not name the role byte; this refusal has to be the role gate and not the owner count standing in front of it", err)
 	}
 }
 
@@ -751,8 +773,26 @@ func groupPolicyRefusalSitesOf(t *testing.T) []groupPolicyRefusalSite {
 }
 
 // groupPolicyRefusalRow is one input that reaches one site.
+//
+// A row states EITHER a policy or a call. The policy form is for the sites inside Validate, and
+// it is what lets the encode gate below be held to the same derived class rather than to the two
+// refusals somebody thought of: a row that carried only a closure could be run, but nothing else
+// could ask what value it was about.
 type groupPolicyRefusalRow struct {
-	call func(t *testing.T) error
+	policy *GroupPolicyExtension
+	call   func(t *testing.T) error
+}
+
+// run is the row's input, whichever form it was written in.
+func (self groupPolicyRefusalRow) run(t *testing.T) error {
+	t.Helper()
+	if self.call != nil {
+		return self.call(t)
+	}
+	if self.policy == nil {
+		t.Fatal("a refusal row states neither a policy nor a call, so it observes nothing")
+	}
+	return self.policy.Validate()
 }
 
 // the two member ids the rows order against, fixed rather than minted, so the row that claims an
@@ -825,39 +865,27 @@ func groupPolicyRefusalRows() map[string]groupPolicyRefusalRow {
 			}).encodeUnchecked()
 			return err
 		}},
-		"(*GroupPolicyExtension).Validate:ErrMalformedExtension#0": {call: func(t *testing.T) error {
-			return (&GroupPolicyExtension{
-				Roles: []RoleEntry{{MemberId: groupPolicyLowId, Role: Role(9)}},
-			}).Validate()
+		"(*GroupPolicyExtension).Validate:ErrMalformedExtension#0": {policy: &GroupPolicyExtension{
+			Roles: []RoleEntry{{MemberId: groupPolicyLowId, Role: Role(9)}},
 		}},
-		"(*GroupPolicyExtension).Validate:ErrMalformedExtension#1": {call: func(t *testing.T) error {
-			return (&GroupPolicyExtension{
-				Roles: []RoleEntry{{MemberId: nil, Role: RoleOwner}},
-			}).Validate()
+		"(*GroupPolicyExtension).Validate:ErrMalformedExtension#1": {policy: &GroupPolicyExtension{
+			Roles: []RoleEntry{{MemberId: nil, Role: RoleOwner}},
 		}},
-		"(*GroupPolicyExtension).Validate:ErrRolesNotCanonical#0": {call: func(t *testing.T) error {
-			return (&GroupPolicyExtension{Roles: []RoleEntry{
-				{MemberId: groupPolicyHighId, Role: RoleOwner},
-				{MemberId: groupPolicyLowId, Role: RoleMember},
-			}}).Validate()
+		"(*GroupPolicyExtension).Validate:ErrRolesNotCanonical#0": {policy: &GroupPolicyExtension{Roles: []RoleEntry{
+			{MemberId: groupPolicyHighId, Role: RoleOwner},
+			{MemberId: groupPolicyLowId, Role: RoleMember},
+		}}},
+		"(*GroupPolicyExtension).Validate:ErrDuplicateRoleEntry#0": {policy: &GroupPolicyExtension{Roles: []RoleEntry{
+			{MemberId: groupPolicyLowId, Role: RoleOwner},
+			{MemberId: groupPolicyLowId, Role: RoleMember},
+		}}},
+		"(*GroupPolicyExtension).Validate:ErrNoOwner#0": {policy: &GroupPolicyExtension{
+			Roles: []RoleEntry{{MemberId: groupPolicyLowId, Role: RoleMember}},
 		}},
-		"(*GroupPolicyExtension).Validate:ErrDuplicateRoleEntry#0": {call: func(t *testing.T) error {
-			return (&GroupPolicyExtension{Roles: []RoleEntry{
-				{MemberId: groupPolicyLowId, Role: RoleOwner},
-				{MemberId: groupPolicyLowId, Role: RoleMember},
-			}}).Validate()
-		}},
-		"(*GroupPolicyExtension).Validate:ErrNoOwner#0": {call: func(t *testing.T) error {
-			return (&GroupPolicyExtension{
-				Roles: []RoleEntry{{MemberId: groupPolicyLowId, Role: RoleMember}},
-			}).Validate()
-		}},
-		"(*GroupPolicyExtension).Validate:ErrMultipleOwners#0": {call: func(t *testing.T) error {
-			return (&GroupPolicyExtension{Roles: []RoleEntry{
-				{MemberId: groupPolicyLowId, Role: RoleOwner},
-				{MemberId: groupPolicyHighId, Role: RoleOwner},
-			}}).Validate()
-		}},
+		"(*GroupPolicyExtension).Validate:ErrMultipleOwners#0": {policy: &GroupPolicyExtension{Roles: []RoleEntry{
+			{MemberId: groupPolicyLowId, Role: RoleOwner},
+			{MemberId: groupPolicyHighId, Role: RoleOwner},
+		}}},
 		"(*GroupPolicyExtension).Canonicalize:ErrDuplicateRoleEntry#0": {call: func(t *testing.T) error {
 			return (&GroupPolicyExtension{Roles: []RoleEntry{
 				{MemberId: groupPolicyHighId, Role: RoleOwner},
@@ -865,6 +893,52 @@ func groupPolicyRefusalRows() map[string]groupPolicyRefusalRow {
 			}}).Canonicalize()
 		}},
 	}
+}
+
+// TestEncodeRefusesEveryPolicyValidateRefuses is the encode gate, held to the DERIVED class of
+// Validate's refusals rather than to the one or two an encode test would have thought of.
+//
+// Encode's whole contribution over encodeUnchecked is the Validate call in front of it, and that
+// call is one line: delete it and every test in this file still passes, because the codec refuses
+// an undefined role byte on its own and nothing else here asks Encode about a policy Validate
+// would refuse. What that would ship is an encoder that produces a two owner or non canonical
+// group policy, which then goes into a group context, is covered by the confirmed transcript
+// hash, and is refused by every peer -- at the far end, with nothing pointing back at the encode.
+//
+// The class is the Validate sites the scan above reads, so a clause added to Validate is asked of
+// Encode too by the commit that writes it.
+func TestEncodeRefusesEveryPolicyValidateRefuses(t *testing.T) {
+	rows := groupPolicyRefusalRows()
+	covered := 0
+	for _, one := range groupPolicyRefusalSitesOf(t) {
+		if !strings.HasPrefix(one.site, "(*GroupPolicyExtension).Validate:") {
+			continue
+		}
+		row, held := rows[one.site]
+		if !held || row.policy == nil {
+			t.Errorf("%s has no policy on its row, so Encode is not asked about the value that refusal is about", one.site)
+			continue
+		}
+		covered += 1
+		sentinel, named := lifecycleOwnedErrors[one.sentinel]
+		if !named {
+			t.Errorf("%s answers %s, which is not a lifecycle sentinel", one.site, one.sentinel)
+			continue
+		}
+		encoded, err := row.policy.Encode()
+		if !errors.Is(err, sentinel) {
+			t.Errorf("Encode over the policy %s is about answered %v, want %s; the gate in front of the encoder is one line and nothing else in this file asks about it",
+				one.site, err, one.sentinel)
+		}
+		if len(encoded.ExtensionData) != 0 || encoded.ExtensionType != 0 {
+			t.Errorf("Encode answered the entry %+v beside its refusal for %s; a refused policy must never reach a caller as bytes it could sign",
+				encoded, one.site)
+		}
+	}
+	if covered == 0 {
+		t.Fatalf("no refusal site of %s sits inside Validate, so this gate asked Encode about nothing", groupPolicySourceFile)
+	}
+	t.Logf("Encode is held to the %d refusals Validate makes", covered)
 }
 
 // TestEveryRefusalTheGroupPolicyMakesHasAnInputThatProducesItAndAnswersNoOther is guardrail 5 over
@@ -915,7 +989,7 @@ func TestEveryRefusalTheGroupPolicyMakesHasAnInputThatProducesItAndAnswersNoOthe
 				one.site, one.sentinel)
 			continue
 		}
-		err := rows[one.site].call(t)
+		err := rows[one.site].run(t)
 		if err == nil {
 			t.Errorf("%s: the input for this refusal was accepted", one.site)
 			continue
