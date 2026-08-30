@@ -16,6 +16,13 @@
 // list of a class understated the class, and the plan's own draft of this test held ten sentinel
 // names in a slice literal, which is exactly the shape that goes stale the day an eleventh
 // refusal lands.
+//
+// It answers in TWO verdicts and both are asserted, because "some test names this refusal" and
+// "some code a test runs names this refusal" are different statements, and the gap between them is
+// where a refusal loses its last real assertion while the roster goes on reporting it watched. And
+// the scan itself is swept under every file name this package's directory holds, because a roster
+// that can tell "read nothing" from "found nothing" still cannot tell either of those from "read
+// all but one file".
 package mls
 
 import (
@@ -470,7 +477,8 @@ type refusalSource struct {
 // The parts are kept separate rather than reduced to a verdict, because each of them is a way the
 // scan can go quiet, and a scan that has gone quiet issues the real source exactly the clean bill
 // a working one issues. An empty refusals map means no refusal site was recognised; an empty
-// namedBy means no test was recognised; and either one on its own reports zero unnamed refusals.
+// namedBy or exercisedBy means no test was recognised; and any one of them on its own reports zero
+// unnamed and zero unexercised refusals.
 type refusalScan struct {
 	// every package level variable of the non test source that some function answers at an
 	// error result, mapped to the file declaring it. this is the roster: a refusal is a value a
@@ -479,6 +487,10 @@ type refusalScan struct {
 	// identifiers the test binary names, mapped to the test that names them -- directly, or
 	// through one package level declaration of the test binary that the test itself names.
 	namedBy map[string]string
+	// identifiers named from inside code a Test can reach and RUN, mapped to the declaration
+	// whose body names them. the naming side above counts a mention in a table; this one counts
+	// only a mention in a body, and the two disagree over three of this package's refusals.
+	exercisedBy map[string]string
 	// package level variables the non test source declares and never answers at an error
 	// result. outside the roster by construction, and reported so the number is visible.
 	declaredNotReturned []string
@@ -489,6 +501,28 @@ func (self refusalScan) unnamed() []string {
 	missing := []string{}
 	for name := range self.refusals {
 		if _, named := self.namedBy[name]; !named {
+			missing = append(missing, name)
+		}
+	}
+	slices.Sort(missing)
+	return missing
+}
+
+// unexercised is the roster's second verdict: the refusals that no code a test reaches names.
+//
+// Separate from unnamed because they are different failures, and the difference was measured
+// rather than reasoned. A refusal reported unnamed has nothing in the test binary mentioning it at
+// all. A refusal reported unexercised IS mentioned -- but only in data: a table that enumerates
+// sentinel names, which states that a name exists and cannot state that any branch answers it,
+// because there is no branch in it. Three of this package's refusals sit in exactly that position:
+// ErrLeafHasNoChildren, ErrRootHasNoParent and ErrRootHasNoSibling are listed in
+// treeMathOwnedErrors so the error class sweeps can run over them, and with their real assertions
+// -- the errors.Is rows inside checkNodeInvariants -- replaced by `err == nil`, the naming side
+// went on reporting a clean bill over all of them.
+func (self refusalScan) unexercised() []string {
+	missing := []string{}
+	for name := range self.refusals {
+		if _, exercised := self.exercisedBy[name]; !exercised {
 			missing = append(missing, name)
 		}
 	}
@@ -570,6 +604,66 @@ func packageLevelMentionsIn(parsed parsedSource, into map[string]map[string]bool
 	}
 }
 
+// executableMentionsIn maps each package level declaration of one file to the identifiers it
+// mentions from inside code that RUNS -- a function's body, or the body of a function literal
+// however deeply that literal sits inside a declaration's value.
+//
+// The data a declaration holds is deliberately not counted, and that is the whole difference
+// between this and packageLevelMentionsIn above. `var owned = map[string]error{"X": X}` mentions
+// X, and what the mention states is that X exists and belongs to a class; it cannot state that
+// anything answers X. A table whose rows are DRIVEN still counts here, through the body that
+// drives them -- nilArgumentRows is a function and its rows are written inside it, which is the
+// shape a table has when a test does more with it than list it.
+func executableMentionsIn(parsed parsedSource, into map[string]map[string]bool) {
+	for _, declaration := range parsed.file.Decls {
+		switch typed := declaration.(type) {
+		case *ast.FuncDecl:
+			if typed.Body == nil {
+				continue
+			}
+			name := typed.Name.Name
+			if typed.Recv != nil && len(typed.Recv.List) == 1 {
+				name = receiverTypeName(typed.Recv.List[0].Type) + "." + name
+			}
+			into[name] = identifiersIn(typed.Body)
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				switch typedSpec := spec.(type) {
+				case *ast.ValueSpec:
+					bodies := functionLiteralIdentifiersIn(typedSpec)
+					for _, ident := range typedSpec.Names {
+						if ident.Name != "_" {
+							into[ident.Name] = bodies
+						}
+					}
+				case *ast.TypeSpec:
+					into[typedSpec.Name.Name] = functionLiteralIdentifiersIn(typedSpec)
+				}
+			}
+		}
+	}
+}
+
+// functionLiteralIdentifiersIn is every identifier the BODIES of a node's function literals
+// mention, and nothing its data mentions.
+//
+// A closure written inside a table is code, and a sentinel named in one is named by something that
+// runs. A sentinel named in the row beside it is not.
+func functionLiteralIdentifiersIn(node ast.Node) map[string]bool {
+	found := map[string]bool{}
+	ast.Inspect(node, func(inner ast.Node) bool {
+		literal, isLiteral := inner.(*ast.FuncLit)
+		if !isLiteral || literal.Body == nil {
+			return true
+		}
+		for name := range identifiersIn(literal.Body) {
+			found[name] = true
+		}
+		return true
+	})
+	return found
+}
+
 // refusalSitesIn collects, out of one non test file, the package level variables its functions
 // answer at an error result.
 func refusalSitesIn(parsed parsedSource, path string, packageVars map[string]string,
@@ -605,6 +699,38 @@ func refusalSitesIn(parsed parsedSource, path string, packageVars map[string]str
 	}
 }
 
+// reachedFromTests is every package level declaration of the test binary a Test can reach: the
+// Test roots themselves, whatever they name, whatever that names, and so on to a fixed point.
+//
+// Transitive, where the naming side below stops at one hop, and the two depths answer different
+// questions. Naming asks whether anything in the test binary still mentions the sentinel, and a
+// mention arbitrarily far from anything a test runs is not evidence of that, so it stops.
+// Exercising asks whether a Test RUNS code that names it, and the code that does is routinely two
+// calls down: this package's tree math sentinels are asserted inside checkNodeInvariants, which no
+// Test body names -- three sweep helpers do, and the Tests name those. A one hop closure does not
+// reach it. The walk is also what says a declaration is reached at all, which matters in the other
+// direction: over two hundred of this package's test declarations are reachable from no Test, and
+// a sentinel named only in one of those is named by nothing that runs.
+func reachedFromTests(roots map[string]map[string]bool,
+	declarations map[string]map[string]bool) map[string]bool {
+	reached := map[string]bool{}
+	pending := slices.Sorted(maps.Keys(roots))
+	for len(pending) > 0 {
+		name := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if reached[name] {
+			continue
+		}
+		reached[name] = true
+		for mentioned := range declarations[name] {
+			if _, isDeclaration := declarations[mentioned]; isDeclaration && !reached[mentioned] {
+				pending = append(pending, mentioned)
+			}
+		}
+	}
+	return reached
+}
+
 // scanRefusals runs the whole roster over one package's sources.
 //
 // The naming side reaches ONE hop past a Test function and no further, and the depth is measured
@@ -625,7 +751,8 @@ func scanRefusals(sources []refusalSource) refusalScan {
 			packageVars[name] = source.path
 		}
 	}
-	scan := refusalScan{refusals: map[string]string{}, namedBy: map[string]string{}}
+	scan := refusalScan{refusals: map[string]string{}, namedBy: map[string]string{},
+		exercisedBy: map[string]string{}}
 	for _, source := range sources {
 		if source.isTest {
 			continue
@@ -641,11 +768,13 @@ func scanRefusals(sources []refusalSource) refusalScan {
 
 	roots := map[string]map[string]bool{}
 	testDeclarations := map[string]map[string]bool{}
+	testExecutable := map[string]map[string]bool{}
 	for _, source := range sources {
 		if !source.isTest {
 			continue
 		}
 		packageLevelMentionsIn(source.parsed, testDeclarations)
+		executableMentionsIn(source.parsed, testExecutable)
 		for _, declaration := range source.parsed.file.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
 			if !isFunction || function.Recv != nil || !strings.HasPrefix(function.Name.Name, "Test") {
@@ -672,6 +801,16 @@ func scanRefusals(sources []refusalSource) refusalScan {
 			}
 		}
 	}
+	// the second verdict, over the closure rather than one hop, and over bodies rather than over
+	// everything a declaration holds. sorted for the same reason the naming side is: the
+	// declaration credited with exercising a refusal is the same one on every run.
+	for _, declaration := range slices.Sorted(maps.Keys(reachedFromTests(roots, testDeclarations))) {
+		for name := range testExecutable[declaration] {
+			if _, already := scan.exercisedBy[name]; !already {
+				scan.exercisedBy[name] = declaration
+			}
+		}
+	}
 	return scan
 }
 
@@ -692,8 +831,15 @@ func refusalSourcesOfThisPackage(t *testing.T) []refusalSource {
 	return sources
 }
 
-// The control's production half. Four refusals and two values that are not refusals, so both
+// The control's production half. Five refusals and two values that are not refusals, so both
 // directions of the class are committed: what the roster must include, and what it must leave out.
+//
+// The five refusals are one per shape the two verdicts can disagree about. errNamedDirectly is
+// named and exercised; errNamedByNothing is neither; errNamedOnlyByAnUncalledHelper is named by a
+// body no test reaches, which is neither; and the two that cross are errNamedThroughATable, named
+// by a table and exercised by nothing, and errNamedByADeepHelper, exercised two calls below a Test
+// and named by nothing within one hop of it. A control holding only the agreeing shapes would let
+// either verdict be quietly reduced to the other.
 const refusalRosterProductionControl = `package control
 
 import (
@@ -704,6 +850,7 @@ import (
 var (
 	errNamedDirectly               = errors.New("control: a test body names this")
 	errNamedThroughATable          = errors.New("control: a table a test names names this")
+	errNamedByADeepHelper          = errors.New("control: a helper two calls below a test names this")
 	errNamedOnlyByAnUncalledHelper = errors.New("control: only a helper no test names names this")
 	errNamedByNothing              = errors.New("control: nothing names this")
 	errNeverReturned               = errors.New("control: no error result ever answers this")
@@ -720,6 +867,8 @@ func refuse(which int) ([]byte, error) {
 		return nil, errNamedOnlyByAnUncalledHelper
 	case 3:
 		return nil, errNamedByNothing
+	case 4:
+		return nil, errNamedByADeepHelper
 	}
 	return cachedTable, nil
 }
@@ -729,8 +878,8 @@ func reads() bool {
 }
 `
 
-// The control's test half: one Test naming a refusal directly and a table naming a second, and one
-// helper naming a third that no Test names at all.
+// The control's test half: one Test naming a refusal directly and a table naming a second, a chain
+// of two helpers naming a third, and one helper naming a fourth that no Test reaches at all.
 const refusalRosterTestControl = `package control
 
 import "testing"
@@ -741,6 +890,19 @@ func TestControlNamesOneDirectlyAndOneThroughATable(t *testing.T) {
 	if errNamedDirectly == nil || controlTable == nil {
 		t.Fatal("control")
 	}
+	if controlCallsAHelper() == nil {
+		t.Fatal("control")
+	}
+}
+
+// two calls below the Test, which is where this package's real assertions on the tree math
+// sentinels live and is one hop further than the naming side reaches.
+func controlCallsAHelper() error {
+	return controlHelperTheFirstOneCalls()
+}
+
+func controlHelperTheFirstOneCalls() error {
+	return errNamedByADeepHelper
 }
 
 func helperNoTestNames() error {
@@ -748,10 +910,65 @@ func helperNoTestNames() error {
 }
 `
 
-// The two the control's roster must report, and no others. Written out because this is the
-// control's own expected answer and not a class read off anything: a control whose expectation was
-// derived from the same code it is controlling states nothing.
-var refusalRosterControlUnnamed = []string{"errNamedByNothing", "errNamedOnlyByAnUncalledHelper"}
+// The whole answer the control commits, written out because this is the control's own expected
+// answer and not a class read off anything: a control whose expectation was derived from the same
+// code it is controlling states nothing.
+//
+// Three lists rather than one, because the roster answers in more than one way and each of them is
+// a way it can go quiet. The refusals are what the production scan must recognise; a scan that
+// recognised fewer would report every missing one as watched by nobody's test, which is the same
+// clean bill a working scan gives.
+var refusalRosterControlRefusals = []string{
+	"errNamedByADeepHelper", "errNamedByNothing", "errNamedDirectly",
+	"errNamedOnlyByAnUncalledHelper", "errNamedThroughATable",
+}
+
+// The refusals of the control that no test names within one hop of a Test body.
+var refusalRosterControlUnnamed = []string{
+	"errNamedByADeepHelper", "errNamedByNothing", "errNamedOnlyByAnUncalledHelper",
+}
+
+// The refusals of the control that no body a Test reaches names. It crosses the list above in both
+// directions on purpose: errNamedByADeepHelper is unnamed and exercised, errNamedThroughATable is
+// named and unexercised, and a roster that answered one verdict twice fails on both.
+var refusalRosterControlUnexercised = []string{
+	"errNamedByNothing", "errNamedOnlyByAnUncalledHelper", "errNamedThroughATable",
+}
+
+// assertRefusalRosterControl runs the control through the same scanRefusals the real package goes
+// through, under the file names it is handed, and holds it to that whole answer.
+//
+// The names are parameters because a scan can be narrowed per FILE, and a control that only ever
+// ran under "control.go" could not see that: it is the same file every time, so a predicate over
+// the path either excludes the control always -- which every assertion here catches -- or never.
+// TestTheRefusalRosterReadsAFileWhateverItIsNamed is what runs it under the names that matter.
+func assertRefusalRosterControl(t *testing.T, productionPath string, testPath string) {
+	t.Helper()
+	control := scanRefusals([]refusalSource{
+		{path: productionPath, parsed: mustParseText(t, productionPath, refusalRosterProductionControl)},
+		{path: testPath, parsed: mustParseText(t, testPath, refusalRosterTestControl), isTest: true},
+	})
+	if got := slices.Sorted(maps.Keys(control.refusals)); !slices.Equal(got, refusalRosterControlRefusals) {
+		t.Errorf("with the control's production half named %q the roster read the refusals %v, want %v; a refusal site it stops recognising is a refusal of the real source that nothing is watching",
+			productionPath, got, refusalRosterControlRefusals)
+	}
+	if got := control.unnamed(); !slices.Equal(got, refusalRosterControlUnnamed) {
+		t.Errorf("with the control named %q and %q the roster read %v as unnamed, want %v; a shape it lets through is a shape the real source can be written in, and a shape it reports is a refusal the real source would be failed for having",
+			productionPath, testPath, got, refusalRosterControlUnnamed)
+	}
+	if got := control.unexercised(); !slices.Equal(got, refusalRosterControlUnexercised) {
+		t.Errorf("with the control named %q and %q the roster read %v as unexercised, want %v; the two verdicts cross in this control, so a roster answering one of them twice fails here",
+			productionPath, testPath, got, refusalRosterControlUnexercised)
+	}
+	if _, sweptIn := control.refusals["cachedTable"]; sweptIn {
+		t.Errorf("named %q the roster read the control's non error package variable as a refusal, so it is matching a return position rather than an error result",
+			productionPath)
+	}
+	if !slices.Contains(control.declaredNotReturned, "errNeverReturned") {
+		t.Errorf("named %q the control declares errNeverReturned and no error result answers it, and the roster did not put it outside the class: %v",
+			productionPath, control.declaredNotReturned)
+	}
+}
 
 // TestEveryRefusalThisPackageShipsIsNamedByATest is the framing refusal roster, widened to the
 // package because every way of fencing "framing" off is a list.
@@ -770,27 +987,14 @@ var refusalRosterControlUnnamed = []string{"errNamedByNothing", "errNamedOnlyByA
 // renamed away, or moved into a file the build no longer compiles.
 //
 // Two things keep it from reporting clean once it has stopped reading. The control is run through
-// the same scanRefusals the real package goes through and must report exactly the two refusals it
-// commits and neither of the two it names; and the real scan must find this task's own three
-// sentinels among the refusals it read, which is what says it read framing_protect.go rather than
-// an empty directory.
+// the same scanRefusals the real package goes through and must produce the whole answer it commits;
+// and the real scan must find this task's own three sentinels among the refusals it read, which is
+// what says it read framing_protect.go rather than an empty directory. Neither of those sees a scan
+// that read all but ONE file, which is what TestTheRefusalRosterReadsAFileWhateverItIsNamed holds,
+// and neither sees a refusal whose last remaining mention is in a list, which is what
+// TestEveryRefusalThisPackageShipsIsNamedByCodeATestRuns holds.
 func TestEveryRefusalThisPackageShipsIsNamedByATest(t *testing.T) {
-	control := scanRefusals([]refusalSource{
-		{path: "control.go", parsed: mustParseText(t, "control.go", refusalRosterProductionControl)},
-		{path: "control_test.go", parsed: mustParseText(t, "control_test.go", refusalRosterTestControl),
-			isTest: true},
-	})
-	if got := control.unnamed(); !slices.Equal(got, refusalRosterControlUnnamed) {
-		t.Fatalf("the roster read %v out of the control, want %v; a shape it lets through is a shape the real source can be written in, and a shape it reports is a refusal the real source would be failed for having",
-			got, refusalRosterControlUnnamed)
-	}
-	if _, sweptIn := control.refusals["cachedTable"]; sweptIn {
-		t.Error("the roster read the control's non error package variable as a refusal, so it is matching a return position rather than an error result")
-	}
-	if !slices.Contains(control.declaredNotReturned, "errNeverReturned") {
-		t.Errorf("the control declares errNeverReturned and no error result answers it, and the roster did not put it outside the class: %v",
-			control.declaredNotReturned)
-	}
+	assertRefusalRosterControl(t, "control.go", "control_test.go")
 
 	scan := scanRefusals(refusalSourcesOfThisPackage(t))
 	if len(scan.refusals) == 0 || len(scan.namedBy) == 0 {
@@ -812,6 +1016,237 @@ func TestEveryRefusalThisPackageShipsIsNamedByATest(t *testing.T) {
 	}
 	t.Logf("%d refusals watched, %d package variables outside the class because no error result answers them",
 		len(scan.refusals), len(scan.declaredNotReturned))
+}
+
+// TestEveryRefusalThisPackageShipsIsNamedByCodeATestRuns is the roster's second verdict, and it is
+// here because the first one can be satisfied by a mention that runs nothing.
+//
+// The naming side reaches one hop past a Test body, and a package level TABLE is a legal hop. That
+// is deliberate and it is right for a table that DRIVES its rows -- nil_argument_test.go's do --
+// but a table can also merely enumerate, and an enumeration credits a refusal while asserting
+// nothing whatever about it. Three of this package's refusals were in exactly that position when
+// this was written: ErrLeafHasNoChildren, ErrRootHasNoParent and ErrRootHasNoSibling are listed in
+// treeMathOwnedErrors so that the error class sweeps have a class to run over, and their real
+// assertions are the errors.Is rows inside checkNodeInvariants -- a helper no Test body names, two
+// calls below the Tests that walk the tree, which one hop does not reach. Replacing those rows
+// with `err == nil`, so that two of the three lose their only real assertion, left the naming side
+// reporting a clean bill over all 103 refusals and the full suite passing. Measured, not supposed.
+//
+// So this verdict asks the other question: is the refusal named by code a Test RUNS. Mentions in
+// data do not count, for the reason executableMentionsIn gives. Mentions arbitrarily deep DO
+// count, over the closure of what the Tests reach rather than one hop, because the body that
+// actually asserts a refusal is routinely a helper or two below the Test that runs it. The two
+// verdicts are different classes in both directions and the control commits both directions.
+func TestEveryRefusalThisPackageShipsIsNamedByCodeATestRuns(t *testing.T) {
+	assertRefusalRosterControl(t, "control.go", "control_test.go")
+
+	scan := scanRefusals(refusalSourcesOfThisPackage(t))
+	if len(scan.refusals) == 0 || len(scan.exercisedBy) == 0 {
+		t.Fatalf("the scan read %d refusals and %d identifiers named from a body a test reaches, so whatever it reports below, it read nothing",
+			len(scan.refusals), len(scan.exercisedBy))
+	}
+	// the same three anchors the naming side uses, and here for the same reason: a guard on the
+	// SCAN rather than on the class, because a guard derived from the thing it guards guards
+	// nothing.
+	for _, anchor := range []string{"errWrongGroupId", "errWrongEpoch", "errBlankSenderLeaf"} {
+		if _, read := scan.refusals[anchor]; !read {
+			t.Fatalf("framing_protect.go answers %s at an error result and the scan did not read it, so it read something other than this package",
+				anchor)
+		}
+	}
+	unexercised := scan.unexercised()
+	for _, name := range unexercised {
+		t.Errorf("%s is a refusal %s answers, and no body any test in this package reaches names it; whatever still mentions it does so the way a list does, so the assertion that held this refusal is gone and has to be written back into code a test runs",
+			name, scan.refusals[name])
+	}
+	t.Logf("%d refusals watched, %d of them named from a body a test reaches",
+		len(scan.refusals), len(scan.refusals)-len(unexercised))
+}
+
+// TestTheRefusalRosterReadsAFileWhateverItIsNamed is the half that says the roster read the whole
+// package rather than most of it.
+//
+// The roster can already tell "read nothing" from "found nothing": the control commits both
+// directions of the class, and three anchors say the real scan reached framing_protect.go. Neither
+// of those sees a scan that read all but ONE file. A base name exemption at the top of
+// refusalSitesIn -- `if strings.HasSuffix(path, "tree.go") { return }`, which is the exact shape
+// rule 5 exists for and which this project has already shipped once in a join gate -- dropped nine
+// refusal sites out of the watched class, moved them quietly into declaredNotReturned, and the
+// roster issued a clean bill with the full suite green. Measured.
+//
+// So the property here is the one a narrowing of any shape breaks: what the roster answers about a
+// file does not depend on what the file is CALLED. The control is run through it under every name
+// this package's own directory holds, in the production position and in the test position at once,
+// and must produce the same whole answer under each. A predicate over the path -- suffix, prefix,
+// equality, extension, directory -- fails at the first name it excludes, whatever it is keyed on,
+// because the names are the package's rather than this test's. That is the derived form of the
+// rule: the class of file names is read off the package, so a file added tomorrow is swept without
+// anybody editing a list.
+func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
+	paths := packageSourcePaths(t)
+	// counted, because a path list that came back empty leaves the loop below running zero times
+	// and reporting PASS, which is the one outcome a sweep must not be able to reach
+	if len(paths) < 2 {
+		t.Fatalf("the package listed %d source files, so this sweep ran the control under nothing",
+			len(paths))
+	}
+	if !slices.Contains(paths, "framing_protect.go") {
+		t.Fatalf("the path list holds %d names and framing_protect.go is not among them, so it is not this package's directory that was read",
+			len(paths))
+	}
+	for _, path := range paths {
+		assertRefusalRosterControl(t, path, path)
+	}
+	t.Logf("the control produced its whole answer under each of %d file names", len(paths))
+}
+
+// ---------------------------------------------------------------------------
+// the rules this package exports and nothing applies
+// ---------------------------------------------------------------------------
+
+// rulesThisPackageExportsAndNothingApplies is every exported rule of this package that nothing in
+// its own non test source runs, written down with the reason each one is there.
+//
+// The class is DERIVED below; this is the answer that derivation must produce, which is the same
+// shape as refusalRosterControlUnnamed above and as crypto_test.go's
+// packageDeclarationsAwaitingTheirFirstCaller. It is held in BOTH directions, which is what makes
+// an entry expire by failing: a rule that appears and is not written here fails until somebody
+// gives the reason, and a rule written here that has since been wired fails until somebody takes
+// it off. The excuse survives exactly as long as the condition it names.
+//
+// Why the two framing rules are here rather than wired. This task produces the two signatures and
+// p8 puts them on the receive paths, so OpenPublicMessage and OpenPrivateMessage verify a signature
+// and a membership tag today and do not yet ask which group or which epoch the content names, or
+// whether the sender's leaf is occupied. That is the plan's order and not a defect. What WAS a
+// defect is that nothing in this package said so: both rules had no caller, no gate reported it,
+// and a p8 that slipped would have left this package shipping a receive path that accepts another
+// group's message with nothing anywhere failing.
+//
+// CheckUpdatePathKeyUniqueness is the same shape one plan over. tree_sync.go's own comment names
+// its call site -- the group lifecycle's, right before the merge -- and it is listed here for the
+// same reason: so that the commit which wires it is the commit this list fails on.
+var rulesThisPackageExportsAndNothingApplies = []string{
+	"CheckFramedContentContext",
+	"CheckSenderLeaf",
+	"CheckUpdatePathKeyUniqueness",
+}
+
+// exportedRulesOfThisPackage is every exported function of the non test source whose whole answer
+// is an error, mapped to the file declaring it.
+//
+// Derived off the SHAPE and not off the spelling. A function whose only result is an error exists
+// to refuse and to do nothing else, which is what a validation rule is; a list of "Check" prefixed
+// names would be the enumeration rule 5 is about, and the next rule spelled Verify, Assert or
+// Require falls straight out of it. A fence around framing_protect.go would be that same
+// enumeration one indirection out, which is the argument the roster above already makes.
+func exportedRulesOfThisPackage(sources []refusalSource) map[string]string {
+	rules := map[string]string{}
+	for _, source := range sources {
+		if source.isTest {
+			continue
+		}
+		for _, declaration := range source.parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil || !ast.IsExported(function.Name.Name) {
+				continue
+			}
+			if function.Type.Results == nil || len(function.Type.Results.List) != 1 {
+				continue
+			}
+			result := function.Type.Results.List[0]
+			if len(result.Names) > 1 {
+				continue
+			}
+			identifier, isIdentifier := result.Type.(*ast.Ident)
+			if isIdentifier && identifier.Name == "error" {
+				rules[function.Name.Name] = source.path
+			}
+		}
+	}
+	return rules
+}
+
+// rulesAppliedIn is the rules some other declaration of the non test source mentions, mapped to
+// the file that mentions them.
+//
+// A mention rather than a call, deliberately: a rule handed to something as a value is applied as
+// much as one called outright, and under-reporting the unapplied is the safe direction for a list
+// that has to be written by hand. A declaration's own name is not among its mentions -- the walk
+// reads a function's signature and its body and not its Name -- so a recursive rule does not
+// apply itself.
+func rulesAppliedIn(sources []refusalSource, rules map[string]string) map[string]string {
+	applied := map[string]string{}
+	for _, source := range sources {
+		if source.isTest {
+			continue
+		}
+		for _, declaration := range source.parsed.file.Decls {
+			mentions := map[string]bool{}
+			if function, isFunction := declaration.(*ast.FuncDecl); isFunction {
+				maps.Copy(mentions, identifiersIn(function.Type))
+				if function.Body != nil {
+					maps.Copy(mentions, identifiersIn(function.Body))
+				}
+			} else {
+				mentions = identifiersIn(declaration)
+			}
+			for name := range mentions {
+				if _, isRule := rules[name]; !isRule {
+					continue
+				}
+				if _, already := applied[name]; !already {
+					applied[name] = source.path
+				}
+			}
+		}
+	}
+	return applied
+}
+
+// TestEveryExportedRuleIsAppliedByThisPackageOrPinnedAsUnwired holds this package to knowing which
+// of its own rules nothing runs.
+//
+// CheckFramedContentContext and CheckSenderLeaf are the reason it exists. They are ValSem002,
+// ValSem003 and ValSem004; they are the refusals a receive path cannot verify its way past; and on
+// the day they landed nothing in this package called either. The tests above drive them directly,
+// every gate in the package passed, and the two receive paths went on accepting a framed content
+// from another group, from another epoch, and a member message naming a blanked leaf. The dead code
+// gate cannot see it: crypto_test.go's call graph half skips exported names on purpose, because an
+// exported declaration with no caller in its own package is what an API entry point looks like --
+// and a rule is exactly the exported declaration for which that is not true. A rule nobody runs
+// refuses nothing.
+//
+// So the gap becomes a fact this package asserts rather than one a reader has to notice, and it is
+// asserted in both directions, which is the half that matters on the day p8 lands.
+func TestEveryExportedRuleIsAppliedByThisPackageOrPinnedAsUnwired(t *testing.T) {
+	sources := refusalSourcesOfThisPackage(t)
+	rules := exportedRulesOfThisPackage(sources)
+	if len(rules) == 0 {
+		t.Fatal("the scan derived no exported rule out of this package, so whatever it reports below, it read nothing")
+	}
+	// an anchor on each half, for the roster's reason: a guard derived from the thing it guards
+	// guards nothing. psk.go exports CheckNoDuplicatePsks, whose whole answer is an error, and
+	// calls it from its own proposal list check.
+	if _, derived := rules["CheckNoDuplicatePsks"]; !derived {
+		t.Fatal("psk.go exports CheckNoDuplicatePsks and its whole answer is an error, and the scan did not derive it as a rule, so the class below is not this package's rules")
+	}
+	applied := rulesAppliedIn(sources, rules)
+	if _, isApplied := applied["CheckNoDuplicatePsks"]; !isApplied {
+		t.Fatal("psk.go calls CheckNoDuplicatePsks from its own source and the scan did not see it applied, so what it reports below is about the scan and not about this package")
+	}
+	unapplied := []string{}
+	for name := range rules {
+		if _, isApplied := applied[name]; !isApplied {
+			unapplied = append(unapplied, name)
+		}
+	}
+	slices.Sort(unapplied)
+	if !slices.Equal(unapplied, rulesThisPackageExportsAndNothingApplies) {
+		t.Errorf("this package exports %d rules and applies none of %v itself; the list it is pinned to is %v. A name that has appeared is a rule this package ships and never runs -- write it there with the reason and the task that wires it, or wire it. A name that has gone is a rule something applies now -- take it off, so the next unwired one cannot hide behind it.",
+			len(rules), unapplied, rulesThisPackageExportsAndNothingApplies)
+	}
+	t.Logf("%d exported rules, %d of them applied by this package's own source",
+		len(rules), len(rules)-len(unapplied))
 }
 
 // ---------------------------------------------------------------------------
