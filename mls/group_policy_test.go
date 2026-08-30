@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/token"
+	"go/types"
 	"maps"
 	"math/rand"
 	"regexp"
@@ -12,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // the file whose refusals the derived sweep at the bottom of this file reads. A CONSTANT and not
@@ -679,38 +683,163 @@ func groupPolicyMessagePattern(format string) string {
 	return strings.Join(quoted, ".*")
 }
 
-// groupPolicyRefusalIn reads one returned expression for the sentinel it answers and the format
-// it answers it under. The empty name means this expression is not a refusal.
-func groupPolicyRefusalIn(parsed parsedSource, expression ast.Expr, declared []string) (string, string) {
-	isSentinel := func(node ast.Expr) string {
-		identifier, isIdentifier := node.(*ast.Ident)
-		if !isIdentifier || !strings.HasPrefix(identifier.Name, "Err") ||
-			!slices.Contains(declared, identifier.Name) {
-			return ""
+// groupPolicySentinelClass is what a refusal of this package ANSWERS, read off the type checker.
+//
+// Every package level variable whose type implements error, exported or not. The predicate below
+// used to require the name to begin with "Err", which is the exported registry's convention and
+// not the package's: errCredentialTypeNotListed, errMissingRequiredCapability, errPathLength,
+// errDuplicatePsk and errLeafExtensionNotListed are all refusals this package makes today, and a
+// clause of Validate answering one of them was invisible -- the site never joined the derived
+// class, the table below stayed equal to the class, and the gate reported a clause it had run no
+// input through. What a refusal answers is not decided by the first three letters of a name. It
+// is decided by the type, so go/types decides it here.
+func groupPolicySentinelClass(t *testing.T) []string {
+	t.Helper()
+	errorInterface, isInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	if !isInterface {
+		t.Fatal("the universe scope's error is not an interface, so this class is read off nothing")
+	}
+	scope := typeCheckedPackage(t).Scope()
+	names := []string{}
+	for _, name := range scope.Names() {
+		declared, isVariable := scope.Lookup(name).(*types.Var)
+		if !isVariable || !types.Implements(declared.Type(), errorInterface) {
+			continue
 		}
-		return identifier.Name
+		names = append(names, name)
 	}
-	if name := isSentinel(expression); name != "" {
-		return name, ""
-	}
-	call, isCall := expression.(*ast.CallExpr)
-	if !isCall || parsed.render(call.Fun) != "fmt.Errorf" || len(call.Args) < 2 {
-		return "", ""
-	}
-	literal, isLiteral := call.Args[0].(*ast.BasicLit)
-	if !isLiteral {
-		return "", ""
-	}
-	format, err := strconv.Unquote(literal.Value)
-	if err != nil {
-		return "", ""
-	}
-	for _, argument := range call.Args[1:] {
-		if name := isSentinel(argument); name != "" {
-			return name, format
+	// the positive control, on BOTH halves of what was widened. A class holding no exported
+	// sentinel is one reading the wrong package; a class holding no unexported one is the class
+	// this function was written to replace, reporting exactly what a complete one reports.
+	for _, wanted := range []string{"ErrMalformedExtension", "errPathLength"} {
+		if !slices.Contains(names, wanted) {
+			t.Fatalf("the sentinel class read off the type checker is %v and does not hold %s, so it is not reading this package's error variables",
+				names, wanted)
 		}
 	}
-	return "", ""
+	return names
+}
+
+// groupPolicyRefusal is what one returned expression refuses with: the sentinel it answers and
+// the format it answers it under. The empty sentinel means the expression is not a refusal.
+type groupPolicyRefusal struct {
+	sentinel string
+	format   string
+}
+
+// groupPolicyRefusalIn resolves one returned expression to the refusal it makes.
+//
+// DERIVED on the axis the sweep below was already derived on AND on the one it was not. The
+// sweep reads every return statement of the file off the AST, which is genuinely derived; what
+// it then DID with each return was a two entry hand list -- a bare Err-prefixed identifier, or a
+// DIRECT fmt.Errorf carrying one -- and two entirely ordinary refusals fell outside it in
+// silence. A clause answering an unexported sentinel, which is this package's dominant
+// convention for a non-registry error. And a clause that builds its fmt.Errorf into a local and
+// returns the variable. Neither grows the derived class, so the table stays equal to it and the
+// gate reports a clause it never ran an input through: a gate that derives one axis and
+// enumerates another is not a derived gate.
+//
+// So the question is asked as what a refusal IS rather than as how one is spelled:
+//
+//   - an identifier naming one of this package's error variables IS the refusal it names;
+//   - an identifier naming a LOCAL is whatever that local was built from, resolved in the body it
+//     was assigned in, which is what makes `refusal := fmt.Errorf(...); return refusal` the same
+//     refusal as returning the call;
+//   - a CALL is a refusal when one of its arguments is. That covers fmt.Errorf, errors.Join, a
+//     ValSem wrapper and anything a later task writes, rather than the one function name that
+//     happens to be used today. Its FORMAT is its first argument when that is a string literal,
+//     which is the shape every wrapper of this package has and is what tells two clauses
+//     answering one sentinel apart.
+//
+// A local resolves through EVERY assignment to that name rather than the nearest one, so the
+// answer is conservative in the direction that fails loudly: a name ever built from a sentinel is
+// reported, and an over-reported site is a site with no row, which is a failure naming it.
+// Under-reporting is silent, and is the whole reason this function was rewritten.
+func groupPolicyRefusalIn(body *ast.BlockStmt, expression ast.Expr, sentinels []string) groupPolicyRefusal {
+	return groupPolicyRefusalOf(body, expression, sentinels, map[string]bool{})
+}
+
+// groupPolicyRefusalOf is the recursion, carrying the local names already followed so a body that
+// assigns a name from itself -- compareMemberIds folds its running answer through exactly that
+// shape -- terminates rather than recursing forever.
+func groupPolicyRefusalOf(body *ast.BlockStmt, expression ast.Expr, sentinels []string, seen map[string]bool) groupPolicyRefusal {
+	switch node := expression.(type) {
+	case *ast.Ident:
+		if slices.Contains(sentinels, node.Name) {
+			return groupPolicyRefusal{sentinel: node.Name}
+		}
+		if body == nil || seen[node.Name] {
+			return groupPolicyRefusal{}
+		}
+		followed := maps.Clone(seen)
+		followed[node.Name] = true
+		for _, assigned := range groupPolicyAssignmentsTo(body, node.Name) {
+			if found := groupPolicyRefusalOf(body, assigned, sentinels, followed); found.sentinel != "" {
+				return found
+			}
+		}
+	case *ast.CallExpr:
+		format := ""
+		if len(node.Args) != 0 {
+			literal, isLiteral := node.Args[0].(*ast.BasicLit)
+			if isLiteral && literal.Kind == token.STRING {
+				if unquoted, err := strconv.Unquote(literal.Value); err == nil {
+					format = unquoted
+				}
+			}
+		}
+		for _, argument := range node.Args {
+			if found := groupPolicyRefusalOf(body, argument, sentinels, maps.Clone(seen)); found.sentinel != "" {
+				if found.format == "" {
+					found.format = format
+				}
+				return found
+			}
+		}
+	}
+	return groupPolicyRefusal{}
+}
+
+// groupPolicyAssignmentsTo is every expression one name is assigned inside a body, including a
+// var declaration's initialiser.
+//
+// A one expression right hand side is attributed to EVERY name on the left, which is what keeps
+// `value, err := wrap(ErrSomething)` resolvable: the call is what both names came from, and a
+// reader that only paired them positionally would drop the error half of every two result call.
+func groupPolicyAssignmentsTo(body *ast.BlockStmt, name string) []ast.Expr {
+	assigned := []ast.Expr{}
+	take := func(names []*ast.Ident, values []ast.Expr) {
+		for i, target := range names {
+			if target.Name != name {
+				continue
+			}
+			if len(values) == 1 {
+				assigned = append(assigned, values[0])
+				continue
+			}
+			if i < len(values) {
+				assigned = append(assigned, values[i])
+			}
+		}
+	}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch statement := node.(type) {
+		case *ast.AssignStmt:
+			targets := []*ast.Ident{}
+			for _, one := range statement.Lhs {
+				identifier, isIdentifier := one.(*ast.Ident)
+				if !isIdentifier {
+					identifier = ast.NewIdent("")
+				}
+				targets = append(targets, identifier)
+			}
+			take(targets, statement.Rhs)
+		case *ast.ValueSpec:
+			take(statement.Names, statement.Values)
+		}
+		return true
+	})
+	return assigned
 }
 
 // groupPolicyRefusalSitesOf is the class the sweep below runs over: every refusal group_policy.go
@@ -724,13 +853,7 @@ func groupPolicyRefusalIn(parsed parsedSource, expression ast.Expr, declared []s
 // covered by a table that says it is.
 func groupPolicyRefusalSitesOf(t *testing.T) []groupPolicyRefusalSite {
 	t.Helper()
-	declared := []string{}
-	for _, path := range packageLevelFunctions(t).files {
-		declared = append(declared, packageLevelVarNamesIn(mustParseSource(t, path))...)
-	}
-	if len(declared) == 0 {
-		t.Fatal("this package's non test source declares no package level variable, so every sentinel below reads as an unknown identifier and the class is empty")
-	}
+	sentinels := groupPolicySentinelClass(t)
 	parsed := mustParseSource(t, groupPolicySourceFile)
 	seen := map[string]int{}
 	sites := []groupPolicyRefusalSite{}
@@ -748,15 +871,15 @@ func groupPolicyRefusalSitesOf(t *testing.T) []groupPolicyRefusalSite {
 				return true
 			}
 			for _, result := range returned.Results {
-				sentinel, format := groupPolicyRefusalIn(parsed, result, declared)
-				if sentinel == "" {
+				refusal := groupPolicyRefusalIn(one.body, result, sentinels)
+				if refusal.sentinel == "" {
 					continue
 				}
-				key := where + ":" + sentinel
+				key := where + ":" + refusal.sentinel
 				sites = append(sites, groupPolicyRefusalSite{
 					site:     fmt.Sprintf("%s#%d", key, seen[key]),
-					sentinel: sentinel,
-					pattern:  groupPolicyMessagePattern(format),
+					sentinel: refusal.sentinel,
+					pattern:  groupPolicyMessagePattern(refusal.format),
 				})
 				seen[key] += 1
 			}
@@ -832,6 +955,18 @@ func groupPolicyWellFormedBody(t *testing.T) []byte {
 // no longer makes fails rather than outliving it.
 func groupPolicyRefusalRows() map[string]groupPolicyRefusalRow {
 	return map[string]groupPolicyRefusalRow{
+		// the repeated 0xF001 entry. Two entries of one type is what RFC 9420 forbids and what
+		// no ValSem in this build refuses, so this accessor is the door that refuses it.
+		"GroupPolicyOf:ErrMalformedExtension#0": {call: func(t *testing.T) error {
+			policy, err := (&GroupPolicyExtension{
+				Roles: []RoleEntry{{MemberId: groupPolicyLowId, Role: RoleOwner}},
+			}).Encode()
+			if err != nil {
+				t.Fatalf("the policy entry this row repeats: %v", err)
+			}
+			_, err = GroupPolicyOf([]Extension{policy, policy})
+			return err
+		}},
 		"GroupPolicyOf:ErrNoGroupPolicy#0": {call: func(t *testing.T) error {
 			_, err := GroupPolicyOf([]Extension{
 				{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{0x00}},
@@ -1019,6 +1154,444 @@ func TestEveryRefusalTheGroupPolicyMakesHasAnInputThatProducesItAndAnswersNoOthe
 		if !matched {
 			t.Errorf("%s answered %q, which does not match the message written at that site (%s); this input reaches some OTHER clause answering the same sentinel",
 				one.site, err.Error(), pattern)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the resolver's own control, the repeated entry, the refused decode and the stable sort
+// ---------------------------------------------------------------------------
+
+// groupPolicyRefusalShapesControl is a body written to hold the refusal spellings this package
+// makes and the plumbing it must not mistake for one, so the resolver above is measured on a
+// source whose answer is known rather than only on a file it agrees with.
+//
+// Two of these shapes are the ones the previous predicate could not see, and they are the reason
+// this control exists: production source does not carry them today, so a widening tested only
+// against production source is a widening nothing observes.
+const groupPolicyRefusalShapesControl = `package control
+
+var (
+	ErrExported   = errors.New("control: an exported sentinel")
+	errUnexported = errors.New("control: an unexported sentinel")
+	notAnError    = 3
+)
+
+func answersAnExportedSentinel() error {
+	return ErrExported
+}
+
+func answersAnUnexportedSentinel() error {
+	return errUnexported
+}
+
+func wrapsDirectly() error {
+	return fmt.Errorf("%w: entry %d is out of order", ErrExported, 1)
+}
+
+func buildsIntoALocal() error {
+	refusal := fmt.Errorf("%w: built into a local first", errUnexported)
+	return refusal
+}
+
+func buildsIntoALocalUnderABranch(bad bool) error {
+	var refusal error
+	if bad {
+		refusal = fmt.Errorf("%w: built under a branch", errUnexported)
+	}
+	return refusal
+}
+
+func wrapsThroughSomethingOtherThanErrorf() error {
+	return errors.Join(ErrExported, errUnexported)
+}
+
+func plumbsSomebodyElsesError(data []byte) error {
+	value, err := decodeSomething(data)
+	if err != nil {
+		return err
+	}
+	return use(value)
+}
+
+func answersAPackageVarThatIsNotAnError() error {
+	return notAnError
+}
+
+func refusesNothing() error {
+	return nil
+}
+`
+
+// groupPolicyControlRefusalsOf resolves every return of one declaration of a parsed control.
+func groupPolicyControlRefusalsOf(t *testing.T, parsed parsedSource, name string, sentinels []string) []groupPolicyRefusal {
+	t.Helper()
+	found := []groupPolicyRefusal{}
+	for _, one := range declaredIn(parsed) {
+		if one.name != name || one.body == nil {
+			continue
+		}
+		ast.Inspect(one.body, func(node ast.Node) bool {
+			returned, isReturn := node.(*ast.ReturnStmt)
+			if !isReturn {
+				return true
+			}
+			for _, result := range returned.Results {
+				if refusal := groupPolicyRefusalIn(one.body, result, sentinels); refusal.sentinel != "" {
+					found = append(found, refusal)
+				}
+			}
+			return true
+		})
+		return found
+	}
+	t.Fatalf("the control declares no %s, so the expectation for it observes nothing", name)
+	return nil
+}
+
+// TestTheRefusalResolverReadsEveryShapeAPackageRefusalTakes is guardrail 5 applied to the gate
+// rather than to the code, which is where this file had it backwards.
+//
+// The sweep it feeds was derived off the AST and then handed a two entry hand list of spellings,
+// and the two shapes missing from that list are not exotic: an unexported sentinel is what five
+// refusals of this package answer today, and a fmt.Errorf built into a local is what any clause
+// that wants to log before returning looks like. Both left the derived class at twelve sites and
+// both left the two sweeps below passing, so the next clause added to Validate would have been
+// reported as covered by a gate that ran nothing through it.
+//
+// The negative half is asserted too. A resolver that answered "refusal" for every return would
+// satisfy every positive row here and would put a site on every plumbing return of the file,
+// which is a class nobody could write rows for -- so the plumbing shapes must come back empty.
+func TestTheRefusalResolverReadsEveryShapeAPackageRefusalTakes(t *testing.T) {
+	parsed := mustParseText(t, "the refusal shapes control", groupPolicyRefusalShapesControl)
+	// the control's own sentinels, named here rather than type checked, because what this test
+	// is about is the RESOLUTION; the class itself has its own control inside
+	// groupPolicySentinelClass, which fails if this package's unexported sentinels stop being
+	// read.
+	sentinels := []string{"ErrExported", "errUnexported"}
+	for _, one := range []struct {
+		declaration string
+		sentinel    string
+		format      string
+		why         string
+	}{
+		{declaration: "answersAnExportedSentinel", sentinel: "ErrExported",
+			why: "the shape the previous predicate did read"},
+		{declaration: "answersAnUnexportedSentinel", sentinel: "errUnexported",
+			why: "an unexported sentinel, which is what five refusals of this package answer today"},
+		{declaration: "wrapsDirectly", sentinel: "ErrExported", format: "%w: entry %d is out of order",
+			why: "the other shape the previous predicate did read"},
+		{declaration: "buildsIntoALocal", sentinel: "errUnexported", format: "%w: built into a local first",
+			why: "a fmt.Errorf assigned to a local and returned by name"},
+		{declaration: "buildsIntoALocalUnderABranch", sentinel: "errUnexported", format: "%w: built under a branch",
+			why: "the same, assigned under a branch rather than at the point of return"},
+		{declaration: "wrapsThroughSomethingOtherThanErrorf", sentinel: "ErrExported",
+			why: "a wrapper that is not fmt.Errorf, which a name match on fmt.Errorf cannot see"},
+		{declaration: "plumbsSomebodyElsesError", why: "an error handed back from a call that carries no sentinel"},
+		{declaration: "answersAPackageVarThatIsNotAnError", why: "a package level variable that is not an error"},
+		{declaration: "refusesNothing", why: "a nil return"},
+	} {
+		found := groupPolicyControlRefusalsOf(t, parsed, one.declaration, sentinels)
+		if one.sentinel == "" {
+			if len(found) != 0 {
+				t.Errorf("%s (%s) resolved to %v; a resolver that reads a refusal into ordinary plumbing puts a site on returns no row can be written for",
+					one.declaration, one.why, found)
+			}
+			continue
+		}
+		if len(found) != 1 {
+			t.Errorf("%s (%s) resolved to %v, want exactly one refusal answering %s",
+				one.declaration, one.why, found, one.sentinel)
+			continue
+		}
+		if found[0].sentinel != one.sentinel {
+			t.Errorf("%s (%s) answers %s, want %s", one.declaration, one.why, found[0].sentinel, one.sentinel)
+		}
+		if found[0].format != one.format {
+			t.Errorf("%s (%s) carries the format %q, want %q; the format is what tells two clauses answering one sentinel apart",
+				one.declaration, one.why, found[0].format, one.format)
+		}
+	}
+}
+
+// groupPolicyPositionsNamedBy is the entry positions a repeat refusal reports, read as the
+// numbers in its message rather than as its wording.
+//
+// Read this way on purpose. The wording is already held by the derived message pattern in the
+// sweep above, and what this reader is for is the OTHER half: the refusal must name the two
+// entries in the order the vector holds them. That is the only thing left that a walk over the
+// vector in the wrong direction changes -- with the repeat refused, first and last are the same
+// entry and every other observable is identical -- and "the walk was reversed and nothing
+// noticed" is the finding this pair of accessors is being repaired for. A reader that matched
+// the sentence would fail on a reworded message and pass on a reversed walk, which is backwards.
+func groupPolicyPositionsNamedBy(t *testing.T, err error) []int {
+	t.Helper()
+	found := []int{}
+	for _, digits := range regexp.MustCompile(`[0-9]+`).FindAllString(err.Error(), -1) {
+		value, convertErr := strconv.Atoi(digits)
+		if convertErr != nil {
+			t.Fatalf("the refusal %q carries %q where a position was expected: %v", err, digits, convertErr)
+		}
+		found = append(found, value)
+	}
+	return found
+}
+
+// TestGroupPolicyOfRefusesAListCarryingTwoPoliciesRatherThanPickingOne is finding 8's answer, and
+// the answer is a refusal rather than a test pinning which of two illegal entries wins.
+//
+// The prior question was whether a repeated extension type is refused anywhere. It is not:
+// ValSem209 is named in three comments of this package and implemented in none of them, and
+// LeafNode.Validate -- the door those comments point at -- walks every entry, range checks every
+// urmessage_leaf_keys body, and accepts a leaf carrying two of anything. So the accessor was
+// picking the group's policy by iteration order, and the list it picks from is inside the
+// CONFIRMED TRANSCRIPT HASH: both role sets are covered by every confirmation tag the group ever
+// produced, so a member reading the first and a member reading the second disagree about who may
+// remove whom while agreeing on every hash.
+//
+// Both orders are run, because a refusal that only fires when the SECOND entry is the odd one is
+// an accessor that still answers by position.
+func TestGroupPolicyOfRefusesAListCarryingTwoPoliciesRatherThanPickingOne(t *testing.T) {
+	crypto := testCrypto(t)
+	first := testIdentity(t, crypto, "first-owner")
+	second := testIdentity(t, crypto, "second-owner")
+	entryOf := func(m *testMember) Extension {
+		entry, err := (&GroupPolicyExtension{
+			Roles:    []RoleEntry{{MemberId: m.IdentityPub, Role: RoleOwner}},
+			ServerId: []byte("urmessage-v1-server"),
+		}).Encode()
+		if err != nil {
+			t.Fatalf("the %s policy entry: %v", m.Name, err)
+		}
+		return entry
+	}
+	firstEntry, secondEntry := entryOf(first), entryOf(second)
+	if bytes.Equal(firstEntry.ExtensionData, secondEntry.ExtensionData) {
+		t.Fatal("the two policy entries encode identically, so this test cannot tell a refusal from a lucky pick")
+	}
+	// the control: each entry alone is answered, so a refusal below is about the repeat rather
+	// than about either body
+	for _, one := range []struct {
+		name  string
+		entry Extension
+		owner *testMember
+	}{{"first", firstEntry, first}, {"second", secondEntry, second}} {
+		policy, err := GroupPolicyOf([]Extension{
+			{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x00, 0x00, 0x00}},
+			one.entry,
+		})
+		if err != nil {
+			t.Fatalf("GroupPolicyOf over the %s entry alone: %v", one.name, err)
+		}
+		if id, named := policy.OwnerId(); !named || !bytes.Equal(id, one.owner.IdentityPub) {
+			t.Fatalf("GroupPolicyOf over the %s entry alone answered a policy owned by somebody else", one.name)
+		}
+	}
+	for _, one := range []struct {
+		name string
+		list []Extension
+		at   []int
+	}{
+		{"first then second", []Extension{firstEntry, secondEntry}, []int{0, 1}},
+		{"second then first", []Extension{secondEntry, firstEntry}, []int{0, 1}},
+		{"with an unrelated entry between them", []Extension{
+			firstEntry,
+			{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x00, 0x00, 0x00}},
+			secondEntry,
+		}, []int{0, 2}},
+		{"behind two entries of other types", []Extension{
+			{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x00, 0x00, 0x00}},
+			{ExtensionType: ExtensionTypeApplicationId, ExtensionData: []byte("urmessage")},
+			firstEntry,
+			secondEntry,
+		}, []int{2, 3}},
+	} {
+		policy, err := GroupPolicyOf(one.list)
+		if !errors.Is(err, ErrMalformedExtension) {
+			t.Errorf("GroupPolicyOf over a list carrying urmessage_group_policy twice (%s) answered %v, want ErrMalformedExtension",
+				one.name, err)
+			continue
+		}
+		if policy != nil {
+			owner, _ := policy.OwnerId()
+			t.Errorf("GroupPolicyOf over a list carrying urmessage_group_policy twice (%s) answered the policy owned by %x beside its refusal; which of two policies a member enforces cannot be decided by iteration order over a list the transcript hash covers",
+				one.name, owner)
+		}
+		if at := groupPolicyPositionsNamedBy(t, err); !slices.Equal(at, one.at) {
+			t.Errorf("GroupPolicyOf over %s named entries %v, want %v; the refusal has to point at the two entries in the order the vector holds them, which is the last thing a walk in the wrong direction changes",
+				one.name, at, one.at)
+		}
+	}
+}
+
+// TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone is the property UnmarshalMLS states in
+// its own words -- "the refusal is made against the decoded value BEFORE the assignment" -- and
+// that nothing observed.
+//
+// The static gate in decoder_publish_test.go pins this decoder as one that stages, and it reads
+// the receiver's write against the READER's last read: moving the assignment to before
+// decoded.Validate() leaves every reader read behind it, so that verdict does not change and the
+// whole suite stays green. What changes is the case the static reader cannot model: a body whose
+// bytes decode perfectly and whose CONTENT the codec refuses. That receiver is then holding a non
+// canonical or two owner policy the codec rejected -- inside a group context, on its way to a
+// transcript hash -- while its caller was handed an error saying the decode did not happen. p6
+// shipped this exact shape at the outermost decoder for Welcome, GroupInfo and KeyPackage.
+//
+// The hostile bodies are DERIVED from the Validate refusals the sweep above reads, so a clause
+// added to Validate is asked this question by the commit that writes it rather than by whoever
+// remembers this test. The truncations are run too, which is the half the static verdict already
+// covers, so both halves of "a refused decode changes nothing" are stated in one place.
+func TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone(t *testing.T) {
+	held := func() *GroupPolicyExtension {
+		return &GroupPolicyExtension{
+			Roles: []RoleEntry{
+				{MemberId: groupPolicyLowId, Role: RoleOwner},
+				{MemberId: groupPolicyHighId, Role: RoleAdmin},
+			},
+			RetentionPolicy:     RetentionPolicy{DurableMs: 7, MediaMs: 9},
+			DisappearingBuckets: []uint8{1, 2},
+			ServerId:            []byte("the policy the caller already holds"),
+		}
+	}
+	heldBytes, err := held().encodeUnchecked()
+	if err != nil {
+		t.Fatalf("encode the policy the caller already holds: %v", err)
+	}
+	unchanged := func(t *testing.T, what string, receiver *GroupPolicyExtension) {
+		t.Helper()
+		after, err := receiver.encodeUnchecked()
+		if err != nil {
+			t.Fatalf("%s: re-encode the receiver after a refused decode: %v", what, err)
+		}
+		if !bytes.Equal(after, heldBytes) {
+			t.Errorf("%s: a refused decode left the caller's policy as\n  %x\nand it was\n  %x\nthe caller was handed an error saying the decode did not happen",
+				what, after, heldBytes)
+		}
+	}
+
+	rows := groupPolicyRefusalRows()
+	reached := 0
+	for _, one := range groupPolicyRefusalSitesOf(t) {
+		if !strings.HasPrefix(one.site, "(*GroupPolicyExtension).Validate:") {
+			continue
+		}
+		row, listed := rows[one.site]
+		if !listed || row.policy == nil {
+			t.Errorf("%s has no policy on its row, so no body can be built for the refusal it makes", one.site)
+			continue
+		}
+		body, err := row.policy.encodeUnchecked()
+		if err != nil {
+			// the one Validate clause no wire body can carry: the role byte gate runs on the
+			// encode side too, so a body naming an undefined role cannot be assembled at all.
+			// Logged rather than skipped silently, because a class that quietly lost every
+			// member would report exactly what a complete one reports.
+			t.Logf("%s: no body can carry this refusal to a decoder, the encoder refuses it first (%v)", one.site, err)
+			continue
+		}
+		sentinel, named := lifecycleOwnedErrors[one.sentinel]
+		if !named {
+			t.Errorf("%s answers %s, which this gate cannot join to a value; give the sentinel a class entry",
+				one.site, one.sentinel)
+			continue
+		}
+		receiver := held()
+		if err := receiver.UnmarshalMLS(syntax.NewReader(body)); !errors.Is(err, sentinel) {
+			t.Errorf("%s: decoding the body that refusal is about answered %v, want %s; this body was supposed to reach the content check rather than the byte reads",
+				one.site, err, one.sentinel)
+			continue
+		}
+		reached += 1
+		unchanged(t, one.site, receiver)
+	}
+	if reached == 0 {
+		t.Fatalf("no Validate refusal of %s could be reached through a decode, so this gate observed nothing", groupPolicySourceFile)
+	}
+	t.Logf("%d of Validate's refusals are reachable through a decode and leave the receiver alone", reached)
+
+	valid, err := (&GroupPolicyExtension{
+		Roles:               []RoleEntry{{MemberId: groupPolicyLowId, Role: RoleOwner}},
+		RetentionPolicy:     RetentionPolicy{DurableMs: 1, MediaMs: 2},
+		DisappearingBuckets: []uint8{3},
+		ServerId:            []byte("valid"),
+	}).encodeUnchecked()
+	if err != nil {
+		t.Fatalf("encode the body the truncations are cut from: %v", err)
+	}
+	if bytes.Equal(valid, heldBytes) {
+		t.Fatal("the held policy and the decoded one encode identically, so the truncations cannot tell an untouched receiver from a clobbered one")
+	}
+	for cut := 0; cut < len(valid); cut += 1 {
+		receiver := held()
+		if err := receiver.UnmarshalMLS(syntax.NewReader(valid[:cut])); err == nil {
+			t.Fatalf("a policy body truncated to %d of %d octets was accepted", cut, len(valid))
+		}
+		unchanged(t, fmt.Sprintf("truncated to %d of %d octets", cut, len(valid)), receiver)
+	}
+}
+
+// TestSortingTheRolesKeepsTwoEntriesForOneMemberInTheOrderTheyArrived is the stability
+// sortRolesByMemberId's comment claims. It matters, and this is what says so.
+//
+// Canonicalize sorts IN PLACE and then refuses the duplicate, so the caller still holds the
+// reordered slice; a caller repairing the policy by dropping the later of the two entries keeps
+// whichever role the sort left first. With an unstable sort that is arbitrary, and the value it
+// decides is a member's AUTHORITY in a structure covered by the confirmed transcript hash.
+//
+// The fixture is the whole of why this test is worth writing rather than asserting. Go's unstable
+// sort runs an insertion sort below thirteen elements, which is stable by accident, and it leaves
+// an already ascending input alone -- so a fixture of the size every other test in this file uses
+// cannot tell the two sorts apart, and a test written over one passes under both. This one is
+// built in DESCENDING member id order and swept from seven duplicated members to twenty, and
+// every one of those shapes is one the unstable sort reorders.
+func TestSortingTheRolesKeepsTwoEntriesForOneMemberInTheOrderTheyArrived(t *testing.T) {
+	arrived := func(members int) []RoleEntry {
+		roles := []RoleEntry{}
+		for i := members; i >= 1; i -= 1 {
+			id := bytes.Repeat([]byte{byte(i)}, 32)
+			roles = append(roles,
+				RoleEntry{MemberId: id, Role: RoleAdmin},
+				RoleEntry{MemberId: id, Role: RoleMember})
+		}
+		return roles
+	}
+	for members := 7; members <= 20; members += 1 {
+		roles := arrived(members)
+		sortRolesByMemberId(roles)
+		pairs := 0
+		for i := 1; i < len(roles); i += 1 {
+			if compareMemberIds(roles[i-1].MemberId, roles[i].MemberId) > 0 {
+				t.Fatalf("%d members: the sort left entry %d ahead of entry %d, so it did not sort at all",
+					members, i-1, i)
+			}
+			if !sameMemberId(roles[i-1].MemberId, roles[i].MemberId) {
+				continue
+			}
+			pairs += 1
+			if roles[i-1].Role != RoleAdmin || roles[i].Role != RoleMember {
+				t.Fatalf("%d members: the two entries for member %x came out %s then %s and they arrived %s then %s; an unstable sort decides which role a caller repairing the duplicate keeps",
+					members, roles[i].MemberId[:1], roles[i-1].Role, roles[i].Role, RoleAdmin, RoleMember)
+			}
+		}
+		if pairs != members {
+			t.Fatalf("%d members: %d adjacent duplicate pairs survived the sort, want %d; the fixture this property is observed on is not the one this test built",
+				members, pairs, members)
+		}
+	}
+
+	// and the same statement through the API a caller reaches: Canonicalize refuses the
+	// duplicate AFTER sorting in place, so what the caller is left holding is this order.
+	policy := &GroupPolicyExtension{Roles: arrived(13)}
+	if err := policy.Canonicalize(); !errors.Is(err, ErrDuplicateRoleEntry) {
+		t.Fatalf("Canonicalize over a role list holding every member twice answered %v, want ErrDuplicateRoleEntry", err)
+	}
+	for i := 1; i < len(policy.Roles); i += 1 {
+		if !sameMemberId(policy.Roles[i-1].MemberId, policy.Roles[i].MemberId) {
+			continue
+		}
+		if policy.Roles[i-1].Role != RoleAdmin || policy.Roles[i].Role != RoleMember {
+			t.Fatalf("after a refused Canonicalize the caller holds member %x as %s then %s, and it handed in %s then %s",
+				policy.Roles[i].MemberId[:1], policy.Roles[i-1].Role, policy.Roles[i].Role, RoleAdmin, RoleMember)
 		}
 	}
 }

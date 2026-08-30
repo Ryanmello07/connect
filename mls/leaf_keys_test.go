@@ -3,6 +3,7 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -136,5 +137,83 @@ func TestLeafKeysOfReadsTheEntryOfItsOwnTypeAndNoOther(t *testing.T) {
 	}
 	if !bytes.Equal(keys.DeviceXwingPub, alice.XwingPub) {
 		t.Fatal("LeafKeysOf answered something other than the leaf's own X-Wing key when the entry was not first")
+	}
+}
+
+// TestLeafKeysOfRefusesALeafCarryingTwoWrapKeysRatherThanPickingOne is finding 8's other half,
+// and it is a refusal rather than a test pinning which of two illegal entries wins.
+//
+// The prior question -- is a repeated extension type refused anywhere -- has the answer "nowhere".
+// ValSem209 is named in three comments of this package and implemented in none; LeafNode.Validate,
+// the door those comments point at, walks every entry and range checks every urmessage_leaf_keys
+// body it finds, and accepts a leaf carrying two well formed ones. So this accessor was the only
+// reader of such a leaf, and it was choosing the group's wrap target by iteration order: not a
+// parse failure anywhere, just a commit secret wrapped to one of two devices while the other
+// silently stops receiving. Reversing the walk changed which device that was and passed the whole
+// suite.
+//
+// Both orders, and a decoy between them, because a refusal that only fires for one arrangement is
+// an accessor still answering by position.
+func TestLeafKeysOfRefusesALeafCarryingTwoWrapKeysRatherThanPickingOne(t *testing.T) {
+	crypto := testCrypto(t)
+	alice := testIdentity(t, crypto, "alice")
+	bob := testIdentity(t, crypto, "bob")
+	aliceKeys, bobKeys := testLeafKeys(t, alice), testLeafKeys(t, bob)
+	if bytes.Equal(aliceKeys.ExtensionData, bobKeys.ExtensionData) {
+		t.Fatal("the two leaf keys entries encode identically, so this test cannot tell a refusal from a lucky pick")
+	}
+
+	// the control: either entry alone is answered, so a refusal below is about the repeat rather
+	// than about either body
+	for _, one := range []struct {
+		name  string
+		entry Extension
+		owner *testMember
+	}{{"alice", aliceKeys, alice}, {"bob", bobKeys, bob}} {
+		keys, err := LeafKeysOf(&LeafNode{Extensions: []Extension{one.entry}})
+		if err != nil {
+			t.Fatalf("LeafKeysOf over %s's entry alone: %v", one.name, err)
+		}
+		if !bytes.Equal(keys.DeviceXwingPub, one.owner.XwingPub) {
+			t.Fatalf("LeafKeysOf over %s's entry alone answered somebody else's wrap key", one.name)
+		}
+	}
+
+	for _, one := range []struct {
+		name       string
+		extensions []Extension
+		at         []int
+	}{
+		{"alice then bob", []Extension{aliceKeys, bobKeys}, []int{0, 1}},
+		{"bob then alice", []Extension{bobKeys, aliceKeys}, []int{0, 1}},
+		{"with an unrelated entry between them", []Extension{
+			aliceKeys,
+			{ExtensionType: ExtensionTypeApplicationId, ExtensionData: []byte("urmessage")},
+			bobKeys,
+		}, []int{0, 2}},
+		{"behind two entries of other types", []Extension{
+			{ExtensionType: ExtensionTypeApplicationId, ExtensionData: []byte("urmessage")},
+			{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x00, 0x00, 0x00}},
+			aliceKeys,
+			bobKeys,
+		}, []int{2, 3}},
+	} {
+		keys, err := LeafKeysOf(&LeafNode{Extensions: one.extensions})
+		if !errors.Is(err, ErrMalformedExtension) {
+			t.Errorf("LeafKeysOf over a leaf carrying urmessage_leaf_keys twice (%s) answered %v, want ErrMalformedExtension",
+				one.name, err)
+			continue
+		}
+		if keys != nil {
+			t.Errorf("LeafKeysOf over a leaf carrying urmessage_leaf_keys twice (%s) answered the wrap key %x beside its refusal; a commit secret wrapped to a target picked by iteration order goes to one of two devices and the other stops receiving without a parse failure anywhere",
+				one.name, keys.DeviceXwingPub)
+		}
+		// the same reader group_policy_test.go uses, for the same reason: with the repeat
+		// refused, the ORDER the two entries are named in is the only observable a reversed walk
+		// still changes, and "the walk was reversed and nothing noticed" is what this is for.
+		if at := groupPolicyPositionsNamedBy(t, err); !slices.Equal(at, one.at) {
+			t.Errorf("LeafKeysOf over a leaf %s named entries %v, want %v; the refusal has to point at the two entries in the order the vector holds them",
+				one.name, at, one.at)
+		}
 	}
 }

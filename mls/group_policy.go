@@ -185,7 +185,14 @@ func sameMemberId(left []byte, right []byte) bool {
 //
 // STABLE, which matters only for a slice that already holds a duplicate: an unstable sort would
 // order the two copies arbitrarily, so which of the two roles a duplicate carried into the
-// refusal would vary run to run.
+// refusal would vary run to run. Canonicalize sorts IN PLACE and then refuses, so the caller
+// still holds the reordered slice after the refusal, and a caller repairing the duplicate by
+// dropping the later entry keeps whichever role the sort happened to leave first.
+//
+// The stability is what TestSortingTheRolesKeepsTwoEntriesForOneMemberInTheOrderTheyArrived
+// holds, over a fixture large enough for the difference to exist: Go's unstable sort runs an
+// insertion sort below thirteen elements and is stable there by accident, so a three entry test
+// of this property observes nothing.
 func sortRolesByMemberId(roles []RoleEntry) {
 	slices.SortStableFunc(roles, func(left RoleEntry, right RoleEntry) int {
 		return compareMemberIds(left.MemberId, right.MemberId)
@@ -532,12 +539,33 @@ func (self *GroupPolicyExtension) Clone() *GroupPolicyExtension {
 // Absence is ErrNoGroupPolicy and not ErrMalformedExtension, because the two name different
 // groups: a context with no policy at all is one this profile did not create, and a context
 // whose policy will not parse is one this profile created and cannot read.
+//
+// A list carrying 0xF001 TWICE is refused, and it is refused HERE because no other door in this
+// build refuses it. RFC 9420 forbids a repeated extension type and this package hands that
+// refusal to ValSem209 in three comments; ValSem209 is not implemented. What that left was an
+// accessor answering one of two policies by iteration order over a list that is inside the
+// CONFIRMED TRANSCRIPT HASH -- so both role sets are covered by every confirmation tag the group
+// has ever produced, both are what the group agreed to by the transcript's reckoning, and which
+// one a member enforces is decided by nothing. A member reading the first and a member reading
+// the second disagree about who may remove whom while agreeing on every hash. Refusing is the
+// only answer that does not fork the group's governance silently, and it is also what makes the
+// walk direction stop mattering: at most one entry reaches the parse.
 func GroupPolicyOf(exts []Extension) (*GroupPolicyExtension, error) {
-	for _, ext := range exts {
-		if ext.ExtensionType != ExtensionTypeUrmessageGroupPolicy {
+	// the whole vector before the parse, for LeafKeysOf's reason: a scan that returned at the
+	// first match cannot see the second, so it cannot refuse the pair.
+	found := -1
+	for i := range exts {
+		if exts[i].ExtensionType != ExtensionTypeUrmessageGroupPolicy {
 			continue
 		}
-		return ParseGroupPolicyFrom(ext)
+		if found >= 0 {
+			return nil, fmt.Errorf("%w: the extension list carries urmessage_group_policy at entry %d and again at entry %d",
+				ErrMalformedExtension, found, i)
+		}
+		found = i
 	}
-	return nil, ErrNoGroupPolicy
+	if found < 0 {
+		return nil, ErrNoGroupPolicy
+	}
+	return ParseGroupPolicyFrom(exts[found])
 }
