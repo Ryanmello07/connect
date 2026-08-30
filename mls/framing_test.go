@@ -2896,6 +2896,26 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 		_, err := senderDataAAD(nil, 0, ContentType(codePoint))
 		return err
 	},
+	// framing_protect.go's section 6.3.1 PrivateMessageContent, at both ends of it. The encoder
+	// is handed nothing but the code point, because it refuses before it writes -- through
+	// FramedContent.checkArms, which is the single arm rule and is why the encoder's own default
+	// is unreachable; what this row observes is that the caller is told the number either way.
+	// The decoder reads the content type off the CLEARTEXT header, which is to say off the wire,
+	// so this is the shape an attacker chosen header arrives in and the refusal is what stops an
+	// unregistered arm being decoded as an application blob.
+	"marshalPrivateMessageContentWithPadding": func(codePoint uint64) error {
+		_, err := marshalPrivateMessageContentWithPadding(&FramedContent{
+			Sender:      Sender{SenderType: SenderTypeMember},
+			ContentType: ContentType(codePoint),
+		}, &FramedContentAuthData{}, nil)
+		return err
+	},
+	"unmarshalPrivateMessageContent": func(codePoint uint64) error {
+		_, _, err := unmarshalPrivateMessageContent(handDerivedAuthDataGolden(ContentTypeCommit),
+			&PrivateMessage{ContentType: ContentType(codePoint)},
+			Sender{SenderType: SenderTypeMember})
+		return err
+	},
 }
 
 // undeclaredCodePointsOf is every code point of a framing registry's width that the registry

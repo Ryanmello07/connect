@@ -714,3 +714,416 @@ func openSenderData(crypto CryptoProvider, senderDataSecret []byte, encryptedSen
 	}
 	return senderData, nil
 }
+
+// ---------------------------------------------------------------------------
+// PrivateMessageContent and its padding, RFC 9420 section 6.3.1
+// ---------------------------------------------------------------------------
+
+// PaddingSizeV1 is the MLS level padding this product emits, and it is ZERO.
+//
+// connect/message already pads ct_body to a size bucket -- MASTER section 8 requires
+// octet_length(ct_body) to equal size_bucket_bytes[b]+16 exactly -- so padding here would be
+// padding inside padding: it cannot narrow a bucket that has already been rounded up, and every
+// octet of it pushes a message that was sitting under a bucket boundary up onto the next rung of a
+// ladder MASTER deliberately did not renumber. Two padding schemes stacked also make the OUTER one
+// the only one an observer sees, so the inner one buys nothing an attacker on the wire can be
+// denied by it.
+//
+// The DECODER is deliberately more permissive than this constant. Any all-zero padding length is
+// accepted, because peers in the interop harness emit their own padding and a receiver that
+// refused it would fail the harness against implementations doing nothing wrong.
+const PaddingSizeV1 = 0
+
+// errNonZeroPadding is ValSem011 in the validation plan catalogue, and it is a stand in on
+// errDecryptFailed terms exactly: that plan owns the single declaration site for the exported
+// ErrNonZeroPadding, the name has not landed in this package yet, and
+// TestNoValidationOwnedNameHasLandedBesideItsStandIn fails on the commit that lands the exported
+// twin beside this one. When it lands, the return below becomes ValSem(ValSem011,
+// ErrNonZeroPadding).
+//
+// It names NO position and NO count, and that is the rule rather than terseness. The padding is
+// the tail of a plaintext an attacker would like to learn about a byte at a time, and a refusal
+// that said "byte 9 of 16 is non zero" is a decoder that answers, for each position, whether the
+// bytes before it were zero -- which is the padding oracle every one of this class of bugs has
+// been. The check that raises it accumulates over the WHOLE tail rather than stopping at the first
+// offending octet, so the position is absent from the timing as well as from the words.
+var errNonZeroPadding = errors.New("mls: private message padding is not all zero")
+
+// marshalPrivateMessageContentWithPadding serializes RFC 9420 section 6.3.1
+// PrivateMessageContent: the content arm the type selects, the auth data, and then the caller
+// supplied padding octets.
+//
+// It takes the padding as OCTETS rather than as a count, and that is why there is one serializer
+// here rather than the two the plan drafts. The count form has no production caller -- every
+// production path arrives with bytes already, because SealPrivateMessage builds them from
+// PaddingSizeV1 and hands them down -- and this package refuses a production declaration nothing
+// in production names. The count form the plan pins is a thing the TESTS want, so it lives beside
+// them, in framing_protect_test.go, with the same signature and the same refusal for a negative
+// size. The refusal that a caller can actually reach is SealPrivateMessage's, which is where a
+// padding size enters this package at all.
+//
+// Caller supplied so that a test can emit the NON ZERO padding ValSem011 is about. Nothing on the
+// production path can reach a non-zero tail, so the property has no producer inside this package
+// and would otherwise have to be forged by hand-assembling a plaintext -- which tests a
+// hand-assembled encoder rather than this one.
+//
+// The padding carries NO length prefix of its own. It is whatever remains after the content arm
+// and the auth data, which is why the decoder below reads to the end rather than asserting full
+// consumption.
+func marshalPrivateMessageContentWithPadding(content *FramedContent,
+	auth *FramedContentAuthData, padding []byte) ([]byte, error) {
+
+	if err := content.checkArms(); err != nil {
+		return nil, err
+	}
+	w := syntax.NewWriter()
+	switch content.ContentType {
+	case ContentTypeApplication:
+		w.WriteOpaque(content.ApplicationData)
+	case ContentTypeProposal:
+		if err := content.Proposal.MarshalMLS(w); err != nil {
+			return nil, err
+		}
+	case ContentTypeCommit:
+		if err := content.Commit.MarshalMLS(w); err != nil {
+			return nil, err
+		}
+	default:
+		// unreachable through checkArms, which refuses every unregistered content type ahead
+		// of this switch. It is written anyway because the two would otherwise agree only by
+		// inspection, and a later task that loosened checkArms would silently produce a
+		// plaintext with no content arm in it at all.
+		return nil, fmt.Errorf("%w: %d", ErrUnknownContentType, content.ContentType)
+	}
+	if err := auth.MarshalMLS(w, content.ContentType); err != nil {
+		return nil, err
+	}
+	w.WriteRaw(padding)
+	return w.Bytes()
+}
+
+// unmarshalPrivateMessageContent rebuilds the FramedContent from the cleartext header plus the
+// decrypted body, and enforces ValSem011 over the tail.
+//
+// The sender comes from the SENDER DATA and not from the plaintext, and the group id, epoch,
+// content type and authenticated data come from the header: RFC 9420 section 6.3.1 does not carry
+// any of the five inside the encrypted body, so this reassembles rather than decodes them. That is
+// why a caller cannot skip the sender data step and open the content first -- there would be no
+// leaf index to build the content sender out of, and no ratchet to find the key in.
+//
+// The padding check is a REFUSAL and it accumulates. Both halves matter. The RFC requires the
+// padding be all zero, and a decoder that simply stopped reading at the end of the auth data would
+// hand an attacker who can write to the plaintext -- which is to say, any member of the group -- a
+// covert channel of unbounded width inside every message, invisible to every signature because the
+// padding is inside the AEAD but outside the FramedContent that gets signed. And the accumulation
+// is what keeps the refusal from naming which octet offended: an early return would answer the
+// same sentinel but would answer it sooner for a non-zero byte at position 0 than at position 15,
+// which is the position leaked back through timing.
+func unmarshalPrivateMessageContent(plaintext []byte, header *PrivateMessage,
+	sender Sender) (*FramedContent, *FramedContentAuthData, error) {
+
+	if header == nil {
+		return nil, nil, errNilPrivateMessage
+	}
+	content := &FramedContent{
+		GroupId:           header.GroupId,
+		Epoch:             header.Epoch,
+		Sender:            sender,
+		AuthenticatedData: header.AuthenticatedData,
+		ContentType:       header.ContentType,
+	}
+	r := syntax.NewReader(plaintext)
+	switch header.ContentType {
+	case ContentTypeApplication:
+		applicationData, err := r.ReadOpaque()
+		if err != nil {
+			return nil, nil, err
+		}
+		content.ApplicationData = applicationData
+	case ContentTypeProposal:
+		content.Proposal = &Proposal{}
+		if err := content.Proposal.UnmarshalMLS(r); err != nil {
+			return nil, nil, err
+		}
+	case ContentTypeCommit:
+		content.Commit = &Commit{}
+		if err := content.Commit.UnmarshalMLS(r); err != nil {
+			return nil, nil, err
+		}
+	default:
+		return nil, nil, fmt.Errorf("%w: %d", ErrUnknownContentType, header.ContentType)
+	}
+
+	auth := &FramedContentAuthData{}
+	if err := auth.UnmarshalMLS(r, header.ContentType); err != nil {
+		return nil, nil, err
+	}
+
+	// everything left is padding. ReadRaw(Remaining()) consumes it explicitly because this
+	// package Reader has no Rest, and the whole tail is read before anything is decided about
+	// it so that the amount consumed does not vary with where the first non-zero octet sits.
+	padding, err := r.ReadRaw(r.Remaining())
+	if err != nil {
+		return nil, nil, err
+	}
+	var accumulated byte
+	for _, b := range padding {
+		accumulated |= b
+	}
+	if accumulated != 0 {
+		return nil, nil, errNonZeroPadding
+	}
+	return content, auth, nil
+}
+
+// ---------------------------------------------------------------------------
+// the message keys and PrivateMessage, RFC 9420 section 6.3.1 and section 9
+// ---------------------------------------------------------------------------
+
+// MessageKeySource is the per sender ratchet surface of RFC 9420 section 9 as the framing layer
+// needs it: ContentTypeApplication selects the application ratchet and proposal and commit select
+// the handshake one, and this layer does not have to know that.
+//
+// The secret tree implements it and OWNS everything stateful about it -- the skipped key window,
+// the retained key bound, the generation counter and its refusal to wrap. Framing holds no key
+// beyond the call it was handed in, which is why there is no method here for giving one back.
+//
+// The three methods are not interchangeable and the split is deliberate. NextMessageKey CONSUMES,
+// because a sender that dropped an answer must not be able to ask for the same generation twice.
+// MessageKey does NOT, because a receiver has to look a generation up, open the AEAD, and only
+// then say the key is spent -- a lookup that consumed would burn the real message key on the first
+// forged packet anyone on the network cared to send. EraseMessageKey is that second half, and it
+// is total: it is called on paths that never derived a key at all.
+type MessageKeySource interface {
+	NextMessageKey(contentType ContentType, leaf LeafIndex) (key []byte, nonce []byte, generation uint32, err error)
+	MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte, err error)
+	EraseMessageKey(contentType ContentType, leaf LeafIndex, generation uint32)
+}
+
+// The secret tree is the production implementation, asserted here rather than described.
+//
+// This line is the whole contract between the framing plan and the secret tree plan. The two were
+// written against each other prose -- one declares the interface, the other declares the methods
+// -- and prose is exactly what a signature drifts away from without anything failing: a leaf
+// argument widened on one side, a generation returned as uint64 on the other, an argument order
+// swapped. Every one of those compiles on its own side and is found, without this, by the message
+// protection vector family several plans later.
+var _ MessageKeySource = (*SecretTree)(nil)
+
+// errNilMessageKeySource is what section 6.3.1 two operations answer a caller that passed no key
+// source, for errNilAuthenticatedContent reason: a nil interface dereference out of a library
+// takes the caller process rather than its call, and says nothing about which argument was wrong.
+//
+// It is refused rather than defaulted for a second reason this argument has and the others do not:
+// there is no key source that could stand in for a missing one. A default would either derive
+// message keys from nothing, which is a public key every party in the world can compute, or hand
+// back the same key for every generation, which is the AEAD nonce reuse the whole of section 9 is
+// built to prevent.
+var errNilMessageKeySource = errors.New("mls: the section 6.3.1 operations require a message key source")
+
+// applyReuseGuard is RFC 9420 section 6.3.1 reuse_guard: the sender draws four random octets per
+// message and XORs them over the FIRST FOUR octets of the ratchet nonce.
+//
+// What it defends against is a sender whose ratchet state was rolled back -- restored from a
+// backup, forked across two devices, resumed after a crash -- and which therefore hands out one
+// generation twice. Without the guard that is the same key and the same nonce over two different
+// plaintexts, which for a stream cipher AEAD is a total loss of confidentiality for both. With it
+// the second message lands on a nonce 2^-32 likely to collide with the first.
+//
+// It returns a COPY, and that is not caution. The unguarded nonce is what every OTHER member of
+// the group derives for this generation, and the guard is per message; writing the guarded value
+// back over the ratchet own nonce would leave this sender holding a nonce nobody else computes, so
+// every later message it opened at that generation would fail. The secret tree hands out copies
+// for its own reasons -- see MessageKey -- and this function does not rely on that, because a
+// source that handed out its storage and a guard that wrote through it are two defects that are
+// only harmless together.
+func applyReuseGuard(nonce []byte, reuseGuard [senderDataReuseGuardSize]byte) []byte {
+	guarded := make([]byte, len(nonce))
+	copy(guarded, nonce)
+	for i := 0; i < len(reuseGuard) && i < len(guarded); i += 1 {
+		guarded[i] ^= reuseGuard[i]
+	}
+	return guarded
+}
+
+// SealPrivateMessage encrypts a signed AuthenticatedContent as an RFC 9420 section 6.3
+// PrivateMessage, emitting paddingSize octets of zero padding inside the ciphertext.
+//
+// This is the only place a padding SIZE enters this package, so it is where a negative one is
+// refused. Refused rather than clamped: make([]byte, -1) panics, so a clamp is the difference
+// between a caller's arithmetic error surfacing as this error and surfacing as a crash inside the
+// runtime with this frame nowhere in the message.
+func SealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
+	authContent *AuthenticatedContent, paddingSize int) (*PrivateMessage, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the content and the sender data are two AEAD seals through it", ErrNilCryptoProvider)
+	}
+	if paddingSize < 0 {
+		return nil, ErrInvalidPaddingSize
+	}
+	return sealPrivateMessage(crypto, keys, senderDataSecret, authContent, make([]byte, paddingSize))
+}
+
+// sealPrivateMessage is the same seal with caller supplied padding octets, and it is the only copy
+// of section 6.3.1 encrypt path: the exported entry point above delegates here.
+//
+// The CONTENT is encrypted first and the sender data second, which is the order section 6.3.2
+// forces rather than a preference: the sender data key is derived from the content ciphertext, so
+// the ciphertext has to exist before the header that names its generation can be sealed.
+//
+// The reuse guard is drawn BEFORE the generation is consumed. Both orders produce the same
+// message, and the difference is only visible when the draw fails -- at which point the version
+// that consumed first has burned a generation of this leaf ratchet on a message that was never
+// built, and every receiver will class that generation as consumed forever after.
+func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
+	authContent *AuthenticatedContent, padding []byte) (*PrivateMessage, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the content and the sender data are two AEAD seals through it", ErrNilCryptoProvider)
+	}
+	if keys == nil {
+		return nil, errNilMessageKeySource
+	}
+	if authContent == nil {
+		return nil, errNilAuthenticatedContent
+	}
+	if authContent.WireFormat != WireFormatPrivateMessage {
+		return nil, ErrWireFormatMismatch
+	}
+	content := &authContent.Content
+	// section 6.3.2 gives a PrivateMessage sender data a leaf_index and nothing else, so a non
+	// member sender has no field on the wire to travel in and no ratchet to draw a key from. It
+	// is refused here rather than encoded as leaf zero, which is a real member ratchet and
+	// would be a message sealed under somebody else keys.
+	if content.Sender.SenderType != SenderTypeMember {
+		return nil, ErrSenderNotMember
+	}
+
+	plaintext, err := marshalPrivateMessageContentWithPadding(content, &authContent.Auth, padding)
+	if err != nil {
+		return nil, err
+	}
+	var reuseGuard [senderDataReuseGuardSize]byte
+	copy(reuseGuard[:], crypto.Random(len(reuseGuard)))
+
+	key, nonce, generation, err := keys.NextMessageKey(content.ContentType, content.Sender.LeafIndex)
+	if err != nil {
+		return nil, err
+	}
+	aad, err := privateContentAAD(content.GroupId, content.Epoch, content.ContentType,
+		content.AuthenticatedData)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext, err := crypto.AeadSeal(key, applyReuseGuard(nonce, reuseGuard), aad, plaintext)
+	if err != nil {
+		return nil, err
+	}
+	// forward secrecy: the generation this message was sealed under stops existing the moment
+	// the message exists. It is erased on the SUCCESS path only -- a seal that failed produced
+	// no ciphertext anybody could open, and erasing there would consume the generation while
+	// leaving the caller with nothing to send.
+	keys.EraseMessageKey(content.ContentType, content.Sender.LeafIndex, generation)
+
+	message := &PrivateMessage{
+		GroupId:           content.GroupId,
+		Epoch:             content.Epoch,
+		ContentType:       content.ContentType,
+		AuthenticatedData: content.AuthenticatedData,
+		Ciphertext:        ciphertext,
+	}
+	senderData := &SenderData{
+		LeafIndex:  content.Sender.LeafIndex,
+		Generation: generation,
+		ReuseGuard: reuseGuard,
+	}
+	encryptedSenderData, err := sealSenderData(crypto, senderDataSecret, senderData, message, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	message.EncryptedSenderData = encryptedSenderData
+	return message, nil
+}
+
+// OpenPrivateMessage decrypts a section 6.3 PrivateMessage and verifies the sender signature.
+// ValSem006, ValSem010 and ValSem011 all come out of it.
+//
+// The signature is verified HERE rather than being left to the caller, and that is the structural
+// reason this function exists at all rather than being a decrypt the group layer calls. Who signed
+// a PrivateMessage is not knowable until the sender data has been opened -- the leaf index is
+// inside it -- so a caller handed a decrypted AuthenticatedContent and told to go and verify it
+// would be handed the sender out of a structure this function had already decided to trust.
+//
+// The order is section 6.3 and is not interchangeable: sender data, then content, then signature.
+// The sender data names the ratchet the content key is in, and the content carries the signature.
+// Every AEAD failure on either of the first two collapses into one value, for errDecryptFailed
+// reason; the erase happens between the second and the third, because a message whose AEAD opened
+// came from somebody holding this epoch keys, and holding the key open across a signature check
+// would leave a replay of the same ciphertext decryptable a second time.
+func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
+	message *PrivateMessage, resolve SignatureKeyResolver, groupContext []byte) (*AuthenticatedContent, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the sender data and the content are two AEAD opens through it", ErrNilCryptoProvider)
+	}
+	if keys == nil {
+		return nil, errNilMessageKeySource
+	}
+	if message == nil {
+		return nil, errNilPrivateMessage
+	}
+	if resolve == nil {
+		return nil, errNilSignatureKeyResolver
+	}
+
+	senderData, err := openSenderData(crypto, senderDataSecret, message.EncryptedSenderData,
+		message, message.Ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	sender := Sender{SenderType: SenderTypeMember, LeafIndex: senderData.LeafIndex}
+
+	// a refusal here is a fact about the ratchet -- consumed, too far ahead, erased epoch --
+	// and it is answered VERBATIM rather than being folded into errDecryptFailed. The two are
+	// different statements: this one says the key never existed or no longer does, which is a
+	// visible gap the product acts on, and ValSem006 says a key was found and the message did
+	// not open under it. A re-derivation here instead of a refusal would be the worse of the two
+	// available bugs, because a generation the tree has already handed out is one an attacker
+	// can replay.
+	key, nonce, err := keys.MessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation)
+	if err != nil {
+		return nil, err
+	}
+	aad, err := privateContentAAD(message.GroupId, message.Epoch, message.ContentType,
+		message.AuthenticatedData)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := crypto.AeadOpen(key, applyReuseGuard(nonce, senderData.ReuseGuard),
+		aad, message.Ciphertext)
+	if err != nil {
+		// p2 ErrAeadOpen never escapes: every open failure on this path is ValSem006, and
+		// distinguishing them would be a decryption oracle.
+		return nil, errDecryptFailed
+	}
+	keys.EraseMessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation)
+
+	content, auth, err := unmarshalPrivateMessageContent(plaintext, message, sender)
+	if err != nil {
+		return nil, err
+	}
+	authContent := &AuthenticatedContent{
+		WireFormat: WireFormatPrivateMessage,
+		Content:    *content,
+		Auth:       *auth,
+	}
+	pub, err := resolve(sender)
+	if err != nil {
+		return nil, err
+	}
+	if err := VerifyAuthenticatedContent(crypto, pub, authContent, groupContext); err != nil {
+		return nil, err
+	}
+	return authContent, nil
+}

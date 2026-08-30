@@ -462,6 +462,55 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 				bytes.Repeat([]byte{0xab}, 64))
 			return err
 		}},
+		// section 6.3.1's seal and open. Every other argument of every row is a live one -- the
+		// wire format is the one the seal admits, the sender is a member, the secret is at the
+		// provider's own hash width -- so what is observed is the nil argument and not a wire
+		// format or sender type refusal standing in front of it.
+		//
+		// The key source is refused rather than defaulted, and that is the sharpest of these six:
+		// a default would either derive message keys from nothing, which every party in the world
+		// can compute, or answer one key for every generation, which is the AEAD nonce reuse the
+		// whole of section 9 exists to prevent.
+		"sealPrivateMessage(keys)": {sentinel: errNilMessageKeySource, call: func(t *testing.T) error {
+			_, err := sealPrivateMessage(crypto, nil, secret, &AuthenticatedContent{
+				WireFormat: WireFormatPrivateMessage,
+				Content:    *framingTestMemberContent(),
+			}, nil)
+			return err
+		}},
+		"sealPrivateMessage(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
+			_, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), secret, nil, nil)
+			return err
+		}},
+		"OpenPrivateMessage(keys)": {sentinel: errNilMessageKeySource, call: func(t *testing.T) error {
+			_, err := OpenPrivateMessage(crypto, nil, secret, &PrivateMessage{},
+				StaticSignatureKey(nil), framingTestGroupContext(t))
+			return err
+		}},
+		"OpenPrivateMessage(message)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
+			_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), secret, nil,
+				StaticSignatureKey(nil), framingTestGroupContext(t))
+			return err
+		}},
+		"OpenPrivateMessage(resolve)": {sentinel: errNilSignatureKeyResolver, call: func(t *testing.T) error {
+			_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), secret,
+				&PrivateMessage{}, nil, framingTestGroupContext(t))
+			return err
+		}},
+		// the decoder, whose header is not an option but a third of its input: the group id, the
+		// epoch, the content type and the authenticated data are all reassembled from it, and
+		// there is no default header that could stand in without producing a FramedContent that
+		// describes a different message.
+		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
+			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
+				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)
+			if err != nil {
+				t.Fatalf("the plaintext this row hands the decoder: %v", err)
+			}
+			_, _, err = unmarshalPrivateMessageContent(plaintext, nil,
+				Sender{SenderType: SenderTypeMember, LeafIndex: 1})
+			return err
+		}},
 	}
 }
 

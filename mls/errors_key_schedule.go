@@ -158,5 +158,15 @@ var (
 	// as a decryption that did not work with nothing in it that says which field was wrong. The
 	// content AAD reaches this refusal through that one rather than through a switch of its
 	// own, which is the same single assembly that keeps the shared header in one place.
+	//
+	// framing_protect.go raises it at both ends of the section 6.3.1 PrivateMessageContent, which
+	// is a fourth place and is the one that runs on a DECRYPTED body. The encoder refuses ahead
+	// of writing an arm, so a plaintext with no content arm in it cannot be produced; the decoder
+	// refuses a content type read off the cleartext header, which is where a peer puts one, and
+	// without that refusal an unregistered arm would fall through to the application case and be
+	// handed up as application data. The refusal there is not the last word on the message: the
+	// AEAD has already authenticated it, so what this says is that a peer holding this epoch's
+	// keys sent a structure this package will not assemble, and each raiser names the offending
+	// value itself.
 	ErrUnknownContentType = errors.New("mls: unregistered content type")
 )

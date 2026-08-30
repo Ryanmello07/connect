@@ -213,6 +213,42 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 	arguments["openSenderData.encryptedSenderData"] = encryptedSenderData
 	arguments["openSenderData.header"] = senderDataHeader
 	arguments["openSenderData.ciphertext"] = senderDataCiphertext
+
+	// section 6.3.1's three. The open's row needs a base call that SUCCEEDS, for the reason the
+	// two sections above do: a base call that refused would leave every perturbation below it
+	// comparing one refusal against another.
+	//
+	// The key source is PINNED at one generation, which is what makes these rows mean anything.
+	// This gate calls each row twice over one script and requires the two answers to agree, and
+	// a source that advanced would hand the second call a different key whatever its arguments
+	// were -- a row satisfied by the ratchet rather than by the argument that moved. The real
+	// secret tree is exercised where its advance is the subject, in
+	// TestPrivateMessageRoundTripsThroughTheRealSecretTreeAtEveryBoundaryGeneration.
+	//
+	// The seal that builds the open's message draws its reuse guard from a provider of its OWN
+	// rather than from the fixture. Four octets off the fixture's stream would move every
+	// argument built after this one, which is a change to rows this task has nothing to do with.
+	privateSealer := mustProviderOver(t, fixture.Suite(), providerStubStream(0x71))
+	arguments["SealPrivateMessage.keys"] = framingPinnedKeySource(fixture, 0x4b, 0)
+	arguments["SealPrivateMessage.senderDataSecret"] = senderDataSecret
+	arguments["SealPrivateMessage.authContent"] = signed
+	arguments["SealPrivateMessage.paddingSize"] = 16
+	arguments["sealPrivateMessage.keys"] = framingPinnedKeySource(fixture, 0x4b, 0)
+	arguments["sealPrivateMessage.senderDataSecret"] = senderDataSecret
+	arguments["sealPrivateMessage.authContent"] = signed
+	// non-zero padding, which is the whole reason this variant exists: zeros here would leave
+	// the padding argument indistinguishable from an argument the seal ignored.
+	arguments["sealPrivateMessage.padding"] = bytes.Repeat([]byte{0x71}, 16)
+	privateMessage, err := SealPrivateMessage(privateSealer, framingPinnedKeySource(fixture, 0x4b, 0),
+		senderDataSecret, signed, 16)
+	if err != nil {
+		t.Fatalf("seal the message the OpenPrivateMessage row reads: %v", err)
+	}
+	arguments["OpenPrivateMessage.keys"] = framingPinnedKeySource(fixture, 0x4b, 0)
+	arguments["OpenPrivateMessage.senderDataSecret"] = senderDataSecret
+	arguments["OpenPrivateMessage.message"] = privateMessage
+	arguments["OpenPrivateMessage.resolve"] = StaticSignatureKey(pub)
+	arguments["OpenPrivateMessage.groupContext"] = encodedGroupContext
 }
 
 // providerPublicMessagePerturbations moves the epoch of the message being opened.
@@ -357,6 +393,29 @@ func providerPrivateMessagePerturbations(t *testing.T, operation string, paramet
 	moved := *base
 	moved.Epoch++
 	return []providerPerturbation{{where: "epoch one higher", value: reflect.ValueOf(&moved)}}
+}
+
+// providerMessageKeySourcePerturbations answers a key source that derives from a DIFFERENT seed.
+//
+// The seed and not the generation, because what this row asks is whether the operation used the
+// key material it was handed AT ALL: a seal that derived a key of its own, or that sealed under a
+// constant, answers identically here and one that read its source cannot. Everything else about
+// the source is unchanged -- same widths, same generation, same erase behaviour -- so a difference
+// in the answer is attributable to the key material and to nothing else.
+func providerMessageKeySourcePerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base, isSource := argument.Interface().(*framingKeySource)
+	if !isSource || base == nil {
+		t.Fatalf("the base argument for %s.%s is not this file's key source, so perturbing it changes nothing",
+			operation, parameter.name)
+	}
+	moved := framingPinnedKeySource(base.crypto, base.seed^0xff, base.start)
+	return []providerPerturbation{{
+		where: "a source seeded differently",
+		value: reflect.ValueOf(moved),
+	}}
 }
 
 // ---------------------------------------------------------------------------
@@ -4454,6 +4513,1487 @@ func TestOpenSenderDataRefusesAPlaintextThatIsNotExactlyASenderData(t *testing.T
 		}
 		if got != nil {
 			t.Errorf("a sender data plaintext with %s was refused and still answered %+v", row.what, *got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PrivateMessageContent and its padding, RFC 9420 section 6.3.1
+// ---------------------------------------------------------------------------
+
+// marshalPrivateMessageContent serializes a PrivateMessageContent with paddingSize zero octets
+// after the auth data, which is the count form of the section 6.3.1 serializer.
+//
+// It lives HERE and not in framing_protect.go, and that is a deviation from the plan's file layout
+// with a reason rather than a preference. Nothing in production takes a padding count at this
+// level: SealPrivateMessage is where a size enters the package, and it turns one into octets and
+// hands those down, so a count form in framing_protect.go is a declaration nothing in production
+// names -- which TestNoStubShapesRemainInSource refuses, and refuses correctly, because a body
+// nothing reaches is a body nothing checks. The signature and the refusal are the plan's
+// unchanged, so a later plan's test that calls it compiles against what it was promised.
+//
+// The negative refusal is duplicated here rather than dropped so this helper cannot hand a test a
+// panic where the production entry point hands a caller an error.
+func marshalPrivateMessageContent(content *FramedContent, auth *FramedContentAuthData,
+	paddingSize int) ([]byte, error) {
+
+	if paddingSize < 0 {
+		return nil, ErrInvalidPaddingSize
+	}
+	return marshalPrivateMessageContentWithPadding(content, auth, make([]byte, paddingSize))
+}
+
+// framingPrivateHeaderFor is the cleartext PrivateMessage header that goes with one framed
+// content: the five fields section 6.3.1 leaves outside the ciphertext.
+//
+// The decoder is handed these rather than reading them out of the plaintext, so a header built
+// some other way would be reassembling a different message from the same octets. Every test
+// below builds it through this function for that reason.
+func framingPrivateHeaderFor(content *FramedContent) *PrivateMessage {
+	return &PrivateMessage{
+		GroupId:           content.GroupId,
+		Epoch:             content.Epoch,
+		ContentType:       content.ContentType,
+		AuthenticatedData: content.AuthenticatedData,
+	}
+}
+
+// framingPrivateAuthFor is the auth data one content type carries.
+//
+// A commit carries a confirmation tag as well as a signature and the encoder refuses to write one
+// without it, so the tail this file pads is TWO fields long for a commit and one for the other
+// two. That difference is the reason the padding sweeps below run over every content type instead
+// of over the application arm alone: a padding check written against a one field tail is a check
+// whose offset arithmetic is wrong for a commit and right for everything the author looked at.
+func framingPrivateAuthFor(t *testing.T, crypto CryptoProvider, contentType ContentType) *FramedContentAuthData {
+	t.Helper()
+	auth := &FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}
+	if contentType == ContentTypeCommit {
+		auth.ConfirmationTag = bytes.Repeat([]byte{0x52}, crypto.HashSize())
+	}
+	return auth
+}
+
+// framingPrivateContentsOfEveryType is one framed content per REGISTERED content type, read off
+// the registry rather than listed.
+//
+// Listed, this sweep would state a property about the content types somebody remembered. Read off
+// the registry it states it about the ones that exist, and a content type added by a later task
+// arrives here as a fatal rather than as a silently narrower sweep.
+func framingPrivateContentsOfEveryType(t *testing.T) map[ContentType]*FramedContent {
+	t.Helper()
+	built := map[ContentType]*FramedContent{
+		ContentTypeApplication: framingTestMemberContent(),
+		ContentTypeProposal:    framingTestProposalContent(),
+		ContentTypeCommit:      framingTestCommitContent(),
+	}
+	registered := registryConstantsOfType(t, "ContentType")
+	for name, code := range registered {
+		content, held := built[ContentType(code)]
+		if !held {
+			t.Fatalf("%s is a registered content type and no content is built for it, so every padding sweep in this file runs over a subset of the registry",
+				name)
+		}
+		if content.ContentType != ContentType(code) {
+			t.Fatalf("the content built for %s carries content type %d", name, content.ContentType)
+		}
+	}
+	for contentType := range built {
+		found := false
+		for _, code := range registered {
+			if ContentType(code) == contentType {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("a content is built for content type %d, which no registry of this package holds", contentType)
+		}
+	}
+	return built
+}
+
+// framingPrivatePaddingLengths is the padding lengths every sweep below runs over.
+//
+// The ladder is derived off the widths the wire gives a length rather than sampled in the middle,
+// which is the rule p4's nonce reuse at 2^32 was missed by. 255, 256 and 257 straddle the octet
+// boundary a length-prefixed decoder would carry, and 1024 is past anything a hand written
+// constant in a padding check is likely to have been sized for.
+func framingPrivatePaddingLengths() []int {
+	lengths := []int{0, 1, 2, 3}
+	for bits := 4; bits <= 10; bits++ {
+		lengths = append(lengths, (1<<bits)-1, 1<<bits, (1<<bits)+1)
+	}
+	slices.Sort(lengths)
+	return slices.Compact(lengths)
+}
+
+// TestPrivateMessageContentRoundTripsEveryPaddingLengthAtEveryContentType is the symmetry
+// property, and it is stated for what it CANNOT see as much as for what it can.
+//
+// It holds three things a round trip can hold: that the padding lengthens the plaintext by exactly
+// the number of octets asked for and not by a length prefix as well, that the content survives,
+// and that the sender comes back as the one the caller handed in rather than one decoded out of
+// the body -- section 6.3.1 does not carry a sender inside the ciphertext, so a decoder that
+// produced one got it from somewhere it does not belong.
+//
+// What it cannot see is a padding check that never runs, because a round trip only ever presents
+// zero padding. TestPrivateMessageContentRefusesEveryNonZeroPaddingOctet is that half.
+func TestPrivateMessageContentRoundTripsEveryPaddingLengthAtEveryContentType(t *testing.T) {
+	crypto := newTestCrypto(t)
+	for contentType, content := range framingPrivateContentsOfEveryType(t) {
+		auth := framingPrivateAuthFor(t, crypto, contentType)
+		header := framingPrivateHeaderFor(content)
+		unpadded, err := marshalPrivateMessageContent(content, auth, 0)
+		if err != nil {
+			t.Fatalf("content type %d: marshal unpadded: %v", contentType, err)
+		}
+		for _, paddingSize := range framingPrivatePaddingLengths() {
+			plaintext, err := marshalPrivateMessageContent(content, auth, paddingSize)
+			if err != nil {
+				t.Fatalf("content type %d padding %d: marshal: %v", contentType, paddingSize, err)
+			}
+			if len(plaintext) != len(unpadded)+paddingSize {
+				t.Fatalf("content type %d padding %d: plaintext is %d octets, want %d",
+					contentType, paddingSize, len(plaintext), len(unpadded)+paddingSize)
+			}
+			if !bytes.Equal(plaintext[:len(unpadded)], unpadded) {
+				t.Fatalf("content type %d padding %d: the padded plaintext does not begin with the unpadded one",
+					contentType, paddingSize)
+			}
+			for at, b := range plaintext[len(unpadded):] {
+				if b != 0 {
+					t.Fatalf("content type %d padding %d: the encoder wrote %#02x at padding octet %d",
+						contentType, paddingSize, b, at)
+				}
+			}
+
+			// the sender the decoder is handed is deliberately NOT the one the content
+			// carries, so a decoder that read it out of the plaintext or off the header
+			// answers a value this comparison refuses
+			sender := Sender{SenderType: SenderTypeMember, LeafIndex: 6}
+			decodedContent, decodedAuth, err := unmarshalPrivateMessageContent(plaintext, header, sender)
+			if err != nil {
+				t.Fatalf("content type %d padding %d: unmarshal: %v", contentType, paddingSize, err)
+			}
+			if decodedContent.Sender != sender {
+				t.Fatalf("content type %d padding %d: sender %+v, want %+v",
+					contentType, paddingSize, decodedContent.Sender, sender)
+			}
+			if decodedContent.ContentType != contentType || decodedContent.Epoch != content.Epoch ||
+				!bytes.Equal(decodedContent.GroupId, content.GroupId) ||
+				!bytes.Equal(decodedContent.AuthenticatedData, content.AuthenticatedData) {
+				t.Fatalf("content type %d padding %d: header fields came back as %+v",
+					contentType, paddingSize, decodedContent)
+			}
+			if !bytes.Equal(decodedContent.ApplicationData, content.ApplicationData) {
+				t.Fatalf("content type %d padding %d: application data %q, want %q",
+					contentType, paddingSize, decodedContent.ApplicationData, content.ApplicationData)
+			}
+			if !bytes.Equal(decodedAuth.Signature, auth.Signature) ||
+				!bytes.Equal(decodedAuth.ConfirmationTag, auth.ConfirmationTag) {
+				t.Fatalf("content type %d padding %d: auth data %+v, want %+v",
+					contentType, paddingSize, decodedAuth, auth)
+			}
+			reEncoded, err := marshalPrivateMessageContent(decodedContent, decodedAuth, paddingSize)
+			if err != nil {
+				t.Fatalf("content type %d padding %d: re-marshal: %v", contentType, paddingSize, err)
+			}
+			if !bytes.Equal(reEncoded, plaintext) {
+				t.Fatalf("content type %d padding %d: re-encoding the decode gives %x, want %x",
+					contentType, paddingSize, reEncoded, plaintext)
+			}
+		}
+	}
+}
+
+// TestPrivateMessageContentRefusesEveryNonZeroPaddingOctet is ValSem011, swept over EVERY position
+// of EVERY padding length at EVERY content type.
+//
+// Derived rather than sampled, and the difference is the whole test. A decoder that checks only
+// the first padding octet, or only the last, or only the first eight, passes a test that tampers
+// at offsets somebody chose; the class here is the padding length, so every such decoder fails at
+// some position of some length. The value flipped in is 0x01 rather than 0xff because it is the
+// smallest non-zero octet and therefore the one a check written on a truthiness test or on a high
+// bit misses.
+//
+// Non-zero padding is not a cosmetic violation. The padding sits INSIDE the AEAD and OUTSIDE the
+// FramedContent the signature is taken over, so a member that writes into it has a covert channel
+// of unbounded width that no authenticator in this protocol can see. This refusal is the only
+// thing that closes it.
+func TestPrivateMessageContentRefusesEveryNonZeroPaddingOctet(t *testing.T) {
+	crypto := newTestCrypto(t)
+	refused := 0
+	for contentType, content := range framingPrivateContentsOfEveryType(t) {
+		auth := framingPrivateAuthFor(t, crypto, contentType)
+		header := framingPrivateHeaderFor(content)
+		for _, paddingSize := range framingPrivatePaddingLengths() {
+			if paddingSize == 0 {
+				continue
+			}
+			plaintext, err := marshalPrivateMessageContent(content, auth, paddingSize)
+			if err != nil {
+				t.Fatalf("content type %d padding %d: marshal: %v", contentType, paddingSize, err)
+			}
+			for offset := range paddingSize {
+				tampered := append([]byte(nil), plaintext...)
+				tampered[len(tampered)-paddingSize+offset] = 0x01
+				_, _, err := unmarshalPrivateMessageContent(tampered, header, content.Sender)
+				if !errors.Is(err, errNonZeroPadding) {
+					t.Fatalf("content type %d padding %d octet %d: got %v, want errNonZeroPadding",
+						contentType, paddingSize, offset, err)
+				}
+				refused++
+			}
+		}
+	}
+	if refused == 0 {
+		t.Fatal("no padding octet was tampered with, so this sweep asserts nothing")
+	}
+	t.Logf("%d non-zero padding octets refused across every position of every padding length at every content type", refused)
+}
+
+// TestPrivateMessageContentRefusesEveryNonZeroOctetValue is the other axis of the same rule: every
+// VALUE a padding octet can hold other than zero.
+//
+// Derived off the width of a byte rather than off a handful of values. A check written as
+// `b > 0x7f`, or as a comparison against a particular byte, or one that treated 0x00 and some
+// other value as equivalent, refuses most of the range and admits part of it -- and part of the
+// range is all an attacker needs, because a covert channel over a restricted alphabet is still a
+// covert channel.
+func TestPrivateMessageContentRefusesEveryNonZeroOctetValue(t *testing.T) {
+	crypto := newTestCrypto(t)
+	content := framingTestMemberContent()
+	auth := framingPrivateAuthFor(t, crypto, content.ContentType)
+	header := framingPrivateHeaderFor(content)
+	const paddingSize = 8
+	plaintext, err := marshalPrivateMessageContent(content, auth, paddingSize)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	values := 0
+	for value := 1; value <= int(^uint8(0)); value++ {
+		for offset := range paddingSize {
+			tampered := append([]byte(nil), plaintext...)
+			tampered[len(tampered)-paddingSize+offset] = byte(value)
+			_, _, err := unmarshalPrivateMessageContent(tampered, header, content.Sender)
+			if !errors.Is(err, errNonZeroPadding) {
+				t.Fatalf("padding octet %d set to %#02x: got %v, want errNonZeroPadding", offset, value, err)
+			}
+			values++
+		}
+	}
+	if values != paddingSize*int(^uint8(0)) {
+		t.Fatalf("the sweep ran %d combinations and the class holds %d", values, paddingSize*int(^uint8(0)))
+	}
+}
+
+// TestPrivateMessageContentPaddingRefusalNamesNoPositionOrValue is the oracle half of ValSem011.
+//
+// A padding decoder that says WHICH octet offended answers, for every position, the question "were
+// all the octets before this one zero" -- which is the padding oracle this whole class of bug is
+// named after. The refusal is therefore required to render IDENTICALLY however the padding is
+// wrong: same sentinel, same words, same absence of a number.
+//
+// The comparison is against the refusal for a DIFFERENT position rather than against a written
+// down string, so a later task that rewords the sentinel moves this test with it instead of
+// leaving a literal behind that says what somebody once believed.
+func TestPrivateMessageContentPaddingRefusalNamesNoPositionOrValue(t *testing.T) {
+	crypto := newTestCrypto(t)
+	content := framingTestMemberContent()
+	auth := framingPrivateAuthFor(t, crypto, content.ContentType)
+	header := framingPrivateHeaderFor(content)
+	const paddingSize = 32
+	plaintext, err := marshalPrivateMessageContent(content, auth, paddingSize)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rendered := map[string][]string{}
+	for offset := range paddingSize {
+		for _, value := range []byte{0x01, 0x02, 0x40, 0x80, 0xff} {
+			tampered := append([]byte(nil), plaintext...)
+			tampered[len(tampered)-paddingSize+offset] = value
+			_, _, err := unmarshalPrivateMessageContent(tampered, header, content.Sender)
+			if err == nil {
+				t.Fatalf("padding octet %d set to %#02x was accepted", offset, value)
+			}
+			where := fmt.Sprintf("octet %d set to %#02x", offset, value)
+			rendered[err.Error()] = append(rendered[err.Error()], where)
+		}
+	}
+	if len(rendered) != 1 {
+		t.Fatalf("the padding refusal renders %d different ways across the tampered positions, which tells a caller where the padding went wrong: %v",
+			len(rendered), rendered)
+	}
+	only := ""
+	for text := range rendered {
+		only = text
+	}
+	// and it does not name a position or a length by number either, which a single spelling
+	// would still allow if every case happened to render the same digits
+	if regexp.MustCompile(`[0-9]`).MatchString(only) {
+		t.Errorf("the padding refusal renders as %q, which carries a number; the position and the count are exactly what must not be in it", only)
+	}
+}
+
+// TestPrivateMessageContentAcceptsEveryAllZeroPaddingLength is the interop half of the rule.
+//
+// The RFC fixes what padding must CONTAIN and says nothing about how much of it there may be, and
+// peers in the harness emit their own. A receiver that refused a length it would not itself have
+// produced would fail the harness against implementations doing nothing wrong, so the acceptance
+// is a property in its own right rather than the absence of a check.
+func TestPrivateMessageContentAcceptsEveryAllZeroPaddingLength(t *testing.T) {
+	crypto := newTestCrypto(t)
+	for contentType, content := range framingPrivateContentsOfEveryType(t) {
+		auth := framingPrivateAuthFor(t, crypto, contentType)
+		header := framingPrivateHeaderFor(content)
+		body, err := marshalPrivateMessageContent(content, auth, 0)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+		for _, paddingSize := range framingPrivatePaddingLengths() {
+			// assembled here rather than through the encoder, so this states that the
+			// DECODER accepts a peer's padding and not merely that it accepts its own
+			peer := append(append([]byte(nil), body...), make([]byte, paddingSize)...)
+			if _, _, err := unmarshalPrivateMessageContent(peer, header, content.Sender); err != nil {
+				t.Fatalf("content type %d: a peer that padded to %d octets was refused: %v",
+					contentType, paddingSize, err)
+			}
+		}
+	}
+}
+
+// TestSealPrivateMessageRefusesEveryNegativePaddingSize sweeps the negative half of the int
+// rather than -1 alone, with the boundary derived off the width of the type.
+//
+// make([]byte, n) panics for a negative n, so the alternative to this refusal is not a wrong
+// answer but a crash inside the runtime with this frame nowhere in the message. The minimum is
+// included because a clamp written as `if paddingSize < 0 { paddingSize = 0 }` and an arithmetic
+// overflow in a caller meet exactly there.
+//
+// SealPrivateMessage is the subject: it is the only place in this package a padding SIZE enters
+// from a caller. The count form of the serializer is held to the same refusal in the same loop,
+// because it is this file's own helper and a helper that panicked where the production path
+// refuses would fail a test for a reason that is not the one it is about.
+func TestSealPrivateMessageRefusesEveryNegativePaddingSize(t *testing.T) {
+	const maxInt = int(^uint(0) >> 1)
+	const minInt = -maxInt - 1
+	crypto := newTestCrypto(t)
+	content := framingTestMemberContent()
+	auth := framingPrivateAuthFor(t, crypto, content.ContentType)
+	for _, paddingSize := range []int{-1, -2, -3, -256, minInt + 1, minInt} {
+		encoded, err := marshalPrivateMessageContent(content, auth, paddingSize)
+		if !errors.Is(err, ErrInvalidPaddingSize) {
+			t.Fatalf("padding size %d: got %v, want ErrInvalidPaddingSize", paddingSize, err)
+		}
+		if encoded != nil {
+			t.Errorf("padding size %d: refused and answered %x alongside", paddingSize, encoded)
+		}
+		message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			bytes.Repeat([]byte{0x33}, crypto.HashSize()),
+			&AuthenticatedContent{WireFormat: WireFormatPrivateMessage, Content: *content}, paddingSize)
+		if !errors.Is(err, ErrInvalidPaddingSize) {
+			t.Fatalf("seal at padding size %d: got %v, want ErrInvalidPaddingSize", paddingSize, err)
+		}
+		if message != nil {
+			t.Errorf("seal at padding size %d refused and answered a message alongside", paddingSize)
+		}
+	}
+}
+
+// TestPaddingSizeV1IsZeroBecauseTheRecordLayerPads pins the product decision, not the RFC.
+//
+// MASTER section 8 requires connect/message to pad ct_body to a size bucket, so MLS level padding
+// is padding inside padding: it cannot narrow a bucket already rounded up, and every octet of it
+// pushes a message that was under a boundary onto the next rung. The constant is what SealPrivate
+// Message emits by default, so a later task that "adds some padding for safety" changes an
+// observable property of every message this product sends and has to change this line to do it.
+func TestPaddingSizeV1IsZeroBecauseTheRecordLayerPads(t *testing.T) {
+	if PaddingSizeV1 != 0 {
+		t.Fatalf("PaddingSizeV1 = %d; connect/message pads ct_body to a size bucket, so MLS padding must be 0", PaddingSizeV1)
+	}
+}
+
+// TestUnmarshalPrivateMessageContentRefusesAnUnregisteredContentType is the header arm nothing
+// else reaches.
+//
+// The content type comes off the CLEARTEXT header, which is to say off the wire, so this switch
+// runs on a value an unauthenticated peer chose. A default arm that fell through to the
+// application case would decode a proposal's octets as an opaque blob and hand it up as
+// application data.
+func TestUnmarshalPrivateMessageContentRefusesAnUnregisteredContentType(t *testing.T) {
+	crypto := newTestCrypto(t)
+	content := framingTestMemberContent()
+	auth := framingPrivateAuthFor(t, crypto, content.ContentType)
+	plaintext, err := marshalPrivateMessageContent(content, auth, 0)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	registered := registryConstantsOfType(t, "ContentType")
+	for code := uint64(0); code <= uint64(^uint8(0)); code++ {
+		isRegistered := false
+		for _, held := range registered {
+			if held == code {
+				isRegistered = true
+			}
+		}
+		if isRegistered {
+			continue
+		}
+		header := framingPrivateHeaderFor(content)
+		header.ContentType = ContentType(code)
+		_, _, err := unmarshalPrivateMessageContent(plaintext, header, content.Sender)
+		if !errors.Is(err, ErrUnknownContentType) {
+			t.Fatalf("content type %d: got %v, want ErrUnknownContentType", code, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MessageKeySource, the reuse guard, and section 6.3's seal and open
+// ---------------------------------------------------------------------------
+
+// framingKeySource is a MessageKeySource that answers one deterministic key and nonce per
+// (contentType, leaf, generation) triple. The real one is the secret tree.
+//
+// It exists because the properties this file is about -- which nonce a seal used, whether the
+// guarded nonce was written back over the ratchet's, what a refusal from the ratchet does to the
+// caller -- are not reachable through a real secret tree at the generations they matter at. The
+// tree is exercised too, in the tests below that plant a ratchet head, and the two are
+// complementary rather than alternatives: this one can be driven to any generation and cannot say
+// what the tree does, and the tree can say what the tree does and cannot be stepped four billion
+// times.
+//
+// handed keeps the nonce slices this source gave out, unre-derived, which is what makes a guard
+// that wrote through into the ratchet's storage visible: a copy is invisible from the return value
+// and shows up only in what the source still holds afterwards.
+type framingKeySource struct {
+	crypto       CryptoProvider
+	seed         byte
+	start        uint32
+	pinned       bool
+	head         map[ContentType]uint32
+	erased       []string
+	handed       [][]byte
+	refuseNext   error
+	refuseLookup error
+}
+
+// framingNewKeySource builds a source whose first generation is start and which advances.
+func framingNewKeySource(crypto CryptoProvider, seed byte, start uint32) *framingKeySource {
+	return &framingKeySource{crypto: crypto, seed: seed, start: start, head: map[ContentType]uint32{}}
+}
+
+// framingPinnedKeySource builds one whose generation never advances, so two calls over it answer
+// the same key. The provider gates need that: a row whose base call and control call disagree
+// states nothing about any argument.
+func framingPinnedKeySource(crypto CryptoProvider, seed byte, at uint32) *framingKeySource {
+	source := framingNewKeySource(crypto, seed, at)
+	source.pinned = true
+	return source
+}
+
+// derive is a function of the whole triple and of this source's seed, at the provider's own key
+// and nonce widths.
+//
+// The generation enters as all FOUR of its octets. Truncated to one, every generation congruent
+// mod 256 would share a key and a nonce -- which is the nonce reuse these tests are written to
+// catch, reintroduced inside the instrument that is supposed to see it.
+func (self *framingKeySource) derive(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte) {
+	context := []byte{
+		self.seed, byte(contentType),
+		byte(leaf), byte(leaf >> 8), byte(leaf >> 16), byte(leaf >> 24),
+		byte(generation), byte(generation >> 8), byte(generation >> 16), byte(generation >> 24),
+	}
+	secret := bytes.Repeat([]byte{0x77}, self.crypto.HashSize())
+	key = self.crypto.ExpandWithLabel(secret, "framing test message key", context, self.crypto.KeySize())
+	nonce = self.crypto.ExpandWithLabel(secret, "framing test message nonce", context, self.crypto.NonceSize())
+	return key, nonce
+}
+
+func (self *framingKeySource) headOf(contentType ContentType) uint32 {
+	if _, held := self.head[contentType]; !held {
+		self.head[contentType] = self.start
+	}
+	return self.head[contentType]
+}
+
+func (self *framingKeySource) NextMessageKey(contentType ContentType, leaf LeafIndex) ([]byte, []byte, uint32, error) {
+	if self.refuseNext != nil {
+		return nil, nil, 0, self.refuseNext
+	}
+	generation := self.headOf(contentType)
+	if !self.pinned {
+		self.head[contentType] = generation + 1
+	}
+	key, nonce := self.derive(contentType, leaf, generation)
+	self.handed = append(self.handed, nonce)
+	return key, nonce, generation, nil
+}
+
+func (self *framingKeySource) MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) ([]byte, []byte, error) {
+	if self.refuseLookup != nil {
+		return nil, nil, self.refuseLookup
+	}
+	key, nonce := self.derive(contentType, leaf, generation)
+	self.handed = append(self.handed, nonce)
+	return key, nonce, nil
+}
+
+func (self *framingKeySource) EraseMessageKey(contentType ContentType, leaf LeafIndex, generation uint32) {
+	self.erased = append(self.erased, fmt.Sprintf("%d/%d/%d", contentType, leaf, generation))
+}
+
+// the test double answers the same surface the secret tree does, asserted here so a change to the
+// interface moves both rather than leaving this file compiling against a shape nothing implements
+var _ MessageKeySource = (*framingKeySource)(nil)
+
+// framingRecordedAead is one AEAD call this file watched go past.
+type framingRecordedAead struct {
+	key   []byte
+	nonce []byte
+	aad   []byte
+}
+
+// framingRecordingCrypto is a provider that records the key and nonce of every AEAD call made
+// through it and otherwise behaves exactly like the one it wraps.
+//
+// The nonce a seal actually used is not in its answer and is not recoverable from the ciphertext,
+// so without this the reuse guard's whole contract -- that the nonce on the wire is the ratchet
+// nonce XOR the four guard octets, and that two generations never share one -- is unobservable.
+// The alternative is to re-implement section 6.3.1 in the test and compare ciphertexts, which
+// tests the re-implementation.
+type framingRecordingCrypto struct {
+	CryptoProvider
+	seals []framingRecordedAead
+	opens []framingRecordedAead
+}
+
+func framingRecordingProvider(inner CryptoProvider) *framingRecordingCrypto {
+	return &framingRecordingCrypto{CryptoProvider: inner}
+}
+
+func (self *framingRecordingCrypto) AeadSeal(key []byte, nonce []byte, aad []byte, plaintext []byte) ([]byte, error) {
+	self.seals = append(self.seals, framingRecordedAead{
+		key:   append([]byte(nil), key...),
+		nonce: append([]byte(nil), nonce...),
+		aad:   append([]byte(nil), aad...),
+	})
+	return self.CryptoProvider.AeadSeal(key, nonce, aad, plaintext)
+}
+
+func (self *framingRecordingCrypto) AeadOpen(key []byte, nonce []byte, aad []byte, ciphertext []byte) ([]byte, error) {
+	self.opens = append(self.opens, framingRecordedAead{
+		key:   append([]byte(nil), key...),
+		nonce: append([]byte(nil), nonce...),
+		aad:   append([]byte(nil), aad...),
+	})
+	return self.CryptoProvider.AeadOpen(key, nonce, aad, ciphertext)
+}
+
+// framingPrivateSigned is a message signed under WireFormatPrivateMessage together with what it
+// takes to seal, open and check it.
+type framingPrivateSigned struct {
+	crypto           CryptoProvider
+	priv             SignaturePrivateKey
+	pub              SignaturePublicKey
+	groupContext     []byte
+	senderDataSecret []byte
+	authContent      *AuthenticatedContent
+}
+
+func framingPrivateSignedContent(t *testing.T, crypto CryptoProvider, content *FramedContent) framingPrivateSigned {
+	t.Helper()
+	priv, pub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("key pair: %v", err)
+	}
+	groupContext := framingTestGroupContext(t)
+	authContent, err := SignAuthenticatedContent(crypto, priv, WireFormatPrivateMessage, content, groupContext)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	// a commit's auth data carries a confirmation tag as well, and both the encoder and the
+	// verifier refuse one without it. The committer fills it in once it has advanced the
+	// transcript; here it is a value of the provider's own tag width and nothing more.
+	if content.ContentType == ContentTypeCommit {
+		authContent.Auth.ConfirmationTag = bytes.Repeat([]byte{0x77}, crypto.HashSize())
+	}
+	return framingPrivateSigned{
+		crypto: crypto, priv: priv, pub: pub, groupContext: groupContext,
+		senderDataSecret: bytes.Repeat([]byte{0x33}, crypto.HashSize()),
+		authContent:      authContent,
+	}
+}
+
+func framingPrivateSignedMember(t *testing.T) framingPrivateSigned {
+	t.Helper()
+	return framingPrivateSignedContent(t, newTestCrypto(t), framingTestMemberContent())
+}
+
+// framingSenderDataOf opens the cleartext header's sender data, which is where the generation and
+// the reuse guard a seal chose are readable from.
+func framingSenderDataOf(t *testing.T, crypto CryptoProvider, senderDataSecret []byte, message *PrivateMessage) *SenderData {
+	t.Helper()
+	senderData, err := openSenderData(crypto, senderDataSecret, message.EncryptedSenderData,
+		message, message.Ciphertext)
+	if err != nil {
+		t.Fatalf("open the sender data: %v", err)
+	}
+	return senderData
+}
+
+// TestApplyReuseGuardXorsEveryBitOfTheGuardAndNothingBeyondIt sweeps every bit of the guard and
+// every octet of the nonce.
+//
+// One guard value states that the function does something. The class here is the 32 bits of the
+// guard crossed with the whole width of the nonce, which is what separates a guard that XORs the
+// first four octets from one that XORs the first, from one that XORs all twelve with the guard
+// repeated, from one that XORs the LAST four -- all four of which round trip perfectly against
+// themselves and interoperate with nobody.
+func TestApplyReuseGuardXorsEveryBitOfTheGuardAndNothingBeyondIt(t *testing.T) {
+	crypto := newTestCrypto(t)
+	base := crypto.ExpandWithLabel(bytes.Repeat([]byte{0x41}, crypto.HashSize()),
+		"reuse guard sweep", nil, crypto.NonceSize())
+	if len(base) <= senderDataReuseGuardSize {
+		t.Fatalf("the nonce is %d octets and the guard is %d, so there is nothing beyond the guard to hold",
+			len(base), senderDataReuseGuardSize)
+	}
+	for at := range senderDataReuseGuardSize {
+		for bit := range 8 {
+			var guard [senderDataReuseGuardSize]byte
+			guard[at] = 1 << bit
+			original := append([]byte(nil), base...)
+			guarded := applyReuseGuard(base, guard)
+
+			if !bytes.Equal(base, original) {
+				t.Fatalf("guard octet %d bit %d: applyReuseGuard mutated the ratchet nonce in place", at, bit)
+			}
+			if len(guarded) != len(base) {
+				t.Fatalf("guard octet %d bit %d: the guarded nonce is %d octets and the ratchet nonce is %d",
+					at, bit, len(guarded), len(base))
+			}
+			want := append([]byte(nil), base...)
+			want[at] ^= 1 << bit
+			if !bytes.Equal(guarded, want) {
+				t.Fatalf("guard octet %d bit %d: guarded %x, want %x", at, bit, guarded, want)
+			}
+		}
+	}
+
+	// the zero guard is the identity, which is what says the XOR is over the guard and not over
+	// some constant of its own
+	if guarded := applyReuseGuard(base, [senderDataReuseGuardSize]byte{}); !bytes.Equal(guarded, base) {
+		t.Errorf("the zero guard moved the nonce to %x from %x", guarded, base)
+	}
+	// and the all ones guard flips exactly the guard's own width
+	all := [senderDataReuseGuardSize]byte{}
+	for i := range all {
+		all[i] = 0xff
+	}
+	guarded := applyReuseGuard(base, all)
+	for at, b := range guarded {
+		want := base[at]
+		if at < senderDataReuseGuardSize {
+			want ^= 0xff
+		}
+		if b != want {
+			t.Fatalf("under an all ones guard, nonce octet %d of %d is %#02x and want %#02x",
+				at, len(guarded), b, want)
+		}
+	}
+}
+
+// TestApplyReuseGuardAnswersStorageTheCallerDoesNotAlreadyHold is the aliasing half.
+//
+// A guard that returned its argument, or that wrote through it, leaves this sender holding a nonce
+// no other member of the group computes for that generation -- the guard is per message and the
+// ratchet nonce is not -- so every later message it tried to open at that generation would fail
+// with a bad tag and be diagnosed as tampering.
+func TestApplyReuseGuardAnswersStorageTheCallerDoesNotAlreadyHold(t *testing.T) {
+	base := bytes.Repeat([]byte{0x5c}, 12)
+	guarded := applyReuseGuard(base, [senderDataReuseGuardSize]byte{0x11, 0x22, 0x33, 0x44})
+	guarded[len(guarded)-1] ^= 0xff
+	if base[len(base)-1] != 0x5c {
+		t.Fatal("writing into the guarded nonce reached the ratchet nonce, so the two share storage")
+	}
+}
+
+// TestPrivateMessageSealOpenRoundTripsEveryContentType runs the whole path a peer runs: sign,
+// seal, serialize, parse somebody else's octets, open.
+//
+// The serialization in the middle is what makes this more than a seal-then-open: every field the
+// two AEADs are bound to has to survive the codec, so a codec that dropped one shows up here as a
+// decryption failure rather than as a difference nothing compares.
+//
+// What it CANNOT see is stated so nobody reads it as the guard: it is a symmetry property, so a
+// seal and an open that are wrong the same way pass it. The sweeps below are what hold those.
+func TestPrivateMessageSealOpenRoundTripsEveryContentType(t *testing.T) {
+	crypto := newTestCrypto(t)
+	for contentType, content := range framingPrivateContentsOfEveryType(t) {
+		signed := framingPrivateSignedContent(t, crypto, content)
+		sealKeys := framingNewKeySource(crypto, 0x01, 0)
+		message, err := SealPrivateMessage(crypto, sealKeys, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("content type %d: seal: %v", contentType, err)
+		}
+		if len(sealKeys.erased) != 1 {
+			t.Fatalf("content type %d: the seal erased %v, want exactly the generation it used",
+				contentType, sealKeys.erased)
+		}
+		if content.ApplicationData != nil && bytes.Contains(message.Ciphertext, content.ApplicationData) {
+			t.Fatalf("content type %d: the plaintext is visible in the ciphertext", contentType)
+		}
+		if len(message.EncryptedSenderData) == 0 {
+			t.Fatalf("content type %d: the message carries no encrypted sender data", contentType)
+		}
+
+		encoded, err := syntax.Marshal(message)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+		decoded := PrivateMessage{}
+		if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("content type %d: unmarshal: %v", contentType, err)
+		}
+
+		openKeys := framingNewKeySource(crypto, 0x01, 0)
+		opened, err := OpenPrivateMessage(crypto, openKeys, signed.senderDataSecret, &decoded,
+			StaticSignatureKey(signed.pub), signed.groupContext)
+		if err != nil {
+			t.Fatalf("content type %d: open: %v", contentType, err)
+		}
+		if len(openKeys.erased) != 1 {
+			t.Fatalf("content type %d: the open erased %v, want exactly the generation it opened",
+				contentType, openKeys.erased)
+		}
+		if opened.WireFormat != WireFormatPrivateMessage {
+			t.Errorf("content type %d: opened under wire format %d", contentType, opened.WireFormat)
+		}
+		if opened.Content.Sender != content.Sender {
+			t.Fatalf("content type %d: sender %+v, want %+v", contentType, opened.Content.Sender, content.Sender)
+		}
+		if !bytes.Equal(opened.Content.ApplicationData, content.ApplicationData) {
+			t.Fatalf("content type %d: application data %q, want %q",
+				contentType, opened.Content.ApplicationData, content.ApplicationData)
+		}
+		if opened.Content.ContentType != contentType {
+			t.Fatalf("content type %d came back as %d", contentType, opened.Content.ContentType)
+		}
+		if !bytes.Equal(opened.Auth.Signature, signed.authContent.Auth.Signature) ||
+			!bytes.Equal(opened.Auth.ConfirmationTag, signed.authContent.Auth.ConfirmationTag) {
+			t.Fatalf("content type %d: auth data %+v, want %+v", contentType, opened.Auth, signed.authContent.Auth)
+		}
+	}
+}
+
+// framingBoundaryGenerations is the generations every sweep in this file drives a seal at.
+//
+// Derived off the WIDTH of the counter rather than sampled around a value somebody picked. p4's
+// secret tree shipped a nonce reuse at 2^32 that passed sixty nine tests, every one of which
+// sampled the middle of the range; the two values at the top of this ladder are the ones that
+// would have caught it, and the octet boundaries below them are where a counter carried through a
+// narrower type stops agreeing with itself.
+func framingBoundaryGenerations() []uint32 {
+	last := ^uint32(0)
+	found := []uint32{0, 1, 2}
+	for bits := 8; bits < 32; bits += 8 {
+		found = append(found, uint32(1)<<bits-1, uint32(1)<<bits)
+	}
+	found = append(found, last-1, last)
+	slices.Sort(found)
+	return slices.Compact(found)
+}
+
+// TestSealPrivateMessageSealsUnderTheGuardedNonceAtEveryBoundaryGeneration is the reuse guard's
+// contract read off the AEAD call itself.
+//
+// Three things are held, and none of them is visible from the message. The key is the one the
+// source handed over, unaltered. The nonce is the source's nonce XOR the four guard octets the
+// sender data carries, exactly -- so a seal that used the unguarded nonce, or that guarded a
+// different four octets, or that drew a second guard for the AEAD than the one it published, fails
+// here while round tripping perfectly against itself. And the source's own nonce storage is
+// UNCHANGED afterwards, which is what says the guard copied.
+//
+// The sweep is over framingBoundaryGenerations because a generation that only appears in the
+// middle of the range is a generation a counter defect cannot be seen at.
+func TestSealPrivateMessageSealsUnderTheGuardedNonceAtEveryBoundaryGeneration(t *testing.T) {
+	inner := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	content := &signed.authContent.Content
+	for _, generation := range framingBoundaryGenerations() {
+		recording := framingRecordingProvider(inner)
+		keys := framingPinnedKeySource(inner, 0x01, generation)
+		message, err := SealPrivateMessage(recording, keys, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("generation %d: seal: %v", generation, err)
+		}
+		if len(recording.seals) != 2 {
+			t.Fatalf("generation %d: the seal made %d AEAD calls, want the content then the sender data",
+				generation, len(recording.seals))
+		}
+		senderData := framingSenderDataOf(t, inner, signed.senderDataSecret, message)
+		if senderData.Generation != generation {
+			t.Fatalf("the sender data carries generation %d and the source handed out %d",
+				senderData.Generation, generation)
+		}
+		if senderData.LeafIndex != content.Sender.LeafIndex {
+			t.Fatalf("generation %d: the sender data names leaf %d and the content names %d",
+				generation, senderData.LeafIndex, content.Sender.LeafIndex)
+		}
+
+		wantKey, wantNonce := keys.derive(content.ContentType, content.Sender.LeafIndex, generation)
+		if !bytes.Equal(recording.seals[0].key, wantKey) {
+			t.Fatalf("generation %d: the content was sealed under key %x and the source handed out %x",
+				generation, recording.seals[0].key, wantKey)
+		}
+		guarded := applyReuseGuard(wantNonce, senderData.ReuseGuard)
+		if !bytes.Equal(recording.seals[0].nonce, guarded) {
+			t.Fatalf("generation %d: the content was sealed under nonce %x and the ratchet nonce guarded by the published reuse guard is %x",
+				generation, recording.seals[0].nonce, guarded)
+		}
+		if bytes.Equal(recording.seals[0].nonce, wantNonce) && senderData.ReuseGuard != [senderDataReuseGuardSize]byte{} {
+			t.Fatalf("generation %d: the content was sealed under the UNGUARDED ratchet nonce while publishing a non-zero reuse guard",
+				generation)
+		}
+		if len(keys.handed) != 1 {
+			t.Fatalf("generation %d: the source handed out %d nonces, want one", generation, len(keys.handed))
+		}
+		if !bytes.Equal(keys.handed[0], wantNonce) {
+			t.Fatalf("generation %d: the source's own nonce is %x after the seal and was %x before it, so the guard wrote through",
+				generation, keys.handed[0], wantNonce)
+		}
+	}
+}
+
+// TestSealPrivateMessageNeverRepeatsAContentNonceAcrossGenerations is the nonce reuse property
+// itself, over the boundary ladder.
+//
+// A repeated (key, nonce) pair over two different plaintexts is a total loss of confidentiality for
+// both under a stream cipher AEAD, and it is the failure p4 shipped one rung down. What is compared
+// is the PAIR: a source that varied the key and reused the nonce, and one that varied the nonce and
+// reused the key, are both caught, and so is a seal that ignored one of the two.
+func TestSealPrivateMessageNeverRepeatsAContentNonceAcrossGenerations(t *testing.T) {
+	inner := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	seenNonce := map[string]uint32{}
+	seenPair := map[string]uint32{}
+	for _, generation := range framingBoundaryGenerations() {
+		recording := framingRecordingProvider(inner)
+		keys := framingPinnedKeySource(inner, 0x01, generation)
+		if _, err := SealPrivateMessage(recording, keys, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1); err != nil {
+			t.Fatalf("generation %d: seal: %v", generation, err)
+		}
+		nonce := string(recording.seals[0].nonce)
+		pair := string(recording.seals[0].key) + "|" + nonce
+		if previous, repeated := seenNonce[nonce]; repeated {
+			t.Fatalf("generation %d seals under the same nonce as generation %d", generation, previous)
+		}
+		if previous, repeated := seenPair[pair]; repeated {
+			t.Fatalf("generation %d seals under the same key and nonce as generation %d", generation, previous)
+		}
+		seenNonce[nonce] = generation
+		seenPair[pair] = generation
+	}
+	if len(seenPair) != len(framingBoundaryGenerations()) {
+		t.Fatalf("the sweep recorded %d pairs over %d generations", len(seenPair), len(framingBoundaryGenerations()))
+	}
+}
+
+// TestSealPrivateMessageDrawsAFreshReuseGuardForEveryMessage is the other half of what the guard is
+// for: one generation handed out twice must not produce one nonce twice.
+//
+// That is exactly the rolled back sender the guard exists for -- a restored backup, a forked
+// device, a resumed process -- and it is the case a source that advances cannot present. The
+// generation is held FIXED here on purpose, so the only thing that can differ between the two
+// messages is the guard.
+func TestSealPrivateMessageDrawsAFreshReuseGuardForEveryMessage(t *testing.T) {
+	inner := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	seen := map[string]int{}
+	guards := map[[senderDataReuseGuardSize]byte]int{}
+	const messages = 32
+	for i := range messages {
+		recording := framingRecordingProvider(inner)
+		keys := framingPinnedKeySource(inner, 0x01, 7)
+		message, err := SealPrivateMessage(recording, keys, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("message %d: seal: %v", i, err)
+		}
+		senderData := framingSenderDataOf(t, inner, signed.senderDataSecret, message)
+		if previous, repeated := guards[senderData.ReuseGuard]; repeated {
+			t.Fatalf("message %d published the same reuse guard as message %d, so the guard is not drawn per message",
+				i, previous)
+		}
+		guards[senderData.ReuseGuard] = i
+		nonce := string(recording.seals[0].nonce)
+		if previous, repeated := seen[nonce]; repeated {
+			t.Fatalf("message %d reuses the nonce of message %d at one generation, which is the reuse the guard exists to prevent",
+				i, previous)
+		}
+		seen[nonce] = i
+	}
+	if len(seen) != messages {
+		t.Fatalf("the sweep produced %d distinct nonces over %d messages at one generation", len(seen), messages)
+	}
+}
+
+// TestSealPrivateMessageAnswersItsKeySourceRefusalVerbatim is the guard against a seal that
+// re-derives when the ratchet says no.
+//
+// Every one of these sentinels means "there is no key here": the ratchet is exhausted, the epoch is
+// gone, the content type has no ratchet behind it. A seal that answered one of them by falling back
+// to some other generation would be encrypting under a key the receiver has already consumed --
+// which is a message an attacker who kept the earlier ciphertext can replay -- and it would do it
+// with a nil error, so nothing above would know.
+func TestSealPrivateMessageAnswersItsKeySourceRefusalVerbatim(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	for _, refusal := range []error{ErrRatchetExhausted, ErrEpochErased, ErrUnknownContentType,
+		ErrRatchetGenerationTooFarAhead, ErrSecretTreeLeafOutOfRange} {
+
+		keys := framingNewKeySource(crypto, 0x01, 0)
+		keys.refuseNext = fmt.Errorf("the ratchet says no: %w", refusal)
+		message, err := SealPrivateMessage(crypto, keys, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if !errors.Is(err, refusal) {
+			t.Fatalf("a key source refusing with %v: the seal answered %v", refusal, err)
+		}
+		if message != nil {
+			t.Errorf("a key source refusing with %v: the seal answered a message alongside its refusal", refusal)
+		}
+		if len(keys.erased) != 0 {
+			t.Errorf("a key source refusing with %v: the seal erased %v", refusal, keys.erased)
+		}
+	}
+}
+
+// TestOpenPrivateMessageAnswersItsKeySourceRefusalVerbatim is the same rule on the receive side,
+// and it is the sharper of the two.
+//
+// A refusal here is a fact about the ratchet -- consumed, too far ahead, erased epoch -- and it is
+// NOT ValSem006, which says a key was found and the message did not open under it. An open that
+// collapsed the two would tell an operator to go looking for a key mismatch when what happened is a
+// replay; an open that answered a ratchet refusal by re-deriving the generation would decrypt that
+// replay.
+func TestOpenPrivateMessageAnswersItsKeySourceRefusalVerbatim(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	for _, refusal := range []error{ErrRatchetGenerationConsumed, ErrRatchetGenerationTooFarAhead,
+		ErrRatchetExhausted, ErrEpochErased, ErrUnknownContentType} {
+
+		keys := framingNewKeySource(crypto, 0x01, 0)
+		keys.refuseLookup = fmt.Errorf("the ratchet says no: %w", refusal)
+		opened, err := OpenPrivateMessage(crypto, keys, signed.senderDataSecret, message,
+			StaticSignatureKey(signed.pub), signed.groupContext)
+		if !errors.Is(err, refusal) {
+			t.Fatalf("a key source refusing with %v: the open answered %v", refusal, err)
+		}
+		if errors.Is(err, errDecryptFailed) {
+			t.Errorf("a key source refusing with %v: the open folded a ratchet refusal into ValSem006", refusal)
+		}
+		if opened != nil {
+			t.Errorf("a key source refusing with %v: the open answered a message alongside its refusal", refusal)
+		}
+		if len(keys.erased) != 0 {
+			t.Errorf("a key source refusing with %v: the open erased %v", refusal, keys.erased)
+		}
+	}
+}
+
+// TestOpenPrivateMessageRefusesEveryKeyButTheOneTheSenderUsed is what says the open READS its key
+// source rather than deriving a key of its own.
+//
+// The source is the same construction with a different seed, so the shapes are all right and only
+// the bytes are wrong -- which is the difference between an open that looked a generation up and
+// one that recomputed something.
+func TestOpenPrivateMessageRefusesEveryKeyButTheOneTheSenderUsed(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	for seed := 0; seed <= int(^uint8(0)); seed += 17 {
+		if byte(seed) == 0x01 {
+			continue
+		}
+		opened, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, byte(seed), 0),
+			signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext)
+		if !errors.Is(err, errDecryptFailed) {
+			t.Fatalf("a key source seeded %#02x: got %v, want errDecryptFailed", seed, err)
+		}
+		if opened != nil {
+			t.Errorf("a key source seeded %#02x: refused and answered a message alongside", seed)
+		}
+	}
+}
+
+// TestSealPrivateMessageRefusesEverySenderTypeButMember derives the class off the registry.
+//
+// Section 6.3.2 gives a PrivateMessage's sender data a leaf_index and NOTHING else, so there is no
+// field on the wire for an external sender's index and no ratchet for a new member's absent leaf. A
+// seal that let one through would write the sender's index into the leaf_index field, which names a
+// real member's ratchet -- a message sealed under somebody else's keys and attributed to them.
+func TestSealPrivateMessageRefusesEverySenderTypeButMember(t *testing.T) {
+	crypto := newTestCrypto(t)
+	refused := 0
+	for name, code := range registryConstantsOfType(t, "SenderType") {
+		if SenderType(code) == SenderTypeMember {
+			continue
+		}
+		content := framingTestProposalContent()
+		content.Sender = Sender{SenderType: SenderType(code), SenderIndex: 2}
+		// assembled rather than signed, so what is being measured is the guard and not
+		// whatever the signer thinks of this sender type
+		authContent := &AuthenticatedContent{
+			WireFormat: WireFormatPrivateMessage,
+			Content:    *content,
+			Auth:       FramedContentAuthData{Signature: bytes.Repeat([]byte{0x01}, 64)},
+		}
+		message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			bytes.Repeat([]byte{0x33}, crypto.HashSize()), authContent, PaddingSizeV1)
+		if !errors.Is(err, ErrSenderNotMember) {
+			t.Fatalf("%s: got %v, want ErrSenderNotMember", name, err)
+		}
+		if message != nil {
+			t.Errorf("%s: refused and answered a message alongside", name)
+		}
+		refused++
+	}
+	if refused == 0 {
+		t.Fatal("every registered sender type is member, so this sweep asserts nothing")
+	}
+}
+
+// TestSealPrivateMessageRefusesEveryWireFormatButItsOwn derives the class off the registry too.
+//
+// The wire format is inside the signature preimage, so a content signed for a PublicMessage and
+// sealed as a PrivateMessage is a message whose signature verifies against neither -- and the
+// caller finds out at the receiver rather than here. It is checked BEFORE the sender type, and this
+// sweep pins that order by handing it a member sender: an implementation that checked the sender
+// first would answer the same thing here, so the ordering is held by the neighbouring test.
+func TestSealPrivateMessageRefusesEveryWireFormatButItsOwn(t *testing.T) {
+	crypto := newTestCrypto(t)
+	refused := 0
+	for name, code := range registryConstantsOfType(t, "WireFormat") {
+		if WireFormat(code) == WireFormatPrivateMessage {
+			continue
+		}
+		authContent := &AuthenticatedContent{
+			WireFormat: WireFormat(code),
+			Content:    *framingTestMemberContent(),
+			Auth:       FramedContentAuthData{Signature: bytes.Repeat([]byte{0x01}, 64)},
+		}
+		message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			bytes.Repeat([]byte{0x33}, crypto.HashSize()), authContent, PaddingSizeV1)
+		if !errors.Is(err, ErrWireFormatMismatch) {
+			t.Fatalf("%s: got %v, want ErrWireFormatMismatch", name, err)
+		}
+		if message != nil {
+			t.Errorf("%s: refused and answered a message alongside", name)
+		}
+		refused++
+	}
+	if refused == 0 {
+		t.Fatal("every registered wire format is the private message one, so this sweep asserts nothing")
+	}
+}
+
+// TestSealPrivateMessageRefusesTheWireFormatAheadOfTheSenderType pins the order the two guards run
+// in, which neither sweep above can see on its own.
+//
+// The order matters because a caller that got both wrong has to be told the one it can act on. The
+// wire format is a fact about how this message was SIGNED, and no amount of fixing the sender makes
+// a content signed under another wire format sealable.
+func TestSealPrivateMessageRefusesTheWireFormatAheadOfTheSenderType(t *testing.T) {
+	crypto := newTestCrypto(t)
+	content := framingTestProposalContent()
+	content.Sender = Sender{SenderType: SenderTypeNewMemberProposal}
+	authContent := &AuthenticatedContent{
+		WireFormat: WireFormatPublicMessage,
+		Content:    *content,
+		Auth:       FramedContentAuthData{Signature: bytes.Repeat([]byte{0x01}, 64)},
+	}
+	_, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		bytes.Repeat([]byte{0x33}, crypto.HashSize()), authContent, PaddingSizeV1)
+	if !errors.Is(err, ErrWireFormatMismatch) {
+		t.Fatalf("a message wrong in both: got %v, want ErrWireFormatMismatch", err)
+	}
+}
+
+// TestOpenPrivateMessageRefusesEveryTamperedOctet sweeps the whole of the message a peer can write
+// to and holds each refusal to ValSem006.
+//
+// Derived over the LENGTH of each field rather than at a position somebody chose, which is this
+// file's rule and is what separates an open that authenticates its whole ciphertext from one that
+// authenticates its first block. The sender data is keyed off the content ciphertext, so a flipped
+// ciphertext octet fails at the sender data step and a rewritten authenticated_data -- which is in
+// the content AAD and not in the sender data's -- fails at the content step; both are ValSem006,
+// and that they are the same value is the point rather than an accident.
+func TestOpenPrivateMessageRefusesEveryTamperedOctet(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	open := func(m *PrivateMessage) error {
+		_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, m, StaticSignatureKey(signed.pub), signed.groupContext)
+		return err
+	}
+	if err := open(message); err != nil {
+		t.Fatalf("the untampered message did not open, so every refusal below is unattributable: %v", err)
+	}
+
+	for at := range message.Ciphertext {
+		tampered := *message
+		tampered.Ciphertext = append([]byte(nil), message.Ciphertext...)
+		tampered.Ciphertext[at] ^= 0xff
+		if err := open(&tampered); !errors.Is(err, errDecryptFailed) {
+			t.Fatalf("ciphertext octet %d of %d: got %v, want errDecryptFailed", at, len(message.Ciphertext), err)
+		}
+	}
+	for at := range message.EncryptedSenderData {
+		tampered := *message
+		tampered.EncryptedSenderData = append([]byte(nil), message.EncryptedSenderData...)
+		tampered.EncryptedSenderData[at] ^= 0xff
+		if err := open(&tampered); !errors.Is(err, errDecryptFailed) {
+			t.Fatalf("encrypted sender data octet %d of %d: got %v, want errDecryptFailed",
+				at, len(message.EncryptedSenderData), err)
+		}
+	}
+	for at := range message.AuthenticatedData {
+		tampered := *message
+		tampered.AuthenticatedData = append([]byte(nil), message.AuthenticatedData...)
+		tampered.AuthenticatedData[at] ^= 0xff
+		if err := open(&tampered); !errors.Is(err, errDecryptFailed) {
+			t.Fatalf("authenticated data octet %d of %d: got %v, want errDecryptFailed",
+				at, len(message.AuthenticatedData), err)
+		}
+	}
+	for at := range message.GroupId {
+		tampered := *message
+		tampered.GroupId = append([]byte(nil), message.GroupId...)
+		tampered.GroupId[at] ^= 0xff
+		if err := open(&tampered); !errors.Is(err, errDecryptFailed) {
+			t.Fatalf("group id octet %d of %d: got %v, want errDecryptFailed", at, len(message.GroupId), err)
+		}
+	}
+	// the epoch and the content type are in both AADs and are not byte runs
+	movedEpoch := *message
+	movedEpoch.Epoch++
+	if err := open(&movedEpoch); !errors.Is(err, errDecryptFailed) {
+		t.Fatalf("an epoch one higher: got %v, want errDecryptFailed", err)
+	}
+	movedType := *message
+	movedType.ContentType = ContentTypeProposal
+	if err := open(&movedType); !errors.Is(err, errDecryptFailed) {
+		t.Fatalf("a rewritten content type: got %v, want errDecryptFailed", err)
+	}
+	// and the sender data secret itself, at every octet of its width
+	for at := range signed.senderDataSecret {
+		wrong := append([]byte(nil), signed.senderDataSecret...)
+		wrong[at] ^= 0xff
+		_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), wrong, message,
+			StaticSignatureKey(signed.pub), signed.groupContext)
+		if !errors.Is(err, errDecryptFailed) {
+			t.Fatalf("sender data secret octet %d of %d: got %v, want errDecryptFailed",
+				at, len(signed.senderDataSecret), err)
+		}
+	}
+}
+
+// TestOpenPrivateMessageVerifiesTheSignatureItDecrypted is ValSem010 on this path.
+//
+// The open is the only place this check can happen: who signed a PrivateMessage is not knowable
+// until the sender data has been opened, so a caller handed a decrypted AuthenticatedContent and
+// told to verify it would be verifying a sender this function had already decided to trust. An open
+// that skipped it accepts any member's message under any other member's leaf.
+//
+// The sweep is over every octet of the signature and every octet of the key, derived off their
+// lengths, because a verifier narrowed to the first block passes a single flipped bit.
+func TestOpenPrivateMessageVerifiesTheSignatureItDecrypted(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	for at := range signed.authContent.Auth.Signature {
+		forged := *signed.authContent
+		forged.Auth = FramedContentAuthData{Signature: append([]byte(nil), signed.authContent.Auth.Signature...)}
+		forged.Auth.Signature[at] ^= 0xff
+		message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, &forged, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("signature octet %d: seal: %v", at, err)
+		}
+		_, err = OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext)
+		if !errors.Is(err, errBadSignature) {
+			t.Fatalf("signature octet %d of %d: got %v, want a bad signature",
+				at, len(signed.authContent.Auth.Signature), err)
+		}
+	}
+
+	message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	for at := range signed.pub {
+		wrong := append(SignaturePublicKey(nil), signed.pub...)
+		wrong[at] ^= 0xff
+		_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, message, StaticSignatureKey(wrong), signed.groupContext)
+		if !errors.Is(err, errBadSignature) {
+			t.Fatalf("public key octet %d of %d: got %v, want a bad signature", at, len(signed.pub), err)
+		}
+	}
+	// and the group context, which is inside the signature preimage for a member sender
+	for at := range signed.groupContext {
+		wrong := append([]byte(nil), signed.groupContext...)
+		wrong[at] ^= 0xff
+		_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, message, StaticSignatureKey(signed.pub), wrong)
+		if !errors.Is(err, errBadSignature) {
+			t.Fatalf("group context octet %d of %d: got %v, want a bad signature", at, len(signed.groupContext), err)
+		}
+	}
+}
+
+// TestOpenPrivateMessageAnswersItsResolversRefusalVerbatim.
+//
+// The resolver is how the caller says whose key a leaf holds, and "I do not know that leaf" is a
+// fact the caller has to be handed back unchanged: it is a gap in the tree, not a bad signature,
+// and folding it into ValSem010 would send an operator looking for a forgery.
+func TestOpenPrivateMessageAnswersItsResolversRefusalVerbatim(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	refusal := errors.New("the resolver has no key for that leaf")
+	asked := []Sender{}
+	resolve := func(sender Sender) (SignaturePublicKey, error) {
+		asked = append(asked, sender)
+		return nil, refusal
+	}
+	if _, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, message, resolve, signed.groupContext); !errors.Is(err, refusal) {
+		t.Fatalf("got %v, want the resolver's own refusal", err)
+	}
+	if len(asked) != 1 {
+		t.Fatalf("the resolver was asked %d times, want once", len(asked))
+	}
+	// and it is asked about the sender the SENDER DATA named, not about one read off the
+	// plaintext -- there is no sender in the plaintext to read
+	want := Sender{SenderType: SenderTypeMember, LeafIndex: signed.authContent.Content.Sender.LeafIndex}
+	if asked[0] != want {
+		t.Fatalf("the resolver was asked about %+v, want %+v", asked[0], want)
+	}
+}
+
+// TestOpenPrivateMessageRefusesNonZeroPaddingItSelfDecrypted is ValSem011 reached the way a peer
+// reaches it: through a real seal, with a real AEAD tag over the offending plaintext.
+//
+// This is the only route to that check that is not a hand assembled plaintext. Reaching it requires
+// a valid tag, so what it says is that a MEMBER cannot open a covert channel inside the padding --
+// which is the threat, since the padding is inside the AEAD and outside every signature.
+func TestOpenPrivateMessageRefusesNonZeroPaddingItSelfDecrypted(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	for _, paddingSize := range []int{1, 2, 16, 64} {
+		for offset := range paddingSize {
+			padding := make([]byte, paddingSize)
+			padding[offset] = 0x01
+			message, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+				signed.senderDataSecret, signed.authContent, padding)
+			if err != nil {
+				t.Fatalf("padding %d octet %d: seal: %v", paddingSize, offset, err)
+			}
+			opened, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+				signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext)
+			if !errors.Is(err, errNonZeroPadding) {
+				t.Fatalf("padding %d octet %d: got %v, want errNonZeroPadding", paddingSize, offset, err)
+			}
+			if opened != nil {
+				t.Errorf("padding %d octet %d: refused and answered a message alongside", paddingSize, offset)
+			}
+		}
+		// and the all zero tail of the same length opens, so what refuses above is the
+		// CONTENT of the padding and not its presence
+		message, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, signed.authContent, make([]byte, paddingSize))
+		if err != nil {
+			t.Fatalf("padding %d: seal: %v", paddingSize, err)
+		}
+		if _, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext); err != nil {
+			t.Fatalf("padding %d, all zero: %v", paddingSize, err)
+		}
+	}
+}
+
+// TestSealPrivateMessageEmitsExactlyThePaddingItWasAskedFor.
+//
+// The ciphertext grows by exactly the padding size, which is what says the padding reached the
+// plaintext rather than being counted somewhere and dropped, and PaddingSizeV1 emits none.
+func TestSealPrivateMessageEmitsExactlyThePaddingItWasAskedFor(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	unpadded, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, 0)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	for _, paddingSize := range framingPrivatePaddingLengths() {
+		message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, signed.authContent, paddingSize)
+		if err != nil {
+			t.Fatalf("padding %d: seal: %v", paddingSize, err)
+		}
+		if len(message.Ciphertext) != len(unpadded.Ciphertext)+paddingSize {
+			t.Fatalf("padding %d: the ciphertext is %d octets and the unpadded one is %d",
+				paddingSize, len(message.Ciphertext), len(unpadded.Ciphertext))
+		}
+	}
+	atV1, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal at PaddingSizeV1: %v", err)
+	}
+	if len(atV1.Ciphertext) != len(unpadded.Ciphertext) {
+		t.Errorf("a seal at PaddingSizeV1 is %d octets and one at zero padding is %d",
+			len(atV1.Ciphertext), len(unpadded.Ciphertext))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the real secret tree as the message key source
+// ---------------------------------------------------------------------------
+
+// framingSecretTreeAt builds a secret tree and plants one ratchet's head, so a seal through it
+// draws the generation this file is interested in.
+//
+// Planting is the only way to reach the top of the counter: a ratchet cannot be stepped four
+// billion times in a test, and every generation this project has shipped a defect at was one no
+// sampled test visited. It is the same seam TestRatchetRefusesToWrapTheGenerationCounter uses one
+// layer down.
+func framingSecretTreeAt(t *testing.T, crypto CryptoProvider, leaf LeafIndex,
+	contentType ContentType, head uint32) *SecretTree {
+
+	t.Helper()
+	tree, err := NewSecretTree(crypto, 8, bytes.Repeat([]byte{0x2a}, crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	kind, err := ratchetTypeOf(contentType)
+	if err != nil {
+		t.Fatalf("ratchetTypeOf(%d): %v", contentType, err)
+	}
+	r, err := tree.ratchetFor(leaf, kind)
+	if err != nil {
+		t.Fatalf("ratchetFor(%d, %d): %v", leaf, kind, err)
+	}
+	r.head = head
+	return tree
+}
+
+// TestPrivateMessageRoundTripsThroughTheRealSecretTreeAtEveryBoundaryGeneration is the assertion
+// that the interface this plan declares and the implementation p4 ships are the same thing in
+// practice as well as at compile time.
+//
+// Two trees over one encryption secret, which is what a sender and a receiver actually hold: the
+// sender's NextMessageKey consumes and the receiver's MessageKey looks the same generation up, and
+// a single tree could not do both. The generations are the boundary ladder, so the wrap and the
+// octet carries are visited rather than sampled around.
+func TestPrivateMessageRoundTripsThroughTheRealSecretTreeAtEveryBoundaryGeneration(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	leaf := signed.authContent.Content.Sender.LeafIndex
+	contentType := signed.authContent.Content.ContentType
+	for _, generation := range framingBoundaryGenerations() {
+		sender := framingSecretTreeAt(t, crypto, leaf, contentType, generation)
+		receiver := framingSecretTreeAt(t, crypto, leaf, contentType, generation)
+
+		message, err := SealPrivateMessage(crypto, sender, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("generation %d: seal: %v", generation, err)
+		}
+		senderData := framingSenderDataOf(t, crypto, signed.senderDataSecret, message)
+		if senderData.Generation != generation {
+			t.Fatalf("a tree planted at generation %d sealed at generation %d", generation, senderData.Generation)
+		}
+		opened, err := OpenPrivateMessage(crypto, receiver, signed.senderDataSecret, message,
+			StaticSignatureKey(signed.pub), signed.groupContext)
+		if err != nil {
+			t.Fatalf("generation %d: open: %v", generation, err)
+		}
+		if !bytes.Equal(opened.Content.ApplicationData, signed.authContent.Content.ApplicationData) {
+			t.Fatalf("generation %d: application data %q", generation, opened.Content.ApplicationData)
+		}
+		// the open erased the generation it used, so a replay of the same octets finds no key
+		_, err = OpenPrivateMessage(crypto, receiver, signed.senderDataSecret, message,
+			StaticSignatureKey(signed.pub), signed.groupContext)
+		if err == nil {
+			t.Fatalf("generation %d: a replay of the same message opened a second time", generation)
+		}
+		if errors.Is(err, errNonZeroPadding) {
+			t.Fatalf("generation %d: a replay was refused for its padding, which is not the reason", generation)
+		}
+	}
+}
+
+// TestSealPrivateMessageRefusesRatherThanWrappingTheGenerationCounter is the boundary this project
+// has shipped a defect at one layer down, held from the layer that consumes it.
+//
+// A wrap is not a lost message. It is the generation numbers on the wire starting again at zero
+// under keys that have moved on, so every one of them collides with a number the receiver has
+// already marked consumed and the four billionth message silently becomes a replay of the first.
+// What is asserted is the REFUSAL and the absence of generation zero, not merely that something
+// went wrong: a seal that wrapped would answer a perfectly well formed message with a nil error.
+func TestSealPrivateMessageRefusesRatherThanWrappingTheGenerationCounter(t *testing.T) {
+	last := ^uint32(0)
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	leaf := signed.authContent.Content.Sender.LeafIndex
+	contentType := signed.authContent.Content.ContentType
+	tree := framingSecretTreeAt(t, crypto, leaf, contentType, last-1)
+
+	produced := []uint32{}
+	for i := range 2 {
+		message, err := SealPrivateMessage(crypto, tree, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("seal %d at the top of the counter: %v", i, err)
+		}
+		produced = append(produced,
+			framingSenderDataOf(t, crypto, signed.senderDataSecret, message).Generation)
+	}
+	if !slices.Equal(produced, []uint32{last - 1, last}) {
+		t.Fatalf("the last two seals produced generations %v, want %v", produced, []uint32{last - 1, last})
+	}
+	for i := range 3 {
+		message, err := SealPrivateMessage(crypto, tree, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if !errors.Is(err, ErrRatchetExhausted) {
+			t.Fatalf("seal %d past the end of the counter: got %v, want ErrRatchetExhausted", i, err)
+		}
+		if message != nil {
+			generation := framingSenderDataOf(t, crypto, signed.senderDataSecret, message).Generation
+			t.Fatalf("seal %d past the end of the counter answered a message at generation %d", i, generation)
 		}
 	}
 }

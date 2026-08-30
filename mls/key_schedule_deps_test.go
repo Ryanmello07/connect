@@ -96,7 +96,7 @@ var (
 // sentinel replaced by a value of another type still compiles at most call sites and
 // changes what errors.Is answers.
 var (
-	_ int   = syntax.MaxVectorLength
+	_ int = syntax.MaxVectorLength
 	// the ratchet tree exception, and the only raised bound in this package. A constant
 	// retyped here would compile at both call sites and change which trees decode.
 	_ int   = syntax.MaxRatchetTreeLength
@@ -736,7 +736,7 @@ const keyScheduleDepsFile = "key_schedule_deps_test.go"
 // pin file therefore cannot land uncounted, and the cost is the intended one -- adding a
 // pin means bumping a number in the same commit.
 var pinBlockSizes = map[string]int{
-	"crypto_test.go":            1,
+	"crypto_test.go": 1,
 	// the three framing registry widths, p6 task 1. Each is a conversion of ^T(0) to the
 	// octet or the pair of octets RFC 9420 gives that registry, which is the only form that
 	// can say a type is no WIDER than its wire field; a literal conversion the other way
@@ -749,6 +749,12 @@ var pinBlockSizes = map[string]int{
 	// and carries the same pin: drift between the interface and the wrapper has to fail at
 	// build rather than at the gate reading it.
 	"treekem_test.go": 1,
+	// framingKeySource, the MessageKeySource this file drives section 6.3.1's seal and open
+	// with. It carries the same pin for the same reason, one interface over: the double is
+	// the instrument every nonce and generation property in that file is measured through,
+	// so drift between MessageKeySource and it has to fail at BUILD rather than leave the
+	// double implementing a shape the production callers no longer take.
+	"framing_protect_test.go": 1,
 }
 
 // blankPinControl holds two package level pins and one blank assignment inside a function

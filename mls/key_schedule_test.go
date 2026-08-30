@@ -4515,6 +4515,55 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{opened.ReuseGuard[:]}
 		}},
+		// section 6.3's seal, in both its forms, and its open. What the seal answers here is the
+		// encrypted sender data rather than the content ciphertext, and that is deliberate: the
+		// content ciphertext is a plaintext plus a tag and its length moves with the signature
+		// inside it, which is a length this differential has nothing to say about. The sealed
+		// sender data is twelve octets and a tag at every width.
+		//
+		// What these rows state is the half that has bitten this construction's neighbours: the
+		// sender_data_secret is refused against KDF.Nh and the ciphertext SAMPLE is KDF.Nh octets
+		// of the content ciphertext, so a body carrying a written down 32 anywhere refuses its own
+		// secret, or samples past the ciphertext it was handed, the moment the kdf is 48 wide. The
+		// message key and nonce are the KEY SOURCE's to size, and this file's double reads both
+		// widths off the provider it was built over, so a seal that wrote either down is refused
+		// by the AEAD at the wider suite rather than passing quietly.
+		{name: "SealPrivateMessage", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+			if sealErr != nil {
+				t.Fatalf("SealPrivateMessage over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData}
+		}},
+		{name: "sealPrivateMessage", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, bytes.Repeat([]byte{0x71}, 16))
+			if sealErr != nil {
+				t.Fatalf("sealPrivateMessage over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData}
+		}},
+		{name: "OpenPrivateMessage", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+			if sealErr != nil {
+				t.Fatalf("seal the message the open row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			if _, openErr := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, message, StaticSignatureKey(signed.pub),
+				signed.groupContext); openErr != nil {
+				t.Fatalf("OpenPrivateMessage over a provider whose KDF.Nh is %d refused a message it had just sealed: %v",
+					crypto.HashSize(), openErr)
+			}
+			return nil
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })

@@ -622,6 +622,18 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// the other half of syntax.Unmarshal -- it joins the decoder's answer with Done, so a
 		// plaintext of twelve good octets and a tail is refused rather than attributed.
 		"framing_protect.go: syntax.Marshal(senderData)",
+		// section 6.3.1's PrivateMessageContent, which opens a Reader and a Writer by hand
+		// rather than being a structure handed to syntax.Marshal. It has to: the content arm is
+		// selected by a content type that is not inside the structure, and the PADDING has no
+		// length prefix, so the decoder reads to the end rather than to a field boundary and
+		// there is no Unmarshaler this shape could be written as. The default limit and not the
+		// ratchet tree one, on the AAD's reading: every vector inside a PrivateMessageContent --
+		// the application data, the signature, the confirmation tag -- is an MLS structure
+		// capped at MaxVectorLength, and a plaintext assembled past that is one no peer running
+		// the default limit could decode, which arrives as a decryption that worked followed by
+		// a parse that did not.
+		"framing_protect.go: syntax.NewReader(plaintext)",
+		"framing_protect.go: syntax.NewWriter()",
 		"framing_protect.go: syntax.Unmarshal(plaintext, senderData)",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
@@ -1457,6 +1469,40 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// ciphertext and requires each to change the verdict; and the KDF.Nh gate runs it over a
 	// provider whose hash is 48 and requires it to work there.
 	"openSenderData": "answers a structure it decrypted rather than bytes of its own, and both provider methods it reaches -- ExpandWithLabel and AeadOpen -- fail rather than answer under a wrapper that flips every answer",
+
+	// section 6.3's open, on openSenderData's terms exactly and for the same reason: it reaches
+	// AeadOpen twice through the sender data step and the content step, and under a wrapper that
+	// flips every answer neither key is the key the message was sealed under, so the row has an
+	// error rather than two answers to compare. Its answer is a view over the caller's own
+	// message besides.
+	//
+	// It is not unheld. TestProviderHasNoRemainingStubs moves its key source, its secret, its
+	// message, its resolver and its group context and requires each to change the verdict;
+	// TestOpenPrivateMessageRefusesEveryTamperedOctet sweeps every octet of the ciphertext, the
+	// encrypted sender data, the authenticated data, the group id and the secret; and
+	// TestOpenPrivateMessageVerifiesTheSignatureItDecrypted sweeps every octet of the signature,
+	// the public key and the group context.
+	"OpenPrivateMessage": "answers a verdict and a view over the message it was handed, and both AEAD opens it reaches fail rather than answer under a wrapper that flips every answer",
+
+	// section 6.3's seal, in both its forms, and the reason here is a DIFFERENT one from every
+	// other entry in this table: the row would pass whatever the implementation did. This gate
+	// compares one row's answer over the real provider against its answer over the tagging
+	// wrapper, and a seal that draws four octets of reuse_guard per message answers differently
+	// on any two calls -- so a seal that ignored its parameter entirely and reached for a
+	// provider of its own would still answer two different things, and would be reported as
+	// routing through the one it was handed. An excuse is the honest reading of that; a row
+	// would be a green light nothing can turn red.
+	//
+	// It is not unheld, and what holds it is this gate's own claim made where the entropy is
+	// controlled: TestProviderHasNoRemainingStubs builds every call of a row over a fresh
+	// provider on ONE script, so the guard is the same octets in the base call and in the
+	// tagging-wrapped one, and the answer moving is attributable to the provider rather than to
+	// the draw. TestEveryProviderOperationDrawsExactlyWhatItUses adds that the draw is exactly
+	// the four octets section 6.3.1 fixes and comes from the caller's own source, and
+	// TestSealPrivateMessageSealsUnderTheGuardedNonceAtEveryBoundaryGeneration reads the key and
+	// the nonce off the AEAD call itself.
+	"SealPrivateMessage": "draws a fresh reuse guard per message, so two calls of one row differ whatever provider they were handed and the comparison this gate makes cannot fail",
+	"sealPrivateMessage": "draws a fresh reuse guard per message, so two calls of one row differ whatever provider they were handed and the comparison this gate makes cannot fail",
 }
 
 // A construction handed a provider computes with that provider and not with one of its

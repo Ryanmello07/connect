@@ -2803,6 +2803,11 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	// read -- and the "leaves its input alone" half still runs, which is the half that matters,
 	// since the key, the message and the group context are all read again after the call.
 	"OpenPublicMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
+	// section 6.3's open, on exactly the same terms: the AuthenticatedContent it answers is the
+	// caller's header carried through plus a plaintext it decrypted, and the plaintext's arrays
+	// are the decoder's own copies. The half that matters is the one that still runs -- the key
+	// source, the secret, the message and the group context are all read again after the call.
+	"OpenPrivateMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -3526,6 +3531,111 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{opened.ReuseGuard[:]}
 		}},
+		// section 6.3.1's serializer, its decoder and its reuse guard, and then section 6.3's
+		// seal and open.
+		//
+		// The seal rows build a provider of their OWN over a constant source rather than using
+		// the one above. That is not a way around this gate: it is what makes the rows readable
+		// at all, since a seal draws four octets of reuse_guard per message and two calls over
+		// crypto/rand answer differently for a reason that has nothing to do with anybody's
+		// storage. Over a fixed source the guard is the same octets twice and the answers are
+		// comparable, which is the property this gate is about.
+		//
+		// The decoder's answers are its ApplicationData and its Signature and NOT the header
+		// fields it carries through. Those are windows onto the header by construction -- section
+		// 6.3.1 does not put a group id or an epoch inside the ciphertext, so a decoder that
+		// produced them would be producing them out of nothing -- and the header's arrays are
+		// still handed in through the recorder, so the half this row is here for still runs.
+		{name: "applyReuseGuard", call: func(take func([]byte) []byte) [][]byte {
+			return [][]byte{applyReuseGuard(take(bytes.Repeat([]byte{0x5c}, params.Nn)),
+				[senderDataReuseGuardSize]byte{0x11, 0x22, 0x33, 0x44})}
+		}},
+		{name: "marshalPrivateMessageContentWithPadding", call: func(take func([]byte) []byte) [][]byte {
+			content := framingStubFramedContentOver(take)
+			encoded, marshalErr := marshalPrivateMessageContentWithPadding(content,
+				&FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x51}, 64))},
+				take(make([]byte, 16)))
+			if marshalErr != nil {
+				t.Fatalf("marshalPrivateMessageContentWithPadding: %v", marshalErr)
+			}
+			return [][]byte{encoded}
+		}},
+		{name: "unmarshalPrivateMessageContent", call: func(take func([]byte) []byte) [][]byte {
+			content := framingStubFramedContent()
+			auth := &FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}
+			plaintext, marshalErr := marshalPrivateMessageContent(content, auth, 16)
+			if marshalErr != nil {
+				t.Fatalf("the plaintext the decoder row reads: %v", marshalErr)
+			}
+			decoded, decodedAuth, err := unmarshalPrivateMessageContent(take(plaintext),
+				&PrivateMessage{
+					GroupId:           take(content.GroupId),
+					Epoch:             content.Epoch,
+					ContentType:       content.ContentType,
+					AuthenticatedData: take(content.AuthenticatedData),
+				}, content.Sender)
+			if err != nil {
+				t.Fatalf("unmarshalPrivateMessageContent refused a plaintext it had just encoded: %v", err)
+			}
+			return [][]byte{decoded.ApplicationData, decodedAuth.Signature}
+		}},
+		{name: "SealPrivateMessage", call: func(take func([]byte) []byte) [][]byte {
+			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
+			message, sealErr := SealPrivateMessage(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				take(bytes.Repeat([]byte{0x6d}, sealer.HashSize())), &AuthenticatedContent{
+					WireFormat: WireFormatPrivateMessage,
+					Content:    *framingStubFramedContentOver(take),
+					Auth:       FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x51}, 64))},
+				}, 16)
+			if sealErr != nil {
+				t.Fatalf("SealPrivateMessage: %v", sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData, message.Ciphertext}
+		}},
+		{name: "sealPrivateMessage", call: func(take func([]byte) []byte) [][]byte {
+			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
+			message, sealErr := sealPrivateMessage(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				take(bytes.Repeat([]byte{0x6d}, sealer.HashSize())), &AuthenticatedContent{
+					WireFormat: WireFormatPrivateMessage,
+					Content:    *framingStubFramedContentOver(take),
+					Auth:       FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x51}, 64))},
+				}, take(bytes.Repeat([]byte{0x71}, 16)))
+			if sealErr != nil {
+				t.Fatalf("sealPrivateMessage: %v", sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData, message.Ciphertext}
+		}},
+		{name: "OpenPrivateMessage", call: func(take func([]byte) []byte) [][]byte {
+			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
+			priv, pub, keyErr := sealer.SignatureKeyPair()
+			if keyErr != nil {
+				t.Fatalf("the key pair the open row reads: %v", keyErr)
+			}
+			groupContext := framingStubGroupContext(t, sealer)
+			secret := bytes.Repeat([]byte{0x6d}, sealer.HashSize())
+			signed, signErr := SignAuthenticatedContent(sealer, priv, WireFormatPrivateMessage,
+				framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the open row reads: %v", signErr)
+			}
+			message, sealErr := SealPrivateMessage(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				secret, signed, 16)
+			if sealErr != nil {
+				t.Fatalf("seal the message the open row reads: %v", sealErr)
+			}
+			if _, openErr := OpenPrivateMessage(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				take(secret), &PrivateMessage{
+					GroupId:             take(message.GroupId),
+					Epoch:               message.Epoch,
+					ContentType:         message.ContentType,
+					AuthenticatedData:   take(message.AuthenticatedData),
+					EncryptedSenderData: take(message.EncryptedSenderData),
+					Ciphertext:          take(message.Ciphertext),
+				}, StaticSignatureKey(pub), take(groupContext)); openErr != nil {
+				t.Fatalf("OpenPrivateMessage refused a message it had just sealed: %v", openErr)
+			}
+			return nil
+		}},
 		// the static resolver, whose answer is a COPY of the key it was handed rather than a window
 		// onto it. The copy in its body is what this row observes: the aliasing half fails on a
 		// resolver that captured the caller's slice, and the fresh storage half fails on one that
@@ -3954,6 +4064,9 @@ var providerConstructionValues = map[string]any{
 	"OpenPublicMessage":             OpenPublicMessage,
 	"sealSenderData":                sealSenderData,
 	"openSenderData":                openSenderData,
+	"SealPrivateMessage":            SealPrivateMessage,
+	"sealPrivateMessage":            sealPrivateMessage,
+	"OpenPrivateMessage":            OpenPrivateMessage,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -4486,6 +4599,12 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 			return providerSignatureKeyResolverPerturbations(t, operation, parameter, argument)
 		}
 	case reflect.Interface:
+		// section 6.3.1's message key source, whose rule lives beside the operations that take
+		// one, in framing_protect_test.go, which is where psk_test.go, leaf_node_test.go and
+		// treekem_test.go keep theirs.
+		if argument.Type() == reflect.TypeOf((*MessageKeySource)(nil)).Elem() && !argument.IsNil() {
+			return providerMessageKeySourcePerturbations(t, operation, parameter, argument)
+		}
 		if argument.Type() != reflect.TypeOf((*CryptoProvider)(nil)).Elem() {
 			break
 		}
@@ -4827,8 +4946,10 @@ var providerStreamDependentOperations = []string{
 	"EncryptWithLabel",
 	"HpkeSeal",
 	"Random",
+	"SealPrivateMessage",
 	"SealWithLabel",
 	"SignatureKeyPair",
+	"sealPrivateMessage",
 }
 
 // The operations with no argument to move and no draw to make, each with the registry
@@ -4912,6 +5033,12 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 	// which point they fail.
 	"SealPublicMessage": {"result 0 field 2 is empty", "result 0 field 4 is empty"},
 	"OpenPublicMessage": {"result 0 field 2 is empty", "result 0 field 4 is empty"},
+	// section 6.3's open, whose row is built over the APPLICATION message the framing rows are
+	// signed over. Field 4 is the auth data's confirmation_tag, and RFC 9420 section 8.2 gives
+	// one to a commit and to nothing else, so empty is the correct answer here rather than a
+	// stub. The entry stops being correct the day this row carries a commit, at which point it
+	// fails.
+	"OpenPrivateMessage": {"result 0 field 4 is empty"},
 }
 
 // A construction whose answer is not a function of its arguments alone, named with the reason
@@ -5537,9 +5664,18 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// needed the second. Neither has a production caller until p6 task 11 assembles the
 	// PrivateMessage around them. Both entries come off by FAILING on the commit that gives them
 	// one.
-	"./sealSenderData":    "p6 task 9 lands section 6.3.2's seal and open together so the inverse is stated in one diff; p6 task 11's SealPrivateMessage is the first production caller",
-	"./openSenderData":    "p6 task 9 lands section 6.3.2's seal and open together so the inverse is stated in one diff; p6 task 11's OpenPrivateMessage is the first production caller",
-	"./privateContentAAD": "p6 task 8 lands section 6.3's two AADs together because the content AAD is assembled out of the sender data AAD; p6 task 11's PrivateMessage content encryption is the first production caller",
+	//
+	// And all three came off on p6 task 11, by FAILING on the commit that landed
+	// SealPrivateMessage and OpenPrivateMessage -- the callers they named, on the task they
+	// named. That is ten entries, every one of which expired the way this gate is built to make
+	// them expire, and the table is empty again.
+	//
+	// It stayed empty through task 11, which is worth recording because the draft of that task
+	// would have added an eleventh. The plan produces a count form of the section 6.3.1
+	// serializer beside the octet form, and nothing in production takes a count at that level, so
+	// the count form would have been a declaration excused here with no task to name as its first
+	// caller -- an entry that could never expire, which is the one shape this table must not
+	// hold. It lives in framing_protect_test.go instead, beside its only callers.
 }
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
@@ -6781,6 +6917,11 @@ var providerStreamDraws = map[string]func(params *SuiteParams) int{
 	// material in a path whose whole security rests on the one.
 	"SealWithLabel":    func(params *SuiteParams) int { return params.Nsk },
 	"SignatureKeyPair": func(params *SuiteParams) int { return params.NsigPriv },
+	// section 6.3.1's reuse_guard, which is four octets whatever the suite is: RFC 9420 fixes
+	// its width in the SenderData structure rather than deriving it from the AEAD, so this is
+	// one of the two entries in this table that is not a registry field.
+	"SealPrivateMessage": func(params *SuiteParams) int { return senderDataReuseGuardSize },
+	"sealPrivateMessage": func(params *SuiteParams) int { return senderDataReuseGuardSize },
 }
 
 // Every operation draws exactly the bytes it uses and no others.
