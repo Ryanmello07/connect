@@ -302,12 +302,12 @@ type seedCodec struct {
 	describe       func(value any) string
 }
 
-// seedCodecs is every structure this package states the corpus properties over. p4's two are here
-// and p5's two are in tree_roundtrip_test.go, joined rather than kept in a second table: each
-// property below is written once over the table, and a second table is a second place for the same
-// property to be stated more weakly.
+// seedCodecs is every structure this package states the corpus properties over. p4's two are here,
+// p5's two are in tree_roundtrip_test.go and p6's one is in framing_guard_test.go, joined rather
+// than kept in three tables: each property below is written once over the table, and a second
+// table is a second place for the same property to be stated more weakly.
 func seedCodecs() []seedCodec {
-	return append(keyScheduleSeedCodecs(), treeSeedCodecs()...)
+	return slices.Concat(keyScheduleSeedCodecs(), treeSeedCodecs(), framingSeedCodecs())
 }
 
 func keyScheduleSeedCodecs() []seedCodec {
@@ -1569,15 +1569,28 @@ func addSeedCorpus(f *testing.F, target string) int {
 // per seed, and a run that called it fewer times than seeds were handed over is a run in which the
 // hand off did not happen. That is the same fact the 401 vanishing subtests were, asserted where a
 // plain go test run reaches it.
-func fuzzTheCommittedSeedCorpus(f *testing.F, target string, property func(t *testing.T, encoded []byte)) {
+//
+// The property answers a BOOL, and that is the second half of the same correction. Every target
+// here states its property through syntax.CheckRoundTrip, which returns nil for an input that does
+// not decode -- correct against its contract, and silent. So a target handed a corpus of octets
+// none of which decode evaluates the refusal half of its property, never reaches the round trip
+// half, and reports exactly what a complete run reports: the hand off happened, the engine ran,
+// every input passed. p1 measured uniform random bytes reaching the round trip property 14 times
+// in 4096 against the SIMPLEST structure in this tree, so that is not a hypothetical corpus, it is
+// what an unseeded or a stale one looks like. What each target answers is whether THAT input
+// reached the substance of its property, and a run in which none did is a failure here rather than
+// a green run nobody can tell from a real one.
+func fuzzTheCommittedSeedCorpus(f *testing.F, target string, property func(t *testing.T, encoded []byte) bool) {
 	f.Helper()
 	added := addSeedCorpus(f, target)
-	// a plain counter and not an atomic: the default arm runs the seeds one at a time and joins
+	// plain counters and not atomics: the default arm runs the seeds one at a time and joins
 	// each before starting the next, and nothing here calls t.Parallel.
-	executed := 0
+	executed, reached := 0, 0
 	f.Fuzz(func(t *testing.T, encoded []byte) {
 		executed += 1
-		property(t, encoded)
+		if property(t, encoded) {
+			reached += 1
+		}
 	})
 	if !seedCorpusExecutionIsObservable() {
 		return
@@ -1588,7 +1601,12 @@ func fuzzTheCommittedSeedCorpus(f *testing.F, target string, property func(t *te
 		f.Errorf("%s: %d committed seeds were handed to the engine and it ran the property %d times; the corpus is reaching no engine, and every property this package states over it is stated over bytes nothing consumes",
 			target, added, executed)
 	}
-	f.Logf("%s: %d committed seeds handed over, %d engine executions", target, added, executed)
+	if reached == 0 {
+		f.Errorf("%s: the engine ran the property over %d inputs and not one of them decoded, so this target evaluated the refusal half of its property and nothing else; a corpus that reaches no decoder is indistinguishable at the reporting layer from one that reaches every arm",
+			target, executed)
+	}
+	f.Logf("%s: %d committed seeds handed over, %d engine executions, %d of them reaching the round trip property",
+		target, added, executed, reached)
 }
 
 // seedCorpusExecutionIsObservable reports whether THIS invocation of go test is one in which the
@@ -1629,10 +1647,11 @@ func seedCorpusExecutionIsObservable() bool {
 // Seeds that do not decode are not failures. A fuzzer spends most of its budget on inputs no
 // decoder accepts, and an obligation on those would drown the one that matters.
 func FuzzGroupContextRoundTrip(f *testing.F) {
-	fuzzTheCommittedSeedCorpus(f, groupContextSeedTarget, func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, groupContextSeedTarget, func(t *testing.T, encoded []byte) bool {
 		if err := syntax.CheckRoundTrip[GroupContext, *GroupContext](encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
+		return syntax.Unmarshal(encoded, &GroupContext{}) == nil
 	})
 }
 
@@ -1641,10 +1660,11 @@ func FuzzGroupContextRoundTrip(f *testing.F) {
 // coverage feedback and its found corpus per target, and one target over two grammars spends
 // half its budget on each while reporting one.
 func FuzzPreSharedKeyIdRoundTrip(f *testing.F) {
-	fuzzTheCommittedSeedCorpus(f, preSharedKeyIdSeedTarget, func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, preSharedKeyIdSeedTarget, func(t *testing.T, encoded []byte) bool {
 		if err := syntax.CheckRoundTrip[PreSharedKeyId, *PreSharedKeyId](encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
+		return syntax.Unmarshal(encoded, &PreSharedKeyId{}) == nil
 	})
 }
 

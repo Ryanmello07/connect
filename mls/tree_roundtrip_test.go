@@ -769,10 +769,16 @@ func TestUpdatePathDecodeIsRoundTripStable(t *testing.T) {
 // rather than a second spelling of the bound for the reason that helper's comment gives: this was
 // the second spelling, and both copies dropped the bound with the suite still green.
 func FuzzRatchetTreeDecode(f *testing.F) {
-	fuzzTheCommittedSeedCorpus(f, ratchetTreeSeedTarget, func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, ratchetTreeSeedTarget, func(t *testing.T, encoded []byte) bool {
 		if err := checkRatchetTreeRoundTrip(encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
+		// through UnmarshalRatchetTree and not syntax.Unmarshal, because it is the entry point that
+		// raises the vector bound to MaxRatchetTreeLength. The default one refuses trees this
+		// target's own corpus carries, and a reachability count taken through it would report zero
+		// for a target that had reached every seed.
+		_, err := UnmarshalRatchetTree(encoded)
+		return err == nil
 	})
 }
 
@@ -781,10 +787,11 @@ func FuzzRatchetTreeDecode(f *testing.F) {
 // feedback and its found corpus per target, so one target over two grammars spends half its budget
 // on each while reporting one.
 func FuzzUpdatePathDecode(f *testing.F) {
-	fuzzTheCommittedSeedCorpus(f, updatePathSeedTarget, func(t *testing.T, encoded []byte) {
+	fuzzTheCommittedSeedCorpus(f, updatePathSeedTarget, func(t *testing.T, encoded []byte) bool {
 		if err := syntax.CheckRoundTrip[UpdatePath, *UpdatePath](encoded); err != nil {
 			t.Fatalf("%d octets %x: %v", len(encoded), encoded, err)
 		}
+		return syntax.Unmarshal(encoded, &UpdatePath{}) == nil
 	})
 }
 
