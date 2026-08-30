@@ -3700,6 +3700,26 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{answered}
 		}},
+		// section 6's outermost decoder, and the one row of this class whose input an attacker
+		// chooses. Every byte that arrives from the network reaches ParseMLSMessage, so a decoded
+		// field that VIEWED the frame it arrived in is a field whoever owns that buffer can change
+		// after the message was accepted -- and the caller handing the bytes over is a transport
+		// that reuses its read buffer.
+		{name: "ParseMLSMessage", call: func(take func([]byte) []byte) [][]byte {
+			encoded, marshalErr := MarshalMLSMessage(&MLSMessage{
+				Version:        ProtocolVersionMls10,
+				WireFormat:     WireFormatPrivateMessage,
+				PrivateMessage: framingTestPrivateMessage(),
+			})
+			if marshalErr != nil {
+				t.Fatalf("encode the message the parse row reads: %v", marshalErr)
+			}
+			parsed, parseErr := ParseMLSMessage(take(encoded))
+			if parseErr != nil {
+				t.Fatalf("ParseMLSMessage: %v", parseErr)
+			}
+			return [][]byte{parsed.PrivateMessage.GroupId, parsed.PrivateMessage.Ciphertext}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		recorder := &argumentRecorder{}

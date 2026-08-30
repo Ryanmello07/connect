@@ -574,6 +574,26 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"extension.go: syntax.ReadVector(r, readOneUint16[T])",
 		"extension.go: syntax.WriteVector(w, exts, writeOneExtension)",
 		"extension.go: syntax.WriteVector(w, values, writeOneUint16[T])",
+		// the two byte level entry points of section 6's outermost structure: every byte this
+		// system sends leaves through MarshalMLSMessage and every byte that arrives enters
+		// through ParseMLSMessage. The default limit, and here that is a CEILING rather than a
+		// capacity, which is the one entry in this list where the two come apart.
+		//
+		// Four of the five arms are ordinary MLS structures capped at MaxVectorLength, and for
+		// them the default is the strictest correct reading: this decode runs before anything in
+		// the system has authenticated the sender, so a raised bound would be an acceptance rule
+		// handed to a stranger. The other two are the problem. A GroupInfo or a Welcome carrying
+		// this product's own ratchet_tree extension is larger than MaxVectorLength -- measured
+		// over a real thousand leaf tree by
+		// TestAGroupInfoAndAWelcomeCarryingThisProductsTreeNeedTheRaisedLimitInBothDirections,
+		// and again at this layer by
+		// TestParseMLSMessageCannotCarryThisProductsOwnGroupInfoOrWelcome -- so those two arms do
+		// not fit through this pair at this bound. ParseMLSMessage takes no limit argument, so
+		// the lifecycle plan that carries a Welcome cannot raise this one: it owes an entry point
+		// of its own wired to MaxRatchetTreeLength, and that is a decision written down here
+		// rather than discovered when a real group refuses to join.
+		"framing.go: syntax.Marshal(message)",
+		"framing.go: syntax.Unmarshal(data, message)",
 		// the two preimages of framing_preimage.go, each reached as syntax.Marshal over the
 		// structure the RFC writes rather than as a Writer opened here and filled by hand.
 		// syntax.Marshal(self) is the serialized AuthenticatedContent a ProposalRef is taken

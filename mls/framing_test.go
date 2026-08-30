@@ -4,6 +4,7 @@ package mls
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -2781,7 +2782,38 @@ func handDerivedTranscriptInputTail() []byte {
 	}
 }
 
+// handDerivedPrivateMessageTail is a whole valid PrivateMessage, written out here rather than
+// produced by the encoder under test.
+//
+// RFC 9420 section 6.3: an empty group_id<V>, an eight octet epoch, the application content type,
+// and three empty vectors. It stands behind the two octets the MLSMessage decoder is being asked
+// to refuse, for handDerivedCommitTail's reason: a refusal that was really a truncation would read
+// as a refusal of the code point and is not one.
+func handDerivedPrivateMessageTail() []byte {
+	return []byte{
+		0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+	}
+}
+
 var framingCodePointRefusals = map[string]func(codePoint uint64) error{
+	// framing.go's outermost structure, at both ends of the same wire format registry. The
+	// encoder is handed the code point and NO arm, because it refuses the discriminant ahead of
+	// the arm check; the decoder is handed a whole valid private message behind the two octets
+	// it refuses, so a refusal that was really a truncation cannot pass for a refusal of the
+	// code point. The version is mls10 in both, because this pair is about the second field and
+	// an unsupported version would refuse ahead of it.
+	"MLSMessage.MarshalMLS": func(codePoint uint64) error {
+		return (&MLSMessage{Version: ProtocolVersionMls10, WireFormat: WireFormat(codePoint)}).MarshalMLS(syntax.NewWriter())
+	},
+	"MLSMessage.UnmarshalMLS": func(codePoint uint64) error {
+		return (&MLSMessage{}).UnmarshalMLS(syntax.NewReader(append(
+			[]byte{0x00, 0x01, byte(codePoint >> 8), byte(codePoint)}, handDerivedPrivateMessageTail()...)))
+	},
 	"Sender.MarshalMLS": func(codePoint uint64) error {
 		return (&Sender{SenderType: SenderType(codePoint)}).MarshalMLS(syntax.NewWriter())
 	},
@@ -3341,6 +3373,46 @@ func framingProbeEncoding(t *testing.T, codec syntax.Codec) []byte {
 }
 
 var framingWholeReceiverProbes = map[string]framingReceiverProbe{
+	// section 6's outermost structure, whose two refusals stand at the FIRST two fields -- which
+	// is exactly where a decoder that assigned as it read would have stamped a version and a
+	// wire format out of a frame this package refused. The prior value and the encoding differ in
+	// the arm as well as in the discriminant, so a receiver stamped with either is visibly not
+	// the one it held.
+	"MLSMessage.UnmarshalMLS": {
+		prior: func() any {
+			return &MLSMessage{Version: ProtocolVersionMls10, WireFormat: WireFormatPrivateMessage,
+				PrivateMessage: framingTestPrivateMessage()}
+		},
+		valid: func(t *testing.T) []byte {
+			return framingProbeEncoding(t, framingTestMlsMessage(t, WireFormatPublicMessage))
+		},
+		decode: func(into any, bs []byte) error {
+			return into.(*MLSMessage).UnmarshalMLS(syntax.NewReader(bs))
+		},
+		other: func(t *testing.T) []func(into any) error {
+			unregistered := uint64(undeclaredCodePointsOf(t, "WireFormat")[0])
+			return []func(into any) error{
+				// an unregistered wire format, refused at the second field with a whole valid
+				// message standing behind it
+				func(into any) error {
+					return into.(*MLSMessage).UnmarshalMLS(syntax.NewReader(append(
+						[]byte{0x00, 0x01, byte(unregistered >> 8), byte(unregistered)},
+						handDerivedPrivateMessageTail()...)))
+				},
+				// a protocol version this profile does not implement, refused at the FIRST field
+				func(into any) error {
+					return into.(*MLSMessage).UnmarshalMLS(syntax.NewReader(append(
+						[]byte{0x00, 0x02, 0x00, 0x02}, handDerivedPrivateMessageTail()...)))
+				},
+				// and a registered wire format over a content type no registry declares, refused
+				// from strictly behind the four octets this decoder would stamp
+				func(into any) error {
+					return into.(*MLSMessage).UnmarshalMLS(syntax.NewReader(append(
+						[]byte{0x00, 0x01}, framingRefusedContentBehind(t, WireFormatPublicMessage)...)))
+				},
+			}
+		},
+	},
 	"Sender.UnmarshalMLS": {
 		prior:  func() any { return testSenderOfType(SenderTypeMember) },
 		valid:  func(t *testing.T) []byte { return handDerivedSenderGolden(SenderTypeExternal) },
@@ -5787,4 +5859,977 @@ func TestEverySectionSixThreeAadAssemblesTheSharedHeaderExactlyOnce(t *testing.T
 	}
 	t.Logf("%s is the single assembly of section 6.3's header, and %d function(s) extending it spend those fields on it and nowhere else",
 		assembly.name, extended)
+}
+
+// ---------------------------------------------------------------------------
+// MLSMessage, RFC 9420 section 6: the outermost object on the wire
+// ---------------------------------------------------------------------------
+
+// mlsMessageArmFields is every arm of MLSMessage, read off the STRUCT rather than listed: each
+// pointer field of it is an arm and no other field is.
+//
+// Derived because the alternative is the enumeration this project has been caught by fourteen
+// times. An arm added to that struct joins every sweep below without anybody remembering to add
+// it, and an arm removed empties out of them the same way.
+func mlsMessageArmFields(t *testing.T) []string {
+	t.Helper()
+	structure := reflect.TypeOf(MLSMessage{})
+	found := []string{}
+	for at := 0; at < structure.NumField(); at += 1 {
+		if structure.Field(at).Type.Kind() == reflect.Pointer {
+			found = append(found, structure.Field(at).Name)
+		}
+	}
+	slices.Sort(found)
+	if len(found) == 0 {
+		t.Fatal("MLSMessage declares no pointer field, so the arm class is empty and every sweep over it below would report green having probed nothing")
+	}
+	return found
+}
+
+// mlsMessageArmOfEachWireFormat joins the wire format registry to those arms by NAME -- the
+// constant WireFormatPublicMessage names the arm PublicMessage -- and requires the join to be a
+// bijection.
+//
+// Both directions, because either alone understates the class. A code point declared with no arm
+// is a select case this codec cannot carry; an arm declared with no code point is a field nothing
+// can ever put on the wire. A table of five rows reports neither, and the wire format registry is
+// open: the next code point IANA assigns arrives as a constant somebody adds here.
+func mlsMessageArmOfEachWireFormat(t *testing.T) map[WireFormat]string {
+	t.Helper()
+	fields := mlsMessageArmFields(t)
+	armOf := map[WireFormat]string{}
+	for name, value := range registryConstantsOfType(t, "WireFormat") {
+		arm, named := strings.CutPrefix(name, "WireFormat")
+		if !named || !slices.Contains(fields, arm) {
+			t.Fatalf("the wire format %s folds to the arm %q and MLSMessage declares the arms %v; a code point whose arm this struct does not hold is a select case nothing can encode",
+				name, arm, fields)
+		}
+		armOf[WireFormat(value)] = arm
+	}
+	named := slices.Sorted(maps.Values(armOf))
+	if !slices.Equal(named, fields) {
+		t.Fatalf("the wire format registry names the arms %v and MLSMessage declares %v; an arm no code point names is a field this codec can never write",
+			named, fields)
+	}
+	return armOf
+}
+
+// framingWireFormats is the registry itself, in code point order.
+func framingWireFormats(t *testing.T) []WireFormat {
+	t.Helper()
+	found := []WireFormat{}
+	for _, value := range registryConstantsOfType(t, "WireFormat") {
+		found = append(found, WireFormat(value))
+	}
+	slices.Sort(found)
+	return found
+}
+
+// mlsMessageCanonicalArm is one arm value put through its OWN codec once, before the wrapper is
+// anywhere in the picture.
+//
+// A nil vector and an empty one encode to the same octets, so a fixture written with a nil
+// extensions vector is a value that no decode of any bytes can produce. Comparing a decoded
+// message against such a fixture fails for a reason that has nothing to do with the structure
+// under test -- measured here: the GroupInfo and KeyPackage fixtures of this package both carry
+// one, and both round tripped BYTE EXACTLY while failing a value comparison. Canonicalizing
+// through the arm's own codec keeps the equality claim below about MLSMessage: whatever an arm
+// does to its own fields it has already done before this wrapper is reached, and a wrapper that
+// dropped or moved a field is still seen.
+func mlsMessageCanonicalArm[T any, PT interface {
+	*T
+	syntax.Codec
+}](t *testing.T, value PT) PT {
+	t.Helper()
+	encoded, err := syntax.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode a %T arm fixture: %v", value, err)
+	}
+	decoded := PT(new(T))
+	if err := syntax.Unmarshal(encoded, decoded); err != nil {
+		t.Fatalf("decode a %T arm fixture: %v", value, err)
+	}
+	return decoded
+}
+
+// mlsMessageArmValues fills one arm each, with a value distinct from every other arm's so that a
+// message carrying the wrong one is visibly the wrong one rather than an empty structure.
+func mlsMessageArmValues(t *testing.T) map[string]func(*MLSMessage) {
+	t.Helper()
+	groupInfo, welcome := testGroupInfo(), testWelcome()
+	keyPackage := KeyPackage{
+		Version:     ProtocolVersionMls10,
+		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+		InitKey:     HpkePublicKey{0xaa, 0xbb},
+		LeafNode:    *testLeafNodeOfSource(LeafNodeSourceKeyPackage),
+		Signature:   []byte{0xcc},
+	}
+	canonicalPublic := mlsMessageCanonicalArm[PublicMessage](t, framingTestPublicMessage())
+	canonicalPrivate := mlsMessageCanonicalArm[PrivateMessage](t, framingTestPrivateMessage())
+	canonicalWelcome := mlsMessageCanonicalArm[Welcome](t, &welcome)
+	canonicalGroupInfo := mlsMessageCanonicalArm[GroupInfo](t, &groupInfo)
+	canonicalKeyPackage := mlsMessageCanonicalArm[KeyPackage](t, &keyPackage)
+	return map[string]func(*MLSMessage){
+		"PublicMessage":  func(message *MLSMessage) { held := *canonicalPublic; message.PublicMessage = &held },
+		"PrivateMessage": func(message *MLSMessage) { held := *canonicalPrivate; message.PrivateMessage = &held },
+		"Welcome":        func(message *MLSMessage) { held := *canonicalWelcome; message.Welcome = &held },
+		"GroupInfo":      func(message *MLSMessage) { held := *canonicalGroupInfo; message.GroupInfo = &held },
+		"KeyPackage":     func(message *MLSMessage) { held := *canonicalKeyPackage; message.KeyPackage = &held },
+	}
+}
+
+// framingTestMlsMessage is a valid message under one wire format: the mls10 version, that wire
+// format, and exactly the arm it names.
+func framingTestMlsMessage(t *testing.T, wireFormat WireFormat) *MLSMessage {
+	t.Helper()
+	arm, named := mlsMessageArmOfEachWireFormat(t)[wireFormat]
+	if !named {
+		t.Fatalf("no arm of MLSMessage is registered at wire format %#04x", wireFormat)
+	}
+	populate, held := mlsMessageArmValues(t)[arm]
+	if !held {
+		t.Fatalf("this file has no way to fill the %s arm", arm)
+	}
+	message := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: wireFormat}
+	populate(message)
+	return message
+}
+
+// framingMlsMessageArm is the arm a message carries, found by walking the pointer fields rather
+// than by a switch, so an arm added to the struct is reached here without this file being told.
+func framingMlsMessageArm(t *testing.T, message *MLSMessage) (string, syntax.Codec) {
+	t.Helper()
+	value := reflect.ValueOf(message).Elem()
+	found, arm := "", syntax.Codec(nil)
+	for _, field := range mlsMessageArmFields(t) {
+		held := value.FieldByName(field)
+		if held.IsNil() {
+			continue
+		}
+		if found != "" {
+			t.Fatalf("this message carries the %s arm and the %s arm at once", found, field)
+		}
+		codec, isCodec := held.Interface().(syntax.Codec)
+		if !isCodec {
+			t.Fatalf("the %s arm of MLSMessage is not a syntax.Codec, so its own encoding cannot be taken", field)
+		}
+		found, arm = field, codec
+	}
+	if found == "" {
+		t.Fatal("this message carries no arm at all")
+	}
+	return found, arm
+}
+
+// mlsMessageHeaderOf is version || wire_format written out beside the codec, off the registry
+// rather than off the encoder.
+func mlsMessageHeaderOf(wireFormat WireFormat) []byte {
+	return []byte{
+		byte(ProtocolVersionMls10 >> 8), byte(ProtocolVersionMls10),
+		byte(wireFormat >> 8), byte(wireFormat),
+	}
+}
+
+// TestTheMlsMessageEncodingIsTheVersionThenTheWireFormatThenTheArmAlone holds section 6's field
+// order against a layout written beside the codec rather than read back through it.
+//
+// A round trip sees none of this. Version and wire_format are ADJACENT uint16s, so an encoder
+// that wrote them the other way round agrees with its own decoder perfectly, produces a message
+// of exactly the right length, and is read by every other implementation as a protocol version
+// nobody has defined -- which is the same defect measured on KeyPackage one file over, where the
+// two swapped fields survived the whole of mls and message green.
+//
+// The tail is the arm's OWN encoding, taken through the arm's own codec: what this wrapper
+// contributes over its five arms is the four octet header and the fact that it adds nothing else,
+// and a wrapper that wrote a length prefix around the arm -- which is what a reader reaching for
+// WriteOpaque would produce -- round trips against itself and against nobody.
+func TestTheMlsMessageEncodingIsTheVersionThenTheWireFormatThenTheArmAlone(t *testing.T) {
+	swept := 0
+	for _, wireFormat := range framingWireFormats(t) {
+		message := framingTestMlsMessage(t, wireFormat)
+		encoded, err := MarshalMLSMessage(message)
+		if err != nil {
+			t.Fatalf("a message of wire format %#04x did not encode: %v", wireFormat, err)
+		}
+		header := mlsMessageHeaderOf(wireFormat)
+		if !bytes.HasPrefix(encoded, header) {
+			t.Errorf("a message of wire format %#04x opens with %x and RFC 9420 section 6 writes %x -- the mls10 version, then the wire format",
+				wireFormat, encoded[:min(len(encoded), len(header))], header)
+			continue
+		}
+		field, arm := framingMlsMessageArm(t, message)
+		body, err := syntax.Marshal(arm)
+		if err != nil {
+			t.Fatalf("the %s arm of a %#04x message did not encode on its own: %v", field, wireFormat, err)
+		}
+		if !bytes.Equal(encoded[len(header):], body) {
+			t.Errorf("a message of wire format %#04x carries %x behind its header and the %s arm encodes on its own to %x; this wrapper is the header and nothing else",
+				wireFormat, encoded[len(header):], field, body)
+			continue
+		}
+		swept += 1
+	}
+	if swept != len(framingWireFormats(t)) {
+		t.Fatalf("%d of %d wire formats were laid out, so this gate did not cover the registry", swept, len(framingWireFormats(t)))
+	}
+}
+
+// TestMLSMessageRoundTripsEveryWireFormatThroughItsEntryPoints is the round trip over the whole
+// registry, through the two free functions the rest of the system calls.
+//
+// The arm exclusivity is the half a round trip on its own does not state: a decoder that
+// populated two arms, or that left a previous value's arm standing beside the one it read, round
+// trips byte exactly, because the encoder writes only the arm the discriminant names. What that
+// costs is a value whose Welcome field is a Welcome nobody sent.
+func TestMLSMessageRoundTripsEveryWireFormatThroughItsEntryPoints(t *testing.T) {
+	armOf := mlsMessageArmOfEachWireFormat(t)
+	fields := mlsMessageArmFields(t)
+	for _, wireFormat := range framingWireFormats(t) {
+		message := framingTestMlsMessage(t, wireFormat)
+		encoded, err := MarshalMLSMessage(message)
+		if err != nil {
+			t.Fatalf("marshal a %#04x message: %v", wireFormat, err)
+		}
+		decoded, err := ParseMLSMessage(encoded)
+		if err != nil {
+			t.Fatalf("parse a %#04x message: %v", wireFormat, err)
+		}
+		if decoded.Version != ProtocolVersionMls10 || decoded.WireFormat != wireFormat {
+			t.Errorf("a %#04x message decoded to version %d wire format %#04x", wireFormat, decoded.Version, decoded.WireFormat)
+			continue
+		}
+		held := reflect.ValueOf(decoded).Elem()
+		for _, field := range fields {
+			populated := !held.FieldByName(field).IsNil()
+			if populated != (field == armOf[wireFormat]) {
+				t.Errorf("a %#04x message decoded with its %s arm populated=%v; wire format %#04x names the %s arm and exactly that one",
+					wireFormat, field, populated, wireFormat, armOf[wireFormat])
+			}
+		}
+		if !reflect.DeepEqual(decoded, message) {
+			t.Errorf("a %#04x message decoded to %+v, want %+v", wireFormat, decoded, message)
+			continue
+		}
+		reencoded, err := MarshalMLSMessage(decoded)
+		if err != nil {
+			t.Fatalf("re-marshal a %#04x message: %v", wireFormat, err)
+		}
+		if !bytes.Equal(reencoded, encoded) {
+			t.Errorf("a %#04x message re-encoded to %x, want %x", wireFormat, reencoded, encoded)
+		}
+	}
+}
+
+// TestEveryWireFormatCarriesExactlyTheArmItNames is section 6's select, stated over the cross
+// product of the five code points with the five arms rather than over the diagonal.
+//
+// The per-case half is what stands between MLSMessage{WireFormat: WireFormatWelcome} and
+// self.Welcome.MarshalMLS(w) on a nil pointer, which is a panic raised by a value a caller
+// assembled and not by anything off the wire -- but it is raised inside the one function every
+// outbound byte of this system leaves through.
+//
+// The COUNT is the half a per-case check does not give at all, and ProposalOrRef measured what it
+// is worth one layer down: a value carrying two arms encodes to the one its discriminant names,
+// so two distinct values share one encoding and the arm nobody named is dropped in silence. Here
+// the dropped arm is dropped out of the frame a peer receives and stores, and the sender's own
+// re-read of its own message finds a field it never sent.
+func TestEveryWireFormatCarriesExactlyTheArmItNames(t *testing.T) {
+	armOf := mlsMessageArmOfEachWireFormat(t)
+	fields := mlsMessageArmFields(t)
+	populate := mlsMessageArmValues(t)
+	if !slices.Equal(slices.Sorted(maps.Keys(populate)), fields) {
+		t.Fatalf("this file fills %v and MLSMessage declares the arms %v; an arm with no way to fill it is one every sweep here skips in silence",
+			slices.Sorted(maps.Keys(populate)), fields)
+	}
+	formats := framingWireFormats(t)
+
+	// the control: the diagonal encodes, or every refusal below is a refusal of a fixture this
+	// file built wrong rather than of the mismatch it is about
+	for _, wireFormat := range formats {
+		matching := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: wireFormat}
+		populate[armOf[wireFormat]](matching)
+		if _, err := MarshalMLSMessage(matching); err != nil {
+			t.Fatalf("a message of wire format %#04x carrying its own %s arm did not encode: %v",
+				wireFormat, armOf[wireFormat], err)
+		}
+	}
+
+	foreign, armless, pairs := 0, 0, 0
+	for _, wireFormat := range formats {
+		// no arm at all, for every code point rather than for the one a case would have probed
+		empty := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: wireFormat}
+		encoded, raised, err := marshalCatchingPanic(empty)
+		if raised != nil {
+			t.Errorf("a message of wire format %#04x with no arm at all panicked in the encoder: %v; the arm the discriminant names was dereferenced without being checked for",
+				wireFormat, raised)
+		} else if !errors.Is(err, ErrContentArmMismatch) {
+			t.Errorf("a message of wire format %#04x with no arm at all encoded to %x with %v, want ErrContentArmMismatch",
+				wireFormat, encoded, err)
+		} else {
+			armless += 1
+		}
+
+		for _, field := range fields {
+			if field == armOf[wireFormat] {
+				continue
+			}
+			// the foreign arm: the count is satisfied, so the only thing that can refuse this
+			// is the per-case check for the arm the discriminant names
+			mismatched := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: wireFormat}
+			populate[field](mismatched)
+			encoded, raised, err := marshalCatchingPanic(mismatched)
+			if raised != nil {
+				t.Errorf("a message of wire format %#04x carrying the %s arm panicked in the encoder: %v",
+					wireFormat, field, raised)
+				continue
+			}
+			if !errors.Is(err, ErrContentArmMismatch) {
+				t.Errorf("a message of wire format %#04x carrying the %s arm encoded to %x with %v, want ErrContentArmMismatch; the arm it names is in neither those bytes nor the frame a peer would receive",
+					wireFormat, field, encoded, err)
+				continue
+			}
+			foreign += 1
+		}
+
+		// and more than one arm, over every PAIR the derivation produces
+		for i := 0; i < len(fields); i += 1 {
+			for j := i + 1; j < len(fields); j += 1 {
+				both := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: wireFormat}
+				populate[fields[i]](both)
+				populate[fields[j]](both)
+				encoded, raised, err := marshalCatchingPanic(both)
+				if raised != nil {
+					t.Errorf("a message of wire format %#04x carrying both the %s and the %s arm panicked in the encoder: %v",
+						wireFormat, fields[i], fields[j], raised)
+					continue
+				}
+				if !errors.Is(err, ErrContentArmMismatch) {
+					t.Errorf("a message of wire format %#04x carrying both the %s and the %s arm encoded to %x with %v; one of the two is nowhere in those octets, so it encodes identically to the value that never carried it",
+						wireFormat, fields[i], fields[j], encoded, err)
+					continue
+				}
+				pairs += 1
+			}
+		}
+	}
+	wantForeign, wantPairs := len(formats)*(len(fields)-1), len(formats)*len(fields)*(len(fields)-1)/2
+	if armless != len(formats) || foreign != wantForeign || pairs != wantPairs {
+		t.Errorf("%d armless, %d foreign and %d paired refusals over %d code points and %d arms, want %d, %d and %d",
+			armless, foreign, pairs, len(formats), len(fields), len(formats), wantForeign, wantPairs)
+	}
+	t.Logf("%d code points x %d arms: %d foreign arms, %d armless and %d pairs refused",
+		len(formats), len(fields), foreign, armless, pairs)
+}
+
+// marshalIntoCatchingPanic encodes into a Writer the CALLER holds, and reports a panic rather
+// than letting it take the test binary.
+//
+// The Writer is the point. syntax.Marshal and MarshalLimit drop the buffer whenever the encode
+// errors -- deliberately, so that a caller cannot take a partial encoding by accident -- so an
+// assertion that a refusal "wrote nothing" made through either of them compares nil against nil
+// and cannot fail. Measured here: both of the write-nothing checks below were written that way
+// first, and moving the header write to the top of MarshalMLS left them green.
+func marshalIntoCatchingPanic(w *syntax.Writer, codec syntax.Marshaler) (raised any, err error) {
+	defer func() { raised = recover() }()
+	return nil, codec.MarshalMLS(w)
+}
+
+// framingMlsMessageBody is a whole valid arm encoding, minus the four octet header, for a decoder
+// that is being asked to refuse a discriminant rather than to run out of input.
+func framingMlsMessageBody(t *testing.T, wireFormat WireFormat) []byte {
+	t.Helper()
+	encoded, err := MarshalMLSMessage(framingTestMlsMessage(t, wireFormat))
+	if err != nil {
+		t.Fatalf("encode the %#04x body this sweep stands behind: %v", wireFormat, err)
+	}
+	return encoded[len(mlsMessageHeaderOf(wireFormat)):]
+}
+
+// TestEveryUnregisteredWireFormatIsRefusedWhateverStandsBehindIt sweeps the whole sixteen bit
+// code point space, less the five the registry declares, on both halves of the codec.
+//
+// The whole space rather than a specimen, for the reason p6 task 1 swept SenderType's 252
+// undeclared octets: the width is what the registry is open over, and a decoder that refused
+// 0x0063 while accepting 0x0100 is one nothing built from a handful of samples would report.
+//
+// What the four TAILS state is the property that matters at this layer. This discriminant selects
+// which of five parsers runs on attacker controlled bytes, so the refusal has to be the
+// discriminant's own and not a consequence of the arm behind it failing to parse: the same code
+// point is refused identically with a whole valid message behind it, with garbage behind it, and
+// with nothing behind it at all. A decoder that entered an arm first and let the arm decide would
+// answer three different errors here, and for the tail that happened to parse it would answer
+// none.
+func TestEveryUnregisteredWireFormatIsRefusedWhateverStandsBehindIt(t *testing.T) {
+	body := framingMlsMessageBody(t, WireFormatPrivateMessage)
+	tails := []struct {
+		what   string
+		octets []byte
+	}{
+		{"nothing at all", nil},
+		{"a whole valid private message", body},
+		{"a single octet", []byte{0xff}},
+		{"sixty four octets of 0xff", bytes.Repeat([]byte{0xff}, 64)},
+	}
+	unregistered := undeclaredCodePointsOf(t, "WireFormat")
+	if len(unregistered) == 0 {
+		t.Fatal("the wire format registry declares every code point of its width, so this sweep has nothing to refuse")
+	}
+	refused := 0
+	for _, codePoint := range unregistered {
+		for _, tail := range tails {
+			frame := append(mlsMessageHeaderOf(WireFormat(codePoint)), tail.octets...)
+			message, err := ParseMLSMessage(frame)
+			if !errors.Is(err, ErrUnknownWireFormat) {
+				t.Fatalf("a frame naming wire format %d with %s behind it answered %v, want ErrUnknownWireFormat; the discriminant chooses which parser runs on these bytes, so it is refused on its own or it is not refused at all",
+					codePoint, tail.what, err)
+			}
+			if message != nil {
+				t.Fatalf("a frame naming wire format %d with %s behind it was refused with %v and handed back %+v; a refused parse that returns a message hands the caller fields out of bytes this package would not accept",
+					codePoint, tail.what, err, message)
+			}
+			refused += 1
+		}
+		// the encoder half of the same code point, with and without an arm standing beside it.
+		// The wire format is refused ahead of the arm check, so a message this package could
+		// never have built is still refused as the code point it names.
+		for _, populated := range []bool{false, true} {
+			message := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: WireFormat(codePoint)}
+			if populated {
+				message.PrivateMessage = framingTestPrivateMessage()
+			}
+			writer := syntax.NewWriter()
+			raised, err := marshalIntoCatchingPanic(writer, message)
+			if raised != nil {
+				t.Fatalf("encoding a message at unregistered wire format %d panicked: %v", codePoint, raised)
+			}
+			if !errors.Is(err, ErrUnknownWireFormat) {
+				t.Fatalf("encoding a message at unregistered wire format %d (arm populated=%v) answered %v, want ErrUnknownWireFormat",
+					codePoint, populated, err)
+			}
+			if writer.Len() != 0 {
+				t.Fatalf("encoding a message at unregistered wire format %d left %d octets on the caller's Writer before refusing; this header is what every peer parses before it parses anything else",
+					codePoint, writer.Len())
+			}
+			refused += 1
+		}
+	}
+	t.Logf("%d refusals over %d unregistered wire formats, on both halves and behind %d different tails",
+		refused, len(unregistered), len(tails))
+}
+
+// TestEveryProtocolVersionButMls10IsRefusedAheadOfTheWireFormat sweeps the whole version space on
+// both halves, and states the ORDER the two checks stand in.
+//
+// Spec A's v1 profile pins mls10, and a decoder that ignored the field would accept a message
+// from a protocol this package does not implement -- reading its five arm grammar out of bytes
+// some later version writes differently. The whole space rather than one wrong value, because the
+// field is sixteen bits and its registry is open.
+//
+// The ORDER is asserted rather than assumed because both orders pass a test of either check
+// alone. version stands ahead of wire_format in the structure, so a frame that is wrong in both
+// is refused as the version: the reverse order tells a peer running a later protocol that its
+// WIRE FORMAT was unknown, which is a true statement about a field this implementation had no
+// business reading yet and which sends whoever debugs it to the wrong registry.
+func TestEveryProtocolVersionButMls10IsRefusedAheadOfTheWireFormat(t *testing.T) {
+	body := framingMlsMessageBody(t, WireFormatPrivateMessage)
+	unregistered := WireFormat(undeclaredCodePointsOf(t, "WireFormat")[0])
+
+	// the control: the same body under mls10 and a registered wire format is ACCEPTED, so every
+	// refusal below is a refusal of the version rather than of the fixture
+	accepted := append(mlsMessageHeaderOf(WireFormatPrivateMessage), body...)
+	if _, err := ParseMLSMessage(accepted); err != nil {
+		t.Fatalf("the mls10 control frame this sweep varies the version of was refused: %v", err)
+	}
+
+	swept := 0
+	for value := 0; value <= 0xffff; value += 1 {
+		if ProtocolVersion(value) == ProtocolVersionMls10 {
+			continue
+		}
+		header := []byte{byte(value >> 8), byte(value), byte(WireFormatPrivateMessage >> 8), byte(WireFormatPrivateMessage)}
+		message, err := ParseMLSMessage(append(header, body...))
+		if !errors.Is(err, ErrUnsupportedVersion) {
+			t.Fatalf("a frame naming protocol version %d over a registered wire format answered %v, want ErrUnsupportedVersion", value, err)
+		}
+		if message != nil {
+			t.Fatalf("a frame naming protocol version %d was refused with %v and handed back %+v", value, err, message)
+		}
+		if !namesTheNumber(err.Error(), uint64(value)) {
+			t.Fatalf("a frame naming protocol version %d was refused with %q, which does not name it; the octets are what the caller has off the wire",
+				value, err)
+		}
+
+		// the order: wrong in both fields is refused as the version, which is the field that
+		// stands first
+		both := []byte{byte(value >> 8), byte(value), byte(unregistered >> 8), byte(unregistered)}
+		_, err = ParseMLSMessage(append(both, body...))
+		if !errors.Is(err, ErrUnsupportedVersion) || errors.Is(err, ErrUnknownWireFormat) {
+			t.Fatalf("a frame naming protocol version %d AND unregistered wire format %d answered %v; version stands ahead of wire_format on the wire and is refused ahead of it here",
+				value, unregistered, err)
+		}
+
+		// and the encoder, which refuses the version before it looks at the wire format or the
+		// arms and writes nothing
+		outbound := framingTestMlsMessage(t, WireFormatPrivateMessage)
+		outbound.Version = ProtocolVersion(value)
+		writer := syntax.NewWriter()
+		if _, err := marshalIntoCatchingPanic(writer, outbound); !errors.Is(err, ErrUnsupportedVersion) {
+			t.Fatalf("encoding a message at protocol version %d answered %v, want ErrUnsupportedVersion", value, err)
+		}
+		if writer.Len() != 0 {
+			t.Fatalf("encoding a message at protocol version %d left %d octets on the caller's Writer before refusing",
+				value, writer.Len())
+		}
+		outbound.WireFormat = unregistered
+		outbound.PrivateMessage = nil
+		if _, err := MarshalMLSMessage(outbound); !errors.Is(err, ErrUnsupportedVersion) || errors.Is(err, ErrUnknownWireFormat) {
+			t.Fatalf("encoding a message wrong in the version (%d), the wire format (%d) and the arms answered %v; the version is refused first",
+				value, unregistered, err)
+		}
+		swept += 1
+	}
+	if swept != 0xffff {
+		t.Fatalf("%d versions swept, and the field is sixteen bits wide with one value registered", swept)
+	}
+}
+
+// TestParseMLSMessageRefusesEveryTruncationAndEveryTrailingOctet is syntax rule 3 at the one
+// place it is enforced.
+//
+// Full consumption is this entry point's own obligation rather than the arm decoders': a nested
+// codec reads its fields and stops, and the reader it leaves behind is the caller's problem. So a
+// frame with a tail is refused HERE or nowhere -- and a decoder that ignored the tail would let
+// one frame be read as one message by this implementation and as something else by an
+// implementation that framed it differently, over bytes a peer stores and forwards.
+//
+// Every trailing OCTET rather than one, because a tail of 0x00 is the value a codec that reached
+// for a fixed width read is likeliest to swallow.
+func TestParseMLSMessageRefusesEveryTruncationAndEveryTrailingOctet(t *testing.T) {
+	truncations, tails := 0, 0
+	for _, wireFormat := range framingWireFormats(t) {
+		encoded, err := MarshalMLSMessage(framingTestMlsMessage(t, wireFormat))
+		if err != nil {
+			t.Fatalf("encode a %#04x message: %v", wireFormat, err)
+		}
+		// the control: the whole thing is accepted, or the truncations below refuse something
+		// this fixture broke rather than a short frame
+		if _, err := ParseMLSMessage(encoded); err != nil {
+			t.Fatalf("the complete %#04x message this sweep truncates was refused: %v", wireFormat, err)
+		}
+		for at := 0; at < len(encoded); at += 1 {
+			message, err := ParseMLSMessage(encoded[:at])
+			if err == nil {
+				t.Fatalf("a %#04x message truncated to %d of %d octets was accepted as %+v", wireFormat, at, len(encoded), message)
+			}
+			if message != nil {
+				t.Fatalf("a %#04x message truncated to %d octets was refused with %v and handed back %+v", wireFormat, at, err, message)
+			}
+			truncations += 1
+		}
+		for octet := 0; octet <= 0xff; octet += 1 {
+			message, err := ParseMLSMessage(append(slices.Clone(encoded), byte(octet)))
+			if err == nil {
+				t.Fatalf("a %#04x message with a trailing %#02x was accepted as %+v; the tail is not part of any structure this package encodes",
+					wireFormat, octet, message)
+			}
+			if message != nil {
+				t.Fatalf("a %#04x message with a trailing %#02x was refused with %v and handed back %+v", wireFormat, octet, err, message)
+			}
+			tails += 1
+		}
+	}
+	t.Logf("%d truncations and %d trailing octets refused over %d wire formats", truncations, tails, len(framingWireFormats(t)))
+}
+
+// framingHostileMlsMessages is a deterministic corpus of things that are not messages: every
+// truncation of every valid encoding, three corruptions at every octet of each, the bare headers,
+// and a pseudo random stream.
+//
+// Deterministic because a randomized corpus that fails once is a corpus nobody can re-run, and
+// generated rather than written out because the class this is about is "input", which nobody can
+// list. The fuzz target below is the same property under a mutating engine; this is the half that
+// runs in every suite.
+func framingHostileMlsMessages(t *testing.T) [][]byte {
+	t.Helper()
+	corpus := [][]byte{nil, {}, {0x00}, {0x00, 0x01}, {0x00, 0x01, 0x00}}
+	for _, wireFormat := range framingWireFormats(t) {
+		corpus = append(corpus, mlsMessageHeaderOf(wireFormat))
+		encoded, err := MarshalMLSMessage(framingTestMlsMessage(t, wireFormat))
+		if err != nil {
+			t.Fatalf("encode a %#04x message: %v", wireFormat, err)
+		}
+		corpus = append(corpus, encoded)
+		for at := 0; at < len(encoded); at += 1 {
+			corpus = append(corpus, slices.Clone(encoded[:at]))
+			for _, mask := range []byte{0x01, 0x80, 0xff} {
+				corrupted := slices.Clone(encoded)
+				corrupted[at] ^= mask
+				corpus = append(corpus, corrupted)
+			}
+		}
+	}
+	// an xorshift rather than math/rand, so the stream is fixed by this file and cannot move
+	// with the standard library's generator
+	state := uint32(0x5a5b5c5d)
+	next := func() byte {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		return byte(state)
+	}
+	for size := 0; size < 256; size += 1 {
+		noise := make([]byte, size%97)
+		for at := range noise {
+			noise[at] = next()
+		}
+		corpus = append(corpus, noise)
+		// and the same noise behind a header this package would accept, which is what reaches
+		// an arm decoder rather than stopping at the discriminant
+		corpus = append(corpus, append(mlsMessageHeaderOf(WireFormatPrivateMessage), noise...))
+	}
+	return corpus
+}
+
+// parseCatchingPanic runs the inbound path and reports a panic as a value rather than letting it
+// take the test binary, because "refused" and "crashed" are different answers and the message has
+// to say which one happened.
+func parseCatchingPanic(data []byte) (message *MLSMessage, raised any, err error) {
+	defer func() { raised = recover() }()
+	message, err = ParseMLSMessage(data)
+	return message, nil, err
+}
+
+// TestParseMLSMessageAnswersAnErrorRatherThanAPanicOnAnyInput is gate 4 property 1 at the outermost
+// decoder, plus the two things a refusal owes its caller.
+//
+// A panic here is an availability bug reachable by anyone who can address a frame at this
+// process: the input is whatever arrived, nothing has been authenticated yet, and a nil
+// dereference inside the parse takes the process rather than the connection.
+//
+// The two obligations are stated together because the same input states both. A refusal returns
+// no message, so there is nothing partially populated for a caller to log, match or forward; and
+// an ACCEPTED input re-encodes to exactly the octets it came from, because MLS signs over
+// serialized forms and a decoder that accepted two encodings of one message is a signature bypass
+// rather than a leniency.
+//
+// The accepted count is the reachability guard p1 measured the need for: uniform random bytes
+// reach a round trip property 14 times in 4096, so a corpus that never decodes reports green
+// having evaluated nothing. Corruptions of valid encodings are what buy reachability here.
+func TestParseMLSMessageAnswersAnErrorRatherThanAPanicOnAnyInput(t *testing.T) {
+	corpus := framingHostileMlsMessages(t)
+	accepted, refused := 0, 0
+	for _, input := range corpus {
+		message, raised, err := parseCatchingPanic(input)
+		if raised != nil {
+			t.Fatalf("%d octets %x panicked in the inbound path: %v", len(input), input, raised)
+		}
+		if err != nil {
+			if message != nil {
+				t.Fatalf("%d octets %x were refused with %v and handed back %+v", len(input), input, err, message)
+			}
+			refused += 1
+			continue
+		}
+		reencoded, err := MarshalMLSMessage(message)
+		if err != nil {
+			t.Fatalf("%d octets %x decoded and would not re-encode: %v", len(input), input, err)
+		}
+		if !bytes.Equal(reencoded, input) {
+			t.Fatalf("%d octets %x decoded and re-encoded to %x; a message with two encodings is a message whose signature covers whichever one the sender chose",
+				len(input), input, reencoded)
+		}
+		accepted += 1
+	}
+	if accepted == 0 {
+		t.Fatalf("not one of %d hostile inputs decoded, so the round trip half of this property reached nothing", len(corpus))
+	}
+	t.Logf("%d hostile inputs: %d refused without a panic and without a message, %d decoded and re-encoded to their own octets",
+		len(corpus), refused, accepted)
+}
+
+// FuzzParseMLSMessage is that property under a mutating engine.
+//
+// Seeded with valid encodings of four of the five arms rather than with nothing, for the reason
+// p1 measured and syntax/fuzz_test.go records: uniform random bytes almost never decode as a
+// structure of this depth, so an unseeded target spends its whole budget rediscovering the four
+// octet header and never once evaluates the round trip half of its own property. The hostile
+// literals are there because the seeds cannot produce them: no encoding this package writes
+// carries a presence octet of 2 or a length prefix longer than its own content, and only a
+// mutation or an attacker presents one.
+func FuzzParseMLSMessage(f *testing.F) {
+	for _, seed := range [][]byte{
+		nil,
+		{0x00, 0x01},
+		{0x00, 0x01, 0x00, 0x02},
+		{0x00, 0x02, 0x00, 0x02},
+		{0x00, 0x01, 0x00, 0x63},
+		{0x00, 0x01, 0xff, 0xff, 0xff},
+	} {
+		f.Add(seed)
+	}
+	welcome, groupInfo := testWelcome(), testGroupInfo()
+	for _, message := range []*MLSMessage{
+		{Version: ProtocolVersionMls10, WireFormat: WireFormatPublicMessage, PublicMessage: framingTestPublicMessage()},
+		{Version: ProtocolVersionMls10, WireFormat: WireFormatPrivateMessage, PrivateMessage: framingTestPrivateMessage()},
+		{Version: ProtocolVersionMls10, WireFormat: WireFormatWelcome, Welcome: &welcome},
+		{Version: ProtocolVersionMls10, WireFormat: WireFormatGroupInfo, GroupInfo: &groupInfo},
+	} {
+		encoded, err := MarshalMLSMessage(message)
+		if err != nil {
+			f.Fatalf("seed a %#04x message: %v", message.WireFormat, err)
+		}
+		f.Add(encoded)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		message, err := ParseMLSMessage(data)
+		if err != nil {
+			if message != nil {
+				t.Fatalf("%d octets %x refused with %v and handed back %+v", len(data), data, err, message)
+			}
+			return
+		}
+		reencoded, err := MarshalMLSMessage(message)
+		if err != nil {
+			t.Fatalf("%d octets %x decoded and would not re-encode: %v", len(data), data, err)
+		}
+		if !bytes.Equal(reencoded, data) {
+			t.Fatalf("%d octets %x re-encoded to %x", len(data), data, reencoded)
+		}
+	})
+}
+
+// TestParseMLSMessageCannotCarryThisProductsOwnGroupInfoOrWelcome is the ceiling this entry point
+// inherits, recorded as a measurement rather than left in a comment.
+//
+// welcome_wire_test.go measures it one layer down: a ratchet_tree extension travels as an
+// opaque<V>, so a GroupInfo carrying this product's own thousand leaf tree is larger than
+// MaxVectorLength and neither half of that codec can reach it at the default limit. This is the
+// same fact at the function every byte off the wire passes through, and it is worth stating
+// separately because ParseMLSMessage takes no limit argument: whoever writes the group lifecycle
+// cannot raise this one, they have to add an entry point of their own.
+//
+// The bound is deliberately not raised here. A Welcome is decoded by a party who is not yet a
+// member, with no group state to check it against and every length in it chosen by whoever sent
+// it, so a raised limit at the outermost decoder would be an acceptance rule handed to a stranger
+// over the largest allocation the structure has.
+//
+// Behind a size guard, for welcome_wire_test.go's reason: a fixture that shrank below
+// MaxVectorLength would leave this passing against either limit while stating nothing.
+func TestParseMLSMessageCannotCarryThisProductsOwnGroupInfoOrWelcome(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	groupInfo, treeBody := welcomeWireProductGroupInfo(t, crypto)
+	if len(treeBody) <= syntax.MaxVectorLength {
+		t.Fatalf("the %d leaf ratchet tree encodes to %d octets and MaxVectorLength is %d; this fixture no longer separates the two limits",
+			productGroupLeafCount, len(treeBody), syntax.MaxVectorLength)
+	}
+	message := &MLSMessage{Version: ProtocolVersionMls10, WireFormat: WireFormatGroupInfo, GroupInfo: &groupInfo}
+
+	if _, err := MarshalMLSMessage(message); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Fatalf("encoding a group info carrying a %d leaf tree through MarshalMLSMessage answered %v, want ErrLengthExceedsMax; this is the ceiling p7 has to raise somewhere else",
+			productGroupLeafCount, err)
+	}
+	encoded, err := syntax.MarshalLimit(message, syntax.MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("the same message does not encode at MaxRatchetTreeLength either: %v", err)
+	}
+	if parsed, err := ParseMLSMessage(encoded); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Fatalf("parsing a %d octet group info message answered %v (message %v), want ErrLengthExceedsMax",
+			len(encoded), err, parsed != nil)
+	}
+	t.Logf("a group info message carrying a %d leaf tree is %d octets; MaxVectorLength is %d, so this entry point refuses this product's own group",
+		productGroupLeafCount, len(encoded), syntax.MaxVectorLength)
+}
+
+// ---------------------------------------------------------------------------
+// the published corpus, at the outermost structure
+// ---------------------------------------------------------------------------
+
+// framingMessagesVector is the seven fields of one mlswg `messages` case that carry a whole
+// MLSMessage rather than a bare structure. The other ten are bodies other codecs own.
+type framingMessagesVector struct {
+	GroupInfo                string `json:"mls_group_info"`
+	KeyPackage               string `json:"mls_key_package"`
+	Welcome                  string `json:"mls_welcome"`
+	PrivateMessage           string `json:"private_message"`
+	PublicMessageApplication string `json:"public_message_application"`
+	PublicMessageCommit      string `json:"public_message_commit"`
+	PublicMessageProposal    string `json:"public_message_proposal"`
+}
+
+// framingPublishedMessage is one of those fields: the name the corpus spells it with, its hex,
+// and the wire format the RFC says it is published under.
+type framingPublishedMessage struct {
+	field      string
+	encoded    string
+	wireFormat WireFormat
+}
+
+func (self framingMessagesVector) messages() []framingPublishedMessage {
+	return []framingPublishedMessage{
+		{"mls_group_info", self.GroupInfo, WireFormatGroupInfo},
+		{"mls_key_package", self.KeyPackage, WireFormatKeyPackage},
+		{"mls_welcome", self.Welcome, WireFormatWelcome},
+		{"private_message", self.PrivateMessage, WireFormatPrivateMessage},
+		{"public_message_application", self.PublicMessageApplication, WireFormatPublicMessage},
+		{"public_message_commit", self.PublicMessageCommit, WireFormatPublicMessage},
+		{"public_message_proposal", self.PublicMessageProposal, WireFormatPublicMessage},
+	}
+}
+
+// TestTheMessagesCorpusMlsMessagesRoundTripByteExactly is the interop half of this task: 2100
+// published MLSMessages, none of which this package produced, each decoded through the entry
+// point every byte off the wire passes through and re-encoded to the same octets.
+//
+// Byte exactness against bytes this package did not write is the assertion a self round trip
+// cannot make. It sees a header this codec writes in the other order, a length prefix around the
+// arm that no other implementation puts there, and a wire format read at one octet instead of
+// two -- and every one of those is invisible to a codec compared against itself.
+//
+// The wire format each field is published under is asserted rather than assumed, and the registry
+// is joined in the other direction as well: a code point with no published message is a select
+// case this corpus does not reach, which is a hole worth reporting rather than a sweep that
+// quietly covers four fifths of the registry.
+func TestTheMessagesCorpusMlsMessagesRoundTripByteExactly(t *testing.T) {
+	entries := LoadVectorFile(t, "messages.json")
+	if len(entries) != welcomeWireMessagesCases {
+		t.Fatalf("messages.json carries %d cases, want %d", len(entries), welcomeWireMessagesCases)
+	}
+	armOf := mlsMessageArmOfEachWireFormat(t)
+	fields := mlsMessageArmFields(t)
+	seen := map[WireFormat]int{}
+	for i, raw := range entries {
+		vector := framingMessagesVector{}
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			t.Fatalf("case %d: parse: %v", i, err)
+		}
+		for _, published := range vector.messages() {
+			at := fmt.Sprintf("messages.json case %d field %s", i, published.field)
+			if published.encoded == "" {
+				t.Fatalf("%s: the corpus carries no such field, so this sweep would run over six of seven and report the same thing", at)
+			}
+			encoded := MustHex(t, published.encoded)
+			message, err := ParseMLSMessage(encoded)
+			if err != nil {
+				t.Errorf("%s: the published message was refused: %v", at, err)
+				continue
+			}
+			if message.Version != ProtocolVersionMls10 || message.WireFormat != published.wireFormat {
+				t.Errorf("%s: decoded as version %d wire format %#04x, want mls10 and %#04x",
+					at, message.Version, message.WireFormat, published.wireFormat)
+				continue
+			}
+			held := reflect.ValueOf(message).Elem()
+			armed := true
+			for _, field := range fields {
+				if !held.FieldByName(field).IsNil() != (field == armOf[published.wireFormat]) {
+					t.Errorf("%s: decoded with its %s arm populated=%v and wire format %#04x names %s",
+						at, field, !held.FieldByName(field).IsNil(), published.wireFormat, armOf[published.wireFormat])
+					armed = false
+				}
+			}
+			if !armed {
+				continue
+			}
+			reencoded, err := MarshalMLSMessage(message)
+			if err != nil {
+				t.Errorf("%s: re-encode: %v", at, err)
+				continue
+			}
+			if !bytes.Equal(reencoded, encoded) {
+				t.Errorf("%s: re-encoded to\n  %x\nand the published encoding is\n  %x", at, reencoded, encoded)
+				continue
+			}
+			seen[published.wireFormat] += 1
+		}
+	}
+	covered := slices.Sorted(maps.Keys(seen))
+	if !slices.Equal(covered, framingWireFormats(t)) {
+		t.Fatalf("the corpus round tripped the wire formats %v and the registry declares %v; a code point no published message reaches is one this interop gate says nothing about",
+			covered, framingWireFormats(t))
+	}
+	total := 0
+	for _, count := range seen {
+		total += count
+	}
+	t.Logf("%d published MLSMessages round tripped byte exactly, over %d wire formats", total, len(seen))
+}
+
+// ---------------------------------------------------------------------------
+// the three narrow statements the plan wrote, kept beside the sweeps above
+// ---------------------------------------------------------------------------
+
+// The plan's own three tests for this task, kept rather than replaced, and each one is a real
+// statement: every one of them was made to FAIL by a one line edit to the code under test --
+// swapping the two header writes for the first, decoding through a bare Reader instead of
+// syntax.Unmarshal for the second, and deleting either refusal for the third.
+//
+// What they are not is the whole property, and that is why the sweeps above exist beside them.
+// The first covers one of five wire formats and two of five arms; the second appends one octet
+// where a codec that swallowed a trailing 0x00 would be the interesting case; the third names one
+// unregistered wire format out of 65531 and one wrong version out of 65535, with nothing standing
+// behind either, so it cannot tell a refusal of the discriminant from an arm decoder running out
+// of input. Each of those gaps is the shape of a defect this package has already shipped once.
+
+func TestMLSMessageRoundTripPrivate(t *testing.T) {
+	message := MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatPrivateMessage,
+		PrivateMessage: &PrivateMessage{
+			GroupId:             []byte{0x01},
+			Epoch:               1,
+			ContentType:         ContentTypeApplication,
+			AuthenticatedData:   []byte{},
+			EncryptedSenderData: []byte{0x01, 0x02},
+			Ciphertext:          []byte{0x03, 0x04},
+		},
+	}
+	encoded, err := MarshalMLSMessage(&message)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.HasPrefix(encoded, []byte{0x00, 0x01, 0x00, 0x02}) {
+		t.Fatalf("prefix %x, want 00010002", encoded[0:min(len(encoded), 4)])
+	}
+	decoded, err := ParseMLSMessage(encoded)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if decoded.PrivateMessage == nil || decoded.PublicMessage != nil {
+		t.Fatalf("decoded %+v", decoded)
+	}
+	reencoded, err := MarshalMLSMessage(decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("re-encoded %x, want %x", reencoded, encoded)
+	}
+}
+
+func TestParseMLSMessageRejectsTrailingBytes(t *testing.T) {
+	message := MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatPrivateMessage,
+		PrivateMessage: &PrivateMessage{
+			GroupId: []byte{0x01}, Epoch: 1, ContentType: ContentTypeApplication,
+			AuthenticatedData: []byte{}, EncryptedSenderData: []byte{0x01}, Ciphertext: []byte{0x02},
+		},
+	}
+	encoded, err := MarshalMLSMessage(&message)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := ParseMLSMessage(append(encoded, 0x00)); err == nil {
+		t.Fatal("trailing byte accepted")
+	}
+}
+
+func TestParseMLSMessageRejectsWrongVersionAndUnknownWireFormat(t *testing.T) {
+	if _, err := ParseMLSMessage([]byte{0x00, 0x02, 0x00, 0x02}); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Fatalf("version: got %v, want ErrUnsupportedVersion", err)
+	}
+	if _, err := ParseMLSMessage([]byte{0x00, 0x01, 0x00, 0x63}); !errors.Is(err, ErrUnknownWireFormat) {
+		t.Fatalf("wire format: got %v, want ErrUnknownWireFormat", err)
+	}
 }

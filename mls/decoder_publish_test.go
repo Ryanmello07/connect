@@ -649,6 +649,12 @@ var decoderPublishOrder = []string{
 	// caller holding this message's group id, epoch, sender and content type.
 	"framing.go: (*FramedContent).UnmarshalMLS publishes before its last read",
 	"framing.go: (*FramedContentAuthData).UnmarshalMLS stages",
+	// section 6's outermost structure. Staged whole rather than stamped with the header before
+	// the arm is read, which is what the plan's own draft did: its decoder assigned
+	// *self = MLSMessage{version, wireFormat} and then filled the arm into the receiver, so a
+	// truncation inside any of the five arms left the caller holding a version and a wire format
+	// out of a frame this package refused.
+	"framing.go: (*MLSMessage).UnmarshalMLS stages",
 	"framing.go: (*PrivateMessage).UnmarshalMLS stages",
 	"framing.go: (*PublicMessage).UnmarshalMLS stages",
 	"framing.go: (*Sender).UnmarshalMLS stages",

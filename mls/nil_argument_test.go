@@ -370,6 +370,12 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err = OpenWithLabel(crypto, priv, "Welcome", []byte("context"), nil)
 			return err
 		}},
+		// the outbound entry point of section 6's outermost structure, which would otherwise
+		// dereference its message at MarshalMLS's first statement
+		"MarshalMLSMessage(message)": {sentinel: errNilMLSMessage, call: func(t *testing.T) error {
+			_, err := MarshalMLSMessage(nil)
+			return err
+		}},
 		// the framing pair, which is what this file was written for
 		"FramedContentTBSBytes(content)": {sentinel: errNilFramedContent, call: func(t *testing.T) error {
 			_, err := FramedContentTBSBytes(WireFormatPrivateMessage, nil, framingTestGroupContext(t))

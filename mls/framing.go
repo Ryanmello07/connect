@@ -852,3 +852,234 @@ func (self *SenderData) UnmarshalMLS(r *syntax.Reader) error {
 const senderDataReuseGuardSize = 4
 
 var _ syntax.Codec = (*SenderData)(nil)
+
+// ---------------------------------------------------------------------------
+// MLSMessage, RFC 9420 section 6
+// ---------------------------------------------------------------------------
+
+// MLSMessage is the outermost object on the wire, RFC 9420 section 6:
+//
+//	struct {
+//	    ProtocolVersion version = mls10;
+//	    WireFormat wire_format;
+//	    select (MLSMessage.wire_format) {
+//	        case mls_public_message:  PublicMessage public_message;
+//	        case mls_private_message: PrivateMessage private_message;
+//	        case mls_welcome:         Welcome welcome;
+//	        case mls_group_info:      GroupInfo group_info;
+//	        case mls_key_package:     KeyPackage key_package;
+//	    };
+//	} MLSMessage;
+//
+// This is the object an attacker reaches first, and the wire_format field is what makes it that:
+// it decides which of five decoders runs on the rest of the bytes. So the discriminant is refused
+// on its own, ahead of every arm, rather than by whichever arm happens to fail on the input --
+// and the version is refused ahead of the discriminant, because that is the order the fields
+// stand in and a message from a protocol this package does not implement is not a message whose
+// wire format means anything.
+//
+// The arms are named by direct type rather than through a registry with an init(), because every
+// one of them is package mls: there is no import edge to break, and a registry would hide which
+// plan owns which type behind a map that says nothing at build time.
+//
+// Exactly one arm is populated, and the encoder COUNTS rather than trusting the discriminant to
+// pick one out. ProposalOrRef measured what the other reading costs one layer down: a value
+// carrying two arms encodes to the one its discriminant names, so two distinct values share one
+// encoding and the arm nobody named is dropped in silence. Here that arm is dropped out of the
+// bytes a peer receives, stores and replays.
+type MLSMessage struct {
+	Version        ProtocolVersion
+	WireFormat     WireFormat
+	PublicMessage  *PublicMessage
+	PrivateMessage *PrivateMessage
+	Welcome        *Welcome
+	GroupInfo      *GroupInfo
+	KeyPackage     *KeyPackage
+}
+
+// populatedArms counts the arms this value carries, whatever its wire format names.
+//
+// It is separate from the select below because the two ask different questions: the select asks
+// which arm the discriminant names, and this asks whether anything was left standing beside it.
+func (self *MLSMessage) populatedArms() int {
+	populated := 0
+	for _, present := range []bool{
+		self.PublicMessage != nil,
+		self.PrivateMessage != nil,
+		self.Welcome != nil,
+		self.GroupInfo != nil,
+		self.KeyPackage != nil,
+	} {
+		if present {
+			populated += 1
+		}
+	}
+	return populated
+}
+
+// MarshalMLS refuses the version, then the wire format, then the arms, and writes nothing until
+// all three have passed.
+//
+// The order is the wire's own, and stating it is the point: a caller holding a message this
+// package would not send under any wire format is told it is the VERSION that is wrong, rather
+// than being told about whichever field was inspected first. The reverse order refuses a well
+// formed mls10 message for the wrong reason the moment a later profile adds a wire format.
+//
+// Nothing is written before the checks, which is FramedContent.MarshalMLS's discipline: a caller
+// that ignored the error must not be able to pass on a four octet header with no message behind
+// it, and this header is the one thing every peer parses before it parses anything else.
+func (self *MLSMessage) MarshalMLS(w *syntax.Writer) error {
+	if self.Version != ProtocolVersionMls10 {
+		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, self.Version)
+	}
+	var arm syntax.Marshaler
+	switch self.WireFormat {
+	case WireFormatPublicMessage:
+		if self.PublicMessage != nil {
+			arm = self.PublicMessage
+		}
+	case WireFormatPrivateMessage:
+		if self.PrivateMessage != nil {
+			arm = self.PrivateMessage
+		}
+	case WireFormatWelcome:
+		if self.Welcome != nil {
+			arm = self.Welcome
+		}
+	case WireFormatGroupInfo:
+		if self.GroupInfo != nil {
+			arm = self.GroupInfo
+		}
+	case WireFormatKeyPackage:
+		if self.KeyPackage != nil {
+			arm = self.KeyPackage
+		}
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownWireFormat, self.WireFormat)
+	}
+	// the arm the discriminant names has to be present, and it has to be the only one
+	if arm == nil || self.populatedArms() != 1 {
+		return ErrContentArmMismatch
+	}
+	w.WriteUint16(uint16(self.Version))
+	w.WriteUint16(uint16(self.WireFormat))
+	return arm.MarshalMLS(w)
+}
+
+// UnmarshalMLS reads the version, refuses anything but mls10, reads the wire format, refuses
+// anything the registry does not declare, and only then enters an arm.
+//
+// Both refusals stand AHEAD of every arm decoder, and that is this method's security property
+// rather than a tidiness: the discriminant chooses which parser runs on attacker controlled
+// bytes, so a decoder that entered an arm first and let the arm's own parse decide would be
+// running one of five grammars on the strength of a field it had not checked. The refusal of an
+// unregistered wire format therefore cannot depend on what stands behind it -- a registered arm's
+// bytes, garbage, or nothing at all are refused identically.
+//
+// The receiver is published whole and last, which is welcome_wire.go's convention and is here for
+// its reason with the blast radius one layer wider: a caller that reused its MLSMessage and
+// checked the error must not be left holding a version and a wire format read out of a frame this
+// package refused, over an arm from whatever it held before -- which is a well formed message
+// describing something nobody sent.
+func (self *MLSMessage) UnmarshalMLS(r *syntax.Reader) error {
+	version, err := r.ReadUint16()
+	if err != nil {
+		return err
+	}
+	if ProtocolVersion(version) != ProtocolVersionMls10 {
+		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, version)
+	}
+	wireFormat, err := r.ReadUint16()
+	if err != nil {
+		return err
+	}
+	decoded := MLSMessage{Version: ProtocolVersion(version), WireFormat: WireFormat(wireFormat)}
+	switch decoded.WireFormat {
+	case WireFormatPublicMessage:
+		arm := &PublicMessage{}
+		if err := arm.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		decoded.PublicMessage = arm
+	case WireFormatPrivateMessage:
+		arm := &PrivateMessage{}
+		if err := arm.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		decoded.PrivateMessage = arm
+	case WireFormatWelcome:
+		arm := &Welcome{}
+		if err := arm.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		decoded.Welcome = arm
+	case WireFormatGroupInfo:
+		arm := &GroupInfo{}
+		if err := arm.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		decoded.GroupInfo = arm
+	case WireFormatKeyPackage:
+		arm := &KeyPackage{}
+		if err := arm.UnmarshalMLS(r); err != nil {
+			return err
+		}
+		decoded.KeyPackage = arm
+	default:
+		return fmt.Errorf("%w: %d", ErrUnknownWireFormat, decoded.WireFormat)
+	}
+	*self = decoded
+	return nil
+}
+
+var _ syntax.Codec = (*MLSMessage)(nil)
+
+// MarshalMLSMessage and ParseMLSMessage are the one sanctioned pair of byte level free functions
+// outside the validation plan's codec table, registry C1 section 7.2. Every byte this system puts
+// on the wire leaves through the first and every byte that arrives enters through the second, so
+// there is one place to read for what is emitted and one for what is accepted.
+// errNilMLSMessage is what MarshalMLSMessage answers a caller that passed no message, for
+// errNilFramedContent's reason: a nil dereference out of a library takes the caller's process
+// rather than its call, and says nothing about which argument was wrong. It matters here because
+// this is the function every outbound byte of this system leaves through.
+var errNilMLSMessage = errors.New("mls: marshalling a message requires a message")
+
+func MarshalMLSMessage(message *MLSMessage) ([]byte, error) {
+	if message == nil {
+		return nil, errNilMLSMessage
+	}
+	return syntax.Marshal(message)
+}
+
+// ParseMLSMessage is the single entry point for every byte that arrives from the network or out
+// of the store.
+//
+// syntax.Unmarshal is what makes it an entry point rather than a decode: it joins the decoder's
+// answer with Done, so a frame carrying trailing bytes is refused instead of being silently
+// truncated to whatever the decoder happened to consume. That matters more here than anywhere
+// below it -- an MLSMessage is what a peer stores and forwards, and a decoder that ignored a tail
+// would let one frame be read as two different messages by two implementations.
+//
+// Nothing is returned beside an error. A partially populated message handed back with a refusal
+// is a value a caller can log, forward or match against, and every field in it would have come
+// out of bytes this package would not accept.
+//
+// The DEFAULT vector length limit, which is a ceiling this records rather than hides. A Welcome or
+// a GroupInfo carrying this product's own ratchet_tree extension is larger than
+// syntax.MaxVectorLength -- welcome_wire_test.go measures it over a real thousand leaf tree in
+// TestAGroupInfoAndAWelcomeCarryingThisProductsTreeNeedTheRaisedLimitInBothDirections -- so those
+// two arms do not fit through this function at this bound, and the lifecycle plan that carries
+// them needs an entry point of its own wired to syntax.MaxRatchetTreeLength.
+// TestParseMLSMessageCannotCarryThisProductsOwnGroupInfoOrWelcome is that measurement stated at
+// this layer, so the ceiling is a failing test away from being noticed rather than a remark in a
+// comment. The bound is NOT raised here, and that is the decision: a Welcome is decoded by a party
+// who is not yet a member, with no group state to check it against and every length in it chosen
+// by whoever sent it, so a raised limit at this entry point would be an acceptance rule handed to
+// a stranger over the largest allocation the structure has.
+func ParseMLSMessage(data []byte) (*MLSMessage, error) {
+	message := &MLSMessage{}
+	if err := syntax.Unmarshal(data, message); err != nil {
+		return nil, err
+	}
+	return message, nil
+}
