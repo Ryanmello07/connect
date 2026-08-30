@@ -428,20 +428,33 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 					GroupExtensions: exts,
 				}
 			}
+			// required_capabilities is LAST and the disagreement is planted in the MIDDLE, which
+			// is what makes this observe the property it claims. Planted in the
+			// required_capabilities entry instead, it is refused by the body reconciliation at
+			// the end whatever the positional loop did -- so the first version of this probe
+			// passed over a loop narrowed to entry zero, and mutation m14 was caught only by
+			// TestValidateAgainstContextComparesEveryEntryOfTheExtensionsVectorAndBothHalvesOfEach.
 			agreeing := []Extension{
 				{ExtensionType: ExtensionTypeApplicationId, ExtensionData: body},
+				{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{0x0a}},
 				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: encoded},
 			}
 			if err := reconcileWithGroupContext(validation(agreeing, caps), contextOf(agreeing)); err != nil {
-				t.Fatalf("two identical extension vectors were refused: %v; every refusal below could then be this", err)
+				t.Fatalf("three identical extension vectors were refused: %v; every refusal below could then be this", err)
 			}
-			// the disagreement is at the SECOND entry, which is what a positional comparison
-			// that stopped at the first would walk past
-			differing := slices.Clone(agreeing)
-			differing[1] = Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: encoded}
-			if err := reconcileWithGroupContext(validation(agreeing, caps), contextOf(differing)); !errors.Is(err, errGroupContextDisagreement) {
-				t.Errorf("a disagreement at the second of two entries answered %v, want errGroupContextDisagreement; a comparison that stops at the first entry lets a swapped pair through",
-					err)
+			for _, one := range []struct {
+				name  string
+				entry Extension
+			}{
+				{"a type", Extension{ExtensionType: ExtensionTypeApplicationId, ExtensionData: []byte{0x0a}}},
+				{"a body", Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{0x0b}}},
+			} {
+				differing := slices.Clone(agreeing)
+				differing[1] = one.entry
+				if err := reconcileWithGroupContext(validation(agreeing, caps), contextOf(differing)); !errors.Is(err, errGroupContextDisagreement) {
+					t.Errorf("%s disagreement in the middle of three entries answered %v, want errGroupContextDisagreement; a comparison that stops at the first entry lets a swapped pair through, and nothing behind it can see one",
+						one.name, err)
+				}
 			}
 			// and the type it DOES read by type is read through the lookup, so a peer sending
 			// two required_capabilities is refused here rather than choosing which one this
