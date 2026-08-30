@@ -143,14 +143,19 @@ func TestLeafKeysOfReadsTheEntryOfItsOwnTypeAndNoOther(t *testing.T) {
 // TestLeafKeysOfRefusesALeafCarryingTwoWrapKeysRatherThanPickingOne is finding 8's other half,
 // and it is a refusal rather than a test pinning which of two illegal entries wins.
 //
-// The prior question -- is a repeated extension type refused anywhere -- has the answer "nowhere".
-// ValSem209 is named in three comments of this package and implemented in none; LeafNode.Validate,
-// the door those comments point at, walks every entry and range checks every urmessage_leaf_keys
-// body it finds, and accepts a leaf carrying two well formed ones. So this accessor was the only
-// reader of such a leaf, and it was choosing the group's wrap target by iteration order: not a
-// parse failure anywhere, just a commit secret wrapped to one of two devices while the other
-// silently stops receiving. Reversing the walk changed which device that was and passed the whole
-// suite.
+// The prior question -- is a repeated extension type refused anywhere -- had the answer
+// "nowhere". ValSem209 was named in three comments of this package and implemented in none;
+// LeafNode.Validate, the door those comments pointed at, walks every entry and range checks every
+// urmessage_leaf_keys body it finds, and accepts a leaf carrying two well formed ones on purpose.
+// So this accessor was the only reader of such a leaf, and it was choosing the group's wrap
+// target by iteration order: not a parse failure anywhere, just a commit secret wrapped to one of
+// two devices while the other silently stops receiving. Reversing the walk changed which device
+// that was and passed the whole suite.
+//
+// The answer is now "at the lookup", once, for the whole package: FindExtensionEntry refuses the
+// repeat and this accessor names the type. What this test states is unchanged by that -- the
+// refusal has to be observable THROUGH LeafKeysOf, which is what a caller holds -- and a
+// delegation that dropped the error on the floor would fail here.
 //
 // Both orders, and a decoy between them, because a refusal that only fires for one arrangement is
 // an accessor still answering by position.

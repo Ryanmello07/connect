@@ -188,13 +188,95 @@ func readOneExtension(r *syntax.Reader) (Extension, error) {
 // from this file's own declarations and fails on the commit that lands the real name.
 var errMissingRequiredCapability = errors.New("mls: leaf does not support a required capability")
 
-// FindExtension returns the body of the first entry carrying t, and whether one was found.
+// FindExtensionEntry returns the one entry carrying t, whether the vector carried one, and a
+// refusal if it carried more than one.
 //
-// First rather than only, and no duplicate check here: extensions<V> is a vector and the wire
-// permits two entries of one type. Which of them wins is a validation question -- ValSem209
-// and the group context extension rules are where a repeated type is refused -- and a lookup
-// that answered "not found" for a vector holding two would make that refusal unreachable by
-// hiding the input it is stated over.
+// This is the package's only lookup of an extension BY TYPE, and it is the door that refuses a
+// repeated type. The position is the package's rather than this function's: RFC 9420 forbids two
+// entries of one type in an extensions vector, and nothing else in this build refuses one.
+// ValSem209 is named by the validation plan and implemented nowhere, and LeafNode.Validate --
+// the door the comments here used to hand the refusal to -- range checks EVERY entry it finds
+// and accepts a leaf carrying two well formed ones on purpose, because applying a rule to every
+// entry is a different rule from refusing the repeat and this package needs both.
+//
+// So a lookup that answered one of two would be the whole decision, and none of the three things
+// it decides can be decided by iteration order. Which entry is reached picks the group's wrap
+// target; picks the role list a member enforces, off a list the confirmed transcript hash covers
+// so both role sets are equally agreed to; and picks the required_capabilities this client holds
+// every leaf against. The last of those is picked by a PEER, because reconcileRequiredCapabilities
+// reads it off a *GroupContext that came off the wire through the exported ValidateAgainstContext
+// -- the validation entry point whose job is to refuse exactly that. Two members reading two
+// different entries agree on every hash and disagree about the group. Refusing is the only answer
+// with no arbitrary half in it, and it is also what makes the walk direction stop mattering: at
+// most one entry of a type is ever answered, so first and last are the same entry.
+//
+// When ValSem209 lands it refuses this input EARLIER, at whole group context validation, and this
+// refusal becomes a second line of defence rather than the only one. It does not become wrong,
+// and it must not be deleted on the strength of ValSem209 arriving: the accessors below reach
+// this lookup from paths ValSem209 does not sit in front of -- a LeafNode read out of a Welcome,
+// a KeyPackage validated on its own -- so the earlier rule subsumes some of these calls and not
+// all of them.
+//
+// The repeat is refused as an ERROR and not as "not found", and that is what the third result
+// exists for. Absence is a legal answer that callers ACT on -- reconcileRequiredCapabilities
+// reads an absent required_capabilities as "this group requires nothing" and accepts -- so a
+// repeat reported as absence would be ACCEPTED there rather than refused, which is the fail open
+// this whole rule is against.
+//
+// The whole vector is walked before anything is answered, because the refusal is about the
+// VECTOR rather than about either entry: a scan that returned at the first match cannot see the
+// second, so it cannot refuse the pair.
+//
+// The refusal names the two POSITIONS and carries no other digits, which is a convention the
+// tests read rather than an ornament. groupPolicyPositionsNamedBy pulls every digit run out of
+// the message and compares it against the positions the vector holds, because with the repeat
+// refused the ORDER the two are named in is the last observable a walk in the wrong direction
+// changes. A %#04x extension type spelled into this message would put digits in it that are not
+// positions. The type is named by the caller instead, which is also where the human name for it
+// is: this lookup has a uint16 and LeafKeysOf has "urmessage_leaf_keys".
+//
+// ErrMalformedExtension is the sentinel because it is the one the group lifecycle asks this
+// question with, and because it is already what both accessors carry for this same repeat.
+//
+// What comes back is a VIEW of the caller's entry and not a copy of it, so its body shares
+// storage with the vector the caller handed in and changes when that vector changes. That is the
+// right default for a lookup -- copying every body on the way past charges every caller for the
+// one that keeps its answer -- but it means the []byte inside is not safe to hold across a
+// mutation of the leaf it was read out of. The copy happens one step later: every
+// ParseXExtension of this package copies what it keeps out of the bytes it was given, so the
+// PARSED structure is the thing that is safe to hold.
+// TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes states that over the whole
+// documented path rather than over the parse alone, because the doc on LeafKeysExtension sends
+// its reader through this lookup first.
+func FindExtensionEntry(exts []Extension, t ExtensionType) (Extension, bool, error) {
+	// the whole vector before anything is answered: a scan that returned at the first match
+	// cannot see the second, so it cannot refuse the pair.
+	found := -1
+	for i := range exts {
+		if exts[i].ExtensionType != t {
+			continue
+		}
+		if found >= 0 {
+			return Extension{}, false, fmt.Errorf(
+				"%w: the extensions vector carries one type at entry %d and again at entry %d",
+				ErrMalformedExtension, found, i)
+		}
+		found = i
+	}
+	if found < 0 {
+		return Extension{}, false, nil
+	}
+	return exts[found], true, nil
+}
+
+// FindExtension returns the body of the entry carrying t, whether one was found, and the refusal
+// FindExtensionEntry makes over a vector carrying two.
+//
+// A wrapper over that lookup and not a walk of its own, which is the whole of what keeps the two
+// answers the same. A hand rolled walk written beside this one is a second selection rule, and a
+// second selection rule is how a fourth accessor comes to answer by position while these two
+// refuse; TestEveryExtensionTypeSelectionOfBothPackagesIsClassifiedHere is what fails on the
+// commit that writes one, and it finds them by what they do rather than by their names.
 //
 // The bool is separate from a nil body because an extension present with an empty body is a
 // different statement from an extension that is absent: required_capabilities carrying three
@@ -202,23 +284,17 @@ var errMissingRequiredCapability = errors.New("mls: leaf does not support a requ
 // group that never set one looks like. Those are the same nil in Go and different bytes on the
 // wire, and the wire is what everything downstream is signed over.
 //
-// What comes back is a VIEW of the entry's body and not a copy of it, so it shares storage
-// with the vector the caller handed in and changes when that vector changes. That is the right
-// default for a lookup -- copying every body on the way past charges every caller for the one
-// that keeps its answer -- but it means the []byte this hands back is not safe to hold across
-// a mutation of the leaf it was read out of. The copy happens one step later: every
-// ParseXExtension of this package copies what it keeps out of the bytes it was given, so the
-// PARSED structure is the thing that is safe to hold.
-// TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes states that over the whole
-// documented path rather than over the parse alone, because the doc on LeafKeysExtension sends
-// its reader through this lookup first.
-func FindExtension(exts []Extension, t ExtensionType) ([]byte, bool) {
-	for i := range exts {
-		if exts[i].ExtensionType == t {
-			return exts[i].ExtensionData, true
-		}
+// A refusal answers false as well as the error, so a caller that read only the bool and dropped
+// the error would be left holding "absent" rather than a body picked out of an illegal vector.
+// That is the safe half of a mistake nobody should make; it is not why the error is here, since
+// absence and a repeat are different inputs and every caller in this package acts on them
+// differently.
+func FindExtension(exts []Extension, t ExtensionType) ([]byte, bool, error) {
+	entry, found, err := FindExtensionEntry(exts, t)
+	if err != nil || !found {
+		return nil, false, err
 	}
-	return nil, false
+	return entry.ExtensionData, true, nil
 }
 
 // The four uint16 registries all encode as one length prefixed vector of uint16, so the pair
@@ -518,18 +594,19 @@ const XwingPublicKeyLen = 1216
 // FOR THE READER ARRIVING WITH wrap.go IN HAND. This is where a device's X-Wing wrap target
 // comes from, and there are four things to know before reading one off a leaf:
 //
-//   - Find the ENTRY with FindExtension(leaf.Extensions, ExtensionTypeUrmessageLeafKeys) and
-//     hand the whole Extension to ParseLeafKeysFrom. Not its body to ParseLeafKeysExtension:
-//     ParseLeafKeysFrom is the only one of the two that is given the tag and so the only one
-//     that can check it. FindExtension answers the FIRST entry of that type and a vector may
-//     legally hold two; refusing a repeat is ValSem209's job at validation, not this codec's,
-//     so found does not mean unique.
+//   - Find the ENTRY with FindExtensionEntry(leaf.Extensions, ExtensionTypeUrmessageLeafKeys)
+//     and hand the whole Extension to ParseLeafKeysFrom. Not its body to
+//     ParseLeafKeysExtension: ParseLeafKeysFrom is the only one of the two that is given the
+//     tag and so the only one that can check it. FindExtensionEntry answers the ONE entry of
+//     that type and REFUSES a vector carrying two, so found does mean unique -- the repeat is
+//     refused at the lookup because nothing else in this build refuses it, and that lookup's
+//     own doc is where the argument for that position is written out.
 //   - A parsed DeviceXwingPub is a fresh copy, never a view into the leaf's bytes, so wrapping
 //     to it cannot be perturbed by whoever owns that buffer. The reverse also holds: a
 //     DeviceXwingPub handed to Encode is copied into the extension body, so mutating that
 //     slice afterwards does not change an Extension already produced. The LOOKUP in front of
-//     the parse copies nothing, though -- FindExtension answers a view of the caller's vector
-//     -- so what is safe to hold is the parsed structure and not the []byte it came from.
+//     the parse copies nothing, though -- it answers a view of the caller's vector -- so what
+//     is safe to hold is the parsed structure and not the []byte it came from.
 //   - Every value that comes back has already been refused unless alg_id is AlgIdXwing and
 //     len(DeviceXwingPub) is exactly XwingPublicKeyLen. Neither needs re-checking, and a
 //     length check written against a different constant is how the two come to drift. What is

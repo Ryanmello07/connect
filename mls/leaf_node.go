@@ -699,12 +699,20 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 	// the ID for each extension in the extensions field is listed in the capabilities.extensions
 	// field of the LeafNode", narrowed by section 7.2 to the non-default types.
 	//
-	// EVERY entry, and the urmessage_leaf_keys body of every entry that carries one. A lookup
-	// answers the FIRST entry of a type and extensions<V> legally holds two, so a body checked
-	// through FindExtension would leave a second, malformed leaf keys entry inside an accepted
-	// leaf -- signed, tree hashed, and read by whichever consumer happened to iterate rather
-	// than look up. That is the p4 ValSem401 shape exactly: a rule applied to element zero
+	// EVERY entry, and the urmessage_leaf_keys body of every entry that carries one. This is a
+	// WALK and not a lookup, and the difference is the whole reason it is written out rather
+	// than delegated: FindExtensionEntry refuses a repeated type, so a body checked through the
+	// lookup would make this clause refuse the leaf for carrying two instead of range checking
+	// the second body -- and section 7.3 is a rule about every extension a leaf carries, which a
+	// validator applies to all of them whatever some other door does about the repeat. Applying
+	// it to the first alone is the p4 ValSem401 shape exactly: a rule applied to element zero
 	// while the loop that reaches the rest never runs it.
+	//
+	// So a leaf carrying two well formed urmessage_leaf_keys entries passes HERE and is refused
+	// at the lookup, by LeafKeysOf, which is this package's one position on the repeat stated
+	// from the other side. TestEveryExtensionTypeSelectionOfBothPackagesIsClassifiedHere is what
+	// holds this loop to visiting every entry, so an edit that quietly turns it into a lookup
+	// fails rather than narrowing the clause to element zero.
 	for i := range self.Extensions {
 		extensionType := self.Extensions[i].ExtensionType
 		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {

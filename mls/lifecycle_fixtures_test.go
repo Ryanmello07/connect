@@ -516,9 +516,9 @@ func TestFixtureKeyPackageAnswersTheInitKeyBeforeTheEncryptionKey(t *testing.T) 
 //
 // The X-Wing key is compared against the MEMBER's own rather than merely required to be
 // present, because a leaf carrying somebody else's wrap key is the same silent failure one step
-// later, and the count is asserted because extensions<V> legally holds two entries of a type
-// while LeafKeysOf answers the first -- a fixture that appended a second would be read one way
-// here and another by whatever iterates.
+// later, and the count is asserted because extensions<V> legally holds two entries of a type on
+// the wire while LeafKeysOf REFUSES one that does -- a fixture that appended a second would stop
+// being readable at all, and every task joining a member through it would fail at the wrap.
 func TestFixtureKeyPackageLeafCarriesTheMembersLeafKeysExtension(t *testing.T) {
 	crypto := testCrypto(t)
 	frank := testIdentity(t, crypto, "frank")
@@ -541,7 +541,7 @@ func TestFixtureKeyPackageLeafCarriesTheMembersLeafKeysExtension(t *testing.T) {
 		}
 	}
 	if carried != 1 {
-		t.Errorf("the fixture key package's leaf carries %d urmessage_leaf_keys entries, want 1; LeafKeysOf answers the first and a second is read by whatever iterates", carried)
+		t.Errorf("the fixture key package's leaf carries %d urmessage_leaf_keys entries, want 1; LeafKeysOf refuses a leaf carrying two, so a fixture with a second has no readable wrap key at all", carried)
 	}
 	// the entry is inside what the leaf SIGNED, which is what stops a later task from reading a
 	// wrap key that no signature covers: marshalCore writes the extensions vector, so a leaf

@@ -955,18 +955,16 @@ func groupPolicyWellFormedBody(t *testing.T) []byte {
 // no longer makes fails rather than outliving it.
 func groupPolicyRefusalRows() map[string]groupPolicyRefusalRow {
 	return map[string]groupPolicyRefusalRow{
-		// the repeated 0xF001 entry. Two entries of one type is what RFC 9420 forbids and what
-		// no ValSem in this build refuses, so this accessor is the door that refuses it.
-		"GroupPolicyOf:ErrMalformedExtension#0": {call: func(t *testing.T) error {
-			policy, err := (&GroupPolicyExtension{
-				Roles: []RoleEntry{{MemberId: groupPolicyLowId, Role: RoleOwner}},
-			}).Encode()
-			if err != nil {
-				t.Fatalf("the policy entry this row repeats: %v", err)
-			}
-			_, err = GroupPolicyOf([]Extension{policy, policy})
-			return err
-		}},
+		// no row for the repeated 0xF001 entry, and that is the derivation working rather than a
+		// gap. The class above is every sentinel group_policy.go NAMES at a refusal, and the
+		// repeat is refused by FindExtensionEntry now -- one door for the package instead of one
+		// per accessor -- so this file names nothing for it. What that row asserted is asserted
+		// where the refusal is made and where it arrives:
+		// TestFindExtensionRefusesAVectorCarryingARepeatedTypeRatherThanAnsweringByPosition over
+		// every declared extension type, and
+		// TestGroupPolicyOfRefusesAListCarryingTwoPoliciesRatherThanPickingOne over the accessor,
+		// which also holds it to NOT answering ErrNoGroupPolicy -- the exclusivity half this
+		// sweep used to give it.
 		"GroupPolicyOf:ErrNoGroupPolicy#0": {call: func(t *testing.T) error {
 			_, err := GroupPolicyOf([]Extension{
 				{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{0x00}},
@@ -1340,14 +1338,19 @@ func groupPolicyPositionsNamedBy(t *testing.T, err error) []int {
 // TestGroupPolicyOfRefusesAListCarryingTwoPoliciesRatherThanPickingOne is finding 8's answer, and
 // the answer is a refusal rather than a test pinning which of two illegal entries wins.
 //
-// The prior question was whether a repeated extension type is refused anywhere. It is not:
-// ValSem209 is named in three comments of this package and implemented in none of them, and
-// LeafNode.Validate -- the door those comments point at -- walks every entry, range checks every
+// The prior question was whether a repeated extension type is refused anywhere. It was not:
+// ValSem209 was named in three comments of this package and implemented in none of them, and
+// LeafNode.Validate -- the door those comments pointed at -- walks every entry, range checks every
 // urmessage_leaf_keys body, and accepts a leaf carrying two of anything. So the accessor was
 // picking the group's policy by iteration order, and the list it picks from is inside the
 // CONFIRMED TRANSCRIPT HASH: both role sets are covered by every confirmation tag the group ever
 // produced, so a member reading the first and a member reading the second disagree about who may
 // remove whom while agreeing on every hash.
+//
+// It is refused now, at the lookup, once for the package. This test is unchanged by where the
+// refusal is made, because what it states is that GroupPolicyOf does not ANSWER such a list --
+// which is what a caller holds, and what a delegation that swallowed the lookup's error would
+// break.
 //
 // Both orders are run, because a refusal that only fires when the SECOND entry is the odd one is
 // an accessor that still answers by position.
@@ -1411,6 +1414,15 @@ func TestGroupPolicyOfRefusesAListCarryingTwoPoliciesRatherThanPickingOne(t *tes
 			t.Errorf("GroupPolicyOf over a list carrying urmessage_group_policy twice (%s) answered %v, want ErrMalformedExtension",
 				one.name, err)
 			continue
+		}
+		// and NOT as absence. The exclusivity used to be held by the refusal sweep above, whose
+		// class is derived from the sentinels group_policy.go names and which no longer holds a
+		// row for this refusal because the lookup makes it. A repeat answered as ErrNoGroupPolicy
+		// is a list carrying two policies reported as a list carrying none, which is the
+		// fail open the whole rule is against.
+		if errors.Is(err, ErrNoGroupPolicy) {
+			t.Errorf("GroupPolicyOf over a list carrying urmessage_group_policy twice (%s) answered ErrNoGroupPolicy as well, so a list holding two is indistinguishable from one holding none",
+				one.name)
 		}
 		if policy != nil {
 			owner, _ := policy.OwnerId()

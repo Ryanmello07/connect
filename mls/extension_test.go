@@ -476,7 +476,11 @@ func upstreamRequiredCapabilitiesBodies(t *testing.T) map[string][]byte {
 			continue
 		}
 		contexts++
-		if data, ok := FindExtension(context.Extensions, ExtensionTypeRequiredCapabilities); ok {
+		data, ok, err := FindExtension(context.Extensions, ExtensionTypeRequiredCapabilities)
+		if err != nil {
+			t.Fatalf("an upstream group context carries required_capabilities more than once: %v", err)
+		}
+		if ok {
 			found[hex.EncodeToString(data)] = data
 		}
 	}
@@ -793,7 +797,12 @@ func TestFindExtensionAnswersBothDirections(t *testing.T) {
 		present = append(present, Extension{ExtensionType: extensionType, ExtensionData: bodyFor(extensionType)})
 	}
 	for _, extensionType := range types {
-		body, ok := FindExtension(present, extensionType)
+		body, ok, err := FindExtension(present, extensionType)
+		if err != nil {
+			t.Errorf("%#04x: FindExtension over a vector holding it exactly once refused it: %v",
+				uint16(extensionType), err)
+			continue
+		}
 		if !ok {
 			t.Errorf("%#04x: FindExtension over a vector holding it reported absent", uint16(extensionType))
 			continue
@@ -804,42 +813,44 @@ func TestFindExtensionAnswersBothDirections(t *testing.T) {
 		absent := slices.DeleteFunc(slices.Clone(present), func(e Extension) bool {
 			return e.ExtensionType == extensionType
 		})
-		if body, ok := FindExtension(absent, extensionType); ok {
-			t.Errorf("%#04x: FindExtension over a vector without it returned %x and reported found",
-				uint16(extensionType), body)
+		if body, ok, err := FindExtension(absent, extensionType); ok || err != nil {
+			t.Errorf("%#04x: FindExtension over a vector without it returned (%x, %v, %v), want absent and no refusal",
+				uint16(extensionType), body, ok, err)
 		}
 	}
-	if _, ok := FindExtension(nil, ExtensionTypeRatchetTree); ok {
-		t.Error("FindExtension reported found over a nil vector")
+	if _, ok, err := FindExtension(nil, ExtensionTypeRatchetTree); ok || err != nil {
+		t.Errorf("FindExtension over a nil vector answered (%v, %v), want absent and no refusal", ok, err)
 	}
-	if _, ok := FindExtension([]Extension{}, ExtensionTypeRatchetTree); ok {
-		t.Error("FindExtension reported found over an empty vector")
+	if _, ok, err := FindExtension([]Extension{}, ExtensionTypeRatchetTree); ok || err != nil {
+		t.Errorf("FindExtension over an empty vector answered (%v, %v), want absent and no refusal", ok, err)
 	}
 	// present with an empty body is not absent, which is the whole reason the bool is
-	// separate from the slice
-	body, ok := FindExtension([]Extension{{ExtensionType: ExtensionTypeRatchetTree}}, ExtensionTypeRatchetTree)
-	if !ok || len(body) != 0 {
-		t.Errorf("an entry with an empty body reported (%x, %v), want (empty, true)", body, ok)
+	// separate from the slice, and neither of them is the refusal
+	body, ok, err := FindExtension([]Extension{{ExtensionType: ExtensionTypeRatchetTree}}, ExtensionTypeRatchetTree)
+	if !ok || len(body) != 0 || err != nil {
+		t.Errorf("an entry with an empty body reported (%x, %v, %v), want (empty, true, nil)", body, ok, err)
 	}
 }
 
-// TestFindExtensionReturnsTheFirstOfARepeatedType is the selection rule FindExtension's comment
-// argues for at length, stated where it can fail.
+// TestFindExtensionRefusesAVectorCarryingARepeatedTypeRatherThanAnsweringByPosition is the
+// selection rule the lookup's comment argues for, stated where it can fail. It is the exact
+// reverse of the test that stood here, and that reversal is the point of the commit.
 //
-// extensions<V> is a vector and the wire permits two entries of one type. FindExtension returns
-// the FIRST rather than refusing, deliberately: ValSem209 and the group context extension rules
-// are what refuse a repeated type, and a lookup answering "not found" for a vector holding two
-// would hide the input that refusal is stated over. Which of the two it returns is therefore a
-// wire visible choice. If a peer sends two required_capabilities bodies, the body this
-// implementation enforces is chosen by the sender, and choosing the last would mean enforcing a
-// different one from every implementation that chooses the first.
+// The test that stood here pinned first-wins, and its failure text argued
+// that a lookup refusing a repeated type "hides the input ValSem209 is stated over". It was
+// committed beside two accessors that refuse a repeat BECAUSE ValSem209 is implemented nowhere,
+// so one branch held both positions at once: a repeat is a refusal because the rule does not
+// exist, and a repeat is answered by position because the rule will refuse it. The package now
+// holds one position -- the lookup refuses -- and hiding an input from a rule that does not
+// exist hides it from nothing. When ValSem209 lands it refuses this input earlier; it does not
+// make answering by position safe here, because these lookups are reached from paths that
+// whole-context validation does not sit in front of.
 //
-// The sweep above builds no vector holding two entries of one type -- it puts exactly one entry
-// per declared type into `present` -- so first and last are never distinguished there. This
-// builds exactly that vector, for every extension type the package declares plus the ones it
-// declares for nothing, with the repeated pair bracketed by other entries so a lookup that
-// always returned exts[0], or always exts[len-1], fails here too.
-func TestFindExtensionReturnsTheFirstOfARepeatedType(t *testing.T) {
+// Derived over every extension type the package declares plus the code points it declares none
+// of, in three arrangements, so a lookup that always answered exts[0], or always exts[len-1], or
+// only noticed adjacent entries, fails here too. Both the entry lookup and the body wrapper are
+// asked, because the wrapper is where a second walk would be written.
+func TestFindExtensionRefusesAVectorCarryingARepeatedTypeRatherThanAnsweringByPosition(t *testing.T) {
 	types := []ExtensionType{}
 	for _, value := range sortedValues(registryConstantsOfType(t, "ExtensionType")) {
 		types = append(types, ExtensionType(value))
@@ -851,29 +862,69 @@ func TestFindExtensionReturnsTheFirstOfARepeatedType(t *testing.T) {
 		t.Fatalf("the derivation found %d extension types, so this sweep states almost nothing", len(types))
 	}
 	for _, extensionType := range types {
-		// some other type, so the repeated pair sits neither at the head of the vector nor at
-		// its tail and neither end can be returned by accident
+		// some other type, so a repeated pair can be put where neither end of the vector is the
+		// answer a broken lookup would reach for
 		other := types[0]
 		if other == extensionType {
 			other = types[1]
 		}
 		first := []byte{byte(extensionType >> 8), byte(extensionType), 0x01}
 		second := []byte{byte(extensionType >> 8), byte(extensionType), 0x02}
-		exts := []Extension{
+		for _, one := range []struct {
+			name string
+			exts []Extension
+			at   []int
+		}{
+			{"bracketed by other entries", []Extension{
+				{ExtensionType: other, ExtensionData: []byte{0xff}},
+				{ExtensionType: extensionType, ExtensionData: first},
+				{ExtensionType: extensionType, ExtensionData: second},
+				{ExtensionType: other, ExtensionData: []byte{0xfe}},
+			}, []int{1, 2}},
+			{"adjacent at the head", []Extension{
+				{ExtensionType: extensionType, ExtensionData: second},
+				{ExtensionType: extensionType, ExtensionData: first},
+				{ExtensionType: other, ExtensionData: []byte{0xfe}},
+			}, []int{0, 1}},
+			{"apart, with another entry between them", []Extension{
+				{ExtensionType: extensionType, ExtensionData: first},
+				{ExtensionType: other, ExtensionData: []byte{0xff}},
+				{ExtensionType: extensionType, ExtensionData: second},
+			}, []int{0, 2}},
+		} {
+			body, ok, err := FindExtension(one.exts, extensionType)
+			if !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("%#04x, %s: FindExtension over a vector holding it twice answered (%x, %v, %v), want ErrMalformedExtension; which body a peer gets to have enforced is otherwise chosen by the peer",
+					uint16(extensionType), one.name, body, ok, err)
+				continue
+			}
+			if ok || body != nil {
+				t.Errorf("%#04x, %s: FindExtension answered (%x, %v) beside its refusal; a caller reading the body would be acting on one of two entries picked by iteration order",
+					uint16(extensionType), one.name, body, ok)
+			}
+			// with the repeat refused, the ORDER the two positions are named in is the only
+			// observable a walk in the wrong direction still changes, which is what the reader
+			// the two accessors share is for
+			if at := groupPolicyPositionsNamedBy(t, err); !slices.Equal(at, one.at) {
+				t.Errorf("%#04x, %s: the refusal named entries %v, want %v; it has to point at the two entries in the order the vector holds them",
+					uint16(extensionType), one.name, at, one.at)
+			}
+			entry, found, err := FindExtensionEntry(one.exts, extensionType)
+			if !errors.Is(err, ErrMalformedExtension) || found ||
+				entry.ExtensionData != nil || entry.ExtensionType != 0 {
+				t.Errorf("%#04x, %s: FindExtensionEntry answered (%v, %v, %v), want a refusal and no entry",
+					uint16(extensionType), one.name, entry, found, err)
+			}
+		}
+		// the control: one entry of the type is still answered, and answered with ITS body, so
+		// the refusals above are about the repeat rather than about this sweep's bodies
+		once := []Extension{
 			{ExtensionType: other, ExtensionData: []byte{0xff}},
 			{ExtensionType: extensionType, ExtensionData: first},
-			{ExtensionType: extensionType, ExtensionData: second},
-			{ExtensionType: other, ExtensionData: []byte{0xfe}},
 		}
-		body, ok := FindExtension(exts, extensionType)
-		if !ok {
-			t.Errorf("%#04x: FindExtension over a vector holding it twice reported absent; a lookup that refuses a repeated type hides the input ValSem209 is stated over",
-				uint16(extensionType))
-			continue
-		}
-		if !bytes.Equal(body, first) {
-			t.Errorf("%#04x: FindExtension over a vector holding it twice returned %x, want the FIRST entry's body %x; which body a peer gets to have enforced is otherwise chosen by the peer",
-				uint16(extensionType), body, first)
+		if body, ok, err := FindExtension(once, extensionType); err != nil || !ok || !bytes.Equal(body, first) {
+			t.Errorf("%#04x: FindExtension over a vector holding it once answered (%x, %v, %v), want its body and no refusal",
+				uint16(extensionType), body, ok, err)
 		}
 	}
 }
@@ -3439,9 +3490,9 @@ func TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes(t *testing.T) {
 		t.Fatalf("the vector decoded to %d entries, want 1", len(exts))
 	}
 
-	found, ok := FindExtension(exts, ExtensionTypeUrmessageLeafKeys)
-	if !ok {
-		t.Fatalf("FindExtension did not find the entry this test just wrote")
+	found, ok, err := FindExtension(exts, ExtensionTypeUrmessageLeafKeys)
+	if err != nil || !ok {
+		t.Fatalf("FindExtension did not find the entry this test just wrote: %v", err)
 	}
 	// the documented behaviour of the lookup, held here so the doc and the code cannot drift
 	// apart in silence. If this ever fails because FindExtension started copying, that is a

@@ -493,11 +493,22 @@ func reconcileWithGroupContext(ctx *TreeValidationContext, gc *GroupContext) err
 // its own. Absence is reconciled too and in both directions: a nil rc is "requires nothing" and
 // an absent extension is the same statement, so the two must not be able to differ.
 //
-// FindExtension answers the FIRST entry of the type, which is the value section 13's consumers
-// read; a vector carrying two is refused by ValSem209 at the door that owns repeated extension
-// types, not here.
+// The lookup REFUSES a group context carrying two required_capabilities rather than answering
+// the first, and that refusal is worth more here than at either accessor. This runs under
+// reconcileWithGroupContext, under the exported (*RatchetTree).ValidateAgainstContext, whose
+// *GroupContext came off the wire: a peer that sent two would otherwise choose which one this
+// client reconciles against, and so which one every leaf is held to, at the validation entry
+// point whose job is to refuse exactly that. Answering the first is not safe by accident here
+// either, because an absent required_capabilities is read three lines down as "this group
+// requires nothing" -- so a repeat reported as absence would be ACCEPTED rather than refused.
+//
+// The refusal is not a disagreement between the two structures and so does not carry
+// errGroupContextDisagreement: nothing here disagrees, the group context is malformed.
 func reconcileRequiredCapabilities(required *RequiredCapabilities, groupExtensions []Extension) error {
-	body, carried := FindExtension(groupExtensions, ExtensionTypeRequiredCapabilities)
+	body, carried, err := FindExtension(groupExtensions, ExtensionTypeRequiredCapabilities)
+	if err != nil {
+		return fmt.Errorf("the group context carries required_capabilities more than once: %w", err)
+	}
 	if !carried {
 		if required != nil {
 			return fmt.Errorf("%w: the leaves are held to a required_capabilities the epoch does not carry",

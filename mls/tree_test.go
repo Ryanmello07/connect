@@ -4036,9 +4036,9 @@ func TestEveryRatchetTreeExtensionThisPackageBuildsCarriesItsOwnTag(t *testing.T
 
 	// and the entry FindExtension hands a caller out of a real extensions vector is the one
 	// this pair accepts, which is the shape the group lifecycle plan uses
-	body, found := FindExtension([]Extension{ext}, ExtensionTypeRatchetTree)
-	if !found {
-		t.Fatalf("FindExtension did not find the entry Encode built")
+	body, found, err := FindExtension([]Extension{ext}, ExtensionTypeRatchetTree)
+	if err != nil || !found {
+		t.Fatalf("FindExtension did not find the entry Encode built: %v", err)
 	}
 	if !bytes.Equal(body, ext.ExtensionData) {
 		t.Fatalf("FindExtension answered a different body")

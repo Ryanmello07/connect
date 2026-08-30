@@ -1,0 +1,557 @@
+// The one rule this package has about a repeated extension type, and the derived class it is
+// stated over.
+//
+// The rule: extensions<V> is a vector and the wire permits two entries of one type, RFC 9420
+// forbids it, and NOTHING in this build refuses it except the lookup. ValSem209 is named by the
+// validation plan and implemented nowhere; LeafNode.Validate -- the door three comments used to
+// hand the refusal to -- walks every entry and range checks each, which is a different rule and
+// accepts a leaf carrying two well formed entries on purpose. So FindExtensionEntry refuses, once,
+// for every caller.
+//
+// Why this file exists rather than three assertions beside the three accessors. Before it, one
+// branch held BOTH positions at once: two accessors refused a repeat and said in as many words
+// that they did so because ValSem209 does not exist, while two lookups and a group context
+// reconciliation answered by position and said a repeat would be refused by ValSem209. Both were
+// committed together, and the test that pinned first-wins argued in its failure text that
+// refusing "hides the input ValSem209 is stated over". Nothing derived the class, so the way that
+// contradiction was found was by reading five comments -- and a FOURTH accessor, of which p7 has
+// several still to write, would have landed on whichever side its author read first.
+//
+// So the class is derived from what a declaration DOES, not from a list of the ones that exist:
+// every declaration that reads an extension's TYPE off something other than an Extension it was
+// handed whole is reading one out of a vector, and every one of those has to be classified here.
+// The classification is a table, and the table is held EQUAL to the derived class in both
+// directions, which is what stops it being the enumeration rule 5 forbids: a declaration with no
+// row fails rather than going unclassified, and a row for a declaration that no longer exists
+// fails rather than outliving it.
+//
+// The rule is stated over the READ and not over the loop deliberately. A lookup written with
+// slices.IndexFunc and a closure carries no for statement at all, and a rule that recognised the
+// loop would report a clean run over it -- the same understatement this project has been walked
+// past fourteen times, one level down.
+package mls
+
+import (
+	"bytes"
+	"errors"
+	"go/ast"
+	"go/types"
+	"maps"
+	"slices"
+	"testing"
+)
+
+// The three names the derivation is written against, read out of the compiler's types rather
+// than matched as text: the struct one entry is, the field that carries its type, and the type
+// that field has. All three are this package's own declarations, and a control below declares
+// its own copies so the matcher is proven to read a package it has never seen.
+const (
+	extensionStructTypeName = "Extension"
+	extensionTypeFieldName  = "ExtensionType"
+	extensionTypeTypeName   = "ExtensionType"
+)
+
+// extensionTypeSelectionRoots is where the rule is stated. This package's own directory and
+// ../message's, which is the scope every cross package guardrail of this package already uses,
+// and it is wider than the place the demand comes from on purpose: mls must not import message,
+// so message is where a second reader of a group context extension can be written without any
+// gate of this package noticing.
+//
+// ../message declares nothing of the kind today. That is not a reason to leave it out -- a scope
+// that covers only what is already written is a scope that stops covering the first thing added.
+var extensionTypeSelectionRoots = []string{".", messagePackageDir}
+
+// extensionTypeSelectionNamedAs answers whether the compiler reads a type as the named type
+// spelled name, through any number of pointers.
+//
+// The compiler's reading and not the source's, so an alias, a type declared in another package
+// and referred to as mls.Extension, and a value reached through a pointer all answer the same.
+func extensionTypeSelectionNamedAs(found types.Type, name string) bool {
+	for {
+		if found == nil {
+			return false
+		}
+		pointer, isPointer := found.(*types.Pointer)
+		if !isPointer {
+			break
+		}
+		found = pointer.Elem()
+	}
+	named, isNamed := found.(*types.Named)
+	return isNamed && named.Obj() != nil && named.Obj().Name() == name
+}
+
+// extensionTypeSelectionUnparenthesised strips the parentheses a selector's base may be written
+// with, because (exts[i]).ExtensionType and exts[i].ExtensionType are the same read.
+func extensionTypeSelectionUnparenthesised(expr ast.Expr) ast.Expr {
+	for {
+		parens, isParens := expr.(*ast.ParenExpr)
+		if !isParens {
+			return expr
+		}
+		expr = parens.X
+	}
+}
+
+// extensionTypeSelectionDeclarationName names one declaration the way the tables of this package
+// name declarations: a plain function by its name, a method as (*T).Name or T.Name.
+func extensionTypeSelectionDeclarationName(checked checkedBodies, function *ast.FuncDecl) string {
+	if function.Recv == nil || len(function.Recv.List) != 1 {
+		return function.Name.Name
+	}
+	receiver := checked.render(function.Recv.List[0].Type)
+	if len(receiver) > 0 && receiver[0] == '*' {
+		receiver = "(" + receiver + ")"
+	}
+	return receiver + "." + function.Name.Name
+}
+
+// The objects a declaration was HANDED: its receiver and its parameters.
+//
+// Results are not among them, and neither is any local. A value a declaration was handed is one
+// its caller chose; a value it read out of a slice, bound with a range clause, assigned to a
+// local or took as a function literal's parameter is one it selected for itself, and selecting
+// is the thing this rule is about. The distinction is drawn over the type checker's OBJECTS
+// rather than over names, so a local shadowing a parameter is a different object and is not
+// mistaken for the parameter.
+func extensionTypeSelectionHandedTo(checked checkedBodies, function *ast.FuncDecl) map[types.Object]bool {
+	handed := map[types.Object]bool{}
+	fields := []*ast.Field{}
+	if function.Recv != nil {
+		fields = append(fields, function.Recv.List...)
+	}
+	if function.Type.Params != nil {
+		fields = append(fields, function.Type.Params.List...)
+	}
+	for _, field := range fields {
+		for _, name := range field.Names {
+			if object := checked.info.Defs[name]; object != nil {
+				handed[object] = true
+			}
+		}
+	}
+	return handed
+}
+
+// What one scan read: the declarations that select, and how many extension type reads were seen
+// at all.
+//
+// The read count is carried for the reason packageLevelScan carries its file list. A matcher
+// that stopped resolving its subject reports an EMPTY set of selections, and an empty set
+// satisfies a table equality gate whose table was emptied with it -- so "nothing selects" and
+// "nothing was read" have to be distinguishable, and only the second is a broken gate.
+type extensionTypeSelectionScan struct {
+	selecting map[string]string
+	reads     int
+}
+
+// extensionTypeSelectionsIn is the rule: every declaration of one checked package that reads an
+// extension's TYPE off something other than an Extension it was handed whole.
+//
+// Stated over the READ rather than over the comparison, and over the comparison's absence rather
+// than its shape, because neither is where the class lives. A lookup that assigns
+// exts[i].ExtensionType to a local and compares the local later is the same lookup; one written
+// with slices.IndexFunc and a closure has no loop at all; one that switches on the value makes no
+// binary comparison. All three read an extension's type out of a vector, and that read is the
+// step none of them can be written without.
+//
+// The exemption is narrow on purpose: only a direct field read off an identifier the declaration
+// was handed. A function literal's parameter is not the declaration's, so the closure a
+// slices.IndexFunc lookup is written with is reported; a local assigned from a parameter is not
+// the parameter, so a tag check laundered through one is reported too. That last one is a false
+// positive and it is the safe direction -- it costs a row in the table saying what it is, and the
+// table is read by a human, while the other direction costs a lookup nobody classified.
+func extensionTypeSelectionsIn(checked checkedBodies) extensionTypeSelectionScan {
+	scan := extensionTypeSelectionScan{selecting: map[string]string{}}
+	for _, file := range checked.files {
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			handed := extensionTypeSelectionHandedTo(checked, function)
+			name := extensionTypeSelectionDeclarationName(checked, function)
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				selector, isSelector := node.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != extensionTypeFieldName {
+					return true
+				}
+				if !extensionTypeSelectionNamedAs(checked.info.TypeOf(selector), extensionTypeTypeName) ||
+					!extensionTypeSelectionNamedAs(checked.info.TypeOf(selector.X), extensionStructTypeName) {
+					return true
+				}
+				scan.reads++
+				if base, isIdent := extensionTypeSelectionUnparenthesised(selector.X).(*ast.Ident); isIdent {
+					if object := checked.info.Uses[base]; object != nil && handed[object] {
+						// the whole entry was handed to this declaration by its caller: a tag
+						// check, which selects nothing
+						return true
+					}
+				}
+				if _, already := scan.selecting[name]; !already {
+					scan.selecting[name] = checked.where(selector)
+				}
+				return true
+			})
+		}
+	}
+	return scan
+}
+
+// extensionTypeSelectionControl is a package the matcher has never seen, declaring its own
+// Extension and ExtensionType, written so that every half of the rule has something to report
+// and something to walk past.
+//
+// A control rather than a second opinion about the real source: a matcher that resolved nothing
+// reports an empty set over mls too, and an empty set is exactly what a package with no lookups
+// would produce. The only way to tell the two apart is to run the matcher on source known to
+// hold both answers.
+const extensionTypeSelectionControl = `package control
+
+import "slices"
+
+type ExtensionType uint16
+
+type Extension struct {
+	ExtensionType ExtensionType
+	ExtensionData []byte
+}
+
+type Holder struct {
+	Extensions []Extension
+}
+
+const ExtensionTypeSomething ExtensionType = 0xF00D
+
+// handed the whole entry by its caller: a tag check, and not a selection
+func ParseSomethingFrom(ext Extension) []byte {
+	if ext.ExtensionType != ExtensionTypeSomething {
+		return nil
+	}
+	return ext.ExtensionData
+}
+
+// the receiver is handed too
+func (self Extension) IsSomething() bool {
+	return self.ExtensionType == ExtensionTypeSomething
+}
+
+// the fourth accessor, hand rolling the walk the package has one door for
+func SomethingOf(exts []Extension) []byte {
+	for i := range exts {
+		if exts[i].ExtensionType == ExtensionTypeSomething {
+			return exts[i].ExtensionData
+		}
+	}
+	return nil
+}
+
+// the same lookup with no for statement anywhere in it, which is why the rule is stated over the
+// read and not over the loop
+func SomethingElseOf(exts []Extension) []byte {
+	at := slices.IndexFunc(exts, func(e Extension) bool {
+		return e.ExtensionType == ExtensionTypeSomething
+	})
+	if at < 0 {
+		return nil
+	}
+	return exts[at].ExtensionData
+}
+
+// the range form, whose subject is a loop variable and not a parameter, and which makes no
+// comparison of its own at all
+func (self *Holder) ThirdOf() map[ExtensionType][]byte {
+	out := map[ExtensionType][]byte{}
+	for _, ext := range self.Extensions {
+		out[ext.ExtensionType] = ext.ExtensionData
+	}
+	return out
+}
+`
+
+// What the matcher must report out of the control, and by omission what it must walk past.
+var extensionTypeSelectionControlReports = []string{"(*Holder).ThirdOf", "SomethingElseOf", "SomethingOf"}
+
+// One classified member of the derived class.
+//
+// The prose is what a reader gets; refusesTheRepeat is the package's position stated as a
+// property of the set rather than of any one member -- exactly one declaration may own the
+// refusal, because two doors is two rules and neither would be reached by every caller; and the
+// probe is what stops the row being a label. A row asserting that a declaration visits every
+// entry, on a declaration that stops at the first, has to fail.
+type extensionTypeSelection struct {
+	what             string
+	refusesTheRepeat bool
+	probe            func(t *testing.T)
+}
+
+// Every declaration of this package and of ../message that reads an extension's type out of a
+// vector, with what it does about a repeated type.
+//
+// Held EQUAL to the derived class in both directions by the gate below, so this is a
+// classification and not a list: the commit that writes a fourth accessor either routes it
+// through FindExtensionEntry -- in which case it reads no extension type of its own and is not
+// in the class at all -- or hand rolls a walk and fails here until somebody writes down which of
+// the two things it does.
+var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
+	"FindExtensionEntry": {
+		what: "the package's ONE lookup of an extension by type, and so the one door that refuses a repeated one. " +
+			"RFC 9420 forbids two entries of a type and nothing else in this build refuses it: ValSem209 is not " +
+			"implemented, and LeafNode.Validate accepts a leaf carrying two well formed entries on purpose. Every " +
+			"accessor reaches an entry through here, so the refusal reaches every caller without any of them " +
+			"restating it",
+		refusesTheRepeat: true,
+		probe: func(t *testing.T) {
+			entry := Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x01}}
+			second := Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x02}}
+			other := Extension{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x03}}
+			got, found, err := FindExtensionEntry([]Extension{other, entry}, entry.ExtensionType)
+			if err != nil || !found || !bytes.Equal(got.ExtensionData, entry.ExtensionData) {
+				t.Fatalf("FindExtensionEntry over a vector holding the type once answered (%v, %v, %v), want the entry; the refusal below would otherwise be a lookup that answers nothing at all",
+					got, found, err)
+			}
+			for _, held := range [][]Extension{
+				{entry, second},
+				{second, entry},
+				{other, entry, other, second},
+			} {
+				answered, found, err := FindExtensionEntry(held, entry.ExtensionType)
+				if !errors.Is(err, ErrMalformedExtension) || found || answered.ExtensionData != nil {
+					t.Errorf("FindExtensionEntry over %v answered (%v, %v, %v), want ErrMalformedExtension and no entry; a lookup that answers one of two picks the group's wrap target, its role list and its required_capabilities by iteration order",
+						held, answered, found, err)
+				}
+			}
+		},
+	},
+	"(*GroupContext).Clone": {
+		what: "reads the type of EVERY entry and writes each one into the copy. It selects none, and the " +
+			"property that matters here is the one the rule reports it for: the clone must carry the same " +
+			"entries in the same order, repeats included. A clone that collapsed two entries of one type -- " +
+			"which is the tidy thing to do and is one line -- would make a group context the lookup refuses " +
+			"become one it answers, and the epoch a member is still decrypting with would differ from the one " +
+			"it was validated as. This row is the false positive the rule's exemption is deliberately too " +
+			"narrow to drop, and it is worth the row",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			held := &GroupContext{Extensions: []Extension{
+				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x01}},
+				{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x02}},
+				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x03}},
+			}}
+			clone := held.Clone()
+			if len(clone.Extensions) != len(held.Extensions) {
+				t.Fatalf("a context carrying %d extensions, two of them one type, cloned to %d; a clone that drops a repeat turns a context the lookup refuses into one it answers",
+					len(held.Extensions), len(clone.Extensions))
+			}
+			for i := range held.Extensions {
+				if clone.Extensions[i].ExtensionType != held.Extensions[i].ExtensionType ||
+					!bytes.Equal(clone.Extensions[i].ExtensionData, held.Extensions[i].ExtensionData) {
+					t.Errorf("entry %d cloned to %v, want %v; the order and the bodies are what the transcript hash covers",
+						i, clone.Extensions[i], held.Extensions[i])
+				}
+			}
+			// the repeat survives the copy, so the lookup still refuses over the clone
+			if _, _, err := FindExtensionEntry(clone.Extensions, ExtensionTypeRequiredCapabilities); !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("the clone of a context carrying required_capabilities twice is answered by the lookup with %v, want ErrMalformedExtension",
+					err)
+			}
+			// and it is a copy rather than an alias, which is what the doc on Clone is for
+			clone.Extensions[0].ExtensionData[0] ^= 0xff
+			if bytes.Equal(clone.Extensions[0].ExtensionData, held.Extensions[0].ExtensionData) {
+				t.Error("writing to the clone's first extension body changed the original's, so a rewritten epoch reaches back into the one a member is still decrypting with")
+			}
+		},
+	},
+	"(*LeafNode).Validate": {
+		what: "walks every extension of a leaf and applies RFC 9420 section 7.3 to each. It SELECTS none -- the " +
+			"walk exists precisely so the rule is not applied to element zero alone -- so the repeat is not its " +
+			"rule and a leaf carrying two well formed urmessage_leaf_keys entries passes it, to be refused at the " +
+			"lookup by whoever reads one. TestLeafNodeValidateRangeChecksEveryUrmessageLeafKeysEntry is the wide " +
+			"statement of this; the probe here is the one row that separates a walk from a lookup",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := leafValidationCrypto(t)
+			good := leafValidationLeafKeysEntry(t)
+			bad := Extension{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{}}
+			// the second entry is the one that separates a walk from a lookup: a clause that
+			// stopped at the first match would accept this leaf
+			behind := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+				leaf.Extensions = []Extension{good, bad}
+			})
+			if err := behind.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); !errors.Is(err, ErrLeafKeysExtensionInvalid) {
+				t.Errorf("a leaf whose SECOND urmessage_leaf_keys entry is malformed validated with %v, want ErrLeafKeysExtensionInvalid; a clause that stops at the first match carries the rest into an accepted leaf unlooked at",
+					err)
+			}
+			// and the other half of "it selects nothing": two well formed entries are accepted
+			// here, because refusing the repeat is the lookup's rule and not this one's
+			both := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, func(leaf *LeafNode) {
+				leaf.Extensions = []Extension{good, good}
+			})
+			if err := both.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit)); err != nil {
+				t.Errorf("a leaf carrying two well formed urmessage_leaf_keys entries was refused here with %v; if this clause starts refusing the repeat then the package has two doors for one rule and this row is the wrong classification",
+					err)
+			}
+			if _, err := LeafKeysOf(both); !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("the leaf this clause accepted is answered by LeafKeysOf with %v, want ErrMalformedExtension; accepting the repeat here is only correct because the lookup refuses it",
+					err)
+			}
+		},
+	},
+	"reconcileWithGroupContext": {
+		what: "compares the leaves' extensions vector against the epoch's POSITIONALLY, entry by entry, after " +
+			"pinning their lengths equal. It selects nothing by type -- both operands of its comparison are read " +
+			"at the same index -- so a repeat is not decided here. The one extension it does read BY TYPE, " +
+			"required_capabilities, it reads through the lookup, which is what makes a peer sending two of them a " +
+			"refusal at this validation entry point rather than a choice the peer gets to make",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			body := []byte{0x00, 0x00, 0x00}
+			caps := &RequiredCapabilities{}
+			encoded, err := marshalBytes(caps.MarshalMLS)
+			if err != nil {
+				t.Fatalf("encode the required_capabilities this probe reconciles: %v", err)
+			}
+			contextOf := func(exts []Extension) *GroupContext {
+				return &GroupContext{
+					CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+					GroupId:     []byte("reconcile"),
+					Extensions:  exts,
+				}
+			}
+			validation := func(exts []Extension, required *RequiredCapabilities) *TreeValidationContext {
+				return &TreeValidationContext{
+					Crypto:          crypto,
+					Suite:           CipherSuiteX25519ChaCha20Sha256Ed25519,
+					GroupId:         []byte("reconcile"),
+					RequiredCaps:    required,
+					GroupExtensions: exts,
+				}
+			}
+			agreeing := []Extension{
+				{ExtensionType: ExtensionTypeApplicationId, ExtensionData: body},
+				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: encoded},
+			}
+			if err := reconcileWithGroupContext(validation(agreeing, caps), contextOf(agreeing)); err != nil {
+				t.Fatalf("two identical extension vectors were refused: %v; every refusal below could then be this", err)
+			}
+			// the disagreement is at the SECOND entry, which is what a positional comparison
+			// that stopped at the first would walk past
+			differing := slices.Clone(agreeing)
+			differing[1] = Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: encoded}
+			if err := reconcileWithGroupContext(validation(agreeing, caps), contextOf(differing)); !errors.Is(err, errGroupContextDisagreement) {
+				t.Errorf("a disagreement at the second of two entries answered %v, want errGroupContextDisagreement; a comparison that stops at the first entry lets a swapped pair through",
+					err)
+			}
+			// and the type it DOES read by type is read through the lookup, so a peer sending
+			// two required_capabilities is refused here rather than choosing which one this
+			// client holds every leaf to
+			repeated := append(slices.Clone(agreeing), Extension{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: encoded})
+			if err := reconcileWithGroupContext(validation(repeated, caps), contextOf(repeated)); !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("a group context carrying required_capabilities twice reconciled with %v, want ErrMalformedExtension; the *GroupContext here came off the wire, so a peer would otherwise choose which body every leaf of this group is judged against",
+					err)
+			}
+		},
+	},
+}
+
+// extensionTypeSelectionsOfEveryRoot is the derived class over both scanned roots, with the
+// place each was found.
+//
+// A name that appears in both roots is fatal rather than merged: the table is keyed by name, and
+// two declarations sharing one row would let a row assert one of them while covering neither.
+func extensionTypeSelectionsOfEveryRoot(t *testing.T) map[string]string {
+	t.Helper()
+	found := map[string]string{}
+	reads := 0
+	for _, root := range extensionTypeSelectionRoots {
+		checked := typeCheckedBodiesOf(t, root)
+		if len(checked.paths) == 0 {
+			t.Fatalf("%s holds no non test source, so this gate scanned nothing there", root)
+		}
+		scan := extensionTypeSelectionsIn(checked)
+		reads += scan.reads
+		for name, where := range scan.selecting {
+			if held, already := found[name]; already {
+				t.Fatalf("%s selects an extension by type at %s and at %s; this table is keyed by name, so the two would share one row and one of them would go unclassified",
+					name, held, where)
+			}
+			found[name] = where
+		}
+	}
+	if reads == 0 {
+		t.Fatalf("no read of an extension's type was resolved across %v, so this gate would report a clean run over a package that hand rolled every lookup it has",
+			extensionTypeSelectionRoots)
+	}
+	t.Logf("%d extension type reads across %v, of which %d are selections out of a vector",
+		reads, extensionTypeSelectionRoots, len(found))
+	return found
+}
+
+// TestEveryExtensionTypeSelectionOfBothPackagesIsClassifiedHere is rule 5 over the class this
+// package had no derivation for: a lookup that selects an extension by type.
+//
+// The contradiction this file was written for was reachable because nothing derived that class.
+// Three comments handed the refusal of a repeated type to ValSem209, two accessors refused it
+// themselves and said ValSem209 does not exist, and both were committed together -- and the
+// reason nobody had to choose was that adding a lookup required nothing of its author. p7 has
+// nineteen tasks left and several of them read an extension off a group context, so the gate has
+// to fail on the commit that writes the fourth one rather than on the reader who notices later.
+//
+// The matcher runs on the control first, which is what says it reads anything at all: an empty
+// report over this package and an empty report from a matcher that resolved nothing are the same
+// value, and only the control tells them apart.
+func TestEveryExtensionTypeSelectionOfBothPackagesIsClassifiedHere(t *testing.T) {
+	control := extensionTypeSelectionsIn(typeCheckedBodiesOfText(t, "the extension type selection control",
+		extensionTypeSelectionControl))
+	if reported := slices.Sorted(maps.Keys(control.selecting)); !slices.Equal(reported, extensionTypeSelectionControlReports) {
+		t.Fatalf("the rule reported %v out of the control, want %v; a rule that reports the tag checks demands a row for every parse in this package, and one that misses the closure form reports a clean run over a lookup written with slices.IndexFunc",
+			reported, extensionTypeSelectionControlReports)
+	}
+	if control.reads < len(extensionTypeSelectionControlReports) {
+		t.Fatalf("the rule resolved %d extension type reads in the control, which declares more than that; the type resolution is not reading the control at all",
+			control.reads)
+	}
+
+	derived := extensionTypeSelectionsOfEveryRoot(t)
+	classified := slices.Sorted(maps.Keys(extensionTypeSelectionsOfBothPackages))
+	if found := slices.Sorted(maps.Keys(derived)); !slices.Equal(found, classified) {
+		t.Fatalf("%v select an extension by type and this table classifies %v; a declaration with no row is a lookup nobody decided the repeat question for, and a row with no declaration is a classification that outlived what it classified. Locations: %v",
+			found, classified, derived)
+	}
+	for name, where := range derived {
+		t.Logf("%s at %s: %s", name, where, extensionTypeSelectionsOfBothPackages[name].what)
+	}
+
+	doors := []string{}
+	for name, one := range extensionTypeSelectionsOfBothPackages {
+		if one.refusesTheRepeat {
+			doors = append(doors, name)
+		}
+		if one.what == "" || one.probe == nil {
+			t.Errorf("%s is classified with no account of what it does or no probe of it; a row that states nothing is the enumeration this gate exists to not be", name)
+		}
+	}
+	slices.Sort(doors)
+	if !slices.Equal(doors, []string{"FindExtensionEntry"}) {
+		t.Errorf("the declarations refusing a repeated extension type are %v, want exactly [FindExtensionEntry]; two doors for one rule is two rules, and a caller reaching only one of them is a caller the other does not protect",
+			doors)
+	}
+}
+
+// TestEveryClassifiedExtensionTypeSelectionBehavesAsItIsClassified runs each row's probe, so a
+// row is an assertion rather than a label.
+//
+// The gate above compares two sets of names and would pass over a table whose every account was
+// wrong. What separates "walks every entry" from "stops at the first" is not visible in any name
+// or signature: both are a range statement over the same vector, and the difference is which
+// entries the rule is applied to. So each row states its claim as an input and an answer.
+func TestEveryClassifiedExtensionTypeSelectionBehavesAsItIsClassified(t *testing.T) {
+	if len(extensionTypeSelectionsOfBothPackages) == 0 {
+		t.Fatal("the classification table is empty, so this runs nothing")
+	}
+	for _, name := range slices.Sorted(maps.Keys(extensionTypeSelectionsOfBothPackages)) {
+		one := extensionTypeSelectionsOfBothPackages[name]
+		t.Run(name, func(t *testing.T) { one.probe(t) })
+	}
+}

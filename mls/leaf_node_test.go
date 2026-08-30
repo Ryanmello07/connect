@@ -3452,10 +3452,12 @@ func leafValidationMalformedLeafKeysBodies(t *testing.T) map[string][]byte {
 
 // Every urmessage_leaf_keys entry is range checked, and not only the first one a lookup finds.
 //
-// extensions<V> legally holds two entries of one type -- refusing a repeat is somebody else's
-// rule -- and a body checked through FindExtension is the first of them. The second row of this
-// table is the p4 ValSem401 shape written out: a rule applied to element zero, with the elements
-// after it carried into an accepted leaf unlooked at.
+// extensions<V> legally holds two entries of one type on the wire, and refusing that repeat is
+// the LOOKUP's rule rather than this clause's: FindExtensionEntry is the door, so a body checked
+// through the lookup would refuse the leaf for carrying two instead of range checking the second
+// body. Section 7.3 is a rule about every extension a leaf carries and a validator has to apply
+// it to all of them. The second row of this table is the p4 ValSem401 shape written out: a rule
+// applied to element zero, with the elements after it carried into an accepted leaf unlooked at.
 func TestLeafNodeValidateRangeChecksEveryUrmessageLeafKeysEntry(t *testing.T) {
 	crypto := leafValidationCrypto(t)
 	good := leafValidationLeafKeysEntry(t)
