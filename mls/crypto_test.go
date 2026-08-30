@@ -3487,6 +3487,45 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return nil
 		}},
+		// section 6.3.2's seal and open. The seal's answer is the sealed sender data, which is
+		// bytes it produced; the open's is the reuse guard out of the plaintext it decrypted,
+		// which is the one byte field its answer carries and is fresh storage out of the aead
+		// rather than a window onto anything the caller passed. What both rows state beyond
+		// that is the half that matters for these two: the secret, the header and the
+		// ciphertext are all read again by the caller after the call -- the ciphertext most of
+		// all, since it is about to be serialized into the very message this header describes.
+		{name: "sealSenderData", call: func(take func([]byte) []byte) [][]byte {
+			sealed, sealErr := sealSenderData(crypto, take(bytes.Repeat([]byte{0x6d}, crypto.HashSize())),
+				&SenderData{LeafIndex: 2, Generation: 5, ReuseGuard: [4]byte{0x21, 0x22, 0x23, 0x24}},
+				&PrivateMessage{GroupId: take([]byte{0x11, 0x12}), Epoch: 4,
+					ContentType: ContentTypeApplication, AuthenticatedData: take([]byte{0x13})},
+				take(bytes.Repeat([]byte{0x6e}, crypto.HashSize())))
+			if sealErr != nil {
+				t.Fatalf("sealSenderData: %v", sealErr)
+			}
+			return [][]byte{sealed}
+		}},
+		{name: "openSenderData", call: func(take func([]byte) []byte) [][]byte {
+			secret := bytes.Repeat([]byte{0x6d}, crypto.HashSize())
+			ciphertext := bytes.Repeat([]byte{0x6e}, crypto.HashSize())
+			header := &PrivateMessage{GroupId: []byte{0x11, 0x12}, Epoch: 4,
+				ContentType: ContentTypeApplication, AuthenticatedData: []byte{0x13}}
+			senderData := &SenderData{LeafIndex: 2, Generation: 5,
+				ReuseGuard: [4]byte{0x21, 0x22, 0x23, 0x24}}
+			sealed, sealErr := sealSenderData(crypto, secret, senderData, header, ciphertext)
+			if sealErr != nil {
+				t.Fatalf("seal the sender data the open row reads: %v", sealErr)
+			}
+			opened, openErr := openSenderData(crypto, take(secret), take(sealed),
+				&PrivateMessage{GroupId: take(header.GroupId), Epoch: header.Epoch,
+					ContentType:       header.ContentType,
+					AuthenticatedData: take(header.AuthenticatedData)},
+				take(ciphertext))
+			if openErr != nil {
+				t.Fatalf("openSenderData refused a header it had just sealed: %v", openErr)
+			}
+			return [][]byte{opened.ReuseGuard[:]}
+		}},
 		// the static resolver, whose answer is a COPY of the key it was handed rather than a window
 		// onto it. The copy in its body is what this row observes: the aliasing half fails on a
 		// resolver that captured the caller's slice, and the fresh storage half fails on one that
@@ -3913,6 +3952,8 @@ var providerConstructionValues = map[string]any{
 	"verifyMembershipTag":           verifyMembershipTag,
 	"SealPublicMessage":             SealPublicMessage,
 	"OpenPublicMessage":             OpenPublicMessage,
+	"sealSenderData":                sealSenderData,
+	"openSenderData":                openSenderData,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -4413,6 +4454,14 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		if argument.Type() == reflect.TypeOf((*PublicMessage)(nil)) && !argument.IsNil() {
 			return providerPublicMessagePerturbations(t, operation, parameter, argument)
 		}
+		// section 6.3.2's two, whose rules live beside them in framing_protect_test.go for the
+		// reason the three above do.
+		if argument.Type() == reflect.TypeOf((*SenderData)(nil)) && !argument.IsNil() {
+			return providerSenderDataPerturbations(t, operation, parameter, argument)
+		}
+		if argument.Type() == reflect.TypeOf((*PrivateMessage)(nil)) && !argument.IsNil() {
+			return providerPrivateMessagePerturbations(t, operation, parameter, argument)
+		}
 		// the labelled open's ciphertext, whose two fields are byte slices this rule cannot
 		// reach through a pointer to a struct. Its rule lives beside the structure it moves,
 		// in treekem_test.go, which is where psk_test.go and leaf_node_test.go keep theirs.
@@ -4604,7 +4653,14 @@ func providerStructByteFields(value reflect.Value) [][]byte {
 	for i := range value.NumField() {
 		field := value.Field(i)
 		switch {
-		case field.Kind() == reflect.Slice && field.Type().Elem().Kind() == reflect.Uint8:
+		// a FIXED WIDTH byte array is bytes no less than a slice is, and reading only the slice
+		// left section 6.3.2's SenderData rendering as "carrying no bytes at all" -- its
+		// reuse_guard is opaque[4] because the RFC fixes that field's width, and "no bytes at
+		// all" is exactly what a stub answers, so a complete implementation would have been
+		// reported while an actual stub of it sat here indistinguishable. One case and not two,
+		// because the reading is the same either way.
+		case (field.Kind() == reflect.Slice || field.Kind() == reflect.Array) &&
+			field.Type().Elem().Kind() == reflect.Uint8:
 			out := make([]byte, field.Len())
 			for at := range out {
 				out[at] = byte(field.Index(at).Uint())
@@ -5474,6 +5530,15 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// does not. It is not untested -- the section 6.3 goldens, the collision sweep over the header
 	// corpus, and the structural pair test all run it -- and this entry comes off by FAILING on the
 	// commit that gives it a production caller.
+	// The ninth and tenth are p6 task 9's. Section 6.3.2's seal and its open land TOGETHER,
+	// because the property that matters about them is not that either works -- it is that the
+	// open is the seal's inverse over the RFC's construction rather than over whatever the seal
+	// happened to do, and a task that landed one without the other would leave that to whoever
+	// needed the second. Neither has a production caller until p6 task 11 assembles the
+	// PrivateMessage around them. Both entries come off by FAILING on the commit that gives them
+	// one.
+	"./sealSenderData":    "p6 task 9 lands section 6.3.2's seal and open together so the inverse is stated in one diff; p6 task 11's SealPrivateMessage is the first production caller",
+	"./openSenderData":    "p6 task 9 lands section 6.3.2's seal and open together so the inverse is stated in one diff; p6 task 11's OpenPrivateMessage is the first production caller",
 	"./privateContentAAD": "p6 task 8 lands section 6.3's two AADs together because the content AAD is assembled out of the sender data AAD; p6 task 11's PrivateMessage content encryption is the first production caller",
 }
 

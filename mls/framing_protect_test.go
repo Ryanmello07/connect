@@ -172,6 +172,47 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 	arguments["OpenPublicMessage.message"] = message
 	arguments["OpenPublicMessage.resolve"] = StaticSignatureKey(pub)
 	arguments["OpenPublicMessage.groupContext"] = encodedGroupContext
+
+	// section 6.3.2's seal and open. The open's row needs a base call that SUCCEEDS, for the
+	// reason section 6.2's does: a base call that refused would leave every perturbation below
+	// it comparing one refusal against another, and would report a construction that reads none
+	// of its inputs as one that observes all of them.
+	//
+	// The secret is at the provider's own hash width rather than a written down 32 octets, for
+	// the membership key's reason above, and because SenderDataKeyNonce refuses every other
+	// length -- a refused call is a row that observed nothing.
+	//
+	// The CIPHERTEXT is exactly KDF.Nh, which is SenderDataKeyNonce.ciphertext's choice and is
+	// made here for that argument's reason. RFC 9420 section 6.3.2 samples the first KDF.Nh
+	// octets and no more, so a longer ciphertext would put the middle and last perturbations
+	// outside the sample -- where an answer that does not move is the RFC working rather than a
+	// stub, and would be reported as "does not read the ciphertext it was handed". Where the
+	// sample boundary is held instead is
+	// TestTheSenderDataSampleLocatesBothItsOffsetAndItsLength.
+	senderDataSecret := bytes.Repeat([]byte{0x6d}, fixture.HashSize())
+	senderDataCiphertext := bytes.Repeat([]byte{0x6e}, fixture.HashSize())
+	senderDataHeader := &PrivateMessage{
+		GroupId:           []byte{0x11, 0x12},
+		Epoch:             4,
+		ContentType:       ContentTypeApplication,
+		AuthenticatedData: []byte{0x13},
+	}
+	// every field carries something, so a perturbation has a field to move and a seal that
+	// dropped one is not hidden by that field being zero to begin with.
+	senderData := &SenderData{LeafIndex: 2, Generation: 5, ReuseGuard: [4]byte{0x21, 0x22, 0x23, 0x24}}
+	arguments["sealSenderData.senderDataSecret"] = senderDataSecret
+	arguments["sealSenderData.senderData"] = senderData
+	arguments["sealSenderData.header"] = senderDataHeader
+	arguments["sealSenderData.ciphertext"] = senderDataCiphertext
+	encryptedSenderData, err := sealSenderData(fixture, senderDataSecret, senderData,
+		senderDataHeader, senderDataCiphertext)
+	if err != nil {
+		t.Fatalf("seal the sender data the openSenderData row reads: %v", err)
+	}
+	arguments["openSenderData.senderDataSecret"] = senderDataSecret
+	arguments["openSenderData.encryptedSenderData"] = encryptedSenderData
+	arguments["openSenderData.header"] = senderDataHeader
+	arguments["openSenderData.ciphertext"] = senderDataCiphertext
 }
 
 // providerPublicMessagePerturbations moves the epoch of the message being opened.
@@ -272,6 +313,49 @@ func providerAuthenticatedContentPerturbations(t *testing.T, operation string, p
 	}
 	moved := *base
 	moved.Content.Epoch++
+	return []providerPerturbation{{where: "epoch one higher", value: reflect.ValueOf(&moved)}}
+}
+
+// providerSenderDataPerturbations moves the GENERATION of the sender data being sealed.
+//
+// The generation and not the leaf index, for one reason that is worth writing down: the two are
+// adjacent uint32s in section 6.3.2's structure, so a codec that swapped them agrees with itself
+// and a perturbation of either moves the answer just the same. What this row asks is only whether
+// the seal put the sender data into the plaintext AT ALL -- a seal that sealed a constant, or that
+// sealed its header twice, answers identically here and one that carried the caller's value
+// cannot. Which field goes where is TestSenderDataRoundTrip's golden.
+func providerSenderDataPerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base := argument.Interface().(*SenderData)
+	if base == nil {
+		t.Fatalf("the base argument for %s.%s is a nil sender data, so perturbing it changes nothing",
+			operation, parameter.name)
+	}
+	moved := *base
+	moved.Generation++
+	return []providerPerturbation{{where: "generation one higher", value: reflect.ValueOf(&moved)}}
+}
+
+// providerPrivateMessagePerturbations moves the epoch of the cleartext header, which is the field
+// two messages of one group differ in and is inside section 6.3.2's associated data.
+//
+// The header is not encrypted and is not the plaintext: what a seal or an open does with it is
+// build the AAD, so an operation that dropped it out of that AAD answers identically here and one
+// that kept it cannot. The copy is a struct copy whose byte fields are read and never written, so
+// this perturbation cannot reach into the base argument every other row is built from.
+func providerPrivateMessagePerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base := argument.Interface().(*PrivateMessage)
+	if base == nil {
+		t.Fatalf("the base argument for %s.%s is a nil private message header, so perturbing it changes nothing",
+			operation, parameter.name)
+	}
+	moved := *base
+	moved.Epoch++
 	return []providerPerturbation{{where: "epoch one higher", value: reflect.ValueOf(&moved)}}
 }
 
@@ -3849,5 +3933,527 @@ func TestOpenPublicMessageRefusesAMembershipTagOnASenderTypeSectionSixTwoGivesNo
 	if refused == 0 || members != 1 {
 		t.Fatalf("%d tags were refused on sender types that carry none and %d member arms were carried; with either half empty this states one rule rather than the select",
 			refused, members)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the sender data, RFC 9420 section 6.3.2
+// ---------------------------------------------------------------------------
+
+func TestSenderDataRoundTrip(t *testing.T) {
+	senderData := SenderData{
+		LeafIndex:  1,
+		Generation: 7,
+		ReuseGuard: [4]byte{0xde, 0xad, 0xbe, 0xef},
+	}
+	encoded, err := syntax.Marshal(&senderData)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// the golden is hand derived and it is what separates the field ORDER and the raw
+	// reuse guard from a codec that agrees with itself: leaf_index 1 and generation 7 are
+	// two different numbers, so a codec that swapped them in both halves round trips
+	// perfectly and produces 00000007 00000001 here, and a reuse guard written as an
+	// opaque<V> produces thirteen octets rather than twelve.
+	want := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0xde, 0xad, 0xbe, 0xef}
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encoded %x, want %x", encoded, want)
+	}
+	var decoded SenderData
+	if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded != senderData {
+		t.Fatalf("decoded %+v, want %+v", decoded, senderData)
+	}
+}
+
+// TestCiphertextSampleIsBoundedByHashSize is the plan's regression test against the key-schedule
+// plan's SenderDataKeyNonce, kept because this is the caller that ships broken if that derivation
+// drifts.
+//
+// What it is worth on its own is less than its name claims, and that is recorded here rather than
+// left for the next reader to rediscover. Its ciphertext is a run of one repeated octet, so a
+// sample taken from the WRONG OFFSET reads the same bytes as one taken from the front and this
+// test cannot see it; and its truncated arm is a ciphertext of exactly KDF.Nh bytes, which a rule
+// that cut at Nh-1 would also cut, so a sample one octet SHORT is invisible to it too. Both were
+// measured against the mutants. What it does catch is a sample longer than Nh.
+// TestTheSenderDataSampleLocatesBothItsOffsetAndItsLength is the version that puts the boundary
+// where the name says it is.
+func TestCiphertextSampleIsBoundedByHashSize(t *testing.T) {
+	crypto := newTestCrypto(t)
+	secret := bytes.Repeat([]byte{0x11}, crypto.HashSize())
+
+	long := bytes.Repeat([]byte{0xab}, crypto.HashSize()+40)
+	keyLong, nonceLong, err := SenderDataKeyNonce(crypto, secret, long)
+	if err != nil {
+		t.Fatalf("long ciphertext: %v", err)
+	}
+	keyTrunc, nonceTrunc, err := SenderDataKeyNonce(crypto, secret, long[:crypto.HashSize()])
+	if err != nil {
+		t.Fatalf("truncated ciphertext: %v", err)
+	}
+	if !bytes.Equal(keyLong, keyTrunc) || !bytes.Equal(nonceLong, nonceTrunc) {
+		t.Fatal("sample is not truncated to KDF.Nh")
+	}
+
+	// a ciphertext shorter than KDF.Nh must not panic and must use the whole thing
+	short := []byte{0x01, 0x02, 0x03}
+	keyShort, nonceShort, err := SenderDataKeyNonce(crypto, secret, short)
+	if err != nil {
+		t.Fatalf("short ciphertext: %v", err)
+	}
+	if len(keyShort) != crypto.KeySize() || len(nonceShort) != crypto.NonceSize() {
+		t.Fatalf("short sample produced key %d nonce %d", len(keyShort), len(nonceShort))
+	}
+	keyWhole := crypto.ExpandWithLabel(secret, "key", short, crypto.KeySize())
+	if !bytes.Equal(keyShort, keyWhole) {
+		t.Fatal("short ciphertext sample was padded or truncated")
+	}
+}
+
+// TestTheSenderDataSampleLocatesBothItsOffsetAndItsLength puts section 6.3.2's sample boundary
+// where the sample rule says it is, in both directions, one octet at a time.
+//
+// The sweep is over a ciphertext of DISTINCT octets, which is the whole reason this test exists
+// beside the one above it. A ciphertext that is a run of one value cannot separate
+// ciphertext[0..Nh-1] from ciphertext[1..Nh] -- both samples read the same bytes -- so a sample
+// taken from the wrong offset derives the right key from the wrong place and every whole-answer
+// comparison over a repeated octet agrees with it.
+//
+// Every octet below KDF.Nh has to change the answer and every octet at or above it has to leave it
+// alone, which locates the offset AND the length rather than inferring them from one comparison.
+// Three lengths, because a rule whose bound is wrong only past 2*Nh behaves correctly at a long
+// ciphertext: Nh+1 is the shortest input the cut applies to at all and is where that family is
+// visible.
+//
+// Why the caller cares, rather than leaving this to the derivation's own plan: a sample of the
+// wrong length or from the wrong offset is not a failure. It is real ciphertext, so it derives a
+// well formed key of exactly the right width that opens nothing -- and against a peer that made
+// the same mistake it interoperates perfectly, which is how it survives a round trip test.
+func TestTheSenderDataSampleLocatesBothItsOffsetAndItsLength(t *testing.T) {
+	crypto := newTestCrypto(t)
+	nh := crypto.HashSize()
+	secret := bytes.Repeat([]byte{0x5c}, nh)
+	swept := 0
+	for _, length := range []int{nh + 1, nh + nh/2, 3 * nh} {
+		if length <= nh {
+			t.Fatalf("a ciphertext of %d octets is not past KDF.Nh (%d), so this row observes no boundary",
+				length, nh)
+		}
+		ciphertext := make([]byte, length)
+		for i := range ciphertext {
+			ciphertext[i] = byte(i%251) + 1
+		}
+		baseKey, baseNonce, err := SenderDataKeyNonce(crypto, secret, ciphertext)
+		if err != nil {
+			t.Fatalf("SenderDataKeyNonce over %d octets: %v", length, err)
+		}
+		inside, outside := 0, 0
+		for i := range ciphertext {
+			altered := bytes.Clone(ciphertext)
+			altered[i] ^= 0xff
+			key, nonce, err := SenderDataKeyNonce(crypto, secret, altered)
+			if err != nil {
+				t.Fatalf("SenderDataKeyNonce with octet %d of %d flipped: %v", i, length, err)
+			}
+			changed := !bytes.Equal(key, baseKey) || !bytes.Equal(nonce, baseNonce)
+			if i < nh {
+				if !changed {
+					t.Errorf("ciphertext of %d octets: flipping octet %d changed nothing, and the sample is ciphertext[0..%d]; the sample is shorter than KDF.Nh or starts past the front",
+						length, i, nh-1)
+				}
+				inside++
+				continue
+			}
+			if changed {
+				t.Errorf("ciphertext of %d octets: flipping octet %d changed the answer, and the sample ends at %d; the sample is longer than KDF.Nh or the cut does not fire at this length",
+					length, i, nh-1)
+			}
+			outside++
+		}
+		if inside != nh || outside != length-nh {
+			t.Fatalf("ciphertext of %d octets: the sweep read %d octets inside the sample and %d outside, want %d and %d",
+				length, inside, outside, nh, length-nh)
+		}
+		swept += length
+	}
+
+	// the other end of the rule: a ciphertext shorter than KDF.Nh is used WHOLE and never
+	// padded. Padding is the plausible mistake and it is a real one -- two short ciphertexts
+	// differing only in length would sample identically, which is one keystream over two
+	// messages, the reuse the sample exists to prevent reintroduced at the short end.
+	short := bytes.Repeat([]byte{0x2a}, nh/2)
+	shortKey, _, err := SenderDataKeyNonce(crypto, secret, short)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over a short ciphertext: %v", err)
+	}
+	padded := make([]byte, nh)
+	copy(padded, short)
+	paddedKey, _, err := SenderDataKeyNonce(crypto, secret, padded)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over the padded ciphertext: %v", err)
+	}
+	if bytes.Equal(shortKey, paddedKey) {
+		t.Error("a short ciphertext derives the same key as itself zero padded to KDF.Nh, so it is being padded rather than used whole")
+	}
+	shorterKey, _, err := SenderDataKeyNonce(crypto, secret, short[:len(short)-1])
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over a shorter ciphertext: %v", err)
+	}
+	if bytes.Equal(shortKey, shorterKey) {
+		t.Error("two short ciphertexts of different lengths derive one key, which is one keystream over two messages")
+	}
+	if swept == 0 {
+		t.Fatal("no ciphertext length was swept, so this gate located no boundary")
+	}
+}
+
+// TestTheSenderDataKeyAndNonceAreTheWidthsTheProviderAnswers is the differential this registry
+// cannot supply on its own.
+//
+// Both registered suites fix AEAD.Nn at 12, and the suite every other test in this file runs at
+// fixes AEAD.Nk at 32 -- which is also KDF.Nh, and also the literal a body would have written
+// down. So inside this registry a hardcoded 32 and a read of KeySize() are the same number and
+// nothing above can separate them: measured, KeySize() replaced by 32 and NonceSize() by 12 in
+// SenderDataKeyNonce leaves every other test of the section 6.3.2 path passing.
+//
+// The synthetic suite is the input that separates them, and the row list below is what stops the
+// separation going quiet: a width here that coincided with Nk or Nn would be satisfied by the very
+// literal this test exists to catch.
+func TestTheSenderDataKeyAndNonceAreTheWidthsTheProviderAnswers(t *testing.T) {
+	crypto := &suiteCryptoProvider{params: &ksWelcomeSyntheticParams, random: constantReader{value: 0x40}}
+	for _, other := range []struct {
+		name  string
+		value int
+	}{
+		{name: "this suite's KDF.Nh", value: ksWelcomeSyntheticParams.Nh},
+		{name: "the aes suite's Nk", value: 16},
+		{name: "the chacha suite's Nk", value: 32},
+		{name: "the registry's Nn", value: 12},
+		{name: "the registry's KDF.Nh", value: newTestCrypto(t).HashSize()},
+	} {
+		if other.value == ksWelcomeSyntheticParams.Nk || other.value == ksWelcomeSyntheticParams.Nn {
+			t.Fatalf("this suite's Nk is %d and its Nn is %d, and %s is %d; a width that coincides with either leaves the substitution it exists to catch satisfying this test",
+				ksWelcomeSyntheticParams.Nk, ksWelcomeSyntheticParams.Nn, other.name, other.value)
+		}
+	}
+	secret := bytes.Repeat([]byte{0x61}, ksWelcomeSyntheticParams.Nh)
+	ciphertext := bytes.Repeat([]byte{0x62}, 4*ksWelcomeSyntheticParams.Nh)
+	key, nonce, err := SenderDataKeyNonce(crypto, secret, ciphertext)
+	if err != nil {
+		t.Fatalf("SenderDataKeyNonce over a suite whose KDF.Nh is %d: %v", ksWelcomeSyntheticParams.Nh, err)
+	}
+	if len(key) != crypto.KeySize() {
+		t.Errorf("the sender data key is %d octets and this suite's AEAD.Nk is %d, so the width is written down rather than read off the provider",
+			len(key), crypto.KeySize())
+	}
+	if len(nonce) != crypto.NonceSize() {
+		t.Errorf("the sender data nonce is %d octets and this suite's AEAD.Nn is %d, so the width is written down rather than read off the provider",
+			len(nonce), crypto.NonceSize())
+	}
+	// and the values, not merely the lengths: a body that answered the right widths out of the
+	// wrong expansion would satisfy everything above.
+	sample := ciphertext[:crypto.HashSize()]
+	if want := crypto.ExpandWithLabel(secret, "key", sample, crypto.KeySize()); !bytes.Equal(key, want) {
+		t.Errorf("the sender data key is %x, want %x", key, want)
+	}
+	if want := crypto.ExpandWithLabel(secret, "nonce", sample, crypto.NonceSize()); !bytes.Equal(nonce, want) {
+		t.Errorf("the sender data nonce is %x, want %x", nonce, want)
+	}
+}
+
+// senderDataTestHeader is the cleartext PrivateMessage header the seal and open rows below run
+// against. It carries authenticated_data, which the sender data AAD must NOT cover -- a header
+// with that field empty cannot tell section 6.3.2's AAD from section 6.3.1's.
+func senderDataTestHeader() *PrivateMessage {
+	return &PrivateMessage{
+		GroupId:             []byte{0x01, 0x02},
+		Epoch:               9,
+		ContentType:         ContentTypeApplication,
+		AuthenticatedData:   []byte{0x71, 0x72, 0x73},
+		EncryptedSenderData: []byte{0x81},
+		Ciphertext:          []byte{0x91, 0x92},
+	}
+}
+
+func TestSenderDataSealOpen(t *testing.T) {
+	crypto := newTestCrypto(t)
+	secret := bytes.Repeat([]byte{0x11}, crypto.HashSize())
+	ciphertext := bytes.Repeat([]byte{0xab}, 64)
+	header := &PrivateMessage{
+		GroupId:     []byte{0x01, 0x02},
+		Epoch:       9,
+		ContentType: ContentTypeApplication,
+	}
+	senderData := SenderData{LeafIndex: 1, Generation: 7, ReuseGuard: [4]byte{1, 2, 3, 4}}
+
+	sealed, err := sealSenderData(crypto, secret, &senderData, header, ciphertext)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	opened, err := openSenderData(crypto, secret, sealed, header, ciphertext)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if *opened != senderData {
+		t.Fatalf("opened %+v, want %+v", *opened, senderData)
+	}
+
+	// the epoch is in the AAD, so a rewritten header fails to open
+	rewritten := *header
+	rewritten.Epoch = 10
+	if _, err := openSenderData(crypto, secret, sealed, &rewritten, ciphertext); !errors.Is(err, errDecryptFailed) {
+		t.Fatalf("rewritten epoch: got %v, want errDecryptFailed", err)
+	}
+
+	// the ciphertext keys the sender data, so a rewritten ciphertext fails too
+	other := bytes.Repeat([]byte{0xcd}, 64)
+	if _, err := openSenderData(crypto, secret, sealed, header, other); !errors.Is(err, errDecryptFailed) {
+		t.Fatalf("rewritten ciphertext: got %v, want errDecryptFailed", err)
+	}
+}
+
+// senderDataAADParameterNames is the names of senderDataAAD's parameters, read off the source.
+//
+// This is what makes the sweep below a DERIVATION rather than a list. Which fields of the header
+// the sender data is bound to is decided by that function's parameter list and by nothing else --
+// it cannot reach a field it was not passed -- so the class of covered fields is read from there,
+// and a later task that widens or narrows it moves this test with it rather than leaving a list
+// behind that says what somebody once believed.
+func senderDataAADParameterNames(t *testing.T) []string {
+	t.Helper()
+	names := []string{}
+	found := false
+	for file, parsed := range framingParsedProductionFiles(t) {
+		for _, declaration := range parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil || function.Name.Name != "senderDataAAD" {
+				continue
+			}
+			if found {
+				t.Fatalf("two production files declare senderDataAAD, the second being %s", file)
+			}
+			found = true
+			for _, field := range function.Type.Params.List {
+				for _, name := range field.Names {
+					names = append(names, name.Name)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no production file of this package declares senderDataAAD, so the covered field class cannot be derived")
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestTheSenderDataAadCoversExactlyTheHeaderFieldsItsParameterListNames sweeps EVERY field of the
+// cleartext header and holds what the seal is bound to against what senderDataAAD can see.
+//
+// The plan's own seal test moves one field -- the epoch -- and states that one is covered. That is
+// not the property. A seal built over section 6.3.1's AAD instead of section 6.3.2's is bound to
+// authenticated_data as well, agrees with its own open at every input, and passes every round trip
+// and every rewritten-epoch check in this file; a seal that dropped group_id from the preimage is
+// invisible the same way. What separates them is the whole header, swept, against a class read off
+// the source.
+//
+// The alteration is per TYPE rather than per field, and an unhandled type is a FAILURE rather than
+// a skip, so a field added to PrivateMessage by a later task arrives here as a red test instead of
+// silently leaving the sweep.
+func TestTheSenderDataAadCoversExactlyTheHeaderFieldsItsParameterListNames(t *testing.T) {
+	crypto := newTestCrypto(t)
+	secret := bytes.Repeat([]byte{0x11}, crypto.HashSize())
+	ciphertext := bytes.Repeat([]byte{0xab}, 64)
+	senderData := SenderData{LeafIndex: 3, Generation: 11, ReuseGuard: [4]byte{9, 8, 7, 6}}
+
+	header := senderDataTestHeader()
+	sealed, err := sealSenderData(crypto, secret, &senderData, header, ciphertext)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	covered := senderDataAADParameterNames(t)
+	if len(covered) == 0 {
+		t.Fatal("senderDataAAD takes no parameters, so this sweep has no class to hold the header against")
+	}
+	observed := []string{}
+	fields := reflect.TypeOf(PrivateMessage{})
+	for i := 0; i < fields.NumField(); i++ {
+		name := fields.Field(i).Name
+		altered := *header
+		target := reflect.ValueOf(&altered).Elem().Field(i)
+		switch value := target.Interface().(type) {
+		case []byte:
+			target.Set(reflect.ValueOf(append(bytes.Clone(value), 0x5a)))
+		case uint64:
+			target.Set(reflect.ValueOf(value + 1))
+		case ContentType:
+			// a REGISTERED neighbour, because senderDataAAD refuses an unregistered content
+			// type before it writes an octet -- an unregistered one would be answered by that
+			// guard rather than by the AEAD, and this row would be observing the wrong refusal.
+			if value == ContentTypeApplication {
+				target.Set(reflect.ValueOf(ContentTypeProposal))
+			} else {
+				target.Set(reflect.ValueOf(ContentTypeApplication))
+			}
+		default:
+			t.Fatalf("PrivateMessage.%s is a %s and this sweep alters no value of that type; a header field nothing alters is a field this gate says nothing about",
+				name, target.Type())
+		}
+		if reflect.DeepEqual(altered, *header) {
+			t.Fatalf("PrivateMessage.%s was not moved by the alteration, so its row states nothing", name)
+		}
+		_, err := openSenderData(crypto, secret, sealed, &altered, ciphertext)
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, errDecryptFailed):
+			observed = append(observed, name)
+		default:
+			t.Fatalf("PrivateMessage.%s rewritten answered %v, which is neither an open nor ValSem006", name, err)
+		}
+	}
+	slices.Sort(observed)
+
+	want := []string{}
+	for i := 0; i < fields.NumField(); i++ {
+		name := fields.Field(i).Name
+		if slices.Contains(covered, strings.ToLower(name[:1])+name[1:]) {
+			want = append(want, name)
+		}
+	}
+	slices.Sort(want)
+	if len(want) == 0 {
+		t.Fatalf("no field of PrivateMessage matched a parameter of senderDataAAD (%v), so the class reader is reading the wrong thing", covered)
+	}
+	if !slices.Equal(observed, want) {
+		t.Errorf("rewriting %v broke the sender data open and senderDataAAD's parameters name %v; a field covered but not named is an AAD wider than section 6.3.2's, and one named but not covered is a header field the seal does not bind",
+			observed, want)
+	}
+}
+
+// TestTheSenderDataSealIsTheSectionSixThreeTwoConstructionAndNotOnlyItsOwnInverse recomputes the
+// whole of section 6.3.2 beside the seal and compares.
+//
+// A seal and an open that are each other's inverse agree at every input whatever they do in
+// between: the wrong label, the wrong secret, the sample taken from the wrong place, the AAD
+// assembled in the wrong order -- every one of those round trips perfectly and interoperates with
+// nobody. So this reads the sealed octets with the pieces the RFC names, assembled here rather
+// than borrowed from the code under test, and the answer has to be the sender data's own encoding.
+func TestTheSenderDataSealIsTheSectionSixThreeTwoConstructionAndNotOnlyItsOwnInverse(t *testing.T) {
+	crypto := newTestCrypto(t)
+	secret := bytes.Repeat([]byte{0x11}, crypto.HashSize())
+	ciphertext := bytes.Repeat([]byte{0xab}, 64)
+	header := senderDataTestHeader()
+	senderData := SenderData{LeafIndex: 5, Generation: 2, ReuseGuard: [4]byte{0xa1, 0xa2, 0xa3, 0xa4}}
+
+	sealed, err := sealSenderData(crypto, secret, &senderData, header, ciphertext)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	sample := ciphertext[:crypto.HashSize()]
+	key := crypto.ExpandWithLabel(secret, "key", sample, crypto.KeySize())
+	nonce := crypto.ExpandWithLabel(secret, "nonce", sample, crypto.NonceSize())
+	aad, err := senderDataAAD(header.GroupId, header.Epoch, header.ContentType)
+	if err != nil {
+		t.Fatalf("the section 6.3.2 aad: %v", err)
+	}
+	plaintext, err := crypto.AeadOpen(key, nonce, aad, sealed)
+	if err != nil {
+		t.Fatalf("the sealed sender data does not open under section 6.3.2's own key, nonce and aad: %v", err)
+	}
+	encoded, err := syntax.Marshal(&senderData)
+	if err != nil {
+		t.Fatalf("marshal the sender data: %v", err)
+	}
+	if !bytes.Equal(plaintext, encoded) {
+		t.Errorf("the sealed plaintext is %x and the sender data encodes to %x", plaintext, encoded)
+	}
+
+	// and the AAD is section 6.3.2's and NOT section 6.3.1's, which is the confusion the two
+	// AADs sitting next to each other invites. The content AAD is this one plus
+	// authenticated_data, so a seal built over it is its own inverse and differs from this
+	// only in bytes no round trip reads.
+	contentAAD, err := privateContentAAD(header.GroupId, header.Epoch, header.ContentType,
+		header.AuthenticatedData)
+	if err != nil {
+		t.Fatalf("the section 6.3.1 aad: %v", err)
+	}
+	if bytes.Equal(aad, contentAAD) {
+		t.Fatal("the two section 6.3 aads are equal at this header, so this row cannot separate them")
+	}
+	if _, err := crypto.AeadOpen(key, nonce, contentAAD, sealed); err == nil {
+		t.Error("the sender data opens under section 6.3.1's aad, so it was sealed under the content's associated data rather than the header's")
+	}
+}
+
+// TestOpenSenderDataRefusesAPlaintextThatIsNotExactlyASenderData is the full consumption half.
+//
+// syntax.Unmarshal joins the decoder's answer with Done, so twelve good octets followed by a tail
+// is refused. An open that reached for a bare Reader and never asked Done would accept an
+// unbounded family of encodings of one header -- every one of them decrypting, decoding and
+// attributing identically -- and nothing that round trips could see it, because this package would
+// only ever produce the twelve octet form itself.
+//
+// The plaintexts are sealed with the provider directly rather than through sealSenderData, because
+// sealSenderData cannot produce them: it marshals a SenderData, which is exactly twelve octets.
+// That is the point -- the input this rule exists for is one a conforming sender never sends.
+func TestOpenSenderDataRefusesAPlaintextThatIsNotExactlyASenderData(t *testing.T) {
+	crypto := newTestCrypto(t)
+	secret := bytes.Repeat([]byte{0x11}, crypto.HashSize())
+	ciphertext := bytes.Repeat([]byte{0xab}, 64)
+	header := senderDataTestHeader()
+	senderData := SenderData{LeafIndex: 1, Generation: 7, ReuseGuard: [4]byte{1, 2, 3, 4}}
+	encoded, err := syntax.Marshal(&senderData)
+	if err != nil {
+		t.Fatalf("marshal the sender data: %v", err)
+	}
+
+	sample := ciphertext[:crypto.HashSize()]
+	key := crypto.ExpandWithLabel(secret, "key", sample, crypto.KeySize())
+	nonce := crypto.ExpandWithLabel(secret, "nonce", sample, crypto.NonceSize())
+	aad, err := senderDataAAD(header.GroupId, header.Epoch, header.ContentType)
+	if err != nil {
+		t.Fatalf("the section 6.3.2 aad: %v", err)
+	}
+	sealAs := func(plaintext []byte) []byte {
+		t.Helper()
+		blob, sealErr := crypto.AeadSeal(key, nonce, aad, plaintext)
+		if sealErr != nil {
+			t.Fatalf("seal %x: %v", plaintext, sealErr)
+		}
+		return blob
+	}
+
+	// the control: the exact encoding opens, so every refusal below is about the plaintext's
+	// length and not about a key, a nonce or an aad this row got wrong.
+	opened, err := openSenderData(crypto, secret, sealAs(encoded), header, ciphertext)
+	if err != nil {
+		t.Fatalf("the exact twelve octet encoding was refused: %v", err)
+	}
+	if *opened != senderData {
+		t.Fatalf("opened %+v, want %+v", *opened, senderData)
+	}
+
+	for _, row := range []struct {
+		what      string
+		plaintext []byte
+		sentinel  error
+	}{
+		{what: "one trailing octet", plaintext: append(bytes.Clone(encoded), 0x00), sentinel: syntax.ErrTrailingBytes},
+		{what: "a whole second sender data appended", plaintext: append(bytes.Clone(encoded), encoded...), sentinel: syntax.ErrTrailingBytes},
+		{what: "one octet short", plaintext: encoded[:len(encoded)-1], sentinel: syntax.ErrTruncated},
+		{what: "empty", plaintext: nil, sentinel: syntax.ErrTruncated},
+	} {
+		got, err := openSenderData(crypto, secret, sealAs(row.plaintext), header, ciphertext)
+		if !errors.Is(err, row.sentinel) {
+			t.Errorf("a sender data plaintext with %s answered %v, want %v; a header this package accepts in two encodings is one a peer can rewrite without breaking",
+				row.what, err, row.sentinel)
+		}
+		if got != nil {
+			t.Errorf("a sender data plaintext with %s was refused and still answered %+v", row.what, *got)
+		}
 	}
 }

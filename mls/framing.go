@@ -766,3 +766,89 @@ func (self *PrivateMessage) UnmarshalMLS(r *syntax.Reader) error {
 }
 
 var _ syntax.Codec = (*PrivateMessage)(nil)
+
+// ---------------------------------------------------------------------------
+// SenderData, RFC 9420 section 6.3.2
+// ---------------------------------------------------------------------------
+
+// SenderData is who sent a PrivateMessage and at which ratchet generation, RFC 9420 section
+// 6.3.2:
+//
+//	struct {
+//	    uint32 leaf_index;
+//	    uint32 generation;
+//	    opaque reuse_guard[4];
+//	} SenderData;
+//
+// It travels ENCRYPTED, under a key derived from the content ciphertext, and that is the whole
+// reason it is a structure of its own rather than three more fields of PrivateMessage's cleartext
+// header. The header a message server reads has to name the group and the epoch so the server can
+// order, route and prune; it must not name the member who sent the message, or the transport
+// learns the group's traffic graph while holding no key at all.
+//
+// The reuse guard is FOUR OCTETS AND FIXED WIDTH, and it is the field a codec is likeliest to get
+// subtly wrong: it is opaque[4] and not opaque<V>, so it carries no length prefix, and an encoder
+// that reached for WriteOpaque writes a sender data this implementation agrees with itself about
+// perfectly -- both halves would add the prefix -- and no other implementation reads. Nothing that
+// round trips can see that, which is why the codec below spells the raw write out and says why.
+//
+// What the guard is FOR is not this codec's job and is what decides the field's shape: section
+// 6.3.2 xors it into the ratchet nonce before the content is sealed, so two senders that reach one
+// generation of one ratchet -- which a forked group state makes possible -- do not seal two
+// messages under a single nonce. It is CARRIED rather than derived because the receiver has no way
+// to recompute a value the sender drew at random.
+type SenderData struct {
+	LeafIndex  LeafIndex
+	Generation uint32
+	ReuseGuard [senderDataReuseGuardSize]byte
+}
+
+// MarshalMLS writes the three fields in section 6.3.2's order.
+//
+// There is no code point refusal here and that is the structure rather than an omission every
+// other encoder of this file makes: all three fields are fixed width, so there is no discriminant
+// that could be unregistered and no vector whose length could fail to encode. What can still fail
+// is the Writer, and syntax.Marshal is what answers that to the caller.
+func (self *SenderData) MarshalMLS(w *syntax.Writer) error {
+	w.WriteUint32(uint32(self.LeafIndex))
+	w.WriteUint32(self.Generation)
+	// WriteRaw and NOT WriteOpaque, which is privateContentAAD's rule for the same reason:
+	// reuse_guard is a fixed width array and not a nested vector, so a length prefix in front
+	// of it is an encoding this package would also read back and no peer computes.
+	w.WriteRaw(self.ReuseGuard[:])
+	return nil
+}
+
+// UnmarshalMLS reads the three fields and publishes the receiver ONCE, after the last of them has
+// succeeded.
+//
+// The staging is PrivateMessage.UnmarshalMLS's and it has a sharper edge here than it does there.
+// What a decoder that assigned as it read would leave in a caller's receiver is an ATTRIBUTION: a
+// leaf index and a generation are what a receiver picks a signature key and a message key by, so a
+// receiver stamped out of input this package refused names a member who sent nothing, at a
+// generation nobody reached, and it decodes and re-encodes as though a peer had sent it.
+func (self *SenderData) UnmarshalMLS(r *syntax.Reader) error {
+	leafIndex, err := r.ReadUint32()
+	if err != nil {
+		return err
+	}
+	generation, err := r.ReadUint32()
+	if err != nil {
+		return err
+	}
+	reuseGuard, err := r.ReadRaw(senderDataReuseGuardSize)
+	if err != nil {
+		return err
+	}
+	decoded := SenderData{LeafIndex: LeafIndex(leafIndex), Generation: generation}
+	copy(decoded.ReuseGuard[:], reuseGuard)
+	*self = decoded
+	return nil
+}
+
+// senderDataReuseGuardSize is the width of section 6.3.2's reuse_guard, written once so the read
+// and the array declaration cannot disagree: a ReadRaw of some other length against a [4]byte
+// compiles, copies whatever the two have in common and silently drops or zero fills the rest.
+const senderDataReuseGuardSize = 4
+
+var _ syntax.Codec = (*SenderData)(nil)

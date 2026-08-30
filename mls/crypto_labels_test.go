@@ -614,6 +614,15 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// reproduce -- which is a decryption that fails for a reason nobody can attribute.
 		"framing_preimage.go: syntax.NewWriter()",
 		"framing_preimage.go: syntax.NewWriter()",
+		// section 6.3.2's sender data, entered as syntax.Marshal and syntax.Unmarshal over the
+		// structure the RFC writes rather than as a Reader and a Writer opened by hand. The
+		// default limit and not the ratchet tree one, and for this pair the bound is not even
+		// reachable: a SenderData is two uint32s and a four octet array, twelve octets at every
+		// input, with no vector in it for any limit to cap. What the DECODE side is here for is
+		// the other half of syntax.Unmarshal -- it joins the decoder's answer with Done, so a
+		// plaintext of twelve good octets and a tail is refused rather than attributed.
+		"framing_protect.go: syntax.Marshal(senderData)",
+		"framing_protect.go: syntax.Unmarshal(plaintext, senderData)",
 		// the joiner derivation's group context preimage. The default limit and not the
 		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
 		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
@@ -1430,6 +1439,24 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// rather than about the tag standing in front of it; and
 	// TestOpenPublicMessageRefusesEveryKeyButTheSendersOwn sweeps the resolver's answer.
 	"OpenPublicMessage": "answers a verdict and a view over its own argument, and reaches only MacVerify and VerifyWithLabel, both of which the tagging provider passes through",
+
+	// section 6.3.2's open. Its two provider methods are ExpandWithLabel and AeadOpen, and both
+	// DO have bytes to flip -- which is precisely why no row can be written for it. Under a
+	// wrapper that flips every answer the derived key is not the key the header was sealed
+	// under, so the aead refuses and the row has an error rather than two answers to compare;
+	// sealing over the same wrapper does not help, because the flipped ciphertext then fails
+	// its own tag. A row here would report "did not route through its provider" for every
+	// possible implementation, the correct one included.
+	//
+	// It is not unheld, and what holds it is stronger than this gate: it is the only
+	// construction in this package whose inverse is written next to it, so
+	// TestTheSenderDataSealIsTheSectionSixThreeTwoConstructionAndNotOnlyItsOwnInverse rebuilds
+	// section 6.3.2's key, nonce and aad beside the seal and opens the sealed octets with them,
+	// which nothing reaching for a provider of its own could satisfy;
+	// TestProviderHasNoRemainingStubs moves its secret, its sealed header, its header and its
+	// ciphertext and requires each to change the verdict; and the KDF.Nh gate runs it over a
+	// provider whose hash is 48 and requires it to work there.
+	"openSenderData": "answers a structure it decrypted rather than bytes of its own, and both provider methods it reaches -- ExpandWithLabel and AeadOpen -- fail rather than answer under a wrapper that flips every answer",
 }
 
 // A construction handed a provider computes with that provider and not with one of its
@@ -1773,6 +1800,23 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("SealPublicMessage: %v", sealErr)
 			}
 			return message.MembershipTag
+		}},
+		// section 6.3.2's seal, whose whole answer is bytes it produced: the sealed sender data.
+		// Both provider methods it reaches have bytes to flip -- ExpandWithLabel answers the key
+		// and the nonce, AeadSeal answers the ciphertext -- so a seal that reached for a provider
+		// of its own is separated here twice over. Its open half cannot be a row at all and
+		// labelConstructionsOverAnyProvider says why.
+		{name: "sealSenderData", call: func(crypto CryptoProvider) []byte {
+			sealed, sealErr := sealSenderData(crypto,
+				bytes.Repeat([]byte{0x6d}, crypto.HashSize()),
+				&SenderData{LeafIndex: 2, Generation: 5, ReuseGuard: [4]byte{0x21, 0x22, 0x23, 0x24}},
+				&PrivateMessage{GroupId: []byte{0x11, 0x12}, Epoch: 4,
+					ContentType: ContentTypeApplication, AuthenticatedData: []byte{0x13}},
+				bytes.Repeat([]byte{0x6e}, crypto.HashSize()))
+			if sealErr != nil {
+				t.Fatalf("sealSenderData: %v", sealErr)
+			}
+			return sealed
 		}},
 	} {
 		covered = append(covered, testCase.name)

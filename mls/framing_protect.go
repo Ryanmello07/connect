@@ -19,6 +19,8 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // The label RFC 9420 section 6.1 signs a FramedContentTBS under, written once because a label
@@ -570,4 +572,145 @@ func OpenPublicMessage(crypto CryptoProvider, membershipKey []byte, message *Pub
 		return nil, err
 	}
 	return authContent, nil
+}
+
+// ---------------------------------------------------------------------------
+// the sender data, RFC 9420 section 6.3.2
+// ---------------------------------------------------------------------------
+
+// errDecryptFailed is ValSem006 in the validation plan's catalogue, and it is a stand in on
+// errApplicationMustBeCiphertext's terms exactly: that plan owns the single declaration site for
+// the exported ErrDecryptFailed, the name has not landed in this package yet, and
+// TestNoValidationOwnedNameHasLandedBesideItsStandIn fails on the commit that lands the exported
+// twin beside this one. When it lands, every return of it below becomes ValSem(ValSem006,
+// ErrDecryptFailed).
+//
+// It is ONE value for the whole of "this message does not decrypt", and that is the rule rather
+// than a shortcut. p2's ErrAeadOpen never escapes this layer: a caller that could tell a wrong
+// key from a wrong nonce from a tampered ciphertext from an associated data it disagreed about
+// learns which of its guesses was closest, which is a decryption oracle offered to whoever can
+// reach the transport -- and a receiver has no branch to take on any of the four other than
+// dropping the message. The sender data half and the content half of section 6.3 answer the same
+// value for the same reason: which of the two AEAD opens failed is itself a fact about the key
+// schedule that an unauthenticated peer must not be able to read off a refusal.
+var errDecryptFailed = errors.New("mls: message does not decrypt")
+
+// errNilSenderData is what a seal answers a caller that passed no sender data, for
+// errNilAuthenticatedContent's reason: a nil dereference out of a library takes the caller's
+// process rather than its call, and says nothing about which argument was wrong.
+var errNilSenderData = errors.New("mls: seal requires sender data")
+
+// errNilPrivateMessage is what section 6.3's operations answer a caller that passed no header.
+//
+// The header is not decoration to these two: its group_id, epoch and content_type ARE the
+// associated data, so a nil one is not a missing option but a missing third of the input, and
+// there is no default header that could stand in for it without producing an AEAD nobody else can
+// open.
+var errNilPrivateMessage = errors.New("mls: the section 6.3 operations require the message header")
+
+// sealSenderData encrypts a SenderData under RFC 9420 section 6.3.2, keyed off the content
+// ciphertext it will travel beside.
+//
+// The KEY IS DERIVED FROM THE CIPHERTEXT, which is the one thing about this operation worth
+// understanding before reading it. sender_data_secret does not ratchet: every member holds the
+// same one for the whole epoch, so sealing every header under it directly would be one key and
+// one nonce over every message anybody sends in that epoch, which is a reused keystream. Section
+// 6.3.2 fixes that by sampling the content ciphertext into the expansion, so each message's
+// header is sealed under its own key -- and it is why this function takes the ciphertext at all
+// when it is not the thing being encrypted.
+//
+// The derivation itself is NOT here. It is SenderDataKeyNonce, in secret_tree.go, which is the
+// copy mlswg's secret-tree.json covers; the private one that used to sit in this file was the
+// untested duplicate of a construction whose two failure modes -- a sample of the wrong length,
+// and a short ciphertext padded rather than used whole -- both produce a perfectly well formed key
+// that simply interoperates with nobody. Two copies of that is two chances to get it wrong and one
+// vector set. framing_protect_test.go holds the sample rule from this side anyway, because this is
+// the caller that ships broken if that derivation ever drifts.
+//
+// The AAD is senderDataAAD's and covers group_id, epoch and content_type and NOT
+// authenticated_data, which is section 6.3.2's structure and is load bearing in an
+// order-of-operations way: the sender data is opened FIRST, because it is what names the leaf
+// whose ratchet holds the content key, so an AAD here that reached into the content step would
+// leave a receiver with no order in which it could do the two.
+//
+// The provider is checked before anything else is read, which is SignAuthenticatedContent's
+// discipline: a body that marshalled its sender data first would answer a codec error to a caller
+// whose actual mistake was passing no provider.
+func sealSenderData(crypto CryptoProvider, senderDataSecret []byte, senderData *SenderData,
+	header *PrivateMessage, ciphertext []byte) ([]byte, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the sender data key and nonce are two expansions through it", ErrNilCryptoProvider)
+	}
+	if senderData == nil {
+		return nil, errNilSenderData
+	}
+	if header == nil {
+		return nil, errNilPrivateMessage
+	}
+	plaintext, err := syntax.Marshal(senderData)
+	if err != nil {
+		return nil, err
+	}
+	aad, err := senderDataAAD(header.GroupId, header.Epoch, header.ContentType)
+	if err != nil {
+		return nil, err
+	}
+	key, nonce, err := SenderDataKeyNonce(crypto, senderDataSecret, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	return crypto.AeadSeal(key, nonce, aad, plaintext)
+}
+
+// openSenderData is the receive half, and it is ValSem006.
+//
+// It is handed the CIPHERTEXT as well as the encrypted header because the ciphertext is what keys
+// this open, per sealSenderData's note. That makes the content ciphertext authenticated by this
+// step as well as by its own: a peer that rewrote a single octet of it derives a different sender
+// data key here, so the header stops opening -- which is why the two byte slice arguments are not
+// interchangeable, and why a caller that passed the wrong one sees a decryption failure rather
+// than a length error.
+//
+// Every failure of the AEAD collapses into errDecryptFailed, for the reason that sentinel's
+// comment gives. What does NOT collapse into it is a plaintext that opened and then failed to
+// decode: reaching that point required a valid AEAD tag, so it is a fact about a peer that holds
+// this epoch's secrets and sent a malformed structure, and not about an attacker probing. There is
+// no oracle in telling the two apart, and collapsing them would send an operator looking for a key
+// mismatch when what happened is a peer's codec.
+//
+// syntax.Unmarshal and not a bare UnmarshalMLS over a Reader, which is the difference between "the
+// sender data decoded" and "the plaintext WAS a sender data". Unmarshal joins the decoder's answer
+// with Done, so a plaintext carrying twelve good octets and a tail is refused. Without that check
+// this open accepts an unbounded family of encodings of one header, and a receiver that accepts
+// two encodings of one object while the protocol signs and macs over serialized forms is the shape
+// a malleability bug is built out of.
+func openSenderData(crypto CryptoProvider, senderDataSecret []byte, encryptedSenderData []byte,
+	header *PrivateMessage, ciphertext []byte) (*SenderData, error) {
+
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the sender data key and nonce are two expansions through it", ErrNilCryptoProvider)
+	}
+	if header == nil {
+		return nil, errNilPrivateMessage
+	}
+	aad, err := senderDataAAD(header.GroupId, header.Epoch, header.ContentType)
+	if err != nil {
+		return nil, err
+	}
+	key, nonce, err := SenderDataKeyNonce(crypto, senderDataSecret, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := crypto.AeadOpen(key, nonce, aad, encryptedSenderData)
+	if err != nil {
+		// p2's ErrAeadOpen never escapes: every open failure on this path is ValSem006, and
+		// distinguishing them would be a decryption oracle.
+		return nil, errDecryptFailed
+	}
+	senderData := &SenderData{}
+	if err := syntax.Unmarshal(plaintext, senderData); err != nil {
+		return nil, err
+	}
+	return senderData, nil
 }

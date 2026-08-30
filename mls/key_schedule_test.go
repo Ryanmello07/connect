@@ -4476,6 +4476,45 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return nil
 		}},
+		// section 6.3.2's seal and open. Neither answer is a KDF length -- the seal's is twelve
+		// octets of sender data plus the aead tag, and the open's is the four octet reuse guard --
+		// so the equivalence passes over both without an excuse, and what these rows state is the
+		// half that has bitten this construction before: the sender_data_secret is refused against
+		// KDF.Nh and the SAMPLE is KDF.Nh octets of the ciphertext, so a body carrying a written
+		// down 32 anywhere in either refuses its own secret, or samples past the ciphertext it was
+		// handed, the moment the kdf is 48 wide.
+		{name: "sealSenderData", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			sealed, sealErr := sealSenderData(crypto,
+				bytes.Repeat([]byte{0x6d}, crypto.HashSize()),
+				&SenderData{LeafIndex: 2, Generation: 5, ReuseGuard: [4]byte{0x21, 0x22, 0x23, 0x24}},
+				&PrivateMessage{GroupId: []byte{0x11, 0x12}, Epoch: 4,
+					ContentType: ContentTypeApplication, AuthenticatedData: []byte{0x13}},
+				bytes.Repeat([]byte{0x6e}, crypto.HashSize()))
+			if sealErr != nil {
+				t.Fatalf("sealSenderData over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			return [][]byte{sealed}
+		}},
+		{name: "openSenderData", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			secret := bytes.Repeat([]byte{0x6d}, crypto.HashSize())
+			ciphertext := bytes.Repeat([]byte{0x6e}, crypto.HashSize())
+			header := &PrivateMessage{GroupId: []byte{0x11, 0x12}, Epoch: 4,
+				ContentType: ContentTypeApplication, AuthenticatedData: []byte{0x13}}
+			senderData := &SenderData{LeafIndex: 2, Generation: 5,
+				ReuseGuard: [4]byte{0x21, 0x22, 0x23, 0x24}}
+			sealed, sealErr := sealSenderData(crypto, secret, senderData, header, ciphertext)
+			if sealErr != nil {
+				t.Fatalf("seal the sender data the open row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			opened, openErr := openSenderData(crypto, secret, sealed, header, ciphertext)
+			if openErr != nil {
+				t.Fatalf("openSenderData over a provider whose KDF.Nh is %d refused a header it had just sealed: %v",
+					crypto.HashSize(), openErr)
+			}
+			return [][]byte{opened.ReuseGuard[:]}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })

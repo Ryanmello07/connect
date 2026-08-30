@@ -442,6 +442,26 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 				framingTestGroupContext(t))
 			return err
 		}},
+		// section 6.3.2's seal and open, which read their two pointer arguments at the first
+		// statements after the provider check. Every OTHER argument of every row here is a live
+		// one -- the secret is at the provider's own hash width, the header is one the aad
+		// accepts, the ciphertext is real -- so what is being observed is the nil argument and
+		// not a length refusal or an unregistered content type standing in front of it.
+		"sealSenderData(senderData)": {sentinel: errNilSenderData, call: func(t *testing.T) error {
+			_, err := sealSenderData(crypto, secret, nil, senderDataTestHeader(),
+				bytes.Repeat([]byte{0xab}, 64))
+			return err
+		}},
+		"sealSenderData(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
+			_, err := sealSenderData(crypto, secret, &SenderData{LeafIndex: 1, Generation: 7}, nil,
+				bytes.Repeat([]byte{0xab}, 64))
+			return err
+		}},
+		"openSenderData(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
+			_, err := openSenderData(crypto, secret, bytes.Repeat([]byte{0xcd}, 28), nil,
+				bytes.Repeat([]byte{0xab}, 64))
+			return err
+		}},
 	}
 }
 
