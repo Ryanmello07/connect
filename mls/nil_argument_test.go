@@ -530,6 +530,13 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err := LeafKeysOf(nil)
 			return err
 		}},
+		// the v1 proposal profile gate. A nil proposal has no type to judge, and the refusal is
+		// the same one an unregistered type gets: this build will not act on it. The alternative
+		// is a dereference, and the caller that reaches this with nil is a commit path holding an
+		// arm the codec left empty.
+		"checkProposalProfile(proposal)": {sentinel: errUnsupportedProposalType, call: func(t *testing.T) error {
+			return checkProposalProfile(defaultProfile(), nil)
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

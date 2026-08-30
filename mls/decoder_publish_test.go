@@ -668,6 +668,13 @@ var decoderPublishOrder = []string{
 	"group_policy.go: (*GroupPolicyExtension).UnmarshalMLS stages",
 	"key_package.go: (*KeyPackage).UnmarshalMLS stages",
 	"leaf_node.go: (*LeafNode).UnmarshalMLS stages",
+	// the urmessage_owner_successor body. It STAGES, and for group_policy.go's reason one file
+	// over: the nomination is read into locals, validated whole and only then assigned, so a
+	// decode that refuses a floor shorter than ninety days leaves the caller holding the
+	// nomination its group actually agreed to rather than a composite of that one and a peer's
+	// refused bytes. TestARefusedOwnerSuccessorDecodeLeavesTheCallersValueAlone is the
+	// behavioural half of this row.
+	"owner_successor.go: (*OwnerSuccessorExtension).UnmarshalMLS stages",
 	// Proposal is FramedContent's arrangement for FramedContent's reason, one layer down: the
 	// reset ahead of the arm is what keeps a previous value's arm off a decode of bytes that
 	// carry a different one, and TestAProposalDecodeLeavesNoFieldOfThePreviousValueBehind is

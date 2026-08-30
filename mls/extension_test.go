@@ -2902,6 +2902,34 @@ var extensionBodyTagsToStamp = map[string]struct {
 		},
 		refusal: ErrMalformedExtension,
 	},
+	// the urmessage_owner_successor body of MASTER section 11. Encode validates before it
+	// stamps, so the value built here has to be one a group could actually run: a floor no
+	// shorter than the ninety day minimum.
+	//
+	// The refusal is ErrMalformedExtension, for the group policy row's reason -- a caller here is
+	// asking whether there is a nomination in this entry it can act on, and an entry of the wrong
+	// type answers that exactly as a floor this profile refuses does. What makes the shared
+	// sentinel safe is the sweep below, which says nothing but 0xF003 is ACCEPTED, and the tag it
+	// has to be told apart from is 0xF001 -- two identifiers away in the same const block, and
+	// carrying an opaque<V> at an offset a nomination body also has one at, so a nomination read
+	// back as a group policy is a decode that can succeed.
+	"OwnerSuccessorExtension": {
+		tag: ExtensionTypeUrmessageOwnerSuccessor,
+		build: func() (Extension, error) {
+			nomination := &OwnerSuccessorExtension{
+				Enabled:           true,
+				SuccessorMemberId: []byte("the successor"),
+				NominatedAtMs:     1770000000000,
+				FloorMs:           SuccessionFloorMinMs,
+			}
+			return nomination.Encode()
+		},
+		readBack: func(ext Extension) error {
+			_, err := ParseOwnerSuccessorFrom(ext)
+			return err
+		},
+		refusal: ErrMalformedExtension,
+	},
 	// the ratchet_tree body of RFC 9420 section 12.4.3.3, whose Encode is the raised limit
 	// encode with the tag stamped on. One occupied leaf and nothing else, because what the
 	// two tests below ask about is the TAG: a wider tree costs 65536 read backs each.

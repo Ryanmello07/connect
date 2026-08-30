@@ -3769,6 +3769,37 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{policy.Roles[0].MemberId, policy.ServerId}
 		}},
+		// the urmessage_owner_successor decode, whose one produced run is the successor member
+		// id it read. It must be a COPY for the same reason the policy's two are: the body is an
+		// Extension.ExtensionData a caller owns and may reuse, and a nomination holding a window
+		// onto it names a successor that changes after the group agreed to it.
+		{name: "ParseOwnerSuccessorExtension", call: func(take func([]byte) []byte) [][]byte {
+			encoded, err := (&OwnerSuccessorExtension{
+				Enabled:           true,
+				SuccessorMemberId: []byte{0x01, 0x02},
+				NominatedAtMs:     1,
+				FloorMs:           SuccessionFloorMinMs,
+			}).Encode()
+			if err != nil {
+				t.Fatalf("the nomination body this row decodes: %v", err)
+			}
+			nomination, err := ParseOwnerSuccessorExtension(take(encoded.ExtensionData))
+			if err != nil {
+				t.Fatalf("ParseOwnerSuccessorExtension over a body it had just encoded: %v", err)
+			}
+			return [][]byte{nomination.SuccessorMemberId}
+		}},
+		// the countersignature preimage of MASTER section 11. Both of its variable fields are
+		// runs a caller owns -- a group id off a group context and a member id off a role list --
+		// and the preimage it answers is handed to a signer, so a result that VIEWED either
+		// argument would be a preimage whose content changed between signing and verifying.
+		{name: "successionPreimage", call: func(take func([]byte) []byte) [][]byte {
+			preimage, err := successionPreimage(take([]byte("gid")), 7, take([]byte("sid")), 42)
+			if err != nil {
+				t.Fatalf("successionPreimage: %v", err)
+			}
+			return [][]byte{preimage}
+		}},
 		{name: "compareMemberIds", call: func(take func([]byte) []byte) [][]byte {
 			compareMemberIds(take([]byte{0x01, 0x02}), take([]byte{0x01, 0x03}))
 			return nil
@@ -5882,6 +5913,31 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller
 	// the count form would have been a declaration excused here with no task to name as its first
 	// caller -- an entry that could never expire, which is the one shape this table must not
 	// hold. It lives in framing_protect_test.go instead, beside its only callers.
+	//
+	// The eleventh, twelfth and thirteenth are p7 tasks 4 and 5, and all three are the same
+	// shape: a rule that has to exist before the path that runs it, so that the path does not
+	// get to invent it. Each names the production declaration whose arrival takes the entry off
+	// by FAILING, and none of the three names a task number, because what expires an excuse here
+	// is a caller arriving and not a task passing.
+	//
+	// successionPreimage is the bytes an admin countersigns, MASTER section 11. It lands with the
+	// nomination it is a preimage OVER, because a countersignature preimage split from the
+	// structure it covers is two statements of one layout that agree until one of them changes,
+	// and the half that moved is invisible to every round trip. p7 task 21's ValidateSuccession
+	// is the first thing with a countersignature to check.
+	"./successionPreimage": {firstCaller: "ValidateSuccession",
+		why: "the countersignature preimage of MASTER section 11, landed beside the nomination it covers rather than beside the validator that reads it"},
+	// checkProposalProfile is the v1 refusal of psk, reinit and external_init at this plan's
+	// parse boundary. It lands ahead of the boundary itself because the three doors that apply it
+	// -- the cache store, resolution, and ValSem113 -- are three tasks, and a rule written by
+	// whichever of them needed it first would be three rules.
+	"./checkProposalProfile": {firstCaller: "ProposalCache.Store",
+		why: "the v1 proposal profile gate, landed before the three doors that apply it so that the three cannot each write their own"},
+	// proposalTypePathRequired is RFC 9420 section 12.4's pathRequiredTypes set. Same argument:
+	// the commit path is the caller, and a predicate the commit path wrote for itself would be
+	// one nothing else could reuse or check.
+	"./proposalTypePathRequired": {firstCaller: "CommitPathRequired",
+		why: "RFC 9420 section 12.4's path required set, landed with the profile gate it sits beside rather than with the commit path that reads it"},
 }
 
 // ---------------------------------------------------------------------------

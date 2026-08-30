@@ -698,6 +698,18 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// preimage allowed past MaxVectorLength is one no peer running the default limit
 		// could verify.
 		"leaf_node.go: syntax.NewWriter()",
+		// the urmessage_owner_successor extension, extension type 0xF003. The body is an MLS
+		// structure carried inside a group context, so all three of these are the default limit:
+		// an extension body encoded past MaxVectorLength is one no peer running the default
+		// could decode, and the group context it sits in is inside every confirmation tag the
+		// group has produced.
+		"owner_successor.go: syntax.Marshal(self)",
+		// the countersignature preimage of MASTER section 11. A Writer rather than a private
+		// append helper, so the one length prefix implementation in this tree is what frames the
+		// group id and the successor id, and an overlong field is a refusal rather than a
+		// truncated uint32 two different inputs would share.
+		"owner_successor.go: syntax.NewWriter()",
+		"owner_successor.go: syntax.Unmarshal(data, nomination)",
 		// ValSem403's duplicate test, which decides identity over the serialized
 		// PreSharedKeyID rather than over a field list. The default limit and not the
 		// ratchet tree one: a PreSharedKeyID is an MLS structure whose every field is
