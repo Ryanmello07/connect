@@ -596,6 +596,17 @@ func TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBindin
 				epochGroupContextTypeName, field)
 		}
 	}
+	// the scope, held to the one the crypto guardrails walk rather than left as an alias a
+	// later edit can quietly replace with a literal. Measured on the gate next door: written
+	// as a restatement and narrowed to []string{"."}, the whole of ./mls/... and ./message/...
+	// stayed green, because ../message declares no group context today -- so the paragraph
+	// beside epochMoverRoots would be an argument no test could lose. Narrowing
+	// forbiddenScanRoots itself fails TestHkdfExtractHasOnlyTwoCallSites, which is G1 and
+	// predates this file, so this borrows a scope something already pins.
+	if !slices.Equal(epochMoverRoots, forbiddenScanRoots) {
+		t.Fatalf("this gate walks %v and the package's guardrails walk %v; a scope of its own is a scope nothing holds, and the root it would drop first is the one that declares no group context yet",
+			epochMoverRoots, forbiddenScanRoots)
+	}
 
 	control := epochMoversIn(typeCheckedBodiesOfText(t, "the epoch mover control", epochMoverControl),
 		epochCacheTypeName, []string{"Clear"})
