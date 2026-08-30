@@ -432,6 +432,17 @@ var proposalCacheBindingWriters = map[string]epochBindingWriterRow{
 			if err := cache.CheckEpoch([]byte("anything"), 4242); err != nil {
 				t.Errorf("a cleared cache still reported a binding: %v", err)
 			}
+			// the binding FIELDS and not only the answer. Both guards short circuit on
+			// an empty cache, so a Clear that emptied the map and left groupId and
+			// epoch behind answers exactly as this one does -- measured, that mutation
+			// survived the whole of ./mls/... and ./message/... -- and the day somebody
+			// makes an empty cache answer for the group it last held, the stale binding
+			// is live again. It also releases the caller's array, which is the one
+			// retention this cache keeps across a whole epoch.
+			if cache.groupId != nil || cache.epoch != 0 {
+				t.Errorf("Clear left the binding fields at epoch %d of group %x; it emptied the entries and unbound nothing, so the release rests entirely on the emptiness short circuit in front of every guard",
+					cache.epoch, cache.groupId)
+			}
 			if got := len(cache.Pending()); got != 0 {
 				t.Errorf("Clear left %d entries behind, so the references of the closed epoch are still nameable", got)
 			}
