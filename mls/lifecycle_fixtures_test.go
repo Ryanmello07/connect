@@ -500,3 +500,141 @@ func TestFixtureKeyPackageAnswersTheInitKeyBeforeTheEncryptionKey(t *testing.T) 
 		}
 	}
 }
+
+// TestFixtureKeyPackageLeafCarriesTheMembersLeafKeysExtension holds testKeyPackage to the one
+// thing its leaf must carry beyond a signature, and reads it through the accessor production
+// reads it through rather than off leaf.Extensions[0].
+//
+// NewKeyPackage takes the extensions vector as an ARGUMENT, so handing it nil builds a leaf
+// that is well formed, correctly signed, accepted by section 7.3 validation and accepted by
+// KeyPackage.Validate, and carries no urmessage_leaf_keys entry at all. Every other assertion
+// this file makes about the fixture passes over that leaf. What it produces is a member with no
+// wrap key: task 12 adds them, task 16 seals the epoch secret to a key that is not there, and
+// the discovery lands on whoever writes the task rather than on the fixture that caused it.
+// MASTER section 5.3 is why LeafKeysOf answers absence with a refusal rather than a nil result,
+// and this is that refusal turned into an assertion about the fixture.
+//
+// The X-Wing key is compared against the MEMBER's own rather than merely required to be
+// present, because a leaf carrying somebody else's wrap key is the same silent failure one step
+// later, and the count is asserted because extensions<V> legally holds two entries of a type
+// while LeafKeysOf answers the first -- a fixture that appended a second would be read one way
+// here and another by whatever iterates.
+func TestFixtureKeyPackageLeafCarriesTheMembersLeafKeysExtension(t *testing.T) {
+	crypto := testCrypto(t)
+	frank := testIdentity(t, crypto, "frank")
+	kp, _, _ := testKeyPackage(t, crypto, frank)
+
+	keys, err := LeafKeysOf(&kp.LeafNode)
+	if err != nil {
+		t.Fatalf("the fixture key package's leaf carries no readable urmessage_leaf_keys extension: %v; every task that joins a member through this fixture joins one with no wrap key", err)
+	}
+	if keys.AlgId != AlgIdXwing {
+		t.Errorf("the fixture key package's leaf names wrap algorithm %#04x, want %#04x", keys.AlgId, AlgIdXwing)
+	}
+	if !bytes.Equal(keys.DeviceXwingPub, frank.XwingPub) {
+		t.Error("the fixture key package's leaf carries an X-Wing key that is not this member's, so the epoch wrap would go to somebody else")
+	}
+	carried := 0
+	for i := range kp.LeafNode.Extensions {
+		if kp.LeafNode.Extensions[i].ExtensionType == ExtensionTypeUrmessageLeafKeys {
+			carried++
+		}
+	}
+	if carried != 1 {
+		t.Errorf("the fixture key package's leaf carries %d urmessage_leaf_keys entries, want 1; LeafKeysOf answers the first and a second is read by whatever iterates", carried)
+	}
+	// the entry is inside what the leaf SIGNED, which is what stops a later task from reading a
+	// wrap key that no signature covers: marshalCore writes the extensions vector, so a leaf
+	// whose signature verifies is a leaf whose extensions were signed
+	if err := kp.LeafNode.VerifySignature(crypto, nil, 0); err != nil {
+		t.Fatalf("the fixture leaf's signature does not verify, so its extensions vector is not covered by anything: %v", err)
+	}
+}
+
+// TestFixtureLeafValidationCarriesAClockThatCanRefuseAnExpiredLeaf is the check
+// testLeafValidation's own comment promises and nothing held it to.
+//
+// LeafValidationContext documents NowMs of 0 as an OPT OUT: validateLifetime returns nil before
+// it reads either endpoint. So a fixture context answering 0 is a context under which every
+// fixture leaf still validates, every assertion in this file still passes, and the section 7.3
+// rule the fixture claims to be judged by is the one rule that never runs. What that buys is a
+// task shipping an expired leaf with a green suite behind it.
+//
+// The property is observed rather than asserted about: a leaf whose lifetime ENDED long ago,
+// re-signed so that nothing but the lifetime can be what refuses it, must be refused with
+// ErrLeafNodeLifetime by the very context the fixtures hand out. Under NowMs of 0 it is
+// accepted. The unexpired leaf goes through the same context first, because a context that
+// refused everything would produce the refusal below while saying nothing.
+func TestFixtureLeafValidationCarriesAClockThatCanRefuseAnExpiredLeaf(t *testing.T) {
+	crypto := testCrypto(t)
+	grace := testIdentity(t, crypto, "grace")
+	leaf, _ := testLeafNode(t, crypto, grace)
+	ctx := testLeafValidation(crypto)
+
+	// the control on the context: a leaf inside its own lifetime is accepted by it
+	if err := leaf.Validate(ctx); err != nil {
+		t.Fatalf("the fixture context refuses a leaf that is inside its own lifetime (%v), so the refusal below would say nothing about the clock", err)
+	}
+	if ctx.NowMs == 0 {
+		t.Fatal("the fixture context carries NowMs 0, which LeafValidationContext documents as an opt out of the lifetime check entirely; every fixture leaf is then judged by seven of section 7.3's eight rules")
+	}
+	// and it is THIS machine's clock rather than some fixed instant that merely is not zero: a
+	// constant far from now is caught by the acceptance above, and a constant near it today
+	// stops being near it tomorrow
+	if drift := int64(ctx.NowMs) - time.Now().UnixMilli(); drift > 300_000 || drift < -300_000 {
+		t.Errorf("the fixture context's NowMs is %d ms away from this machine's clock, so it is not reading a real one", drift)
+	}
+
+	// a lifetime that ended in 1970, re-signed under the member's own key so that the signature
+	// rule above it cannot be what refuses this leaf
+	expired := leaf.Clone()
+	expired.Lifetime = Lifetime{NotBefore: 1000, NotAfter: 2000}
+	if err := expired.Sign(crypto, grace.SigPriv, nil, 0); err != nil {
+		t.Fatalf("re-signing the expired leaf: %v", err)
+	}
+	if err := expired.Validate(ctx); !errors.Is(err, ErrLeafNodeLifetime) {
+		t.Fatalf("the fixture context answered %v for a leaf whose lifetime ended at unix second 2000, want ErrLeafNodeLifetime; the fixture's clock is not checking a lifetime at all", err)
+	}
+}
+
+// TestFixtureIdentityGivesTheCredentialAndTheSignatureKeySeparateStorage is the clone
+// testIdentity's comment argues five lines for, held by something.
+//
+// SignaturePublicKey is a []byte, so IdentityPub: sigPub gives the two fields ONE backing
+// array. Every assertion this file already makes still passes over that: the two are equal, the
+// pair signs and verifies, and two members share nothing. What it costs is invisible until a
+// later task edits one field in place -- normalising an identity, truncating it, zeroing it
+// after use -- and finds it has edited the member's signature key as well, producing a
+// credential that no longer matches the key its leaf is signed under, with nothing at the point
+// of the edit to say so.
+//
+// Both directions are edited, because "these two fields do not alias" is a symmetric claim and
+// a test that touched only one of them would pass over a fixture that cloned only one.
+func TestFixtureIdentityGivesTheCredentialAndTheSignatureKeySeparateStorage(t *testing.T) {
+	crypto := testCrypto(t)
+	heidi := testIdentity(t, crypto, "heidi")
+	// the guard on the premise: the two carry the same VALUE, which is what makes an aliasing
+	// question meaningful at all. two unrelated keys would pass every edit below trivially.
+	if !bytes.Equal(heidi.IdentityPub, heidi.SigPub) {
+		t.Fatal("the fixture's credential identity is not the member's signature public key, so this test would pass on two unrelated values")
+	}
+	if len(heidi.IdentityPub) == 0 {
+		t.Fatal("the fixture's credential identity is empty, so there is no byte to edit")
+	}
+
+	heidi.IdentityPub[0] ^= 0xff
+	if bytes.Equal(heidi.IdentityPub, heidi.SigPub) {
+		t.Fatal("editing the credential identity edited the signature public key: the two fields share one backing array")
+	}
+	heidi.IdentityPub[0] ^= 0xff
+
+	heidi.SigPub[0] ^= 0xff
+	if bytes.Equal(heidi.IdentityPub, heidi.SigPub) {
+		t.Fatal("editing the signature public key edited the credential identity: the two fields share one backing array")
+	}
+	heidi.SigPub[0] ^= 0xff
+
+	if !bytes.Equal(heidi.IdentityPub, heidi.SigPub) {
+		t.Fatal("the two edits above did not restore the fixture, so the comparisons they made were not about aliasing")
+	}
+}

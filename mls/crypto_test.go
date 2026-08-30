@@ -4493,8 +4493,8 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		// names and nothing else about the call changes.
 		"CipherSuite": params.Suite,
 		"cred":        leafNodeStubCredential(),
-		"caps": leafNodeStubCapabilities(),
-		"exts": leafNodeStubExtensions(),
+		"caps":        leafNodeStubCapabilities(),
+		"exts":        leafNodeStubExtensions(),
 		// the path secret ladder of RFC 9420 section 7.4 and the node key under it. Both
 		// are exactly KDF.Nh, because a rung of that ladder IS a KDF output and every rung
 		// after the first is derived at that width -- a shorter one would still derive and
@@ -5214,7 +5214,7 @@ var providerConstructionsAnsweringOffTheWallClock = map[string]string{
 	// two calls a second apart answer different signatures for a reason that is not the
 	// arguments. Everything above the comparisons still runs for it.
 	"NewKeyPackage": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out and the parameter list derived off its own declaration, TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
-	"NewLeafNode": "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
+	"NewLeafNode":   "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
 }
 
 // Every operation on both surfaces is covered, with nothing skipped and nothing excused.
@@ -5888,9 +5888,10 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller
 // the excuse that could never expire
 // ---------------------------------------------------------------------------
 
-// excuseVerdicts is what one excuse table looks like when it is read against one package's
-// declarations. Two lists rather than one, because the table can go wrong in two directions and
-// a reader answering one verdict twice would report a clean bill for the other.
+// excuseVerdicts is what one excuse table looks like when it is read against the declarations
+// of every package the guardrails scan. Three lists rather than one, because the table can go
+// wrong in three directions and a reader answering one verdict twice would report a clean bill
+// for another.
 type excuseVerdicts struct {
 	// entries whose expiry the loop in TestNoStubShapesRemainInSource could never observe.
 	cannotExpire []string
@@ -5899,6 +5900,12 @@ type excuseVerdicts struct {
 	// comes off on the commit that lands the caller the entry actually promised, whether or
 	// not that caller ended up calling it.
 	callerLanded []string
+	// entries addressed at a package this reader holds no declarations for. That is neither
+	// verdict: it is the reader saying it judged the entry by nothing. Reported rather than
+	// skipped, because an address a reader steps over is an excuse nothing reads at all, and a
+	// gate that steps over what it cannot judge reports exactly what a clean table reports --
+	// which is the shape this whole file exists to refuse.
+	unreadable []string
 }
 
 // declarationFileOf answers the file one name is declared in, or "".
@@ -5935,14 +5942,41 @@ func declarationFileOf(declaredIn map[string]string, name string) string {
 //     arriving moves nothing it looks at. This is the seam case, and it is the reason the class
 //     is read off the _test.go files of the package rather than off a list of names: a seam
 //     written tomorrow, under any spelling, in any file, has the same only-truthful answer.
-func readExcuses(excuses map[string]awaitingFirstCaller, declaredIn map[string]string) excuseVerdicts {
+//
+// declaredIn is keyed by PACKAGE -- the same key declarationAddress writes an entry under --
+// and the resolution happens in the package the entry is ADDRESSED AT. That is not a choice,
+// it is derived twice over: uncalledDeclarationsIn reports only unexported functions, and Go's
+// own visibility rule makes an unexported function's callers its own package's; and the expiry
+// loop groups files by package and asks each group about its own names. So the package in the
+// address is the only package a first caller can be declared in and the only one whose arrival
+// the expiry loop would notice.
+//
+// This read ONE package before -- the mls directory -- while forbiddenScanRoots has always held
+// two and declarationAddress keys by package precisely so that a ../message address is legal.
+// Every entry addressed at any other package resolved to "" and took the branch marked "the
+// caller is not written yet", so a seam in connect/message excused by naming a ramp of
+// connect/message's own test binary was waved through, and the gate then logged the promise it
+// had not checked. Measured end to end before this was widened; the identical entry keyed at
+// the mls package was refused, which is the whole of the defect.
+//
+// An address at a package declaredIn holds nothing for is its own verdict rather than silence,
+// because a reader that skipped it would answer, for an entry it never looked at, exactly what
+// it answers for a clean one.
+//
+// The honest limit is unchanged and is one sentence longer. An author who names a caller that
+// will never be written in the excused declaration's own package -- including a name only some
+// OTHER package declares, which cannot call an unexported declaration of this one -- states
+// something false, and no reading of this tree tells that from a caller not yet written. What
+// it costs to get past this gate is still a lie in the table rather than a correct entry.
+func readExcuses(excuses map[string]awaitingFirstCaller, declaredIn map[string]map[string]string) excuseVerdicts {
 	verdicts := excuseVerdicts{}
 	for _, address := range slices.Sorted(maps.Keys(excuses)) {
 		excuse := excuses[address]
-		name := address
+		where, name := "", address
 		if cut := strings.LastIndex(address, "/"); cut >= 0 {
-			name = address[cut+1:]
+			where, name = address[:cut], address[cut+1:]
 		}
+		declared, readable := declaredIn[where]
 		switch {
 		case excuse.firstCaller == "":
 			verdicts.cannotExpire = append(verdicts.cannotExpire,
@@ -5950,8 +5984,11 @@ func readExcuses(excuses map[string]awaitingFirstCaller, declaredIn map[string]s
 		case excuse.firstCaller == name:
 			verdicts.cannotExpire = append(verdicts.cannotExpire,
 				address+": names itself as its own first caller")
+		case !readable:
+			verdicts.unreadable = append(verdicts.unreadable,
+				address+": the scan groups no package under "+where+", so nothing judged this entry's expiry")
 		default:
-			file := declarationFileOf(declaredIn, excuse.firstCaller)
+			file := declarationFileOf(declared, excuse.firstCaller)
 			switch {
 			case file == "":
 				// the ordinary shape: the caller is not written yet, which is what the
@@ -5966,6 +6003,55 @@ func readExcuses(excuses map[string]awaitingFirstCaller, declaredIn map[string]s
 		}
 	}
 	return verdicts
+}
+
+// declarationsOfEveryScannedPackage answers the package level declarations of every package the
+// guardrail scan reaches, keyed by the package directory declarationAddress writes into an
+// address.
+//
+// The set of packages is DERIVED from the scan, and from the scan rather than from
+// forbiddenScanRoots directly, because the addresses this feeds are minted by
+// TestNoStubShapesRemainInSource out of filepath.Dir of a scanned path. A package that is a
+// SUBDIRECTORY of a root mints addresses of its own -- mls/syntax already is one -- and a
+// reader keyed on the roots alone would hold nothing for them. Same walk, same grouping
+// expression, same keys.
+func declarationsOfEveryScannedPackage(t *testing.T) map[string]map[string]string {
+	t.Helper()
+	declared := map[string]map[string]string{}
+	for path := range mustScanSources(t, forbiddenScanRoots).sourceTexts {
+		where := filepath.ToSlash(filepath.Dir(path))
+		if _, read := declared[where]; read {
+			continue
+		}
+		declared[where] = packageLevelDeclarations(t, where)
+	}
+	// the guard on the walk rather than on any one package. A scan that read nothing groups
+	// nothing and answers every entry "unreadable", which is loud; a scan that read one root
+	// answers the other root's entries "not written yet", which is the exact silence this
+	// reader was widened to end, and is what a walk failing on the second root would produce.
+	// Both halves of the rule are decided by which side of _test.go a file falls, so each root
+	// is required to contribute some of each -- a root reached with its test files skipped
+	// reports every seam of it as awaiting a caller.
+	for _, root := range forbiddenScanRoots {
+		names, read := declared[filepath.ToSlash(root)]
+		if !read {
+			t.Fatalf("the scan grouped no package under %q, and it is one of the roots the guardrails walk (%v)",
+				root, forbiddenScanRoots)
+		}
+		production, tests := 0, 0
+		for _, file := range names {
+			if strings.HasSuffix(file, "_test.go") {
+				tests++
+				continue
+			}
+			production++
+		}
+		if production == 0 || tests == 0 {
+			t.Fatalf("%q contributed %d production and %d test declarations; a root missing either half is a root judged by half a rule",
+				root, production, tests)
+		}
+	}
+	return declared
 }
 
 // The control's production half. One declaration awaiting a caller nobody has written, one
@@ -5994,7 +6080,25 @@ func TestControlDrivesTheSeam() {}
 func aHelperOfTheTestBinary() int { return 3 }
 `
 
-// The control's excuse table: one row per verdict, plus the row that must produce none.
+// The control's SECOND package. It is what says the reader resolves a first caller in the
+// package the entry is addressed at rather than in one fixed directory, and it carries the same
+// two shapes the first package does -- one production caller, one helper of a test binary --
+// under names the first package does not declare. A reader that read only the first package and
+// a reader that merged the two into one map are then different from this one, and the whole
+// answer below is what separates all three.
+const excuseExpiryOtherPackageProductionControl = `package elsewhere
+
+func theCallerThatLandedInTheOtherPackage() int { return 4 }
+`
+
+// The second package's test half, whose spelling says nothing about tests for the same reason
+// the first package's does: what decides is the file a declaration lives in.
+const excuseExpiryOtherPackageTestControl = `package elsewhere
+
+func aRampOfTheOtherPackagesTestBinary() int { return 5 }
+`
+
+// The control's excuse table: one row per verdict, plus the rows that must produce none.
 var excuseExpiryControlTable = map[string]awaitingFirstCaller{
 	"./awaitedByACallerNotWrittenYet": {firstCaller: "aCallerNoFileDeclaresYet",
 		why: "the ordinary shape, and the row that must produce no verdict at all"},
@@ -6010,11 +6114,20 @@ var excuseExpiryControlTable = map[string]awaitingFirstCaller{
 		why: "an expiry that is its own arrival"},
 	"./anExcuseNamingAProductionVar": {firstCaller: "errNamedLikeATestSeamButDeclaredInProduction",
 		why: "a caller spelled like a test seam and declared in production, which is a LANDED verdict and not a refusal"},
+	"../elsewhere/aSeamTheOtherPackagesTestNames": {firstCaller: "aRampOfTheOtherPackagesTestBinary",
+		why: "the measured hole: the seam shape, one package over from the one this reader used to read"},
+	"../elsewhere/awaitedByTheOtherPackagesCaller": {firstCaller: "theCallerThatLandedInTheOtherPackage",
+		why: "the sharper expiry, one package over"},
+	"./awaitedByANameOnlyTheOtherPackageDeclares": {firstCaller: "theCallerThatLandedInTheOtherPackage",
+		why: "a name this package does not declare and the other one does: no verdict, because the lookup is per package and an unexported declaration here is unreachable from there"},
+	"../nowhere/anExcuseAddressedAtAPackageNobodyScanned": {firstCaller: "aCallerNoFileDeclaresYet",
+		why: "an address at a package the scan does not reach, which is the verdict that says the reader judged nothing"},
 }
 
 // The whole answer the control commits, written out rather than derived: an expectation
 // computed from the same code it is controlling states nothing.
 var excuseExpiryControlCannotExpire = []string{
+	"../elsewhere/aSeamTheOtherPackagesTestNames: aRampOfTheOtherPackagesTestBinary is declared by the test binary (control_test.go)",
 	"./aSeamADeclaringTestNames: TestControlDrivesTheSeam is declared by the test binary (control_test.go)",
 	"./aSeamAHelperNames: aHelperOfTheTestBinary is declared by the test binary (control_test.go)",
 	"./anExcuseNamingItself: names itself as its own first caller",
@@ -6022,29 +6135,45 @@ var excuseExpiryControlCannotExpire = []string{
 }
 
 var excuseExpiryControlCallerLanded = []string{
+	"../elsewhere/awaitedByTheOtherPackagesCaller: theCallerThatLandedInTheOtherPackage has landed in control.go",
 	"./anExcuseNamingAProductionVar: errNamedLikeATestSeamButDeclaredInProduction has landed in control.go",
 	"./awaitedByACallerThatHasLanded: theCallerThatLanded has landed in control.go",
 }
 
-// declarationsOfTheExcuseControl runs the control's two halves through declarationsIn, which is
-// the same collector packageLevelDeclarations uses on the real package, so the control is not a
+var excuseExpiryControlUnreadable = []string{
+	"../nowhere/anExcuseAddressedAtAPackageNobodyScanned: the scan groups no package under ../nowhere, so nothing judged this entry's expiry",
+}
+
+// declarationsOfTheExcuseControl runs the control's halves through declarationsIn, which is the
+// same collector packageLevelDeclarations uses on the real packages, so the control is not a
 // second reading of the source.
-func declarationsOfTheExcuseControl(t *testing.T) map[string]string {
+//
+// It is keyed by PACKAGE for the same reason the real reader is, and the two packages give
+// their halves the SAME file names on purpose: what decides a verdict is which side of _test.go
+// a file falls on and which package it is in, never the file's name, and a control whose two
+// packages used different names could not say that.
+func declarationsOfTheExcuseControl(t *testing.T) map[string]map[string]string {
 	t.Helper()
-	declared := map[string]string{}
+	declared := map[string]map[string]string{}
 	for _, half := range []struct {
+		where  string
 		name   string
 		source string
 	}{
-		{name: "control.go", source: excuseExpiryProductionControl},
-		{name: "control_test.go", source: excuseExpiryTestControl},
+		{where: ".", name: "control.go", source: excuseExpiryProductionControl},
+		{where: ".", name: "control_test.go", source: excuseExpiryTestControl},
+		{where: "../elsewhere", name: "control.go", source: excuseExpiryOtherPackageProductionControl},
+		{where: "../elsewhere", name: "control_test.go", source: excuseExpiryOtherPackageTestControl},
 	} {
 		parsed, err := parser.ParseFile(token.NewFileSet(), half.name, half.source,
 			parser.SkipObjectResolution)
 		if err != nil {
-			t.Fatalf("parse %s: %v", half.name, err)
+			t.Fatalf("parse %s/%s: %v", half.where, half.name, err)
 		}
-		declarationsIn(parsed, half.name, declared)
+		if declared[half.where] == nil {
+			declared[half.where] = map[string]string{}
+		}
+		declarationsIn(parsed, half.name, declared[half.where])
 	}
 	return declared
 }
@@ -6080,19 +6209,25 @@ func TestNoExcuseAwaitingAFirstCallerNamesAnExpiryThatCannotArrive(t *testing.T)
 			control.cannotExpire, excuseExpiryControlCannotExpire)
 	}
 	if !slices.Equal(control.callerLanded, excuseExpiryControlCallerLanded) {
-		t.Errorf("the reader answered %v as having a landed caller out of the control, want %v; the two verdicts cross in this control, so a reader answering one of them twice fails here",
+		t.Errorf("the reader answered %v as having a landed caller out of the control, want %v; the three verdicts cross in this control, so a reader answering one of them twice fails here",
 			control.callerLanded, excuseExpiryControlCallerLanded)
 	}
+	if !slices.Equal(control.unreadable, excuseExpiryControlUnreadable) {
+		t.Errorf("the reader answered %v as judged by nothing out of the control, want %v; an address it steps over silently is an excuse nothing reads",
+			control.unreadable, excuseExpiryControlUnreadable)
+	}
 
-	declared := packageLevelDeclarations(t, ".")
+	declared := declarationsOfEveryScannedPackage(t)
 	// the guard on the SCAN rather than on the class, because a scan that read nothing reports
 	// exactly what a scan over a clean table reports. One production declaration and one of the
-	// test binary, so both halves of the rule are known to be reachable.
-	if file := declared["errNilLeafOccupancyTest"]; file != "framing_protect.go" {
+	// test binary, so both halves of the rule are known to be reachable. The other roots are
+	// held by declarationsOfEveryScannedPackage itself, which requires each of them to have
+	// contributed declarations of both kinds.
+	if file := declared[cryptoOwnRoot]["errNilLeafOccupancyTest"]; file != "framing_protect.go" {
 		t.Fatalf("errNilLeafOccupancyTest is declared in %q and framing_protect.go certainly declares it, so this scan read something other than this package",
 			file)
 	}
-	if file := declared["TestNoStubShapesRemainInSource"]; !strings.HasSuffix(file, "_test.go") {
+	if file := declared[cryptoOwnRoot]["TestNoStubShapesRemainInSource"]; !strings.HasSuffix(file, "_test.go") {
 		t.Fatalf("TestNoStubShapesRemainInSource is declared in %q, so the scan is not reading this package's test files and every seam would read as awaiting a caller",
 			file)
 	}
@@ -6104,6 +6239,10 @@ func TestNoExcuseAwaitingAFirstCallerNamesAnExpiryThatCannotArrive(t *testing.T)
 	}
 	for _, verdict := range verdicts.callerLanded {
 		t.Errorf("%s; the caller this excuse promised has arrived, so the entry is a line to delete",
+			verdict)
+	}
+	for _, verdict := range verdicts.unreadable {
+		t.Errorf("%s; this entry was judged by nothing at all, which is the silence this gate exists to end -- either it is addressed at a package the guardrails do not walk, or it is spelled some way declarationAddress does not mint",
 			verdict)
 	}
 	t.Logf("%d excuse(s) awaiting a first caller, each naming a production declaration that has not landed",
@@ -6125,11 +6264,15 @@ func TestNoExcuseAwaitingAFirstCallerNamesAnExpiryThatCannotArrive(t *testing.T)
 // became test-only, or stopped being returned, this fails rather than quietly moving the near
 // miss into the class the rule above refuses.
 func TestTheGuardThatReadsLikeATestSeamIsProductionsOwn(t *testing.T) {
-	declared := packageLevelDeclarations(t, ".")
+	declared := declarationsOfEveryScannedPackage(t)
 	probe := map[string]awaitingFirstCaller{
 		"./aDeclarationAwaitingIt": {firstCaller: "errNilLeafOccupancyTest", why: "the near miss"},
 	}
 	verdicts := readExcuses(probe, declared)
+	if len(verdicts.unreadable) != 0 {
+		t.Fatalf("the reader judged the near miss by nothing (%v); the probe is addressed at this package and this package is a guardrail root, so the reader is not holding the packages it walked",
+			verdicts.unreadable)
+	}
 	if len(verdicts.cannotExpire) != 0 {
 		t.Errorf("naming errNilLeafOccupancyTest as a first caller was refused as unable to expire (%v); the rule is reading the spelling of a name rather than the file it is declared in, and this package's genuine internal guards are spelled that way",
 			verdicts.cannotExpire)
