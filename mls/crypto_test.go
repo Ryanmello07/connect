@@ -2860,6 +2860,8 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	// are the decoder's own copies. The half that matters is the one that still runs -- the key
 	// source, the secret, the message and the group context are all read again after the call.
 	"OpenPrivateMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
+	// section 6's ValSem002 and ValSem003, on VerifyAuthenticatedContent's terms exactly.
+	"CheckFramedContentContext": "answers an error and no bytes; what it produces is a verdict",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -3423,6 +3425,22 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			if verifyErr := VerifyAuthenticatedContent(crypto, SignaturePublicKey(take(verifyPub)),
 				authContent, take(groupContext)); verifyErr != nil {
 				t.Fatalf("VerifyAuthenticatedContent refused a signature made over the same message: %v", verifyErr)
+			}
+			return nil
+		}},
+		// section 6's ValSem002 and ValSem003, on VerifyAuthenticatedContent's terms: what it
+		// answers is a verdict and no bytes. The half that matters is the one that still runs. The
+		// group id it is handed is the RECEIVER's own -- one array held for the life of the group
+		// and compared against again by every message after this one -- so a rule that sorted it,
+		// padded it to a common length, or wrote a sentinel through it would corrupt the value
+		// every later comparison is made against, and the corruption would be invisible until some
+		// message from the right group was refused.
+		{name: "CheckFramedContentContext", call: func(take func([]byte) []byte) [][]byte {
+			content := framingStubFramedContentOver(take)
+			if checkErr := CheckFramedContentContext(content,
+				take(bytes.Clone(content.GroupId)), content.Epoch); checkErr != nil {
+				t.Fatalf("CheckFramedContentContext refused a content carrying its own group id and epoch: %v",
+					checkErr)
 			}
 			return nil
 		}},
