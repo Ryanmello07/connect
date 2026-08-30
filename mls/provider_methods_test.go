@@ -863,7 +863,7 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		// carried through the copy, which is what the retention half reads: an applier walking
 		// the resolved list must not be walking the array the commit was decoded out of.
 		{name: "(*ProposalCache).Resolve", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
-			list, err := NewProposalCache().Resolve(crypto, LeafIndex(3), []ProposalOrRef{{
+			list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(3), []ProposalOrRef{{
 				Type: ProposalOrRefTypeProposal,
 				Proposal: &Proposal{
 					ProposalType: ProposalTypeGroupContextExtensions,

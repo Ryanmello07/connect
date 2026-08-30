@@ -635,6 +635,45 @@ func testProposalContentAt(t *testing.T, sender LeafIndex, groupId []byte, epoch
 	}
 }
 
+// testResolveContextAt is the group context a resolution runs under, with the group and epoch
+// named.
+//
+// Only the two fields the cache compares are filled. Resolve reads GroupId and Epoch and nothing
+// else, so a fixture carrying a tree hash would be stating that the rest matters -- and a later
+// reader would then be unable to tell which field a refusal came from.
+func testResolveContextAt(groupId []byte, epoch uint64) *GroupContext {
+	return &GroupContext{
+		Version:     ProtocolVersionMls10,
+		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:     groupId,
+		Epoch:       epoch,
+	}
+}
+
+// testResolveContext is the epoch every test that is NOT about the epoch binding resolves in: the
+// group id and epoch testProposalContent stamps on a cached proposal.
+//
+// It has to agree with that fixture and the agreement is asserted rather than assumed --
+// TestTheResolutionFixtureRunsInTheEpochTheCacheFixtureStoresIn is what says so. Two fixtures
+// drifting apart would turn every resolution in this file into an out-of-epoch refusal, and the
+// tests that assert an error would go on passing.
+func testResolveContext() *GroupContext {
+	return testResolveContextAt([]byte("group"), 1)
+}
+
+// TestTheResolutionFixtureRunsInTheEpochTheCacheFixtureStoresIn joins the two fixtures above, so
+// the twenty resolutions in this file are known to be running in the epoch their entries belong
+// to rather than passing for some other reason.
+func TestTheResolutionFixtureRunsInTheEpochTheCacheFixtureStoresIn(t *testing.T) {
+	crypto := testCrypto(t)
+	stored := testProposalContent(t, crypto, LeafIndex(1), testRemoveProposal(LeafIndex(4)))
+	resolving := testResolveContext()
+	if !bytes.Equal(stored.Content.GroupId, resolving.GroupId) || stored.Content.Epoch != resolving.Epoch {
+		t.Fatalf("the cache fixture stores in epoch %d of group %x and the resolution fixture runs in epoch %d of group %x; every resolution in this file is then out of epoch",
+			stored.Content.Epoch, stored.Content.GroupId, resolving.Epoch, resolving.GroupId)
+	}
+}
+
 // testRemoveProposal is a well formed remove of one leaf, which is the cheapest proposal that
 // carries a value a test can tell two of apart.
 func testRemoveProposal(removed LeafIndex) *Proposal {
@@ -667,7 +706,7 @@ func TestProposalCacheResolvesByReference(t *testing.T) {
 		t.Fatalf("Get = %+v %v", cached, ok)
 	}
 
-	list, err := cache.Resolve(crypto, LeafIndex(0),
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -709,7 +748,7 @@ func TestTheCacheAnswersTheReferenceItWasAskedForAndNotTheFirstOneItHolds(t *tes
 			t.Errorf("Get(entry %d) answered a removal of leaf %d sent by leaf %d, want %d sent by %d",
 				i, cached.Proposal.Remove.Removed, cached.Sender, removals[i], senders[i])
 		}
-		list, err := cache.Resolve(crypto, LeafIndex(0),
+		list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 			[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}})
 		if err != nil {
 			t.Fatalf("Resolve(entry %d): %v", i, err)
@@ -746,7 +785,7 @@ func TestTheCacheKeyIsTheWholeReferenceAndNotAPrefixOfIt(t *testing.T) {
 			t.Errorf("Get answered an entry for a reference differing from the stored one at octet %d of %d; the lookup is not keyed on the whole reference",
 				i, len(ref))
 		}
-		if _, err := cache.Resolve(crypto, LeafIndex(0),
+		if _, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 			[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ProposalRef(neighbour)}}); err == nil {
 			t.Errorf("Resolve accepted a reference differing from the stored one at octet %d of %d",
 				i, len(ref))
@@ -765,7 +804,7 @@ func TestProposalCacheResolveUnknownReference(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
 	unknown := ProposalRef(bytes.Repeat([]byte{9}, 32))
-	_, err := cache.Resolve(crypto, LeafIndex(0),
+	_, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: unknown}})
 	if !errors.Is(err, errProposalNotCached) {
 		t.Fatalf("Resolve error = %v, want errProposalNotCached", err)
@@ -784,7 +823,7 @@ func TestResolveRefusesOneReferenceNamedTwice(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
-	_, err := cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{
+	_, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
 		{Type: ProposalOrRefTypeReference, Reference: ref},
 		{Type: ProposalOrRefTypeReference, Reference: ref},
 	})
@@ -794,7 +833,7 @@ func TestResolveRefusesOneReferenceNamedTwice(t *testing.T) {
 	// and the duplicate is refused wherever in the vector it appears, not only when the two are
 	// adjacent: a scan comparing each entry with the one before it passes the interleaved shape
 	other := testStoredRemove(t, crypto, cache, LeafIndex(2), LeafIndex(5))
-	_, err = cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{
+	_, err = cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
 		{Type: ProposalOrRefTypeReference, Reference: ref},
 		{Type: ProposalOrRefTypeReference, Reference: other},
 		{Type: ProposalOrRefTypeReference, Reference: ref},
@@ -811,7 +850,7 @@ func TestResolveRefusesOneReferenceNamedTwice(t *testing.T) {
 func TestProposalCacheByValueSenderIsCommitter(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
-	list, err := cache.Resolve(crypto, LeafIndex(5), []ProposalOrRef{{
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(5), []ProposalOrRef{{
 		Type:     ProposalOrRefTypeProposal,
 		Proposal: testRemoveProposal(LeafIndex(2)),
 	}})
@@ -964,7 +1003,7 @@ func TestProposalCacheBucketsAndOrder(t *testing.T) {
 		{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(1))},
 		{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(2))},
 	}
-	list, err := cache.Resolve(crypto, LeafIndex(0), refs)
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), refs)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -994,7 +1033,7 @@ func TestResolveKeepsCommitOrderInAllAndInEveryBucket(t *testing.T) {
 	// the cache's reception order answers 4, 2 rather than 2, 4
 	fourth := testStoredRemove(t, crypto, cache, LeafIndex(9), LeafIndex(4))
 	second := testStoredRemove(t, crypto, cache, LeafIndex(8), LeafIndex(2))
-	list, err := cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
 		{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(1))},
 		{Type: ProposalOrRefTypeReference, Reference: second},
 		{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(3))},
@@ -1039,7 +1078,7 @@ func TestProposalListPathRequiredAddOnly(t *testing.T) {
 	crypto := testCrypto(t)
 	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "bob"))
 	cache := NewProposalCache()
-	list, err := cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type:     ProposalOrRefTypeProposal,
 		Proposal: &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}},
 	}})
@@ -1058,7 +1097,7 @@ func TestProposalListPathRequiredAddOnly(t *testing.T) {
 func TestAnEmptyProposalListRequiresAPath(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
-	list, err := cache.Resolve(crypto, LeafIndex(0), nil)
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), nil)
 	if err != nil {
 		t.Fatalf("Resolve of an empty vector: %v", err)
 	}
@@ -1130,7 +1169,7 @@ func TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn(t *testing.T
 			continue
 		}
 		accepted = append(accepted, name)
-		list, err := NewProposalCache().Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+		list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 			Type:     ProposalOrRefTypeProposal,
 			Proposal: proposalOfRegisteredType(t, crypto, member, proposalType),
 		}})
@@ -1185,7 +1224,7 @@ func TestTheListPathRequirementFollowsTheRfcSetForEveryAcceptedType(t *testing.T
 		if refusal, classified := proposalTypeProfile[proposalType]; !classified || refusal != nil {
 			continue
 		}
-		list, err := NewProposalCache().Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+		list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 			Type:     ProposalOrRefTypeProposal,
 			Proposal: proposalOfRegisteredType(t, crypto, member, proposalType),
 		}})
@@ -1219,7 +1258,7 @@ func TestResolveRefusesASecondGroupContextExtensionsProposal(t *testing.T) {
 	crypto := testCrypto(t)
 	first := []Extension{{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0, 0, 0}}}
 	second := []Extension{{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{1}}}
-	_, err := NewProposalCache().Resolve(crypto, LeafIndex(0), []ProposalOrRef{
+	_, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
 		{Type: ProposalOrRefTypeProposal, Proposal: &Proposal{
 			ProposalType:           ProposalTypeGroupContextExtensions,
 			GroupContextExtensions: &GroupContextExtensions{Extensions: first}}},
@@ -1236,7 +1275,7 @@ func TestResolveRefusesASecondGroupContextExtensionsProposal(t *testing.T) {
 func TestExtensionsAnswersTheProposedSetAndNothingWhenThereIsNone(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
-	empty, err := cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+	empty, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(1))}})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -1245,7 +1284,7 @@ func TestExtensionsAnswersTheProposedSetAndNothingWhenThereIsNone(t *testing.T) 
 		t.Errorf("a list with no group_context_extensions proposal answered %v %v", exts, ok)
 	}
 	proposed := []Extension{{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0, 0, 0}}}
-	list, err := cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: &Proposal{
 			ProposalType:           ProposalTypeGroupContextExtensions,
 			GroupContextExtensions: &GroupContextExtensions{Extensions: proposed}}}})
@@ -1308,7 +1347,7 @@ func TestResolveHandsBackNothingTheCacheStillHolds(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
-	list, err := cache.Resolve(crypto, LeafIndex(0),
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -1364,7 +1403,7 @@ func TestStoreJudgesItsProviderBeforeAnythingElse(t *testing.T) {
 	if _, err := NewProposalCache().Store(crypto, nil); !errors.Is(err, errNilAuthenticatedContent) {
 		t.Errorf("Store(crypto, nil) = %v, want errNilAuthenticatedContent", err)
 	}
-	if _, err := NewProposalCache().Resolve(nil, 0, nil); !errors.Is(err, ErrNilCryptoProvider) {
+	if _, err := NewProposalCache().Resolve(nil, nil, 0, nil); !errors.Is(err, ErrNilCryptoProvider) {
 		t.Errorf("Resolve(nil, ...) = %v, want ErrNilCryptoProvider", err)
 	}
 }
@@ -1394,12 +1433,12 @@ func TestTheCacheRunsTheV1ProfileGateOnBothDoors(t *testing.T) {
 		testProposalContent(t, crypto, LeafIndex(1), psk)); !errors.Is(err, errProfilePsk) {
 		t.Errorf("Store of a psk proposal = %v, want errProfilePsk", err)
 	}
-	if _, err := NewProposalCache().Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+	if _, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: psk}}); !errors.Is(err, errProfilePsk) {
 		t.Errorf("Resolve of an inline psk proposal = %v, want errProfilePsk", err)
 	}
 	grease := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownBody: []byte{1, 2}}
-	if _, err := NewProposalCache().Resolve(crypto, LeafIndex(0), []ProposalOrRef{{
+	if _, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: grease}}); !errors.Is(err, errUnsupportedProposalType) {
 		t.Errorf("Resolve of an inline GREASE proposal = %v, want errUnsupportedProposalType", err)
 	}
@@ -1420,7 +1459,7 @@ func TestResolveRefusesEveryProposalOrRefShapeTheCodecRefuses(t *testing.T) {
 		"no arm at all":                {Type: ProposalOrRefTypeProposal},
 		"a reference of no octets":     {Type: ProposalOrRefTypeReference, Reference: ProposalRef{}},
 	} {
-		if _, err := cache.Resolve(crypto, LeafIndex(0), []ProposalOrRef{entry}); err == nil {
+		if _, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{entry}); err == nil {
 			t.Errorf("Resolve accepted %s", name)
 		}
 	}
@@ -1455,12 +1494,315 @@ func TestPendingAnswersEveryEntryOnceInReceptionOrder(t *testing.T) {
 		}
 	}
 	// and what Pending answers resolves, which is the whole of what a committer does with it
-	list, err := cache.Resolve(crypto, LeafIndex(0), pending)
+	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), pending)
 	if err != nil {
 		t.Fatalf("Resolve of the pending vector: %v", err)
 	}
 	if len(list.Removes) != 2 || list.Removes[0].Proposal.Remove.Removed != 4 ||
 		list.Removes[1].Proposal.Remove.Removed != 5 {
 		t.Errorf("the pending vector resolved to %+v", list.Removes)
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// the epoch a RESOLUTION runs in
+// ---------------------------------------------------------------------------
+
+// TestResolveRefusesAReferenceCachedInAnEpochThatHasClosed is the replay property at the door the
+// pinned signature left open.
+//
+// A ProposalRef is a hash over an AuthenticatedContent carrying the group id and the epoch, so an
+// entry cached in epoch N is a name no commit of epoch N+1 can legitimately carry. A cache nobody
+// cleared at the boundary still answers every one of those names, and the commit that names one
+// applies a proposal the group has already applied under a reference every peer verifies and
+// agrees with. Resolve read neither the epoch nor the group id -- it was handed neither -- so this
+// resolved, unconditionally, in every direction.
+//
+// Every direction is what is asserted. A guard that refused only a HIGHER epoch takes a replay
+// out of a closed one; a guard that compared only the epoch number takes another group's entry,
+// because every group this client is in runs an epoch 7.
+func TestResolveRefusesAReferenceCachedInAnEpochThatHasClosed(t *testing.T) {
+	crypto := testCrypto(t)
+	cache := NewProposalCache()
+	ref, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+		testRemoveProposal(LeafIndex(4))))
+	if err != nil {
+		t.Fatalf("Store at epoch 7: %v", err)
+	}
+	named := []ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}}
+
+	// the epoch the entry belongs to resolves, so every refusal below is the epoch and not a
+	// reference this cache never held
+	list, err := cache.Resolve(crypto, testResolveContextAt([]byte("group"), 7), LeafIndex(0), named)
+	if err != nil {
+		t.Fatalf("Resolve in the epoch the entry was cached in: %v", err)
+	}
+	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 4 {
+		t.Fatalf("the entry resolved to %+v in its own epoch", list.Removes)
+	}
+
+	for _, one := range []struct {
+		what    string
+		context *GroupContext
+	}{
+		{"the epoch after, which is the replay a commit of the new epoch performs",
+			testResolveContextAt([]byte("group"), 8)},
+		{"the epoch before, which is a commit of a closed epoch naming a proposal of the live one",
+			testResolveContextAt([]byte("group"), 6)},
+		{"another group at the same epoch number, which is not the same epoch at all",
+			testResolveContextAt([]byte("other"), 7)},
+	} {
+		refused, err := cache.Resolve(crypto, one.context, LeafIndex(0), named)
+		if !errors.Is(err, errProposalResolvedOutOfEpoch) {
+			t.Errorf("resolving into %s answered %v, want errProposalResolvedOutOfEpoch", one.what, err)
+		}
+		if refused != nil {
+			t.Errorf("resolving into %s answered a list as well as an error, and a caller that reads the list applies the replayed proposal", one.what)
+		}
+		// two rules, two values. Store refuses an ENTRY that arrived carrying another
+		// epoch and the remedy is to drop that message; this refuses a COMMIT of another
+		// epoch and the remedy is that the lifecycle did not clear the cache. A caller
+		// that could not tell them apart would be told to look at the wrong thing.
+		if errors.Is(err, errProposalCacheEpoch) {
+			t.Errorf("resolving into %s answered Store's errProposalCacheEpoch as well, so the two rules of this file share one value", one.what)
+		}
+		if errors.Is(err, errProposalNotCached) {
+			t.Errorf("resolving into %s answered errProposalNotCached, which is untrue -- the reference IS cached, in an epoch that has closed, and that is the whole of the fault", one.what)
+		}
+	}
+}
+
+// TestAResolutionThatNamesNothingCachedIsNotJudgedByTheBindingOfACacheItNeverReads is the other
+// half of rule 4: what it does NOT refuse.
+//
+// A commit carrying every proposal by value reads no cache entry, so no entry of a closed epoch
+// can reach the list it produces and there is nothing to replay. Refusing it would be a rule
+// about the caller's housekeeping wearing the name of a replay refusal, and the first thing
+// anybody would do about it is clear the cache in the one path that showed the error rather than
+// in the path that advanced the epoch.
+func TestAResolutionThatNamesNothingCachedIsNotJudgedByTheBindingOfACacheItNeverReads(t *testing.T) {
+	crypto := testCrypto(t)
+	cache := NewProposalCache()
+	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+		testRemoveProposal(LeafIndex(4)))); err != nil {
+		t.Fatalf("Store at epoch 7: %v", err)
+	}
+	inline := []ProposalOrRef{{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(9))}}
+	list, err := cache.Resolve(crypto, testResolveContextAt([]byte("group"), 8), LeafIndex(3), inline)
+	if err != nil {
+		t.Fatalf("an inline only commit of epoch 8, over a cache still holding epoch 7, answered %v; it reads no entry of that cache", err)
+	}
+	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 9 || list.Removes[0].Sender != 3 {
+		t.Fatalf("the inline proposal resolved to %+v", list.Removes)
+	}
+}
+
+// TestAnEmptyCacheBelongsToNoEpochAndAnswersTheTruthAboutTheReferenceItWasAskedFor is the
+// boundary between the two refusals a lookup can earn.
+//
+// An empty cache is exactly the state Clear leaves behind, and it holds no entry from any epoch,
+// so a reference into it is not a replay -- it is a name nothing was ever stored under, and
+// errProposalNotCached is the true account. A guard that refused the empty cache as out of epoch
+// would report a replay to every member that received a commit before the proposal it names.
+func TestAnEmptyCacheBelongsToNoEpochAndAnswersTheTruthAboutTheReferenceItWasAskedFor(t *testing.T) {
+	crypto := testCrypto(t)
+	cache := NewProposalCache()
+	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
+	cache.Clear()
+	named := []ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}}
+	for _, at := range []*GroupContext{
+		testResolveContextAt([]byte("group"), 1),
+		testResolveContextAt([]byte("group"), 99),
+		testResolveContextAt([]byte("other"), 1),
+	} {
+		_, err := cache.Resolve(crypto, at, LeafIndex(0), named)
+		if !errors.Is(err, errProposalNotCached) {
+			t.Errorf("a reference into a cleared cache, resolving in epoch %d of group %x, answered %v, want errProposalNotCached",
+				at.Epoch, at.GroupId, err)
+		}
+		if errors.Is(err, errProposalResolvedOutOfEpoch) {
+			t.Errorf("a cleared cache reported itself out of epoch %d of group %x; Clear is what releases the binding and an empty cache belongs to no epoch",
+				at.Epoch, at.GroupId)
+		}
+	}
+	// and an inline commit resolves against a cleared cache in any epoch, which is what makes
+	// Clear a release rather than a way to break the group
+	if _, err := cache.Resolve(crypto, testResolveContextAt([]byte("group"), 99), LeafIndex(0),
+		[]ProposalOrRef{{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(2))}}); err != nil {
+		t.Errorf("an inline commit against a cleared cache answered %v", err)
+	}
+}
+
+// TestResolveRefusesANilGroupContextRatherThanDereferencingIt is the argument rule over the
+// parameter this task added.
+//
+// nil_argument_test.go derives the class of nil refusals off the source and carries the row that
+// sweeps this one; what is here is the ORDER. The provider is judged first, because a caller that
+// passed neither should be sent to the one it is asked for first rather than to whichever the
+// body happened to read.
+func TestResolveRefusesANilGroupContextRatherThanDereferencingIt(t *testing.T) {
+	crypto := testCrypto(t)
+	if _, err := NewProposalCache().Resolve(crypto, nil, LeafIndex(0), nil); !errors.Is(err, ErrNilGroupContext) {
+		t.Errorf("Resolve with no group context = %v, want ErrNilGroupContext", err)
+	}
+	if _, err := NewProposalCache().Resolve(nil, nil, LeafIndex(0), nil); !errors.Is(err, ErrNilCryptoProvider) {
+		t.Errorf("Resolve with neither a provider nor a group context = %v, want ErrNilCryptoProvider; the provider is the first thing this body asks for", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the two survivors this file carried
+// ---------------------------------------------------------------------------
+
+// TestExtensionsAnswersTheFirstOfTwoInAHandAssembledList holds the index Extensions reads.
+//
+// Every list Resolve produces carries at most one GroupContextExtensions proposal, because Resolve
+// refuses the second -- so over those lists GCE[0] and GCE[len-1] are the same entry and no test
+// that goes through Resolve can tell them apart. Measured: the whole of ./mls/... and
+// ./message/... was green with the LAST one answered.
+//
+// A hand assembled list is not a hypothetical. p7 task 7 builds ProposalList values field by
+// field and reads this through (*ProposalValidationInput).effectiveExtensions, so a list carrying
+// two is a value that reaches this accessor, and which of the two it answers decides the
+// extension set every leaf of the group is then validated against.
+func TestExtensionsAnswersTheFirstOfTwoInAHandAssembledList(t *testing.T) {
+	first := []Extension{{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0, 0, 0}}}
+	second := []Extension{{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x02}}}
+	entry := func(extensions []Extension) CachedProposal {
+		return CachedProposal{Proposal: Proposal{
+			ProposalType:           ProposalTypeGroupContextExtensions,
+			GroupContextExtensions: &GroupContextExtensions{Extensions: extensions},
+		}}
+	}
+	list := &ProposalList{
+		GCE: []CachedProposal{entry(first), entry(second)},
+		All: []CachedProposal{entry(first), entry(second)},
+	}
+	answered, ok := list.Extensions()
+	if !ok || len(answered) != 1 {
+		t.Fatalf("Extensions over a list carrying two group_context_extensions answered %v %v", answered, ok)
+	}
+	if answered[0].ExtensionType != first[0].ExtensionType {
+		t.Errorf("Extensions answered extension type %#04x, want the FIRST entry's %#04x; the index is exact and not whichever end of the slice reads the same over the one entry lists Resolve produces",
+			uint16(answered[0].ExtensionType), uint16(first[0].ExtensionType))
+	}
+}
+
+// TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped executes Resolve's default bucket
+// branch, which is unreachable over the profile this build runs.
+//
+// The branch used to carry a comment calling itself reachable. It is not: every value that
+// reaches the switch has been through checkProposalProfile, which refuses every type
+// proposalTypeProfile does not classify as accepted, and the four cases are exactly the four it
+// does. So the refusal was defensive code no test executed, and turning it into a silent drop --
+// which leaves the proposal counted in All and applied by nothing -- changed no test's answer.
+//
+// What makes it reachable is the commit that widens the accepted set, and that is what this test
+// performs: one row added to the profile table for the length of this test, which is the smallest
+// faithful model of that commit. The row is removed by the cleanup whether this passes or fails,
+// because every other test in this file derives its class off the same table.
+func TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped(t *testing.T) {
+	crypto := testCrypto(t)
+	const widened = ProposalType(0x0B0B)
+	if _, already := proposalTypeProfile[widened]; already {
+		t.Fatalf("%#04x is already classified, so this test is not modelling a widening at all", uint16(widened))
+	}
+	proposalTypeProfile[widened] = nil
+	t.Cleanup(func() { delete(proposalTypeProfile, widened) })
+
+	accepted := &Proposal{ProposalType: widened, UnknownBody: []byte{0xde, 0xad}}
+	if err := checkProposalProfile(defaultProfile(), accepted); err != nil {
+		t.Fatalf("the widened profile refused %#04x with %v, so this never reaches the bucket switch and the branch is still unobserved",
+			uint16(widened), err)
+	}
+	list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0),
+		[]ProposalOrRef{{Type: ProposalOrRefTypeProposal, Proposal: accepted}})
+	if !errors.Is(err, errUnsupportedProposalType) {
+		t.Fatalf("an accepted type with no bucket resolved with err = %v, want errUnsupportedProposalType; a proposal counted in All and put in no bucket is one the group agreed to and no member applies",
+			err)
+	}
+	if list != nil {
+		t.Errorf("the refusal answered a list as well: %+v", list)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// one value per rule, over the class this file declares
+// ---------------------------------------------------------------------------
+
+// proposalListOwnedErrors is every sentinel proposal_list.go declares, keyed by its name.
+//
+// Nothing here is trusted. TestProposalListOwnedErrorsIsEveryRefusalItsFileDeclares holds it to
+// what the file actually declares in BOTH directions, so a twelfth sentinel added with no row is
+// judged by no sweep and a row for a name the file no longer declares fails rather than outliving
+// it. This is the framing_errors.go shape, over the file ledger 30 is about.
+var proposalListOwnedErrors = map[string]error{
+	"errProfilePsk":                     errProfilePsk,
+	"errProfileReInit":                  errProfileReInit,
+	"errProfileExternalCommit":          errProfileExternalCommit,
+	"errUnsupportedProposalType":        errUnsupportedProposalType,
+	"errProposalCacheNotAProposal":      errProposalCacheNotAProposal,
+	"errProposalSenderNotMember":        errProposalSenderNotMember,
+	"errProposalCacheEpoch":             errProposalCacheEpoch,
+	"errProposalResolvedOutOfEpoch":     errProposalResolvedOutOfEpoch,
+	"errProposalNotCached":              errProposalNotCached,
+	"errDuplicateProposalReference":     errDuplicateProposalReference,
+	"errMultipleGroupContextExtensions": errMultipleGroupContextExtensions,
+}
+
+// TestProposalListOwnedErrorsIsEveryRefusalItsFileDeclares derives the class the sweep below runs
+// over rather than trusting the transcription of it.
+func TestProposalListOwnedErrorsIsEveryRefusalItsFileDeclares(t *testing.T) {
+	declared := packageSentinelTextsIn(mustParseSource(t, "proposal_list.go"))
+	if len(declared) == 0 {
+		t.Fatal("the scan found no errors.New declaration in proposal_list.go, which certainly holds several, so this gate compared the table against an empty set")
+	}
+	for _, name := range slices.Sorted(maps.Keys(declared)) {
+		if _, listed := proposalListOwnedErrors[name]; !listed {
+			t.Errorf("proposal_list.go declares %s and proposalListOwnedErrors does not list it, so no sweep judges it; add it there",
+				name)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(proposalListOwnedErrors)) {
+		if _, held := declared[name]; !held {
+			t.Errorf("proposalListOwnedErrors lists %s and proposal_list.go does not declare it, so the sweep runs over a name this file does not own",
+				name)
+		}
+	}
+}
+
+// TestEveryRefusalOfThisFileIsItsOwnValue is ledger 30 stated as a test.
+//
+// Four rules of this file once shared one error value, and errors.Is cannot tell two rules apart
+// when they answer the same one: a test asserting the broad question passes over a rule that fired
+// for the wrong reason, and a caller branching on one is answered yes by another. The message is
+// held distinct as well, because two rules reading the same sentence are indistinguishable in a
+// log even when the values differ.
+func TestEveryRefusalOfThisFileIsItsOwnValue(t *testing.T) {
+	names := slices.Sorted(maps.Keys(proposalListOwnedErrors))
+	for i, name := range names {
+		first := proposalListOwnedErrors[name]
+		if first == nil {
+			t.Fatalf("%s is nil", name)
+		}
+		if !strings.HasPrefix(first.Error(), "mls: ") {
+			t.Errorf("%s reads %q; every typed error of this package names the package it came from",
+				name, first.Error())
+		}
+		for j, other := range names {
+			if i == j {
+				continue
+			}
+			second := proposalListOwnedErrors[other]
+			if errors.Is(first, second) {
+				t.Errorf("%s answers to %s (%v), so a caller branching on the two reads one as the other",
+					name, other, first)
+			}
+			if first.Error() == second.Error() {
+				t.Errorf("%s and %s both read %q, so the two are indistinguishable in a log",
+					name, other, first.Error())
+			}
+		}
 	}
 }

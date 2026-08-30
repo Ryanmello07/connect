@@ -207,7 +207,7 @@ func providerNilMethodRows() []providerNilMethodRow {
 			return err
 		}},
 		{name: "(*ProposalCache).Resolve", call: func() error {
-			_, err := (&ProposalCache{}).Resolve(nil, 0, nil)
+			_, err := (&ProposalCache{}).Resolve(nil, nil, 0, nil)
 			return err
 		}},
 	}

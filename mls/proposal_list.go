@@ -201,6 +201,16 @@ func proposalTypeName(proposalType ProposalType) string {
 // from a reference it published twice from one belonging to an epoch that has closed, and those
 // are three different faults with three different remedies.
 //
+// errProposalCacheEpoch and errProposalResolvedOutOfEpoch are two values for what a careless
+// reading calls one rule, and they are two rules. The first is Store's: an ENTRY arrived carrying
+// an epoch other than the one this cache is holding, and the remedy is to drop that message. The
+// second is Resolve's: the cache is intact and it belongs to an epoch that has CLOSED, so the
+// commit being resolved is naming proposals the group has already applied -- a replay, whose
+// remedy is that the epoch boundary did not clear this cache and the caller that advanced it is
+// the defect. A caller told only errProposalCacheEpoch cannot tell a peer that mislabelled one
+// message from its own lifecycle failing to clear a whole cache, and ledger 30 is four rules of
+// this file sharing one value.
+//
 // Unexported, on the shape credential.go's errProfileCredentialType and this file's own
 // errProfile* take, for two reasons that are not the same reason. errProposalSenderNotMember and
 // errMultipleGroupContextExtensions stand in for names the VALIDATION plan owns -- section 12.2's
@@ -216,6 +226,7 @@ var (
 	errProposalCacheNotAProposal      = errors.New("mls: a cache entry must be a framed proposal")
 	errProposalSenderNotMember        = errors.New("mls: a cached proposal is attributed to a leaf and only a member sender occupies one")
 	errProposalCacheEpoch             = errors.New("mls: proposal does not belong to the epoch this cache holds")
+	errProposalResolvedOutOfEpoch     = errors.New("mls: a commit names a cached proposal from an epoch that has closed")
 	errProposalNotCached              = errors.New("mls: proposal reference is not cached for this epoch")
 	errDuplicateProposalReference     = errors.New("mls: a commit names one proposal reference twice")
 	errMultipleGroupContextExtensions = errors.New("mls: a proposal list carries more than one group_context_extensions proposal")
@@ -282,6 +293,14 @@ func (self *ProposalList) PathRequired() bool {
 // name. The index is therefore exact for every list this package produces. A ProposalList a
 // caller assembled by hand can still hold two, and this answers the first of them -- see the note
 // on errMultipleGroupContextExtensions.
+//
+// The hand assembled list is not a hypothetical and is why the index is held by a test of its
+// own. Every list Resolve builds carries at most one GCE, so over those lists GCE[0] and
+// GCE[len-1] are the same entry and no test that goes through Resolve can tell them apart --
+// measured: the whole suite was green with the last one answered. p7 task 7 assembles
+// ProposalList values field by field and reads this through
+// (*ProposalValidationInput).effectiveExtensions, and there the two differ.
+// TestExtensionsAnswersTheFirstOfTwoInAHandAssembledList is what separates them.
 func (self *ProposalList) Extensions() ([]Extension, bool) {
 	if len(self.GCE) == 0 {
 		return nil, false
@@ -360,36 +379,78 @@ func cloneProposal(proposal *Proposal) (Proposal, error) {
 	return copied, nil
 }
 
+// bindingHolds answers whether the group and epoch this cache is bound to are the ones named.
+//
+// ONE comparison for the two rules that ask the question, because two copies of it are two
+// places the wrong field can be compared and a reader mutating either would find the other still
+// right. Store asks it of an arriving ENTRY and Resolve asks it of the COMMIT being resolved;
+// what they share is the question and not the answer, and each keeps its own sentinel.
+//
+// crypto/subtle and not == over a string conversion. That is framing_protect.go's
+// CheckFramedContentContext one type up, comparing the same field for the same reason: this
+// package holds no comparison of octets spelled as ordinary go equality at all, and
+// TestFramingUsesConstantTimeComparison reads that off the type checked source rather than off a
+// list of comparator names -- so a string conversion is not a way around it, it is the exact
+// shape that gate was built after somebody tried.
+//
+// Both halves, and never the epoch alone: every group this client is a member of runs an epoch 7,
+// so an epoch number is not an identity. And never the group alone: that is the whole of the
+// replay this file exists to refuse.
+func (self *ProposalCache) bindingHolds(groupId []byte, epoch uint64) bool {
+	return subtle.ConstantTimeCompare(self.groupId, groupId) == 1 && self.epoch == epoch
+}
+
 // CheckEpoch refuses when this cache holds an epoch other than the one the caller is about to act
 // in.
 //
-// It exists because Resolve cannot ask the question itself. Resolve is handed a committer and a
-// ProposalOrRef vector and nothing that names an epoch, so the one place the cache sees an epoch
-// is Store -- and a cache that was never cleared after a commit goes on answering the previous
-// epoch's references to a commit of the new one, which is a REPLAY: a proposal a member published
-// and the group already applied, applied a second time under a reference that still verifies.
-// Store refuses an entry from another epoch, so the cache can only ever hold one epoch's worth;
-// what Store cannot see is an epoch that advanced with no new proposal in it.
+// It is Store's rule, stated as a method because the commit path wants to ask it before it has a
+// message to store: a cache that was never cleared after a commit still holds the previous
+// epoch's entries, and what Store cannot see on its own is an epoch that advanced with no new
+// proposal arriving in it.
 //
-// The commit path is therefore expected to call this before Resolve and Clear on every epoch
-// change. That is a rule about a CALLER and not one this type can enforce through a signature the
-// group lifecycle plan pins -- said out loud here rather than left as a comment claiming a
-// discipline nothing checks.
+// It is no longer the only thing standing between a closed epoch's proposals and a commit of the
+// new one. Resolve asks the same question of its own group context, under
+// errProposalResolvedOutOfEpoch, which is what makes the refusal a property of the RESOLUTION
+// rather than a discipline expected of a caller -- see the note there. Both remain, because they
+// answer for different callers: this one lets a lifecycle notice the boundary before it has
+// anything to resolve, and the one in Resolve is the door no commit gets past.
 //
 // An empty cache belongs to no epoch and answers nil: there is nothing in it to be stale.
 func (self *ProposalCache) CheckEpoch(groupId []byte, epoch uint64) error {
 	if len(self.byRef) == 0 {
 		return nil
 	}
-	// crypto/subtle and not == over a string conversion. That is framing_protect.go's
-	// CheckFramedContentContext one type up, comparing the same field for the same reason:
-	// this package holds no comparison of octets spelled as ordinary go equality at all, and
-	// TestFramingUsesConstantTimeComparison reads that off the type checked source rather than
-	// off a list of comparator names -- so a string conversion is not a way around it, it is
-	// the exact shape that gate was built after somebody tried.
-	if subtle.ConstantTimeCompare(self.groupId, groupId) != 1 || self.epoch != epoch {
+	if !self.bindingHolds(groupId, epoch) {
 		return fmt.Errorf("%w: the cache holds epoch %d of group %x and was asked for epoch %d of group %x",
 			errProposalCacheEpoch, self.epoch, self.groupId, epoch, groupId)
+	}
+	return nil
+}
+
+// checkResolveEpoch refuses a commit that names a cached reference while this cache belongs to
+// another epoch.
+//
+// This is the replay door, and it is Resolve's own rule rather than CheckEpoch's. A ProposalRef
+// is a hash over an AuthenticatedContent carrying the group id and the epoch, so an entry cached
+// in epoch N is a name no commit of epoch N+1 can legitimately carry -- and a cache nobody
+// cleared at the boundary answers exactly those names, which applies a proposal the group has
+// already applied under a reference every peer still verifies.
+//
+// It is asked at the lookup rather than over the whole call, so a commit that carries every
+// proposal INLINE is not refused for the state of a cache it never reads. What makes a reference
+// a replay is that it names an entry, and this is the statement in front of the only line that
+// can answer one.
+//
+// An empty cache belongs to no epoch: there is nothing in it to replay, and a reference into it
+// is answered by errProposalNotCached, which is the true account of what went wrong.
+func (self *ProposalCache) checkResolveEpoch(groupContext *GroupContext) error {
+	if len(self.byRef) == 0 {
+		return nil
+	}
+	if !self.bindingHolds(groupContext.GroupId, groupContext.Epoch) {
+		return fmt.Errorf("%w: the cache holds epoch %d of group %x and this commit is of epoch %d of group %x",
+			errProposalResolvedOutOfEpoch, self.epoch, self.groupId,
+			groupContext.Epoch, groupContext.GroupId)
 	}
 	return nil
 }
@@ -486,7 +547,7 @@ func (self *ProposalCache) Get(ref ProposalRef) (CachedProposal, bool) {
 // Resolve turns a commit's ProposalOrRef vector into one bucketed list, so that validation and
 // application have exactly one path whether the commit carried a proposal inline or by name.
 //
-// Four rules that are the cache's rather than validation's, in the order they are applied:
+// Five rules that are the cache's rather than validation's, in the order they are applied:
 //
 //  1. every entry goes through ProposalOrRef.checkArm first, which is proposal_wire.go's and is
 //     not restated here. It refuses a discriminant outside the two the registry defines, an entry
@@ -501,16 +562,39 @@ func (self *ProposalCache) Get(ref ProposalRef) (CachedProposal, bool) {
 //     GroupContextExtensions -- but those are task 7's rules over a list, and this one is about
 //     identity: a reference IS a name, and one name resolving to two entries of one list means a
 //     member's single published proposal is applied twice.
-//  4. a second GroupContextExtensions proposal is refused, which is what makes
+//  4. a reference into a cache bound to ANOTHER epoch is refused, under this cache's own
+//     errProposalResolvedOutOfEpoch and not under Store's errProposalCacheEpoch -- see
+//     checkResolveEpoch, and see the note beside the two values for why they are two.
+//  5. a second GroupContextExtensions proposal is refused, which is what makes
 //     ProposalList.Extensions exact rather than a silent choice between two extension sets.
+//
+// THE GROUP CONTEXT IS WHY RULE 4 CAN BE STATED AT ALL, and it is what this signature was
+// changed to carry. The shape the group lifecycle plan first pinned took a committer and a
+// vector and nothing that names an epoch, so this body could not ask which epoch it was
+// resolving in -- and a proposal cached in epoch N therefore resolved in epoch N+1
+// unconditionally, which is the one direction a cache must not fail. CheckEpoch existed and read
+// like the guard, but its only caller in the tree was Store, on the stored content's OWN epoch:
+// self referential for the first entry, so the binding went to whatever was stored first, and
+// what is stored first is attacker supplied. The mitigation on offer was a Clear() at the epoch
+// boundaries somebody had remembered to write down, which is an enumeration of the paths that
+// advance an epoch. A group context is what every caller of this method already holds -- Commit
+// and the inbound commit path both resolve against self.context -- so asking for it costs the
+// callers nothing and moves the refusal from a discipline to a door.
 //
 // The provider is not reached. It is in the signature because the group lifecycle plan pins it
 // there and every caller already holds one; the refusal below is what stops the parameter being a
-// promise the body does not keep.
-func (self *ProposalCache) Resolve(crypto CryptoProvider, committer LeafIndex,
-	refs []ProposalOrRef) (*ProposalList, error) {
+// promise the body does not keep. The group context is reached, at rule 4, which is the
+// difference between the two parameters and the reason only one of them needs that excuse.
+func (self *ProposalCache) Resolve(crypto CryptoProvider, groupContext *GroupContext,
+	committer LeafIndex, refs []ProposalOrRef) (*ProposalList, error) {
 	if crypto == nil {
 		return nil, fmt.Errorf("%w: resolution runs under the caller's provider", ErrNilCryptoProvider)
+	}
+	// before the vector is walked, because a resolution with no epoch to observe is the defect
+	// this parameter was added to close and answering it per entry would make an empty commit
+	// the one call that still has none.
+	if groupContext == nil {
+		return nil, fmt.Errorf("%w: resolution is refused unless it can name the epoch it runs in", ErrNilGroupContext)
 	}
 	list := &ProposalList{}
 	namedAt := map[string]int{}
@@ -533,6 +617,14 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, committer LeafIndex,
 			source = entry.Proposal
 			sender = committer
 		} else {
+			// the epoch BEFORE the lookup and before the duplicate bookkeeping. A cache
+			// belonging to a closed epoch still answers every key it holds, so the lookup
+			// below succeeds on a replayed reference and reports nothing; and a stale cache
+			// makes every reference of this vector wrong, which is a larger fault than one
+			// of them being named twice.
+			if err := self.checkResolveEpoch(groupContext); err != nil {
+				return nil, fmt.Errorf("%w: at proposal_or_ref %d", err, i)
+			}
 			key := string(entry.Reference)
 			if at, twice := namedAt[key]; twice {
 				return nil, fmt.Errorf("%w: entries %d and %d both name %x",
@@ -579,12 +671,23 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, committer LeafIndex,
 			}
 			list.GCE = append(list.GCE, cached)
 		default:
-			// reachable, and that is why it is here rather than argued away as dead. The
-			// four cases above are the four types proposalTypeProfile classifies as
-			// accepted, and a fifth accepted with no bucket beside it would otherwise be
-			// counted in All and applied by nothing.
-			// TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn derives the
-			// accepted set off that table and fails on the commit that widens it.
+			// UNREACHABLE TODAY, and the account this branch used to carry -- "reachable,
+			// and that is why it is here rather than argued away as dead" -- was false.
+			// Every value reaching this switch has been through checkProposalProfile, which
+			// refuses every type proposalTypeProfile does not classify as accepted, and the
+			// four cases above are exactly the four it does. Nothing this build can assemble
+			// arrives here. A justification comment is a claim, and that one could not be
+			// checked by anybody who did not re-derive it.
+			//
+			// It stays, and it REFUSES rather than dropping, because the commit that widens
+			// the accepted set is what makes it reachable: a fifth accepted type with no
+			// bucket beside it would be counted in All, applied by nothing, and named by no
+			// error -- a proposal the group agreed to and no member acted on.
+			// TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn fails on that
+			// commit before this line ever runs, and
+			// TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped performs the
+			// widening for the length of one test so that this line is executed rather than
+			// reasoned about.
 			return nil, fmt.Errorf("%w: %s has no bucket", errUnsupportedProposalType,
 				proposalTypeName(cached.Proposal.ProposalType))
 		}
@@ -605,8 +708,19 @@ func (self *ProposalCache) Pending() []ProposalOrRef {
 	return out
 }
 
-// Clear empties the cache and unbinds it from the epoch it was holding. Called on every epoch
-// change, which is the discipline CheckEpoch exists to make observable.
+// Clear empties the cache and unbinds it from the epoch it was holding.
+//
+// WHO CALLS IT is a derived question and not a list of call sites. Two hand written Clear()
+// calls at the epoch boundaries somebody remembered is an enumeration of the paths that advance
+// an epoch, and this project's ledger holds fourteen enumerations that understated their class.
+// TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBinding derives that
+// class off what a declaration DOES -- it writes a group context, or an epoch, into storage that
+// outlives the call -- over the same roots the crypto guardrails walk, and holds every member to
+// ending the binding through one of the methods that can.
+//
+// Clear is not the only way to end one; it is the way that ends it without starting another. A
+// method that rebound the cache to the new epoch would answer the same gate, and
+// TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere is where the two are told apart.
 func (self *ProposalCache) Clear() {
 	self.byRef = map[string]CachedProposal{}
 	self.order = nil

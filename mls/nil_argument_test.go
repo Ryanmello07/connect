@@ -400,6 +400,16 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err := NewProposalCache().Store(crypto, nil)
 			return err
 		}},
+		// the same cache's resolution, whose group context is the parameter that lets it
+		// refuse a reference cached in an epoch that has closed. It is dereferenced inside
+		// the by-reference branch of the loop, so a commit carrying nothing by reference
+		// would reach no dereference at all -- which is why the guard is up front and why
+		// this row passes an empty vector: what it observes is the refusal and not the one
+		// input shape that happens to walk past the read.
+		"(*ProposalCache).Resolve(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			_, err := NewProposalCache().Resolve(crypto, nil, LeafIndex(0), nil)
+			return err
+		}},
 		"NewCryptoProviderWithRandom(random)": {sentinel: ErrNilRandomSource, call: func(t *testing.T) error {
 			_, err := NewCryptoProviderWithRandom(CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
 			return err
