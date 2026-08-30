@@ -51,15 +51,21 @@ const (
 	extensionTypeTypeName   = "ExtensionType"
 )
 
-// extensionTypeSelectionRoots is where the rule is stated. This package's own directory and
-// ../message's, which is the scope every cross package guardrail of this package already uses,
-// and it is wider than the place the demand comes from on purpose: mls must not import message,
-// so message is where a second reader of a group context extension can be written without any
-// gate of this package noticing.
+// extensionTypeSelectionRoots is where the rule is stated: it IS forbiddenScanRoots, not a copy
+// of it. The scope is wider than the place the demand comes from on purpose -- mls must not
+// import message, so message is where a second reader of a group context extension can be
+// written without any gate of this package noticing -- and ../message declares nothing of the
+// kind today, which is not a reason to leave it out: a scope that covers only what is already
+// written is a scope that stops covering the first thing added.
 //
-// ../message declares nothing of the kind today. That is not a reason to leave it out -- a scope
-// that covers only what is already written is a scope that stops covering the first thing added.
-var extensionTypeSelectionRoots = []string{".", messagePackageDir}
+// It is an alias rather than a restatement because a restatement is not held by anything. This
+// was measured: written as []string{".", messagePackageDir}, narrowing it to []string{"."}
+// left the whole of ./mls/... ./message/... green, so the paragraph above was an argument no
+// test could lose. Narrowing forbiddenScanRoots itself FAILS TestHkdfExtractHasOnlyTwoCallSites,
+// which is G1 and predates this gate -- so borrowing that value borrows a scope something
+// already pins. Deriving the class and then writing the scope down beside it is the defect
+// ledger 21 names, and this gate was written to fix an instance of it.
+var extensionTypeSelectionRoots = forbiddenScanRoots
 
 // extensionTypeSelectionNamedAs answers whether the compiler reads a type as the named type
 // spelled name, through any number of pointers.
