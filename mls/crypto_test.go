@@ -6292,6 +6292,109 @@ func TestTheGuardThatReadsLikeATestSeamIsProductionsOwn(t *testing.T) {
 	}
 }
 
+// aDeclarationOfEachHalfOf answers one bare name the TEST BINARY of a package declares and one
+// its PRODUCTION source declares, chosen out of what the scan already read rather than written
+// out here.
+//
+// Derived, and per root, because the property below is the same at every root the guardrails
+// walk and a name typed here would be a name about one of them. Sorted keys, so the choice is
+// the same on every run rather than whichever one the map happened to hand back first.
+//
+// Bare names only. A method is spelled Type.Method and declarationFileOf resolves a bare name
+// against both shapes, so a name carrying a dot would exercise that resolver's second arm
+// rather than the per package lookup this is here to reach.
+func aDeclarationOfEachHalfOf(t *testing.T, where string, declared map[string]string) (ofTheTestBinary string, inProduction string) {
+	t.Helper()
+	for _, name := range slices.Sorted(maps.Keys(declared)) {
+		if strings.Contains(name, ".") {
+			continue
+		}
+		if strings.HasSuffix(declared[name], "_test.go") {
+			if ofTheTestBinary == "" {
+				ofTheTestBinary = name
+			}
+			continue
+		}
+		if inProduction == "" {
+			inProduction = name
+		}
+	}
+	if ofTheTestBinary == "" || inProduction == "" {
+		t.Fatalf("%s answered %q as a declaration of its test binary and %q as one of its production source; a root missing either half cannot say which of the two the reader is keyed on",
+			where, ofTheTestBinary, inProduction)
+	}
+	return ofTheTestBinary, inProduction
+}
+
+// TestTheExcuseReaderJudgesASeamAtEveryRootTheGuardrailsWalk is the composition neither of the
+// two things already holding readExcuses can state.
+//
+// The reader resolves an entry's first caller in the package the entry is ADDRESSED AT, and
+// that is what was widened this batch, from the one directory it used to read to every package
+// the guardrail scan groups. excuseExpiryControlTable states the rule over two SYNTHETIC
+// packages, so it says the reader is per package while saying nothing about the packages this
+// tree has; and packageDeclarationsAwaitingTheirFirstCaller is empty, and has to stay empty, so
+// the real table exercises the reader over nothing at all. Between them sits the join: that the
+// map declarationsOfEveryScannedPackage builds out of the real roots is one the reader can
+// address.
+//
+// Measured, which is why this exists rather than being argued for. The arrangement that ought to
+// prove the widening -- an uncalled declaration in ../message, excused by an entry naming a
+// declaration of ../message's own test binary -- was landed in the real table with the reader
+// narrowed back to one directory, and the real table's loop reported nothing at all: the entry
+// resolved to "" and took the branch marked "the caller is not written yet", which is the exact
+// silence the widening was for. Only the synthetic control failed. So on that arrangement the
+// arm saying the widening is load bearing on THIS tree was the control, and the subject was
+// judged by nothing.
+//
+// A probe closes it without landing a seam, which matters because the seam that would exercise
+// the real table is a declaration this package must not ship. Both halves at every root: a
+// reader answering cannotExpire for everything and one answering callerLanded for everything
+// each satisfy one of them, and both are derived off the same map rather than named here.
+func TestTheExcuseReaderJudgesASeamAtEveryRootTheGuardrailsWalk(t *testing.T) {
+	declared := declarationsOfEveryScannedPackage(t)
+	for _, root := range forbiddenScanRoots {
+		where := filepath.ToSlash(root)
+		ofTheTestBinary, inProduction := aDeclarationOfEachHalfOf(t, where, declared[where])
+		seam := declarationAddress(where, "aSeamNoProductionCallerWillEverReach")
+
+		// the seam's only truthful expiry, at this root: a declaration of this root's own
+		// test binary, which the expiry loop can never observe arriving
+		verdicts := readExcuses(map[string]awaitingFirstCaller{seam: {
+			firstCaller: ofTheTestBinary,
+			why:         "the seam shape, addressed at this root and naming this root's own test binary",
+		}}, declared)
+		if want := []string{seam + ": " + ofTheTestBinary + " is declared by the test binary (" +
+			declared[where][ofTheTestBinary] + ")"}; !slices.Equal(verdicts.cannotExpire, want) {
+			t.Errorf("at %s the reader answered %v as unable to expire, want %v; a seam excused at this root is one this reader is not judging, and its entry would sit in a shipped binary saying the declaration was being watched",
+				where, verdicts.cannotExpire, want)
+		}
+		if len(verdicts.unreadable) != 0 {
+			t.Errorf("at %s the reader judged the seam by nothing (%v); it holds no declarations for a package the guardrails walked, so an entry addressed there is read by neither half of the rule",
+				where, verdicts.unreadable)
+		}
+
+		// and the other half at the same address, so the answer above is about the FILE a
+		// declaration lives in rather than about the address or the spelling
+		verdicts = readExcuses(map[string]awaitingFirstCaller{seam: {
+			firstCaller: inProduction,
+			why:         "the same address, naming this root's own production source",
+		}}, declared)
+		if want := []string{seam + ": " + inProduction + " has landed in " +
+			declared[where][inProduction]}; !slices.Equal(verdicts.callerLanded, want) {
+			t.Errorf("at %s the reader answered %v as having a landed caller, want %v; the sharper expiry is what takes an entry off on the commit that lands the caller it promised, and at this root it is answering something else",
+				where, verdicts.callerLanded, want)
+		}
+		if len(verdicts.cannotExpire) != 0 {
+			t.Errorf("at %s naming a production declaration was refused as unable to expire (%v); the rule is reading the spelling of a name rather than the file it is declared in",
+				where, verdicts.cannotExpire)
+		}
+		t.Logf("%s: %s (%s) is a seam's only truthful expiry there, and %s (%s) is a landed one",
+			where, ofTheTestBinary, declared[where][ofTheTestBinary],
+			inProduction, declared[where][inProduction])
+	}
+}
+
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
 // the package directory the gate grouped a file under, then the declaration's name. It is
 // one function so the table, the sweep and the expiry check cannot spell it three ways.

@@ -729,6 +729,30 @@ func (self *KeyPackage) keyPackageTbs(w *syntax.Writer) error {
 }
 `
 
+// namesOneMoreFileAdds reads one scan's answer as a DELTA against another's: the names the
+// second answer holds that the first does not, and the names it lost, both as MULTISETS.
+//
+// Multisets and not sets, because the second assembly a control lands can carry the same
+// SPELLING as one the package under test already holds -- which is one of the two arms the
+// finding above was measured on -- and a set difference would answer "nothing added" for it
+// and report a working scan as broken.
+//
+// dropped is returned rather than dropped on the floor because it is the one thing a delta
+// cannot state on its own: a scan that answered a shorter list once another file was beside it
+// would still add the control's name, and the added half alone would pass it.
+func namesOneMoreFileAdds(without []string, with []string) (added []string, dropped []string) {
+	remaining := slices.Clone(without)
+	added = []string{}
+	for _, name := range with {
+		if at := slices.Index(remaining, name); at >= 0 {
+			remaining = slices.Delete(remaining, at, at+1)
+			continue
+		}
+		added = append(added, name)
+	}
+	return added, remaining
+}
+
 // TestTheKeyPackageSignaturePreimageIsAssembledExactlyOnce is the file header's first claim,
 // as a gate.
 //
@@ -775,15 +799,45 @@ func TestTheKeyPackageSignaturePreimageIsAssembledExactlyOnce(t *testing.T) {
 		return found
 	}
 
-	// the control, landed one file over rather than inside key_package.go
+	emitting := scan(sources)
+
+	// the control, landed one file over rather than inside key_package.go, and read as what
+	// that file ADDS rather than as the whole answer the scan gives with it in place.
+	//
+	// The whole-answer form is what this replaces, and it was measured rather than reasoned
+	// about. It compared scan(sources + control) against the one list a clean package plus the
+	// control produces, so ANY second assembly already in sources inflated that list and this
+	// control's own Fatalf fired -- ahead of the assertion below, and while reporting that
+	// whatever it read, it was "not reading a second assembly next door", which is exactly what
+	// it had just read. Both arms of the mutation were measured on it: a second assembly named
+	// keyPackageTbs answered [MarshalMLS keyPackageTbs keyPackageTbs marshalCore], and the same
+	// assembly under the non colliding name assembleSignedPrefix answered
+	// [MarshalMLS assembleSignedPrefix keyPackageTbs marshalCore]. Right verdict both times,
+	// wrong diagnostic both times, and the sentence this gate exists to print unreachable in
+	// both -- a control eating the assertion it was written to protect, and sending a reader to
+	// debug the scan rather than to delete their duplicate.
+	//
+	// A DELTA separates the control from the subject and gives up nothing the control was for.
+	// Whatever the package under test holds cancels out of both sides, so what is left states
+	// only what the scan does with the control FILE: a scan that reads one file, or narrows by
+	// a name pattern rather than by a file list, or stopped reading altogether, adds nothing
+	// and fails here. And a package carrying a real second assembly leaves this control silent
+	// and reaches the assertion below, which names it.
 	control := scan(append(slices.Clone(sources),
 		mustParseText(t, "second_assembly_control.go", keyPackageSecondAssemblyControl)))
-	if want := []string{"MarshalMLS", "keyPackageTbs", "marshalCore"}; !slices.Equal(control, want) {
-		t.Fatalf("over a package carrying a second assembly one file over, the scan read %v, want %v; whatever it reports about the real package, it is not reading a second assembly next door",
-			control, want)
+	added, dropped := namesOneMoreFileAdds(emitting, control)
+	if want := []string{"keyPackageTbs"}; !slices.Equal(added, want) {
+		t.Fatalf("landing a second assembly one file over added %v to the scan's answer for this package (%v), want %v added; the scan is not reading a second assembly next door, whatever it reports about the real package",
+			added, emitting, want)
+	}
+	// and the delta is a delta rather than a fresh reading: one more file may only ADD to the
+	// answer, and a scan whose reading of a file depends on what sits beside it is telling us
+	// nothing about either package it was handed
+	if len(dropped) != 0 {
+		t.Fatalf("landing one more file took %v out of the scan's answer for this package (%v); what this scan reads in a file depends on what is beside it, so neither of its two answers is about the package",
+			dropped, emitting)
 	}
 
-	emitting := scan(sources)
 	if want := []string{"MarshalMLS", "marshalCore"}; !slices.Equal(emitting, want) {
 		t.Errorf("this package assembles the key package encoding in %v, want %v. marshalCore is the one assembly of the signed prefix and MarshalMLS reaches it; anything else is a second opinion about what a key package signs, and two implementations of one preimage disagree by bytes the day one of them changes",
 			emitting, want)
