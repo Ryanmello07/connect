@@ -137,6 +137,16 @@ func keyScheduleIsCodecEntryPoint(name string) bool {
 // own result is not the pair either. The control below declares one of each, so an exemption
 // that widened to cover them fails there rather than in a review.
 //
+// There is a THIRD sanctioned spelling by the time p7 lands, and it is not a read side at all.
+// ParseRole maps the sdk's role NAME onto the wire byte MASTER section 11 assigns it; the
+// interface registry pins that signature, so the name is not this file's to change, and a prefix
+// rule reports it for the letters at the front of it. What is exempted is not the name: it is
+// that the declaration is handed no byte run, answers none, and names no type this package has a
+// codec for anywhere in its signature. A byte level codec has bytes on one side of it and a
+// layout on the other, and this has neither, so there is nothing for it to be a second copy OF
+// whatever somebody called it. The near miss is the same runless signature answering a structure
+// syntax.Unmarshal already decodes; the control declares it and it stays reported.
+//
 // There are TWO sanctioned read side spellings and not one, and the second is exempt on a
 // stricter reading than the first. ParseLeafKeysFrom is handed the whole Extension and answers
 // the body, so the tag is in its hands and it is the only entry point that can refuse a body
@@ -146,10 +156,32 @@ func keyScheduleIsCodecEntryPoint(name string) bool {
 // name -- what sanctions the shape is the types, not what somebody called it -- and the near
 // miss the control declares is the same shape answering a structure that is not an extension
 // body, which is a second decoder for something whose codec is syntax.Unmarshal.
-func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string, bodies []string) []string {
+func keyScheduleCodecWrappersIn(parsed parsedSource, sanctioned []string, bodies []string,
+	structures []string, byteRuns []string) []string {
+	// the types this package HAS a codec for, in every spelling a signature can name one in.
+	// A declaration that mentions one of these is laying that type out or taking it apart,
+	// which is the thing convention C1 says happens in exactly one place.
+	namesACodecType := func(rendered string) bool {
+		return slices.ContainsFunc(slices.Concat(structures, bodies), func(one string) bool {
+			return rendered == one || rendered == "*"+one ||
+				rendered == "[]"+one || rendered == "[]*"+one
+		})
+	}
 	exempt := map[string]bool{}
 	for _, one := range declaredIn(parsed) {
 		if one.receiver != "" || !strings.HasPrefix(one.name, "Parse") {
+			continue
+		}
+		// the runless half: no byte run on either side of the signature and no type this
+		// package has a codec for anywhere in it. Nothing byte level can be happening in a
+		// declaration with no bytes to read and no structure to lay out, so the prefix is
+		// all this rule ever had against it. The second clause is what keeps this off
+		// ParseGroupContextFrom, whose input is not a run either and which IS a second
+		// decoder for a structure syntax.Unmarshal owns.
+		if !slices.ContainsFunc(slices.Concat(one.params, one.results), func(rendered string) bool {
+			return keyScheduleIsByteRun(rendered, byteRuns) || namesACodecType(rendered)
+		}) {
+			exempt[one.name] = true
 			continue
 		}
 		// the bytes taking half: the name states the body it answers, and it is handed
@@ -839,6 +871,17 @@ func ParseLeafKeysFrom(ext Extension) (*LeafKeysExtension, error) { return nil, 
 // whose codec is syntax.Unmarshal. Reported.
 func ParseGroupContextFrom(ext Extension) (*GroupContext, error) { return nil, nil }
 
+// the third sanctioned spelling, which is not a read side at all: a Parse handed no byte
+// run, answering none, and naming no type this package has a codec for. ParseRole maps a
+// role NAME onto a wire byte and there is nothing byte level in it to be a second copy of.
+// Not reported.
+func ParseRole(name string) (Role, error) { return 0, nil }
+
+// and the near miss THAT exemption must not cover: the same runless signature answering a
+// structure whose codec is syntax.Unmarshal, which is a second decoder however its input
+// happens to be spelled. Reported.
+func ParseGroupContextByName(name string) (*GroupContext, error) { return nil, nil }
+
 // the near miss the exemption must not cover: an Encode that answers the body's bytes
 // instead of the Extension, which is the tag choice handed back to the caller and is the
 // whole thing the exception is written to prevent. Its Parse is a second codec like any
@@ -996,6 +1039,7 @@ var keyScheduleCodecControlWrappers = []string{
 	"ParseGroupContextAfterItsOwnHeaderIndirect",
 	"ParseGroupContextBlankingTheRefusal",
 	"ParseGroupContextByHand",
+	"ParseGroupContextByName",
 	"ParseGroupContextDroppingTheRefusal",
 	"ParseGroupContextFrom",
 	"ParseGroupContextPatchingAField",
@@ -1056,7 +1100,8 @@ func TestNoTypeOfThisPackageCarriesAByteLevelCodecOfItsOwn(t *testing.T) {
 		fields := keyScheduleStructFieldsIn(files)
 		structures := mlsStructuresIn(files, sanctioned)
 		found := slices.Concat(
-			keyScheduleCodecWrappersIn(parsed, sanctioned, extensionBodyTypesIn(files)),
+			keyScheduleCodecWrappersIn(parsed, sanctioned, extensionBodyTypesIn(files),
+				structures, packageByteSliceTypeNamesIn(parsed)),
 			keyScheduleSecondCodecsIn(parsed, structures,
 				packageByteSliceTypeNamesIn(parsed), fields),
 		)

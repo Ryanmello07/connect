@@ -2863,6 +2863,14 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	"OpenPrivateMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
 	// section 6's ValSem002 and ValSem003, on VerifyAuthenticatedContent's terms exactly.
 	"CheckFramedContentContext": "answers an error and no bytes; what it produces is a verdict",
+	// the group policy's ordering primitive and the equality derived from it. Both answer a
+	// verdict about two member ids and produce no storage at all, so the aliasing and fresh
+	// storage halves have nothing to read. The half that still runs is the one that matters for
+	// a comparator: a sort that normalised a run before comparing it, or that wrote a sentinel
+	// into one, would edit the role list of a policy the caller is about to encode into a group
+	// context and cover with a transcript hash.
+	"compareMemberIds": "answers -1, 0 or 1 and no bytes; what it produces is an ordering",
+	"sameMemberId":     "answers a bool and no bytes; what it produces is a verdict",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -3738,6 +3746,36 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 				t.Fatalf("ParseMLSMessage: %v", parseErr)
 			}
 			return [][]byte{parsed.PrivateMessage.GroupId, parsed.PrivateMessage.Ciphertext}
+		}},
+		// the urmessage_group_policy decode and the two comparisons its canonical form rests on.
+		//
+		// The decode's answers are the member id and the server id it read, which are the two
+		// byte runs it produces, and they must be COPIES: the body it is handed is an
+		// Extension.ExtensionData a caller owns and may reuse, and a policy holding windows onto
+		// it is a role list that changes after the group agreed to it. The two comparisons
+		// produce nothing and are here for the half that still runs -- neither may touch the runs
+		// it is ordering.
+		{name: "ParseGroupPolicyExtension", call: func(take func([]byte) []byte) [][]byte {
+			encoded, err := (&GroupPolicyExtension{
+				Roles:    []RoleEntry{{MemberId: []byte{0x01, 0x02}, Role: RoleOwner}},
+				ServerId: []byte("urmessage-v1-server"),
+			}).Encode()
+			if err != nil {
+				t.Fatalf("the group policy body this row decodes: %v", err)
+			}
+			policy, err := ParseGroupPolicyExtension(take(encoded.ExtensionData))
+			if err != nil {
+				t.Fatalf("ParseGroupPolicyExtension over a body it had just encoded: %v", err)
+			}
+			return [][]byte{policy.Roles[0].MemberId, policy.ServerId}
+		}},
+		{name: "compareMemberIds", call: func(take func([]byte) []byte) [][]byte {
+			compareMemberIds(take([]byte{0x01, 0x02}), take([]byte{0x01, 0x03}))
+			return nil
+		}},
+		{name: "sameMemberId", call: func(take func([]byte) []byte) [][]byte {
+			sameMemberId(take([]byte{0x01, 0x02}), take([]byte{0x01, 0x02}))
+			return nil
 		}},
 	} {
 		covered = append(covered, testCase.name)

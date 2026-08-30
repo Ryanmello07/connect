@@ -2693,6 +2693,7 @@ var extensionBodyByteRunsThatAreNotBodies = map[string]string{
 	"(*RatchetTree).TreeHash":     "answers the section 7.8 tree hash of the whole tree, which is what GroupContext.TreeHash is set from; the same argument as NodeTreeHash, and the signature is the one the key schedule and the group lifecycle plans compile against rather than one this package is free to change",
 	"(*RatchetTree).TreeHashes":   "answers the section 7.8 tree hash of every node, which is the column the tree-validation corpus publishes and the one a parent hash check reads; the same argument as the two above, one level of slicing out -- KDF.Nh octets of digest per node, and a slice of digests is no more a body than one of them is",
 	"(*RatchetTree).ParentHash":   "answers the RFC 9420 section 7.9 parent hash of one node, which is KDF.Nh octets of digest and not a ratchet_tree body; the ParentHashInput preimage the encoder assembles is hashed and discarded inside the call, and the value that leaves is the one a LeafNode.parent_hash field and a ParentNode.parent_hash field are compared against -- the same argument as the three tree hashes above, whose preimages this one is built out of",
+	"(*GroupPolicyExtension).OwnerId": "answers the OWNER'S MEMBER ID out of a group policy, which is an Ed25519 identity public key -- one FIELD read out of the structure -- and not a urmessage_group_policy body; no tag exists that would make an identity key readable as any extension of this package, and pairing it with 0xF001 produces an entry the first peer to read it refuses rather than one it misreads. It is reported for a reason the four tree hashes above share: the rule reads the RESULT, an exported method of a body type answering a byte run, and nothing a declaration scan can see says which of the type's fields the run came from. The signature is the interface registry's and this task does not own it",
 	"PskSecret":                   "answers the RFC 9420 section 8.4 psk_secret, which is KDF.Nh octets of key schedule output and not an extension body; the PSKLabel preimage it assembles is built on a Writer marshalPskLabel opens for itself and never goes through the encoder this package's extension bodies are built with. It is in this table for a MECHANICAL reason rather than a judgement about what the bytes are, and that is the difference from the four above: it entered the closure on the commit that landed (*RatchetTree).Validate, because the closure is keyed by NAME and this package now declares three unrelated methods spelled Validate -- LeafNode's, PreSharedKeyId's and the ratchet tree's -- of which only the third reaches the encoder, while PskSecret calls the second. TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse holds it to exactly that account, so the entry expires the moment the reach becomes a real one",
 }
 
@@ -2824,6 +2825,31 @@ var extensionBodyTagsToStamp = map[string]struct {
 			return err
 		},
 		refusal: ErrLeafKeysExtensionInvalid,
+	},
+	// the urmessage_group_policy body of MASTER section 6. Encode validates before it stamps,
+	// so the value built here has to be one a group could actually run: exactly one owner, a non
+	// empty member id, and a canonical role list. One entry rather than several, because what
+	// the two tests below ask about is the TAG and a longer role list costs 65536 read backs of
+	// it.
+	//
+	// The refusal is ErrMalformedExtension, which is also what this body's content refusals
+	// carry, and that is deliberate rather than a shortcut: a caller here is asking one question
+	// -- is there a group policy in this entry that I can act on -- and an entry of the wrong
+	// type answers it exactly as a role byte this profile cannot render does. The sweep below is
+	// what says nothing but 0xF001 is ACCEPTED, which is the half a shared sentinel cannot blur.
+	"GroupPolicyExtension": {
+		tag: ExtensionTypeUrmessageGroupPolicy,
+		build: func() (Extension, error) {
+			policy := &GroupPolicyExtension{
+				Roles: []RoleEntry{{MemberId: []byte("the owner"), Role: RoleOwner}},
+			}
+			return policy.Encode()
+		},
+		readBack: func(ext Extension) error {
+			_, err := ParseGroupPolicyFrom(ext)
+			return err
+		},
+		refusal: ErrMalformedExtension,
 	},
 	// the ratchet_tree body of RFC 9420 section 12.4.3.3, whose Encode is the raised limit
 	// encode with the tag stamped on. One occupied leaf and nothing else, because what the

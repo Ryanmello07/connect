@@ -661,6 +661,11 @@ var decoderPublishOrder = []string{
 	"framing.go: (*SenderData).UnmarshalMLS stages",
 	"framing_preimage.go: (*confirmedTranscriptHashInput).UnmarshalMLS stages",
 	"group_context.go: (*GroupContext).UnmarshalMLS stages",
+	// the urmessage_group_policy body. It STAGES: every field is read into a local, the whole
+	// value is assembled and validated, and only then is it assigned to the receiver -- so a
+	// decode that refuses a non canonical role list leaves the caller's policy as it was rather
+	// than holding half of two.
+	"group_policy.go: (*GroupPolicyExtension).UnmarshalMLS stages",
 	"key_package.go: (*KeyPackage).UnmarshalMLS stages",
 	"leaf_node.go: (*LeafNode).UnmarshalMLS stages",
 	// Proposal is FramedContent's arrangement for FramedContent's reason, one layer down: the

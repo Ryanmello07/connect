@@ -655,6 +655,20 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"framing_protect.go: syntax.NewReader(plaintext)",
 		"framing_protect.go: syntax.NewWriter()",
 		"framing_protect.go: syntax.Unmarshal(plaintext, senderData)",
+		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure
+		// encode its Encode reaches, and the decode both Parse entry points reach. All six at the
+		// default limit and none at the ratchet tree one, and here that is the strictest reading
+		// in the package rather than a capacity argument. This body sits in the GROUP CONTEXT, so
+		// its bytes are inside the confirmed transcript hash: a role list allowed past
+		// MaxVectorLength is one no peer running the default limit could have encoded or decoded,
+		// which is not a rejected message but a permanent fork, and the group is capped at
+		// MaxGroupMembers entries anyway, three orders of magnitude below the bound.
+		"group_policy.go: syntax.Marshal(self)",
+		"group_policy.go: syntax.ReadVector(r, readOneDisappearingBucket)",
+		"group_policy.go: syntax.ReadVector(r, readOneRoleEntry)",
+		"group_policy.go: syntax.Unmarshal(data, policy)",
+		"group_policy.go: syntax.WriteVector(w, self.DisappearingBuckets, writeOneDisappearingBucket)",
+		"group_policy.go: syntax.WriteVector(w, self.Roles, writeOneRoleEntry)",
 		// the RFC 9420 section 5.2 KeyPackageRef, which is RefHash over the whole encoded
 		// key package rather than over the prefix its signature covers. The default limit
 		// and not the ratchet tree one: a key package is one joiner's advertisement, every

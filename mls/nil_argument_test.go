@@ -521,6 +521,15 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		"CheckSenderLeaf(leafOccupied)": {sentinel: errNilLeafOccupancyTest, call: func(t *testing.T) error {
 			return CheckSenderLeaf(Sender{SenderType: SenderTypeMember, LeafIndex: 1}, nil)
 		}},
+		// the group lifecycle's leaf keys accessor. A nil leaf is refused rather than
+		// dereferenced, and the sentinel is the one the lifecycle asks this question with:
+		// "there is no urmessage_leaf_keys here" is the same answer for a leaf that is not
+		// there as for a leaf that carries no such extension, and a caller repairs both the
+		// same way -- by not wrapping an epoch secret to that device.
+		"LeafKeysOf(leaf)": {sentinel: ErrMalformedExtension, call: func(t *testing.T) error {
+			_, err := LeafKeysOf(nil)
+			return err
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)
