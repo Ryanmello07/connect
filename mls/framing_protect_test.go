@@ -4612,15 +4612,42 @@ func framingPrivateContentsOfEveryType(t *testing.T) map[ContentType]*FramedCont
 	return built
 }
 
-// framingPrivatePaddingLengths is the padding lengths every sweep below runs over.
+// framingPrivatePaddingLengths is the padding lengths the sweeps that are QUADRATIC in the
+// length run over -- the ones that tamper once per octet and read the whole tail each time.
 //
 // The ladder is derived off the widths the wire gives a length rather than sampled in the middle,
 // which is the rule p4's nonce reuse at 2^32 was missed by. 255, 256 and 257 straddle the octet
 // boundary a length-prefixed decoder would carry, and 1024 is past anything a hand written
 // constant in a padding check is likely to have been sized for.
+//
+// It stops at 1025 for a reason that is about cost and not about the class: at 2^17 octets a
+// per octet sweep is seventeen billion byte reads. The lengths past the 16 bit boundary are
+// framingPrivateWidePaddingLengths, and every sweep that is linear in the length runs over
+// that one instead.
 func framingPrivatePaddingLengths() []int {
 	lengths := []int{0, 1, 2, 3}
 	for bits := 4; bits <= 10; bits++ {
+		lengths = append(lengths, (1<<bits)-1, 1<<bits, (1<<bits)+1)
+	}
+	slices.Sort(lengths)
+	return slices.Compact(lengths)
+}
+
+// framingPrivateWidePaddingLengths carries the same ladder past the 16 bit boundary.
+//
+// It is a second function rather than more rungs on the first because the sweeps below split by
+// COST and not by taste. The per octet refusal is QUADRATIC in the padding length -- one tamper
+// per octet, each of them read over the whole tail -- so 2^17 octets of it is seventeen billion
+// byte reads and a package that takes a minute becomes one that takes an hour. Every sweep that
+// is linear in the length runs over this ladder instead, so no test in this file stops at 1025
+// for a reason no rule states.
+//
+// What the extra rungs are for: the padding tail carries no length prefix of its own, so the only
+// widths that could matter to it are the ones a length would be ENCODED in if somebody added one,
+// and 2^16 is the one this file could not previously reach.
+func framingPrivateWidePaddingLengths() []int {
+	lengths := framingPrivatePaddingLengths()
+	for bits := 11; bits <= 17; bits++ {
 		lengths = append(lengths, (1<<bits)-1, 1<<bits, (1<<bits)+1)
 	}
 	slices.Sort(lengths)
@@ -4647,7 +4674,7 @@ func TestPrivateMessageContentRoundTripsEveryPaddingLengthAtEveryContentType(t *
 		if err != nil {
 			t.Fatalf("content type %d: marshal unpadded: %v", contentType, err)
 		}
-		for _, paddingSize := range framingPrivatePaddingLengths() {
+		for _, paddingSize := range framingPrivateWidePaddingLengths() {
 			plaintext, err := marshalPrivateMessageContent(content, auth, paddingSize)
 			if err != nil {
 				t.Fatalf("content type %d padding %d: marshal: %v", contentType, paddingSize, err)
@@ -4797,6 +4824,312 @@ func TestPrivateMessageContentRefusesEveryNonZeroOctetValue(t *testing.T) {
 	}
 }
 
+// framingByteFold is one accumulator a padding check could be written as, together with the
+// operator that spells it.
+type framingByteFold struct {
+	name string
+	fold func(accumulated byte, next byte) byte
+}
+
+// framingCancellingByteFolds derives the accumulators the tail sweep below is about: the binary
+// operators the language defines over a byte, filtered to the ones that already refuse a LONE
+// non-zero octet.
+//
+// Derived off the operator set rather than off the operators that occurred to the author, which
+// is this project's rule and is here because the defect this exists for is ONE CHARACTER:
+// accumulated |= b becoming accumulated ^= b. Every operator listed is one such edit away from
+// the one the package ships, and the list is the language's rather than a guess at which edits
+// are likely.
+//
+// The filter is what makes the family the right one. A fold whose zero is ABSORBING -- and, and
+// not, multiply, and both shifts -- accepts a tail of a single non-zero octet and is therefore
+// already failed by TestPrivateMessageContentRefusesEveryNonZeroOctetValue; carrying it here
+// would restate that test rather than add to it. What survives is exactly the family that agrees
+// with or on every one octet tail and disagrees with it somewhere above one octet, which is the
+// blind spot the single octet sweeps have.
+func framingCancellingByteFolds(t *testing.T) []framingByteFold {
+	t.Helper()
+	candidates := []framingByteFold{
+		{name: "or", fold: func(accumulated byte, next byte) byte { return accumulated | next }},
+		{name: "xor", fold: func(accumulated byte, next byte) byte { return accumulated ^ next }},
+		{name: "and", fold: func(accumulated byte, next byte) byte { return accumulated & next }},
+		{name: "andnot", fold: func(accumulated byte, next byte) byte { return accumulated &^ next }},
+		{name: "add", fold: func(accumulated byte, next byte) byte { return accumulated + next }},
+		{name: "subtract", fold: func(accumulated byte, next byte) byte { return accumulated - next }},
+		{name: "multiply", fold: func(accumulated byte, next byte) byte { return accumulated * next }},
+		{name: "shift left", fold: func(accumulated byte, next byte) byte { return accumulated << (next & 7) }},
+		{name: "shift right", fold: func(accumulated byte, next byte) byte { return accumulated >> (next & 7) }},
+	}
+	kept := []framingByteFold{}
+	for _, candidate := range candidates {
+		refusesEverySingle := true
+		for value := 1; value <= int(^uint8(0)); value += 1 {
+			if candidate.fold(0, byte(value)) == 0 {
+				refusesEverySingle = false
+			}
+		}
+		if refusesEverySingle {
+			kept = append(kept, candidate)
+		}
+	}
+	if len(kept) < 2 {
+		t.Fatalf("the derived fold family holds %d accumulators, so a sweep over it says nothing about any fold but the one this package ships",
+			len(kept))
+	}
+	return kept
+}
+
+// framingCovertPayload is one shape the data an attacker hides in the padding comes in.
+type framingCovertPayload struct {
+	what string
+	at   func(at int) byte
+}
+
+// framingCovertPayloads is those shapes: a repeated octet, a counter, and text.
+//
+// Every one of them is non-zero at every position, so a tail built from one is non-zero wherever
+// the closing octet lands. Three shapes rather than one because a payload of a single repeated
+// value cancels under folds a varying one does not, and the reverse.
+func framingCovertPayloads() []framingCovertPayload {
+	covert := []byte("this octet is not padding")
+	return []framingCovertPayload{
+		{what: "one repeated octet", at: func(int) byte { return 0x01 }},
+		{what: "a counter", at: func(at int) byte { return byte(at%int(^uint8(0))) + 1 }},
+		{what: "text", at: func(at int) byte { return covert[at%len(covert)] }},
+	}
+}
+
+// framingFoldingPaddingTail builds the tail a member writes when the receiver's padding check
+// FOLDS: payload in the leading octets and one closing octet chosen so the fold comes back to
+// zero.
+//
+// This is the attack itself rather than a model of it. A member that wants a covert channel
+// writes whatever it likes into the first n-1 octets and then picks the last one to satisfy
+// whatever the receiver accumulates -- so the closing octet is found by SEARCHING the byte range
+// here rather than by inverting the fold, which keeps it correct for whatever the derived family
+// holds instead of for the two folds an author can invert in their head.
+//
+// It answers false when the fold admits no closing octet, and that is the honest answer for the
+// bitwise or: there is no non-zero tail an or accumulator folds to zero, which is the whole
+// reason it is the accumulator this package ships. The caller counts what it built rather than
+// treating false as a skip, so a family that had quietly gone uncancellable fails instead of
+// passing vacuously.
+func framingFoldingPaddingTail(length int, fold func(byte, byte) byte, payload func(int) byte) ([]byte, bool) {
+	if length < 1 {
+		return nil, false
+	}
+	tail := make([]byte, length)
+	var accumulated byte
+	for at := range length - 1 {
+		tail[at] = payload(at)
+		accumulated = fold(accumulated, tail[at])
+	}
+	for closing := 0; closing <= int(^uint8(0)); closing += 1 {
+		if fold(accumulated, byte(closing)) != 0 {
+			continue
+		}
+		tail[length-1] = byte(closing)
+		if slices.Max(tail) == 0 {
+			// an all zero tail is legal padding and not the attack
+			continue
+		}
+		return tail, true
+	}
+	return nil, false
+}
+
+// framingPaddingPositions derives the octets of a tail a sparse tamper is placed at: every one of
+// them while the whole set is small, and otherwise the two ends, the middle, and the octets
+// either side of every boundary a length would be encoded across.
+//
+// Bounded on purpose, and the bound is why it is derived rather than exhaustive: every pair of
+// every position of a 2^17 octet tail is eight billion tampers. What the pairs are FOR is the
+// position axis -- the value axis is covered exhaustively at length two by the sweep below -- and
+// the boundaries are where offset arithmetic written against a narrower length goes wrong.
+func framingPaddingPositions(length int) []int {
+	if length <= 16 {
+		positions := make([]int, length)
+		for at := range length {
+			positions[at] = at
+		}
+		return positions
+	}
+	positions := []int{0, 1, length/2 - 1, length / 2, length - 2, length - 1}
+	for bits := 8; bits < 32; bits += 8 {
+		positions = append(positions, (1<<bits)-1, 1<<bits)
+	}
+	slices.Sort(positions)
+	positions = slices.Compact(positions)
+	inside := []int{}
+	for _, at := range positions {
+		if 0 <= at && at < length {
+			inside = append(inside, at)
+		}
+	}
+	return inside
+}
+
+// framingPaddingPositionPairs is every pair of those positions.
+func framingPaddingPositionPairs(length int) [][2]int {
+	positions := framingPaddingPositions(length)
+	pairs := [][2]int{}
+	for i := range positions {
+		for j := i + 1; j < len(positions); j += 1 {
+			pairs = append(pairs, [2]int{positions[i], positions[j]})
+		}
+	}
+	return pairs
+}
+
+// framingCancellingOctetPairs derives one two octet tail per fold that that fold accumulates to
+// zero, by searching the byte square rather than by writing the pairs down.
+//
+// One representative per fold rather than all of them, because the axes are separated on purpose:
+// every value a two octet tail can hold is visited exhaustively by the whole space sweep below,
+// and what this set is spent on is the POSITION axis, which the whole space sweep cannot reach.
+func framingCancellingOctetPairs(folds []framingByteFold) [][2]byte {
+	seen := map[[2]byte]bool{}
+	found := [][2]byte{}
+	for _, fold := range folds {
+		for first := 1; first <= int(^uint8(0)); first += 1 {
+			closed := false
+			for second := 1; second <= int(^uint8(0)); second += 1 {
+				if fold.fold(fold.fold(0, byte(first)), byte(second)) != 0 {
+					continue
+				}
+				pair := [2]byte{byte(first), byte(second)}
+				if !seen[pair] {
+					seen[pair] = true
+					found = append(found, pair)
+				}
+				closed = true
+				break
+			}
+			if closed {
+				break
+			}
+		}
+	}
+	return found
+}
+
+// TestPrivateMessageContentRefusesEveryNonZeroPaddingTailNotOnlyTheSingleOctetOnes is the half of
+// ValSem011 the per octet and per value sweeps above cannot reach.
+//
+// Both of those set exactly ONE padding octet non-zero, so the accumulator that decides the
+// refusal is only ever handed a single non-zero byte -- and every fold agrees with every other
+// fold on a tail like that. Measured: with the accumulator folding by xor instead of by or, the
+// whole of ./mls/... and ./message/... stayed green while a tail of eight octets with two of them
+// set to 0x41 went from refused to ACCEPTED. That is the covert channel ValSem011 exists to
+// close, reopened by one character and invisible to every test in the package.
+//
+// The class is the TAIL and not the octet, and it is attacked from three sides.
+//
+// The whole space, at the lengths whose whole space fits: every non-zero tail of one octet and
+// every non-zero tail of two. That is exhaustive rather than derived -- the only sweep in this
+// file that can be -- and a fold has nowhere in those two lengths to hide, which is what pins the
+// VALUE axis for the two sweeps under it.
+//
+// The attack itself, at every length the wide ladder reaches: n-1 octets of payload and one
+// closing octet chosen so the fold returns to zero. That is what a member with a covert channel
+// actually writes, and every octet of the tail but one carries data.
+//
+// And the sparse version of the same thing: two non-zero octets with the rest of the tail zero,
+// at position pairs derived off the length, which is the axis the exhaustive sweep cannot reach.
+func TestPrivateMessageContentRefusesEveryNonZeroPaddingTailNotOnlyTheSingleOctetOnes(t *testing.T) {
+	crypto := newTestCrypto(t)
+	folds := framingCancellingByteFolds(t)
+	cancelling := framingCancellingOctetPairs(folds)
+	// the refusal is checked without formatting anything, because the exhaustive half runs it
+	// two hundred thousand times per content type and a Sprintf per iteration costs more than
+	// the decoder under it does
+	check := func(plaintext []byte, header *PrivateMessage, sender Sender) error {
+		content, auth, err := unmarshalPrivateMessageContent(plaintext, header, sender)
+		if !errors.Is(err, errNonZeroPadding) {
+			return fmt.Errorf("got %v, want errNonZeroPadding", err)
+		}
+		if content != nil || auth != nil {
+			return errors.New("refused and answered a content or an auth data alongside")
+		}
+		return nil
+	}
+
+	exhaustive, closed, sparse := 0, 0, 0
+	for contentType, content := range framingPrivateContentsOfEveryType(t) {
+		auth := framingPrivateAuthFor(t, crypto, contentType)
+		header := framingPrivateHeaderFor(content)
+		body, err := marshalPrivateMessageContent(content, auth, 0)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+
+		one := append(append([]byte(nil), body...), 0)
+		for value := 1; value <= int(^uint8(0)); value += 1 {
+			one[len(body)] = byte(value)
+			if err := check(one, header, content.Sender); err != nil {
+				t.Fatalf("content type %d, the one octet tail %#02x: %v", contentType, value, err)
+			}
+			exhaustive += 1
+		}
+		two := append(append([]byte(nil), body...), 0, 0)
+		for first := 0; first <= int(^uint8(0)); first += 1 {
+			for second := 0; second <= int(^uint8(0)); second += 1 {
+				if first == 0 && second == 0 {
+					continue
+				}
+				two[len(body)], two[len(body)+1] = byte(first), byte(second)
+				if err := check(two, header, content.Sender); err != nil {
+					t.Fatalf("content type %d, the two octet tail %#02x %#02x: %v",
+						contentType, first, second, err)
+				}
+				exhaustive += 1
+			}
+		}
+
+		for _, paddingSize := range framingPrivateWidePaddingLengths() {
+			if paddingSize < 2 {
+				continue
+			}
+			for _, fold := range folds {
+				for _, payload := range framingCovertPayloads() {
+					tail, built := framingFoldingPaddingTail(paddingSize, fold.fold, payload.at)
+					if !built {
+						continue
+					}
+					plaintext := append(append([]byte(nil), body...), tail...)
+					if err := check(plaintext, header, content.Sender); err != nil {
+						t.Fatalf("content type %d, %d octets of padding carrying %s and closed under %s: %v",
+							contentType, paddingSize, payload.what, fold.name, err)
+					}
+					closed += 1
+				}
+			}
+
+			plaintext := append(append([]byte(nil), body...), make([]byte, paddingSize)...)
+			tail := plaintext[len(body):]
+			for _, at := range framingPaddingPositionPairs(paddingSize) {
+				for _, values := range cancelling {
+					tail[at[0]], tail[at[1]] = values[0], values[1]
+					if err := check(plaintext, header, content.Sender); err != nil {
+						t.Fatalf("content type %d, %d octets of padding with %#02x at %d and %#02x at %d: %v",
+							contentType, paddingSize, values[0], at[0], values[1], at[1], err)
+					}
+					tail[at[0]], tail[at[1]] = 0, 0
+					sparse += 1
+				}
+			}
+		}
+	}
+	if closed == 0 {
+		t.Fatal("no fold in the derived family admitted a tail that closes, so the sweep over the attack ran nothing")
+	}
+	if sparse == 0 {
+		t.Fatal("no cancelling octet pair was derived, so the sweep over the position axis ran nothing")
+	}
+	t.Logf("%d tails over the whole space at one and two octets, %d tails closed under a folding accumulator, %d sparse cancelling pairs",
+		exhaustive, closed, sparse)
+}
+
 // TestPrivateMessageContentPaddingRefusalNamesNoPositionOrValue is the oracle half of ValSem011.
 //
 // A padding decoder that says WHICH octet offended answers, for every position, the question "were
@@ -4860,7 +5193,7 @@ func TestPrivateMessageContentAcceptsEveryAllZeroPaddingLength(t *testing.T) {
 		if err != nil {
 			t.Fatalf("content type %d: marshal: %v", contentType, err)
 		}
-		for _, paddingSize := range framingPrivatePaddingLengths() {
+		for _, paddingSize := range framingPrivateWidePaddingLengths() {
 			// assembled here rather than through the encoder, so this states that the
 			// DECODER accepts a peer's padding and not merely that it accepts its own
 			peer := append(append([]byte(nil), body...), make([]byte, paddingSize)...)
@@ -5404,6 +5737,161 @@ func framingBoundaryGenerations() []uint32 {
 	return slices.Compact(found)
 }
 
+// framingOrderingsOf derives every ordering of n things, by insertion rather than from a table.
+//
+// It exists so the AAD test below can state which ordering of section 6.3.1's fields the code
+// actually used, out of all of them, rather than comparing against the one wrong ordering the
+// author thought of.
+func framingOrderingsOf(n int) [][]int {
+	if n <= 0 {
+		return [][]int{{}}
+	}
+	orderings := [][]int{}
+	for _, shorter := range framingOrderingsOf(n - 1) {
+		for at := 0; at <= len(shorter); at += 1 {
+			ordering := append([]int{}, shorter[:at]...)
+			ordering = append(ordering, n-1)
+			ordering = append(ordering, shorter[at:]...)
+			orderings = append(orderings, ordering)
+		}
+	}
+	return orderings
+}
+
+// TestThePrivateMessageContentSealIsTheSectionSixThreeOneConstructionAndNotOnlyItsOwnInverse is
+// the content half of what the sender data seal already has.
+//
+// Nothing round trips through an AAD. It is never compared against a peer's, so the seal and the
+// open agree with each other by construction whatever they compute, and a whole family of wrong
+// constructions is invisible from every symmetry property in this package: a length prefix in
+// front of the header, a field written twice, the two opaque fields exchanged. Measured: with
+// group_id and authenticated_data swapped at BOTH call sites -- the seal's and the open's -- the
+// whole of ./mls/... and ./message/... stayed green. The asymmetric version of that edit is
+// caught by the round trip; the symmetric one is exactly what a round trip is blind to, and it is
+// permanent interop divergence rather than a bug that shows up locally.
+//
+// What is compared is not "the aad the code computes" against one alternative, but WHICH ORDERING
+// of section 6.3.1's four fields the recorded aad is, out of all twenty four of them. That is the
+// derived class: any argument order mistake among the four lands on one of the twenty three wrong
+// orderings, and the failure names the ordering it found instead of printing two hex strings at a
+// reader.
+//
+// The header is given a group_id and an authenticated_data of different values AND different
+// lengths on purpose. At a header whose two opaque fields are equal the swap is invisible, so a
+// fixture that happened to make them equal would be a test that passed under the mutation it is
+// named for -- which is why the twenty four encodings are asserted distinct before anything is
+// compared to them.
+func TestThePrivateMessageContentSealIsTheSectionSixThreeOneConstructionAndNotOnlyItsOwnInverse(t *testing.T) {
+	inner := newTestCrypto(t)
+	for contentType, content := range framingPrivateContentsOfEveryType(t) {
+		content.GroupId = []byte("section 6.3.1 group id")
+		content.AuthenticatedData = []byte("aad")
+		signed := framingPrivateSignedContent(t, inner, content)
+
+		// the four fields of PrivateContentAAD, in the order RFC 9420 section 6.3.1 writes
+		// them, assembled here rather than borrowed from the code under test
+		fields := []struct {
+			name  string
+			write func(w *syntax.Writer)
+		}{
+			{name: "group_id", write: func(w *syntax.Writer) { w.WriteOpaque(content.GroupId) }},
+			{name: "epoch", write: func(w *syntax.Writer) { w.WriteUint64(content.Epoch) }},
+			{name: "content_type", write: func(w *syntax.Writer) { w.WriteUint8(uint8(content.ContentType)) }},
+			{name: "authenticated_data", write: func(w *syntax.Writer) { w.WriteOpaque(content.AuthenticatedData) }},
+		}
+		orderings := framingOrderingsOf(len(fields))
+		orderingOf := map[string]string{}
+		sectionOrder := ""
+		for _, ordering := range orderings {
+			w := syntax.NewWriter()
+			names := []string{}
+			for _, at := range ordering {
+				fields[at].write(w)
+				names = append(names, fields[at].name)
+			}
+			encoded, err := w.Bytes()
+			if err != nil {
+				t.Fatalf("content type %d: the %s ordering: %v", contentType, strings.Join(names, " "), err)
+			}
+			if previous, clash := orderingOf[string(encoded)]; clash {
+				t.Fatalf("content type %d: the orderings %q and %q encode identically, so this fixture cannot separate them",
+					contentType, previous, strings.Join(names, " "))
+			}
+			orderingOf[string(encoded)] = strings.Join(names, " ")
+			if slices.IsSorted(ordering) {
+				sectionOrder = strings.Join(names, " ")
+			}
+		}
+		if len(orderingOf) != len(orderings) || sectionOrder == "" {
+			t.Fatalf("content type %d: %d distinct encodings over %d orderings, section 6.3.1's is %q",
+				contentType, len(orderingOf), len(orderings), sectionOrder)
+		}
+
+		recording := framingRecordingProvider(inner)
+		message, err := SealPrivateMessage(recording, framingPinnedKeySource(inner, 0x01, 9),
+			signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("content type %d: seal: %v", contentType, err)
+		}
+		// the content is sealed first and the sender data second, which is the order section
+		// 6.3.2 forces: the sender data key is derived from the content ciphertext
+		if len(recording.seals) != 2 {
+			t.Fatalf("content type %d: the seal made %d aead calls, want the content's and the sender data's",
+				contentType, len(recording.seals))
+		}
+		sealedUnder, known := orderingOf[string(recording.seals[0].aad)]
+		if !known {
+			t.Fatalf("content type %d: the content was sealed under %x, which is no ordering of section 6.3.1's four fields at all",
+				contentType, recording.seals[0].aad)
+		}
+		if sealedUnder != sectionOrder {
+			t.Fatalf("content type %d: the content was sealed under the fields in the order %q; section 6.3.1 is %q",
+				contentType, sealedUnder, sectionOrder)
+		}
+
+		// and the sender data is sealed under section 6.3.2's three fields rather than this
+		// one's four, which is the confusion two AADs side by side invites
+		senderAAD, err := senderDataAAD(content.GroupId, content.Epoch, content.ContentType)
+		if err != nil {
+			t.Fatalf("content type %d: the section 6.3.2 aad: %v", contentType, err)
+		}
+		if !bytes.Equal(recording.seals[1].aad, senderAAD) {
+			t.Fatalf("content type %d: the sender data was sealed under %x and section 6.3.2's aad is %x",
+				contentType, recording.seals[1].aad, senderAAD)
+		}
+		if bytes.Equal(recording.seals[0].aad, recording.seals[1].aad) {
+			t.Fatalf("content type %d: both seals used one aad, so this row cannot separate the two constructions",
+				contentType)
+		}
+
+		// the OPEN computes the same construction. An order mistake present on one side alone
+		// is caught by the round trip; this is what says the two sides agree on section 6.3.1
+		// rather than merely on each other.
+		opening := framingRecordingProvider(inner)
+		if _, err := OpenPrivateMessage(opening, framingPinnedKeySource(inner, 0x01, 9),
+			signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext); err != nil {
+			t.Fatalf("content type %d: open: %v", contentType, err)
+		}
+		if len(opening.opens) != 2 {
+			t.Fatalf("content type %d: the open made %d aead calls, want the sender data's and the content's",
+				contentType, len(opening.opens))
+		}
+		if !bytes.Equal(opening.opens[0].aad, senderAAD) {
+			t.Fatalf("content type %d: the sender data was opened under %x and section 6.3.2's aad is %x",
+				contentType, opening.opens[0].aad, senderAAD)
+		}
+		openedUnder, known := orderingOf[string(opening.opens[1].aad)]
+		if !known {
+			t.Fatalf("content type %d: the content was opened under %x, which is no ordering of section 6.3.1's four fields at all",
+				contentType, opening.opens[1].aad)
+		}
+		if openedUnder != sectionOrder {
+			t.Fatalf("content type %d: the content was opened under the fields in the order %q; section 6.3.1 is %q",
+				contentType, openedUnder, sectionOrder)
+		}
+	}
+}
+
 // TestSealPrivateMessageSealsUnderTheGuardedNonceAtEveryBoundaryGeneration is the reuse guard's
 // contract read off the AEAD call itself.
 //
@@ -5478,12 +5966,25 @@ func TestSealPrivateMessageSealsUnderTheGuardedNonceAtEveryBoundaryGeneration(t 
 }
 
 // TestSealPrivateMessageNeverRepeatsAContentNonceAcrossGenerations is the nonce reuse property
-// itself, over the boundary ladder.
+// itself, over the boundary ladder, and it is in two halves because one instrument cannot hold
+// both of them.
 //
 // A repeated (key, nonce) pair over two different plaintexts is a total loss of confidentiality for
 // both under a stream cipher AEAD, and it is the failure p4 shipped one rung down. What is compared
 // is the PAIR: a source that varied the key and reused the nonce, and one that varied the nonce and
 // reused the key, are both caught, and so is a seal that ignored one of the two.
+//
+// The first half runs over framingPinnedKeySource, and what it holds is the PASS THROUGH. That
+// source feeds all four octets of the generation into ExpandWithLabel, so its nonces are distinct
+// across generations by construction, and the distinctness the loop observes is the instrument's
+// rather than the subject's. It is worth running -- a seal that derived a nonce of its own, or that
+// reused the last message's, fails it -- but on its own the name would overclaim.
+//
+// The second half is where the name is earned. It reads the nonce off a REAL secret tree at each
+// boundary generation, holds those pairwise distinct, and then holds the seal's own nonce to be
+// exactly that one guarded by the reuse guard the message published. Distinct ratchet nonces plus a
+// seal that uses them is what "no nonce repeats" means on the wire. The ratchet's half of it is
+// DeriveTreeSecret(secret, "nonce", generation, ...) one layer down, held there and by its vectors.
 func TestSealPrivateMessageNeverRepeatsAContentNonceAcrossGenerations(t *testing.T) {
 	inner := newTestCrypto(t)
 	signed := framingPrivateSignedMember(t)
@@ -5509,6 +6010,61 @@ func TestSealPrivateMessageNeverRepeatsAContentNonceAcrossGenerations(t *testing
 	}
 	if len(seenPair) != len(framingBoundaryGenerations()) {
 		t.Fatalf("the sweep recorded %d pairs over %d generations", len(seenPair), len(framingBoundaryGenerations()))
+	}
+
+	// and the same property against the real ratchet, which is the half the loop above cannot
+	// state. The maps are separate because the two halves draw from different key sources, so a
+	// collision between them would mean nothing.
+	leaf := signed.authContent.Content.Sender.LeafIndex
+	contentType := signed.authContent.Content.ContentType
+	seenRatchet := map[string]uint32{}
+	seenBare := map[string]uint32{}
+	seenSealed := map[string]uint32{}
+	for _, generation := range framingBoundaryGenerations() {
+		recording := framingRecordingProvider(inner)
+		sender := framingSecretTreeAt(t, inner, leaf, contentType, generation)
+		lookup := framingSecretTreeAt(t, inner, leaf, contentType, generation)
+		message, err := SealPrivateMessage(recording, sender, signed.senderDataSecret,
+			signed.authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("generation %d: seal through the real tree: %v", generation, err)
+		}
+		key, nonce, err := lookup.MessageKey(contentType, leaf, generation)
+		if err != nil {
+			t.Fatalf("generation %d: the ratchet's own key: %v", generation, err)
+		}
+		pair := string(key) + "|" + string(nonce)
+		if previous, repeated := seenRatchet[pair]; repeated {
+			t.Fatalf("the ratchet answers the same key and nonce at generation %d as at generation %d",
+				generation, previous)
+		}
+		seenRatchet[pair] = generation
+		// and the NONCE on its own, not only the pair. A ratchet that varied the key and held
+		// the nonce still where it was is safe against this AEAD -- a nonce is only reused
+		// under one key -- and is a different nonce from the one every peer derives for that
+		// generation, which is silent interop divergence rather than a broken open. Measured:
+		// with the generation dropped from DeriveTreeSecret(secret, "nonce", ...) the pair
+		// above still separates every generation.
+		if previous, repeated := seenBare[string(nonce)]; repeated {
+			t.Fatalf("the ratchet answers the same nonce at generation %d as at generation %d",
+				generation, previous)
+		}
+		seenBare[string(nonce)] = generation
+		senderData := framingSenderDataOf(t, inner, signed.senderDataSecret, message)
+		guarded := applyReuseGuard(nonce, senderData.ReuseGuard)
+		if !bytes.Equal(recording.seals[0].nonce, guarded) {
+			t.Fatalf("generation %d: the content was sealed under %x and the ratchet nonce guarded by the published guard is %x",
+				generation, recording.seals[0].nonce, guarded)
+		}
+		if previous, repeated := seenSealed[string(recording.seals[0].nonce)]; repeated {
+			t.Fatalf("generation %d seals under the same nonce as generation %d through the real tree",
+				generation, previous)
+		}
+		seenSealed[string(recording.seals[0].nonce)] = generation
+	}
+	if len(seenRatchet) != len(framingBoundaryGenerations()) || len(seenBare) != len(seenRatchet) {
+		t.Fatalf("the real tree answered %d distinct key and nonce pairs and %d distinct nonces over %d generations",
+			len(seenRatchet), len(seenBare), len(framingBoundaryGenerations()))
 	}
 }
 
@@ -5955,6 +6511,55 @@ func TestOpenPrivateMessageRefusesNonZeroPaddingItSelfDecrypted(t *testing.T) {
 	}
 }
 
+// TestOpenPrivateMessageRefusesAPaddingTailThatFoldsToZeroItSelfDecrypted is the same class the
+// decoder sweep holds, reached the way a member reaches it: through a real seal, with a real AEAD
+// tag over the offending tail.
+//
+// The sweep above it in this file sets ONE padding octet, and every accumulator agrees on a tail
+// like that. This is the shape that matters, because the covert channel is only worth anything to
+// somebody who can produce a valid tag -- which is to say a member of the group -- and the tail it
+// writes is as wide as the padding, not one octet of it.
+func TestOpenPrivateMessageRefusesAPaddingTailThatFoldsToZeroItSelfDecrypted(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	folds := framingCancellingByteFolds(t)
+	sealed := 0
+	for _, paddingSize := range framingPrivatePaddingLengths() {
+		if paddingSize < 2 {
+			continue
+		}
+		for _, fold := range folds {
+			for _, payload := range framingCovertPayloads() {
+				tail, built := framingFoldingPaddingTail(paddingSize, fold.fold, payload.at)
+				if !built {
+					continue
+				}
+				message, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+					signed.senderDataSecret, signed.authContent, tail)
+				if err != nil {
+					t.Fatalf("%d octets carrying %s closed under %s: seal: %v",
+						paddingSize, payload.what, fold.name, err)
+				}
+				opened, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+					signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext)
+				if !errors.Is(err, errNonZeroPadding) {
+					t.Fatalf("%d octets carrying %s closed under %s: got %v, want errNonZeroPadding",
+						paddingSize, payload.what, fold.name, err)
+				}
+				if opened != nil {
+					t.Errorf("%d octets carrying %s closed under %s: refused and answered a message alongside",
+						paddingSize, payload.what, fold.name)
+				}
+				sealed += 1
+			}
+		}
+	}
+	if sealed == 0 {
+		t.Fatal("no fold in the derived family admitted a tail that closes, so this sweep sealed nothing")
+	}
+	t.Logf("%d sealed messages whose padding folds to zero were refused on open", sealed)
+}
+
 // TestSealPrivateMessageEmitsExactlyThePaddingItWasAskedFor.
 //
 // The ciphertext grows by exactly the padding size, which is what says the padding reached the
@@ -5967,7 +6572,7 @@ func TestSealPrivateMessageEmitsExactlyThePaddingItWasAskedFor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	for _, paddingSize := range framingPrivatePaddingLengths() {
+	for _, paddingSize := range framingPrivateWidePaddingLengths() {
 		message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
 			signed.senderDataSecret, signed.authContent, paddingSize)
 		if err != nil {
@@ -6062,6 +6667,98 @@ func TestPrivateMessageRoundTripsThroughTheRealSecretTreeAtEveryBoundaryGenerati
 		}
 		if errors.Is(err, errNonZeroPadding) {
 			t.Fatalf("generation %d: a replay was refused for its padding, which is not the reason", generation)
+		}
+	}
+}
+
+// TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefuse is the ordering
+// OpenPrivateMessage's own commentary claims and nothing held.
+//
+// The claim is that the erase sits between the content open and the signature check, because
+// "holding the key open across a signature check would leave a replay of the same ciphertext
+// decryptable a second time". Measured: with the erase moved to after VerifyAuthenticatedContent,
+// the whole of ./mls/... and ./message/... stayed green. What that costs is every message that
+// DECRYPTS and is then refused -- for its padding at ValSem011 or for its signature at ValSem010
+// -- leaving this epoch's message key alive at that generation, so the ciphertext just refused can
+// be fed back into the same check for as long as the epoch lasts.
+//
+// What holds it is the REPLAY and not a count of erasures. A second open of the same octets has to
+// fail because the key is gone, which the real tree says as ErrRatchetGenerationConsumed, and not
+// because the padding is still wrong or the signature still forged -- and that difference is
+// exactly what the moved erase produces. Counting erasures cannot see it either way round: the
+// moved version erases exactly once on the path that succeeds, which is the path every other test
+// here takes.
+//
+// Both refusals below the open are swept, because the erase sits ahead of both and an ordering
+// held over one of them is an ordering held half way.
+func TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefuse(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	leaf := signed.authContent.Content.Sender.LeafIndex
+	contentType := signed.authContent.Content.ContentType
+
+	forged := *signed.authContent
+	forged.Auth = FramedContentAuthData{Signature: append([]byte(nil), signed.authContent.Auth.Signature...)}
+	forged.Auth.Signature[0] ^= 0xff
+
+	rows := []struct {
+		what     string
+		content  *AuthenticatedContent
+		padding  []byte
+		sentinel error
+	}{
+		{what: "a padding tail the sender wrote into", content: signed.authContent,
+			padding: []byte{0x01}, sentinel: errNonZeroPadding},
+		{what: "a signature that does not verify", content: &forged,
+			padding: nil, sentinel: errBadSignature},
+	}
+
+	for _, row := range rows {
+		for _, generation := range framingBoundaryGenerations() {
+			sender := framingSecretTreeAt(t, crypto, leaf, contentType, generation)
+			receiver := framingSecretTreeAt(t, crypto, leaf, contentType, generation)
+			message, err := sealPrivateMessage(crypto, sender, signed.senderDataSecret,
+				row.content, row.padding)
+			if err != nil {
+				t.Fatalf("%s at generation %d: seal: %v", row.what, generation, err)
+			}
+			open := func() error {
+				_, err := OpenPrivateMessage(crypto, receiver, signed.senderDataSecret, message,
+					StaticSignatureKey(signed.pub), signed.groupContext)
+				return err
+			}
+			if err := open(); !errors.Is(err, row.sentinel) {
+				t.Fatalf("%s at generation %d: got %v, want %v", row.what, generation, err, row.sentinel)
+			}
+			replay := open()
+			if errors.Is(replay, row.sentinel) {
+				t.Fatalf("%s at generation %d: a replay of the refused ciphertext reached the same check a second time, so the message key outlived the refusal",
+					row.what, generation)
+			}
+			if !errors.Is(replay, ErrRatchetGenerationConsumed) {
+				t.Fatalf("%s at generation %d: a replay answered %v, want ErrRatchetGenerationConsumed",
+					row.what, generation, replay)
+			}
+		}
+	}
+
+	// and the erase names the generation the message arrived at, which the tree above cannot
+	// say: an erase of some OTHER generation leaves this one alive, and the replay would then
+	// refuse for that reason rather than for this one.
+	for _, row := range rows {
+		message, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+			signed.senderDataSecret, row.content, row.padding)
+		if err != nil {
+			t.Fatalf("%s: seal: %v", row.what, err)
+		}
+		keys := framingNewKeySource(crypto, 0x01, 0)
+		if _, err := OpenPrivateMessage(crypto, keys, signed.senderDataSecret, message,
+			StaticSignatureKey(signed.pub), signed.groupContext); !errors.Is(err, row.sentinel) {
+			t.Fatalf("%s: got %v, want %v", row.what, err, row.sentinel)
+		}
+		erased := fmt.Sprintf("%d/%d/%d", contentType, leaf, 0)
+		if !slices.Equal(keys.erased, []string{erased}) {
+			t.Fatalf("%s: the refused open erased %v, want exactly [%s]", row.what, keys.erased, erased)
 		}
 	}
 }
