@@ -4737,10 +4737,20 @@ func TestPrivateMessageContentRefusesEveryNonZeroPaddingOctet(t *testing.T) {
 			for offset := range paddingSize {
 				tampered := append([]byte(nil), plaintext...)
 				tampered[len(tampered)-paddingSize+offset] = 0x01
-				_, _, err := unmarshalPrivateMessageContent(tampered, header, content.Sender)
+				decoded, decodedAuth, err := unmarshalPrivateMessageContent(tampered, header, content.Sender)
 				if !errors.Is(err, errNonZeroPadding) {
 					t.Fatalf("content type %d padding %d octet %d: got %v, want errNonZeroPadding",
 						contentType, paddingSize, offset, err)
+				}
+				// and NOTHING alongside it. A decoder that answered the content it had just
+				// decided not to trust hands a caller that checked the error loosely -- or
+				// that logged it and carried on -- the very FramedContent whose padding
+				// carries the covert channel this refusal exists to close. Measured: with
+				// the refusal returning content and auth beside the error, the whole of
+				// ./mls/... and ./message/... stayed green.
+				if decoded != nil || decodedAuth != nil {
+					t.Fatalf("content type %d padding %d octet %d: refused and answered a content or an auth data alongside",
+						contentType, paddingSize, offset)
 				}
 				refused++
 			}
@@ -4914,12 +4924,20 @@ func TestPaddingSizeV1IsZeroBecauseTheRecordLayerPads(t *testing.T) {
 }
 
 // TestUnmarshalPrivateMessageContentRefusesAnUnregisteredContentType is the header arm nothing
-// else reaches.
+// else reaches, and it is run against an EMPTY body as well as a full one.
 //
 // The content type comes off the CLEARTEXT header, which is to say off the wire, so this switch
 // runs on a value an unauthenticated peer chose. A default arm that fell through to the
 // application case would decode a proposal's octets as an opaque blob and hand it up as
 // application data.
+//
+// The empty body is what makes this a statement about THIS arm. Against a full plaintext the
+// refusal is not attributable: an unregistered content type is refused a second time by
+// FramedContentAuthData.UnmarshalMLS a few lines further down, so a decoder whose own default
+// fell through to the application case is still refused -- measured, on the mutation that made it
+// fall through, which this test passed before the empty row was added. With no octets to read,
+// a fall-through answers a TRUNCATION and only an arm that refuses before it consumes anything
+// answers the content type.
 func TestUnmarshalPrivateMessageContentRefusesAnUnregisteredContentType(t *testing.T) {
 	crypto := newTestCrypto(t)
 	content := framingTestMemberContent()
@@ -4941,9 +4959,86 @@ func TestUnmarshalPrivateMessageContentRefusesAnUnregisteredContentType(t *testi
 		}
 		header := framingPrivateHeaderFor(content)
 		header.ContentType = ContentType(code)
-		_, _, err := unmarshalPrivateMessageContent(plaintext, header, content.Sender)
-		if !errors.Is(err, ErrUnknownContentType) {
-			t.Fatalf("content type %d: got %v, want ErrUnknownContentType", code, err)
+		for _, body := range []struct {
+			what      string
+			plaintext []byte
+		}{
+			{what: "a full body", plaintext: plaintext},
+			{what: "no body at all", plaintext: nil},
+			{what: "a body of one octet", plaintext: []byte{0x00}},
+		} {
+			_, _, err := unmarshalPrivateMessageContent(body.plaintext, header, content.Sender)
+			if !errors.Is(err, ErrUnknownContentType) {
+				t.Fatalf("content type %d with %s: got %v, want ErrUnknownContentType",
+					code, body.what, err)
+			}
+		}
+	}
+}
+
+// TestUnmarshalPrivateMessageContentAnswersTheAuthDataCodecsRefusalVerbatim is the guard on the
+// one refusal of this decoder that nothing downstream repeats.
+//
+// It exists because the obvious test for it states nothing. A truncated auth data LATCHES the
+// Reader, so the padding read a few lines below refuses the plaintext whatever this line does --
+// which is why the truncation sweep in the second half is here for completeness rather than as
+// the property.
+//
+// The refusal that is only this line's is a commit carrying an EMPTY confirmation tag. That is
+// wire legal, it consumes its octets cleanly and leaves the Reader unlatched, and
+// FramedContentAuthData.UnmarshalMLS refuses it because an empty opaque is the encoding of "no
+// tag" and a commit with no tag is one every peer rejects at ValSem009 having verified its
+// signature first. A decoder that dropped the codec's error hands that plaintext up carrying
+// neither a signature nor a confirmation tag, with a nil error, and the padding check under it
+// passes because the tail really is zeros.
+//
+// Measured rather than supposed: with `if err := auth.UnmarshalMLS(...); err != nil` reduced to
+// `_ = auth.UnmarshalMLS(...)`, the whole of ./mls/... and ./message/... stayed green. This test
+// is what that mutation now fails.
+func TestUnmarshalPrivateMessageContentAnswersTheAuthDataCodecsRefusalVerbatim(t *testing.T) {
+	content := framingTestCommitContent()
+	header := framingPrivateHeaderFor(content)
+	for _, paddingSize := range framingPrivatePaddingLengths() {
+		w := syntax.NewWriter()
+		if err := content.Commit.MarshalMLS(w); err != nil {
+			t.Fatalf("the commit arm this row hands the decoder: %v", err)
+		}
+		w.WriteOpaque(bytes.Repeat([]byte{0x51}, 64))
+		// an empty opaque<V> is a legal encoding and is the encoding of "no tag"
+		w.WriteOpaque(nil)
+		w.WriteRaw(make([]byte, paddingSize))
+		plaintext, err := w.Bytes()
+		if err != nil {
+			t.Fatalf("the plaintext this row hands the decoder: %v", err)
+		}
+		decoded, auth, err := unmarshalPrivateMessageContent(plaintext, header, content.Sender)
+		if !errors.Is(err, errMissingConfirmationTag) {
+			t.Fatalf("padding %d: a commit whose confirmation tag is an empty opaque: got %v, want errMissingConfirmationTag",
+				paddingSize, err)
+		}
+		if decoded != nil || auth != nil {
+			t.Errorf("padding %d: refused and answered a content or an auth data alongside", paddingSize)
+		}
+	}
+
+	// and every truncation of a well formed body, derived off its length rather than sampled.
+	// These are refused through the latched Reader rather than through the line above, and the
+	// reason they are here anyway is that a decoder which stopped latching -- a Reader rewritten
+	// to answer per call rather than stickily -- would turn every one of them into a plaintext
+	// accepted with a half read auth data, and nothing else in this file would notice.
+	crypto := newTestCrypto(t)
+	for contentType, whole := range framingPrivateContentsOfEveryType(t) {
+		auth := framingPrivateAuthFor(t, crypto, contentType)
+		full, err := marshalPrivateMessageContent(whole, auth, 0)
+		if err != nil {
+			t.Fatalf("content type %d: marshal: %v", contentType, err)
+		}
+		wholeHeader := framingPrivateHeaderFor(whole)
+		for at := range len(full) {
+			if _, _, err := unmarshalPrivateMessageContent(full[:at], wholeHeader, whole.Sender); err == nil {
+				t.Fatalf("content type %d: a body truncated to %d of %d octets was accepted",
+					contentType, at, len(full))
+			}
 		}
 	}
 }
@@ -5237,9 +5332,13 @@ func TestPrivateMessageSealOpenRoundTripsEveryContentType(t *testing.T) {
 		if err != nil {
 			t.Fatalf("content type %d: seal: %v", contentType, err)
 		}
-		if len(sealKeys.erased) != 1 {
-			t.Fatalf("content type %d: the seal erased %v, want exactly the generation it used",
-				contentType, sealKeys.erased)
+		// the source starts at generation 0, so the seal spends exactly that one and the
+		// open spends exactly the one the sender data named it. Both are held by VALUE and
+		// not by count, for the reason the boundary sweep writes down.
+		spent := fmt.Sprintf("%d/%d/%d", contentType, content.Sender.LeafIndex, 0)
+		if !slices.Equal(sealKeys.erased, []string{spent}) {
+			t.Fatalf("content type %d: the seal erased %v, want exactly [%s]",
+				contentType, sealKeys.erased, spent)
 		}
 		if content.ApplicationData != nil && bytes.Contains(message.Ciphertext, content.ApplicationData) {
 			t.Fatalf("content type %d: the plaintext is visible in the ciphertext", contentType)
@@ -5263,9 +5362,9 @@ func TestPrivateMessageSealOpenRoundTripsEveryContentType(t *testing.T) {
 		if err != nil {
 			t.Fatalf("content type %d: open: %v", contentType, err)
 		}
-		if len(openKeys.erased) != 1 {
-			t.Fatalf("content type %d: the open erased %v, want exactly the generation it opened",
-				contentType, openKeys.erased)
+		if !slices.Equal(openKeys.erased, []string{spent}) {
+			t.Fatalf("content type %d: the open erased %v, want exactly [%s]",
+				contentType, openKeys.erased, spent)
 		}
 		if opened.WireFormat != WireFormatPrivateMessage {
 			t.Errorf("content type %d: opened under wire format %d", contentType, opened.WireFormat)
@@ -5341,6 +5440,17 @@ func TestSealPrivateMessageSealsUnderTheGuardedNonceAtEveryBoundaryGeneration(t 
 		if senderData.LeafIndex != content.Sender.LeafIndex {
 			t.Fatalf("generation %d: the sender data names leaf %d and the content names %d",
 				generation, senderData.LeafIndex, content.Sender.LeafIndex)
+		}
+		// the erase names the generation the message was actually sealed under, and not a
+		// neighbour of it. Counting erasures cannot see this: a seal that erased
+		// generation+1 erases exactly once, leaves the generation it DID use alive in the
+		// sender's window, and answers a message that opens perfectly -- so what it costs
+		// is the forward secrecy the erase is the whole of. Measured: with the argument
+		// moved by one, the whole of ./mls/... and ./message/... stayed green.
+		erased := fmt.Sprintf("%d/%d/%d", content.ContentType, content.Sender.LeafIndex, generation)
+		if !slices.Equal(keys.erased, []string{erased}) {
+			t.Fatalf("generation %d: the seal erased %v, want exactly [%s]",
+				generation, keys.erased, erased)
 		}
 
 		wantKey, wantNonce := keys.derive(content.ContentType, content.Sender.LeafIndex, generation)
