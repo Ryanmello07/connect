@@ -31,9 +31,13 @@
 //     cannot be reproduced: section 6.3.2's reuse guard is four fresh random octets per message,
 //     so two seals of one content never match. What is held instead is that resealing through an
 //     independently constructed secret tree and reopening through a third one recovers the same
-//     authenticated content, and that the two seals DIFFER -- a reuse guard stuck at a constant
-//     is a nonce reused across two messages of one generation, which is the failure the guard
-//     exists to prevent and which nothing about a round trip can see.
+//     authenticated content, and that the two seals produce different CONTENT CIPHERTEXTS. The
+//     content ciphertext and not the whole message: the guard is also carried inside the encrypted
+//     sender data, so two whole messages differ whether or not the guard ever reaches the nonce,
+//     and comparing those would be a check that passes over a guard applied to nothing. Two seals
+//     at one generation of one ratchet share a key and a base nonce, so the content ciphertexts
+//     are equal exactly when the guard did not reach the nonce -- which is a nonce reused across
+//     two messages, the failure the guard exists to prevent, and one no round trip can see.
 //   - the group context compared against a second opinion. Every signature and every tag in this
 //     family is over the serialized GroupContext, so a codec that serialized it differently from
 //     the RFC would fail every open here with a signature error and name nothing. The comparison
@@ -260,7 +264,7 @@ type messageProtectionComparison struct {
 	// roundTrips counts the private columns that were resealed through an independently
 	// constructed secret tree and reopened through a third one with the authenticated content
 	// coming back byte identical, and resealsDiffer the private columns whose two independent
-	// seals of one content came out as different ciphertexts.
+	// seals of one content came out as different CONTENT ciphertexts.
 	roundTrips    int
 	resealsDiffer int
 	// checks is every comparison the run made, in the order it made them.
@@ -290,7 +294,7 @@ func (self messageProtectionComparison) incomplete() error {
 		return fmt.Errorf("%w: %d private columns survived a reseal and reopen and the case publishes %d",
 			errMessageProtectionIncomplete, self.roundTrips, messageProtectionPrivateColumns)
 	case self.resealsDiffer != messageProtectionPrivateColumns:
-		return fmt.Errorf("%w: %d private columns produced two different ciphertexts from two seals and the case publishes %d",
+		return fmt.Errorf("%w: %d private columns produced two different content ciphertexts from two seals and the case publishes %d",
 			errMessageProtectionIncomplete, self.resealsDiffer, messageProtectionPrivateColumns)
 	case len(self.checks) != len(messageProtectionCheckNames):
 		return fmt.Errorf("%w: the run made %d comparisons and this family owes %d per case",
@@ -617,18 +621,25 @@ func compareMessageProtectionVector(t *testing.T, raw json.RawMessage) (messageP
 			name: column.name + "/content", field: column.rawField, got: recovered, want: column.raw,
 		})
 
-		first, err := messageProtectionReseal(t, crypto, encryptionSecret, senderDataSecret, opened)
+		first, firstCiphertext, err := messageProtectionReseal(t, crypto, encryptionSecret, senderDataSecret, opened)
 		if err != nil {
 			return evidence, fmt.Errorf("%w: %s: %w", errMessageProtectionRoundTrip, column.name, err)
 		}
-		second, err := messageProtectionReseal(t, crypto, encryptionSecret, senderDataSecret, opened)
+		_, secondCiphertext, err := messageProtectionReseal(t, crypto, encryptionSecret, senderDataSecret, opened)
 		if err != nil {
 			return evidence, fmt.Errorf("%w: %s: %w", errMessageProtectionRoundTrip, column.name, err)
 		}
-		// the reuse guard. Two seals of one content through two identically seeded trees differ
-		// only by section 6.3.2's four fresh octets, so an equality here is a nonce reused
-		// across two messages of one generation.
-		if bytes.Equal(first, second) {
+		// the reuse guard, read off the CONTENT ciphertext. Two seals of one content through two
+		// identically seeded trees take the same key and the same base nonce at generation 0, so
+		// the two ciphertexts are equal exactly when section 6.3.2's four fresh octets did not
+		// reach the nonce -- which is a nonce reused across two messages of one generation. The
+		// whole messages differ either way, because the guard is also carried inside the
+		// encrypted sender data, so comparing those would pass over a guard applied to nothing.
+		if len(firstCiphertext) == 0 || len(secondCiphertext) == 0 {
+			return evidence, fmt.Errorf("%w: %s: a reseal produced %d and %d octets of content ciphertext",
+				errMessageProtectionRoundTrip, column.name, len(firstCiphertext), len(secondCiphertext))
+		}
+		if bytes.Equal(firstCiphertext, secondCiphertext) {
 			return evidence, fmt.Errorf("%w: %s", errMessageProtectionReuseGuardStuck, column.name)
 		}
 		evidence.resealsDiffer++
@@ -687,24 +698,33 @@ func messageProtectionSecretTree(t *testing.T, crypto CryptoProvider, encryption
 }
 
 // messageProtectionReseal protects one already authenticated content as a PrivateMessage through
-// a secret tree of its own and returns the serialized MLSMessage.
+// a secret tree of its own, and returns the serialized MLSMessage together with the content
+// ciphertext inside it.
+//
+// Both, because the two callers ask different questions of one seal: the round trip is over the
+// serialized message, which is what a peer receives, and the reuse guard is over the content
+// ciphertext alone, which is the only part of the message the guard changes.
 func messageProtectionReseal(t *testing.T, crypto CryptoProvider, encryptionSecret []byte,
-	senderDataSecret []byte, authContent *AuthenticatedContent) ([]byte, error) {
+	senderDataSecret []byte, authContent *AuthenticatedContent) ([]byte, []byte, error) {
 
 	t.Helper()
 	tree, err := messageProtectionSecretTree(t, crypto, encryptionSecret)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sealed, err := SealPrivateMessage(crypto, tree, senderDataSecret, authContent, PaddingSizeV1)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return MarshalMLSMessage(&MLSMessage{
+	encoded, err := MarshalMLSMessage(&MLSMessage{
 		Version:        ProtocolVersionMls10,
 		WireFormat:     WireFormatPrivateMessage,
 		PrivateMessage: sealed,
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return encoded, bytes.Clone(sealed.Ciphertext), nil
 }
 
 // messageProtectionContextOf holds one unprotected message to the group, the epoch and the sender
@@ -1100,6 +1120,56 @@ func TestCompareMessageProtectionVectorRefusesACaseItShouldNotAccept(t *testing.
 		refusals = append(refusals, comparatorRefusal{row.name, encode(corrupted), row.want})
 	}
 	assertComparatorRefuses(t, "message-protection", refuseMessageProtectionVector, encode(base), refusals)
+}
+
+// TestTheMessageProtectionGeneratorReachesAnIndependentDerivation is the other half of the claim
+// this family's generate direction makes about itself.
+//
+// The claim is that the generator protects its messages over a group context THIS FILE wrote out
+// by hand while the consume direction verifies them over the codec's, so the two halves are two
+// implementations of section 8.1 rather than one agreeing with itself. Nothing else in this file
+// can see that: swap independentGroupContext for syntax.Marshal over the p4 struct and every
+// generated case still verifies, every count still adds up, and the generate direction becomes a
+// round trip through one serializer while continuing to report itself as a generate direction.
+// Measured -- that edit leaves this file's other five tests green.
+//
+// The walk is theCallsReachableFrom in tree_kat_test.go, which family 11's generator is held by
+// for the same reason and which separates a CALL from a MENTION: a call replaced by a discard of
+// the same identifier still names it, and a gate reading mentions would go on reporting a
+// derivation as reached over a generator that no longer runs it. The class of derivations is
+// DERIVED -- every function these test files declare whose name claims independence -- rather
+// than a list naming the one that exists today.
+func TestTheMessageProtectionGeneratorReachesAnIndependentDerivation(t *testing.T) {
+	declared := testFileFunctions(packageTestFiles(t))
+	// the generator the registry installs has to reach the case builder, or what is held below
+	// is a function nothing runs.
+	if !theCallsReachableFrom(t, declared, "generateMessageProtectionVector")["generateMessageProtectionCases"] {
+		t.Fatal("generateMessageProtectionVector does not call generateMessageProtectionCases, so the derivation held below is not on the registered generator's path")
+	}
+	roots := []string{}
+	for name := range declared {
+		if strings.HasPrefix(name, "independent") {
+			roots = append(roots, name)
+		}
+	}
+	slices.Sort(roots)
+	if len(roots) == 0 {
+		t.Fatalf("no function this package's %d declared test functions name claims independence, so the derivation below is over an empty class",
+			len(declared))
+	}
+	reached := theCallsReachableFrom(t, declared, "generateMessageProtectionCases")
+	found := []string{}
+	for _, root := range roots {
+		if reached[root] {
+			found = append(found, root)
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("generateMessageProtectionCases calls none of the %d independent derivations these test files declare (%v); family 4's generate direction then protects and unprotects over one serializer, and an encoder and a decoder wrong in the same direction agree perfectly",
+			len(roots), roots)
+	}
+	t.Logf("generateMessageProtectionCases reaches %v of the %d independent derivations declared across this package's test files",
+		found, len(roots))
 }
 
 // mpGeneratedApplication is the application payload a generated case at one suite carries.
