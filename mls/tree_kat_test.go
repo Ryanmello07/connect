@@ -607,24 +607,34 @@ func TestTreeVectorSuiteAgreementFlagsADisagreement(t *testing.T) {
 	}
 }
 
-// TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey holds the one place outside this file
-// that types the corpus's ciphersuite key out to the key this file derives.
+// TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey holds every place outside this file that
+// types the corpus's ciphersuite key out to the key this file derives.
 //
-// The header of this file used to claim the key "is never typed out a second time". Within
-// this file that was true; within the package it was not, and the second spelling sits on the
-// path this file's own comparator control runs through: aCaseAtARegisteredSuite decodes with a
-// literal tag of its own and hands back the case whose key
-// TestTreeVectorPublishedSuiteRefusesAWrongCase then derives with theJsonKeyOf. Two spellings
-// that disagreed would leave that control driving the comparator with a case selected at a
-// field the comparator never reads, and the refusal table would go on passing.
+// The header of this file used to claim the key "is never typed out a second time". Within this
+// file that was true; within the package it was not, and the second spelling sits on the path
+// this file's own comparator control runs through: aCaseAtARegisteredSuite hands back the case
+// whose key TestTreeVectorPublishedSuiteRefusesAWrongCase then derives with theJsonKeyOf. Two
+// spellings that disagreed would leave that control driving the comparator with a case selected
+// at a field the comparator never reads, and the refusal table would go on passing.
 //
-// The literal is read out of the shared helper's own source rather than repeated here, so this
-// gate cannot become the third spelling.
+// The finder decodes through vectorCaseHeader now -- p6 task 18 gave it a named type when the
+// suiteless corpus derivation needed the same key a third time -- so this gate reads THAT tag by
+// reflection and holds the finder to still using it. Both halves are load bearing and for
+// different reasons. The reflection half is the comparison of the two spellings. The structural
+// half is what says the finder has not grown a private spelling beside the shared one: an
+// anonymous struct written back into its body is a key this reflection cannot see, and the
+// version of this gate that only scanned the body stopped seeing anything at all the moment the
+// literal moved out of it -- which is how it came to be rewritten.
 func TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey(t *testing.T) {
 	key := theJsonKeyOf(t, treeVectorHeader{}, "CipherSuite")
+	if shared := theJsonKeyOf(t, vectorCaseHeader{}, "CipherSuite"); shared != key {
+		t.Errorf("%T decodes %q and %T addresses %q, so the case that drives this file's comparator control is selected at a field the comparator never reads",
+			vectorCaseHeader{}, shared, treeVectorHeader{}, key)
+	}
 	parsed := theSourceDeclaring(t, "", "aCaseAtARegisteredSuite")
+	declaration := parsed.declarationOf(t, "", "aCaseAtARegisteredSuite")
 	found := []string{}
-	ast.Inspect(parsed.declarationOf(t, "", "aCaseAtARegisteredSuite"), func(node ast.Node) bool {
+	ast.Inspect(declaration, func(node ast.Node) bool {
 		field, isField := node.(*ast.Field)
 		if !isField || field.Tag == nil {
 			return true
@@ -638,12 +648,28 @@ func TestTheSharedCaseFinderAddressesTheSameCiphersuiteKey(t *testing.T) {
 		}
 		return true
 	})
-	if len(found) != 1 {
-		t.Fatalf("aCaseAtARegisteredSuite carries %v json keys and this gate is written for the one it decodes the ciphersuite with", found)
+	for _, tag := range found {
+		if tag != key {
+			t.Errorf("aCaseAtARegisteredSuite spells a json key %q of its own and %T addresses %q",
+				tag, treeVectorHeader{}, key)
+		}
 	}
-	if found[0] != key {
-		t.Errorf("aCaseAtARegisteredSuite decodes %q and %T addresses %q, so the case that drives this file's comparator control is selected at a field the comparator never reads",
-			found[0], treeVectorHeader{}, key)
+	if len(found) > 0 {
+		return
+	}
+	// no key of its own, so it decodes through the shared named type -- and this is where that
+	// is checked rather than assumed. A finder that had moved to some third header would leave
+	// the reflection above comparing a type nothing uses.
+	names := false
+	ast.Inspect(declaration, func(node ast.Node) bool {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && identifier.Name == "vectorCaseHeader" {
+			names = true
+		}
+		return true
+	})
+	if !names {
+		t.Errorf("aCaseAtARegisteredSuite spells no json key and does not decode through %T either, so nothing here says which key it selects a case at",
+			vectorCaseHeader{})
 	}
 }
 

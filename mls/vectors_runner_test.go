@@ -148,6 +148,17 @@ type vectorRunTally struct {
 	file string
 	// entries is how many cases the corpus parsed to.
 	entries int
+	// suiteless is true where the corpus publishes no ciphersuite column at all, which is
+	// what family 12's messages.json is: a pile of encodings, none of which a ciphersuite
+	// selects anything in. Every case of such a corpus is covered and none is declined, and
+	// the three per suite assertions in assertRun are about a column that does not exist.
+	//
+	// DERIVED from the corpus by newVectorRunTally and never declared by the family, for
+	// guardrail 5's reason. A family that set this itself could set it over a corpus that
+	// DOES publish the column, and the run would then take the suite split -- the assertion
+	// that separates a filter which reached both registered suites from one that reached the
+	// same suite twice -- out of its own accounting while every other count still added up.
+	suiteless bool
 	// covered and skipped are the two halves of the partition. Their sum must be entries.
 	covered int
 	skipped int
@@ -182,10 +193,53 @@ func newVectorRunTally(t *testing.T, file string) (*vectorRunTally, []json.RawMe
 	return &vectorRunTally{
 		file:      file,
 		entries:   len(entries),
+		suiteless: !corpusPublishesACipherSuiteColumn(t, file, entries),
 		matched:   map[CipherSuite]int{},
 		published: map[uint16]int{},
 		answers:   map[string]int{},
 	}, entries
+}
+
+// vectorCaseHeader is the one field of a corpus case every piece of this file needs to read
+// before it knows anything else about the family: the ciphersuite the case sits at.
+//
+// A named type and not a second anonymous struct literal, so the json key is spelled ONCE in
+// this file and every reader of it -- the driver that picks a case to drive an installed
+// verifier with, and the derivation of suiteless below -- asks theJsonKeyOf for the same
+// spelling. Two spellings of one key is how the two come apart about which key the corpus
+// actually uses, and the disagreement is silent in the worst direction: the second spelling
+// looks up nothing, and a corpus that publishes the column perfectly well is then read as one
+// that does not.
+type vectorCaseHeader struct {
+	CipherSuite uint16 `json:"cipher_suite"`
+}
+
+// corpusPublishesACipherSuiteColumn answers whether ANY case of a corpus publishes the
+// ciphersuite key at all.
+//
+// Read off a generic decode rather than off vectorCaseHeader, because that is the whole
+// question: an absent key and a published 0 decode identically through the struct, and only
+// one of the two means "this family has no suite dimension". The key itself is read off
+// vectorCaseHeader's own struct tag, so the spelling cannot drift from the filter's.
+//
+// ANY rather than ALL, so a corpus that publishes the column for some of its cases and not
+// others is treated as suite bearing and its keyless cases fall to the filter, which declines
+// them. A corpus in that state is a corpus problem and this is where it surfaces as one --
+// as an unregistered suite 0 -- rather than as a family that quietly stopped asserting its
+// suite split.
+func corpusPublishesACipherSuiteColumn(t *testing.T, file string, entries []json.RawMessage) bool {
+	t.Helper()
+	key := theJsonKeyOf(t, vectorCaseHeader{}, "CipherSuite")
+	for index, raw := range entries {
+		published := map[string]json.RawMessage{}
+		if err := json.Unmarshal(raw, &published); err != nil {
+			t.Fatalf("parse %s case %d as a json object: %v", file, index, err)
+		}
+		if _, found := published[key]; found {
+			return true
+		}
+	}
+	return false
 }
 
 // filter records one case against the suite filter and answers whether this package has a
@@ -205,6 +259,22 @@ func (self *vectorRunTally) filter(code uint16) (CipherSuite, bool) {
 	self.covered++
 	self.matched[suite]++
 	return suite, true
+}
+
+// cover records one case of a corpus that publishes no ciphersuite column.
+//
+// The suiteless half of filter() above, and separate from it because the two answer different
+// questions: filter asks the registry whether this package has a provider for a code point,
+// and there is no code point here to ask about. A family that called this over a corpus that
+// DOES publish the column would be counting a case as covered without consulting the filter
+// at all, which is refused here rather than left to show up as a suite split that adds up.
+func (self *vectorRunTally) cover(t *testing.T) {
+	t.Helper()
+	if !self.suiteless {
+		t.Fatalf("%s publishes a cipher_suite column and a case of it was counted as covered without the suite filter being asked about it",
+			self.file)
+	}
+	self.covered++
 }
 
 // requireCompared refuses a comparator that declined a case the suite filter matched.
@@ -268,21 +338,32 @@ func (self *vectorRunTally) assertRun(t *testing.T, wantCovered int, wantSkipped
 	if self.skipped != wantSkipped {
 		t.Fatalf("%s: skipped %d cases at unimplemented suites, want %d", self.file, self.skipped, wantSkipped)
 	}
-	if got := slices.Sorted(maps.Keys(self.matched)); !slices.Equal(got, Suites()) {
-		t.Fatalf("%s: the corpus answered for %v and this package registers %v", self.file, got, Suites())
-	}
-	// the per suite split, which the key set above says nothing about: a run that reached
-	// one registered suite for every case and the other for one satisfies both the total and
-	// the key set, and is a run that covered one suite.
-	for _, suite := range Suites() {
-		want := self.published[uint16(suite)]
-		if want == 0 {
-			t.Fatalf("%s: the corpus publishes nothing at suite %#04x, which this package registers",
-				self.file, uint16(suite))
+	if self.suiteless {
+		// a corpus with no ciphersuite column has nothing for the filter to decline, so a
+		// run over one that reported a declined case, or that reached a suite, went through
+		// filter() rather than cover() -- and the three assertions in the other arm would
+		// then be held over a column the corpus does not publish.
+		if self.skipped != 0 || len(self.matched) != 0 {
+			t.Fatalf("%s: the corpus publishes no cipher_suite column and this run declined %d cases and reached %v; a suiteless corpus has no case for the suite filter to decline",
+				self.file, self.skipped, slices.Sorted(maps.Keys(self.matched)))
 		}
-		if self.matched[suite] != want {
-			t.Fatalf("%s: suite %#04x was covered %d times and the corpus publishes %d cases at it",
-				self.file, uint16(suite), self.matched[suite], want)
+	} else {
+		if got := slices.Sorted(maps.Keys(self.matched)); !slices.Equal(got, Suites()) {
+			t.Fatalf("%s: the corpus answered for %v and this package registers %v", self.file, got, Suites())
+		}
+		// the per suite split, which the key set above says nothing about: a run that reached
+		// one registered suite for every case and the other for one satisfies both the total and
+		// the key set, and is a run that covered one suite.
+		for _, suite := range Suites() {
+			want := self.published[uint16(suite)]
+			if want == 0 {
+				t.Fatalf("%s: the corpus publishes nothing at suite %#04x, which this package registers",
+					self.file, uint16(suite))
+			}
+			if self.matched[suite] != want {
+				t.Fatalf("%s: suite %#04x was covered %d times and the corpus publishes %d cases at it",
+					self.file, uint16(suite), self.matched[suite], want)
+			}
 		}
 	}
 	if self.comparisons != wantComparisons {
@@ -578,10 +659,21 @@ func probeAssertion(run func(probe *testing.T)) (failed bool, raised any) {
 // is the whole failure this file exists to make impossible.
 func aCaseAtARegisteredSuite(t *testing.T, file string) (json.RawMessage, bool) {
 	t.Helper()
-	for _, raw := range LoadVectorFile(t, file) {
-		header := struct {
-			CipherSuite uint16 `json:"cipher_suite"`
-		}{}
+	entries := LoadVectorFile(t, file)
+	// the suiteless corpus. A family whose cases carry no ciphersuite column runs every one
+	// of them -- messages.json is 300 encodings and nothing in it is selected by a suite --
+	// so its first case is a case the verifier can be driven with. Read off whether the
+	// column is PUBLISHED and not off a decoded value, because an absent key decodes to 0,
+	// suite 0 is not registered, and this loop would then report that a corpus of 300
+	// drivable cases has none.
+	if !corpusPublishesACipherSuiteColumn(t, file, entries) {
+		if len(entries) == 0 {
+			return nil, false
+		}
+		return entries[0], true
+	}
+	for _, raw := range entries {
+		header := vectorCaseHeader{}
 		if err := json.Unmarshal(raw, &header); err != nil {
 			t.Fatalf("parse a %s case: %v", file, err)
 		}
@@ -1023,6 +1115,14 @@ func TestAssertRunFlagsTheControlFixture(t *testing.T) {
 		}},
 		{"skipped %d cases at unimplemented suites", func(f *vectorRunControlFixture) {
 			f.skipped++
+		}},
+		// the suiteless arm taken over a corpus that does publish the column. Every count in
+		// this fixture still adds up -- the partition, the totals, the comparisons -- and the
+		// three assertions in the other arm are the ones that separate a run which reached
+		// both registered suites from one that reached the same suite twice, so a family that
+		// reached this arm by mistake would go on passing with its suite split unasserted.
+		{"publishes no cipher_suite column", func(f *vectorRunControlFixture) {
+			f.tally.suiteless = true
 		}},
 		{"the corpus answered for", func(f *vectorRunControlFixture) {
 			f.tally.matched[CipherSuite(alienControlSuite)] = 1

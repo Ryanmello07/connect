@@ -87,7 +87,9 @@ var vectorManifest = baseVectorManifest()
 // expectedPendingFamilies is every family with no runner yet, ascending. It shrinks to the
 // empty slice by the end of slice A4 and never grows.
 //
-// 5 and 6 are absent because p4 tasks 17 and 16 register them from key_schedule_kat_test.go,
+// 4 is absent because p6 task 17 registers it from message_protection_kat_test.go,
+// 12 because p6 task 18 registers it from messages_kat_test.go,
+// 5 and 6 because p4 tasks 17 and 16 register them from key_schedule_kat_test.go,
 // 10 and 11 because p5 tasks 24 and 25 register them from tree_kat_test.go,
 // 7 because p4 task 20 registers it from transcript_kat_test.go, and 3 because p4 task 25
 // registers it from secret_tree_kat_test.go. 16 is still
@@ -105,7 +107,7 @@ var vectorManifest = baseVectorManifest()
 // EncryptWithLabel, all of which this package declares, and 16's runner exists in package
 // syntax and is not installed here. Both are owned by tasks that are not this one, and both
 // are named here so that "pending" cannot go on meaning two different things silently.
-var expectedPendingFamilies = []int{2, 4, 8, 9, 12, 13, 14, 15, 16}
+var expectedPendingFamilies = []int{2, 8, 9, 13, 14, 15, 16}
 
 // RegisterVectorFamily installs a family runner. Registering a number twice, or a number
 // outside 1 to 16, is a programming error rather than a condition to report: both mean the
