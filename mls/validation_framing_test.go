@@ -222,82 +222,124 @@ func TestFramedContentContextRefusesANilContent(t *testing.T) {
 // ValSem004, the sender's leaf
 // ---------------------------------------------------------------------------
 
-// framingLeafOccupancy is the occupancy pattern ValSem004 is swept over.
+// framingLeafOccupancies is the occupancy patterns ValSem004 is swept over, and there is more
+// than one of them for a reason that was measured rather than reasoned.
 //
-// The blank leaves are in the MIDDLE and both ends are occupied, which is this project's most
-// expensive recurring defect written as a fixture. p4's ValSem401 ran over psks[0] instead of
-// psks[i]; p5 task 7's erratum loop ran over element zero; p5 task 15's sweep was tested with its
-// offender at the first index it visited, so a loop bounded at x < 2 passed. A pattern whose only
-// blank leaf sits at position zero, or at the last position, is a pattern all three of those bugs
-// pass. TestSenderLeafRefusesBlankLeaf asserts that shape rather than trusting this comment.
-func framingLeafOccupancy() []bool {
-	return []bool{true, true, false, true, true, false, true, true}
+// A single pattern cannot state this rule. Blanks in the MIDDLE catch a rule that judges only the
+// first leaf or only the last -- p4's ValSem401 over psks[0], p5 task 7's erratum loop over
+// element zero, p5 task 15's sweep bounded at x < 2. Blanks at the ENDS catch the mirror, a rule
+// that SKIPS the first leaf or the last, and that shape is not hypothetical: with this rule
+// rewritten to `sender.LeafIndex != 0 && !leafOccupied(...)` -- which accepts every message
+// claiming leaf zero, and leaf zero is the one a removed founder leaves blank -- the plan's draft
+// of this test passed, and so did this file's own first draft, whose single pattern kept both ends
+// occupied precisely to catch the other direction.
+//
+// So the patterns are GENERATED rather than chosen: one per leaf, blank at that leaf alone, plus a
+// wholly occupied tree so the rule cannot be satisfied by refusing everything. Every position is
+// then blank in one pattern and occupied in the rest, and TestSenderLeafRefusesBlankLeaf asserts
+// that of the patterns rather than trusting this comment.
+func framingLeafOccupancies(width int) [][]bool {
+	patterns := [][]bool{}
+	for blank := 0; blank < width; blank += 1 {
+		pattern := make([]bool, width)
+		for at := range pattern {
+			pattern[at] = at != blank
+		}
+		patterns = append(patterns, pattern)
+	}
+	occupied := make([]bool, width)
+	for at := range occupied {
+		occupied[at] = true
+	}
+	return append(patterns, occupied)
 }
 
-// TestSenderLeafRefusesBlankLeaf is ValSem004 over every leaf of framingLeafOccupancy, with the
-// expectation of each row read off the occupancy rather than written beside it.
+// TestSenderLeafRefusesBlankLeaf is ValSem004 over every leaf of every framingLeafOccupancies
+// pattern, with the expectation of each row read off the occupancy rather than written beside it.
 func TestSenderLeafRefusesBlankLeaf(t *testing.T) {
-	occupancy := framingLeafOccupancy()
-	// the fixture's own shape, asserted. a blank leaf at either end is a fixture that cannot
-	// see a rule which judged one position, and this is the statement of that rather than the
-	// comment above it.
-	if len(occupancy) < 4 {
-		t.Fatalf("the occupancy fixture is %d leaves and a position sweep needs a run", len(occupancy))
-	}
-	if !occupancy[0] || !occupancy[len(occupancy)-1] {
-		t.Fatal("the occupancy fixture is blank at one of its ends, so a rule that judged only the first leaf or only the last would pass this sweep")
-	}
-	blank := []LeafIndex{}
-	for at, filled := range occupancy {
-		if !filled {
-			blank = append(blank, LeafIndex(at))
+	const width = 8
+	patterns := framingLeafOccupancies(width)
+
+	// the sweep's own completeness, derived off the patterns it is about to run. Every leaf
+	// position has to be blank in at least one pattern and occupied in at least one, or a rule
+	// that judged that position alone -- or skipped it -- passes the whole sweep.
+	blankIn := make([]int, width)
+	occupiedIn := make([]int, width)
+	for _, pattern := range patterns {
+		if len(pattern) != width {
+			t.Fatalf("a pattern is %d leaves wide and this sweep is %d", len(pattern), width)
+		}
+		for at, filled := range pattern {
+			if filled {
+				occupiedIn[at] += 1
+				continue
+			}
+			blankIn[at] += 1
 		}
 	}
-	if len(blank) < 2 {
-		t.Fatalf("the occupancy fixture holds %d blank leaves and this sweep needs more than one", len(blank))
+	for at := 0; at < width; at += 1 {
+		if blankIn[at] == 0 || occupiedIn[at] == 0 {
+			t.Fatalf("leaf %d is blank in %d patterns and occupied in %d; a rule that judged only that leaf, or that skipped it, would pass this sweep",
+				at, blankIn[at], occupiedIn[at])
+		}
 	}
 
 	calls := 0
-	leafOccupied := func(leaf LeafIndex) bool {
-		calls += 1
-		return int(leaf) < len(occupancy) && occupancy[leaf]
-	}
-	for at, filled := range occupancy {
-		sender := Sender{SenderType: SenderTypeMember, LeafIndex: LeafIndex(at)}
-		err := CheckSenderLeaf(sender, leafOccupied)
-		if filled {
-			if err != nil {
-				t.Errorf("leaf %d is occupied and was refused: %v", at, err)
+	refused := 0
+	for which, pattern := range patterns {
+		leafOccupied := func(leaf LeafIndex) bool {
+			calls += 1
+			return int(leaf) < len(pattern) && pattern[leaf]
+		}
+		for at, filled := range pattern {
+			sender := Sender{SenderType: SenderTypeMember, LeafIndex: LeafIndex(at)}
+			err := CheckSenderLeaf(sender, leafOccupied)
+			if filled {
+				if err != nil {
+					t.Errorf("pattern %d: leaf %d is occupied and was refused: %v", which, at, err)
+				}
+				continue
 			}
-			continue
+			if !errors.Is(err, errBlankSenderLeaf) {
+				t.Errorf("pattern %d: leaf %d is blank: got %v, want errBlankSenderLeaf", which, at, err)
+				continue
+			}
+			// the refusal names the leaf, so a receiver is not left walking its own tree to
+			// work out which message it just dropped
+			if !strings.Contains(err.Error(), strconv.Itoa(at)) {
+				t.Errorf("pattern %d: the ValSem004 refusal for leaf %d reads %q and does not name the leaf",
+					which, at, err)
+			}
+			refused += 1
 		}
-		if !errors.Is(err, errBlankSenderLeaf) {
-			t.Errorf("leaf %d is blank: got %v, want errBlankSenderLeaf", at, err)
-			continue
-		}
-		// the refusal names the leaf, so a receiver is not left walking its own tree to work
-		// out which message it just dropped
-		if !strings.Contains(err.Error(), strconv.Itoa(at)) {
-			t.Errorf("the ValSem004 refusal for leaf %d reads %q and does not name the leaf", at, err)
-		}
+	}
+	// counted, because a pattern generator that stopped producing blanks leaves every loop above
+	// running over occupied leaves alone and reporting PASS
+	if refused != width {
+		t.Fatalf("%d leaves refused over %d patterns, want %d; every pattern but the last blanks exactly one leaf",
+			refused, len(patterns), width)
 	}
 	// the predicate was actually consulted. a rule that answered nil without calling it accepts
 	// every leaf, and every "occupied" row above passes over such a rule unchanged.
 	if calls == 0 {
 		t.Fatal("the occupancy predicate was never called, so whatever decided the rows above was not the tree")
 	}
+
+	full := patterns[len(patterns)-1]
+	fullyOccupied := func(leaf LeafIndex) bool { return int(leaf) < len(full) && full[leaf] }
 	// a leaf past the end of the tree entirely, which is what a hostile peer writes
-	beyond := Sender{SenderType: SenderTypeMember, LeafIndex: LeafIndex(len(occupancy) + 1)}
-	if err := CheckSenderLeaf(beyond, leafOccupied); !errors.Is(err, errBlankSenderLeaf) {
+	beyond := Sender{SenderType: SenderTypeMember, LeafIndex: LeafIndex(width + 1)}
+	if err := CheckSenderLeaf(beyond, fullyOccupied); !errors.Is(err, errBlankSenderLeaf) {
 		t.Errorf("a leaf past the end of the tree: got %v, want errBlankSenderLeaf", err)
 	}
 	widest := Sender{SenderType: SenderTypeMember, LeafIndex: math.MaxUint32}
-	if err := CheckSenderLeaf(widest, leafOccupied); !errors.Is(err, errBlankSenderLeaf) {
+	if err := CheckSenderLeaf(widest, fullyOccupied); !errors.Is(err, errBlankSenderLeaf) {
 		t.Errorf("the widest leaf index a uint32 holds: got %v, want errBlankSenderLeaf", err)
 	}
 
-	// every sender type that is not a member, derived off the registry rather than being the
-	// one somebody thought of, each at a leaf index this rule WOULD have refused. RFC 9420
+	// every sender type that is not a member, derived off the registry rather than being the one
+	// somebody thought of, at every leaf position under the pattern that blanks it -- so the
+	// carve out is exercised at each position this rule would otherwise have refused. RFC 9420
 	// section 6 gives those three types no leaf, so a rule that judged their zero valued
 	// LeafIndex would be answering about a field the message never carried.
 	others := 0
@@ -305,9 +347,14 @@ func TestSenderLeafRefusesBlankLeaf(t *testing.T) {
 		if senderType == SenderTypeMember {
 			continue
 		}
-		for _, at := range blank {
-			sender := Sender{SenderType: senderType, LeafIndex: at}
-			if err := CheckSenderLeaf(sender, leafOccupied); err != nil {
+		for at := 0; at < width; at += 1 {
+			pattern := patterns[at]
+			if pattern[at] {
+				t.Fatalf("pattern %d was expected to blank leaf %d and does not", at, at)
+			}
+			occupancy := func(leaf LeafIndex) bool { return int(leaf) < len(pattern) && pattern[leaf] }
+			sender := Sender{SenderType: senderType, LeafIndex: LeafIndex(at)}
+			if err := CheckSenderLeaf(sender, occupancy); err != nil {
 				t.Errorf("sender type %d at blank leaf %d was refused: %v; only a member carries a leaf index",
 					senderType, at, err)
 			}
