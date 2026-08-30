@@ -488,6 +488,30 @@ func TestARefusedOwnerSuccessorDecodeLeavesTheCallersValueAlone(t *testing.T) {
 	if refusals == 0 {
 		t.Fatal("no truncation was refused, so this states nothing about what a refusal leaves behind")
 	}
+
+	// and the refusal that is NOT a truncation, which is the one the sweep above cannot reach
+	// and the one this decoder actually has. A body that is complete and well formed and carries
+	// a floor this profile refuses is read to the END before Validate says no, so it is the only
+	// input that separates a decoder which validates before it publishes from one that publishes
+	// and then validates -- and the derived gate in decoder_publish_test.go cannot separate them
+	// either, because a Validate call is not a read of the Reader. Measured: with the assignment
+	// moved ahead of the Validate, the truncation sweep above still passes.
+	for _, refused := range [][]byte{
+		handAssembledOwnerSuccessorBody(t, 0x01, bytes.Repeat([]byte{0x11}, 32), 1, SuccessionFloorMinMs-1),
+		handAssembledOwnerSuccessorBody(t, 0x01, nil, 1770000000000, SuccessionFloorMinMs),
+	} {
+		into := held
+		into.SuccessorMemberId = bytes.Clone(held.SuccessorMemberId)
+		before := into
+		if err := syntax.Unmarshal(refused, &into); err == nil {
+			t.Fatalf("a body this profile refuses decoded without a refusal: %x", refused)
+		}
+		if into.Enabled != before.Enabled || into.NominatedAtMs != before.NominatedAtMs ||
+			into.FloorMs != before.FloorMs || !bytes.Equal(into.SuccessorMemberId, before.SuccessorMemberId) {
+			t.Fatalf("a decode refused by validation left the caller holding %+v, want %+v; the nomination its group actually agreed to has been overwritten by one this build will not act on",
+				into, before)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

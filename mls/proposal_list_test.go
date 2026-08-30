@@ -392,6 +392,59 @@ func TestProfileGateRefusesGreaseType(t *testing.T) {
 	if err := checkProposalProfile(defaultProfile(), proposal); !errors.Is(err, errUnsupportedProposalType) {
 		t.Fatalf("checkProposalProfile error = %v, want errUnsupportedProposalType", err)
 	}
+	// the same refusal over a value whose UnknownType is NOT set, which is the half the plan's
+	// version cannot state. A decoded GREASE proposal always carries UnknownType, so the forged
+	// discriminant clause refuses it whatever the type rule does -- measured: with the type rule
+	// disabled entirely, the case above still passes. This one is refused by the type rule or by
+	// nothing.
+	byTypeAlone := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownBody: []byte{0x01}}
+	if err := checkProposalProfile(defaultProfile(), byTypeAlone); !errors.Is(err, errUnsupportedProposalType) {
+		t.Fatalf("an unregistered proposal type carrying no forged discriminant was answered %v, want errUnsupportedProposalType",
+			err)
+	}
+}
+
+// TestCheckProposalTypeAnswersTheWholeCodePointSpaceFromTheRegistry is the total statement of the
+// one refusal surface, over all 65536 code points rather than over the eight the registry names.
+//
+// The derived sweep next door covers the REGISTERED types, which leaves the complement -- every
+// GREASE value, and every code point registered after this was written -- stated by nothing. That
+// gap is not theoretical: disabling the "not registered" branch of checkProposalType leaves every
+// named test in this file passing, because a decoded GREASE proposal carries UnknownType and is
+// caught by the forged discriminant clause instead. Two rules, one of which had silently stopped
+// running.
+func TestCheckProposalTypeAnswersTheWholeCodePointSpaceFromTheRegistry(t *testing.T) {
+	registered := proposalTypeValuesOf(proposalTypeRegistry(t))
+	unregistered, accepted := 0, 0
+	for value := 0; value <= 0xffff; value += 1 {
+		proposalType := ProposalType(value)
+		got := defaultProfile().checkProposalType(proposalType)
+		if !slices.Contains(registered, proposalType) {
+			unregistered += 1
+			if !errors.Is(got, errUnsupportedProposalType) {
+				t.Fatalf("the unregistered code point %#04x was answered %v, want errUnsupportedProposalType",
+					value, got)
+			}
+			continue
+		}
+		want := proposalTypeProfile[proposalType]
+		if want == nil {
+			accepted += 1
+			if got != nil {
+				t.Fatalf("the registered code point %#04x is classified as implemented and was answered %v",
+					value, got)
+			}
+			continue
+		}
+		if !errors.Is(got, want) {
+			t.Fatalf("the registered code point %#04x was answered %v, want %v", value, got, want)
+		}
+	}
+	if unregistered == 0 || accepted == 0 {
+		t.Fatalf("the sweep saw %d unregistered and %d accepted code points; a run with nothing on one side states only half the rule",
+			unregistered, accepted)
+	}
+	t.Logf("%d unregistered code points refused, %d registered and accepted", unregistered, accepted)
 }
 
 func TestProfileGateAcceptsTheFourV1Types(t *testing.T) {
