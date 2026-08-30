@@ -781,6 +781,32 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 	if calls := control.callsToPackage("syntax"); !slices.Equal(calls, []string{"syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)"}) {
 		t.Errorf("the matcher read %v out of a control building one raised writer", calls)
 	}
+	// and it reads an entry point reached through a RENAMED import as the entry point it is
+	// rather than as no call at all.
+	//
+	// Measured, not supposed: the matcher used to key on the literal identifier `syntax`, and
+	// adding `sx "github.com/urnetwork/connect/mls/syntax"` beside the plain import in
+	// welcome_wire.go together with an sx.UnmarshalLimit(data, welcome, sx.MaxRatchetTreeLength)
+	// entry point left this gate PASSING -- a brand new decode at the raised limit, invisible to
+	// the one gate whose whole subject is which limit this package enters the codec at, while
+	// the list it holds is exact and would have caught the same call spelled the usual way. The
+	// bound in the argument keeps the alias, which is the honest rendering: normalising it away
+	// would hide the second half of the same edit.
+	renamed := mustParseText(t, "the renamed import control", renamedSyntaxImportControl)
+	if calls := renamed.callsToPackage("syntax"); !slices.Equal(calls, []string{
+		"syntax.NewWriter()",
+		"syntax.UnmarshalLimit(data, value, sx.MaxRatchetTreeLength)",
+	}) {
+		t.Errorf("the matcher read %v out of a control entering the codec through a renamed import", calls)
+	}
+	// and a DOT imported codec is reported as the hole it is. Its entry points are spelled as
+	// bare identifiers, so there is no selector for this matcher or for syntaxInstantiationsAt
+	// to match, and a matcher that answered "no calls" would be issuing a clean bill to a file
+	// that enters the codec everywhere.
+	dotted := mustParseText(t, "the dot import control", dottedSyntaxImportControl)
+	if calls := dotted.callsToPackage("syntax"); !slices.Equal(calls, []string{"syntax" + packageAliasMarker}) {
+		t.Errorf("the matcher read %v out of a control that dot imported the codec", calls)
+	}
 }
 
 // A labelled construction whose writer would accept a field sixteen times longer than any
@@ -792,6 +818,35 @@ func mlsKdfLabel(label string, context []byte, length int) []byte {
 	writer := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
 	writer.WriteUint16(uint16(length))
 	return mlsLabelBytes(writer)
+}
+`
+
+// The same codec entered twice, once under its own name and once under a rename, with the
+// renamed entry carrying the raised bound. This is the shape a raised limit would arrive in
+// without anybody having to write the word syntax.
+const renamedSyntaxImportControl = `package mls
+
+import (
+	"github.com/urnetwork/connect/mls/syntax"
+	sx "github.com/urnetwork/connect/mls/syntax"
+)
+
+func decodeAtTheRaisedBound(data []byte, value *Welcome) error {
+	_ = syntax.NewWriter()
+	return sx.UnmarshalLimit(data, value, sx.MaxRatchetTreeLength)
+}
+`
+
+// The codec dot imported, which is the one spelling neither matcher can see: UnmarshalLimit
+// here is a bare identifier and carries no package selector at all.
+const dottedSyntaxImportControl = `package mls
+
+import (
+	. "github.com/urnetwork/connect/mls/syntax"
+)
+
+func decodeAtTheRaisedBound(data []byte, value *Welcome) error {
+	return UnmarshalLimit(data, value, MaxRatchetTreeLength)
 }
 `
 

@@ -1137,6 +1137,13 @@ func TestThisWelcomeCodecHandsWelcomeKeyNonceTheCiphertextItExpects(t *testing.T
 // decides which truncations can see it, and a single cut chosen here would be a guess at that.
 // The decode goes through UnmarshalMLS directly: syntax.Unmarshal's contract is about the
 // bytes, and this is a statement about the receiver.
+//
+// The TABLE is four rows and this package declares thirty one decoders, which is the shape rule
+// 5 exists for and which duly understated the class: the same edit that fails GroupInfo here
+// survived the whole suite in Commit, because Commit had no row. What decides membership now is
+// decoder_publish_test.go, which derives the verdict for every UnmarshalMLS off the source and
+// pins it; this file is what says what the verdict is worth for the four structures it owns, and
+// commit_wire_test.go does the same for Commit.
 func TestARefusedDecodeLeavesTheCallersValueAlone(t *testing.T) {
 	for _, one := range []struct {
 		name  string
@@ -1215,5 +1222,170 @@ func TestARefusedDecodeLeavesTheCallersValueAlone(t *testing.T) {
 					one.name, cut, len(encoded), after, heldBytes)
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the limit this product's own group needs, measured one level up from the tree
+// ---------------------------------------------------------------------------
+
+// welcomeWireProductGroupInfo is a GroupInfo carrying the ratchet_tree extension of the group
+// MASTER sizes this product for, built out of a real tree rather than out of a byte count.
+//
+// Out of a real tree because the number is the whole point: 500 members with two devices each is
+// productGroupLeafCount leaves, every leaf of this profile carries a 1216 octet X-Wing key in an
+// urmessage_leaf_keys extension, and the array that produces is about 1.33 MiB. A fixture that
+// stated 1394000 as a literal would go on passing after the leaf grew or the cap moved, which is
+// exactly when this measurement stops being true.
+func welcomeWireProductGroupInfo(t *testing.T, crypto CryptoProvider) (GroupInfo, []byte) {
+	t.Helper()
+	tree, _ := newTestTree(t, crypto, productGroupLeafCount)
+	extension, err := tree.Encode()
+	if err != nil {
+		t.Fatalf("encode a %d leaf ratchet tree as an extension: %v", productGroupLeafCount, err)
+	}
+	groupInfo := testGroupInfo()
+	groupInfo.Extensions = []Extension{extension}
+	return groupInfo, extension.ExtensionData
+}
+
+// TestAGroupInfoAndAWelcomeCarryingThisProductsTreeNeedTheRaisedLimitInBothDirections is the
+// obligation p7 inherits, recorded as a measurement rather than left in a comment.
+//
+// tree.go wires the ratchet_tree ARRAY to MaxRatchetTreeLength, and
+// TestTheRatchetTreeCodecIsHandedTheRaisedLimitAtTheProductsGroupSize holds that. What neither
+// of them reaches is the structure the array TRAVELS IN. A ratchet_tree extension is carried as
+// an Extension whose ExtensionData is a plain opaque<V>, so a GroupInfo decode meets that length
+// prefix through ReadOpaque and refuses it against whatever limit ITS caller opened, before
+// tree.go's raised entry point is anywhere in the call. The same again one level up: the Welcome
+// that seals the GroupInfo carries it as encrypted_group_info, another opaque<V>.
+//
+// So the two codecs are correct -- both take the caller's Reader and Writer, which is what lets
+// a caller open them at the bound the payload needs -- and the DEFAULT limit refuses this
+// product's own group in all four directions. Nothing in this tree opens either at
+// MaxRatchetTreeLength today: this package enters the codec at the raised bound in exactly two
+// places, tree.go's marshalRatchetTree and UnmarshalRatchetTree, and neither is reachable from a
+// GroupInfo decode. Whoever writes the group lifecycle owes those entry points, and this is the
+// measurement that says what they owe. The refusals are asserted as ErrLengthExceedsMax rather
+// than as any error, because a refusal for some other reason would be a fixture that had stopped
+// being the thing under test.
+//
+// The four directions are failed SEPARATELY for the reason the tree test states: a raise wired
+// into the decode alone still refuses to PUBLISH this product's own group info, and a Welcome
+// that encodes and cannot be read is the same defect wearing the other shoe. Each is asserted
+// behind a size guard: a fixture that shrank below MaxVectorLength would leave everything here
+// passing against either limit while reporting a clean bill over the one decision it exists to
+// make.
+func TestAGroupInfoAndAWelcomeCarryingThisProductsTreeNeedTheRaisedLimitInBothDirections(t *testing.T) {
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	groupInfo, treeBody := welcomeWireProductGroupInfo(t, crypto)
+
+	groupInfoBytes, err := syntax.MarshalLimit(&groupInfo, syntax.MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("a group info carrying a %d leaf ratchet tree does not encode at MaxRatchetTreeLength: %v; this is the encode the raised bound exists for",
+			productGroupLeafCount, err)
+	}
+	t.Logf("a group info carrying a %d leaf tree (%d members x 2 devices) encodes to %d octets, the tree body alone to %d; MaxVectorLength is %d and MaxRatchetTreeLength is %d",
+		productGroupLeafCount, productGroupLeafCount/2, len(groupInfoBytes), len(treeBody),
+		syntax.MaxVectorLength, syntax.MaxRatchetTreeLength)
+
+	// the Welcome that seals it. Sealed rather than padded to a chosen length, so the
+	// ciphertext measured here is the one a joiner is handed and its size is the AEAD's answer
+	// rather than a number this test picked.
+	key := bytes.Repeat([]byte{0x5c}, crypto.KeySize())
+	nonce := bytes.Repeat([]byte{0x3d}, crypto.NonceSize())
+	sealed, err := crypto.AeadSeal(key, nonce, nil, groupInfoBytes)
+	if err != nil {
+		t.Fatalf("seal a %d octet group info under a welcome key: %v", len(groupInfoBytes), err)
+	}
+	welcome := testWelcome()
+	welcome.EncryptedGroupInfo = sealed
+	welcomeBytes, err := syntax.MarshalLimit(&welcome, syntax.MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("a welcome carrying a %d octet encrypted_group_info does not encode at MaxRatchetTreeLength: %v",
+			len(sealed), err)
+	}
+
+	for _, one := range []struct {
+		what    string
+		encoded []byte
+		value   syntax.Codec
+		fresh   func() syntax.Codec
+	}{
+		{
+			what:    "a group info carrying this product's ratchet_tree extension",
+			encoded: groupInfoBytes,
+			value:   &groupInfo,
+			fresh:   func() syntax.Codec { return &GroupInfo{} },
+		},
+		{
+			what:    "the welcome that seals it",
+			encoded: welcomeBytes,
+			value:   &welcome,
+			fresh:   func() syntax.Codec { return &Welcome{} },
+		},
+	} {
+		// the guards that keep the two limits apart. Without the first, everything below
+		// holds under either bound and states nothing; without the second, this product does
+		// not fit the bound p1 raised for it, which is the regression worth failing on.
+		if len(one.encoded) <= syntax.MaxVectorLength {
+			t.Fatalf("%s encodes to %d octets, which the default limit of %d accepts, so nothing below can tell the two limits apart",
+				one.what, len(one.encoded), syntax.MaxVectorLength)
+		}
+		if len(one.encoded) > syntax.MaxRatchetTreeLength {
+			t.Fatalf("%s encodes to %d octets and the ratchet tree bound is %d, so this product's own group does not fit the limit p1 raised for it",
+				one.what, len(one.encoded), syntax.MaxRatchetTreeLength)
+		}
+
+		// the ENCODE at the default limit refuses it, which is the direction a raise wired
+		// only into the decode would leave broken
+		if _, err := syntax.Marshal(one.value); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+			t.Errorf("%s: syntax.Marshal answered %v, want syntax.ErrLengthExceedsMax; a member running the default bound cannot publish this legal group at all",
+				one.what, err)
+		}
+
+		// and the DECODE at the default limit refuses it, at the length prefix of the
+		// opaque<V> the payload travels in rather than anywhere inside the tree codec
+		if err := one.fresh().UnmarshalMLS(syntax.NewReader(one.encoded)); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+			t.Errorf("%s: the codec answered %v to a reader opened at the default limit, want syntax.ErrLengthExceedsMax; a peer running that bound reports this legal group as a corrupt message",
+				one.what, err)
+		}
+		if err := syntax.Unmarshal(one.encoded, one.fresh()); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+			t.Errorf("%s: syntax.Unmarshal answered %v, want syntax.ErrLengthExceedsMax", one.what, err)
+		}
+
+		// at the raised bound both directions succeed, and the round trip is byte exact
+		decoded := one.fresh()
+		if err := syntax.UnmarshalLimit(one.encoded, decoded, syntax.MaxRatchetTreeLength); err != nil {
+			t.Fatalf("%s: decoding at MaxRatchetTreeLength answered %v; this is the decode the raised bound exists for",
+				one.what, err)
+		}
+		reencoded, err := syntax.MarshalLimit(decoded, syntax.MaxRatchetTreeLength)
+		if err != nil {
+			t.Fatalf("%s: re-encoding at MaxRatchetTreeLength answered %v", one.what, err)
+		}
+		if !bytes.Equal(reencoded, one.encoded) {
+			t.Errorf("%s: the re-encoding at the raised bound differs from the encoding", one.what)
+		}
+	}
+
+	// and what came back out of the raised decode is this product's tree rather than an opaque
+	// of the right length
+	out := GroupInfo{}
+	if err := syntax.UnmarshalLimit(groupInfoBytes, &out, syntax.MaxRatchetTreeLength); err != nil {
+		t.Fatalf("decode the group info at MaxRatchetTreeLength: %v", err)
+	}
+	if len(out.Extensions) != 1 || out.Extensions[0].ExtensionType != ExtensionTypeRatchetTree {
+		t.Fatalf("the decoded group info carries %d extensions, want one ratchet_tree", len(out.Extensions))
+	}
+	if !bytes.Equal(out.Extensions[0].ExtensionData, treeBody) {
+		t.Errorf("the ratchet_tree body that came back is %d octets and the one that went in is %d",
+			len(out.Extensions[0].ExtensionData), len(treeBody))
+	}
+	// the body still needs tree.go's own raised entry point to become a tree, which is the
+	// distinction this whole test is about: the extension travelled as an opaque and nothing
+	// in the GroupInfo decode parsed it
+	if _, err := UnmarshalRatchetTree(out.Extensions[0].ExtensionData); err != nil {
+		t.Errorf("the ratchet_tree body carried through a group info does not decode: %v", err)
 	}
 }

@@ -809,6 +809,11 @@ func FuzzUpdatePathDecode(f *testing.F) {
 // TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit -- whose list is otherwise every way this
 // package enters the codec -- has never seen one.
 func (self parsedSource) syntaxInstantiationsAt(typeName string) []string {
+	// which identifiers this file spells the syntax package with, derived off its own imports
+	// for the reason namesOfImportedPackage states: a renamed import spells the same generic
+	// entry point under a different first identifier, and a matcher keyed on the literal name
+	// reports it as no instantiation at all.
+	names, dotImported := self.namesOfImportedPackage("syntax")
 	// which instantiations are a call's function, so that a called one is reported as the call
 	// that carries its bound rather than as the half of it that cannot.
 	enclosing := map[ast.Node]*ast.CallExpr{}
@@ -819,6 +824,9 @@ func (self parsedSource) syntaxInstantiationsAt(typeName string) []string {
 		return true
 	})
 	found := []string{}
+	if dotImported {
+		found = append(found, "syntax"+packageAliasMarker)
+	}
 	ast.Inspect(self.file, func(node ast.Node) bool {
 		var instantiated ast.Expr
 		var arguments []ast.Expr
@@ -834,17 +842,21 @@ func (self parsedSource) syntaxInstantiationsAt(typeName string) []string {
 		if !isSelector {
 			return true
 		}
-		if base, isIdentifier := selector.X.(*ast.Ident); !isIdentifier || base.Name != "syntax" {
+		base, isIdentifier := selector.X.(*ast.Ident)
+		if !isIdentifier || !slices.Contains(names, base.Name) {
 			return true
 		}
 		if !expressionsName(arguments, typeName) {
 			return true
 		}
+		// rendered under the package's own name whichever identifier the file spelled it
+		// with, so that the entry a gate holds against a list is the entry point and not the
+		// import alias in front of it
 		if call, isCalled := enclosing[node]; isCalled {
-			found = append(found, self.render(call))
+			found = append(found, "syntax"+strings.TrimPrefix(self.render(call), base.Name))
 			return true
 		}
-		found = append(found, self.render(node))
+		found = append(found, "syntax"+strings.TrimPrefix(self.render(node), base.Name))
 		return true
 	})
 	slices.Sort(found)
@@ -923,11 +935,61 @@ func TestEveryRatchetTreeCodecCallInThisPackageRunsAtTheRaisedBound(t *testing.T
 	if raised != 1 {
 		t.Errorf("the matcher read %d of the control's three ratchet tree sites as carrying the raised bound, want 1: %v", raised, entries)
 	}
+	// and a ratchet tree entry point reached through a RENAMED import is read as the entry point
+	// it is, under the package's own name, rather than as no instantiation at all.
+	//
+	// This matcher keyed on the literal identifier `syntax` for the same reason callsToPackage
+	// did, and it is the worse of the two places to have it: a generic instantiation is where the
+	// BOUND lives, so an aliased CheckRoundTrip[RatchetTree, ...] with no bound at all is a
+	// ratchet tree codec call running at the default limit that this gate would have reported as
+	// nothing. The alias survives on the bound argument, which is what makes the renamed raised
+	// call below still count as unbounded here -- the safe direction, since it forces the rename
+	// to be written down rather than passing silently.
+	renamed := mustParseText(t, "the renamed import control", renamedRatchetTreeBoundControl)
+	if entries := renamed.syntaxInstantiationsAt("RatchetTree"); !slices.Equal(entries, []string{
+		"syntax.CheckRoundTripLimit[RatchetTree, *RatchetTree](bs, sx.MaxRatchetTreeLength)",
+	}) {
+		t.Errorf("the matcher read %v out of a control entering the ratchet tree codec through a renamed import", entries)
+	}
+	// and a DOT imported codec is reported as the hole it is rather than as a file that
+	// instantiates nothing: a bare CheckRoundTripLimit[RatchetTree, ...] has no package selector
+	// for this matcher to match.
+	dotted := mustParseText(t, "the dot import control", dottedRatchetTreeBoundControl)
+	if entries := dotted.syntaxInstantiationsAt("RatchetTree"); !slices.Equal(entries, []string{
+		"syntax" + packageAliasMarker,
+	}) {
+		t.Errorf("the matcher read %v out of a control that dot imported the codec", entries)
+	}
 	// the count of raised ones rather than the word "all", because this line prints on the way out
 	// of a failure too and a log that contradicts the error above it is worse than no log.
 	t.Logf("%d ratchet tree codec instantiations, %d of them at the raised bound: %v",
 		len(found), len(found)-len(unbounded), found)
 }
+
+// The ratchet tree codec entered through a rename, which is the spelling a matcher keyed on the
+// literal package name reads as no instantiation at all.
+const renamedRatchetTreeBoundControl = `package mls
+
+import (
+	sx "github.com/urnetwork/connect/mls/syntax"
+)
+
+func checkRaised(bs []byte) error {
+	return sx.CheckRoundTripLimit[RatchetTree, *RatchetTree](bs, sx.MaxRatchetTreeLength)
+}
+`
+
+// The same entered through a dot import, where there is no selector to match at all.
+const dottedRatchetTreeBoundControl = `package mls
+
+import (
+	. "github.com/urnetwork/connect/mls/syntax"
+)
+
+func checkRaised(bs []byte) error {
+	return CheckRoundTripLimit[RatchetTree, *RatchetTree](bs, MaxRatchetTreeLength)
+}
+`
 
 // A file entering the ratchet tree codec at both bounds, plus one generic syntax call over another
 // structure. Every matcher above runs on this as well as on the real source.

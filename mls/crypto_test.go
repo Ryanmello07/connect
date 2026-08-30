@@ -635,12 +635,64 @@ func (self parsedSource) methodsOn(receiver string) []string {
 	return names
 }
 
-// Every call in this file written as a selector on one package, rendered. A gate over
-// which constructor a package is entered through reads this rather than the file's
-// characters, so a call spelled across two lines or with a differently named import
-// still reports as the call it is.
+// packageAliasMarker is the entry the matchers below report instead of a call list when a
+// file has DOT imported the package they are asked about.
+//
+// A dot imported entry point is spelled as a bare identifier -- Unmarshal(data, v) rather
+// than syntax.Unmarshal(data, v) -- so it has no selector for either matcher to match, and
+// reporting nothing would be reporting a clean file. This entry has no valid spelling, so a
+// gate holding an exact list fails on it rather than passing over a whole import.
+const packageAliasMarker = " IS DOT IMPORTED, so its entry points are bare identifiers and this matcher cannot see them"
+
+// Every identifier this file can spell one imported package with, and whether it dot
+// imported it.
+//
+// Derived off the file's own import declarations rather than assumed to be the package
+// name. A renamed import spells the SAME entry point under a different first identifier,
+// and a matcher keyed on the literal name reports it as no call at all -- which for a gate
+// holding an exact list is a new entry point that joins nothing. Measured: adding
+// `sx "github.com/urnetwork/connect/mls/syntax"` beside the plain import in welcome_wire.go
+// together with an sx.UnmarshalLimit(data, welcome, sx.MaxRatchetTreeLength) entry point
+// left TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit passing -- a brand new decode
+// at the RAISED limit, unrecorded by the gate whose whole subject is which limit this
+// package enters the codec at.
+//
+// The package's own name is always in the set, so a control source that spells a call
+// without importing anything is still read.
+func (self parsedSource) namesOfImportedPackage(pkg string) ([]string, bool) {
+	names, dotImported := []string{pkg}, false
+	for _, imported := range self.file.Imports {
+		path, err := strconv.Unquote(imported.Path.Value)
+		if err != nil || path[strings.LastIndex(path, "/")+1:] != pkg {
+			continue
+		}
+		if imported.Name == nil {
+			continue
+		}
+		switch imported.Name.Name {
+		case ".":
+			dotImported = true
+		case "_":
+		default:
+			if !slices.Contains(names, imported.Name.Name) {
+				names = append(names, imported.Name.Name)
+			}
+		}
+	}
+	return names, dotImported
+}
+
+// Every call in this file written as a selector on one package, rendered under the
+// package's OWN name whichever identifier the file spelled it with. A gate over which
+// constructor a package is entered through reads this rather than the file's characters,
+// so a call spelled across two lines or with a differently named import still reports as
+// the call it is.
 func (self parsedSource) callsToPackage(pkg string) []string {
+	names, dotImported := self.namesOfImportedPackage(pkg)
 	calls := []string{}
+	if dotImported {
+		calls = append(calls, pkg+packageAliasMarker)
+	}
 	ast.Inspect(self.file, func(node ast.Node) bool {
 		call, isCall := node.(*ast.CallExpr)
 		if !isCall {
@@ -650,8 +702,8 @@ func (self parsedSource) callsToPackage(pkg string) []string {
 		if !isSelector {
 			return true
 		}
-		if base, isIdentifier := selector.X.(*ast.Ident); isIdentifier && base.Name == pkg {
-			calls = append(calls, self.render(call))
+		if base, isIdentifier := selector.X.(*ast.Ident); isIdentifier && slices.Contains(names, base.Name) {
+			calls = append(calls, pkg+strings.TrimPrefix(self.render(call), base.Name))
 		}
 		return true
 	})
