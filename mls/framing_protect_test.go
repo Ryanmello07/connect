@@ -4735,9 +4735,16 @@ func TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSectio
 			continue
 		}
 
-		// the absence half. Each field the header and the sender data carry is moved in turn and
-		// these octets must not move with it, so a body that grew a second copy of one is a
-		// failure here rather than a copy that agrees with the header until the day it does not.
+		// the absence half, and it is the SOLE catcher of its own class rather than a restatement
+		// of the comparison above. Each field the header and the encrypted sender data carry is
+		// moved in turn, and these octets must not move with it.
+		//
+		// MEASURED, because a sweep whose whole class is already covered by the line above it is
+		// better deleted: an encoder that writes the group id into the body only when it is longer
+		// than the octets this row publishes leaves the comparison above green and every round trip
+		// sweep in this file green, and fails here. That is the shape a covert channel written into
+		// the plaintext under a CONDITION has, and no golden over the octets one content happens to
+		// produce can see it.
 		for _, name := range reassembled {
 			moved := *row.content
 			perturbFramedContentField(t, reflect.ValueOf(&moved).Elem(), name)
@@ -4752,9 +4759,15 @@ func TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSectio
 			}
 		}
 
-		// the decode direction, over the HAND WRITTEN octets and not over this encoder's, so a
-		// transposition present on the decode side alone -- which round trips nothing and is
-		// therefore invisible to every symmetry test in this file -- is caught here.
+		// the decode direction, over the HAND WRITTEN octets and not over this encoder's.
+		//
+		// Recorded as what it is rather than stated as a second guarantee. MEASURED: the symmetric
+		// transposition this test exists for fails the comparison ABOVE and leaves every round trip
+		// sweep in this file green, and the same transposition on the decode side alone fails those
+		// sweeps as well as this -- so this half is the sole catcher of neither, and it is redundant
+		// for as long as the comparison above stays byte exact and something else round trips. It is
+		// kept because that transitivity is only as good as those two, and because a decoder that
+		// refused octets no encoder in this package produces has no other reader on this branch.
 		//
 		// The sender handed in is deliberately not the one the row carries: section 6.3.1 has no
 		// sender in it, so a decoder that produced this row's sender read it somewhere it does

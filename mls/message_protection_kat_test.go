@@ -822,10 +822,10 @@ func messageProtectionRawValueOf(opened *AuthenticatedContent) ([]byte, error) {
 // on messagesCheck in messages_kat_test.go. MEASURED: replacing it with the comparator's own copy
 // of the published answer -- `want := HexOf(check.want)`, so the runner compares the corpus
 // against itself and opens the file a second time for nothing -- leaves the whole of ./mls/... and
-// ./message/... green at 6510 passing. A comparator that answered without opening anything is a
-// failure in verdict(), which compares every recovered half against the published one and requires
-// every check to be non-empty; it is not this loop that catches it, and the earlier wording here
-// said it was.
+// ./message/... at 6511 passing and 0 failing, which is the baseline exactly. A comparator that
+// answered without opening anything is a failure in verdict(), which compares every recovered half
+// against the published one and requires every check to be non-empty; it is not this loop that
+// catches that, and the wording here used to say it was.
 //
 // What the second reading is FOR is the one thing that comparison cannot reach: a check whose
 // FIELD does not address the answer it carries, or names a column the corpus does not publish at
