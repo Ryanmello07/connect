@@ -4505,6 +4505,296 @@ func framingPrivateWidePaddingLengths() []int {
 	return slices.Compact(lengths)
 }
 
+// framedContentArmFields is every field of FramedContent that RFC 9420 section 6.3.1 carries
+// INSIDE the ciphertext, derived by joining the two structures rather than listed.
+//
+// A field of FramedContent the cleartext PrivateMessage header also carries is REASSEMBLED by the
+// decoder and never decoded: section 6.3.1 leaves the group id, the epoch, the content type and
+// the authenticated data outside the ciphertext, and unmarshalPrivateMessageContent copies them
+// off the header. What remains is the content arm, and Sender -- which is the one exclusion, and
+// it is the RFC's rather than a convenience: section 6.3.2 carries the sender in the ENCRYPTED
+// SENDER DATA and not in the content, which is why the decoder takes it as a parameter instead of
+// reading it out of these octets.
+//
+// Derived so that an arm added to FramedContent by a later task arrives in the layout table below
+// as a fatal rather than as a plaintext nothing ever wrote down.
+func framedContentArmFields(t *testing.T) []string {
+	t.Helper()
+	elsewhere := map[string]bool{"Sender": true}
+	header := reflect.TypeOf(PrivateMessage{})
+	for index := 0; index < header.NumField(); index++ {
+		elsewhere[header.Field(index).Name] = true
+	}
+	arms := []string{}
+	shape := reflect.TypeOf(FramedContent{})
+	for index := 0; index < shape.NumField(); index++ {
+		if name := shape.Field(index).Name; !elsewhere[name] {
+			arms = append(arms, name)
+		}
+	}
+	slices.Sort(arms)
+	if len(arms) == 0 {
+		t.Fatal("the join of FramedContent against the cleartext header found no content arm at all, so the layout table below would be held to an empty class")
+	}
+	return arms
+}
+
+// privateMessageContentGolden is one row of the section 6.3.1 layout table: the arm the row's
+// content type selects, a content that carries it, and the octets that arm alone encodes to.
+type privateMessageContentGolden struct {
+	field   string
+	content *FramedContent
+	arm     []byte
+}
+
+// handDerivedPrivateMessageContentGoldens is RFC 9420 section 6.3.1's PrivateMessageContent
+// written from the wire format, not read back out of framing_protect.go.
+//
+//	struct {
+//	    select (PrivateMessageContent.content_type) {
+//	        case application:  opaque application_data<V>;
+//	        case proposal:     Proposal proposal;
+//	        case commit:       Commit commit;
+//	    };
+//	    FramedContentAuthData auth;
+//	    opaque padding[length_of_padding];
+//	} PrivateMessageContent;
+//
+// The octet arithmetic, from the varint length prefix p1 implements: a length below 64 has prefix
+// bits 00 and occupies one octet.
+//
+//	application  application_data<V> over aa bb    -> 02 aa bb
+//	proposal     ProposalType remove = 0x0003, then Remove.removed as a uint32 3
+//	                                               -> 00 03 00 00 00 03
+//	commit       proposals<V> empty -> 00, then optional<UpdatePath> absent -> 00
+//	                                               -> 00 00
+//
+// Every row also carries distinctive values in the fields the body must NOT hold -- a group id, an
+// epoch, a sender and an authenticated data -- so the sweep below can move each of them and
+// require these octets not to move with them.
+func handDerivedPrivateMessageContentGoldens() map[ContentType]privateMessageContentGolden {
+	reassembled := func() *FramedContent {
+		return &FramedContent{
+			GroupId:           []byte{0x67, 0x69},
+			Epoch:             4,
+			Sender:            Sender{SenderType: SenderTypeMember, LeafIndex: 2},
+			AuthenticatedData: []byte{0xad, 0xae},
+		}
+	}
+	application := reassembled()
+	application.ContentType = ContentTypeApplication
+	application.ApplicationData = []byte{0xaa, 0xbb}
+
+	proposal := reassembled()
+	proposal.ContentType = ContentTypeProposal
+	proposal.Proposal = &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 3}}
+
+	commit := reassembled()
+	commit.ContentType = ContentTypeCommit
+	commit.Commit = &Commit{}
+
+	return map[ContentType]privateMessageContentGolden{
+		ContentTypeApplication: {"ApplicationData", application, []byte{0x02, 0xaa, 0xbb}},
+		ContentTypeProposal:    {"Proposal", proposal, []byte{0x00, 0x03, 0x00, 0x00, 0x00, 0x03}},
+		ContentTypeCommit:      {"Commit", commit, []byte{0x00, 0x00}},
+	}
+}
+
+// handDerivedPrivateMessageContentAuth is the value handDerivedAuthDataGolden's octets are the
+// encoding of, built off authDataVariantPaths rather than off a select written out a second time.
+//
+// That arm table is the one framing_test.go already holds to the type, so an arm that gained a
+// field there gains one here rather than leaving this layout stating the shape it used to have.
+func handDerivedPrivateMessageContentAuth(t *testing.T, contentType ContentType) *FramedContentAuthData {
+	t.Helper()
+	fields, held := authDataVariantPaths[contentType]
+	if !held || len(fields) == 0 {
+		t.Fatalf("no auth data arm is written down for content type %d, so the layout below would be over an empty tail", contentType)
+	}
+	auth := &FramedContentAuthData{}
+	for _, name := range fields {
+		switch name {
+		case "Signature":
+			auth.Signature = []byte{0x11, 0x22, 0x33}
+		case "ConfirmationTag":
+			auth.ConfirmationTag = []byte{0x44, 0x55}
+		default:
+			t.Fatalf("the auth data arm of content type %d carries the field %s and this layout has no octets for it",
+				contentType, name)
+		}
+	}
+	return auth
+}
+
+// perturbFramedContentField moves one field of a FramedContent to a different value, by SHAPE
+// rather than by name.
+//
+// It fails on a shape it has no move for, deliberately: a field added to FramedContent that this
+// could not move is a field the sweep below would otherwise report as absent from the encrypted
+// body having never once changed it.
+func perturbFramedContentField(t *testing.T, content reflect.Value, name string) {
+	t.Helper()
+	field := content.FieldByName(name)
+	if !field.IsValid() || !field.CanSet() {
+		t.Fatalf("%s is not a settable field of FramedContent, so this sweep would move nothing", name)
+	}
+	switch {
+	case field.Type() == reflect.TypeOf([]byte(nil)):
+		field.Set(reflect.ValueOf([]byte{0x5a, 0x5b, 0x5c}))
+	case field.Kind() == reflect.Uint64:
+		field.SetUint(field.Uint() + 0x0102030405060708)
+	case field.Type() == reflect.TypeOf(Sender{}):
+		field.Set(reflect.ValueOf(Sender{SenderType: SenderTypeExternal, SenderIndex: 0x0b0c0d0e}))
+	default:
+		t.Fatalf("%s is a %s and this sweep has no move for that shape", name, field.Type())
+	}
+}
+
+// TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSection631Writes holds the
+// section 6.3.1 plaintext to the RFC, over a class derived twice and in both directions.
+//
+// Why a golden and not another round trip. The defect this refuses is the auth data written
+// BEFORE the content arm by the encoder and read before it by the decoder -- a SYMMETRIC
+// transposition, so every round trip in this package still passes, every encode-then-decode still
+// agrees, and what comes out is a plaintext every peer decrypts and then reads as a different
+// message. MEASURED before this test existed: that edit failed four tests on the whole branch and
+// all four were family 4's -- message_protection_kat_test.go's vector runner, its installation
+// gate, its comparator control, and the registry that drives it -- because family 4's three
+// private columns are the only foreign PrivateMessages anything on this branch opens. A vector
+// runner is a fine catcher and a poor SOLE catcher: it reports a corpus that disagreed rather
+// than a layout that moved, and it goes quiet the day the corpus is not vendored.
+//
+// The class is joined twice, the way TestEveryRegisteredProposalArmEncodesToTheLayoutSection121-
+// Writes joins its own: to the ContentType registry, so a fourth content type cannot land without
+// a layout, and to the arms of FramedContent that section 6.3.1 carries inside the ciphertext, so
+// an arm cannot land without one either. The COMPLEMENT of that join is swept as well -- every
+// field of FramedContent that is neither an arm nor the selector must leave these octets unchanged
+// when it moves -- because "the sender comes from the sender data" is a claim about what is ABSENT
+// from this plaintext, and nothing that round trips can see an absence.
+func TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSection631Writes(t *testing.T) {
+	goldens := handDerivedPrivateMessageContentGoldens()
+	covered := slices.Sorted(maps.Keys(goldens))
+
+	declared := []ContentType{}
+	for _, value := range registryConstantsOfType(t, "ContentType") {
+		declared = append(declared, ContentType(value))
+	}
+	slices.Sort(declared)
+	if !slices.Equal(declared, covered) {
+		t.Fatalf("package mls registers the content types %v and this table lays out %v; a content type with no golden is one whose plaintext nothing has written down, and its layout is whatever the encoder happens to do",
+			declared, covered)
+	}
+
+	arms := framedContentArmFields(t)
+	laid := []string{}
+	for _, contentType := range covered {
+		laid = append(laid, goldens[contentType].field)
+	}
+	slices.Sort(laid)
+	if !slices.Equal(arms, laid) {
+		t.Fatalf("section 6.3.1 carries the FramedContent arms %v inside the ciphertext and this table lays out %v; the two derivations disagree, so one of them has stopped describing the structure",
+			arms, laid)
+	}
+
+	// the complement of the arm join. A field of FramedContent is an arm with a golden, or the
+	// selector, or a field this plaintext must not carry -- and there is no fourth kind, so a
+	// field added later cannot sit outside all three.
+	reassembled := []string{}
+	shape := reflect.TypeOf(FramedContent{})
+	for index := 0; index < shape.NumField(); index++ {
+		name := shape.Field(index).Name
+		if name == "ContentType" || slices.Contains(arms, name) {
+			continue
+		}
+		reassembled = append(reassembled, name)
+	}
+	if len(reassembled) == 0 {
+		t.Fatal("every field of FramedContent is an arm or the selector, so the absence sweep below moves nothing")
+	}
+
+	padding := []byte{0x00, 0x00, 0x00, 0x00}
+	for _, contentType := range covered {
+		row := goldens[contentType]
+		if row.content.ContentType != contentType {
+			t.Fatalf("the %s row carries content type %d and is keyed at %d", row.field, row.content.ContentType, contentType)
+		}
+		if arm := reflect.ValueOf(*row.content).FieldByName(row.field); !arm.IsValid() || arm.IsZero() {
+			t.Fatalf("the %s row does not populate the arm it names, so whatever it encodes to is not that arm", row.field)
+		}
+		auth := handDerivedPrivateMessageContentAuth(t, contentType)
+		golden := joinBytes(row.arm, handDerivedAuthDataGolden(contentType), padding)
+
+		encoded, err := marshalPrivateMessageContentWithPadding(row.content, auth, padding)
+		if err != nil {
+			t.Errorf("%s: marshal: %v", row.field, err)
+			continue
+		}
+		if !bytes.Equal(encoded, golden) {
+			t.Errorf("a %s PrivateMessageContent encodes to %x and RFC 9420 section 6.3.1 writes %x; an encoder and a decoder that agree on an order the RFC does not still seal and open every message this package makes, and read every message a peer makes as a different one",
+				row.field, encoded, golden)
+			continue
+		}
+
+		// the absence half. Each field the header and the sender data carry is moved in turn and
+		// these octets must not move with it, so a body that grew a second copy of one is a
+		// failure here rather than a copy that agrees with the header until the day it does not.
+		for _, name := range reassembled {
+			moved := *row.content
+			perturbFramedContentField(t, reflect.ValueOf(&moved).Elem(), name)
+			again, err := marshalPrivateMessageContentWithPadding(&moved, auth, padding)
+			if err != nil {
+				t.Errorf("%s: marshal with %s moved: %v", row.field, name, err)
+				continue
+			}
+			if !bytes.Equal(again, golden) {
+				t.Errorf("%s: moving %s changed the section 6.3.1 plaintext to %x; the cleartext header and the encrypted sender data carry that field, and a body holding a second copy of it is a copy no peer reads",
+					row.field, name, again)
+			}
+		}
+
+		// the decode direction, over the HAND WRITTEN octets and not over this encoder's, so a
+		// transposition present on the decode side alone -- which round trips nothing and is
+		// therefore invisible to every symmetry test in this file -- is caught here.
+		//
+		// The sender handed in is deliberately not the one the row carries: section 6.3.1 has no
+		// sender in it, so a decoder that produced this row's sender read it somewhere it does
+		// not belong.
+		sender := Sender{SenderType: SenderTypeMember, LeafIndex: 9}
+		decoded, decodedAuth, err := unmarshalPrivateMessageContent(golden, framingPrivateHeaderFor(row.content), sender)
+		if err != nil {
+			t.Errorf("%s: the hand written layout did not decode: %v", row.field, err)
+			continue
+		}
+		if decoded.Sender != sender {
+			t.Errorf("%s: the layout decoded with sender %+v, want the one handed in, %+v", row.field, decoded.Sender, sender)
+			continue
+		}
+		if err := decoded.checkArms(); err != nil {
+			t.Errorf("%s: the layout decoded to a content production's own arm rule refuses: %v", row.field, err)
+			continue
+		}
+		if arm := reflect.ValueOf(*decoded).FieldByName(row.field); !arm.IsValid() || arm.IsZero() {
+			t.Errorf("%s: the layout decoded with that arm empty, so the decoder read past the body and dropped it", row.field)
+			continue
+		}
+		if !bytes.Equal(decodedAuth.Signature, auth.Signature) ||
+			!bytes.Equal(decodedAuth.ConfirmationTag, auth.ConfirmationTag) {
+			t.Errorf("%s: the layout's tail decoded as signature %x and tag %x, want %x and %x",
+				row.field, decodedAuth.Signature, decodedAuth.ConfirmationTag, auth.Signature, auth.ConfirmationTag)
+			continue
+		}
+		reencoded, err := marshalPrivateMessageContentWithPadding(decoded, decodedAuth, padding)
+		if err != nil {
+			t.Errorf("%s: re-marshal what the layout decoded to: %v", row.field, err)
+			continue
+		}
+		if !bytes.Equal(reencoded, golden) {
+			t.Errorf("%s: what the layout decoded to re-encodes as %x, want %x", row.field, reencoded, golden)
+		}
+	}
+	t.Logf("RFC 9420 section 6.3.1 held over the content types %v and the arms %v, in both directions", covered, arms)
+}
+
 // TestPrivateMessageContentRoundTripsEveryPaddingLengthAtEveryContentType is the symmetry
 // property, and it is stated for what it CANNOT see as much as for what it can.
 //

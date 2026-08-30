@@ -75,11 +75,23 @@
 // refused, by three rows of the table below at once. So the family's content comparison is
 // observed; either arm of it alone is not.
 //
-// And nothing here is the SOLE catcher of a code defect. Every single edit tried against the
-// framing crypto these five columns cover -- an epoch off by one inside the section 6.3.2 AAD,
-// the two ratchets exchanged, the reuse guard xored onto the tail of the nonce, the reuse guard
-// drawn as a constant, the SenderData codec transposed, the GroupContext codec transposed -- is
-// refused by this runner AND by a hand derived preimage or golden test elsewhere in the package.
+// And nothing here is the SOLE catcher of a code defect -- a claim first measured over a list of
+// edits that had a hole in it, and the hole is written down here rather than quietly filled in.
+// Every edit on the original list -- an epoch off by one inside the section 6.3.2 AAD, the two
+// ratchets exchanged, the reuse guard xored onto the tail of the nonce, the reuse guard drawn as a
+// constant, the SenderData codec transposed, the GroupContext codec transposed -- is refused by
+// this runner AND by a hand derived preimage or golden test elsewhere in the package. The edit the
+// list did not hold is the PrivateMessageContent codec transposed: section 6.3.1's auth data
+// written before the content arm by the encoder and read before it by the decoder. That one is
+// SYMMETRIC, so every round trip in the package still passes and every encode-then-decode still
+// agrees, and MEASURED it failed four tests on the whole branch -- this runner, its installation
+// gate, its comparator control, and the registry that drives it, which is family 4 four times over
+// and nothing else. It is now also refused by
+// TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSection631Writes in
+// framing_protect_test.go, section 6.3.1 written out by hand over every registered content type in
+// both directions, so the claim above holds again over a list one edit longer than the one it was
+// first measured on.
+//
 // What this family holds alone is the three PRIVATE columns, which nothing else on this branch
 // opens at all, the three raw values every column carries, the byte exact re-seal, and the
 // accounting: fourteen comparisons against nine distinct published answers.
@@ -90,6 +102,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"reflect"
 	"slices"
 	"strings"
@@ -799,8 +815,23 @@ func messageProtectionRawValueOf(opened *AuthenticatedContent) ([]byte, error) {
 //
 // What the loop counts is not calls that returned. It counts comparisons whose recovered half
 // this runner itself re-checked against a GENERIC decode of the corpus text -- no struct tag in
-// the way -- so a comparator that answered without opening anything is a failure here rather than
-// a number that looks right.
+// the way.
+//
+// That second reading is REDUNDANT with the comparator's own verdict, and it is recorded here as
+// redundant rather than stated as a second guarantee, the way family 12 records the same construct
+// on messagesCheck in messages_kat_test.go. MEASURED: replacing it with the comparator's own copy
+// of the published answer -- `want := HexOf(check.want)`, so the runner compares the corpus
+// against itself and opens the file a second time for nothing -- leaves the whole of ./mls/... and
+// ./message/... green at 6510 passing. A comparator that answered without opening anything is a
+// failure in verdict(), which compares every recovered half against the published one and requires
+// every check to be non-empty; it is not this loop that catches it, and the earlier wording here
+// said it was.
+//
+// What the second reading is FOR is the one thing that comparison cannot reach: a check whose
+// FIELD does not address the answer it carries, or names a column the corpus does not publish at
+// all. Both are silent on the comparator's side, because the field a check names and the answer it
+// carries come off one row of one table and cannot disagree there. The two readings are redundant
+// only while that stays true, which is why this one is kept rather than deleted.
 func TestVectorMessageProtection(t *testing.T) {
 	tally, entries := newVectorRunTally(t, messageProtectionKatFile)
 	for index, raw := range entries {
@@ -1139,8 +1170,155 @@ func TestCompareMessageProtectionVectorRefusesACaseItShouldNotAccept(t *testing.
 	assertComparatorRefuses(t, "message-protection", refuseMessageProtectionVector, encode(base), refusals)
 }
 
-// TestTheMessageProtectionGeneratorReachesAnIndependentDerivation is the other half of the claim
-// this family's generate direction makes about itself.
+// theGroupContextParameters is every production entry point of this package that takes a
+// SERIALIZED GROUP CONTEXT, and the argument position it takes it in, read off the type checked
+// package rather than listed.
+//
+// Derived because the class is the thing under test. "The two functions family 4's generator
+// seals with" is a list, and a list covers the call sites somebody remembered: a third production
+// entry point taking a group context -- and this derivation finds more than two -- called from the
+// generator would be a message protected over whatever it was handed, with nothing asking where
+// those octets came from. The join is the PARAMETER NAME, which production spells one way
+// everywhere, and the gate below fails outright if the derivation finds none.
+//
+// Methods as well as package level functions. A group context reaches production through whatever
+// names it, and a derivation reading the package scope alone would exempt every method the day one
+// takes one.
+func theGroupContextParameters(t *testing.T) map[string]int {
+	t.Helper()
+	positions := map[string]int{}
+	take := func(name string, signature *types.Signature) {
+		params := signature.Params()
+		for index := 0; index < params.Len(); index++ {
+			if params.At(index).Name() == "groupContext" {
+				positions[name] = index
+				return
+			}
+		}
+	}
+	scope := typeCheckedPackage(t).Scope()
+	for _, name := range scope.Names() {
+		switch found := scope.Lookup(name).(type) {
+		case *types.Func:
+			if signature, isSignature := found.Type().(*types.Signature); isSignature {
+				take(found.Name(), signature)
+			}
+		case *types.TypeName:
+			named, isNamed := found.Type().(*types.Named)
+			if !isNamed {
+				continue
+			}
+			for index := 0; index < named.NumMethods(); index++ {
+				method := named.Method(index)
+				if signature, isSignature := method.Type().(*types.Signature); isSignature {
+					take(method.Name(), signature)
+				}
+			}
+		}
+	}
+	return positions
+}
+
+// aGroupContextSite is one call a generator makes into production in the group context position:
+// the callee, the function whose call produced the octets handed to it, and how that argument was
+// written, so a failure names the shape it could not resolve rather than reporting a bare no.
+type aGroupContextSite struct {
+	callee   string
+	origin   string
+	spelling string
+}
+
+// theCalleeNameOf is the bare name a call expression invokes, which is how a call reaches a
+// production function whether it is written plain or through a qualifier.
+func theCalleeNameOf(callee ast.Expr) string {
+	switch named := callee.(type) {
+	case *ast.Ident:
+		return named.Name
+	case *ast.SelectorExpr:
+		return named.Sel.Name
+	}
+	return ""
+}
+
+// theOriginOfArgument names the function whose call produced one argument, following a local name
+// back through the single assignment that wrote it and no further.
+//
+// ONE hop and not a fixed point. One hop is the shape being judged -- a context built on one line
+// and passed on the next -- and a walk that chased names indefinitely would have to answer what to
+// do about a name assigned from itself. A second hop resolves to no origin, which the gate below
+// reads as a failure and never as a pass.
+func theOriginOfArgument(argument ast.Expr, assigned map[string][]ast.Expr) (origin string, spelling string) {
+	switch expression := argument.(type) {
+	case *ast.CallExpr:
+		if name := theCalleeNameOf(expression.Fun); name != "" {
+			return name, name + "(...)"
+		}
+		return "", "a call whose callee this walk cannot name"
+	case *ast.Ident:
+		wrote := assigned[expression.Name]
+		if len(wrote) != 1 {
+			return "", fmt.Sprintf("%s, which this body assigns %d times", expression.Name, len(wrote))
+		}
+		call, isCall := wrote[0].(*ast.CallExpr)
+		if !isCall {
+			return "", fmt.Sprintf("%s, which this body assigns from something that is not a call", expression.Name)
+		}
+		if name := theCalleeNameOf(call.Fun); name != "" {
+			return name, fmt.Sprintf("%s, assigned from %s(...)", expression.Name, name)
+		}
+		return "", fmt.Sprintf("%s, assigned from a call this walk cannot name", expression.Name)
+	}
+	return "", "an expression this walk cannot resolve to a call"
+}
+
+// theGroupContextSitesOf resolves, for every call one function body makes to a production entry
+// point that takes a group context, which function PRODUCED the octets passed there.
+//
+// A CALL and not a mention, for theCallsReachableFrom's reason: a call replaced by a discard of the
+// same identifier still names it, and a gate reading mentions is satisfied by the edit it exists to
+// refuse.
+//
+// Two spellings resolve -- the argument is itself a call, or it is a local name this body assigns
+// exactly once from one -- and everything else resolves to NO origin and is reported rather than
+// accepted. The walk fails CLOSED on purpose: a refactor that moved the seal into a helper, or that
+// assigned the context in two places, leaves the gate with an origin it cannot name, and that is a
+// derivation to be redone rather than a pass to be collected.
+func theGroupContextSitesOf(function *ast.FuncDecl, positions map[string]int) []aGroupContextSite {
+	assigned := map[string][]ast.Expr{}
+	ast.Inspect(function, func(node ast.Node) bool {
+		assignment, isAssignment := node.(*ast.AssignStmt)
+		if !isAssignment {
+			return true
+		}
+		for index, target := range assignment.Lhs {
+			name, isName := target.(*ast.Ident)
+			if !isName || index >= len(assignment.Rhs) {
+				continue
+			}
+			assigned[name.Name] = append(assigned[name.Name], assignment.Rhs[index])
+		}
+		return true
+	})
+	sites := []aGroupContextSite{}
+	ast.Inspect(function, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		callee := theCalleeNameOf(call.Fun)
+		at, takes := positions[callee]
+		if !takes || at >= len(call.Args) {
+			return true
+		}
+		origin, spelling := theOriginOfArgument(call.Args[at], assigned)
+		sites = append(sites, aGroupContextSite{callee: callee, origin: origin, spelling: spelling})
+		return true
+	})
+	return sites
+}
+
+// TestTheMessageProtectionGeneratorProtectsOverAnIndependentGroupContext is the other half of the
+// claim this family's generate direction makes about itself.
 //
 // The claim is that the generator protects its messages over a group context THIS FILE wrote out
 // by hand while the consume direction verifies them over the codec's, so the two halves are two
@@ -1150,43 +1328,104 @@ func TestCompareMessageProtectionVectorRefusesACaseItShouldNotAccept(t *testing.
 // round trip through one serializer while continuing to report itself as a generate direction.
 // Measured -- that edit leaves this file's other five tests green.
 //
-// The walk is theCallsReachableFrom in tree_kat_test.go, which family 11's generator is held by
-// for the same reason and which separates a CALL from a MENTION: a call replaced by a discard of
-// the same identifier still names it, and a gate reading mentions would go on reporting a
-// derivation as reached over a generator that no longer runs it. The class of derivations is
-// DERIVED -- every function these test files declare whose name claims independence -- rather
-// than a list naming the one that exists today.
-func TestTheMessageProtectionGeneratorReachesAnIndependentDerivation(t *testing.T) {
+// What this gate asks, and why it is not the question the first version of it asked. That version
+// asked whether the generator REACHED any function whose name claims independence, and the answer
+// to that question is yes for a generator that reaches one and protects over another. MEASURED:
+// the swap above, plus the single line `_ = independentOpaqueV(t, groupId)` -- and
+// independentGroupContext calls independentOpaqueV, so that line is what a refactor which
+// hand-wrote part of section 8.1 and took the codec for the rest looks like, not a contrivance --
+// left the whole of ./mls/... and ./message/... at 6510 passing with the exact defect the
+// paragraph above describes present in the source. Reaching a derivation and protecting over one
+// are two claims, and only the second is the one this family makes.
+//
+// So the question is asked of the ARGUMENT. Every call the generator makes to a production entry
+// point that takes a group context is found -- the class derived off the type checked package by
+// the parameter's own name, so a third such entry point called from here is covered on the commit
+// that declares it -- and the octets each one is handed must come from a function whose name claims
+// independence AND which these test files declare. The class of derivations stays DERIVED for the
+// reason it was before: a list names the ones that existed when it was written.
+func TestTheMessageProtectionGeneratorProtectsOverAnIndependentGroupContext(t *testing.T) {
+	// the controls, over sources written here, because a resolver that answered "independent" for
+	// everything -- or that could not tell a mention from a call -- would pass this file while
+	// reporting on nothing.
+	control := func(source string) []string {
+		fileSet := token.NewFileSet()
+		parsed, err := parser.ParseFile(fileSet, "control_test.go", source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse the control: %v", err)
+		}
+		declared := testFileFunctions(map[string]*ast.File{"control_test.go": parsed})
+		generator, held := declared["generateControl"]
+		if !held {
+			t.Fatal("the control declares no generateControl, so it exercises nothing")
+		}
+		origins := []string{}
+		for _, site := range theGroupContextSitesOf(generator, map[string]int{"sealControl": 1}) {
+			origins = append(origins, site.origin)
+		}
+		return origins
+	}
+	for _, row := range []struct {
+		name   string
+		source string
+		want   []string
+	}{
+		{"a context built by a hand derivation on the line above",
+			"package control\n\nfunc generateControl() {\n\tcontext := independentControl()\n\tsealControl(nil, context)\n}\n",
+			[]string{"independentControl"}},
+		{"a context built by the codec beside a MENTION of a hand derivation",
+			"package control\n\nfunc generateControl() {\n\tcontext := marshalControl()\n\t_ = independentControl\n\tsealControl(nil, context)\n}\n",
+			[]string{"marshalControl"}},
+		{"a hand derivation called inline in the argument",
+			"package control\n\nfunc generateControl() {\n\tsealControl(nil, independentControl())\n}\n",
+			[]string{"independentControl"}},
+		{"a context this body never assigns, which must resolve to no origin at all",
+			"package control\n\nfunc generateControl() {\n\tsealControl(nil, whateverThisIs)\n}\n",
+			[]string{""}},
+		{"a context assigned twice, which is a body this one hop walk must refuse to name",
+			"package control\n\nfunc generateControl() {\n\tcontext := independentControl()\n\tcontext = marshalControl()\n\tsealControl(nil, context)\n}\n",
+			[]string{""}},
+		{"a call with no argument in the group context position",
+			"package control\n\nfunc generateControl() {\n\tsealControl(nil)\n}\n",
+			[]string{}},
+	} {
+		if got := control(row.source); !slices.Equal(got, row.want) {
+			t.Fatalf("the resolver reads %s as %v, want %v", row.name, got, row.want)
+		}
+	}
+
+	positions := theGroupContextParameters(t)
+	if len(positions) == 0 {
+		t.Fatal("no production declaration of this package takes a groupContext parameter, so every call site in the generator is invisible to this derivation and the gate below holds over nothing")
+	}
 	declared := testFileFunctions(packageTestFiles(t))
-	// the generator the registry installs has to reach the case builder, or what is held below
-	// is a function nothing runs.
+	// the generator the registry installs has to reach the case builder, or what is held below is
+	// a function nothing runs.
 	if !theCallsReachableFrom(t, declared, "generateMessageProtectionVector")["generateMessageProtectionCases"] {
 		t.Fatal("generateMessageProtectionVector does not call generateMessageProtectionCases, so the derivation held below is not on the registered generator's path")
 	}
-	roots := []string{}
-	for name := range declared {
-		if strings.HasPrefix(name, "independent") {
-			roots = append(roots, name)
+	builder, held := declared["generateMessageProtectionCases"]
+	if !held {
+		t.Fatal("generateMessageProtectionCases is not declared in the test files scanned, so its call sites would be an empty set")
+	}
+	sites := theGroupContextSitesOf(builder, positions)
+	if len(sites) == 0 {
+		t.Fatalf("generateMessageProtectionCases calls none of the %d production declarations that take a group context, so it protects nothing over one and this gate would hold vacuously",
+			len(positions))
+	}
+	for _, site := range sites {
+		if !strings.HasPrefix(site.origin, "independent") {
+			t.Errorf("generateMessageProtectionCases hands %s a group context from %s; family 4's generate direction then protects over the serializer its consume direction verifies over, and an encoder and a decoder wrong in the same direction agree perfectly",
+				site.callee, site.spelling)
+			continue
+		}
+		if _, ours := declared[site.origin]; !ours {
+			t.Errorf("generateMessageProtectionCases hands %s a group context from %s, which these test files do not declare; a name that claims independence and lives in production is production",
+				site.callee, site.spelling)
 		}
 	}
-	slices.Sort(roots)
-	if len(roots) == 0 {
-		t.Fatalf("no function this package's %d declared test functions name claims independence, so the derivation below is over an empty class",
-			len(declared))
-	}
-	reached := theCallsReachableFrom(t, declared, "generateMessageProtectionCases")
-	found := []string{}
-	for _, root := range roots {
-		if reached[root] {
-			found = append(found, root)
-		}
-	}
-	if len(found) == 0 {
-		t.Fatalf("generateMessageProtectionCases calls none of the %d independent derivations these test files declare (%v); family 4's generate direction then protects and unprotects over one serializer, and an encoder and a decoder wrong in the same direction agree perfectly",
-			len(roots), roots)
-	}
-	t.Logf("generateMessageProtectionCases reaches %v of the %d independent derivations declared across this package's test files",
-		found, len(roots))
+	t.Logf("generateMessageProtectionCases passes %d group contexts into production, every one of them from a derivation these test files declare, against the %d production declarations that take one",
+		len(sites), len(positions))
 }
 
 // mpGeneratedApplication is the application payload a generated case at one suite carries.

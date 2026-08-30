@@ -846,42 +846,140 @@ func TestCompareMessagesVectorRefusesACaseItShouldNotAccept(t *testing.T) {
 	assertComparatorRefuses(t, "messages", refuseMessagesVector, encode(base), refusals)
 }
 
+// messagesShapelessProbe is one opaque<V> over octets no column of this corpus publishes.
+//
+// It is what separates a checker that CHECKS A STRUCTURE from one whose whole body is a variable
+// length vector and therefore cannot tell one column of that shape from another. RFC 9420 section
+// 12.1 gives ExternalInit exactly such a body -- opaque kem_output<V> and nothing else -- so this
+// is a real property of the registry rather than a hole in the table.
+func messagesShapelessProbe(t *testing.T) []byte {
+	t.Helper()
+	w := syntax.NewWriter()
+	w.WriteOpaque([]byte("an opaque vector no column of the messages corpus publishes"))
+	probe, err := w.Bytes()
+	if err != nil {
+		t.Fatalf("build the shapeless probe: %v", err)
+	}
+	return probe
+}
+
+// messagesIllegalProbes are octets no structure this corpus publishes encodes to.
+//
+// The middle one is the load bearing one: 0xff is varint prefix bits 11, which p1's reader refuses
+// before it has read a length at all, so a checker that accepts it is not reading through this
+// package's syntax layer whatever else it claims. They exist so that the exclusion below cannot be
+// bought: a checker that accepted EVERYTHING would accept the shapeless probe too and would
+// otherwise be exempted for looking like an opaque vector.
+func messagesIllegalProbes() map[string][]byte {
+	return map[string][]byte{
+		"nothing at all":                      {},
+		"a reserved varint length prefix":     {0xff},
+		"five octets with no length in front": {0x01, 0x02, 0x03, 0x04, 0x05},
+	}
+}
+
+// aWholeInputOpaqueVector reports whether these octets are one opaque<V> and nothing after it.
+//
+// The second half of the exclusion below. A shapeless checker is only entitled to accept a column
+// whose encoding IS the shape it cannot distinguish, so the column is required to be one too --
+// which makes the exemption a statement about the pair rather than a licence granted to one
+// checker over everything it happens to swallow.
+func aWholeInputOpaqueVector(data []byte) bool {
+	r := syntax.NewReader(data)
+	body, err := r.ReadOpaque()
+	if err != nil || r.Remaining() != 0 {
+		return false
+	}
+	w := syntax.NewWriter()
+	w.WriteOpaque(body)
+	encoded, err := w.Bytes()
+	return err == nil && bytes.Equal(encoded, data)
+}
+
 // TestMessagesEveryColumnDecodesThroughItsOwnCheckerAndNotAnother is the control on the checker
-// shapes themselves.
+// shapes themselves, and it is the PAIRWISE exclusion its name states rather than a count.
 //
 // Every column of this corpus round trips, so a table in which two rows had been given each
 // other's checker would fail loudly -- but only for the pairs whose encodings are incompatible,
-// and there is no gate saying which pairs those are. This asserts the thing that is actually
-// wanted: each column's own checker ACCEPTS it and at least one other checker in the table
-// REFUSES it, so no checker in this table is one that accepts everything it is handed.
+// and there is no gate saying which pairs those are. The version this replaces asked only that at
+// least ONE of the other sixteen checkers refuse each column, which is weaker than the name: a
+// checker that accepted fifteen of the seventeen column encodings satisfies every row of that
+// loop, because one incompatible checker somewhere in the table is enough to keep the count above
+// zero.
 //
-// A checker that accepted every column would be caught here by name. The count is derived from
-// the table rather than written down, so a row added without a checker of its own cannot slip
-// past by keeping the total right.
+// What is asserted instead is that NO other checker accepts a column, with one exclusion that is
+// derived rather than named. MEASURED over this corpus: fifteen of the seventeen columns are
+// refused by all sixteen of the other checkers, and the two that are not --
+// group_context_extensions_proposal and ratchet_tree -- are accepted by external_init_proposal's
+// checker alone, because section 12.1 gives ExternalInit a body that is one opaque<V> and nothing
+// else, and a vector is a vector. That containment is not a defect in any row, so it is exempted
+// -- but only by proving BOTH halves of it: the accepting checker must accept a bare opaque<V>
+// over octets this corpus does not publish, and the accepted column's own octets must be one
+// opaque<V> spanning the whole input. Neither half is written down as a name.
+//
+// Every checker is separately required to refuse octets nothing in this corpus encodes to, so a
+// checker that accepted everything cannot buy the exclusion by also accepting the probe. The count
+// is derived from the table rather than written down, so a row added without a checker of its own
+// cannot slip past by keeping the total right.
+//
+// What this still cannot see: a checker that dropped ONE half of the shape its name states -- the
+// wire format or the content type -- while keeping the other, because the surviving half is enough
+// to refuse every other column in this table. Each half is observed instead by a column swap row
+// of TestCompareMessagesVectorRefusesACaseItShouldNotAccept: the proposal-for-commit swap is
+// refused only by the content type check and the group-info-for-welcome swap only by the wire
+// format check, so neither half of checkMLSMessageColumn is unmeasured.
 func TestMessagesEveryColumnDecodesThroughItsOwnCheckerAndNotAnother(t *testing.T) {
 	base, _ := messagesKatBaseCase(t)
 	codecs := messagesCodecs()
 	if len(codecs) != messagesFields {
 		t.Fatalf("the codec table holds %d rows and this family reads %d columns", len(codecs), messagesFields)
 	}
+
+	probe := messagesShapelessProbe(t)
+	shapeless := map[string]bool{}
+	for _, codec := range codecs {
+		if encoded, err := codec.check(probe); err == nil && bytes.Equal(encoded, probe) {
+			shapeless[codec.name] = true
+		}
+		for name, illegal := range messagesIllegalProbes() {
+			if _, err := codec.check(illegal); err == nil {
+				t.Errorf("%s accepted %s, so it accepts what nothing in this corpus encodes to and the exclusion below would exempt it for a reason that is not true of it",
+					codec.name, name)
+			}
+		}
+	}
+	if len(shapeless) == len(codecs) {
+		t.Fatalf("all %d checkers in this table accept a bare opaque vector, so the exclusion below exempts every pair and this test holds nothing",
+			len(codecs))
+	}
+
+	excluded := 0
 	for _, own := range codecs {
 		data := MustHex(t, own.field(&base))
 		if _, err := own.check(data); err != nil {
 			t.Errorf("%s was refused by its own checker: %v", own.name, err)
 			continue
 		}
-		refused := 0
 		for _, other := range codecs {
 			if other.name == own.name {
 				continue
 			}
 			if _, err := other.check(data); err != nil {
-				refused++
+				continue
 			}
-		}
-		if refused == 0 {
-			t.Errorf("%s was accepted by all %d of the other checkers in this table, so none of them is checking anything about the structure it names",
-				own.name, len(codecs)-1)
+			if !shapeless[other.name] {
+				t.Errorf("%s accepts %s's octets and is not a checker whose whole body is one opaque vector; a checker that accepts a column it does not name is not checking the structure its name states",
+					other.name, own.name)
+				continue
+			}
+			if !aWholeInputOpaqueVector(data) {
+				t.Errorf("%s accepts %s's octets and those octets are not one opaque vector spanning the whole input, so the containment that exempts this pair is not the one that is actually happening",
+					other.name, own.name)
+				continue
+			}
+			excluded++
 		}
 	}
+	t.Logf("%d of the %d checkers accept a bare opaque vector and %d ordered pairs are exempted by that containment; every other pair is refused",
+		len(shapeless), len(codecs), excluded)
 }
