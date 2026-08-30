@@ -39,9 +39,26 @@
 //     bodies are proposal_wire.go's to encode, and a re_init arm this package wrote in another
 //     field order would go on round tripping through a closure that made the same choice. The
 //     discriminant is put back on instead and the whole read through Proposal, so what these
-//     seven columns hold is production. Six of the seven columns are read by nothing else on
-//     this branch: add, update, remove, re_init, external_init and group_context_extensions
-//     have no other reader of this corpus, and pre_shared_key_proposal has psk_test.go's.
+//     seven columns hold is production.
+//
+// What this runner adds over the four tests that already read this corpus, stated because a
+// runner that adds no protection of its own is better replaced by a comment. Ten of the
+// seventeen columns have another reader on this branch: framing_test.go's
+// TestTheMessagesCorpusMlsMessagesRoundTripByteExactly takes the seven MLSMessage columns,
+// commit_wire_test.go takes commit, welcome_wire_test.go takes group_secrets, and psk_test.go
+// takes pre_shared_key_proposal. The other SEVEN -- add, update, remove, re_init, external_init
+// and group_context_extensions, plus ratchet_tree -- are read by nothing else at all, and six of
+// those seven are the arms whose bodies only exist in this corpus. This runner also installs
+// family 12, so the corpus is offered to it by TestVectorFamiliesVerify and 12 leaves
+// expectedPendingFamilies.
+//
+// Measured, and recorded because it is the shape of what this file does NOT hold: nothing here
+// is the SOLE catcher of a code defect. Every single edit tried against the codecs these columns
+// cover -- a joiner secret's length prefix widened symmetrically, a re_init arm's group id moved
+// behind its two uint16 fields symmetrically -- is refused by this runner and by a hand derived
+// layout or golden test next door. What this family holds alone is the seven columns above and
+// the accounting: 5100 comparisons against 4801 distinct published answers, which is the number
+// nothing else in the package states.
 //   - the comparison made against a SECOND DECODE of the corpus text. The comparator returns the
 //     octets it re-encoded rather than a verdict, and TestVectorMessages holds those against the
 //     published string read out of a generic json decode with no struct tag in the way. A struct
@@ -406,6 +423,13 @@ func messagesCodecs() []messagesCodec {
 // The published half is NOT carried here and that is deliberate. It is re-read by the runner out
 // of a generic decode of the corpus text, so the comparison is between what this package produced
 // and what the file says, with no struct tag standing between the two.
+//
+// That second reading is REDUNDANT with the byte comparison each checker already makes, and it is
+// recorded as redundant rather than as a second guarantee: replacing this field with the
+// published octets themselves, so that the runner compares the corpus against itself, leaves the
+// whole of ./mls/... and ./message/... green. It is here because the two are redundant only while
+// every checker keeps its own byte comparison -- a checker that lost one would leave the runner's
+// reading as the only thing between a re-encoding and the file.
 type messagesCheck struct {
 	name string
 	got  []byte

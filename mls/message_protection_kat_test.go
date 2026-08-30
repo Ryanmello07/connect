@@ -61,11 +61,28 @@
 // recovers the three raw values out of them, holds the two public columns byte exact through a
 // re-seal, and installs family 4 so the corpus is offered to it by TestVectorFamiliesVerify.
 //
-// What the vendored corpus cannot see, stated because a runner that overstates itself is worse
-// than one that does less. The re-seal comparison is only breakable by a defect in this package:
-// the resealed bytes are a function of the opened message, so no edit to a published case can
-// make them differ while leaving the open to succeed. It is covered by mutation rather than by a
-// row in the refusal table below, and the mutation is recorded in that table's own comment.
+// What this family cannot see, stated because a runner that overstates itself is worse than one
+// that does less, and measured rather than supposed.
+//
+// The re-seal comparison is not breakable by any edit to a published case: the resealed bytes are
+// a function of the opened message, so a case that made them differ would have failed the open
+// first. It is therefore absent from the refusal table below and reachable only by mutation.
+//
+// The two PUBLIC content comparisons are redundant with the two private ones, because both halves
+// of a case carry the same raw value: replacing the recovered proposal and commit with the
+// published ones in the public arm alone leaves this file green, and it is the private arm's
+// comparison of the same two columns that then does the work. Replacing them in BOTH arms is
+// refused, by three rows of the table below at once. So the family's content comparison is
+// observed; either arm of it alone is not.
+//
+// And nothing here is the SOLE catcher of a code defect. Every single edit tried against the
+// framing crypto these five columns cover -- an epoch off by one inside the section 6.3.2 AAD,
+// the two ratchets exchanged, the reuse guard xored onto the tail of the nonce, the reuse guard
+// drawn as a constant, the SenderData codec transposed, the GroupContext codec transposed -- is
+// refused by this runner AND by a hand derived preimage or golden test elsewhere in the package.
+// What this family holds alone is the three PRIVATE columns, which nothing else on this branch
+// opens at all, the three raw values every column carries, the byte exact re-seal, and the
+// accounting: fourteen comparisons against nine distinct published answers.
 package mls
 
 import (
