@@ -1120,3 +1120,100 @@ func TestThisWelcomeCodecHandsWelcomeKeyNonceTheCiphertextItExpects(t *testing.T
 		t.Fatalf("opened %d published welcomes through this codec, want %d", opened, ksWelcomeKatVectors)
 	}
 }
+
+// TestARefusedDecodeLeavesTheCallersValueAlone is the property four comments in
+// welcome_wire.go claim and nothing observed.
+//
+// Every decoder in that file stages into a local and publishes the receiver whole. What it
+// costs when that stops being true is not tidiness. A decoder that assigned as it read would
+// leave a REFUSED GroupInfo holding a group context out of the sender's bytes and a
+// confirmation tag out of whatever the caller's value held before -- a well formed object
+// describing an epoch nobody published, and one whose signature was taken over a different
+// one. For EncryptedGroupSecrets it is worse, because a joiner SCANS that vector for the entry
+// its own key package reference matches: a half filled entry is one that can still be matched,
+// pairing a reference out of these bytes with a ciphertext out of the previous decode.
+//
+// The sweep is every truncation rather than one, because which field a decoder publishes early
+// decides which truncations can see it, and a single cut chosen here would be a guess at that.
+// The decode goes through UnmarshalMLS directly: syntax.Unmarshal's contract is about the
+// bytes, and this is a statement about the receiver.
+func TestARefusedDecodeLeavesTheCallersValueAlone(t *testing.T) {
+	for _, one := range []struct {
+		name  string
+		valid func() syntax.Codec
+		held  func() syntax.Codec
+	}{
+		{
+			name:  "GroupInfo",
+			valid: func() syntax.Codec { value := testGroupInfo(); return &value },
+			held: func() syntax.Codec {
+				value := testGroupInfo()
+				value.GroupContext.GroupId = []byte{0xb0, 0xb1, 0xb2}
+				value.ConfirmationTag = bytes.Repeat([]byte{0xbb}, 32)
+				value.Signer = 0x0b0b0b0b
+				value.Signature = []byte{0xbe, 0xef}
+				return &value
+			},
+		},
+		{
+			name:  "GroupSecrets",
+			valid: func() syntax.Codec { value := testGroupSecrets(); return &value },
+			held: func() syntax.Codec {
+				return &GroupSecrets{JoinerSecret: bytes.Repeat([]byte{0xab}, 6)}
+			},
+		},
+		{
+			name:  "Welcome",
+			valid: func() syntax.Codec { value := testWelcome(); return &value },
+			held: func() syntax.Codec {
+				return &Welcome{
+					CipherSuite:        CipherSuiteX25519AesGcm128Sha256Ed25519,
+					EncryptedGroupInfo: bytes.Repeat([]byte{0xcc}, 3),
+				}
+			},
+		},
+		{
+			name: "EncryptedGroupSecrets",
+			valid: func() syntax.Codec {
+				value := testWelcome().Secrets[0]
+				return &value
+			},
+			held: func() syntax.Codec {
+				return &EncryptedGroupSecrets{
+					NewMember: []byte{0xd0, 0xd1},
+					EncryptedGroupSecrets: HpkeCiphertext{
+						KemOutput:  []byte{0xd2},
+						Ciphertext: []byte{0xd3, 0xd4},
+					},
+				}
+			},
+		},
+	} {
+		encoded, err := syntax.Marshal(one.valid())
+		if err != nil {
+			t.Fatalf("%s: encode the input the truncations are cut from: %v", one.name, err)
+		}
+		heldBytes, err := syntax.Marshal(one.held())
+		if err != nil {
+			t.Fatalf("%s: encode the value the caller already holds: %v", one.name, err)
+		}
+		if bytes.Equal(heldBytes, encoded) {
+			t.Fatalf("%s: the held value and the decoded one encode identically, so this case cannot tell an untouched receiver from a clobbered one",
+				one.name)
+		}
+		for cut := 0; cut < len(encoded); cut++ {
+			receiver := one.held()
+			if err := receiver.UnmarshalMLS(syntax.NewReader(encoded[:cut])); err == nil {
+				t.Fatalf("%s truncated to %d of %d octets was accepted", one.name, cut, len(encoded))
+			}
+			after, err := syntax.Marshal(receiver)
+			if err != nil {
+				t.Fatalf("%s: re-encode the receiver after a refused decode at %d: %v", one.name, cut, err)
+			}
+			if !bytes.Equal(after, heldBytes) {
+				t.Fatalf("%s: a decode refused at %d of %d octets left the caller's value as\n  %x\nand it was\n  %x",
+					one.name, cut, len(encoded), after, heldBytes)
+			}
+		}
+	}
+}
