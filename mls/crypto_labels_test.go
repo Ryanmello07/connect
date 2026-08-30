@@ -710,6 +710,15 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// truncated uint32 two different inputs would share.
 		"owner_successor.go: syntax.NewWriter()",
 		"owner_successor.go: syntax.Unmarshal(data, nomination)",
+		// the proposal cache's copy, taken as a round trip through the one codec rather than
+		// as a field by field traversal of a structure that already has one. The default limit
+		// and not the ratchet tree one, for two reasons: a Proposal is an MLS structure whose
+		// every field is capped at MaxVectorLength, and these octets have to be the SAME octets
+		// the ProposalRef was taken over -- a copy admitted at a raised bound would be a cache
+		// entry no peer running the default limit could have sent, held under a name every peer
+		// agrees with.
+		"proposal_list.go: syntax.Marshal(proposal)",
+		"proposal_list.go: syntax.Unmarshal(encoded, &copied)",
 		// ValSem403's duplicate test, which decides identity over the serialized
 		// PreSharedKeyID rather than over a field list. The default limit and not the
 		// ratchet tree one: a PreSharedKeyID is an MLS structure whose every field is

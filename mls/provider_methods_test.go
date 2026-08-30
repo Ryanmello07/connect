@@ -816,6 +816,74 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
 		}},
+		// p7 task 6's proposal cache. Two values, answering the three gates differently: the
+		// REFERENCE is derived through the provider and must move over one that flips every
+		// answer, and the cached extension body is the caller's own and must neither move nor
+		// share storage with what was handed in.
+		//
+		// The proposal is a group_context_extensions and not a remove, because a remove is a
+		// leaf index and carries no octets at all -- a row built on one would hand nothing
+		// through the recorder and the retention half of this file would observe nothing while
+		// reporting a clean run.
+		{name: "(*ProposalCache).Store", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			cache := NewProposalCache()
+			content := &AuthenticatedContent{
+				WireFormat: WireFormatPublicMessage,
+				Content: FramedContent{
+					GroupId:     take(bytes.Repeat([]byte{0x61}, 12)),
+					Epoch:       9,
+					Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: 1},
+					ContentType: ContentTypeProposal,
+					Proposal: &Proposal{
+						ProposalType: ProposalTypeGroupContextExtensions,
+						GroupContextExtensions: &GroupContextExtensions{Extensions: []Extension{{
+							ExtensionType: ExtensionTypeRequiredCapabilities,
+							ExtensionData: take(bytes.Repeat([]byte{0x62}, 12)),
+						}}},
+					},
+				},
+				Auth: FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x63}, 64))},
+			}
+			ref, err := cache.Store(crypto, content)
+			if err != nil {
+				return nil, err
+			}
+			cached, held := cache.Get(ref)
+			if !held {
+				return nil, fmt.Errorf("the cache missed the reference it had just answered")
+			}
+			return []providerDrivenMethodValue{
+				{name: "ProposalRef", content: ref},
+				{name: "the cached extension body", carried: true,
+					content: cached.Proposal.GroupContextExtensions.Extensions[0].ExtensionData},
+			}, nil
+		}},
+		// resolution, which reaches the provider for nothing at all -- see the excuse in
+		// providerDrivenMethodsOverAnyProvider. Its one value is the caller's own extension body
+		// carried through the copy, which is what the retention half reads: an applier walking
+		// the resolved list must not be walking the array the commit was decoded out of.
+		{name: "(*ProposalCache).Resolve", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			list, err := NewProposalCache().Resolve(crypto, LeafIndex(3), []ProposalOrRef{{
+				Type: ProposalOrRefTypeProposal,
+				Proposal: &Proposal{
+					ProposalType: ProposalTypeGroupContextExtensions,
+					GroupContextExtensions: &GroupContextExtensions{Extensions: []Extension{{
+						ExtensionType: ExtensionTypeRequiredCapabilities,
+						ExtensionData: take(bytes.Repeat([]byte{0x64}, 12)),
+					}}},
+				},
+			}})
+			if err != nil {
+				return nil, err
+			}
+			extensions, proposed := list.Extensions()
+			if !proposed || len(extensions) != 1 {
+				return nil, fmt.Errorf("the resolved list carries %d extensions, want 1", len(extensions))
+			}
+			return []providerDrivenMethodValue{
+				{name: "the resolved extension body", content: extensions[0].ExtensionData, carried: true},
+			}, nil
+		}},
 	}
 }
 
@@ -1086,6 +1154,14 @@ var providerDrivenMethodsOverAnyProvider = map[string]string{
 	// unheld: the KDF.Nh gate below holds the length it refuses against a provider whose Nh
 	// is not 32, which is the whole of what it uses the provider for.
 	"(*PreSharedKeyId).Validate": "reads a length off the provider and nothing else, so a provider that flips every answer cannot separate it from a literal",
+	// resolution turns a commit's ProposalOrRef vector into a bucketed list out of entries the
+	// cache already holds, and reaches the provider for nothing: the reference is the map key
+	// and the copy is the codec's. A provider that flips every answer therefore cannot separate
+	// it from a body handed none, and a row here would report "did not route through its
+	// provider" for every possible implementation. The parameter is in the signature because
+	// the group lifecycle plan pins it there and every caller already holds one; what holds it
+	// is the nil provider gate next door, which demands the refusal rather than a dereference.
+	"(*ProposalCache).Resolve": "reaches the provider for nothing at all, so a provider that flips every answer cannot separate it from a body handed none",
 }
 
 // TestEveryMethodHandedAProviderRoutesThroughIt is

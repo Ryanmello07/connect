@@ -195,6 +195,21 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*TreeKEMPrivate).Consistent", call: func() error {
 			return (&TreeKEMPrivate{}).Consistent(nil, nil)
 		}},
+		// p7 task 6's cache, on the ZERO valued receiver, which is the one that separates the
+		// orders these bodies could be written in. A zero ProposalCache holds no entry and no
+		// epoch binding, so a Store that judged its ARGUMENT first would answer
+		// errNilAuthenticatedContent -- sending the caller to fix a message it never passed,
+		// over a provider it never passed either. Resolve is handed no vector for the matching
+		// reason: an empty commit resolves to an empty list and no error at all, so the refusal
+		// below is the provider's and can be nothing else.
+		{name: "(*ProposalCache).Store", call: func() error {
+			_, err := (&ProposalCache{}).Store(nil, nil)
+			return err
+		}},
+		{name: "(*ProposalCache).Resolve", call: func() error {
+			_, err := (&ProposalCache{}).Resolve(nil, 0, nil)
+			return err
+		}},
 	}
 }
 

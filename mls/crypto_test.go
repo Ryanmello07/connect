@@ -5920,6 +5920,12 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller
 	// by FAILING, and none of the three names a task number, because what expires an excuse here
 	// is a caller arriving and not a task passing.
 	//
+	// Two of those three came off on p7 task 6, by FAILING on the commit that landed
+	// ProposalCache.Store and ProposalList.PathRequired -- the callers they named, on the task
+	// that needed them. checkProposalProfile is now reached from both doors of the cache and
+	// proposalTypePathRequired from the list's own predicate, so what is left is the one entry
+	// whose caller has not landed.
+	//
 	// successionPreimage is the bytes an admin countersigns, MASTER section 11. It lands with the
 	// nomination it is a preimage OVER, because a countersignature preimage split from the
 	// structure it covers is two statements of one layout that agree until one of them changes,
@@ -5927,17 +5933,6 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller
 	// is the first thing with a countersignature to check.
 	"./successionPreimage": {firstCaller: "ValidateSuccession",
 		why: "the countersignature preimage of MASTER section 11, landed beside the nomination it covers rather than beside the validator that reads it"},
-	// checkProposalProfile is the v1 refusal of psk, reinit and external_init at this plan's
-	// parse boundary. It lands ahead of the boundary itself because the three doors that apply it
-	// -- the cache store, resolution, and ValSem113 -- are three tasks, and a rule written by
-	// whichever of them needed it first would be three rules.
-	"./checkProposalProfile": {firstCaller: "ProposalCache.Store",
-		why: "the v1 proposal profile gate, landed before the three doors that apply it so that the three cannot each write their own"},
-	// proposalTypePathRequired is RFC 9420 section 12.4's pathRequiredTypes set. Same argument:
-	// the commit path is the caller, and a predicate the commit path wrote for itself would be
-	// one nothing else could reuse or check.
-	"./proposalTypePathRequired": {firstCaller: "CommitPathRequired",
-		why: "RFC 9420 section 12.4's path required set, landed with the profile gate it sits beside rather than with the commit path that reads it"},
 }
 
 // ---------------------------------------------------------------------------

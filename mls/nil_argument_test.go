@@ -394,6 +394,12 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			}
 			return VerifyAuthenticatedContent(crypto, pub, nil, framingTestGroupContext(t))
 		}},
+		// p7 task 6's cache store, which would otherwise dereference its content at the
+		// content type check -- the first statement after the provider
+		"(*ProposalCache).Store(content)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
+			_, err := NewProposalCache().Store(crypto, nil)
+			return err
+		}},
 		"NewCryptoProviderWithRandom(random)": {sentinel: ErrNilRandomSource, call: func(t *testing.T) error {
 			_, err := NewCryptoProviderWithRandom(CipherSuiteX25519ChaCha20Sha256Ed25519, nil)
 			return err
