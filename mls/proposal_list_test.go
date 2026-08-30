@@ -1326,15 +1326,26 @@ func TestResolveHandsBackNothingTheCacheStillHolds(t *testing.T) {
 }
 
 // TestStoreHandsBackNothingTheCacheStillHolds is the third direction: the reference Store answers
-// is the caller's, and writing into it must not rename the entry.
+// is the caller's, and writing into it must change nothing the cache is holding.
+//
+// Both halves, because the cache holds the reference TWICE -- once as the map key and once as the
+// entry's own Ref, which is what Get answers and what a committer names the proposal by. A key
+// cut from a string conversion is safe whatever the caller does to the answer, so a probe that
+// only looked the entry up would report clean over an entry whose own Ref the caller had just
+// rewritten -- and that Ref is the one that ends up in a commit.
 func TestStoreHandsBackNothingTheCacheStillHolds(t *testing.T) {
 	crypto := testCrypto(t)
 	cache := NewProposalCache()
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	name := bytes.Clone(ref)
 	ref[0] ^= 0xFF
-	if _, ok := cache.Get(ProposalRef(name)); !ok {
-		t.Error("writing into the reference Store answered renamed the entry the cache is holding")
+	cached, ok := cache.Get(ProposalRef(name))
+	if !ok {
+		t.Fatal("writing into the reference Store answered renamed the entry the cache is holding")
+	}
+	if !slices.Equal([]byte(cached.Ref), name) {
+		t.Errorf("the entry names itself %x after the caller edited the reference Store answered, want %x",
+			cached.Ref, name)
 	}
 }
 
