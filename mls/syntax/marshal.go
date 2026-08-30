@@ -83,9 +83,26 @@ func Unmarshal(bs []byte, v Unmarshaler) error {
 }
 
 // UnmarshalLimit decodes bs into v under a caller chosen vector length limit; the
-// ratchet tree paths — tree_sync.go, UnmarshalRatchetTree, and any GroupInfo or
-// Welcome decode that may carry a tree — pass MaxRatchetTreeLength and nothing
-// else raises the bound. Unmarshal is this with the default limit.
+// ratchet tree paths — tree_sync.go, UnmarshalRatchetTree, and the GroupInfo or
+// Welcome decodes that carry a tree — pass MaxRatchetTreeLength, and nothing else
+// raises the bound. Unmarshal is this with the default limit.
+//
+// One decode of a GroupInfo and of a Welcome deliberately does NOT take the raised
+// bound, and it is named here because the sentence above otherwise reads as though
+// every such decode did. mls.ParseMLSMessage is the outermost entry point — every
+// byte that arrives off the network or out of the store enters through it — and it
+// calls Unmarshal, so this product's own group info and welcome do not fit through
+// it at all. That is a decision rather than an oversight, and it is the group
+// lifecycle plan's to inherit: a Welcome is decoded by a party who is not yet a
+// member, with no group state to check it against and every length in it chosen by
+// whoever sent it, so a raised limit at that entry point would be an acceptance
+// rule handed to a stranger over the largest allocation the structure has. Whoever
+// has to carry such a Welcome owes an entry point of their own wired to
+// MaxRatchetTreeLength; they cannot raise this one.
+// mls.TestParseMLSMessageCannotCarryThisProductsOwnGroupInfoOrWelcome is that
+// ceiling measured rather than asserted, and mls's
+// TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit is what pins the pair of
+// calls that inherit it.
 //
 // The result joins the decoder's error with Done, mirroring MarshalLimit rather
 // than returning early on the first of the two. The decoder's error and Done's
