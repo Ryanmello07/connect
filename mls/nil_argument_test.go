@@ -547,10 +547,12 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			return err
 		}},
 		// the v1 proposal profile gate. A nil proposal has no type to judge, and the refusal is
-		// the same one an unregistered type gets: this build will not act on it. The alternative
-		// is a dereference, and the caller that reaches this with nil is a commit path holding an
-		// arm the codec left empty.
-		"checkProposalProfile(proposal)": {sentinel: errUnsupportedProposalType, call: func(t *testing.T) error {
+		// its OWN and not the one an unregistered type gets: a peer sending a code point this
+		// build does not implement is routine traffic to drop, and a caller reaching this holding
+		// nothing is a commit path bug, and the two are repaired at opposite ends. The
+		// alternative to refusing is a dereference, and the caller that reaches this with nil is
+		// a commit path holding an arm the codec left empty.
+		"checkProposalProfile(proposal)": {sentinel: errNilProposal, call: func(t *testing.T) error {
 			return checkProposalProfile(defaultProfile(), nil)
 		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {

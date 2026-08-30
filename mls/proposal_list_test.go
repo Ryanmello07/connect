@@ -38,49 +38,109 @@ import (
 // the registry, derived
 // ---------------------------------------------------------------------------
 
-// proposalTypeRegistry is every constant of type ProposalType this package declares, mapped to
-// the value its declaration gives it.
+// proposalTypeRegistryIn reads one parsed file for the proposal type registry it declares,
+// answering the code points by name and, separately, every declaration it could not read.
+//
+// THE UNIT IS THE CONST BLOCK AND NOT THE TYPE ANNOTATION, and that is this derivation's whole
+// point. The first version of it skipped every ValueSpec whose Type was nil, which reads as
+// "constants of type ProposalType" and is actually "constants whose SOURCE TEXT spells the type
+// out". Go does not require it to: a member written as ProposalTypeBranch = 0x0008 beside the
+// seven annotated ones is a registration in every sense that matters -- it is inside the
+// registry's own declaration, every use of it as a proposal type converts implicitly, and a peer
+// sending 0x0008 gets whatever the profile says about that code point -- and it was INVISIBLE.
+// Measured: adding exactly that line left TestTheV1ProfileClassifiesEveryRegisteredProposalType,
+// TestCheckProposalTypeAnswersTheWholeCodePointSpaceFromTheRegistry,
+// TestProposalTypePathRequiredSet and TestProposalTypeNameNamesEveryRegisteredType all passing
+// over a registry one code point short. The consequence is safe today -- an unclassified point is
+// refused as unregistered -- and the day the profile widens to admit that type, the reason it was
+// refused is a table nobody knew was short.
+//
+// A const block is one declaration and registering a code point means adding a line to it, so the
+// block is what survives the spelling. A block that names ProposalType nowhere is not the registry
+// and no member of it is a code point, which is what keeps MaxGroupMembers out of the class.
+//
+// The value is still parsed from the literal, so a code point changed by one is a changed
+// derivation and not an agreed one -- a scan that read only the NAMES would agree with 0xF004 as
+// happily as 0xF003. A member the literal reading cannot follow is REPORTED rather than skipped:
+// an iota'd registry is a legal thing to write and this reader cannot follow one, so it has to
+// say so instead of quietly answering a map one code point short, which is the exact failure
+// this whole derivation exists to have caught.
+func proposalTypeRegistryIn(parsed parsedSource) (map[string]uint64, []string) {
+	registered := map[string]uint64{}
+	unreadable := []string{}
+	for _, declaration := range parsed.file.Decls {
+		generic, isGeneric := declaration.(*ast.GenDecl)
+		if !isGeneric || generic.Tok != token.CONST {
+			continue
+		}
+		if !proposalTypeConstBlock(parsed, generic) {
+			continue
+		}
+		for _, specification := range generic.Specs {
+			value, isValue := specification.(*ast.ValueSpec)
+			if !isValue {
+				continue
+			}
+			for i, name := range value.Names {
+				if i >= len(value.Values) {
+					unreadable = append(unreadable, name.Name+" is declared with no value of its own, and this derivation reads the code point off the literal rather than following an iota")
+					continue
+				}
+				literal, isLiteral := value.Values[i].(*ast.BasicLit)
+				if !isLiteral || literal.Kind != token.INT {
+					unreadable = append(unreadable, name.Name+" is given a value this derivation cannot read as an integer literal")
+					continue
+				}
+				code, err := strconv.ParseUint(literal.Value, 0, 16)
+				if err != nil {
+					unreadable = append(unreadable, name.Name+" is given the value "+literal.Value+", which is not a 16 bit code point: "+err.Error())
+					continue
+				}
+				registered[name.Name] = code
+			}
+		}
+	}
+	slices.Sort(unreadable)
+	return registered, unreadable
+}
+
+// proposalTypeConstBlock answers whether one const declaration is the proposal type registry:
+// whether ANY member of it carries the registry's type annotation.
+//
+// One annotated member is enough, because a const block is written as a unit and the annotation
+// is what says which registry the unit is. The alternative -- requiring every member to be
+// annotated -- is exactly the rule that made an untyped eighth code point invisible.
+func proposalTypeConstBlock(parsed parsedSource, generic *ast.GenDecl) bool {
+	for _, specification := range generic.Specs {
+		value, isValue := specification.(*ast.ValueSpec)
+		if isValue && value.Type != nil && parsed.render(value.Type) == "ProposalType" {
+			return true
+		}
+	}
+	return false
+}
+
+// proposalTypeRegistry is every proposal type code point this package's non test source
+// registers, mapped to the value its declaration gives it.
 //
 // Read off the syntax tree of the whole package rather than out of extension.go by name, which
 // is ledger 21: deriving a class and then writing down the file it lives in is the same defect
 // one level up, and a registry constant moved to another file of this package would leave a scan
-// keyed on the filename reporting a clean run over a class it had stopped reading. The value is
-// parsed from the literal, so a code point changed by one is a changed derivation and not an
-// agreed one -- a scan that read only the NAMES would agree with 0xF004 as happily as 0xF003.
+// keyed on the filename reporting a clean run over a class it had stopped reading.
 func proposalTypeRegistry(t *testing.T) map[string]ProposalType {
 	t.Helper()
 	registered := map[string]ProposalType{}
 	for path, parsed := range decoderSourceOfThisPackage(t) {
-		for _, declaration := range parsed.file.Decls {
-			generic, isGeneric := declaration.(*ast.GenDecl)
-			if !isGeneric || generic.Tok != token.CONST {
-				continue
+		found, unreadable := proposalTypeRegistryIn(parsed)
+		if len(unreadable) != 0 {
+			t.Fatalf("%s declares registry members this derivation cannot read: %v", path, unreadable)
+		}
+		for name, code := range found {
+			if held, already := registered[name]; already && uint16(held) != uint16(code) {
+				t.Fatalf("%s is declared twice, as %#04x and %#04x; a wire enum that disagrees by a NUMBER is the drift nothing in this package could see",
+					name, uint16(held), uint16(code))
 			}
-			for _, specification := range generic.Specs {
-				value, isValue := specification.(*ast.ValueSpec)
-				if !isValue || value.Type == nil || parsed.render(value.Type) != "ProposalType" {
-					continue
-				}
-				for i, name := range value.Names {
-					if i >= len(value.Values) {
-						t.Fatalf("%s declares %s with no value; this derivation reads the code point off the literal and cannot follow an iota",
-							path, name.Name)
-					}
-					literal, isLiteral := value.Values[i].(*ast.BasicLit)
-					if !isLiteral || literal.Kind != token.INT {
-						t.Fatalf("%s gives %s a value this derivation cannot read as an integer literal", path, name.Name)
-					}
-					code, err := strconv.ParseUint(literal.Value, 0, 16)
-					if err != nil {
-						t.Fatalf("%s gives %s the value %s: %v", path, name.Name, literal.Value, err)
-					}
-					if held, already := registered[name.Name]; already {
-						t.Fatalf("%s is declared twice, as %#04x and %#04x; a wire enum that disagrees by a NUMBER is the drift nothing in this package could see",
-							name.Name, uint16(held), code)
-					}
-					registered[name.Name] = ProposalType(code)
-				}
-			}
+			registered[name] = ProposalType(code)
 		}
 	}
 	// the positive control: a derivation that had stopped resolving would answer an empty map,
@@ -106,6 +166,111 @@ func proposalTypeValuesOf(registered map[string]ProposalType) []ProposalType {
 	values := slices.Collect(maps.Values(registered))
 	slices.Sort(values)
 	return slices.Compact(values)
+}
+
+// proposalTypeRegistryControl is one const declaration of each shape the derivation has to tell
+// apart, so that what it reads is measured on a body known to hold every case rather than only on
+// a package that happens to be written one way today.
+//
+// The member that matters is ProposalTypeBranch: a registry entry with NO type annotation of its
+// own. The whole registry of the real package is annotated, so the real package cannot tell a
+// derivation that reads const blocks from one that reads type annotations -- which is exactly why
+// the short version of this reader passed for as long as it did. This control is the only place
+// the two answer differently.
+const proposalTypeRegistryControl = `package control
+
+type ProposalType uint16
+
+const (
+	ProposalTypeReserved ProposalType = 0x0000
+	ProposalTypeAdd      ProposalType = 0x0001
+	// no type annotation, and a registration all the same: Go reads it as an untyped constant,
+	// every use of it as a proposal type converts implicitly, and a peer sending 0x0008 is
+	// answered by whatever the profile says about this code point
+	ProposalTypeBranch = 0x0008
+)
+
+// a registry member declared on its own rather than in the block, which the block rule must
+// still reach because a declaration is a declaration
+const ProposalTypeLater ProposalType = 0x0009
+
+// a const block of this package that is NOT the registry. No member of it names ProposalType,
+// so no member of it is a code point, and a derivation that swept every const of the package
+// would report these two as proposal types.
+const (
+	MaxGroupMembers = 500
+	someOtherCap    = 10
+)
+
+// a constant whose NAME reads like a registry member and whose declaration is not one, which is
+// what says this reads declarations rather than matching text
+const proposalTypeNameForLogs = "add"
+
+// and a var, which is not a const declaration at all
+var ProposalTypeFromAVar ProposalType = 0x000A
+`
+
+// TestTheRegistryDerivationReadsAConstBlockRatherThanATypeAnnotation is the narrowing probe the
+// real package cannot supply.
+//
+// Every ProposalType constant this package declares carries its type in the source text, so the
+// annotation reading and the block reading agree over the whole real registry and the suite is
+// green under both. Measured: adding ProposalTypeBranch = 0x0008 beside the seven annotated
+// constants left TestTheV1ProfileClassifiesEveryRegisteredProposalType,
+// TestCheckProposalTypeAnswersTheWholeCodePointSpaceFromTheRegistry,
+// TestProposalTypePathRequiredSet and TestProposalTypeNameNamesEveryRegisteredType all passing
+// over a registry one code point short -- the gate complete downward and short upward, which is
+// the direction that matters, since an unclassified point is refused as unregistered today and is
+// a table nobody knew was short on the day the profile widens to admit it.
+//
+// So the reader is run over a body that holds the case, and the answer is pinned exactly in both
+// directions: a member it misses is the defect this replaces, and a member it invents -- a
+// MaxGroupMembers read as a code point -- is a gate somebody switches off.
+func TestTheRegistryDerivationReadsAConstBlockRatherThanATypeAnnotation(t *testing.T) {
+	control := mustParseText(t, "the proposal type registry control", proposalTypeRegistryControl)
+	found, unreadable := proposalTypeRegistryIn(control)
+	if len(unreadable) != 0 {
+		t.Fatalf("the reader could not read %v out of the control", unreadable)
+	}
+	want := map[string]uint64{
+		"ProposalTypeReserved": 0x0000,
+		"ProposalTypeAdd":      0x0001,
+		"ProposalTypeBranch":   0x0008,
+		"ProposalTypeLater":    0x0009,
+	}
+	if !maps.Equal(found, want) {
+		t.Fatalf("the derivation read %v out of the control, want %v; the member with no type annotation is the one this reader exists for, and MaxGroupMembers is the one it must not invent",
+			found, want)
+	}
+
+	// and the reader REPORTS what it cannot follow rather than answering a short map, which is
+	// the other way a derivation goes quiet. An iota'd registry is legal Go and this reader
+	// cannot read one.
+	iotad := mustParseText(t, "an iota'd registry", `package control
+
+type ProposalType uint16
+
+const (
+	ProposalTypeReserved ProposalType = iota
+	ProposalTypeAdd
+)
+`)
+	found, unreadable = proposalTypeRegistryIn(iotad)
+	if len(unreadable) == 0 {
+		t.Fatalf("the reader answered %v over an iota'd registry and reported nothing it could not read; a scan that steps over what it cannot judge reports exactly what a complete one reports",
+			found)
+	}
+	if len(found) != 0 {
+		t.Errorf("the reader answered %v over an iota'd registry as well as reporting it; the values there are not the ones the literals say", found)
+	}
+
+	// the real package is read by the same function, and it holds the registry the profile is
+	// stated over. A control that passed while the reader had stopped resolving real source
+	// would be a gate over nothing.
+	registered := proposalTypeRegistry(t)
+	if len(registered) < 8 {
+		t.Fatalf("the derivation read %v out of this package, which registers eight proposal types", registered)
+	}
 }
 
 // TestTheV1ProfileClassifiesEveryRegisteredProposalType is rule 5 over the class this gate is
@@ -139,12 +304,11 @@ func TestTheV1ProfileClassifiesEveryRegisteredProposalType(t *testing.T) {
 // project three authentication bypasses.
 func TestEveryRegisteredProposalTypeIsAcceptedOrRefusedByItsOwnSentinel(t *testing.T) {
 	registered := proposalTypeRegistry(t)
-	everySentinel := map[string]error{
-		"errProfilePsk":              errProfilePsk,
-		"errProfileReInit":           errProfileReInit,
-		"errProfileExternalCommit":   errProfileExternalCommit,
-		"errUnsupportedProposalType": errUnsupportedProposalType,
-	}
+	// the whole refusal class of this file, derived, and not the four the profile happens to
+	// use today. A fifth sentinel a later rule answers is swept here the moment it is declared,
+	// which is what stops "answers to its own value and to no other" from meaning "and to no
+	// other of the four somebody remembered".
+	everySentinel := proposalListOwnedErrors
 	accepted, refused := 0, 0
 	for _, name := range slices.Sorted(maps.Keys(registered)) {
 		proposalType := registered[name]
@@ -180,38 +344,6 @@ func TestEveryRegisteredProposalTypeIsAcceptedOrRefusedByItsOwnSentinel(t *testi
 			accepted, refused)
 	}
 	t.Logf("%d registered types accepted by the v1 profile, %d refused", accepted, refused)
-}
-
-// TestTheFourProfileRefusalsAreFourDistinctValues is errors_lifecycle.go's rule applied to the
-// stand-ins this file declares.
-//
-// errors.Is cannot tell two rules apart when they answer the same value, so two of these spelled
-// as one would make every assertion above hold while the gate said "psk" about a reinit.
-func TestTheFourProfileRefusalsAreFourDistinctValues(t *testing.T) {
-	named := map[string]error{
-		"errProfilePsk":              errProfilePsk,
-		"errProfileReInit":           errProfileReInit,
-		"errProfileExternalCommit":   errProfileExternalCommit,
-		"errUnsupportedProposalType": errUnsupportedProposalType,
-	}
-	for _, first := range slices.Sorted(maps.Keys(named)) {
-		for _, second := range slices.Sorted(maps.Keys(named)) {
-			if first == second {
-				continue
-			}
-			if errors.Is(named[first], named[second]) {
-				t.Errorf("%s answers to %s, so the two name one rule and no caller can tell them apart",
-					first, second)
-			}
-		}
-	}
-	// and every one of them is a distinct value from the framing sentinel the arm rule answers,
-	// because the type rule and the arm rule are two rules
-	for _, name := range slices.Sorted(maps.Keys(named)) {
-		if errors.Is(named[name], ErrContentArmMismatch) || errors.Is(ErrContentArmMismatch, named[name]) {
-			t.Errorf("%s and ErrContentArmMismatch answer to each other", name)
-		}
-	}
 }
 
 // TestProposalTypeNameNamesEveryRegisteredType holds the error message's vocabulary to the
@@ -391,17 +523,24 @@ func TestProfileGateRefusesExternalInit(t *testing.T) {
 // ValSem113, and a proposal whose arm this build cannot read is one it must drop rather than skip.
 func TestProfileGateRefusesGreaseType(t *testing.T) {
 	proposal := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownType: ProposalType(0x0A0A)}
-	if err := checkProposalProfile(defaultProfile(), proposal); !errors.Is(err, errUnsupportedProposalType) {
-		t.Fatalf("checkProposalProfile error = %v, want errUnsupportedProposalType", err)
+	err := checkProposalProfile(defaultProfile(), proposal)
+	if !errors.Is(err, errUnregisteredProposalType) {
+		t.Fatalf("checkProposalProfile error = %v, want errUnregisteredProposalType", err)
+	}
+	// and it is refused as UNREGISTERED and not as a forgery. This is the value the collapse hid:
+	// a decoded GREASE proposal carries UnknownType equal to ProposalType, because that is how
+	// proposal_wire.go makes GREASE round trip, so a discriminant clause reading "UnknownType is
+	// set at all" accuses the peer's honest message of being a forgery this build produced. While
+	// the two rules shared one sentinel every assertion here held either way.
+	if errors.Is(err, errForgedProposalDiscriminant) {
+		t.Errorf("a GREASE proposal decoded as the codec decodes one was answered %v, which names the forged discriminant rule; nothing about it disagrees with anything",
+			err)
 	}
 	// the same refusal over a value whose UnknownType is NOT set, which is the half the plan's
-	// version cannot state. A decoded GREASE proposal always carries UnknownType, so the forged
-	// discriminant clause refuses it whatever the type rule does -- measured: with the type rule
-	// disabled entirely, the case above still passes. This one is refused by the type rule or by
-	// nothing.
+	// version cannot state. This one is refused by the type rule or by nothing.
 	byTypeAlone := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownBody: []byte{0x01}}
-	if err := checkProposalProfile(defaultProfile(), byTypeAlone); !errors.Is(err, errUnsupportedProposalType) {
-		t.Fatalf("an unregistered proposal type carrying no forged discriminant was answered %v, want errUnsupportedProposalType",
+	if err := checkProposalProfile(defaultProfile(), byTypeAlone); !errors.Is(err, errUnregisteredProposalType) {
+		t.Fatalf("an unregistered proposal type carrying no forged discriminant was answered %v, want errUnregisteredProposalType",
 			err)
 	}
 }
@@ -423,8 +562,8 @@ func TestCheckProposalTypeAnswersTheWholeCodePointSpaceFromTheRegistry(t *testin
 		got := defaultProfile().checkProposalType(proposalType)
 		if !slices.Contains(registered, proposalType) {
 			unregistered += 1
-			if !errors.Is(got, errUnsupportedProposalType) {
-				t.Fatalf("the unregistered code point %#04x was answered %v, want errUnsupportedProposalType",
+			if !errors.Is(got, errUnregisteredProposalType) {
+				t.Fatalf("the unregistered code point %#04x was answered %v, want errUnregisteredProposalType",
 					value, got)
 			}
 			continue
@@ -549,9 +688,26 @@ func TestTheProfileGateRefusesAForgedWireDiscriminant(t *testing.T) {
 		t.Fatalf("the forged proposal encodes under the discriminant %x, and this test is about the case where that is not the add it claims to be",
 			encoded[:min(2, len(encoded))])
 	}
-	if err := checkProposalProfile(defaultProfile(), forged); !errors.Is(err, errUnsupportedProposalType) {
-		t.Fatalf("a proposal that names an add and encodes as a reinit was answered %v, want errUnsupportedProposalType",
+	err = checkProposalProfile(defaultProfile(), forged)
+	if !errors.Is(err, errForgedProposalDiscriminant) {
+		t.Fatalf("a proposal that names an add and encodes as a reinit was answered %v, want errForgedProposalDiscriminant",
 			err)
+	}
+	// and it is NOT the refusal a type outside the profile gets, which is what the collapse cost:
+	// the caller was told "proposal type is not one this build processes" about a proposal whose
+	// type is add, and add is one this build processes. The two are opposite faults -- a peer sent
+	// a type we do not implement, versus our own commit builder produced octets every receiver
+	// will read as a different proposal than the one we hold a reference to.
+	for name, other := range map[string]error{
+		"errProfileReInit":            errProfileReInit,
+		"errUnregisteredProposalType": errUnregisteredProposalType,
+		"errReservedProposalType":     errReservedProposalType,
+		"errNilProposal":              errNilProposal,
+	} {
+		if errors.Is(err, other) {
+			t.Errorf("the forged discriminant refusal answers to %s as well as to its own sentinel; a caller cannot tell a message to drop from a message this build must not have built",
+				name)
+		}
 	}
 	// and the same forge under an accepted type, so the clause is about the DISAGREEMENT rather
 	// than about which type was forged
@@ -560,17 +716,123 @@ func TestTheProfileGateRefusesAForgedWireDiscriminant(t *testing.T) {
 		Add:          &Add{KeyPackage: *keyPackage},
 		UnknownType:  ProposalTypeRemove,
 	}
-	if err := checkProposalProfile(defaultProfile(), alsoForged); !errors.Is(err, errUnsupportedProposalType) {
-		t.Fatalf("a proposal that names an add and encodes as a remove was answered %v, want errUnsupportedProposalType",
+	if err := checkProposalProfile(defaultProfile(), alsoForged); !errors.Is(err, errForgedProposalDiscriminant) {
+		t.Fatalf("a proposal that names an add and encodes as a remove was answered %v, want errForgedProposalDiscriminant",
+			err)
+	}
+}
+
+// TestTheForgedDiscriminantClauseIsAboutTheDisagreementAndNotAboutUnknownTypeBeingSet is the
+// test the two fixtures next door cannot be: both of them forge a genuine disagreement, so a
+// clause reading "UnknownType is set at all" and one reading "UnknownType is not the type"
+// answer identically over every input in that test.
+//
+// Measured: narrowing the landed clause from the first rule to the second left the whole of
+// ./mls/... and ./message/... green, while the clause's own comment and its test both CLAIMED
+// the second. So the file implemented one rule and documented another, and nothing could tell.
+//
+// The two inputs below are the ones that separate them, and each is a real value rather than a
+// probe. The first is what proposal_wire.go's own decoder produces for an unregistered code
+// point -- UnknownType is set to ProposalType, which is how a GREASE body round trips -- so
+// under the wide rule every honestly relayed GREASE proposal is refused as a forgery. The second
+// is a proposal whose discriminant and type agree on an ACCEPTED type: MarshalMLS writes the
+// same octets it would write with UnknownType unset, so there is no second reading for any
+// receiver to take, and refusing it refuses a proposal that is not wrong about anything.
+func TestTheForgedDiscriminantClauseIsAboutTheDisagreementAndNotAboutUnknownTypeBeingSet(t *testing.T) {
+	crypto := testCrypto(t)
+	bob := testIdentity(t, crypto, "bob")
+	keyPackage, _, _ := testKeyPackage(t, crypto, bob)
+
+	// the GREASE proposal the codec itself builds, round tripped rather than hand written, so
+	// this is the value that actually arrives off the wire and not one this test invented
+	grease := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownType: ProposalType(0x0A0A),
+		UnknownBody: []byte{0xde, 0xad}}
+	encoded, err := syntax.Marshal(grease)
+	if err != nil {
+		t.Fatalf("syntax.Marshal the grease proposal: %v", err)
+	}
+	decoded := &Proposal{}
+	if err := syntax.Unmarshal(encoded, decoded); err != nil {
+		t.Fatalf("syntax.Unmarshal the grease proposal: %v", err)
+	}
+	if decoded.UnknownType != decoded.ProposalType {
+		t.Fatalf("the decoder answered UnknownType %#04x for ProposalType %#04x; this test is about the case where a decoded proposal carries the two EQUAL and there is nothing to disagree about",
+			uint16(decoded.UnknownType), uint16(decoded.ProposalType))
+	}
+	got := checkProposalProfile(defaultProfile(), decoded)
+	if !errors.Is(got, errUnregisteredProposalType) {
+		t.Errorf("a GREASE proposal off the wire was answered %v, want errUnregisteredProposalType: the rule it breaks is that nothing here knows the code point",
+			got)
+	}
+	if errors.Is(got, errForgedProposalDiscriminant) {
+		t.Errorf("a GREASE proposal off the wire was refused as a forged discriminant; its discriminant is exactly the type it names")
+	}
+
+	// and the accepted type carrying its own discriminant, which encodes to the octets a plain
+	// add encodes to and is therefore a proposal nothing can read two ways
+	agreeing := &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *keyPackage},
+		UnknownType: ProposalTypeAdd}
+	plain := &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *keyPackage}}
+	withDiscriminant, err := syntax.Marshal(agreeing)
+	if err != nil {
+		t.Fatalf("syntax.Marshal the agreeing proposal: %v", err)
+	}
+	withoutDiscriminant, err := syntax.Marshal(plain)
+	if err != nil {
+		t.Fatalf("syntax.Marshal the plain proposal: %v", err)
+	}
+	if !bytes.Equal(withDiscriminant, withoutDiscriminant) {
+		t.Fatalf("the two encode differently, so this test is not about a proposal that is indistinguishable on the wire from an ordinary add")
+	}
+	if err := checkProposalProfile(defaultProfile(), agreeing); err != nil {
+		t.Errorf("an add whose discriminant is add was refused with %v; the octets it produces are an ordinary add's, so the disagreement this rule is about does not exist here",
 			err)
 	}
 }
 
 // TestTheProfileGateRefusesANilProposal states the one argument shape a caller can reach it with
-// that has no type at all.
+// that has no type at all, and holds it to a value of its own.
+//
+// A nil proposal is not an unsupported TYPE: there is no type. It is a caller that reached the
+// gate holding nothing, which is a commit path defect rather than a message to drop -- the
+// opposite remedy from every other refusal here, which is why sharing a value with them was
+// wrong.
 func TestTheProfileGateRefusesANilProposal(t *testing.T) {
-	if err := checkProposalProfile(defaultProfile(), nil); !errors.Is(err, errUnsupportedProposalType) {
-		t.Fatalf("checkProposalProfile(profile, nil) = %v, want errUnsupportedProposalType", err)
+	err := checkProposalProfile(defaultProfile(), nil)
+	if !errors.Is(err, errNilProposal) {
+		t.Fatalf("checkProposalProfile(profile, nil) = %v, want errNilProposal", err)
+	}
+	for name, other := range map[string]error{
+		"errUnregisteredProposalType":   errUnregisteredProposalType,
+		"errReservedProposalType":       errReservedProposalType,
+		"errForgedProposalDiscriminant": errForgedProposalDiscriminant,
+	} {
+		if errors.Is(err, other) {
+			t.Errorf("the nil refusal answers to %s as well; a caller told a peer sent something unsupported would go looking at the wire for a bug in its own commit path",
+				name)
+		}
+	}
+}
+
+// TestTheReservedCodePointIsRefusedAsItsOwnRuleAndNotAsAnUnregisteredOne is ledger 17 for
+// errReservedProposalType.
+//
+// 0x0000 IS in the RFC 9420 section 17.5 registry; what it is registered as is "reserved", which
+// is not a proposal. A caller told "not in this build's registry" about it would go looking for a
+// registration that is right there in extension.go, and a build that later widened its registry
+// would have no way to tell the two apart.
+func TestTheReservedCodePointIsRefusedAsItsOwnRuleAndNotAsAnUnregisteredOne(t *testing.T) {
+	err := defaultProfile().checkProposalType(ProposalTypeReserved)
+	if !errors.Is(err, errReservedProposalType) {
+		t.Fatalf("checkProposalType(reserved) = %v, want errReservedProposalType", err)
+	}
+	if errors.Is(err, errUnregisteredProposalType) {
+		t.Error("the reserved code point is refused as unregistered; it is registered, and what it is registered as is not a proposal")
+	}
+	// and the whole gate answers the same value over a proposal carrying it, so the two doors
+	// this file has agree about which rule the reserved point breaks
+	if err := checkProposalProfile(defaultProfile(), &Proposal{ProposalType: ProposalTypeReserved}); !errors.Is(err, errReservedProposalType) {
+		t.Fatalf("checkProposalProfile over a reserved proposal = %v, want errReservedProposalType", err)
 	}
 }
 
@@ -1439,8 +1701,8 @@ func TestTheCacheRunsTheV1ProfileGateOnBothDoors(t *testing.T) {
 	}
 	grease := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownBody: []byte{1, 2}}
 	if _, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
-		Type: ProposalOrRefTypeProposal, Proposal: grease}}); !errors.Is(err, errUnsupportedProposalType) {
-		t.Errorf("Resolve of an inline GREASE proposal = %v, want errUnsupportedProposalType", err)
+		Type: ProposalOrRefTypeProposal, Proposal: grease}}); !errors.Is(err, errUnregisteredProposalType) {
+		t.Errorf("Resolve of an inline GREASE proposal = %v, want errUnregisteredProposalType", err)
 	}
 }
 
@@ -1718,9 +1980,15 @@ func TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped(t *testing.T)
 	}
 	list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeProposal, Proposal: accepted}})
-	if !errors.Is(err, errUnsupportedProposalType) {
-		t.Fatalf("an accepted type with no bucket resolved with err = %v, want errUnsupportedProposalType; a proposal counted in All and put in no bucket is one the group agreed to and no member applies",
+	if !errors.Is(err, errAcceptedTypeHasNoBucket) {
+		t.Fatalf("an accepted type with no bucket resolved with err = %v, want errAcceptedTypeHasNoBucket; a proposal counted in All and put in no bucket is one the group agreed to and no member applies",
 			err)
+	}
+	// and it is not the refusal an unsupported type gets. The two are opposite: this type IS
+	// supported -- the profile was just widened to accept it -- and what is missing is a bucket
+	// on THIS side. A caller told the type was unsupported would go and look at the peer.
+	if errors.Is(err, errUnregisteredProposalType) || errors.Is(err, errReservedProposalType) {
+		t.Errorf("the bucketless refusal answers to a type refusal as well: %v", err)
 	}
 	if list != nil {
 		t.Errorf("the refusal answered a list as well: %+v", list)
@@ -1741,7 +2009,11 @@ var proposalListOwnedErrors = map[string]error{
 	"errProfilePsk":                     errProfilePsk,
 	"errProfileReInit":                  errProfileReInit,
 	"errProfileExternalCommit":          errProfileExternalCommit,
-	"errUnsupportedProposalType":        errUnsupportedProposalType,
+	"errReservedProposalType":           errReservedProposalType,
+	"errUnregisteredProposalType":       errUnregisteredProposalType,
+	"errNilProposal":                    errNilProposal,
+	"errForgedProposalDiscriminant":     errForgedProposalDiscriminant,
+	"errAcceptedTypeHasNoBucket":        errAcceptedTypeHasNoBucket,
 	"errProposalCacheNotAProposal":      errProposalCacheNotAProposal,
 	"errProposalSenderNotMember":        errProposalSenderNotMember,
 	"errProposalCacheEpoch":             errProposalCacheEpoch,
@@ -1803,6 +2075,12 @@ func TestEveryRefusalOfThisFileIsItsOwnValue(t *testing.T) {
 				t.Errorf("%s and %s both read %q, so the two are indistinguishable in a log",
 					name, other, first.Error())
 			}
+		}
+		// and every one of them is a distinct value from the framing sentinel the ARM rule
+		// answers, because the type rule and the arm rule are two rules and this file owns
+		// only one of them
+		if errors.Is(first, ErrContentArmMismatch) || errors.Is(ErrContentArmMismatch, first) {
+			t.Errorf("%s and ErrContentArmMismatch answer to each other", name)
 		}
 	}
 }

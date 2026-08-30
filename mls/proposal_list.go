@@ -32,7 +32,7 @@ import (
 	"github.com/urnetwork/connect/mls/syntax"
 )
 
-// The four refusals this gate answers, standing in for the validation plan's catalogue.
+// The refusals this gate answers, standing in for the validation plan's catalogue.
 //
 // One value per rule and never one value shared by two, which is errors_lifecycle.go's rule and
 // the reason p8's catalogue spells them separately: a caller -- or a test -- asking which of the
@@ -41,11 +41,29 @@ import (
 // defect. errProfileExternalCommit rather than errProfileExternalInit is p8's spelling and is
 // kept, because external_init is the proposal an external COMMIT carries and the refusal is about
 // the commit shape rather than about one arm.
+//
+// THE RULE ABOVE ONCE DID NOT HOLD IN THIS FILE, which is why the list is longer than the plan's
+// four. Five rules of this gate -- a RESERVED code point, a code point OUTSIDE the registry, a
+// NIL proposal, a wire DISCRIMINANT that is not the type the proposal names, and an accepted type
+// resolution has no BUCKET for -- all answered one value whose message read "proposal type is not
+// one this build processes". That is not a spelling question. This gate has two callers and they
+// need opposite handling: ProposalCache.Store judges what a PEER sent, where "a code point this
+// build does not implement" is routine traffic to drop, and Resolve judges what this build's own
+// commit path ASSEMBLED, where a forged discriminant means this build is emitting proposals whose
+// ProposalRef every receiver computes over octets naming a different type -- messages that will
+// not verify, produced by us. A caller handed one value cannot separate the two, and the forged
+// case was reported to it as a sentence about a registry, over a proposal whose type is
+// registered and whose octets are the whole of what is wrong.
 var (
-	errProfilePsk              = errors.New("mls: pre_shared_key proposals are outside the v1 profile")
-	errProfileReInit           = errors.New("mls: reinit proposals are outside the v1 profile")
-	errProfileExternalCommit   = errors.New("mls: external commits are outside the v1 profile")
-	errUnsupportedProposalType = errors.New("mls: proposal type is not one this build processes")
+	errProfilePsk            = errors.New("mls: pre_shared_key proposals are outside the v1 profile")
+	errProfileReInit         = errors.New("mls: reinit proposals are outside the v1 profile")
+	errProfileExternalCommit = errors.New("mls: external commits are outside the v1 profile")
+
+	errReservedProposalType       = errors.New("mls: the reserved code point names no proposal")
+	errUnregisteredProposalType   = errors.New("mls: proposal type is not in this build's proposal type registry")
+	errNilProposal                = errors.New("mls: the v1 profile gate was handed no proposal")
+	errForgedProposalDiscriminant = errors.New("mls: proposal would be encoded under a discriminant other than the type it names")
+	errAcceptedTypeHasNoBucket    = errors.New("mls: the v1 profile accepts a proposal type resolution has no bucket for")
 )
 
 // proposalTypeProfile is the v1 disposition of every REGISTERED proposal type: nil for the four
@@ -62,9 +80,11 @@ var (
 //
 // ProposalTypeReserved is in the map and refused. It is a registry code point, so leaving it out
 // would make the two sets unequal for a reason that has nothing to do with the profile, and it is
-// never a legal proposal type, so the refusal it earns is the unsupported one.
+// never a legal proposal type -- which is a rule of its OWN and not the unregistered one. 0x0000
+// IS in the registry; what it is registered as is "not a proposal", and a caller told "this code
+// point is not in the registry" about it would go looking for a registration that is right there.
 var proposalTypeProfile = map[ProposalType]error{
-	ProposalTypeReserved:               errUnsupportedProposalType,
+	ProposalTypeReserved:               errReservedProposalType,
 	ProposalTypeAdd:                    nil,
 	ProposalTypeUpdate:                 nil,
 	ProposalTypeRemove:                 nil,
@@ -93,13 +113,15 @@ func defaultProfile() *profile {
 // The two answers it separates are worth separating: a REGISTERED type this profile does not
 // implement is refused with the sentinel naming which one, so a peer running a fuller profile can
 // be told what this build will not do, and an UNREGISTERED one -- a GREASE value, or a code point
-// registered after this was written -- is refused as unsupported, because there is nothing to
-// name. Both are refusals; a v1 client acts on four proposal types and no others.
+// registered after this was written -- is refused with its own sentinel, because there is no
+// narrowing to name and the remedy is a different one: a registered refusal is a decision this
+// profile made and could revisit, an unregistered one is a code point nothing here has ever heard
+// of. Both are refusals; a v1 client acts on four proposal types and no others.
 func (self *profile) checkProposalType(proposalType ProposalType) error {
 	refusal, registered := proposalTypeProfile[proposalType]
 	if !registered {
 		return fmt.Errorf("%w: %s is not a registered proposal type",
-			errUnsupportedProposalType, proposalTypeName(proposalType))
+			errUnregisteredProposalType, proposalTypeName(proposalType))
 	}
 	if refusal != nil {
 		return fmt.Errorf("%w: %s is registered and outside the v1 profile",
@@ -110,8 +132,11 @@ func (self *profile) checkProposalType(proposalType ProposalType) error {
 
 // checkProposalProfile refuses any proposal this build will not process.
 //
-// Three rules, in the order a caller wants to hear them:
+// Four rules, in the order a caller wants to hear them:
 //
+//  0. that there IS a proposal. A nil one has no type, no discriminant and no arm, so it is not
+//     an unsupported type -- it is a caller that reached this gate holding nothing, which is a
+//     commit path bug and not a message to drop. It answers its own value for that reason.
 //  1. the TYPE, through the one refusal surface above;
 //  2. the WIRE DISCRIMINANT, which is not always the type -- see below;
 //  3. the ARM, through (*Proposal).checkArm, which is proposal_wire.go's and is not restated
@@ -129,9 +154,26 @@ func (self *profile) checkProposalType(proposalType ProposalType) error {
 // octets. A proposal admitted here as an Add and encoded under 0x0005 is a reference the proposer
 // believes is an Add and every receiver refuses as a reinit. This plan never emits one, so it
 // refuses to act on one.
+//
+// RULE 2 IS ABOUT THE DISAGREEMENT AND NOT ABOUT UnknownType BEING SET, and the two are a
+// one-clause difference that was worth deciding rather than inheriting. When UnknownType equals
+// ProposalType the octets carry exactly the type this gate was asked about: MarshalMLS writes the
+// same discriminant either way and selects the same arm, so the encoding is indistinguishable
+// from the one a proposal with UnknownType unset produces, and there is no second reading for any
+// receiver to take. Nothing is forged, so nothing here is refused.
+//
+// What decides it is the OTHER direction. proposal_wire.go's decoder sets UnknownType to
+// ProposalType for every unregistered code point it reads -- that is how GREASE round trips -- so
+// a proposal a peer honestly sent under 0x0A0A arrives with the two EQUAL. Under "UnknownType is
+// set at all" that peer's message is refused as a forgery this build's own commit builder is
+// accused of producing, when what actually happened is that a registry we do not have was used.
+// Both readings refused it while the two rules shared one sentinel, which is why the collapse
+// hid this: now that they answer different values, the wide clause reports the wrong one for
+// every GREASE proposal that ever arrives, and the narrow one leaves that case to rule 1, which
+// is the rule it breaks.
 func checkProposalProfile(active *profile, proposal *Proposal) error {
 	if proposal == nil {
-		return fmt.Errorf("%w: nil proposal", errUnsupportedProposalType)
+		return fmt.Errorf("%w: nothing was handed to the type rule", errNilProposal)
 	}
 	if active == nil {
 		active = defaultProfile()
@@ -139,9 +181,9 @@ func checkProposalProfile(active *profile, proposal *Proposal) error {
 	if err := active.checkProposalType(proposal.ProposalType); err != nil {
 		return err
 	}
-	if proposal.UnknownType != ProposalTypeReserved {
+	if proposal.UnknownType != ProposalTypeReserved && proposal.UnknownType != proposal.ProposalType {
 		return fmt.Errorf("%w: %s would be encoded under the discriminant %s",
-			errUnsupportedProposalType, proposalTypeName(proposal.ProposalType),
+			errForgedProposalDiscriminant, proposalTypeName(proposal.ProposalType),
 			proposalTypeName(proposal.UnknownType))
 	}
 	return proposal.checkArm()
@@ -688,7 +730,7 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, groupContext *GroupCon
 			// TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped performs the
 			// widening for the length of one test so that this line is executed rather than
 			// reasoned about.
-			return nil, fmt.Errorf("%w: %s has no bucket", errUnsupportedProposalType,
+			return nil, fmt.Errorf("%w: %s has no bucket", errAcceptedTypeHasNoBucket,
 				proposalTypeName(cached.Proposal.ProposalType))
 		}
 	}

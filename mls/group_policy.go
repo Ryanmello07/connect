@@ -266,21 +266,29 @@ func (self *GroupPolicyExtension) MarshalMLS(w *syntax.Writer) error {
 	return nil
 }
 
-// UnmarshalMLS reads the wire form and VALIDATES what it read before it hands anything back.
+// UnmarshalMLS reads the wire form. It does NOT judge the value it read.
 //
-// The validation belongs here rather than in ParseGroupPolicyExtension, and that is a decision
-// worth two sentences because the plan put it in the parser. Convention C1 says an MLS
-// structure has exactly one byte level codec, syntax.Marshal and syntax.Unmarshal reached
-// through this pair, and the gate that enforces it reads every declaration taking a byte run
-// and answering a structure: a ParseX that does anything besides plumb its run into the codec
-// IS a second decoder by that reading, whatever it was called. So the canonical checks live at
-// the one decode every path shares, which is also where they are worth the most -- a policy
-// nested inside some later structure is checked by the same code as one parsed from an
-// extension body, rather than by whichever entry point its caller happened to use.
+// A CODEC DECODES, IT DOES NOT JUDGE, which is this package's rule and is stated at length on
+// OwnerSuccessorExtension.UnmarshalMLS. The short of it: a syntax.Codec that refuses values its
+// own MarshalMLS writes does not round trip -- syntax.Marshal(&GroupPolicyExtension{}) succeeds
+// and syntax.Unmarshal of its own output failed -- so the pin this type carries claimed a
+// contract the pair did not keep. What is left here is the reading: a truncated body, a role
+// vector this Reader cannot lay out, a tail. What a policy must LOOK LIKE is Validate's.
+//
+// WHERE THE READ SIDE JUDGES IS THE ONE THING THE TWO EXTENSIONS DECIDE DIFFERENTLY, and the
+// rule that decides it is the same for both: a value rule runs at the earliest door that can
+// state it without pre-empting a rule that has to run first. A nomination's rules are conditions
+// on a promotion and spec A section 3.4 puts the owner's opt out ahead of them, so the earliest
+// such door is the promotion validator and nothing before it may answer. A policy's rules are
+// conditions on the STRUCTURE -- a defined role byte, ascending member ids, exactly one owner --
+// and there is no later door at all: RoleOf and the owner lookup act on whatever they are given,
+// so a policy naming two owners answers one of them and half a group believes the other. The
+// earliest door is therefore the tag checked parse entry point, ParseGroupPolicyFrom, which is
+// where Validate now runs -- and not the loose body one, which convention C1 requires to stay
+// bare plumbing and which the note there explains.
 //
 // The whole value is replaced rather than filled field by field, so a decode that refuses part
-// way leaves the receiver as it was rather than holding half of two policies. The refusal is
-// made against the decoded value BEFORE the assignment for the same reason.
+// way leaves the receiver as it was rather than holding half of two policies.
 func (self *GroupPolicyExtension) UnmarshalMLS(r *syntax.Reader) error {
 	roles, err := syntax.ReadVector(r, readOneRoleEntry)
 	if err != nil {
@@ -307,9 +315,6 @@ func (self *GroupPolicyExtension) UnmarshalMLS(r *syntax.Reader) error {
 		RetentionPolicy:     RetentionPolicy{DurableMs: durableMs, MediaMs: mediaMs},
 		DisappearingBuckets: buckets,
 		ServerId:            serverId,
-	}
-	if err := decoded.Validate(); err != nil {
-		return err
 	}
 	*self = decoded
 	return nil
@@ -403,29 +408,32 @@ func (self *GroupPolicyExtension) Encode() (Extension, error) {
 	return Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: data}, nil
 }
 
-// ParseGroupPolicyExtension decodes and validates an extension body: the bytes of one entry's
-// ExtensionData, not the entry itself.
+// ParseGroupPolicyExtension decodes an extension body -- the bytes of one entry's ExtensionData,
+// not the entry itself -- and hands back whatever policy those octets carry, UNJUDGED.
 //
-// The order and duplicate checks DO run on the way in, and that is the whole value of having a
-// canonical encoding -- a receiver that re-sorted a non canonical body would accept two
-// spellings of one policy, and since this body is inside the group context that is two
-// transcript hashes each end believes is the only one. They run inside UnmarshalMLS rather than
-// here, which is what leaves this declaration as the bare plumbing convention C1 asks an entry
-// point to be: it hands its run to the one codec and reports what came back, exactly as
-// ParseMLSMessage does, and adds no second reading of the bytes for the codec to disagree with.
+// It is the codec spelled as a function and nothing else, which is what convention C1 requires of
+// it: the gate reads every declaration taking a byte run and answering an MLS structure, and one
+// that does anything besides plumb its run into the codec is a second decoder by that reading,
+// whatever it was called and however harmless the extra call is. Adding Validate here was
+// measured against that gate and reported. So this door checks nothing -- not the tag those bytes
+// arrived under, which it cannot see, and not the content, which is the paragraph below.
 //
-// What that costs is the wrapping the plan wrote here: a truncated or trailing body answers
-// mls/syntax's own sentinel rather than ErrMalformedExtension. That is the more precise answer
-// of the two -- ErrTruncated says the sender and this package disagree about the encoding,
-// ErrMalformedExtension says they agree about it and the content is refused -- and the second
-// is still what every content refusal carries.
+// WHERE THE CONTENT IS CHECKED IS ParseGroupPolicyFrom, and the two omissions are the same
+// omission rather than a hole beside a documented gap: a caller holding a loose body has already
+// stepped outside the pair Encode and ParseGroupPolicyFrom make, and this answers exactly the
+// octets it was handed. Every consumer inside this package reaches a policy through
+// ParseGroupPolicyFrom or through GroupPolicyOf above it, which is asserted rather than left as
+// advice -- TestNothingReachesAGroupPolicyThroughTheUnjudgedDoor derives the callers of this
+// declaration out of the package's own source and holds them to the one that judges.
+//
+// What the plumbing costs is the wrapping the plan wrote here: a truncated or trailing body
+// answers mls/syntax's own sentinel rather than ErrMalformedExtension. That is the more precise
+// answer of the two -- ErrTruncated says the sender and this package disagree about the encoding,
+// ErrMalformedExtension says they agree about it and the content is refused -- and the second is
+// still what every content refusal carries.
 //
 // syntax.Unmarshal already joins the decoder's answer with Done, so a body with a tail is
 // refused there and there is no separate trailing byte check here.
-//
-// It is handed the body and never sees the tag those bytes arrived under, so it cannot refuse a
-// wrong one; that is ParseGroupPolicyFrom's job and it is the entry point a caller holding an
-// Extension should reach for.
 func ParseGroupPolicyExtension(data []byte) (*GroupPolicyExtension, error) {
 	policy := &GroupPolicyExtension{}
 	if err := syntax.Unmarshal(data, policy); err != nil {
@@ -442,12 +450,28 @@ func ParseGroupPolicyExtension(data []byte) (*GroupPolicyExtension, error) {
 // documented cannot pair a policy body with 0xF002 -- which would encode, be covered by the
 // confirmed transcript hash, and be refused by the first peer that tried to read an X-Wing key
 // out of a role list.
+//
+// IT IS ALSO THE READ SIDE DOOR THAT JUDGES, which is the other half of being Encode's
+// counterpart: Encode validates before it writes, and a body that came in under this tag is one
+// this client is about to act on. The rules are conditions on the STRUCTURE -- a defined role
+// byte, ascending member ids, exactly one owner -- and unlike the succession conditions in
+// owner_successor.go there is no later door that owns them: RoleOf and OwnerId answer from
+// whatever they are handed, so a policy naming two owners answers one of them and half a group
+// enforces the other, inside a structure the confirmed transcript hash covers. The earliest door
+// that can state them without pre-empting anything is therefore this one.
 func ParseGroupPolicyFrom(ext Extension) (*GroupPolicyExtension, error) {
 	if ext.ExtensionType != ExtensionTypeUrmessageGroupPolicy {
 		return nil, fmt.Errorf("%w: extension type %#04x is not urmessage_group_policy",
 			ErrMalformedExtension, uint16(ext.ExtensionType))
 	}
-	return ParseGroupPolicyExtension(ext.ExtensionData)
+	policy, err := ParseGroupPolicyExtension(ext.ExtensionData)
+	if err != nil {
+		return nil, err
+	}
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	return policy, nil
 }
 
 // RoleOf returns a member's role and whether the policy names them at all.

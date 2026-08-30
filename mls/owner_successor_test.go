@@ -323,30 +323,131 @@ func TestTheFloorRefusalIsThisRulesSentinelAndNoOtherSuccessionSentinel(t *testi
 	}
 }
 
-// TestOwnerSuccessorRefusesAShortFloorOnTheWayInAsWell is the half the plan's encode-only test
-// leaves open.
+// TestAShortFloorIsRefusedByTheConditionAndNotByTheCodec is what replaced the decode side floor
+// refusal, and it states the three things that decision has to keep true.
 //
-// The floor exists so a group cannot shorten its own succession delay after the fact. A refusal
-// on the encode side alone stops THIS client writing one and stops nothing at all: the group
-// context comes off the wire, so a modified client shortens the floor to a minute, every honest
-// receiver decodes it happily, and the ninety day delay is gone for every member. The rule has to
-// run at the decode, and the body is hand assembled here because the checked encoder will not
-// produce one.
-func TestOwnerSuccessorRefusesAShortFloorOnTheWayInAsWell(t *testing.T) {
+// The floor exists so a group cannot shorten its own succession delay after the fact, and a
+// refusal on the encode side alone would stop THIS client writing one and stop nothing else. What
+// stops a modified client is spec A section 3.4 condition 5, which refuses the PROMOTION -- so the
+// ninety day delay holds for every member whether or not the nomination decodes, and it holds at
+// the one place a promotion is judged rather than at every place a group context is read.
+//
+// Refusing at the codec instead cost three things and each is asserted here: the nomination has to
+// REACH a caller so that condition 1, the owner's opt out, can be asked of it first; the group
+// context has to stay readable to a client doing something else entirely; and Validate has to go
+// on refusing the value, so Encode and condition 5 share one comparison rather than each carrying
+// its own copy of the threshold.
+func TestAShortFloorIsRefusedByTheConditionAndNotByTheCodec(t *testing.T) {
 	successor := bytes.Repeat([]byte{0x11}, 32)
 	for _, floorMs := range []uint64{0, 1, SuccessionFloorMinMs - 1} {
 		body := handAssembledOwnerSuccessorBody(t, 0x01, successor, 1770000000000, floorMs)
 		parsed, err := ParseOwnerSuccessorExtension(body)
-		if !errors.Is(err, ErrSuccessionFloorTooShort) {
-			t.Fatalf("a body carrying a %d ms floor decoded to (%+v, %v), want ErrSuccessionFloorTooShort",
-				floorMs, parsed, err)
+		if err != nil {
+			t.Fatalf("a body carrying a %d ms floor was refused at the decode with %v; the group context that carries it is then unreadable, and the refusal names succession to a caller that was not asking about it",
+				floorMs, err)
+		}
+		if parsed.FloorMs != floorMs {
+			t.Fatalf("the nomination came back carrying a %d ms floor and the octets said %d; a value the codec normalises is one condition 5 can never see",
+				parsed.FloorMs, floorMs)
+		}
+		// the rule is still stated, once, where both doors that ACT on a nomination reach it
+		if err := parsed.Validate(); !errors.Is(err, ErrSuccessionFloorTooShort) {
+			t.Fatalf("Validate over a %d ms floor answered %v, want ErrSuccessionFloorTooShort; spec A section 3.4 condition 5 and Encode both call this, and a rule nothing states is one neither of them can enforce",
+				floorMs, err)
+		}
+		// and this build still refuses to WRITE one, which is the direction the encode side owns
+		if _, err := parsed.Encode(); !errors.Is(err, ErrSuccessionFloorTooShort) {
+			t.Fatalf("Encode of a %d ms floor answered %v, want ErrSuccessionFloorTooShort", floorMs, err)
 		}
 	}
 	// and the floor exactly at the minimum is accepted, so the comparison is the boundary the
 	// spec states and not one either side of it
 	atTheFloor := handAssembledOwnerSuccessorBody(t, 0x01, successor, 1770000000000, SuccessionFloorMinMs)
-	if _, err := ParseOwnerSuccessorExtension(atTheFloor); err != nil {
+	nomination, err := ParseOwnerSuccessorExtension(atTheFloor)
+	if err != nil {
 		t.Fatalf("a body carrying exactly the ninety day floor was refused: %v", err)
+	}
+	if err := nomination.Validate(); err != nil {
+		t.Fatalf("Validate over exactly the ninety day floor answered %v, want nil", err)
+	}
+}
+
+// TestADisabledNominationIsReadEvenWhenItsFloorIsShort is spec A section 3.4's opt out, at the
+// only door this task owns.
+//
+// Section 3.4 lists five conditions on a promotion, puts Enabled first, and states that the opt
+// out is absolute: TestSuccessionOptOutIsAbsolute -- p7 task 21's -- asserts a promotion in a
+// group with Enabled false fails even when the other four conditions hold. A codec that answered
+// the FLOOR decided a nomination whose owner had switched succession off before anything asked
+// whether it was on. For the pair that is both disabled and short floored, OwnerSuccessorOf
+// answered ErrSuccessionFloorTooShort and the promotion path never saw Enabled at all -- and task
+// 21's drafted tests never construct that pair, so the divergence would have landed green.
+//
+// What this states is the half that has to be true for condition 1 to be askable at all: the pair
+// reaches a caller, and it reaches it saying it is switched off.
+func TestADisabledNominationIsReadEvenWhenItsFloorIsShort(t *testing.T) {
+	const shortFloor = uint64(60000)
+	body := handAssembledOwnerSuccessorBody(t, 0x00, nil, 0, shortFloor)
+	nomination, found, err := OwnerSuccessorOf([]Extension{
+		{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: body},
+	})
+	if err != nil {
+		t.Fatalf("a nomination that is both disabled and short floored was answered %v out of a group context; the opt out is condition 1 and the floor is condition 5, so the owner's own decision lost to one they may never have looked at",
+			err)
+	}
+	if !found {
+		t.Fatal("OwnerSuccessorOf reported no nomination in a list that carries one")
+	}
+	if nomination.Enabled {
+		t.Fatal("the nomination came back enabled")
+	}
+	if nomination.FloorMs != shortFloor {
+		t.Fatalf("FloorMs = %d, want %d", nomination.FloorMs, shortFloor)
+	}
+	// and the floor is still a refusal, so this is about WHICH DOOR answers rather than about
+	// the rule having gone away
+	if err := nomination.Validate(); !errors.Is(err, ErrSuccessionFloorTooShort) {
+		t.Fatalf("Validate over the short floor answered %v, want ErrSuccessionFloorTooShort", err)
+	}
+}
+
+// TestTheNominationCodecRoundTripsEveryValueItsEncoderWrites is the syntax.Codec contract the pin
+// beside this type claims, stated over the values that used to break it.
+//
+// syntax.Marshal(&OwnerSuccessorExtension{FloorMs: 0}) succeeded and syntax.Unmarshal of its own
+// output failed, so the declared codec was not total over the type it is declared for. That is not
+// an abstract complaint about a contract: cloneProposal in proposal_list.go copies a value through
+// Marshal and Unmarshal precisely because a round trip makes the copy exactly what the octets say,
+// and a codec of this package that refuses its own output is a copy that fails on one value and
+// no other, inside a cache whose whole job is to answer what the group agreed to.
+func TestTheNominationCodecRoundTripsEveryValueItsEncoderWrites(t *testing.T) {
+	for _, one := range []OwnerSuccessorExtension{
+		{},
+		{FloorMs: 0},
+		{Enabled: true, SuccessorMemberId: bytes.Repeat([]byte{0x11}, 32), NominatedAtMs: 1, FloorMs: 1},
+		{Enabled: false, NominatedAtMs: 1770000000000},
+		{Enabled: true, SuccessorMemberId: bytes.Repeat([]byte{0x22}, 32),
+			NominatedAtMs: 1770000000000, FloorMs: SuccessionFloorMinMs},
+	} {
+		encoded, err := syntax.Marshal(&one)
+		if err != nil {
+			t.Errorf("syntax.Marshal(%+v) = %v", one, err)
+			continue
+		}
+		back := OwnerSuccessorExtension{}
+		if err := syntax.Unmarshal(encoded, &back); err != nil {
+			t.Errorf("the codec refused its own output for %+v: %v; the syntax.Codec pinned beside this type claims a round trip the pair does not have",
+				one, err)
+			continue
+		}
+		again, err := syntax.Marshal(&back)
+		if err != nil {
+			t.Errorf("syntax.Marshal of the decoded %+v = %v", back, err)
+			continue
+		}
+		if !bytes.Equal(encoded, again) {
+			t.Errorf("%+v encodes to %x and the decode of that re-encodes to %x", one, encoded, again)
+		}
 	}
 }
 
@@ -365,10 +466,17 @@ func TestOwnerSuccessorRefusesANominationTimeWithNoSuccessorNamed(t *testing.T) 
 	if errors.Is(err, ErrSuccessionFloorTooShort) {
 		t.Error("a nomination time with no successor answers the FLOOR sentinel, so the two rules of Validate are one comparison")
 	}
-	// the same refusal on the way in, over octets the checked encoder will not write
+	// and the same rule reached through the read path, which is Validate and not the decode: the
+	// octets decode, and what refuses is the one statement of the rule that Encode and spec A
+	// section 3.4's condition 5 both reach
 	body := handAssembledOwnerSuccessorBody(t, 0x01, nil, 1770000000000, SuccessionFloorMinMs)
-	if _, err := ParseOwnerSuccessorExtension(body); !errors.Is(err, ErrMalformedExtension) {
-		t.Fatalf("decoding a nomination time with no successor answered %v, want ErrMalformedExtension", err)
+	decoded, err := ParseOwnerSuccessorExtension(body)
+	if err != nil {
+		t.Fatalf("a nomination time with no successor was refused at the decode with %v; a codec that judges takes the whole group context down with it",
+			err)
+	}
+	if err := decoded.Validate(); !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("Validate over a nomination time with no successor answered %v, want ErrMalformedExtension", err)
 	}
 	// and the two legal shapes either side of it: nobody nominated and no time, and a successor
 	// named at time zero, which is a nomination made by a client whose clock read the epoch
@@ -489,28 +597,25 @@ func TestARefusedOwnerSuccessorDecodeLeavesTheCallersValueAlone(t *testing.T) {
 		t.Fatal("no truncation was refused, so this states nothing about what a refusal leaves behind")
 	}
 
-	// and the refusal that is NOT a truncation, which is the one the sweep above cannot reach
-	// and the one this decoder actually has. A body that is complete and well formed and carries
-	// a floor this profile refuses is read to the END before Validate says no, so it is the only
-	// input that separates a decoder which validates before it publishes from one that publishes
-	// and then validates -- and the derived gate in decoder_publish_test.go cannot separate them
-	// either, because a Validate call is not a read of the Reader. Measured: with the assignment
-	// moved ahead of the Validate, the truncation sweep above still passes.
-	for _, refused := range [][]byte{
-		handAssembledOwnerSuccessorBody(t, 0x01, bytes.Repeat([]byte{0x11}, 32), 1, SuccessionFloorMinMs-1),
-		handAssembledOwnerSuccessorBody(t, 0x01, nil, 1770000000000, SuccessionFloorMinMs),
-	} {
-		into := held
-		into.SuccessorMemberId = bytes.Clone(held.SuccessorMemberId)
-		before := into
-		if err := syntax.Unmarshal(refused, &into); err == nil {
-			t.Fatalf("a body this profile refuses decoded without a refusal: %x", refused)
-		}
-		if into.Enabled != before.Enabled || into.NominatedAtMs != before.NominatedAtMs ||
-			into.FloorMs != before.FloorMs || !bytes.Equal(into.SuccessorMemberId, before.SuccessorMemberId) {
-			t.Fatalf("a decode refused by validation left the caller holding %+v, want %+v; the nomination its group actually agreed to has been overwritten by one this build will not act on",
-				into, before)
-		}
+	// and the refusal that is NOT a truncation, which is the one the sweep above cannot reach.
+	// This decoder no longer judges a nomination's VALUE -- see the note on UnmarshalMLS for the
+	// decision and its three reasons -- so the complete body refusal it still has is the one
+	// about the octets themselves: an enabled byte that is neither 0 nor 1 encodes no bool of
+	// this type. The body carrying it is FULL LENGTH, which is what makes it a statement the
+	// truncation sweep cannot make and what the derived gate in decoder_publish_test.go cannot
+	// model either, since it reads writes against reads and not against refusals.
+	full := handAssembledOwnerSuccessorBody(t, 0x02, bytes.Repeat([]byte{0x11}, 32),
+		1770000000000, SuccessionFloorMinMs)
+	into := held
+	into.SuccessorMemberId = bytes.Clone(held.SuccessorMemberId)
+	before := into
+	if err := syntax.Unmarshal(full, &into); !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("a full length body carrying an enabled byte of 0x02 answered %v, want ErrMalformedExtension", err)
+	}
+	if into.Enabled != before.Enabled || into.NominatedAtMs != before.NominatedAtMs ||
+		into.FloorMs != before.FloorMs || !bytes.Equal(into.SuccessorMemberId, before.SuccessorMemberId) {
+		t.Fatalf("a refused decode left the caller holding %+v, want %+v; the nomination its group actually agreed to has been overwritten by octets this build will not read",
+			into, before)
 	}
 }
 

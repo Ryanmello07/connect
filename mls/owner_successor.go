@@ -10,16 +10,30 @@
 // required_capabilities (spec A section 3.4): requiring it would exclude a member for a
 // governance feature its group may never enable.
 //
-// WHAT IS HERE AND WHAT IS NOT. MASTER section 11 makes five conditions on the promotion of a
-// nominated successor, and errors_lifecycle.go declares one sentinel for each --
-// ErrSuccessionDisabled, ErrSuccessionNotNominee, ErrSuccessionQuorum, ErrSuccessionFloor and
-// ErrSuccessionFloorTooShort. Four of the five are conditions on a promotion COMMIT: they read
-// the committer, the admin set of the epoch being committed from, the countersignatures riding
-// in the promotion record and this client's own clock, none of which exists inside an extension
-// body. They are succession.go's, which p7 task 21 writes, and this file must not answer them --
-// a refusal returned from the wrong place is a rule that two doors enforce differently.
-// ErrSuccessionFloorTooShort is the one that IS a condition on the extension: it reads nothing
-// but the nomination's own FloorMs, so it is refused here, at the codec, in both directions.
+// WHAT IS HERE AND WHAT IS NOT. MASTER section 11 and spec A section 3.4 make five conditions on
+// the promotion of a nominated successor, and errors_lifecycle.go declares one sentinel for each
+// -- ErrSuccessionDisabled, ErrSuccessionNotNominee, ErrSuccessionQuorum, ErrSuccessionFloor and
+// ErrSuccessionFloorTooShort. All five are conditions on a promotion COMMIT and all five are
+// succession.go's, which p7 task 21 writes; this file must not answer any of them on the read
+// side, because a refusal returned from the wrong place is a rule that two doors enforce
+// differently.
+//
+// ErrSuccessionFloorTooShort READS ONLY THE NOMINATION, and that is exactly why it was tempting
+// to answer it here, at the codec, in both directions. It was, and that was wrong three ways.
+// (a) It made spec A section 3.4's condition 5 unreachable on every production path: a nomination
+// with a short floor never survives a decode, so the branch that names it in succession.go can
+// only ever fire for a struct built in memory. (b) It PRE-EMPTED condition 1. Section 3.4 puts
+// the owner's opt out first and states that it is absolute; a nomination that is both
+// Enabled=false and short-floored was answered ErrSuccessionFloorTooShort and never reached the
+// opt out at all, so the one condition the owner set by hand lost to one they may never have
+// looked at. (c) It made the group's own context undecodable: the nomination is deliberately not
+// in required_capabilities, so a peer can commit one, and a v1 client that refuses to DECODE a
+// short floor cannot read the group context it is a member of -- a refusal about succession
+// returned to a caller doing something else entirely.
+//
+// So this file states the two rules on the nomination in Validate and calls it from Encode, the
+// construction door. Nothing on the read side judges. See the note on UnmarshalMLS for the
+// package rule that follows from it.
 //
 // ExtensionTypeUrmessageOwnerSuccessor (0xF003) is declared once with the other registry enums,
 // in extension.go, and is checked against the interface registry and spec A there rather than
@@ -34,11 +48,14 @@ import (
 
 // SuccessionFloorMinMs is ninety days, MASTER section 11 and spec A section 3.4.
 //
-// A nomination carrying a shorter floor is invalid in BOTH directions -- the encoder refuses to
-// write one and the decoder refuses to accept one -- so a group cannot shorten its own
-// succession delay after the fact, and cannot be handed a shortened one by a peer either. The
-// floor is what makes the delay a delay: an owner who is merely offline for a week has ninety
-// days to come back and say no.
+// A nomination carrying a shorter floor is one this build never WRITES -- Encode refuses it --
+// and never ACTS ON: spec A section 3.4's condition 5 refuses the promotion it would authorise.
+// Those are the two directions that matter, and neither of them is the decode. A group therefore
+// cannot shorten its own succession delay after the fact and cannot be handed a shortened one by
+// a peer, while a peer that commits one is refused at the promotion rather than at the octets --
+// which is the difference between a nomination this client will not act on and a group context
+// this client cannot read. The floor is what makes the delay a delay: an owner who is merely
+// offline for a week has ninety days to come back and say no.
 const SuccessionFloorMinMs uint64 = 7776000000
 
 // successionPreimageLabel is the domain separation string of the bytes an admin countersigns,
@@ -99,18 +116,37 @@ func (self *OwnerSuccessorExtension) MarshalMLS(w *syntax.Writer) error {
 	return nil
 }
 
-// UnmarshalMLS reads the wire form, refuses any boolean byte but 0 and 1, and VALIDATES what it
-// read before it hands anything back.
+// UnmarshalMLS reads the wire form and refuses any boolean byte but 0 and 1. It does NOT judge
+// the value it read.
 //
-// The validation is here rather than in ParseOwnerSuccessorExtension, which is group_policy.go's
-// decision and its argument: convention C1 says an MLS structure has exactly one byte level
-// codec, so the refusals live at the one decode every path shares -- a nomination nested inside
-// some later structure is judged by the same code as one parsed out of an extension body, rather
-// than by whichever entry point its caller happened to reach for.
+// THIS IS THE PACKAGE'S RULE AND NOT A LOCAL CHOICE: a codec decodes, it does not judge. What
+// UnmarshalMLS refuses is octets that encode no value of this type -- a truncation, and an
+// enabled byte of 0x02, which is not a bool in the encoding this type declares. What Validate
+// refuses is a value this profile will not act on, and that is a different question asked by a
+// different caller. Three things follow from putting the second inside the first, all three of
+// which this file had:
 //
-// The whole value is replaced rather than filled field by field, and the refusal is made against
-// the decoded value BEFORE the assignment, so a decode that refuses leaves the receiver as it
-// was rather than holding half of two nominations.
+//   - the declared syntax.Codec stops round tripping. syntax.Marshal(&OwnerSuccessorExtension{})
+//     succeeds and syntax.Unmarshal of its own output fails, so the pin two lines above claims a
+//     contract the pair does not keep, and every caller that assumes an encode/decode pair is
+//     total over the type -- cloneProposal in proposal_list.go is one -- is assuming wrong.
+//   - a rule that must run LATER can no longer run at all, because a value refused at the octets
+//     never reaches the door that would have ordered it correctly. Spec A section 3.4's opt out
+//     is the case: it is condition 1 and the floor is condition 5, and a codec answering the
+//     floor decides a nomination the owner switched off before anybody asks whether it is on.
+//   - a group context becomes unreadable over a rule about governance. The extension is not in
+//     required_capabilities by design, so a peer may commit one this profile refuses, and
+//     refusing to DECODE it takes the whole context down with it.
+//
+// So Validate is called by Encode, the construction door, and by p7 task 21's promotion
+// validator, which is the read side door that can ask the five conditions in the order section
+// 3.4 states them. group_policy.go answers the same question differently on the read side and
+// says why there: its rules are conditions on the STRUCTURE with no later door to own them, so
+// they run at the parse entry points. The rule both files share is this one -- the codec never
+// judges -- and the difference is only which door does.
+//
+// The whole value is replaced rather than filled field by field, so a decode that refuses part
+// way leaves the receiver as it was rather than holding half of two nominations.
 func (self *OwnerSuccessorExtension) UnmarshalMLS(r *syntax.Reader) error {
 	enabled, err := r.ReadUint8()
 	if err != nil {
@@ -138,16 +174,23 @@ func (self *OwnerSuccessorExtension) UnmarshalMLS(r *syntax.Reader) error {
 		NominatedAtMs:     nominatedAtMs,
 		FloorMs:           floorMs,
 	}
-	if err := decoded.Validate(); err != nil {
-		return err
-	}
 	*self = decoded
 	return nil
 }
 
-// Validate applies the two rules that are conditions on the nomination itself. The other four
-// section 11 conditions are conditions on a promotion commit and are succession.go's; the file
-// comment says why they cannot be answered from here.
+// Validate applies the two rules that read nothing but the nomination itself.
+//
+// WHO CALLS IT is the whole of the decision this file records. Encode calls it, so this build
+// never writes a nomination it would refuse. Nothing on the READ side calls it, because the two
+// rules are conditions on a promotion and spec A section 3.4 orders the promotion's conditions
+// with the owner's opt out first -- so the earliest door that can state either of them without
+// pre-empting condition 1 is p7 task 21's promotion validator, which asks condition 1 itself and
+// reaches this for condition 5 after the other four have passed. A door earlier than that answers
+// the floor to a caller who was asking whether succession is even switched on.
+//
+// The floor rule is stated HERE and only here, so the promotion validator's condition 5 is a call
+// rather than a second copy of the comparison. Two statements of one threshold are two things
+// that can disagree, and the one that had not been updated would be the one the commit path ran.
 //
 // The two refusals answer two different sentinels and never one, which is errors_lifecycle.go's
 // rule: errors.Is cannot tell two rules apart when they answer the same value, so a test
@@ -187,7 +230,10 @@ func (self *OwnerSuccessorExtension) Encode() (Extension, error) {
 //
 // Bare plumbing, which is what convention C1 asks an entry point to be -- it hands its run to
 // the one codec and reports what came back, and adds no second reading of the bytes for the
-// codec to disagree with. Every refusal it can make is UnmarshalMLS's.
+// codec to disagree with. Every refusal it can make is UnmarshalMLS's, and UnmarshalMLS refuses
+// only octets that encode no nomination: this entry point answers whatever nomination the group
+// context actually carries, including one whose floor the promotion validator will refuse. See
+// the note on Validate for why that is the read side this file wants.
 func ParseOwnerSuccessorExtension(data []byte) (*OwnerSuccessorExtension, error) {
 	nomination := &OwnerSuccessorExtension{}
 	if err := syntax.Unmarshal(data, nomination); err != nil {

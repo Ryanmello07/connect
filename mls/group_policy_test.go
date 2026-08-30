@@ -342,21 +342,19 @@ func TestGroupPolicyRejectsUnsortedOnParse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeUnchecked: %v", err)
 	}
-	_, err = ParseGroupPolicyExtension(encoded)
+	entry := Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: encoded}
+	_, err = ParseGroupPolicyFrom(entry)
 	if !errors.Is(err, ErrRolesNotCanonical) {
-		t.Fatalf("ParseGroupPolicyExtension error = %v, want ErrRolesNotCanonical", err)
+		t.Fatalf("ParseGroupPolicyFrom error = %v, want ErrRolesNotCanonical", err)
 	}
 	// and the refusal is a REFUSAL rather than a silent re-sort: nothing usable comes back
-	policy, err := ParseGroupPolicyExtension(encoded)
+	policy, err := ParseGroupPolicyFrom(entry)
 	if policy != nil {
-		t.Fatalf("ParseGroupPolicyExtension answered %+v beside its refusal; a receiver that hands back a re-sorted policy accepts two spellings of one group", policy)
+		t.Fatalf("ParseGroupPolicyFrom answered %+v beside its refusal; a receiver that hands back a re-sorted policy accepts two spellings of one group", policy)
 	}
-	// the same body under its own tag is refused identically, so the tag checked entry point is
-	// not a laxer path to the same bytes
-	if _, err := ParseGroupPolicyFrom(Extension{
-		ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: encoded,
-	}); !errors.Is(err, ErrRolesNotCanonical) {
-		t.Fatalf("ParseGroupPolicyFrom error = %v, want ErrRolesNotCanonical", err)
+	// and out of a group context, which is where every consumer in this package reads one
+	if _, err := GroupPolicyOf([]Extension{entry}); !errors.Is(err, ErrRolesNotCanonical) {
+		t.Fatalf("GroupPolicyOf error = %v, want ErrRolesNotCanonical", err)
 	}
 }
 
@@ -1436,23 +1434,167 @@ func TestGroupPolicyOfRefusesAListCarryingTwoPoliciesRatherThanPickingOne(t *tes
 	}
 }
 
-// TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone is the property UnmarshalMLS states in
-// its own words -- "the refusal is made against the decoded value BEFORE the assignment" -- and
-// that nothing observed.
+// TestEveryContentRefusalOfAGroupPolicyIsMadeAtTheParseDoor is what holds the read side together
+// after the rule that a codec decodes and does not judge moved Validate out of UnmarshalMLS.
+//
+// The risk that change introduces is exactly one: a policy reaching a caller unjudged. RoleOf and
+// OwnerId act on whatever they are handed, so a policy naming two owners answers one of them and
+// half a group believes the other, inside a structure the confirmed transcript hash covers. So the
+// class is DERIVED from the Validate refusals group_policy.go declares -- a clause added to
+// Validate is asked this question by the commit that writes it -- and every member of it has to be
+// reachable through the entry point a body actually arrives at.
+//
+// Both halves are asserted per refusal, and the first is the one that says the two rules were
+// SEPARATED rather than merely moved: the codec accepts the body, and the parse door refuses it.
+// A codec that still refused would be the old arrangement with a second copy of the rule beside it.
+func TestEveryContentRefusalOfAGroupPolicyIsMadeAtTheParseDoor(t *testing.T) {
+	rows := groupPolicyRefusalRows()
+	reached := 0
+	for _, one := range groupPolicyRefusalSitesOf(t) {
+		if !strings.HasPrefix(one.site, "(*GroupPolicyExtension).Validate:") {
+			continue
+		}
+		row, listed := rows[one.site]
+		if !listed || row.policy == nil {
+			t.Errorf("%s has no policy on its row, so no body can be built for the refusal it makes", one.site)
+			continue
+		}
+		body, err := row.policy.encodeUnchecked()
+		if err != nil {
+			// the one Validate clause no wire body can carry: the role byte gate runs on the
+			// encode side too, so a body naming an undefined role cannot be assembled at all.
+			// Logged rather than skipped silently, because a class that quietly lost every
+			// member would report exactly what a complete one reports.
+			t.Logf("%s: no body can carry this refusal to a parser, the encoder refuses it first (%v)", one.site, err)
+			continue
+		}
+		sentinel, named := lifecycleOwnedErrors[one.sentinel]
+		if !named {
+			t.Errorf("%s answers %s, which this gate cannot join to a value; give the sentinel a class entry",
+				one.site, one.sentinel)
+			continue
+		}
+		// the codec reads it, because judging is not the codec's job any more
+		staged := &GroupPolicyExtension{}
+		if err := syntax.Unmarshal(body, staged); err != nil {
+			t.Errorf("%s: the CODEC refused the body this refusal is about with %v; a codec that judges is the arrangement this decision moved away from, and the rule is now stated in two places that can disagree",
+				one.site, err)
+		}
+		parsed, err := ParseGroupPolicyFrom(Extension{
+			ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: body,
+		})
+		if !errors.Is(err, sentinel) {
+			t.Errorf("%s: ParseGroupPolicyFrom over the body that refusal is about answered %v, want %s; a policy that reaches a caller unjudged is one RoleOf and OwnerId answer from",
+				one.site, err, one.sentinel)
+			continue
+		}
+		if parsed != nil {
+			t.Errorf("%s: the refusal answered a policy as well: %+v", one.site, parsed)
+		}
+		reached += 1
+	}
+	if reached == 0 {
+		t.Fatalf("no Validate refusal of %s is reachable through the parse door, so every one of these rules has left the read path",
+			groupPolicySourceFile)
+	}
+	t.Logf("%d of Validate's refusals are made at the parse door", reached)
+
+	// and through the two doors above it, so the whole read side is covered rather than the one
+	// entry point the loop names. A group context is what a caller actually holds.
+	twoOwners := &GroupPolicyExtension{
+		Roles: []RoleEntry{
+			{MemberId: groupPolicyLowId, Role: RoleOwner},
+			{MemberId: groupPolicyHighId, Role: RoleOwner},
+		},
+		ServerId: []byte("two owners"),
+	}
+	body, err := twoOwners.encodeUnchecked()
+	if err != nil {
+		t.Fatalf("encode the two owner policy: %v", err)
+	}
+	entry := Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: body}
+	if _, err := GroupPolicyOf([]Extension{entry}); !errors.Is(err, ErrMultipleOwners) {
+		t.Errorf("GroupPolicyOf over a group context carrying a two owner policy answered %v, want ErrMultipleOwners; every consumer of a policy in this package reads it through here",
+			err)
+	}
+	// and the loose body door answers the policy, unjudged, which is what makes the gate below
+	// worth having rather than a restatement of the paragraph on it
+	unjudged, err := ParseGroupPolicyExtension(body)
+	if err != nil {
+		t.Fatalf("ParseGroupPolicyExtension refused a body the codec can read: %v", err)
+	}
+	if owner, named := unjudged.OwnerId(); !named {
+		t.Errorf("the unjudged policy names no owner at all: %x", owner)
+	}
+}
+
+// TestNothingReachesAGroupPolicyThroughTheUnjudgedDoor is what makes ParseGroupPolicyExtension
+// safe to leave unjudged, and it is derived rather than promised.
+//
+// Convention C1 requires that declaration to be bare plumbing -- a byte run in, an MLS structure
+// out, and nothing between them but the one codec call -- so the content rules cannot live there
+// and live at ParseGroupPolicyFrom instead. What that leaves is an exported door that answers a
+// policy nothing has judged, and a second caller of it inside this package would be a policy
+// reaching RoleOf and OwnerId with no owner count behind it.
+//
+// So the callers are read off the package's own non test source, and the only one allowed is the
+// door that judges. A gate written as advice in a doc comment is one the next task walks past.
+func TestNothingReachesAGroupPolicyThroughTheUnjudgedDoor(t *testing.T) {
+	const unjudged = "ParseGroupPolicyExtension"
+	const judges = "ParseGroupPolicyFrom"
+	callers := []string{}
+	found := 0
+	for path, parsed := range decoderSourceOfThisPackage(t) {
+		for _, one := range declaredIn(parsed) {
+			if one.body == nil {
+				continue
+			}
+			where := one.name
+			if one.receiver != "" {
+				where = "(" + one.receiver + ")." + one.name
+			}
+			ast.Inspect(one.body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				name, isIdentifier := call.Fun.(*ast.Ident)
+				if !isIdentifier || name.Name != unjudged {
+					return true
+				}
+				found += 1
+				if where != judges {
+					callers = append(callers, path+": "+where)
+				}
+				return true
+			})
+		}
+	}
+	// the positive control: a scan that had stopped resolving would report no caller at all,
+	// and no caller is exactly what a clean run reports
+	if found == 0 {
+		t.Fatalf("the scan found no call to %s in this package, and %s certainly makes one, so it is reading nothing",
+			unjudged, judges)
+	}
+	if len(callers) != 0 {
+		t.Errorf("%s is reached from %v as well as from %s; that door answers a policy no rule has judged, and a policy naming two owners answers one of them to RoleOf while half the group enforces the other",
+			unjudged, callers, judges)
+	}
+	t.Logf("%d call to %s in this package, all from %s", found, unjudged, judges)
+}
+
+// TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone is the property the decoder's own
+// comment claims: a decode that refuses part way leaves the receiver as it was.
 //
 // The static gate in decoder_publish_test.go pins this decoder as one that stages, and it reads
-// the receiver's write against the READER's last read: moving the assignment to before
-// decoded.Validate() leaves every reader read behind it, so that verdict does not change and the
-// whole suite stays green. What changes is the case the static reader cannot model: a body whose
-// bytes decode perfectly and whose CONTENT the codec refuses. That receiver is then holding a non
-// canonical or two owner policy the codec rejected -- inside a group context, on its way to a
-// transcript hash -- while its caller was handed an error saying the decode did not happen. p6
-// shipped this exact shape at the outermost decoder for Welcome, GroupInfo and KeyPackage.
+// the receiver's write against the READER's last read. What it cannot model is what a refused
+// decode leaves BEHIND, and that is what this observes: a receiver holding a half read policy is
+// one that goes into a group context and a transcript hash while its caller was handed an error
+// saying the decode did not happen. p6 shipped this exact shape at the outermost decoder for
+// Welcome, GroupInfo and KeyPackage.
 //
-// The hostile bodies are DERIVED from the Validate refusals the sweep above reads, so a clause
-// added to Validate is asked this question by the commit that writes it rather than by whoever
-// remembers this test. The truncations are run too, which is the half the static verdict already
-// covers, so both halves of "a refused decode changes nothing" are stated in one place.
+// Every refusal this decoder still has is a truncation, because the content refusals are the parse
+// door's now -- see the test above, which is where a clause added to Validate is judged.
 func TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone(t *testing.T) {
 	held := func() *GroupPolicyExtension {
 		return &GroupPolicyExtension{
@@ -1481,46 +1623,6 @@ func TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone(t *testing.T) {
 		}
 	}
 
-	rows := groupPolicyRefusalRows()
-	reached := 0
-	for _, one := range groupPolicyRefusalSitesOf(t) {
-		if !strings.HasPrefix(one.site, "(*GroupPolicyExtension).Validate:") {
-			continue
-		}
-		row, listed := rows[one.site]
-		if !listed || row.policy == nil {
-			t.Errorf("%s has no policy on its row, so no body can be built for the refusal it makes", one.site)
-			continue
-		}
-		body, err := row.policy.encodeUnchecked()
-		if err != nil {
-			// the one Validate clause no wire body can carry: the role byte gate runs on the
-			// encode side too, so a body naming an undefined role cannot be assembled at all.
-			// Logged rather than skipped silently, because a class that quietly lost every
-			// member would report exactly what a complete one reports.
-			t.Logf("%s: no body can carry this refusal to a decoder, the encoder refuses it first (%v)", one.site, err)
-			continue
-		}
-		sentinel, named := lifecycleOwnedErrors[one.sentinel]
-		if !named {
-			t.Errorf("%s answers %s, which this gate cannot join to a value; give the sentinel a class entry",
-				one.site, one.sentinel)
-			continue
-		}
-		receiver := held()
-		if err := receiver.UnmarshalMLS(syntax.NewReader(body)); !errors.Is(err, sentinel) {
-			t.Errorf("%s: decoding the body that refusal is about answered %v, want %s; this body was supposed to reach the content check rather than the byte reads",
-				one.site, err, one.sentinel)
-			continue
-		}
-		reached += 1
-		unchanged(t, one.site, receiver)
-	}
-	if reached == 0 {
-		t.Fatalf("no Validate refusal of %s could be reached through a decode, so this gate observed nothing", groupPolicySourceFile)
-	}
-	t.Logf("%d of Validate's refusals are reachable through a decode and leave the receiver alone", reached)
-
 	valid, err := (&GroupPolicyExtension{
 		Roles:               []RoleEntry{{MemberId: groupPolicyLowId, Role: RoleOwner}},
 		RetentionPolicy:     RetentionPolicy{DurableMs: 1, MediaMs: 2},
@@ -1533,12 +1635,17 @@ func TestARefusedGroupPolicyDecodeLeavesTheCallersPolicyAlone(t *testing.T) {
 	if bytes.Equal(valid, heldBytes) {
 		t.Fatal("the held policy and the decoded one encode identically, so the truncations cannot tell an untouched receiver from a clobbered one")
 	}
+	refusals := 0
 	for cut := 0; cut < len(valid); cut += 1 {
 		receiver := held()
 		if err := receiver.UnmarshalMLS(syntax.NewReader(valid[:cut])); err == nil {
 			t.Fatalf("a policy body truncated to %d of %d octets was accepted", cut, len(valid))
 		}
+		refusals += 1
 		unchanged(t, fmt.Sprintf("truncated to %d of %d octets", cut, len(valid)), receiver)
+	}
+	if refusals == 0 {
+		t.Fatal("no truncation was refused, so this states nothing about what a refusal leaves behind")
 	}
 }
 
