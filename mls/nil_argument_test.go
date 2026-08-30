@@ -507,6 +507,20 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		// epoch, the content type and the authenticated data are all reassembled from it, and
 		// there is no default header that could stand in without producing a FramedContent that
 		// describes a different message.
+		// section 6's context and sender rules. Every other argument of both rows is a live one
+		// -- the group id and the epoch are the ones this content actually carries, and the
+		// sender is a member at an occupied leaf -- so what is observed is the nil argument and
+		// not a ValSem002, ValSem003 or ValSem004 refusal standing in front of it.
+		"CheckFramedContentContext(content)": {sentinel: errNilFramedContent, call: func(t *testing.T) error {
+			live := framingTestMemberContent()
+			return CheckFramedContentContext(nil, live.GroupId, live.Epoch)
+		}},
+		// the occupancy test, which is a func and not a pointer and is refused for the reason
+		// OpenPublicMessage's resolver is: a rule that called it would take the caller's process
+		// rather than its call.
+		"CheckSenderLeaf(leafOccupied)": {sentinel: errNilLeafOccupancyTest, call: func(t *testing.T) error {
+			return CheckSenderLeaf(Sender{SenderType: SenderTypeMember, LeafIndex: 1}, nil)
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

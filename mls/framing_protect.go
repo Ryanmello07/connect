@@ -1127,3 +1127,102 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	}
 	return authContent, nil
 }
+
+// ---------------------------------------------------------------------------
+// the context and the sender leaf, RFC 9420 section 6
+// ---------------------------------------------------------------------------
+
+// errWrongGroupId is ValSem002 in the validation plan's catalogue, and it is a stand in on
+// errApplicationMustBeCiphertext's terms exactly: that plan owns the single declaration site for
+// the exported ErrWrongGroupId, the name has not landed in this package yet, and
+// TestNoValidationOwnedNameHasLandedBesideItsStandIn fails on the commit that lands the exported
+// twin beside this one. When it lands, the return below becomes ValSem(ValSem002, ErrWrongGroupId).
+var errWrongGroupId = errors.New("mls: framed content names another group")
+
+// errWrongEpoch is ValSem003, on the same terms.
+//
+// It is its OWN value rather than a second spelling of errWrongGroupId, and the separation is the
+// rule rather than a nicety. A message naming another group is one a receiver drops and never
+// thinks about again. A message naming another epoch of THIS group is one a receiver may have to
+// keep: delivery across a commit reorders, and the epoch that can open the message is one this
+// member either had a moment ago or is about to have. A caller handed one value for both would
+// either buffer traffic addressed to strangers or discard its own group's.
+var errWrongEpoch = errors.New("mls: framed content names another epoch")
+
+// errBlankSenderLeaf is ValSem004, on the same terms.
+var errBlankSenderLeaf = errors.New("mls: the sender's leaf is blank")
+
+// errNilLeafOccupancyTest is what CheckSenderLeaf answers a caller that passed no occupancy
+// predicate, for errNilSignatureKeyResolver's reason: the predicate is a func rather than a
+// pointer and is refused on the same ground, that calling it would take the caller's process
+// rather than its call.
+//
+// It is refused AHEAD of the sender type rather than only on the branch that would call it. A
+// rule that answered nil for a non member sender would tell a caller holding no occupancy test
+// that its sender had been checked, and the caller cannot see the difference: nil is what a
+// checked sender answers too.
+var errNilLeafOccupancyTest = errors.New("mls: the sender leaf rule requires a leaf occupancy test")
+
+// CheckFramedContentContext is ValSem002 and ValSem003: the group id and the epoch a FramedContent
+// carries are this receiver's own, or the content belongs to another conversation.
+//
+// Both fields are inside the signature preimage, so a valid signature says only that SOME member
+// of SOME group signed these bytes in SOME epoch. It is this rule that turns that into a statement
+// about this group and this epoch, which is why it is a refusal a receive path cannot skip: a
+// receiver that verified the signature and stopped would accept a member's message from epoch N
+// as a message of epoch N+1, and every secret the message is judged under changes at a commit.
+//
+// The group id comparison reaches crypto/subtle.ConstantTimeCompare and not bytes.Equal. Not
+// because a group id is a secret -- it travels in the clear on every PrivateMessage header -- but
+// because guardrail 8 is stated over this package's whole source and one exception is how a gate
+// stops being a gate. tree_sync.go compares the same field the same way for the same reason. The
+// call also refuses a length mismatch by construction, which is the class a prefix comparison
+// accepts.
+//
+// The group id is judged BEFORE the epoch, and the order is stated rather than left to the
+// reader. An epoch number is a fact about a group, so a message from another group has no epoch
+// this receiver can compare against, and a body that answered ValSem003 for it would tell its
+// caller that a stranger's message was one of this group's own that had arrived late.
+func CheckFramedContentContext(content *FramedContent, groupId []byte, epoch uint64) error {
+	if content == nil {
+		return errNilFramedContent
+	}
+	if subtle.ConstantTimeCompare(content.GroupId, groupId) != 1 {
+		return errWrongGroupId
+	}
+	if content.Epoch != epoch {
+		return fmt.Errorf("%w: the content names epoch %d and this is epoch %d",
+			errWrongEpoch, content.Epoch, epoch)
+	}
+	return nil
+}
+
+// CheckSenderLeaf is ValSem004: a member sender names a leaf the ratchet tree actually holds a
+// member at, and not one that was blanked by a removal or never filled.
+//
+// It takes a PREDICATE rather than a tree, which is the interface registry's signature and is
+// what keeps this layer free of tree types. Framing is the layer below the group, so a framing
+// rule that took a *RatchetTree would make every framing test build one, and the group lifecycle
+// is what owns the tree -- it passes its own ratchet tree's occupancy test in, and the test here
+// needs no group at all.
+//
+// The refusal names the leaf. A blank sender leaf is a fact about the tree and not about a
+// secret: the tree's occupancy is public to every member, and a receiver told only that some
+// leaf was blank has to walk its own tree to find out which message it just dropped.
+func CheckSenderLeaf(sender Sender, leafOccupied func(LeafIndex) bool) error {
+	if leafOccupied == nil {
+		return errNilLeafOccupancyTest
+	}
+	// only a member sender carries a leaf index at all. RFC 9420 section 6's other three sender
+	// types select the sender_index or select nothing, so a rule that ran the occupancy test over
+	// their zero valued LeafIndex would answer about a field the message never carried -- refusing
+	// an external proposal whenever leaf 0 happened to be blank, and passing one whenever it was
+	// not.
+	if sender.SenderType != SenderTypeMember {
+		return nil
+	}
+	if !leafOccupied(sender.LeafIndex) {
+		return fmt.Errorf("%w: leaf %d", errBlankSenderLeaf, sender.LeafIndex)
+	}
+	return nil
+}
