@@ -1123,3 +1123,89 @@ func TestProposalAndProposalOrRefConsumeExactlyTheirOwnOctets(t *testing.T) {
 	}
 	t.Logf("%d tails refused and %d truncations refused across %d encodings", tails, cuts, len(cases))
 }
+
+// TestEveryProposalTypeRefusesEveryArmThatIsNotItsOwn states the other direction of the arm
+// check, over the CROSS PRODUCT of the registered types with the registered arms rather than
+// over the single pair the round trips probe.
+//
+// checkArm asks two questions and only one of them was observed anywhere in this file. The count
+// answers "exactly one arm", and TestEveryArmOfAProposalIsCountedByItsArmCheck holds that count
+// to the type. What no test here said is WHICH one: a proposal whose type names Add and whose
+// single populated arm is Remove satisfies the count, and the per-case nil check is the only
+// thing standing between it and self.Add.KeyPackage.MarshalMLS(w) on a nil pointer.
+//
+// Deleting any one of those seven checks leaves every arm test in this file green -- measured --
+// and is noticed only by TestProposalRefsAreDistinctAcrossTheGeneratedProposalSpace over in
+// framing_test.go, which does not report a missing refusal: it PANICS on the nil dereference,
+// from a stack trace in a file about something else. That is the wrong way to learn this, and it
+// is the shape p7's group lifecycle will reach, since it assembles proposals rather than
+// decoding them. So the refusal is stated here over the cross product, and the panic is caught
+// and named rather than left to take the run down, because a crash and a missing refusal are the
+// same defect and the message has to say which one happened.
+func TestEveryProposalTypeRefusesEveryArmThatIsNotItsOwn(t *testing.T) {
+	samples := proposalArmSamples(t)
+	registered := slices.Sorted(maps.Keys(samples))
+
+	// the control: each row encodes when its type and its arm agree, or every refusal below is
+	// a refusal of something this table built wrong rather than of the mismatch
+	for _, proposalType := range registered {
+		matching := samples[proposalType].proposal
+		if _, err := syntax.Marshal(&matching); err != nil {
+			t.Fatalf("the %s row did not encode with its own type: %v", samples[proposalType].field, err)
+		}
+	}
+
+	refused := 0
+	for _, named := range registered {
+		for _, populated := range registered {
+			if named == populated {
+				continue
+			}
+			// exactly one arm is populated, so the COUNT is satisfied and the only thing that
+			// can refuse this is the per-case check for the arm the type names
+			mismatched := samples[populated].proposal
+			mismatched.ProposalType = named
+
+			var marshalErr error
+			panicked := false
+			func() {
+				defer func() {
+					if raised := recover(); raised != nil {
+						panicked = true
+						t.Errorf("a proposal typed %#04x carrying the %s arm panicked in the encoder: %v; the arm the discriminant names was dereferenced without being checked for",
+							named, samples[populated].field, raised)
+					}
+				}()
+				_, marshalErr = syntax.Marshal(&mismatched)
+			}()
+			if panicked {
+				continue
+			}
+			if !errors.Is(marshalErr, ErrContentArmMismatch) {
+				t.Errorf("a proposal typed %#04x carrying the %s arm encoded with %v, want ErrContentArmMismatch; MLS signs over serialized forms, so an encoder that wrote whichever arm was non-nil would sign a proposal the caller did not build",
+					named, samples[populated].field, marshalErr)
+				continue
+			}
+			refused += 1
+		}
+	}
+
+	// and the third shape: a type that names an arm with nothing populated at all, stated for
+	// every registered type rather than for Remove alone
+	empty := 0
+	for _, named := range registered {
+		if _, err := syntax.Marshal(&Proposal{ProposalType: named}); !errors.Is(err, ErrContentArmMismatch) {
+			t.Errorf("a proposal typed %#04x with no arm at all encoded with %v, want ErrContentArmMismatch", named, err)
+			continue
+		}
+		empty += 1
+	}
+
+	if want := len(registered) * (len(registered) - 1); refused != want {
+		t.Fatalf("%d of the %d (type, foreign arm) pairs were refused", refused, want)
+	}
+	if empty != len(registered) {
+		t.Fatalf("%d of the %d armless proposals were refused", empty, len(registered))
+	}
+	t.Logf("%d (type, foreign arm) pairs and %d armless proposals refused", refused, empty)
+}
