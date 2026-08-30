@@ -31,6 +31,17 @@
 //     re-encode byte exactly, and the run reports seventeen comparisons over a row that holds
 //     fifteen of its own answers. The shape is read off the column's NAME, which is the only
 //     thing that says what the column is.
+//   - the seven proposal columns read through the PRODUCTION Proposal codec rather than through
+//     a decoder written here. The corpus publishes the BODY of a proposal arm with no
+//     discriminant in front of it, and the obvious reading of that is a reader and a writer
+//     spelled out in this file for each arm -- which is what a harness that then reports the
+//     column as covered would be testing. It would test itself: RFC 9420 section 12.1's arm
+//     bodies are proposal_wire.go's to encode, and a re_init arm this package wrote in another
+//     field order would go on round tripping through a closure that made the same choice. The
+//     discriminant is put back on instead and the whole read through Proposal, so what these
+//     seven columns hold is production. Six of the seven columns are read by nothing else on
+//     this branch: add, update, remove, re_init, external_init and group_context_extensions
+//     have no other reader of this corpus, and pre_shared_key_proposal has psk_test.go's.
 //   - the comparison made against a SECOND DECODE of the corpus text. The comparator returns the
 //     octets it re-encoded rather than a verdict, and TestVectorMessages holds those against the
 //     published string read out of a generic json decode with no struct tag in the way. A struct
@@ -165,36 +176,54 @@ type messagesCodec struct {
 	check func(data []byte) ([]byte, error)
 }
 
-// checkReEncode is the explicit form, for the columns that are a bare arm body rather than a
-// standalone wire type: the corpus publishes the BODY of a proposal arm, not a framed Proposal,
-// so there is no Codec whose Unmarshal reads exactly those octets.
+// checkProposalArmColumn is the form for the seven columns that carry the BODY of one arm of an
+// RFC 9420 section 12.1 Proposal, with no discriminant in front of it.
 //
-// Done() is part of the decode and not an afterthought. A decoder that consumed a prefix of the
-// column and stopped would re-encode that prefix byte exactly and agree, which is a comparison
-// over less of the published value than the corpus offered.
-func checkReEncode(data []byte, decode func(r *syntax.Reader) error,
-	encode func(w *syntax.Writer) error) ([]byte, error) {
-
-	r := syntax.NewReader(data)
-	if err := decode(r); err != nil {
-		return nil, fmt.Errorf("%w: %w", errMessagesDoesNotDecode, err)
+// The discriminant is put BACK ON and the whole read through the production Proposal codec, then
+// taken off the re-encoding again. The alternative -- a reader and a writer for each arm spelled
+// out in this file -- is what the shape of the corpus invites and it is a harness testing itself:
+// the arm bodies are proposal_wire.go's to encode, and an arm this package wrote in another field
+// order round trips perfectly through a closure in a test file that made the same choice. Going
+// through Proposal means these 2100 bodies are foreign encodings held against the encoder a peer
+// will actually meet.
+//
+// The prefix is derived by asking the codec to write the discriminant rather than by assuming two
+// octets, and it is CHECKED off the front of the re-encoding rather than skipped: a Proposal that
+// emitted its discriminant at another width would otherwise have that width silently absorbed
+// into the body on the way back out, and the body would compare equal.
+func checkProposalArmColumn(proposalType ProposalType) func(data []byte) ([]byte, error) {
+	return func(data []byte) ([]byte, error) {
+		w := syntax.NewWriter()
+		w.WriteUint16(uint16(proposalType))
+		prefix, err := w.Bytes()
+		if err != nil {
+			return nil, fmt.Errorf("%w: encode the %#04x discriminant: %w", errMessagesNotByteExact,
+				uint16(proposalType), err)
+		}
+		framed := append(bytes.Clone(prefix), data...)
+		proposal := &Proposal{}
+		if err := syntax.Unmarshal(framed, proposal); err != nil {
+			return nil, fmt.Errorf("%w: %w", errMessagesDoesNotDecode, err)
+		}
+		if proposal.ProposalType != proposalType {
+			return nil, fmt.Errorf("%w: the body decoded as proposal type %#04x under the %#04x discriminant",
+				errMessagesWrongShape, uint16(proposal.ProposalType), uint16(proposalType))
+		}
+		encoded, err := syntax.Marshal(proposal)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errMessagesNotByteExact, err)
+		}
+		if len(encoded) < len(prefix) || !bytes.Equal(encoded[:len(prefix)], prefix) {
+			return nil, fmt.Errorf("%w: the re-encoded proposal is %s and does not begin with the %s this codec wrote for the discriminant",
+				errMessagesNotByteExact, HexOf(encoded), HexOf(prefix))
+		}
+		body := encoded[len(prefix):]
+		if !bytes.Equal(body, data) {
+			return body, fmt.Errorf("%w: re-encoded %s, want %s", errMessagesNotByteExact,
+				HexOf(body), HexOf(data))
+		}
+		return body, nil
 	}
-	if err := r.Done(); err != nil {
-		return nil, fmt.Errorf("%w: %w", errMessagesDoesNotDecode, err)
-	}
-	w := syntax.NewWriter()
-	if err := encode(w); err != nil {
-		return nil, fmt.Errorf("%w: %w", errMessagesNotByteExact, err)
-	}
-	encoded, err := w.Bytes()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errMessagesNotByteExact, err)
-	}
-	if !bytes.Equal(encoded, data) {
-		return encoded, fmt.Errorf("%w: re-encoded %s, want %s", errMessagesNotByteExact,
-			HexOf(encoded), HexOf(data))
-	}
-	return encoded, nil
 }
 
 // checkCodecReEncode is the whole-wire-type form: decode through the type's own Codec, hold the
@@ -207,9 +236,12 @@ func checkReEncode(data []byte, decode func(r *syntax.Reader) error,
 // nothing about re-encoding it. Here every input is a known good encoding published by another
 // implementation, so "it did not decode" is the loudest finding this family can make, and a bare
 // CheckRoundTrip converts it into a pass. Measured on this corpus: with the bare call, a case
-// with every column truncated by one octet is accepted at commit, group_secrets, add_proposal,
-// update_proposal and pre_shared_key_proposal -- five of seventeen columns reporting a comparison
-// they did not make.
+// whose commit and group_secrets columns each stop one octet short is ACCEPTED at both, and the
+// two are the only columns this function is asked about. It was asked about five before the seven
+// proposal columns moved to the production codec, and the other three were then refused for the
+// WRONG reason -- an encode failure out of a half decoded value rather than a decode failure --
+// which a control naming its sentinel catches and a control asking only for "some error" does
+// not.
 func checkCodecReEncode[T any, PT interface {
 	*T
 	syntax.Codec
@@ -343,103 +375,24 @@ func messagesCodecs() []messagesCodec {
 		{"group_secrets", func(v *messagesVector) string { return v.GroupSecrets },
 			checkCodecReEncode[GroupSecrets, *GroupSecrets]},
 
-		// the proposal arm bodies. The corpus carries the BODY and not a framed Proposal, so
-		// the three arms that are a whole wire type decode as that type and the four that are
-		// not go through explicit reader and writer closures.
+		// the seven proposal arm bodies, each read through the production Proposal codec with
+		// its own discriminant put back in front of it.
 		{"add_proposal", func(v *messagesVector) string { return v.AddProposal },
-			checkCodecReEncode[KeyPackage, *KeyPackage]},
+			checkProposalArmColumn(ProposalTypeAdd)},
 		{"update_proposal", func(v *messagesVector) string { return v.UpdateProposal },
-			checkCodecReEncode[LeafNode, *LeafNode]},
-		{"pre_shared_key_proposal", func(v *messagesVector) string { return v.PreSharedKeyProposal },
-			checkCodecReEncode[PreSharedKeyId, *PreSharedKeyId]},
+			checkProposalArmColumn(ProposalTypeUpdate)},
 		{"remove_proposal", func(v *messagesVector) string { return v.RemoveProposal },
-			func(data []byte) ([]byte, error) {
-				value := Remove{}
-				return checkReEncode(data,
-					func(r *syntax.Reader) error {
-						removed, err := r.ReadUint32()
-						if err != nil {
-							return err
-						}
-						value.Removed = LeafIndex(removed)
-						return nil
-					},
-					func(w *syntax.Writer) error {
-						w.WriteUint32(uint32(value.Removed))
-						return nil
-					})
-			}},
+			checkProposalArmColumn(ProposalTypeRemove)},
+		{"pre_shared_key_proposal", func(v *messagesVector) string { return v.PreSharedKeyProposal },
+			checkProposalArmColumn(ProposalTypePreSharedKey)},
 		{"re_init_proposal", func(v *messagesVector) string { return v.ReInitProposal },
-			func(data []byte) ([]byte, error) {
-				value := ReInit{}
-				return checkReEncode(data,
-					func(r *syntax.Reader) error {
-						groupId, err := r.ReadOpaque()
-						if err != nil {
-							return err
-						}
-						version, err := r.ReadUint16()
-						if err != nil {
-							return err
-						}
-						suite, err := r.ReadUint16()
-						if err != nil {
-							return err
-						}
-						extensions, err := ReadExtensions(r)
-						if err != nil {
-							return err
-						}
-						value = ReInit{
-							GroupId:     groupId,
-							Version:     ProtocolVersion(version),
-							CipherSuite: CipherSuite(suite),
-							Extensions:  extensions,
-						}
-						return nil
-					},
-					func(w *syntax.Writer) error {
-						w.WriteOpaque(value.GroupId)
-						w.WriteUint16(uint16(value.Version))
-						w.WriteUint16(uint16(value.CipherSuite))
-						return WriteExtensions(w, value.Extensions)
-					})
-			}},
+			checkProposalArmColumn(ProposalTypeReInit)},
 		{"external_init_proposal", func(v *messagesVector) string { return v.ExternalInitProposal },
-			func(data []byte) ([]byte, error) {
-				value := ExternalInit{}
-				return checkReEncode(data,
-					func(r *syntax.Reader) error {
-						kemOutput, err := r.ReadOpaque()
-						if err != nil {
-							return err
-						}
-						value.KemOutput = kemOutput
-						return nil
-					},
-					func(w *syntax.Writer) error {
-						w.WriteOpaque(value.KemOutput)
-						return nil
-					})
-			}},
+			checkProposalArmColumn(ProposalTypeExternalInit)},
 		{"group_context_extensions_proposal", func(v *messagesVector) string {
 			return v.GroupContextExtensionsProposal
 		},
-			func(data []byte) ([]byte, error) {
-				value := GroupContextExtensions{}
-				return checkReEncode(data,
-					func(r *syntax.Reader) error {
-						extensions, err := ReadExtensions(r)
-						if err != nil {
-							return err
-						}
-						value.Extensions = extensions
-						return nil
-					},
-					func(w *syntax.Writer) error {
-						return WriteExtensions(w, value.Extensions)
-					})
-			}},
+			checkProposalArmColumn(ProposalTypeGroupContextExtensions)},
 
 		// the ratchet tree, at the raised vector length bound.
 		{"ratchet_tree", func(v *messagesVector) string { return v.RatchetTree },
@@ -787,12 +740,12 @@ func messagesDropOctet(t *testing.T, text string) string {
 // hands the comparator cases that are wrong in each of the ways the corpus is not, and requires
 // the matching refusal.
 //
-// The truncation rows are the ones that matter most and they are deliberately one per CHECKER
-// SHAPE rather than one per column: the three explicit-closure columns, the four whole-wire-type
-// columns, the six MLSMessage columns and the ratchet tree are four different decode paths, and a
-// row per path is what says each of them reads to the end of its input. The two whole-wire-type
-// rows named commit and group_secrets are also the measurement in checkCodecReEncode's own
-// comment: against a bare syntax.CheckRoundTrip they are ACCEPTED.
+// The truncation rows are the ones that matter most and they are one per DECODE PATH as well as
+// spread across the columns: the seven proposal arms, the two whole wire types, the seven
+// MLSMessages and the ratchet tree are four different paths, and a row per path is what says each
+// of them reads to the end of its input. The two rows named commit and group_secrets are also the
+// measurement in checkCodecReEncode's own comment: against a bare syntax.CheckRoundTrip they are
+// ACCEPTED.
 func TestCompareMessagesVectorRefusesACaseItShouldNotAccept(t *testing.T) {
 	base, encode := messagesKatBaseCase(t)
 	rows := []struct {
