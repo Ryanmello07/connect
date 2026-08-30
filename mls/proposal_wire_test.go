@@ -642,3 +642,484 @@ func TestEveryRegisteredProposalArmEncodesToTheLayoutSection121Writes(t *testing
 	}
 	t.Logf("%d registered proposal arms, each encoded to and decoded from the layout section 12.1 gives it", len(covered))
 }
+
+// ---------------------------------------------------------------------------
+// the code points, read twice out of the RFC
+// ---------------------------------------------------------------------------
+
+// rfc9420Section175ProposalTypes is the "MLS Proposal Types" registry of RFC 9420 section 17.5,
+// transcribed out of its Initial Contents table:
+//
+//	| Value    | Name                     | R | Ext | Path | Ref      |
+//	| 0x0000   | RESERVED                 | - | -   | -    | RFC 9420 |
+//	| 0x0001   | add                      | Y | Y   | N    | RFC 9420 |
+//	| 0x0002   | update                   | Y | N   | Y    | RFC 9420 |
+//	| 0x0003   | remove                   | Y | Y   | Y    | RFC 9420 |
+//	| 0x0004   | psk                      | Y | Y   | N    | RFC 9420 |
+//	| 0x0005   | reinit                   | Y | Y   | N    | RFC 9420 |
+//	| 0x0006   | external_init            | Y | N   | Y    | RFC 9420 |
+//	| 0x0007   | group_context_extensions | Y | Y   | Y    | RFC 9420 |
+//
+// The table's own RESERVED is folded to lower case so the whole map is one spelling convention
+// and a Go constant name can be folded onto it; no other character of any row is touched. The
+// GREASE rows -- 0x0A0A, 0x1A1A and the rest of that ladder -- are deliberately absent: they are
+// registered as reserved-for-GREASE rather than as proposals, they name no arm, and the sweep
+// below covers them along with every other code point that names no arm.
+var rfc9420Section175ProposalTypes = map[string]uint64{
+	"reserved":                 0x0000,
+	"add":                      0x0001,
+	"update":                   0x0002,
+	"remove":                   0x0003,
+	"psk":                      0x0004,
+	"reinit":                   0x0005,
+	"external_init":            0x0006,
+	"group_context_extensions": 0x0007,
+}
+
+// rfc9420Section72DefaultProposalTypes is the SECOND reading of the same seven assignments, out
+// of RFC 9420 section 7.2's default list:
+//
+//	The following proposal and extension types are considered "default" and MUST NOT be
+//	listed:
+//
+//	*  Proposal types:
+//	   -  0x0001 - add
+//	   -  0x0002 - update
+//	   -  0x0003 - remove
+//	   -  0x0004 - psk
+//	   -  0x0005 - reinit
+//	   -  0x0006 - external_init
+//	   -  0x0007 - group_context_extensions
+//
+// Two transcriptions rather than one, for the reason the extension registry already carries one:
+// a code point pinned ONCE agrees with whatever the transcriber believed, and this package has
+// already shipped a constant declared at its neighbour's code point defended by a pin written
+// from the same misreading. Section 7.2 and section 17.5 are different pages written for
+// different purposes, so a hand that slipped on one of them did not slip the same way on both.
+var rfc9420Section72DefaultProposalTypes = map[string]uint64{
+	"add":                      0x0001,
+	"update":                   0x0002,
+	"remove":                   0x0003,
+	"psk":                      0x0004,
+	"reinit":                   0x0005,
+	"external_init":            0x0006,
+	"group_context_extensions": 0x0007,
+}
+
+// proposalTypeRfcNameAliases is the two constants whose Go spelling does not fold to the RFC's
+// own name for the same code point. It is a NAME map and carries no value, which is what makes
+// it safe to write by hand: an alias that is wrong joins a constant to a different registry row
+// and fails the comparison, rather than agreeing with an error the way a value pin would.
+//
+// The gate below holds it to being exactly the set of names that do not fold on their own, so a
+// stale entry and a missing one both fail on the commit that creates them.
+var proposalTypeRfcNameAliases = map[string]string{
+	"pre_shared_key": "psk",
+	"re_init":        "reinit",
+}
+
+// rfcProposalTypeName is a declared constant's name folded to the RFC's spelling of the same
+// code point, through the shared fold and then the alias.
+func rfcProposalTypeName(constantName string) string {
+	folded := rfcNameOfRegistryConstant("ProposalType", constantName)
+	if alias, aliased := proposalTypeRfcNameAliases[folded]; aliased {
+		return alias
+	}
+	return folded
+}
+
+// TestEveryProposalTypeCodePointIsPinnedByTwoIndependentReadingsOfTheRfc joins the proposal type
+// registry to the RFC twice, on the NAME, in both directions, over the package's constants and
+// over the single-transcription pin that already stands beside them.
+//
+// The pin in extension_test.go is one person reading one page and typing values beside Go
+// identifiers. It catches a constant edited afterwards and nothing else: a constant declared at
+// its neighbour's code point from the beginning is defended by a pin written from the same
+// belief, which is exactly the state ExtensionTypeExternalSenders was in at external_pub's
+// 0x0004. So the pin is joined here too, against a reading of a different page, and a swap
+// present in BOTH the source and the pin fails.
+//
+// A swapped proposal code point is not a compile error and not a bad encoding. It makes this
+// implementation write reinit where every peer writes external_init, and read a peer's
+// external_init as a reinit -- a proposal whose body is a different structure, under a
+// discriminant that decides which. Nothing that round trips its own output can see it.
+func TestEveryProposalTypeCodePointIsPinnedByTwoIndependentReadingsOfTheRfc(t *testing.T) {
+	// the two readings against each other first. Every name section 7.2 lists must be in the
+	// section 17.5 registry at the same value, and the only row 17.5 may hold beyond them is
+	// the reserved zero, which is not a "default proposal type" and has no section 7.2 line.
+	for _, name := range slices.Sorted(maps.Keys(rfc9420Section72DefaultProposalTypes)) {
+		listed := rfc9420Section72DefaultProposalTypes[name]
+		registered, held := rfc9420Section175ProposalTypes[name]
+		if !held {
+			t.Fatalf("RFC 9420 section 7.2 names the default proposal type %s at %#04x and the section 17.5 transcription has no row spelling it; one of the two readings has been mistyped and the join below would run one code point short",
+				name, listed)
+		}
+		if registered != listed {
+			t.Fatalf("%s is %#04x read out of section 7.2 and %#04x read out of section 17.5; the two transcriptions of one registry disagree",
+				name, listed, registered)
+		}
+	}
+	beyondTheDefaults := []string{}
+	for name := range rfc9420Section175ProposalTypes {
+		if _, isDefault := rfc9420Section72DefaultProposalTypes[name]; !isDefault {
+			beyondTheDefaults = append(beyondTheDefaults, name)
+		}
+	}
+	slices.Sort(beyondTheDefaults)
+	if !slices.Equal(beyondTheDefaults, []string{"reserved"}) {
+		t.Fatalf("the section 17.5 transcription holds %v beyond section 7.2's default list, and the reserved zero is the only row that may stand outside it",
+			beyondTheDefaults)
+	}
+
+	// the alias table, held to exactly the names that do not fold on their own
+	declared := registryConstantsOfType(t, "ProposalType")
+	needed := map[string]string{}
+	for _, name := range slices.Sorted(maps.Keys(declared)) {
+		folded := rfcNameOfRegistryConstant("ProposalType", name)
+		if _, listed := rfc9420Section175ProposalTypes[folded]; listed {
+			continue
+		}
+		alias, aliased := proposalTypeRfcNameAliases[folded]
+		if !aliased {
+			t.Fatalf("%s folds to the RFC name %s, which RFC 9420 section 17.5 does not register, and no alias says what the RFC calls that code point; an unjoinable constant is one this gate cannot cross check",
+				name, folded)
+		}
+		if _, listed := rfc9420Section175ProposalTypes[alias]; !listed {
+			t.Fatalf("the alias %s -> %s names no row of the section 17.5 registry", folded, alias)
+		}
+		needed[folded] = alias
+	}
+	if !maps.Equal(needed, proposalTypeRfcNameAliases) {
+		t.Fatalf("the constants of ProposalType need the aliases %v and this file holds %v; an alias for a name nothing folds to is a join key nothing uses, and a missing one drops a constant out of the join",
+			needed, proposalTypeRfcNameAliases)
+	}
+
+	// and the join, over both the declarations and the pin that guards them
+	for _, source := range []struct {
+		what      string
+		constants map[string]uint64
+	}{
+		{what: "package mls", constants: declared},
+		{what: "the registryCodePoints pin", constants: registryCodePoints["ProposalType"]},
+	} {
+		if len(source.constants) == 0 {
+			t.Fatalf("%s holds no ProposalType constant, so this join ran over nothing", source.what)
+		}
+		byRfcName := map[string]uint64{}
+		for name, value := range source.constants {
+			rfcName := rfcProposalTypeName(name)
+			if other, repeated := byRfcName[rfcName]; repeated {
+				t.Fatalf("%s: two constants fold to the RFC name %s, at %#04x and %#04x, so the join is ambiguous",
+					source.what, rfcName, other, value)
+			}
+			byRfcName[rfcName] = value
+		}
+		if !maps.Equal(byRfcName, rfc9420Section175ProposalTypes) {
+			t.Fatalf("%s reads the proposal type registry as\n %v\nand RFC 9420 section 17.5 assigns\n %v",
+				source.what, byRfcName, rfc9420Section175ProposalTypes)
+		}
+	}
+	t.Logf("%d proposal type code points joined on the name across two readings of RFC 9420, over the declarations and over the pin",
+		len(rfc9420Section175ProposalTypes))
+}
+
+// ---------------------------------------------------------------------------
+// the whole code point space, on both halves
+// ---------------------------------------------------------------------------
+
+// TestEveryProposalTypeWithNoArmIsCarriedVerbatimOverTheWholeSixteenBitSpace sweeps all 65536
+// proposal type code points rather than the one GREASE value a case would have probed.
+//
+// The class is DERIVED: the width of the registry against the code points that name an arm, so
+// the ladder of GREASE values, the reserved zero, and every unassigned point in between are all
+// in it without being listed. p6 task 1 did this for SenderType over its 252 undeclared octets
+// and this is the same derivation one registry wider -- the registry is 16 bits, which is why
+// an 8-bit implementation of it encodes every proposal one octet short.
+//
+// What is swept is the opposite property from SenderType's, and that is the point of stating it.
+// A sender type outside the registry is REFUSED; a proposal type outside it is CARRIED, verbatim
+// and re-encoded exactly, because GREASE is parsed and ignored rather than rejected. A codec
+// that refused one of them refuses a peer that generates it, and a codec that carried a
+// REGISTERED one -- the complement at the end -- drops a real proposal's arm on the floor while
+// re-encoding byte identically, which no round trip anywhere in this package can see.
+func TestEveryProposalTypeWithNoArmIsCarriedVerbatimOverTheWholeSixteenBitSpace(t *testing.T) {
+	armed := map[ProposalType]bool{}
+	for _, value := range registryConstantsOfType(t, "ProposalType") {
+		// the reserved zero is excluded by its VALUE and not by its name, on the terms the arm
+		// table above already uses: it names no arm, so it belongs to the verbatim class.
+		if value == uint64(ProposalTypeReserved) {
+			continue
+		}
+		armed[ProposalType(value)] = true
+	}
+	if len(armed) == 0 {
+		t.Fatal("no proposal type was derived as naming an arm, so this sweep would run over the whole space and say nothing about the seven arms")
+	}
+
+	body := []byte{0xde, 0xad}
+	carried := 0
+	for candidate := 0; candidate <= 0xffff; candidate += 1 {
+		proposalType := ProposalType(candidate)
+		if armed[proposalType] {
+			continue
+		}
+		encoded := []byte{byte(candidate >> 8), byte(candidate), body[0], body[1]}
+
+		decoded := Proposal{}
+		if err := syntax.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("the proposal type %#04x, which names no arm, was refused with %v; GREASE is parsed and ignored, and a codec that refuses an unregistered type cannot round trip a peer that generates one",
+				candidate, err)
+		}
+		if decoded.ProposalType != proposalType {
+			t.Fatalf("%#04x decoded as proposal type %#04x", candidate, decoded.ProposalType)
+		}
+		if decoded.UnknownType != proposalType {
+			t.Fatalf("%#04x decoded with unknown type %#04x; without it the re-encode falls back to the arm discriminant and the code point the peer sent is lost",
+				candidate, decoded.UnknownType)
+		}
+		if !bytes.Equal(decoded.UnknownBody, body) {
+			t.Fatalf("%#04x decoded with the verbatim body %x, want %x", candidate, decoded.UnknownBody, body)
+		}
+		reencoded, err := syntax.Marshal(&decoded)
+		if err != nil {
+			t.Fatalf("%#04x: re-marshal: %v", candidate, err)
+		}
+		if !bytes.Equal(reencoded, encoded) {
+			t.Fatalf("%#04x re-encoded to %x, want %x", candidate, reencoded, encoded)
+		}
+
+		// the encode half, built rather than read back: the discriminant override is what emits
+		// a body under a code point this package does not register, and it is stated over the
+		// whole space rather than at one GREASE value for the same reason the decode half is.
+		built := Proposal{ProposalType: proposalType, UnknownType: proposalType, UnknownBody: body}
+		builtEncoded, err := syntax.Marshal(&built)
+		if err != nil {
+			t.Fatalf("%#04x: marshal: %v", candidate, err)
+		}
+		if !bytes.Equal(builtEncoded, encoded) {
+			t.Fatalf("%#04x encoded to %x, want %x", candidate, builtEncoded, encoded)
+		}
+		carried += 1
+	}
+	if carried+len(armed) != 1<<16 {
+		t.Fatalf("the derivation split the %d proposal type code points into %d naming an arm and %d carried verbatim",
+			1<<16, len(armed), carried)
+	}
+
+	// the complement, over the arms' own published layouts: a registered type must be read AS
+	// its arm and never as a verbatim body.
+	for proposalType, sample := range proposalArmSamples(t) {
+		decoded := Proposal{}
+		if err := syntax.Unmarshal(sample.golden, &decoded); err != nil {
+			t.Fatalf("%s: the published layout did not decode: %v", sample.field, err)
+		}
+		if decoded.UnknownType != ProposalTypeReserved || decoded.UnknownBody != nil {
+			t.Fatalf("a %s proposal decoded with unknown type %#04x and the verbatim body %x; the registered code point %#04x was read as an unregistered one, and a proposal read that way re-encodes byte identically with its arm dropped",
+				sample.field, decoded.UnknownType, decoded.UnknownBody, proposalType)
+		}
+	}
+	t.Logf("%d proposal type code points carried verbatim on both halves, %d read as arms", carried, len(armed))
+}
+
+// rfc9420Section124ProposalOrRefTypes is the enum of RFC 9420 section 12.4, transcribed:
+//
+//	enum {
+//	  reserved(0),
+//	  proposal(1),
+//	  reference(2),
+//	  (255)
+//	} ProposalOrRefType;
+var rfc9420Section124ProposalOrRefTypes = map[string]uint64{
+	"reserved":  0,
+	"proposal":  1,
+	"reference": 2,
+}
+
+// rfc9420Section124ProposalOrRefSelectCases is the second reading of the same registry, out of
+// the structure that consumes it four lines further down the same section:
+//
+//	struct {
+//	  ProposalOrRefType type;
+//	  select (ProposalOrRef.type) {
+//	    case proposal:  Proposal proposal;
+//	    case reference: ProposalRef reference;
+//	  };
+//	} ProposalOrRef;
+//
+// It carries no values, and that is what it is for: it says WHICH members of the enum name a
+// body, which is the difference between the two the enum itself does not state. reserved(0) is
+// a member of the registry and names no case, so it is refused like every unassigned octet
+// rather than being special.
+var rfc9420Section124ProposalOrRefSelectCases = []string{"proposal", "reference"}
+
+// TestProposalOrRefRefusesEveryCodePointThatNamesNoArmOnBothHalves sweeps the whole octet space
+// of ProposalOrRefType on both halves of the codec.
+//
+// Two things this replaces. The reserved zero was the only refusal stated, on the DECODE half
+// only, which left 253 octets and the entire encode half unobserved -- and the encode half is
+// the one with teeth here, because a ProposalOrRef goes inside a Commit inside a FramedContent
+// that is signed, so an encoder that wrote an unregistered discriminant produces signed bytes
+// no peer can attribute to any proposal.
+//
+// The accepted class is derived from the RFC and deliberately NOT from this package's own
+// switch. A class read off the code under test shrinks by exactly the case a mutation adds,
+// which is a gate that agrees with whatever the code does.
+func TestProposalOrRefRefusesEveryCodePointThatNamesNoArmOnBothHalves(t *testing.T) {
+	accepted := map[uint64]bool{}
+	for _, name := range rfc9420Section124ProposalOrRefSelectCases {
+		value, held := rfc9420Section124ProposalOrRefTypes[name]
+		if !held {
+			t.Fatalf("the section 12.4 select names the case %s and the enum transcription beside it has no member spelling that; the two readings describe different registries",
+				name)
+		}
+		accepted[value] = true
+	}
+	if len(accepted) != len(rfc9420Section124ProposalOrRefSelectCases) {
+		t.Fatalf("the %d select cases resolved to %d distinct code points", len(rfc9420Section124ProposalOrRefSelectCases), len(accepted))
+	}
+
+	// this package's constants joined to the enum by name, both directions at once, so the
+	// sweep below runs over the octets the RFC leaves without a body rather than over the
+	// octets this package happens not to have declared.
+	byRfcName := map[string]uint64{}
+	for name, value := range registryConstantsOfType(t, "ProposalOrRefType") {
+		rfcName := rfcNameOfRegistryConstant("ProposalOrRefType", name)
+		if other, repeated := byRfcName[rfcName]; repeated {
+			t.Fatalf("two constants fold to the RFC name %s, at %d and %d", rfcName, other, value)
+		}
+		byRfcName[rfcName] = value
+	}
+	if !maps.Equal(byRfcName, rfc9420Section124ProposalOrRefTypes) {
+		t.Fatalf("package mls reads ProposalOrRefType as %v and RFC 9420 section 12.4 writes %v", byRfcName, rfc9420Section124ProposalOrRefTypes)
+	}
+	if bits := framingRegistryBits(t, "ProposalOrRefType"); bits != 8 {
+		t.Fatalf("ProposalOrRefType is %d bits wide and section 12.4 writes it as one octet, so this sweep is over the wrong space", bits)
+	}
+
+	refused := 0
+	for candidate := 0; candidate <= 0xff; candidate += 1 {
+		if accepted[uint64(candidate)] {
+			continue
+		}
+		// BOTH arms are populated, so what the encoder refuses is the TYPE. With neither arm
+		// set an encoder that had lost its discriminant check would still refuse, for the
+		// missing body, and this sweep would pass over an encoder that writes anything.
+		unencodable := ProposalOrRef{
+			Type:      ProposalOrRefType(candidate),
+			Proposal:  &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 1}},
+			Reference: ProposalRef{0x01, 0x02},
+		}
+		if _, err := syntax.Marshal(&unencodable); !errors.Is(err, ErrUnknownProposalOrRefType) {
+			t.Fatalf("encoding ProposalOrRef type %#02x with both arms populated: got %v, want ErrUnknownProposalOrRefType", candidate, err)
+		}
+		// each octet twice, bare and with a tail, so a refusal that was really a truncation
+		// cannot pass for a refusal of the discriminant
+		for _, encoded := range [][]byte{{byte(candidate)}, {byte(candidate), 0xde, 0xad, 0xbe, 0xef}} {
+			decoded := ProposalOrRef{}
+			if err := syntax.Unmarshal(encoded, &decoded); !errors.Is(err, ErrUnknownProposalOrRefType) {
+				t.Fatalf("decoding %x: got %v, want ErrUnknownProposalOrRefType", encoded, err)
+			}
+		}
+		refused += 1
+	}
+	if refused+len(accepted) != 1<<8 {
+		t.Fatalf("the derivation split the %d ProposalOrRefType code points into %d with a body and %d refused",
+			1<<8, len(accepted), refused)
+	}
+	t.Logf("%d ProposalOrRefType code points refused on both halves of the codec", refused)
+}
+
+// ---------------------------------------------------------------------------
+// full consumption
+// ---------------------------------------------------------------------------
+
+// TestProposalAndProposalOrRefConsumeExactlyTheirOwnOctets is the full consumption statement
+// both codecs owe, over every registered arm rather than over the one somebody picked.
+//
+// A Proposal is hashed WHOLE to make a ProposalRef, and a ProposalOrRef sits inside a Commit
+// inside a signed FramedContent. A decoder that tolerated a tail would accept two octet strings
+// as one proposal, which is two encodings under one reference and one signature covering only
+// one of them. The refusal comes from syntax.UnmarshalLimit joining r.Done() rather than from
+// anything in proposal_wire.go, which is exactly why it is stated here: that join has been
+// dropped before, and the files whose tests noticed were somebody else's.
+//
+// The proper prefixes are the other side of the same length. They are swept whole rather than
+// cut at the boundaries somebody thought of, because a decoder that read an arm short leaves a
+// partly populated structure that then re-encodes to something the sender never wrote.
+func TestProposalAndProposalOrRefConsumeExactlyTheirOwnOctets(t *testing.T) {
+	type consuming struct {
+		name   string
+		golden []byte
+		fresh  func() syntax.Codec
+	}
+	cases := []consuming{}
+	for _, sample := range proposalArmSamples(t) {
+		cases = append(cases, consuming{
+			name:   "Proposal/" + sample.field,
+			golden: sample.golden,
+			fresh:  func() syntax.Codec { return &Proposal{} },
+		})
+	}
+	for _, one := range []struct {
+		name  string
+		value ProposalOrRef
+	}{
+		{name: "ProposalOrRef/proposal", value: ProposalOrRef{Type: ProposalOrRefTypeProposal,
+			Proposal: &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 7}}}},
+		{name: "ProposalOrRef/reference", value: ProposalOrRef{Type: ProposalOrRefTypeReference,
+			Reference: ProposalRef{0xaa, 0xbb, 0xcc}}},
+	} {
+		encoded, err := syntax.Marshal(&one.value)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", one.name, err)
+		}
+		cases = append(cases, consuming{
+			name:   one.name,
+			golden: encoded,
+			fresh:  func() syntax.Codec { return &ProposalOrRef{} },
+		})
+	}
+	slices.SortFunc(cases, func(a consuming, b consuming) int { return strings.Compare(a.name, b.name) })
+
+	tails, cuts := 0, 0
+	for _, one := range cases {
+		// the control: the golden itself decodes, or every refusal below is a refusal of
+		// something this table built wrong
+		if err := syntax.Unmarshal(one.golden, one.fresh()); err != nil {
+			t.Fatalf("%s: the golden itself was refused (%v), so nothing below proves anything", one.name, err)
+		}
+		for _, tail := range [][]byte{{0x00}, {0xff}, {0x00, 0x00}, repeatByte(0x5a, 17)} {
+			longer := joinBytes(one.golden, tail)
+			if err := syntax.Unmarshal(longer, one.fresh()); !errors.Is(err, syntax.ErrTrailingBytes) {
+				t.Errorf("%s with %d trailing octets (%x): err = %v, want syntax.ErrTrailingBytes",
+					one.name, len(tail), longer, err)
+				continue
+			}
+			tails += 1
+		}
+		for cut := 0; cut < len(one.golden); cut += 1 {
+			if err := syntax.Unmarshal(one.golden[:cut], one.fresh()); err == nil {
+				t.Errorf("%s: %d octets of %d decoded rather than being refused", one.name, cut, len(one.golden))
+				continue
+			}
+			cuts += 1
+		}
+	}
+	if tails == 0 || cuts == 0 {
+		t.Fatalf("%d tails and %d truncations were judged, so one half of this observed nothing", tails, cuts)
+	}
+
+	// the one exception, stated so it is a decision somebody reads rather than a hole somebody
+	// finds. Under a code point that names no arm there is no full consumption to enforce: the
+	// body has no length of its own, so everything left IS the body. That is the same
+	// ReadRaw(Remaining()) whose blast radius the vector region test above bounds.
+	absorbed := Proposal{}
+	tailAbsorbing := []byte{0x0a, 0x0a, 0xde, 0xad, 0x00}
+	if err := syntax.Unmarshal(tailAbsorbing, &absorbed); err != nil {
+		t.Fatalf("a proposal under an unregistered code point with a trailing octet was refused: %v", err)
+	}
+	if !bytes.Equal(absorbed.UnknownBody, []byte{0xde, 0xad, 0x00}) {
+		t.Fatalf("the unregistered body came back as %x, want the whole of the remainder", absorbed.UnknownBody)
+	}
+	t.Logf("%d tails refused and %d truncations refused across %d encodings", tails, cuts, len(cases))
+}
