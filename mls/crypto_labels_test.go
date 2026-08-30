@@ -746,6 +746,31 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"treekem.go: syntax.ReadVector(r, readOneUpdatePathNode)",
 		"treekem.go: syntax.WriteVector(w, self.EncryptedPathSecret, writeOneHpkeCiphertext)",
 		"treekem.go: syntax.WriteVector(w, self.Nodes, writeOneUpdatePathNode)",
+		// the two vectors of RFC 9420 section 12.4.3.1: a Welcome's secrets<V> and a
+		// GroupSecrets' psks<V>. All four take the caller's Writer or Reader rather than
+		// building one, so each runs under whichever limit the caller opened.
+		//
+		// The default is the right one for both structures, and for the secrets vector it is the
+		// strictest reading anywhere in this package. A Welcome is decoded by a party who is NOT
+		// YET A MEMBER: there is no group state to check the result against, no signature over
+		// it, and every length in it was chosen by whoever sent it. So a raised bound here would
+		// not be a capacity, it would be an acceptance rule handed to a stranger, over the one
+		// decode in this package that runs before anything can refuse it -- and it would raise
+		// it over the largest allocation the structure has. The size argument agrees: the
+		// secrets vector holds one entry per joiner of a single commit, bounded by the group's
+		// own size, and one allowed past MaxVectorLength is one no peer running the default
+		// limit could have sent. psks<V> is always empty under the v1 profile.
+		//
+		// The GroupInfo that may carry a ratchet_tree extension is not a counterexample and is
+		// worth saying so here, because it is the first thing a reader will reach for. That
+		// decode is opened by its CALLER, so these four inherit the raised bound wherever the
+		// lifecycle passes one, exactly as treekem.go's four do; and the tree body itself is
+		// decoded by tree.go's UnmarshalLimit entry above, which is wired to
+		// MaxRatchetTreeLength explicitly and is where that decision is written down.
+		"welcome_wire.go: syntax.ReadVector(r, readOneEncryptedGroupSecrets)",
+		"welcome_wire.go: syntax.ReadVector(r, readOnePreSharedKeyId)",
+		"welcome_wire.go: syntax.WriteVector(w, self.Psks, writeOnePreSharedKeyId)",
+		"welcome_wire.go: syntax.WriteVector(w, self.Secrets, writeOneEncryptedGroupSecrets)",
 	}
 	if !slices.Equal(entered, want) {
 		t.Errorf("this package enters the codec at %v, want %v", entered, want)
