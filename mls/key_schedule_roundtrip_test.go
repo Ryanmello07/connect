@@ -302,6 +302,44 @@ type seedCodec struct {
 	describe       func(value any) string
 }
 
+// seedCorpusReachabilityConstructor is the name of the method below, spelled once because the gate
+// that requires every target to reach its reachability answer through it looks for that name.
+const seedCorpusReachabilityConstructor = "roundTripProperty"
+
+// roundTripProperty is the property every committed corpus target states, built out of the codec's
+// own two entry points rather than written out again at each target.
+//
+// Both halves come off the table on purpose. The round trip half was already shared, through
+// checkRoundTrip; the REACHABILITY half was not, and five targets each answered it with a locally
+// written expression that nothing observed. Replacing one of those answers with a bare `return
+// true` -- a target reporting that every input it saw reached a decoder, over a corpus that might
+// reach none -- left the whole suite green, which is precisely the failure the count was added to
+// expose. Answering out of codec.decode makes the answer a property of the table, and
+// TestEveryCommittedCorpusCodecAnswersReachabilityFromItsOwnDecoder is the control on it.
+func (self seedCodec) roundTripProperty() func(t *testing.T, encoded []byte) bool {
+	return func(t *testing.T, encoded []byte) bool {
+		if err := self.checkRoundTrip(encoded); err != nil {
+			t.Fatalf("%s: %d octets %x: %v", self.target, len(encoded), encoded, err)
+		}
+		_, err := self.decode(encoded)
+		return err == nil
+	}
+}
+
+// seedCodecFor is one target's entry in the shared table. A target with no entry is a failure and
+// not a fallback: every property this package states over a corpus is stated through that table,
+// so a target outside it is a corpus nothing but the fuzzing engine ever reads.
+func seedCodecFor(t testing.TB, target string) seedCodec {
+	t.Helper()
+	for _, codec := range seedCodecs() {
+		if codec.target == target {
+			return codec
+		}
+	}
+	t.Fatalf("%s names no entry of the shared codec table", target)
+	return seedCodec{}
+}
+
 // seedCodecs is every structure this package states the corpus properties over. p4's two are here,
 // p5's two are in tree_roundtrip_test.go and p6's one is in framing_guard_test.go, joined rather
 // than kept in three tables: each property below is written once over the table, and a second
