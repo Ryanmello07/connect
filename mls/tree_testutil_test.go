@@ -52,7 +52,7 @@ import (
 )
 
 // one member of a test tree, with the private halves a real client would hold.
-type testMember struct {
+type testTreeMember struct {
 	LeafIndex      LeafIndex
 	SignaturePriv  SignaturePrivateKey
 	EncryptionPriv HpkePrivateKey
@@ -86,10 +86,10 @@ func testGroupId() []byte {
 // It takes testing.TB rather than *testing.T so the task 28 benchmarks can build trees without
 // faking a *testing.T, which is also why the well-formedness check reports through t.Errorf on
 // the TB rather than through anything only a test has.
-func newTestTree(t testing.TB, crypto CryptoProvider, n uint32) (*RatchetTree, []*testMember) {
+func newTestTree(t testing.TB, crypto CryptoProvider, n uint32) (*RatchetTree, []*testTreeMember) {
 	t.Helper()
 	tree := NewRatchetTree()
-	members := make([]*testMember, 0, n)
+	members := make([]*testTreeMember, 0, n)
 	for i := uint32(0); i < n; i += 1 {
 		signaturePriv, signaturePub, err := crypto.SignatureKeyPair()
 		if err != nil {
@@ -142,7 +142,7 @@ func newTestTree(t testing.TB, crypto CryptoProvider, n uint32) (*RatchetTree, [
 		if err := tree.SetLeaf(LeafIndex(i), leaf); err != nil {
 			t.Fatalf("SetLeaf(%d): %v", i, err)
 		}
-		members = append(members, &testMember{
+		members = append(members, &testTreeMember{
 			LeafIndex:      LeafIndex(i),
 			SignaturePriv:  signaturePriv,
 			EncryptionPriv: encryptionPriv,
@@ -186,7 +186,7 @@ var (
 // with no members still is, and which FullLeafCount answers zero for on its own. Neither rule
 // is rewritten here, so a change to either moves this check with it rather than leaving it
 // agreeing with a shape the container no longer builds.
-func testTreeExpectedWidth(members []*testMember) LeafCount {
+func testTreeExpectedWidth(members []*testTreeMember) LeafCount {
 	width := FullLeafCount(LeafCount(len(members)))
 	if floor := NewRatchetTree().LeafWidth(); width < floor {
 		width = floor
@@ -197,7 +197,7 @@ func testTreeExpectedWidth(members []*testMember) LeafCount {
 // testTreeFaults is every way this tree and this membership disagree with what newTestTree
 // promises, as a list rather than as reports, so the control below can drive it and read back
 // what it found.
-func testTreeFaults(crypto CryptoProvider, tree *RatchetTree, members []*testMember) []error {
+func testTreeFaults(crypto CryptoProvider, tree *RatchetTree, members []*testTreeMember) []error {
 	faults := []error{}
 	width := tree.LeafWidth()
 	if !IsFullLeafCount(width) {
@@ -300,7 +300,7 @@ func testTreeFaults(crypto CryptoProvider, tree *RatchetTree, members []*testMem
 // own: both are opaque, both round trip, both are the right length. The signature the builder
 // already made does not answer this question either -- it was made with whatever key the builder
 // used, so it verifies whether or not the key handed BACK to the caller is that one.
-func testTreeSignatureKeyPairAgrees(crypto CryptoProvider, leaf *LeafNode, member *testMember) error {
+func testTreeSignatureKeyPairAgrees(crypto CryptoProvider, leaf *LeafNode, member *testTreeMember) error {
 	probe := leaf.Clone()
 	if err := probe.Sign(crypto, member.SignaturePriv, testGroupId(), member.LeafIndex); err != nil {
 		return err
@@ -311,7 +311,7 @@ func testTreeSignatureKeyPairAgrees(crypto CryptoProvider, leaf *LeafNode, membe
 // testTreeEncryptionKeyPairAgrees seals to the public half the leaf publishes and opens with the
 // private half the member is holding, which is exactly what task 22 does with these two values
 // and exactly what nothing else here would notice going wrong.
-func testTreeEncryptionKeyPairAgrees(crypto CryptoProvider, leaf *LeafNode, member *testMember) error {
+func testTreeEncryptionKeyPairAgrees(crypto CryptoProvider, leaf *LeafNode, member *testTreeMember) error {
 	plaintext := []byte("urmessage test tree key pair probe")
 	kemOutput, ciphertext, err := crypto.HpkeSeal(leaf.EncryptionKey, nil, nil, plaintext)
 	if err != nil {
@@ -328,7 +328,7 @@ func testTreeEncryptionKeyPairAgrees(crypto CryptoProvider, leaf *LeafNode, memb
 }
 
 // assertTestTreeIsWellFormed reports every fault of a tree this builder produced.
-func assertTestTreeIsWellFormed(t testing.TB, crypto CryptoProvider, tree *RatchetTree, members []*testMember) {
+func assertTestTreeIsWellFormed(t testing.TB, crypto CryptoProvider, tree *RatchetTree, members []*testTreeMember) {
 	t.Helper()
 	for _, fault := range testTreeFaults(crypto, tree, members) {
 		t.Errorf("the test tree is malformed: %v", fault)
@@ -485,7 +485,7 @@ type testTreeFaultRow struct {
 	// bound to one sentinel while naming another.
 	text string
 	// breaks answers a tree and a membership that violate this row's clause.
-	breaks func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember)
+	breaks func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember)
 }
 
 func testTreeFaultRows() map[string]testTreeFaultRow {
@@ -495,7 +495,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			text:     "the leaf width is not a power of two",
 			// five nodes is a leaf width of three, which is not a power of two and IS
 			// NodeWidth(3), so this fixture separates the two shape clauses
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				return &RatchetTree{nodes: make([]*Node, 5)}, nil
 			},
 		},
@@ -504,7 +504,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			text:     "the node array is not the node width of its own leaf width",
 			// four nodes is a leaf width of two, which IS a power of two and is not four nodes
 			// wide, so this fixture separates them the other way
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				return &RatchetTree{nodes: make([]*Node, 4)}, nil
 			},
 		},
@@ -515,7 +515,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			// leaf holding its own keys, every added leaf is blank and every added parent is
 			// blank, so this fixture separates the width clause from every other clause of the
 			// checker: it is the only one with anything to say about it.
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 4)
 				if err := tree.growTo(tree.LeafWidth() * 2); err != nil {
 					t.Fatalf("growTo: %v", err)
@@ -528,15 +528,15 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			text:     "member i does not carry leaf index i",
 			// the membership reversed and nothing else touched: every leaf is still occupied by
 			// the member holding its own keys, so no other clause fires
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 2)
-				return tree, []*testMember{members[1], members[0]}
+				return tree, []*testTreeMember{members[1], members[0]}
 			},
 		},
 		"errTestTreeMemberLeafBlank": {
 			sentinel: errTestTreeMemberLeafBlank,
 			text:     "a member's leaf is blank",
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 4)
 				if err := tree.Blank(members[1].LeafIndex.NodeIndex()); err != nil {
 					t.Fatalf("Blank: %v", err)
@@ -549,7 +549,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			text:     "a leaf outside the membership is occupied",
 			// a three member tree is four leaves wide, so leaf 3 is a position the tree has and
 			// the membership does not
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 3)
 				if err := tree.SetLeaf(LeafIndex(3), tree.Leaf(LeafIndex(0))); err != nil {
 					t.Fatalf("SetLeaf: %v", err)
@@ -560,7 +560,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 		"errTestTreeParentNotBlank": {
 			sentinel: errTestTreeParentNotBlank,
 			text:     "a parent node of a fresh test tree is not blank",
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 2)
 				if err := tree.SetParent(NodeIndex(1), &ParentNode{
 					EncryptionKey: HpkePublicKey(repeatByte(0x33, 32)),
@@ -575,7 +575,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			text:     "a member's leaf signature does not verify at its own index",
 			// signed with the right key over the wrong group id, so the leaf's own key pair is
 			// untouched and only its binding to this group is wrong
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 2)
 				leaf := tree.Leaf(LeafIndex(1)).Clone()
 				if err := leaf.Sign(crypto, members[1].SignaturePriv,
@@ -593,7 +593,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			text:     "a member's leaf does not pass section 7.3 validation",
 			// a leaf carrying urmessage_leaf_keys and no longer claiming to support it,
 			// re-signed so the signature is correct and only section 7.3 refuses it
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 2)
 				leaf := tree.Leaf(LeafIndex(1)).Clone()
 				leaf.Capabilities.Extensions = slices.DeleteFunc(leaf.Capabilities.Extensions,
@@ -613,7 +613,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 			// the leaf and its stored signature are untouched, so nothing but the private half
 			// handed back to the caller is wrong -- which is the whole of what this clause is
 			// for
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 2)
 				members[1].SignaturePriv = members[0].SignaturePriv
 				return tree, members
@@ -622,7 +622,7 @@ func testTreeFaultRows() map[string]testTreeFaultRow {
 		"errTestTreeEncryptionKeyPairMismatch": {
 			sentinel: errTestTreeEncryptionKeyPairMismatch,
 			text:     "a member's encryption private key is not the one its leaf publishes",
-			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+			breaks: func(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 				tree, members := newTestTree(t, crypto, 2)
 				members[1].EncryptionPriv = members[0].EncryptionPriv
 				return tree, members

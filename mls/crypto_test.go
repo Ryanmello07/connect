@@ -32,6 +32,7 @@ import (
 	"go/token"
 	"go/types"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -5758,7 +5759,33 @@ func Exported(secret []byte) []byte {
 // It held one entry before this one, and that entry expired exactly as it was written to:
 // p4 task 5 landed key_schedule.go, DeriveJoinerSecret erases its pseudorandom key through
 // zeroizeSecret, and the excuse died with the condition it named rather than outliving it.
-var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
+// awaitingFirstCaller is one excuse: the production declaration whose arrival ends it, and
+// the reason the excuse was written.
+//
+// firstCaller is a FIELD rather than a clause inside why, and that is the whole of what this
+// type is for. The map's safety argument is expiry by failure, and the only expiry the loop
+// below can observe is a PRODUCTION caller arriving -- so an excuse for a declaration that can
+// never gain one never expires, and the map holds it forever while the declaration ships. That
+// is not a hypothetical: a construction-bypass seam is a declaration whose whole purpose is
+// that production must never call it, so its excuse is exactly the entry this table cannot
+// expire, and the note at the foot of the map records the one that was nearly written.
+//
+// Every entry this table has ever held already stated its first caller, in prose, at the end
+// of the why: "p6 task 11's SealPrivateMessage is the first production caller". Moving that
+// clause into a field of its own is what turns the promise into something the gate can hold
+// the entry to, and TestNoExcuseAwaitingAFirstCallerNamesAnExpiryThatCannotArrive is what does
+// the holding. It refuses an entry with no first caller, an entry that names itself, and an
+// entry whose named first caller is a declaration of the TEST BINARY -- which is the only
+// truthful answer a seam has, because a seam's callers are tests and always will be.
+type awaitingFirstCaller struct {
+	// the production declaration whose arrival makes this entry expire, spelled the way
+	// declarationsIn spells a declaration: a bare name, or Type.Method for a method.
+	firstCaller string
+	// why the declaration landed ahead of that caller.
+	why string
+}
+
+var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller{
 	// It was empty, and that was the state to keep it in. Its one entry was takeLeafSecret,
 	// excused between p4 task 21 landing the secret tree's descent and p4 task 22 landing the
 	// ratchetFor that calls it, and it expired by FAILING the moment ratchetFor named it,
@@ -5817,6 +5844,271 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]string{
 	// the count form would have been a declaration excused here with no task to name as its first
 	// caller -- an entry that could never expire, which is the one shape this table must not
 	// hold. It lives in framing_protect_test.go instead, beside its only callers.
+}
+
+// ---------------------------------------------------------------------------
+// the excuse that could never expire
+// ---------------------------------------------------------------------------
+
+// excuseVerdicts is what one excuse table looks like when it is read against one package's
+// declarations. Two lists rather than one, because the table can go wrong in two directions and
+// a reader answering one verdict twice would report a clean bill for the other.
+type excuseVerdicts struct {
+	// entries whose expiry the loop in TestNoStubShapesRemainInSource could never observe.
+	cannotExpire []string
+	// entries whose named first caller has LANDED in production. That is the sharper expiry:
+	// the existing loop comes off when the declaration gains any caller at all, and this one
+	// comes off on the commit that lands the caller the entry actually promised, whether or
+	// not that caller ended up calling it.
+	callerLanded []string
+}
+
+// declarationFileOf answers the file one name is declared in, or "".
+//
+// A method is spelled Type.Method by declarationsIn, and a caller writing an entry has no
+// reason to know which of the two shapes a future declaration will take, so a bare name is
+// resolved against both. Sorted, so a name that matched two receivers answers the same file on
+// every run rather than moving between them.
+func declarationFileOf(declaredIn map[string]string, name string) string {
+	if file, declared := declaredIn[name]; declared {
+		return file
+	}
+	for _, key := range slices.Sorted(maps.Keys(declaredIn)) {
+		if strings.HasSuffix(key, "."+name) {
+			return declaredIn[key]
+		}
+	}
+	return ""
+}
+
+// readExcuses is the whole rule, and it is DERIVED from what the expiry loop can see rather
+// than from any property of the excused declaration itself.
+//
+// The excused declaration's own name, file and shape are deliberately not read. That is the
+// half rule 5 is about: this package holds errNilLeafOccupancyTest, a genuine internal guard
+// that reads exactly like a test seam, and a classifier keyed on the spelling would call it
+// one. What decides here is the entry's stated EXPIRY -- because an excuse is a promise that a
+// production caller is coming, and the three ways that promise can be unkeepable are visible
+// without knowing anything about the declaration being excused.
+//
+//   - no first caller at all. Nothing can arrive, so nothing can expire.
+//   - the declaration itself. It would have to call itself to be called.
+//   - a declaration of the TEST BINARY. The expiry loop reads production callers, so a test
+//     arriving moves nothing it looks at. This is the seam case, and it is the reason the class
+//     is read off the _test.go files of the package rather than off a list of names: a seam
+//     written tomorrow, under any spelling, in any file, has the same only-truthful answer.
+func readExcuses(excuses map[string]awaitingFirstCaller, declaredIn map[string]string) excuseVerdicts {
+	verdicts := excuseVerdicts{}
+	for _, address := range slices.Sorted(maps.Keys(excuses)) {
+		excuse := excuses[address]
+		name := address
+		if cut := strings.LastIndex(address, "/"); cut >= 0 {
+			name = address[cut+1:]
+		}
+		switch {
+		case excuse.firstCaller == "":
+			verdicts.cannotExpire = append(verdicts.cannotExpire,
+				address+": names no first caller")
+		case excuse.firstCaller == name:
+			verdicts.cannotExpire = append(verdicts.cannotExpire,
+				address+": names itself as its own first caller")
+		default:
+			file := declarationFileOf(declaredIn, excuse.firstCaller)
+			switch {
+			case file == "":
+				// the ordinary shape: the caller is not written yet, which is what the
+				// excuse exists to say
+			case strings.HasSuffix(file, "_test.go"):
+				verdicts.cannotExpire = append(verdicts.cannotExpire,
+					address+": "+excuse.firstCaller+" is declared by the test binary ("+file+")")
+			default:
+				verdicts.callerLanded = append(verdicts.callerLanded,
+					address+": "+excuse.firstCaller+" has landed in "+file)
+			}
+		}
+	}
+	return verdicts
+}
+
+// The control's production half. One declaration awaiting a caller nobody has written, one
+// caller that HAS landed, and one package variable spelled the way a test seam is spelled while
+// being production's own -- which is errNilLeafOccupancyTest's shape, put in the control so the
+// rule is measured against it rather than asserted about it.
+const excuseExpiryProductionControl = `package control
+
+func awaitedByACallerNotWrittenYet() int { return 0 }
+
+func awaitedByACallerThatHasLanded() int { return 1 }
+
+func theCallerThatLanded() int { return awaitedByACallerThatHasLanded() }
+
+var errNamedLikeATestSeamButDeclaredInProduction = 2
+`
+
+// The control's test half. Two declarations of the test binary: one a Test function, one a
+// helper whose name says nothing about tests at all. Both are answers a seam's excuse could
+// truthfully give, and the second is what says the rule is keyed on WHERE a declaration lives
+// rather than on how it is spelled.
+const excuseExpiryTestControl = `package control
+
+func TestControlDrivesTheSeam() {}
+
+func aHelperOfTheTestBinary() int { return 3 }
+`
+
+// The control's excuse table: one row per verdict, plus the row that must produce none.
+var excuseExpiryControlTable = map[string]awaitingFirstCaller{
+	"./awaitedByACallerNotWrittenYet": {firstCaller: "aCallerNoFileDeclaresYet",
+		why: "the ordinary shape, and the row that must produce no verdict at all"},
+	"./awaitedByACallerThatHasLanded": {firstCaller: "theCallerThatLanded",
+		why: "the sharper expiry: the promised caller has landed"},
+	"./aSeamADeclaringTestNames": {firstCaller: "TestControlDrivesTheSeam",
+		why: "the hole: a seam whose only truthful first caller is a Test"},
+	"./aSeamAHelperNames": {firstCaller: "aHelperOfTheTestBinary",
+		why: "the same hole under a caller whose name says nothing about tests"},
+	"./anExcuseNamingNobody": {firstCaller: "",
+		why: "no expiry condition at all"},
+	"./anExcuseNamingItself": {firstCaller: "anExcuseNamingItself",
+		why: "an expiry that is its own arrival"},
+	"./anExcuseNamingAProductionVar": {firstCaller: "errNamedLikeATestSeamButDeclaredInProduction",
+		why: "a caller spelled like a test seam and declared in production, which is a LANDED verdict and not a refusal"},
+}
+
+// The whole answer the control commits, written out rather than derived: an expectation
+// computed from the same code it is controlling states nothing.
+var excuseExpiryControlCannotExpire = []string{
+	"./aSeamADeclaringTestNames: TestControlDrivesTheSeam is declared by the test binary (control_test.go)",
+	"./aSeamAHelperNames: aHelperOfTheTestBinary is declared by the test binary (control_test.go)",
+	"./anExcuseNamingItself: names itself as its own first caller",
+	"./anExcuseNamingNobody: names no first caller",
+}
+
+var excuseExpiryControlCallerLanded = []string{
+	"./anExcuseNamingAProductionVar: errNamedLikeATestSeamButDeclaredInProduction has landed in control.go",
+	"./awaitedByACallerThatHasLanded: theCallerThatLanded has landed in control.go",
+}
+
+// declarationsOfTheExcuseControl runs the control's two halves through declarationsIn, which is
+// the same collector packageLevelDeclarations uses on the real package, so the control is not a
+// second reading of the source.
+func declarationsOfTheExcuseControl(t *testing.T) map[string]string {
+	t.Helper()
+	declared := map[string]string{}
+	for _, half := range []struct {
+		name   string
+		source string
+	}{
+		{name: "control.go", source: excuseExpiryProductionControl},
+		{name: "control_test.go", source: excuseExpiryTestControl},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), half.name, half.source,
+			parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", half.name, err)
+		}
+		declarationsIn(parsed, half.name, declared)
+	}
+	return declared
+}
+
+// TestNoExcuseAwaitingAFirstCallerNamesAnExpiryThatCannotArrive closes the one hole in
+// packageDeclarationsAwaitingTheirFirstCaller.
+//
+// The table's entire safety argument is expiry by failure: an entry dies on the commit that
+// gives its declaration a production caller, and the loop in TestNoStubShapesRemainInSource is
+// what kills it. Ten entries have died that way and none was ever removed by somebody
+// remembering it. What that argument does not cover is an entry for a declaration that can
+// never GAIN a production caller -- a construction-bypass seam, whose whole purpose is that
+// production must not call it. Its excuse would be correct on the day it was written, correct
+// forever after, and the seam would sit in a shipped binary with a table entry saying it was
+// being watched. The one entry that must never be written is the only kind the table cannot
+// expire.
+//
+// So the shape of a never-expiring excuse is made unwritable rather than looked for after the
+// fact: every entry states the production declaration whose arrival ends it, and readExcuses
+// refuses the three ways that statement can be unkeepable. The class of "declaration of the
+// test binary" is read off the package's own _test.go files, so it is the package that decides
+// it and not a list here -- a seam added tomorrow under any name is refused by the same rule.
+//
+// The honest limit, recorded because a gate nobody knows the edge of is worse than none: this
+// refuses the TRUTHFUL entry for a seam. An author who instead names a production caller that
+// will never be written states something false, and no reading of this tree can see that today.
+// What it costs to get past this gate is a lie in the table rather than a correct entry, which
+// is the difference between an oversight and a decision.
+func TestNoExcuseAwaitingAFirstCallerNamesAnExpiryThatCannotArrive(t *testing.T) {
+	control := readExcuses(excuseExpiryControlTable, declarationsOfTheExcuseControl(t))
+	if !slices.Equal(control.cannotExpire, excuseExpiryControlCannotExpire) {
+		t.Errorf("the reader answered %v as unable to expire out of the control, want %v; a shape it lets through is a shape the real table can be written in",
+			control.cannotExpire, excuseExpiryControlCannotExpire)
+	}
+	if !slices.Equal(control.callerLanded, excuseExpiryControlCallerLanded) {
+		t.Errorf("the reader answered %v as having a landed caller out of the control, want %v; the two verdicts cross in this control, so a reader answering one of them twice fails here",
+			control.callerLanded, excuseExpiryControlCallerLanded)
+	}
+
+	declared := packageLevelDeclarations(t, ".")
+	// the guard on the SCAN rather than on the class, because a scan that read nothing reports
+	// exactly what a scan over a clean table reports. One production declaration and one of the
+	// test binary, so both halves of the rule are known to be reachable.
+	if file := declared["errNilLeafOccupancyTest"]; file != "framing_protect.go" {
+		t.Fatalf("errNilLeafOccupancyTest is declared in %q and framing_protect.go certainly declares it, so this scan read something other than this package",
+			file)
+	}
+	if file := declared["TestNoStubShapesRemainInSource"]; !strings.HasSuffix(file, "_test.go") {
+		t.Fatalf("TestNoStubShapesRemainInSource is declared in %q, so the scan is not reading this package's test files and every seam would read as awaiting a caller",
+			file)
+	}
+
+	verdicts := readExcuses(packageDeclarationsAwaitingTheirFirstCaller, declared)
+	for _, verdict := range verdicts.cannotExpire {
+		t.Errorf("%s; this excuse can never expire, so it is not an excuse -- if the declaration will never have a production caller it belongs in test source, beside the tests that are its only callers, the way framing_protect_test.go holds the section 6.3.1 count form",
+			verdict)
+	}
+	for _, verdict := range verdicts.callerLanded {
+		t.Errorf("%s; the caller this excuse promised has arrived, so the entry is a line to delete",
+			verdict)
+	}
+	t.Logf("%d excuse(s) awaiting a first caller, each naming a production declaration that has not landed",
+		len(packageDeclarationsAwaitingTheirFirstCaller))
+}
+
+// TestTheGuardThatReadsLikeATestSeamIsProductionsOwn pins errNilLeafOccupancyTest in both
+// directions, the way rulesThisPackageExportsAndNothingApplies is pinned.
+//
+// It is the near miss the rule above is measured against. Its name ends in Test, it is answered
+// only on a path a caller reaches by passing nil, and every test-seam classifier keyed on
+// spelling would take it for one. It is not: CheckSenderLeaf returns it from production source,
+// which is the thing a construction-bypass seam can never do.
+//
+// One direction: it is declared in production, so naming it as a first caller is a LANDED
+// verdict rather than a refusal -- the rule is keyed on where a declaration lives and not on how
+// it is spelled. The other: it really is a refusal a production error result answers, so it sits
+// in the refusal roster's watched class rather than among the values nothing returns. If it ever
+// became test-only, or stopped being returned, this fails rather than quietly moving the near
+// miss into the class the rule above refuses.
+func TestTheGuardThatReadsLikeATestSeamIsProductionsOwn(t *testing.T) {
+	declared := packageLevelDeclarations(t, ".")
+	probe := map[string]awaitingFirstCaller{
+		"./aDeclarationAwaitingIt": {firstCaller: "errNilLeafOccupancyTest", why: "the near miss"},
+	}
+	verdicts := readExcuses(probe, declared)
+	if len(verdicts.cannotExpire) != 0 {
+		t.Errorf("naming errNilLeafOccupancyTest as a first caller was refused as unable to expire (%v); the rule is reading the spelling of a name rather than the file it is declared in, and this package's genuine internal guards are spelled that way",
+			verdicts.cannotExpire)
+	}
+	if !slices.Equal(verdicts.callerLanded, []string{
+		"./aDeclarationAwaitingIt: errNilLeafOccupancyTest has landed in framing_protect.go"}) {
+		t.Errorf("the landed verdict for errNilLeafOccupancyTest is %v, so the reader did not resolve it to production source at all",
+			verdicts.callerLanded)
+	}
+
+	scan := scanRefusals(refusalSourcesOfThisPackage(t))
+	if _, watched := scan.refusals["errNilLeafOccupancyTest"]; !watched {
+		t.Errorf("errNilLeafOccupancyTest is not a refusal any production error result answers; it has become the very thing the rule above refuses to excuse, and CheckSenderLeaf has lost its nil occupancy guard")
+	}
+	if slices.Contains(scan.declaredNotReturned, "errNilLeafOccupancyTest") {
+		t.Errorf("errNilLeafOccupancyTest has moved into the values nothing returns, so the guard it names is gone")
+	}
 }
 
 // declarationAddress is the key packageDeclarationsAwaitingTheirFirstCaller is written in:
@@ -5894,10 +6186,10 @@ func TestNoStubShapesRemainInSource(t *testing.T) {
 	// that no package declares, or that something now calls, is a line to delete. the
 	// address carries the package, so an unrelated declaration of the same name in the
 	// other root neither excuses this one nor keeps its excuse alive.
-	for address, why := range packageDeclarationsAwaitingTheirFirstCaller {
+	for address, excuse := range packageDeclarationsAwaitingTheirFirstCaller {
 		if !slices.Contains(stillUncalled, address) {
 			t.Errorf("%s is excused as awaiting its first caller (%s), and it is now either called or gone; delete the entry",
-				address, why)
+				address, excuse.why)
 		}
 	}
 }

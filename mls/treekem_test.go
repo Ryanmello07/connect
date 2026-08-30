@@ -3508,7 +3508,7 @@ func testUpdatePathContext(t *testing.T, treeHash []byte) []byte {
 //
 // An opening is recorded only when the plaintext is the expected secret, so a ciphertext that
 // opened to something else is a failure rather than an opening counted as one.
-func updatePathOpenings(t *testing.T, crypto CryptoProvider, members []*testMember,
+func updatePathOpenings(t *testing.T, crypto CryptoProvider, members []*testTreeMember,
 	groupContext []byte, node UpdatePathNode, secret []byte) []string {
 	t.Helper()
 	found := []string{}
@@ -4272,7 +4272,7 @@ func TestEncryptUpdatePathPairsAgainstAHandDerivedResolution(t *testing.T) {
 // context assembled some other way here would still round trip, because the same bytes would go
 // into the seal and the open.
 func createAndEncryptPath(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
-	member *testMember, exclude []LeafIndex) (*RatchetTree, *UpdatePath, *UpdatePathPlan, []byte) {
+	member *testTreeMember, exclude []LeafIndex) (*RatchetTree, *UpdatePath, *UpdatePathPlan, []byte) {
 	t.Helper()
 	senderTree := tree.Clone()
 	plan, err := senderTree.CreateUpdatePathSecrets(crypto, member.LeafIndex,

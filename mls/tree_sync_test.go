@@ -1739,7 +1739,7 @@ func TestValidateAcceptsATreeWithNoMembersAtEveryWidth(t *testing.T) {
 // parent's key. Two commits from members on the far side of the tree fill four parent positions
 // with real keys and leave three blank, so every sweep below runs over occupied leaves, occupied
 // parents and blank positions in one array.
-func updatePathUniquenessTree(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+func updatePathUniquenessTree(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 	t.Helper()
 	tree, members := newTestTree(t, crypto, 8)
 	for _, committer := range []int{7, 4} {
@@ -1770,7 +1770,7 @@ func updatePathUniquenessTree(t *testing.T, crypto CryptoProvider) (*RatchetTree
 // updatePathFrom is one member's freshly published path over a tree, with the two claims every
 // sweep below rests on checked once here rather than at each of them: the path has a middle to
 // put an offender in, and untampered it is accepted.
-func updatePathFrom(t *testing.T, crypto CryptoProvider, tree *RatchetTree, member *testMember) *UpdatePath {
+func updatePathFrom(t *testing.T, crypto CryptoProvider, tree *RatchetTree, member *testTreeMember) *UpdatePath {
 	t.Helper()
 	_, path, _, _ := createAndEncryptPath(t, crypto, tree, member, nil)
 	if len(path.Nodes) < 3 {
@@ -1796,10 +1796,10 @@ func updatePathFrom(t *testing.T, crypto CryptoProvider, tree *RatchetTree, memb
 //
 // The committer is DERIVED from that property rather than named, so it stays off the diagonal if
 // newTestTree's ordering ever changes.
-func updatePathUniquenessFixture(t *testing.T, crypto CryptoProvider) (*RatchetTree, *UpdatePath, *testMember) {
+func updatePathUniquenessFixture(t *testing.T, crypto CryptoProvider) (*RatchetTree, *UpdatePath, *testTreeMember) {
 	t.Helper()
 	tree, members := updatePathUniquenessTree(t, crypto)
-	var sender *testMember
+	var sender *testTreeMember
 	for _, member := range members {
 		if NodeIndex(uint32(member.LeafIndex)) != member.LeafIndex.NodeIndex() {
 			sender = member

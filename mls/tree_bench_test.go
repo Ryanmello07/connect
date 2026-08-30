@@ -62,7 +62,7 @@ import (
 // and the wall clock of this file is dominated by key generation nobody measures.
 type benchTreeFixture struct {
 	tree    *RatchetTree
-	members []*testMember
+	members []*testTreeMember
 	crypto  CryptoProvider
 }
 
@@ -82,7 +82,7 @@ var (
 // benchmark handed the cache directly would leave the next one measuring a tree the previous one
 // committed over. Clone copies every node, so the members' private keys still match the leaves the
 // clone publishes.
-func benchmarkTree(b *testing.B, n uint32) (*RatchetTree, []*testMember, CryptoProvider) {
+func benchmarkTree(b *testing.B, n uint32) (*RatchetTree, []*testTreeMember, CryptoProvider) {
 	b.Helper()
 	fixture := benchTreeFixtureFor(b, n)
 	return fixture.tree.Clone(), fixture.members, fixture.crypto
@@ -115,7 +115,7 @@ func benchTreeFixtureFor(t testing.TB, n uint32) *benchTreeFixture {
 // parents at twice the fixture cost, and committing from fewer would leave a band of height-one
 // parents blank -- which is the density the sweep's cost is proportional to, so it would quietly
 // halve the number this file exists to report.
-func benchDenseCommitters(members []*testMember) []LeafIndex {
+func benchDenseCommitters(members []*testTreeMember) []LeafIndex {
 	committers := []LeafIndex{}
 	for index := 0; index < len(members); index += 2 {
 		committers = append(committers, members[index].LeafIndex)
@@ -147,7 +147,7 @@ func benchDenseFixtureFor(t testing.TB, n uint32) *benchTreeFixture {
 	return cached.(*benchTreeFixture)
 }
 
-func benchmarkDenseTree(b *testing.B, n uint32) (*RatchetTree, []*testMember, CryptoProvider) {
+func benchmarkDenseTree(b *testing.B, n uint32) (*RatchetTree, []*testTreeMember, CryptoProvider) {
 	b.Helper()
 	fixture := benchDenseFixtureFor(b, n)
 	return fixture.tree.Clone(), fixture.members, fixture.crypto
@@ -157,7 +157,7 @@ func benchmarkDenseTree(b *testing.B, n uint32) (*RatchetTree, []*testMember, Cr
 // and the group context those ciphertexts were sealed under, so the merge side and the verify side
 // measure the same commit. base decides whether the commit lands on the blank-parent tree or on
 // the dense one.
-func benchmarkCommittedTree(b *testing.B, base *RatchetTree, members []*testMember,
+func benchmarkCommittedTree(b *testing.B, base *RatchetTree, members []*testTreeMember,
 	crypto CryptoProvider) (*UpdatePath, []byte) {
 	b.Helper()
 	sender := base.Clone()

@@ -346,12 +346,17 @@ var cryptoOwnedErrors = map[string]error{
 // error in a file of its own and watched the entire package stay green, and framing_errors.go
 // joined the same way -- p6 task 1 landed ten structural framing errors in a file of its own,
 // and this gate is what said so in the same run rather than a plan later.
+// errors_lifecycle.go is the sixth and it joined on p7 task 1, in the same way and for the same
+// reason: twenty five group lifecycle policy refusals landed in a file of their own, no class
+// held them, and this gate named all twenty five on the first full run of that task rather than
+// leaving a whole exported surface unjudged until a later plan wrapped one of them.
 var mlsErrorClasses = map[string]map[string]error{
 	treeErrorsFile:        treeOwnedErrors,
 	treeMathErrorsFile:    treeMathOwnedErrors,
 	keyScheduleErrorsFile: keyScheduleOwnedErrors,
 	cryptoErrorsFile:      cryptoOwnedErrors,
 	framingErrorsFile:     framingOwnedErrors,
+	lifecycleErrorsFile:   lifecycleOwnedErrors,
 }
 
 // TestCryptoOwnedErrorsIsEveryErrorItsFileDeclares is the same derivation the other three

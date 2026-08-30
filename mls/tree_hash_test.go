@@ -1298,7 +1298,7 @@ func siblingUnder(t *testing.T, parent NodeIndex, child NodeIndex) NodeIndex {
 // before the node below it can be computed, and so on down. Filling bottom up would hash
 // placeholder fields and produce a chain that is stable, self-consistent and invalid.
 func chainedTestTree(t *testing.T, crypto CryptoProvider, n uint32,
-	committer LeafIndex) (*RatchetTree, []*testMember, []NodeIndex) {
+	committer LeafIndex) (*RatchetTree, []*testTreeMember, []NodeIndex) {
 	t.Helper()
 	tree, members := newTestTree(t, crypto, n)
 	leafNode := committer.NodeIndex()
@@ -1368,7 +1368,7 @@ func nonBlankParentsOf(tree *RatchetTree) []NodeIndex {
 // installs a hand-built two-node chain: parent 1 with a child leaf 0 whose parent_hash field is
 // the parent hash of node 1 with copath child 2. Node 1 is the root of a two leaf tree, so its
 // own parent_hash field is the zero-length string.
-func buildParentHashChain(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testMember) {
+func buildParentHashChain(t *testing.T, crypto CryptoProvider) (*RatchetTree, []*testTreeMember) {
 	t.Helper()
 	tree, members := newTestTree(t, crypto, 2)
 	parent := &ParentNode{
@@ -1437,7 +1437,7 @@ func TestVerifyParentHashesRejectsATamperedChain(t *testing.T) {
 // what makes a second claimant, a stale claimant and no claimant at all, and those tests sit on
 // different leaves of different fixtures.
 func giveTheLeafACommitParentHash(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
-	members []*testMember, i LeafIndex, hash []byte) {
+	members []*testTreeMember, i LeafIndex, hash []byte) {
 	t.Helper()
 	leaf := tree.Leaf(i).Clone()
 	leaf.LeafNodeSource = LeafNodeSourceCommit
