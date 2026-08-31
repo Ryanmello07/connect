@@ -595,7 +595,12 @@ type proposalCacheBinding struct {
 // in this build, it is loud at every door, and it is derived rather than trusted --
 // TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBinding reads the class of
 // declarations that move a group between epochs off the source and holds every one of them to
-// ending the binding.
+// ending the binding -- with the group context that same body moved to, at a point after it moved
+// there. The third demand is the one a reader would not think to write down and is the one a
+// caller gets wrong for free: calling the right ender, on the right cache, on every path, and
+// handing it the epoch that just closed wedges this member exactly as the replay it replaced did,
+// with no peer involved at all. That gate's mover class is EMPTY over this package today, so it
+// demands nothing here yet and runs entirely on its own control -- said out loud there as well.
 type ProposalCache struct {
 	byRef map[string]CachedProposal
 	order []string
@@ -665,6 +670,18 @@ func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
 // would open the new epoch with the closed epoch's cache already full: every sender would arrive at
 // its quota having cached nothing, which is the wedge this whole file was rewritten to remove,
 // reintroduced through the accounting instead of through the binding.
+//
+// WHAT THE CALLER OWES IS THE CONTEXT IT MOVED TO, AND OWES IT AFTER MOVING THERE -- and this
+// signature cannot check either half. Every *GroupContext names some epoch, so a boundary that
+// hands over the one that is about to close is making a request this method cannot tell apart from
+// the right one, and `self.proposals.Rebind(self.context); self.context = staged` is exactly that
+// request: the cache is emptied and bound to the epoch the group is LEAVING. The member is then
+// wedged for the whole of the new epoch -- Store answers errProposalCacheNotRebound, Pending
+// answers nothing, Resolve answers errProposalResolvedOutOfEpoch for every reference a commit
+// names -- and because it cannot resolve that commit it never reaches the next boundary, so this
+// method never runs again. Nothing here heals it, which is why the demand is a GATE and not a
+// sentence: TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBinding reads
+// which context each boundary's rebind is handed, and on which side of the write, off the source.
 func (self *ProposalCache) Rebind(groupContext *GroupContext) error {
 	if groupContext == nil {
 		return fmt.Errorf("%w: a cache takes its epoch from the group's own context and from nothing else",
@@ -871,11 +888,27 @@ func (self *ProposalCache) checkResolveEpoch(groupContext *GroupContext) error {
 // to the epoch the group is in -- a no means a peer sent, or somebody replayed, a proposal of
 // another epoch, and the remedy is to drop it.
 //
-// The second rule is what it is because of what it is NOT: it does not compare the message
-// against itself. The binding it is measured against was taken from the caller's group context at
-// construction or at the last rebind, so a replayed proposal of a closed epoch is refused here
-// and changes nothing -- not the entries, and above all not the binding, which this method does
-// not write at all.
+// EACH OF THEM IS NECESSARY AND THAT IS MEASURED rather than argued. Delete the CheckEpoch and a
+// cache still bound to a closed epoch accepts that epoch's proposals while its caller is acting in
+// the new one, which TestCheckEpochAnswersTheBindingAndRebindMovesIt catches. Delete the clause
+// after it and a proposal stamped with another epoch is cached in this one, which the
+// (*ProposalCache).Store row's probe in epoch_advance_test.go catches under errProposalCacheEpoch.
+// Neither refusal is reachable through the other.
+//
+// WHAT IS NOT INDEPENDENT IS THE VALUE THE SECOND RULE IS MEASURED AGAINST, and saying so is worth
+// more than a sentence claiming otherwise. By the time it runs, CheckEpoch has established that
+// this cache's binding and the caller's group context are the same group and the same epoch -- so
+// bindingHolds(message) and a direct comparison of the message against groupContext are the SAME
+// TEST, and rewriting the clause as the second spelling leaves the whole of ./mls/... and
+// ./message/... green. That was measured, and it is not a hole: the two are equivalent, and a
+// mutation between equivalent programs is one no test can be asked to catch. The binding is the
+// subject written here because it is what the refusal prints and what the sentinel names, not
+// because the two could ever disagree.
+//
+// What the second rule does NOT do is compare the message against itself. The pair it is measured
+// against was taken from the caller's group context at construction or at the last rebind, so a
+// replayed proposal of a closed epoch is refused here and changes nothing -- not the entries, and
+// above all not the binding, which this method does not write at all.
 //
 // The sender rule is this cache's own and is not ValSem112. A CachedProposal carries a LeafIndex,
 // and a sender that is not a member has none: Sender{SenderType: SenderTypeNewMemberProposal}
@@ -947,16 +980,18 @@ func (self *ProposalCache) Store(crypto CryptoProvider, groupContext *GroupConte
 		return nil, fmt.Errorf("%w: %s holds %d octets and this proposal's %d would carry it past the %d one epoch's cache may hold",
 			errProposalCacheOctets, self.bindingName(), self.octets, octets, maxCachedProposalOctets)
 	}
-	// the zero valued cache is usable, which is Go's convention for a container and is what
-	// lets the nil provider gate drive this method on a receiver it did not have to build. A
-	// nil map reads fine and only the inserts below need one. It is not a way in: a zero
-	// valued cache is bound to nothing, and the two rules above have already refused.
-	if self.byRef == nil {
-		self.byRef = map[string]CachedProposal{}
-	}
-	if self.perSender == nil {
-		self.perSender = map[proposalCacheQuota]int{}
-	}
+	// NO LAZY MAP HERE, and its absence is the thing to read. A store reaches this line only
+	// past CheckEpoch, which refuses every cache whose binding is nil, and the only two
+	// declarations that write a binding -- NewProposalCache and Rebind -- build both maps in
+	// the same statement list as the binding. So a BOUND cache always has somewhere to store,
+	// and a guard for the nil case is a branch nothing can take.
+	//
+	// It stood here anyway, and that was measured rather than argued: deleting
+	// `byRef: map[string]CachedProposal{}` from NewProposalCache's composite literal left the
+	// whole of ./mls/... and ./message/... green, because the unreachable guard was quietly
+	// doing the constructor's job. Two initialisations, each covering for the other, are two
+	// lines neither of which any test can observe. One initialisation, at the two places that
+	// decide which epoch this cache belongs to, is a line every store observes.
 	// the order, the octets and the sender's quota move together and only for an entry that is
 	// new, because they describe the same set: an entry counted twice is a ceiling reached by
 	// re-delivering one message, and an entry counted never is a ceiling nothing reaches.

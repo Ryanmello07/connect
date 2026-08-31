@@ -40,23 +40,37 @@
 //     ProposalCache, so a rule that resolved the ender by TYPE accepted it; the cache the epoch
 //     actually bound went on holding the closed epoch. Latent while Group holds one cache and live
 //     the moment p7 task 19 adds a staged or past-epoch one, which is what task 19 is for.
+//   - the rebind handed the context that is about to CLOSE, ahead of the write that replaces it.
+//     Every path runs it, it is the right cache, and it binds the cache to the epoch the group is
+//     leaving. The member is then wedged for the whole of the new epoch: Store answers
+//     errProposalCacheNotRebound, Pending answers nothing, and Resolve answers
+//     errProposalResolvedOutOfEpoch for every reference a commit names. Because it cannot resolve
+//     that commit it never reaches the next boundary, so the next Rebind never runs, and nothing
+//     in this package heals it. That is the same permanent lockout the binding was rewritten to
+//     remove, reached from the caller's side instead of from a peer's -- not peer triggerable,
+//     which is exactly what a gate of this kind is for.
 //
-// So the rule below is stated over PATHS and over IDENTITY. Every path that leaves a declaration
-// having made the write must have ended the binding of every cache the moved value holds -- the
-// caches read off the value's own struct rather than named, so a second cache is a new obligation
-// rather than a new way to pass. epochWalk is the reading: an abstract walk of the body carrying
-// "some path here has moved a group" as a MAY and "every path here has ended this cache" as a
-// MUST, joined at every branch and checked at every exit. It is deliberately conservative -- a
-// clear inside a loop, a goroutine, a function literal or a jump is one this rule refuses to call
-// guaranteed -- because the direction a gate is allowed to be wrong in is the loud one.
+// So the rule below is stated over PATHS, over IDENTITY, and over the ARGUMENT. Every path that
+// leaves a declaration having made the write must have ended the binding of every cache the moved
+// value holds -- the caches read off the value's own struct rather than named, so a second cache
+// is a new obligation rather than a new way to pass -- and every ending it is credited with must
+// have been handed the group context THIS BODY MOVED, at a point where the move had already
+// happened. epochWalk is the reading: an abstract walk of the body carrying "some path here has
+// moved a group, and these are the expressions that now name it" as a MAY and "every path here has
+// ended this cache" as a MUST, joined at every branch and checked at every exit. It is
+// deliberately conservative -- a clear inside a loop, a goroutine, a function literal or a jump is
+// one this rule refuses to call guaranteed, and so is one handed a context it cannot name --
+// because the direction a gate is allowed to be wrong in is the loud one.
 //
 // WHAT IS TRUE TODAY, said out loud rather than hidden by a green run. Not one declaration of
 // either scanned root is classified as moving a group between epochs: the only member of the
 // class is the group context DECODER, which writes an epoch it read out of the caller's own
-// octets. So the second half of this gate -- every mover ends the binding -- runs on the control
-// package and on nothing else, and the control is therefore not decoration. It is the whole of the
-// evidence that the demand exists at all, and the commit that lands MergePendingCommit is the one
-// that will be met by it. Every arm of every matcher below has a control member that changes its
+// octets. So the second half of this gate -- every mover ends the binding, with the context it
+// moved, after it moved it -- runs on the control package and on nothing else, and the control is
+// therefore not decoration. It is the whole of the evidence that the demand exists at all, and the
+// commit that lands MergePendingCommit is the one that will be met by it. Adding the argument half
+// did not change that: the mover class over the real source still has exactly one member and it is
+// still classified as moving no group, so this gate demands nothing of this package today. Every arm of every matcher below has a control member that changes its
 // answer when the arm is removed; an arm with no such member is prose, which is rule 5 one level
 // down and is the defect this file was last corrected for.
 package mls
@@ -106,19 +120,24 @@ var epochBoundFields = []string{"GroupId", "Epoch"}
 var epochMoverRoots = forbiddenScanRoots
 
 // epochMoverFinding is one declaration's membership: where the write is, how it is written, the
-// ender calls the rule FOUND over the moved value's own caches, the ones it accepts as running on
-// every path out, and the paths that leave with a cache still bound.
+// ender calls the rule FOUND over the moved value's own caches, the ones handed a context this
+// body had not moved, the ones it accepts as running on every path out, and the paths that leave
+// with a cache still bound.
 //
-// finds and ends are carried apart because a declaration that fails this gate fails in two very
-// different ways, and a reader who cannot tell them apart cannot act. "No ender was found at all"
-// is a boundary nobody wrote a rebind for; "an ender was found and no path is guaranteed to reach
-// it" is a rebind written in the wrong place, which is a two line fix and is the shape p7 has.
-// skipped names the paths, so the report is a location rather than a verdict.
+// finds, wrong and ends are carried apart because a declaration that fails this gate fails in
+// three very different ways, and a reader who cannot tell them apart cannot act. "No ender was
+// found at all" is a boundary nobody wrote a rebind for; "an ender was found and no path is
+// guaranteed to reach it" is a rebind written in the wrong place, which is a two line fix and is
+// the shape p7 has; and "an ender was found and handed something else" is a rebind written with
+// the wrong argument, which answers every other question this gate asks correctly and leaves the
+// member wedged anyway. skipped names the paths, so the report is a location rather than a
+// verdict.
 type epochMoverFinding struct {
 	where   string
 	how     string
 	ends    string
 	finds   string
+	wrong   string
 	skipped string
 }
 
@@ -248,10 +267,87 @@ func epochCachesHeldBy(checked checkedBodies, bases map[types.Object]bool, cache
 	return held
 }
 
+// epochGroupMove is what one statement moved: how it is written, the value that HOLDS the storage
+// written -- which is the value whose caches the boundary owes a rebind -- and the expressions
+// that NAME the moved group context once the write has landed.
+//
+// The names are what the argument half of the rule is checked against, and there are two of them
+// rather than one because a boundary writes `self.context = staged` and may then hand the ender
+// either side of that assignment: `self.context` is the storage it wrote and `staged` is the value
+// it wrote, and the instant the write lands the two are one context. Both are accepted, everything
+// else is refused, and `self.context` handed BEFORE the write is refused by the WALK rather than
+// here -- because that is a question about paths and not about spelling.
+type epochGroupMove struct {
+	how   string
+	base  types.Object
+	names [][]types.Object
+}
+
+// epochDenotationOf answers the chain of objects an expression names a group context through:
+// `self.context` is [self, context] and `staged` is [staged].
+//
+// Over the type checker's OBJECTS and not over the rendered text, for the reason every other
+// derivation in this file is over them: two declarations may both spell a field `context`, and a
+// rule comparing spellings would read one group's context as another's --
+// (*Group).mergeAndClearWithAnotherGroupsContext is the control member that says so, and its
+// argument is spelled `other.context` precisely so a text comparison would have to work to tell it
+// apart from `self.context`.
+//
+// A dereference and an address-of name the same storage as their operand, so both are followed:
+// `*self.slot` is the context `self.slot` points at, which is what
+// (*Group).overwriteThroughThePointer writes and what its clear is handed. Anything else -- a
+// call's result, an index, a conversion -- answers nil and is REFUSED rather than guessed at,
+// because an ender handed a context this rule cannot name is one a reader cannot check either.
+// (*Group).mergeAndClearWithAContextItBuiltAfterwards is that shape: a rebind to a context the
+// declaration constructed after the move, which is not the epoch the group is now in.
+func epochDenotationOf(checked checkedBodies, expr ast.Expr) []types.Object {
+	if expr == nil {
+		return nil
+	}
+	switch node := extensionTypeSelectionUnparenthesised(expr).(type) {
+	case *ast.StarExpr:
+		return epochDenotationOf(checked, node.X)
+	case *ast.UnaryExpr:
+		if node.Op != token.AND {
+			return nil
+		}
+		return epochDenotationOf(checked, node.X)
+	case *ast.SelectorExpr:
+		outer := epochDenotationOf(checked, node.X)
+		field := checked.info.Uses[node.Sel]
+		if outer == nil || field == nil {
+			return nil
+		}
+		return append(outer, field)
+	case *ast.Ident:
+		if object := checked.info.Uses[node]; object != nil {
+			return []types.Object{object}
+		}
+	}
+	return nil
+}
+
+// epochNamesUnion is what a branch does to the contexts two readings of one body moved.
+//
+// A union, because moved is a MAY: a rebind written after an if that moved on one arm is checked
+// against everything either arm could have left the live context named as, and the exit check is
+// where a path that moved and did not rebind is caught.
+func epochNamesUnion(left [][]types.Object, right [][]types.Object) [][]types.Object {
+	joined := append([][]types.Object{}, left...)
+	for _, name := range right {
+		if !slices.ContainsFunc(joined, func(held []types.Object) bool { return slices.Equal(held, name) }) {
+			joined = append(joined, name)
+		}
+	}
+	return joined
+}
+
 // epochGroupMoveIn answers whether one statement moves a group between epochs, how it is written,
-// and the VALUE it wrote through -- which is the value whose caches the boundary owes a rebind.
-func epochGroupMoveIn(checked checkedBodies, node ast.Node) (string, types.Object, bool) {
-	for _, target := range epochAssignedTargets(node) {
+// the VALUE it wrote through -- which is the value whose caches the boundary owes a rebind -- and
+// what the moved context is now called.
+func epochGroupMoveIn(checked checkedBodies, node ast.Node) (epochGroupMove, bool) {
+	assignment, _ := node.(*ast.AssignStmt)
+	for at, target := range epochAssignedTargets(node) {
 		selector := epochWriteTarget(target)
 		if selector == nil {
 			// a bare identifier: a local or a parameter, which is storage of this
@@ -263,13 +359,31 @@ func epochGroupMoveIn(checked checkedBodies, node ast.Node) (string, types.Objec
 		}
 		// replacing the group context a value HOLDS, or moving one of the bound fields of a
 		// group context in place
-		if extensionTypeSelectionNamedAs(checked.info.TypeOf(selector), epochGroupContextTypeName) ||
-			(slices.Contains(epochBoundFields, selector.Sel.Name) &&
-				extensionTypeSelectionNamedAs(checked.info.TypeOf(selector.X), epochGroupContextTypeName)) {
-			return checked.render(node), epochRootObject(checked, selector.X), true
+		var context ast.Expr
+		switch {
+		case extensionTypeSelectionNamedAs(checked.info.TypeOf(selector), epochGroupContextTypeName):
+			context = selector
+		case slices.Contains(epochBoundFields, selector.Sel.Name) &&
+			extensionTypeSelectionNamedAs(checked.info.TypeOf(selector.X), epochGroupContextTypeName):
+			context = selector.X
+		default:
+			continue
 		}
+		move := epochGroupMove{how: checked.render(node), base: epochRootObject(checked, selector.X)}
+		if named := epochDenotationOf(checked, context); named != nil {
+			move.names = append(move.names, named)
+		}
+		// and the value ASSIGNED, which names the same context the instant the write lands and
+		// is what a boundary rebinding from its own staged context hands the ender
+		if assignment != nil && len(assignment.Rhs) == len(assignment.Lhs) &&
+			extensionTypeSelectionNamedAs(checked.info.TypeOf(assignment.Rhs[at]), epochGroupContextTypeName) {
+			if named := epochDenotationOf(checked, assignment.Rhs[at]); named != nil {
+				move.names = epochNamesUnion(move.names, [][]types.Object{named})
+			}
+		}
+		return move, true
 	}
-	return "", nil, false
+	return epochGroupMove{}, false
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +399,11 @@ func epochGroupMoveIn(checked checkedBodies, node ast.Node) (string, types.Objec
 type epochPath struct {
 	live  bool
 	moved bool
+	// the expressions that name a group context this path has already moved, which is what an
+	// ender's argument is measured against. It is empty until the first write, and that is the
+	// whole of the ORDER half: a rebind handed the live context ahead of the write is handed it
+	// at a point where this path does not name it yet, so no path counts that rebind.
+	names [][]types.Object
 	ended map[types.Object]bool
 }
 
@@ -300,7 +419,8 @@ func epochPathJoin(left epochPath, right epochPath) epochPath {
 	if !right.live {
 		return left
 	}
-	joined := epochPath{live: true, moved: left.moved || right.moved, ended: map[types.Object]bool{}}
+	joined := epochPath{live: true, moved: left.moved || right.moved,
+		names: epochNamesUnion(left.names, right.names), ended: map[types.Object]bool{}}
 	for object := range left.ended {
 		if right.ended[object] {
 			joined.ended[object] = true
@@ -315,7 +435,25 @@ func (self epochPath) with(object types.Object) epochPath {
 	ended := map[types.Object]bool{}
 	maps.Copy(ended, self.ended)
 	ended[object] = true
-	return epochPath{live: self.live, moved: self.moved, ended: ended}
+	return epochPath{live: self.live, moved: self.moved, names: self.names, ended: ended}
+}
+
+// moving answers this path having moved one more group context, over a copy for with's reason.
+func (self epochPath) moving(move epochGroupMove) epochPath {
+	return epochPath{live: self.live, moved: true, names: epochNamesUnion(self.names, move.names),
+		ended: self.ended}
+}
+
+// holds answers whether one denotation names a context this path has already moved.
+//
+// An empty denotation is never held, so an argument this rule could not read -- a call's result,
+// an index, or an ender that declares no context at all -- is refused rather than accepted by
+// default. That is the same direction every other reading here is wrong in.
+func (self epochPath) holds(named []types.Object) bool {
+	if len(named) == 0 {
+		return false
+	}
+	return slices.ContainsFunc(self.names, func(held []types.Object) bool { return slices.Equal(held, named) })
 }
 
 // epochWalk is one declaration's reading: what it moved, which caches it owes, what it was found
@@ -326,38 +464,96 @@ type epochWalk struct {
 	bases    map[types.Object]bool
 	required map[types.Object]bool
 	saw      map[types.Object]string
-	skipped  []string
+	// the ender calls found on the right cache and handed a context this declaration had not
+	// moved by then, which is a different report from "no rebind" and from "no path reaches it"
+	wrong   []string
+	skipped []string
 	// the states that left the innermost loop or switch, so a break is a path out rather than
 	// a statement that falls through into whatever was written under it
 	breaks []epochPath
 }
 
-// enderOf answers which cache field a call ends the binding of, or nil.
+// enderOf answers which cache field a call ends the binding of, the group context it was handed,
+// and whether it is an ender call on one of this declaration's own caches at all.
 //
-// Three questions, and the gate that asked only the first two accepted a clear of the wrong cache:
-// the method is one the classification table calls a binding ender; the receiver is a FIELD whose
-// object is one of the caches the moved value holds; and the value that field is reached through
-// is one this declaration actually wrote a group context into. A cache reached through anything
-// but a field of the moved value -- a local, a parameter, a call's result -- is refused rather
-// than followed, which is the conservative direction: it fails, loudly, and the fix is to write the
-// rebind where the reader can see what it rebinds.
-func (self *epochWalk) enderOf(call *ast.CallExpr) types.Object {
+// Four questions now, and the gate that asked only the first three accepted a rebind to the epoch
+// that had just closed: the method is one the classification table calls a binding ender; the
+// receiver is a FIELD whose object is one of the caches the moved value holds; the value that
+// field is reached through is one this declaration actually wrote a group context into; and the
+// argument carrying the new binding is found in the ender's OWN SIGNATURE. A cache reached through
+// anything but a field of the moved value -- a local, a parameter, a call's result -- is refused
+// rather than followed, which is the conservative direction: it fails, loudly, and the fix is to
+// write the rebind where the reader can see what it rebinds.
+//
+// WHICH context it was handed is the caller's question and not this one's, because the answer
+// depends on the path: the same expression names the closing context before the write and the new
+// one after it, and only the walk knows which side of the write this call is on.
+func (self *epochWalk) enderOf(call *ast.CallExpr) (types.Object, ast.Expr, bool) {
 	method, isMethod := extensionTypeSelectionUnparenthesised(call.Fun).(*ast.SelectorExpr)
 	if !isMethod || !slices.Contains(self.enders, method.Sel.Name) {
-		return nil
+		return nil, nil, false
 	}
 	held, isField := extensionTypeSelectionUnparenthesised(method.X).(*ast.SelectorExpr)
 	if !isField {
-		return nil
+		return nil, nil, false
 	}
 	field := self.checked.info.Uses[held.Sel]
 	if field == nil || !self.required[field] {
-		return nil
+		return nil, nil, false
 	}
 	if root := epochRootObject(self.checked, held.X); root == nil || !self.bases[root] {
+		return nil, nil, false
+	}
+	return field, epochEnderArgument(self.checked, call), true
+}
+
+// epochEnderArgument answers the group context an ender call was handed, found by TYPE in the
+// ender's own signature.
+//
+// Not argument zero. A rule stated over a POSITION is one a parameter added in front of it walks
+// straight through, and the ender names are already a parameter of this matcher rather than a
+// constant here -- so the signature is the only thing that can say which argument carries the
+// binding. TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere holds the real ender to
+// declaring exactly one, so the two ends of this agree.
+//
+// An ender declaring NONE answers nil, which the caller reads as an argument naming nothing and
+// refuses. That is the loud direction and it has a control member: (*ProposalCache).Release ends a
+// binding and takes no context, and (*Group).mergeAndReleaseWithoutAContext is refused because of
+// it. Two of them answers nil for the same reason -- an ender taking two contexts is one nothing
+// here can say the binding came from -- and (*ProposalCache).ClearBetween is that member.
+// (*ProposalCache).ClearAt is the third: it takes a reason first and the context second, so a rule
+// reading argument zero answers a string literal there and refuses a boundary that is correct.
+func epochEnderArgument(checked checkedBodies, call *ast.CallExpr) ast.Expr {
+	signature, isSignature := checked.info.TypeOf(call.Fun).(*types.Signature)
+	if !isSignature {
 		return nil
 	}
-	return field
+	params := signature.Params()
+	found := -1
+	for at := 0; at < params.Len(); at++ {
+		if !extensionTypeSelectionNamedAs(params.At(at).Type(), epochGroupContextTypeName) {
+			continue
+		}
+		if found != -1 {
+			return nil
+		}
+		found = at
+	}
+	// the bound is a slice guard and not a rule: a type checked call to a non variadic
+	// parameter always supplies it, and a variadic one never resolves to a context at all
+	if found == -1 || found >= len(call.Args) {
+		return nil
+	}
+	return call.Args[found]
+}
+
+// epochArgumentText names what an ender was handed, for a report a reader can act on rather than
+// a verdict.
+func epochArgumentText(checked checkedBodies, argument ast.Expr) string {
+	if argument == nil {
+		return "no group context at all"
+	}
+	return checked.render(argument)
 }
 
 // exit records one path leaving the declaration, and is where the whole rule is spent.
@@ -397,13 +593,25 @@ func (self *epochWalk) effects(node ast.Node, state epochPath, counts bool) epoc
 		if !isCall {
 			return true
 		}
-		object := self.enderOf(call)
-		if object == nil {
+		object, argument, isEnder := self.enderOf(call)
+		if !isEnder {
 			return true
 		}
 		// recorded whether or not this path counts it, so a report can say "the rebind is
 		// there and no path reaches it" rather than only "no rebind"
 		self.saw[object] = self.checked.render(call)
+		// and the argument is read against what THIS PATH has moved SO FAR, which is the
+		// order half and the argument half asked as one question. Ahead of the write the
+		// path names no context, so a rebind handed the closing one is a rebind nothing
+		// counts; after it the only names that answer are the storage written and the value
+		// written into it.
+		if !state.holds(epochDenotationOf(self.checked, argument)) {
+			self.wrong = append(self.wrong,
+				fmt.Sprintf("%s at %s is handed %s, which is not a group context this declaration had moved by then",
+					self.checked.render(call), self.checked.where(call),
+					epochArgumentText(self.checked, argument)))
+			return true
+		}
 		if counts {
 			state = state.with(object)
 		}
@@ -508,16 +716,19 @@ func (self *epochWalk) statement(node ast.Stmt, state epochPath) epochPath {
 	default:
 		// an assignment, an increment, a send, a declaration, an expression -- and a DEFER:
 		// a statement holding no statement of its own, so its calls are read once and here.
-		// The defer is among them deliberately rather than by omission. Its call runs at the
-		// exit and not where it is written, and under this reading the two coincide, because
-		// every exit a deferred rebind covers is an exit this walk reaches after passing the
-		// defer. It gets no arm of its own for the reason every other arm has a control
-		// member: an arm whose answer never differs from the one beneath it is a sentence
-		// nothing can measure, which is the defect one level down that this file was last
-		// corrected for.
+		// The defer is among them deliberately, and the argument half is what makes that a
+		// measurement rather than a convenience. A deferred call RUNS at the exit, but its
+		// arguments are evaluated where it is WRITTEN -- so a rebind deferred ahead of the
+		// move is handed the epoch that is about to close no matter that the call itself
+		// happens afterwards. Reading it here is therefore the CORRECT place, and the two
+		// control members that separate the readings are (*Group).mergeAndClearInADefer,
+		// registered after the move and accepted, and
+		// (*Group).mergeAndClearInADeferRegisteredBeforeTheMove, which is not and is refused.
+		// Before the argument half existed this arm's answer never differed from the one
+		// beneath it, which is what that paragraph used to admit.
 		state = self.effects(node, state, true)
-		if _, _, moves := epochGroupMoveIn(self.checked, node); moves {
-			state.moved = true
+		if move, moves := epochGroupMoveIn(self.checked, node); moves {
+			state = state.moving(move)
 		}
 		return state
 	}
@@ -635,14 +846,14 @@ func epochMoversIn(checked checkedBodies, cacheType string, enders []string) epo
 					}
 					scan.writes++
 				}
-				how, base, moved := epochGroupMoveIn(checked, node)
+				move, moved := epochGroupMoveIn(checked, node)
 				if !moved {
 					return true
 				}
 				moves = true
-				finding.how = how
-				if base != nil {
-					bases[base] = true
+				finding.how = move.how
+				if move.base != nil {
+					bases[move.base] = true
 				}
 				return true
 			})
@@ -660,6 +871,7 @@ func epochMoversIn(checked checkedBodies, cacheType string, enders []string) epo
 				epochPath{live: true, ended: map[types.Object]bool{}}), function.Body)
 			finding.where = checked.where(function)
 			finding.finds = walk.rendered()
+			finding.wrong = strings.Join(walk.wrong, "; ")
 			finding.skipped = strings.Join(walk.skipped, "; ")
 			if walk.covered() {
 				finding.ends = finding.finds
@@ -686,9 +898,15 @@ func epochMoversIn(checked checkedBodies, cacheType string, enders []string) epo
 // them: an unreachable clear, a clear past a return, a clear on one branch, in a loop, in a range,
 // in a switch with no default, in a type switch, in one select clause, past a break, past a jump,
 // in a goroutine and inside a function literal are all clears this rule refuses -- and a clear on
-// both branches, in every clause of a switch, under a label, and in a defer are all clears it
-// accepts. The identity arms are the rest: a clear of another type, of a field of another type, of
-// another value's cache, and of one of the two caches a group holds.
+// both branches, in every clause of a switch, under a label, and in a defer registered after the
+// move are all clears it accepts. The identity arms are the rest: a clear of another type, of a
+// field of another type, of another value's cache, and of one of the two caches a group holds. The
+// ARGUMENT arms are the newest: a clear handed the context that is about to close, one handed
+// another group's context, one handed a context the declaration built after the move, one handed
+// nothing at all, one naming two contexts, one whose ender takes its context second, and a defer
+// registered before the move -- against a clear handed the storage the write landed in, one handed
+// the value that was written into it, one handed the operand of a dereference and one the operand
+// of an address-of, which are the spellings of the same context and are all accepted.
 const epochMoverControl = `package control
 
 type GroupContext struct {
@@ -702,9 +920,32 @@ type ProposalCache struct {
 	epoch uint64
 }
 
-func (self *ProposalCache) Clear() {
+// the ender, and it takes the context it is being bound to. That parameter is the whole of what
+// makes the argument half measurable: a control whose ender took nothing could not tell a matcher
+// that reads the argument from one that does not.
+func (self *ProposalCache) Clear(context *GroupContext) {
 	self.byRef = map[string]int{}
-	self.epoch = 0
+	self.epoch = context.Epoch
+}
+
+// a SECOND classified ender, taking no group context at all, so a matcher that assumed every ender
+// carries one has something here to be wrong about
+func (self *ProposalCache) Release() {
+	self.byRef = map[string]int{}
+}
+
+// a THIRD, with the context somewhere other than first, because the argument half is stated over
+// the SIGNATURE and a rule stated over argument zero would be right everywhere else by accident
+func (self *ProposalCache) ClearAt(reason string, context *GroupContext) {
+	self.byRef = map[string]int{}
+	self.epoch = context.Epoch
+}
+
+// and a FOURTH taking two of them, which is an ender nothing can say the binding came from even
+// when both arguments are the context the caller moved to
+func (self *ProposalCache) ClearBetween(from *GroupContext, to *GroupContext) {
+	self.byRef = map[string]int{}
+	self.epoch = to.Epoch
 }
 
 func (self *ProposalCache) Store(key string, at uint64) {
@@ -733,10 +974,66 @@ func (self *Group) mergeWithoutClearing(staged *GroupContext) {
 	self.name = "merged"
 }
 
-// the same with the clear, which is the shape this gate accepts
+// the same with the clear, handed the storage the write landed in, which is the shape this gate
+// accepts
 func (self *Group) mergeAndClear(staged *GroupContext) {
 	self.context = staged
-	self.proposals.Clear()
+	self.proposals.Clear(self.context)
+}
+
+// and handed the value that was written instead, which names the same context the instant the
+// assignment lands and is what a boundary rebinding from its own staged context writes
+func (self *Group) mergeAndClearWithTheStagedContext(staged *GroupContext) {
+	self.context = staged
+	self.proposals.Clear(staged)
+}
+
+// the defect the argument half exists for: every path runs the clear, it is the right cache, and
+// the context it is handed is the one that is about to CLOSE
+func (self *Group) clearWithTheClosingContextThenMerge(staged *GroupContext) {
+	self.proposals.Clear(self.context)
+	self.context = staged
+}
+
+// the same defect wearing another group's context, which is neither the epoch that closed nor the
+// one this group moved to, and which a rule comparing rendered text would have to work to tell
+// apart from self.context
+func (self *Group) mergeAndClearWithAnotherGroupsContext(staged *GroupContext, other *Group) {
+	self.context = staged
+	self.proposals.Clear(other.context)
+}
+
+// a context this declaration built AFTER the move: an expression the rule cannot name, and one it
+// refuses rather than guesses at
+func (self *Group) mergeAndClearWithAContextItBuiltAfterwards(staged *GroupContext) {
+	self.context = staged
+	self.proposals.Clear(self.stageTheNextContext())
+}
+
+// an ender that ends the binding and names no epoch to take it to, so there is no argument to read
+func (self *Group) mergeAndReleaseWithoutAContext(staged *GroupContext) {
+	self.context = staged
+	self.proposals.Release()
+}
+
+// an ender whose context is not its first argument, handed the storage the write landed in
+func (self *Group) mergeAndClearAtWithTheContext(staged *GroupContext) {
+	self.context = staged
+	self.proposals.ClearAt("boundary", self.context)
+}
+
+// an ender naming two contexts, both of them the right one, which still leaves nothing to say
+// which of them the binding was taken from
+func (self *Group) mergeAndClearBetweenTwoContexts(staged *GroupContext) {
+	self.context = staged
+	self.proposals.ClearBetween(self.context, self.context)
+}
+
+// a context assembled as a VALUE and installed by address, with the clear handed the same value:
+// an address-of names its operand for the reason a dereference does
+func (self *Group) mergeByAddressAndClearWithTheValue(next GroupContext) {
+	self.context = &next
+	self.proposals.Clear(&next)
 }
 
 // the cheapest advance there is, and it is not an assignment at all
@@ -748,7 +1045,7 @@ func (self *Group) bumpTheEpochInPlace() {
 // write back to it is a read of the selector chain rather than of the field
 func (self *Group) bumpTheEpochAndClear() {
 	self.context.Epoch++
-	self.proposals.Clear()
+	self.proposals.Clear(self.context)
 }
 
 // rewriting the group id in place, which moves the group as surely as the epoch does
@@ -760,7 +1057,14 @@ func (self *Group) rebrand(id []byte) {
 // is a write through a dereference and is a write nothing else here makes
 func (self *Group) overwriteThroughThePointer(staged *GroupContext) {
 	*self.slot = *staged
-	self.proposals.Clear()
+	self.proposals.Clear(self.slot)
+}
+
+// the same write with the clear handed the value that was copied IN rather than the storage it was
+// copied into, which is the one member the dereference arm carries: *staged names staged
+func (self *Group) overwriteThroughThePointerAndClearWithTheSource(staged *GroupContext) {
+	*self.slot = *staged
+	self.proposals.Clear(staged)
 }
 
 // the decoder shape: an epoch written into a context out of the caller's own input
@@ -799,24 +1103,25 @@ func (self *Group) mergeAndClearTheWrongField(staged *GroupContext) {
 }
 
 // the right FIELD of the wrong VALUE: another group's cache is not this one's, and an ender
-// resolved by type alone cannot tell the two apart
+// resolved by type alone cannot tell the two apart. Handed the right context, so identity is the
+// only thing left for it to fail on
 func (self *Group) mergeAndClearAnotherGroupsCache(staged *GroupContext, other *Group) {
 	self.context = staged
-	other.proposals.Clear()
+	other.proposals.Clear(self.context)
 }
 
 // a plain function moving a group it was handed: an epoch boundary is not always a method, and
 // what owes the rebind is the value the write was made through
 func mergeIntoTheGroup(group *Group, staged *GroupContext) {
 	group.context = staged
-	group.proposals.Clear()
+	group.proposals.Clear(group.context)
 }
 
 // the clear is written and no path runs it
 func (self *Group) mergeAndClearUnreachably(staged *GroupContext) {
 	self.context = staged
 	if false {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -827,14 +1132,14 @@ func (self *Group) mergeReturningBeforeTheClear(staged *GroupContext) bool {
 	if self.name == "" {
 		return false
 	}
-	self.proposals.Clear()
+	self.proposals.Clear(self.context)
 	return true
 }
 
 // and in the order p7 wrote them, which is the accepted one
 func (self *Group) mergeAndClearBeforeTheReturn(staged *GroupContext) bool {
 	self.context = staged
-	self.proposals.Clear()
+	self.proposals.Clear(self.context)
 	if self.name == "" {
 		return false
 	}
@@ -845,7 +1150,7 @@ func (self *Group) mergeAndClearBeforeTheReturn(staged *GroupContext) bool {
 func (self *Group) mergeAndClearOnOnePath(staged *GroupContext) {
 	self.context = staged
 	if self.name == "" {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -853,19 +1158,30 @@ func (self *Group) mergeAndClearOnOnePath(staged *GroupContext) {
 func (self *Group) mergeAndClearOnBothPaths(staged *GroupContext) {
 	self.context = staged
 	if self.name == "" {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	} else {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
-// a deferred clear runs on every exit taken after it is registered
+// a deferred clear runs on every exit taken after it is registered, and its ARGUMENT is evaluated
+// where the defer is WRITTEN -- so this one is registered after the move and is handed the context
+// the group is now in
 func (self *Group) mergeAndClearInADefer(staged *GroupContext) bool {
-	defer self.proposals.Clear()
 	self.context = staged
+	defer self.proposals.Clear(self.context)
 	if self.name == "" {
 		return false
 	}
+	return true
+}
+
+// and the same defer registered BEFORE the move, which is what a rule reading only where a
+// deferred call RUNS would accept: the call happens at the exit, and the context it was handed was
+// read at the defer and is the one that closed
+func (self *Group) mergeAndClearInADeferRegisteredBeforeTheMove(staged *GroupContext) bool {
+	defer self.proposals.Clear(self.context)
+	self.context = staged
 	return true
 }
 
@@ -873,7 +1189,7 @@ func (self *Group) mergeAndClearInADefer(staged *GroupContext) bool {
 func (self *Group) mergeAndClearInALoop(staged *GroupContext, times int) {
 	self.context = staged
 	for i := 0; i < times; i++ {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -881,7 +1197,7 @@ func (self *Group) mergeAndClearInALoop(staged *GroupContext, times int) {
 func (self *Group) mergeAndClearOverARange(staged *GroupContext, names []string) {
 	self.context = staged
 	for range names {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -890,7 +1206,7 @@ func (self *Group) mergeAndClearInASwitch(staged *GroupContext) {
 	self.context = staged
 	switch self.name {
 	case "merged":
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -899,7 +1215,7 @@ func (self *Group) mergeAndClearInATypeSwitch(staged *GroupContext, held any) {
 	self.context = staged
 	switch held.(type) {
 	case string:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -908,9 +1224,9 @@ func (self *Group) mergeAndClearInEverySwitchClause(staged *GroupContext) {
 	self.context = staged
 	switch self.name {
 	case "merged":
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	default:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -920,10 +1236,10 @@ func (self *Group) mergeAndClearInALabelledSwitch(staged *GroupContext) {
 pick:
 	switch self.name {
 	case "merged":
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 		break pick
 	default:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -933,7 +1249,7 @@ func (self *Group) mergeAndClearInALabelledLoop(staged *GroupContext, times int)
 	self.context = staged
 spin:
 	for i := 0; i < times; i++ {
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 		continue spin
 	}
 }
@@ -944,9 +1260,9 @@ func (self *Group) mergeAndClearInEverySelectClause(staged *GroupContext, ready 
 	self.context = staged
 	select {
 	case <-ready:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	case <-other:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -958,7 +1274,7 @@ func (self *Group) refuseThenMergeAndClear(staged *GroupContext) bool {
 		return false
 	}
 	self.context = staged
-	self.proposals.Clear()
+	self.proposals.Clear(self.context)
 	return true
 }
 
@@ -967,7 +1283,7 @@ func (self *Group) mergeAndClearInOneSelectClause(staged *GroupContext, ready ch
 	self.context = staged
 	select {
 	case <-ready:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	default:
 	}
 }
@@ -981,9 +1297,9 @@ func (self *Group) mergeAndBreakOutBeforeTheClear(staged *GroupContext) {
 		if self.context == nil {
 			break
 		}
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	default:
-		self.proposals.Clear()
+		self.proposals.Clear(self.context)
 	}
 }
 
@@ -991,7 +1307,7 @@ func (self *Group) mergeAndBreakOutBeforeTheClear(staged *GroupContext) {
 func (self *Group) mergeAndJumpPastTheClear(staged *GroupContext) {
 	self.context = staged
 	goto done
-	self.proposals.Clear()
+	self.proposals.Clear(self.context)
 done:
 	self.name = "merged"
 }
@@ -999,14 +1315,14 @@ done:
 // nothing orders a goroutine's clear against this declaration's return
 func (self *Group) mergeAndClearInAGoroutine(staged *GroupContext) {
 	self.context = staged
-	go self.proposals.Clear()
+	go self.proposals.Clear(self.context)
 }
 
 // a clear inside a function literal runs when somebody calls the literal, and nothing here says
 // whether anybody does
 func (self *Group) mergeAndClearInALiteral(staged *GroupContext) func() {
 	self.context = staged
-	return func() { self.proposals.Clear() }
+	return func() { self.proposals.Clear(self.context) }
 }
 
 // two caches, which is the shape p7 task 19 adds and the shape that makes "which cache" a
@@ -1021,14 +1337,14 @@ type StagingGroup struct {
 // one the group holds
 func (self *StagingGroup) mergeAndClearOneOfTwoCaches(staged *GroupContext) {
 	self.context = staged
-	self.pending.Clear()
+	self.pending.Clear(self.context)
 }
 
 // and the shape that owes both and ends both
 func (self *StagingGroup) mergeAndClearBothCaches(staged *GroupContext) {
 	self.context = staged
-	self.proposals.Clear()
-	self.pending.Clear()
+	self.proposals.Clear(self.context)
+	self.pending.Clear(self.context)
 }
 `
 
@@ -1036,11 +1352,15 @@ func (self *StagingGroup) mergeAndClearBothCaches(staged *GroupContext) {
 var epochMoverControlReports = []string{
 	"(*Group).bumpTheEpochAndClear",
 	"(*Group).bumpTheEpochInPlace",
+	"(*Group).clearWithTheClosingContextThenMerge",
 	"(*Group).mergeAndBreakOutBeforeTheClear",
 	"(*Group).mergeAndClear",
 	"(*Group).mergeAndClearAnotherGroupsCache",
+	"(*Group).mergeAndClearAtWithTheContext",
 	"(*Group).mergeAndClearBeforeTheReturn",
+	"(*Group).mergeAndClearBetweenTwoContexts",
 	"(*Group).mergeAndClearInADefer",
+	"(*Group).mergeAndClearInADeferRegisteredBeforeTheMove",
 	"(*Group).mergeAndClearInAGoroutine",
 	"(*Group).mergeAndClearInALabelledLoop",
 	"(*Group).mergeAndClearInALabelledSwitch",
@@ -1057,10 +1377,16 @@ var epochMoverControlReports = []string{
 	"(*Group).mergeAndClearTheWrongField",
 	"(*Group).mergeAndClearTheWrongThing",
 	"(*Group).mergeAndClearUnreachably",
+	"(*Group).mergeAndClearWithAContextItBuiltAfterwards",
+	"(*Group).mergeAndClearWithAnotherGroupsContext",
+	"(*Group).mergeAndClearWithTheStagedContext",
 	"(*Group).mergeAndJumpPastTheClear",
+	"(*Group).mergeAndReleaseWithoutAContext",
+	"(*Group).mergeByAddressAndClearWithTheValue",
 	"(*Group).mergeReturningBeforeTheClear",
 	"(*Group).mergeWithoutClearing",
 	"(*Group).overwriteThroughThePointer",
+	"(*Group).overwriteThroughThePointerAndClearWithTheSource",
 	"(*Group).rebrand",
 	"(*Group).refuseThenMergeAndClear",
 	"(*GroupContext).decode",
@@ -1070,44 +1396,67 @@ var epochMoverControlReports = []string{
 }
 
 // Which of them the matcher must read as ending the cache binding: every path out of them has
-// rebound every cache the value they moved holds.
+// rebound every cache the value they moved holds, with the context that value moved to.
 //
 // mergeAndClearTheWrongThing calls a method of that NAME on another type, mergeAndClearTheWrongField
 // on a field of another type, mergeAndClearAnotherGroupsCache on the right field of another value,
 // and mergeAndClearOneOfTwoCaches on one of the two its group holds -- none of them are here, and
 // each is a shape a gate that resolved the ender by type alone accepted.
+//
+// The argument half takes six more out. clearWithTheClosingContextThenMerge and
+// mergeAndClearInADeferRegisteredBeforeTheMove are handed the epoch that is about to close;
+// mergeAndClearWithAnotherGroupsContext is handed a context this body never moved;
+// mergeAndClearWithAContextItBuiltAfterwards is handed one it constructed after the move;
+// mergeAndReleaseWithoutAContext is handed nothing to read at all; and
+// mergeAndClearBetweenTwoContexts hands two, which names no one of them.
+//
+// And four spellings of the RIGHT context are all here, which is what says the rule reads the
+// storage written as well as the value written into it: mergeAndClear names the field the write
+// landed in, mergeAndClearWithTheStagedContext the value assigned,
+// overwriteThroughThePointerAndClearWithTheSource the operand of a dereference, and
+// mergeByAddressAndClearWithTheValue the operand of an address-of. mergeAndClearAtWithTheContext
+// is the one whose ender takes its context second.
 var epochMoverControlEnders = []string{
 	"(*Group).bumpTheEpochAndClear",
 	"(*Group).mergeAndClear",
+	"(*Group).mergeAndClearAtWithTheContext",
 	"(*Group).mergeAndClearBeforeTheReturn",
 	"(*Group).mergeAndClearInADefer",
 	"(*Group).mergeAndClearInALabelledSwitch",
 	"(*Group).mergeAndClearInEverySelectClause",
 	"(*Group).mergeAndClearInEverySwitchClause",
 	"(*Group).mergeAndClearOnBothPaths",
+	"(*Group).mergeAndClearWithTheStagedContext",
+	"(*Group).mergeByAddressAndClearWithTheValue",
 	"(*Group).overwriteThroughThePointer",
+	"(*Group).overwriteThroughThePointerAndClearWithTheSource",
 	"(*Group).refuseThenMergeAndClear",
 	"(*StagingGroup).mergeAndClearBothCaches",
 	"mergeIntoTheGroup",
 }
 
 // And which of them the matcher must read as CALLING an ender on one of their own caches at all,
-// whether or not every path reaches it.
+// whether or not every path reaches it and whether or not it was handed the right context.
 //
-// This is what separates the two ways of failing, and without it the reachability half of the rule
-// is unmeasured: a matcher that never looked inside an if, a loop or a switch would report exactly
+// This is what separates the ways of failing, and without it the reachability half of the rule is
+// unmeasured: a matcher that never looked inside an if, a loop or a switch would report exactly
 // the same set of enders as this one and would be reporting it for the wrong reason. Every entry
 // here that is NOT an ender above is a rebind this rule found and refused -- the unreachable one,
 // the one past a return, the one on a single branch, in a loop, in a range, in a switch, in a type
-// switch, in a select clause, past a break, past a jump, in a goroutine, and one of two caches --
-// and the four movers that call one and are absent from the enders for a reason of identity rather
-// than of paths are absent from here too.
+// switch, in a select clause, past a break, past a jump, in a goroutine, one of two caches, the
+// four handed a context this body had not moved, the one handed none and the one handed two -- and
+// the four movers that call an ender and are absent from the enders for a reason of IDENTITY
+// rather than of paths or arguments are absent from here too.
 var epochMoverControlFinds = []string{
 	"(*Group).bumpTheEpochAndClear",
+	"(*Group).clearWithTheClosingContextThenMerge",
 	"(*Group).mergeAndBreakOutBeforeTheClear",
 	"(*Group).mergeAndClear",
+	"(*Group).mergeAndClearAtWithTheContext",
 	"(*Group).mergeAndClearBeforeTheReturn",
+	"(*Group).mergeAndClearBetweenTwoContexts",
 	"(*Group).mergeAndClearInADefer",
+	"(*Group).mergeAndClearInADeferRegisteredBeforeTheMove",
 	"(*Group).mergeAndClearInAGoroutine",
 	"(*Group).mergeAndClearInALabelledLoop",
 	"(*Group).mergeAndClearInALabelledSwitch",
@@ -1121,9 +1470,15 @@ var epochMoverControlFinds = []string{
 	"(*Group).mergeAndClearOnOnePath",
 	"(*Group).mergeAndClearOverARange",
 	"(*Group).mergeAndClearUnreachably",
+	"(*Group).mergeAndClearWithAContextItBuiltAfterwards",
+	"(*Group).mergeAndClearWithAnotherGroupsContext",
+	"(*Group).mergeAndClearWithTheStagedContext",
 	"(*Group).mergeAndJumpPastTheClear",
+	"(*Group).mergeAndReleaseWithoutAContext",
+	"(*Group).mergeByAddressAndClearWithTheValue",
 	"(*Group).mergeReturningBeforeTheClear",
 	"(*Group).overwriteThroughThePointer",
+	"(*Group).overwriteThroughThePointerAndClearWithTheSource",
 	"(*Group).refuseThenMergeAndClear",
 	"(*StagingGroup).mergeAndClearBothCaches",
 	"(*StagingGroup).mergeAndClearOneOfTwoCaches",
@@ -1476,6 +1831,31 @@ func TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere(t *testing.T) {
 		t.Errorf("the methods classified as ending the epoch binding are %v, want exactly [(*ProposalCache).Rebind]; the gate over the epoch movers accepts a call to any of them, so a name added here widens that gate",
 			ends)
 	}
+	// and every one of them takes exactly one group context, because the gate over the epoch
+	// movers reads WHICH context an ender was handed. An ender declaring none is one that half
+	// of the rule cannot read at all, so every mover calling it would be refused for a reason
+	// its author could not act on; an ender declaring two is one nothing can say the binding
+	// came from. The demand belongs here, where the classification is made, rather than being
+	// discovered at the call sites -- and (*ProposalCache).Release in the mover control is the
+	// shape it refuses.
+	for _, name := range epochBindingEnders() {
+		method, held := reflect.TypeOf(&ProposalCache{}).MethodByName(name)
+		if !held {
+			t.Errorf("%s is classified as ending the epoch binding and is not a method of *%s the compiler can find, so the gate over the epoch movers accepts a call nothing here describes",
+				name, epochCacheTypeName)
+			continue
+		}
+		contexts := 0
+		for at := 1; at < method.Type.NumIn(); at++ {
+			if method.Type.In(at) == reflect.TypeOf(&GroupContext{}) {
+				contexts++
+			}
+		}
+		if contexts != 1 {
+			t.Errorf("%s takes %d *%s parameters and the argument half of the mover gate reads exactly one, which is the context it holds a boundary to having moved to; with none, or with two, that half is vacuous",
+				name, contexts, epochGroupContextTypeName)
+		}
+	}
 	for _, name := range slices.Sorted(maps.Keys(proposalCacheBindingWriters)) {
 		one := proposalCacheBindingWriters[name]
 		t.Run(name, func(t *testing.T) { one.probe(t) })
@@ -1559,12 +1939,17 @@ func TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBindin
 			epochMoverRoots, forbiddenScanRoots)
 	}
 
-	// the control's ender is spelled Clear and the real one is spelled Rebind, deliberately:
-	// the ender names are a PARAMETER of the matcher, and a control that shared the real
-	// spelling could not tell a matcher that reads the parameter from one that hardcodes the
-	// name it expects to find.
+	// the control's enders are spelled Clear and Release and the real one is spelled Rebind,
+	// deliberately: the ender names are a PARAMETER of the matcher, and a control that shared
+	// the real spelling could not tell a matcher that reads the parameter from one that
+	// hardcodes the name it expects to find. Two of them rather than one because the argument
+	// half is stated over the ender's own SIGNATURE: Clear takes the context it binds to,
+	// Release takes none, ClearAt takes it second and ClearBetween takes two. A matcher that
+	// assumed every ender carries exactly one context, or that read argument zero, answers
+	// wrongly on (*Group).mergeAndReleaseWithoutAContext,
+	// (*Group).mergeAndClearBetweenTwoContexts and (*Group).mergeAndClearAtWithTheContext.
 	control := epochMoversIn(typeCheckedBodiesOfText(t, "the epoch mover control", epochMoverControl),
-		epochCacheTypeName, []string{"Clear"})
+		epochCacheTypeName, []string{"Clear", "ClearAt", "ClearBetween", "Release"})
 	if reported := slices.Sorted(maps.Keys(control.moving)); !slices.Equal(reported, epochMoverControlReports) {
 		t.Fatalf("the rule reported %v out of the control, want %v; a rule that reports the staging of a local demands a row for every commit path in this plan, and one that misses the increment form reports a clean run over the cheapest epoch advance there is",
 			reported, epochMoverControlReports)
@@ -1611,8 +1996,8 @@ func TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBindin
 			t.Errorf("%s is classified with no account of what it does or no probe of it; a row that states nothing is the enumeration this gate exists to not be", name)
 		}
 		if one.movesAGroupBetweenEpochs && finding.ends == "" {
-			t.Errorf("%s moves a group to another epoch at %s (%s) and does not end every cache binding the value it moved holds on every path out of it. Found: %q. Left bound: %s. The cache it leaves behind belongs to the epoch that just closed, and every reference in it is a proposal the group has already applied",
-				name, finding.where, finding.how, finding.finds, finding.skipped)
+			t.Errorf("%s moves a group to another epoch at %s (%s) and does not end every cache binding the value it moved holds, on every path out of it, with the context it moved to. Found: %q. Handed a context it had not moved: %q. Left bound: %s. A cache left behind belongs to the epoch that just closed and every reference in it is a proposal the group has already applied; a cache rebound to that same closing epoch is worse, because it also refuses every proposal of the new one and nothing in this package releases it",
+				name, finding.where, finding.how, finding.finds, finding.wrong, finding.skipped)
 		}
 		if !one.movesAGroupBetweenEpochs && finding.ends != "" {
 			t.Errorf("%s is classified as moving no group between epochs and ends a cache binding at %s; one of the two is wrong and a reader cannot tell which",
