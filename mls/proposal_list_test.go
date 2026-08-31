@@ -1304,6 +1304,15 @@ func TestCheckEpochAnswersTheBindingAndRebindMovesIt(t *testing.T) {
 	if got := len(cache.Pending(at8)); got != 0 {
 		t.Errorf("Rebind left %d entries behind", got)
 	}
+	// and Store asks the same question of the same caller. A caller still acting in the epoch
+	// that closed is refused as OUR fault and not as the message's, even when the message it
+	// brings is a genuine proposal of that closed epoch: the cache and the caller disagreeing
+	// about which epoch this is means nobody carried the cache over the boundary, and a caller
+	// told the message was stale would go looking at the message.
+	if _, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 7,
+		testRemoveProposal(LeafIndex(4)))); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("Store by a caller acting in the epoch that closed = %v, want errProposalCacheNotRebound", err)
+	}
 	if err := cache.Rebind(nil); !errors.Is(err, ErrNilGroupContext) {
 		t.Errorf("Rebind(nil) = %v, want ErrNilGroupContext", err)
 	}
