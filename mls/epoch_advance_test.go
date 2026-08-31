@@ -9,7 +9,8 @@
 // any commit that names a proposal, and the first fix anybody reaches for is to weaken the door.
 //
 // Why it is derived rather than written down. The mitigation on offer was `self.proposals.Clear()`
-// at two hand written call sites, which is an enumeration of the paths that advance an epoch --
+// at two hand written call sites -- Rebind's ancestor, and the shape of the call is not the point --
+// which is an enumeration of the paths that advance an epoch --
 // the shape rule 5 exists to refuse, and the shape that has understated its class fourteen times
 // on this project: a constant time gate banning six comparator names that missed bytes.HasPrefix
 // where the derived version finds eighteen; a table calling itself "every rule of the CreateGroup
@@ -388,69 +389,85 @@ type epochBindingWriterRow struct {
 // the epoch binding.
 //
 // This is the other half of the derivation and it is what "or rebinding" means: the gate above
-// does not demand a call to Clear by name, it demands a call to one of the methods classified HERE
-// as ending a binding. A method that rebound the cache to the new epoch instead of emptying it
-// would answer the same demand the moment somebody added its row, and until somebody does, adding
-// it fails this gate rather than silently widening the other one.
+// does not demand a call by NAME, it demands a call to one of the methods classified HERE as ending
+// a binding. That is not hypothetical any more -- the method is Rebind, and the Clear it replaced
+// was the one that ended a binding without starting the next, which left the cache in the state a
+// replayed proposal could then fill. A third method lands here before it can be accepted there.
 var proposalCacheBindingWriters = map[string]epochBindingWriterRow{
 	"(*ProposalCache).Store": {
-		what: "binds the cache to the group and epoch of its FIRST entry and refuses every later entry that " +
-			"does not match. It writes the binding and it never ends one: a Store that rebound would make the " +
-			"binding whatever arrived last, and what arrives is attacker supplied",
+		what: "writes what the cache HOLDS and never what it BELONGS TO. It is the door a peer's message comes " +
+			"through, which is exactly why it must not be able to move the binding: it took the binding from " +
+			"its own first entry once, and one replayed proposal of a closed epoch then bound a whole cache to " +
+			"that closed epoch with no way back. It writes no binding and it ends none",
 		endsTheBinding: false,
 		probe: func(t *testing.T) {
 			crypto := testCrypto(t)
-			cache := NewProposalCache()
-			if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+			at7 := testResolveContextAt([]byte("group"), 7)
+			cache := testCacheAt(t, at7)
+			held := cache.binding
+			if _, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 7,
 				testRemoveProposal(LeafIndex(4)))); err != nil {
 				t.Fatalf("Store at epoch 7: %v", err)
 			}
-			if err := cache.CheckEpoch([]byte("group"), 7); err != nil {
-				t.Fatalf("the cache did not bind to the epoch of its first entry: %v", err)
+			if cache.binding != held {
+				t.Errorf("an accepted Store replaced the binding; the binding is the group's and a store is a message's")
 			}
-			if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 8,
+			if _, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 8,
 				testRemoveProposal(LeafIndex(5)))); !errors.Is(err, errProposalCacheEpoch) {
 				t.Errorf("Store of an epoch 8 entry into a cache holding epoch 7 answered %v, want errProposalCacheEpoch", err)
 			}
-			if err := cache.CheckEpoch([]byte("group"), 7); err != nil {
-				t.Errorf("the refused store moved the binding: %v; a Store that rebinds hands the binding to whatever arrived last", err)
+			if cache.binding != held {
+				t.Errorf("a refused Store replaced the binding; a Store that rebinds hands the binding to whatever arrived last, and what arrives is attacker supplied")
 			}
-			if err := cache.CheckEpoch([]byte("group"), 8); !errors.Is(err, errProposalCacheEpoch) {
-				t.Errorf("the cache answered for epoch 8 after storing only in epoch 7 = %v, want errProposalCacheEpoch", err)
+			if err := cache.CheckEpoch(at7); err != nil {
+				t.Errorf("the cache no longer holds the epoch it was built in: %v", err)
+			}
+			if err := cache.CheckEpoch(testResolveContextAt([]byte("group"), 8)); !errors.Is(err, errProposalCacheNotRebound) {
+				t.Errorf("the cache answered for epoch 8 after storing only in epoch 7 = %v, want errProposalCacheNotRebound", err)
 			}
 		},
 	},
-	"(*ProposalCache).Clear": {
-		what: "empties the cache and unbinds it, which is what an epoch boundary owes it. It is the one method " +
-			"classified as ending a binding, so it is the one call the gate over the epoch movers accepts",
+	"(*ProposalCache).Rebind": {
+		what: "empties the cache and binds it to the epoch the CALLER names, which is what an epoch boundary " +
+			"owes it. It is the one method classified as ending a binding, so it is the one call the gate over " +
+			"the epoch movers accepts. It ends a binding by starting the next one and it cannot do only the " +
+			"first half: a release with no rebind leaves the cache unbound, and unbound is the state a replayed " +
+			"message used to be able to fill",
 		endsTheBinding: true,
 		probe: func(t *testing.T) {
 			crypto := testCrypto(t)
-			cache := NewProposalCache()
+			at1 := testResolveContext()
+			cache := testCacheAt(t, at1)
 			ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
-			cache.Clear()
-			if err := cache.CheckEpoch([]byte("anything"), 4242); err != nil {
-				t.Errorf("a cleared cache still reported a binding: %v", err)
+			at2 := testResolveContextAt([]byte("group"), 2)
+			if err := cache.Rebind(at2); err != nil {
+				t.Fatalf("Rebind: %v", err)
 			}
-			// the binding FIELDS and not only the answer. Both guards short circuit on
-			// an empty cache, so a Clear that emptied the map and left groupId and
-			// epoch behind answers exactly as this one does -- measured, that mutation
-			// survived the whole of ./mls/... and ./message/... -- and the day somebody
-			// makes an empty cache answer for the group it last held, the stale binding
-			// is live again. It also releases the caller's array, which is the one
-			// retention this cache keeps across a whole epoch.
-			if cache.groupId != nil || cache.epoch != 0 {
-				t.Errorf("Clear left the binding fields at epoch %d of group %x; it emptied the entries and unbound nothing, so the release rests entirely on the emptiness short circuit in front of every guard",
-					cache.epoch, cache.groupId)
+			if err := cache.CheckEpoch(at2); err != nil {
+				t.Errorf("a rebound cache does not hold the epoch it was rebound to: %v", err)
 			}
-			if got := len(cache.Pending()); got != 0 {
-				t.Errorf("Clear left %d entries behind, so the references of the closed epoch are still nameable", got)
+			if err := cache.CheckEpoch(at1); !errors.Is(err, errProposalCacheNotRebound) {
+				t.Errorf("a rebound cache still answers for the epoch that closed = %v, want errProposalCacheNotRebound", err)
 			}
-			// and the entry is gone rather than merely unnamed by Pending, which is what
-			// makes the clear a release of the closed epoch's proposals
-			if _, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0),
+			// the binding FIELDS and not only the answer. A rebind that emptied the map
+			// and left the old pair in place answers a closed epoch at every door, and
+			// the measured history of this row is that exactly that mutation -- on the
+			// Clear this replaces -- survived the whole of ./mls/... and ./message/...
+			// because both guards short circuited on an empty cache. There is no such
+			// short circuit any more, and this reads the fields regardless.
+			if cache.binding == nil || cache.binding.epoch != at2.Epoch ||
+				!bytes.Equal(cache.binding.groupId, at2.GroupId) {
+				t.Errorf("Rebind left the cache holding %+v, want epoch %d of group %x",
+					cache.binding, at2.Epoch, at2.GroupId)
+			}
+			if got := len(cache.Pending(at2)); got != 0 {
+				t.Errorf("Rebind left %d entries behind, so the references of the closed epoch are still nameable", got)
+			}
+			// and the entry is GONE rather than merely unnamed by Pending, which is what
+			// makes the rebind a release of the closed epoch's proposals
+			if _, err := cache.Resolve(crypto, at2, LeafIndex(0),
 				[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}}); !errors.Is(err, errProposalNotCached) {
-				t.Errorf("a reference into a cleared cache answered %v, want errProposalNotCached", err)
+				t.Errorf("a reference into a rebound cache answered %v, want errProposalNotCached", err)
 			}
 		},
 	},
@@ -532,8 +549,8 @@ func TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere(t *testing.T) {
 		}
 	}
 	slices.Sort(ends)
-	if !slices.Equal(ends, []string{"(*ProposalCache).Clear"}) {
-		t.Errorf("the methods classified as ending the epoch binding are %v, want exactly [(*ProposalCache).Clear]; the gate over the epoch movers accepts a call to any of them, so a name added here widens that gate",
+	if !slices.Equal(ends, []string{"(*ProposalCache).Rebind"}) {
+		t.Errorf("the methods classified as ending the epoch binding are %v, want exactly [(*ProposalCache).Rebind]; the gate over the epoch movers accepts a call to any of them, so a name added here widens that gate",
 			ends)
 	}
 	for _, name := range slices.Sorted(maps.Keys(proposalCacheBindingWriters)) {
@@ -619,6 +636,10 @@ func TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBindin
 			epochMoverRoots, forbiddenScanRoots)
 	}
 
+	// the control's ender is spelled Clear and the real one is spelled Rebind, deliberately:
+	// the ender names are a PARAMETER of the matcher, and a control that shared the real
+	// spelling could not tell a matcher that reads the parameter from one that hardcodes the
+	// name it expects to find.
 	control := epochMoversIn(typeCheckedBodiesOfText(t, "the epoch mover control", epochMoverControl),
 		epochCacheTypeName, []string{"Clear"})
 	if reported := slices.Sorted(maps.Keys(control.moving)); !slices.Equal(reported, epochMoverControlReports) {

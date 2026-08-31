@@ -203,7 +203,7 @@ func providerNilMethodRows() []providerNilMethodRow {
 		// reason: an empty commit resolves to an empty list and no error at all, so the refusal
 		// below is the provider's and can be nothing else.
 		{name: "(*ProposalCache).Store", call: func() error {
-			_, err := (&ProposalCache{}).Store(nil, nil)
+			_, err := (&ProposalCache{}).Store(nil, nil, nil)
 			return err
 		}},
 		{name: "(*ProposalCache).Resolve", call: func() error {

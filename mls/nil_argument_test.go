@@ -394,11 +394,35 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			}
 			return VerifyAuthenticatedContent(crypto, pub, nil, framingTestGroupContext(t))
 		}},
+		// the cache's own constructor, which is the first half of where the epoch binding
+		// comes from. A nil context here would otherwise answer a cache bound to nothing,
+		// which is the one state in which a message can supply the epoch
+		"NewProposalCache(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			_, err := NewProposalCache(nil)
+			return err
+		}},
 		// p7 task 6's cache store, which would otherwise dereference its content at the
 		// content type check -- the first statement after the provider
 		"(*ProposalCache).Store(content)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
-			_, err := NewProposalCache().Store(crypto, nil)
+			_, err := testCache(t).Store(crypto, testResolveContext(), nil)
 			return err
+		}},
+		// the same store's group context, which is the parameter the epoch every rule of
+		// that body runs in is taken from. It is read before the message, so this row
+		// passes no content at all: what it observes is the refusal, and a body that
+		// dereferenced it would do so at the CheckEpoch two statements later.
+		"(*ProposalCache).Store(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			_, err := testCache(t).Store(crypto, nil, nil)
+			return err
+		}},
+		// the boundary question asked with no message in hand, and the rebind that answers
+		// it. A Rebind handed nothing would otherwise leave the cache bound to nothing,
+		// which is the one state in which the epoch could come from somewhere else.
+		"(*ProposalCache).CheckEpoch(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			return testCache(t).CheckEpoch(nil)
+		}},
+		"(*ProposalCache).Rebind(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			return testCache(t).Rebind(nil)
 		}},
 		// the same cache's resolution, whose group context is the parameter that lets it
 		// refuse a reference cached in an epoch that has closed. It is dereferenced inside
@@ -407,7 +431,7 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		// this row passes an empty vector: what it observes is the refusal and not the one
 		// input shape that happens to walk past the read.
 		"(*ProposalCache).Resolve(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
-			_, err := NewProposalCache().Resolve(crypto, nil, LeafIndex(0), nil)
+			_, err := testCache(t).Resolve(crypto, nil, LeafIndex(0), nil)
 			return err
 		}},
 		"NewCryptoProviderWithRandom(random)": {sentinel: ErrNilRandomSource, call: func(t *testing.T) error {

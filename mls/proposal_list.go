@@ -251,15 +251,19 @@ func proposalTypeName(proposalType ProposalType) string {
 // from a reference it published twice from one belonging to an epoch that has closed, and those
 // are three different faults with three different remedies.
 //
-// errProposalCacheEpoch and errProposalResolvedOutOfEpoch are two values for what a careless
-// reading calls one rule, and they are two rules. The first is Store's: an ENTRY arrived carrying
-// an epoch other than the one this cache is holding, and the remedy is to drop that message. The
-// second is Resolve's: the cache is intact and it belongs to an epoch that has CLOSED, so the
-// commit being resolved is naming proposals the group has already applied -- a replay, whose
-// remedy is that the epoch boundary did not clear this cache and the caller that advanced it is
-// the defect. A caller told only errProposalCacheEpoch cannot tell a peer that mislabelled one
-// message from its own lifecycle failing to clear a whole cache, and ledger 30 is four rules of
-// this file sharing one value.
+// THE EPOCH RULES ARE THREE VALUES for what a careless reading calls one rule, and they are three
+// rules with three remedies. errProposalCacheEpoch is about a MESSAGE: a proposal arrived carrying
+// an epoch other than the one the group is in, and the remedy is to drop it. The other two are
+// about THIS BUILD, at two different doors. errProposalCacheNotRebound is Store's and CheckEpoch's:
+// the cache is bound to an epoch the caller has already left, so the lifecycle advanced a group and
+// did not Rebind, and the remedy is in the declaration that advanced it -- there is nothing wrong
+// with any message. errProposalResolvedOutOfEpoch is Resolve's: the same staleness caught at the
+// lookup, where what it costs is a commit naming proposals the group has already applied, so the
+// refusal is a property of the resolution rather than a discipline expected of a caller.
+//
+// Three and not one because the audiences differ. A caller told only errProposalCacheEpoch cannot
+// tell a peer that mislabelled one message from its own lifecycle failing to carry a whole cache
+// across a boundary, and ledger 30 is four rules of this file sharing one value.
 //
 // Unexported, on the shape credential.go's errProfileCredentialType and this file's own
 // errProfile* take, for two reasons that are not the same reason. errProposalSenderNotMember and
@@ -276,6 +280,7 @@ var (
 	errProposalCacheNotAProposal      = errors.New("mls: a cache entry must be a framed proposal")
 	errProposalSenderNotMember        = errors.New("mls: a cached proposal is attributed to a leaf and only a member sender occupies one")
 	errProposalCacheEpoch             = errors.New("mls: proposal does not belong to the epoch this cache holds")
+	errProposalCacheNotRebound        = errors.New("mls: the proposal cache is bound to an epoch the caller has already left")
 	errProposalResolvedOutOfEpoch     = errors.New("mls: a commit names a cached proposal from an epoch that has closed")
 	errProposalNotCached              = errors.New("mls: proposal reference is not cached for this epoch")
 	errDuplicateProposalReference     = errors.New("mls: a commit names one proposal reference twice")
@@ -373,7 +378,29 @@ func (self *ProposalList) Refs() []ProposalOrRef {
 	return out
 }
 
-// ProposalCache holds the proposals received this epoch, keyed by ProposalRef.
+// proposalCacheBinding is the group and epoch one cache belongs to.
+//
+// A struct behind a POINTER, so that "bound to nothing" is a state this type can be in and can be
+// told apart from "bound to the empty group at epoch 0" -- which is not a hypothetical, because
+// epoch 0 is where every group starts and a zero valued pair would answer for it. A cache with no
+// binding refuses at every door rather than acquiring one later, and that is the whole of what
+// makes the zero value safe -- and the zero value is the only unbound cache there is, because the
+// constructor refuses to build one.
+//
+// It is a type of its own rather than two fields of the cache so that the write has ONE target: a
+// reader asking where the binding comes from reads the two places this struct is built, and
+// TestEveryWriteOfTheCacheBindingReadsTheCallersGroupContext derives that class off the source
+// rather than off this sentence.
+type proposalCacheBinding struct {
+	// a COPY of the caller's group id and not the caller's own array. The cache outlives the
+	// buffer a group context was decoded out of, and a binding aliased to that buffer follows
+	// it when the caller reuses it -- so the one guard that would say this cache had gone
+	// stale would agree with whatever the buffer now holds.
+	groupId []byte
+	epoch   uint64
+}
+
+// ProposalCache holds the proposals received in ONE epoch of ONE group, keyed by ProposalRef.
 //
 // THE KEY IS THE WHOLE REFERENCE, converted to a string. Not a prefix of it, and not a
 // comparison: a map over the full octets answers exactly the entry whose reference the commit
@@ -383,26 +410,94 @@ func (self *ProposalList) Refs() []ProposalOrRef {
 // truncated prefix answer the same entry, so a commit naming one member's removal applies
 // another member's, under a reference every peer checks and agrees with.
 //
-// THE CACHE IS BOUND TO ONE EPOCH. groupId and epoch are taken from the first entry stored and
-// every later Store is held to them, because a ProposalRef is a hash over an AuthenticatedContent
-// that carries both -- so an entry from another epoch is not merely stale, it is a name no commit
-// of THIS epoch can legitimately carry. Clear unbinds. What this cannot do on its own is notice
-// that the epoch advanced with no proposal arriving in the new one, which is why CheckEpoch
-// exists and why the commit path has to call it: see the note there.
+// THE BINDING COMES FROM THE GROUP AND NEVER FROM A MESSAGE, and that is the whole design of this
+// type. It is written in exactly two places -- NewProposalCache and Rebind -- and both read a
+// *GroupContext the caller already holds; no method assigns it, so there is no code path in which
+// a peer's octets decide which epoch this cache belongs to.
+//
+// It was the other way round, and the other way round is a denial of service, which is why this
+// paragraph is here. The binding used to be taken from the first entry STORED and checked against
+// that same entry's own epoch -- self referential for the first one -- and released only by a
+// Clear the lifecycle had to remember. So one replayed genuine proposal of a closed epoch,
+// delivered to a cache that had just been cleared, bound the cache to the closed epoch: the
+// member could then neither cache the live epoch's proposals nor resolve any commit that named
+// one, and nothing released it, because the only release ran off a commit the member could no
+// longer resolve. Integrity held -- the stale proposal was never applied -- and availability was
+// gone for good, at the cost of replaying one message every peer had already seen. A guard cannot
+// fix that, because the value the guard compares against is the attacker's; only taking the value
+// from somewhere else can, and the group's own context is the only other place it exists.
+//
+// What is left is a discipline of OURS rather than a door a peer can push: a lifecycle that
+// advances an epoch and does not Rebind leaves this cache refusing the new epoch. That is a bug
+// in this build, it is loud at every door, and it is derived rather than trusted --
+// TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBinding reads the class of
+// declarations that move a group between epochs off the source and holds every one of them to
+// ending the binding.
 type ProposalCache struct {
 	byRef map[string]CachedProposal
 	order []string
-	// a COPY of the caller's group id and not the caller's own array. The cache outlives the
-	// buffer a proposal was decoded out of, and a binding aliased to that buffer follows it
-	// when the caller reuses it -- so the one guard that would say this cache had gone stale
-	// would agree with whatever the buffer now holds.
-	groupId []byte
-	epoch   uint64
+	// nil until the cache is bound. See proposalCacheBinding, and see bindingHolds for what
+	// nil answers.
+	binding *proposalCacheBinding
 }
 
-// NewProposalCache returns an empty cache, bound to no epoch.
-func NewProposalCache() *ProposalCache {
-	return &ProposalCache{byRef: map[string]CachedProposal{}}
+// NewProposalCache returns an empty cache bound to the group and epoch the CALLER is in.
+//
+// The context is a parameter rather than something the cache picks up later, because a cache that
+// could be built without one has to learn its epoch from somewhere, and the only other thing on
+// offer is whatever message arrives first. That is attacker supplied. Making the caller name the
+// epoch is what turns "the cache checks that entries match" into "the cache knows which epoch it
+// is in", and those are different claims: the first is true of a cache bound to a replay.
+//
+// A composite literal and not a field assignment, so that this constructor is not a second
+// spelling of the write Rebind owns and a reader counting the places the binding is written
+// counts two rather than three.
+//
+// IT REFUSES A NIL CONTEXT rather than answering a cache bound to nothing, and that is not a rule
+// of this file: TestEveryConstructorOverAGroupContextRefusesANilOne derives the class of exported
+// package level functions over a *GroupContext off this package's source and holds every one of
+// them to ErrNilGroupContext. It is also the right rule here for a reason of this cache's own. A
+// cache bound to nothing is the one state in which the epoch has to come from somewhere else, and
+// a constructor that answered one would hand that state to every caller that did not read an
+// error. The zero value is still that state -- Go's convention for a container leaves it usable --
+// and it is safe for the reason bindingHolds gives: it refuses at every door.
+func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
+	if groupContext == nil {
+		return nil, fmt.Errorf("%w: a cache is built bound to the epoch its group is in", ErrNilGroupContext)
+	}
+	return &ProposalCache{
+		byRef: map[string]CachedProposal{},
+		binding: &proposalCacheBinding{
+			groupId: bytes.Clone(groupContext.GroupId),
+			epoch:   groupContext.Epoch,
+		},
+	}, nil
+}
+
+// Rebind empties the cache and binds it to the group and epoch the caller names. It is what an
+// epoch boundary owes this cache.
+//
+// One method for the two halves of a boundary -- release the closed epoch's entries, and take the
+// new epoch -- because a cache that could be released WITHOUT being rebound is a cache in the
+// unbound state again, and the unbound state is where binding-from-a-message used to be possible.
+// This replaces the Clear that used to do only the first half, and the difference is not
+// bookkeeping: Clear left behind exactly the state a replay could bind.
+//
+// It answers a refusal rather than binding to nothing when it is handed no context, for the same
+// reason: the one thing a rebind must not be able to do is leave the cache with no epoch and a
+// door open.
+func (self *ProposalCache) Rebind(groupContext *GroupContext) error {
+	if groupContext == nil {
+		return fmt.Errorf("%w: a cache takes its epoch from the group's own context and from nothing else",
+			ErrNilGroupContext)
+	}
+	self.byRef = map[string]CachedProposal{}
+	self.order = nil
+	self.binding = &proposalCacheBinding{
+		groupId: bytes.Clone(groupContext.GroupId),
+		epoch:   groupContext.Epoch,
+	}
+	return nil
 }
 
 // cloneProposal answers a copy of a proposal that shares no storage with the one it was handed,
@@ -431,10 +526,17 @@ func cloneProposal(proposal *Proposal) (Proposal, error) {
 
 // bindingHolds answers whether the group and epoch this cache is bound to are the ones named.
 //
-// ONE comparison for the two rules that ask the question, because two copies of it are two
-// places the wrong field can be compared and a reader mutating either would find the other still
-// right. Store asks it of an arriving ENTRY and Resolve asks it of the COMMIT being resolved;
-// what they share is the question and not the answer, and each keeps its own sentinel.
+// ONE comparison for the five rules that ask the question, because five copies of it are five
+// places the wrong field can be compared and a reader mutating one would find the others still
+// right. CheckEpoch, Store, Cached, Pending and Resolve all ask it; what they share is the question
+// and not the answer, and each keeps its own refusal.
+//
+// AN UNBOUND CACHE ANSWERS FALSE, and there is no emptiness clause in front of it. An empty cache
+// is not a cache that belongs to no epoch -- it belongs to the epoch it was bound to, and asking
+// it about another one is the case CheckEpoch exists for: an epoch that advanced with no proposal
+// arriving in the new one. The clause that used to short circuit on an empty map is exactly what
+// made a freshly emptied cache answer nil for whatever epoch it was next asked about, and that is
+// the door the binding used to walk in through.
 //
 // crypto/subtle and not == over a string conversion. That is framing_protect.go's
 // CheckFramedContentContext one type up, comparing the same field for the same reason: this
@@ -447,32 +549,46 @@ func cloneProposal(proposal *Proposal) (Proposal, error) {
 // so an epoch number is not an identity. And never the group alone: that is the whole of the
 // replay this file exists to refuse.
 func (self *ProposalCache) bindingHolds(groupId []byte, epoch uint64) bool {
-	return subtle.ConstantTimeCompare(self.groupId, groupId) == 1 && self.epoch == epoch
+	if self.binding == nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(self.binding.groupId, groupId) == 1 && self.binding.epoch == epoch
 }
 
-// CheckEpoch refuses when this cache holds an epoch other than the one the caller is about to act
+// bindingName names what this cache belongs to, for a refusal a reader can act on.
+//
+// A cache bound to nothing says so rather than reporting "epoch 0 of group ", which is a sentence
+// a reader would spend an afternoon looking for a group id in.
+func (self *ProposalCache) bindingName() string {
+	if self.binding == nil {
+		return "no group"
+	}
+	return fmt.Sprintf("epoch %d of group %x", self.binding.epoch, self.binding.groupId)
+}
+
+// CheckEpoch refuses when this cache is bound to an epoch other than the one the caller is acting
 // in.
 //
-// It is Store's rule, stated as a method because the commit path wants to ask it before it has a
-// message to store: a cache that was never cleared after a commit still holds the previous
-// epoch's entries, and what Store cannot see on its own is an epoch that advanced with no new
-// proposal arriving in it.
+// It is the boundary question asked without a message in hand: a lifecycle that has advanced an
+// epoch and wants to know whether the cache came with it. That question is the one this file was
+// rewritten around -- while the binding came from the first entry stored, an emptied cache
+// answered nil for every epoch anybody asked about, so the guard could not see the case its own
+// comment named.
 //
-// It is no longer the only thing standing between a closed epoch's proposals and a commit of the
-// new one. Resolve asks the same question of its own group context, under
+// It is not the only thing standing between a closed epoch's proposals and a commit of the new
+// one. Resolve asks the same question of its own group context, under
 // errProposalResolvedOutOfEpoch, which is what makes the refusal a property of the RESOLUTION
 // rather than a discipline expected of a caller -- see the note there. Both remain, because they
 // answer for different callers: this one lets a lifecycle notice the boundary before it has
 // anything to resolve, and the one in Resolve is the door no commit gets past.
-//
-// An empty cache belongs to no epoch and answers nil: there is nothing in it to be stale.
-func (self *ProposalCache) CheckEpoch(groupId []byte, epoch uint64) error {
-	if len(self.byRef) == 0 {
-		return nil
+func (self *ProposalCache) CheckEpoch(groupContext *GroupContext) error {
+	if groupContext == nil {
+		return fmt.Errorf("%w: the epoch a cache is checked against is the group's own",
+			ErrNilGroupContext)
 	}
-	if !self.bindingHolds(groupId, epoch) {
-		return fmt.Errorf("%w: the cache holds epoch %d of group %x and was asked for epoch %d of group %x",
-			errProposalCacheEpoch, self.epoch, self.groupId, epoch, groupId)
+	if !self.bindingHolds(groupContext.GroupId, groupContext.Epoch) {
+		return fmt.Errorf("%w: the cache holds %s and the caller is acting in epoch %d of group %x",
+			errProposalCacheNotRebound, self.bindingName(), groupContext.Epoch, groupContext.GroupId)
 	}
 	return nil
 }
@@ -483,37 +599,45 @@ func (self *ProposalCache) CheckEpoch(groupId []byte, epoch uint64) error {
 // This is the replay door, and it is Resolve's own rule rather than CheckEpoch's. A ProposalRef
 // is a hash over an AuthenticatedContent carrying the group id and the epoch, so an entry cached
 // in epoch N is a name no commit of epoch N+1 can legitimately carry -- and a cache nobody
-// cleared at the boundary answers exactly those names, which applies a proposal the group has
+// rebound at the boundary answers exactly those names, which applies a proposal the group has
 // already applied under a reference every peer still verifies.
 //
 // It is asked at the lookup rather than over the whole call, so a commit that carries every
 // proposal INLINE is not refused for the state of a cache it never reads. What makes a reference
 // a replay is that it names an entry, and this is the statement in front of the only line that
 // can answer one.
-//
-// An empty cache belongs to no epoch: there is nothing in it to replay, and a reference into it
-// is answered by errProposalNotCached, which is the true account of what went wrong.
 func (self *ProposalCache) checkResolveEpoch(groupContext *GroupContext) error {
-	if len(self.byRef) == 0 {
-		return nil
-	}
 	if !self.bindingHolds(groupContext.GroupId, groupContext.Epoch) {
-		return fmt.Errorf("%w: the cache holds epoch %d of group %x and this commit is of epoch %d of group %x",
-			errProposalResolvedOutOfEpoch, self.epoch, self.groupId,
+		return fmt.Errorf("%w: the cache holds %s and this commit is of epoch %d of group %x",
+			errProposalResolvedOutOfEpoch, self.bindingName(),
 			groupContext.Epoch, groupContext.GroupId)
 	}
 	return nil
 }
 
-// Store caches a proposal received this epoch and answers its reference.
+// Store caches a proposal received in the caller's epoch and answers its reference.
 //
 // The order of the refusals is the order a caller wants to hear them, and it is asserted rather
 // than assumed. The PROVIDER first, because the reference is a hash and the hash is the
 // provider's, so a body that judged the message first would answer "this is not a proposal" to a
-// caller whose actual mistake was passing no provider. Then the message itself, then the SENDER,
-// then the v1 profile, then the EPOCH -- and the reference is computed last, because it is the
-// only step that costs a hash and there is nothing to hash in a message five rules have already
-// refused.
+// caller whose actual mistake was passing no provider. Then the group CONTEXT, because it is the
+// other thing the caller was asked for and it decides which epoch every rule below runs in. Then
+// the message itself, then the SENDER, then the v1 profile. Then the two epoch rules, OURS first
+// -- and the reference is computed last, because it is the only step that costs a hash and there
+// is nothing to hash in a message seven rules have already refused.
+//
+// THE TWO EPOCH RULES ARE TWO RULES WITH TWO REMEDIES, and they are in that order because a stale
+// cache makes every entry in it wrong while a mislabelled message is one message. CheckEpoch asks
+// whether THIS CACHE came with the group -- a no means the lifecycle advanced an epoch and did
+// not rebind, which is a bug in this build. The clause after it asks whether the MESSAGE belongs
+// to the epoch the group is in -- a no means a peer sent, or somebody replayed, a proposal of
+// another epoch, and the remedy is to drop it.
+//
+// The second rule is what it is because of what it is NOT: it does not compare the message
+// against itself. The binding it is measured against was taken from the caller's group context at
+// construction or at the last rebind, so a replayed proposal of a closed epoch is refused here
+// and changes nothing -- not the entries, and above all not the binding, which this method does
+// not write at all.
 //
 // The sender rule is this cache's own and is not ValSem112. A CachedProposal carries a LeafIndex,
 // and a sender that is not a member has none: Sender{SenderType: SenderTypeNewMemberProposal}
@@ -531,9 +655,14 @@ func (self *ProposalCache) checkResolveEpoch(groupContext *GroupContext) error {
 // the derivation puts it there -- which is the point of deriving a class rather than listing one.
 //
 //go:noinline
-func (self *ProposalCache) Store(crypto CryptoProvider, content *AuthenticatedContent) (ProposalRef, error) {
+func (self *ProposalCache) Store(crypto CryptoProvider, groupContext *GroupContext,
+	content *AuthenticatedContent) (ProposalRef, error) {
+
 	if crypto == nil {
 		return nil, fmt.Errorf("%w: the reference an entry is keyed by is a hash and the hash is the provider's", ErrNilCryptoProvider)
+	}
+	if groupContext == nil {
+		return nil, fmt.Errorf("%w: a store is refused unless it can name the epoch it is storing in", ErrNilGroupContext)
 	}
 	if content == nil {
 		return nil, fmt.Errorf("%w: there is nothing to cache", errNilAuthenticatedContent)
@@ -547,8 +676,15 @@ func (self *ProposalCache) Store(crypto CryptoProvider, content *AuthenticatedCo
 	if err := checkProposalProfile(defaultProfile(), content.Content.Proposal); err != nil {
 		return nil, err
 	}
-	if err := self.CheckEpoch(content.Content.GroupId, content.Content.Epoch); err != nil {
+	// ours before theirs: a cache that did not come with the group is wrong about every entry
+	// it holds, and a caller told only that one message was stale would go looking at the
+	// message.
+	if err := self.CheckEpoch(groupContext); err != nil {
 		return nil, err
+	}
+	if !self.bindingHolds(content.Content.GroupId, content.Content.Epoch) {
+		return nil, fmt.Errorf("%w: the proposal is of epoch %d of group %x and the cache holds %s",
+			errProposalCacheEpoch, content.Content.Epoch, content.Content.GroupId, self.bindingName())
 	}
 	ref, err := content.ProposalRef(crypto)
 	if err != nil {
@@ -560,12 +696,11 @@ func (self *ProposalCache) Store(crypto CryptoProvider, content *AuthenticatedCo
 	}
 	// the zero valued cache is usable, which is Go's convention for a container and is what
 	// lets the nil provider gate drive this method on a receiver it did not have to build. A
-	// nil map reads fine and only the insert below needs one.
+	// nil map reads fine and only the insert below needs one. It is not a way in: a zero
+	// valued cache is bound to nothing, and the two rules above have already refused.
 	if self.byRef == nil {
 		self.byRef = map[string]CachedProposal{}
 	}
-	self.groupId = bytes.Clone(content.Content.GroupId)
-	self.epoch = content.Content.Epoch
 	key := string(ref)
 	if _, exists := self.byRef[key]; !exists {
 		self.order = append(self.order, key)
@@ -583,13 +718,41 @@ func (self *ProposalCache) Store(crypto CryptoProvider, content *AuthenticatedCo
 	return ref, nil
 }
 
-// Get looks up a cached proposal by its whole reference.
+// Cached looks up a proposal of the caller's epoch by its whole reference.
 //
-// The value it answers is the cache's own and is not copied: Get has no error to report a copy
+// NOT SPELLED Get, AND THE NAME IS LOAD BEARING. tree.go declares (*RatchetTree).Get, and
+// guardrail 8's reachability walk over the ratchet tree's key questions -- tree_test.go's
+// TestEveryKeyQuestionOverTheRatchetTreeIsAnsweredInConstantTime -- is keyed by the bare
+// declaration NAME, because it reads parsed source with no type information in it. Two methods
+// called Get are one node in that graph. So a lookup here spelled Get would put this body's
+// constant time comparison inside the call graph of every tree method that reads a node, which
+// makes an excused member of that class read as reaching the sanctioned comparison -- measured,
+// that is exactly what happened -- and, worse, makes the POSITIVE half of that rule satisfiable by
+// any key question that happens to call something named Get. The rename keeps that gate as precise
+// as it was rather than working around it.
+//
+// THE GROUP CONTEXT IS NOT DECORATION HERE. p7's CheckErrata8815 reads this and reports "proposal
+// reference %x is not cached for this epoch" on a miss, and a Get that consulted only the map
+// could not make that claim: it would answer an entry of a closed epoch to a caller that had
+// asked about the live one. The ordering that saves it today -- Resolve running first at both
+// call sites -- is a property of two call sites and not of this method, and those are different
+// claims.
+//
+// A missing entry and an entry of another epoch are ONE answer, because to the caller they are
+// one fact: nothing of your epoch is cached under that reference. A caller that needs the two
+// apart is resolving a commit, and Resolve separates them under two sentinels of its own.
+//
+// The value it answers is the cache's own and is not copied: this has no error to report a copy
 // failing with, and a copy on every lookup would be a marshal per resolved reference. A caller
 // that writes into what it gets back corrupts the entry. Resolve, which is what the commit path
 // actually uses, copies.
-func (self *ProposalCache) Get(ref ProposalRef) (CachedProposal, bool) {
+func (self *ProposalCache) Cached(groupContext *GroupContext, ref ProposalRef) (CachedProposal, bool) {
+	if groupContext == nil {
+		return CachedProposal{}, false
+	}
+	if !self.bindingHolds(groupContext.GroupId, groupContext.Epoch) {
+		return CachedProposal{}, false
+	}
 	cached, ok := self.byRef[string(ref)]
 	return cached, ok
 }
@@ -614,7 +777,7 @@ func (self *ProposalCache) Get(ref ProposalRef) (CachedProposal, bool) {
 //     member's single published proposal is applied twice.
 //  4. a reference into a cache bound to ANOTHER epoch is refused, under this cache's own
 //     errProposalResolvedOutOfEpoch and not under Store's errProposalCacheEpoch -- see
-//     checkResolveEpoch, and see the note beside the two values for why they are two.
+//     checkResolveEpoch, and see the note beside the values for why the epoch rules are three.
 //  5. a second GroupContextExtensions proposal is refused, which is what makes
 //     ProposalList.Extensions exact rather than a silent choice between two extension sets.
 //
@@ -622,14 +785,16 @@ func (self *ProposalCache) Get(ref ProposalRef) (CachedProposal, bool) {
 // changed to carry. The shape the group lifecycle plan first pinned took a committer and a
 // vector and nothing that names an epoch, so this body could not ask which epoch it was
 // resolving in -- and a proposal cached in epoch N therefore resolved in epoch N+1
-// unconditionally, which is the one direction a cache must not fail. CheckEpoch existed and read
-// like the guard, but its only caller in the tree was Store, on the stored content's OWN epoch:
-// self referential for the first entry, so the binding went to whatever was stored first, and
-// what is stored first is attacker supplied. The mitigation on offer was a Clear() at the epoch
-// boundaries somebody had remembered to write down, which is an enumeration of the paths that
-// advance an epoch. A group context is what every caller of this method already holds -- Commit
-// and the inbound commit path both resolve against self.context -- so asking for it costs the
-// callers nothing and moves the refusal from a discipline to a door.
+// unconditionally, which is the one direction a cache must not fail. A group context is what
+// every caller of this method already holds -- Commit and the inbound commit path both resolve
+// against self.context -- so asking for it costs the callers nothing and moves the refusal from a
+// discipline to a door.
+//
+// It is the same object the binding itself comes from, which is the second half of the fix and
+// the more important one. Rule 4 was landed first, over a binding still taken from the first
+// entry stored; that made a stale entry unusable but left the binding attacker supplied, so a
+// replay of one genuine old proposal into a freshly emptied cache locked the member out of its
+// own live epoch. A door is worth what the value behind it is worth.
 //
 // The provider is not reached. It is in the signature because the group lifecycle plan pins it
 // there and every caller already holds one; the refusal below is what stops the parameter being a
@@ -745,35 +910,25 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, groupContext *GroupCon
 	return list, nil
 }
 
-// Pending answers every cached proposal as a by-reference entry, in the order it was received.
+// Pending answers every proposal cached in the caller's epoch as a by-reference entry, in the
+// order it was received.
 //
 // A committer includes all valid pending proposals (RFC 9420 section 12.4 SHOULD), and the ORDER
 // is the reception order rather than the map's, because Add placement depends on it and a map
 // range answers a different tree on every run.
-func (self *ProposalCache) Pending() []ProposalOrRef {
+//
+// The group context is here for Cached's reason and it matters more here, because what this answers
+// goes straight into a commit: a Pending that read only the map would hand a committer of the new
+// epoch the references of the closed one, and the commit built from them names proposals no
+// receiver can resolve. Nothing of another epoch is answered, so a committer over a cache nobody
+// rebound commits nothing rather than committing a replay.
+func (self *ProposalCache) Pending(groupContext *GroupContext) []ProposalOrRef {
+	if groupContext == nil || !self.bindingHolds(groupContext.GroupId, groupContext.Epoch) {
+		return []ProposalOrRef{}
+	}
 	out := make([]ProposalOrRef, 0, len(self.order))
 	for _, key := range self.order {
 		out = append(out, ProposalOrRef{Type: ProposalOrRefTypeReference, Reference: ProposalRef(key)})
 	}
 	return out
-}
-
-// Clear empties the cache and unbinds it from the epoch it was holding.
-//
-// WHO CALLS IT is a derived question and not a list of call sites. Two hand written Clear()
-// calls at the epoch boundaries somebody remembered is an enumeration of the paths that advance
-// an epoch, and this project's ledger holds fourteen enumerations that understated their class.
-// TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBinding derives that
-// class off what a declaration DOES -- it writes a group context, or an epoch, into storage that
-// outlives the call -- over the same roots the crypto guardrails walk, and holds every member to
-// ending the binding through one of the methods that can.
-//
-// Clear is not the only way to end one; it is the way that ends it without starting another. A
-// method that rebound the cache to the new epoch would answer the same gate, and
-// TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere is where the two are told apart.
-func (self *ProposalCache) Clear() {
-	self.byRef = map[string]CachedProposal{}
-	self.order = nil
-	self.groupId = nil
-	self.epoch = 0
 }

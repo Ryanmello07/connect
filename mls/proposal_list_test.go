@@ -964,12 +964,37 @@ func testRemoveProposal(removed LeafIndex) *Proposal {
 	return &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: removed}}
 }
 
+// testCacheAt is a cache bound to one epoch, with the constructor's refusal taken here rather
+// than checked at forty call sites.
+//
+// The refusal itself is held by TestACacheBoundToNothingRefusesRatherThanBindingItselfLater and by
+// the derived nil argument sweep, so a helper that swallowed it would be swallowing something two
+// gates already read. What it must not do is hide it: t.Fatalf and not a discarded error, because
+// a nil cache handed on from here would fail every later line as a dereference rather than as the
+// constructor refusing.
+func testCacheAt(t *testing.T, groupContext *GroupContext) *ProposalCache {
+	t.Helper()
+	cache, err := NewProposalCache(groupContext)
+	if err != nil {
+		t.Fatalf("NewProposalCache(epoch %d of group %x): %v", groupContext.Epoch, groupContext.GroupId, err)
+	}
+	return cache
+}
+
+// testCache is the cache every test that is NOT about the epoch binding stores into: bound to the
+// epoch testProposalContent stamps on a proposal and testResolveContext resolves in.
+func testCache(t *testing.T) *ProposalCache {
+	t.Helper()
+	return testCacheAt(t, testResolveContext())
+}
+
 // testStoredRemove caches one remove sent by one member and answers its reference.
 func testStoredRemove(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
 	sender LeafIndex, removed LeafIndex) ProposalRef {
 
 	t.Helper()
-	ref, err := cache.Store(crypto, testProposalContent(t, crypto, sender, testRemoveProposal(removed)))
+	ref, err := cache.Store(crypto, testResolveContext(),
+		testProposalContent(t, crypto, sender, testRemoveProposal(removed)))
 	if err != nil {
 		t.Fatalf("Store(remove %d from leaf %d): %v", removed, sender, err)
 	}
@@ -982,12 +1007,12 @@ func testStoredRemove(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
 
 func TestProposalCacheResolvesByReference(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
-	cached, ok := cache.Get(ref)
+	cached, ok := cache.Cached(testResolveContext(), ref)
 	if !ok || cached.Sender != 1 || cached.ByValue {
-		t.Fatalf("Get = %+v %v", cached, ok)
+		t.Fatalf("Cached = %+v %v", cached, ok)
 	}
 
 	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
@@ -1016,7 +1041,7 @@ func TestProposalCacheResolvesByReference(t *testing.T) {
 // reference every peer verifies and agrees with.
 func TestTheCacheAnswersTheReferenceItWasAskedForAndNotTheFirstOneItHolds(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	senders := []LeafIndex{1, 2, 3}
 	removals := []LeafIndex{7, 8, 9}
 	refs := []ProposalRef{}
@@ -1024,12 +1049,12 @@ func TestTheCacheAnswersTheReferenceItWasAskedForAndNotTheFirstOneItHolds(t *tes
 		refs = append(refs, testStoredRemove(t, crypto, cache, senders[i], removals[i]))
 	}
 	for i, ref := range refs {
-		cached, ok := cache.Get(ref)
+		cached, ok := cache.Cached(testResolveContext(), ref)
 		if !ok {
-			t.Fatalf("Get(entry %d) missed a reference this cache answered", i)
+			t.Fatalf("Cached(entry %d) missed a reference this cache answered", i)
 		}
 		if cached.Proposal.Remove.Removed != removals[i] || cached.Sender != senders[i] {
-			t.Errorf("Get(entry %d) answered a removal of leaf %d sent by leaf %d, want %d sent by %d",
+			t.Errorf("Cached(entry %d) answered a removal of leaf %d sent by leaf %d, want %d sent by %d",
 				i, cached.Proposal.Remove.Removed, cached.Sender, removals[i], senders[i])
 		}
 		list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
@@ -1057,7 +1082,7 @@ func TestTheCacheAnswersTheReferenceItWasAskedForAndNotTheFirstOneItHolds(t *tes
 // byte alone is not: a key of ref[8:] is invisible to it.
 func TestTheCacheKeyIsTheWholeReferenceAndNotAPrefixOfIt(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	if len(ref) == 0 {
 		t.Fatal("the stored reference is empty, so every neighbour below is the same reference")
@@ -1065,8 +1090,8 @@ func TestTheCacheKeyIsTheWholeReferenceAndNotAPrefixOfIt(t *testing.T) {
 	for i := range ref {
 		neighbour := bytes.Clone(ref)
 		neighbour[i] ^= 0xFF
-		if _, ok := cache.Get(ProposalRef(neighbour)); ok {
-			t.Errorf("Get answered an entry for a reference differing from the stored one at octet %d of %d; the lookup is not keyed on the whole reference",
+		if _, ok := cache.Cached(testResolveContext(), ProposalRef(neighbour)); ok {
+			t.Errorf("the lookup answered an entry for a reference differing from the stored one at octet %d of %d; the lookup is not keyed on the whole reference",
 				i, len(ref))
 		}
 		if _, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
@@ -1078,15 +1103,15 @@ func TestTheCacheKeyIsTheWholeReferenceAndNotAPrefixOfIt(t *testing.T) {
 	// and a reference that is a genuine PREFIX of a stored one, which is the shape a caller
 	// sends when it truncates on the wire rather than in the map
 	for cut := 1; cut < len(ref); cut += 1 {
-		if _, ok := cache.Get(ProposalRef(ref[:cut])); ok {
-			t.Errorf("Get answered an entry for the first %d octets of a %d octet reference", cut, len(ref))
+		if _, ok := cache.Cached(testResolveContext(), ProposalRef(ref[:cut])); ok {
+			t.Errorf("the lookup answered an entry for the first %d octets of a %d octet reference", cut, len(ref))
 		}
 	}
 }
 
 func TestProposalCacheResolveUnknownReference(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	unknown := ProposalRef(bytes.Repeat([]byte{9}, 32))
 	_, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: unknown}})
@@ -1105,7 +1130,7 @@ func TestProposalCacheResolveUnknownReference(t *testing.T) {
 // duplicate that the cache itself manufactured.
 func TestResolveRefusesOneReferenceNamedTwice(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	_, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
 		{Type: ProposalOrRefTypeReference, Reference: ref},
@@ -1133,7 +1158,7 @@ func TestResolveRefusesOneReferenceNamedTwice(t *testing.T) {
 
 func TestProposalCacheByValueSenderIsCommitter(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(5), []ProposalOrRef{{
 		Type:     ProposalOrRefTypeProposal,
 		Proposal: testRemoveProposal(LeafIndex(2)),
@@ -1162,10 +1187,10 @@ func TestTheCacheAcceptsExactlyOneSenderTypeOfTheWholeCodePointSpace(t *testing.
 	accepted := []SenderType{}
 	for code := 0; code < 256; code += 1 {
 		senderType := SenderType(code)
-		cache := NewProposalCache()
+		cache := testCache(t)
 		content := testProposalContent(t, crypto, LeafIndex(1), testRemoveProposal(LeafIndex(4)))
 		content.Content.Sender = Sender{SenderType: senderType, LeafIndex: 1}
-		_, err := cache.Store(crypto, content)
+		_, err := cache.Store(crypto, testResolveContext(), content)
 		if err == nil {
 			accepted = append(accepted, senderType)
 			continue
@@ -1183,70 +1208,107 @@ func TestTheCacheAcceptsExactlyOneSenderTypeOfTheWholeCodePointSpace(t *testing.
 // the epoch an entry belongs to
 // ---------------------------------------------------------------------------
 
-// TestTheCacheIsBoundToTheEpochOfItsFirstEntry is the replay property.
+// TestTheCacheIsBoundToTheGroupsOwnEpochAndNotToWhateverArrivedFirst is the replay property, and
+// the direction it is stated in is the whole of the fix.
 //
 // A ProposalRef is a hash over an AuthenticatedContent that carries the group id and the epoch,
 // so an entry from another epoch is not merely stale -- it is a name no commit of THIS epoch can
 // legitimately carry. A cache that took entries from two epochs would answer the older one's
 // references to the newer one's commit, which applies a proposal the group has already applied
 // under a reference that still verifies.
-func TestTheCacheIsBoundToTheEpochOfItsFirstEntry(t *testing.T) {
+//
+// What the earlier reading could not say is WHICH epoch is this cache's. It took that from the
+// first entry stored and then held every later entry to it, so the four refusals below all held --
+// and all of them held against a binding a peer had chosen. Here the binding is the group context
+// the cache was constructed with, and the FIRST store is judged by exactly the same rule as the
+// fourth, which is what the first case below is for and what no ordering of the old rule could
+// state.
+func TestTheCacheIsBoundToTheGroupsOwnEpochAndNotToWhateverArrivedFirst(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+	live := testResolveContextAt([]byte("group"), 7)
+	cache := testCacheAt(t, live)
+	if _, err := cache.Store(crypto, live, testProposalContentAt(t, 1, []byte("group"), 8,
+		testRemoveProposal(LeafIndex(5)))); !errors.Is(err, errProposalCacheEpoch) {
+		t.Errorf("the FIRST store into a cache bound to epoch 7, carrying epoch 8, answered %v, want errProposalCacheEpoch; a cache that took its epoch from whatever arrived first would have accepted this and bound itself to it",
+			err)
+	}
+	if _, err := cache.Store(crypto, live, testProposalContentAt(t, 1, []byte("group"), 7,
 		testRemoveProposal(LeafIndex(4)))); err != nil {
 		t.Fatalf("Store at epoch 7: %v", err)
 	}
 	// the epoch after
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 8,
+	if _, err := cache.Store(crypto, live, testProposalContentAt(t, 1, []byte("group"), 8,
 		testRemoveProposal(LeafIndex(5)))); !errors.Is(err, errProposalCacheEpoch) {
 		t.Errorf("Store at epoch 8 into a cache holding epoch 7 answered %v, want errProposalCacheEpoch", err)
 	}
 	// and the epoch before, because a cache that only refused a HIGHER epoch would take a
 	// replayed proposal from a closed one
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 6,
+	if _, err := cache.Store(crypto, live, testProposalContentAt(t, 1, []byte("group"), 6,
 		testRemoveProposal(LeafIndex(5)))); !errors.Is(err, errProposalCacheEpoch) {
 		t.Errorf("Store at epoch 6 into a cache holding epoch 7 answered %v, want errProposalCacheEpoch", err)
 	}
 	// and another GROUP at the same epoch, because the epoch number alone is not an identity:
 	// every group in this client runs an epoch 7
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("other"), 7,
+	if _, err := cache.Store(crypto, live, testProposalContentAt(t, 1, []byte("other"), 7,
 		testRemoveProposal(LeafIndex(5)))); !errors.Is(err, errProposalCacheEpoch) {
 		t.Errorf("Store for another group at epoch 7 answered %v, want errProposalCacheEpoch", err)
 	}
-	if got := len(cache.Pending()); got != 1 {
-		t.Errorf("the cache holds %d entries after three refusals, want 1", got)
+	if got := len(cache.Pending(live)); got != 1 {
+		t.Errorf("the cache holds %d entries after four refusals, want 1", got)
 	}
 }
 
-// TestCheckEpochAnswersTheBindingAndClearReleasesIt is the half Store cannot see: an epoch that
+// TestCheckEpochAnswersTheBindingAndRebindMovesIt is the half Store cannot see: an epoch that
 // advanced with no proposal arriving in the new one.
-func TestCheckEpochAnswersTheBindingAndClearReleasesIt(t *testing.T) {
+//
+// THE EMPTY CACHE IS THE CASE THAT MATTERS, and it is the one the earlier reading could not see.
+// While the binding came from the first entry stored, an empty cache answered nil for every epoch
+// anybody named -- and an empty cache is precisely what a boundary leaves behind, so the one guard
+// written to notice a boundary was blind to exactly the state a boundary produces. A cache bound
+// at construction belongs to its epoch whether or not anything has been stored in it.
+func TestCheckEpochAnswersTheBindingAndRebindMovesIt(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
-	// an empty cache belongs to no epoch: there is nothing in it to be stale
-	if err := cache.CheckEpoch([]byte("group"), 99); err != nil {
-		t.Fatalf("CheckEpoch on an empty cache = %v, want nil", err)
+	at7 := testResolveContextAt([]byte("group"), 7)
+	cache := testCacheAt(t, at7)
+	if err := cache.CheckEpoch(at7); err != nil {
+		t.Fatalf("CheckEpoch for the epoch this cache was built in = %v, want nil", err)
 	}
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+	if err := cache.CheckEpoch(testResolveContextAt([]byte("group"), 8)); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Fatalf("CheckEpoch on an EMPTY cache, for the epoch after the one it was bound to, = %v, want errProposalCacheNotRebound; an empty cache belongs to the epoch it was bound to, and an emptied cache that answered for any epoch is the whole of what this guard could not see",
+			err)
+	}
+	if _, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 7,
 		testRemoveProposal(LeafIndex(4)))); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
-	if err := cache.CheckEpoch([]byte("group"), 7); err != nil {
+	if err := cache.CheckEpoch(at7); err != nil {
 		t.Errorf("CheckEpoch for the epoch this cache holds = %v, want nil", err)
 	}
-	if err := cache.CheckEpoch([]byte("group"), 8); !errors.Is(err, errProposalCacheEpoch) {
-		t.Errorf("CheckEpoch for the next epoch = %v, want errProposalCacheEpoch", err)
+	if err := cache.CheckEpoch(testResolveContextAt([]byte("group"), 8)); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch for the next epoch = %v, want errProposalCacheNotRebound", err)
 	}
-	if err := cache.CheckEpoch([]byte("other"), 7); !errors.Is(err, errProposalCacheEpoch) {
-		t.Errorf("CheckEpoch for another group = %v, want errProposalCacheEpoch", err)
+	if err := cache.CheckEpoch(testResolveContextAt([]byte("other"), 7)); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch for another group = %v, want errProposalCacheNotRebound", err)
 	}
-	cache.Clear()
-	if err := cache.CheckEpoch([]byte("group"), 8); err != nil {
-		t.Errorf("CheckEpoch after Clear = %v, want nil; Clear is what releases the binding", err)
+	at8 := testResolveContextAt([]byte("group"), 8)
+	if err := cache.Rebind(at8); err != nil {
+		t.Fatalf("Rebind to epoch 8: %v", err)
 	}
-	if got := len(cache.Pending()); got != 0 {
-		t.Errorf("Clear left %d entries behind", got)
+	if err := cache.CheckEpoch(at8); err != nil {
+		t.Errorf("CheckEpoch after Rebind = %v, want nil; Rebind is what carries the cache across a boundary", err)
+	}
+	if err := cache.CheckEpoch(at7); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch for the epoch that just closed = %v, want errProposalCacheNotRebound; a rebind MOVES the binding and does not release it, and a released binding is the one a message could fill",
+			err)
+	}
+	if got := len(cache.Pending(at8)); got != 0 {
+		t.Errorf("Rebind left %d entries behind", got)
+	}
+	if err := cache.Rebind(nil); !errors.Is(err, ErrNilGroupContext) {
+		t.Errorf("Rebind(nil) = %v, want ErrNilGroupContext", err)
+	}
+	if err := cache.CheckEpoch(at8); err != nil {
+		t.Errorf("the refused rebind moved the binding: %v", err)
 	}
 }
 
@@ -1257,22 +1319,203 @@ func TestCheckEpochAnswersTheBindingAndClearReleasesIt(t *testing.T) {
 // changes when the caller reuses that buffer, so a cache that was holding group A silently starts
 // answering for group B with no error path anywhere -- and CheckEpoch, the one guard that would
 // have said so, agrees with whatever the buffer now holds.
+//
+// BOTH WRITE SITES, because two places that build a binding are two places the clone can be
+// dropped, and the one that is dropped is whichever a later reader did not have in front of them.
 func TestTheCachedGroupIdIsCutFromTheCallersArrayAndNotAliasedToIt(t *testing.T) {
-	crypto := testCrypto(t)
-	cache := NewProposalCache()
 	groupId := []byte("group")
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, groupId, 7,
-		testRemoveProposal(LeafIndex(4)))); err != nil {
-		t.Fatalf("Store: %v", err)
-	}
+	cache := testCacheAt(t, testResolveContextAt(groupId, 7))
 	for i := range groupId {
 		groupId[i] = 0x5A
 	}
-	if err := cache.CheckEpoch([]byte("group"), 7); err != nil {
-		t.Errorf("CheckEpoch for the group this cache was bound to = %v after the caller overwrote its own array, want nil", err)
+	if err := cache.CheckEpoch(testResolveContextAt([]byte("group"), 7)); err != nil {
+		t.Errorf("CheckEpoch for the group this cache was built in = %v after the caller overwrote its own array, want nil", err)
 	}
-	if err := cache.CheckEpoch(groupId, 7); !errors.Is(err, errProposalCacheEpoch) {
-		t.Errorf("CheckEpoch for what the caller's array now holds = %v, want errProposalCacheEpoch", err)
+	if err := cache.CheckEpoch(testResolveContextAt(groupId, 7)); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch for what the caller's array now holds = %v, want errProposalCacheNotRebound", err)
+	}
+	rebound := []byte("second")
+	if err := cache.Rebind(testResolveContextAt(rebound, 9)); err != nil {
+		t.Fatalf("Rebind: %v", err)
+	}
+	for i := range rebound {
+		rebound[i] = 0x5A
+	}
+	if err := cache.CheckEpoch(testResolveContextAt([]byte("second"), 9)); err != nil {
+		t.Errorf("CheckEpoch after a Rebind = %v after the caller overwrote its own array, want nil", err)
+	}
+	if err := cache.CheckEpoch(testResolveContextAt(rebound, 9)); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch for what the caller's array now holds = %v, want errProposalCacheNotRebound", err)
+	}
+}
+
+// TestAReplayedProposalOfAClosedEpochNeitherBindsTheCacheNorLocksOutTheLiveEpoch is the defect,
+// written as the sequence that produced it.
+//
+// The sequence: a member caches a genuine proposal in epoch N, the group commits and moves to N+1,
+// and somebody replays that same genuine epoch N proposal at the freshly emptied cache. It is a
+// message every peer has already seen and it verifies, so nothing upstream of this cache drops it.
+//
+// What used to happen is that the cache took its binding from that replay, because the binding came
+// from the first entry stored and was checked against that entry's own epoch. The member was then
+// bound to a closed epoch: it could cache nothing of the live one, resolve no commit that named a
+// proposal, and never recover, because the only thing that released the binding ran off a commit it
+// could no longer resolve. Integrity held the whole time -- the replayed proposal was never applied
+// -- and the member was permanently unable to take part in its own group, at the cost of replaying
+// one message.
+//
+// So the assertions after the replay are about AVAILABILITY and not about the refusal. The refusal
+// is one line; the five under it are the group carrying on, and they are the half the earlier fix
+// did not have.
+func TestAReplayedProposalOfAClosedEpochNeitherBindsTheCacheNorLocksOutTheLiveEpoch(t *testing.T) {
+	crypto := testCrypto(t)
+	closed := testResolveContextAt([]byte("group"), 7)
+	live := testResolveContextAt([]byte("group"), 8)
+
+	cache := testCacheAt(t, closed)
+	stale := testProposalContentAt(t, 1, []byte("group"), 7, testRemoveProposal(LeafIndex(4)))
+	staleRef, err := cache.Store(crypto, closed, stale)
+	if err != nil {
+		t.Fatalf("Store in epoch 7: %v", err)
+	}
+
+	// the boundary
+	if err := cache.Rebind(live); err != nil {
+		t.Fatalf("Rebind to epoch 8: %v", err)
+	}
+
+	// the replay, delivered before anything of the live epoch has arrived, which is the one
+	// moment at which the old cache had no opinion of its own to check it against
+	if _, err := cache.Store(crypto, live, stale); !errors.Is(err, errProposalCacheEpoch) {
+		t.Fatalf("the replayed epoch 7 proposal answered %v, want errProposalCacheEpoch", err)
+	}
+
+	fresh := testProposalContentAt(t, 2, []byte("group"), 8, testRemoveProposal(LeafIndex(5)))
+	freshRef, err := cache.Store(crypto, live, fresh)
+	if err != nil {
+		t.Fatalf("a genuine epoch 8 proposal, stored after the replay, answered %v; the replay took the binding and this member can no longer take part in its own group", err)
+	}
+	if err := cache.CheckEpoch(live); err != nil {
+		t.Errorf("after the replay the cache reports %v for its own live epoch", err)
+	}
+	if _, held := cache.Cached(live, freshRef); !held {
+		t.Error("the live epoch's proposal is not answered by the lookup after the replay")
+	}
+	if got := len(cache.Pending(live)); got != 1 {
+		t.Errorf("Pending answers %d entries of the live epoch after the replay, want 1; a committer reading this commits nothing", got)
+	}
+	list, err := cache.Resolve(crypto, live, LeafIndex(0),
+		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: freshRef}})
+	if err != nil {
+		t.Fatalf("a commit of the live epoch naming the live epoch's own proposal answered %v; this is the member that can no longer merge a commit, which is what made the lockout permanent", err)
+	}
+	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 5 {
+		t.Errorf("the live commit resolved to %+v", list.Removes)
+	}
+	// and the replayed name is GONE rather than merely refused: the entry left with the epoch
+	if _, err := cache.Resolve(crypto, live, LeafIndex(0),
+		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: staleRef}}); !errors.Is(err, errProposalNotCached) {
+		t.Errorf("a commit of epoch 8 naming the epoch 7 reference answered %v, want errProposalNotCached", err)
+	}
+}
+
+// TestCachedAndPendingAnswerNothingForAnEpochThisCacheIsNotBoundTo closes the two doors that read the
+// map and consulted no binding at all.
+//
+// Neither is the door a replay comes through, and that is exactly why they are worth closing. p7's
+// CheckErrata8815 calls this and reports "proposal reference %x is not cached for this epoch" on a
+// miss, which is a claim about an epoch that a lookup consulting only the map cannot make; what
+// saved it was the ORDER of two call sites, Resolve running first at both, and the order of two
+// call sites is a property of those call sites rather than of this method. Pending is worse: what
+// it answers goes straight into a commit, so a committer over a cache nobody rebound would name the
+// closed epoch's references in the new epoch's commit.
+func TestCachedAndPendingAnswerNothingForAnEpochThisCacheIsNotBoundTo(t *testing.T) {
+	crypto := testCrypto(t)
+	at7 := testResolveContextAt([]byte("group"), 7)
+	cache := testCacheAt(t, at7)
+	ref, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 7,
+		testRemoveProposal(LeafIndex(4))))
+	if err != nil {
+		t.Fatalf("Store at epoch 7: %v", err)
+	}
+	if _, held := cache.Cached(at7, ref); !held {
+		t.Fatal("the lookup missed the reference Store answered in the epoch the cache is bound to, so every refusal below is that miss")
+	}
+	if got := len(cache.Pending(at7)); got != 1 {
+		t.Fatalf("Pending answers %d entries in the epoch the cache is bound to, want 1", got)
+	}
+	for _, one := range []struct {
+		what    string
+		context *GroupContext
+	}{
+		{"the epoch after, which is what a member reads with after a boundary nobody rebound over",
+			testResolveContextAt([]byte("group"), 8)},
+		{"the epoch before", testResolveContextAt([]byte("group"), 6)},
+		{"another group at the same epoch number", testResolveContextAt([]byte("other"), 7)},
+	} {
+		if cached, held := cache.Cached(one.context, ref); held {
+			t.Errorf("the lookup in %s answered %+v, so \"not cached for this epoch\" is a sentence about a lookup that read no epoch",
+				one.what, cached)
+		}
+		if got := cache.Pending(one.context); len(got) != 0 {
+			t.Errorf("Pending in %s answered %d entries, which a committer of that epoch would name in its commit",
+				one.what, len(got))
+		}
+	}
+	// and no group context at all is not a way past either of them
+	if _, held := cache.Cached(nil, ref); held {
+		t.Error("a lookup with no group context answered an entry")
+	}
+	if got := cache.Pending(nil); len(got) != 0 {
+		t.Errorf("Pending with no group context answered %d entries", len(got))
+	}
+}
+
+// TestACacheBoundToNothingRefusesRatherThanBindingItselfLater is the fail-closed half, over the
+// one unbound cache this package can still produce.
+//
+// A cache with no binding is the state in which "take the epoch from whatever arrives" is a
+// tempting thing to write, and it is the state the old Clear left behind after every epoch
+// boundary. The constructor no longer produces one. What still does is the ZERO VALUE, because Go's
+// convention for a container leaves it usable and the nil provider gate drives Store on one -- so
+// the zero value is what this is stated over.
+//
+// The empty group at epoch 0 is checked by name because it is not a hypothetical: epoch 0 is where
+// every group starts, so a binding held as two zero valued fields with no way to say "bound to
+// nothing" would answer for it.
+func TestACacheBoundToNothingRefusesRatherThanBindingItselfLater(t *testing.T) {
+	crypto := testCrypto(t)
+	if _, err := NewProposalCache(nil); !errors.Is(err, ErrNilGroupContext) {
+		t.Fatalf("NewProposalCache(nil) = %v, want ErrNilGroupContext; a constructor that answered an unbound cache hands the one state the epoch can come from a message in to every caller that did not read an error",
+			err)
+	}
+	cache := &ProposalCache{}
+	if err := cache.CheckEpoch(testResolveContext()); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch on a zero valued cache = %v, want errProposalCacheNotRebound", err)
+	}
+	zero := &GroupContext{}
+	if err := cache.CheckEpoch(zero); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("CheckEpoch for the empty group at epoch 0 = %v, want errProposalCacheNotRebound; a zero valued binding answers for the epoch every group starts in",
+			err)
+	}
+	if _, err := cache.Store(crypto, zero, testProposalContentAt(t, 1, nil, 0,
+		testRemoveProposal(LeafIndex(4)))); !errors.Is(err, errProposalCacheNotRebound) {
+		t.Errorf("Store into a cache bound to nothing = %v, want errProposalCacheNotRebound", err)
+	}
+	if _, held := cache.Cached(zero, ProposalRef("anything")); held {
+		t.Error("a cache bound to nothing answered a lookup")
+	}
+	if got := len(cache.Pending(zero)); got != 0 {
+		t.Errorf("Pending on a cache bound to nothing answered %d entries", got)
+	}
+	// and it becomes usable the one way it can
+	live := testResolveContext()
+	if err := cache.Rebind(live); err != nil {
+		t.Fatalf("Rebind: %v", err)
+	}
+	if _, err := cache.Store(crypto, live, testProposalContent(t, crypto, LeafIndex(1),
+		testRemoveProposal(LeafIndex(4)))); err != nil {
+		t.Errorf("Store after Rebind = %v", err)
 	}
 }
 
@@ -1282,7 +1525,7 @@ func TestTheCachedGroupIdIsCutFromTheCallersArrayAndNotAliasedToIt(t *testing.T)
 
 func TestProposalCacheBucketsAndOrder(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	refs := []ProposalOrRef{
 		{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(1))},
 		{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(2))},
@@ -1312,7 +1555,7 @@ func TestProposalCacheBucketsAndOrder(t *testing.T) {
 // satisfied by all three.
 func TestResolveKeepsCommitOrderInAllAndInEveryBucket(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	// cached in the OPPOSITE order to the one the commit names them in, so a resolution reading
 	// the cache's reception order answers 4, 2 rather than 2, 4
 	fourth := testStoredRemove(t, crypto, cache, LeafIndex(9), LeafIndex(4))
@@ -1361,7 +1604,7 @@ func TestResolveKeepsCommitOrderInAllAndInEveryBucket(t *testing.T) {
 func TestProposalListPathRequiredAddOnly(t *testing.T) {
 	crypto := testCrypto(t)
 	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "bob"))
-	cache := NewProposalCache()
+	cache := testCache(t)
 	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type:     ProposalOrRefTypeProposal,
 		Proposal: &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}},
@@ -1380,7 +1623,7 @@ func TestProposalListPathRequiredAddOnly(t *testing.T) {
 // still holds.
 func TestAnEmptyProposalListRequiresAPath(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), nil)
 	if err != nil {
 		t.Fatalf("Resolve of an empty vector: %v", err)
@@ -1453,7 +1696,7 @@ func TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn(t *testing.T
 			continue
 		}
 		accepted = append(accepted, name)
-		list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
+		list, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 			Type:     ProposalOrRefTypeProposal,
 			Proposal: proposalOfRegisteredType(t, crypto, member, proposalType),
 		}})
@@ -1508,7 +1751,7 @@ func TestTheListPathRequirementFollowsTheRfcSetForEveryAcceptedType(t *testing.T
 		if refusal, classified := proposalTypeProfile[proposalType]; !classified || refusal != nil {
 			continue
 		}
-		list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
+		list, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 			Type:     ProposalOrRefTypeProposal,
 			Proposal: proposalOfRegisteredType(t, crypto, member, proposalType),
 		}})
@@ -1542,7 +1785,7 @@ func TestResolveRefusesASecondGroupContextExtensionsProposal(t *testing.T) {
 	crypto := testCrypto(t)
 	first := []Extension{{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0, 0, 0}}}
 	second := []Extension{{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{1}}}
-	_, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
+	_, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{
 		{Type: ProposalOrRefTypeProposal, Proposal: &Proposal{
 			ProposalType:           ProposalTypeGroupContextExtensions,
 			GroupContextExtensions: &GroupContextExtensions{Extensions: first}}},
@@ -1558,7 +1801,7 @@ func TestResolveRefusesASecondGroupContextExtensionsProposal(t *testing.T) {
 // TestExtensionsAnswersTheProposedSetAndNothingWhenThereIsNone
 func TestExtensionsAnswersTheProposedSetAndNothingWhenThereIsNone(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	empty, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(1))}})
 	if err != nil {
@@ -1594,14 +1837,15 @@ func TestExtensionsAnswersTheProposedSetAndNothingWhenThereIsNone(t *testing.T) 
 // what the cache would then answer is whatever the caller wrote afterwards.
 func TestTheCacheKeepsNothingTheCallerCanStillWriteInto(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	body := []byte{0x11, 0x22, 0x33}
 	proposal := &Proposal{
 		ProposalType: ProposalTypeGroupContextExtensions,
 		GroupContextExtensions: &GroupContextExtensions{Extensions: []Extension{
 			{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: body}}},
 	}
-	ref, err := cache.Store(crypto, testProposalContent(t, crypto, LeafIndex(1), proposal))
+	ref, err := cache.Store(crypto, testResolveContext(),
+		testProposalContent(t, crypto, LeafIndex(1), proposal))
 	if err != nil {
 		t.Fatalf("Store: %v", err)
 	}
@@ -1610,9 +1854,9 @@ func TestTheCacheKeepsNothingTheCallerCanStillWriteInto(t *testing.T) {
 		body[i] = 0xFF
 	}
 	proposal.GroupContextExtensions.Extensions[0].ExtensionType = ExtensionTypeUrmessageGroupPolicy
-	cached, ok := cache.Get(ref)
+	cached, ok := cache.Cached(testResolveContext(), ref)
 	if !ok {
-		t.Fatal("Get missed the reference Store answered")
+		t.Fatal("the lookup missed the reference Store answered")
 	}
 	held := cached.Proposal.GroupContextExtensions.Extensions[0]
 	if held.ExtensionType != ExtensionTypeRequiredCapabilities {
@@ -1629,7 +1873,7 @@ func TestTheCacheKeepsNothingTheCallerCanStillWriteInto(t *testing.T) {
 // the entries every later commit of this epoch resolves.
 func TestResolveHandsBackNothingTheCacheStillHolds(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	list, err := cache.Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}})
@@ -1638,7 +1882,7 @@ func TestResolveHandsBackNothingTheCacheStillHolds(t *testing.T) {
 	}
 	list.All[0].Proposal.Remove.Removed = 99
 	list.All[0].Ref[0] ^= 0xFF
-	cached, ok := cache.Get(ref)
+	cached, ok := cache.Cached(testResolveContext(), ref)
 	if !ok {
 		t.Fatal("the caller's edit to the resolved reference reached the key this cache is holding")
 	}
@@ -1658,11 +1902,11 @@ func TestResolveHandsBackNothingTheCacheStillHolds(t *testing.T) {
 // rewritten -- and that Ref is the one that ends up in a commit.
 func TestStoreHandsBackNothingTheCacheStillHolds(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	name := bytes.Clone(ref)
 	ref[0] ^= 0xFF
-	cached, ok := cache.Get(ProposalRef(name))
+	cached, ok := cache.Cached(testResolveContext(), ProposalRef(name))
 	if !ok {
 		t.Fatal("writing into the reference Store answered renamed the entry the cache is holding")
 	}
@@ -1680,14 +1924,19 @@ func TestStoreHandsBackNothingTheCacheStillHolds(t *testing.T) {
 // the difference between a caller told to fix the argument it got wrong and one sent to fix a
 // message that was never the problem.
 func TestStoreJudgesItsProviderBeforeAnythingElse(t *testing.T) {
-	if _, err := NewProposalCache().Store(nil, nil); !errors.Is(err, ErrNilCryptoProvider) {
-		t.Errorf("Store(nil, nil) = %v, want ErrNilCryptoProvider", err)
+	if _, err := testCache(t).Store(nil, nil, nil); !errors.Is(err, ErrNilCryptoProvider) {
+		t.Errorf("Store(nil, nil, nil) = %v, want ErrNilCryptoProvider", err)
 	}
 	crypto := testCrypto(t)
-	if _, err := NewProposalCache().Store(crypto, nil); !errors.Is(err, errNilAuthenticatedContent) {
-		t.Errorf("Store(crypto, nil) = %v, want errNilAuthenticatedContent", err)
+	// the group context before the message, because it is the other thing the caller was
+	// asked for and it decides which epoch every rule after it runs in
+	if _, err := testCache(t).Store(crypto, nil, nil); !errors.Is(err, ErrNilGroupContext) {
+		t.Errorf("Store(crypto, nil, nil) = %v, want ErrNilGroupContext", err)
 	}
-	if _, err := NewProposalCache().Resolve(nil, nil, 0, nil); !errors.Is(err, ErrNilCryptoProvider) {
+	if _, err := testCache(t).Store(crypto, testResolveContext(), nil); !errors.Is(err, errNilAuthenticatedContent) {
+		t.Errorf("Store(crypto, groupContext, nil) = %v, want errNilAuthenticatedContent", err)
+	}
+	if _, err := testCache(t).Resolve(nil, nil, 0, nil); !errors.Is(err, ErrNilCryptoProvider) {
 		t.Errorf("Resolve(nil, ...) = %v, want ErrNilCryptoProvider", err)
 	}
 }
@@ -1698,11 +1947,11 @@ func TestStoreRefusesAnythingThatIsNotAFramedProposal(t *testing.T) {
 	crypto := testCrypto(t)
 	commit := testProposalContent(t, crypto, LeafIndex(1), testRemoveProposal(LeafIndex(4)))
 	commit.Content.ContentType = ContentTypeCommit
-	if _, err := NewProposalCache().Store(crypto, commit); !errors.Is(err, errProposalCacheNotAProposal) {
+	if _, err := testCache(t).Store(crypto, testResolveContext(), commit); !errors.Is(err, errProposalCacheNotAProposal) {
 		t.Errorf("Store of a commit = %v, want errProposalCacheNotAProposal", err)
 	}
 	empty := testProposalContent(t, crypto, LeafIndex(1), nil)
-	if _, err := NewProposalCache().Store(crypto, empty); !errors.Is(err, errProposalCacheNotAProposal) {
+	if _, err := testCache(t).Store(crypto, testResolveContext(), empty); !errors.Is(err, errProposalCacheNotAProposal) {
 		t.Errorf("Store of a proposal content with no proposal = %v, want errProposalCacheNotAProposal", err)
 	}
 }
@@ -1713,16 +1962,16 @@ func TestStoreRefusesAnythingThatIsNotAFramedProposal(t *testing.T) {
 func TestTheCacheRunsTheV1ProfileGateOnBothDoors(t *testing.T) {
 	crypto := testCrypto(t)
 	psk := &Proposal{ProposalType: ProposalTypePreSharedKey, PreSharedKey: &PreSharedKey{}}
-	if _, err := NewProposalCache().Store(crypto,
+	if _, err := testCache(t).Store(crypto, testResolveContext(),
 		testProposalContent(t, crypto, LeafIndex(1), psk)); !errors.Is(err, errProfilePsk) {
 		t.Errorf("Store of a psk proposal = %v, want errProfilePsk", err)
 	}
-	if _, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
+	if _, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: psk}}); !errors.Is(err, errProfilePsk) {
 		t.Errorf("Resolve of an inline psk proposal = %v, want errProfilePsk", err)
 	}
 	grease := &Proposal{ProposalType: ProposalType(0x0A0A), UnknownBody: []byte{1, 2}}
-	if _, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
+	if _, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(0), []ProposalOrRef{{
 		Type: ProposalOrRefTypeProposal, Proposal: grease}}); !errors.Is(err, errUnregisteredProposalType) {
 		t.Errorf("Resolve of an inline GREASE proposal = %v, want errUnregisteredProposalType", err)
 	}
@@ -1734,7 +1983,7 @@ func TestTheCacheRunsTheV1ProfileGateOnBothDoors(t *testing.T) {
 // that looked it up would key every commit that made the same mistake to one entry.
 func TestResolveRefusesEveryProposalOrRefShapeTheCodecRefuses(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	for name, entry := range map[string]ProposalOrRef{
 		"an unregistered discriminant": {Type: ProposalOrRefType(7), Reference: ref},
@@ -1758,14 +2007,14 @@ func TestResolveRefusesEveryProposalOrRefShapeTheCodecRefuses(t *testing.T) {
 // is an identity, so the second store is the same entry rather than a second one.
 func TestPendingAnswersEveryEntryOnceInReceptionOrder(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	first := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	second := testStoredRemove(t, crypto, cache, LeafIndex(2), LeafIndex(5))
 	again := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	if !slices.Equal([]byte(first), []byte(again)) {
 		t.Fatal("one proposal stored twice answered two references")
 	}
-	pending := cache.Pending()
+	pending := cache.Pending(testResolveContext())
 	if len(pending) != 2 {
 		t.Fatalf("Pending answers %d entries after three stores of two proposals, want 2", len(pending))
 	}
@@ -1808,8 +2057,9 @@ func TestPendingAnswersEveryEntryOnceInReceptionOrder(t *testing.T) {
 // because every group this client is in runs an epoch 7.
 func TestResolveRefusesAReferenceCachedInAnEpochThatHasClosed(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
-	ref, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+	at7 := testResolveContextAt([]byte("group"), 7)
+	cache := testCacheAt(t, at7)
+	ref, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 7,
 		testRemoveProposal(LeafIndex(4))))
 	if err != nil {
 		t.Fatalf("Store at epoch 7: %v", err)
@@ -1867,8 +2117,9 @@ func TestResolveRefusesAReferenceCachedInAnEpochThatHasClosed(t *testing.T) {
 // in the path that advanced the epoch.
 func TestAResolutionThatNamesNothingCachedIsNotJudgedByTheBindingOfACacheItNeverReads(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
-	if _, err := cache.Store(crypto, testProposalContentAt(t, 1, []byte("group"), 7,
+	at7 := testResolveContextAt([]byte("group"), 7)
+	cache := testCacheAt(t, at7)
+	if _, err := cache.Store(crypto, at7, testProposalContentAt(t, 1, []byte("group"), 7,
 		testRemoveProposal(LeafIndex(4)))); err != nil {
 		t.Fatalf("Store at epoch 7: %v", err)
 	}
@@ -1882,39 +2133,51 @@ func TestAResolutionThatNamesNothingCachedIsNotJudgedByTheBindingOfACacheItNever
 	}
 }
 
-// TestAnEmptyCacheBelongsToNoEpochAndAnswersTheTruthAboutTheReferenceItWasAskedFor is the
-// boundary between the two refusals a lookup can earn.
+// TestAnEmptyCacheStillBelongsToTheEpochItWasBoundToAndNamesTheRightRefusal is the boundary
+// between the two refusals a lookup can earn.
 //
-// An empty cache is exactly the state Clear leaves behind, and it holds no entry from any epoch,
-// so a reference into it is not a replay -- it is a name nothing was ever stored under, and
-// errProposalNotCached is the true account. A guard that refused the empty cache as out of epoch
-// would report a replay to every member that received a commit before the proposal it names.
-func TestAnEmptyCacheBelongsToNoEpochAndAnswersTheTruthAboutTheReferenceItWasAskedFor(t *testing.T) {
+// A cache emptied by a rebind holds no entry, so a reference into it FROM THE EPOCH IT IS NOW BOUND
+// TO is not a replay -- it is a name nothing was ever stored under, and errProposalNotCached is the
+// true account. A guard that reported a replay there would say so to every member that received a
+// commit before the proposal it names.
+//
+// What the emptiness short circuit ALSO did was answer nil for every other epoch, so an emptied
+// cache reported itself to be in whatever epoch it was next asked about. That is the same "the
+// first thing that arrives decides" the binding itself used to have, one door along, and it is why
+// there is no emptiness clause in front of the comparison any more. An empty cache belongs to the
+// epoch it was bound to, and a resolution in another one is this build failing to rebind.
+func TestAnEmptyCacheStillBelongsToTheEpochItWasBoundToAndNamesTheRightRefusal(t *testing.T) {
 	crypto := testCrypto(t)
-	cache := NewProposalCache()
+	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
-	cache.Clear()
+	at2 := testResolveContextAt([]byte("group"), 2)
+	if err := cache.Rebind(at2); err != nil {
+		t.Fatalf("Rebind: %v", err)
+	}
 	named := []ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}}
+	_, err := cache.Resolve(crypto, at2, LeafIndex(0), named)
+	if !errors.Is(err, errProposalNotCached) {
+		t.Errorf("a reference into a rebound cache, resolving in the epoch it was rebound to, answered %v, want errProposalNotCached", err)
+	}
+	if errors.Is(err, errProposalResolvedOutOfEpoch) {
+		t.Errorf("a rebound cache reported itself out of the epoch it had just been rebound to")
+	}
 	for _, at := range []*GroupContext{
 		testResolveContextAt([]byte("group"), 1),
 		testResolveContextAt([]byte("group"), 99),
-		testResolveContextAt([]byte("other"), 1),
+		testResolveContextAt([]byte("other"), 2),
 	} {
 		_, err := cache.Resolve(crypto, at, LeafIndex(0), named)
-		if !errors.Is(err, errProposalNotCached) {
-			t.Errorf("a reference into a cleared cache, resolving in epoch %d of group %x, answered %v, want errProposalNotCached",
+		if !errors.Is(err, errProposalResolvedOutOfEpoch) {
+			t.Errorf("a reference into an EMPTY cache bound to epoch 2, resolving in epoch %d of group %x, answered %v, want errProposalResolvedOutOfEpoch; an empty cache that answers for any epoch is a binding taken from whoever asks",
 				at.Epoch, at.GroupId, err)
 		}
-		if errors.Is(err, errProposalResolvedOutOfEpoch) {
-			t.Errorf("a cleared cache reported itself out of epoch %d of group %x; Clear is what releases the binding and an empty cache belongs to no epoch",
-				at.Epoch, at.GroupId)
-		}
 	}
-	// and an inline commit resolves against a cleared cache in any epoch, which is what makes
-	// Clear a release rather than a way to break the group
+	// and an inline commit resolves against an empty cache in any epoch, which is what keeps
+	// the rule about the references a commit reads rather than about anybody's housekeeping
 	if _, err := cache.Resolve(crypto, testResolveContextAt([]byte("group"), 99), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeProposal, Proposal: testRemoveProposal(LeafIndex(2))}}); err != nil {
-		t.Errorf("an inline commit against a cleared cache answered %v", err)
+		t.Errorf("an inline commit against an empty cache answered %v", err)
 	}
 }
 
@@ -1927,10 +2190,10 @@ func TestAnEmptyCacheBelongsToNoEpochAndAnswersTheTruthAboutTheReferenceItWasAsk
 // body happened to read.
 func TestResolveRefusesANilGroupContextRatherThanDereferencingIt(t *testing.T) {
 	crypto := testCrypto(t)
-	if _, err := NewProposalCache().Resolve(crypto, nil, LeafIndex(0), nil); !errors.Is(err, ErrNilGroupContext) {
+	if _, err := testCache(t).Resolve(crypto, nil, LeafIndex(0), nil); !errors.Is(err, ErrNilGroupContext) {
 		t.Errorf("Resolve with no group context = %v, want ErrNilGroupContext", err)
 	}
-	if _, err := NewProposalCache().Resolve(nil, nil, LeafIndex(0), nil); !errors.Is(err, ErrNilCryptoProvider) {
+	if _, err := testCache(t).Resolve(nil, nil, LeafIndex(0), nil); !errors.Is(err, ErrNilCryptoProvider) {
 		t.Errorf("Resolve with neither a provider nor a group context = %v, want ErrNilCryptoProvider; the provider is the first thing this body asks for", err)
 	}
 }
@@ -2000,7 +2263,7 @@ func TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped(t *testing.T)
 		t.Fatalf("the widened profile refused %#04x with %v, so this never reaches the bucket switch and the branch is still unobserved",
 			uint16(widened), err)
 	}
-	list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(0),
+	list, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(0),
 		[]ProposalOrRef{{Type: ProposalOrRefTypeProposal, Proposal: accepted}})
 	if !errors.Is(err, errAcceptedTypeHasNoBucket) {
 		t.Fatalf("an accepted type with no bucket resolved with err = %v, want errAcceptedTypeHasNoBucket; a proposal counted in All and put in no bucket is one the group agreed to and no member applies",
@@ -2039,6 +2302,7 @@ var proposalListOwnedErrors = map[string]error{
 	"errProposalCacheNotAProposal":      errProposalCacheNotAProposal,
 	"errProposalSenderNotMember":        errProposalSenderNotMember,
 	"errProposalCacheEpoch":             errProposalCacheEpoch,
+	"errProposalCacheNotRebound":        errProposalCacheNotRebound,
 	"errProposalResolvedOutOfEpoch":     errProposalResolvedOutOfEpoch,
 	"errProposalNotCached":              errProposalNotCached,
 	"errDuplicateProposalReference":     errDuplicateProposalReference,

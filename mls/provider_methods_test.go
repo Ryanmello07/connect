@@ -826,7 +826,12 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		// through the recorder and the retention half of this file would observe nothing while
 		// reporting a clean run.
 		{name: "(*ProposalCache).Store", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
-			cache := NewProposalCache()
+			// the cache is bound to the group and epoch this row's content names,
+			// out of a context of the caller's own rather than out of the content --
+			// which is also why the group id below is recorded once for the message
+			// and built separately for the binding
+			context := testResolveContextAt(bytes.Repeat([]byte{0x61}, 12), 9)
+			cache := testCacheAt(t, context)
 			content := &AuthenticatedContent{
 				WireFormat: WireFormatPublicMessage,
 				Content: FramedContent{
@@ -844,11 +849,11 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				},
 				Auth: FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x63}, 64))},
 			}
-			ref, err := cache.Store(crypto, content)
+			ref, err := cache.Store(crypto, context, content)
 			if err != nil {
 				return nil, err
 			}
-			cached, held := cache.Get(ref)
+			cached, held := cache.Cached(context, ref)
 			if !held {
 				return nil, fmt.Errorf("the cache missed the reference it had just answered")
 			}
@@ -863,7 +868,7 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		// carried through the copy, which is what the retention half reads: an applier walking
 		// the resolved list must not be walking the array the commit was decoded out of.
 		{name: "(*ProposalCache).Resolve", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
-			list, err := NewProposalCache().Resolve(crypto, testResolveContext(), LeafIndex(3), []ProposalOrRef{{
+			list, err := testCache(t).Resolve(crypto, testResolveContext(), LeafIndex(3), []ProposalOrRef{{
 				Type: ProposalOrRefTypeProposal,
 				Proposal: &Proposal{
 					ProposalType: ProposalTypeGroupContextExtensions,

@@ -3648,6 +3648,15 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 			_, err := NewKeyScheduleFromEpochSecret(crypto, secret, context)
 			return err
 		},
+		// p7 task 6's proposal cache, which is in this class for a reason of its own: the
+		// context it is handed IS the epoch binding, so a constructor that accepted a nil
+		// one would answer a cache bound to nothing -- and a cache bound to nothing is the
+		// state in which the epoch has to come from somewhere, which is where a replayed
+		// proposal used to supply it.
+		"NewProposalCache": func(context *GroupContext) error {
+			_, err := NewProposalCache(context)
+			return err
+		},
 	}
 	found := keyScheduleConstructorsOverAGroupContext(t)
 	if got := slices.Sorted(maps.Keys(covered)); !slices.Equal(got, slices.Sorted(slices.Values(found))) {
