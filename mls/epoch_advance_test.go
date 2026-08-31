@@ -582,10 +582,17 @@ func (self *epochWalk) rendered() string {
 	return strings.Join(calls, "; ")
 }
 
-// covered answers the whole demand: the moved value holds at least one cache, every one of them is
-// ended by a call this walk found, and no path left the declaration owing one.
+// covered answers the whole demand: every cache the moved value holds is ended by a call this walk
+// found, and no path left the declaration owing one.
+//
+// A mover whose moved value holds NO cache needs no clause of its own here, and the one that was
+// written did not survive its own mutation. Nothing can be found for a cache a value does not
+// hold -- enderOf refuses any field that is not one of them -- so finds is empty, ends is the
+// calls that were found rather than a verdict, and such a declaration is reported as ending no
+// binding. That is the loud answer and the right one: a boundary with no cache in reach fails
+// this gate until somebody writes down why it moves a group and owes nothing.
 func (self *epochWalk) covered() bool {
-	if len(self.required) == 0 || len(self.skipped) != 0 {
+	if len(self.skipped) != 0 {
 		return false
 	}
 	for object := range self.required {
