@@ -25,10 +25,28 @@
 // behind unexported fields of an unexported type, so no declaration outside package mls can write
 // it however it is spelled; the gate asserts the fields really are unexported instead of leaving
 // that as the reason a narrow scan is enough.
+//
+// AND THAT RULE IS ABOUT THE WRITE, WHICH IS ONLY HALF OF WHERE THE VALUE CAME FROM. This was
+// stated as more than it holds and the overstatement survived a review: proposal_list.go said "there
+// is no code path in which a peer's octets decide which epoch this cache belongs to", while the gate
+// demanded only that the write read a *GroupContext the writing declaration was HANDED -- a rule
+// about the TYPE of the value. This package decodes a GroupContext straight off peer octets, so a
+// GroupInfo marshalled with an attacker's group id and an epoch of 1<<40 and round tripped hands
+// &decoded.GroupContext to NewProposalCache with both halves of that gate green. A GroupInfo is what
+// a joiner is handed inside a Welcome.
+//
+// So the second half of this file is the CALLER'S rule, stated as a gate of its own rather than as a
+// paragraph asking the next author to be careful. It derives the types this package decodes and
+// refuses any call of a binding writer whose group context argument was selected out of one. Its
+// class over this package's own non test source is EMPTY today -- the group lifecycle that will call
+// these two is a later task -- so it is a tripwire, and it is the control below that says the
+// matcher reads anything at all. That is stated here rather than left for a reader to discover.
 package mls
 
 import (
 	"go/ast"
+	"go/token"
+	"go/types"
 	"maps"
 	"reflect"
 	"slices"
@@ -434,3 +452,442 @@ func TestNoDeclarationOfThisPackageReadsAStoredEpochIntoTheCacheBinding(t *testi
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// where the CALLER got the context, which is the half the gate above does not hold
+// ---------------------------------------------------------------------------
+
+// The method that makes a type one this package decodes. It is the one codec convention this package
+// pins -- every wire type declares it and asserts syntax.Codec beside itself -- so the class is read
+// off the compiler's method sets rather than off a list of type names that would go stale the first
+// time a structure was added.
+const proposalBindingDecoderMethod = "UnmarshalMLS"
+
+// proposalBindingWireTypesIn is the class: every named type of one checked package that declares the
+// decoder method, by the bare name the compiler reads its receiver as.
+//
+// A type that can be decoded is a type whose fields can be chosen by whoever wrote the octets. That
+// is the whole of the property -- a verified GroupInfo's fields were chosen by the same octets, and
+// the verification is somewhere else -- so this does not try to tell a checked one from an unchecked
+// one and refuses both. See the test for why that is the honest rule and not a lazy one.
+func proposalBindingWireTypesIn(checked checkedBodies) map[string]bool {
+	wire := map[string]bool{}
+	for _, file := range checked.files {
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv == nil || len(function.Recv.List) != 1 {
+				continue
+			}
+			if function.Name.Name != proposalBindingDecoderMethod {
+				continue
+			}
+			if name := proposalBindingTypeNameOf(checked.info.TypeOf(function.Recv.List[0].Type)); name != "" {
+				wire[name] = true
+			}
+		}
+	}
+	return wire
+}
+
+// proposalBindingTypeNameOf names a type the way this file's tables do: the bare name, through any
+// number of pointers, and empty for anything that is not a named type.
+func proposalBindingTypeNameOf(found types.Type) string {
+	for {
+		pointer, isPointer := found.(*types.Pointer)
+		if !isPointer {
+			break
+		}
+		found = pointer.Elem()
+	}
+	named, isNamed := found.(*types.Named)
+	if !isNamed || named.Obj() == nil {
+		return ""
+	}
+	return named.Obj().Name()
+}
+
+// proposalBindingWriterObjects is the class the gate above already derived, as the compiler's own
+// function objects, so a CALL can be matched to a writer by identity rather than by spelling.
+//
+// Derived from proposalBindingWritesIn and not from a second list, which is the whole reason this
+// gate stays joined to that one: a third writer landing tomorrow is a third call site to judge
+// without anybody extending anything, and a writer that stopped writing drops out of both at once.
+func proposalBindingWriterObjects(checked checkedBodies) map[types.Object]string {
+	written, _ := proposalBindingWritesIn(checked)
+	writers := map[types.Object]string{}
+	for _, file := range checked.files {
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			name := extensionTypeSelectionDeclarationName(checked, function)
+			if _, writes := written[name]; !writes {
+				continue
+			}
+			if object := checked.info.Defs[function.Name]; object != nil {
+				writers[object] = name
+			}
+		}
+	}
+	return writers
+}
+
+// proposalBindingCalleeObject answers the declaration one call expression reaches, by the compiler's
+// object rather than by the name at the call, so a local shadowing a package function is not
+// mistaken for it.
+func proposalBindingCalleeObject(checked checkedBodies, call *ast.CallExpr) types.Object {
+	switch fun := extensionTypeSelectionUnparenthesised(call.Fun).(type) {
+	case *ast.Ident:
+		return checked.info.Uses[fun]
+	case *ast.SelectorExpr:
+		return checked.info.Uses[fun.Sel]
+	}
+	return nil
+}
+
+// proposalBindingArgumentRoot answers the value one argument was ultimately cut from, and whether a
+// FIELD SELECTION was crossed on the way.
+//
+// The second half is what separates the two accepted shapes from the refused one, and neither is
+// visible in the argument's own type -- every one of them is a *GroupContext. `groupContext` crosses
+// no selection and is the caller's own choice; `&self.context` crosses one and lands on a group;
+// `&decoded.GroupContext` crosses one and lands on a structure somebody else's octets filled in.
+//
+// A call is followed through its FUN, because a method call answers a value of whatever it was
+// called on: decoded.GroupContext.Clone() is the decoded context with a copy in front of it, and a
+// walk that stopped at the call would report the one laundering shape this package already has a
+// method for.
+func proposalBindingArgumentRoot(checked checkedBodies, expr ast.Expr) (types.Object, bool) {
+	selected := false
+	for {
+		expr = extensionTypeSelectionUnparenthesised(expr)
+		switch node := expr.(type) {
+		case *ast.UnaryExpr:
+			if node.Op != token.AND {
+				return nil, selected
+			}
+			expr = node.X
+		case *ast.StarExpr:
+			expr = node.X
+		case *ast.IndexExpr:
+			expr = node.X
+		case *ast.CallExpr:
+			expr = node.Fun
+		case *ast.SelectorExpr:
+			selected = true
+			expr = node.X
+		case *ast.Ident:
+			return checked.info.Uses[node], selected
+		default:
+			return nil, selected
+		}
+	}
+}
+
+// proposalBindingProvenance is one group context argument handed to a binding writer: where it is,
+// how it is written, and what this rule reads its provenance as.
+type proposalBindingProvenance struct {
+	where    string
+	how      string
+	caller   string
+	writer   string
+	accepted bool
+	why      string
+}
+
+// proposalBindingVerdict is the rule, over one argument.
+//
+// Three answers and not two, because the three have three remedies. A selection out of a wire type
+// is the defect and the remedy is to copy the verified context into the group's own state first. A
+// value the declaration was handed crosses no selection and is accepted, because whose context it is
+// is then that caller's question and the buck passes up the stack rather than stopping here. And an
+// argument this rule cannot attribute -- a context assembled in the body, or the result of a
+// function -- is refused rather than assumed, because a context built out of whatever is in scope is
+// exactly the laundering shape and there is nothing at the call that tells it from a legitimate one.
+func proposalBindingVerdict(wire map[string]bool, root types.Object, selected bool,
+	handed map[types.Object]bool) (bool, string) {
+
+	if root == nil {
+		return false, "assembled in the body, so there is no value to attribute"
+	}
+	if selected {
+		name := proposalBindingTypeNameOf(root.Type())
+		if wire[name] {
+			return false, "selected out of a " + name + ", which is a type this package decodes off the wire"
+		}
+		return true, "selected out of a " + name + ", which this package does not decode"
+	}
+	if handed[root] {
+		return true, "the declaration's own parameter or receiver"
+	}
+	return false, "a value this declaration chose for itself rather than one it was handed"
+}
+
+// proposalBindingProvenanceIn is the scan: every group context argument of every call of a binding
+// writer in one checked package, with its verdict, and how many arguments were judged at all.
+//
+// The judged count is carried for the reason every derived gate of this package carries one. A
+// matcher that stopped resolving its subject reports NO findings, and no findings is exactly what a
+// package with no such call reports -- so "nothing calls a writer" and "nothing was read" have to be
+// distinguishable, and only the second is a broken gate.
+func proposalBindingProvenanceIn(checked checkedBodies) ([]proposalBindingProvenance, int) {
+	wire := proposalBindingWireTypesIn(checked)
+	writers := proposalBindingWriterObjects(checked)
+	found := []proposalBindingProvenance{}
+	judged := 0
+	for _, file := range checked.files {
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			caller := extensionTypeSelectionDeclarationName(checked, function)
+			handed := extensionTypeSelectionHandedTo(checked, function)
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				writer, writes := writers[proposalBindingCalleeObject(checked, call)]
+				if !writes {
+					return true
+				}
+				for _, argument := range call.Args {
+					if !extensionTypeSelectionNamedAs(checked.info.TypeOf(argument), proposalBindingContextType) {
+						continue
+					}
+					judged += 1
+					root, selected := proposalBindingArgumentRoot(checked, argument)
+					accepted, why := proposalBindingVerdict(wire, root, selected, handed)
+					found = append(found, proposalBindingProvenance{
+						where:    checked.where(argument),
+						how:      checked.render(argument),
+						caller:   caller,
+						writer:   writer,
+						accepted: accepted,
+						why:      why,
+					})
+				}
+				return true
+			})
+		}
+	}
+	return found, judged
+}
+
+// proposalBindingProvenanceControl is a package the matcher has never seen, carrying every shape the
+// rule has an answer for -- including the reviewer's own demonstration, which the real source will
+// not hold unless somebody writes it.
+//
+// The decoders take no reader. What makes a type a wire type to this matcher is that it declares the
+// method the one codec convention names, and a control that reproduced mls/syntax to say so would be
+// testing the importer rather than the rule.
+const proposalBindingProvenanceControl = `package control
+
+type GroupContext struct {
+	GroupId []byte
+	Epoch   uint64
+}
+
+func (self *GroupContext) UnmarshalMLS() error { return nil }
+
+func (self *GroupContext) Clone() *GroupContext { return self }
+
+// what a joiner is handed inside a Welcome: a decoded structure with a group context inside it
+type GroupInfo struct {
+	GroupContext GroupContext
+	Signature    []byte
+}
+
+func (self *GroupInfo) UnmarshalMLS() error { return nil }
+
+// the group's own state, which is not decoded off anything
+type Group struct {
+	context GroupContext
+}
+
+type proposalCacheBinding struct {
+	groupId []byte
+	epoch   uint64
+}
+
+type ProposalCache struct {
+	binding *proposalCacheBinding
+}
+
+// the two writers, in the two shapes the real ones take
+func NewFromTheContext(groupContext *GroupContext) *ProposalCache {
+	return &ProposalCache{
+		binding: &proposalCacheBinding{groupId: groupContext.GroupId, epoch: groupContext.Epoch},
+	}
+}
+
+func (self *ProposalCache) rebindFromTheContext(groupContext *GroupContext) {
+	self.binding = &proposalCacheBinding{groupId: groupContext.GroupId, epoch: groupContext.Epoch}
+}
+
+// accepted: the caller was handed the context and crosses no selection, so whose context it is is
+// its own caller's question
+func bindFromTheContextItWasHanded(groupContext *GroupContext) *ProposalCache {
+	return NewFromTheContext(groupContext)
+}
+
+// accepted: selected out of a group, which is not a type this package decodes
+func (self *Group) bindFromItsOwnState() *ProposalCache {
+	return NewFromTheContext(&self.context)
+}
+
+// accepted through the method arm as well, so a rule that read only plain calls is not enough
+func rebindFromTheContextItWasHanded(cache *ProposalCache, groupContext *GroupContext) {
+	cache.rebindFromTheContext(groupContext)
+}
+
+// the defect, and it is the reviewer's demonstration verbatim: the GroupInfo is a parameter, so the
+// declaration WAS handed it, and the write inside NewFromTheContext still reads a group context
+// parameter. Both halves of the write rule hold and the epoch is the attacker's.
+func bindFromADecodedGroupInfo(info *GroupInfo) *ProposalCache {
+	return NewFromTheContext(&info.GroupContext)
+}
+
+// the same defect through the method arm
+func rebindFromADecodedGroupInfo(cache *ProposalCache, info *GroupInfo) {
+	cache.rebindFromTheContext(&info.GroupContext)
+}
+
+// the defect with the decode in the body rather than in the signature
+func bindFromAGroupInfoDecodedHere() *ProposalCache {
+	decoded := GroupInfo{}
+	decoded.UnmarshalMLS()
+	return NewFromTheContext(&decoded.GroupContext)
+}
+
+// a copy of a decoded context is still a decoded context, and Clone is the method that makes this
+// shape one line away
+func bindFromACloneOfADecodedContext(info *GroupInfo) *ProposalCache {
+	return NewFromTheContext(info.GroupContext.Clone())
+}
+
+// a context decoded straight into a local, which crosses no selection and was handed to nobody
+func bindFromALocalItDecodedItself() *ProposalCache {
+	local := GroupContext{}
+	local.UnmarshalMLS()
+	return NewFromTheContext(&local)
+}
+
+// a context assembled out of whatever was in scope, which is the laundering shape and is refused
+// because nothing at the call tells it from a legitimate one
+func bindFromAContextAssembledHere(info *GroupInfo) *ProposalCache {
+	return NewFromTheContext(&GroupContext{GroupId: info.GroupContext.GroupId, Epoch: info.GroupContext.Epoch})
+}
+
+// and a read of a decoded context that binds nothing, which is not a call of a writer at all
+func readsADecodedEpochWithoutBinding(info *GroupInfo) uint64 {
+	return info.GroupContext.Epoch
+}
+`
+
+// What the matcher must accept out of the control, keyed by the declaration the call is in.
+var proposalBindingProvenanceControlAccepted = []string{
+	"(*Group).bindFromItsOwnState",
+	"bindFromTheContextItWasHanded",
+	"rebindFromTheContextItWasHanded",
+}
+
+// And what it must refuse. bindFromADecodedGroupInfo is the reviewer's demonstration; a rule that
+// accepted it is the rule this file already had.
+var proposalBindingProvenanceControlRefused = []string{
+	"bindFromACloneOfADecodedContext",
+	"bindFromAContextAssembledHere",
+	"bindFromADecodedGroupInfo",
+	"bindFromAGroupInfoDecodedHere",
+	"bindFromALocalItDecodedItself",
+	"rebindFromADecodedGroupInfo",
+}
+
+// TestNoDeclarationOfThisPackageBindsTheCacheToAGroupContextItSelectedOutOfAWireType is the caller's
+// half of the binding rule, and it is the half proposal_list.go used to claim in prose.
+//
+// WHAT IT REFUSES AND WHY THAT IS THE HONEST LINE. It refuses a VERIFIED GroupInfo's context as well
+// as an unverified one. That is not the rule being lazy: the two are the same expression at the
+// call, so a rule that let one through could not be checked by anything, and "the caller verified it
+// first" is exactly the kind of discipline this file exists because nobody kept. What a Welcome path
+// does instead is copy the context it verified into the group's own state -- Clone is there for it
+// -- and bind from that, which crosses a selection out of a Group rather than out of a GroupInfo and
+// is accepted. The difference on the wire is nothing; the difference in the source is that one of
+// them is a value this client vouches for.
+//
+// ITS CLASS OVER THE REAL SOURCE IS EMPTY TODAY and that is said rather than hidden. Nothing in this
+// package's non test source calls either writer -- the group lifecycle that will is a later task --
+// so the control is what says the matcher resolves anything, and the value of the gate is that it
+// fails on the commit that wires the Welcome path the obvious way. A gate written after that commit
+// would be a gate written after the defect.
+func TestNoDeclarationOfThisPackageBindsTheCacheToAGroupContextItSelectedOutOfAWireType(t *testing.T) {
+	control := typeCheckedBodiesOfText(t, "the proposal binding provenance control",
+		proposalBindingProvenanceControl)
+	wire := proposalBindingWireTypesIn(control)
+	for _, name := range []string{"GroupContext", "GroupInfo"} {
+		if !wire[name] {
+			t.Fatalf("the matcher did not read %s as a wire type of the control, so the class it refuses out of is empty and every call would be accepted",
+				name)
+		}
+	}
+	if wire["Group"] {
+		t.Fatal("the matcher read Group as a wire type of the control; a rule that treats the group's own state as decoded refuses the fix as well as the defect")
+	}
+	found, judged := proposalBindingProvenanceIn(control)
+	if judged == 0 {
+		t.Fatal("the matcher judged no group context argument in the control, so it would report a clean run over any package at all")
+	}
+	accepted, refused := []string{}, []string{}
+	for _, provenance := range found {
+		if provenance.accepted {
+			accepted = append(accepted, provenance.caller)
+			continue
+		}
+		refused = append(refused, provenance.caller)
+	}
+	slices.Sort(accepted)
+	slices.Sort(refused)
+	if !slices.Equal(accepted, proposalBindingProvenanceControlAccepted) {
+		t.Fatalf("the rule accepted %v of the control, want %v; one that refuses a context the declaration was handed refuses the fix, and one that refuses a selection out of the group's own state refuses the only shape a lifecycle has",
+			accepted, proposalBindingProvenanceControlAccepted)
+	}
+	if !slices.Equal(refused, proposalBindingProvenanceControlRefused) {
+		t.Fatalf("the rule refused %v of the control, want %v; bindFromADecodedGroupInfo is the reviewer's own demonstration and a rule that accepts it is the rule this file already had",
+			refused, proposalBindingProvenanceControlRefused)
+	}
+
+	// and then the real source. The fact that makes this gate necessary is asserted on it, so a
+	// package that stopped decoding a group context off the wire would say so rather than leaving
+	// a rule nobody could explain.
+	checked := typeCheckedBodiesOf(t, ".")
+	realWire := proposalBindingWireTypesIn(checked)
+	if len(realWire) == 0 {
+		t.Fatal("this package was read as decoding nothing at all, so the gate is not reading what it claims to")
+	}
+	if !realWire[proposalBindingContextType] {
+		t.Fatalf("%s is not read as a wire type of this package; it is what (*GroupInfo).UnmarshalMLS decodes off a reader, and if that has stopped being true this whole gate needs rewriting rather than relaxing",
+			proposalBindingContextType)
+	}
+	carrier, held := reflect.TypeOf(GroupInfo{}).FieldByName(proposalBindingContextType)
+	if !held || carrier.Type != reflect.TypeOf(GroupContext{}) {
+		t.Fatalf("GroupInfo no longer carries a %s field, so the attack this gate is about has changed shape and the gate should be rewritten against the new one",
+			proposalBindingContextType)
+	}
+	if !realWire["GroupInfo"] {
+		t.Fatal("GroupInfo is not read as a wire type of this package, so the one structure a joiner is handed inside a Welcome is outside the class this gate refuses")
+	}
+	provenance, realJudged := proposalBindingProvenanceIn(checked)
+	for _, one := range provenance {
+		if one.accepted {
+			t.Logf("%s at %s passes %q to %s: %s", one.caller, one.where, one.how, one.writer, one.why)
+			continue
+		}
+		t.Errorf("%s at %s binds the proposal cache through %s to %q, which is %s; a binding is worth the authority of the value it was taken from, and a %s this package decoded is a structure whoever wrote the octets filled in -- an attacker choosing the group id and the epoch this cache then believes it is in. Copy a context you have VERIFIED into this client's own state and bind from that",
+			one.caller, one.where, one.writer, one.how, one.why, proposalBindingContextType)
+	}
+	t.Logf("%d group context arguments judged over %d call sites of a binding writer in this package's non test source",
+		realJudged, len(provenance))
+}
+

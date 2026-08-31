@@ -2316,6 +2316,10 @@ var proposalListOwnedErrors = map[string]error{
 	"errProposalNotCached":              errProposalNotCached,
 	"errDuplicateProposalReference":     errDuplicateProposalReference,
 	"errMultipleGroupContextExtensions": errMultipleGroupContextExtensions,
+	"errProposalCacheFull":              errProposalCacheFull,
+	"errProposalCacheSenderQuota":       errProposalCacheSenderQuota,
+	"errProposalCacheOctets":            errProposalCacheOctets,
+	"errAcceptedTypeHasNoCeiling":       errAcceptedTypeHasNoCeiling,
 }
 
 // TestProposalListOwnedErrorsIsEveryRefusalItsFileDeclares derives the class the sweep below runs
