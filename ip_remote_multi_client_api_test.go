@@ -8,14 +8,92 @@ package connect
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
+
+// Discovery retains the destination and the nearest eight intermediaries when
+// a server returns a longer path; shorter legacy paths are unaffected.
+func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T) {
+	intermediaryIds := make([]Id, MaxMultihopLength+3)
+	for idIndex := range intermediaryIds {
+		intermediaryIds[idIndex] = NewId()
+	}
+	providerId := NewId()
+	wantEstimatedBytesPerSecond := ByteCount(7_500_000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/network/find-providers2" {
+			t.Errorf("discovery path=%q", request.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(&FindProviders2Result{
+			Providers: []*FindProvidersProvider{{
+				ClientId:                providerId,
+				IntermediaryIds:         intermediaryIds,
+				EstimatedBytesPerSecond: wantEstimatedBytesPerSecond,
+				Tier:                    0,
+				NetworkOnly:             true,
+				ReputationFailedNames:   " Bloomberg ,canva,bloomberg",
+			}},
+		}); err != nil {
+			t.Errorf("encode discovery response: %v", err)
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientStrategySettings()
+	settings.EnableNormal = true
+	settings.EnableResilient = false
+	settings.RequestTimeout = 5 * time.Second
+	strategy := NewClientStrategy(ctx, settings)
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		[]*ProviderSpec{{BestAvailable: true}},
+		strategy,
+		nil,
+		server.URL,
+		"test-jwt",
+		server.URL,
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	destinations, err := generator.NextDestinationsContext(ctx, 1, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(destinations) != 1 {
+		t.Fatalf("destination count=%d want=1", len(destinations))
+	}
+	wantIds := append(
+		slices.Clone(intermediaryIds[len(intermediaryIds)-MaxMultihopLength:]),
+		providerId,
+	)
+	for destination, stats := range destinations {
+		if !slices.Equal(destination.Ids(), wantIds) {
+			t.Fatalf("destination ids=%v want=%v", destination.Ids(), wantIds)
+		}
+		if stats.EstimatedBytesPerSecond != wantEstimatedBytesPerSecond || !stats.NetworkOnly {
+			t.Fatalf("discovery stats=%+v, want speed and network-only metadata", stats)
+		}
+		if !slices.Equal(stats.ReputationFailures, []string{"bloomberg", "canva"}) {
+			t.Fatalf("reputation failures=%q, want normalized Bloomberg/Canva", stats.ReputationFailures)
+		}
+	}
+}
 
 // newRemoveClientTestGenerator builds a generator against a counting api
 // server. The client strategy lives on its own ctx (like the app-scoped
@@ -221,4 +299,109 @@ func TestRemoveClientArgsStaleGenerationCannotDeleteLiveReplacement(t *testing.T
 	waitForPersisted(t, store, "current identity removed", func(persisted []*WindowClientIdentity) bool {
 		return len(persisted) == 0
 	})
+}
+
+// A window client can still be sending its final contract-close control when
+// the window retires it. The derived client JWT must remain valid until that
+// OOB lifecycle is joined; deleting the network-client row first makes the
+// close fail with 401 and leaves server-side contract cleanup behind.
+func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
+	controlStarted := make(chan struct{})
+	controlRelease := make(chan struct{})
+	controlDone := make(chan error, 1)
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(controlRelease) }) })
+	removeCount := &atomic.Int32{}
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/connect/control":
+			var args ConnectControlArgs
+			if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+				t.Errorf("decode control: %v", err)
+				http.Error(w, "bad control", http.StatusBadRequest)
+				return
+			}
+			startOnce.Do(func() { close(controlStarted) })
+			<-controlRelease
+			_ = json.NewEncoder(w).Encode(&ConnectControlResult{Pack: args.Pack})
+		case "/network/remove-client":
+			removeCount.Add(1)
+			_, _ = w.Write([]byte("{}"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer apiServer.Close()
+
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableNormal = true
+	strategySettings.EnableResilient = false
+	strategySettings.RequestTimeout = 5 * time.Second
+	strategy := NewClientStrategy(strategyCtx, strategySettings)
+
+	generatorCtx, generatorCancel := context.WithCancel(context.Background())
+	defer generatorCancel()
+	providerId := NewId()
+	generator := NewApiMultiClientGenerator(
+		generatorCtx,
+		[]*ProviderSpec{{ClientId: &providerId}},
+		strategy,
+		nil,
+		apiServer.URL,
+		"network-jwt",
+		apiServer.URL,
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	defer clientCancel()
+	clientId := NewId()
+	clientOob := NewApiOutOfBandControl(clientCtx, strategy, "derived-client-jwt", apiServer.URL)
+	client := NewClient(clientCtx, clientId, clientOob, DefaultClientSettings())
+	clientOob.SendControlWithCtx(
+		context.Background(),
+		[]*protocol.Frame{},
+		func(_ []*protocol.Frame, err error) { controlDone <- err },
+	)
+	select {
+	case <-controlStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup control did not reach the server")
+	}
+
+	clientArgs := &MultiClientGeneratorClientArgs{
+		ClientId: clientId,
+		ClientAuth: &ClientAuth{
+			ByJwt:      "derived-client-jwt",
+			InstanceId: NewId(),
+		},
+	}
+	generator.RemoveClientWithArgs(client, clientArgs)
+	client.Cancel()
+	time.Sleep(100 * time.Millisecond)
+	if count := removeCount.Load(); count != 0 {
+		t.Fatalf("identity was revoked while cleanup control was in flight: remove count %d", count)
+	}
+
+	releaseOnce.Do(func() { close(controlRelease) })
+	select {
+	case err := <-controlDone:
+		if err != nil {
+			t.Fatalf("cleanup control failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup control did not finish")
+	}
+	if !waitForCondition(5*time.Second, func() bool { return removeCount.Load() == 1 }) {
+		t.Fatal("identity was not revoked after cleanup control completed")
+	}
 }

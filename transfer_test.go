@@ -116,15 +116,16 @@ func TestCumulativeAckBoundarySurvivesImmediateSendItemReuse(t *testing.T) {
 		},
 	}
 	sequence := &SendSequence{
-		client:      client,
-		log:         client.log,
-		resendQueue: newResendQueue(nil, 0),
-		sendItems:   []*sendItem{target, later},
+		client:           client,
+		log:              client.log,
+		resendQueue:      newResendQueue(nil, 0),
+		sendItems:        []*sendItem{target, later},
+		flightController: newSendFlightController(DefaultSendBufferSettings()),
 	}
 	sequence.resendQueue.Add(target)
 	sequence.resendQueue.Add(later)
 
-	sequence.receiveAck(target.messageId, false, sequenceTag{})
+	sequence.receiveAck(target.messageId, false, sequenceTag{}, false)
 
 	if len(sequence.sendItems) != 1 || sequence.sendItems[0] != later {
 		t.Fatalf("cumulative ack crossed its snapshotted boundary: remaining=%d", len(sequence.sendItems))
@@ -271,16 +272,11 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 		protocol.ProvideMode_Network: true,
 	}
 
-	clientSettingsA := DefaultClientSettings()
-	clientSettingsA.SendBufferSettings.SequenceBufferSize = 0
-	clientSettingsA.SendBufferSettings.AckBufferSize = 0
+	clientSettingsA := DefaultClientSettingsWithBufferSize(n)
 	clientSettingsA.SendBufferSettings.AckTimeout = 300 * time.Second
 	clientSettingsA.SendBufferSettings.IdleTimeout = 300 * time.Second
-	clientSettingsA.ReceiveBufferSettings.SequenceBufferSize = 0
 	clientSettingsA.ReceiveBufferSettings.GapTimeout = 300 * time.Second
 	clientSettingsA.ReceiveBufferSettings.IdleTimeout = 300 * time.Second
-	// clientSettingsA.ReceiveBufferSettings.AckBufferSize = 0
-	clientSettingsA.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsA.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsA.ContractManagerSettings.LegacyCreateContract = true
 	applyTestEncryptionSettings(clientSettingsA, encMode)
@@ -298,16 +294,11 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 
 	aContractManager.SetProvideModes(provideModes)
 
-	clientSettingsB := DefaultClientSettings()
-	clientSettingsB.SendBufferSettings.SequenceBufferSize = 0
-	clientSettingsB.SendBufferSettings.AckBufferSize = 0
+	clientSettingsB := DefaultClientSettingsWithBufferSize(n)
 	clientSettingsB.SendBufferSettings.AckTimeout = 300 * time.Second
 	clientSettingsB.SendBufferSettings.IdleTimeout = 300 * time.Second
-	clientSettingsB.ReceiveBufferSettings.SequenceBufferSize = 0
 	clientSettingsB.ReceiveBufferSettings.GapTimeout = 300 * time.Second
 	clientSettingsB.ReceiveBufferSettings.IdleTimeout = 300 * time.Second
-	// clientSettingsB.ReceiveBufferSettings.AckBufferSize = 0
-	clientSettingsB.ForwardBufferSettings.SequenceBufferSize = 0
 	clientSettingsB.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 	clientSettingsB.ContractManagerSettings.LegacyCreateContract = true
 	applyTestEncryptionSettings(clientSettingsB, encMode)
@@ -325,26 +316,46 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 
 	bContractManager.SetProvideModes(provideModes)
 
-	acks := make(chan error)
-	receives := make(chan *protocol.SimpleMessage)
+	// Callbacks are receive-side delivery and cannot block. These exact bounded
+	// collectors cover both sender generations; an overflow is a test failure,
+	// not backpressure into either Client pump.
+	acks := make(chan error, 2*n)
+	receives := make(chan *protocol.SimpleMessage, 2*n)
+	asyncErrors := make(chan error, 1)
+	recordAsyncError := func(err error) {
+		select {
+		case asyncErrors <- err:
+		default:
+		}
+	}
+	ackCallback := func(err error) {
+		select {
+		case acks <- err:
+		default:
+			recordAsyncError(fmt.Errorf("ack callback collector overflow: %v", err))
+		}
+	}
 
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
 			if err != nil {
-				panic(err)
+				recordAsyncError(fmt.Errorf("decode received frame: %w", err))
+				return
 			}
 			switch v := m.(type) {
 			case *protocol.SimpleMessage:
-				receives <- v
+				select {
+				case receives <- v:
+				default:
+					recordAsyncError(fmt.Errorf("receive callback collector overflow"))
+				}
 			}
 		}
 	})
 
 	var ackCount int
-	var waitingAckCount int
 	var receiveCount int
-	var waitingReceiveCount int
 	var receiveMessages map[string]bool
 
 	for range contractCount {
@@ -372,35 +383,33 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	// 	aClientId,
 	// )
 
-	go func() {
-		for i := 0; i < n; i += 1 {
-			message := &protocol.SimpleMessage{
-				Content: fmt.Sprintf("hi %d", i),
+	sendMessages := func(client *Client) <-chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; i < n; i += 1 {
+				message := &protocol.SimpleMessage{
+					Content: fmt.Sprintf("hi %d", i),
+				}
+				frame, err := ToFrame(message, DefaultProtocolVersion)
+				if err != nil {
+					recordAsyncError(fmt.Errorf("encode message %d: %w", i, err))
+					return
+				}
+				if !client.Send(frame, bClientId, ackCallback) {
+					recordAsyncError(fmt.Errorf("send message %d", i))
+					return
+				}
 			}
-			frame, err := ToFrame(message, DefaultProtocolVersion)
-			if err != nil {
-				panic(err)
-			}
-			success := a.Send(frame, DestinationId(bClientId), func(err error) {
-				acks <- err
-			})
-			AssertEqual(t, success, true)
-		}
-	}()
+		}()
+		return done
+	}
+	sendDone := sendMessages(a)
 
 	ackCount = 0
-	waitingAckCount = -1
 	receiveCount = 0
-	waitingReceiveCount = -1
 	receiveMessages = map[string]bool{}
 	for receiveCount < n || ackCount < n {
-		if receiveCount < n && waitingReceiveCount < receiveCount {
-			fmt.Printf("[0] waiting for %d/%d\n", receiveCount+1, n)
-			waitingReceiveCount = receiveCount
-		} else if ackCount < n && waitingAckCount < ackCount {
-			fmt.Printf("[0] waiting for ack %d/%d\n", ackCount+1, n)
-		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -411,9 +420,18 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 		case err := <-acks:
 			AssertEqual(t, err, nil)
 			ackCount += 1
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous send/receive worker: %v", asyncErr)
 		case <-time.After(timeout):
 			t.Fatal("Timeout.")
 		}
+	}
+	select {
+	case <-sendDone:
+	case asyncErr := <-asyncErrors:
+		t.Fatalf("asynchronous sender: %v", asyncErr)
+	case <-time.After(timeout):
+		t.Fatal("sender did not finish")
 	}
 	for i := 0; i < n; i += 1 {
 		message := fmt.Sprintf("hi %d", i)
@@ -479,35 +497,12 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 	default:
 	}
 
-	go func() {
-		for i := 0; i < n; i += 1 {
-			message := &protocol.SimpleMessage{
-				Content: fmt.Sprintf("hi %d", i),
-			}
-			frame, err := ToFrame(message, DefaultProtocolVersion)
-			if err != nil {
-				panic(err)
-			}
-			success := a2.Send(frame, DestinationId(bClientId), func(err error) {
-				acks <- err
-			})
-			AssertEqual(t, success, true)
-		}
-	}()
+	sendDone = sendMessages(a2)
 
 	ackCount = 0
-	waitingAckCount = -1
 	receiveCount = 0
-	waitingReceiveCount = -1
 	receiveMessages = map[string]bool{}
 	for receiveCount < n || ackCount < n {
-		if receiveCount < n && waitingReceiveCount < receiveCount {
-			fmt.Printf("[1] waiting for %d/%d\n", receiveCount+1, n)
-			waitingReceiveCount = receiveCount
-		} else if ackCount < n && waitingAckCount < ackCount {
-			fmt.Printf("[1] waiting for ack %d/%d\n", ackCount+1, n)
-		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -518,17 +513,24 @@ func runSendReceiveSenderReset(t *testing.T, encMode encryptionMode) {
 		case err := <-acks:
 			AssertEqual(t, err, nil)
 			ackCount += 1
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous send/receive worker: %v", asyncErr)
 		case <-time.After(timeout):
 			t.Fatal("Timeout.")
 		}
+	}
+	select {
+	case <-sendDone:
+	case asyncErr := <-asyncErrors:
+		t.Fatalf("asynchronous sender: %v", asyncErr)
+	case <-time.After(timeout):
+		t.Fatal("replacement sender did not finish")
 	}
 	for i := 0; i < n; i += 1 {
 		message := fmt.Sprintf("hi %d", i)
 		found := receiveMessages[message]
 		AssertEqual(t, found, true)
 	}
-
-	fmt.Printf("[2] done\n")
 
 	AssertEqual(t, n, len(receiveMessages))
 	AssertEqual(t, n, ackCount)
@@ -856,14 +858,14 @@ func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
 
 // FIXME TestAckTimeout
 
-func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
+func TestSendBufferSharesWireIdentityAcrossLocalRoutes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	defer client.Cancel()
 
 	peerId := NewId()
-	destination := DestinationId(peerId)
+	destination := peerId
 	send := func(content string, opts ...any) {
 		frame := &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferExchangeSignals,
@@ -921,14 +923,18 @@ func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
 	// receiver keys its head slot per lane: a ForceStream sequence COEXISTS
 	// with the plain one instead of retiring it.
 	send("stream", ForceStream())
+	var stream *SendSequence
 	func() {
 		client.sendBuffer.mutex.Lock()
 		defer client.sendBuffer.mutex.Unlock()
 		exactCount := 0
 		wireCount := 0
-		for id := range client.sendBuffer.sendSequences {
+		for id, sequence := range client.sendBuffer.sendSequences {
 			if id.Destination == destination {
 				exactCount += 1
+				if id.ForceStream {
+					stream = sequence
+				}
 			}
 		}
 		for wireId := range client.sendBuffer.wireSendSequences {
@@ -946,35 +952,38 @@ func TestSendBufferRetiresWireIndistinguishableSequenceForks(t *testing.T) {
 	default:
 	}
 
-	// Intermediaries remain a sender-side route choice absent from the
-	// destination's receive-head identity, so an intermediaries fork still
-	// synchronously retires the same-lane predecessor.
+	// Intermediaries are contract-acquisition metadata, not logical sequence
+	// identity. A later multihop send therefore joins the existing stream lane.
 	via := RequireMultiHopId(NewId(), peerId)
 	frame := &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferExchangeSignals,
 		MessageBytes: []byte("via intermediary"),
 	}
 	if !client.SendMultiHopWithTimeout(frame, via, nil, time.Second, ForceStream()) {
-		t.Fatal("multi-hop replacement enqueue failed")
+		t.Fatal("multi-hop enqueue failed")
 	}
 	func() {
 		client.sendBuffer.mutex.Lock()
 		defer client.sendBuffer.mutex.Unlock()
 		viaCount := 0
-		for id := range client.sendBuffer.sendSequences {
+		for id, sequence := range client.sendBuffer.sendSequences {
 			if id.Destination == destination && id.ForceStream {
 				viaCount += 1
-				if id.IntermediaryIds.Len() != 1 {
-					t.Fatalf("force-stream lane intermediaries = %v, want one", id.IntermediaryIds)
+				if sequence != stream {
+					t.Fatal("multihop send replaced the existing stream sequence")
 				}
 			}
 		}
 		if viaCount != 1 {
-			t.Fatalf("force-stream lane sequences = %d, want the intermediary replacement only", viaCount)
+			t.Fatalf("force-stream lane sequences = %d, want one shared sequence", viaCount)
 		}
 	}()
-	// the direct force-stream sequence was retired by the intermediaries fork
-	// (same lane on the wire); the plain lane is untouched
+	select {
+	case <-stream.ctx.Done():
+		t.Fatal("multihop send canceled the existing stream sequence")
+	default:
+	}
+	// The plain lane is distinct and remains untouched.
 	select {
 	case <-plain.ctx.Done():
 		t.Fatal("plain lane sequence was retired by another lane's intermediaries fork")
@@ -1033,15 +1042,11 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 	}
 
 	newSettings := func() *ClientSettings {
-		clientSettings := DefaultClientSettings()
-		clientSettings.SendBufferSettings.SequenceBufferSize = 0
-		clientSettings.SendBufferSettings.AckBufferSize = 0
+		clientSettings := DefaultClientSettingsWithBufferSize(n)
 		clientSettings.SendBufferSettings.AckTimeout = 300 * time.Second
 		clientSettings.SendBufferSettings.IdleTimeout = 300 * time.Second
-		clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
 		clientSettings.ReceiveBufferSettings.GapTimeout = 300 * time.Second
 		clientSettings.ReceiveBufferSettings.IdleTimeout = 300 * time.Second
-		clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
 		clientSettings.ForwardBufferSettings.IdleTimeout = 300 * time.Second
 		clientSettings.ContractManagerSettings.LegacyCreateContract = true
 		applyTestEncryptionSettings(clientSettings, encryptionModeOn)
@@ -1060,18 +1065,30 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 	b.RouteManager().UpdateTransport(bReceiveTransport, []Route{bReceive})
 	b.ContractManager().SetProvideModes(provideModes)
 
-	acks := make(chan error)
-	receives := make(chan *protocol.SimpleMessage)
+	acks := make(chan error, n)
+	receives := make(chan *protocol.SimpleMessage, n)
+	asyncErrors := make(chan error, 1)
+	recordAsyncError := func(err error) {
+		select {
+		case asyncErrors <- err:
+		default:
+		}
+	}
 
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		for _, frame := range frames {
 			m, err := FromFrame(frame)
 			if err != nil {
-				panic(err)
+				recordAsyncError(fmt.Errorf("decode ForceStream receive: %w", err))
+				return
 			}
 			switch v := m.(type) {
 			case *protocol.SimpleMessage:
-				receives <- v
+				select {
+				case receives <- v:
+				default:
+					recordAsyncError(fmt.Errorf("ForceStream receive collector overflow"))
+				}
 			}
 		}
 	})
@@ -1097,19 +1114,29 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 		}
 	}
 
+	sendDone := make(chan struct{})
 	go func() {
+		defer close(sendDone)
 		for i := 0; i < n; i += 1 {
 			message := &protocol.SimpleMessage{
 				Content: fmt.Sprintf("hi %d", i),
 			}
 			frame, err := ToFrame(message, DefaultProtocolVersion)
 			if err != nil {
-				panic(err)
+				recordAsyncError(fmt.Errorf("encode ForceStream message %d: %w", i, err))
+				return
 			}
-			success := a.SendWithTimeout(frame, DestinationId(bClientId), func(err error) {
-				acks <- err
+			success := a.SendWithTimeout(frame, bClientId, func(err error) {
+				select {
+				case acks <- err:
+				default:
+					recordAsyncError(fmt.Errorf("ForceStream ack collector overflow: %v", err))
+				}
 			}, -1, ForceStream())
-			AssertEqual(t, success, true)
+			if !success {
+				recordAsyncError(fmt.Errorf("send ForceStream message %d", i))
+				return
+			}
 		}
 	}()
 
@@ -1134,9 +1161,18 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 		case err := <-acks:
 			AssertEqual(t, err, nil)
 			ackCount += 1
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous ForceStream worker: %v", asyncErr)
 		case <-time.After(progressTimeout):
 			t.Fatalf("Timeout: %d/%d received, %d/%d acked — the ForceStream data sequence is starved (EncryptedControl carrier fork)", receiveCount, n, ackCount, n)
 		}
+	}
+	select {
+	case <-sendDone:
+	case asyncErr := <-asyncErrors:
+		t.Fatalf("asynchronous ForceStream sender: %v", asyncErr)
+	case <-time.After(timeout):
+		t.Fatal("ForceStream sender did not finish")
 	}
 	for i := 0; i < n; i += 1 {
 		message := fmt.Sprintf("hi %d", i)
@@ -1150,7 +1186,7 @@ func TestSendReceiveEncryptedForceStreamData(t *testing.T) {
 		defer a.sendBuffer.mutex.Unlock()
 		clientRoleSequences := []sendSequenceId{}
 		for key := range a.sendBuffer.sendSequences {
-			if key.Destination.DestinationId == bClientId &&
+			if key.Destination == bClientId &&
 				key.EncryptionRole == sequenceTlsRoleClient &&
 				!key.EncryptionCompanion &&
 				!key.CompanionContract {

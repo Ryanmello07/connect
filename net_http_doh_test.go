@@ -1,13 +1,17 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
 	"slices"
 	"sync"
@@ -213,6 +217,144 @@ func TestDohCacheCachesMiss(t *testing.T) {
 		AssertEqual(t, len(ips), 0)
 	}
 	AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
+}
+
+func TestDohCacheReportsTunnelRouteForAResult(t *testing.T) {
+	answer := netip.MustParseAddr("203.0.113.65")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDohWire(w, r, []netip.Addr{answer}, 300, false)
+	}))
+	defer server.Close()
+
+	type observedResult struct {
+		domain string
+		addrs  []netip.Addr
+		route  *DohRoute
+	}
+	observed := make(chan observedResult, 1)
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = time.Second
+	settings.DnsResolverSettings.EnableRemoteDoh = true
+	settings.DnsResolverSettings.EnableRemoteDns = false
+	settings.DnsResolverSettings.EnableLocalDoh = false
+	settings.DnsResolverSettings.EnableLocalDns = false
+	settings.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{server.URL}
+	// An owner-supplied dialer is the signal that this cache rides a tunnel;
+	// use the host dialer in the test while retaining the same observation path.
+	settings.DialContextSettings = &DialContextSettings{
+		DialContext: (&net.Dialer{}).DialContext,
+	}
+	settings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
+		observed <- observedResult{domain: domain, addrs: addrs, route: route}
+	}
+
+	cache := NewDohCache(settings)
+	defer cache.Close()
+	addrs, authoritative := cache.QueryResult(context.Background(), "A", "smtp.example.test")
+	if !authoritative || !slices.Equal(addrs, []netip.Addr{answer}) {
+		t.Fatalf("A result = %v authoritative=%v, want %v true", addrs, authoritative, answer)
+	}
+	select {
+	case result := <-observed:
+		if result.domain != "smtp.example.test" || !slices.Equal(result.addrs, []netip.Addr{answer}) {
+			t.Fatalf("observed result = %+v", result)
+		}
+		if result.route == nil || !result.route.Local.IsValid() || !result.route.Remote.IsValid() {
+			t.Fatalf("observed route = %+v, want valid tunnel tuple", result.route)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successful A answer did not report its tunnel route")
+	}
+}
+
+type dohRouteConn struct {
+	net.Conn
+	local  net.Addr
+	remote net.Addr
+}
+
+func (self *dohRouteConn) LocalAddr() net.Addr {
+	return self.local
+}
+
+func (self *dohRouteConn) RemoteAddr() net.Addr {
+	return self.remote
+}
+
+// Adapts one deterministic callback into an HTTP transport.
+type dohRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+// Delegates each request to the deterministic test callback.
+func (self dohRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
+
+// TestDohRouteForConnRejectsMissingEndpoint pins the live proxy panic: an
+// HTTP/2 GotConn callback can retain a non-nil connection wrapper after one
+// endpoint address has disappeared. Route metadata is optional, so either
+// missing endpoint must return no route instead of dereferencing net.Addr.
+func TestDohRouteForConnRejectsMissingEndpoint(t *testing.T) {
+	local := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 41000}
+	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 443}
+	var typedNilAddr *net.TCPAddr
+	for _, test := range []struct {
+		name string
+		conn net.Conn
+	}{
+		{name: "nil connection"},
+		{name: "nil local", conn: &dohRouteConn{remote: remote}},
+		{name: "nil remote", conn: &dohRouteConn{local: local}},
+		{name: "typed nil local", conn: &dohRouteConn{local: typedNilAddr, remote: remote}},
+		{name: "typed nil remote", conn: &dohRouteConn{local: local, remote: typedNilAddr}},
+	} {
+		if route := dohRouteForConn(test.conn); route != nil {
+			t.Errorf("%s: route = %+v, want nil for missing endpoint", test.name, route)
+		}
+	}
+}
+
+// Pins the complete live failure path: HTTP/2 invokes GotConn with a wrapper
+// whose endpoint disappeared, but route observation is optional and the valid
+// DoH response must still reach the resolver.
+func TestDohQueryPreservesResponseWhenRouteEndpointMissing(t *testing.T) {
+	responseWire := []byte{0x01, 0x02, 0x03, 0x04}
+	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 443}
+	transport := dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		trace := httptrace.ContextClientTrace(request.Context())
+		if trace == nil || trace.GotConn == nil {
+			return nil, fmt.Errorf("request has no GotConn trace")
+		}
+		trace.GotConn(httptrace.GotConnInfo{
+			Conn: &dohRouteConn{remote: remote},
+		})
+		return &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(responseWire)),
+			Request:    request,
+		}, nil
+	})
+	client := &dohClient{
+		httpClient:   &http.Client{Transport: transport},
+		captureRoute: true,
+	}
+
+	data, route, err := client.queryWireRawDetailedWithRoute(
+		context.Background(),
+		"https://doh.example.test/dns-query",
+		dnsmessage.TypeA,
+		"smtp.example.test",
+	)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if !bytes.Equal(data, responseWire) {
+		t.Fatalf("response = %v, want %v", data, responseWire)
+	}
+	if route != nil {
+		t.Fatalf("route = %+v, want no metadata for missing endpoint", route)
+	}
 }
 
 // TestDohCacheDoesNotCacheHttpError: an HTTP 5xx (transient server failure, not an

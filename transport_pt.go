@@ -54,11 +54,15 @@ func DefaultPacketTranslationSettings() *PacketTranslationSettings {
 		// DnsReadTimeout: 1 * time.Second:
 		DnsStateTimeout: 5 * time.Second,
 
-		DnsMaxCombinePerAddress: 64 * 1024,
-		DnsMaxCombine:           64 * 1024 * 1024 * 1024,
+		DnsMaxCombinePerAddress:       64,
+		DnsMaxCombine:                 512,
+		DnsMaxCombineFragmentCount:    32,
+		DnsMaxCombinedPacketByteCount: 64 * 1024,
+		DnsMaxCombineBytesPerAddress:  MemoryScaledByteCount(kib(256), kib(64)),
+		DnsMaxCombineBytes:            MemoryScaledByteCount(mib(2), kib(512)),
 
-		DnsMaxPumpHostsPerAddress: 2 * 1024,
-		DnsMaxPumpHosts:           1024 * 1024 * 1024,
+		DnsMaxPumpHostsPerAddress: MemoryScaledCount(1024, 256),
+		DnsMaxPumpHosts:           int64(MemoryScaledCount(8192, 2048)),
 
 		WritePacketsPerSecond: 200,
 		SequenceBufferSize:    32,
@@ -78,6 +82,12 @@ type PacketTranslationSettings struct {
 
 	DnsMaxCombinePerAddress int
 	DnsMaxCombine           int64
+	// The count limits above bound map/heap cardinality. These limits also
+	// bound attacker-controlled fragment fanout and retained pooled capacity.
+	DnsMaxCombineFragmentCount    int
+	DnsMaxCombinedPacketByteCount ByteCount
+	DnsMaxCombineBytesPerAddress  ByteCount
+	DnsMaxCombineBytes            ByteCount
 
 	DnsMaxPumpHostsPerAddress int
 	DnsMaxPumpHosts           int64
@@ -87,8 +97,18 @@ type PacketTranslationSettings struct {
 }
 
 type packet struct {
-	data []byte
-	addr net.Addr
+	data        []byte
+	addr        net.Addr
+	writeResult chan error
+}
+
+// finishPacketWrite publishes the wire disposition for a logical PacketConn
+// write. The channel is buffered because a deadline or cancellation may have
+// already released the caller while the encoder still owned the packet copy.
+func finishPacketWrite(p *packet, err error) {
+	if p.writeResult != nil {
+		p.writeResult <- err
+	}
 }
 
 // implements PacketConn
@@ -96,6 +116,13 @@ type packetTranslation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
+
+	operationLock   sync.Mutex
+	operationClosed bool
+	operationWg     sync.WaitGroup
+	workerWg        sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
 
 	ptMode       PacketTranslationMode
 	packetConn   net.PacketConn
@@ -124,6 +151,18 @@ func NewPacketTranslation(
 	packetConn net.PacketConn,
 	settings *PacketTranslationSettings,
 ) (*packetTranslation, error) {
+	if settings.DnsStateTimeout <= 0 {
+		return nil, fmt.Errorf("DNS state timeout must be positive")
+	}
+	if settings.DnsMaxCombinePerAddress <= 0 || settings.DnsMaxCombine <= 0 ||
+		settings.DnsMaxCombineFragmentCount <= 0 ||
+		settings.DnsMaxCombinedPacketByteCount <= 0 ||
+		settings.DnsMaxCombineBytesPerAddress <= 0 || settings.DnsMaxCombineBytes <= 0 {
+		return nil, fmt.Errorf("DNS combine limits must be positive")
+	}
+	if settings.DnsMaxPumpHostsPerAddress <= 0 || settings.DnsMaxPumpHosts <= 0 {
+		return nil, fmt.Errorf("DNS pump limits must be positive")
+	}
 	return NewPacketTranslationWithPrefix(
 		ctx,
 		ptMode,
@@ -170,25 +209,50 @@ func NewPacketTranslationWithPrefix(
 	switch ptMode {
 	case PacketTranslationModeDns, PacketTranslationModeDnsPump:
 		pt.dnsClient = true
-		go HandleError(pt.encodeDns, cancel)
-		go HandleError(pt.decodeDns, cancel)
+		pt.startWorker(pt.encodeDns)
+		pt.startWorker(pt.decodeDns)
 	case PacketTranslationModeDecode53:
 		pt.dnsClient = false
 		pt.dnsPumpQueue = newPumpQueue(settings)
-		go HandleError(pt.encodeDns, cancel)
-		go HandleError(pt.decodeDns, cancel)
+		pt.startWorker(pt.encodeDns)
+		pt.startWorker(pt.decodeDns)
 	case PacketTranslationModeDecode53RequireDnsPump:
 		pt.dnsClient = false
 		pt.dnsPumpQueue = newPumpQueue(settings)
 		pt.dnsRequirePump = true
-		go HandleError(pt.encodeDns, cancel)
-		go HandleError(pt.decodeDns, cancel)
+		pt.startWorker(pt.encodeDns)
+		pt.startWorker(pt.decodeDns)
 	default:
 		cancel()
 		return nil, fmt.Errorf("Unsupported packet translation mode: %s", ptMode)
 	}
+	context.AfterFunc(cancelCtx, func() {
+		_ = pt.close()
+	})
 
 	return pt, nil
+}
+
+// startWorker accounts for every top-level owner before it can observe
+// cancellation. Close joins these workers before draining their shared queues.
+func (self *packetTranslation) startWorker(run func()) {
+	self.workerWg.Add(1)
+	go func() {
+		defer self.workerWg.Done()
+		HandleError(run, self.cancel)
+	}()
+}
+
+// beginOperation prevents a PacketConn call from publishing into a queue after
+// shutdown has joined the queue consumers and begun its final drain.
+func (self *packetTranslation) beginOperation() bool {
+	self.operationLock.Lock()
+	defer self.operationLock.Unlock()
+	if self.operationClosed || self.ctx.Err() != nil {
+		return false
+	}
+	self.operationWg.Add(1)
+	return true
 }
 
 func (self *packetTranslation) newHeader() [18]byte {
@@ -246,7 +310,8 @@ func (self *packetTranslation) encodeDns() {
 	}
 	for {
 		if self.dnsClient {
-			writeOne := func(p *packet) error {
+			writeOne := func(p *packet) (writeErr error) {
+				defer func() { finishPacketWrite(p, writeErr) }()
 				defer MessagePoolReturn(p.data)
 
 				// fmt.Printf("WRITE ONE\n")
@@ -283,7 +348,7 @@ func (self *packetTranslation) encodeDns() {
 						writeDuration := endTime.Sub(startTime)
 						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
 						if 0 < timeout && !waitPace(timeout) {
-							return nil
+							return self.ctx.Err()
 						}
 					}
 
@@ -381,7 +446,8 @@ func (self *packetTranslation) encodeDns() {
 				}
 			}
 		} else {
-			writeOne := func(p *packet) error {
+			writeOne := func(p *packet) (writeErr error) {
+				defer func() { finishPacketWrite(p, writeErr) }()
 				defer MessagePoolReturn(p.data)
 
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
@@ -467,7 +533,7 @@ func (self *packetTranslation) encodeDns() {
 						writeDuration := endTime.Sub(startTime)
 						timeout := time.Second/time.Duration(self.settings.WritePacketsPerSecond) - writeDuration
 						if 0 < timeout && !waitPace(timeout) {
-							return nil
+							return self.ctx.Err()
 						}
 					}
 				}
@@ -503,8 +569,6 @@ func (self *packetTranslation) encodeDns() {
 }
 
 func (self *packetTranslation) decodeDns() {
-	defer self.cancel()
-
 	type readData struct {
 		addr   net.Addr
 		header [18]byte
@@ -514,12 +578,12 @@ func (self *packetTranslation) decodeDns() {
 
 	readPipeline := make(chan *readData, self.settings.SequenceBufferSize)
 	pumpPipeline := make(chan *pumpItem, self.settings.SequenceBufferSize)
-
+	var childWorkers sync.WaitGroup
 	defer func() {
-		// the goroutines below see ctx.Done() and exit; drain any
-		// queued readData items so their pooled bytes are returned.
-		// (producer-consumer race may leak at most one item per goroutine
-		// after this drain, which is acceptable.)
+		self.cancel()
+		childWorkers.Wait()
+		// No producer or consumer remains after the join, so this drain is the
+		// final disposition for every readData item that never reached combine.
 		for {
 			select {
 			case r, ok := <-readPipeline:
@@ -532,8 +596,15 @@ func (self *packetTranslation) decodeDns() {
 			}
 		}
 	}()
+	runChild := func(run func()) {
+		childWorkers.Add(1)
+		go func() {
+			defer childWorkers.Done()
+			HandleError(run, self.cancel)
+		}()
+	}
 
-	go HandleError(func() {
+	runChild(func() {
 		defer self.cancel()
 
 		dnsCombineQueue := newCombineQueue(self.settings)
@@ -547,16 +618,41 @@ func (self *packetTranslation) decodeDns() {
 				}
 			}
 		}()
+		expiryTimer := time.NewTimer(time.Hour)
+		if !expiryTimer.Stop() {
+			<-expiryTimer.C
+		}
+		defer expiryTimer.Stop()
+		var expiry <-chan time.Time
+		resetExpiry := func() {
+			if !expiryTimer.Stop() && expiry != nil {
+				select {
+				case <-expiryTimer.C:
+				default:
+				}
+			}
+			if oldest, ok := dnsCombineQueue.OldestUpdateTime(); ok {
+				delay := time.Until(oldest.Add(self.settings.DnsStateTimeout))
+				expiryTimer.Reset(max(time.Duration(0), delay))
+				expiry = expiryTimer.C
+			} else {
+				expiry = nil
+			}
+		}
 
 		for {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-expiry:
+				dnsCombineQueue.RemoveOlder(time.Now().Add(-self.settings.DnsStateTimeout))
+				resetExpiry()
 			case r := <-readPipeline:
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
 				dnsCombineQueue.RemoveOlder(minUpdateTime)
 
 				out, limit, err := dnsCombineQueue.Combine(r.addr, r.header, r.data)
+				resetExpiry()
 				if err != nil {
 					// drop the packet
 					MessagePoolReturn(r.data)
@@ -581,28 +677,58 @@ func (self *packetTranslation) decodeDns() {
 
 				select {
 				case <-self.ctx.Done():
+					MessagePoolReturn(out.data)
 					return
 				case self.in <- out:
 				}
 			}
 		}
-	}, self.cancel)
+	})
 
-	go HandleError(func() {
+	runChild(func() {
 		defer self.cancel()
+		if self.dnsPumpQueue == nil {
+			<-self.ctx.Done()
+			return
+		}
+		expiryTimer := time.NewTimer(time.Hour)
+		if !expiryTimer.Stop() {
+			<-expiryTimer.C
+		}
+		defer expiryTimer.Stop()
+		var expiry <-chan time.Time
+		resetExpiry := func() {
+			if !expiryTimer.Stop() && expiry != nil {
+				select {
+				case <-expiryTimer.C:
+				default:
+				}
+			}
+			if oldest, ok := self.dnsPumpQueue.OldestUpdateTime(); ok {
+				delay := time.Until(oldest.Add(self.settings.DnsStateTimeout))
+				expiryTimer.Reset(max(time.Duration(0), delay))
+				expiry = expiryTimer.C
+			} else {
+				expiry = nil
+			}
+		}
 
 		for {
 			select {
 			case <-self.ctx.Done():
 				return
+			case <-expiry:
+				self.dnsPumpQueue.RemoveOlder(time.Now().Add(-self.settings.DnsStateTimeout))
+				resetExpiry()
 			case item := <-pumpPipeline:
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
 				self.dnsPumpQueue.RemoveOlder(minUpdateTime)
 				// if limit, drop the pump header but continue to process the packet
 				self.dnsPumpQueue.Add(item)
+				resetExpiry()
 			}
 		}
-	}, self.cancel)
+	})
 
 	packetData := make([]byte, 2048)
 	var buf [1024]byte
@@ -728,7 +854,67 @@ func (self *packetTranslation) currentWriteDeadline() (time.Time, <-chan struct{
 	return self.writeDeadline, self.writeDeadlineMonitor.NotifyChannel()
 }
 
+// waitForWireWrite keeps PacketConn.WriteTo synchronous with the translated
+// wire writes it represents. In particular, a caller may close the PacketConn
+// immediately after a successful return without losing an accepted QUIC close
+// packet from the encoder queue.
+func (self *packetTranslation) waitForWireWrite(
+	writeResult <-chan error,
+	packetByteCount int,
+) (int, error) {
+	for {
+		// Prefer an already-published disposition over a concurrent shutdown.
+		select {
+		case err := <-writeResult:
+			if err != nil {
+				return 0, err
+			}
+			return packetByteCount, nil
+		default:
+		}
+
+		writeDeadline, deadlineChanged := self.currentWriteDeadline()
+		if writeDeadline.IsZero() {
+			select {
+			case err := <-writeResult:
+				if err != nil {
+					return 0, err
+				}
+				return packetByteCount, nil
+			case <-self.ctx.Done():
+				return 0, fmt.Errorf("Done.")
+			case <-deadlineChanged:
+			}
+			continue
+		}
+
+		timeout := time.Until(writeDeadline)
+		if timeout <= 0 {
+			self.log.Infof("[pt]write packet timeout\n")
+			return 0, fmt.Errorf("Timeout.")
+		}
+		select {
+		case err := <-writeResult:
+			if err != nil {
+				return 0, err
+			}
+			return packetByteCount, nil
+		case <-self.ctx.Done():
+			return 0, fmt.Errorf("Done.")
+		case <-time.After(timeout):
+			self.log.Infof("[pt]write packet timeout\n")
+			return 0, fmt.Errorf("Timeout.")
+		case <-deadlineChanged:
+		}
+	}
+}
+
 func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int, err error) {
+	if !self.beginOperation() {
+		return 0, fmt.Errorf("Done.")
+	}
+	defer self.operationWg.Done()
+
 	// packetDataCopy := make([]byte, len(packetData))
 	// copy(packetDataCopy, packetData)
 	packetDataCopy := MessagePoolCopy(packetData)
@@ -740,8 +926,9 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 	}()
 
 	p := &packet{
-		data: packetDataCopy,
-		addr: addr,
+		data:        packetDataCopy,
+		addr:        addr,
+		writeResult: make(chan error, 1),
 	}
 
 	for {
@@ -753,9 +940,8 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 				return
 			case self.out <- p:
 				queued = true
-				n = len(packetData)
 				self.log.V(2).Infof("[pt]write packet\n")
-				return
+				return self.waitForWireWrite(p.writeResult, len(packetData))
 			case <-deadlineChanged:
 			}
 			continue
@@ -775,9 +961,8 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 			return
 		case self.out <- p:
 			queued = true
-			n = len(packetData)
 			self.log.V(2).Infof("[pt]write packet\n")
-			return
+			return self.waitForWireWrite(p.writeResult, len(packetData))
 		case <-deadlineChanged:
 			continue
 		default:
@@ -788,9 +973,8 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 			return
 		case self.out <- p:
 			queued = true
-			n = len(packetData)
 			self.log.V(2).Infof("[pt]write packet\n")
-			return
+			return self.waitForWireWrite(p.writeResult, len(packetData))
 		case <-time.After(timeout):
 			err = fmt.Errorf("Timeout.")
 			self.log.Infof("[pt]write packet timeout\n")
@@ -801,6 +985,11 @@ func (self *packetTranslation) WriteTo(packetData []byte, addr net.Addr) (n int,
 }
 
 func (self *packetTranslation) ReadFrom(packetData []byte) (n int, addr net.Addr, err error) {
+	if !self.beginOperation() {
+		return 0, nil, fmt.Errorf("Done.")
+	}
+	defer self.operationWg.Done()
+
 	for {
 		readDeadline, deadlineChanged := self.currentReadDeadline()
 		if readDeadline.IsZero() {
@@ -891,8 +1080,39 @@ func (self *packetTranslation) SetWriteDeadline(t time.Time) error {
 }
 
 func (self *packetTranslation) Close() error {
-	self.cancel()
-	return self.packetConn.Close()
+	return self.close()
+}
+
+func (self *packetTranslation) close() error {
+	self.closeOnce.Do(func() {
+		self.operationLock.Lock()
+		self.operationClosed = true
+		self.operationLock.Unlock()
+		self.cancel()
+		self.closeErr = self.packetConn.Close()
+		self.operationWg.Wait()
+		self.workerWg.Wait()
+		returnPacketTranslationQueue(self.in)
+		returnPacketTranslationQueue(self.out)
+		returnPacketTranslationQueue(self.forward)
+	})
+	return self.closeErr
+}
+
+// returnPacketTranslationQueue releases ownership after every producer and
+// consumer of a retired packet queue has joined.
+func returnPacketTranslationQueue(queue chan *packet) {
+	for {
+		select {
+		case queued := <-queue:
+			if queued != nil {
+				finishPacketWrite(queued, net.ErrClosed)
+				MessagePoolReturn(queued.data)
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (self *packetTranslation) SetReadBuffer(bytes int) error {

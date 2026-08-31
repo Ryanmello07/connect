@@ -84,7 +84,11 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	// the sanity probe briefly — the pin is that a LIVE conn buffers at all
 	sanityDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err = manager.ReceiveExchangeSignals(source, lifecycleCandidateSignals(t, streamId, 1))
+		err = manager.ReceiveExchangeSignals(
+			source,
+			TransferKey{},
+			lifecycleCandidateSignals(t, streamId, 1),
+		)
 		AssertEqual(t, err, nil)
 		buffered := func() int {
 			pconn.signalLock.Lock()
@@ -134,7 +138,11 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	// late signals: dropped without error, without buffering, in bounded time
 	startTime := time.Now()
 	for i := 0; i < 100; i += 1 {
-		err = manager.ReceiveExchangeSignals(source, lifecycleCandidateSignals(t, streamId, 10))
+		err = manager.ReceiveExchangeSignals(
+			source,
+			TransferKey{},
+			lifecycleCandidateSignals(t, streamId, 10),
+		)
 		if err != nil {
 			t.Fatalf("late signals to a closed conn must be a no-op, not an error (batch %d): %v", i, err)
 		}
@@ -165,7 +173,9 @@ type blockingSignalSender struct {
 	blockedCount     int32
 }
 
-func (self *blockingSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+// SendSignal consumes one frame after modeling blocking or nonblocking delivery.
+func (self *blockingSignalSender) SendSignal(_ Id, signal *protocol.Frame, opts ...any) {
+	defer MessagePoolReturn(signal.MessageBytes)
 	for _, opt := range opts {
 		if _, ok := opt.(signalSendNonBlocking); ok {
 			atomic.AddInt32(&self.nonBlockingCount, 1)
@@ -222,7 +232,7 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	source.StreamId = streamId
 	done := make(chan error, 1)
 	go func() {
-		done <- manager.ReceiveExchangeSignals(source, &protocol.ExchangeSignals{
+		done <- manager.ReceiveExchangeSignals(source, TransferKey{}, &protocol.ExchangeSignals{
 			StreamId: streamId.Bytes(),
 			Signals: []*protocol.ExchangeSignal{{
 				SignalType: protocol.SignalType_WaitingForSdpOffer,
@@ -237,5 +247,47 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&sender.nonBlockingCount); got == 0 {
 		t.Fatal("the receive-path response send did not carry the non-blocking contract")
+	}
+}
+
+// A Pion ICE callback shares Pion's event machinery. Candidate publication
+// must therefore use the same zero-timeout transfer handoff as an inbound
+// signal response, even though the candidate was generated locally.
+func TestPionIceCandidateCallbackSendDoesNotBlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &blockingSignalSender{ctx: ctx}
+	conn := &peerConn{
+		ctx:                ctx,
+		key:                peerConnKey{PeerId: NewId(), StreamId: NewId()},
+		signalSender:       sender,
+		signalGeneration:   NewId(),
+		iceCandidatesReady: true,
+	}
+	candidate := &webrtc.ICECandidate{
+		Foundation: "nonblocking",
+		Priority:   1,
+		Address:    "192.0.2.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       10000,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.handleLocalIceCandidate(candidate)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Pion ICE callback blocked on a saturated Transfer sender")
+	}
+	if got := atomic.LoadInt32(&sender.nonBlockingCount); got != 1 {
+		t.Fatalf("nonblocking candidate sends = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&sender.blockedCount); got != 0 {
+		t.Fatalf("blocking candidate sends = %d, want 0", got)
 	}
 }

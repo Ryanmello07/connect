@@ -352,6 +352,11 @@ type UpgradeMux struct {
 	// cache emits no query the mux sees). Observation only — the flow always passes
 	// through. Self-contained + independently testable (see sniSniffer).
 	sni *sniSniffer
+
+	// upstreamMultiClient resolves a successful DoH connection's exact socket
+	// tuple to the provider that carried it. Installed with the batch upstream;
+	// nil for generic/server uses where provider affinity is not meaningful.
+	upstreamMultiClient atomic.Pointer[RemoteUserNatMultiClient]
 }
 
 // dnsResolverSettings extracts the resolver config from the mux settings (nil = no DNS
@@ -524,6 +529,9 @@ func NewUpgradeMux(
 	dohSettings.DohServerResolvedCallback = func(domain string, addrs []netip.Addr) {
 		self.reverse.record(addrs, domain)
 	}
+	dohSettings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
+		self.bindDnsResultToExit(domain, addrs, route)
+	}
 	tunSettings.DohSettings = dohSettings
 	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
 	// query context) and the underlying DoH request through the tun alike. SetSettings re-derives
@@ -538,6 +546,7 @@ func NewUpgradeMux(
 	// one mux per connect, so the first-load timeline's activation is the connect start
 	self.firstLoad = newFirstLoadTimeline(log)
 	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, self.onPump, initialReceiver, log)
+	self.mux.setOnSendGroup(self.onSendGroup)
 	self.tunnelDohWarmFunction = func(ctx context.Context, serverCount int) bool {
 		return self.mux.Tun().DohCache().Warm(ctx, serverCount)
 	}
@@ -914,6 +923,64 @@ func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.Provide
 	return false
 }
 
+// Classifies one exact directional flow once while preserving content state
+// that inherently advances for each ordered packet. A claimed group is
+// consumed in full; malformed content inside an intercepted flow fails closed
+// instead of decomposing the group into independently routed packets.
+func (self *UpgradeMux) onSendGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool {
+	if group == nil || group.ipPath == nil || len(group.packets) == 0 {
+		return true
+	}
+	for _, packet := range group.packets {
+		self.firstLoad.observeSend(packet)
+	}
+
+	ipPath := group.ipPath
+	switch {
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 443:
+		for _, packet := range group.packets {
+			var segment tlsSegment
+			if peekClaim(packet, &segment) == peekTls {
+				self.sni.observeSegment(segment)
+			}
+		}
+		return false
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 80:
+		return self.httpBlocked()
+	case ipPath.Protocol == IpProtocolUdp && ipPath.DestinationPort == 53:
+		settings := self.settings.Load()
+		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
+			return false
+		}
+		for _, packet := range group.packets {
+			packetPath, payload, err := ParseIpPathWithPayload(packet)
+			if err == nil {
+				self.handleDns(source, provideMode, packetPath, payload)
+			}
+		}
+		return true
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 53:
+		settings := self.settings.Load()
+		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
+			return false
+		}
+		for _, packet := range group.packets {
+			packetPath, err := ParseIpPath(packet)
+			if err == nil {
+				self.handleDnsTcpPacket(packetPath, packet)
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // httpBlocked reports whether claimed plaintext HTTP (TCP/80) should be dropped (block mode);
 // otherwise it passes through to the egress unchanged.
 func (self *UpgradeMux) httpBlocked() bool {
@@ -1034,8 +1101,16 @@ func dnsColdProbeDelay(failureCount int, initialDelay time.Duration, maxDelay ti
 }
 
 func (self *UpgradeMux) coldDohProbeNeeded() bool {
-	return self.dnsProbeRequested.Load() ||
-		(self.fallbackDohCache.Load() != nil && self.tunnelDohCold())
+	return self.dnsUpgradeEnabled() && (self.dnsProbeRequested.Load() ||
+		(self.fallbackDohCache.Load() != nil && self.tunnelDohCold()))
+}
+
+// dnsUpgradeEnabled reports whether this mux owns DNS interception. An
+// UpgradeMux may exist only for HTTP/SNI policy with Dns nil; in that mode its
+// internal Tun still has a DohCache for implementation uniformity, but it must
+// not open speculative DoH connections or retain their retry workers.
+func (self *UpgradeMux) dnsUpgradeEnabled() bool {
+	return dnsResolverSettings(self.settings.Load()) != nil
 }
 
 // ensureColdProber starts at most one background warm-probe worker. A cold mux
@@ -1117,6 +1192,10 @@ func (self *UpgradeMux) runColdDohProber() {
 }
 
 func (self *UpgradeMux) wakeColdProber() {
+	if !self.dnsUpgradeEnabled() {
+		self.dnsProbeRequested.Store(false)
+		return
+	}
 	self.dnsProbeRequested.Store(true)
 	if self.ensureColdProber() {
 		return
@@ -1128,7 +1207,8 @@ func (self *UpgradeMux) wakeColdProber() {
 }
 
 func (self *UpgradeMux) warmFallbackDns() {
-	if self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+	if !self.dnsUpgradeEnabled() || self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+		self.fallbackDohWarmPending.Store(false)
 		return
 	}
 	self.fallbackDohWarmPending.Store(true)
@@ -2386,6 +2466,18 @@ func (self *UpgradeMux) SendPacket(source TransferPath, provideMode protocol.Pro
 	return self.mux.SendPacket(source, provideMode, packet, timeout)
 }
 
+// Consumes a native packet burst after grouping it by exact directional flow.
+// Each group is classified once at the routing boundary while content-aware
+// observers still inspect its packets in order.
+func (self *UpgradeMux) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	return self.mux.SendPacketBatch(source, provideMode, packets, timeout)
+}
+
 // Receive is installed as the wrapped upstream's receive callback. The
 // callback IpPath is the canonical outbound path, not the return packet's
 // direction. Read the actual packet source (the server IP) to refresh that
@@ -2402,9 +2494,71 @@ func (self *UpgradeMux) Receive(source TransferPath, provideMode protocol.Provid
 	self.mux.Receive(source, provideMode, ipPath, packet)
 }
 
+// Batch receive preserves first-load and reverse-affinity observation for
+// every packet, then retains the batch through the generic mux boundary.
+func (self *UpgradeMux) ReceivePackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	for _, packet := range packets {
+		self.firstLoad.observeReceive(packet)
+		if packetSource, _, ok := ipPacketSourceDestinationAddrs(packet); ok {
+			self.reverse.touch(packetSource)
+		}
+	}
+	self.mux.ReceivePackets(source, provideMode, ipPath, packets)
+}
+
+// A batch receiver is used by device adapters while the singular receiver
+// remains available for synthesized and mixed traffic.
+func (self *UpgradeMux) AddPacketsReceiver(receiver ReceivePacketsFunction) func() {
+	return self.mux.AddPacketsReceiver(receiver)
+}
+
 // SetUpstream wires the wrapped upstream send (the remote UserNat).
 func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
+	self.upstreamMultiClient.Store(nil)
 	self.mux.SetUpstream(upstream)
+}
+
+func (self *UpgradeMux) bindDnsResultToExit(domain string, addrs []netip.Addr, route *DohRoute) {
+	upstream := self.upstreamMultiClient.Load()
+	if upstream == nil || route == nil || !route.Local.IsValid() || !route.Remote.IsValid() {
+		return
+	}
+	localAddr := route.Local.Addr().Unmap()
+	remoteAddr := route.Remote.Addr().Unmap()
+	if localAddr.Is4() != remoteAddr.Is4() {
+		return
+	}
+	version := 6
+	if localAddr.Is4() {
+		version = 4
+	}
+	upstream.bindDnsResultToExit(&IpPath{
+		Version:         version,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IP(localAddr.AsSlice()),
+		SourcePort:      int(route.Local.Port()),
+		DestinationIp:   net.IP(remoteAddr.AsSlice()),
+		DestinationPort: int(route.Remote.Port()),
+	}, domain, addrs)
+}
+
+// Wires an exact-flow group path when the upstream supports it.
+func (self *UpgradeMux) SetUpstreamBatchClient(upstream *RemoteUserNatMultiClient) {
+	self.upstreamMultiClient.Store(upstream)
+	self.mux.SetUpstream(upstream.SendPacket)
+	self.mux.setUpstreamGroupSend(func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		group *ipPacketGroup,
+		timeout time.Duration,
+	) bool {
+		return upstream.sendPacketGroup(source, provideMode, group, timeout)
+	})
 }
 
 // SetSettings updates the mux's DNS and HTTP policy at runtime. The tun's DohCache is

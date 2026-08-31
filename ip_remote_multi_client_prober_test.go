@@ -209,7 +209,7 @@ func TestProbeResolutionThroughChannel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		parent.clientReceivePacket(client, TransferPath{}, 0, ingressPath, answerPacket)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, answerPacket)
 	}
 
 	// stage B: tcp syns to exactly the answered addresses (plus any literal
@@ -225,7 +225,7 @@ func TestProbeResolutionThroughChannel(t *testing.T) {
 			resolvedSeen += 1
 		}
 		ingressPath, packet := probeTestSynAck(t, probe.ipPath, probe.synSequence)
-		parent.clientReceivePacket(client, TransferPath{}, 0, ingressPath, packet)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, packet)
 	}
 	if resolvedSeen != len(expectedNames) {
 		t.Errorf("saw %d tcp probes for resolved names, want %d", resolvedSeen, len(expectedNames))
@@ -290,7 +290,7 @@ func TestProbeResolverDownFallsBackToLiterals(t *testing.T) {
 			t.Errorf("fallback pass probed %q, not a literal-ip host", probe.target.Host)
 		}
 		ingressPath, packet := probeTestSynAck(t, probe.ipPath, probe.synSequence)
-		parent.clientReceivePacket(client, TransferPath{}, 0, ingressPath, packet)
+		parent.clientReceivePacket(client, TransferPath{}, 0, TransportTypeUnknown, ingressPath, packet)
 	}
 
 	var result probeResult
@@ -647,8 +647,49 @@ func TestPoolAdmitOrder(t *testing.T) {
 	}
 }
 
+func TestMultiClientExpandPlanCapsConstructedClients(t *testing.T) {
+	tests := []struct {
+		name               string
+		neededCount        int
+		evaluationMultiple int
+		fixedDestination   bool
+		wantAdmit          int
+		wantRequest        int
+	}{
+		{name: "none", neededCount: 0},
+		{name: "single pooled", neededCount: 1, evaluationMultiple: 2, wantAdmit: 1, wantRequest: 2},
+		{name: "small pooled surplus", neededCount: 3, evaluationMultiple: 2, wantAdmit: 3, wantRequest: 4},
+		{name: "large cold start", neededCount: 12, evaluationMultiple: 2, wantAdmit: 4, wantRequest: 4},
+		{name: "large low memory", neededCount: 12, evaluationMultiple: 1, wantAdmit: 4, wantRequest: 4},
+		{name: "fixed destination", neededCount: 12, evaluationMultiple: 4, fixedDestination: true, wantAdmit: 4, wantRequest: 4},
+		{name: "zero value multiple", neededCount: 2, wantAdmit: 2, wantRequest: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			admitCount, requestCount := multiClientExpandPlan(
+				test.neededCount,
+				test.evaluationMultiple,
+				test.fixedDestination,
+			)
+			if admitCount != test.wantAdmit || requestCount != test.wantRequest {
+				t.Fatalf(
+					"expand plan = (admit=%d, request=%d), want (%d, %d)",
+					admitCount,
+					requestCount,
+					test.wantAdmit,
+					test.wantRequest,
+				)
+			}
+			if multiClientExpandStepMax < admitCount || multiClientExpandStepMax < requestCount {
+				t.Fatalf("expand plan exceeded step max %d", multiClientExpandStepMax)
+			}
+		})
+	}
+}
+
 // The expand wiring: the multiple applies to the candidate-request count and
-// only there; every admission routes through the pure chooser; the surplus is
+// both constructed and admitted candidates pass through the four-client step
+// plan; every admission routes through the pure chooser; the surplus is
 // cancelled politely into the monitor's NotAdded terminal state; and the
 // standing-reserve / hard-max size math stays outside pooling's reach.
 func TestPoolExpandSourceAnchor(t *testing.T) {
@@ -661,10 +702,8 @@ func TestPoolExpandSourceAnchor(t *testing.T) {
 		t.Fatal("could not find expand")
 	}
 	for _, required := range []string{
-		// the multiple lands on the request count...
-		"requestCount := n * evaluationPoolMultiple",
-		// ...never on the admit budget, which stays the needed count
-		"admitBudget := n",
+		// one plan caps both full client constructions and admissions
+		"admitBudget, requestCount := multiClientExpandPlan(",
 		"EvaluationPoolMultiple",
 		// every admission goes through the single pure chooser
 		"poolAdmitOrder(",
@@ -692,6 +731,9 @@ func TestPoolExpandSourceAnchor(t *testing.T) {
 	}
 	if !strings.Contains(resizeBody, "WindowSizeHardMax") {
 		t.Error("resize no longer bounds by WindowSizeHardMax")
+	}
+	if !strings.Contains(resizeBody, "plannedAdmitCount, _ := multiClientExpandPlan(") {
+		t.Error("resize no longer reports the bounded expansion step")
 	}
 }
 

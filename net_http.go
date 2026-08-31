@@ -5,8 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-
-	// "errors"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand"
@@ -37,8 +36,15 @@ import (
 type HttpPostRawFunction func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error)
 type HttpGetRawFunction func(ctx context.Context, requestUrl string, byJwt string) ([]byte, error)
 
+// DefaultMaxHttpResponseBodyBytes bounds API responses that are materialized
+// in memory. API calls return JSON/control data rather than streamed payloads;
+// larger payloads must use an explicitly streaming transport.
+const DefaultMaxHttpResponseBodyBytes int64 = 2 * 1024 * 1024
+
+var ErrHttpResponseBodyTooLarge = errors.New("http response body exceeds memory limit")
+
 func DefaultClientStrategySettings() *ClientStrategySettings {
-	return &ClientStrategySettings{
+	settings := &ClientStrategySettings{
 		ExposeServerIps:       true,
 		ExposeServerHostNames: true,
 
@@ -57,7 +63,8 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		DohSettings: DefaultDohSettings(),
 
-		HelloRetryTimeout: 5 * time.Second,
+		HelloRetryTimeout:        5 * time.Second,
+		MaxHttpResponseBodyBytes: DefaultMaxHttpResponseBodyBytes,
 
 		GetRetryCount:       1,
 		GetRetryStatusCodes: []int{http.StatusBadGateway, http.StatusServiceUnavailable},
@@ -69,6 +76,25 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		ConnectSettings: *DefaultConnectSettings(),
 	}
+	// A configured process budget identifies an embedded/mobile client. Bound
+	// the connection-resident HTTP/WebSocket working set there; an unset or
+	// reference-sized budget leaves Go and gorilla defaults untouched for
+	// desktop and server callers.
+	if 0 < MemoryBudget() && MemoryBudget() < referenceMemoryBudgetByteCount {
+		settings.HttpReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.HttpWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.WebSocketReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.WebSocketWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxDecoderHeaderTableSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxEncoderHeaderTableSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxReceiveBufferPerConnection = int(
+			MemoryScaledByteCount(mib(1), kib(256)),
+		)
+		settings.Http2MaxReceiveBufferPerStream = int(
+			MemoryScaledByteCount(kib(512), kib(128)),
+		)
+	}
+	return settings
 }
 
 type ClientStrategySettings struct {
@@ -104,10 +130,31 @@ type ClientStrategySettings struct {
 	ExtenderMinimumWeight float32
 	// drop dialers that have not had a successful connect in this timeout
 	ExtenderDropTimeout time.Duration
+	// ExtenderConfigs installs exact extender endpoints before discovery.
+	// Measurement fixtures use it for hermetic production extender paths. Nil
+	// retains normal discovery and selection. The strategy copies each entry.
+	ExtenderConfigs []*ExtenderConfig
 
 	DohSettings *DohSettings
 
 	HelloRetryTimeout time.Duration
+
+	// MaxHttpResponseBodyBytes is the largest response body the strategy will
+	// materialize. Values <= 0 use DefaultMaxHttpResponseBodyBytes so a partial
+	// settings struct cannot accidentally restore an unbounded io.ReadAll.
+	MaxHttpResponseBodyBytes int64
+
+	// Embedded low-memory transports set explicit connection-resident buffer
+	// and HTTP/2 dynamic-table/receive-window bounds. Zero preserves the
+	// library defaults, which is the desktop/server behavior.
+	HttpReadBufferSize                 int
+	HttpWriteBufferSize                int
+	WebSocketReadBufferSize            int
+	WebSocketWriteBufferSize           int
+	Http2MaxDecoderHeaderTableSize     int
+	Http2MaxEncoderHeaderTableSize     int
+	Http2MaxReceiveBufferPerConnection int
+	Http2MaxReceiveBufferPerStream     int
 
 	// retry a GET whose RESPONSE status is in `GetRetryStatusCodes` —
 	// transient gateway statuses meaning the lb momentarily had no healthy
@@ -167,9 +214,9 @@ func newNormalDialTlsContext(
 	settings *ClientStrategySettings,
 	nextProtos []string,
 ) DialTlsContextFunction {
-	netDialer := settings.NetDialer()
 	tlsConfig := newClientTlsConfig(settings.TlsConfig, nextProtos)
-	if settings.ProxySettings == nil {
+	if settings.ProxySettings == nil && settings.DialContextSettings == nil {
+		netDialer := settings.NetDialer()
 		tlsDialer := &tls.Dialer{
 			NetDialer: netDialer,
 			Config:    tlsConfig,
@@ -178,18 +225,14 @@ func newNormalDialTlsContext(
 	}
 
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
-		proxyDialContext := settings.ProxySettings.NewDialContext(
-			ctx,
-			netDialer,
-		)
-
-		// The rest of this function is adapted from tls.Dialer to use a
-		// context-aware proxy dialer.
-		conn, err := proxyDialContext(ctx, network, addr)
+		// DialContext preserves injected userspace networks in tests and proxy
+		// routing in production before wrapping the resulting connection in TLS.
+		conn, err := settings.DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
 
+		netDialer := settings.NetDialer()
 		if netDialer.Timeout != 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
@@ -289,6 +332,23 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 			dialers[dialer3] = true
 		}
 	}
+	for _, extenderConfig := range settings.ExtenderConfigs {
+		if extenderConfig == nil {
+			continue
+		}
+		copiedConfig := *extenderConfig
+		dialer := &clientDialer{
+			description:        "configured extender",
+			persistent:         true,
+			minimumWeight:      settings.ExtenderMinimumWeight,
+			priority:           100,
+			dialTlsContext:     newExtenderDialTlsContext(&settings.ConnectSettings, &copiedConfig, clientWebSocketNextProtos),
+			httpDialTlsContext: newExtenderDialTlsContext(&settings.ConnectSettings, &copiedConfig, clientHttpNextProtos),
+			extenderConfig:     &copiedConfig,
+			settings:           settings,
+		}
+		dialers[dialer] = true
+	}
 	// FIXME
 	/*
 		if settings.EnablePt {
@@ -360,7 +420,7 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 
 	self.extenderIpSecrets = maps.Clone(extenderIpSecrets)
 	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() {
+		if dialer.IsExtender() && !dialer.persistent {
 			dialer.Close()
 			delete(self.dialers, dialer)
 		}
@@ -545,41 +605,89 @@ type evalResult struct {
 	dialer *clientDialer
 	wsConn *websocket.Conn
 	err    error
+	// materialize is run only for the selected HTTP response, while the
+	// request context is still alive. Losing parallel responses are closed
+	// without allocating their bodies.
+	materialize func() error
 
 	httpResult
 }
 
-func newEvalResultFromHttpResponse(response *http.Response, err error) *evalResult {
-	if err == nil {
-		defer response.Body.Close()
-		bodyBytes, err := io.ReadAll(response.Body)
-		return &evalResult{
-			err: err,
-			httpResult: httpResult{
-				response: response,
-				// status: response.Status,
-				// statusCode: response.StatusCode,
-				// header: response.Header.Clone(),
-				// trailer: response.Trailer.Clone(),
-				bodyBytes: bodyBytes,
-			},
-		}
-	} else {
-		return &evalResult{
-			err: err,
+func readHttpResponseBody(response *http.Response, maxBytes int64) ([]byte, error) {
+	if response == nil || response.Body == nil {
+		return nil, fmt.Errorf("http response has no body")
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxHttpResponseBodyBytes
+	}
+	if maxBytes < response.ContentLength {
+		return nil, fmt.Errorf(
+			"%w: content length %d, limit %d",
+			ErrHttpResponseBodyTooLarge,
+			response.ContentLength,
+			maxBytes,
+		)
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if maxBytes < int64(len(bodyBytes)) {
+		return nil, fmt.Errorf("%w: limit %d", ErrHttpResponseBodyTooLarge, maxBytes)
+	}
+	return bodyBytes, nil
+}
+
+func newEvalResultFromHttpResponse(response *http.Response, err error, maxBodyBytes int64) *evalResult {
+	result := &evalResult{
+		err: err,
+		httpResult: httpResult{
+			response: response,
+		},
+	}
+	if err == nil && (response == nil || response.Body == nil) {
+		result.err = fmt.Errorf("http response has no body")
+	} else if err == nil {
+		result.materialize = func() error {
+			defer func() {
+				response.Body.Close()
+				response.Body = nil
+			}()
+			bodyBytes, readErr := readHttpResponseBody(response, maxBodyBytes)
+			if readErr == nil {
+				result.bodyBytes = bodyBytes
+			}
+			return readErr
 		}
 	}
+	return result
+}
+
+func (self *evalResult) Selected() *evalResult {
+	if self.materialize != nil {
+		self.err = self.materialize()
+		self.materialize = nil
+	}
+	return self
 }
 
 func (self *evalResult) Close() {
+	self.materialize = nil
 	if self.wsConn != nil {
 		self.wsConn.Close()
 		// if wsConn is set, the response does not need to be closed
 		// https://pkg.go.dev/github.com/gorilla/websocket#Dialer.DialContext
+	} else if self.response != nil && self.response.Body != nil {
+		self.response.Body.Close()
 	}
-	// else if self.response != nil {
-	// 	self.response.Body.Close()
-	// }
+}
+
+// materializeHttpResult returns the response body already read when the
+// strategy selected this result.
+func materializeHttpResult(result *evalResult) (*httpResult, error) {
+	defer result.Close()
+	return &result.httpResult, result.err
 }
 
 func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
@@ -675,7 +783,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 
 				result := eval(handleCtx, dialer)
 				if result != nil {
-					if result.err == nil {
+					if result.Selected().err == nil {
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s\n", dialer.String())
 						}
@@ -703,7 +811,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					return nil
 				case result := <-out:
 					if result != nil {
-						if result.err == nil {
+						if result.Selected().err == nil {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
 							}
@@ -735,7 +843,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					return nil
 				case result := <-out:
 					if result != nil {
-						if result.err == nil {
+						if result.Selected().err == nil {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
 							}
@@ -759,7 +867,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 				return nil
 			case result := <-out:
 				if result != nil {
-					if result.err == nil {
+					if result.Selected().err == nil {
 						return result
 					}
 					result.Close()
@@ -824,7 +932,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 
 			result := eval(handleCtx, dialer)
 			if result != nil {
-				if result.err == nil {
+				if result.Selected().err == nil {
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][s]select: %s\n", dialer.String())
 					}
@@ -908,14 +1016,14 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 
 		dialer.Update(handleCtx, err)
 
-		return newEvalResultFromHttpResponse(response, err)
+		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 
 	result := self.parallelEval(request.Context(), eval)
 	if result == nil {
 		return nil, fmt.Errorf("Timeout.")
 	}
-	return &result.httpResult, result.err
+	return materializeHttpResult(result)
 }
 
 func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http.Request) (*httpResult, error) {
@@ -941,7 +1049,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 		dialer.Update(handleCtx, err)
 
-		return newEvalResultFromHttpResponse(response, err)
+		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		httpClient := dialer.HttpClient()
@@ -956,14 +1064,14 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 		dialer.Update(handleCtx, err)
 
-		return newEvalResultFromHttpResponse(response, err)
+		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 
 	result := self.serialEval(request.Context(), eval, helloEval)
 	if result == nil {
 		return nil, fmt.Errorf("Timeout.")
 	}
-	return &result.httpResult, result.err
+	return materializeHttpResult(result)
 }
 
 func (self *ClientStrategy) WsDialContext(ctx context.Context, url string, requestHeader http.Header) (*websocket.Conn, *http.Response, error) {
@@ -1014,7 +1122,7 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	defer self.mutex.Unlock()
 
 	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() && dialer.IsLastSuccess() {
+		if dialer.IsExtender() && !dialer.persistent && dialer.IsLastSuccess() {
 			if self.settings.ExtenderDropTimeout <= time.Now().Sub(dialer.lastErrorTime) {
 				dialer.Close()
 				delete(self.dialers, dialer)
@@ -1209,7 +1317,9 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 
 // non-extender dialers are never dropped
 type clientDialer struct {
-	description   string
+	description string
+	// persistent dialers were supplied explicitly and are not discovery cache.
+	persistent    bool
 	minimumWeight float32
 	// 0 is max
 	priority int
@@ -1256,6 +1366,8 @@ func (self *clientDialer) HttpClient() *http.Client {
 			ResponseHeaderTimeout: self.settings.ConnectTimeout,
 			ExpectContinueTimeout: self.settings.ConnectTimeout,
 			DisableKeepAlives:     false,
+			ReadBufferSize:        self.settings.HttpReadBufferSize,
+			WriteBufferSize:       self.settings.HttpWriteBufferSize,
 			// A custom DialTLSContext disables net/http's automatic HTTP/2
 			// attempt unless this is set. ConnectControl and peer-key requests
 			// arrive in parallel while a provider window forms; keeping the
@@ -1264,6 +1376,17 @@ func (self *clientDialer) HttpClient() *http.Client {
 			// and creating visible CPU/pause bursts on mobile. HTTP/2
 			// multiplexes those requests over the established connection.
 			ForceAttemptHTTP2: true,
+		}
+		if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
+			0 < self.settings.Http2MaxEncoderHeaderTableSize ||
+			0 < self.settings.Http2MaxReceiveBufferPerConnection ||
+			0 < self.settings.Http2MaxReceiveBufferPerStream {
+			transport.HTTP2 = &http.HTTP2Config{
+				MaxDecoderHeaderTableSize:     self.settings.Http2MaxDecoderHeaderTableSize,
+				MaxEncoderHeaderTableSize:     self.settings.Http2MaxEncoderHeaderTableSize,
+				MaxReceiveBufferPerConnection: self.settings.Http2MaxReceiveBufferPerConnection,
+				MaxReceiveBufferPerStream:     self.settings.Http2MaxReceiveBufferPerStream,
+			}
 		}
 		// a custom dial context applies to plain (non-tls) connections;
 		// tls connections use the dialTlsContext chain above
@@ -1297,15 +1420,15 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 				if err != nil {
 					return nil, err
 				}
-				return newWebSocketWriteBatchConn(conn), nil
+				return NewWebSocketWriteBatchConn(conn), nil
 			}
 		}
 		// pool, size := MessagePool(2048)
 		self.websocketDialer = &websocket.Dialer{
 			NetDialTLSContext: netDialTlsContext,
 			HandshakeTimeout:  settings.HandshakeTimeout,
-			// ReadBufferSize: size,
-			// WriteBufferSize: size,
+			ReadBufferSize:    settings.WebSocketReadBufferSize,
+			WriteBufferSize:   settings.WebSocketWriteBufferSize,
 			// WriteBufferPool: pool,
 			EnableCompression: false,
 		}
@@ -1321,7 +1444,7 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 				if err != nil {
 					return nil, err
 				}
-				return newWebSocketWriteBatchConn(conn), nil
+				return NewWebSocketWriteBatchConn(conn), nil
 			}
 		}
 	}
@@ -1748,7 +1871,7 @@ func HttpPostStreamWithStrategyRaw(
 	}
 
 	defer res.Body.Close()
-	bodyBytes, err := io.ReadAll(res.Body)
+	bodyBytes, err := readHttpResponseBody(res, DefaultMaxHttpResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}

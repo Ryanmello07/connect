@@ -54,7 +54,7 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// must match `DefaultMtu`. packets are written directly into the
 		// receiver tap/tun interface, so this must not exceed the device
 		// interface mtu.
-		Mtu: 1440,
+		Mtu: DefaultMtu,
 
 		DialRace:          2,
 		DialRaceTimeout:   2 * time.Second,
@@ -456,7 +456,9 @@ func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpo
 
 // synchronizeTcpInboundProcessorsWithLock performs gVisor's documented user
 // unlock handoff for every endpoint touched in the burst. The shard write lock
-// remains held so the next burst cannot overtake the handoff.
+// remains held so the next burst cannot overtake the handoff. Endpoint state
+// is cleared independently from packetCount: individual finite callbacks must
+// retain their shared cadence until one of them performs the scheduler yield.
 func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundShard) {
 	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
 		endpointId := shard.endpointIds[endpointIndex]
@@ -472,10 +474,6 @@ func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundSha
 		}
 	}
 	shard.endpointCount = 0
-	// UnlockUser requeues protocol work but does not run it synchronously.
-	// Yield once while this shard remains gated so the awakened worker cannot
-	// be starved by an immediately reacquired producer lock.
-	runtime.Gosched()
 }
 
 // tunLinkEndpoint converts channel.Endpoint's silent bounded-queue drop into
@@ -870,9 +868,40 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 			// bounded endpoint array cannot overflow mid-batch
 			self.gro.Flush()
 			self.synchronizeTcpInboundProcessorsWithLock(shard)
+			// UnlockUser requeues protocol work but does not run it
+			// synchronously. Yield while the shard remains gated so a new
+			// producer cannot immediately overtake the awakened worker.
+			runtime.Gosched()
 		}
 	}
 	self.gro.Flush()
+
+	// A finite response commonly ends with fewer than the 16 packets that
+	// trigger the mid-batch cadence above. gVisor can have queued one of those
+	// packets while a syscall owned the endpoint; without this final
+	// LockUser/UnlockUser handoff there may be no later packet to wake its TCP
+	// processor. The provider NAT has already consumed the upstream bytes, so
+	// that missed tail is permanent rather than recoverable by retransmission.
+	finalHandoff := false
+	for shardIndex, locked := range lockedShards {
+		if !locked {
+			continue
+		}
+		shard := &self.tcpInboundShards[shardIndex]
+		if shard.endpointCount == 0 {
+			shard.packetCount = 0
+			continue
+		}
+		self.synchronizeTcpInboundProcessorsWithLock(shard)
+		shard.packetCount = 0
+		finalHandoff = true
+	}
+	if finalHandoff {
+		// UnlockUser queues processors asynchronously. Yield once for the whole
+		// finite batch while every touched shard remains gated so the awakened
+		// workers cannot be overtaken by the next producer callback.
+		runtime.Gosched()
+	}
 
 	return total, nil
 }
@@ -889,11 +918,11 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 
 	endpointId, shardIndex, tcpInbound := tcpInboundFlow(packet)
 	var tcpInboundShard *tunTcpInboundShard
-	synchronize := false
+	yieldProcessor := false
 	if tcpInbound {
 		tcpInboundShard = &self.tcpInboundShards[shardIndex]
 		tcpInboundShard.writeLock.Lock()
-		synchronize = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
 	}
 
 	// copy the packet
@@ -911,8 +940,12 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 		self.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
 		pkb.DecRef()
 		if tcpInbound {
-			if synchronize {
-				self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			// A one-packet callback is itself a complete finite burst. Always
+			// finish its endpoint handoff; waiting for a future 16th packet can
+			// strand a short TLS/HTTP response forever.
+			self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			if yieldProcessor {
+				runtime.Gosched()
 			}
 			tcpInboundShard.writeLock.Unlock()
 		}
@@ -1142,7 +1175,9 @@ func raceTunDialContext(
 
 // safe to call from multiple goroutines
 func (self *Tun) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	dialCtx := self.dialCtx(ctx)
+	if network == "tcp6" || network == "udp6" {
+		return nil, syscall.EAFNOSUPPORT
+	}
 
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
@@ -1152,20 +1187,30 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 	if err != nil {
 		return nil, err
 	}
+	if port < 0 || 65535 < port {
+		return nil, fmt.Errorf("invalid port %q", portStr)
+	}
+
+	parsedAddr, parsedAddrErr := netip.ParseAddr(host)
+	if parsedAddrErr == nil {
+		parsedAddr = parsedAddr.Unmap()
+		if !parsedAddr.Is4() {
+			return nil, syscall.EAFNOSUPPORT
+		}
+	}
+	dialCtx := self.dialCtx(ctx)
 
 	var addrs []netip.Addr
-	if addr, err := netip.ParseAddr(host); err == nil {
+	if parsedAddrErr == nil {
 		// address is ip:port
-		addrs = append(addrs, addr)
+		addrs = append(addrs, parsedAddr)
 	} else {
-		// resolve ips using doh, local
-
-		resolvedAddrs := self.DohCache().Query(dialCtx, "A", host)
+		// Remote providers currently forward IPv4 only. Resolve A records so
+		// an internal dial cannot select an IPv6 address that will blackhole at
+		// the provider.
+		addrs = append(addrs, self.DohCache().Query(dialCtx, "A", host)...)
 		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]query doh (%s) found %v\n", host, resolvedAddrs)
-		}
-		for _, addr := range resolvedAddrs {
-			addrs = append(addrs, addr)
+			self.log.Infof("[tun]query doh (%s) found %v\n", host, addrs)
 		}
 	}
 
@@ -1174,13 +1219,10 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 	}
 
 	addr := addrs[mathrand.Intn(len(addrs))]
-
-	// var returnErr error
-	// for _, addr := range addrs {
 	addrPort := netip.AddrPortFrom(addr, uint16(port))
 
 	switch network {
-	case "tcp", "tcp4", "tcp6":
+	case "tcp", "tcp4":
 		fa, pn := self.convertToFullAddr(addrPort)
 		conn, err := gonet.DialContextTCP(dialCtx, self.stack, fa, pn)
 		if err == nil {
@@ -1193,7 +1235,7 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
 		}
 		return nil, err
-	case "udp", "udp4", "udp6":
+	case "udp", "udp4":
 		fa, pn := self.convertToFullAddr(addrPort)
 		conn, err := self.dialUdp(nil, &fa, pn)
 		if err == nil {
