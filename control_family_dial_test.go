@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -608,4 +609,108 @@ func TestFamilyFallbackDoesNotWriteTheLedgerUnderAForce(t *testing.T) {
 	}
 	SetControlIpFamilyPolicy(IpFamilyAuto)
 	controlFamilyClear()
+}
+
+// deadlineConn blocks in Read until the connection is closed or a deadline in
+// the past is set, which is how crypto/tls interrupts a handshake whose context
+// expired (Conn.handshakeContext sets the underlying deadline to now). Writes
+// are accepted and dropped: the ClientHello goes out, the ServerHello never
+// comes back, which is the post-connect blackhole this feature targets.
+type deadlineConn struct {
+	remote   net.Addr
+	unblock  chan struct{}
+	closeers sync.Once
+}
+
+func newDeadlineConn(ip string) *deadlineConn {
+	return &deadlineConn{
+		remote:  &net.TCPAddr{IP: net.ParseIP(ip), Port: 443},
+		unblock: make(chan struct{}),
+	}
+}
+
+func (self *deadlineConn) release() {
+	self.closeers.Do(func() { close(self.unblock) })
+}
+
+func (self *deadlineConn) Read(b []byte) (int, error) {
+	<-self.unblock
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (self *deadlineConn) Write(b []byte) (int, error) { return len(b), nil }
+func (self *deadlineConn) Close() error                { self.release(); return nil }
+func (self *deadlineConn) LocalAddr() net.Addr         { return nil }
+func (self *deadlineConn) RemoteAddr() net.Addr        { return self.remote }
+func (self *deadlineConn) SetDeadline(t time.Time) error {
+	if !t.IsZero() && !t.After(time.Now()) {
+		self.release()
+	}
+	return nil
+}
+func (self *deadlineConn) SetReadDeadline(t time.Time) error  { return self.SetDeadline(t) }
+func (self *deadlineConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// The fragment/reorder dialers go through the family fallback too.
+//
+// Spec section 2 says the retry helper serves sites 1 and 2, and site 2 names
+// "the resilient dialers". It was wired into newNormalDialTlsContext only, and
+// that is the wrong one to have alone: api posts do not race the dialers, they
+// go through HttpSerial -> serialEval, which sorts by priority, and "fragment"
+// is priority 0 against "normal" at 25. On a fresh ClientStrategy every
+// dialer's lastSuccessTime and lastErrorTime are the zero time, so
+// IsLastSuccess() is true for all of them and the fragment dialer runs first --
+// so the FIRST request of a launch, the login, was the one dialer with no
+// timeout classification, no strike and no in-place retry.
+func TestResilientDialGoesThroughTheFamilyFallback(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	settings := DefaultConnectSettings()
+	// stands in for the handshake's own TlsTimeout expiring inside a caller
+	// budget that is still alive
+	settings.TlsTimeout = 250 * time.Millisecond
+
+	var mutex sync.Mutex
+	var dialed []string
+	var conns []*deadlineConn
+	settings.DialContextSettings = &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			mutex.Lock()
+			dialed = append(dialed, network)
+			mutex.Unlock()
+			ip := "2001:db8::1"
+			if network == "tcp4" {
+				ip = "192.0.2.1"
+			}
+			conn := newDeadlineConn(ip)
+			mutex.Lock()
+			conns = append(conns, conn)
+			mutex.Unlock()
+			return conn, nil
+		},
+	}
+
+	// the "fragment" dialer: priority 0, the first one serialEval reaches
+	dialTls := newResilientDialTlsContext(settings, true, false, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := dialTls(ctx, "tcp", "api.example:443")
+	if err == nil {
+		conn.Close()
+		t.Fatal("expected the blackholed handshake to fail")
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	for _, c := range conns {
+		c.release()
+	}
+	if len(dialed) != 2 || dialed[0] != "tcp" || dialed[1] != "tcp4" {
+		t.Fatalf("dialed %v, want [tcp tcp4] -- the resilient dialer still "+
+			"handshakes inline with no family classification and no retry", dialed)
+	}
 }

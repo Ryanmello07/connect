@@ -91,36 +91,51 @@ func newResilientDialTlsContext(
 			panic(err)
 		}
 
-		// fmt.Printf("Extender client 1\n")
+		// the handshake half of the dial, split out so the address-family
+		// fallback can own the connection between the connect and the
+		// handshake -- it has to read the family off it before a failed
+		// handshake takes it away.
+		handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+			rconn := NewResilientTlsConn(conn, fragment, reorder)
 
-		conn, err := connectSettings.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return nil, err
+			// copy and extend
+			tlsConfig := baseTlsConfig.Clone()
+			tlsConfig.ServerName = host
+			tlsConn := tls.Client(rconn, tlsConfig)
+
+			var err error
+			func() {
+				tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
+				defer tlsCancel()
+				err = tlsConn.HandshakeContext(tlsCtx)
+			}()
+			if err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			// once the stream is established, no longer need the resilient features
+			if err := rconn.Off(); err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+
+			return tlsConn, nil
 		}
 
-		rconn := NewResilientTlsConn(conn, fragment, reorder)
-
-		// copy and extend
-		tlsConfig := baseTlsConfig.Clone()
-		tlsConfig.ServerName = host
-		tlsConn := tls.Client(rconn, tlsConfig)
-
-		func() {
-			tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
-			defer tlsCancel()
-			err = tlsConn.HandshakeContext(tlsCtx)
-		}()
-		if err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-		// once the stream is established, no longer need the resilient features
-		if err := rconn.Off(); err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-
-		return tlsConn, nil
+		// Spec section 2: the retry helper serves site 1 AND site 2, and site 2
+		// names the resilient dialers. It had only ever been wired into the
+		// normal dialer, and that is the wrong one to have alone: api posts do
+		// not race the dialers, they go through HttpSerial -> serialEval, which
+		// sorts by priority, and "fragment" is priority 0 while "normal" is 25.
+		// On a fresh ClientStrategy every dialer's lastSuccessTime and
+		// lastErrorTime are the zero time, so IsLastSuccess() is true for all of
+		// them and the fragment dialer goes first. A login post on a blackholed
+		// ipv6 path therefore stalled here, in a dialer with no timeout
+		// classification and no strike, until serialEval's whole 15s budget was
+		// gone -- the exact stall this feature exists to remove, with an empty
+		// ledger to show for it.
+		return dialControlTlsWithFamilyFallback(
+			ctx, "tcp", addr, connectSettings.DialContext, handshake)
 	}
 }
 
