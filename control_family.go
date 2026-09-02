@@ -181,6 +181,24 @@ func init() {
 // demoting IPv6 there would take the user from a slow control plane to no
 // control plane at all.
 func controlFamilyDemote(family int) bool {
+	// The developer setting and the learned memory "are independent state and
+	// never mix" (spec section 1), and this is where they would. Under a force
+	// there is no other family in play: a timeout on the only family the
+	// policy permits is not evidence about family CHOICE, because there is
+	// nothing to compare it against, and the retry it would trigger dials
+	// straight into controlDialNetwork's own force-conflict error.
+	//
+	// The damage lands later. A strike written under Force IPv4 makes the
+	// status line read "IPv4 demoted" beside a policy row reading Force IPv4,
+	// and it stays armed for the moment the developer sets the row back to
+	// Auto -- at which point Auto steers every control dial, every extender
+	// and the h3/quic pick onto the family they had just forced away from, for
+	// five minutes and up to six hours if strikes accumulated while the force
+	// was on.
+	if ControlIpFamilyPolicy() != IpFamilyAuto {
+		return false
+	}
+
 	other := 4
 	if family == 4 {
 		other = 6

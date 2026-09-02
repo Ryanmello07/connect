@@ -564,3 +564,48 @@ func TestFamilyFallbackRollsBackTheStrikeWhenTheRetryAlsoFails(t *testing.T) {
 		})
 	}
 }
+
+// The developer setting and the learned memory are independent state and never
+// mix. A timeout observed while a FORCE is in effect carries no information
+// about family choice -- there is no other family in play to compare it
+// against -- so it must not be written to the ledger.
+//
+// The real damage is deferred: a strike recorded under Force IPv4 stays armed
+// for the moment the developer sets the row back to Auto, and then steers
+// every control dial onto the family they had just forced away from.
+func TestFamilyFallbackDoesNotWriteTheLedgerUnderAForce(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+
+	for _, policy := range []IpFamilyPolicy{IpFamilyForce4, IpFamilyForce6} {
+		controlFamilyClear()
+		SetControlIpFamilyPolicy(policy)
+
+		attempts := 0
+		dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			attempts += 1
+			return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}, nil
+		}
+		handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+			return nil, &timeoutError{}
+		}
+
+		_, err := dialControlTlsWithFamilyFallback(
+			context.Background(), "tcp", "api.example:443", dial, handshake)
+		if err == nil {
+			t.Fatal("expected the timeout back")
+		}
+		if got := controlFamilyDemotedFamily(); got != 0 {
+			t.Fatalf("policy %d: ipv%d demoted while a force is in effect", policy, got)
+		}
+		if got := controlFamilyStatus(); got != "" {
+			t.Fatalf("policy %d: status %q contradicts the policy row", policy, got)
+		}
+		if attempts != 1 {
+			t.Fatalf("policy %d: dialed %d times, want 1 -- the retry would be "+
+				"rejected by the force itself", policy, attempts)
+		}
+	}
+	SetControlIpFamilyPolicy(IpFamilyAuto)
+	controlFamilyClear()
+}
