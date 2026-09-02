@@ -1,40 +1,58 @@
-// The gates over VerifiedGroupContext, and the one question about it that IS a property of
+// The gates over VerifiedGroupContext, and the two questions about it that ARE properties of
 // source shape.
 //
-// WHAT THIS FILE IS INSTEAD OF. proposal_binding_test.go used to carry a second gate: an AST walk
-// over every call of a binding writer, refusing an argument whose chain of selections reached a
-// type this package decodes off the wire. It was written three times and bypassed three times --
-// by any *GroupContext at all, then by one local struct between the decode and the bind, then
-// twice over by an ordinary accessor method and by an embedded wire type whose promoted selection
-// the walk never consulted the type checker about. All three bypasses are now compile errors,
-// because NewProposalCache and Rebind take a *VerifiedGroupContext and none of those shapes
-// produces one.
+// WHAT THIS FILE IS INSTEAD OF. proposal_binding_test.go used to carry an AST walk over every call
+// of a binding writer, refusing an argument whose chain of selections reached a type this package
+// decodes off the wire. It was written three times and bypassed three times -- by any *GroupContext
+// at all, then by one local struct between the decode and the bind, then twice over by an ordinary
+// accessor method and by an embedded wire type whose promoted selection the walk never consulted
+// the type checker about. All three bypasses are now compile errors, because NewProposalCache and
+// Rebind take a *VerifiedGroupContext and none of those shapes produces one.
 //
-// THE DIFFERENCE BETWEEN THE QUESTION THAT FAILED AND THE ONE HELD HERE is worth stating, because
-// this file is an AST gate too and a reader is entitled to ask what makes it different. The
-// deleted gate asked WHERE A VALUE CAME FROM, which is a fact about a computation and not about
-// the text: the same expression -- a field selected out of a struct -- is the defect when the
-// struct was decoded and the remedy when it was the group's own state, and no amount of walking
-// separates them. This one asks WHICH DECLARATIONS BUILD A NAMED STRUCT TYPE, which is a closed
-// syntactic question: Go has exactly two ways to put a value in a field, a composite literal and
-// an assignment, and the type checker resolves both by object. There is no third spelling to be
-// bypassed by, and the compiler already refuses every declaration outside this package because
-// the field is unexported.
+// THE DIFFERENCE BETWEEN THE QUESTION THAT FAILED AND THE ONES HELD HERE is worth stating, because
+// this file is an AST gate too and a reader is entitled to ask what makes it different. The deleted
+// gate asked WHERE A VALUE CAME FROM, which is a fact about a computation and not about the text:
+// the same expression -- a field selected out of a struct -- is the defect when the struct was
+// decoded and the remedy when it was the group's own state, and no amount of walking separates
+// them. These ask WHICH DECLARATIONS BUILD A NAMED STRUCT TYPE and WHICH DECLARATIONS HAND ITS
+// CONTENTS BACK OUT, and both are closed syntactic questions the type checker answers by object.
 //
-// SO THE SCOPE IS THIS PACKAGE AND THAT IS A COMPILER FACT rather than a choice, exactly as it is
-// for the cache's own binding: the gate asserts the field really is unexported instead of leaving
-// that as the unstated reason a narrow scan is enough.
+// TWO SCOPES WERE WRONG IN THE ROUND THAT WROTE THE FIRST OF THEM, AND BOTH ARE FIXED HERE, because
+// each was a rule 5 failure -- a class stated as a shape narrower than the class:
+//
+//  1. THE WALK ENTERED FUNCTION BODIES. A construction at PACKAGE SCOPE is not in any body, so
+//     var vouchAnything = func(c *GroupContext) *VerifiedGroupContext { return &VerifiedGroupContext{inner: c} }
+//     appended to the source left the whole suite green -- measured at 6789 tests. The class is
+//     "every construction of this type" and the scope of that class is every declaration of every
+//     file, which is what file.Decls is; the walk now starts there and attributes what it finds to
+//     the declaration it is inside, whatever kind of declaration that is.
+//  2. NOTHING HELD THE TYPE TO HANDING OUT A COPY. The VALUE level half was held -- rewriting
+//     Context's body from Clone to a bare return is caught -- and the CLASS was not, so
+//     func (self *VerifiedGroupContext) Inner() *GroupContext { return self.inner } survived the
+//     full suite. That is historical bypass #2, the ordinary accessor, reappearing one type up. The
+//     class is every declaration that is handed one of these and answers a group context, and it is
+//     held twice over: by the source gate below, and behaviourally over the compiled method set, so
+//     that an accessor added tomorrow fails even before anybody updates a table.
+//
+// SO THE SCOPE IS THIS PACKAGE AND THAT IS A COMPILER FACT rather than a choice: the field is
+// unexported, so no other package can build one or read one, and the gate asserts that rather than
+// leaving it as the unstated reason a narrow scan is enough. What an EXTERNAL package can reach is
+// held from outside, in external_provenance_test.go, which is where the two demonstrated bypasses
+// are run from.
 package mls
 
 import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"go/types"
 	"maps"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // The two names this file's derivation is written against, checked against the compiler's reading
@@ -45,21 +63,57 @@ const (
 	verifiedGroupContextFieldName = "inner"
 )
 
-// verifiedGroupContextConstruction is one build of the type: where it is and how it is spelled.
-type verifiedGroupContextConstruction struct {
+// verifiedGroupContextSite is one declaration's dealing with the type: where it is and how it is
+// spelled.
+type verifiedGroupContextSite struct {
 	where string
 	how   string
 }
 
-// verifiedGroupContextConstructionsIn is the class: every declaration of one checked package that
-// builds a VerifiedGroupContext carrying a context, with the count of nodes it judged at all.
+// verifiedGroupContextDeclarationName names ANY top level declaration the way this package's tables
+// name declarations.
+//
+// The kind arm is the fix for the scope defect this file's header records. A gate that could only
+// name a *ast.FuncDecl had to skip everything else, and skipping is how a construction at package
+// scope became invisible; naming a var, const or type declaration by its own first name means the
+// walk can descend into every declaration there is and still report what it found under something a
+// reviewer can search for.
+func verifiedGroupContextDeclarationName(checked checkedBodies, declaration ast.Decl) string {
+	switch shape := declaration.(type) {
+	case *ast.FuncDecl:
+		return extensionTypeSelectionDeclarationName(checked, shape)
+	case *ast.GenDecl:
+		for _, spec := range shape.Specs {
+			switch named := spec.(type) {
+			case *ast.ValueSpec:
+				if len(named.Names) > 0 {
+					return shape.Tok.String() + " " + named.Names[0].Name
+				}
+			case *ast.TypeSpec:
+				return shape.Tok.String() + " " + named.Name.Name
+			case *ast.ImportSpec:
+				return shape.Tok.String() + " " + named.Path.Value
+			}
+		}
+		return shape.Tok.String()
+	}
+	return "an unnamed declaration at " + checked.where(declaration)
+}
+
+// verifiedGroupContextConstructionsIn is the first class: every declaration of one checked package
+// that builds a VerifiedGroupContext carrying a context, with the count of nodes it judged at all.
+//
+// EVERY DECLARATION AND NOT EVERY FUNCTION BODY. The walk is over file.Decls, which is the whole of
+// what a Go file holds, and it descends into each declaration entire rather than into a body it
+// picked out. A composite literal in a var initializer is a construction of this type exactly as
+// much as one inside a function is, and the round that scanned bodies proved that the difference is
+// not academic: the package scope spelling left the suite green.
 //
 // TWO WAYS A FIELD IS FILLED AND THERE IS NO THIRD. A composite literal is how the constructor
 // writes it, and an assignment to the field is the other; a matcher reading only one of them would
-// report a clean run over a package that used the other, which is the half this gate exists to
-// hold. Both arms go through the type checker rather than through the spelling, so a literal
-// written with the type elided inside a slice of them is a member, and a local named
-// VerifiedGroupContext in some other package is not.
+// report a clean run over a package that used the other. Both arms go through the type checker
+// rather than through the spelling, so a literal written with the type elided inside a slice of
+// them is a member, and a local named VerifiedGroupContext in some other package is not.
 //
 // AN EMPTY LITERAL IS NOT A MEMBER, and that is deliberate rather than an omission.
 // VerifiedGroupContext{} carries a nil context, which is the zero value every door of this package
@@ -71,23 +125,19 @@ type verifiedGroupContextConstruction struct {
 // The judged count is carried for the reason every derived gate of this package carries one: a
 // matcher that stopped resolving its subject reports an EMPTY class, and an empty class is exactly
 // what a package that builds none reports.
-func verifiedGroupContextConstructionsIn(checked checkedBodies) (map[string][]verifiedGroupContextConstruction, int) {
-	found := map[string][]verifiedGroupContextConstruction{}
+func verifiedGroupContextConstructionsIn(checked checkedBodies) (map[string][]verifiedGroupContextSite, int) {
+	found := map[string][]verifiedGroupContextSite{}
 	judged := 0
 	for _, file := range checked.files {
 		for _, declaration := range file.Decls {
-			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction || function.Body == nil {
-				continue
-			}
-			name := extensionTypeSelectionDeclarationName(checked, function)
+			name := verifiedGroupContextDeclarationName(checked, declaration)
 			record := func(node ast.Node) {
-				found[name] = append(found[name], verifiedGroupContextConstruction{
+				found[name] = append(found[name], verifiedGroupContextSite{
 					where: checked.where(node),
 					how:   checked.render(node),
 				})
 			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
+			ast.Inspect(declaration, func(node ast.Node) bool {
 				switch built := node.(type) {
 				case *ast.CompositeLit:
 					if !extensionTypeSelectionNamedAs(checked.info.TypeOf(built),
@@ -121,12 +171,104 @@ func verifiedGroupContextConstructionsIn(checked checkedBodies) (map[string][]ve
 	return found, judged
 }
 
-// verifiedGroupContextControl is a package the matcher has never seen, carrying every shape this
-// rule has an answer for.
+// verifiedGroupContextSignatureHolds answers whether any of these types is the named type, through
+// any number of pointers.
+//
+// A helper over a tuple rather than a loop written twice, because the two halves of the reader rule
+// ask the same question of a signature's inputs and of its outputs, and two spellings of one
+// question is how one of them ends up narrower than the other.
+func verifiedGroupContextSignatureHolds(tuple *types.Tuple, name string) bool {
+	if tuple == nil {
+		return false
+	}
+	for at := 0; at < tuple.Len(); at += 1 {
+		if extensionTypeSelectionNamedAs(tuple.At(at).Type(), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// verifiedGroupContextReadersIn is the second class: every declaration of one checked package that
+// is HANDED a VerifiedGroupContext and ANSWERS a group context.
+//
+// THAT PAIR IS THE WHOLE RULE, and each half is load bearing. A declaration that takes one and
+// answers a cache is not handing the context out; a declaration that takes a bare *GroupContext and
+// answers one is an ordinary function over a value nobody vouched for. It is the conjunction that
+// describes "a caller holding a verified value can reach the context inside it", which is the class
+// historical bypass #2 lives in -- and the reason the value level assertion on Context alone was not
+// enough, since an accessor added beside it satisfies that assertion by not being it.
+//
+// THE RECEIVER COUNTS AS BEING HANDED ONE, which is what makes a method of the type a member and is
+// the difference between catching Inner and not. go/types puts the receiver outside Params, so a
+// rule that read Params alone would report a clean run over exactly the spelling that was measured
+// to survive.
+//
+// FUNCTION LITERALS AS WELL AS FUNCTION DECLARATIONS, for the reason the construction walk enters
+// every declaration: var leakIt = func(v *VerifiedGroupContext) *GroupContext { return v.inner } is
+// a reader written where no *ast.FuncDecl exists, and a rule that only judged declarations would
+// have the same hole in it that the construction rule had.
+func verifiedGroupContextReadersIn(checked checkedBodies) (map[string][]verifiedGroupContextSite, int) {
+	found := map[string][]verifiedGroupContextSite{}
+	judged := 0
+	for _, file := range checked.files {
+		for _, declaration := range file.Decls {
+			name := verifiedGroupContextDeclarationName(checked, declaration)
+			ast.Inspect(declaration, func(node ast.Node) bool {
+				var signature *types.Signature
+				var at *ast.FuncType
+				switch shape := node.(type) {
+				case *ast.FuncDecl:
+					defined, isFunction := checked.info.Defs[shape.Name].(*types.Func)
+					if !isFunction {
+						return true
+					}
+					signature, _ = defined.Type().(*types.Signature)
+					at = shape.Type
+				case *ast.FuncLit:
+					signature, _ = checked.info.TypeOf(shape).(*types.Signature)
+					at = shape.Type
+				default:
+					return true
+				}
+				if signature == nil {
+					return true
+				}
+				judged += 1
+				handed := verifiedGroupContextSignatureHolds(signature.Params(),
+					verifiedGroupContextTypeName)
+				if signature.Recv() != nil && extensionTypeSelectionNamedAs(
+					signature.Recv().Type(), verifiedGroupContextTypeName) {
+					handed = true
+				}
+				if !handed {
+					return true
+				}
+				if !verifiedGroupContextSignatureHolds(signature.Results(), groupContextTypeName) {
+					return true
+				}
+				found[name] = append(found[name], verifiedGroupContextSite{
+					where: checked.where(at),
+					how:   checked.render(at),
+				})
+				return true
+			})
+		}
+	}
+	return found, judged
+}
+
+// the type a reader hands back, named beside the two above so a rename empties no class silently.
+const groupContextTypeName = "GroupContext"
+
+// verifiedGroupContextControl is a package the matchers have never seen, carrying every shape these
+// two rules have an answer for.
 //
 // A control rather than a second opinion about the real source: a matcher that resolved nothing
 // reports a clean run over mls too, and the only way to tell that apart from a package that obeys
-// the rule is to run it over source known to hold both answers.
+// the rules is to run them over source known to hold both answers. It carries the two shapes that
+// were MEASURED to survive the previous round -- a construction at package scope and an exported
+// accessor answering the inner pointer -- so the control fails if either scope is narrowed again.
 const verifiedGroupContextControl = `package control
 
 type GroupContext struct {
@@ -144,7 +286,7 @@ type somethingElse struct {
 	inner *GroupContext
 }
 
-// the shape the real constructor is written in
+// the shape a constructor is written in
 func confirmIt(context *GroupContext) *VerifiedGroupContext {
 	return &VerifiedGroupContext{inner: context}
 }
@@ -173,15 +315,28 @@ func nothingAtAll() *VerifiedGroupContext {
 	return &VerifiedGroupContext{}
 }
 
-// a COPY of one that already exists, which is not a new authority
+// a COPY of one that already exists, which is not a new authority and is not a read of the
+// context either
 func passItOn(verified *VerifiedGroupContext) *VerifiedGroupContext {
 	held := *verified
 	return &held
 }
 
-// a read of the field, which is not a write of it
+// a read of the field written as a plain function, which is the reader rule's other half
 func contextOf(verified *VerifiedGroupContext) *GroupContext {
 	return verified.inner
+}
+
+// the accessor that was MEASURED to survive the whole suite, written as a method so the rule has
+// to read the receiver to see it
+func (self *VerifiedGroupContext) Inner() *GroupContext {
+	return self.inner
+}
+
+// an ordinary function over a context nobody vouched for, which answers a group context and is
+// not a reader of this type
+func echo(context *GroupContext) *GroupContext {
+	return context
 }
 
 // and the same field name filled on another type entirely
@@ -190,36 +345,78 @@ func fillTheOtherOne(context *GroupContext) *somethingElse {
 	other.inner = context
 	return other
 }
+
+// the construction at PACKAGE SCOPE that was measured to leave the whole suite green, in the
+// initializer of a var, where no function body walk can reach it
+var vouchAnything = func(context *GroupContext) *VerifiedGroupContext {
+	return &VerifiedGroupContext{inner: context}
+}
+
+// and the same at package scope with no function around it at all
+var alreadyVouched = &VerifiedGroupContext{inner: &GroupContext{Epoch: 1 << 40}}
+
+// a reader at package scope, for the reason the construction above is here
+var leakIt = func(verified *VerifiedGroupContext) *GroupContext {
+	return verified.inner
+}
 `
 
-// What the matcher must report out of the control, and by omission what it must walk past.
+// What the construction matcher must report out of the control, and by omission what it must walk
+// past.
 var verifiedGroupContextControlConstructions = []string{
 	"confirmIt",
 	"confirmItPositionally",
 	"confirmSeveral",
 	"fillItAfterwards",
+	"var alreadyVouched",
+	"var vouchAnything",
+}
+
+// What the reader matcher must report out of the same control.
+var verifiedGroupContextControlReaders = []string{
+	"(*VerifiedGroupContext).Inner",
+	"contextOf",
+	"var leakIt",
 }
 
 // The declarations of this package that build a VerifiedGroupContext carrying a context, with why
 // each is entitled to.
 //
-// ONE, and the gate below holds the derived class EQUAL to this in both directions, so a second
-// one fails here until somebody says what it is. That is the whole point of keeping a gate at all
-// after deleting the one this file replaces: the type makes a bypass a compile error for every
-// package but this one, and inside this one the remaining question is which declarations are
-// allowed to confer the authority. A row with no declaration is a claim that outlived what it
-// described; a declaration with no row is a new door onto the epoch a cache believes it is in,
-// added without the conversation.
+// ONE, and the gate below holds the derived class EQUAL to this in both directions, so a second one
+// fails here until somebody says what it is. That is the whole point of keeping a gate at all after
+// deleting the walk this file replaces: the type makes a bypass a compile error for every package
+// but this one, and inside this one the remaining question is which declarations are allowed to
+// confer the authority. A row with no declaration is a claim that outlived what it described; a
+// declaration with no row is a new door onto the epoch a cache believes it is in, added without the
+// conversation.
 var verifiedGroupContextConstructionSites = map[string]string{
-	"(*KeySchedule).ConfirmGroupContext": "the one place in this package where a group context stops " +
-		"being octets somebody sent and becomes a value this client vouches for. It takes no group " +
-		"context at all -- there is nothing in its signature to launder -- and answers the one its own " +
-		"schedule was derived over, once the confirmation tag proves a holder of this epoch's " +
-		"confirmation key named it",
+	"(*GroupInfo).VerifiedContext": "the one place in this package where a group context stops " +
+		"being octets somebody sent and becomes a value this client vouches for. It is " +
+		"(*GroupInfo).Verify and nothing else: a member of the ratchet tree the CALLER holds signed " +
+		"the GroupInfoTBS these octets are, under the GroupInfoTBS label, and the signer's key came " +
+		"out of that tree rather than out of the message. Every refusal it makes is one of Verify's, " +
+		"and so is every gap -- the tree is the caller's to authenticate",
+}
+
+// The declarations of this package that are handed a VerifiedGroupContext and answer a group
+// context, with why each is entitled to.
+//
+// ONE, held equal in both directions for the construction table's reason and against the bypass
+// that was measured: an exported accessor answering self.inner satisfied every value level
+// assertion in this file by not being the accessor those assertions name. A second reader is a
+// second answer to "what can a holder of a verified context reach", and a verified value that can
+// be edited after it was verified is not one.
+var verifiedGroupContextReaderSites = map[string]string{
+	"(*VerifiedGroupContext).Context": "the one read of a verified value there is, and it answers a " +
+		"Clone. The value a cache binds to must not move under it, so what a holder is handed is a " +
+		"copy it may do as it likes with; the pointer itself is never handed out, and that is a " +
+		"property of the CLASS of readers rather than of this one body, which is why this table is " +
+		"held equal in both directions",
 }
 
 // TestEveryConstructionOfAVerifiedGroupContextIsClassifiedHere is rule 5 over the class that
-// replaced an AST walk three rounds could not make hold.
+// replaced an AST walk three rounds could not make hold, with the scope defect a fourth round left
+// in it fixed: the walk is over every declaration and not over every function body.
 //
 // It runs on the control first, which is what says the matcher reads anything at all, and then on
 // the real source. The reflection half in front of both is not decoration: it is what makes the
@@ -252,7 +449,7 @@ func TestEveryConstructionOfAVerifiedGroupContextIsClassifiedHere(t *testing.T) 
 		t.Fatal("the matcher judged no construction in the control, so it would report a clean run over any package at all")
 	}
 	if reported := slices.Sorted(maps.Keys(built)); !slices.Equal(reported, verifiedGroupContextControlConstructions) {
-		t.Fatalf("the rule read %v out of the control as building a verified context, want %v; one that reads only keyed elements walks past the positional build, one that reads only literals walks past the assignment, and one that reads the field NAME rather than the type it belongs to reports a build of something else",
+		t.Fatalf("the rule read %v out of the control as building a verified context, want %v; one that reads only keyed elements walks past the positional build, one that reads only literals walks past the assignment, one that reads the field NAME rather than the type it belongs to reports a build of something else, and one that enters function BODIES walks past both package scope builds -- which is the spelling that was measured to leave the whole suite green",
 			reported, verifiedGroupContextControlConstructions)
 	}
 
@@ -276,6 +473,167 @@ func TestEveryConstructionOfAVerifiedGroupContextIsClassifiedHere(t *testing.T) 
 		}
 		for _, one := range found[name] {
 			t.Logf("%s at %s builds %q", name, one.where, one.how)
+		}
+	}
+}
+
+// TestEveryReaderOfAVerifiedGroupContextIsClassifiedHere is the same rule over the other half of
+// the type's contract, and it is the gate the last round did not have at all.
+//
+// The value level property -- Context answers a Clone -- is asserted below and IS caught when
+// Context's body is rewritten to a bare return. What it is not is a statement about the class: an
+// added func (self *VerifiedGroupContext) Inner() *GroupContext { return self.inner } passed the
+// entire suite, because every existing assertion was about Context by name. This asks the class
+// question instead, in both directions.
+func TestEveryReaderOfAVerifiedGroupContextIsClassifiedHere(t *testing.T) {
+	control := typeCheckedBodiesOfText(t, "the verified group context control", verifiedGroupContextControl)
+	read, judged := verifiedGroupContextReadersIn(control)
+	if judged == 0 {
+		t.Fatal("the matcher resolved no signature in the control, so it would report a clean run over any package at all")
+	}
+	if reported := slices.Sorted(maps.Keys(read)); !slices.Equal(reported, verifiedGroupContextControlReaders) {
+		t.Fatalf("the rule read %v out of the control as handing a verified context's group context back, want %v; one that reads Params without the RECEIVER walks past the method -- which is the spelling that was measured to survive the whole suite -- one that reads only *ast.FuncDecl walks past the package scope literal, and one that asks either half of the pair alone reports the copy and the plain echo as readers",
+			reported, verifiedGroupContextControlReaders)
+	}
+
+	checked := typeCheckedBodiesOf(t, ".")
+	found, realJudged := verifiedGroupContextReadersIn(checked)
+	if realJudged == 0 {
+		t.Fatal("no signature of this package was resolved, so this gate is not reading what it claims to")
+	}
+	classified := slices.Sorted(maps.Keys(verifiedGroupContextReaderSites))
+	if names := slices.Sorted(maps.Keys(found)); !slices.Equal(names, classified) {
+		t.Fatalf("%v are handed a %s and answer a %s, and this table names %v; a reader with no row is a second way for a holder to reach the context a cache is bound to, and a row with no reader is a claim that outlived what it described",
+			names, verifiedGroupContextTypeName, groupContextTypeName, classified)
+	}
+	for _, name := range classified {
+		if verifiedGroupContextReaderSites[name] == "" {
+			t.Errorf("%s is classified with no account of what entitles it, which is the enumeration this gate exists to not be", name)
+		}
+		for _, one := range found[name] {
+			t.Logf("%s at %s reads %q", name, one.where, one.how)
+		}
+	}
+}
+
+// TestNoMethodOfAVerifiedGroupContextHandsOutTheStorageItVouchesFor is the behavioural half of the
+// reader class, derived off the COMPILED method set rather than off the source.
+//
+// Two gates over one class on purpose. The source gate above fails when a reader is added without a
+// row, which is a conversation somebody can have and then win; this one fails when a reader hands
+// out the storage, whatever any table says about it, and it needs nobody to have updated anything.
+// Between them the added accessor that survived the last round fails twice.
+//
+// EVERY METHOD ANSWERING A CONTEXT IS DRIVEN, not Context by name, which is the whole point. The
+// two answer shapes are both judged -- a *GroupContext, whose pointer is compared against the one
+// the value holds, and a GroupContext by value, whose byte slices would alias even though the
+// struct is a copy. A method this gate cannot call is REPORTED rather than skipped, because a
+// skipped method is a clean run over a reader nobody looked at.
+//
+// The scribble is checked for being observable before it is trusted: a mutation that wrote nothing
+// would leave the receiver unchanged for a reason that is this test's own and not the type's.
+func TestNoMethodOfAVerifiedGroupContextHandsOutTheStorageItVouchesFor(t *testing.T) {
+	verified := testVerifiedContextAt(t, &GroupContext{
+		Version:                 ProtocolVersionMls10,
+		CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:                 []byte("storage that is not handed out"),
+		Epoch:                   13,
+		ConfirmedTranscriptHash: bytes.Repeat([]byte{0x5c}, 32),
+		Extensions: []Extension{{
+			ExtensionType: ExtensionTypeRequiredCapabilities,
+			ExtensionData: []byte{0x07, 0x08, 0x09},
+		}},
+	})
+	// the receiver's own octets, read independently of Clone so that a broken Clone cannot make
+	// this comparison agree with itself
+	before, err := syntax.Marshal(verified.inner)
+	if err != nil {
+		t.Fatalf("the verified context did not marshal: %v", err)
+	}
+
+	contextPointer := reflect.TypeOf((*GroupContext)(nil))
+	contextValue := reflect.TypeOf(GroupContext{})
+	holder := reflect.TypeOf(&VerifiedGroupContext{})
+	judged := 0
+	for i := range holder.NumMethod() {
+		method := holder.Method(i)
+		answers := false
+		for at := range method.Type.NumOut() {
+			if out := method.Type.Out(at); out == contextPointer || out == contextValue {
+				answers = true
+			}
+		}
+		if !answers {
+			continue
+		}
+		judged += 1
+		if method.Type.NumIn() != 1 {
+			t.Errorf("%s.%s answers a group context and takes %d arguments, so this gate cannot drive it; say what it is rather than leaving a reader nobody looked at",
+				verifiedGroupContextTypeName, method.Name, method.Type.NumIn()-1)
+			continue
+		}
+		for _, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(verified)}) {
+			answered := (*GroupContext)(nil)
+			switch result.Type() {
+			case contextPointer:
+				answered, _ = result.Interface().(*GroupContext)
+				if answered == nil {
+					continue
+				}
+				if answered == verified.inner {
+					t.Errorf("%s.%s answers the very pointer the value holds, so any holder of a verified context can rewrite the group it vouches for after the vouching",
+						verifiedGroupContextTypeName, method.Name)
+					continue
+				}
+			case contextValue:
+				held, _ := result.Interface().(GroupContext)
+				answered = &held
+			default:
+				continue
+			}
+			whole, err := syntax.Marshal(answered)
+			if err != nil {
+				t.Fatalf("%s answered a context that did not marshal: %v", method.Name, err)
+			}
+			scribbleOverAGroupContext(answered)
+			scribbled, err := syntax.Marshal(answered)
+			if err != nil {
+				t.Fatalf("%s answered a context that did not marshal after the scribble: %v", method.Name, err)
+			}
+			if bytes.Equal(whole, scribbled) {
+				t.Fatalf("the scribble changed nothing in what %s answered, so the comparison below would agree for this test's own reason rather than the type's",
+					method.Name)
+			}
+		}
+	}
+	if judged == 0 {
+		t.Fatalf("no method of *%s answers a group context, and Context certainly does, so this gate drove nothing",
+			verifiedGroupContextTypeName)
+	}
+	after, err := syntax.Marshal(verified.inner)
+	if err != nil {
+		t.Fatalf("the verified context did not marshal after the scribbles: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("writing through what a method of *%s answered moved the verified value from %x to %x; a value a cache is bound to must not move under it",
+			verifiedGroupContextTypeName, before, after)
+	}
+}
+
+// scribbleOverAGroupContext writes into every byte a context holds and moves its epoch.
+//
+// Every field rather than one, because aliasing is per slice: a Clone that copied the group id and
+// kept the caller's transcript hash would pass a test that only wrote through the group id.
+func scribbleOverAGroupContext(context *GroupContext) {
+	context.Epoch ^= 0xffff
+	for _, field := range [][]byte{context.GroupId, context.TreeHash, context.ConfirmedTranscriptHash} {
+		for at := range field {
+			field[at] ^= 0xff
+		}
+	}
+	for _, extension := range context.Extensions {
+		for at := range extension.ExtensionData {
+			extension.ExtensionData[at] ^= 0xff
 		}
 	}
 }
@@ -310,7 +668,7 @@ func TestNeitherWriterOfTheCacheBindingTakesABareGroupContext(t *testing.T) {
 		takesConfirmed := false
 		for at := 0; at < signature.NumIn(); at++ {
 			if signature.In(at) == bare {
-				t.Errorf("%s writes the cache binding and takes a %s; every group context names some epoch and this package decodes one straight off peer octets, so that parameter is a claim about a struct's fields and not about anybody's authority -- take a %s, whose only constructor confirmed it",
+				t.Errorf("%s writes the cache binding and takes a %s; every group context names some epoch and this package decodes one straight off peer octets, so that parameter is a claim about a struct's fields and not about anybody's authority -- take a %s, whose only constructor verified a member's signature over it",
 					name, bare, confirmed)
 			}
 			if signature.In(at) == confirmed {
@@ -348,233 +706,263 @@ func bindingWriterSignature(cache reflect.Type, name string) (reflect.Type, bool
 // what the constructor actually establishes
 // ---------------------------------------------------------------------------
 
-// testConfirmedScheduleOver is one epoch's key schedule, derived the way a JOINER derives one:
-// out of a joiner secret and a psk secret, over the group context named.
+// testSignedGroupInfoOver is a GroupInfo naming this tree at the caller's context, signed by the
+// member at the leaf it names.
 //
-// The joiner path and not NewKeyScheduleFromEpochSecret, and the difference is the whole property
-// these tests are about. The epoch secret of the joiner path is
-// ExpandWithLabel(member_secret, "epoch", group_context), so the context is mixed INTO the secret
-// every key of the epoch descends from -- change one octet of it and confirmation_key changes with
-// it. NewKeyScheduleFromEpochSecret takes the epoch secret from its caller, which is the group
-// CREATION path: there the context and the secret are both this client's own, so a fixture built
-// that way could not tell a confirmed context from an unconfirmed one at all.
-//
-// The two secrets are fixed rather than random, so that two schedules over two contexts differ in
-// exactly one thing.
-func testConfirmedScheduleOver(t *testing.T, groupContext *GroupContext) *KeySchedule {
+// IT OVERWRITES THE CALLER'S TREE HASH, in place, and that is not a convenience. A group info whose
+// context named some other tree is refused by rule 1 of Verify before anything else is looked at,
+// so a fixture that left the caller's tree hash alone would make every test below refuse for the
+// fixture's reason rather than its own -- and a caller comparing what it passed in against what
+// came out would then be comparing against a context this client never vouched for.
+func testSignedGroupInfoOver(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
+	members []*testTreeMember, signer LeafIndex, context *GroupContext) *GroupInfo {
 	t.Helper()
-	crypto := testCrypto(t)
-	nh := crypto.HashSize()
-	schedule, err := NewKeyScheduleFromJoiner(crypto,
-		bytes.Repeat([]byte{0x4a}, nh), bytes.Repeat([]byte{0x5b}, nh), groupContext)
+	treeHash, err := tree.TreeHash(crypto)
 	if err != nil {
-		t.Fatalf("a key schedule over epoch %d of group %x: %v",
-			groupContext.Epoch, groupContext.GroupId, err)
+		t.Fatalf("TreeHash: %v", err)
 	}
-	return schedule
+	context.TreeHash = treeHash
+	info := &GroupInfo{
+		GroupContext: *context,
+		Extensions: []Extension{{
+			ExtensionType: ExtensionTypeRequiredCapabilities,
+			ExtensionData: []byte{0x04, 0x05},
+		}},
+		ConfirmationTag: bytes.Repeat([]byte{0x32}, crypto.HashSize()),
+		Signer:          signer,
+	}
+	if err := info.Sign(crypto, members[signer].SignaturePriv); err != nil {
+		t.Fatalf("Sign at leaf %d: %v", signer, err)
+	}
+	return info
 }
 
 // testVerifiedContextAt is the group context of one epoch with its authority established the one
 // way this package establishes it, for the tests that need a cache bound somewhere.
 //
-// The tag is the schedule's OWN, which is what a creator's is and what a member recomputing a
-// commit's compares against. What that fixture cannot demonstrate -- that a tag from one epoch
-// does not confirm another -- is the subject of a test of its own below rather than something
-// this helper is asked to carry.
+// It goes through the whole door -- a real two member tree, a real signature by member 0, a real
+// (*GroupInfo).Verify -- rather than reaching for the field, because a fixture that built the value
+// some shorter way would leave every test that uses it passing over a constructor that had stopped
+// checking anything.
 func testVerifiedContextAt(t *testing.T, groupContext *GroupContext) *VerifiedGroupContext {
 	t.Helper()
-	schedule := testConfirmedScheduleOver(t, groupContext)
-	verified, err := schedule.ConfirmGroupContext(
-		schedule.ConfirmationTag(groupContext.ConfirmedTranscriptHash))
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 2)
+	info := testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(0), groupContext)
+	verified, err := info.VerifiedContext(crypto, tree)
 	if err != nil {
-		t.Fatalf("ConfirmGroupContext over epoch %d of group %x: %v",
+		t.Fatalf("VerifiedContext over epoch %d of group %x: %v",
 			groupContext.Epoch, groupContext.GroupId, err)
 	}
 	return verified
 }
 
-// TestConfirmGroupContextAnswersTheContextItsOwnScheduleWasDerivedOver is the accepting half.
+// TestVerifiedContextAnswersTheContextTheSignatureCovers is the accepting half.
 //
 // Every field is compared and not only the two the cache binds to, because the value this hands
 // back is the whole context and a constructor that answered the right group at the wrong tree hash
 // would be handing a caller an epoch nobody published.
 //
-// The fixture carries an EXTENSION rather than none, and that is not decoration. The codec has one
-// spelling for an absent vector and an empty one, so ReadExtensions never answers nil -- a fixture
-// with no extensions would compare a nil slice against an empty one and fail for a reason that is
-// the codec convention rather than this constructor. Carrying one also says the whole context
-// survives the decode, which is the claim being made.
-func TestConfirmGroupContextAnswersTheContextItsOwnScheduleWasDerivedOver(t *testing.T) {
+// The fixture carries an EXTENSION and fills both hashes rather than leaving them nil, and that is
+// not decoration. The codec has one spelling for an absent vector and an empty one, so a field left
+// nil comes back empty and the comparison would fail for a reason that is the codec convention
+// rather than this constructor. Carrying them also says the whole context survives the serialize
+// and decode this door answers through, which is the claim being made.
+func TestVerifiedContextAnswersTheContextTheSignatureCovers(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 4)
 	context := &GroupContext{
 		Version:                 ProtocolVersionMls10,
 		CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
 		GroupId:                 []byte("a group"),
 		Epoch:                   7,
-		TreeHash:                bytes.Repeat([]byte{0x31}, 32),
-		ConfirmedTranscriptHash: bytes.Repeat([]byte{0x32}, 32),
+		ConfirmedTranscriptHash: bytes.Repeat([]byte{0x32}, crypto.HashSize()),
 		Extensions: []Extension{{
 			ExtensionType: ExtensionTypeRequiredCapabilities,
 			ExtensionData: []byte{0x00, 0x00, 0x00},
 		}},
 	}
-	schedule := testConfirmedScheduleOver(t, context)
-	verified, err := schedule.ConfirmGroupContext(schedule.ConfirmationTag(context.ConfirmedTranscriptHash))
+	info := testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(2), context)
+	verified, err := info.VerifiedContext(crypto, tree)
 	if err != nil {
-		t.Fatalf("ConfirmGroupContext with this schedule's own tag: %v", err)
+		t.Fatalf("VerifiedContext over a group info its own member signed: %v", err)
 	}
 	answered := verified.Context()
 	if answered == nil {
-		t.Fatal("a confirmed context answered nothing, so every door below would refuse it")
+		t.Fatal("a verified context answered nothing, so every door below would refuse it")
 	}
-	if !reflect.DeepEqual(answered, context) {
-		t.Errorf("ConfirmGroupContext answered %+v, want %+v; it decodes the bytes this epoch expanded over, so a difference here is the answer describing an epoch the keys were not derived from",
-			answered, context)
-	}
-}
-
-// TestConfirmGroupContextRefusesATagFromAnotherEpoch is the refusing half, and it is the property
-// the whole design rests on.
-//
-// Two schedules built from the SAME joiner secret and the SAME psk secret over two contexts that
-// differ only in their epoch number. If the tag of one confirmed the other, then the value this
-// type carries would say nothing about which epoch it belongs to -- which is exactly what a bare
-// *GroupContext said, and this whole file would be ceremony.
-func TestConfirmGroupContextRefusesATagFromAnotherEpoch(t *testing.T) {
-	at7 := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     []byte("a group"),
-		Epoch:       7,
-	}
-	at8 := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     []byte("a group"),
-		Epoch:       8,
-	}
-	seven, eight := testConfirmedScheduleOver(t, at7), testConfirmedScheduleOver(t, at8)
-	strangersTag := eight.ConfirmationTag(at8.ConfirmedTranscriptHash)
-	if bytes.Equal(strangersTag, seven.ConfirmationTag(at7.ConfirmedTranscriptHash)) {
-		t.Fatal("the two epochs produced the same confirmation tag, so the refusal below would hold nothing; the epoch secret is expanded over the group context and two contexts must not reach one key")
-	}
-	if _, err := seven.ConfirmGroupContext(strangersTag); !errors.Is(err, errUnconfirmedGroupContext) {
-		t.Errorf("epoch 7's schedule confirmed its context under epoch 8's tag = %v, want errUnconfirmedGroupContext; a constructor that accepted a stranger's tag would confer this type's authority on any context at all",
-			err)
-	}
-	// and the same over the GROUP rather than the epoch, because an epoch number is not an
-	// identity: every group this client is in runs an epoch 7
-	otherGroup := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     []byte("another"),
-		Epoch:       7,
-	}
-	other := testConfirmedScheduleOver(t, otherGroup)
-	if _, err := seven.ConfirmGroupContext(other.ConfirmationTag(otherGroup.ConfirmedTranscriptHash)); !errors.Is(err, errUnconfirmedGroupContext) {
-		t.Errorf("epoch 7 of one group confirmed itself under epoch 7 of another group's tag = %v, want errUnconfirmedGroupContext",
-			err)
+	if !reflect.DeepEqual(answered, &info.GroupContext) {
+		t.Errorf("VerifiedContext answered %+v, want %+v; it decodes the octets the signature covered, so a difference here is the answer describing an epoch nobody signed",
+			answered, &info.GroupContext)
 	}
 }
 
-// TestConfirmGroupContextRefusesAnEmptyOrTruncatedTag is the shape a caller reaches by passing
-// whatever it happened to decode.
+// TestVerifiedContextRefusesEveryGroupInfoVerifyRefuses is the refusing half, and it is the
+// property the whole design rests on.
 //
-// The truncated case is the sharp one. A prefix comparison accepts every truncation of a valid
-// tag, and a one octet tag is then a forgery an attacker finds in 256 tries; what refuses it is
-// MacVerify's length check, reached through VerifyConfirmationTag, which is guardrail 8's whole
-// point.
-func TestConfirmGroupContextRefusesAnEmptyOrTruncatedTag(t *testing.T) {
-	context := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     []byte("a group"),
-		Epoch:       3,
+// EVERY ROW ASKS FOR ITS OWN SENTINEL and not merely for an error, which is this project's most
+// repeated defect asked at a new door: errors.Is cannot tell two rules apart when they answer one
+// value, so a row asserting "some refusal" passes over a constructor that refused for a reason
+// nobody meant. The six are Verify's four rules and its two argument refusals, and each is built
+// adversarially rather than described.
+//
+// Every row also asserts that NOTHING was answered. A constructor that returned a usable verified
+// context beside a non nil error would be read as "err != nil" by a careful caller and as a
+// verified epoch by everybody else, and the value that would then be bound is the attacker's.
+func TestVerifiedContextRefusesEveryGroupInfoVerifyRefuses(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 4)
+	other, _ := newTestTree(t, crypto, 2)
+	contextAt := func(epoch uint64) *GroupContext {
+		return &GroupContext{
+			Version:                 ProtocolVersionMls10,
+			CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+			GroupId:                 []byte("a group"),
+			Epoch:                   epoch,
+			ConfirmedTranscriptHash: bytes.Repeat([]byte{0x33}, crypto.HashSize()),
+		}
 	}
-	schedule := testConfirmedScheduleOver(t, context)
-	whole := schedule.ConfirmationTag(context.ConfirmedTranscriptHash)
-	if len(whole) < 2 {
-		t.Fatalf("the confirmation tag is %d octets, so there is no truncation to make", len(whole))
+
+	// the positive control, so that nothing below passes because this door refuses everything
+	control := testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(1), contextAt(1))
+	if _, err := control.VerifiedContext(crypto, tree); err != nil {
+		t.Fatalf("the honest group info was refused with %v, so every refusal below says nothing", err)
 	}
-	for _, one := range []struct {
-		name string
-		tag  []byte
-	}{
-		{name: "no tag at all", tag: nil},
-		{name: "an empty tag", tag: []byte{}},
-		{name: "the tag one octet short", tag: whole[:len(whole)-1]},
-		{name: "the tag's first octet alone", tag: whole[:1]},
-		{name: "the tag with its last octet flipped", tag: append(bytes.Clone(whole[:len(whole)-1]), whole[len(whole)-1]^0x01)},
-	} {
-		if _, err := schedule.ConfirmGroupContext(one.tag); !errors.Is(err, errUnconfirmedGroupContext) {
-			t.Errorf("ConfirmGroupContext with %s = %v, want errUnconfirmedGroupContext", one.name, err)
+
+	rows := []struct {
+		name     string
+		sentinel error
+		call     func(t *testing.T) (*VerifiedGroupContext, error)
+	}{{
+		name:     "no crypto provider, which is how the signature would be checked",
+		sentinel: ErrNilCryptoProvider,
+		call: func(t *testing.T) (*VerifiedGroupContext, error) {
+			return testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(0),
+				contextAt(2)).VerifiedContext(nil, tree)
+		},
+	}, {
+		name:     "no tree, which is the only thing that can say who the members are",
+		sentinel: ErrTreeMalformed,
+		call: func(t *testing.T) (*VerifiedGroupContext, error) {
+			return testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(0),
+				contextAt(3)).VerifiedContext(crypto, nil)
+		},
+	}, {
+		name:     "a signed context naming a DIFFERENT tree than the one it is checked against",
+		sentinel: ErrWelcomeTreeHashMismatch,
+		call: func(t *testing.T) (*VerifiedGroupContext, error) {
+			// signed over the other tree's hash, so the signature is perfectly good and
+			// the context is about a group this tree is not
+			info := testSignedGroupInfoOver(t, crypto, other, members, LeafIndex(0), contextAt(4))
+			return info.VerifiedContext(crypto, tree)
+		},
+	}, {
+		name:     "a signer index past the end of this tree",
+		sentinel: ErrLeafIndexOutOfRange,
+		call: func(t *testing.T) (*VerifiedGroupContext, error) {
+			info := testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(0), contextAt(5))
+			info.Signer = LeafIndex(1 << 20)
+			if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+				t.Fatalf("re-sign at the out of range index: %v", err)
+			}
+			return info.VerifiedContext(crypto, tree)
+		},
+	}, {
+		name:     "a signer index naming a position no member occupies",
+		sentinel: errBlankSenderLeaf,
+		call: func(t *testing.T) (*VerifiedGroupContext, error) {
+			blanked, blankedMembers := newTestTree(t, crypto, 4)
+			if err := blanked.Blank(LeafIndex(2).NodeIndex()); err != nil {
+				t.Fatalf("Blank leaf 2: %v", err)
+			}
+			// the info is built AFTER the blanking, so its tree hash is the blanked
+			// tree's and rule 1 is not what refuses this row
+			info := testSignedGroupInfoOver(t, crypto, blanked, blankedMembers, LeafIndex(0),
+				contextAt(6))
+			info.Signer = LeafIndex(2)
+			if err := info.Sign(crypto, blankedMembers[0].SignaturePriv); err != nil {
+				t.Fatalf("re-sign at the blank leaf: %v", err)
+			}
+			return info.VerifiedContext(crypto, blanked)
+		},
+	}, {
+		name:     "a signature by a key that sits in no leaf of this tree",
+		sentinel: ErrWelcomeGroupInfoSignature,
+		call: func(t *testing.T) (*VerifiedGroupContext, error) {
+			stranger, _, err := crypto.SignatureKeyPair()
+			if err != nil {
+				t.Fatalf("SignatureKeyPair: %v", err)
+			}
+			info := testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(0), contextAt(7))
+			if err := info.Sign(crypto, stranger); err != nil {
+				t.Fatalf("Sign as the stranger: %v", err)
+			}
+			return info.VerifiedContext(crypto, tree)
+		},
+	}}
+
+	for _, row := range rows {
+		verified, err := row.call(t)
+		if verified != nil {
+			t.Errorf("a group info with %s was VOUCHED FOR; the cache would bind to epoch %d of group %x on an attacker's say so",
+				row.name, verified.Context().Epoch, verified.Context().GroupId)
+		}
+		if !errors.Is(err, row.sentinel) {
+			t.Errorf("a group info with %s answered %v, want %v", row.name, err, row.sentinel)
 		}
 	}
 }
 
-// TestConfirmGroupContextRefusesOverAnErasedEpoch is the state the whole erase discipline exists
-// for, asked at this door.
+// TestAVerifiedContextIsNotChangeableThroughWhatItHandsBack is the aliasing half, asked at both
+// ends: what a holder is handed, and what the caller that supplied the group info still holds.
 //
-// An erased confirmation_key is KDF.Nh ZERO bytes, which every party on earth can compute, so a
-// tag over it authenticates nobody -- and a context confirmed by one would carry this type's
-// authority on an attacker's say so.
-//
-// The refusal is ErrEpochErased and not errUnconfirmedGroupContext, which is the distinction a
-// caller acts on: "the tag does not confirm this context" sends a member looking for a fork with
-// a peer, and what actually happened is that this client dropped the epoch's secrets when it aged
-// out of the window. Both are refusals; only one of them is true.
-func TestConfirmGroupContextRefusesOverAnErasedEpoch(t *testing.T) {
+// The value a cache binds to must not move under it. Context answers a Clone, so a caller that
+// rewrites the group id of what it was handed rewrites its own copy; and the constructor decodes
+// the octets the signature covered, so the caller's own GroupInfo is not the storage the verified
+// value vouches for either. A design missing the second half would be one where an attacker that
+// got a GroupInfo verified could then edit the group out from under the cache that trusted it.
+func TestAVerifiedContextIsNotChangeableThroughWhatItHandsBack(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 2)
 	context := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     []byte("a group"),
-		Epoch:       4,
+		Version:                 ProtocolVersionMls10,
+		CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:                 []byte("a group"),
+		Epoch:                   5,
+		ConfirmedTranscriptHash: bytes.Repeat([]byte{0x71}, crypto.HashSize()),
 	}
-	schedule := testConfirmedScheduleOver(t, context)
-	tag := schedule.ConfirmationTag(context.ConfirmedTranscriptHash)
-	if _, err := schedule.ConfirmGroupContext(tag); err != nil {
-		t.Fatalf("the control: a live epoch refused its own tag: %v", err)
+	info := testSignedGroupInfoOver(t, crypto, tree, members, LeafIndex(0), context)
+	signedTreeHash := bytes.Clone(info.GroupContext.TreeHash)
+	verified, err := info.VerifiedContext(crypto, tree)
+	if err != nil {
+		t.Fatalf("VerifiedContext: %v", err)
 	}
-	schedule.Zeroize()
-	if _, err := schedule.ConfirmGroupContext(tag); !errors.Is(err, ErrEpochErased) {
-		t.Errorf("an erased epoch confirmed a context = %v, want ErrEpochErased; its confirmation key is zeros, which every party can compute",
-			err)
-	}
-}
 
-// TestAConfirmedContextIsNotChangeableThroughWhatItHandsBack is the aliasing half.
-//
-// The value a cache binds to must not move under it. Context() answers a Clone, so a caller that
-// rewrites the group id of what it was handed rewrites its own copy; the alternative -- handing
-// back the pointer -- would let any holder of a verified context change which group it vouches
-// for, after the vouching.
-func TestAConfirmedContextIsNotChangeableThroughWhatItHandsBack(t *testing.T) {
-	context := &GroupContext{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-		GroupId:     []byte("a group"),
-		Epoch:       5,
-		TreeHash:    bytes.Repeat([]byte{0x71}, 32),
-	}
-	verified := testVerifiedContextAt(t, context)
 	handed := verified.Context()
 	handed.Epoch = 99
 	handed.GroupId[0] ^= 0xff
 	handed.TreeHash[0] ^= 0xff
 	again := verified.Context()
 	if again.Epoch != 5 {
-		t.Errorf("a write through what Context answered moved the confirmed epoch to %d", again.Epoch)
+		t.Errorf("a write through what Context answered moved the verified epoch to %d", again.Epoch)
 	}
 	if !bytes.Equal(again.GroupId, []byte("a group")) {
-		t.Errorf("a write through what Context answered moved the confirmed group id to %x", again.GroupId)
+		t.Errorf("a write through what Context answered moved the verified group id to %x", again.GroupId)
 	}
-	if !bytes.Equal(again.TreeHash, bytes.Repeat([]byte{0x71}, 32)) {
-		t.Errorf("a write through what Context answered moved the confirmed tree hash to %x", again.TreeHash)
+	if !bytes.Equal(again.TreeHash, signedTreeHash) {
+		t.Errorf("a write through what Context answered moved the verified tree hash to %x", again.TreeHash)
 	}
-	// and the caller's own structure is not what the confirmed value holds either, since the
-	// constructor decoded the schedule's bytes rather than keeping the argument
-	context.Epoch = 98
+
+	// and the group info the caller still holds is not the storage either, since the
+	// constructor decoded the octets the signature covered rather than keeping the argument
+	info.GroupContext.Epoch = 98
+	info.GroupContext.GroupId[0] ^= 0xff
 	if verified.Context().Epoch != 5 {
-		t.Error("a write through the caller's own context moved the confirmed epoch, so the confirmed value aliases the structure the schedule was built from")
+		t.Error("a write through the caller's own group info moved the verified epoch, so the verified value aliases the structure it was built from")
+	}
+	if !bytes.Equal(verified.Context().GroupId, []byte("a group")) {
+		t.Errorf("a write through the caller's own group info moved the verified group id to %x",
+			verified.Context().GroupId)
 	}
 }
 
@@ -602,33 +990,33 @@ func TestTheZeroVerifiedGroupContextIsRefusedAtEveryDoor(t *testing.T) {
 	}
 }
 
-// TestACacheBindsToTheEpochItsConfirmedContextNames joins this type to the thing it exists for.
+// TestACacheBindsToTheEpochItsVerifiedContextNames joins this type to the thing it exists for.
 //
 // The cache's binding is unexported and this is in the same package, so the two fields it compares
-// are read directly rather than inferred from a refusal: a test that only observed CheckEpoch
-// would pass over a constructor that bound to the right epoch of the wrong group.
-func TestACacheBindsToTheEpochItsConfirmedContextNames(t *testing.T) {
+// are read directly rather than inferred from a refusal: a test that only observed CheckEpoch would
+// pass over a constructor that bound to the right epoch of the wrong group.
+func TestACacheBindsToTheEpochItsVerifiedContextNames(t *testing.T) {
 	context := testResolveContextAt([]byte("bound here"), 11)
 	cache, err := NewProposalCache(testVerifiedContextAt(t, context))
 	if err != nil {
-		t.Fatalf("NewProposalCache over a confirmed context: %v", err)
+		t.Fatalf("NewProposalCache over a verified context: %v", err)
 	}
 	if cache.binding == nil {
-		t.Fatal("a cache built over a confirmed context is bound to nothing")
+		t.Fatal("a cache built over a verified context is bound to nothing")
 	}
 	if !bytes.Equal(cache.binding.groupId, context.GroupId) || cache.binding.epoch != context.Epoch {
 		t.Errorf("the cache bound itself to epoch %d of group %x, want epoch %d of group %x",
 			cache.binding.epoch, cache.binding.groupId, context.Epoch, context.GroupId)
 	}
-	// and the binding does not alias the confirmed value's own storage
+	// and the binding does not alias the verified value's own storage
 	verified := testVerifiedContextAt(t, context)
 	rebound, err := NewProposalCache(verified)
 	if err != nil {
-		t.Fatalf("NewProposalCache over a second confirmed context: %v", err)
+		t.Fatalf("NewProposalCache over a second verified context: %v", err)
 	}
 	verified.inner.GroupId[0] ^= 0xff
 	if !bytes.Equal(rebound.binding.groupId, context.GroupId) {
-		t.Errorf("the binding followed a write into the confirmed context's own array to %x; a binding aliased to storage somebody else holds agrees with whatever that storage later says",
+		t.Errorf("the binding followed a write into the verified context's own array to %x; a binding aliased to storage somebody else holds agrees with whatever that storage later says",
 			rebound.binding.groupId)
 	}
 }

@@ -2244,21 +2244,14 @@ var keyScheduleMethodArgumentRows = map[string]func(schedule *KeySchedule) [][]r
 	"VerifyMembershipTag": func(schedule *KeySchedule) [][]reflect.Value {
 		return [][]reflect.Value{{reflect.ValueOf(tagSweepTbm), reflect.ValueOf(schedule.MembershipTag(tagSweepTbm))}}
 	},
-	// group_context_verified.go's constructor, driven rather than excused for the reason
-	// Export is. It answers a *VerifiedGroupContext, whose only field is unexported, so the
-	// flattener reads no octets out of it at all -- and that is exactly the fact worth
-	// DRIVING rather than writing down as an excuse, because a constructor that grew an
-	// exported field, or that started answering the context by pointer into something this
-	// type keeps, would begin handing storage out and this sweep would see it.
-	//
-	// The row carries the schedule's own tag, read back off the bytes the epoch expanded
-	// over, because the accepting path is the only one that answers anything to read: a
-	// refused call answers nil, and every row these sweeps are built from has to succeed.
-	"ConfirmGroupContext": func(schedule *KeySchedule) [][]reflect.Value {
-		decoded := &GroupContext{}
-		_ = syntax.Unmarshal(schedule.GroupContextBytes(), decoded)
-		return [][]reflect.Value{{reflect.ValueOf(schedule.ConfirmationTag(decoded.ConfirmedTranscriptHash))}}
-	},
+	// A *KeySchedule no longer answers a *VerifiedGroupContext at all, and the row that used
+	// to drive one is gone with the method. ConfirmGroupContext confirmed a tag against the
+	// epoch's own schedule, which is a tautology any package can write -- the context went in
+	// through an exported constructor and ConfirmationTag is exported on this same type -- so
+	// the verified type's constructor is (*GroupInfo).VerifiedContext now and the authority is
+	// a member's signature checked against a tree. The flattener's arm for that result type is
+	// kept below, because it is what would read a verified value if a method of this type ever
+	// answered one again.
 }
 
 // tagSweepTranscriptHash is the confirmed_transcript_hash the sweeps drive the confirmation
@@ -3714,7 +3707,7 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 		},
 		// p7 task 6's proposal cache used to be in this class and is deliberately not any
 		// more. It takes a *VerifiedGroupContext now -- a group context whose authority has
-		// been established, whose only constructor is (*KeySchedule).ConfirmGroupContext --
+		// been established, whose only constructor is (*GroupInfo).VerifiedContext --
 		// so it is no longer a constructor over a *GroupContext at all, and the class this
 		// gate derives is what says so rather than this comment. Its own nil refusal is
 		// still held, by the derived nil argument sweep next door.
@@ -4026,11 +4019,6 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 var scheduleAnswersThatAreNotKdfLengths = map[exposedAnswerAt]string{
 	{method: "ExternalKeyPair", result: 0}: "the hpke private key, which is Nsk; X25519 fixes it at 32 and the narrow suite's KDF.Nh is also 32, so the equality is that suite's coincidence rather than anything this method did, and a kdf getting wider does not make an X25519 key wider",
 	{method: "ExternalKeyPair", result: 1}: "the hpke public key, which is Npk; the same coincidence at 32 and the same reason a wider kdf does not widen it",
-	{method: "ConfirmGroupContext", result: 0}: "the group context this epoch was derived over, read through " +
-		"the confirmed value's accessor. Its group id is whoever created the group's, and its two hashes are " +
-		"the suite's HASH size rather than its KDF.Nh -- the same number for every suite this build runs and " +
-		"a different quantity, so a comparison against a kdf length here would be pinning a coincidence. " +
-		"Nothing in it is a secret: the same octets go out inside every GroupInfo",
 }
 
 // scheduleStorageReaders is how this gate reads each byte slice a *KeySchedule keeps behind

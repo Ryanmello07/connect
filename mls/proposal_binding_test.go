@@ -39,12 +39,12 @@
 //
 // What answers it instead is the compiler. NewProposalCache and Rebind take a
 // *VerifiedGroupContext, a type whose only field is unexported and whose only constructor is
-// (*KeySchedule).ConfirmGroupContext -- which takes no group context at all and answers the one
-// its own epoch schedule was derived over, once a confirmation tag proves a holder of that
-// epoch's confirmation key named it. Every bypass listed above now fails to COMPILE rather than
+// (*GroupInfo).VerifiedContext -- which answers the group context of a GroupInfo only once a
+// member of the ratchet tree the CALLER holds has been shown to have signed it, under a signature
+// checked against a key that came out of that tree. Every bypass listed above now fails to COMPILE rather than
 // failing to be spotted. group_context_verified.go carries the argument, and
-// group_context_verified_test.go holds the one question that IS a property of source shape: which
-// declarations of this package construct that type.
+// group_context_verified_test.go holds the two questions that ARE properties of source shape:
+// which declarations of this package construct that type, and which hand its contents back out.
 //
 // SO WHAT IS LEFT HERE IS THE WRITE, and it is still worth a gate for the reason it always was.
 // The type says the value handed in has authority; it says nothing about which of the fields in

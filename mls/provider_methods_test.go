@@ -944,6 +944,47 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 			}
 			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
 		}},
+		// p7 task 15's door onto a verified group context, which is that verifying half plus a
+		// decode. It is driven rather than excused because what it answers is the value a
+		// proposal cache binds an epoch to: a body that reached for its own ed25519 would vouch
+		// for a group info nobody in the tree signed, and the cache would bind to whatever that
+		// group info named.
+		//
+		// TWO VALUES, because the two things that could route round the provider are separate.
+		// The verdict moves when the signature check goes through the provider it was handed.
+		// The confirmed transcript hash moves with the provider's KDF.Nh -- the fixture cuts it
+		// to that width -- so it is what says the context that came back is the one that was
+		// signed rather than something reassembled at a length written down here. The refusing
+		// path answers a marker of its own so that both providers leave the same number of
+		// values behind, which is what the differentials compare over.
+		{name: "(*GroupInfo).VerifiedContext", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			signer := SignaturePrivateKey(bytes.Repeat([]byte{0x75}, 32))
+			signerPub, err := signaturePublicKeyOf(signer)
+			if err != nil {
+				return nil, err
+			}
+			tree := providerRowRatchetTree(t)
+			tree.Leaf(LeafIndex(0)).SignatureKey = SignaturePublicKey(take(signerPub))
+			info, err := providerRowGroupInfo(t, crypto, tree)
+			if err != nil {
+				return nil, err
+			}
+			if err := info.Sign(crypto, signer); err != nil {
+				return nil, err
+			}
+			verdict := []byte("this group context was vouched for")
+			transcript := []byte("nothing was vouched for at all")
+			verified, refused := info.VerifiedContext(crypto, tree)
+			if refused != nil {
+				verdict = []byte("the group info is refused: " + refused.Error())
+			} else {
+				transcript = verified.Context().ConfirmedTranscriptHash
+			}
+			return []providerDrivenMethodValue{
+				{name: "the verdict", content: verdict},
+				{name: "the confirmed transcript hash of the context it vouched for", content: transcript},
+			}, nil
+		}},
 	}
 }
 

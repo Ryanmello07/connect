@@ -228,6 +228,14 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*GroupInfo).Verify", call: func() error {
 			return (&GroupInfo{}).Verify(nil, nil)
 		}},
+		// and the door built on that verifier, which must make the same refusal for the same
+		// reason: it is Verify and nothing else, so a provider check that stopped happening
+		// there would stop happening here, and this row is what says the delegation is real
+		// rather than a body that grew a check of its own beside it.
+		{name: "(*GroupInfo).VerifiedContext", call: func() error {
+			_, err := (&GroupInfo{}).VerifiedContext(nil, nil)
+			return err
+		}},
 	}
 }
 

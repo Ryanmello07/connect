@@ -1873,7 +1873,7 @@ func TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere(t *testing.T) {
 		for at := 1; at < method.Type.NumIn(); at++ {
 			// the VERIFIED context and not the bare one. An ender takes a group context
 			// whose authority has been established -- the type whose only constructor is
-			// (*KeySchedule).ConfirmGroupContext -- because a binding is only worth the
+			// (*GroupInfo).VerifiedContext -- because a binding is only worth the
 			// authority of the value it was taken from, and every *GroupContext names some
 			// epoch whoever wrote the octets chose. An ender that widened back to the bare
 			// type is a door onto the epoch this cache believes it is in, and it fails here.

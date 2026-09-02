@@ -734,12 +734,21 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"framing_protect.go: syntax.NewReader(plaintext)",
 		"framing_protect.go: syntax.NewWriter()",
 		"framing_protect.go: syntax.Unmarshal(plaintext, senderData)",
-		// the group context a confirmed epoch answers, decoded back out of the bytes that
-		// epoch's own secrets were expanded over. The default limit and no other: these are
-		// bytes this build produced by marshalling a GroupContext of its own, so a raised
-		// bound here would be raising a limit for a value that never came off a wire -- and
-		// if it ever needs one, the encoder that produced them is the place that says so.
-		"group_context_verified.go: syntax.Unmarshal(self.groupContextBytes, decoded)",
+		// the two halves of one statement: the group context a VERIFIED group info names, taken
+		// back apart out of its own serialization so that what the answer carries is exactly the
+		// octets the signature covered. The encode writes what GroupInfoTBS.MarshalMLS wrote
+		// first -- a group context is inline and carries no framing of its own -- and the decode
+		// reads it back.
+		//
+		// The DEFAULT limit on both, and for the encode that is the same bound welcome.go's
+		// preimage runs under rather than a second opinion: these octets are a prefix of the
+		// bytes SignWithLabel was handed, so a group context this encoder would accept at a
+		// raised bound is one the signature over it could not have been made at. The decode
+		// takes the default for the reason every re-decode here does: they are bytes this build
+		// produced one statement earlier, so a raised bound would be raising a limit for a value
+		// that never came off a wire.
+		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
+		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure
 		// encode its Encode reaches, and the decode both Parse entry points reach. All six at the
 		// default limit and none at the ratchet tree one, and here that is the strictest reading
