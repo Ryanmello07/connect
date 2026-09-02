@@ -410,10 +410,29 @@ func TestXwingCombinerOrderMatchesTheDraft(t *testing.T) {
 // bytes upstream never published. The digest check above catches that too, but this names it:
 // a carriage return in a corpus fetched from a repository that publishes LF is git having
 // rewritten the evidence.
+// The predicate, split out so the control below runs the same code the rule does rather than a
+// second copy of it.
+func xwingCarriageReturnAt(raw []byte) int {
+	return bytes.IndexByte(raw, '\r')
+}
+
 func TestXwingVectorFileWasNotSmudgedOnTheWayIn(t *testing.T) {
 	raw := loadXwingVectorFile(t)
-	if i := bytes.IndexByte(raw, '\r'); i >= 0 {
+	if i := xwingCarriageReturnAt(raw); i >= 0 {
 		t.Fatalf("%s carries a carriage return at offset %d; git rewrote the corpus on checkout and it is no longer the bytes upstream published", xwingVectorPath, i)
+	}
+	// The control, and it is not decoration here. This corpus is a SINGLE LINE of json with no
+	// newline in it at all, so there is nothing in it for git to convert and the rule above
+	// cannot fail on the file as vendored. What is load bearing against a smudge today is the
+	// digest in loadXwingVectorFile and the attributes file the test below reads; this rule is
+	// what would catch a re-vendoring that shipped a pretty printed corpus, and without a control
+	// it would be a matcher nothing has ever seen say yes.
+	if n := bytes.Count(raw, []byte{'\n'}); n != 0 {
+		t.Errorf("%s holds %d newlines; it was a single line when this control was written, so re-read the paragraph above and decide which of the two checks is now the weaker one", xwingVectorPath, n)
+	}
+	smudged := append(append([]byte{}, raw[:16]...), append([]byte{'\r', '\n'}, raw[16:]...)...)
+	if i := xwingCarriageReturnAt(smudged); i != 16 {
+		t.Fatalf("the smudge predicate answered %d on a corpus carrying a carriage return at offset 16, so it would report the real file clean whatever git had done to it", i)
 	}
 }
 
