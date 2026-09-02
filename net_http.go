@@ -229,43 +229,45 @@ func newNormalDialTlsContext(
 	// ones.
 
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		// the handshake half of the dial. It does NOT close the connection it
+		// was handed on its own error paths -- dialControlTlsWithFamilyFallback
+		// owns that connection, because it has to read the family off it before
+		// it goes away.
+		handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+			netDialer := settings.NetDialer()
+			if netDialer.Timeout != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
+				defer cancel()
+			}
+			if !netDialer.Deadline.IsZero() {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
+				defer cancel()
+			}
+
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+
+			config := tlsConfig.Clone()
+			if config.ServerName == "" {
+				config.ServerName = host
+			}
+			tlsConn := tls.Client(conn, config)
+			tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
+			defer tlsCancel()
+			if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		}
 		// DialContext preserves injected userspace networks in tests and proxy
 		// routing in production before wrapping the resulting connection in TLS.
-		conn, err := settings.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-
-		netDialer := settings.NetDialer()
-		if netDialer.Timeout != 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
-			defer cancel()
-		}
-		if !netDialer.Deadline.IsZero() {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
-			defer cancel()
-		}
-
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-
-		config := tlsConfig.Clone()
-		if config.ServerName == "" {
-			config.ServerName = host
-		}
-		tlsConn := tls.Client(conn, config)
-		tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
-		defer tlsCancel()
-		if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-		return tlsConn, nil
+		return dialControlTlsWithFamilyFallback(
+			ctx, network, addr, settings.DialContext, handshake)
 	}
 }
 

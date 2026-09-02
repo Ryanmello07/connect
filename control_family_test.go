@@ -291,3 +291,5 @@ type stubConn struct {
 }
 
 func (self *stubConn) RemoteAddr() net.Addr { return self.remote }
+
+func (self *stubConn) Close() error { return nil }
