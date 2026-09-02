@@ -32,6 +32,20 @@ import (
 // tolerance the spec set) while the caller still has budget left, which is
 // also the only case where a retry has anywhere to run.
 //
+// KNOWN LIMIT, and it needs a spec decision rather than a silent workaround.
+// Both production entry points give this helper a caller deadline at or below
+// TlsTimeout, so on both of them the caller's deadline is what a stalled
+// handshake hits and no demotion is recorded: http.Client.Timeout is
+// RequestTimeout (15s, and it starts before the dial does) for the api path,
+// and gorilla/websocket caps its dial context at Dialer.HandshakeTimeout (5s)
+// for the platform control websocket. The spec asks for two things that cannot
+// both hold at those budgets -- a tls handshake tolerance left at 15s, and an
+// in-place retry that fits inside the caller's own budget. Closing it means
+// either raising the control websocket's handshake budget above TlsTimeout so
+// the handshake's own timeout is the binding one, or amending the spec to
+// state a first-attempt floor. Dividing the caller's budget, which is what
+// this code used to do, is the one answer the spec rules out.
+//
 // Exactly one retry, and only to the other family. The caller already sits
 // inside the client strategy's serial and parallel dialer evaluation under a
 // shared request budget, so a helper that retried repeatedly could consume the

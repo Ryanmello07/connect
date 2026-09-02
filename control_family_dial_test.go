@@ -617,9 +617,9 @@ func TestFamilyFallbackDoesNotWriteTheLedgerUnderAForce(t *testing.T) {
 // are accepted and dropped: the ClientHello goes out, the ServerHello never
 // comes back, which is the post-connect blackhole this feature targets.
 type deadlineConn struct {
-	remote   net.Addr
-	unblock  chan struct{}
-	closeers sync.Once
+	remote    net.Addr
+	unblock   chan struct{}
+	closeOnce sync.Once
 }
 
 func newDeadlineConn(ip string) *deadlineConn {
@@ -630,7 +630,7 @@ func newDeadlineConn(ip string) *deadlineConn {
 }
 
 func (self *deadlineConn) release() {
-	self.closeers.Do(func() { close(self.unblock) })
+	self.closeOnce.Do(func() { close(self.unblock) })
 }
 
 func (self *deadlineConn) Read(b []byte) (int, error) {
