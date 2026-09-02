@@ -357,11 +357,29 @@ func TestPickControlUDPAddrHonorsPolicyAndDemotion(t *testing.T) {
 	}
 	controlFamilyClear()
 
+	// demoting the OTHER family is the assertion that actually distinguishes
+	// the demotion branch from the IPv4-first Auto default above: Auto alone
+	// already answers v4, so demote(6)+want=v4 above cannot fail if the
+	// demotion branch is deleted. demote(4) must move the pick to v6.
+	controlFamilyDemote(4)
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v6.IP) {
+		t.Fatalf("got %v, want the IPv6 address once IPv4 is demoted", got.IP)
+	}
+	controlFamilyClear()
+
 	// a force wins outright
 	SetControlIpFamilyPolicy(IpFamilyForce4)
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)
 	if got := pickControlIPAddr(addrs); !got.IP.Equal(v4.IP) {
 		t.Fatalf("got %v, want the IPv4 address under force4", got.IP)
+	}
+
+	// force6 is the assertion that distinguishes the force switch from the
+	// IPv4-first Auto default, pinned here at the unit level and not only
+	// through the /etc/hosts-dependent resolveEgressUDPAddr test.
+	SetControlIpFamilyPolicy(IpFamilyForce6)
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v6.IP) {
+		t.Fatalf("got %v, want the IPv6 address under force6", got.IP)
 	}
 }
 
