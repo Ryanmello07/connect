@@ -3,7 +3,6 @@ package connect
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net"
 	"time"
 
@@ -56,8 +55,16 @@ type ConnectSettings struct {
 
 	DialContextSettings *DialContextSettings
 
-	DisableIpv4 bool
-	DisableIpv6 bool
+	// DialNetworkHook, when set, is called at the top of DialContext with the
+	// network string this dial will actually use -- AFTER controlDialNetwork
+	// has resolved it -- and the address.
+	//
+	// Test seam only, and deliberately here rather than on the net.Dialer's
+	// Control callback: Control only ever sees an already-family-specific
+	// network string, so a hook there cannot distinguish a "tcp4" this seam
+	// resolved from a "tcp4" the caller asked for, and cannot observe that
+	// this seam was skipped entirely.
+	DialNetworkHook func(network string, addr string)
 }
 
 type DialContextSettings struct {
@@ -65,38 +72,12 @@ type DialContextSettings struct {
 }
 
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
-	if self.DisableIpv4 && self.DisableIpv6 {
-		return nil, fmt.Errorf("ipv4 and ipv6 are both disabled")
+	network, networkErr := controlDialNetwork(network)
+	if networkErr != nil {
+		return nil, networkErr
 	}
-	switch network {
-	case "tcp":
-		if self.DisableIpv4 {
-			network = "tcp6"
-		} else if self.DisableIpv6 {
-			network = "tcp4"
-		}
-	case "tcp4":
-		if self.DisableIpv4 {
-			return nil, fmt.Errorf("ipv4 is disabled")
-		}
-	case "tcp6":
-		if self.DisableIpv6 {
-			return nil, fmt.Errorf("ipv6 is disabled")
-		}
-	case "udp":
-		if self.DisableIpv4 {
-			network = "udp6"
-		} else if self.DisableIpv6 {
-			network = "udp4"
-		}
-	case "udp4":
-		if self.DisableIpv4 {
-			return nil, fmt.Errorf("ipv4 is disabled")
-		}
-	case "udp6":
-		if self.DisableIpv6 {
-			return nil, fmt.Errorf("ipv6 is disabled")
-		}
+	if hook := self.DialNetworkHook; hook != nil {
+		hook(network, addr)
 	}
 
 	var dialContext DialContextFunction

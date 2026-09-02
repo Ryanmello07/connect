@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // A direct TLS dial must use ConnectSettings.DialContext when one is supplied,
@@ -134,5 +136,60 @@ func TestClientStrategySeamDefaultsAreDisabled(t *testing.T) {
 	}
 	if settings.TlsConfig == nil || settings.TlsConfig.MinVersion < tls.VersionTLS12 {
 		t.Fatal("default strategy lost its production TLS configuration")
+	}
+}
+
+// The MOBILE configuration -- no proxy, no injected dial context -- is the one
+// that took the old fast path and bypassed ConnectSettings.DialContext
+// entirely. That bypass is why DisableIpv4/DisableIpv6 were dead: the flags
+// were honored by the fragment and reorder dialers and ignored by the default
+// one, so the strategy raced a forced dialer against an unforced one.
+//
+// The hook is on ConnectSettings.DialContext -- the seam the family policy
+// lives on -- and records the network string AFTER controlDialNetwork has
+// resolved it. That placement is what makes this test FAIL on unfixed code:
+// with the fast path still present the mobile shape returns a raw tls.Dialer
+// and never calls DialContext at all, so the hook never fires and the test
+// fails on "the seam is still bypassed".
+//
+// A hook on the net.Dialer's Control callback could not do this. Control is
+// documented to receive an already-family-specific network ("tcp4"/"tcp6"),
+// never "tcp", so against an IPv4 literal it records "tcp4" whether or not the
+// bypass was ever closed -- a guard that passes on the unfixed code it exists
+// to catch.
+func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) {
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	settings := DefaultClientStrategySettings()
+	if settings.ProxySettings != nil || settings.DialContextSettings != nil {
+		t.Fatal("the default settings are no longer the mobile shape this test pins")
+	}
+
+	var mutex sync.Mutex
+	var networks []string
+	settings.DialNetworkHook = func(network string, addr string) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		networks = append(networks, network)
+	}
+
+	dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
+	// the address is never reached: 198.51.100.0/24 is TEST-NET-2 and the dial
+	// fails. What is under test is the NETWORK STRING the seam resolved.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := dialTls(ctx, "tcp", "198.51.100.1:443")
+	if err == nil {
+		conn.Close()
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(networks) == 0 {
+		t.Fatal("ConnectSettings.DialContext was never called -- the seam is still bypassed")
+	}
+	if len(networks) != 1 || networks[0] != "tcp4" {
+		t.Fatalf("resolved %v, want exactly [tcp4] under IpFamilyForce4", networks)
 	}
 }

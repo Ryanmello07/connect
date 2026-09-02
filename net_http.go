@@ -215,14 +215,18 @@ func newNormalDialTlsContext(
 	nextProtos []string,
 ) DialTlsContextFunction {
 	tlsConfig := newClientTlsConfig(settings.TlsConfig, nextProtos)
-	if settings.ProxySettings == nil && settings.DialContextSettings == nil {
-		netDialer := settings.NetDialer()
-		tlsDialer := &tls.Dialer{
-			NetDialer: netDialer,
-			Config:    tlsConfig,
-		}
-		return tlsDialer.DialContext
-	}
+	// Every dial takes the explicit path below, including the mobile shape
+	// (no proxy, no injected dial context) that used to shortcut to a raw
+	// tls.Dialer here. That shortcut bypassed ConnectSettings.DialContext, so
+	// the address-family policy expressed there was honored by the fragment
+	// and reorder dialers and ignored by this one -- a strategy that raced a
+	// forced dialer against an unforced one. It also hid the tls handshake,
+	// which is where a blackholed path actually fails.
+	//
+	// The cost is that ConnectTimeout and TlsTimeout are now separate budgets
+	// rather than one deadline shared across connect and handshake. That is
+	// the intended behavior, and it applies to every dial, not only forced
+	// ones.
 
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
 		// DialContext preserves injected userspace networks in tests and proxy
