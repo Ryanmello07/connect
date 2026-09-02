@@ -212,17 +212,25 @@ func (self *forgetfulConn) Close() error {
 	return nil
 }
 
-// The retry is only reachable if the FIRST handshake is bounded to part of the
-// caller's budget. The failure this helper exists to catch is a handshake that
-// stalls until its deadline, so a first attempt allowed to spend the whole
-// request budget hands the retry a context that is already dead.
-func TestFamilyFallbackBoundsTheFirstHandshakeToPartOfTheBudget(t *testing.T) {
+// The first handshake gets the caller's WHOLE remaining budget.
+//
+// It used to get half. The spec's out-of-scope list rules on this directly --
+// of shortening the 15s tls handshake tolerance: "Considered and declined: it
+// would risk false-positive demotion for users on genuinely slow links" -- and
+// halving the caller's budget did exactly that, implicitly and much harder
+// than the version that was declined. gorilla/websocket caps the dial context
+// at Dialer.HandshakeTimeout, which DefaultConnectSettings sets to 5s, so on
+// the platform control websocket -- the path that reconnects most often -- the
+// first handshake was cut at 2.5s and a timeout inside it was treated as proof
+// the family is blackholed.
+func TestFamilyFallbackGivesTheFirstHandshakeTheWholeCallerBudget(t *testing.T) {
 	restore := swapControlFamilyProbe(func(int) bool { return true })
 	defer restore()
 	controlFamilyClear()
 	defer controlFamilyClear()
 
-	callerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 5s is the platform control websocket's real budget
+	callerCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	callerDeadline, _ := callerCtx.Deadline()
 
@@ -243,6 +251,8 @@ func TestFamilyFallbackBoundsTheFirstHandshakeToPartOfTheBudget(t *testing.T) {
 		deadlines = append(deadlines, deadline)
 		mutex.Unlock()
 		if connFamily(conn) == 6 {
+			// the handshake's OWN timeout, not the caller's: this is the
+			// TlsTimeout the spec left at 15s
 			return nil, &timeoutError{}
 		}
 		return conn, nil
@@ -262,25 +272,63 @@ func TestFamilyFallbackBoundsTheFirstHandshakeToPartOfTheBudget(t *testing.T) {
 	if len(deadlines) != 2 {
 		t.Fatalf("handshaked %d times, want 2", len(deadlines))
 	}
-	// half of a 10s budget: the first attempt has to give up with most of the
-	// second half still available to the retry
-	if !deadlines[0].Before(callerDeadline.Add(-4 * time.Second)) {
+	if deadlines[0].Before(callerDeadline) {
 		t.Fatalf(
-			"the first handshake was given until %s of the caller's %s -- no budget is left to retry with",
+			"the first handshake was cut at %s, %s short of the caller's own %s -- "+
+				"a fraction of the caller's budget is a shortened handshake tolerance, "+
+				"which the spec considered and declined",
 			deadlines[0].Format(time.RFC3339Nano),
+			callerDeadline.Sub(deadlines[0]),
 			callerDeadline.Format(time.RFC3339Nano),
 		)
 	}
-	if deadlines[1].Before(deadlines[0]) {
-		t.Fatal("the retry was given less budget than the first attempt")
+}
+
+// The consequence, on the real websocket budget: a handshake that is merely
+// SLOW -- slower than the caller's whole 5s, so the caller's own deadline is
+// what ends it -- must not be read as a blackholed family. Under the halving
+// this demoted at 2.5s with the caller's budget still half unspent.
+func TestFamilyFallbackDoesNotDemoteASlowHandshakeOnTheWebsocketBudget(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	// above 2 * the deleted 2s minimum, so the deleted code took its dividing
+	// branch and demoted; below anything a real caller would call patient
+	callerCtx, cancel := context.WithTimeout(context.Background(), 4500*time.Millisecond)
+	defer cancel()
+
+	attempts := 0
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}, nil
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	_, err := dialControlTlsWithFamilyFallback(
+		callerCtx, "tcp", "api.example:443", dial, handshake)
+	if err == nil {
+		t.Fatal("expected the timeout back")
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1 -- the caller's budget was gone", attempts)
+	}
+	if got := controlFamilyDemotedFamily(); got != 0 {
+		t.Fatalf("ipv%d was demoted by a handshake that only ran out of the "+
+			"caller's own time", got)
 	}
 }
 
-// The real failure is a handshake that STALLS to its deadline -- a blackholed
-// path gives up only when the context does, because the kernel retransmits for
-// minutes. The caller must still receive a working connection, which is only
-// possible if the first attempt left some budget behind.
-func TestFamilyFallbackRecoversFromAHandshakeThatStallsToItsDeadline(t *testing.T) {
+// The failure this helper exists to catch: a handshake that stalls until a
+// deadline of its OWN -- a blackholed path gives up only when something times
+// it out, because the kernel retransmits for minutes -- while the caller still
+// has budget. That is the case the retry can act on, and the caller must
+// receive a working connection.
+func TestFamilyFallbackRecoversFromAHandshakeThatStallsToItsOwnDeadline(t *testing.T) {
 	restore := swapControlFamilyProbe(func(int) bool { return true })
 	defer restore()
 	controlFamilyClear()
@@ -304,9 +352,14 @@ func TestFamilyFallbackRecoversFromAHandshakeThatStallsToItsDeadline(t *testing.
 			return nil, err
 		}
 		if connFamily(conn) == 6 {
-			// the ServerHello never arrives; the handshake ends at the deadline
-			<-ctx.Done()
-			return nil, ctx.Err()
+			// what newNormalDialTlsContext does: the handshake carries its own
+			// TlsTimeout inside the caller's budget. The ServerHello never
+			// arrives and the handshake ends there, with the caller's budget
+			// still alive.
+			handshakeCtx, handshakeCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer handshakeCancel()
+			<-handshakeCtx.Done()
+			return nil, handshakeCtx.Err()
 		}
 		return conn, nil
 	}

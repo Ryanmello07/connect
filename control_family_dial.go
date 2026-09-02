@@ -3,49 +3,7 @@ package connect
 import (
 	"context"
 	"net"
-	"time"
 )
-
-// controlFamilyMinHandshakeBudget is the least time the first handshake may be
-// held to before its timeout stops being evidence about the path. A tls
-// handshake is one to two round trips on top of the connect, and a congested
-// mobile link can spend a second on those, so an attempt cut below a couple of
-// seconds would call a slow link a broken one. When the caller cannot afford
-// this much for the first attempt AND as much again for a retry, the helper
-// does not divide the budget at all and does not demote: there would be
-// nothing left to act on, and a request that merely ran out of time proves
-// nothing.
-const controlFamilyMinHandshakeBudget = 2 * time.Second
-
-// controlFamilyHandshakeBudget bounds the FIRST handshake to half of whatever
-// the caller has left, so that one retry over the other family still fits
-// inside the caller's own deadline. The failure this exists to catch is a
-// handshake that stalls until its deadline -- a blackholed path gives up only
-// when the context does, because the kernel retransmits for minutes -- so a
-// first attempt allowed to spend the whole request budget hands the retry a
-// context that is already dead.
-//
-// The third result reports whether the returned budget is the HANDSHAKE's own.
-// It is false only when the caller's remaining time is too small to divide, in
-// which case a timeout below is the request running out rather than the path
-// failing. That distinction is what keeps a user on a genuinely slow link from
-// having a healthy family demoted for five minutes.
-func controlFamilyHandshakeBudget(
-	ctx context.Context,
-) (context.Context, context.CancelFunc, bool) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		// no budget to divide, and no caller deadline that could be mistaken
-		// for the handshake's own
-		return ctx, func() {}, true
-	}
-	half := time.Until(deadline) / 2
-	if half < controlFamilyMinHandshakeBudget {
-		return ctx, func() {}, false
-	}
-	handshakeCtx, cancel := context.WithTimeout(ctx, half)
-	return handshakeCtx, cancel, true
-}
 
 // dialControlTlsWithFamilyFallback performs a control-plane dial and its
 // handshake, and retries ONCE over the other address family when the handshake
@@ -57,11 +15,22 @@ func controlFamilyHandshakeBudget(
 // Eyeballs cannot see it: it races only the tcp handshake, so the broken family
 // WINS the race and then stalls.
 //
-// The first handshake is held to half the caller's remaining budget so the
-// retry has the other half to work in and the caller receives a working
-// connection. A timeout that arrives with the caller's own budget already
-// spent is NOT counted: that is a request running out of time, which says
-// nothing about the family, and there would be no time to retry either way.
+// The first handshake gets the caller's WHOLE remaining budget. An earlier
+// version gave it half, so that a retry would always fit; that quietly
+// shortened the tls handshake tolerance the spec had considered and declined
+// to shorten ("it would risk false-positive demotion for users on genuinely
+// slow links"), and by far more than the spec had contemplated -- the platform
+// control websocket's dial context is capped at HandshakeTimeout, 5s, so the
+// first handshake got 2.5s and any handshake slower than that was read as
+// proof of a blackholed path. A congested mobile link with a pinned P-384
+// chain reaches 2.5s without anything being wrong.
+//
+// A timeout that arrives with the caller's own budget already spent is NOT
+// counted: that is a request running out of time, which says nothing about
+// the family, and there would be no time to retry either way. What remains to
+// trigger a demotion is a handshake that hits its OWN timeout (TlsTimeout, the
+// tolerance the spec set) while the caller still has budget left, which is
+// also the only case where a retry has anywhere to run.
 //
 // Exactly one retry, and only to the other family. The caller already sits
 // inside the client strategy's serial and parallel dialer evaluation under a
@@ -88,9 +57,7 @@ func dialControlTlsWithFamilyFallback(
 	// we are about to lose is the whole point of the exercise.
 	failed := connFamily(conn)
 
-	handshakeCtx, cancelHandshake, handshakeOwnsBudget := controlFamilyHandshakeBudget(ctx)
-	tlsConn, err := handshake(handshakeCtx, conn)
-	cancelHandshake()
+	tlsConn, err := handshake(ctx, conn)
 	if err == nil {
 		return tlsConn, nil
 	}
@@ -116,7 +83,7 @@ func dialControlTlsWithFamilyFallback(
 	// the timeout has to be the handshake's own. A caller whose budget is
 	// gone gets no strike and no retry -- the strike records what this helper
 	// is about to test, and it cannot test anything with no time left.
-	if !handshakeOwnsBudget || ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return nil, err
 	}
 	if !controlFamilyDemote(failed) {
