@@ -9,26 +9,23 @@
 // DISTINCT PUBLISHED ANSWERS the implementation is held against, not the count of calls made.
 // This project has already shipped a generate direction that shared its serializer with the
 // consume direction and therefore proved nothing; the three directions below share no serializer
-// with each other:
+// with each other.
 //
-//   - keygen           seed -> pk         full KAT. holds the SHAKE-256 expansion, the ML-KEM
-//                                         key generation and this package's own pk_M ‖ pk_X
-//                                         encoder against published octets.
-//   - decapsulation    (seed, ct) -> ss   full KAT, on a ciphertext this package did not
-//                                         produce. transitively pins the ct split, ML-KEM
-//                                         decapsulation, the x25519 dh, and the combiner
-//                                         including the label's position. it does NOT read this
-//                                         package's public key encoder, which is why it and the
-//                                         keygen direction are independent.
-//   - encapsulation    eseed -> ct_X      full KAT for the x25519 half.
-//   - encapsulation    eseed -> ct_M      NOT reachable: crypto/mlkem's Encapsulate takes no
-//                                         randomness and returns no error, so ML-KEM's
-//                                         derandomized encapsulation is not exposed by the
-//                                         standard library. it is covered by round trip in
-//                                         xwing_test.go and by the standard library's own FIPS
-//                                         203 ACVP tests. re-implementing ML-KEM to close that
-//                                         gap would mean shipping new crypto, which the global
-//                                         constraints forbid outright.
+// keygen, seed -> pk. A full known answer test. It holds the SHAKE-256 expansion, the ML-KEM key
+// generation and this package's own pk_M then pk_X encoder against published octets.
+//
+// decapsulation, (seed, ct) -> ss. A full known answer test, on a ciphertext this package did not
+// produce. It transitively pins the ciphertext split, ML-KEM decapsulation, the x25519 dh, and the
+// combiner including the label's position. It does NOT read this package's public key encoder,
+// which is why it and the keygen direction are independent rather than two readings of one path.
+//
+// encapsulation, eseed -> ct_X. A full known answer test for the x25519 half.
+//
+// encapsulation, eseed -> ct_M. NOT REACHABLE. crypto/mlkem's Encapsulate takes no randomness and
+// returns no error, so ML-KEM's derandomized encapsulation is not exposed by the standard library.
+// It is covered by round trip in xwing_test.go and by the standard library's own FIPS 203 ACVP
+// tests. Re-implementing ML-KEM to close that gap would mean shipping new crypto, which the global
+// constraints forbid outright.
 //
 // The gap above is the one place this file cannot hold the draft, and it is stated rather than
 // left for a reader to discover by counting.
@@ -186,14 +183,40 @@ func TestXwingVectorEncapsulateX25519Half(t *testing.T) {
 // ── what the vector gate is actually worth, measured rather than claimed ─────────────
 
 // One comparison the gate makes against a value the draft published.
+//
+// It carries what this package PRODUCED and the corpus field the answer belongs to, and it does
+// NOT carry the published bytes. That is deliberate and it is the difference between a gate and
+// a gate that can be made vacuous by one line: a collector that also decided what the answer
+// should be could set the two equal to each other, and every count below would still read nine.
+// The published side is computed from the file by xwingPublishedValue, which has no access to
+// anything this package produced, so the only way to satisfy a comparison is to match the file.
 type xwingPublishedAnswer struct {
 	vector int
-	// the field of the vector the answer was read out of
+	// the field of the vector the answer belongs to
 	field string
 	// what the answer is about: this implementation's output, or the corpus itself
 	holdsTheImplementation bool
-	want                   []byte
 	got                    []byte
+}
+
+// The bytes one field of one vector publishes as an answer, read out of the corpus and nowhere
+// else. ct is the one field that is an input AND an answer: the whole 1120 octets go in, and the
+// last 32 of them are ct_X, which is the half of encapsulation the standard library lets this
+// package be held to.
+func xwingPublishedValue(t *testing.T, vector xwingVector, field string) []byte {
+	t.Helper()
+	switch field {
+	case "sk":
+		return mustHexBytes(t, vector.Sk)
+	case "pk":
+		return mustHexBytes(t, vector.Pk)
+	case "ss":
+		return mustHexBytes(t, vector.Ss)
+	case "ct":
+		return mustHexBytes(t, vector.Ct)[XwingMlkemCiphertextSize:]
+	}
+	t.Fatalf("the gate recorded an answer about the field %q and this function publishes no value for it", field)
+	return nil
 }
 
 // Every published answer the gate holds this package against, together with which of the
@@ -214,8 +237,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 
 		// the corpus's own claim about itself, which is not a statement about this package
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "sk", holdsTheImplementation: false,
-			want: mustHexBytes(t, vector.Sk), got: seed,
+			vector: i, field: "sk", holdsTheImplementation: false, got: seed,
 		})
 
 		priv, err := XwingKeyGenFromSeed(seed)
@@ -223,8 +245,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 			t.Fatalf("vector %d keygen: %v", i, err)
 		}
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "pk", holdsTheImplementation: true,
-			want: mustHexBytes(t, vector.Pk), got: priv.Public().Bytes(),
+			vector: i, field: "pk", holdsTheImplementation: true, got: priv.Public().Bytes(),
 		})
 
 		ct := mustHexBytes(t, vector.Ct)
@@ -234,8 +255,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 			t.Fatalf("vector %d decapsulate: %v", i, err)
 		}
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "ss", holdsTheImplementation: true,
-			want: mustHexBytes(t, vector.Ss), got: shared,
+			vector: i, field: "ss", holdsTheImplementation: true, got: shared,
 		})
 
 		eseed := mustHexBytes(t, vector.Eseed)
@@ -245,8 +265,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 			t.Fatalf("vector %d ephemeral: %v", i, err)
 		}
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "ct", holdsTheImplementation: true,
-			want: ct[XwingMlkemCiphertextSize:], got: ephemeral,
+			vector: i, field: "ct", holdsTheImplementation: true, got: ephemeral,
 		})
 	}
 	return answers, consumed
@@ -256,24 +275,32 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 // above are three directions and not one written three ways.
 //
 // Nine is three vectors times the three answers the standard library lets this package be held
-// to. The assertion is on the number of DISTINCT published byte strings, so a gate that compared
-// the same answer nine times, or that compared a value this package itself produced, reports
-// fewer than nine and fails -- which is the shape of vacuous vector gate this project keeps
-// finding. The count of CALLS is not asserted anywhere, because a call count is satisfied by
-// nine copies of one comparison.
+// to. Every published side is recomputed HERE, out of the corpus, rather than taken from the
+// collector, so a comparison cannot be satisfied by anything this package produced. The
+// assertion is then on the number of DISTINCT published byte strings: a gate that compared the
+// same answer nine times reports fewer than nine and fails. The count of CALLS is not asserted
+// anywhere, because a call count is satisfied by nine copies of one comparison.
 func TestXwingIsHeldAgainstNineDistinctPublishedAnswers(t *testing.T) {
+	vectors := loadXwingVectors(t)
 	answers, _ := xwingHoldAgainstTheDraft(t)
 	distinct := map[string]bool{}
 	held := 0
 	for _, answer := range answers {
-		if !bytes.Equal(answer.got, answer.want) {
-			t.Errorf("vector %d, %s: got %x, want %x", answer.vector, answer.field, answer.got, answer.want)
+		if answer.vector < 0 || answer.vector >= len(vectors) {
+			t.Fatalf("the gate recorded an answer about vector %d and the corpus has %d", answer.vector, len(vectors))
+		}
+		want := xwingPublishedValue(t, vectors[answer.vector], answer.field)
+		if len(want) == 0 {
+			t.Fatalf("vector %d publishes nothing for %s, so that comparison is against an empty string", answer.vector, answer.field)
+		}
+		if !bytes.Equal(answer.got, want) {
+			t.Errorf("vector %d, %s: got %x, want %x", answer.vector, answer.field, answer.got, want)
 		}
 		if !answer.holdsTheImplementation {
 			continue
 		}
 		held++
-		distinct[string(answer.want)] = true
+		distinct[string(want)] = true
 	}
 	if held != 3*xwingVectorCount {
 		t.Errorf("the gate holds this package against %d published answers, want %d", held, 3*xwingVectorCount)
