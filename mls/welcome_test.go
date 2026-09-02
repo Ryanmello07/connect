@@ -1126,6 +1126,43 @@ func TestAGroupInfoCarriedRatchetTreeMustDescribeTheTreeItIsVerifiedAgainst(t *t
 		}
 	}
 
+	// a foreign tree whose hash AGREES with this tree's in its FIRST OCTET, searched for rather
+	// than written down. Without it a rule 9 comparison narrowed to a prefix refuses a tree drawn
+	// at random 255 times in 256, so the row above passes over it and reports a clean run -- which
+	// is the exact defect TestGroupInfoVerifyComparesTheWholeTreeHash measured of the rule 4
+	// comparison, and for an attacker who wants a carried tree adopted it is a one octet search.
+	//
+	// Drawn rather than constructed because a tree hash cannot be steered: the loop keeps drawing
+	// four leaf trees until one collides in that octet and differs overall, which takes 256 draws
+	// on average, and an exhausted loop is fatal rather than skipped.
+	ownHash, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("TreeHash: %v", err)
+	}
+	var colliding *RatchetTree
+	for attempt := 0; attempt < 8192 && colliding == nil; attempt += 1 {
+		candidate, _ := newTestTree(t, crypto, 4)
+		hash, err := candidate.TreeHash(crypto)
+		if err != nil {
+			t.Fatalf("TreeHash of a candidate tree: %v", err)
+		}
+		if hash[0] == ownHash[0] && !bytes.Equal(hash, ownHash) {
+			colliding = candidate
+		}
+	}
+	if colliding == nil {
+		t.Fatal("no four leaf tree colliding with this one in the first octet of its tree hash turned up in 8192 draws, so this row measures nothing")
+	}
+	collidingExtension, err := colliding.Encode()
+	if err != nil {
+		t.Fatalf("encode the colliding tree as a ratchet_tree extension: %v", err)
+	}
+	if err := signedOver(t, []Extension{collidingExtension}).Verify(crypto, tree); !errors.Is(err,
+		ErrWelcomeCarriedTreeMismatch) {
+		t.Errorf("a group info carrying a tree whose hash agrees with this one's first octet answered %v, want ErrWelcomeCarriedTreeMismatch; a rule 9 comparison that reads a prefix accepts a carried tree an attacker searched one octet for",
+			err)
+	}
+
 	// two of them is the extensions vector being illegal rather than the tree being wrong, and it
 	// is FindExtensionEntry's refusal because that lookup is this package's ONE door for a
 	// repeated extension type -- a second walk written here would be a second selection rule
