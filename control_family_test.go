@@ -667,3 +667,61 @@ func TestEgressBoundIPAddrOverridesForceWhenSingleFamilyBound(t *testing.T) {
 		t.Fatalf("got %v, want the v6-bound address to override force4", got.IP)
 	}
 }
+
+// A demotion learned on one path must not be applied unchecked on the next.
+//
+// The ledger's only invalidation is AddNetworkChangeListener(controlFamilyClear),
+// and connect.NetworkChanged() has exactly one caller in the whole tree --
+// DeviceLocal. On ios that means the listener fires in the network extension
+// and NEVER in the app process, which is the process that dials pre-login and
+// whenever the tunnel is down: regimes 1 and 3 of the design's own table, and
+// the state a user is in when they open the Developer menu to fix this. Android
+// registers its callbacks from initDevice, so it is exposed the same way while
+// signed out. So an app-process demotion could stand for up to six hours with
+// no path change ever clearing it.
+//
+// The self-inflicted-outage guard is therefore evaluated on USE as well as on
+// record: a demotion can never be applied on a path where recording it would
+// have been refused.
+func TestADemotionIsRevalidatedOnUseNotOnlyWhenRecorded(t *testing.T) {
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	// learned on a dual-stack wifi with a broken HE ipv6 path
+	restoreDualStack := swapControlFamilyProbe(func(int) bool { return true })
+	if !controlFamilyDemote(6) {
+		t.Fatal("expected the demotion to take on a dual-stack path")
+	}
+	if got, _ := controlDialNetwork("tcp", "api.example:443"); got != "tcp4" {
+		t.Fatalf("precondition: controlDialNetwork = %q, want tcp4", got)
+	}
+	restoreDualStack()
+
+	// the user joins an ipv6-only cellular / NAT64 network. No NetworkChanged()
+	// arrives, because in this process nothing can call it.
+	restore := swapControlFamilyProbe(func(family int) bool { return family == 6 })
+	defer restore()
+
+	if got := controlFamilyDemotedFamily(); got != 0 {
+		t.Fatalf("ipv%d is still demoted on a path with no ipv4 at all", got)
+	}
+	network, err := controlDialNetwork("tcp", "api.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if network != "tcp" {
+		t.Fatalf("narrowed to %q on a path with no ipv4 -- every control dial "+
+			"would fail with no route until the backoff expired", network)
+	}
+	if got := controlFamilyStatus(); got != "" {
+		t.Fatalf("status %q describes a demotion the dialer is no longer acting on", got)
+	}
+	if got := pickControlIPAddr([]net.IPAddr{
+		{IP: net.ParseIP("2001:db8::1")},
+		{IP: net.ParseIP("192.0.2.1")},
+	}); !got.IP.Equal(net.ParseIP("192.0.2.1")) {
+		// auto with nothing live ties toward ipv4; the assertion that matters
+		// is that the stale demotion of 6 is not steering this pick
+		t.Fatalf("h3/quic pick %v is still steered by the stale demotion", got.IP)
+	}
+}

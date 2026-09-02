@@ -273,23 +273,74 @@ func controlFamilyClear() {
 // reported, because narrowing to a family we also believe is broken is worse
 // than letting the platform race them.
 func controlFamilyDemotedFamily() int {
-	controlFamilyLedger.mu.Lock()
-	defer controlFamilyLedger.mu.Unlock()
-	now := controlFamilyLedger.now()
-	live := 0
-	for family, entry := range controlFamilyLedger.demoted {
-		if now.Before(entry.until) {
-			if live != 0 {
-				return 0
-			}
-			live = family
-		}
-	}
-	return live
+	family, _, _ := controlFamilyLiveDemotion()
+	return family
 }
 
-// controlFamilyDemotedUntil is the expiry for a family, zero when not demoted.
-// Exists for the tests and for the status line.
+// controlFamilyLiveDemotion returns the family currently demoted, its entry,
+// and the clock reading both were judged against.
+//
+// The self-inflicted-outage guard is RE-EVALUATED here, on every read, and not
+// only when the demotion was recorded. A demotion that was safe on the path it
+// was learned on is not necessarily safe on the next one, and the ledger's only
+// invalidation does not reach every process that keeps one:
+// connect.NetworkChanged() has exactly one caller in the tree, DeviceLocal, so
+// on ios the listener fires in the network extension and never in the APP
+// process -- which is the process that dials pre-login and whenever the tunnel
+// is down, the two regimes in the design's own table where a user is most
+// likely to be stuck. Android registers its callbacks from initDevice, so it is
+// exposed the same way while signed out.
+//
+// Checking on use rather than only on record closes that on every platform at
+// once, without needing the host to tell us anything, and it is strictly
+// stronger than a new invalidation signal would be: a demotion can never be
+// APPLIED on a path where RECORDING it would have been refused. It costs a
+// probe only while a demotion is live -- the rare case, and one where the
+// client is already on a degraded path.
+//
+// An entry that fails the check is dropped rather than merely ignored, so the
+// status line the developer ui reads agrees with what the dialer does, and so a
+// path that stays broken is not re-probed on every dial.
+func controlFamilyLiveDemotion() (int, controlFamilyDemotion, time.Time) {
+	controlFamilyLedger.mu.Lock()
+	now := controlFamilyLedger.now()
+
+	live := 0
+	var entry controlFamilyDemotion
+	for family, candidate := range controlFamilyLedger.demoted {
+		if !now.Before(candidate.until) {
+			continue
+		}
+		if live != 0 {
+			controlFamilyLedger.mu.Unlock()
+			return 0, controlFamilyDemotion{}, now
+		}
+		live, entry = family, candidate
+	}
+	if live == 0 {
+		controlFamilyLedger.mu.Unlock()
+		return 0, controlFamilyDemotion{}, now
+	}
+
+	other := 4
+	if live == 4 {
+		other = 6
+	}
+	if controlFamilyLedger.probe(other) {
+		controlFamilyLedger.mu.Unlock()
+		return live, entry, now
+	}
+	delete(controlFamilyLedger.demoted, live)
+	controlFamilyLedger.mu.Unlock()
+
+	loggerOrDefault(nil).Infof(
+		"[family]undemote family=%d (ipv%d is not usable on this path)\n", live, other)
+	return 0, controlFamilyDemotion{}, now
+}
+
+// controlFamilyDemotedUntil is the raw expiry recorded for a family, zero when
+// none is. Unlike controlFamilyLiveDemotion it applies no guard and no expiry
+// check -- it reports what was written. Exists for the tests.
 func controlFamilyDemotedUntil(family int) time.Time {
 	controlFamilyLedger.mu.Lock()
 	defer controlFamilyLedger.mu.Unlock()
@@ -301,23 +352,18 @@ func controlFamilyDemotedUntil(family int) time.Time {
 // place of it: a row that read "Force IPv4" because the heuristic fired could
 // not be set back to Auto.
 func controlFamilyStatus() string {
-	controlFamilyLedger.mu.Lock()
-	defer controlFamilyLedger.mu.Unlock()
-	now := controlFamilyLedger.now()
-	parts := []string{}
-	for _, family := range []int{4, 6} {
-		entry, ok := controlFamilyLedger.demoted[family]
-		if !ok || !now.Before(entry.until) {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf(
-			"IPv%d demoted for %s (%d strikes)",
-			family,
-			entry.until.Sub(now).Round(time.Minute),
-			entry.strikes,
-		))
+	// the same read the dialer takes, so the row cannot report a demotion that
+	// is no longer being acted on
+	family, entry, now := controlFamilyLiveDemotion()
+	if family == 0 {
+		return ""
 	}
-	return strings.Join(parts, ", ")
+	return fmt.Sprintf(
+		"IPv%d demoted for %s (%d strikes)",
+		family,
+		entry.until.Sub(now).Round(time.Minute),
+		entry.strikes,
+	)
 }
 
 // controlFamilyInterface is one interface as the probe needs to see it: a
