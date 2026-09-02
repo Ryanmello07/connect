@@ -565,17 +565,22 @@ const AlgIdXwing uint16 = 0x0014
 // TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded, because both documents are prose
 // this package could copy a digit wrong out of and neither fails when it does.
 //
-// It will be duplicated in ../message on purpose and in one direction only, because mls must
-// not import message. That copy has NOT landed: no XwingPublicKeySize is declared anywhere in
-// this tree, and neither is the compile assertion p2 task 22 is titled after, so at this
-// moment there is no cross package pin on this number at all. Which is exactly why the
-// derivation above is stated here, against crypto/mlkem and crypto/ecdh, rather than left to
-// an assertion nobody has written yet.
+// It is duplicated in ../message on purpose and in one direction only, because mls must not
+// import message. That copy landed with p2 tasks 19 and 20 as message.XwingPublicKeySize, and it
+// carries its own pin: message/xwing.go declares the difference between the two constants as an
+// array length in BOTH directions, so a tree in which they disagree does not build. The same
+// pair of lines pins message.XwingAlgId to AlgIdXwing above, which is the same duplication one
+// registry over and was under nothing until then. p2 task 22 adds the test that names the first
+// of those two pins; the compile assertion is what actually holds it, and it holds without any
+// test running at all.
+//
+// The derivation above is stated here anyway, against crypto/mlkem and crypto/ecdh, because a
+// compile assertion says the two copies AGREE and says nothing about whether either is right.
 //
 // The pin is not left to anybody's memory either.
 // TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere derives every
-// X-Wing named declaration of this package and of ../message and fails on the commit that
-// lands a second statement of this size, which is the commit where the assertion has to be
+// X-Wing named declaration of this package and of ../message and fails on the commit that lands
+// a third statement of this size, which is the commit where a third pin would have to be
 // written.
 const XwingPublicKeyLen = 1216
 

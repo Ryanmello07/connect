@@ -7385,26 +7385,64 @@ func TestEveryProviderConstructorHoldsTheSourceItWasGiven(t *testing.T) {
 // passed all 2284 tests. Task 20 lands X-Wing key generation over a seed in exactly that
 // package.
 //
-// Measured when this was written: message declares no function at all, so the class outside
-// this package is empty and the residual is the tripwire itself. It is not vacuous through
-// a broken walk: rootSourcePaths refuses a root holding no non test source, and the type
-// check of that root is fatal if it does not complete.
+// Task 20 landed, so the class outside this package is no longer empty and the tripwire is no
+// longer the whole of the residual. What answers each member is the table below: the refusal is
+// held in the declaring package's own tests, this names which test holds it, and the gate reads
+// that package's declarations to check the name resolves. A row that named nothing checkable
+// would have moved the problem into a comment, which is what the tripwire was avoiding.
+//
+// It is not vacuous through a broken walk: rootSourcePaths refuses a root holding no non test
+// source, the type check of that root is fatal if it does not complete, and
+// packageLevelDeclarations refuses a directory holding no go file.
+
+// Every entropy taking declaration outside this package, with the test in that package's own
+// tests that holds its refusal of a nil source.
+//
+// The CLASS is derived and only the answers are written down. It is read off io.Reader by the
+// type checker, over every root the guardrails walk but this one, so a function added there is
+// in it whatever its parameter is called and whatever file it is in. This table is held to that
+// class in BOTH directions below, and each row's test name is resolved against the declaring
+// package, so there are three ways to fail and none of them is a stale label: a member with no
+// row, a row with no member, and a row naming a test that package does not declare.
+var entropyRefusalsHeldOutsideThisPackage = map[string]string{
+	"XwingGenerateKey": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
+	"XwingEncapsulate": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
+}
+
 func TestNoEntropyTakingFunctionLivesWhereThisGateCannotCallIt(t *testing.T) {
 	source := entropySourceType(t)
+	found := map[string]bool{}
 	for _, root := range forbiddenScanRoots {
 		if root == cryptoOwnRoot {
 			continue
 		}
+		declaredThere := packageLevelDeclarations(t, root)
 		for _, declared := range declaredFunctionsOf(t, root) {
 			if len(declared.takes(source)) == 0 {
 				continue
 			}
-			t.Errorf("%s declares %s, which takes an entropy source and is outside the package "+
-				"TestEveryEntropyTakingFunctionRefusesANilSource can call into: hold its refusal in "+
-				"that package's own tests, and extend this gate to name where that is held",
-				root, declared.name)
+			found[declared.name] = true
+			holder, classified := entropyRefusalsHeldOutsideThisPackage[declared.name]
+			if !classified {
+				t.Errorf("%s declares %s, which takes an entropy source and is outside the package "+
+					"TestEveryEntropyTakingFunctionRefusesANilSource can call into: hold its refusal in "+
+					"that package's own tests, and name that test in entropyRefusalsHeldOutsideThisPackage",
+					root, declared.name)
+				continue
+			}
+			if _, resolves := declaredThere[holder]; !resolves {
+				t.Errorf("entropyRefusalsHeldOutsideThisPackage says %s's refusal is held by %s and %s declares no test under that name, so that row names nothing and the refusal is held by a comment",
+					declared.name, holder, root)
+			}
 		}
 	}
+	for _, name := range slices.Sorted(maps.Keys(entropyRefusalsHeldOutsideThisPackage)) {
+		if !found[name] {
+			t.Errorf("entropyRefusalsHeldOutsideThisPackage carries a row for %s and no root outside this package declares it taking an entropy source, so this table describes a tree that no longer exists",
+				name)
+		}
+	}
+	t.Logf("%d entropy taking declarations outside this package, each answered by a test that package declares", len(found))
 }
 
 // Nothing on the provider surface reaches another source when the caller's runs dry.
@@ -7523,12 +7561,24 @@ var cryptoImportPaths = []string{
 	`"crypto/ed25519"`,
 	`"crypto/hkdf"`,
 	`"crypto/hmac"`,
+	// crypto/mlkem and crypto/sha3 are ../message's X-Wing: ML-KEM-768 with the seed
+	// construction draft-connolly-cfrg-xwing-kem section 5.2 needs, the SHAKE-256 that expands
+	// that seed, and the SHA3-256 the combiner is. Both are standard library, both are pure go
+	// and neither consults the environment, which is the property this list exists to keep true.
+	// They arrived with p2 tasks 19 and 20 and are written down here on the same terms as fmt.
+	`"crypto/mlkem"`,
 	`"crypto/rand"`,
 	`"crypto/sha256"`,
+	`"crypto/sha3"`,
 	`"crypto/subtle"`,
 	`"encoding/binary"`,
 	`"errors"`,
 	`"fmt"`,
+	// mls itself, reached from ../message and in that direction only. It is what keeps the one
+	// reviewed ECDH call site in the tree: X-Wing's x25519 half goes through X25519GenerateKey,
+	// X25519PrivateKey, X25519PublicKey and X25519DH rather than through crypto/ecdh, so the
+	// low order point refusal those wrap cannot be bypassed by writing the exchange again.
+	`"github.com/urnetwork/connect/mls"`,
 	`"github.com/urnetwork/connect/mls/syntax"`,
 	`"golang.org/x/crypto/chacha20poly1305"`,
 	`"io"`,

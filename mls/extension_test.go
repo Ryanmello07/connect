@@ -2739,13 +2739,13 @@ func exportedSymbolsHandingOutABodyIn(parsed parsedSource, bodies []string, byte
 // made it necessary. This is the base name exemption this project keeps rediscovering, kept
 // off by keying on the qualified name and by expiring on failure.
 var extensionBodyByteRunsThatAreNotBodies = map[string]string{
-	"NewKeyPackage": "answers the two HPKE private halves of a fresh key package -- an init key and a leaf encryption key, one X25519 scalar each -- which are keys and not extension bodies, and no tag exists that would make a KEM scalar readable as any extension of this package. It reaches the encoder because the KeyPackageTBS it signs is assembled through marshalBytes, and that preimage is signed and discarded inside the call, exactly as the four tree hashes above hash and discard theirs. Unlike PskSecret's entry this is a REAL edge rather than a name collision: this constructor does reach the encoder, and what it answers is simply not a body",
-	"(*RatchetTree).NodeTreeHash": "answers the RFC 9420 section 7.8 tree hash of one subtree, which is KDF.Nh octets of digest and not a ratchet_tree body; the TreeHashInput preimage the encoder assembles is hashed and discarded inside the call, and no tag exists that would make a bare digest readable as any extension of this package",
-	"(*RatchetTree).TreeHash":     "answers the section 7.8 tree hash of the whole tree, which is what GroupContext.TreeHash is set from; the same argument as NodeTreeHash, and the signature is the one the key schedule and the group lifecycle plans compile against rather than one this package is free to change",
-	"(*RatchetTree).TreeHashes":   "answers the section 7.8 tree hash of every node, which is the column the tree-validation corpus publishes and the one a parent hash check reads; the same argument as the two above, one level of slicing out -- KDF.Nh octets of digest per node, and a slice of digests is no more a body than one of them is",
-	"(*RatchetTree).ParentHash":   "answers the RFC 9420 section 7.9 parent hash of one node, which is KDF.Nh octets of digest and not a ratchet_tree body; the ParentHashInput preimage the encoder assembles is hashed and discarded inside the call, and the value that leaves is the one a LeafNode.parent_hash field and a ParentNode.parent_hash field are compared against -- the same argument as the three tree hashes above, whose preimages this one is built out of",
+	"NewKeyPackage":                   "answers the two HPKE private halves of a fresh key package -- an init key and a leaf encryption key, one X25519 scalar each -- which are keys and not extension bodies, and no tag exists that would make a KEM scalar readable as any extension of this package. It reaches the encoder because the KeyPackageTBS it signs is assembled through marshalBytes, and that preimage is signed and discarded inside the call, exactly as the four tree hashes above hash and discard theirs. Unlike PskSecret's entry this is a REAL edge rather than a name collision: this constructor does reach the encoder, and what it answers is simply not a body",
+	"(*RatchetTree).NodeTreeHash":     "answers the RFC 9420 section 7.8 tree hash of one subtree, which is KDF.Nh octets of digest and not a ratchet_tree body; the TreeHashInput preimage the encoder assembles is hashed and discarded inside the call, and no tag exists that would make a bare digest readable as any extension of this package",
+	"(*RatchetTree).TreeHash":         "answers the section 7.8 tree hash of the whole tree, which is what GroupContext.TreeHash is set from; the same argument as NodeTreeHash, and the signature is the one the key schedule and the group lifecycle plans compile against rather than one this package is free to change",
+	"(*RatchetTree).TreeHashes":       "answers the section 7.8 tree hash of every node, which is the column the tree-validation corpus publishes and the one a parent hash check reads; the same argument as the two above, one level of slicing out -- KDF.Nh octets of digest per node, and a slice of digests is no more a body than one of them is",
+	"(*RatchetTree).ParentHash":       "answers the RFC 9420 section 7.9 parent hash of one node, which is KDF.Nh octets of digest and not a ratchet_tree body; the ParentHashInput preimage the encoder assembles is hashed and discarded inside the call, and the value that leaves is the one a LeafNode.parent_hash field and a ParentNode.parent_hash field are compared against -- the same argument as the three tree hashes above, whose preimages this one is built out of",
 	"(*GroupPolicyExtension).OwnerId": "answers the OWNER'S MEMBER ID out of a group policy, which is an Ed25519 identity public key -- one FIELD read out of the structure -- and not a urmessage_group_policy body; no tag exists that would make an identity key readable as any extension of this package, and pairing it with 0xF001 produces an entry the first peer to read it refuses rather than one it misreads. It is reported for a reason the four tree hashes above share: the rule reads the RESULT, an exported method of a body type answering a byte run, and nothing a declaration scan can see says which of the type's fields the run came from. The signature is the interface registry's and this task does not own it",
-	"PskSecret":                   "answers the RFC 9420 section 8.4 psk_secret, which is KDF.Nh octets of key schedule output and not an extension body; the PSKLabel preimage it assembles is built on a Writer marshalPskLabel opens for itself and never goes through the encoder this package's extension bodies are built with. It is in this table for a MECHANICAL reason rather than a judgement about what the bytes are, and that is the difference from the four above: it entered the closure on the commit that landed (*RatchetTree).Validate, because the closure is keyed by NAME and this package now declares three unrelated methods spelled Validate -- LeafNode's, PreSharedKeyId's and the ratchet tree's -- of which only the third reaches the encoder, while PskSecret calls the second. TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse holds it to exactly that account, so the entry expires the moment the reach becomes a real one",
+	"PskSecret":                       "answers the RFC 9420 section 8.4 psk_secret, which is KDF.Nh octets of key schedule output and not an extension body; the PSKLabel preimage it assembles is built on a Writer marshalPskLabel opens for itself and never goes through the encoder this package's extension bodies are built with. It is in this table for a MECHANICAL reason rather than a judgement about what the bytes are, and that is the difference from the four above: it entered the closure on the commit that landed (*RatchetTree).Validate, because the closure is keyed by NAME and this package now declares three unrelated methods spelled Validate -- LeafNode's, PreSharedKeyId's and the ratchet tree's -- of which only the third reaches the encoder, while PskSecret calls the second. TestThePskSecretExemptionIsAReachThroughACollidingMethodNameAndNothingElse holds it to exactly that account, so the entry expires the moment the reach becomes a real one",
 }
 
 // extensionBodyByteRunsReportedByEitherRule is the union of what the two rules below report
@@ -3607,16 +3607,42 @@ func xwingNamedDeclarationsIn(t *testing.T, dir string) map[string]string {
 // makes it a classification rather than a list: a new one cannot land without being written
 // down here, and one written down here cannot survive the declaration going away.
 //
-// The reason it is worth a gate at all is that XwingPublicKeyLen has no compile time pin across
-// the package boundary and will not have one until p2 task 22 lands message.XwingPublicKeySize
-// and the assertion that the two agree. Until then the only thing holding the number is the
-// derivation against crypto/mlkem and crypto/ecdh in
-// TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded, which is real but says nothing about
-// a second copy. So the commit that lands the second copy fails here, and the message it fails
-// with is what to do about it.
+// The reason it is worth a gate at all is that XwingPublicKeyLen is stated twice, once here and
+// once as message.XwingPublicKeySize, and nothing the compiler does across a package boundary
+// notices a disagreement on its own. The second copy landed with p2 tasks 19 and 20 and brought
+// its pin with it: message/xwing.go declares the difference in both directions as an array
+// length, so a tree in which the two disagree fails to build. This gate is what forced that to
+// be written on the commit that landed the copy rather than on a later one, and it is what will
+// force the same of a third statement of the size, in either package, whenever one arrives.
 var xwingNamedDeclarationsOfBothPackages = map[string]string{
-	"AlgIdXwing":        "the wrap KEM code point, 0x0014, and not a size",
-	"XwingPublicKeyLen": "the encapsulation key size, derived against crypto/mlkem and crypto/ecdh by TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded",
+	"AlgIdXwing":                "the wrap KEM code point, 0x0014, and not a size",
+	"XwingPublicKeyLen":         "the encapsulation key size, derived against crypto/mlkem and crypto/ecdh by TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded",
+	"XwingPublicKeySize":        "../message's second statement of the encapsulation key size, pinned to XwingPublicKeyLen at COMPILE time by the array length declarations in message/xwing.go",
+	"XwingAlgId":                "../message's second statement of the wrap KEM code point, pinned to AlgIdXwing at COMPILE time beside it",
+	"XwingSeedSize":             "the storable X-Wing private key size, 32, and not the encapsulation key size",
+	"XwingExpandedSize":         "the SHAKE-256 seed expansion length, 96, and not a key size",
+	"XwingMlkemSeedSize":        "the ML-KEM d and z seed length, 64, which is the half of the expansion that is NOT the encapsulation key size",
+	"XwingMlkemPublicKeySize":   "the ML-KEM-768 encapsulation key size, 1184; one addend of XwingPublicKeySize, and held to a key crypto/mlkem actually produced by ../message's own tests",
+	"XwingMlkemCiphertextSize":  "the ML-KEM-768 ciphertext size, 1088, and not a key size",
+	"XwingCiphertextSize":       "the X-Wing ciphertext size, 1120, and not a key size",
+	"XwingSharedSize":           "the shared secret size, 32, and not a key size",
+	"XwingX25519KeySize":        "the x25519 key size, 32; the other addend of XwingPublicKeySize",
+	"xwingLabel":                "XWingLabel, the six ascii bytes the combiner ends with, and not a size",
+	"XwingPrivateKey":           "the private key type, and not a size",
+	"XwingPublicKey":            "the public key type, and not a size",
+	"XwingPrivateKey.Public":    "the private key type's public half, and not a size",
+	"XwingPrivateKey.Seed":      "the private key type's stored seed, and not a size",
+	"XwingPublicKey.Bytes":      "the public key type's pk_M then pk_X encoder, and not a size",
+	"XwingKeyGenFromSeed":       "the draft section 5.2 key generation, and not a size",
+	"XwingGenerateKey":          "key generation over a random source, and not a size",
+	"ParseXwingPublicKey":       "the encapsulation key parser, and not a size",
+	"xwingCombine":              "the draft section 5.3 combiner, and not a size",
+	"XwingEncapsulate":          "the draft section 5.4 encapsulation, and not a size",
+	"XwingDecapsulate":          "the draft section 5.5 decapsulation, and not a size",
+	"ErrXwingBadSeedSize":       "the refusal of a seed that is not XwingSeedSize, and not a second statement of it",
+	"ErrXwingBadPublicKeySize":  "the refusal of a key that is not XwingPublicKeySize, and not a second statement of it",
+	"ErrXwingBadCiphertextSize": "the refusal of a ciphertext that is not XwingCiphertextSize, and not a second statement of it",
+	"ErrXwingInvalidPoint":      "the refusal of an x25519 half that produced no usable secret, and not a size",
 }
 
 // TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere fails on the commit
