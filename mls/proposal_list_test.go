@@ -2318,7 +2318,9 @@ var proposalListOwnedErrors = map[string]error{
 	"errMultipleGroupContextExtensions": errMultipleGroupContextExtensions,
 	"errProposalCacheFull":              errProposalCacheFull,
 	"errProposalCacheSenderQuota":       errProposalCacheSenderQuota,
+	"errProposalCacheTargetQuota":       errProposalCacheTargetQuota,
 	"errProposalCacheOctets":            errProposalCacheOctets,
+	"errProposalCacheSenderOctets":      errProposalCacheSenderOctets,
 	"errAcceptedTypeHasNoCeiling":       errAcceptedTypeHasNoCeiling,
 }
 

@@ -286,21 +286,35 @@ var (
 	errDuplicateProposalReference     = errors.New("mls: a commit names one proposal reference twice")
 	errMultipleGroupContextExtensions = errors.New("mls: a proposal list carries more than one group_context_extensions proposal")
 
-	// THE FOUR CEILING RULES are four values for what a careless reading calls one rule, and
-	// they are four rules with four remedies. errProposalCacheFull is about the EPOCH: this
-	// group has published more proposals than one valid commit list could name, and the remedy
-	// is for somebody to commit. errProposalCacheSenderQuota is about ONE SENDER: that member
-	// has published more of one type than a valid list could carry from it, and the remedy is
-	// to stop trusting the member -- a caller told only "the cache is full" would go looking at
-	// the group. errProposalCacheOctets is about the BYTES, which is a different resource from
-	// the count and is the one an entry ceiling alone does not bound. errAcceptedTypeHasNoCeiling
-	// is about THIS BUILD, exactly as errAcceptedTypeHasNoBucket beside it is: the profile
-	// accepts a type nothing gave a ceiling to, which is a commit that widened the accepted set
-	// and stopped half way.
-	errProposalCacheFull        = errors.New("mls: the epoch's proposal cache holds as many proposals as one valid commit list could name")
-	errProposalCacheSenderQuota = errors.New("mls: one sender has cached as many proposals of one type as a valid commit list could carry from it")
-	errProposalCacheOctets      = errors.New("mls: the epoch's cached proposals would exceed the octets one epoch's cache may hold")
-	errAcceptedTypeHasNoCeiling = errors.New("mls: the v1 profile accepts a proposal type the cache has no ceiling for")
+	// THE SIX CEILING RULES are six values for what a careless reading calls one rule, and they
+	// are six rules with six remedies, in three PAIRS of a group rule and a sender rule.
+	//
+	// errProposalCacheFull is about the EPOCH: this group has published more proposals than one
+	// valid commit list could name, and the remedy is for somebody to commit.
+	// errProposalCacheSenderQuota is about ONE SENDER: that member has published more of one type
+	// than a valid list could carry from it, and the remedy is to stop trusting the member -- a
+	// caller told only "the cache is full" would go looking at the group.
+	//
+	// errProposalCacheTargetQuota is that sender rule stated over the leaf a proposal APPLIES TO.
+	// Section 12.2 invalidates a list carrying two proposals that apply to one leaf, so a member's
+	// second remove of the leaf it has already asked to remove is an entry no committer can use
+	// beside the first, and admitting it fills the cache with a set no valid commit list names.
+	//
+	// errProposalCacheOctets and errProposalCacheSenderOctets are that same pair over the BYTES,
+	// which are a different resource from the count and the one an entry ceiling alone does not
+	// bound. They are a PAIR for the reason the counted ones are: a total with no per sender
+	// column beside it is a total ONE sender reaches, and every honest member is then refused for
+	// the rest of the epoch -- the starvation, not the exhaustion.
+	//
+	// errAcceptedTypeHasNoCeiling is about THIS BUILD, exactly as errAcceptedTypeHasNoBucket
+	// beside it is: the profile accepts a type nothing gave a ceiling to -- in either column --
+	// which is a commit that widened the accepted set and stopped half way.
+	errProposalCacheFull         = errors.New("mls: the epoch's proposal cache holds as many proposals as one valid commit list could name")
+	errProposalCacheSenderQuota  = errors.New("mls: one sender has cached as many proposals of one type as a valid commit list could carry from it")
+	errProposalCacheTargetQuota  = errors.New("mls: one sender has cached a second proposal applying to a leaf it already holds one for, and no valid commit list carries both")
+	errProposalCacheOctets       = errors.New("mls: the epoch's cached proposals would exceed the octets one epoch's cache may hold")
+	errProposalCacheSenderOctets = errors.New("mls: one sender's cached proposals would exceed the octets one sender may spend of one epoch's cache")
+	errAcceptedTypeHasNoCeiling  = errors.New("mls: the v1 profile accepts a proposal type the cache has no ceiling for")
 )
 
 // CachedProposal is a proposal plus the provenance validation needs: who sent it, and whether
@@ -428,17 +442,33 @@ func (self *ProposalList) Refs() []ProposalOrRef {
 // no receiver can apply. Section 12.2 states the list rules and spec A section 3.1 states
 // MaxGroupMembers, and the two together give a ceiling per accepted proposal type.
 
-// proposalCacheCeiling is the two ceilings one accepted proposal type has: how many entries of it
-// one valid commit list could name at all, and how many of it that list could carry FROM ONE SENDER.
+// proposalCacheCeiling is the three ceilings one accepted proposal type has: how many entries of it
+// one valid commit list could name at all, how many of it that list could carry FROM ONE SENDER,
+// and how many of the ones it carried from that sender could apply to ONE LEAF.
 //
-// TWO COLUMNS AND NOT ONE, because a total alone is satisfied by one peer filling it. A cache capped
+// MORE THAN ONE COLUMN, because a total alone is satisfied by one peer filling it. A cache capped
 // only on the total converts an exhaustion into a STARVATION: the first sender to reach the total
 // denies every honest member its own proposal for the rest of the epoch, which is the same
 // availability failure one layer up and is strictly cheaper to mount than the memory one. The per
 // sender column is what makes a flooder spend its own quota rather than the group's.
+//
+// AND THE THIRD COLUMN IS THAT ARGUMENT FINISHED. The per sender column counted (sender, type) with
+// no regard to what the proposal applied to, so one sender's 500 removes ALL NAMING ONE LEAF sat
+// inside its quota -- and section 12.2 invalidates a list carrying two proposals that apply to the
+// same leaf, so Pending answered 500 references no valid commit list could carry. That is not
+// waste, it is the availability failure again by another route: the flood makes every commit built
+// from this cache invalid, an invalid commit never advances the epoch, and the epoch advance is the
+// only thing that empties the cache. An entry that no valid list can carry alongside the entries
+// already held is one no committer can use, which is this file's own stated rule, and the per
+// target column is what makes the code count what that sentence says.
+//
+// perTarget is ZERO for a type that applies to no existing leaf -- an add makes a leaf rather than
+// naming one -- and proposalAppliesToLeaf is what decides which is which, read off the ARM the
+// proposal carries rather than off a list of type names.
 type proposalCacheCeiling struct {
 	perList   int
 	perSender int
+	perTarget int
 }
 
 // proposalTypeCacheCeiling is the disposition of every ACCEPTED proposal type, derived from RFC 9420
@@ -452,7 +482,11 @@ type proposalCacheCeiling struct {
 // proposals that apply to the same leaf". An Update applies to its OWN sender's leaf, so one sender
 // contributes at most ONE committable update however many it publishes -- which is the whole of why
 // an update flood is refused at the second one. A Remove applies to the leaf it names, so one sender
-// may legitimately hold one per member, bounded again by the membership cap.
+// may legitimately hold ONE PER MEMBER: one in the per target column, and the membership cap in the
+// per sender column, which is what bounds how many distinct leaves it may name. Both halves are
+// needed and neither implies the other -- a per target column alone leaves a sender naming leaf 0,
+// leaf 1, leaf 2 and on without bound, because this cache holds no tree and cannot say which of
+// those leaves exists, and a per sender column alone is the 500-removes-of-leaf-4 flood.
 //
 // GroupContextExtensions: section 12.2 invalidates a list carrying two of them at all, so it is one
 // per list and therefore one per sender.
@@ -464,10 +498,35 @@ type proposalCacheCeiling struct {
 // this cache held without bound, and a ceiling for a type the profile no longer accepts is a row
 // that outlived what it described.
 var proposalTypeCacheCeiling = map[ProposalType]proposalCacheCeiling{
-	ProposalTypeAdd:                    {perList: MaxGroupMembers, perSender: MaxGroupMembers},
-	ProposalTypeUpdate:                 {perList: MaxGroupMembers, perSender: 1},
-	ProposalTypeRemove:                 {perList: MaxGroupMembers, perSender: MaxGroupMembers},
-	ProposalTypeGroupContextExtensions: {perList: 1, perSender: 1},
+	ProposalTypeAdd:                    {perList: MaxGroupMembers, perSender: MaxGroupMembers, perTarget: 0},
+	ProposalTypeUpdate:                 {perList: MaxGroupMembers, perSender: 1, perTarget: 1},
+	ProposalTypeRemove:                 {perList: MaxGroupMembers, perSender: MaxGroupMembers, perTarget: 1},
+	ProposalTypeGroupContextExtensions: {perList: 1, perSender: 1, perTarget: 0},
+}
+
+// proposalAppliesToLeaf answers the leaf RFC 9420 section 12.2's same-leaf rule reads one proposal
+// as applying to, and whether it applies to an existing leaf at all.
+//
+// READ OFF THE ARM AND NOT OFF THE DISCRIMINANT, and the difference is that the arm is where the
+// leaf actually is: a Remove carries the index it names, an Update carries the leaf node that
+// replaces its own sender's. checkProposalProfile has already run checkArm by the time this is
+// asked anything, so the two agree -- and reading the arm is what lets the gate over this rule
+// DERIVE which accepted types apply to a leaf, by reflecting over the arm structures for a field
+// that names a leaf or replaces one, rather than by trusting the switch below.
+// TestEveryAcceptedTypeThatAppliesToALeafIsCountedAgainstThatLeaf is that gate: an eighth arm
+// carrying a LeafIndex fails there rather than being counted against nothing here.
+//
+// An Add applies to NO existing leaf: section 12.1.1 places an added member at a blank one, so two
+// adds from one sender are two members and not two proposals about one member. What bounds them is
+// the membership cap, which is the per sender column.
+func proposalAppliesToLeaf(sender LeafIndex, proposal *Proposal) (LeafIndex, bool) {
+	switch {
+	case proposal.Update != nil:
+		return sender, true
+	case proposal.Remove != nil:
+		return proposal.Remove.Removed, true
+	}
+	return 0, false
 }
 
 // maxCachedProposals is the entry ceiling: the sum of the per list column, which is the largest
@@ -508,6 +567,45 @@ func maxCachedProposals() int {
 // raise -- and the SPEC is the place to state it.
 const maxCachedProposalOctets = 8 << 20
 
+// maxCachedProposalOctetsPerSender is the octet ceiling's per sender column, and it exists for the
+// reason the counted ceiling has one: a bare total is a total ONE sender reaches.
+//
+// MEASURED, not argued. With the octets counted as a single number and no attribution, leaf 1
+// reached 8,388,605 of the 8,388,608 -- headroom 3 -- out of 27 messages and 15 of its own 500
+// entry add quota, because Store applies no key package validation and an add is therefore a half
+// megabyte vehicle. Leaf 2, which had cached nothing at all, was then refused a six octet remove.
+// That is verbatim the starvation the per sender ENTRY column was added to prevent, left open in
+// the dimension where one message is worth half a mebibyte -- and strictly cheaper to mount, since
+// it needs one sender where the entry route needs two.
+//
+// THE SHARE IS DERIVED FROM THE CEILING TABLE, and it is the same share of the octets that the
+// entry column already grants one sender of the entries: one sender may hold sum(perSender) of the
+// sum(perList) entries a valid commit list could name -- 1002 of 1501 as the table stands -- so it
+// may spend that fraction of the octets. Deriving it rather than writing a number down is what
+// keeps the two dimensions from stating different policies: a table edit that changed what one
+// sender may hold in entries and left an octet constant behind would be a per sender rule in one
+// dimension and a free-for-all in the other, which is the defect this closes.
+//
+// The division comes FIRST so the product cannot overflow a 32 bit int -- this package builds for
+// android/arm and js/wasm -- at a cost of at most sum(perSender) octets of the share, which is a
+// thousandth of a percent of it and in the refusing direction.
+//
+// WHAT IT DOES NOT CLAIM. It does not make this cache safe against a COALITION: two senders inside
+// their own shares still reach the total, exactly as two senders inside their own entry quotas
+// still reach the entry ceiling. That is the bound the entry column already draws, and a cache is
+// not the place a sybil is answered.
+func maxCachedProposalOctetsPerSender() int {
+	perSender, perList := 0, 0
+	for _, ceiling := range proposalTypeCacheCeiling {
+		perSender += ceiling.perSender
+		perList += ceiling.perList
+	}
+	if perList == 0 {
+		return 0
+	}
+	return maxCachedProposalOctets / perList * perSender
+}
+
 // proposalCacheQuota names one sender's holding of one proposal type, which is the unit the per
 // sender column is counted in.
 //
@@ -517,6 +615,21 @@ const maxCachedProposalOctets = 8 << 20
 type proposalCacheQuota struct {
 	sender       LeafIndex
 	proposalType ProposalType
+}
+
+// proposalCacheLeafQuota names one sender's holding of one proposal type THAT APPLIES TO ONE LEAF,
+// which is the unit the per target column is counted in.
+//
+// The leaf is part of the key rather than a second map per sender, for proposalCacheQuota's reason.
+// The SENDER is part of it because a rule counted over the whole cache would let one member's
+// remove of leaf 4 refuse another member's -- cross member denial, which is the failure the per
+// sender column exists to prevent, and section 12.2's list rule is the COMMITTER's to satisfy by
+// choosing among what it was offered. And the TYPE is part of it because a sender's own update and
+// its remove of somebody else are two different holdings that happen to be counted per leaf.
+type proposalCacheLeafQuota struct {
+	sender       LeafIndex
+	proposalType ProposalType
+	leaf         LeafIndex
 }
 
 // proposalCacheBinding is the group and epoch one cache belongs to.
@@ -571,12 +684,35 @@ type proposalCacheBinding struct {
 // SO THE CALLER'S HALF IS A GATE OF ITS OWN AND NOT A SENTENCE HERE.
 // TestNoDeclarationOfThisPackageBindsTheCacheToAGroupContextItSelectedOutOfAWireType derives the
 // wire types of this package -- every named type declaring an UnmarshalMLS, which is the one codec
-// convention this package pins -- and refuses any call of a binding writer whose group context
-// argument is SELECTED out of a value of one. It refuses a verified GroupInfo's context as well as
-// an unverified one, and that is deliberate: the two are the same expression at the call, so a rule
-// that let one through could not be checked. A Welcome path that has verified a GroupInfo copies the
-// context into the group's own state -- (*GroupContext).Clone is there for it -- and binds from
-// that, which is the difference between a value this client vouches for and one it merely parsed.
+// convention this package pins -- and accepts a binding writer's group context argument only when
+// the whole chain down to its root crossed no such type AND the root is a value the calling
+// declaration was HANDED. It refuses a verified GroupInfo's context as well as an unverified one,
+// and that is deliberate: the two are the same expression at the call, so a rule that let one
+// through could not be checked. A Welcome path that has verified a GroupInfo copies the context into
+// the group's own state -- (*GroupContext).Clone is there for it -- and binds from that, which is
+// the difference between a value this client vouches for and one it merely parsed.
+//
+// BOTH HALVES OF THAT RULE ARE THERE BECAUSE ONE OF THEM WAS NOT ENOUGH. The gate read only the
+// ROOT of the chain, so one local structure between the decode and the bind passed it -- and passed
+// it with a LOG LINE saying the laundering was acceptable:
+//
+//	type joinStateMutation struct{ context GroupContext }
+//	state := joinStateMutation{context: info.GroupContext}
+//	NewProposalCache(&state.context)
+//
+// The sharp part is that the paragraph above tells a reader to copy the verified context into their
+// own state and bind from that, and the bypass is that advice written out. What separates them is
+// not in the expression, so the rule demands the root be something the CALLER chose and refuses
+// everything else -- which is what makes the advice checkable: a group's own state is reached
+// through the group, and a group is a parameter or a receiver.
+//
+// WHAT THAT RULE STILL CANNOT SEE is stated in the gate rather than left for the next reviewer. It
+// reads one declaration at a time, so a helper that returns a decoded context is refused for being
+// unattributable rather than recognised, and a body that writes a decoded epoch into a FIELD of the
+// context it was handed is outside the rule entirely -- the field write is the epoch mover's own
+// required shape, so no rule stated here can refuse it. The gate is a tripwire on the shapes a
+// lifecycle actually gets written in, and the precondition it cannot express is the one this
+// paragraph states: the value handed to either writer must be one this client vouches for.
 //
 // It was the other way round, and the other way round is a denial of service, which is why this
 // paragraph is here. The binding used to be taken from the first entry STORED and checked against
@@ -609,10 +745,21 @@ type ProposalCache struct {
 	// decremented: nothing removes a single entry, so there is no path on which this can drift
 	// from what byRef holds.
 	octets int
+	// the same octets ATTRIBUTED, which is what stops one sender spending the whole total and
+	// starving every other member for the rest of the epoch. It is the octet dimension's half of
+	// what perSender is for the counted one, and it is keyed by the SENDER ALONE rather than by
+	// a sender and a type because the resource is this cache's memory and not any one proposal
+	// type's: a sender's half megabyte add and its six octet remove are the same mebibytes.
+	octetsPerSender map[LeafIndex]int
 	// how many entries each sender holds of each accepted type, which is the column that stops
 	// one peer spending the whole cache. Nil until the first store, for byRef's reason: a read
 	// of a nil map answers zero, which is the right answer for a sender that has cached nothing.
 	perSender map[proposalCacheQuota]int
+	// how many entries each sender holds of each accepted type that apply to ONE LEAF, which is
+	// what keeps what this cache holds to a set some valid commit list could name. See
+	// proposalCacheCeiling for why a cache with only the two columns above holds 500 removes of
+	// one leaf, and why that is an availability failure rather than waste.
+	perLeaf map[proposalCacheLeafQuota]int
 	// nil until the cache is bound. See proposalCacheBinding, and see bindingHolds for what
 	// nil answers.
 	binding *proposalCacheBinding
@@ -643,8 +790,10 @@ func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
 		return nil, fmt.Errorf("%w: a cache is built bound to the epoch its group is in", ErrNilGroupContext)
 	}
 	return &ProposalCache{
-		byRef:     map[string]CachedProposal{},
-		perSender: map[proposalCacheQuota]int{},
+		byRef:           map[string]CachedProposal{},
+		octetsPerSender: map[LeafIndex]int{},
+		perSender:       map[proposalCacheQuota]int{},
+		perLeaf:         map[proposalCacheLeafQuota]int{},
 		binding: &proposalCacheBinding{
 			groupId: bytes.Clone(groupContext.GroupId),
 			epoch:   groupContext.Epoch,
@@ -690,7 +839,9 @@ func (self *ProposalCache) Rebind(groupContext *GroupContext) error {
 	self.byRef = map[string]CachedProposal{}
 	self.order = nil
 	self.octets = 0
+	self.octetsPerSender = map[LeafIndex]int{}
 	self.perSender = map[proposalCacheQuota]int{}
+	self.perLeaf = map[proposalCacheLeafQuota]int{}
 	self.binding = &proposalCacheBinding{
 		groupId: bytes.Clone(groupContext.GroupId),
 		epoch:   groupContext.Epoch,
@@ -779,17 +930,31 @@ func (self *ProposalCache) bindingName() string {
 // sentence about a limit to a caller holding a message this cache already agreed to, and the caller
 // would go looking for a flood that is its own duplicate.
 //
-// THE TWO REFUSALS ARE TWO RULES WITH TWO REMEDIES, which is this file's rule for every pair it
-// separates. errProposalCacheFull is about the epoch and the remedy is for somebody to commit;
-// errProposalCacheSenderQuota is about one member and the remedy is to stop trusting it. A caller
-// told only "the cache said no" cannot tell a busy group from a flooding peer, and those are the
-// only two things it can mean.
+// THE THREE REFUSALS ARE THREE RULES WITH THREE REMEDIES, which is this file's rule for every pair
+// it separates. errProposalCacheFull is about the epoch and the remedy is for somebody to commit;
+// errProposalCacheSenderQuota is about one member holding too much of a type and the remedy is to
+// stop trusting it; errProposalCacheTargetQuota is about one member holding two proposals about ONE
+// LEAF, which is a pair section 12.2 lets no list carry, so the remedy is the same but the sentence
+// is not -- a member at that refusal has published nothing excessive in total. A caller told only
+// "the cache said no" cannot tell a busy group from a flooding peer from a peer whose second
+// proposal simply cannot be committed beside its first.
+//
+// THE PER TARGET RULE IS ASKED LAST OF THE THREE and only of a proposal that applies to a leaf,
+// because it is the narrowest: a sender at its per type quota is over a bound that holds whatever
+// the proposals were about, and answering the narrow rule first would report a leaf to a caller
+// whose member is flooding every leaf there is.
 //
 // The type's ceiling is looked up rather than defaulted, and an accepted type with no row is refused
 // under a value of its own, for the reason Resolve's bucketless branch is refused rather than
 // dropped: the commit that widens the accepted set is what makes that branch reachable, and a fifth
-// accepted type admitted with no ceiling would be the one type this cache held without bound.
-func (self *ProposalCache) checkCacheCeiling(sender LeafIndex, proposalType ProposalType) error {
+// accepted type admitted with no ceiling would be the one type this cache held without bound. The
+// same value answers a row that has a per sender column and no per target one under a type that
+// APPLIES to a leaf, because that is the same commit stopping half way one column further in --
+// and, like the bucketless branch, it is unreachable in this build:
+// TestEveryAcceptedTypeThatAppliesToALeafIsCountedAgainstThatLeaf fails on that commit before this
+// line can run.
+func (self *ProposalCache) checkCacheCeiling(sender LeafIndex, proposal *Proposal) error {
+	proposalType := proposal.ProposalType
 	ceiling, accepted := proposalTypeCacheCeiling[proposalType]
 	if !accepted {
 		return fmt.Errorf("%w: %s has no ceiling", errAcceptedTypeHasNoCeiling,
@@ -803,6 +968,45 @@ func (self *ProposalCache) checkCacheCeiling(sender LeafIndex, proposalType Prop
 		return fmt.Errorf("%w: leaf %d holds %d %s proposals in %s and one valid commit list carries at most %d of that type from one sender",
 			errProposalCacheSenderQuota, sender, held, proposalTypeName(proposalType),
 			self.bindingName(), ceiling.perSender)
+	}
+	leaf, targeted := proposalAppliesToLeaf(sender, proposal)
+	if !targeted {
+		return nil
+	}
+	if ceiling.perTarget < 1 {
+		return fmt.Errorf("%w: %s applies to leaf %d and its ceiling states none per leaf",
+			errAcceptedTypeHasNoCeiling, proposalTypeName(proposalType), leaf)
+	}
+	if held := self.perLeaf[proposalCacheLeafQuota{
+		sender: sender, proposalType: proposalType, leaf: leaf,
+	}]; held >= ceiling.perTarget {
+		return fmt.Errorf("%w: leaf %d holds %d %s proposals in %s that apply to leaf %d and one valid commit list carries at most %d of them",
+			errProposalCacheTargetQuota, sender, held, proposalTypeName(proposalType),
+			self.bindingName(), leaf, ceiling.perTarget)
+	}
+	return nil
+}
+
+// checkOctetCeiling refuses a NEW entry that would put this epoch's cache, or the sender's own share
+// of it, past the octets it may hold. See maxCachedProposalOctets for where the total comes from and
+// maxCachedProposalOctetsPerSender for why the total alone is not a bound.
+//
+// It is asked of an entry the cache does not already hold, for checkCacheCeiling's reason, and it is
+// asked AFTER the copy because what an entry costs is what it encodes to and the encode is the copy.
+//
+// The two clauses are in the counted pair's order -- the group's rule before the sender's -- so that
+// a caller reading two refusals of this file learns them in one order. Which of the two fires is not
+// arbitrary either way: a total reached with every sender inside its share is a group that has to
+// commit, and a share reached under an unfilled total is one member.
+func (self *ProposalCache) checkOctetCeiling(sender LeafIndex, octets int) error {
+	if self.octets+octets > maxCachedProposalOctets {
+		return fmt.Errorf("%w: %s holds %d octets and this proposal's %d would carry it past the %d one epoch's cache may hold",
+			errProposalCacheOctets, self.bindingName(), self.octets, octets, maxCachedProposalOctets)
+	}
+	if held := self.octetsPerSender[sender]; held+octets > maxCachedProposalOctetsPerSender() {
+		return fmt.Errorf("%w: leaf %d holds %d octets in %s and this proposal's %d would carry it past the %d one sender may spend",
+			errProposalCacheSenderOctets, sender, held, self.bindingName(), octets,
+			maxCachedProposalOctetsPerSender())
 	}
 	return nil
 }
@@ -874,8 +1078,8 @@ func (self *ProposalCache) checkResolveEpoch(groupContext *GroupContext) error {
 // re-delivery of something this cache already agreed to. The hash is therefore what a flooder still
 // spends per message, and it is one hash over a body the caller had already decoded and framed.
 //
-// The two COUNTED ceilings run before the copy and the OCTET one after it, because what an entry
-// costs is what it encodes to and the encode is the copy. See proposalTypeCacheCeiling for why there
+// The COUNTED ceilings run before the copy and the OCTET ones after it, because what an entry costs
+// is what it encodes to and the encode is the copy. See proposalTypeCacheCeiling for why there
 // are ceilings at all: nothing but Rebind empties this cache, Rebind runs at an epoch boundary, and
 // a member who never commits therefore keeps the epoch open and this map growing -- measured at
 // 20,000 well formed proposals of one epoch from one sender, every one accepted, and answered by
@@ -965,7 +1169,7 @@ func (self *ProposalCache) Store(crypto CryptoProvider, groupContext *GroupConte
 	_, held := self.byRef[key]
 	if !held {
 		if err := self.checkCacheCeiling(content.Content.Sender.LeafIndex,
-			content.Content.Proposal.ProposalType); err != nil {
+			content.Content.Proposal); err != nil {
 			return nil, err
 		}
 	}
@@ -973,12 +1177,13 @@ func (self *ProposalCache) Store(crypto CryptoProvider, groupContext *GroupConte
 	if err != nil {
 		return nil, err
 	}
-	// the octet ceiling over the total this entry would make it, and not over the entry alone:
-	// a per proposal limit says nothing about how many of them there are, and the resource
-	// being bounded is what this cache HOLDS for the length of an epoch.
-	if !held && self.octets+octets > maxCachedProposalOctets {
-		return nil, fmt.Errorf("%w: %s holds %d octets and this proposal's %d would carry it past the %d one epoch's cache may hold",
-			errProposalCacheOctets, self.bindingName(), self.octets, octets, maxCachedProposalOctets)
+	// the octet ceilings over the totals this entry would make them, and not over the entry
+	// alone: a per proposal limit says nothing about how many of them there are, and the
+	// resource being bounded is what this cache HOLDS for the length of an epoch.
+	if !held {
+		if err := self.checkOctetCeiling(content.Content.Sender.LeafIndex, octets); err != nil {
+			return nil, err
+		}
 	}
 	// NO LAZY MAP HERE, and its absence is the thing to read. A store reaches this line only
 	// past CheckEpoch, which refuses every cache whose binding is nil, and the only two
@@ -998,10 +1203,24 @@ func (self *ProposalCache) Store(crypto CryptoProvider, groupContext *GroupConte
 	if !held {
 		self.order = append(self.order, key)
 		self.octets += octets
+		self.octetsPerSender[content.Content.Sender.LeafIndex] += octets
 		self.perSender[proposalCacheQuota{
 			sender:       content.Content.Sender.LeafIndex,
 			proposalType: content.Content.Proposal.ProposalType,
 		}] += 1
+		// the per leaf count moves with the rest and only for a proposal that applies to a
+		// leaf, which is the same question checkCacheCeiling asked two statements up and is
+		// asked again rather than carried down, because a bool threaded through the body
+		// would be a second place the two could disagree.
+		if leaf, targeted := proposalAppliesToLeaf(content.Content.Sender.LeafIndex,
+			content.Content.Proposal); targeted {
+
+			self.perLeaf[proposalCacheLeafQuota{
+				sender:       content.Content.Sender.LeafIndex,
+				proposalType: content.Content.Proposal.ProposalType,
+				leaf:         leaf,
+			}] += 1
+		}
 	}
 	// the entry's own Ref is cut from the KEY rather than from the answer, so the reference
 	// this cache holds and the reference the caller walks away with share no storage. Storing
