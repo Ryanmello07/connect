@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/wlynxg/anet"
 )
 
 // Address-family policy for this process's CONTROL-PLANE dials: the api
@@ -379,8 +381,17 @@ type controlFamilyInterface struct {
 // hostControlFamilyInterfaces enumerates this device's interfaces. An error
 // from either half is returned rather than swallowed -- the probe fails
 // CLOSED, and it can only do that if it is told enumeration failed.
+//
+// anet, not net. Android 11 restricted the netlink socket that Go's
+// net.Interfaces() uses, so it returns an error there, and this repo already
+// depends on wlynxg/anet for exactly that and already primes it
+// (transport_p2p_webrtc_android.go calls anet.SetAndroidVersion). Off android
+// anet.Interfaces is literally net.Interfaces. It matters more now than it
+// would have before: a probe that fails closed on an enumeration error would
+// otherwise refuse every demotion on modern android, disabling the feature on
+// one of the two platforms it exists for.
 func hostControlFamilyInterfaces() ([]controlFamilyInterface, error) {
-	ifaces, err := net.Interfaces()
+	ifaces, err := anet.Interfaces()
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +401,7 @@ func hostControlFamilyInterfaces() ([]controlFamilyInterface, error) {
 		// between the enumeration and the read. It contributes no evidence,
 		// which leaves the probe short of a reason to say yes -- the safe
 		// direction.
-		addrs, err := iface.Addrs()
+		addrs, err := anet.InterfaceAddrsByInterface(&iface)
 		if err != nil {
 			continue
 		}
