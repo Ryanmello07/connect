@@ -449,8 +449,11 @@ func xwingCalleeOf(info *types.Info, callee ast.Expr) *types.Func {
 //     xwingEncapsulateFromTheVector contributes ParseXwingPublicKey and XwingEncapsulate, and how
 //     x25519PublicKeyOfScalar contributes nothing at all -- everything it reaches is mls's.
 //   - a call into any other package is neither, and is skipped.
-//   - an identifier naming a variable something was assigned to is followed back to what was
-//     assigned, which is how priv.Public().Bytes() reaches XwingKeyGenFromSeed.
+//   - an identifier naming a variable something was assigned to is followed back to THE
+//     ASSIGNMENT THAT PRODUCED THIS USE -- the last right hand side written before it, and not
+//     every right hand side the variable ever received -- which is how priv.Public().Bytes()
+//     reaches XwingKeyGenFromSeed. See xwingAssignmentBefore for what following all of them
+//     costs.
 //
 // go/types AND NOT NAMES. A reading that matched method calls by NAME would answer
 // (*XwingPublicKey).Bytes for the .Bytes() inside x25519PublicKeyOfScalar -- that is mls's X25519
@@ -595,7 +598,10 @@ var xwingCollectorProducers = sync.OnceValues(func() ([]xwingCollectorRow, error
 	reach := func(start ast.Node) []string {
 		found := map[string]bool{}
 		seenFunction := map[*types.Func]bool{}
-		seenVariable := map[*types.Var]bool{}
+		// keyed by the ASSIGNMENT rather than by the variable, because one variable read at two
+		// positions can have two producing assignments and a per-variable guard would drop the
+		// second of them
+		seenAssignment := map[ast.Expr]bool{}
 		var walk func(node ast.Node)
 		walk = func(node ast.Node) {
 			ast.Inspect(node, func(inner ast.Node) bool {
@@ -618,17 +624,15 @@ var xwingCollectorProducers = sync.OnceValues(func() ([]xwingCollectorRow, error
 					}
 				case *ast.Ident:
 					variable, isVariable := info.Uses[held].(*types.Var)
-					if !isVariable || seenVariable[variable] {
+					if !isVariable {
 						return true
 					}
-					sources, isAssigned := assigned[variable]
-					if !isAssigned {
+					produced := xwingAssignmentBefore(assigned[variable], held.Pos())
+					if produced == nil || seenAssignment[produced] {
 						return true
 					}
-					seenVariable[variable] = true
-					for _, one := range sources {
-						walk(one)
-					}
+					seenAssignment[produced] = true
+					walk(produced)
 				}
 				return true
 			})
@@ -691,6 +695,34 @@ var xwingCollectorProducers = sync.OnceValues(func() ([]xwingCollectorRow, error
 	}
 	return rows, nil
 })
+
+// xwingAssignmentBefore answers the assignment that produced the value a use at this position
+// reads: the LAST right hand side written before it, and nil when the variable received none.
+//
+// THE LAST ONE AND NOT ALL OF THEM, and that is the whole of this function. assigned is a multi
+// map -- a variable assigned twice carries both right hand sides -- so a walk that followed every
+// one of them answers what a variable EVER held rather than what it holds at the literal being
+// read. Measured: inserting `shared = xwingPublishedValue(t, vector, "ss")` after the decapsulate
+// check makes the ss row compare the corpus against itself, and a walk over every assignment goes
+// on reporting XwingDecapsulate as that row's producer -- so the row goes on counting towards the
+// nine, with the whole tree green. That is the failure this derivation replaced a hand written
+// list to prevent, arriving one level further down.
+//
+// POSITION ORDER is the right reading for the collector, which is straight line code inside one
+// loop. Where it is not -- a value assigned below its own use and carried round a loop -- this
+// answers the earlier assignment or nothing at all, which shows up as a row holding none of this
+// package and FAILS the count of nine. Under-reaching is the safe direction here and over-reaching
+// is the defect: a row that stopped being traced is a row that stops counting, and a row that is
+// traced to something it no longer came out of is a row that counts wrongly.
+func xwingAssignmentBefore(sources []ast.Expr, use token.Pos) ast.Expr {
+	var produced ast.Expr
+	for _, one := range sources {
+		if one.Pos() < use && (produced == nil || one.Pos() > produced.Pos()) {
+			produced = one
+		}
+	}
+	return produced
+}
 
 // TestTheCollectorsProducersAreReadOffItsOwnSource is the control on the reading above.
 //

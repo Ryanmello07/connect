@@ -144,6 +144,46 @@ func testLeafNode(t *testing.T, crypto CryptoProvider, m *testMember) (*LeafNode
 	return leaf, encPriv
 }
 
+// testUpdateLeafNode mints the leaf an Update proposal carries: the UPDATE source, signed over the
+// group id and the leaf index the update is attributed to, with a fresh encryption key.
+//
+// A SEPARATE FIXTURE from testLeafNode and not a flag on it, because the two differ in three
+// things at once and a caller holding the wrong one still holds a leaf that verifies against
+// itself. The source selects the section 7.2 variant, so an update leaf carries no lifetime; the
+// source selects whether the LeafNodeTBS carries the group id and the leaf index, so an update
+// leaf is bound to this group at this position and a key_package leaf is bound to neither; and
+// section 7.3's update arm requires the encryption key to differ from the one being replaced, so
+// a fresh key is drawn rather than the member's existing one reused.
+//
+// It BUILDS AND SIGNS rather than re-signing testLeafNode's output. NewLeafNode mints the
+// key_package source and fills in a Lifetime, and re-signing that value under the update source
+// would leave the lifetime standing in the Go struct under a source whose encoding does not carry
+// it -- which is the exact shape (*LeafNode).UnmarshalMLS stages a fresh value to avoid.
+//
+// Every vector is the leaf's own before it is signed, through Clone, for NewLeafNode's reason: the
+// caller's storage goes on being written to and a retained slice is a leaf that changes after it
+// was signed.
+func testUpdateLeafNode(t *testing.T, crypto CryptoProvider, m *testMember,
+	groupId []byte, at LeafIndex) (*LeafNode, HpkePrivateKey) {
+	t.Helper()
+	encPriv, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair(%s): %v", m.Name, err)
+	}
+	leaf := (&LeafNode{
+		EncryptionKey:  encPub,
+		SignatureKey:   m.SigPub,
+		Credential:     BasicCredential(m.IdentityPub),
+		Capabilities:   testCapabilities(),
+		LeafNodeSource: LeafNodeSourceUpdate,
+		Extensions:     []Extension{testLeafKeys(t, m)},
+	}).Clone()
+	if err := leaf.Sign(crypto, m.SigPriv, groupId, at); err != nil {
+		t.Fatalf("LeafNode.Sign(%s) at leaf %d: %v", m.Name, at, err)
+	}
+	return leaf, encPriv
+}
+
 // testKeyPackage mints a key package plus its init and encryption private keys, IN THAT ORDER,
 // through TreeKEM's constructor rather than by hand.
 //
@@ -196,6 +236,63 @@ func testLeafValidation(crypto CryptoProvider) *LeafValidationContext {
 		ExpectedSource: LeafNodeSourceKeyPackage,
 		NowMs:          uint64(max(time.Now().UnixMilli(), 1)),
 		ClockSkewMs:    leafLifetimeSkewSeconds * 1000,
+	}
+}
+
+// TestFixtureUpdateLeafNodeIsAcceptedAtItsOwnIndexAndNowhereElse holds testUpdateLeafNode to the
+// validator every caller of it puts its output through, and to the context that validator binds.
+//
+// The positive half alone would be satisfied by a leaf signed with no context at all: the
+// key_package arm of the section 7.2 select carries neither the group id nor the leaf index, so a
+// leaf built under that source verifies at every index of every group. So each of the three things
+// the update source decides is asked for separately -- another index, another group, and the
+// key_package expectation -- and each must be a refusal. A fixture that failed any of them would
+// make every test reading it agree that an unbound leaf is an update leaf.
+func TestFixtureUpdateLeafNodeIsAcceptedAtItsOwnIndexAndNowhereElse(t *testing.T) {
+	crypto := testCrypto(t)
+	dora := testIdentity(t, crypto, "dora")
+	groupId := []byte("fixture-group")
+	leaf, encPriv := testUpdateLeafNode(t, crypto, dora, groupId, LeafIndex(3))
+	if leaf.LeafNodeSource != LeafNodeSourceUpdate {
+		t.Fatalf("the fixture leaf carries source %d, want the update source %d",
+			leaf.LeafNodeSource, LeafNodeSourceUpdate)
+	}
+	at := func(id []byte, index LeafIndex, source LeafNodeSource) *LeafValidationContext {
+		return &LeafValidationContext{Crypto: crypto, Suite: crypto.Suite(),
+			GroupId: id, LeafIndex: index, ExpectedSource: source}
+	}
+	if err := leaf.Validate(at(groupId, 3, LeafNodeSourceUpdate)); err != nil {
+		t.Fatalf("the fixture update leaf does not pass section 7.3 at its own index: %v", err)
+	}
+	for name, refused := range map[string]*LeafValidationContext{
+		"at another index":                 at(groupId, 4, LeafNodeSourceUpdate),
+		"in another group":                 at([]byte("another-group"), 3, LeafNodeSourceUpdate),
+		"where a key_package leaf belongs": at(groupId, 3, LeafNodeSourceKeyPackage),
+	} {
+		if err := leaf.Validate(refused); err == nil {
+			t.Errorf("the fixture update leaf is accepted %s, so it is not bound to the context it was signed in",
+				name)
+		}
+	}
+	// two calls draw two encryption keys, which is section 7.3's update arm made possible: a
+	// fixture answering one fixed key could never build an update that changed anything
+	second, _ := testUpdateLeafNode(t, crypto, dora, groupId, LeafIndex(3))
+	if bytes.Equal(leaf.EncryptionKey, second.EncryptionKey) {
+		t.Error("two update leaves for one member publish the same encryption key, so no test reading this fixture can build an update whose key actually changed")
+	}
+	// and the private half is the leaf's own, which is testLeafNode's check at the other fixture:
+	// sealed to what the leaf publishes, opened with what the fixture handed back
+	kemOutput, ciphertext, err := crypto.HpkeSeal(leaf.EncryptionKey, []byte("info"), []byte("aad"),
+		[]byte("to the update leaf"))
+	if err != nil {
+		t.Fatalf("HpkeSeal to the fixture update leaf's encryption key: %v", err)
+	}
+	opened, err := crypto.HpkeOpen(encPriv, kemOutput, []byte("info"), []byte("aad"), ciphertext)
+	if err != nil {
+		t.Fatalf("the private key testUpdateLeafNode returned does not open a message sealed to the leaf's encryption key: %v", err)
+	}
+	if !bytes.Equal(opened, []byte("to the update leaf")) {
+		t.Fatalf("opened %q, want %q", opened, "to the update leaf")
 	}
 }
 

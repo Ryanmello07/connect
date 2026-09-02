@@ -1,6 +1,7 @@
 package mls
 
 import (
+	"bytes"
 	"errors"
 	"go/ast"
 	"maps"
@@ -85,6 +86,36 @@ func testUpdateOf(sender LeafIndex, leaf *LeafNode) CachedProposal {
 	}
 }
 
+// testUpdateProposalOf is one member's Update: a leaf built for the update source, signed at that
+// member's own leaf index under the group id the input announces, carried by a proposal attributed
+// to that leaf.
+//
+// The three have to agree and there is one place they are written, because every way they can
+// disagree is a refusal at the update door rather than the rule a test is about: a leaf signed at
+// another index, a leaf signed in another group, a proposal attributed to another leaf.
+func testUpdateProposalOf(t *testing.T, crypto CryptoProvider, m *testMember,
+	sender LeafIndex) (CachedProposal, *LeafNode) {
+	t.Helper()
+	leaf, _ := testUpdateLeafNode(t, crypto, m, testValidationGroupId(), sender)
+	return testUpdateOf(sender, leaf), leaf
+}
+
+// testResignedUpdateOf re-signs a leaf a test has just altered and answers the proposal carrying
+// it, so that the rule under test is what refuses it rather than the signature.
+//
+// Every fixture below that reaches past the signature clause of section 7.3 needs this: the
+// signature covers the whole leaf, so a capability vector emptied or an extension appended after
+// the fixture signed is a leaf whose signature no longer verifies, and the update door would
+// answer errBadSignature for a leaf whose fault is something else entirely.
+func testResignedUpdateOf(t *testing.T, crypto CryptoProvider, m *testMember,
+	sender LeafIndex, leaf *LeafNode) CachedProposal {
+	t.Helper()
+	if err := leaf.Sign(crypto, m.SigPriv, testValidationGroupId(), sender); err != nil {
+		t.Fatalf("re-sign %s's update leaf at leaf %d: %v", m.Name, sender, err)
+	}
+	return testUpdateOf(sender, leaf)
+}
+
 func testGceOf(exts ...Extension) CachedProposal {
 	return CachedProposal{
 		Proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions,
@@ -106,6 +137,15 @@ func testRequiredCapabilitiesExtension(t *testing.T) Extension {
 	return Extension{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: body}
 }
 
+// testValidationGroupId is the group id every input below is judged under.
+//
+// ONE SPELLING, because an update leaf's LeafNodeTBS carries the group id and a fixture that
+// signed under one id while the input announced another would be a leaf refused for the wrong
+// reason -- and every test asserting a refusal would pass over it.
+func testValidationGroupId() []byte {
+	return []byte("group")
+}
+
 func testValidationInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	committer LeafIndex, list *ProposalList) *ProposalValidationInput {
 	t.Helper()
@@ -114,7 +154,7 @@ func testValidationInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 		Tree:   tree,
 		Context: &GroupContext{Version: ProtocolVersionMls10,
 			CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
-			GroupId:     []byte("group"), Epoch: 1},
+			GroupId:     testValidationGroupId(), Epoch: 1},
 		Committer: committer,
 		List:      list,
 		Now:       time.Now(),
@@ -148,6 +188,8 @@ var proposalValidationOwnedErrors = map[string]error{
 	"ErrUpdateDuplicateEncryptionKey":    ErrUpdateDuplicateEncryptionKey,
 	"ErrSelfUpdateInCommit":              ErrSelfUpdateInCommit,
 	"ErrUpdateSenderNotMember":           ErrUpdateSenderNotMember,
+	"ErrUpdateLeafNodeInvalid":           ErrUpdateLeafNodeInvalid,
+	"ErrUpdateEncryptionKeyUnchanged":    ErrUpdateEncryptionKeyUnchanged,
 	"ErrRemoveCommitter":                 ErrRemoveCommitter,
 	"ErrUpdateOrRemoveSameLeaf":          ErrUpdateOrRemoveSameLeaf,
 	"ErrProposalListMisbucketed":         ErrProposalListMisbucketed,
@@ -194,8 +236,12 @@ func TestProposalValidationOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) 
 // two of them are "the same thing really".
 func TestEveryProposalListRefusalIsDistinctFromEveryOther(t *testing.T) {
 	names := slices.Sorted(maps.Keys(proposalValidationOwnedErrors))
-	if len(names) != 19 {
-		t.Fatalf("the proposal list refusal set holds %d values, this task declares 19", len(names))
+	// 21 since the section 12.1.2 update door landed: the nineteen this file's own task declared,
+	// plus ErrUpdateLeafNodeInvalid and ErrUpdateEncryptionKeyUnchanged. The count is asserted
+	// rather than derived for lifecycleOwnedErrors' reason -- a later task adding a sentinel moves
+	// this number and says which task moved it.
+	if len(names) != 21 {
+		t.Fatalf("the proposal list refusal set holds %d values, this file declares 21", len(names))
 	}
 	for _, name := range names {
 		one := proposalValidationOwnedErrors[name]
@@ -395,14 +441,36 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				return testValidationInput(t, crypto, tree, LeafIndex(0),
 					testProposalList(t, testUpdateOf(9, leaf)))
 			}},
+		// bob's own update leaf, signed at bob's own index -- and then signed AGAIN by alice, so
+		// what the leaf publishes and what signed it are two different members. Every other field
+		// is well formed, which is the point: before this door existed the leaf went into the tree
+		// with nothing having verified the signature at all.
+		"validateUpdateLeafNodeIsValidForAnUpdate": {sentinel: ErrUpdateLeafNodeInvalid,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[0], LeafIndex(1), leaf)))
+			}},
+		// bob's update, well formed and correctly signed, republishing the encryption key bob's
+		// leaf already holds. ValSem110 excludes exactly that key from what it compares against,
+		// so no other rule of this file can answer for this one.
+		"validateUpdateChangesTheEncryptionKey": {sentinel: ErrUpdateEncryptionKeyUnchanged,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				leaf.EncryptionKey = tree.Leaf(1).EncryptionKey
+				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+			}},
 		// an update and a remove landing on one leaf. Two removes would be ValSem107's, which
 		// is why this pair is mixed.
 		"validateSingleUpdateOrRemovePerLeaf": {sentinel: ErrUpdateOrRemoveSameLeaf,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				leaf, _ := testLeafNode(t, crypto, members[1])
+				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
 				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf), testRemoveOf(1)))
+					testProposalList(t, update, testRemoveOf(1)))
 			}},
 		"validateCommitterIsNotRemoved": {sentinel: ErrRemoveCommitter,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
@@ -677,13 +745,13 @@ func proposalValidationRefusalOf(t *testing.T, what string,
 // ---------------------------------------------------------------------------
 
 // TestValidateProposalListAcceptsAValidList is the control every negative row above is measured
-// against: with none of the nineteen rules broken, the aggregate accepts.
+// against: with none of the twenty one rules broken, the aggregate accepts.
 func TestValidateProposalListAcceptsAValidList(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
 	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
-	leaf, _ := testLeafNode(t, crypto, members[1])
-	list := testProposalList(t, testUpdateOf(1, leaf), testRemoveOf(2), testAddOf(kp))
+	update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	list := testProposalList(t, update, testRemoveOf(2), testAddOf(kp))
 	if err := ValidateProposalList(testValidationInput(t, crypto, tree, LeafIndex(0), list)); err != nil {
 		t.Fatalf("ValidateProposalList: %v", err)
 	}
@@ -778,6 +846,10 @@ func TestRequiredCapabilitiesThatCannotBeReadIsARefusalRatherThanNoRequirement(t
 		for rule, run := range map[string]func(*ProposalValidationInput) error{
 			"ValSem106": ValSem106RequiredCapabilitiesSatisfied,
 			"ValSem109": ValSem109UpdateRequiredCapabilities,
+			// the update door reads the same extension for the same reason, and answers the
+			// same refusal ahead of any leaf: a group whose required_capabilities cannot be
+			// read is one no leaf can be held to
+			"validateUpdateLeafNodeIsValidForAnUpdate": validateUpdateLeafNodeIsValidForAnUpdate,
 		} {
 			if err := run(in); !errors.Is(err, ErrMalformedExtension) {
 				t.Errorf("%s over %s answered %v, want %v", rule, name, err, ErrMalformedExtension)
@@ -853,5 +925,351 @@ func TestValSem113ReadsTheBucketsAndNotOnlyTheCommitOrder(t *testing.T) {
 	if err := proposalValidationRefusalOf(t, "ValidateProposalList over an armless bucketed add",
 		ValidateProposalList, in); err == nil {
 		t.Fatal("ValidateProposalList accepted an add with no add arm")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the update door: RFC 9420 section 12.1.2 and what it reaches of section 7.3
+// ---------------------------------------------------------------------------
+
+// updateDoorFault is one way an Update's LeafNode can be invalid for an update, the section 7.3
+// clause it breaks, and the value that clause answers underneath ErrUpdateLeafNodeInvalid.
+type updateDoorFault struct {
+	// the section 7.3 clause, for the failure text.
+	clause string
+	// the sentinel the clause answers. It is asked THROUGH the wrap, which is what
+	// ErrUpdateLeafNodeInvalid's own declaration promises a caller: which proposal is bad, and
+	// what section 7.3 said about it.
+	inner error
+	build func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput
+}
+
+// updateDoorFaults is one input per clause of section 7.3 that (*LeafNode).Validate can decide
+// about an update leaf, each built so that EVERY other rule of this file accepts it.
+//
+// That last part is the whole content of the table and is asserted rather than described. Before
+// the update door existed, ValSem109 read the update leaf's Capabilities and ValSem110 read its
+// EncryptionKey and nothing read anything else about it -- so each row here is a leaf that reached
+// (*RatchetTree).UpdateLeaf with no signature check, no leaf_node_source check, no credential
+// check and no section 13.4 group extension check. The rows are not a list of everything section
+// 7.3 says: they are one input per clause of it a caller of this door can reach, and the clauses
+// that need the leaf being replaced or every other leaf of the group are named on
+// LeafValidationContext as belonging elsewhere.
+func updateDoorFaults() map[string]updateDoorFault {
+	return map[string]updateDoorFault{
+		// the headline. A key_package leaf carries a lifetime, is signed with NO group id and NO
+		// leaf index, and therefore verifies in whatever group it is pasted into at whatever
+		// position it is moved to -- which is exactly what an update leaf must not be.
+		"a key_package leaf offered as an update": {
+			clause: "the leaf_node_source rule", inner: ErrLeafNodeSourceMismatch,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				leaf, _ := testLeafNode(t, crypto, members[1])
+				return testValidationInput(t, crypto, tree, LeafIndex(0),
+					testProposalList(t, testUpdateOf(1, leaf)))
+			}},
+		"a leaf another member signed": {
+			clause: "the signature rule", inner: ErrCryptoBadSignature,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[0], LeafIndex(1), leaf)))
+			}},
+		// the leaf index half of the section 7.2 context select: bob's own leaf, bob's own
+		// signature, signed at leaf 0 and offered at leaf 1
+		"a leaf signed at another index": {
+			clause: "the signature rule, over the leaf index it is bound to", inner: ErrCryptoBadSignature,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				leaf, _ := testUpdateLeafNode(t, crypto, members[1], testValidationGroupId(), LeafIndex(0))
+				return testValidationInput(t, crypto, tree, LeafIndex(0),
+					testProposalList(t, testUpdateOf(1, leaf)))
+			}},
+		// and the group id half of it
+		"a leaf signed in another group": {
+			clause: "the signature rule, over the group id it is bound to", inner: ErrCryptoBadSignature,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				leaf, _ := testUpdateLeafNode(t, crypto, members[1], []byte("another group"), LeafIndex(1))
+				return testValidationInput(t, crypto, tree, LeafIndex(0),
+					testProposalList(t, testUpdateOf(1, leaf)))
+			}},
+		// x509's registered code point, which testCapabilities does not list. The leaf is NOT
+		// re-signed and does not need to be: section 7.3 puts the credential rule ahead of the
+		// signature rule and (*LeafNode).Validate takes that order, which is the only order under
+		// which this clause can ever fire -- Credential.MarshalMLS refuses every type outside this
+		// profile, so a leaf carrying one cannot have a preimage built for it at all.
+		//
+		// Emptying capabilities.credentials instead would assert nothing: SupportsCredential
+		// answers true for basic unconditionally, so a basic leaf reaches this clause whatever its
+		// vector says. Measured -- that fixture left this row green over a door that refused
+		// nothing.
+		"a leaf whose credential type is not in its own capabilities": {
+			clause: "section 7.2's credential type rule", inner: errCredentialTypeNotListed,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				leaf.Credential.CredentialType = CredentialType(0x0002)
+				return testValidationInput(t, crypto, tree, LeafIndex(0),
+					testProposalList(t, testUpdateOf(1, leaf)))
+			}},
+		"a leaf that does not list the group's ciphersuite": {
+			clause: "section 11.1's ciphersuite rule", inner: errCipherSuiteNotListed,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				leaf.Capabilities.CipherSuites = []CipherSuite{}
+				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+			}},
+		"a leaf carrying an extension it does not list": {
+			clause: "the leaf extension rule", inner: errLeafExtensionNotListed,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				leaf.Extensions = append(leaf.Extensions,
+					Extension{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}})
+				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+			}},
+		// erratum 8745 at the list level, and the row this door exists for as much as the source
+		// row does. ERRATA.md says this package applies section 13.4's group extension rule to
+		// all three sources; that was true of (*LeafNode).Validate and, for an update leaf,
+		// reached by nobody. ValSem109 cannot answer it: it asks only about
+		// required_capabilities, and this group context carries none.
+		"a leaf that does not support an extension the group context carries": {
+			clause: "section 13.4 as corrected by erratum 8745", inner: errGroupContextExtensionNotListed,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, update))
+				in.Context.Extensions = []Extension{
+					{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}}}
+				return in
+			}},
+	}
+}
+
+// TestTheUpdateDoorRefusesWhatEveryOtherUpdateRuleOfThisFileReadsPast is the defect this door was
+// written for, stated one section 7.3 clause at a time.
+//
+// FOUR CLAIMS PER ROW, and the middle two are the ones that make this a test about a missing door
+// rather than about a validator that already existed:
+//
+//   - the door answers ErrUpdateLeafNodeInvalid, and answers the clause's own sentinel THROUGH it,
+//     which is what the wrap promises a caller.
+//   - EVERY OTHER RULE OF THIS FILE THAT READS AN UPDATE ACCEPTS THE SAME LIST. ValSem109 reads
+//     the leaf's Capabilities, ValSem110 its EncryptionKey, ValSem111 and ValSem112 its sender,
+//     and the encryption key rule the leaf it replaces -- and not one of them is a section 7.3
+//     validator. The rules are read off the production groups rather than named here, so a
+//     fourteenth update rule added later is swept without anybody editing this.
+//   - ApplyProposals INSTALLS the leaf. That is the consequence: RFC 9420 section 12.3 application
+//     is not a validator, and until this door existed nothing between the wire and
+//     (*RatchetTree).UpdateLeaf judged an update's leaf at all.
+//   - the aggregate answers the same value, so the door is reached with this input rather than
+//     tripping over an earlier rule.
+func TestTheUpdateDoorRefusesWhatEveryOtherUpdateRuleOfThisFileReadsPast(t *testing.T) {
+	crypto := testCrypto(t)
+	faults := updateDoorFaults()
+	if len(faults) == 0 {
+		t.Fatal("no fault is written down, so this sweep asserted nothing")
+	}
+	for _, name := range slices.Sorted(maps.Keys(faults)) {
+		fault := faults[name]
+		t.Run(name, func(t *testing.T) {
+			in := fault.build(t, crypto)
+			answered := validateUpdateLeafNodeIsValidForAnUpdate(in)
+			if !errors.Is(answered, ErrUpdateLeafNodeInvalid) {
+				t.Fatalf("the update door answered %v over %s, want %v", answered, name, ErrUpdateLeafNodeInvalid)
+			}
+			if !errors.Is(answered, fault.inner) {
+				t.Errorf("the update door answered %v and %s is refused by %s, whose value is %v; a caller cannot ask which section 7.3 clause fired",
+					answered, name, fault.clause, fault.inner)
+			}
+			// every other rule the aggregate runs, so this is one door's refusal and not a
+			// second spelling of somebody else's
+			for _, other := range proposalListRules() {
+				if other == "validateUpdateLeafNodeIsValidForAnUpdate" {
+					continue
+				}
+				if err := proposalListRuleFor(t, other)(in); err != nil {
+					t.Errorf("%s also refuses %s, with %v; this row is meant to be a leaf every other rule of this file accepts",
+						other, name, err)
+				}
+			}
+			// the consequence: with no door, the leaf goes into the tree
+			applied, err := ApplyProposals(in.Tree, in.Context, in.Committer, in.List)
+			if err != nil {
+				t.Fatalf("ApplyProposals refused %s: %v; section 12.3 application is not a validator and this row is written to reach the tree",
+					name, err)
+			}
+			installed := applied.Tree.Leaf(in.List.Updates[0].Sender)
+			if installed == nil {
+				t.Fatalf("applying %s left leaf %d blank", name, in.List.Updates[0].Sender)
+			}
+			if !bytes.Equal(installed.EncryptionKey, in.List.Updates[0].Proposal.Update.LeafNode.EncryptionKey) {
+				t.Fatalf("applying %s did not install the update's own leaf, so this row does not show what an unjudged update reaches",
+					name)
+			}
+			if aggregated := ValidateProposalList(in); !errors.Is(aggregated, ErrUpdateLeafNodeInvalid) {
+				t.Fatalf("ValidateProposalList over %s answered %v, want %v; the aggregate is reaching a different rule with this input",
+					name, aggregated, ErrUpdateLeafNodeInvalid)
+			}
+		})
+	}
+}
+
+// TestValSem110AndTheEncryptionKeyRuleAreOppositeHalvesOfOneQuestion states each of the two
+// encryption key rules over the input the OTHER one is written to accept.
+//
+// They are near opposites and that is why they carry two values. ValSem110 refuses a key somebody
+// else holds and must therefore exclude the updating leaf's own outgoing key -- "without that
+// exclusion a member republishing anything at all would be refused for colliding with itself" --
+// and the excluded key is exactly what section 7.3's update arm refuses. Asserting either half
+// alone passes over an implementation that answered one value for both, which would leave a
+// caller unable to tell "your key is somebody else's" from "your key has not changed".
+func TestValSem110AndTheEncryptionKeyRuleAreOppositeHalvesOfOneQuestion(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
+
+	// bob republishing bob's own outgoing key
+	_, own := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	own.EncryptionKey = tree.Leaf(1).EncryptionKey
+	unchanged := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+		testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), own)))
+	if err := ValSem110UpdateUniqueEncryptionKey(unchanged); err != nil {
+		t.Fatalf("ValSem110 refused a leaf republishing its own outgoing key: %v", err)
+	}
+	if err := validateUpdateChangesTheEncryptionKey(unchanged); !errors.Is(err, ErrUpdateEncryptionKeyUnchanged) {
+		t.Fatalf("the update arm of section 7.3's leaf_node_source rule answered %v over an update that changed no key, want %v",
+			err, ErrUpdateEncryptionKeyUnchanged)
+	}
+
+	// and bob republishing carol's, which is the other half
+	_, borrowed := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	borrowed.EncryptionKey = tree.Leaf(2).EncryptionKey
+	duplicate := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+		testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), borrowed)))
+	if err := ValSem110UpdateUniqueEncryptionKey(duplicate); !errors.Is(err, ErrUpdateDuplicateEncryptionKey) {
+		t.Fatalf("ValSem110 answered %v over an update publishing another member's key, want %v",
+			err, ErrUpdateDuplicateEncryptionKey)
+	}
+	if err := validateUpdateChangesTheEncryptionKey(duplicate); err != nil {
+		t.Fatalf("the update arm refused an update whose key DID change, with %v; the two rules are answering one question",
+			err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// which leaf validation doors this package has, derived rather than listed
+// ---------------------------------------------------------------------------
+
+// leafValidationExpectedSourceField is the field of LeafValidationContext that carries section
+// 7.3's leaf_node_source rule, spelled once so the scan below and the struct cannot drift apart.
+const leafValidationExpectedSourceField = "ExpectedSource"
+
+// leafValidationSourcesWithNoDoorYet is every LeafNodeSource constant that no non test file of
+// this package names as a LeafValidationContext.ExpectedSource, with the reason.
+//
+// It is an ADMITTED GAP and not a decision, and it is written here so that the commit which closes
+// it fails this gate rather than leaving a stale excuse behind. That is the same shape
+// validation_framing_test.go's rulesThisPackageExportsAndNothingApplies takes, and it is here for
+// the reason this task exists at all: the update door was missing, two comments in this package
+// described it as though it were not, and nothing anywhere reported that it had no caller.
+//
+// tree_sync.go's whole tree sweep is not a door in this sense. It passes ExpectedSource:
+// leaf.LeafNodeSource -- the source INFERRED from the leaf rather than expected of it -- and its
+// own header says why a tree sweep cannot state the per position rule, and that the rule is
+// therefore still owed by "the update path and the proposal validator ... at their own doors". The
+// scan reads a constant NAME and an inferred source is not one, so that call site is correctly not
+// counted here.
+var leafValidationSourcesWithNoDoorYet = map[string]string{
+	"LeafNodeSourceCommit": "RFC 9420 section 7.3's commit arm belongs to the client PROCESSING a commit, over the LeafNode of an UpdatePath. MergeUpdatePath's own header says it deliberately does not verify that leaf's signature and hands it to \"the commit processing layer rather than the tree\", and this package has no commit processing layer yet -- the group lifecycle plan's commit validation and commit processing tasks own it. Until one lands, an UpdatePath's leaf is held only by the parent hash chain, by VerifyParentHashes and by whatever whole tree validation the caller runs afterwards, and none of those is section 7.3 at the sender's position.",
+}
+
+// leafValidationExpectedSourceNames answers, for every non test file of this package, each
+// LeafNodeSource constant it names as an ExpectedSource, mapped to the file naming it.
+//
+// Read off the SOURCE and not off a call graph, because what is being measured is whether anybody
+// wrote the expectation down. A door that computed its expected source at run time from something
+// else would not be counted, which is the conservative direction: this gate under-reports doors and
+// so fails when one is missing rather than when one is merely written unusually.
+func leafValidationExpectedSourceNames(t *testing.T) map[string]string {
+	t.Helper()
+	found := map[string]string{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		parsed := mustParseSource(t, path)
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			pair, isPair := node.(*ast.KeyValueExpr)
+			if !isPair {
+				return true
+			}
+			key, isKey := pair.Key.(*ast.Ident)
+			if !isKey || key.Name != leafValidationExpectedSourceField {
+				return true
+			}
+			named, isNamed := pair.Value.(*ast.Ident)
+			if !isNamed {
+				return true
+			}
+			found[named.Name] = path
+			return true
+		})
+	}
+	return found
+}
+
+// TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap derives both halves and holds
+// them against each other.
+//
+// The class of sources is the package's own LeafNodeSource constants, so a fourth source declared
+// later is swept on the commit that declares it. The class of doors is read off the non test
+// source. Neither is a list, and the one list here -- the admitted gap -- is required to name a
+// source that exists and to name one no door states, so it expires by FAILING on the commit that
+// closes it rather than by somebody remembering to delete it.
+func TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap(t *testing.T) {
+	if _, held := reflect.TypeOf(LeafValidationContext{}).FieldByName(leafValidationExpectedSourceField); !held {
+		t.Fatalf("LeafValidationContext declares no %s field, so the scan below reads a key nothing writes",
+			leafValidationExpectedSourceField)
+	}
+	declared := registryConstantsOfType(t, "LeafNodeSource")
+	doors := leafValidationExpectedSourceNames(t)
+	// the positive control: a scan that resolved nothing reports exactly the clean bill a
+	// complete one reports, and key_package.go certainly states its own expectation
+	if doors["LeafNodeSourceKeyPackage"] == "" {
+		t.Fatalf("the scan found the doors %v, and key_package.go certainly expects LeafNodeSourceKeyPackage, so it is reading something other than this package",
+			doors)
+	}
+	for _, name := range slices.Sorted(maps.Keys(declared)) {
+		door, hasDoor := doors[name]
+		reason, admitted := leafValidationSourcesWithNoDoorYet[name]
+		switch {
+		case hasDoor && admitted:
+			t.Errorf("%s is expected at a door in %s and is also written down as having none, with the reason %q; one of the two is stale",
+				name, door, reason)
+		case !hasDoor && !admitted:
+			t.Errorf("no non test file of this package ever expects %s of a leaf, and nothing is written down about it. RFC 9420 section 7.3 states a rule for every source, and a source nothing expects is a leaf installed with no signature check, no leaf_node_source check and no section 13.4 check -- which is the defect the update door closed",
+				name)
+		case hasDoor:
+			t.Logf("%s is stated at %s", name, door)
+		default:
+			t.Logf("%s has no door: %s", name, reason)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(doors)) {
+		if _, isConstant := declared[name]; !isConstant {
+			t.Errorf("%s expects %s of a leaf and this package declares no LeafNodeSource constant of that name",
+				doors[name], name)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(leafValidationSourcesWithNoDoorYet)) {
+		if _, isConstant := declared[name]; !isConstant {
+			t.Errorf("the admitted gap names %s and this package declares no LeafNodeSource constant of that name",
+				name)
+		}
 	}
 }

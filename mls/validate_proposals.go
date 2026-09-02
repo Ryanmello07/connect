@@ -105,7 +105,14 @@ func (self *ProposalValidationInput) effectiveExtensions() []Extension {
 // quietly leaving the aggregate smaller.
 //
 // The groups are three and not one because the ORDER between them is load bearing and the header
-// says why: the structural group is what makes the other twelve safe to write.
+// says why: the structural group is what makes the rules of the second group safe to write.
+//
+// The second group ENDS with the two section 12.1.2 rules rather than beginning with them, and
+// that position is load bearing twice over. Both read the sender's leaf index -- one to rebuild
+// the LeafNodeTBS the update leaf signed, one to find the leaf it replaces -- so both are written
+// against a sender ValSem112 has already said is a member. And ValSem109 states the
+// required_capabilities clause at the list level with a value of its own, so it is asked first and
+// the leaf validator's broader answer cannot stand in for it.
 var (
 	proposalListStructuralChecks = []func(*ProposalValidationInput) error{
 		ValSem113ProposalTypeSupported,
@@ -127,6 +134,8 @@ var (
 		ValSem110UpdateUniqueEncryptionKey,
 		ValSem111NoCommitterUpdate,
 		ValSem112UpdateSenderIsMember,
+		validateUpdateLeafNodeIsValidForAnUpdate,
+		validateUpdateChangesTheEncryptionKey,
 	}
 	proposalListCrossChecks = []func(*ProposalValidationInput) error{
 		validateSingleUpdateOrRemovePerLeaf,
@@ -603,6 +612,134 @@ func ValSem112UpdateSenderIsMember(in *ProposalValidationInput) error {
 		sender := in.List.Updates[i].Sender
 		if in.Tree.Leaf(sender) == nil {
 			return fmt.Errorf("%w: leaf %d, at updates[%d]", ErrUpdateSenderNotMember, sender, i)
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9420 section 12.1.2: what an Update's own LeafNode owes
+// ---------------------------------------------------------------------------
+
+// validateUpdateLeafNodeIsValidForAnUpdate is RFC 9420 section 12.2's first invalidation
+// condition -- "It contains an individual proposal that is invalid as specified in Section 12.1"
+// -- reaching section 12.1.2: "An Update proposal is invalid if the LeafNode is invalid for an
+// Update proposal according to Section 7.3."
+//
+// IT IS THE UPDATE DOOR ONTO (*LeafNode).Validate, and until it existed there was none.
+// LeafValidationContext.ExpectedSource's own header names three callers -- "key_package.go with
+// key_package, proposal validation with update, the tree and the update path with commit" -- and
+// only the first and the third had been written. An Update's leaf therefore reached
+// (*RatchetTree).UpdateLeaf, through ApplyProposals, with no signature check, no leaf_node_source
+// check, no credential check and no section 13.4 group extension check: a member could install any
+// leaf at its own index, including one another member signed, and this package would take it.
+// ValSem109 next door reads that leaf's Capabilities and ValSem110 reads its EncryptionKey, and
+// neither of them validates it.
+//
+// WHAT AN UPDATE LEAF OWES THAT A KEY PACKAGE LEAF DOES NOT, worked out from section 7.3 rather
+// than copied off key_package.go's context:
+//
+//   - the SOURCE. ExpectedSource is LeafNodeSourceUpdate, so a leaf whose source says key_package
+//     is refused HERE rather than installed. That is not a formality: the source selects the
+//     section 7.2 variant AND the signature preimage, so a key_package leaf accepted at this
+//     position would be one signed with no group id and no leaf index -- and signatureContent's
+//     own header says what that is, a leaf that "verifies in whatever group it is pasted into" at
+//     "whatever position of the tree it is moved to".
+//   - the CONTEXT the signature is bound to. GroupId and LeafIndex are this group's id and the
+//     index the update is attributed to, which is what makes the update arm of that select worth
+//     anything. Passing them empty would verify every update leaf against a preimage no sender
+//     built.
+//   - NOTHING in place of the lifetime, at this door. The lifetime is a variant field carried only
+//     under key_package, so validateLifetime answers nil for an update leaf whatever clock it is
+//     handed, and a NowMs passed here would be an input no branch below could read. What section
+//     7.3 puts in its place is the update arm of the leaf_node_source rule -- the encryption key
+//     must differ from the one being replaced -- and that is a rule about two leaves, which is why
+//     it is the separate door below rather than a field of this context.
+//
+// RequiredCaps IS PASSED AND IS REDUNDANT, said plainly because a mutation measures it: ValSem109
+// runs first over the same leaf against the same effective extensions, so clearing this field to
+// nil leaves the whole of ./mls/... and ./message/... green. It stays because handing a validator
+// nil for a group that does require something is the shape reconcileRequiredCapabilities exists to
+// refuse at the tree door -- "a caller that passed nil ... gets every leaf admitted without the
+// requirement being applied at all" -- and a call site that reads that way is one a later reader
+// has to re-derive. Nothing here claims a test can tell which of the two asked.
+//
+// GroupExtensions is NOT redundant and is the erratum 8745 half. ValSem109 asks only about
+// required_capabilities; section 13.4 as corrected asks that an updated leaf support every
+// extension in the GroupContext, and this is the only place a list-level caller asks it. ERRATA.md
+// says this package applies that rule to all three sources -- which was true of
+// (*LeafNode).Validate and, for update leaves, reached by nobody.
+func validateUpdateLeafNodeIsValidForAnUpdate(in *ProposalValidationInput) error {
+	if err := in.check(); err != nil {
+		return err
+	}
+	extensions := in.effectiveExtensions()
+	required, err := requiredCapabilitiesOf(extensions)
+	if err != nil {
+		return err
+	}
+	for i := range in.List.Updates {
+		cached := &in.List.Updates[i]
+		err := cached.Proposal.Update.LeafNode.Validate(&LeafValidationContext{
+			Crypto:          in.Crypto,
+			Suite:           in.Context.CipherSuite,
+			GroupId:         in.Context.GroupId,
+			LeafIndex:       cached.Sender,
+			ExpectedSource:  LeafNodeSourceUpdate,
+			RequiredCaps:    required,
+			GroupExtensions: extensions,
+			// NowMs and ClockSkewMs are left at their zero values, and for an update leaf that
+			// is not the documented opt out being taken -- it is the one input this rule has no
+			// use for. See the paragraph above.
+		})
+		if err != nil {
+			return fmt.Errorf("%w: updates[%d] for leaf %d: %w",
+				ErrUpdateLeafNodeInvalid, i, cached.Sender, err)
+		}
+	}
+	return nil
+}
+
+// validateUpdateChangesTheEncryptionKey is the UPDATE arm of section 7.3's leaf_node_source rule:
+// "the encryption_key represents a different public key than the encryption_key in the leaf node
+// being replaced".
+//
+// It is here and not in (*LeafNode).Validate because it is a rule about TWO leaves and that
+// validator is handed one; LeafValidationContext's header lists it among the rules it cannot
+// answer and hands it to proposal validation by name. This is that door.
+//
+// WHAT IT CLOSES is the one shape ValSem110 is written to let through. ValSem110 refuses an update
+// publishing a key another member, another Add or another Update already publishes, and to do that
+// it must EXCLUDE the updating leaf's own outgoing key -- "without that exclusion a member
+// republishing anything at all would be refused for colliding with itself". The excluded key is
+// precisely the key this rule refuses, so an Update that changes a leaf's credential, capabilities
+// or extensions while keeping the encryption key it already had passes every other rule of this
+// file. What section 7.3 wants of an update is fresh key material at that leaf: a commit built over
+// an update that changed nothing re-seals the sender's path to a public key whose private half is
+// exactly as old as the epoch the update was supposed to end.
+//
+// A blank or out of range sender is SKIPPED rather than refused, because ValSem112 owns that
+// observation and answers a value of its own for it. Running after ValSem112 in the same group,
+// this never sees one; the clause is written anyway so that the rule called on its own reports
+// nothing rather than reading through a nil leaf.
+//
+// crypto/subtle for guardrail 8's reason, which is ValSem104's reason: nothing this package ships
+// compares data with a variable-time call, and the class that holds that is derived off the
+// imports rather than off a list of banned names.
+func validateUpdateChangesTheEncryptionKey(in *ProposalValidationInput) error {
+	if err := in.check(); err != nil {
+		return err
+	}
+	for i := range in.List.Updates {
+		cached := &in.List.Updates[i]
+		replaced := in.Tree.Leaf(cached.Sender)
+		if replaced == nil {
+			continue
+		}
+		if subtle.ConstantTimeCompare(replaced.EncryptionKey,
+			cached.Proposal.Update.LeafNode.EncryptionKey) == 1 {
+			return fmt.Errorf("%w: updates[%d] for leaf %d publishes %x again",
+				ErrUpdateEncryptionKeyUnchanged, i, cached.Sender, replaced.EncryptionKey)
 		}
 	}
 	return nil

@@ -1127,7 +1127,7 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // same reason: so that the commit which wires it is the commit this list fails on.
 //
 // ValidateProposalList is p7 task 7's aggregate, and it is here for exactly that reason rather than
-// because anything about it is unfinished. Its nineteen rules are all applied -- ValidateProposalList
+// because anything about it is unfinished. Its twenty one rules are all applied -- ValidateProposalList
 // runs every one of them, and ApplyProposals runs the two structural ones on its own account -- but
 // the commit paths that call the aggregate are tasks 22 and 25, which have not landed. Until they do,
 // this package ships a section 12.2 validator that its own commit construction does not run, and

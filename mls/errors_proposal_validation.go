@@ -1,5 +1,6 @@
-// The RFC 9420 section 12.2 proposal-list refusals: ONE VALUE PER RULE, thirteen ValSem codes
-// and the three list rules section 12.2 states without a code.
+// The RFC 9420 section 12.2 proposal-list refusals: ONE VALUE PER RULE, thirteen ValSem codes,
+// the three list rules section 12.2 states without a code, and the two rules section 12.1.2 puts
+// on an Update's own LeafNode.
 //
 // One value per rule is the whole content of this file and it is why the file exists at all
 // rather than the values sitting beside the functions that raise them. The plan this task comes
@@ -99,6 +100,37 @@ var (
 	// sender was attributed to is occupied -- and a list assembled in process has been through
 	// neither.
 	ErrUpdateSenderNotMember = errors.New("mls: an update proposal is attributed to a leaf that is blank or outside the tree")
+
+	// RFC 9420 section 12.2's FIRST invalidation condition -- "It contains an individual proposal
+	// that is invalid as specified in Section 12.1" -- reaching section 12.1.2's "An Update
+	// proposal is invalid if the LeafNode is invalid for an Update proposal according to Section
+	// 7.3".
+	//
+	// Its own value and NOT ValSem109's, which is the rule this file's header is about. ValSem109
+	// asks one question of an updated leaf -- does it still support the group's
+	// required_capabilities -- and section 7.3 asks eight, of which that is one. An implementation
+	// whose whole section 7.3 answer came back as ValSem109's value could not be asked whether it
+	// had checked the SIGNATURE, and a caller told "an updated leaf does not support one of the
+	// group's required capabilities" over a forged leaf would go looking at its own capabilities
+	// vector. It WRAPS the leaf validator's own refusal rather than replacing it, so a caller may
+	// ask either question: which proposal is bad, or what section 7.3 said about it.
+	ErrUpdateLeafNodeInvalid = errors.New("mls: an update proposal carries a leaf node that is not valid for an update")
+
+	// Section 7.3's UPDATE arm of the leaf_node_source rule: "the encryption_key represents a
+	// different public key than the encryption_key in the leaf node being replaced".
+	//
+	// (*LeafNode).Validate cannot state it -- it is a rule about two leaves and that validator
+	// holds one -- and LeafValidationContext's own header hands it here by name. It is the clause
+	// that stands where the lifetime check stands under key_package: the lifetime is a variant
+	// field an update leaf does not carry, so section 7.3's freshness obligation for an update is
+	// that the key actually CHANGED.
+	//
+	// Distinct from ValSem110 and the two are near opposites. ValSem110 refuses an update
+	// publishing a key SOMEBODY ELSE holds, and to do that it excludes the updating leaf's own
+	// outgoing key from the set it compares against -- which is exactly the key this rule refuses.
+	// One value for the two would make the exclusion and the refusal indistinguishable to a
+	// caller, and the same exclusion is why no other rule of this file can answer for this one.
+	ErrUpdateEncryptionKeyUnchanged = errors.New("mls: an update proposal republishes the encryption key of the leaf it replaces")
 
 	// RFC 9420 section 12.2's "It contains a Remove proposal that removes the committer". The
 	// plan's thirteen do not carry it and the RFC states it in the same list as ValSem111's

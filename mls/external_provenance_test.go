@@ -585,6 +585,10 @@ const (
 	// it. One spelling, so the source this gate compiles and the type it compares that source's
 	// shadow against cannot become two different packages.
 	externalMlsImportPath = "github.com/urnetwork/connect/mls"
+	// the words the compiler opens a refused CONVERSION with, spelled once because the gate reads
+	// them two ways: they are among the words each conversion spelling is held to, and they are
+	// how a row says of itself that its refusal is the conversion one.
+	externalConversionDiagnostic = "cannot convert"
 )
 
 // externalSpelling is one way of writing an mls.VerifiedGroupContext in a package that imports mls,
@@ -608,12 +612,32 @@ type externalSpelling struct {
 	// DERIVED rather than claimed: the gate below reads every refused spelling's diagnostics
 	// against every OTHER refused spelling's words and requires them to fall short.
 	mentions []string
-	// whether this spelling's refusal is the CROSS-PACKAGE STRUCT IDENTITY one, in which case
-	// the shadow it converts from has to be shown to have this type's exact shape. A shadow that
-	// had stopped having it is refused too, on a different rule, with a diagnostic that reads the
-	// same way -- measured -- so an arm named for the identity rule that never asserted the shape
-	// cannot tell its own refusal from that one.
-	identity bool
+}
+
+// convertsFromTheShadow reports whether this spelling's body converts the shadow struct into this
+// type, which is what makes its refusal the CROSS-PACKAGE STRUCT IDENTITY one -- and what obliges
+// the gate to show that the shadow really has this type's shape. A shadow that had stopped having
+// it is refused too, on the ordinary conversion rule, with a diagnostic that reads the same way.
+//
+// DERIVED off the body this gate compiles, and it used to be a bool set by hand on two rows. That
+// bool was a rule 5 shape inside a rule 5 gate and it was measured: clearing it on both rows left
+// the whole suite green, and clearing it TOGETHER with one field appended to the generated shadow
+// restored the exact defect the shape assertion exists to catch -- both conversions still refused,
+// every word they are held to still present, the derived count of refusals still what the field
+// list makes it, and nothing anywhere failing. Read off the body, a row that stopped converting
+// stops claiming to, and a row that converts cannot stop being asked.
+func (self externalSpelling) convertsFromTheShadow() bool {
+	return strings.Contains(self.body, externalForgingShadow+"{")
+}
+
+// isHeldToAConversionRefusal is the SECOND reading of the same row: not what it compiles but what
+// its diagnostics are required to say.
+//
+// The gate requires the two to agree. They are derived from different halves of the row, so a row
+// that stopped being a conversion in one half -- a body rewritten, or the conversion words dropped
+// from what it is held to -- fails there rather than quietly taking the shape assertion with it.
+func (self externalSpelling) isHeldToAConversionRefusal() bool {
+	return slices.Contains(self.mentions, externalConversionDiagnostic)
 }
 
 // externalForgingSuite is the whole synthetic corpus, derived once.
@@ -760,17 +784,17 @@ var _ = %s
 		// the DESTINATION is what separates the two conversions. This one converts to the VALUE
 		// type and the next to the POINTER type, so the two diagnostics end "to type mls.X" and
 		// "to type *mls.X", and neither of those texts appears in the other's.
-		mentions: []string{"cannot convert", externalForgingShadow, "to type mls." + held.Name()},
-		identity: true,
+		mentions: []string{externalConversionDiagnostic, externalForgingShadow,
+			"to type mls." + held.Name()},
 	}, externalSpelling{
 		name: "a conversion from a pointer to an identically shaped struct",
 		body: fmt.Sprintf(`func spelling() *mls.%s {
 	return (*mls.%s)(&%s)
 }
 `, held.Name(), held.Name(), shadowLiteral),
-		refused:  true,
-		mentions: []string{"cannot convert", "*" + externalForgingShadow, "to type *mls." + held.Name()},
-		identity: true,
+		refused: true,
+		mentions: []string{externalConversionDiagnostic, "*" + externalForgingShadow,
+			"to type *mls." + held.Name()},
 	})
 	return externalForgingSuite{
 		typeName:   held.Name(),
@@ -982,7 +1006,7 @@ func TestEachForgedSpellingThisGateCompilesIsRefusedForItsOwnReason(t *testing.T
 	// are read off disk once rather than once per spelling. Measured, that is about two seconds
 	// for the first check and about a tenth of a second for each of the rest.
 	shared := importer.ForCompiler(fileSet, "source", nil)
-	compiled, refused := 0, 0
+	compiled, refused, shapeAsserted := 0, 0, 0
 	// what each refused spelling was actually told, kept so the separation below is read off the
 	// same diagnostics the assertions above were read off
 	diagnosticsOf := map[string][]string{}
@@ -999,8 +1023,16 @@ func TestEachForgedSpellingThisGateCompilesIsRefusedForItsOwnReason(t *testing.T
 			Error:    func(err error) { diagnostics = append(diagnostics, err.Error()) },
 		}
 		outside, checkErr := config.Check(externalForgingPackage, fileSet, []*ast.File{file}, nil)
-		if spelling.identity {
+		// the two readings of the row, from its body and from its words, held against each other
+		// before either is acted on
+		if spelling.convertsFromTheShadow() != spelling.isHeldToAConversionRefusal() {
+			t.Errorf("%q converts from %s in its body (%v) and is held to a %q diagnostic (%v); the two readings of what this row's refusal is about disagree, and the shape assertion follows the first of them",
+				spelling.name, externalForgingShadow, spelling.convertsFromTheShadow(),
+				externalConversionDiagnostic, spelling.isHeldToAConversionRefusal())
+		}
+		if spelling.convertsFromTheShadow() {
 			externalShadowHasThisTypesShape(t, spelling.name, outside, shared, suite.typeName, source)
+			shapeAsserted += 1
 		}
 		if !spelling.refused {
 			if checkErr != nil || len(diagnostics) != 0 {
@@ -1036,6 +1068,13 @@ func TestEachForgedSpellingThisGateCompilesIsRefusedForItsOwnReason(t *testing.T
 	if compiled != 1 {
 		t.Errorf("%d of this gate's %d files were written to compile, want exactly 1; without one that compiles a harness that resolves nothing reports a clean run",
 			compiled, len(suite.spellings))
+	}
+	// the floor under the derivation above. Every refusal here is a compile error, and a gate that
+	// stopped recognising its conversion rows would go on reporting four clean refusals while the
+	// one rule that is about the SHADOW rather than about a field name was observed over nothing.
+	if shapeAsserted == 0 {
+		t.Errorf("no spelling this gate compiled was read as converting from %s, so the cross-package struct identity rule was asserted over nothing and a shadow that had stopped having mls.%s's shape would be refused, counted and reported clean",
+			externalForgingShadow, suite.typeName)
 	}
 	// the count is derived rather than written down: two spellings per unexported field, plus the
 	// two conversions, which is what the generator above builds off the type's own field list.
