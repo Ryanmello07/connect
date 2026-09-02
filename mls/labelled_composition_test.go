@@ -554,6 +554,142 @@ func TestTheLabelledConstructionCheckBuildsNoNameOnThePathAMessageTakes(t *testi
 	}
 }
 
+// A composition parked on a struct FIELD, in both spellings of a store.
+//
+// A control rather than a member of this package, for the reason the test below gives: the
+// only struct field composition in the tree reaches no labelled construction, so the derived
+// tables cannot tell a walk that reads this shape from one that does not.
+const labelledStoredCompositionControl = `package mls
+
+type carrier struct {
+	stored []byte
+}
+
+func (self *carrier) fill(v syntax.Marshaler) error {
+	encoded, err := syntax.Marshal(v)
+	if err != nil {
+		return err
+	}
+	self.stored = encoded
+	return nil
+}
+
+func build(v syntax.Marshaler) (*carrier, error) {
+	encoded, err := syntax.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return &carrier{stored: encoded}, nil
+}
+`
+
+// Two compositions off two writers, one of which a caller can grow and one of which nobody
+// can. They are the same statements in the same order and differ in one method name, which is
+// the whole of what the width reading has to see.
+const labelledWriterWidthControl = `package mls
+
+func fixedWidth(generation uint32) []byte {
+	writer := syntax.NewWriter()
+	writer.WriteUint32(generation)
+	return mlsLabelBytes(writer)
+}
+
+func callersOctets(value []byte) []byte {
+	writer := syntax.NewWriter()
+	writer.WriteOpaque(value)
+	return mlsLabelBytes(writer)
+}
+`
+
+// One control parsed the way the walk parses this package, with its declarations indexed.
+func labelledControl(t *testing.T, name string, source string) (parsedSource, map[string][]labelledDeclaration) {
+	t.Helper()
+	parsed := mustParseText(t, name, source)
+	return parsed, labelledDeclarationsIn([]parsedSource{parsed})
+}
+
+// The expression one declaration answers, for a control whose whole body is a return.
+func labelledControlAnswer(t *testing.T, function *ast.FuncDecl) ast.Expr {
+	t.Helper()
+	last := function.Body.List[len(function.Body.List)-1]
+	returned, isReturn := last.(*ast.ReturnStmt)
+	if !isReturn || len(returned.Results) != 1 {
+		t.Fatalf("the control %s does not end in a single valued return", function.Name.Name)
+	}
+	return returned.Results[0]
+}
+
+// Every reading this walk grew is driven over a body known to hold the shape it looks for.
+//
+// THE DERIVED TABLES CANNOT DO THIS, and that is the whole reason this test exists rather than
+// being folded into them. They compare the walk against the tree, and the tree does not have
+// to carry a member of every shape the walk can read. Measured, against the tree as it stands:
+// with labelledCompositionFieldsIn returning nothing, and separately with
+// labelledFixedWidthComposition answering true unconditionally, the gate passed and so did all
+// 1687 tests of ./mls/... and ./message/.... The only struct field composition in this package
+// -- KeySchedule.groupContextBytes -- reaches no labelled construction, and the only fixed
+// width one is the single row whose answer does not move when the rule stops discriminating.
+//
+// A reading nothing drives is a reading somebody deletes, which is the sentence
+// TestEveryLabelledConstructionRefusesALabelTooLongToBeOneField is written under. So each is
+// driven over a CONTROL: source this file writes, holding the shape, parsed by the same parser
+// the gate reads the package with, which is the idiom parsedSource was declared for.
+func TestEveryReadingOfTheCompositionWalkSeesTheShapeItLooksFor(t *testing.T) {
+	// the control's own producer, named rather than derived: what is under test is the
+	// reading, and a control that had to bootstrap the producer relation as well would fail
+	// for two reasons at once
+	producers := map[string]bool{"mlsLabelBytes": true}
+
+	t.Run("a composition stored on a struct field", func(t *testing.T) {
+		parsed, _ := labelledControl(t, "stored_composition_control.go", labelledStoredCompositionControl)
+		for _, entry := range []struct {
+			receiver string
+			name     string
+		}{
+			// assigned onto a selector after the struct exists
+			{receiver: "*carrier", name: "fill"},
+			// and written at the composite literal that builds it, which is the spelling
+			// newKeyScheduleFromParts uses
+			{receiver: "", name: "build"},
+		} {
+			body := parsed.declarationOf(t, entry.receiver, entry.name).Body
+			stored := labelledCompositionFieldsIn(body, producers,
+				labelledCompositionLocals(body, producers, nil))
+			if stored["stored"] != "syntax.Marshal" {
+				t.Errorf("%s stores a composition on the field and the walk read %q from it",
+					entry.name, stored["stored"])
+			}
+		}
+	})
+
+	t.Run("a composition whose size the encoding fixes", func(t *testing.T) {
+		parsed, index := labelledControl(t, "writer_width_control.go", labelledWriterWidthControl)
+		types := labelledParameterTypes([]parsedSource{parsed})
+		carriers := labelledFieldCarrierTypes([]parsedSource{parsed})
+		for _, entry := range []struct {
+			name  string
+			fixed bool
+		}{
+			{name: "fixedWidth", fixed: true},
+			{name: "callersOctets", fixed: false},
+		} {
+			function := parsed.declarationOf(t, "", entry.name)
+			answered := labelledControlAnswer(t, function)
+			// the inline reading first, since a width answer about an expression the walk
+			// never reaches as a composition would be an answer about nothing
+			if labelledInlineComposition(answered, producers) == "" {
+				t.Fatalf("%s answers a composition inline and the inline reading did not see one",
+					entry.name)
+			}
+			got := labelledFixedWidthComposition(function.Body, answered, index[entry.name][0],
+				labelledCompositionLocals(function.Body, producers, nil), types, carriers)
+			if got != entry.fixed {
+				t.Errorf("%s: the width reading answered %v, want %v", entry.name, got, entry.fixed)
+			}
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // the class, derived off the source rather than listed
 // ---------------------------------------------------------------------------
