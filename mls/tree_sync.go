@@ -208,6 +208,14 @@ func (self *RatchetTree) validateStructure() error {
 // key_package leaf turning up at a position that has just committed is refusable. This door
 // cannot state it and does not pretend to.
 //
+// THE PROPOSAL VALIDATOR'S HALF HAS LANDED and the update path's has not, which is worth saying
+// here because this paragraph is where a reader comes to find out. validate_proposals.go's
+// validateUpdateLeafNodeIsValidForAnUpdate is section 12.1.2's door: it expects the update source
+// at the sender's own index under the group's own id. The commit half -- an UpdatePath's leaf,
+// expected to carry the commit source at the sender's position -- has no caller in this package
+// yet, and TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap is what holds that gap
+// visible rather than leaving it to this sentence.
+//
 // An unknown source is refused too, by marshalCore, which is why the self comparison is not a
 // hole: the preimage for a fourth source cannot be built at all.
 func (self *RatchetTree) validateLeaves(ctx *TreeValidationContext) error {

@@ -605,6 +605,19 @@ type LeafValidationContext struct {
 	// with key_package, proposal validation with update, the tree and the update path with
 	// commit -- and a validator that did not compare against an expectation would accept a
 	// key_package leaf, lifetime and all, exactly where an update leaf belongs.
+	//
+	// TWO OF THOSE THREE ARE WRITTEN, and this paragraph says which because it once did not.
+	// key_package.go states key_package and validate_proposals.go's
+	// validateUpdateLeafNodeIsValidForAnUpdate states update; the COMMIT door is still owed,
+	// and it belongs to the client processing a commit rather than to the tree -- see
+	// MergeUpdatePath, which says in as many words that it does not verify the leaf's
+	// signature. The sentence above described all three for as long as only one of them
+	// existed, which is how an Update's leaf came to reach the tree with nothing having
+	// validated it at all. TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap now
+	// derives the source class and the door class and holds them against each other, so the
+	// commit door is an admitted gap that fails on the commit that closes it rather than a
+	// sentence nobody can check. tree_sync.go's whole tree sweep is not one of the three: it
+	// INFERS the source from the leaf, and its own header says why.
 	ExpectedSource LeafNodeSource
 
 	// RequiredCaps is the group's required_capabilities extension body, or nil for a group

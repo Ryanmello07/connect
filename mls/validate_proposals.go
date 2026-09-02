@@ -1,7 +1,9 @@
 // RFC 9420 section 12.2 proposal-list validation, one named function per ValSem code so the
 // negative tests the validation plan owns have a specific target, plus the three list rules
-// section 12.2 states with no code of their own. Every rule runs on the sender side and on the
-// receiver side, from the same input.
+// section 12.2 states with no code of their own, plus the two rules section 12.2's FIRST
+// invalidation condition reaches -- "It contains an individual proposal that is invalid as
+// specified in Section 12.1" -- for section 12.1.2's Update. Every rule runs on the sender side and
+// on the receiver side, from the same input.
 //
 // THE ORDER THE RULES RUN IN, and the one place it is not the plan's. ValSem113 runs FIRST rather
 // than thirteenth, and the two structural rules beside it run before every ValSem code. That is

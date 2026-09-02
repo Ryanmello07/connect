@@ -969,7 +969,7 @@ func updateDoorFaults() map[string]updateDoorFault {
 					testProposalList(t, testUpdateOf(1, leaf)))
 			}},
 		"a leaf another member signed": {
-			clause: "the signature rule", inner: ErrCryptoBadSignature,
+			clause: "the signature rule", inner: errBadSignature,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
 				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
@@ -979,7 +979,7 @@ func updateDoorFaults() map[string]updateDoorFault {
 		// the leaf index half of the section 7.2 context select: bob's own leaf, bob's own
 		// signature, signed at leaf 0 and offered at leaf 1
 		"a leaf signed at another index": {
-			clause: "the signature rule, over the leaf index it is bound to", inner: ErrCryptoBadSignature,
+			clause: "the signature rule, over the leaf index it is bound to", inner: errBadSignature,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
 				leaf, _ := testUpdateLeafNode(t, crypto, members[1], testValidationGroupId(), LeafIndex(0))
@@ -988,7 +988,7 @@ func updateDoorFaults() map[string]updateDoorFault {
 			}},
 		// and the group id half of it
 		"a leaf signed in another group": {
-			clause: "the signature rule, over the group id it is bound to", inner: ErrCryptoBadSignature,
+			clause: "the signature rule, over the group id it is bound to", inner: errBadSignature,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
 				leaf, _ := testUpdateLeafNode(t, crypto, members[1], []byte("another group"), LeafIndex(1))
@@ -1032,6 +1032,31 @@ func updateDoorFaults() map[string]updateDoorFault {
 					Extension{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}})
 				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
 					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+			}},
+		// MASTER section 5.3's range check, which (*LeafNode).Validate makes on the whole entry
+		// rather than on its body. An update is how a member changes its device keys, so a
+		// malformed urmessage_leaf_keys body arriving by Update is the ordinary way this clause is
+		// reached at all -- and it reached the tree unread.
+		"a leaf whose urmessage_leaf_keys body does not parse": {
+			clause: "the leaf keys range check", inner: ErrLeafKeysExtensionInvalid,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				leaf.Extensions[0].ExtensionData = []byte{0xff, 0xff}
+				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+			}},
+		// the argument rule, which is a refusal of this door like any other: every rule of this
+		// file is reachable with a provider nobody supplied, and a validator that dereferenced one
+		// would take the caller's process rather than its call
+		"a validation input carrying no crypto provider": {
+			clause: "the provider rule", inner: ErrNilCryptoProvider,
+			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
+				tree, members := testTreeWith(t, crypto, "alice", "bob")
+				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, update))
+				in.Crypto = nil
+				return in
 			}},
 		// erratum 8745 at the list level, and the row this door exists for as much as the source
 		// row does. ERRATA.md says this package applies section 13.4's group extension rule to
@@ -1117,6 +1142,194 @@ func TestTheUpdateDoorRefusesWhatEveryOtherUpdateRuleOfThisFileReadsPast(t *test
 					name, aggregated, ErrUpdateLeafNodeInvalid)
 			}
 		})
+	}
+}
+
+// leafValidationRefusalDeclarations are the methods whose bodies decide what
+// (*LeafNode).Validate can answer: the validator itself and the two helpers it delegates to that
+// are declared beside it.
+//
+// Three and not one, because a clause delegated is still a clause this door reaches: the signature
+// rule is VerifySignature's body and the lifetime rule is validateLifetime's, and a derivation over
+// Validate alone would leave both outside the class and the table free to omit them.
+var leafValidationRefusalDeclarations = []string{"Validate", "VerifySignature", "validateLifetime"}
+
+// leafValidationRefusalNames is every package level error value those three bodies NAME, read off
+// leaf_node.go's source and the type checked package rather than listed.
+//
+// An identifier is a refusal when the package scope resolves it to a value of type error, which is
+// the shape every sentinel of this package has. That is the derivation and not a prefix match:
+// four of the nine are unexported and two of those carry no Err prefix at all.
+func leafValidationRefusalNames(t *testing.T) []string {
+	t.Helper()
+	pkg := typeCheckedPackage(t)
+	parsed := mustParseSource(t, "leaf_node.go")
+	found := map[string]bool{}
+	for _, name := range leafValidationRefusalDeclarations {
+		declaration := parsed.declarationOf(t, "*LeafNode", name)
+		ast.Inspect(declaration, func(node ast.Node) bool {
+			identifier, isIdentifier := node.(*ast.Ident)
+			if !isIdentifier {
+				return true
+			}
+			object := pkg.Scope().Lookup(identifier.Name)
+			if object == nil || object.Type() == nil || object.Type().String() != "error" {
+				return true
+			}
+			found[identifier.Name] = true
+			return true
+		})
+	}
+	return slices.Sorted(maps.Keys(found))
+}
+
+// leafValidationRefusals joins those names to the values, so a row can be said to cover one.
+//
+// Written here and held to the derived names in BOTH directions by the gate below, which is the
+// shape proposalValidationOwnedErrors already takes: a class computed from the same source it is
+// judging agrees with that source whatever the source says, and a class typed out beside it goes
+// stale in silence. Neither alone is worth anything; the two held against each other are.
+var leafValidationRefusals = map[string]error{
+	"ErrNilCryptoProvider":              ErrNilCryptoProvider,
+	"ErrLeafNodeSourceMismatch":         ErrLeafNodeSourceMismatch,
+	"errCredentialTypeNotListed":        errCredentialTypeNotListed,
+	"errBadSignature":                   errBadSignature,
+	"errCipherSuiteNotListed":           errCipherSuiteNotListed,
+	"errLeafExtensionNotListed":         errLeafExtensionNotListed,
+	"ErrLeafKeysExtensionInvalid":       ErrLeafKeysExtensionInvalid,
+	"errGroupContextExtensionNotListed": errGroupContextExtensionNotListed,
+	"ErrLeafNodeLifetime":               ErrLeafNodeLifetime,
+}
+
+// updateDoorClausesNoInputCanReach is the refusal of that class no input at THIS door can produce,
+// with the reason -- and it is the conclusion this task was asked to reach, written where it can be
+// checked rather than in a comment.
+//
+// Section 7.3's lifetime rule is the one clause an update leaf owes nothing to. The lifetime is a
+// variant field carried only under key_package, so validateLifetime returns before reading it for
+// every other source; a leaf whose source is key_package is refused by the leaf_node_source rule
+// first, so no input that reaches the lifetime clause reaches it AS AN UPDATE. What section 7.3
+// puts in its place is the update arm of the leaf_node_source rule, which is
+// validateUpdateChangesTheEncryptionKey's, and which is a rule about two leaves rather than a field
+// of the context.
+//
+// TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry asserts that rather than trusting
+// it, in both directions: an update leaf carrying an expired lifetime is accepted here, and the
+// same leaf under the key_package source with the same clock is refused.
+var updateDoorClausesNoInputCanReach = map[string]string{
+	"ErrLeafNodeLifetime": "the lifetime is a variant field only a key_package leaf carries, and a key_package leaf is refused by the leaf_node_source rule before validateLifetime is reached",
+}
+
+// TestEveryRefusalTheLeafValidatorCanAnswerHasAnUpdateDoorRowOrAnAdmittedReason is the gate that
+// stops updateDoorFaults from being the clauses somebody remembered.
+//
+// A table of section 7.3 clauses written by hand is exactly the shape this commit was sent to close
+// one level up: the package named three callers of (*LeafNode).Validate in a comment, wrote two,
+// and nothing reported the third. So the class is derived off the validator's own source, the table
+// is held to it, and a tenth refusal added to (*LeafNode).Validate by a later task fails here until
+// somebody either builds an input that reaches it or writes down why none can.
+func TestEveryRefusalTheLeafValidatorCanAnswerHasAnUpdateDoorRowOrAnAdmittedReason(t *testing.T) {
+	derived := leafValidationRefusalNames(t)
+	// the positive control: a scan that resolved nothing reports the clean bill a complete one
+	// reports, and Validate certainly names the source rule's own value
+	if !slices.Contains(derived, "ErrLeafNodeSourceMismatch") {
+		t.Fatalf("the scan read %v out of leaf_node.go, which certainly names ErrLeafNodeSourceMismatch, so it is reading something other than the validator",
+			derived)
+	}
+	if got := slices.Sorted(maps.Keys(leafValidationRefusals)); !slices.Equal(got, derived) {
+		t.Fatalf("%v name the refusals %v and leafValidationRefusals holds %v; the class this gate sweeps is the second",
+			leafValidationRefusalDeclarations, derived, got)
+	}
+	rows := updateDoorFaults()
+	for _, name := range derived {
+		value := leafValidationRefusals[name]
+		covered := ""
+		for _, row := range slices.Sorted(maps.Keys(rows)) {
+			if errors.Is(rows[row].inner, value) {
+				covered = row
+				break
+			}
+		}
+		reason, admitted := updateDoorClausesNoInputCanReach[name]
+		switch {
+		case covered != "" && admitted:
+			t.Errorf("%s is reached by the %q row and is also written down as reachable by no input, with the reason %q; one of the two is stale",
+				name, covered, reason)
+		case covered == "" && !admitted:
+			t.Errorf("(*LeafNode).Validate can answer %s and no row of updateDoorFaults builds an input that reaches it, so the update door's coverage of section 7.3 is asserted over %d clauses and not over that one",
+				name, len(rows))
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(updateDoorClausesNoInputCanReach)) {
+		if _, isRefusal := leafValidationRefusals[name]; !isRefusal {
+			t.Errorf("the admitted reasons name %s and the leaf validator answers no refusal of that name", name)
+		}
+	}
+	// and every row is about a refusal the validator can actually answer, which is the other
+	// direction: a row asserting a sentinel this door cannot produce would pass its own case by
+	// never having been reached
+	for _, row := range slices.Sorted(maps.Keys(rows)) {
+		reached := false
+		for _, name := range derived {
+			if errors.Is(rows[row].inner, leafValidationRefusals[name]) {
+				reached = true
+				break
+			}
+		}
+		if !reached {
+			t.Errorf("the %q row is held to %v and (*LeafNode).Validate names no refusal that value answers to",
+				row, rows[row].inner)
+		}
+	}
+}
+
+// TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry is the one clause of section 7.3
+// the update door owes nothing to, asserted in both directions.
+//
+// A key_package leaf's freshness is its lifetime. An update leaf carries none -- the field is a
+// variant of the section 7.2 select and is neither encoded nor signed under this source -- so the
+// Go struct's Lifetime holds whatever it was built with and reading it would be judging a leaf by
+// bytes nobody sent. Section 7.3 puts the update arm of the leaf_node_source rule there instead,
+// which is validateUpdateChangesTheEncryptionKey's.
+//
+// The second half is what makes the first half a statement about the SOURCE rather than about a
+// validator that has no lifetime clause at all: the same expired interval, under key_package with a
+// real clock, is refused.
+func TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := testTreeWith(t, crypto, "alice", "bob")
+	_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	// an interval that ended in 1970, which no clock and no skew can make current
+	leaf.Lifetime = Lifetime{NotBefore: 1, NotAfter: 2}
+	in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+		testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+	if err := validateUpdateLeafNodeIsValidForAnUpdate(in); err != nil {
+		t.Fatalf("the update door refused an update leaf carrying an expired lifetime with %v; the lifetime is a variant field this source does not carry, so nothing here may read it",
+			err)
+	}
+	if err := ValidateProposalList(in); err != nil {
+		t.Fatalf("the aggregate refused it with %v", err)
+	}
+	// and the clause exists: the same interval under the source that DOES carry it, with the
+	// clock every sending path passes
+	expired := &LeafValidationContext{
+		Crypto: crypto, Suite: crypto.Suite(), GroupId: testValidationGroupId(), LeafIndex: 1,
+		ExpectedSource: LeafNodeSourceUpdate,
+		NowMs:          uint64(max(time.Now().UnixMilli(), 1)),
+		ClockSkewMs:    leafLifetimeSkewSeconds * 1000,
+	}
+	if err := leaf.Validate(expired); err != nil {
+		t.Fatalf("the same leaf is refused under the update source once a clock is supplied, with %v; then the lifetime IS being read under a source that does not carry it",
+			err)
+	}
+	expired.ExpectedSource = LeafNodeSourceKeyPackage
+	leaf.LeafNodeSource = LeafNodeSourceKeyPackage
+	if err := leaf.Sign(crypto, members[1].SigPriv, nil, 0); err != nil {
+		t.Fatalf("re-sign the leaf under the key_package source: %v", err)
+	}
+	if err := leaf.Validate(expired); !errors.Is(err, ErrLeafNodeLifetime) {
+		t.Fatalf("the same expired interval under key_package answered %v, want %v; if that clause cannot fire then the update half above asserts nothing",
+			err, ErrLeafNodeLifetime)
 	}
 }
 
