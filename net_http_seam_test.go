@@ -157,6 +157,11 @@ func TestClientStrategySeamDefaultsAreDisabled(t *testing.T) {
 // never "tcp", so against an IPv4 literal it records "tcp4" whether or not the
 // bypass was ever closed -- a guard that passes on the unfixed code it exists
 // to catch.
+//
+// The target is a NAME, not an address literal. controlDialNetwork
+// deliberately leaves a literal's network string alone -- the address already
+// fixes the family, so narrowing there can only break a working dial -- and
+// the seam this test exists to guard is the one that steers a RESOLUTION.
 func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) {
 	SetControlIpFamilyPolicy(IpFamilyForce4)
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)
@@ -175,11 +180,12 @@ func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) 
 	}
 
 	dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
-	// the address is never reached: 198.51.100.0/24 is TEST-NET-2 and the dial
-	// fails. What is under test is the NETWORK STRING the seam resolved.
+	// the host is never reached: .invalid is reserved by RFC 2606 and never
+	// resolves. What is under test is the NETWORK STRING the seam resolved,
+	// which is recorded before the dial is attempted.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := dialTls(ctx, "tcp", "198.51.100.1:443")
+	conn, err := dialTls(ctx, "tcp", "family-seam.invalid:443")
 	if err == nil {
 		conn.Close()
 	}

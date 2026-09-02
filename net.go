@@ -72,7 +72,7 @@ type DialContextSettings struct {
 }
 
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
-	network, networkErr := controlDialNetwork(network)
+	network, networkErr := controlDialNetwork(network, addr)
 	if networkErr != nil {
 		return nil, networkErr
 	}

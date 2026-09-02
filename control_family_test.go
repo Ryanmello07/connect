@@ -36,7 +36,7 @@ func TestControlDialNetworkForce(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			SetControlIpFamilyPolicy(test.policy)
 			defer SetControlIpFamilyPolicy(IpFamilyAuto)
-			got, err := controlDialNetwork(test.network)
+			got, err := controlDialNetwork(test.network, "api.example:443")
 			if test.wantErr {
 				if err == nil {
 					t.Fatalf("expected an error for %s under %d", test.network, test.policy)
@@ -48,6 +48,61 @@ func TestControlDialNetworkForce(t *testing.T) {
 			}
 			if got != test.want {
 				t.Fatalf("got %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// A dial whose target is ALREADY AN IP LITERAL has no family choice left in
+// it, so narrowing it can never change which family is dialed -- it can only
+// turn a working dial into an instant "no suitable address found". Measured:
+// `dial tcp6 1.1.1.1:443` fails immediately.
+//
+// This is the whole fallback layer, not a corner case. The extender dialers
+// dial extenderConfig.Ip (net_extender.go) and the remote plain-DNS resolver
+// dials a configured resolver address (net_http_doh.go), both IP literals,
+// both through ConnectSettings.DialContext. A demotion learned on the api path
+// used to take every one of them down with it -- and because they fail at
+// CONNECT, none of them recorded anything that could undo the demotion.
+func TestControlDialNetworkNeverNarrowsAnIPLiteral(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+
+	tests := []struct {
+		name    string
+		policy  IpFamilyPolicy
+		demote  int
+		network string
+		addr    string
+	}{
+		{"force6 leaves an ipv4 extender literal alone", IpFamilyForce6, 0, "tcp", "192.0.2.7:443"},
+		{"force4 leaves an ipv6 extender literal alone", IpFamilyForce4, 0, "tcp", "[2001:db8::7]:443"},
+		{"a demotion of 6 leaves an ipv4 literal alone", IpFamilyAuto, 6, "tcp", "1.1.1.1:443"},
+		{"a demotion of 4 leaves an ipv6 literal alone", IpFamilyAuto, 4, "tcp", "[2606:4700:4700::1111]:53"},
+		{"a demotion leaves a bare literal alone", IpFamilyAuto, 6, "udp", "1.1.1.1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			controlFamilyClear()
+			defer controlFamilyClear()
+			SetControlIpFamilyPolicy(test.policy)
+			defer SetControlIpFamilyPolicy(IpFamilyAuto)
+			if test.demote != 0 {
+				SetControlIpFamilyPolicy(IpFamilyAuto)
+				if !controlFamilyDemote(test.demote) {
+					t.Fatal("expected the demotion to take")
+				}
+				SetControlIpFamilyPolicy(test.policy)
+			}
+
+			got, err := controlDialNetwork(test.network, test.addr)
+			if err != nil {
+				t.Fatalf("%v -- a literal dial must never be refused", err)
+			}
+			if got != test.network {
+				t.Fatalf(
+					"got %q for %s, want %q unchanged -- narrowing a literal can only break it",
+					got, test.addr, test.network)
 			}
 		})
 	}
@@ -133,7 +188,7 @@ func TestControlFamilyDemoteRefusedWhenOtherFamilyUnusable(t *testing.T) {
 						"left is the one being demoted",
 					test.demote, 10-test.demote)
 			}
-			network, err := controlDialNetwork("tcp")
+			network, err := controlDialNetwork("tcp", "api.example:443")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -337,7 +392,7 @@ func TestControlFamilyDemoteNarrowsToTheOtherFamily(t *testing.T) {
 			if !controlFamilyDemote(test.demote) {
 				t.Fatal("expected the demotion to take")
 			}
-			network, err := controlDialNetwork("tcp")
+			network, err := controlDialNetwork("tcp", "api.example:443")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -362,7 +417,7 @@ func TestForceBeatsDemotion(t *testing.T) {
 
 	SetControlIpFamilyPolicy(IpFamilyForce6)
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)
-	network, err := controlDialNetwork("tcp")
+	network, err := controlDialNetwork("tcp", "api.example:443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +463,7 @@ func TestControlFamilyDemotionExpires(t *testing.T) {
 
 	controlFamilyDemote(6)
 	now = now.Add(controlFamilyDemotionBase + time.Second)
-	network, err := controlDialNetwork("tcp")
+	network, err := controlDialNetwork("tcp", "api.example:443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +484,7 @@ func TestNetworkChangedClearsTheLedger(t *testing.T) {
 
 	controlFamilyDemote(6)
 	NetworkChanged()
-	network, err := controlDialNetwork("tcp")
+	network, err := controlDialNetwork("tcp", "api.example:443")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -70,7 +70,25 @@ func ControlIpFamilyPolicy() IpFamilyPolicy {
 // that asked for tcp6 by name must not silently be given tcp4. A DEMOTION
 // never errors -- it is a heuristic, and a heuristic must not fail a caller's
 // explicit request.
-func controlDialNetwork(network string) (string, error) {
+//
+// `addr` is the dial target, and is load bearing: see the literal check below.
+func controlDialNetwork(network string, addr string) (string, error) {
+	// An address that is ALREADY AN IP LITERAL has no family choice left in
+	// it. There is no resolution step to steer, so narrowing cannot change
+	// which family is dialed -- it can only turn a dial that would have worked
+	// into an instant "no suitable address found", which is what
+	// `dial tcp6 1.1.1.1:443` returns.
+	//
+	// That is not a corner case, it is the whole fallback layer: the extender
+	// dialers dial extenderConfig.Ip (net_extender.go), and the remote plain
+	// DNS resolver dials a configured resolver address (net_http_doh.go). A
+	// demotion learned on the api path used to take both of them down with it,
+	// and every one of those failures is a CONNECT failure, so none of them
+	// recorded anything that could undo the demotion.
+	if isIPLiteralDialAddr(addr) {
+		return network, nil
+	}
+
 	policy := ControlIpFamilyPolicy()
 
 	switch network {
@@ -105,6 +123,20 @@ func controlDialNetwork(network string) (string, error) {
 		return network + "6", nil
 	}
 	return network, nil
+}
+
+// isIPLiteralDialAddr reports whether a dial target names an address rather
+// than a host. Accepts a bare literal as well as host:port, because callers
+// reach ConnectSettings.DialContext with both shapes.
+func isIPLiteralDialAddr(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return net.ParseIP(host) != nil
 }
 
 const (
@@ -176,6 +208,33 @@ func controlFamilyDemote(family int) bool {
 	loggerOrDefault(nil).Infof(
 		"[family]demote family=%d strikes=%d for=%s\n", family, strikes, backoff)
 	return true
+}
+
+// controlFamilyUndemote drops any demotion of `family`, strike count included,
+// and reports whether there was one.
+//
+// The ledger records evidence, and evidence can be contradicted. Two things
+// contradict it, both of them dial failures the ledger would otherwise never
+// hear about: the family we demoted ONTO failing to connect at all, and the
+// in-place retry over that family failing too. The spec is explicit about the
+// second -- "a second failure over the second family is also not a family
+// problem" -- and the first is the only route back from a demotion that took
+// the user offline, because a connect failure never reaches the strike path.
+//
+// The entry is removed rather than decremented. The backoff exists to stop a
+// CONFIRMED bad path from costing the user repeatedly; a demotion the evidence
+// no longer supports should not leave a doubled sentence behind for the next
+// one.
+func controlFamilyUndemote(family int) bool {
+	controlFamilyLedger.mu.Lock()
+	_, had := controlFamilyLedger.demoted[family]
+	delete(controlFamilyLedger.demoted, family)
+	controlFamilyLedger.mu.Unlock()
+
+	if had {
+		loggerOrDefault(nil).Infof("[family]undemote family=%d (contradicted)\n", family)
+	}
+	return had
 }
 
 // controlFamilyClear drops everything learned. Wired to NetworkChanged.
