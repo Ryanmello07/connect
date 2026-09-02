@@ -321,7 +321,41 @@ type PreSharedKeyInput struct {
 // exactly: a psk_input computed for position i of an n entry list is not the psk_input for
 // any other position, or for the same position in a list of another length, so a
 // contribution cannot be lifted out of one list and spliced into another.
+//
+// THE RESULT IS BOUNDED, and this is the second member of a class rather than a precaution.
+// PskSecret hands these bytes to ExpandWithLabel as the CONTEXT of "derived psk", which is one
+// opaque<V> of a KDFLabel, and ExpandWithLabel is a CryptoProvider method that cannot report a
+// refusal -- an over long context takes the process down inside crypto_labels.go's
+// mlsLabelBytes. A PSKLabel is a COMPOSITION: the psk_id it inlines carries a psk_group_id and a
+// psk_nonce which are each bounded by syntax.MaxVectorLength on their own and are unbounded
+// together, and both arrive from the wire in a Welcome or in a PreSharedKey proposal. So the same
+// one valid message that crashed every member through the proposal cache reaches the key schedule
+// by this route as well, and the bound is here for the reason it is there: this is the outermost
+// declaration on the path whose signature can say no.
 func marshalPskLabel(id *PreSharedKeyId, index uint16, count uint16) ([]byte, error) {
+	encoded, err := encodePskLabel(id, index, count)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkLabelledFieldLength("psk label", len(encoded)); err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+// The encoding on its own, with no bound, which is the half a caller must never reach.
+//
+// It is a declaration rather than the first four statements of the one above it for a reason
+// that is about the TEST and is worth stating rather than leaving as a shape somebody tidies
+// away. The boundary this defect turns on is a length, so the case that matters is a PSKLabel
+// of EXACTLY syntax.MaxVectorLength octets and one either side of it, and a test cannot state
+// that length unless it can encode a label the bound would refuse. The alternative is a test
+// that re-encodes a PSKLabel to measure one, which is a SECOND OPINION about an encoding --
+// exactly what this file's own comment above refuses a length prefix here for, and what
+// key_package.go's "assembled exactly once" gate exists to stop. So the split is the encoding
+// staying observable rather than a layer for its own sake, and nothing but marshalPskLabel and
+// that boundary test calls it.
+func encodePskLabel(id *PreSharedKeyId, index uint16, count uint16) ([]byte, error) {
 	w := syntax.NewWriter()
 	if err := id.MarshalMLS(w); err != nil {
 		return nil, err

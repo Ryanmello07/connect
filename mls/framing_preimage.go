@@ -149,6 +149,24 @@ func (self *AuthenticatedContent) ConfirmedTranscriptHashInput() ([]byte, error)
 // The label is the entire domain separation between a proposal reference and a key package
 // reference, and a second spelling of it here would be a second opinion about which of the two a
 // given digest is.
+//
+// THE MARSHAL IS BOUNDED AND THE REFERENCE IS TAKEN FROM WHAT IT ANSWERS, and that order is the
+// whole of why this line is not a plain syntax.Marshal. MakeProposalRef wraps these bytes in ONE
+// opaque<V> of a RefHashInput, and RefHash cannot report a refusal — it answers a digest by the
+// fixed signature the tree and the framing layers call it through, so an over long value stops
+// the process instead. An AuthenticatedContent is a COMPOSITION: its group_id, its
+// authenticated_data, the arms of the proposal it carries and its signature are each bounded by
+// syntax.MaxVectorLength and their SUM is not, and a decoder produces such a value rather than
+// refusing it. Measured: an Add whose key package carries a BasicCredential of
+// MaxVectorLength-64 octets marshals to 1050064 octets, decodes back, and signs and verifies as
+// an authentic member message.
+//
+// So the refusal is HERE, at the outermost declaration that can carry one, and not at
+// (*ProposalCache).Store or at any other caller. Store computes this reference before its
+// ceilings on purpose — the reference is the key, so a ceiling asked first would refuse a
+// re-delivery of a message the cache already holds — which means a bound written into Store
+// would sit downstream of the crash it was written to prevent, and would do nothing for the
+// callers of this method that are not Store.
 func (self *AuthenticatedContent) ProposalRef(crypto CryptoProvider) (ProposalRef, error) {
 	// the provider first, before the receiver is judged. A body that checked the content type
 	// first would answer ErrContentArmMismatch to a caller whose actual mistake was passing no
@@ -159,7 +177,7 @@ func (self *AuthenticatedContent) ProposalRef(crypto CryptoProvider) (ProposalRe
 	if self.Content.ContentType != ContentTypeProposal {
 		return nil, fmt.Errorf("%w: a proposal ref requires a proposal", ErrContentArmMismatch)
 	}
-	encoded, err := syntax.Marshal(self)
+	encoded, err := marshalBoundedComposition("authenticated content", self)
 	if err != nil {
 		return nil, err
 	}

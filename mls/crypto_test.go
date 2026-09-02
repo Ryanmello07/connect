@@ -2871,6 +2871,14 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	// context and cover with a transcript hash.
 	"compareMemberIds": "answers -1, 0 or 1 and no bytes; what it produces is an ordering",
 	"sameMemberId":     "answers a bool and no bytes; what it produces is a verdict",
+	// the labelled constructions' length gate, on VerifyAuthenticatedContent's terms. It
+	// answers whether a value fits in one length prefixed field and produces no storage at
+	// all, so the aliasing and fresh storage halves have nothing to read. The half that
+	// still runs is the one that matters and it matters more here than almost anywhere: this
+	// runs on a peer's message BEFORE the signature over it is checked, so a gate that
+	// normalised or truncated what it was measuring would be editing an unverified message
+	// in place and handing the edited bytes to the verify.
+	"checkLabelledConstruction": "answers an error and no bytes; what it produces is a verdict about a length",
 }
 
 // A construction handed a caller's bytes that this gate does not hold, named with the
@@ -2983,6 +2991,12 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		}},
 		{name: "mlsSignContent", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{mlsSignContent("label", take(value))}
+		}},
+		{name: "checkLabelledConstruction", call: func(take func([]byte) []byte) [][]byte {
+			if err := checkLabelledConstruction("probe", "label", take(value)); err != nil {
+				t.Fatalf("checkLabelledConstruction over a value that fits: %v", err)
+			}
+			return nil
 		}},
 		{name: "mlsEncryptContext", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{mlsEncryptContext("label", take(value))}

@@ -37,22 +37,151 @@ import (
 // silently interoperating with this one.
 const MlsLabelPrefix = "MLS 1.0 "
 
-// The sticky writer's error, taken once (convention C2).
+// The sticky writer's error, carried OUT to the caller rather than taken down the process
+// with it (convention C2).
 //
-// Every labelled construction in this file returns bytes and no error, because the
-// interface spec A section 3.3 fixes on CryptoProvider has no error return and neither
-// does RefHash. That is sound rather than a shortcut: a syntax.Writer's only failure mode
-// is a vector longer than its limit, and every value that reaches a labelled construction
-// arrived through a decode or an encode already bounded by syntax.MaxVectorLength. A
-// panic here is therefore unreachable — and it is a panic rather than a truncation
-// because a label that describes more bytes than it carries is exactly the shape a
-// signature bypass is built out of.
-func mlsLabelBytes(w *syntax.Writer) []byte {
+// syntax.ErrLengthExceedsMax survives the wrap, so a caller asks errors.Is which refusal
+// this was instead of reading the string.
+func mlsLabelPreimage(w *syntax.Writer) ([]byte, error) {
 	encoded, err := w.Bytes()
 	if err != nil {
-		panic("mls: a labelled preimage could not be encoded: " + err.Error())
+		return nil, fmt.Errorf("mls: a labelled preimage could not be encoded: %w", err)
+	}
+	return encoded, nil
+}
+
+// mlsLabelPreimage for the constructions whose signatures cannot carry a refusal.
+//
+// THE PREMISE THIS COMMENT USED TO STATE WAS FALSE, and the correction is written out
+// rather than the sentence quietly deleted, because the false version was true FIELD BY
+// FIELD and that is what let it survive review. It said: every value that reaches a
+// labelled construction arrived through a decode or an encode already bounded by
+// syntax.MaxVectorLength, so a panic here is unreachable.
+//
+// Every FIELD does obey that limit. A COMPOSITION of fields does not. RefHash wraps a
+// whole serialized AuthenticatedContent in ONE opaque<V>, and that structure's group_id,
+// authenticated_data, proposal arms and signature are each bounded by a mebibyte with an
+// UNBOUNDED SUM. Measured: an Add whose key package carries a BasicCredential of
+// MaxVectorLength-64 octets marshals to 1050045 octets, decodes back through
+// syntax.Unmarshal, and signs and verifies as an authentic member message — and it took
+// the process down in five separate places, ProposalCache.Store, KeyPackage.Ref,
+// DeriveJoinerSecret, EncryptWithLabel and VerifyWithLabel, the last of which runs BEFORE
+// any application level check a caller could have made. One member, one valid proposal,
+// every other member crashed.
+//
+// What makes the panic unreachable NOW is not that premise but a bound, applied by the
+// outermost declaration that CAN report one, in the shape owner_successor.go's
+// successionPreimage already uses. Two instruments, and which of them applies is decided by
+// the signature rather than by taste: checkLabelledConstruction at the four entry points
+// into this layer that carry an error — SignWithLabel, VerifyWithLabel, EncryptWithLabel and
+// DecryptWithLabel — and marshalBoundedComposition where a composition is BUILT, for the two
+// constructions whose signatures cannot carry a refusal at all.
+//
+// TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere derives that
+// set of call sites off the source rather than trusting this paragraph, which is the whole
+// lesson of the premise above: a sentence about reachability that no test reads is a
+// sentence that stays written after it stops being true. It anchors on the declaration that
+// PANICS on an encoder's refusal, walks BACK to every parameter whose bytes reach it, and
+// requires every value this package builds with a syntax encoder and sends there to have
+// been bounded first. A composition of a shape nobody has thought of yet is one that walk
+// reports, which is exactly what a premise about fields could not do.
+//
+// It stays a panic rather than becoming a truncation for the reason it always did: a label
+// that describes more bytes than it carries is exactly the shape a signature bypass is
+// built out of. It stays a panic rather than an error only where the signature leaves no
+// room for one — mlsKdfLabel under ExpandWithLabel, DeriveSecret and DeriveTreeSecret, which
+// are CryptoProvider methods, and RefHash, which the tree and the framing layers reach
+// through a fixed reference maker — and nowhere else. Answering nil there instead would be
+// worse than the crash rather than safer: two references that are both nil are two proposals
+// with one name, which is the collision the labels in this file exist to prevent.
+//
+// WHAT IS LEFT, written down rather than glossed. The walk is over THIS PACKAGE, so what it
+// establishes is that no message a PEER sends reaches the panic: every path from decoded
+// bytes to a labelled construction is one of the bounded sites it derives. An out-of-package
+// caller that hand builds a value past the limit and hands it straight to the exported
+// RefHash, MakeKeyPackageRef or MakeProposalRef, or to a provider's ExpandWithLabel, still
+// panics. That is a local programming error of the same kind as the wrong length seed handed
+// to ed25519.NewKeyFromSeed that SignWithLabel's own comment records, and closing it means
+// widening the CryptoProvider interface, which is pinned.
+func mlsLabelBytes(w *syntax.Writer) []byte {
+	encoded, err := mlsLabelPreimage(w)
+	if err != nil {
+		panic(err.Error())
 	}
 	return encoded
+}
+
+// checkLabelledFieldLength refuses a value too long to be ONE length prefixed field of a
+// labelled construction.
+//
+// The bound is stated over the VALUE's own length and not over the finished preimage,
+// because a labelled construction wraps the caller's value in exactly one opaque<V> and
+// the limit is that field's. The label and the varint prefixes beside it are this file's
+// own constants; a preimage that failed once the value had passed this check would be a
+// bug here rather than a message a peer sent.
+//
+// A PRE-CHECK returning syntax.ErrLengthExceedsMax rather than a write that latches it,
+// which is owner_successor.go:successionPreimage's shape, and it is that shape because the
+// value being judged is a PEER's: a library that panics on a peer's message hands every
+// member of a group a remote crash that one valid proposal reaches.
+//
+// It takes the LENGTH rather than the field, so that the one comparison in this file can
+// also judge a concatenation that must not be built in order to be measured — the prefixed
+// label of checkLabelledConstruction below. Two spellings of "does this fit in one field"
+// are two things that can disagree, and this is the one.
+func checkLabelledFieldLength(what string, length int) error {
+	if length > syntax.MaxVectorLength {
+		return fmt.Errorf("%w: the serialized %s is %d octets and one labelled field holds at most %d",
+			syntax.ErrLengthExceedsMax, what, length, syntax.MaxVectorLength)
+	}
+	return nil
+}
+
+// checkLabelledConstruction refuses a labelled construction that cannot be encoded. It is
+// what the four entry points into this layer whose signatures CAN carry a refusal ask before
+// they build a preimage.
+//
+// BOTH fields and not only the value. A labelled construction is two opaque<V> in one
+// preimage and either of them alone latches the writer, so a gate over the value only is a
+// gate that reports half the shape it was written for.
+//
+// The VALUE is the half this exists for and the half a peer controls: it is a COMPOSITION, a
+// whole serialized structure whose fields are each bounded by a mebibyte and whose sum is
+// not, which is the defect the paragraph above mlsLabelBytes records. The LABEL is an RFC
+// 9420 constant at every call this package makes and could be argued out of the check on
+// that ground; it is checked anyway, because these entry points are exported and take it
+// from a caller, and because a rule that holds for one field of a two field preimage is a
+// rule the next reader has to derive over again.
+//
+// The label is measured WITH the prefix, since the prefix is inside the field whose length
+// is being declared, and it is MEASURED rather than concatenated: building a second copy of
+// mlsSignContent's label on every signature and every verify is a cost every message in the
+// system pays for a branch no message takes.
+func checkLabelledConstruction(what string, label string, value []byte) error {
+	if err := checkLabelledFieldLength(what+" label", len(MlsLabelPrefix)+len(label)); err != nil {
+		return err
+	}
+	return checkLabelledFieldLength(what, len(value))
+}
+
+// marshalBoundedComposition serializes a structure that is about to become ONE length
+// prefixed field of a labelled construction, and refuses it when the SUM of its fields
+// does not fit even though every field did.
+//
+// syntax.Marshal alone is not enough, and that gap IS the defect this exists for: it
+// bounds each field it writes and says nothing about the total, so it answers 1050045
+// octets happily and the labelled field that wraps them refuses. Every caller in this
+// package that hands a serialized structure to RefHash or to ExpandWithLabel — the two
+// entry points whose signatures cannot report a refusal — comes through here.
+func marshalBoundedComposition(what string, v syntax.Marshaler) ([]byte, error) {
+	encoded, err := syntax.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkLabelledFieldLength(what, len(encoded)); err != nil {
+		return nil, err
+	}
+	return encoded, nil
 }
 
 // struct { uint16 length; opaque label<V>; opaque context<V> } KDFLabel, serialized.
@@ -187,6 +316,9 @@ func (self *suiteCryptoProvider) SignWithLabel(priv SignaturePrivateKey, label s
 	if len(priv) != self.params.NsigPriv {
 		return nil, ErrBadSignatureKey
 	}
+	if err := checkLabelledConstruction("signature content", label, content); err != nil {
+		return nil, err
+	}
 	return ed25519.Sign(ed25519.NewKeyFromSeed(priv), mlsSignContent(label, content)), nil
 }
 
@@ -224,6 +356,9 @@ func (self *suiteCryptoProvider) VerifyWithLabel(pub SignaturePublicKey, label s
 	}
 	if len(sig) != ed25519.SignatureSize {
 		return ErrCryptoBadSignature
+	}
+	if err := checkLabelledConstruction("signature content", label, content); err != nil {
+		return err
 	}
 	if !ed25519.Verify(ed25519.PublicKey(pub), mlsSignContent(label, content), sig) {
 		return ErrCryptoBadSignature
@@ -350,6 +485,9 @@ func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, co
 	if crypto == nil {
 		return nil, nil, fmt.Errorf("%w: the seal is the provider's HPKE", ErrNilCryptoProvider)
 	}
+	if err := checkLabelledConstruction("encryption context", label, context); err != nil {
+		return nil, nil, err
+	}
 	return crypto.HpkeSeal(pub, mlsEncryptContext(label, context), nil, plaintext)
 }
 
@@ -370,6 +508,9 @@ func EncryptWithLabel(crypto CryptoProvider, pub HpkePublicKey, label string, co
 func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, context []byte, kemOutput []byte, ciphertext []byte) ([]byte, error) {
 	if crypto == nil {
 		return nil, fmt.Errorf("%w: the open is the provider's HPKE", ErrNilCryptoProvider)
+	}
+	if err := checkLabelledConstruction("encryption context", label, context); err != nil {
+		return nil, err
 	}
 	return crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)
 }

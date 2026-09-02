@@ -19,8 +19,6 @@ package mls
 import (
 	"bytes"
 	"fmt"
-
-	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // PastEpochWindow bounds how many past epochs of state, and therefore how many past
@@ -74,11 +72,19 @@ func ZeroSecret(crypto CryptoProvider) []byte {
 // The pseudorandom key is erased before returning. It is not the joiner secret and nothing
 // downstream needs it, and it is one HKDF-Expand away from every key of the epoch.
 //
-// A nil context is refused rather than serialized. syntax.Marshal is handed a non nil
+// A nil context is refused rather than serialized. The marshal is handed a non nil
 // interface holding a nil pointer, so MarshalMLS dereferences it and the caller gets a
 // runtime panic raised inside the syntax package, naming neither this function nor the
 // argument that was missing. Every caller of this takes its context off a struct field,
 // which is exactly where an unset one comes from.
+//
+// The encoding goes through marshalBoundedComposition rather than through syntax.Marshal,
+// and that is not tidiness. These bytes become the CONTEXT field of ExpandWithLabel, which
+// is one opaque<V> of a KDFLabel, and ExpandWithLabel is a CryptoProvider method with no
+// error to return: a GroupContext whose group_id, extensions and hashes each obey the
+// mebibyte limit while their SUM does not would take the process down inside the key
+// schedule. A group context that large is one a decoder accepts, so the refusal belongs
+// here, where there is still a caller to tell.
 func DeriveJoinerSecret(
 	crypto CryptoProvider,
 	initSecretPrev []byte,
@@ -101,7 +107,7 @@ func DeriveJoinerSecret(
 	if len(commitSecret) != nh {
 		return nil, fmt.Errorf("%w: commit secret is %d bytes, want %d", ErrSecretLength, len(commitSecret), nh)
 	}
-	encodedGroupContext, err := syntax.Marshal(groupContext)
+	encodedGroupContext, err := marshalBoundedComposition("group context", groupContext)
 	if err != nil {
 		return nil, err
 	}
@@ -214,9 +220,12 @@ func NewKeySchedule(
 // undecryptable message rather than as the length mistake it is.
 //
 // A nil context is refused rather than serialized, for the reason DeriveJoinerSecret gives:
-// syntax.Marshal is handed a non nil interface holding a nil pointer and MarshalMLS
+// the marshal is handed a non nil interface holding a nil pointer and MarshalMLS
 // dereferences it, so the caller would get a panic out of the syntax package naming neither
-// this function nor the argument that was missing.
+// this function nor the argument that was missing. The encoding is bounded for that
+// function's other reason as well -- these bytes are the context field of the "epoch"
+// expansion, and a composition past one field's limit reaches a construction that cannot
+// refuse it.
 //
 // member_secret is erased once it has produced the two things it feeds. The epoch does not
 // retain it and nothing downstream needs it, and it reproduces both welcome_secret and
@@ -246,7 +255,7 @@ func NewKeyScheduleFromJoiner(
 	if len(pskSecret) != nh {
 		return nil, fmt.Errorf("%w: psk secret is %d bytes, want %d", ErrSecretLength, len(pskSecret), nh)
 	}
-	encodedGroupContext, err := syntax.Marshal(groupContext)
+	encodedGroupContext, err := marshalBoundedComposition("group context", groupContext)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +339,7 @@ func NewKeyScheduleFromEpochSecret(
 	if len(epochSecret) != nh {
 		return nil, fmt.Errorf("%w: epoch secret is %d bytes, want %d", ErrSecretLength, len(epochSecret), nh)
 	}
-	encodedGroupContext, err := syntax.Marshal(groupContext)
+	encodedGroupContext, err := marshalBoundedComposition("group context", groupContext)
 	if err != nil {
 		return nil, err
 	}

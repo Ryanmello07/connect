@@ -419,10 +419,17 @@ func TestOpaqueVectorBoundariesMatchSyntax(t *testing.T) {
 
 func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 	// mlsLabelBytes panics rather than returning a short preimage, and this pins the
-	// boundary at which it would: syntax.MaxVectorLength. every value that reaches a
-	// labelled construction came through a decode or an encode already bounded by it, so
-	// the panic is unreachable in production — but if that ever stops being true, it must
-	// stop being true loudly.
+	// boundary at which it would: syntax.MaxVectorLength.
+	//
+	// THE SENTENCE THAT USED TO STAND HERE WAS FALSE and is written out rather than quietly
+	// replaced, because it was false in the same way its twin in crypto_labels.go was and
+	// that is the whole lesson. It said: every value that reaches a labelled construction
+	// came through a decode or an encode already bounded by MaxVectorLength, so the panic is
+	// unreachable in production. Every FIELD is bounded by it. A COMPOSITION of fields is
+	// not, and RefHash wraps a whole AuthenticatedContent in one of them. What makes the
+	// panic unreachable from a peer's message NOW is
+	// TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere, which
+	// derives that class off the source instead of asserting it in a comment.
 	writer := syntax.NewWriter()
 	writer.WriteOpaque(make([]byte, syntax.MaxVectorLength))
 	if _, err := writer.Bytes(); err != nil {
@@ -545,6 +552,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// rejected message.
 		"commit_wire.go: syntax.ReadVector(r, readOneProposalOrRef)",
 		"commit_wire.go: syntax.WriteVector(w, self.Proposals, writeOneProposalOrRef)",
+		// marshalBoundedComposition, which is the ONE marshal in this package of a structure
+		// destined to become a single length prefixed field of a labelled construction. Four
+		// separate calls used to do this -- the two references and the two group context
+		// expansions -- and each of them answered a length nothing then checked, which is the
+		// composition defect labelled_composition_test.go closes. The default limit and not the
+		// ratchet tree one, on the strictest reading available: whatever comes out of here is
+		// about to be wrapped in one opaque<V> capped at MaxVectorLength, so a raised bound here
+		// would produce a preimage this package cannot encode and would take the process down
+		// rather than refusing.
+		"crypto_labels.go: syntax.Marshal(v)",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
 		"crypto_labels.go: syntax.NewWriter()",
@@ -594,17 +611,18 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// rather than discovered when a real group refuses to join.
 		"framing.go: syntax.Marshal(message)",
 		"framing.go: syntax.Unmarshal(data, message)",
-		// the two preimages of framing_preimage.go, each reached as syntax.Marshal over the
-		// structure the RFC writes rather than as a Writer opened here and filled by hand.
-		// syntax.Marshal(self) is the serialized AuthenticatedContent a ProposalRef is taken
-		// over; syntax.Marshal(self.transcriptHashInput()) is section 8.2's
-		// ConfirmedTranscriptHashInput. The default limit and not the ratchet tree one, and for
-		// this pair that is the strictest reading in the package: a proposal reference or a
-		// transcript entry taken over a structure allowed past MaxVectorLength is one no peer
-		// running the default limit could have computed, and both of those disagreements are
-		// permanent -- a commit naming a ref nobody else derives, and a transcript chain that
-		// has forked.
-		"framing_preimage.go: syntax.Marshal(self)",
+		// section 8.2's ConfirmedTranscriptHashInput, reached as syntax.Marshal over the
+		// structure the RFC writes rather than as a Writer opened here and filled by hand. The
+		// default limit and not the ratchet tree one, and that is the strictest reading in the
+		// package: a transcript entry taken over a structure allowed past MaxVectorLength is one
+		// no peer running the default limit could have computed, and that disagreement is a
+		// forked transcript chain rather than a rejected message.
+		//
+		// Its neighbour is gone rather than moved. The AuthenticatedContent a ProposalRef is
+		// taken over is a COMPOSITION headed for one opaque<V>, so it is encoded through
+		// crypto_labels.go's marshalBoundedComposition above; the transcript input is hashed
+		// whole and carries no such field, which is why the two that used to sit here as a pair
+		// are no longer one decision.
 		"framing_preimage.go: syntax.Marshal(self.transcriptHashInput())",
 		// section 6.1's FramedContentTBS, the third preimage of that file and the one every
 		// framing signature is taken over. The default limit and not the ratchet tree one, on
@@ -669,26 +687,20 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"group_policy.go: syntax.Unmarshal(data, policy)",
 		"group_policy.go: syntax.WriteVector(w, self.DisappearingBuckets, writeOneDisappearingBucket)",
 		"group_policy.go: syntax.WriteVector(w, self.Roles, writeOneRoleEntry)",
-		// the RFC 9420 section 5.2 KeyPackageRef, which is RefHash over the whole encoded
-		// key package rather than over the prefix its signature covers. The default limit
-		// and not the ratchet tree one: a key package is one joiner's advertisement, every
-		// vector in it is capped at MaxVectorLength, and a reference taken over one allowed
-		// past that names a structure no peer running the default limit could decode -- which
-		// arrives as a commit adding a joiner nobody else can read.
-		"key_package.go: syntax.Marshal(self)",
-		// the joiner derivation's group context preimage. The default limit and not the
-		// ratchet tree one, because a GroupContext is not a ratchet tree: every field of
-		// it is an MLS structure capped at MaxVectorLength, and a joiner secret expanded
-		// over a context that had been allowed past that is a secret no peer running the
-		// default limit could have derived.
-		"key_schedule.go: syntax.Marshal(groupContext)",
-		// the same preimage from the two entry points that do not reach it through the
-		// joiner derivation: the one a Welcome'd member takes, and the one a group being
-		// created takes. Same structure, same reason, same limit. Three calls rather than
-		// one shared helper because each sits on a path that can refuse before the other
-		// two are reachable, and a helper would move the decision rather than remove it.
-		"key_schedule.go: syntax.Marshal(groupContext)",
-		"key_schedule.go: syntax.Marshal(groupContext)",
+		// The RFC 9420 section 5.2 KeyPackageRef and the three group context preimages of the
+		// key schedule used to appear here as four more entries, one per call, each under an
+		// argument about why the default limit was the right one for that structure. They are
+		// all four in crypto_labels.go: syntax.Marshal(v) above now.
+		//
+		// That is a consolidation this file should be suspicious of, so the reason is written
+		// out. It is NOT a helper introduced to shorten a list. Every one of those four values
+		// is about to be wrapped in ONE opaque<V> -- of a RefHashInput, or of a KDFLabel -- by a
+		// construction with no way to report a refusal, and the limit that governs them is
+		// therefore not each structure's own but that single field's. Four sites each deciding
+		// the limit for itself is four places for the same decision, which is the shape this
+		// package refuses everywhere else; and while they were four, each one answered a length
+		// nobody then compared against anything, which is exactly how a composition past the
+		// field limit reached a panic.
 		// the LeafNodeTBS preimage of section 7.2. It opens its own Writer rather than
 		// going through marshalBytes for the reason signatureContent writes down -- the
 		// placeholder gate cannot see a parameter that is read only inside a closure, and
@@ -3203,12 +3215,18 @@ func sourceDeclaringProviderMethod(t *testing.T, name string) parsedSource {
 // test in this package, which is what says the pin carries something they do not.
 var signWithLabelStatements = []string{
 	"if len(priv) != self.params.NsigPriv {\n\treturn nil, ErrBadSignatureKey\n}",
+	"if err := checkLabelledConstruction(\"signature content\", label, content); err != nil {\n\treturn nil, err\n}",
 	"return ed25519.Sign(ed25519.NewKeyFromSeed(priv), mlsSignContent(label, content)), nil",
 }
 
 var verifyWithLabelStatements = []string{
 	"if len(pub) != self.params.NsigPub {\n\treturn ErrBadSignatureKey\n}",
 	"if len(sig) != ed25519.SignatureSize {\n\treturn ErrCryptoBadSignature\n}",
+	// the refusal is pinned WITH the verify and above it. It is the statement that decides
+	// whether this method answers a caller or takes the process down with it, and a peer's
+	// whole signed message is what it judges -- a message the framing layer has not looked
+	// at yet, since this runs before any application level check exists to run.
+	"if err := checkLabelledConstruction(\"signature content\", label, content); err != nil {\n\treturn err\n}",
 	"if !ed25519.Verify(ed25519.PublicKey(pub), mlsSignContent(label, content), sig) {\n\treturn ErrCryptoBadSignature\n}",
 	"return nil",
 }
@@ -3991,11 +4009,13 @@ var mlsEncryptContextStatements = []string{
 // so each of them still differs from its pin in exactly the one way it was written to differ.
 var encryptWithLabelStatements = []string{
 	"if crypto == nil {\n\treturn nil, nil, fmt.Errorf(\"%w: the seal is the provider's HPKE\", ErrNilCryptoProvider)\n}",
+	"if err := checkLabelledConstruction(\"encryption context\", label, context); err != nil {\n\treturn nil, nil, err\n}",
 	"return crypto.HpkeSeal(pub, mlsEncryptContext(label, context), nil, plaintext)",
 }
 
 var decryptWithLabelStatements = []string{
 	"if crypto == nil {\n\treturn nil, fmt.Errorf(\"%w: the open is the provider's HPKE\", ErrNilCryptoProvider)\n}",
+	"if err := checkLabelledConstruction(\"encryption context\", label, context); err != nil {\n\treturn nil, err\n}",
 	"return crypto.HpkeOpen(priv, kemOutput, mlsEncryptContext(label, context), nil, ciphertext)",
 }
 
@@ -4095,7 +4115,17 @@ func DecryptWithLabel(crypto CryptoProvider, priv HpkePrivateKey, label string, 
 // construction added beside these is a decision somebody writes down rather than a gap.
 var labelPackageFunctions = []string{
 	"DecryptWithLabel", "EncryptWithLabel", "MakeKeyPackageRef", "MakeProposalRef", "RefHash",
-	"mlsEncryptContext", "mlsKdfLabel", "mlsLabelBytes", "mlsSignContent",
+	// the four declarations that answer the composition defect, and they are in this file
+	// rather than beside their callers for the reason the list itself exists: the decision
+	// about what fits in one field of a labelled construction is a decision about the
+	// construction, and a copy of it written next to a caller is a second opinion about a
+	// length. checkLabelledFieldLength is the one comparison; checkLabelledConstruction is
+	// what the four entry points that can refuse ask; marshalBoundedComposition is what the
+	// callers of the two that cannot refuse build through; mlsLabelPreimage is the writer's
+	// error carried out rather than taken down the process, which is what makes any of it
+	// reportable at all.
+	"checkLabelledConstruction", "checkLabelledFieldLength", "marshalBoundedComposition",
+	"mlsEncryptContext", "mlsKdfLabel", "mlsLabelBytes", "mlsLabelPreimage", "mlsSignContent",
 	// the public half of a signature key pair this package was handed. It is a derivation
 	// rather than a labelled construction, and it lives in this file because doc.go names
 	// four files as the whole cryptographic surface and ed25519.NewKeyFromSeed is a
@@ -4844,6 +4874,13 @@ var labelledPathFrames = []string{
 	"HpkeSealBase plaintext",
 	"HpkeSetupBaseR info",
 	"HpkeSetupBaseS info",
+	// the refusal the two entry points now ask before they build a preimage. It is ON the
+	// path because the label and the context are what it judges, and a band written into
+	// either of these two would drop a context as completely as one written into the kdf --
+	// by refusing the message that carries it rather than by sealing it under nothing.
+	"checkLabelledConstruction label",
+	"checkLabelledConstruction value",
+	"checkLabelledFieldLength length",
 	"hpkeKeySchedule info",
 	"hpkeKeySchedule keyScheduleContext",
 	"hpkeKeyScheduleContext info",
@@ -4852,14 +4889,40 @@ var labelledPathFrames = []string{
 	"mlsEncryptContext context",
 	"mlsEncryptContext label",
 	"mlsLabelBytes w",
+	"mlsLabelPreimage w",
 }
 
 // The frames of the path that had no pin of their own, statement by statement. The seven
 // above them are pinned where they are declared, as the constructions they are.
 var mlsLabelBytesStatements = []string{
-	"encoded, err := w.Bytes()",
-	"if err != nil {\n\tpanic(\"mls: a labelled preimage could not be encoded: \" + err.Error())\n}",
+	"encoded, err := mlsLabelPreimage(w)",
+	"if err != nil {\n\tpanic(err.Error())\n}",
 	"return encoded",
+}
+
+// The same encode with the refusal carried OUT, which is the declaration every construction
+// whose signature can report one goes through.
+var mlsLabelPreimageStatements = []string{
+	"encoded, err := w.Bytes()",
+	"if err != nil {\n\treturn nil, fmt.Errorf(\"mls: a labelled preimage could not be encoded: %w\", err)\n}",
+	"return encoded, nil",
+}
+
+// The one comparison in this package that decides whether a value fits in one length
+// prefixed field, and the two field gate the entry points reach it through.
+//
+// Pinned because an off by one here is invisible from every direction a behavioural test can
+// come from except the exact boundary: >= MaxVectorLength refuses a preimage the protocol
+// requires and > MaxVectorLength+1 admits the one that panics, and both of those answer
+// every other length correctly.
+var checkLabelledFieldLengthStatements = []string{
+	"if length > syntax.MaxVectorLength {\n\treturn fmt.Errorf(\"%w: the serialized %s is %d octets and one labelled field holds at most %d\",\n\t\tsyntax.ErrLengthExceedsMax, what, length, syntax.MaxVectorLength)\n}",
+	"return nil",
+}
+
+var checkLabelledConstructionStatements = []string{
+	"if err := checkLabelledFieldLength(what+\" label\", len(MlsLabelPrefix)+len(label)); err != nil {\n\treturn err\n}",
+	"return checkLabelledFieldLength(what, len(value))",
 }
 
 var hpkeSealBaseStatements = []string{
@@ -4959,6 +5022,9 @@ var labelledPathPins = []struct {
 }{
 	{receiver: "", name: "mlsEncryptContext", want: mlsEncryptContextStatements},
 	{receiver: "", name: "mlsLabelBytes", want: mlsLabelBytesStatements},
+	{receiver: "", name: "mlsLabelPreimage", want: mlsLabelPreimageStatements},
+	{receiver: "", name: "checkLabelledConstruction", want: checkLabelledConstructionStatements},
+	{receiver: "", name: "checkLabelledFieldLength", want: checkLabelledFieldLengthStatements},
 	{receiver: "", name: "EncryptWithLabel", want: encryptWithLabelStatements},
 	{receiver: "", name: "DecryptWithLabel", want: decryptWithLabelStatements},
 	{receiver: providerReceiver, name: "HpkeSeal", want: hpkeSealStatements},
