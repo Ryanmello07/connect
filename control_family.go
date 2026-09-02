@@ -243,27 +243,156 @@ func controlFamilyStatus() string {
 	return strings.Join(parts, ", ")
 }
 
-// probeFamilySupport reports whether this device has a usable global address
-// of the family.
+// controlFamilyInterface is one interface as the probe needs to see it: a
+// name, its flags, and its addresses. net.Interface plus the result of its
+// Addrs() call, so the probe's decision can be exercised against a synthetic
+// device rather than against whatever the build machine happens to have.
+type controlFamilyInterface struct {
+	name  string
+	flags net.Flags
+	addrs []net.Addr
+}
+
+// hostControlFamilyInterfaces enumerates this device's interfaces. An error
+// from either half is returned rather than swallowed -- the probe fails
+// CLOSED, and it can only do that if it is told enumeration failed.
+func hostControlFamilyInterfaces() ([]controlFamilyInterface, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	probed := make([]controlFamilyInterface, 0, len(ifaces))
+	for _, iface := range ifaces {
+		// A per-interface Addrs() error is not fatal: an interface can go away
+		// between the enumeration and the read. It contributes no evidence,
+		// which leaves the probe short of a reason to say yes -- the safe
+		// direction.
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		probed = append(probed, controlFamilyInterface{
+			name:  iface.Name,
+			flags: iface.Flags,
+			addrs: addrs,
+		})
+	}
+	return probed, nil
+}
+
+// the enumeration seam, separate from the ledger's mutex because
+// probeFamilySupport runs while the ledger is held.
+var controlFamilyProbeSource = struct {
+	mu         sync.Mutex
+	interfaces func() ([]controlFamilyInterface, error)
+}{
+	interfaces: hostControlFamilyInterfaces,
+}
+
+// controlFamilyTunnelInterfacePrefixes are the interface names a tunnel takes
+// on the platforms this ships to: utunN on darwin/ios, tunN/tapN on
+// linux/android, plus the ipsec/ppp/wg shapes another vpn on the device may
+// present. Matching by NAME rather than by address range is deliberate:
+// RandomLocalIpv4 (tun.go) hands the tun a 10.a.b.h address chosen precisely
+// so it does NOT overlap any real local subnet, so it is indistinguishable
+// from an ordinary home-lan lease by range alone. Matching by the
+// FlagPointToPoint bit is not an option either -- cellular interfaces carry it
+// on android, and excluding the one real path would be worse than useless.
+var controlFamilyTunnelInterfacePrefixes = []string{
+	"utun", "tun", "tap", "ipsec", "ppp", "wg",
+}
+
+// controlFamilyReservedPrefixes are ranges no working path can be numbered
+// from, and which this project's own tunnels DO use: 192.0.2.0/24 is
+// android's escape-mode tun address (MainService.ESCAPE_FALLBACK_ADDRESS).
+// They pass IsGlobalUnicast, so without this they would read as connectivity.
+var controlFamilyReservedPrefixes = []*net.IPNet{
+	{IP: net.IPv4(192, 0, 2, 0), Mask: net.CIDRMask(24, 32)},    // TEST-NET-1
+	{IP: net.IPv4(198, 51, 100, 0), Mask: net.CIDRMask(24, 32)}, // TEST-NET-2
+	{IP: net.IPv4(203, 0, 113, 0), Mask: net.CIDRMask(24, 32)},  // TEST-NET-3
+	{IP: net.ParseIP("2001:db8::"), Mask: net.CIDRMask(32, 128)},
+}
+
+// probeFamilySupport reports whether this device has a usable path of the
+// family THAT IS NOT THIS PRODUCT'S OWN TUNNEL.
+//
+// The distinction is the whole guard. The app's tun carries a global-unicast
+// IPv4 address by default -- RandomLocalIpv4's 10.a.b.h (tun.go), or
+// 192.0.2.1 in android's escape mode -- and net.IP.IsGlobalUnicast is true for
+// both. An "is there any IsGlobalUnicast IPv4 address" probe therefore answers
+// YES on an IPv6-only iphone with the tunnel up (ios has no CLAT; NAT64/DNS64
+// is the App Store-required configuration), which is exactly the device where
+// demoting IPv6 takes the control plane offline for five minutes and then for
+// up to six hours. The tunnel is not a path to the api: this process's own
+// traffic is excluded from it.
 //
 // NOT nettest.SupportsIPv4/SupportsIPv6: those memoize inside x/net behind a
 // sync.Once, so they answer for whatever network the process started on and
 // never re-evaluate across a wifi/cellular switch. A stale "yes, IPv4 works"
 // is exactly the wrong answer for the guard that keeps a demotion from taking
 // an IPv6-only user offline.
+//
+// FAILS CLOSED. An unreadable interface table means "no evidence", and the
+// only job this function has is to REFUSE a dangerous demotion. A refused
+// demotion costs a user a slow path; a wrongly permitted one costs them the
+// whole control plane.
 func probeFamilySupport(family int) bool {
-	addrs, err := net.InterfaceAddrs()
+	controlFamilyProbeSource.mu.Lock()
+	enumerate := controlFamilyProbeSource.interfaces
+	controlFamilyProbeSource.mu.Unlock()
+
+	ifaces, err := enumerate()
 	if err != nil {
-		// unknown: assume the family is available rather than blocking a
-		// demotion that may be the user's only way onto a working path
-		return true
+		return false
 	}
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok || ipNet.IP == nil || !ipNet.IP.IsGlobalUnicast() {
+	for _, iface := range ifaces {
+		if iface.flags&net.FlagUp == 0 {
 			continue
 		}
-		if (ipNet.IP.To4() != nil) == (family == 4) {
+		if iface.flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if isControlFamilyTunnelInterface(iface.name) {
+			continue
+		}
+		for _, addr := range iface.addrs {
+			ip := controlFamilyAddrIP(addr)
+			if ip == nil || !ip.IsGlobalUnicast() {
+				continue
+			}
+			if isControlFamilyReservedIP(ip) {
+				continue
+			}
+			if (ip.To4() != nil) == (family == 4) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func controlFamilyAddrIP(addr net.Addr) net.IP {
+	switch v := addr.(type) {
+	case *net.IPNet:
+		return v.IP
+	case *net.IPAddr:
+		return v.IP
+	}
+	return nil
+}
+
+func isControlFamilyTunnelInterface(name string) bool {
+	for _, prefix := range controlFamilyTunnelInterfacePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isControlFamilyReservedIP(ip net.IP) bool {
+	for _, reserved := range controlFamilyReservedPrefixes {
+		if reserved.Contains(ip) {
 			return true
 		}
 	}
@@ -417,6 +546,20 @@ func pickControlIPAddr(addrs []net.IPAddr) net.IPAddr {
 // none. For a developer ui that shows what auto has learned.
 func ControlFamilyStatus() string {
 	return controlFamilyStatus()
+}
+
+func swapControlFamilyInterfaces(
+	interfaces func() ([]controlFamilyInterface, error),
+) func() {
+	controlFamilyProbeSource.mu.Lock()
+	defer controlFamilyProbeSource.mu.Unlock()
+	prev := controlFamilyProbeSource.interfaces
+	controlFamilyProbeSource.interfaces = interfaces
+	return func() {
+		controlFamilyProbeSource.mu.Lock()
+		defer controlFamilyProbeSource.mu.Unlock()
+		controlFamilyProbeSource.interfaces = prev
+	}
 }
 
 func swapControlFamilyProbe(probe func(family int) bool) func() {

@@ -100,23 +100,195 @@ func (self *timeoutError) Timeout() bool   { return true }
 func (self *timeoutError) Temporary() bool { return true }
 
 // A demotion must never take the user offline. With no IPv4 on the device,
-// demoting IPv6 is refused.
+// demoting IPv6 is refused -- and with no IPv6, demoting IPv4 is refused.
+//
+// BOTH directions, and each with a probe that answers true only for the family
+// being demoted. That is what pins `other`: with the guard's
+// `other := 4; if family == 4 { other = 6 }` mutated so `other` is always 4,
+// the demote(4) row probes 4, gets true, and the demotion is wrongly accepted.
+// A single-direction test, or a row whose probe answers true for everything,
+// cannot tell the mutant from the original.
 func TestControlFamilyDemoteRefusedWhenOtherFamilyUnusable(t *testing.T) {
-	restore := swapControlFamilyProbe(func(family int) bool { return family == 6 })
+	tests := []struct {
+		name     string
+		usable   int
+		demote   int
+		wantNoop string
+	}{
+		{"no ipv4, demoting ipv6 refused", 6, 6, "tcp"},
+		{"no ipv6, demoting ipv4 refused", 4, 4, "tcp"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			restore := swapControlFamilyProbe(func(family int) bool {
+				return family == test.usable
+			})
+			defer restore()
+			controlFamilyClear()
+			defer controlFamilyClear()
+
+			if controlFamilyDemote(test.demote) {
+				t.Fatalf(
+					"demoted ipv%d with no ipv%d available -- the only family "+
+						"left is the one being demoted",
+					test.demote, 10-test.demote)
+			}
+			network, err := controlDialNetwork("tcp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if network != test.wantNoop {
+				t.Fatalf("got %q, want %s -- a refused demotion must not narrow", network, test.wantNoop)
+			}
+		})
+	}
+}
+
+// The guard the spec spends a section on is only as good as the probe behind
+// it, and the probe had no direct test at all: all sixteen call sites inject a
+// fake, so the "IPv6-only guard" test proved the BRANCH and never the probe.
+//
+// The device this pins is the one the guard exists for: an IPv6-only handset
+// (ios has no CLAT; NAT64/DNS64 is the App Store-required configuration) with
+// this product's tunnel up. The tun carries RandomLocalIpv4's 10.a.b.h, which
+// is IsGlobalUnicast, so a probe that accepts any global-unicast address
+// answers "IPv4 is available" on a device that has no IPv4 whatsoever -- and
+// the demotion of IPv6 that follows takes the control plane offline for five
+// minutes, doubling to six hours.
+func TestProbeFamilySupportIgnoresOurOwnTunnel(t *testing.T) {
+	loopback := controlFamilyInterface{
+		name:  "lo0",
+		flags: net.FlagUp | net.FlagLoopback,
+		addrs: []net.Addr{ipNet("127.0.0.1/8"), ipNet("::1/128")},
+	}
+	// the ios/darwin shape: PacketTunnelProvider installs RandomLocalIpv4
+	utun := controlFamilyInterface{
+		name:  "utun4",
+		flags: net.FlagUp | net.FlagPointToPoint,
+		addrs: []net.Addr{ipNet("10.7.3.42/32")},
+	}
+	// the android shape, including escape mode's 192.0.2.1
+	androidTun := controlFamilyInterface{
+		name:  "tun0",
+		flags: net.FlagUp | net.FlagPointToPoint,
+		addrs: []net.Addr{ipNet("10.0.0.19/24")},
+	}
+	androidEscapeTun := controlFamilyInterface{
+		name:  "tun0",
+		flags: net.FlagUp | net.FlagPointToPoint,
+		addrs: []net.Addr{ipNet("192.0.2.1/24")},
+	}
+	cellularV6Only := controlFamilyInterface{
+		name:  "pdp_ip0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("2600:1700:1234:5678::1/64"), ipNet("fe80::1/64")},
+	}
+	// an ordinary home-lan lease. RFC1918 by range, exactly like the tun's
+	// address, and it MUST still count: rejecting private ranges outright
+	// would answer "no IPv4" for most of the userbase.
+	wifi := controlFamilyInterface{
+		name:  "en0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("192.168.1.20/24")},
+	}
+	downEthernet := controlFamilyInterface{
+		name:  "en1",
+		flags: 0,
+		addrs: []net.Addr{ipNet("192.168.5.7/24")},
+	}
+
+	tests := []struct {
+		name   string
+		ifaces []controlFamilyInterface
+		want4  bool
+		want6  bool
+	}{
+		{
+			"ipv6-only iphone with our tunnel up",
+			[]controlFamilyInterface{loopback, cellularV6Only, utun},
+			false, true,
+		},
+		{
+			"ipv6-only android with our tunnel up",
+			[]controlFamilyInterface{loopback, cellularV6Only, androidTun},
+			false, true,
+		},
+		{
+			"ipv6-only android in escape mode",
+			[]controlFamilyInterface{loopback, cellularV6Only, androidEscapeTun},
+			false, true,
+		},
+		{
+			"dual-stack wifi with our tunnel up",
+			[]controlFamilyInterface{loopback, wifi, cellularV6Only, utun},
+			true, true,
+		},
+		{
+			"ipv4-only wifi",
+			[]controlFamilyInterface{loopback, wifi},
+			true, false,
+		},
+		{
+			"loopback alone is not connectivity",
+			[]controlFamilyInterface{loopback},
+			false, false,
+		},
+		{
+			"an interface that is down carries no path",
+			[]controlFamilyInterface{loopback, downEthernet},
+			false, false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			restore := swapControlFamilyInterfaces(
+				func() ([]controlFamilyInterface, error) { return test.ifaces, nil })
+			defer restore()
+
+			if got := probeFamilySupport(4); got != test.want4 {
+				t.Fatalf("probeFamilySupport(4) = %v, want %v", got, test.want4)
+			}
+			if got := probeFamilySupport(6); got != test.want6 {
+				t.Fatalf("probeFamilySupport(6) = %v, want %v", got, test.want6)
+			}
+		})
+	}
+}
+
+// An unreadable interface table is NO EVIDENCE, and the only job this probe
+// has is to refuse a dangerous demotion. Failing open answers "yes, the other
+// family works" on a device nothing is known about, which is the one answer
+// that can take the control plane down. This repo already documents that
+// mobile interface enumeration can be restricted (see LocalIpv4Networks).
+func TestProbeFamilySupportFailsClosedOnEnumerationError(t *testing.T) {
+	restore := swapControlFamilyInterfaces(
+		func() ([]controlFamilyInterface, error) {
+			return nil, errors.New("operation not permitted")
+		})
 	defer restore()
+
+	if probeFamilySupport(4) {
+		t.Fatal("probeFamilySupport(4) said yes with no readable interface table")
+	}
+	if probeFamilySupport(6) {
+		t.Fatal("probeFamilySupport(6) said yes with no readable interface table")
+	}
+
+	// and the guard it feeds must therefore refuse the demotion
 	controlFamilyClear()
 	defer controlFamilyClear()
-
 	if controlFamilyDemote(6) {
-		t.Fatal("demoted ipv6 with no ipv4 available")
+		t.Fatal("demoted ipv6 on a device whose interfaces could not be read")
 	}
-	network, err := controlDialNetwork("tcp")
+}
+
+func ipNet(cidr string) *net.IPNet {
+	ip, network, err := net.ParseCIDR(cidr)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	if network != "tcp" {
-		t.Fatalf("got %q, want tcp -- a refused demotion must not narrow", network)
-	}
+	network.IP = ip
+	return network
 }
 
 // The POLICY accessor must never reflect a learned demotion. A ui row that
