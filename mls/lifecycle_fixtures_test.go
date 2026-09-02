@@ -214,11 +214,11 @@ const lifecycleErrorsFile = "errors_lifecycle.go"
 // requires the two sets to be equal in BOTH directions, so a sentinel added to the file and not
 // to this map -- and a name here the file no longer declares -- is a failure naming it.
 //
-// mlsErrorClasses holds this under lifecycleErrorsFile, which is what puts these twenty five
-// inside TestEveryExportedErrorOfThisPackageIsInAMaintainedClass and inside the exclusivity
-// sweep over every ordered pair of this package's classes. Without that entry the whole set is a
-// surface a caller can branch on that no sweep in this package judges -- which is exactly the
-// hole that gate was written for, and it is the failure this task's first full run produced.
+// mlsErrorClasses holds this under lifecycleErrorsFile, which is what puts all of them inside
+// TestEveryExportedErrorOfThisPackageIsInAMaintainedClass and inside the exclusivity sweep over
+// every ordered pair of this package's classes. Without that entry the whole set is a surface a
+// caller can branch on that no sweep in this package judges -- which is exactly the hole that
+// gate was written for, and it is the failure this task's first full run produced.
 var lifecycleOwnedErrors = map[string]error{
 	"ErrGroupSizeExceeded":           ErrGroupSizeExceeded,
 	"ErrDeviceLimitExceeded":         ErrDeviceLimitExceeded,
@@ -240,6 +240,7 @@ var lifecycleOwnedErrors = map[string]error{
 	"ErrWelcomeTreeHashMismatch":     ErrWelcomeTreeHashMismatch,
 	"ErrWelcomeLeafNotFound":         ErrWelcomeLeafNotFound,
 	"ErrWelcomeSuiteMismatch":        ErrWelcomeSuiteMismatch,
+	"ErrWelcomeCarriedTreeMismatch":  ErrWelcomeCarriedTreeMismatch,
 	"ErrGroupIdInUse":                ErrGroupIdInUse,
 	"ErrPendingCommitExists":         ErrPendingCommitExists,
 	"ErrNoPendingCommit":             ErrNoPendingCommit,
@@ -283,8 +284,11 @@ func TestLifecycleOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) {
 // and a sweep that both went empty would agree with each other perfectly.
 func TestLifecycleErrorsAreDistinct(t *testing.T) {
 	names := slices.Sorted(maps.Keys(lifecycleOwnedErrors))
-	if len(names) != 25 {
-		t.Fatalf("the lifecycle error set holds %d values, this task produces 25", len(names))
+	// 26 since p7 task 14's second pass wired (*GroupInfo).Verify's rule 9. The count is
+	// asserted rather than derived on purpose -- see the note on lifecycleOwnedErrors -- so a
+	// later task adding a sentinel moves this number and says which task moved it.
+	if len(names) != 26 {
+		t.Fatalf("the lifecycle error set holds %d values, this plan declares 26", len(names))
 	}
 	for _, name := range names {
 		a := lifecycleOwnedErrors[name]

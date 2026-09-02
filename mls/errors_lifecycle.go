@@ -65,6 +65,13 @@ var (
 	ErrWelcomeLeafNotFound         = errors.New("mls: own leaf node is not present in the ratchet tree")
 	ErrWelcomeSuiteMismatch        = errors.New("mls: welcome ciphersuite does not match the key package")
 
+	// ErrWelcomeCarriedTreeMismatch names a GroupInfo whose own ratchet_tree extension
+	// describes a tree other than the one it was verified against. Its whole account -- what
+	// the rule buys, and the forgery it does NOT stop -- is on (*GroupInfo).Verify under
+	// "WHAT RULE 9 BUYS AND WHAT IT DOES NOT", because the rule is only safe to read together
+	// with the precondition stated above it.
+	ErrWelcomeCarriedTreeMismatch = errors.New("mls: group info carries a ratchet_tree extension for a different tree")
+
 	// the group state machine this client runs
 	ErrGroupIdInUse        = errors.New("mls: group id is already in use by this client")
 	ErrPendingCommitExists = errors.New("mls: a pending commit is already staged")

@@ -407,12 +407,17 @@ func TestAGroupInfoDoesNotVerifyUnlessAMemberOfTheTreeSignedIt(t *testing.T) {
 // with no row here fails and a row naming a refusal Verify no longer makes fails as well.
 func groupInfoVerifySentinels() map[string]error {
 	return map[string]error{
-		"ErrNilCryptoProvider":         ErrNilCryptoProvider,
-		"ErrTreeMalformed":             ErrTreeMalformed,
-		"ErrWelcomeTreeHashMismatch":   ErrWelcomeTreeHashMismatch,
-		"ErrLeafIndexOutOfRange":       ErrLeafIndexOutOfRange,
-		"errBlankSenderLeaf":           errBlankSenderLeaf,
-		"ErrWelcomeGroupInfoSignature": ErrWelcomeGroupInfoSignature,
+		"ErrNilCryptoProvider":          ErrNilCryptoProvider,
+		"ErrTreeMalformed":              ErrTreeMalformed,
+		"ErrUnsupportedVersion":         ErrUnsupportedVersion,
+		"errGroupInfoProviderSuite":     errGroupInfoProviderSuite,
+		"ErrWelcomeTreeHashMismatch":    ErrWelcomeTreeHashMismatch,
+		"ErrLeafIndexOutOfRange":        ErrLeafIndexOutOfRange,
+		"errBlankSenderLeaf":            errBlankSenderLeaf,
+		"errGroupInfoPreimage":          errGroupInfoPreimage,
+		"ErrWelcomeGroupInfoSignature":  ErrWelcomeGroupInfoSignature,
+		"ErrMalformedExtension":         ErrMalformedExtension,
+		"ErrWelcomeCarriedTreeMismatch": ErrWelcomeCarriedTreeMismatch,
 	}
 }
 
@@ -504,6 +509,61 @@ func TestEachRuleOfGroupInfoVerifyAnswersItsOwnSentinel(t *testing.T) {
 		"ErrWelcomeGroupInfoSignature": func(t *testing.T) error {
 			info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
 			if err := info.Sign(crypto, members[1].SignaturePriv); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			return info.Verify(crypto, tree)
+		},
+		// rules 2 and 3 are signed by a REAL member at the leaf they name, which is the whole
+		// point of them: the version and the suite are inside GroupInfoTBS, so what these drive
+		// is a member committing to a version or a suite the verifier is not running, with a
+		// signature over it that is perfectly good.
+		"ErrUnsupportedVersion": func(t *testing.T) error {
+			info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+			info.GroupContext.Version = ProtocolVersion(0x4242)
+			if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			return info.Verify(crypto, tree)
+		},
+		"errGroupInfoProviderSuite": func(t *testing.T) error {
+			info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+			info.GroupContext.CipherSuite = CipherSuite(0xbeef)
+			if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			return info.Verify(crypto, tree)
+		},
+		// nothing signs this one and nothing could: one labelled field holds MaxVectorLength, so
+		// this group info has no to-be-signed encoding at all, which is the fault rule 7 is for
+		// and is exactly why it is not a signature refusal
+		"errGroupInfoPreimage": func(t *testing.T) error {
+			info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+			info.Extensions = []Extension{{
+				ExtensionType: ExtensionTypeApplicationId,
+				ExtensionData: make([]byte, syntax.MaxVectorLength+1),
+			}}
+			return info.Verify(crypto, tree)
+		},
+		"ErrMalformedExtension": func(t *testing.T) error {
+			carried, err := tree.Encode()
+			if err != nil {
+				t.Fatalf("encode this tree as a ratchet_tree extension: %v", err)
+			}
+			info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+			info.Extensions = []Extension{carried, carried}
+			if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			return info.Verify(crypto, tree)
+		},
+		"ErrWelcomeCarriedTreeMismatch": func(t *testing.T) error {
+			carried, err := elsewhere.Encode()
+			if err != nil {
+				t.Fatalf("encode the other tree as a ratchet_tree extension: %v", err)
+			}
+			info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+			info.Extensions = []Extension{carried}
+			if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
 				t.Fatalf("Sign: %v", err)
 			}
 			return info.Verify(crypto, tree)
@@ -717,5 +777,538 @@ func TestGroupInfoRoundTripThenVerify(t *testing.T) {
 	}
 	if err := parsed.Verify(crypto, tree); err != nil {
 		t.Errorf("Verify after a round trip = %v, want nil", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// p7 task 14, second pass: the four gaps a review measured in this pair, and the forgery the
+// joiner task is about to build.
+//
+// Each test below exists because a MUTATION of the production body survived the whole suite.
+// That is the standard the file's own header sets -- a test that cannot fail is a clean run over
+// nothing -- and the four survivors were: a Verify that answered nil for an empty signature, a
+// Sign that wrote only into an empty Signature, a signer bound taken from the tree's MEMBER
+// COUNT rather than its leaf width, and a Verify that accepted any ciphersuite and any protocol
+// version. The fifth thing here is not a mutation at all: it is the shape p7 task 16 will write
+// if the precondition on Verify goes unread, asserted as the fact it is.
+// ---------------------------------------------------------------------------
+
+// TestAGroupInfoCarryingNoSignatureAtAllIsRefused is finding 2, and the reason it is written at
+// all is that `if len(self.Signature) == 0 { return nil }` inserted into Verify passed the full
+// suite at 6805 tests.
+//
+// Every existing negative case in this file supplies a real 64 octet signature, so nothing in
+// the package asked what happens to a group info carrying none. Production was already correct
+// -- VerifyWithLabel refuses it -- but an empty signature<V> is a WIRE-LEGAL encoding a peer can
+// send: syntax.Unmarshal accepts it and yields len(Signature) == 0. So the object is built here
+// AND taken off the wire, because the wire is where it comes from, and a fixture assembled in
+// memory would leave the decoder's half of the claim untested.
+//
+// The lengths are swept rather than the empty case alone. What must not decide the answer is the
+// LENGTH: a body that refused only the empty vector, or only anything shorter than a signature,
+// would pass an empty-signature test while accepting 64 octets of zeros, and the object a peer
+// actually sends is whichever of those the peer prefers.
+func TestAGroupInfoCarryingNoSignatureAtAllIsRefused(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 4)
+
+	// the positive control, so nothing below passes because Verify refuses everything
+	honest := signedTestGroupInfo(t, crypto, tree, members, LeafIndex(0))
+	if err := honest.Verify(crypto, tree); err != nil {
+		t.Fatalf("the honest group info was refused with %v, so every refusal below says nothing", err)
+	}
+	real := bytes.Clone(honest.Signature)
+	if len(real) == 0 {
+		t.Fatal("the honest signature is empty, so the rows below are not the lengths they claim")
+	}
+
+	rows := map[string][]byte{
+		"absent":                              nil,
+		"present and empty":                   {},
+		"one octet":                           {0x00},
+		"a run of zeros of its size":          make([]byte, len(real)),
+		"the real one short an octet":         bytes.Clone(real[:len(real)-1]),
+		"the real one with an octet appended": append(bytes.Clone(real), 0x00),
+	}
+	for _, name := range slices.Sorted(maps.Keys(rows)) {
+		info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+		info.Signature = rows[name]
+		if err := info.Verify(crypto, tree); !errors.Is(err, ErrWelcomeGroupInfoSignature) {
+			t.Errorf("a group info whose signature is %s answered %v, want ErrWelcomeGroupInfoSignature",
+				name, err)
+		}
+	}
+
+	// and off the wire, which is the path that makes the empty case a peer's choice rather than
+	// this test's: the encode carries an empty signature<V> and the decode gives it back
+	unsigned := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+	encoded, err := syntax.Marshal(unsigned)
+	if err != nil {
+		t.Fatalf("marshal an unsigned group info: %v", err)
+	}
+	parsed := GroupInfo{}
+	if err := syntax.Unmarshal(encoded, &parsed); err != nil {
+		t.Fatalf("unmarshal an unsigned group info: %v", err)
+	}
+	if len(parsed.Signature) != 0 {
+		t.Fatalf("the decoded signature is %d octets, so this half is not driving an empty signature<V> at all",
+			len(parsed.Signature))
+	}
+	if err := parsed.Verify(crypto, tree); !errors.Is(err, ErrWelcomeGroupInfoSignature) {
+		t.Errorf("a group info decoded off the wire with an empty signature<V> answered %v, want ErrWelcomeGroupInfoSignature",
+			err)
+	}
+}
+
+// TestSigningAGroupInfoAgainAfterAFieldChangedReplacesTheStaleSignature is finding 3, and it is
+// the input TestGroupInfoSigningTwiceAnswersTheSameSignature cannot be.
+//
+// `if len(self.Signature) == 0 { self.Signature = signature }` survives the full suite, because
+// the twice-signing test compares the first signature to the second and under that mutation the
+// second Sign is a NO OP -- the two signatures it compares are one signature, and they are equal
+// for the worst possible reason.
+//
+// The order below is p7 task 15's own: a committer assembles a GroupInfo, signs it, fills in the
+// confirmation tag once the key schedule has advanced, and signs again. Under the mutation that
+// committer publishes a signature over the OLD confirmation tag, and every peer refuses it.
+func TestSigningAGroupInfoAgainAfterAFieldChangedReplacesTheStaleSignature(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 2)
+
+	info := signedTestGroupInfo(t, crypto, tree, members, LeafIndex(0))
+	stale := bytes.Clone(info.Signature)
+	info.ConfirmationTag = bytes.Repeat([]byte{0x5c}, crypto.HashSize())
+	if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+		t.Fatalf("Sign after the confirmation tag was filled in: %v", err)
+	}
+	if bytes.Equal(stale, info.Signature) {
+		t.Fatalf("signing again over a changed confirmation tag left the first signature %x in place",
+			stale)
+	}
+	if err := info.Verify(crypto, tree); err != nil {
+		t.Errorf("the group info signed after its confirmation tag was filled in was refused with %v", err)
+	}
+
+	// and the stale signature is not merely different, it is REFUSED, which is what says the
+	// paragraph above describes a defect rather than a cosmetic difference
+	replaced := bytes.Clone(info.Signature)
+	info.Signature = stale
+	if err := info.Verify(crypto, tree); !errors.Is(err, ErrWelcomeGroupInfoSignature) {
+		t.Errorf("the signature taken before the confirmation tag changed answered %v against the changed object, want ErrWelcomeGroupInfoSignature",
+			err)
+	}
+	info.Signature = replaced
+
+	// Sign overwrites whatever it finds and does not defer to it: a signature that was never
+	// this object's is replaced the same way a stale one of its own is
+	other := testGroupInfoOverTree(t, crypto, tree, LeafIndex(1))
+	planted := bytes.Repeat([]byte{0x77}, len(stale))
+	other.Signature = bytes.Clone(planted)
+	if err := other.Sign(crypto, members[1].SignaturePriv); err != nil {
+		t.Fatalf("Sign over a planted signature: %v", err)
+	}
+	if bytes.Equal(other.Signature, planted) {
+		t.Errorf("Sign left a planted signature in place")
+	}
+	if err := other.Verify(crypto, tree); err != nil {
+		t.Errorf("a group info signed over a planted signature was refused with %v", err)
+	}
+}
+
+// TestTheSignerBoundIsTheTreesLeafWidthAndNotItsMembership is finding 4, and it needs the one
+// group shape this file had none of.
+//
+// Changing Verify's bound from tree.LeafWidth() to LeafCount(tree.MemberCount()) survives the
+// full suite, because every tree in this file is full: with n members at width n the two answer
+// the same number and no input can tell them apart. A THREE member group pads to width 4, so
+// leaf 3 is INSIDE the tree and occupied by nobody -- and the mutation answers
+// ErrLeafIndexOutOfRange there, where errBlankSenderLeaf belongs. That is exactly the rule
+// collapse this file's header says a single sentinel would hide, arriving through a bound rather
+// than through a sentinel.
+//
+// The shape is asserted before it is used. A fixture that had stopped padding would leave this
+// passing while measuring nothing at all.
+func TestTheSignerBoundIsTheTreesLeafWidthAndNotItsMembership(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 3)
+	if tree.LeafWidth() != 4 || tree.MemberCount() != 3 {
+		t.Fatalf("a three member tree here has leaf width %d and %d members; this test separates the two bounds only when they differ",
+			tree.LeafWidth(), tree.MemberCount())
+	}
+	if tree.Leaf(LeafIndex(3)) != nil {
+		t.Fatal("leaf 3 of a three member group is occupied, so it is not the trailing blank leaf this test is about")
+	}
+
+	// inside the tree and belonging to nobody: the blank leaf rule, and not the index rule
+	blank := testGroupInfoOverTree(t, crypto, tree, LeafIndex(3))
+	if err := blank.Sign(crypto, members[0].SignaturePriv); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	answered := blank.Verify(crypto, tree)
+	if !errors.Is(answered, errBlankSenderLeaf) {
+		t.Errorf("a group info naming the trailing blank leaf 3 of a three member group answered %v, want errBlankSenderLeaf",
+			answered)
+	}
+	if errors.Is(answered, ErrLeafIndexOutOfRange) {
+		t.Errorf("leaf 3 was reported as outside a tree four leaves wide, which is what a bound taken from the member count reports; a caller told that goes looking for a malformed sender index over a position that is simply empty")
+	}
+
+	// and the position that IS outside the tree still is, so the rule above did not simply
+	// swallow the index rule
+	beyond := testGroupInfoOverTree(t, crypto, tree, LeafIndex(tree.LeafWidth()))
+	if err := beyond.Sign(crypto, members[0].SignaturePriv); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	outside := beyond.Verify(crypto, tree)
+	if !errors.Is(outside, ErrLeafIndexOutOfRange) {
+		t.Errorf("a group info naming leaf %d of a four leaf tree answered %v, want ErrLeafIndexOutOfRange",
+			tree.LeafWidth(), outside)
+	}
+	if errors.Is(outside, errBlankSenderLeaf) {
+		t.Errorf("a signer index past the end of the tree was reported as a blank leaf, so the two rules cannot be told apart")
+	}
+}
+
+// TestVerifyRefusesAGroupInfoNamingASuiteOrVersionThisVerifierDoesNotRun is finding 5.
+//
+// Measured before the rules existed: a GroupInfo whose GroupContext.CipherSuite is 0xbeef,
+// signed by a real member, verified through the suite 3 provider, answered nil; so did one
+// naming version 0x4242. The suite and the version are INSIDE the signed bytes, which is what
+// makes this more than tidiness -- a MEMBER can commit to a suite the verifier is not running,
+// and (*GroupInfo).VerifiedContext then hands a proposal cache a group context naming it.
+//
+// The suite rows are DERIVED from the registry rather than written down: Suites() is this
+// package's own closed set, so every registered code point other than the provider's is swept,
+// and a third suite added later joins the sweep on the commit that registers it. Two
+// unregistered points are swept beside them, because "not this provider's" and "not a suite at
+// all" are different inputs and only the first is what the rule is about.
+//
+// The ORDER is pinned in the same test, because it is the reason these two rules run where they
+// do: the tree hash is taken THROUGH the provider, so over a group info naming another suite a
+// tree hash comparison holds one suite's hash function against another's. A group info that is
+// wrong about BOTH must answer the suite, not the tree.
+func TestVerifyRefusesAGroupInfoNamingASuiteOrVersionThisVerifierDoesNotRun(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 4)
+	elsewhere, _ := newTestTree(t, crypto, 4)
+
+	if err := signedTestGroupInfo(t, crypto, tree, members, LeafIndex(0)).Verify(crypto, tree); err != nil {
+		t.Fatalf("the honest group info was refused with %v, so every refusal below says nothing", err)
+	}
+
+	suites := []CipherSuite{}
+	for _, registered := range Suites() {
+		if registered != crypto.Suite() {
+			suites = append(suites, registered)
+		}
+	}
+	if len(suites) == 0 {
+		t.Fatal("the registry holds no suite other than the provider's, so the derived rows below are empty")
+	}
+	suites = append(suites, CipherSuite(0xbeef), CipherSuite(0x0000))
+	for _, suite := range suites {
+		info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+		info.GroupContext.CipherSuite = suite
+		if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		if err := info.Verify(crypto, tree); !errors.Is(err, errGroupInfoProviderSuite) {
+			t.Errorf("a group info naming ciphersuite %#04x, signed by a real member and verified through the %#04x provider, answered %v; want errGroupInfoProviderSuite",
+				uint16(suite), uint16(crypto.Suite()), err)
+		}
+	}
+
+	for _, version := range []ProtocolVersion{0x4242, 0x0000, 0xffff} {
+		info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+		info.GroupContext.Version = version
+		if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		if err := info.Verify(crypto, tree); !errors.Is(err, ErrUnsupportedVersion) {
+			t.Errorf("a group info naming protocol version %#04x, signed by a real member, answered %v; want ErrUnsupportedVersion",
+				uint16(version), err)
+		}
+	}
+
+	// the order: wrong about the suite AND about the tree answers the suite, because the tree
+	// hash the other rule would compare was taken through a provider this group info does not
+	// name
+	both := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+	both.GroupContext.CipherSuite = CipherSuite(0xbeef)
+	if err := both.Sign(crypto, members[0].SignaturePriv); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	answered := both.Verify(crypto, elsewhere)
+	if !errors.Is(answered, errGroupInfoProviderSuite) {
+		t.Errorf("a group info wrong about the suite and about the tree answered %v, want errGroupInfoProviderSuite; a tree hash comparison made under a provider the group info does not name compares two different hash functions",
+			answered)
+	}
+	// and the version outranks the suite for the same reason one level up: a structure that is
+	// not mls10 is not one whose ciphersuite field this build knows the meaning of
+	neither := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+	neither.GroupContext.Version = ProtocolVersion(0x4242)
+	neither.GroupContext.CipherSuite = CipherSuite(0xbeef)
+	if err := neither.Sign(crypto, members[0].SignaturePriv); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := neither.Verify(crypto, tree); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Errorf("a group info wrong about the version and the suite answered %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+// TestAGroupInfoCarriedRatchetTreeMustDescribeTheTreeItIsVerifiedAgainst is Verify's rule 9,
+// held to the thing it buys and, in the test after this one, to the thing it does not.
+//
+// The gap it closes was measured: a GroupInfo whose ratchet_tree extension described tree A
+// while its group context named tree B verified against B with the extension ENTIRELY IGNORED,
+// because Verify never decoded GroupInfo.Extensions. One object could therefore verify against
+// the tree a joiner already trusts and simultaneously carry a different tree for a later code
+// path to adopt, with "the group info verified" as its warrant.
+//
+// The positive control is the first row and it is not decoration: a rule that refused every
+// carried tree would satisfy every other row here, and RFC 9420 section 12.4.3.1 exists so a
+// Welcome CAN carry the tree.
+func TestAGroupInfoCarriedRatchetTreeMustDescribeTheTreeItIsVerifiedAgainst(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := newTestTree(t, crypto, 4)
+	elsewhere, _ := newTestTree(t, crypto, 4)
+
+	own, err := tree.Encode()
+	if err != nil {
+		t.Fatalf("encode this tree as a ratchet_tree extension: %v", err)
+	}
+	other, err := elsewhere.Encode()
+	if err != nil {
+		t.Fatalf("encode the other tree as a ratchet_tree extension: %v", err)
+	}
+
+	signedOver := func(t *testing.T, exts []Extension) *GroupInfo {
+		t.Helper()
+		info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+		info.Extensions = exts
+		if err := info.Sign(crypto, members[0].SignaturePriv); err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		return info
+	}
+
+	// carrying nothing at all, and carrying the tree it names: both verify, which is what says
+	// every refusal below is the rule's and not a blanket
+	if err := signedOver(t, nil).Verify(crypto, tree); err != nil {
+		t.Fatalf("a group info carrying no ratchet_tree extension was refused with %v", err)
+	}
+	if err := signedOver(t, []Extension{own}).Verify(crypto, tree); err != nil {
+		t.Fatalf("a group info carrying the very tree it is verified against was refused with %v; the extension exists so a welcome can carry the tree",
+			err)
+	}
+
+	// the gap: one tree in the extension, another in the group context and in the caller's hand
+	if err := signedOver(t, []Extension{other}).Verify(crypto, tree); !errors.Is(err,
+		ErrWelcomeCarriedTreeMismatch) {
+		t.Errorf("a group info carrying a ratchet_tree for another group answered %v, want ErrWelcomeCarriedTreeMismatch; before this rule the extension was not decoded at all",
+			err)
+	}
+
+	// a carried body that is not a tree, which is the same rule with the decoder's reason behind
+	// it rather than a hash comparison
+	rows := map[string][]byte{
+		"empty":                           {},
+		"one octet":                       {0x01},
+		"the real body short an octet":    bytes.Clone(own.ExtensionData[:len(own.ExtensionData)-1]),
+		"the real body with a byte added": append(bytes.Clone(own.ExtensionData), 0x00),
+	}
+	for _, name := range slices.Sorted(maps.Keys(rows)) {
+		broken := Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: rows[name]}
+		if err := signedOver(t, []Extension{broken}).Verify(crypto, tree); !errors.Is(err,
+			ErrWelcomeCarriedTreeMismatch) {
+			t.Errorf("a group info whose ratchet_tree body is %s answered %v, want ErrWelcomeCarriedTreeMismatch",
+				name, err)
+		}
+	}
+
+	// two of them is the extensions vector being illegal rather than the tree being wrong, and it
+	// is FindExtensionEntry's refusal because that lookup is this package's ONE door for a
+	// repeated extension type -- a second walk written here would be a second selection rule
+	if err := signedOver(t, []Extension{own, own}).Verify(crypto, tree); !errors.Is(err,
+		ErrMalformedExtension) {
+		t.Errorf("a group info carrying two ratchet_tree extensions answered %v, want ErrMalformedExtension", err)
+	}
+
+	// rule 9 runs after the signature, so a group info that is wrong about both answers the
+	// signature: the decode of a peer-chosen tree is paid only once a member of the caller's
+	// tree is known to have signed
+	unsigned := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+	unsigned.Extensions = []Extension{other}
+	if err := unsigned.Sign(crypto, members[1].SignaturePriv); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := unsigned.Verify(crypto, tree); !errors.Is(err, ErrWelcomeGroupInfoSignature) {
+		t.Errorf("a group info with a bad signature AND a foreign carried tree answered %v, want ErrWelcomeGroupInfoSignature",
+			err)
+	}
+}
+
+// TestAJoinerThatTakesTheTreeOutOfTheGroupInfoItChecksIsProtectedByNothingHere is finding 1, and
+// it asserts the SUCCESS of the forgery rather than papering over it.
+//
+// This is the shape p7 task 16 will build if the precondition on Verify goes unread, and the
+// object it accepts is not a near miss: the attacker mints its own four leaf tree with every
+// leaf its own, encodes that tree into a ratchet_tree extension, names the group id the joiner
+// expects, sets tree_hash to its OWN tree's hash and signs at its own leaf 0. Every rule of
+// Verify is TRUE of the result, rule 9 included -- the carried tree and the tree it is verified
+// against are the same tree, so they agree, and agreement is not authentication.
+//
+// A test that asserted only the refusal against the honest tree would let this file read as
+// though the gap were closed, which is the one thing the next task must not be told. So both
+// halves are asserted, and this test FAILS if either stops being true: if the forgery starts
+// being refused, somebody has closed the gap and this account is stale; if the honest tree stops
+// refusing it, the door has stopped working altogether.
+func TestAJoinerThatTakesTheTreeOutOfTheGroupInfoItChecksIsProtectedByNothingHere(t *testing.T) {
+	crypto := testCrypto(t)
+	honestTree, _ := newTestTree(t, crypto, 4)
+	attackersTree, attackers := newTestTree(t, crypto, 4)
+
+	carried, err := attackersTree.Encode()
+	if err != nil {
+		t.Fatalf("encode the attacker's tree as a ratchet_tree extension: %v", err)
+	}
+	// the group id the joiner expects, and the attacker's own tree hash
+	forged := testGroupInfoOverTree(t, crypto, attackersTree, LeafIndex(0))
+	forged.Extensions = []Extension{carried}
+	if err := forged.Sign(crypto, attackers[0].SignaturePriv); err != nil {
+		t.Fatalf("the attacker signing its own group info: %v", err)
+	}
+
+	// the joiner's mistake, written the way the RFC invites it: resolve the tree out of the very
+	// group info being checked
+	resolved, err := ParseRatchetTreeFrom(forged.Extensions[0])
+	if err != nil {
+		t.Fatalf("a joiner parsing the carried ratchet_tree: %v", err)
+	}
+	if answered := forged.Verify(crypto, resolved); answered != nil {
+		t.Fatalf("the self-consistent forgery was refused with %v; if a later task closed this, delete the account of it on (*GroupInfo).Verify rather than leaving this test asserting a gap that no longer exists",
+			answered)
+	}
+	verified, err := forged.VerifiedContext(crypto, resolved)
+	if err != nil || verified == nil {
+		t.Fatalf("VerifiedContext refused the forgery Verify accepted (%v); the two doors have stopped agreeing", err)
+	}
+	if !bytes.Equal(verified.Context().GroupId, []byte(welcomeTestGroupId)) {
+		t.Fatalf("the vouched-for context names group %x", verified.Context().GroupId)
+	}
+
+	// and the half that IS closed: against a tree the joiner already trusts, the same object is
+	// refused, which is what says the gap is in WHERE THE TREE CAME FROM and nowhere else
+	if err := forged.Verify(crypto, honestTree); !errors.Is(err, ErrWelcomeTreeHashMismatch) {
+		t.Errorf("the forgery against the joiner's own tree answered %v, want ErrWelcomeTreeHashMismatch",
+			err)
+	}
+}
+
+// groupInfoVerifyExitControl is a body the exit rule below is proven to read: one refusal that
+// names a sentinel, one bare `return err`, one delegation to a helper, and a `return nil`.
+//
+// A control rather than a second opinion about welcome.go, for the reason every derivation in
+// this package carries one: a matcher that had stopped resolving anything reports an EMPTY set
+// of unnamed exits, and an empty set is exactly what a compliant body reports. Only source known
+// to hold both answers tells the two apart.
+const groupInfoVerifyExitControl = `package control
+
+import "errors"
+
+var errControlRefused = errors.New("control: refused")
+
+type Thing struct{}
+
+func (self *Thing) helper() error { return nil }
+
+func (self *Thing) Check(bad bool) error {
+	if bad {
+		return errControlRefused
+	}
+	if err := self.helper(); err != nil {
+		return err
+	}
+	return self.helper()
+}
+`
+
+// groupInfoVerifyUnnamedExits is every exit of one body that refuses without naming what it
+// refuses under: a return that is neither `return nil` nor carries a package level variable of
+// the package the names were collected from.
+//
+// Stated over the RETURN and over the ABSENCE of a name, because that is where the class lives.
+// `return err`, `return self.checkTheOtherThing(...)` and a wrap of a helper's error with no
+// sentinel of this layer are three spellings of one hole, and a rule that banned the identifier
+// `err` would report a clean run over the other two.
+func groupInfoVerifyUnnamedExits(parsed parsedSource, body *ast.BlockStmt, declared []string) []string {
+	unnamed := []string{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		returned, isReturn := node.(*ast.ReturnStmt)
+		if !isReturn {
+			return true
+		}
+		if len(returned.Results) == 1 {
+			if identifier, isIdentifier := returned.Results[0].(*ast.Ident); isIdentifier &&
+				identifier.Name == "nil" {
+				return true
+			}
+		}
+		named := false
+		for _, result := range returned.Results {
+			ast.Inspect(result, func(inner ast.Node) bool {
+				identifier, isIdentifier := inner.(*ast.Ident)
+				if isIdentifier && slices.Contains(declared, identifier.Name) {
+					named = true
+				}
+				return true
+			})
+		}
+		if !named {
+			unnamed = append(unnamed, parsed.render(returned))
+		}
+		return true
+	})
+	return unnamed
+}
+
+// TestEveryRefusingExitOfGroupInfoVerifyNamesTheSentinelItRefusesUnder closes the class the
+// sentinel roster above cannot see.
+//
+// groupInfoVerifySentinelNames derives Verify's refusal class from the identifiers in its return
+// statements, so an exit spelled `return err` contributes NOTHING to that class while still
+// being one of Verify's answers. Two of them lived here -- the tree hash draw and the signature
+// preimage -- and the effect is not cosmetic: whatever tree.go or syntax decides to answer next
+// becomes a refusal of Verify that no sweep of this package judges, while the roster gate above
+// reports a clean run. This is the same understatement rule 5 is about, arriving through an
+// omission rather than through a list.
+//
+// It is stated over Verify and not over every declaration of the file on purpose. Verify is the
+// refusal surface a PEER reaches, and its answers are ones a caller branches on; Sign's are its
+// own caller's encode and provider failures, with nothing on the wire behind them.
+func TestEveryRefusingExitOfGroupInfoVerifyNamesTheSentinelItRefusesUnder(t *testing.T) {
+	declared := []string{}
+	for _, path := range packageLevelFunctions(t).files {
+		declared = append(declared, packageLevelVarNamesIn(mustParseSource(t, path))...)
+	}
+	if !slices.Contains(declared, "ErrWelcomeGroupInfoSignature") {
+		t.Fatalf("the package level variable scan found %d names and not ErrWelcomeGroupInfoSignature, so it is reading something other than this package",
+			len(declared))
+	}
+
+	control := mustParseText(t, "the unnamed refusal control", groupInfoVerifyExitControl)
+	inControl := append(slices.Clone(declared), packageLevelVarNamesIn(control)...)
+	reported := groupInfoVerifyUnnamedExits(control,
+		control.declarationOf(t, "*Thing", "Check").Body, inControl)
+	if len(reported) != 2 {
+		t.Fatalf("the rule reported %v out of the control, which holds exactly two unnamed refusals beside one named refusal and one nil; a rule that reported none of them would report a clean run over any body at all",
+			reported)
+	}
+
+	parsed := mustParseSource(t, "welcome.go")
+	body := parsed.declarationOf(t, "*GroupInfo", "Verify").Body
+	if unnamed := groupInfoVerifyUnnamedExits(parsed, body, declared); len(unnamed) != 0 {
+		t.Errorf("(*GroupInfo).Verify refuses through %v without naming a sentinel; the refusal class gate beside this one derives its class from those identifiers, so an exit with no name in it is an answer of Verify's that nothing in this package sweeps",
+			unnamed)
 	}
 }
