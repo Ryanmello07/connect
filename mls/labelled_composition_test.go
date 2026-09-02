@@ -415,6 +415,21 @@ func TestEveryLabelledConstructionRefusesALabelTooLongToBeOneField(t *testing.T)
 	if err != nil {
 		t.Fatalf("DeriveKeyPair: %v", err)
 	}
+	// the exporter's own epoch. Any epoch will do: what is under test is the label this
+	// method takes from a caller, and the schedule is here so that the call reaches the
+	// KDFLabel that label is written into rather than stopping at a live secret check.
+	schedule, err := NewKeyScheduleFromEpochSecret(crypto, crypto.Random(crypto.HashSize()),
+		&GroupContext{
+			Version:                 ProtocolVersionMls10,
+			CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+			GroupId:                 []byte("the labelled bound"),
+			Epoch:                   1,
+			TreeHash:                crypto.Random(crypto.HashSize()),
+			ConfirmedTranscriptHash: crypto.Random(crypto.HashSize()),
+		})
+	if err != nil {
+		t.Fatalf("the epoch the exporter row is driven over: %v", err)
+	}
 	content := []byte("content")
 	for _, entry := range []struct {
 		name string
@@ -441,6 +456,13 @@ func TestEveryLabelledConstructionRefusesALabelTooLongToBeOneField(t *testing.T)
 				return err
 			}
 			_, err = DecryptWithLabel(crypto, priv, label, nil, kemOutput, ciphertext)
+			return err
+		}},
+		// the exported method that used to PANIC on this row. Its boundary is the prefixed
+		// one and not RefHash's, because the label reaches a KDFLabel through DeriveSecret and
+		// the "MLS 1.0 " that construction writes is inside the field being declared.
+		{name: "(*KeySchedule).Export", call: func(label string) error {
+			_, err := schedule.Export(label, []byte("context"), 32)
 			return err
 		}},
 	} {
@@ -471,6 +493,48 @@ func TestEveryLabelledConstructionRefusesALabelTooLongToBeOneField(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+// The refusal every message pays for costs nothing on the path every message takes.
+//
+// This is a test rather than a sentence in checkLabelledConstruction's comment because the
+// sentence WAS there and was half false. The label BYTES were measured rather than
+// concatenated, exactly as it said; the label's NAME, what+" label", was then built eagerly to
+// describe them -- 16.72 ns/op, 24 B/op, one allocation on every signature and every verify in
+// the system, for the branch that same comment says no message takes. A comment cannot notice
+// that. An allocation count can, and it is the only instrument here that can: every behavioural
+// assertion in this file passed with the eager version and would pass with it again.
+//
+// Zero rather than "fewer than before". One allocation is precisely what the defect was, so any
+// allocation on the accepting path is the defect back.
+//
+// The refusal is asserted underneath it, because the cheap way to allocate nothing is to stop
+// naming the field, and a length refusal that cannot say WHICH of a construction's two fields
+// was too long sends the caller to shrink the wrong one.
+func TestTheLabelledConstructionCheckBuildsNoNameOnThePathAMessageTakes(t *testing.T) {
+	content := make([]byte, 4096)
+	if err := checkLabelledConstruction("signature content", "UpdatePathNode", content); err != nil {
+		t.Fatalf("the accepted construction this measures was refused: %v", err)
+	}
+	var answered error
+	allocations := testing.AllocsPerRun(1000, func() {
+		answered = checkLabelledConstruction("signature content", "UpdatePathNode", content)
+	})
+	if answered != nil {
+		t.Fatalf("the measured call answered %v", answered)
+	}
+	if allocations != 0 {
+		t.Errorf("checkLabelledConstruction allocates %v per ACCEPTED construction, want 0", allocations)
+	}
+	refused := checkLabelledConstruction("signature content",
+		strings.Repeat("l", syntax.MaxVectorLength), content)
+	if !errors.Is(refused, syntax.ErrLengthExceedsMax) {
+		t.Fatalf("an over long label answered %v, want syntax.ErrLengthExceedsMax", refused)
+	}
+	if !strings.Contains(refused.Error(), "signature content label") {
+		t.Errorf("the refusal reads %q and does not name the label as the field that did not fit",
+			refused.Error())
 	}
 }
 
