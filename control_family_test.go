@@ -146,23 +146,35 @@ func TestControlIpFamilyPolicyIgnoresDemotion(t *testing.T) {
 }
 
 func TestControlFamilyDemoteNarrowsToTheOtherFamily(t *testing.T) {
-	restore := swapControlFamilyProbe(func(int) bool { return true })
-	defer restore()
-	controlFamilyClear()
-	defer controlFamilyClear()
+	tests := []struct {
+		name   string
+		demote int
+		want   string
+	}{
+		{"demote 6 narrows to tcp4", 6, "tcp4"},
+		{"demote 4 narrows to tcp6", 4, "tcp6"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			restore := swapControlFamilyProbe(func(int) bool { return true })
+			defer restore()
+			controlFamilyClear()
+			defer controlFamilyClear()
 
-	if !controlFamilyDemote(6) {
-		t.Fatal("expected the demotion to take")
-	}
-	network, err := controlDialNetwork("tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if network != "tcp4" {
-		t.Fatalf("got %q, want tcp4", network)
-	}
-	if controlFamilyStatus() == "" {
-		t.Fatal("expected a non-empty status while a demotion is live")
+			if !controlFamilyDemote(test.demote) {
+				t.Fatal("expected the demotion to take")
+			}
+			network, err := controlDialNetwork("tcp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if network != test.want {
+				t.Fatalf("got %q, want %s", network, test.want)
+			}
+			if controlFamilyStatus() == "" {
+				t.Fatal("expected a non-empty status while a demotion is live")
+			}
+		})
 	}
 }
 
