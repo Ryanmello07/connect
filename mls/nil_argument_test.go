@@ -323,6 +323,14 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			return tree.ValidateAgainstContext(&TreeValidationContext{
 				Crypto: crypto, Suite: crypto.Suite(), GroupId: testGroupId()}, nil)
 		}},
+		// p7 task 14's group info verifier, whose tree is not one input among several: the
+		// signer's public key is not in a GroupInfo at all, so the tree is the only thing that
+		// can say who the members are. A nil one would otherwise be dereferenced at LeafWidth.
+		// ErrTreeMalformed and none of that method's own four sentinels, because no tree is not
+		// a tree whose hash disagrees, an index outside one, a blank leaf or a bad signature.
+		"(*GroupInfo).Verify(tree)": {sentinel: ErrTreeMalformed, call: func(t *testing.T) error {
+			return (&GroupInfo{}).Verify(crypto, nil)
+		}},
 		"(*TreeKEMPrivate).Consistent(tree)": {sentinel: ErrPathSecretMismatch, call: func(t *testing.T) error {
 			return NewTreeKEMPrivate(members[0].LeafIndex, members[0].EncryptionPriv).Consistent(crypto, nil)
 		}},

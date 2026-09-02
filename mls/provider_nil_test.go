@@ -210,6 +210,24 @@ func providerNilMethodRows() []providerNilMethodRow {
 			_, err := (&ProposalCache{}).Resolve(nil, nil, 0, nil)
 			return err
 		}},
+		// p7 task 14's group info pair, on a ZERO valued GroupInfo, which is the receiver that
+		// separates the orders these bodies could be written in. A zero GroupInfo names signer
+		// leaf 0 and carries an empty tree hash, so a Verify that judged its receiver against
+		// its tree before it looked at its provider would answer ErrWelcomeTreeHashMismatch --
+		// sending the caller to look for a fork over a provider it never passed.
+		//
+		// Both are handed a nil TREE as well, deliberately. Verify's tree is not one input among
+		// several -- a GroupInfo carries no verification key, so the tree is the only thing that
+		// can say who the members are -- and with a real tree here the gate would pass over a
+		// body with no provider check at all, because (*RatchetTree).TreeHash makes the same
+		// refusal one frame down. With no tree, only a body that reads its provider FIRST
+		// answers ErrNilCryptoProvider; one that reads its tree first answers ErrTreeMalformed.
+		{name: "(*GroupInfo).Sign", call: func() error {
+			return (&GroupInfo{}).Sign(nil, nil)
+		}},
+		{name: "(*GroupInfo).Verify", call: func() error {
+			return (&GroupInfo{}).Verify(nil, nil)
+		}},
 	}
 }
 

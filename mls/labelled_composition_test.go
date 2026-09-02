@@ -1760,6 +1760,8 @@ var labelledCompositionClass = []string{
 	"leaf_node.go *LeafNode.Sign: signatureContent -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
 	"leaf_node.go *LeafNode.VerifySignature: signatureContent -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
 	"psk.go PskSecret: marshalPskLabel -> *suiteCryptoProvider.ExpandWithLabel context (bounded where it is built)",
+	"welcome.go *GroupInfo.Sign: signaturePreimage -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
+	"welcome.go *GroupInfo.Verify: signaturePreimage -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
 }
 
 func TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere(t *testing.T) {

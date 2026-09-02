@@ -889,6 +889,61 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				{name: "the resolved extension body", content: extensions[0].ExtensionData, carried: true},
 			}, nil
 		}},
+		// p7 task 14's group info signing half. What it leaves behind is a signature over the
+		// GroupInfoTBS taken through the provider it was handed -- a body that reached for
+		// ed25519 itself would answer a signature that verifies against every GroupInfo in this
+		// package and against every published welcome, because the corpora are all Ed25519,
+		// which is the scheme it would have hardcoded.
+		//
+		// The private key is a fixed 32 octets rather than one drawn through the provider, so
+		// this row does not consume a stream another row is positioned in, and it is taken
+		// through the recorder because it is the caller's.
+		{name: "(*GroupInfo).Sign", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			info, err := providerRowGroupInfo(t, crypto, providerRowRatchetTree(t))
+			if err != nil {
+				return nil, err
+			}
+			if err := info.Sign(crypto, SignaturePrivateKey(take(bytes.Repeat([]byte{0x73}, 32)))); err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{{name: "Signature", content: info.Signature}}, nil
+		}},
+		// its verifying half, whose whole answer is a yes or a no, so this row reads the VERDICT
+		// for the reason (*LeafNode).VerifySignature's does: the tagging provider passes
+		// VerifyWithLabel through unchanged, and there is nothing in a refusal for a flip to
+		// change.
+		//
+		// The group info is signed through the same provider it is then verified against, which
+		// is what makes the verdict move: over a provider whose signing half flips its answer, a
+		// verifier that routed through that provider refuses and one that reached for ed25519 on
+		// its own accepts exactly as it did over the real provider.
+		//
+		// The signer's public key is installed through (*RatchetTree).Leaf and not through
+		// SetLeaf, and that is what puts a caller's array where the retention gate can see it:
+		// SetLeaf stores a COPY, so an array handed to it is not the array Verify reads the
+		// signer's key out of. This is also the one input a GroupInfo does not carry -- the
+		// verification key is the tree's -- so it is the array that matters here.
+		{name: "(*GroupInfo).Verify", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			signer := SignaturePrivateKey(bytes.Repeat([]byte{0x74}, 32))
+			signerPub, err := signaturePublicKeyOf(signer)
+			if err != nil {
+				return nil, err
+			}
+			tree := providerRowRatchetTree(t)
+			tree.Leaf(LeafIndex(0)).SignatureKey = SignaturePublicKey(take(signerPub))
+			info, err := providerRowGroupInfo(t, crypto, tree)
+			if err != nil {
+				return nil, err
+			}
+			if err := info.Sign(crypto, signer); err != nil {
+				return nil, err
+			}
+			verdict := []byte("the group info verifies")
+			if refused := info.Verify(crypto, tree); refused != nil {
+				verdict = []byte("the group info is refused: " + refused.Error())
+			}
+			return []providerDrivenMethodValue{{name: "the verdict", content: verdict}}, nil
+		}},
 	}
 }
 
@@ -974,6 +1029,38 @@ func providerRowRatchetTree(t *testing.T) *RatchetTree {
 		t.Fatalf("the row's tree is %d nodes wide, want 7", tree.NodeWidth())
 	}
 	return tree
+}
+
+// providerRowGroupInfo is the p7 task 14 GroupInfo the two rows below drive, over the tree it is
+// handed and with every derived field cut to that provider's own KDF.Nh.
+//
+// The tree hash is taken through the ROW's provider rather than through one fixed here, which is
+// the opposite of what providerRowChainedRatchetTree does and is right for the opposite reason.
+// What the rows below read is a signature and a verdict; a group context whose tree hash was
+// computed under some other provider would make (*GroupInfo).Verify refuse over every provider,
+// and the verdict would then be constant for a reason that is this fixture's rather than the
+// method's.
+//
+// It is called AFTER any leaf of the tree has been settled, because the hash it writes into the
+// group context is the hash of the tree as it stands.
+func providerRowGroupInfo(t *testing.T, crypto CryptoProvider, tree *RatchetTree) (*GroupInfo, error) {
+	t.Helper()
+	treeHash, err := tree.TreeHash(crypto)
+	if err != nil {
+		return nil, err
+	}
+	return &GroupInfo{
+		GroupContext: GroupContext{
+			Version:                 ProtocolVersionMls10,
+			CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+			GroupId:                 []byte("the group this info describes"),
+			Epoch:                   9,
+			TreeHash:                treeHash,
+			ConfirmedTranscriptHash: bytes.Repeat([]byte{0x71}, crypto.HashSize()),
+		},
+		ConfirmationTag: bytes.Repeat([]byte{0x72}, crypto.HashSize()),
+		Signer:          LeafIndex(0),
+	}, nil
 }
 
 // providerDrivenMethods is every method this package's non test source declares whose

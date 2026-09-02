@@ -887,6 +887,24 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"treekem.go: syntax.ReadVector(r, readOneUpdatePathNode)",
 		"treekem.go: syntax.WriteVector(w, self.EncryptedPathSecret, writeOneHpkeCiphertext)",
 		"treekem.go: syntax.WriteVector(w, self.Nodes, writeOneUpdatePathNode)",
+		// p7 task 14's GroupInfo signature preimage, RFC 9420 section 12.4.3.
+		//
+		// The DEFAULT limit, and here that is not a judgement call but the only bound that can
+		// hold. These bytes become ONE labelled field: SignWithLabel and VerifyWithLabel run
+		// checkLabelledConstruction over them, which refuses a value past MaxVectorLength, so a
+		// preimage built at MaxRatchetTreeLength would be refused one frame later by the
+		// provider rather than accepted -- and it would be refused with a message about a
+		// labelled field rather than about the group info that overran. The refusal belongs at
+		// the encode, which is where a caller can still be told which structure was too big.
+		//
+		// The consequence is worth writing down here rather than being rediscovered: a GroupInfo
+		// carrying this product's own ratchet_tree extension is about 1.33 MiB, so it cannot be
+		// signed at all under the current cap. TestAGroupInfoCarryingThisProductsTreeCannotBeSigned
+		// measures it. That is not a hole in this call, it is the labelled field cap meeting the
+		// tree, and what makes it survivable is that a GroupInfo does not have to carry the tree:
+		// (*GroupInfo).Verify takes the *RatchetTree as an argument precisely because the signer's
+		// key comes from a tree the joiner obtained, not from the message.
+		"welcome.go: syntax.Marshal(&tbs)",
 		// the two vectors of RFC 9420 section 12.4.3.1: a Welcome's secrets<V> and a
 		// GroupSecrets' psks<V>. All four take the caller's Writer or Reader rather than
 		// building one, so each runs under whichever limit the caller opened.
