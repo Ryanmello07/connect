@@ -357,6 +357,12 @@ var mlsErrorClasses = map[string]map[string]error{
 	cryptoErrorsFile:      cryptoOwnedErrors,
 	framingErrorsFile:     framingOwnedErrors,
 	lifecycleErrorsFile:   lifecycleOwnedErrors,
+
+	// the seventh, and it joined on p7 task 7 for the reason the sixth did: nineteen proposal
+	// list refusals landed in a file of their own, no class held them, and without an entry
+	// here the whole exported surface of RFC 9420 section 12.2 would sit outside both sweeps
+	// below.
+	proposalValidationErrorsFile: proposalValidationOwnedErrors,
 }
 
 // TestCryptoOwnedErrorsIsEveryErrorItsFileDeclares is the same derivation the other three

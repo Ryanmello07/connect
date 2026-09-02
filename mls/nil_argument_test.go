@@ -589,6 +589,29 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		"checkProposalProfile(proposal)": {sentinel: errNilProposal, call: func(t *testing.T) error {
 			return checkProposalProfile(defaultProfile(), nil)
 		}},
+		// p7 task 8's section 12.3 application, whose three pointer arguments are each read
+		// before any proposal is applied. Every OTHER argument of every row is a live one --
+		// a real two leaf tree, this profile's own group context, an empty but present list
+		// -- so what each observes is the nil argument rather than a refusal standing in
+		// front of it. The tree and the list answer separate values because a caller that
+		// passed no tree and a caller that passed no proposals have made different mistakes
+		// and repair them in different places; the context answers the key schedule's own,
+		// which is the value every other declaration of this package asks that question
+		// with.
+		"ApplyProposals(tree)": {sentinel: errNilRatchetTree, call: func(t *testing.T) error {
+			_, err := ApplyProposals(nil, testApplyContext(), LeafIndex(0), &ProposalList{})
+			return err
+		}},
+		"ApplyProposals(ctx)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			tree, _ := testTreeWith(t, crypto, "alice", "bob")
+			_, err := ApplyProposals(tree, nil, LeafIndex(0), &ProposalList{})
+			return err
+		}},
+		"ApplyProposals(list)": {sentinel: errNilProposalList, call: func(t *testing.T) error {
+			tree, _ := testTreeWith(t, crypto, "alice", "bob")
+			_, err := ApplyProposals(tree, testApplyContext(), LeafIndex(0), nil)
+			return err
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

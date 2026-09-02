@@ -3705,6 +3705,15 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 			_, err := NewKeyScheduleFromEpochSecret(crypto, secret, context)
 			return err
 		},
+		// p7 task 8's section 12.3 application. The context is what a
+		// GroupContextExtensions proposal replaces, so a nil one is an application with
+		// nothing to replace rather than an application over an empty extension set. The
+		// tree and the list are live: an empty tree and an empty list are both legal, and
+		// what this row observes is the context.
+		"ApplyProposals": func(context *GroupContext) error {
+			_, err := ApplyProposals(NewRatchetTree(), context, LeafIndex(0), &ProposalList{})
+			return err
+		},
 		// p7 task 6's proposal cache used to be in this class and is deliberately not any
 		// more. It takes a *VerifiedGroupContext now -- a group context whose authority has
 		// been established, whose only constructor is (*GroupInfo).VerifiedContext --

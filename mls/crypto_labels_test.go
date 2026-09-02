@@ -896,6 +896,11 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"treekem.go: syntax.ReadVector(r, readOneUpdatePathNode)",
 		"treekem.go: syntax.WriteVector(w, self.EncryptedPathSecret, writeOneHpkeCiphertext)",
 		"treekem.go: syntax.WriteVector(w, self.Nodes, writeOneUpdatePathNode)",
+		// p7 task 7's ValSem106 and ValSem109, which decode the required_capabilities body the
+		// group context carries. The DEFAULT limit, because an extension_data<V> is bounded by the
+		// extensions vector it arrived inside and that vector is decoded under this same limit; a
+		// larger one here would accept a body no encoder of this package could ever have written.
+		"validate_proposals.go: syntax.Unmarshal(data, &required)",
 		// p7 task 14's GroupInfo signature preimage, RFC 9420 section 12.4.3.
 		//
 		// The DEFAULT limit, and here that is not a judgement call but the only bound that can
