@@ -327,3 +327,49 @@ func TestControlDialFamilyLineOnFailure(t *testing.T) {
 		t.Fatalf("line %q should carry the error", line)
 	}
 }
+
+// The h3/quic transport resolves a name to exactly ONE udp address and dials
+// it, with no family race of any kind. It is the fallback carrier that is
+// supposed to rescue a stalled h1, so if it picks the same broken family the
+// fallback is lost too.
+func TestPickControlUDPAddrHonorsPolicyAndDemotion(t *testing.T) {
+	v6 := net.IPAddr{IP: net.ParseIP("2001:db8::1")}
+	v4 := net.IPAddr{IP: net.ParseIP("192.0.2.1")}
+	addrs := []net.IPAddr{v6, v4}
+
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	// auto with nothing learned keeps the resolver's own order
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v6.IP) {
+		t.Fatalf("got %v, want the resolver's first address", got.IP)
+	}
+
+	// a demotion moves the pick off the demoted family
+	controlFamilyDemote(6)
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v4.IP) {
+		t.Fatalf("got %v, want the IPv4 address once IPv6 is demoted", got.IP)
+	}
+	controlFamilyClear()
+
+	// a force wins outright
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v4.IP) {
+		t.Fatalf("got %v, want the IPv4 address under force4", got.IP)
+	}
+}
+
+// With no address of the preferred family, the pick falls back rather than
+// failing: a forced family that the name does not publish must not make the
+// transport unusable.
+func TestPickControlUDPAddrFallsBackWhenNoAddressMatches(t *testing.T) {
+	v6 := net.IPAddr{IP: net.ParseIP("2001:db8::1")}
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	if got := pickControlIPAddr([]net.IPAddr{v6}); !got.IP.Equal(v6.IP) {
+		t.Fatalf("got %v, want the only available address", got.IP)
+	}
+}

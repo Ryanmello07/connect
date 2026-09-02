@@ -368,6 +368,41 @@ func swapControlFamilyClock(now func() time.Time) func() {
 	}
 }
 
+// pickControlIPAddr chooses which resolved address a single-address control
+// dial should use, honoring a force and then a demotion.
+//
+// Falls back to the first address when nothing matches the preference: a
+// forced family the name does not publish must degrade to "dial what exists"
+// rather than make the transport unusable.
+func pickControlIPAddr(addrs []net.IPAddr) net.IPAddr {
+	if len(addrs) == 0 {
+		return net.IPAddr{}
+	}
+	want := 0
+	switch ControlIpFamilyPolicy() {
+	case IpFamilyForce4:
+		want = 4
+	case IpFamilyForce6:
+		want = 6
+	default:
+		switch controlFamilyDemotedFamily() {
+		case 6:
+			want = 4
+		case 4:
+			want = 6
+		}
+	}
+	if want == 0 {
+		return addrs[0]
+	}
+	for _, addr := range addrs {
+		if (addr.IP.To4() != nil) == (want == 4) {
+			return addr
+		}
+	}
+	return addrs[0]
+}
+
 func swapControlFamilyProbe(probe func(family int) bool) func() {
 	controlFamilyLedger.mu.Lock()
 	defer controlFamilyLedger.mu.Unlock()

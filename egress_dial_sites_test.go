@@ -28,7 +28,8 @@ var allowedRawDialSites = map[string]map[string]string{
 		"net.Dial": "connect()-only UDP local-address probe; no packet is sent",
 	},
 	"egress_dial.go": {
-		"net.ResolveUDPAddr": "the no-egress fallback of resolveEgressUDPAddr itself",
+		"net.DefaultResolver": "the no-egress fallback of resolveEgressUDPAddr itself, " +
+			"resolving to a list so pickControlIPAddr can honor the family policy",
 	},
 }
 
