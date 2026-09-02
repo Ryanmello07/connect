@@ -181,7 +181,11 @@ func (self *AuthenticatedContent) ProposalRef(crypto CryptoProvider) (ProposalRe
 	if err != nil {
 		return nil, err
 	}
-	return ProposalRef(MakeProposalRef(crypto, encoded)), nil
+	reference, err := MakeProposalRef(crypto, encoded)
+	if err != nil {
+		return nil, err
+	}
+	return ProposalRef(reference), nil
 }
 
 // ---------------------------------------------------------------------------

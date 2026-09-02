@@ -195,7 +195,7 @@ func TestKeyPackageRefCoversTheSignatureAndNotOnlyTheSignedPrefix(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	if want := MakeKeyPackageRef(crypto, encoded); !bytes.Equal(ref, want) {
+	if want := mustKeyPackageRef(t, crypto, encoded); !bytes.Equal(ref, want) {
 		t.Fatalf("Ref answered %x and RefHash over the whole encoding is %x", ref, want)
 	}
 	// and the candidate it must NOT be
@@ -203,7 +203,7 @@ func TestKeyPackageRefCoversTheSignatureAndNotOnlyTheSignedPrefix(t *testing.T) 
 	if err != nil {
 		t.Fatalf("signedPreimage: %v", err)
 	}
-	if bytes.Equal(ref, MakeKeyPackageRef(crypto, tbs)) {
+	if bytes.Equal(ref, mustKeyPackageRef(t, crypto, tbs)) {
 		t.Fatalf("Ref hashed the KeyPackageTBS prefix; two key packages differing only in their signature would then share a reference")
 	}
 	// the property that says so without reference to either assembly: moving the signature

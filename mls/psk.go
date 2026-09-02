@@ -337,7 +337,7 @@ func marshalPskLabel(id *PreSharedKeyId, index uint16, count uint16) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	if err := checkLabelledFieldLength("psk label", len(encoded)); err != nil {
+	if err := checkLabelledFieldLength("psk label", "", len(encoded)); err != nil {
 		return nil, err
 	}
 	return encoded, nil

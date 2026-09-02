@@ -433,9 +433,25 @@ func (self *KeySchedule) GroupContextBytes() []byte {
 // over KDF.Nh zero bytes is a value anyone can compute with no knowledge of the group. Since
 // URmessage wraps seed recovery to this answer, an export taken from an aged out epoch would
 // be wrapped to a key the attacker also holds, and a length check alone would report nothing.
+//
+// The caller's LABEL is refused above what one length prefixed field holds, through the same
+// single comparison every other labelled construction asks and not a second spelling of it.
+// It travels into DeriveSecret's KDFLabel with the "MLS 1.0 " prefix ahead of it, and the
+// prefix is INSIDE the field whose length is declared, so the boundary sits that many octets
+// under syntax.MaxVectorLength; past it the writer latches and mlsLabelBytes turns its
+// refusal into a process exit.
+//
+// This one is written HERE rather than left to the provider for the reason the length above
+// is: the label is a CALLER's string, this method is exported and takes it by design, and the
+// argument crypto_labels.go makes for the remaining panics — that closing them means widening
+// the pinned CryptoProvider interface — does not reach this declaration, which is not one of
+// that interface's methods and already answers a caller's mistake with a typed error.
 func (self *KeySchedule) Export(label string, context []byte, length int) ([]byte, error) {
 	if length < 0 || length > 255*self.crypto.HashSize() {
 		return nil, fmt.Errorf("%w: %d", ErrExportLength, length)
+	}
+	if err := checkLabelledFieldLength("exporter", " label", len(MlsLabelPrefix)+len(label)); err != nil {
+		return nil, err
 	}
 	if !self.secretIsLive(self.secrets.Exporter) {
 		return nil, ErrEpochErased

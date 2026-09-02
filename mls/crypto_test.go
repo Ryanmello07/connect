@@ -3043,13 +3043,13 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			return [][]byte{opened}
 		}},
 		{name: "RefHash", call: func(take func([]byte) []byte) [][]byte {
-			return [][]byte{RefHash(crypto, "MLS 1.0 a label", take(value))}
+			return [][]byte{mustRefHash(t, crypto, "MLS 1.0 a label", take(value))}
 		}},
 		{name: "MakeKeyPackageRef", call: func(take func([]byte) []byte) [][]byte {
-			return [][]byte{MakeKeyPackageRef(crypto, take(value))}
+			return [][]byte{mustKeyPackageRef(t, crypto, take(value))}
 		}},
 		{name: "MakeProposalRef", call: func(take func([]byte) []byte) [][]byte {
-			return [][]byte{MakeProposalRef(crypto, take(value))}
+			return [][]byte{mustProposalRef(t, crypto, take(value))}
 		}},
 		// the one codec entry in this class, and it is here for a reason beyond covering the
 		// class: connect/message reads a device wrap target off every leaf through this call, so

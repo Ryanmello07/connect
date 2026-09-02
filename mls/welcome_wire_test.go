@@ -1012,7 +1012,7 @@ func TestThisWelcomeCodecHandsWelcomeKeyNonceTheCiphertextItExpects(t *testing.T
 			t.Fatalf("%s: the published key package is not headed with the mls10 key package header %x",
 				at, mlsMessageKeyPackageHeader)
 		}
-		reference := MakeKeyPackageRef(crypto, message[len(mlsMessageKeyPackageHeader):])
+		reference := mustKeyPackageRef(t, crypto, message[len(mlsMessageKeyPackageHeader):])
 		addressed := -1
 		for i, one := range welcome.Secrets {
 			if bytes.Equal(one.NewMember, reference) {

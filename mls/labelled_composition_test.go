@@ -505,27 +505,48 @@ func labelledParameterTypes(sources []parsedSource) map[string]string {
 	return types
 }
 
-// Every name this package declares as a slice of bytes, so that a parameter typed
-// SignaturePublicKey or ProposalRef is read as the byte carrier it is.
+// Every name this package declares that can BECOME one length prefixed field of a labelled
+// construction, so that a parameter typed SignaturePublicKey or ProposalRef is read as the
+// byte carrier it is -- and a parameter typed string is read as the LABEL half of the same
+// preimage.
 //
-// Derived off the type declarations rather than listed, for rule 5's reason one layer down:
-// a hand written list of byte-slice names understates itself the moment somebody declares
-// another one, and the understatement here is a whole branch of the walk going unwalked.
-func labelledByteSliceTypes(sources []parsedSource) map[string]bool {
-	named := map[string]bool{"[]byte": true}
-	for _, source := range sources {
-		for _, declaration := range source.file.Decls {
-			generic, isGeneric := declaration.(*ast.GenDecl)
-			if !isGeneric {
-				continue
-			}
-			for _, specification := range generic.Specs {
-				typed, isType := specification.(*ast.TypeSpec)
-				if !isType {
+// THE BYTE HALF ALONE WAS THE CLASS UNTIL NOW, and that is written out rather than quietly
+// widened, because it is the same failure the premise above this file replaced: a rule that
+// was true of everything it could see and silent about half the shape. A labelled
+// construction is TWO opaque<V> in one preimage -- checkLabelledConstruction says so and
+// refuses both of them -- and the position walk dropped every parameter whose type was not a
+// slice of bytes BEFORE it started, so the label of every labelled construction was
+// structurally outside the set this gate could report. Measured: a declaration forwarding a
+// caller's string straight into mlsKdfLabel left the gate green, while the control, a []byte
+// composition handed to RefHash through a local, was caught. (*KeySchedule).Export was a live
+// member of that blind spot: exported, holding an error return, and panicking on a caller's
+// label.
+//
+// The two base spellings are not a list this package can understate. A value arrives at
+// syntax.Writer.WriteOpaque as []byte, or through the one conversion every labelled
+// construction in crypto_labels.go writes, []byte(aString); Go admits no third pre-declared
+// type convertible to a slice of bytes, so what a later declaration can add is a NAMED type
+// over one of those two -- and those are derived off the type declarations below, to a
+// fixpoint so that a name declared over another name is one as well.
+func labelledFieldCarrierTypes(sources []parsedSource) map[string]bool {
+	named := map[string]bool{"[]byte": true, "string": true}
+	for spreading := true; spreading; {
+		spreading = false
+		for _, source := range sources {
+			for _, declaration := range source.file.Decls {
+				generic, isGeneric := declaration.(*ast.GenDecl)
+				if !isGeneric {
 					continue
 				}
-				if source.render(typed.Type) == "[]byte" {
-					named[typed.Name.Name] = true
+				for _, specification := range generic.Specs {
+					typed, isType := specification.(*ast.TypeSpec)
+					if !isType || named[typed.Name.Name] {
+						continue
+					}
+					if named[source.render(typed.Type)] {
+						named[typed.Name.Name] = true
+						spreading = true
+					}
 				}
 			}
 		}
@@ -590,9 +611,39 @@ func labelledCompositionOf(call *ast.CallExpr, producers map[string]bool) string
 	return ""
 }
 
-// Every local of one body that holds a composition, and the encoder it came from.
-func labelledCompositionLocals(body *ast.BlockStmt, producers map[string]bool) map[string]string {
+// The composition ONE expression answers, or the empty string.
+//
+// Three readings and not one, because a composition arrives at a name three ways: as the
+// encoder call itself, as an alias of something already holding one -- which is the shape the
+// labelled path walk in crypto_labels_test.go records nine surviving mutants for -- and as a
+// FIELD read back off a receiver, which is how a composition stored in one declaration is
+// used in another.
+func labelledCompositionIn(value ast.Expr, producers map[string]bool, held map[string]string) string {
+	switch read := value.(type) {
+	case *ast.CallExpr:
+		return labelledCompositionOf(read, producers)
+	case *ast.Ident:
+		return held[read.Name]
+	case *ast.SelectorExpr:
+		return held[read.Sel.Name]
+	}
+	return ""
+}
+
+// Every name inside one body that holds a composition, and the encoder it came from.
+//
+// The seed is every struct field of this package a composition is stored on, which is what
+// makes a body that only READS one see it: a field is not assigned here, so no statement of
+// this body mentions where its bytes came from. It is keyed by the field's own name, since a
+// selector expression carries that name as an identifier and the flow walk below matches on
+// identifiers.
+func labelledCompositionLocals(body *ast.BlockStmt, producers map[string]bool,
+	seed map[string]string) map[string]string {
+
 	locals := map[string]string{}
+	for name, from := range seed {
+		locals[name] = from
+	}
 	for spreading := true; spreading; {
 		spreading = false
 		ast.Inspect(body, func(node ast.Node) bool {
@@ -602,16 +653,8 @@ func labelledCompositionLocals(body *ast.BlockStmt, producers map[string]bool) m
 			}
 			from := ""
 			for _, value := range assignment.Rhs {
-				if call, isCall := value.(*ast.CallExpr); isCall {
-					if of := labelledCompositionOf(call, producers); of != "" {
-						from = of
-					}
-				}
-				// an alias of a composition is the composition, which is the shape the
-				// labelled path walk in crypto_labels_test.go records nine surviving
-				// mutants for
-				if identifier, isIdentifier := value.(*ast.Ident); isIdentifier && locals[identifier.Name] != "" {
-					from = locals[identifier.Name]
+				if of := labelledCompositionIn(value, producers, locals); of != "" {
+					from = of
 				}
 			}
 			if from == "" {
@@ -633,10 +676,103 @@ func labelledCompositionLocals(body *ast.BlockStmt, producers map[string]bool) m
 	return locals
 }
 
+// Every struct FIELD one body stores a composition on, by the name the field is written with.
+//
+// THE THIRD SHAPE, and the one the walk could not see at all. A composition assigned to a
+// local is walked from that local and a composition passed inline is read at the call; a
+// composition parked on a field leaves the body entirely and comes back somewhere else, so
+// nothing in the reading body says what it is. Measured green against the version that read
+// AssignStmt targets as identifiers only -- and the shape is in the tree today, as
+// KeySchedule.groupContextBytes, which GroupContextBytes() hands straight back out. It is
+// bounded at every constructor that fills it, so there is no defect to report; what there was
+// is a gate that could not have reported one, which is why the author's own note says one
+// constructor was bounded "although the derived gate does not require it".
+//
+// Both spellings of a store: the composite literal that BUILDS the struct, which is how
+// newKeyScheduleFromParts fills its field, and an assignment onto a selector afterwards.
+//
+// The field NAME and not the (type, field) pair. Resolving a selector to the type it is
+// reached through needs a type checker, and the coarser reading over-approximates, which is
+// the safe direction here for the reason labelledDeclarationsIn gives about arity: a field
+// that is not really the composition costs a row a reviewer reads, and one that is and is
+// missed costs the property.
+func labelledCompositionFieldsIn(body *ast.BlockStmt, producers map[string]bool,
+	held map[string]string) map[string]string {
+
+	stored := map[string]string{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch written := node.(type) {
+		case *ast.KeyValueExpr:
+			named, isNamed := written.Key.(*ast.Ident)
+			if !isNamed {
+				return true
+			}
+			if from := labelledCompositionIn(written.Value, producers, held); from != "" {
+				stored[named.Name] = from
+			}
+		case *ast.AssignStmt:
+			from := ""
+			for _, value := range written.Rhs {
+				if of := labelledCompositionIn(value, producers, held); of != "" {
+					from = of
+				}
+			}
+			if from == "" {
+				return true
+			}
+			for _, target := range written.Lhs {
+				if selector, isSelector := target.(*ast.SelectorExpr); isSelector {
+					stored[selector.Sel.Name] = from
+				}
+			}
+		}
+		return true
+	})
+	return stored
+}
+
+// Every parameter of this package one body hands a whole composition to, positionally.
+//
+// This exists for ONE reader and is deliberately not used anywhere else. A field is often
+// filled from a parameter rather than from a local -- newKeyScheduleFromParts is handed the
+// serialized group context and stores it -- so without this reading the field walk above stops
+// one frame short of the only struct field composition in the tree.
+//
+// It is NOT fed to the producer rule and NOT fed to the edge table, and the line is the
+// difference between building a composition and forwarding one. A declaration that forwards
+// what its caller built has no bound to place: the caller already had one, and the frontier
+// walk is what says whether the position it forwards INTO refuses. Feeding it in measured as
+// exactly that mistake -- SignWithLabel would have been reported as a body that builds a
+// composition and hands it to mlsSignContent with nothing bounding it, which is a sentence
+// about a refusal it performs itself two lines earlier.
+func labelledCompositionArgumentsIn(index map[string][]labelledDeclaration, body *ast.BlockStmt,
+	producers map[string]bool, held map[string]string) map[string]string {
+
+	handed := map[string]string{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		for _, callee := range labelledCalleesOf(index, call) {
+			for i, argument := range call.Args {
+				if from := labelledCompositionIn(argument, producers, held); from != "" {
+					handed[labelledFrame{receiver: callee.receiver, name: callee.name,
+						parameter: callee.parameters[i]}.String()] = from
+				}
+			}
+		}
+		return true
+	})
+	return handed
+}
+
 // Whether one declaration ANSWERS a composition, so that a caller assigning from it holds
 // one.
-func labelledAnswersAComposition(function *ast.FuncDecl, producers map[string]bool) bool {
-	locals := labelledCompositionLocals(function.Body, producers)
+func labelledAnswersAComposition(function *ast.FuncDecl, producers map[string]bool,
+	fields map[string]string) bool {
+
+	locals := labelledCompositionLocals(function.Body, producers, fields)
 	answered := map[string]bool{}
 	for name := range locals {
 		answered[name] = true
@@ -660,26 +796,67 @@ func labelledAnswersAComposition(function *ast.FuncDecl, producers map[string]bo
 	return found
 }
 
-// Every declaration of this package that answers a composition, to a fixpoint.
-func labelledCompositionProducers(index map[string][]labelledDeclaration, t *testing.T) map[string]bool {
+// Every declaration of this package that ANSWERS a composition, and every struct field one is
+// STORED on, to a joint fixpoint.
+//
+// The two are one fixpoint rather than two passes because each is the other's input. A field
+// carries a composition only once something that answers one has been written into it, and a
+// declaration that hands that field back out answers one in its turn --
+// KeySchedule.groupContextBytes and GroupContextBytes() are exactly that pair, and neither is
+// visible from a walk that computed the other first.
+func labelledCompositionCarriers(index map[string][]labelledDeclaration, t *testing.T) (
+	map[string]bool, map[string]string) {
+
 	producers := map[string]bool{}
+	fields := map[string]string{}
+	// see labelledCompositionArgumentsIn: this reading is the field walk's alone
+	parameters := map[string]string{}
 	for spreading := true; spreading; {
 		spreading = false
-		for name, declarations := range index {
-			if producers[name] {
-				continue
+		note := func(into map[string]string, name string, from string) {
+			if from == "" || into[name] != "" {
+				return
 			}
+			into[name] = from
+			spreading = true
+		}
+		for name, declarations := range index {
 			for _, declaration := range declarations {
 				function := declaration.source.declarationOf(t, declaration.receiver, declaration.name)
-				if labelledAnswersAComposition(function, producers) {
+				seed := map[string]string{}
+				for field, from := range fields {
+					seed[field] = from
+				}
+				for _, parameter := range declaration.parameters {
+					here := labelledFrame{receiver: declaration.receiver, name: declaration.name,
+						parameter: parameter}
+					if from := parameters[here.String()]; from != "" && seed[parameter] == "" {
+						seed[parameter] = from
+					}
+				}
+				held := labelledCompositionLocals(function.Body, producers, seed)
+				for field, from := range labelledCompositionFieldsIn(function.Body, producers, held) {
+					note(fields, field, from)
+				}
+				for landing, from := range labelledCompositionArgumentsIn(index, function.Body, producers, held) {
+					note(parameters, landing, from)
+				}
+				// the producer relation is deliberately NOT told about fields, and the
+				// line is the same one labelledCompositionArgumentsIn draws: a
+				// declaration that hands a stored composition back out FORWARDS one, and
+				// this relation is about which declarations BUILD one. Admitting it
+				// measured as a package wide cascade -- 47 further declarations became
+				// producers, among them every Clone in the package, because this relation
+				// is coarse on purpose and a field name matches everywhere it is written
+				// -- which would have turned the table a reviewer reads into noise.
+				if !producers[name] && labelledAnswersAComposition(function, producers, nil) {
 					producers[name] = true
 					spreading = true
-					break
 				}
 			}
 		}
 	}
-	return producers
+	return producers, fields
 }
 
 // The one comparison in this package that refuses a length, found rather than named: a body
@@ -864,13 +1041,13 @@ func labelledAliasesOf(function *ast.FuncDecl, parameter string) map[string]bool
 // Whether one declaration bounds the composition it ANSWERS, which is the other half of the
 // rule: a producer either refuses its own result or hands an unbounded one to its caller.
 func labelledBoundsWhatItAnswers(source parsedSource, function *ast.FuncDecl,
-	producers map[string]bool) bool {
+	producers map[string]bool, fields map[string]string) bool {
 
 	if labelledRefusesALength(source, function) {
 		return true
 	}
 	answered := map[string]bool{}
-	for name := range labelledCompositionLocals(function.Body, producers) {
+	for name := range labelledCompositionLocals(function.Body, producers, fields) {
 		answered[name] = true
 	}
 	found := false
@@ -981,14 +1158,14 @@ func labelledFieldPositions(t *testing.T, sources []parsedSource, index map[stri
 	anchors []labelledFrame, refused map[string]bool) (positions map[string]bool) {
 
 	types := labelledParameterTypes(sources)
-	byteSlices := labelledByteSliceTypes(sources)
+	carriers := labelledFieldCarrierTypes(sources)
 	forward := map[string][]string{}
 	for _, declarations := range index {
 		for _, declaration := range declarations {
 			for _, parameter := range declaration.parameters {
 				here := labelledFrame{receiver: declaration.receiver, name: declaration.name,
 					parameter: parameter}
-				if !byteSlices[types[here.String()]] {
+				if !carriers[types[here.String()]] {
 					continue
 				}
 				for _, next := range labelledFlowFrom(declaration, t, index, parameter) {
@@ -1042,48 +1219,192 @@ func (self labelledCompositionEdge) String() string {
 	return fmt.Sprintf("%s %s: %s -> %s (%s)", self.file, self.from, self.producer, self.to, self.closed)
 }
 
+// The expression one name was assigned from in this body, or the name itself where nothing
+// here assigns it.
+//
+// What reads it is the fixed width question below, which is about the WRITER a composition
+// came out of. A composition given a name and one passed inline have to answer that question
+// the same way, or hoisting a call into a local would move an edge from one column of the
+// table to another while changing no byte.
+func labelledAssignedFrom(body *ast.BlockStmt, name string) ast.Expr {
+	var from ast.Expr = ast.NewIdent(name)
+	ast.Inspect(body, func(node ast.Node) bool {
+		assignment, isAssignment := node.(*ast.AssignStmt)
+		if !isAssignment || len(assignment.Rhs) != 1 {
+			return true
+		}
+		for _, target := range assignment.Lhs {
+			if written, isIdentifier := target.(*ast.Ident); isIdentifier && written.Name == name {
+				from = assignment.Rhs[0]
+			}
+		}
+		return true
+	})
+	return from
+}
+
+// Whether the composition an expression answers has a size the ENCODING fixes rather than one
+// a caller can move.
+//
+// THE FOURTH ANSWER the column below can carry, and a real member rather than an excuse for
+// one. (*suiteCryptoProvider).DeriveTreeSecret hands ExpandWithLabel a context built out of a
+// uint32 generation and nothing else -- five octets including the vector's own length prefix,
+// at every call any caller anywhere can make -- and a rule that reported that as unbounded
+// would be saying one labelled field might not hold four bytes. The defect this whole file
+// exists for needs a VARIABLE length field: a sum is unbounded because the fields it adds are
+// each bounded and their COUNT is not.
+//
+// Derived off what enters the writer rather than off the writer's name or its method's. Every
+// value written into it is read for whether it can carry octets -- an identifier of a field
+// carrying type, a conversion to one, or a local already holding a composition -- and the
+// answer is no only when NONE of them can. A statement that starts writing a caller's bytes
+// into this same writer stops matching here, and its edge changes column rather than
+// disappearing, which is what the table below is compared for.
+func labelledFixedWidthComposition(body *ast.BlockStmt, built ast.Expr,
+	declaration labelledDeclaration, locals map[string]string,
+	types map[string]string, carriers map[string]bool) bool {
+
+	writers := map[string]bool{}
+	ast.Inspect(built, func(node ast.Node) bool {
+		if named, isNamed := node.(*ast.Ident); isNamed {
+			writers[named.Name] = true
+		}
+		return true
+	})
+	carrying := func(argument ast.Expr) bool {
+		found := false
+		ast.Inspect(argument, func(node ast.Node) bool {
+			switch read := node.(type) {
+			// a conversion to a slice, which is how a string reaches an opaque field
+			case *ast.ArrayType:
+				found = true
+			case *ast.Ident:
+				here := labelledFrame{receiver: declaration.receiver, name: declaration.name,
+					parameter: read.Name}
+				if carriers[read.Name] || carriers[types[here.String()]] || locals[read.Name] != "" {
+					found = true
+				}
+			}
+			return true
+		})
+		return found
+	}
+	wrote := false
+	fixed := true
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		selector, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector || !strings.HasPrefix(selector.Sel.Name, "Write") {
+			return true
+		}
+		if base, isBase := selector.X.(*ast.Ident); !isBase || !writers[base.Name] {
+			return true
+		}
+		wrote = true
+		for _, argument := range call.Args {
+			if carrying(argument) {
+				fixed = false
+			}
+		}
+		return true
+	})
+	return wrote && fixed
+}
+
+// The encoder a composition passed INLINE came from, or the empty string.
+//
+// The whole argument expression rather than only its outermost call, because a composition
+// wrapped in a conversion on the way to a field is the same composition arriving at the same
+// field, and ProposalRef(...) is a conversion this package writes.
+func labelledInlineComposition(argument ast.Expr, producers map[string]bool) string {
+	from := ""
+	ast.Inspect(argument, func(node ast.Node) bool {
+		if call, isCall := node.(*ast.CallExpr); isCall {
+			if of := labelledCompositionOf(call, producers); of != "" {
+				from = of
+			}
+		}
+		return true
+	})
+	return from
+}
+
 // Every composition this package builds that reaches a labelled construction, with how each
 // one is closed.
-func labelledCompositionEdges(t *testing.T, index map[string][]labelledDeclaration,
-	producers map[string]bool, positions map[string]bool,
-	refused map[string]bool, truncated map[string]bool) []string {
+//
+// TWO SHAPES AND NOT ONE. A composition given a NAME is walked from that name, which is what
+// the locals do and what this read until now; a composition passed INLINE has no name to walk
+// from, so the argument expression is read where it lands. Measured: an inline composition
+// handed to a labelled construction left the version of this gate that read only the named
+// shape green, and it is the same value arriving at the same field by one fewer statement.
+func labelledCompositionEdges(t *testing.T, sources []parsedSource,
+	index map[string][]labelledDeclaration, producers map[string]bool, fields map[string]string,
+	positions map[string]bool, refused map[string]bool, truncated map[string]bool) []string {
 
+	types := labelledParameterTypes(sources)
+	carriers := labelledFieldCarrierTypes(sources)
 	edges := []string{}
 	for _, declarations := range index {
 		for _, declaration := range declarations {
 			function := declaration.source.declarationOf(t, declaration.receiver, declaration.name)
-			locals := labelledCompositionLocals(function.Body, producers)
-			for local, producer := range locals {
+			locals := labelledCompositionLocals(function.Body, producers, fields)
+			record := func(producer string, built ast.Expr, frame labelledFrame) {
+				if !positions[frame.String()] {
+					return
+				}
 				bounded := false
 				for _, candidate := range index[producer] {
 					if labelledBoundsWhatItAnswers(candidate.source,
-						candidate.source.declarationOf(t, candidate.receiver, candidate.name), producers) {
+						candidate.source.declarationOf(t, candidate.receiver, candidate.name),
+						producers, fields) {
 						bounded = true
 					}
 				}
+				closed := ""
+				switch {
+				case refused[frame.String()]:
+					closed = "refused at the construction"
+				case truncated[frame.String()]:
+					closed = "truncated at the construction"
+				case bounded:
+					closed = "bounded where it is built"
+				case labelledFixedWidthComposition(function.Body, built, declaration, locals,
+					types, carriers):
+					closed = "fixed width where it is built"
+				default:
+					closed = "NOTHING BOUNDS IT"
+				}
+				here := labelledFrame{receiver: declaration.receiver, name: declaration.name}
+				edges = append(edges, labelledCompositionEdge{
+					file: declaration.source.fileSet.Position(function.Pos()).Filename,
+					from: strings.TrimSpace(here.String()), producer: producer,
+					to: frame.String(), closed: closed,
+				}.String())
+			}
+			for local, producer := range locals {
+				built := labelledAssignedFrom(function.Body, local)
 				for _, frame := range labelledFlowFrom(declaration, t, index, local) {
-					if !positions[frame.String()] {
-						continue
-					}
-					closed := ""
-					switch {
-					case refused[frame.String()]:
-						closed = "refused at the construction"
-					case truncated[frame.String()]:
-						closed = "truncated at the construction"
-					case bounded:
-						closed = "bounded where it is built"
-					default:
-						closed = "NOTHING BOUNDS IT"
-					}
-					here := labelledFrame{receiver: declaration.receiver, name: declaration.name}
-					edges = append(edges, labelledCompositionEdge{
-						file: declaration.source.fileSet.Position(function.Pos()).Filename,
-						from: strings.TrimSpace(here.String()), producer: producer,
-						to: frame.String(), closed: closed,
-					}.String())
+					record(producer, built, frame)
 				}
 			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				for _, callee := range labelledCalleesOf(index, call) {
+					for i, argument := range call.Args {
+						if producer := labelledInlineComposition(argument, producers); producer != "" {
+							record(producer, argument, labelledFrame{receiver: callee.receiver,
+								name: callee.name, parameter: callee.parameters[i]})
+						}
+					}
+				}
+				return true
+			})
 		}
 	}
 	slices.Sort(edges)
@@ -1106,9 +1427,22 @@ var labelledPanicAnchorFrames = []string{
 // This is the FRONTIER of the class rather than the class itself: it is where a composition
 // would have to arrive to reach a panic, and each entry says whether that position refuses
 // an over long value, truncates it, or is open and leaves the bound to whoever built the
-// value. The open ones are exactly the two constructions whose signatures cannot report a
-// refusal -- the RFC 9420 section 5.2 reference makers, and the KDF label under a
-// CryptoProvider method -- which is why the answer this landed is split rather than uniform.
+// value. The open ones are now exactly ONE construction: the KDF label under a CryptoProvider
+// method, whose signature the pinned interface fixes. That is why the answer this landed is
+// split rather than uniform.
+//
+// BOTH HALVES OF EVERY PREIMAGE ARE HERE NOW, and the arrival of the label rows is the whole
+// second half of this table. A labelled construction is two opaque<V> and either of them alone
+// latches the writer, and until labelledFieldCarrierTypes learned to read a string the walk
+// dropped every label position before it started -- so the label of every construction in this
+// package was outside the class this gate could report, while the sentence above it claimed
+// "every parameter of this package whose bytes reach the panicking encoder". (*KeySchedule).Export
+// was a live member of that blind spot and is the reason its row now says refused.
+//
+// The two RFC 9420 section 5.2 reference MAKERS have left this table, and their absence is the
+// statement rather than an omission: RefHash refuses both of its own fields now, and the walk
+// STOPS at a refused position, so MakeKeyPackageRef and MakeProposalRef are no longer upstream
+// of anything that panics. Take RefHash's bound away and both come back.
 //
 // It is derived and compared both ways for the same reason the table below it is. A
 // declaration that starts forwarding bytes into a labelled field appears here; one that
@@ -1118,6 +1452,8 @@ var labelledPanicAnchorFrames = []string{
 // of them except the four entry points that refuse first, which is a fact this walk
 // establishes rather than assumes -- a refused position is where the walk STOPS, so those
 // two having no callers in this table is the statement that they have no unrefused ones.
+// mlsKdfLabel is open on both fields for the same reason with one caller more, and that one
+// is the residual: ExpandWithLabel is a provider method and cannot refuse.
 //
 // The six senderDataSecret rows are the walk over-approximating and are left in rather than
 // filtered out. crypto_labels_test.go's flow relation spreads taint through a method call on
@@ -1127,22 +1463,37 @@ var labelledPanicAnchorFrames = []string{
 // cost of it is a row; the alternative is a walk that decides for itself which flows are
 // real, which is the class of judgement that let the premise this file replaces survive.
 var labelledFieldFrontier = []string{
+	// the exported method that took a caller's label straight into a KDFLabel and panicked
+	// on it, while its own signature already carried ErrExportLength for a caller's number
 	"*KeySchedule.Export context (open, so a caller must bound what it sends)",
+	"*KeySchedule.Export label (refused here)",
+	// the three provider methods the pinned interface fixes, which is the whole residual
+	"*suiteCryptoProvider.DeriveSecret label (open, so a caller must bound what it sends)",
+	"*suiteCryptoProvider.DeriveTreeSecret label (open, so a caller must bound what it sends)",
 	"*suiteCryptoProvider.ExpandWithLabel context (open, so a caller must bound what it sends)",
+	"*suiteCryptoProvider.ExpandWithLabel label (open, so a caller must bound what it sends)",
 	"*suiteCryptoProvider.SignWithLabel content (refused here)",
+	"*suiteCryptoProvider.SignWithLabel label (refused here)",
 	"*suiteCryptoProvider.VerifyWithLabel content (refused here)",
+	"*suiteCryptoProvider.VerifyWithLabel label (refused here)",
 	"DecryptWithLabel context (refused here)",
+	"DecryptWithLabel label (refused here)",
 	"EncryptWithLabel context (refused here)",
-	"MakeKeyPackageRef keyPackage (open, so a caller must bound what it sends)",
-	"MakeProposalRef authenticatedContent (open, so a caller must bound what it sends)",
+	"EncryptWithLabel label (refused here)",
 	"OpenPrivateMessage senderDataSecret (open, so a caller must bound what it sends)",
-	"RefHash value (open, so a caller must bound what it sends)",
+	// the exported reference maker, on both of its fields. It adds no "MLS 1.0 " of its own,
+	// so both boundaries are the whole MaxVectorLength rather than the prefix less one
+	"RefHash label (refused here)",
+	"RefHash value (refused here)",
 	"SealPrivateMessage senderDataSecret (open, so a caller must bound what it sends)",
 	"SenderDataKeyNonce ciphertext (truncated here)",
 	"SenderDataKeyNonce senderDataSecret (open, so a caller must bound what it sends)",
 	"mlsEncryptContext context (open, so a caller must bound what it sends)",
+	"mlsEncryptContext label (open, so a caller must bound what it sends)",
 	"mlsKdfLabel context (open, so a caller must bound what it sends)",
+	"mlsKdfLabel label (open, so a caller must bound what it sends)",
 	"mlsSignContent content (open, so a caller must bound what it sends)",
+	"mlsSignContent label (open, so a caller must bound what it sends)",
 	"openSenderData senderDataSecret (open, so a caller must bound what it sends)",
 	"sealPrivateMessage senderDataSecret (open, so a caller must bound what it sends)",
 	"sealSenderData senderDataSecret (open, so a caller must bound what it sends)",
@@ -1162,13 +1513,30 @@ var labelledFieldFrontier = []string{
 // construction's signature can carry a refusal it carries one, and the composition arrives
 // unbounded on purpose -- a signature preimage IS the whole message and refusing to build
 // one this side would be refusing to check a peer's. Where it cannot, the value is bounded
-// at the declaration that BUILDS it, which is the only place upstream of RefHash and of a
-// provider method that still has a caller to answer.
+// at the declaration that BUILDS it, which is the only place upstream of a provider method
+// that still has a caller to answer.
+//
+// THREE SHAPES REACH THIS TABLE and only one of them is an assignment. A composition given a
+// name is walked from that name; one passed INLINE is read at the call it lands in; one parked
+// on a STRUCT FIELD is picked up wherever the field is read. The second and third were
+// measured green against the version of this walk that read AssignStmt alone, which is what
+// "every composition this package builds" was claiming while two thirds of the ways to write
+// one were invisible to it.
+//
+// The two RFC 9420 section 5.2 reference rows have left this table, and their absence is a
+// statement about RefHash rather than about (*KeyPackage).Ref or (*AuthenticatedContent).ProposalRef.
+// Those two still bound what they build -- the error a caller reads has to name a KEY PACKAGE
+// rather than a reference input -- but RefHash refuses the same octets one frame further down,
+// the frontier walk stops at a refused position, and a composition that cannot reach a panic is
+// not an edge to a panic. Take RefHash's bound away and both rows come back.
+//
+// The fixed width row is the fourth answer and not a hole. DeriveTreeSecret's context is a
+// uint32 generation and nothing else, so its size is the encoding's rather than a caller's;
+// see labelledFixedWidthComposition, which derives that off what enters the writer.
 var labelledCompositionClass = []string{
-	"framing_preimage.go *AuthenticatedContent.ProposalRef: marshalBoundedComposition -> MakeProposalRef authenticatedContent (bounded where it is built)",
+	"crypto_labels.go *suiteCryptoProvider.DeriveTreeSecret: mlsLabelBytes -> *suiteCryptoProvider.ExpandWithLabel context (fixed width where it is built)",
 	"framing_protect.go SignAuthenticatedContent: FramedContentTBSBytes -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
 	"framing_protect.go VerifyAuthenticatedContent: FramedContentTBSBytes -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
-	"key_package.go *KeyPackage.Ref: marshalBoundedComposition -> MakeKeyPackageRef keyPackage (bounded where it is built)",
 	"key_package.go *KeyPackage.Validate: signedPreimage -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
 	"key_package.go NewKeyPackage: signedPreimage -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
 	"key_schedule.go DeriveJoinerSecret: marshalBoundedComposition -> *suiteCryptoProvider.ExpandWithLabel context (bounded where it is built)",
@@ -1181,7 +1549,7 @@ var labelledCompositionClass = []string{
 func TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere(t *testing.T) {
 	sources := packageSources(t)
 	index := labelledDeclarationsIn(sources)
-	producers := labelledCompositionProducers(index, t)
+	producers, fields := labelledCompositionCarriers(index, t)
 	anchors := labelledPanicAnchors(t, sources, producers)
 
 	anchored := []string{}
@@ -1226,7 +1594,7 @@ func TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere
 			strings.Join(frontier, "\n"), strings.Join(labelledFieldFrontier, "\n"))
 	}
 
-	edges := labelledCompositionEdges(t, index, producers, positions, refused, truncated)
+	edges := labelledCompositionEdges(t, sources, index, producers, fields, positions, refused, truncated)
 	if !slices.Equal(edges, labelledCompositionClass) {
 		t.Errorf("the compositions of this package reach a labelled construction as\n%s\nand this gate knows of\n%s",
 			strings.Join(edges, "\n"), strings.Join(labelledCompositionClass, "\n"))

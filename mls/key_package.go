@@ -313,11 +313,12 @@ func NewKeyPackage(crypto CryptoProvider, suite CipherSuite, cred Credential,
 // TestKeyPackageRefCoversTheSignatureAndNotOnlyTheSignedPrefix is what says so.
 //
 // The marshal is BOUNDED, for the reason (*AuthenticatedContent).ProposalRef gives at length:
-// MakeKeyPackageRef wraps whatever this answers in ONE opaque<V>, RefHash has no way to report a
-// refusal, and a KeyPackage is a COMPOSITION -- its credential, its extensions, its key material
+// MakeKeyPackageRef wraps whatever this answers in ONE opaque<V>, and a KeyPackage is a
+// COMPOSITION -- its credential, its extensions, its key material
 // and its signature are each bounded by syntax.MaxVectorLength and their sum is not. A credential
 // of MaxVectorLength-64 octets is a key package a decoder ACCEPTS, and this method used to take
-// the process down over one.
+// the process down over one. RefHash refuses the same octets now, one frame further down; the
+// bound stays here because this is the frame that can say a KEY PACKAGE was what did not fit.
 func (self *KeyPackage) Ref(crypto CryptoProvider) ([]byte, error) {
 	if crypto == nil {
 		return nil, fmt.Errorf("%w: the reference is hashed through it", ErrNilCryptoProvider)
@@ -326,7 +327,7 @@ func (self *KeyPackage) Ref(crypto CryptoProvider) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return MakeKeyPackageRef(crypto, encoded), nil
+	return MakeKeyPackageRef(crypto, encoded)
 }
 
 // Validate is RFC 9420 section 10.1 for one key package, minus the 100-series proposal checks.

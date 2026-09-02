@@ -4180,13 +4180,13 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 		call func(t *testing.T, crypto CryptoProvider) [][]byte
 	}{
 		{name: "RefHash", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
-			return [][]byte{RefHash(crypto, "MLS 1.0 a label", value)}
+			return [][]byte{mustRefHash(t, crypto, "MLS 1.0 a label", value)}
 		}},
 		{name: "MakeKeyPackageRef", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
-			return [][]byte{MakeKeyPackageRef(crypto, value)}
+			return [][]byte{mustKeyPackageRef(t, crypto, value)}
 		}},
 		{name: "MakeProposalRef", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
-			return [][]byte{MakeProposalRef(crypto, value)}
+			return [][]byte{mustProposalRef(t, crypto, value)}
 		}},
 		{name: "EncryptWithLabel", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			kemOutput, ciphertext, sealErr := EncryptWithLabel(crypto, pub, "UpdatePathNode", value, plaintext)
@@ -7997,7 +7997,7 @@ func TestWelcomeKeyNonceOpensThePublishedWelcomes(t *testing.T) {
 			t.Fatalf("%s: the published key package is not headed with the mls10 key package header %x",
 				at, mlsMessageKeyPackageHeader)
 		}
-		reference := MakeKeyPackageRef(crypto, message[len(mlsMessageKeyPackageHeader):])
+		reference := mustKeyPackageRef(t, crypto, message[len(mlsMessageKeyPackageHeader):])
 		addressed := -1
 		for i, one := range secrets {
 			if bytes.Equal(one.newMember, reference) {

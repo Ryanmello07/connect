@@ -4186,7 +4186,7 @@ func TestProposalRefCoversTheWholeAuthenticatedContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if !bytes.Equal(ref, MakeProposalRef(crypto, encoded)) {
+	if !bytes.Equal(ref, mustProposalRef(t, crypto, encoded)) {
 		t.Fatal("ProposalRef is not MakeProposalRef over the serialized AuthenticatedContent")
 	}
 
@@ -4254,21 +4254,21 @@ func TestProposalRefIsNotTakenOverASmallerStructureOrWithoutItsLabel(t *testing.
 		value []byte
 	}{
 		{"taken over the FramedContent, so it covers neither the wire format nor the signature",
-			MakeProposalRef(crypto, framedContent)},
+			mustProposalRef(t, crypto, framedContent)},
 		{"taken over the Proposal alone, so two members proposing the same removal share one reference",
-			MakeProposalRef(crypto, proposal)},
+			mustProposalRef(t, crypto, proposal)},
 		{"taken with the label dropped, so a proposal reference and a key package reference over one blob collide",
-			RefHash(crypto, "", wholeStructure)},
+			mustRefHash(t, crypto, "", wholeStructure)},
 		{"taken with no RefHashInput at all, which is the digest with both length prefixes gone",
 			crypto.Hash(wholeStructure)},
 		{"taken with the key package label, which is the other half of section 5.2's domain separation",
-			MakeKeyPackageRef(crypto, wholeStructure)},
+			mustKeyPackageRef(t, crypto, wholeStructure)},
 	} {
 		if bytes.Equal(ref, wrong.value) {
 			t.Errorf("ProposalRef equals the reference %s", wrong.why)
 		}
 	}
-	if !bytes.Equal(ref, RefHash(crypto, ProposalRefLabel, wholeStructure)) {
+	if !bytes.Equal(ref, mustRefHash(t, crypto, ProposalRefLabel, wholeStructure)) {
 		t.Fatal("ProposalRef is not RefHash over the serialized AuthenticatedContent under the proposal label, so the comparisons above are against the wrong baseline")
 	}
 }

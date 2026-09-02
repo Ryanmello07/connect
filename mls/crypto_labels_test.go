@@ -472,18 +472,6 @@ func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 			call: func(n int) { mlsKdfLabel(strings.Repeat("x", n), nil, 32) },
 		},
 		{
-			// RefHash adds nothing to the label it is handed, so both of its fields
-			// reach the whole limit
-			name: "the ref hash label field",
-			room: syntax.MaxVectorLength,
-			call: func(n int) { RefHash(crypto, strings.Repeat("x", n), nil) },
-		},
-		{
-			name: "the ref hash value field",
-			room: syntax.MaxVectorLength,
-			call: func(n int) { RefHash(crypto, "label", make([]byte, n)) },
-		},
-		{
 			name: "the sign content's content field",
 			room: syntax.MaxVectorLength,
 			call: func(n int) { mlsSignContent("label", make([]byte, n)) },
@@ -515,6 +503,79 @@ func TestLabelWriterUsesTheDefaultVectorLimit(t *testing.T) {
 			t.Errorf("a labelled construction accepted %s one byte past the limit", testCase.name)
 		}
 	}
+	// RefHash's two fields sat in the table above until this construction stopped reaching
+	// the panic the table is about. It REFUSES now, on both of its fields, so its boundary is
+	// read off an error rather than off a recover -- and it is still read, because that bound
+	// is the whole of what stands between an exported declaration and a process exit.
+	//
+	// The boundary is the full MaxVectorLength at BOTH fields, which is the "RefHash adds no
+	// prefix of its own" decision restated as a bound: a label measured with the eight octets
+	// this construction does not write would refuse eight labels it can encode, and no round
+	// trip in this package could see the difference.
+	for _, testCase := range []struct {
+		name string
+		call func(n int) error
+	}{
+		{
+			name: "the ref hash label field",
+			call: func(n int) error {
+				_, err := RefHash(crypto, strings.Repeat("x", n), nil)
+				return err
+			},
+		},
+		{
+			name: "the ref hash value field",
+			call: func(n int) error {
+				_, err := RefHash(crypto, "label", make([]byte, n))
+				return err
+			},
+		},
+	} {
+		if err := testCase.call(syntax.MaxVectorLength); err != nil {
+			t.Errorf("RefHash refused %s at the limit: %v", testCase.name, err)
+		}
+		// a panic here fails the test where it is raised rather than being reported, which is
+		// the outcome this row exists to make impossible
+		if err := testCase.call(syntax.MaxVectorLength + 1); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+			t.Errorf("RefHash answered %v for %s one byte past the limit, want a length refusal",
+				err, testCase.name)
+		}
+	}
+}
+
+// The reference makers with the refusal taken HERE, for the assertions whose subject is the
+// reference rather than the bound.
+//
+// A helper rather than an inline check at each of them, because a test that wrote its own
+// two line error branch thirty times is thirty places for one of them to swallow the error
+// and compare a nil reference against a nil reference -- which is exactly the collision
+// RefHash's refusal exists to prevent, arrived at from the test side. The boundary itself is
+// driven above and in labelled_composition_test.go, where the error IS the subject.
+func mustRefHash(t *testing.T, crypto CryptoProvider, label string, value []byte) []byte {
+	t.Helper()
+	reference, err := RefHash(crypto, label, value)
+	if err != nil {
+		t.Fatalf("RefHash under %q over %d octets: %v", label, len(value), err)
+	}
+	return reference
+}
+
+func mustKeyPackageRef(t *testing.T, crypto CryptoProvider, keyPackage []byte) []byte {
+	t.Helper()
+	reference, err := MakeKeyPackageRef(crypto, keyPackage)
+	if err != nil {
+		t.Fatalf("MakeKeyPackageRef over %d octets: %v", len(keyPackage), err)
+	}
+	return reference
+}
+
+func mustProposalRef(t *testing.T, crypto CryptoProvider, authenticatedContent []byte) []byte {
+	t.Helper()
+	reference, err := MakeProposalRef(crypto, authenticatedContent)
+	if err != nil {
+		t.Fatalf("MakeProposalRef over %d octets: %v", len(authenticatedContent), err)
+	}
+	return reference
 }
 
 // Every way this package enters the codec, and the limit each entry carries.
@@ -1333,7 +1394,7 @@ func TestRefHashDoesNotAddTheMlsPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode the bare label input: %v", err)
 	}
-	if got, want := RefHash(crypto, "RefHash", value), crypto.Hash(input); !bytes.Equal(got, want) {
+	if got, want := mustRefHash(t, crypto, "RefHash", value), crypto.Hash(input); !bytes.Equal(got, want) {
 		t.Fatalf("RefHash = %x, want %x", got, want)
 	}
 
@@ -1344,7 +1405,7 @@ func TestRefHashDoesNotAddTheMlsPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode the prefixed label input: %v", err)
 	}
-	if bytes.Equal(RefHash(crypto, "RefHash", value), crypto.Hash(prefixed)) {
+	if bytes.Equal(mustRefHash(t, crypto, "RefHash", value), crypto.Hash(prefixed)) {
 		t.Fatalf("RefHash added the MLS 1.0 prefix")
 	}
 }
@@ -1378,8 +1439,8 @@ func TestKeyPackageRefAndProposalRefDiffer(t *testing.T) {
 	// over one input can see it.
 	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 	value := bytes.Repeat([]byte{0x13}, 64)
-	keyPackageRef := MakeKeyPackageRef(crypto, value)
-	proposalRef := MakeProposalRef(crypto, value)
+	keyPackageRef := mustKeyPackageRef(t, crypto, value)
+	proposalRef := mustProposalRef(t, crypto, value)
 	if bytes.Equal(keyPackageRef, proposalRef) {
 		t.Fatalf("key package and proposal references collide")
 	}
@@ -1388,10 +1449,10 @@ func TestKeyPackageRefAndProposalRefDiffer(t *testing.T) {
 	}
 	// and each maker is its own label rather than the other's, which the inequality above
 	// holds just as well when the two are swapped
-	if !bytes.Equal(keyPackageRef, RefHash(crypto, KeyPackageRefLabel, value)) {
+	if !bytes.Equal(keyPackageRef, mustRefHash(t, crypto, KeyPackageRefLabel, value)) {
 		t.Fatalf("MakeKeyPackageRef is not RefHash with the key package label")
 	}
-	if !bytes.Equal(proposalRef, RefHash(crypto, ProposalRefLabel, value)) {
+	if !bytes.Equal(proposalRef, mustRefHash(t, crypto, ProposalRefLabel, value)) {
 		t.Fatalf("MakeProposalRef is not RefHash with the proposal label")
 	}
 }
@@ -1412,7 +1473,7 @@ func TestRefHashMatchesTheCryptoBasicsVectors(t *testing.T) {
 		crypto := mustProvider(t, suite)
 		refHash := vector.RefHash
 		assertLabelKat(t, fmt.Sprintf("ref_hash suite %#04x", uint16(suite)),
-			RefHash(crypto, refHash.Label, mustDecodeHex(t, "value", refHash.Value)),
+			mustRefHash(t, crypto, refHash.Label, mustDecodeHex(t, "value", refHash.Value)),
 			refHash.Out)
 		// the corpus publishes the bare label, which is the other half of why RefHash
 		// must not add the prefix: if upstream ever republished a prefixed one, the
@@ -1467,10 +1528,10 @@ func TestKeyPackageRefLabelMatchesThePublishedWelcomes(t *testing.T) {
 		// this is read before the count below rather than after it: the count reports
 		// and moves on to the next suite, so a check written under it is one no failing
 		// input ever reaches
-		if bytes.Contains(welcome, MakeProposalRef(crypto, keyPackage)) {
+		if bytes.Contains(welcome, mustProposalRef(t, crypto, keyPackage)) {
 			t.Errorf("suite %#04x: the published welcome carries the proposal labelled reference of its key package", uint16(suite))
 		}
-		reference := MakeKeyPackageRef(crypto, keyPackage)
+		reference := mustKeyPackageRef(t, crypto, keyPackage)
 		if count := bytes.Count(welcome, reference); count != 1 {
 			t.Errorf("suite %#04x: the key package reference %x appears %d times in the published welcome, want once",
 				uint16(suite), reference, count)
@@ -1533,10 +1594,10 @@ func TestProposalRefLabelMatchesThePublishedCommits(t *testing.T) {
 				// carries, and this is read before the count below rather than after it:
 				// the count reports and moves on to the next proposal, so a check written
 				// under it is one no failing input ever reaches
-				if bytes.Contains(commit, MakeKeyPackageRef(crypto, authenticatedContent)) {
+				if bytes.Contains(commit, mustKeyPackageRef(t, crypto, authenticatedContent)) {
 					t.Errorf("%s: the published commit carries the key package labelled reference of a proposal", at)
 				}
-				reference := MakeProposalRef(crypto, authenticatedContent)
+				reference := mustProposalRef(t, crypto, authenticatedContent)
 				if count := bytes.Count(commit, reference); count != 1 {
 					t.Errorf("%s: the proposal reference %x appears %d times in the published commit, want once",
 						at, reference, count)
@@ -1709,13 +1770,13 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 		call func(crypto CryptoProvider) []byte
 	}{
 		{name: "RefHash", call: func(crypto CryptoProvider) []byte {
-			return RefHash(crypto, "MLS 1.0 a label", value)
+			return mustRefHash(t, crypto, "MLS 1.0 a label", value)
 		}},
 		{name: "MakeKeyPackageRef", call: func(crypto CryptoProvider) []byte {
-			return MakeKeyPackageRef(crypto, value)
+			return mustKeyPackageRef(t, crypto, value)
 		}},
 		{name: "MakeProposalRef", call: func(crypto CryptoProvider) []byte {
-			return MakeProposalRef(crypto, value)
+			return mustProposalRef(t, crypto, value)
 		}},
 		{name: "EncryptWithLabel", call: func(crypto CryptoProvider) []byte {
 			_, ciphertext, encryptErr := EncryptWithLabel(crypto, pub, "UpdatePathNode", value, []byte("secret"))
@@ -4922,13 +4983,13 @@ var mlsLabelPreimageStatements = []string{
 // requires and > MaxVectorLength+1 admits the one that panics, and both of those answer
 // every other length correctly.
 var checkLabelledFieldLengthStatements = []string{
-	"if length > syntax.MaxVectorLength {\n\treturn fmt.Errorf(\"%w: the serialized %s is %d octets and one labelled field holds at most %d\",\n\t\tsyntax.ErrLengthExceedsMax, what, length, syntax.MaxVectorLength)\n}",
+	"if length > syntax.MaxVectorLength {\n\treturn fmt.Errorf(\"%w: the serialized %s is %d octets and one labelled field holds at most %d\",\n\t\tsyntax.ErrLengthExceedsMax, what+part, length, syntax.MaxVectorLength)\n}",
 	"return nil",
 }
 
 var checkLabelledConstructionStatements = []string{
-	"if err := checkLabelledFieldLength(what+\" label\", len(MlsLabelPrefix)+len(label)); err != nil {\n\treturn err\n}",
-	"return checkLabelledFieldLength(what, len(value))",
+	"if err := checkLabelledFieldLength(what, \" label\", len(MlsLabelPrefix)+len(label)); err != nil {\n\treturn err\n}",
+	"return checkLabelledFieldLength(what, \"\", len(value))",
 }
 
 var hpkeSealBaseStatements = []string{

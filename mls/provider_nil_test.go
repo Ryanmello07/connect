@@ -264,13 +264,18 @@ func providerCallWithNoProvider(t *testing.T, name string, function reflect.Valu
 // method off a nil interface, and an ErrSecretLength for a secret nobody could have got right
 // sends the caller to check its arguments over a provider it never passed.
 //
-// What it demands of a member that CANNOT report is that it does not answer. Those six
-// constructions hand back bytes and nothing else -- RefHash, the two reference makers,
-// ZeroSecret, EmptyPskSecret and ConfirmedTranscriptHash -- so the only alternative to
-// stopping is a plausibly shaped value derived from no provider at all, which is worse than a
-// panic and is the outcome this half rules out. Their exemption from the sentinel is read off
-// their signatures rather than written down here, so it lapses the moment one of them grows an
-// error to return.
+// What it demands of a member that CANNOT report is that it does not answer. Those three
+// constructions hand back bytes and nothing else -- ZeroSecret, EmptyPskSecret and
+// ConfirmedTranscriptHash -- so the only alternative to stopping is a plausibly shaped value
+// derived from no provider at all, which is worse than a panic and is the outcome this half
+// rules out. Their exemption from the sentinel is read off their signatures rather than
+// written down here, so it lapses the moment one of them grows an error to return.
+//
+// IT HAS ALREADY LAPSED ONCE, which is why that sentence is worth keeping rather than tidying
+// into the present tense: this paragraph named six, and RefHash and the two reference makers
+// were three of them. They grew an error the day the labelled bound closed the last exported
+// panic, and this gate moved them across on its own and failed until RefHash refused a nil
+// provider the way every other reporting construction does.
 func TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt(t *testing.T) {
 	reporting, silent := 0, 0
 	for _, construction := range providerConstructions(t) {

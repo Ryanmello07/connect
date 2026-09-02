@@ -74,8 +74,8 @@ func mlsLabelPreimage(w *syntax.Writer) ([]byte, error) {
 // successionPreimage already uses. Two instruments, and which of them applies is decided by
 // the signature rather than by taste: checkLabelledConstruction at the four entry points
 // into this layer that carry an error — SignWithLabel, VerifyWithLabel, EncryptWithLabel and
-// DecryptWithLabel — and marshalBoundedComposition where a composition is BUILT, for the two
-// constructions whose signatures cannot carry a refusal at all.
+// DecryptWithLabel — and marshalBoundedComposition where a composition is BUILT, for the one
+// construction whose signature cannot carry a refusal at all.
 //
 // TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere derives that
 // set of call sites off the source rather than trusting this paragraph, which is the whole
@@ -90,19 +90,29 @@ func mlsLabelPreimage(w *syntax.Writer) ([]byte, error) {
 // that describes more bytes than it carries is exactly the shape a signature bypass is
 // built out of. It stays a panic rather than an error only where the signature leaves no
 // room for one — mlsKdfLabel under ExpandWithLabel, DeriveSecret and DeriveTreeSecret, which
-// are CryptoProvider methods, and RefHash, which the tree and the framing layers reach
-// through a fixed reference maker — and nowhere else. Answering nil there instead would be
-// worse than the crash rather than safer: two references that are both nil are two proposals
-// with one name, which is the collision the labels in this file exist to prevent.
+// are CryptoProvider methods — and nowhere else. RefHash used to be named here too, on the
+// ground that the tree and the framing layers reach it through a fixed reference maker; that
+// was never a pin and it answers an error now. Answering nil where the panic does remain
+// would be worse than the crash rather than safer: two references that are both nil are two
+// proposals with one name, which is the collision the labels in this file exist to prevent.
 //
 // WHAT IS LEFT, written down rather than glossed. The walk is over THIS PACKAGE, so what it
 // establishes is that no message a PEER sends reaches the panic: every path from decoded
-// bytes to a labelled construction is one of the bounded sites it derives. An out-of-package
-// caller that hand builds a value past the limit and hands it straight to the exported
-// RefHash, MakeKeyPackageRef or MakeProposalRef, or to a provider's ExpandWithLabel, still
-// panics. That is a local programming error of the same kind as the wrong length seed handed
-// to ed25519.NewKeyFromSeed that SignWithLabel's own comment records, and closing it means
-// widening the CryptoProvider interface, which is pinned.
+// bytes to a labelled construction is one of the bounded sites it derives.
+//
+// The OUT-OF-PACKAGE caller is no longer part of that residual at any EXPORTED declaration.
+// RefHash refuses both of its fields and the two reference makers carry that refusal out, and
+// (*KeySchedule).Export refuses the label it takes from a caller, on a signature that already
+// carried ErrExportLength for a caller's length. What used to stand here said closing them
+// "means widening the CryptoProvider interface, which is pinned", and that was true of none
+// of the four: not one of them is a method of that interface. The argument was borrowed from
+// the provider methods standing next to them.
+//
+// What remains is a provider's own ExpandWithLabel, DeriveSecret or DeriveTreeSecret, called
+// from outside this package with a label or a context past the limit. Those signatures the
+// pinned interface really does fix. That is a local programming error of the same kind as the
+// wrong length seed handed to ed25519.NewKeyFromSeed that SignWithLabel's own comment
+// records, and closing it does mean widening that interface.
 func mlsLabelBytes(w *syntax.Writer) []byte {
 	encoded, err := mlsLabelPreimage(w)
 	if err != nil {
@@ -129,10 +139,17 @@ func mlsLabelBytes(w *syntax.Writer) []byte {
 // also judge a concatenation that must not be built in order to be measured — the prefixed
 // label of checkLabelledConstruction below. Two spellings of "does this fit in one field"
 // are two things that can disagree, and this is the one.
-func checkLabelledFieldLength(what string, length int) error {
+//
+// The name arrives in TWO PARTS and is joined HERE, on the refusal path and nowhere else. A
+// caller that names a sub field — the prefixed label of checkLabelledConstruction below —
+// would otherwise build that string on every signature and every verify in the system, to
+// name a branch no message takes; measured at 16.72 ns/op, 24 B/op, one allocation each. A
+// caller with nothing to add passes the empty string and its refusal reads exactly as it
+// did, so no error text moved.
+func checkLabelledFieldLength(what string, part string, length int) error {
 	if length > syntax.MaxVectorLength {
 		return fmt.Errorf("%w: the serialized %s is %d octets and one labelled field holds at most %d",
-			syntax.ErrLengthExceedsMax, what, length, syntax.MaxVectorLength)
+			syntax.ErrLengthExceedsMax, what+part, length, syntax.MaxVectorLength)
 	}
 	return nil
 }
@@ -157,11 +174,19 @@ func checkLabelledFieldLength(what string, length int) error {
 // is being declared, and it is MEASURED rather than concatenated: building a second copy of
 // mlsSignContent's label on every signature and every verify is a cost every message in the
 // system pays for a branch no message takes.
+//
+// THE FIELD'S NAME USED TO CONTRADICT THAT SENTENCE, and the contradiction is written out
+// rather than the line quietly repaired, because it is the third premise in this file to
+// have outlived its own code. The label BYTES were measured, and then what+" label" was
+// concatenated EAGERLY to name them — 16.72 ns/op, 24 B/op, one allocation, on every
+// signature and every verify in the system, for the branch the sentence above says no
+// message takes. The name now travels to checkLabelledFieldLength in two parts and is joined
+// only where it is read, which is inside the refusal.
 func checkLabelledConstruction(what string, label string, value []byte) error {
-	if err := checkLabelledFieldLength(what+" label", len(MlsLabelPrefix)+len(label)); err != nil {
+	if err := checkLabelledFieldLength(what, " label", len(MlsLabelPrefix)+len(label)); err != nil {
 		return err
 	}
-	return checkLabelledFieldLength(what, len(value))
+	return checkLabelledFieldLength(what, "", len(value))
 }
 
 // marshalBoundedComposition serializes a structure that is about to become ONE length
@@ -171,14 +196,21 @@ func checkLabelledConstruction(what string, label string, value []byte) error {
 // syntax.Marshal alone is not enough, and that gap IS the defect this exists for: it
 // bounds each field it writes and says nothing about the total, so it answers 1050045
 // octets happily and the labelled field that wraps them refuses. Every caller in this
-// package that hands a serialized structure to RefHash or to ExpandWithLabel — the two
-// entry points whose signatures cannot report a refusal — comes through here.
+// package that hands a serialized structure to RefHash or to ExpandWithLabel comes through
+// here.
+//
+// ExpandWithLabel is now the only one of those two whose signature cannot report a refusal,
+// and this declaration stays in front of RefHash's callers anyway. The reason is the error
+// rather than the crash: what a caller of (*KeyPackage).Ref has to read is that a KEY PACKAGE
+// did not fit, and RefHash one frame down can only say that a reference input did not. The
+// two bounds are the same comparison over the same octets, so they cannot disagree about
+// whether to refuse — only about what to call the thing refused.
 func marshalBoundedComposition(what string, v syntax.Marshaler) ([]byte, error) {
 	encoded, err := syntax.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
-	if err := checkLabelledFieldLength(what, len(encoded)); err != nil {
+	if err := checkLabelledFieldLength(what, "", len(encoded)); err != nil {
 		return nil, err
 	}
 	return encoded, nil
@@ -249,18 +281,65 @@ const (
 //
 // The provider is a parameter rather than a receiver because the reference makers are
 // what the tree and the framing layers call, and they hold a CryptoProvider rather than
-// the concrete type. No error return, by the registry's fixed signature — see
-// mlsLabelBytes for why the writer cannot fail here.
-func RefHash(crypto CryptoProvider, label string, value []byte) []byte {
+// the concrete type.
+//
+// THE SENTENCE THAT USED TO FINISH THIS PARAGRAPH WAS FALSE, and it is written out rather
+// than quietly deleted because it is the second retracted premise this file has carried as a
+// live comment. It said: "No error return, by the registry's fixed signature — see
+// mlsLabelBytes for why the writer cannot fail here." The paragraph it pointed AT, forty
+// lines up, said the opposite in the same file — that an out-of-package caller handing this
+// declaration an over-long value still panics — and that one was the correct one. Two
+// sentences in one file that contradict each other, with the comment citing the one that
+// disagrees with it.
+//
+// Nothing pinned the signature either. The registry the sentence named is a map[string]any
+// of package level constructions, which fixes no arity and no result; what is pinned is the
+// CryptoProvider INTERFACE, and this is not one of its methods. So the argument that leaves
+// mlsKdfLabel panicking under ExpandWithLabel never applied here at all, and this refuses
+// instead, on BOTH of its fields and through the same one comparison every other labelled
+// construction asks.
+//
+// It refuses rather than answering a reference, which is the same decision mlsLabelBytes
+// records for the panic it replaces: two references that are both nil are two proposals with
+// one name, and that collision is the whole reason these labels exist. A caller that reads
+// the slice without reading the error gets zero bytes rather than a plausible value.
+//
+// The boundary is MaxVectorLength on BOTH fields rather than MaxVectorLength minus the
+// prefix on the label, which is the bytes-level decision above restated as a bound: this
+// construction adds no "MLS 1.0 " of its own, so the caller's whole label is the field.
+//
+// The PROVIDER is judged first, ahead of both fields, which is the order
+// (*AuthenticatedContent).ProposalRef gives the reason for: a body that measured the caller's
+// value first would answer a length refusal to a caller whose actual mistake was passing no
+// provider, and send it to shrink a value that was never the problem. It is also the only
+// order that does not read a method off a nil interface. That refusal is not a decision this
+// declaration got to make once it had an error to return --
+// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt derives the class off
+// the signature, so growing the error moved this construction into it.
+func RefHash(crypto CryptoProvider, label string, value []byte) ([]byte, error) {
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the reference is the provider's hash", ErrNilCryptoProvider)
+	}
+	if err := checkLabelledFieldLength("reference input", " label", len(label)); err != nil {
+		return nil, err
+	}
+	if err := checkLabelledFieldLength("reference input", "", len(value)); err != nil {
+		return nil, err
+	}
 	writer := syntax.NewWriter()
 	writer.WriteOpaque([]byte(label))
 	writer.WriteOpaque(value)
-	return crypto.Hash(mlsLabelBytes(writer))
+	return crypto.Hash(mlsLabelBytes(writer)), nil
 }
 
 // The reference by which a Welcome addresses a joiner and a proposal names the key package
 // it adds. The input is the serialized KeyPackage, not the MLSMessage that carried it.
-func MakeKeyPackageRef(crypto CryptoProvider, keyPackage []byte) []byte {
+//
+// The refusal is RefHash's and is carried out unchanged rather than being restated here. A
+// second length comparison written at this declaration would be the second spelling
+// checkLabelledFieldLength's comment exists to prevent, and this maker adds nothing to the
+// field being judged.
+func MakeKeyPackageRef(crypto CryptoProvider, keyPackage []byte) ([]byte, error) {
 	return RefHash(crypto, KeyPackageRefLabel, keyPackage)
 }
 
@@ -268,7 +347,9 @@ func MakeKeyPackageRef(crypto CryptoProvider, keyPackage []byte) []byte {
 // is the serialized AuthenticatedContent that framed the proposal and not the Proposal
 // itself (RFC 9420 section 5.2), so the reference covers the sender and the signature
 // rather than only the proposed change.
-func MakeProposalRef(crypto CryptoProvider, authenticatedContent []byte) []byte {
+//
+// The refusal is RefHash's, carried out for the reason MakeKeyPackageRef gives.
+func MakeProposalRef(crypto CryptoProvider, authenticatedContent []byte) ([]byte, error) {
 	return RefHash(crypto, ProposalRefLabel, authenticatedContent)
 }
 
