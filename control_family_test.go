@@ -725,3 +725,70 @@ func TestADemotionIsRevalidatedOnUseNotOnlyWhenRecorded(t *testing.T) {
 		t.Fatalf("h3/quic pick %v is still steered by the stale demotion", got.IP)
 	}
 }
+
+// The use-time guard has its own copy of "which family is the OTHER one", and
+// that copy needs the same discriminating table that pinned the copy in
+// controlFamilyDemote (TestControlFamilyDemoteRefusedWhenOtherFamilyUnusable
+// above). Same defect class, reintroduced in new code.
+//
+// With controlFamilyLiveDemotion's `other := 4; if live == 4 { other = 6 }`
+// mutated so `other` is always 4, the ipv6 row cannot tell the difference --
+// it probes 4 either way. Only the ipv4 row can: the mutant re-validates a
+// demotion of IPv4 against probe(4), which is the family it just demoted, gets
+// true, and keeps steering every control dial in the process onto IPv6 on a
+// device that has no IPv6 at all. That is the self-inflicted outage the guard
+// exists to prevent, arrived at through the guard itself.
+//
+// Both rows demote on a dual-stack path first, because recording a demotion is
+// itself guarded: the ledger cannot be seeded into the state under test any
+// other way.
+func TestALiveDemotionIsRevalidatedAgainstTheOtherFamily(t *testing.T) {
+	tests := []struct {
+		name   string
+		demote int
+		// the only family with a path once the device has moved
+		usable int
+	}{
+		{"ipv6 demoted, then the path loses ipv4", 6, 6},
+		{"ipv4 demoted, then the path loses ipv6", 4, 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			controlFamilyClear()
+			defer controlFamilyClear()
+
+			// learned where the guard permits it: both families present
+			restoreDualStack := swapControlFamilyProbe(func(int) bool { return true })
+			if !controlFamilyDemote(test.demote) {
+				t.Fatalf("precondition: demoting ipv%d on a dual-stack path was refused", test.demote)
+			}
+			restoreDualStack()
+
+			// the device moves to a path carrying ONLY the demoted family
+			restore := swapControlFamilyProbe(func(family int) bool {
+				return family == test.usable
+			})
+			defer restore()
+
+			if got := controlFamilyDemotedFamily(); got != 0 {
+				t.Fatalf(
+					"ipv%d is still demoted on a path with no ipv%d -- the guard "+
+						"was re-checked against the demoted family instead of the other one",
+					got, 10-test.usable)
+			}
+			network, err := controlDialNetwork("tcp", "api.example:443")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if network != "tcp" {
+				t.Fatalf(
+					"narrowed to %q on a path that has no such family -- every "+
+						"control dial would fail with no route until the backoff expired",
+					network)
+			}
+			if got := controlFamilyStatus(); got != "" {
+				t.Fatalf("status %q describes a demotion the dialer is no longer acting on", got)
+			}
+		})
+	}
+}
