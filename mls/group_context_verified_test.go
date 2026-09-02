@@ -31,14 +31,29 @@
 //     func (self *VerifiedGroupContext) Inner() *GroupContext { return self.inner } survived the
 //     full suite. That is historical bypass #2, the ordinary accessor, reappearing one type up. The
 //     class is every declaration that is handed one of these and answers a group context, and it is
-//     held twice over: by the source gate below, and behaviourally over the compiled method set, so
-//     that an accessor added tomorrow fails even before anybody updates a table.
+//     asked twice over: by the source gate below, and behaviourally over the compiled method set,
+//     which is the half that fires without anybody having updated a table. Two askings notice more
+//     spellings than one; neither closes the class, for the reason under the next heading.
 //
 // SO THE SCOPE IS THIS PACKAGE AND THAT IS A COMPILER FACT rather than a choice: the field is
 // unexported, so no other package can build one or read one, and the gate asserts that rather than
 // leaving it as the unstated reason a narrow scan is enough. What an EXTERNAL package can reach is
 // held from outside, in external_provenance_test.go, which is where the two demonstrated bypasses
 // are run from.
+//
+// AND WITHIN THIS PACKAGE THESE GATES ARE A REVIEW AID AND NOT A FENCE, which is the honest reading
+// and is measured rather than modest. Five rounds of hardening them each ended with a reviewer
+// holding a new spelling: a defined struct type with the same underlying type, a non-empty
+// interface carrying the pointer in an exported field, a type alias no matcher was unaliasing, an
+// instantiated-generic collision in a cycle memo. Every one was real, and every one needed a
+// DECLARATION ADDED TO PACKAGE mls -- an in-package forgery, which is a code review question rather
+// than an attack, because the compiler closes the same class against every other package and that
+// is where untrusted octets come from. Within one Go package an unexported field is visible to the
+// whole package, so no source walk can enumerate the ways to write &VerifiedGroupContext{inner: x}.
+// What these gates do is catch the ordinary spellings and name them against a table, so a new door
+// is something a reviewer is shown rather than something they must think to look for. A green run
+// here means a reviewer was helped. It does not mean no declaration can evade them, and a sixth
+// round of matcher arms would not make it mean that.
 package mls
 
 import (
@@ -110,11 +125,15 @@ func verifiedGroupContextDeclarationName(checked checkedBodies, declaration ast.
 // much as one inside a function is, and the round that scanned bodies proved that the difference is
 // not academic: the package scope spelling left the suite green.
 //
-// TWO WAYS A FIELD IS FILLED AND THERE IS NO THIRD. A composite literal is how the constructor
-// writes it, and an assignment to the field is the other; a matcher reading only one of them would
-// report a clean run over a package that used the other. Both arms go through the type checker
-// rather than through the spelling, so a literal written with the type elided inside a slice of
-// them is a member, and a local named VerifiedGroupContext in some other package is not.
+// THE TWO WAYS A FIELD IS ORDINARILY FILLED, WHICH ARE NOT ALL THE WAYS. A composite literal is how
+// the constructor writes it and an assignment to the field is the other, so a matcher reading only
+// one of them would report a clean run over a package that used the other; both arms go through the
+// type checker rather than through the spelling, so a literal written with the type elided inside a
+// slice of them is a member, and a local named VerifiedGroupContext in some other package is not.
+// What they do NOT cover is said here rather than left to be discovered by the next reviewer: a
+// conversion from an identically shaped struct type declared in this package builds one too and is
+// neither arm. This walk is a review aid over the ordinary spellings -- see this file's header --
+// and the compiler is what closes the class against every package but this one.
 //
 // AN EMPTY LITERAL IS NOT A MEMBER, and that is deliberate rather than an omission.
 // VerifiedGroupContext{} carries a nil context, which is the zero value every door of this package
@@ -582,9 +601,11 @@ func TestEveryReaderOfAVerifiedGroupContextIsClassifiedHere(t *testing.T) {
 // reader class, derived off the COMPILED method set rather than off the source.
 //
 // Two gates over one class on purpose. The source gate above fails when a reader is added without a
-// row, which is a conversation somebody can have and then win; this one fails when a reader hands
-// out the storage, whatever any table says about it, and it needs nobody to have updated anything.
-// Between them the added accessor that survived the last round fails twice.
+// row, which is a conversation somebody can have and then win; this one fails when a METHOD OF THE
+// COMPILED TYPE hands out the storage, whatever any table says about it, and it needs nobody to
+// have updated anything. Between them the added accessor that survived the last round fails twice.
+// Neither closes the class: a plain function of this package that reads the field is not in this
+// gate's subject at all, and what the source gate does not see is under this file's header.
 //
 // EVERY METHOD ANSWERING A CONTEXT IS DRIVEN, not Context by name, which is the whole point. The
 // two answer shapes are both judged -- a *GroupContext, whose pointer is compared against the one

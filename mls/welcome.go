@@ -18,10 +18,13 @@
 // never sees.
 //
 // THE PRECONDITION THAT SENTENCE HIDES IS THE MOST IMPORTANT THING IN THIS FILE, and it is
-// written out in full on Verify itself, under "WHERE THE TREE COMES FROM". A joiner that
-// resolves the tree out of the GroupInfo's OWN ratchet_tree extension -- which RFC 9420 section
-// 12.4.3.1 invites, and which the next task to touch this file will implement -- is answered nil
-// over a completely self-consistent forgery. Read that paragraph before writing the call site.
+// written out in full on Verify itself, under "WHERE THE TREE COMES FROM". A JOINER CANNOT
+// AUTHENTICATE THE TREE FROM THE WELCOME ALONE, whatever shape its call site takes: an attacker
+// that mints its own tree and signs at its own leaf is answered nil, and it makes no difference
+// whether the joiner lifted that tree out of the GroupInfo's ratchet_tree extension or was handed
+// it as a parameter of its own, because both octet strings arrive over one wire from one sender.
+// p7 task 16's JoinFromWelcome takes the tree as a separate ratchetTree []byte, so nobody writing
+// it may read that separation as the check. Read that paragraph before writing the call site.
 //
 // The signer's public key is NOT a field of GroupInfo, and that is the whole reason Verify
 // takes a tree. A structure that carried the key its own signature is checked under verifies
@@ -159,28 +162,52 @@ func (self *GroupInfo) Sign(crypto CryptoProvider, priv SignaturePrivateKey) err
 // not a defect in Verify. It is a precondition on its CALLER, and until this paragraph it was
 // written down nowhere.
 //
-// So a caller that obtains the tree FROM THE GROUP INFO IT IS CHECKING has authenticated
-// nothing, and what it accepts is not a near miss. Measured on this build:
+// So the tree a caller passes must come from OUTSIDE THE WELCOME, and outside the WHOLE message
+// rather than outside one field of it. Measured on this build:
 //
-//	an attacker mints its own four leaf tree with every leaf its own, encodes that tree into a
-//	ratchet_tree extension, sets GroupContext.GroupId to whatever the joiner expects, sets
-//	GroupContext.TreeHash to its OWN tree's hash, and signs at its own leaf 0. A joiner doing
-//	`carried, _ := ParseRatchetTreeFrom(extension); info.Verify(crypto, carried)` is answered
+//	an attacker mints its own four leaf tree with every leaf its own, sets
+//	GroupContext.GroupId to whatever the joiner expects, sets GroupContext.TreeHash to its OWN
+//	tree's hash, and signs at its own leaf 0. Verify against the attacker's tree is answered
 //	NIL. Against the honest tree the same object correctly answers ErrWelcomeTreeHashMismatch.
 //
 // Every rule below passes over that object because every rule below is TRUE of it: a member of
 // that tree did sign that group info about that tree. The forgery is self-consistent, and
-// self-consistency is the whole of what a signature check can establish. RFC 9420 section
-// 12.4.3.1 invites the shape -- the ratchet_tree extension exists so a Welcome can carry the
-// tree -- and p7 task 16 is the next task to write that call site. It must not resolve the tree
-// out of the GroupInfo and then hand it back here as though that were a check.
+// self-consistency is the whole of what a signature check can establish.
 //
-// WHAT ACTUALLY CLOSES IT is two things outside this file, and neither of them is a stronger
-// signature: (*RatchetTree).ValidateAgainstContext, run by whoever OBTAINED the tree, against a
-// group context that came from somewhere the joiner already trusts; and an identity the joiner
-// ALREADY TRUSTS matched against at least one leaf's credential, which is an authentication
-// service this build does not have. Until that exists the CALLER is the party making the
-// authority claim, and the tree in this parameter list is what says so.
+// THE PARAMETER SHAPE IS NOT THE FIX, which is the sentence this paragraph exists for, because
+// an earlier version of it did not say so. That version warned against ONE spelling -- lifting
+// the tree out of the GroupInfo's own ratchet_tree extension, which RFC 9420 section 12.4.3.1
+// invites and which is written carried, _ := ParseRatchetTreeFrom(ext); info.Verify(crypto,
+// carried) -- and p7 task 16's
+//
+//	JoinFromWelcome(cfg *GroupConfig, welcome []byte, ratchetTree []byte, keys *JoinKeyMaterial)
+//
+// takes the tree as its OWN parameter, so an implementer reads that warning as obeyed by
+// construction while THE IDENTICAL FORGERY WORKS UNCHANGED: the attacker supplies both byte
+// strings, they arrive over one wire from one sender, and which parameter an octet came in is
+// not a property anything here can check. That was measured, with nothing changed but where the
+// octets came from.
+//
+// WHAT A CALLER MUST DO INSTEAD is anchor on something the joiner held BEFORE the Welcome
+// arrived. There are two such things and only the second of them closes this:
+//
+//  1. THE KEY PACKAGE THE WELCOME IS ADDRESSED TO. A joiner must find its own
+//     EncryptedGroupSecrets by the reference of a KeyPackage IT published and open it with an init
+//     private key only it holds, refusing under ErrWelcomeNoMatchingKeyPackage otherwise -- which
+//     is the sentinel p7 task 16's own test names for a Welcome addressed to somebody else. That
+//     establishes this Welcome was made for THIS joiner, which is worth having, and it establishes
+//     nothing about who made it: a published KeyPackage is public and anybody at all may build a
+//     group around one.
+//  2. A SIGNER CREDENTIAL THE JOINER ALREADY TRUSTS, matched against at least one leaf of the
+//     tree, together with (*RatchetTree).ValidateAgainstContext run over that tree by whoever
+//     obtained it, against a group context that came from somewhere the joiner already trusts.
+//     This is the half that actually closes it, and this build does not have it: there is no
+//     authentication service here, so no credential in any leaf means anything to a joiner yet.
+//
+// Until 2 exists, NO call site of this method can answer "is this the group I meant to join" --
+// not JoinFromWelcome, not any other parameter list -- and none of them may be written as though
+// it did. The CALLER is the party making the authority claim, and the tree it passes is what
+// says so.
 //
 // THE RULES, in the order they run. Each answers a sentinel no other one answers.
 //

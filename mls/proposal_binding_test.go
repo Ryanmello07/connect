@@ -38,10 +38,10 @@
 // round's remedy was a shape the next reader wrote by following the type doc's own advice.
 //
 // What answers it instead is the compiler. NewProposalCache and Rebind take a
-// *VerifiedGroupContext, a type whose only field is unexported and whose only constructor is
-// (*GroupInfo).VerifiedContext -- which answers the group context of a GroupInfo only once a
-// member of the ratchet tree the CALLER holds has been shown to have signed it, under a signature
-// checked against a key that came out of that tree. Every bypass listed above now fails to COMPILE rather than
+// *VerifiedGroupContext, a type whose only field is unexported and whose only constructor, for
+// every package but this one, is (*GroupInfo).VerifiedContext -- which answers the group context of
+// a GroupInfo only once a member of the ratchet tree the CALLER holds has been shown to have signed
+// it, under a signature checked against a key that came out of that tree. Every bypass listed above now fails to COMPILE rather than
 // failing to be spotted. group_context_verified.go carries the argument, and
 // group_context_verified_test.go holds the two questions that ARE properties of source shape:
 // which declarations of this package construct that type, and which hand its contents back out.

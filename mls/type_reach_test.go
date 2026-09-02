@@ -25,17 +25,20 @@
 // would drift apart again.
 //
 // WHERE "REACH" STOPS, WHICH IS THE WHOLE OF THE JUDGEMENT HERE. Transitive reachability over
-// approximates, and a helper that flags everything is a helper the next person deletes. Three lines
-// are drawn, each derived from something rather than exempted by name:
+// approximates, and a helper that flags everything is a helper the next person deletes. Four lines
+// are drawn. The first three are derived from something rather than exempted by name; the fourth is
+// an approximation the source side cannot avoid, written down rather than left to be rediscovered:
 //
-//  1. A STRUCT IS ENTERED THROUGH ITS EXPORTED FIELDS ONLY, because those are what a holder can
-//     spell. This is not a convenience: it IS the mechanism VerifiedGroupContext rests on, stated
-//     as a walk. The type's own doc says "there is no spelling that reaches the field", and
+//  1. A STRUCT IS ENTERED THROUGH ITS EXPORTED FIELDS ONLY, because those are what a holder in
+//     ANOTHER package can spell. This is not a convenience: it IS the mechanism
+//     VerifiedGroupContext rests on, stated as a walk, and it is the compiler's property rather
+//     than a gate's -- the type's own doc puts it as "for every package but this one", and
 //     TestEveryConstructionOfAVerifiedGroupContextIsClassifiedHere asserts the field is unexported.
-//     So a *VerifiedGroupContext does not reach a *GroupContext, and every gate below can go on
-//     naming the verified type as the thing that is safe to hand out without an exemption written
-//     anywhere. It generalises: a second guard type declared tomorrow is sealed by the same
-//     property that makes it a guard. What it costs is stated in the control -- see
+//     So a *VerifiedGroupContext does not reach a *GroupContext for any holder outside package mls,
+//     and every gate below can go on naming the verified type as the thing that is safe to hand out
+//     without an exemption written anywhere. It generalises that far and no further: a second guard
+//     type declared tomorrow is sealed against other packages by the same property, and inside its
+//     own package its field is ordinary. What it costs is stated in the control -- see
 //     notALeakThroughASealedBox -- a box with an unexported field and an accessor of its own is a
 //     leak this walk does not see, and that accessor is not in the reader class because it is
 //     handed the box rather than the verified value.
@@ -47,6 +50,14 @@
 //  3. A SIGNATURE IS ENTERED THROUGH ITS RESULTS AND NOT ITS PARAMETERS. What a returned func
 //     RETURNS is something the holder receives; what it TAKES is something the holder supplies, and
 //     supplying a context to a callback is not being handed the one this value vouches for.
+//  4. AN INTERFACE IS ENTERED THROUGH WHAT ITS OWN METHODS ANSWER, and the empty one holds
+//     everything, which is what makes Held() any the leak it was measured to be. What that cannot
+//     see is a concrete type carrying a context in a field, handed back as some interface that does
+//     not answer one: go/types has a static type and the value is not in it. This is the one line
+//     here that is an approximation rather than a judgement, and the compiled walk beside it asks
+//     the precise question instead -- an interface holds a target exactly when the target
+//     implements it. A matcher limit that is written nowhere is one the next round rediscovers,
+//     which is the only reason it is a numbered line.
 //
 // AND THREE GATES DELIBERATELY DO NOT ASK THIS QUESTION, said here so the omission is a decision
 // rather than an oversight. verifiedGroupContextConstructionsIn asks whether a composite literal IS

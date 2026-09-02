@@ -28,10 +28,11 @@
 // joiner_secret AND the group context, and the resulting key schedule, confirmation tag and
 // GroupInfo signature are all perfectly consistent with each other. What (*GroupInfo).Verify adds
 // is that the signature must be by a member of THE TREE THE CALLER PASSED -- so the attack now
-// requires the attacker to supply the tree as well, which a joiner that lifts the ratchet_tree out
-// of the same message hands it for free. The test drives both readings: against the joiner's own
-// tree the forgery is refused, and against the tree the attacker supplied it verifies and a cache
-// binds to epoch 1<<40 of ATTACKER-CHOSEN-GROUP.
+// requires the attacker to supply the tree as well, which the same message hands it for free. The
+// PARAMETER the tree arrives in is not the question: p7 task 16's JoinFromWelcome takes it as its
+// own ratchetTree []byte and the attacker supplies that byte string too. The test drives both
+// readings: against the joiner's own tree the forgery is refused, and against the tree the attacker
+// supplied it verifies and a cache binds to epoch 1<<40 of ATTACKER-CHOSEN-GROUP.
 //
 // WHAT WOULD ACTUALLY CLOSE B is not a shape of this constructor. It is (*RatchetTree)
 // .ValidateAgainstContext run by whoever obtained the tree, plus at least one leaf whose credential
@@ -306,8 +307,10 @@ func TestADecodedGroupInfoIsNotVouchedForByTheTreeTheJoinerIsAlreadyIn(t *testin
 //  2. Against the tree the ATTACKER supplied, it VERIFIES, and a proposal cache binds to epoch
 //     1<<40 of ATTACKER-CHOSEN-GROUP. Verify establishes that a member of the tree the caller
 //     passed signed this -- and when the caller passed the attacker's tree, the attacker is that
-//     member. A joiner that lifts the ratchet_tree extension out of the very GroupInfo it is
-//     checking has done this to itself.
+//     member. A joiner has done this to itself whenever the tree it passed came out of the same
+//     message as the group info -- lifted from the ratchet_tree extension, or handed over as a
+//     parameter beside it, which is p7 task 16's shape and is the same octets from the same
+//     sender.
 //
 // It asserts the SUCCESS in case 2 rather than papering over it. A test that only asserted case 1
 // would let this file read as though B were closed, which is the thing the constructor must not be

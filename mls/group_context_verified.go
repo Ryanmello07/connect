@@ -55,10 +55,12 @@
 // it inherits that gap exactly, and the gap is where the second demonstrated bypass still lives:
 //
 //   - THE TREE IS THE CALLER'S TRUST ANCHOR AND NOTHING HERE AUTHENTICATES IT. An attacker that
-//     supplies the GroupInfo may also supply the tree -- a joiner that took the ratchet_tree out of
-//     the same GroupInfo it is checking has done exactly that -- and a tree holding the attacker's
-//     own leaf verifies the attacker's own signature. So the honest joiner flow over an
-//     attacker-chosen joiner_secret is closed ONLY relative to a tree the caller already trusts.
+//     supplies the GroupInfo supplies the tree too -- whether the joiner lifted it out of the
+//     GroupInfo's ratchet_tree extension or was handed it as its own parameter, which is the shape
+//     p7 task 16's JoinFromWelcome writes; both octet strings come over one wire from one sender --
+//     and a tree holding the attacker's own leaf verifies the attacker's own signature. So the
+//     honest joiner flow over an attacker-chosen joiner_secret is closed ONLY relative to a tree
+//     the caller already trusts.
 //     What actually closes it is two things this package cannot do on its own account:
 //     (*RatchetTree).ValidateAgainstContext, run by whoever obtained the tree, and an identity the
 //     joiner ALREADY TRUSTS matched against at least one leaf's credential -- an authentication
@@ -70,14 +72,37 @@
 //   - NOT THAT THE SIGNER WAS ENTITLED. Whether that member may publish a GroupInfo at all is the
 //     group policy's, and this type is not a substitute for it.
 //
-// ONE DOOR, AND THE GATES BESIDE IT ARE ABOUT THE CLASS RATHER THAN THE NAME. A second constructor
-// is a second thing to get wrong, so there is one; a second ACCESSOR handing the inner pointer out
-// would undo the value-level half just as quietly, so the class of readers is gated too. Both
-// classes are derived off the source in group_context_verified_test.go over EVERY declaration of
-// every file rather than over function bodies, because a construction written at package scope --
-// var vouchAnything = func(c *GroupContext) *VerifiedGroupContext { ... } -- is invisible to a walk
-// that only enters bodies. That is measured rather than supposed: the previous gate walked bodies,
-// and the package scope build left the whole suite green.
+// ONE DOOR, AND WHAT HOLDS IT IS THE COMPILER. The gates beside it are a review aid, and that
+// division is written here because five rounds of hardening them had it the other way round.
+//
+// WHAT THE COMPILER HOLDS was measured from package mls_test -- outside mls, which is where every
+// untrusted octet arrives from. The only exported route to a *VerifiedGroupContext is
+// (*GroupInfo).VerifiedContext(crypto, tree); Context answers a COPY; the zero value is refused by
+// NewProposalCache with a named error and its Context is nil; and a composite literal with an
+// element, a write of the field, and a conversion from an identically shaped struct declared out
+// there ALL FAIL TO COMPILE -- "cannot refer to unexported field inner".
+//
+// WHICH OF THOSE A TEST HOLDS, said exactly, because a doc naming one file for all four would be
+// the overclaim this section exists to remove. A compile error is not something a test in this
+// build can assert; what external_provenance_test.go holds from OUTSIDE is the property the three
+// compile errors rest on -- the field is unexported -- together with the single exported door and
+// the zero value's two refusals. The copy is held from INSIDE, in group_context_verified_test.go,
+// by the aliasing test and by the behavioural gate over the compiled method set. So the guarantee
+// against untrusted input holds, and no gate in this package is what holds it.
+//
+// WHAT THE GATES ARE FOR is the one package the compiler does not close. Within package mls an
+// unexported field is visible to the whole package, so &VerifiedGroupContext{inner: x} is ordinary
+// Go here and no source walk can enumerate the ways to write it. Every bypass five rounds of review
+// turned up needed a DECLARATION ADDED TO THIS PACKAGE -- a defined struct type with the same
+// underlying type, a non-empty interface carrying the pointer in an exported field, a type alias no
+// matcher was unaliasing, an instantiated-generic collision in a cycle memo -- which is an
+// in-package forgery, and that is a code review question rather than an attack. The gates in
+// group_context_verified_test.go catch the ordinary spellings and name them against a table, so a
+// reviewer notices a new door; both walk EVERY declaration of every file rather than function
+// bodies, because a construction at package scope is invisible to a walk that only enters bodies
+// and the package scope build was measured leaving the whole suite green. THEY ARE NOT EXHAUSTIVE.
+// Five rounds each ended with a reviewer holding a spelling the round before had not enumerated, so
+// read a green run here as "a reviewer was helped", never as "no declaration can evade this".
 package mls
 
 import (
@@ -89,12 +114,22 @@ import (
 // VerifiedGroupContext is a group context whose authority has been established, and it is the only
 // thing the proposal cache will bind an epoch to.
 //
-// ONE UNEXPORTED FIELD, AND THAT FIELD IS THE WHOLE MECHANISM. A struct whose only field is
-// unexported cannot be built carrying a value from any other package -- mls.VerifiedGroupContext{}
-// compiles out there and is the zero value, which every door refuses, and there is no spelling that
-// reaches the field. Inside this package the class of declarations that can build one is what the
-// compiler already enumerates -- a composite literal with an element, or a write of the field, and
-// there is no third spelling in Go -- and the gate holds that class to a table.
+// ONE UNEXPORTED FIELD, AND THAT FIELD IS THE WHOLE MECHANISM -- FOR EVERY PACKAGE BUT THIS ONE.
+// A struct whose only field is unexported cannot be built carrying a value from any other package:
+// mls.VerifiedGroupContext{} compiles out there and is the zero value, which every door refuses,
+// and a literal with an element, a write of the field and a conversion from a struct declared out
+// there with the same shape are all "cannot refer to unexported field inner". That is the whole
+// guarantee and it belongs to the compiler. No test asserts those three refusals directly, because
+// a compile error is not a thing a test in this build can observe; what external_provenance_test.go
+// holds from outside is the property all three rest on, that this field is unexported.
+//
+// INSIDE THIS PACKAGE THE FIELD IS ORDINARY, so nothing here is a barrier and the gates over it are
+// a review aid rather than a fence. An earlier version of this paragraph said the constructions
+// were "a composite literal with an element, or a write of the field, and there is no third
+// spelling in Go", and that was wrong twice over: a conversion from an identically shaped struct
+// type declared IN this package is a third, and five rounds of review each found a spelling the
+// round before had not enumerated. The gates hold the ordinary ones to a table, which is worth
+// having and is not the same thing as closing the class. See this file's header.
 //
 // A POINTER TO A CONTEXT AND NOT A CONTEXT, so that the zero value is telling. A
 // VerifiedGroupContext holding a GroupContext by value would have a zero value that reads as a
@@ -109,7 +144,9 @@ import (
 // one rule -- a verified value must not be changeable after it was verified -- and the second half
 // is a CLASS rather than a line, because an accessor added later that answered self.inner would
 // undo it with the existing one untouched. That is why the gate is over every declaration that
-// takes one of these and answers a group context, and not over Context alone.
+// takes one of these and answers a group context, and not over Context alone. Only a declaration of
+// THIS package can be that accessor, and the gate over them helps a reviewer see one rather than
+// closing the class -- see this file's header.
 type VerifiedGroupContext struct {
 	inner *GroupContext
 }
