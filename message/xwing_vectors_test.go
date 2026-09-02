@@ -11,6 +11,13 @@
 // consume direction and therefore proved nothing; the three directions below share no serializer
 // with each other.
 //
+// Which side of a comparison runs production code is DERIVED here and not typed. It was typed
+// once, as a bool on each row, and the count it produced was wrong by three: the ct_X rows claimed
+// to hold this package while the value on their got side came out of x25519PublicKeyOfScalar, a
+// helper declared in message/xwing_test.go that reaches mls.X25519PrivateKey, and XwingEncapsulate
+// was called nowhere in this file at all. A gate that counts its own worth must not take that
+// count from the same hand that wrote the rows.
+//
 // keygen, seed -> pk. A full known answer test. It holds the SHAKE-256 expansion, the ML-KEM key
 // generation and this package's own pk_M then pk_X encoder against published octets.
 //
@@ -19,7 +26,12 @@
 // combiner including the label's position. It does NOT read this package's public key encoder,
 // which is why it and the keygen direction are independent rather than two readings of one path.
 //
-// encapsulation, eseed -> ct_X. A full known answer test for the x25519 half.
+// encapsulation, eseed -> ct_X. A full known answer test for the x25519 half, and it runs
+// XwingEncapsulate. The draft fixes the ephemeral, which is what makes encapsulation drivable at
+// all: eseed[32:64] is ek_X, and XwingEncapsulate draws ek_X and nothing else from the reader it
+// is handed, so a reader over exactly those thirty two octets pins ct[1088:1120] to a value the
+// draft published. The peer key is parsed out of the corpus rather than taken from this package's
+// own keygen, so this direction shares no serializer with that one either.
 //
 // encapsulation, eseed -> ct_M. NOT REACHABLE. crypto/mlkem's Encapsulate takes no randomness and
 // returns no error, so ML-KEM's derandomized encapsulation is not exposed by the standard library.
@@ -37,6 +49,9 @@ import (
 	"crypto/sha3"
 	"encoding/hex"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"os"
 	"path/filepath"
@@ -78,6 +93,31 @@ const (
 	xwingVectorSha256             = "409efe197550b22985b4a0419418a0c5f2c2b193426c55bd998399ec8d3e614d"
 	xwingVectorCount              = 3
 )
+
+// The number of published answers ONE vector can hold this package to, and the reason it is three
+// rather than four.
+//
+// keygen's pk, decapsulation's ss, and encapsulation's ct_X. The fourth, encapsulation's ct_M, is
+// not reachable: crypto/mlkem's Encapsulate takes no randomness and the standard library exposes
+// no derandomized entry point, so ct_M is fresh on every call and there is nothing published to
+// hold it to.
+//
+// This number is written down rather than derived, and that is deliberate: it is the tripwire, and
+// a derivation of how many answers the gate makes is satisfied by whatever the gate happens to
+// make. What is derived is WHICH answers count towards it, off where their producers are declared.
+const xwingHeldAnswersPerVector = 3
+
+// The number of comparisons ONE vector produces, which is the three above plus the two claims the
+// corpus makes about ITSELF: that sk is the seed, and that eseed[32:64] is the scalar behind the
+// published ct_X.
+//
+// This is a floor on ROWS, and it is not the count of calls TestXwingIsHeldAgainstNineDistinct-
+// PublishedAnswers argues against asserting. A row count on its own is satisfied by five copies of
+// one comparison; it is asserted beside the held count, the distinct count and the direction
+// count, and any one of those three fails that copy. What it buys is that a row deleted from the
+// collector fails this file -- including one of the two that hold nothing, whose loss the other
+// three counts cannot see, because each of them is computed over the rows that were left.
+const xwingAnswersPerVector = 5
 
 // The raw file, its digest checked before anything parses it.
 func loadXwingVectorFile(t *testing.T) []byte {
@@ -161,9 +201,71 @@ func TestXwingVectorDecapsulate(t *testing.T) {
 	}
 }
 
-func TestXwingVectorEncapsulateX25519Half(t *testing.T) {
-	// eseed[32:64] is ek_X, and ct[1088:1120] must be its public key. this is the half of
-	// encapsulation the standard library lets us pin exactly.
+// ct_X as THIS PACKAGE's encapsulation produces it, driven from the corpus.
+//
+// The draft fixes the ephemeral, which is the whole reason encapsulation is drivable here: eseed
+// is sixty four octets, eseed[0:32] is the ML-KEM half's randomness and eseed[32:64] is ek_X.
+// XwingEncapsulate draws ek_X and only ek_X from the reader it is handed -- crypto/mlkem's
+// Encapsulate takes no randomness, so the ML-KEM half cannot be steered by anything -- so a reader
+// over eseed[32:64] pins ct[1088:1120] exactly, and that is a value the draft published.
+//
+// The reader is exactly thirty two octets long on purpose. An encapsulation that drew ek_X from
+// the process source, or out of the wrong window of the eseed, produces a different ct_X and fails
+// here; one that read more than thirty two octets runs the reader dry and fails here too, rather
+// than succeeding on bytes nobody chose.
+//
+// The peer key is PARSED OUT OF THE CORPUS rather than taken from this package's own keygen, which
+// is what keeps this direction and the keygen direction independent rather than two readings of
+// one path.
+func xwingEncapsulateFromTheVector(t *testing.T, i int, vector xwingVector) []byte {
+	t.Helper()
+	eseed := mustHexBytes(t, vector.Eseed)
+	if len(eseed) != 2*XwingX25519KeySize {
+		t.Fatalf("vector %d: eseed is %d bytes, want %d", i, len(eseed), 2*XwingX25519KeySize)
+	}
+	pub, err := ParseXwingPublicKey(mustHexBytes(t, vector.Pk))
+	if err != nil {
+		t.Fatalf("vector %d: parse the published pk: %v", i, err)
+	}
+	ct, shared, err := XwingEncapsulate(bytes.NewReader(eseed[XwingX25519KeySize:]), pub)
+	if err != nil {
+		t.Fatalf("vector %d encapsulate: %v", i, err)
+	}
+	if len(ct) != XwingCiphertextSize {
+		t.Fatalf("vector %d: ciphertext is %d bytes, want %d", i, len(ct), XwingCiphertextSize)
+	}
+	// the shared secret is NOT held to vector.Ss and cannot be. ct_M came out of crypto/mlkem's
+	// own randomness on this call, so the secret this encapsulation combined is not the one the
+	// draft published for the ciphertext the draft published. Its length is the whole of what
+	// there is to say about it here, and saying it stops a later reader assuming otherwise.
+	if len(shared) != XwingSharedSize {
+		t.Fatalf("vector %d: shared secret is %d bytes, want %d", i, len(shared), XwingSharedSize)
+	}
+	return ct[XwingMlkemCiphertextSize:]
+}
+
+// TestXwingVectorEncapsulateProducesThePublishedCtX is the encapsulation direction, and unlike the
+// test that used to carry that claim it calls XwingEncapsulate.
+func TestXwingVectorEncapsulateProducesThePublishedCtX(t *testing.T) {
+	for i, vector := range loadXwingVectors(t) {
+		got := xwingEncapsulateFromTheVector(t, i, vector)
+		want := mustHexBytes(t, vector.Ct)[XwingMlkemCiphertextSize:]
+		if !bytes.Equal(got, want) {
+			t.Errorf("vector %d: ct_X = %x, want %x", i, got, want)
+		}
+	}
+}
+
+// TestXwingVectorEseedTailIsTheEphemeralScalarBehindCtX is a claim about the CORPUS, and it is now
+// named for that.
+//
+// It was called TestXwingVectorEncapsulateX25519Half, and it never called XwingEncapsulate: the
+// value on its got side comes out of x25519PublicKeyOfScalar, a helper declared in
+// message/xwing_test.go which reaches mls.X25519PrivateKey, so what it observed was mls's one ECDH
+// wrapper and the corpus and none of this package's X-Wing code. It is worth keeping, because it
+// says eseed[32:64] really is the scalar behind the published ct_X, and that is the premise the
+// encapsulation direction above is driven on -- but under a name that says what it holds.
+func TestXwingVectorEseedTailIsTheEphemeralScalarBehindCtX(t *testing.T) {
 	for i, vector := range loadXwingVectors(t) {
 		eseed := mustHexBytes(t, vector.Eseed)
 		if len(eseed) != 2*XwingX25519KeySize {
@@ -194,9 +296,160 @@ type xwingPublishedAnswer struct {
 	vector int
 	// the field of the vector the answer belongs to
 	field string
-	// what the answer is about: this implementation's output, or the corpus itself
-	holdsTheImplementation bool
-	got                    []byte
+	// the declarations UNDER TEST that got came out of, in call order and in the spelling
+	// entropyDeclaredName prints. The harness that called them -- this file's own loaders,
+	// decoders and drivers -- is not a producer, and naming one here would classify its row as
+	// holding nothing, because every one of them is declared in a _test.go file.
+	//
+	// Whether the answer holds THIS PACKAGE is derived from where the producers are declared, and
+	// is not a field: it was a field once, typed row by row, and three of
+	// the nine rows it counted were wrong. An empty producers is the corpus's claim about itself
+	// and is a statement about no implementation at all.
+	//
+	// What the derivation closes is the CLASSIFICATION: whether a row claiming to hold this
+	// package names declarations this package actually has, in its non test source. What it
+	// cannot close is whether the row named the declarations that really ran -- no test inside a
+	// go package can observe that without instrumenting the build -- so a row naming
+	// XwingEncapsulate over a got that came from somewhere else would still pass. That gap is
+	// stated here rather than left for a reader to find by counting, and it is why the
+	// encapsulation row is held behaviourally as well: ct_X is reproducible from the corpus only
+	// if XwingEncapsulate is what produced it, which is what the standalone test above observes.
+	producers []string
+	got       []byte
+}
+
+// Whether one answer holds this package, DERIVED from where its producers are declared.
+//
+// A producer this package declares nowhere is fatal rather than false. The safe reading of an
+// unresolvable name -- that it holds nothing -- is also the reading that hides it, and a row
+// naming a function that does not exist is a row nobody can check.
+func (self xwingPublishedAnswer) holdsThisPackage(t *testing.T, declared map[string]bool) bool {
+	t.Helper()
+	if len(self.producers) == 0 {
+		return false
+	}
+	holds := true
+	for _, producer := range self.producers {
+		production, declaredHere := declared[producer]
+		if !declaredHere {
+			t.Fatalf("vector %d, %s: the gate records %s as having produced its value and this package declares no function of that name, so the classification the count rests on is over a name nobody can resolve",
+				self.vector, self.field, producer)
+		}
+		if !production {
+			holds = false
+		}
+	}
+	return holds
+}
+
+// The direction an answer belongs to, which is its producer set and not its field.
+//
+// Two answers produced by the same declarations are two readings of one path however differently
+// they are named, and that is the failure this file's opening paragraph is about: a generate
+// direction that shared its serializer with the consume direction proved nothing and counted two.
+func (self xwingPublishedAnswer) direction() string {
+	return strings.Join(self.producers, " -> ")
+}
+
+// Every function name this package declares, and whether the only declarations of it are in this
+// directory's non test source.
+//
+// This is the derivation the classification above rests on. A name resolves to production only if
+// a non test file of this package declares it, so a helper declared in a _test.go file -- which is
+// what x25519PublicKeyOfScalar is, and what produced the overcount -- cannot be counted as this
+// package's own code however a row describes it.
+//
+// It reuses entropy_test.go's entropyDeclaredName rather than spelling a second reading of a
+// receiver. Both files are this package's own test binary, and the two have to agree: a failure
+// printed over there and a producer named here must be about the same declaration.
+//
+// A name in both sets resolves to test, which understates. parser.ParseFile applies no build
+// constraints, so two files that never build together can each declare one name, and understating
+// is the answer that cannot restore an overcount.
+//
+// No non test file read, or a file that does not parse, is fatal: either leaves a map in which
+// nothing is production, and a gate every one of whose answers holds nothing reports a clean zero.
+func xwingDeclarationsOfThisPackage(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read this package's directory, which is what says where each producer is declared: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	production := map[string]bool{}
+	test := map[string]bool{}
+	read := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(".", name))
+		parsed, err := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		into := test
+		if !strings.HasSuffix(name, "_test.go") {
+			into = production
+			read++
+		}
+		for _, declaration := range parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction {
+				continue
+			}
+			into[entropyDeclaredName(function)] = true
+		}
+	}
+	if read == 0 {
+		t.Fatal("no non test go file was read out of this package, so nothing here is production and every answer below would be counted as holding none of it")
+	}
+	declared := map[string]bool{}
+	for name := range production {
+		declared[name] = true
+	}
+	for name := range test {
+		declared[name] = false
+	}
+	return declared
+}
+
+// TestTheProducerDerivationSeparatesProductionFromTestDeclarations is the control on the reader
+// above, and it is not decoration.
+//
+// A reader that answered production for everything is the answer that makes every count read
+// high, which is precisely the defect this derivation replaced; a reader that answered test for
+// everything makes the gate read zero and would be noticed at once. Only the first needs a
+// tripwire, and x25519PublicKeyOfScalar is the name it has to say no to, because it is the one a
+// hand written bool said yes to three times.
+func TestTheProducerDerivationSeparatesProductionFromTestDeclarations(t *testing.T) {
+	declared := xwingDeclarationsOfThisPackage(t)
+	for _, name := range []string{
+		"XwingKeyGenFromSeed", "XwingEncapsulate", "XwingDecapsulate", "ParseXwingPublicKey",
+		"(*XwingPrivateKey).Public", "(*XwingPublicKey).Bytes", "xwingCombine",
+	} {
+		production, declaredHere := declared[name]
+		if !declaredHere {
+			t.Errorf("%s is declared in message/xwing.go and the derivation did not see it, so an answer produced by it would be fatal rather than counted", name)
+			continue
+		}
+		if !production {
+			t.Errorf("%s is declared in this package's non test source and the derivation calls it a test declaration, so every answer it produces is counted as holding nothing", name)
+		}
+	}
+	for _, name := range []string{
+		"x25519PublicKeyOfScalar", "xwingEncapsulateFromTheVector", "mustHexBytes", "loadXwingVectors",
+	} {
+		production, declaredHere := declared[name]
+		if !declaredHere {
+			t.Errorf("%s is declared in a _test.go file of this package and the derivation did not see it", name)
+			continue
+		}
+		if production {
+			t.Errorf("%s is declared in a _test.go file of this package and the derivation calls it production, so the classification the count rests on is inverted and the overcount is back", name)
+		}
+	}
 }
 
 // The bytes one field of one vector publishes as an answer, read out of the corpus and nowhere
@@ -235,9 +488,10 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 		seed := mustHexBytes(t, vector.Seed)
 		consumed["seed"] = true
 
-		// the corpus's own claim about itself, which is not a statement about this package
+		// the corpus's own claim about itself. no declaration of this package ran to produce it,
+		// so the derivation counts it as holding nothing, which is what it holds
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "sk", holdsTheImplementation: false, got: seed,
+			vector: i, field: "sk", got: seed,
 		})
 
 		priv, err := XwingKeyGenFromSeed(seed)
@@ -245,7 +499,9 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 			t.Fatalf("vector %d keygen: %v", i, err)
 		}
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "pk", holdsTheImplementation: true, got: priv.Public().Bytes(),
+			vector: i, field: "pk",
+			producers: []string{"XwingKeyGenFromSeed", "(*XwingPrivateKey).Public", "(*XwingPublicKey).Bytes"},
+			got:       priv.Public().Bytes(),
 		})
 
 		ct := mustHexBytes(t, vector.Ct)
@@ -255,17 +511,35 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 			t.Fatalf("vector %d decapsulate: %v", i, err)
 		}
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "ss", holdsTheImplementation: true, got: shared,
+			vector: i, field: "ss",
+			producers: []string{"XwingKeyGenFromSeed", "XwingDecapsulate"},
+			got:       shared,
 		})
 
-		eseed := mustHexBytes(t, vector.Eseed)
+		// the encapsulation direction, which reads the corpus's eseed and the corpus's pk and runs
+		// this package's own encapsulation. that is what the ct_X row below claimed and did not do
 		consumed["eseed"] = true
+		consumed["pk"] = true
+		answers = append(answers, xwingPublishedAnswer{
+			vector: i, field: "ct",
+			producers: []string{"ParseXwingPublicKey", "XwingEncapsulate"},
+			got:       xwingEncapsulateFromTheVector(t, i, vector),
+		})
+
+		// and the corpus's second claim about itself: eseed[32:64] is the scalar behind ct_X,
+		// which is the premise the row above is driven on. its producer is declared in
+		// message/xwing_test.go and reaches mls, so the derivation counts it as holding none of
+		// this package -- and that is the whole of the correction, because this row is the one
+		// that was counted as three of nine
+		eseed := mustHexBytes(t, vector.Eseed)
 		ephemeral, err := x25519PublicKeyOfScalar(eseed[XwingX25519KeySize:])
 		if err != nil {
 			t.Fatalf("vector %d ephemeral: %v", i, err)
 		}
 		answers = append(answers, xwingPublishedAnswer{
-			vector: i, field: "ct", holdsTheImplementation: true, got: ephemeral,
+			vector: i, field: "ct",
+			producers: []string{"x25519PublicKeyOfScalar"},
+			got:       ephemeral,
 		})
 	}
 	return answers, consumed
@@ -280,10 +554,29 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 // assertion is then on the number of DISTINCT published byte strings: a gate that compared the
 // same answer nine times reports fewer than nine and fails. The count of CALLS is not asserted
 // anywhere, because a call count is satisfied by nine copies of one comparison.
+//
+// Which comparisons count towards the nine is DERIVED, off where each answer's producers are
+// declared, and that is the correction this test carries. The number nine was here before and it
+// was wrong: three of the answers it counted were produced by a helper of this package's test
+// binary, holding mls's ECDH wrapper and the corpus rather than any X-Wing code, and the row that
+// closed that gap -- an encapsulation this file actually drives -- did not exist. Nine is now nine
+// pk, ss and ct_X answers, three of each, each produced by a function declared in message/xwing.go.
+//
+// The DIRECTIONS are counted too, and separately. A direction is a producer set, so three answers
+// per vector that all came out of one path collapse to one direction and fail here even while the
+// count of nine is satisfied -- which is the shape of the generate-shares-the-serializer failure
+// this file's opening paragraph records having shipped once.
 func TestXwingIsHeldAgainstNineDistinctPublishedAnswers(t *testing.T) {
+	// the name carries the number, so the number is held to the name rather than left to drift
+	// out of it by an edit to either constant
+	if want := xwingHeldAnswersPerVector * xwingVectorCount; want != 9 {
+		t.Fatalf("this test is named for nine published answers and the constants make it %d; rename it or fix them", want)
+	}
 	vectors := loadXwingVectors(t)
+	declared := xwingDeclarationsOfThisPackage(t)
 	answers, _ := xwingHoldAgainstTheDraft(t)
 	distinct := map[string]bool{}
+	directions := map[string]bool{}
 	held := 0
 	for _, answer := range answers {
 		if answer.vector < 0 || answer.vector >= len(vectors) {
@@ -296,20 +589,31 @@ func TestXwingIsHeldAgainstNineDistinctPublishedAnswers(t *testing.T) {
 		if !bytes.Equal(answer.got, want) {
 			t.Errorf("vector %d, %s: got %x, want %x", answer.vector, answer.field, answer.got, want)
 		}
-		if !answer.holdsTheImplementation {
+		if !answer.holdsThisPackage(t, declared) {
 			continue
 		}
 		held++
 		distinct[string(want)] = true
+		directions[answer.direction()] = true
 	}
-	if held != 3*xwingVectorCount {
-		t.Errorf("the gate holds this package against %d published answers, want %d", held, 3*xwingVectorCount)
+	if len(answers) != xwingAnswersPerVector*xwingVectorCount {
+		t.Errorf("the gate made %d comparisons against the corpus, want %d; a row deleted here is a published answer nothing reads, and the counts below are all computed over the rows that were left",
+			len(answers), xwingAnswersPerVector*xwingVectorCount)
 	}
-	if len(distinct) != 3*xwingVectorCount {
+	if held != xwingHeldAnswersPerVector*xwingVectorCount {
+		t.Errorf("the gate holds this package against %d published answers, want %d; a comparison counts only when every declaration that produced it is declared in this package's non test source",
+			held, xwingHeldAnswersPerVector*xwingVectorCount)
+	}
+	if len(distinct) != xwingHeldAnswersPerVector*xwingVectorCount {
 		t.Errorf("those %d comparisons are against %d DISTINCT published values; two of them are the same answer, so one of the two proves nothing",
 			held, len(distinct))
 	}
-	t.Logf("%d published answers compared, %d of them holding this package, %d distinct", len(answers), held, len(distinct))
+	if len(directions) != xwingHeldAnswersPerVector {
+		t.Errorf("those %d comparisons come out of %d distinct producer sets, want %d: %v; two directions sharing a producer set are two readings of one path",
+			held, len(directions), xwingHeldAnswersPerVector, slices.Sorted(maps.Keys(directions)))
+	}
+	t.Logf("%d published answers compared, %d of them holding this package over %d directions, %d distinct: %v",
+		len(answers), held, len(directions), len(distinct), slices.Sorted(maps.Keys(directions)))
 }
 
 // TestEveryFieldTheCorpusPublishesIsReadBySomething derives the coverage class off the file
