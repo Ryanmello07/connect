@@ -397,8 +397,20 @@ func TestXwingCombinerOrderMatchesTheDraft(t *testing.T) {
 	labelFirst.Write(x25519Shared)
 	labelFirst.Write(ct[XwingMlkemCiphertextSize:])
 	labelFirst.Write(priv.x25519PublicKey)
-	if bytes.Equal(published, labelFirst.Sum(nil)) {
-		t.Errorf("a label first combiner reproduced the draft's answer, which is only possible if the label is empty or the two forms have collided")
+	labelFirstDigest := labelFirst.Sum(nil)
+	// the claim about the CORPUS: the ordering spec A's table describes is not the ordering
+	// these vectors were produced under. It fires if a re-vendoring ever ships label first
+	// vectors, which would mean the draft had moved and this file's whole argument with it.
+	if bytes.Equal(published, labelFirstDigest) {
+		t.Errorf("a label first combiner reproduced the draft's published answer, so either the label is empty or the corpus is no longer the one this file argues about")
+	}
+	// and the claim about THIS PACKAGE, which is the one an edit can break: our combiner must
+	// not agree with the label first form. It fires on exactly the two mutations that matter --
+	// the label moved to the front, and the label emptied so that the two orderings collapse --
+	// and it fires independently of the comparison against the vector above, which is why both
+	// halves report rather than the first one stopping the test.
+	if bytes.Equal(ss, labelFirstDigest) {
+		t.Errorf("this package's combiner agrees with the label first form, which is the ordering spec A section 5.4's table describes and the draft does not")
 	}
 }
 
