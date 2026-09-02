@@ -143,9 +143,8 @@ func mlsLabelBytes(w *syntax.Writer) []byte {
 // The name arrives in TWO PARTS and is joined HERE, on the refusal path and nowhere else. A
 // caller that names a sub field — the prefixed label of checkLabelledConstruction below —
 // would otherwise build that string on every signature and every verify in the system, to
-// name a branch no message takes; measured at 16.72 ns/op, 24 B/op, one allocation each. A
-// caller with nothing to add passes the empty string and its refusal reads exactly as it
-// did, so no error text moved.
+// name a branch no message takes. A caller with nothing to add passes the empty string and
+// its refusal reads exactly as it did, so no error text moved.
 func checkLabelledFieldLength(what string, part string, length int) error {
 	if length > syntax.MaxVectorLength {
 		return fmt.Errorf("%w: the serialized %s is %d octets and one labelled field holds at most %d",
@@ -178,10 +177,23 @@ func checkLabelledFieldLength(what string, part string, length int) error {
 // THE FIELD'S NAME USED TO CONTRADICT THAT SENTENCE, and the contradiction is written out
 // rather than the line quietly repaired, because it is the third premise in this file to
 // have outlived its own code. The label BYTES were measured, and then what+" label" was
-// concatenated EAGERLY to name them — 16.72 ns/op, 24 B/op, one allocation, on every
-// signature and every verify in the system, for the branch the sentence above says no
-// message takes. The name now travels to checkLabelledFieldLength in two parts and is joined
-// only where it is read, which is inside the refusal.
+// concatenated EAGERLY to name them, on every signature and every verify in the system, for
+// the branch the sentence above says no message takes. The name now travels to
+// checkLabelledFieldLength in two parts and is joined only where it is read, which is inside
+// the refusal.
+//
+// WHAT THAT COSTS IS MEASURED HERE rather than carried over from the report that prompted it,
+// because the report's figure does not reproduce and the difference is the whole shape of the
+// answer. It named 16.72 ns/op and 24 B/op, one allocation. On go1.26.5 the eager form costs
+// 7.99 ns/op against this one's 2.27 for the same call, and ZERO allocations at either name
+// this package passes: Go concatenates into a 32 octet buffer on the STACK when the result
+// cannot escape, and "signature content label" is 23 of them. The allocation the report named
+// is real and is one bad name away — measured, a field name of 26 octets allocates nothing
+// and one of 33 allocates once, since 26 plus " label" is exactly the buffer. So what every
+// message was paying is 5.7 ns rather than an allocation, and what this closes is both.
+// TestTheLabelledConstructionCheckBuildsNoNameOnThePathAMessageTakes sweeps the length rather
+// than driving the two names, for exactly that reason: over this package's own names the
+// defect is invisible to an allocation count.
 func checkLabelledConstruction(what string, label string, value []byte) error {
 	if err := checkLabelledFieldLength(what, " label", len(MlsLabelPrefix)+len(label)); err != nil {
 		return err

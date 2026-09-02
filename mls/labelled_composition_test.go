@@ -496,36 +496,52 @@ func TestEveryLabelledConstructionRefusesALabelTooLongToBeOneField(t *testing.T)
 	}
 }
 
-// The refusal every message pays for costs nothing on the path every message takes.
+// The refusal every message pays for builds no name on the path every message takes.
 //
 // This is a test rather than a sentence in checkLabelledConstruction's comment because the
 // sentence WAS there and was half false. The label BYTES were measured rather than
 // concatenated, exactly as it said; the label's NAME, what+" label", was then built eagerly to
-// describe them -- 16.72 ns/op, 24 B/op, one allocation on every signature and every verify in
-// the system, for the branch that same comment says no message takes. A comment cannot notice
-// that. An allocation count can, and it is the only instrument here that can: every behavioural
-// assertion in this file passed with the eager version and would pass with it again.
+// describe them, on every signature and every verify in the system, for the branch that same
+// comment says no message takes.
 //
-// Zero rather than "fewer than before". One allocation is precisely what the defect was, so any
-// allocation on the accepting path is the defect back.
+// A SWEEP OVER THE NAME'S LENGTH rather than a drive of the two names this package passes, and
+// the reason is the instrument rather than the subject. Go concatenates into a 32 octet buffer
+// on the STACK when the result cannot escape, and "signature content label" is 23 of them, so
+// over this package's own names an allocation count reports zero with the defect in place --
+// measured, and it is how the first version of this test came to pass against the very
+// spelling it was written to reject. Past that buffer the two spellings separate: measured, a
+// field name of 26 octets allocates nothing and one of 33 allocates once, 26 plus " label"
+// being exactly the buffer.
+//
+// So the sweep runs the length THROUGH the boundary rather than picking a side of it, which is
+// what makes this a statement about the declaration instead of about Go's stack buffer: no
+// length of a field's name makes this build one, and a spelling that concatenates eagerly
+// fails somewhere in the range whatever the buffer happens to be.
+//
+// Zero rather than "fewer than before". One allocation is precisely what the defect was, so
+// any allocation on the accepting path is the defect back.
 //
 // The refusal is asserted underneath it, because the cheap way to allocate nothing is to stop
 // naming the field, and a length refusal that cannot say WHICH of a construction's two fields
 // was too long sends the caller to shrink the wrong one.
 func TestTheLabelledConstructionCheckBuildsNoNameOnThePathAMessageTakes(t *testing.T) {
 	content := make([]byte, 4096)
-	if err := checkLabelledConstruction("signature content", "UpdatePathNode", content); err != nil {
-		t.Fatalf("the accepted construction this measures was refused: %v", err)
-	}
-	var answered error
-	allocations := testing.AllocsPerRun(1000, func() {
-		answered = checkLabelledConstruction("signature content", "UpdatePathNode", content)
-	})
-	if answered != nil {
-		t.Fatalf("the measured call answered %v", answered)
-	}
-	if allocations != 0 {
-		t.Errorf("checkLabelledConstruction allocates %v per ACCEPTED construction, want 0", allocations)
+	for length := 0; length <= 64; length++ {
+		what := strings.Repeat("n", length)
+		if err := checkLabelledConstruction(what, "UpdatePathNode", content); err != nil {
+			t.Fatalf("the accepted construction this measures was refused: %v", err)
+		}
+		var answered error
+		allocations := testing.AllocsPerRun(200, func() {
+			answered = checkLabelledConstruction(what, "UpdatePathNode", content)
+		})
+		if answered != nil {
+			t.Fatalf("the measured call answered %v", answered)
+		}
+		if allocations != 0 {
+			t.Fatalf("checkLabelledConstruction allocates %v per ACCEPTED construction under a field name of %d octets, want 0",
+				allocations, length)
+		}
 	}
 	refused := checkLabelledConstruction("signature content",
 		strings.Repeat("l", syntax.MaxVectorLength), content)
