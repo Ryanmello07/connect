@@ -1,8 +1,15 @@
 package connect
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
+	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Address-family policy for this process's CONTROL-PLANE dials: the api
@@ -90,5 +97,235 @@ func controlDialNetwork(network string) (string, error) {
 	case IpFamilyForce6:
 		return network + "6", nil
 	}
+	// auto: a live demotion narrows to the family that is not demoted
+	switch controlFamilyDemotedFamily() {
+	case 6:
+		return network + "4", nil
+	case 4:
+		return network + "6", nil
+	}
 	return network, nil
+}
+
+const (
+	// A demotion has to outlast the reconnect storm that follows a failure,
+	// and a persistent path problem has to stop costing the user anything
+	// within a couple of strikes. Five minutes doubling to six hours does
+	// both: the second strike already covers a ten-minute session, and a
+	// genuinely broken tunnel settles at the cap.
+	controlFamilyDemotionBase = 5 * time.Minute
+	controlFamilyDemotionMax  = 6 * time.Hour
+)
+
+type controlFamilyDemotion struct {
+	until   time.Time
+	strikes int
+}
+
+// the learned half of the policy. Guarded by its own mutex rather than folded
+// into an atomic: an entry is three fields and every read is off the hot path
+// of an already-blocking dial.
+var controlFamilyLedger = struct {
+	mu      sync.Mutex
+	demoted map[int]controlFamilyDemotion
+	now     func() time.Time
+	probe   func(family int) bool
+}{
+	demoted: map[int]controlFamilyDemotion{},
+	now:     time.Now,
+	probe:   probeFamilySupport,
+}
+
+func init() {
+	// a path change invalidates everything learned about the old path
+	AddNetworkChangeListener(controlFamilyClear)
+}
+
+// controlFamilyDemote records that `family` connected and then failed. It
+// reports whether the demotion took.
+//
+// It is REFUSED when the other family is not usable on this device. On an
+// IPv6-only network with no CLAT there is no IPv4 to fall back to, and
+// demoting IPv6 there would take the user from a slow control plane to no
+// control plane at all.
+func controlFamilyDemote(family int) bool {
+	other := 4
+	if family == 4 {
+		other = 6
+	}
+
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+
+	if !controlFamilyLedger.probe(other) {
+		return false
+	}
+
+	now := controlFamilyLedger.now()
+	entry := controlFamilyLedger.demoted[family]
+	entry.strikes += 1
+	backoff := controlFamilyDemotionBase << (entry.strikes - 1)
+	if backoff > controlFamilyDemotionMax || backoff <= 0 {
+		backoff = controlFamilyDemotionMax
+	}
+	entry.until = now.Add(backoff)
+	controlFamilyLedger.demoted[family] = entry
+	return true
+}
+
+// controlFamilyClear drops everything learned. Wired to NetworkChanged.
+func controlFamilyClear() {
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+	clear(controlFamilyLedger.demoted)
+}
+
+// controlFamilyDemotedFamily returns the family currently demoted, or 0.
+// A demotion of BOTH families is impossible by construction -- demoting one
+// requires the other to be usable -- but if it somehow occurred, neither is
+// reported, because narrowing to a family we also believe is broken is worse
+// than letting the platform race them.
+func controlFamilyDemotedFamily() int {
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+	now := controlFamilyLedger.now()
+	live := 0
+	for family, entry := range controlFamilyLedger.demoted {
+		if now.Before(entry.until) {
+			if live != 0 {
+				return 0
+			}
+			live = family
+		}
+	}
+	return live
+}
+
+// controlFamilyDemotedUntil is the expiry for a family, zero when not demoted.
+// Exists for the tests and for the status line.
+func controlFamilyDemotedUntil(family int) time.Time {
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+	return controlFamilyLedger.demoted[family].until
+}
+
+// controlFamilyStatus describes any live demotion for the developer ui, and is
+// empty when there is none. The ui shows this BESIDE the policy, never in
+// place of it: a row that read "Force IPv4" because the heuristic fired could
+// not be set back to Auto.
+func controlFamilyStatus() string {
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+	now := controlFamilyLedger.now()
+	parts := []string{}
+	for _, family := range []int{4, 6} {
+		entry, ok := controlFamilyLedger.demoted[family]
+		if !ok || !now.Before(entry.until) {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf(
+			"IPv%d demoted for %s (%d strikes)",
+			family,
+			entry.until.Sub(now).Round(time.Minute),
+			entry.strikes,
+		))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// probeFamilySupport reports whether this device has a usable global address
+// of the family.
+//
+// NOT nettest.SupportsIPv4/SupportsIPv6: those memoize inside x/net behind a
+// sync.Once, so they answer for whatever network the process started on and
+// never re-evaluate across a wifi/cellular switch. A stale "yes, IPv4 works"
+// is exactly the wrong answer for the guard that keeps a demotion from taking
+// an IPv6-only user offline.
+func probeFamilySupport(family int) bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		// unknown: assume the family is available rather than blocking a
+		// demotion that may be the user's only way onto a working path
+		return true
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok || ipNet.IP == nil || !ipNet.IP.IsGlobalUnicast() {
+			continue
+		}
+		if (ipNet.IP.To4() != nil) == (family == 4) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPathTimeout reports whether err is the post-connect timeout that proves a
+// path is blackholed.
+//
+// Deliberately narrow. A certificate failure, an ALPN mismatch, a refusal or a
+// reset all mean the packets ARRIVED and something at the far end objected --
+// which says nothing about the family. Demoting on those would blame IPv6 for
+// a server misconfiguration and steer every user off a healthy path, which is
+// worse than the bug this exists to fix.
+func isPathTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return false
+}
+
+// connFamily is 4, 6, or 0 when the connection has no usable remote address.
+func connFamily(conn net.Conn) int {
+	if conn == nil {
+		return 0
+	}
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return 0
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return 0
+	}
+	if ip.To4() != nil {
+		return 4
+	}
+	return 6
+}
+
+// test seams. Package-private and restored by the caller.
+func swapControlFamilyClock(now func() time.Time) func() {
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+	prev := controlFamilyLedger.now
+	controlFamilyLedger.now = now
+	return func() {
+		controlFamilyLedger.mu.Lock()
+		defer controlFamilyLedger.mu.Unlock()
+		controlFamilyLedger.now = prev
+	}
+}
+
+func swapControlFamilyProbe(probe func(family int) bool) func() {
+	controlFamilyLedger.mu.Lock()
+	defer controlFamilyLedger.mu.Unlock()
+	prev := controlFamilyLedger.probe
+	controlFamilyLedger.probe = probe
+	return func() {
+		controlFamilyLedger.mu.Lock()
+		defer controlFamilyLedger.mu.Unlock()
+		controlFamilyLedger.probe = prev
+	}
 }
