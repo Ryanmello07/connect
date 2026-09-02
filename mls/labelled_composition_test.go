@@ -102,20 +102,47 @@ func labelledCompositionPaths() []labelledCompositionPath {
 			},
 		},
 		{
-			// the worst of them, because it runs on the RECEIVE path of every signed
-			// message and before any check the application layer could have made.
-			name: "SignWithLabel and VerifyWithLabel over a FramedContentTBS",
+			name: "SignWithLabel over a FramedContentTBS",
 			compose: func(t *testing.T, payload int) []byte {
 				return enormousFramedContentTBS(t, payload)
 			},
 			drive: func(t *testing.T, crypto CryptoProvider, payload int) error {
 				member := testIdentity(t, crypto, "alice")
-				tbs := enormousFramedContentTBS(t, payload)
-				signature, err := crypto.SignWithLabel(member.SigPriv, framedContentTBSLabel, tbs)
+				_, err := crypto.SignWithLabel(member.SigPriv, framedContentTBSLabel,
+					enormousFramedContentTBS(t, payload))
+				return err
+			},
+		},
+		{
+			// THE WORST OF THEM, and it is a row of its own rather than the second half of
+			// the one above for a reason mutation testing found rather than review. Driven
+			// as sign-then-verify, the over long case stops at the SIGN and the verify is
+			// never reached with the value under test: removing the bound from
+			// VerifyWithLabel left that row green. This is the receive path, so it is driven
+			// the way a peer reaches it -- a signature made over something else, arriving
+			// with a preimage this side has not looked at yet.
+			//
+			// At a length that fits, the signature is over this very content and the answer
+			// is nil, so the row also says the refusal is not simply refusing everything.
+			name: "VerifyWithLabel over a FramedContentTBS a peer sent",
+			compose: func(t *testing.T, payload int) []byte {
+				return enormousFramedContentTBS(t, payload)
+			},
+			drive: func(t *testing.T, crypto CryptoProvider, payload int) error {
+				member := testIdentity(t, crypto, "alice")
+				content := enormousFramedContentTBS(t, payload)
+				// signed over what this side CAN sign, which for the over long case is not
+				// the content being verified. A real 64 byte signature either way, so the
+				// length gate above it passes and the preimage is really built.
+				signed := content
+				if len(signed) > syntax.MaxVectorLength {
+					signed = enormousFramedContentTBS(t, 32)
+				}
+				signature, err := crypto.SignWithLabel(member.SigPriv, framedContentTBSLabel, signed)
 				if err != nil {
 					return err
 				}
-				return crypto.VerifyWithLabel(member.SigPub, framedContentTBSLabel, tbs, signature)
+				return crypto.VerifyWithLabel(member.SigPub, framedContentTBSLabel, content, signature)
 			},
 		},
 		{
@@ -131,7 +158,25 @@ func labelledCompositionPaths() []labelledCompositionPath {
 			},
 		},
 		{
-			name: "EncryptWithLabel and DecryptWithLabel over a GroupContext",
+			name: "EncryptWithLabel over a GroupContext",
+			compose: func(t *testing.T, payload int) []byte {
+				return mustMarshalForSize(t, enormousGroupContext(payload))
+			},
+			drive: func(t *testing.T, crypto CryptoProvider, payload int) error {
+				_, pub, err := crypto.DeriveKeyPair(crypto.Random(32))
+				if err != nil {
+					return err
+				}
+				_, _, err = EncryptWithLabel(crypto, pub, "node",
+					mustMarshalForSize(t, enormousGroupContext(payload)), []byte("x"))
+				return err
+			},
+		},
+		{
+			// the open, driven the way the verify above it is and for the same reason: a
+			// seal-then-open row stops at the seal and leaves the receiving half unread,
+			// which is where a peer's context arrives.
+			name: "DecryptWithLabel over a GroupContext a peer sent",
 			compose: func(t *testing.T, payload int) []byte {
 				return mustMarshalForSize(t, enormousGroupContext(payload))
 			},
@@ -141,7 +186,11 @@ func labelledCompositionPaths() []labelledCompositionPath {
 					return err
 				}
 				context := mustMarshalForSize(t, enormousGroupContext(payload))
-				kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, "node", context, []byte("x"))
+				sealed := context
+				if len(sealed) > syntax.MaxVectorLength {
+					sealed = mustMarshalForSize(t, enormousGroupContext(32))
+				}
+				kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, "node", sealed, []byte("x"))
 				if err != nil {
 					return err
 				}
