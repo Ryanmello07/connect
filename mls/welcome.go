@@ -165,10 +165,22 @@ func (self *GroupInfo) Sign(crypto CryptoProvider, priv SignaturePrivateKey) err
 // So the tree a caller passes must come from OUTSIDE THE WELCOME, and outside the WHOLE message
 // rather than outside one field of it. Measured on this build:
 //
-//	an attacker mints its own four leaf tree with every leaf its own, sets
-//	GroupContext.GroupId to whatever the joiner expects, sets GroupContext.TreeHash to its OWN
-//	tree's hash, and signs at its own leaf 0. Verify against the attacker's tree is answered
-//	NIL. Against the honest tree the same object correctly answers ErrWelcomeTreeHashMismatch.
+//	an attacker mints a ONE LEAF tree whose leaf is its own, writes a group context naming
+//	ATTACKER-CHOSEN-GROUP at epoch 1<<40 with GroupContext.TreeHash set to its OWN tree's
+//	hash, and signs at its own leaf 0. Against the attacker's tree,
+//	(*GroupInfo).VerifiedContext -- this method and a decode -- answers no error, and a
+//	proposal cache binds to that group at that epoch. Against the VICTIM'S own four leaf tree
+//	the same object correctly answers ErrWelcomeTreeHashMismatch. Both run from outside this
+//	package, in external_provenance_test.go:
+//	TestBypassBIsClosedOnlyAgainstATreeTheJoinerAlreadyTrusts drives both readings and the
+//	cache binding, and TestADecodedGroupInfoIsNotVouchedForByTheTreeTheJoinerIsAlreadyIn
+//	drives the refusal against the victim's tree on its own.
+//
+// The group id is written down as the ATTACKER'S choice rather than as the joiner's expectation
+// because that is what those two tests set, and naming it so puts the attacker's choice in their
+// failure text. Nothing weaker is being claimed by saying it that way: no rule below reads GroupId
+// at all, so nothing here would treat a group info naming the group the joiner expects any
+// differently.
 //
 // Every rule below passes over that object because every rule below is TRUE of it: a member of
 // that tree did sign that group info about that tree. The forgery is self-consistent, and
@@ -201,13 +213,30 @@ func (self *GroupInfo) Sign(crypto CryptoProvider, priv SignaturePrivateKey) err
 //  2. A SIGNER CREDENTIAL THE JOINER ALREADY TRUSTS, matched against at least one leaf of the
 //     tree, together with (*RatchetTree).ValidateAgainstContext run over that tree by whoever
 //     obtained it, against a group context that came from somewhere the joiner already trusts.
-//     This is the half that actually closes it, and this build does not have it: there is no
-//     authentication service here, so no credential in any leaf means anything to a joiner yet.
+//     This is the half that actually closes it, and this build holds ONE of its two clauses:
+//     ValidateAgainstContext is next door in tree_sync.go, and the credential is not -- there is
+//     no authentication service here, so no credential in any leaf means anything to a joiner
+//     yet.
 //
-// Until 2 exists, NO call site of this method can answer "is this the group I meant to join" --
-// not JoinFromWelcome, not any other parameter list -- and none of them may be written as though
-// it did. The CALLER is the party making the authority claim, and the tree it passes is what
-// says so.
+// WHICH HALF OF 2 IS AVAILABLE NOW, said precisely, because an earlier version of this paragraph
+// said that until 2 exists NO call site of this method could answer "is this the group I meant to
+// join" -- and that is refuted by this doc's own "the tree a caller passes must come from OUTSIDE
+// THE WELCOME" paragraph above, and by a test that passes on this build. What IS here is the
+// RECONCILIATION. A joiner that holds the group's tree from a
+// channel it already trusts passes that tree, and rule 4 below refuses a group info whose context
+// names any other tree with ErrWelcomeTreeHashMismatch; a joiner that holds only the tree hash or
+// the group context from such a channel compares it against this GroupInfo's own before calling;
+// and (*RatchetTree).ValidateAgainstContext is that same question asked of a TREE rather than of a
+// group info. TestBypassBIsClosedOnlyAgainstATreeTheJoinerAlreadyTrusts measures exactly that
+// split, from outside the package: one forged group info, refused against the tree the joiner
+// already had and accepted against the tree its sender supplied.
+//
+// What is MISSING is where a trusted tree comes FROM for a joiner that holds nothing about this
+// group yet, and that is 2's other clause. So a FIRST join off an unauthenticated Welcome cannot be
+// answered here by any parameter list, JoinFromWelcome's included, and must not be written as
+// though it could; a rejoin, or an invitation confirmed out of band, can be, by passing the tree
+// that channel carried. Either way THE CALLER is the party making the authority claim, and the tree
+// it passes is what says so.
 //
 // THE RULES, in the order they run. Each answers a sentinel no other one answers.
 //

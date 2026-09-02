@@ -78,17 +78,44 @@
 // WHAT THE COMPILER HOLDS was measured from package mls_test -- outside mls, which is where every
 // untrusted octet arrives from. The only exported route to a *VerifiedGroupContext is
 // (*GroupInfo).VerifiedContext(crypto, tree); Context answers a COPY; the zero value is refused by
-// NewProposalCache with a named error and its Context is nil; and a composite literal with an
-// element, a write of the field, and a conversion from an identically shaped struct declared out
-// there ALL FAIL TO COMPILE -- "cannot refer to unexported field inner".
+// NewProposalCache with a named error and its Context is nil; and four spellings that would carry a
+// context in from out there are refused by the compiler, EACH WITH ITS OWN DIAGNOSTIC:
 //
-// WHICH OF THOSE A TEST HOLDS, said exactly, because a doc naming one file for all four would be
-// the overclaim this section exists to remove. A compile error is not something a test in this
-// build can assert; what external_provenance_test.go holds from OUTSIDE is the property the three
-// compile errors rest on -- the field is unexported -- together with the single exported door and
-// the zero value's two refusals. The copy is held from INSIDE, in group_context_verified_test.go,
-// by the aliasing test and by the behavioural gate over the compiled method set. So the guarantee
-// against untrusted input holds, and no gate in this package is what holds it.
+//	mls.VerifiedGroupContext{inner: c}
+//	    cannot refer to unexported field inner in struct literal of type mls.VerifiedGroupContext
+//	forged.inner = c
+//	    forged.inner undefined (cannot refer to unexported field inner)
+//	mls.VerifiedGroupContext(shadow{inner: c})
+//	    cannot convert shadow{…} (value of struct type shadow) to type mls.VerifiedGroupContext
+//	(*mls.VerifiedGroupContext)(&shadow{inner: c})
+//	    cannot convert &shadow{…} (value of type *shadow) to type *mls.VerifiedGroupContext
+//
+// ONE DIAGNOSTIC QUOTED FOR ALL FOUR WOULD BE THE OVERCLAIM this section exists to remove, and an
+// earlier version of this paragraph was exactly that. The first two fail on the FIELD REFERENCE.
+// The two conversions fail on CROSS-PACKAGE STRUCT IDENTITY -- a struct declared out there with a
+// field spelled inner is not this struct type, because an unexported field name carries the package
+// that declared it -- which is a different rule answered in different words.
+//
+// WHICH OF THOSE A TEST HOLDS: all of them, and the four refusals DIRECTLY.
+// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler in
+// external_provenance_test.go type checks a synthetic package outside mls, one file per spelling
+// over a shared prologue, and requires each refusal to carry the words that separate it from the
+// others -- "unexported field" and the field's own name for the first two, "cannot convert" and the
+// type's own name for the conversions -- beside a file that differs only in the construction and
+// MUST COMPILE, so a harness that had stopped resolving this package fails rather than reporting
+// clean refusals. The spellings are generated off this type's own field list, so a field renamed,
+// added or exported changes what is compiled rather than leaving the gate watching a name that has
+// moved. An earlier version of this paragraph said a compile error was not something a test in this
+// build could assert, and gave that as the reason the boundary the whole guarantee rests on had no
+// gate; go/types is in the standard library, this package already type checks source through it in
+// four other gates, and this one costs about two and a half seconds.
+//
+// external_provenance_test.go also holds, from OUTSIDE, the property the first two refusals rest on
+// -- the field is unexported -- together with the single exported door and the zero value's two
+// refusals. The copy is held from INSIDE, in group_context_verified_test.go, by the aliasing test
+// and by the behavioural gate over the compiled method set. The COMPILER is still what holds this
+// boundary and no gate in this package is a substitute for it; what the gate adds is that this
+// build notices the day it stops holding.
 //
 // WHAT THE GATES ARE FOR is the one package the compiler does not close. Within package mls an
 // unexported field is visible to the whole package, so &VerifiedGroupContext{inner: x} is ordinary
@@ -116,12 +143,17 @@ import (
 //
 // ONE UNEXPORTED FIELD, AND THAT FIELD IS THE WHOLE MECHANISM -- FOR EVERY PACKAGE BUT THIS ONE.
 // A struct whose only field is unexported cannot be built carrying a value from any other package:
-// mls.VerifiedGroupContext{} compiles out there and is the zero value, which every door refuses,
-// and a literal with an element, a write of the field and a conversion from a struct declared out
-// there with the same shape are all "cannot refer to unexported field inner". That is the whole
-// guarantee and it belongs to the compiler. No test asserts those three refusals directly, because
-// a compile error is not a thing a test in this build can observe; what external_provenance_test.go
-// holds from outside is the property all three rest on, that this field is unexported.
+// mls.VerifiedGroupContext{} compiles out there and is the zero value, which every door refuses; a
+// literal with an element and a write of the field are both "cannot refer to unexported field
+// inner"; and a conversion from a struct declared out there with the same shape, in its value form
+// and in its pointer form, is "cannot convert", which is a DIFFERENT refusal on a different rule --
+// an unexported field name carries the package that declared it, so that struct is not this struct
+// type. That is the whole guarantee and it belongs to the compiler. All four refusals are asserted
+// directly, by compiling them: external_provenance_test.go's
+// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler type checks a
+// synthetic package outside mls, generates the spellings off this type's own field list, and holds
+// each to its own diagnostic beside a file that must compile. The same test file holds from outside
+// the property the first two rest on, that this field is unexported.
 //
 // INSIDE THIS PACKAGE THE FIELD IS ORDINARY, so nothing here is a barrier and the gates over it are
 // a review aid rather than a fence. An earlier version of this paragraph said the constructions

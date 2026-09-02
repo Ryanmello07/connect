@@ -739,11 +739,15 @@ func scribbleOverAGroupContext(context *GroupContext) {
 // TestNeitherWriterOfTheCacheBindingTakesABareGroupContext is the compile time property written
 // down, over the class the write gate already derives rather than over a list.
 //
-// The three bypasses this design replaces are compile errors now, and a compile error is not
-// something a test can report. What a test CAN report is the signature that makes them compile
-// errors, and that is this: no declaration that writes the cache binding takes a *GroupContext at
-// all, and every one of them takes the verified type. A widening back to *GroupContext -- the one
-// edit that would let a decoded context reach the binding again in any spelling -- fails here.
+// The three bypasses this design replaces are compile errors now. A compile error IS reportable --
+// external_provenance_test.go compiles the external forging spellings and observes each refusal in
+// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler -- but that gate
+// stands at the PACKAGE BOUNDARY, and what makes those spellings compile errors in the first place
+// is the signature this test reads: no declaration that writes the cache binding takes a
+// *GroupContext at all, and every one of them takes the verified type. A widening back to
+// *GroupContext -- the one edit that would let a decoded context reach the binding again in any
+// spelling -- fails here, and the external compile gate would not see it at all, because a widened
+// signature compiles perfectly and that gate would go on reporting clean refusals over it.
 func TestNeitherWriterOfTheCacheBindingTakesABareGroupContext(t *testing.T) {
 	written, _ := proposalBindingWritesIn(typeCheckedBodiesOf(t, "."))
 	if len(written) == 0 {

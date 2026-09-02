@@ -44,6 +44,7 @@ package mls_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/importer"
 	"go/parser"
@@ -562,5 +563,289 @@ func TestTheOnlyExportedDoorOntoAVerifiedGroupContextIsAVerifiedGroupInfo(t *tes
 	if !takesATree {
 		t.Errorf("(*GroupInfo).VerifiedContext takes no %s; the signer's public key is not a field of a GroupInfo, so without a tree there is nothing in the call that can say who the members are and the door is the caller vouching for its own octets",
 			tree)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the external boundary, compiled rather than described
+// ---------------------------------------------------------------------------
+
+// The synthetic package the gate below compiles and the file its diagnostics are reported against.
+// Both appear in the failure text, so they are named for what they are.
+const (
+	externalForgingPackage = "outside"
+	externalForgingFile    = "outside.go"
+)
+
+// externalSpelling is one way of writing an mls.VerifiedGroupContext in a package that imports mls,
+// as source that package could actually be written with, together with what the compiler must
+// answer about it.
+type externalSpelling struct {
+	// what this spelling is called in the failure text.
+	name string
+	// the body, appended to a prologue every spelling shares. Sharing the prologue is what makes
+	// the control a control: the file that compiles and the files that do not differ in the
+	// construction and in nothing else, so a diagnostic can only be about the construction.
+	body string
+	// whether the compiler must refuse this file. Exactly one spelling is written to compile.
+	refused bool
+	// substrings every diagnostic must carry. A file that failed to compile for an unrelated
+	// reason -- a moved exported symbol, a typo in the generator below -- reads to a gate that
+	// counts only "was there an error" exactly like the refusal this gate exists to observe. And
+	// the two conversions do NOT fail for the reason the two field spellings fail, so one shared
+	// expectation would let either refusal stand in for the other, which is the overclaim the
+	// paragraph in group_context_verified.go was corrected for.
+	mentions []string
+}
+
+// externalForgingSuite is the whole synthetic corpus, derived once.
+type externalForgingSuite struct {
+	// the type name as the compiler carries it, for the failure text.
+	typeName string
+	// the declarations every spelling is compiled on top of.
+	prologue string
+	// how many unexported fields the type holds, so the caller can say how many refusals it
+	// should have seen without writing the number down.
+	unexported int
+	spellings  []externalSpelling
+}
+
+// externalForgingSpellings derives, from the compiled type, every spelling of a forged verified
+// group context this gate compiles.
+//
+// FROM THE TYPE AND NOT FROM A LIST. What the compiler refuses is a reference to a field of THIS
+// struct, so the two field spellings are generated per field: a field renamed, added, or made
+// exported changes what is compiled here rather than leaving the gate watching a name that has
+// moved. The shadow struct the two conversions convert FROM is rendered off the same field list for
+// the same reason -- a hand written shadow stops having "the same shape" the day a field is added,
+// and a conversion refused because the shapes differ looks exactly like a conversion refused for
+// the reason this gate is about.
+//
+// The field names come from the type linked into this test binary and the refusals come from the
+// source on disk, which are two readings of one package; a build where those had drifted apart
+// fails here rather than reporting on the older of the two.
+func externalForgingSpellings(t *testing.T) externalForgingSuite {
+	t.Helper()
+	held := reflect.TypeOf(mls.VerifiedGroupContext{})
+	if held.Kind() != reflect.Struct {
+		t.Fatalf("mls.%s is a %s rather than a struct, so there is no field for any of these spellings to name",
+			held.Name(), held.Kind())
+	}
+	if held.NumField() == 0 {
+		t.Fatalf("mls.%s holds no field at all, so no spelling an outsider writes could carry a group context in and this gate would compile files about nothing",
+			held.Name())
+	}
+	declarations := []string{}
+	elements := []string{}
+	unexported := []reflect.StructField{}
+	stolenOf := map[string]string{}
+	shadow := []string{"type shadow struct {"}
+	for at := range held.NumField() {
+		field := held.Field(at)
+		stolen := fmt.Sprintf("stolen%d", at)
+		stolenOf[field.Name] = stolen
+		declarations = append(declarations, fmt.Sprintf(
+			"// octets an attacker decoded, for field %s. What it holds is immaterial: the\n"+
+				"// refusals below are decided at the reference to the field, before anything is\n"+
+				"// assigned to it.\nvar %s %s\n", field.Name, stolen, field.Type))
+		elements = append(elements, fmt.Sprintf("%s: %s", field.Name, stolen))
+		shadow = append(shadow, fmt.Sprintf("\t%s %s", field.Name, field.Type))
+		if !field.IsExported() {
+			unexported = append(unexported, field)
+		}
+	}
+	if len(unexported) == 0 {
+		t.Fatalf("every field of mls.%s is exported, so any package that imports mls can build one carrying whatever it decoded and the type establishes nothing whatever",
+			held.Name())
+	}
+	shadow = append(shadow, "}")
+	shadowLiteral := "shadow{" + strings.Join(elements, ", ") + "}"
+
+	prologue := fmt.Sprintf(`package %s
+
+import "github.com/urnetwork/connect/mls"
+
+%s
+// a struct declared OUT HERE with this type's exact shape. Its unexported field is package %s's
+// and not package mls's -- an unexported field name carries the package that declared it -- which
+// is the whole of why the conversions are refused, and it is a DIFFERENT refusal from the two that
+// name the field directly.
+%s
+
+// building one is ordinary go out here and is not the thing under test; the control compiles this
+// line too.
+var _ = %s
+
+`, externalForgingPackage, strings.Join(declarations, "\n"), externalForgingPackage,
+		strings.Join(shadow, "\n"), shadowLiteral)
+
+	// the control first, so a reader of the failure text meets the file that must compile before
+	// the ones that must not.
+	spellings := []externalSpelling{{
+		name: "the legitimate spellings, which must compile",
+		body: fmt.Sprintf(`func spelling(info *mls.GroupInfo, crypto mls.CryptoProvider,
+	tree *mls.RatchetTree) (*mls.GroupContext, error) {
+	// the zero value, which any package may spell and which every door refuses
+	zero := mls.%s{}
+	if zero.Context() != nil {
+		return nil, nil
+	}
+	// the one exported door there is
+	verified, err := info.VerifiedContext(crypto, tree)
+	if err != nil {
+		return nil, err
+	}
+	return verified.Context(), nil
+}
+`, held.Name()),
+		refused: false,
+	}}
+	for _, field := range unexported {
+		spellings = append(spellings, externalSpelling{
+			name: fmt.Sprintf("a composite literal naming %s", field.Name),
+			body: fmt.Sprintf(`func spelling() mls.%s {
+	return mls.%s{%s: %s}
+}
+`, held.Name(), held.Name(), field.Name, stolenOf[field.Name]),
+			refused:  true,
+			mentions: []string{"unexported field", field.Name},
+		}, externalSpelling{
+			name: fmt.Sprintf("a write of %s", field.Name),
+			body: fmt.Sprintf(`func spelling() mls.%s {
+	forged := mls.%s{}
+	forged.%s = %s
+	return forged
+}
+`, held.Name(), held.Name(), field.Name, stolenOf[field.Name]),
+			refused:  true,
+			mentions: []string{"unexported field", field.Name},
+		})
+	}
+	spellings = append(spellings, externalSpelling{
+		name: "a conversion from an identically shaped struct",
+		body: fmt.Sprintf(`func spelling() mls.%s {
+	return mls.%s(%s)
+}
+`, held.Name(), held.Name(), shadowLiteral),
+		refused:  true,
+		mentions: []string{"cannot convert", held.Name()},
+	}, externalSpelling{
+		name: "a conversion from a pointer to an identically shaped struct",
+		body: fmt.Sprintf(`func spelling() *mls.%s {
+	return (*mls.%s)(&%s)
+}
+`, held.Name(), held.Name(), shadowLiteral),
+		refused:  true,
+		mentions: []string{"cannot convert", held.Name()},
+	})
+	return externalForgingSuite{
+		typeName:   held.Name(),
+		prologue:   prologue,
+		unexported: len(unexported),
+		spellings:  spellings,
+	}
+}
+
+// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler is the external
+// boundary ASSERTED rather than described.
+//
+// It exists because a paragraph written to stop this package overclaiming claimed LESS than the
+// code delivers: it said a compile error was not a thing a test in this build could observe, and
+// gave that as the reason the property the entire guarantee rests on had no gate of its own.
+// go/types is in the standard library, this package already type checks source through it in four
+// other gates, and the whole of this one costs about two and a half seconds.
+//
+// WHAT IT IS NOT is a matcher over this package's AST. The language already decides whether an
+// outsider may name an unexported field, and a walk asking the same question of syntax would be
+// re-deriving the compiler's answer badly. This gate's job is to notice the day that answer
+// CHANGES -- a field exported by accident, the type moved somewhere its field is reachable, a
+// constructor added that hands the inner pointer out -- and the only way to notice is to compile
+// the spellings and look at what comes back.
+//
+// THE POSITIVE CONTROL IS THE LOAD BEARING PART. Files that fail to compile are also what a gate
+// whose import path had gone stale, whose synthetic source held a typo, or whose importer could not
+// resolve this package at all would produce, and every one of those reads as a set of clean
+// refusals. So the control shares the whole prologue with the rest, differs from them only in the
+// construction, and MUST compile: it exercises the one exported door and the zero value, so a build
+// where either had moved fails here rather than passing quietly.
+//
+// EACH REFUSAL IS HELD TO ITS OWN DIAGNOSTIC. The two field spellings fail on the field reference
+// and the two conversions fail on cross-package struct identity, which is different text about a
+// different rule; a gate that asked only "was there an error" would let either one stand in for the
+// other, and the doc that quoted one diagnostic for all of them was corrected in the same commit as
+// this test.
+//
+// IT DOES NOT ENUMERATE THE SPELLINGS and must not be read as doing so. Five rounds of review here
+// each ended with a reviewer holding a construction the round before had not written down. What
+// this holds is that these -- the ones a reader tries first -- are each refused today, and that a
+// change which made any of them compile is reported rather than found a round later.
+//
+// ONE NEIGHBOURING CASE IS DELIBERATELY NOT THIS GATE'S, and that was measured rather than
+// reasoned about: an EXPORTED field ADDED BESIDE the unexported one leaves every spelling here
+// still refused, so this gate passes over it. What fails then is
+// TestTheZeroVerifiedGroupContextIsTheOnlyOneAnOutsiderCanSpell above, which refuses any exported
+// field at all -- the stronger rule, and the older one. The two are not redundant: that one reads
+// the TYPE, this one reads what a package importing it may WRITE.
+func TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler(t *testing.T) {
+	suite := externalForgingSpellings(t)
+	fileSet := token.NewFileSet()
+	// one importer for every check: it carries a cache, so package mls and everything it imports
+	// are read off disk once rather than once per spelling. Measured, that is about two seconds
+	// for the first check and about a tenth of a second for each of the rest.
+	shared := importer.ForCompiler(fileSet, "source", nil)
+	compiled, refused := 0, 0
+	for _, spelling := range suite.spellings {
+		source := suite.prologue + spelling.body
+		file, err := parser.ParseFile(fileSet, externalForgingFile, source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("%q did not parse, so this gate compiled nothing about it: %v\n%s",
+				spelling.name, err, source)
+		}
+		diagnostics := []string{}
+		config := types.Config{
+			Importer: shared,
+			Error:    func(err error) { diagnostics = append(diagnostics, err.Error()) },
+		}
+		_, checkErr := config.Check(externalForgingPackage, fileSet, []*ast.File{file}, nil)
+		if !spelling.refused {
+			if checkErr != nil || len(diagnostics) != 0 {
+				t.Fatalf("%q is this gate's positive control and must compile from outside mls; it answered %v %s. Every refusal this gate reports would read the same way if the harness had stopped resolving package mls at all, so a control that does not compile makes the rest of the run mean nothing.\n%s",
+					spelling.name, checkErr, strings.Join(diagnostics, "; "), source)
+			}
+			compiled += 1
+			continue
+		}
+		if len(diagnostics) == 0 {
+			t.Errorf("%q COMPILED from outside mls. A package importing this one can now build an mls.%s carrying whatever it decoded off the wire, so the type says nothing about anybody's authority and every door that takes one is back to trusting its caller's octets.\n%s",
+				spelling.name, suite.typeName, source)
+			continue
+		}
+		wrong := false
+		for _, one := range diagnostics {
+			for _, want := range spelling.mentions {
+				if !strings.Contains(one, want) {
+					wrong = true
+					t.Errorf("%q was refused with %q, which does not mention %q. A file refused for some other reason counts as a refusal to a gate that only asks whether the compiler complained, and this one is here to observe THIS refusal.\n%s",
+						spelling.name, one, want, source)
+				}
+			}
+		}
+		if wrong {
+			continue
+		}
+		refused += 1
+		for _, one := range diagnostics {
+			t.Logf("%s: %s", spelling.name, one)
+		}
+	}
+	if compiled != 1 {
+		t.Errorf("%d of this gate's %d files were written to compile, want exactly 1; without one that compiles a harness that resolves nothing reports a clean run",
+			compiled, len(suite.spellings))
+	}
+	// the count is derived rather than written down: two spellings per unexported field, plus the
+	// two conversions, which is what the generator above builds off the type's own field list.
+	if want := 2*suite.unexported + 2; refused != want {
+		t.Errorf("%d spellings were refused with the diagnostic this gate expects and mls.%s holds %d unexported fields, which is %d spellings; a field with no refusal of its own is a field nothing here watched",
+			refused, suite.typeName, suite.unexported, want)
 	}
 }
