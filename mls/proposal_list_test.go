@@ -974,7 +974,7 @@ func testRemoveProposal(removed LeafIndex) *Proposal {
 // constructor refusing.
 func testCacheAt(t *testing.T, groupContext *GroupContext) *ProposalCache {
 	t.Helper()
-	cache, err := NewProposalCache(groupContext)
+	cache, err := NewProposalCache(testVerifiedContextAt(t, groupContext))
 	if err != nil {
 		t.Fatalf("NewProposalCache(epoch %d of group %x): %v", groupContext.Epoch, groupContext.GroupId, err)
 	}
@@ -1291,7 +1291,7 @@ func TestCheckEpochAnswersTheBindingAndRebindMovesIt(t *testing.T) {
 		t.Errorf("CheckEpoch for another group = %v, want errProposalCacheNotRebound", err)
 	}
 	at8 := testResolveContextAt([]byte("group"), 8)
-	if err := cache.Rebind(at8); err != nil {
+	if err := cache.Rebind(testVerifiedContextAt(t, at8)); err != nil {
 		t.Fatalf("Rebind to epoch 8: %v", err)
 	}
 	if err := cache.CheckEpoch(at8); err != nil {
@@ -1344,7 +1344,7 @@ func TestTheCachedGroupIdIsCutFromTheCallersArrayAndNotAliasedToIt(t *testing.T)
 		t.Errorf("CheckEpoch for what the caller's array now holds = %v, want errProposalCacheNotRebound", err)
 	}
 	rebound := []byte("second")
-	if err := cache.Rebind(testResolveContextAt(rebound, 9)); err != nil {
+	if err := cache.Rebind(testVerifiedContextAt(t, testResolveContextAt(rebound, 9))); err != nil {
 		t.Fatalf("Rebind: %v", err)
 	}
 	for i := range rebound {
@@ -1389,7 +1389,7 @@ func TestAReplayedProposalOfAClosedEpochNeitherBindsTheCacheNorLocksOutTheLiveEp
 	}
 
 	// the boundary
-	if err := cache.Rebind(live); err != nil {
+	if err := cache.Rebind(testVerifiedContextAt(t, live)); err != nil {
 		t.Fatalf("Rebind to epoch 8: %v", err)
 	}
 
@@ -1519,7 +1519,7 @@ func TestACacheBoundToNothingRefusesRatherThanBindingItselfLater(t *testing.T) {
 	}
 	// and it becomes usable the one way it can
 	live := testResolveContext()
-	if err := cache.Rebind(live); err != nil {
+	if err := cache.Rebind(testVerifiedContextAt(t, live)); err != nil {
 		t.Fatalf("Rebind: %v", err)
 	}
 	if _, err := cache.Store(crypto, live, testProposalContent(t, crypto, LeafIndex(1),
@@ -2160,7 +2160,7 @@ func TestAnEmptyCacheStillBelongsToTheEpochItWasBoundToAndNamesTheRightRefusal(t
 	cache := testCache(t)
 	ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 	at2 := testResolveContextAt([]byte("group"), 2)
-	if err := cache.Rebind(at2); err != nil {
+	if err := cache.Rebind(testVerifiedContextAt(t, at2)); err != nil {
 		t.Fatalf("Rebind: %v", err)
 	}
 	named := []ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: ref}}

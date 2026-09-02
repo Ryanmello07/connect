@@ -531,7 +531,7 @@ func epochEnderArgument(checked checkedBodies, call *ast.CallExpr) ast.Expr {
 	params := signature.Params()
 	found := -1
 	for at := 0; at < params.Len(); at++ {
-		if !extensionTypeSelectionNamedAs(params.At(at).Type(), epochGroupContextTypeName) {
+		if !epochEnderCarriesTheContext(params.At(at).Type()) {
 			continue
 		}
 		if found != -1 {
@@ -545,6 +545,30 @@ func epochEnderArgument(checked checkedBodies, call *ast.CallExpr) ast.Expr {
 		return nil
 	}
 	return call.Args[found]
+}
+
+// epochEnderCarriesTheContext reports whether one parameter of an ender is the group context a
+// boundary moved to.
+//
+// The type name is matched by SUFFIX rather than by equality, and that is a correction rather
+// than a loosening. The real ender takes a *VerifiedGroupContext -- a group context whose
+// authority has been established -- while the control below takes a bare *GroupContext, and both
+// are the parameter this rule is about. Matching the exact name would read the real ender as
+// declaring none, and the caller reads "declares none" as an ender nothing can say the binding
+// came from, so every boundary that is in fact correct would be refused for a reason its author
+// could not act on. The suffix is what the two spellings share and what any later wrapper of a
+// group context would share too.
+func epochEnderCarriesTheContext(found types.Type) bool {
+	for {
+		pointer, isPointer := found.(*types.Pointer)
+		if !isPointer {
+			break
+		}
+		found = pointer.Elem()
+	}
+	named, isNamed := found.(*types.Named)
+	return isNamed && named.Obj() != nil &&
+		strings.HasSuffix(named.Obj().Name(), epochGroupContextTypeName)
 }
 
 // epochArgumentText names what an ender was handed, for a report a reader can act on rather than
@@ -1610,7 +1634,7 @@ var proposalCacheBindingWriters = map[string]epochBindingWriterRow{
 			cache := testCacheAt(t, at1)
 			ref := testStoredRemove(t, crypto, cache, LeafIndex(1), LeafIndex(4))
 			at2 := testResolveContextAt([]byte("group"), 2)
-			if err := cache.Rebind(at2); err != nil {
+			if err := cache.Rebind(testVerifiedContextAt(t, at2)); err != nil {
 				t.Fatalf("Rebind: %v", err)
 			}
 			if err := cache.CheckEpoch(at2); err != nil {
@@ -1847,12 +1871,22 @@ func TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere(t *testing.T) {
 		}
 		contexts := 0
 		for at := 1; at < method.Type.NumIn(); at++ {
-			if method.Type.In(at) == reflect.TypeOf(&GroupContext{}) {
+			// the VERIFIED context and not the bare one. An ender takes a group context
+			// whose authority has been established -- the type whose only constructor is
+			// (*KeySchedule).ConfirmGroupContext -- because a binding is only worth the
+			// authority of the value it was taken from, and every *GroupContext names some
+			// epoch whoever wrote the octets chose. An ender that widened back to the bare
+			// type is a door onto the epoch this cache believes it is in, and it fails here.
+			if method.Type.In(at) == reflect.TypeOf(&VerifiedGroupContext{}) {
 				contexts++
+			}
+			if method.Type.In(at) == reflect.TypeOf(&GroupContext{}) {
+				t.Errorf("%s is classified as ending the epoch binding and takes a bare *%s; that is a claim about a struct's fields and not about anybody's authority, and this package decodes one straight off peer octets",
+					name, epochGroupContextTypeName)
 			}
 		}
 		if contexts != 1 {
-			t.Errorf("%s takes %d *%s parameters and the argument half of the mover gate reads exactly one, which is the context it holds a boundary to having moved to; with none, or with two, that half is vacuous",
+			t.Errorf("%s takes %d *Verified%s parameters and the argument half of the mover gate reads exactly one, which is the context it holds a boundary to having moved to; with none, or with two, that half is vacuous",
 				name, contexts, epochGroupContextTypeName)
 		}
 	}

@@ -2244,6 +2244,21 @@ var keyScheduleMethodArgumentRows = map[string]func(schedule *KeySchedule) [][]r
 	"VerifyMembershipTag": func(schedule *KeySchedule) [][]reflect.Value {
 		return [][]reflect.Value{{reflect.ValueOf(tagSweepTbm), reflect.ValueOf(schedule.MembershipTag(tagSweepTbm))}}
 	},
+	// group_context_verified.go's constructor, driven rather than excused for the reason
+	// Export is. It answers a *VerifiedGroupContext, whose only field is unexported, so the
+	// flattener reads no octets out of it at all -- and that is exactly the fact worth
+	// DRIVING rather than writing down as an excuse, because a constructor that grew an
+	// exported field, or that started answering the context by pointer into something this
+	// type keeps, would begin handing storage out and this sweep would see it.
+	//
+	// The row carries the schedule's own tag, read back off the bytes the epoch expanded
+	// over, because the accepting path is the only one that answers anything to read: a
+	// refused call answers nil, and every row these sweeps are built from has to succeed.
+	"ConfirmGroupContext": func(schedule *KeySchedule) [][]reflect.Value {
+		decoded := &GroupContext{}
+		_ = syntax.Unmarshal(schedule.GroupContextBytes(), decoded)
+		return [][]reflect.Value{{reflect.ValueOf(schedule.ConfirmationTag(decoded.ConfirmedTranscriptHash))}}
+	},
 }
 
 // tagSweepTranscriptHash is the confirmed_transcript_hash the sweeps drive the confirmation
@@ -2344,6 +2359,20 @@ func exposedByteSlices(t *testing.T, what string, result reflect.Value) []expose
 		// derivation that answers over one.
 		return nil
 	}
+	// a value whose whole storage sits behind an UNEXPORTED field, which is the one shape the
+	// field walk below reads as empty rather than as unreadable -- and empty is exactly the
+	// clean run a leak reports. VerifiedGroupContext is that shape on purpose: the unexported
+	// field is what makes the type unforgeable outside this package, so the sweep goes through
+	// the accessor, which is the whole of what any caller can reach through one. Read as an
+	// ordinary pointer to a struct it would contribute nothing, and this gate would be silent
+	// about every byte an epoch handed out through it.
+	if result.Type() == reflect.TypeOf((*VerifiedGroupContext)(nil)) {
+		if result.IsNil() {
+			return nil
+		}
+		confirmed, _ := result.Interface().(*VerifiedGroupContext)
+		return exposedByteSlices(t, what+".Context()", reflect.ValueOf(confirmed.Context()))
+	}
 	if result.Kind() == reflect.Pointer && result.Type().Elem().Kind() == reflect.Struct {
 		if result.IsNil() {
 			return nil
@@ -2358,6 +2387,41 @@ func exposedByteSlices(t *testing.T, what string, result reflect.Value) []expose
 				exposedByteSlices(t, what+"."+element.Type().Field(i).Name, element.Field(i))...)
 		}
 		return exposed
+	}
+	// a struct held by VALUE, which is the same reading as the pointer above one indirection
+	// in. GroupContext's extensions are a vector of them, so without this arm the one answer
+	// that reaches this sweep through an accessor would stop at the vector.
+	if result.Kind() == reflect.Struct {
+		exposed := []exposedSlice{}
+		for i := range result.NumField() {
+			if !result.Type().Field(i).IsExported() {
+				continue
+			}
+			exposed = append(exposed,
+				exposedByteSlices(t, what+"."+result.Type().Field(i).Name, result.Field(i))...)
+		}
+		return exposed
+	}
+	// a vector of something that is not octets, read element by element. The octet case is
+	// answered above, so what lands here is a vector of structures, and a secret parked in one
+	// is as reachable as a secret parked in a field.
+	if result.Kind() == reflect.Slice {
+		exposed := []exposedSlice{}
+		for i := range result.Len() {
+			exposed = append(exposed,
+				exposedByteSlices(t, fmt.Sprintf("%s[%d]", what, i), result.Index(i))...)
+		}
+		return exposed
+	}
+	// a fixed width scalar cannot BE KDF.Nh octets however it is set, so there is nothing here
+	// for guardrail 6 to compare. It is read as nothing rather than refused, because refusing
+	// it would make an answer that carries a protocol version beside its secrets unreadable as
+	// a WHOLE -- which is how a real leak ends up outside the sweep, one field along from a
+	// number nobody cared about.
+	switch result.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return nil
 	}
 	t.Fatalf("%s answers a %s, which this sweep cannot read for bytes; extend it rather than letting a new result shape fall outside guardrail 6",
 		what, result.Type())
@@ -3648,15 +3712,12 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 			_, err := NewKeyScheduleFromEpochSecret(crypto, secret, context)
 			return err
 		},
-		// p7 task 6's proposal cache, which is in this class for a reason of its own: the
-		// context it is handed IS the epoch binding, so a constructor that accepted a nil
-		// one would answer a cache bound to nothing -- and a cache bound to nothing is the
-		// state in which the epoch has to come from somewhere, which is where a replayed
-		// proposal used to supply it.
-		"NewProposalCache": func(context *GroupContext) error {
-			_, err := NewProposalCache(context)
-			return err
-		},
+		// p7 task 6's proposal cache used to be in this class and is deliberately not any
+		// more. It takes a *VerifiedGroupContext now -- a group context whose authority has
+		// been established, whose only constructor is (*KeySchedule).ConfirmGroupContext --
+		// so it is no longer a constructor over a *GroupContext at all, and the class this
+		// gate derives is what says so rather than this comment. Its own nil refusal is
+		// still held, by the derived nil argument sweep next door.
 	}
 	found := keyScheduleConstructorsOverAGroupContext(t)
 	if got := slices.Sorted(maps.Keys(covered)); !slices.Equal(got, slices.Sorted(slices.Values(found))) {
@@ -3965,6 +4026,11 @@ var constructionsWhoseAnswerOnlyCoincidesWithKdfNh = map[string]string{
 var scheduleAnswersThatAreNotKdfLengths = map[exposedAnswerAt]string{
 	{method: "ExternalKeyPair", result: 0}: "the hpke private key, which is Nsk; X25519 fixes it at 32 and the narrow suite's KDF.Nh is also 32, so the equality is that suite's coincidence rather than anything this method did, and a kdf getting wider does not make an X25519 key wider",
 	{method: "ExternalKeyPair", result: 1}: "the hpke public key, which is Npk; the same coincidence at 32 and the same reason a wider kdf does not widen it",
+	{method: "ConfirmGroupContext", result: 0}: "the group context this epoch was derived over, read through " +
+		"the confirmed value's accessor. Its group id is whoever created the group's, and its two hashes are " +
+		"the suite's HASH size rather than its KDF.Nh -- the same number for every suite this build runs and " +
+		"a different quantity, so a comparison against a kdf length here would be pinning a coincidence. " +
+		"Nothing in it is a secret: the same octets go out inside every GroupInfo",
 }
 
 // scheduleStorageReaders is how this gate reads each byte slice a *KeySchedule keeps behind

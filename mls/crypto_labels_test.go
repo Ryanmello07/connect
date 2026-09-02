@@ -673,6 +673,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"framing_protect.go: syntax.NewReader(plaintext)",
 		"framing_protect.go: syntax.NewWriter()",
 		"framing_protect.go: syntax.Unmarshal(plaintext, senderData)",
+		// the group context a confirmed epoch answers, decoded back out of the bytes that
+		// epoch's own secrets were expanded over. The default limit and no other: these are
+		// bytes this build produced by marshalling a GroupContext of its own, so a raised
+		// bound here would be raising a limit for a value that never came off a wire -- and
+		// if it ever needs one, the encoder that produced them is the place that says so.
+		"group_context_verified.go: syntax.Unmarshal(self.groupContextBytes, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure
 		// encode its Encode reaches, and the decode both Parse entry points reach. All six at the
 		// default limit and none at the ratchet tree one, and here that is the strictest reading

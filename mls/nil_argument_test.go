@@ -396,8 +396,10 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		}},
 		// the cache's own constructor, which is the first half of where the epoch binding
 		// comes from. A nil context here would otherwise answer a cache bound to nothing,
-		// which is the one state in which a message can supply the epoch
-		"NewProposalCache(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+		// which is the one state in which a message can supply the epoch. It takes a
+		// *VerifiedGroupContext rather than a *GroupContext, so the OTHER half of that
+		// question -- whose context it is -- is the compiler's rather than a gate's
+		"NewProposalCache(verified)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
 			_, err := NewProposalCache(nil)
 			return err
 		}},
@@ -421,7 +423,7 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		"(*ProposalCache).CheckEpoch(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
 			return testCache(t).CheckEpoch(nil)
 		}},
-		"(*ProposalCache).Rebind(groupContext)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+		"(*ProposalCache).Rebind(verified)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
 			return testCache(t).Rebind(nil)
 		}},
 		// the same cache's resolution, whose group context is the parameter that lets it

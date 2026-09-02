@@ -876,7 +876,7 @@ func TestRebindReleasesTheOctetsAndTheSenderQuotasWithTheEntries(t *testing.T) {
 		t.Fatal("the cache counted no octets for an entry it holds, so the release below observes nothing")
 	}
 	next := testResolveContextAt([]byte("group"), 2)
-	if err := cache.Rebind(next); err != nil {
+	if err := cache.Rebind(testVerifiedContextAt(t, next)); err != nil {
 		t.Fatalf("Rebind: %v", err)
 	}
 	if cache.octets != 0 {

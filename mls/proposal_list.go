@@ -664,55 +664,40 @@ type proposalCacheBinding struct {
 // truncated prefix answer the same entry, so a commit naming one member's removal applies
 // another member's, under a reference every peer checks and agrees with.
 //
-// THE BINDING IS WRITTEN OUT OF A *GroupContext THE WRITING DECLARATION WAS HANDED. It is written
-// in exactly two places -- NewProposalCache and Rebind -- and no method assigns it;
+// THE BINDING IS WRITTEN OUT OF A *VerifiedGroupContext THE WRITING DECLARATION WAS HANDED. It
+// is written in exactly two places -- NewProposalCache and Rebind -- and no method assigns it;
 // TestEveryWriteOfTheCacheBindingReadsTheCallersGroupContext derives that class off the source and
-// holds every member of it to reading a group context parameter and nothing else.
+// holds every member of it to reading a verified context parameter and nothing else.
 //
-// THAT IS A RULE ABOUT THE WRITE AND NOT ABOUT THE CALLER, and the difference is exactly what this
-// paragraph used to get wrong. It said "there is no code path in which a peer's octets decide which
-// epoch this cache belongs to", and at the scope it was stated that sentence is FALSE. The gate
-// demands that the value be read off a *GroupContext the declaration was handed, which is a fact
-// about the TYPE of the value; and this package decodes a GroupContext straight off peer octets --
-// (*GroupInfo).UnmarshalMLS calls decoded.GroupContext.UnmarshalMLS, and group_context.go then
-// writes GroupId and Epoch out of the reader. A GroupInfo marshalled with an attacker's group id and
-// an epoch of 1<<40, round tripped, and its &decoded.GroupContext handed to NewProposalCache binds
-// this cache to exactly that pair with both gates green, because the write did read a *GroupContext
-// parameter. A GroupInfo is what a joiner is handed inside a Welcome, so that is the shape of the
-// next task on this path rather than a hypothesis.
+// THE OTHER HALF -- where the CALLER got that value -- IS THE COMPILER'S NOW, and that is the
+// whole of what changed here. It used to be a gate: an AST walk over every call of a binding
+// writer, refusing an argument whose chain of selections reached a type this package decodes. It
+// was written three times and bypassed three times, each time by ordinary Go a reader would write
+// on purpose -- a local struct holding a copy of the decoded context, an accessor method returning
+// an inner field, an embedded wire type whose promoted selection the walk could not see. The
+// paragraph that used to be here told a reader to copy the context they had verified into their
+// own state and bind from that, and the second bypass is that advice written out.
+// group_context_verified.go carries the argument in full.
 //
-// SO THE CALLER'S HALF IS A GATE OF ITS OWN AND NOT A SENTENCE HERE.
-// TestNoDeclarationOfThisPackageBindsTheCacheToAGroupContextItSelectedOutOfAWireType derives the
-// wire types of this package -- every named type declaring an UnmarshalMLS, which is the one codec
-// convention this package pins -- and accepts a binding writer's group context argument only when
-// the whole chain down to its root crossed no such type AND the root is a value the calling
-// declaration was HANDED. It refuses a verified GroupInfo's context as well as an unverified one,
-// and that is deliberate: the two are the same expression at the call, so a rule that let one
-// through could not be checked. A Welcome path that has verified a GroupInfo copies the context into
-// the group's own state -- (*GroupContext).Clone is there for it -- and binds from that, which is
-// the difference between a value this client vouches for and one it merely parsed.
+// So the demand is stated as a TYPE. A *VerifiedGroupContext is buildable only by
+// (*KeySchedule).ConfirmGroupContext, whose own signature carries no group context at all: it
+// answers the context THIS EPOCH'S SCHEDULE WAS DERIVED OVER, once a confirmation tag proves a
+// holder of the epoch's confirmation key named it. A GroupInfo a joiner decoded cannot be handed
+// to either writer, and neither can any laundering of one, because none of them is that type --
+// they stop COMPILING rather than stopping a gate. What a caller still owes is the tag, and the
+// tag is not something an attacker can supply for a context of its choosing: the confirmation key
+// is one DeriveSecret off an epoch_secret expanded over the context itself, so a changed group id
+// or epoch derives a different key and the tag it was handed stops verifying.
 //
-// BOTH HALVES OF THAT RULE ARE THERE BECAUSE ONE OF THEM WAS NOT ENOUGH. The gate read only the
-// ROOT of the chain, so one local structure between the decode and the bind passed it -- and passed
-// it with a LOG LINE saying the laundering was acceptable:
-//
-//	type joinStateMutation struct{ context GroupContext }
-//	state := joinStateMutation{context: info.GroupContext}
-//	NewProposalCache(&state.context)
-//
-// The sharp part is that the paragraph above tells a reader to copy the verified context into their
-// own state and bind from that, and the bypass is that advice written out. What separates them is
-// not in the expression, so the rule demands the root be something the CALLER chose and refuses
-// everything else -- which is what makes the advice checkable: a group's own state is reached
-// through the group, and a group is a parameter or a receiver.
-//
-// WHAT THAT RULE STILL CANNOT SEE is stated in the gate rather than left for the next reviewer. It
-// reads one declaration at a time, so a helper that returns a decoded context is refused for being
-// unattributable rather than recognised, and a body that writes a decoded epoch into a FIELD of the
-// context it was handed is outside the rule entirely -- the field write is the epoch mover's own
-// required shape, so no rule stated here can refuse it. The gate is a tripwire on the shapes a
-// lifecycle actually gets written in, and the precondition it cannot express is the one this
-// paragraph states: the value handed to either writer must be one this client vouches for.
+// WHAT THAT DOES NOT REACH is stated here rather than left for the next reviewer, because the
+// gate it replaces overstated itself twice. A declaration inside package mls can still write the
+// field of a VerifiedGroupContext, since the field is unexported rather than unreachable, so the
+// class of declarations that BUILD one is derived off the source and held to a table by
+// TestEveryConstructionOfAVerifiedGroupContextIsClassifiedHere. That is a different question from
+// the one the deleted gate failed at: who constructs a named type is a property of source shape --
+// a composite literal or a write of the field, and Go has no third spelling -- while where a value
+// came from is not. And confirmation says nothing about whether the context is CORRECT: the tree
+// hash, the transcript and the signer's entitlement are validations of their own.
 //
 // It was the other way round, and the other way round is a denial of service, which is why this
 // paragraph is here. The binding used to be taken from the first entry STORED and checked against
@@ -777,17 +762,22 @@ type ProposalCache struct {
 // spelling of the write Rebind owns and a reader counting the places the binding is written
 // counts two rather than three.
 //
-// IT REFUSES A NIL CONTEXT rather than answering a cache bound to nothing, and that is not a rule
-// of this file: TestEveryConstructorOverAGroupContextRefusesANilOne derives the class of exported
-// package level functions over a *GroupContext off this package's source and holds every one of
-// them to ErrNilGroupContext. It is also the right rule here for a reason of this cache's own. A
-// cache bound to nothing is the one state in which the epoch has to come from somewhere else, and
-// a constructor that answered one would hand that state to every caller that did not read an
-// error. The zero value is still that state -- Go's convention for a container leaves it usable --
-// and it is safe for the reason bindingHolds gives: it refuses at every door.
-func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
-	if groupContext == nil {
-		return nil, fmt.Errorf("%w: a cache is built bound to the epoch its group is in", ErrNilGroupContext)
+// IT TAKES A *VerifiedGroupContext AND NOT A *GroupContext, which is the whole of what says whose
+// epoch this is. Every *GroupContext names some epoch and this package decodes one straight off
+// peer octets, so the bare type is a claim about a struct's fields rather than about anybody's
+// authority; the verified type is buildable only by (*KeySchedule).ConfirmGroupContext, and a
+// decoded context cannot reach here in any spelling because it is the wrong type.
+//
+// IT REFUSES A CONTEXT THAT VOUCHES FOR NOTHING -- no value at all, or the zero value another
+// package can spell -- rather than answering a cache bound to nothing. A cache bound to nothing
+// is the one state in which the epoch has to come from somewhere else, and a constructor that
+// answered one would hand that state to every caller that did not read an error. The zero value
+// of the cache is still that state -- Go's convention for a container leaves it usable -- and it
+// is safe for the reason bindingHolds gives: it refuses at every door.
+func NewProposalCache(verified *VerifiedGroupContext) (*ProposalCache, error) {
+	if verified == nil || verified.inner == nil {
+		return nil, fmt.Errorf("%w: a cache is built bound to the epoch its group is in, and only a context this client has confirmed says which epoch that is",
+			ErrNilGroupContext)
 	}
 	return &ProposalCache{
 		byRef:           map[string]CachedProposal{},
@@ -795,8 +785,8 @@ func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
 		perSender:       map[proposalCacheQuota]int{},
 		perLeaf:         map[proposalCacheLeafQuota]int{},
 		binding: &proposalCacheBinding{
-			groupId: bytes.Clone(groupContext.GroupId),
-			epoch:   groupContext.Epoch,
+			groupId: bytes.Clone(verified.inner.GroupId),
+			epoch:   verified.inner.Epoch,
 		},
 	}, nil
 }
@@ -812,7 +802,9 @@ func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
 //
 // It answers a refusal rather than binding to nothing when it is handed no context, for the same
 // reason: the one thing a rebind must not be able to do is leave the cache with no epoch and a
-// door open.
+// door open. It takes a *VerifiedGroupContext for NewProposalCache's reason, and the two together
+// are why no gate over the callers is needed any more -- a context decoded off a peer's octets is
+// not that type, so it cannot be handed to either of them however it is spelled.
 //
 // THE CEILING ARITHMETIC IS RELEASED WITH THE ENTRIES, in the same statement list, because the two
 // are one fact. A boundary that emptied byRef and kept the octet total or the per sender quotas
@@ -831,9 +823,12 @@ func NewProposalCache(groupContext *GroupContext) (*ProposalCache, error) {
 // method never runs again. Nothing here heals it, which is why the demand is a GATE and not a
 // sentence: TestEveryDeclarationThatMovesAGroupToAnotherEpochEndsTheProposalCacheBinding reads
 // which context each boundary's rebind is handed, and on which side of the write, off the source.
-func (self *ProposalCache) Rebind(groupContext *GroupContext) error {
-	if groupContext == nil {
-		return fmt.Errorf("%w: a cache takes its epoch from the group's own context and from nothing else",
+// The type cannot answer that half and does not try: a verified context of the epoch that is
+// CLOSING is exactly as verified as one of the epoch being entered, so which of the two a
+// boundary hands over stays a question about the call and not about the value.
+func (self *ProposalCache) Rebind(verified *VerifiedGroupContext) error {
+	if verified == nil || verified.inner == nil {
+		return fmt.Errorf("%w: a cache takes its epoch from a context this client has confirmed and from nothing else",
 			ErrNilGroupContext)
 	}
 	self.byRef = map[string]CachedProposal{}
@@ -843,8 +838,8 @@ func (self *ProposalCache) Rebind(groupContext *GroupContext) error {
 	self.perSender = map[proposalCacheQuota]int{}
 	self.perLeaf = map[proposalCacheLeafQuota]int{}
 	self.binding = &proposalCacheBinding{
-		groupId: bytes.Clone(groupContext.GroupId),
-		epoch:   groupContext.Epoch,
+		groupId: bytes.Clone(verified.inner.GroupId),
+		epoch:   verified.inner.Epoch,
 	}
 	return nil
 }
