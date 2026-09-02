@@ -74,6 +74,9 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		MinNextConnectDelay: 100 * time.Millisecond,
 		MaxNextConnectDelay: 1000 * time.Millisecond,
 
+		Http2SendPingTimeout: 10 * time.Second,
+		Http2PingTimeout:     5 * time.Second,
+
 		ConnectSettings: *DefaultConnectSettings(),
 	}
 	// A configured process budget identifies an embedded/mobile client. Bound
@@ -155,6 +158,18 @@ type ClientStrategySettings struct {
 	Http2MaxEncoderHeaderTableSize     int
 	Http2MaxReceiveBufferPerConnection int
 	Http2MaxReceiveBufferPerStream     int
+
+	// HTTP/2 health check for POOLED control-plane connections. Go performs no
+	// health check at all when SendPingTimeout is zero (net/http.HTTP2Config:
+	// "If zero, no health check is performed"), so a connection that connected
+	// cleanly and later went dark stays in the idle pool and every later
+	// request multiplexed onto it hangs to the request timeout.
+	//
+	// Settings fields rather than package constants, per CONSTANTAUDIT.md:
+	// they are per-connection tunables and the settings struct that owns the
+	// transport reaches the use site directly.
+	Http2SendPingTimeout time.Duration
+	Http2PingTimeout     time.Duration
 
 	// retry a GET whose RESPONSE status is in `GetRetryStatusCodes` —
 	// transient gateway statuses meaning the lb momentarily had no healthy
@@ -1383,16 +1398,31 @@ func (self *clientDialer) HttpClient() *http.Client {
 			// multiplexes those requests over the established connection.
 			ForceAttemptHTTP2: true,
 		}
+		// A control-plane connection that went dark AFTER connecting is
+		// invisible to any dial-time policy: http/2 multiplexes every later
+		// request onto it and each one hangs to the request timeout, for as
+		// long as the idle pool holds it. Go performs NO health check when
+		// SendPingTimeout is zero (net/http.HTTP2Config: "If zero, no health
+		// check is performed"), which is what leaves that connection in the
+		// pool. The ping is what turns a silent pool poisoning into an
+		// eviction.
+		//
+		// Built unconditionally. The memory-budget fields below are set only
+		// when an embedder asked for them -- that guard is about the mobile
+		// heap -- but it used to gate the whole config, so a desktop build had
+		// no HTTP2Config at all and therefore no health check either.
+		transport.HTTP2 = &http.HTTP2Config{
+			SendPingTimeout: self.settings.Http2SendPingTimeout,
+			PingTimeout:     self.settings.Http2PingTimeout,
+		}
 		if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
 			0 < self.settings.Http2MaxEncoderHeaderTableSize ||
 			0 < self.settings.Http2MaxReceiveBufferPerConnection ||
 			0 < self.settings.Http2MaxReceiveBufferPerStream {
-			transport.HTTP2 = &http.HTTP2Config{
-				MaxDecoderHeaderTableSize:     self.settings.Http2MaxDecoderHeaderTableSize,
-				MaxEncoderHeaderTableSize:     self.settings.Http2MaxEncoderHeaderTableSize,
-				MaxReceiveBufferPerConnection: self.settings.Http2MaxReceiveBufferPerConnection,
-				MaxReceiveBufferPerStream:     self.settings.Http2MaxReceiveBufferPerStream,
-			}
+			transport.HTTP2.MaxDecoderHeaderTableSize = self.settings.Http2MaxDecoderHeaderTableSize
+			transport.HTTP2.MaxEncoderHeaderTableSize = self.settings.Http2MaxEncoderHeaderTableSize
+			transport.HTTP2.MaxReceiveBufferPerConnection = self.settings.Http2MaxReceiveBufferPerConnection
+			transport.HTTP2.MaxReceiveBufferPerStream = self.settings.Http2MaxReceiveBufferPerStream
 		}
 		// a custom dial context applies to plain (non-tls) connections;
 		// tls connections use the dialTlsContext chain above

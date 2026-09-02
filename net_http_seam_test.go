@@ -193,3 +193,49 @@ func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) 
 		t.Fatalf("resolved %v, want exactly [tcp4] under IpFamilyForce4", networks)
 	}
 }
+
+// A pooled connection that connected cleanly and later went dark is invisible
+// to any dial-time logic: http/2 multiplexes every later request onto it, and
+// with no health check each one hangs to the request timeout. Go's default for
+// HTTP2Config.SendPingTimeout is zero, which its own doc defines as "no health
+// check is performed".
+//
+// This also pins that the config is built on EVERY platform. It used to be
+// built only under the mobile memory guard, so desktop had no HTTP2Config at
+// all and therefore no health check either.
+func TestHttpClientConfiguresHttp2HealthCheck(t *testing.T) {
+	settings := DefaultClientStrategySettings()
+	dialer := &clientDialer{
+		dialTlsContext:     newNormalDialTlsContext(settings, clientWebSocketNextProtos),
+		httpDialTlsContext: newNormalDialTlsContext(settings, clientHttpNextProtos),
+		settings:           settings,
+	}
+	client := dialer.HttpClient()
+	defer client.CloseIdleConnections()
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type %T", client.Transport)
+	}
+	if transport.HTTP2 == nil {
+		t.Fatal("no HTTP2Config: a pooled dead connection is never detected")
+	}
+	// asserted against the SETTINGS, not against bare literals: the durations
+	// are tunable fields, so a test that pinned 10s/5s directly would fail an
+	// embedder that legitimately tuned them, and would stop testing that the
+	// transport is wired to the settings at all
+	if settings.Http2SendPingTimeout <= 0 {
+		t.Fatal("the default Http2SendPingTimeout is zero, which disables the health check")
+	}
+	if settings.Http2PingTimeout <= 0 {
+		t.Fatal("the default Http2PingTimeout is zero")
+	}
+	if transport.HTTP2.SendPingTimeout != settings.Http2SendPingTimeout {
+		t.Fatalf("SendPingTimeout is %s, want the settings value %s",
+			transport.HTTP2.SendPingTimeout, settings.Http2SendPingTimeout)
+	}
+	if transport.HTTP2.PingTimeout != settings.Http2PingTimeout {
+		t.Fatalf("PingTimeout is %s, want the settings value %s",
+			transport.HTTP2.PingTimeout, settings.Http2PingTimeout)
+	}
+}
