@@ -282,7 +282,7 @@ func newNormalDialTlsContext(
 		// DialContext preserves injected userspace networks in tests and proxy
 		// routing in production before wrapping the resulting connection in TLS.
 		return dialControlTlsWithFamilyFallback(
-			ctx, network, addr, settings.DialContext, handshake)
+			ctx, &settings.ConnectSettings, network, addr, settings.DialContext, handshake)
 	}
 }
 

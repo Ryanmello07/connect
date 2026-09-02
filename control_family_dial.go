@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"net"
+	"time"
 )
 
 // dialControlTlsWithFamilyFallback performs a control-plane dial and its
@@ -15,36 +16,52 @@ import (
 // Eyeballs cannot see it: it races only the tcp handshake, so the broken family
 // WINS the race and then stalls.
 //
-// The first handshake gets the caller's WHOLE remaining budget. An earlier
-// version gave it half, so that a retry would always fit; that quietly
-// shortened the tls handshake tolerance the spec had considered and declined
-// to shorten ("it would risk false-positive demotion for users on genuinely
-// slow links"), and by far more than the spec had contemplated -- the platform
-// control websocket's dial context is capped at HandshakeTimeout, 5s, so the
-// first handshake got 2.5s and any handshake slower than that was read as
-// proof of a blackholed path. A congested mobile link with a pinned P-384
-// chain reaches 2.5s without anything being wrong.
-//
 // A timeout that arrives with the caller's own budget already spent is NOT
 // counted: that is a request running out of time, which says nothing about
 // the family, and there would be no time to retry either way. What remains to
-// trigger a demotion is a handshake that hits its OWN timeout (TlsTimeout, the
-// tolerance the spec set) while the caller still has budget left, which is
-// also the only case where a retry has anywhere to run.
+// trigger a demotion is a handshake that hits its OWN timeout while the caller
+// still has budget left, which is also the only case where a retry has
+// anywhere to run.
 //
-// KNOWN LIMIT, and it needs a spec decision rather than a silent workaround.
-// Both production entry points give this helper a caller deadline at or below
-// TlsTimeout, so on both of them the caller's deadline is what a stalled
-// handshake hits and no demotion is recorded: http.Client.Timeout is
-// RequestTimeout (15s, and it starts before the dial does) for the api path,
-// and gorilla/websocket caps its dial context at Dialer.HandshakeTimeout (5s)
-// for the platform control websocket. The spec asks for two things that cannot
-// both hold at those budgets -- a tls handshake tolerance left at 15s, and an
-// in-place retry that fits inside the caller's own budget. Closing it means
-// either raising the control websocket's handshake budget above TlsTimeout so
-// the handshake's own timeout is the binding one, or amending the spec to
-// state a first-attempt floor. Dividing the caller's budget, which is what
-// this code used to do, is the one answer the spec rules out.
+// WHAT THAT OWN TIMEOUT IS, and why it is not TlsTimeout. Both production
+// entry points hand this helper a caller deadline at or below TlsTimeout:
+// http.Client.Timeout is RequestTimeout (15s, and it starts before the dial
+// does) on the api path, and gorilla/websocket caps its dial context at
+// Dialer.HandshakeTimeout (5s) on the platform control websocket. A handshake
+// bounded only by TlsTimeout therefore never reaches its own timeout -- the
+// caller's deadline always arrives first, the branch above declines the
+// strike, and the retry never runs at all.
+//
+// So the first handshake is bounded by ControlFamilyFirstHandshakeTimeout, and
+// THAT is the timeout a stalled handshake hits. It is a floor, not a fraction:
+// an earlier version halved whatever the caller had left, which shortened the
+// tls tolerance the spec had considered and declined to shorten ("it would
+// risk false-positive demotion for users on genuinely slow links") and did it
+// hardest exactly where the budget was smallest -- 2.5s on the control
+// websocket, which a congested mobile link reaches with a pinned P-384 chain
+// and nothing wrong. A fixed 8s cannot scale down like that, and it is larger
+// than the entire budget in which a shipping platform websocket dial already
+// completes a connect, this handshake and an http upgrade.
+//
+// THE BOUND IS APPLIED ONLY WHERE TWO ATTEMPTS FIT: the caller must still have
+// ControlFamilyFirstHandshakeTimeout + ControlFamilyRetryReserve left when the
+// handshake starts. A bound that produces a timeout with no room to retry is
+// strictly worse than no bound -- it converts a request that would have kept
+// waiting into one that fails early and learns nothing. Below that threshold
+// the first handshake keeps the caller's whole remaining budget and this
+// helper behaves exactly as it did before the bound existed.
+//
+// That threshold is also the whole of the api-path/websocket split. The api
+// path arrives with ~15s and is bounded; the control websocket arrives with
+// 5s, which is under 8s + 5s, so it is never bounded and its handshake
+// tolerance is left alone. The websocket does not need a retry of its own: the
+// demotion ledger is process-global (control_family.go), read inside every
+// dial through controlDialNetwork and pickControlIPAddr, so a demotion learned
+// on the api path is already in force for the control websocket, the h3/quic
+// name path and the extenders. One path with enough budget is enough to LEARN;
+// every path benefits. Raising the websocket's HandshakeTimeout instead would
+// change a shared transport timeout for every user to buy a second attempt on
+// a path that already inherits the answer.
 //
 // Exactly one retry, and only to the other family. The caller already sits
 // inside the client strategy's serial and parallel dialer evaluation under a
@@ -54,6 +71,7 @@ import (
 // is also not a family problem, and the original error is returned unwrapped.
 func dialControlTlsWithFamilyFallback(
 	ctx context.Context,
+	settings *ConnectSettings,
 	network string,
 	addr string,
 	dial DialContextFunction,
@@ -71,7 +89,15 @@ func dialControlTlsWithFamilyFallback(
 	// we are about to lose is the whole point of the exercise.
 	failed := connFamily(conn)
 
-	tlsConn, err := handshake(ctx, conn)
+	// The bound goes on the handshake and NOT on the connect. The connect has
+	// its own budget (ConnectTimeout) and its own second chance
+	// (redialWithoutAContradictedDemotion, below), which a shortened context
+	// would leave with a dead deadline to dial on. Measuring what is left here
+	// rather than before the dial is also the honest reading: it is the budget
+	// the retry will actually inherit.
+	handshakeCtx, handshakeCancel := firstHandshakeContext(ctx, settings)
+	tlsConn, err := handshake(handshakeCtx, conn)
+	handshakeCancel()
 	if err == nil {
 		return tlsConn, nil
 	}
@@ -94,9 +120,11 @@ func dialControlTlsWithFamilyFallback(
 	if failed == 0 {
 		return nil, err
 	}
-	// the timeout has to be the handshake's own. A caller whose budget is
-	// gone gets no strike and no retry -- the strike records what this helper
-	// is about to test, and it cannot test anything with no time left.
+	// the timeout has to be the handshake's own -- the bound above, or
+	// TlsTimeout when there was no room to apply one. The CALLER's context is
+	// what is tested, never the bounded one: a caller whose budget is gone
+	// gets no strike and no retry, because the strike records what this helper
+	// is about to test and it cannot test anything with no time left.
 	if ctx.Err() != nil {
 		return nil, err
 	}
@@ -127,6 +155,37 @@ func dialControlTlsWithFamilyFallback(
 		return nil, err
 	}
 	return retryTlsConn, nil
+}
+
+// firstHandshakeContext bounds the first handshake of a control dial to
+// ControlFamilyFirstHandshakeTimeout, so that a retry over the other family
+// fits inside the caller's own budget -- and returns the caller's context
+// unchanged when it does not fit.
+//
+// A context with NO deadline is bounded: an unbounded caller has room for two
+// attempts by definition, and leaving it unbounded is the one shape where a
+// stalled handshake would hang until the kernel gave up, which is minutes.
+func firstHandshakeContext(
+	ctx context.Context,
+	settings *ConnectSettings,
+) (context.Context, context.CancelFunc) {
+	noBound := func() (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
+	if settings == nil {
+		return noBound()
+	}
+	bound := settings.ControlFamilyFirstHandshakeTimeout
+	reserve := settings.ControlFamilyRetryReserve
+	if bound <= 0 || reserve <= 0 {
+		return noBound()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) < bound+reserve {
+			return noBound()
+		}
+	}
+	return context.WithTimeout(ctx, bound)
 }
 
 // redialWithoutAContradictedDemotion is the only route back from a demotion

@@ -30,6 +30,10 @@ func DefaultConnectSettings() *ConnectSettings {
 			Interval: 5 * time.Second,
 			Count:    1,
 		},
+
+		ControlFamilyFirstHandshakeTimeout: 8 * time.Second,
+		ControlFamilyRetryReserve:          5 * time.Second,
+
 		TlsConfig: tlsConfig,
 	}
 }
@@ -47,6 +51,52 @@ type ConnectSettings struct {
 	IdleConnTimeout  time.Duration
 	KeepAliveTimeout time.Duration
 	KeepAliveConfig  net.KeepAliveConfig
+
+	// ControlFamilyFirstHandshakeTimeout bounds the FIRST tls handshake of a
+	// control dial (dialControlTlsWithFamilyFallback) so that the retry over
+	// the other address family has somewhere to run inside the caller's own
+	// budget. It is what a stalled handshake hits instead of the caller's
+	// deadline, and hitting it is what records a demotion.
+	//
+	// A FLOOR, not a fraction of the caller's budget. A fraction scales down
+	// with the caller and turns a merely slow handshake into "this family is
+	// blackholed" -- halving the platform control websocket's 5s gave the
+	// first handshake 2.5s, which a congested mobile link reaches with a
+	// pinned P-384 chain and nothing wrong. A fixed floor cannot do that: 8s
+	// is more than the whole of `HandshakeTimeout`, and `HandshakeTimeout` is
+	// the budget in which every shipping platform websocket dial already
+	// completes a tcp connect, this same tls handshake AND an http upgrade.
+	// A handshake past 8s is one this product already treats as failed
+	// everywhere else.
+	//
+	// It is deliberately NOT `TlsTimeout`: at 15s it is at or above every
+	// production caller's own budget, so nothing ever reaches it and the
+	// retry never runs (see dialControlTlsWithFamilyFallback).
+	//
+	// <= 0 disables the bound; the first handshake then gets the caller's
+	// whole remaining budget.
+	ControlFamilyFirstHandshakeTimeout time.Duration
+
+	// ControlFamilyRetryReserve is how much of the caller's budget must
+	// remain AFTER a bounded first handshake before the bound is applied at
+	// all. Below `ControlFamilyFirstHandshakeTimeout + ControlFamilyRetryReserve`
+	// the first handshake is left unbounded, because a bound that produces a
+	// timeout with no room to retry is strictly worse than no bound: it turns
+	// a request that would have kept waiting into one that fails early.
+	//
+	// `HandshakeTimeout`'s 5s again, for the same reason: it is this
+	// codebase's own statement of what a COMPLETE control dial needs, so a
+	// retry given that much is given as much as a whole production websocket
+	// dial gets.
+	//
+	// This is also what keeps the bound off the platform control websocket.
+	// gorilla caps that dial context at `HandshakeTimeout`, and 5s is less
+	// than 8s + 5s, so it is never bounded and its handshake tolerance is
+	// untouched. It does not need its own retry: the demotion ledger is
+	// process-global, so what the api path learns is already in force here.
+	//
+	// <= 0 disables the bound.
+	ControlFamilyRetryReserve time.Duration
 
 	TlsConfig *tls.Config
 

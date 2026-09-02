@@ -135,7 +135,7 @@ func newResilientDialTlsContext(
 		// gone -- the exact stall this feature exists to remove, with an empty
 		// ledger to show for it.
 		return dialControlTlsWithFamilyFallback(
-			ctx, "tcp", addr, connectSettings.DialContext, handshake)
+			ctx, connectSettings, "tcp", addr, connectSettings.DialContext, handshake)
 	}
 }
 

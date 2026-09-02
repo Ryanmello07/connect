@@ -40,7 +40,7 @@ func TestFamilyFallbackRecoversFromAPostConnectTimeout(t *testing.T) {
 	}
 
 	conn, err := dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestFamilyFallbackRetriesOnlyOnce(t *testing.T) {
 	}
 
 	_, err := dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if err == nil {
 		t.Fatal("expected the second failure to be returned")
 	}
@@ -108,7 +108,7 @@ func TestFamilyFallbackDoesNotRetryANonTimeout(t *testing.T) {
 	}
 
 	_, err := dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if !errors.Is(err, certErr) {
 		t.Fatalf("got %v, want the certificate error unwrapped", err)
 	}
@@ -137,7 +137,7 @@ func TestFamilyFallbackDoesNotRetryAnExplicitFamily(t *testing.T) {
 	}
 
 	_, _ = dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp6", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp6", "api.example:443", dial, handshake)
 	if attempts != 1 {
 		t.Fatalf("dialed %d times, want 1 for an explicit tcp6", attempts)
 	}
@@ -180,7 +180,7 @@ func TestFamilyFallbackReadsTheFamilyBeforeTheConnectionIsClosed(t *testing.T) {
 	}
 
 	conn, err := dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,25 +213,45 @@ func (self *forgetfulConn) Close() error {
 	return nil
 }
 
-// The first handshake gets the caller's WHOLE remaining budget.
+// The platform control websocket's handshake tolerance is left alone: on its
+// budget the first handshake still gets the caller's WHOLE remaining time.
 //
-// It used to get half. The spec's out-of-scope list rules on this directly --
-// of shortening the 15s tls handshake tolerance: "Considered and declined: it
-// would risk false-positive demotion for users on genuinely slow links" -- and
-// halving the caller's budget did exactly that, implicitly and much harder
-// than the version that was declined. gorilla/websocket caps the dial context
-// at Dialer.HandshakeTimeout, which DefaultConnectSettings sets to 5s, so on
-// the platform control websocket -- the path that reconnects most often -- the
-// first handshake was cut at 2.5s and a timeout inside it was treated as proof
-// the family is blackholed.
-func TestFamilyFallbackGivesTheFirstHandshakeTheWholeCallerBudget(t *testing.T) {
+// gorilla/websocket caps the dial context at Dialer.HandshakeTimeout, 5s, and
+// 5s is below ControlFamilyFirstHandshakeTimeout + ControlFamilyRetryReserve,
+// so the bound is never applied here -- there is no room for a second attempt
+// to run in, and a bound that produced a timeout with nowhere to retry would
+// only make this path fail sooner than it does today. It loses nothing by it:
+// the demotion ledger is process-global, so the demotion the api path has the
+// budget to LEARN is already in force for this dial.
+//
+// The first handshake used to get half the caller's budget on every path. The
+// spec's out-of-scope list rules on that directly -- of shortening the 15s tls
+// handshake tolerance: "Considered and declined: it would risk false-positive
+// demotion for users on genuinely slow links" -- and halving did exactly that,
+// implicitly and hardest where the budget was smallest: 2.5s here, on the path
+// that reconnects most often, with a timeout inside it read as proof the
+// family is blackholed.
+func TestFamilyFallbackLeavesTheWebsocketBudgetUnbounded(t *testing.T) {
 	restore := swapControlFamilyProbe(func(int) bool { return true })
 	defer restore()
 	controlFamilyClear()
 	defer controlFamilyClear()
 
-	// 5s is the platform control websocket's real budget
-	callerCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// the platform control websocket's real budget, read from the settings
+	// gorilla is handed rather than restated
+	settings := DefaultConnectSettings()
+	if settings.HandshakeTimeout >=
+		settings.ControlFamilyFirstHandshakeTimeout+settings.ControlFamilyRetryReserve {
+		t.Fatalf(
+			"the websocket's %s budget now reaches the %s+%s bound threshold -- "+
+				"the first handshake on the control websocket is about to be cut short, "+
+				"which is the false positive the spec declined",
+			settings.HandshakeTimeout,
+			settings.ControlFamilyFirstHandshakeTimeout,
+			settings.ControlFamilyRetryReserve,
+		)
+	}
+	callerCtx, cancel := context.WithTimeout(context.Background(), settings.HandshakeTimeout)
 	defer cancel()
 	callerDeadline, _ := callerCtx.Deadline()
 
@@ -260,7 +280,7 @@ func TestFamilyFallbackGivesTheFirstHandshakeTheWholeCallerBudget(t *testing.T) 
 	}
 
 	conn, err := dialControlTlsWithFamilyFallback(
-		callerCtx, "tcp", "api.example:443", dial, handshake)
+		callerCtx, settings, "tcp", "api.example:443", dial, handshake)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +331,7 @@ func TestFamilyFallbackDoesNotDemoteASlowHandshakeOnTheWebsocketBudget(t *testin
 	}
 
 	_, err := dialControlTlsWithFamilyFallback(
-		callerCtx, "tcp", "api.example:443", dial, handshake)
+		callerCtx, DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if err == nil {
 		t.Fatal("expected the timeout back")
 	}
@@ -366,7 +386,7 @@ func TestFamilyFallbackRecoversFromAHandshakeThatStallsToItsOwnDeadline(t *testi
 	}
 
 	conn, err := dialControlTlsWithFamilyFallback(
-		callerCtx, "tcp", "api.example:443", dial, handshake)
+		callerCtx, DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if err != nil {
 		t.Fatalf("%v -- the stalled first attempt left the retry no budget", err)
 	}
@@ -404,7 +424,7 @@ func TestFamilyFallbackDoesNotDemoteWhenTheCallersBudgetRanOut(t *testing.T) {
 	}
 
 	_, err := dialControlTlsWithFamilyFallback(
-		callerCtx, "tcp", "api.example:443", dial, handshake)
+		callerCtx, DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want the caller's deadline error", err)
 	}
@@ -465,7 +485,7 @@ func TestFamilyFallbackUndoesADemotionThatCannotConnect(t *testing.T) {
 	}
 
 	conn, err := dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if err != nil {
 		t.Fatalf("%v -- the demotion steered the dial onto a family with no route "+
 			"and nothing could undo it", err)
@@ -505,7 +525,7 @@ func TestFamilyFallbackDoesNotUndoAForce(t *testing.T) {
 	}
 
 	_, err := dialControlTlsWithFamilyFallback(
-		context.Background(), "tcp", "api.example:443", dial, handshake)
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 	if !errors.Is(err, dialErr) {
 		t.Fatalf("got %v, want the dial error", err)
 	}
@@ -551,7 +571,7 @@ func TestFamilyFallbackRollsBackTheStrikeWhenTheRetryAlsoFails(t *testing.T) {
 			}
 
 			_, err := dialControlTlsWithFamilyFallback(
-				context.Background(), "tcp", "api.example:443", dial, handshake)
+				context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 			if err == nil {
 				t.Fatal("expected the original error back")
 			}
@@ -592,7 +612,7 @@ func TestFamilyFallbackDoesNotWriteTheLedgerUnderAForce(t *testing.T) {
 		}
 
 		_, err := dialControlTlsWithFamilyFallback(
-			context.Background(), "tcp", "api.example:443", dial, handshake)
+			context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
 		if err == nil {
 			t.Fatal("expected the timeout back")
 		}
@@ -712,5 +732,282 @@ func TestResilientDialGoesThroughTheFamilyFallback(t *testing.T) {
 	if len(dialed) != 2 || dialed[0] != "tcp" || dialed[1] != "tcp4" {
 		t.Fatalf("dialed %v, want [tcp tcp4] -- the resilient dialer still "+
 			"handshakes inline with no family classification and no retry", dialed)
+	}
+}
+
+// THE POINT OF THE WHOLE FEATURE, on the budget the api path actually has.
+//
+// A handshake bounded only by TlsTimeout can never reach its own timeout: at
+// 15s it is at or above every production caller's budget, so the caller's
+// deadline always arrives first, the ctx.Err() branch declines the strike, and
+// the retry never runs. The demotion trigger was configured out of existence.
+//
+// ControlFamilyFirstHandshakeTimeout is what a stalled handshake hits instead,
+// and this pins that it leaves a retry a real amount of time to run in --
+// ControlFamilyRetryReserve at the very least -- on the api path's own
+// RequestTimeout budget, with the shipping defaults and not test-sized ones.
+func TestFamilyFallbackBoundsTheFirstHandshakeOnTheApiBudget(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	// http.Client.Timeout is RequestTimeout on every api dialer (HttpClient),
+	// and serialEval bounds the whole request by the same value
+	settings := DefaultConnectSettings()
+	callerCtx, cancel := context.WithTimeout(context.Background(), settings.RequestTimeout)
+	defer cancel()
+	callerDeadline, _ := callerCtx.Deadline()
+
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		if network == "tcp4" {
+			return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}}, nil
+		}
+		return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}, nil
+	}
+	var mutex sync.Mutex
+	deadlines := []time.Time{}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("the handshake was given a context with no deadline")
+		}
+		mutex.Lock()
+		deadlines = append(deadlines, deadline)
+		mutex.Unlock()
+		if connFamily(conn) == 6 {
+			return nil, &timeoutError{}
+		}
+		return conn, nil
+	}
+
+	conn, err := dialControlTlsWithFamilyFallback(
+		callerCtx, settings, "tcp", "api.example:443", dial, handshake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := connFamily(conn); got != 4 {
+		t.Fatalf("returned an IPv%d connection, want IPv4", got)
+	}
+	if controlFamilyDemotedFamily() != 6 {
+		t.Fatal("expected ipv6 to be demoted -- the handshake hit a timeout of its own")
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(deadlines) != 2 {
+		t.Fatalf("handshaked %d times, want 2", len(deadlines))
+	}
+	// the retry's budget: what the caller still had when the bound expired
+	left := callerDeadline.Sub(deadlines[0])
+	if left < settings.ControlFamilyRetryReserve {
+		t.Fatalf(
+			"the first handshake was given %s of the caller's %s, leaving %s for a "+
+				"retry -- want at least %s held back, or a stall simply ends at the "+
+				"caller's own deadline and nothing is learned",
+			time.Until(deadlines[0]),
+			settings.RequestTimeout,
+			left,
+			settings.ControlFamilyRetryReserve,
+		)
+	}
+	// and it is the floor that bounded it, not some fraction of the caller
+	bounded := time.Until(deadlines[0])
+	slack := 2 * time.Second
+	if bounded < settings.ControlFamilyFirstHandshakeTimeout-slack ||
+		settings.ControlFamilyFirstHandshakeTimeout+slack < bounded {
+		t.Fatalf(
+			"the first handshake got %s, want ~%s (ControlFamilyFirstHandshakeTimeout)",
+			bounded, settings.ControlFamilyFirstHandshakeTimeout)
+	}
+	// the retry gets the rest of the caller's budget, unbounded
+	if !deadlines[1].Equal(callerDeadline) {
+		t.Fatalf("the retry's deadline was %s, want the caller's own %s",
+			deadlines[1].Format(time.RFC3339Nano), callerDeadline.Format(time.RFC3339Nano))
+	}
+}
+
+// End to end, with a handshake that really stalls: it now ends at the bound
+// with the caller's budget still alive, which is the one state that records a
+// strike and runs the retry. Before the bound existed this stall ran to the
+// caller's own deadline and produced nothing -- no strike, no retry, no
+// connection.
+//
+// Test-sized durations: the shape is what is under test, and the shipping
+// values are pinned against the real budgets by the two tests either side.
+func TestFamilyFallbackDemotesAStallThatOutlastsTheBound(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	settings := DefaultConnectSettings()
+	settings.ControlFamilyFirstHandshakeTimeout = 250 * time.Millisecond
+	settings.ControlFamilyRetryReserve = 100 * time.Millisecond
+
+	// far above the bound plus the reserve, so two attempts fit
+	callerCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var mutex sync.Mutex
+	var dialed []string
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		mutex.Lock()
+		dialed = append(dialed, network)
+		mutex.Unlock()
+		if network == "tcp4" {
+			return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}}, nil
+		}
+		return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}, nil
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		if connFamily(conn) == 6 {
+			// the blackhole: the ClientHello goes out and nothing comes back,
+			// so this ends only when something times it out
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return conn, nil
+	}
+
+	start := time.Now()
+	conn, err := dialControlTlsWithFamilyFallback(
+		callerCtx, settings, "tcp", "api.example:443", dial, handshake)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("%v -- the stall ran past the bound and left the retry no budget", err)
+	}
+	if got := connFamily(conn); got != 4 {
+		t.Fatalf("returned an IPv%d connection, want IPv4", got)
+	}
+	if controlFamilyDemotedFamily() != 6 {
+		t.Fatal("expected ipv6 to be demoted by the stall")
+	}
+	if 2*time.Second < elapsed {
+		t.Fatalf("took %s -- the stall ended at the caller's deadline, not at the bound",
+			elapsed)
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(dialed) != 2 || dialed[0] != "tcp" || dialed[1] != "tcp4" {
+		t.Fatalf("dialed %v, want [tcp tcp4]", dialed)
+	}
+}
+
+// The bound is a tolerance, not a target. A handshake that is slow but WORKING
+// finishes inside it and must be returned, with no strike: a demotion narrows
+// every control dial in the process for five minutes, and being on a congested
+// link is not evidence of a blackhole.
+//
+// This is the failure mode of the deleted implementation, which took a
+// FRACTION of the caller's budget instead of a floor, and so shrank the
+// tolerance exactly where the caller had least to give.
+func TestFamilyFallbackDoesNotDemoteAHandshakeThatFinishesInsideTheBound(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	settings := DefaultConnectSettings()
+	settings.ControlFamilyFirstHandshakeTimeout = 500 * time.Millisecond
+	settings.ControlFamilyRetryReserve = 100 * time.Millisecond
+
+	// 800ms is over the 600ms threshold, so the bound applies -- and under
+	// twice the bound, so HALF of it (400ms) is less than the bound. The
+	// handshake below lands between the two: inside the floor, outside the
+	// fraction the deleted implementation would have allowed.
+	callerCtx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+
+	attempts := 0
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}, nil
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		// slow, and inside the bound: a congested link with a pinned P-384
+		// chain, not a path that drops large packets
+		select {
+		case <-time.After(450 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return conn, nil
+	}
+
+	conn, err := dialControlTlsWithFamilyFallback(
+		callerCtx, settings, "tcp", "api.example:443", dial, handshake)
+	if err != nil {
+		t.Fatalf("%v -- a slow but working handshake was cut short by the bound", err)
+	}
+	if got := connFamily(conn); got != 6 {
+		t.Fatalf("returned an IPv%d connection, want the IPv6 one that worked", got)
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1 -- nothing failed", attempts)
+	}
+	if got := controlFamilyDemotedFamily(); got != 0 {
+		t.Fatalf("ipv%d was demoted by a handshake that succeeded", got)
+	}
+}
+
+// A caller without room for two attempts is not bounded at all. The bound
+// exists to hold budget back for a retry; where there is no retry to hold it
+// back for, taking it is pure loss -- it would end a request that was still
+// waiting, earlier than it would have ended, and learn nothing for it.
+//
+// This is what keeps the bound off the platform control websocket (5s, under
+// the 8s + 5s threshold) and off every dialer the client strategy reaches
+// after the first has already spent part of the request budget.
+func TestFamilyFallbackDoesNotBoundACallerWithNoRoomForTwoAttempts(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	settings := DefaultConnectSettings()
+	settings.ControlFamilyFirstHandshakeTimeout = 400 * time.Millisecond
+	settings.ControlFamilyRetryReserve = 200 * time.Millisecond
+
+	// below the 600ms threshold, above the bound on its own -- the shape that
+	// would be bounded if only the bound, and not the reserve, were consulted
+	callerCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	callerDeadline, _ := callerCtx.Deadline()
+
+	attempts := 0
+	var handshakeDeadline time.Time
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}, nil
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		handshakeDeadline, _ = ctx.Deadline()
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	_, err := dialControlTlsWithFamilyFallback(
+		callerCtx, settings, "tcp", "api.example:443", dial, handshake)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want the caller's own deadline error", err)
+	}
+	if !handshakeDeadline.Equal(callerDeadline) {
+		t.Fatalf(
+			"the handshake was bounded to %s, %s short of the caller's own %s -- "+
+				"there was no room for a retry, so the single attempt must get everything",
+			handshakeDeadline.Format(time.RFC3339Nano),
+			callerDeadline.Sub(handshakeDeadline),
+			callerDeadline.Format(time.RFC3339Nano),
+		)
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1", attempts)
+	}
+	if got := controlFamilyDemotedFamily(); got != 0 {
+		t.Fatalf("ipv%d was demoted by the caller's own budget expiring", got)
 	}
 }
