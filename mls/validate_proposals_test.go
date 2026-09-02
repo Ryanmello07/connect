@@ -2,6 +2,7 @@ package mls
 
 import (
 	"errors"
+	"go/ast"
 	"maps"
 	"reflect"
 	"runtime"
@@ -504,31 +505,77 @@ func TestEveryRuleTheAggregateRunsHasARowAndEveryRowIsARuleItRuns(t *testing.T) 
 	}
 }
 
-// TestValidateProposalListRunsEveryValSemThisFileDeclares derives the thirteen codes from the
-// source rather than counting them here.
+// proposalListRulesDeclared is every rule validate_proposals.go declares, read off the SIGNATURE
+// rather than off a name.
 //
-// The plan names ValSem101 to ValSem113 and the aggregate holds them in a slice literal. A slice
-// literal is a transcription, and the failure it has on this project is the quiet one: a code
-// declared, exported, documented and never run. So the class is every package level ValSem
-// function validate_proposals.go declares, and each must appear in exactly one group.
-func TestValidateProposalListRunsEveryValSemThisFileDeclares(t *testing.T) {
-	declared := packageLevelDeclarations(t, ".")
-	fromFile := []string{}
-	for name, file := range declared {
-		if file == "validate_proposals.go" && strings.HasPrefix(name, "ValSem") {
-			fromFile = append(fromFile, name)
+// The shape is the class: a package level function taking one *ProposalValidationInput and
+// answering one error is a rule of this file and there is nothing else it could be. Deriving on
+// the ValSem prefix instead would cover the thirteen codes and leave the six rules that carry no
+// code outside the coverage gate entirely -- the two structural ones, the bucket count, the
+// single GCE, the same-leaf rule and the remove-the-committer rule. That is rule 5s shortfall
+// exactly: a class stated over the members somebody remembered rather than over the ones that
+// exist.
+func proposalListRulesDeclared(t *testing.T) []string {
+	t.Helper()
+	parsed := mustParseSource(t, "validate_proposals.go")
+	found := []string{}
+	for _, declaration := range parsed.file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Recv != nil || function.Type.Params == nil {
+			continue
+		}
+		if len(function.Type.Params.List) != 1 ||
+			parsed.render(function.Type.Params.List[0].Type) != "*ProposalValidationInput" {
+			continue
+		}
+		if function.Type.Results == nil || len(function.Type.Results.List) != 1 ||
+			parsed.render(function.Type.Results.List[0].Type) != "error" {
+			continue
+		}
+		// the aggregate is not one of its own rules
+		if function.Name.Name == "ValidateProposalList" {
+			continue
+		}
+		found = append(found, function.Name.Name)
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestValidateProposalListRunsEveryRuleThisFileDeclares derives the rule set from the source
+// rather than counting it here.
+//
+// The aggregate holds its rules in three slice literals. A slice literal is a transcription, and
+// the failure it has on this project is the quiet one: a rule declared, documented and never run.
+// So the class is every rule-shaped function validate_proposals.go declares, held in both
+// directions, and the thirteen ValSem codes are counted inside it -- because "thirteen" is a claim
+// about RFC 9420 section 12.2 rather than about this file.
+func TestValidateProposalListRunsEveryRuleThisFileDeclares(t *testing.T) {
+	declared := proposalListRulesDeclared(t)
+	if !slices.Contains(declared, "ValSem108RemoveExists") {
+		t.Fatalf("the signature scan read %v out of validate_proposals.go, which certainly declares ValSem108RemoveExists, so it is reading something else",
+			declared)
+	}
+	codes := []string{}
+	for _, name := range declared {
+		if strings.HasPrefix(name, "ValSem") {
+			codes = append(codes, name)
 		}
 	}
-	slices.Sort(fromFile)
-	if len(fromFile) != 13 {
+	if len(codes) != 13 {
 		t.Fatalf("validate_proposals.go declares %d ValSem functions (%v), RFC 9420 section 12.2 as this plan states it is thirteen",
-			len(fromFile), fromFile)
+			len(codes), codes)
 	}
 	run := proposalListRules()
-	for _, name := range fromFile {
+	for _, name := range declared {
 		if !slices.Contains(run, name) {
-			t.Errorf("%s is declared and ValidateProposalList runs %v, so that code is exported, documented and reached by nothing",
+			t.Errorf("%s is declared and ValidateProposalList runs %v, so that rule is documented and reached by nothing",
 				name, run)
+		}
+	}
+	for _, name := range run {
+		if !slices.Contains(declared, name) {
+			t.Errorf("ValidateProposalList runs %s and validate_proposals.go declares no rule of that name", name)
 		}
 	}
 }
@@ -582,12 +629,15 @@ func TestEveryBucketOfAProposalListIsNamedByTheBucketRule(t *testing.T) {
 func TestEveryProposalValidationEntryPointRefusesANilInput(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice")
-	shapes := map[string]*ProposalValidationInput{
-		"a nil input":    nil,
-		"no list":        {Tree: tree, Context: &GroupContext{}},
-		"no tree":        {List: &ProposalList{}, Context: &GroupContext{}},
-		"no context":     {List: &ProposalList{}, Tree: tree},
-		"nothing at all": {},
+	shapes := map[string]struct {
+		in       *ProposalValidationInput
+		sentinel error
+	}{
+		"a nil input":    {nil, errNilProposalValidationInput},
+		"no list":        {&ProposalValidationInput{Tree: tree, Context: &GroupContext{}}, errNilProposalList},
+		"no tree":        {&ProposalValidationInput{List: &ProposalList{}, Context: &GroupContext{}}, errNilRatchetTree},
+		"no context":     {&ProposalValidationInput{List: &ProposalList{}, Tree: tree}, ErrNilGroupContext},
+		"nothing at all": {&ProposalValidationInput{}, errNilProposalList},
 	}
 	doors := map[string]func(*ProposalValidationInput) error{"ValidateProposalList": ValidateProposalList}
 	for _, name := range proposalListRules() {
@@ -598,9 +648,9 @@ func TestEveryProposalValidationEntryPointRefusesANilInput(t *testing.T) {
 	}
 	for _, name := range slices.Sorted(maps.Keys(doors)) {
 		for _, shape := range slices.Sorted(maps.Keys(shapes)) {
-			answered := proposalValidationRefusalOf(t, name+" with "+shape, doors[name], shapes[shape])
-			if !errors.Is(answered, errNilProposalValidationInput) {
-				t.Errorf("%s with %s answered %v, want %v", name, shape, answered, errNilProposalValidationInput)
+			answered := proposalValidationRefusalOf(t, name+" with "+shape, doors[name], shapes[shape].in)
+			if !errors.Is(answered, shapes[shape].sentinel) {
+				t.Errorf("%s with %s answered %v, want %v", name, shape, answered, shapes[shape].sentinel)
 			}
 		}
 	}
@@ -739,29 +789,48 @@ func TestRequiredCapabilitiesThatCannotBeReadIsARefusalRatherThanNoRequirement(t
 // TestValSem113AnswersTheProfileGatesOwnValueForEveryTypeItRefuses says the delegation is complete
 // rather than covering the one type a single fixture happens to use.
 //
-// The three registered types outside the v1 profile answer three different values on purpose --
-// proposal_list.go's header argues for each -- and a ValSem113 that collapsed them, or that
-// answered an umbrella of its own, would take that distinction away from every caller of the
-// commit path while leaving a psk-only test green.
+// The class is READ OFF proposalTypeProfile rather than listed, which matters because the point of
+// ValSem113 is that there is exactly one table of what the v1 profile accepts: a fixture list of
+// three or four types would be a second, shorter statement of that table, and the first code point
+// whose disposition changed would leave the two disagreeing with nothing to say so. The profile
+// table is itself held to the registry in both directions by
+// TestTheV1ProfileClassifiesEveryRegisteredProposalType, so this is derived from a derived class.
+//
+// No arm is built for any row, and that is not laziness: checkProposalProfile judges the TYPE
+// before it looks at the arm, so a refused type is refused whatever it carries -- and a row that
+// supplied the matching arm would be asserting the same thing through more fixture. The
+// unregistered code point is the one row the table cannot supply, because a table of the registry
+// has no member outside it.
 func TestValSem113AnswersTheProfileGatesOwnValueForEveryTypeItRefuses(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice")
-	for name, row := range map[string]struct {
-		proposal Proposal
-		sentinel error
-	}{
-		"psk":      {Proposal{ProposalType: ProposalTypePreSharedKey, PreSharedKey: &PreSharedKey{}}, errProfilePsk},
-		"reinit":   {Proposal{ProposalType: ProposalTypeReInit, ReInit: &ReInit{}}, errProfileReInit},
-		"external": {Proposal{ProposalType: ProposalTypeExternalInit, ExternalInit: &ExternalInit{}}, errProfileExternalCommit},
-		"reserved": {Proposal{ProposalType: ProposalTypeReserved}, errReservedProposalType},
-		"grease":   {Proposal{ProposalType: ProposalType(0x1A1A), UnknownBody: []byte{1}}, errUnregisteredProposalType},
-	} {
-		in := testValidationInput(t, crypto, tree, LeafIndex(0),
-			&ProposalList{All: []CachedProposal{{Proposal: row.proposal}}})
-		if err := ValSem113ProposalTypeSupported(in); !errors.Is(err, row.sentinel) {
-			t.Errorf("ValSem113 over a %s proposal answered %v, want %v", name, err, row.sentinel)
+	answered := func(proposal Proposal) error {
+		return ValSem113ProposalTypeSupported(testValidationInput(t, crypto, tree, LeafIndex(0),
+			&ProposalList{All: []CachedProposal{{Proposal: proposal}}}))
+	}
+	refused := 0
+	for _, code := range slices.Sorted(maps.Keys(proposalTypeProfile)) {
+		want := proposalTypeProfile[code]
+		if want == nil {
+			// a type this profile accepts. It is refused here anyway, by the arm check,
+			// which is a different rule and is why nothing is asserted about its value.
+			continue
+		}
+		refused += 1
+		if err := answered(Proposal{ProposalType: code}); !errors.Is(err, want) {
+			t.Errorf("ValSem113 over a %s proposal answered %v, and the v1 profile refuses that code point with %v",
+				proposalTypeName(code), err, want)
 		}
 	}
+	if refused == 0 {
+		t.Fatal("the v1 profile table refuses no registered proposal type at all, so this sweep asserted nothing")
+	}
+	// and a code point outside the registry, which is the one member of the class the table
+	// cannot hold
+	if err := answered(Proposal{ProposalType: ProposalType(0x1A1A), UnknownBody: []byte{1}}); !errors.Is(err, errUnregisteredProposalType) {
+		t.Errorf("ValSem113 over an unregistered code point answered %v, want %v", err, errUnregisteredProposalType)
+	}
+	t.Logf("%d registered proposal types the v1 profile refuses, each answered through ValSem113", refused)
 }
 
 // TestValSem113ReadsTheBucketsAndNotOnlyTheCommitOrder is what makes the twelve rules below it

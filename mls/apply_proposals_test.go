@@ -88,6 +88,39 @@ func TestApplyProposalsPlacesAddsInCommitOrderRatherThanBucketOrder(t *testing.T
 	}
 }
 
+// TestApplyProposalsTakesTheAddOrderFromTheCommitOrderAndNotFromTheBucket separates the two fields
+// that could carry it.
+//
+// Every list (*ProposalCache).Resolve builds appends to All and to the bucket in one walk, so over
+// those two lists the Adds bucket and the adds of the commit order are the same sequence and no
+// fixture that goes through Resolve can tell a walk of one from a walk of the other -- and the
+// count rule this file runs ahead of the walk cannot see a disagreement in ORDER either. So the
+// two are put in conflict here: All says dave then erin, the bucket says erin then dave, and
+// ProposalList's own doc names All as the field that carries the wire's order.
+func TestApplyProposalsTakesTheAddOrderFromTheCommitOrderAndNotFromTheBucket(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	dave := testIdentity(t, crypto, "dave")
+	erin := testIdentity(t, crypto, "erin")
+	kpDave, _, _ := testKeyPackage(t, crypto, dave)
+	kpErin, _, _ := testKeyPackage(t, crypto, erin)
+	list := &ProposalList{
+		All:  []CachedProposal{testAddOf(kpDave), testAddOf(kpErin)},
+		Adds: []CachedProposal{testAddOf(kpErin), testAddOf(kpDave)},
+	}
+	result, err := ApplyProposals(tree, testApplyContext(), LeafIndex(0), list)
+	if err != nil {
+		t.Fatalf("ApplyProposals: %v", err)
+	}
+	if len(result.AddedLeaves) != 2 {
+		t.Fatalf("AddedLeaves = %v, want two entries", result.AddedLeaves)
+	}
+	landed := result.Tree.Leaf(result.AddedLeaves[0])
+	if landed == nil || !bytes.Equal(landed.SignatureKey, dave.SigPub) {
+		t.Fatal("the first leaf taken is not the first add of the COMMIT order, so the placement is being read off the bucket")
+	}
+}
+
 // TestApplyProposalsDoesNotMutateTheInputTree is what makes a rejected commit safe.
 //
 // Section 12.4.2 validates the update path, the tree and the confirmation tag AGAINST the tree
@@ -210,6 +243,55 @@ func TestApplyProposalsGceReplacesWholesaleAndBeforeEverythingElse(t *testing.T)
 	}
 	if len(unchanged.Extensions) != 1 || unchanged.Extensions[0].ExtensionType != ExtensionType(0x00FF) {
 		t.Fatalf("an empty list changed the group's extensions: %+v", unchanged.Extensions)
+	}
+}
+
+// TestApplyProposalsAnswersAnExtensionVectorNothingElseWritesThrough is the extension half of the
+// "a candidate the caller did not own" claim.
+//
+// The tree half is held next door by a hash comparison. This half needs a write, because both
+// vectors have the length they were built with: a result sharing the caller's backing array
+// hashes, prints and compares identically to one that does not, and the difference only appears
+// when somebody assigns through it. Task 22 builds the next epoch's GroupContext out of
+// result.Extensions, so the somebody is real.
+//
+// Both sources are covered: the group's own vector when no proposal replaces it, and the
+// proposal's vector when one does.
+func TestApplyProposalsAnswersAnExtensionVectorNothingElseWritesThrough(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice")
+	carried := Extension{ExtensionType: ExtensionType(0x00FF), ExtensionData: []byte{1}}
+	replacement := Extension{ExtensionType: ExtensionType(0x00FE), ExtensionData: []byte{2}}
+	proposal := testGceOf(replacement)
+
+	for name, row := range map[string]struct {
+		list  *ProposalList
+		owner func(ctx *GroupContext) []Extension
+	}{
+		"the group's own vector": {&ProposalList{},
+			func(ctx *GroupContext) []Extension { return ctx.Extensions }},
+		"the proposal's vector": {testProposalList(t, proposal),
+			func(ctx *GroupContext) []Extension {
+				return proposal.Proposal.GroupContextExtensions.Extensions
+			}},
+	} {
+		ctx := testApplyContext()
+		ctx.Extensions = []Extension{carried}
+		result, err := ApplyProposals(tree, ctx, LeafIndex(0), row.list)
+		if err != nil {
+			t.Fatalf("%s: ApplyProposals: %v", name, err)
+		}
+		source := row.owner(ctx)
+		if len(result.Extensions) != 1 || len(source) != 1 {
+			t.Fatalf("%s: the fixture holds %d applied and %d source entries, want one of each",
+				name, len(result.Extensions), len(source))
+		}
+		before := source[0].ExtensionType
+		result.Extensions[0] = Extension{ExtensionType: ExtensionType(0x0BAD)}
+		if source[0].ExtensionType != before {
+			t.Errorf("%s: writing through the applied vector rewrote it, so the two share storage",
+				name)
+		}
 	}
 }
 

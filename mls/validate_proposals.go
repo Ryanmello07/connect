@@ -48,23 +48,31 @@ type ProposalValidationInput struct {
 
 // check is the argument rule every entry point of this file runs first.
 //
-// A method with a nil-receiver guard rather than a nil comparison in each of the fourteen
-// functions, so that one rule is written once: fourteen copies of a guard is fourteen chances for
-// one of them to be the copy that was not updated. Go calls a method on a nil pointer without
+// A method with a nil-receiver guard rather than a nil comparison in each of the twenty rule
+// functions, so that one rule is written once: twenty copies of a guard is twenty chances for one
+// of them to be the copy that was not updated. Go calls a method on a nil pointer without
 // dereferencing it, so this is reachable from every door.
-// TestEveryProposalValidationEntryPointRefusesANilInput drives all fourteen.
+// TestEveryProposalValidationEntryPointRefusesANilInput drives all of them.
+//
+// FOUR VALUES AND NOT ONE, which is the rule the four arguments of ApplyProposals are held to and
+// is here for the same reason: a caller that handed this no tree and a caller that handed it no
+// proposals have made different mistakes and repair them in different places, and "the input was
+// incomplete" is a sentence that sends both of them to read the whole struct. Three of the four
+// already exist for exactly these conditions -- the two the application door answers, and the key
+// schedule's own for a missing group context -- so this adds one value rather than four, and no
+// condition of this package comes to answer two names.
 func (self *ProposalValidationInput) check() error {
 	if self == nil {
 		return fmt.Errorf("%w: no validation input", errNilProposalValidationInput)
 	}
 	if self.List == nil {
-		return fmt.Errorf("%w: no proposal list", errNilProposalValidationInput)
+		return fmt.Errorf("%w: proposal list validation has nothing to judge", errNilProposalList)
 	}
 	if self.Tree == nil {
-		return fmt.Errorf("%w: no ratchet tree", errNilProposalValidationInput)
+		return fmt.Errorf("%w: every membership rule of section 12.2 is stated over it", errNilRatchetTree)
 	}
 	if self.Context == nil {
-		return fmt.Errorf("%w: no group context", errNilProposalValidationInput)
+		return fmt.Errorf("%w: the version, the suite and the group extensions are its", ErrNilGroupContext)
 	}
 	return nil
 }
@@ -90,10 +98,11 @@ func (self *ProposalValidationInput) effectiveExtensions() []Extension {
 //
 // Slices rather than a straight-line sequence of calls, because what has to be checkable is that
 // the aggregate runs EVERY ValSem code and not a subset of them:
-// TestValidateProposalListRunsEveryValSemThisFileDeclares reads the ValSem function names out of
-// this file's source and requires each to appear in exactly one of the three, so a fourteenth
-// code added below is unrun until somebody puts it in a group, and a code deleted from a group
-// fails rather than quietly leaving the aggregate smaller.
+// TestValidateProposalListRunsEveryRuleThisFileDeclares reads the rule functions out of this
+// file's source -- by SIGNATURE, so the six rules that carry no ValSem code are in the class too
+// -- and requires each to appear in exactly one of the three, so a twentieth rule added below is
+// unrun until somebody puts it in a group, and a rule deleted from a group fails rather than
+// quietly leaving the aggregate smaller.
 //
 // The groups are three and not one because the ORDER between them is load bearing and the header
 // says why: the structural group is what makes the other twelve safe to write.
@@ -133,6 +142,13 @@ var (
 // build refuses external commits outright at the profile gate -- errProfileExternalCommit -- so
 // an external commit's list is refused by ValSem113 before any rule below could be asked about
 // it. A second procedure here would be an implementation of a shape this build never accepts.
+//
+// ITS OWN in.check IS REDUNDANT AND IS KEPT, which is worth saying because a mutation measured it:
+// every rule of every group opens with the same call, so removing this one leaves the whole of
+// ./mls/... and ./message/... green -- the first structural rule answers the identical value a
+// moment later. It stays because refusing at the door is what the rest of this package does, and
+// because without it the aggregate's refusal would depend on the first element of a slice.
+// Nothing here claims a test can tell which of the two guards fired.
 func ValidateProposalList(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err

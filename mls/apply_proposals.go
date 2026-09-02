@@ -61,7 +61,6 @@ type ApplyResult struct {
 // confirmation tag against the tree this produces -- so a version that worked in place would
 // leave a member's live state half-way through a commit it went on to reject, with no way back to
 // the epoch it was in.
-//
 func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 	list *ProposalList) (*ApplyResult, error) {
 
