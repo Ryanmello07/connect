@@ -278,10 +278,10 @@ func (self *GroupInfo) Verify(crypto CryptoProvider, tree *RatchetTree) error {
 			ErrNilCryptoProvider)
 	}
 	// refused rather than dereferenced, and refused as a malformed tree rather than as any of
-	// the four rules: no tree is not a tree whose hash disagrees, nor an index outside one, and
+	// the rules below: no tree is not a tree whose hash disagrees, nor an index outside one, and
 	// a caller handed one of those answers would go looking for a fault in a GroupInfo that may
-	// be perfectly good. LeafWidth on a nil receiver is a nil dereference two lines down, which
-	// takes the caller's process rather than its call.
+	// be perfectly good. TreeHash on a nil receiver is a nil dereference at rule 4, which takes
+	// the caller's process rather than its call.
 	if tree == nil {
 		return fmt.Errorf("%w: there is no ratchet tree for this group info to be checked against",
 			ErrTreeMalformed)
