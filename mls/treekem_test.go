@@ -1327,8 +1327,8 @@ func TestTheUpdatePathDrawsEveryOctetStringItPublishesFromFreshEntropy(t *testin
 		named := map[string][]byte{
 			"the sender's new leaf encryption key, as the tree publishes it": tree.Leaf(sender).EncryptionKey,
 			"the leaf private key the plan's private state keeps":            plan.Private.EncryptionPriv,
-			"path_secret[0]":                                                 plan.PathSecrets[0],
-			"the commit secret":                                              plan.CommitSecret,
+			"path_secret[0]":    plan.PathSecrets[0],
+			"the commit secret": plan.CommitSecret,
 		}
 		for i, x := range plan.Path {
 			named[fmt.Sprintf("the public key published at node %d", x)] = plan.PublicKeys[i]
@@ -2806,12 +2806,16 @@ func TestEveryPublishedUpdatePathHasOneCiphertextPerResolutionNode(t *testing.T)
 // one and this was the other, unwritten, which is the shape the ciphertext paragraph itself
 // warns about.
 //
-// It differs from the ciphertext count in one way worth writing down: the door is already built.
-// LeafValidationContext.ExpectedSource is a REQUIRED input whose own comment names "the tree and
-// the update path with commit", and Validate answers ErrLeafNodeSourceMismatch against it. So
-// the second control drives that door from the expectation this position takes, over every
-// source the package declares, and the gap this test closes is a naming gap rather than a
-// missing capability.
+// It differs from the ciphertext count in one way worth writing down: the door is
+// ValidateUpdatePathLeafNode, and the second control drives THAT rather than a context this test
+// wrote for itself, over every source the package declares.
+//
+// THAT PARAGRAPH USED TO SAY THE DOOR WAS ALREADY BUILT, and it was not. What was built was the
+// validator's ability to hold an expectation -- LeafValidationContext.ExpectedSource -- with no
+// production caller setting it to commit anywhere in this package, so this control demonstrated
+// only that a test could ask the question. A test that constructs the caller it is checking for
+// is a test of the callee, and the gap it reported closed was still open: the leaf of a received
+// UpdatePath reached MergeUpdatePath and the tree with nothing having judged it.
 func TestEveryPublishedUpdatePathCarriesACommitSourceLeaf(t *testing.T) {
 	leaves := 0
 	forEachPublishedUpdatePath(t, func(at int, tree *RatchetTree, published treekemPublishedUpdatePath, raw []byte) {
@@ -2856,24 +2860,29 @@ func TestEveryPublishedUpdatePathCarriesACommitSourceLeaf(t *testing.T) {
 			roundTripped.LeafNode.LeafNodeSource)
 	}
 
-	// the second control: the door that does enforce it, driven from the expectation THIS
-	// position takes. Over every source the package declares rather than over the one wrong
-	// source somebody would have written, so a fourth source is refused by this on the commit
-	// that declares it.
+	// the second control: the production door that does enforce it, called the way a client
+	// processing a commit calls it. Over every source the package declares rather than over the
+	// one wrong source somebody would have written, so a fourth source is refused by this on the
+	// commit that declares it.
 	crypto := leafValidationCrypto(t)
 	accepted, refused := 0, 0
 	for _, source := range leafNodeSources(t) {
 		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
-		err := leaf.Validate(leafValidationContextFor(crypto, LeafNodeSourceCommit))
+		err := ValidateUpdatePathLeafNode(crypto, commitDoorGroupContext(),
+			leafValidationLeafIndex, commitDoorPathCarrying(leaf))
 		if source == LeafNodeSourceCommit {
 			if err != nil {
-				t.Errorf("the commit sourced leaf was refused at the update path position: %v", err)
+				t.Errorf("the commit sourced leaf was refused at the update path door: %v", err)
 			}
 			accepted += 1
 			continue
 		}
 		if !errors.Is(err, ErrLeafNodeSourceMismatch) {
-			t.Errorf("a %d sourced leaf validated at the update path position gave err = %v, want ErrLeafNodeSourceMismatch",
+			t.Errorf("a %d sourced leaf judged at the update path door gave err = %v, want ErrLeafNodeSourceMismatch",
+				source, err)
+		}
+		if !errors.Is(err, errUpdatePathLeafNodeInvalid) {
+			t.Errorf("a %d sourced leaf judged at the update path door gave err = %v, which does not answer to errUpdatePathLeafNodeInvalid; a caller cannot tell which half of a commit it must reject",
 				source, err)
 		}
 		refused += 1
@@ -2882,7 +2891,7 @@ func TestEveryPublishedUpdatePathCarriesACommitSourceLeaf(t *testing.T) {
 		t.Fatalf("the expectation this position takes accepted %d leaves and refused %d, over the %d sources this package declares",
 			accepted, refused, len(leafNodeSources(t)))
 	}
-	t.Logf("%d published paths carry a commit sourced leaf with a parent hash; the codec accepts a key_package sourced one and ExpectedSource refuses it",
+	t.Logf("%d published paths carry a commit sourced leaf with a parent hash; the codec accepts a key_package sourced one and ValidateUpdatePathLeafNode refuses it",
 		leaves)
 }
 
@@ -6140,4 +6149,294 @@ func TestMergeUpdatePathRefusesALeafClaimingAParentInAGroupThatHasNone(t *testin
 	}
 	mergeMustNotTouchTheTree(t, crypto, tree.Clone(), members[0].LeafIndex, claiming,
 		ErrParentHashMismatch, "a one member commit whose leaf claims a parent hash")
+}
+
+// ---------------------------------------------------------------------------
+// the commit door: RFC 9420 section 7.3 over a received UpdatePath's leaf
+// ---------------------------------------------------------------------------
+
+// commitDoorGroupContext is the group a received UpdatePath is judged in, matching the group id
+// and the leaf index leafValidationSignedLeaf signs under so that a leaf built there is accepted
+// here. The urmessage_leaf_keys entry is what makes section 13.4's clause live at this door: a
+// group using an extension its members must support.
+func commitDoorGroupContext() *GroupContext {
+	return &GroupContext{
+		Version:     ProtocolVersionMls10,
+		CipherSuite: CipherSuiteX25519ChaCha20Sha256Ed25519,
+		GroupId:     []byte(leafValidationGroupId),
+		Epoch:       1,
+		Extensions: []Extension{
+			{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte("x")},
+		},
+	}
+}
+
+// commitDoorPathCarrying is a published-shaped UpdatePath whose leaf is the one handed in, so a
+// case below changes the LEAF and nothing else about the path.
+func commitDoorPathCarrying(leaf *LeafNode) *UpdatePath {
+	path := testUpdatePathFixture()
+	path.LeafNode = *leaf
+	return path
+}
+
+// TestTheCommitDoorRefusesEveryWayAnUpdatePathLeafIsWrongForThisPosition is the commit half of
+// section 7.3, stated one clause at a time over the door that did not exist.
+//
+// Before ValidateUpdatePathLeafNode the leaf of a received UpdatePath was held by nothing that
+// judged it AS A LEAF. MergeUpdatePath recomputes the parent hash chain against it and says in as
+// many words that it does not verify the signature; VerifyParentHashes counts claimants. Neither
+// asks whether the leaf is signed by the key it names, whether that signature is bound to this
+// group and this position, whether the credential is one this profile reads, or whether the member
+// supports the extensions the group is using. Every row here is a leaf all of those accept.
+//
+// The wrap is asserted on every row alongside the clause's own value, because that pairing is what
+// errUpdatePathLeafNodeInvalid promises a caller: which half of the commit to reject, and what
+// section 7.3 said about it.
+func TestTheCommitDoorRefusesEveryWayAnUpdatePathLeafIsWrongForThisPosition(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	// the control every row below is one change away from
+	good := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil)
+	if err := ValidateUpdatePathLeafNode(crypto, commitDoorGroupContext(),
+		leafValidationLeafIndex, commitDoorPathCarrying(good)); err != nil {
+		t.Fatalf("the commit door refused a well formed commit leaf at its own position: %v", err)
+	}
+	elsewhere := commitDoorGroupContext()
+	elsewhere.GroupId = []byte("another group")
+	unsupportedExtension := commitDoorGroupContext()
+	unsupportedExtension.Extensions = append(unsupportedExtension.Extensions,
+		Extension{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}})
+	unsupportedCapability := commitDoorGroupContext()
+	unsupportedCapability.Extensions = append(unsupportedCapability.Extensions,
+		testRequiredCapabilitiesNaming(t, ExtensionType(0xF00A)))
+	forged := leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil)
+	forged.Signature = leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil).Signature
+	for name, row := range map[string]struct {
+		context *GroupContext
+		sender  LeafIndex
+		leaf    *LeafNode
+		inner   error
+	}{
+		// the leaf index half of section 7.2's context select: the committer's own leaf, its own
+		// signature, offered at a position it was not signed for. A path accepted at another
+		// index reseals another member's copath.
+		"a commit leaf offered at another position": {
+			context: commitDoorGroupContext(), sender: leafValidationLeafIndex + 1,
+			leaf: good, inner: errBadSignature},
+		// and the group id half of it, which is what stops a commit leaf being pasted into a
+		// group its signer never committed in
+		"a commit leaf pasted into another group": {
+			context: elsewhere, sender: leafValidationLeafIndex,
+			leaf: good, inner: errBadSignature},
+		"a commit leaf carrying another leaf's signature": {
+			context: commitDoorGroupContext(), sender: leafValidationLeafIndex,
+			leaf: forged, inner: errBadSignature},
+		// section 13.4 as corrected by erratum 8745, which ERRATA.md says this package applies to
+		// all three sources -- and which, for a commit leaf, was reached by nobody
+		"a commit leaf that does not support an extension the group carries": {
+			context: unsupportedExtension, sender: leafValidationLeafIndex,
+			leaf: good, inner: errGroupContextExtensionNotListed},
+		// and the required_capabilities clause, which is this door reading the group's own
+		// extensions rather than taking a second argument for them
+		"a commit leaf that does not support a capability the group requires": {
+			context: unsupportedCapability, sender: leafValidationLeafIndex,
+			leaf: good, inner: errMissingRequiredCapability},
+	} {
+		err := ValidateUpdatePathLeafNode(crypto, row.context, row.sender,
+			commitDoorPathCarrying(row.leaf))
+		if !errors.Is(err, errUpdatePathLeafNodeInvalid) {
+			t.Errorf("the commit door over %s answered %v, which does not answer to errUpdatePathLeafNodeInvalid",
+				name, err)
+		}
+		if !errors.Is(err, row.inner) {
+			t.Errorf("the commit door over %s answered %v, want %v underneath; a caller cannot ask which section 7.3 clause fired",
+				name, err, row.inner)
+		}
+	}
+}
+
+// TestTheCommitDoorRefusesEveryArgumentItCannotJudgeWithout is the argument rule, and it is a
+// refusal of this door like any other: a client processing a commit reaches it with whatever it
+// holds, and a door that dereferenced a missing argument would take the caller's process rather
+// than its call.
+//
+// The provider is FIRST, ahead of the group context and the path, which is the order every
+// declaration of this package taking a provider is held to -- and is the only order that does not
+// read a field off an argument the caller never supplied.
+func TestTheCommitDoorRefusesEveryArgumentItCannotJudgeWithout(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	good := commitDoorPathCarrying(leafValidationSignedLeaf(t, crypto, LeafNodeSourceCommit, nil))
+	for name, row := range map[string]struct {
+		call func() error
+		want error
+	}{
+		"no provider at all": {want: ErrNilCryptoProvider, call: func() error {
+			return ValidateUpdatePathLeafNode(nil, commitDoorGroupContext(),
+				leafValidationLeafIndex, good)
+		}},
+		"no provider and no other argument either": {want: ErrNilCryptoProvider, call: func() error {
+			return ValidateUpdatePathLeafNode(nil, nil, 0, nil)
+		}},
+		"no group context": {want: ErrNilGroupContext, call: func() error {
+			return ValidateUpdatePathLeafNode(crypto, nil, leafValidationLeafIndex, good)
+		}},
+		"no update path": {want: errNilUpdatePath, call: func() error {
+			return ValidateUpdatePathLeafNode(crypto, commitDoorGroupContext(),
+				leafValidationLeafIndex, nil)
+		}},
+	} {
+		answered := func() (out error) {
+			defer func() {
+				if panicked := recover(); panicked != nil {
+					t.Errorf("the commit door with %s panicked with %v", name, panicked)
+					out = nil
+				}
+			}()
+			return row.call()
+		}()
+		if !errors.Is(answered, row.want) {
+			t.Errorf("the commit door with %s answered %v, want %v", name, answered, row.want)
+		}
+	}
+}
+
+// commitPathValidUnder is an UpdatePath whose leaf passes ValidateUpdatePathLeafNode in one group,
+// built from that group's own context rather than from a fixture's assumptions.
+//
+// Written for the sweeps in other files that need a path this door ACCEPTS -- the nil argument
+// gate needs the other arguments live so its refusal is attributable to the nil one, and the
+// KDF.Nh gate needs the call to work over a provider whose hash is 48. Both would otherwise carry
+// a copy of this construction, and two copies of "what this door accepts" is two chances to write
+// one of them wrong.
+//
+// The leaf's capabilities are taken FROM the context: the ciphersuite it announces, and every
+// extension type it carries. A fixture that listed a fixed vector would refuse in any group whose
+// extensions this file did not anticipate, and the refusal would be attributed to whatever the
+// caller was measuring.
+func commitPathValidUnder(t *testing.T, crypto CryptoProvider, context *GroupContext,
+	sender LeafIndex) *UpdatePath {
+	t.Helper()
+	signerPriv, signerPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair for the commit leaf: %v", err)
+	}
+	listed := []ExtensionType{}
+	for i := range context.Extensions {
+		listed = append(listed, context.Extensions[i].ExtensionType)
+	}
+	leaf := &LeafNode{
+		EncryptionKey: HpkePublicKey(repeatByte(0x11, 32)),
+		SignatureKey:  signerPub,
+		Credential:    BasicCredential([]byte("alice")),
+		Capabilities: Capabilities{
+			Versions:     []ProtocolVersion{ProtocolVersionMls10},
+			CipherSuites: []CipherSuite{context.CipherSuite},
+			Extensions:   listed,
+			Proposals:    []ProposalType{},
+			Credentials:  []CredentialType{CredentialTypeBasic},
+		},
+		LeafNodeSource: LeafNodeSourceCommit,
+		ParentHash:     repeatByte(0x44, 32),
+		Extensions:     []Extension{},
+	}
+	if err := leaf.Sign(crypto, signerPriv, context.GroupId, sender); err != nil {
+		t.Fatalf("sign the commit leaf at leaf %d: %v", sender, err)
+	}
+	return &UpdatePath{LeafNode: *leaf, Nodes: []UpdatePathNode{}}
+}
+
+// providerUpdatePathPerturbations moves a received UpdatePath in the half a validator judges,
+// which is the LEAF inside it.
+//
+// Its rule lives here rather than in crypto_test.go's switch for the reason
+// providerHpkeCiphertextPerturbations' does: the generic byte rule cannot reach through a pointer
+// to a struct, and a rule that moved the path's node vector would be moving the half
+// ValidateUpdatePathLeafNode is written NOT to judge -- the ciphertexts and the node keys belong to
+// MergeUpdatePath and DecryptUpdatePath.
+//
+// Every row is a change the commit door must notice, and each moves a DIFFERENT clause of section
+// 7.3: the signature itself, the key the signature is checked against, the source that selects what
+// the signature covers, the identity inside the credential, and the encryption key the tree will
+// install. A single row would be satisfied by a door that read one field.
+//
+// The path is CLONED per row -- the leaf through LeafNode.Clone, which makes every vector the
+// clone's own -- so a perturbation cannot write through into the base argument every other row of
+// that gate is built from.
+func providerUpdatePathPerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+	t.Helper()
+	base := argument.Interface().(*UpdatePath)
+	moved := []providerPerturbation{}
+	for _, row := range []struct {
+		where string
+		edit  func(leaf *LeafNode)
+	}{
+		{where: "the leaf's signature", edit: func(leaf *LeafNode) { leaf.Signature[0] ^= 0xff }},
+		{where: "the leaf's signature key", edit: func(leaf *LeafNode) { leaf.SignatureKey[0] ^= 0xff }},
+		{where: "the leaf's encryption key", edit: func(leaf *LeafNode) { leaf.EncryptionKey[0] ^= 0xff }},
+		{where: "the leaf's source", edit: func(leaf *LeafNode) {
+			leaf.LeafNodeSource = LeafNodeSourceUpdate
+		}},
+		{where: "the identity in the leaf's credential", edit: func(leaf *LeafNode) {
+			leaf.Credential.Identity[0] ^= 0xff
+		}},
+	} {
+		leaf := base.LeafNode.Clone()
+		if len(leaf.Signature) == 0 || len(leaf.SignatureKey) == 0 ||
+			len(leaf.EncryptionKey) == 0 || len(leaf.Credential.Identity) == 0 {
+			t.Fatalf("the base argument for %s.%s carries a leaf with an empty vector, so a perturbation of it changes nothing",
+				operation, parameter.name)
+		}
+		row.edit(leaf)
+		moved = append(moved, providerPerturbation{
+			where: row.where,
+			value: reflect.ValueOf(&UpdatePath{LeafNode: *leaf, Nodes: base.Nodes}),
+		})
+	}
+	return moved
+}
+
+// providerCommitDoorContextPerturbations moves the three fields of a GroupContext that
+// ValidateUpdatePathLeafNode reads, and it exists because the generic rule moves the one field it
+// must not.
+//
+// The generic *GroupContext perturbation moves the EPOCH, on the grounds that it is "the field two
+// contexts of one group differ in and nothing else" -- which is right for every construction whose
+// preimage carries a group context. A LeafNodeTBS does not: section 7.2 binds an update or commit
+// leaf to the group id and the leaf index and to nothing else about the epoch, so a leaf validator
+// whose verdict moved with the epoch would be refusing leaves that are still perfectly valid one
+// commit later. The epoch is the field this door is RIGHT not to read, and a rule that demanded
+// otherwise would be asking for a defect.
+//
+// So the three it does read are moved instead, one clause each: the group id, which the signature
+// covers; the ciphersuite, which section 11.1 requires the leaf to list; and the extensions, which
+// section 13.4 as corrected by erratum 8745 requires it to support. Each must change the verdict.
+func providerCommitDoorContextPerturbations(t *testing.T, operation string,
+	parameter providerParameter, argument reflect.Value) []providerPerturbation {
+	t.Helper()
+	base := argument.Interface().(*GroupContext)
+	if len(base.GroupId) == 0 {
+		t.Fatalf("the base argument for %s.%s carries no group id, so moving it changes nothing",
+			operation, parameter.name)
+	}
+	elsewhere := base.Clone()
+	elsewhere.GroupId[0] ^= 0xff
+	otherSuite := base.Clone()
+	for _, suite := range Suites() {
+		if suite != base.CipherSuite {
+			otherSuite.CipherSuite = suite
+			break
+		}
+	}
+	if otherSuite.CipherSuite == base.CipherSuite {
+		t.Fatalf("this profile registers one ciphersuite, so %s.%s has no second suite to move to",
+			operation, parameter.name)
+	}
+	demanding := base.Clone()
+	demanding.Extensions = append(demanding.Extensions,
+		Extension{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}})
+	return []providerPerturbation{
+		{where: "byte 0 of the group id", value: reflect.ValueOf(elsewhere)},
+		{where: "the ciphersuite moved to another registered one", value: reflect.ValueOf(otherSuite)},
+		{where: "an extension the leaf does not list added to the group", value: reflect.ValueOf(demanding)},
+	}
 }

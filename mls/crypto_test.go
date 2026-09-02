@@ -2863,6 +2863,12 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	"OpenPrivateMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
 	// section 6's ValSem002 and ValSem003, on VerifyAuthenticatedContent's terms exactly.
 	"CheckFramedContentContext": "answers an error and no bytes; what it produces is a verdict",
+	// RFC 9420 section 7.3's commit door, on VerifyAuthenticatedContent's terms and for its
+	// reason: its whole answer is whether the leaf of a received UpdatePath is valid at the
+	// sender's position. The half that still runs is the one that matters -- the group context
+	// and the path are the caller's own and are read again after the call, and this door is
+	// reached before anything in a commit has been trusted.
+	"ValidateUpdatePathLeafNode": "answers an error and no bytes; what it produces is a verdict",
 	// the group policy's ordering primitive and the equality derived from it. Both answer a
 	// verdict about two member ids and produce no storage at all, so the aliasing and fresh
 	// storage halves have nothing to read. The half that still runs is the one that matters for
@@ -3896,8 +3902,17 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			t.Errorf("the gate excuses %s, which no construction of this package declares", name)
 		}
 	}
+	// The no-bytes table is read by TWO gates, so its staleness check is held against both
+	// classes rather than against this one alone. This gate's class is the constructions handed a
+	// caller's bytes; the KDF.Nh differential next door reads the same table over the
+	// constructions handed a PROVIDER, and a member of that class answering no bytes -- section
+	// 7.3's commit door is one -- takes no caller bytes at all. Held against this class alone, a
+	// perfectly live entry is reported as naming a construction the package does not declare, and
+	// the repair somebody reaches for is deleting it, which turns the other gate's "answered
+	// nothing, so this row compared no length" back on.
+	construction := slices.Concat(declared, packageLevelFunctionsTaking(t, providerInterfaceName))
 	for name := range packageConstructionsAnsweringNoBytes {
-		if !slices.Contains(declared, name) {
+		if !slices.Contains(construction, name) {
 			t.Errorf("%s is named as answering no bytes, and no construction of this package declares it", name)
 		}
 	}
@@ -4232,6 +4247,7 @@ var providerConstructionValues = map[string]any{
 	"DerivePathSecrets":             DerivePathSecrets,
 	"DeriveNodeKeyPair":             DeriveNodeKeyPair,
 	"SignAuthenticatedContent":      SignAuthenticatedContent,
+	"ValidateUpdatePathLeafNode":    ValidateUpdatePathLeafNode,
 	"VerifyAuthenticatedContent":    VerifyAuthenticatedContent,
 	"ComputeMembershipTag":          ComputeMembershipTag,
 	"verifyMembershipTag":           verifyMembershipTag,
@@ -4610,6 +4626,23 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 		KemOutput:  labelledKemOutput,
 		Ciphertext: labelledCiphertext,
 	}
+	// RFC 9420 section 7.3's commit door, whose three arguments have to AGREE for the base call
+	// to be an ACCEPTANCE: the leaf is signed over this group id at this sender index and lists
+	// this suite. A base call that already refuses answers the same refusal under every
+	// perturbation, and every row over it would report a parameter nothing observes -- which is
+	// this gate reporting a clean bill having compared one error against itself.
+	//
+	// The group id is not "context" and not any other row's bytes, because the leaf's own
+	// LeafNodeTBS covers it: a shared value would tie this fixture's acceptance to a length some
+	// other row is free to change.
+	commitDoorStubContext := &GroupContext{
+		Version: ProtocolVersionMls10, CipherSuite: params.Suite,
+		GroupId: ascendingBytes(0x05, 24), Epoch: 3,
+	}
+	arguments["ValidateUpdatePathLeafNode.context"] = commitDoorStubContext
+	arguments["ValidateUpdatePathLeafNode.sender"] = LeafIndex(1)
+	arguments["ValidateUpdatePathLeafNode.path"] =
+		commitPathValidUnder(t, crypto, commitDoorStubContext, LeafIndex(1))
 	return arguments
 }
 
@@ -4763,8 +4796,23 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		if argument.Type() == reflect.TypeOf((*HpkeCiphertext)(nil)) && !argument.IsNil() {
 			return providerHpkeCiphertextPerturbations(t, operation, parameter, argument)
 		}
+		// the commit door's update path, whose judged half is the LEAF inside it and whose rule
+		// lives beside that structure in treekem_test.go for the reason the ciphertext's does.
+		if argument.Type() == reflect.TypeOf((*UpdatePath)(nil)) && !argument.IsNil() {
+			return providerUpdatePathPerturbations(t, operation, parameter, argument)
+		}
 		if argument.Type() != reflect.TypeOf((*GroupContext)(nil)) || argument.IsNil() {
 			break
+		}
+		// the commit door reads the group id, the suite and the extensions off its context and
+		// deliberately does NOT read the epoch -- a LeafNodeTBS carries no epoch, so a leaf
+		// validator that changed its verdict when the epoch moved would be judging a leaf by a
+		// field its signature does not cover. The epoch move below is therefore the one
+		// perturbation that must NOT separate this operation, and its rule moves the three
+		// fields it does read instead. It lives beside the door in treekem_test.go, which is
+		// where the update path's own rule is.
+		if operation == "ValidateUpdatePathLeafNode" {
+			return providerCommitDoorContextPerturbations(t, operation, parameter, argument)
 		}
 		// the epoch, because it is the field two contexts of one group differ in and
 		// nothing else: an operation that dropped the group context out of its preimage
@@ -4880,6 +4928,7 @@ func providerUnflippableAnswersReached(perturbed reflect.Value) []string {
 var providerExcusedFromTheRoutingClaim = map[string]string{
 	"NewSecretTree reaches the provider only through HashSize":                                       "validates encryption_secret against KDF.Nh and stores it, and the first value derived THROUGH the provider exists only once a leaf has been taken",
 	"VerifyAuthenticatedContent reaches the provider only through VerifyWithLabel":                   "answers an error, and a wrapper that flips bytes has nothing to change in a refusal; TestProviderHasNoRemainingStubs still holds it by input perturbation, and a verify made to accept unconditionally fails that half",
+	"ValidateUpdatePathLeafNode reaches the provider only through VerifyWithLabel":                   "RFC 9420 section 7.3's commit door, on VerifyAuthenticatedContent's terms exactly: its whole answer is a verdict about a received UpdatePath's leaf, and a wrapper that flips bytes has nothing to change in one. It is still held by input perturbation here -- the sender index, the group context and each of five fields of the leaf must change the verdict -- and a door made to accept unconditionally fails that half",
 	"OpenPublicMessage reaches the provider only through HashSize and MacVerify and VerifyWithLabel": "answers a message it did not derive: both of its authenticators are VERDICTS, so the union of the two refusals it reaches -- MacVerify for ValSem007 and ValSem008, VerifyWithLabel for ValSem010 -- has nothing a wrapper that flips bytes can change, and HashSize is the width the membership_key is refused against. It is the exact shape the comment above warned would land here, and it is not unheld: TestProviderHasNoRemainingStubs moves its key, its message, its resolver and its group context and requires each to change the verdict; TestPublicMessageRefusesForgedMembershipTag sweeps every bit and every length of the tag; TestOpenPublicMessageRefusesEveryFlippedBitOfTheSignature does the same for the signature with the tag recomputed each time, which is what separates the two authenticators; and TestOpenPublicMessageRefusesEveryKeyButTheSendersOwn sweeps the resolver's answer",
 	"verifyMembershipTag reaches the provider only through HashSize and MacVerify":                   "answers an error over a comparison, and MacVerify is the second half of the union that is not a size while HashSize is the width the membership_key is refused against: a wrapper that flips bytes has nothing to change in a bool or in an int the registry fixes. It is the construction that comment above warned would land here, and it is not unheld -- TestProviderHasNoRemainingStubs moves its key, its message, its group context and its tag and requires each to change the verdict, TestVerifyMembershipTagRefusesEveryTagButItsOwn sweeps every bit and every length, TestBothDoorsIntoSection62RefuseEveryKeyNoTagMayBeTakenUnder sweeps every key width and the erased epoch's own key, and TestTheMembershipTagPreimageIsTheOneThePublishedTagsWereTakenOver holds it to tags mlswg published",
 }

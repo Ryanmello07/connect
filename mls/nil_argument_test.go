@@ -612,6 +612,18 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err := ApplyProposals(tree, testApplyContext(), LeafIndex(0), nil)
 			return err
 		}},
+		// RFC 9420 section 7.3's commit door. Its group context is where the group id, the suite
+		// and the extensions the leaf is judged against all come from, so a nil one is a door
+		// with no expectation to state rather than a door over an empty group -- and the PATH is
+		// live in that row, which is what makes the refusal the context's.
+		"ValidateUpdatePathLeafNode(context)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			live := commitDoorGroupContext()
+			return ValidateUpdatePathLeafNode(crypto, nil, LeafIndex(1),
+				commitPathValidUnder(t, crypto, live, LeafIndex(1)))
+		}},
+		"ValidateUpdatePathLeafNode(path)": {sentinel: errNilUpdatePath, call: func(t *testing.T) error {
+			return ValidateUpdatePathLeafNode(crypto, commitDoorGroupContext(), LeafIndex(1), nil)
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

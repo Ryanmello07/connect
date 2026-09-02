@@ -1126,6 +1126,14 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // its call site -- the group lifecycle's, right before the merge -- and it is listed here for the
 // same reason: so that the commit which wires it is the commit this list fails on.
 //
+// ValidateUpdatePathLeafNode is the same shape again, and it is here on the commit it landed rather
+// than a plan later. It is RFC 9420 section 7.3's commit door -- the third of the validator's three
+// expectations, and the one that had no caller at all while three comments in this package said it
+// was already built. The client that must call it is the one PROCESSING a commit, which is the
+// layer MergeUpdatePath hands the leaf's signature to and which has not landed; until it does, this
+// package ships a section 7.3 door its own construction does not run, and that fact belongs here
+// rather than in the gap between two tasks.
+//
 // ValidateProposalList is p7 task 7's aggregate, and it is here for exactly that reason rather than
 // because anything about it is unfinished. Its twenty one rules are all applied -- ValidateProposalList
 // runs every one of them, and ApplyProposals runs the two structural ones on its own account -- but
@@ -1137,6 +1145,7 @@ var rulesThisPackageExportsAndNothingApplies = []string{
 	"CheckSenderLeaf",
 	"CheckUpdatePathKeyUniqueness",
 	"ValidateProposalList",
+	"ValidateUpdatePathLeafNode",
 }
 
 // exportedRulesOfThisPackage is every exported function of the non test source whose whole answer

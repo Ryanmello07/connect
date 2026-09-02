@@ -1680,6 +1680,19 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// did not compute, which is the reading a provider of its own cannot pass at all.
 	"VerifyAuthenticatedContent": "answers an error and no bytes, so the tagging provider has nothing in the answer to flip",
 
+	// RFC 9420 section 7.3's commit door, on VerifyAuthenticatedContent's terms exactly: it
+	// answers an error, and the one provider method it reaches is VerifyWithLabel, which
+	// taggingProviderPassesThrough already names as unflippable. A row here would report "did not
+	// route through its provider" for every possible implementation.
+	//
+	// It is not unheld. TestTheCommitDoorRefusesEveryWayAnUpdatePathLeafIsWrongForThisPosition
+	// moves the sender index, the group id, the signature and the group's extensions and requires
+	// each to change the verdict, which no verifier reaching for a provider of its own could
+	// satisfy; the KDF.Nh gate runs it over a provider whose hash is 48 and requires it to work
+	// there; and TestEveryPublishedUpdatePathCarriesACommitSourceLeaf drives it over every source
+	// the package declares.
+	"ValidateUpdatePathLeafNode": "answers an error and no bytes, and reaches only VerifyWithLabel, which the tagging provider passes through",
+
 	// framing's ValSem007 and ValSem008, on exactly those terms. It answers an error, and the
 	// one provider method it reaches is MacVerify, which answers a bool the tagging wrapper has
 	// nothing to flip in. It is not unheld: TestProviderHasNoRemainingStubs moves its key, its

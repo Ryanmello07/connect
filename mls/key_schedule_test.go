@@ -3688,6 +3688,9 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 	// a nil literal and a nil valued variable of the type are the same argument, and the
 	// second is how an unset struct field arrives
 	var unset *GroupContext
+	// built once, against the real context, so the rows that hand this door a nil context are
+	// handing it a nil context and nothing else
+	commitPath := commitPathValidUnder(t, crypto, ksVectorEpoch0GroupContext(t), LeafIndex(1))
 	covered := map[string]func(context *GroupContext) error{
 		"DeriveJoinerSecret": func(context *GroupContext) error {
 			_, err := DeriveJoinerSecret(crypto, secret, secret, context)
@@ -3713,6 +3716,13 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 		"ApplyProposals": func(context *GroupContext) error {
 			_, err := ApplyProposals(NewRatchetTree(), context, LeafIndex(0), &ProposalList{})
 			return err
+		},
+		// RFC 9420 section 7.3's commit door. The context is where the group id, the suite and
+		// the extensions the leaf is judged against all come from, so a nil one leaves this
+		// door with no expectation to state rather than with an empty one -- and the PATH here
+		// is live, built against the real context once, so the refusal is the context's.
+		"ValidateUpdatePathLeafNode": func(context *GroupContext) error {
+			return ValidateUpdatePathLeafNode(crypto, context, LeafIndex(1), commitPath)
 		},
 		// p7 task 6's proposal cache used to be in this class and is deliberately not any
 		// more. It takes a *VerifiedGroupContext now -- a group context whose authority has
@@ -4443,6 +4453,21 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 					crypto.HashSize(), signErr)
 			}
 			return [][]byte{authContent.Auth.Signature}
+		}},
+		// RFC 9420 section 7.3's commit door. It reads no length off the provider -- what it
+		// takes from one is a verification -- so what this row states is the other half of the
+		// equivalence: it must WORK over a provider whose KDF.Nh is not 32, which a body that
+		// had cut anything about the LeafNodeTBS to a written down 32 would refuse. It answers
+		// no bytes and is named as such.
+		{name: "ValidateUpdatePathLeafNode", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			context := &GroupContext{Version: ProtocolVersionMls10, CipherSuite: crypto.Suite(),
+				GroupId: []byte("kdf-nh-group"), Epoch: 1}
+			path := commitPathValidUnder(t, crypto, context, LeafIndex(1))
+			if err := ValidateUpdatePathLeafNode(crypto, context, LeafIndex(1), path); err != nil {
+				t.Fatalf("ValidateUpdatePathLeafNode over a provider whose KDF.Nh is %d refused a leaf signed over the same one: %v",
+					crypto.HashSize(), err)
+			}
+			return nil
 		}},
 		{name: "VerifyAuthenticatedContent", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			groupContext := framingStubGroupContext(t, crypto)

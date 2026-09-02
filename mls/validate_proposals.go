@@ -629,9 +629,13 @@ func ValSem112UpdateSenderIsMember(in *ProposalValidationInput) error {
 // Update proposal according to Section 7.3."
 //
 // IT IS THE UPDATE DOOR ONTO (*LeafNode).Validate, and until it existed there was none.
-// LeafValidationContext.ExpectedSource's own header names three callers -- "key_package.go with
-// key_package, proposal validation with update, the tree and the update path with commit" -- and
-// only the first and the third had been written. An Update's leaf therefore reached
+// LeafValidationContext.ExpectedSource names one caller per source -- key_package.go with
+// key_package, this with update, treekem.go's ValidateUpdatePathLeafNode with commit -- and when
+// this landed only the first of the three had been written. The header said otherwise, which is
+// the whole reason it is now derived rather than described:
+// TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap reads the door class off the
+// call sites, and the commit door landed one round later against that gate rather than against
+// another paragraph. An Update's leaf therefore reached
 // (*RatchetTree).UpdateLeaf, through ApplyProposals, with no signature check, no leaf_node_source
 // check, no credential check and no section 13.4 group extension check: a member could install any
 // leaf at its own index, including one another member signed, and this package would take it.

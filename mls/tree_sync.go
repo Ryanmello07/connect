@@ -182,42 +182,51 @@ func (self *RatchetTree) validateStructure() error {
 
 // validateLeaves is check 2: every non-blank leaf passes RFC 9420 section 7.3 at its own index.
 //
-// The expected source is INFERRED from the leaf rather than demanded by the caller, and that is
-// the one rule of section 7.3 this call site cannot state. A settled tree legally holds all
-// three sources at once -- key_package under a member who was added and has not committed since,
-// update under one who refreshed itself, commit under whoever last committed a path -- so there
-// is no single source a whole tree sweep could expect.
+// The source is the one rule of section 7.3 this call site does not judge, and it SAYS SO --
+// LeafValidationContext.SourceIsNotJudgedHere -- rather than inferring an expectation. A settled
+// tree legally holds all three sources at once -- key_package under a member who was added and has
+// not committed since, update under one who refreshed itself, commit under whoever last committed
+// a path -- so there is no single source a whole tree sweep could expect.
 //
-// What survives the inference is every other rule, and the signature BINDING is the one to read
+// IT USED TO INFER ONE, and the difference is not a matter of spelling. The call below read
+// `ExpectedSource: leaf.LeafNodeSource`, the expectation taken from the leaf being judged, so
+// Validate's comparison was `x != x` for every input and ErrLeafNodeSourceMismatch could not fire
+// from this door at all -- a check that reported clean having compared nothing, at a call site that
+// read like a door. Saying nothing is defensible here and saying it that way was not.
+//
+// What survives the waiver is every other rule, and the signature BINDING is the one to read
 // twice, because it is NOT uniform across the three sources. signatureContent puts the group id
 // and the leaf index into the preimage under update and commit, so a leaf of either of those
 // sources, lifted from another group or from another index of this one, is refused here. Under
 // key_package that arm of the section 7.2 select is EMPTY -- no group id and no leaf index -- so
 // a key_package leaf verifies at every index of every group, and this door accepts it wherever
 // it sits. That is RFC 9420 as written and not a defect of this file; it is written down here
-// because it is what makes the inference a COST rather than a free choice, and because a reader
+// because it is what makes the waiver a COST rather than a free choice, and because a reader
 // deciding whether a per position source rule is still owed would otherwise have to reconstruct
 // it from leaf_node.go's select.
 // TestTheIndexAndGroupBindingIsUpdateAndCommitsAndNotKeyPackages measures both halves of it.
 //
 // What holds a key_package leaf in place instead is every rule that is not a signature: check 3
 // refuses a repeated signature key, so one signed leaf cannot occupy two positions at once, and
-// an expired one is refused by the lifetime clause below. What is still OWED is the per position
-// source rule -- "this position takes commit" -- which the update path and the proposal
-// validator state at their own doors, where the position's history is known and where a
+// an expired one is refused by the lifetime clause below. The per position source rule -- "this
+// position takes commit" -- is owed by the doors that know the position's history, where a
 // key_package leaf turning up at a position that has just committed is refusable. This door
 // cannot state it and does not pretend to.
 //
-// THE PROPOSAL VALIDATOR'S HALF HAS LANDED and the update path's has not, which is worth saying
-// here because this paragraph is where a reader comes to find out. validate_proposals.go's
-// validateUpdateLeafNodeIsValidForAnUpdate is section 12.1.2's door: it expects the update source
-// at the sender's own index under the group's own id. The commit half -- an UpdatePath's leaf,
-// expected to carry the commit source at the sender's position -- has no caller in this package
-// yet, and TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap is what holds that gap
-// visible rather than leaving it to this sentence.
+// BOTH OF THOSE DOORS EXIST NOW, which is worth saying here because this paragraph is where a
+// reader comes to find out. validate_proposals.go's validateUpdateLeafNodeIsValidForAnUpdate is
+// section 12.1.2's: it expects the update source at the sender's own index under the group's own
+// id. treekem.go's ValidateUpdatePathLeafNode is the commit half: a RECEIVED UpdatePath's leaf,
+// expected to carry the commit source at the sender's position, under the group id, the suite and
+// the group context extensions the receiver holds.
+// TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap derives the source class and the
+// door class off the call sites of the validator and holds them against each other, so a door
+// deleted is a failure rather than a sentence that goes quietly out of date.
 //
-// An unknown source is refused too, by marshalCore, which is why the self comparison is not a
-// hole: the preimage for a fourth source cannot be built at all.
+// An unknown source is refused here too, and by the signature rather than by the waived rule:
+// marshalCore has no arm for a fourth source, so the preimage cannot be built and VerifySignature
+// answers ErrTreeMalformed. That is what this sweep gets for free from verifying the signature at
+// every leaf, and it is why waiving the source rule is not the same as accepting any octet.
 func (self *RatchetTree) validateLeaves(ctx *TreeValidationContext) error {
 	for i := uint32(0); i < uint32(self.LeafWidth()); i += 1 {
 		leaf := self.Leaf(LeafIndex(i))
@@ -225,15 +234,17 @@ func (self *RatchetTree) validateLeaves(ctx *TreeValidationContext) error {
 			continue
 		}
 		err := leaf.Validate(&LeafValidationContext{
-			Crypto:          ctx.Crypto,
-			Suite:           ctx.Suite,
-			GroupId:         ctx.GroupId,
-			LeafIndex:       LeafIndex(i),
-			ExpectedSource:  leaf.LeafNodeSource,
-			RequiredCaps:    ctx.RequiredCaps,
-			GroupExtensions: ctx.GroupExtensions,
-			NowMs:           ctx.NowMs,
-			ClockSkewMs:     ctx.ClockSkewMs,
+			Crypto:  ctx.Crypto,
+			Suite:   ctx.Suite,
+			GroupId: ctx.GroupId,
+			// the position IS demanded -- it is half of what an update and a commit leaf bind
+			// their signature to -- and only the SOURCE is waived. See the header.
+			LeafIndex:             LeafIndex(i),
+			SourceIsNotJudgedHere: true,
+			RequiredCaps:          ctx.RequiredCaps,
+			GroupExtensions:       ctx.GroupExtensions,
+			NowMs:                 ctx.NowMs,
+			ClockSkewMs:           ctx.ClockSkewMs,
 		})
 		if err != nil {
 			return fmt.Errorf("leaf %d: %w", i, err)

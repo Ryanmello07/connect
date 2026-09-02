@@ -293,6 +293,20 @@ var (
 	errGroupContextExtensionNotListed = fmt.Errorf("%w: group context extension", errMissingRequiredCapability)
 )
 
+// errLeafSourceRuleWaivedAndStated is a LeafValidationContext that both waives section 7.3's
+// leaf_node_source rule and states an expectation for it.
+//
+// A refusal rather than a precedence rule, because either precedence is a trap. "The waiver wins"
+// makes one added field switch off a real door in silence, which is the defect class this whole
+// area exists to close; "the expectation wins" makes the waiver a field a caller can set with no
+// effect, which is a second way to write a check that cannot fire. A caller that wrote both did
+// not decide, so neither answer is its answer.
+//
+// It is a refusal about the CONTEXT and not about the leaf, so it names no leaf: every leaf
+// reaching a call site written this way gets it, which is what makes it visible on the first run
+// rather than on the first hostile input.
+var errLeafSourceRuleWaivedAndStated = errors.New("mls: the leaf validation context both waives the leaf_node_source rule and expects a source")
+
 // signatureContent is RFC 9420 section 7.2's LeafNodeTBS: the leaf's fields down to and
 // including extensions, followed -- for the update and commit sources ONLY -- by the group id
 // and the leaf index.
@@ -602,23 +616,45 @@ type LeafValidationContext struct {
 
 	// ExpectedSource is section 7.3's leaf_node_source rule, and it is a REQUIRED input rather
 	// than a defaulted one. The same Validate is reached from three places -- key_package.go
-	// with key_package, proposal validation with update, the tree and the update path with
-	// commit -- and a validator that did not compare against an expectation would accept a
-	// key_package leaf, lifetime and all, exactly where an update leaf belongs.
+	// with key_package, proposal validation with update, the update path with commit -- and a
+	// validator that did not compare against an expectation would accept a key_package leaf,
+	// lifetime and all, exactly where an update leaf belongs.
 	//
-	// TWO OF THOSE THREE ARE WRITTEN, and this paragraph says which because it once did not.
-	// key_package.go states key_package and validate_proposals.go's
-	// validateUpdateLeafNodeIsValidForAnUpdate states update; the COMMIT door is still owed,
-	// and it belongs to the client processing a commit rather than to the tree -- see
-	// MergeUpdatePath, which says in as many words that it does not verify the leaf's
-	// signature. The sentence above described all three for as long as only one of them
-	// existed, which is how an Update's leaf came to reach the tree with nothing having
-	// validated it at all. TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap now
-	// derives the source class and the door class and holds them against each other, so the
-	// commit door is an admitted gap that fails on the commit that closes it rather than a
-	// sentence nobody can check. tree_sync.go's whole tree sweep is not one of the three: it
-	// INFERS the source from the leaf, and its own header says why.
+	// ALL THREE ARE WRITTEN, and this paragraph names them because it has twice described
+	// doors that did not exist. key_package.go states key_package, validate_proposals.go's
+	// validateUpdateLeafNodeIsValidForAnUpdate states update, and treekem.go's
+	// ValidateUpdatePathLeafNode states commit over a RECEIVED UpdatePath's leaf. It described
+	// all three for as long as only one of them existed -- which is how an Update's leaf came
+	// to reach the tree with nothing having validated it at all -- and then described all
+	// three again for as long as two of them did.
+	//
+	// So the sentence is no longer what holds it.
+	// TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap derives the source class
+	// off this package's LeafNodeSource constants and the door class off the CALL SITES of
+	// this validator, and holds the two against each other: a fourth source, a door deleted,
+	// or a call site whose expectation is not a constant this package declares is a failure
+	// rather than a paragraph that has gone quietly out of date.
 	ExpectedSource LeafNodeSource
+
+	// SourceIsNotJudgedHere waives the rule above, and one caller legitimately needs it:
+	// (*RatchetTree).validateLeaves sweeps a settled tree, which holds all three sources at
+	// once -- key_package under a member added and not yet committed over, update under one
+	// that refreshed itself, commit under whoever last committed a path -- so there is no
+	// single source a whole tree sweep could demand. Its own header names the doors that owe
+	// the per position rule instead.
+	//
+	// A FIELD rather than a value of ExpectedSource, and that is the whole of why it exists.
+	// The waiver used to be spelled `ExpectedSource: leaf.LeafNodeSource`, the expectation
+	// taken from the very leaf being judged, and under that spelling the comparison below is
+	// `x != x` for every input: ErrLeafNodeSourceMismatch could not fire from the tree door
+	// for anything, and the call site read exactly like a door. A waiver has to be visible to
+	// be reviewable, and a gate can read a field name off a call site while it cannot decide
+	// from an arbitrary expression whether the value came out of the leaf.
+	//
+	// It waives ONLY that rule; every other clause of Validate runs, which is what makes the
+	// tree sweep worth running. Setting it beside an ExpectedSource is refused rather than
+	// resolved -- see errLeafSourceRuleWaivedAndStated.
+	SourceIsNotJudgedHere bool
 
 	// RequiredCaps is the group's required_capabilities extension body, or nil for a group
 	// that carries none. Nil is "no requirement" and is satisfied by anything.
@@ -677,7 +713,13 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 	if ctx == nil || ctx.Crypto == nil {
 		return fmt.Errorf("%w: the leaf's signature is verified through it", ErrNilCryptoProvider)
 	}
-	if self.LeafNodeSource != ctx.ExpectedSource {
+	// the contradiction before the rule, so a context that cannot be read one way is refused
+	// rather than being read the convenient way. See errLeafSourceRuleWaivedAndStated.
+	if ctx.SourceIsNotJudgedHere && ctx.ExpectedSource != 0 {
+		return fmt.Errorf("%w: it waives the rule and expects source %d",
+			errLeafSourceRuleWaivedAndStated, uint8(ctx.ExpectedSource))
+	}
+	if !ctx.SourceIsNotJudgedHere && self.LeafNodeSource != ctx.ExpectedSource {
 		return fmt.Errorf("%w: leaf_node_source is %d and this position takes %d",
 			ErrLeafNodeSourceMismatch, uint8(self.LeafNodeSource), uint8(ctx.ExpectedSource))
 	}

@@ -32,6 +32,7 @@ package mls
 import (
 	"crypto/subtle"
 	"errors"
+	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
@@ -591,12 +592,16 @@ func readOneUpdatePathNode(r *syntax.Reader) (UpdatePathNode, error) {
 //
 // Section 7.6 also requires the leaf_node here to carry leaf_node_source = commit, and this
 // codec does not enforce that either: it decodes whatever leaf the leaf codec accepts, so a
-// key_package sourced leaf inside an UpdatePath decodes cleanly. That relation differs from the
-// ciphertext count above in one way worth writing down -- its door is already built.
-// LeafValidationContext.ExpectedSource is the expectation this position sets to commit and
-// Validate answers ErrLeafNodeSourceMismatch against it, so what was missing was the sentence
-// saying so. TestEveryPublishedUpdatePathCarriesACommitSourceLeaf states the relation against
-// the published corpus and drives both halves.
+// key_package sourced leaf inside an UpdatePath decodes cleanly. The door that DOES enforce it is
+// ValidateUpdatePathLeafNode below, which is section 7.3's commit door onto (*LeafNode).Validate.
+//
+// THAT SENTENCE USED TO SAY THE DOOR WAS ALREADY BUILT AND IT WAS NOT. What existed was the
+// validator's ability to hold an expectation -- LeafValidationContext.ExpectedSource -- with no
+// production caller anywhere in this package setting it to commit, so the relation named here was
+// enforced by nobody, and a test could exercise it only by writing the context itself. The
+// difference between "the validator could answer this" and "some caller asks it" is the whole of
+// the defect that comment was an instance of. TestEveryPublishedUpdatePathCarriesACommitSourceLeaf
+// states the relation against the published corpus and drives the real door.
 type UpdatePath struct {
 	LeafNode LeafNode
 	Nodes    []UpdatePathNode
@@ -940,7 +945,10 @@ func updatePathCoversTheFilteredPath(path *UpdatePath, steps []PathStep) bool {
 // writing it down -- a check both sides assume the other makes is a check nobody makes. The
 // signature is what makes the parent_hash comparison above mean anything, and it is verified by
 // whoever holds the group id and the sender's index, which is the commit processing layer rather
-// than the tree. What this does enforce, and enforces by DERIVATION rather than by a rule of its
+// than the tree. That layer's door is ValidateUpdatePathLeafNode, immediately below, and it is
+// NAMED here rather than gestured at: this paragraph said "the commit processing layer" for as
+// long as there was no such door anywhere in this package, which reads to a caller as an assurance
+// that somebody else is doing it. What this does enforce, and enforces by DERIVATION rather than by a rule of its
 // own, is that the leaf carries a parent_hash field at all: nodeParentHashField answers "no
 // field" for every leaf whose source is not commit, so a path whose leaf claims some other source
 // leaves the node above it with no claimant and VerifyParentHashes refuses it.
@@ -1036,6 +1044,91 @@ func (self *RatchetTree) MergeUpdatePath(crypto CryptoProvider, sender LeafIndex
 	// the adoption, and the last statement that can be reached by a failure is above it. A caller
 	// holding this tree sees the previous epoch or the new one and never a half of both.
 	self.nodes = provisional.nodes
+	return nil
+}
+
+// errUpdatePathLeafNodeInvalid is a received UpdatePath whose leaf_node does not pass RFC 9420
+// section 7.3 at the sender's position, carried unexported on errPathLength's terms and for its
+// reason: the validation plan owns the exported catalogue, and two plans declaring one name in one
+// package is a compile error at merge.
+//
+// It is a WRAP and never the whole answer -- the clause that refused is underneath it, reachable
+// with errors.Is. A caller that could learn only "the path's leaf is bad" cannot tell a forged
+// commit from a member whose capabilities have fallen behind the group's extensions, and those two
+// are repaired at opposite ends: one by refusing the commit, one by asking that member to update.
+var errUpdatePathLeafNodeInvalid = errors.New("mls: the update path's leaf node is not valid for a commit")
+
+// ValidateUpdatePathLeafNode is RFC 9420 section 7.3's COMMIT door: the leaf of a RECEIVED
+// UpdatePath, judged at the sender's position in the group the receiver holds.
+//
+// IT IS THE THIRD OF SECTION 7.3'S THREE DOORS AND UNTIL IT EXISTED THERE WERE TWO.
+// LeafValidationContext.ExpectedSource takes one of three values and each needs a caller stating
+// it: key_package.go states key_package, validate_proposals.go states update, and this states
+// commit. Nothing stated commit; three separate comments described the commit door as already
+// built; and the leaf of a received UpdatePath therefore reached MergeUpdatePath -- and the tree --
+// with no signature check, no leaf_node_source check, no credential check and no section 13.4
+// check. MergeUpdatePath says in as many words that it does not make them. This is the body that
+// does.
+//
+// WHAT A COMMIT LEAF OWES THAT AN UPDATE LEAF DOES NOT, worked out from section 7.6 rather than
+// copied off the update door:
+//
+//   - the SOURCE is commit, which is the field that makes the leaf carry a parent_hash at all.
+//     marshalCore's select gives the commit arm parent_hash and gives the update arm nothing, so a
+//     leaf claiming update inside an UpdatePath is one whose parent_hash is not covered by its own
+//     signature -- and that field is the entire subject of the chain comparison MergeUpdatePath
+//     makes. A receiver skipping this rule compares a recomputed chain against an unsigned field.
+//   - the CONTEXT the signature is bound to is the group's id and the SENDER's index, which is the
+//     binding the update source takes too and is why signatureContent's select covers update and
+//     commit together. Without it a commit leaf verifies in whatever group it is pasted into at
+//     whatever position it is moved to.
+//
+// WHAT IT DOES NOT JUDGE is the parent_hash VALUE and the path around it. That is section 7.9.2's
+// obligation, it needs the whole merged tree rather than one leaf, and MergeUpdatePath already
+// makes it twice over -- the chain comparison and VerifyParentHashes. Two doors, one rule each,
+// and this one is written so neither has to assume the other ran: it is a pure function of a leaf
+// and a group context, safe to call before the merge as well as after.
+//
+// The clock is left out, and for a commit leaf that is not the documented NowMs opt out being
+// taken -- it is the one input this rule has no use for. The lifetime is a variant field only a
+// key_package leaf carries, so validateLifetime returns before reading it under any other source,
+// and a NowMs passed here would be an input no branch could read.
+func ValidateUpdatePathLeafNode(crypto CryptoProvider, context *GroupContext, sender LeafIndex,
+	path *UpdatePath) error {
+	// the provider ahead of every other argument, which is what
+	// TestEveryDeclarationHandedANilProviderRefusesRatherThanDereferencingIt demands of every
+	// declaration taking one, and is MergeUpdatePath's order next door.
+	if crypto == nil {
+		return ErrNilCryptoProvider
+	}
+	if context == nil {
+		return fmt.Errorf("%w: the group id, the suite and the extensions the leaf is judged against are all its",
+			ErrNilGroupContext)
+	}
+	if path == nil {
+		return errNilUpdatePath
+	}
+	// read off the group's own extensions rather than taken as a second argument, so this door and
+	// section 13.4's loop inside Validate read one list. A required_capabilities passed separately
+	// is a second source of truth for something the GroupContext already carries, and the two
+	// disagreeing admits a leaf against requirements the group does not have.
+	required, err := requiredCapabilitiesOf(context.Extensions)
+	if err != nil {
+		return err
+	}
+	err = path.LeafNode.Validate(&LeafValidationContext{
+		Crypto:          crypto,
+		Suite:           context.CipherSuite,
+		GroupId:         context.GroupId,
+		LeafIndex:       sender,
+		ExpectedSource:  LeafNodeSourceCommit,
+		RequiredCaps:    required,
+		GroupExtensions: context.Extensions,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: the path published at leaf %d: %w",
+			errUpdatePathLeafNodeInvalid, sender, err)
+	}
 	return nil
 }
 

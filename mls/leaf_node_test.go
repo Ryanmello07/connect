@@ -3663,3 +3663,79 @@ func TestLeafNodeValidateTreatsAZeroClockAsAnOptOutOfTheLifetimeCheck(t *testing
 		t.Errorf("a one millisecond clock: err = %v, want ErrLeafNodeLifetime", err)
 	}
 }
+
+// TestLeafNodeValidateWaivesTheSourceRuleOnlyWhenAskedAndOnlyThatRule is the other half of the
+// leaf_node_source rule: the one position that legitimately states no expectation, and everything
+// that position still judges.
+//
+// A whole tree sweep holds all three sources at once and cannot demand any of them, so
+// SourceIsNotJudgedHere exists. What it must not become is a way of switching the door off, and
+// there are three ways that could happen. It could waive more than the source rule -- so every
+// other clause is asserted UNDER the waiver here. It could be settable beside an expectation, in
+// which case one added field silently disables a real door -- so the contradiction is refused, over
+// the whole octet space rather than the one value somebody would have tried. And it could be
+// spelled as an expectation taken from the leaf, which is what tree_sync.go used to do and is a
+// comparison of a value with itself; leaf_validation_doors_test.go is what refuses that spelling at
+// every call site.
+func TestLeafNodeValidateWaivesTheSourceRuleOnlyWhenAskedAndOnlyThatRule(t *testing.T) {
+	crypto := leafValidationCrypto(t)
+	waiving := func(source LeafNodeSource) *LeafValidationContext {
+		ctx := leafValidationContextFor(crypto, source)
+		ctx.ExpectedSource = 0
+		ctx.SourceIsNotJudgedHere = true
+		return ctx
+	}
+	sources := leafNodeSources(t)
+	// every source is accepted, which is the whole reason the waiver exists
+	for _, source := range sources {
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+		if err := leaf.Validate(waiving(source)); err != nil {
+			t.Errorf("a %d sourced leaf is refused at a position that judges no source: %v", source, err)
+		}
+	}
+	// and only the source rule is waived: the signature is still verified, at the same position
+	for _, source := range sources {
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+		if len(leaf.Signature) == 0 {
+			t.Fatalf("the %d sourced fixture carries no signature", source)
+		}
+		leaf.Signature[0] ^= 0xFF
+		if err := leaf.Validate(waiving(source)); !errors.Is(err, errBadSignature) {
+			t.Errorf("a %d sourced leaf whose signature does not verify was answered %v under the waiver, want %v; the waiver is meant to drop one rule and not the file",
+				source, err, errBadSignature)
+		}
+	}
+	// and section 13.4's clause, which is a rule about the GROUP and is most of what a whole tree
+	// sweep is running for
+	for _, source := range sources {
+		leaf := leafValidationSignedLeaf(t, crypto, source, nil)
+		ctx := waiving(source)
+		ctx.GroupExtensions = append(ctx.GroupExtensions,
+			Extension{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}})
+		if err := leaf.Validate(ctx); !errors.Is(err, errGroupContextExtensionNotListed) {
+			t.Errorf("a %d sourced leaf that does not support an extension the group carries was answered %v under the waiver, want %v",
+				source, err, errGroupContextExtensionNotListed)
+		}
+	}
+	// the contradiction, over the whole octet space of expectations rather than over one value.
+	// The pairing worth reading twice is the one where the expectation MATCHES the leaf's own
+	// source: "the waiver wins" accepts it and "the expectation wins" accepts it, and both of
+	// those are a context that means two things at once being read as one of them.
+	refused := 0
+	for _, actual := range sources {
+		leaf := leafValidationSignedLeaf(t, crypto, actual, nil)
+		for expected := 1; expected <= 0xFF; expected += 1 {
+			ctx := waiving(actual)
+			ctx.ExpectedSource = LeafNodeSource(expected)
+			if err := leaf.Validate(ctx); !errors.Is(err, errLeafSourceRuleWaivedAndStated) {
+				t.Fatalf("a context that waives the source rule and expects %d answered %v over a %d sourced leaf, want %v",
+					expected, err, actual, errLeafSourceRuleWaivedAndStated)
+			}
+			refused += 1
+		}
+	}
+	if refused != len(sources)*0xFF {
+		t.Fatalf("the contradiction sweep ran %d pairings over %d sources; it is not covering the octet space",
+			refused, len(sources))
+	}
+}
