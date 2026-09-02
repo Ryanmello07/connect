@@ -413,6 +413,12 @@ func pickControlIPAddr(addrs []net.IPAddr) net.IPAddr {
 	return addrs[0]
 }
 
+// ControlFamilyStatus describes any live demotion, and is empty when there is
+// none. For a developer ui that shows what auto has learned.
+func ControlFamilyStatus() string {
+	return controlFamilyStatus()
+}
+
 func swapControlFamilyProbe(probe func(family int) bool) func() {
 	controlFamilyLedger.mu.Lock()
 	defer controlFamilyLedger.mu.Unlock()
