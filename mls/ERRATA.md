@@ -204,3 +204,90 @@ initial extension registry (section 17.3), and
 `TestTheDefaultExtensionTypeClassIsExactlyTheFiveRfc9420Section72Names` holds the range against
 the five code points over the whole uint16 space. A code point registered by a later document is
 **not** default and must be listed.
+
+---
+
+## Erratum 8815 — Section 12.2, proposal references in a Commit are not validated
+
+Retrieved from <https://errata.rfc-editor.org/eid8815> on **2026-09-02**.
+
+| | |
+|---|---|
+| Errata ID | 8815 |
+| RFC | 9420, "The Messaging Layer Security (MLS) Protocol", July 2023 |
+| Section | 12.2 |
+| Status | **Reported** |
+| Type | Technical |
+| Reported By | Ludovic Paillat |
+| Date Reported | 2026-03-09 |
+
+### Section 12.2 says
+
+```
+For a regular, i.e., not external, Commit, the list is invalid if any of the following occurs: It
+contains an individual proposal that is invalid as specified in Section 12.1.
+```
+
+### It should say
+
+```
+For a regular, i.e., not external, Commit, the list is invalid if any of the following occurs: It
+contains a reference to a proposal that was not previously received by the group member. It
+contains an individual proposal that is invalid as specified in Section 12.1.
+```
+
+### Notes
+
+**Not transcribed.** The retrieval available here returns the errata page through a summarising
+fetch, and what it gave back for this field was a paraphrase in the third person ("The errata
+submitter observes that ...") rather than the submitter's own words. This file's first rule is
+quote, do not summarise, so the Notes are recorded as unread rather than as a quotation they are
+not. Anyone revisiting this should read them at the URL above.
+
+### What has been checked against the source, and what has not
+
+**Verified against the errata page, <https://errata.rfc-editor.org/eid8815>, on 2026-09-02.** The
+metadata table — errata ID, RFC, section, status `Reported`, type Technical, reporter, date
+reported — and the two language blocks.
+
+**NOT verified: the line breaking of the two quoted blocks.** The errata page renders them as
+fixed-width blocks and the retrieval returned them as running text, so the wrapping above is this
+file's and not the page's. The words are the page's; the line breaks are not. That distinction
+matters here because RFC 9420 section 12.2's own list is a bulleted one and the quotation reads as
+a run-on sentence, which is an artefact of the retrieval rather than of the erratum.
+
+**Verified against RFC 9420 itself: section 12.2's invalidation list and section 12.4's
+ProposalOrRef.** Section 12.2's list of what makes a proposal list invalid is quoted in full in
+`mls_measure/mls-go/rfc9420.txt` and contains no clause about references at all, while section 12.4
+says "Proposals sent by reference are specified by including the hash of the AuthenticatedContent
+object in which the proposal was sent" and "A sender and a receiver of a Commit MUST verify that the
+committed list of proposals is valid as specified in Section 12.2". The gap the erratum names is
+real in the published text.
+
+### What this package does
+
+`CheckErrata8815` in `validate_commit.go` states the added clause over a commit's `ProposalOrRef`
+vector: every entry of type `reference` names a proposal this member holds. It answers
+`errProposalNotCached`, which is the value `(*ProposalCache).Resolve` already answers the same
+question with — one rule, one value, two doors. A nil cache holds nothing, so a commit naming any
+reference is refused under one; a commit carrying only by-value proposals names no reference and
+passes, which is the correct answer for it.
+
+`(*ProposalCache).Resolve` already refused an uncached reference before this entry existed, so the
+erratum costs this implementation no behaviour change on the path that resolves a vector. What it
+adds is the rule stated where a vector has NOT been resolved — a commit this client is assembling,
+or one whose list arrived already bucketed — and a named target the negative test can drive.
+
+**This is stricter than the published RFC, deliberately, and the erratum is only `Reported`.** The
+consequences:
+
+- Security: without the clause, section 12.2 states no rule about references, so a commit naming a
+  reference no member holds is not invalid by the published text. Every receiver that cannot resolve
+  it computes a different post-commit tree from the committer, and the disagreement is only caught
+  by the confirmation tag — after the epoch has been derived, with nothing left to say which
+  proposal was missing.
+- Interoperability: none observed. A peer implementing the published text still has to resolve the
+  reference in order to apply the commit at all, so a commit this rule refuses is one that peer
+  cannot apply either. The divergence is in what is REPORTED, not in what is accepted.
+- Status: `Reported` means submitted and nothing more. Re-read the status at the URL above rather
+  than trusting this table, which is a snapshot of one day.

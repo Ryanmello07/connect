@@ -1269,6 +1269,23 @@ func (self *ProposalCache) Cached(groupContext *GroupContext, ref ProposalRef) (
 	return cached, ok
 }
 
+// holds answers whether this cache carries an entry under that reference.
+//
+// The question erratum 8815 asks -- "was this proposal previously received by the group member" --
+// and nothing else. It is separate from Cached because it answers it WITHOUT the epoch binding:
+// CheckErrata8815 judges a vector rather than resolving one, and the binding is CheckEpoch's rule
+// with CheckEpoch's own sentinel, so re-deciding it here would give one condition two names.
+//
+// A nil cache holds nothing, which is what makes CheckErrata8815 fail closed under one rather than
+// having to guard for it.
+func (self *ProposalCache) holds(ref ProposalRef) bool {
+	if self == nil {
+		return false
+	}
+	_, cached := self.byRef[string(ref)]
+	return cached
+}
+
 // Resolve turns a commit's ProposalOrRef vector into one bucketed list, so that validation and
 // application have exactly one path whether the commit carried a proposal inline or by name.
 //

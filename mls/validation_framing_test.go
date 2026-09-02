@@ -1122,9 +1122,21 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // and a p8 that slipped would have left this package shipping a receive path that accepts another
 // group's message with nothing anywhere failing.
 //
-// CheckUpdatePathKeyUniqueness is the same shape one plan over. tree_sync.go's own comment names
-// its call site -- the group lifecycle's, right before the merge -- and it is listed here for the
-// same reason: so that the commit which wires it is the commit this list fails on.
+// CheckUpdatePathKeyUniqueness WAS here for that reason and is not any more, which is the half of
+// this list that is easiest to forget: p7 task 10's ValSem207PathEncryptionKeysUnique is the funnel
+// tree_sync.go's comment named, so the rule has the caller it was waiting for and this list failed
+// until the entry came off.
+//
+// ValidateCommit is p7 task 10's aggregate, and it is here for ValidateProposalList's reason rather
+// than because anything about it is unfinished. Its twelve rules are all applied -- ValidateCommit
+// runs every one of them -- but the commit paths that call the aggregate are tasks 18 and 22, which
+// have not landed. Until they do, this package ships a section 12.4.2 validator that its own commit
+// construction does not run.
+//
+// ValSem205ConfirmationTag is the one rule of that file the aggregate deliberately does not run,
+// and it is unwired for a reason that is a fact about the protocol rather than about the plan's
+// order: the confirmation key belongs to the epoch the commit OPENS, so it does not exist until the
+// new key schedule has been derived. The caller that has one is p7 task 18.
 //
 // ValidateUpdatePathLeafNode is the same shape again, and it is here on the commit it landed rather
 // than a plan later. It is RFC 9420 section 7.3's commit door -- the third of the validator's three
@@ -1143,7 +1155,8 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 var rulesThisPackageExportsAndNothingApplies = []string{
 	"CheckFramedContentContext",
 	"CheckSenderLeaf",
-	"CheckUpdatePathKeyUniqueness",
+	"ValSem205ConfirmationTag",
+	"ValidateCommit",
 	"ValidateProposalList",
 	"ValidateUpdatePathLeafNode",
 }

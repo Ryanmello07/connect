@@ -3724,6 +3724,14 @@ func TestEveryConstructorOverAGroupContextRefusesANilOne(t *testing.T) {
 		"ValidateUpdatePathLeafNode": func(context *GroupContext) error {
 			return ValidateUpdatePathLeafNode(crypto, context, LeafIndex(1), commitPath)
 		},
+		// p7 task 10's erratum 8745 door. The context is where the extensions the update
+		// path's leaf owes support for come from, so a nil one leaves this rule with nothing
+		// to hold the leaf against -- which is a check skipped rather than a check passed.
+		// The PATH is live, built against the real context once, so the refusal is the
+		// context's.
+		"CheckErrata8745": func(context *GroupContext) error {
+			return CheckErrata8745(commitPath, context)
+		},
 		// p7 task 6's proposal cache used to be in this class and is deliberately not any
 		// more. It takes a *VerifiedGroupContext now -- a group context whose authority has
 		// been established, whose only constructor is (*GroupInfo).VerifiedContext --

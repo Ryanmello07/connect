@@ -210,6 +210,13 @@ type leafValidationDoor struct {
 	// file is the base name of the file the call is written in, and position is file:line.
 	file     string
 	position string
+	// callSite is the file and the DECLARATION the call is written in, which is what the waiver
+	// table below is keyed by. See leafValidationPositionsThatDoNotJudgeTheSource: keyed by file
+	// alone, a second waiving call inside an already-admitted file was admitted with no reason of
+	// its own, which is the base-name-exemption shape this project has now shipped four times.
+	// It is not the position, because a line number moves whenever anything above it is edited
+	// and a waiver that expired on an unrelated commit would be re-approved without being read.
+	callSite string
 	// expects is the LeafNodeSource constant this position names, empty for a waiver.
 	expects string
 	// waives is a position that states no expectation at all.
@@ -236,34 +243,73 @@ func scanLeafValidationDoors(t *testing.T) leafValidationDoorScan {
 	validate := source.declarationNamed(t, "*LeafNode", "Validate")
 	scan := leafValidationDoorScan{source: source, consumed: map[*ast.CompositeLit]bool{}}
 	for _, file := range source.files {
+		// the literals over the WHOLE file, because the second half of this derivation is about
+		// contexts built anywhere at all -- including in a package level initializer, which is
+		// not inside any declaration the walk below visits
 		ast.Inspect(file, func(node ast.Node) bool {
-			if literal, isLiteral := node.(*ast.CompositeLit); isLiteral {
-				if named, isNamed := literal.Type.(*ast.Ident); isNamed &&
-					named.Name == leafValidationContextType {
-					scan.literals = append(scan.literals, literal)
-				}
+			literal, isLiteral := node.(*ast.CompositeLit)
+			if !isLiteral {
 				return true
 			}
-			call, isCall := node.(*ast.CallExpr)
-			if !isCall {
-				return true
-			}
-			selector, isSelector := call.Fun.(*ast.SelectorExpr)
-			if !isSelector || source.info.Uses[selector.Sel] != validate {
-				return true
-			}
-			literal := leafValidationContextLiteralOf(t, source, call)
-			if literal == nil {
-				return true
-			}
-			scan.consumed[literal] = true
-			if door, readable := classifyLeafValidationDoor(t, source, literal); readable {
-				scan.doors = append(scan.doors, door)
+			if named, isNamed := literal.Type.(*ast.Ident); isNamed &&
+				named.Name == leafValidationContextType {
+				scan.literals = append(scan.literals, literal)
 			}
 			return true
 		})
+		// the CALLS per declaration, so each door knows the call site it is written in. A walk
+		// over the whole file cannot say that, and the waiver table has to be keyed by it: keyed
+		// by file, a second waiving call in an already-admitted file is admitted with no reason
+		// of its own.
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				// a call of the validator outside any function body -- in a var initializer,
+				// say -- is one no call site names, so the waiver table could not key it.
+				// Refused rather than skipped: a scan that walked past it would report the
+				// clean bill a complete one reports.
+				ast.Inspect(declaration, func(node ast.Node) bool {
+					if leafValidationCallOf(source, validate, node) != nil {
+						t.Errorf("(*LeafNode).Validate is called at %s, which is not inside a function declaration; this gate keys a door by the declaration it is written in and has nothing to key that one by",
+							source.at(node))
+					}
+					return true
+				})
+				continue
+			}
+			site := source.fileOf(function) + " " + declarationName(function)
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call := leafValidationCallOf(source, validate, node)
+				if call == nil {
+					return true
+				}
+				literal := leafValidationContextLiteralOf(t, source, call)
+				if literal == nil {
+					return true
+				}
+				scan.consumed[literal] = true
+				if door, readable := classifyLeafValidationDoor(t, source, literal); readable {
+					door.callSite = site
+					scan.doors = append(scan.doors, door)
+				}
+				return true
+			})
+		}
 	}
 	return scan
+}
+
+// leafValidationCallOf answers the node as a call of the validator, or nil.
+func leafValidationCallOf(source checkedSource, validate types.Object, node ast.Node) *ast.CallExpr {
+	call, isCall := node.(*ast.CallExpr)
+	if !isCall {
+		return nil
+	}
+	selector, isSelector := call.Fun.(*ast.SelectorExpr)
+	if !isSelector || source.info.Uses[selector.Sel] != validate {
+		return nil
+	}
+	return call
 }
 
 // leafValidationContextLiteralOf is the context a call of the validator states, or nil with the
@@ -364,15 +410,29 @@ func classifyLeafValidationDoor(t *testing.T, source checkedSource,
 // the branch below that has no entry here, and the failure names it.
 var leafValidationSourcesWithNoDoorYet = map[string]string{}
 
-// leafValidationPositionsThatDoNotJudgeTheSource is every production file holding a call of
+// leafValidationPositionsThatDoNotJudgeTheSource is every production CALL SITE of
 // (*LeafNode).Validate that WAIVES section 7.3's leaf_node_source rule, with the reason.
 //
 // A waiver is a decision and this is where it is written down, in both directions: a call site
 // that waives and is not named here fails, and a name here that no call site waives fails too. The
 // point is that switching a real door off has to be a visible edit to this file rather than one
 // extra field in a struct literal nobody diffs.
+//
+// KEYED BY THE CALL SITE AND NOT BY THE FILE, which is the whole of what this map's header used to
+// claim and did not do. `waivers[door.file] = door.position` is last-write-wins, so a SECOND
+// waiving call inside an already-admitted file was admitted with no reason of its own -- measured:
+// a second waiving call in tree_sync.go ran green while the identical call in
+// validate_proposals.go failed immediately. That is the fourth instance of the
+// base-name-exemption shape on this project and the first inside the gate written to close that
+// class: the join gate that exempted a file by base name, the leaf-validation rule applied at
+// element zero, and the ceiling table that enumerated its scope are the other three.
+//
+// The key is the file plus the DECLARATION and not the file plus the LINE, because a line number
+// moves whenever anything above it is edited: a waiver keyed on one would expire on an unrelated
+// commit and be re-approved by whoever was fixing the build rather than read. A declaration
+// holding two waiving calls is refused outright below, so the key cannot silently cover two.
 var leafValidationPositionsThatDoNotJudgeTheSource = map[string]string{
-	"tree_sync.go": "(*RatchetTree).validateLeaves sweeps a settled tree, which legally holds all three sources at once -- key_package under a member added and not yet committed over, update under one that refreshed itself, commit under whoever last committed a path -- so there is no single source a whole tree sweep could demand. Its own header names the two doors that owe the per position rule instead, and every other clause of section 7.3 still runs at every leaf.",
+	"tree_sync.go *RatchetTree.validateLeaves": "sweeps a settled tree, which legally holds all three sources at once -- key_package under a member added and not yet committed over, update under one that refreshed itself, commit under whoever last committed a path -- so there is no single source a whole tree sweep could demand. Its own header names the two doors that owe the per position rule instead, and every other clause of section 7.3 still runs at every leaf.",
 }
 
 // TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap derives both halves and holds
@@ -389,10 +449,10 @@ func TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap(t *testing.T
 	declared := registryConstantsOfType(t, "LeafNodeSource")
 	scan := scanLeafValidationDoors(t)
 	doors := map[string]string{}
-	waivers := map[string]string{}
+	waivers := map[string][]string{}
 	for _, door := range scan.doors {
 		if door.waives {
-			waivers[door.file] = door.position
+			waivers[door.callSite] = append(waivers[door.callSite], door.position)
 			continue
 		}
 		if first, twice := doors[door.expects]; twice {
@@ -441,21 +501,33 @@ func TestEveryLeafNodeSourceEitherHasAValidationDoorOrAnAdmittedGap(t *testing.T
 
 // leafValidationWaiversAreAdmitted holds the waiving call sites against the written reasons in
 // both directions.
-func leafValidationWaiversAreAdmitted(t *testing.T, waivers map[string]string) {
+//
+// THREE conditions and not two, and the third is the one the file-keyed version had no way to
+// state: a call site that waives with no reason fails, a reason for a call site that no longer
+// waives fails, and a DECLARATION holding more than one waiving call fails. Without the third the
+// key still covers two decisions with one reason -- the same last-write-wins hole one level in --
+// and the remedy is to split the second call out or to widen the reason on purpose.
+func leafValidationWaiversAreAdmitted(t *testing.T, waivers map[string][]string) {
 	t.Helper()
-	for _, file := range slices.Sorted(maps.Keys(waivers)) {
-		reason, admitted := leafValidationPositionsThatDoNotJudgeTheSource[file]
+	for _, site := range slices.Sorted(maps.Keys(waivers)) {
+		at := waivers[site]
+		reason, admitted := leafValidationPositionsThatDoNotJudgeTheSource[site]
 		if !admitted {
-			t.Errorf("the call of (*LeafNode).Validate at %s waives section 7.3's leaf_node_source rule and no reason is written down for it. A position that judges no source accepts a key_package leaf, lifetime and all, exactly where a commit leaf belongs -- so the waiver is a decision, and it is made here",
-				waivers[file])
+			t.Errorf("the call of (*LeafNode).Validate at %v waives section 7.3's leaf_node_source rule and no reason is written down for %s. A position that judges no source accepts a key_package leaf, lifetime and all, exactly where a commit leaf belongs -- so the waiver is a decision, and it is made here",
+				at, site)
 			continue
 		}
-		t.Logf("%s waives the source rule: %s", waivers[file], reason)
+		if len(at) > 1 {
+			t.Errorf("%s holds %d waiving calls of (*LeafNode).Validate, at %v, and one reason is written down for it. One reason covering two decisions is the last-write-wins hole this map was re-keyed to close: split the second call into a declaration of its own, or say in the reason why both waive",
+				site, len(at), at)
+			continue
+		}
+		t.Logf("%s waives the source rule at %s: %s", site, at[0], reason)
 	}
-	for _, file := range slices.Sorted(maps.Keys(leafValidationPositionsThatDoNotJudgeTheSource)) {
-		if _, waives := waivers[file]; !waives {
-			t.Errorf("a waiver is written down for %s and no call of (*LeafNode).Validate in that file waives the source rule; the reason has outlived what it excused",
-				file)
+	for _, site := range slices.Sorted(maps.Keys(leafValidationPositionsThatDoNotJudgeTheSource)) {
+		if _, waives := waivers[site]; !waives {
+			t.Errorf("a waiver is written down for %s and no call of (*LeafNode).Validate there waives the source rule; the reason has outlived what it excused",
+				site)
 		}
 	}
 }

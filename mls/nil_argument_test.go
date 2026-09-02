@@ -407,6 +407,17 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		// which is the one state in which a message can supply the epoch. It takes a
 		// *VerifiedGroupContext rather than a *GroupContext, so the OTHER half of that
 		// question -- whose context it is -- is the compiler's rather than a gate's
+		// p7 task 10's two rules that are stated over something other than a validation
+		// input, so their nil guards are argument rules rather than the input rule's.
+		// CheckErrata8745 takes a live path and no context; ValSem300 takes no tree at all,
+		// and answering nil at either would be a rule that reports clean by having nothing
+		// to read.
+		"CheckErrata8745(context)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
+			return CheckErrata8745(&UpdatePath{}, nil)
+		}},
+		"ValSem300NoTrailingBlankNodes(tree)": {sentinel: ErrTreeMalformed, call: func(t *testing.T) error {
+			return ValSem300NoTrailingBlankNodes(nil)
+		}},
 		"NewProposalCache(verified)": {sentinel: ErrNilGroupContext, call: func(t *testing.T) error {
 			_, err := NewProposalCache(nil)
 			return err

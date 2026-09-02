@@ -403,6 +403,77 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"(*LeafNode).checkGroupContextExtensions": {
+		what: "walks every extension of a GROUP CONTEXT and applies RFC 9420 section 13.4, as erratum 8745 " +
+			"corrects it, to each. It SELECTS none -- the walk exists precisely so the rule is not applied to " +
+			"element zero, and ERRATA.md records that narrowing it to element zero once passed the whole suite " +
+			"because a real context is LED by the types section 7.2 exempts. So the repeat is not its rule: a " +
+			"context carrying one type twice is judged twice here and refused, if at all, by whoever reads one " +
+			"through the lookup",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			leaf, _ := testLeafNode(t, crypto, testIdentity(t, crypto, "group-extension-walk"))
+			narrowed := leaf.Clone()
+			narrowed.Capabilities = testNarrowedCapabilities()
+			// the offender BEHIND an entry section 7.2 exempts, which is the one arrangement
+			// that separates a walk from a read of element zero
+			exempt := Extension{ExtensionType: ExtensionTypeRequiredCapabilities}
+			offender := Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor}
+			if err := narrowed.checkGroupContextExtensions([]Extension{exempt, offender}); !errors.Is(err,
+				errGroupContextExtensionNotListed) {
+				t.Errorf("a leaf that does not list the SECOND group context extension was judged %v, want errGroupContextExtensionNotListed; a clause that stops at the first entry steps over the exempt one and never reaches the rule",
+					err)
+			}
+			// and the other half of "it selects nothing": one type carried twice is accepted
+			// here when the leaf lists it, because refusing the repeat is the lookup's rule
+			if err := leaf.checkGroupContextExtensions([]Extension{offender, offender}); err != nil {
+				t.Errorf("a group context carrying one type twice was refused here with %v; if this clause starts refusing the repeat then the package has two doors for one rule and this row is the wrong classification",
+					err)
+			}
+		},
+	},
+	"ValSem209GroupExtensionsSupported": {
+		what: "walks every extension a GroupContextExtensions proposal installs and applies the v1 profile gate " +
+			"to each, then section 13.4 and section 7.3 to every member the commit leaves in the group. It " +
+			"SELECTS none of them -- the one extension it reads BY TYPE, required_capabilities, it reads through " +
+			"requiredCapabilitiesOf and therefore through the lookup, which is what makes a proposal carrying two " +
+			"of them a refusal rather than a choice the committer gets to make",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			// the offending type at entry 1, behind an admitted one
+			outside := testProposalList(t, testGceOf(
+				Extension{ExtensionType: ExtensionTypeRatchetTree},
+				Extension{ExtensionType: ExtensionTypeExternalSenders}))
+			if err := ValSem209GroupExtensionsSupported(
+				testCommitInput(t, crypto, tree, outside, &Commit{})); !errors.Is(err, errProfileExternalSender) {
+				t.Errorf("a group_context_extensions proposal whose SECOND entry is outside the v1 profile was judged %v, want errProfileExternalSender",
+					err)
+			}
+			// one admitted type carried twice is accepted here, because the repeat is the
+			// lookup's rule and this walk applies the profile to every entry
+			twice := testProposalList(t, testGceOf(
+				Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy},
+				Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy}))
+			if err := ValSem209GroupExtensionsSupported(
+				testCommitInput(t, crypto, tree, twice, &Commit{})); err != nil {
+				t.Errorf("a group_context_extensions proposal carrying one admitted type twice was refused here with %v; if this rule starts refusing the repeat then the package has two doors for one rule",
+					err)
+			}
+			// and the type it DOES read by type is read through the lookup, so two
+			// required_capabilities entries are refused rather than one of them chosen
+			repeated := testProposalList(t, testGceOf(
+				testRequiredCapabilitiesNaming(t, ExtensionTypeUrmessageGroupPolicy),
+				testRequiredCapabilitiesNaming(t, ExtensionTypeUrmessageOwnerSuccessor)))
+			if err := ValSem209GroupExtensionsSupported(
+				testCommitInput(t, crypto, tree, repeated, &Commit{})); !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("a group_context_extensions proposal carrying required_capabilities twice was judged %v, want ErrMalformedExtension; the committer would otherwise choose which body every leaf of this group is held to",
+					err)
+			}
+		},
+	},
 	"reconcileWithGroupContext": {
 		what: "compares the leaves' extensions vector against the epoch's POSITIONALLY, entry by entry, after " +
 			"pinning their lengths equal. It selects nothing by type -- both operands of its comparison are read " +

@@ -819,12 +819,8 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 	// the p4 ValSem401 shape again, and it is why
 	// TestLeafNodeValidateReadsEveryGroupContextExtensionAndNotOnlyTheFirst puts the offender
 	// at every position of the vector rather than at the only position a one entry vector has.
-	for i := range ctx.GroupExtensions {
-		extensionType := ctx.GroupExtensions[i].ExtensionType
-		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {
-			return fmt.Errorf("%w: the group context carries extension type %#04x and the leaf does not list it",
-				errGroupContextExtensionNotListed, uint16(extensionType))
-		}
+	if err := self.checkGroupContextExtensions(ctx.GroupExtensions); err != nil {
+		return err
 	}
 	// section 7.3: "If the GroupContext has a required_capabilities extension, then the
 	// required extensions, proposals, and credential types MUST be listed in the LeafNode's
@@ -833,6 +829,28 @@ func (self *LeafNode) Validate(ctx *LeafValidationContext) error {
 		return err
 	}
 	return self.validateLifetime(ctx)
+}
+
+// checkGroupContextExtensions is the loop above, as a body of its own so that the second door onto
+// this rule runs THIS one rather than a copy.
+//
+// The second door is validate_commit.go's CheckErrata8745, which states erratum 8745 over the leaf
+// an UpdatePath publishes without a provider and without verifying a signature. Two bodies applying
+// one rule is how the two come to disagree, and the disagreement is invisible: both accept every
+// conforming leaf, and they differ only on the leaf the erratum is about.
+//
+// EVERY entry, for the reason the caller's comment gives: a loop that answered element zero steps
+// over the exempt entries a real GroupContext carries first and never reaches the non-default
+// extension behind them.
+func (self *LeafNode) checkGroupContextExtensions(groupExtensions []Extension) error {
+	for i := range groupExtensions {
+		extensionType := groupExtensions[i].ExtensionType
+		if !isDefaultExtensionType(extensionType) && !self.Capabilities.SupportsExtension(extensionType) {
+			return fmt.Errorf("%w: the group context carries extension type %#04x and the leaf does not list it",
+				errGroupContextExtensionNotListed, uint16(extensionType))
+		}
+	}
+	return nil
 }
 
 // validateLifetime is section 7.3's lifetime rule, and it is a body of its own because it is
