@@ -382,6 +382,98 @@ func TestEveryLabelledConstructionRefusesACompositionPastOneFieldsLimit(t *testi
 	}
 }
 
+// A label the SENDING half of a construction can actually use.
+//
+// The two rows below driven from the receiving side need a message to receive, and an over
+// long label is one this side cannot sign or seal under either -- so the message under test
+// is made with a label that fits and judged against the one that does not, which is the
+// shape a peer's message has.
+func labelThisSideCanUse(label string) string {
+	if len(MlsLabelPrefix)+len(label) > syntax.MaxVectorLength {
+		return "short"
+	}
+	return label
+}
+
+// The label is the OTHER opaque<V> of a labelled construction, and it is refused on the same
+// terms as the value.
+//
+// This is a test rather than a sentence in checkLabelledConstruction's comment because the
+// half of a rule that nothing drives is the half somebody deletes. Measured: with the label
+// clause removed from checkLabelledConstruction, all 1685 tests of ./mls/... and
+// ./message/... passed except two PINS -- nothing behavioural saw it at all, and a pin says
+// only that a body changed.
+//
+// The boundary is not MaxVectorLength. The "MLS 1.0 " prefix this layer adds is INSIDE the
+// field whose length is being declared, so the largest label that can be written is
+// MaxVectorLength minus the prefix -- and a gate that measured the caller's string alone
+// would admit eight octets that panic. That is the case the middle row exists for.
+func TestEveryLabelledConstructionRefusesALabelTooLongToBeOneField(t *testing.T) {
+	crypto := testCrypto(t)
+	member := testIdentity(t, crypto, "alice")
+	priv, pub, err := crypto.DeriveKeyPair(crypto.Random(32))
+	if err != nil {
+		t.Fatalf("DeriveKeyPair: %v", err)
+	}
+	content := []byte("content")
+	for _, entry := range []struct {
+		name string
+		call func(label string) error
+	}{
+		{name: "SignWithLabel", call: func(label string) error {
+			_, err := crypto.SignWithLabel(member.SigPriv, label, content)
+			return err
+		}},
+		{name: "VerifyWithLabel", call: func(label string) error {
+			signature, err := crypto.SignWithLabel(member.SigPriv, labelThisSideCanUse(label), content)
+			if err != nil {
+				return err
+			}
+			return crypto.VerifyWithLabel(member.SigPub, label, content, signature)
+		}},
+		{name: "EncryptWithLabel", call: func(label string) error {
+			_, _, err := EncryptWithLabel(crypto, pub, label, nil, content)
+			return err
+		}},
+		{name: "DecryptWithLabel", call: func(label string) error {
+			kemOutput, ciphertext, err := EncryptWithLabel(crypto, pub, labelThisSideCanUse(label), nil, content)
+			if err != nil {
+				return err
+			}
+			_, err = DecryptWithLabel(crypto, priv, label, nil, kemOutput, ciphertext)
+			return err
+		}},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, size := range []struct {
+				name    string
+				length  int
+				refused bool
+			}{
+				{name: "one octet under the prefixed limit", length: syntax.MaxVectorLength - len(MlsLabelPrefix) - 1},
+				{name: "exactly the prefixed limit", length: syntax.MaxVectorLength - len(MlsLabelPrefix)},
+				{name: "one octet over the prefixed limit", length: syntax.MaxVectorLength - len(MlsLabelPrefix) + 1, refused: true},
+			} {
+				label := strings.Repeat("l", size.length)
+				var err error
+				recovered := recoveredPanic(func() { err = entry.call(label) })
+				if recovered != nil {
+					t.Fatalf("%s: the construction PANICKED rather than answering: %v", size.name, recovered)
+				}
+				if size.refused {
+					if !errors.Is(err, syntax.ErrLengthExceedsMax) {
+						t.Fatalf("%s: answered %v, want syntax.ErrLengthExceedsMax", size.name, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("%s: a label that FITS was refused with %v", size.name, err)
+				}
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the class, derived off the source rather than listed
 // ---------------------------------------------------------------------------
