@@ -1877,12 +1877,18 @@ func TestEveryWriterOfTheProposalCacheBindingIsClassifiedHere(t *testing.T) {
 			// authority of the value it was taken from, and every *GroupContext names some
 			// epoch whoever wrote the octets chose. An ender that widened back to the bare
 			// type is a door onto the epoch this cache believes it is in, and it fails here.
-			if method.Type.In(at) == reflect.TypeOf(&VerifiedGroupContext{}) {
+			// both halves TRANSITIVELY, for the reason
+			// TestNeitherWriterOfTheCacheBindingTakesABareGroupContext asks it that
+			// way: an ender taking []*GroupContext is the same door as one taking a
+			// bare pointer, and a *VerifiedGroupContext reaches no group context
+			// because its field is unexported
+			if reflectTypeReaches(method.Type.In(at),
+				[]reflect.Type{reflect.TypeOf(&VerifiedGroupContext{})}) {
 				contexts++
 			}
-			if method.Type.In(at) == reflect.TypeOf(&GroupContext{}) {
-				t.Errorf("%s is classified as ending the epoch binding and takes a bare *%s; that is a claim about a struct's fields and not about anybody's authority, and this package decodes one straight off peer octets",
-					name, epochGroupContextTypeName)
+			if reflectTypeReaches(method.Type.In(at), reachGroupContextTargets) {
+				t.Errorf("%s is classified as ending the epoch binding and takes %s, which reaches a bare %s; that is a claim about a struct's fields and not about anybody's authority, and this package decodes one straight off peer octets",
+					name, method.Type.In(at), epochGroupContextTypeName)
 			}
 		}
 		if contexts != 1 {

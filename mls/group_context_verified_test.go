@@ -44,6 +44,7 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/types"
 	"maps"
@@ -171,24 +172,6 @@ func verifiedGroupContextConstructionsIn(checked checkedBodies) (map[string][]ve
 	return found, judged
 }
 
-// verifiedGroupContextSignatureHolds answers whether any of these types is the named type, through
-// any number of pointers.
-//
-// A helper over a tuple rather than a loop written twice, because the two halves of the reader rule
-// ask the same question of a signature's inputs and of its outputs, and two spellings of one
-// question is how one of them ends up narrower than the other.
-func verifiedGroupContextSignatureHolds(tuple *types.Tuple, name string) bool {
-	if tuple == nil {
-		return false
-	}
-	for at := 0; at < tuple.Len(); at += 1 {
-		if extensionTypeSelectionNamedAs(tuple.At(at).Type(), name) {
-			return true
-		}
-	}
-	return false
-}
-
 // verifiedGroupContextReadersIn is the second class: every declaration of one checked package that
 // is HANDED a VerifiedGroupContext and ANSWERS a group context.
 //
@@ -208,6 +191,17 @@ func verifiedGroupContextSignatureHolds(tuple *types.Tuple, name string) bool {
 // every declaration: var leakIt = func(v *VerifiedGroupContext) *GroupContext { return v.inner } is
 // a reader written where no *ast.FuncDecl exists, and a rule that only judged declarations would
 // have the same hole in it that the construction rule had.
+//
+// AND BOTH HALVES ASK THEIR QUESTION TRANSITIVELY, which is the round this file is on now. They
+// used to test each tuple element with extensionTypeSelectionNamedAs, which unwraps *types.Pointer
+// and nothing else, so a result of []*GroupContext -- or a map of them, or a channel of them, or an
+// any holding one -- was read as answering no group context at all. Three such readers were
+// measured surviving the whole suite at 6810 passing, and the control below now carries one per
+// constructor of typeReachesNamed, so an arm that stops working drops a name out of the reported
+// set rather than narrowing in silence. Where the transitive question STOPS -- a struct is entered
+// through its exported fields, a named type's methods are not followed, a signature is entered
+// through its results -- is argued in type_reach_test.go, and the first and second of those are
+// what keep passItOn out of this class.
 func verifiedGroupContextReadersIn(checked checkedBodies) (map[string][]verifiedGroupContextSite, int) {
 	found := map[string][]verifiedGroupContextSite{}
 	judged := 0
@@ -235,16 +229,16 @@ func verifiedGroupContextReadersIn(checked checkedBodies) (map[string][]verified
 					return true
 				}
 				judged += 1
-				handed := verifiedGroupContextSignatureHolds(signature.Params(),
+				handed := typeReachesTupleNamed(signature.Params(),
 					verifiedGroupContextTypeName)
-				if signature.Recv() != nil && extensionTypeSelectionNamedAs(
+				if signature.Recv() != nil && typeReachesNamed(
 					signature.Recv().Type(), verifiedGroupContextTypeName) {
 					handed = true
 				}
 				if !handed {
 					return true
 				}
-				if !verifiedGroupContextSignatureHolds(signature.Results(), groupContextTypeName) {
+				if !typeReachesTupleNamed(signature.Results(), groupContextTypeName) {
 					return true
 				}
 				found[name] = append(found[name], verifiedGroupContextSite{
@@ -359,6 +353,61 @@ var alreadyVouched = &VerifiedGroupContext{inner: &GroupContext{Epoch: 1 << 40}}
 var leakIt = func(verified *VerifiedGroupContext) *GroupContext {
 	return verified.inner
 }
+
+// THE WRAPPED HAND-OUTS. Each is one constructor away from the shape the two gates were written
+// against, and the first three of them were MEASURED to survive the whole suite at 6810 passing --
+// driven end to end, Leaked()[0].GroupId = attackersGroupId turned "the honest group @ 3" into
+// "ATTACKER-CHOSEN-GROUP @ 1099511627776" with NewProposalCache binding to that pair.
+func leakedThroughASlice(verified *VerifiedGroupContext) []*GroupContext {
+	return []*GroupContext{verified.inner}
+}
+
+func (self *VerifiedGroupContext) Leaked() []*GroupContext {
+	return []*GroupContext{self.inner}
+}
+
+func (self *VerifiedGroupContext) Held() any {
+	return self.inner
+}
+
+type contextPointer *GroupContext
+
+type contextBox struct {
+	Held *GroupContext
+}
+
+// the line the reach helper draws, run rather than argued: no holder can spell this field, which
+// is the same property that makes handing back a verified value harmless
+type sealedBox struct {
+	held *GroupContext
+}
+
+func leakedThroughADefinedPointer(verified *VerifiedGroupContext) contextPointer {
+	return verified.inner
+}
+
+func leakedThroughAMapValue(verified *VerifiedGroupContext) map[string]*GroupContext {
+	return map[string]*GroupContext{"it": verified.inner}
+}
+
+func leakedThroughAChannel(verified *VerifiedGroupContext) chan *GroupContext {
+	held := make(chan *GroupContext, 1)
+	held <- verified.inner
+	return held
+}
+
+func leakedThroughAFunctionResult(verified *VerifiedGroupContext) func() *GroupContext {
+	return func() *GroupContext { return verified.inner }
+}
+
+func leakedThroughAStructField(verified *VerifiedGroupContext) *contextBox {
+	return &contextBox{Held: verified.inner}
+}
+
+// and the one that is NOT a reader, which is where the transitive question stops
+func notALeakThroughASealedBox(verified *VerifiedGroupContext) *sealedBox {
+	return &sealedBox{held: verified.inner}
+}
 `
 
 // What the construction matcher must report out of the control, and by omission what it must walk
@@ -373,9 +422,22 @@ var verifiedGroupContextControlConstructions = []string{
 }
 
 // What the reader matcher must report out of the same control.
+//
+// Eleven and not three, because the question is asked transitively now. notALeakThroughASealedBox
+// is the omission that carries the judgement: it hands the inner pointer into a struct whose field
+// no holder can spell, which is the same property VerifiedGroupContext itself rests on, and a
+// matcher that reported it would report every declaration answering a verified context too.
 var verifiedGroupContextControlReaders = []string{
+	"(*VerifiedGroupContext).Held",
 	"(*VerifiedGroupContext).Inner",
+	"(*VerifiedGroupContext).Leaked",
 	"contextOf",
+	"leakedThroughAChannel",
+	"leakedThroughADefinedPointer",
+	"leakedThroughAFunctionResult",
+	"leakedThroughAMapValue",
+	"leakedThroughASlice",
+	"leakedThroughAStructField",
 	"var leakIt",
 }
 
@@ -530,6 +592,22 @@ func TestEveryReaderOfAVerifiedGroupContextIsClassifiedHere(t *testing.T) {
 // struct is a copy. A method this gate cannot call is REPORTED rather than skipped, because a
 // skipped method is a clean run over a reader nobody looked at.
 //
+// AND "ANSWERING A CONTEXT" IS ASKED TRANSITIVELY, which is what this round fixed. The judgement
+// used to be out == contextPointer || out == contextValue, so Leaked() []*GroupContext and
+// Held() any were not judged at all -- both were measured surviving the whole suite at 6810
+// passing, and the second of them was driven end to end into a cache bound to
+// "ATTACKER-CHOSEN-GROUP @ 1099511627776". A method is judged now when its result type REACHES a
+// group context through any composition of pointers, slices, arrays, maps, channels, function
+// results, interfaces and exported struct fields, and what it returned is WALKED for the contexts
+// a holder can actually get out of it. Both walks are typeReachesNamed's, controlled in
+// type_reach_test.go with a member per constructor.
+//
+// The walk answers two different findings and the gate spends both. A POINTER reached is compared
+// against the one the value holds, which catches every hand-out of the storage however it was
+// wrapped; a COPY of the struct is written through, which catches a clone that kept the caller's
+// octet slices. What the walk could not follow -- a function it cannot call, one that panicked --
+// is reported for the reason an undriveable method is.
+//
 // The scribble is checked for being observable before it is trusted: a mutation that wrote nothing
 // would leave the receiver unchanged for a reason that is this test's own and not the type's.
 func TestNoMethodOfAVerifiedGroupContextHandsOutTheStorageItVouchesFor(t *testing.T) {
@@ -551,15 +629,13 @@ func TestNoMethodOfAVerifiedGroupContextHandsOutTheStorageItVouchesFor(t *testin
 		t.Fatalf("the verified context did not marshal: %v", err)
 	}
 
-	contextPointer := reflect.TypeOf((*GroupContext)(nil))
-	contextValue := reflect.TypeOf(GroupContext{})
 	holder := reflect.TypeOf(&VerifiedGroupContext{})
-	judged := 0
+	judged, observed := 0, 0
 	for i := range holder.NumMethod() {
 		method := holder.Method(i)
 		answers := false
 		for at := range method.Type.NumOut() {
-			if out := method.Type.Out(at); out == contextPointer || out == contextValue {
+			if reflectTypeReaches(method.Type.Out(at), reachGroupContextTargets) {
 				answers = true
 			}
 		}
@@ -572,31 +648,28 @@ func TestNoMethodOfAVerifiedGroupContextHandsOutTheStorageItVouchesFor(t *testin
 				verifiedGroupContextTypeName, method.Name, method.Type.NumIn()-1)
 			continue
 		}
-		for _, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(verified)}) {
-			answered := (*GroupContext)(nil)
-			switch result.Type() {
-			case contextPointer:
-				answered, _ = result.Interface().(*GroupContext)
-				if answered == nil {
-					continue
-				}
-				if answered == verified.inner {
-					t.Errorf("%s.%s answers the very pointer the value holds, so any holder of a verified context can rewrite the group it vouches for after the vouching",
-						verifiedGroupContextTypeName, method.Name)
-					continue
-				}
-			case contextValue:
-				held, _ := result.Interface().(GroupContext)
-				answered = &held
-			default:
+		reached, blocked := []reachedGroupContext{}, []string{}
+		for at, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(verified)}) {
+			reachGroupContextsIn(result, fmt.Sprintf("%s result %d", method.Name, at),
+				&reached, &blocked, 0)
+		}
+		for _, one := range blocked {
+			t.Errorf("%s.%s answers something this gate could not follow -- %s -- so it is a reader nobody looked at",
+				verifiedGroupContextTypeName, method.Name, one)
+		}
+		for _, one := range reached {
+			observed += 1
+			if one.identity == verified.inner {
+				t.Errorf("%s.%s hands out the very pointer the value holds, reached as %s, so any holder of a verified context can rewrite the group it vouches for after the vouching",
+					verifiedGroupContextTypeName, method.Name, one.how)
 				continue
 			}
-			whole, err := syntax.Marshal(answered)
+			whole, err := syntax.Marshal(one.context)
 			if err != nil {
 				t.Fatalf("%s answered a context that did not marshal: %v", method.Name, err)
 			}
-			scribbleOverAGroupContext(answered)
-			scribbled, err := syntax.Marshal(answered)
+			scribbleOverAGroupContext(one.context)
+			scribbled, err := syntax.Marshal(one.context)
 			if err != nil {
 				t.Fatalf("%s answered a context that did not marshal after the scribble: %v", method.Name, err)
 			}
@@ -607,8 +680,12 @@ func TestNoMethodOfAVerifiedGroupContextHandsOutTheStorageItVouchesFor(t *testin
 		}
 	}
 	if judged == 0 {
-		t.Fatalf("no method of *%s answers a group context, and Context certainly does, so this gate drove nothing",
+		t.Fatalf("no method of *%s answers a type that reaches a group context, and Context certainly does, so this gate drove nothing",
 			verifiedGroupContextTypeName)
+	}
+	if observed == 0 {
+		t.Fatalf("this gate drove %d methods of *%s and got no group context out of what any of them answered, so a leak in every one of them would read as a clean run",
+			judged, verifiedGroupContextTypeName)
 	}
 	after, err := syntax.Marshal(verified.inner)
 	if err != nil {
@@ -667,11 +744,16 @@ func TestNeitherWriterOfTheCacheBindingTakesABareGroupContext(t *testing.T) {
 		}
 		takesConfirmed := false
 		for at := 0; at < signature.NumIn(); at++ {
-			if signature.In(at) == bare {
-				t.Errorf("%s writes the cache binding and takes a %s; every group context names some epoch and this package decodes one straight off peer octets, so that parameter is a claim about a struct's fields and not about anybody's authority -- take a %s, whose only constructor verified a member's signature over it",
-					name, bare, confirmed)
+			// TRANSITIVELY on both halves. A writer taking []*GroupContext is the same
+			// door as one taking a bare pointer, and it is the door three measured
+			// leaks went through one type up. A *VerifiedGroupContext reaches no group
+			// context: its field is unexported, which is the line type_reach_test.go
+			// draws and the reason this gate can go on demanding that very type.
+			if reflectTypeReaches(signature.In(at), reachGroupContextTargets) {
+				t.Errorf("%s writes the cache binding and takes %s, which reaches a %s; every group context names some epoch and this package decodes one straight off peer octets, so that parameter is a claim about a struct's fields and not about anybody's authority -- take a %s, whose only constructor verified a member's signature over it",
+					name, signature.In(at), bare, confirmed)
 			}
-			if signature.In(at) == confirmed {
+			if reflectTypeReaches(signature.In(at), []reflect.Type{confirmed}) {
 				takesConfirmed = true
 			}
 		}
