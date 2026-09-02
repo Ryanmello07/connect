@@ -191,6 +191,18 @@ func controlDialThrottle(key string) *logThrottle {
 // `bound` is whether this dial path rides the egress-bound dialer — false
 // names a path that is in-tunnel by design (e.g. the mux's tunnel DoH).
 func logControlDialResult(log Logger, tag string, bound bool, network string, addr string, conn net.Conn, err error) {
+	l := loggerOrDefault(log)
+
+	// The family line is NOT gated on egressBound(). The [egress]dial line
+	// below is desktop-only by design -- it reports an interface binding that
+	// only Windows and macOS ever force -- but Android and iOS are the two
+	// platforms where a broken address family is actually reported, and until
+	// this line existed no mobile bundle at any verbosity could say which
+	// family a control dial used.
+	if ok, _ := controlDialThrottle("family|" + tag + "|" + addr).Allow(time.Now()); ok {
+		l.Infof("%s\n", controlDialFamilyLine(tag, network, addr, conn, err))
+	}
+
 	if !egressBound() {
 		return
 	}
@@ -207,7 +219,6 @@ func logControlDialResult(log Logger, tag string, bound bool, network string, ad
 	if 0 < suppressed {
 		suffix = fmt.Sprintf(" (%d suppressed)", suppressed)
 	}
-	l := loggerOrDefault(log)
 	if err != nil {
 		l.Infof("[egress]dial tag=%s %s %s if=4:%d/6:%d bound=%s err=%s%s\n", tag, network, addr, index4, index6, boundStr, err, suffix)
 	} else {

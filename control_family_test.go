@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -293,3 +294,36 @@ type stubConn struct {
 func (self *stubConn) RemoteAddr() net.Addr { return self.remote }
 
 func (self *stubConn) Close() error { return nil }
+
+// The family must be a LITERAL token, never derived from the address. The sdk
+// log redactor rewrites both IPv4 and IPv6 literals to the same opaque token
+// shape, so a redacted bundle -- the mode users are asked to send -- cannot
+// tell a v4 dial from a v6 dial by its address.
+func TestControlDialFamilyLineCarriesALiteralFamilyToken(t *testing.T) {
+	conn := &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}}
+	line := controlDialFamilyLine("api", "tcp", "api.example:443", conn, nil)
+	if !strings.Contains(line, "family=6") {
+		t.Fatalf("line %q does not carry a literal family token", line)
+	}
+	if !strings.Contains(line, "tag=api") {
+		t.Fatalf("line %q does not name the dial tag", line)
+	}
+
+	conn4 := &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}}
+	line4 := controlDialFamilyLine("platform", "tcp", "connect.example:443", conn4, nil)
+	if !strings.Contains(line4, "family=4") {
+		t.Fatalf("line %q does not carry a literal family token", line4)
+	}
+}
+
+// A failed dial has no connection to read a family from, and must say so
+// rather than claim one.
+func TestControlDialFamilyLineOnFailure(t *testing.T) {
+	line := controlDialFamilyLine("api", "tcp4", "api.example:443", nil, errors.New("i/o timeout"))
+	if !strings.Contains(line, "family=?") {
+		t.Fatalf("line %q should report an unknown family on failure", line)
+	}
+	if !strings.Contains(line, "err=") {
+		t.Fatalf("line %q should carry the error", line)
+	}
+}

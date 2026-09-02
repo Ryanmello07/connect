@@ -155,9 +155,9 @@ func controlFamilyDemote(family int) bool {
 	}
 
 	controlFamilyLedger.mu.Lock()
-	defer controlFamilyLedger.mu.Unlock()
 
 	if !controlFamilyLedger.probe(other) {
+		controlFamilyLedger.mu.Unlock()
 		return false
 	}
 
@@ -170,14 +170,24 @@ func controlFamilyDemote(family int) bool {
 	}
 	entry.until = now.Add(backoff)
 	controlFamilyLedger.demoted[family] = entry
+	strikes := entry.strikes
+	controlFamilyLedger.mu.Unlock()
+
+	loggerOrDefault(nil).Infof(
+		"[family]demote family=%d strikes=%d for=%s\n", family, strikes, backoff)
 	return true
 }
 
 // controlFamilyClear drops everything learned. Wired to NetworkChanged.
 func controlFamilyClear() {
 	controlFamilyLedger.mu.Lock()
-	defer controlFamilyLedger.mu.Unlock()
+	hadEntries := 0 < len(controlFamilyLedger.demoted)
 	clear(controlFamilyLedger.demoted)
+	controlFamilyLedger.mu.Unlock()
+
+	if hadEntries {
+		loggerOrDefault(nil).Infof("[family]clear (network changed)\n")
+	}
 }
 
 // controlFamilyDemotedFamily returns the family currently demoted, or 0.
@@ -258,6 +268,46 @@ func probeFamilySupport(family int) bool {
 		}
 	}
 	return false
+}
+
+// controlDialFamilyLine formats the per-dial family evidence.
+//
+// `family=4` / `family=6` is a LITERAL token, deliberately not derived from an
+// address in the rendered line. The sdk's log redactor rewrites both IPv4 and
+// IPv6 literals to the same opaque <addr:hex> shape, including the brackets
+// that would otherwise give an IPv6 address away -- so in a REDACTED bundle,
+// which is the mode a user is asked to send, an address cannot tell a support
+// engineer which family was dialed. This token can.
+func controlDialFamilyLine(
+	tag string,
+	network string,
+	addr string,
+	conn net.Conn,
+	err error,
+) string {
+	family := "?"
+	if f := connFamily(conn); f != 0 {
+		family = fmt.Sprintf("%d", f)
+	}
+	policy := "auto"
+	switch ControlIpFamilyPolicy() {
+	case IpFamilyForce4:
+		policy = "force4"
+	case IpFamilyForce6:
+		policy = "force6"
+	}
+	demoted := controlFamilyStatus()
+	if demoted == "" {
+		demoted = "none"
+	}
+	if err != nil {
+		return fmt.Sprintf(
+			"[family]dial tag=%s net=%s family=%s policy=%s demoted=%s err=%s",
+			tag, network, family, policy, demoted, err)
+	}
+	return fmt.Sprintf(
+		"[family]dial tag=%s net=%s family=%s policy=%s demoted=%s",
+		tag, network, family, policy, demoted)
 }
 
 // isPathTimeout reports whether err is the post-connect timeout that proves a
