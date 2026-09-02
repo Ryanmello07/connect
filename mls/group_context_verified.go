@@ -19,8 +19,8 @@
 // the next reader bypassed by writing the advice down.
 //
 // THE FOURTH ROUND GOT THE TYPE RIGHT AND THE CONSTRUCTOR WRONG. VerifiedGroupContext -- one
-// unexported field, so no declaration outside this package can build one carrying a context
-// however it is spelled -- is the right shape and is kept. Its constructor was
+// unexported field, so no declaration outside this package can build one carrying a context, IN
+// SAFE GO, however it is spelled -- is the right shape and is kept. Its constructor was
 // (*KeySchedule).ConfirmGroupContext, which confirmed a CONFIRMATION TAG against the epoch's own
 // key schedule, and that establishes nothing at all:
 //
@@ -75,9 +75,9 @@
 // ONE DOOR, AND WHAT HOLDS IT IS THE COMPILER. The gates beside it are a review aid, and that
 // division is written here because five rounds of hardening them had it the other way round.
 //
-// WHAT THE COMPILER HOLDS was measured from package mls_test -- outside mls, which is where every
-// untrusted octet arrives from. The only exported route to a *VerifiedGroupContext is
-// (*GroupInfo).VerifiedContext(crypto, tree); Context answers a COPY; the zero value is refused by
+// WHAT THE COMPILER HOLDS, IN SAFE GO, was measured from package mls_test -- outside mls, which
+// is where every untrusted octet arrives from. The only exported route to a
+// *VerifiedGroupContext is (*GroupInfo).VerifiedContext(crypto, tree); Context answers a COPY; the zero value is refused by
 // NewProposalCache with a named error and its Context is nil; and four spellings that would carry a
 // context in from out there are refused by the compiler, EACH WITH ITS OWN DIAGNOSTIC:
 //
@@ -96,19 +96,44 @@
 // field spelled inner is not this struct type, because an unexported field name carries the package
 // that declared it -- which is a different rule answered in different words.
 //
+// UNSAFE IS OUT OF SCOPE, AND IT IS OUT OF SCOPE BY DECISION RATHER THAN UNNOTICED. Every "cannot"
+// in this file is about SAFE Go and is now written that way. Measured from package mls_test, over
+// a shadow struct declared out there:
+//
+//	forged := (*mls.VerifiedGroupContext)(unsafe.Pointer(&shadow{inner: attackersContext}))
+//
+// builds one carrying ATTACKER-CHOSEN-GROUP at epoch 1<<40, and NewProposalCache over it answers a
+// cache and no error. There is no gate here for that and there should not be. An unsafe.Pointer
+// conversion defeats every guarantee the type system makes, so a rule banning one spelling of it
+// would be exactly the enumeration this header spends four rounds arguing against; and a package
+// that can run unsafe in this process can rewrite the context AFTER any check whatever, which no
+// shape of this type could notice. The boundary this file is about is the one the COMPILER
+// decides, and the compiler is not asked about unsafe.
+//
 // WHICH OF THOSE A TEST HOLDS: all of them, and the four refusals DIRECTLY.
-// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler in
-// external_provenance_test.go type checks a synthetic package outside mls, one file per spelling
-// over a shared prologue, and requires each refusal to carry the words that separate it from the
-// others -- "unexported field" and the field's own name for the first two, "cannot convert" and the
-// type's own name for the conversions -- beside a file that differs only in the construction and
-// MUST COMPILE, so a harness that had stopped resolving this package fails rather than reporting
-// clean refusals. The spellings are generated off this type's own field list, so a field renamed,
-// added or exported changes what is compiled rather than leaving the gate watching a name that has
-// moved. An earlier version of this paragraph said a compile error was not something a test in this
-// build could assert, and gave that as the reason the boundary the whole guarantee rests on had no
-// gate; go/types is in the standard library, this package already type checks source through it in
-// four other gates, and this one costs about two and a half seconds.
+// TestEachForgedSpellingThisGateCompilesIsRefusedForItsOwnReason in external_provenance_test.go
+// type checks a synthetic package outside mls, one file per spelling over a shared prologue,
+// beside a file that differs only in the construction and MUST COMPILE, so a harness that had
+// stopped resolving this package fails rather than reporting clean refusals. The spellings are
+// generated off this type's own field list, so an unexported field renamed or added, or the last
+// one exported, changes what is compiled rather than leaving the gate watching a name that has
+// moved. An EXPORTED field added beside it is not one of those, and is the older and stronger
+// rule TestTheZeroVerifiedGroupContextIsTheOnlyOneAnOutsiderCanSpell holds.
+//
+// EACH REFUSAL IS HELD TO WORDS NO OTHER ONE OF THEM CARRIES, and that separation is DERIVED there
+// rather than trusted: the gate reads every refused spelling's diagnostics against every OTHER
+// refused spelling's words and requires them to fall short. The first version of it held both
+// field spellings to "unexported field" and the field's own name, which both diagnostics carry, so
+// either would have satisfied the other's expectation. The two conversions are also held to the
+// SHADOW they convert from -- go/types is asked whether that struct has this type's exact shape,
+// field for field, and whether the two are nonetheless neither identical nor convertible -- because
+// a shadow that had stopped having this shape is refused too, on the ordinary conversion rule, with
+// a diagnostic that reads the same way.
+//
+// An earlier version of this paragraph said a compile error was not something a test in this build
+// could assert, and gave that as the reason the boundary the whole guarantee rests on had no gate;
+// go/types is in the standard library, this package already type checks source through it in four
+// other gates, and this one costs about two and a half seconds.
 //
 // external_provenance_test.go also holds, from OUTSIDE, the property the first two refusals rest on
 // -- the field is unexported -- together with the single exported door and the zero value's two
@@ -141,19 +166,22 @@ import (
 // VerifiedGroupContext is a group context whose authority has been established, and it is the only
 // thing the proposal cache will bind an epoch to.
 //
-// ONE UNEXPORTED FIELD, AND THAT FIELD IS THE WHOLE MECHANISM -- FOR EVERY PACKAGE BUT THIS ONE.
-// A struct whose only field is unexported cannot be built carrying a value from any other package:
-// mls.VerifiedGroupContext{} compiles out there and is the zero value, which every door refuses; a
-// literal with an element and a write of the field are both "cannot refer to unexported field
-// inner"; and a conversion from a struct declared out there with the same shape, in its value form
-// and in its pointer form, is "cannot convert", which is a DIFFERENT refusal on a different rule --
-// an unexported field name carries the package that declared it, so that struct is not this struct
-// type. That is the whole guarantee and it belongs to the compiler. All four refusals are asserted
-// directly, by compiling them: external_provenance_test.go's
-// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler type checks a
-// synthetic package outside mls, generates the spellings off this type's own field list, and holds
-// each to its own diagnostic beside a file that must compile. The same test file holds from outside
-// the property the first two rest on, that this field is unexported.
+// ONE UNEXPORTED FIELD, AND THAT FIELD IS THE WHOLE MECHANISM -- IN SAFE GO, AND FOR EVERY PACKAGE
+// BUT THIS ONE. A struct whose only field is unexported cannot be built, in safe Go, carrying a
+// value from any other package: mls.VerifiedGroupContext{} compiles out there and is the zero
+// value, which every door refuses; a literal with an element and a write of the field are both
+// "cannot refer to unexported field inner"; and a conversion from a struct declared out there with
+// the same shape, in its value form and in its pointer form, is "cannot convert", which is a
+// DIFFERENT refusal on a different rule -- an unexported field name carries the package that
+// declared it, so that struct is not this struct type. That is the whole of the guarantee and it
+// belongs to the compiler, and it stops where safe Go stops: an unsafe.Pointer conversion builds
+// one from outside in a single line, which this file's header states, measures, and deliberately
+// does not gate. All four refusals are asserted directly, by compiling them:
+// external_provenance_test.go's TestEachForgedSpellingThisGateCompilesIsRefusedForItsOwnReason
+// type checks a synthetic package outside mls, generates the spellings off this type's own
+// unexported field list, and holds each to words no other one of them carries, beside a file that
+// must compile. The same test file holds from outside the property the first two rest on, that
+// this field is unexported.
 //
 // INSIDE THIS PACKAGE THE FIELD IS ORDINARY, so nothing here is a barrier and the gates over it are
 // a review aid rather than a fence. An earlier version of this paragraph said the constructions

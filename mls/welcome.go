@@ -178,9 +178,13 @@ func (self *GroupInfo) Sign(crypto CryptoProvider, priv SignaturePrivateKey) err
 //
 // The group id is written down as the ATTACKER'S choice rather than as the joiner's expectation
 // because that is what those two tests set, and naming it so puts the attacker's choice in their
-// failure text. Nothing weaker is being claimed by saying it that way: no rule below reads GroupId
-// at all, so nothing here would treat a group info naming the group the joiner expects any
-// differently.
+// failure text. Nothing weaker is being claimed by saying it that way, and the reason is narrower
+// than "no rule reads it": rule 7 marshals the WHOLE group context, group id and all, as the first
+// member of the preimage, and rule 8 checks the signature over exactly those octets, so a group id
+// edited after signing is refused like any other edit to the signed bytes. What no rule below does
+// is COMPARE GroupId against anything -- there is no name of this method's in which an expectation
+// could arrive, and a joiner holding nothing about this group yet has none to pass. So nothing here
+// would treat a group info naming the group the joiner expects any differently from this one.
 //
 // Every rule below passes over that object because every rule below is TRUE of it: a member of
 // that tree did sign that group info about that tree. The forgery is self-consistent, and

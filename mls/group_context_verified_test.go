@@ -741,7 +741,7 @@ func scribbleOverAGroupContext(context *GroupContext) {
 //
 // The three bypasses this design replaces are compile errors now. A compile error IS reportable --
 // external_provenance_test.go compiles the external forging spellings and observes each refusal in
-// TestEveryExternalSpellingOfAForgedVerifiedGroupContextIsRefusedByTheCompiler -- but that gate
+// TestEachForgedSpellingThisGateCompilesIsRefusedForItsOwnReason -- but that gate
 // stands at the PACKAGE BOUNDARY, and what makes those spellings compile errors in the first place
 // is the signature this test reads: no declaration that writes the cache binding takes a
 // *GroupContext at all, and every one of them takes the verified type. A widening back to

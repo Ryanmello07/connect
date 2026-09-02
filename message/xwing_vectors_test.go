@@ -11,12 +11,20 @@
 // consume direction and therefore proved nothing; the three directions below share no serializer
 // with each other.
 //
-// Which side of a comparison runs production code is DERIVED here and not typed. It was typed
-// once, as a bool on each row, and the count it produced was wrong by three: the ct_X rows claimed
-// to hold this package while the value on their got side came out of x25519PublicKeyOfScalar, a
-// helper declared in message/xwing_test.go that reaches mls.X25519PrivateKey, and XwingEncapsulate
-// was called nowhere in this file at all. A gate that counts its own worth must not take that
-// count from the same hand that wrote the rows.
+// Which side of a comparison runs production code is DERIVED here and not typed, and so are the
+// DECLARATIONS each side ran. Both were typed once. A bool on each row made the count wrong by
+// three: the ct_X rows claimed to hold this package while the value on their got side came out of
+// x25519PublicKeyOfScalar, a helper declared in message/xwing_test.go that reaches
+// mls.X25519PrivateKey, and XwingEncapsulate was called nowhere in this file at all. Replacing the
+// bool with a derivation over a HAND WRITTEN LIST OF PRODUCER NAMES left the second half of that
+// defect standing: a row whose got was changed to read the corpus back out of itself, while its
+// list went on naming XwingEncapsulate, still counted towards the nine, and so did a row that
+// simply dropped a name from its list. Measured before this pass, all three left every test in
+// this file green. The residual was written down here as unobservable from inside a go test
+// without instrumenting the build, and that was overstated: this file already parses every .go file in this directory, and
+// go/types resolves every call in the collector to the declaration it actually reaches. So the
+// producer names are read off the collector's own source, and a gate that counts its own worth
+// takes nothing at all from the hand that wrote the rows.
 //
 // keygen, seed -> pk. A full known answer test. It holds the SHAKE-256 expansion, the ML-KEM key
 // generation and this package's own pk_M then pk_X encoder against published octets.
@@ -49,14 +57,19 @@ import (
 	"crypto/sha3"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/urnetwork/connect/mls"
@@ -92,6 +105,15 @@ const (
 	xwingVectorUpstreamPath       = "spec/test-vectors.json"
 	xwingVectorSha256             = "409efe197550b22985b4a0419418a0c5f2c2b193426c55bd998399ec8d3e614d"
 	xwingVectorCount              = 3
+)
+
+// Where the source reading below starts and what it looks for. These are written down because a
+// walk has to start somewhere; everything it FINDS is derived, and a rename of either one fails
+// the reading with "declares no ..." rather than quietly reading nothing.
+const (
+	xwingPackageImportPath = "github.com/urnetwork/connect/message"
+	xwingCollectorName     = "xwingHoldAgainstTheDraft"
+	xwingAnswerTypeName    = "xwingPublishedAnswer"
 )
 
 // The number of published answers ONE vector can hold this package to, and the reason it is three
@@ -296,29 +318,37 @@ type xwingPublishedAnswer struct {
 	vector int
 	// the field of the vector the answer belongs to
 	field string
-	// the declarations UNDER TEST that got came out of, in call order and in the spelling
-	// entropyDeclaredName prints. The harness that called them -- this file's own loaders,
-	// decoders and drivers -- is not a producer, and naming one here would classify its row as
-	// holding nothing, because every one of them is declared in a _test.go file.
+	// the declarations of this package's NON TEST source that got came out of, sorted, in the
+	// spelling entropyDeclaredName prints. NOT SET ON THE LITERALS BELOW: it is filled in from
+	// xwingCollectorProducers, which reads it off the collector's own source. The harness that
+	// called them -- this file's own loaders, decoders and drivers -- is not a producer, and the
+	// walk goes THROUGH one into what it reaches rather than recording it, which is why
+	// x25519PublicKeyOfScalar contributes nothing and xwingEncapsulateFromTheVector contributes
+	// the two declarations it drives.
 	//
-	// Whether the answer holds THIS PACKAGE is derived from where the producers are declared, and
-	// is not a field: it was a field once, typed row by row, and three of
-	// the nine rows it counted were wrong. An empty producers is the corpus's claim about itself
-	// and is a statement about no implementation at all.
+	// Whether the answer holds THIS PACKAGE is derived from this set and is not a field: it was a
+	// field once, typed row by row, and three of the nine rows it counted were wrong. An empty
+	// set is the corpus's claim about itself and is a statement about no implementation at all.
 	//
-	// What the derivation closes is the CLASSIFICATION: whether a row claiming to hold this
-	// package names declarations this package actually has, in its non test source. What it
-	// cannot close is whether the row named the declarations that really ran -- no test inside a
-	// go package can observe that without instrumenting the build -- so a row naming
-	// XwingEncapsulate over a got that came from somewhere else would still pass. That gap is
-	// stated here rather than left for a reader to find by counting, and it is why the
-	// encapsulation row is held behaviourally as well: ct_X is reproducible from the corpus only
-	// if XwingEncapsulate is what produced it, which is what the standalone test above observes.
+	// WHAT IS STILL NOT OBSERVED is the call actually being made at run time: the reading is of
+	// the collector's SOURCE, so a row whose value is produced inside a branch this build never
+	// takes would be read as producing it. The collector's only branches are its t.Fatalf guards,
+	// which produce no value and leave nothing for such a row to be built from. The reading also
+	// cannot see through an indirection -- a value fetched from a func variable or an interface
+	// -- and would answer an empty set for one, which understates and cannot restore an
+	// overcount. The encapsulation row is held behaviourally as well, for the same reason it
+	// always was: ct_X is reproducible from the corpus only if XwingEncapsulate is what produced
+	// it, which is what the standalone test above observes.
 	producers []string
 	got       []byte
 }
 
 // Whether one answer holds this package, DERIVED from where its producers are declared.
+//
+// The producers themselves came from go/types, over the collector's own source; declared came from
+// go/ast, over the same directory. This method is where the two readings are reconciled, and they
+// have to agree: a name one of them resolves and the other has never heard of means one of them is
+// reading something else.
 //
 // A producer this package declares nowhere is fatal rather than false. The safe reading of an
 // unresolvable name -- that it holds nothing -- is also the reading that hides it, and a row
@@ -349,6 +379,365 @@ func (self xwingPublishedAnswer) holdsThisPackage(t *testing.T, declared map[str
 // direction that shared its serializer with the consume direction proved nothing and counted two.
 func (self xwingPublishedAnswer) direction() string {
 	return strings.Join(self.producers, " -> ")
+}
+
+// xwingCollectorRow is one row of the collector as its SOURCE describes it: the field it is about,
+// and every declaration of this package's non test source that its got value comes out of.
+type xwingCollectorRow struct {
+	field     string
+	producers []string
+}
+
+// xwingTypesDeclaredName spells one resolved function the way entropyDeclaredName spells a parsed
+// one, so a name this reading produces and a name that reading produces are the same string.
+func xwingTypesDeclaredName(function *types.Func) string {
+	signature, isSignature := function.Type().(*types.Signature)
+	if !isSignature || signature.Recv() == nil {
+		return function.Name()
+	}
+	receiver := signature.Recv().Type()
+	prefix := ""
+	if pointer, isPointer := receiver.(*types.Pointer); isPointer {
+		prefix, receiver = "*", pointer.Elem()
+	}
+	named, isNamed := receiver.(*types.Named)
+	if !isNamed || named.Obj() == nil {
+		return "(" + prefix + "?)." + function.Name()
+	}
+	return "(" + prefix + named.Obj().Name() + ")." + function.Name()
+}
+
+// xwingCalleeOf answers the function a call expression calls, as the compiler resolved it, or nil
+// for a builtin, a conversion or a call through a value this reading cannot follow.
+func xwingCalleeOf(info *types.Info, callee ast.Expr) *types.Func {
+	switch held := callee.(type) {
+	case *ast.Ident:
+		function, isFunction := info.Uses[held].(*types.Func)
+		if isFunction {
+			return function
+		}
+	case *ast.SelectorExpr:
+		function, isFunction := info.Uses[held.Sel].(*types.Func)
+		if isFunction {
+			return function
+		}
+	}
+	return nil
+}
+
+// xwingCollectorProducers reads the collector's own source and answers, for each
+// xwingPublishedAnswer literal it builds and IN SOURCE ORDER, the field that literal is about and
+// the declarations of this package's non test source its got value comes out of.
+//
+// WHY IT EXISTS. The producers were a hand written list beside each value. The classification over
+// them was derived, so a list naming something this package does not declare was fatal and a list
+// naming a test helper counted as holding nothing -- but nothing checked that a row's list was
+// about the value ON THE ROW. Measured before this pass, three mutations of the collector left
+// every count in this file reading nine and every test in it green: the keygen row's got changed to
+// read pk back out of the corpus, the encapsulation row's got changed to read ct back out of the
+// corpus, and a row that dropped one name from its list. The first two are the ones that matter -- each turns a comparison
+// against this package into a comparison of the corpus with itself, which is the exact failure the
+// file's opening paragraph says a vector gate is worth nothing without.
+//
+// HOW THE REACH IS TAKEN. Start at the literal's got expression and walk it.
+//
+//   - a call whose callee resolves to a function of this package declared in NON TEST source IS a
+//     producer, and the walk records it and does not enter it: that declaration is the thing under
+//     test, and what it calls is its own business.
+//   - a call that resolves to a function of this package declared in a _test.go file is HARNESS.
+//     The walk goes through it into its body and keeps looking, which is how
+//     xwingEncapsulateFromTheVector contributes ParseXwingPublicKey and XwingEncapsulate, and how
+//     x25519PublicKeyOfScalar contributes nothing at all -- everything it reaches is mls's.
+//   - a call into any other package is neither, and is skipped.
+//   - an identifier naming a variable something was assigned to is followed back to what was
+//     assigned, which is how priv.Public().Bytes() reaches XwingKeyGenFromSeed.
+//
+// go/types AND NOT NAMES. A reading that matched method calls by NAME would answer
+// (*XwingPublicKey).Bytes for the .Bytes() inside x25519PublicKeyOfScalar -- that is mls's X25519
+// public key and not this package's at all -- which is an overcount of exactly the kind the typed
+// bools produced. Every callee is resolved to the object the compiler resolves it to, and its
+// package and its declaring file decide what it is.
+//
+// It is cached for the test binary: it type checks this package and everything it imports from
+// source, which is a couple of seconds, and three tests below want the same answer.
+var xwingCollectorProducers = sync.OnceValues(func() ([]xwingCollectorRow, error) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return nil, fmt.Errorf("read this package's directory, which is what the collector is declared in: %w", err)
+	}
+	fileSet := token.NewFileSet()
+	byPackage := map[string][]*ast.File{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(".", entry.Name()))
+		parsed, err := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		byPackage[parsed.Name.Name] = append(byPackage[parsed.Name.Name], parsed)
+	}
+	// the package the collector is declared in, chosen by looking for it rather than by naming a
+	// package clause: an external test package in this directory would be a second package here
+	// and is not the one the collector runs in.
+	files := []*ast.File{}
+	for _, group := range byPackage {
+		for _, file := range group {
+			for _, declaration := range file.Decls {
+				function, isFunction := declaration.(*ast.FuncDecl)
+				if isFunction && function.Recv == nil && function.Name.Name == xwingCollectorName {
+					files = group
+				}
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no package in this directory declares %s, so this reading would be over nothing",
+			xwingCollectorName)
+	}
+	info := &types.Info{
+		Defs:  map[*ast.Ident]types.Object{},
+		Uses:  map[*ast.Ident]types.Object{},
+		Types: map[ast.Expr]types.TypeAndValue{},
+	}
+	refused := []string{}
+	config := types.Config{
+		Importer: importer.ForCompiler(fileSet, "source", nil),
+		Error:    func(err error) { refused = append(refused, err.Error()) },
+	}
+	checked, err := config.Check(xwingPackageImportPath, fileSet, files, info)
+	if err != nil || len(refused) != 0 {
+		return nil, fmt.Errorf("type check %s from source: %v %s",
+			xwingPackageImportPath, err, strings.Join(refused, "; "))
+	}
+
+	// where each function of this package is declared, and its body, so a call can be classified
+	// and a harness call can be walked through
+	production := map[*types.Func]bool{}
+	bodyOf := map[*types.Func]*ast.FuncDecl{}
+	var collector *ast.FuncDecl
+	for _, file := range files {
+		fromTest := strings.HasSuffix(fileSet.Position(file.Pos()).Filename, "_test.go")
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction {
+				continue
+			}
+			object, isObject := info.Defs[function.Name].(*types.Func)
+			if !isObject {
+				continue
+			}
+			production[object] = !fromTest
+			bodyOf[object] = function
+			if function.Recv == nil && function.Name.Name == xwingCollectorName {
+				collector = function
+			}
+		}
+	}
+	if collector == nil || collector.Body == nil {
+		return nil, fmt.Errorf("%s has no body in the source this reading parsed", xwingCollectorName)
+	}
+
+	// what each variable of this package's source was assigned, so a value can be followed back to
+	// the call it came out of. Keyed by the resolved object, so two locals with one name in two
+	// functions are two entries.
+	assigned := map[*types.Var][]ast.Expr{}
+	record := func(into []ast.Expr, from []ast.Expr) {
+		for at, one := range into {
+			held, isIdent := one.(*ast.Ident)
+			if !isIdent {
+				continue
+			}
+			object, isVariable := info.Defs[held].(*types.Var)
+			if !isVariable {
+				object, isVariable = info.Uses[held].(*types.Var)
+			}
+			if !isVariable || object == nil {
+				continue
+			}
+			if len(from) == len(into) {
+				assigned[object] = append(assigned[object], from[at])
+				continue
+			}
+			// one call answering several values: every name on the left came out of it
+			assigned[object] = append(assigned[object], from...)
+		}
+	}
+	for _, file := range files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch held := node.(type) {
+			case *ast.AssignStmt:
+				record(held.Lhs, held.Rhs)
+			case *ast.ValueSpec:
+				if len(held.Values) != 0 {
+					names := []ast.Expr{}
+					for _, one := range held.Names {
+						names = append(names, one)
+					}
+					record(names, held.Values)
+				}
+			case *ast.RangeStmt:
+				// a value that came out of a call through a range still came out of it
+				names := []ast.Expr{}
+				if held.Key != nil {
+					names = append(names, held.Key)
+				}
+				if held.Value != nil {
+					names = append(names, held.Value)
+				}
+				record(names, []ast.Expr{held.X})
+			}
+			return true
+		})
+	}
+
+	reach := func(start ast.Node) []string {
+		found := map[string]bool{}
+		seenFunction := map[*types.Func]bool{}
+		seenVariable := map[*types.Var]bool{}
+		var walk func(node ast.Node)
+		walk = func(node ast.Node) {
+			ast.Inspect(node, func(inner ast.Node) bool {
+				switch held := inner.(type) {
+				case *ast.CallExpr:
+					callee := xwingCalleeOf(info, held.Fun)
+					if callee == nil || callee.Pkg() != checked {
+						return true
+					}
+					if production[callee] {
+						found[xwingTypesDeclaredName(callee)] = true
+						return true
+					}
+					if seenFunction[callee] {
+						return true
+					}
+					seenFunction[callee] = true
+					if body := bodyOf[callee]; body != nil && body.Body != nil {
+						walk(body.Body)
+					}
+				case *ast.Ident:
+					variable, isVariable := info.Uses[held].(*types.Var)
+					if !isVariable || seenVariable[variable] {
+						return true
+					}
+					sources, isAssigned := assigned[variable]
+					if !isAssigned {
+						return true
+					}
+					seenVariable[variable] = true
+					for _, one := range sources {
+						walk(one)
+					}
+				}
+				return true
+			})
+		}
+		walk(start)
+		return slices.Sorted(maps.Keys(found))
+	}
+
+	rows := []xwingCollectorRow{}
+	var failure error
+	ast.Inspect(collector.Body, func(node ast.Node) bool {
+		literal, isLiteral := node.(*ast.CompositeLit)
+		if !isLiteral {
+			return true
+		}
+		named, isNamed := info.Types[literal].Type.(*types.Named)
+		if !isNamed || named.Obj() == nil || named.Obj().Name() != xwingAnswerTypeName {
+			return true
+		}
+		field, got := "", ast.Expr(nil)
+		for _, element := range literal.Elts {
+			pair, isPair := element.(*ast.KeyValueExpr)
+			if !isPair {
+				continue
+			}
+			key, isKey := pair.Key.(*ast.Ident)
+			if !isKey {
+				continue
+			}
+			switch key.Name {
+			case "field":
+				text, isText := pair.Value.(*ast.BasicLit)
+				if !isText || text.Kind != token.STRING {
+					continue
+				}
+				unquoted, err := strconv.Unquote(text.Value)
+				if err != nil {
+					failure = fmt.Errorf("%s builds a row whose field is not a string constant: %w",
+						xwingCollectorName, err)
+					return false
+				}
+				field = unquoted
+			case "got":
+				got = pair.Value
+			}
+		}
+		if field == "" || got == nil {
+			failure = fmt.Errorf("%s builds a %s at %s naming field %q and got %v; a row this reading cannot read is a row whose producers would come back empty and be counted as holding nothing",
+				xwingCollectorName, xwingAnswerTypeName, fileSet.Position(literal.Pos()), field, got != nil)
+			return false
+		}
+		rows = append(rows, xwingCollectorRow{field: field, producers: reach(got)})
+		return true
+	})
+	if failure != nil {
+		return nil, failure
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("%s builds no %s at all", xwingCollectorName, xwingAnswerTypeName)
+	}
+	return rows, nil
+})
+
+// TestTheCollectorsProducersAreReadOffItsOwnSource is the control on the reading above.
+//
+// TWO FAILURE DIRECTIONS AND BOTH ARE HELD. A walk that answered production for everything is the
+// shape of the overcount this file has now replaced twice, and it shows up here as more rows
+// holding this package than there are answers per vector; one that answered nothing is the shape
+// of a reading that resolved nothing at all, and it shows up as fewer. Neither is left to the
+// counts further down, because those are computed over whatever the reading returned.
+//
+// AND THE TWO READINGS ARE RECONCILED. The names come from go/types over the collector's source
+// and xwingDeclarationsOfThisPackage reads the same directory with go/ast; a name one resolves and
+// the other has never heard of, or calls a test declaration, means the walk recorded HARNESS as a
+// producer instead of going through it.
+func TestTheCollectorsProducersAreReadOffItsOwnSource(t *testing.T) {
+	spelled, err := xwingCollectorProducers()
+	if err != nil {
+		t.Fatalf("read the collector's producers off its own source: %v", err)
+	}
+	if len(spelled) != xwingAnswersPerVector {
+		t.Fatalf("the collector builds %d rows per vector and this file is written around %d; the producers below are matched to the rows by position, so a row added or removed without that constant moves every one of them",
+			len(spelled), xwingAnswersPerVector)
+	}
+	declared := xwingDeclarationsOfThisPackage(t)
+	holding := 0
+	for _, row := range spelled {
+		if len(row.producers) == 0 {
+			continue
+		}
+		holding += 1
+		for _, producer := range row.producers {
+			isProduction, declaredHere := declared[producer]
+			if !declaredHere {
+				t.Errorf("the source reading answers %q for the %s row and this package's declaration reading has never heard of that name; the two are readings of one directory and a name in one and not the other means one of them is about something else",
+					producer, row.field)
+				continue
+			}
+			if !isProduction {
+				t.Errorf("the source reading answers %q for the %s row and that name is declared in a _test.go file, so the walk recorded HARNESS as a producer rather than going through it into what it reaches; that is the overcount this derivation exists to make impossible",
+					producer, row.field)
+			}
+		}
+		t.Logf("%s <- %v", row.field, row.producers)
+	}
+	if holding != xwingHeldAnswersPerVector {
+		t.Errorf("%d of the collector's %d rows come out of this package's non test source, want %d; a reading that answered production for everything makes every count below read high and one that answered nothing makes them all read zero",
+			holding, len(spelled), xwingHeldAnswersPerVector)
+	}
 }
 
 // Every function name this package declares, and whether the only declarations of it are in this
@@ -482,6 +871,10 @@ func xwingPublishedValue(t *testing.T, vector xwingVector, field string) []byte 
 // rather than as a green test.
 func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]bool) {
 	t.Helper()
+	spelled, err := xwingCollectorProducers()
+	if err != nil {
+		t.Fatalf("read this function's own producers off its source: %v", err)
+	}
 	answers := []xwingPublishedAnswer{}
 	consumed := map[string]bool{}
 	for i, vector := range loadXwingVectors(t) {
@@ -500,8 +893,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 		}
 		answers = append(answers, xwingPublishedAnswer{
 			vector: i, field: "pk",
-			producers: []string{"XwingKeyGenFromSeed", "(*XwingPrivateKey).Public", "(*XwingPublicKey).Bytes"},
-			got:       priv.Public().Bytes(),
+			got: priv.Public().Bytes(),
 		})
 
 		ct := mustHexBytes(t, vector.Ct)
@@ -512,8 +904,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 		}
 		answers = append(answers, xwingPublishedAnswer{
 			vector: i, field: "ss",
-			producers: []string{"XwingKeyGenFromSeed", "XwingDecapsulate"},
-			got:       shared,
+			got: shared,
 		})
 
 		// the encapsulation direction, which reads the corpus's eseed and the corpus's pk and runs
@@ -522,15 +913,15 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 		consumed["pk"] = true
 		answers = append(answers, xwingPublishedAnswer{
 			vector: i, field: "ct",
-			producers: []string{"ParseXwingPublicKey", "XwingEncapsulate"},
-			got:       xwingEncapsulateFromTheVector(t, i, vector),
+			got: xwingEncapsulateFromTheVector(t, i, vector),
 		})
 
 		// and the corpus's second claim about itself: eseed[32:64] is the scalar behind ct_X,
-		// which is the premise the row above is driven on. its producer is declared in
-		// message/xwing_test.go and reaches mls, so the derivation counts it as holding none of
-		// this package -- and that is the whole of the correction, because this row is the one
-		// that was counted as three of nine
+		// which is the premise the row above is driven on. the walk goes THROUGH
+		// x25519PublicKeyOfScalar -- it is declared in message/xwing_test.go, so it is harness --
+		// and everything it reaches from there is mls's, so this row's producer set comes back
+		// empty and it holds none of this package. that is the whole of the first correction,
+		// because this row is the one that was counted as three of nine
 		eseed := mustHexBytes(t, vector.Eseed)
 		ephemeral, err := x25519PublicKeyOfScalar(eseed[XwingX25519KeySize:])
 		if err != nil {
@@ -538,9 +929,24 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 		}
 		answers = append(answers, xwingPublishedAnswer{
 			vector: i, field: "ct",
-			producers: []string{"x25519PublicKeyOfScalar"},
-			got:       ephemeral,
+			got: ephemeral,
 		})
+	}
+	// the producers, attached from the reading of this function's own SOURCE rather than typed
+	// beside each value. The rows repeat per vector in the order the literals are written, so the
+	// reading's row at at%len(spelled) is this row's literal -- and that correspondence is not
+	// assumed, it is checked against the field each of the two says it is about.
+	if len(spelled) == 0 || len(answers)%len(spelled) != 0 {
+		t.Fatalf("this function built %d rows over %d literals, which do not divide; the producers below are matched to the rows by position and a partial vector would attach one literal's producers to another literal's value",
+			len(answers), len(spelled))
+	}
+	for at := range answers {
+		row := spelled[at%len(spelled)]
+		if row.field != answers[at].field {
+			t.Fatalf("row %d is about %q and literal %d of this function's source is about %q; the two have gone out of step, so every producer set below would be attached to the wrong value",
+				at, answers[at].field, at%len(spelled), row.field)
+		}
+		answers[at].producers = row.producers
 	}
 	return answers, consumed
 }
@@ -555,12 +961,17 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 // same answer nine times reports fewer than nine and fails. The count of CALLS is not asserted
 // anywhere, because a call count is satisfied by nine copies of one comparison.
 //
-// Which comparisons count towards the nine is DERIVED, off where each answer's producers are
-// declared, and that is the correction this test carries. The number nine was here before and it
-// was wrong: three of the answers it counted were produced by a helper of this package's test
-// binary, holding mls's ECDH wrapper and the corpus rather than any X-Wing code, and the row that
-// closed that gap -- an encapsulation this file actually drives -- did not exist. Nine is now nine
-// pk, ss and ct_X answers, three of each, each produced by a function declared in message/xwing.go.
+// Which comparisons count towards the nine is DERIVED, and BOTH halves of that are derived now.
+// WHICH declarations produced an answer is read off the collector's own source by
+// xwingCollectorProducers, and WHERE those declarations live is read off this directory by
+// xwingDeclarationsOfThisPackage. The number nine was here before and it was wrong twice. First,
+// three of the answers it counted were produced by a helper of this package's test binary, holding
+// mls's ECDH wrapper and the corpus rather than any X-Wing code, and the row that closed that gap
+// -- an encapsulation this file actually drives -- did not exist. Then, with the classification
+// derived but the producer NAMES still typed by hand, a row whose got was changed to read the
+// corpus back out of itself went on counting towards the nine with the whole tree green. Nine is
+// now nine pk, ss and ct_X answers, three of each, each of them traced through the collector's own
+// source to a function declared in message/xwing.go.
 //
 // The DIRECTIONS are counted too, and separately. A direction is a producer set, so three answers
 // per vector that all came out of one path collapse to one direction and fail here even while the
