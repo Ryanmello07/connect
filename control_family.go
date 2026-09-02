@@ -393,6 +393,16 @@ func pickControlIPAddr(addrs []net.IPAddr) net.IPAddr {
 		}
 	}
 	if want == 0 {
+		// No preference in force: keep net.ResolveUDPAddr's own tie-break
+		// (addrs.first(isIPv4), GOROOT/src/net/ipsock.go) rather than letting
+		// the resolver's own ordering -- normally IPv6-first per RFC 6724 on a
+		// dual-stack, v6-capable device -- become the de facto default. Force
+		// and demotion above are the only things allowed to move off IPv4.
+		for _, addr := range addrs {
+			if addr.IP.To4() != nil {
+				return addr
+			}
+		}
 		return addrs[0]
 	}
 	for _, addr := range addrs {

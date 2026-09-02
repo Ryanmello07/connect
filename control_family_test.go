@@ -342,9 +342,12 @@ func TestPickControlUDPAddrHonorsPolicyAndDemotion(t *testing.T) {
 	controlFamilyClear()
 	defer controlFamilyClear()
 
-	// auto with nothing learned keeps the resolver's own order
-	if got := pickControlIPAddr(addrs); !got.IP.Equal(v6.IP) {
-		t.Fatalf("got %v, want the resolver's first address", got.IP)
+	// auto with nothing learned ties toward IPv4, matching
+	// net.ResolveUDPAddr's own tie-break -- NOT the resolver's list order
+	// (addrs[0] here is v6), so a dual-stack, v6-first RFC 6724 ordering does
+	// not silently become the new default family.
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v4.IP) {
+		t.Fatalf("got %v, want the IPv4 tie-break address", got.IP)
 	}
 
 	// a demotion moves the pick off the demoted family
@@ -371,5 +374,51 @@ func TestPickControlUDPAddrFallsBackWhenNoAddressMatches(t *testing.T) {
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)
 	if got := pickControlIPAddr([]net.IPAddr{v6}); !got.IP.Equal(v6.IP) {
 		t.Fatalf("got %v, want the only available address", got.IP)
+	}
+}
+
+// EgressInterfaceIndex is a (index4, index6) pair, and both being set at once
+// is the NORMAL bound configuration -- the Windows service updates both on
+// every network change (see EgressInterfaceIndex's doc comment) -- not an
+// edge case. With both set the bind constrains nothing about family, so an
+// explicit Force4/Force6 must still win; only a bind that names exactly one
+// family may override the pick.
+func TestEgressBoundIPAddrIgnoresNonConstrainingBind(t *testing.T) {
+	v6 := net.IPAddr{IP: net.ParseIP("2001:db8::1")}
+	v4 := net.IPAddr{IP: net.ParseIP("192.0.2.1")}
+	addrs := []net.IPAddr{v6, v4} // v6 first, so a buggy "take addrs[0]" loop is caught
+
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	pick := pickControlIPAddr(addrs)
+	if !pick.IP.Equal(v4.IP) {
+		t.Fatalf("precondition: pickControlIPAddr under force4 = %v, want v4", pick.IP)
+	}
+
+	// both indexes set: not a family constraint. The forced pick must survive
+	// untouched, even though addrs[0] (v6) has a nonzero index too.
+	if got := egressBoundIPAddr(addrs, 16, 23, pick); !got.IP.Equal(v4.IP) {
+		t.Fatalf("got %v, want the forced address unchanged by a both-set bind", got.IP)
+	}
+
+	// neither index set: also not a constraint, pick stands.
+	if got := egressBoundIPAddr(addrs, 0, 0, pick); !got.IP.Equal(v4.IP) {
+		t.Fatalf("got %v, want the forced address unchanged by an unset bind", got.IP)
+	}
+}
+
+// Exactly one index set IS a hard family constraint and must override even an
+// opposite Force, because the socket literally cannot carry the other family.
+func TestEgressBoundIPAddrOverridesForceWhenSingleFamilyBound(t *testing.T) {
+	v6 := net.IPAddr{IP: net.ParseIP("2001:db8::1")}
+	v4 := net.IPAddr{IP: net.ParseIP("192.0.2.1")}
+	addrs := []net.IPAddr{v6, v4}
+
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	pick := pickControlIPAddr(addrs)
+
+	if got := egressBoundIPAddr(addrs, 0, 23, pick); !got.IP.Equal(v6.IP) {
+		t.Fatalf("got %v, want the v6-bound address to override force4", got.IP)
 	}
 }

@@ -72,41 +72,28 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 // resolveEgressUDPAddr is net.ResolveUDPAddr for control dials, made
 // family-aware: while this process's own sockets are steered around the
 // tunnel it provides, it resolves through the egress-bound resolver instead
-// of the OS resolver, preferring an address family the bind can actually
-// carry. On a platform with no egress escape, or with none in force -- which
-// is every mobile build, since egressBound() is never true there -- it still
-// resolves through the OS resolver, but the address it returns is chosen by
-// pickControlIPAddr rather than taken as the resolver's first result, so a
-// forced family or a live demotion applies here too.
+// of the OS resolver. On a platform with no egress escape, or with none in
+// force -- which is every mobile build, since egressBound() is never true
+// there -- it resolves through the OS resolver instead. Either way, the
+// address returned is chosen by pickControlIPAddr rather than taken as the
+// resolver's first result, so a forced family or a live demotion applies on
+// both paths.
+//
+// While bound, an interface index that is set for exactly one family (the
+// normal single-homed shape) is a hard constraint and overrides the pick;
+// when both are set (or neither), the bind constrains nothing about family
+// and the preference from pickControlIPAddr stands.
 //
 // This is the H3/QUIC platform transport's name path (transport.go), and it is
 // the second half of the Linux fix: pinning the resolver into NetDialer alone
 // would leave these three call sites resolving through the captured stub.
 func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error) {
 	resolver := egressResolver()
-	if resolver == nil || !egressBound() {
-		host, portStr, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("resolve %s: non-numeric port: %w", addr, err)
-		}
-		// an ip literal has no family choice to make
-		if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
-			return &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: port, Zone: ip.Zone()}, nil
-		}
-		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, err
-		}
-		if len(addrs) == 0 {
-			return nil, fmt.Errorf("resolve %s: no addresses", host)
-		}
-		pick := pickControlIPAddr(addrs)
-		return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
+	bound := resolver != nil && egressBound()
+	if !bound {
+		resolver = net.DefaultResolver
 	}
+
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -115,7 +102,7 @@ func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: non-numeric port: %w", addr, err)
 	}
-	// an ip literal needs no resolution
+	// an ip literal needs no resolution and has no family choice to make
 	if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
 		return &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: port, Zone: ip.Zone()}, nil
 	}
@@ -126,16 +113,36 @@ func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("resolve %s: no addresses", host)
 	}
-	index4, index6 := EgressInterfaceIndex()
 	pick := pickControlIPAddr(addrs)
+	if bound {
+		index4, index6 := EgressInterfaceIndex()
+		pick = egressBoundIPAddr(addrs, index4, index6, pick)
+	}
+	return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
+}
+
+// egressBoundIPAddr applies an interface-index bind's family constraint on
+// top of pickControlIPAddr's preference, when the bind actually expresses
+// one. Only a SINGLE family's index being set is a family constraint. With
+// both indexes set -- the normal shape while the Windows service holds the
+// tunnel up, per EgressInterfaceIndex's doc comment -- the bind constrains
+// nothing about family: a naive "first address whose family has a nonzero
+// index" loop would match addrs[0] on its very first iteration regardless of
+// family, silently discarding pick (and with it any Force4/Force6 or
+// demotion). With neither index set there is no bind at all. So the override
+// only runs when exactly one of index4/index6 is nonzero; otherwise pick
+// stands unchanged.
+func egressBoundIPAddr(addrs []net.IPAddr, index4 uint32, index6 uint32, pick net.IPAddr) net.IPAddr {
+	if (index4 == 0) == (index6 == 0) {
+		return pick
+	}
 	for _, a := range addrs {
 		is4 := a.IP.To4() != nil
 		if (is4 && index4 != 0) || (!is4 && index6 != 0) {
-			pick = a
-			break
+			return a
 		}
 	}
-	return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
+	return pick
 }
 
 // usableEgressDnsServer reports whether an adapter-configured resolver can be
