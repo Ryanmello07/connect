@@ -166,6 +166,22 @@ func testLeafNode(t *testing.T, crypto CryptoProvider, m *testMember) (*LeafNode
 func testUpdateLeafNode(t *testing.T, crypto CryptoProvider, m *testMember,
 	groupId []byte, at LeafIndex) (*LeafNode, HpkePrivateKey) {
 	t.Helper()
+	return testUpdateLeafNodeNaming(t, crypto, m, groupId, at, testCapabilities())
+}
+
+// testUpdateLeafNodeNaming is the same fixture with the capabilities vector named by the caller.
+//
+// It exists because a leaf's capabilities are one of the things the GROUP's own ciphersuite is
+// judged against -- section 11.1's "all members of the group need to support the cipher suite and
+// protocol version in use", which (*LeafNode).Validate asks as SupportsCipherSuite(ctx.Suite). A
+// corpus whose every leaf advertises Suites() cannot tell that read from a build-time constant,
+// because both answer true for either registered suite. A member that advertises only the suite
+// its own group runs is what separates them, and it is a conforming leaf: section 7.2 requires the
+// vector to list what the member can do, not every code point the registry holds.
+func testUpdateLeafNodeNaming(t *testing.T, crypto CryptoProvider, m *testMember,
+	groupId []byte, at LeafIndex, caps Capabilities) (*LeafNode, HpkePrivateKey) {
+
+	t.Helper()
 	encPriv, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
 	if err != nil {
 		t.Fatalf("DeriveKeyPair(%s): %v", m.Name, err)
@@ -174,7 +190,7 @@ func testUpdateLeafNode(t *testing.T, crypto CryptoProvider, m *testMember,
 		EncryptionKey:  encPub,
 		SignatureKey:   m.SigPub,
 		Credential:     BasicCredential(m.IdentityPub),
-		Capabilities:   testCapabilities(),
+		Capabilities:   caps,
 		LeafNodeSource: LeafNodeSourceUpdate,
 		Extensions:     []Extension{testLeafKeys(t, m)},
 	}).Clone()
@@ -201,7 +217,11 @@ func testUpdateLeafNode(t *testing.T, crypto CryptoProvider, m *testMember,
 // two arguments are nil and 0.
 func testKeyPackage(t *testing.T, crypto CryptoProvider, m *testMember) (*KeyPackage, HpkePrivateKey, HpkePrivateKey) {
 	t.Helper()
-	kp, initPriv, encPriv, err := NewKeyPackage(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+	// THE PROVIDER'S OWN SUITE AND NOT A LITERAL. NewKeyPackage refuses a suite the provider does
+	// not run, so a hard coded code point here made this fixture answerable only under the default
+	// provider -- and a corpus that can mint a key package for only one suite is a corpus in which
+	// every ciphersuite read of the proposal door is the same program as that one constant.
+	kp, initPriv, encPriv, err := NewKeyPackage(crypto, crypto.Suite(),
 		BasicCredential(m.IdentityPub), testCapabilities(), []Extension{testLeafKeys(t, m)})
 	if err != nil {
 		t.Fatalf("NewKeyPackage(%s): %v", m.Name, err)
