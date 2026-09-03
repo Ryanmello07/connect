@@ -325,11 +325,20 @@ func TestTheCommitFixtureCorpusSeparatesEveryLeafItDecidesOff(t *testing.T) {
 	widest := LeafIndex(0)
 	widestIn := ""
 	treesDiffer := []string{}
+	built := 0
 	for _, name := range slices.Sorted(maps.Keys(corpus)) {
-		in := corpus[name](t, crypto)
+		// EACH FIXTURE IS BUILT INSIDE ITS OWN SUBTEST, and that is not tidiness. A builder
+		// answers t.Fatalf when its own precondition stops holding, and a Fatalf in the middle
+		// of this loop takes the whole test with it -- so the four claims below would report
+		// nothing about the other ten fixtures, and the claim a corpus regression actually
+		// broke would never be printed. One red row per fixture, and the measurement carries on
+		// over the ones that built.
+		var in *CommitValidationInput
+		t.Run(name, func(t *testing.T) { in = corpus[name](t, crypto) })
 		if in == nil {
-			t.Fatalf("%s answered no commit validation input", name)
+			continue
 		}
+		built += 1
 		for path, values := range commitCorpusLeafDimensions(in) {
 			if dimensions[path] == nil {
 				dimensions[path] = map[LeafIndex][]string{}
@@ -351,6 +360,10 @@ func TestTheCommitFixtureCorpusSeparatesEveryLeafItDecidesOff(t *testing.T) {
 		}
 	}
 
+	if built < len(corpus) {
+		t.Errorf("%d of the %d fixtures in this corpus could not be built, so the claims below are stated over the rest of it",
+			len(corpus)-built, len(corpus))
+	}
 	if len(dimensions) == 0 {
 		t.Fatal("the walk found no leaf index anywhere in the corpus, so it read something other than these inputs")
 	}
