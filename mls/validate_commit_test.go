@@ -3117,6 +3117,20 @@ func testCommitProposalBuilders() map[ProposalType]func(t *testing.T, crypto Cry
 // with no builder fails here with the sentence that says what to write.
 func testCommitCarryingOneOfEveryBucket(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
 	t.Helper()
+	in, _ := testCommitCarryingOneOfEveryBucketAndItsMembers(t, crypto)
+	return in
+}
+
+// testCommitCarryingOneOfEveryBucketAndItsMembers is that fixture with the group it was built over,
+// for the rows that need to sign a second proposal from one of its members.
+//
+// An Update is signed at its sender's own leaf index, so a fixture that wanted a second update
+// would have to forge one or be handed the member that can sign it. This is the second, and the
+// caller above drops the members because the establishment table's build signature takes none.
+func testCommitCarryingOneOfEveryBucketAndItsMembers(t *testing.T,
+	crypto CryptoProvider) (*CommitValidationInput, []*testMember) {
+
+	t.Helper()
 	in, members := testFullCommitInput(t, crypto)
 	builders := testCommitProposalBuilders()
 	entries := []CachedProposal{}
@@ -3138,7 +3152,34 @@ func testCommitCarryingOneOfEveryBucket(t *testing.T, crypto CryptoProvider) *Co
 		}
 	}
 	testCommitProposals(t, in, entries...)
+	return in, members
+}
+
+// testCommitLedBy answers the same commit with entries placed AHEAD of its commit order, and the
+// commit's own ProposalOrRef vector rebuilt to match.
+//
+// AHEAD AND NOT APPENDED, which is the whole use of it. A rule or a view narrowed to element zero
+// answers the FIRST entry of its type, so an offender that has to be found is one placed behind an
+// innocent proposal of its own type -- which is the shape all four of the bypasses this package was
+// repaired for took, and the shape a fixture carrying one of each type cannot make.
+func testCommitLedBy(t *testing.T, in *CommitValidationInput,
+	first ...CachedProposal) *CommitValidationInput {
+
+	t.Helper()
+	in.List = NewProposalList(append(slices.Clone(first), in.List.All()...))
+	in.Commit.Proposals = in.List.Refs()
 	return in
+}
+
+// testCommitCarryingAnInnocentRemoveFirst is the fixture above with a second remove ahead of the
+// one the List.order establishment row swaps, so that row's break has to be FOUND rather than read
+// off element zero.
+func testCommitCarryingAnInnocentRemoveFirst(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	return testCommitLedBy(t, testCommitCarryingOneOfEveryBucket(t, crypto),
+		testRemoveOf(LeafIndex(2)))
 }
 
 // testCommitNamingACachedProposal is the base for the Pending row: a commit whose FIRST proposal is
@@ -3193,6 +3234,10 @@ func commitDoorEstablishments() map[string]commitSourceEstablishment {
 			establishes: "the commit order is the whole of a proposal list, so every per-type view a rule " +
 				"decides off is this order filtered and a rule stated over the removes is a rule about the " +
 				"commit the sender signed rather than about a field a caller filled in beside it",
+			// two removes, so the break below is the SECOND of them: a view that answered the
+			// first entry of its type, or a rule narrowed to it, reads the innocent one and
+			// accepts this commit
+			build: testCommitCarryingAnInnocentRemoveFirst,
 			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
 				// A COUNT-PRESERVING SWAP, which is what this row owes and what the five rows it
 				// replaces never did. One remove is exchanged for another remove at the same
@@ -3202,7 +3247,7 @@ func commitDoorEstablishments() map[string]commitSourceEstablishment {
 				// against the counting door -- the sender signs one remove and the receiver applies
 				// another -- and the only thing that can refuse it is a rule reading the same
 				// entries the application walks.
-				testListEntryAt(t, in.List, "Removes", 0).Proposal.Remove.Removed = in.Committer
+				testListEntryAt(t, in.List, "Removes", 1).Proposal.Remove.Removed = in.Committer
 				in.Commit.Proposals = in.List.Refs()
 			},
 			refuses: ErrRemoveCommitter,

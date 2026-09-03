@@ -286,6 +286,42 @@ func TestAViewOfAProposalListFollowsAWriteToTheCommitOrder(t *testing.T) {
 	}
 }
 
+// TestAProposalListDoesNotShareTheSliceItWasBuiltFrom holds the one thing the constructor claims
+// beyond indexing nothing.
+//
+// NewProposalList clones what it is handed, and without that the caller's own slice header is the
+// list's commit order: a caller that goes on appending to it writes past the length this list was
+// built with, and every append that fits the spare capacity lands in entries the list will answer
+// the moment somebody extends it. That is a list changing under a validator that has already
+// judged it, which is the same fault class as the one this type was rebuilt for, one level out.
+//
+// The append is made to SPARE CAPACITY on purpose. A slice built with make(cap>len) and appended to
+// writes into the array the list would be sharing, so a constructor that did not clone is separated
+// from one that did; an append past capacity reallocates and both constructors look the same.
+func TestAProposalListDoesNotShareTheSliceItWasBuiltFrom(t *testing.T) {
+	order := make([]CachedProposal, 0, 4)
+	order = append(order,
+		CachedProposal{Proposal: Proposal{ProposalType: ProposalTypeRemove,
+			Remove: &Remove{Removed: LeafIndex(1)}}, Sender: LeafIndex(1)})
+	if cap(order) <= len(order) {
+		t.Fatal("the fixture slice has no spare capacity, so an append below reallocates and a constructor that shared the caller's array would look like one that cloned")
+	}
+	list := NewProposalList(order)
+	// the caller goes on using its own slice, which is the ordinary thing a caller does
+	order = append(order,
+		CachedProposal{Proposal: Proposal{ProposalType: ProposalTypeRemove,
+			Remove: &Remove{Removed: LeafIndex(2)}}, Sender: LeafIndex(2)})
+	order[0].Sender = LeafIndex(0x5eed)
+	if held := list.All(); len(held) != 1 || held[0].Sender != LeafIndex(1) {
+		t.Fatalf("the list answers %v after its caller wrote through the slice it was built from; the commit order is the caller's array and not the list's",
+			held)
+	}
+	if removes := list.Removes(); len(removes) != 1 || removes[0].Sender != LeafIndex(1) {
+		t.Fatalf("the removes view answers %v after the caller's write; the view filters the caller's array",
+			removes)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the four inputs the counting door accepted
 // ---------------------------------------------------------------------------
@@ -297,12 +333,22 @@ func TestAViewOfAProposalListFollowsAWriteToTheCommitOrder(t *testing.T) {
 // another proposal of the same type at the same position, so the total count, every per-type count
 // and the commit's own ProposalOrRef vector are all unchanged -- which is precisely the class the
 // count rule could not see, and precisely the class the derivation makes unrepresentable.
+//
+// AND THE OFFENDER HIDES BEHIND AN INNOCENT ENTRY OF ITS OWN TYPE, which is the other half of the
+// shape and the half a fixture carrying one of each type cannot make. Each of the four originals
+// was built that way: the bucket held a proposal the rules were happy with while the commit order
+// held the one that mattered. Over a list carrying ONE remove, a view that answered element zero
+// of its own filter refuses the offender anyway and this row says nothing; over a list whose first
+// remove is innocent, that view accepts the commit.
 type commitBypass struct {
 	// view is the per-type view the old bucket field would have carried the innocent entry in.
 	view string
-	// swaps replaces the entry that view answers first with the offending one, in place, in the
+	// leads is the innocent proposal of that same type placed AHEAD of the offender, and false
+	// for a type section 12.2 admits only one of.
+	leads func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool)
+	// swaps replaces the entry that view answers at `at` with the offending one, in place, in the
 	// commit order.
-	swaps func(t *testing.T, in *CommitValidationInput)
+	swaps func(t *testing.T, in *CommitValidationInput, at int)
 	// refuses is what the aggregate must answer now that the view cannot be given anything else.
 	refuses error
 }
@@ -313,36 +359,59 @@ func commitBypassesTheCountRuleAdmitted() map[string]commitBypass {
 	return map[string]commitBypass{
 		"a remove of the committer behind an innocent remove": {
 			view: "Removes",
-			swaps: func(t *testing.T, in *CommitValidationInput) {
-				testListEntryAt(t, in.List, "Removes", 0).Proposal.Remove.Removed = in.Committer
+			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+				return testRemoveOf(LeafIndex(2)), true
+			},
+			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+				testListEntryAt(t, in.List, "Removes", at).Proposal.Remove.Removed = in.Committer
 			},
 			refuses: ErrRemoveCommitter,
 		},
-		"an add republishing the update path's leaf key": {
+		"an add republishing the update path's leaf key behind an innocent add": {
 			view: "Adds",
-			swaps: func(t *testing.T, in *CommitValidationInput) {
-				testListEntryAt(t, in.List, "Adds", 0).Proposal.Add.KeyPackage.LeafNode.EncryptionKey =
+			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+				kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "frank"))
+				return testAddOf(kp), true
+			},
+			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+				testListEntryAt(t, in.List, "Adds", at).Proposal.Add.KeyPackage.LeafNode.EncryptionKey =
 					in.Commit.Path.LeafNode.EncryptionKey
 			},
 			refuses: errDuplicateEncryptionKey,
 		},
-		"an update republishing the update path's leaf key": {
+		"an update republishing the update path's leaf key behind an innocent update": {
 			view: "Updates",
-			swaps: func(t *testing.T, in *CommitValidationInput) {
-				testListEntryAt(t, in.List, "Updates", 0).Proposal.Update.LeafNode.EncryptionKey =
+			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+				update, _ := testUpdateProposalOf(t, crypto, members[2], LeafIndex(2))
+				return update, true
+			},
+			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+				testListEntryAt(t, in.List, "Updates", at).Proposal.Update.LeafNode.EncryptionKey =
 					in.Commit.Path.LeafNode.EncryptionKey
 			},
 			refuses: errDuplicateEncryptionKey,
 		},
 		"a group_context_extensions installing an extension outside the v1 profile": {
 			view: "GCE",
-			swaps: func(t *testing.T, in *CommitValidationInput) {
+			// NO INNOCENT LEAD, and that is not an omission. Section 12.2 makes a list carrying
+			// two GroupContextExtensions proposals invalid outright and both doors of this package
+			// refuse one, so a GCE offender cannot hide behind another of its own type -- the
+			// original bypass put a DIFFERENT extension set in the bucket rather than a second
+			// proposal. What separates a working GCE view from a broken one over this row is
+			// therefore the type it filters on rather than the position it stops at: a view
+			// answering some other type answers no extension set at all,
+			// (*ProposalList).Extensions falls back to the group's own, and this commit is
+			// accepted.
+			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+				return CachedProposal{}, false
+			},
+			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
 				// 0xABCD, which is the code point the owner used against the counting door: a
 				// type this build's extension registry does not carry, so no member could
 				// evaluate it and the group would be agreeing to a state none of them can read
 				installed := append(slices.Clone(testCommitInstalledExtensions()),
 					Extension{ExtensionType: ExtensionType(0xABCD), ExtensionData: []byte{}})
-				testListEntryAt(t, in.List, "GCE", 0).Proposal.GroupContextExtensions.Extensions =
+				testListEntryAt(t, in.List, "GCE", at).Proposal.GroupContextExtensions.Extensions =
 					installed
 			},
 			refuses: errUnregisteredGroupExtension,
@@ -380,7 +449,12 @@ func TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt(t *testing.T) {
 	for _, name := range slices.Sorted(maps.Keys(rows)) {
 		row := rows[name]
 		t.Run(name, func(t *testing.T) {
-			in := testCommitCarryingOneOfEveryBucket(t, crypto)
+			in, members := testCommitCarryingOneOfEveryBucketAndItsMembers(t, crypto)
+			at := 0
+			if lead, hides := row.leads(t, crypto, members); hides {
+				in = testCommitLedBy(t, in, lead)
+				at = 1
+			}
 			if failure := ValidateCommit(in); failure != nil {
 				t.Fatalf("ValidateCommit refused the commit this row is one swap away from: %v; every refusal below would then be that one",
 					failure)
@@ -390,7 +464,7 @@ func TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt(t *testing.T) {
 			for _, bucket := range proposalBucketsOf(in.List) {
 				counts[bucket.accessor] = len(bucket.entries)
 			}
-			row.swaps(t, in)
+			row.swaps(t, in, at)
 			// the swap preserved every count the retired rule could see, which is what makes this
 			// the input that rule admitted rather than one it would have caught
 			if after := len(in.List.All()); after != before {
@@ -403,18 +477,18 @@ func TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt(t *testing.T) {
 						bucket.accessor, counts[bucket.accessor], got)
 				}
 			}
-			// and the view the innocent entry used to hide in answers the offending entry, which
-			// is the whole of the repair: there is no field left to hide it in
-			answered := false
+			// and the view the offender used to be hidden from answers it AT THE POSITION IT WAS
+			// PUT, which is the whole of the repair: there is no field left to hide it in and no
+			// first entry of its own type to stop at
+			answered := 0
 			for _, bucket := range proposalBucketsOf(in.List) {
-				if bucket.accessor != row.view {
-					continue
+				if bucket.accessor == row.view {
+					answered = len(bucket.entries)
 				}
-				answered = len(bucket.entries) > 0
 			}
-			if !answered {
-				t.Fatalf("the %s view answers nothing after the swap, so the rule stated over it reads nothing and this row asserts a refusal that came from somewhere else",
-					row.view)
+			if answered <= at {
+				t.Fatalf("the %s view answers %d entries and the offender was put at %d, so no rule stated over that view reads it and this row asserts a refusal that came from somewhere else",
+					row.view, answered, at)
 			}
 			if failure := ValidateCommit(in); !errors.Is(failure, row.refuses) {
 				t.Fatalf("ValidateCommit over the swapped commit answered %v, want %v; this is the input the counting door returned nil for, and a member that accepts it applies a commit the transcript does not cover",
