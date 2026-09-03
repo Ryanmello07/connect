@@ -329,6 +329,48 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"(*CommitValidationInput).checkExtensionsAreTheSetThisCommitInstalls": {
+		what: "reads the type of EVERY entry of TWO vectors positionally and selects none. It is the commit " +
+			"door's join between the extension set a caller announces and the one the commit installs, so a " +
+			"repeated type is not a question it answers: two entries of one type in both vectors agree, and " +
+			"the door that refuses the repeat is the lookup every accessor reaches. What matters here is the " +
+			"property (*GroupContext).Clone's row names -- the walk is positional and covers every entry, so " +
+			"a swapped pair or an altered body in the MIDDLE is a disagreement rather than a match",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob")
+			installed := []Extension{
+				{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x01}},
+				{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{0x0a}},
+				{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x02}},
+			}
+			in := testCommitInput(t, crypto, tree,
+				testProposalList(t, testGceOf(installed...)), &Commit{})
+			in.Extensions = slices.Clone(installed)
+			if err := in.checkExtensionsAreTheSetThisCommitInstalls(); err != nil {
+				t.Fatalf("two identical extension vectors, one type carried twice, were refused: %v; the repeat is the lookup's refusal and not this one, and every refusal below could then be this",
+					err)
+			}
+			for _, one := range []struct {
+				name  string
+				entry Extension
+			}{
+				{"a type", Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor,
+					ExtensionData: []byte{0x0a}}},
+				{"a body", Extension{ExtensionType: ExtensionTypeRatchetTree,
+					ExtensionData: []byte{0x0b}}},
+			} {
+				differing := slices.Clone(installed)
+				differing[1] = one.entry
+				in.Extensions = differing
+				if err := in.checkExtensionsAreTheSetThisCommitInstalls(); !errors.Is(err, errCommitExtensionsNotApplied) {
+					t.Errorf("%s disagreement in the middle of three entries answered %v, want errCommitExtensionsNotApplied; a comparison that stops at the first entry lets a swapped pair through and nothing behind it can see one",
+						one.name, err)
+				}
+			}
+		},
+	},
 	"(*GroupContext).Clone": {
 		what: "reads the type of EVERY entry and writes each one into the copy. It selects none, and the " +
 			"property that matters here is the one the rule reports it for: the clone must carry the same " +

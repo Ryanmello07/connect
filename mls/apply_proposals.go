@@ -90,6 +90,16 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 	if err := validateBucketsAgreeWithTheCommitOrder(structural); err != nil {
 		return nil, err
 	}
+	// and the GCE bucket holds AT MOST ONE, because step 1 below decides the whole of the next
+	// epoch's extension set off GCE[0]. Section 12.2 makes a list carrying two invalid and
+	// (*ProposalCache).Resolve refuses the second as it buckets, so nothing this package resolves
+	// reaches here with two -- but a list a caller assembled field by field does, and over that
+	// list this door would install one of two extension sets with nothing saying which. That is
+	// the same fault the three rules above close one field lower down: a step decided off a
+	// source the door has not established.
+	if err := validateOneGroupContextExtensions(structural); err != nil {
+		return nil, err
+	}
 
 	// slices.Clone of the extension vector and not the caller's own backing array, for the
 	// reason the tree is cloned: an ApplyResult is a candidate state, and a candidate that

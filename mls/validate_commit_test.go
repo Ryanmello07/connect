@@ -43,6 +43,7 @@ var commitValidationOwnedErrors = map[string]error{
 	"errNilCommitValidationInput":   errNilCommitValidationInput,
 	"errNilCommit":                  errNilCommit,
 	"errCommitProposalsNotResolved": errCommitProposalsNotResolved,
+	"errCommitExtensionsNotApplied": errCommitExtensionsNotApplied,
 	"errMissingPath":                errMissingPath,
 	"errPathLeafKeyUnchanged":       errPathLeafKeyUnchanged,
 	"errBadConfirmationTag":         errBadConfirmationTag,
@@ -86,6 +87,7 @@ var commitValidationBorrowedErrors = map[string]error{
 	"ErrNodeIsParent":                   ErrNodeIsParent,
 	"ErrNodeOutOfRange":                 ErrNodeOutOfRange,
 	"ErrNodeTypeMismatch":               ErrNodeTypeMismatch,
+	"ErrProposalListBucketsDisagree":    ErrProposalListBucketsDisagree,
 	"ErrProposalListMisbucketed":        ErrProposalListMisbucketed,
 	"ErrRatchetExhausted":               ErrRatchetExhausted,
 	"ErrRemoveCommitter":                ErrRemoveCommitter,
@@ -1252,6 +1254,33 @@ func commitRuleCases() []commitRuleCase {
 			return ValidateCommit(testCommitInput(t, crypto, tree, list,
 				&Commit{Proposals: []ProposalOrRef{}}))
 		}},
+		// the bucket join, over the input the owner verified against the unmutated door: a list
+		// whose All IS the faithful resolution of the commit's vector and whose Removes bucket is
+		// empty. ValSem200 reads the bucket, so this commit -- which removes its own committer,
+		// RFC 9420 section 12.2's own rule -- was accepted by the whole aggregate.
+		{"CommitValidationInput.check", "ErrProposalListBucketsDisagree", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+			innocent := testRemoveOf(LeafIndex(2))
+			list := &ProposalList{
+				All:     []CachedProposal{innocent, testRemoveOf(LeafIndex(0))},
+				Removes: []CachedProposal{innocent},
+			}
+			return ValidateCommit(testCommitInput(t, crypto, tree, list, &Commit{}))
+		}},
+		// the extension join, with the disagreement in the MIDDLE of the installed vector
+		{"CommitValidationInput.check", "errCommitExtensionsNotApplied", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+			installed := testCommitInstalledExtensions()
+			in := testCommitInput(t, crypto, tree,
+				testProposalList(t, testGceOf(installed...)), &Commit{})
+			announced := slices.Clone(installed)
+			announced[1] = Extension{ExtensionType: announced[1].ExtensionType,
+				ExtensionData: []byte{0xaa}}
+			in.Extensions = announced
+			return ValidateCommit(in)
+		}},
 		// the structural precondition, with the armless proposal behind an innocent one
 		{"CommitValidationInput.check", "ErrContentArmMismatch", func(t *testing.T) error {
 			crypto := testCrypto(t)
@@ -2007,23 +2036,37 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 			failure)
 	}
 
-	// the base: a commit whose one proposal is a remove this member holds, named by reference
-	base := func(t *testing.T) (*CommitValidationInput, CachedProposal, CachedProposal) {
+	// the base: a commit whose TWO proposals are removes this member holds, both named by
+	// reference.
+	//
+	// TWO AND NOT ONE, and every row below plants its disagreement at entry ONE. The join walks the
+	// vector, and over a base carrying a single entry every row of this table was answered by a read
+	// of its head: narrowed to i < 1 the whole loop stayed green over all seven rows, which is the
+	// element-zero shape this file's own header states the doctrine for. With an agreeing entry in
+	// front of the disagreeing one, a loop and a read of the head are told apart.
+	base := func(t *testing.T) (*CommitValidationInput, CachedProposal, CachedProposal, CachedProposal) {
 		t.Helper()
 		in, _ := testFullCommitInput(t, crypto)
 		cache := testCacheAt(t, testResolveContext())
 		in.Pending = cache
+		agreeing := testCachedRemoveOf(t, crypto, cache, LeafIndex(1))
 		held := testCachedRemoveOf(t, crypto, cache, LeafIndex(2))
 		other := testCachedRemoveOf(t, crypto, cache, LeafIndex(3))
-		in.List = testProposalList(t, held)
-		in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: held.Ref}}
-		return in, held, other
+		in.List = testProposalList(t, agreeing, held)
+		in.Commit.Proposals = []ProposalOrRef{
+			{Type: ProposalOrRefTypeReference, Reference: agreeing.Ref},
+			{Type: ProposalOrRefTypeReference, Reference: held.Ref}}
+		return in, agreeing, held, other
 	}
-	// the control. Every row below is this commit with one field of one entry changed, so a row
-	// that is refused is refused by the join and by nothing else.
-	control, _, _ := base(t)
+	// the control. Every row below is this commit with one field of its SECOND entry changed, so a
+	// row that is refused is refused by the join and by nothing else.
+	control, _, _, _ := base(t)
 	if failure := ValidateCommit(control); failure != nil {
 		t.Fatalf("ValidateCommit refused the commit every row below is one edit away from: %v", failure)
+	}
+	if len(control.List.All) < 2 || len(control.Commit.Proposals) < 2 {
+		t.Fatalf("the base carries %d list entries and %d vector entries; a base of one cannot tell the join's loop from a read of its head",
+			len(control.List.All), len(control.Commit.Proposals))
 	}
 
 	// every row names the FIELD of a ProposalOrRef it makes the two disagree over, and the gate
@@ -2033,56 +2076,72 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 	rows := []struct {
 		name  string
 		field string
-		apply func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal)
+		apply func(t *testing.T, in *CommitValidationInput,
+			agreeing CachedProposal, held CachedProposal, other CachedProposal)
 	}{
 		{"a list longer than the commit's own vector", "",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
-				in.List = testProposalList(t, held, other)
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
+				in.List = testProposalList(t, agreeing, held, other)
 			}},
 		{"an entry the list holds by value and the commit names by reference", "Type",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
 				inline := held
 				inline.ByValue = true
-				in.List = testProposalList(t, inline)
+				in.List = testProposalList(t, agreeing, inline)
 			}},
 		{"an entry the list holds by reference and the commit carries by value", "Type",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
 				carried := held.Proposal
-				in.Commit.Proposals = []ProposalOrRef{
-					{Type: ProposalOrRefTypeProposal, Proposal: &carried}}
+				in.Commit.Proposals[1] = ProposalOrRef{
+					Type: ProposalOrRefTypeProposal, Proposal: &carried}
 			}},
 		{"a reference the list does not name, naming a proposal this member does hold", "Reference",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
-				in.Commit.Proposals = []ProposalOrRef{
-					{Type: ProposalOrRefTypeReference, Reference: other.Ref}}
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
+				in.Commit.Proposals[1] = ProposalOrRef{
+					Type: ProposalOrRefTypeReference, Reference: other.Ref}
 			}},
 		{"a by-value entry of another type", "Proposal",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
 				inline := held
 				inline.ByValue = true
-				in.List = testProposalList(t, inline)
-				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeProposal,
+				in.List = testProposalList(t, agreeing, inline)
+				in.Commit.Proposals[1] = ProposalOrRef{Type: ProposalOrRefTypeProposal,
 					Proposal: &Proposal{ProposalType: ProposalTypeGroupContextExtensions,
-						GroupContextExtensions: &GroupContextExtensions{}}}}
+						GroupContextExtensions: &GroupContextExtensions{}}}
 			}},
 		{"a by-value entry carrying no proposal at all", "Proposal",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
 				inline := held
 				inline.ByValue = true
-				in.List = testProposalList(t, inline)
-				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeProposal}}
+				in.List = testProposalList(t, agreeing, inline)
+				in.Commit.Proposals[1] = ProposalOrRef{Type: ProposalOrRefTypeProposal}
 			}},
 		{"a discriminant that names neither a proposal nor a reference", "Type",
-			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
-				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeReserved}}
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
+				in.Commit.Proposals[1] = ProposalOrRef{Type: ProposalOrRefTypeReserved}
 			}},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			in, held, other := base(t)
-			row.apply(t, in, held, other)
-			if failure := ValidateCommit(in); !errors.Is(failure, errCommitProposalsNotResolved) {
+			in, agreeing, held, other := base(t)
+			row.apply(t, in, agreeing, held, other)
+			failure := ValidateCommit(in)
+			if !errors.Is(failure, errCommitProposalsNotResolved) {
 				t.Fatalf("ValidateCommit over %s = %v, want errCommitProposalsNotResolved", row.name, failure)
+			}
+			// and the refusal names the entry it fired at, which is the whole of what separates a
+			// walk of the vector from a read of its head
+			if row.name != "a list longer than the commit's own vector" &&
+				!strings.Contains(failure.Error(), "entry 1") {
+				t.Errorf("ValidateCommit over %s refused with %v without naming entry 1, where the disagreement is; a join that answered element zero cannot refuse this input at all",
+					row.name, failure)
 			}
 		})
 	}
@@ -2454,6 +2513,40 @@ func testArmlessList(t *testing.T, code ProposalType) *ProposalList {
 	}
 }
 
+// testBucketOnlyArmlessList is a list whose BUCKET carries an armless proposal the commit order
+// does not.
+//
+// THE SHAPE testArmlessList CANNOT PRODUCE, and the reason it is here. That fixture places its
+// offender in All and in the matching bucket at once, so the All sweep of checkProposalListStructure
+// answers every case and the bucket sweep never fires: two mutations of the bucket half survived,
+// and the two that were caught were caught by an error-roster reachability gate rather than by
+// anything driving the behaviour. A list whose bucket carries an entry All does not is exactly what
+// re-opens the nil-arm dereference at in.List.Removes[i].Proposal.Remove.Removed, because every
+// bucketed rule reads the arm the BUCKET names.
+//
+// A type with no bucket cannot be carried by one, so the second answer is false rather than an
+// empty list: a fixture that reported clean over a shape it never built is the thing this exists to
+// not be. Which types have buckets is read off proposalBucketsOf, and the bucket is filled through
+// reflection, so a fifth bucket is driven without being named here.
+func testBucketOnlyArmlessList(t *testing.T, code ProposalType) (*ProposalList, bool) {
+	t.Helper()
+	innocent := testRemoveOf(1)
+	armless := CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: code}}
+	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
+		if bucket.carries != code {
+			continue
+		}
+		list := &ProposalList{
+			All:     []CachedProposal{innocent},
+			Removes: []CachedProposal{innocent},
+		}
+		held := reflect.ValueOf(list).Elem().FieldByName(bucket.field)
+		held.Set(reflect.Append(held, reflect.ValueOf(armless)))
+		return list, true
+	}
+	return nil, false
+}
+
 // TestNoDoorHandedAProposalListDereferencesAMissingArm is finding 2's class, derived on both axes.
 //
 // THE DOORS are every rule the two aggregates run, read off the production slices, plus every
@@ -2482,6 +2575,7 @@ func TestNoDoorHandedAProposalListDereferencesAMissingArm(t *testing.T) {
 	}
 	// and one outside the registry, which is the member of the class the registry cannot supply
 	inputs["an unregistered code point"] = ProposalType(0x1A1A)
+	bucketOnlyShapes := 0
 
 	for _, typeName := range slices.Sorted(maps.Keys(inputs)) {
 		code := inputs[typeName]
@@ -2495,18 +2589,34 @@ func TestNoDoorHandedAProposalListDereferencesAMissingArm(t *testing.T) {
 			// checkProposalProfile's own stated order
 			wanted = refusal
 		}
-		for _, name := range slices.Sorted(maps.Keys(doors)) {
-			door := doors[name]
-			answered := proposalListDoorAnswer(t, name+" over an armless "+typeName, door,
-				crypto, tree, testArmlessList(t, code))
-			if !door.refuses {
-				continue
-			}
-			if !errors.Is(answered, wanted) {
-				t.Errorf("%s over a list whose second entry is a %s with no arm answered %v, want %v",
-					name, typeName, answered, wanted)
+		// TWO SHAPES per type, and the second is the one nothing drove. The first carries the
+		// armless entry in the commit order and in its bucket, which the All sweep answers; the
+		// second carries it in the BUCKET ALONE, which only the bucket sweep can answer.
+		shapes := map[string]*ProposalList{
+			"in the commit order and in its bucket": testArmlessList(t, code),
+		}
+		if bucketOnly, bucketed := testBucketOnlyArmlessList(t, code); bucketed {
+			shapes["in its bucket alone"] = bucketOnly
+			bucketOnlyShapes += 1
+		}
+		for _, shape := range slices.Sorted(maps.Keys(shapes)) {
+			for _, name := range slices.Sorted(maps.Keys(doors)) {
+				door := doors[name]
+				answered := proposalListDoorAnswer(t,
+					name+" over an armless "+typeName+" "+shape, door, crypto, tree, shapes[shape])
+				if !door.refuses {
+					continue
+				}
+				if !errors.Is(answered, wanted) {
+					t.Errorf("%s over a list carrying a %s with no arm %s answered %v, want %v",
+						name, typeName, shape, answered, wanted)
+				}
 			}
 		}
+	}
+	if bucketOnlyShapes != len(proposalBucketsOf(&ProposalList{})) {
+		t.Errorf("the sweep drove %d bucket-only shapes and a ProposalList has %d buckets; the half of the structural rule that reads the buckets is then driven by nothing for the rest",
+			bucketOnlyShapes, len(proposalBucketsOf(&ProposalList{})))
 	}
 }
 
@@ -2526,3 +2636,917 @@ func proposalListDoorAnswer(t *testing.T, what string, door proposalListDoor,
 	return door.run(t, crypto, tree, list)
 }
 
+
+// ---------------------------------------------------------------------------
+// which source each rule decides off, and the door that establishes it
+// ---------------------------------------------------------------------------
+
+// THE DEFECT CLASS THIS SECTION EXISTS FOR is a rule decided off a field the door has not
+// established, and it has been the finding three commits running: ValSem201 stated over List while
+// the door held only Commit.Proposals; then four rules stated over a BUCKET while the door held
+// only All -- which accepted a commit that removes its own committer, RFC 9420 section 12.2's own
+// rule, at the validation door. Enumerating "the four bucket rules" would have been the fourth
+// instance, so what is written down here is not the four: it is a DERIVATION of which source every
+// rule of commitValidationChecks reads, and a table saying what the door establishes about each.
+//
+// A rule that comes to read a source with no establishment fails on the commit that writes it,
+// whether that source is a fifth bucket, a field added to CommitValidationInput, or one of the
+// eighteen already here that a later rule starts reading.
+
+// commitDoorMethod is the name of the argument rule every entry point of validate_commit.go and
+// validate_proposals.go runs first. It is what the derivation below excludes, and the
+// establishment table is a description of it.
+const commitDoorMethod = "check"
+
+// commitSourceValue is one value the reader below tracks: either a SOURCE PATH rooted at
+// CommitValidationInput -- "List", "List.Removes", "Commit.Path" -- or a STRUCT BINDING, which is
+// what a delegate's input is.
+//
+// The binding half is what makes the derivation exact across proposalValidationInput. That method
+// builds a *ProposalValidationInput out of this input's own fields and the rule reading
+// in.List.Removes is on the far side of it, so a reader that stopped at the call would attribute
+// nothing at all to ValSem200, and one that followed it without the mapping would report the
+// section 12.2 input's field names, which are not this input's.
+type commitSourceValue struct {
+	path   string
+	fields map[string]string
+}
+
+// commitSourceCallee is one resolved call: the declaration, and the bindings its receiver and
+// parameters take from the call site.
+type commitSourceCallee struct {
+	declaration *ast.FuncDecl
+	bindings    map[string]commitSourceValue
+}
+
+// commitSourceReader walks this package's non test source from a named declaration and answers
+// every source of a CommitValidationInput that declaration decides off.
+type commitSourceReader struct {
+	byName map[string][]*ast.FuncDecl
+	class  map[string]bool
+}
+
+// commitInputSourceClass is every source a rule can decide off, derived from the three types
+// rather than listed.
+//
+// One level of expansion for List and for Commit and no deeper, because that is where the
+// granularity stops mattering: the door joins the buckets to All and All to the commit's own
+// vector, and a rule reading Removes[i].Proposal.Remove.Removed is deciding off Removes.
+// Reflection over the structs and not a list of names, so a fifth bucket on ProposalList, or a
+// third field on Commit, is a source the gates below demand an establishment for on the commit
+// that adds it.
+func commitInputSourceClass() map[string]bool {
+	class := map[string]bool{}
+	input := reflect.TypeOf(CommitValidationInput{})
+	for i := 0; i < input.NumField(); i += 1 {
+		class[input.Field(i).Name] = true
+	}
+	list := reflect.TypeOf(ProposalList{})
+	for i := 0; i < list.NumField(); i += 1 {
+		class["List."+list.Field(i).Name] = true
+	}
+	commit := reflect.TypeOf(Commit{})
+	for i := 0; i < commit.NumField(); i += 1 {
+		class["Commit."+commit.Field(i).Name] = true
+	}
+	return class
+}
+
+// newCommitSourceReader indexes every function and method of this package's non test source by its
+// BARE name.
+//
+// By bare name, which over-reaches, and that is the safe direction for commitRefusalClosure's
+// reason: Go's method sets are not recoverable from an unresolved AST, so a call of Extensions
+// resolves to every declaration of that name and each is walked. A callee whose bindings carry
+// nothing input-derived is dropped, and a selector that does not resolve to a member of the source
+// class is dropped, so the over-reach costs work rather than accuracy -- while a derivation that
+// MISSED a read would be a rule deciding off a source no gate below asks about.
+func newCommitSourceReader(t *testing.T) *commitSourceReader {
+	t.Helper()
+	reader := &commitSourceReader{byName: map[string][]*ast.FuncDecl{}, class: commitInputSourceClass()}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		source := mustParseSource(t, path)
+		for _, declaration := range source.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			reader.byName[function.Name.Name] = append(reader.byName[function.Name.Name], function)
+		}
+	}
+	if len(reader.byName) == 0 {
+		t.Fatal("the reader indexed no declaration of this package, so every derivation below walks nothing")
+	}
+	return reader
+}
+
+// evaluate answers what one expression IS in terms of the input: a source path, a struct binding,
+// or nothing.
+//
+// The selector case is where the granularity is enforced. in.List.Removes[i].Proposal.Remove.Removed
+// walks down to "List", then to "List.Removes" because that is in the class, and then answers
+// "List.Removes" for every field read past it -- so one dereference chain reports the one source it
+// decides off rather than a name per link.
+func (self *commitSourceReader) evaluate(expr ast.Expr,
+	bindings map[string]commitSourceValue) commitSourceValue {
+
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return bindings[typed.Name]
+	case *ast.ParenExpr:
+		return self.evaluate(typed.X, bindings)
+	case *ast.StarExpr:
+		return self.evaluate(typed.X, bindings)
+	case *ast.UnaryExpr:
+		return self.evaluate(typed.X, bindings)
+	case *ast.IndexExpr:
+		return self.evaluate(typed.X, bindings)
+	case *ast.SliceExpr:
+		return self.evaluate(typed.X, bindings)
+	case *ast.CompositeLit:
+		return commitSourceValue{fields: self.fieldsOf(typed, bindings)}
+	case *ast.CallExpr:
+		return self.answerOf(typed, bindings)
+	case *ast.SelectorExpr:
+		base := self.evaluate(typed.X, bindings)
+		if base.fields != nil {
+			if path, mapped := base.fields[typed.Sel.Name]; mapped {
+				return commitSourceValue{path: path}
+			}
+			return commitSourceValue{}
+		}
+		if base.path == "" {
+			return commitSourceValue{}
+		}
+		if self.class[base.path+"."+typed.Sel.Name] {
+			return commitSourceValue{path: base.path + "." + typed.Sel.Name}
+		}
+		return base
+	}
+	return commitSourceValue{}
+}
+
+// fieldsOf reads a struct literal as a mapping from its own field names to the sources they were
+// built out of.
+func (self *commitSourceReader) fieldsOf(literal *ast.CompositeLit,
+	bindings map[string]commitSourceValue) map[string]string {
+
+	fields := map[string]string{}
+	for _, element := range literal.Elts {
+		pair, isPair := element.(*ast.KeyValueExpr)
+		if !isPair {
+			continue
+		}
+		key, isIdentifier := pair.Key.(*ast.Ident)
+		if !isIdentifier {
+			continue
+		}
+		if value := self.evaluate(pair.Value, bindings); value.path != "" {
+			fields[key.Name] = value.path
+		}
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return fields
+}
+
+// calleesOf resolves one call to the declarations it can reach, with each declaration's receiver
+// and parameters bound to what the call site handed them.
+//
+// A callee whose every binding is empty is dropped rather than walked: nothing it reads can be a
+// source of this input, and walking it anyway would be a walk of the whole package from every rule.
+func (self *commitSourceReader) calleesOf(call *ast.CallExpr,
+	bindings map[string]commitSourceValue) []commitSourceCallee {
+
+	name := ""
+	receiver := commitSourceValue{}
+	switch function := call.Fun.(type) {
+	case *ast.Ident:
+		name = function.Name
+	case *ast.SelectorExpr:
+		name = function.Sel.Name
+		receiver = self.evaluate(function.X, bindings)
+	default:
+		return nil
+	}
+	callees := []commitSourceCallee{}
+	for _, declaration := range self.byName[name] {
+		inner := map[string]commitSourceValue{}
+		if declaration.Recv != nil && len(declaration.Recv.List) == 1 &&
+			len(declaration.Recv.List[0].Names) == 1 {
+			inner[declaration.Recv.List[0].Names[0].Name] = receiver
+		}
+		if declaration.Type.Params != nil {
+			at := 0
+			for _, parameter := range declaration.Type.Params.List {
+				for _, identifier := range parameter.Names {
+					if at < len(call.Args) {
+						inner[identifier.Name] = self.evaluate(call.Args[at], bindings)
+					}
+					at += 1
+				}
+			}
+		}
+		carries := false
+		for _, value := range inner {
+			if value.path != "" || value.fields != nil {
+				carries = true
+			}
+		}
+		if carries {
+			callees = append(callees, commitSourceCallee{declaration, inner})
+		}
+	}
+	return callees
+}
+
+// answerOf is what a call ANSWERS, which for proposalValidationInput is the delegate input's own
+// field mapping and for FilteredDirectPath is nothing.
+func (self *commitSourceReader) answerOf(call *ast.CallExpr,
+	bindings map[string]commitSourceValue) commitSourceValue {
+
+	for _, callee := range self.calleesOf(call, bindings) {
+		answered := commitSourceValue{}
+		ast.Inspect(callee.declaration.Body, func(node ast.Node) bool {
+			returned, isReturn := node.(*ast.ReturnStmt)
+			if !isReturn || len(returned.Results) != 1 {
+				return true
+			}
+			result := returned.Results[0]
+			if unary, isUnary := result.(*ast.UnaryExpr); isUnary {
+				result = unary.X
+			}
+			if value := self.evaluate(result, callee.bindings); value.path != "" || value.fields != nil {
+				answered = value
+			}
+			return false
+		})
+		if answered.path != "" || answered.fields != nil {
+			return answered
+		}
+	}
+	return commitSourceValue{}
+}
+
+// read collects every source one declaration decides off, following the calls it makes.
+//
+// EVERY CALL OF A DOOR'S OWN check IS SKIPPED, at every depth, and that is the whole point of the
+// derivation. Every rule of this file opens with in.check(), and the door reads the list, the
+// buckets, the commit's vector and both trees while ESTABLISHING them -- so a reader that counted
+// those would report that every rule decides off everything, and the gate below would be an
+// identity. What is left is what the rule decides off on top of what the door established, which
+// is exactly the thing that has to have an establishment behind it.
+func (self *commitSourceReader) read(declaration *ast.FuncDecl,
+	bindings map[string]commitSourceValue, into map[string]bool, walked map[string]bool) {
+
+	key := declaration.Name.Name + "|"
+	for _, name := range slices.Sorted(maps.Keys(bindings)) {
+		key += name + "=" + bindings[name].path + ";"
+		for _, field := range slices.Sorted(maps.Keys(bindings[name].fields)) {
+			key += field + ">" + bindings[name].fields[field] + ","
+		}
+	}
+	if walked[key] {
+		return
+	}
+	walked[key] = true
+	ast.Inspect(declaration.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CallExpr:
+			if selector, isSelector := typed.Fun.(*ast.SelectorExpr); isSelector &&
+				selector.Sel.Name == commitDoorMethod {
+				return true
+			}
+			for _, callee := range self.calleesOf(typed, bindings) {
+				self.read(callee.declaration, callee.bindings, into, walked)
+			}
+			return true
+		case *ast.SelectorExpr:
+			if value := self.evaluate(typed, bindings); value.path != "" {
+				into[value.path] = true
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// sourcesRead is every source of a CommitValidationInput the named declaration decides off.
+func (self *commitSourceReader) sourcesRead(name string) []string {
+	identity := map[string]string{}
+	input := reflect.TypeOf(CommitValidationInput{})
+	for i := 0; i < input.NumField(); i += 1 {
+		identity[input.Field(i).Name] = input.Field(i).Name
+	}
+	found := map[string]bool{}
+	for _, declaration := range self.byName[name] {
+		bindings := map[string]commitSourceValue{}
+		if declaration.Recv != nil && len(declaration.Recv.List) == 1 &&
+			len(declaration.Recv.List[0].Names) == 1 &&
+			receiverTypeName(declaration.Recv.List[0].Type) == "CommitValidationInput" {
+			bindings[declaration.Recv.List[0].Names[0].Name] = commitSourceValue{fields: identity}
+		}
+		if declaration.Type.Params != nil {
+			for _, parameter := range declaration.Type.Params.List {
+				for _, identifier := range parameter.Names {
+					bindings[identifier.Name] = commitSourceValue{fields: identity}
+				}
+			}
+		}
+		self.read(declaration, bindings, found, map[string]bool{})
+	}
+	return slices.Sorted(maps.Keys(found))
+}
+
+// commitRuleSources is the derivation itself: for every rule ValidateCommit runs, the sources it
+// decides off.
+//
+// THREE CONTROLS, each ruling out a different way for this to report a clean bill over a walk that
+// resolved nothing. ValSem200 reaches List.Removes only through a delegate another method builds,
+// so a reader that does not follow that mapping finds nothing there. ValSem207 names in.PostTree in
+// its own body, so a reader that resolved no selector at all finds nothing there. And the class
+// must have an OUTSIDE: ValSem205's three confirmation tag fields are read by no rule the aggregate
+// runs, so a derivation reporting every field of the struct is a walk with no edges.
+func commitRuleSources(t *testing.T) map[string][]string {
+	t.Helper()
+	reader := newCommitSourceReader(t)
+	sources := map[string][]string{}
+	union := map[string]bool{}
+	for _, name := range commitRulesTheAggregateRuns() {
+		sources[name] = reader.sourcesRead(name)
+		for _, source := range sources[name] {
+			union[source] = true
+		}
+	}
+	if len(sources) == 0 {
+		t.Fatal("ValidateCommit runs no rule, so the derivation had nothing to read")
+	}
+	if !slices.Contains(sources["ValSem200NoSelfRemove"], "List.Removes") {
+		t.Fatalf("the derivation says ValSem200NoSelfRemove decides off %v, and it decides off the Removes bucket through the section 12.2 input this file builds for it; a reader that does not follow that mapping attributes nothing to either delegating rule",
+			sources["ValSem200NoSelfRemove"])
+	}
+	if !slices.Contains(sources["ValSem207PathEncryptionKeysUnique"], "PostTree") {
+		t.Fatalf("the derivation says ValSem207PathEncryptionKeysUnique decides off %v, and it names in.PostTree in its own body",
+			sources["ValSem207PathEncryptionKeysUnique"])
+	}
+	for _, outside := range []string{"ConfirmationKey", "ConfirmedHash", "ConfirmationTag"} {
+		if union[outside] {
+			t.Fatalf("the derivation says a rule the aggregate runs decides off %s; the only rule that reads the confirmation tag is ValSem205, which the aggregate deliberately does not run, so a class holding it has no outside",
+				outside)
+		}
+	}
+	class := commitInputSourceClass()
+	for _, source := range slices.Sorted(maps.Keys(union)) {
+		if !class[source] {
+			t.Errorf("the derivation reports %s, which is not a field of CommitValidationInput, of a ProposalList or of a Commit",
+				source)
+		}
+	}
+	return sources
+}
+
+// commitSourceEstablishment is what the door establishes about one source, and an input that
+// breaks it.
+//
+// EVERY ROW IS DRIVEN and none of them is a label. The row starts from a commit ValidateCommit
+// ACCEPTS, breaks the one thing it claims the door establishes, and states what the aggregate must
+// answer -- so a row whose establishment is a fiction fails, and so does one whose establishment
+// was real and has since been deleted.
+//
+// refuses nil is a row of the other kind, and it is the honest way to write "the door establishes
+// nothing about this, because no rule it runs decides anything off it": the break is applied and
+// the aggregate must go on ACCEPTING. Crypto and Now are those two, and the day a rule reaches the
+// provider or the clock without the door growing a guard, the row fails -- by a panic or by a
+// changed answer.
+type commitSourceEstablishment struct {
+	establishes string
+	build       func(t *testing.T, crypto CryptoProvider) *CommitValidationInput
+	breaks      func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput)
+	refuses     error
+}
+
+// testCommitInstalledExtensions is the group context extension set the fixture below installs.
+//
+// THREE ENTRIES, so the extension join's fault can be planted in the middle: a comparison narrowed
+// to entry zero, or one that stops at the first agreement, is told apart from the whole walk only
+// by a vector that has a middle. ratchet_tree is a default type and is exempt from section 13.4's
+// listing rule; the other two are private use types every fixture leaf of this package lists, so
+// the set is one an honest commit could install into this group.
+func testCommitInstalledExtensions() []Extension {
+	return []Extension{
+		{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+		{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x01}},
+		{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{0x02}},
+	}
+}
+
+// testCommitCarryingOneOfEveryBucket is the commit nearly every establishment row starts from: a
+// four member group, a full update path, and ONE PROPOSAL OF EVERY BUCKETED TYPE.
+//
+// One of each and not one, because the bucket rows are generated off proposalBucketsOf and each of
+// them empties its own bucket: over a list carrying only removes, emptying the Adds bucket is a
+// break that breaks nothing. It also puts each bucket's own entry at a different position of the
+// commit order, so the count sweep the join runs cannot be narrowed to element zero without three
+// of the four rows failing.
+func testCommitCarryingOneOfEveryBucket(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	testCommitProposals(t, in,
+		testRemoveOf(LeafIndex(3)), testAddOf(kp), update,
+		testGceOf(testCommitInstalledExtensions()...))
+	return in
+}
+
+// testCommitNamingACachedProposal is the base for the Pending row: a commit whose FIRST proposal is
+// carried inline and whose SECOND names a proposal this member has received.
+//
+// The order is the point. Erratum 8815 is stated over references and skips by-value entries, so a
+// commit whose only reference is its second is exactly the input a rule written over entry zero
+// admits -- and the row's break, a validator handed no record of what this member received, has to
+// reach entry one to refuse.
+func testCommitNamingACachedProposal(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+	t.Helper()
+	in, _ := testFullCommitInput(t, crypto)
+	cache := testCacheAt(t, testResolveContext())
+	in.Pending = cache
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	inline := testAddOf(kp)
+	held := testCachedRemoveOf(t, crypto, cache, LeafIndex(2))
+	in.List = testProposalList(t, inline, held)
+	carried := inline.Proposal
+	in.Commit.Proposals = []ProposalOrRef{
+		{Type: ProposalOrRefTypeProposal, Proposal: &carried},
+		{Type: ProposalOrRefTypeReference, Reference: held.Ref},
+	}
+	return in
+}
+
+// commitSetBucket replaces one named bucket of a list through reflection, so the rows generated off
+// proposalBucketsOf do not have to name the four fields a second time.
+func commitSetBucket(t *testing.T, list *ProposalList, field string, entries []CachedProposal) {
+	t.Helper()
+	held := reflect.ValueOf(list).Elem().FieldByName(field)
+	if !held.IsValid() || held.Type() != reflect.TypeOf([]CachedProposal{}) {
+		t.Fatalf("proposalBucketsOf names a bucket %s and a ProposalList has no []CachedProposal field of that name",
+			field)
+	}
+	held.Set(reflect.ValueOf(entries))
+}
+
+// commitDoorEstablishments is one row per source a rule of the aggregate decides off.
+//
+// The four bucket rows are GENERATED off proposalBucketsOf rather than written, which is the whole
+// difference between this and the enumeration it replaces: a fifth bucket added to ProposalList
+// gets a row, a drive and a refusal without anybody remembering to write one, and it fails
+// immediately if the door does not in fact hold it to the commit order.
+func commitDoorEstablishments() map[string]commitSourceEstablishment {
+	rows := map[string]commitSourceEstablishment{
+		"List": {
+			establishes: "there IS a proposal list, which every rule below reads an arm off",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.List = nil
+			},
+			refuses: errNilProposalList,
+		},
+		"List.All": {
+			establishes: "the commit order carries exactly the proposals the buckets do, so a rule stated over " +
+				"All and a rule stated over a bucket are two rules about one commit",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				// the THIRD entry and not the first: the join counts the commit order by type, and a
+				// count narrowed to element zero cannot see an entry dropped from the middle
+				in.List.All = slices.Concat(in.List.All[:2], in.List.All[3:])
+				in.Commit.Proposals = in.List.Refs()
+			},
+			refuses: ErrProposalListBucketsDisagree,
+		},
+		"Commit": {
+			establishes: "there IS a commit; the update path and the proposal vector are its",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Commit = nil
+			},
+			refuses: errNilCommit,
+		},
+		"Commit.Proposals": {
+			establishes: "the list is the resolution of the commit's own ProposalOrRef vector -- same length, " +
+				"same order, each entry naming what the entry beside it names",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				// entries one and two swapped, so the disagreement is not at element zero
+				in.Commit.Proposals[1], in.Commit.Proposals[2] =
+					in.Commit.Proposals[2], in.Commit.Proposals[1]
+			},
+			refuses: errCommitProposalsNotResolved,
+		},
+		"Commit.Path": {
+			establishes: "there is an update path whenever RFC 9420 section 12.4 requires one, which is what " +
+				"every rule reading the path stands on when it answers nil for an absent one",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Commit.Path = nil
+			},
+			refuses: errMissingPath,
+		},
+		"Extensions": {
+			establishes: "the extension set the caller announces is the one this commit installs, so ValSem209 " +
+				"and erratum 8745 judge the members and the path leaf against one vector",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				announced := slices.Clone(testCommitInstalledExtensions())
+				announced[1] = Extension{ExtensionType: announced[1].ExtensionType,
+					ExtensionData: []byte{0xaa}}
+				in.Extensions = announced
+			},
+			refuses: errCommitExtensionsNotApplied,
+		},
+		"PreTree": {
+			establishes: "there IS a pre-commit tree, which is the group the proposals arrived in and what " +
+				"section 12.2's membership rules are stated over",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.PreTree = nil
+			},
+			refuses: errNilRatchetTree,
+		},
+		"PostTree": {
+			establishes: "there IS a post-proposal tree, which is the tree the update path was built against",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.PostTree = nil
+			},
+			refuses: errNilRatchetTree,
+		},
+		"Context": {
+			establishes: "there IS a group context; the version, the suite and the group's own extensions are its",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Context = nil
+			},
+			refuses: ErrNilGroupContext,
+		},
+		"Pending": {
+			establishes: "every proposal the commit names by reference is one this member has received, which is " +
+				"erratum 8815 -- and a validator handed no record of what was received has not checked it",
+			build: testCommitNamingACachedProposal,
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Pending = nil
+			},
+			refuses: errProposalNotCached,
+		},
+		"Committer": {
+			establishes: "the commit is attributed to a leaf of this group, which every comparison against the " +
+				"committer's current leaf and every filtered direct path stands on",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Committer = LeafIndex(97)
+			},
+			refuses: ErrLeafOutOfRange,
+		},
+		"Own": {
+			establishes: "this receiver occupies a leaf of the tree the path was built against; a path secret is " +
+				"addressed to a position, and a receiver that has none can open nothing",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Own = LeafIndex(97)
+			},
+			refuses: errPathDecrypt,
+		},
+		"Crypto": {
+			establishes: "NOTHING, and nothing is owed: no rule the aggregate runs calls a method on the provider. " +
+				"The two delegating rules copy the field into the section 12.2 input and neither body they reach " +
+				"verifies anything, and ValSem205 -- which does, and which refuses a nil one itself -- is the rule " +
+				"the aggregate deliberately does not run. The day that stops being true this row fails, by a panic " +
+				"or by a changed answer",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Crypto = nil
+			},
+			refuses: nil,
+		},
+		"Now": {
+			establishes: "NOTHING, for the Crypto row's reason one field over: no rule the aggregate runs reads a " +
+				"clock. A lifetime is carried only under a key_package sourced leaf and section 12.4.2's path leaf " +
+				"is commit sourced, so the field is copied into the section 12.2 input and read by nothing this " +
+				"door reaches",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				in.Now = time.Time{}
+			},
+			refuses: nil,
+		},
+	}
+	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
+		field := bucket.field
+		carries := bucket.carries
+		rows["List."+field] = commitSourceEstablishment{
+			establishes: "the " + field + " bucket holds exactly the " + proposalTypeName(carries) +
+				" proposals of the commit order, so a rule stated over the bucket is a rule about the commit " +
+				"the sender signed rather than about a field a caller filled in beside it",
+			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+				commitSetBucket(t, in.List, field, nil)
+			},
+			refuses: ErrProposalListBucketsDisagree,
+		}
+	}
+	return rows
+}
+
+// TestEveryRuleTheCommitAggregateRunsDecidesOffASourceTheDoorEstablishes is this task's gate, and
+// it is the derivation rather than a list of the four rules that happened to be wrong.
+//
+// BOTH DIRECTIONS. A source some rule decides off with no row is a rule standing on nothing --
+// which is what ValSem200 was doing off the Removes bucket while the door held only All, and what a
+// thirteenth rule reading a fifth source would be doing on the commit that adds it. A row for a
+// source no rule reads is an establishment nothing needs, and it goes.
+func TestEveryRuleTheCommitAggregateRunsDecidesOffASourceTheDoorEstablishes(t *testing.T) {
+	sources := commitRuleSources(t)
+	rows := commitDoorEstablishments()
+	needed := map[string]bool{}
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		for _, source := range sources[name] {
+			needed[source] = true
+			if _, established := rows[source]; established {
+				continue
+			}
+			t.Errorf("%s decides off %s and the door establishes nothing about it. A rule stated over a field the door has not joined to the commit is a rule about a commit that was never sent: write down what the door establishes about %s and drive it, or stop reading it",
+				name, source, source)
+		}
+		t.Logf("%s decides off %v", name, sources[name])
+	}
+	for _, source := range slices.Sorted(maps.Keys(rows)) {
+		if !needed[source] {
+			t.Errorf("the door is said to establish %s and no rule the aggregate runs decides off it; an establishment nothing needs goes on reporting a clean bill after the rule it was written for has gone",
+				source)
+		}
+	}
+}
+
+// TestEveryEstablishmentTheCommitDoorClaimsIsOneItMakes drives every row, so the table above is a
+// set of assertions rather than a set of labels.
+//
+// The control per row is what makes the break exact: the commit each row starts from is accepted by
+// ValidateCommit, so the refusal that follows is the break's and not something the fixture was
+// already carrying.
+func TestEveryEstablishmentTheCommitDoorClaimsIsOneItMakes(t *testing.T) {
+	crypto := testCrypto(t)
+	rows := commitDoorEstablishments()
+	if len(rows) == 0 {
+		t.Fatal("no establishment is written down, so this drives nothing")
+	}
+	for _, source := range slices.Sorted(maps.Keys(rows)) {
+		row := rows[source]
+		t.Run(source, func(t *testing.T) {
+			if row.establishes == "" || row.breaks == nil {
+				t.Fatalf("%s is classified with no account of what the door establishes or no input that breaks it",
+					source)
+			}
+			build := row.build
+			if build == nil {
+				build = testCommitCarryingOneOfEveryBucket
+			}
+			in := build(t, crypto)
+			if failure := ValidateCommit(in); failure != nil {
+				t.Fatalf("ValidateCommit refused the commit this row is one break away from: %v; every refusal below would then be that one",
+					failure)
+			}
+			row.breaks(t, crypto, in)
+			answered := ValidateCommit(in)
+			if row.refuses == nil {
+				if answered != nil {
+					t.Fatalf("the row says the door establishes nothing about %s and ValidateCommit answered %v once it was broken; a rule the aggregate runs has come to decide off it, so the door owes it an establishment",
+						source, answered)
+				}
+				return
+			}
+			if !errors.Is(answered, row.refuses) {
+				t.Fatalf("ValidateCommit over a commit whose %s the door was said to establish answered %v, want %v",
+					source, answered, row.refuses)
+			}
+		})
+	}
+}
+
+// commitRuleTrees is which of the two trees each rule of the aggregate is stated over, with the
+// reason.
+//
+// THE TWO ARE INTERCHANGEABLE IN EVERY FIXTURE THAT CLONES ONE INTO THE OTHER, which is what every
+// fixture in this file does by default, and that is why this is written down: three tree reads of
+// validate_commit.go could be swapped to the other tree with the whole suite green. It is derived
+// off the same walk the establishment gate uses, so a rule that starts reading a tree, stops
+// reading one, or comes to read BOTH fails here rather than passing quietly -- and reading both is
+// its own failure, because a rule whose two halves are judged in two different epochs is two rules.
+var commitRuleTrees = map[string]string{
+	"ValSem200NoSelfRemove": "PreTree: section 12.2 is stated over the group the proposals ARRIVED in, and " +
+		"proposalValidationInput is the one place this file decides that",
+	"ValSem208SingleGroupContextExtensions": "PreTree: the same delegate input, for ValSem200's reason",
+	"ValSem202PathLength": "PostTree: the proposals are applied before the path is validated and a remove " +
+		"blanks nodes the filter steps over, so against the pre tree an honest commit that removes anybody " +
+		"would be refused",
+	"ValSem203PathDecrypt": "PostTree: the path addresses positions in the tree it was BUILT against, so a " +
+		"receiver the commit's own proposals moved or evicted is judged where the path put it",
+	"ValSem204PathKeyMismatch": "PreTree: section 12.4.2 states it over the committer's CURRENT leaf, which is " +
+		"the leaf the path is replacing",
+	"ValSem207PathEncryptionKeysUnique": "PostTree: the keys the path is about to install must be new to the " +
+		"tree the merge happens in",
+	"ValSem209GroupExtensionsSupported": "PostTree: the members the new extensions take effect for are the ones " +
+		"this commit LEAVES in the group, the ones it adds included",
+	"validateCommitPostTreeIsExportable": "PostTree: ValSem300 is stated over the tree a GroupInfo published " +
+		"from this commit carries",
+}
+
+// TestEveryTreeReadOfTheCommitRulesIsTheTreeItsRuleIsStatedOver holds each rule to one tree.
+func TestEveryTreeReadOfTheCommitRulesIsTheTreeItsRuleIsStatedOver(t *testing.T) {
+	sources := commitRuleSources(t)
+	read := map[string]string{}
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		trees := []string{}
+		for _, source := range sources[name] {
+			if source == "PreTree" || source == "PostTree" {
+				trees = append(trees, source)
+			}
+		}
+		if len(trees) == 0 {
+			continue
+		}
+		if len(trees) > 1 {
+			t.Errorf("%s decides off %v; a rule stated over both trees is a rule whose two halves are judged in two different epochs, and the table below can say only one thing about it",
+				name, trees)
+			continue
+		}
+		read[name] = trees[0]
+	}
+	if len(read) < 2 {
+		t.Fatalf("the derivation found %d rules reading a tree and this file states more than that, so it read something other than the rules",
+			len(read))
+	}
+	for _, name := range slices.Sorted(maps.Keys(read)) {
+		reason, written := commitRuleTrees[name]
+		if !written {
+			t.Errorf("%s decides off %s and nothing says which tree it is stated over; the two are interchangeable in every fixture that clones one into the other, so a rule with no row here is one whose tree can be swapped with the suite green",
+				name, read[name])
+			continue
+		}
+		if !strings.HasPrefix(reason, read[name]+":") {
+			t.Errorf("%s decides off %s and it is written down as %q; one of the two has moved",
+				name, read[name], reason)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(commitRuleTrees)) {
+		if _, reads := read[name]; !reads {
+			t.Errorf("a tree is written down for %s and the aggregate runs no rule of that name that reads one; the row has outlived what it classified",
+				name)
+		}
+	}
+}
+
+// TestTheSectionTwelveTwoInputThisFileBuildsIsThisCommitsOwnFields holds every field of the
+// delegate input to the field of this input it is built from.
+//
+// proposalValidationInput is the one place this file decides what section 12.2 is asked ABOUT, and
+// its Tree is the one field whose value does not carry the same name on both sides: PreTree,
+// because section 12.2's membership rules are about the group the proposals arrived in. Swapping it
+// to PostTree leaves the behaviour of both delegating rules unchanged -- neither reads the tree at
+// all -- so the mapping is asserted here rather than left to a rule to notice.
+//
+// Held to the delegate type in BOTH directions, so a field added to ProposalValidationInput that
+// this builder leaves at its zero value fails here rather than being handed over empty.
+func TestTheSectionTwelveTwoInputThisFileBuildsIsThisCommitsOwnFields(t *testing.T) {
+	crypto := testCrypto(t)
+	in := testCommitCarryingOneOfEveryBucket(t, crypto)
+	// the two trees must be distinguishable, or every claim below about which one was handed over
+	// is a comparison of one pointer with itself
+	if in.PreTree == in.PostTree {
+		t.Fatal("the fixture hands one tree to both fields, so nothing below can tell them apart")
+	}
+	in.Extensions = slices.Clone(testCommitInstalledExtensions())
+	in.Now = time.Now().Add(time.Hour)
+	built := in.proposalValidationInput()
+	if built == nil {
+		t.Fatal("proposalValidationInput answered nothing")
+	}
+	expected := map[string]any{
+		"Crypto":     in.Crypto,
+		"Tree":       in.PreTree,
+		"Context":    in.Context,
+		"Extensions": in.Extensions,
+		"Committer":  in.Committer,
+		"List":       in.List,
+		"Now":        in.Now,
+	}
+	delegate := reflect.TypeOf(ProposalValidationInput{})
+	if delegate.NumField() == 0 {
+		t.Fatal("reflection found no field on ProposalValidationInput, so this gate read nothing")
+	}
+	held := reflect.ValueOf(built).Elem()
+	for i := 0; i < delegate.NumField(); i += 1 {
+		name := delegate.Field(i).Name
+		want, written := expected[name]
+		if !written {
+			t.Errorf("a ProposalValidationInput carries %s and nothing says which field of a commit validation input it is built from; a field left at its zero value is section 12.2 asked about something the commit does not carry",
+				name)
+			continue
+		}
+		if got := held.Field(i).Interface(); !reflect.DeepEqual(got, want) {
+			t.Errorf("the section 12.2 input's %s is %v and this commit's own value is %v", name, got, want)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(expected)) {
+		if _, onTheType := delegate.FieldByName(name); !onTheType {
+			t.Errorf("this gate claims the delegate carries %s and a ProposalValidationInput has no such field",
+				name)
+		}
+	}
+}
+
+// TestValSem209IsStatedOverTheTreeTheProposalsBuild is finding 3's behavioural half for the member
+// walk, and it is the security relevant direction.
+//
+// A MEMBER THIS COMMIT ADDS is in the post-proposal tree and in no other, so it is the member the
+// distinction is visible on: section 12.4.2 applies the proposals before the extensions are judged,
+// so a joiner who does not support an extension the same commit installs is exactly the state
+// section 13.4 says cannot happen. Over the pre-commit tree that joiner is not there to be asked
+// and the whole rule reports clean.
+//
+// The removed-member direction cannot tell the two trees apart, which is why it is not the fixture:
+// ValSem209 skips the leaves the list removes, so a narrow member the commit evicts is exempt in
+// both trees.
+//
+// The offender is at the LAST leaf of the post tree and behind the exempt extension in the
+// installed vector, so neither loop can be narrowed to element zero and still refuse it.
+func TestValSem209IsStatedOverTheTreeTheProposalsBuild(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	kp.LeafNode.Capabilities = testNarrowedCapabilities()
+
+	list := testProposalList(t, testGceOf(
+		Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+		Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}),
+		testAddOf(kp))
+	in := testCommitInput(t, crypto, tree, list, &Commit{})
+	applied, err := ApplyProposals(in.PreTree, in.Context, in.Committer, in.List)
+	if err != nil {
+		t.Fatalf("ApplyProposals to build the post tree: %v", err)
+	}
+	in.PostTree = applied.Tree
+	if len(in.PostTree.NonBlankLeaves()) <= len(in.PreTree.NonBlankLeaves()) {
+		t.Fatalf("the post tree holds %d members and the pre tree %d; the add must put one there or the two trees are one",
+			len(in.PostTree.NonBlankLeaves()), len(in.PreTree.NonBlankLeaves()))
+	}
+	if failure := ValSem209GroupExtensionsSupported(in); !errors.Is(failure, errGroupContextExtensionNotListed) {
+		t.Fatalf("ValSem209 over a commit installing urmessage_owner_successor while ADDING a member that does not list it = %v, want errGroupContextExtensionNotListed",
+			failure)
+	}
+	// and over the pre-commit tree the joiner is not a member yet, so the rule has nobody to
+	// refuse -- which is what makes the tree this rule reads a decision rather than a spelling
+	overThePreTree := *in
+	overThePreTree.PostTree = in.PreTree
+	if failure := ValSem209GroupExtensionsSupported(&overThePreTree); failure != nil {
+		t.Fatalf("ValSem209 over the pre-commit tree refused %v; the fixture is then not telling the two trees apart",
+			failure)
+	}
+}
+
+// TestValSem203ReadsTheFilteredDirectPathsOfTheTreeThePathWasBuiltAgainst is finding 3's
+// behavioural half for the receiver's own filtered direct path.
+//
+// A COMMIT THAT EVICTS THIS MEMBER is the input the distinction is visible on. Removing the right
+// hand half of the group truncates the tree, so the evicted member's leaf is not a position of the
+// post-proposal tree at all and the path, which was built against that tree, addresses nothing to
+// it. Over the pre-commit tree the same member's filtered direct path meets the committer's at the
+// root, and the rule reports that a secret exists for a member the commit has removed.
+//
+// WHICH READ FIRED IS ASSERTED and not only that something did. Both halves of this rule answer
+// errPathDecrypt, so the sentinel alone cannot tell the receiver's own path read from the
+// intersection that follows it: with the read swapped to the pre tree this input is still refused,
+// by the clause below it. The committer's half of the same swap is held by
+// TestEveryTreeReadOfTheCommitRulesIsTheTreeItsRuleIsStatedOver, which fails on a rule that comes
+// to read both trees.
+func TestValSem203ReadsTheFilteredDirectPathsOfTheTreeThePathWasBuiltAgainst(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
+	list := testProposalList(t, testRemoveOf(LeafIndex(2)), testRemoveOf(LeafIndex(3)))
+	in := testCommitInput(t, crypto, tree, list, &Commit{})
+	applied, err := ApplyProposals(in.PreTree, in.Context, in.Committer, in.List)
+	if err != nil {
+		t.Fatalf("ApplyProposals to build the post tree: %v", err)
+	}
+	in.PostTree = applied.Tree
+	if in.PostTree.LeafCount() >= in.PreTree.LeafCount() {
+		t.Fatalf("the post tree is %d leaves wide and the pre tree %d; the removals must truncate or the two trees are one",
+			in.PostTree.LeafCount(), in.PreTree.LeafCount())
+	}
+	in.Commit.Path = testCommitPath(t, crypto, members[0], 1)
+	in.Committer = LeafIndex(0)
+	in.Own = LeafIndex(3)
+
+	failure := ValSem203PathDecrypt(in)
+	if !errors.Is(failure, errPathDecrypt) {
+		t.Fatalf("ValSem203 over a receiver this commit removes = %v, want errPathDecrypt", failure)
+	}
+	if !strings.Contains(failure.Error(), "this member's filtered direct path") {
+		t.Errorf("ValSem203 refused with %v; over a receiver whose leaf the post-proposal tree no longer has, the refusal that says the tree was read is the one about this member's own filtered direct path",
+			failure)
+	}
+	overThePreTree := *in
+	overThePreTree.PostTree = in.PreTree
+	if answered := ValSem203PathDecrypt(&overThePreTree); answered != nil {
+		t.Fatalf("ValSem203 over the pre-commit tree answered %v and must accept; the fixture is then not telling the two trees apart",
+			answered)
+	}
+}

@@ -97,6 +97,14 @@ var (
 	// of this file is a peer's commit being refused.
 	errCommitProposalsNotResolved = errors.New("mls: the proposal list handed to commit validation is not the resolution of the commit's own proposal vector")
 
+	// the JOIN between the extension set the caller announces and the one this commit installs.
+	// Its own value and not errCommitProposalsNotResolved's for that value's own reason: the two
+	// name different pairs of fields and a caller told only "your input contradicts itself"
+	// cannot tell which pair it has to repair. It is the caller's mistake and not the sender's,
+	// which is what both joins have in common and what separates them from every other value of
+	// this file.
+	errCommitExtensionsNotApplied = errors.New("mls: the extension set handed to commit validation is not the one this commit installs")
+
 	// ValSem201: the path is populated when section 12.4's rule requires one. Its own value and
 	// not errPathLength's, because a commit that carries no path at all and a commit whose path
 	// is the wrong length are sent by different senders for different reasons -- the first
@@ -261,7 +269,29 @@ func (self *CommitValidationInput) check() error {
 	if err := checkProposalListStructure(self.List); err != nil {
 		return err
 	}
-	return self.checkListResolvesTheCommitsVector()
+	// AND THE BUCKETS ARE THE COMMIT ORDER BUCKETED BY TYPE, which is the second of the three
+	// joins this door owes and was the one it did not ask.
+	//
+	// FOUR OF THE TWELVE RULES BELOW DECIDE OFF A BUCKET -- ValSem200 off Removes, ValSem206 off
+	// Adds and Updates, ValSem208 and ValSem209 off GCE -- while
+	// checkListResolvesTheCommitsVector holds only All to the commit's own ProposalOrRef vector.
+	// A list whose All was the faithful resolution of that vector and whose BUCKET was empty
+	// therefore satisfied every rule stated over the bucket by carrying nothing for it to read:
+	// a commit removing its own committer, which is RFC 9420 section 12.2's rule and this file's
+	// ValSem200, was accepted here. So was a commit carrying two GroupContextExtensions
+	// proposals, and one whose Add republishes the update path leaf's encryption key.
+	//
+	// The rule that holds the two fields together already existed one file over and had exactly
+	// one caller, ApplyProposals. This is the door asking it, rather than a second body: two
+	// bodies stating one rule is how the two come to disagree, and it answers
+	// ErrProposalListBucketsDisagree because that is the value the rule already answers.
+	if err := validateBucketsAgreeWithTheCommitOrder(self.proposalValidationInput()); err != nil {
+		return err
+	}
+	if err := self.checkListResolvesTheCommitsVector(); err != nil {
+		return err
+	}
+	return self.checkExtensionsAreTheSetThisCommitInstalls()
 }
 
 // checkListResolvesTheCommitsVector holds the two fields that are both this commit's proposals to
@@ -322,6 +352,62 @@ func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 		default:
 			return fmt.Errorf("%w: entry %d carries the discriminant %d, which names neither a proposal nor a reference",
 				errCommitProposalsNotResolved, i, uint8(vector[i].Type))
+		}
+	}
+	return nil
+}
+
+// checkExtensionsAreTheSetThisCommitInstalls is the third join: the extension set the caller
+// announces is the one this commit actually installs.
+//
+// EXTENSIONS AND THE LIST'S OWN GroupContextExtensions PROPOSAL ARE A THIRD PAIR OF FIELDS
+// CARRYING ONE THING, and the rules read them SEPARATELY. ValSem209 walks the members against
+// in.List.Extensions() -- the set the commit's own proposal installs -- while CheckErrata8745
+// holds the update path's leaf against effectiveExtensions(), which PREFERS in.Extensions
+// whenever a caller supplied one. A caller announcing a set the commit does not install would
+// therefore have the group's members judged against one extension vector and the committer's own
+// new leaf against another, inside one commit, with every rule answering yes. That is the shape
+// this door has now been repaired for three times -- List against Commit.Proposals, then the
+// buckets against All -- so the third instance is closed here rather than left for the first
+// caller that fills the field.
+//
+// A NIL Extensions IS NOT A DISAGREEMENT and is the ordinary case: effectiveExtensions then falls
+// through to the same two sources this compares against, so there is only one set to read and
+// nothing to join. What that costs is that the branch preferring Extensions now answers what the
+// fallback answers for every input that reaches it, which is ValidateProposalList's own stated
+// position on its own redundant door check: the field stays because a caller announcing the
+// applied state is a caller this package wants to be able to REFUSE, and nothing here claims a
+// test can tell which of the two produced the set.
+//
+// A COUNT, A NAMING AND THE BODIES, which is one comparison stronger than
+// checkListResolvesTheCommitsVector makes, and it is stronger because an extension IS its body:
+// section 13.4's clause is stated over the whole vector and required_capabilities lives entirely
+// in the body, so a comparison of types alone would let a swapped requirement through. The bodies
+// go through subtle.ConstantTimeCompare, which is this package's rule over every comparison of
+// data it ships and is derived rather than listed.
+func (self *CommitValidationInput) checkExtensionsAreTheSetThisCommitInstalls() error {
+	if self.Extensions == nil {
+		return nil
+	}
+	installed := self.Context.Extensions
+	if carried, ok := self.List.Extensions(); ok {
+		installed = carried
+	}
+	if len(self.Extensions) != len(installed) {
+		return fmt.Errorf("%w: the caller announces %d extension(s) and the commit installs %d",
+			errCommitExtensionsNotApplied, len(self.Extensions), len(installed))
+	}
+	for i := range installed {
+		if self.Extensions[i].ExtensionType != installed[i].ExtensionType {
+			return fmt.Errorf("%w: entry %d is announced as %#04x and installed as %#04x",
+				errCommitExtensionsNotApplied, i,
+				uint16(self.Extensions[i].ExtensionType), uint16(installed[i].ExtensionType))
+		}
+		if subtle.ConstantTimeCompare(self.Extensions[i].ExtensionData,
+			installed[i].ExtensionData) != 1 {
+			return fmt.Errorf("%w: the body of entry %d is announced as %x and installed as %x",
+				errCommitExtensionsNotApplied, i,
+				self.Extensions[i].ExtensionData, installed[i].ExtensionData)
 		}
 	}
 	return nil
