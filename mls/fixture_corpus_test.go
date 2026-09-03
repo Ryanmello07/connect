@@ -636,12 +636,28 @@ func validationFixtureBuildersInSource(t *testing.T, named string) []string {
 	return found
 }
 
+// validationDoorMethod is the method every validation input of this package carries, and it is what
+// makes such a type identifiable STRUCTURALLY rather than by how it was named.
+//
+// Both inputs declare `func (self *X) check() error`, and both headers say why it is a method
+// rather than a guard repeated in each rule -- "eleven copies of a guard is eleven chances for one
+// of them to be the copy that was not updated". So a type that carries one IS a door's input,
+// whatever it is called.
+const validationDoorMethod = "check"
+
 // validationInputTypesInSource is every validation input type this package's own source declares.
 //
 // DERIVED SO THAT A THIRD DOOR CANNOT ARRIVE WITHOUT A CORPUS, and so that the gate cannot be
 // pointed at one door and left there. This file used to measure CommitValidationInput and nothing
 // else while ProposalValidationInput -- the door that reads the group id, the ciphersuite, the
 // version and the clock -- had no corpus at all, and nothing anywhere said so.
+//
+// TWO MARKS, UNIONED, because one of them is a naming convention and a convention is an
+// enumeration with extra steps: a third input called AppliedStateInput would carry no corpus and
+// nothing would say so. The structural mark is the one that generalises -- a struct that declares
+// validationDoorMethod is an input some door refuses arguments at -- and the suffix stays beside it
+// so that an input whose door has not grown its guard yet is still measured. Either alone is
+// weaker than both; a type is in the class if it answers to either.
 func validationInputTypesInSource(t *testing.T) []string {
 	t.Helper()
 	entries, err := os.ReadDir(".")
@@ -649,7 +665,8 @@ func validationInputTypesInSource(t *testing.T) []string {
 		t.Fatalf("read this package's own directory: %v", err)
 	}
 	fileSet := token.NewFileSet()
-	found := []string{}
+	structs := map[string]bool{}
+	named, guarded := map[string]bool{}, map[string]bool{}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -660,19 +677,43 @@ func validationInputTypesInSource(t *testing.T) []string {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 		for _, declared := range file.Decls {
-			general, isGeneral := declared.(*ast.GenDecl)
-			if !isGeneral || general.Tok != token.TYPE {
+			if general, isGeneral := declared.(*ast.GenDecl); isGeneral && general.Tok == token.TYPE {
+				for _, spec := range general.Specs {
+					typed, isTyped := spec.(*ast.TypeSpec)
+					if !isTyped {
+						continue
+					}
+					if _, isStruct := typed.Type.(*ast.StructType); !isStruct {
+						continue
+					}
+					structs[typed.Name.Name] = true
+					if strings.HasSuffix(typed.Name.Name, "ValidationInput") {
+						named[typed.Name.Name] = true
+					}
+				}
 				continue
 			}
-			for _, spec := range general.Specs {
-				typed, isTyped := spec.(*ast.TypeSpec)
-				if !isTyped || !strings.HasSuffix(typed.Name.Name, "ValidationInput") {
-					continue
-				}
-				if _, isStruct := typed.Type.(*ast.StructType); isStruct {
-					found = append(found, typed.Name.Name)
-				}
+			function, isFunction := declared.(*ast.FuncDecl)
+			if !isFunction || function.Recv == nil || function.Name.Name != validationDoorMethod {
+				continue
 			}
+			if function.Type.Params != nil && len(function.Type.Params.List) != 0 {
+				continue
+			}
+			if function.Type.Results == nil || len(function.Type.Results.List) != 1 {
+				continue
+			}
+			result, isNamed := function.Type.Results.List[0].Type.(*ast.Ident)
+			if !isNamed || result.Name != "error" || len(function.Recv.List) != 1 {
+				continue
+			}
+			guarded[receiverTypeName(function.Recv.List[0].Type)] = true
+		}
+	}
+	found := []string{}
+	for name := range structs {
+		if named[name] || guarded[name] {
+			found = append(found, name)
 		}
 	}
 	slices.Sort(found)
@@ -735,6 +776,12 @@ const corpusRenderBudget = 24
 // rendering one literally would make the group's own arithmetic the dimension; its hash is the one
 // identity a ratchet tree has -- the value a GroupContext carries and a transcript covers -- and it
 // changes if anything in the tree does. Nothing else is special cased and nothing at all is skipped.
+//
+// AN UNEXPORTED FIELD GETS NO PATH OF ITS OWN AND IS NOT LOST. The walk descends through exported
+// fields, because those are what a path can be spelled from; the rendering beside it reads
+// unexported state too, so a constant behind one is caught at the nearest exported ancestor rather
+// than reported by its own name. That is why a ProposalCache, whose whole state is unexported, is a
+// dimension this can tell two of apart.
 func corpusDimensionsOf(crypto CryptoProvider, root any) map[string][]string {
 	return corpusDimensionsFrom(crypto, root, "", 0)
 }
