@@ -58,14 +58,50 @@ func TestEveryFieldOfACachedProposalIsJoinedToTheCommitsOwnVector(t *testing.T) 
 		t.Errorf("a CachedProposal carries %v and the join compares %v; a field with no comparison is one a peer moves with every rule of the commit door still answering yes, and a comparison with no field is a row that outlived what it described",
 			declared, joined)
 	}
-	// AND NO FIELD IS COMPARED THROUGH A CONVERSION THAT COULD LOSE IT. The Sender row reads a
-	// LeafIndex as eight octets, so it is exact for every width that type has been given or could
-	// be; a build that widened it past eight would be comparing the low half of the index and
-	// calling two leaves one, which is this door's own defect class -- a proxy for the thing --
-	// spelled as an integer conversion and compiling silently.
-	if size := reflect.TypeFor[LeafIndex]().Size(); size > 8 {
-		t.Errorf("a LeafIndex is %d octets and the join reads one as eight; the comparison is over the low eight of it, so two different leaves join as one",
-			size)
+	// AND NO FIELD IS COMPARED THROUGH A CONVERSION THAT COULD LOSE IT, asserted over the
+	// COMPARISON rather than over the type.
+	//
+	// WHAT STOOD HERE WAS A FACT ABOUT THE TYPE: `reflect.TypeFor[LeafIndex]().Size() > 8`. That
+	// is false in every build this package will ever have -- Go has no integer wider than eight
+	// octets -- so the clause could not fail, and it says nothing whatever about the function that
+	// does the comparing. Measured: with the octets rewritten to AppendUint32, and again to the
+	// low octet alone, the clause stayed silent and the whole suite stayed green.
+	//
+	// THE TWO PROPERTIES A COMPARATOR OVER AN INDEX OWES are stated instead, and both are derived.
+	// It must SEPARATE every value the type can hold, which is one probe per bit of the type's own
+	// width; and it must be wide enough for every width the type could be GIVEN, which is the
+	// widest integer Go has rather than the width it has today. The first fails on a truncation
+	// inside the current type -- the low octet alone collapses leaf 256 onto leaf 0 -- and the
+	// second fails on AppendUint32, which is exact today and is the low half of a LeafIndex the
+	// moment somebody widens the declaration. Both were applied and both fail here now.
+	sender, compared := cachedProposalJoin["Sender"]
+	if !compared {
+		t.Fatal("the join has no comparison for Sender, so the width claims below are about nothing")
+	}
+	octetsOf := func(at LeafIndex) []byte {
+		t.Helper()
+		got, err := sender.octets(&CachedProposal{Sender: at})
+		if err != nil {
+			t.Fatalf("the Sender row cannot read leaf %d: %v", at, err)
+		}
+		return got
+	}
+	index := reflect.TypeFor[LeafIndex]()
+	if kind := index.Kind(); kind < reflect.Uint || kind > reflect.Uint64 {
+		t.Fatalf("a LeafIndex is a %s and the two claims below are derived from its being an unsigned integer",
+			kind)
+	}
+	zero := octetsOf(LeafIndex(0))
+	for bit := 0; bit < int(index.Size())*8; bit += 1 {
+		at := LeafIndex(1) << bit
+		if slices.Equal(octetsOf(at), zero) {
+			t.Errorf("the join reads leaf %d and leaf 0 as the same octets; bit %d of a LeafIndex is not compared, so two leaves that differ only there join as one",
+				at, bit)
+		}
+	}
+	if widest := int(reflect.TypeFor[uint64]().Size()); len(zero) < widest {
+		t.Errorf("the join reads a LeafIndex as %d octets and the widest integer a LeafIndex could be declared as is %d; the comparison is over the low %d of it the moment the declaration moves, which is this door's own defect class spelled as an integer conversion",
+			len(zero), widest, len(zero))
 	}
 	// and the production walk really is over that set rather than over a slice built beside it
 	walked := []string{}
@@ -305,10 +341,19 @@ func TestAnInlineProposalAttributedToAnotherLeafIsRefused(t *testing.T) {
 		t.Fatalf("the fixture's committer is leaf %d, so attributing the update to it is not a disagreement", wrong)
 	}
 	// the committer's own update, carried inline, which is the only inline update a resolution
-	// could produce -- and then attributed to somebody else's leaf
-	update, leaf := testUpdateProposalOf(t, crypto, members[0], in.Committer)
+	// could produce -- and then attributed to somebody else's leaf.
+	//
+	// BEHIND AN INNOCENT ADD, which is this file's own header requirement and was violated here:
+	// the list carried one entry, so the join's walk over the vector and a read of its head
+	// answered alike and the whole rule could be narrowed to entry zero with this test green.
+	joiner, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	update, leaf := testUpdateProposalOf(t, crypto, members[in.Committer], in.Committer)
 	update.Sender = wrong
-	testCommitProposals(t, in, update)
+	testCommitProposals(t, in, testAddOf(joiner), update)
+	if at := len(in.List.All()) - 1; at < 1 {
+		t.Fatalf("the offending entry is at %d of %d; a probe at element zero is one a rule narrowed to the first entry refuses anyway",
+			at, len(in.List.All()))
+	}
 
 	applied, err := ApplyProposals(in.PreTree, in.Context, in.Committer, in.List)
 	if err != nil {
@@ -342,31 +387,172 @@ func TestAnInlineProposalAttributedToAnotherLeafIsRefused(t *testing.T) {
 // chosen outside the tree so that what accepting it costs is not a member being replaced but the
 // apply door indexing past the end of the tree -- a rule reading in.List deciding off a leaf index
 // no message ever carried.
+//
+// THE MOVE IS EXACTLY ONE OCTET UP AND NOTHING ELSE, which is the WIDTH of the comparison rather
+// than the fact of one. The leaf this test used to name was the tree's width plus one -- leaf 5
+// against a recorded leaf 1 -- so every octet of the two indices differed and a comparison one
+// octet wide separated them just as well as a comparison eight octets wide. Measured: with the
+// Sender row truncated to the low octet of a LeafIndex, the whole suite stayed green. Two leaves
+// that agree in their low octet and differ above it are the pair that tells the two apart, and
+// they are also the reason this corpus now carries a leaf index that does not fit in one octet.
 func TestACachedProposalMovedToALeafOfItsOwnIsRefused(t *testing.T) {
 	crypto := testCrypto(t)
 	in, _, _ := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
 	if failure := ValidateCommit(in); failure != nil {
 		t.Fatalf("ValidateCommit refused the commit this test is one edit away from: %v", failure)
 	}
-	outside := LeafIndex(in.PreTree.LeafWidth()) + 1
 	entry := testListEntryAt(t, in.List, "Removes", 0)
 	if entry.ByValue {
 		t.Fatal("the fixture's remove is carried by value, so this test is not driving the by-reference arm")
 	}
 	held := entry.Sender
-	if held == outside {
-		t.Fatalf("the cache recorded leaf %d as the sender, which is the leaf this test moves it to", outside)
+	// one octet up, which is the smallest move a comparison narrower than the index cannot see
+	const octet = LeafIndex(1) << 8
+	outside := held + octet
+	if outside%octet != held%octet {
+		t.Fatalf("leaf %d and leaf %d differ in their low octet, so this probe does not separate a comparison one octet wide from the whole index",
+			held, outside)
+	}
+	if outside < LeafIndex(in.PreTree.LeafWidth()) {
+		t.Fatalf("leaf %d is inside a tree %d leaves wide, so what accepting this costs is not the apply door indexing past its end",
+			outside, in.PreTree.LeafWidth())
 	}
 	entry.Sender = outside
 
 	failure := ValidateCommit(in)
 	if !errors.Is(failure, errCommitProposalsNotResolved) {
-		t.Fatalf("ValidateCommit over a list that attributes a cached proposal to leaf %d while the cache recorded leaf %d = %v, want errCommitProposalsNotResolved",
+		t.Fatalf("ValidateCommit over a list that attributes a cached proposal to leaf %d while the cache recorded leaf %d = %v, want errCommitProposalsNotResolved; the two agree in their low octet, so a Sender comparison narrower than a LeafIndex accepts this",
 			outside, held, failure)
 	}
 	if !strings.Contains(failure.Error(), "Sender") {
 		t.Errorf("the refusal is %v and does not say which field disagreed; only the sender does here",
 			failure)
+	}
+}
+
+// TestAListThatRecordsAnotherNameForTheProposalItHoldsIsRefused is the Ref row, which nothing
+// observed at all.
+//
+// MEASURED: emptying that row's comparator to `return nil, nil` left the whole suite green, and the
+// reason it is invisible rather than merely uncovered is subtle.ConstantTimeCompare(nil, nil) == 1
+// -- a comparator that reads nothing reports every pair as equal, so the row goes on being walked
+// and goes on answering yes.
+//
+// WHAT THE Ref FIELD IS is the name this member RESOLVED the entry under, and it is not the same
+// fact as what that name points at: the Proposal row holds the body, and this row holds the
+// provenance. The two are told apart here by giving the list a name the cache really holds -- for a
+// DIFFERENT remove -- while leaving the body, the sender and the arm exactly as the commit names
+// them, so the Ref row is the only one that can refuse.
+//
+// WHAT ACCEPTING IT COSTS is asserted rather than described, and it is (*ProposalList).Refs. That
+// method rebuilds a commit's ProposalOrRef vector out of the list's own Ref fields, and it is what
+// every committer in this package uses to publish one. A member that accepted this list and went on
+// to re-derive the vector from it would publish a commit naming a remove of another leaf than the
+// one it validated -- the transcript covering one proposal and the list applying another, which is
+// this door's whole subject.
+func TestAListThatRecordsAnotherNameForTheProposalItHoldsIsRefused(t *testing.T) {
+	crypto := testCrypto(t)
+	in, cache, held := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused the commit this test is one edit away from: %v", failure)
+	}
+	// a second remove this member also holds, so the name the list records is a real one
+	other := testCachedRemoveOf(t, crypto, cache, LeafIndex(3))
+	if slices.Equal(other.Ref, held.Ref) {
+		t.Fatal("the cache answered one reference for two different removes, so there is no second name to record here")
+	}
+	at := -1
+	for i := range in.Commit.Proposals {
+		if in.Commit.Proposals[i].Type == ProposalOrRefTypeReference {
+			at = i
+			break
+		}
+	}
+	if at < 1 {
+		t.Fatalf("the fixture's first by-reference entry is at %d; a probe placed at element zero is one a rule narrowed to the first entry refuses anyway",
+			at)
+	}
+	entry := testListEntryAt(t, in.List, "Removes", 0)
+	entry.Ref = other.Ref
+
+	// the body, the sender and the arm still agree, so the Ref row is the only one that can refuse
+	if entry.Proposal.Remove.Removed != held.Proposal.Remove.Removed ||
+		entry.Sender != held.Sender || entry.ByValue != held.ByValue {
+		t.Fatal("the edit moved something besides the reference, so a refusal here could come from another row")
+	}
+	// what accepting it costs, through the method a committer publishes a vector with
+	rebuilt := in.List.Refs()
+	if slices.Equal(rebuilt[at].Reference, in.Commit.Proposals[at].Reference) {
+		t.Fatal("the vector rebuilt from the list names what the commit names, so this edit costs nothing and is not the one this test is about")
+	}
+	republished, names := cache.Cached(in.Context, rebuilt[at].Reference)
+	if !names || republished.Proposal.Remove.Removed == held.Proposal.Remove.Removed {
+		t.Fatal("the name the list now records does not resolve to a different remove, so the cost this test asserts is not the one it describes")
+	}
+
+	failure := ValidateCommit(in)
+	if !errors.Is(failure, errCommitProposalsNotResolved) {
+		t.Fatalf("ValidateCommit over a list that records the name of a remove of leaf %d beside the body of a remove of leaf %d = %v, want errCommitProposalsNotResolved; Refs rebuilds the published vector out of that field, so a member accepting this republishes a commit naming a proposal it never judged",
+			republished.Proposal.Remove.Removed, held.Proposal.Remove.Removed, failure)
+	}
+	if !strings.Contains(failure.Error(), "Ref") {
+		t.Errorf("the refusal is %v and does not say which field disagreed; the body, the sender and the arm all agree here and only the name does",
+			failure)
+	}
+}
+
+// TestTheJoinRefusesTwoProposalsThatEncodeAlikeUnderDifferentTypes is the claim the header of
+// checkListResolvesTheCommitsVector used to make the other way round.
+//
+// THE SENTENCE WAS "the discriminant is the first field of a proposal's encoding, so a type
+// disagreement is an octet disagreement". It is false in this build and the pair below is the
+// measurement: proposal_wire.go selects the ARM by ProposalType and writes UnknownType as the wire
+// discriminant whenever one is set, so a remove of leaf 0x03bbccdd and an external_init carrying
+// bb cc dd under UnknownType remove encode to the same six octets.
+//
+// DRIVEN THROUGH THE JOIN AND NOT THROUGH THE DOOR, deliberately: the v1 profile refuses
+// external_init and the structural rule at the door refuses it before any join runs, so this pair
+// cannot be posted to ValidateCommit. That is the whole reason the row is worth writing -- the
+// safety of the old sentence rested on normalisation in another file plus a profile refusal in a
+// third, with nothing tying either to this comparison, and NewProposalList keeps an un-normalised
+// value verbatim on its decode-error path. The comparison now carries the type itself.
+func TestTheJoinRefusesTwoProposalsThatEncodeAlikeUnderDifferentTypes(t *testing.T) {
+	asRemove := CachedProposal{Proposal: Proposal{ProposalType: ProposalTypeRemove,
+		Remove: &Remove{Removed: LeafIndex(0x03bbccdd)}}}
+	asExternalInit := CachedProposal{Proposal: Proposal{ProposalType: ProposalTypeExternalInit,
+		UnknownType:  ProposalTypeRemove,
+		ExternalInit: &ExternalInit{KemOutput: []byte{0xbb, 0xcc, 0xdd}}}}
+
+	// the premise, measured here rather than asserted: the two encode alike
+	first, err := proposalOctets(&asRemove.Proposal)
+	if err != nil {
+		t.Fatalf("encode the remove: %v", err)
+	}
+	second, err := proposalOctets(&asExternalInit.Proposal)
+	if err != nil {
+		t.Fatalf("encode the external_init: %v", err)
+	}
+	if !slices.Equal(first, second) {
+		t.Skipf("a %s encodes to %x and a %s to %x, so this build no longer writes UnknownType as the wire discriminant and the pair this row exists for cannot be built",
+			proposalTypeName(asRemove.Proposal.ProposalType), first,
+			proposalTypeName(asExternalInit.Proposal.ProposalType), second)
+	}
+	if asRemove.Proposal.ProposalType == asExternalInit.Proposal.ProposalType {
+		t.Fatal("both halves carry one ProposalType, so there is no type disagreement here to refuse")
+	}
+
+	failure := joinCachedProposals(0, &asRemove, &asExternalInit)
+	if !errors.Is(failure, errCommitProposalsNotResolved) {
+		t.Fatalf("the join over a %s and an %s that encode to the same %x = %v, want errCommitProposalsNotResolved; the two are one proposal to a comparison of the octets alone",
+			proposalTypeName(asRemove.Proposal.ProposalType),
+			proposalTypeName(asExternalInit.Proposal.ProposalType), first, failure)
+	}
+	if !strings.Contains(failure.Error(), "Proposal") {
+		t.Errorf("the refusal is %v and does not name the field that disagreed", failure)
+	}
+	// and the accepting half, so the row is not "the join refuses everything"
+	if failure := joinCachedProposals(0, &asRemove, &asRemove); failure != nil {
+		t.Fatalf("the join refused a proposal against itself: %v", failure)
 	}
 }
 

@@ -353,11 +353,23 @@ func (self *CommitValidationInput) check() error {
 // is what a third read per entry breaks in one direction and a join reading one side twice breaks
 // in the other. Every mutation is in that test's comment with its measured numbers.
 //
-// THE TYPE IS NOT COMPARED SEPARATELY, and that is deliberate rather than an omission: the
-// discriminant is the first field of a proposal's encoding, so a type disagreement is an octet
-// disagreement, and a second comparison in front of the Proposal field's would be a line no input
-// can reach. The refusal still NAMES both types, because a reader handed two hex strings and no
-// noun has to decode them to find out what disagreed.
+// THE TYPE IS COMPARED, IN FRONT OF THE ENCODING, and the sentence that stood here said the
+// opposite: "the discriminant is the first field of a proposal's encoding, so a type disagreement
+// is an octet disagreement, and a second comparison would be a line no input can reach". THAT IS
+// FALSE IN THIS BUILD, and it was measured rather than argued. proposal_wire.go's MarshalMLS
+// selects the ARM by ProposalType and writes UnknownType as the WIRE discriminant whenever one is
+// set, so a remove of leaf 0x03bbccdd and an external_init carrying the three octets bb cc dd
+// under UnknownType remove both encode to 000303bbccdd -- two proposals of different types with
+// one encoding, which a comparison of the octets alone reports as equal.
+//
+// IT IS NOT REACHABLE THROUGH THE WIRE TODAY and that is exactly why the comparison is here rather
+// than left implied. UnmarshalMLS normalises the pair and NewProposalList clones through the
+// codec, so the safety rested on a normalisation in another file that no assertion tied to this
+// join -- and NewProposalList's `if err != nil { continue }` path keeps an un-normalised value
+// verbatim. A row of octets and the type they were written under is one comparison and closes
+// both. TestTheJoinRefusesTwoProposalsThatEncodeAlikeUnderDifferentTypes drives that exact pair.
+// The refusal still NAMES both types, because a reader handed two hex strings and no noun has to
+// decode them to find out what disagreed.
 func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 	vector := self.Commit.Proposals
 	order := self.List.All()
@@ -477,11 +489,20 @@ var cachedProposalJoin = map[string]cachedProposalFieldJoin{
 			return fmt.Sprintf("%x", entry.Ref)
 		},
 	},
-	// the proposal itself, by its wire encoding, which is the one identity a Proposal has in
-	// this package -- see proposalOctets. The type is the first field of that encoding, so this
-	// row subsumes the ProposalType comparison round three stopped at.
+	// the proposal itself, by its wire encoding UNDER ITS OWN TYPE. The encoding is the one
+	// identity a Proposal has in this package -- see proposalOctets -- and the type is written in
+	// front of it rather than read out of it, for the reason the header above gives and measures:
+	// the discriminant that reaches the wire is UnknownType when one is set, so two proposals of
+	// different types can encode alike.
 	"Proposal": {
-		octets: func(entry *CachedProposal) ([]byte, error) { return proposalOctets(&entry.Proposal) },
+		octets: func(entry *CachedProposal) ([]byte, error) {
+			encoded, err := proposalOctets(&entry.Proposal)
+			if err != nil {
+				return nil, err
+			}
+			return append(binary.BigEndian.AppendUint16(nil, uint16(entry.Proposal.ProposalType)),
+				encoded...), nil
+		},
 		names: func(entry *CachedProposal) string {
 			encoded, err := proposalOctets(&entry.Proposal)
 			if err != nil {
@@ -498,10 +519,13 @@ var cachedProposalJoin = map[string]cachedProposalFieldJoin{
 	// SIXTY-FOUR BITS FOR A THIRTY-TWO BIT INDEX, which is not waste and is this file's own
 	// defect class pointed at this line. AppendUint32 of a widened LeafIndex compares the low
 	// half of the thing and reports two different leaves as one -- a proxy for the index rather
-	// than the index -- and it compiles, so nothing but a reader would notice. Sixty-four covers
-	// every width a leaf index could be given, and
-	// TestEveryFieldOfACachedProposalIsJoinedToTheCommitsOwnVector refuses a build that went
-	// past it rather than leaving the truncation to be found later.
+	// than the index -- and it compiles, so nothing but a reader would notice. Sixty-four is the
+	// widest an integer LeafIndex could be GIVEN rather than the width it has, which is what makes
+	// it the right number: TestEveryFieldOfACachedProposalIsJoinedToTheCommitsOwnVector holds this
+	// function to emitting at least that many octets and to separating every bit a LeafIndex
+	// carries, so both AppendUint32 and a truncation to the low octet fail there. The gate used to
+	// be `reflect.TypeFor[LeafIndex]().Size() > 8`, which is a fact about the TYPE and stayed
+	// false while the comparison truncated.
 	"Sender": {
 		octets: func(entry *CachedProposal) ([]byte, error) {
 			return binary.BigEndian.AppendUint64(nil, uint64(entry.Sender)), nil
