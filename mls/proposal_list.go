@@ -1004,6 +1004,13 @@ func NewProposalCache(verified *VerifiedGroupContext) (*ProposalCache, error) {
 // CLOSING is exactly as verified as one of the epoch being entered, so which of the two a
 // boundary hands over stays a question about the call and not about the value.
 func (self *ProposalCache) Rebind(verified *VerifiedGroupContext) error {
+	// a cache that does not exist cannot be given an epoch, and this is the one method of this
+	// type that WRITES: bindingHolds answers false for a nil receiver and every reader is safe
+	// behind it, while this body would dereference one. NewProposalCache is what builds a cache.
+	if self == nil {
+		return fmt.Errorf("%w: there is no cache here to bind, and a cache is built by NewProposalCache rather than by being rebound",
+			errProposalCacheNotRebound)
+	}
 	if verified == nil || verified.inner == nil {
 		return fmt.Errorf("%w: a cache takes its epoch from a context this client has confirmed and from nothing else",
 			ErrNilGroupContext)
@@ -1077,6 +1084,13 @@ func proposalOctets(proposal *Proposal) ([]byte, error) {
 // right. CheckEpoch, Store, Cached, Pending and Resolve all ask it; what they share is the question
 // and not the answer, and each keeps its own refusal.
 //
+// A NIL CACHE ANSWERS FALSE, which is holds()'s doctrine one method over and is what lets every
+// caller of this be written without a receiver guard of its own. Three exported methods -- Cached,
+// Pending and CheckEpoch -- reach this and nothing else on a nil receiver, and
+// CommitValidationInput.Pending is legitimately nil, so a guard on the binding alone made those
+// three take the caller's process rather than refuse. A cache that does not exist belongs to no
+// epoch, which is the same answer an unbound one gives and the fail-closed one for all three.
+//
 // AN UNBOUND CACHE ANSWERS FALSE, and there is no emptiness clause in front of it. An empty cache
 // is not a cache that belongs to no epoch -- it belongs to the epoch it was bound to, and asking
 // it about another one is the case CheckEpoch exists for: an epoch that advanced with no proposal
@@ -1095,7 +1109,7 @@ func proposalOctets(proposal *Proposal) ([]byte, error) {
 // so an epoch number is not an identity. And never the group alone: that is the whole of the
 // replay this file exists to refuse.
 func (self *ProposalCache) bindingHolds(groupId []byte, epoch uint64) bool {
-	if self.binding == nil {
+	if self == nil || self.binding == nil {
 		return false
 	}
 	return subtle.ConstantTimeCompare(self.binding.groupId, groupId) == 1 && self.binding.epoch == epoch
@@ -1104,9 +1118,10 @@ func (self *ProposalCache) bindingHolds(groupId []byte, epoch uint64) bool {
 // bindingName names what this cache belongs to, for a refusal a reader can act on.
 //
 // A cache bound to nothing says so rather than reporting "epoch 0 of group ", which is a sentence
-// a reader would spend an afternoon looking for a group id in.
+// a reader would spend an afternoon looking for a group id in. A cache that does not exist says the
+// same thing: this is reached from CheckEpoch's own refusal, which a nil receiver gets to.
 func (self *ProposalCache) bindingName() string {
-	if self.binding == nil {
+	if self == nil || self.binding == nil {
 		return "no group"
 	}
 	return fmt.Sprintf("epoch %d of group %x", self.binding.epoch, self.binding.groupId)

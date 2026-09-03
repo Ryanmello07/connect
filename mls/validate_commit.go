@@ -55,8 +55,10 @@ package mls
 
 import (
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -96,6 +98,16 @@ var (
 	// the two fields disagreeing is a commit path bug in this process, while every other value
 	// of this file is a peer's commit being refused.
 	errCommitProposalsNotResolved = errors.New("mls: the proposal list handed to commit validation is not the resolution of the commit's own proposal vector")
+
+	// THIS BUILD'S OWN FAULT and not a peer's: a field of CachedProposal that the join has no
+	// comparison for. It is the shape errAcceptedTypeHasNoBucket and errAcceptedTypeHasNoCeiling
+	// take one type over -- a commit that widened something and stopped half way -- and it is
+	// ANSWERED rather than skipped for their reason. A field silently left out of the join is a
+	// fact about the commit that a peer can move with every rule of this door still answering
+	// yes, which is the class four rounds of repair were spent on. Its own value because the
+	// remedy is nothing like the join's: errCommitProposalsNotResolved says repair the caller
+	// that built these two fields, and this one says finish the commit that added the field.
+	errCachedProposalFieldNotJoined = errors.New("mls: a field of a cached proposal has no comparison in the join between a commit's proposal vector and the list resolved from it")
 
 	// the JOIN between the extension set the caller announces and the one this commit installs.
 	// Its own value and not errCommitProposalsNotResolved's for that value's own reason: the two
@@ -313,41 +325,39 @@ func (self *CommitValidationInput) check() error {
 // stated over the resolution and this is what makes the resolution the commit's own: same length,
 // same order, each entry naming what the entry beside it names.
 //
-// AN IDENTITY ON BOTH ARMS, and it used to be one on only one of them. A by-REFERENCE entry is
-// compared by its reference, which for a reference IS the identity: a ProposalRef is a hash over
-// the whole framed proposal, so two entries sharing one are the same proposal. A by-VALUE entry is
-// compared by its OCTETS, which is that same statement for a value: the encoding is what the
-// sender signed and what the transcript hash covers, so two entries encoding alike are one
-// proposal and two that do not are two. Both comparisons are subtle.ConstantTimeCompare rather
-// than bytes.Equal, which is this package's rule over every comparison of data it ships and is
-// derived rather than listed.
+// AN IDENTITY ON BOTH ARMS AND OVER EVERY FIELD OF ONE, which is what four rounds of this join
+// each stopped one field short of. Round one held the buckets to nothing; round two joined them by
+// a per-type COUNT, so a swap passed; round three joined by ProposalType, so another proposal of
+// the same type passed; round four compared the by-value entries by their OCTETS and left the
+// by-reference arm comparing a name and left Sender out of both arms. Each round repaired the
+// input it was handed. This one is stated over the TYPE instead: joinCachedProposals walks the
+// fields of a CachedProposal and refuses a field it has no comparison for, so the join covers
+// whatever the struct carries and a fifth round is a compile-time absence rather than a fifth
+// probe. See cachedProposalJoin for why the type's field set is the right class and not merely a
+// convenient one.
 //
-// THE BY-VALUE ARM USED TO COMPARE THE PROPOSAL TYPE, which is the KIND and not the THING. The
-// type is the whole of what section 12.4's pathRequiredTypes test reads, so comparing it makes the
-// PATH decision the same over either field -- and every other rule of this door is stated over the
-// LIST, so it made none of those the same. A commit whose signed vector removes leaf 3 while its
-// list removes leaf 2 was accepted here and applied by removing leaf 2: one member applying a
-// different commit from the one the transcript covers, which is verbatim the fault the per-type
-// buckets were removed for, one field further in. Every per-type count, every type and the vector's
-// own length agree across that edit; only the octets do not.
-// TestACommitWhoseVectorNamesAnotherProposalOfItsOwnTypeIsRefused is that input, driven through
-// ApplyProposals so that what the two fields disagree about is a leaf that does or does not leave
-// the group.
+// WHAT THE VECTOR NAMES IS BUILT RATHER THAN READ OFF THE LIST, and that is the other half. A
+// by-value entry carries its proposal, and Resolve attributes it to the COMMITTER; a by-reference
+// entry carries a hash, and what that hash names lives in this member's own cache, under the
+// sender the cache recorded. entryTheCommitNames produces that entry from the vector and the cache
+// alone, so what the list is compared against is a resolution of this commit rather than a
+// restatement of the list. The two faults that closed with it were both live and both verified by
+// the owner: a list carrying a remove of leaf 3 under the name of a cached remove of leaf 2 was
+// accepted and applied by removing leaf 3, and an inline Update whose list entry named leaf 2 was
+// accepted and written into leaf 2.
 //
-// THE COST WAS THE OBJECTION AND IT IS NOW MEASURED RATHER THAN ASSERTED. The stronger comparison
-// is an encode of every by-value proposal at every door a commit passes, and the number that
-// objection needed is in the suite:
-// TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt times this whole join
-// against the ValidateCommit that runs it, over the fixture carrying one proposal of every viewed
-// type -- an Add's KeyPackage among them, which is the largest thing this package encodes -- and
-// the join is about a fifth of a percent of the door. A commit is validated once per epoch and the
-// door it sits in verifies a signature per leaf.
+// THE COST WAS THE OBJECTION AND IT IS MEASURED RATHER THAN ASSERTED.
+// TestTheVectorJoinReadsEachEntryTwiceAndNoMore states the bound over the READS the join makes --
+// the thing that moves when this arm gets more expensive -- rather than over a door whose own cost
+// is thirteen copies of this one. The join reads each field of each entry twice, and the bracket
+// is what a third read per entry breaks in one direction and a join reading one side twice breaks
+// in the other. Every mutation is in that test's comment with its measured numbers.
 //
 // THE TYPE IS NOT COMPARED SEPARATELY, and that is deliberate rather than an omission: the
-// discriminant is the first field of the encoding, so a type disagreement is an octet
-// disagreement, and a second comparison in front of this one would be a line no input can reach.
-// The refusal still NAMES both types, because a reader handed two hex strings and no noun has to
-// decode them to find out what disagreed.
+// discriminant is the first field of a proposal's encoding, so a type disagreement is an octet
+// disagreement, and a second comparison in front of the Proposal field's would be a line no input
+// can reach. The refusal still NAMES both types, because a reader handed two hex strings and no
+// noun has to decode them to find out what disagreed.
 func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 	vector := self.Commit.Proposals
 	order := self.List.All()
@@ -356,45 +366,206 @@ func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 			errCommitProposalsNotResolved, len(vector), len(order))
 	}
 	for i := range vector {
-		cached := &order[i]
-		switch vector[i].Type {
-		case ProposalOrRefTypeReference:
-			if cached.ByValue {
-				return fmt.Errorf("%w: entry %d is named by reference and the list holds it by value",
-					errCommitProposalsNotResolved, i)
+		signed, err := self.entryTheCommitNames(i)
+		if err != nil {
+			return err
+		}
+		if err := joinCachedProposals(i, signed, &order[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// entryTheCommitNames is the CachedProposal a resolution of this commit would produce at that
+// position of its ProposalOrRef vector, built from the vector and this member's own cache.
+//
+// THIS IS WHERE THE BY-REFERENCE ARM GETS AN IDENTITY. A ProposalRef is a hash over the framed
+// proposal the SENDER published, so it is an identity for the CACHE'S entry and says nothing
+// whatever about what the list put beside it: comparing the list's Ref to the vector's Reference
+// established only that the two spelled the same name. What the name means is in the cache, so the
+// cache is what the list is joined to, and (*ProposalCache).Cached is the lookup that answers this
+// member's own epoch rather than any entry the map happens to hold.
+//
+// A REFERENCE THIS MEMBER DOES NOT HOLD ANSWERS errProposalNotCached, which is erratum 8815's
+// value and (*ProposalCache).Resolve's -- one rule, one value, three doors, on the terms
+// CheckErrata8815 already states for the first two. This door is the strongest of the three and
+// the erratum's own rule stays: task 18 asks it of a commit and a cache with no validation input
+// around them, and a nil cache is a validator with no record of what this member received.
+//
+// IT ANSWERS A VALUE AND NOT A POINTER INTO THE CACHE. Cached hands back the map's own entry by
+// value, so the arms below it are still the cache's; nothing here writes through them, and the
+// join it feeds only reads.
+func (self *CommitValidationInput) entryTheCommitNames(at int) (*CachedProposal, error) {
+	entry := self.Commit.Proposals[at]
+	switch entry.Type {
+	case ProposalOrRefTypeProposal:
+		if entry.Proposal == nil {
+			return nil, fmt.Errorf("%w: entry %d is carried by value and carries no proposal",
+				errCommitProposalsNotResolved, at)
+		}
+		// what Resolve builds from a by-value entry: the committer's own, under no name.
+		// Attributing it to the committer is the whole of what makes ValSem111 checkable, and
+		// it is the fact neither arm of this join used to carry -- ApplyProposals writes an
+		// Update into the leaf this field names.
+		return &CachedProposal{Proposal: *entry.Proposal, Sender: self.Committer, ByValue: true}, nil
+	case ProposalOrRefTypeReference:
+		cached, held := self.Pending.Cached(self.Context, entry.Reference)
+		if !held {
+			return nil, fmt.Errorf("%w: entry %d names %x and this member holds nothing under that reference in epoch %d of group %x, so nothing says what the list carries beside it (erratum 8815)",
+				errProposalNotCached, at, entry.Reference, self.Context.Epoch, self.Context.GroupId)
+		}
+		return &cached, nil
+	}
+	return nil, fmt.Errorf("%w: entry %d carries the discriminant %d, which names neither a proposal nor a reference",
+		errCommitProposalsNotResolved, at, uint8(entry.Type))
+}
+
+// cachedProposalFieldJoin is one field of a CachedProposal read as the octets two entries are
+// compared BY, beside a rendering of that field for the refusal.
+//
+// OCTETS FOR EVERY FIELD AND NOT A COMPARISON PER TYPE. Guardrail 8 is stated over every
+// comparison of data this package ships and the gate that enforces it derives its comparator class
+// from the package's imports rather than from a list of names, so a LeafIndex compared with == and
+// a ProposalRef compared with crypto/subtle would be two disciplines inside one loop -- and the
+// one that decays is the second. Four octet readers and one subtle.ConstantTimeCompare is one.
+type cachedProposalFieldJoin struct {
+	// octets is the field's value as the octets it is compared by. It answers an error for a
+	// value this build cannot encode, which is the Proposal field's case and no other's.
+	octets func(entry *CachedProposal) ([]byte, error)
+	// names the field's value for a reader, because a refusal carrying two hex strings and no
+	// noun is one somebody has to decode before they can act on it.
+	names func(entry *CachedProposal) string
+}
+
+// cachedProposalJoin is the comparison each field of a CachedProposal is joined by, keyed by that
+// field's own name.
+//
+// WHAT A JOIN OVER THIS TYPE OWES IS THE WHOLE TYPE, and that is a derivation rather than a
+// preference. A commit's ProposalOrRef vector and the list resolved from it are two
+// representations of one commit; the join between them is worth exactly the set of facts it
+// compares, and whatever it leaves out is a field a peer moves with every rule of the door still
+// answering yes.
+//
+// THE CONSUMERS' SET IS NOT COMPUTED SEPARATELY BECAUSE IT CANNOT EXCEED THIS ONE, which is the
+// argument for taking the class off the type. ApplyProposals reads Sender at its UpdateLeaf call
+// and the Proposal arms at its other three steps; the rules of section 12.2 read ByValue and Ref.
+// Every one of those is a field of this struct or lies under one, so the struct's own field set is
+// a SUPERSET of what any consumer can read and remains one however the consumers are edited. A
+// join derived off the READERS would have to be recomputed every time a reader moved -- and would
+// be wrong for exactly the window in which somebody had moved one; this one is recomputed only
+// when the type changes, and the walk does that itself.
+//
+// A FIELD WITH NO ROW HERE IS A REFUSAL AND NOT A SKIP. joinCachedProposals walks the type and
+// looks each field up here, so the commit that adds a fifth field to CachedProposal makes every
+// commit carrying a proposal fail closed until somebody writes down how the new field is compared.
+// That is the answer a join owes a fact it cannot check, and it is the opposite of what the four
+// rounds before this one did with the fields they did not cover.
+// TestEveryFieldOfACachedProposalIsJoinedToTheCommitsOwnVector holds this map to the type in both
+// directions and TestAFieldOfACachedProposalWithNoJoinRefusesTheCommit drives the refusal, by
+// taking one row out for the length of a single test.
+var cachedProposalJoin = map[string]cachedProposalFieldJoin{
+	// the name a by-reference entry was resolved under, and empty for one carried by value. The
+	// octets are the reference itself; what it NAMES is joined by the Proposal row below, which
+	// is the distinction this file spent a round discovering.
+	"Ref": {
+		octets: func(entry *CachedProposal) ([]byte, error) { return entry.Ref, nil },
+		names: func(entry *CachedProposal) string {
+			if len(entry.Ref) == 0 {
+				return "no reference"
 			}
-			if subtle.ConstantTimeCompare(cached.Ref, vector[i].Reference) != 1 {
-				return fmt.Errorf("%w: entry %d names %x and the list holds %x",
-					errCommitProposalsNotResolved, i, vector[i].Reference, cached.Ref)
-			}
-		case ProposalOrRefTypeProposal:
-			if !cached.ByValue {
-				return fmt.Errorf("%w: entry %d is carried by value and the list holds it by reference",
-					errCommitProposalsNotResolved, i)
-			}
-			if vector[i].Proposal == nil {
-				return fmt.Errorf("%w: entry %d is carried by value and carries no proposal",
-					errCommitProposalsNotResolved, i)
-			}
-			signed, err := proposalOctets(vector[i].Proposal)
+			return fmt.Sprintf("%x", entry.Ref)
+		},
+	},
+	// the proposal itself, by its wire encoding, which is the one identity a Proposal has in
+	// this package -- see proposalOctets. The type is the first field of that encoding, so this
+	// row subsumes the ProposalType comparison round three stopped at.
+	"Proposal": {
+		octets: func(entry *CachedProposal) ([]byte, error) { return proposalOctets(&entry.Proposal) },
+		names: func(entry *CachedProposal) string {
+			encoded, err := proposalOctets(&entry.Proposal)
 			if err != nil {
-				return fmt.Errorf("%w: entry %d is carried by value and this build cannot encode it: %w",
-					errCommitProposalsNotResolved, i, err)
+				return fmt.Sprintf("a %s this build cannot encode",
+					proposalTypeName(entry.Proposal.ProposalType))
 			}
-			resolved, err := proposalOctets(&cached.Proposal)
-			if err != nil {
-				return fmt.Errorf("%w: the list holds entry %d as a proposal this build cannot encode: %w",
-					errCommitProposalsNotResolved, i, err)
+			return fmt.Sprintf("a %s, %x", proposalTypeName(entry.Proposal.ProposalType), encoded)
+		},
+	},
+	// the leaf the proposal is attributed to, which ApplyProposals writes an Update INTO. Big
+	// endian rather than the platform's own order, because a length or an order that varies with
+	// the machine is a comparison that varies with it, and these nine platforms are a gate.
+	//
+	// SIXTY-FOUR BITS FOR A THIRTY-TWO BIT INDEX, which is not waste and is this file's own
+	// defect class pointed at this line. AppendUint32 of a widened LeafIndex compares the low
+	// half of the thing and reports two different leaves as one -- a proxy for the index rather
+	// than the index -- and it compiles, so nothing but a reader would notice. Sixty-four covers
+	// every width a leaf index could be given, and
+	// TestEveryFieldOfACachedProposalIsJoinedToTheCommitsOwnVector refuses a build that went
+	// past it rather than leaving the truncation to be found later.
+	"Sender": {
+		octets: func(entry *CachedProposal) ([]byte, error) {
+			return binary.BigEndian.AppendUint64(nil, uint64(entry.Sender)), nil
+		},
+		names: func(entry *CachedProposal) string { return fmt.Sprintf("leaf %d", entry.Sender) },
+	},
+	// which arm of the vector carried it, which decides who the proposal is attributed to and
+	// therefore decides Sender. One octet, so that this row is the same kind of comparison as
+	// the three above it rather than a bool compared with ==.
+	"ByValue": {
+		octets: func(entry *CachedProposal) ([]byte, error) {
+			if entry.ByValue {
+				return []byte{1}, nil
 			}
-			if subtle.ConstantTimeCompare(signed, resolved) != 1 {
-				return fmt.Errorf("%w: entry %d is a %s the commit signs as %x and the list holds a %s as %x",
-					errCommitProposalsNotResolved, i,
-					proposalTypeName(vector[i].Proposal.ProposalType), signed,
-					proposalTypeName(cached.Proposal.ProposalType), resolved)
+			return []byte{0}, nil
+		},
+		names: func(entry *CachedProposal) string {
+			if entry.ByValue {
+				return "carried by value"
 			}
-		default:
-			return fmt.Errorf("%w: entry %d carries the discriminant %d, which names neither a proposal nor a reference",
-				errCommitProposalsNotResolved, i, uint8(vector[i].Type))
+			return "named by reference"
+		},
+	},
+}
+
+// cachedProposalFields is the field set joinCachedProposals walks, read off the type once.
+//
+// A package level value and not a call per entry: reflect.VisibleFields allocates, this join runs
+// once per proposal per rule of the aggregate, and what it answers cannot change while the process
+// is up. What is DERIVED is the set, and it still is -- the commit that adds a field to
+// CachedProposal changes this value with nobody editing it, which is the whole point.
+//
+// VisibleFields and not NumField, so that a field promoted from an embedded struct is walked as
+// well: a fact moved one level down is the shape the unrepresentability gate next door was
+// repaired for, and a walk that read only the outer struct would answer "covered" for it.
+var cachedProposalFields = reflect.VisibleFields(reflect.TypeFor[CachedProposal]())
+
+// joinCachedProposals holds the entry a commit's own vector names at one position to the entry the
+// resolved list carries there, over every field of a CachedProposal.
+//
+// The order of the comparisons is the field order of the type, which is what makes the refusal a
+// reader gets deterministic. It is not a security property: an entry disagreeing about two fields
+// is refused either way, and every comparison here runs to completion whatever it finds.
+func joinCachedProposals(at int, signed *CachedProposal, held *CachedProposal) error {
+	for _, field := range cachedProposalFields {
+		compare, joined := cachedProposalJoin[field.Name]
+		if !joined {
+			return fmt.Errorf("%w: a CachedProposal carries %s and entry %d of this commit cannot be joined without it",
+				errCachedProposalFieldNotJoined, field.Name, at)
+		}
+		want, err := compare.octets(signed)
+		if err != nil {
+			return fmt.Errorf("%w: entry %d is named as something this build cannot read the %s of: %w",
+				errCommitProposalsNotResolved, at, field.Name, err)
+		}
+		got, err := compare.octets(held)
+		if err != nil {
+			return fmt.Errorf("%w: the list holds entry %d as something this build cannot read the %s of: %w",
+				errCommitProposalsNotResolved, at, field.Name, err)
+		}
+		if subtle.ConstantTimeCompare(want, got) != 1 {
+			return fmt.Errorf("%w: entry %d names a proposal whose %s is %s and the list holds one whose %s is %s",
+				errCommitProposalsNotResolved, at, field.Name, compare.names(signed),
+				field.Name, compare.names(held))
 		}
 	}
 	return nil

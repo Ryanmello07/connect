@@ -132,6 +132,24 @@ func proposalListStorageFields(t *testing.T) []reflect.StructField {
 // was rebuilt to remove. An EXPORTED field is one a caller outside this package writes, which is
 // how the four bypasses above were built in the first place.
 //
+// AND THE COUNT IS OVER EVERY FIELD RATHER THAN OVER THE ONES THAT REACH A CachedProposal, which
+// is this gate's own repair. proposalListStorageFields derives its ROUTES off reflect.Kind and
+// misses none of them, and then asks the enumerated question "does this field reach the TYPE
+// CachedProposal" -- while the paragraph above states the class as a second representation of one
+// fact WHATEVER IT IS CALLED. An index of POSITIONS is not called anything of the sort:
+// `addsAt []int`, filled in NewProposalList, kept in step in Resolve and answered by Adds, holds
+// no CachedProposal, reaches none, and passed every derivation gate in this file. It is the same
+// defect one indirection over -- a view that can fall behind the order it was built from -- and
+// nothing here saw it.
+//
+// So the class is taken as the COMPLEMENT of the one field that is allowed rather than as a shape
+// somebody thought of. Every fact a ProposalList can answer is a function of its commit order --
+// that is the whole doctrine of the type -- so a second field is either a cache of something
+// derivable, which can fall behind, or a fact about the commit the constructor was never given,
+// which nothing can fill. Neither is representable, and a field of any type at all fails here.
+// proposalListStorageFields stays because it says WHICH field the one field is, and because a
+// build whose single field stopped carrying proposals would otherwise pass a count of one.
+//
 // A cache would fail this, deliberately. Filtering at every read costs something and the honest
 // alternative is to index once at construction and answer the index; that index cannot diverge
 // from the order for a caller, but it can diverge for an in-package edit, and it re-opens the
@@ -139,6 +157,18 @@ func proposalListStorageFields(t *testing.T) []reflect.StructField {
 // TestDerivingTheViewsCostsLessThanTheRulesThatReadThem, which is why the measurement is in the
 // suite rather than in a commit message.
 func TestAProposalListKeepsItsProposalsInExactlyOnePlace(t *testing.T) {
+	// the complement first: a ProposalList has ONE field, whatever it holds. An index of
+	// positions, a count, a memoised length or a closure over the order are all second
+	// representations of the commit order and none of them reaches a CachedProposal.
+	structure := reflect.TypeOf(ProposalList{})
+	if structure.NumField() != 1 {
+		named := []string{}
+		for i := 0; i < structure.NumField(); i += 1 {
+			named = append(named, structure.Field(i).Name+" "+structure.Field(i).Type.String())
+		}
+		t.Fatalf("ProposalList carries %d fields, %v; every question a list answers is a function of its commit order, so a second field is either a cache of something derivable -- which can fall behind an in-package write, and an index of POSITIONS is exactly that -- or a fact about the commit nothing can fill",
+			structure.NumField(), named)
+	}
 	fields := proposalListStorageFields(t)
 	if len(fields) != 1 {
 		names := []string{}
@@ -441,11 +471,20 @@ type commitBypass struct {
 	// view is the per-type view the old bucket field would have carried the innocent entry in.
 	view string
 	// leads is the innocent proposal of that same type placed AHEAD of the offender, and false
-	// for a type section 12.2 admits only one of.
-	leads func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool)
+	// for a type section 12.2 admits only one of. It takes the input because an Update is
+	// carried by REFERENCE -- Resolve attributes an inline proposal to the committer, so an
+	// update of somebody else's leaf is a cached one -- and what a reference names lives in the
+	// input's own cache.
+	leads func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+		members []*testMember) (CachedProposal, bool)
 	// swaps replaces the entry that view answers at `at` with the offending one, in place, in the
-	// commit order.
-	swaps func(t *testing.T, in *CommitValidationInput, at int)
+	// commit order, and leaves the commit's own vector naming what the list now holds. For a
+	// by-value entry that is free -- (*ProposalList).Refs copies the Proposal struct and keeps
+	// its arm pointer, so an edit through the arm moves both fields at once -- and for a cached
+	// one it is testRestoreCachedEntries, because a reference names whatever the CACHE holds and
+	// an edit to the list alone is a list that no longer resolves this commit.
+	swaps func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+		members []*testMember, at int)
 	// refuses is what the aggregate must answer now that the view cannot be given anything else.
 	refuses error
 }
@@ -456,21 +495,29 @@ func commitBypassesTheCountRuleAdmitted() map[string]commitBypass {
 	return map[string]commitBypass{
 		"a remove of the committer behind an innocent remove": {
 			view: "Removes",
-			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+			leads: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember) (CachedProposal, bool) {
+
 				return testRemoveOf(LeafIndex(2)), true
 			},
-			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+			swaps: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember, at int) {
+
 				testListEntryAt(t, in.List, "Removes", at).Proposal.Remove.Removed = in.Committer
 			},
 			refuses: ErrRemoveCommitter,
 		},
 		"an add republishing the update path's leaf key behind an innocent add": {
 			view: "Adds",
-			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+			leads: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember) (CachedProposal, bool) {
+
 				kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "frank"))
 				return testAddOf(kp), true
 			},
-			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+			swaps: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember, at int) {
+
 				testListEntryAt(t, in.List, "Adds", at).Proposal.Add.KeyPackage.LeafNode.EncryptionKey =
 					in.Commit.Path.LeafNode.EncryptionKey
 			},
@@ -478,13 +525,26 @@ func commitBypassesTheCountRuleAdmitted() map[string]commitBypass {
 		},
 		"an update republishing the update path's leaf key behind an innocent update": {
 			view: "Updates",
-			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
-				update, _ := testUpdateProposalOf(t, crypto, members[2], LeafIndex(2))
-				return update, true
+			// CACHED, like the update it hides, because that is the only shape an update in a
+			// commit has: an inline one is attributed to the committer and would be the
+			// committer covering its own Update.
+			leads: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember) (CachedProposal, bool) {
+
+				return testCachedUpdateOf(t, crypto, in.Pending, members[2], LeafIndex(2)), true
 			},
-			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+			swaps: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember, at int) {
+
 				testListEntryAt(t, in.List, "Updates", at).Proposal.Update.LeafNode.EncryptionKey =
 					in.Commit.Path.LeafNode.EncryptionKey
+				// and the cache is put back in step with the list, because this entry is
+				// carried by reference: the join holds the list's entry to what the CACHE
+				// holds under that name, so an edit to the list alone would be refused for
+				// not resolving the commit rather than by the rule this row is about. That
+				// refusal is a different test's -- see
+				// TestACommitWhoseReferenceNamesOneProposalWhileItsListHoldsAnother.
+				testRestoreCachedEntries(t, crypto, in)
 			},
 			refuses: errDuplicateEncryptionKey,
 		},
@@ -499,10 +559,13 @@ func commitBypassesTheCountRuleAdmitted() map[string]commitBypass {
 			// answering some other type answers no extension set at all,
 			// (*ProposalList).Extensions falls back to the group's own, and this commit is
 			// accepted.
-			leads: func(t *testing.T, crypto CryptoProvider, members []*testMember) (CachedProposal, bool) {
+			leads: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember) (CachedProposal, bool) {
+
 				return CachedProposal{}, false
 			},
-			swaps: func(t *testing.T, in *CommitValidationInput, at int) {
+			swaps: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+				members []*testMember, at int) {
 				// 0xABCD, which is the code point the owner used against the counting door: a
 				// type this build's extension registry does not carry, so no member could
 				// evaluate it and the group would be agreeing to a state none of them can read
@@ -548,7 +611,7 @@ func TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			in, members := testCommitCarryingOneOfEveryBucketAndItsMembers(t, crypto)
 			at := 0
-			if lead, hides := row.leads(t, crypto, members); hides {
+			if lead, hides := row.leads(t, crypto, in, members); hides {
 				in = testCommitLedBy(t, in, lead)
 				at = 1
 			}
@@ -561,7 +624,7 @@ func TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt(t *testing.T) {
 			for _, bucket := range proposalBucketsOf(in.List) {
 				counts[bucket.accessor] = len(bucket.entries)
 			}
-			row.swaps(t, in, at)
+			row.swaps(t, crypto, in, members, at)
 			// the swap preserved every count the retired rule could see, which is what makes this
 			// the input that rule admitted rather than one it would have caught
 			if after := len(in.List.All()); after != before {
@@ -981,7 +1044,7 @@ func testCommitOrderOfWidth(t *testing.T, width int) []CachedProposal {
 // program is no more expensive than another needs the other program written down.
 //
 // THE TWO ARE TIMED IN ALTERNATING BLOCKS, for the reason
-// TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt gives at length: this
+// TestTheVectorJoinReadsEachEntryTwiceAndNoMore gives at length: this
 // machine's clock advances in steps of 505.7 microseconds, so each block has to run for
 // milliseconds, and its speed wanders over the seconds a long loop takes, so the two halves have to
 // take turns rather than run one after the other. Measured without the turns, the quadratic

@@ -7633,6 +7633,19 @@ var cryptoImportPaths = []string{
 	`"io"`,
 	`"math"`,
 	`"math/bits"`,
+	// validate_commit.go's join between a commit's ProposalOrRef vector and the list resolved
+	// from it, which is walked over the FIELDS of a CachedProposal rather than over a list of
+	// them. reflect.VisibleFields is what says what those fields are, so a field added to that
+	// struct with no comparison beside it refuses every commit carrying a proposal instead of
+	// being quietly left out of the join -- and four rounds of that door were each exactly one
+	// uncovered field, so the walk is the repair rather than a convenience. What is reached is
+	// VisibleFields and TypeFor over one package level type, evaluated once at initialisation:
+	// no value is inspected, nothing is constructed from a name, no method is called by name and
+	// nothing consults the environment, which is the property this list exists to keep true. It
+	// is standard library and pure go, so the nine platform cross build is unaffected.
+	// reflect.DeepEqual is now in the class the constant time gate derives over these imports,
+	// and this package calls it nowhere.
+	`"reflect"`,
 	`"slices"`,
 	`"strconv"`,
 	`"sync"`,

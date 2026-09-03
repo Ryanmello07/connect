@@ -41,17 +41,18 @@ const commitValidationFile = "validate_commit.go"
 // no row here fails rather than sitting outside every sweep below, and a row here for a name the
 // file no longer declares fails too.
 var commitValidationOwnedErrors = map[string]error{
-	"errNilCommitValidationInput":   errNilCommitValidationInput,
-	"errNilCommit":                  errNilCommit,
-	"errCommitProposalsNotResolved": errCommitProposalsNotResolved,
-	"errCommitExtensionsNotApplied": errCommitExtensionsNotApplied,
-	"errMissingPath":                errMissingPath,
-	"errPathLeafKeyUnchanged":       errPathLeafKeyUnchanged,
-	"errBadConfirmationTag":         errBadConfirmationTag,
-	"errCommitterNotMember":         errCommitterNotMember,
-	"errProfileExternalSender":      errProfileExternalSender,
-	"errProfileGroupExtension":      errProfileGroupExtension,
-	"errUnregisteredGroupExtension": errUnregisteredGroupExtension,
+	"errNilCommitValidationInput":     errNilCommitValidationInput,
+	"errNilCommit":                    errNilCommit,
+	"errCommitProposalsNotResolved":   errCommitProposalsNotResolved,
+	"errCachedProposalFieldNotJoined": errCachedProposalFieldNotJoined,
+	"errCommitExtensionsNotApplied":   errCommitExtensionsNotApplied,
+	"errMissingPath":                  errMissingPath,
+	"errPathLeafKeyUnchanged":         errPathLeafKeyUnchanged,
+	"errBadConfirmationTag":           errBadConfirmationTag,
+	"errCommitterNotMember":           errCommitterNotMember,
+	"errProfileExternalSender":        errProfileExternalSender,
+	"errProfileGroupExtension":        errProfileGroupExtension,
+	"errUnregisteredGroupExtension":   errUnregisteredGroupExtension,
 }
 
 // commitValidationBorrowedErrors is every sentinel a rule of validate_commit.go can answer that
@@ -1253,6 +1254,20 @@ func commitRuleCases() []commitRuleCase {
 			return ValidateCommit(testCommitInput(t, crypto, tree, list,
 				&Commit{Proposals: []ProposalOrRef{}}))
 		}},
+		// the join over a CachedProposal field nothing compares, which is this build's own
+		// fault rather than a peer's and is driven by taking a row out of the join for the
+		// length of this call. It is the branch that makes the walk over the type a REFUSAL
+		// instead of a silent skip, and it is unreachable in a build whose join covers the
+		// type -- which is what TestEveryFieldOfACachedProposalIsJoinedToTheCommitsOwnVector
+		// holds, and why the row has to be removed for the line to run at all.
+		{"CommitValidationInput.check", "errCachedProposalFieldNotJoined", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+			restore := testJoinWithoutTheFieldRow(t, "Sender")
+			defer restore()
+			return ValidateCommit(testCommitInput(t, crypto, tree,
+				testProposalList(t, testRemoveOf(2)), &Commit{}))
+		}},
 		// the extension join, with the disagreement in the MIDDLE of the installed vector
 		{"CommitValidationInput.check", "errCommitExtensionsNotApplied", func(t *testing.T) error {
 			crypto := testCrypto(t)
@@ -1975,19 +1990,100 @@ func TestEveryRuleTheCommitAggregateRunsHasARowAndEveryRowIsARuleItRuns(t *testi
 // the two fields that are one commit, and the two trees that are not one tree
 // ---------------------------------------------------------------------------
 
-// testCachedRemoveOf stores a remove of one leaf in a cache and answers the reference it is keyed
-// by beside the list entry that names it -- the two halves the join holds together.
+// testCachedProposalOf stores one proposal in a cache and answers THE CACHE'S OWN ENTRY for it.
+//
+// The entry is read back through (*ProposalCache).Cached rather than assembled here, and that is
+// the point of the helper rather than a detail. What a commit's by-reference entry resolves to is
+// whatever the cache holds under that name -- the sender it recorded, the proposal it cloned, and
+// ByValue false -- so a fixture that built the list entry by hand beside the store would be
+// asserting its own idea of the resolution, and the join between them would pass or fail on the
+// fixture's arithmetic rather than on the door's.
+func testCachedProposalOf(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
+	sender LeafIndex, proposal *Proposal) CachedProposal {
+
+	t.Helper()
+	ref, failure := cache.Store(crypto, testResolveContext(),
+		testProposalContent(t, crypto, sender, proposal))
+	if failure != nil {
+		t.Fatalf("Store a %s from leaf %d: %v", proposalTypeName(proposal.ProposalType), sender, failure)
+	}
+	held, cached := cache.Cached(testResolveContext(), ref)
+	if !cached {
+		t.Fatalf("the cache does not hold the %s it has just stored under %x",
+			proposalTypeName(proposal.ProposalType), ref)
+	}
+	return held
+}
+
+// testCachedRemoveOf stores a remove of one leaf in a cache and answers the list entry that names
+// it -- the two halves the join holds together.
 func testCachedRemoveOf(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
 	removed LeafIndex) CachedProposal {
 
 	t.Helper()
-	proposal := Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: removed}}
-	ref, failure := cache.Store(crypto, testResolveContext(),
-		testProposalContent(t, crypto, LeafIndex(1), &proposal))
-	if failure != nil {
-		t.Fatalf("Store a remove of leaf %d: %v", removed, failure)
+	return testCachedProposalOf(t, crypto, cache, LeafIndex(1),
+		&Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: removed}})
+}
+
+// testCachedUpdateOf stores one member's Update in a cache and answers the list entry that names
+// it: a leaf built for the update source, signed at that member's own leaf index, attributed to
+// that leaf by the cache because that is the sender the framed proposal carried.
+func testCachedUpdateOf(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
+	m *testMember, sender LeafIndex) CachedProposal {
+
+	t.Helper()
+	leaf, _ := testUpdateLeafNode(t, crypto, m, testValidationGroupId(), sender)
+	return testCachedProposalOf(t, crypto, cache, sender,
+		&Proposal{ProposalType: ProposalTypeUpdate, Update: &Update{LeafNode: *leaf}})
+}
+
+// testRestoreCachedEntries puts the cache and the commit's own vector back in step with a list a
+// test has just edited, by emptying the cache and storing every by-reference entry of the list
+// back into it.
+//
+// EMPTIED AND REFILLED RATHER THAN ADDED TO, and the reason is a ceiling rather than tidiness: one
+// sender may hold ONE committable Update, so storing an edited update beside the one it replaces
+// is a second update from that leaf and the cache refuses it -- correctly, because those two
+// entries are a pair no valid commit list can carry. A swap is a replacement and this is what a
+// replacement looks like from the cache's side.
+//
+// THE REFERENCES OF THE ENTRIES A TEST DID NOT TOUCH DO NOT MOVE, which is what makes this usable
+// in the middle of a fixture. A ProposalRef is a hash over the framed proposal and every field of
+// testProposalContent is deterministic, so re-storing an unchanged entry re-derives the same name
+// and the rest of the commit still resolves.
+func testRestoreCachedEntries(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
+	t.Helper()
+	if failure := in.Pending.Rebind(testVerifiedContextAt(t, in.Context)); failure != nil {
+		t.Fatalf("Rebind the fixture's cache to epoch %d of group %x: %v",
+			in.Context.Epoch, in.Context.GroupId, failure)
 	}
-	return CachedProposal{Ref: ref, Sender: LeafIndex(1), Proposal: proposal}
+	order := in.List.All()
+	for i := range order {
+		if order[i].ByValue {
+			continue
+		}
+		order[i] = testCachedProposalOf(t, crypto, in.Pending, order[i].Sender, &order[i].Proposal)
+	}
+	in.Commit.Proposals = in.List.Refs()
+}
+
+// testJoinWithoutTheFieldRow takes one field's comparison out of the join for the length of a test
+// and answers the restore, so the refusal a field with no comparison produces can be driven.
+//
+// A PACKAGE LEVEL MAP EDITED IN A TEST, which is the shape
+// TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped already takes next door and is
+// here for its reason: the branch is unreachable in a build whose join covers the type, and a
+// branch that is only reasoned about is one the next edit deletes. The restore is answered rather
+// than deferred here so that the caller's own defer runs it whatever the test does.
+func testJoinWithoutTheFieldRow(t *testing.T, field string) func() {
+	t.Helper()
+	held, joined := cachedProposalJoin[field]
+	if !joined {
+		t.Fatalf("the join has no comparison for %s, so there is nothing here to take out; this helper is naming a field a CachedProposal no longer carries",
+			field)
+	}
+	delete(cachedProposalJoin, field)
+	return func() { cachedProposalJoin[field] = held }
 }
 
 // TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector is the join, over the input
@@ -2264,110 +2360,185 @@ func TestACommitWhoseVectorNamesAnotherProposalOfItsOwnTypeIsRefused(t *testing.
 	}
 }
 
-// TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt is the number the cost
-// objection needed, and it is here because that objection was made without one.
+// testCommitWideEnoughToPrice is the fixture the cost claims below are measured over: the commit
+// carrying one proposal of every viewed type, with enough adds behind it that the PER ENTRY work
+// is most of what is being timed.
 //
-// THE OBJECTION, in the words it was declined in: comparing a by-value entry by its octets rather
-// than by its type "costs an encode of every proposal at every door on the path a commit runs".
-// It is true, it is a statement about a quantity, and the quantity turns out to be larger than
-// either side of that exchange assumed. The fixture is the one every establishment row of this file
-// starts from -- one proposal of every viewed type, carried by value, an Add's whole KeyPackage
-// among them, which is the largest thing this package encodes.
+// THE WIDTH IS WHAT MAKES THE RATIO A STATEMENT ABOUT THE JOIN'S OWN ARITHMETIC. Over four entries
+// the join's fixed costs -- one length comparison, one slice header, the loop itself -- are a
+// large enough share that an arm doing half as much work again moves the total by tens of percent
+// rather than by half, which is how the bound this test replaces came to be eight times a measured
+// two. At twelve entries the fixed part is small and the ratio is the number of encodes per entry,
+// which is the quantity the claim is actually about.
 //
-// THE NUMBERS, on this machine. The join costs about 18 microseconds: eight encodes, two per
-// by-value entry. ValidateCommit costs about 240, which is THIRTEEN TIMES THE JOIN, because every
-// rule of commitValidationChecks re-establishes its own preconditions through
-// (*CommitValidationInput).check and the join lives in check -- twelve rules plus the aggregate's
-// own call. With the arm comparing proposal types instead, the same door ran in under three
-// microseconds. So this is not a rounding error on a structural door: it is most of one.
+// The adds are led rather than appended for testCommitLedBy's reason, and they carry distinct key
+// packages so that ValSem206 has nothing to say about them.
+func testCommitWideEnoughToPrice(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+	t.Helper()
+	extra := []CachedProposal{}
+	for i := 0; i < 8; i += 1 {
+		kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "wide"+strconv.Itoa(i)))
+		extra = append(extra, testAddOf(kp))
+	}
+	return testCommitLedBy(t, testCommitCarryingOneOfEveryBucket(t, crypto), extra...)
+}
+
+// testJoinReadingEachEntryOnce is the vector join with ONE read of each field per entry instead of
+// two: the same walk, over the same entries, through the same comparisons, encoding what the
+// commit names and comparing it with itself.
 //
-// IT IS STILL THE RIGHT ANSWER, and the alternative is not cheaper, it is wrong: a door comparing
-// the KIND accepts a commit whose signed vector removes leaf 3 while its list removes leaf 2, and
-// the member applies the second. A fifth of a millisecond, once per epoch, against applying a
-// commit the transcript does not cover. And the thirteen is where to look first if it ever stops
-// being affordable -- twelve of those thirteen joins re-answer a question already answered, which
-// is a redundancy this arm made expensive rather than one it introduced. Comparing the kind again
-// is not on the list of answers.
+// A WITNESS THAT IS A COPY OF THE IMPLEMENTATION, which is
+// TestAPerTypeViewIsLinearInTheCommitOrder's shape one file over and is here for its reason. The
+// claim being measured is "the join reads each entry twice and no more", and a claim that one
+// program costs what another costs needs the other program written down. What it is NOT standing
+// in for is the join's ANSWER -- every test above holds that.
 //
-// WHAT IS ASSERTED, AND WHY IT IS NOT THE SHARE. The join's share of ValidateCommit is about 8%,
-// and that number cannot fail: the door IS thirteen copies of the join, so a join that got three
-// times more expensive would take the door with it and the share would not move. It is logged
-// because it is the objection's own question, and the two things that CAN fail are asserted
-// instead --
+// IT IS DELIBERATELY THE SAME LOOP AND NOT A BARE ENCODE LOOP, and that is the whole reason it
+// exists. A yardstick that only called proposalOctets in a row shared no allocation pattern, no
+// map lookup and no cache read with the join, so the two blocks met different machines: measured,
+// the ratio of the join to a bare encode loop moved between 1.76 and 2.95 over eight runs, which
+// is most of what a whole extra encode per entry is worth. Two copies of one loop differing by one
+// read per field track each other instead.
+func testJoinReadingEachEntryOnce(in *CommitValidationInput) error {
+	vector := in.Commit.Proposals
+	order := in.List.All()
+	if len(vector) != len(order) {
+		return errCommitProposalsNotResolved
+	}
+	for i := range vector {
+		signed, err := in.entryTheCommitNames(i)
+		if err != nil {
+			return err
+		}
+		for _, field := range cachedProposalFields {
+			compare := cachedProposalJoin[field.Name]
+			want, err := compare.octets(signed)
+			if err != nil {
+				return err
+			}
+			if subtle.ConstantTimeCompare(want, want) != 1 {
+				return errCommitProposalsNotResolved
+			}
+		}
+	}
+	return nil
+}
+
+// TestTheVectorJoinReadsEachEntryTwiceAndNoMore is the cost claim, stated over the one thing that
+// moves when the join gets more expensive.
 //
-//   - THE DOOR IS THE JOIN, ONCE PER RULE. Held against the rule slice itself rather than against
-//     the number thirteen, so hoisting the join out of check would make this red and send the next
-//     reader to this comment rather than leaving it stale.
-//   - THE JOIN IS WITHIN A FEW TIMES OF APPLYING THE LIST IT IDENTIFIES. ApplyProposals walks the
-//     same proposals over the same tree with no crypto in it either, so it is the yardstick on this
-//     machine that is not made of the thing being measured. Measured at 2x; the bound is 8.
+// WHAT THIS REPLACES, AND WHY IT WAS NOT A COST CHECK. The test here before it bounded the join
+// against ApplyProposals at eight times a measured 2.18, and said in its own comment that the
+// bound "would catch a third encode per entry, or an arm that encoded inside a loop". Both were
+// applied and both PASSED the whole suite: a third encode took the ratio to 3.86 and an encode
+// inside the entry loop took it to 4.6, against a ceiling of 8. At four proposals that bound
+// needed a tenfold regression to fire. Its companion assertion -- the door is thirteen copies of
+// the join -- could not move with the join's cost at all, measuring 10.7, 13.4 and 13.6 across
+// baseline, 1.5x and 3x, because the door IS thirteen joins and grows with them. So one assertion
+// was a structure check listed as a cost check and the other was a ceiling nothing could reach.
 //
-// THE MEASUREMENTS ARE TAKEN IN ALTERNATING BLOCKS, and the block is the unit for a reason this
-// file paid to learn twice. Go's clock on this machine advances in steps of 505.7 microseconds --
-// probed, not assumed -- so the span of one ValidateCommit, or of ten joins, is quantised to
-// nothing or to half a millisecond, and a per-round interleave measures the timer rather than the
-// code. Run the other way, as long loops one after another, each span is fine and the RATIOS are
-// not: they moved by a factor of five across five runs, because the machine's own speed wanders
-// over the seconds those loops take and each loop met a different machine. So each block is sized
-// to run for milliseconds -- comfortably above the step, and the SHORTEST block is checked rather
-// than the total -- and the three take turns a dozen times.
-func TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt(t *testing.T) {
+// WHAT IS ASSERTED NOW. The join reads each field of each entry TWICE: once off the entry the
+// commit names and once off the entry the list holds. For the Proposal field that read is an
+// encode and the encodes are nearly all of the cost. The yardstick is therefore the same walk
+// reading each field ONCE, so the two differ by exactly the thing being bounded and by nothing
+// else, and what is asserted is a bracket around two rather than a ceiling in the distance. Every
+// number below is the per-round median this test computes, over four to six runs of it on this
+// machine, and every mutation was applied to the join and measured rather than reasoned about:
+//
+//	the join as it stands                          1.79 to 1.92
+//	a third encode of every entry                  2.60 to 3.38   over the ceiling
+//	an encode inside the field loop                4.85 to 5.89   over the ceiling
+//	the join reading only the entry it names       0.91 to 1.17   under the floor
+//
+// THE FLOOR IS NOT DECORATION AND IT IS NOT THE ONE A READER WOULD GUESS. An arm that compared
+// something CHEAPER than the thing -- a count, a type, a name, which is every regression this door
+// has actually had -- would not be caught here, because the witness reads the same comparators the
+// join does and would get cheaper with it; those are caught by
+// TestACommitWhoseReferenceNamesOneProposalWhileItsListHoldsAnother and the probes beside it,
+// which is where a claim about what a join COMPARES belongs. What the floor catches is the join
+// reading one of its two entries twice instead of reading both once, which is a cost regression
+// and an identity regression at the same time and is measured above.
+//
+// THE THIRTEEN COPIES ASSERTION STAYS AND IS LABELLED FOR WHAT IT IS: a claim about the SHAPE of
+// the door -- that the join runs once per rule because every rule re-establishes its preconditions
+// through check -- and not a claim about anybody's cost. The door is made of the thing being
+// measured, so this ratio cannot move when the join gets dearer; hoisting the join out of check is
+// what it catches, and it catches nothing else. It is stated here rather than deleted because that
+// hoist is a real edit somebody would make on reading the number above it.
+//
+// THE TWO ARE MEASURED IN PAIRS AND THE RATIOS ARE TAKEN PER PAIR, which is what makes this a
+// gate rather than a coin toss, and it was arrived at by measuring the alternative. Go's clock on
+// this machine advances in steps of 505.7 microseconds -- probed, not assumed -- so a block has to
+// run for milliseconds to be a measurement at all; and this machine's speed wanders over the
+// seconds a run takes, so a ratio of two totals, or of two minima, is a ratio of two different
+// machines. Measured that way the SAME BUILD came back at 1.79, 2.01 and 3.95 across runs, which
+// is a ceiling nothing under four could hold. Timing the join block and the witness block back to
+// back and dividing THEM makes the wander common to both, and what is asserted is the MEDIAN of a
+// dozen such pairs -- a slow round moves numerator and denominator together and a single stalled
+// round cannot move a median at all.
+func TestTheVectorJoinReadsEachEntryTwiceAndNoMore(t *testing.T) {
 	crypto := testCrypto(t)
-	in := testCommitCarryingOneOfEveryBucket(t, crypto)
+	in := testCommitWideEnoughToPrice(t, crypto)
 	if failure := ValidateCommit(in); failure != nil {
 		t.Fatalf("the fixture commit is refused with %v, so the timing below would be a timing of the rules that ran before the refusal",
 			failure)
 	}
-	byValue := 0
-	for _, cached := range in.List.All() {
+	order := in.List.All()
+	byValue, byReference := 0, 0
+	for _, cached := range order {
 		if cached.ByValue {
 			byValue += 1
+		} else {
+			byReference += 1
 		}
 	}
-	if byValue == 0 {
-		t.Fatal("the fixture's commit carries no proposal by value, so the join below encodes nothing and this measures the arm that was never in question")
+	if byValue == 0 || byReference == 0 {
+		t.Fatalf("the fixture carries %d entries by value and %d by reference; the two arms of the join reach their proposals differently and a fixture missing one of them prices half the join",
+			byValue, byReference)
+	}
+	if failure := testJoinReadingEachEntryOnce(in); failure != nil {
+		t.Fatalf("the witness refuses the fixture with %v, so it is not walking the same entries the join walks",
+			failure)
 	}
 	// the aggregate's own call to check, plus one per rule that re-establishes its preconditions
 	// through it. Read off the rule slice, so a thirteenth rule is a thirteenth join and this
 	// arithmetic follows it.
 	runs := len(commitValidationChecks) + 1
 
-	// each block is sized to run for milliseconds at the cost its own work was measured at, and the
-	// floor is checked against the SHORTEST block rather than the total, because a total above the
-	// clock's step says nothing about the spans it was added up from.
-	const blocks = 12
-	const doorsPerBlock = 200
-	const appliesPerBlock = 2000
-	const joinsPerBlock = 2000
+	// each block is sized to run for milliseconds at the cost its own work was measured at, so
+	// that a pair of them is a pair of measurements rather than a pair of clock steps.
+	const rounds = 16
+	const doorsPerBlock = 40
+	const joinsPerBlock = 800
+	const witnessPerBlock = 1600
 	const floor = 4 * time.Millisecond
 
-	took := map[string]time.Duration{}
 	shortest := map[string]time.Duration{}
-	timed := func(name string, work func()) {
+	timed := func(name string, work func()) time.Duration {
+		// the collection BEFORE the clock starts rather than inside the span. These three
+		// blocks allocate at different rates, and a collection earned by one of them landing
+		// inside the next is what took the per-round ratios from a factor of two to a factor
+		// of twenty -- measured, and the reason a median was not enough on its own.
+		runtime.GC()
 		started := time.Now()
 		work()
 		spent := time.Since(started)
-		took[name] += spent
 		if held, seen := shortest[name]; !seen || spent < held {
 			shortest[name] = spent
 		}
+		return spent
 	}
-	for block := 0; block < blocks; block += 1 {
-		timed("door", func() {
+	door := func() time.Duration {
+		return timed("door", func() {
 			for again := 0; again < doorsPerBlock; again += 1 {
 				if failure := ValidateCommit(in); failure != nil {
 					t.Fatalf("the fixture stopped being accepted mid-measurement: %v", failure)
 				}
 			}
 		})
-		timed("apply", func() {
-			for again := 0; again < appliesPerBlock; again += 1 {
-				if _, failure := ApplyProposals(in.PreTree, in.Context, in.Committer, in.List); failure != nil {
-					t.Fatalf("the apply door stopped accepting the fixture mid-measurement: %v", failure)
-				}
-			}
-		})
-		timed("join", func() {
+	}
+	join := func() time.Duration {
+		return timed("join", func() {
 			for again := 0; again < joinsPerBlock; again += 1 {
 				if failure := in.checkListResolvesTheCommitsVector(); failure != nil {
 					t.Fatalf("the join stopped accepting the fixture mid-measurement: %v", failure)
@@ -2375,39 +2546,67 @@ func TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt(t
 			}
 		})
 	}
+	witness := func() time.Duration {
+		return timed("witness", func() {
+			for again := 0; again < witnessPerBlock; again += 1 {
+				if failure := testJoinReadingEachEntryOnce(in); failure != nil {
+					t.Fatalf("the witness stopped accepting the fixture mid-measurement: %v", failure)
+				}
+			}
+		})
+	}
+	// A WARM ROUND, DISCARDED. Measured: the first block of a fresh process ran a fifth to a
+	// third slower than every later one, and a single go test run takes exactly that block.
+	door()
+	join()
+	witness()
 
+	readRatios := []float64{}
+	copyRatios := []float64{}
+	for round := 0; round < rounds; round += 1 {
+		// the pair first and back to back, so that whatever this machine is doing during the
+		// round is doing it to both halves
+		joined := join()
+		witnessed := witness()
+		readRatios = append(readRatios, (float64(joined)/joinsPerBlock)/(float64(witnessed)/witnessPerBlock))
+		copyRatios = append(copyRatios, (float64(door())/doorsPerBlock)/(float64(joined)/joinsPerBlock))
+	}
 	for _, name := range slices.Sorted(maps.Keys(shortest)) {
 		if shortest[name] < floor {
 			t.Fatalf("the shortest %s block ran for %v, which is inside what this machine's clock can resolve; the ratios below would be measurements of the timer",
 				name, shortest[name])
 		}
 	}
-	doorEach := took["door"] / (blocks * doorsPerBlock)
-	applyEach := took["apply"] / (blocks * appliesPerBlock)
-	joinEach := took["join"] / (blocks * joinsPerBlock)
-	share := float64(joinEach) / float64(doorEach)
-	copies := float64(doorEach) / float64(joinEach)
-	overApply := float64(joinEach) / float64(applyEach)
-	t.Logf("the vector join over %d proposals, %d of them by value: %v per run, %.2fx the %v ApplyProposals costs over the same list; ValidateCommit is %v, %.1f copies of the join against the %d its rules ask for, and the join is %.2f%% of it",
-		len(in.List.All()), byValue, joinEach, overApply, applyEach, doorEach, copies, runs, share*100)
+	slices.Sort(readRatios)
+	slices.Sort(copyRatios)
+	reads := readRatios[len(readRatios)/2]
+	copies := copyRatios[len(copyRatios)/2]
+	t.Logf("the vector join over %d proposals, %d by value and %d by reference: %v per run, and per round it costs the walk that reads each entry once %.2f times over (%.2f to %.2f); ValidateCommit is %.1f copies of it against the %d its rules ask for",
+		len(order), byValue, byReference, shortest["join"]/joinsPerBlock, reads,
+		readRatios[0], readRatios[len(readRatios)-1], copies, runs)
 
-	// THE DOOR IS THE JOIN, ONCE PER RULE, within a factor of two either way -- loose because what
-	// is being asserted is the SHAPE, that the door's cost is thirteen joins and not one, and
-	// because the two halves are different sizes of work on a machine whose ratios move by tens of
-	// percent between runs.
 	if copies < float64(runs)/2 || copies > float64(runs)*2 {
-		t.Errorf("ValidateCommit costs %.1f copies of the join and its rules ask for %d; the comment above explains this door's cost by that multiplication and no longer describes it",
+		t.Errorf("ValidateCommit costs %.1f copies of the join and its rules ask for %d; the join is no longer running once per rule, so a rule is deciding off a pair of fields this door has not held together",
 			copies, runs)
 	}
-	// AND THE JOIN IS WITHIN EIGHT TIMES OF APPLYING THE LIST, against a measured two. That is
-	// the bound that would catch the encode itself getting more expensive -- a third encode per
-	// entry, or an arm that encoded inside a loop -- because ApplyProposals is the one structural
-	// door on this machine whose cost is not made of the thing being measured.
-	if overApply > 8 {
-		t.Errorf("the vector join costs %.2fx what applying the same list costs, and it was measured at about 2x when the by-value arm was made an identity; the encode at every door is no longer a few times the work of the door beside it",
-			overApply)
+	if reads > joinReadCeiling {
+		t.Errorf("the vector join costs %.2f times the walk that reads each entry once, and reading each entry twice is what it is; something in it now reads more than the entry the commit names and the entry the list holds",
+			reads)
+	}
+	if reads < joinReadFloor {
+		t.Errorf("the vector join costs %.2f times the walk that reads each entry once, and reading each entry twice is what it is; under the floor is a join reading ONE of the two entries it exists to hold together, which is this door's own history rather than a hypothetical",
+			reads)
 	}
 }
+
+// The bracket TestTheVectorJoinReadsEachEntryTwiceAndNoMore holds the join in, against the same
+// walk reading each entry once. The measured value and the mutations either side of it are in that
+// test's own comment; the margins are wide enough for a machine whose block timings move by tens of
+// percent and narrow enough that one more read per entry is outside them.
+const (
+	joinReadFloor   = 1.45
+	joinReadCeiling = 2.25
+)
 
 // TestTheExtensionSetTheCommitInstallsIsWhatItsPathLeafOwesSupportFor is the half of
 // effectiveExtensions that nothing observed, and it is the security relevant half.
@@ -2851,7 +3050,6 @@ func proposalListDoorAnswer(t *testing.T, what string, door proposalListDoor,
 	}()
 	return door.run(t, crypto, tree, list)
 }
-
 
 // TestEveryDoorHandedAProposalListRefusesOneCarryingTwoGroupContextExtensions is the same class as
 // the missing arm above, over the source every reader of the installed extension set decides off.
@@ -3330,23 +3528,37 @@ func testCommitInstalledExtensions() []Extension {
 // generation buys is that the two halves cannot drift: a fifth view with no builder fails loudly
 // here, and a builder for a type no view answers fails too.
 func testCommitProposalBuilders() map[ProposalType]func(t *testing.T, crypto CryptoProvider,
-	members []*testMember) CachedProposal {
+	in *CommitValidationInput, members []*testMember) CachedProposal {
 
-	return map[ProposalType]func(*testing.T, CryptoProvider, []*testMember) CachedProposal{
-		ProposalTypeAdd: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+	return map[ProposalType]func(*testing.T, CryptoProvider, *CommitValidationInput, []*testMember) CachedProposal{
+		ProposalTypeAdd: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+			members []*testMember) CachedProposal {
+
 			kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
 			return testAddOf(kp)
 		},
-		ProposalTypeUpdate: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
-			update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-			return update
+		ProposalTypeUpdate: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+			members []*testMember) CachedProposal {
+
+			// BY REFERENCE, AND THAT IS THE ONE SHAPE AN UPDATE IN A COMMIT HAS. Resolve
+			// attributes a by-VALUE entry to the COMMITTER, so an inline Update is an update
+			// of the committer's own leaf -- which section 12.4 replaces through the
+			// UpdatePath and ValSem111 refuses a commit for covering. This fixture used to
+			// carry an inline update from leaf 1 under a committer at leaf 0, which is a
+			// state no resolution can produce, and the door accepted it because neither arm
+			// of its join looked at Sender.
+			return testCachedUpdateOf(t, crypto, in.Pending, members[1], LeafIndex(1))
 		},
-		ProposalTypeRemove: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+		ProposalTypeRemove: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput,
+			members []*testMember) CachedProposal {
+
 			// leaf 3 and not the committer's leaf 0, which is section 12.2's own rule and is
 			// what the List.order row below breaks on purpose
 			return testRemoveOf(LeafIndex(3))
 		},
-		ProposalTypeGroupContextExtensions: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+		ProposalTypeGroupContextExtensions: func(t *testing.T, crypto CryptoProvider,
+			in *CommitValidationInput, members []*testMember) CachedProposal {
+
 			return testGceOf(testCommitInstalledExtensions()...)
 		},
 	}
@@ -3383,6 +3595,12 @@ func testCommitCarryingOneOfEveryBucketAndItsMembers(t *testing.T,
 
 	t.Helper()
 	in, members := testFullCommitInput(t, crypto)
+	// the cache is part of the fixture now, because one of the four entries is carried by
+	// reference and what a reference NAMES lives here. A commit whose vector names a proposal
+	// this member never received is refused by the join and by erratum 8815 both, so a fixture
+	// that left this nil would be establishing nothing about the four rules stated over the
+	// views -- it would be refused before any of them ran.
+	in.Pending = testCacheAt(t, in.Context)
 	builders := testCommitProposalBuilders()
 	entries := []CachedProposal{}
 	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
@@ -3391,7 +3609,7 @@ func testCommitCarryingOneOfEveryBucketAndItsMembers(t *testing.T,
 			t.Fatalf("a ProposalList answers a %s view and this fixture builds no %s proposal; every row written against that view would then be driven over a commit that carries nothing for it to answer",
 				bucket.accessor, proposalTypeName(bucket.carries))
 		}
-		entries = append(entries, build(t, crypto, members))
+		entries = append(entries, build(t, crypto, in, members))
 	}
 	// the other direction: a builder for a type no view answers is a fixture entry no rule stated
 	// over a view would read
@@ -3573,6 +3791,19 @@ func commitDoorEstablishments() map[string]commitSourceEstablishment {
 		"Committer": {
 			establishes: "the commit is attributed to a leaf of this group, which every comparison against the " +
 				"committer's current leaf and every filtered direct path stands on",
+			// A COMMIT CARRYING NO PROPOSALS, because this source is now established TWICE
+			// OVER and the two halves refuse in different places. The join attributes every
+			// by-value entry to the committer, so over the fixture that carries one proposal
+			// of every type a committer moved to leaf 97 is refused for not resolving the
+			// commit before any rule reaches the tree -- true, and about the other half of
+			// the same field. What this row is about is the half every filtered direct path
+			// and every comparison against the committer's current leaf stands on: that the
+			// number names a leaf of this group at all. The join's half is
+			// TestAnInlineProposalAttributedToAnotherLeafIsRefused.
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				return in
+			},
 			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
 				in.Committer = LeafIndex(97)
 			},
