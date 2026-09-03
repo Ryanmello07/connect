@@ -1679,6 +1679,12 @@ var labelledPanicAnchorFrames = []string{
 // cost of it is a row; the alternative is a walk that decides for itself which flows are
 // real, which is the class of judgement that let the premise this file replaces survive.
 var labelledFieldFrontier = []string{
+	// p7 task 11's group exporter, which forwards its caller's context straight into the
+	// schedule's. The LABEL does not reach this frontier because it is a string and this walk
+	// is over the bytes of this package; the context does, and it arrives here open for the
+	// same reason the schedule's own row is open one line down -- a group cannot bound what a
+	// caller exports over without deciding for the caller what an exporter context may be.
+	"*Group.Export context (open, so a caller must bound what it sends)",
 	// the exported method that took a caller's label straight into a KDFLabel and panicked
 	// on it, while its own signature already carried ErrExportLength for a caller's number
 	"*KeySchedule.Export context (open, so a caller must bound what it sends)",

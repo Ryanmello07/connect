@@ -635,6 +635,18 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		"ValidateUpdatePathLeafNode(path)": {sentinel: errNilUpdatePath, call: func(t *testing.T) error {
 			return ValidateUpdatePathLeafNode(crypto, commitDoorGroupContext(), LeafIndex(1), nil)
 		}},
+		// p7 task 11's group creation. The config is the only argument carrying a group at all
+		// -- the suite, the group id, the extensions, the provider and the store are all in it --
+		// so a nil one is a caller that reached the constructor holding nothing, and every other
+		// argument of this row is live so that what it observes is the config rather than a
+		// refusal standing in front of it. Its own value and not ErrNilCryptoProvider: a caller
+		// that passed no config has not passed a config with no provider, and the two are
+		// repaired in different places.
+		"NewGroup(cfg)": {sentinel: errNilGroupConfig, call: func(t *testing.T) error {
+			owner := testIdentity(t, crypto, "owner")
+			_, err := NewGroup(nil, owner.SigPriv, BasicCredential(owner.IdentityPub))
+			return err
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

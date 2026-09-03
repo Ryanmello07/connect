@@ -3386,6 +3386,59 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			return [][]byte{leaf.EncryptionKey, leaf.SignatureKey, leaf.Credential.Identity,
 				leaf.Extensions[0].ExtensionData}
 		}},
+		// p7 task 11's group creation, which is handed a caller's array in four places at once:
+		// the signature private key, the credential's identity, the group id, and the device's
+		// X-Wing public key. Every one of them is KEPT -- in the founding leaf, in the group
+		// context, in the leaf_keys extension the leaf carries -- so a construction that viewed
+		// any of them is a group whose leaf changes the next time its caller writes into the
+		// buffer it was cut from, with every signature still verifying at the moment it was made
+		// and nothing in between to point at.
+		//
+		// What it ANSWERS is deliberately the four values that are a function of its arguments
+		// alone. A group draws two secrets and stamps a leaf Lifetime off the wall clock, so the
+		// tree hash, the epoch authenticator and everything downstream of them differ between two
+		// calls for reasons that are not the arguments, and the determinism half of this gate
+		// would report a defect that is not there. Those values MOVING is the assertion
+		// TestNewGroupDrawsEachFoundingSecretFreshAndFromItsOwnDraw makes, which is where the
+		// entropy is held.
+		{name: "NewGroup", call: func(take func([]byte) []byte) [][]byte {
+			identity := []byte("the creator of this group")
+			policy := &GroupPolicyExtension{Roles: []RoleEntry{{MemberId: identity, Role: RoleOwner}}}
+			if canonicalErr := policy.Canonicalize(); canonicalErr != nil {
+				t.Fatalf("Canonicalize the policy this row's group carries: %v", canonicalErr)
+			}
+			policyExt, policyErr := policy.Encode()
+			if policyErr != nil {
+				t.Fatalf("Encode the policy this row's group carries: %v", policyErr)
+			}
+			group, groupErr := NewGroup(&GroupConfig{
+				Suite:      CipherSuiteX25519ChaCha20Sha256Ed25519,
+				GroupId:    take([]byte("group-1")),
+				Extensions: []Extension{policyExt},
+				Crypto:     crypto,
+				Store:      newTestStore(),
+				LeafKeys: LeafKeysExtension{
+					AlgId:          AlgIdXwing,
+					DeviceXwingPub: take(bytes.Repeat([]byte{0x62}, XwingPublicKeyLen)),
+				},
+			}, SignaturePrivateKey(take(bytes.Repeat([]byte{0x54}, 32))),
+				Credential{CredentialType: CredentialTypeBasic, Identity: take(identity)})
+			if groupErr != nil {
+				t.Fatalf("NewGroup: %v", groupErr)
+			}
+			defer group.Close()
+			leaf := group.OwnLeafNodeCopy()
+			if leaf == nil {
+				t.Fatal("the group this row built holds no leaf at its own index")
+			}
+			members := group.Members()
+			if len(members) != 1 || members[0].LeafKeys == nil {
+				t.Fatalf("the group this row built answers %d members; the leaf_keys body is one of the four arrays it is read for",
+					len(members))
+			}
+			return [][]byte{group.GroupId(), leaf.Credential.Identity, leaf.SignatureKey,
+				members[0].LeafKeys.DeviceXwingPub}
+		}},
 		// the path secret ladder of RFC 9420 section 7.4. Its first rung is the caller's own
 		// array -- in task 22 it is the plaintext an HpkeOpen just produced -- and the answer
 		// becomes the private state of an epoch, so a ladder that VIEWED that buffer is a group

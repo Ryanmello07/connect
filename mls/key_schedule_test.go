@@ -2751,14 +2751,8 @@ func identifiersNamedIn(expr ast.Expr) []string {
 // handed the epoch secret just as surely as one taking the schedule itself.
 func theTypesHoldingTheEpochSecret(structs map[string]*ast.StructType) []string {
 	holding := map[string]bool{}
-	for name, structure := range structs {
-		for _, field := range structure.Fields.List {
-			for _, declared := range field.Names {
-				if declared.Name == epochSecretStorageField {
-					holding[name] = true
-				}
-			}
-		}
+	for _, name := range theTypesDeclaringTheEpochSecret(structs) {
+		holding[name] = true
 	}
 	for {
 		grew := false
@@ -2779,6 +2773,38 @@ func theTypesHoldingTheEpochSecret(structs map[string]*ast.StructType) []string 
 			return slices.Sorted(maps.Keys(holding))
 		}
 	}
+}
+
+// theTypesDeclaringTheEpochSecret is the SEED of the closure above: the structs that DECLARE the
+// storage, without the ones that merely reach it through a field of their own.
+//
+// The two readings answer different questions and both are wanted. "What can hand the epoch secret
+// out" is transitive -- a *Group holds a *KeySchedule, so a method on a Group could answer the
+// schedule's secret -- and guardrail 6's two surface gates are right to close over that. "Whose
+// erase must clear it", "whose methods derive from the nine", and "whose tag verifiers compare
+// through MacVerify" are all questions about the type that OWNS the storage: a type that reaches it
+// through a pointer has no secrets field to sweep, no Zeroize of its own to read, and its own
+// refusals are held where its own state is. Reading the transitive set in those three does not
+// widen them, it points them at the wrong type -- the closure answers a SORTED list, so the day
+// p7's Group landed the first member became Group and all three would have been asking about a
+// struct holding none of the storage they are written over.
+//
+// It is derived, and it still fails on a second DECLARER: a struct that declares the storage joins
+// this reading by declaring it, exactly as it joined the closure, and the three gates over it
+// refuse to run with more than one member. What it stops demanding is that a type which merely
+// POINTS at a schedule answer for that schedule's erase, which was never a claim any of them made.
+func theTypesDeclaringTheEpochSecret(structs map[string]*ast.StructType) []string {
+	declaring := map[string]bool{}
+	for name, structure := range structs {
+		for _, field := range structure.Fields.List {
+			for _, declared := range field.Names {
+				if declared.Name == epochSecretStorageField {
+					declaring[name] = true
+				}
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(declaring))
 }
 
 // theExportedSurfaceReaching is every exported package level function of the parsed files
@@ -2907,11 +2933,218 @@ const epochSecretHolderControl = "package control\n" +
 	"\treturn nil\n" +
 	"}\n"
 
+// groupMethodsTakingArguments excuses an exported method of *Group from the sweep below.
+//
+// It is EMPTY and the intention is that it stays that way. Every method this type declares that
+// takes arguments can be driven with arguments a caller would choose, and an excuse here is
+// precisely a refusal to try them -- which is the shape keyScheduleMethodArgumentRows' own doc
+// argues against, one type over.
+var groupMethodsTakingArguments = map[string]string{}
+
+// groupMethodArgumentRows drives an exported method of *Group that takes arguments through the
+// sweep that reads what a group hands out.
+//
+// Export carries the same three rows the schedule's does and for the same reason: one of them asks
+// for KDF.Nh octets, so the answer is the same SIZE as the secret guardrail 6 is looking for and
+// the comparison can mean something, and another asks for a length that is not KDF.Nh so the pair
+// differs in the length alone. EpochSecret is driven over the whole of its closed enum, because an
+// accessor that already answers secrets is the likeliest place for a leak to be written; the arm
+// that REFUSES a name outside the enum is not driven here, since a row that errors is a row this
+// sweep refuses to read, and TestEpochSecretAccessorIsClosed is what holds that arm.
+var groupMethodArgumentRows = map[string]func(group *Group) [][]reflect.Value{
+	"Export": func(group *Group) [][]reflect.Value {
+		nh := group.crypto.HashSize()
+		return [][]reflect.Value{
+			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf([]byte(nil)), reflect.ValueOf(nh)},
+			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh)},
+			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
+		}
+	},
+	"EpochSecret": func(group *Group) [][]reflect.Value {
+		return [][]reflect.Value{
+			{reflect.ValueOf(EpochSecretSenderData)},
+			{reflect.ValueOf(EpochSecretEncryption)},
+		}
+	},
+	"MemberAt": func(group *Group) [][]reflect.Value {
+		return [][]reflect.Value{
+			{reflect.ValueOf(group.OwnLeafIndex())},
+			{reflect.ValueOf(LeafIndex(1))},
+		}
+	},
+}
+
+// answersOnlyErrors is the signature half of the eraser filter below: a method with no result at
+// all, or whose every result is an error, hands out no bytes for a sweep to read.
+func answersOnlyErrors(signature reflect.Type) bool {
+	errorInterface := reflect.TypeOf((*error)(nil)).Elem()
+	for i := range signature.NumOut() {
+		if signature.Out(i) != errorInterface {
+			return false
+		}
+	}
+	return true
+}
+
+// bytesTheGroupHandsOut is every byte slice reachable through *Group's own exported surface.
+//
+// It is bytesTheScheduleHandsOut one type over, and it exists because p7 task 11 made Group the
+// second type of this package that can reach an epoch secret: it holds the schedule, so every
+// exported method it declares is a place the schedule's storage could be answered from, and
+// reflection over the compiled method set is what makes a method added tomorrow join by existing.
+//
+// THE ERASER IS SKIPPED for the reason the schedule's Zeroize is, and the shape is one result
+// wider. Close answers an error and nothing else -- there is no byte in that signature for a
+// secret to hide in -- and it sorts FIRST of this type's exported methods, so a sweep that called
+// it would read a zeroized epoch through every method after it and report exactly the clean run a
+// complete sweep reports. The criterion is the signature and not the name, so a second eraser
+// joins the skip by having the shape rather than by being listed.
+func bytesTheGroupHandsOut(t *testing.T, at string, group *Group) []exposedSlice {
+	t.Helper()
+	groupType := reflect.TypeOf(group)
+	valueType := groupType.Elem()
+	for i := range valueType.NumField() {
+		if valueType.Field(i).IsExported() {
+			t.Fatalf("%s: Group has exported field %s, so its storage is reachable without going through a method this sweep reads",
+				at, valueType.Field(i).Name)
+		}
+	}
+	exposed := []exposedSlice{}
+	skipped := []string{}
+	for i := range groupType.NumMethod() {
+		method := groupType.Method(i)
+		if method.Type.NumIn() == 1 && answersOnlyErrors(method.Type) {
+			skipped = append(skipped, method.Name)
+			continue
+		}
+		rows := [][]reflect.Value{nil}
+		if method.Type.NumIn() != 1 {
+			build, driven := groupMethodArgumentRows[method.Name]
+			if !driven {
+				reason, excused := groupMethodsTakingArguments[method.Name]
+				if !excused {
+					t.Fatalf("%s: (*Group).%s takes arguments and this sweep calls with none; give it rows in groupMethodArgumentRows or write down in groupMethodsTakingArguments why it cannot surface epoch_secret",
+						at, method.Name)
+				}
+				t.Logf("%s: (*Group).%s not swept: %s", at, method.Name, reason)
+				continue
+			}
+			rows = build(group)
+			if len(rows) == 0 {
+				t.Fatalf("%s: groupMethodArgumentRows drives (*Group).%s with no rows at all, so it is swept in name only",
+					at, method.Name)
+			}
+			for _, row := range rows {
+				if len(row)+1 != method.Type.NumIn() {
+					t.Fatalf("%s: groupMethodArgumentRows drives (*Group).%s with %d arguments and it takes %d",
+						at, method.Name, len(row), method.Type.NumIn()-1)
+				}
+				for argument, value := range row {
+					if want := method.Type.In(argument + 1); !value.Type().AssignableTo(want) {
+						t.Fatalf("%s: groupMethodArgumentRows hands (*Group).%s a %s in argument %d, which takes %s",
+							at, method.Name, value.Type(), argument, want)
+					}
+				}
+			}
+		} else if _, driven := groupMethodArgumentRows[method.Name]; driven {
+			t.Errorf("groupMethodArgumentRows drives %s, which takes no arguments", method.Name)
+		}
+		for _, row := range rows {
+			for index, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(group)}, row...)) {
+				for _, one := range exposedByteSlices(t, "(*Group)."+method.Name, result) {
+					one.method = method.Name
+					one.result = index
+					one.taken = bytes.Clone(one.bytes)
+					exposed = append(exposed, one)
+				}
+			}
+		}
+	}
+	for name := range groupMethodArgumentRows {
+		if _, found := groupType.MethodByName(name); !found {
+			t.Errorf("groupMethodArgumentRows drives %s, which *Group does not declare", name)
+		}
+	}
+	for name := range groupMethodsTakingArguments {
+		if _, found := groupType.MethodByName(name); !found {
+			t.Errorf("groupMethodsTakingArguments excuses %s, which *Group does not declare", name)
+		}
+		if _, driven := groupMethodArgumentRows[name]; driven {
+			t.Errorf("%s is both excused from this sweep and driven through it, so which one holds depends on the order these two maps are read",
+				name)
+		}
+	}
+	// the skip is a positive control on itself: this type declares an eraser, so a filter that
+	// had stopped matching one would sweep it and read zeros everywhere after it
+	if len(skipped) == 0 {
+		t.Fatalf("%s: no exported method of *Group was read as an eraser, and Close is one; the signature filter is matching nothing and this sweep is reading a closed group",
+			at)
+	}
+	for _, one := range exposed {
+		if !bytes.Equal(one.bytes, one.taken) {
+			t.Fatalf("%s: %s changed after this sweep read it, so what it collected is not what those methods answered and every comparison over it runs against the rewrite",
+				at, one.path)
+		}
+	}
+	return exposed
+}
+
+// fixedRandomProvider answers one chosen value for every draw of that value's width.
+type fixedRandomProvider struct {
+	CryptoProvider
+	value []byte
+}
+
+func (self *fixedRandomProvider) Random(n int) []byte {
+	if n == len(self.value) {
+		return bytes.Clone(self.value)
+	}
+	return self.CryptoProvider.Random(n)
+}
+
+// newGroupOverTheEpochSecret founds a group whose epoch secret IS the one this corpus epoch
+// publishes, which is the whole of what makes the NewGroup row below a live comparison.
+//
+// Without it that row could not fail. A group draws its epoch secret at random, so whatever its
+// exported surface answered could never equal a value the corpus names, and the row would report
+// the clean run a Group that handed its epoch secret out would also report. Fixing the draw is the
+// only way to put a KNOWN secret inside a construction that chooses its own.
+//
+// The v1 suite whatever the corpus epoch runs, because the profile refuses to create a group under
+// 0x0001 -- and both registered suites have KDF.Nh 32, so the value handed over is the right width
+// for the schedule NewGroup builds and the comparison is over the same octets either way.
+func newGroupOverTheEpochSecret(t *testing.T, epoch ksVectorEpoch) (*Group, error) {
+	t.Helper()
+	base, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider for the group this row founds: %v", err)
+	}
+	owner := testIdentity(t, base, "owner")
+	crypto := &fixedRandomProvider{CryptoProvider: base, value: epochSecretOfTheEpoch(t, epoch)}
+	return NewGroup(testGroupConfig(t, crypto, owner, "group"+epoch.at),
+		owner.SigPriv, BasicCredential(owner.IdentityPub))
+}
+
 // epochSecretHolderSweeps is how this gate reads a value of a type that keeps the epoch
 // secret. It is keyed by type name and checked against the derived closure in both
 // directions, so a second holder landing in this package fails here until somebody teaches
 // the sweep to read one rather than falling outside it in silence.
 var epochSecretHolderSweeps = map[string]func(t *testing.T, at string, value reflect.Value) [][]byte{
+	// p7 task 11's group, which reaches the epoch secret by holding the schedule that declares
+	// it. Every byte it hands out goes through its own exported surface, read by reflection for
+	// the reason the schedule's is: a leak added to this type tomorrow is a method, and a list of
+	// accessors is exactly what would not have it.
+	"Group": func(t *testing.T, at string, value reflect.Value) [][]byte {
+		t.Helper()
+		if value.IsNil() {
+			return nil
+		}
+		group, isGroup := value.Interface().(*Group)
+		if !isGroup {
+			t.Fatalf("%s: the sweep was handed a %s where a *Group belongs", at, value.Type())
+		}
+		return exposedBytes(bytesTheGroupHandsOut(t, at, group))
+	},
 	"KeySchedule": func(t *testing.T, at string, value reflect.Value) [][]byte {
 		t.Helper()
 		if value.IsNil() {
@@ -2987,6 +3220,14 @@ var epochSecretSurfaceRows = map[string]func(t *testing.T, epoch ksVectorEpoch) 
 			epoch.crypto, epochSecretOfTheEpoch(t, epoch), epoch.groupContext)
 		return []reflect.Value{reflect.ValueOf(schedule), reflect.ValueOf(&err).Elem()}
 	},
+	// p7 task 11's group creation, the first construction of this package to answer a holder that
+	// is not a schedule. It is founded over this epoch's own epoch secret rather than over a fresh
+	// draw, so the comparison the gate runs on what the group hands out is a live one -- see
+	// newGroupOverTheEpochSecret for why a row over a randomly founded group could not fail.
+	"NewGroup": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
+		group, err := newGroupOverTheEpochSecret(t, epoch)
+		return []reflect.Value{reflect.ValueOf(group), reflect.ValueOf(&err).Elem()}
+	},
 }
 
 // TestNoExportedFunctionOfThisPackageHandsOutTheEpochSecret is the other half of guardrail
@@ -3016,6 +3257,13 @@ func TestNoExportedFunctionOfThisPackageHandsOutTheEpochSecret(t *testing.T) {
 	if want := []string{"Holder", "Wrapper"}; !slices.Equal(controlHolders, want) {
 		t.Fatalf("the closure read %v out of the control as holding the epoch secret, want %v; it is not seeding on the storage or not following a reference to it",
 			controlHolders, want)
+	}
+	// and its SEED, which is what the three gates over the declarer read. A seed that had started
+	// following the reference would point those three at a type holding none of the storage they
+	// are written over, and one that had stopped reading the field leaves all five gates empty.
+	if declaring := theTypesDeclaringTheEpochSecret(controlStructs); !slices.Equal(declaring, []string{"Holder"}) {
+		t.Fatalf("the seed of that closure read %v out of the control as DECLARING the epoch secret, want [Holder]",
+			declaring)
 	}
 	controlSurface := theExportedSurfaceReaching([]parsedSource{control}, controlHolders)
 	wantSurface := []string{"ExportedAnsweringAHolder", "ExportedOverTheHolder", "ExportedOverTheWrapper"}
@@ -3351,6 +3599,7 @@ const epochSecretMethodControl = "package control\n" +
 // the same type. It is checked against the derived closure in both directions, like
 // epochSecretHolderSweeps, so a second holder cannot land here unread.
 var epochSecretHolderTypes = map[string]reflect.Type{
+	"Group":       reflect.TypeOf((*Group)(nil)),
 	"KeySchedule": reflect.TypeOf((*KeySchedule)(nil)),
 }
 
@@ -6455,9 +6704,10 @@ func TestEveryMethodDerivingFromTheEpochsSecretsRefusesAnErasedEpoch(t *testing.
 		files = append(files, parsed)
 		structTypesIn(parsed, structs)
 	}
-	holders := theTypesHoldingTheEpochSecret(structs)
+	holders := theTypesDeclaringTheEpochSecret(structs)
 	if len(holders) != 1 {
-		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
+		t.Fatalf("this package's source has %v DECLARING the epoch secret storage and this gate reads one declarer; a type that merely POINTS at one is the transitive reading and belongs to guardrail 6's surface gates rather than to this one",
+			holders)
 	}
 	storage := epochSecretsStorageFieldIn(t, structs, holders[0])
 	deriving := theMethodsDerivingFromOneOfTheNine(declaredAcross(files), storage,
@@ -7573,9 +7823,10 @@ func theTagVerifiersOfThisPackage(t *testing.T) []tagVerifierSourceDeclaration {
 		files = append(files, parsed)
 		structTypesIn(parsed, structs)
 	}
-	holders := theTypesHoldingTheEpochSecret(structs)
+	holders := theTypesDeclaringTheEpochSecret(structs)
 	if len(holders) != 1 {
-		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
+		t.Fatalf("this package's source has %v DECLARING the epoch secret storage and this gate reads one declarer; a type that merely POINTS at one is the transitive reading and belongs to guardrail 6's surface gates rather than to this one",
+			holders)
 	}
 	class := boolAnsweringDerivations(declaredAcross(files), epochSecretsStorageFieldIn(t, structs, holders[0]),
 		slices.Concat([]string{"[]byte"}, packageByteSliceTypeNames(t)))
@@ -8630,9 +8881,10 @@ func TestZeroizeErasesEveryByteSliceThisTypeDeclares(t *testing.T) {
 	if len(helpers) == 0 {
 		t.Fatal("this package's source declares no erase helper, so the reading below finds no erase however Zeroize is written")
 	}
-	holders := theTypesHoldingTheEpochSecret(structs)
+	holders := theTypesDeclaringTheEpochSecret(structs)
 	if len(holders) != 1 {
-		t.Fatalf("this package's source has %v keeping the epoch secret and this gate reads one holder", holders)
+		t.Fatalf("this package's source has %v DECLARING the epoch secret storage and this gate reads one declarer; a type that merely POINTS at one is the transitive reading and belongs to guardrail 6's surface gates rather than to this one",
+			holders)
 	}
 	held := theByteSlicesHeldBy(structs, holders[0], named)
 	// the positive control on the real source. The nine live one struct hop away, so a walk

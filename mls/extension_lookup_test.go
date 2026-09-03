@@ -329,6 +329,42 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"NewGroup": {
+		what: "reads the type of EVERY entry of the config's extensions vector and selects none. RFC 9420 " +
+			"section 11 lets the creator choose the group's extensions, and this is where that choice is " +
+			"held to the v1 profile's group context set, one entry at a time. A repeated type is not a " +
+			"question it answers: two entries of one type are both judged and both must be admitted, and " +
+			"the door that refuses the repeat is the lookup every accessor reaches -- which the creation " +
+			"path reaches one statement later, through GroupPolicyOf. What matters here is the property " +
+			"(*LeafNode).Validate's row names: the walk covers every entry, so an offending extension in " +
+			"the MIDDLE or at the END is refused rather than walked past",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			owner := testIdentity(t, crypto, "owner")
+			// the offending entry LAST, which is what separates "every entry" from "the first"
+			trailing := testGroupConfig(t, crypto, owner, "group-1")
+			trailing.Extensions = append(trailing.Extensions,
+				Extension{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{0x01}})
+			if group, err := NewGroup(trailing, owner.SigPriv, BasicCredential(owner.IdentityPub)); err == nil {
+				group.Close()
+				t.Error("a config whose LAST extension is a leaf extension founded a group; the profile rule is being applied to the first entry alone")
+			}
+			// and the repeat is somebody else's rule. Both entries are admitted here, and what
+			// refuses the group is the lookup GroupPolicyOf reaches one statement later.
+			repeated := testGroupConfig(t, crypto, owner, "group-1")
+			repeated.Extensions = append(repeated.Extensions, repeated.Extensions[0])
+			group, err := NewGroup(repeated, owner.SigPriv, BasicCredential(owner.IdentityPub))
+			if err == nil {
+				group.Close()
+				t.Fatal("a config carrying the group policy twice founded a group; the repeat reaches no door at all")
+			}
+			if !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("a config carrying the group policy twice was refused with %v, want ErrMalformedExtension; the repeat is the lookup's refusal and not this loop's",
+					err)
+			}
+		},
+	},
 	"(*CommitValidationInput).checkExtensionsAreTheSetThisCommitInstalls": {
 		what: "reads the type of EVERY entry of TWO vectors positionally and selects none. It is the commit " +
 			"door's join between the extension set a caller announces and the one the commit installs, so a " +

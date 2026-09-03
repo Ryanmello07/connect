@@ -72,6 +72,14 @@ var (
 	_ func(syntax.Marshaler, int) ([]byte, error) = syntax.MarshalLimit
 	_ func([]byte, syntax.Unmarshaler, int) error = syntax.UnmarshalLimit
 
+	// the writer at a caller chosen bound, which p7 task 11's persisted state blob is the
+	// first of this package to open directly: a group's state carries the encoded ratchet
+	// tree as one opaque field, so the writer that frames it has to be able to hold what
+	// MarshalLimit above was allowed to produce. The bound is the only parameter and it is
+	// an int, so the pin is what fails if it grows an argument or takes the bound as
+	// something else.
+	_ func(int) *syntax.Writer = syntax.NewWriterLimit
+
 	// registry section 2 again, the vector pair. extensions<V> is the first structure in
 	// this package to reach them, and they are generic, so the pin instantiates them at
 	// the element type this package actually uses: a callback shape that moved would
@@ -742,7 +750,7 @@ var pinBlockSizes = map[string]int{
 	// can say a type is no WIDER than its wire field; a literal conversion the other way
 	// says only that the value fits and compiles unchanged at every wider type.
 	"framing_test.go":           3,
-	"key_schedule_deps_test.go": 77,
+	"key_schedule_deps_test.go": 78,
 	"pins_test.go":              8,
 	// keyRecordingCryptoProvider, the wrapper the update path erasure gate reads private
 	// keys through. It is written out method by method for taggingCryptoProvider's reason

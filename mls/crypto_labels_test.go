@@ -747,6 +747,25 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// takes the default for the reason every re-decode here does: they are bytes this build
 		// produced one statement earlier, so a raised bound would be raising a limit for a value
 		// that never came off a wire.
+		// p7 task 11's group creation. The required_capabilities body and the group context are
+		// both encoded at the DEFAULT limit, for tree_sync.go's reason one entry up: each of them
+		// is a structure that travels -- the extension body inside a GroupContext, the context
+		// itself inlined into every FramedContentTBS -- and a body allowed past MaxVectorLength
+		// is one no peer running the default limit could have sent, over bytes the confirmed
+		// transcript hash covers.
+		"group.go: syntax.Marshal(required)",
+		"group.go: syntax.Marshal(self.context)",
+		"group.go: syntax.Marshal(self.context)",
+		// the two encodes of the persisted state blob, at the RAISED limit, and here that is a
+		// capacity rather than an acceptance rule. These octets never travel: they are this
+		// client's own local state, read back only by the LoadGroup that wrote them, and the tree
+		// inside them is written by tree.go's own encoder at MaxRatchetTreeLength. A default
+		// limit writer here would refuse to PERSIST a group this build is entitled to hold -- the
+		// 500 member cap errors_lifecycle.go states -- and would refuse it only on the largest
+		// group anybody had made, which is the failure that is hardest to reach in a test.
+		"group.go: syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)",
+		"group.go: syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)",
+		"group.go: syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure
