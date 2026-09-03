@@ -1961,6 +1961,21 @@ func TestEveryRuleTheCommitAggregateRunsHasARowAndEveryRowIsARuleItRuns(t *testi
 // the two fields that are one commit, and the two trees that are not one tree
 // ---------------------------------------------------------------------------
 
+// testCachedRemoveOf stores a remove of one leaf in a cache and answers the reference it is keyed
+// by beside the list entry that names it -- the two halves the join holds together.
+func testCachedRemoveOf(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
+	removed LeafIndex) CachedProposal {
+
+	t.Helper()
+	proposal := Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: removed}}
+	ref, failure := cache.Store(crypto, testResolveContext(),
+		testProposalContent(t, crypto, LeafIndex(1), &proposal))
+	if failure != nil {
+		t.Fatalf("Store a remove of leaf %d: %v", removed, failure)
+	}
+	return CachedProposal{Ref: ref, Sender: LeafIndex(1), Proposal: proposal}
+}
+
 // TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector is the join, over the input
 // RFC 9420 section 12.4's own pseudocode asserts against.
 //
@@ -1969,10 +1984,12 @@ func TestEveryRuleTheCommitAggregateRunsHasARowAndEveryRowIsARuleItRuns(t *testi
 // which the RFC refuses outright -- was ACCEPTED whenever the caller handed over a non-empty list
 // that lets the path be omitted, because the rule was reading a field the commit did not name.
 //
-// THE FIVE WAYS TO DISAGREE are the five things the join compares, and each is driven: the count,
-// the discriminant, which side of the by-value line an entry is on, the reference a by-reference
-// entry names, and the type a by-value entry carries. A join that compared fewer would leave the
-// rule decidable off a list that is not the commit's in exactly the ways it did not compare.
+// THE SIX WAYS TO DISAGREE are the six things the join compares, and each is driven from a commit
+// ValidateCommit ACCEPTS -- one whose only proposal is a remove this member has actually received,
+// named by reference. That base is what makes each row exact: with the disagreement introduced the
+// only rule that can refuse is the join, so a row that stopped being refused would be a clause
+// nothing holds. Measured: without it, dropping the by-reference half of the by-value line was
+// still "caught", by a path rule that fired on the way past.
 func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
@@ -1990,42 +2007,78 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 			failure)
 	}
 
-	held := CachedProposal{Ref: ProposalRef([]byte("a-reference")), Sender: LeafIndex(1),
-		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}}
-	for _, row := range []struct {
-		name   string
-		list   *ProposalList
-		vector []ProposalOrRef
-	}{
-		{"a list longer than the vector", testProposalList(t, testAddOf(kp), testRemoveOf(2)),
-			[]ProposalOrRef{{Type: ProposalOrRefTypeProposal,
-				Proposal: &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}}},
-		{"a by-value entry the list holds by reference", testProposalList(t, held),
-			[]ProposalOrRef{{Type: ProposalOrRefTypeProposal,
-				Proposal: &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}}}},
-		{"a by-reference entry the list holds by value", testProposalList(t, testRemoveOf(2)),
-			[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: held.Ref}}},
-		{"a reference the list does not hold", testProposalList(t, held),
-			[]ProposalOrRef{{Type: ProposalOrRefTypeReference,
-				Reference: ProposalRef([]byte("another-reference"))}}},
-		{"a by-value entry of another type", testProposalList(t, testRemoveOf(2)),
-			[]ProposalOrRef{{Type: ProposalOrRefTypeProposal,
-				Proposal: &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}}},
-		{"a discriminant that names neither", testProposalList(t, testRemoveOf(2)),
-			[]ProposalOrRef{{Type: ProposalOrRefTypeReserved}}},
-	} {
-		in := testCommitInput(t, crypto, tree, row.list, &Commit{Proposals: row.vector})
-		if failure := ValidateCommit(in); !errors.Is(failure, errCommitProposalsNotResolved) {
-			t.Errorf("ValidateCommit over %s = %v, want errCommitProposalsNotResolved", row.name, failure)
-		}
+	// the base: a commit whose one proposal is a remove this member holds, named by reference
+	base := func(t *testing.T) (*CommitValidationInput, CachedProposal, CachedProposal) {
+		t.Helper()
+		in, _ := testFullCommitInput(t, crypto)
+		cache := testCacheAt(t, testResolveContext())
+		in.Pending = cache
+		held := testCachedRemoveOf(t, crypto, cache, LeafIndex(2))
+		other := testCachedRemoveOf(t, crypto, cache, LeafIndex(3))
+		in.List = testProposalList(t, held)
+		in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: held.Ref}}
+		return in, held, other
+	}
+	// the control. Every row below is this commit with one field of one entry changed, so a row
+	// that is refused is refused by the join and by nothing else.
+	control, _, _ := base(t)
+	if failure := ValidateCommit(control); failure != nil {
+		t.Fatalf("ValidateCommit refused the commit every row below is one edit away from: %v", failure)
 	}
 
-	// and the accepting half, so the join is not "every commit that names a proposal": the list
-	// the fixture builds from the vector is the resolution of it
-	whole := testCommitInput(t, crypto, tree, testProposalList(t, testRemoveOf(2)), &Commit{})
-	whole.Commit.Path = testCommitPath(t, crypto, testIdentity(t, crypto, "alice"), 1)
-	if failure := whole.check(); failure != nil {
-		t.Fatalf("the argument rule refused a list that IS the commit's own vector: %v", failure)
+	for _, row := range []struct {
+		name  string
+		apply func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal)
+	}{
+		{"a list longer than the commit's own vector",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				in.List = testProposalList(t, held, other)
+			}},
+		{"an entry the list holds by value and the commit names by reference",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				inline := held
+				inline.ByValue = true
+				in.List = testProposalList(t, inline)
+			}},
+		{"an entry the list holds by reference and the commit carries by value",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				carried := held.Proposal
+				in.Commit.Proposals = []ProposalOrRef{
+					{Type: ProposalOrRefTypeProposal, Proposal: &carried}}
+			}},
+		{"a reference the list does not name, naming a proposal this member does hold",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				in.Commit.Proposals = []ProposalOrRef{
+					{Type: ProposalOrRefTypeReference, Reference: other.Ref}}
+			}},
+		{"a by-value entry of another type",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				inline := held
+				inline.ByValue = true
+				in.List = testProposalList(t, inline)
+				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeProposal,
+					Proposal: &Proposal{ProposalType: ProposalTypeGroupContextExtensions,
+						GroupContextExtensions: &GroupContextExtensions{}}}}
+			}},
+		{"a by-value entry carrying no proposal at all",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				inline := held
+				inline.ByValue = true
+				in.List = testProposalList(t, inline)
+				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeProposal}}
+			}},
+		{"a discriminant that names neither a proposal nor a reference",
+			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
+				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeReserved}}
+			}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			in, held, other := base(t)
+			row.apply(t, in, held, other)
+			if failure := ValidateCommit(in); !errors.Is(failure, errCommitProposalsNotResolved) {
+				t.Fatalf("ValidateCommit over %s = %v, want errCommitProposalsNotResolved", row.name, failure)
+			}
+		})
 	}
 }
 
