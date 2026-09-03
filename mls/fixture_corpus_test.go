@@ -276,6 +276,18 @@ func testCommitInputInASecondGroupAtALaterEpoch(t *testing.T,
 	in.ConfirmationKey = crypto.Random(crypto.HashSize())
 	in.ConfirmedHash = crypto.Hash([]byte("the second group's confirmed hash"))
 	in.ConfirmationTag = crypto.Mac(in.ConfirmationKey, in.ConfirmedHash)
+	// AND ITS CACHE IS STILL BOUND TO THE EPOCH IT LEFT, which is the other direction of
+	// bindingHolds and the one no fixture held. The corpus already carries commits whose cache
+	// belongs to another group -- so the two comparisons had a witness where they disagree --
+	// and in every one of those the cache sat at epoch 1 of group "group" while the caller did
+	// too, so `self.binding.epoch == 1` and `self.binding.epoch == epoch` were one program.
+	// Here the binding carries exactly those two values while the caller carries neither.
+	//
+	// NOTHING NAMES THE CACHE, so this stays an accepted commit: entryTheCommitNames consults it
+	// only for a by-reference entry and both of this fixture's proposals are carried by value.
+	// A door that came to refuse a stale cache outright would fail this row rather than pass it
+	// quietly, which is the right way round for a fact nobody has stated as a rule.
+	in.Pending = testCacheAt(t, testResolveContext())
 	testCommitProposals(t, in, testRemoveOf(LeafIndex(3)), testRemoveOf(LeafIndex(2)))
 	testFitCommitPath(t, crypto, in, members[in.Committer])
 	if failure := ValidateCommit(in); failure != nil {
@@ -562,20 +574,55 @@ func testCommitTheCommitterJudgesItselfFromABlankSibling(t *testing.T,
 // disagreement that has agreement in front of it. Entry zero therefore agrees, and this fixture is
 // also the corpus's witness that the announced set and the installed set CAN agree entry by entry.
 //
-// THE DISAGREEMENT IS A SWAP AND NOT AN EDITED BODY, because the join compares two things per entry
-// -- the extension TYPE and the extension DATA -- and each is a pair of its own. Rewriting one
-// entry's body leaves every type equal, so the type comparison would still be indistinguishable
-// from one of either side against itself. Reordering the tail moves both.
-func testCommitAnnouncingExtensionsItDoesNotInstall(t *testing.T,
+// THE DISAGREEMENT IS A SWAP OF THE BODIES AND THE TYPES ARE LEFT ALONE, and the argument that used
+// to stand here said the opposite of what it should have. It read "rewriting one entry's body
+// leaves every type equal, so the type comparison would still be indistinguishable from one of
+// either side against itself; reordering the tail moves both" -- and moving both is exactly the
+// shape that leaves NEITHER clause decidable. The join has a type clause and a data clause and they
+// answer one sentinel, so an input whose two pairs differ TOGETHER is refused by either clause
+// alone: delete the data comparison and the swap is still caught by the type comparison, delete the
+// type comparison and it is still caught by the data one. What makes the DATA clause decidable is a
+// fixture whose types agree and whose bodies do not, which is a swap of the tail's bodies; the type
+// clause gets the fixture below. Contrast ValSem206, whose three clauses each own a fixture and
+// whose mutations therefore die in this gate's own driving test.
+func testCommitAnnouncingAnExtensionBodyItDoesNotInstall(t *testing.T,
 	crypto CryptoProvider) *CommitValidationInput {
 
 	t.Helper()
 	in, members := testFullCommitInput(t, crypto)
 	in.Context.Extensions = testCommitInstalledExtensions()
-	installed := slices.Clone(testCommitInstalledExtensions())
-	installed[1], installed[2] = installed[2], installed[1]
-	testCommitProposals(t, in, testGceOf(installed...))
-	in.Extensions = testCommitInstalledExtensions()
+	testCommitProposals(t, in, testGceOf(testCommitInstalledExtensions()...))
+	announced := slices.Clone(testCommitInstalledExtensions())
+	announced[1].ExtensionData, announced[2].ExtensionData =
+		announced[2].ExtensionData, announced[1].ExtensionData
+	in.Extensions = announced
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	return in
+}
+
+// testCommitAnnouncingAnExtensionTypeItDoesNotInstall is its mirror: the announced tail carries the
+// installed BODIES under each other's types.
+//
+// IT IS THE HALF THE TYPE CLAUSE IS DECIDABLE OVER, and it is a second fixture rather than a second
+// edit of the one above for the reason that one now records. Here every body sits opposite the body
+// it is compared with and only the discriminants disagree, so deleting the type comparison accepts
+// a commit this row says is refused.
+//
+// THE TYPES ARE SWAPPED RATHER THAN INVENTED, so the announced vector carries no extension type
+// twice and no type this profile refuses. effectiveExtensions prefers a caller announced set, so an
+// announced vector holding two entries of one type would be judged by the extension lookup before
+// this join ran, and the fixture would wear the name of a rule it never reached.
+func testCommitAnnouncingAnExtensionTypeItDoesNotInstall(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	in.Context.Extensions = testCommitInstalledExtensions()
+	testCommitProposals(t, in, testGceOf(testCommitInstalledExtensions()...))
+	announced := slices.Clone(testCommitInstalledExtensions())
+	announced[1].ExtensionType, announced[2].ExtensionType =
+		announced[2].ExtensionType, announced[1].ExtensionType
+	in.Extensions = announced
 	testFitCommitPath(t, crypto, in, members[in.Committer])
 	return in
 }
@@ -583,22 +630,21 @@ func testCommitAnnouncingExtensionsItDoesNotInstall(t *testing.T,
 // testCommitAnnouncingOneMoreExtensionThanItInstalls is the commit whose announced set is SHORTER
 // than the one it installs, and whose first entry is not the installed first entry either.
 //
-// TWO WITNESSES IN ONE FIXTURE, and both are pairs the corpus held at one value. The count clause
-// of the join compares len(self.Extensions) against len(installed), and every fixture in the corpus
-// made those two the same number; the entry clause compares the two vectors position by position,
-// and every fixture made those agree. This disagrees in both, and the count clause is what refuses
-// it -- which is why the shorter vector's surviving entry is deliberately left equal to the one it
-// sits opposite, so the entry-by-entry pairing witnesses agreement here as well as disagreement.
+// EVERY ENTRY IT DOES CARRY AGREES, and that is a correction this round made rather than the shape
+// it was written in. The fixture used to replace entry zero with an extension the installed set does
+// not carry, so the ENTRY clause refused it before the count clause was reached -- and a count
+// clause deleted outright left this row refused all the same, by the comparison one line down, with
+// the whole suite green. A clause is decidable only over an input NOTHING ELSE refuses, so the
+// announced vector here is the installed one with its tail cut off: same entries, same bodies, one
+// fewer of them. Delete the count and the loop indexes past the end of the vector the caller
+// announced.
 func testCommitAnnouncingOneMoreExtensionThanItInstalls(t *testing.T,
 	crypto CryptoProvider) *CommitValidationInput {
 
 	t.Helper()
 	in, members := testFullCommitInput(t, crypto)
 	in.Context.Extensions = testCommitInstalledExtensions()
-	announced := slices.Clone(testCommitInstalledExtensions()[:2])
-	announced[0] = Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor,
-		ExtensionData: []byte{0x09}}
-	in.Extensions = announced
+	in.Extensions = slices.Clone(testCommitInstalledExtensions()[:2])
 	testFitCommitPath(t, crypto, in, members[in.Committer])
 	return in
 }
@@ -814,6 +860,200 @@ func testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces(t *testing.T,
 }
 
 // ---------------------------------------------------------------------------
+// the fixtures the EVERY CONSTANT claim was missing
+// ---------------------------------------------------------------------------
+//
+// EVERY FIXTURE IN THIS SECTION EXISTS FOR ONE AGREEMENT VALUE. A pair witnessed equal in one
+// fixture and unequal in another is separable from ONE constant -- the value it happened to agree
+// at -- and the round before this one proved that is not enough by moving forty-nine call sites off
+// LeafIndex(0) and landing every one of them on LeafIndex(1). So each of these either gives a pair
+// a SECOND value to agree at, or carries the one value it already agrees at on a side where the two
+// disagree, which is the position the constant and the comparison part company at.
+
+// testCommitFromLeafZeroJudgedFromTheLeafItsCommitterUsuallyOccupies is the commit whose committer
+// sits at leaf zero and whose judge sits at leaf one.
+//
+// IT IS THE SECOND POSITION ValSem203PathDecrypt is decidable from, and it is needed because the
+// last repair moved the pin rather than removing it. Own and Committer agree in exactly one fixture
+// and they agree there at ONE, so `in.Own == LeafIndex(1)` and `in.Own == in.Committer` answered
+// alike over the whole corpus -- the same defect the round before closed at LeafIndex(0), one
+// number along. Here Own IS one while the two disagree, which no constant survives.
+func testCommitFromLeafZeroJudgedFromTheLeafItsCommitterUsuallyOccupies(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	in.Committer = testCommitterAtLeafZero
+	in.Own = testCommitterLeaf
+	// a by-value entry of a commit vector resolves to whoever sent the commit, which is this
+	// fixture's committer and not the one testRemoveOf names
+	removes := []CachedProposal{testRemoveOf(testHeldRemoveTarget)}
+	removes[0].Sender = in.Committer
+	testCommitProposals(t, in, removes...)
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused a commit sent from leaf zero: %v; a fixture no door accepts measures nothing about the doors",
+			failure)
+	}
+	return in
+}
+
+// testCommitWhosePendingCacheBelongsToAnotherGroup is the commit whose own proposal cache is bound
+// to a different group at a different epoch.
+//
+// TWO PAIRS AND NOTHING IN THE CORPUS HELD EITHER. (*ProposalCache).bindingHolds compares the
+// caller's group id and epoch against the ones the cache was bound to, and this door reaches it --
+// CheckErrata8815 asks it of the whole vector and the by-reference arm of the join asks it per
+// entry. Every fixture that carried a cache at all built that cache AT this input's own context, so
+// both comparisons and the constant `true` were the same program here.
+//
+// BOTH HALVES MOVE, because bindingHolds is an AND of two comparisons and its own header says why
+// neither is an identity alone: every group this client belongs to runs an epoch 7, and the group
+// alone is the replay it exists to refuse.
+func testCommitWhosePendingCacheBelongsToAnotherGroup(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	// STORED FIRST AND REBOUND AFTER, because a cache refuses a proposal framed in a group it
+	// does not belong to -- Store asks bindingHolds too. So the entry goes in under the group
+	// this fixture is in and the cache is then moved, which is the state a member reaches by
+	// advancing an epoch: the commit still names what it received, and the cache no longer
+	// answers to the epoch the commit is being judged in.
+	cache := testCacheAt(t, testResolveContext())
+	held := testCachedRemoveOf(t, crypto, cache, testHeldRemoveTarget)
+	elsewhere := *in.Context
+	elsewhere.GroupId = testSecondGroupId()
+	elsewhere.Epoch = testSecondEpoch
+	if failure := cache.Rebind(testVerifiedContextAt(t, &elsewhere)); failure != nil {
+		t.Fatalf("Rebind this fixture's cache to epoch %d of group %x: %v",
+			elsewhere.Epoch, elsewhere.GroupId, failure)
+	}
+	in.Pending = cache
+	in.List = testProposalList(t, held)
+	in.Commit.Proposals = []ProposalOrRef{
+		{Type: ProposalOrRefTypeReference, Reference: held.Ref},
+	}
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	return in
+}
+
+// testCommitCarryingAProposalUnderItsOwnTypeAsTheUnknownOne is the commit whose proposal names the
+// same type twice: once as its arm and once as the discriminant the encoder is to write.
+//
+// IT IS THE ONLY INPUT checkProposalProfile's forgery clause AGREES in. That clause refuses a
+// proposal whose UnknownType is set and names something other than its ProposalType, and every
+// fixture in either corpus left UnknownType at the reserved zero -- so the two were unequal
+// wherever they were read and `proposal.UnknownType != proposal.ProposalType` and the constant
+// `true` were one program. proposal_list.go says outright that UnknownType equal to ProposalType is
+// the admitted shape, because it is how proposal_wire.go makes a GREASE code point round trip, and
+// until now nothing in the corpus carried it.
+func testCommitCarryingAProposalUnderItsOwnTypeAsTheUnknownOne(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	testCommitProposals(t, in, testAddOf(kp), testRemoveOf(testHeldRemoveTarget))
+	// THE FIELD IS SET ON THE ORDER THE LIST KEEPS and not on the entries handed to the
+	// constructor. NewProposalList clones every proposal through the codec, and the decoder
+	// normalises an UnknownType naming a registered type back to the reserved zero -- so a
+	// fixture that set it before construction would announce nothing at all. The commit's own
+	// vector is taken from the list afterwards, so the two sides of the join carry one proposal.
+	//
+	// TWO ENTRIES OF TWO TYPES, because one is separable from one constant only: a corpus in
+	// which the clause agrees at `remove` and nowhere else cannot tell
+	// `UnknownType != proposal.ProposalType` from `UnknownType != ProposalTypeRemove`. The add
+	// is the second value it agrees at.
+	order := in.List.All()
+	for i := range order {
+		order[i].Proposal.UnknownType = order[i].Proposal.ProposalType
+	}
+	in.Commit.Proposals = in.List.Refs()
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused a proposal announcing its own type as the discriminant: %v; proposal_list.go names that the admitted shape",
+			failure)
+	}
+	return in
+}
+
+// testValidationInputWhoseUpdateComesFromTheLeafItsCommitterUsuallyOccupies is ValSem111's second
+// position, and it is the proposal door's copy of the argument above.
+//
+// Every fixture that reaches ValSem111 carries Committer = 1, and the one fixture where the rule's
+// two sides AGREE agrees at 1 -- so `updates[i].Sender == LeafIndex(1)` and
+// `updates[i].Sender == in.Committer` are one program over this corpus, which is precisely the
+// state the previous round left after moving forty-nine call sites off LeafIndex(0). Here an update
+// is sent FROM leaf one while the committer sits at leaf zero, so the sender carries the agreement
+// value at a position the two disagree at.
+func testValidationInputWhoseUpdateComesFromTheLeafItsCommitterUsuallyOccupies(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
+	update, _ := testUpdateProposalOf(t, crypto, members[testCommitterLeaf], testCommitterLeaf)
+	in := testValidationInput(t, crypto, tree, testCommitterAtLeafZero,
+		testProposalList(t, update))
+	if failure := ValidateProposalList(in); failure != nil {
+		t.Fatalf("ValidateProposalList refused an update sent from leaf one under a committer at leaf zero: %v",
+			failure)
+	}
+	return in
+}
+
+// testValidationInputAddingAKeyPackageForAnotherVersion is ValSem105's VERSION clause in the one
+// direction the corpus could not reach.
+//
+// testValidationInputAnnouncingAnUnimplementedVersion moves the GROUP off mls10 and leaves the
+// added key package on it, which separates the two as a relation but pins the group's own side:
+// every fixture in which the two AGREE agrees at mls10, and no fixture carries mls10 in the group
+// while the add carries something else. So `kp.Version != ProtocolVersionMls10` and
+// `kp.Version != in.Context.Version` answer alike everywhere. This is the other direction, and it
+// is the one a real peer sends: an ordinary mls10 group handed an Add announcing a version this
+// build does not implement.
+//
+// THE VERSION IS EDITED AFTER THE KEY PACKAGE IS MINTED and that is safe HERE for a reason the
+// rule's own order gives: ValSem105 compares the version and the suite BEFORE it calls
+// KeyPackage.Validate, so the refusal this row names is reached without the signature over the
+// edited field ever being checked. A fixture relying on that order is a fixture that would start
+// failing loudly if the order changed, which is the right way round.
+func testValidationInputAddingAKeyPackageForAnotherVersion(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	kp.Version = testUnimplementedProtocolVersion
+	return testValidationInput(t, crypto, tree, testCommitterLeaf,
+		testProposalList(t, testAddOf(kp)))
+}
+
+// testValidationInputCarryingAProposalUnderItsOwnTypeAsTheUnknownOne is the proposal door's copy of
+// the commit fixture above: the one input checkProposalProfile's forgery clause agrees in.
+func testValidationInputCarryingAProposalUnderItsOwnTypeAsTheUnknownOne(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	in := testValidationInput(t, crypto, tree, testCommitterLeaf,
+		testProposalList(t, testAddOf(kp), testRemoveOf(testHeldRemoveTarget)))
+	// set on the order the list keeps, and over two types, for the reasons the commit fixture
+	// above records
+	order := in.List.All()
+	for i := range order {
+		order[i].Proposal.UnknownType = order[i].Proposal.ProposalType
+	}
+	if failure := ValidateProposalList(in); failure != nil {
+		t.Fatalf("ValidateProposalList refused a proposal announcing its own type as the discriminant: %v; proposal_list.go names that the admitted shape",
+			failure)
+	}
+	return in
+}
+
+// ---------------------------------------------------------------------------
 // the corpora
 // ---------------------------------------------------------------------------
 
@@ -908,9 +1148,19 @@ func commitFixtureCorpus() map[string]validationFixtureRow[CommitValidationInput
 			build: testCommitTheCommitterJudgesItselfFromABlankSibling},
 		"testCommitAnnouncingTheExtensionSetItInstalls": {
 			build: testCommitAnnouncingTheExtensionSetItInstalls},
-		"testCommitAnnouncingExtensionsItDoesNotInstall": {
-			build:   testCommitAnnouncingExtensionsItDoesNotInstall,
+		"testCommitAnnouncingAnExtensionBodyItDoesNotInstall": {
+			build:   testCommitAnnouncingAnExtensionBodyItDoesNotInstall,
 			refuses: errCommitExtensionsNotApplied},
+		"testCommitAnnouncingAnExtensionTypeItDoesNotInstall": {
+			build:   testCommitAnnouncingAnExtensionTypeItDoesNotInstall,
+			refuses: errCommitExtensionsNotApplied},
+		"testCommitFromLeafZeroJudgedFromTheLeafItsCommitterUsuallyOccupies": {
+			build: testCommitFromLeafZeroJudgedFromTheLeafItsCommitterUsuallyOccupies},
+		"testCommitCarryingAProposalUnderItsOwnTypeAsTheUnknownOne": {
+			build: testCommitCarryingAProposalUnderItsOwnTypeAsTheUnknownOne},
+		"testCommitWhosePendingCacheBelongsToAnotherGroup": {
+			build:   testCommitWhosePendingCacheBelongsToAnotherGroup,
+			refuses: errProposalNotCached},
 		"testCommitAnnouncingOneMoreExtensionThanItInstalls": {
 			build:   testCommitAnnouncingOneMoreExtensionThanItInstalls,
 			refuses: errCommitExtensionsNotApplied},
@@ -941,8 +1191,16 @@ func proposalFixtureCorpus() map[string]validationFixtureRow[ProposalValidationI
 	return map[string]validationFixtureRow[ProposalValidationInput]{
 		"testValidationInput": {build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+			// THE REMOVED LEAF IS testCommitterLeaf and not the ordinary held
+			// target, which is this row carrying its share of the every-constant
+			// claim rather than a second fixture doing it. validateCommitterIsNotRemoved
+			// compares Removed against in.Committer, the two agree in exactly one
+			// fixture and they agree there at ONE -- so `Removed == LeafIndex(1)` and
+			// the honest comparison answer alike unless some fixture carries leaf one
+			// on the removed side while the committer sits elsewhere. This is that
+			// fixture: the committer is at leaf zero and the remove names leaf one.
 			return testValidationInput(t, crypto, tree, testCommitterAtLeafZero,
-				testProposalList(t, testRemoveOf(testHeldRemoveTarget)))
+				testProposalList(t, testRemoveOf(testCommitterLeaf)))
 		}},
 		"updateSweepFixture": {build: updateSweepFixture},
 		"testFullValidationInput": {build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
@@ -973,6 +1231,13 @@ func proposalFixtureCorpus() map[string]validationFixtureRow[ProposalValidationI
 		"testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces": {
 			build:   testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces,
 			refuses: ErrUpdateEncryptionKeyUnchanged},
+		"testValidationInputWhoseUpdateComesFromTheLeafItsCommitterUsuallyOccupies": {
+			build: testValidationInputWhoseUpdateComesFromTheLeafItsCommitterUsuallyOccupies},
+		"testValidationInputCarryingAProposalUnderItsOwnTypeAsTheUnknownOne": {
+			build: testValidationInputCarryingAProposalUnderItsOwnTypeAsTheUnknownOne},
+		"testValidationInputAddingAKeyPackageForAnotherVersion": {
+			build:   testValidationInputAddingAKeyPackageForAnotherVersion,
+			refuses: ErrSuiteMismatch},
 	}
 }
 
@@ -1557,8 +1822,8 @@ type corpusFixtureUnderTest struct {
 // validationFixtureBuildersInSource is concerned -- that walk is over the result type, which is the
 // whole of what makes it unfoolable -- so nothing here answers an input and only the reduction
 // leaves the loop.
-func corpusFixtureReducedTo(crypto CryptoProvider, name string, in any, list *ProposalList,
-	pairs []comparisonPair) corpusFixtureUnderTest {
+func corpusFixtureReducedTo(crypto CryptoProvider, name string, in any, again any,
+	list *ProposalList, pairs []comparisonPair) corpusFixtureUnderTest {
 
 	dimensions := corpusDimensionsOf(crypto, in)
 	corpusListDimensionsInto(crypto, dimensions, list)
@@ -1566,9 +1831,12 @@ func corpusFixtureReducedTo(crypto CryptoProvider, name string, in any, list *Pr
 	// the commit order is behind an unexported field with one accessor, so the vector it IS
 	// does not appear in the walk above any more than its per-entry dimensions do
 	vectors[corpusOrderPath] = len(list.All())
-	return corpusFixtureUnderTest{name: name, dimensions: dimensions,
-		relations: corpusRelationVerdictsOf(crypto, in, pairs),
-		leaves:    corpusLeafIndicesOf(in), vectors: vectors, clocks: clocks,
+	relations := corpusRelationVerdictsOf(crypto, in, pairs)
+	// the SECOND build of the same fixture, which is what says whether a value the two agreed
+	// at is a value a constant in the source could have been. See corpusStableAgreementsIn.
+	corpusStableAgreementsIn(relations, corpusRelationVerdictsOf(crypto, again, pairs))
+	return corpusFixtureUnderTest{name: name, dimensions: dimensions, relations: relations,
+		leaves: corpusLeafIndicesOf(in), vectors: vectors, clocks: clocks,
 		order: list.All()}
 }
 
@@ -1611,13 +1879,21 @@ func fixtureCorporaUnderMeasurement() map[string]func(*testing.T,
 				// other fixtures, and the claim a corpus regression actually broke
 				// would never be printed. One red row per fixture, and the
 				// measurement carries on over the ones that built.
-				var in *ProposalValidationInput
-				t.Run(name, func(t *testing.T) { in = corpus[name].build(t, crypto) })
-				if in == nil {
+				//
+				// TWICE, in the one subtest, because the every-constant claim
+				// asks whether a value the two agreed at is one a constant could
+				// be -- and the answer is whether building the same fixture again
+				// reaches it again.
+				var in, again *ProposalValidationInput
+				t.Run(name, func(t *testing.T) {
+					in = corpus[name].build(t, crypto)
+					again = corpus[name].build(t, crypto)
+				})
+				if in == nil || again == nil {
 					continue
 				}
-				built = append(built, corpusFixtureReducedTo(crypto, name, in, in.List,
-					compared))
+				built = append(built, corpusFixtureReducedTo(crypto, name, in, again,
+					in.List, compared))
 			}
 			return built, len(corpus)
 		},
@@ -1647,13 +1923,17 @@ func measureCommitCorpus(t *testing.T, crypto CryptoProvider) commitCorpusMeasur
 	compared := pairs[reflect.TypeFor[CommitValidationInput]().Name()]
 	measured := commitCorpusMeasurement{expected: len(corpus)}
 	for _, name := range slices.Sorted(maps.Keys(corpus)) {
-		var in *CommitValidationInput
-		t.Run(name, func(t *testing.T) { in = corpus[name].build(t, crypto) })
-		if in == nil {
+		// twice, for corpusStableAgreementsIn's reason, and in the one subtest
+		var in, again *CommitValidationInput
+		t.Run(name, func(t *testing.T) {
+			in = corpus[name].build(t, crypto)
+			again = corpus[name].build(t, crypto)
+		})
+		if in == nil || again == nil {
 			continue
 		}
 		measured.fixtures = append(measured.fixtures,
-			corpusFixtureReducedTo(crypto, name, in, in.List, compared))
+			corpusFixtureReducedTo(crypto, name, in, again, in.List, compared))
 		same, err := testTreesHashAlike(t, crypto, in.PreTree, in.PostTree)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -1823,6 +2103,23 @@ func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int
 // no fixture populates -- is a claim that goes green by the corpus getting emptier, which is the
 // direction every regression here has taken. A rule reading a field no fixture fills is a rule
 // nothing measures, and the derivation is what says the rule exists.
+//
+// AND SEPARABILITY FROM ONE CONSTANT IS NOT SEPARABILITY FROM EVERY CONSTANT, which is the third
+// round of this same defect and the reason the two witnesses are no longer enough on their own. A
+// pair that agrees at ONE value v and disagrees elsewhere tells `a == b` from `a == a` and from
+// `false`, and tells it from nothing else: `a == v` answers true wherever the two agree and false
+// wherever they do not, so the comparison and that constant are one program over this corpus.
+// Measured on this tree: the previous round moved forty-nine call sites off LeafIndex(0) so that
+// ValSem111 -- `updates[i].Sender == in.Committer` -- would stop being `== LeafIndex(0)`, and every
+// fixture reaching that rule then carried Committer = 1. So it became `== LeafIndex(1)` instead,
+// and this log read "6 of 6 pairs witnessed both equal and unequal" either way.
+//
+// TWO WAYS OUT AND THE SECOND IS THE CHEAP ONE. Either the corpus witnesses the two agreeing at
+// more than one value -- then no single constant can stand in for either side -- or some fixture
+// carries the agreement value on one side WHILE the two disagree, which is exactly the position at
+// which `a == v` and `a == b` answer differently. The second is asked of each side separately,
+// because `a == v` and `b == v` are two constant rules and a corpus can refuse one while admitting
+// the other.
 func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label string,
 	fixtures []corpusFixtureUnderTest, compared []comparisonPair) {
 
@@ -1835,17 +2132,48 @@ func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label stri
 	separated := 0
 	for _, pair := range compared {
 		equalIn, differIn, reachedIn := []string{}, []string{}, []string{}
+		agreed, differLeft, differRight := []string{}, []string{}, []string{}
 		for _, fixture := range fixtures {
 			verdict := fixture.relations[pair.String()]
 			if !verdict.reached {
 				continue
 			}
 			reachedIn = append(reachedIn, fixture.name)
-			if verdict.equal {
+			if len(verdict.agreed) != 0 {
 				equalIn = append(equalIn, fixture.name)
 			}
-			if verdict.differ {
+			if len(verdict.differLeft) != 0 {
 				differIn = append(differIn, fixture.name)
+			}
+			for _, value := range verdict.agreed {
+				agreed = corpusWithValue(agreed, value)
+			}
+			for _, value := range verdict.differLeft {
+				differLeft = corpusWithValue(differLeft, value)
+			}
+			for _, value := range verdict.differRight {
+				differRight = corpusWithValue(differRight, value)
+			}
+		}
+		// the side a single agreement value pins, or none where the corpus carries that
+		// value on both sides while the two disagree.
+		//
+		// THE VALUE HAS TO BE ONE A CONSTANT COULD BE, which is what stable says and why
+		// each fixture is built twice: two keys that collide in a fixture collide at
+		// different octets every run, so no constant in the source is that value and there
+		// is nothing to be separable from. See corpusStableAgreementsIn.
+		stable := []string{}
+		for _, fixture := range fixtures {
+			for _, value := range fixture.relations[pair.String()].stable {
+				stable = corpusWithValue(stable, value)
+			}
+		}
+		pinned := ""
+		if len(agreed) == 1 && slices.Contains(stable, agreed[0]) {
+			if !slices.Contains(differLeft, agreed[0]) {
+				pinned = pair.left.String()
+			} else if !slices.Contains(differRight, agreed[0]) {
+				pinned = pair.right.String()
 			}
 		}
 		switch {
@@ -1858,12 +2186,15 @@ func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label stri
 		case len(differIn) == 0:
 			t.Errorf("%s: %s is compared by %s and the two are equal in every fixture that reaches them (%v), so that comparison and a comparison of either side against itself are the same program here. Give the corpus a fixture where they disagree",
 				label, pair, pair.in, reachedIn)
+		case pinned != "":
+			t.Errorf("%s: %s is compared by %s and the two agree at ONE value across the corpus -- %s -- with no fixture carrying that value at %s while they disagree. So that comparison and `%s == <that value>` are the same program here, exactly as the last round left ValSem111 the same program as `== LeafIndex(1)`. Give the corpus a fixture where the two agree at a SECOND value, or one where %s carries this one and the other side does not",
+				label, pair, pair.in, corpusShortly(agreed[0]), pinned, pinned, pinned)
 		default:
 			separated += 1
 		}
 	}
-	t.Logf("%s: %d of %d compared pairs are witnessed both equal and unequal", label, separated,
-		len(compared))
+	t.Logf("%s: %d of %d compared pairs are witnessed equal, unequal, and separably from every constant",
+		label, separated, len(compared))
 }
 
 // TestEveryValidationInputCorpusSeparatesEveryDimensionItDecidesOff is the gate the four rounds

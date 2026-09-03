@@ -170,11 +170,36 @@ func pathsOf(expr ast.Expr, roots map[string]bool, locals map[string][]pPath) []
 			return out
 		}
 		selector, isSelector := node.Fun.(*ast.SelectorExpr)
-		if !isSelector {
+		base := []pPath{}
+		if isSelector {
+			base = pathsOf(selector.X, roots, locals)
+		}
+		// A CALL WHOSE CALLEE IS NOT ITSELF A PATH IS A FUNCTION OF ITS ARGUMENT, and where
+		// there is exactly one argument the value it answers is a value of that argument
+		// alone: string(key), slices.Clone(key), and the octets accessor every field of
+		// joinCachedProposals reaches its two entries through. WITHOUT THIS the commit
+		// door's central join contributes nothing at all -- the join reads both of its
+		// entries through a closure held in a table, so both sides of its
+		// subtle.ConstantTimeCompare are values the path language cannot spell.
+		//
+		// THE CALL IS DROPPED RATHER THAN RECORDED, because a corpus walking the path has
+		// no receiver to make it on, and the claim that leaves is stated over the argument.
+		// That is the direction that asks for MORE: a == b gives f(a) == f(b) for any f, so
+		// an equal witness carries over unchanged, and the differ witness is demanded of
+		// the argument itself rather than of the function of it.
+		if len(base) == 0 {
+			if len(node.Args) == 1 {
+				return pathsOf(node.Args[0], roots, locals)
+			}
 			return nil
 		}
-		base := pathsOf(selector.X, roots, locals)
-		if len(base) == 0 {
+		// A CALL STEP IS A CALL THE CORPUS HAS TO MAKE, and it makes it by reflection --
+		// which reaches a type's EXPORTED methods and no others. So a path through an
+		// unexported one is a path no fixture can ever answer, and recording it would state
+		// the pair claim over a value nothing can produce: a permanent red that no corpus
+		// could go green against. Derived from the name's own case rather than from a list
+		// of the two this package writes today.
+		if !ast.IsExported(selector.Sel.Name) {
 			return nil
 		}
 		args := []pPath{}
@@ -198,15 +223,25 @@ func pathsOf(expr ast.Expr, roots map[string]bool, locals map[string][]pPath) []
 	return nil
 }
 
-// localsIn answers, for one function body, every local that holds a path into a validation input.
+// localsIn answers, for one function body, every local that holds a path into a validation input,
+// starting from the bindings its caller already made for it.
+//
+// THE SEED IS HOW A RULE'S OWN HELPER IS READ. comparisonsIn follows a call into a function this
+// package declares with that function's parameters bound to the paths the caller passed, and those
+// bindings arrive here; a body walked with no seed is one reached through its own root.
 //
 // FOUR ROUNDS TO A FIXED POINT rather than one, because a rule routinely names a value through two
 // locals -- adds := in.List.Adds() and then kp := &adds[i].Proposal.Add.KeyPackage -- and a single
 // pass over the body resolves the second only if it happens to come after the first in AST order.
 // Four is past the deepest chain this package writes and is a bound rather than a loop until
 // nothing changes, so a body with a cycle in it terminates.
-func localsIn(body *ast.BlockStmt, roots map[string]bool) map[string][]pPath {
+func localsIn(body *ast.BlockStmt, roots map[string]bool,
+	seed map[string][]pPath) map[string][]pPath {
+
 	locals := map[string][]pPath{}
+	for name, found := range seed {
+		locals[name] = slices.Clone(found)
+	}
 	remember := func(name string, found []pPath) {
 		for _, one := range found {
 			if !slices.ContainsFunc(locals[name], func(other pPath) bool {
@@ -236,7 +271,38 @@ func localsIn(body *ast.BlockStmt, roots map[string]bool) map[string][]pPath {
 						remember(ident.Name, pathsOf(node.Rhs[0], roots, locals))
 					}
 				}
+			case *ast.DeclStmt:
+				// A `var` BINDS EXACTLY AS `:=` DOES, and this arm is here because the
+				// walk read only the second. Measured on this tree: rewriting the one
+				// `:=` of ValSem206PathLeafEncryptionKeyUnique as a `var` deleted THREE
+				// of the fourteen pairs at the commit door and left every claim green,
+				// because none of them is a count -- the log moved from "14 of 14" to
+				// "11 of 11" and both read as success.
+				general, isGeneral := node.Decl.(*ast.GenDecl)
+				if !isGeneral || general.Tok != token.VAR {
+					return true
+				}
+				for _, spec := range general.Specs {
+					valued, isValued := spec.(*ast.ValueSpec)
+					if !isValued || len(valued.Values) != len(valued.Names) {
+						continue
+					}
+					for i := range valued.Names {
+						if valued.Names[i].Name == "_" {
+							continue
+						}
+						remember(valued.Names[i].Name,
+							pathsOf(valued.Values[i], roots, locals))
+					}
+				}
 			case *ast.RangeStmt:
+				over := []pPath{}
+				for _, one := range pathsOf(node.X, roots, locals) {
+					if one.length {
+						continue
+					}
+					over = append(over, one)
+				}
 				if node.Value == nil {
 					return true
 				}
@@ -245,10 +311,7 @@ func localsIn(body *ast.BlockStmt, roots map[string]bool) map[string][]pPath {
 					return true
 				}
 				expanded := []pPath{}
-				for _, one := range pathsOf(node.X, roots, locals) {
-					if one.length {
-						continue
-					}
+				for _, one := range over {
 					expanded = append(expanded, pPath{steps: append(slices.Clone(one.steps),
 						pStep{kind: "elem"})})
 				}
@@ -320,6 +383,124 @@ func comparatorClassOf(t *testing.T, files []parsedSource) []string {
 	return slices.Compact(found)
 }
 
+// packageFunction is one function this package declares, and the file it was read out of.
+type packageFunction struct {
+	parsed parsedSource
+	decl   *ast.FuncDecl
+}
+
+// packageFunctionsByName is every function this package declares, keyed by its own name.
+func packageFunctionsByName(sources []parsedSource) map[string][]packageFunction {
+	found := map[string][]packageFunction{}
+	for _, parsed := range sources {
+		for _, declared := range parsed.file.Decls {
+			function, isFunction := declared.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			found[function.Name.Name] = append(found[function.Name.Name],
+				packageFunction{parsed: parsed, decl: function})
+		}
+	}
+	return found
+}
+
+// interfaceMethodsOf is every method name an interface this package declares carries.
+//
+// WHAT IT IS FOR is one line below: a call through an interface is a call whose body the CALLER
+// chooses, and this package ships CryptoProvider precisely so a deployment can supply its own. So
+// the comparisons in whatever implementation happens to sit in this repository are not comparisons
+// either door makes -- ValSem205 reaching subtle.ConstantTimeCompare inside one provider is that
+// provider decision, and the corpus would then be asked to separate a MAC length the build fixes at
+// thirty-two octets from the literal 32, which is a fixture no build could produce.
+func interfaceMethodsOf(sources []parsedSource) map[string]bool {
+	found := map[string]bool{}
+	for _, parsed := range sources {
+		ast.Inspect(parsed.file, func(n ast.Node) bool {
+			declared, isInterface := n.(*ast.InterfaceType)
+			if !isInterface || declared.Methods == nil {
+				return true
+			}
+			for _, method := range declared.Methods.List {
+				for _, named := range method.Names {
+					found[named.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// comparisonWalk is the scope the derivation runs over: this package's functions by name, the input
+// types whose own frames are walked separately, and the method names an interface answers.
+type comparisonWalk struct {
+	functions  map[string][]packageFunction
+	inputs     []string
+	dispatched map[string]bool
+}
+
+// comparisonCallHops is how many CALLS past a rule's own body the walk follows.
+//
+// A BOUND AND NOT A FIXED POINT, for localsIn's reason: a bound terminates on a call graph with a
+// cycle in it, and the recursion guard beside it already refuses a name twice on one chain. Three
+// is past the deepest chain of door logic this package writes -- a rule, the join it delegates to,
+// and the accessor that join reads its two entries through -- and what lies deeper is a utility
+// shared with the rest of the package rather than a decision either door makes.
+const comparisonCallHops = 3
+
+// boundParametersOf binds one call's arguments to the callee's parameters, and its receiver to the
+// callee's receiver, as paths in the CALLER's frame.
+//
+// EVERY POSITION OR NONE. A variadic callee, a call whose arguments are one multi-valued call, and
+// a parameter list whose length does not match the call site are all shapes where position i of the
+// call is not position i of the signature -- and a binding off by one position is a pair the
+// derivation invented rather than read.
+//
+// ONE PATH OR NO BINDING, for the same reason one level down. A local resolves to EVERY path it was
+// ever assigned from, which is the right answer where a rule compares it -- the run took one of
+// them -- and the wrong one where it is carried into a callee, because localsIn is flat over a body
+// and two sibling loops that name their variable alike are unioned. Measured: binding a
+// multiply-resolved argument made SupportsExtension answer nine pairs, crossing every required
+// capability list against every capability vector, and six of them are comparisons no line of this
+// package makes. A parameter the frame could have passed more than one value for is left unbound,
+// so the callee's comparison over it spells no pair rather than a cross product of them.
+func boundParametersOf(target packageFunction, receiver []pPath, call *ast.CallExpr,
+	roots map[string]bool, locals map[string][]pPath) map[string][]pPath {
+
+	bound := map[string][]pPath{}
+	if target.decl.Recv != nil && len(receiver) == 1 {
+		for _, field := range target.decl.Recv.List {
+			for _, named := range field.Names {
+				if named.Name != "_" {
+					bound[named.Name] = receiver
+				}
+			}
+		}
+	}
+	names := []*ast.Ident{}
+	if target.decl.Type.Params != nil {
+		for _, field := range target.decl.Type.Params.List {
+			if _, isVariadic := field.Type.(*ast.Ellipsis); isVariadic {
+				return bound
+			}
+			names = append(names, field.Names...)
+		}
+	}
+	if len(names) != len(call.Args) {
+		return bound
+	}
+	for i, named := range names {
+		if named.Name == "_" {
+			continue
+		}
+		if reached := pathsOf(call.Args[i], roots, locals); len(reached) == 1 {
+			bound[named.Name] = reached
+		}
+	}
+	return bound
+}
+
 // doorComparisonPairsMemo holds the derivation, which parses every source of this package and type
 // checks every package it imports. Both corpora are measured against it and three tests ask for it,
 // so it is computed once per run rather than once per asking.
@@ -327,6 +508,19 @@ var doorComparisonPairsMemo struct {
 	once  sync.Once
 	pairs map[string][]comparisonPair
 	class []string
+	lost  []string
+}
+
+// doorComparisonLosses is every local of a frame this walk enters that holds a path into a
+// validation input and that the walk failed to bind one for.
+//
+// IT IS EMPTY OR THE DERIVATION IS INCOMPLETE, which is what
+// TestEveryDoorComparisonIsReadOffThisPackagesSource states over it. See bindingsLostIn for why
+// this and not a count.
+func doorComparisonLosses(t *testing.T) []string {
+	t.Helper()
+	doorComparisonPairs(t)
+	return doorComparisonPairsMemo.lost
 }
 
 // doorComparisonPairs answers, for each validation input type this package declares, every pair of
@@ -341,8 +535,12 @@ func doorComparisonPairs(t *testing.T) (map[string][]comparisonPair, []string) {
 	doorComparisonPairsMemo.once.Do(func() {
 		sources := packageSources(t)
 		class := comparatorClassOf(t, sources)
+		walk := comparisonWalk{functions: packageFunctionsByName(sources),
+			inputs:     validationInputTypesInSource(t),
+			dispatched: interfaceMethodsOf(sources)}
 		pairs := map[string][]comparisonPair{}
-		for _, named := range validationInputTypesInSource(t) {
+		lost := []string{}
+		for _, named := range walk.inputs {
 			seen := map[string]bool{}
 			for _, parsed := range sources {
 				for _, declared := range parsed.file.Decls {
@@ -354,7 +552,15 @@ func doorComparisonPairs(t *testing.T) (map[string][]comparisonPair, []string) {
 					if len(roots) == 0 {
 						continue
 					}
-					for _, pair := range comparisonsIn(parsed, function, roots, class) {
+					read, dropped := comparisonsIn(parsed, function, roots, nil,
+						class, walk, comparisonCallHops,
+						[]string{function.Name.Name})
+					for _, one := range dropped {
+						if !slices.Contains(lost, one) {
+							lost = append(lost, one)
+						}
+					}
+					for _, pair := range read {
 						if seen[pair.String()] {
 							continue
 						}
@@ -367,7 +573,9 @@ func doorComparisonPairs(t *testing.T) (map[string][]comparisonPair, []string) {
 				return strings.Compare(one.String(), other.String())
 			})
 		}
+		slices.Sort(lost)
 		doorComparisonPairsMemo.pairs, doorComparisonPairsMemo.class = pairs, class
+		doorComparisonPairsMemo.lost = lost
 	})
 	return doorComparisonPairsMemo.pairs, doorComparisonPairsMemo.class
 }
@@ -394,6 +602,83 @@ func rootsOfType(parsed parsedSource, function *ast.FuncDecl, named string) map[
 	return roots
 }
 
+// bindingsLostIn answers every local of one frame whose bound expression pathsOf CAN spell and
+// that localsIn did not record a path for.
+//
+// THIS IS WHAT THE CLASS SIZE IS HELD AGAINST, and it is here because no count could be. Every
+// claim over these pairs is stated per pair, so a walk that quietly stops finding three of them
+// states three fewer claims in exactly the same words: measured on this tree, rewriting the one
+// `:=` of ValSem206PathLeafEncryptionKeyUnique as a `var` deleted three of the fourteen pairs at
+// the commit door, moved the log from "14 of 14 compared pairs" to "11 of 11", and moved no
+// assertion at all. A literal fourteen beside it would be the same hole with a maintenance burden
+// attached -- the next person to add a rule edits the number to match.
+//
+// WHAT DOES NOT MOVE WITH THE CLASS IS THE TWO HALVES OF THE WALK AGREEING. pathsOf says which
+// expressions name a value of the input; localsIn says which of a frame's locals hold one. A local
+// bound from an expression pathsOf resolves and that localsIn did not bind is a binding FORM the
+// walk cannot read -- a `var` where it reads only `:=`, a tuple where it reads only a pair -- and
+// every comparison that names such a local silently leaves the class. The claim is zero of them,
+// whatever the class size is, and the walk that answers it is the walk under test rather than a
+// second opinion about it.
+//
+// THE SAME STATEMENT SHAPES AND THE SAME ORDER as localsIn, and only the shapes it binds FROM: the
+// key of a range is not one localsIn records, so this does not ask for it.
+func bindingsLostIn(body *ast.BlockStmt, roots map[string]bool,
+	locals map[string][]pPath) []string {
+
+	lost := []string{}
+	check := func(name *ast.Ident, value ast.Expr) {
+		if name == nil || name.Name == "_" || value == nil {
+			return
+		}
+		if len(locals[name.Name]) != 0 || len(pathsOf(value, roots, locals)) == 0 {
+			return
+		}
+		if !slices.Contains(lost, name.Name) {
+			lost = append(lost, name.Name)
+		}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if len(node.Rhs) == len(node.Lhs) {
+				for i := range node.Lhs {
+					ident, isIdent := node.Lhs[i].(*ast.Ident)
+					if isIdent {
+						check(ident, node.Rhs[i])
+					}
+				}
+			} else if len(node.Rhs) == 1 && len(node.Lhs) > 1 {
+				ident, isIdent := node.Lhs[0].(*ast.Ident)
+				if isIdent {
+					check(ident, node.Rhs[0])
+				}
+			}
+		case *ast.DeclStmt:
+			general, isGeneral := node.Decl.(*ast.GenDecl)
+			if !isGeneral || general.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range general.Specs {
+				valued, isValued := spec.(*ast.ValueSpec)
+				if !isValued || len(valued.Values) != len(valued.Names) {
+					continue
+				}
+				for i := range valued.Names {
+					check(valued.Names[i], valued.Values[i])
+				}
+			}
+		case *ast.RangeStmt:
+			ident, isIdent := node.Value.(*ast.Ident)
+			if isIdent {
+				check(ident, node.X)
+			}
+		}
+		return true
+	})
+	return lost
+}
+
 // comparisonsIn answers every pair of input paths one function compares.
 //
 // TWO SPELLINGS AND BOTH DERIVED. The equality operators are the language's own, and a call to a
@@ -401,27 +686,34 @@ func rootsOfType(parsed parsedSource, function *ast.FuncDecl, named string) map[
 // subtle.ConstantTimeCompare is how this package is required to compare every octet string it
 // ships, so a walk that read only the operators would miss every key comparison in both doors.
 func comparisonsIn(parsed parsedSource, function *ast.FuncDecl, roots map[string]bool,
-	class []string) []comparisonPair {
+	seed map[string][]pPath, class []string, walk comparisonWalk, hops int,
+	stack []string) ([]comparisonPair, []string) {
 
-	locals := localsIn(function.Body, roots)
+	locals := localsIn(function.Body, roots, seed)
 	found := []comparisonPair{}
+	lost := []string{}
+	for _, name := range bindingsLostIn(function.Body, roots, locals) {
+		lost = append(lost, function.Name.Name+": "+name)
+	}
 	seen := map[string]bool{}
 	ast.Inspect(function.Body, func(n ast.Node) bool {
 		var left, right []pPath
+		var leftExpr, rightExpr ast.Expr
 		switch node := n.(type) {
 		case *ast.BinaryExpr:
 			if node.Op != token.EQL && node.Op != token.NEQ {
 				return true
 			}
-			left, right = pathsOf(node.X, roots, locals), pathsOf(node.Y, roots, locals)
+			leftExpr, rightExpr = node.X, node.Y
 		case *ast.CallExpr:
 			if !slices.Contains(class, parsed.render(node.Fun)) || len(node.Args) < 2 {
 				return true
 			}
-			left, right = pathsOf(node.Args[0], roots, locals), pathsOf(node.Args[1], roots, locals)
+			leftExpr, rightExpr = node.Args[0], node.Args[1]
 		default:
 			return true
 		}
+		left, right = pathsOf(leftExpr, roots, locals), pathsOf(rightExpr, roots, locals)
 		for _, one := range left {
 			for _, other := range right {
 				first, second := one, other
@@ -444,7 +736,67 @@ func comparisonsIn(parsed parsedSource, function *ast.FuncDecl, roots map[string
 		}
 		return true
 	})
-	return found
+	if hops <= 0 {
+		return found, lost
+	}
+	// AND THE HELPERS THE RULE IS WRITTEN OUT OF, with their parameters bound to the paths
+	// this frame passed them. Without this the scope of the walk is "a function whose
+	// signature names a validation input", which is an enumeration wearing a derivation's
+	// clothes: joinCachedProposals holds the vector the sender signed against the list this
+	// member resolved over EVERY field of a CachedProposal, CheckUpdatePathKeyUniqueness is
+	// the whole body of ValSem207, and neither is in that scope -- both take the types the
+	// input carries rather than the input. Both are door logic and both contributed nothing.
+	ast.Inspect(function.Body, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		name, receiver := "", []pPath{}
+		switch callee := call.Fun.(type) {
+		case *ast.Ident:
+			name = callee.Name
+		case *ast.SelectorExpr:
+			name, receiver = callee.Sel.Name, pathsOf(callee.X, roots, locals)
+		default:
+			return true
+		}
+		if slices.Contains(stack, name) || walk.dispatched[name] {
+			return true
+		}
+		// AMBIGUITY IS NOT FOLLOWED. Two declarations of one name are two methods on
+		// different receivers, and there is no type information here to say which was
+		// called; binding the wrong one's parameters would invent a pair rather than
+		// read one.
+		declared := walk.functions[name]
+		if len(declared) != 1 {
+			return true
+		}
+		target := declared[0]
+		// A CALLEE THAT TAKES A VALIDATION INPUT IS WALKED IN ITS OWN FRAME, under the
+		// door whose input it takes, so following it from here would restate its pairs
+		// behind a path prefix and ask the corpus to separate each of them twice.
+		for _, named := range walk.inputs {
+			if len(rootsOfType(target.parsed, target.decl, named)) != 0 {
+				return true
+			}
+		}
+		bound := boundParametersOf(target, receiver, call, roots, locals)
+		if len(bound) == 0 {
+			return true
+		}
+		deeper, dropped := comparisonsIn(target.parsed, target.decl, nil, bound, class,
+			walk, hops-1, append(slices.Clone(stack), name))
+		for _, pair := range deeper {
+			if seen[pair.String()] {
+				continue
+			}
+			seen[pair.String()] = true
+			found = append(found, pair)
+		}
+		lost = append(lost, dropped...)
+		return true
+	})
+	return found, lost
 }
 
 // ---------------------------------------------------------------------------
@@ -452,16 +804,71 @@ func comparisonsIn(parsed parsedSource, function *ast.FuncDecl, roots map[string
 // ---------------------------------------------------------------------------
 
 // corpusPairVerdict is what one fixture witnesses about one pair: whether the pair was reachable in
-// it at all, and whether the values it reached were ever equal and ever unlike.
+// it at all, the VALUES the two were equal at, and the values each side carried where they were not.
 //
-// BOTH FLAGS CAN BE TRUE AT ONCE and that is not a contradiction: a pair spread over a vector is
-// compared once per position, so a fixture whose first extension matches and whose second does not
-// witnesses both halves by itself. A fixture that reaches neither side witnesses nothing, which is
-// why reached is carried rather than inferred from the other two.
+// VALUES AND NOT TWO FLAGS, which is the second constant this file was written to refuse and the
+// one it left standing. A pair witnessed equal in one fixture and unequal in another is separated
+// from ONE constant; it is separated from EVERY constant only when the value it agrees at moves, or
+// when some fixture carries that value on one side while the two disagree. Measured: the previous
+// round moved forty-nine call sites off LeafIndex(0) so that ValSem111's
+// `updates[i].Sender == in.Committer` would stop being `== LeafIndex(0)` -- and every fixture that
+// reaches that rule now carries Committer = 1, so it became `== LeafIndex(1)` instead and the gate
+// reported "6 of 6 pairs witnessed both equal and unequal" either way.
+//
+// BOTH HALVES CAN BE WITNESSED AT ONCE and that is not a contradiction: a pair spread over a vector
+// is compared once per position, so a fixture whose first extension matches and whose second does
+// not witnesses both by itself. A fixture that reaches neither side witnesses nothing, which is why
+// reached is carried rather than inferred from the rest.
 type corpusPairVerdict struct {
-	reached bool
-	equal   bool
-	differ  bool
+	reached     bool
+	agreed      []string
+	stable      []string
+	differLeft  []string
+	differRight []string
+}
+
+// corpusStableAgreementsIn marks, on one fixture's verdicts, the agreement values a SECOND build of
+// the same fixture reached too.
+//
+// A CONSTANT IN THE SOURCE CAN ONLY BE A VALUE THE BUILD REPRODUCES, and that is the whole of what
+// this is for. The every-constant claim next door asks a pair that agrees at one value to carry
+// that value somewhere the two disagree -- which is the right demand for a leaf index, a protocol
+// version or a group id, and an impossible one for a freshly generated encryption key: ValSem206
+// and ValSem204 agree exactly where a fixture made two keys collide, and the octets they collide at
+// are different every run, so no line anybody could write into validate_commit.go is that value.
+//
+// MEASURED RATHER THAN TYPED. The alternative is a list of the kinds of value a constant may be,
+// which is the enumeration this file exists not to be -- and it would be wrong in both directions,
+// since a group id is octets and a MAC length is an integer. Building the fixture twice answers the
+// question the claim actually asks.
+func corpusStableAgreementsIn(verdicts map[string]corpusPairVerdict,
+	again map[string]corpusPairVerdict) {
+
+	for key, verdict := range verdicts {
+		for _, value := range verdict.agreed {
+			if slices.Contains(again[key].agreed, value) {
+				verdict.stable = append(verdict.stable, value)
+			}
+		}
+		verdicts[key] = verdict
+	}
+}
+
+// corpusWithValue adds one value to a set of them, distinctly and in the order first seen.
+func corpusWithValue(held []string, value string) []string {
+	if slices.Contains(held, value) {
+		return held
+	}
+	return append(held, value)
+}
+
+// corpusShortly is one rendered value cut to what a failure message can carry: these are hex
+// octet strings and tree hashes, and a refusal nobody reads to the end is a refusal nobody acts on.
+func corpusShortly(value string) string {
+	if len(value) > 96 {
+		return value[:96] + "..."
+	}
+	return value
 }
 
 // corpusRelationVerdictsOf reduces one built fixture to what it says about every pair its door
@@ -475,24 +882,24 @@ func corpusRelationVerdictsOf(crypto CryptoProvider, root any,
 		left := corpusRenderedAlong(crypto, at, pair.left)
 		right := corpusRenderedAlong(crypto, at, pair.right)
 		verdict := corpusPairVerdict{}
+		witness := func(one string, other string) {
+			if one == other {
+				verdict.agreed = corpusWithValue(verdict.agreed, one)
+				return
+			}
+			verdict.differLeft = corpusWithValue(verdict.differLeft, one)
+			verdict.differRight = corpusWithValue(verdict.differRight, other)
+		}
 		if len(left) != 0 && len(right) != 0 {
 			verdict.reached = true
 			if pair.positional() {
 				for i := 0; i < min(len(left), len(right)); i += 1 {
-					if left[i] == right[i] {
-						verdict.equal = true
-					} else {
-						verdict.differ = true
-					}
+					witness(left[i], right[i])
 				}
 			} else {
 				for _, one := range left {
 					for _, other := range right {
-						if one == other {
-							verdict.equal = true
-						} else {
-							verdict.differ = true
-						}
+						witness(one, other)
 					}
 				}
 			}
@@ -724,5 +1131,15 @@ func TestEveryDoorComparisonIsReadOffThisPackagesSource(t *testing.T) {
 	}
 	if !spreadOverAVector {
 		t.Errorf("the walk found no pair whose two sides spread over a vector, so the positional pairing above is dead code")
+	}
+	// AND THE CLASS IS HELD TO THE SOURCE RATHER THAN TO A NUMBER. Every claim over these pairs
+	// is stated per pair, so a walk that quietly stops finding three of them states three fewer
+	// claims in exactly the same words -- "11 of 11" reads as well as "14 of 14". This is the
+	// half that does not move with the class: a comparison one side of which resolved while the
+	// other is a local this frame bound out of the same input is a pair the walk DROPPED, and
+	// the number of them is zero however many pairs there are. See spellableLocalsIn.
+	for _, one := range doorComparisonLosses(t) {
+		t.Errorf("%s holds a path into its input that pathsOf can spell and localsIn did not bind, so every comparison that rule writes over it leaves this class silently. localsIn does not read the binding form it was written with",
+			one)
 	}
 }
