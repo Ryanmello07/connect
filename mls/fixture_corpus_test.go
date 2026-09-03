@@ -560,6 +560,50 @@ func testCommitTheCommitterJudgesItselfFromABlankSibling(t *testing.T,
 	return in
 }
 
+// testCommitTheCommitterJudgesItselfFromLeafZeroWithABlankSibling is that same input one leaf over,
+// and it is a second fixture rather than an edit of the first for the every-constant reason.
+//
+// ONE FIXTURE OF THIS SHAPE IS SEPARABLE FROM ONE CONSTANT. The early return is decidable only
+// where the committer's own filtered direct path is EMPTY, which is the shape above and nothing
+// else in the corpus -- so with a single such fixture, `in.Own == LeafIndex(<that fixture's leaf>)`
+// and `in.Own == in.Committer` answer alike over every input here. Measured on this tree: with only
+// the leaf one fixture, replacing the comparison with `in.Own == LeafIndex(1)` left the whole
+// ./mls/... and ./message/... run green -- which is the round before this one repeating itself at
+// LeafIndex(1) instead of LeafIndex(0). Two of them, at two leaves, is what no single constant
+// survives: each is accepted by the honest rule and refused by the constant that names the other.
+func testCommitTheCommitterJudgesItselfFromLeafZeroWithABlankSibling(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob")
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	in.Committer = testCommitterAtLeafZero
+	in.Own = in.Committer
+	// a by-value entry resolves to whoever sent the commit, which here is leaf zero rather than
+	// the leaf testRemoveOf names
+	removes := []CachedProposal{testRemoveOf(testCommitterLeaf)}
+	removes[0].Sender = in.Committer
+	testCommitProposals(t, in, removes...)
+	applied, err := ApplyProposals(in.PreTree, in.Context, in.Own, in.List)
+	if err != nil {
+		t.Fatalf("ApplyProposals to blank the committer's sibling: %v", err)
+	}
+	in.PostTree = applied.Tree
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	filtered, err := in.PostTree.FilteredDirectPath(in.Committer)
+	if err != nil {
+		t.Fatalf("FilteredDirectPath(%d) over the post tree: %v", in.Committer, err)
+	}
+	if len(filtered) != 0 {
+		t.Fatalf("the committer's filtered direct path in the post tree is %v and this fixture exists to make it empty; without that, skipping the early return of ValSem203 changes no verdict",
+			filtered)
+	}
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused leaf zero's own commit: %v", failure)
+	}
+	return in
+}
+
 // testCommitAnnouncingExtensionsItDoesNotInstall is the commit whose announced extension set and
 // whose installed one agree at the ends and disagree in the middle.
 //
@@ -1146,6 +1190,8 @@ func commitFixtureCorpus() map[string]validationFixtureRow[CommitValidationInput
 			build: testCommitInputAnnouncingAnUnimplementedVersion},
 		"testCommitTheCommitterJudgesItselfFromABlankSibling": {
 			build: testCommitTheCommitterJudgesItselfFromABlankSibling},
+		"testCommitTheCommitterJudgesItselfFromLeafZeroWithABlankSibling": {
+			build: testCommitTheCommitterJudgesItselfFromLeafZeroWithABlankSibling},
 		"testCommitAnnouncingTheExtensionSetItInstalls": {
 			build: testCommitAnnouncingTheExtensionSetItInstalls},
 		"testCommitAnnouncingAnExtensionBodyItDoesNotInstall": {
