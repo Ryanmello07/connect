@@ -97,6 +97,14 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 	// list this door would install one of two extension sets with nothing saying which. That is
 	// the same fault the three rules above close one field lower down: a step decided off a
 	// source the door has not established.
+	//
+	// REDUNDANT WITH THE DOOR AND KEPT, and that is measured rather than assumed:
+	// (*ProposalValidationInput).check asks this same rule, so the three calls above reach it
+	// a moment earlier and deleting this line leaves the whole of ./mls/... and ./message/...
+	// green. It stays for the reason those three are called rather than restated -- this file
+	// names the preconditions its four numbered steps stand on, and a reader asking which
+	// extension set step 1 installs should find the answer here rather than inside another
+	// rule's argument check. Nothing here claims a test can tell which of the two guards fired.
 	if err := validateOneGroupContextExtensions(structural); err != nil {
 		return nil, err
 	}
