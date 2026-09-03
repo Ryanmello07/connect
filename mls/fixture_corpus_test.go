@@ -603,6 +603,32 @@ func testCommitAnnouncingOneMoreExtensionThanItInstalls(t *testing.T,
 	return in
 }
 
+// testCommitAnnouncingTheExtensionSetItInstalls is an ACCEPTED commit whose announced and
+// installed extension sets agree, and it is two entries long rather than three.
+//
+// ONE AGREEING PAIR IS ONE LENGTH, which is the limit of the relation claim and was measured on
+// this tree: with the corpus holding a single accepted fixture whose two sets agree at three
+// entries, `len(self.Extensions) != len(installed)` and `len(self.Extensions) != 3` are the same
+// program over every input here, and that mutation survived the full ./mls/... and ./message/...
+// run. A relation is separable from a constant when the corpus holds a fixture where it holds and
+// one where it does not; it is separable from EVERY constant only when it holds at more than one
+// value. This is the second value.
+func testCommitAnnouncingTheExtensionSetItInstalls(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	announced := slices.Clone(testCommitInstalledExtensions()[:2])
+	in.Context.Extensions = slices.Clone(announced)
+	in.Extensions = announced
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused a commit announcing exactly the set it installs: %v",
+			failure)
+	}
+	return in
+}
+
 // testCommitWhosePathLeafRepublishesAnAddedKey, ...AnAddedInitKey and ...AnUpdatedKey are the three
 // inputs ValSem206PathLeafEncryptionKeyUnique's three clauses are decidable over.
 //
@@ -880,6 +906,8 @@ func commitFixtureCorpus() map[string]validationFixtureRow[CommitValidationInput
 			build: testCommitInputAnnouncingAnUnimplementedVersion},
 		"testCommitTheCommitterJudgesItselfFromABlankSibling": {
 			build: testCommitTheCommitterJudgesItselfFromABlankSibling},
+		"testCommitAnnouncingTheExtensionSetItInstalls": {
+			build: testCommitAnnouncingTheExtensionSetItInstalls},
 		"testCommitAnnouncingExtensionsItDoesNotInstall": {
 			build:   testCommitAnnouncingExtensionsItDoesNotInstall,
 			refuses: errCommitExtensionsNotApplied},
@@ -2141,6 +2169,48 @@ func TestNoValidationInputIsBuiltFromANumberWithNoName(t *testing.T) {
 			len(builders), builders)
 	}
 	t.Logf("%d builders, %d call sites", len(builders), called)
+	assertBareNumbersAreRecognised(t, types)
+}
+
+// assertBareNumbersAreRecognised is the control the claim above needs to mean anything.
+//
+// A MATCHER THAT RECOGNISES NOTHING PASSES EVERY CALL SITE, and it does so silently: measured, the
+// literal arm of isBareNumber replaced by `false` left the gate above green over the whole of
+// ./mls/... and ./message/..., because a gate whose only output is "no offenders" cannot tell a
+// clean package from a walk that read nothing. So the matcher is driven over text that is known to
+// hold one of each kind, and over text that is known to hold none.
+//
+// THE NEGATIVE HALF IS THE OTHER ERROR. A matcher that answered true for everything would also
+// pass no call site -- it would fail all of them -- but the failure a reviewer would then reach for
+// is to loosen the claim rather than to fix the matcher, so the shapes a fixture legitimately hands
+// a builder are held to being accepted: a named constant, a helper call carrying a number, and an
+// ordinary local.
+func assertBareNumbersAreRecognised(t *testing.T, types map[string]bool) {
+	t.Helper()
+	for _, one := range []struct {
+		source string
+		bare   bool
+	}{
+		{source: "0", bare: true},
+		{source: "9", bare: true},
+		{source: "LeafIndex(0)", bare: true},
+		{source: "(LeafIndex(258))", bare: true},
+		{source: "uint32(3)", bare: true},
+		{source: "testCommitterLeaf", bare: false},
+		{source: "testWideCommitterLeaf", bare: false},
+		{source: "testRemoveOf(LeafIndex(3))", bare: false},
+		{source: "tree", bare: false},
+		{source: "testProposalList(t, held)", bare: false},
+	} {
+		parsed, err := parser.ParseExpr(one.source)
+		if err != nil {
+			t.Fatalf("parse the control %q: %v", one.source, err)
+		}
+		if answered := isBareNumber(parsed, types); answered != one.bare {
+			t.Errorf("the matcher reads %s as bare=%v and it is bare=%v; a matcher that recognises nothing passes every call site of every builder and says so in exactly the words a clean package says",
+				one.source, answered, one.bare)
+		}
+	}
 }
 
 // testTreesHashAlike answers whether two trees are the same tree by the one identity a ratchet tree
