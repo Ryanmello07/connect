@@ -490,8 +490,327 @@ func testWideValidationInput(t *testing.T, crypto CryptoProvider) *ProposalValid
 }
 
 // ---------------------------------------------------------------------------
+// the fixtures the RELATION claim was missing
+// ---------------------------------------------------------------------------
+//
+// EVERY FIXTURE BELOW EXISTS FOR A PAIR AND NOT FOR A FIELD. fixture_relations_test.go derives, off
+// this package's own source, every pair of input paths a rule compares, and the corpus owes each
+// pair a fixture where the two are equal and one where they are not. Ten of the twenty pairs had
+// only one of the two, and two had neither because no fixture ever filled both sides.
+//
+// MOST OF THEM ARE REFUSALS AND THAT IS WHAT THE ROW'S SENTINEL IS FOR. A rule that refuses on
+// equality -- ValSem104, ValSem111, ValSem204, ValSem206, validateCommitterIsNotRemoved,
+// validateUpdateChangesTheEncryptionKey -- has no ACCEPTED input in which its two sides agree, so
+// the only witness that tells it from `false` is an input the door turns away. Until this round the
+// commit corpus had no way to hold one: its rows carried no verdict at all.
+
+// testCommitTheCommitterJudgesItselfFromABlankSibling is the commit whose judge IS its committer,
+// standing where the committer's filtered direct path is EMPTY.
+//
+// IT IS THE ONE INPUT ValSem203PathDecrypt's FIRST LINE IS DECIDABLE OVER, and the last round
+// measured what its absence cost: `if in.Own == in.Committer` could be replaced by
+// `if in.Own == LeafIndex(0)` -- true in every fixture, since Own was 0 and Committer 1 throughout
+// -- or by `if false` outright, and the whole suite stayed green. Both are real behaviour changes
+// and neither was observable, because no fixture ever put the two leaves on the same number.
+//
+// THE BLANK SIBLING IS WHAT MAKES THE EARLY RETURN MATTER. Own == Committer alone is not enough: in
+// any group whose committer has a non-empty filtered direct path, the loop the early return skips
+// would compare that path against ITSELF and find every node shared, so the mutant and the honest
+// rule agree anyway. Here the group is two leaves and the committer's own commit removes the other
+// one, so the sibling subtree is blank, the filtered direct path is empty, and a run that reaches
+// the loop finds no shared node and REFUSES the committer's own commit. That is the difference the
+// early return is there to make, and this is the input that makes it.
+func testCommitTheCommitterJudgesItselfFromABlankSibling(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob")
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	in.Own = in.Committer
+	testCommitProposals(t, in, testRemoveOf(LeafIndex(0)))
+	applied, err := ApplyProposals(in.PreTree, in.Context, in.Own, in.List)
+	if err != nil {
+		t.Fatalf("ApplyProposals to blank the committer's sibling: %v", err)
+	}
+	in.PostTree = applied.Tree
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	filtered, err := in.PostTree.FilteredDirectPath(in.Committer)
+	if err != nil {
+		t.Fatalf("FilteredDirectPath(%d) over the post tree: %v", in.Committer, err)
+	}
+	if len(filtered) != 0 {
+		t.Fatalf("the committer's filtered direct path in the post tree is %v and this fixture exists to make it empty; without that, skipping the early return of ValSem203 changes no verdict",
+			filtered)
+	}
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused the committer's own commit: %v", failure)
+	}
+	return in
+}
+
+// testCommitAnnouncingExtensionsItDoesNotInstall is the commit whose announced extension set and
+// whose installed one agree at the ends and disagree in the middle.
+//
+// IT IS THE ONLY INPUT THE EXTENSION JOIN IS DECIDABLE OVER, which the last round measured:
+// `if self.Extensions != nil` could be replaced by `if false` -- deleting the join outright -- with
+// the whole suite green, because every fixture that filled Extensions filled it with the very
+// vector the join compares it against. A join whose two sides are equal in every input is a join
+// nothing can tell from its own absence.
+//
+// NOT THE FIRST ENTRY, for testCommitInstalledExtensions' own reason: a comparison narrowed to
+// entry zero, or one that stops at the first agreement, is told apart from the whole walk only by a
+// disagreement that has agreement in front of it. Entry zero therefore agrees, and this fixture is
+// also the corpus's witness that the announced set and the installed set CAN agree entry by entry.
+//
+// THE DISAGREEMENT IS A SWAP AND NOT AN EDITED BODY, because the join compares two things per entry
+// -- the extension TYPE and the extension DATA -- and each is a pair of its own. Rewriting one
+// entry's body leaves every type equal, so the type comparison would still be indistinguishable
+// from one of either side against itself. Reordering the tail moves both.
+func testCommitAnnouncingExtensionsItDoesNotInstall(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	in.Context.Extensions = testCommitInstalledExtensions()
+	installed := slices.Clone(testCommitInstalledExtensions())
+	installed[1], installed[2] = installed[2], installed[1]
+	testCommitProposals(t, in, testGceOf(installed...))
+	in.Extensions = testCommitInstalledExtensions()
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	return in
+}
+
+// testCommitAnnouncingOneMoreExtensionThanItInstalls is the commit whose announced set is SHORTER
+// than the one it installs, and whose first entry is not the installed first entry either.
+//
+// TWO WITNESSES IN ONE FIXTURE, and both are pairs the corpus held at one value. The count clause
+// of the join compares len(self.Extensions) against len(installed), and every fixture in the corpus
+// made those two the same number; the entry clause compares the two vectors position by position,
+// and every fixture made those agree. This disagrees in both, and the count clause is what refuses
+// it -- which is why the shorter vector's surviving entry is deliberately left equal to the one it
+// sits opposite, so the entry-by-entry pairing witnesses agreement here as well as disagreement.
+func testCommitAnnouncingOneMoreExtensionThanItInstalls(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	in.Context.Extensions = testCommitInstalledExtensions()
+	announced := slices.Clone(testCommitInstalledExtensions()[:2])
+	announced[0] = Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor,
+		ExtensionData: []byte{0x09}}
+	in.Extensions = announced
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	return in
+}
+
+// testCommitWhosePathLeafRepublishesAnAddedKey, ...AnAddedInitKey and ...AnUpdatedKey are the three
+// inputs ValSem206PathLeafEncryptionKeyUnique's three clauses are decidable over.
+//
+// THE RULE REFUSES ON EQUALITY, so there is no accepted input in which any of its three
+// comparisons agrees, and a corpus of accepted inputs alone cannot tell the whole rule from
+// `return nil`. Three fixtures and not one because the rule reads three different fields -- an
+// add's leaf key, an add's INIT key, and an update's leaf key -- and a single collision witnesses
+// exactly one of them.
+func testCommitWhosePathLeafRepublishesAnAddedKey(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	testCommitProposals(t, in, testAddOf(kp))
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	in.Commit.Path.LeafNode.EncryptionKey = slices.Clone(kp.LeafNode.EncryptionKey)
+	return in
+}
+
+func testCommitWhosePathLeafRepublishesAnAddedInitKey(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	testCommitProposals(t, in, testAddOf(kp))
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	in.Commit.Path.LeafNode.EncryptionKey = slices.Clone(kp.InitKey)
+	return in
+}
+
+func testCommitWhosePathLeafRepublishesAnUpdatedKey(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	// BY REFERENCE, which is the one shape an update inside a commit has: (*ProposalCache).Resolve
+	// attributes a by-VALUE entry to the committer, so an inline update would be an update of the
+	// committer's own leaf and the vector join would refuse this fixture before ValSem206 ran.
+	in.Pending = testCacheAt(t, in.Context)
+	update := testCachedUpdateOf(t, crypto, in.Pending, members[2], LeafIndex(2))
+	testCommitProposals(t, in, update)
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	in.Commit.Path.LeafNode.EncryptionKey =
+		slices.Clone(update.Proposal.Update.LeafNode.EncryptionKey)
+	return in
+}
+
+// testCommitWhosePathLeafKeepsTheCommittersKey is the input ValSem204PathKeyMismatch is decidable
+// over: the update path publishes the key the committer already had.
+//
+// Section 12.4.2's rule is that the two must DIFFER, so every accepted commit in the corpus has
+// them differing and the comparison is indistinguishable from `false` over accepted inputs alone.
+func testCommitWhosePathLeafKeepsTheCommittersKey(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, _ := testFullCommitInput(t, crypto)
+	current := in.PreTree.Leaf(in.Committer)
+	if current == nil {
+		t.Fatalf("leaf %d of the pre tree is blank, so this fixture has no committer", in.Committer)
+	}
+	in.Commit.Path.LeafNode.EncryptionKey = slices.Clone(current.EncryptionKey)
+	return in
+}
+
+// testCommitWhoseVectorIsShorterThanItsList is the input checkListResolvesTheCommitsVector's LENGTH
+// clause is decidable over.
+//
+// The join holds the ProposalOrRef vector the sender signed to the list this member resolved it
+// into, and every fixture of this package builds the second from the first -- testCommitProposals
+// sets both from one set of entries so that a fixture cannot make them disagree by accident. That
+// is the right default and it left the two lengths equal in every input, so `!=` and `false` were
+// the same program.
+func testCommitWhoseVectorIsShorterThanItsList(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	testCommitProposals(t, in, testRemoveOf(LeafIndex(3)), testRemoveOf(LeafIndex(2)))
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	// the vector the sender signed names ONE of the two proposals the list resolves, which is
+	// the caller error this value exists to name
+	in.Commit.Proposals = slices.Clone(in.Commit.Proposals[:1])
+	return in
+}
+
+// testCommitWhosePathIsShorterThanItsFilteredDirectPath is the input ValSem202PathLength is
+// decidable over.
+//
+// Every other fixture fits its path to the committer's filtered direct path -- testFitCommitPath is
+// how they are built -- so the two lengths agreed everywhere and the comparison could have been
+// stated over either side alone.
+func testCommitWhosePathIsShorterThanItsFilteredDirectPath(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, _ := testFullCommitInput(t, crypto)
+	if len(in.Commit.Path.Nodes) == 0 {
+		t.Fatalf("this fixture's path already has no nodes, so there is nothing to shorten and the length rule stays undecidable")
+	}
+	in.Commit.Path.Nodes = slices.Clone(in.Commit.Path.Nodes[:len(in.Commit.Path.Nodes)-1])
+	return in
+}
+
+// testValidationInputRemovingItsOwnCommitter is the input validateCommitterIsNotRemoved is
+// decidable over, and testValidationInputCarryingTheCommittersOwnUpdate is ValSem111's.
+//
+// BOTH RULES REFUSE ON EQUALITY, so no accepted fixture can witness their comparisons agreeing --
+// and the last round left ValSem111's `updates[i].Sender == in.Committer` surviving a replacement
+// by `== LeafIndex(0)` for exactly that reason, dying in the full suite only to a gate about
+// bucket positions rather than to anything stated about the rule.
+func testValidationInputRemovingItsOwnCommitter(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	return testValidationInput(t, crypto, tree, testCommitterLeaf,
+		testProposalList(t, testRemoveOf(testCommitterLeaf)))
+}
+
+func testValidationInputCarryingTheCommittersOwnUpdate(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
+	update, _ := testUpdateProposalOf(t, crypto, members[testCommitterLeaf], testCommitterLeaf)
+	return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, update))
+}
+
+// testValidationInputAddingAKeyPackageForAnotherSuite is the input ValSem105's SUITE clause is
+// decidable over in the refusing direction.
+//
+// testValidationInputUnderTheOtherSuite already separates the ciphersuite as a DIMENSION -- a whole
+// group running the registry's other suite -- but in it the group and the add agree, as they must
+// for the input to be accepted. Separation is not discrimination: the comparison and `false` stay
+// the same program until some input has the two disagreeing.
+func testValidationInputAddingAKeyPackageForAnotherSuite(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	other := testOtherSuiteCrypto(t, crypto)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	kp, _, _ := testKeyPackage(t, other, testIdentity(t, other, "erin"))
+	return testValidationInput(t, crypto, tree, testCommitterLeaf,
+		testProposalList(t, testAddOf(kp)))
+}
+
+// testValidationInputWhoseAddReusesItsInitKey is the input ValSem104 is decidable over: an added
+// key package whose init key IS its own leaf's encryption key.
+func testValidationInputWhoseAddReusesItsInitKey(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+	kp.InitKey = slices.Clone(kp.LeafNode.EncryptionKey)
+	return testValidationInput(t, crypto, tree, testCommitterLeaf,
+		testProposalList(t, testAddOf(kp)))
+}
+
+// testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces is the input
+// validateUpdateChangesTheEncryptionKey is decidable over.
+//
+// THE LEAF IS RE-SIGNED after its key is put back, because the signature covers the whole leaf: an
+// update leaf edited and not re-signed is refused by validateUpdateLeafNodeIsValidForAnUpdate one
+// rule earlier, which would make this a fixture about signatures wearing the name of one about
+// keys.
+func testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces(t *testing.T,
+	crypto CryptoProvider) *ProposalValidationInput {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
+	replaced := tree.Leaf(LeafIndex(2))
+	if replaced == nil {
+		t.Fatalf("leaf 2 of this fixture's tree is blank, so there is no leaf for an update to republish")
+	}
+	leaf, _ := testUpdateLeafNode(t, crypto, members[2], testValidationGroupId(), LeafIndex(2))
+	leaf.EncryptionKey = slices.Clone(replaced.EncryptionKey)
+	return testValidationInput(t, crypto, tree, testCommitterLeaf,
+		testProposalList(t, testResignedUpdateOf(t, crypto, members[2], LeafIndex(2), leaf)))
+}
+
+// ---------------------------------------------------------------------------
 // the corpora
 // ---------------------------------------------------------------------------
+
+// validationFixtureRow is one entry of either corpus: the fixture, and the verdict the door it is a
+// fixture FOR must give it.
+//
+// THE VERDICT IS THE HALF THAT KILLS THE SURVIVORS, and it is stated ONCE over both doors because
+// stating it at one of them is what left three of them alive. Separating a dimension in the corpus
+// makes a production read distinguishable from a constant; it does not by itself make any test
+// NOTICE the difference. The proposal corpus has been driven through its door since the round that
+// built it, while the commit corpus was measured by a gate that never called ValidateCommit -- so
+// ten of fourteen commit fixtures were never judged by anything, and varying a corpus nothing runs
+// changes nothing. A row that expects a refusal names the sentinel, so a fixture that starts being
+// refused for a different reason is a failure rather than a pass.
+//
+// PARAMETERISED BY THE INPUT rather than written twice, for validationFixtureBuildersInSource's
+// reason one section down: a second door held by a weaker structure than the first is how the
+// first door's repairs stop reaching the second.
+type validationFixtureRow[Input any] struct {
+	build func(*testing.T, CryptoProvider) *Input
+	// refuses is the value the door must answer, or nil where it must accept.
+	refuses error
+}
 
 // commitFixtureCorpus is every fixture of this package that answers a commit validation input,
 // keyed by the name it is declared under.
@@ -499,63 +818,82 @@ func testWideValidationInput(t *testing.T, crypto CryptoProvider) *ProposalValid
 // KEYED BY THE DECLARED NAME because that is what the derivation below can read. Several of these
 // builders take arguments -- a tree, a list, an input to lead -- and the row supplies the ordinary
 // ones, so what is measured is the fixture as its callers use it rather than a zero value of it.
-func commitFixtureCorpus() map[string]func(*testing.T, CryptoProvider) *CommitValidationInput {
-	return map[string]func(*testing.T, CryptoProvider) *CommitValidationInput{
-		"testCommitInput": func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
-			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+func commitFixtureCorpus() map[string]validationFixtureRow[CommitValidationInput] {
+	return map[string]validationFixtureRow[CommitValidationInput]{
+		"testCommitInput": {build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+			tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
 			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
 			testCommitProposals(t, in, testRemoveOf(LeafIndex(2)))
+			// the path is fitted because the row is DRIVEN now and not only measured: a
+			// list carrying a Remove requires one, so the fixture this helper's own
+			// callers build is a commit with a path and this row used to be the one
+			// shape of it nothing ever asked a door about
+			testFitCommitPath(t, crypto, in, members[in.Committer])
 			return in
-		},
-		"testFullCommitInput": func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+		}},
+		"testFullCommitInput": {build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
 			in, _ := testFullCommitInput(t, crypto)
 			return in
-		},
-		"testCommitCarryingOneOfEveryBucket": testCommitCarryingOneOfEveryBucket,
-		"testCommitCarryingOneOfEveryBucketAndItsMembers": func(t *testing.T,
+		}},
+		"testCommitCarryingOneOfEveryBucket": {build: testCommitCarryingOneOfEveryBucket},
+		"testCommitCarryingOneOfEveryBucketAndItsMembers": {build: func(t *testing.T,
 			crypto CryptoProvider) *CommitValidationInput {
 			in, _ := testCommitCarryingOneOfEveryBucketAndItsMembers(t, crypto)
 			return in
-		},
-		"testCommitCarryingAnInnocentRemoveFirst": testCommitCarryingAnInnocentRemoveFirst,
-		"testCommitNamingACachedProposal":         testCommitNamingACachedProposal,
-		"testCommitNamingACachedRemove": func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+		}},
+		"testCommitCarryingAnInnocentRemoveFirst": {build: testCommitCarryingAnInnocentRemoveFirst},
+		"testCommitNamingACachedProposal":         {build: testCommitNamingACachedProposal},
+		"testCommitNamingACachedRemove": {build: func(t *testing.T,
+			crypto CryptoProvider) *CommitValidationInput {
 			in, _, _ := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
 			return in
-		},
-		"testCommitWideEnoughToPrice": testCommitWideEnoughToPrice,
-		"testCommitLedBy": func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+		}},
+		"testCommitWideEnoughToPrice": {build: testCommitWideEnoughToPrice},
+		"testCommitLedBy": {build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
 			return testCommitLedBy(t, testCommitCarryingOneOfEveryBucket(t, crypto),
 				testRemoveOf(LeafIndex(3)))
-		},
-		"testCommitInputOverTheTreeItsProposalsBuild":     testCommitInputOverTheTreeItsProposalsBuild,
-		"testWideCommitInput":                             testWideCommitInput,
-		"testCommitInputInASecondGroupAtALaterEpoch":      testCommitInputInASecondGroupAtALaterEpoch,
-		"testCommitInputUnderTheOtherSuite":               testCommitInputUnderTheOtherSuite,
-		"testCommitInputAnnouncingAnUnimplementedVersion": testCommitInputAnnouncingAnUnimplementedVersion,
+		}},
+		"testCommitInputOverTheTreeItsProposalsBuild": {
+			build: testCommitInputOverTheTreeItsProposalsBuild},
+		"testWideCommitInput": {build: testWideCommitInput},
+		"testCommitInputInASecondGroupAtALaterEpoch": {
+			build: testCommitInputInASecondGroupAtALaterEpoch},
+		"testCommitInputUnderTheOtherSuite": {build: testCommitInputUnderTheOtherSuite},
+		"testCommitInputAnnouncingAnUnimplementedVersion": {
+			build: testCommitInputAnnouncingAnUnimplementedVersion},
+		"testCommitTheCommitterJudgesItselfFromABlankSibling": {
+			build: testCommitTheCommitterJudgesItselfFromABlankSibling},
+		"testCommitAnnouncingExtensionsItDoesNotInstall": {
+			build:   testCommitAnnouncingExtensionsItDoesNotInstall,
+			refuses: errCommitExtensionsNotApplied},
+		"testCommitAnnouncingOneMoreExtensionThanItInstalls": {
+			build:   testCommitAnnouncingOneMoreExtensionThanItInstalls,
+			refuses: errCommitExtensionsNotApplied},
+		"testCommitWhosePathLeafRepublishesAnAddedKey": {
+			build:   testCommitWhosePathLeafRepublishesAnAddedKey,
+			refuses: errDuplicateEncryptionKey},
+		"testCommitWhosePathLeafRepublishesAnAddedInitKey": {
+			build:   testCommitWhosePathLeafRepublishesAnAddedInitKey,
+			refuses: errDuplicateEncryptionKey},
+		"testCommitWhosePathLeafRepublishesAnUpdatedKey": {
+			build:   testCommitWhosePathLeafRepublishesAnUpdatedKey,
+			refuses: errDuplicateEncryptionKey},
+		"testCommitWhosePathLeafKeepsTheCommittersKey": {
+			build:   testCommitWhosePathLeafKeepsTheCommittersKey,
+			refuses: errPathLeafKeyUnchanged},
+		"testCommitWhoseVectorIsShorterThanItsList": {
+			build:   testCommitWhoseVectorIsShorterThanItsList,
+			refuses: errCommitProposalsNotResolved},
+		"testCommitWhosePathIsShorterThanItsFilteredDirectPath": {
+			build:   testCommitWhosePathIsShorterThanItsFilteredDirectPath,
+			refuses: errPathLength},
 	}
-}
-
-// proposalFixtureRow is one entry of the section 12.2 corpus: the fixture, and the verdict the door
-// it is a fixture FOR must give it.
-//
-// THE VERDICT IS THE HALF THAT KILLS THE SURVIVORS. Separating a dimension in the corpus makes a
-// production read distinguishable from a constant; it does not by itself make any test NOTICE the
-// difference, and the commit corpus is measured by a gate that never calls ValidateCommit. All five
-// of the reads this round was sent to close are reached only from ValidateProposalList, so the
-// corpus is driven through it and each row says what must come back. A row that expects a refusal
-// names the sentinel, so a fixture that starts being refused for a different reason is a failure
-// rather than a pass.
-type proposalFixtureRow struct {
-	build func(*testing.T, CryptoProvider) *ProposalValidationInput
-	// refuses is the value ValidateProposalList must answer, or nil where it must accept.
-	refuses error
 }
 
 // proposalFixtureCorpus is every fixture of this package that answers a section 12.2 validation
 // input, keyed by the name it is declared under.
-func proposalFixtureCorpus() map[string]proposalFixtureRow {
-	return map[string]proposalFixtureRow{
+func proposalFixtureCorpus() map[string]validationFixtureRow[ProposalValidationInput] {
+	return map[string]validationFixtureRow[ProposalValidationInput]{
 		"testValidationInput": {build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
 			return testValidationInput(t, crypto, tree, LeafIndex(0),
@@ -575,6 +913,21 @@ func proposalFixtureCorpus() map[string]proposalFixtureRow {
 		"testValidationInputOnAClockPastTheAddsLifetime": {
 			build:   testValidationInputOnAClockPastTheAddsLifetime,
 			refuses: ErrLeafNodeLifetime},
+		"testValidationInputRemovingItsOwnCommitter": {
+			build:   testValidationInputRemovingItsOwnCommitter,
+			refuses: ErrRemoveCommitter},
+		"testValidationInputCarryingTheCommittersOwnUpdate": {
+			build:   testValidationInputCarryingTheCommittersOwnUpdate,
+			refuses: ErrSelfUpdateInCommit},
+		"testValidationInputAddingAKeyPackageForAnotherSuite": {
+			build:   testValidationInputAddingAKeyPackageForAnotherSuite,
+			refuses: ErrSuiteMismatch},
+		"testValidationInputWhoseAddReusesItsInitKey": {
+			build:   testValidationInputWhoseAddReusesItsInitKey,
+			refuses: ErrInitEqualsEncryptionKey},
+		"testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces": {
+			build:   testValidationInputWhoseUpdateRepublishesTheLeafKeyItReplaces,
+			refuses: ErrUpdateEncryptionKeyUnchanged},
 	}
 }
 
@@ -1053,9 +1406,32 @@ const corpusClockSeparation = 365 * 24 * time.Hour
 type corpusFixtureUnderTest struct {
 	name       string
 	dimensions map[string][]string
-	leaves     []LeafIndex
-	order      []CachedProposal
-	now        time.Time
+	// relations is what this fixture witnesses about every PAIR of paths its door compares,
+	// keyed by the pair as fixture_relations_test.go derives it. A dimension claim cannot see a
+	// corpus whose dimensions are separately varied and JOINTLY degenerate, and both survivors
+	// of the last round were exactly that shape.
+	relations map[string]corpusPairVerdict
+	leaves    []LeafIndex
+	order     []CachedProposal
+	now       time.Time
+}
+
+// corpusFixtureReducedTo is one built fixture reduced to everything the claims below read, written
+// once so that the two doors' loops cannot come to measure different things.
+//
+// IT TAKES THE INPUT AS an empty interface ON PURPOSE. A helper whose PARAMETER were a
+// *CommitValidationInput would be fine; one whose RESULT were is a fixture builder as far as
+// validationFixtureBuildersInSource is concerned -- that walk is over the result type, which is the
+// whole of what makes it unfoolable -- so nothing here answers an input and only the reduction
+// leaves the loop.
+func corpusFixtureReducedTo(crypto CryptoProvider, name string, in any, list *ProposalList,
+	now time.Time, pairs []comparisonPair) corpusFixtureUnderTest {
+
+	dimensions := corpusDimensionsOf(crypto, in)
+	corpusListDimensionsInto(crypto, dimensions, list)
+	return corpusFixtureUnderTest{name: name, dimensions: dimensions,
+		relations: corpusRelationVerdictsOf(crypto, in, pairs),
+		leaves:    corpusLeafIndicesOf(in), order: list.All(), now: now}
 }
 
 // fixtureCorporaUnderMeasurement is the corpus of every door, keyed by the validation input it is a
@@ -1073,16 +1449,21 @@ func fixtureCorporaUnderMeasurement() map[string]func(*testing.T,
 	CryptoProvider) ([]corpusFixtureUnderTest, int) {
 
 	return map[string]func(*testing.T, CryptoProvider) ([]corpusFixtureUnderTest, int){
-		"CommitValidationInput": func(t *testing.T,
+		// KEYED BY THE TYPE ITSELF and not by its name spelled out, so that the join to
+		// validationInputTypesInSource cannot be satisfied by a string that has drifted from
+		// the type it names
+		reflect.TypeFor[CommitValidationInput]().Name(): func(t *testing.T,
 			crypto CryptoProvider) ([]corpusFixtureUnderTest, int) {
 
 			measured := measureCommitCorpus(t, crypto)
 			return measured.fixtures, measured.expected
 		},
-		"ProposalValidationInput": func(t *testing.T,
+		reflect.TypeFor[ProposalValidationInput]().Name(): func(t *testing.T,
 			crypto CryptoProvider) ([]corpusFixtureUnderTest, int) {
 
 			corpus := proposalFixtureCorpus()
+			pairs, _ := doorComparisonPairs(t)
+			compared := pairs[reflect.TypeFor[ProposalValidationInput]().Name()]
 			built := []corpusFixtureUnderTest{}
 			for _, name := range slices.Sorted(maps.Keys(corpus)) {
 				// EACH FIXTURE IS BUILT INSIDE ITS OWN SUBTEST, and that is not
@@ -1097,11 +1478,8 @@ func fixtureCorporaUnderMeasurement() map[string]func(*testing.T,
 				if in == nil {
 					continue
 				}
-				dimensions := corpusDimensionsOf(crypto, in)
-				corpusListDimensionsInto(crypto, dimensions, in.List)
-				built = append(built, corpusFixtureUnderTest{name: name,
-					dimensions: dimensions, leaves: corpusLeafIndicesOf(in),
-					order: in.List.All(), now: in.Now})
+				built = append(built, corpusFixtureReducedTo(crypto, name, in, in.List,
+					in.Now, compared))
 			}
 			return built, len(corpus)
 		},
@@ -1127,18 +1505,17 @@ type commitCorpusMeasurement struct {
 func measureCommitCorpus(t *testing.T, crypto CryptoProvider) commitCorpusMeasurement {
 	t.Helper()
 	corpus := commitFixtureCorpus()
+	pairs, _ := doorComparisonPairs(t)
+	compared := pairs[reflect.TypeFor[CommitValidationInput]().Name()]
 	measured := commitCorpusMeasurement{expected: len(corpus)}
 	for _, name := range slices.Sorted(maps.Keys(corpus)) {
 		var in *CommitValidationInput
-		t.Run(name, func(t *testing.T) { in = corpus[name](t, crypto) })
+		t.Run(name, func(t *testing.T) { in = corpus[name].build(t, crypto) })
 		if in == nil {
 			continue
 		}
-		dimensions := corpusDimensionsOf(crypto, in)
-		corpusListDimensionsInto(crypto, dimensions, in.List)
-		measured.fixtures = append(measured.fixtures, corpusFixtureUnderTest{name: name,
-			dimensions: dimensions, leaves: corpusLeafIndicesOf(in),
-			order: in.List.All(), now: in.Now})
+		measured.fixtures = append(measured.fixtures,
+			corpusFixtureReducedTo(crypto, name, in, in.List, in.Now, compared))
 		same, err := testTreesHashAlike(t, crypto, in.PreTree, in.PostTree)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -1152,21 +1529,30 @@ func measureCommitCorpus(t *testing.T, crypto CryptoProvider) commitCorpusMeasur
 
 // assertCorpusSeparatesItsDimensions is the gate, written once and stated at both doors.
 //
-// FIVE CLAIMS, and the first is the class while the other four are shapes that class cannot see.
+// SIX CLAIMS. Two of them are classes -- every dimension, and every RELATION between two dimensions
+// -- and the other four are shapes neither class can see.
 //
 //	no dimension is one value across the corpus     -- the class itself
+//	no pair the doors compare is jointly degenerate -- the second class, and see below
 //	the widest leaf index does not fit in one octet -- a comparator truncated to its low octet
 //	a commit order longer than one entry exists     -- a loop against a read of its head
 //	one fixture's clock is not the wall clock       -- in.Now against a call to time.Now()
 //	the commit order is measured at all             -- the accessor call being dropped
 //
-// THE LAST FOUR ARE NOT INSTANCES OF THE FIRST. A list's length is not a value at any path, the
-// widest leaf index lives below the hop bound, and a corpus whose clocks are eleven distinct calls
-// to time.Now() separates the Now dimension while leaving the field and the call the same program.
-// Each is named with the mutation it exists to make fail, which is what the first claim gives every
-// other dimension for free.
+// THE RELATION CLAIM IS NOT AN INSTANCE OF THE DIMENSION CLAIM and this file's last round is the
+// proof: Own took four values and Committer took four, so both were separated, and every fixture
+// still had Own == 0 with Committer != 0 -- so ValSem203PathDecrypt's `in.Own == in.Committer` and
+// the constant `in.Own == LeafIndex(0)` were the same program. Separation is not discrimination.
+// Which pairs are demanded is derived off this package's own source; see
+// fixture_relations_test.go.
+//
+// THE LAST FOUR ARE INSTANCES OF NEITHER. A list's length is not a value at any path, the widest
+// leaf index lives below the hop bound, and a corpus whose clocks are eleven distinct calls to
+// time.Now() separates the Now dimension while leaving the field and the call the same program.
+// Each is named with the mutation it exists to make fail, which is what the two classes give every
+// other dimension and every other pair for free.
 func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int,
-	fixtures []corpusFixtureUnderTest) {
+	fixtures []corpusFixtureUnderTest, compared []comparisonPair) {
 
 	t.Helper()
 	if len(fixtures) < expected {
@@ -1243,6 +1629,63 @@ func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int
 		t.Errorf("every fixture in the %s corpus carries a clock within %s of now, so in.Now and a call to time.Now() answer every lifetime alike and the field is the call. Give one fixture a clock a lifetime is decided differently under",
 			label, corpusClockSeparation)
 	}
+	assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t, label, fixtures, compared)
+}
+
+// assertCorpusSeparatesEveryRelationItsDoorDecidesBy is the second class: for every pair of paths
+// this door's rules compare, the corpus holds a fixture where the two are equal and one where they
+// are not.
+//
+// WHY BOTH WITNESSES. A pair that is equal in every fixture cannot tell `a == b` from `a == a`, and
+// one that is equal in none cannot tell it from `false`; either way the comparison and a constant
+// are the same program over this corpus, which is the whole of what "the fixtures cannot see it"
+// means. Requiring both is what makes the comparison a comparison.
+//
+// A PAIR THE CORPUS NEVER REACHES IS A FAILURE AND NOT A PASS. The alternative -- skipping a pair
+// no fixture populates -- is a claim that goes green by the corpus getting emptier, which is the
+// direction every regression here has taken. A rule reading a field no fixture fills is a rule
+// nothing measures, and the derivation is what says the rule exists.
+func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label string,
+	fixtures []corpusFixtureUnderTest, compared []comparisonPair) {
+
+	t.Helper()
+	if len(compared) == 0 {
+		t.Errorf("no rule of this package was derived as comparing two paths of a %s, so the relation claim over its corpus holds vacuously",
+			label)
+		return
+	}
+	separated := 0
+	for _, pair := range compared {
+		equalIn, differIn, reachedIn := []string{}, []string{}, []string{}
+		for _, fixture := range fixtures {
+			verdict := fixture.relations[pair.String()]
+			if !verdict.reached {
+				continue
+			}
+			reachedIn = append(reachedIn, fixture.name)
+			if verdict.equal {
+				equalIn = append(equalIn, fixture.name)
+			}
+			if verdict.differ {
+				differIn = append(differIn, fixture.name)
+			}
+		}
+		switch {
+		case len(reachedIn) == 0:
+			t.Errorf("%s: %s is compared by %s and no fixture in the corpus reaches both of its sides, so that rule is stated over values nothing here carries",
+				label, pair, pair.in)
+		case len(equalIn) == 0:
+			t.Errorf("%s: %s is compared by %s and the two are unequal in every fixture that reaches them (%v), so that comparison and the constant `false` are the same program here. Give the corpus a fixture where they agree -- if agreeing is what the rule refuses, the fixture's row owes the sentinel it is refused by",
+				label, pair, pair.in, reachedIn)
+		case len(differIn) == 0:
+			t.Errorf("%s: %s is compared by %s and the two are equal in every fixture that reaches them (%v), so that comparison and a comparison of either side against itself are the same program here. Give the corpus a fixture where they disagree",
+				label, pair, pair.in, reachedIn)
+		default:
+			separated += 1
+		}
+	}
+	t.Logf("%s: %d of %d compared pairs are witnessed both equal and unequal", label, separated,
+		len(compared))
 }
 
 // TestEveryValidationInputCorpusSeparatesEveryDimensionItDecidesOff is the gate the four rounds
@@ -1256,6 +1699,7 @@ func TestEveryValidationInputCorpusSeparatesEveryDimensionItDecidesOff(t *testin
 			declared)
 	}
 	corpora := fixtureCorporaUnderMeasurement()
+	pairs, _ := doorComparisonPairs(t)
 	for _, name := range declared {
 		measure, measured := corpora[name]
 		if !measured {
@@ -1264,7 +1708,7 @@ func TestEveryValidationInputCorpusSeparatesEveryDimensionItDecidesOff(t *testin
 			continue
 		}
 		fixtures, expected := measure(t, crypto)
-		assertCorpusSeparatesItsDimensions(t, name, expected, fixtures)
+		assertCorpusSeparatesItsDimensions(t, name, expected, fixtures, pairs[name])
 	}
 	for _, name := range slices.Sorted(maps.Keys(corpora)) {
 		if !slices.Contains(declared, name) {
@@ -1283,36 +1727,121 @@ func TestTheCommitCorpusIsJudgedBetweenTwoTreesThatDiffer(t *testing.T) {
 	}
 }
 
-// TestEveryProposalFixtureIsJudgedTheWayItsRowSays drives the corpus through the door it is a
-// corpus for.
+// ---------------------------------------------------------------------------
+// the corpora, driven through the doors they are corpora for
+// ---------------------------------------------------------------------------
+
+// fixtureCorporaUnderTheirDoors is every corpus DRIVEN, keyed by the validation input it is a
+// corpus of, and it is a registry for fixtureCorporaUnderMeasurement's reason: two tests, one of
+// which gets deleted, is the shape this defect takes, and the set of keys is joined below to the
+// set of input types this package's own source declares.
+//
+// IT IS A SEPARATE REGISTRY FROM THE MEASUREMENT because the two answer different questions and one
+// of them used to be asked at one door only. Measuring a corpus says a value is separable from a
+// constant; DRIVING it is what makes some test notice the difference. Until this round the commit
+// corpus was measured and never driven -- ten of its fourteen fixtures were built by nothing but
+// the dimension walk -- so varying it changed no verdict anywhere, which is why all three of the
+// last round's survivors were commit-door reads.
+func fixtureCorporaUnderTheirDoors() map[string]func(*testing.T, CryptoProvider) (int, int) {
+	return map[string]func(*testing.T, CryptoProvider) (int, int){
+		reflect.TypeFor[CommitValidationInput]().Name(): func(t *testing.T,
+			crypto CryptoProvider) (int, int) {
+
+			return assertCorpusIsJudgedTheWayItsRowsSay(t, crypto, commitFixtureCorpus(),
+				ValidateCommit)
+		},
+		reflect.TypeFor[ProposalValidationInput]().Name(): func(t *testing.T,
+			crypto CryptoProvider) (int, int) {
+
+			return assertCorpusIsJudgedTheWayItsRowsSay(t, crypto, proposalFixtureCorpus(),
+				ValidateProposalList)
+		},
+	}
+}
+
+// assertCorpusIsJudgedTheWayItsRowsSay drives one corpus through its door and answers how many
+// fixtures it drove and how many of them the door had to refuse.
 //
 // SEPARATING A DIMENSION DOES NOT BY ITSELF MAKE ANY TEST NOTICE IT. The gate above measures
-// fixtures and calls no door; the five reads this round was sent to close are all inside
-// ValidateProposalList, and each becomes decidable only when some test drives an input whose value
-// differs from the constant AND asserts what comes back. This is that test, and the corpus is
-// exactly the set of inputs it is stated over -- so a fixture added to separate a dimension is also
-// a fixture the door is held to, and a fixture that quietly stops being accepted is a failure here
-// rather than a silent weakening of the corpus.
-func TestEveryProposalFixtureIsJudgedTheWayItsRowSays(t *testing.T) {
-	crypto := testCrypto(t)
-	corpus := proposalFixtureCorpus()
+// fixtures and calls no door; a read becomes decidable only when some test drives an input whose
+// value differs from the constant AND asserts what comes back. This is that test, and the corpus is
+// exactly the set of inputs it is stated over -- so a fixture added to separate a dimension or a
+// relation is also a fixture the door is held to, and a fixture that quietly stops being accepted
+// is a failure here rather than a silent weakening of the corpus.
+//
+// EACH FIXTURE IN ITS OWN SUBTEST for the reason the measurement loop gives: a builder answers
+// t.Fatalf when its own precondition stops holding, and one such failure must not take the other
+// rows' verdicts with it.
+func assertCorpusIsJudgedTheWayItsRowsSay[Input any](t *testing.T, crypto CryptoProvider,
+	corpus map[string]validationFixtureRow[Input], door func(*Input) error) (int, int) {
+
+	t.Helper()
+	driven, refused := 0, 0
 	for _, name := range slices.Sorted(maps.Keys(corpus)) {
 		row := corpus[name]
-		t.Run(name, func(t *testing.T) {
-			in := row.build(t, crypto)
-			failure := ValidateProposalList(in)
+		if row.refuses != nil {
+			refused += 1
+		}
+		var in *Input
+		t.Run(name, func(t *testing.T) { in = row.build(t, crypto) })
+		if in == nil {
+			continue
+		}
+		driven += 1
+		t.Run(name+"/verdict", func(t *testing.T) {
+			failure := door(in)
 			switch {
 			case row.refuses == nil && failure != nil:
-				t.Fatalf("ValidateProposalList refused this fixture: %v. A fixture no door accepts measures nothing about the doors; if the refusal is correct the row owes a sentinel, and if it is not the fixture is wrong",
+				t.Fatalf("the door refused this fixture: %v. A fixture no door accepts measures nothing about the doors; if the refusal is correct the row owes a sentinel, and if it is not the fixture is wrong",
 					failure)
 			case row.refuses != nil && failure == nil:
-				t.Fatalf("ValidateProposalList accepted this fixture and its row says it must answer %v",
+				t.Fatalf("the door accepted this fixture and its row says it must answer %v",
 					row.refuses)
 			case row.refuses != nil && !errors.Is(failure, row.refuses):
-				t.Fatalf("ValidateProposalList answered %v and this fixture's row says %v; a fixture refused for another reason is one that no longer reaches the rule it was built for",
+				t.Fatalf("the door answered %v and this fixture's row says %v; a fixture refused for another reason is one that no longer reaches the rule it was built for",
 					failure, row.refuses)
 			}
 		})
+	}
+	return driven, refused
+}
+
+// TestEveryValidationInputCorpusIsJudgedTheWayItsRowsSay drives every corpus through its own door.
+//
+// AND HOLDS EACH ONE TO CARRYING A REFUSAL. A corpus of accepted inputs alone cannot witness the
+// agreeing side of any rule that refuses on equality -- ValSem104, ValSem111, ValSem204, ValSem206,
+// validateCommitterIsNotRemoved and validateUpdateChangesTheEncryptionKey are six of them -- so a
+// corpus with no refusing row is one whose relation claims can only ever be half stated. That is
+// what the commit corpus was until this round: rows with no verdict field at all.
+func TestEveryValidationInputCorpusIsJudgedTheWayItsRowsSay(t *testing.T) {
+	crypto := testCrypto(t)
+	declared := validationInputTypesInSource(t)
+	if len(declared) < 2 {
+		t.Fatalf("this package's source declares %v validation input types; the derivation read something other than the package",
+			declared)
+	}
+	driven := fixtureCorporaUnderTheirDoors()
+	for _, name := range declared {
+		drive, drives := driven[name]
+		if !drives {
+			t.Errorf("this package declares %s and no corpus in this file is driven through its door, so every fixture of that door is measured and judged by nothing",
+				name)
+			continue
+		}
+		built, refused := drive(t, crypto)
+		if built == 0 {
+			t.Errorf("no fixture of the %s corpus could be built, so its door was asked nothing", name)
+		}
+		if refused == 0 {
+			t.Errorf("no row of the %s corpus names a refusal, so no fixture of it can witness a rule that refuses on equality agreeing, and every such rule stays indistinguishable from `return nil`",
+				name)
+		}
+		t.Logf("%s: %d fixtures driven, %d of them refused by their row", name, built, refused)
+	}
+	for _, name := range slices.Sorted(maps.Keys(driven)) {
+		if !slices.Contains(declared, name) {
+			t.Errorf("this file drives a corpus of %s and this package declares no such type", name)
+		}
 	}
 }
 
