@@ -451,6 +451,10 @@ type comparisonWalk struct {
 // is past the deepest chain of door logic this package writes -- a rule, the join it delegates to,
 // and the accessor that join reads its two entries through -- and what lies deeper is a utility
 // shared with the rest of the package rather than a decision either door makes.
+//
+// AND IT IS MEASURED RATHER THAN ASSERTED, because a bound nobody checked is the shape half this
+// file exists to refuse: at eight hops the walk finds the same twenty-five pairs it finds at three,
+// so this number is past the end of the graph rather than in the middle of it.
 const comparisonCallHops = 3
 
 // boundParametersOf binds one call's arguments to the callee's parameters, and its receiver to the
@@ -1087,6 +1091,54 @@ func corpusIndirect(value reflect.Value) reflect.Value {
 // ---------------------------------------------------------------------------
 // the derivation, held to being a derivation
 // ---------------------------------------------------------------------------
+
+// TestTheDroppedBindingClaimSeesADroppedBinding is the control the claim in
+// TestEveryDoorComparisonIsReadOffThisPackagesSource is worth nothing without.
+//
+// A CHECKER THAT REPORTS NOTHING PASSES EVERYTHING, which is the defect one level up from the one
+// bindingsLostIn exists to catch: if its statement walk stopped matching, the class could shrink
+// silently again and this file would say so in exactly the same words. So it is run over a body
+// this test holds -- a rule binding two locals out of a commit input, one with `var` and one with
+// `:=` -- and held to BOTH answers: nothing lost against the bindings localsIn really makes, and
+// every one of them lost against a walk that made none.
+//
+// THE CONTROL IS PARSED TEXT rather than a fixture of the package, which is crypto_test.go's own
+// idiom one file over: a body known to violate the rule, held beside the real one, so the matcher
+// is exercised in both directions on every run.
+func TestTheDroppedBindingClaimSeesADroppedBinding(t *testing.T) {
+	control := mustParseText(t, "control_relations.go", `package mls
+
+func controlRuleBindingTwoLocals(in *CommitValidationInput) error {
+	var key = in.Commit.Path.LeafNode.EncryptionKey
+	adds := in.List.Adds()
+	for i := range adds {
+		if subtle.ConstantTimeCompare(adds[i].Proposal.Add.KeyPackage.InitKey, key) == 1 {
+			return errDuplicateEncryptionKey
+		}
+	}
+	return nil
+}
+`)
+	function := control.declarationOf(t, "", "controlRuleBindingTwoLocals")
+	roots := rootsOfType(control, function, reflect.TypeFor[CommitValidationInput]().Name())
+	if len(roots) == 0 {
+		t.Fatalf("the control body names no commit validation input, so neither half below reads anything")
+	}
+	held := localsIn(function.Body, roots, nil)
+	if lost := bindingsLostIn(function.Body, roots, held); len(lost) != 0 {
+		t.Errorf("the walk binds every local of the control and the claim reports %v lost, so it fires on bodies it has no complaint about",
+			lost)
+	}
+	// EVERY local the control binds out of its input, named here because the control is written
+	// three lines up: this is the answer a walk that bound nothing owes, and a claim that
+	// answered less than it would be one that reports only some of what it loses.
+	blind := bindingsLostIn(function.Body, roots, map[string][]pPath{})
+	slices.Sort(blind)
+	if want := []string{"adds", "key"}; !slices.Equal(blind, want) {
+		t.Errorf("against a walk that bound nothing the claim reports %v lost and the control binds %v out of its input, so it is not seeing what it says it sees",
+			blind, want)
+	}
+}
 
 // TestEveryDoorComparisonIsReadOffThisPackagesSource is what stops the class above from quietly
 // becoming empty.

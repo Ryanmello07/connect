@@ -276,18 +276,20 @@ func testCommitInputInASecondGroupAtALaterEpoch(t *testing.T,
 	in.ConfirmationKey = crypto.Random(crypto.HashSize())
 	in.ConfirmedHash = crypto.Hash([]byte("the second group's confirmed hash"))
 	in.ConfirmationTag = crypto.Mac(in.ConfirmationKey, in.ConfirmedHash)
-	// AND ITS CACHE IS STILL BOUND TO THE EPOCH IT LEFT, which is the other direction of
-	// bindingHolds and the one no fixture held. The corpus already carries commits whose cache
-	// belongs to another group -- so the two comparisons had a witness where they disagree --
-	// and in every one of those the cache sat at epoch 1 of group "group" while the caller did
-	// too, so `self.binding.epoch == 1` and `self.binding.epoch == epoch` were one program.
-	// Here the binding carries exactly those two values while the caller carries neither.
+	// AND ITS CACHE IS STILL BOUND TO THE EPOCH THIS GROUP LEFT, which is bindingHolds' other
+	// half and the one no fixture held. It is bound to THIS group at an earlier epoch rather
+	// than to another group, so the epoch comparison is the only one that disagrees here and the
+	// group comparison is the only one that disagrees in
+	// testCommitWhosePendingCacheBelongsToAnotherGroup: two comparisons joined by an AND are two
+	// clauses answering one bool, and a corpus that moves both at once holds neither.
 	//
 	// NOTHING NAMES THE CACHE, so this stays an accepted commit: entryTheCommitNames consults it
 	// only for a by-reference entry and both of this fixture's proposals are carried by value.
 	// A door that came to refuse a stale cache outright would fail this row rather than pass it
 	// quietly, which is the right way round for a fact nobody has stated as a rule.
-	in.Pending = testCacheAt(t, testResolveContext())
+	stale := *in.Context
+	stale.Epoch = 1
+	in.Pending = testCacheAt(t, &stale)
 	testCommitProposals(t, in, testRemoveOf(LeafIndex(3)), testRemoveOf(LeafIndex(2)))
 	testFitCommitPath(t, crypto, in, members[in.Committer])
 	if failure := ValidateCommit(in); failure != nil {
@@ -952,9 +954,12 @@ func testCommitFromLeafZeroJudgedFromTheLeafItsCommitterUsuallyOccupies(t *testi
 // entry. Every fixture that carried a cache at all built that cache AT this input's own context, so
 // both comparisons and the constant `true` were the same program here.
 //
-// BOTH HALVES MOVE, because bindingHolds is an AND of two comparisons and its own header says why
-// neither is an identity alone: every group this client belongs to runs an epoch 7, and the group
-// alone is the replay it exists to refuse.
+// ONLY THE GROUP MOVES, and the epoch is deliberately left where it is. bindingHolds is an AND of
+// two comparisons answering one bool, so a fixture in which both halves disagree is refused by
+// either half alone -- which is the extension join's defect two files over, and it would leave the
+// corpus unable to tell a cache check that reads the group from one that reads both. The epoch half
+// gets its own witness on testCommitInputInASecondGroupAtALaterEpoch, whose cache stays at the
+// epoch that group has left.
 func testCommitWhosePendingCacheBelongsToAnotherGroup(t *testing.T,
 	crypto CryptoProvider) *CommitValidationInput {
 
@@ -969,10 +974,42 @@ func testCommitWhosePendingCacheBelongsToAnotherGroup(t *testing.T,
 	held := testCachedRemoveOf(t, crypto, cache, testHeldRemoveTarget)
 	elsewhere := *in.Context
 	elsewhere.GroupId = testSecondGroupId()
-	elsewhere.Epoch = testSecondEpoch
 	if failure := cache.Rebind(testVerifiedContextAt(t, &elsewhere)); failure != nil {
 		t.Fatalf("Rebind this fixture's cache to epoch %d of group %x: %v",
 			elsewhere.Epoch, elsewhere.GroupId, failure)
+	}
+	in.Pending = cache
+	in.List = testProposalList(t, held)
+	in.Commit.Proposals = []ProposalOrRef{
+		{Type: ProposalOrRefTypeReference, Reference: held.Ref},
+	}
+	testFitCommitPath(t, crypto, in, members[in.Committer])
+	return in
+}
+
+// testCommitWhosePendingCacheBelongsToALaterEpoch is the third of the cache fixtures, and it is the
+// epoch comparison read from the other side.
+//
+// A CLAUSE NEEDS A WITNESS IN BOTH DIRECTIONS WHEN ITS TWO SIDES ARE BOTH FIELDS. The corpus agrees
+// on the epoch at ONE value -- epoch 1, which is where almost every fixture lives -- so
+// `self.binding.epoch == 1` stands in for the comparison unless some fixture carries epoch 1 on
+// EACH side while the two disagree. testCommitInputInASecondGroupAtALaterEpoch carries it on the
+// binding, being a caller in epoch 9 holding a cache still at 1; this carries it on the caller,
+// being a caller in epoch 1 holding a cache that has been moved on to 9. Neither alone is enough,
+// because `caller.epoch == 1` and `binding.epoch == 1` are two different constant rules.
+func testCommitWhosePendingCacheBelongsToALaterEpoch(t *testing.T,
+	crypto CryptoProvider) *CommitValidationInput {
+
+	t.Helper()
+	in, members := testFullCommitInput(t, crypto)
+	// stored first and rebound after, for the reason the group fixture above records
+	cache := testCacheAt(t, testResolveContext())
+	held := testCachedRemoveOf(t, crypto, cache, testHeldRemoveTarget)
+	ahead := *in.Context
+	ahead.Epoch = testSecondEpoch
+	if failure := cache.Rebind(testVerifiedContextAt(t, &ahead)); failure != nil {
+		t.Fatalf("Rebind this fixture's cache to epoch %d of group %x: %v",
+			ahead.Epoch, ahead.GroupId, failure)
 	}
 	in.Pending = cache
 	in.List = testProposalList(t, held)
@@ -1206,6 +1243,9 @@ func commitFixtureCorpus() map[string]validationFixtureRow[CommitValidationInput
 			build: testCommitCarryingAProposalUnderItsOwnTypeAsTheUnknownOne},
 		"testCommitWhosePendingCacheBelongsToAnotherGroup": {
 			build:   testCommitWhosePendingCacheBelongsToAnotherGroup,
+			refuses: errProposalNotCached},
+		"testCommitWhosePendingCacheBelongsToALaterEpoch": {
+			build:   testCommitWhosePendingCacheBelongsToALaterEpoch,
 			refuses: errProposalNotCached},
 		"testCommitAnnouncingOneMoreExtensionThanItInstalls": {
 			build:   testCommitAnnouncingOneMoreExtensionThanItInstalls,
