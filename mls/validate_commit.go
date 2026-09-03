@@ -269,6 +269,17 @@ func (self *CommitValidationInput) check() error {
 	if err := checkProposalListStructure(self.List); err != nil {
 		return err
 	}
+	// AND THE LIST CARRIES AT MOST ONE GroupContextExtensions PROPOSAL, because the extension join
+	// three clauses down decides the set this commit installs off (*ProposalList).Extensions, which
+	// answers GCE[0]. Deciding off the first of two is the very fault this door is being repaired
+	// for, one field further in, so it is established here rather than left to ValSem208 -- a rule
+	// that runs ninth, after the join that reads it. Stated here rather than inherited from the
+	// section 12.2 door the bucket join goes through, on ValidateProposalList's terms: the two are
+	// redundant wherever both run, and a precondition a reader has to trace through another rule's
+	// delegate to find is one the next edit reorders away.
+	if err := checkOneGroupContextExtensions(self.List); err != nil {
+		return err
+	}
 	// AND THE BUCKETS ARE THE COMMIT ORDER BUCKETED BY TYPE, which is the second of the three
 	// joins this door owes and was the one it did not ask.
 	//

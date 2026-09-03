@@ -2637,6 +2637,58 @@ func proposalListDoorAnswer(t *testing.T, what string, door proposalListDoor,
 }
 
 
+// TestEveryDoorHandedAProposalListRefusesOneCarryingTwoGroupContextExtensions is the same class as
+// the missing arm above, over the source every reader of the installed extension set decides off.
+//
+// (*ProposalList).Extensions answers GCE[0], and that index is exact only for a list nothing
+// carries two in. The rule refusing the second ran FIFTH inside ValidateProposalList and NINTH
+// inside ValidateCommit, so every other door of the two validators -- and each of the twenty odd
+// is exported -- decided ValSem106's required capabilities, ValSem109's, the section 12.1.2 update
+// rules' and the commit door's own extension join off the first of two sets with nothing saying
+// which. Both check methods now ask it, and this holds every door to that.
+//
+// THE SECOND PROPOSAL IS THE OFFENDER, so a door that read GCE[0] and stopped cannot refuse this
+// list at all. The doors are read off the production slices, so a rule added later is held to this
+// without anybody adding a row.
+func TestEveryDoorHandedAProposalListRefusesOneCarryingTwoGroupContextExtensions(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	doors := proposalListDoors(t)
+	if len(doors) < 20 {
+		t.Fatalf("the sweep found %d doors, and this package declares two aggregates and more than twenty rules between them",
+			len(doors))
+	}
+	first := testGceOf(Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy,
+		ExtensionData: []byte{0x01}})
+	second := testGceOf(Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy,
+		ExtensionData: []byte{0x02}})
+	refusing := 0
+	for _, name := range slices.Sorted(maps.Keys(doors)) {
+		door := doors[name]
+		if !door.refuses {
+			continue
+		}
+		refusing += 1
+		answered := proposalListDoorAnswer(t,
+			name+" over a list carrying two group_context_extensions proposals", door,
+			crypto, tree, testProposalList(t, first, second))
+		if !errors.Is(answered, errMultipleGroupContextExtensions) {
+			t.Errorf("%s over a list carrying two group_context_extensions proposals answered %v, want errMultipleGroupContextExtensions; the extension set every rule behind this door is judged against would otherwise be the first of two and nothing would say which",
+				name, answered)
+		}
+	}
+	if refusing == 0 {
+		t.Fatal("no door of the sweep refuses anything, so this drove nothing")
+	}
+	// the control: one alone is accepted, so the refusals above are about the SECOND proposal and
+	// not about a group_context_extensions proposal these doors cannot take
+	if failure := ValidateProposalList(testValidationInput(t, crypto, tree, LeafIndex(0),
+		testProposalList(t, first))); failure != nil {
+		t.Fatalf("ValidateProposalList refused a list carrying ONE group_context_extensions proposal: %v; every refusal above could then be that",
+			failure)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // which source each rule decides off, and the door that establishes it
 // ---------------------------------------------------------------------------

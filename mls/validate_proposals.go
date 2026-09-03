@@ -76,7 +76,19 @@ func (self *ProposalValidationInput) check() error {
 	if self.Context == nil {
 		return fmt.Errorf("%w: the version, the suite and the group extensions are its", ErrNilGroupContext)
 	}
-	return checkProposalListStructure(self.List)
+	if err := checkProposalListStructure(self.List); err != nil {
+		return err
+	}
+	// AND THE LIST CARRIES AT MOST ONE GroupContextExtensions PROPOSAL, which belongs at the door
+	// for checkProposalListStructure's own reason one line up. (*ProposalList).Extensions answers
+	// GCE[0], so every reader of the installed extension set decides off the FIRST of however many
+	// the list carries: effectiveExtensions and through it ValSem106, ValSem109 and the section
+	// 12.1.2 update rules, ApplyProposals' first step, and the commit door's extension join. Over a
+	// list carrying two that is a choice nothing states, and the rule refusing it ran FIFTH inside
+	// one aggregate rather than at the door every one of those readers arrives through -- so a
+	// caller reaching any single rule of this file got the first of two extension sets and no
+	// refusal at all. A rule the aggregate reaches is not a rule the exported doors beside it ask.
+	return checkOneGroupContextExtensions(self.List)
 }
 
 // effectiveExtensions is the extension list the rest of the list is judged against.
@@ -353,8 +365,21 @@ func validateOneGroupContextExtensions(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	if len(in.List.GCE) > 1 {
-		return fmt.Errorf("%w: the list carries %d", errMultipleGroupContextExtensions, len(in.List.GCE))
+	return checkOneGroupContextExtensions(in.List)
+}
+
+// checkOneGroupContextExtensions is that rule as a body BOTH doors run, which is the shape
+// checkProposalListStructure takes and is here for its reason: this is a precondition every rule
+// that reads the installed extension set stands on, and a precondition enforced by the order of one
+// aggregate is a precondition every other entry point skips. It answers the same value the rule
+// does, because it is the rule.
+//
+// ValidateProposalList's own note applies unchanged: the rule above is now redundant with the door
+// wherever it runs, it is kept because refusing at the door is what the rest of this package does,
+// and nothing here claims a test can tell which of the two guards fired.
+func checkOneGroupContextExtensions(list *ProposalList) error {
+	if len(list.GCE) > 1 {
+		return fmt.Errorf("%w: the list carries %d", errMultipleGroupContextExtensions, len(list.GCE))
 	}
 	return nil
 }
