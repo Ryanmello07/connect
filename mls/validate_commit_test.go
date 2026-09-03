@@ -2047,13 +2047,23 @@ func testCachedProposalOf(t *testing.T, crypto CryptoProvider, cache *ProposalCa
 
 // testCachedRemoveOf stores a remove of one leaf in a cache and answers the list entry that names
 // it -- the two halves the join holds together.
+//
+// THE SENDER IS NEITHER THE ZERO VALUE NOR THE COMMITTER, which is the whole point of the number.
+// A by-REFERENCE entry keeps the sender the cache recorded, and the by-VALUE arm of the same join
+// attributes its entry to the committer; a fixture whose cached sender happened to be the
+// committer's leaf could not tell those two rules apart, which is the same shape as a fixture
+// whose committer is leaf 0. It used to be leaf 1, and leaf 1 is now testCommitterLeaf.
 func testCachedRemoveOf(t *testing.T, crypto CryptoProvider, cache *ProposalCache,
 	removed LeafIndex) CachedProposal {
 
 	t.Helper()
-	return testCachedProposalOf(t, crypto, cache, LeafIndex(1),
+	return testCachedProposalOf(t, crypto, cache, testCachedSenderLeaf,
 		&Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: removed}})
 }
+
+// testCachedSenderLeaf is the member the by-reference fixtures published their proposal from: a
+// real leaf of the four member group, not the zero value, and not the committer's.
+const testCachedSenderLeaf = LeafIndex(3)
 
 // testCachedUpdateOf stores one member's Update in a cache and answers the list entry that names
 // it: a leaf built for the update source, signed at that member's own leaf index, attributed to
