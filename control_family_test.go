@@ -199,8 +199,8 @@ func TestControlFamilyDemoteRefusedWhenOtherFamilyUnusable(t *testing.T) {
 	}
 }
 
-// The guard the spec spends a section on is only as good as the probe behind
-// it, and the probe had no direct test at all: all sixteen call sites inject a
+// The IPv6-only guard is only as good as the probe behind it, and the probe
+// had no direct test at all: all sixteen call sites inject a
 // fake, so the "IPv6-only guard" test proved the BRANCH and never the probe.
 //
 // The device this pins is the one the guard exists for: an IPv6-only handset

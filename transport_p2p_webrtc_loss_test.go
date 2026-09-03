@@ -220,8 +220,11 @@ func newVnetWebRtcPeerConnectionFactory(
 		webrtc.WithInterceptorRegistry(nil),
 	)
 	return &webRtcPeerConnectionFactory{
-		newPeerConnection: func(networkPeer bool) (*webrtc.PeerConnection, error) {
-			return api.NewPeerConnection(webrtc.Configuration{})
+		newPeerConnection: func(
+			networkPeer bool,
+		) (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, err := api.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, err
 		},
 	}
 }
@@ -301,8 +304,8 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	managerA.newPeerConnectionFactory = func(
 		*WebRtcSettings,
 		*webrtc.Certificate,

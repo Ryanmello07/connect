@@ -199,8 +199,11 @@ type ClientStrategySettings struct {
 
 // stores statistics on client strategies
 type ClientStrategy struct {
-	ctx context.Context
-	log Logger
+	ctx                context.Context
+	cancel             context.CancelFunc
+	closeOnce          sync.Once
+	unsubNetworkChange func()
+	log                Logger
 
 	settings *ClientStrategySettings
 
@@ -404,8 +407,10 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 	*/
 
+	strategyCtx, strategyCancel := context.WithCancel(ctx)
 	clientStrategy := &ClientStrategy{
-		ctx:                 ctx,
+		ctx:                 strategyCtx,
+		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
 		dialers:             dialers,
@@ -417,22 +422,44 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	// find-providers) would otherwise stall on a dead socket until its
 	// timeout. Clients rebuild lazily on next use. Unsubscribe rides ctx.
 	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
+	clientStrategy.unsubNetworkChange = unsubNetworkChange
 	go HandleError(func() {
-		<-ctx.Done()
-		unsubNetworkChange()
+		<-strategyCtx.Done()
+		clientStrategy.Close()
 	})
 	return clientStrategy
+}
+
+// Releases every strategy-owned idle HTTP connection without making the
+// strategy terminal. Network changes use the same operation before lazy
+// redial on the new path.
+func (self *ClientStrategy) CloseIdleConnections() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for dialer := range self.dialers {
+		dialer.Close()
+	}
+}
+
+// Ends discovery and releases pooled HTTP connections. APIs and transports
+// sharing the strategy must be closed first; repeated calls are safe.
+func (self *ClientStrategy) Close() {
+	self.closeOnce.Do(func() {
+		if self.cancel != nil {
+			self.cancel()
+		}
+		if self.unsubNetworkChange != nil {
+			self.unsubNetworkChange()
+		}
+		self.CloseIdleConnections()
+	})
 }
 
 // networkChanged drops every dialer's pooled connections (idle sockets bound
 // to the old network path); in-flight requests finish on their own
 // connections, and the http clients rebuild lazily on next use.
 func (self *ClientStrategy) networkChanged() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for dialer := range self.dialers {
-		dialer.Close()
-	}
+	self.CloseIdleConnections()
 }
 
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {
@@ -711,6 +738,28 @@ func materializeHttpResult(result *evalResult) (*httpResult, error) {
 	return &result.httpResult, result.err
 }
 
+// Give each synchronous route an equal share of the remaining deadline while
+// retaining one share for parallel discovery/fallback. A route remembered as
+// successful may have become a black hole; it must not consume the request's
+// entire deadline before another route is allowed to run.
+func preferredEvalAttemptContext(
+	ctx context.Context,
+	remainingAttemptCount int,
+) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || remainingAttemptCount <= 0 {
+		return context.WithCancel(ctx)
+	}
+	remainingTimeout := time.Until(deadline)
+	if remainingTimeout <= 0 {
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		attemptCancel()
+		return attemptCtx, func() {}
+	}
+	attemptTimeout := remainingTimeout / time.Duration(remainingAttemptCount+1)
+	return context.WithTimeout(ctx, attemptTimeout)
+}
+
 func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
 	// in this order:
 	// 1. try all dialers that previously worked sequentially
@@ -718,9 +767,23 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 	// 3. expand the extenders and try new extenders in parallel blocks
 
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	defer handleCancel()
+	// Every parallel attempt remains owned by this call until its eval stack
+	// returns. Cancellation only asks a dial to stop; it is not completion.
+	// Register before launch so cleanup never races Wait with a later Add.
+	var workerWaitGroup sync.WaitGroup
+	startWorker := func(run func(), handlers ...any) {
+		workerWaitGroup.Add(1)
+		go func() {
+			defer workerWaitGroup.Done()
+			HandleError(run, handlers...)
+		}()
+	}
+	defer func() {
+		handleCancel()
+		workerWaitGroup.Wait()
+	}()
 	// merge handleCtx with self.ctx
-	go HandleError(func() {
+	startWorker(func() {
 		defer handleCancel()
 		select {
 		case <-handleCtx.Done():
@@ -728,7 +791,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case <-self.ctx.Done():
 			return
 		}
-	})
+	}, handleCancel)
 
 	out := make(chan *evalResult)
 
@@ -780,10 +843,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			dialers := slices.Collect(maps.Keys(dialerWeights))
 			WeightedShuffle(dialers, dialerWeights)
 
-			// always try the top options first
-			serialDialers = append(serialDialers, dialers[0])
-
-			for _, dialer := range dialers[1:] {
+			for _, dialer := range dialers {
 				if dialer.IsLastSuccess() {
 					serialDialers = append(serialDialers, dialer)
 				} else {
@@ -795,16 +855,22 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 				return a.priority - b.priority
 			})
-			for _, dialer := range serialDialers {
+			for i, dialer := range serialDialers {
 				select {
 				case <-handleCtx.Done():
 					return nil
 				default:
 				}
 
-				result := eval(handleCtx, dialer)
+				attemptCtx, attemptCancel := preferredEvalAttemptContext(
+					handleCtx,
+					len(serialDialers)-i,
+				)
+				result := eval(attemptCtx, dialer)
 				if result != nil {
+					result.dialer = dialer
 					if result.Selected().err == nil {
+						attemptCancel()
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s\n", dialer.String())
 						}
@@ -815,6 +881,14 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					}
 					result.Close()
 				}
+				attemptErr := attemptCtx.Err()
+				attemptCancel()
+				if attemptErr != nil && handleCtx.Err() == nil {
+					// eval ignores errors caused by its context because parallel
+					// losers share that signal. This private attempt deadline is
+					// different: it is evidence that this route black-holed.
+					dialer.Update(handleCtx, attemptErr)
+				}
 			}
 
 			// note parallel dialers is in the original weighted order
@@ -822,7 +896,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			n := min(len(parallelDialers), self.settings.ParallelBlockSize)
 			p += n
 			for _, dialer := range parallelDialers[0:n] {
-				go HandleError(func() {
+				startWorker(func() {
 					run(dialer)
 				})
 			}
@@ -843,7 +917,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						}
 						result.Close()
 					}
-					go HandleError(func() {
+					startWorker(func() {
 						run(dialer)
 					})
 				}
@@ -854,7 +928,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			n := min(len(expandedDialers), self.settings.ParallelBlockSize-p)
 			p += n
 			for _, dialer := range expandedDialers[0:n] {
-				go HandleError(func() {
+				startWorker(func() {
 					run(dialer)
 				})
 			}
@@ -875,7 +949,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						}
 						result.Close()
 					}
-					go HandleError(func() {
+					startWorker(func() {
 						run(dialer)
 					})
 				}
@@ -909,17 +983,27 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	defer handleCancel()
+	// The strategy-context bridge is function-owned; join it so even a fast
+	// successful serial result leaves no callback racing the caller's cleanup.
+	var contextWaitGroup sync.WaitGroup
+	defer func() {
+		handleCancel()
+		contextWaitGroup.Wait()
+	}()
 	// merge handleCtx with self.ctx
-	go HandleError(func() {
-		defer handleCancel()
-		select {
-		case <-handleCtx.Done():
-			return
-		case <-self.ctx.Done():
-			return
-		}
-	}, handleCancel)
+	contextWaitGroup.Add(1)
+	go func() {
+		defer contextWaitGroup.Done()
+		HandleError(func() {
+			defer handleCancel()
+			select {
+			case <-handleCtx.Done():
+				return
+			case <-self.ctx.Done():
+				return
+			}
+		}, handleCancel)
+	}()
 
 	// keep trying as long as there is time left
 	for {
@@ -944,16 +1028,22 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 		slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 			return a.priority - b.priority
 		})
-		for _, dialer := range serialDialers {
+		for i, dialer := range serialDialers {
 			select {
 			case <-handleCtx.Done():
 				return nil
 			default:
 			}
 
-			result := eval(handleCtx, dialer)
+			attemptCtx, attemptCancel := preferredEvalAttemptContext(
+				handleCtx,
+				len(serialDialers)-i,
+			)
+			result := eval(attemptCtx, dialer)
 			if result != nil {
+				result.dialer = dialer
 				if result.Selected().err == nil {
+					attemptCancel()
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][s]select: %s\n", dialer.String())
 					}
@@ -963,6 +1053,13 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
 				}
 				result.Close()
+			}
+			attemptErr := attemptCtx.Err()
+			attemptCancel()
+			if attemptErr != nil && handleCtx.Err() == nil {
+				// See parallelEval: a private attempt timeout is a route
+				// failure, not cancellation of the caller's request.
+				dialer.Update(handleCtx, attemptErr)
 			}
 		}
 
@@ -1021,12 +1118,51 @@ func (self *ClientStrategy) applyExtraHeaders(h http.Header) {
 	}
 }
 
+// Multi-route evaluation requires an independent body reader for every
+// attempt. Clone copies request metadata; GetBody resets consumed content.
+func cloneHttpRequestForAttempt(ctx context.Context, request *http.Request) (*http.Request, error) {
+	attemptRequest := request.Clone(ctx)
+	if request.Body == nil {
+		return attemptRequest, nil
+	}
+	if request.GetBody == nil {
+		return nil, fmt.Errorf("http request body is not replayable")
+	}
+	attemptBody, err := request.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("rebuild http request body: %w", err)
+	}
+	attemptRequest.Body = attemptBody
+	return attemptRequest, nil
+}
+
+// Rejects a body that cannot be rebuilt before any route consumes it.
+func validateHttpRequestForAttempts(request *http.Request) error {
+	if request == nil {
+		return fmt.Errorf("http request is nil")
+	}
+	if request.Body != nil && request.GetBody == nil {
+		return fmt.Errorf("http request body is not replayable")
+	}
+	return nil
+}
+
 func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, error) {
+	if err := validateHttpRequestForAttempts(request); err != nil {
+		return nil, err
+	}
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
 	self.applyExtraHeaders(request.Header)
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(request.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1053,13 +1189,29 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	// 2. retest and expand dialers using get of the hello request.
 	//    This is a basic ping to the server, which is run in parallel.
 	// 3. continue from 1 until timeout
+	if err := validateHttpRequestForAttempts(request); err != nil {
+		return nil, err
+	}
+	if err := validateHttpRequestForAttempts(helloRequest); err != nil {
+		return nil, err
+	}
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
+	if helloRequest.Body != nil {
+		defer helloRequest.Body.Close()
+	}
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(request.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
@@ -1073,8 +1225,12 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(helloRequest.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
@@ -1142,12 +1298,20 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	now := time.Now()
 	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() && !dialer.persistent && dialer.IsLastSuccess() {
-			if self.settings.ExtenderDropTimeout <= time.Now().Sub(dialer.lastErrorTime) {
-				dialer.Close()
-				delete(self.dialers, dialer)
-			}
+		shouldDrop := func() bool {
+			dialer.mutex.Lock()
+			defer dialer.mutex.Unlock()
+
+			return dialer.extenderConfig != nil &&
+				!dialer.persistent &&
+				!dialer.isLastSuccessWithLock() &&
+				self.settings.ExtenderDropTimeout <= now.Sub(dialer.lastErrorTime)
+		}()
+		if shouldDrop {
+			dialer.Close()
+			delete(self.dialers, dialer)
 		}
 	}
 }
@@ -1524,11 +1688,17 @@ func (self *clientDialer) IsExtender() bool {
 	return self.extenderConfig != nil
 }
 
+// Reports whether the latest completed outcome succeeded. The caller holds
+// mutex.
+func (self *clientDialer) isLastSuccessWithLock() bool {
+	return 0 < self.successCount && !self.lastSuccessTime.Before(self.lastErrorTime)
+}
+
 func (self *clientDialer) IsLastSuccess() bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	return !self.lastSuccessTime.Before(self.lastErrorTime)
+	return self.isLastSuccessWithLock()
 }
 
 func (self *clientDialer) String() string {

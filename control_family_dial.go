@@ -34,10 +34,10 @@ import (
 //
 // So the first handshake is bounded by ControlFamilyFirstHandshakeTimeout, and
 // THAT is the timeout a stalled handshake hits. It is a floor, not a fraction:
-// an earlier version halved whatever the caller had left, which shortened the
-// tls tolerance the spec had considered and declined to shorten ("it would
-// risk false-positive demotion for users on genuinely slow links") and did it
-// hardest exactly where the budget was smallest -- 2.5s on the control
+// an earlier version halved whatever the caller had left, which shortens the
+// tls handshake tolerance this product deliberately does not shorten -- doing
+// so risks false-positive demotion for users on genuinely slow links -- and
+// did it hardest exactly where the budget was smallest -- 2.5s on the control
 // websocket, which a congested mobile link reaches with a pinned P-384 chain
 // and nothing wrong. A fixed 8s cannot scale down like that, and it is larger
 // than the entire budget in which a shipping platform websocket dial already
@@ -51,17 +51,25 @@ import (
 // the first handshake keeps the caller's whole remaining budget and this
 // helper behaves exactly as it did before the bound existed.
 //
-// That threshold is also the whole of the api-path/websocket split. The api
-// path arrives with ~15s and is bounded; the control websocket arrives with
-// 5s, which is under 8s + 5s, so it is never bounded and its handshake
-// tolerance is left alone. The websocket does not need a retry of its own: the
-// demotion ledger is process-global (control_family.go), read inside every
-// dial through controlDialNetwork and pickControlIPAddr, so a demotion learned
-// on the api path is already in force for the control websocket, the h3/quic
-// name path and the extenders. One path with enough budget is enough to LEARN;
-// every path benefits. Raising the websocket's HandshakeTimeout instead would
-// change a shared transport timeout for every user to buy a second attempt on
-// a path that already inherits the answer.
+// That threshold is what decides, per attempt, whether this helper bounds
+// anything. An api attempt that arrives with the whole RequestTimeout (~15s)
+// is bounded -- which is every attempt the client strategy runs in parallel,
+// including the parallel hello a strategy with no successful dialer yet falls
+// straight through to, so a cold launch is bounded. The strategy's SERIAL
+// attempts are not: parallelEval and serialEval give each remembered dialer an
+// equal share of what is left (preferredEvalAttemptContext, net_http.go), and
+// a share of 15s is under 8s + 5s, so the same "no room for two attempts"
+// rule declines to bound them. Nor is the platform control websocket, which
+// gorilla caps at HandshakeTimeout (5s).
+//
+// None of those paths needs a retry of its own: the demotion ledger is
+// process-global (control_family.go), read inside every dial through
+// controlDialNetwork and pickControlIPAddr, so a demotion learned on any
+// bounded attempt is already in force for the control websocket, the h3/quic
+// name path and the extenders. One attempt with enough budget is enough to
+// LEARN; every path benefits. Raising the websocket's HandshakeTimeout
+// instead would change a shared transport timeout for every user to buy a
+// second attempt on a path that already inherits the answer.
 //
 // Exactly one retry, and only to the other family. The caller already sits
 // inside the client strategy's serial and parallel dialer evaluation under a
@@ -141,10 +149,10 @@ func dialControlTlsWithFamilyFallback(
 	retryConn, retryErr := dial(ctx, retryNetwork, addr)
 	if retryErr != nil {
 		// The other family could not even connect, so the evidence does not
-		// say "this family is blackholed", it says "this moment is bad". The
-		// spec: "a second failure over the second family is also not a family
-		// problem." Leaving the strike standing would narrow every control
-		// dial in the process onto a family that just failed outright.
+		// say "this family is blackholed", it says "this moment is bad": a
+		// second failure over the second family is not a family problem.
+		// Leaving the strike standing would narrow every control dial in the
+		// process onto a family that just failed outright.
 		controlFamilyUndemote(failed)
 		return nil, err
 	}
@@ -202,7 +210,7 @@ func firstHandshakeContext(
 // that refutation. It clears the entry and dials once more with the caller's
 // original family-agnostic network, which also restores the Happy Eyeballs
 // race that the narrowing had switched off -- the platform's own answer to a
-// PRE-connect blackhole, and the thing the design says already works.
+// PRE-connect blackhole, which already works.
 //
 // A FORCE is never undone here. It is an explicit developer override whose
 // entire purpose is to be obeyed against this client's judgement.

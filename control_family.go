@@ -183,8 +183,8 @@ func init() {
 // demoting IPv6 there would take the user from a slow control plane to no
 // control plane at all.
 func controlFamilyDemote(family int) bool {
-	// The developer setting and the learned memory "are independent state and
-	// never mix" (spec section 1), and this is where they would. Under a force
+	// The developer setting and the learned memory are independent state and
+	// must never mix, and this is where they would. Under a force
 	// there is no other family in play: a timeout on the only family the
 	// policy permits is not evidence about family CHOICE, because there is
 	// nothing to compare it against, and the retry it would trigger dials
@@ -236,9 +236,9 @@ func controlFamilyDemote(family int) bool {
 // The ledger records evidence, and evidence can be contradicted. Two things
 // contradict it, both of them dial failures the ledger would otherwise never
 // hear about: the family we demoted ONTO failing to connect at all, and the
-// in-place retry over that family failing too. The spec is explicit about the
-// second -- "a second failure over the second family is also not a family
-// problem" -- and the first is the only route back from a demotion that took
+// in-place retry over that family failing too. The second is not a family
+// problem -- a failure over BOTH families says the moment is bad, not the
+// family -- and the first is the only route back from a demotion that took
 // the user offline, because a connect failure never reaches the strike path.
 //
 // The entry is removed rather than decremented. The backoff exists to stop a

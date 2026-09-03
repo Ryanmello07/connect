@@ -21,6 +21,13 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 		taken, returned, _ := MessagePoolCounts()
 		return int64(taken) - int64(returned)
 	}
+	poolOutstandingByClass := func() map[int]int64 {
+		outstanding := map[int]int64{}
+		for _, stats := range GetMessagePoolClassStats() {
+			outstanding[stats.Size] = int64(stats.Taken) - int64(stats.Returned)
+		}
+		return outstanding
+	}
 	settle := func() int64 {
 		prev := poolOutstanding()
 		stableCount := 0
@@ -47,6 +54,7 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 	// warmup cycle to initialize process-global pools before the baseline
 	runMultiClientPoolCycle(ctx, t)
 	before := settle()
+	beforeByClass := poolOutstandingByClass()
 
 	const cycles = 10
 	for i := 0; i < cycles; i += 1 {
@@ -55,8 +63,20 @@ func TestMultiClientLifecyclePoolBalance(t *testing.T) {
 
 	after := settle()
 	if before < after {
-		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d)",
-			cycles, before, after, after-before)
+		afterByClass := poolOutstandingByClass()
+		// Diagnose whether CloseAndWait lost an owner permanently or published
+		// before a delayed transport return. Either violates this lifecycle
+		// boundary; the late count keeps the failure signature actionable.
+		time.Sleep(2 * time.Second)
+		late := settle()
+		growthByClass := map[int]int64{}
+		for size, afterCount := range afterByClass {
+			if growth := afterCount - beforeByClass[size]; growth != 0 {
+				growthByClass[size] = growth
+			}
+		}
+		t.Errorf("pool buffers not returned across %d multi-client lifecycles: outstanding %d -> %d (+%d), late=%d, class growth=%v",
+			cycles, before, after, after-before, late, growthByClass)
 	}
 }
 
@@ -137,8 +157,20 @@ func TestRemoteUserNatClientRawSendPoolBalance(t *testing.T) {
 		}
 	}
 
-	natClient.Close()
-	providerClient.Close()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if joinableNatClient, ok := natClient.(interface {
+		CloseAndWait(context.Context) error
+	}); ok {
+		if err := joinableNatClient.CloseAndWait(closeCtx); err != nil {
+			t.Fatalf("join single-destination local NAT: %v", err)
+		}
+	} else {
+		natClient.Close()
+	}
+	if err := providerClient.CloseAndWait(closeCtx); err != nil {
+		t.Fatalf("join single-destination provider client: %v", err)
+	}
 	cancel()
 	after := settle()
 	if before < after {
@@ -447,14 +479,40 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		cycleCancel()
 		providerClient.Cancel()
 		providerEchoWaitGroup.Wait()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := providerClient.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("join pool-balance provider client: %v", err)
+		}
 	}()
 
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
 	received := make(chan struct{}, 64)
+	generator := testMultiClientGenerator(providerClient)
+	// RemoteUserNatMultiClient owns its windows, while the generator owns the
+	// Clients it creates. Mirror ApiMultiClientGenerator's retirement join so
+	// this pool assertion measures a complete lifecycle rather than sampling
+	// generator-owned clients that the lightweight fixture left unjoined.
+	var generatedClientsMutex sync.Mutex
+	var generatedClients []*Client
+	newClient := generator.newClient
+	generator.newClient = func(
+		ctx context.Context,
+		args *MultiClientGeneratorClientArgs,
+		settings *ClientSettings,
+	) (*Client, error) {
+		client, err := newClient(ctx, args, settings)
+		if err == nil {
+			generatedClientsMutex.Lock()
+			generatedClients = append(generatedClients, client)
+			generatedClientsMutex.Unlock()
+		}
+		return client, err
+	}
 	multi := NewRemoteUserNatMultiClient(
 		cycleCtx,
-		testMultiClientGenerator(providerClient),
+		generator,
 		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 			select {
 			case received <- struct{}{}:
@@ -469,6 +527,17 @@ func runMultiClientPoolCycle(ctx context.Context, t *testing.T) {
 		defer closeCancel()
 		if err := multi.CloseAndWait(closeCtx); err != nil {
 			t.Errorf("join multi-client local NAT: %v", err)
+		}
+		generatedClientsMutex.Lock()
+		clients := append([]*Client(nil), generatedClients...)
+		generatedClientsMutex.Unlock()
+		for _, client := range clients {
+			client.Cancel()
+		}
+		for _, client := range clients {
+			if err := client.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("join generator-owned client: %v", err)
+			}
 		}
 	}()
 

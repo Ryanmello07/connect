@@ -224,11 +224,11 @@ func (self *forgetfulConn) Close() error {
 // the demotion ledger is process-global, so the demotion the api path has the
 // budget to LEARN is already in force for this dial.
 //
-// The first handshake used to get half the caller's budget on every path. The
-// spec's out-of-scope list rules on that directly -- of shortening the 15s tls
-// handshake tolerance: "Considered and declined: it would risk false-positive
-// demotion for users on genuinely slow links" -- and halving did exactly that,
-// implicitly and hardest where the budget was smallest: 2.5s here, on the path
+// The first handshake used to get half the caller's budget on every path.
+// Shortening the 15s tls handshake tolerance is something this product
+// deliberately does not do -- it would risk false-positive demotion for users
+// on genuinely slow links -- and halving did exactly that, implicitly and
+// hardest where the budget was smallest: 2.5s here, on the path
 // that reconnects most often, with a timeout inside it read as proof the
 // family is blackholed.
 func TestFamilyFallbackLeavesTheWebsocketBudgetUnbounded(t *testing.T) {
@@ -245,7 +245,7 @@ func TestFamilyFallbackLeavesTheWebsocketBudgetUnbounded(t *testing.T) {
 		t.Fatalf(
 			"the websocket's %s budget now reaches the %s+%s bound threshold -- "+
 				"the first handshake on the control websocket is about to be cut short, "+
-				"which is the false positive the spec declined",
+				"which is the false positive this bound exists to avoid",
 			settings.HandshakeTimeout,
 			settings.ControlFamilyFirstHandshakeTimeout,
 			settings.ControlFamilyRetryReserve,
@@ -272,8 +272,8 @@ func TestFamilyFallbackLeavesTheWebsocketBudgetUnbounded(t *testing.T) {
 		deadlines = append(deadlines, deadline)
 		mutex.Unlock()
 		if connFamily(conn) == 6 {
-			// the handshake's OWN timeout, not the caller's: this is the
-			// TlsTimeout the spec left at 15s
+			// the handshake's OWN timeout, not the caller's: this is
+			// TlsTimeout, left at 15s
 			return nil, &timeoutError{}
 		}
 		return conn, nil
@@ -297,7 +297,7 @@ func TestFamilyFallbackLeavesTheWebsocketBudgetUnbounded(t *testing.T) {
 		t.Fatalf(
 			"the first handshake was cut at %s, %s short of the caller's own %s -- "+
 				"a fraction of the caller's budget is a shortened handshake tolerance, "+
-				"which the spec considered and declined",
+				"which this product deliberately does not do",
 			deadlines[0].Format(time.RFC3339Nano),
 			callerDeadline.Sub(deadlines[0]),
 			callerDeadline.Format(time.RFC3339Nano),
@@ -537,8 +537,8 @@ func TestFamilyFallbackDoesNotUndoAForce(t *testing.T) {
 	}
 }
 
-// The spec: "a second failure over the second family is also not a family
-// problem." A strike that the retry could not confirm must not be left
+// A second failure over the second family is not a family problem. A strike
+// that the retry could not confirm must not be left
 // standing -- it narrows every control dial in the process, including the
 // extender and h3/quic paths, on evidence the helper itself just contradicted.
 func TestFamilyFallbackRollsBackTheStrikeWhenTheRetryAlsoFails(t *testing.T) {
@@ -673,15 +673,13 @@ func (self *deadlineConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // The fragment/reorder dialers go through the family fallback too.
 //
-// Spec section 2 says the retry helper serves sites 1 and 2, and site 2 names
-// "the resilient dialers". It was wired into newNormalDialTlsContext only, and
-// that is the wrong one to have alone: api posts do not race the dialers, they
-// go through HttpSerial -> serialEval, which sorts by priority, and "fragment"
-// is priority 0 against "normal" at 25. On a fresh ClientStrategy every
-// dialer's lastSuccessTime and lastErrorTime are the zero time, so
-// IsLastSuccess() is true for all of them and the fragment dialer runs first --
-// so the FIRST request of a launch, the login, was the one dialer with no
-// timeout classification, no strike and no in-place retry.
+// The helper was wired into newNormalDialTlsContext only, and that is the
+// wrong one to have alone: api posts do not race the dialers, they go through
+// HttpSerial -> serialEval, which sorts the already-succeeded dialers by
+// priority, and "fragment" is priority 0 against "normal" at 25. So the
+// fragment dialer leads every warm serial post, and shares the parallel hello
+// before that -- and it was the one dialer with no timeout classification, no
+// strike and no in-place retry.
 func TestResilientDialGoesThroughTheFamilyFallback(t *testing.T) {
 	restore := swapControlFamilyProbe(func(int) bool { return true })
 	defer restore()
