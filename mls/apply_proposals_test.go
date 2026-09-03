@@ -393,3 +393,42 @@ func applyProposalsRefusalOf(t *testing.T, what string, tree *RatchetTree,
 	}()
 	return ApplyProposals(tree, ctx, own, list)
 }
+
+// TestApplyProposalsRefusesAListCarryingTwoGroupContextExtensions holds the source this door
+// decides the next epoch's whole extension set off to a rule that says which entry it is.
+//
+// (*ProposalList).Extensions answers GCE[0] and says so, and what makes that index EXACT is that
+// (*ProposalCache).Resolve refuses the second one as it buckets. That says nothing about a list a
+// caller assembled field by field, and this door takes one: over such a list step 1 installed one
+// of two extension sets with nothing at all saying which, while both validators refused it
+// outright. It is the same fault the three structural rules above close one field lower down -- a
+// step decided off a source the door has not established -- so the rule that already states it is
+// asked here rather than restated.
+//
+// THE SECOND PROPOSAL IS THE OFFENDER and it sits behind an agreeing one, so a rule that answered
+// element zero cannot refuse this list at all.
+func TestApplyProposalsRefusesAListCarryingTwoGroupContextExtensions(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob")
+	first := testGceOf(Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy,
+		ExtensionData: []byte{0x01}})
+	second := testGceOf(Extension{ExtensionType: ExtensionTypeUrmessageGroupPolicy,
+		ExtensionData: []byte{0x02}})
+	_, failure := ApplyProposals(tree, testApplyContext(), LeafIndex(0),
+		testProposalList(t, first, second))
+	if !errors.Is(failure, errMultipleGroupContextExtensions) {
+		t.Fatalf("ApplyProposals over a list carrying two group_context_extensions proposals = %v, want errMultipleGroupContextExtensions; the applied extension set is otherwise one of the two and nothing says which",
+			failure)
+	}
+	// the control: one of them alone is applied, so the refusal above is about the second and not
+	// about a GroupContextExtensions proposal this door cannot handle
+	applied, err := ApplyProposals(tree, testApplyContext(), LeafIndex(0),
+		testProposalList(t, first))
+	if err != nil {
+		t.Fatalf("ApplyProposals over a list carrying one: %v", err)
+	}
+	if len(applied.Extensions) != 1 || !bytes.Equal(applied.Extensions[0].ExtensionData, []byte{0x01}) {
+		t.Fatalf("the applied extension set is %v, want the one the single proposal installs",
+			applied.Extensions)
+	}
+}
