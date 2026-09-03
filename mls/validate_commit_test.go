@@ -140,19 +140,22 @@ var commitValidationSanctionedWraps = map[string]string{
 // sides of the proposals, one epoch, the committer at testCommitterLeaf and this member at
 // testOwnLeaf.
 //
-// NEITHER OF THOSE IS LEAF ZERO AND THEY ARE NOT EACH OTHER, and both halves of that are the
-// corpus repair rather than a taste. See testCommitterLeaf for the first: with every fixture
-// committing from leaf 0 the join's `Sender: self.Committer` and the constant `LeafIndex(0)`
-// produce the same octets for every input this package has, and the mutation was measured green
-// over the whole suite. The second is ValSem203PathDecrypt, which returns before it reads a tree
-// at all when Own == Committer.
+// THE COMMITTER IS NOT LEAF ZERO, THE JUDGE IS, AND THEY ARE NOT EACH OTHER. This paragraph used
+// to say neither of them was leaf zero, which was false against testOwnLeaf and is the sentence
+// that hid ValSem203PathDecrypt's leaf-zero exposure for a round: `in.Own == in.Committer` was
+// replaced by `in.Own == LeafIndex(0)` with the whole suite green. See testCommitterLeaf for the
+// first half -- with every fixture committing from leaf 0 the join's `Sender: self.Committer` and
+// the constant `LeafIndex(0)` produce the same octets for every input this package has, and that
+// mutation was measured green too. The second half is ValSem203PathDecrypt, which returns before
+// it reads a tree at all when Own == Committer; testCommitTheCommitterJudgesItselfFromABlankSibling
+// is the fixture in which they DO agree, and the corpus is held to carrying both.
 //
 // PostTree is a CLONE and not the same pointer. Several rules write nothing but several tests do,
 // and a fixture that handed one tree to both fields would make an edit meant for the post-proposal
 // tree land in the pre-commit one -- which is the difference ValSem204 and ValSem207 are stated
 // across. A clone is not a DIFFERENCE, though, and that is a separate hole this corpus had:
 // testCommitInputOverTheTreeItsProposalsBuild is the fixture whose two trees answer differently,
-// and testCorpusSeparatesEveryLeafDimension holds the corpus to carrying one.
+// and TestTheCommitCorpusIsJudgedBetweenTwoTreesThatDiffer holds the corpus to carrying one.
 
 func testCommitInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	list *ProposalList, commit *Commit) *CommitValidationInput {
@@ -2951,7 +2954,7 @@ func proposalListDoors(t *testing.T) map[string]proposalListDoor {
 		proposalRule := rule
 		doors[name] = proposalListDoor{refuses: true,
 			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
-				return proposalRule(testValidationInput(t, crypto, tree, LeafIndex(0), list))
+				return proposalRule(testValidationInput(t, crypto, tree, testCommitterLeaf, list))
 			}}
 	}
 	maps.Copy(doors, proposalListReaders())
@@ -3165,7 +3168,7 @@ func TestEveryDoorHandedAProposalListRefusesOneCarryingTwoGroupContextExtensions
 	}
 	// the control: one alone is accepted, so the refusals above are about the SECOND proposal and
 	// not about a group_context_extensions proposal these doors cannot take
-	if failure := ValidateProposalList(testValidationInput(t, crypto, tree, LeafIndex(0),
+	if failure := ValidateProposalList(testValidationInput(t, crypto, tree, testCommitterLeaf,
 		testProposalList(t, first))); failure != nil {
 		t.Fatalf("ValidateProposalList refused a list carrying ONE group_context_extensions proposal: %v; every refusal above could then be that",
 			failure)

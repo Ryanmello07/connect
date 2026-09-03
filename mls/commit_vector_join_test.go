@@ -164,6 +164,15 @@ func TestAFieldOfACachedProposalWithNoJoinRefusesTheCommit(t *testing.T) {
 // The order is the point, and it is testCommitNamingACachedProposal's: a rule written over entry
 // zero reads the inline add and never reaches the reference. It is built here rather than reused
 // because these rows need the cache back to edit what it holds.
+// testHeldRemoveTarget is the leaf the cached remove below names, and it is a member of the four
+// member group that is neither the committer nor the member judging the commit.
+//
+// NAMED RATHER THAN WRITTEN AT EACH CALL SITE, which is TestNoValidationInputIsBuiltFromANumberWithNoName's
+// rule: four call sites each spelling LeafIndex(2) are four decisions nobody made, and the one that
+// matters here is that removing the committer or the judge would be refused by a rule that has
+// nothing to do with the vector join these fixtures are about.
+const testHeldRemoveTarget = LeafIndex(2)
+
 func testCommitNamingACachedRemove(t *testing.T, crypto CryptoProvider,
 	removed LeafIndex) (*CommitValidationInput, *ProposalCache, CachedProposal) {
 
@@ -397,7 +406,7 @@ func TestAnInlineProposalAttributedToAnotherLeafIsRefused(t *testing.T) {
 // they are also the reason this corpus now carries a leaf index that does not fit in one octet.
 func TestACachedProposalMovedToALeafOfItsOwnIsRefused(t *testing.T) {
 	crypto := testCrypto(t)
-	in, _, _ := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
+	in, _, _ := testCommitNamingACachedRemove(t, crypto, testHeldRemoveTarget)
 	if failure := ValidateCommit(in); failure != nil {
 		t.Fatalf("ValidateCommit refused the commit this test is one edit away from: %v", failure)
 	}
@@ -452,7 +461,7 @@ func TestACachedProposalMovedToALeafOfItsOwnIsRefused(t *testing.T) {
 // this door's whole subject.
 func TestAListThatRecordsAnotherNameForTheProposalItHoldsIsRefused(t *testing.T) {
 	crypto := testCrypto(t)
-	in, cache, held := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
+	in, cache, held := testCommitNamingACachedRemove(t, crypto, testHeldRemoveTarget)
 	if failure := ValidateCommit(in); failure != nil {
 		t.Fatalf("ValidateCommit refused the commit this test is one edit away from: %v", failure)
 	}
@@ -687,7 +696,7 @@ func TestEveryExportedMethodOfAProposalCacheRefusesANilCacheRatherThanPanicking(
 // proposal" are one fact to the caller.
 func TestACommitNamingAReferenceUnderNoCacheIsRefusedRatherThanCrashing(t *testing.T) {
 	crypto := testCrypto(t)
-	in, _, _ := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
+	in, _, _ := testCommitNamingACachedRemove(t, crypto, testHeldRemoveTarget)
 	if failure := ValidateCommit(in); failure != nil {
 		t.Fatalf("ValidateCommit refused the commit this test takes the cache away from: %v", failure)
 	}

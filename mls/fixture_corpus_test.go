@@ -812,6 +812,23 @@ type validationFixtureRow[Input any] struct {
 	refuses error
 }
 
+// testCommitterAtLeafZero is the one committer in either corpus that sits on leaf zero, and it is
+// there ON PURPOSE.
+//
+// Every other call site of testValidationInput now names testCommitterLeaf, which is the repair
+// this round made -- forty-nine of them used to spell LeafIndex(0) and no test said why. But a
+// corpus in which the committer is NEVER leaf zero is degenerate in the other direction: leaf zero
+// is exactly where `x == in.Committer` and `x == LeafIndex(0)` disagree, so one fixture keeps it
+// and says so here rather than leaving a number at a call site to carry the argument.
+const testCommitterAtLeafZero = LeafIndex(0)
+
+// testFullValidationMembers is the group testFullValidationInput builds for the corpus.
+//
+// NINE, because that fixture divides its group into thirds -- three updates, three removes and
+// three adds -- and a width that is not a multiple of three would make one of those buckets shorter
+// than the others for a reason nobody chose.
+const testFullValidationMembers = 9
+
 // commitFixtureCorpus is every fixture of this package that answers a commit validation input,
 // keyed by the name it is declared under.
 //
@@ -845,7 +862,7 @@ func commitFixtureCorpus() map[string]validationFixtureRow[CommitValidationInput
 		"testCommitNamingACachedProposal":         {build: testCommitNamingACachedProposal},
 		"testCommitNamingACachedRemove": {build: func(t *testing.T,
 			crypto CryptoProvider) *CommitValidationInput {
-			in, _, _ := testCommitNamingACachedRemove(t, crypto, LeafIndex(2))
+			in, _, _ := testCommitNamingACachedRemove(t, crypto, testHeldRemoveTarget)
 			return in
 		}},
 		"testCommitWideEnoughToPrice": {build: testCommitWideEnoughToPrice},
@@ -896,12 +913,12 @@ func proposalFixtureCorpus() map[string]validationFixtureRow[ProposalValidationI
 	return map[string]validationFixtureRow[ProposalValidationInput]{
 		"testValidationInput": {build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
-			return testValidationInput(t, crypto, tree, LeafIndex(0),
-				testProposalList(t, testRemoveOf(LeafIndex(2))))
+			return testValidationInput(t, crypto, tree, testCommitterAtLeafZero,
+				testProposalList(t, testRemoveOf(testHeldRemoveTarget)))
 		}},
 		"updateSweepFixture": {build: updateSweepFixture},
 		"testFullValidationInput": {build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
-			return testFullValidationInput(t, crypto, 9)
+			return testFullValidationInput(t, crypto, testFullValidationMembers)
 		}},
 		"testValidationInputInASecondGroupAtALaterEpoch": {
 			build: testValidationInputInASecondGroupAtALaterEpoch},
@@ -1393,6 +1410,90 @@ func corpusLeafIndicesOf(value any) []LeafIndex {
 	return found
 }
 
+// corpusShapesOf answers, for one built input, the LENGTH of every vector dimension it carries and
+// the value of every TIMESTAMP it carries, each keyed by the path that reached it.
+//
+// TWO AGGREGATE CLAIMS USED TO NAME THEIR OWN FIELD. "no fixture carries more than one proposal"
+// read in.List and nothing else, and "one fixture's clock is not the wall clock" read in.Now and
+// nothing else -- so "no other vector is always one long" and "no other timestamp is time.Now()"
+// were sentences nobody had checked. Both are the ledger-21 shape one level up from where this file
+// already fixed it: the walk was derived and the SCOPE of the claim stated over it was written
+// down. This is that scope derived. What a vector is, and what a timestamp is, are read off the
+// values.
+//
+// IT DESCENDS THE WAY corpusDimensionsFrom DESCENDS, to the same bound and by the same rules, so a
+// vector the dimension claim measures is a vector this measures and there is no path that is one
+// claim's business and not the other's. An octet string is not a vector here for that walk's reason:
+// it is ONE value, and its length is a property of the value rather than a dimension of the input.
+func corpusShapesOf(root any) (map[string]int, map[string]time.Time) {
+	vectors, clocks := map[string]int{}, map[string]time.Time{}
+	var walk func(value reflect.Value, path string, hops int)
+	walk = func(value reflect.Value, path string, hops int) {
+		if !value.IsValid() {
+			return
+		}
+		if value.Type() == reflect.TypeFor[time.Time]() && value.CanInterface() && path != "" {
+			clocks[path] = value.Interface().(time.Time)
+			return
+		}
+		// RECORDED BEFORE THE BOUND IS CHECKED, exactly as corpusDimensionsFrom records a
+		// value before it decides whether to descend past it. A vector sitting AT the bound
+		// is a vector this claim is about; what the bound stops is walking INTO it.
+		if path != "" && (value.Kind() == reflect.Slice || value.Kind() == reflect.Array ||
+			value.Kind() == reflect.Map) {
+			countable := value.Kind() == reflect.Array ||
+				(!value.IsNil() && value.Type() != reflect.TypeFor[[]byte]())
+			if value.Kind() != reflect.Map && value.Type().Elem().Kind() == reflect.Uint8 {
+				countable = false
+			}
+			if countable && value.Len() > vectors[path] {
+				vectors[path] = value.Len()
+			}
+		}
+		if hops >= corpusDimensionHops {
+			return
+		}
+		switch value.Kind() {
+		case reflect.Pointer, reflect.Interface:
+			if !value.IsNil() {
+				walk(value.Elem(), path, hops)
+			}
+		case reflect.Slice, reflect.Array:
+			if value.Kind() == reflect.Slice && value.IsNil() {
+				return
+			}
+			if value.Type().Elem().Kind() == reflect.Uint8 {
+				return
+			}
+			for i := 0; i < value.Len(); i += 1 {
+				walk(value.Index(i), path+"[]", hops)
+			}
+		case reflect.Map:
+			if value.IsNil() {
+				return
+			}
+			iterator := value.MapRange()
+			for iterator.Next() {
+				walk(iterator.Value(), path+"{}", hops)
+			}
+		case reflect.Struct:
+			for i := 0; i < value.NumField(); i += 1 {
+				field := value.Type().Field(i)
+				if !field.IsExported() {
+					continue
+				}
+				under := field.Name
+				if path != "" {
+					under = path + "." + field.Name
+				}
+				walk(value.Field(i), under, hops+1)
+			}
+		}
+	}
+	walk(reflect.ValueOf(root), "", 0)
+	return vectors, clocks
+}
+
 // ---------------------------------------------------------------------------
 // the gate
 // ---------------------------------------------------------------------------
@@ -1412,8 +1513,12 @@ type corpusFixtureUnderTest struct {
 	// of the last round were exactly that shape.
 	relations map[string]corpusPairVerdict
 	leaves    []LeafIndex
-	order     []CachedProposal
-	now       time.Time
+	// vectors is the length of every vector dimension and clocks is every timestamp, each
+	// keyed by path. They are what the length claim and the clock claim are stated over, and
+	// they exist because those two claims used to read in.List and in.Now by name.
+	vectors map[string]int
+	clocks  map[string]time.Time
+	order   []CachedProposal
 }
 
 // corpusFixtureReducedTo is one built fixture reduced to everything the claims below read, written
@@ -1425,13 +1530,18 @@ type corpusFixtureUnderTest struct {
 // whole of what makes it unfoolable -- so nothing here answers an input and only the reduction
 // leaves the loop.
 func corpusFixtureReducedTo(crypto CryptoProvider, name string, in any, list *ProposalList,
-	now time.Time, pairs []comparisonPair) corpusFixtureUnderTest {
+	pairs []comparisonPair) corpusFixtureUnderTest {
 
 	dimensions := corpusDimensionsOf(crypto, in)
 	corpusListDimensionsInto(crypto, dimensions, list)
+	vectors, clocks := corpusShapesOf(in)
+	// the commit order is behind an unexported field with one accessor, so the vector it IS
+	// does not appear in the walk above any more than its per-entry dimensions do
+	vectors[corpusOrderPath] = len(list.All())
 	return corpusFixtureUnderTest{name: name, dimensions: dimensions,
 		relations: corpusRelationVerdictsOf(crypto, in, pairs),
-		leaves:    corpusLeafIndicesOf(in), order: list.All(), now: now}
+		leaves:    corpusLeafIndicesOf(in), vectors: vectors, clocks: clocks,
+		order: list.All()}
 }
 
 // fixtureCorporaUnderMeasurement is the corpus of every door, keyed by the validation input it is a
@@ -1479,7 +1589,7 @@ func fixtureCorporaUnderMeasurement() map[string]func(*testing.T,
 					continue
 				}
 				built = append(built, corpusFixtureReducedTo(crypto, name, in, in.List,
-					in.Now, compared))
+					compared))
 			}
 			return built, len(corpus)
 		},
@@ -1515,7 +1625,7 @@ func measureCommitCorpus(t *testing.T, crypto CryptoProvider) commitCorpusMeasur
 			continue
 		}
 		measured.fixtures = append(measured.fixtures,
-			corpusFixtureReducedTo(crypto, name, in, in.List, in.Now, compared))
+			corpusFixtureReducedTo(crypto, name, in, in.List, compared))
 		same, err := testTreesHashAlike(t, crypto, in.PreTree, in.PostTree)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -1529,15 +1639,29 @@ func measureCommitCorpus(t *testing.T, crypto CryptoProvider) commitCorpusMeasur
 
 // assertCorpusSeparatesItsDimensions is the gate, written once and stated at both doors.
 //
-// SIX CLAIMS. Two of them are classes -- every dimension, and every RELATION between two dimensions
-// -- and the other four are shapes neither class can see.
+// SIX CLAIMS, AND FIVE OF THEM ARE CLASSES.
 //
 //	no dimension is one value across the corpus     -- the class itself
 //	no pair the doors compare is jointly degenerate -- the second class, and see below
-//	the widest leaf index does not fit in one octet -- a comparator truncated to its low octet
-//	a commit order longer than one entry exists     -- a loop against a read of its head
-//	one fixture's clock is not the wall clock       -- in.Now against a call to time.Now()
+//	no vector dimension is always at most one long  -- a loop against a read of its head
+//	no timestamp dimension is the wall clock        -- a field against a call to time.Now()
+//	no LEAF INDEX anywhere fits in one octet        -- a comparator truncated to its low octet
 //	the commit order is measured at all             -- the accessor call being dropped
+//
+// THE THIRD AND FOURTH USED TO NAME THEIR OWN FIELD, which is the same defect as a walk that names
+// its types, one level up: "no fixture carries more than one proposal" read in.List and said
+// nothing about any other vector, and "one fixture's clock is not the wall clock" read in.Now and
+// said nothing about any other timestamp. Both are now stated over every vector and every timestamp
+// corpusShapesOf reaches.
+//
+// THE FIFTH IS NOT WIDENED AND THE WORDING SAYS SO. "No other integer dimension fits in one octet"
+// is not a claim this corpus could satisfy or should: ProtocolVersionMls10 is 1 and a registered
+// ciphersuite code point is 1 or 2, so demanding every integer dimension exceed 255 would demand
+// fixtures announcing values no build accepts. A LEAF INDEX is different in kind -- it is the only
+// integer these doors decide IDENTITY by, it is the one whose comparator a truncation to its low
+// octet leaves exact over every group that fits in one octet, and that truncation was measured
+// green on this tree. So the claim is about leaf indices, by that argument, rather than about
+// integers by an omission.
 //
 // THE RELATION CLAIM IS NOT AN INSTANCE OF THE DIMENSION CLAIM and this file's last round is the
 // proof: Own took four values and Committer took four, so both were separated, and every fixture
@@ -1546,11 +1670,12 @@ func measureCommitCorpus(t *testing.T, crypto CryptoProvider) commitCorpusMeasur
 // Which pairs are demanded is derived off this package's own source; see
 // fixture_relations_test.go.
 //
-// THE LAST FOUR ARE INSTANCES OF NEITHER. A list's length is not a value at any path, the widest
-// leaf index lives below the hop bound, and a corpus whose clocks are eleven distinct calls to
-// time.Now() separates the Now dimension while leaving the field and the call the same program.
-// Each is named with the mutation it exists to make fail, which is what the two classes give every
-// other dimension and every other pair for free.
+// THE LAST FOUR ARE INSTANCES OF NEITHER OF THE FIRST TWO. A vector's length is not a value at any
+// path -- two lists of different lengths are two different renderings and the dimension claim is
+// satisfied by either -- the widest leaf index lives below the hop bound, and a corpus whose clocks
+// are eleven distinct calls to time.Now() separates the Now dimension while leaving the field and
+// the call the same program. Each is named with the mutation it exists to make fail, which is what
+// the two classes give every other dimension and every other pair for free.
 func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int,
 	fixtures []corpusFixtureUnderTest, compared []comparisonPair) {
 
@@ -1564,11 +1689,21 @@ func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int
 	}
 
 	dimensions := map[string]map[string][]string{}
-	lengths := map[int][]string{}
+	longest := map[string]int{}
+	furthestFromNow := map[string]time.Duration{}
 	widest, widestIn := LeafIndex(0), ""
-	offTheWallClock := []string{}
 	carriesEntries := false
 	for _, fixture := range fixtures {
+		for path, length := range fixture.vectors {
+			if length > longest[path] {
+				longest[path] = length
+			}
+		}
+		for path, at := range fixture.clocks {
+			if apart := time.Since(at).Abs(); apart > furthestFromNow[path] {
+				furthestFromNow[path] = apart
+			}
+		}
 		for path, values := range fixture.dimensions {
 			if dimensions[path] == nil {
 				dimensions[path] = map[string][]string{}
@@ -1582,11 +1717,7 @@ func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int
 				widest, widestIn = at, fixture.name
 			}
 		}
-		lengths[len(fixture.order)] = append(lengths[len(fixture.order)], fixture.name)
 		carriesEntries = carriesEntries || len(fixture.order) > 0
-		if time.Since(fixture.now).Abs() > corpusClockSeparation {
-			offTheWallClock = append(offTheWallClock, fixture.name)
-		}
 	}
 
 	if len(dimensions) == 0 {
@@ -1604,19 +1735,42 @@ func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int
 		t.Errorf("every fixture in the %s corpus carries %s = %s, so that field and that constant are the same program and no test here can tell a rule reading the field from a rule reading the constant. Give one fixture a different value for it",
 			label, path, only)
 	}
-	t.Logf("%s: %d fixtures, %d dimensions, widest leaf index %d (in %s), commit orders of %v, %d fixture(s) off the wall clock",
-		label, len(fixtures), len(dimensions), widest, widestIn,
-		slices.Sorted(maps.Keys(lengths)), len(offTheWallClock))
+	t.Logf("%s: %d fixtures, %d dimensions, widest leaf index %d (in %s), %d vector dimension(s), %d timestamp dimension(s)",
+		label, len(fixtures), len(dimensions), widest, widestIn, len(longest),
+		len(furthestFromNow))
 
 	// the narrowest integer width there is, which is what a truncated comparator collapses to
 	if octet := LeafIndex(math.MaxUint8); widest <= octet {
 		t.Errorf("the widest leaf index in the %s corpus is %d and one octet holds %d, so a comparison of leaf indices one octet wide is exact over every input here. Measured: the join's Sender comparator truncated to its low octet left the whole suite green",
 			label, widest, octet)
 	}
-	if !slices.ContainsFunc(slices.Sorted(maps.Keys(lengths)), func(at int) bool { return at > 1 }) {
-		t.Errorf("no fixture in the %s corpus carries more than one proposal -- the lengths are %v -- so a loop over the commit order and a read of its head answer alike, which is the shape four bypasses of the commit door took",
-			label, slices.Sorted(maps.Keys(lengths)))
+	if len(longest) == 0 {
+		t.Errorf("the walk found no vector dimension anywhere in the %s corpus, so the length claim below holds vacuously",
+			label)
 	}
+	for _, path := range slices.Sorted(maps.Keys(longest)) {
+		if longest[path] > 1 {
+			continue
+		}
+		t.Errorf("no fixture in the %s corpus carries more than one entry at %s -- the longest is %d -- so a loop over it and a read of its head answer alike, which is the shape four bypasses of the commit door took",
+			label, path, longest[path])
+	}
+	if len(furthestFromNow) == 0 {
+		t.Errorf("the walk found no timestamp anywhere in the %s corpus, so the clock claim below holds vacuously",
+			label)
+	}
+	for _, path := range slices.Sorted(maps.Keys(furthestFromNow)) {
+		if furthestFromNow[path] > corpusClockSeparation {
+			continue
+		}
+		t.Errorf("every fixture in the %s corpus carries a %s within %s of now -- the furthest is %s away -- so that field and a call to time.Now() answer every lifetime alike and the field is the call. Give one fixture a clock a lifetime is decided differently under",
+			label, path, corpusClockSeparation, furthestFromNow[path])
+	}
+	// corpusOrderPath is ONE NAME USED TWICE -- corpusListDimensionsInto writes the per-entry
+	// dimensions under it and this reads them back -- rather than a class stated by
+	// enumeration. There is nothing here to derive: the claim is that the accessor call still
+	// happens, and the only evidence of that is dimensions appearing under the path the call
+	// writes them to.
 	measuresEntries := false
 	for path := range dimensions {
 		measuresEntries = measuresEntries || strings.HasPrefix(path, corpusOrderPath)
@@ -1624,10 +1778,6 @@ func assertCorpusSeparatesItsDimensions(t *testing.T, label string, expected int
 	if carriesEntries && !measuresEntries {
 		t.Errorf("fixtures in the %s corpus carry proposals and the measurement holds no dimension beneath %s, so the commit order is reached by nothing here. Its entries are behind an unexported field with one accessor, so losing that call loses every per-entry dimension -- the sender among them -- and no other claim would notice",
 			label, corpusOrderPath)
-	}
-	if len(offTheWallClock) == 0 {
-		t.Errorf("every fixture in the %s corpus carries a clock within %s of now, so in.Now and a call to time.Now() answer every lifetime alike and the field is the call. Give one fixture a clock a lifetime is decided differently under",
-			label, corpusClockSeparation)
 	}
 	assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t, label, fixtures, compared)
 }
@@ -1843,6 +1993,154 @@ func TestEveryValidationInputCorpusIsJudgedTheWayItsRowsSay(t *testing.T) {
 			t.Errorf("this file drives a corpus of %s and this package declares no such type", name)
 		}
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// the POPULATION the rules are actually driven over
+// ---------------------------------------------------------------------------
+//
+// A CORPUS IS NOT A POPULATION. Everything above is stated over the registry rows, and the inputs
+// this package's rules are actually driven with are built at call sites -- fifty-two of
+// testValidationInput alone, of which forty-nine passed the committer as `LeafIndex(0)`. A perfect
+// corpus and a door whose own per-rule tests are every one of them judged at leaf zero coexist
+// happily: measured, ValSem111's `updates[i].Sender == in.Committer` could be replaced by
+// `== LeafIndex(0)` and survive every test written against that rule, dying only in a gate about
+// bucket positions that had no interest in the committer at all.
+//
+// SO THE CALL SITES ARE HELD TOO, and the claim over them is stated as a property of the SPELLING
+// rather than as a count. A number written into a call site says which leaf, which width or which
+// epoch the fixture uses and says nothing about WHY; a named constant is a place to put the why,
+// and -- this is the half that matters here -- it is a single place to change when the answer
+// stops being right. `LeafIndex(0)` at forty-nine sites was forty-nine independent decisions
+// nobody had made; testCommitterLeaf at forty-nine sites is one.
+
+// validationInputBuildersInSource is every function this package's test files declare that answers
+// a validation input of ANY type this package declares, which is the population's own class.
+func validationInputBuildersInSource(t *testing.T) []string {
+	t.Helper()
+	found := []string{}
+	for _, named := range validationInputTypesInSource(t) {
+		found = append(found, validationFixtureBuildersInSource(t, named)...)
+	}
+	slices.Sort(found)
+	return slices.Compact(found)
+}
+
+// packageDeclaredTypeNames is every type name a conversion in this package can be spelled with:
+// the types the package declares, and the numeric builtins.
+//
+// IT IS WHAT TELLS A CONVERSION FROM A CALL. `LeafIndex(0)` and `testRemoveOf(0)` are the same AST
+// shape, and only one of them is a number wearing a type; a walk that could not tell them apart
+// would either miss every typed literal or refuse every fixture helper that takes one.
+func packageDeclaredTypeNames(t *testing.T) map[string]bool {
+	t.Helper()
+	found := map[string]bool{}
+	for _, name := range []string{"int", "int8", "int16", "int32", "int64", "uint", "uint8",
+		"uint16", "uint32", "uint64", "uintptr", "byte", "rune", "float32", "float64"} {
+		found[name] = true
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read this package's own directory: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			continue
+		}
+		file, err := parser.ParseFile(fileSet, entry.Name(), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		for _, declared := range file.Decls {
+			general, isGeneral := declared.(*ast.GenDecl)
+			if !isGeneral || general.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range general.Specs {
+				if typed, isTyped := spec.(*ast.TypeSpec); isTyped {
+					found[typed.Name.Name] = true
+				}
+			}
+		}
+	}
+	return found
+}
+
+// isBareNumber answers whether an argument is A NUMBER WITH NO NAME: a numeric literal, or a
+// conversion of one to a type this package declares.
+func isBareNumber(expr ast.Expr, types map[string]bool) bool {
+	switch node := expr.(type) {
+	case *ast.BasicLit:
+		return node.Kind == token.INT || node.Kind == token.FLOAT
+	case *ast.ParenExpr:
+		return isBareNumber(node.X, types)
+	case *ast.CallExpr:
+		ident, isIdent := node.Fun.(*ast.Ident)
+		if !isIdent || !types[ident.Name] || len(node.Args) != 1 {
+			return false
+		}
+		return isBareNumber(node.Args[0], types)
+	}
+	return false
+}
+
+// TestNoValidationInputIsBuiltFromANumberWithNoName holds the population.
+//
+// DERIVED IN BOTH DIRECTIONS: the builders are read off the result type, the type names that make a
+// conversion a conversion are read off the package's own declarations, and the call sites are read
+// off every test file. A builder written tomorrow is measured on the run after it is written.
+//
+// WHAT IT REFUSES is a literal at a fixture's call site, whatever the literal means. That is wider
+// than the leaf indices this round was sent for, and deliberately: the epoch a fixture runs in, the
+// width of the group it builds and the position it puts an offender at are the same kind of
+// decision, and each of them has been a pinned dimension in this package at some point.
+func TestNoValidationInputIsBuiltFromANumberWithNoName(t *testing.T) {
+	builders := validationInputBuildersInSource(t)
+	if len(builders) == 0 {
+		t.Fatalf("no function in this package's test files answers a validation input, so this claim is stated over nothing")
+	}
+	types := packageDeclaredTypeNames(t)
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read this package's own directory: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	called := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fileSet, entry.Name(), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			ident, isIdent := call.Fun.(*ast.Ident)
+			if !isIdent || !slices.Contains(builders, ident.Name) {
+				return true
+			}
+			called += 1
+			for at, argument := range call.Args {
+				if !isBareNumber(argument, types) {
+					continue
+				}
+				t.Errorf("%s:%d: %s is handed a number with no name at argument %d. A literal at a fixture call site is a decision about which leaf, which epoch or which width this input runs at that nobody wrote down, and it is the shape the corpus kept drifting back into: the committer was spelled LeafIndex(0) at forty-nine of fifty-two call sites of testValidationInput and no test anywhere said why. Name it",
+					entry.Name(), fileSet.Position(argument.Pos()).Line, ident.Name, at)
+			}
+			return true
+		})
+	}
+	if called == 0 {
+		t.Errorf("no call to any of the %d validation input builders %v was found in this package's test files, so the walk read something other than the call sites",
+			len(builders), builders)
+	}
+	t.Logf("%d builders, %d call sites", len(builders), called)
 }
 
 // testTreesHashAlike answers whether two trees are the same tree by the one identity a ratchet tree

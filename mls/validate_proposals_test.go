@@ -211,13 +211,51 @@ func testRequiredCapabilitiesExtension(t *testing.T) Extension {
 // saying so.
 const testCommitterLeaf = LeafIndex(1)
 
-// testOwnLeaf is the leaf the member JUDGING these commits sits at, and it is neither zero nor the
-// committer's.
+// testOwnLeaf is the leaf the member JUDGING these commits sits at, and it IS leaf zero, which is
+// deliberate and is the opposite of what this comment used to claim.
 //
-// ValSem203PathDecrypt returns before it reads a tree at all when Own == Committer -- "the
-// committer seals nothing to itself" -- so a corpus that judged every commit as its own committer
-// drove none of that rule's tree reads. Own and Committer differing is what makes them run.
+// THE SENTENCE HERE SAID "neither zero nor the committer's" WHILE THE LINE BELOW IT SAID ZERO, and
+// validate_commit_test.go repeated the claim -- so a reader auditing ValSem203PathDecrypt's
+// leaf-zero exposure was told by two files that it could not exist. It could: `in.Own ==
+// in.Committer` was replaced by `in.Own == LeafIndex(0)` with the whole suite green, because Own
+// was 0 and Committer 1 in every fixture and the two mutants agree wherever that holds.
+//
+// LEAF ZERO IS WHERE THE FIELD AND THE CONSTANT DISAGREE, which is why it stays. What was missing
+// was not a different number here but the OTHER witness: an input in which Own and Committer are
+// the same leaf. testCommitTheCommitterJudgesItselfFromABlankSibling is that input, and the
+// relation claim in fixture_corpus_test.go is what holds the corpus to carrying both.
+//
+// Own differing from Committer is still what makes ValSem203's tree reads run at all: the rule
+// returns before it touches a tree when the two agree -- "the committer seals nothing to itself".
 const testOwnLeaf = LeafIndex(0)
+
+// testUpdatedLeaf is the member every update and single-leaf remove fixture of this file is ABOUT,
+// and it is not the committer's leaf.
+//
+// DERIVED FROM testCommitterLeaf RATHER THAN WRITTEN AS A NUMBER, and held to it by
+// TestTheLeafTheseFixturesUpdateIsNotTheCommitters. ValSem111 refuses a list covering the
+// committer's own update and validateCommitterIsNotRemoved refuses one removing its leaf, so a
+// fixture whose subject drifted onto the committer's leaf would be refused by one of those two
+// rather than by the rule it is a fixture for -- and every negative assertion over it would go on
+// passing, because they all assert THAT the aggregate refuses.
+//
+// It used to be able to be written as a number because the inputs of this file were all judged at
+// leaf zero: the committer was LeafIndex(0) at forty-nine of fifty-two call sites, so "not the
+// committer" and "not leaf zero" were the same sentence and neither was stated.
+const testUpdatedLeaf = testCommitterLeaf ^ 1
+
+// TestTheLeafTheseFixturesUpdateIsNotTheCommitters holds the two constants apart.
+//
+// It is one line because the constants are one line, and it is here because the alternative is a
+// comment: every negative fixture of this file asserts THAT the aggregate refuses, so a subject
+// that drifted onto the committer's leaf would be refused by ValSem111 or by
+// validateCommitterIsNotRemoved and every one of those assertions would go on passing.
+func TestTheLeafTheseFixturesUpdateIsNotTheCommitters(t *testing.T) {
+	if testUpdatedLeaf == testCommitterLeaf {
+		t.Fatalf("the fixtures of this file update leaf %d and commit from leaf %d; every rule they are built for is then unreachable behind the two rules that refuse a committer judging itself",
+			testUpdatedLeaf, testCommitterLeaf)
+	}
+}
 
 // testValidationGroupId is the group id every input below is judged under.
 
@@ -392,7 +430,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				tree, _ := testTreeWith(t, crypto, "alice")
 				psk := CachedProposal{Proposal: Proposal{
 					ProposalType: ProposalTypePreSharedKey, PreSharedKey: &PreSharedKey{}}}
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					NewProposalList([]CachedProposal{psk}))
 			}},
 		"validateOneGroupContextExtensions": {sentinel: errMultipleGroupContextExtensions,
@@ -400,7 +438,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				tree, _ := testTreeWith(t, crypto, "alice")
 				one := testGceOf(Extension{ExtensionType: ExtensionType(0x00FF), ExtensionData: []byte{1}})
 				two := testGceOf(Extension{ExtensionType: ExtensionType(0x00FF), ExtensionData: []byte{2}})
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, one, two))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, one, two))
 			}},
 		// two entries of one commit naming one cached proposal. They remove DIFFERENT leaves,
 		// so no content rule of this file could answer instead.
@@ -411,7 +449,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				first.ByValue, first.Ref = false, ProposalRef([]byte("one-name"))
 				second := testRemoveOf(2)
 				second.ByValue, second.Ref = false, ProposalRef([]byte("one-name"))
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, first, second))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, first, second))
 			}},
 		"ValSem101UniqueSignatureKey": {sentinel: ErrAddDuplicateSignatureKey,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
@@ -419,7 +457,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				carol := testIdentity(t, crypto, "carol")
 				first, _, _ := testKeyPackage(t, crypto, carol)
 				second, _, _ := testKeyPackage(t, crypto, carol)
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testAddOf(first), testAddOf(second)))
 			}},
 		"ValSem102UniqueInitKey": {sentinel: ErrDuplicateInitKey,
@@ -428,7 +466,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				dave, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
 				erin, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
 				erin.InitKey = dave.InitKey
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testAddOf(dave), testAddOf(erin)))
 			}},
 		"ValSem103UniqueEncryptionKey": {sentinel: ErrAddDuplicateEncryptionKey,
@@ -437,7 +475,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				dave, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
 				erin, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
 				erin.LeafNode.EncryptionKey = dave.LeafNode.EncryptionKey
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testAddOf(dave), testAddOf(erin)))
 			}},
 		"ValSem104InitNotEqualEncryptionKey": {sentinel: ErrInitEqualsEncryptionKey,
@@ -445,7 +483,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				tree, _ := testTreeWith(t, crypto, "alice")
 				dave, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
 				dave.InitKey = HpkePublicKey(dave.LeafNode.EncryptionKey)
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testAddOf(dave)))
 			}},
 		"ValSem105SuiteAndVersionMatch": {sentinel: ErrSuiteMismatch,
@@ -453,14 +491,14 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				tree, _ := testTreeWith(t, crypto, "alice")
 				dave, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
 				dave.Version = ProtocolVersion(0x0002)
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testAddOf(dave)))
 			}},
 		"ValSem106RequiredCapabilitiesSatisfied": {sentinel: ErrAddMissingRequiredCapability,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, _ := testTreeWith(t, crypto, "alice")
 				dave, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
-				in := testValidationInput(t, crypto, tree, LeafIndex(0),
+				in := testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testAddOf(dave)))
 				in.Context.Extensions = []Extension{testRequiredCapabilitiesExtension(t)}
 				return in
@@ -468,83 +506,89 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 		"ValSem107UniqueRemove": {sentinel: ErrDuplicateRemove,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, _ := testTreeWith(t, crypto, "alice", "bob")
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testRemoveOf(1), testRemoveOf(1)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testRemoveOf(testUpdatedLeaf),
+						testRemoveOf(testUpdatedLeaf)))
 			}},
 		"ValSem108RemoveExists": {sentinel: ErrRemoveNonMember,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, _ := testTreeWith(t, crypto, "alice", "bob")
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testRemoveOf(9)))
 			}},
 		"ValSem109UpdateRequiredCapabilities": {sentinel: ErrUpdateMissingRequiredCapability,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				leaf, _ := testLeafNode(t, crypto, members[1])
-				in := testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				leaf, _ := testLeafNode(t, crypto, members[testUpdatedLeaf])
+				in := testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 				in.Context.Extensions = []Extension{testRequiredCapabilitiesExtension(t)}
 				return in
 			}},
-		// bob's update republishes carol's encryption key, which no member may hold twice
+		// the updated member republishes carol's encryption key, which no member may hold twice
 		"ValSem110UpdateUniqueEncryptionKey": {sentinel: ErrUpdateDuplicateEncryptionKey,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
-				leaf, _ := testLeafNode(t, crypto, members[1])
+				leaf, _ := testLeafNode(t, crypto, members[testUpdatedLeaf])
 				leaf.EncryptionKey = tree.Leaf(2).EncryptionKey
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 			}},
 		"ValSem111NoCommitterUpdate": {sentinel: ErrSelfUpdateInCommit,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				leaf, _ := testLeafNode(t, crypto, members[0])
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(0, leaf)))
+				leaf, _ := testLeafNode(t, crypto, members[testCommitterLeaf])
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testCommitterLeaf, leaf)))
 			}},
 		"ValSem112UpdateSenderIsMember": {sentinel: ErrUpdateSenderNotMember,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
 				leaf, _ := testLeafNode(t, crypto, members[1])
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
 					testProposalList(t, testUpdateOf(9, leaf)))
 			}},
-		// bob's own update leaf, signed at bob's own index -- and then signed AGAIN by alice, so
-		// what the leaf publishes and what signed it are two different members. Every other field
-		// is well formed, which is the point: before this door existed the leaf went into the tree
-		// with nothing having verified the signature at all.
+		// the updated member's own leaf, signed at its own index -- and then signed AGAIN by the
+		// committer, so what the leaf publishes and what signed it are two different members.
+		// Every other field is well formed, which is the point: before this door existed the leaf
+		// went into the tree with nothing having verified the signature at all.
 		"validateUpdateLeafNodeIsValidForAnUpdate": {sentinel: ErrUpdateLeafNodeInvalid,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-					testResignedUpdateOf(t, crypto, members[0], LeafIndex(1), leaf)))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf],
+					testUpdatedLeaf)
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[testCommitterLeaf],
+						testUpdatedLeaf, leaf)))
 			}},
-		// bob's update, well formed and correctly signed, republishing the encryption key bob's
-		// leaf already holds. ValSem110 excludes exactly that key from what it compares against,
-		// so no other rule of this file can answer for this one.
+		// that member's update, well formed and correctly signed, republishing the encryption key
+		// its leaf already holds. ValSem110 excludes exactly that key from what it compares
+		// against, so no other rule of this file can answer for this one.
 		"validateUpdateChangesTheEncryptionKey": {sentinel: ErrUpdateEncryptionKeyUnchanged,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				leaf.EncryptionKey = tree.Leaf(1).EncryptionKey
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf],
+					testUpdatedLeaf)
+				leaf.EncryptionKey = tree.Leaf(testUpdatedLeaf).EncryptionKey
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[testUpdatedLeaf],
+						testUpdatedLeaf, leaf)))
 			}},
 		// an update and a remove landing on one leaf. Two removes would be ValSem107's, which
 		// is why this pair is mixed.
 		"validateSingleUpdateOrRemovePerLeaf": {sentinel: ErrUpdateOrRemoveSameLeaf,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, update, testRemoveOf(1)))
+				update, _ := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf],
+					testUpdatedLeaf)
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, update, testRemoveOf(testUpdatedLeaf)))
 			}},
 		"validateCommitterIsNotRemoved": {sentinel: ErrRemoveCommitter,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, _ := testTreeWith(t, crypto, "alice", "bob")
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testRemoveOf(0)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testRemoveOf(testCommitterLeaf)))
 			}},
 	}
 }
@@ -808,9 +852,9 @@ func TestValidateProposalListAcceptsAValidList(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol")
 	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
-	update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	update, _ := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 	list := testProposalList(t, update, testRemoveOf(2), testAddOf(kp))
-	if err := ValidateProposalList(testValidationInput(t, crypto, tree, LeafIndex(0), list)); err != nil {
+	if err := ValidateProposalList(testValidationInput(t, crypto, tree, testCommitterLeaf, list)); err != nil {
 		t.Fatalf("ValidateProposalList: %v", err)
 	}
 }
@@ -827,14 +871,14 @@ func TestValSem101AcceptsAnAddOfAMemberTheSameListRemoves(t *testing.T) {
 	// bob's own signature key, arriving again in a key package, beside a remove of bob's leaf
 	kp, _, _ := testKeyPackage(t, crypto, members[1])
 	list := testProposalList(t, testRemoveOf(1), testAddOf(kp))
-	in := testValidationInput(t, crypto, tree, LeafIndex(0), list)
+	in := testValidationInput(t, crypto, tree, testCommitterLeaf, list)
 	if err := ValSem101UniqueSignatureKey(in); err != nil {
 		t.Fatalf("ValSem101 over a rejoin refused it: %v", err)
 	}
 	// and the same list without the remove is the refusal, which is what says the exemption is
 	// doing the work rather than the fixture being toothless
 	without := testProposalList(t, testAddOf(kp))
-	if err := ValSem101UniqueSignatureKey(testValidationInput(t, crypto, tree, LeafIndex(0), without)); !errors.Is(err, ErrAddDuplicateSignatureKey) {
+	if err := ValSem101UniqueSignatureKey(testValidationInput(t, crypto, tree, testCommitterLeaf, without)); !errors.Is(err, ErrAddDuplicateSignatureKey) {
 		t.Fatalf("ValSem101 over the same add with no remove answered %v, want %v", err, ErrAddDuplicateSignatureKey)
 	}
 }
@@ -853,7 +897,7 @@ func TestValSem110ExcludesAnUpdatingLeafsOwnOutgoingKey(t *testing.T) {
 	// bob republishing the key bob's leaf already holds: legal, because that leaf is being
 	// replaced by this very proposal
 	leaf.EncryptionKey = tree.Leaf(1).EncryptionKey
-	in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, testUpdateOf(1, leaf)))
+	in := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, testUpdateOf(1, leaf)))
 	if err := ValSem110UpdateUniqueEncryptionKey(in); err != nil {
 		t.Fatalf("ValSem110 refused a leaf republishing its own outgoing key: %v", err)
 	}
@@ -869,7 +913,7 @@ func TestValSem106ReadsTheExtensionsAGroupContextExtensionsProposalInTheSameList
 	tree, _ := testTreeWith(t, crypto, "alice")
 	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
 	list := testProposalList(t, testGceOf(testRequiredCapabilitiesExtension(t)), testAddOf(kp))
-	in := testValidationInput(t, crypto, tree, LeafIndex(0), list)
+	in := testValidationInput(t, crypto, tree, testCommitterLeaf, list)
 	if err := ValSem106RequiredCapabilitiesSatisfied(in); !errors.Is(err, ErrAddMissingRequiredCapability) {
 		t.Fatalf("ValSem106 answered %v, want %v; the requirement this commit adds is not being read",
 			err, ErrAddMissingRequiredCapability)
@@ -877,7 +921,7 @@ func TestValSem106ReadsTheExtensionsAGroupContextExtensionsProposalInTheSameList
 	// the control: the same add with no GCE beside it is accepted, so the refusal above is the
 	// proposal's doing rather than the fixture's
 	if err := ValSem106RequiredCapabilitiesSatisfied(testValidationInput(t, crypto, tree,
-		LeafIndex(0), testProposalList(t, testAddOf(kp)))); err != nil {
+		testCommitterLeaf, testProposalList(t, testAddOf(kp)))); err != nil {
 		t.Fatalf("ValSem106 refused an add under a group requiring nothing: %v", err)
 	}
 }
@@ -899,7 +943,7 @@ func TestRequiredCapabilitiesThatCannotBeReadIsARefusalRatherThanNoRequirement(t
 			ExtensionData: []byte{0xff, 0xff, 0xff}}},
 		"the extension twice": {testRequiredCapabilitiesExtension(t), testRequiredCapabilitiesExtension(t)},
 	} {
-		in := testValidationInput(t, crypto, tree, LeafIndex(0), list)
+		in := testValidationInput(t, crypto, tree, testCommitterLeaf, list)
 		in.Context.Extensions = exts
 		for rule, run := range map[string]func(*ProposalValidationInput) error{
 			"ValSem106": ValSem106RequiredCapabilitiesSatisfied,
@@ -935,7 +979,7 @@ func TestValSem113AnswersTheProfileGatesOwnValueForEveryTypeItRefuses(t *testing
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice")
 	answered := func(proposal Proposal) error {
-		return ValSem113ProposalTypeSupported(testValidationInput(t, crypto, tree, LeafIndex(0),
+		return ValSem113ProposalTypeSupported(testValidationInput(t, crypto, tree, testCommitterLeaf,
 			NewProposalList([]CachedProposal{{Proposal: proposal}})))
 	}
 	refused := 0
@@ -992,7 +1036,7 @@ func TestAnArmlessAddIsRefusedEvenWhenAnInnocentAddPrecedesIt(t *testing.T) {
 	if adds := list.Adds(); len(adds) != 2 {
 		t.Fatalf("the adds view answers %d of the two adds in the commit order", len(adds))
 	}
-	in := testValidationInput(t, crypto, tree, LeafIndex(0), list)
+	in := testValidationInput(t, crypto, tree, testCommitterLeaf, list)
 	if err := ValSem113ProposalTypeSupported(in); err == nil {
 		t.Fatal("the type door accepted an add with no add arm behind an innocent one")
 	}
@@ -1045,36 +1089,37 @@ func updateDoorFaults() map[string]updateDoorFault {
 			clause: "the leaf_node_source rule", inner: ErrLeafNodeSourceMismatch,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				leaf, _ := testLeafNode(t, crypto, members[1])
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				leaf, _ := testLeafNode(t, crypto, members[testUpdatedLeaf])
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 			}},
 		"a leaf another member signed": {
 			clause: "the signature rule", inner: errBadSignature,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-					testResignedUpdateOf(t, crypto, members[0], LeafIndex(1), leaf)))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[testCommitterLeaf], testUpdatedLeaf, leaf)))
 			}},
-		// the leaf index half of the section 7.2 context select: bob's own leaf, bob's own
-		// signature, signed at leaf 0 and offered at leaf 1
+		// the leaf index half of the section 7.2 context select: the updated member's own leaf,
+		// its own signature, signed at the committer's index and offered at its own
 		"a leaf signed at another index": {
 			clause: "the signature rule, over the leaf index it is bound to", inner: errBadSignature,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				leaf, _ := testUpdateLeafNode(t, crypto, members[1], testValidationGroupId(), LeafIndex(0))
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				leaf, _ := testUpdateLeafNode(t, crypto, members[testUpdatedLeaf], testValidationGroupId(),
+					testCommitterLeaf)
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 			}},
 		// and the group id half of it
 		"a leaf signed in another group": {
 			clause: "the signature rule, over the group id it is bound to", inner: errBadSignature,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				leaf, _ := testUpdateLeafNode(t, crypto, members[1], []byte("another group"), LeafIndex(1))
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				leaf, _ := testUpdateLeafNode(t, crypto, members[testUpdatedLeaf], []byte("another group"), testUpdatedLeaf)
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 			}},
 		// x509's registered code point, which testCapabilities does not list. The leaf is NOT
 		// re-signed and does not need to be: section 7.3 puts the credential rule ahead of the
@@ -1090,29 +1135,29 @@ func updateDoorFaults() map[string]updateDoorFault {
 			clause: "section 7.2's credential type rule", inner: errCredentialTypeNotListed,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 				leaf.Credential.CredentialType = CredentialType(0x0002)
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 			}},
 		"a leaf that does not list the group's ciphersuite": {
 			clause: "section 11.1's ciphersuite rule", inner: errCipherSuiteNotListed,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 				leaf.Capabilities.CipherSuites = []CipherSuite{}
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf, leaf)))
 			}},
 		"a leaf carrying an extension it does not list": {
 			clause: "the leaf extension rule", inner: errLeafExtensionNotListed,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 				leaf.Extensions = append(leaf.Extensions,
 					Extension{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}})
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf, leaf)))
 			}},
 		// MASTER section 5.3's range check, which (*LeafNode).Validate makes on the whole entry
 		// rather than on its body. An update is how a member changes its device keys, so a
@@ -1122,10 +1167,10 @@ func updateDoorFaults() map[string]updateDoorFault {
 			clause: "the leaf keys range check", inner: ErrLeafKeysExtensionInvalid,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 				leaf.Extensions[0].ExtensionData = []byte{0xff, 0xff}
-				return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-					testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+					testResignedUpdateOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf, leaf)))
 			}},
 		// the argument rule, which is a refusal of this door like any other: every rule of this
 		// file is reachable with a provider nobody supplied, and a validator that dereferenced one
@@ -1134,8 +1179,8 @@ func updateDoorFaults() map[string]updateDoorFault {
 			clause: "the provider rule", inner: ErrNilCryptoProvider,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, update))
+				update, _ := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
+				in := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, update))
 				in.Crypto = nil
 				return in
 			}},
@@ -1148,8 +1193,8 @@ func updateDoorFaults() map[string]updateDoorFault {
 			clause: "section 13.4 as corrected by erratum 8745", inner: errGroupContextExtensionNotListed,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, update))
+				update, _ := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
+				in := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, update))
 				in.Context.Extensions = []Extension{
 					{ExtensionType: ExtensionType(0xF00A), ExtensionData: []byte{1}}}
 				return in
@@ -1171,12 +1216,12 @@ func updateDoorFaults() map[string]updateDoorFault {
 			inner:  errProfileCredentialType,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+				_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 				leaf.Credential.CredentialType = CredentialType(0x0002)
 				leaf.Capabilities.Credentials = append(leaf.Capabilities.Credentials,
 					CredentialType(0x0002))
-				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					testProposalList(t, testUpdateOf(1, leaf)))
+				return testValidationInput(t, crypto, tree, testCommitterLeaf,
+					testProposalList(t, testUpdateOf(testUpdatedLeaf, leaf)))
 			}},
 		// errMissingRequiredCapability, which is Capabilities.Supports' own value: the fifth
 		// return site of the sentinel the four clauses above WRAP, and the only one outside
@@ -1194,8 +1239,8 @@ func updateDoorFaults() map[string]updateDoorFault {
 			alsoRefusedBy: []string{"ValSem109UpdateRequiredCapabilities"},
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
 				tree, members := testTreeWith(t, crypto, "alice", "bob")
-				update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-				in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, update))
+				update, _ := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
+				in := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, update))
 				in.Context.Extensions = []Extension{testRequiredCapabilitiesExtension(t)}
 				return in
 			}},
@@ -1444,11 +1489,11 @@ func TestEveryRefusalTheLeafValidatorCanAnswerHasAnUpdateDoorRowOrAnAdmittedReas
 func TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob")
-	_, leaf := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+	_, leaf := testUpdateProposalOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf)
 	// an interval that ended in 1970, which no clock and no skew can make current
 	leaf.Lifetime = Lifetime{NotBefore: 1, NotAfter: 2}
-	in := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
-		testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), leaf)))
+	in := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
+		testResignedUpdateOf(t, crypto, members[testUpdatedLeaf], testUpdatedLeaf, leaf)))
 	if err := validateUpdateLeafNodeIsValidForAnUpdate(in); err != nil {
 		t.Fatalf("the update door refused an update leaf carrying an expired lifetime with %v; the lifetime is a variant field this source does not carry, so nothing here may read it",
 			err)
@@ -1459,7 +1504,8 @@ func TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry(t *testing.T
 	// and the clause exists: the same interval under the source that DOES carry it, with the
 	// clock every sending path passes
 	expired := &LeafValidationContext{
-		Crypto: crypto, Suite: crypto.Suite(), GroupId: testValidationGroupId(), LeafIndex: 1,
+		Crypto: crypto, Suite: crypto.Suite(), GroupId: testValidationGroupId(),
+		LeafIndex: testUpdatedLeaf,
 		ExpectedSource: LeafNodeSourceUpdate,
 		NowMs:          uint64(max(time.Now().UnixMilli(), 1)),
 		ClockSkewMs:    leafLifetimeSkewSeconds * 1000,
@@ -1470,7 +1516,7 @@ func TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry(t *testing.T
 	}
 	expired.ExpectedSource = LeafNodeSourceKeyPackage
 	leaf.LeafNodeSource = LeafNodeSourceKeyPackage
-	if err := leaf.Sign(crypto, members[1].SigPriv, nil, 0); err != nil {
+	if err := leaf.Sign(crypto, members[testUpdatedLeaf].SigPriv, nil, 0); err != nil {
 		t.Fatalf("re-sign the leaf under the key_package source: %v", err)
 	}
 	if err := leaf.Validate(expired); !errors.Is(err, ErrLeafNodeLifetime) {
@@ -1495,7 +1541,7 @@ func TestValSem110AndTheEncryptionKeyRuleAreOppositeHalvesOfOneQuestion(t *testi
 	// bob republishing bob's own outgoing key
 	_, own := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
 	own.EncryptionKey = tree.Leaf(1).EncryptionKey
-	unchanged := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+	unchanged := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
 		testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), own)))
 	if err := ValSem110UpdateUniqueEncryptionKey(unchanged); err != nil {
 		t.Fatalf("ValSem110 refused a leaf republishing its own outgoing key: %v", err)
@@ -1508,7 +1554,7 @@ func TestValSem110AndTheEncryptionKeyRuleAreOppositeHalvesOfOneQuestion(t *testi
 	// and bob republishing carol's, which is the other half
 	_, borrowed := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
 	borrowed.EncryptionKey = tree.Leaf(2).EncryptionKey
-	duplicate := testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t,
+	duplicate := testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t,
 		testResignedUpdateOf(t, crypto, members[1], LeafIndex(1), borrowed)))
 	if err := ValSem110UpdateUniqueEncryptionKey(duplicate); !errors.Is(err, ErrUpdateDuplicateEncryptionKey) {
 		t.Fatalf("ValSem110 answered %v over an update publishing another member's key, want %v",
@@ -1541,7 +1587,7 @@ func TestTheUpdateDoorReadsTheEffectiveExtensionsAndNotTheGroupContextsOwn(t *te
 	base := func() *ProposalValidationInput {
 		tree, members := testTreeWith(t, crypto, "alice", "bob")
 		update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-		return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, update))
+		return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, update))
 	}
 	// the control every arm below is one change away from: the same update, judged against a
 	// group that requires nothing, is accepted
@@ -1558,7 +1604,7 @@ func TestTheUpdateDoorReadsTheEffectiveExtensionsAndNotTheGroupContextsOwn(t *te
 	// is FIRST in the list so that a door reading the list in order meets it before the update.
 	tree, members := testTreeWith(t, crypto, "alice", "bob")
 	update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-	sending := testValidationInput(t, crypto, tree, LeafIndex(0),
+	sending := testValidationInput(t, crypto, tree, testCommitterLeaf,
 		testProposalList(t, testGceOf(unsupported), update))
 	// arm three, the ordinary case: the group's own extensions, unchanged
 	ordinary := base()
@@ -1616,11 +1662,20 @@ func updateSweepFixture(t *testing.T, crypto CryptoProvider) *ProposalValidation
 	t.Helper()
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
 	entries := []CachedProposal{}
-	for at := 1; at < len(members); at += 1 {
+	for at := 0; at < len(members); at += 1 {
+		// SKIPPED BY COMPARISON WITH THE COMMITTER and not by starting the loop at one.
+		// The header says "one per member other than the committer" and the loop used to
+		// say "every member but leaf zero", which were the same sentence only while every
+		// input of this package sat at leaf zero. ValSem111 refuses a list covering the
+		// committer's own update, so the day the two stopped agreeing this fixture became
+		// one the aggregate refuses before any sweep rule runs.
+		if LeafIndex(at) == testCommitterLeaf {
+			continue
+		}
 		update, _ := testUpdateProposalOf(t, crypto, members[at], LeafIndex(at))
 		entries = append(entries, update)
 	}
-	return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, entries...))
+	return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, entries...))
 }
 
 // testRequiredCapabilitiesNaming is a required_capabilities extension over the types a caller

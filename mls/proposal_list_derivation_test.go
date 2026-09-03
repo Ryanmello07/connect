@@ -829,7 +829,12 @@ func testFullValidationInput(t *testing.T, crypto CryptoProvider,
 	tree, built := testTreeWith(t, crypto, names...)
 	third := members / 3
 	entries := []CachedProposal{}
-	for at := 1; at <= third; at += 1 {
+	// one update per member, the COMMITTER'S OWN SKIPPED: ValSem111 refuses a list covering it,
+	// and the leaf this loop used to start past was leaf zero rather than the committer
+	for at := 0; at < members && len(entries) < third; at += 1 {
+		if LeafIndex(at) == testCommitterLeaf {
+			continue
+		}
 		update, _ := testUpdateProposalOf(t, crypto, built[at], LeafIndex(at))
 		entries = append(entries, update)
 	}
@@ -842,7 +847,7 @@ func testFullValidationInput(t *testing.T, crypto CryptoProvider,
 	}
 	entries = append(entries, testGceOf(Extension{
 		ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: []byte{0x01}}))
-	return testValidationInput(t, crypto, tree, LeafIndex(0), testProposalList(t, entries...))
+	return testValidationInput(t, crypto, tree, testCommitterLeaf, testProposalList(t, entries...))
 }
 
 // TestDerivingTheViewsCostsLessThanTheRulesThatReadThem is the measurement the choice between
