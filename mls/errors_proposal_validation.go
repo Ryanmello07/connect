@@ -144,20 +144,18 @@ var (
 	// whose application order would otherwise decide what the leaf ends up holding.
 	ErrUpdateOrRemoveSameLeaf = errors.New("mls: a proposal list carries more than one update or remove applying to one leaf")
 
-	// The structural precondition every rule above is written against: a bucket holds only
-	// proposals of the type it is named for. A ProposalList that came out of
-	// (*ProposalCache).Resolve always does; one a caller assembled field by field can hold an
-	// Add in Removes, and every rule that then read cached.Proposal.Remove would take the
-	// caller's process rather than its call.
-	ErrProposalListMisbucketed = errors.New("mls: a proposal list holds a proposal in a bucket its type does not name")
-
-	// The second half of that precondition: the buckets are the commit order bucketed, so a
-	// bucket holds exactly as many proposals as the commit order carries of its type. It is a
-	// COUNT rule and says nothing about which proposals those are -- a caller that filled both
-	// fields with different proposals of one type is beyond what any cheap rule can see -- and
-	// what it does close is the one shape that silently loses work: an Adds bucket every rule
-	// of validate_proposals.go judges beside an All the application walks, one of them empty.
-	ErrProposalListBucketsDisagree = errors.New("mls: a proposal list's buckets are not its commit order bucketed by type")
+	// TWO STRUCTURAL VALUES USED TO STAND HERE AND BOTH ARE GONE, which is written down because a
+	// value deleted with no account reads as a value somebody lost.
+	//
+	// ErrProposalListMisbucketed said a bucket held a proposal of a type it was not named for, and
+	// ErrProposalListBucketsDisagree said the buckets were not the commit order bucketed by type.
+	// Both were preconditions of a ProposalList that carried its commit order and four per-type
+	// buckets as independently writable fields. The type now stores the commit ORDER alone and
+	// derives every per-type view from it -- see proposal_list.go -- so an entry of
+	// (*ProposalList).Removes is a Remove because that is the predicate it was selected by, and a
+	// view that disagrees with the order cannot be constructed. Neither value has an input left
+	// that could answer it, and a sentinel no input reaches is a rule that reports a clean bill
+	// forever.
 )
 
 // errNilProposalValidationInput is what the validation entry points answer instead of

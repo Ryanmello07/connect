@@ -87,8 +87,6 @@ var commitValidationBorrowedErrors = map[string]error{
 	"ErrNodeIsParent":                   ErrNodeIsParent,
 	"ErrNodeOutOfRange":                 ErrNodeOutOfRange,
 	"ErrNodeTypeMismatch":               ErrNodeTypeMismatch,
-	"ErrProposalListBucketsDisagree":    ErrProposalListBucketsDisagree,
-	"ErrProposalListMisbucketed":        ErrProposalListMisbucketed,
 	"ErrRatchetExhausted":               ErrRatchetExhausted,
 	"ErrRemoveCommitter":                ErrRemoveCommitter,
 	"ErrRootHasNoParent":                ErrRootHasNoParent,
@@ -1254,20 +1252,6 @@ func commitRuleCases() []commitRuleCase {
 			return ValidateCommit(testCommitInput(t, crypto, tree, list,
 				&Commit{Proposals: []ProposalOrRef{}}))
 		}},
-		// the bucket join, over the input the owner verified against the unmutated door: a list
-		// whose All IS the faithful resolution of the commit's vector and whose Removes bucket is
-		// empty. ValSem200 reads the bucket, so this commit -- which removes its own committer,
-		// RFC 9420 section 12.2's own rule -- was accepted by the whole aggregate.
-		{"CommitValidationInput.check", "ErrProposalListBucketsDisagree", func(t *testing.T) error {
-			crypto := testCrypto(t)
-			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
-			innocent := testRemoveOf(LeafIndex(2))
-			list := &ProposalList{
-				All:     []CachedProposal{innocent, testRemoveOf(LeafIndex(0))},
-				Removes: []CachedProposal{innocent},
-			}
-			return ValidateCommit(testCommitInput(t, crypto, tree, list, &Commit{}))
-		}},
 		// the extension join, with the disagreement in the MIDDLE of the installed vector
 		{"CommitValidationInput.check", "errCommitExtensionsNotApplied", func(t *testing.T) error {
 			crypto := testCrypto(t)
@@ -2064,9 +2048,9 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 	if failure := ValidateCommit(control); failure != nil {
 		t.Fatalf("ValidateCommit refused the commit every row below is one edit away from: %v", failure)
 	}
-	if len(control.List.All) < 2 || len(control.Commit.Proposals) < 2 {
+	if len(control.List.All()) < 2 || len(control.Commit.Proposals) < 2 {
 		t.Fatalf("the base carries %d list entries and %d vector entries; a base of one cannot tell the join's loop from a read of its head",
-			len(control.List.All), len(control.Commit.Proposals))
+			len(control.List.All()), len(control.Commit.Proposals))
 	}
 
 	// every row names the FIELD of a ProposalOrRef it makes the two disagree over, and the gate
@@ -2395,6 +2379,35 @@ func proposalListReaders() map[string]proposalListDoor {
 				list.Refs()
 				return nil
 			}},
+		// the commit order and the four per-type views of it. Written out rather than generated
+		// off the method set, because the sweep below is what generating them would defeat: a
+		// sixth accessor added later has to appear here, and a row that produced itself out of
+		// reflection would drive whatever the type happened to answer and say nothing.
+		"ProposalList.All": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.All()
+				return nil
+			}},
+		"ProposalList.Adds": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.Adds()
+				return nil
+			}},
+		"ProposalList.Updates": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.Updates()
+				return nil
+			}},
+		"ProposalList.Removes": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.Removes()
+				return nil
+			}},
+		"ProposalList.GCE": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.GCE()
+				return nil
+			}},
 	}
 }
 
@@ -2493,58 +2506,22 @@ func TestProposalListReadersIsEveryExportedDoorHandedAProposalList(t *testing.T)
 // guard written over element zero passes this, and so does a guard that stopped at the first entry
 // it could read.
 //
-// The entry goes in its own bucket when the type has one, because a bucketed rule reads the arm the
-// BUCKET names -- `list.Removes[i].Proposal.Remove.Removed` never looks at the entry's own type --
-// and which types have buckets is read off proposalBucketsOf rather than written here.
+// ONE SHAPE, WHERE THERE USED TO BE TWO, and the second is gone because it cannot be built. A
+// ProposalList once carried its per-type views as writable fields, so a list whose BUCKET held an
+// armless entry the commit order did not was a real input and had a fixture of its own: it is what
+// re-opened the nil-arm dereference at in.List.Removes()[i].Proposal.Remove.Removed, because a
+// bucketed rule reads the arm the BUCKET names. The views are now the commit order filtered, so an
+// entry a view answers is an entry of the order and the sweep below judges it once.
+//
+// The armless entry is BEHIND an innocent one, which is what the two-shape split used to be worth
+// on its own: a door narrowed to entry zero answers clean over this list.
 func testArmlessList(t *testing.T, code ProposalType) *ProposalList {
 	t.Helper()
 	innocent := testRemoveOf(1)
 	armless := CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: code}}
-	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
-		if bucket.carries == code {
-			return testProposalList(t, innocent, armless)
-		}
-	}
-	// a type with no bucket of its own is carried in the commit order alone, which is what a list
-	// assembled around a type this build does not implement looks like
-	return &ProposalList{
-		All:     []CachedProposal{innocent, armless},
-		Removes: []CachedProposal{innocent},
-	}
-}
-
-// testBucketOnlyArmlessList is a list whose BUCKET carries an armless proposal the commit order
-// does not.
-//
-// THE SHAPE testArmlessList CANNOT PRODUCE, and the reason it is here. That fixture places its
-// offender in All and in the matching bucket at once, so the All sweep of checkProposalListStructure
-// answers every case and the bucket sweep never fires: two mutations of the bucket half survived,
-// and the two that were caught were caught by an error-roster reachability gate rather than by
-// anything driving the behaviour. A list whose bucket carries an entry All does not is exactly what
-// re-opens the nil-arm dereference at in.List.Removes[i].Proposal.Remove.Removed, because every
-// bucketed rule reads the arm the BUCKET names.
-//
-// A type with no bucket cannot be carried by one, so the second answer is false rather than an
-// empty list: a fixture that reported clean over a shape it never built is the thing this exists to
-// not be. Which types have buckets is read off proposalBucketsOf, and the bucket is filled through
-// reflection, so a fifth bucket is driven without being named here.
-func testBucketOnlyArmlessList(t *testing.T, code ProposalType) (*ProposalList, bool) {
-	t.Helper()
-	innocent := testRemoveOf(1)
-	armless := CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: code}}
-	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
-		if bucket.carries != code {
-			continue
-		}
-		list := &ProposalList{
-			All:     []CachedProposal{innocent},
-			Removes: []CachedProposal{innocent},
-		}
-		held := reflect.ValueOf(list).Elem().FieldByName(bucket.field)
-		held.Set(reflect.Append(held, reflect.ValueOf(armless)))
-		return list, true
-	}
-	return nil, false
+	// NewProposalList and not testProposalList, because the class this fixture is driven over is
+	// the whole proposal registry and testProposalList refuses a type no view answers
+	return NewProposalList([]CachedProposal{innocent, armless})
 }
 
 // TestNoDoorHandedAProposalListDereferencesAMissingArm is finding 2's class, derived on both axes.
@@ -2575,7 +2552,6 @@ func TestNoDoorHandedAProposalListDereferencesAMissingArm(t *testing.T) {
 	}
 	// and one outside the registry, which is the member of the class the registry cannot supply
 	inputs["an unregistered code point"] = ProposalType(0x1A1A)
-	bucketOnlyShapes := 0
 
 	for _, typeName := range slices.Sorted(maps.Keys(inputs)) {
 		code := inputs[typeName]
@@ -2589,34 +2565,23 @@ func TestNoDoorHandedAProposalListDereferencesAMissingArm(t *testing.T) {
 			// checkProposalProfile's own stated order
 			wanted = refusal
 		}
-		// TWO SHAPES per type, and the second is the one nothing drove. The first carries the
-		// armless entry in the commit order and in its bucket, which the All sweep answers; the
-		// second carries it in the BUCKET ALONE, which only the bucket sweep can answer.
-		shapes := map[string]*ProposalList{
-			"in the commit order and in its bucket": testArmlessList(t, code),
-		}
-		if bucketOnly, bucketed := testBucketOnlyArmlessList(t, code); bucketed {
-			shapes["in its bucket alone"] = bucketOnly
-			bucketOnlyShapes += 1
-		}
-		for _, shape := range slices.Sorted(maps.Keys(shapes)) {
-			for _, name := range slices.Sorted(maps.Keys(doors)) {
-				door := doors[name]
-				answered := proposalListDoorAnswer(t,
-					name+" over an armless "+typeName+" "+shape, door, crypto, tree, shapes[shape])
-				if !door.refuses {
-					continue
-				}
-				if !errors.Is(answered, wanted) {
-					t.Errorf("%s over a list carrying a %s with no arm %s answered %v, want %v",
-						name, typeName, shape, answered, wanted)
-				}
+		// ONE SHAPE per type, where there used to be two. The armless entry is carried in the
+		// commit order, which is now the only place a list carries anything: the second shape --
+		// the entry in its BUCKET ALONE, which only a bucket sweep could answer -- was a list a
+		// caller assembled field by field, and no such list exists.
+		list := testArmlessList(t, code)
+		for _, name := range slices.Sorted(maps.Keys(doors)) {
+			door := doors[name]
+			answered := proposalListDoorAnswer(t,
+				name+" over an armless "+typeName+" in the commit order", door, crypto, tree, list)
+			if !door.refuses {
+				continue
+			}
+			if !errors.Is(answered, wanted) {
+				t.Errorf("%s over a list carrying a %s with no arm answered %v, want %v",
+					name, typeName, answered, wanted)
 			}
 		}
-	}
-	if bucketOnlyShapes != len(proposalBucketsOf(&ProposalList{})) {
-		t.Errorf("the sweep drove %d bucket-only shapes and a ProposalList has %d buckets; the half of the structural rule that reads the buckets is then driven by nothing for the rest",
-			bucketOnlyShapes, len(proposalBucketsOf(&ProposalList{})))
 	}
 }
 
@@ -2711,12 +2676,12 @@ func TestEveryDoorHandedAProposalListRefusesOneCarryingTwoGroupContextExtensions
 const commitDoorMethod = "check"
 
 // commitSourceValue is one value the reader below tracks: either a SOURCE PATH rooted at
-// CommitValidationInput -- "List", "List.Removes", "Commit.Path" -- or a STRUCT BINDING, which is
+// CommitValidationInput -- "List", "List.order", "Commit.Path" -- or a STRUCT BINDING, which is
 // what a delegate's input is.
 //
 // The binding half is what makes the derivation exact across proposalValidationInput. That method
 // builds a *ProposalValidationInput out of this input's own fields and the rule reading
-// in.List.Removes is on the far side of it, so a reader that stopped at the call would attribute
+// in.List.Removes() is on the far side of it, so a reader that stopped at the call would attribute
 // nothing at all to ValSem200, and one that followed it without the mapping would report the
 // section 12.2 input's field names, which are not this input's.
 type commitSourceValue struct {
@@ -2742,11 +2707,12 @@ type commitSourceReader struct {
 // rather than listed.
 //
 // One level of expansion for List and for Commit and no deeper, because that is where the
-// granularity stops mattering: the door joins the buckets to All and All to the commit's own
-// vector, and a rule reading Removes[i].Proposal.Remove.Removed is deciding off Removes.
-// Reflection over the structs and not a list of names, so a fifth bucket on ProposalList, or a
-// third field on Commit, is a source the gates below demand an establishment for on the commit
-// that adds it.
+// granularity stops mattering: the door joins the commit order to the commit's own vector, and a
+// rule reading Removes()[i].Proposal.Remove.Removed is deciding off the order that view filters.
+// Reflection over the structs and not a list of names, so a second field on ProposalList -- an
+// index beside the order, which is the shape this type was rebuilt to stop having -- or a third
+// field on Commit, is a source the gates below demand an establishment for on the commit that
+// adds it.
 func commitInputSourceClass() map[string]bool {
 	class := map[string]bool{}
 	input := reflect.TypeOf(CommitValidationInput{})
@@ -2798,10 +2764,16 @@ func newCommitSourceReader(t *testing.T) *commitSourceReader {
 // evaluate answers what one expression IS in terms of the input: a source path, a struct binding,
 // or nothing.
 //
-// The selector case is where the granularity is enforced. in.List.Removes[i].Proposal.Remove.Removed
-// walks down to "List", then to "List.Removes" because that is in the class, and then answers
-// "List.Removes" for every field read past it -- so one dereference chain reports the one source it
-// decides off rather than a name per link.
+// The selector case is where the granularity is enforced. A read of the commit order walks down to
+// "List" and then to "List.order" because that is in the class, and answers "List.order" for every
+// field read past it -- so one dereference chain reports the one source it decides off rather than
+// a name per link.
+//
+// A read through a per-type VIEW gets there in one more hop, and it is the call case that takes it:
+// `removes := in.List.Removes()` resolves to (*ProposalList).Removes with its receiver bound to
+// "List", and the walk into that method -- and into the filter it delegates to -- finds self.order.
+// So ValSem200 reads "List.order" rather than a name of its own, which is the derivation agreeing
+// with the type: a view is not a source, it is the order seen through a predicate.
 func (self *commitSourceReader) evaluate(expr ast.Expr,
 	bindings map[string]commitSourceValue) commitSourceValue {
 
@@ -3018,7 +2990,7 @@ func (self *commitSourceReader) sourcesRead(name string) []string {
 // decides off.
 //
 // THREE CONTROLS, each ruling out a different way for this to report a clean bill over a walk that
-// resolved nothing. ValSem200 reaches List.Removes only through a delegate another method builds,
+// resolved nothing. ValSem200 reaches List.Removes() only through a delegate another method builds,
 // so a reader that does not follow that mapping finds nothing there. ValSem207 names in.PostTree in
 // its own body, so a reader that resolved no selector at all finds nothing there. And the class
 // must have an OUTSIDE: ValSem205's three confirmation tag fields are read by no rule the aggregate
@@ -3037,8 +3009,8 @@ func commitRuleSources(t *testing.T) map[string][]string {
 	if len(sources) == 0 {
 		t.Fatal("ValidateCommit runs no rule, so the derivation had nothing to read")
 	}
-	if !slices.Contains(sources["ValSem200NoSelfRemove"], "List.Removes") {
-		t.Fatalf("the derivation says ValSem200NoSelfRemove decides off %v, and it decides off the Removes bucket through the section 12.2 input this file builds for it; a reader that does not follow that mapping attributes nothing to either delegating rule",
+	if !slices.Contains(sources["ValSem200NoSelfRemove"], "List.order") {
+		t.Fatalf("the derivation says ValSem200NoSelfRemove decides off %v, and it decides off the commit order -- through the section 12.2 input this file builds for it, and then through (*ProposalList).Removes, which filters that order; a reader that follows neither hop attributes nothing to either delegating rule",
 			sources["ValSem200NoSelfRemove"])
 	}
 	if !slices.Contains(sources["ValSem207PathEncryptionKeysUnique"], "PostTree") {
@@ -3096,22 +3068,76 @@ func testCommitInstalledExtensions() []Extension {
 	}
 }
 
-// testCommitCarryingOneOfEveryBucket is the commit nearly every establishment row starts from: a
-// four member group, a full update path, and ONE PROPOSAL OF EVERY BUCKETED TYPE.
+// testCommitProposalBuilders is one proposal per per-type view a ProposalList answers, each of a
+// shape THIS GROUP accepts, keyed by the type the view selects on.
 //
-// One of each and not one, because the bucket rows are generated off proposalBucketsOf and each of
-// them empties its own bucket: over a list carrying only removes, emptying the Adds bucket is a
-// break that breaks nothing. It also puts each bucket's own entry at a different position of the
-// commit order, so the count sweep the join runs cannot be narrowed to element zero without three
-// of the four rows failing.
+// A TABLE KEYED BY THE VIEW'S OWN TYPE rather than a sequence of calls, because the fixture below
+// is generated off proposalBucketsOf and this is the half a generator cannot invent: an Add needs a
+// key package for somebody outside the group, an Update needs a leaf signed by the member whose
+// leaf it replaces, a Remove needs an index that exists and is not the committer, and a
+// GroupContextExtensions needs the extension set this commit is said to install. What the
+// generation buys is that the two halves cannot drift: a fifth view with no builder fails loudly
+// here, and a builder for a type no view answers fails too.
+func testCommitProposalBuilders() map[ProposalType]func(t *testing.T, crypto CryptoProvider,
+	members []*testMember) CachedProposal {
+
+	return map[ProposalType]func(*testing.T, CryptoProvider, []*testMember) CachedProposal{
+		ProposalTypeAdd: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+			kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+			return testAddOf(kp)
+		},
+		ProposalTypeUpdate: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+			update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
+			return update
+		},
+		ProposalTypeRemove: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+			// leaf 3 and not the committer's leaf 0, which is section 12.2's own rule and is
+			// what the List.order row below breaks on purpose
+			return testRemoveOf(LeafIndex(3))
+		},
+		ProposalTypeGroupContextExtensions: func(t *testing.T, crypto CryptoProvider, members []*testMember) CachedProposal {
+			return testGceOf(testCommitInstalledExtensions()...)
+		},
+	}
+}
+
+// testCommitCarryingOneOfEveryBucket is the commit nearly every establishment row starts from: a
+// four member group, a full update path, and ONE PROPOSAL OF EVERY VIEWED TYPE.
+//
+// One of each and not one, because the rows that read a view are written against a commit that
+// carries something for that view to answer: over a list carrying only removes, a row about the
+// adds is a row about an empty answer. It also puts each view's own entry at a different position
+// of the commit order, so a rule narrowed to element zero is separated from one that walks.
+//
+// GENERATED OFF proposalBucketsOf, WHICH IS THE HALF THAT USED TO BE HAND WRITTEN. The
+// establishment rows were generated while this fixture was not, so a fifth view added to
+// ProposalList got a row whose break emptied a field this commit never filled: the row failed red,
+// safely, but because it was unusable rather than because the door was wrong -- a red that says
+// nothing about the door is a red somebody deletes. Both halves are now the same class, and a view
+// with no builder fails here with the sentence that says what to write.
 func testCommitCarryingOneOfEveryBucket(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
 	t.Helper()
 	in, members := testFullCommitInput(t, crypto)
-	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
-	update, _ := testUpdateProposalOf(t, crypto, members[1], LeafIndex(1))
-	testCommitProposals(t, in,
-		testRemoveOf(LeafIndex(3)), testAddOf(kp), update,
-		testGceOf(testCommitInstalledExtensions()...))
+	builders := testCommitProposalBuilders()
+	entries := []CachedProposal{}
+	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
+		build, written := builders[bucket.carries]
+		if !written {
+			t.Fatalf("a ProposalList answers a %s view and this fixture builds no %s proposal; every row written against that view would then be driven over a commit that carries nothing for it to answer",
+				bucket.accessor, proposalTypeName(bucket.carries))
+		}
+		entries = append(entries, build(t, crypto, members))
+	}
+	// the other direction: a builder for a type no view answers is a fixture entry no rule stated
+	// over a view would read
+	viewed := proposalListViewedTypes()
+	for _, carries := range slices.Sorted(maps.Keys(builders)) {
+		if !viewed[carries] {
+			t.Fatalf("this fixture builds a %s and a ProposalList answers no view for that type; the entry would sit in the commit order and be read by no rule stated over a view",
+				proposalTypeName(carries))
+		}
+	}
+	testCommitProposals(t, in, entries...)
 	return in
 }
 
@@ -3139,24 +3165,21 @@ func testCommitNamingACachedProposal(t *testing.T, crypto CryptoProvider) *Commi
 	return in
 }
 
-// commitSetBucket replaces one named bucket of a list through reflection, so the rows generated off
-// proposalBucketsOf do not have to name the four fields a second time.
-func commitSetBucket(t *testing.T, list *ProposalList, field string, entries []CachedProposal) {
-	t.Helper()
-	held := reflect.ValueOf(list).Elem().FieldByName(field)
-	if !held.IsValid() || held.Type() != reflect.TypeOf([]CachedProposal{}) {
-		t.Fatalf("proposalBucketsOf names a bucket %s and a ProposalList has no []CachedProposal field of that name",
-			field)
-	}
-	held.Set(reflect.ValueOf(entries))
-}
-
 // commitDoorEstablishments is one row per source a rule of the aggregate decides off.
 //
-// The four bucket rows are GENERATED off proposalBucketsOf rather than written, which is the whole
-// difference between this and the enumeration it replaces: a fifth bucket added to ProposalList
-// gets a row, a drive and a refusal without anybody remembering to write one, and it fails
-// immediately if the door does not in fact hold it to the commit order.
+// FOUR ROWS USED TO BE GENERATED HERE, one per per-type bucket of a ProposalList, each claiming
+// that the bucket held exactly the proposals of its type in the commit order. They are gone with
+// the buckets: the source class is derived off the FIELDS of the three input types, a list now
+// stores its commit order and nothing else, and a rule that reads the removes is a rule that reads
+// the order. So there is one row where there were five, and what it has to establish is the whole
+// of what those five claimed.
+//
+// AND ITS BREAK IS A SWAP. Every one of the five it replaces broke its source by EMPTYING it --
+// the one shape a count catches -- which is how a per-type count came to be certified by a table
+// whose rows read "holds exactly the <type> proposals of the commit order". The bypasses that got
+// past that door were all count-preserving. The List.order row therefore swaps one entry for
+// another of the same type at the same position, which is the first of the four the owner verified
+// against the counting door, and requires the aggregate to refuse it.
 func commitDoorEstablishments() map[string]commitSourceEstablishment {
 	rows := map[string]commitSourceEstablishment{
 		"List": {
@@ -3166,16 +3189,23 @@ func commitDoorEstablishments() map[string]commitSourceEstablishment {
 			},
 			refuses: errNilProposalList,
 		},
-		"List.All": {
-			establishes: "the commit order carries exactly the proposals the buckets do, so a rule stated over " +
-				"All and a rule stated over a bucket are two rules about one commit",
+		"List.order": {
+			establishes: "the commit order is the whole of a proposal list, so every per-type view a rule " +
+				"decides off is this order filtered and a rule stated over the removes is a rule about the " +
+				"commit the sender signed rather than about a field a caller filled in beside it",
 			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
-				// the THIRD entry and not the first: the join counts the commit order by type, and a
-				// count narrowed to element zero cannot see an entry dropped from the middle
-				in.List.All = slices.Concat(in.List.All[:2], in.List.All[3:])
+				// A COUNT-PRESERVING SWAP, which is what this row owes and what the five rows it
+				// replaces never did. One remove is exchanged for another remove at the same
+				// position of the same order: the entry count is unchanged, the per-type counts are
+				// unchanged, and the commit's own ProposalOrRef vector still names a proposal of
+				// this type at this index. It is the first of the four inputs the owner verified
+				// against the counting door -- the sender signs one remove and the receiver applies
+				// another -- and the only thing that can refuse it is a rule reading the same
+				// entries the application walks.
+				testListEntryAt(t, in.List, "Removes", 0).Proposal.Remove.Removed = in.Committer
 				in.Commit.Proposals = in.List.Refs()
 			},
-			refuses: ErrProposalListBucketsDisagree,
+			refuses: ErrRemoveCommitter,
 		},
 		"Commit": {
 			establishes: "there IS a commit; the update path and the proposal vector are its",
@@ -3281,19 +3311,6 @@ func commitDoorEstablishments() map[string]commitSourceEstablishment {
 			},
 			refuses: nil,
 		},
-	}
-	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
-		field := bucket.field
-		carries := bucket.carries
-		rows["List."+field] = commitSourceEstablishment{
-			establishes: "the " + field + " bucket holds exactly the " + proposalTypeName(carries) +
-				" proposals of the commit order, so a rule stated over the bucket is a rule about the commit " +
-				"the sender signed rather than about a field a caller filled in beside it",
-			breaks: func(t *testing.T, crypto CryptoProvider, in *CommitValidationInput) {
-				commitSetBucket(t, in.List, field, nil)
-			},
-			refuses: ErrProposalListBucketsDisagree,
-		}
 	}
 	return rows
 }

@@ -26,48 +26,48 @@ func TestCommitPathRequiredRules(t *testing.T) {
 		t.Fatal("an empty proposal list requires a path")
 	}
 
-	addOnly := &ProposalList{All: []CachedProposal{
+	addOnly := NewProposalList([]CachedProposal{
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
-	}}
+	})
 	if CommitPathRequired(addOnly) {
 		t.Fatal("an add-only list does not require a path")
 	}
 
-	withUpdate := &ProposalList{All: []CachedProposal{
+	withUpdate := NewProposalList([]CachedProposal{
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeUpdate}},
-	}}
+	})
 	if !CommitPathRequired(withUpdate) {
 		t.Fatal("a list containing an update requires a path")
 	}
 
-	withGce := &ProposalList{All: []CachedProposal{
+	withGce := NewProposalList([]CachedProposal{
 		{Proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions}},
-	}}
+	})
 	if !CommitPathRequired(withGce) {
 		t.Fatal("group_context_extensions is in the RFC 9420 section 12.4 pathRequiredTypes list")
 	}
 
 	// the case the plan's four do not hold: the only path-required entry sits at the END of a
 	// list of four, behind three that are not.
-	trailing := &ProposalList{All: []CachedProposal{
+	trailing := NewProposalList([]CachedProposal{
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeRemove}},
-	}}
+	})
 	if !CommitPathRequired(trailing) {
 		t.Fatal("a remove at the last index of a four entry list requires a path; the rule is over every entry and not over the first")
 	}
 
 	// a list with no path-required entry ANYWHERE is the other half of that: a rule that
 	// answered true for any non-empty list would pass every case above.
-	if CommitPathRequired(&ProposalList{All: []CachedProposal{
+	if CommitPathRequired(NewProposalList([]CachedProposal{
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
 		{Proposal: Proposal{ProposalType: ProposalTypeAdd}},
-	}}) {
+	})) {
 		t.Fatal("four adds require no path")
 	}
 }
@@ -89,7 +89,7 @@ func TestCommitPathRequiredIsThePathRequiredTypeSetOverTheWholeRegistry(t *testi
 	required := 0
 	for _, name := range slices.Sorted(maps.Keys(declared)) {
 		proposalType := ProposalType(declared[name])
-		list := &ProposalList{All: []CachedProposal{{Proposal: Proposal{ProposalType: proposalType}}}}
+		list := NewProposalList([]CachedProposal{{Proposal: Proposal{ProposalType: proposalType}}})
 		want := proposalTypePathRequired(proposalType)
 		if got := CommitPathRequired(list); got != want {
 			t.Errorf("CommitPathRequired over a list of one %s = %v, and proposalTypePathRequired says %v",

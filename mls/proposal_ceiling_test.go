@@ -511,8 +511,9 @@ func TestOneSenderCannotHoldASecondProposalAboutALeafItAlreadyNamed(t *testing.T
 		t.Fatalf("the resolved list carries %d proposals, want 3", list.Len())
 	}
 	seen := map[proposalCacheLeafQuota]string{}
-	for i := range list.All {
-		cached := list.All[i]
+	order := list.All()
+	for i := range order {
+		cached := order[i]
 		leaf, targeted := proposalAppliesToLeaf(cached.Sender, &cached.Proposal)
 		if !targeted {
 			continue

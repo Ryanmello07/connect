@@ -130,8 +130,6 @@ func (self *ProposalValidationInput) effectiveExtensions() []Extension {
 var (
 	proposalListStructuralChecks = []func(*ProposalValidationInput) error{
 		ValSem113ProposalTypeSupported,
-		validateProposalBucketsHoldTheirOwnType,
-		validateBucketsAgreeWithTheCommitOrder,
 		validateOneGroupContextExtensions,
 		validateNoRepeatedProposalReference,
 	}
@@ -191,31 +189,6 @@ func ValidateProposalList(in *ProposalValidationInput) error {
 // the structural rules the twelve below are written against
 // ---------------------------------------------------------------------------
 
-// proposalBucket is one of a ProposalList's per-type buckets: the field it is held in, the type
-// every entry of it must carry, and the entries.
-type proposalBucket struct {
-	field   string
-	carries ProposalType
-	entries []CachedProposal
-}
-
-// proposalBucketsOf is every per-type bucket of a list, and it is the one place they are
-// enumerated.
-//
-// A list of four fields is exactly the shape rule 5 warns about, so it is held to the type rather
-// than to memory: TestEveryBucketOfAProposalListIsNamedByTheBucketRule reflects over
-// ProposalList's own fields and requires every []CachedProposal field except the commit-order one
-// to appear here. A fifth bucket added to the struct by a later task -- a psk bucket, when the
-// profile widens -- fails that test rather than silently sitting outside every rule below.
-func proposalBucketsOf(list *ProposalList) []proposalBucket {
-	return []proposalBucket{
-		{field: "Adds", carries: ProposalTypeAdd, entries: list.Adds},
-		{field: "Updates", carries: ProposalTypeUpdate, entries: list.Updates},
-		{field: "Removes", carries: ProposalTypeRemove, entries: list.Removes},
-		{field: "GCE", carries: ProposalTypeGroupContextExtensions, entries: list.GCE},
-	}
-}
-
 // checkProposalArms is the structural precondition EVERY rule that reads a proposal's arm is
 // written against, enforced at the door rather than stated in prose.
 //
@@ -224,46 +197,36 @@ func proposalBucketsOf(list *ProposalList) []proposalBucket {
 // the ORDER INSIDE ONE AGGREGATE. Every rule of this file is an exported door of its own, and
 // validate_commit.go's rules are eleven more that never call ValidateProposalList at all, so a
 // caller reaching any of them hands a list nothing has been through: a Remove carrying no Remove
-// arm is then `in.List.Removes[i].Proposal.Remove.Removed` on a nil pointer -- a panic out of a
+// arm is then `in.List.Removes()[i].Proposal.Remove.Removed` on a nil pointer -- a panic out of a
 // library, which takes the caller's process rather than its call and is the one answer a door of
 // this package must never give. Both check methods run this, so the precondition holds at every
 // door rather than at the two aggregates.
 //
-// TWO RULES, because there are two ways one dereference happens. The first is checkProposalProfile,
-// which is proposal_list.go's and reaches (*Proposal).checkArm as its last of four -- and it is
-// called WHOLE rather than reduced to the arm clause, because those four run in an order the gate's
-// own header argues for and a caller wants: a pre_shared_key proposal is told that this profile
-// does not implement pre_shared_key, not that its arm is missing. The second is that an entry of
-// the Removes bucket is a Remove, because a bucketed rule reads the arm the BUCKET names and not
-// the one the entry's own type names, and proposalBucketsOf is the derived class of buckets.
+// ONE RULE OVER THE COMMIT ORDER, AND THAT IS NOW THE WHOLE CLASS. It is checkProposalProfile,
+// which is proposal_list.go's and reaches (*Proposal).checkArm as its last of four -- called WHOLE
+// rather than reduced to the arm clause, because those four run in an order the gate's own header
+// argues for and a caller wants: a pre_shared_key proposal is told that this profile does not
+// implement pre_shared_key, not that its arm is missing.
 //
-// The bucket rule is asked FIRST of each bucket entry. An Add sitting in the Removes bucket carries
-// an Add arm and a type this profile accepts, so it passes the profile gate and is still the
-// dereference this exists to prevent.
+// IT USED TO BE TWO. The second was "an entry of the Removes bucket is a Remove", because the
+// buckets were fields a caller filled in and an Add sitting in the Removes field carried an Add
+// arm that every rule stated over removes would then dereference. (*ProposalList).Removes is now
+// the commit order FILTERED, so an entry it answers carries a Remove type because that is the
+// predicate it was selected by, and the profile sweep over the order below has already judged that
+// entry's arm. There is no misbucketing left to refuse, and ErrProposalListMisbucketed is gone
+// with the rule rather than kept as a value nothing can answer.
 //
-// It answers the values the two named rules that state these answer -- checkProposalProfile's eight
-// and ErrProposalListMisbucketed -- and no value of its own, which is
+// It answers checkProposalProfile's eight values and no value of its own, which is
 // errors_proposal_validation.go's rule: one rule, one value, however many doors ask it.
-// ValSem113ProposalTypeSupported and validateProposalBucketsHoldTheirOwnType are therefore
-// redundant with this everywhere they run and are kept, on ValidateProposalList's own stated terms
-// -- refusing at the door is what the rest of this package does, and nothing here claims a test can
-// tell which of the two guards fired.
+// ValSem113ProposalTypeSupported is therefore redundant with this everywhere they both run and is
+// kept, on ValidateProposalList's own stated terms -- refusing at the door is what the rest of
+// this package does, and nothing here claims a test can tell which of the two guards fired.
 func checkProposalListStructure(list *ProposalList) error {
 	active := defaultProfile()
-	for i := range list.All {
-		if err := checkProposalProfile(active, &list.All[i].Proposal); err != nil {
+	order := list.All()
+	for i := range order {
+		if err := checkProposalProfile(active, &order[i].Proposal); err != nil {
 			return fmt.Errorf("%w: at proposal %d of the commit order", err, i)
-		}
-	}
-	for _, bucket := range proposalBucketsOf(list) {
-		for i := range bucket.entries {
-			if got := bucket.entries[i].Proposal.ProposalType; got != bucket.carries {
-				return fmt.Errorf("%w: %s[%d] is a %s", ErrProposalListMisbucketed,
-					bucket.field, i, proposalTypeName(got))
-			}
-			if err := checkProposalProfile(active, &bucket.entries[i].Proposal); err != nil {
-				return fmt.Errorf("%w: at %s[%d]", err, bucket.field, i)
-			}
 		}
 	}
 	return nil
@@ -276,83 +239,42 @@ func checkProposalListStructure(list *ProposalList) error {
 // values unchanged and not an umbrella of this file's own -- see the note in
 // errors_proposal_validation.go.
 //
-// The sweep is over the commit order AND over every bucket, which is not redundant on a list a
-// caller assembled: All and the buckets are separate fields, nothing makes one a permutation of
-// the other, and a proposal reachable by application through a bucket while absent from All would
-// otherwise be applied by ApplyProposals having been judged by nothing. It is also what makes the
-// twelve rules below safe to write, because the arm check is inside this gate.
+// THE SWEEP IS OVER THE COMMIT ORDER AND THAT IS EVERY PROPOSAL THERE IS. It used to sweep the
+// order and then each bucket, because the two were separate fields and a proposal reachable by
+// application through a bucket while absent from All would otherwise have been applied having been
+// judged by nothing. Every view is now the order filtered, so a bucket entry IS an order entry and
+// the second sweep judged each of them twice. It is also what makes the twelve rules below safe to
+// write, because the arm check is inside this gate.
 func ValSem113ProposalTypeSupported(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
 	active := defaultProfile()
-	for i := range in.List.All {
-		if err := checkProposalProfile(active, &in.List.All[i].Proposal); err != nil {
+	order := in.List.All()
+	for i := range order {
+		if err := checkProposalProfile(active, &order[i].Proposal); err != nil {
 			return fmt.Errorf("%w: at proposal %d of the commit order", err, i)
 		}
 	}
-	for _, bucket := range proposalBucketsOf(in.List) {
-		for i := range bucket.entries {
-			if err := checkProposalProfile(active, &bucket.entries[i].Proposal); err != nil {
-				return fmt.Errorf("%w: at %s[%d]", err, bucket.field, i)
-			}
-		}
-	}
 	return nil
 }
 
-// validateProposalBucketsHoldTheirOwnType is the precondition every bucketed rule below reads
-// against: an entry of the Removes bucket is a Remove.
+// TWO RULES USED TO STAND HERE AND BOTH ARE GONE, which is the point of the change that removed
+// them rather than a loss.
 //
-// (*ProposalCache).Resolve buckets by the proposal's own type, so nothing this package assembles
-// can fail this. What can is a ProposalList built field by field -- the shape the vector runners
-// and every test of this file build -- and the failure mode is not a wrong answer but a nil
-// dereference two rules later.
-func validateProposalBucketsHoldTheirOwnType(in *ProposalValidationInput) error {
-	if err := in.check(); err != nil {
-		return err
-	}
-	for _, bucket := range proposalBucketsOf(in.List) {
-		for i := range bucket.entries {
-			if got := bucket.entries[i].Proposal.ProposalType; got != bucket.carries {
-				return fmt.Errorf("%w: %s[%d] is a %s", ErrProposalListMisbucketed,
-					bucket.field, i, proposalTypeName(got))
-			}
-		}
-	}
-	return nil
-}
-
-// validateBucketsAgreeWithTheCommitOrder holds a list's buckets to its commit order by count.
+// validateProposalBucketsHoldTheirOwnType said "an entry of the Removes bucket is a Remove", and
+// validateBucketsAgreeWithTheCommitOrder said "the buckets are the commit order bucketed by type"
+// -- by a per-type COUNT, which is as far as a cheap rule could get. Both were stated because
+// ProposalList carried All and four buckets as independently writable fields, and both were
+// bypassed in count-preserving form: All=[remove(committer)] beside Removes=[remove(3)] satisfied
+// the count, was accepted by ValidateCommit, and was applied by removing leaf 3.
 //
-// Every entry (*ProposalCache).Resolve produces is appended to All and to exactly one bucket in
-// the same statement list, so nothing this package resolves can fail this. What can is a list a
-// caller assembled field by field, and the failure it closes is the quiet one: ApplyProposals
-// walks All to place Adds in commit order while every rule of this file reads the Adds bucket, so
-// a list carrying its adds in one field and not the other is judged by validation and applied by
-// nothing, or applied without ever having been judged. Both are green suites.
-//
-// A count and not an identity, said plainly: two entries of one type in All and two in the bucket
-// satisfy this even if they are four different proposals. That shape is a caller assembling a
-// value inconsistently on purpose, and the cost of catching it -- encoding every proposal twice
-// to compare -- is not worth paying on a path a commit runs.
-func validateBucketsAgreeWithTheCommitOrder(in *ProposalValidationInput) error {
-	if err := in.check(); err != nil {
-		return err
-	}
-	inOrder := map[ProposalType]int{}
-	for i := range in.List.All {
-		inOrder[in.List.All[i].Proposal.ProposalType] += 1
-	}
-	for _, bucket := range proposalBucketsOf(in.List) {
-		if got, want := len(bucket.entries), inOrder[bucket.carries]; got != want {
-			return fmt.Errorf("%w: %s holds %d and the commit order carries %d %s proposals",
-				ErrProposalListBucketsDisagree, bucket.field, got, want,
-				proposalTypeName(bucket.carries))
-		}
-	}
-	return nil
-}
+// (*ProposalList).Removes is now the commit order filtered to removes, so there is no second field
+// to disagree, nothing to count against anything, and no input either rule could refuse. A check
+// leaves the dual representation in place for the next reader; the derivation removes it. What
+// held the two representations together is now proposal_list.go's TYPE, and the gates that hold
+// the type to that claim are TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered and
+// TestAProposalListKeepsItsProposalsInExactlyOnePlace.
 
 // validateOneGroupContextExtensions is RFC 9420 section 12.2's "It contains multiple
 // GroupContextExtensions proposals".
@@ -378,8 +300,9 @@ func validateOneGroupContextExtensions(in *ProposalValidationInput) error {
 // wherever it runs, it is kept because refusing at the door is what the rest of this package does,
 // and nothing here claims a test can tell which of the two guards fired.
 func checkOneGroupContextExtensions(list *ProposalList) error {
-	if len(list.GCE) > 1 {
-		return fmt.Errorf("%w: the list carries %d", errMultipleGroupContextExtensions, len(list.GCE))
+	gce := list.GCE()
+	if len(gce) > 1 {
+		return fmt.Errorf("%w: the list carries %d", errMultipleGroupContextExtensions, len(gce))
 	}
 	return nil
 }
@@ -402,8 +325,9 @@ func validateNoRepeatedProposalReference(in *ProposalValidationInput) error {
 		return err
 	}
 	namedAt := map[string]int{}
-	for i := range in.List.All {
-		cached := in.List.All[i]
+	order := in.List.All()
+	for i := range order {
+		cached := order[i]
 		if cached.ByValue || len(cached.Ref) == 0 {
 			continue
 		}
@@ -431,6 +355,7 @@ func ValSem101UniqueSignatureKey(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	adds := in.List.Adds()
 	seen := map[string]bool{}
 	removed := removedLeaves(in.List)
 	for _, leafIndex := range in.Tree.NonBlankLeaves() {
@@ -443,8 +368,8 @@ func ValSem101UniqueSignatureKey(in *ProposalValidationInput) error {
 		}
 		seen[string(leaf.SignatureKey)] = true
 	}
-	for i := range in.List.Adds {
-		key := string(in.List.Adds[i].Proposal.Add.KeyPackage.LeafNode.SignatureKey)
+	for i := range adds {
+		key := string(adds[i].Proposal.Add.KeyPackage.LeafNode.SignatureKey)
 		if seen[key] {
 			return fmt.Errorf("%w: adds[%d] publishes %x", ErrAddDuplicateSignatureKey, i, key)
 		}
@@ -462,9 +387,10 @@ func ValSem102UniqueInitKey(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	adds := in.List.Adds()
 	seen := map[string]bool{}
-	for i := range in.List.Adds {
-		key := string(in.List.Adds[i].Proposal.Add.KeyPackage.InitKey)
+	for i := range adds {
+		key := string(adds[i].Proposal.Add.KeyPackage.InitKey)
 		if seen[key] {
 			return fmt.Errorf("%w: adds[%d] publishes %x", ErrDuplicateInitKey, i, key)
 		}
@@ -479,6 +405,7 @@ func ValSem103UniqueEncryptionKey(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	adds := in.List.Adds()
 	seen := map[string]bool{}
 	removed := removedLeaves(in.List)
 	for _, leafIndex := range in.Tree.NonBlankLeaves() {
@@ -491,8 +418,8 @@ func ValSem103UniqueEncryptionKey(in *ProposalValidationInput) error {
 		}
 		seen[string(leaf.EncryptionKey)] = true
 	}
-	for i := range in.List.Adds {
-		key := string(in.List.Adds[i].Proposal.Add.KeyPackage.LeafNode.EncryptionKey)
+	for i := range adds {
+		key := string(adds[i].Proposal.Add.KeyPackage.LeafNode.EncryptionKey)
 		if seen[key] {
 			return fmt.Errorf("%w: adds[%d] publishes %x", ErrAddDuplicateEncryptionKey, i, key)
 		}
@@ -514,8 +441,9 @@ func ValSem104InitNotEqualEncryptionKey(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Adds {
-		kp := &in.List.Adds[i].Proposal.Add.KeyPackage
+	adds := in.List.Adds()
+	for i := range adds {
+		kp := &adds[i].Proposal.Add.KeyPackage
 		if subtle.ConstantTimeCompare(kp.InitKey, kp.LeafNode.EncryptionKey) == 1 {
 			return fmt.Errorf("%w: adds[%d]", ErrInitEqualsEncryptionKey, i)
 		}
@@ -534,8 +462,9 @@ func ValSem105SuiteAndVersionMatch(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Adds {
-		kp := &in.List.Adds[i].Proposal.Add.KeyPackage
+	adds := in.List.Adds()
+	for i := range adds {
+		kp := &adds[i].Proposal.Add.KeyPackage
 		if kp.CipherSuite != in.Context.CipherSuite || kp.Version != in.Context.Version {
 			return fmt.Errorf("%w: adds[%d] is version %#04x suite %#04x, the group is %#04x %#04x",
 				ErrSuiteMismatch, i, uint16(kp.Version), uint16(kp.CipherSuite),
@@ -554,12 +483,13 @@ func ValSem106RequiredCapabilitiesSatisfied(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	adds := in.List.Adds()
 	required, err := requiredCapabilitiesOf(in.effectiveExtensions())
 	if err != nil || required == nil {
 		return err
 	}
-	for i := range in.List.Adds {
-		caps := &in.List.Adds[i].Proposal.Add.KeyPackage.LeafNode.Capabilities
+	for i := range adds {
+		caps := &adds[i].Proposal.Add.KeyPackage.LeafNode.Capabilities
 		if err := caps.Supports(required); err != nil {
 			return fmt.Errorf("%w: adds[%d]: %v", ErrAddMissingRequiredCapability, i, err)
 		}
@@ -572,9 +502,10 @@ func ValSem107UniqueRemove(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	removes := in.List.Removes()
 	seen := map[LeafIndex]bool{}
-	for i := range in.List.Removes {
-		leafIndex := in.List.Removes[i].Proposal.Remove.Removed
+	for i := range removes {
+		leafIndex := removes[i].Proposal.Remove.Removed
 		if seen[leafIndex] {
 			return fmt.Errorf("%w: leaf %d, at removes[%d]", ErrDuplicateRemove, leafIndex, i)
 		}
@@ -592,8 +523,9 @@ func ValSem108RemoveExists(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Removes {
-		leafIndex := in.List.Removes[i].Proposal.Remove.Removed
+	removes := in.List.Removes()
+	for i := range removes {
+		leafIndex := removes[i].Proposal.Remove.Removed
 		if in.Tree.Leaf(leafIndex) == nil {
 			return fmt.Errorf("%w: leaf %d, at removes[%d]", ErrRemoveNonMember, leafIndex, i)
 		}
@@ -612,12 +544,13 @@ func ValSem109UpdateRequiredCapabilities(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	updates := in.List.Updates()
 	required, err := requiredCapabilitiesOf(in.effectiveExtensions())
 	if err != nil || required == nil {
 		return err
 	}
-	for i := range in.List.Updates {
-		caps := &in.List.Updates[i].Proposal.Update.LeafNode.Capabilities
+	for i := range updates {
+		caps := &updates[i].Proposal.Update.LeafNode.Capabilities
 		if err := caps.Supports(required); err != nil {
 			return fmt.Errorf("%w: updates[%d]: %v", ErrUpdateMissingRequiredCapability, i, err)
 		}
@@ -635,11 +568,13 @@ func ValSem110UpdateUniqueEncryptionKey(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	adds := in.List.Adds()
+	updates := in.List.Updates()
 	seen := map[string]bool{}
 	removed := removedLeaves(in.List)
 	updated := map[LeafIndex]bool{}
-	for i := range in.List.Updates {
-		updated[in.List.Updates[i].Sender] = true
+	for i := range updates {
+		updated[updates[i].Sender] = true
 	}
 	for _, leafIndex := range in.Tree.NonBlankLeaves() {
 		if removed[leafIndex] || updated[leafIndex] {
@@ -651,11 +586,11 @@ func ValSem110UpdateUniqueEncryptionKey(in *ProposalValidationInput) error {
 		}
 		seen[string(leaf.EncryptionKey)] = true
 	}
-	for i := range in.List.Adds {
-		seen[string(in.List.Adds[i].Proposal.Add.KeyPackage.LeafNode.EncryptionKey)] = true
+	for i := range adds {
+		seen[string(adds[i].Proposal.Add.KeyPackage.LeafNode.EncryptionKey)] = true
 	}
-	for i := range in.List.Updates {
-		key := string(in.List.Updates[i].Proposal.Update.LeafNode.EncryptionKey)
+	for i := range updates {
+		key := string(updates[i].Proposal.Update.LeafNode.EncryptionKey)
 		if seen[key] {
 			return fmt.Errorf("%w: updates[%d] publishes %x", ErrUpdateDuplicateEncryptionKey, i, key)
 		}
@@ -670,8 +605,9 @@ func ValSem111NoCommitterUpdate(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Updates {
-		if in.List.Updates[i].Sender == in.Committer {
+	updates := in.List.Updates()
+	for i := range updates {
+		if updates[i].Sender == in.Committer {
 			return fmt.Errorf("%w: leaf %d, at updates[%d]", ErrSelfUpdateInCommit, in.Committer, i)
 		}
 	}
@@ -688,8 +624,9 @@ func ValSem112UpdateSenderIsMember(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Updates {
-		sender := in.List.Updates[i].Sender
+	updates := in.List.Updates()
+	for i := range updates {
+		sender := updates[i].Sender
 		if in.Tree.Leaf(sender) == nil {
 			return fmt.Errorf("%w: leaf %d, at updates[%d]", ErrUpdateSenderNotMember, sender, i)
 		}
@@ -757,13 +694,14 @@ func validateUpdateLeafNodeIsValidForAnUpdate(in *ProposalValidationInput) error
 	if err := in.check(); err != nil {
 		return err
 	}
+	updates := in.List.Updates()
 	extensions := in.effectiveExtensions()
 	required, err := requiredCapabilitiesOf(extensions)
 	if err != nil {
 		return err
 	}
-	for i := range in.List.Updates {
-		cached := &in.List.Updates[i]
+	for i := range updates {
+		cached := &updates[i]
 		err := cached.Proposal.Update.LeafNode.Validate(&LeafValidationContext{
 			Crypto:          in.Crypto,
 			Suite:           in.Context.CipherSuite,
@@ -814,8 +752,9 @@ func validateUpdateChangesTheEncryptionKey(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Updates {
-		cached := &in.List.Updates[i]
+	updates := in.List.Updates()
+	for i := range updates {
+		cached := &updates[i]
 		replaced := in.Tree.Leaf(cached.Sender)
 		if replaced == nil {
 			continue
@@ -846,16 +785,18 @@ func validateSingleUpdateOrRemovePerLeaf(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	updates := in.List.Updates()
+	removes := in.List.Removes()
 	touched := map[LeafIndex]bool{}
-	for i := range in.List.Updates {
-		sender := in.List.Updates[i].Sender
+	for i := range updates {
+		sender := updates[i].Sender
 		if touched[sender] {
 			return fmt.Errorf("%w: leaf %d, at updates[%d]", ErrUpdateOrRemoveSameLeaf, sender, i)
 		}
 		touched[sender] = true
 	}
-	for i := range in.List.Removes {
-		leafIndex := in.List.Removes[i].Proposal.Remove.Removed
+	for i := range removes {
+		leafIndex := removes[i].Proposal.Remove.Removed
 		if touched[leafIndex] {
 			return fmt.Errorf("%w: leaf %d, at removes[%d]", ErrUpdateOrRemoveSameLeaf, leafIndex, i)
 		}
@@ -875,8 +816,9 @@ func validateCommitterIsNotRemoved(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	for i := range in.List.Removes {
-		if in.List.Removes[i].Proposal.Remove.Removed == in.Committer {
+	removes := in.List.Removes()
+	for i := range removes {
+		if removes[i].Proposal.Remove.Removed == in.Committer {
 			return fmt.Errorf("%w: leaf %d, at removes[%d]", ErrRemoveCommitter, in.Committer, i)
 		}
 	}
@@ -889,9 +831,10 @@ func validateCommitterIsNotRemoved(in *ProposalValidationInput) error {
 
 // removedLeaves is the set of leaves this list removes.
 func removedLeaves(list *ProposalList) map[LeafIndex]bool {
+	removes := list.Removes()
 	out := map[LeafIndex]bool{}
-	for i := range list.Removes {
-		out[list.Removes[i].Proposal.Remove.Removed] = true
+	for i := range removes {
+		out[removes[i].Proposal.Remove.Removed] = true
 	}
 	return out
 }

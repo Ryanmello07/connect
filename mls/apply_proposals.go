@@ -74,20 +74,21 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 		return nil, fmt.Errorf("%w: there is nothing to apply", errNilProposalList)
 	}
 
-	// the two structural rules of validate_proposals.go, ahead of every dereference below. A
-	// bucket holding a proposal of another type, or a proposal whose named arm is not the one
-	// populated, is a nil dereference at `cached.Proposal.Remove.Removed` -- and a caller that
-	// applies before it validates is the ordinary shape rather than a mistake, because section
-	// 12.4.2 validates the tree this produces. The rules are called rather than restated so that
-	// there is one statement of each.
+	// the structural rule of validate_proposals.go, ahead of every dereference below. A proposal
+	// whose named arm is not the one populated is a nil dereference at
+	// `cached.Proposal.Remove.Removed` -- and a caller that applies before it validates is the
+	// ordinary shape rather than a mistake, because section 12.4.2 validates the tree this
+	// produces. The rule is called rather than restated so that there is one statement of it.
+	//
+	// IT USED TO BE THREE AND THE OTHER TWO ARE GONE WITH THE FIELDS THEY GUARDED. A list once
+	// carried All and four buckets as independently writable fields, so this door also had to ask
+	// that each bucket held its own type and that the buckets were the commit order bucketed --
+	// the second by a per-type count, which every count-preserving disagreement satisfied.
+	// (*ProposalList).Removes is now the commit order filtered, so step 3 below walks the same
+	// entries step 4 does: the divergence this door used to check for cannot be constructed, and
+	// the two rules have no input left to refuse.
 	structural := &ProposalValidationInput{Tree: tree, Context: ctx, Committer: own, List: list}
 	if err := ValSem113ProposalTypeSupported(structural); err != nil {
-		return nil, err
-	}
-	if err := validateProposalBucketsHoldTheirOwnType(structural); err != nil {
-		return nil, err
-	}
-	if err := validateBucketsAgreeWithTheCommitOrder(structural); err != nil {
 		return nil, err
 	}
 	// and the GCE bucket holds AT MOST ONE, because step 1 below decides the whole of the next
@@ -124,8 +125,9 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 
 	// 2. Updates, any order. The sender's leaf is replaced and its direct path is blanked, which
 	//    section 12.1.2 requires and RatchetTree.UpdateLeaf does.
-	for i := range list.Updates {
-		cached := &list.Updates[i]
+	updates := list.Updates()
+	for i := range updates {
+		cached := &updates[i]
 		if err := result.Tree.UpdateLeaf(cached.Sender, &cached.Proposal.Update.LeafNode); err != nil {
 			return nil, fmt.Errorf("mls: applying the update at updates[%d] for leaf %d: %w",
 				i, cached.Sender, err)
@@ -134,8 +136,9 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 	}
 
 	// 3. Removes, any order. RemoveLeaf blanks the path, blanks the leaf and truncates.
-	for i := range list.Removes {
-		leafIndex := list.Removes[i].Proposal.Remove.Removed
+	removes := list.Removes()
+	for i := range removes {
+		leafIndex := removes[i].Proposal.Remove.Removed
 		if err := result.Tree.RemoveLeaf(leafIndex); err != nil {
 			return nil, fmt.Errorf("mls: applying the remove at removes[%d] for leaf %d: %w",
 				i, leafIndex, err)
@@ -146,14 +149,16 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 		}
 	}
 
-	// 4. Adds, IN COMMIT ORDER. The bucket is not the order: it is the order the proposals were
-	//    bucketed in, which for a resolved list is the commit order and for a list a caller
-	//    assembled is whatever that caller appended in. All is the field that carries the wire's
-	//    own order, so the walk is over All and the Adds bucket is not read here at all.
+	// 4. Adds, IN COMMIT ORDER, and the walk is over All rather than over Adds. The two now hold
+	//    the same entries in the same order -- Adds is All filtered -- so this is a statement
+	//    about what section 12.3 says rather than a defence against a field a caller filled in:
+	//    "in the order they appear in the proposals vector" is the vector, and reading it here is
+	//    what a later edit of the views cannot quietly change.
 	//    AddLeaf places at the leftmost blank leaf and extends the tree to the right when there
 	//    is none.
-	for i := range list.All {
-		cached := &list.All[i]
+	order := list.All()
+	for i := range order {
+		cached := &order[i]
 		if cached.Proposal.ProposalType != ProposalTypeAdd {
 			continue
 		}

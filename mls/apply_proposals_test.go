@@ -88,25 +88,36 @@ func TestApplyProposalsPlacesAddsInCommitOrderRatherThanBucketOrder(t *testing.T
 	}
 }
 
-// TestApplyProposalsTakesTheAddOrderFromTheCommitOrderAndNotFromTheBucket separates the two fields
-// that could carry it.
+// TestApplyProposalsTakesTheAddOrderFromTheCommitOrder holds section 12.3's one ordered clause to
+// the one order a list has.
 //
-// Every list (*ProposalCache).Resolve builds appends to All and to the bucket in one walk, so over
-// those two lists the Adds bucket and the adds of the commit order are the same sequence and no
-// fixture that goes through Resolve can tell a walk of one from a walk of the other -- and the
-// count rule this file runs ahead of the walk cannot see a disagreement in ORDER either. So the
-// two are put in conflict here: All says dave then erin, the bucket says erin then dave, and
-// ProposalList's own doc names All as the field that carries the wire's order.
-func TestApplyProposalsTakesTheAddOrderFromTheCommitOrderAndNotFromTheBucket(t *testing.T) {
+// IT USED TO PUT TWO FIELDS IN CONFLICT and it cannot any more, which is the change rather than a
+// weakening. A ProposalList once carried its adds in All and in an Adds field a caller wrote
+// separately, so this test built All saying dave-then-erin beside a bucket saying
+// erin-then-dave and required the placement to follow All. The views are now the commit order
+// filtered, so that fixture does not exist: (*ProposalList).Adds answers dave-then-erin because
+// the order does, and the conflict is unrepresentable rather than caught.
+// TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt is where that is asserted.
+//
+// What is left here is still worth driving, because it is section 12.3's own clause: adds are
+// placed "in the order they appear in the proposals vector", and an implementation that reversed
+// the walk, or that placed them in some order of its own, puts two members on each other's
+// leaves. The two adds are told apart by their signature keys, so a placement in the other order
+// fails rather than reading the same.
+func TestApplyProposalsTakesTheAddOrderFromTheCommitOrder(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
 	dave := testIdentity(t, crypto, "dave")
 	erin := testIdentity(t, crypto, "erin")
 	kpDave, _, _ := testKeyPackage(t, crypto, dave)
 	kpErin, _, _ := testKeyPackage(t, crypto, erin)
-	list := &ProposalList{
-		All:  []CachedProposal{testAddOf(kpDave), testAddOf(kpErin)},
-		Adds: []CachedProposal{testAddOf(kpErin), testAddOf(kpDave)},
+	list := NewProposalList([]CachedProposal{testAddOf(kpDave), testAddOf(kpErin)})
+	// the derived view is the same sequence, which is what makes the walk below a statement about
+	// section 12.3 rather than a statement about which of two fields was read
+	adds := list.Adds()
+	if len(adds) != 2 || !bytes.Equal(adds[0].Proposal.Add.KeyPackage.LeafNode.SignatureKey, dave.SigPub) {
+		t.Fatalf("the adds view answers %d entries and does not open with dave; it is not the commit order filtered",
+			len(adds))
 	}
 	result, err := ApplyProposals(tree, testApplyContext(), LeafIndex(0), list)
 	if err != nil {
@@ -117,7 +128,7 @@ func TestApplyProposalsTakesTheAddOrderFromTheCommitOrderAndNotFromTheBucket(t *
 	}
 	landed := result.Tree.Leaf(result.AddedLeaves[0])
 	if landed == nil || !bytes.Equal(landed.SignatureKey, dave.SigPub) {
-		t.Fatal("the first leaf taken is not the first add of the COMMIT order, so the placement is being read off the bucket")
+		t.Fatal("the first leaf taken is not the first add of the COMMIT order")
 	}
 }
 
@@ -321,31 +332,35 @@ func TestApplyProposalsReportsSelfRemovalAndOnlyForOurOwnLeaf(t *testing.T) {
 	}
 }
 
-// TestApplyProposalsRefusesAListItWouldOtherwiseDereference holds the structural preconditions at
+// TestApplyProposalsRefusesAListItWouldOtherwiseDereference holds the structural precondition at
 // the application door.
 //
 // A caller applies before it validates -- section 12.4.2 validates the tree this produces -- so a
-// misbucketed list, an armless proposal or a bucket the commit order does not carry reaches here
-// first, and every one of them is a nil dereference or silently lost work rather than a wrong
-// answer.
+// proposal whose named arm is not the one populated, or one of a type this build does not
+// implement, reaches here first, and each is a nil dereference rather than a wrong answer.
+//
+// TWO OF THE THREE ROWS THIS TABLE CARRIED ARE GONE WITH THE FIELDS THEY DESCRIBED. "A remove in
+// the adds bucket" and "an add the commit order does not carry" were shapes a caller could build
+// while ProposalList carried its views as writable fields; the views are now the commit order
+// filtered, so neither can be constructed and neither has a refusal left to assert. The row that
+// stays is the one about the ARM, which is a fault of the proposal rather than of the list, and it
+// is joined by a type this profile refuses -- the other half of what ValSem113 answers at this
+// door.
 func TestApplyProposalsRefusesAListItWouldOtherwiseDereference(t *testing.T) {
 	crypto := testCrypto(t)
-	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
-	remove := testRemoveOf(1)
 	armless := CachedProposal{Proposal: Proposal{ProposalType: ProposalTypeRemove}}
+	psk := CachedProposal{Proposal: Proposal{
+		ProposalType: ProposalTypePreSharedKey, PreSharedKey: &PreSharedKey{}}}
 	for name, row := range map[string]struct {
 		list     *ProposalList
 		sentinel error
 	}{
-		"a remove in the adds bucket": {
-			&ProposalList{Adds: []CachedProposal{remove}, All: []CachedProposal{remove}},
-			ErrProposalListMisbucketed},
-		"an add the commit order does not carry": {
-			&ProposalList{Adds: []CachedProposal{testAddOf(kp)}},
-			ErrProposalListBucketsDisagree},
 		"a remove with no remove arm": {
-			&ProposalList{Removes: []CachedProposal{armless}, All: []CachedProposal{armless}},
+			NewProposalList([]CachedProposal{armless}),
 			ErrContentArmMismatch},
+		"a proposal of a type this profile does not implement": {
+			NewProposalList([]CachedProposal{psk}),
+			errProfilePsk},
 	} {
 		tree, _ := testTreeWith(t, crypto, "alice", "bob")
 		_, err := applyProposalsRefusalOf(t, name, tree, testApplyContext(), LeafIndex(0), row.list)

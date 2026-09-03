@@ -45,23 +45,66 @@ func testTreeWith(t *testing.T, crypto CryptoProvider, names ...string) (*Ratche
 // by nothing and would report the clean bill a correct one reports.
 func testProposalList(t *testing.T, entries ...CachedProposal) *ProposalList {
 	t.Helper()
-	list := &ProposalList{}
+	// the type has no bucket to fill any more -- every per-type view is the commit order
+	// filtered -- so this hands the order over and nothing else. What it still owes is the
+	// refusal the old bucketing switch owed: a fixture built around a type no view answers would
+	// be a list every rule stated over a view walks straight past, which is a green test over an
+	// input nothing judged. The class is proposalListViewedTypes and not a switch of its own.
+	viewed := proposalListViewedTypes()
 	for _, entry := range entries {
-		list.All = append(list.All, entry)
-		switch entry.Proposal.ProposalType {
-		case ProposalTypeAdd:
-			list.Adds = append(list.Adds, entry)
-		case ProposalTypeUpdate:
-			list.Updates = append(list.Updates, entry)
-		case ProposalTypeRemove:
-			list.Removes = append(list.Removes, entry)
-		case ProposalTypeGroupContextExtensions:
-			list.GCE = append(list.GCE, entry)
-		default:
-			t.Fatalf("testProposalList has no bucket for %s", proposalTypeName(entry.Proposal.ProposalType))
+		if !viewed[entry.Proposal.ProposalType] {
+			t.Fatalf("testProposalList was handed a %s and a ProposalList answers no view for that type, so no rule stated over a view would read it",
+				proposalTypeName(entry.Proposal.ProposalType))
 		}
 	}
-	return list
+	return NewProposalList(entries)
+}
+
+// testListPlus answers a NEW list carrying this one's commit order with the entries appended.
+//
+// A list has one setter, its constructor, so a fixture that wants a longer commit order builds a
+// longer one rather than appending to a field. That is the whole property this package was
+// rebuilt for, held at the fixtures too: a test that could append to the order without the views
+// following would be a test of a type this package no longer has.
+func testListPlus(t *testing.T, list *ProposalList, extra ...CachedProposal) *ProposalList {
+	t.Helper()
+	return NewProposalList(append(slices.Clone(list.All()), extra...))
+}
+
+// testListEntryAt answers a POINTER to the entry of the commit order that the named view answers
+// at position at.
+//
+// THE VIEWS ARE ANSWERS AND NOT STORAGE, which is what this exists to say. (*ProposalList).Updates
+// filters the commit order into a fresh slice at every call, so a fixture that edited
+// `list.Updates()[at]` would edit a copy nothing reads and would then assert that the rule under
+// test accepted an unbroken list. The commit order is the one place a list keeps a proposal, so an
+// edit that has to be seen is made there.
+func testListEntryAt(t *testing.T, list *ProposalList, view string, at int) *CachedProposal {
+	t.Helper()
+	carries := ProposalType(0)
+	named := false
+	for _, bucket := range proposalBucketsOf(list) {
+		if bucket.accessor == view {
+			carries, named = bucket.carries, true
+		}
+	}
+	if !named {
+		t.Fatalf("a ProposalList answers no view called %s", view)
+	}
+	order := list.All()
+	seen := 0
+	for i := range order {
+		if order[i].Proposal.ProposalType != carries {
+			continue
+		}
+		if seen == at {
+			return &order[i]
+		}
+		seen += 1
+	}
+	t.Fatalf("the commit order carries %d %s proposals and this asked for the one at %d",
+		seen, proposalTypeName(carries), at)
+	return nil
 }
 
 func testAddOf(kp *KeyPackage) CachedProposal {
@@ -192,8 +235,6 @@ var proposalValidationOwnedErrors = map[string]error{
 	"ErrUpdateEncryptionKeyUnchanged":    ErrUpdateEncryptionKeyUnchanged,
 	"ErrRemoveCommitter":                 ErrRemoveCommitter,
 	"ErrUpdateOrRemoveSameLeaf":          ErrUpdateOrRemoveSameLeaf,
-	"ErrProposalListMisbucketed":         ErrProposalListMisbucketed,
-	"ErrProposalListBucketsDisagree":     ErrProposalListBucketsDisagree,
 	"errNilProposalValidationInput":      errNilProposalValidationInput,
 	"errNilProposalList":                 errNilProposalList,
 	"errNilRatchetTree":                  errNilRatchetTree,
@@ -236,12 +277,16 @@ func TestProposalValidationOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) 
 // two of them are "the same thing really".
 func TestEveryProposalListRefusalIsDistinctFromEveryOther(t *testing.T) {
 	names := slices.Sorted(maps.Keys(proposalValidationOwnedErrors))
-	// 21 since the section 12.1.2 update door landed: the nineteen this file's own task declared,
-	// plus ErrUpdateLeafNodeInvalid and ErrUpdateEncryptionKeyUnchanged. The count is asserted
-	// rather than derived for lifecycleOwnedErrors' reason -- a later task adding a sentinel moves
+	// 19 since ProposalList came to derive its per-type views from its commit order: it was 21 --
+	// the nineteen this file's own task declared plus ErrUpdateLeafNodeInvalid and
+	// ErrUpdateEncryptionKeyUnchanged from the section 12.1.2 update door -- and
+	// ErrProposalListMisbucketed and ErrProposalListBucketsDisagree went with the two structural
+	// rules they were the values of. Both were about a list whose buckets disagreed with its
+	// commit order, and that list can no longer be constructed. The count is asserted rather than
+	// derived for lifecycleOwnedErrors' reason -- a later task adding or removing a sentinel moves
 	// this number and says which task moved it.
-	if len(names) != 21 {
-		t.Fatalf("the proposal list refusal set holds %d values, this file declares 21", len(names))
+	if len(names) != 19 {
+		t.Fatalf("the proposal list refusal set holds %d values, this file declares 19", len(names))
 	}
 	for _, name := range names {
 		one := proposalValidationOwnedErrors[name]
@@ -308,24 +353,7 @@ func proposalListRuleRows() map[string]proposalListRuleRow {
 				psk := CachedProposal{Proposal: Proposal{
 					ProposalType: ProposalTypePreSharedKey, PreSharedKey: &PreSharedKey{}}}
 				return testValidationInput(t, crypto, tree, LeafIndex(0),
-					&ProposalList{All: []CachedProposal{psk}})
-			}},
-		// a remove sitting in the adds bucket, which is a nil dereference in ValSem101 under
-		// any order that runs the duplicate rules first
-		"validateProposalBucketsHoldTheirOwnType": {sentinel: ErrProposalListMisbucketed,
-			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
-				tree, _ := testTreeWith(t, crypto, "alice", "bob")
-				remove := testRemoveOf(1)
-				return testValidationInput(t, crypto, tree, LeafIndex(0), &ProposalList{
-					Adds: []CachedProposal{remove}, All: []CachedProposal{remove}})
-			}},
-		// an add every rule of this file judges and the application walks straight past
-		"validateBucketsAgreeWithTheCommitOrder": {sentinel: ErrProposalListBucketsDisagree,
-			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
-				tree, _ := testTreeWith(t, crypto, "alice")
-				kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "carol"))
-				return testValidationInput(t, crypto, tree, LeafIndex(0), &ProposalList{
-					Adds: []CachedProposal{testAddOf(kp)}})
+					NewProposalList([]CachedProposal{psk}))
 			}},
 		"validateOneGroupContextExtensions": {sentinel: errMultipleGroupContextExtensions,
 			build: func(t *testing.T, crypto CryptoProvider) *ProposalValidationInput {
@@ -648,41 +676,31 @@ func TestValidateProposalListRunsEveryRuleThisFileDeclares(t *testing.T) {
 	}
 }
 
-// TestEveryBucketOfAProposalListIsNamedByTheBucketRule derives the bucket set from the struct.
+// TestEveryPerTypeViewOfAProposalListIsNamedByTheViewRule derives the view set from the type.
 //
 // proposalBucketsOf is four rows written by hand, and four rows written by hand is the shape that
-// understates its class the moment a fifth bucket is added -- a psk bucket, when the profile
-// widens. So the class is read off ProposalList itself: every []CachedProposal field must be
-// named, except the one field that is the commit order rather than a bucket, which is excluded by
-// name and with its reason.
-func TestEveryBucketOfAProposalListIsNamedByTheBucketRule(t *testing.T) {
-	const commitOrderField = "All"
+// understates its class the moment a fifth view is added -- a psk view, when the profile widens.
+// So the class is read off *ProposalList's own METHOD SET: every method answering
+// []CachedProposal must be named, except the one that answers the commit order rather than a view
+// of it, which is excluded by name and with its reason inside proposalListViewMethods.
+//
+// OFF THE METHODS AND NO LONGER OFF THE FIELDS. The views used to be exported fields and this gate
+// used to read them off the struct; a list now stores the commit order alone, so a field walk
+// would find one field, exclude it as the commit order, and pass over an empty class reporting a
+// clean bill.
+func TestEveryPerTypeViewOfAProposalListIsNamedByTheViewRule(t *testing.T) {
 	named := []string{}
 	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
-		named = append(named, bucket.field)
+		named = append(named, bucket.accessor)
 	}
 	slices.Sort(named)
-	fields := []string{}
-	structure := reflect.TypeOf(ProposalList{})
-	for i := 0; i < structure.NumField(); i += 1 {
-		field := structure.Field(i)
-		if field.Type != reflect.TypeOf([]CachedProposal{}) || field.Name == commitOrderField {
-			continue
-		}
-		fields = append(fields, field.Name)
+	answered := proposalListBucketNames(t)
+	if len(answered) == 0 {
+		t.Fatal("*ProposalList answers no per-type view at all, so this gate read something other than the type")
 	}
-	slices.Sort(fields)
-	if len(fields) == 0 {
-		t.Fatal("ProposalList declares no []CachedProposal bucket at all, so this gate read something other than the struct")
-	}
-	if !slices.Equal(named, fields) {
-		t.Fatalf("ProposalList's buckets are %v and proposalBucketsOf names %v; a bucket nothing names is judged by no rule of validate_proposals.go and applied by nothing",
-			fields, named)
-	}
-	// and the exclusion is real rather than a name nobody declares
-	if _, found := structure.FieldByName(commitOrderField); !found {
-		t.Fatalf("ProposalList declares no %s field, so the one exclusion this gate makes is excluding nothing",
-			commitOrderField)
+	if !slices.Equal(named, answered) {
+		t.Fatalf("*ProposalList answers the views %v and proposalBucketsOf names %v; a view nothing names is judged by no rule of validate_proposals.go and applied by nothing",
+			answered, named)
 	}
 }
 
@@ -878,7 +896,7 @@ func TestValSem113AnswersTheProfileGatesOwnValueForEveryTypeItRefuses(t *testing
 	tree, _ := testTreeWith(t, crypto, "alice")
 	answered := func(proposal Proposal) error {
 		return ValSem113ProposalTypeSupported(testValidationInput(t, crypto, tree, LeafIndex(0),
-			&ProposalList{All: []CachedProposal{{Proposal: proposal}}}))
+			NewProposalList([]CachedProposal{{Proposal: proposal}})))
 	}
 	refused := 0
 	for _, code := range slices.Sorted(maps.Keys(proposalTypeProfile)) {
@@ -905,24 +923,36 @@ func TestValSem113AnswersTheProfileGatesOwnValueForEveryTypeItRefuses(t *testing
 	t.Logf("%d registered proposal types the v1 profile refuses, each answered through ValSem113", refused)
 }
 
-// TestValSem113ReadsTheBucketsAndNotOnlyTheCommitOrder is what makes the twelve rules below it
-// safe to write.
+// TestValSem113JudgesEveryEntryAViewCanAnswer is what makes the twelve rules below it safe to
+// write.
 //
-// A proposal reachable through a bucket and absent from All would otherwise be judged by no arm
-// check at all, and the rules that read that bucket dereference the arm. The fixture is an Add
-// whose Add arm is nil, in the Adds bucket, which is a nil dereference in ValSem101 under any
-// version that swept the commit order alone.
-func TestValSem113ReadsTheBucketsAndNotOnlyTheCommitOrder(t *testing.T) {
+// IT USED TO SAY "AND NOT ONLY THE COMMIT ORDER", and the reason that half is gone is the point.
+// A ProposalList once carried its per-type views as writable fields, so a proposal reachable
+// through a view and absent from the commit order was a real input: it was judged by no arm check
+// at all, and the rules reading that view dereferenced the arm. Sweeping the order alone left
+// exactly that hole. A view is now the order filtered, so an entry a view can answer is an entry
+// of the order and the sweep over the order is the whole of the class.
+//
+// What is still driven is what a rule stated over the adds actually stands on: an Add with a nil
+// Add arm reaches ValSem101's `add.KeyPackage` as a dereference, and this gate is what refuses it
+// first. The armless entry is BEHIND an innocent add, so a sweep narrowed to entry zero accepts
+// this list.
+func TestValSem113JudgesEveryEntryAViewCanAnswer(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice")
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "carol"))
 	armless := CachedProposal{Proposal: Proposal{ProposalType: ProposalTypeAdd}}
-	in := testValidationInput(t, crypto, tree, LeafIndex(0),
-		&ProposalList{Adds: []CachedProposal{armless}})
+	list := NewProposalList([]CachedProposal{testAddOf(kp), armless})
+	// the fixture is only worth driving if the armless entry is one the adds view answers
+	if adds := list.Adds(); len(adds) != 2 {
+		t.Fatalf("the adds view answers %d of the two adds in the commit order", len(adds))
+	}
+	in := testValidationInput(t, crypto, tree, LeafIndex(0), list)
 	if err := ValSem113ProposalTypeSupported(in); err == nil {
-		t.Fatal("ValSem113 accepted an add with no add arm sitting in the adds bucket")
+		t.Fatal("ValSem113 accepted an add with no add arm behind an innocent one")
 	}
 	// and the aggregate refuses it rather than dereferencing it
-	if err := proposalValidationRefusalOf(t, "ValidateProposalList over an armless bucketed add",
+	if err := proposalValidationRefusalOf(t, "ValidateProposalList over an armless add",
 		ValidateProposalList, in); err == nil {
 		t.Fatal("ValidateProposalList accepted an add with no add arm")
 	}
@@ -1190,11 +1220,11 @@ func TestTheUpdateDoorRefusesWhatEveryOtherUpdateRuleOfThisFileReadsPast(t *test
 				t.Fatalf("ApplyProposals refused %s: %v; section 12.3 application is not a validator and this row is written to reach the tree",
 					name, err)
 			}
-			installed := applied.Tree.Leaf(in.List.Updates[0].Sender)
+			installed := applied.Tree.Leaf(in.List.Updates()[0].Sender)
 			if installed == nil {
-				t.Fatalf("applying %s left leaf %d blank", name, in.List.Updates[0].Sender)
+				t.Fatalf("applying %s left leaf %d blank", name, in.List.Updates()[0].Sender)
 			}
-			if !bytes.Equal(installed.EncryptionKey, in.List.Updates[0].Proposal.Update.LeafNode.EncryptionKey) {
+			if !bytes.Equal(installed.EncryptionKey, in.List.Updates()[0].Proposal.Update.LeafNode.EncryptionKey) {
 				t.Fatalf("applying %s did not install the update's own leaf, so this row does not show what an unjudged update reaches",
 					name)
 			}
@@ -1516,7 +1546,7 @@ func TestTheUpdateDoorReadsTheEffectiveExtensionsAndNotTheGroupContextsOwn(t *te
 // every rule that sweeps the Updates bucket reaches every position of it
 // ---------------------------------------------------------------------------
 
-// updateSweepRule is one rule of this file that ranges over in.List.Updates, and the edit that
+// updateSweepRule is one rule of this file that ranges over in.List.Updates(), and the edit that
 // makes the update at a chosen position the one it must refuse.
 //
 // The EDIT takes a position rather than the fixture carrying the fault, because that is the whole
@@ -1573,27 +1603,27 @@ func updateSweepRules() map[string]updateSweepRule {
 		"ValSem109UpdateRequiredCapabilities": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
 			in.Context.Extensions = []Extension{
 				testRequiredCapabilitiesNaming(t, ExtensionTypeUrmessageLeafKeys)}
-			leaf := &in.List.Updates[at].Proposal.Update.LeafNode
+			leaf := &testListEntryAt(t, in.List, "Updates", at).Proposal.Update.LeafNode
 			leaf.Capabilities.Extensions = withoutExtensionType(leaf.Capabilities.Extensions,
 				ExtensionTypeUrmessageLeafKeys)
 		}},
 		// the committer's own key, which is the one member key the members' half of ValSem110
 		// does not exclude: alice commits and is not updated, so her outgoing key is still taken.
 		"ValSem110UpdateUniqueEncryptionKey": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
-			in.List.Updates[at].Proposal.Update.LeafNode.EncryptionKey =
+			testListEntryAt(t, in.List, "Updates", at).Proposal.Update.LeafNode.EncryptionKey =
 				in.Tree.Leaf(in.Committer).EncryptionKey
 		}},
 		"ValSem111NoCommitterUpdate": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
-			in.Committer = in.List.Updates[at].Sender
+			in.Committer = testListEntryAt(t, in.List, "Updates", at).Sender
 		}},
 		// a leaf index past the width of the fixture tree, which is a sender no leaf occupies.
 		"ValSem112UpdateSenderIsMember": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
-			in.List.Updates[at].Sender = LeafIndex(in.Tree.LeafWidth()) + 1
+			testListEntryAt(t, in.List, "Updates", at).Sender = LeafIndex(in.Tree.LeafWidth()) + 1
 		}},
 		// the signature, flipped AFTER signing, which is the one edit that reaches the update
 		// door without reaching any other rule of this file: no other rule verifies anything.
 		"validateUpdateLeafNodeIsValidForAnUpdate": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
-			leaf := &in.List.Updates[at].Proposal.Update.LeafNode
+			leaf := &testListEntryAt(t, in.List, "Updates", at).Proposal.Update.LeafNode
 			if len(leaf.Signature) == 0 {
 				t.Fatal("the fixture update leaf carries no signature, so flipping a byte of it asserts nothing")
 			}
@@ -1602,36 +1632,58 @@ func updateSweepRules() map[string]updateSweepRule {
 		// the leaf republishing the key it already holds, which is section 7.3's update arm and
 		// is exactly the shape ValSem110 must let through.
 		"validateUpdateChangesTheEncryptionKey": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
-			sender := in.List.Updates[at].Sender
-			in.List.Updates[at].Proposal.Update.LeafNode.EncryptionKey =
-				in.Tree.Leaf(sender).EncryptionKey
+			entry := testListEntryAt(t, in.List, "Updates", at)
+			entry.Proposal.Update.LeafNode.EncryptionKey =
+				in.Tree.Leaf(entry.Sender).EncryptionKey
 		}},
 		// a Remove landing on the leaf this Update refreshes. The refusal is raised in the
 		// Removes loop, so what it observes is that the UPDATES loop reached position `at` to
 		// record that leaf at all.
 		"validateSingleUpdateOrRemovePerLeaf": {breaks: func(t *testing.T, in *ProposalValidationInput, at int) {
-			remove := testRemoveOf(in.List.Updates[at].Sender)
-			in.List.All = append(in.List.All, remove)
-			in.List.Removes = append(in.List.Removes, remove)
+			remove := testRemoveOf(testListEntryAt(t, in.List, "Updates", at).Sender)
+			in.List = testListPlus(t, in.List, remove)
 		}},
 	}
 }
 
-// proposalListRulesThatSweepTheUpdates is every rule of this file whose body ranges over
-// in.List.Updates, read off the source rather than named.
+// proposalListRulesThatSweepTheUpdates is every rule of this file whose body ranges over the
+// updates view, read off the source rather than named.
 //
 // Off the RANGE STATEMENT and not off a token search, because what is being measured is that a
-// loop exists over that bucket: a body merely mentioning in.List.Updates once would match a token
-// scan and would be a rule reading element zero, which is the defect this gate is about.
+// loop exists over that view: a body merely mentioning the updates once would match a token scan
+// and would be a rule reading element zero, which is the defect this gate is about.
+//
+// IN TWO STEPS NOW, and the second step is what the derivation of the views cost this gate. The
+// view is a method rather than a field, so a rule cannot range over `in.List.Updates()` -- ranging
+// over a call would refilter the commit order at every index. Each rule binds the answer once and
+// ranges over the binding, so the scan first collects the names bound from in.List.Updates() and
+// then finds the loops over them. A gate left reading the old selector would find no rule at all
+// and report a clean bill over an empty class, which is why the caller below keeps a positive
+// control.
 func proposalListRulesThatSweepTheUpdates(t *testing.T) []string {
 	t.Helper()
 	parsed := mustParseSource(t, "validate_proposals.go")
 	found := []string{}
 	for _, name := range proposalListRulesDeclared(t) {
+		body := parsed.declarationOf(t, "", name).Body
+		bound := map[string]bool{}
+		ast.Inspect(body, func(node ast.Node) bool {
+			assign, isAssign := node.(*ast.AssignStmt)
+			if !isAssign {
+				return true
+			}
+			for at, value := range assign.Rhs {
+				if parsed.render(value) != "in.List.Updates()" || at >= len(assign.Lhs) {
+					continue
+				}
+				bound[parsed.render(assign.Lhs[at])] = true
+			}
+			return true
+		})
 		sweeps := false
-		ast.Inspect(parsed.declarationOf(t, "", name).Body, func(node ast.Node) bool {
+		ast.Inspect(body, func(node ast.Node) bool {
 			loop, isLoop := node.(*ast.RangeStmt)
-			if !isLoop || parsed.render(loop.X) != "in.List.Updates" {
+			if !isLoop || !bound[parsed.render(loop.X)] {
 				return true
 			}
 			sweeps = true
@@ -1661,16 +1713,16 @@ func TestEveryRuleThatSweepsTheUpdatesBucketReachesEveryPositionOfIt(t *testing.
 	// the positive control: a scan that resolved nothing reports the clean bill a complete one
 	// reports, and the update door certainly sweeps the bucket
 	if !slices.Contains(derived, "validateUpdateLeafNodeIsValidForAnUpdate") {
-		t.Fatalf("the scan read %v out of validate_proposals.go, which certainly has validateUpdateLeafNodeIsValidForAnUpdate ranging over in.List.Updates, so it is reading something else",
+		t.Fatalf("the scan read %v out of validate_proposals.go, which certainly has validateUpdateLeafNodeIsValidForAnUpdate ranging over the updates view, so it is reading something else",
 			derived)
 	}
 	for _, name := range slices.Sorted(maps.Keys(rows)) {
 		if !slices.Contains(derived, name) {
-			t.Errorf("updateSweepRules names %s and no rule of this file by that name ranges over in.List.Updates; the row has outlived what it covered",
+			t.Errorf("updateSweepRules names %s and no rule of this file by that name ranges over the updates view; the row has outlived what it covered",
 				name)
 		}
 	}
-	positions := len(updateSweepFixture(t, crypto).List.Updates)
+	positions := len(updateSweepFixture(t, crypto).List.Updates())
 	if positions < 3 {
 		t.Fatalf("the fixture carries %d updates; with fewer than three, a rule reading the first and the last would step over nothing and this sweep would assert almost nothing",
 			positions)
@@ -1678,7 +1730,7 @@ func TestEveryRuleThatSweepsTheUpdatesBucketReachesEveryPositionOfIt(t *testing.
 	for _, name := range derived {
 		row, written := rows[name]
 		if !written {
-			t.Errorf("%s ranges over in.List.Updates and has no row here, so nothing says it reaches any position but the first",
+			t.Errorf("%s ranges over the updates view and has no row here, so nothing says it reaches any position but the first",
 				name)
 			continue
 		}

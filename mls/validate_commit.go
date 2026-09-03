@@ -280,25 +280,23 @@ func (self *CommitValidationInput) check() error {
 	if err := checkOneGroupContextExtensions(self.List); err != nil {
 		return err
 	}
-	// AND THE BUCKETS ARE THE COMMIT ORDER BUCKETED BY TYPE, which is the second of the three
-	// joins this door owes and was the one it did not ask.
+	// THE SECOND JOIN THIS DOOR USED TO OWE IS NOT A JOIN ANY MORE, and that is worth a paragraph
+	// because it is the door's history rather than its code.
 	//
-	// FOUR OF THE TWELVE RULES BELOW DECIDE OFF A BUCKET -- ValSem200 off Removes, ValSem206 off
-	// Adds and Updates, ValSem208 and ValSem209 off GCE -- while
-	// checkListResolvesTheCommitsVector holds only All to the commit's own ProposalOrRef vector.
-	// A list whose All was the faithful resolution of that vector and whose BUCKET was empty
-	// therefore satisfied every rule stated over the bucket by carrying nothing for it to read:
-	// a commit removing its own committer, which is RFC 9420 section 12.2's rule and this file's
-	// ValSem200, was accepted here. So was a commit carrying two GroupContextExtensions
-	// proposals, and one whose Add republishes the update path leaf's encryption key.
+	// Four of the twelve rules below decide off a per-type view -- ValSem200 off Removes,
+	// ValSem206 off Adds and Updates, ValSem208 and ValSem209 off GCE -- while
+	// checkListResolvesTheCommitsVector holds only the commit order to the commit's own
+	// ProposalOrRef vector. When the views were fields a caller wrote beside the order, a list
+	// whose order WAS the faithful resolution of that vector and whose view was empty satisfied
+	// every rule stated over that view by carrying nothing for it to read: a commit removing its
+	// own committer was accepted here, and so were a commit carrying two GroupContextExtensions
+	// proposals and one whose Add republishes the update path leaf's encryption key. The door then
+	// asked a per-type COUNT, and each of those came back in count-preserving form.
 	//
-	// The rule that holds the two fields together already existed one file over and had exactly
-	// one caller, ApplyProposals. This is the door asking it, rather than a second body: two
-	// bodies stating one rule is how the two come to disagree, and it answers
-	// ErrProposalListBucketsDisagree because that is the value the rule already answers.
-	if err := validateBucketsAgreeWithTheCommitOrder(self.proposalValidationInput()); err != nil {
-		return err
-	}
+	// (*ProposalList).Removes is now the commit order filtered to removes. There is no second
+	// field, so there is nothing to join and no rule here to ask: holding the order to the
+	// commit's vector, one clause down, is now the whole of what makes a rule stated over the
+	// removes a rule about the commit the sender signed.
 	if err := self.checkListResolvesTheCommitsVector(); err != nil {
 		return err
 	}
@@ -315,8 +313,7 @@ func (self *CommitValidationInput) check() error {
 // stated over the resolution and this is what makes the resolution the commit's own: same length,
 // same order, each entry naming what the entry beside it names.
 //
-// A COUNT AND A NAMING, NOT AN IDENTITY, said as plainly as validateBucketsAgreeWithTheCommitOrder
-// says it one file over, and for that rule's reason. A by-value entry is compared by its proposal
+// A COUNT AND A NAMING, NOT AN IDENTITY, said plainly. A by-value entry is compared by its proposal
 // TYPE and not by its octets: the type is the whole of what section 12.4's pathRequiredTypes test
 // reads, so this is exactly enough to make the decision the same over either field, and the
 // stronger comparison costs an encode of every proposal at every door on the path a commit runs.
@@ -329,12 +326,13 @@ func (self *CommitValidationInput) check() error {
 // package's rule over every comparison of data it ships and is derived rather than listed.
 func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 	vector := self.Commit.Proposals
-	if len(vector) != len(self.List.All) {
+	order := self.List.All()
+	if len(vector) != len(order) {
 		return fmt.Errorf("%w: the commit names %d proposals and the list holds %d",
-			errCommitProposalsNotResolved, len(vector), len(self.List.All))
+			errCommitProposalsNotResolved, len(vector), len(order))
 	}
 	for i := range vector {
-		cached := &self.List.All[i]
+		cached := &order[i]
 		switch vector[i].Type {
 		case ProposalOrRefTypeReference:
 			if cached.ByValue {
@@ -758,12 +756,14 @@ func ValSem206PathLeafEncryptionKeyUnique(in *CommitValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
+	adds := in.List.Adds()
+	updates := in.List.Updates()
 	if in.Commit.Path == nil {
 		return nil
 	}
 	key := in.Commit.Path.LeafNode.EncryptionKey
-	for i := range in.List.Adds {
-		add := in.List.Adds[i].Proposal.Add
+	for i := range adds {
+		add := adds[i].Proposal.Add
 		if add == nil {
 			continue
 		}
@@ -776,8 +776,8 @@ func ValSem206PathLeafEncryptionKeyUnique(in *CommitValidationInput) error {
 				errDuplicateEncryptionKey, i)
 		}
 	}
-	for i := range in.List.Updates {
-		update := in.List.Updates[i].Proposal.Update
+	for i := range updates {
+		update := updates[i].Proposal.Update
 		if update == nil {
 			continue
 		}

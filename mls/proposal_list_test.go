@@ -1020,13 +1020,13 @@ func TestProposalCacheResolvesByReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 4 {
-		t.Fatalf("Removes = %+v", list.Removes)
+	if len(list.Removes()) != 1 || list.Removes()[0].Proposal.Remove.Removed != 4 {
+		t.Fatalf("Removes = %+v", list.Removes())
 	}
-	if list.Removes[0].Sender != 1 {
+	if list.Removes()[0].Sender != 1 {
 		t.Fatal("the resolved proposal must keep its original sender, not the committer")
 	}
-	if list.Removes[0].ByValue {
+	if list.Removes()[0].ByValue {
 		t.Fatal("a proposal named by reference is not one the commit carried by value")
 	}
 }
@@ -1062,10 +1062,10 @@ func TestTheCacheAnswersTheReferenceItWasAskedForAndNotTheFirstOneItHolds(t *tes
 		if err != nil {
 			t.Fatalf("Resolve(entry %d): %v", i, err)
 		}
-		if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != removals[i] ||
-			list.Removes[0].Sender != senders[i] {
+		if len(list.Removes()) != 1 || list.Removes()[0].Proposal.Remove.Removed != removals[i] ||
+			list.Removes()[0].Sender != senders[i] {
 			t.Errorf("Resolve(entry %d) answered %+v, want a removal of leaf %d sent by leaf %d",
-				i, list.Removes, removals[i], senders[i])
+				i, list.Removes(), removals[i], senders[i])
 		}
 	}
 }
@@ -1166,8 +1166,8 @@ func TestProposalCacheByValueSenderIsCommitter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if len(list.Removes) != 1 || list.Removes[0].Sender != 5 || !list.Removes[0].ByValue {
-		t.Fatalf("by-value proposal must be attributed to the committer: %+v", list.Removes)
+	if len(list.Removes()) != 1 || list.Removes()[0].Sender != 5 || !list.Removes()[0].ByValue {
+		t.Fatalf("by-value proposal must be attributed to the committer: %+v", list.Removes())
 	}
 }
 
@@ -1418,8 +1418,8 @@ func TestAReplayedProposalOfAClosedEpochNeitherBindsTheCacheNorLocksOutTheLiveEp
 	if err != nil {
 		t.Fatalf("a commit of the live epoch naming the live epoch's own proposal answered %v; this is the member that can no longer merge a commit, which is what made the lockout permanent", err)
 	}
-	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 5 {
-		t.Errorf("the live commit resolved to %+v", list.Removes)
+	if len(list.Removes()) != 1 || list.Removes()[0].Proposal.Remove.Removed != 5 {
+		t.Errorf("the live commit resolved to %+v", list.Removes())
 	}
 	// and the replayed name is GONE rather than merely refused: the entry left with the epoch
 	if _, err := cache.Resolve(crypto, live, LeafIndex(0),
@@ -1543,10 +1543,10 @@ func TestProposalCacheBucketsAndOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if len(list.All) != 2 || list.Len() != 2 {
-		t.Fatalf("All = %d, Len = %d, want 2", len(list.All), list.Len())
+	if len(list.All()) != 2 || list.Len() != 2 {
+		t.Fatalf("All = %d, Len = %d, want 2", len(list.All()), list.Len())
 	}
-	if list.All[0].Proposal.Remove.Removed != 1 || list.All[1].Proposal.Remove.Removed != 2 {
+	if list.All()[0].Proposal.Remove.Removed != 1 || list.All()[1].Proposal.Remove.Removed != 2 {
 		t.Fatal("All must preserve commit order, because Add placement depends on it")
 	}
 	if !list.PathRequired() {
@@ -1580,14 +1580,14 @@ func TestResolveKeepsCommitOrderInAllAndInEveryBucket(t *testing.T) {
 	}
 	want := []LeafIndex{1, 2, 3, 4}
 	got := []LeafIndex{}
-	for _, cached := range list.All {
+	for _, cached := range list.All() {
 		got = append(got, cached.Proposal.Remove.Removed)
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("All removes leaves %v, want %v in the order the commit names them", got, want)
 	}
 	got = got[:0]
-	for _, cached := range list.Removes {
+	for _, cached := range list.Removes() {
 		got = append(got, cached.Proposal.Remove.Removed)
 	}
 	if !slices.Equal(got, want) {
@@ -1654,44 +1654,76 @@ func TestAnEmptyProposalListRequiresAPath(t *testing.T) {
 // class the moment it is declared, which is what the sweep below needs it to be.
 func proposalListBucketNames(t *testing.T) []string {
 	t.Helper()
-	bucketType := reflect.TypeOf([]CachedProposal{})
 	names := []string{}
-	for i := 0; i < reflect.TypeOf(ProposalList{}).NumField(); i += 1 {
-		field := reflect.TypeOf(ProposalList{}).Field(i)
-		if field.Name == "All" || field.Type != bucketType {
-			continue
-		}
-		names = append(names, field.Name)
+	for _, method := range proposalListViewMethods(t) {
+		names = append(names, method.Name)
 	}
 	if len(names) == 0 {
-		t.Fatal("ProposalList declares no bucket of cached proposals, so the sweep below compares nothing")
+		t.Fatal("ProposalList answers no per-type view of cached proposals, so the sweep below compares nothing")
 	}
 	slices.Sort(names)
 	return names
 }
 
-// proposalListBucketLength reads one bucket of a resolved list by name.
-func proposalListBucketLength(t *testing.T, list *ProposalList, bucket string) int {
+// proposalListViewMethods is the derived class every gate over the per-type views runs on: every
+// method of *ProposalList taking no argument and answering exactly []CachedProposal, less the one
+// that answers the commit order.
+//
+// OFF THE METHOD SET AND NOT OFF THE FIELDS, because the views are no longer fields. A list stores
+// its commit order and derives each view from it, so "every []CachedProposal field except All" now
+// names one thing -- the order itself -- and a gate written that way would sweep nothing while
+// reporting a clean bill. A fifth view added by a later task, a psk view when the profile widens,
+// is in this class on the commit that declares it.
+func proposalListViewMethods(t *testing.T) []reflect.Method {
 	t.Helper()
-	field := reflect.ValueOf(list).Elem().FieldByName(bucket)
-	if !field.IsValid() {
-		t.Fatalf("ProposalList has no field %s", bucket)
+	const commitOrder = "All"
+	entries := reflect.TypeOf([]CachedProposal{})
+	listType := reflect.TypeOf(&ProposalList{})
+	found := []reflect.Method{}
+	for i := 0; i < listType.NumMethod(); i += 1 {
+		method := listType.Method(i)
+		signature := method.Type
+		// one receiver and nothing else in, one []CachedProposal out
+		if signature.NumIn() != 1 || signature.NumOut() != 1 || signature.Out(0) != entries {
+			continue
+		}
+		if method.Name == commitOrder {
+			continue
+		}
+		found = append(found, method)
 	}
-	return field.Len()
+	// and the exclusion is real rather than a name nobody declares
+	if _, answers := listType.MethodByName(commitOrder); !answers {
+		t.Fatalf("*ProposalList answers no %s, so the one exclusion this class makes excludes nothing",
+			commitOrder)
+	}
+	return found
 }
 
-// TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn holds Resolve's bucketing to the
-// profile table and to the ProposalList type, in both directions.
+// proposalListBucketLength reads one per-type view of a list by the name of the method that
+// answers it.
+func proposalListBucketLength(t *testing.T, list *ProposalList, bucket string) int {
+	t.Helper()
+	method := reflect.ValueOf(list).MethodByName(bucket)
+	if !method.IsValid() {
+		t.Fatalf("*ProposalList answers no %s", bucket)
+	}
+	return method.Call(nil)[0].Len()
+}
+
+// TestEveryProposalTypeTheV1ProfileAcceptsLandsInAViewOfItsOwn holds the profile table to the
+// per-type views ProposalList answers, in both directions.
 //
 // Neither side is written down here. The accepted set is the rows of proposalTypeProfile whose
 // refusal is nil -- the same table TestTheV1ProfileClassifiesEveryRegisteredProposalType holds
-// equal to the registry -- and the buckets are the fields of ProposalList. What the two
-// directions catch are different faults. An accepted type with no bucket is counted in All and
-// applied by nothing, which is a commit the group agrees to and does not perform; and a bucket no
-// accepted type fills is a route Resolve never takes, which is the shape a bucket added for a
-// type that was then refused leaves behind. Two accepted types sharing one bucket is the third,
-// and it is why the fill is recorded per bucket rather than counted.
-func TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn(t *testing.T) {
+// equal to the registry -- and the views are the method set of *ProposalList. What the two
+// directions catch are different faults. An accepted type with no view sits in the commit order,
+// is read by no rule stated over a view and is applied by nothing, which is a commit the group
+// agrees to and does not perform; and a view no accepted type fills is a filter that can never
+// select anything, which is the shape a view added for a type that was then refused leaves
+// behind. Two accepted types sharing one view is the third, and it is why the fill is recorded per
+// view rather than counted.
+func TestEveryProposalTypeTheV1ProfileAcceptsLandsInAViewOfItsOwn(t *testing.T) {
 	crypto := testCrypto(t)
 	member := testIdentity(t, crypto, "bob")
 	registered := proposalTypeRegistry(t)
@@ -1713,8 +1745,8 @@ func TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn(t *testing.T
 			t.Errorf("Resolve of a %s the v1 profile accepts: %v", name, err)
 			continue
 		}
-		if len(list.All) != 1 {
-			t.Errorf("a single %s resolved to %d entries in All", name, len(list.All))
+		if len(list.All()) != 1 {
+			t.Errorf("a single %s resolved to %d entries in All", name, len(list.All()))
 			continue
 		}
 		landed := []string{}
@@ -1889,8 +1921,8 @@ func TestResolveHandsBackNothingTheCacheStillHolds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	list.All[0].Proposal.Remove.Removed = 99
-	list.All[0].Ref[0] ^= 0xFF
+	list.All()[0].Proposal.Remove.Removed = 99
+	list.All()[0].Ref[0] ^= 0xFF
 	cached, ok := cache.Cached(testResolveContext(), ref)
 	if !ok {
 		t.Fatal("the caller's edit to the resolved reference reached the key this cache is holding")
@@ -2040,9 +2072,9 @@ func TestPendingAnswersEveryEntryOnceInReceptionOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve of the pending vector: %v", err)
 	}
-	if len(list.Removes) != 2 || list.Removes[0].Proposal.Remove.Removed != 4 ||
-		list.Removes[1].Proposal.Remove.Removed != 5 {
-		t.Errorf("the pending vector resolved to %+v", list.Removes)
+	if len(list.Removes()) != 2 || list.Removes()[0].Proposal.Remove.Removed != 4 ||
+		list.Removes()[1].Proposal.Remove.Removed != 5 {
+		t.Errorf("the pending vector resolved to %+v", list.Removes())
 	}
 }
 
@@ -2081,8 +2113,8 @@ func TestResolveRefusesAReferenceCachedInAnEpochThatHasClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve in the epoch the entry was cached in: %v", err)
 	}
-	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 4 {
-		t.Fatalf("the entry resolved to %+v in its own epoch", list.Removes)
+	if len(list.Removes()) != 1 || list.Removes()[0].Proposal.Remove.Removed != 4 {
+		t.Fatalf("the entry resolved to %+v in its own epoch", list.Removes())
 	}
 
 	for _, one := range []struct {
@@ -2137,8 +2169,8 @@ func TestAResolutionThatNamesNothingCachedIsNotJudgedByTheBindingOfACacheItNever
 	if err != nil {
 		t.Fatalf("an inline only commit of epoch 8, over a cache still holding epoch 7, answered %v; it reads no entry of that cache", err)
 	}
-	if len(list.Removes) != 1 || list.Removes[0].Proposal.Remove.Removed != 9 || list.Removes[0].Sender != 3 {
-		t.Fatalf("the inline proposal resolved to %+v", list.Removes)
+	if len(list.Removes()) != 1 || list.Removes()[0].Proposal.Remove.Removed != 9 || list.Removes()[0].Sender != 3 {
+		t.Fatalf("the inline proposal resolved to %+v", list.Removes())
 	}
 }
 
@@ -2231,10 +2263,7 @@ func TestExtensionsAnswersTheFirstOfTwoInAHandAssembledList(t *testing.T) {
 			GroupContextExtensions: &GroupContextExtensions{Extensions: extensions},
 		}}
 	}
-	list := &ProposalList{
-		GCE: []CachedProposal{entry(first), entry(second)},
-		All: []CachedProposal{entry(first), entry(second)},
-	}
+	list := NewProposalList([]CachedProposal{entry(first), entry(second)})
 	answered, ok := list.Extensions()
 	if !ok || len(answered) != 1 {
 		t.Fatalf("Extensions over a list carrying two group_context_extensions answered %v %v", answered, ok)

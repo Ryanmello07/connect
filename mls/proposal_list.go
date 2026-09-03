@@ -28,6 +28,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
@@ -332,22 +333,159 @@ type CachedProposal struct {
 	ByValue  bool
 }
 
-// ProposalList is one commit's proposals, bucketed by type and also kept in commit order.
+// ProposalList is one commit's proposals: the commit ORDER, and the per-type views of it that
+// RFC 9420 section 12.2's rules are stated over.
 //
-// All is not a convenience. RFC 9420 section 12.1.1 places an added member at the leftmost blank
-// leaf in the order the Add proposals appear, so two commits carrying the same set of adds in a
-// different order build different trees -- and a bucket alone cannot say which order that was.
+// ONE REPRESENTATION, AND THAT IS THE WHOLE OF WHAT THIS TYPE DECIDES. The order is the only
+// thing stored. Adds, Updates, Removes and GCE are that order FILTERED, computed at the read, so
+// a list whose removes disagree with its commit order cannot be constructed -- there is no second
+// field to fill in beside the order, and no index that could fall behind it.
+//
+// THAT IS THE REPAIR OF A FAULT THAT GOT PAST TWO GATES, not a preference. The views used to be
+// exported fields a caller wrote beside All, and the two doors of this package read different
+// ones: ApplyProposals walked Updates and Removes while every rule of validate_proposals.go read
+// the buckets, and the door held the two together by a per-type COUNT. So a list carrying
+// All=[remove(committer)] beside Removes=[remove(3)] was accepted by ValidateCommit and applied
+// by removing leaf 3 -- one member applying a different commit from the one the transcript
+// covers, with every count equal. Three more of that shape were verified against the counting
+// door: an Add colliding with the update path leaf key, an Update publishing it, and a
+// GroupContextExtensions installing an extension outside the v1 profile, each hidden behind an
+// innocent entry of its own type. A count is a CHECK and leaves the dual representation standing
+// for the next reader; deriving the views removes it, and the two rules that used to check for
+// the disagreement are gone rather than reduced.
+//
+// THE DERIVED ORDER IS THE ORDER SECTION 12.3 ASKS FOR, which was confirmed rather than assumed.
+// Section 12.3's application order is GroupContextExtensions, then Updates, then Removes, then
+// Adds "in the order they appear in the proposals vector". Only the Add clause names an order at
+// all -- updates and removes are applied "in any order", which section 12.2's same-leaf rule is
+// what makes safe -- so a view answering the commit order filtered gives section 12.3 exactly the
+// order it names for adds and a permitted order everywhere else. Nothing here sorts, and nothing
+// here would be entitled to.
 type ProposalList struct {
-	Adds    []CachedProposal
-	Updates []CachedProposal
-	Removes []CachedProposal
-	GCE     []CachedProposal
-	All     []CachedProposal
+	// order is the commit's ProposalOrRef vector resolved, and it is the only proposal storage
+	// this type has. Unexported with one constructor for VerifiedGroupContext's reason: a field
+	// a caller can write is a second representation of the same fact however many rules are
+	// stood over it, and this package has now spent two rounds writing those rules.
+	order []CachedProposal
+}
+
+// NewProposalList is how a caller outside a resolution builds a list.
+//
+// IT TAKES THE COMMIT ORDER AND NOTHING ELSE, because there is nothing else to hand it: every
+// per-type view is a function of this vector. A caller that wants a list with one remove in it
+// passes a vector with one remove in it, and cannot pass a vector and a disagreeing bucket
+// because there is no bucket to pass.
+//
+// The vector is CLONED, so a caller that goes on appending to the slice it passed is not
+// appending to this list's commit order.
+func NewProposalList(order []CachedProposal) *ProposalList {
+	return &ProposalList{order: slices.Clone(order)}
+}
+
+// All is the commit order: this commit's ProposalOrRef vector resolved, in the order the sender
+// signed it.
+//
+// THE ORDER IS WHAT IS STORED AND THE VIEWS ARE WHAT IS DERIVED, rather than the other way round,
+// because the order is the half that cannot be recovered. RFC 9420 section 12.1.1 places an added
+// member at the leftmost blank leaf in the order the Add proposals appear, so two commits
+// carrying the same set of adds in a different order build different trees, different tree hashes
+// and different confirmed transcripts. A set of buckets cannot say which order that was; the
+// order can always say what the buckets are.
+//
+// It answers the list's own vector rather than a copy of it. That is a statement about allocation
+// and not about representation: a caller writing through the slice it is handed writes the ONE
+// place this list keeps its proposals, and every view answers that write on the next read.
+func (self *ProposalList) All() []CachedProposal {
+	return self.order
+}
+
+// Adds is the commit order filtered to Add proposals, in commit order.
+func (self *ProposalList) Adds() []CachedProposal {
+	return self.viewOf(ProposalTypeAdd)
+}
+
+// Updates is the commit order filtered to Update proposals, in commit order.
+func (self *ProposalList) Updates() []CachedProposal {
+	return self.viewOf(ProposalTypeUpdate)
+}
+
+// Removes is the commit order filtered to Remove proposals, in commit order.
+func (self *ProposalList) Removes() []CachedProposal {
+	return self.viewOf(ProposalTypeRemove)
+}
+
+// GCE is the commit order filtered to GroupContextExtensions proposals, in commit order.
+//
+// Section 12.2 makes a list carrying two of them invalid and both doors of this package refuse
+// such a list, so over every list this package accepts this answers nought or one entry.
+func (self *ProposalList) GCE() []CachedProposal {
+	return self.viewOf(ProposalTypeGroupContextExtensions)
+}
+
+// viewOf is the derivation the four accessors above are, written once.
+//
+// FILTERED AT EVERY READ RATHER THAN INDEXED ONCE, and that is measured rather than a taste. An
+// index built at construction would be a second representation again -- an unexported one with no
+// setter, which is weaker than none at all, because it can still fall behind an in-package write
+// to the order it was built from. What it would buy is the recomputation, and the recomputation
+// was measured rather than guessed at:
+// TestDerivingTheViewsCostsLessThanTheRulesThatReadThem times the whole of section 12.2 against
+// exactly the view reads that aggregate makes -- twenty of them, counted off validate_proposals.go
+// rather than by hand -- over a list of 97 proposals in a group of 96, and the filtering is 20 us
+// against the aggregate's 3.2 ms. Six tenths of one percent, for a validation a member runs once
+// per epoch. The bound that test enforces is half, because what it is protecting against is a
+// change of order rather than drift.
+//
+// The allocation is skipped entirely for a type the commit does not carry, which is the ordinary
+// case for three of the four.
+func (self *ProposalList) viewOf(carries ProposalType) []CachedProposal {
+	var out []CachedProposal
+	for i := range self.order {
+		if self.order[i].Proposal.ProposalType == carries {
+			out = append(out, self.order[i])
+		}
+	}
+	return out
+}
+
+// proposalBucket is one per-type view of a list: the ACCESSOR that answers it, the type every
+// entry it answers carries, and the entries.
+type proposalBucket struct {
+	accessor string
+	carries  ProposalType
+	entries  []CachedProposal
+}
+
+// proposalBucketsOf is every per-type view of a list, and it is the one place they are enumerated.
+//
+// Four rows written by hand is the shape that understates its class the moment a fifth view is
+// added -- a psk view, when the profile widens -- so it is held to the TYPE rather than to
+// memory. TestEveryPerTypeViewOfAProposalListIsNamedByTheViewRule reflects over *ProposalList's
+// own method set and requires every method answering []CachedProposal, except the commit order
+// one, to appear here; TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered holds each
+// row's entries to the filter of All by that row's own type, element by element and not by count.
+func proposalBucketsOf(list *ProposalList) []proposalBucket {
+	return []proposalBucket{
+		{accessor: "Adds", carries: ProposalTypeAdd, entries: list.Adds()},
+		{accessor: "Updates", carries: ProposalTypeUpdate, entries: list.Updates()},
+		{accessor: "Removes", carries: ProposalTypeRemove, entries: list.Removes()},
+		{accessor: "GCE", carries: ProposalTypeGroupContextExtensions, entries: list.GCE()},
+	}
+}
+
+// proposalListViewedTypes is the set of proposal types this build answers a named view for, read
+// off proposalBucketsOf rather than written down a second time.
+func proposalListViewedTypes() map[ProposalType]bool {
+	viewed := map[ProposalType]bool{}
+	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
+		viewed[bucket.carries] = true
+	}
+	return viewed
 }
 
 // Len is the total proposal count.
 func (self *ProposalList) Len() int {
-	return len(self.All)
+	return len(self.order)
 }
 
 // PathRequired is the RFC 9420 section 12.4 rule: a commit carries an UpdatePath if its proposal
@@ -358,10 +496,10 @@ func (self *ProposalList) Len() int {
 // every member of the previous epoch still holds -- which is the whole of what an update commit
 // exists to prevent.
 func (self *ProposalList) PathRequired() bool {
-	if len(self.All) == 0 {
+	if len(self.order) == 0 {
 		return true
 	}
-	for _, cached := range self.All {
+	for _, cached := range self.order {
 		if proposalTypePathRequired(cached.Proposal.ProposalType) {
 			return true
 		}
@@ -380,14 +518,15 @@ func (self *ProposalList) PathRequired() bool {
 // on errMultipleGroupContextExtensions.
 //
 // The hand assembled list is not a hypothetical and is why the index is held by a test of its
-// own. Every list Resolve builds carries at most one GCE, so over those lists GCE[0] and
-// GCE[len-1] are the same entry and no test that goes through Resolve can tell them apart --
-// measured: the whole suite was green with the last one answered. p7 task 7 assembles
-// ProposalList values field by field and reads this through
-// (*ProposalValidationInput).effectiveExtensions, and there the two differ.
+// own. Every list Resolve builds carries at most one GCE, so over those lists GCE()[0] and
+// GCE()[len-1] are the same entry and no test that goes through Resolve can tell them apart --
+// measured: the whole suite was green with the last one answered. A commit order a caller hands
+// NewProposalList can carry two, and it is read through
+// (*ProposalValidationInput).effectiveExtensions, where the two differ.
 // TestExtensionsAnswersTheFirstOfTwoInAHandAssembledList is what separates them.
 func (self *ProposalList) Extensions() ([]Extension, bool) {
-	if len(self.GCE) == 0 {
+	gce := self.GCE()
+	if len(gce) == 0 {
 		return nil, false
 	}
 	// a GCE entry carrying no GroupContextExtensions arm is a malformed list and every door that
@@ -396,17 +535,17 @@ func (self *ProposalList) Extensions() ([]Extension, bool) {
 	// what it owes is the one thing a door must not do: it does not dereference the missing arm.
 	// "No extension set this list can name" is also the fail-closed answer for the two callers,
 	// which fall back to the group's own extensions rather than to a set read off nothing.
-	if self.GCE[0].Proposal.GroupContextExtensions == nil {
+	if gce[0].Proposal.GroupContextExtensions == nil {
 		return nil, false
 	}
-	return self.GCE[0].Proposal.GroupContextExtensions.Extensions, true
+	return gce[0].Proposal.GroupContextExtensions.Extensions, true
 }
 
 // Refs rebuilds the ProposalOrRef vector a commit carries, in commit order.
 func (self *ProposalList) Refs() []ProposalOrRef {
-	out := make([]ProposalOrRef, 0, len(self.All))
-	for i := range self.All {
-		cached := self.All[i]
+	out := make([]ProposalOrRef, 0, len(self.order))
+	for i := range self.order {
+		cached := self.order[i]
 		if cached.ByValue {
 			proposal := cached.Proposal
 			out = append(out, ProposalOrRef{Type: ProposalOrRefTypeProposal, Proposal: &proposal})
@@ -1350,6 +1489,7 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, groupContext *GroupCon
 		return nil, fmt.Errorf("%w: resolution is refused unless it can name the epoch it runs in", ErrNilGroupContext)
 	}
 	list := &ProposalList{}
+	viewed := proposalListViewedTypes()
 	namedAt := map[string]int{}
 	for i := range refs {
 		entry := refs[i]
@@ -1413,39 +1553,36 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, groupContext *GroupCon
 			return nil, err
 		}
 		cached := CachedProposal{Ref: name, Proposal: proposal, Sender: sender, ByValue: byValue}
-		list.All = append(list.All, cached)
-		switch cached.Proposal.ProposalType {
-		case ProposalTypeAdd:
-			list.Adds = append(list.Adds, cached)
-		case ProposalTypeUpdate:
-			list.Updates = append(list.Updates, cached)
-		case ProposalTypeRemove:
-			list.Removes = append(list.Removes, cached)
-		case ProposalTypeGroupContextExtensions:
-			if len(list.GCE) != 0 {
-				return nil, fmt.Errorf("%w: at proposal_or_ref %d", errMultipleGroupContextExtensions, i)
-			}
-			list.GCE = append(list.GCE, cached)
-		default:
-			// UNREACHABLE TODAY, and the account this branch used to carry -- "reachable,
-			// and that is why it is here rather than argued away as dead" -- was false.
-			// Every value reaching this switch has been through checkProposalProfile, which
-			// refuses every type proposalTypeProfile does not classify as accepted, and the
-			// four cases above are exactly the four it does. Nothing this build can assemble
-			// arrives here. A justification comment is a claim, and that one could not be
-			// checked by anybody who did not re-derive it.
-			//
-			// It stays, and it REFUSES rather than dropping, because the commit that widens
-			// the accepted set is what makes it reachable: a fifth accepted type with no
-			// bucket beside it would be counted in All, applied by nothing, and named by no
-			// error -- a proposal the group agreed to and no member acted on.
-			// TestEveryProposalTypeTheV1ProfileAcceptsLandsInABucketOfItsOwn fails on that
-			// commit before this line ever runs, and
-			// TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped performs the
-			// widening for the length of one test so that this line is executed rather than
-			// reasoned about.
+		// AND THE TYPE HAS A NAMED VIEW OF ITS OWN, asked before the entry joins the order.
+		//
+		// UNREACHABLE TODAY, and this is not the branch's excuse for existing. Every value
+		// reaching here has been through checkProposalProfile, which refuses every type
+		// proposalTypeProfile does not classify as accepted, and proposalListViewedTypes is
+		// exactly the four it does accept -- read off proposalBucketsOf rather than listed
+		// here, so the two cannot drift apart.
+		//
+		// It stays, and it REFUSES rather than dropping, because the commit that widens the
+		// accepted set is what makes it reachable: a fifth accepted type with no view beside
+		// it would sit in the commit order, be read by no rule stated over a view, be applied
+		// by nothing, and be named by no error -- a proposal the group agreed to and no member
+		// acted on. Deriving the views closed the DISAGREEMENT between a view and the order;
+		// it does not close a type the order carries and no view answers.
+		// TestEveryProposalTypeTheV1ProfileAcceptsLandsInAViewOfItsOwn fails on that commit
+		// before this line ever runs, and
+		// TestABucketlessAcceptedTypeIsRefusedRatherThanSilentlyDropped performs the widening
+		// for the length of one test so that this line is executed rather than reasoned about.
+		if !viewed[cached.Proposal.ProposalType] {
 			return nil, fmt.Errorf("%w: %s has no bucket", errAcceptedTypeHasNoBucket,
 				proposalTypeName(cached.Proposal.ProposalType))
+		}
+		list.order = append(list.order, cached)
+		// and section 12.2's one-GroupContextExtensions rule as the order is built, so the
+		// refusal can name the entry that broke it. Asked off the DERIVED view rather than off
+		// a counter of its own -- a counter beside the order is the very thing this type was
+		// rebuilt to stop having -- and only when the entry just appended is a GCE, so the
+		// sweep runs at most twice over a whole resolution.
+		if cached.Proposal.ProposalType == ProposalTypeGroupContextExtensions && len(list.GCE()) > 1 {
+			return nil, fmt.Errorf("%w: at proposal_or_ref %d", errMultipleGroupContextExtensions, i)
 		}
 	}
 	return list, nil
