@@ -37,6 +37,7 @@ import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -376,10 +377,28 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 //
 // Transitive rather than one hop, because the pair this file declares is a wrapper and a body:
 // the wrapper names no MLSMessage at all, and a rule reading one hop would report the seam that
-// does the work and call the seam beside it clean. It is a fixed point over bare names, so two
-// declarations sharing one spelling merge -- which errs towards calling a declaration a seam,
-// the direction a gate is allowed to err in.
+// does the work and call the seam beside it clean.
+//
+// An edge is followed only when the name it is written as belongs to ONE declaration in the
+// scan, and that condition is here because leaving it out was measured to break the rule. A
+// selector tail carries no receiver, so every X.UnmarshalMLS and every X.MarshalMLS in the tree
+// is one bare name; MLSMessage has both, so a walk that merged them marked the whole family as
+// reaching the wire and the transitive step then spread that to anything naming any of them.
+// Measured over the two roots: with the merge in place the class swallowed
+// marshalPrivateMessageContentWithPadding, which is production source, is genuinely handed the
+// authenticators, and serializes a FRAGMENT -- so the gate reported this package as shipping a
+// forge it does not ship. That was caught by the near miss the gate below pins rather than by
+// inspection, which is what that pin is for.
+//
+// The honest limit it buys, stated because it is a real one: a seam that reached the wire door
+// through a helper whose bare name some OTHER declaration also carries is not followed. What is
+// never missed is a seam that names the door itself, which both of this file's do and which is
+// the shape the plan wrote.
 func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
+	declarations := map[string]int{}
+	for _, candidate := range candidates {
+		declarations[candidate.bare] += 1
+	}
 	reaches := map[string]bool{}
 	for grew := true; grew; {
 		grew = false
@@ -393,7 +412,7 @@ func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
 				continue
 			}
 			for named := range candidate.names {
-				if reaches[named] {
+				if reaches[named] && declarations[named] == 1 {
 					reaches[candidate.bare] = true
 					grew = true
 					break
@@ -525,9 +544,18 @@ func TestTheConstructionBypassSeamGateReadsItsControl(t *testing.T) {
 // correct assembly would have computed, and it reaches the door this package's octets leave by. A
 // seam written tomorrow under any spelling, in any file, in either of those two shapes, is in it.
 func TestEveryConstructionBypassSeamIsDeclaredInTestSource(t *testing.T) {
+	// both roots the guardrails walk, and not this directory alone. The seams themselves are
+	// methods on *Group and could not be declared in another package, but the CLASS is not
+	// about them: every name it is derived from -- FramedContentAuthData, MLSMessage,
+	// MarshalMLSMessage -- is EXPORTED, so the same forge assembled in connect/message is the
+	// same shape reached through a qualified name, and a selector tail is the identifier this
+	// matcher already reads. Deriving a class and then scoping it to the directory its first
+	// two members happen to sit in is the defect this project has paid for more than once, so
+	// the scope is the walk every other package wide gate here uses.
+	scan := mustScanSources(t, forbiddenScanRoots)
 	parsed := []parsedSource{}
-	for _, path := range packageSourcePaths(t) {
-		parsed = append(parsed, mustParseSource(t, path))
+	for _, path := range slices.Sorted(maps.Keys(scan.sourceTexts)) {
+		parsed = append(parsed, mustParseText(t, path, scan.sourceTexts[path]))
 	}
 
 	// the anchors, against the package's own declarations. A door that had been renamed leaves
