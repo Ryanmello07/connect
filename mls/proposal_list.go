@@ -431,10 +431,11 @@ func (self *ProposalList) GCE() []CachedProposal {
 // was measured rather than guessed at:
 // TestDerivingTheViewsCostsLessThanTheRulesThatReadThem times the whole of section 12.2 against
 // exactly the view reads that aggregate makes -- twenty of them, counted off validate_proposals.go
-// rather than by hand -- over a list of 97 proposals in a group of 96, and the filtering is 20 us
-// against the aggregate's 3.2 ms. Six tenths of one percent, for a validation a member runs once
-// per epoch. The bound that test enforces is half, because what it is protecting against is a
-// change of order rather than drift.
+// rather than by hand -- over a list of 97 proposals in a group of 96, and the filtering is 33 us
+// against the aggregate's 3.2 ms. One percent, for a validation a member runs once per epoch. The
+// bound that test enforces is a tenth, which an accessor gone worse than linear reaches and
+// nothing else does; TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop is the other half, and it
+// is what makes "filtered at every read" affordable rather than merely cheap in one fixture.
 //
 // The allocation is skipped entirely for a type the commit does not carry, which is the ordinary
 // case for three of the four.
@@ -1576,14 +1577,22 @@ func (self *ProposalCache) Resolve(crypto CryptoProvider, groupContext *GroupCon
 				proposalTypeName(cached.Proposal.ProposalType))
 		}
 		list.order = append(list.order, cached)
-		// and section 12.2's one-GroupContextExtensions rule as the order is built, so the
-		// refusal can name the entry that broke it. Asked off the DERIVED view rather than off
-		// a counter of its own -- a counter beside the order is the very thing this type was
-		// rebuilt to stop having -- and only when the entry just appended is a GCE, so the
-		// sweep runs at most twice over a whole resolution.
-		if cached.Proposal.ProposalType == ProposalTypeGroupContextExtensions && len(list.GCE()) > 1 {
-			return nil, fmt.Errorf("%w: at proposal_or_ref %d", errMultipleGroupContextExtensions, i)
-		}
+	}
+	// and section 12.2's one-GroupContextExtensions rule over the order this walk built.
+	//
+	// AFTER THE LOOP AND THROUGH THE RULE'S OWN BODY, which is two decisions. It is
+	// checkOneGroupContextExtensions and not a second spelling, because two bodies stating one
+	// rule is how the two come to disagree -- the shape this file's own header argues for
+	// everywhere else. And it is outside the walk because a view is FILTERED at every read: a
+	// call inside the loop is a sweep of the order per entry, which is quadratic in what a peer
+	// can send, and TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop holds every reader of a
+	// view to that.
+	//
+	// What it costs is the index: the refusal no longer names the proposal_or_ref that broke the
+	// rule. Nothing asserted that index, section 12.2 states the rule over the LIST rather than
+	// over an entry, and a caller told "this commit carries two" is told the thing it can act on.
+	if err := checkOneGroupContextExtensions(list); err != nil {
+		return nil, err
 	}
 	return list, nil
 }

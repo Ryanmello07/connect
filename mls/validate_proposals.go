@@ -245,6 +245,14 @@ func checkProposalListStructure(list *ProposalList) error {
 // judged by nothing. Every view is now the order filtered, so a bucket entry IS an order entry and
 // the second sweep judged each of them twice. It is also what makes the twelve rules below safe to
 // write, because the arm check is inside this gate.
+//
+// THIS LOOP IS UNOBSERVABLE AND IS KEPT, which is measured rather than assumed: narrowing it to the
+// first proposal of the order leaves the whole of ./mls/... and ./message/... green. Every door of
+// this file opens with in.check, which reaches checkProposalListStructure, which sweeps the same
+// order a moment earlier and answers the same eight values -- so no input can reach this loop
+// having got past that one. It stays on ValidateProposalList's own stated terms: refusing at the
+// door is what the rest of this package does, this is the rule the plan names, and nothing here
+// claims a test can tell which of the two guards fired.
 func ValSem113ProposalTypeSupported(in *ProposalValidationInput) error {
 	if err := in.check(); err != nil {
 		return err

@@ -154,6 +154,14 @@ func ApplyProposals(tree *RatchetTree, ctx *GroupContext, own LeafIndex,
 	//    about what section 12.3 says rather than a defence against a field a caller filled in:
 	//    "in the order they appear in the proposals vector" is the vector, and reading it here is
 	//    what a later edit of the views cannot quietly change.
+	//
+	//    MEASURED: rewriting this walk to range over list.Adds() leaves the whole of ./mls/... and
+	//    ./message/... green, and that is the derivation's own guarantee rather than a gap in the
+	//    suite. Under the fields this type used to carry the same rewrite was a fork -- the bucket
+	//    was whatever order a caller appended in, and
+	//    TestApplyProposalsTakesTheAddOrderFromTheCommitOrder existed to build exactly that
+	//    conflict. There is no longer an input that separates the two programs, so no test can.
+	//
 	//    AddLeaf places at the leftmost blank leaf and extends the tree to the right when there
 	//    is none.
 	order := list.All()

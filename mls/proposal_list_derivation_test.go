@@ -32,6 +32,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unicode"
@@ -502,6 +503,116 @@ func TestTheCountPreservingBypassesOfTheBucketJoinCannotBeBuilt(t *testing.T) {
 // what the derivation costs
 // ---------------------------------------------------------------------------
 
+// TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop is the half of the cost claim a stopwatch
+// cannot make.
+//
+// A VIEW IS FILTERED AT EVERY READ, which is what makes divergence unrepresentable and is also the
+// one way this type can be made expensive: a caller that writes `for i := range list.Removes()`
+// and then `list.Removes()[i]` sweeps the whole commit order once per entry, and a list bounded
+// only by what a peer may send is then quadratic in what a peer may send. Every rule in this
+// package binds its view once and ranges over the binding, and this is what says so.
+//
+// IT IS NOT COVERED BY THE TIMING BELOW, which is why it is a separate gate rather than a clause
+// in that one. That test replays the view reads it counts off the SOURCE -- call sites, not calls
+// executed -- so a rule that moved its filter inside a loop would make the aggregate slower and
+// the replay no bigger, and the ratio it reports would go DOWN. A measurement that moves the wrong
+// way on the defect it names is worse than no measurement, so the defect is named here instead.
+//
+// THE CLASS IS DERIVED ON BOTH AXES. The view names come off proposalBucketsOf, and the readers
+// are every function of this package's non-test source that calls one of them -- less the methods
+// declared on *ProposalList itself, which ARE the derivation and cannot be written any other way.
+// Reading by bare method name over-reaches if another type ever answers an Adds(), and that is the
+// safe direction: a reader wrongly in the class costs a binding, and a reader missed is the
+// quadratic sweep this exists to prevent.
+func TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop(t *testing.T) {
+	views := map[string]bool{}
+	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
+		views[bucket.accessor] = true
+	}
+	if len(views) == 0 {
+		t.Fatal("*ProposalList answers no per-type view, so this gate read nothing")
+	}
+	readers := []string{}
+	offenders := 0
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			// the accessors themselves are the derivation and are excluded by their RECEIVER
+			// rather than by their file or their name
+			if function.Recv != nil && len(function.Recv.List) == 1 &&
+				receiverTypeName(function.Recv.List[0].Type) == "ProposalList" {
+				continue
+			}
+			depth := 0
+			var walk func(ast.Node) bool
+			walk = func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.RangeStmt:
+					// the range EXPRESSION is evaluated once and is not inside the loop
+					ast.Inspect(typed.X, walk)
+					depth += 1
+					ast.Inspect(typed.Body, walk)
+					depth -= 1
+					return false
+				case *ast.ForStmt:
+					if typed.Init != nil {
+						ast.Inspect(typed.Init, walk)
+					}
+					depth += 1
+					if typed.Cond != nil {
+						ast.Inspect(typed.Cond, walk)
+					}
+					if typed.Post != nil {
+						ast.Inspect(typed.Post, walk)
+					}
+					ast.Inspect(typed.Body, walk)
+					depth -= 1
+					return false
+				case *ast.CallExpr:
+					selector, isSelector := typed.Fun.(*ast.SelectorExpr)
+					if !isSelector || len(typed.Args) != 0 || !views[selector.Sel.Name] {
+						return true
+					}
+					readers = append(readers, function.Name.Name+" -> "+selector.Sel.Name)
+					if depth > 0 {
+						offenders += 1
+						t.Errorf("%s calls %s() inside a loop of its own body; a per-type view is the commit order FILTERED at every read, so this sweeps the whole order once per iteration and is quadratic in what one peer can put in a commit. Bind it once above the loop, as every other rule of this package does",
+							function.Name.Name, selector.Sel.Name)
+					}
+					return true
+				}
+				return true
+			}
+			ast.Inspect(function.Body, walk)
+		}
+	}
+	// the positive control: a scan that resolved nothing reports the clean bill a complete one
+	// reports, and section 12.2's committer rule certainly reads the removes
+	found := false
+	for _, one := range readers {
+		if strings.HasPrefix(one, "validateCommitterIsNotRemoved -> Removes") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the scan found the view readers %v, and validateCommitterIsNotRemoved certainly reads the removes, so it is reading something other than this package",
+			readers)
+	}
+	t.Logf("%d reads of a per-type view across this package's non-test source, %d of them inside a loop",
+		len(readers), offenders)
+}
+
+// ---------------------------------------------------------------------------
+// the stopwatch
+// ---------------------------------------------------------------------------
+
 // proposalListViewReadsOfSectionTwelveTwo is how many times each per-type view is filtered during
 // one run of ValidateProposalList, read off validate_proposals.go rather than counted by hand.
 //
@@ -615,6 +726,16 @@ func TestDerivingTheViewsCostsLessThanTheRulesThatReadThem(t *testing.T) {
 	}
 
 	const rounds = 50
+	// AND THE VIEW HALF IS RUN MANY TIMES OVER, which is not padding. The filtering is so much
+	// cheaper than the rules that read it that on a clock ticking in milliseconds -- Windows'
+	// does -- fifty replays finish inside one tick and the ratio comes out as a flat zero. A zero
+	// that means "below the timer" reads exactly like a zero that means "free", and this test
+	// would then be reporting a measurement it had not made. So the cheap half is run `scale`
+	// times as often and its time divided back down, and both halves are required to be above
+	// the tick before anything is concluded from them.
+	const scale = 400
+	const tick = 5 * time.Millisecond
+
 	// the whole of section 12.2, which is what the views are read BY
 	whole := time.Now()
 	for round := 0; round < rounds; round += 1 {
@@ -624,27 +745,72 @@ func TestDerivingTheViewsCostsLessThanTheRulesThatReadThem(t *testing.T) {
 	}
 	wholeTook := time.Since(whole)
 
-	// and exactly the view reads that aggregate makes, replayed off the counted class
+	// and exactly the view reads that aggregate makes, replayed off the counted class.
+	//
+	// THROUGH THE ACCESSORS AND NOT THROUGH proposalBucketsOf's ENTRIES, which is a distinction
+	// this test got wrong once and would have gone on reporting a number for. Ranging over
+	// proposalBucketsOf calls each accessor ONCE and hands back the slices; a replay that then
+	// read len() off those slices was timing four filters per round and reporting them as twenty.
+	// So the accessors are held as functions and each is CALLED as many times as
+	// validate_proposals.go calls it.
+	answering := []struct {
+		name   string
+		answer func() []CachedProposal
+	}{
+		{"Adds", in.List.Adds},
+		{"Updates", in.List.Updates},
+		{"Removes", in.List.Removes},
+		{"GCE", in.List.GCE},
+	}
+	// and that hand-written four is held to the derived class in both directions, so a fifth view
+	// is replayed rather than silently left out of the number this test reports
+	replayed := []string{}
+	for _, one := range answering {
+		replayed = append(replayed, one.name)
+	}
+	slices.Sort(replayed)
+	if !slices.Equal(replayed, proposalListBucketNames(t)) {
+		t.Fatalf("this replay calls %v and *ProposalList answers %v; a view left out of the replay is filtering the aggregate pays for and this measurement does not count",
+			replayed, proposalListBucketNames(t))
+	}
+
 	views := time.Now()
 	filtered := 0
-	for round := 0; round < rounds; round += 1 {
-		for _, bucket := range proposalBucketsOf(in.List) {
-			for at := 0; at < reads[bucket.accessor]; at += 1 {
-				filtered += len(bucket.entries)
+	for round := 0; round < rounds*scale; round += 1 {
+		for _, one := range answering {
+			for at := 0; at < reads[one.name]; at += 1 {
+				filtered += len(one.answer())
 			}
 		}
 	}
-	viewsTook := time.Since(views)
-	if filtered == 0 {
-		t.Fatal("the replay filtered nothing, so the half below is a timing of an empty loop")
+	viewsTook := time.Since(views) / scale
+	if want := rounds * scale * len(in.List.All()); filtered < want {
+		t.Fatalf("the replay walked %d entries and the %d view reads over a %d entry order are at least %d; it is not filtering as many times as the aggregate does",
+			filtered, asked, len(in.List.All()), want)
+	}
+	if wholeTook < tick || time.Since(views) < tick {
+		t.Fatalf("the aggregate took %v over %d rounds and the view replay took %v over %d; one of them is inside the clock's own granularity, so the ratio below is not a measurement",
+			wholeTook, rounds, time.Since(views), rounds*scale)
 	}
 
 	share := float64(viewsTook) / float64(wholeTook)
-	t.Logf("section 12.2 over %d proposals: %v for the whole aggregate, %v for the %d view reads it makes (%v), %.1f%% of it",
+	t.Logf("section 12.2 over %d proposals: %v per run of the whole aggregate, %v per run of the %d view reads it makes (%v), %.2f%% of it",
 		len(in.List.All()), wholeTook/rounds, viewsTook/rounds, asked, reads, share*100)
-	// half, which is loose by design: what fails this is a change of order rather than drift
-	if share > 0.5 {
-		t.Errorf("filtering the views costs %.1f%% of what the rules that read them cost; the derivation was chosen over an index on the measurement that it does not, so either the accessors have become quadratic or a rule has started filtering inside a loop",
+	// A TENTH, against a measured one hundredth. Ten times the headroom is loose enough that
+	// nothing about a slower machine reaches it -- both halves are loops over the same data in
+	// the same process, so what is compared is a ratio and not a wall clock -- and tight enough
+	// to be reached by the change it is protecting against: an ACCESSOR that became more than
+	// linear in the commit order, which is an order of magnitude at this width.
+	//
+	// It says nothing about a rule that started filtering inside its own loop, and it must not be
+	// read as though it did: the replay is sized off the CALL SITES this file's scan counts, so a
+	// rule that moved its filter into a loop would grow the aggregate and not the replay, and this
+	// ratio would fall. TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop is that half.
+	//
+	// A bound of a half would be a bound nothing can fail, which is a logger with an assertion
+	// painted on it.
+	if share > 0.10 {
+		t.Errorf("filtering the views costs %.2f%% of what the rules that read them cost, and it was measured at about 1%% when the derivation was chosen over an index; an accessor has become more than linear in the commit order",
 			share*100)
 	}
 }

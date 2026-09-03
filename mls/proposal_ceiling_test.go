@@ -960,3 +960,162 @@ func TestAnAcceptedTypeWithNoCeilingIsRefusedRatherThanAdmittedWithoutBound(t *t
 	}
 }
 
+// ---------------------------------------------------------------------------
+// the cache's accounting is a view of what it holds, package-wide rule 11a
+// ---------------------------------------------------------------------------
+
+// proposalCacheAccountingDerivedFrom recomputes every accounting field of a cache from the entries
+// it holds, so the fields can be compared with what they describe.
+//
+// THE SAME CLASS ProposalList WAS REBUILT FOR, one type over, and it is here because that class is
+// the defect rather than the file it was found in. A ProposalCache keeps byRef -- the entries --
+// and then FIVE derived views of that map as state beside it: order, octets, octetsPerSender,
+// perSender and perLeaf. Store's own comment says they "move together ... because they describe the
+// same set", and the octet field's says "never decremented: nothing removes a single entry, so
+// there is no path on which this can drift". Both are arguments, and until this gate there was no
+// identity relation between the five fields and the map: a Store that incremented one of them twice,
+// or that attributed a remove to the wrong leaf, left every ceiling test green, because the ceiling
+// tests read the counters the flood built rather than the entries the cache holds.
+//
+// It is a CHECK and not a derivation, which is the weaker answer and is chosen with a reason. The
+// per-type views of a ProposalList could be derived because a view is a pure function of the order
+// and is read a bounded number of times per commit; these counters are read on the hot path of
+// every Store and deriving them would make one store O(n) in the cache and a full epoch O(n^2) in
+// what an attacker can send. So the identity relation is asserted here rather than made structural,
+// and the difference is written down rather than left for the next reader to discover.
+func proposalCacheAccountingDerivedFrom(t *testing.T, cache *ProposalCache) (int,
+	map[LeafIndex]int, map[proposalCacheQuota]int, map[proposalCacheLeafQuota]int) {
+
+	t.Helper()
+	octets := 0
+	octetsPerSender := map[LeafIndex]int{}
+	perSender := map[proposalCacheQuota]int{}
+	perLeaf := map[proposalCacheLeafQuota]int{}
+	for _, key := range slices.Sorted(maps.Keys(cache.byRef)) {
+		entry := cache.byRef[key]
+		// the same encode Store counted, reached through the same function, so this measures
+		// the accounting rather than a second opinion about how big a proposal is
+		_, size, err := cloneProposal(&entry.Proposal)
+		if err != nil {
+			t.Fatalf("re-encoding a cached %s to price it: %v",
+				proposalTypeName(entry.Proposal.ProposalType), err)
+		}
+		octets += size
+		octetsPerSender[entry.Sender] += size
+		perSender[proposalCacheQuota{sender: entry.Sender,
+			proposalType: entry.Proposal.ProposalType}] += 1
+		if leaf, targeted := proposalAppliesToLeaf(entry.Sender, &entry.Proposal); targeted {
+			perLeaf[proposalCacheLeafQuota{sender: entry.Sender,
+				proposalType: entry.Proposal.ProposalType, leaf: leaf}] += 1
+		}
+	}
+	return octets, octetsPerSender, perSender, perLeaf
+}
+
+// TestTheCachesAccountingIsAlwaysAViewOfTheEntriesItHolds is that identity relation, driven over a
+// sequence of stores chosen to reach every branch of Store's accounting.
+//
+// THE SEQUENCE IS THE FIXTURE. Two senders, so the per sender columns are not one column; three
+// types, so the per type key is not the sender's; an update and a remove from one sender, so the
+// per leaf key is not the per sender key; a RE-DELIVERY of a proposal already held, which is the
+// branch that must count nothing and is the one an over-counting Store fails on; and an add, which
+// applies to no existing leaf and must therefore appear in every column except perLeaf.
+//
+// AND A REBIND AT THE END, because releasing the entries and releasing their accounting are two
+// statements and the whole point of this gate is that two statements about one fact are what drift.
+func TestTheCachesAccountingIsAlwaysAViewOfTheEntriesItHolds(t *testing.T) {
+	crypto := testCrypto(t)
+	cache := testCache(t)
+	alice := testIdentity(t, crypto, "alice")
+	bob := testIdentity(t, crypto, "bob")
+	keyPackage, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "carol"))
+
+	stores := []struct {
+		what     string
+		sender   LeafIndex
+		proposal *Proposal
+	}{
+		{"a remove of leaf 4 from leaf 0", LeafIndex(0), testRemoveProposal(LeafIndex(4))},
+		{"a remove of leaf 5 from leaf 0", LeafIndex(0), testRemoveProposal(LeafIndex(5))},
+		{"a remove of leaf 4 from leaf 1", LeafIndex(1), testRemoveProposal(LeafIndex(4))},
+		{"an update from leaf 0", LeafIndex(0), testUpdateProposal(t, crypto, alice)},
+		{"an update from leaf 1", LeafIndex(1), testUpdateProposal(t, crypto, bob)},
+		{"an add from leaf 1", LeafIndex(1), testPaddedAddProposal(t, keyPackage, 0)},
+	}
+	for _, store := range stores {
+		if _, err := cache.Store(crypto, testResolveContext(),
+			testProposalContent(t, crypto, store.sender, store.proposal)); err != nil {
+			t.Fatalf("Store %s: %v", store.what, err)
+		}
+	}
+	// the re-delivery, which must change nothing at all: the same proposal from the same sender
+	// hashes to the key already held
+	if _, err := cache.Store(crypto, testResolveContext(),
+		testProposalContent(t, crypto, LeafIndex(0), testRemoveProposal(LeafIndex(4)))); err != nil {
+		t.Fatalf("re-storing a proposal the cache already holds: %v", err)
+	}
+	if len(cache.byRef) != len(stores) {
+		t.Fatalf("the cache holds %d entries after %d distinct stores and one re-delivery; the fixture is not the shape this gate is written over",
+			len(cache.byRef), len(stores))
+	}
+
+	// the order is the key set of the map, once each and in reception order
+	if len(cache.order) != len(cache.byRef) {
+		t.Errorf("the cache holds %d entries and its order names %d; a name with no entry answers a reference Resolve cannot find, and an entry with no name is one Pending never offers",
+			len(cache.byRef), len(cache.order))
+	}
+	named := map[string]bool{}
+	for at, key := range cache.order {
+		if named[key] {
+			t.Errorf("the cache's order names the same entry twice, at %d; one entry offered twice is a commit naming a duplicate reference",
+				at)
+		}
+		named[key] = true
+		if _, holds := cache.byRef[key]; !holds {
+			t.Errorf("the cache's order names an entry at %d that byRef does not hold", at)
+		}
+	}
+
+	octets, octetsPerSender, perSender, perLeaf := proposalCacheAccountingDerivedFrom(t, cache)
+	if cache.octets != octets {
+		t.Errorf("the cache accounts %d octets and the entries it holds are %d; a total that is not a view of what it counts is a ceiling reached by re-delivering one message, or one nothing reaches",
+			cache.octets, octets)
+	}
+	if !maps.Equal(cache.octetsPerSender, octetsPerSender) {
+		t.Errorf("the cache attributes octets %v and the entries it holds are %v",
+			cache.octetsPerSender, octetsPerSender)
+	}
+	if !maps.Equal(cache.perSender, perSender) {
+		t.Errorf("the cache counts %v per sender and type and the entries it holds are %v",
+			cache.perSender, perSender)
+	}
+	if !maps.Equal(cache.perLeaf, perLeaf) {
+		t.Errorf("the cache counts %v per sender, type and leaf and the entries it holds are %v",
+			cache.perLeaf, perLeaf)
+	}
+	// the positive control: a derivation that found nothing would agree with a cache that counted
+	// nothing, and this fixture certainly stores an add, which is counted everywhere but perLeaf
+	if len(perSender) < 2 || len(perLeaf) == 0 || octets == 0 {
+		t.Fatalf("the derivation answered %d per-sender rows, %d per-leaf rows and %d octets; it read something other than the entries",
+			len(perSender), len(perLeaf), octets)
+	}
+	if len(perLeaf) >= len(perSender)+len(stores) {
+		t.Errorf("every entry landed in a per-leaf row and the fixture stores an add, which applies to no existing leaf; the per-leaf column is counting something other than what applies to a leaf")
+	}
+
+	// and Rebind releases the entries and their accounting together
+	next := testResolveContext()
+	next.Epoch += 1
+	if err := cache.Rebind(testVerifiedContextAt(t, next)); err != nil {
+		t.Fatalf("Rebind to epoch %d: %v", next.Epoch, err)
+	}
+	octets, octetsPerSender, perSender, perLeaf = proposalCacheAccountingDerivedFrom(t, cache)
+	if cache.octets != octets || !maps.Equal(cache.octetsPerSender, octetsPerSender) ||
+		!maps.Equal(cache.perSender, perSender) || !maps.Equal(cache.perLeaf, perLeaf) ||
+		len(cache.order) != len(cache.byRef) {
+
+		t.Errorf("after Rebind the cache accounts %d octets, %v per sender, %v per type, %v per leaf and %d names over %d entries; accounting an epoch has released is a quota the next epoch's senders are still paying",
+			cache.octets, cache.octetsPerSender, cache.perSender, cache.perLeaf,
+			len(cache.order), len(cache.byRef))
+	}
+}

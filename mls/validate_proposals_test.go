@@ -923,21 +923,26 @@ func TestValSem113AnswersTheProfileGatesOwnValueForEveryTypeItRefuses(t *testing
 	t.Logf("%d registered proposal types the v1 profile refuses, each answered through ValSem113", refused)
 }
 
-// TestValSem113JudgesEveryEntryAViewCanAnswer is what makes the twelve rules below it safe to
-// write.
+// TestAnArmlessAddIsRefusedEvenWhenAnInnocentAddPrecedesIt is what makes the twelve rules below it
+// safe to write.
 //
-// IT USED TO SAY "AND NOT ONLY THE COMMIT ORDER", and the reason that half is gone is the point.
-// A ProposalList once carried its per-type views as writable fields, so a proposal reachable
-// through a view and absent from the commit order was a real input: it was judged by no arm check
-// at all, and the rules reading that view dereferenced the arm. Sweeping the order alone left
-// exactly that hole. A view is now the order filtered, so an entry a view can answer is an entry
-// of the order and the sweep over the order is the whole of the class.
+// IT USED TO SAY "ValSem113 READS THE BUCKETS AND NOT ONLY THE COMMIT ORDER", and both halves of
+// that name have had to go. A ProposalList once carried its per-type views as writable fields, so
+// a proposal reachable through a view and absent from the commit order was a real input, judged by
+// no arm check at all and dereferenced by the rules reading that view; a view is now the order
+// filtered, so there is no such input and no bucket half to read. And the rule is not named,
+// because no test can say which guard fired: every door of this file opens with in.check, which
+// reaches checkProposalListStructure over the same order, and NARROWING ValSem113's OWN LOOP TO
+// THE FIRST PROPOSAL LEAVES THE WHOLE SUITE GREEN. That is measured, it is the position
+// ValidateProposalList's header already takes about its own redundant door check, and a test name
+// claiming otherwise would be the claim rather than the observation.
 //
-// What is still driven is what a rule stated over the adds actually stands on: an Add with a nil
-// Add arm reaches ValSem101's `add.KeyPackage` as a dereference, and this gate is what refuses it
-// first. The armless entry is BEHIND an innocent add, so a sweep narrowed to entry zero accepts
-// this list.
-func TestValSem113JudgesEveryEntryAViewCanAnswer(t *testing.T) {
+// What IS driven is the input: an Add with a nil Add arm, BEHIND an innocent add, is refused
+// before any rule reaches `add.KeyPackage`. Behind an innocent add of its own type, which is what
+// this adds to TestNoDoorHandedAProposalListDereferencesAMissingArm one file over -- that sweep
+// puts its armless entry behind an innocent REMOVE, so the adds view there answers one entry and
+// a guard narrowed to the first entry of a view passes it.
+func TestAnArmlessAddIsRefusedEvenWhenAnInnocentAddPrecedesIt(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice")
 	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "carol"))
@@ -949,7 +954,7 @@ func TestValSem113JudgesEveryEntryAViewCanAnswer(t *testing.T) {
 	}
 	in := testValidationInput(t, crypto, tree, LeafIndex(0), list)
 	if err := ValSem113ProposalTypeSupported(in); err == nil {
-		t.Fatal("ValSem113 accepted an add with no add arm behind an innocent one")
+		t.Fatal("the type door accepted an add with no add arm behind an innocent one")
 	}
 	// and the aggregate refuses it rather than dereferencing it
 	if err := proposalValidationRefusalOf(t, "ValidateProposalList over an armless add",
