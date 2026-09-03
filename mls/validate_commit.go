@@ -313,17 +313,41 @@ func (self *CommitValidationInput) check() error {
 // stated over the resolution and this is what makes the resolution the commit's own: same length,
 // same order, each entry naming what the entry beside it names.
 //
-// A COUNT AND A NAMING, NOT AN IDENTITY, said plainly. A by-value entry is compared by its proposal
-// TYPE and not by its octets: the type is the whole of what section 12.4's pathRequiredTypes test
-// reads, so this is exactly enough to make the decision the same over either field, and the
-// stronger comparison costs an encode of every proposal at every door on the path a commit runs.
-// What that leaves unjudged is a caller that resolved a vector into a list of the same shape
-// carrying different bodies, which is a caller assembling a value inconsistently on purpose.
+// AN IDENTITY ON BOTH ARMS, and it used to be one on only one of them. A by-REFERENCE entry is
+// compared by its reference, which for a reference IS the identity: a ProposalRef is a hash over
+// the whole framed proposal, so two entries sharing one are the same proposal. A by-VALUE entry is
+// compared by its OCTETS, which is that same statement for a value: the encoding is what the
+// sender signed and what the transcript hash covers, so two entries encoding alike are one
+// proposal and two that do not are two. Both comparisons are subtle.ConstantTimeCompare rather
+// than bytes.Equal, which is this package's rule over every comparison of data it ships and is
+// derived rather than listed.
 //
-// A by-REFERENCE entry is compared by its reference, which for a reference is the identity: a
-// ProposalRef is a hash over the whole framed proposal, so two entries sharing one are the same
-// proposal. The comparison is subtle.ConstantTimeCompare rather than bytes.Equal, which is this
-// package's rule over every comparison of data it ships and is derived rather than listed.
+// THE BY-VALUE ARM USED TO COMPARE THE PROPOSAL TYPE, which is the KIND and not the THING. The
+// type is the whole of what section 12.4's pathRequiredTypes test reads, so comparing it makes the
+// PATH decision the same over either field -- and every other rule of this door is stated over the
+// LIST, so it made none of those the same. A commit whose signed vector removes leaf 3 while its
+// list removes leaf 2 was accepted here and applied by removing leaf 2: one member applying a
+// different commit from the one the transcript covers, which is verbatim the fault the per-type
+// buckets were removed for, one field further in. Every per-type count, every type and the vector's
+// own length agree across that edit; only the octets do not.
+// TestACommitWhoseVectorNamesAnotherProposalOfItsOwnTypeIsRefused is that input, driven through
+// ApplyProposals so that what the two fields disagree about is a leaf that does or does not leave
+// the group.
+//
+// THE COST WAS THE OBJECTION AND IT IS NOW MEASURED RATHER THAN ASSERTED. The stronger comparison
+// is an encode of every by-value proposal at every door a commit passes, and the number that
+// objection needed is in the suite:
+// TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt times this whole join
+// against the ValidateCommit that runs it, over the fixture carrying one proposal of every viewed
+// type -- an Add's KeyPackage among them, which is the largest thing this package encodes -- and
+// the join is about a fifth of a percent of the door. A commit is validated once per epoch and the
+// door it sits in verifies a signature per leaf.
+//
+// THE TYPE IS NOT COMPARED SEPARATELY, and that is deliberate rather than an omission: the
+// discriminant is the first field of the encoding, so a type disagreement is an octet
+// disagreement, and a second comparison in front of this one would be a line no input can reach.
+// The refusal still NAMES both types, because a reader handed two hex strings and no noun has to
+// decode them to find out what disagreed.
 func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 	vector := self.Commit.Proposals
 	order := self.List.All()
@@ -352,11 +376,21 @@ func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 				return fmt.Errorf("%w: entry %d is carried by value and carries no proposal",
 					errCommitProposalsNotResolved, i)
 			}
-			if vector[i].Proposal.ProposalType != cached.Proposal.ProposalType {
-				return fmt.Errorf("%w: entry %d carries a %s and the list holds a %s",
+			signed, err := proposalOctets(vector[i].Proposal)
+			if err != nil {
+				return fmt.Errorf("%w: entry %d is carried by value and this build cannot encode it: %w",
+					errCommitProposalsNotResolved, i, err)
+			}
+			resolved, err := proposalOctets(&cached.Proposal)
+			if err != nil {
+				return fmt.Errorf("%w: the list holds entry %d as a proposal this build cannot encode: %w",
+					errCommitProposalsNotResolved, i, err)
+			}
+			if subtle.ConstantTimeCompare(signed, resolved) != 1 {
+				return fmt.Errorf("%w: entry %d is a %s the commit signs as %x and the list holds a %s as %x",
 					errCommitProposalsNotResolved, i,
-					proposalTypeName(vector[i].Proposal.ProposalType),
-					proposalTypeName(cached.Proposal.ProposalType))
+					proposalTypeName(vector[i].Proposal.ProposalType), signed,
+					proposalTypeName(cached.Proposal.ProposalType), resolved)
 			}
 		default:
 			return fmt.Errorf("%w: entry %d carries the discriminant %d, which names neither a proposal nor a reference",

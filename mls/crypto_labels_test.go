@@ -806,6 +806,14 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// entry no peer running the default limit could have sent, held under a name every peer
 		// agrees with.
 		"proposal_list.go: syntax.Marshal(proposal)",
+		// proposalOctets, the SECOND encode in that file and the same call spelled the same way:
+		// the encoding two proposals are compared BY, which validate_commit.go's by-value arm
+		// takes of the entry the commit signs and of the entry the list holds. The default limit
+		// for the two reasons above and one that belongs only to a comparison: these octets decide
+		// whether the list is the commit's own proposals, so a raised bound here would be a door
+		// answering "the same" over a pair of values no peer running the default limit could have
+		// sent either half of.
+		"proposal_list.go: syntax.Marshal(proposal)",
 		"proposal_list.go: syntax.Unmarshal(encoded, &copied)",
 		// ValSem403's duplicate test, which decides identity over the serialized
 		// PreSharedKeyID rather than over a field list. The default limit and not the

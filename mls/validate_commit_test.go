@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2098,6 +2099,19 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 					Proposal: &Proposal{ProposalType: ProposalTypeGroupContextExtensions,
 						GroupContextExtensions: &GroupContextExtensions{}}}
 			}},
+		// SAME TYPE, ANOTHER PROPOSAL, which is the row the join used to have no answer for: the
+		// by-value arm compared the proposal TYPE and both of these are removes.
+		// TestACommitWhoseVectorNamesAnotherProposalOfItsOwnTypeIsRefused drives what that costs.
+		{"a by-value entry of the same type carrying another proposal", "Proposal",
+			func(t *testing.T, in *CommitValidationInput,
+				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
+				inline := held
+				inline.ByValue = true
+				in.List = testProposalList(t, agreeing, inline)
+				carried := other.Proposal
+				in.Commit.Proposals[1] = ProposalOrRef{Type: ProposalOrRefTypeProposal,
+					Proposal: &carried}
+			}},
 		{"a by-value entry carrying no proposal at all", "Proposal",
 			func(t *testing.T, in *CommitValidationInput,
 				agreeing CachedProposal, held CachedProposal, other CachedProposal) {
@@ -2155,6 +2169,243 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 			t.Errorf("a row claims to make the two disagree over %s and a ProposalOrRef has no such field",
 				name)
 		}
+	}
+}
+
+// TestACommitWhoseVectorNamesAnotherProposalOfItsOwnTypeIsRefused is the by-value arm of the join
+// held to an IDENTITY, driven through the door that made the difference matter.
+//
+// THE INPUT. The commit's own ProposalOrRef vector -- the field the sender signed and the field the
+// transcript hash covers -- carries a remove of leaf 3. The list carries a remove of leaf 2. Every
+// other fact about the two agrees: the same length, the same entry carried by value at the same
+// position, the same proposal TYPE, and therefore the same per-type counts and the same answer from
+// section 12.4's pathRequiredTypes test. The by-value arm used to compare that type and nothing
+// else, so this commit was ACCEPTED.
+//
+// WHAT ACCEPTING IT COSTS is the second half of this test rather than a sentence in a comment.
+// ApplyProposals walks the LIST, so the member that accepted this commit removes leaf 2 while the
+// transcript it goes on to confirm covers a commit that removes leaf 3 -- one member applying a
+// different commit from the one the transcript covers. That is verbatim the fault the four
+// count-preserving bucket bypasses were closed for, one field further in, and with the same
+// reachability: a peer sends it.
+//
+// THE EDIT IS A FRESH ARM AND NOT A WRITE THROUGH THE SHARED ONE. (*ProposalList).Refs copies the
+// Proposal struct into the vector and keeps its arm pointer, so `Remove.Removed = 2` would move
+// both fields at once and leave them agreeing about something else. The assertion below says the
+// vector still names what the fixture signed.
+func TestACommitWhoseVectorNamesAnotherProposalOfItsOwnTypeIsRefused(t *testing.T) {
+	crypto := testCrypto(t)
+	in := testCommitCarryingOneOfEveryBucket(t, crypto)
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("ValidateCommit refused the commit this test is one edit away from: %v; the refusal below would then be that one",
+			failure)
+	}
+	at := -1
+	for i := range in.Commit.Proposals {
+		entry := in.Commit.Proposals[i]
+		if entry.Type == ProposalOrRefTypeProposal && entry.Proposal != nil &&
+			entry.Proposal.ProposalType == ProposalTypeRemove {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		t.Fatal("the fixture's commit carries no remove by value, so there is no by-value entry here to say two different things about")
+	}
+	signs := in.Commit.Proposals[at].Proposal.Remove.Removed
+
+	const applies = LeafIndex(2)
+	if signs == applies {
+		t.Fatalf("the fixture's commit already removes leaf %d, so the edit below makes the two fields agree rather than disagree",
+			applies)
+	}
+	before := len(in.List.All())
+	counts := map[string]int{}
+	for _, bucket := range proposalBucketsOf(in.List) {
+		counts[bucket.accessor] = len(bucket.entries)
+	}
+	testListEntryAt(t, in.List, "Removes", 0).Proposal.Remove = &Remove{Removed: applies}
+
+	if named := in.Commit.Proposals[at].Proposal.Remove.Removed; named != signs {
+		t.Fatalf("the commit's own vector now removes leaf %d and the sender signed a remove of leaf %d; the edit moved both fields and there is no disagreement here to refuse",
+			named, signs)
+	}
+	// and it moved nothing a count can see, which is what makes this the input the type comparison
+	// admitted rather than one it would have caught
+	if after := len(in.List.All()); after != before {
+		t.Fatalf("the edit changed the commit order from %d entries to %d; it is not the count-preserving swap this test is about",
+			before, after)
+	}
+	for _, bucket := range proposalBucketsOf(in.List) {
+		if got := len(bucket.entries); got != counts[bucket.accessor] {
+			t.Fatalf("the edit changed the %s view from %d entries to %d; the length rule one clause up would have caught this input",
+				bucket.accessor, counts[bucket.accessor], got)
+		}
+	}
+
+	// what accepting it costs, through the door that applies what this one judges
+	applied, err := ApplyProposals(in.PreTree, in.Context, in.Committer, in.List)
+	if err != nil {
+		t.Fatalf("ApplyProposals over the edited list: %v", err)
+	}
+	if len(applied.RemovedLeaves) != 1 || applied.RemovedLeaves[0] != applies {
+		t.Fatalf("ApplyProposals over the edited list removed %v, want [%d]; this test is not driving the divergence it is named for",
+			applied.RemovedLeaves, applies)
+	}
+
+	failure := ValidateCommit(in)
+	if !errors.Is(failure, errCommitProposalsNotResolved) {
+		t.Fatalf("ValidateCommit over a commit whose signed vector removes leaf %d and whose list removes leaf %d = %v, want errCommitProposalsNotResolved; the apply door above removes leaf %d, so a member that accepts this applies a commit the transcript does not cover",
+			signs, applies, failure, applies)
+	}
+	if !strings.Contains(failure.Error(), "entry "+strconv.Itoa(at)) {
+		t.Errorf("the refusal is %v and does not name entry %d, where the disagreement is; a join that answered element zero could not refuse this input at all",
+			failure, at)
+	}
+}
+
+// TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt is the number the cost
+// objection needed, and it is here because that objection was made without one.
+//
+// THE OBJECTION, in the words it was declined in: comparing a by-value entry by its octets rather
+// than by its type "costs an encode of every proposal at every door on the path a commit runs".
+// It is true, it is a statement about a quantity, and the quantity turns out to be larger than
+// either side of that exchange assumed. The fixture is the one every establishment row of this file
+// starts from -- one proposal of every viewed type, carried by value, an Add's whole KeyPackage
+// among them, which is the largest thing this package encodes.
+//
+// THE NUMBERS, on this machine. The join costs about 18 microseconds: eight encodes, two per
+// by-value entry. ValidateCommit costs about 240, which is THIRTEEN TIMES THE JOIN, because every
+// rule of commitValidationChecks re-establishes its own preconditions through
+// (*CommitValidationInput).check and the join lives in check -- twelve rules plus the aggregate's
+// own call. With the arm comparing proposal types instead, the same door ran in under three
+// microseconds. So this is not a rounding error on a structural door: it is most of one.
+//
+// IT IS STILL THE RIGHT ANSWER, and the alternative is not cheaper, it is wrong: a door comparing
+// the KIND accepts a commit whose signed vector removes leaf 3 while its list removes leaf 2, and
+// the member applies the second. A fifth of a millisecond, once per epoch, against applying a
+// commit the transcript does not cover. And the thirteen is where to look first if it ever stops
+// being affordable -- twelve of those thirteen joins re-answer a question already answered, which
+// is a redundancy this arm made expensive rather than one it introduced. Comparing the kind again
+// is not on the list of answers.
+//
+// WHAT IS ASSERTED, AND WHY IT IS NOT THE SHARE. The join's share of ValidateCommit is about 8%,
+// and that number cannot fail: the door IS thirteen copies of the join, so a join that got three
+// times more expensive would take the door with it and the share would not move. It is logged
+// because it is the objection's own question, and the two things that CAN fail are asserted
+// instead --
+//
+//   - THE DOOR IS THE JOIN, ONCE PER RULE. Held against the rule slice itself rather than against
+//     the number thirteen, so hoisting the join out of check would make this red and send the next
+//     reader to this comment rather than leaving it stale.
+//   - THE JOIN IS WITHIN A FEW TIMES OF APPLYING THE LIST IT IDENTIFIES. ApplyProposals walks the
+//     same proposals over the same tree with no crypto in it either, so it is the yardstick on this
+//     machine that is not made of the thing being measured. Measured at 2x; the bound is 8.
+//
+// THE MEASUREMENTS ARE TAKEN IN ALTERNATING BLOCKS, and the block is the unit for a reason this
+// file paid to learn twice. Go's clock on this machine advances in steps of 505.7 microseconds --
+// probed, not assumed -- so the span of one ValidateCommit, or of ten joins, is quantised to
+// nothing or to half a millisecond, and a per-round interleave measures the timer rather than the
+// code. Run the other way, as long loops one after another, each span is fine and the RATIOS are
+// not: they moved by a factor of five across five runs, because the machine's own speed wanders
+// over the seconds those loops take and each loop met a different machine. So each block is sized
+// to run for milliseconds -- comfortably above the step, and the SHORTEST block is checked rather
+// than the total -- and the three take turns a dozen times.
+func TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt(t *testing.T) {
+	crypto := testCrypto(t)
+	in := testCommitCarryingOneOfEveryBucket(t, crypto)
+	if failure := ValidateCommit(in); failure != nil {
+		t.Fatalf("the fixture commit is refused with %v, so the timing below would be a timing of the rules that ran before the refusal",
+			failure)
+	}
+	byValue := 0
+	for _, cached := range in.List.All() {
+		if cached.ByValue {
+			byValue += 1
+		}
+	}
+	if byValue == 0 {
+		t.Fatal("the fixture's commit carries no proposal by value, so the join below encodes nothing and this measures the arm that was never in question")
+	}
+	// the aggregate's own call to check, plus one per rule that re-establishes its preconditions
+	// through it. Read off the rule slice, so a thirteenth rule is a thirteenth join and this
+	// arithmetic follows it.
+	runs := len(commitValidationChecks) + 1
+
+	// each block is sized to run for milliseconds at the cost its own work was measured at, and the
+	// floor is checked against the SHORTEST block rather than the total, because a total above the
+	// clock's step says nothing about the spans it was added up from.
+	const blocks = 12
+	const doorsPerBlock = 200
+	const appliesPerBlock = 2000
+	const joinsPerBlock = 2000
+	const floor = 4 * time.Millisecond
+
+	took := map[string]time.Duration{}
+	shortest := map[string]time.Duration{}
+	timed := func(name string, work func()) {
+		started := time.Now()
+		work()
+		spent := time.Since(started)
+		took[name] += spent
+		if held, seen := shortest[name]; !seen || spent < held {
+			shortest[name] = spent
+		}
+	}
+	for block := 0; block < blocks; block += 1 {
+		timed("door", func() {
+			for again := 0; again < doorsPerBlock; again += 1 {
+				if failure := ValidateCommit(in); failure != nil {
+					t.Fatalf("the fixture stopped being accepted mid-measurement: %v", failure)
+				}
+			}
+		})
+		timed("apply", func() {
+			for again := 0; again < appliesPerBlock; again += 1 {
+				if _, failure := ApplyProposals(in.PreTree, in.Context, in.Committer, in.List); failure != nil {
+					t.Fatalf("the apply door stopped accepting the fixture mid-measurement: %v", failure)
+				}
+			}
+		})
+		timed("join", func() {
+			for again := 0; again < joinsPerBlock; again += 1 {
+				if failure := in.checkListResolvesTheCommitsVector(); failure != nil {
+					t.Fatalf("the join stopped accepting the fixture mid-measurement: %v", failure)
+				}
+			}
+		})
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(shortest)) {
+		if shortest[name] < floor {
+			t.Fatalf("the shortest %s block ran for %v, which is inside what this machine's clock can resolve; the ratios below would be measurements of the timer",
+				name, shortest[name])
+		}
+	}
+	doorEach := took["door"] / (blocks * doorsPerBlock)
+	applyEach := took["apply"] / (blocks * appliesPerBlock)
+	joinEach := took["join"] / (blocks * joinsPerBlock)
+	share := float64(joinEach) / float64(doorEach)
+	copies := float64(doorEach) / float64(joinEach)
+	overApply := float64(joinEach) / float64(applyEach)
+	t.Logf("the vector join over %d proposals, %d of them by value: %v per run, %.2fx the %v ApplyProposals costs over the same list; ValidateCommit is %v, %.1f copies of the join against the %d its rules ask for, and the join is %.2f%% of it",
+		len(in.List.All()), byValue, joinEach, overApply, applyEach, doorEach, copies, runs, share*100)
+
+	// THE DOOR IS THE JOIN, ONCE PER RULE, within a factor of two either way -- loose because what
+	// is being asserted is the SHAPE, that the door's cost is thirteen joins and not one, and
+	// because the two halves are different sizes of work on a machine whose ratios move by tens of
+	// percent between runs.
+	if copies < float64(runs)/2 || copies > float64(runs)*2 {
+		t.Errorf("ValidateCommit costs %.1f copies of the join and its rules ask for %d; the comment above explains this door's cost by that multiplication and no longer describes it",
+			copies, runs)
+	}
+	// AND THE JOIN IS WITHIN EIGHT TIMES OF APPLYING THE LIST, against a measured two. That is
+	// the bound that would catch the encode itself getting more expensive -- a third encode per
+	// entry, or an arm that encoded inside a loop -- because ApplyProposals is the one structural
+	// door on this machine whose cost is not made of the thing being measured.
+	if overApply > 8 {
+		t.Errorf("the vector join costs %.2fx what applying the same list costs, and it was measured at about 2x when the by-value arm was made an identity; the encode at every door is no longer a few times the work of the door beside it",
+			overApply)
 	}
 }
 

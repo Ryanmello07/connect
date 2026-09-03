@@ -51,27 +51,73 @@ import (
 // shape a later edit reaches for when it decides the filtering is too expensive. So the walk
 // follows slices, arrays, pointers and map values down to the element type.
 //
-// It does not descend into struct fields, which bounds the walk: a CachedProposal carries a
-// Proposal carrying arm pointers, and a walk into those would recurse over the whole wire model
-// answering nothing.
+// IT DESCENDS INTO STRUCT FIELDS TOO, and that was the hole. The walk used to stop at a struct,
+// on the argument that a CachedProposal carries a Proposal carrying arm pointers and a walk into
+// those would recurse over the whole wire model answering nothing. That argument is about what
+// lies BELOW a CachedProposal, which this walk never reaches -- the entry type is answered before
+// any descent -- and it bought a route straight past the gate: `type proposalListIndex struct {
+// adds []CachedProposal }` as a field on ProposalList, built in NewProposalList and kept in step in
+// Resolve, passed all eight derivation gates and produced a list whose All()[1].Sender was 0x5eed
+// while its Adds()[0].Sender was 0. The suite went red at
+// TestEveryRuleTheCommitAggregateRunsDecidesOffASourceTheDoorEstablishes, incidentally, because a
+// commit rule happens to read that view -- which is a red that says nothing about the property this
+// file exists to assert.
+//
+// SO EVERY ROUTE THE TYPE SYSTEM OFFERS, ENUMERATED OFF reflect.Kind RATHER THAN OFF MEMORY:
+// element types for slices, arrays, pointers and channels, BOTH halves of a map, the fields of a
+// struct, and the parameters and results of a func -- a `views func() []CachedProposal` field is an
+// index with a closure around it. An INTERFACE is answered yes without looking, because a static
+// walk cannot see what an interface holds and the honest answer for a gate about
+// unrepresentability is that it could hold this.
+//
+// The walk is bounded by the set of types it has already entered rather than by refusing to
+// enter one. A negative is stable, and a positive unwinds the whole walk at the first entry type
+// it reaches, so a type met twice inside one field's walk has already answered. The set is FRESH
+// PER FIELD, because a type that answered yes for one field is marked entered and would otherwise
+// answer no for the next.
 func proposalListStorageFields(t *testing.T) []reflect.StructField {
 	t.Helper()
 	entry := reflect.TypeOf(CachedProposal{})
-	var carries func(reflect.Type) bool
-	carries = func(held reflect.Type) bool {
+	var carries func(reflect.Type, map[reflect.Type]bool) bool
+	carries = func(held reflect.Type, entered map[reflect.Type]bool) bool {
 		if held == entry {
 			return true
 		}
+		if entered[held] {
+			return false
+		}
+		entered[held] = true
 		switch held.Kind() {
-		case reflect.Slice, reflect.Array, reflect.Pointer, reflect.Map:
-			return carries(held.Elem())
+		case reflect.Slice, reflect.Array, reflect.Pointer, reflect.Chan:
+			return carries(held.Elem(), entered)
+		case reflect.Map:
+			return carries(held.Key(), entered) || carries(held.Elem(), entered)
+		case reflect.Struct:
+			for i := 0; i < held.NumField(); i += 1 {
+				if carries(held.Field(i).Type, entered) {
+					return true
+				}
+			}
+		case reflect.Func:
+			for i := 0; i < held.NumIn(); i += 1 {
+				if carries(held.In(i), entered) {
+					return true
+				}
+			}
+			for i := 0; i < held.NumOut(); i += 1 {
+				if carries(held.Out(i), entered) {
+					return true
+				}
+			}
+		case reflect.Interface:
+			return true
 		}
 		return false
 	}
 	found := []reflect.StructField{}
 	structure := reflect.TypeOf(ProposalList{})
 	for i := 0; i < structure.NumField(); i += 1 {
-		if carries(structure.Field(i).Type) {
+		if carries(structure.Field(i).Type, map[reflect.Type]bool{}) {
 			found = append(found, structure.Field(i))
 		}
 	}
@@ -320,6 +366,56 @@ func TestAProposalListDoesNotShareTheSliceItWasBuiltFrom(t *testing.T) {
 	if removes := list.Removes(); len(removes) != 1 || removes[0].Sender != LeafIndex(1) {
 		t.Fatalf("the removes view answers %v after the caller's write; the view filters the caller's array",
 			removes)
+	}
+}
+
+// TestAProposalListDoesNotShareTheProposalArmsItWasBuiltFrom is the same claim one dereference in,
+// and the constructor used to fail it.
+//
+// slices.Clone COPIES HEADERS. It stops the caller appending into this list's commit order and it
+// stops nothing else: every entry it copies carries the same *Add, *Update, *Remove and
+// *GroupContextExtensions the caller still holds, and the same backing array under its ProposalRef.
+// Driven before the constructor was repaired, `order[0].Proposal.Remove.Removed = LeafIndex(99)`
+// after construction moved the list's remove target from leaf 3 to leaf 99. That is a list changing
+// under a validator that has already judged it -- the sentence the test above names its own class
+// with, while asserting only over the value fields where a shallow clone is already enough.
+//
+// NO PRODUCTION PATH REACHES IT TODAY and that is not the reason it is closed. Resolve builds its
+// order through cloneProposal, so every list this package produces for itself already owns its
+// arms; NewProposalList is EXPORTED, takes the caller's own values, and is the door a caller
+// outside this package builds a list at.
+//
+// BOTH HALVES OF AN ENTRY, because a CachedProposal carries two things a caller can write through.
+// The proposal is what every rule of section 12.2 reads. The reference is what the commit vector
+// join compares a by-reference entry BY, so a caller that kept its slice and wrote a byte of it
+// would be changing the identity the door matched, after the door matched it.
+func TestAProposalListDoesNotShareTheProposalArmsItWasBuiltFrom(t *testing.T) {
+	order := []CachedProposal{
+		{
+			Ref:      ProposalRef{0x01, 0x02, 0x03, 0x04},
+			Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: LeafIndex(3)}},
+			Sender:   LeafIndex(1),
+		},
+	}
+	list := NewProposalList(order)
+	// the caller goes on using the values it handed over, which is the ordinary thing a caller does
+	order[0].Proposal.Remove.Removed = LeafIndex(99)
+	order[0].Ref[0] = 0xFF
+	removes := list.Removes()
+	if len(removes) != 1 {
+		t.Fatalf("the list answers %d removes and was built from one", len(removes))
+	}
+	if removed := removes[0].Proposal.Remove.Removed; removed != LeafIndex(3) {
+		t.Errorf("the list's remove names leaf %d after its caller wrote through the arm it was built from, and was built naming leaf 3; the arm is the caller's and a validator that has already judged this list judged another one",
+			removed)
+	}
+	if held := list.All(); held[0].Ref[0] != 0x01 {
+		t.Errorf("the list's reference begins %#02x after its caller wrote through the slice it was built from; a by-reference entry is joined to the commit's vector by exactly those octets",
+			held[0].Ref[0])
+	}
+	// and the arm really is a value of this list's own rather than an equal one reached by luck
+	if list.All()[0].Proposal.Remove == order[0].Proposal.Remove {
+		t.Error("the list's remove arm is the caller's own pointer; the two assertions above passed on a value the caller can still reach")
 	}
 }
 
@@ -796,21 +892,222 @@ func TestDerivingTheViewsCostsLessThanTheRulesThatReadThem(t *testing.T) {
 	share := float64(viewsTook) / float64(wholeTook)
 	t.Logf("section 12.2 over %d proposals: %v per run of the whole aggregate, %v per run of the %d view reads it makes (%v), %.2f%% of it",
 		len(in.List.All()), wholeTook/rounds, viewsTook/rounds, asked, reads, share*100)
-	// A TENTH, against a measured one hundredth. Ten times the headroom is loose enough that
-	// nothing about a slower machine reaches it -- both halves are loops over the same data in
-	// the same process, so what is compared is a ratio and not a wall clock -- and tight enough
-	// to be reached by the change it is protecting against: an ACCESSOR that became more than
-	// linear in the commit order, which is an order of magnitude at this width.
+	// A TENTH, against a measured one hundredth, and what it bounds is the DECISION rather than
+	// the order of growth. Ten times the headroom is loose enough that nothing about a slower
+	// machine reaches it -- both halves are loops over the same data in the same process, so what
+	// is compared is a ratio and not a wall clock -- and it is reached by a filtering that stopped
+	// being a rounding error beside the rules that ask for it, which is the whole of what the
+	// choice between deriving and indexing turns on.
 	//
-	// It says nothing about a rule that started filtering inside its own loop, and it must not be
-	// read as though it did: the replay is sized off the CALL SITES this file's scan counts, so a
-	// rule that moved its filter into a loop would grow the aggregate and not the replay, and this
-	// ratio would fall. TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop is that half.
+	// IT DOES NOT CATCH A SUPERLINEAR ACCESSOR AND THIS COMMENT USED TO SAY IT DID -- "tight enough
+	// to be reached by ... an accessor that became more than linear in the commit order, which is
+	// an order of magnitude at this width". Measured: a genuinely quadratic viewOf, with its inner
+	// sweep accumulated into a package level sink so that nothing is eliminated, moves this share
+	// from about 1.1% to between 3.4% and 4.5%. Three or four times, not ten, and the suite stays
+	// green. The cause is arithmetic and not a badly chosen bound: at 97 entries a read is dominated
+	// by the append and copy of the matched values rather than by the type scan, so squaring the
+	// scan moves the total by a small factor however this bound is set, and a bound tight enough to
+	// catch it -- a fortieth -- would sit twice above the linear measurement rather than ten times
+	// above it. A share is a PROXY for the order of growth.
+	// TestAPerTypeViewIsLinearInTheCommitOrder measures the order of growth itself, against a
+	// witness rather than against an aggregate, and that is where the quadratic accessor is refused.
+	//
+	// It says nothing about a rule that started filtering inside its own loop either, and it must
+	// not be read as though it did: the replay is sized off the CALL SITES this file's scan counts,
+	// so a rule that moved its filter into a loop would grow the aggregate and not the replay, and
+	// this ratio would fall. TestNoReaderOfAPerTypeViewFiltersItInsideItsOwnLoop is that half.
 	//
 	// A bound of a half would be a bound nothing can fail, which is a logger with an assertion
 	// painted on it.
 	if share > 0.10 {
-		t.Errorf("filtering the views costs %.2f%% of what the rules that read them cost, and it was measured at about 1%% when the derivation was chosen over an index; an accessor has become more than linear in the commit order",
+		t.Errorf("filtering the views costs %.2f%% of what the rules that read them cost, and it was measured at about 1%% when the derivation was chosen over an index; the filtering is no longer the rounding error the choice to derive rather than index was made on",
 			share*100)
+	}
+}
+
+// testCommitOrderOfWidth is the interleaved fixture repeated to a given width, for a measurement
+// that needs a commit order wider than any door's fixture builds.
+//
+// REPEATED RATHER THAN GENERATED, so the mix is the derived one -- two entries of every viewed type
+// per cycle, no two of a type adjacent -- at every width this is asked for. Two widths compared for
+// how the cost GREW between them have to carry the same proportion of each type, or the ratio is a
+// ratio of two different fixtures; the width is required to be a whole number of cycles for exactly
+// that reason. The senders are renumbered so that no two entries share one, which is what makes the
+// entries of the repeated cycle distinguishable to anything that looks.
+func testCommitOrderOfWidth(t *testing.T, width int) []CachedProposal {
+	t.Helper()
+	cycle := testInterleavedCommitOrder(t)
+	if width%len(cycle) != 0 {
+		t.Fatalf("a width of %d is not a whole number of the fixture's %d entry cycle, so two widths built from it carry different proportions of each type",
+			width, len(cycle))
+	}
+	order := make([]CachedProposal, 0, width)
+	for len(order) < width {
+		order = append(order, cycle...)
+	}
+	for i := range order {
+		order[i].Sender = LeafIndex(i)
+	}
+	return order
+}
+
+// TestAPerTypeViewIsLinearInTheCommitOrder is the growth-order claim, measured against a witness
+// of linearity rather than inferred from a share of something else.
+//
+// WHY IT IS NOT THE TEST ABOVE, in one line: that one bounds the filtering's SHARE of the aggregate
+// at a tenth, and a quadratic viewOf moves the share to 4.5%. It passes. The share is a proxy for
+// the order of growth, and the order of growth can be measured on its own.
+//
+// AND WHY IT IS NOT TWO WIDTHS EITHER, which is the obvious way to measure a growth and was the
+// first thing tried here. Timing the same reads over 128 entries and over 1024 reports a growth of
+// 31x for a width of 8x with the accessor exactly as it stands -- nearly four times what the
+// arithmetic says a linear filter costs. The extra is real and has nothing to do with the accessor:
+// 1024 entries is 96 KiB of commit order against 12 KiB, which is a different level of the memory
+// hierarchy, and the wide run allocates eight times the garbage. A bound set above that noise is
+// above a quadratic accessor too, and a bound set below it fails on a correct one.
+//
+// SO THE COMPARISON IS AGAINST A WITNESS AT ONE WIDTH. Beside each accessor is the SAME filter
+// written out here -- scan the order, append what matches -- run over the same entries at the same
+// width in the same process, so every effect that is about the machine rather than about the
+// accessor is in both halves and divides out. What is left is what the accessor does that a filter
+// of the commit order does not. Measured: 1.0x to 1.3x for the accessor as it stands, and 12x to
+// 20x for a quadratic viewOf whose inner sweep is accumulated into a package level sink so that
+// nothing is eliminated. The bound is FOUR, which sits three times above the first and three times
+// below the second.
+//
+// THE WITNESS IS A COPY OF THE IMPLEMENTATION AND THAT IS THE POINT rather than a smell. It is not
+// standing in for the accessor's ANSWER -- TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered
+// holds that, element by element -- it is standing in for the accessor's COST, and a claim that one
+// program is no more expensive than another needs the other program written down.
+//
+// THE TWO ARE TIMED IN ALTERNATING BLOCKS, for the reason
+// TestComparingTheByValueEntriesByTheirOctetsCostsLessThanTheDoorThatRunsIt gives at length: this
+// machine's clock advances in steps of 505.7 microseconds, so each block has to run for
+// milliseconds, and its speed wanders over the seconds a long loop takes, so the two halves have to
+// take turns rather than run one after the other. Measured without the turns, the quadratic
+// accessor came out at 5.75x rather than 12x -- not because it was cheaper, but because the witness
+// ran second and paid for the collection the quadratic half had earned.
+//
+// THE WIDTH IS WHAT MAKES A CONSTANT FACTOR A STATEMENT ABOUT THE ORDER OF GROWTH. Four times a
+// filter is four times a filter at any width; what says "no worse than linear" is that at a
+// thousand entries a quadratic accessor cannot be within four times of one. The floor beneath the
+// bound is the other half of the same worry: a ratio near zero is an accessor whose call the
+// compiler deleted, and a ceiling passed by measuring nothing is the false pass this file has
+// already had once.
+func TestAPerTypeViewIsLinearInTheCommitOrder(t *testing.T) {
+	const cycles = 128
+	const blocks = 6
+	const roundsPerBlock = 120
+	const floor = 4 * time.Millisecond
+
+	cycle := len(testInterleavedCommitOrder(t))
+	list := NewProposalList(testCommitOrderOfWidth(t, cycles*cycle))
+	held := list.All()
+	if len(held) < 512 {
+		t.Fatalf("the fixture's commit order carries %d entries; at that width a sweep per entry is within a small constant of a filter and this ratio says nothing about the order of growth",
+			len(held))
+	}
+
+	// the witness, over the list's OWN commit order rather than over a second copy of it, so that
+	// the two halves walk the same memory and the comparison is between two programs and not
+	// between two cache states.
+	filterOf := func(carries ProposalType) []CachedProposal {
+		var out []CachedProposal
+		for i := range held {
+			if held[i].Proposal.ProposalType == carries {
+				out = append(out, held[i])
+			}
+		}
+		return out
+	}
+
+	// the accessors held as functions and CALLED, for the reason the replay above is written that
+	// way: ranging over proposalBucketsOf calls each of them once and hands back the slices, which
+	// times one filter and reports it as four. The hand written four are held to the derived class
+	// in both directions -- by name and by the type each filters on -- so a fifth view is measured
+	// on the commit that adds it.
+	answering := []struct {
+		name    string
+		carries ProposalType
+		answer  func() []CachedProposal
+	}{
+		{"Adds", ProposalTypeAdd, list.Adds},
+		{"Updates", ProposalTypeUpdate, list.Updates},
+		{"Removes", ProposalTypeRemove, list.Removes},
+		{"GCE", ProposalTypeGroupContextExtensions, list.GCE},
+	}
+	carriedBy := map[string]ProposalType{}
+	for _, bucket := range proposalBucketsOf(list) {
+		carriedBy[bucket.accessor] = bucket.carries
+	}
+	named := []string{}
+	for _, one := range answering {
+		named = append(named, one.name)
+		if carriedBy[one.name] != one.carries {
+			t.Fatalf("this measurement filters %s on %s and *ProposalList filters it on %s; the witness beside the accessor is answering a different question",
+				one.name, proposalTypeName(one.carries), proposalTypeName(carriedBy[one.name]))
+		}
+	}
+	slices.Sort(named)
+	if !slices.Equal(named, proposalListBucketNames(t)) {
+		t.Fatalf("this measurement reads %v and *ProposalList answers %v; an accessor left out of it is one whose cost this gate does not see",
+			named, proposalListBucketNames(t))
+	}
+
+	// both accumulators are LIVE and both totals are compared below, because a replay whose result
+	// nothing reads is one the compiler is entitled to delete -- an earlier attempt at exactly this
+	// measurement was eliminated and reported a confident false pass.
+	answered := 0
+	witnessed := 0
+	took := map[string]time.Duration{}
+	shortest := map[string]time.Duration{}
+	timed := func(name string, work func()) {
+		started := time.Now()
+		work()
+		spent := time.Since(started)
+		took[name] += spent
+		if before, seen := shortest[name]; !seen || spent < before {
+			shortest[name] = spent
+		}
+	}
+	for block := 0; block < blocks; block += 1 {
+		timed("views", func() {
+			for round := 0; round < roundsPerBlock; round += 1 {
+				for _, one := range answering {
+					answered += len(one.answer())
+				}
+			}
+		})
+		timed("witness", func() {
+			for round := 0; round < roundsPerBlock; round += 1 {
+				for _, one := range answering {
+					witnessed += len(filterOf(one.carries))
+				}
+			}
+		})
+	}
+
+	if answered == 0 || answered != witnessed {
+		t.Fatalf("the accessors answered %d entries and the witness matched %d over the same order; the two halves are not doing the same work and the ratio below is not a comparison",
+			answered, witnessed)
+	}
+	for _, name := range slices.Sorted(maps.Keys(shortest)) {
+		if shortest[name] < floor {
+			t.Fatalf("the shortest %s block ran for %v, which is inside what this machine's clock can resolve; the ratio below would be a measurement of the timer",
+				name, shortest[name])
+		}
+	}
+	viewsEach := took["views"] / (blocks * roundsPerBlock)
+	witnessEach := took["witness"] / (blocks * roundsPerBlock)
+	over := float64(viewsEach) / float64(witnessEach)
+	t.Logf("over %d proposals the %d view reads took %v per round and the same filters written out took %v, %.2fx",
+		len(held), len(answering), viewsEach, witnessEach, over)
+	if over < 0.25 {
+		t.Fatalf("a view read costs %.2fx what filtering the commit order costs, which is less than the filter it IS; the accessor's call was optimised away and this gate measured nothing",
+			over)
+	}
+	if over > 4 {
+		t.Errorf("a view read over %d proposals costs %.2fx what filtering the commit order for the same entries costs; an accessor has become more than linear in the commit order, which is a sweep of the order per entry over a list bounded only by what a peer may send",
+			len(held), over)
 	}
 }

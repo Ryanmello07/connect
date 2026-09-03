@@ -376,10 +376,38 @@ type ProposalList struct {
 // passes a vector with one remove in it, and cannot pass a vector and a disagreeing bucket
 // because there is no bucket to pass.
 //
-// The vector is CLONED, so a caller that goes on appending to the slice it passed is not
-// appending to this list's commit order.
+// THE VECTOR IS CLONED ALL THE WAY DOWN, and the depth is the point rather than a detail.
+// slices.Clone copies headers: it stops a caller appending into this list's commit order, and it
+// stops nothing else, because every entry it copies carries the SAME *Add, *Update, *Remove and
+// *GroupContextExtensions the caller still holds. Measured, before this line was written:
+// `order[0].Proposal.Remove.Removed = LeafIndex(99)` after construction moved the list's remove
+// target from leaf 3 to leaf 99 -- a list changing under a validator that has already judged it,
+// which is the class this type was rebuilt for, one level out from the buckets. So each entry's
+// proposal is copied through the codec and each entry's reference is copied byte for byte, and
+// what a caller keeps a pointer into afterwards is its own value.
+//
+// THROUGH THE CODEC AND NOT ARM BY ARM, for cloneProposal's own reason: seven arms copied by hand
+// is a copy that silently drops the eighth the day one is registered, into a list whose whole job
+// is to say what the group agreed to.
+//
+// AN ENTRY THIS BUILD CANNOT ENCODE IS CARRIED THROUGH AS IT WAS HANDED, which is the one case
+// where the caller keeps its pointers. A proposal with no arm, or with an arm the codec refuses,
+// is one checkProposalListStructure refuses at both doors before any rule reads it -- and the
+// fixtures that drive those refusals are built here. Dropping it would change the commit order's
+// LENGTH, which is the single fact about a list no door can recover and the one thing the vector
+// join compares first; refusing it would need an error return on a constructor whose whole
+// argument is that there is nothing about a commit order to get wrong.
 func NewProposalList(order []CachedProposal) *ProposalList {
-	return &ProposalList{order: slices.Clone(order)}
+	held := slices.Clone(order)
+	for i := range held {
+		held[i].Ref = bytes.Clone(held[i].Ref)
+		copied, _, err := cloneProposal(&held[i].Proposal)
+		if err != nil {
+			continue
+		}
+		held[i].Proposal = copied
+	}
+	return &ProposalList{order: held}
 }
 
 // All is the commit order: this commit's ProposalOrRef vector resolved, in the order the sender
@@ -1021,6 +1049,25 @@ func cloneProposal(proposal *Proposal) (Proposal, int, error) {
 		return Proposal{}, 0, err
 	}
 	return copied, len(encoded), nil
+}
+
+// proposalOctets is a proposal's wire encoding, which is the one thing two proposals can be
+// compared BY.
+//
+// A PROPOSAL HAS NO OTHER IDENTITY IN THIS PACKAGE. Its type is a discriminant, its arms are
+// pointers into whatever buffer decoded them, and a Proposal carrying an Add carries a whole
+// KeyPackage below it -- so == is not defined over it, a field-by-field comparison is a hand
+// written list that goes stale the moment an eighth arm is registered, and both of those are the
+// enumeration rule 5 exists for. The encoding is the value the sender signed, the value the
+// transcript hash covers and the value a ProposalRef is a hash OF, so two proposals encoding alike
+// are one proposal by every measure this protocol has.
+//
+// ONE LINE, AND IT IS HERE RATHER THAN AT THE ONE CALL SITE, for cloneProposal's reason directly
+// above: the codec is what makes a copy exactly what the octets say, and it is what makes a
+// comparison exactly what the octets say. A second door that has to compare two proposals should
+// find the answer beside the clone rather than reach for syntax.Marshal and pick its own spelling.
+func proposalOctets(proposal *Proposal) ([]byte, error) {
+	return syntax.Marshal(proposal)
 }
 
 // bindingHolds answers whether the group and epoch this cache is bound to are the ones named.
