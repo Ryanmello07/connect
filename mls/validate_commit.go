@@ -500,8 +500,12 @@ var cachedProposalJoin = map[string]cachedProposalFieldJoin{
 			if err != nil {
 				return nil, err
 			}
-			return append(binary.BigEndian.AppendUint16(nil, uint16(entry.Proposal.ProposalType)),
-				encoded...), nil
+			// ONE allocation and not two: AppendUint16 onto a nil slice allocates a two
+			// octet array the append below immediately outgrows, and this row is read twice
+			// per entry per rule of the aggregate.
+			octets := make([]byte, 0, 2+len(encoded))
+			octets = binary.BigEndian.AppendUint16(octets, uint16(entry.Proposal.ProposalType))
+			return append(octets, encoded...), nil
 		},
 		names: func(entry *CachedProposal) string {
 			encoded, err := proposalOctets(&entry.Proposal)

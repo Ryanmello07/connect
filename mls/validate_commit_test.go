@@ -2472,22 +2472,34 @@ func testJoinReadingEachEntryOnce(in *CommitValidationInput) error {
 // encode and the encodes are nearly all of the cost. The yardstick is therefore the same walk
 // reading each field ONCE, so the two differ by exactly the thing being bounded and by nothing
 // else, and what is asserted is a bracket around two rather than a ceiling in the distance. Every
-// number below is the per-round median this test computes, over four to six runs of it on this
+// number below is the per-round MEDIAN this test computes, over three to six runs of it on this
 // machine, and every mutation was applied to the join and measured rather than reasoned about:
 //
-//	the join as it stands                          1.79 to 1.92
-//	a third encode of every entry                  2.60 to 3.38   over the ceiling
-//	an encode inside the field loop                4.85 to 5.89   over the ceiling
-//	the join reading only the entry it names       0.91 to 1.17   under the floor
+//	the join as it stands                          1.56 to 1.95   over ten runs
+//	a third read of every entry                    2.53 to 2.78   over the ceiling
+//	an encode inside the field loop                4.56 to 4.87   over the ceiling
+//	the join reading only the entry it names       0.82 to 1.10   under the floor
+//	the join reading one of its two entries twice  1.47 to 2.00   INSIDE the bracket
 //
-// THE FLOOR IS NOT DECORATION AND IT IS NOT THE ONE A READER WOULD GUESS. An arm that compared
-// something CHEAPER than the thing -- a count, a type, a name, which is every regression this door
-// has actually had -- would not be caught here, because the witness reads the same comparators the
-// join does and would get cheaper with it; those are caught by
-// TestACommitWhoseReferenceNamesOneProposalWhileItsListHoldsAnother and the probes beside it,
-// which is where a claim about what a join COMPARES belongs. What the floor catches is the join
-// reading one of its two entries twice instead of reading both once, which is a cost regression
-// and an identity regression at the same time and is measured above.
+// THE LAST ROW IS THE CORRECTION, and the sentence it replaces claimed the opposite. What stood
+// here said "what the floor catches is the join reading one of its two entries twice instead of
+// reading both once". It does not and it cannot: reading `signed` twice costs what reading
+// `signed` and `held` once costs, so that mutation sits at 1.47 to 2.00, which is where the
+// correct build sits. It was applied and measured. What the floor actually catches is a read
+// DROPPED -- the join comparing the entry the commit names with itself -- which is the one shape
+// of this that is cheaper rather than merely wrong, and it lands at 0.82 to 1.10.
+//
+// SO THE DUPLICATED READ IS AN IDENTITY REGRESSION AND IS CAUGHT AS ONE. Measured, it fails
+// TestACommitWhoseReferenceNamesOneProposalWhileItsListHoldsAnother,
+// TestACommitWhoseReferenceNamesABodyDifferingInOneOctetIsRefused,
+// TestAnInlineProposalAttributedToAnotherLeafIsRefused,
+// TestACachedProposalMovedToALeafOfItsOwnIsRefused and
+// TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector -- a join that reads one side
+// twice accepts every disagreement there is, so every probe that asserts a refusal reports it. A
+// cost test is the wrong instrument for a claim about what a join COMPARES, and the same goes for
+// an arm that compared something CHEAPER than the thing -- a count, a type, a name, which is every
+// regression this door has actually had. The witness reads the same comparators the join does and
+// would get cheaper with it.
 //
 // THE THIRTEEN COPIES ASSERTION STAYS AND IS LABELLED FOR WHAT IT IS: a claim about the SHAPE of
 // the door -- that the join runs once per rule because every rule re-establishes its preconditions
@@ -2537,10 +2549,19 @@ func TestTheVectorJoinReadsEachEntryTwiceAndNoMore(t *testing.T) {
 
 	// each block is sized to run for milliseconds at the cost its own work was measured at, so
 	// that a pair of them is a pair of measurements rather than a pair of clock steps.
-	const rounds = 16
-	const doorsPerBlock = 40
-	const joinsPerBlock = 800
-	const witnessPerBlock = 1600
+	//
+	// FORTY-ONE ROUNDS OF HALF SIZED BLOCKS AND NOT SIXTEEN OF FULL SIZED ONES, which is a
+	// measurement about this test rather than about the join. At sixteen rounds the MEDIAN itself
+	// wandered 1.68 to 2.36 over ten runs of an unmodified build and crossed the ceiling on one of
+	// them: a gate that fails one run in four on correct code is a gate somebody deletes, and it
+	// would have been deleted for a reason that was never about the join. The same total work
+	// spread over more, shorter rounds gives the median more samples of the same noise, and the
+	// same ten runs then held 1.56 to 1.88. The per-round spread is unchanged and enormous --
+	// 0.45 to 7.95 across every run recorded above -- which is what the median is here for.
+	const rounds = 41
+	const doorsPerBlock = 30
+	const joinsPerBlock = 400
+	const witnessPerBlock = 800
 	const floor = 4 * time.Millisecond
 
 	shortest := map[string]time.Duration{}
@@ -2633,9 +2654,15 @@ func TestTheVectorJoinReadsEachEntryTwiceAndNoMore(t *testing.T) {
 // walk reading each entry once. The measured value and the mutations either side of it are in that
 // test's own comment; the margins are wide enough for a machine whose block timings move by tens of
 // percent and narrow enough that one more read per entry is outside them.
+//
+// EACH BOUND SITS BETWEEN TWO MEASURED NUMBERS rather than at a round figure near one of them. The
+// floor is between a dropped read at 1.10 and the correct build at 1.56; the ceiling is between the
+// correct build at 1.95 and a third read at 2.53. Both were chosen after the numbers were taken,
+// and each leaves at least a tenth either side -- which is roughly the width the median of
+// forty-one rounds moves by on this machine, so neither bound is a coin toss on a correct build.
 const (
-	joinReadFloor   = 1.45
-	joinReadCeiling = 2.25
+	joinReadFloor   = 1.30
+	joinReadCeiling = 2.30
 )
 
 // TestTheExtensionSetTheCommitInstallsIsWhatItsPathLeafOwesSupportFor is the half of
