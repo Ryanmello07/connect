@@ -107,9 +107,18 @@ func testListEntryAt(t *testing.T, list *ProposalList, view string, at int) *Cac
 	return nil
 }
 
+// testAddOf, testRemoveOf and testGceOf are the three inline proposals this package's fixtures are
+// built from, and each is attributed to testCommitterLeaf.
+//
+// THE SENDER IS NOT A DETAIL OF THESE BUILDERS, it is the fact the commit door's join reads. A
+// by-value entry of a commit's ProposalOrRef vector resolves to the COMMITTER -- that is what
+// (*ProposalCache).Resolve does and what entryTheCommitNames restates -- so a fixture whose inline
+// entries carried the zero value while its committer sat at leaf 0 could not tell the field from
+// the constant. Leaving the sender at the zero value here would put that back one builder down.
 func testAddOf(kp *KeyPackage) CachedProposal {
 	return CachedProposal{
 		Proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}},
+		Sender:   testCommitterLeaf,
 		ByValue:  true,
 	}
 }
@@ -117,9 +126,11 @@ func testAddOf(kp *KeyPackage) CachedProposal {
 func testRemoveOf(leaf LeafIndex) CachedProposal {
 	return CachedProposal{
 		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: leaf}},
+		Sender:   testCommitterLeaf,
 		ByValue:  true,
 	}
 }
+
 
 func testUpdateOf(sender LeafIndex, leaf *LeafNode) CachedProposal {
 	return CachedProposal{
@@ -163,9 +174,11 @@ func testGceOf(exts ...Extension) CachedProposal {
 	return CachedProposal{
 		Proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions,
 			GroupContextExtensions: &GroupContextExtensions{Extensions: exts}},
+		Sender:  testCommitterLeaf,
 		ByValue: true,
 	}
 }
+
 
 // testRequiredCapabilitiesExtension is a required_capabilities naming one extension type no
 // fixture leaf of this package lists, so a capability rule that fires is firing on the
@@ -180,7 +193,34 @@ func testRequiredCapabilitiesExtension(t *testing.T) Extension {
 	return Extension{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: body}
 }
 
+// testCommitterLeaf is the leaf every fixture in this package commits from, and it is NOT leaf
+// zero.
+//
+// IT IS ONE OF THE FOUR NUMBERS THIS CORPUS SPENT THREE ROUNDS BEING UNABLE TO SEE. Every commit
+// fixture used to be built at leaf 0 and every by-value entry left its Sender at the zero value,
+// so `Sender: self.Committer` in entryTheCommitNames and the constant `LeafIndex(0)` produced the
+// same octets for every input this package drives -- and the mutation was applied, measured and
+// left the whole suite green. With the committer off leaf zero the two are told apart in both
+// directions: the constant refuses every honest inline proposal and accepts one attributed to leaf
+// 0, which apply_proposals.go line 131 writes into leaf 0.
+//
+// A BY-VALUE ENTRY CARRIES THIS SAME VALUE AS ITS SENDER, which is not a coincidence to be kept in
+// step by hand but (*ProposalCache).Resolve's own rule: a proposal carried inline is attributed to
+// the committer. testAddOf, testRemoveOf and testGceOf read this constant for that reason, so a
+// fixture cannot attribute an inline proposal to a leaf no resolution could have produced without
+// saying so.
+const testCommitterLeaf = LeafIndex(1)
+
+// testOwnLeaf is the leaf the member JUDGING these commits sits at, and it is neither zero nor the
+// committer's.
+//
+// ValSem203PathDecrypt returns before it reads a tree at all when Own == Committer -- "the
+// committer seals nothing to itself" -- so a corpus that judged every commit as its own committer
+// drove none of that rule's tree reads. Own and Committer differing is what makes them run.
+const testOwnLeaf = LeafIndex(0)
+
 // testValidationGroupId is the group id every input below is judged under.
+
 //
 // ONE SPELLING, because an update leaf's LeafNodeTBS carries the group id and a fixture that
 // signed under one id while the input announced another would be a leaf refused for the wrong

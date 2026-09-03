@@ -137,12 +137,23 @@ var commitValidationSanctionedWraps = map[string]string{
 // ---------------------------------------------------------------------------
 
 // testCommitInput is the shape every rule below is driven through: one tree standing in for both
-// sides of the proposals, one epoch, and the committer at leaf 0.
+// sides of the proposals, one epoch, the committer at testCommitterLeaf and this member at
+// testOwnLeaf.
+//
+// NEITHER OF THOSE IS LEAF ZERO AND THEY ARE NOT EACH OTHER, and both halves of that are the
+// corpus repair rather than a taste. See testCommitterLeaf for the first: with every fixture
+// committing from leaf 0 the join's `Sender: self.Committer` and the constant `LeafIndex(0)`
+// produce the same octets for every input this package has, and the mutation was measured green
+// over the whole suite. The second is ValSem203PathDecrypt, which returns before it reads a tree
+// at all when Own == Committer.
 //
 // PostTree is a CLONE and not the same pointer. Several rules write nothing but several tests do,
 // and a fixture that handed one tree to both fields would make an edit meant for the post-proposal
 // tree land in the pre-commit one -- which is the difference ValSem204 and ValSem207 are stated
-// across.
+// across. A clone is not a DIFFERENCE, though, and that is a separate hole this corpus had:
+// testCommitInputOverTheTreeItsProposalsBuild is the fixture whose two trees answer differently,
+// and testCorpusSeparatesEveryLeafDimension holds the corpus to carrying one.
+
 func testCommitInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	list *ProposalList, commit *Commit) *CommitValidationInput {
 
@@ -163,8 +174,9 @@ func testCommitInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 		// either, and replaced by the tests that need them to differ
 		PostTree:  tree.Clone(),
 		Context:   testResolveContext(),
-		Committer: LeafIndex(0),
-		Own:       LeafIndex(0),
+		Committer: testCommitterLeaf,
+		Own:       testOwnLeaf,
+
 		List:      list,
 		Commit:    commit,
 		Now:       time.Now(),
@@ -203,17 +215,23 @@ func testFitCommitPath(t *testing.T, crypto CryptoProvider, in *CommitValidation
 }
 
 // testFullCommitInput is the input every aggregate row starts from: a four member group, a commit
-// from leaf 0 carrying no proposals and a full path, which ValidateCommit accepts.
+// from testCommitterLeaf carrying no proposals and a full path, which ValidateCommit accepts.
 //
 // Four members and not two, because a two member group's filtered direct path is one node long and
 // half the rules below need an offender that is not at element zero.
+//
+// THE PATH IS FITTED FOR THE MEMBER WHOSE LEAF THE COMMITTER IS, read off in.Committer rather than
+// written as members[0]. A fixture that committed from one leaf while publishing another member's
+// leaf node would be one whose path leaf and whose committer disagree about who sent this commit,
+// and the number is now a constant somebody can move.
 func testFullCommitInput(t *testing.T, crypto CryptoProvider) (*CommitValidationInput, []*testMember) {
 	t.Helper()
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
 	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
-	testFitCommitPath(t, crypto, in, members[0])
+	testFitCommitPath(t, crypto, in, members[in.Committer])
 	return in, members
 }
+
 
 // testCommitPathLeaf is a leaf in the shape an UpdatePath publishes: commit source, a parent hash,
 // and a fresh encryption key.
@@ -287,23 +305,28 @@ func testNarrowLeafCapabilities(t *testing.T, tree *RatchetTree, at LeafIndex) {
 // TestValSem200SelfRemoveInCommit puts the committer's own remove at removes[1].
 //
 // The plan's fixture carries ONE remove, which is the committer's, so a rule reading Removes[0]
-// passes it. Behind an innocent remove of leaf 1 the two are told apart.
+// passes it. Behind an innocent remove of another leaf the two are told apart.
+//
+// WHICH LEAF THE COMMITTER IS IS READ OFF THE INPUT and not written as a number. This test used to
+// remove leaf 0 and call that the committer, which was true only because every fixture in the file
+// committed from leaf 0; a row that spells the committer as a literal is a row that stops being
+// about the committer the moment the fixture moves.
 func TestValSem200SelfRemoveInCommit(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
-	someoneElse := CachedProposal{ByValue: true,
-		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}}
-	theCommitter := CachedProposal{ByValue: true,
-		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 0}}}
-	list := testProposalList(t, someoneElse, theCommitter)
-	in := testCommitInput(t, crypto, tree, list, &Commit{})
+	someoneElse := testRemoveOf(LeafIndex(2))
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	testCommitProposals(t, in, someoneElse, testRemoveOf(in.Committer))
 	if err := ValSem200NoSelfRemove(in); !errors.Is(err, ErrRemoveCommitter) {
 		t.Fatalf("ValSem200 error = %v, want ErrRemoveCommitter", err)
 	}
 	// and the accepting half, so the rule is not "any list of two removes"
-	onlyOthers := testProposalList(t, someoneElse, CachedProposal{ByValue: true,
-		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 1}}})
-	if err := ValSem200NoSelfRemove(testCommitInput(t, crypto, tree, onlyOthers, &Commit{})); err != nil {
+	innocent := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	testCommitProposals(t, innocent, someoneElse, testRemoveOf(LeafIndex(0)))
+	if innocent.Committer == LeafIndex(0) {
+		t.Fatal("the fixture commits from leaf 0, so the accepting half removes its own committer")
+	}
+	if err := ValSem200NoSelfRemove(innocent); err != nil {
 		t.Fatalf("ValSem200 refused a list that removes nobody's committer: %v", err)
 	}
 }
@@ -311,14 +334,13 @@ func TestValSem200SelfRemoveInCommit(t *testing.T) {
 func TestValSem201MissingPath(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, _ := testTreeWith(t, crypto, "alice", "bob")
-	cached := CachedProposal{ByValue: true,
-		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 1}}}
-	list := testProposalList(t, cached)
-	in := testCommitInput(t, crypto, tree, list, &Commit{Path: nil})
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: nil})
+	testCommitProposals(t, in, testRemoveOf(LeafIndex(0)))
 	if err := ValSem201PathPresentWhenRequired(in); !errors.Is(err, errMissingPath) {
 		t.Fatalf("ValSem201 error = %v, want errMissingPath", err)
 	}
 }
+
 
 func TestValSem201EmptyProposalListRequiresPath(t *testing.T) {
 	crypto := testCrypto(t)
@@ -337,9 +359,9 @@ func TestValSem201AcceptsAPathlessAddOnlyCommit(t *testing.T) {
 	joiner := testIdentity(t, crypto, "dave")
 	kp, _, _ := testKeyPackage(t, crypto, joiner)
 	_ = members
-	list := testProposalList(t, CachedProposal{ByValue: true,
-		Proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}})
-	in := testCommitInput(t, crypto, tree, list, &Commit{Path: nil})
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: nil})
+	testCommitProposals(t, in, testAddOf(kp))
+
 	if err := ValSem201PathPresentWhenRequired(in); err != nil {
 		t.Fatalf("ValSem201 refused a pathless add-only commit: %v", err)
 	}
@@ -348,21 +370,23 @@ func TestValSem201AcceptsAPathlessAddOnlyCommit(t *testing.T) {
 func TestValSem202PathLength(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
-	filtered, err := tree.FilteredDirectPath(LeafIndex(0))
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	// the COMMITTER's filtered direct path, read off the input rather than written as leaf 0.
+	// This rule is about the committer's own path and the two were the same number for as long as
+	// every fixture in this file committed from leaf 0.
+	filtered, err := in.PostTree.FilteredDirectPath(in.Committer)
 	if err != nil {
-		t.Fatalf("FilteredDirectPath: %v", err)
+		t.Fatalf("FilteredDirectPath(%d): %v", in.Committer, err)
 	}
 	if len(filtered) < 2 {
 		t.Fatalf("the fixture's filtered direct path is %d long, so a one node path is not short",
 			len(filtered))
 	}
-	short := testCommitPath(t, crypto, members[0], 1)
-	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: short})
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], 1)
 	if err := ValSem202PathLength(in); !errors.Is(err, errPathLength) {
 		t.Fatalf("ValSem202 error = %v, want errPathLength", err)
 	}
-	exact := testCommitPath(t, crypto, members[0], len(filtered))
-	in = testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: exact})
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], len(filtered))
 	if err := ValSem202PathLength(in); err != nil {
 		t.Fatalf("ValSem202 refused a path of the filtered direct path's own length: %v", err)
 	}
@@ -394,11 +418,10 @@ func TestTheCommitPathLeafMustBeCommitSourced(t *testing.T) {
 func TestValSem203PathEncryptsToNobody(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
-	path := testCommitPath(t, crypto, members[0], 2)
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	path := testCommitPath(t, crypto, members[in.Committer], 2)
 	path.Nodes[1].EncryptedPathSecret = nil
-	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: path})
-	in.Committer = LeafIndex(0)
-	in.Own = LeafIndex(1)
+	in.Commit.Path = path
 	failure := ValSem203PathDecrypt(in)
 	if !errors.Is(failure, errPathDecrypt) {
 		t.Fatalf("ValSem203 error = %v, want errPathDecrypt", failure)
@@ -408,10 +431,7 @@ func TestValSem203PathEncryptsToNobody(t *testing.T) {
 	if !strings.Contains(failure.Error(), "node 1") {
 		t.Errorf("ValSem203 refused the path without naming which node encrypts to nobody: %v", failure)
 	}
-	whole := testCommitPath(t, crypto, members[0], 2)
-	in = testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: whole})
-	in.Committer = LeafIndex(0)
-	in.Own = LeafIndex(1)
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], 2)
 	if failure := ValSem203PathDecrypt(in); failure != nil {
 		t.Fatalf("ValSem203 refused a path whose every node addresses somebody: %v", failure)
 	}
@@ -422,9 +442,8 @@ func TestValSem203PathEncryptsToNobody(t *testing.T) {
 func TestValSem203RefusesAReceiverOutsideTheTree(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
-	in := testCommitInput(t, crypto, tree, &ProposalList{},
-		&Commit{Path: testCommitPath(t, crypto, members[0], 2)})
-	in.Committer = LeafIndex(0)
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], 2)
 	in.Own = LeafIndex(97)
 	if failure := ValSem203PathDecrypt(in); !errors.Is(failure, errPathDecrypt) {
 		t.Fatalf("ValSem203 over a receiver outside the tree = %v, want errPathDecrypt", failure)
@@ -434,24 +453,23 @@ func TestValSem203RefusesAReceiverOutsideTheTree(t *testing.T) {
 func TestValSem204PathLeafReusesTheCommittersKey(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob")
-	current := tree.Leaf(LeafIndex(0))
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	current := in.PreTree.Leaf(in.Committer)
 	if current == nil {
-		t.Fatal("leaf 0 is blank")
+		t.Fatalf("leaf %d is blank, so the fixture has no committer", in.Committer)
 	}
-	reused := testCommitPathLeaf(t, crypto, members[0])
+	reused := testCommitPathLeaf(t, crypto, members[in.Committer])
 	reused.EncryptionKey = current.EncryptionKey
-	in := testCommitInput(t, crypto, tree, &ProposalList{},
-		&Commit{Path: &UpdatePath{LeafNode: *reused}})
+	in.Commit.Path = &UpdatePath{LeafNode: *reused}
 	if failure := ValSem204PathKeyMismatch(in); !errors.Is(failure, errPathLeafKeyUnchanged) {
 		t.Fatalf("ValSem204 error = %v, want errPathLeafKeyUnchanged", failure)
 	}
-	fresh := testCommitPathLeaf(t, crypto, members[0])
-	in = testCommitInput(t, crypto, tree, &ProposalList{},
-		&Commit{Path: &UpdatePath{LeafNode: *fresh}})
+	in.Commit.Path = &UpdatePath{LeafNode: *testCommitPathLeaf(t, crypto, members[in.Committer])}
 	if failure := ValSem204PathKeyMismatch(in); failure != nil {
 		t.Fatalf("ValSem204 refused a path leaf carrying a fresh key: %v", failure)
 	}
 }
+
 
 // TestValSem204RefusesACommitterThatOccupiesNoLeaf is the precondition, with its own value.
 func TestValSem204RefusesACommitterThatOccupiesNoLeaf(t *testing.T) {
@@ -498,46 +516,53 @@ func TestValSem206PathLeafKeyIsPublishedByAProposal(t *testing.T) {
 	innocent, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
 	colliding, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "frank"))
 
-	adds := testProposalList(t,
-		CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeAdd,
-			Add: &Add{KeyPackage: *innocent}}},
-		CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeAdd,
-			Add: &Add{KeyPackage: *colliding}}})
+	pathOf := func(t *testing.T, in *CommitValidationInput, key []byte) {
+		t.Helper()
+		leaf := testCommitPathLeaf(t, crypto, members[in.Committer])
+		if key != nil {
+			leaf.EncryptionKey = key
+		}
+		in.Commit.Path = &UpdatePath{LeafNode: *leaf}
+	}
+	withAdds := func(t *testing.T) *CommitValidationInput {
+		t.Helper()
+		in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+		testCommitProposals(t, in, testAddOf(innocent), testAddOf(colliding))
+		return in
+	}
 
-	leaf := testCommitPathLeaf(t, crypto, members[0])
-	leaf.EncryptionKey = colliding.LeafNode.EncryptionKey
-	in := testCommitInput(t, crypto, tree, adds, &Commit{Path: &UpdatePath{LeafNode: *leaf}})
+	in := withAdds(t)
+	pathOf(t, in, colliding.LeafNode.EncryptionKey)
 	if failure := ValSem206PathLeafEncryptionKeyUnique(in); !errors.Is(failure, errDuplicateEncryptionKey) {
 		t.Fatalf("ValSem206 over an add at index 1 = %v, want errDuplicateEncryptionKey", failure)
 	}
 
 	// the init key of the same add, which is a different field of the same joiner
-	leaf = testCommitPathLeaf(t, crypto, members[0])
-	leaf.EncryptionKey = colliding.InitKey
-	in = testCommitInput(t, crypto, tree, adds, &Commit{Path: &UpdatePath{LeafNode: *leaf}})
+	in = withAdds(t)
+	pathOf(t, in, colliding.InitKey)
 	if failure := ValSem206PathLeafEncryptionKeyUnique(in); !errors.Is(failure, errDuplicateEncryptionKey) {
 		t.Fatalf("ValSem206 over the init key of the add at index 1 = %v, want errDuplicateEncryptionKey",
 			failure)
 	}
 
-	// and the updates bucket, offender second again
-	innocentUpdate, _ := testUpdateLeafNode(t, crypto, members[0], []byte("group"), LeafIndex(0))
-	collidingUpdate, _ := testUpdateLeafNode(t, crypto, members[1], []byte("group"), LeafIndex(1))
-	updates := testProposalList(t,
-		CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeUpdate,
-			Update: &Update{LeafNode: *innocentUpdate}}},
-		CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeUpdate,
-			Update: &Update{LeafNode: *collidingUpdate}}})
-	leaf = testCommitPathLeaf(t, crypto, members[0])
-	leaf.EncryptionKey = collidingUpdate.EncryptionKey
-	in = testCommitInput(t, crypto, tree, updates, &Commit{Path: &UpdatePath{LeafNode: *leaf}})
+	// AND THE UPDATES BUCKET, OFFENDER SECOND AGAIN, WITH BOTH UPDATES NAMED BY REFERENCE. That is
+	// the only form a commit carrying two members' updates has: a by-value entry resolves to the
+	// COMMITTER, so a list holding two inline updates from two different leaves is one no
+	// resolution of any commit produces. It was accepted here for exactly as long as every fixture
+	// in this file committed from leaf 0 and every by-value sender was the zero value.
+	in = testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	in.Pending = testCacheAt(t, in.Context)
+	innocentUpdate := testCachedUpdateOf(t, crypto, in.Pending, members[0], LeafIndex(0))
+	collidingUpdate := testCachedUpdateOf(t, crypto, in.Pending, members[1], LeafIndex(1))
+	testCommitProposals(t, in, innocentUpdate, collidingUpdate)
+	pathOf(t, in, collidingUpdate.Proposal.Update.LeafNode.EncryptionKey)
 	if failure := ValSem206PathLeafEncryptionKeyUnique(in); !errors.Is(failure, errDuplicateEncryptionKey) {
 		t.Fatalf("ValSem206 over an update at index 1 = %v, want errDuplicateEncryptionKey", failure)
 	}
 
 	// the accepting half over the same lists, so the rule is not "any list with two proposals"
-	fresh := testCommitPathLeaf(t, crypto, members[0])
-	in = testCommitInput(t, crypto, tree, adds, &Commit{Path: &UpdatePath{LeafNode: *fresh}})
+	in = withAdds(t)
+	pathOf(t, in, nil)
 	if failure := ValSem206PathLeafEncryptionKeyUnique(in); failure != nil {
 		t.Fatalf("ValSem206 refused a path leaf whose key no proposal publishes: %v", failure)
 	}
@@ -669,15 +694,18 @@ func TestValSem209RefusesAGroupExtensionAMemberDoesNotSupport(t *testing.T) {
 }
 
 // TestValSem209ExemptsTheMembersTheCommitRemoves states the scope of the two member loops.
+//
+// The narrow member is at leaf 2 rather than at the committer's own leaf, so the commit this
+// fixture stands for is one a group could send: a commit that evicts its own committer is refused
+// by ValSem200 long before this rule is reached.
 func TestValSem209ExemptsTheMembersTheCommitRemoves(t *testing.T) {
 	crypto := testCrypto(t)
-	tree, _ := testTreeWith(t, crypto, "alice", "bob")
-	testNarrowLeafCapabilities(t, tree, LeafIndex(1))
-	list := testProposalList(t,
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	testNarrowLeafCapabilities(t, tree, LeafIndex(2))
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	testCommitProposals(t, in,
 		testGceOf(Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor}),
-		CachedProposal{ByValue: true,
-			Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 1}}})
-	in := testCommitInput(t, crypto, tree, list, &Commit{})
+		testRemoveOf(LeafIndex(2)))
 	in.PostTree = tree.Clone()
 	if failure := ValSem209GroupExtensionsSupported(in); failure != nil {
 		t.Fatalf("ValSem209 held a commit to the capabilities of the member it removes: %v", failure)
@@ -1293,8 +1321,9 @@ func commitRuleCases() []commitRuleCase {
 		{"ValSem200NoSelfRemove", "ErrRemoveCommitter", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
-			list := testProposalList(t, testRemoveOf(2), testRemoveOf(0))
-			return ValSem200NoSelfRemove(testCommitInput(t, crypto, tree, list, &Commit{}))
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			testCommitProposals(t, in, testRemoveOf(2), testRemoveOf(in.Committer))
+			return ValSem200NoSelfRemove(in)
 		}},
 		{"ValSem201PathPresentWhenRequired", "errMissingPath", func(t *testing.T) error {
 			crypto := testCrypto(t)
@@ -1326,10 +1355,11 @@ func commitRuleCases() []commitRuleCase {
 		{"ValSem204PathKeyMismatch", "errPathLeafKeyUnchanged", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, members := testTreeWith(t, crypto, "alice", "bob")
-			leaf := testCommitPathLeaf(t, crypto, members[0])
-			leaf.EncryptionKey = tree.Leaf(LeafIndex(0)).EncryptionKey
-			return ValSem204PathKeyMismatch(testCommitInput(t, crypto, tree, &ProposalList{},
-				&Commit{Path: &UpdatePath{LeafNode: *leaf}}))
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			leaf := testCommitPathLeaf(t, crypto, members[in.Committer])
+			leaf.EncryptionKey = in.PreTree.Leaf(in.Committer).EncryptionKey
+			in.Commit.Path = &UpdatePath{LeafNode: *leaf}
+			return ValSem204PathKeyMismatch(in)
 		}},
 		// ValSem204's precondition, which is a second value of the same rule and had no row
 		{"ValSem204PathKeyMismatch", "errCommitterNotMember", func(t *testing.T) error {
@@ -1797,7 +1827,7 @@ func commitAggregateRows() map[string]commitAggregateRow {
 			rule: "ValSem200NoSelfRemove", sentinel: ErrRemoveCommitter,
 			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
 				in, _ := testFullCommitInput(t, crypto)
-				testCommitProposals(t, in, testRemoveOf(2), testRemoveOf(0))
+				testCommitProposals(t, in, testRemoveOf(2), testRemoveOf(in.Committer))
 				return in
 			}},
 		"ValSem201 over a pathless commit that names no proposals": {
@@ -1868,8 +1898,8 @@ func commitAggregateRows() map[string]commitAggregateRow {
 			rule: "ValSem209GroupExtensionsSupported", sentinel: errGroupContextExtensionNotListed,
 			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
 				in, members := testFullCommitInput(t, crypto)
-				testNarrowLeafCapabilities(t, in.PostTree, LeafIndex(1))
-				testFitCommitPath(t, crypto, in, members[0])
+				testNarrowLeafCapabilities(t, in.PostTree, LeafIndex(2))
+				testFitCommitPath(t, crypto, in, members[in.Committer])
 				testCommitProposals(t, in, testGceOf(
 					Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
 					Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}))
@@ -1921,7 +1951,7 @@ func commitAggregateRows() map[string]commitAggregateRow {
 				}
 				// blanking the rightmost leaf changes the filtered direct path, so the path is
 				// re-fitted against the tree the aggregate reads
-				testFitCommitPath(t, crypto, in, members[0])
+				testFitCommitPath(t, crypto, in, members[in.Committer])
 				return in
 			}},
 	}
@@ -2130,7 +2160,7 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 		in, _ := testFullCommitInput(t, crypto)
 		cache := testCacheAt(t, testResolveContext())
 		in.Pending = cache
-		agreeing := testCachedRemoveOf(t, crypto, cache, LeafIndex(1))
+		agreeing := testCachedRemoveOf(t, crypto, cache, LeafIndex(0))
 		held := testCachedRemoveOf(t, crypto, cache, LeafIndex(2))
 		other := testCachedRemoveOf(t, crypto, cache, LeafIndex(3))
 		in.List = testProposalList(t, agreeing, held)
@@ -2684,12 +2714,12 @@ func TestValSem202IsStatedOverThePostProposalTree(t *testing.T) {
 		t.Fatalf("both trees answer a filtered direct path of %d nodes, so this fixture cannot tell the two fields apart",
 			len(before))
 	}
-	in.Commit.Path = testCommitPath(t, crypto, members[0], len(after))
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], len(after))
 	if failure := ValSem202PathLength(in); failure != nil {
 		t.Fatalf("ValSem202 refused a path of the POST tree's own filtered direct path length: %v. The proposals are applied before the path is validated, so a rule reading the pre-commit tree refuses every honest commit that removes anybody",
 			failure)
 	}
-	in.Commit.Path = testCommitPath(t, crypto, members[0], len(before))
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], len(before))
 	if failure := ValSem202PathLength(in); !errors.Is(failure, errPathLength) {
 		t.Fatalf("ValSem202 accepted a path of the PRE tree's filtered direct path length = %v, want errPathLength",
 			failure)
@@ -2710,21 +2740,22 @@ func TestValSem204IsStatedOverThePreCommitTree(t *testing.T) {
 	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob")
 	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
-	update, updated := testUpdateProposalOf(t, crypto, members[0], LeafIndex(0))
+	update, updated := testUpdateProposalOf(t, crypto, members[in.Committer], in.Committer)
 	testCommitProposals(t, in, update)
-	if failure := in.PostTree.UpdateLeaf(LeafIndex(0), updated); failure != nil {
-		t.Fatalf("UpdateLeaf(0): %v", failure)
+	if failure := in.PostTree.UpdateLeaf(in.Committer, updated); failure != nil {
+		t.Fatalf("UpdateLeaf(%d): %v", in.Committer, failure)
 	}
-	retired := in.PreTree.Leaf(LeafIndex(0))
-	fresh := in.PostTree.Leaf(LeafIndex(0))
+	retired := in.PreTree.Leaf(in.Committer)
+	fresh := in.PostTree.Leaf(in.Committer)
 	if retired == nil || fresh == nil {
-		t.Fatal("one of the two trees has no leaf 0, so the fixture states nothing")
+		t.Fatalf("one of the two trees has no leaf %d, so the fixture states nothing", in.Committer)
 	}
 	if subtle.ConstantTimeCompare(retired.EncryptionKey, fresh.EncryptionKey) == 1 {
-		t.Fatal("both trees carry the same key at leaf 0, so this fixture cannot tell the two fields apart")
+		t.Fatalf("both trees carry the same key at leaf %d, so this fixture cannot tell the two fields apart",
+			in.Committer)
 	}
 
-	republished := testCommitPathLeaf(t, crypto, members[0])
+	republished := testCommitPathLeaf(t, crypto, members[in.Committer])
 	republished.EncryptionKey = retired.EncryptionKey
 	in.Commit.Path = &UpdatePath{LeafNode: *republished}
 	if failure := ValSem204PathKeyMismatch(in); !errors.Is(failure, errPathLeafKeyUnchanged) {
@@ -2734,7 +2765,7 @@ func TestValSem204IsStatedOverThePreCommitTree(t *testing.T) {
 
 	// the post tree's key is a different rule's business: ValSem204 is about the key the path
 	// retires, and the key an Update in the same commit published is ValSem206's axis
-	carried := testCommitPathLeaf(t, crypto, members[0])
+	carried := testCommitPathLeaf(t, crypto, members[in.Committer])
 	carried.EncryptionKey = fresh.EncryptionKey
 	in.Commit.Path = &UpdatePath{LeafNode: *carried}
 	if failure := ValSem204PathKeyMismatch(in); failure != nil {
@@ -4127,9 +4158,12 @@ func TestValSem203ReadsTheFilteredDirectPathsOfTheTreeThePathWasBuiltAgainst(t *
 		t.Fatalf("the post tree is %d leaves wide and the pre tree %d; the removals must truncate or the two trees are one",
 			in.PostTree.LeafCount(), in.PreTree.LeafCount())
 	}
-	in.Commit.Path = testCommitPath(t, crypto, members[0], 1)
-	in.Committer = LeafIndex(0)
+	in.Commit.Path = testCommitPath(t, crypto, members[in.Committer], 1)
 	in.Own = LeafIndex(3)
+	if in.Own == in.Committer {
+		t.Fatalf("the receiver and the committer are both leaf %d, so ValSem203 returns before it reads a tree at all",
+			in.Own)
+	}
 
 	failure := ValSem203PathDecrypt(in)
 	if !errors.Is(failure, errPathDecrypt) {
