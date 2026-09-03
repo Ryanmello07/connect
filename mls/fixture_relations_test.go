@@ -333,6 +333,10 @@ type comparisonPair struct {
 	left  pPath
 	right pPath
 	in    string
+	// viaCall is whether this was read inside a helper the rule calls rather than in a
+	// frame of the input's own. See TestEveryDoorComparisonIsReadOffThisPackagesSource,
+	// which is what stops the call walk from being deleted green.
+	viaCall bool
 }
 
 // String is the pair as the failure messages name it, and it is the key the corpus is measured
@@ -791,6 +795,7 @@ func comparisonsIn(parsed parsedSource, function *ast.FuncDecl, roots map[string
 				continue
 			}
 			seen[pair.String()] = true
+			pair.viaCall = true
 			found = append(found, pair)
 		}
 		lost = append(lost, dropped...)
@@ -1102,6 +1107,7 @@ func TestEveryDoorComparisonIsReadOffThisPackagesSource(t *testing.T) {
 			declared)
 	}
 	spelledAsACall, spelledAsALength, spreadOverAVector := false, false, false
+	readInsideAHelper := false
 	for _, named := range declared {
 		if len(pairs[named]) == 0 {
 			t.Errorf("no rule of this package was read as comparing two paths of a %s, so the relation claim over that door's corpus holds vacuously",
@@ -1121,6 +1127,7 @@ func TestEveryDoorComparisonIsReadOffThisPackagesSource(t *testing.T) {
 			if pair.positional() {
 				spreadOverAVector = true
 			}
+			readInsideAHelper = readInsideAHelper || pair.viaCall
 		}
 	}
 	if !spelledAsACall {
@@ -1131,6 +1138,9 @@ func TestEveryDoorComparisonIsReadOffThisPackagesSource(t *testing.T) {
 	}
 	if !spreadOverAVector {
 		t.Errorf("the walk found no pair whose two sides spread over a vector, so the positional pairing above is dead code")
+	}
+	if !readInsideAHelper {
+		t.Errorf("every pair the walk found was written in a frame that names a validation input, so the call walk is reaching nothing and the scope of this derivation is again 'a function whose signature names an input'. joinCachedProposals, CheckUpdatePathKeyUniqueness and checkProposalProfile are all door logic and none of them is in that scope")
 	}
 	// AND THE CLASS IS HELD TO THE SOURCE RATHER THAN TO A NUMBER. Every claim over these pairs
 	// is stated per pair, so a walk that quietly stops finding three of them states three fewer

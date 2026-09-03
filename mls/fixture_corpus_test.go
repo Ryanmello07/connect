@@ -2130,6 +2130,11 @@ func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label stri
 		return
 	}
 	separated := 0
+	// what says the SECOND build is measuring: agreement values it reached again and values it
+	// did not. All of one and none of the other means corpusStableAgreementsIn compared a
+	// fixture with itself, or with something unrelated, and the claim below is then either
+	// never stated or stated over freshly generated keys.
+	steady, moved := 0, 0
 	for _, pair := range compared {
 		equalIn, differIn, reachedIn := []string{}, []string{}, []string{}
 		agreed, differLeft, differRight := []string{}, []string{}, []string{}
@@ -2168,6 +2173,13 @@ func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label stri
 				stable = corpusWithValue(stable, value)
 			}
 		}
+		for _, value := range agreed {
+			if slices.Contains(stable, value) {
+				steady += 1
+			} else {
+				moved += 1
+			}
+		}
 		pinned := ""
 		if len(agreed) == 1 && slices.Contains(stable, agreed[0]) {
 			if !slices.Contains(differLeft, agreed[0]) {
@@ -2193,8 +2205,12 @@ func assertCorpusSeparatesEveryRelationItsDoorDecidesBy(t *testing.T, label stri
 			separated += 1
 		}
 	}
-	t.Logf("%s: %d of %d compared pairs are witnessed equal, unequal, and separably from every constant",
-		label, separated, len(compared))
+	if steady == 0 || moved == 0 {
+		t.Errorf("the %s corpus witnesses %d agreement value(s) a second build reached again and %d it did not, and the claim above needs both: with none of the first it is never stated, and with none of the second it is stated over encryption keys that are different octets every run. Building each fixture twice is what tells those apart",
+			label, steady, moved)
+	}
+	t.Logf("%s: %d of %d compared pairs are witnessed equal, unequal, and separably from every constant; %d agreement value(s) survive a second build and %d do not",
+		label, separated, len(compared), steady, moved)
 }
 
 // TestEveryValidationInputCorpusSeparatesEveryDimensionItDecidesOff is the gate the four rounds
