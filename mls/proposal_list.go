@@ -1061,13 +1061,27 @@ func cloneProposal(proposal *Proposal) (Proposal, int, error) {
 // proposalOctets is a proposal's wire encoding, which is the one thing two proposals can be
 // compared BY.
 //
-// A PROPOSAL HAS NO OTHER IDENTITY IN THIS PACKAGE. Its type is a discriminant, its arms are
-// pointers into whatever buffer decoded them, and a Proposal carrying an Add carries a whole
-// KeyPackage below it -- so == is not defined over it, a field-by-field comparison is a hand
-// written list that goes stale the moment an eighth arm is registered, and both of those are the
-// enumeration rule 5 exists for. The encoding is the value the sender signed, the value the
-// transcript hash covers and the value a ProposalRef is a hash OF, so two proposals encoding alike
-// are one proposal by every measure this protocol has.
+// A PROPOSAL HAS NO OTHER IDENTITY ON THE WIRE. Its type is a discriminant, its arms are pointers
+// into whatever buffer decoded them, and a Proposal carrying an Add carries a whole KeyPackage
+// below it -- so == is not defined over it, a field-by-field comparison is a hand written list
+// that goes stale the moment an eighth arm is registered, and both of those are the enumeration
+// rule 5 exists for. The encoding is the value the sender signed, the value the transcript hash
+// covers and the value a ProposalRef is a hash OF, so two proposals encoding alike are one
+// proposal to every RECEIVER of this protocol.
+//
+// IT IS NOT AN IDENTITY FOR A Proposal VALUE IN PROCESS, and the sentence that used to stand here
+// said it was -- "two proposals encoding alike are one proposal by every measure this protocol
+// has". MarshalMLS writes UnknownType as the discriminant when one is set and selects the arm by
+// ProposalType, so {ProposalType: remove, Remove: {Removed: 0x03bbccdd}} and
+// {ProposalType: external_init, UnknownType: remove, ExternalInit: {KemOutput: bb cc dd}} encode
+// to the same 000303bbccdd. That is measured rather than argued, in
+// TestTheJoinRefusesTwoProposalsThatEncodeAlikeUnderDifferentTypes.
+//
+// THREE THINGS KEEP THAT PAIR OFF THE WIRE and none of them is visible from a caller comparing two
+// Proposal values by these octets: UnmarshalMLS normalises the two fields, NewProposalList clones
+// through the codec, and checkProposalProfile's rule 2 above refuses the disagreement outright. A
+// caller that wants the TYPE compared has to compare it -- which is what the commit door's join
+// does, by writing the ProposalType in front of these octets rather than reading it out of them.
 //
 // ONE LINE, AND IT IS HERE RATHER THAN AT THE ONE CALL SITE, for cloneProposal's reason directly
 // above: the codec is what makes a copy exactly what the octets say, and it is what makes a

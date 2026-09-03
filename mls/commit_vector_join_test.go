@@ -532,8 +532,16 @@ func TestTheJoinRefusesTwoProposalsThatEncodeAlikeUnderDifferentTypes(t *testing
 	if err != nil {
 		t.Fatalf("encode the external_init: %v", err)
 	}
-	if !slices.Equal(first, second) {
-		t.Skipf("a %s encodes to %x and a %s to %x, so this build no longer writes UnknownType as the wire discriminant and the pair this row exists for cannot be built",
+	if slices.Equal(first, second) {
+		t.Logf("a %s and a %s both encode to %x, which is the premise this row exists for",
+			proposalTypeName(asRemove.Proposal.ProposalType),
+			proposalTypeName(asExternalInit.Proposal.ProposalType), first)
+	} else {
+		// NOT A SKIP. The refusal below is owed whether or not the two encode alike -- a join
+		// over two different types must answer no either way -- and a row that opted out of its
+		// own assertion when the premise stopped holding would be a row nothing drives on the
+		// build where somebody had just changed the encoder.
+		t.Logf("a %s encodes to %x and a %s to %x, so this build no longer writes UnknownType as the wire discriminant and the Proposal row's type prefix is no longer the only thing separating them",
 			proposalTypeName(asRemove.Proposal.ProposalType), first,
 			proposalTypeName(asExternalInit.Proposal.ProposalType), second)
 	}
