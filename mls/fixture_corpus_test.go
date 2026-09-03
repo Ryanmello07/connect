@@ -276,12 +276,11 @@ func testCommitInputInASecondGroupAtALaterEpoch(t *testing.T,
 	in.ConfirmationKey = crypto.Random(crypto.HashSize())
 	in.ConfirmedHash = crypto.Hash([]byte("the second group's confirmed hash"))
 	in.ConfirmationTag = crypto.Mac(in.ConfirmationKey, in.ConfirmedHash)
-	// AND ITS CACHE IS STILL BOUND TO THE EPOCH THIS GROUP LEFT, which is bindingHolds' other
-	// half and the one no fixture held. It is bound to THIS group at an earlier epoch rather
-	// than to another group, so the epoch comparison is the only one that disagrees here and the
-	// group comparison is the only one that disagrees in
-	// testCommitWhosePendingCacheBelongsToAnotherGroup: two comparisons joined by an AND are two
-	// clauses answering one bool, and a corpus that moves both at once holds neither.
+	// AND ITS CACHE IS STILL BOUND TO THE EPOCH THIS GROUP LEFT, which is the epoch pair read
+	// from the binding's side. It is bound to THIS group at an earlier epoch rather than to
+	// another group, so the epoch is the only one of the two facts that disagrees here -- the
+	// group is the only one that disagrees in testCommitWhosePendingCacheBelongsToAnotherGroup,
+	// and see that fixture for what one axis per fixture does and does not buy.
 	//
 	// NOTHING NAMES THE CACHE, so this stays an accepted commit: entryTheCommitNames consults it
 	// only for a by-reference entry and both of this fixture's proposals are carried by value.
@@ -954,12 +953,20 @@ func testCommitFromLeafZeroJudgedFromTheLeafItsCommitterUsuallyOccupies(t *testi
 // entry. Every fixture that carried a cache at all built that cache AT this input's own context, so
 // both comparisons and the constant `true` were the same program here.
 //
-// ONLY THE GROUP MOVES, and the epoch is deliberately left where it is. bindingHolds is an AND of
-// two comparisons answering one bool, so a fixture in which both halves disagree is refused by
-// either half alone -- which is the extension join's defect two files over, and it would leave the
-// corpus unable to tell a cache check that reads the group from one that reads both. The epoch half
-// gets its own witness on testCommitInputInASecondGroupAtALaterEpoch, whose cache stays at the
-// epoch that group has left.
+// ONLY THE GROUP MOVES, and the epoch is deliberately left where it is. One fixture per axis is
+// what makes a refusal here say WHICH of the two facts was wrong, and it is what the two epoch
+// fixtures beside it need anyway: the epoch pair agrees at one value across the whole corpus, so
+// the claim next door asks for that value to appear on each side while the two disagree, and no
+// single fixture can carry it on both.
+//
+// WHAT THIS DOES NOT ESTABLISH, said here because the obvious reading is that it does: bindingHolds
+// is an AND of the two comparisons and NONE of these three fixtures decides between its clauses.
+// Rebind empties the cache as it moves it, so the reference this commit names is missing whatever
+// the binding says, and the door answers errProposalNotCached by a route that never reaches the
+// AND. Measured: deleting either clause of bindingHolds leaves every claim in this file green and
+// dies in proposal_list_test.go, at TestCheckEpochAnswersTheBindingAndRebindMovesIt and
+// TestResolveRefusesAReferenceCachedInAnEpochThatHasClosed. What these fixtures are for is the
+// relation claim -- two paths this corpus used to carry one value at.
 func testCommitWhosePendingCacheBelongsToAnotherGroup(t *testing.T,
 	crypto CryptoProvider) *CommitValidationInput {
 
@@ -990,13 +997,14 @@ func testCommitWhosePendingCacheBelongsToAnotherGroup(t *testing.T,
 // testCommitWhosePendingCacheBelongsToALaterEpoch is the third of the cache fixtures, and it is the
 // epoch comparison read from the other side.
 //
-// A CLAUSE NEEDS A WITNESS IN BOTH DIRECTIONS WHEN ITS TWO SIDES ARE BOTH FIELDS. The corpus agrees
-// on the epoch at ONE value -- epoch 1, which is where almost every fixture lives -- so
-// `self.binding.epoch == 1` stands in for the comparison unless some fixture carries epoch 1 on
-// EACH side while the two disagree. testCommitInputInASecondGroupAtALaterEpoch carries it on the
-// binding, being a caller in epoch 9 holding a cache still at 1; this carries it on the caller,
-// being a caller in epoch 1 holding a cache that has been moved on to 9. Neither alone is enough,
-// because `caller.epoch == 1` and `binding.epoch == 1` are two different constant rules.
+// A PAIR NEEDS A WITNESS IN BOTH DIRECTIONS WHEN ITS TWO SIDES ARE BOTH FIELDS. The corpus agrees
+// on the epoch at ONE value -- epoch 1, which is where almost every fixture lives -- so a constant
+// stands in for the comparison unless some fixture carries epoch 1 on EACH side while the two
+// disagree. testCommitInputInASecondGroupAtALaterEpoch carries it on the binding, being a caller in
+// epoch 9 holding a cache still at 1; this carries it on the caller, being a caller in epoch 1
+// holding a cache that has been moved on to 9. Neither alone is enough, because
+// `caller.epoch == 1` and `binding.epoch == 1` are two different constant rules and the claim next
+// door refuses both.
 func testCommitWhosePendingCacheBelongsToALaterEpoch(t *testing.T,
 	crypto CryptoProvider) *CommitValidationInput {
 
@@ -2455,7 +2463,6 @@ func TestEveryValidationInputCorpusIsJudgedTheWayItsRowsSay(t *testing.T) {
 		}
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // the POPULATION the rules are actually driven over

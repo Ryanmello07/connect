@@ -30,6 +30,21 @@
 // of its operands trace back to a field of a validation input. A rule added tomorrow is in the
 // class on the run after it is written, and a rule whose comparison is deleted takes its pair with
 // it.
+//
+// AND THE SCOPE IS DERIVED TOO, which is the round after that one and the same ledger entry pointed
+// one level up. The walk used to read a function only where its own signature named a validation
+// input, so the helpers a rule is written out of were invisible: joinCachedProposals, which holds
+// the vector the sender signed against the list this member resolved; CheckUpdatePathKeyUniqueness,
+// which is the whole body of ValSem207; checkProposalProfile, which is where a forged proposal
+// discriminant is refused. All three are door logic and none of them takes a door's input. So the
+// walk follows a rule into the package's own functions, binding their parameters to the paths the
+// caller passed, and comparisonsIn is where that is written.
+//
+// TWO PLACES IT DELIBERATELY STOPS, each with its reason on the line: a call through an interface,
+// because CryptoProvider exists so a deployment can supply its own body and the comparisons inside
+// whichever one this repository ships are not comparisons either door makes; and a path through an
+// unexported method, because the corpus reaches values by reflection and reflection reaches
+// exported methods only, so recording one would state a claim over a value no fixture can produce.
 package mls
 
 import (
@@ -176,17 +191,24 @@ func pathsOf(expr ast.Expr, roots map[string]bool, locals map[string][]pPath) []
 		}
 		// A CALL WHOSE CALLEE IS NOT ITSELF A PATH IS A FUNCTION OF ITS ARGUMENT, and where
 		// there is exactly one argument the value it answers is a value of that argument
-		// alone: string(key), slices.Clone(key), and the octets accessor every field of
-		// joinCachedProposals reaches its two entries through. WITHOUT THIS the commit
-		// door's central join contributes nothing at all -- the join reads both of its
-		// entries through a closure held in a table, so both sides of its
-		// subtle.ConstantTimeCompare are values the path language cannot spell.
+		// alone: string(key), slices.Clone(key), proposalOctets(&entry.Proposal), and the
+		// octets accessor every field of joinCachedProposals reaches its two entries
+		// through. A refactor that put a conversion in front of a comparison would
+		// otherwise take that comparison out of the class with nothing saying so.
 		//
 		// THE CALL IS DROPPED RATHER THAN RECORDED, because a corpus walking the path has
 		// no receiver to make it on, and the claim that leaves is stated over the argument.
 		// That is the direction that asks for MORE: a == b gives f(a) == f(b) for any f, so
 		// an equal witness carries over unchanged, and the differ witness is demanded of
 		// the argument itself rather than of the function of it.
+		//
+		// IT IS NOT ENOUGH FOR joinCachedProposals AND THIS IS WHERE TO READ WHY. That join
+		// holds the entry the commit's vector NAMES against the entry the list resolved,
+		// and the first of those comes back from entryTheCommitNames -- an unexported
+		// method, which the rule below refuses to spell because the corpus makes its calls
+		// by reflection and reflection reaches exported methods only. So one side of the
+		// join stays unspellable, the pair is never formed, and the join contributes
+		// nothing here. What holds it is commit_vector_join_test.go rather than this file.
 		if len(base) == 0 {
 			if len(node.Args) == 1 {
 				return pathsOf(node.Args[0], roots, locals)
@@ -469,8 +491,9 @@ const comparisonCallHops = 3
 // ever assigned from, which is the right answer where a rule compares it -- the run took one of
 // them -- and the wrong one where it is carried into a callee, because localsIn is flat over a body
 // and two sibling loops that name their variable alike are unioned. Measured: binding a
-// multiply-resolved argument made SupportsExtension answer nine pairs, crossing every required
-// capability list against every capability vector, and six of them are comparisons no line of this
+// multiply-resolved argument made the three Supports* helpers answer a nine pair block at the
+// commit door and an eighteen pair block at the proposal door, crossing every required capability
+// list against every capability vector -- and only the diagonal of each block is a comparison this
 // package makes. A parameter the frame could have passed more than one value for is left unbound,
 // so the callee's comparison over it spells no pair rather than a cross product of them.
 func boundParametersOf(target packageFunction, receiver []pPath, call *ast.CallExpr,
@@ -752,8 +775,16 @@ func comparisonsIn(parsed parsedSource, function *ast.FuncDecl, roots map[string
 	// signature names a validation input", which is an enumeration wearing a derivation's
 	// clothes: joinCachedProposals holds the vector the sender signed against the list this
 	// member resolved over EVERY field of a CachedProposal, CheckUpdatePathKeyUniqueness is
-	// the whole body of ValSem207, and neither is in that scope -- both take the types the
-	// input carries rather than the input. Both are door logic and both contributed nothing.
+	// the whole body of ValSem207, checkProposalProfile is where a forged discriminant is
+	// refused -- all three are door logic and none of them takes a validation input.
+	//
+	// WHAT IT ACTUALLY BROUGHT IN, measured rather than hoped for: checkProposalProfile's
+	// pair at both doors, bindingHolds' two at the commit door, and one of SupportsExtension.
+	// joinCachedProposals still spells nothing, for the reason recorded on the exported
+	// method rule in pathsOf, and CheckUpdatePathKeyUniqueness writes no comparison between
+	// two paths at all -- it compares a node index taken out of a map against the leaf the
+	// signature key found. Both are IN the scope now and contribute nothing, which is a
+	// different fact from being outside it and is the one a reader can check.
 	ast.Inspect(function.Body, func(n ast.Node) bool {
 		call, isCall := n.(*ast.CallExpr)
 		if !isCall {
@@ -1192,7 +1223,7 @@ func TestEveryDoorComparisonIsReadOffThisPackagesSource(t *testing.T) {
 		t.Errorf("the walk found no pair whose two sides spread over a vector, so the positional pairing above is dead code")
 	}
 	if !readInsideAHelper {
-		t.Errorf("every pair the walk found was written in a frame that names a validation input, so the call walk is reaching nothing and the scope of this derivation is again 'a function whose signature names an input'. joinCachedProposals, CheckUpdatePathKeyUniqueness and checkProposalProfile are all door logic and none of them is in that scope")
+		t.Errorf("every pair the walk found was written in a frame that names a validation input, so the call walk is reaching nothing and the scope of this derivation is again 'a function whose signature names an input'. checkProposalProfile refuses a forged discriminant, bindingHolds decides whether this member's cache belongs to the epoch being judged, and neither takes a validation input")
 	}
 	// AND THE CLASS IS HELD TO THE SOURCE RATHER THAN TO A NUMBER. Every claim over these pairs
 	// is stated per pair, so a walk that quietly stops finding three of them states three fewer
