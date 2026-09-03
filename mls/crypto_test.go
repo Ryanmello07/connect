@@ -3394,6 +3394,14 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		// buffer it was cut from, with every signature still verifying at the moment it was made
 		// and nothing in between to point at.
 		//
+		// FOUR IS THIS ROW'S ARRAYS AND NOT THE CLASS'S, AND A FIFTH NAME DOES NOT BELONG HERE.
+		// The extension bodies were the fifth and this row ran clean over them for a year, because
+		// what it reads is what a construction ANSWERS and a body kept in the group context is
+		// answered by nothing. The retention half is caller_arrays_test.go, which walks the
+		// argument TYPES for every route they declare storage down instead of naming arrays, so a
+		// sixth is covered on the day it is declared. Anything to be added about a NEW array of a
+		// group belongs there; what belongs here is what this row already is.
+		//
 		// What it ANSWERS is deliberately the four values that are a function of its arguments
 		// alone. A group draws two secrets and stamps a leaf Lifetime off the wall clock, so the
 		// tree hash, the epoch authenticator and everything downstream of them differ between two

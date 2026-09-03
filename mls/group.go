@@ -167,7 +167,15 @@ func (self *profile) checkCiphersuiteForCreate(suite CipherSuite) error {
 type Group struct {
 	stateLock sync.Mutex
 
-	cfg    *GroupConfig
+	// the STORE and not the *GroupConfig it came off. A config is a caller's own structure and
+	// the caller goes on holding it -- to found a second group, or to write a fresh group id into
+	// for the next one -- so a group that kept the pointer would be reading a value somebody else
+	// is still editing, and every octet reachable from that config would be storage this group
+	// and its caller share. Nothing here ever needed the rest of it: the suite, the extensions and
+	// the leaf keys are read once during creation and the store is the only field that outlives
+	// the call. TestNoConstructionOfSealedStorageRetainsItsCallersArrays is what holds this to
+	// one field.
+	store  StateStore
 	crypto CryptoProvider
 	signer SignaturePrivateKey
 	cred   Credential
@@ -269,7 +277,25 @@ func NewGroup(cfg *GroupConfig, signer SignaturePrivateKey, cred Credential) (*G
 	if err != nil {
 		return nil, err
 	}
-	extensions := append([]Extension(nil), cfg.Extensions...)
+	// the extension BODIES are copied and not the entries alone. append copies the Extension
+	// STRUCTS and leaves every ExtensionData pointing at the caller's octets, so a caller that
+	// went on writing into the buffer its policy was encoded out of would be rewriting the
+	// context this group PUBLISHES -- while the key schedule stays derived over the octets as
+	// they were, because the epoch secrets were expanded over the context at creation. That is a
+	// group whose published context and whose epoch secrets have parted company, with every
+	// signature still verifying at the moment it was made and nothing in between to point at.
+	// Nil is kept distinct from empty for cloneBytes's reason, and GroupContext.Clone copies the
+	// bodies the same way for the same reason one epoch later.
+	var extensions []Extension
+	if cfg.Extensions != nil {
+		extensions = make([]Extension, 0, len(cfg.Extensions))
+		for _, extension := range cfg.Extensions {
+			extensions = append(extensions, Extension{
+				ExtensionType: extension.ExtensionType,
+				ExtensionData: cloneBytes(extension.ExtensionData),
+			})
+		}
+	}
 	if len(cfg.RequiredCaps.ExtensionTypes) != 0 || len(cfg.RequiredCaps.ProposalTypes) != 0 ||
 		len(cfg.RequiredCaps.CredentialTypes) != 0 {
 		requiredExt, requiredErr := encodeRequiredCapabilities(&cfg.RequiredCaps)
@@ -354,10 +380,15 @@ func NewGroup(cfg *GroupConfig, signer SignaturePrivateKey, cred Credential) (*G
 	}
 
 	group := &Group{
-		cfg:         cfg,
-		crypto:      crypto,
-		signer:      signer,
-		cred:        cred,
+		store:  cfg.Store,
+		crypto: crypto,
+		// the signing key and the identity are COPIED, for NewLeafNode's reason one layer up:
+		// both are arrays the caller owns and goes on using, and this group signs with the key
+		// and names itself with the identity for the whole of its life. A group holding a view
+		// over either is a group whose signatures start failing at the moment its caller reuses
+		// its own buffer, one epoch after the mistake.
+		signer:      SignaturePrivateKey(cloneBytes(signer)),
+		cred:        Credential{CredentialType: cred.CredentialType, Identity: cloneBytes(cred.Identity)},
 		ownLeaf:     ownLeaf,
 		ownPriv:     NewTreeKEMPrivate(ownLeaf, encPriv),
 		tree:        tree,
@@ -457,10 +488,17 @@ func (self *Group) membersLocked() []Member {
 		if leaf == nil {
 			continue
 		}
+		// EVERY array of this snapshot is copied, and the two beside each other are why that is
+		// said rather than left to be read off the lines: an identity that is cloned and a
+		// signature key that is not are one struct three lines apart, and the second one is a
+		// window onto the LIVE ratchet tree. A caller handed that window writes through it into
+		// the tree this epoch's tree hash was taken over -- the same hazard OwnLeafNodeCopy
+		// answers a Clone for -- and nothing in this package would report it, because the tree
+		// goes on being self consistent with the octets it now holds.
 		member := Member{
 			LeafIndex:    leafIndex,
 			IdentityPub:  cloneBytes(leaf.Credential.Identity),
-			SignatureKey: leaf.SignatureKey,
+			SignatureKey: SignaturePublicKey(cloneBytes(leaf.SignatureKey)),
 			Role:         RoleMember,
 		}
 		if keys, keysErr := LeafKeysOf(leaf); keysErr == nil {
@@ -596,7 +634,7 @@ func (self *Group) persist() error {
 	if err != nil {
 		return err
 	}
-	return self.cfg.Store.PutGroupState(self.context.GroupId, self.context.Epoch, blob)
+	return self.store.PutGroupState(self.context.GroupId, self.context.Epoch, blob)
 }
 
 // marshalState is TASK 19's and this is the stand-in.
