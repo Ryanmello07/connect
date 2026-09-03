@@ -1313,7 +1313,7 @@ func commitRuleCases() []commitRuleCase {
 		{"CommitValidationInput.check", "ErrContentArmMismatch", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
-			armless := CachedProposal{ByValue: true,
+			armless := CachedProposal{ByValue: true, Sender: testCommitterLeaf,
 				Proposal: Proposal{ProposalType: ProposalTypeRemove}}
 			return ValidateCommit(testCommitInput(t, crypto, tree,
 				testProposalList(t, testRemoveOf(2), armless), &Commit{}))
@@ -3026,7 +3026,8 @@ func TestProposalListReadersIsEveryExportedDoorHandedAProposalList(t *testing.T)
 func testArmlessList(t *testing.T, code ProposalType) *ProposalList {
 	t.Helper()
 	innocent := testRemoveOf(1)
-	armless := CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: code}}
+	armless := CachedProposal{ByValue: true, Sender: testCommitterLeaf,
+		Proposal: Proposal{ProposalType: code}}
 	// NewProposalList and not testProposalList, because the class this fixture is driven over is
 	// the whole proposal registry and testProposalList refuses a type no view answers
 	return NewProposalList([]CachedProposal{innocent, armless})
