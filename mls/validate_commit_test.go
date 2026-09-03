@@ -2026,32 +2026,37 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 		t.Fatalf("ValidateCommit refused the commit every row below is one edit away from: %v", failure)
 	}
 
-	for _, row := range []struct {
+	// every row names the FIELD of a ProposalOrRef it makes the two disagree over, and the gate
+	// below holds those names to the struct: a fourth field added to the type with no row here
+	// would be a field of the commit's own vector that the join does not compare and nothing
+	// notices. The count is the one row that is not a field, and it is named as such.
+	rows := []struct {
 		name  string
+		field string
 		apply func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal)
 	}{
-		{"a list longer than the commit's own vector",
+		{"a list longer than the commit's own vector", "",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				in.List = testProposalList(t, held, other)
 			}},
-		{"an entry the list holds by value and the commit names by reference",
+		{"an entry the list holds by value and the commit names by reference", "Type",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				inline := held
 				inline.ByValue = true
 				in.List = testProposalList(t, inline)
 			}},
-		{"an entry the list holds by reference and the commit carries by value",
+		{"an entry the list holds by reference and the commit carries by value", "Type",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				carried := held.Proposal
 				in.Commit.Proposals = []ProposalOrRef{
 					{Type: ProposalOrRefTypeProposal, Proposal: &carried}}
 			}},
-		{"a reference the list does not name, naming a proposal this member does hold",
+		{"a reference the list does not name, naming a proposal this member does hold", "Reference",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				in.Commit.Proposals = []ProposalOrRef{
 					{Type: ProposalOrRefTypeReference, Reference: other.Ref}}
 			}},
-		{"a by-value entry of another type",
+		{"a by-value entry of another type", "Proposal",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				inline := held
 				inline.ByValue = true
@@ -2060,18 +2065,19 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 					Proposal: &Proposal{ProposalType: ProposalTypeGroupContextExtensions,
 						GroupContextExtensions: &GroupContextExtensions{}}}}
 			}},
-		{"a by-value entry carrying no proposal at all",
+		{"a by-value entry carrying no proposal at all", "Proposal",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				inline := held
 				inline.ByValue = true
 				in.List = testProposalList(t, inline)
 				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeProposal}}
 			}},
-		{"a discriminant that names neither a proposal nor a reference",
+		{"a discriminant that names neither a proposal nor a reference", "Type",
 			func(t *testing.T, in *CommitValidationInput, held CachedProposal, other CachedProposal) {
 				in.Commit.Proposals = []ProposalOrRef{{Type: ProposalOrRefTypeReserved}}
 			}},
-	} {
+	}
+	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
 			in, held, other := base(t)
 			row.apply(t, in, held, other)
@@ -2079,6 +2085,33 @@ func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testi
 				t.Fatalf("ValidateCommit over %s = %v, want errCommitProposalsNotResolved", row.name, failure)
 			}
 		})
+	}
+
+	// the field class, off the type
+	driven := map[string]bool{}
+	for _, row := range rows {
+		if row.field != "" {
+			driven[row.field] = true
+		}
+	}
+	entry := reflect.TypeOf(ProposalOrRef{})
+	if entry.NumField() == 0 {
+		t.Fatal("reflection found no field on ProposalOrRef, so the gate below read nothing")
+	}
+	onTheType := map[string]bool{}
+	for i := 0; i < entry.NumField(); i += 1 {
+		name := entry.Field(i).Name
+		onTheType[name] = true
+		if !driven[name] {
+			t.Errorf("a ProposalOrRef carries %s and no row makes the list and the vector disagree over it; a field the join does not compare is a field of the commit's own vector that a rule stated over the list is free to contradict",
+				name)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(driven)) {
+		if !onTheType[name] {
+			t.Errorf("a row claims to make the two disagree over %s and a ProposalOrRef has no such field",
+				name)
+		}
 	}
 }
 
