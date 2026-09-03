@@ -1103,6 +1103,37 @@ func TestTheCachesAccountingIsAlwaysAViewOfTheEntriesItHolds(t *testing.T) {
 		t.Errorf("every entry landed in a per-leaf row and the fixture stores an add, which applies to no existing leaf; the per-leaf column is counting something other than what applies to a leaf")
 	}
 
+	// AND THE CLASS OF ACCOUNTING FIELDS IS THE STRUCT'S, in both directions, because a gate over
+	// five names written down here is the shape that understates its class the moment a sixth
+	// column is added -- and a sixth column is exactly what the last two ceiling repairs each
+	// were. Two fields are exempt and each is exempt for a reason rather than by name: byRef IS
+	// the entries every column above is derived from, and binding names the epoch rather than
+	// counting anything.
+	entries := map[string]string{
+		"byRef":   "the entries themselves, which every column above is derived FROM",
+		"binding": "the epoch this cache belongs to, which counts nothing",
+	}
+	compared := map[string]bool{"order": true, "octets": true, "octetsPerSender": true,
+		"perSender": true, "perLeaf": true}
+	structure := reflect.TypeOf(ProposalCache{})
+	if structure.NumField() == 0 {
+		t.Fatal("reflection found no field on ProposalCache, so the class below is empty")
+	}
+	for i := 0; i < structure.NumField(); i += 1 {
+		name := structure.Field(i).Name
+		if _, exempt := entries[name]; exempt || compared[name] {
+			continue
+		}
+		t.Errorf("a ProposalCache carries %s and nothing here holds it to the entries the cache holds; a column derived from byRef and kept beside it is a second representation of one fact, and the ceiling tests read the column rather than the entries",
+			name)
+	}
+	for _, name := range slices.Sorted(maps.Keys(compared)) {
+		if _, found := structure.FieldByName(name); !found {
+			t.Errorf("this gate compares %s and a ProposalCache declares no field of that name; the comparison has outlived what it described",
+				name)
+		}
+	}
+
 	// and Rebind releases the entries and their accounting together
 	next := testResolveContext()
 	next.Epoch += 1
