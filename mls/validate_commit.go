@@ -86,6 +86,17 @@ var (
 	errNilCommitValidationInput = errors.New("mls: commit validation was handed no input, no commit, no proposal list, no tree or no group context")
 	errNilCommit                = errors.New("mls: commit validation has no commit to judge")
 
+	// the JOIN between the two fields that are both the commit's proposals. RFC 9420 section
+	// 12.4 states its rules over commit.proposals -- the ProposalOrRef vector -- and every rule
+	// of this file that is about the proposals reads List, which is that vector RESOLVED. Two
+	// fields for one thing is two commits unless something says they are the same commit, and
+	// nothing did: a commit carrying Proposals nil and Path nil, which is the exact input
+	// section 12.4's empty clause asserts against, was accepted whenever the caller handed over
+	// a non-empty List. Its own value because it is the caller's mistake and not the sender's:
+	// the two fields disagreeing is a commit path bug in this process, while every other value
+	// of this file is a peer's commit being refused.
+	errCommitProposalsNotResolved = errors.New("mls: the proposal list handed to commit validation is not the resolution of the commit's own proposal vector")
+
 	// ValSem201: the path is populated when section 12.4's rule requires one. Its own value and
 	// not errPathLength's, because a commit that carries no path at all and a commit whose path
 	// is the wrong length are sent by different senders for different reasons -- the first
@@ -189,6 +200,15 @@ func (self *profile) checkGroupExtension(extensionType ExtensionType) error {
 // is stated over the committer's CURRENT leaf and ValSem202, ValSem207 and ValSem300 over the tree
 // the merge is about to happen in, and a single tree would make one of the two wrong.
 //
+// LIST IS COMMIT.PROPOSALS RESOLVED, and check enforces it rather than asking a caller to
+// believe it. A ProposalOrRef vector cannot answer section 12.4's rule on its own -- an entry
+// naming a proposal by reference carries no msg_type, so the pathRequiredTypes test is a question
+// about the RESOLUTION and not about the vector -- which is why every rule here is stated over
+// List. What that costs is that the two can disagree, and a rule decided off a field the RFC does
+// not name is a rule about a commit that was never sent. checkListResolvesTheCommitsVector is the
+// join; errCommitProposalsNotResolved is what a caller that has not resolved one into the other
+// hears.
+//
 // Pending is not in the plan's struct and is added rather than left out. CheckErrata8815 is stated
 // over the proposals this member has actually received, which is exactly what a ProposalCache
 // holds, and a commit validator that could not reach one could not state the erratum at all. A nil
@@ -234,6 +254,75 @@ func (self *CommitValidationInput) check() error {
 	}
 	if self.Context == nil {
 		return fmt.Errorf("%w: the version, the suite and the group extensions are its", ErrNilGroupContext)
+	}
+	// the list must BE a list of proposals before it can be judged as one: every rule below and
+	// every rule this file delegates to reads an arm off it. validate_proposals.go's
+	// checkProposalListStructure is that rule and is not restated here.
+	if err := checkProposalListStructure(self.List); err != nil {
+		return err
+	}
+	return self.checkListResolvesTheCommitsVector()
+}
+
+// checkListResolvesTheCommitsVector holds the two fields that are both this commit's proposals to
+// each other, so that a rule stated over either is a rule about one commit.
+//
+// SECTION 12.4 IS WRITTEN OVER commit.proposals AND THIS FILE DECIDES OVER List. The vector is
+// what the sender signed and what the transcript hash covers; the list is that vector resolved
+// against this member's cache, and it is the only one of the two that can answer a question about
+// a proposal's TYPE, because a by-reference entry carries nothing but a hash. So the rules are
+// stated over the resolution and this is what makes the resolution the commit's own: same length,
+// same order, each entry naming what the entry beside it names.
+//
+// A COUNT AND A NAMING, NOT AN IDENTITY, said as plainly as validateBucketsAgreeWithTheCommitOrder
+// says it one file over, and for that rule's reason. A by-value entry is compared by its proposal
+// TYPE and not by its octets: the type is the whole of what section 12.4's pathRequiredTypes test
+// reads, so this is exactly enough to make the decision the same over either field, and the
+// stronger comparison costs an encode of every proposal at every door on the path a commit runs.
+// What that leaves unjudged is a caller that resolved a vector into a list of the same shape
+// carrying different bodies, which is a caller assembling a value inconsistently on purpose.
+//
+// A by-REFERENCE entry is compared by its reference, which for a reference is the identity: a
+// ProposalRef is a hash over the whole framed proposal, so two entries sharing one are the same
+// proposal. The comparison is subtle.ConstantTimeCompare rather than bytes.Equal, which is this
+// package's rule over every comparison of data it ships and is derived rather than listed.
+func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
+	vector := self.Commit.Proposals
+	if len(vector) != len(self.List.All) {
+		return fmt.Errorf("%w: the commit names %d proposals and the list holds %d",
+			errCommitProposalsNotResolved, len(vector), len(self.List.All))
+	}
+	for i := range vector {
+		cached := &self.List.All[i]
+		switch vector[i].Type {
+		case ProposalOrRefTypeReference:
+			if cached.ByValue {
+				return fmt.Errorf("%w: entry %d is named by reference and the list holds it by value",
+					errCommitProposalsNotResolved, i)
+			}
+			if subtle.ConstantTimeCompare(cached.Ref, vector[i].Reference) != 1 {
+				return fmt.Errorf("%w: entry %d names %x and the list holds %x",
+					errCommitProposalsNotResolved, i, vector[i].Reference, cached.Ref)
+			}
+		case ProposalOrRefTypeProposal:
+			if !cached.ByValue {
+				return fmt.Errorf("%w: entry %d is carried by value and the list holds it by reference",
+					errCommitProposalsNotResolved, i)
+			}
+			if vector[i].Proposal == nil {
+				return fmt.Errorf("%w: entry %d is carried by value and carries no proposal",
+					errCommitProposalsNotResolved, i)
+			}
+			if vector[i].Proposal.ProposalType != cached.Proposal.ProposalType {
+				return fmt.Errorf("%w: entry %d carries a %s and the list holds a %s",
+					errCommitProposalsNotResolved, i,
+					proposalTypeName(vector[i].Proposal.ProposalType),
+					proposalTypeName(cached.Proposal.ProposalType))
+			}
+		default:
+			return fmt.Errorf("%w: entry %d carries the discriminant %d, which names neither a proposal nor a reference",
+				errCommitProposalsNotResolved, i, uint8(vector[i].Type))
+		}
 	}
 	return nil
 }
@@ -380,6 +469,14 @@ func (self *CommitValidationInput) proposalValidationInput() *ProposalValidation
 
 // ValSem201PathPresentWhenRequired: the path is populated when the proposal list is empty or
 // contains a path-required type.
+//
+// SECTION 12.4 WRITES THIS OVER commit.proposals AND THIS READS List, and the two are one field
+// because check joins them -- see checkListResolvesTheCommitsVector, which is where that is
+// enforced and not where it is asserted. It has to read List: the empty half can be asked of
+// either, but pathRequiredTypes is a question about each proposal msg_type and a by-reference
+// entry of the vector carries no type at all. A version of this rule decided off the vector alone
+// would answer "no path required" for every commit that names its removes by reference, which is
+// every commit a real group produces.
 func ValSem201PathPresentWhenRequired(in *CommitValidationInput) error {
 	if err := in.check(); err != nil {
 		return err

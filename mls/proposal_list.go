@@ -390,6 +390,15 @@ func (self *ProposalList) Extensions() ([]Extension, bool) {
 	if len(self.GCE) == 0 {
 		return nil, false
 	}
+	// a GCE entry carrying no GroupContextExtensions arm is a malformed list and every door that
+	// judges one refuses it -- checkProposalListStructure is that rule, and both validation inputs
+	// run it before any rule below reads an arm. This is an exported method with no error to answer, so
+	// what it owes is the one thing a door must not do: it does not dereference the missing arm.
+	// "No extension set this list can name" is also the fail-closed answer for the two callers,
+	// which fall back to the group's own extensions rather than to a set read off nothing.
+	if self.GCE[0].Proposal.GroupContextExtensions == nil {
+		return nil, false
+	}
 	return self.GCE[0].Proposal.GroupContextExtensions.Extensions, true
 }
 

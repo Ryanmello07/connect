@@ -76,7 +76,7 @@ func (self *ProposalValidationInput) check() error {
 	if self.Context == nil {
 		return fmt.Errorf("%w: the version, the suite and the group extensions are its", ErrNilGroupContext)
 	}
-	return nil
+	return checkProposalListStructure(self.List)
 }
 
 // effectiveExtensions is the extension list the rest of the list is judged against.
@@ -202,6 +202,59 @@ func proposalBucketsOf(list *ProposalList) []proposalBucket {
 		{field: "Removes", carries: ProposalTypeRemove, entries: list.Removes},
 		{field: "GCE", carries: ProposalTypeGroupContextExtensions, entries: list.GCE},
 	}
+}
+
+// checkProposalArms is the structural precondition EVERY rule that reads a proposal's arm is
+// written against, enforced at the door rather than stated in prose.
+//
+// IT WAS STATED IN PROSE AND ENFORCED NOWHERE. This file's header and validateCommitterIsNotRemoved's
+// both say the structural rules run before the rules that read an arm, and what made that true was
+// the ORDER INSIDE ONE AGGREGATE. Every rule of this file is an exported door of its own, and
+// validate_commit.go's rules are eleven more that never call ValidateProposalList at all, so a
+// caller reaching any of them hands a list nothing has been through: a Remove carrying no Remove
+// arm is then `in.List.Removes[i].Proposal.Remove.Removed` on a nil pointer -- a panic out of a
+// library, which takes the caller's process rather than its call and is the one answer a door of
+// this package must never give. Both check methods run this, so the precondition holds at every
+// door rather than at the two aggregates.
+//
+// TWO RULES, because there are two ways one dereference happens. The first is checkProposalProfile,
+// which is proposal_list.go's and reaches (*Proposal).checkArm as its last of four -- and it is
+// called WHOLE rather than reduced to the arm clause, because those four run in an order the gate's
+// own header argues for and a caller wants: a pre_shared_key proposal is told that this profile
+// does not implement pre_shared_key, not that its arm is missing. The second is that an entry of
+// the Removes bucket is a Remove, because a bucketed rule reads the arm the BUCKET names and not
+// the one the entry's own type names, and proposalBucketsOf is the derived class of buckets.
+//
+// The bucket rule is asked FIRST of each bucket entry. An Add sitting in the Removes bucket carries
+// an Add arm and a type this profile accepts, so it passes the profile gate and is still the
+// dereference this exists to prevent.
+//
+// It answers the values the two named rules that state these answer -- checkProposalProfile's eight
+// and ErrProposalListMisbucketed -- and no value of its own, which is
+// errors_proposal_validation.go's rule: one rule, one value, however many doors ask it.
+// ValSem113ProposalTypeSupported and validateProposalBucketsHoldTheirOwnType are therefore
+// redundant with this everywhere they run and are kept, on ValidateProposalList's own stated terms
+// -- refusing at the door is what the rest of this package does, and nothing here claims a test can
+// tell which of the two guards fired.
+func checkProposalListStructure(list *ProposalList) error {
+	active := defaultProfile()
+	for i := range list.All {
+		if err := checkProposalProfile(active, &list.All[i].Proposal); err != nil {
+			return fmt.Errorf("%w: at proposal %d of the commit order", err, i)
+		}
+	}
+	for _, bucket := range proposalBucketsOf(list) {
+		for i := range bucket.entries {
+			if got := bucket.entries[i].Proposal.ProposalType; got != bucket.carries {
+				return fmt.Errorf("%w: %s[%d] is a %s", ErrProposalListMisbucketed,
+					bucket.field, i, proposalTypeName(got))
+			}
+			if err := checkProposalProfile(active, &bucket.entries[i].Proposal); err != nil {
+				return fmt.Errorf("%w: at %s[%d]", err, bucket.field, i)
+			}
+		}
+	}
+	return nil
 }
 
 // ValSem113ProposalTypeSupported: every proposal in the list is one this group can process.

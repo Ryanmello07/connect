@@ -17,11 +17,14 @@
 package mls
 
 import (
+	"crypto/subtle"
 	"errors"
 	"go/ast"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -39,6 +42,7 @@ const commitValidationFile = "validate_commit.go"
 var commitValidationOwnedErrors = map[string]error{
 	"errNilCommitValidationInput":   errNilCommitValidationInput,
 	"errNilCommit":                  errNilCommit,
+	"errCommitProposalsNotResolved": errCommitProposalsNotResolved,
 	"errMissingPath":                errMissingPath,
 	"errPathLeafKeyUnchanged":       errPathLeafKeyUnchanged,
 	"errBadConfirmationTag":         errBadConfirmationTag,
@@ -48,27 +52,67 @@ var commitValidationOwnedErrors = map[string]error{
 	"errUnregisteredGroupExtension": errUnregisteredGroupExtension,
 }
 
-// commitValidationBorrowedErrors is every sentinel a rule of validate_commit.go answers that some
-// other file declares.
+// commitValidationBorrowedErrors is every sentinel a rule of validate_commit.go can answer that
+// some other file declares.
 //
-// It is written down because the exclusivity sweep has to run over the WHOLE class a commit
-// refusal can come from, and half of that class is deliberately not this file's: ValSem200
-// delegates to section 12.2's body, ValSem207 to the tree's walk, CheckErrata8815 to the cache's
-// value. A sweep bounded to one file's declarations would report clean over exactly the rules this
-// file was careful not to give values of their own.
+// It is here because the exclusivity sweep has to run over the WHOLE class a commit refusal can
+// come from, and half of that class is deliberately not this file's: ValSem200 delegates to
+// section 12.2's body, ValSem207 to the tree's walk, CheckErrata8815 to the cache's value, and
+// ValSem202 wraps whatever the tree math answered. A sweep bounded to one file's declarations
+// would report clean over exactly the rules this file was careful not to give values of their own.
+//
+// IT WAS A LIST OF TWELVE NAMES HELD BY NOTHING, which is rule 5 inside the gate written to
+// enforce rule 5. It understated the class by more than half -- ErrMalformedExtension,
+// ErrTreeMalformed, ErrNodeTypeMismatch, ErrNilCryptoProvider, errNilProposalList,
+// errNilRatchetTree, ErrNilGroupContext and errNilUpdatePath were all reachable and all outside
+// every sweep, and ValSem205's nil-provider refusal rewritten to answer ErrTreeMalformed left the
+// whole suite green. The class is now DERIVED by
+// TestCommitValidationBorrowedErrorsIsEveryErrorItsRulesCanReach, which walks this package's own
+// call graph out of validate_commit.go's declarations, and this map is held to it in BOTH
+// directions. What the map is FOR is the one thing a source scan cannot do: Go has no reflection
+// over package level variables, so the name a derivation produces has to be bound to the value a
+// sweep compares with somewhere, and here it is, failing the moment the two disagree.
 var commitValidationBorrowedErrors = map[string]error{
-	"ErrRemoveCommitter":                ErrRemoveCommitter,
+	"ErrContentArmMismatch":             ErrContentArmMismatch,
+	"ErrLeafCountNotFull":               ErrLeafCountNotFull,
+	"ErrLeafCountRange":                 ErrLeafCountRange,
+	"ErrLeafHasNoChildren":              ErrLeafHasNoChildren,
+	"ErrLeafIndexOutOfRange":            ErrLeafIndexOutOfRange,
 	"ErrLeafNodeSourceMismatch":         ErrLeafNodeSourceMismatch,
-	"errPathLength":                     errPathLength,
-	"errPathDecrypt":                    errPathDecrypt,
-	"errMissingConfirmationTag":         errMissingConfirmationTag,
+	"ErrLeafOutOfRange":                 ErrLeafOutOfRange,
+	"ErrMalformedExtension":             ErrMalformedExtension,
+	"ErrNilCryptoProvider":              ErrNilCryptoProvider,
+	"ErrNilGroupContext":                ErrNilGroupContext,
+	"ErrNodeIsParent":                   ErrNodeIsParent,
+	"ErrNodeOutOfRange":                 ErrNodeOutOfRange,
+	"ErrNodeTypeMismatch":               ErrNodeTypeMismatch,
+	"ErrProposalListMisbucketed":        ErrProposalListMisbucketed,
+	"ErrRatchetExhausted":               ErrRatchetExhausted,
+	"ErrRemoveCommitter":                ErrRemoveCommitter,
+	"ErrRootHasNoParent":                ErrRootHasNoParent,
+	"ErrRootHasNoSibling":               ErrRootHasNoSibling,
+	"ErrTreeMalformed":                  ErrTreeMalformed,
+	"ErrUnknownProposalOrRefType":       ErrUnknownProposalOrRefType,
 	"errDuplicateEncryptionKey":         errDuplicateEncryptionKey,
-	"errMultipleGroupContextExtensions": errMultipleGroupContextExtensions,
+	"errForgedProposalDiscriminant":     errForgedProposalDiscriminant,
 	"errGroupContextExtensionNotListed": errGroupContextExtensionNotListed,
+	"errMissingConfirmationTag":         errMissingConfirmationTag,
 	"errMissingRequiredCapability":      errMissingRequiredCapability,
-	"errTrailingBlankNodes":             errTrailingBlankNodes,
-	"errProposalNotCached":              errProposalNotCached,
+	"errMultipleGroupContextExtensions": errMultipleGroupContextExtensions,
+	"errNilProposal":                    errNilProposal,
+	"errNilProposalList":                errNilProposalList,
+	"errNilProposalValidationInput":     errNilProposalValidationInput,
+	"errNilRatchetTree":                 errNilRatchetTree,
+	"errNilUpdatePath":                  errNilUpdatePath,
+	"errPathDecrypt":                    errPathDecrypt,
+	"errPathLength":                     errPathLength,
 	"errProfileExternalCommit":          errProfileExternalCommit,
+	"errProfilePsk":                     errProfilePsk,
+	"errProfileReInit":                  errProfileReInit,
+	"errProposalNotCached":              errProposalNotCached,
+	"errReservedProposalType":           errReservedProposalType,
+	"errTrailingBlankNodes":             errTrailingBlankNodes,
+	"errUnregisteredProposalType":       errUnregisteredProposalType,
 }
 
 // commitValidationSanctionedWraps is the one place a refusal of this class answers a SECOND member
@@ -80,6 +124,10 @@ var commitValidationBorrowedErrors = map[string]error{
 // a second wrap has to be argued for here before the sweep will pass over it.
 var commitValidationSanctionedWraps = map[string]string{
 	"errGroupContextExtensionNotListed": "errMissingRequiredCapability",
+	// tree_errors.go declares ErrLeafIndexOutOfRange as a wrap of ErrLeafOutOfRange -- the index
+	// rule is the range rule with the offending index named -- and the derived roster now reaches
+	// both of them, through the filtered direct path ValSem202 and ValSem203 read.
+	"ErrLeafIndexOutOfRange": "ErrLeafOutOfRange",
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +145,15 @@ func testCommitInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 	list *ProposalList, commit *Commit) *CommitValidationInput {
 
 	t.Helper()
+	// the commit's own ProposalOrRef vector IS the list, which is what
+	// (*CommitValidationInput).check joins and what section 12.4's rule is written over. A fixture
+	// that left the vector empty beside a non-empty list would be a commit no sender could have
+	// produced -- and that pair is exactly what made ValSem201 decidable off a field the RFC does
+	// not name, so it is built here rather than left to each test to remember. A test that means
+	// to drive the join fills Proposals itself and this leaves it alone.
+	if commit != nil && commit.Proposals == nil && list != nil {
+		commit.Proposals = list.Refs()
+	}
 	return &CommitValidationInput{
 		Crypto:  crypto,
 		PreTree: tree,
@@ -110,6 +167,50 @@ func testCommitInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 		Commit:    commit,
 		Now:       time.Now(),
 	}
+}
+
+// testCommitProposals sets the list and the commit's own vector from one set of entries, so a
+// fixture cannot make them disagree by accident.
+func testCommitProposals(t *testing.T, in *CommitValidationInput, entries ...CachedProposal) {
+	t.Helper()
+	in.List = testProposalList(t, entries...)
+	in.Commit.Proposals = in.List.Refs()
+}
+
+// testFitCommitPath rebuilds the commit's update path to the length of the committer's filtered
+// direct path IN THE POST TREE, carrying the committer's own signature key.
+//
+// The POST tree, because that is the tree ValSem202 is stated over, and every row below that edits
+// the post tree has to re-fit the path afterwards or be refused by the length rule for a reason
+// that is not the rule it is about.
+func testFitCommitPath(t *testing.T, crypto CryptoProvider, in *CommitValidationInput, m *testMember) {
+	t.Helper()
+	filtered, err := in.PostTree.FilteredDirectPath(in.Committer)
+	if err != nil {
+		t.Fatalf("FilteredDirectPath(%d) over the post tree: %v", in.Committer, err)
+	}
+	path := testCommitPath(t, crypto, m, len(filtered))
+	current := in.PreTree.Leaf(in.Committer)
+	if current == nil {
+		t.Fatalf("leaf %d of the pre tree is blank, so the fixture has no committer", in.Committer)
+	}
+	// the committer's own signature key, so CheckUpdatePathKeyUniqueness exempts the position the
+	// path is replacing rather than reporting the commit as a duplicate
+	path.LeafNode.SignatureKey = current.SignatureKey
+	in.Commit.Path = path
+}
+
+// testFullCommitInput is the input every aggregate row starts from: a four member group, a commit
+// from leaf 0 carrying no proposals and a full path, which ValidateCommit accepts.
+//
+// Four members and not two, because a two member group's filtered direct path is one node long and
+// half the rules below need an offender that is not at element zero.
+func testFullCommitInput(t *testing.T, crypto CryptoProvider) (*CommitValidationInput, []*testMember) {
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	testFitCommitPath(t, crypto, in, members[0])
+	return in, members
 }
 
 // testCommitPathLeaf is a leaf in the shape an UpdatePath publishes: commit source, a parent hash,
@@ -878,12 +979,162 @@ func TestCommitValidationOwnedErrorsIsEveryErrorItsFileDeclares(t *testing.T) {
 }
 
 // commitRefusalRoster is the whole class a commit refusal can come from: this file's sentinels and
-// the ones its rules deliberately borrow.
+// the ones its rules can reach through the bodies they delegate to.
 func commitRefusalRoster() map[string]error {
 	roster := map[string]error{}
 	maps.Copy(roster, commitValidationOwnedErrors)
 	maps.Copy(roster, commitValidationBorrowedErrors)
 	return roster
+}
+
+// commitRefusalClosure is every package level sentinel a rule of validate_commit.go can answer,
+// derived by walking this package's own call graph from that file's declarations.
+//
+// WHY A CLOSURE AND NOT A SCAN OF ONE FILE. Half the refusals a commit rule answers are not
+// written in the file that states the rule and that is deliberate -- ValSem200 delegates to
+// section 12.2's body and answers ErrRemoveCommitter, a name validate_commit.go mentions only in a
+// comment; ValSem209 reaches errMissingRequiredCapability through Capabilities.Supports and
+// ErrMalformedExtension through requiredCapabilitiesOf; ValSem202 wraps whatever the tree math
+// answered with %w. A derivation that read one file's identifiers would find the twelve easy ones
+// and miss exactly the delegated half, which is the half the roster was already missing.
+//
+// THE EDGES. A declaration reaches another when it MENTIONS it and that other is either a function
+// answering an error or a package level value. The mention half is packageLevelMentionsIn, which
+// counts data as well as code, and both halves of the target rule are load bearing: the profile
+// gates are MAPS from a code point to the refusal it earns, so checkProposalType's eight answers
+// and checkGroupExtension's three are named by a table and by no statement at all, and a walk that
+// followed only functions would lose every one of them. What is left out is a mention of a type or
+// of a field, which cannot carry a refusal anywhere.
+//
+// IT OVER-REACHES AND THAT IS THE SAFE DIRECTION, said plainly. A mention is resolved by BARE
+// NAME, because Go's method sets are not recoverable from an unresolved AST -- so a rule that
+// mentions Update reaches TranscriptHashes.Update, and a handful of tree math sentinels ride in
+// behind FilteredDirectPath that no commit fixture will ever produce. A sentinel in the roster
+// that no rule can answer costs one pairwise comparison; a sentinel missing from it is a rule no
+// sweep in this file runs over, which is the defect this replaced.
+func commitRefusalClosure(t *testing.T) map[string]bool {
+	t.Helper()
+	mentions := map[string]map[string]bool{}
+	sentinels := map[string]bool{}
+	answersAnError := map[string]bool{}
+	isATable := map[string]bool{}
+	byBareName := map[string][]string{}
+	read := 0
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		read += 1
+		source := mustParseSource(t, path)
+		packageLevelMentionsIn(source, mentions)
+		for _, declaration := range source.file.Decls {
+			switch typed := declaration.(type) {
+			case *ast.FuncDecl:
+				name := typed.Name.Name
+				if typed.Recv != nil && len(typed.Recv.List) == 1 {
+					name = receiverTypeName(typed.Recv.List[0].Type) + "." + name
+				}
+				byBareName[typed.Name.Name] = append(byBareName[typed.Name.Name], name)
+				if typed.Type.Results == nil {
+					continue
+				}
+				for _, result := range typed.Type.Results.List {
+					if source.render(result.Type) == "error" {
+						answersAnError[name] = true
+					}
+				}
+			case *ast.GenDecl:
+				for _, spec := range typed.Specs {
+					value, isValue := spec.(*ast.ValueSpec)
+					if !isValue {
+						continue
+					}
+					for _, ident := range value.Names {
+						byBareName[ident.Name] = append(byBareName[ident.Name], ident.Name)
+						isATable[ident.Name] = true
+						if strings.HasPrefix(ident.Name, "err") || strings.HasPrefix(ident.Name, "Err") {
+							sentinels[ident.Name] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if read < 2 || len(sentinels) == 0 {
+		t.Fatalf("the scan read %d non test files and found %d sentinels, so the closure below walked nothing",
+			read, len(sentinels))
+	}
+	roots := map[string]map[string]bool{}
+	packageLevelMentionsIn(mustParseSource(t, commitValidationFile), roots)
+	if len(roots) == 0 {
+		t.Fatalf("%s declares nothing, so the closure has no root", commitValidationFile)
+	}
+	queue := slices.Sorted(maps.Keys(roots))
+	walked := map[string]bool{}
+	reached := map[string]bool{}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if walked[name] {
+			continue
+		}
+		walked[name] = true
+		for ident := range mentions[name] {
+			if sentinels[ident] {
+				reached[ident] = true
+				continue
+			}
+			for _, qualified := range byBareName[ident] {
+				if (answersAnError[qualified] || isATable[qualified]) && !walked[qualified] {
+					queue = append(queue, qualified)
+				}
+			}
+		}
+	}
+	// the two controls. errMissingPath is named in the file itself, so a walk that resolved
+	// nothing still finds it; ErrRemoveCommitter is named NOWHERE in that file except a comment
+	// and is reachable only through the body ValSem200 delegates to, so it is the one that says
+	// the graph was walked rather than the file scanned.
+	if !reached["errMissingPath"] || !reached["ErrRemoveCommitter"] {
+		t.Fatalf("the closure reached errMissingPath=%v and ErrRemoveCommitter=%v; both are answerable by a rule of %s and the second is answerable only through a delegation, so a walk missing it read the file rather than the graph",
+			reached["errMissingPath"], reached["ErrRemoveCommitter"], commitValidationFile)
+	}
+	// and the control on the other side: a closure that reached every sentinel this package
+	// declares is a walk with no edges rather than a class
+	if len(reached) >= len(sentinels) {
+		t.Fatalf("the closure reached %d of this package's %d sentinels, which is all of them; a class with no outside is not a class",
+			len(reached), len(sentinels))
+	}
+	return reached
+}
+
+// TestCommitValidationBorrowedErrorsIsEveryErrorItsRulesCanReach holds the borrowed half of the
+// roster to the derived class in both directions.
+//
+// This is the gate the borrowed half never had. It was twelve names held by nothing while the
+// rules could reach thirty four, and the eight the reviewer happened to name -- ErrMalformedExtension,
+// ErrTreeMalformed, ErrNodeTypeMismatch, ErrNilCryptoProvider, errNilProposalList, errNilRatchetTree,
+// ErrNilGroupContext, errNilUpdatePath -- were every one of them outside both exclusivity sweeps.
+func TestCommitValidationBorrowedErrorsIsEveryErrorItsRulesCanReach(t *testing.T) {
+	reached := commitRefusalClosure(t)
+	borrowed := []string{}
+	for _, name := range slices.Sorted(maps.Keys(reached)) {
+		if _, owned := commitValidationOwnedErrors[name]; owned {
+			continue
+		}
+		borrowed = append(borrowed, name)
+	}
+	if got, want := slices.Sorted(maps.Keys(commitValidationBorrowedErrors)), borrowed; !slices.Equal(got, want) {
+		t.Fatalf("the rules of %s can reach %v and commitValidationBorrowedErrors holds %v; every sweep in this file runs over the second, so a name missing from it is a value no rule here is held against and a name that is only in it is a sweep over a refusal nothing can produce",
+			commitValidationFile, want, got)
+	}
+	// and every owned name is inside the closure too, or the file declares a value nothing it
+	// states can answer
+	for _, name := range slices.Sorted(maps.Keys(commitValidationOwnedErrors)) {
+		if !reached[name] {
+			t.Errorf("%s declares %s and no rule of it can answer that value", commitValidationFile, name)
+		}
+	}
 }
 
 // TestEveryCommitValidationRefusalIsDistinctFromEveryOther holds the roster pairwise apart.
@@ -932,50 +1183,110 @@ func TestEveryCommitValidationRefusalIsDistinctFromEveryOther(t *testing.T) {
 	}
 }
 
-// commitRuleCase is one rule, the input that makes it refuse, and the sentinel it owes.
+// commitRuleCase is one refusal a rule of validate_commit.go can answer, the input that produces
+// it, and the sentinel it owes.
+//
+// A SLICE AND NOT A MAP KEYED BY RULE, because a rule answers more than one value and a map keyed
+// by rule admits exactly one row for each. That is how ValSem205's missing provider, ValSem205's
+// absent tag, ValSem204's non-member committer, three of ValSem209's four profile refusals,
+// ValSem300's missing tree, CheckErrata8745's missing context and every value the argument rule
+// answers came to be outside this sweep -- and it is why ValSem205's nil-provider refusal could be
+// rewritten to report a MALFORMED TREE with the whole suite green. A rule with one row is a rule
+// whose other refusals are asserted by nothing.
 type commitRuleCase struct {
+	rule     string
 	sentinel string
 	run      func(t *testing.T) error
 }
 
-// commitRuleCases is one row per rule this file states, each building the input that produces that
-// rule's refusal.
+// commitRuleCases is one row per refusal this file's rules can answer, each building the input
+// that produces exactly that refusal.
 //
 // This is the table ledger 17 asks for -- every code owes a test that names it -- and it is also
 // the exclusivity sweep: TestEachCommitRuleAnswersOnlyItsOwnSentinel runs each row and requires
 // every other member of the roster not to answer.
-func commitRuleCases() map[string]commitRuleCase {
-	return map[string]commitRuleCase{
-		"ValSem200NoSelfRemove": {sentinel: "ErrRemoveCommitter", run: func(t *testing.T) error {
+func commitRuleCases() []commitRuleCase {
+	return []commitRuleCase{
+		// the argument rule at the door, which is five conditions with five values plus the join
+		// and the structural precondition. Driven through ValidateCommit rather than through
+		// check, because check is not a door a caller can reach.
+		{"CommitValidationInput.check", "errNilCommitValidationInput", func(t *testing.T) error {
+			return ValidateCommit(nil)
+		}},
+		{"CommitValidationInput.check", "errNilCommit", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			in.Commit = nil
+			return ValidateCommit(in)
+		}},
+		{"CommitValidationInput.check", "errNilProposalList", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			in.List = nil
+			return ValidateCommit(in)
+		}},
+		{"CommitValidationInput.check", "errNilRatchetTree", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			in.PostTree = nil
+			return ValidateCommit(in)
+		}},
+		{"CommitValidationInput.check", "ErrNilGroupContext", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			in.Context = nil
+			return ValidateCommit(in)
+		}},
+		// the join, over the exact input RFC 9420 section 12.4's empty clause asserts against: a
+		// commit naming no proposals and carrying no path. It was ACCEPTED, because the rule was
+		// decided off a list the commit did not name.
+		{"CommitValidationInput.check", "errCommitProposalsNotResolved", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob")
+			kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
+			list := testProposalList(t, testAddOf(kp))
+			return ValidateCommit(testCommitInput(t, crypto, tree, list,
+				&Commit{Proposals: []ProposalOrRef{}}))
+		}},
+		// the structural precondition, with the armless proposal behind an innocent one
+		{"CommitValidationInput.check", "ErrContentArmMismatch", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
-			list := testProposalList(t,
-				CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeRemove,
-					Remove: &Remove{Removed: 2}}},
-				CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeRemove,
-					Remove: &Remove{Removed: 0}}})
+			armless := CachedProposal{ByValue: true,
+				Proposal: Proposal{ProposalType: ProposalTypeRemove}}
+			return ValidateCommit(testCommitInput(t, crypto, tree,
+				testProposalList(t, testRemoveOf(2), armless), &Commit{}))
+		}},
+		{"ValSem200NoSelfRemove", "ErrRemoveCommitter", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+			list := testProposalList(t, testRemoveOf(2), testRemoveOf(0))
 			return ValSem200NoSelfRemove(testCommitInput(t, crypto, tree, list, &Commit{}))
 		}},
-		"ValSem201PathPresentWhenRequired": {sentinel: "errMissingPath", run: func(t *testing.T) error {
+		{"ValSem201PathPresentWhenRequired", "errMissingPath", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice", "bob")
 			return ValSem201PathPresentWhenRequired(
 				testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{}))
 		}},
-		"ValSem202PathLength": {sentinel: "errPathLength", run: func(t *testing.T) error {
+		{"ValSem202PathLength", "errPathLength", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
 			return ValSem202PathLength(testCommitInput(t, crypto, tree, &ProposalList{},
 				&Commit{Path: testCommitPath(t, crypto, members[0], 1)}))
 		}},
-		"validateCommitPathLeafSource": {sentinel: "ErrLeafNodeSourceMismatch", run: func(t *testing.T) error {
+		{"validateCommitPathLeafSource", "ErrLeafNodeSourceMismatch", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, members := testTreeWith(t, crypto, "alice", "bob")
 			leaf, _ := testLeafNode(t, crypto, members[0])
 			return validateCommitPathLeafSource(testCommitInput(t, crypto, tree, &ProposalList{},
 				&Commit{Path: &UpdatePath{LeafNode: *leaf}}))
 		}},
-		"ValSem203PathDecrypt": {sentinel: "errPathDecrypt", run: func(t *testing.T) error {
+		{"ValSem203PathDecrypt", "errPathDecrypt", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
 			path := testCommitPath(t, crypto, members[0], 2)
@@ -983,7 +1294,7 @@ func commitRuleCases() map[string]commitRuleCase {
 			return ValSem203PathDecrypt(testCommitInput(t, crypto, tree, &ProposalList{},
 				&Commit{Path: path}))
 		}},
-		"ValSem204PathKeyMismatch": {sentinel: "errPathLeafKeyUnchanged", run: func(t *testing.T) error {
+		{"ValSem204PathKeyMismatch", "errPathLeafKeyUnchanged", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, members := testTreeWith(t, crypto, "alice", "bob")
 			leaf := testCommitPathLeaf(t, crypto, members[0])
@@ -991,7 +1302,33 @@ func commitRuleCases() map[string]commitRuleCase {
 			return ValSem204PathKeyMismatch(testCommitInput(t, crypto, tree, &ProposalList{},
 				&Commit{Path: &UpdatePath{LeafNode: *leaf}}))
 		}},
-		"ValSem205ConfirmationTag": {sentinel: "errBadConfirmationTag", run: func(t *testing.T) error {
+		// ValSem204's precondition, which is a second value of the same rule and had no row
+		{"ValSem204PathKeyMismatch", "errCommitterNotMember", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, members := testTreeWith(t, crypto, "alice", "bob")
+			in := testCommitInput(t, crypto, tree, &ProposalList{},
+				&Commit{Path: &UpdatePath{LeafNode: *testCommitPathLeaf(t, crypto, members[0])}})
+			in.Committer = LeafIndex(41)
+			return ValSem204PathKeyMismatch(in)
+		}},
+		// the refusal the reviewer's mutation rewrote: a rule about a missing provider reporting
+		// a malformed tree was invisible to every sweep this file ran
+		{"ValSem205ConfirmationTag", "ErrNilCryptoProvider", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			in.Crypto = nil
+			return ValSem205ConfirmationTag(in)
+		}},
+		{"ValSem205ConfirmationTag", "errMissingConfirmationTag", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice")
+			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+			in.ConfirmationKey = make([]byte, crypto.HashSize())
+			in.ConfirmedHash = []byte("confirmed")
+			return ValSem205ConfirmationTag(in)
+		}},
+		{"ValSem205ConfirmationTag", "errBadConfirmationTag", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice")
 			in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
@@ -1000,22 +1337,18 @@ func commitRuleCases() map[string]commitRuleCase {
 			in.ConfirmationTag = []byte("not the tag")
 			return ValSem205ConfirmationTag(in)
 		}},
-		"ValSem206PathLeafEncryptionKeyUnique": {sentinel: "errDuplicateEncryptionKey", run: func(t *testing.T) error {
+		{"ValSem206PathLeafEncryptionKeyUnique", "errDuplicateEncryptionKey", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, members := testTreeWith(t, crypto, "alice", "bob")
 			innocent, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
 			colliding, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "frank"))
-			list := testProposalList(t,
-				CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeAdd,
-					Add: &Add{KeyPackage: *innocent}}},
-				CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: ProposalTypeAdd,
-					Add: &Add{KeyPackage: *colliding}}})
+			list := testProposalList(t, testAddOf(innocent), testAddOf(colliding))
 			leaf := testCommitPathLeaf(t, crypto, members[0])
 			leaf.EncryptionKey = colliding.LeafNode.EncryptionKey
 			return ValSem206PathLeafEncryptionKeyUnique(testCommitInput(t, crypto, tree, list,
 				&Commit{Path: &UpdatePath{LeafNode: *leaf}}))
 		}},
-		"ValSem207PathEncryptionKeysUnique": {sentinel: "errDuplicateEncryptionKey", run: func(t *testing.T) error {
+		{"ValSem207PathEncryptionKeysUnique", "errDuplicateEncryptionKey", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
 			path := testCommitPath(t, crypto, testIdentity(t, crypto, "mallory"), 2)
@@ -1023,22 +1356,48 @@ func commitRuleCases() map[string]commitRuleCase {
 			return ValSem207PathEncryptionKeysUnique(testCommitInput(t, crypto, tree,
 				&ProposalList{}, &Commit{Path: path}))
 		}},
-		"ValSem208SingleGroupContextExtensions": {sentinel: "errMultipleGroupContextExtensions", run: func(t *testing.T) error {
+		{"ValSem208SingleGroupContextExtensions", "errMultipleGroupContextExtensions", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice")
 			one := testGceOf()
 			return ValSem208SingleGroupContextExtensions(
 				testCommitInput(t, crypto, tree, testProposalList(t, one, one), &Commit{}))
 		}},
-		"ValSem209GroupExtensionsSupported": {sentinel: "errProfileExternalSender", run: func(t *testing.T) error {
+		// ValSem209's four refusals, each with the offending entry at index 1. Three of the four
+		// had no row at all: the profile half of the rule was asserted by the one sentinel that
+		// happened to be first in the table.
+		{"ValSem209GroupExtensionsSupported", "errProfileExternalSender", func(t *testing.T) error {
+			return testValSem209Refusal(t, Extension{ExtensionType: ExtensionTypeExternalSenders})
+		}},
+		{"ValSem209GroupExtensionsSupported", "errProfileGroupExtension", func(t *testing.T) error {
+			return testValSem209Refusal(t, Extension{ExtensionType: ExtensionTypeUrmessageLeafKeys})
+		}},
+		{"ValSem209GroupExtensionsSupported", "errUnregisteredGroupExtension", func(t *testing.T) error {
+			return testValSem209Refusal(t, Extension{ExtensionType: ExtensionType(0xABCD)})
+		}},
+		{"ValSem209GroupExtensionsSupported", "errProfileExternalCommit", func(t *testing.T) error {
+			return testValSem209Refusal(t, Extension{ExtensionType: ExtensionTypeExternalPub})
+		}},
+		// and the two member clauses, which are section 13.4's and section 7.3's and are two
+		// values because they are two rules
+		{"ValSem209GroupExtensionsSupported", "errGroupContextExtensionNotListed", func(t *testing.T) error {
 			crypto := testCrypto(t)
-			tree, _ := testTreeWith(t, crypto, "alice")
+			tree, _ := testTreeWith(t, crypto, "alice", "bob")
+			testNarrowLeafCapabilities(t, tree, LeafIndex(1))
 			list := testProposalList(t, testGceOf(
-				Extension{ExtensionType: ExtensionTypeRatchetTree},
-				Extension{ExtensionType: ExtensionTypeExternalSenders}))
+				Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+				Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}))
 			return ValSem209GroupExtensionsSupported(testCommitInput(t, crypto, tree, list, &Commit{}))
 		}},
-		"ValSem300NoTrailingBlankNodes": {sentinel: "errTrailingBlankNodes", run: func(t *testing.T) error {
+		{"ValSem209GroupExtensionsSupported", "errMissingRequiredCapability", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			tree, _ := testTreeWith(t, crypto, "alice", "bob")
+			testNarrowLeafCapabilities(t, tree, LeafIndex(1))
+			list := testProposalList(t, testGceOf(
+				testRequiredCapabilitiesNaming(t, ExtensionTypeUrmessageOwnerSuccessor)))
+			return ValSem209GroupExtensionsSupported(testCommitInput(t, crypto, tree, list, &Commit{}))
+		}},
+		{"ValSem300NoTrailingBlankNodes", "errTrailingBlankNodes", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			tree, _ := testTreeWith(t, crypto, "alice", "bob")
 			padded := tree.Clone()
@@ -1047,7 +1406,10 @@ func commitRuleCases() map[string]commitRuleCase {
 			}
 			return ValSem300NoTrailingBlankNodes(padded)
 		}},
-		"CheckErrata8745": {sentinel: "errGroupContextExtensionNotListed", run: func(t *testing.T) error {
+		{"ValSem300NoTrailingBlankNodes", "ErrTreeMalformed", func(t *testing.T) error {
+			return ValSem300NoTrailingBlankNodes(nil)
+		}},
+		{"CheckErrata8745", "errGroupContextExtensionNotListed", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			leaf := testCommitPathLeaf(t, crypto, testIdentity(t, crypto, "alice"))
 			leaf.Capabilities = testNarrowedCapabilities()
@@ -1058,7 +1420,12 @@ func commitRuleCases() map[string]commitRuleCase {
 					{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor},
 				}})
 		}},
-		"CheckErrata8815": {sentinel: "errProposalNotCached", run: func(t *testing.T) error {
+		{"CheckErrata8745", "ErrNilGroupContext", func(t *testing.T) error {
+			crypto := testCrypto(t)
+			leaf := testCommitPathLeaf(t, crypto, testIdentity(t, crypto, "alice"))
+			return CheckErrata8745(&UpdatePath{LeafNode: *leaf}, nil)
+		}},
+		{"CheckErrata8815", "errProposalNotCached", func(t *testing.T) error {
 			crypto := testCrypto(t)
 			cache := testCacheAt(t, testResolveContext())
 			ref, failure := cache.Store(crypto, testResolveContext(),
@@ -1076,72 +1443,141 @@ func commitRuleCases() map[string]commitRuleCase {
 	}
 }
 
+// testValSem209Refusal drives ValSem209's profile half over one extension type, with the offending
+// entry SECOND: a rule narrowed to entry zero steps over the admitted type in front of it.
+func testValSem209Refusal(t *testing.T, offending Extension) error {
+	t.Helper()
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice")
+	list := testProposalList(t, testGceOf(
+		Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}}, offending))
+	failure := ValSem209GroupExtensionsSupported(testCommitInput(t, crypto, tree, list, &Commit{}))
+	if failure != nil && !strings.Contains(failure.Error(), "entry 1") {
+		t.Errorf("ValSem209 over %#04x refused without naming which entry: %v",
+			uint16(offending.ExtensionType), failure)
+	}
+	return failure
+}
+
 // TestEachCommitRuleAnswersOnlyItsOwnSentinel is ledger 17's obligation and the exclusivity sweep
-// in one: every rule this file states has a row, the row's refusal answers the sentinel the rule
-// owes, and no other member of the roster answers it.
-//
-// The rows are held against the DERIVED rule class in both directions, so a twelfth rule added to
-// the file with no row fails rather than being left out of the sweep, and a row for a rule that has
-// gone fails too. The two rules that take something other than a validation input -- ValSem300 and
-// the two errata -- are in the class by name because the aggregate reaches them through adapters,
-// and those adapters are the members of the derived class that stand for them.
+// in one: every refusal this file's rules can answer has a row, the row's refusal answers the
+// sentinel it owes, and no other member of the roster answers it.
 func TestEachCommitRuleAnswersOnlyItsOwnSentinel(t *testing.T) {
 	roster := commitRefusalRoster()
+	for _, row := range commitRuleCases() {
+		t.Run(row.rule+"/"+row.sentinel, func(t *testing.T) {
+			owed, held := roster[row.sentinel]
+			if !held {
+				t.Fatalf("%s owes %s and that name is not in the roster", row.rule, row.sentinel)
+			}
+			failure := row.run(t)
+			if failure == nil {
+				t.Fatalf("%s did not refuse the input built for it, so this row states nothing about %s",
+					row.rule, row.sentinel)
+			}
+			if !errors.Is(failure, owed) {
+				t.Fatalf("%s answered %v, want %s", row.rule, failure, row.sentinel)
+			}
+			for _, other := range slices.Sorted(maps.Keys(roster)) {
+				if other == row.sentinel || commitValidationSanctionedWraps[row.sentinel] == other {
+					continue
+				}
+				if errors.Is(failure, roster[other]) {
+					t.Errorf("%s refused with %v, which also answers %s; a caller cannot tell which rule fired and a negative test asserting %s would pass over this one",
+						row.rule, failure, other, other)
+				}
+			}
+		})
+	}
+}
+
+// commitRuleCaseRulesStatedOverSomethingElse is the four names a row may carry that
+// commitRuleNamesDeclared cannot produce, with the reason each is outside that class.
+//
+// Held in both directions by the gate below, so an entry that stops being true fails.
+var commitRuleCaseRulesStatedOverSomethingElse = map[string]string{
+	"ValSem300NoTrailingBlankNodes": "is stated over a ratchet tree, because task 16's welcome path asks it of a tree that arrived in a GroupInfo and holds no commit at all",
+	"CheckErrata8745":               "is stated over an update path and a context, because p7 task 18 calls it with values it holds rather than with a validation input it would have to assemble",
+	"CheckErrata8815":               "is stated over a commit and a cache, for CheckErrata8745's reason",
+	"CommitValidationInput.check":   "is the argument rule every door runs first and is a method rather than a rule function, so it is reached through ValidateCommit rather than called directly",
+}
+
+// TestEveryCommitRuleAndEveryRefusalItNamesHasARow holds the table to two derived classes at once.
+//
+// THE RULES, so a twelfth rule added to the file with no row is a rule the sweep does not run --
+// which is the class check the map keyed by rule name already made. AND THE REFUSALS, which is the
+// half that was missing: every sentinel validate_commit.go NAMES owes a row that produces it, so a
+// rule answering four values cannot be covered by one. Both directions, so a row for a rule that
+// has gone, or a sentinel the file no longer names, fails rather than sitting there.
+func TestEveryCommitRuleAndEveryRefusalItNamesHasARow(t *testing.T) {
 	cases := commitRuleCases()
-	for _, name := range slices.Sorted(maps.Keys(cases)) {
-		row := cases[name]
-		owed, held := roster[row.sentinel]
-		if !held {
-			t.Errorf("%s owes %s and that name is not in the roster", name, row.sentinel)
-			continue
-		}
-		failure := row.run(t)
-		if failure == nil {
-			t.Errorf("%s did not refuse the input built for it, so this row states nothing about %s",
-				name, row.sentinel)
-			continue
-		}
-		if !errors.Is(failure, owed) {
-			t.Errorf("%s answered %v, want %s", name, failure, row.sentinel)
-			continue
-		}
-		for _, other := range slices.Sorted(maps.Keys(roster)) {
-			if other == row.sentinel || commitValidationSanctionedWraps[row.sentinel] == other {
-				continue
-			}
-			if errors.Is(failure, roster[other]) {
-				t.Errorf("%s refused with %v, which also answers %s; a caller cannot tell which rule fired and a negative test asserting %s would pass over this one",
-					name, failure, other, other)
-			}
+	rules := map[string]bool{}
+	produced := map[string]bool{}
+	roster := commitRefusalRoster()
+	for _, row := range cases {
+		rules[row.rule] = true
+		produced[row.sentinel] = true
+		if _, held := roster[row.sentinel]; !held {
+			t.Errorf("a row for %s owes %s and the roster does not hold that name", row.rule, row.sentinel)
 		}
 	}
-	// both directions against the rule class the aggregate is derived from, minus the adapters,
-	// so a rule with no row cannot hide
 	declared := commitRuleNamesDeclared(t)
 	adapters := map[string]bool{
 		"ValidateCommit": true, "validateCommitErrata": true,
 		"validateCommitPostTreeIsExportable": true,
 	}
 	for _, name := range declared {
-		if adapters[name] {
+		if adapters[name] || rules[name] {
 			continue
 		}
-		if _, hasRow := cases[name]; !hasRow {
-			t.Errorf("%s is a rule of this file and no row of commitRuleCases builds the input that makes it refuse; ledger 17 is that every code owes a test that names it",
-				name)
-		}
+		t.Errorf("%s is a rule of this file and no row of commitRuleCases builds the input that makes it refuse; ledger 17 is that every code owes a test that names it",
+			name)
 	}
-	for _, name := range slices.Sorted(maps.Keys(cases)) {
+	for _, name := range slices.Sorted(maps.Keys(rules)) {
 		if slices.Contains(declared, name) {
 			continue
 		}
-		// the three rules stated over something other than a validation input
-		if name == "ValSem300NoTrailingBlankNodes" || name == "CheckErrata8745" || name == "CheckErrata8815" {
-			continue
+		if _, excused := commitRuleCaseRulesStatedOverSomethingElse[name]; !excused {
+			t.Errorf("commitRuleCases holds a row for %s and %s declares no rule of that name",
+				name, commitValidationFile)
 		}
-		t.Errorf("commitRuleCases holds a row for %s and %s declares no rule of that name",
-			name, commitValidationFile)
 	}
+	for _, name := range slices.Sorted(maps.Keys(commitRuleCaseRulesStatedOverSomethingElse)) {
+		if !rules[name] {
+			t.Errorf("a reason is written down for %s and no row carries that name; the excuse has outlived what it excused",
+				name)
+		}
+	}
+	// the refusals half: every sentinel the file itself names owes a row producing it
+	named := commitFileSentinels(t)
+	if len(named) < len(commitValidationOwnedErrors) {
+		t.Fatalf("%s names %d sentinels and declares %d, so the scan read something other than that file",
+			commitValidationFile, len(named), len(commitValidationOwnedErrors))
+	}
+	for _, name := range slices.Sorted(maps.Keys(named)) {
+		if !produced[name] {
+			t.Errorf("%s names %s and no row of commitRuleCases produces it. A rule that answers four values with one row is three refusals nothing asserts -- which is how a rule about a missing provider came to report a malformed tree with the whole suite green",
+				commitValidationFile, name)
+		}
+	}
+}
+
+// commitFileSentinels is every sentinel of the roster that validate_commit.go's own declarations
+// name, read off that file rather than listed.
+func commitFileSentinels(t *testing.T) map[string]bool {
+	t.Helper()
+	mentions := map[string]map[string]bool{}
+	packageLevelMentionsIn(mustParseSource(t, commitValidationFile), mentions)
+	roster := commitRefusalRoster()
+	named := map[string]bool{}
+	for _, identifiers := range mentions {
+		for identifier := range identifiers {
+			if _, held := roster[identifier]; held {
+				named[identifier] = true
+			}
+		}
+	}
+	return named
 }
 
 // TestTheV1ProfileClassifiesEveryRegisteredExtensionTypeAsAGroupContextExtension holds the profile
@@ -1192,8 +1628,15 @@ func TestTheV1ProfileClassifiesEveryRegisteredExtensionTypeAsAGroupContextExtens
 // TestEveryCommitValidationEntryPointRefusesANilInput drives the argument rule at every door.
 //
 // The class is the DERIVED one, so a rule added to the file is swept without anybody editing this.
-func TestEveryCommitValidationEntryPointRefusesANilInput(t *testing.T) {
-	doors := map[string]func(*CommitValidationInput) error{
+// commitValidationDoors is every entry point of validate_commit.go that takes a validation input,
+// as a value rather than as a name.
+//
+// It is a function rather than a literal inside one test because TWO sweeps need the same class:
+// the nil argument rule below, and the arm rule that says none of these dereferences a proposal
+// whose arm is missing. Both are held to commitRuleNamesDeclared in both directions, so a rule
+// added to the file is swept by both without anybody editing either.
+func commitValidationDoors() map[string]func(*CommitValidationInput) error {
+	return map[string]func(*CommitValidationInput) error{
 		"ValidateCommit":                        ValidateCommit,
 		"ValSem200NoSelfRemove":                 ValSem200NoSelfRemove,
 		"ValSem201PathPresentWhenRequired":      ValSem201PathPresentWhenRequired,
@@ -1209,6 +1652,10 @@ func TestEveryCommitValidationEntryPointRefusesANilInput(t *testing.T) {
 		"validateCommitErrata":                  validateCommitErrata,
 		"validateCommitPostTreeIsExportable":    validateCommitPostTreeIsExportable,
 	}
+}
+
+func TestEveryCommitValidationEntryPointRefusesANilInput(t *testing.T) {
+	doors := commitValidationDoors()
 	declared := commitRuleNamesDeclared(t)
 	for _, name := range declared {
 		if _, driven := doors[name]; !driven {
@@ -1248,59 +1695,475 @@ func TestEveryCommitValidationEntryPointRefusesANilInput(t *testing.T) {
 	}
 }
 
-// TestValidateCommitAcceptsAWellFormedFullCommit is the accepting half of the aggregate.
+// TestValidateCommitAcceptsAWellFormedFullCommit is the accepting half of the aggregate, and it is
+// the control every row of the table below is measured against.
 //
-// Without it every rule above could be "return the refusal unconditionally" and the whole file
-// would still be green. The fixture is a four member group, a full commit from leaf 0 with a fresh
-// path of the filtered direct path's own length, and no proposals -- which is section 12.4's
-// "empty" configuration and the one every other configuration is a narrowing of.
+// Without it every rule could be "return the refusal unconditionally" and the whole file would
+// still be green. The fixture is a four member group and a full commit from leaf 0 with a fresh
+// path of the filtered direct path's own length, which is section 12.4's "empty" configuration and
+// the one every row below is one edit away from.
 func TestValidateCommitAcceptsAWellFormedFullCommit(t *testing.T) {
 	crypto := testCrypto(t)
-	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
-	filtered, failure := tree.FilteredDirectPath(LeafIndex(0))
-	if failure != nil {
-		t.Fatalf("FilteredDirectPath: %v", failure)
-	}
-	path := testCommitPath(t, crypto, members[0], len(filtered))
-	// a fresh key at the leaf, which is what ValSem204 is about, and a signature key that is
-	// leaf 0's so CheckUpdatePathKeyUniqueness exempts the right position
-	path.LeafNode.SignatureKey = tree.Leaf(LeafIndex(0)).SignatureKey
-	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: path})
+	in, _ := testFullCommitInput(t, crypto)
 	if failure := ValidateCommit(in); failure != nil {
 		t.Fatalf("ValidateCommit refused a well formed full commit: %v", failure)
 	}
 }
 
-// TestValidateCommitReachesEveryRuleItRuns is the aggregate's negative half: for each rule in the
-// slice, an input that only that rule refuses comes back with that rule's sentinel.
+// commitRuleName is the declared name of one rule of commitValidationChecks, read off the VALUE
+// rather than written beside it, so a row cannot claim to cover a rule it does not hold.
+func commitRuleName(rule func(*CommitValidationInput) error) string {
+	full := runtime.FuncForPC(reflect.ValueOf(rule).Pointer()).Name()
+	return full[strings.LastIndex(full, ".")+1:]
+}
+
+// commitRulesTheAggregateRuns is every rule ValidateCommit runs, in the order it runs them, read
+// off the production slice rather than listed here.
+func commitRulesTheAggregateRuns() []string {
+	names := []string{}
+	for _, rule := range commitValidationChecks {
+		names = append(names, commitRuleName(rule))
+	}
+	return names
+}
+
+// commitRuleFor answers the rule function of that name out of the production slice, so a row is
+// joined to a rule the aggregate actually runs.
+func commitRuleFor(t *testing.T, name string) func(*CommitValidationInput) error {
+	t.Helper()
+	for _, rule := range commitValidationChecks {
+		if commitRuleName(rule) == name {
+			return rule
+		}
+	}
+	t.Fatalf("no rule of ValidateCommit is named %s", name)
+	return nil
+}
+
+// commitAggregateRow is one rule of commitValidationChecks, an input that only that rule refuses,
+// and the value it must answer THROUGH THE AGGREGATE.
+type commitAggregateRow struct {
+	rule     string
+	sentinel error
+	build    func(t *testing.T, crypto CryptoProvider) *CommitValidationInput
+}
+
+// commitAggregateRows is one row per rule the aggregate runs, each starting from the commit
+// ValidateCommit accepts and breaking exactly one thing.
 //
-// The gate above says the slice NAMES every rule; this says the loop that walks it actually calls
-// them, which a `for range checks[:1]` would pass the first of and fail here.
+// THIS TABLE IS THE WHOLE OF WHAT SAYS THE AGGREGATE RUNS ITS RULES, and the gate it replaced said
+// almost nothing. TestValidateCommitRunsEveryRuleThisFileDeclares reads the slice's SOURCE, so it
+// says the names appear; the negative half drove one input, chosen to reach the LAST element, and
+// a list where only the last element is driven is a list of one. Measured: validateCommitErrata
+// neutered to return nil left the full 6961 test suite green, so neither erratum observably ran at
+// all -- and the Pending cache the input carries for erratum 8815 was set by no test in the
+// package.
+//
+// The map is keyed by a LABEL rather than by the rule, because one rule of the slice stands for
+// two errata and each of them owes a row of its own. What the gate holds is that every rule the
+// slice names is some row's rule and every row's rule is one the slice names.
+func commitAggregateRows() map[string]commitAggregateRow {
+	return map[string]commitAggregateRow{
+		"ValSem200 over a commit that removes its own committer": {
+			rule: "ValSem200NoSelfRemove", sentinel: ErrRemoveCommitter,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				testCommitProposals(t, in, testRemoveOf(2), testRemoveOf(0))
+				return in
+			}},
+		"ValSem201 over a pathless commit that names no proposals": {
+			rule: "ValSem201PathPresentWhenRequired", sentinel: errMissingPath,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				in.Commit.Path = nil
+				return in
+			}},
+		"ValSem202 over a path one node short of the filtered direct path": {
+			rule: "ValSem202PathLength", sentinel: errPathLength,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				in.Commit.Path.Nodes = in.Commit.Path.Nodes[:len(in.Commit.Path.Nodes)-1]
+				return in
+			}},
+		"the path leaf source rule over a key_package sourced leaf": {
+			rule: "validateCommitPathLeafSource", sentinel: ErrLeafNodeSourceMismatch,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				in.Commit.Path.LeafNode.LeafNodeSource = LeafNodeSourceKeyPackage
+				return in
+			}},
+		"ValSem203 over a path whose second node encrypts to nobody": {
+			rule: "ValSem203PathDecrypt", sentinel: errPathDecrypt,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				if len(in.Commit.Path.Nodes) < 2 {
+					t.Fatalf("the fixture's path is %d nodes long, so an offender at node 1 cannot be built",
+						len(in.Commit.Path.Nodes))
+				}
+				in.Commit.Path.Nodes[1].EncryptedPathSecret = nil
+				return in
+			}},
+		"ValSem204 over a path leaf republishing the committer's current key": {
+			rule: "ValSem204PathKeyMismatch", sentinel: errPathLeafKeyUnchanged,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				in.Commit.Path.LeafNode.EncryptionKey = in.PreTree.Leaf(in.Committer).EncryptionKey
+				return in
+			}},
+		"ValSem206 over a path leaf whose key the second add publishes": {
+			rule: "ValSem206PathLeafEncryptionKeyUnique", sentinel: errDuplicateEncryptionKey,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				innocent, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "erin"))
+				colliding, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "frank"))
+				testCommitProposals(t, in, testAddOf(innocent), testAddOf(colliding))
+				in.Commit.Path.LeafNode.EncryptionKey = colliding.LeafNode.EncryptionKey
+				return in
+			}},
+		"ValSem207 over a path node reusing a leaf's key": {
+			rule: "ValSem207PathEncryptionKeysUnique", sentinel: errDuplicateEncryptionKey,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				in.Commit.Path.Nodes[1].EncryptionKey = in.PostTree.Leaf(LeafIndex(2)).EncryptionKey
+				return in
+			}},
+		"ValSem208 over a commit carrying two group_context_extensions proposals": {
+			rule: "ValSem208SingleGroupContextExtensions", sentinel: errMultipleGroupContextExtensions,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				one := testGceOf()
+				testCommitProposals(t, in, one, one)
+				return in
+			}},
+		"ValSem209 over an extension one remaining member does not support": {
+			rule: "ValSem209GroupExtensionsSupported", sentinel: errGroupContextExtensionNotListed,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, members := testFullCommitInput(t, crypto)
+				testNarrowLeafCapabilities(t, in.PostTree, LeafIndex(1))
+				testFitCommitPath(t, crypto, in, members[0])
+				testCommitProposals(t, in, testGceOf(
+					Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+					Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}))
+				return in
+			}},
+		// erratum 8745 through the aggregate, and it is also the only thing in this package that
+		// observes the extension set the COMMIT installs. The path leaf is not in the post tree,
+		// so ValSem209's member walk cannot see it -- see
+		// TestTheExtensionSetTheCommitInstallsIsWhatItsPathLeafOwesSupportFor next door.
+		"validateCommitErrata over a path leaf that drops an extension the commit installs": {
+			rule: "validateCommitErrata", sentinel: errGroupContextExtensionNotListed,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				testCommitProposals(t, in, testGceOf(
+					Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+					Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}))
+				in.Commit.Path.LeafNode.Capabilities = testNarrowedCapabilities()
+				return in
+			}},
+		// erratum 8815 through the aggregate, over a Pending cache -- the field the task added and
+		// no test set, which is why the erratum could be deleted with the suite green
+		"validateCommitErrata over a reference this member never received": {
+			rule: "validateCommitErrata", sentinel: errProposalNotCached,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, _ := testFullCommitInput(t, crypto)
+				cache := testCacheAt(t, testResolveContext())
+				ref, failure := cache.Store(crypto, testResolveContext(),
+					testProposalContent(t, crypto, LeafIndex(1),
+						&Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}))
+				if failure != nil {
+					t.Fatalf("Store: %v", failure)
+				}
+				in.Pending = cache
+				held := CachedProposal{Ref: ref, Sender: LeafIndex(1),
+					Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}}
+				never := CachedProposal{
+					Ref:      ProposalRef(append(append([]byte(nil), ref...), 0x5a)),
+					Sender:   LeafIndex(1),
+					Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 3}}}
+				testCommitProposals(t, in, held, never)
+				return in
+			}},
+		"ValSem300 over a post tree ending in a blank node": {
+			rule: "validateCommitPostTreeIsExportable", sentinel: errTrailingBlankNodes,
+			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
+				in, members := testFullCommitInput(t, crypto)
+				if failure := in.PostTree.Blank(NodeIndex(in.PostTree.NodeWidth() - 1)); failure != nil {
+					t.Fatalf("Blank: %v", failure)
+				}
+				// blanking the rightmost leaf changes the filtered direct path, so the path is
+				// re-fitted against the tree the aggregate reads
+				testFitCommitPath(t, crypto, in, members[0])
+				return in
+			}},
+	}
+}
+
+// TestValidateCommitReachesEveryRuleItRuns is the aggregate's negative half: for each rule in the
+// slice, an input that only that rule refuses comes back with that rule's sentinel out of
+// ValidateCommit itself.
+//
+// TWO CLAIMS PER ROW and they are different claims. The named rule must answer the row's value,
+// which says the fixture breaks the rule the row says it breaks. And the AGGREGATE must answer the
+// same value, which says the loop reaches this rule with this input -- a rule the loop skipped, or
+// a rule neutered to return nil, answers something else or nothing at all.
 func TestValidateCommitReachesEveryRuleItRuns(t *testing.T) {
 	crypto := testCrypto(t)
-	// the LAST rule of the slice, reached only if the loop walks the whole of it: a post tree
-	// ending in a blank node, with every earlier rule satisfied
+	rows := commitAggregateRows()
+	for _, label := range slices.Sorted(maps.Keys(rows)) {
+		row := rows[label]
+		t.Run(label, func(t *testing.T) {
+			in := row.build(t, crypto)
+			ruled := commitRuleFor(t, row.rule)(in)
+			if !errors.Is(ruled, row.sentinel) {
+				t.Fatalf("%s over the fixture built for it answered %v, want %v; the row does not break the rule it names",
+					row.rule, ruled, row.sentinel)
+			}
+			aggregated := ValidateCommit(in)
+			if !errors.Is(aggregated, row.sentinel) {
+				t.Fatalf("ValidateCommit answered %v and %s answers %v; the aggregate is not reaching this rule with this input",
+					aggregated, row.rule, row.sentinel)
+			}
+		})
+	}
+}
+
+// TestEveryRuleTheCommitAggregateRunsHasARowAndEveryRowIsARuleItRuns holds the table above to the
+// production slice in both directions.
+//
+// Without it the table is a list, and a list is what rule 5 is about: a thirteenth rule appended to
+// commitValidationChecks with no row would be run by the aggregate and asserted by nothing, and a
+// row naming a rule that had been taken out would go on reporting a clean bill over a rule that no
+// longer runs.
+func TestEveryRuleTheCommitAggregateRunsHasARowAndEveryRowIsARuleItRuns(t *testing.T) {
+	rules := commitRulesTheAggregateRuns()
+	if !slices.Contains(rules, "ValSem209GroupExtensionsSupported") {
+		t.Fatalf("the slice reads as %v and ValidateCommit certainly runs ValSem209GroupExtensionsSupported, so the names are being read off something else",
+			rules)
+	}
+	rows := commitAggregateRows()
+	covered := map[string]bool{}
+	for _, label := range slices.Sorted(maps.Keys(rows)) {
+		covered[rows[label].rule] = true
+		if !slices.Contains(rules, rows[label].rule) {
+			t.Errorf("the row %q names %s and ValidateCommit runs no rule under that name",
+				label, rows[label].rule)
+		}
+	}
+	for _, name := range rules {
+		if !covered[name] {
+			t.Errorf("ValidateCommit runs %s and no row builds an input that only it refuses, so nothing says the aggregate reaches it",
+				name)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the two fields that are one commit, and the two trees that are not one tree
+// ---------------------------------------------------------------------------
+
+// TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector is the join, over the input
+// RFC 9420 section 12.4's own pseudocode asserts against.
+//
+// THE PROBE. Section 12.4 reads "if len(commit.proposals) == 0 || pathRequired: assert(commit.path
+// != null)", and ValSem201 decides it off List. A commit carrying Proposals nil and Path nil --
+// which the RFC refuses outright -- was ACCEPTED whenever the caller handed over a non-empty list
+// that lets the path be omitted, because the rule was reading a field the commit did not name.
+//
+// THE FIVE WAYS TO DISAGREE are the five things the join compares, and each is driven: the count,
+// the discriminant, which side of the by-value line an entry is on, the reference a by-reference
+// entry names, and the type a by-value entry carries. A join that compared fewer would leave the
+// rule decidable off a list that is not the commit's in exactly the ways it did not compare.
+func TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
+
+	// an add-only list lets section 12.4 omit the path, and the commit itself names no proposals
+	// at all, so section 12.4 requires one
+	addOnly := testProposalList(t, testAddOf(kp))
+	probe := testCommitInput(t, crypto, tree, addOnly, &Commit{Proposals: []ProposalOrRef{}})
+	if CommitPathRequired(probe.List) {
+		t.Fatal("the fixture's list requires a path of its own, so it cannot tell the two fields apart")
+	}
+	if failure := ValidateCommit(probe); !errors.Is(failure, errCommitProposalsNotResolved) {
+		t.Fatalf("ValidateCommit over a commit naming no proposals and carrying no path = %v, want errCommitProposalsNotResolved; that commit is the one section 12.4's empty clause asserts against and it was accepted because the rule read a list the commit does not name",
+			failure)
+	}
+
+	held := CachedProposal{Ref: ProposalRef([]byte("a-reference")), Sender: LeafIndex(1),
+		Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}}
+	for _, row := range []struct {
+		name   string
+		list   *ProposalList
+		vector []ProposalOrRef
+	}{
+		{"a list longer than the vector", testProposalList(t, testAddOf(kp), testRemoveOf(2)),
+			[]ProposalOrRef{{Type: ProposalOrRefTypeProposal,
+				Proposal: &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}}},
+		{"a by-value entry the list holds by reference", testProposalList(t, held),
+			[]ProposalOrRef{{Type: ProposalOrRefTypeProposal,
+				Proposal: &Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: 2}}}}},
+		{"a by-reference entry the list holds by value", testProposalList(t, testRemoveOf(2)),
+			[]ProposalOrRef{{Type: ProposalOrRefTypeReference, Reference: held.Ref}}},
+		{"a reference the list does not hold", testProposalList(t, held),
+			[]ProposalOrRef{{Type: ProposalOrRefTypeReference,
+				Reference: ProposalRef([]byte("another-reference"))}}},
+		{"a by-value entry of another type", testProposalList(t, testRemoveOf(2)),
+			[]ProposalOrRef{{Type: ProposalOrRefTypeProposal,
+				Proposal: &Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}}},
+		{"a discriminant that names neither", testProposalList(t, testRemoveOf(2)),
+			[]ProposalOrRef{{Type: ProposalOrRefTypeReserved}}},
+	} {
+		in := testCommitInput(t, crypto, tree, row.list, &Commit{Proposals: row.vector})
+		if failure := ValidateCommit(in); !errors.Is(failure, errCommitProposalsNotResolved) {
+			t.Errorf("ValidateCommit over %s = %v, want errCommitProposalsNotResolved", row.name, failure)
+		}
+	}
+
+	// and the accepting half, so the join is not "every commit that names a proposal": the list
+	// the fixture builds from the vector is the resolution of it
+	whole := testCommitInput(t, crypto, tree, testProposalList(t, testRemoveOf(2)), &Commit{})
+	whole.Commit.Path = testCommitPath(t, crypto, testIdentity(t, crypto, "alice"), 1)
+	if failure := whole.check(); failure != nil {
+		t.Fatalf("the argument rule refused a list that IS the commit's own vector: %v", failure)
+	}
+}
+
+// TestTheExtensionSetTheCommitInstallsIsWhatItsPathLeafOwesSupportFor is the half of
+// effectiveExtensions that nothing observed, and it is the security relevant half.
+//
+// Deleting the branch that prefers the list's own GroupContextExtensions proposal left the whole
+// suite green, and what that branch buys is this commit: one that INSTALLS an extension and, in
+// the same commit, publishes a path leaf that does not support it. Section 12.4.2 applies the
+// proposals before the path is validated, so the set the path leaf owes support for is the new one.
+//
+// VALSEM209 CANNOT COVER THIS and the assertion below says so rather than assuming it. That rule
+// walks the POST tree's members, and the path leaf is not in the post tree because the merge has
+// not happened -- so with the branch gone nothing in ValidateCommit holds the committer's own new
+// leaf against the extension set the same commit installs.
+func TestTheExtensionSetTheCommitInstallsIsWhatItsPathLeafOwesSupportFor(t *testing.T) {
+	crypto := testCrypto(t)
+	in, _ := testFullCommitInput(t, crypto)
+	testCommitProposals(t, in, testGceOf(
+		Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+		Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}))
+	in.Commit.Path.LeafNode.Capabilities = testNarrowedCapabilities()
+
+	// the group's own context carries neither extension, so a validator that read it instead of
+	// the commit's own set has nothing to hold the leaf against
+	if len(in.Context.Extensions) != 0 {
+		t.Fatalf("the fixture's group context already carries %d extensions, so the two sources cannot be told apart",
+			len(in.Context.Extensions))
+	}
+	if failure := ValSem209GroupExtensionsSupported(in); failure != nil {
+		t.Fatalf("ValSem209 refused this commit: %v. Every member of the post tree supports the extension and the offending leaf is the path's, which ValSem209 cannot see -- if it answers here, the row below is asserting the wrong rule",
+			failure)
+	}
+	failure := ValidateCommit(in)
+	if !errors.Is(failure, errGroupContextExtensionNotListed) {
+		t.Fatalf("ValidateCommit over a commit that installs urmessage_owner_successor and publishes a path leaf that does not list it = %v, want errGroupContextExtensionNotListed",
+			failure)
+	}
+	// the same commit with a leaf that lists it is accepted, so the rule is not "any commit
+	// carrying a group_context_extensions proposal"
+	whole, _ := testFullCommitInput(t, crypto)
+	testCommitProposals(t, whole, testGceOf(
+		Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{}},
+		Extension{ExtensionType: ExtensionTypeUrmessageOwnerSuccessor, ExtensionData: []byte{}}))
+	if failure := ValidateCommit(whole); failure != nil {
+		t.Fatalf("ValidateCommit refused a commit whose path leaf lists every extension it installs: %v",
+			failure)
+	}
+}
+
+// TestValSem202IsStatedOverThePostProposalTree drives the field choice, over an input where the two
+// trees answer differently.
+//
+// A four member group whose commit removes leaves 3 and 2 has a filtered direct path of a different
+// length in each tree, so a rule pointed at the pre-commit tree refuses the honest commit -- which
+// is what CommitValidationInput's doc says the two fields exist to prevent, and what nothing
+// measured: the rule rewritten to read PreTree left the whole suite green.
+func TestValSem202IsStatedOverThePostProposalTree(t *testing.T) {
+	crypto := testCrypto(t)
 	tree, members := testTreeWith(t, crypto, "alice", "bob", "carol", "dave")
-	filtered, failure := tree.FilteredDirectPath(LeafIndex(0))
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	testCommitProposals(t, in, testRemoveOf(3), testRemoveOf(2))
+	for _, leafIndex := range []LeafIndex{3, 2} {
+		if failure := in.PostTree.RemoveLeaf(leafIndex); failure != nil {
+			t.Fatalf("RemoveLeaf(%d): %v", leafIndex, failure)
+		}
+	}
+	before, failure := in.PreTree.FilteredDirectPath(in.Committer)
 	if failure != nil {
-		t.Fatalf("FilteredDirectPath: %v", failure)
+		t.Fatalf("FilteredDirectPath over the pre tree: %v", failure)
 	}
-	path := testCommitPath(t, crypto, members[0], len(filtered))
-	path.LeafNode.SignatureKey = tree.Leaf(LeafIndex(0)).SignatureKey
-	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{Path: path})
-	if failure := in.PostTree.Blank(NodeIndex(in.PostTree.NodeWidth() - 1)); failure != nil {
-		t.Fatalf("Blank: %v", failure)
-	}
-	// blanking the rightmost leaf changes the filtered direct path, so the path length rule would
-	// answer first; the check is re-lengthened against the post tree the aggregate reads
-	refiltered, failure := in.PostTree.FilteredDirectPath(LeafIndex(0))
+	after, failure := in.PostTree.FilteredDirectPath(in.Committer)
 	if failure != nil {
-		t.Fatalf("FilteredDirectPath over the padded tree: %v", failure)
+		t.Fatalf("FilteredDirectPath over the post tree: %v", failure)
 	}
-	in.Commit.Path = testCommitPath(t, crypto, members[0], len(refiltered))
-	in.Commit.Path.LeafNode.SignatureKey = tree.Leaf(LeafIndex(0)).SignatureKey
-	if failure := ValidateCommit(in); !errors.Is(failure, errTrailingBlankNodes) {
-		t.Fatalf("ValidateCommit over a post tree ending in a blank = %v, want errTrailingBlankNodes; the last rule of commitValidationChecks is reached only if the loop walks the whole slice",
+	if len(before) == len(after) {
+		t.Fatalf("both trees answer a filtered direct path of %d nodes, so this fixture cannot tell the two fields apart",
+			len(before))
+	}
+	in.Commit.Path = testCommitPath(t, crypto, members[0], len(after))
+	if failure := ValSem202PathLength(in); failure != nil {
+		t.Fatalf("ValSem202 refused a path of the POST tree's own filtered direct path length: %v. The proposals are applied before the path is validated, so a rule reading the pre-commit tree refuses every honest commit that removes anybody",
+			failure)
+	}
+	in.Commit.Path = testCommitPath(t, crypto, members[0], len(before))
+	if failure := ValSem202PathLength(in); !errors.Is(failure, errPathLength) {
+		t.Fatalf("ValSem202 accepted a path of the PRE tree's filtered direct path length = %v, want errPathLength",
+			failure)
+	}
+}
+
+// TestValSem204IsStatedOverThePreCommitTree is the same property for the other field, and the two
+// together are why CommitValidationInput carries two trees.
+//
+// The input is a commit whose list carries an UPDATE from the committer itself. Section 12.2's
+// ValSem111 refuses that list -- at the PROPOSAL door, which ValidateCommit does not run -- so a
+// caller that applied the proposals before judging the commit holds a post tree whose committer
+// leaf carries a key the pre tree does not. Over that pair the two readings disagree, and the
+// dangerous direction is the accepting one: a path that republishes the committer's RETIRED key
+// advances the epoch while leaving that leaf decryptable by whoever holds the old one, which is the
+// whole of what a path exists to prevent.
+func TestValSem204IsStatedOverThePreCommitTree(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members := testTreeWith(t, crypto, "alice", "bob")
+	in := testCommitInput(t, crypto, tree, &ProposalList{}, &Commit{})
+	update, updated := testUpdateProposalOf(t, crypto, members[0], LeafIndex(0))
+	testCommitProposals(t, in, update)
+	if failure := in.PostTree.UpdateLeaf(LeafIndex(0), updated); failure != nil {
+		t.Fatalf("UpdateLeaf(0): %v", failure)
+	}
+	retired := in.PreTree.Leaf(LeafIndex(0))
+	fresh := in.PostTree.Leaf(LeafIndex(0))
+	if retired == nil || fresh == nil {
+		t.Fatal("one of the two trees has no leaf 0, so the fixture states nothing")
+	}
+	if subtle.ConstantTimeCompare(retired.EncryptionKey, fresh.EncryptionKey) == 1 {
+		t.Fatal("both trees carry the same key at leaf 0, so this fixture cannot tell the two fields apart")
+	}
+
+	republished := testCommitPathLeaf(t, crypto, members[0])
+	republished.EncryptionKey = retired.EncryptionKey
+	in.Commit.Path = &UpdatePath{LeafNode: *republished}
+	if failure := ValSem204PathKeyMismatch(in); !errors.Is(failure, errPathLeafKeyUnchanged) {
+		t.Fatalf("ValSem204 over a path leaf republishing the key the PRE tree holds = %v, want errPathLeafKeyUnchanged; the rule is stated over the committer's current leaf and the current leaf is the one the commit arrived on",
+			failure)
+	}
+
+	// the post tree's key is a different rule's business: ValSem204 is about the key the path
+	// retires, and the key an Update in the same commit published is ValSem206's axis
+	carried := testCommitPathLeaf(t, crypto, members[0])
+	carried.EncryptionKey = fresh.EncryptionKey
+	in.Commit.Path = &UpdatePath{LeafNode: *carried}
+	if failure := ValSem204PathKeyMismatch(in); failure != nil {
+		t.Fatalf("ValSem204 refused a path leaf carrying a key the committer's current leaf does not hold: %v",
+			failure)
+	}
+	if failure := ValSem206PathLeafEncryptionKeyUnique(in); !errors.Is(failure, errDuplicateEncryptionKey) {
+		t.Fatalf("ValSem206 over a path leaf republishing an update's key = %v, want errDuplicateEncryptionKey; if nothing refuses this input the split between the two rules is not the split this test claims",
 			failure)
 	}
 }
@@ -1331,3 +2194,249 @@ func TestTheCommitValidationErrataMatchWhatTheErrataFileRecords(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// no door that is handed a proposal list dereferences an arm it was not handed
+// ---------------------------------------------------------------------------
+
+// proposalListDoor is one exported entry point that is handed a proposal list, wrapped so that
+// every shape -- a rule over a validation input, a function taking a list, a method on the list --
+// is driven by one sweep.
+//
+// refuses is false for the doors whose whole answer is a bool or a value. What those owe is only
+// that they do not dereference; a method with no error to answer cannot report anything else.
+type proposalListDoor struct {
+	run     func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error
+	refuses bool
+}
+
+// proposalListReaders is every exported entry point handed a proposal list that is NOT one of the
+// two validators' rules: the functions that take one, and the methods on the type itself.
+//
+// Held in both directions by the sweep below -- by AST for the functions, by reflection over
+// *ProposalList for the methods -- because this is the class rule 5 is about. The reviewer reached
+// three unguarded arm reads; the class is every read reachable from an exported door, and a list of
+// the three would have left (*ProposalList).Extensions, which is a door of its own with no error to
+// answer, exactly where it was.
+func proposalListReaders() map[string]proposalListDoor {
+	return map[string]proposalListDoor{
+		"ApplyProposals": {refuses: true,
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				_, failure := ApplyProposals(tree, testResolveContext(), LeafIndex(0), list)
+				return failure
+			}},
+		"CommitPathRequired": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				CommitPathRequired(list)
+				return nil
+			}},
+		"ProposalList.Len": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.Len()
+				return nil
+			}},
+		"ProposalList.PathRequired": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.PathRequired()
+				return nil
+			}},
+		"ProposalList.Extensions": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.Extensions()
+				return nil
+			}},
+		"ProposalList.Refs": {
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				list.Refs()
+				return nil
+			}},
+	}
+}
+
+// proposalListDoors is every door of this package that judges or reads a proposal list: the two
+// validators' rules, read off the production slices, and the readers above.
+func proposalListDoors(t *testing.T) map[string]proposalListDoor {
+	t.Helper()
+	doors := map[string]proposalListDoor{}
+	for name, rule := range commitValidationDoors() {
+		commitRule := rule
+		doors[name] = proposalListDoor{refuses: true,
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				return commitRule(testCommitInput(t, crypto, tree, list, &Commit{}))
+			}}
+	}
+	proposalDoors := map[string]func(*ProposalValidationInput) error{
+		"ValidateProposalList": ValidateProposalList,
+	}
+	for _, name := range proposalListRules() {
+		proposalDoors[name] = proposalListRuleFor(t, name)
+	}
+	for name, rule := range proposalDoors {
+		proposalRule := rule
+		doors[name] = proposalListDoor{refuses: true,
+			run: func(t *testing.T, crypto CryptoProvider, tree *RatchetTree, list *ProposalList) error {
+				return proposalRule(testValidationInput(t, crypto, tree, LeafIndex(0), list))
+			}}
+	}
+	maps.Copy(doors, proposalListReaders())
+	return doors
+}
+
+// TestProposalListReadersIsEveryExportedDoorHandedAProposalList holds the reader half of the class
+// to the two derivations that produce it.
+func TestProposalListReadersIsEveryExportedDoorHandedAProposalList(t *testing.T) {
+	readers := proposalListReaders()
+	functions := []string{}
+	methods := []string{}
+	for name := range readers {
+		if strings.HasPrefix(name, "ProposalList.") {
+			methods = append(methods, strings.TrimPrefix(name, "ProposalList."))
+			continue
+		}
+		functions = append(functions, name)
+	}
+	slices.Sort(functions)
+	slices.Sort(methods)
+
+	// the functions, off the source: every exported function of the non test files that takes a
+	// *ProposalList anywhere in its parameters
+	declared := []string{}
+	for _, path := range packageSourcePaths(t) {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		source := mustParseSource(t, path)
+		for _, declaration := range source.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv != nil || !ast.IsExported(function.Name.Name) ||
+				function.Type.Params == nil {
+				continue
+			}
+			for _, parameter := range function.Type.Params.List {
+				if source.render(parameter.Type) == "*ProposalList" {
+					declared = append(declared, function.Name.Name)
+					break
+				}
+			}
+		}
+	}
+	slices.Sort(declared)
+	if !slices.Equal(functions, declared) {
+		t.Errorf("this package's non test source exports %v taking a *ProposalList and proposalListReaders drives %v; a door outside the sweep is a door whose arm reads nothing here holds",
+			declared, functions)
+	}
+
+	// the methods, off the type: every exported method of *ProposalList
+	listType := reflect.TypeOf((*ProposalList)(nil))
+	onTheType := []string{}
+	for i := 0; i < listType.NumMethod(); i += 1 {
+		onTheType = append(onTheType, listType.Method(i).Name)
+	}
+	slices.Sort(onTheType)
+	if len(onTheType) == 0 {
+		t.Fatal("reflection found no exported method on *ProposalList, so that half of the class read nothing")
+	}
+	if !slices.Equal(methods, onTheType) {
+		t.Errorf("*ProposalList exports %v and proposalListReaders drives %v", onTheType, methods)
+	}
+}
+
+// testArmlessList is a list carrying an innocent remove and then one proposal of the named type
+// with NO arm at all.
+//
+// SECOND AND NOT FIRST, which is this file's rule for every loop, and it matters twice here: a
+// guard written over element zero passes this, and so does a guard that stopped at the first entry
+// it could read.
+//
+// The entry goes in its own bucket when the type has one, because a bucketed rule reads the arm the
+// BUCKET names -- `list.Removes[i].Proposal.Remove.Removed` never looks at the entry's own type --
+// and which types have buckets is read off proposalBucketsOf rather than written here.
+func testArmlessList(t *testing.T, code ProposalType) *ProposalList {
+	t.Helper()
+	innocent := testRemoveOf(1)
+	armless := CachedProposal{ByValue: true, Proposal: Proposal{ProposalType: code}}
+	for _, bucket := range proposalBucketsOf(&ProposalList{}) {
+		if bucket.carries == code {
+			return testProposalList(t, innocent, armless)
+		}
+	}
+	// a type with no bucket of its own is carried in the commit order alone, which is what a list
+	// assembled around a type this build does not implement looks like
+	return &ProposalList{
+		All:     []CachedProposal{innocent, armless},
+		Removes: []CachedProposal{innocent},
+	}
+}
+
+// TestNoDoorHandedAProposalListDereferencesAMissingArm is finding 2's class, derived on both axes.
+//
+// THE DOORS are every rule the two aggregates run, read off the production slices, plus every
+// exported function and method handed a list, and the aggregates themselves. THE INPUTS are one
+// list per REGISTERED proposal type, read off the registry, plus a code point outside it.
+//
+// What each door owes is what this package's own doctrine says a door owes: a refusal rather than a
+// dereference, so that a missing argument cannot read as "nothing collided". A panic out of a
+// library takes the caller's process rather than its call, and ValidateCommit -- newly exported and
+// reachable by a caller that has resolved nothing -- was three of them.
+func TestNoDoorHandedAProposalListDereferencesAMissingArm(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, _ := testTreeWith(t, crypto, "alice", "bob", "carol")
+	doors := proposalListDoors(t)
+	if len(doors) < 20 {
+		t.Fatalf("the sweep found %d doors, and this package declares two aggregates and more than twenty rules between them",
+			len(doors))
+	}
+	registered := registryConstantsOfType(t, "ProposalType")
+	if len(registered) == 0 {
+		t.Fatal("this package declares no ProposalType constant, so the sweep drove nothing")
+	}
+	inputs := map[string]ProposalType{}
+	for name, code := range registered {
+		inputs[name] = ProposalType(code)
+	}
+	// and one outside the registry, which is the member of the class the registry cannot supply
+	inputs["an unregistered code point"] = ProposalType(0x1A1A)
+
+	for _, typeName := range slices.Sorted(maps.Keys(inputs)) {
+		code := inputs[typeName]
+		wanted := ErrContentArmMismatch
+		refusal, isRegistered := proposalTypeProfile[code]
+		switch {
+		case !isRegistered:
+			wanted = errUnregisteredProposalType
+		case refusal != nil:
+			// a type this profile refuses is refused for its TYPE, whatever it carries, which is
+			// checkProposalProfile's own stated order
+			wanted = refusal
+		}
+		for _, name := range slices.Sorted(maps.Keys(doors)) {
+			door := doors[name]
+			answered := proposalListDoorAnswer(t, name+" over an armless "+typeName, door,
+				crypto, tree, testArmlessList(t, code))
+			if !door.refuses {
+				continue
+			}
+			if !errors.Is(answered, wanted) {
+				t.Errorf("%s over a list whose second entry is a %s with no arm answered %v, want %v",
+					name, typeName, answered, wanted)
+			}
+		}
+	}
+}
+
+// proposalListDoorAnswer runs one door and turns a panic into the failure it should have been, so
+// one door dereferencing its list is a failure of its own case rather than the end of the sweep.
+func proposalListDoorAnswer(t *testing.T, what string, door proposalListDoor,
+	crypto CryptoProvider, tree *RatchetTree, list *ProposalList) (answered error) {
+
+	t.Helper()
+	defer func() {
+		if panicked := recover(); panicked != nil {
+			t.Errorf("%s panicked with %v; a panic out of a library takes the caller's process rather than its call, and a missing arm is an argument to refuse rather than a state to crash in",
+				what, panicked)
+			answered = nil
+		}
+	}()
+	return door.run(t, crypto, tree, list)
+}
+
