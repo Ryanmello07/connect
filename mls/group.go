@@ -62,6 +62,32 @@ var (
 	// founded and this one is a commit that could not be built, and a caller reading one
 	// value cannot tell which of its calls is the one that failed.
 	errCommitConfirmationTag = errors.New("mls: the commit's confirmation tag is not a tag of this suite's width")
+
+	// the Welcome half of a commit, and two values because they are two faults a caller
+	// repairs differently.
+	//
+	// errWelcomeAddPairing is the ONE ASSUMPTION (*StagedCommit).welcomeMessage rests on, written as a
+	// refusal rather than left as an index: StagedCommit.added and (*ProposalList).Adds are two
+	// readings of the same Add proposals -- ApplyProposals walks the commit order and appends a
+	// leaf per Add, and Adds is that same order filtered -- so entry i of one is entry i of the
+	// other. A build where they part company would seal each joiner's group secrets to some
+	// OTHER joiner's init key, silently, with every length equal and every seal well formed.
+	// The proposal list was rebuilt around one representation precisely because a COUNT is what
+	// a dual representation gets held together by and a count is what let four forks through, so
+	// this is stated where the pairing is used rather than assumed at a distance.
+	errWelcomeAddPairing = errors.New(
+		"mls: the leaves this commit added and the Add proposals it names are not the same list")
+
+	// errWelcomePathSecret is a commit that carried an update path and cannot say where one of
+	// its joiners picks that path up.
+	//
+	// A refusal and not a nil path secret, which is the whole reason it exists. GroupSecrets
+	// carries an optional<PathSecret>, so "absent" is a MEANING a joiner acts on -- seed your
+	// direct path from the tree as it stands -- and a commit that reset the nodes above the
+	// joiner while telling it nothing was reset produces a member that derives the wrong key for
+	// every node it shares with the committer, at the far end, with nothing here to point at.
+	errWelcomePathSecret = errors.New(
+		"mls: this commit carried an update path and holds no path secret for a joiner")
 )
 
 // StateStore persists group state and private key material across process restarts. It is
@@ -1630,17 +1656,154 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 		plan:        plan,
 		restoreKind: restoreFromJoiner,
 	}
+	// step 10: the Welcome for the members this commit adds, built BEFORE the staged epoch is
+	// installed as this group's pending commit.
+	//
+	// THAT ORDER IS THE REFUSAL'S. welcomeMessage can fail -- a joiner whose key package will
+	// not encode, a commit that cannot say where a joiner picks up its path -- and a failure
+	// after `self.pending = staged` would leave this group holding a staged epoch its caller was
+	// never handed and does not know to clear, while answering that caller an error. So the
+	// staged commit stays a local until the last thing that can fail has succeeded, and the one
+	// path that drops it erases it: it is a complete second epoch -- a key schedule, a secret
+	// tree and the leaf key this commit drew -- and after the return nothing in this process can
+	// reach it.
+	//
+	// IT IS HANDED THE GROUP INFO STEP 8 ALREADY BUILT, SIGNED AND VERIFIED, rather than
+	// assembling a second one. Two assemblies of one structure agree with each other for exactly
+	// as long as their field lists happen to match, which is the defect welcome_wire.go's header
+	// states and which this project has already paid for once on KeyPackage; and this way the
+	// group info a joiner opens out of the Welcome is the very object VerifiedContext accepted
+	// against the tree this result publishes, rather than a second one built to the same recipe.
+	welcome, err := staged.welcomeMessage(self.crypto, groupInfo)
+	if err != nil {
+		staged.Zeroize()
+		return nil, err
+	}
 	self.pending = staged
 	handedOn = true
 
-	// AND THE WELCOME FOR THE MEMBERS THIS COMMIT ADDS IS TASK 15'S, so a commit covering an Add
-	// answers none today. That is a HOLE and not a design: the added member has a leaf in the tree
-	// this result publishes and no way to reach the epoch, and
-	// TestACommitCoveringAnAddCarriesNoWelcomeUntilTask15 is what makes it impossible to forget --
-	// it fails on the commit that starts building one, rather than waiting for somebody to
-	// remember. Task 15 assembles it from `staged`, which carries the new epoch's schedule, the
-	// post-commit tree and the leaves the adds landed on.
-	return &CommitResult{Commit: commitMessage, RatchetTree: encodedTree}, nil
+	return &CommitResult{
+		Commit:      commitMessage,
+		Welcome:     welcome,
+		RatchetTree: encodedTree,
+	}, nil
+}
+
+// welcomeMessage builds the Welcome for every member this commit added, or nil for a commit that
+// added nobody.
+//
+// A METHOD ON THE STAGED COMMIT AND NOT ON THE GROUP, where the plan wrote it. Every
+// field it reads is this commit's own -- the leaves the adds landed on, the proposal list they
+// came from, the update path plan, the new epoch's key schedule and the committer's leaf -- so it
+// touches no group state and needs nothing the epoch boundary has not already settled.
+//
+// The shape is also what keeps CreateCommit inside
+// TestEveryCompositionEnteringALabelledConstructionIsBoundedBeforeItGetsThere, and that is
+// measured rather than incidental. That gate taints a receiver the moment a composition is handed
+// to a METHOD ON IT -- "a value handed to a method on a local is part of that local from here on"
+// -- so the same body written as a GROUP method, called self.buildWelcome(staged, groupInfo),
+// makes every later self.something() in CreateCommit carry the group info, and five of that
+// function's own compositions were then reported as reaching a labelled construction through
+// self.senderDataSecretLocked(). Written as a method on the value the bytes already belong to,
+// the taint stays where it was.
+//
+// NIL AND NOT AN EMPTY WELCOME for the no-add case, because CommitResult.Welcome is documented as
+// nil when the commit adds nobody and a caller branches on it: a Welcome sealed to an empty
+// joiner set is a message a delivery service would carry to nobody, at the cost of one AEAD seal
+// over the group info every time anybody commits anything.
+//
+// THE PATH SECRET EACH JOINER IS HANDED is the one for the LOWEST NODE ITS LEAF AND THE
+// COMMITTER'S LEAF SHARE, RFC 9420 section 12.4.3.1. That node is on the committer's filtered
+// direct path whenever the commit carries a path at all: its child on the joiner's side contains
+// the joiner's leaf, which the proposals have already installed in the tree the plan was built
+// over, so that child's resolution is non-empty and the node is not one the filter drops. It is
+// also exactly the node the joiner is NOT sealed to in the update path itself -- CreateCommit
+// excludes the added leaves from EncryptUpdatePath, because a member that holds no key yet cannot
+// open anything -- so this secret and that exclusion are two halves of one decision.
+//
+// The secret is CLONED into the joiner entry rather than aliased off the plan. The entries are
+// erased below the moment the seals are made, and an entry that aliased the plan's ladder would
+// erase the committer's own path secrets as a side effect of building a message.
+func (self *StagedCommit) welcomeMessage(crypto CryptoProvider, info *GroupInfo) ([]byte, error) {
+	// the provider first, before anything is read off the receiver: every seal, expansion and
+	// reference below is taken through it, and a caller that passed none is told that rather
+	// than being answered "this commit added nobody", which is true of the zero value and is
+	// not the fault it made.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the welcome is sealed through it", ErrNilCryptoProvider)
+	}
+	if len(self.added) == 0 {
+		return nil, nil
+	}
+	adds := self.list.Adds()
+	if len(adds) != len(self.added) {
+		return nil, fmt.Errorf("%w: %d leaf/leaves were added and %d Add proposal(s) are named",
+			errWelcomeAddPairing, len(self.added), len(adds))
+	}
+	joiners := make([]WelcomeJoiner, 0, len(self.added))
+	// the entries hold this epoch's path secrets, and they are this function's own copies, so
+	// this function is the drop site that owes them an erase. The defer covers the refusals below
+	// as well as the ordinary return: a Welcome that could not be built is still a Welcome whose
+	// ladder was assembled.
+	defer func() {
+		for i := range joiners {
+			joiners[i].Zeroize()
+		}
+	}()
+	for i, leafIndex := range self.added {
+		joiner := WelcomeJoiner{
+			KeyPackage: adds[i].Proposal.Add.KeyPackage,
+			LeafIndex:  leafIndex,
+		}
+		if self.plan != nil {
+			ancestor := CommonAncestor(leafIndex.NodeIndex(), self.committer.NodeIndex())
+			secret := pathSecretAt(self.plan, ancestor)
+			if secret == nil {
+				return nil, fmt.Errorf("%w: node %d is the lowest node leaf %d and leaf %d share",
+					errWelcomePathSecret, ancestor, leafIndex, self.committer)
+			}
+			joiner.PathSecret = cloneBytes(secret)
+		}
+		joiners = append(joiners, joiner)
+	}
+
+	// the CLEARTEXT suite of the Welcome is the one the epoch this commit opens names, which is
+	// the same suite the provider runs -- NewGroup refused any other pairing at creation and no
+	// commit changes a group's ciphersuite. BuildWelcome refuses the disagreement rather than
+	// trusting that sentence.
+	welcome, err := BuildWelcome(crypto, self.context.CipherSuite, info,
+		self.schedule.JoinerSecret(), self.schedule.WelcomeSecret(), joiners)
+	if err != nil {
+		return nil, err
+	}
+	return MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatWelcome,
+		Welcome:    welcome,
+	})
+}
+
+// pathSecretAt is the plan's secret for one node, or nil for a node the plan does not cover.
+//
+// UpdatePathPlan.Path and UpdatePathPlan.PathSecrets are PARALLEL -- CreateUpdatePathSecrets
+// builds one ladder rung per filtered node and slices the commit secret off the end -- so this is
+// an index lookup into the structure that already exists rather than a second map of the same
+// data kept beside it. A second map is the dual representation the proposal list was rebuilt to
+// remove, at a smaller scale.
+//
+// Nil for a nil plan, for the same reason it answers nil for an unlisted node: "the secret for
+// this node, if the commit has one" is the question every call site asks, and the caller that
+// cannot proceed without one refuses on the nil rather than on a second guard here.
+func pathSecretAt(plan *UpdatePathPlan, node NodeIndex) []byte {
+	if plan == nil {
+		return nil
+	}
+	for i, x := range plan.Path {
+		if x == node && i < len(plan.PathSecrets) {
+			return plan.PathSecrets[i]
+		}
+	}
+	return nil
 }
 
 // ClearPendingCommit discards a staged commit. It is what a caller calls when the delivery service

@@ -2977,6 +2977,17 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 	// and the welcome secret, at KDF.Nh and distinct from all five above for the same
 	// reason
 	welcomeSecret := bytes.Repeat([]byte{0x76}, params.Nh)
+	// the published key package p7 task 15's welcome row is addressed to, minted ONCE. Its
+	// reference is one of the two answers that row compares across two calls, and a key package
+	// minted per call carries fresh keys and a fresh wall clock lifetime, so its reference moves
+	// for a reason that has nothing to do with the builder.
+	welcomeRowKeyPackagePtr, _, _, err := NewKeyPackage(crypto, params.Suite,
+		BasicCredential([]byte("the identity the welcome row is addressed to")),
+		testCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("mint the key package the welcome row is addressed to: %v", err)
+	}
+	welcomeRowKeyPackage := *welcomeRowKeyPackagePtr
 	// a second provider over a constant reader, for the one construction here that
 	// encapsulates. EncryptWithLabel draws its ephemeral key through the provider it is
 	// handed, so over a fixed stream it answers the same twice and the determinism half of
@@ -3881,6 +3892,46 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{preimage}
 		}},
+		// p7 task 15's welcome builder. Every run it is handed belongs to its caller -- the
+		// epoch's joiner and welcome secrets, one joiner's path secret, and every octet of the
+		// group info and of the key package the entry is addressed to -- and a builder that
+		// wrote into any of them would be one whose caller's staged epoch changed as a side
+		// effect of assembling a message.
+		//
+		// Only the two DETERMINISTIC answers are returned. Each group secrets entry
+		// encapsulates to a fresh ephemeral, so two calls differ there BY DESIGN and returning
+		// a ciphertext would fail this gate's "answered %x and then %x for one input" rule
+		// against a correct implementation; the sealed group info and the key package
+		// reference are what two calls over one input must agree on.
+		{name: "BuildWelcome", call: func(take func([]byte) []byte) [][]byte {
+			// the key package is minted ONCE for the whole gate, above, and only its init key
+			// is handed through take. NewKeyPackage draws fresh keys and stamps a lifetime off
+			// the wall clock, so a row that minted one per call would answer a different
+			// KeyPackageRef each time and fail this gate's "answered %x and then %x for one
+			// input" rule against a correct builder.
+			joiner := welcomeRowKeyPackage
+			joiner.InitKey = HpkePublicKey(take(bytes.Clone(welcomeRowKeyPackage.InitKey)))
+			welcome, welcomeErr := BuildWelcome(crypto, params.Suite, &GroupInfo{
+				GroupContext: GroupContext{
+					Version:                 ProtocolVersionMls10,
+					CipherSuite:             params.Suite,
+					GroupId:                 take([]byte("the group this welcome row describes")),
+					Epoch:                   3,
+					TreeHash:                take(bytes.Repeat([]byte{0x51}, params.Nh)),
+					ConfirmedTranscriptHash: take(bytes.Repeat([]byte{0x52}, params.Nh)),
+				},
+				ConfirmationTag: take(bytes.Repeat([]byte{0x53}, params.Nh)),
+			}, take(bytes.Repeat([]byte{0x54}, params.Nh)), take(bytes.Repeat([]byte{0x55}, params.Nh)),
+				[]WelcomeJoiner{{
+					KeyPackage: joiner,
+					LeafIndex:  1,
+					PathSecret: take(bytes.Repeat([]byte{0x56}, params.Nh)),
+				}})
+			if welcomeErr != nil {
+				t.Fatalf("BuildWelcome: %v", welcomeErr)
+			}
+			return [][]byte{welcome.EncryptedGroupInfo, welcome.Secrets[0].NewMember}
+		}},
 		{name: "compareMemberIds", call: func(take func([]byte) []byte) [][]byte {
 			compareMemberIds(take([]byte{0x01, 0x02}), take([]byte{0x01, 0x03}))
 			return nil
@@ -4297,6 +4348,7 @@ var providerConstructionValues = map[string]any{
 	"NewKeyScheduleFromEpochSecret": NewKeyScheduleFromEpochSecret,
 	"newKeyScheduleFromParts":       newKeyScheduleFromParts,
 	"WelcomeKeyNonce":               WelcomeKeyNonce,
+	"BuildWelcome":                  BuildWelcome,
 	"PskSecret":                     PskSecret,
 	"EmptyPskSecret":                EmptyPskSecret,
 	"ConfirmedTranscriptHash":       ConfirmedTranscriptHash,
@@ -4490,6 +4542,28 @@ func providerStubStream(first byte) io.Reader {
 // below, so a later method taking one of them fails to resolve rather than being handed
 // another operation's answer, which would fail for a reason that is not the one this gate
 // is about.
+// providerStubKeyPackage is the published key package the welcome row is addressed to.
+//
+// It is minted over a STREAM OF ITS OWN rather than over the provider this gate is about to
+// measure. NewKeyPackage draws three times, so building an argument through the subject would
+// move the window every later row is counted in -- which is the shape this gate's own comment
+// warns about one function down, read back onto the arguments rather than onto the calls.
+//
+// A real key package and not a hand assembled one, because (*KeyPackage).Ref encodes the whole
+// structure: a zero KeyPackage carries credential type 0, which Credential.MarshalMLS refuses,
+// so BuildWelcome over one would answer an error and this gate would report the refusal as the
+// zero answer a stub gives.
+func providerStubKeyPackage(t *testing.T, params *SuiteParams) KeyPackage {
+	t.Helper()
+	minting := mustProviderOver(t, params.Suite, providerStubStream(0x11))
+	kp, _, _, err := NewKeyPackage(minting, params.Suite,
+		BasicCredential(ascendingBytes(0xc6, 16)), testCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("mint the key package the welcome row is addressed to: %v", err)
+	}
+	return *kp
+}
+
 func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvider) map[string]any {
 	t.Helper()
 	arguments := map[string]any{
@@ -4576,6 +4650,38 @@ func providerStubArguments(t *testing.T, params *SuiteParams, crypto CryptoProvi
 				Secret: ascendingBytes(0xb3, params.Nh),
 			},
 		},
+		// p7 task 15's welcome builder. Both of these resolve by NAME rather than by type: a
+		// group info is a whole structure and a joiner list is a slice of them, so neither is a
+		// run this gate's generic byte rows could stand in for.
+		//
+		// Every field of the group info carries something, for the group context row's reason
+		// one entry up: a field left empty is one a perturbation has nothing to move, and a
+		// preimage that dropped it would be reported as covered while saying nothing.
+		"BuildWelcome.info": &GroupInfo{
+			GroupContext: GroupContext{
+				Version:                 ProtocolVersionMls10,
+				CipherSuite:             params.Suite,
+				GroupId:                 ascendingBytes(0xc1, 24),
+				Epoch:                   11,
+				TreeHash:                ascendingBytes(0xc2, params.Nh),
+				ConfirmedTranscriptHash: ascendingBytes(0xc3, params.Nh),
+			},
+			Extensions:      []Extension{{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: ascendingBytes(0xc7, 8)}},
+			ConfirmationTag: ascendingBytes(0xc4, params.Nh),
+			Signer:          1,
+			Signature:       ascendingBytes(0xc8, 64),
+		},
+		// ONE joiner and not none, and that is what makes the row measure anything. With an
+		// empty list BuildWelcome seals the group info and nothing else: it never reads the
+		// joiner secret, never draws an ephemeral, and the perturbation of joinerSecret below
+		// would report "does not read the joinerSecret it was handed" against a correct
+		// implementation. One joiner is also what fixes the draw this gate counts, at one
+		// ephemeral scalar; see providerStreamDraws.
+		"BuildWelcome.joiners": []WelcomeJoiner{{
+			KeyPackage: providerStubKeyPackage(t, params),
+			LeafIndex:  1,
+			PathSecret: ascendingBytes(0xc5, params.Nh),
+		}},
 		"label":  "stub gate label",
 		"length": 32,
 		"n":      32,
@@ -4782,6 +4888,11 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		if argument.Type() == reflect.TypeOf([]PreSharedKeyInput(nil)) {
 			return providerPskInputPerturbations(t, operation, parameter, argument)
 		}
+		// p7 task 15's joiner list, a slice of structs for the same reason the psk list is. Its
+		// rule lives beside the structure it moves, in welcome_test.go.
+		if argument.Type() == reflect.TypeOf([]WelcomeJoiner(nil)) {
+			return providerWelcomeJoinerPerturbations(t, operation, parameter, argument)
+		}
 		if argument.Type().Elem().Kind() != reflect.Uint8 {
 			break
 		}
@@ -4861,6 +4972,13 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 		// lives beside that structure in treekem_test.go for the reason the ciphertext's does.
 		if argument.Type() == reflect.TypeOf((*UpdatePath)(nil)) && !argument.IsNil() {
 			return providerUpdatePathPerturbations(t, operation, parameter, argument)
+		}
+		// p7 task 15's welcome group info, whose fields are a nested struct, a vector of
+		// structs and two byte slices this rule cannot reach through a pointer. Its rule lives
+		// beside the structure in welcome_test.go, which is where leaf_node_test.go,
+		// psk_test.go and treekem_test.go keep theirs.
+		if argument.Type() == reflect.TypeOf((*GroupInfo)(nil)) && !argument.IsNil() {
+			return providerGroupInfoPerturbations(t, operation, parameter, argument)
 		}
 		if argument.Type() != reflect.TypeOf((*GroupContext)(nil)) || argument.IsNil() {
 			break
@@ -5079,6 +5197,26 @@ func providerStructByteFields(value reflect.Value) [][]byte {
 			carried = append(carried, out)
 		case field.Kind() == reflect.Struct:
 			carried = append(carried, providerStructByteFields(field)...)
+		// a VECTOR of structures carries bytes no less than a map of them does, and RFC 9420's
+		// wire types are full of them: a Welcome's secrets<V> is one EncryptedGroupSecrets per
+		// joiner and holds every per-member seal the structure has. Without this case the whole
+		// of that vector rendered as no bytes at all -- which is the answer a stub gives, so a
+		// builder that sealed nothing per joiner was indistinguishable here from a complete one.
+		//
+		// MEASURED, not supposed: with the vector unread, BuildWelcome answered identically with
+		// its joinerSecret moved at every probed position, and this gate reported "does not read
+		// the joinerSecret it was handed" against an implementation that reads it into every
+		// entry of the vector it had just stopped looking at.
+		//
+		// IN ORDER and never sorted, which is the one difference from the map case below. A
+		// vector has an order the wire fixes, so two renderings of one value already agree
+		// without sorting, and sorting would throw away the property a Welcome rests on -- that
+		// entry i is joiner i -- by rendering a builder that transposed two entries as identical
+		// to one that did not.
+		case field.Kind() == reflect.Slice && field.Type().Elem().Kind() == reflect.Struct:
+			for at := range field.Len() {
+				carried = append(carried, providerStructByteFields(field.Index(at))...)
+			}
 		case field.Kind() == reflect.Map && field.Type().Elem().Kind() == reflect.Slice &&
 			field.Type().Elem().Elem().Kind() == reflect.Uint8:
 			// a type that holds its secrets in a MAP holds them no less, and the secret
@@ -5235,6 +5373,12 @@ func providerStubZeroResults(results []reflect.Value) []string {
 // function of its argument and nothing else, so it passes every perturbation this gate
 // makes and reports here as an operation that no longer reads the stream it was given.
 var providerStreamDependentOperations = []string{
+	// p7 task 15's welcome builder, which is stream dependent for exactly one reason: it seals
+	// one GroupSecrets per joiner and every one of those seals encapsulates to a fresh
+	// ephemeral. The group info half of a Welcome is derived and not drawn, so a build over two
+	// streams that answered the same secrets entries would be one where the per-joiner
+	// encapsulation is a constant.
+	"BuildWelcome",
 	"EncryptWithLabel",
 	"HpkeSeal",
 	// the key package constructor draws three times -- a signature key pair and two
@@ -7865,6 +8009,12 @@ func (self *countingReader) Read(p []byte) (int, error) {
 // and discarded it answers identically over two streams and is invisible there. Measured:
 // an AeadSeal with a self.Random(1) in it passed TestProviderHasNoRemainingStubs.
 var providerStreamDraws = map[string]func(params *SuiteParams) int{
+	// ONE ephemeral scalar PER JOINER, and this gate's row carries one joiner. That number is
+	// the property rather than an artefact of the fixture: a builder that drew once and reused
+	// the encapsulation across a Welcome's entries draws Nsk however many joiners it was
+	// handed, and a builder that drew a seed it then discarded draws more. Both answer a
+	// Welcome that decodes, and only a count separates either from a correct one.
+	"BuildWelcome":     func(params *SuiteParams) int { return params.Nsk },
 	"EncryptWithLabel": func(params *SuiteParams) int { return params.Nsk },
 	"HpkeSeal":         func(params *SuiteParams) int { return params.Nsk },
 	// the same ephemeral scalar as the call it forwards to, since it IS that call: an

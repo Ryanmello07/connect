@@ -434,3 +434,203 @@ func (self *GroupInfo) Verify(crypto CryptoProvider, tree *RatchetTree) error {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// p7 task 15: building the Welcome the members a commit adds are handed
+// ---------------------------------------------------------------------------
+
+// errNilWelcomeGroupInfo is BuildWelcome handed no group info to seal.
+//
+// A refusal and not the nil dereference syntax.Marshal would take one statement later, for
+// OpenWithLabel's reason in treekem.go: a builder answers a failure as an error and never as a
+// Welcome, and a panic out of a library takes the caller's process rather than its call.
+//
+// Unexported, for the rule tree_errors.go states: an exported Err in a file with no maintained
+// error class is one no exclusivity sweep of this package judges. It is separate from the two
+// group info sentinels above because it names a different fault -- those two are about an object
+// that IS here, and this one is about there being none.
+var errNilWelcomeGroupInfo = errors.New("mls: there is no group info for this welcome to carry")
+
+// errWelcomeSuiteProvider is a Welcome asked to name one ciphersuite in the clear while every
+// seal in it is made with another suite's primitives.
+//
+// It is a real refusal rather than hygiene. Welcome.CipherSuite is the ONE field of a Welcome
+// that is necessarily in the clear -- welcome_wire.go says why: a joiner picks its KDF and its
+// AEAD off it BEFORE it can open either ciphertext -- so a builder that labelled its output with
+// a suite the provider does not run produces a Welcome that decodes perfectly and that no joiner
+// on earth can open, with the fault surfacing at the far end as a bad AEAD tag over a group info
+// nobody tampered with.
+//
+// It is NOT ErrWelcomeSuiteMismatch, which is task 16's and names the joiner-side comparison of a
+// Welcome's cleartext suite against the key package the joiner published. Those are two values
+// neither of which this function is handed, and a builder told its own provider disagreed would
+// be sent to look at a key package that was never in question.
+var errWelcomeSuiteProvider = errors.New(
+	"mls: the welcome names a ciphersuite the provider building it does not run")
+
+// welcomeHpkeLabel is RFC 9420 section 12.4.3.1's label for the per-joiner seal, written once
+// for groupInfoSignatureLabel's reason one declaration up: a label spelled one way in the
+// sealing half and another in the opening half agrees with itself perfectly, because the label
+// goes into the HPKE info of both, and only a PEER can tell "Welcome" from "welcome". It is also
+// what keeps a sealed GroupSecrets from opening as an UpdatePathNode's path secret under the
+// same key.
+const welcomeHpkeLabel = "Welcome"
+
+// WelcomeJoiner is one new member and the path secret, if any, for the lowest node the joiner's
+// leaf and the committer's leaf share.
+//
+// PathSecret is nil when the commit carried no update path, and nil MEANS SOMETHING here rather
+// than being an empty default: GroupSecrets.PathSecret is an optional<PathSecret>, so nil is the
+// absent presence octet a joiner reads as "seed your direct path from the tree as it stands",
+// and a present one is "the committer reset the nodes above you, and this is where you pick them
+// up".
+type WelcomeJoiner struct {
+	KeyPackage KeyPackage
+	LeafIndex  LeafIndex
+	PathSecret []byte
+}
+
+// Zeroize erases the path secret this joiner entry carries.
+//
+// It is here because a WelcomeJoiner HOLDS KEY MATERIAL, which is the obligation the phase before
+// this one states over the types that DECLARE storage rather than over the ones somebody
+// remembered: the path secret is the seed for every node between the joiner's leaf and the root
+// of the epoch the commit opens, so an entry dropped with it still in it is that ladder left in
+// the heap for the collector to move around. (*StagedCommit).welcomeMessage erases the entries it
+// assembled the moment the seals are made, and that is the drop site this method exists for.
+//
+// THE KEY PACKAGE IS DELIBERATELY NOT TOUCHED. It is the joiner's PUBLISHED key package -- it
+// arrived in an Add proposal that went to every member of the group and to the delivery service,
+// and every field of its encoding is public -- so erasing it would take away nothing an attacker
+// lacks while destroying a value the caller still owns.
+//
+// A nil receiver is accepted for zeroizeSecret's reason: "erase this entry if there is one" is
+// the shape of every drop site, and a guard written at each of them is one that will be missing
+// at the next one somebody adds.
+//
+// The noinline directive is the erase class's rule; see (*TreeKEMPrivate).Zeroize.
+//
+//go:noinline
+func (self *WelcomeJoiner) Zeroize() {
+	if self == nil {
+		return
+	}
+	zeroizeSecret(self.PathSecret)
+}
+
+// BuildWelcome seals the GroupInfo once under the welcome key and seals the GroupSecrets once
+// per joiner under that joiner's own init key.
+//
+// A WELCOME AUTHENTICATES NOTHING ABOUT WHOEVER BUILT IT, and that sentence belongs on the
+// function that PRODUCES the object rather than only on the one that consumes it. Every input
+// here is public: the init key each entry is sealed to comes off a KeyPackage the joiner
+// PUBLISHED, so anybody at all holding that key package can build a Welcome addressed to it, and
+// the GroupInfo inside is signed by whatever leaf of whatever tree the builder chose to name.
+// (*GroupInfo).Verify establishes that a member of the tree THE JOINER PASSES signed it and
+// nothing more, so a joiner that took its tree out of this same message has verified a forgery
+// against itself. welcome.go's header states where a joiner's tree has to come from and task
+// 16's JoinFromWelcome is the caller that owes it; nothing in this function supplies it.
+//
+// TWO DETAILS ARE TRANSCRIBED FROM RFC 9420 section 12.4.3.1 RATHER THAN RECONSTRUCTED, and both
+// are invisible to a round trip through this package alone:
+//
+//   - the group info is AEAD-sealed under welcome_key/welcome_nonce with EMPTY AAD. An
+//     implementation that fed it the group context instead seals and opens against itself
+//     perfectly and interoperates with nothing;
+//   - the group secrets are sealed with SealWithLabel(init_key, "Welcome",
+//     encrypted_group_info, group_secrets), so the HPKE CONTEXT IS THE ENCRYPTED GROUP INFO and
+//     not the group context. Same shape, same failure, and it is also what binds each sealed
+//     GroupSecrets to the one encrypted_group_info it travelled with: an entry lifted onto
+//     another Welcome no longer opens.
+//
+// GroupSecrets.Psks is an EMPTY []PreSharedKeyId and never nil-with-a-meaning. PSK proposals are
+// profile-refused, so there is never a PSK to name, and the typed empty vector is what lets a
+// joiner ASSERT the vector is empty rather than ignore whatever arrived in it.
+//
+// The joiner secret is shared by every entry -- it is the EPOCH's and not the member's -- and the
+// path secret is per entry, which is why this is a loop rather than one seal fanned out.
+func BuildWelcome(crypto CryptoProvider, suite CipherSuite, info *GroupInfo,
+	joinerSecret []byte, welcomeSecret []byte, joiners []WelcomeJoiner) (*Welcome, error) {
+
+	// the provider first, before any other argument is judged: every expansion, seal and
+	// reference below is taken through it, so a caller that passed none passed nothing this
+	// function could have used, and answering it about the group info would send it to look at
+	// the argument that is not the problem.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: the welcome key, every seal and every key package reference are taken through it",
+			ErrNilCryptoProvider)
+	}
+	if info == nil {
+		return nil, errNilWelcomeGroupInfo
+	}
+	if suite != crypto.Suite() {
+		return nil, fmt.Errorf("%w: the welcome names %#04x and the provider runs %#04x",
+			errWelcomeSuiteProvider, uint16(suite), uint16(crypto.Suite()))
+	}
+
+	// BOUNDED and not syntax.Marshal, and the reason is one frame further on than it looks.
+	// The encrypted group info becomes the HPKE CONTEXT of every per-joiner seal below, and
+	// EncryptWithLabel wraps that context in an EncryptContext whose context<V> is a labelled
+	// field: checkLabelledConstruction refuses one past MaxVectorLength. syntax.Marshal bounds
+	// each field it writes and says nothing about the SUM, so a group info that encodes happily
+	// at 1050045 octets would be sealed, and then refused at the first joiner with a message
+	// about a labelled field rather than about the group info that overran. The refusal belongs
+	// here, where a caller can still be told which structure was too big -- which is
+	// marshalBoundedComposition's own argument, and (*KeyPackage).Ref's reason for using it.
+	//
+	// It is the same cap a GroupInfo SIGNATURE already runs under -- checkLabelledConstruction,
+	// one frame inside SignWithLabel, over the preimage (*GroupInfo).signaturePreimage builds --
+	// so a group info that could be signed can be sealed, and this refuses nothing that had a
+	// signature to carry.
+	encodedInfo, err := marshalBoundedComposition("group info", info)
+	if err != nil {
+		return nil, err
+	}
+	key, nonce, err := WelcomeKeyNonce(crypto, welcomeSecret)
+	if err != nil {
+		return nil, err
+	}
+	// EMPTY AAD, per the paragraph above. The nil is the RFC's value and not an omission.
+	encryptedInfo, err := crypto.AeadSeal(key, nonce, nil, encodedInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	welcome := &Welcome{
+		CipherSuite:        suite,
+		Secrets:            make([]EncryptedGroupSecrets, 0, len(joiners)),
+		EncryptedGroupInfo: encryptedInfo,
+	}
+	for i := range joiners {
+		joiner := &joiners[i]
+		secrets := &GroupSecrets{JoinerSecret: joinerSecret, Psks: []PreSharedKeyId{}}
+		if joiner.PathSecret != nil {
+			secrets.PathSecret = &PathSecret{PathSecret: joiner.PathSecret}
+		}
+		plaintext, err := syntax.Marshal(secrets)
+		if err != nil {
+			return nil, err
+		}
+		// the encrypted group info as the context, per the paragraph above.
+		ciphertext, err := SealWithLabel(crypto, joiner.KeyPackage.InitKey, welcomeHpkeLabel,
+			encryptedInfo, plaintext)
+		// the cleartext copy of this epoch's joiner secret beside one joiner's path secret,
+		// erased as soon as it has been sealed. It is a buffer this function BUILT and not one a
+		// caller owns -- every array the caller passed is untouched -- and it is the one place in
+		// this build where those two secrets sit side by side in the clear. Erased on the failure
+		// path as well, which is why it is written before the error check rather than after it.
+		zeroizeSecret(plaintext)
+		if err != nil {
+			return nil, err
+		}
+		ref, err := joiner.KeyPackage.Ref(crypto)
+		if err != nil {
+			return nil, err
+		}
+		welcome.Secrets = append(welcome.Secrets, EncryptedGroupSecrets{
+			NewMember:             ref,
+			EncryptedGroupSecrets: *ciphertext,
+		})
+	}
+	return welcome, nil
+}

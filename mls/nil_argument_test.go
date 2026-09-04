@@ -384,6 +384,17 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err := MarshalMLSMessage(nil)
 			return err
 		}},
+		// p7 task 15's builder, whose group info would otherwise be dereferenced inside
+		// marshalBoundedComposition at its first statement after the provider check. The row
+		// hands VALID secrets, because a welcome secret of the wrong length is WelcomeKeyNonce's
+		// ErrSecretLength and would report a refusal this row did not ask for -- and it is
+		// errNilWelcomeGroupInfo rather than any of welcome.go's other sentinels because no
+		// group info is not a group info this provider cannot check, nor one whose preimage will
+		// not encode: nothing whatever has been decided about an object that is not here.
+		"BuildWelcome(info)": {sentinel: errNilWelcomeGroupInfo, call: func(t *testing.T) error {
+			_, err := BuildWelcome(crypto, crypto.Suite(), nil, secret, secret, nil)
+			return err
+		}},
 		// the framing pair, which is what this file was written for
 		"FramedContentTBSBytes(content)": {sentinel: errNilFramedContent, call: func(t *testing.T) error {
 			_, err := FramedContentTBSBytes(WireFormatPrivateMessage, nil, framingTestGroupContext(t))

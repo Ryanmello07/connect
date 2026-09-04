@@ -381,14 +381,19 @@ func TestCommitStagesTheEpochItOpensRatherThanEnteringIt(t *testing.T) {
 	}
 }
 
-// TestACommitCoveringAnAddCarriesNoWelcomeUntilTask15 is an expiry-by-failure assertion and not a
-// property this build wants.
+// TestACommitAnswersAWelcomeExactlyWhenItAddsSomebody is what replaced this file's
+// expiry-by-failure assertion once p7 task 15 landed.
 //
-// buildWelcomeLocked answers nil, so a member this commit adds has a leaf in the published tree and
-// no way to reach the epoch. That is a hole, it is task 15's, and this is what makes it impossible
-// to forget: the moment the Welcome is built this test FAILS, and the repair is to replace it with
-// the assertion the plan's task 15 writes.
-func TestACommitCoveringAnAddCarriesNoWelcomeUntilTask15(t *testing.T) {
+// It is the SHAPE half and the whole of it: what the Welcome carries -- the group info a joiner
+// verifies, the epoch it names, the confirmation tag, the joiner secret and the path secret -- is
+// held in welcome_test.go, next to the builder those assertions are about.
+//
+// BOTH DIRECTIONS, because either alone is satisfied by a build that ignores the question. A
+// committer that never builds a Welcome leaves the member it just added with a leaf in the
+// published tree and no way to reach the epoch; a committer that builds one for every commit
+// pays an AEAD seal over the group info to address nobody, and CommitResult.Welcome stops being
+// the flag a caller branches on.
+func TestACommitAnswersAWelcomeExactlyWhenItAddsSomebody(t *testing.T) {
 	crypto := testCrypto(t)
 	owner := testIdentity(t, crypto, "owner")
 	group := testNewGroup(t, crypto, owner, "group-1")
@@ -404,11 +409,28 @@ func TestACommitCoveringAnAddCarriesNoWelcomeUntilTask15(t *testing.T) {
 	if len(result.Commit) == 0 {
 		t.Fatal("the commit itself is empty, so this test observed nothing")
 	}
-	if result.Welcome != nil {
-		t.Fatal("a commit covering an Add now answers a Welcome; task 15 has landed, so delete this test and assert what the Welcome carries")
-	}
 	if staged := group.stagedForTest(); staged == nil || len(staged.AddedLeaves()) != 1 {
-		t.Fatal("the commit did not stage an add, so the assertion above is about the wrong shape")
+		t.Fatal("the commit did not stage an add, so the assertion below is about the wrong shape")
+	}
+	if len(result.Welcome) == 0 {
+		t.Fatal("a commit covering an Add answered no Welcome, so the member it added has a leaf in the published tree and no way to reach the epoch")
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+
+	// and the other direction, over a commit of the same group that adds nobody. Forced, because
+	// a commit with no proposals at all has nothing to require a path.
+	empty, err := group.CreateCommit(nil, nil, &CommitOptions{Force: true})
+	if err != nil {
+		t.Fatalf("a commit adding nobody: %v", err)
+	}
+	if staged := group.stagedForTest(); staged == nil || len(staged.AddedLeaves()) != 0 {
+		t.Fatal("the second commit staged an add, so the assertion below is about the wrong shape")
+	}
+	if empty.Welcome != nil {
+		t.Fatalf("a commit adding nobody answered a %d octet Welcome, and CommitResult.Welcome is what a caller branches on",
+			len(empty.Welcome))
 	}
 }
 

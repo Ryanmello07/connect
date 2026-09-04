@@ -975,6 +975,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// (*GroupInfo).Verify takes the *RatchetTree as an argument precisely because the signer's
 		// key comes from a tree the joiner obtained, not from the message.
 		"welcome.go: syntax.Marshal(&tbs)",
+		// p7 task 15's GroupSecrets plaintext, RFC 9420 section 12.4.3.1.
+		//
+		// The DEFAULT limit, and here it is the only one that could be right rather than a
+		// judgement between two. A GroupSecrets is one joiner secret, one optional path secret
+		// and a psks vector this profile always leaves empty -- about seventy octets -- and it
+		// becomes the PLAINTEXT of one HPKE seal, so nothing about it is bounded by the ratchet
+		// tree. The group info this welcome carries does not appear here at all: it goes through
+		// marshalBoundedComposition, because the ciphertext it becomes is the labelled CONTEXT of
+		// every seal below it and a labelled field caps at MaxVectorLength.
+		"welcome.go: syntax.Marshal(secrets)",
 		// the two vectors of RFC 9420 section 12.4.3.1: a Welcome's secrets<V> and a
 		// GroupSecrets' psks<V>. All four take the caller's Writer or Reader rather than
 		// building one, so each runs under whichever limit the caller opened.
@@ -1885,6 +1895,29 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 				t.Fatalf("EncryptWithLabel: %v", encryptErr)
 			}
 			return ciphertext
+		}},
+		// p7 task 15's welcome builder, over an EMPTY joiner set. The group info half is the
+		// one this row can read: it is an AEAD seal under a key and nonce this provider
+		// expanded, so a builder that reached for a provider of its own answers the same bytes
+		// over a provider that flips every answer. The per-joiner seals are left out on
+		// purpose -- they encapsulate to a fresh ephemeral, so they differ over any two
+		// providers whatever either of them did.
+		{name: "BuildWelcome", call: func(crypto CryptoProvider) []byte {
+			welcome, welcomeErr := BuildWelcome(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+				&GroupInfo{GroupContext: GroupContext{
+					Version:                 ProtocolVersionMls10,
+					CipherSuite:             CipherSuiteX25519ChaCha20Sha256Ed25519,
+					GroupId:                 []byte("the group this row describes"),
+					Epoch:                   5,
+					TreeHash:                bytes.Repeat([]byte{0x61}, crypto.HashSize()),
+					ConfirmedTranscriptHash: bytes.Repeat([]byte{0x62}, crypto.HashSize()),
+				}, ConfirmationTag: bytes.Repeat([]byte{0x63}, crypto.HashSize())},
+				bytes.Repeat([]byte{0x64}, crypto.HashSize()),
+				bytes.Repeat([]byte{0x65}, crypto.HashSize()), nil)
+			if welcomeErr != nil {
+				t.Fatalf("BuildWelcome: %v", welcomeErr)
+			}
+			return welcome.EncryptedGroupInfo
 		}},
 		{name: "DecryptWithLabel", call: func(crypto CryptoProvider) []byte {
 			plaintext, decryptErr := DecryptWithLabel(crypto, priv, "UpdatePathNode", value,

@@ -42,6 +42,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -1349,3 +1350,796 @@ func TestEveryRefusingExitOfGroupInfoVerifyNamesTheSentinelItRefusesUnder(t *tes
 			unnamed)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// p7 task 15: what a Welcome carries, and what a joiner can do with it
+// ---------------------------------------------------------------------------
+
+// welcomeTestSignedInfo is a signed GroupInfo over a fresh tree, with the members that own its
+// leaves.
+//
+// The group info is signed at leaf 0 by leaf 0's own key, which is the only pairing under which
+// (*GroupInfo).Verify answers nil -- so every test below that verifies is measuring what
+// BuildWelcome did to the object rather than a fixture that was never verifiable.
+func welcomeTestSignedInfo(t *testing.T, crypto CryptoProvider,
+	names ...string) (*RatchetTree, []*testMember, *GroupInfo) {
+
+	t.Helper()
+	tree, members := testTreeWith(t, crypto, names...)
+	info := testGroupInfoOverTree(t, crypto, tree, LeafIndex(0))
+	if err := info.Sign(crypto, members[0].SigPriv); err != nil {
+		t.Fatalf("Sign the fixture group info: %v", err)
+	}
+	return tree, members, info
+}
+
+// welcomeTestOpenGroupInfo is the joiner's half of the group info seal: open under
+// welcome_key/welcome_nonce with EMPTY AAD, then decode.
+//
+// It is written as the RFC describes the RECEIVE side rather than by calling anything
+// BuildWelcome called, which is the whole point of it: a helper that re-used the builder's own
+// statements would agree with the builder however either of them was wrong.
+func welcomeTestOpenGroupInfo(t *testing.T, crypto CryptoProvider, welcome *Welcome,
+	welcomeSecret []byte) *GroupInfo {
+
+	t.Helper()
+	key, nonce, err := WelcomeKeyNonce(crypto, welcomeSecret)
+	if err != nil {
+		t.Fatalf("WelcomeKeyNonce: %v", err)
+	}
+	plaintext, err := crypto.AeadOpen(key, nonce, nil, welcome.EncryptedGroupInfo)
+	if err != nil {
+		t.Fatalf("AeadOpen of the encrypted group info with empty AAD: %v", err)
+	}
+	decoded := &GroupInfo{}
+	if err := syntax.Unmarshal(plaintext, decoded); err != nil {
+		t.Fatalf("unmarshal the group info this welcome carries: %v", err)
+	}
+	return decoded
+}
+
+// welcomeTestOpenSecrets is the joiner's half of one EncryptedGroupSecrets: open under the
+// joiner's init private key with the ENCRYPTED GROUP INFO as the HPKE context, then decode.
+func welcomeTestOpenSecrets(t *testing.T, crypto CryptoProvider, welcome *Welcome, at int,
+	initPriv HpkePrivateKey) *GroupSecrets {
+
+	t.Helper()
+	opened, err := OpenWithLabel(crypto, initPriv, "Welcome", welcome.EncryptedGroupInfo,
+		&welcome.Secrets[at].EncryptedGroupSecrets)
+	if err != nil {
+		t.Fatalf("OpenWithLabel of secrets entry %d: %v", at, err)
+	}
+	secrets := &GroupSecrets{}
+	if err := syntax.Unmarshal(opened, secrets); err != nil {
+		t.Fatalf("unmarshal group secrets %d: %v", at, err)
+	}
+	return secrets
+}
+
+// welcomeTestFromCommit parses an MLSMessage(Welcome) as a joiner would and answers the Welcome
+// inside it, holding the outer frame to what a Welcome must be framed as.
+func welcomeTestFromCommit(t *testing.T, encoded []byte) *Welcome {
+	t.Helper()
+	if len(encoded) == 0 {
+		t.Fatal("this commit answered no welcome, so there is nothing here to read")
+	}
+	message, err := ParseMLSMessage(encoded)
+	if err != nil {
+		t.Fatalf("ParseMLSMessage over the welcome: %v", err)
+	}
+	if message.Version != ProtocolVersionMls10 {
+		t.Fatalf("the welcome names version %#04x, want mls10", uint16(message.Version))
+	}
+	if message.WireFormat != WireFormatWelcome {
+		t.Fatalf("the welcome is framed as wire format %#04x, want welcome", uint16(message.WireFormat))
+	}
+	if message.Welcome == nil {
+		t.Fatal("the message is framed as a welcome and carries no welcome arm")
+	}
+	return message.Welcome
+}
+
+// TestBuildWelcomeSealsTheGroupInfoUnderTheWelcomeKey is the plan's own case, and it is where the
+// two transcribed details of RFC 9420 section 12.4.3.1 are held: the group info opens with EMPTY
+// AAD, and the group secrets open with the ENCRYPTED GROUP INFO as the HPKE context.
+//
+// Both are invisible to a seal-then-open round trip written through BuildWelcome's own
+// statements, which is why every open here is spelled out from the RFC's receive side instead.
+func TestBuildWelcomeSealsTheGroupInfoUnderTheWelcomeKey(t *testing.T) {
+	crypto := testCrypto(t)
+	_, _, info := welcomeTestSignedInfo(t, crypto, "alice")
+	joinerSecret := bytes.Repeat([]byte{1}, crypto.HashSize())
+	welcomeSecret := bytes.Repeat([]byte{2}, crypto.HashSize())
+
+	bob := testIdentity(t, crypto, "bob")
+	kp, initPriv, _ := testKeyPackage(t, crypto, bob)
+	welcome, err := BuildWelcome(crypto, crypto.Suite(), info, joinerSecret, welcomeSecret,
+		[]WelcomeJoiner{{KeyPackage: *kp, LeafIndex: LeafIndex(1)}})
+	if err != nil {
+		t.Fatalf("BuildWelcome: %v", err)
+	}
+	if welcome.CipherSuite != crypto.Suite() {
+		t.Fatalf("the welcome names suite %#04x in the clear, want %#04x",
+			uint16(welcome.CipherSuite), uint16(crypto.Suite()))
+	}
+	if len(welcome.Secrets) != 1 {
+		t.Fatalf("Secrets = %d, want 1", len(welcome.Secrets))
+	}
+	ref, err := kp.Ref(crypto)
+	if err != nil {
+		t.Fatalf("Ref: %v", err)
+	}
+	if !bytes.Equal(welcome.Secrets[0].NewMember, ref) {
+		t.Fatal("the secrets entry is not keyed by the joiner's own KeyPackageRef, so a joiner scanning the vector for itself would not find it")
+	}
+
+	decoded := welcomeTestOpenGroupInfo(t, crypto, welcome, welcomeSecret)
+	if decoded.GroupContext.Epoch != info.GroupContext.Epoch {
+		t.Fatalf("the sealed group info names epoch %d and the one built names %d",
+			decoded.GroupContext.Epoch, info.GroupContext.Epoch)
+	}
+	if !bytes.Equal(decoded.ConfirmationTag, info.ConfirmationTag) {
+		t.Fatal("the sealed group info carries a different confirmation tag from the one built")
+	}
+
+	secrets := welcomeTestOpenSecrets(t, crypto, welcome, 0, initPriv)
+	if !bytes.Equal(secrets.JoinerSecret, joinerSecret) {
+		t.Fatal("the joiner secret did not survive the seal")
+	}
+	if secrets.PathSecret != nil {
+		t.Fatal("a commit with no path must produce a null path_secret, and a joiner reads a present one as nodes it must re-derive")
+	}
+	if secrets.Psks == nil || len(secrets.Psks) != 0 {
+		t.Fatalf("Psks = %v, want an empty vector: v1 never sends PSKs and the joiner asserts the vector is empty", secrets.Psks)
+	}
+}
+
+// TestBuildWelcomeCarriesThePathSecretWhenThereIsOne is the plan's second case: a joiner whose
+// entry carries a path secret gets that exact secret back out.
+func TestBuildWelcomeCarriesThePathSecretWhenThereIsOne(t *testing.T) {
+	crypto := testCrypto(t)
+	_, _, info := welcomeTestSignedInfo(t, crypto, "alice")
+	welcomeSecret := bytes.Repeat([]byte{2}, crypto.HashSize())
+	bob := testIdentity(t, crypto, "bob")
+	kp, initPriv, _ := testKeyPackage(t, crypto, bob)
+	pathSecret := bytes.Repeat([]byte{9}, crypto.HashSize())
+	welcome, err := BuildWelcome(crypto, crypto.Suite(), info,
+		bytes.Repeat([]byte{1}, crypto.HashSize()), welcomeSecret,
+		[]WelcomeJoiner{{KeyPackage: *kp, LeafIndex: LeafIndex(1), PathSecret: pathSecret}})
+	if err != nil {
+		t.Fatalf("BuildWelcome: %v", err)
+	}
+	secrets := welcomeTestOpenSecrets(t, crypto, welcome, 0, initPriv)
+	if secrets.PathSecret == nil {
+		t.Fatal("the path secret is absent, and a joiner reads absent as \"nothing above you was reset\"")
+	}
+	if !bytes.Equal(secrets.PathSecret.PathSecret, pathSecret) {
+		t.Fatalf("path secret = %x, want %x", secrets.PathSecret.PathSecret, pathSecret)
+	}
+}
+
+// TestBuildWelcomeSealsEachJoinersSecretsToThatJoinersOwnInitKey is the plan's "covers every
+// joiner" case with the assertion it needs to be worth running.
+//
+// Counting the entries is not the property. A builder that sealed all three to the FIRST
+// joiner's init key answers three entries, and every one of them decodes -- for one member. So
+// each entry is opened here with ITS OWN joiner's init private key and checked against its own
+// key package reference, which is the pairing a Welcome exists to establish.
+func TestBuildWelcomeSealsEachJoinersSecretsToThatJoinersOwnInitKey(t *testing.T) {
+	crypto := testCrypto(t)
+	_, _, info := welcomeTestSignedInfo(t, crypto, "alice")
+	joinerSecret := bytes.Repeat([]byte{1}, crypto.HashSize())
+	welcomeSecret := bytes.Repeat([]byte{2}, crypto.HashSize())
+
+	joiners := []WelcomeJoiner{}
+	initKeys := []HpkePrivateKey{}
+	packages := []*KeyPackage{}
+	for _, name := range []string{"bob", "carol", "dave"} {
+		kp, initPriv, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, name))
+		joiners = append(joiners, WelcomeJoiner{
+			KeyPackage: *kp,
+			LeafIndex:  LeafIndex(len(joiners) + 1),
+			// a DISTINCT path secret per joiner, so an entry opened with the wrong member's key
+			// is separated by its content and not only by which key opened it
+			PathSecret: bytes.Repeat([]byte{byte(0xa0 + len(joiners))}, crypto.HashSize()),
+		})
+		initKeys = append(initKeys, initPriv)
+		packages = append(packages, kp)
+	}
+	welcome, err := BuildWelcome(crypto, crypto.Suite(), info, joinerSecret, welcomeSecret, joiners)
+	if err != nil {
+		t.Fatalf("BuildWelcome: %v", err)
+	}
+	if len(welcome.Secrets) != len(joiners) {
+		t.Fatalf("Secrets = %d, want %d: the welcome set MUST cover every new member",
+			len(welcome.Secrets), len(joiners))
+	}
+	for i := range joiners {
+		ref, err := packages[i].Ref(crypto)
+		if err != nil {
+			t.Fatalf("Ref %d: %v", i, err)
+		}
+		if !bytes.Equal(welcome.Secrets[i].NewMember, ref) {
+			t.Fatalf("secrets entry %d is keyed by another member's key package reference", i)
+		}
+		secrets := welcomeTestOpenSecrets(t, crypto, welcome, i, initKeys[i])
+		if secrets.PathSecret == nil ||
+			!bytes.Equal(secrets.PathSecret.PathSecret, joiners[i].PathSecret) {
+
+			t.Fatalf("secrets entry %d carries another joiner's path secret", i)
+		}
+	}
+}
+
+// TestTheGroupInfoAWelcomeCarriesIsOneItsJoinerCanVerify is the round trip this task is judged
+// on: the object BuildWelcome sealed is checked with (*GroupInfo).Verify, the function a joiner
+// will actually run, against the tree that group info names.
+//
+// BOTH DIRECTIONS ARE HELD, because a positive alone is satisfied by a Verify that answers nil to
+// everything. The negative is the same fixture signed by leaf 0's key while NAMING leaf 1 as its
+// signer -- a group info that is perfectly well formed, seals and opens byte for byte, and is
+// refused because the key at the leaf it names did not make that signature.
+func TestTheGroupInfoAWelcomeCarriesIsOneItsJoinerCanVerify(t *testing.T) {
+	crypto := testCrypto(t)
+	tree, members, info := welcomeTestSignedInfo(t, crypto, "alice", "bob")
+	welcomeSecret := bytes.Repeat([]byte{2}, crypto.HashSize())
+	carol := testIdentity(t, crypto, "carol")
+	kp, _, _ := testKeyPackage(t, crypto, carol)
+	joiners := []WelcomeJoiner{{KeyPackage: *kp, LeafIndex: LeafIndex(2)}}
+
+	welcome, err := BuildWelcome(crypto, crypto.Suite(), info,
+		bytes.Repeat([]byte{1}, crypto.HashSize()), welcomeSecret, joiners)
+	if err != nil {
+		t.Fatalf("BuildWelcome: %v", err)
+	}
+	if err := welcomeTestOpenGroupInfo(t, crypto, welcome, welcomeSecret).Verify(crypto, tree); err != nil {
+		t.Fatalf("the group info this welcome carries does not verify against the tree it names: %v", err)
+	}
+
+	// the negative, over the one field a joiner resolves the verification key through
+	misnamed := testGroupInfoOverTree(t, crypto, tree, LeafIndex(1))
+	if err := misnamed.Sign(crypto, members[0].SigPriv); err != nil {
+		t.Fatalf("Sign the misnamed group info: %v", err)
+	}
+	forged, err := BuildWelcome(crypto, crypto.Suite(), misnamed,
+		bytes.Repeat([]byte{1}, crypto.HashSize()), welcomeSecret, joiners)
+	if err != nil {
+		t.Fatalf("BuildWelcome over the misnamed group info: %v", err)
+	}
+	err = welcomeTestOpenGroupInfo(t, crypto, forged, welcomeSecret).Verify(crypto, tree)
+	if !errors.Is(err, ErrWelcomeGroupInfoSignature) {
+		t.Fatalf("a group info naming a signer leaf whose key did not sign it verified with %v, want %v",
+			err, ErrWelcomeGroupInfoSignature)
+	}
+}
+
+// TestEachGroupSecretsSealDrawsItsOwnEntropy is the entropy reading, derived from what the
+// function PUBLISHES rather than from the line that draws.
+//
+// THE SAME KEY PACKAGE APPEARS TWICE ON PURPOSE, and it is the only fixture that isolates the
+// draw. With one recipient key and one plaintext, every input to the two seals is equal, so the
+// only thing left that can separate the two ciphertexts is the randomness each of them takes:
+// a build that drew once and reused the encapsulation for both entries answers two entries that
+// are byte-identical, and every correctness assertion in this file passes over it.
+//
+// The group info seal is asserted EQUAL across the two builds in the same breath, and that is the
+// control rather than an extra. Its key and nonce are DERIVED from welcome_secret and nothing
+// there is drawn, so a build whose group info ciphertext also moved would be one where something
+// other than the HPKE draw is varying, and the inequalities above would be measuring that instead.
+func TestEachGroupSecretsSealDrawsItsOwnEntropy(t *testing.T) {
+	crypto := testCrypto(t)
+	_, _, info := welcomeTestSignedInfo(t, crypto, "alice")
+	joinerSecret := bytes.Repeat([]byte{1}, crypto.HashSize())
+	welcomeSecret := bytes.Repeat([]byte{2}, crypto.HashSize())
+	bob := testIdentity(t, crypto, "bob")
+	kp, _, _ := testKeyPackage(t, crypto, bob)
+	joiners := []WelcomeJoiner{
+		{KeyPackage: *kp, LeafIndex: LeafIndex(1)},
+		{KeyPackage: *kp, LeafIndex: LeafIndex(2)},
+	}
+
+	welcome, err := BuildWelcome(crypto, crypto.Suite(), info, joinerSecret, welcomeSecret, joiners)
+	if err != nil {
+		t.Fatalf("BuildWelcome: %v", err)
+	}
+	first, second := welcome.Secrets[0].EncryptedGroupSecrets, welcome.Secrets[1].EncryptedGroupSecrets
+	if bytes.Equal(first.KemOutput, second.KemOutput) {
+		t.Fatal("two entries of one welcome share an HPKE encapsulation, so the seal drew once and reused it")
+	}
+	if bytes.Equal(first.Ciphertext, second.Ciphertext) {
+		t.Fatal("two entries of one welcome are byte-identical, so nothing separating them was drawn")
+	}
+
+	again, err := BuildWelcome(crypto, crypto.Suite(), info, joinerSecret, welcomeSecret, joiners)
+	if err != nil {
+		t.Fatalf("BuildWelcome a second time: %v", err)
+	}
+	if bytes.Equal(first.KemOutput, again.Secrets[0].EncryptedGroupSecrets.KemOutput) {
+		t.Fatal("two builds over identical arguments produced the same HPKE encapsulation, so the ephemeral is a constant")
+	}
+	if !bytes.Equal(welcome.EncryptedGroupInfo, again.EncryptedGroupInfo) {
+		t.Fatal("the group info ciphertext moved between two builds over identical arguments; its key and nonce are derived and nothing there is drawn, so the entropy readings above are measuring something else")
+	}
+}
+
+// TestBuildWelcomeRefusesTheArgumentsItCannotBuildFrom holds the three refusals apart, each
+// answering a value no other one answers: errors.Is cannot tell two rules apart when they share a
+// sentinel, so an assertion written for one passes over the other firing instead.
+func TestBuildWelcomeRefusesTheArgumentsItCannotBuildFrom(t *testing.T) {
+	crypto := testCrypto(t)
+	_, _, info := welcomeTestSignedInfo(t, crypto, "alice")
+	secret := bytes.Repeat([]byte{3}, crypto.HashSize())
+
+	if _, err := BuildWelcome(nil, crypto.Suite(), info, secret, secret, nil); !errors.Is(err, ErrNilCryptoProvider) {
+		t.Fatalf("no provider = %v, want ErrNilCryptoProvider", err)
+	}
+	if _, err := BuildWelcome(crypto, crypto.Suite(), nil, secret, secret, nil); !errors.Is(err, errNilWelcomeGroupInfo) {
+		t.Fatalf("no group info = %v, want errNilWelcomeGroupInfo", err)
+	}
+	// the OTHER registered suite, which this provider does not run. A welcome labelled with it
+	// would be sealed with this provider's primitives and opened by nobody.
+	_, err := BuildWelcome(crypto, CipherSuiteX25519AesGcm128Sha256Ed25519, info, secret, secret, nil)
+	if !errors.Is(err, errWelcomeSuiteProvider) {
+		t.Fatalf("a suite the provider does not run = %v, want errWelcomeSuiteProvider", err)
+	}
+	if errors.Is(err, errNilWelcomeGroupInfo) || errors.Is(err, ErrNilCryptoProvider) {
+		t.Fatal("the suite refusal answers another rule's sentinel, so no test can tell the two apart")
+	}
+}
+
+// TestZeroizingAWelcomeJoinerErasesThePathSecretAndLeavesTheKeyPackage is the erase obligation
+// this type carries, held over both halves of it.
+//
+// The key package half is not decoration: it is the joiner's PUBLISHED key package and the caller
+// goes on holding it, so an erase that reached into it would destroy a value the caller owns
+// while removing nothing an attacker lacks.
+func TestZeroizingAWelcomeJoinerErasesThePathSecretAndLeavesTheKeyPackage(t *testing.T) {
+	crypto := testCrypto(t)
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "bob"))
+	initKey := bytes.Clone(kp.InitKey)
+	secret := bytes.Repeat([]byte{0x5a}, crypto.HashSize())
+	joiner := WelcomeJoiner{KeyPackage: *kp, LeafIndex: LeafIndex(1), PathSecret: secret}
+
+	joiner.Zeroize()
+	for i, b := range secret {
+		if b != 0 {
+			t.Fatalf("byte %d of the path secret is %#02x after the erase, so this joiner entry was dropped with the epoch's ladder still in it",
+				i, b)
+		}
+	}
+	if !bytes.Equal(joiner.KeyPackage.InitKey, initKey) {
+		t.Fatal("the erase reached into the joiner's published key package, which is public and is the caller's")
+	}
+	// idempotent and nil-safe, for the reason every erase here is: a value may be dropped by one
+	// path and released by another.
+	joiner.Zeroize()
+	var absent *WelcomeJoiner
+	absent.Zeroize()
+}
+
+// TestACommitsWelcomeCarriesTheEpochTheCommitOpens is the end to end reading: everything above
+// holds BuildWelcome to its arguments, and this holds the COMMITTER to handing the right ones.
+//
+// Four things are separated here that a shape assertion cannot tell apart. The group info the
+// Welcome carries verifies against the tree the same commit publishes, which is the round trip
+// task 16 stands on; it names the committer's own leaf as its signer; it names the epoch the
+// commit OPENS; and its confirmation tag is the one the staged epoch computed, which is the
+// assertion a group info assembled with the previous epoch's tag fails.
+func TestACommitsWelcomeCarriesTheEpochTheCommitOpens(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "welcome-group")
+	defer group.Close()
+
+	bob := testIdentity(t, crypto, "bob")
+	kp, initPriv, _ := testKeyPackage(t, crypto, bob)
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("the commit staged nothing, so there is no epoch for this welcome to be about")
+	}
+	welcome := welcomeTestFromCommit(t, result.Welcome)
+	if welcome.CipherSuite != crypto.Suite() {
+		t.Fatalf("the welcome names suite %#04x, want the group's %#04x",
+			uint16(welcome.CipherSuite), uint16(crypto.Suite()))
+	}
+	if len(welcome.Secrets) != 1 {
+		t.Fatalf("the welcome carries %d entries and the commit added 1 member", len(welcome.Secrets))
+	}
+	ref, err := kp.Ref(crypto)
+	if err != nil {
+		t.Fatalf("Ref: %v", err)
+	}
+	if !bytes.Equal(welcome.Secrets[0].NewMember, ref) {
+		t.Fatal("the welcome is not addressed to the key package the Add named")
+	}
+
+	info := welcomeTestOpenGroupInfo(t, crypto, welcome, staged.schedule.WelcomeSecret())
+	// the tree the joiner is handed out of band is the one the same commit published
+	published, err := UnmarshalRatchetTree(result.RatchetTree)
+	if err != nil {
+		t.Fatalf("decode the published tree: %v", err)
+	}
+	if err := info.Verify(crypto, published); err != nil {
+		t.Fatalf("the group info this welcome carries does not verify against the tree the commit published: %v", err)
+	}
+	if info.Signer != group.OwnLeafIndex() {
+		t.Fatalf("the welcome's group info names signer leaf %d and the committer is leaf %d",
+			info.Signer, group.OwnLeafIndex())
+	}
+	if info.GroupContext.Epoch != staged.Epoch() {
+		t.Fatalf("the welcome's group info names epoch %d and the commit opens epoch %d",
+			info.GroupContext.Epoch, staged.Epoch())
+	}
+	if !bytes.Equal(info.ConfirmationTag, staged.confirmTag) {
+		t.Fatal("the welcome's group info carries a confirmation tag the staged epoch did not compute; a joiner checks that tag against the epoch it derives and would refuse this group")
+	}
+
+	secrets := welcomeTestOpenSecrets(t, crypto, welcome, 0, initPriv)
+	if !bytes.Equal(secrets.JoinerSecret, staged.schedule.JoinerSecret()) {
+		t.Fatal("the welcome carries a joiner secret that is not the staged epoch's, so the joiner would derive a different epoch")
+	}
+	if secrets.PathSecret != nil {
+		t.Fatal("this add-only commit carried no update path and the welcome names a path secret anyway")
+	}
+}
+
+// TestTheWelcomePathSecretIsTheOneForTheLowestNodeTheJoinerAndCommitterShare is the path half,
+// and it is checked against the TREE rather than against the plan's own array.
+//
+// The secret is turned into a node key pair the way the committer turned it into one when it
+// installed the node, and the public half is held against the node the published tree carries at
+// the lowest node the two leaves share. A build that handed the joiner some other rung of the
+// ladder -- the leaf's own parent, say, which is the neighbouring index and the plausible
+// mistake -- derives a key that is in the tree, at the wrong place, and only this comparison
+// separates the two.
+func TestTheWelcomePathSecretIsTheOneForTheLowestNodeTheJoinerAndCommitterShare(t *testing.T) {
+	crypto := testCrypto(t)
+	group, _, _ := commitTestGroupOfTwo(t, crypto)
+	defer group.Close()
+
+	carol := testIdentity(t, crypto, "carol")
+	kp, initPriv, _ := testKeyPackage(t, crypto, carol)
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}},
+		// FORCED, because an add-only commit needs no update path: the shape this test is about
+		// only exists when the committer resets the nodes above itself.
+		&CommitOptions{Force: true})
+	if err != nil {
+		t.Fatalf("CreateCommit with a forced path: %v", err)
+	}
+	staged := group.stagedForTest()
+	if staged == nil || staged.plan == nil {
+		t.Fatal("the forced commit staged no update path plan, so this test is not about the shape it was written for")
+	}
+	if len(staged.added) != 1 {
+		t.Fatalf("the commit added %d leaves, want 1", len(staged.added))
+	}
+	joinerLeaf := staged.added[0]
+	ancestor := CommonAncestor(joinerLeaf.NodeIndex(), group.OwnLeafIndex().NodeIndex())
+	if ancestor == joinerLeaf.NodeIndex() || ancestor == group.OwnLeafIndex().NodeIndex() {
+		t.Fatalf("the lowest node leaf %d and leaf %d share is one of the two leaves, so this fixture has no interior node to be wrong about",
+			joinerLeaf, group.OwnLeafIndex())
+	}
+
+	// building the welcome must not erase the COMMITTER's own ladder. The joiner entry holds a
+	// COPY of the rung, and an entry that aliased the plan would erase these secrets as a side
+	// effect of assembling a message -- the staged epoch is what owes them an erase, at the site
+	// that drops it.
+	for i, rung := range staged.plan.PathSecrets {
+		if len(rung) == 0 {
+			t.Fatalf("rung %d of the committer's ladder is empty, so this check observes nothing", i)
+		}
+		if !slices.ContainsFunc(rung, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("rung %d of the committer's own path ladder is all zeros after the welcome was built, so the builder erased storage it had only borrowed",
+				i)
+		}
+	}
+
+	welcome := welcomeTestFromCommit(t, result.Welcome)
+	secrets := welcomeTestOpenSecrets(t, crypto, welcome, 0, initPriv)
+	if secrets.PathSecret == nil {
+		t.Fatal("this commit carried an update path and its welcome names no path secret, so the joiner would seed its direct path from nodes the commit had already reset")
+	}
+	_, pub, err := DeriveNodeKeyPair(crypto, secrets.PathSecret.PathSecret)
+	if err != nil {
+		t.Fatalf("DeriveNodeKeyPair over the welcome's path secret: %v", err)
+	}
+	published, err := UnmarshalRatchetTree(result.RatchetTree)
+	if err != nil {
+		t.Fatalf("decode the published tree: %v", err)
+	}
+	node := published.ParentAt(ancestor)
+	if node == nil {
+		t.Fatalf("the published tree holds no parent node at %d, the lowest node the two leaves share", ancestor)
+	}
+	if !bytes.Equal(node.EncryptionKey, pub) {
+		t.Fatalf("the welcome's path secret derives the key at some node other than %d, the lowest node leaf %d and leaf %d share",
+			ancestor, joinerLeaf, group.OwnLeafIndex())
+	}
+	// and the neighbour that separates "the right node" from "a node in the tree". The LOWEST
+	// node of the committer's filtered path is the plausible mistake -- it is the rung the plan
+	// stores at index 0 -- so this says the two nodes carry different keys, and the comparison
+	// above therefore discriminates between them.
+	if lowest := staged.plan.Path[0]; lowest != ancestor {
+		lower := published.ParentAt(lowest)
+		if lower == nil {
+			t.Fatalf("the published tree holds no parent node at %d, the lowest rung of the committer's path", lowest)
+		}
+		if bytes.Equal(lower.EncryptionKey, node.EncryptionKey) {
+			t.Fatal("two nodes of the published path carry one key, so the comparison above cannot tell which node the secret was for")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the provider stub gate's rule for the structured argument this file owns
+// ---------------------------------------------------------------------------
+
+// groupInfoDeepCopy answers a GroupInfo that shares no storage with this one.
+//
+// The perturbations below edit their copy IN PLACE, so a shallow struct copy would write
+// through into the base argument every other row of the stub gate is built from -- the fault
+// TestTheLeafNodeStubArgumentsAreFreshStorageEveryCall exists for one structure over.
+func groupInfoDeepCopy(info *GroupInfo) *GroupInfo {
+	copied := &GroupInfo{
+		GroupContext:    *info.GroupContext.Clone(),
+		ConfirmationTag: bytes.Clone(info.ConfirmationTag),
+		Signer:          info.Signer,
+		Signature:       bytes.Clone(info.Signature),
+	}
+	for _, extension := range info.Extensions {
+		copied.Extensions = append(copied.Extensions, Extension{
+			ExtensionType: extension.ExtensionType,
+			ExtensionData: bytes.Clone(extension.ExtensionData),
+		})
+	}
+	return copied
+}
+
+// groupInfoStubEdits is one smallest move per field a GroupInfo declares.
+//
+// It is a table and the completeness check below is what makes it a class: the FIELDS are read
+// off the compiled structure, in both directions, so a GroupInfo that grew a sixth field fails
+// here rather than being sealed by a builder no perturbation moves -- which is the same reading
+// TestTheGroupInfoSignatureCoversEveryFieldOfItsToBeSigned makes of the preimage, pointed at the
+// object instead.
+func groupInfoStubEdits() map[string]func(info *GroupInfo) {
+	return map[string]func(info *GroupInfo){
+		// the epoch, because it is the field two contexts of one group differ in and nothing
+		// else; the group context perturbation of the stub gate itself moves the same one.
+		"GroupContext":    func(info *GroupInfo) { info.GroupContext.Epoch++ },
+		"Extensions":      func(info *GroupInfo) { info.Extensions[0].ExtensionData[0] ^= 0xff },
+		"ConfirmationTag": func(info *GroupInfo) { info.ConfirmationTag[0] ^= 0xff },
+		"Signer":          func(info *GroupInfo) { info.Signer++ },
+		"Signature":       func(info *GroupInfo) { info.Signature[0] ^= 0xff },
+	}
+}
+
+// providerGroupInfoPerturbations is the stub gate's rule for a *GroupInfo argument, living beside
+// the structure it moves the way psk_test.go, leaf_node_test.go and treekem_test.go keep theirs.
+//
+// Every field is moved and not only the ones that "matter", because what this rule is held
+// against is a builder that seals a SECOND assembly of the group info: an assembly that dropped
+// the extensions, or the signature, answers the same sealed bytes under every perturbation of
+// the field it dropped, and the whole reason a Welcome carries a signed group info is that a
+// joiner checks that signature over exactly the fields it was made over.
+func providerGroupInfoPerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base, isGroupInfo := argument.Interface().(*GroupInfo)
+	if !isGroupInfo || base == nil {
+		t.Fatalf("the base argument for %s.%s is %v and this rule moves a *GroupInfo",
+			operation, parameter.name, argument.Type())
+	}
+	edits := groupInfoStubEdits()
+	declared := reflect.TypeOf(GroupInfo{})
+	for i := range declared.NumField() {
+		name := declared.Field(i).Name
+		if _, written := edits[name]; !written {
+			t.Fatalf("GroupInfo declares %s and no perturbation here moves it, so a builder that left that field out of what it seals answers identically under every move this gate makes",
+				name)
+		}
+	}
+	for name := range edits {
+		if _, found := declared.FieldByName(name); !found {
+			t.Fatalf("a perturbation here moves GroupInfo.%s, which the structure no longer declares", name)
+		}
+	}
+	moved := []providerPerturbation{}
+	for _, name := range slices.Sorted(maps.Keys(edits)) {
+		copied := groupInfoDeepCopy(base)
+		edits[name](copied)
+		if reflect.DeepEqual(copied, base) {
+			t.Fatalf("the move of GroupInfo.%s left %s.%s equal to the base argument, so the gate would call it twice with the same value",
+				name, operation, parameter.name)
+		}
+		moved = append(moved, providerPerturbation{where: name + " moved", value: reflect.ValueOf(copied)})
+	}
+	return moved
+}
+
+// ---------------------------------------------------------------------------
+// the two refusals the welcome builder makes about the commit it is built from
+// ---------------------------------------------------------------------------
+
+// welcomeTestStagedCommitOf commits one Add and answers the staged epoch plus the group info the
+// committer signed for it, without merging.
+//
+// The group info is rebuilt here rather than read off the commit, because the committer does not
+// hand it out: what a test of the refusals below needs is an object of the right shape, and what
+// holds the object the PRODUCT seals to the tree it publishes is
+// TestACommitsWelcomeCarriesTheEpochTheCommitOpens.
+func welcomeTestStagedCommitOf(t *testing.T, crypto CryptoProvider, group *Group,
+	name string) (*StagedCommit, *GroupInfo) {
+
+	t.Helper()
+	kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, name))
+	if _, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}, nil); err != nil {
+		t.Fatalf("CreateCommit adding %s: %v", name, err)
+	}
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("the commit staged nothing")
+	}
+	return staged, &GroupInfo{
+		GroupContext:    *staged.context,
+		ConfirmationTag: staged.confirmTag,
+		Signer:          group.OwnLeafIndex(),
+	}
+}
+
+// TestTheWelcomeBuilderRefusesACommitItCannotAddressOrSeed drives the two refusals the builder
+// makes about the COMMIT rather than about its arguments, and holds them apart: errors.Is cannot
+// tell two rules apart when they answer one value, so an assertion written for either would pass
+// over the other firing instead.
+//
+// Both are reached through a staged commit edited by hand, because neither is reachable through
+// (*Group).CreateCommit -- which is the point of writing them down. The pairing of
+// StagedCommit.added with (*ProposalList).Adds is an assumption the commit path satisfies today;
+// a build where it stopped holding would seal each joiner's secrets to some OTHER joiner's init
+// key with every length equal, so the refusal is what stands between that and a silent fork.
+func TestTheWelcomeBuilderRefusesACommitItCannotAddressOrSeed(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "welcome-refusals")
+	defer group.Close()
+	staged, info := welcomeTestStagedCommitOf(t, crypto, group, "bob")
+
+	// the control: unedited, this commit builds a welcome
+	if _, err := staged.welcomeMessage(crypto, info); err != nil {
+		t.Fatalf("the unedited staged commit refused to build a welcome with %v, so neither case below observes its own rule", err)
+	}
+
+	// one more added leaf than the commit named Add proposals
+	pairing := *staged
+	pairing.added = append(append([]LeafIndex(nil), staged.added...), LeafIndex(7))
+	_, err := pairing.welcomeMessage(crypto, info)
+	if !errors.Is(err, errWelcomeAddPairing) {
+		t.Fatalf("a commit whose added leaves and Add proposals disagree = %v, want errWelcomeAddPairing", err)
+	}
+	if errors.Is(err, errWelcomePathSecret) {
+		t.Fatal("the pairing refusal answers the path secret rule's sentinel, so no test can tell the two apart")
+	}
+
+	// a commit that carries an update path plan holding no rung for the node the joiner and the
+	// committer share. A plan with an empty ladder is the smallest version of it; what it stands
+	// for is a plan whose filtered path does not reach that node, which would hand the joiner a
+	// null path_secret for a commit that had just reset every node above it.
+	seeding := *staged
+	seeding.plan = &UpdatePathPlan{}
+	_, err = seeding.welcomeMessage(crypto, info)
+	if !errors.Is(err, errWelcomePathSecret) {
+		t.Fatalf("a commit with a path and no secret for a joiner = %v, want errWelcomePathSecret", err)
+	}
+	if errors.Is(err, errWelcomeAddPairing) {
+		t.Fatal("the path secret refusal answers the pairing rule's sentinel, so no test can tell the two apart")
+	}
+}
+
+// theWelcomeJoinerFieldTheSealDoesNotRead is the one field of a joiner entry BuildWelcome
+// deliberately does not read, with the reason written out.
+//
+// A table beside a derivation and not instead of one: the perturbation rule below reads the
+// FIELDS off the compiled WelcomeJoiner and checks this table against them in both directions,
+// so a field added tomorrow has to be either moved or excused here, and an excuse cannot outlive
+// the field it covers.
+var theWelcomeJoinerFieldTheSealDoesNotRead = map[string]string{
+	"LeafIndex": "the leaf a joiner lands on is the COMMITTER's business and not the seal's. " +
+		"(*StagedCommit).welcomeMessage uses it to find the lowest node the joiner and the committer " +
+		"share, and by the time an entry reaches BuildWelcome that lookup has happened and its answer " +
+		"is the PathSecret beside it. RFC 9420's GroupSecrets carries no leaf index at all -- a joiner " +
+		"finds its own leaf by matching the key package it published against the tree -- so a builder " +
+		"that read this field would be sealing something the structure on the wire does not have",
+}
+
+// welcomeJoinerStubEdits is one smallest move per field of a joiner entry the seal DOES read.
+func welcomeJoinerStubEdits() map[string]func(joiner *WelcomeJoiner) {
+	return map[string]func(joiner *WelcomeJoiner){
+		// the init key the entry is sealed to, which is also inside the reference it is keyed
+		// by: any 32 octets are a valid X25519 public key, so this moves the recipient without
+		// moving the shape.
+		"KeyPackage": func(joiner *WelcomeJoiner) { joiner.KeyPackage.InitKey[0] ^= 0xff },
+		"PathSecret": func(joiner *WelcomeJoiner) { joiner.PathSecret[0] ^= 0xff },
+	}
+}
+
+// providerWelcomeJoinerPerturbations is the stub gate's rule for a []WelcomeJoiner argument,
+// living beside the structure it moves the way psk_test.go and leaf_node_test.go keep theirs.
+func providerWelcomeJoinerPerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) []providerPerturbation {
+
+	t.Helper()
+	base, isJoiners := argument.Interface().([]WelcomeJoiner)
+	if !isJoiners || len(base) == 0 {
+		t.Fatalf("the base argument for %s.%s is %v with %d entries, and this rule moves a non-empty []WelcomeJoiner",
+			operation, parameter.name, argument.Type(), argument.Len())
+	}
+	edits := welcomeJoinerStubEdits()
+	declared := reflect.TypeOf(WelcomeJoiner{})
+	for i := range declared.NumField() {
+		name := declared.Field(i).Name
+		_, moves := edits[name]
+		_, excused := theWelcomeJoinerFieldTheSealDoesNotRead[name]
+		if moves == excused {
+			t.Fatalf("WelcomeJoiner declares %s and this rule neither moves it nor writes down why the seal does not read it (or does both), so nothing here says which the field is",
+				name)
+		}
+	}
+	for name := range edits {
+		if _, found := declared.FieldByName(name); !found {
+			t.Fatalf("a perturbation here moves WelcomeJoiner.%s, which the structure no longer declares", name)
+		}
+	}
+	for name := range theWelcomeJoinerFieldTheSealDoesNotRead {
+		if _, found := declared.FieldByName(name); !found {
+			t.Fatalf("theWelcomeJoinerFieldTheSealDoesNotRead excuses WelcomeJoiner.%s, which the structure no longer declares",
+				name)
+		}
+	}
+	moved := []providerPerturbation{}
+	for _, name := range slices.Sorted(maps.Keys(edits)) {
+		copied := make([]WelcomeJoiner, 0, len(base))
+		for _, entry := range base {
+			clone := entry
+			clone.KeyPackage.InitKey = bytes.Clone(entry.KeyPackage.InitKey)
+			clone.PathSecret = bytes.Clone(entry.PathSecret)
+			copied = append(copied, clone)
+		}
+		edits[name](&copied[0])
+		if reflect.DeepEqual(copied, base) {
+			t.Fatalf("the move of WelcomeJoiner.%s left %s.%s equal to the base argument, so the gate would call it twice with the same value",
+				name, operation, parameter.name)
+		}
+		moved = append(moved, providerPerturbation{where: name + " moved", value: reflect.ValueOf(copied)})
+	}
+	return moved
+}
+
+// welcomeMethodRowKeyPackage is the published key package the provider method row for
+// (*StagedCommit).welcomeMessage addresses its one joiner to.
+//
+// Minted ONCE for the whole binary, because that row is run three times over three different
+// providers and its answers are compared across them. NewKeyPackage draws fresh keys and stamps
+// a lifetime off the wall clock, so a row that minted one per call would seal to a different
+// init key every time and the routing differential would read that as the provider having moved.
+//
+// Through a provider of its OWN, for the reason the stub gate's own key package is: the row's
+// provider may be one that flips every answer it gives, or one running a wider KDF, and neither
+// is a thing to mint a key package with.
+var welcomeMethodRowKeyPackage = sync.OnceValues(func() (*KeyPackage, error) {
+	crypto, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		return nil, err
+	}
+	kp, _, _, err := NewKeyPackage(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+		BasicCredential([]byte("the joiner the welcome method row is addressed to")),
+		testCapabilities(), nil)
+	return kp, err
+})

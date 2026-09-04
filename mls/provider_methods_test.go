@@ -110,6 +110,68 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 				{name: "PskNonce", content: id.PskNonce, carried: true},
 			}, nil
 		}},
+		// p7 task 15's welcome builder, over a staged commit assembled HERE rather than
+		// committed: what this row is about is the provider the seal runs through, and a real
+		// commit would bring a second provider's worth of derivation along with it.
+		//
+		// Every run it is handed goes through the recorder -- the group id, the two transcript
+		// hashes, the epoch's joiner and psk secrets, the confirmation tag and the init key the
+		// entry is sealed to -- and the ONE value read back is the sealed group info. It is an
+		// AEAD seal under a key and nonce this provider expanded, so it MOVES over a provider
+		// that flips every answer; and its length is a whole encoded GroupInfo rather than any
+		// registry width, so the KDF.Nh differential reads it without a coincidence this file
+		// put there.
+		//
+		// The per-joiner ciphertexts are deliberately not read back. Each encapsulates to a
+		// fresh ephemeral, so they differ between any two calls whatever provider made them, and
+		// a row that compared them would report every provider as a different one.
+		{name: "(*StagedCommit).welcomeMessage", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			nh := crypto.HashSize()
+			minted, err := welcomeMethodRowKeyPackage()
+			if err != nil {
+				return nil, err
+			}
+			addressed := *minted
+			addressed.InitKey = HpkePublicKey(take(bytes.Clone(minted.InitKey)))
+			context := &GroupContext{
+				Version:                 ProtocolVersionMls10,
+				CipherSuite:             crypto.Suite(),
+				GroupId:                 take([]byte("the group this welcome row describes")),
+				Epoch:                   4,
+				TreeHash:                take(bytes.Repeat([]byte{0x91}, nh)),
+				ConfirmedTranscriptHash: take(bytes.Repeat([]byte{0x92}, nh)),
+			}
+			schedule, err := NewKeyScheduleFromJoiner(crypto,
+				take(bytes.Repeat([]byte{0x93}, nh)), take(bytes.Repeat([]byte{0x94}, nh)), context)
+			if err != nil {
+				return nil, err
+			}
+			staged := &StagedCommit{
+				committer:  0,
+				epoch:      context.Epoch,
+				context:    context,
+				schedule:   schedule,
+				added:      []LeafIndex{1},
+				confirmTag: take(bytes.Repeat([]byte{0x95}, nh)),
+				list: NewProposalList([]CachedProposal{{
+					Proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: addressed}},
+				}}),
+			}
+			message, err := staged.welcomeMessage(crypto, &GroupInfo{
+				GroupContext:    *context,
+				ConfirmationTag: take(bytes.Repeat([]byte{0x96}, nh)),
+			})
+			if err != nil {
+				return nil, err
+			}
+			parsed, err := ParseMLSMessage(message)
+			if err != nil {
+				return nil, err
+			}
+			return []providerDrivenMethodValue{
+				{name: "the sealed group info", content: parsed.Welcome.EncryptedGroupInfo},
+			}, nil
+		}},
 		// framing's proposal reference of section 5.2: the identity a commit names a proposal
 		// by, and the one value in this package whose whole job is to be the same on every peer
 		// that sees the same proposal. The bytes it hashes are the RECEIVER's, so nothing goes

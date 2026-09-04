@@ -228,6 +228,15 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*GroupInfo).Verify", call: func() error {
 			return (&GroupInfo{}).Verify(nil, nil)
 		}},
+		// p7 task 15's welcome builder, on a ZERO valued staged commit -- the receiver that
+		// separates the two orders this body could be written in. A zero StagedCommit added
+		// nobody, so a body that judged its receiver before its provider answers nil and NO
+		// ERROR AT ALL: a caller that passed no provider would be told its commit adds nobody,
+		// which is true of the zero value and is not the fault it made.
+		{name: "(*StagedCommit).welcomeMessage", call: func() error {
+			_, err := (&StagedCommit{}).welcomeMessage(nil, nil)
+			return err
+		}},
 		// and the door built on that verifier, which must make the same refusal for the same
 		// reason: it is Verify and nothing else, so a provider check that stopped happening
 		// there would stop happening here, and this row is what says the delegation is real

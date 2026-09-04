@@ -4671,6 +4671,29 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{secret, overTheEmptyList}
 		}},
+		// p7 task 15's welcome builder, over an EMPTY joiner set: what this row is about is the
+		// group info seal, whose key and nonce come out of WelcomeKeyNonce and whose secret is
+		// KDF.Nh bytes off the provider under test rather than 32 written down. A body that
+		// compared against a literal 32 refuses the wide provider's welcome secret outright and
+		// is reported here rather than passing at the one width where the two coincide.
+		{name: "BuildWelcome", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			nh := crypto.HashSize()
+			welcome, welcomeErr := BuildWelcome(crypto, crypto.Suite(), &GroupInfo{
+				GroupContext: GroupContext{
+					Version:                 ProtocolVersionMls10,
+					CipherSuite:             crypto.Suite(),
+					GroupId:                 []byte("the group this row describes"),
+					Epoch:                   5,
+					TreeHash:                bytes.Repeat([]byte{0x84}, nh),
+					ConfirmedTranscriptHash: bytes.Repeat([]byte{0x85}, nh),
+				},
+				ConfirmationTag: bytes.Repeat([]byte{0x86}, nh),
+			}, bytes.Repeat([]byte{0x87}, nh), bytes.Repeat([]byte{0x8a}, nh), nil)
+			if welcomeErr != nil {
+				t.Fatalf("BuildWelcome over a provider whose KDF.Nh is %d: %v", nh, welcomeErr)
+			}
+			return [][]byte{welcome.EncryptedGroupInfo}
+		}},
 		{name: "DeriveJoinerSecret", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
 			nh := crypto.HashSize()
 			joiner, joinerErr := DeriveJoinerSecret(crypto,
