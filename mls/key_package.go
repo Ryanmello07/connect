@@ -191,6 +191,31 @@ func (self *KeyPackage) UnmarshalMLS(r *syntax.Reader) error {
 
 var _ syntax.Codec = (*KeyPackage)(nil)
 
+// Zeroize erases the one field of this structure that is not part of its encoding: the seed the
+// leaf's signature key was derived from.
+//
+// EVERY OTHER FIELD IS DELIBERATELY LEFT, which is the sentence (*WelcomeJoiner).Zeroize already
+// writes about the key package it carries. The version, the suite, the init key, the leaf node,
+// the extensions and the signature all went to the delivery service and to every member of every
+// group that added this device; erasing a published value takes away nothing an attacker lacks
+// while destroying a structure the caller still owns and may still need to publish.
+//
+// A key package that ARRIVED OFF THE WIRE holds nothing here -- UnmarshalMLS clears the seed with
+// the rest -- so this is a no-op on every key package but one this process minted, which is
+// exactly the one holding a private key. That asymmetry is why the erase is declared on the type
+// rather than left to the holders: a holder cannot see which of the two it was handed.
+//
+// A nil receiver is accepted for zeroizeSecret's reason, and the noinline directive is the erase
+// class's rule; see (*TreeKEMPrivate).Zeroize.
+//
+//go:noinline
+func (self *KeyPackage) Zeroize() {
+	if self == nil {
+		return
+	}
+	zeroizeSecret(self.signPriv)
+}
+
 // signedPreimage is RFC 9420 section 10's KeyPackageTBS, and it is one statement long on
 // purpose: it hands marshalCore to marshalBytes and adds nothing of its own.
 //

@@ -462,6 +462,60 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"cloneExtensions": {
+		what: "reads the type of EVERY entry and writes each one into the copy, which is " +
+			"(*GroupContext).Clone's row one file over and holds for the same reason: a leaf's extensions " +
+			"vector must clone to the same entries in the same order, repeats included, or a leaf the lookup " +
+			"refuses becomes one it answers. It selects nothing by type. The property this probe is really " +
+			"for is the PAIRING -- the entry a body is taken from is the entry it is written into -- which is " +
+			"what the index paired loop it replaced could get wrong on any leaf carrying more than one " +
+			"extension, and what no fixture in this package could observe while every one of them carried one",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			held := []Extension{
+				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x01}},
+				{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{0x02, 0x02}},
+				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x03, 0x03, 0x03}},
+			}
+			clone := cloneExtensions(held)
+			if len(clone) != len(held) {
+				t.Fatalf("a vector carrying %d extensions, two of them one type, cloned to %d; a clone that drops a repeat turns a leaf the lookup refuses into one it answers",
+					len(held), len(clone))
+			}
+			for i := range held {
+				if clone[i].ExtensionType != held[i].ExtensionType ||
+					!bytes.Equal(clone[i].ExtensionData, held[i].ExtensionData) {
+					t.Errorf("entry %d cloned to %v, want %v; an entry carrying another entry's body is a leaf whose required_capabilities holds the urmessage_leaf_keys octets, correctly tagged and correctly length prefixed",
+						i, clone[i], held[i])
+				}
+			}
+			// the repeat survives the copy, so the lookup still refuses over the clone
+			if _, _, err := FindExtensionEntry(clone, ExtensionTypeRequiredCapabilities); !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("the clone of a vector carrying required_capabilities twice is answered by the lookup with %v, want ErrMalformedExtension",
+					err)
+			}
+			// and every entry is a copy rather than an alias, entry one included: a walk that
+			// checked entry zero alone is the one element fixture again
+			for i := range clone {
+				clone[i].ExtensionData[0] ^= 0xff
+			}
+			for i := range held {
+				if bytes.Equal(clone[i].ExtensionData, held[i].ExtensionData) {
+					t.Errorf("writing through the clone's entry %d changed the original's body, so the copy aliases the vector it copied",
+						i)
+				}
+			}
+			// nil clones to nil and an empty vector to an empty one, which is cloneBytes' rule at
+			// the level of the vector: an absent extensions field and a present empty one are
+			// different octets on the wire
+			if cloneExtensions(nil) != nil {
+				t.Error("a nil extensions vector cloned to a non nil one, which changes the encoding of the leaf it was asked to duplicate")
+			}
+			if empty := cloneExtensions([]Extension{}); empty == nil {
+				t.Error("an empty extensions vector cloned to nil, which changes the encoding of the leaf it was asked to duplicate")
+			}
+		},
+	},
 	"(*GroupContext).Clone": {
 		what: "reads the type of EVERY entry and writes each one into the copy. It selects none, and the " +
 			"property that matters here is the one the rule reports it for: the clone must carry the same " +

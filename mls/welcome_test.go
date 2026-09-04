@@ -2972,6 +2972,64 @@ func TestJoinFromWelcomeRefusesALeafThatIsNotTheOneThisJoinerPublished(t *testin
 	}
 }
 
+// TestJoinFromWelcomeRefusesASigningKeyItsOwnKeyPackageDoesNotName is the joiner's own two halves
+// held together, which is the one thing about a join that has nothing to do with the message.
+//
+// A JoinKeyMaterial carries a PUBLISHED key package and a signing key that arrived from somewhere
+// else -- the caller's keyring, its store, whatever it kept beside the key package -- and until
+// this refusal existed the door installed the signing key it was handed and compared it with
+// nothing. The other two doors that produce a leaf for this client, NewLeafNode and
+// (*Group).ProposeUpdate, DERIVE the published key from the private one through
+// signaturePublicKeyOf, so neither of them can be given a mismatched pair.
+//
+// What a mismatch produces has no observer anywhere else: the joiner's leaf verifies, its tree is
+// this group's tree, its epoch is the sender's epoch, and every message it goes on to sign is
+// signed with a key its own published leaf does not name. Every other member refuses those
+// messages at the signature and neither end holds anything that says why.
+func TestJoinFromWelcomeRefusesASigningKeyItsOwnKeyPackageDoesNotName(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-mismatched-signer", nil)
+	defer group.Close()
+	joinTestMerge(t, group)
+
+	// the control first: this material joins. Without it a refusal below says only that something
+	// about the fixture is wrong.
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-mismatched-signer"),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the joiner's own material = %v, want the join to proceed", err)
+	}
+	control.Close()
+
+	// a second signing key of the same shape: drawn through the same provider, the right length,
+	// and not the one the published leaf names. A mismatch this package can produce by accident is
+	// a key rotated on the device without the key package being republished.
+	stranger := testIdentity(t, crypto, "the joiner's other signing key")
+	if bytes.Equal(stranger.SigPriv, keys.SignPrivate) {
+		t.Fatal("the second signing key is the first one, so this case swapped nothing")
+	}
+	mismatched := *keys
+	mismatched.SignPrivate = stranger.SigPriv
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-mismatched-signer"),
+		result.Welcome, result.RatchetTree, &mismatched)
+	if !errors.Is(err, errJoinerSignatureKeyNotTheLeafs) {
+		t.Fatalf("JoinFromWelcome with a signing key the key package does not name = %v, want errJoinerSignatureKeyNotTheLeafs",
+			err)
+	}
+
+	// and a signing key that is not a key at all is refused AS a bad key rather than as a mismatch,
+	// which is the derivation's own refusal reaching the caller: ed25519.NewKeyFromSeed panics on
+	// any other length, so a door that compared before it checked the length would take the process
+	// down rather than answering.
+	short := *keys
+	short.SignPrivate = SignaturePrivateKey(bytes.Clone(keys.SignPrivate[:len(keys.SignPrivate)-1]))
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-mismatched-signer"),
+		result.Welcome, result.RatchetTree, &short)
+	if !errors.Is(err, ErrBadSignatureKey) {
+		t.Fatalf("JoinFromWelcome with a truncated signing key = %v, want ErrBadSignatureKey", err)
+	}
+}
+
 // TestJoinFromWelcomeRefusesAGroupItsCallerDidNotAskToJoin is the intent match, and its whole
 // content is what the doc comment says it is worth: a caller that named a group is not put in
 // another one.

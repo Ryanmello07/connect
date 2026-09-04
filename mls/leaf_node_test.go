@@ -1436,6 +1436,184 @@ func TestTheCloneWalkReachesEverySliceOfTheStructure(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the pairing a one-element fixture cannot see
+// ---------------------------------------------------------------------------
+
+// growEverySliceToTwoElements puts elements into every slice reachable from v, at every depth,
+// until it holds at least two, and answers the locations it grew.
+//
+// TWO AND NOT ONE, which is the whole of why it stands beside growEveryEmptySlice. A vector
+// holding exactly one entry cannot show that a copy paired its entries correctly: entry zero's
+// body read into every entry IS entry zero's body when there is only entry zero, so a loop
+// indexing two sequences by hand is equal to a correct one at every location a one-element
+// fixture has. That is the shape (*LeafNode).Clone carried -- out.Extensions[i].ExtensionData =
+// cloneBytes(self.Extensions[i].ExtensionData) -- and it is the fourth time on this package that
+// a one-element fixture certified a rule it could not observe.
+//
+// Derived off the value like the grower beside it, so a vector added to LeafNode later is
+// occupied twice by the commit that adds it rather than on the day somebody notices.
+func growEverySliceToTwoElements(v reflect.Value, prefix string) []string {
+	grown := []string{}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i += 1 {
+			grown = append(grown, growEverySliceToTwoElements(v.Field(i), prefix+"."+v.Type().Field(i).Name)...)
+		}
+	case reflect.Slice:
+		for v.Len() < 2 {
+			v.Set(reflect.Append(v, reflect.Zero(v.Type().Elem())))
+			grown = append(grown, fmt.Sprintf("%s[%d]", prefix, v.Len()-1))
+		}
+		for i := 0; i < v.Len(); i += 1 {
+			grown = append(grown, growEverySliceToTwoElements(v.Index(i), fmt.Sprintf("%s[%d]", prefix, i))...)
+		}
+	}
+	return grown
+}
+
+// stampEveryScalarInWalkOrder writes a different value into every scalar reachable from v, in the
+// order the walk reaches them.
+//
+// It is what makes the two entries of every vector UNLIKE, which is the other half of the fixture:
+// two entries holding the same octets are as blind to a pairing as one entry is. The counter is
+// carried rather than derived from the path so that the value is deterministic -- the sweep below
+// builds the fixture twice and compares the clone of one against the other -- and a stamp whose
+// low octet is zero is skipped, since zero is what an entry that was never written already holds.
+func stampEveryScalarInWalkOrder(v reflect.Value, counter *uint64) {
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i += 1 {
+			stampEveryScalarInWalkOrder(v.Field(i), counter)
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i += 1 {
+			stampEveryScalarInWalkOrder(v.Index(i), counter)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		*counter += 1
+		for *counter&0xff == 0 {
+			*counter += 1
+		}
+		v.SetUint(*counter)
+	}
+}
+
+// vectorsShorterThanTwoIn is every vector of the value, at every depth, holding fewer than two
+// entries.
+//
+// It is the length half of the fixture's control and it is asked separately because neither walk
+// above reports it: a grower narrowed to one entry grows every empty vector exactly as loudly, and
+// a vector with one entry has no PAIR of entries for the sameness check below to compare. A
+// fixture this reports is the one element fixture again, and over one the pairing under test is
+// unobservable.
+func vectorsShorterThanTwoIn(v reflect.Value, prefix string) []string {
+	short := []string{}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i += 1 {
+			short = append(short, vectorsShorterThanTwoIn(v.Field(i), prefix+"."+v.Type().Field(i).Name)...)
+		}
+	case reflect.Slice:
+		if v.Len() < 2 {
+			short = append(short, fmt.Sprintf("%s (%d)", prefix, v.Len()))
+		}
+		for i := 0; i < v.Len(); i += 1 {
+			short = append(short, vectorsShorterThanTwoIn(v.Index(i), fmt.Sprintf("%s[%d]", prefix, i))...)
+		}
+	}
+	return short
+}
+
+// vectorEntriesThatAreIdenticalIn is every pair of entries of every vector of the value, at every
+// depth, that hold the same value. It is the fixture's own control: a pair it reports is a pair no
+// copy could be caught mispairing.
+func vectorEntriesThatAreIdenticalIn(v reflect.Value, prefix string) []string {
+	same := []string{}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i += 1 {
+			same = append(same, vectorEntriesThatAreIdenticalIn(v.Field(i), prefix+"."+v.Type().Field(i).Name)...)
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i += 1 {
+			for j := i + 1; j < v.Len(); j += 1 {
+				if reflect.DeepEqual(v.Index(i).Interface(), v.Index(j).Interface()) {
+					same = append(same, fmt.Sprintf("%s[%d] == %s[%d]", prefix, i, prefix, j))
+				}
+			}
+			same = append(same, vectorEntriesThatAreIdenticalIn(v.Index(i), fmt.Sprintf("%s[%d]", prefix, i))...)
+		}
+	}
+	return same
+}
+
+// testLeafNodeWithEveryVectorHoldingUnlikeEntries is the template with every vector at every depth
+// holding two entries that differ, built through the two walks above and controlled by the third.
+func testLeafNodeWithEveryVectorHoldingUnlikeEntries(t *testing.T, source LeafNodeSource) *LeafNode {
+	t.Helper()
+	leaf := testLeafNodeOfSource(source)
+	grown := growEverySliceToTwoElements(reflect.ValueOf(leaf).Elem(), "")
+	if len(grown) == 0 {
+		t.Fatalf("source %d: no vector of the template needed growing, so this fixture is the one element template again and the pairing below is unobservable",
+			source)
+	}
+	if again := growEverySliceToTwoElements(reflect.ValueOf(leaf).Elem(), ""); len(again) != 0 {
+		t.Fatalf("source %d: growing twice grew %v the second time, so the first pass left a vector holding one entry",
+			source, again)
+	}
+	if short := vectorsShorterThanTwoIn(reflect.ValueOf(leaf).Elem(), ""); len(short) != 0 {
+		t.Fatalf("source %d: %v hold fewer than two entries; a vector with one entry reports the clean run a correctly paired copy reports, whatever the copy did",
+			source, short)
+	}
+	counter := uint64(0)
+	stampEveryScalarInWalkOrder(reflect.ValueOf(leaf).Elem(), &counter)
+	if same := vectorEntriesThatAreIdenticalIn(reflect.ValueOf(leaf).Elem(), ""); len(same) != 0 {
+		t.Fatalf("source %d: %v; entries holding the same value are entries no copy can be caught mispairing",
+			source, same)
+	}
+	return leaf
+}
+
+// TestLeafNodeCloneGivesEveryVectorEntryItsOwnValue is the half
+// TestLeafNodeCloneSharesNoStorageAtAnyDepth cannot see, and the difference between them is
+// exactly one entry.
+//
+// That sweep runs over a leaf with every vector OCCUPIED, and occupied there means one element.
+// Over such a value a clone that read entry zero's body into every entry holds the same octets a
+// correct clone holds and shares no storage with anything, so it passes the aliasing walk, the
+// goldens, the round trips and the whole of the rest of this package. What it produces on a leaf
+// carrying two extensions is a required_capabilities entry holding the urmessage_leaf_keys octets:
+// correctly tagged, correctly length prefixed, and wrong.
+//
+// The aliasing walk is run here too, over the two entry fixture, because entry ONE's storage is a
+// location the one entry fixture does not have either.
+func TestLeafNodeCloneGivesEveryVectorEntryItsOwnValue(t *testing.T) {
+	for _, source := range leafNodeSources(t) {
+		original := testLeafNodeWithEveryVectorHoldingUnlikeEntries(t, source)
+		reference := testLeafNodeWithEveryVectorHoldingUnlikeEntries(t, source)
+		if !sameLeafNode(original, reference) {
+			t.Fatalf("source %d: the fixture is not deterministic, so the comparison below is against a different value",
+				source)
+		}
+		clone := original.Clone()
+		if !sameLeafNode(clone, reference) {
+			t.Errorf("source %d: Clone of a leaf whose vectors hold two unlike entries differs at %v; a copy that pairs two sequences by hand answers one entry's body under another entry's tag\n got  %s\n want %s",
+				source, leafNodeLocationsDifferingBetween(clone, reference),
+				describeLeafNode(clone), describeLeafNode(reference))
+			continue
+		}
+		written := writeThroughEverySlice(reflect.ValueOf(clone).Elem(), "")
+		if len(written) == 0 {
+			t.Fatalf("source %d: the walk wrote through no slice, so this observed nothing", source)
+		}
+		if !sameLeafNode(original, reference) {
+			t.Errorf("source %d: writing through the clone reached the original at %v",
+				source, leafNodeLocationsDifferingBetween(original, reference))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // LeafNodeTBS, signing and signature verification
 // ---------------------------------------------------------------------------
 

@@ -140,6 +140,20 @@ var (
 	errWelcomeLeafNotTheJoiners = errors.New(
 		"mls: the tree's leaf for this joiner is not the leaf its key package published")
 
+	// errJoinerSignatureKeyNotTheLeafs is a joiner whose signing key is not the signature key its
+	// own key package published.
+	//
+	// The two halves arrive at this door independently -- the key package out of whatever the
+	// caller stored, the private half out of the device's own keyring -- and this is the one door
+	// of the three that produces a leaf for this client where they are not one value: NewLeafNode
+	// and (*Group).ProposeUpdate both DERIVE the published key from the private one through
+	// signaturePublicKeyOf, so a mismatch there cannot be written. A joiner that installed the
+	// mismatched pair signs every message it sends with a key its own published leaf does not
+	// name; every other member refuses those messages at the signature, and neither end holds
+	// anything that says why.
+	errJoinerSignatureKeyNotTheLeafs = errors.New(
+		"mls: this joiner's signing key is not the signature key its key package published")
+
 	// errJoinerWelcomeSecret is this build disagreeing with itself about welcome_secret: the value
 	// JoinFromWelcome derived to open the encrypted group info is not the one the key schedule
 	// derives from the same joiner secret. Its whole account is at the comparison.
@@ -1975,11 +1989,18 @@ type JoinKeyMaterial struct {
 // leaf key for as long as it holds that leaf, and the signing key is its identity. A caller that
 // dropped one of these after a join left all three in the heap for the collector to move around.
 //
-// THE KEY PACKAGE IS DELIBERATELY NOT TOUCHED, for (*WelcomeJoiner).Zeroize's reason one file over:
-// it is the PUBLISHED half. Every field of its encoding went to the delivery service and to every
-// member of every group that added this device, and the one field of the Go struct that is not
-// encoded -- signPriv -- is cleared by UnmarshalMLS on anything that arrived off the wire. Erasing
-// it would take away nothing an attacker lacks while destroying a value the caller still owns.
+// THE KEY PACKAGE'S PUBLISHED HALF IS DELIBERATELY NOT TOUCHED, for (*WelcomeJoiner).Zeroize's
+// reason one file over: every field of its encoding went to the delivery service and to every
+// member of every group that added this device, so erasing it would take away nothing an attacker
+// lacks while destroying a value the caller still owns.
+//
+// ITS ONE UNPUBLISHED FIELD IS. signPriv is the seed the leaf's signature key was minted from,
+// NewKeyPackage sets it, and marshalCore stops above it -- so a joiner assembled out of a key
+// package this process minted is holding a signature private key inside a structure that is
+// otherwise entirely public. (*KeyPackage).Zeroize erases that field and leaves the rest, which is
+// why the call is to it rather than to a zeroizeSecret written here: this type cannot see whether
+// it was handed a minted key package or one decoded off the wire, and the type that can does not
+// have to.
 //
 // A nil receiver is accepted for zeroizeSecret's reason, and the noinline directive is the erase
 // class's rule; see (*TreeKEMPrivate).Zeroize.
@@ -1989,6 +2010,7 @@ func (self *JoinKeyMaterial) Zeroize() {
 	if self == nil {
 		return
 	}
+	self.KeyPackage.Zeroize()
 	zeroizeSecret(self.InitPrivate)
 	zeroizeSecret(self.EncryptPrivate)
 	zeroizeSecret(self.SignPrivate)
@@ -2090,6 +2112,25 @@ func JoinFromWelcome(cfg *GroupConfig, welcome []byte, ratchetTree []byte,
 	}
 	if keys == nil {
 		return nil, errNilJoinKeyMaterial
+	}
+	// THE JOINER'S OWN TWO HALVES, held together before one octet the SENDER chose is judged.
+	//
+	// Here rather than beside step 6's leaf comparison, because this is the caller's material and
+	// not the message's: every refusal below names something about a Welcome, and a caller whose
+	// keyring and whose stored key package have parted company would be sent to look at a message
+	// nobody tampered with. Step 6 asks whether the TREE's leaf is the one this joiner published;
+	// this asks whether the key this group will sign with is the one that leaf names, which no
+	// amount of reading the tree can answer.
+	//
+	// Through subtle for guardrail 8's class reason, which is the class and not this line: a
+	// signature key is public, and every comparison in this package that decides whether a
+	// structure is this client's is spelled the one way.
+	joinerSignatureKey, err := signaturePublicKeyOf(keys.SignPrivate)
+	if err != nil {
+		return nil, err
+	}
+	if subtle.ConstantTimeCompare(joinerSignatureKey, keys.KeyPackage.LeafNode.SignatureKey) != 1 {
+		return nil, errJoinerSignatureKeyNotTheLeafs
 	}
 	active := cfg.Profile
 	if active == nil {

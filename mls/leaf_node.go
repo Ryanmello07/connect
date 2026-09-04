@@ -242,11 +242,40 @@ func (self *LeafNode) Clone() *LeafNode {
 	out.Capabilities.Credentials = cloneSlice(self.Capabilities.Credentials)
 	out.ParentHash = cloneBytes(self.ParentHash)
 	out.Signature = cloneBytes(self.Signature)
-	out.Extensions = cloneSlice(self.Extensions)
-	for i := range out.Extensions {
-		out.Extensions[i].ExtensionData = cloneBytes(self.Extensions[i].ExtensionData)
-	}
+	out.Extensions = cloneExtensions(self.Extensions)
 	return &out
+}
+
+// cloneExtensions answers an extension vector that shares no storage with the one it was made
+// from, and nil for nil for cloneSlice's reason.
+//
+// EACH ENTRY IS REBUILT FROM THE ENTRY IT IS COPYING, rather than a shallow copy fixed up
+// through an index afterwards, and that shape is the whole of why this exists. What stood in
+// Clone was
+//
+//	out.Extensions = cloneSlice(self.Extensions)
+//	for i := range out.Extensions {
+//		out.Extensions[i].ExtensionData = cloneBytes(self.Extensions[i].ExtensionData)
+//	}
+//
+// which pairs two sequences by hand at every iteration, and a pairing written wrong -- entry
+// zero's body read into every entry -- answers a leaf whose required_capabilities carries the
+// urmessage_leaf_keys octets: correctly tagged, correctly length prefixed, refused by nothing
+// this side of a peer parsing a body against the wrong type. There is no index here to get
+// wrong, because the entry a body is taken from IS the entry it is written into.
+// (*GroupContext).Clone is the same rebuild over the same element type one file over.
+func cloneExtensions(in []Extension) []Extension {
+	if in == nil {
+		return nil
+	}
+	out := make([]Extension, 0, len(in))
+	for _, extension := range in {
+		out = append(out, Extension{
+			ExtensionType: extension.ExtensionType,
+			ExtensionData: cloneBytes(extension.ExtensionData),
+		})
+	}
+	return out
 }
 
 // The RFC 9420 section 7.2 signature label, written once because a label spelled one way in
