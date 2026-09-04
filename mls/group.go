@@ -629,12 +629,21 @@ func (self *Group) Close() error {
 // Called with the state lock held, or before the group has been handed to anybody, which is the
 // creation path's case. Task 19 defines the blob and the past-epoch window; this task writes only
 // the current epoch.
+//
+// The group id is CLONED on the way out, for the reason GroupId() clones on the way out. The store
+// is an object the caller supplies and goes on holding -- the sdk writes these implementations
+// over its own sealed local store -- so a store that keeps the slice it was handed, to key a map
+// or to build a path with later, shares an array with this group for the group's lifetime, and a
+// write through it rewrites the group id every epoch secret of this group was derived over.
+// Nothing downstream would report that: the context stays self consistent with the octets it now
+// holds, and the transcript, the tree hash and the key schedule all go on agreeing with each
+// other over the wrong id.
 func (self *Group) persist() error {
 	blob, err := self.marshalState()
 	if err != nil {
 		return err
 	}
-	return self.store.PutGroupState(self.context.GroupId, self.context.Epoch, blob)
+	return self.store.PutGroupState(cloneBytes(self.context.GroupId), self.context.Epoch, blob)
 }
 
 // marshalState is TASK 19's and this is the stand-in.

@@ -12,7 +12,12 @@
 // So the property here is the other half, stated over storage rather than over answers:
 //
 //	no octet a caller can reach through its own arguments is an octet the constructed value can
-//	reach, and no octet a group holds is an octet it hands back out.
+//	reach, and no octet a group holds is an octet it hands back out -- to whoever called it, or
+//	onward to an object that caller supplied.
+//
+// The last clause is a third direction and it is the newest, added because BOTH gates read a
+// method RESULT and an octet handed outward as an ARGUMENT is invisible to a reader of results.
+// See the third section's own header for what that cost.
 //
 // WHY THE ARRAYS ARE WALKED AND NOT LISTED, WHICH IS THE FIRST HALF OF THIS FILE. The row for group
 // creation in crypto_test.go names four arrays -- the group id, the X-Wing public key, the
@@ -82,6 +87,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"maps"
 	"reflect"
 	"slices"
@@ -375,6 +381,84 @@ func byteStoragePathsThrough(found reflect.Type, path string, into *[]string,
 }
 
 // ---------------------------------------------------------------------------
+// and the same question asked of the TYPE CHECKER's types, which is what makes the SCOPE derived
+// ---------------------------------------------------------------------------
+
+// typeReachesByteStorage answers whether a value of this type carries a caller's byte storage, at
+// any depth, through the constructors byteStoragePathsOf walks: slices, arrays, pointers, maps and
+// exported struct fields.
+//
+// TWO WALKS OVER ONE QUESTION, and the second one is here because the class this gate runs over
+// was read with a NARROWER matcher than the arrays inside it. byteStoragePathsOf answers over
+// reflect and can only be asked about a type somebody already has a value of; the SCOPE has to be
+// asked about the parameters of a package level function, which reflect cannot enumerate, and the
+// reading it used was a match on how the parameter was SPELLED -- []byte, or one of the names this
+// package declares for a byte slice. So the arrays half walked to unbounded depth while the half
+// choosing what to walk read one hop, and NewProposalList([]CachedProposal) and
+// ParseRatchetTreeFrom(Extension) are both handed a caller's octets, both answer a sealed type,
+// and both sat outside the class. That is not hypothetical: a real retention in NewProposalList --
+// its Ref clone removed -- was caught by a hand written test, which is the enumeration this gate
+// was written to replace.
+//
+// The two are held to ONE class by TestTheByteStorageReadingsAgreeOverEveryConstructor below,
+// which runs both over the same list of arms, since two spellings of one question is how one of
+// them ends up narrower than the other.
+func typeReachesByteStorage(found types.Type) bool {
+	return typeReachesByteStorageThrough(found, map[types.Type]bool{})
+}
+
+// typeReachesByteStorageThrough is the walk, carrying the types it has already entered.
+//
+// The guard is per BRANCH, exactly as byteStoragePathsThrough's is: a type reached twice down two
+// routes is two routes, and a guard held across the whole walk would answer for the second from
+// the first. An interface is NOT entered, which is byteStorageOutside's line: a parameter of
+// interface type hands over an OBJECT and not a buffer, and this reading is only ever asked about
+// what a construction is HANDED.
+func typeReachesByteStorageThrough(found types.Type, entered map[types.Type]bool) bool {
+	found = types.Unalias(found)
+	if found == nil || entered[found] {
+		return false
+	}
+	entered[found] = true
+	defer delete(entered, found)
+	switch shape := found.(type) {
+	case *types.Named:
+		return typeReachesByteStorageThrough(shape.Underlying(), entered)
+	case *types.Slice:
+		return isByteKind(shape.Elem()) || typeReachesByteStorageThrough(shape.Elem(), entered)
+	case *types.Array:
+		return isByteKind(shape.Elem()) || typeReachesByteStorageThrough(shape.Elem(), entered)
+	case *types.Pointer:
+		return typeReachesByteStorageThrough(shape.Elem(), entered)
+	case *types.Struct:
+		for at := 0; at < shape.NumFields(); at += 1 {
+			field := shape.Field(at)
+			// the exported fields, which are what a holder can spell; the header's line 2
+			if !field.Exported() {
+				continue
+			}
+			if typeReachesByteStorageThrough(field.Type(), entered) {
+				return true
+			}
+		}
+	case *types.Map:
+		// both halves, since a map keyed by a caller's array hands it over exactly as one
+		// valued by it does
+		return typeReachesByteStorageThrough(shape.Key(), entered) ||
+			typeReachesByteStorageThrough(shape.Elem(), entered)
+	}
+	return false
+}
+
+// isByteKind answers whether this is the element type a run of octets is made of. It is the
+// element half of isByteSliceType next door, split out because the walk above asks it of a slice
+// element and of an array element alike.
+func isByteKind(found types.Type) bool {
+	basic, isBasic := found.Underlying().(*types.Basic)
+	return isBasic && basic.Kind() == types.Uint8
+}
+
+// ---------------------------------------------------------------------------
 // the controls for the walks: one member per arm, so an arm that stopped working fails here
 // ---------------------------------------------------------------------------
 
@@ -496,6 +580,109 @@ func TestTheByteStorageWalksAgreeOverEveryConstructor(t *testing.T) {
 	byteStorage{n: len(control.Direct), run: reflect.ValueOf(control.Direct)}.scribble(0x5a)
 	if bytes.Equal(before, control.Direct) {
 		t.Error("a scribble through what the walk kept changed nothing, so the behavioural half writes nowhere")
+	}
+}
+
+// callerArrayControlArms is the arms of the control above, read off the routes the type walk
+// answers rather than typed out a second time.
+//
+// It is what joins the two readings: the reflect walk's own answer over callerArrayControl becomes
+// the list the type checked walk is held to, so an arm one of them stopped entering is a
+// disagreement rather than two lists somebody kept in step.
+func callerArrayControlArms() []string {
+	arms := []string{}
+	for _, route := range callerArrayControlPaths {
+		arm := strings.TrimPrefix(route, "it->.")
+		if at := strings.IndexAny(arm, ".[{-"); at >= 0 {
+			arm = arm[:at]
+		}
+		if !slices.Contains(arms, arm) {
+			arms = append(arms, arm)
+		}
+	}
+	slices.Sort(arms)
+	return arms
+}
+
+// The same shapes as callerArrayControl, one per FUNCTION so the type checked reading can be asked
+// about a parameter, which is the position it is used at.
+//
+// The names are the control's field names with takes in front, so the comparison below is against
+// the arms the reflect walk answers rather than against a second list. The three at the foot are
+// the arms that walk does not answer -- an interface, an unexported field, and a parameter with no
+// storage anywhere in it -- so a reading that swept any of them in fails here.
+const callerStorageTypeControl = `package control
+
+type Named []byte
+
+type inner struct {
+	Deeper  []byte
+	Deepest *inner
+}
+
+type sealed struct {
+	hidden []byte
+}
+
+type held interface{ Held() []byte }
+
+func takesDirect(v []byte)           {}
+func takesNamed(v Named)             {}
+func takesFixed(v [4]byte)           {}
+func takesPointed(v *[]byte)         {}
+func takesNested(v inner)            {}
+func takesNestedPtr(v *inner)        {}
+func takesEntries(v []inner)         {}
+func takesFixture(v [1]inner)        {}
+func takesKeyed(v map[string][]byte) {}
+func takesKeyedBy(v map[*inner]bool) {}
+func takesHeld(v held)               {}
+func takesHidden(v sealed)           {}
+func takesNothing(v int)             {}
+`
+
+// TestTheByteStorageReadingsAgreeOverEveryConstructor holds the type checked reading to the
+// reflect one over the arms the reflect one answers.
+//
+// It is the fix for the defect one level out: the arrays inside a construction were walked at
+// unbounded depth and the choice of WHICH constructions to walk was made on how a parameter was
+// spelled. Two readings of one property drift, and the one that drifts narrower feeds a class
+// every gate over it then reports a clean run against.
+func TestTheByteStorageReadingsAgreeOverEveryConstructor(t *testing.T) {
+	want := []string{}
+	for _, arm := range callerArrayControlArms() {
+		want = append(want, "takes"+arm)
+	}
+	if len(want) == 0 {
+		t.Fatal("the reflect walk answers no arm of its own control, so this comparison holds for a reading that matches nothing")
+	}
+	got := []string{}
+	declared := 0
+	for _, function := range declaredFunctionsIn(t,
+		typeCheckedText(t, "the caller storage type control", callerStorageTypeControl)) {
+
+		if function.method {
+			continue
+		}
+		declared += 1
+		parameters := function.signature.Params()
+		for at := 0; at < parameters.Len(); at += 1 {
+			if typeReachesByteStorage(parameters.At(at).Type()) {
+				got = append(got, function.name)
+				break
+			}
+		}
+	}
+	// the three the reflect walk does not answer are declared here too, or the comparison would
+	// be against a control carrying only its positives
+	if declared != len(want)+3 {
+		t.Fatalf("the control declares %d functions and the class it must separate is %v plus three negatives; a control narrower than the class it holds agrees with anything",
+			declared, want)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("the type checked reading is handed storage by %v, and the reflect walk answers the arms %v; the two readings of one property have parted company",
+			got, want)
 	}
 }
 
@@ -669,19 +856,60 @@ func packageLevelFunctionArity(t *testing.T, name string) int {
 	return 0
 }
 
+// packageLevelFunctionsHandedCallerStorage answers the package level functions whose PARAMETER
+// TYPES reach a caller's byte storage, at any depth.
+//
+// This is not packageLevelFunctionsTakingCallerBytes and the difference is the whole point. That
+// reading is a SPELLING: a parameter counts when it is written []byte or as one of the names this
+// package declares for a byte slice. It is exactly right for the gate it feeds -- "leaves the
+// array it was handed alone" is a statement about an array somebody handed over -- and it is one
+// hop deep, while the arrays half of THIS gate walks a type to unbounded depth. A gate whose scope
+// is read shallower than its subject understates the class, and that is what happened here:
+// NewProposalList takes a []CachedProposal and ParseRatchetTreeFrom takes an Extension, both are
+// handed a caller's octets down a route no spelling can see, both answer a type sealed to the last
+// field, and both sat outside a class derived to hold exactly that shape. A real retention in the
+// first of them -- its Ref clone removed -- was caught by a hand written test, which is the
+// enumeration this gate exists to replace.
+//
+// The type checker and not the parse tree, for extensionTypeSelectionNamedAs's reason: a defined
+// type, an alias and a type spelled through another package's name are one type to the compiler
+// and three spellings to a matcher.
+func packageLevelFunctionsHandedCallerStorage(t *testing.T) []string {
+	t.Helper()
+	names := []string{}
+	for _, function := range declaredFunctionsOf(t, cryptoOwnRoot) {
+		if function.method {
+			continue
+		}
+		parameters := function.signature.Params()
+		for at := 0; at < parameters.Len(); at += 1 {
+			if typeReachesByteStorage(parameters.At(at).Type()) {
+				names = append(names, function.name)
+				break
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("no package level function of this package is handed a caller's storage, so the class below has no subjects")
+	}
+	slices.Sort(names)
+	return names
+}
+
 // packageConstructionsOfSealedStorage is the class this gate runs over: handed a caller's bytes,
 // and answering a value nothing outside can see inside.
 //
-// Both halves are read off the source. The first is crypto_test.go's own derivation, reused rather
-// than restated, and its exemption table is honoured here too -- newKeyScheduleFromParts is excused
-// there with "retaining it is the function", which is a RETENTION exemption and belongs to this
-// gate more squarely than to that one.
+// Both halves are read off the source. The first is the reach reading above rather than
+// crypto_test.go's spelling based one -- see there for why the two are not one class -- and that
+// gate's exemption table is honoured here too: newKeyScheduleFromParts is excused there with
+// "retaining it is the function", which is a RETENTION exemption and belongs to this gate more
+// squarely than to that one.
 func packageConstructionsOfSealedStorage(t *testing.T) []string {
 	t.Helper()
 	sealed := packageSealedTypeNames(t)
 	results := packageLevelFunctionResults(t)
 	names := []string{}
-	for _, name := range packageLevelFunctionsTakingCallerBytes(t) {
+	for _, name := range packageLevelFunctionsHandedCallerStorage(t) {
 		if _, isExcused := packageConstructionsOverBorrowedBytes[name]; isExcused {
 			continue
 		}
@@ -868,8 +1096,86 @@ func callerArrayRows() []callerArrayRow {
 			}
 			return []any{&encoded}, tree
 		}},
+		// the two the spelling based scope could not see. Neither takes a byte slice: one takes a
+		// slice of structures and the other a structure, and the caller's octets are a hop below
+		// each of them.
+		{name: "ParseRatchetTreeFrom", build: func(t *testing.T) ([]any, any) {
+			ext := Extension{ExtensionType: ExtensionTypeRatchetTree,
+				ExtensionData: callerOwnedEncodedTree(t)}
+			tree, err := ParseRatchetTreeFrom(ext)
+			if err != nil {
+				t.Fatalf("ParseRatchetTreeFrom: %v", err)
+			}
+			return []any{&ext}, tree
+		}},
+		{name: "NewProposalList", build: func(t *testing.T) ([]any, any) {
+			order := callerOwnedCommitOrder(t)
+			return []any{&order}, NewProposalList(order)
+		}},
 	}
 }
+
+// callerOwnedCommitOrder is the commit order NewProposalList's row hands in: one entry per arm a
+// Proposal can carry, with every empty vector inside the populated arm occupied.
+//
+// ONE ENTRY PER ARM because a Proposal carries exactly one -- checkArm counts them -- while the
+// argument TYPE declares a storage route through every arm there is. A single entry would leave
+// six of the eight routes unsupplied, and this gate refuses a row that supplies fewer routes than
+// its argument types declare, which is what stops a retention behind an arm nobody filled from
+// reading as compliant.
+//
+// The arm is found rather than named: the one non nil pointer field of the Proposal is the arm,
+// whatever it is called, so an eighth arm registered later is filled by the commit that adds it.
+// Ref and UnknownBody are the two routes that are NOT inside an arm and they are filled by hand --
+// UnknownBody only on the entry whose type has no arm, since a body set beside a populated arm is
+// two arms to checkArm and a proposal that will not encode.
+//
+// Every entry must CLONE, and that is a demand on this fixture rather than an observation.
+// NewProposalList leaves a proposal it could not encode standing as the caller's own, so a
+// fixture carrying one would make this gate report a retention that is really a malformed entry.
+func callerOwnedCommitOrder(t *testing.T) []CachedProposal {
+	t.Helper()
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	member := testIdentity(t, crypto, "the proposer whose arrays this row follows")
+	keyPackage, _, _ := testKeyPackage(t, crypto, member)
+	leaf, _ := testLeafNode(t, crypto, member)
+	order := []CachedProposal{
+		{Proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *keyPackage}}},
+		{Proposal: Proposal{ProposalType: ProposalTypeUpdate, Update: &Update{LeafNode: *leaf}}},
+		{Proposal: Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: LeafIndex(1)}}},
+		{Proposal: Proposal{ProposalType: ProposalTypePreSharedKey,
+			PreSharedKey: &PreSharedKey{Psk: PreSharedKeyId{PskType: PskTypeExternal}}}},
+		{Proposal: Proposal{ProposalType: ProposalTypeReInit, ReInit: &ReInit{
+			Version: ProtocolVersionMls10, CipherSuite: crypto.Suite()}}},
+		{Proposal: Proposal{ProposalType: ProposalTypeExternalInit, ExternalInit: &ExternalInit{}}},
+		{Proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions,
+			GroupContextExtensions: &GroupContextExtensions{}}},
+		{Proposal: Proposal{ProposalType: callerArrayUnregisteredProposalType,
+			UnknownBody: []byte("the verbatim body of a type this build does not register")}},
+	}
+	for at := range order {
+		proposal := reflect.ValueOf(&order[at].Proposal).Elem()
+		for field := range proposal.NumField() {
+			arm := proposal.Field(field)
+			if arm.Kind() == reflect.Pointer && !arm.IsNil() {
+				growEveryEmptySlice(arm.Elem(), "")
+			}
+		}
+		order[at].Ref = ProposalRef(bytes.Repeat([]byte{byte(0x40 + at)}, 32))
+		order[at].Sender = LeafIndex(at)
+		// every entry must survive the clone, or the retention this gate reports is this
+		// fixture's and not the constructor's
+		if _, _, err := cloneProposal(&order[at].Proposal); err != nil {
+			t.Fatalf("entry %d of this row's commit order does not encode, so NewProposalList would keep the caller's own copy of it: %v",
+				at, err)
+		}
+	}
+	return order
+}
+
+// The code point the unknown arm's entry is written under. It is asserted unregistered where it is
+// used, so a build that registers it fails rather than filling that route with a known type.
+const callerArrayUnregisteredProposalType = ProposalType(0x0A0A)
 
 // TestNoConstructionOfSealedStorageRetainsItsCallersArrays is the retention half, over every member
 // of the derived class.
@@ -1159,6 +1465,16 @@ func answerStorageOf(row groupAnswerRow, group *Group) *byteStorageFinder {
 // A row is refused as vacuous when its method's RESULT TYPES declare byte storage and the call
 // produced none, so a method whose answer stopped carrying anything cannot read as compliant. That
 // demand is derived from the signature rather than from a list of which methods answer bytes.
+//
+// THE GROUP IS WALKED TWICE, BEFORE THE CALL AND AFTER IT, and the second walk is the one this
+// test was reopened for. Taking the snapshot only beforehand asks "is this answer storage the
+// group ALREADY held", which is silent about storage the group STARTS holding at answer time: a
+// method that clones its answer and then files the clone away on itself hands out an array that
+// was in neither the group nor the caller when the walk ran, and the finding was measured -- such
+// a method left 7286 tests green. It is not a hypothetical shape either. Memoising the marshalled
+// bytes GroupContext() builds is the obvious next optimisation for the tasks that follow this
+// one, and it lands exactly here: the first call would answer fresh storage and keep it, and every
+// call after that would hand out the group's own.
 func TestNoAnswerOfAGroupSharesStorageWithIt(t *testing.T) {
 	for _, row := range groupAnswerRows() {
 		group := mustFoundedGroup(t)
@@ -1170,6 +1486,18 @@ func TestNoAnswerOfAGroupSharesStorageWithIt(t *testing.T) {
 			t.Fatalf("%s: the group reached no storage at all, so this row compared nothing", row.name)
 		}
 		answered := answerStorageOf(row, group)
+		// what the group holds once the answer has been made. Close() is a row like any other
+		// and it drops the schedule and the secret tree, so this snapshot is allowed to be
+		// smaller than the one above -- what it must not be is empty, or the second comparison
+		// would be the clean run of a comparison that ran over nothing.
+		kept := byteStorageFoundIn(reflect.ValueOf(group), "group after the call", byteStorageInside)
+		if len(kept.unfollowed) != 0 {
+			t.Errorf("%s: the walk over the group after the call could not follow %v", row.name, kept.unfollowed)
+		}
+		if len(kept.found) == 0 {
+			t.Fatalf("%s: the group reached no storage after the call, so the second comparison observed nothing",
+				row.name)
+		}
 		if len(answered.unfollowed) != 0 {
 			t.Errorf("%s: the walk over its answer could not follow %v", row.name, answered.unfollowed)
 		}
@@ -1178,10 +1506,12 @@ func TestNoAnswerOfAGroupSharesStorageWithIt(t *testing.T) {
 				row.name)
 		}
 		for _, given := range answered.found {
-			for _, theirs := range held.found {
-				if given.overlaps(theirs) {
-					t.Errorf("%s hands out %s, which is the group's own %s: a caller writing through what it was handed writes into the group",
-						row.name, given.how, theirs.how)
+			for _, snapshot := range []*byteStorageFinder{held, kept} {
+				for _, theirs := range snapshot.found {
+					if given.overlaps(theirs) {
+						t.Errorf("%s hands out %s, which is the group's own %s: a caller writing through what it was handed writes into the group",
+							row.name, given.how, theirs.how)
+					}
 				}
 			}
 		}
@@ -1247,6 +1577,300 @@ func TestAGroupGoesOnPublishingWhatItWasFoundedOn(t *testing.T) {
 			if _, answeredBefore := before[route]; !answeredBefore {
 				t.Errorf("%s answered nothing at %s before its caller wrote into its own arrays and %v afterwards",
 					row.name, route, after[route])
+			}
+		}
+		group.Close()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the third direction: what a group hands OUTWARD, to an object its caller supplied
+// ---------------------------------------------------------------------------
+
+// THE HALF BOTH GATES ABOVE ARE BLIND TO, and the reason generalises past the one call it was
+// found on.
+//
+// Each of them reads a method RESULT: one walks what a construction ANSWERS, the other what a
+// group answers. An octet handed outward as an ARGUMENT is invisible to both, and a group hands
+// octets outward on every call it makes to an object its caller supplied. persist was the
+// measurement: it passed self.context.GroupId -- the live one, not a copy -- to
+// StateStore.PutGroupState, while GroupId() clones on the way out for exactly the reason persist
+// did not. The sdk writes these StateStore implementations, and one that keeps the slice it was
+// handed, to key a map or to build a path with later, shares an array with the group for the
+// group's lifetime; a write through it rewrites the group id every epoch secret was derived over,
+// with the context, the tree hash and the transcript all going on agreeing with each other over
+// the wrong id.
+//
+// THE SCOPE IS READ OFF GroupConfig and not off the one interface this was found on. A caller
+// supplies a group its objects through that structure, so its interface typed fields ARE the
+// class, and a third one added tomorrow fails the equality below rather than going uncovered.
+
+// groupInjectedObjects answers the objects a caller supplies to a group: the interface typed
+// fields of GroupConfig, read off the compiled type.
+//
+// Interface typed and not "everything a caller passes", because that is the line the argument
+// walk already draws: a slice field is a buffer the group is meant to copy, and the gates above
+// hold it to that. A field the caller supplies an OBJECT through is a field the group calls back
+// into, and the octets that go out on those calls are what nothing else here reads.
+func groupInjectedObjects(t *testing.T) []string {
+	t.Helper()
+	names := []string{}
+	config := reflect.TypeOf(GroupConfig{})
+	for at := range config.NumField() {
+		field := config.Field(at)
+		if field.IsExported() && field.Type.Kind() == reflect.Interface {
+			names = append(names, field.Name)
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("GroupConfig carries no interface typed field, so this gate has no subjects")
+	}
+	slices.Sort(names)
+	return names
+}
+
+// The injected objects this gate does NOT hold, named with the reason, on
+// packageConstructionsOverBorrowedBytes's terms: an object that cannot be held is a line somebody
+// writes on purpose rather than one left out of a table, and the gate below refuses an entry
+// naming a field GroupConfig does not carry, so an entry cannot outlive what it excuses.
+var groupOutwardObjectsHandedWhatTheyCompute = map[string]string{
+	// the provider is handed the very secret it derives from: ExpandWithLabel takes the epoch
+	// secret the schedule holds, MacSign takes the membership key, and an AEAD takes the key it
+	// seals under. Holding those calls to "no octet of the group's own goes out" would be
+	// holding the group to not deriving anything, which is zeroizeSecret's exemption one level
+	// out. What makes the store different is not that it is less trusted but what it is FOR: it
+	// is handed octets to KEEP, so the slice it was given outlives the call.
+	"Crypto": "is handed the secrets it derives from and the keys it tags with; the octets are the argument",
+}
+
+// recordingStore is a StateStore that records the storage of every argument it is handed and then
+// delegates to a real one.
+//
+// It records rather than retains, and the difference matters: a double that KEPT what it was
+// handed would be one implementation of a caller's store out of many, and this gate is about the
+// slice being reachable at all rather than about what any particular caller does with it.
+type recordingStore struct {
+	inner      StateStore
+	recorded   []byteStorage
+	unfollowed []string
+	calls      []string
+}
+
+func newRecordingStore() *recordingStore {
+	return &recordingStore{inner: newTestStore()}
+}
+
+// record walks one call's arguments and keeps every run of octets they reach.
+//
+// byteStorageAnswer is the walk, which is the one the hand-out gate uses: what a store can spell
+// is what any holder can spell, plus whatever an interface it was handed carries.
+func (self *recordingStore) record(call string, arguments ...any) {
+	self.calls = append(self.calls, call)
+	for at, argument := range arguments {
+		how := fmt.Sprintf("%s argument %d", call, at)
+		finder := byteStorageFoundIn(reflect.ValueOf(argument), how, byteStorageAnswer)
+		self.recorded = append(self.recorded, finder.found...)
+		self.unfollowed = append(self.unfollowed, finder.unfollowed...)
+	}
+}
+
+// paths answers the routes this store was handed storage down, which is what the coverage control
+// compares against the interface's own signatures.
+func (self *recordingStore) paths() []string {
+	out := []string{}
+	for _, one := range self.recorded {
+		if !slices.Contains(out, one.path) {
+			out = append(out, one.path)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (self *recordingStore) PutGroupState(groupId []byte, epoch uint64, state []byte) error {
+	self.record("PutGroupState", groupId, epoch, state)
+	return self.inner.PutGroupState(groupId, epoch, state)
+}
+
+func (self *recordingStore) GetGroupState(groupId []byte, epoch uint64) ([]byte, error) {
+	self.record("GetGroupState", groupId, epoch)
+	return self.inner.GetGroupState(groupId, epoch)
+}
+
+func (self *recordingStore) DeleteGroupStateBefore(groupId []byte, epoch uint64) error {
+	self.record("DeleteGroupStateBefore", groupId, epoch)
+	return self.inner.DeleteGroupStateBefore(groupId, epoch)
+}
+
+func (self *recordingStore) PutPrivateKey(pub []byte, priv []byte) error {
+	self.record("PutPrivateKey", pub, priv)
+	return self.inner.PutPrivateKey(pub, priv)
+}
+
+func (self *recordingStore) GetPrivateKey(pub []byte) ([]byte, error) {
+	self.record("GetPrivateKey", pub)
+	return self.inner.GetPrivateKey(pub)
+}
+
+func (self *recordingStore) DeletePrivateKey(pub []byte) error {
+	self.record("DeletePrivateKey", pub)
+	return self.inner.DeletePrivateKey(pub)
+}
+
+func (self *recordingStore) PutKeyPackage(ref []byte, kp []byte, initPriv []byte, encPriv []byte) error {
+	self.record("PutKeyPackage", ref, kp, initPriv, encPriv)
+	return self.inner.PutKeyPackage(ref, kp, initPriv, encPriv)
+}
+
+func (self *recordingStore) TakeKeyPackage(ref []byte) ([]byte, []byte, []byte, error) {
+	self.record("TakeKeyPackage", ref)
+	return self.inner.TakeKeyPackage(ref)
+}
+
+// fillByteStorage builds a value of one type carrying a run of octets down every route that type
+// declares storage at, so the coverage control below hands each method something to record.
+//
+// Derived off the type rather than written per method: a method whose signature grows a parameter
+// is filled by the commit that adds it, and a shape this cannot fill shows up as a route declared
+// and not recorded rather than as a route nobody asked about.
+func fillByteStorage(found reflect.Type, mark byte, depth int) reflect.Value {
+	if depth > byteStorageDepth {
+		return reflect.Zero(found)
+	}
+	switch found.Kind() {
+	case reflect.Slice:
+		if found.Elem().Kind() == reflect.Uint8 {
+			return reflect.ValueOf(bytes.Repeat([]byte{mark}, 8)).Convert(found)
+		}
+		filled := reflect.MakeSlice(found, 1, 1)
+		filled.Index(0).Set(fillByteStorage(found.Elem(), mark, depth+1))
+		return filled
+	case reflect.Array:
+		filled := reflect.New(found).Elem()
+		for at := range found.Len() {
+			filled.Index(at).Set(fillByteStorage(found.Elem(), mark+byte(at), depth+1))
+		}
+		return filled
+	case reflect.Pointer:
+		filled := reflect.New(found.Elem())
+		filled.Elem().Set(fillByteStorage(found.Elem(), mark, depth+1))
+		return filled
+	case reflect.Struct:
+		filled := reflect.New(found).Elem()
+		for at := range found.NumField() {
+			if !found.Field(at).IsExported() {
+				continue
+			}
+			filled.Field(at).Set(fillByteStorage(found.Field(at).Type, mark+byte(at), depth+1))
+		}
+		return filled
+	case reflect.Map:
+		filled := reflect.MakeMap(found)
+		filled.SetMapIndex(fillByteStorage(found.Key(), mark, depth+1),
+			fillByteStorage(found.Elem(), mark+1, depth+1))
+		return filled
+	}
+	return reflect.Zero(found)
+}
+
+// TestTheRecordingStoreReadsEveryArgumentItsInterfaceDeclares is the coverage control for the
+// double, and the class it is held to is StateStore's own method set.
+//
+// A hand written double is nine wrappers, and a wrapper that forgot to record is a call the gate
+// below walks past in silence -- which is the clean run of a gate that had checked it. So every
+// method is driven through reflect with a run of octets down every route its signature declares,
+// and what the double recorded is compared against those routes. A tenth method, or a parameter
+// added to one of the nine, fails here on the commit that adds it.
+func TestTheRecordingStoreReadsEveryArgumentItsInterfaceDeclares(t *testing.T) {
+	storeType := reflect.TypeOf((*StateStore)(nil)).Elem()
+	if storeType.NumMethod() == 0 {
+		t.Fatal("StateStore declares no method, so this control drives nothing")
+	}
+	for at := range storeType.NumMethod() {
+		method := storeType.Method(at)
+		store := newRecordingStore()
+		arguments := []reflect.Value{}
+		declared := []string{}
+		for in := range method.Type.NumIn() {
+			how := fmt.Sprintf("%s argument %d", method.Name, in)
+			arguments = append(arguments, fillByteStorage(method.Type.In(in), byte(0x10+in), 0))
+			declared = append(declared, byteStoragePathsOf(method.Type.In(in), how)...)
+		}
+		if len(declared) == 0 {
+			t.Errorf("%s declares no byte storage in any parameter, so the double has nothing to record there and this gate would pass over a call that carried some",
+				method.Name)
+			continue
+		}
+		reflect.ValueOf(store).MethodByName(method.Name).Call(arguments)
+		if len(store.unfollowed) != 0 {
+			t.Errorf("%s: the double could not follow %v, so it would walk past the same shape on a real call",
+				method.Name, store.unfollowed)
+		}
+		if got := store.paths(); !slices.Equal(got, sortedStorageRoutes(declared)) {
+			t.Errorf("%s handed the double storage at %v and its signature declares %v; a wrapper that stopped recording is a call this gate reads as carrying nothing",
+				method.Name, got, sortedStorageRoutes(declared))
+		}
+	}
+}
+
+// TestNoOctetAGroupHandsOutwardIsStorageItKeeps is the third direction, over the objects the
+// caller supplied.
+//
+// The group is walked BEFORE the outward calls and AFTER them, for the reason the hand-out gate
+// is: a snapshot taken on one side only is silent about storage that arrives on the other. The
+// calls this observes today all happen inside NewGroup -- persist is the only one -- so the first
+// snapshot is the one that matters now, and the second is what covers a method that persists.
+func TestNoOctetAGroupHandsOutwardIsStorageItKeeps(t *testing.T) {
+	// the class, read off GroupConfig, minus what is excused with a reason
+	covered := []string{"Store"}
+	injected := groupInjectedObjects(t)
+	demanded := []string{}
+	for _, name := range injected {
+		if _, isExcused := groupOutwardObjectsHandedWhatTheyCompute[name]; isExcused {
+			continue
+		}
+		demanded = append(demanded, name)
+	}
+	slices.Sort(covered)
+	if !slices.Equal(covered, demanded) {
+		t.Errorf("this gate follows what a group hands to %v, and the objects its caller supplies that are not excused are %v; an injected object with no double is a call nobody reads",
+			covered, demanded)
+	}
+	for name := range groupOutwardObjectsHandedWhatTheyCompute {
+		if !slices.Contains(injected, name) {
+			t.Errorf("the gate excuses %s, which GroupConfig carries no interface typed field for", name)
+		}
+	}
+
+	for _, row := range groupAnswerRows() {
+		cfg, signer, cred := callerOwnedGroupArguments(t)
+		store := newRecordingStore()
+		cfg.Store = store
+		group, err := NewGroup(cfg, signer, cred)
+		if err != nil {
+			t.Fatalf("%s: found the group this row follows: %v", row.name, err)
+		}
+		founded := byteStorageFoundIn(reflect.ValueOf(group), "group as founded", byteStorageInside)
+		row.call(group)
+		kept := byteStorageFoundIn(reflect.ValueOf(group), "group after the call", byteStorageInside)
+		if len(store.recorded) == 0 {
+			t.Fatalf("%s: the group handed its store no octet at all, so this row compared nothing; the store is written to on the creation path",
+				row.name)
+		}
+		if len(store.unfollowed) != 0 {
+			t.Errorf("%s: the walk over what went outward could not follow %v", row.name, store.unfollowed)
+		}
+		if len(founded.found) == 0 || len(kept.found) == 0 {
+			t.Fatalf("%s: the group reached no storage, so this row compared nothing", row.name)
+		}
+		for _, given := range store.recorded {
+			for _, snapshot := range []*byteStorageFinder{founded, kept} {
+				for _, theirs := range snapshot.found {
+					if given.overlaps(theirs) {
+						t.Errorf("%s: the group handed its store %s, which is the group's own %s: a store that keeps what it was handed writes into the group",
+							row.name, given.how, theirs.how)
+					}
+				}
 			}
 		}
 		group.Close()

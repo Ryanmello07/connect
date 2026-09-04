@@ -37,6 +37,7 @@ import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"go/token"
 	"maps"
 	"slices"
 	"strings"
@@ -307,6 +308,11 @@ const seamPaddingOctets = 32
 // guards; a derivation still has to start from something the package declares, and each of these
 // three is checked below against the package's own declarations, so a rename that moved one fails
 // here rather than quietly emptying the rule.
+//
+// seamForgedAuthenticators is the SEED of the parameter half and not the whole of it, and the
+// distinction is the one this file was reopened for. A parameter hands a seam the authenticators
+// when its type CARRIES them, not when its name is this one, and seamAuthenticatorCarriersIn
+// below is where that class is derived.
 const (
 	seamWireDoor             = "MarshalMLSMessage"
 	seamWireDoorType         = "MLSMessage"
@@ -328,13 +334,109 @@ type seamCandidate struct {
 	names map[string]bool
 }
 
+// seamAuthenticatorCarriersIn answers the type names a caller can put its own authenticators
+// inside: the seed itself, every type declared in the scan holding one in a field, every type
+// holding one of THOSE, and so on to a fixed point.
+//
+// THIS IS THE HALF THAT WAS NAMED RATHER THAN DERIVED, and what naming it cost was measured
+// rather than argued. The rule read one identifier -- a parameter handed over the authenticators
+// when its type spelled FramedContentAuthData -- while AuthenticatedContent CARRIES that type in
+// a field, and BOTH of this package's production seal entry points take one:
+// SealPublicMessage(crypto, membershipKey, authContent, groupContext) and
+// sealPrivateMessage(crypto, tree, senderData, authContent, padding). So a construction bypass of
+// identical power written over *AuthenticatedContent -- same file, same unexported caller, only
+// the parameter type differing -- passed this gate while the two real seams failed it, and would
+// have shipped in every binary that imports mls with this gate reporting the package clean.
+//
+// The walk enters EVERY field and not the exported ones alone, which is where it parts company
+// with typeReachesNamed next door, deliberately. That walk asks what a holder in ANOTHER package
+// can spell; this one asks what a caller can hand a seam, and the caller of a seam is inside the
+// package that declares it -- both of this file's are methods on *Group -- so an unexported field
+// is storage a forger can fill in.
+//
+// Non struct declarations are followed whole. type X = AuthenticatedContent, type X
+// AuthenticatedContent and type X []AuthenticatedContent are each a spelling that carries the
+// authenticators, and a walk reading struct fields alone would read a seam over any of the three
+// as taking nothing.
+func seamAuthenticatorCarriersIn(parsed []parsedSource) map[string]bool {
+	named := seamTypeFieldNamesIn(parsed)
+	carriers := map[string]bool{seamForgedAuthenticators: true}
+	for grew := true; grew; {
+		grew = false
+		for name, names := range named {
+			if carriers[name] {
+				continue
+			}
+			for other := range names {
+				if carriers[other] {
+					carriers[name] = true
+					grew = true
+					break
+				}
+			}
+		}
+	}
+	return carriers
+}
+
+// seamTypeFieldNamesIn answers, per type the scan declares, the identifiers its FIELD TYPES name.
+//
+// Field types and not the whole struct, because a struct inspected whole yields its field NAMES
+// too -- and a field called Auth beside a type called Auth would put a type into the closure for
+// the spelling of a label rather than for what it holds.
+func seamTypeFieldNamesIn(parsed []parsedSource) map[string]map[string]bool {
+	named := map[string]map[string]bool{}
+	for _, source := range parsed {
+		for _, declaration := range source.file.Decls {
+			general, isGeneral := declaration.(*ast.GenDecl)
+			if !isGeneral || general.Tok != token.TYPE {
+				continue
+			}
+			for _, specification := range general.Specs {
+				typeSpec, isType := specification.(*ast.TypeSpec)
+				if !isType {
+					continue
+				}
+				held := named[typeSpec.Name.Name]
+				if held == nil {
+					held = map[string]bool{}
+					named[typeSpec.Name.Name] = held
+				}
+				bodies := []ast.Expr{typeSpec.Type}
+				if structType, isStruct := typeSpec.Type.(*ast.StructType); isStruct &&
+					structType.Fields != nil {
+
+					bodies = []ast.Expr{}
+					for _, field := range structType.Fields.List {
+						bodies = append(bodies, field.Type)
+					}
+				}
+				for _, body := range bodies {
+					ast.Inspect(body, func(node ast.Node) bool {
+						if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
+							held[identifier.Name] = true
+						}
+						return true
+					})
+				}
+			}
+		}
+	}
+	return named
+}
+
 // seamCandidatesIn reads one set of parsed files into the shape the two rules below ask about.
 //
 // Parameters and not the receiver. A method whose RECEIVER is the authenticators is a codec of
 // them -- (*FramedContentAuthData).MarshalMLS is one -- and banning that shape would ban the
 // encoder every honest sender runs. What makes a declaration a bypass is being HANDED
 // authenticators for a message it is assembling on somebody else's behalf.
+//
+// The carriers are read off the SAME parsed set the candidates are, so a scan widened to a root
+// widens the closure with it: a type declared in connect/message that holds an
+// mls.FramedContentAuthData is a type a forge over there is handed.
 func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
+	carriers := seamAuthenticatorCarriersIn(parsed)
 	candidates := []seamCandidate{}
 	for _, source := range parsed {
 		for _, declaration := range source.file.Decls {
@@ -354,7 +456,7 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 			for _, field := range function.Type.Params.List {
 				ast.Inspect(field.Type, func(node ast.Node) bool {
 					if identifier, isIdentifier := node.(*ast.Ident); isIdentifier &&
-						identifier.Name == seamForgedAuthenticators {
+						carriers[identifier.Name] {
 						candidate.forgeable = true
 					}
 					return true
@@ -460,13 +562,44 @@ func seamNamesOf(seams []seamCandidate) []string {
 // A package holding one of each shape, so a matcher that stopped matching fails here rather than
 // reporting this package clean.
 //
-// Four negatives and three positives, and every negative is a shape this package's PRODUCTION
+// Five negatives and five positives, and every negative is a shape this package's PRODUCTION
 // source actually has: a fragment serializer handed the authenticators
 // (marshalPrivateMessageContentWithPadding), a sender that computes its own and names the type in
 // its body (SignAuthenticatedContent), and a codec whose receiver is the authenticators
 // ((*FramedContentAuthData).MarshalMLS). A rule that swept any of them in would ban the send path
 // rather than the forge.
+//
+// It declares TYPES as well as functions, which the version of this control that read one
+// identifier did not need. Three of them are production's own shape transcribed --
+// AuthenticatedContent holds the auth data, PublicMessage holds it, MLSMessage holds a
+// PublicMessage -- so the closure the parameter half derives is exercised at one hop and at two,
+// and the fourth carries none at any depth so the closure has something to leave out.
 const constructionBypassSeamControl = `package control
+
+// the authenticators themselves, and the three types production really puts them inside. A seam
+// over any of these is handed exactly what a seam over the first is.
+type FramedContentAuthData struct {
+	Signature []byte
+}
+
+type AuthenticatedContent struct {
+	Content FramedContent
+	Auth    FramedContentAuthData
+}
+
+type PublicMessage struct {
+	Content FramedContent
+	Auth    FramedContentAuthData
+}
+
+type MLSMessage struct {
+	PublicMessage *PublicMessage
+}
+
+// carrying none of them at any depth, which is what says the closure closes.
+type FramedContent struct {
+	GroupId []byte
+}
 
 // the seam shape: the caller chooses the authenticators and the answer is what the wire carries.
 func forgesTheAuthenticatorsOntoTheWire(auth *FramedContentAuthData) ([]byte, error) {
@@ -502,9 +635,35 @@ func sealsWhatItSignedItself(signer SignaturePrivateKey) ([]byte, error) {
 
 // the codec OF the authenticators, reaching the wire door with them as its RECEIVER. It is what
 // says the rule reads parameters and not receivers.
-func (self *FramedContentAuthData) marshalsAMessage(message *MLSMessage) error {
-	_, err := MarshalMLSMessage(message)
+//
+// Its parameter carries NO authenticators, and that is the derived anchor's doing rather than a
+// tidy up. While the anchor was one identifier this took a *MLSMessage, which is a type that
+// carries them -- so under the reading below it would be a positive for its PARAMETER and would
+// have stopped being the receiver negative it is named for.
+func (self *FramedContentAuthData) marshalsAMessage(content *FramedContent) error {
+	_, err := MarshalMLSMessage(&MLSMessage{})
 	return err
+}
+
+// the seam written over the type that CARRIES the authenticators rather than over the
+// authenticators themselves. Identical power -- the caller fills in Auth and this puts it on the
+// wire -- and the rule that anchored on one identifier read it as clean while failing the two real
+// seams beside it.
+func forgesOverACarrier(authContent *AuthenticatedContent) ([]byte, error) {
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+// the same TWO hops out, since an MLSMessage carries a PublicMessage which carries the auth data.
+// Without this member a closure that took one hop and stopped would pass.
+func forgesOverACarrierTwoHopsOut(message *MLSMessage) ([]byte, error) {
+	return MarshalMLSMessage(message)
+}
+
+// reaching the wire door over a type that carries no authenticators at any depth. It is what says
+// the closure is a closure rather than "every type this package declares", and a rule that swept
+// it in would ban every encoder that takes a content.
+func sealsOverSomethingThatCarriesNone(content *FramedContent) ([]byte, error) {
+	return MarshalMLSMessage(&MLSMessage{})
 }
 
 // naming neither the door nor the authenticators, so the fixed point has something to leave out.
@@ -524,6 +683,75 @@ func forgesFromAnotherPackage(auth *mls.FramedContentAuthData) ([]byte, error) {
 	return mls.MarshalMLSMessage(&mls.MLSMessage{})
 }
 `
+
+// The other root again, this time over a type of THIS root that CARRIES the authenticators
+// rather than over the authenticators themselves. It is the shape the scope widening and the
+// anchor derivation only catch together: the closure is read off the same scan the candidates
+// are, so mls's own type declarations are what make a qualified *mls.AuthenticatedContent read as
+// a parameter handed the authenticators.
+const constructionBypassSeamCarrierInTheOtherRootControl = `package message
+
+import "github.com/urnetwork/connect/mls"
+
+func forgesOverACarrierFromAnotherPackage(authContent *mls.AuthenticatedContent) ([]byte, error) {
+	return mls.MarshalMLSMessage(&mls.MLSMessage{})
+}
+`
+
+// TestTheConstructionBypassSeamGateDerivesTheTypesThatCarryTheAuthenticators is the anchor half's
+// own control, and it is here because the anchor was the half this gate got wrong.
+//
+// A parameter hands a seam the authenticators when its type CARRIES them. Reading the identifier
+// instead was measured against a controlled A/B -- one file, one unexported caller, only the
+// parameter type differing -- where the *AuthenticatedContent version passed five gates the two
+// real seams failed. So the closure is asserted at one hop and at two, and it is asserted to
+// CLOSE: a type carrying none of them at any depth stays out, or the rule would ban every encoder
+// that takes a content.
+func TestTheConstructionBypassSeamGateDerivesTheTypesThatCarryTheAuthenticators(t *testing.T) {
+	carriers := seamAuthenticatorCarriersIn([]parsedSource{
+		mustParseText(t, "seam_control.go", constructionBypassSeamControl)})
+	want := []string{"AuthenticatedContent", "FramedContentAuthData", "MLSMessage", "PublicMessage"}
+	if got := slices.Sorted(maps.Keys(carriers)); !slices.Equal(got, want) {
+		t.Fatalf("the closure read %v out of the control, want %v; a carrier it misses is a seam of identical power it would ship, and one it invents bans the send path",
+			got, want)
+	}
+
+	// and over the real scan, where the two things that matter are that the closure grows past
+	// its seed and that what it grows into is production's own
+	scan := mustScanSources(t, forbiddenScanRoots)
+	parsed := []parsedSource{}
+	for _, path := range slices.Sorted(maps.Keys(scan.sourceTexts)) {
+		parsed = append(parsed, mustParseText(t, path, scan.sourceTexts[path]))
+	}
+	declared := packageLevelDeclarations(t, ".")
+	real := seamAuthenticatorCarriersIn(parsed)
+	for _, carrier := range []string{"AuthenticatedContent", "PublicMessage", "MLSMessage"} {
+		if !real[carrier] {
+			t.Errorf("%s is not read as carrying the authenticators, and framing.go declares it with a FramedContentAuthData inside; the anchor has gone back to being a spelling",
+				carrier)
+		}
+		file, isDeclared := declared[carrier]
+		if !isDeclared {
+			t.Errorf("this package declares no %s, so the carrier this closure is pinned against has moved", carrier)
+			continue
+		}
+		if strings.HasSuffix(file, "_test.go") {
+			t.Errorf("%s is declared in %s, so the carriers this closure is pinned against are no longer production's own",
+				carrier, file)
+		}
+	}
+
+	// the two halves together: a forge assembled in the OTHER root over a carrier of this one.
+	// Neither widening catches it alone -- the scope puts the file in front of the rule and the
+	// closure is what says its parameter is the authenticators.
+	seams := constructionBypassSeamsIn(append(slices.Clone(parsed),
+		mustParseText(t, "../message/a_carrier_forge.go",
+			constructionBypassSeamCarrierInTheOtherRootControl)))
+	if !slices.Contains(seamNamesOf(seams), "forgesOverACarrierFromAnotherPackage") {
+		t.Errorf("the matcher read %v and not the forge written in the other root over an *mls.AuthenticatedContent; the closure is not reaching across the scan it is derived from",
+			seamNamesOf(seams))
+	}
+}
 
 // TestTheConstructionBypassSeamGateReadsAForgeInTheOtherRoot measures the reach the widened
 // scope was for.
@@ -555,6 +783,8 @@ func TestTheConstructionBypassSeamGateReadsItsControl(t *testing.T) {
 		mustParseText(t, "seam_control.go", constructionBypassSeamControl)})
 	want := []string{
 		"Group.forgesAsAMethod",
+		"forgesOverACarrier",
+		"forgesOverACarrierTwoHopsOut",
 		"forgesTheAuthenticatorsOntoTheWire",
 		"forgesThroughAWrapper",
 	}
@@ -643,6 +873,34 @@ func TestEveryConstructionBypassSeamIsDeclaredInTestSource(t *testing.T) {
 	if !held {
 		t.Fatalf("the scan read no declaration of %s, so it is not reading this package's production source at all",
 			nearMiss)
+	}
+
+	// the derived anchor, pinned against production's own source the way the near miss is. Both
+	// of these are real seal entry points of this package and both take an *AuthenticatedContent
+	// -- a type that CARRIES the authenticators without being spelled like them -- so a
+	// parameter half anchored on the identifier reads both as taking nothing. That is exactly
+	// what let a bypass of identical power, written over that type in a production file with a
+	// production caller, ship while this gate reported the package clean.
+	entryPoints := map[string]bool{"SealPublicMessage": false, "sealPrivateMessage": false}
+	for _, candidate := range candidates {
+		if _, isEntryPoint := entryPoints[candidate.name]; !isEntryPoint {
+			continue
+		}
+		entryPoints[candidate.name] = true
+		if !candidate.forgeable {
+			t.Errorf("%s is not read as handed the authenticators, and it takes an *AuthenticatedContent; the parameter half is anchored on a spelling again, and a seam written over that type would ship",
+				candidate.name)
+		}
+		if strings.HasSuffix(candidate.file, "_test.go") {
+			t.Errorf("%s has moved into the test binary (%s), so the entry point this anchor is measured against is no longer production's own",
+				candidate.name, candidate.file)
+		}
+	}
+	for name, read := range entryPoints {
+		if !read {
+			t.Fatalf("the scan read no declaration of %s, so the seal entry points the anchor is pinned against are not the ones this package has",
+				name)
+		}
 	}
 
 	seams := constructionBypassSeamsIn(parsed)
