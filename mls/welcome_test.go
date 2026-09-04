@@ -3503,3 +3503,161 @@ func TestJoinFromWelcomeRefusesATreeWhoseLeavesDoNotValidate(t *testing.T) {
 			err)
 	}
 }
+
+// TestJoinFromWelcomeRefusesAWelcomeThatNamesAPreSharedKey is the profile rule over the one field
+// of a GroupSecrets this build never writes.
+//
+// BuildWelcome always writes an EMPTY psks vector -- PSK proposals are profile-refused, so there is
+// never one to name -- and that is precisely why the receiving side has to ASSERT the vector is
+// empty rather than ignore whatever arrived in it. A sender that named a PSK described an epoch
+// derived over a psk_secret this joiner has no way to resolve, and a joiner that walked past the
+// field would derive its own epoch over KDF.Nh zero bytes and disagree with that sender about
+// every secret of the group.
+//
+// The seal is made by hand rather than through BuildWelcome, because BuildWelcome cannot produce
+// this message: it is the receiving half's rule and the sending half has no way to break it.
+func TestJoinFromWelcomeRefusesAWelcomeThatNamesAPreSharedKey(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-named-psk", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there are no group secrets to rewrite")
+	}
+	welcome := welcomeTestFromCommit(t, result.Welcome)
+	if len(welcome.Secrets) != 1 {
+		t.Fatalf("this commit's welcome carries %d entries and this case is written over one",
+			len(welcome.Secrets))
+	}
+	// the live control: as it stands this welcome joins, so what the rewrite below observes is the
+	// psks vector rather than the hand made seal
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-named-psk"),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the unmodified welcome does not join, so the rewrite below observes nothing: %v", err)
+	}
+	control.Close()
+
+	// the same joiner secret this epoch really has, so every derivation downstream of it would
+	// succeed and the psks vector is the only thing wrong with the message
+	named := &GroupSecrets{
+		JoinerSecret: staged.schedule.JoinerSecret(),
+		Psks: []PreSharedKeyId{{
+			PskType:  PskTypeExternal,
+			PskId:    []byte("a pre-shared key this profile has no way to resolve"),
+			PskNonce: bytes.Repeat([]byte{0x71}, crypto.HashSize()),
+		}},
+	}
+	plaintext, err := syntax.Marshal(named)
+	if err != nil {
+		t.Fatalf("encode the group secrets this case seals: %v", err)
+	}
+	// the ENCRYPTED GROUP INFO as the context, which is what the seal this replaces was made
+	// against: a seal made under any other context is refused one step earlier and this case would
+	// then be about the binding rather than about the psks vector
+	sealed, err := SealWithLabel(crypto, keys.KeyPackage.InitKey, "Welcome",
+		welcome.EncryptedGroupInfo, plaintext)
+	if err != nil {
+		t.Fatalf("seal the group secrets this case names a psk in: %v", err)
+	}
+	welcome.Secrets[0].EncryptedGroupSecrets = *sealed
+	encoded, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatWelcome,
+		Welcome:    welcome,
+	})
+	if err != nil {
+		t.Fatalf("re-frame the welcome this case built: %v", err)
+	}
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-named-psk"),
+		encoded, result.RatchetTree, keys)
+	if !errors.Is(err, errProfilePsk) {
+		t.Fatalf("JoinFromWelcome over a welcome naming a pre-shared key = %v, want errProfilePsk", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesARequiredCapabilitiesBodyThatDoesNotDecode is the refusal the plan's
+// own code dropped on the floor: it read the required capabilities as `requiredCaps, _ :=`.
+//
+// A body that does not decode is not "this group requires nothing", and the difference is the one
+// requiredCapabilitiesOf's own comment is about: read as absence, a MALFORMED required_capabilities
+// would be strictly better for an attacker than a well formed one, because every leaf would then be
+// admitted with the requirement never applied. Discarding the error puts this joiner one step from
+// that reading -- what stands between them is reconcileWithGroupContext noticing that the epoch
+// carries an extension the leaves are held to nothing by, which answers a different fault about a
+// different object.
+func TestJoinFromWelcomeRefusesARequiredCapabilitiesBodyThatDoesNotDecode(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-bad-required-caps", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no group context to rewrite")
+	}
+	context := staged.context.Clone()
+	broken := 0
+	for i := range context.Extensions {
+		if context.Extensions[i].ExtensionType == ExtensionTypeRequiredCapabilities {
+			// a varint prefix announcing four octets over a body that holds none
+			context.Extensions[i].ExtensionData = []byte{0xff}
+			broken += 1
+		}
+	}
+	if broken != 1 {
+		t.Fatalf("this group context carries %d required_capabilities entries and this case needs exactly one to break",
+			broken)
+	}
+	forged := joinTestSealWelcome(t, crypto, joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      context,
+		signer:       group.OwnLeafIndex(),
+		signPriv:     group.signer,
+		keyPackage:   &keys.KeyPackage,
+		leafIndex:    LeafIndex(1),
+	})
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-bad-required-caps"),
+		forged, result.RatchetTree, keys)
+	if !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("JoinFromWelcome over a required_capabilities body that does not decode = %v, want ErrMalformedExtension",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAPathSecretOfTheWrongWidth is the width check on the rung a Welcome
+// carries, and it is made where a wrong width is still a statement about a MESSAGE.
+//
+// A short secret ladders perfectly well -- DeriveSecret takes any length -- so without this the
+// joiner derives a full ladder from it and the fault surfaces one function later as
+// ErrPathSecretMismatch, which says the tree and the secret disagree over a tree that is perfectly
+// good. The two are different repairs: one is a sender that sent the wrong thing and the other is a
+// joiner whose state has drifted an epoch from the tree it holds.
+func TestJoinFromWelcomeRefusesAPathSecretOfTheWrongWidth(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-short-ladder",
+		&CommitOptions{Force: true}, "carol", "dave")
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no ladder to be short")
+	}
+	if len(staged.added) != 1 {
+		t.Fatalf("this commit added %d members and this case is written over one", len(staged.added))
+	}
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-short-ladder"),
+		joinTestSealWelcome(t, crypto, joinTestWelcomeSpec{
+			joinerSecret: staged.schedule.JoinerSecret(),
+			context:      staged.context,
+			signer:       group.OwnLeafIndex(),
+			signPriv:     group.signer,
+			keyPackage:   &keys.KeyPackage,
+			leafIndex:    staged.added[0],
+			// one octet short of a rung of this suite's ladder
+			pathSecret: bytes.Repeat([]byte{0x6f}, crypto.HashSize()-1),
+		}), result.RatchetTree, keys)
+	if !errors.Is(err, errPathSecretLength) {
+		t.Fatalf("JoinFromWelcome over a path secret one octet short = %v, want errPathSecretLength", err)
+	}
+}
