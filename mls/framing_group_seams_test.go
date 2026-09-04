@@ -74,10 +74,12 @@ import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -435,7 +437,31 @@ type seamCandidate struct {
 	// to marshalPrivateMessageContentWithPadding, whose switch names every content type -- into
 	// the set of declarations that emit a proposal.
 	chooses map[string]bool
+	// the content types this body WRITES into the framed content's discriminant, and whether any
+	// of those writes is an expression this reading cannot pin to a named one.
+	//
+	// The other half of "what does this declaration put on the wire", and it is here because the
+	// half above rests on the content type being SPELLED OUT. A generator that re-frames a cached
+	// proposal writes `ContentType: cached.ContentType`: it frames, signs, seals and sends a
+	// proposal while naming ContentTypeProposal in no value position at all -- the only mention in
+	// such a body is the guard that ASKED whether what it was handed was a proposal, which is a
+	// comparison. So it chooses nothing the reading above can see, and it sends whatever it was
+	// handed; and what it can be handed includes a proposal. Narrowing the mention to the value
+	// position was right and it traded one under-report for another, which is what this reads.
+	//
+	// A body that writes a NAMED content type has told this reading which message it is building.
+	// A body that writes anything else has not, and "cannot tell" resolves to EVERY content type,
+	// which is the direction this obligation has to fail in: an over-report is a generator asked
+	// to run doors it already runs, and an under-report is the generator the rule exists to catch.
+	//
+	// A DEMULTIPLEXER WRITES NEITHER, which is what keeps the send path out of a class about
+	// proposals. marshalPrivateMessageContentWithPadding switches on the discriminant of a framed
+	// content it was HANDED and assembles none of its own -- the same separation `chooses` makes,
+	// made over the assembly instead of over the mention.
+	frames        map[string]bool
+	framesUnknown bool
 }
+
 
 // seamAuthenticatorCarriersIn answers the type names a caller can put its own authenticators
 // inside: the seed itself, every type declared in the scan holding one in a field, every type
@@ -641,6 +667,12 @@ func seamTypeFieldNamesIn(parsed []parsedSource) map[string]map[string]bool {
 // mls.FramedContentAuthData is a type a forge over there is handed.
 func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 	carriers := seamAuthenticatorCarriersIn(parsed)
+	// the carrier a sender assembles, its discriminant field and the names of the content
+	// types this scan declares. All three are derived -- the field off the compiled structure
+	// by its TYPE, the constants off the const declarations -- so the reading below is anchored
+	// on what the package has rather than on what somebody wrote down about it.
+	contentCarrier, contentDiscriminant, _ := framedContentCarrier()
+	contentTypes := theContentTypeConstants()
 	// the same closure over the type the proposal generator rule is stated about. The anchor is
 	// group_test.go's, checked against this package's own declarations there before anything is
 	// derived from it, so a rename that moved the type fails rather than quietly emptying a class.
@@ -661,6 +693,7 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				answersFrom: map[string]bool{},
 				consumes:    map[string]bool{},
 				chooses:     map[string]bool{},
+				frames:      map[string]bool{},
 			}
 			// every position the caller fills in, gathered before any of them is read, so the
 			// receiver and the parameters are answered by ONE walk rather than by two rules that
@@ -714,11 +747,54 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 			}
 			compared := seamIdentifiersOnlyCompared(function.Body)
 			discarded := seamDiscardedCalls(function.Body)
+			// what this body writes into the framed content's discriminant, recorded as the named
+			// content type it wrote or as "cannot tell" for anything else. Written as a closure so
+			// the composite literal and the assignment forms answer through ONE reading: a body
+			// that builds the carrier and one that overwrites the field of a carrier it was handed
+			// have both decided what goes on the wire.
+			framed := func(value ast.Expr) {
+				if named, isNamed := value.(*ast.Ident); isNamed && contentTypes[named.Name] {
+					candidate.frames[named.Name] = true
+					return
+				}
+				candidate.framesUnknown = true
+			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
 					candidate.names[identifier.Name] = true
 					if !compared[identifier] {
 						candidate.chooses[identifier.Name] = true
+					}
+				}
+				// the carrier assembled here, keyed by the field this package's own structure
+				// declares as its discriminant.
+				if literal, isLiteral := node.(*ast.CompositeLit); isLiteral && literal.Type != nil &&
+					slices.Contains(identifiersNamedIn(literal.Type), contentCarrier) {
+
+					for _, element := range literal.Elts {
+						pair, isPair := element.(*ast.KeyValueExpr)
+						if !isPair {
+							continue
+						}
+						if key, isKey := pair.Key.(*ast.Ident); isKey && key.Name == contentDiscriminant {
+							framed(pair.Value)
+						}
+					}
+				}
+				// and the discriminant written over after the fact. The base of the selector is
+				// not resolved to a type, so a write to the same field of the WIRE header is read
+				// here too -- an over-report, and over-reporting is the direction this half fails
+				// in: a header whose content type is whatever it was handed puts whatever it was
+				// handed on the wire just as surely.
+				if assignment, isAssignment := node.(*ast.AssignStmt); isAssignment {
+					for i, left := range assignment.Lhs {
+						selector, isSelector := left.(*ast.SelectorExpr)
+						if !isSelector || selector.Sel.Name != contentDiscriminant {
+							continue
+						}
+						if i < len(assignment.Rhs) {
+							framed(assignment.Rhs[i])
+						}
 					}
 				}
 				// and the callees whose answer this body USES, which is the reading that tells a
@@ -759,6 +835,81 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 		}
 	}
 	return candidates
+}
+
+// theContentTypeConstants is the names THIS PACKAGE declares as constants of the framing content
+// type, read off its own source once.
+//
+// AN ANCHOR AND NOT A READING OF THE SCAN, for the reason the door name and the receiver name are
+// anchors, and measured rather than argued: the control the generator rule is judged against is a
+// synthetic package that USES this package's content type constants while declaring none, so a set
+// read off the sources under test calls every write in that control "cannot tell". On the first run
+// of this rule that reported the control's commit sender and its application sender -- two of the
+// four negatives -- as proposal generators.
+//
+// A read that fails answers the empty set, which makes every write unknown: an over-report, which
+// is a failing test rather than a silent pass. The gate asserts the set is non-empty rather than
+// resting on that fallback.
+var theContentTypeConstants = sync.OnceValue(func() map[string]bool {
+	_, _, kind := framedContentCarrier()
+	scan, err := scanSources([]string{"."})
+	if err != nil {
+		return map[string]bool{}
+	}
+	parsed := []parsedSource{}
+	texts := productionSources(scan.sourceTexts)
+	for _, path := range slices.Sorted(maps.Keys(texts)) {
+		fileSet := token.NewFileSet()
+		file, err := parser.ParseFile(fileSet, path, texts[path], parser.SkipObjectResolution)
+		if err != nil {
+			continue
+		}
+		parsed = append(parsed, parsedSource{fileSet: fileSet, file: file})
+	}
+	return contentTypeConstantsIn(parsed, kind)
+})
+
+// contentTypeConstantsIn answers the names this scan declares as constants of the framing content
+// type, so the reading above can tell a body that NAMED a content type from one that wrote an
+// expression.
+//
+// Derived off the const declarations rather than written down, for standing rule 5's reason and
+// for a concrete one: the list is the registry, and a fourth content type registered tomorrow is
+// a value a generator can frame from. A transcription of three names would read that fourth as
+// "cannot tell" -- which errs safe here, and would still be a list somebody had to remember.
+//
+// The type of a spec with no type of its own is the previous spec's, which is the language's own
+// repetition rule and is how an iota block spells the second constant onward.
+func contentTypeConstantsIn(parsed []parsedSource, kind string) map[string]bool {
+	named := map[string]bool{}
+	for _, source := range parsed {
+		for _, declaration := range source.file.Decls {
+			constants, isConstant := declaration.(*ast.GenDecl)
+			if !isConstant || constants.Tok != token.CONST {
+				continue
+			}
+			carried := ""
+			for _, specification := range constants.Specs {
+				value, isValue := specification.(*ast.ValueSpec)
+				if !isValue {
+					continue
+				}
+				if value.Type != nil {
+					carried = ""
+					for _, mentioned := range identifiersNamedIn(value.Type) {
+						carried = mentioned
+					}
+				}
+				if carried != kind {
+					continue
+				}
+				for _, name := range value.Names {
+					named[name.Name] = true
+				}
+			}
+		}
+	}
+	return named
 }
 
 // The doors of one scan: every name a whole message becomes octets under, and which of them

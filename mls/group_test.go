@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1532,6 +1533,29 @@ const (
 	proposalGenerationReceiver = "Group"
 )
 
+// framedContentCarrier is the structure a sender assembles to say what it is sending, the field of
+// it that says which arm is populated, and the type of that field.
+//
+// THE FIELD IS FOUND BY ITS TYPE AND NOT BY ITS NAME, which is what makes this an anchor rather
+// than a transcription: the structure declares exactly one field of the content type, so a rename
+// of either moves with the compiled structure and a SECOND discriminant -- two fields saying which
+// arm is populated -- answers the empty string and fails the check at the reading's own gate,
+// rather than leaving that reading pointed at whichever of the two somebody had written down.
+func framedContentCarrier() (carrier string, discriminant string, kind string) {
+	structure := reflect.TypeOf(FramedContent{})
+	declared := reflect.TypeOf(ContentType(0))
+	found := []string{}
+	for i := range structure.NumField() {
+		if structure.Field(i).Type == declared {
+			found = append(found, structure.Field(i).Name)
+		}
+	}
+	if len(found) != 1 {
+		return structure.Name(), "", declared.Name()
+	}
+	return structure.Name(), found[0], declared.Name()
+}
+
 // declarationsReaching answers which declarations of the scan reach target, directly by the
 // reading `direct` gives and otherwise through another declaration of the scan that does, along
 // the edges `edges` gives.
@@ -1607,7 +1631,14 @@ func proposalGeneratorsIn(parsed []parsedSource) (generators []seamCandidate, mi
 	// delegates the framing to a helper has still chosen the content type, so the edges here are
 	// names; what is read at the end of them is the value position rather than the mention.
 	emitsAProposal := declarationsReaching(candidates, proposalGenerationContentType,
-		func(candidate seamCandidate) bool { return candidate.chooses[proposalGenerationContentType] },
+		func(candidate seamCandidate) bool {
+			// what it CHOSE, or -- for a body that assembles the carrier and sets the
+			// discriminant from something this reading cannot pin to a named content type --
+			// whatever it was handed, a cached proposal included. The two are a UNION because
+			// each is the other's blind spot: the first cannot see a re-framer, and the second
+			// cannot see a generator that delegates its framing to a helper.
+			return candidate.chooses[proposalGenerationContentType] || candidate.framesUnknown
+		},
 		func(candidate seamCandidate) map[string]bool { return candidate.names })
 	// and whether it RAN its door, over the calls whose answer it uses. Both halves of that are
 	// measured: a body naming the door certifies nothing, and neither does one calling it and
@@ -1636,14 +1667,16 @@ func proposalGeneratorsIn(parsed []parsedSource) (generators []seamCandidate, mi
 // A package holding one of each shape the class must separate, so a conjunct that stopped doing
 // work fails here rather than being carried by the other one.
 //
-// FIVE POSITIVES, and every one of them has to be REPORTED. One reaches its door only through a
+// SIX POSITIVES, and every one of them has to be REPORTED. One reaches its door only through a
 // helper whose bare name a SECOND declaration also carries, because nothing in the scan says
 // which of the two it calls: one runs the door and one runs nothing, so certifying it off the
 // first is certifying it off a coin toss. Two more are the door reading itself -- one MENTIONS
 // ValidateProposalList and never calls it, one CALLS it and throws the refusal away -- and both
 // were measured to certify a generator that validates nothing. The last two are the position:
 // a free function handed the group, and a method on a type that holds one. Neither has a
-// receiver spelled Group and both send what a method on the group sends.
+// receiver spelled Group and both send what a method on the group sends. The sixth sets its
+// content type from a VARIABLE -- a cached proposal re-framed -- which names the proposal
+// content type in no value position and is what the narrowed reading stopped seeing.
 //
 // FOUR NEGATIVES, each a conjunct of the class asked on its own. One reaches the same wire door
 // carrying a COMMIT, which is what says the class is read off what a message CARRIES -- the
@@ -1728,6 +1761,19 @@ func (self *Group) ProposeAndDiscardsTheDoorsAnswer() ([]byte, error) {
 	return MarshalMLSMessage(&MLSMessage{})
 }
 
+// a generator that RE-FRAMES a cached proposal. It asks what it was handed -- a comparison, and
+// a comparison is not a choice -- and then sends whatever that was, so ContentTypeProposal
+// stands in no value position of this body at all. The reading that narrowed "emits a proposal"
+// to the chosen identifier does not see it, and the mention-based reading it replaced did.
+func (self *Group) ReframeACachedProposal(cached *FramedContent) ([]byte, error) {
+	if cached.ContentType != ContentTypeProposal {
+		return nil, errNotAProposal
+	}
+	content := &FramedContent{ContentType: cached.ContentType, Proposal: cached.Proposal}
+	_ = content
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
 // a free function handed the group, and a method on a type that HOLDS one. Both send exactly
 // what a method on *Group sends, and a rule that named the position had neither.
 func ProposeOverAGroupItWasHanded(group *Group) ([]byte, error) {
@@ -1797,6 +1843,7 @@ func TestTheProposalGeneratorObligationReadsItsControl(t *testing.T) {
 		"Group.ProposeAndDiscardsTheDoorsAnswer":               "it calls the door and drops the refusal, which is the same certificate with a call expression in it",
 		"ProposeOverAGroupItWasHanded":                         "the group stands in a parameter rather than the receiver, which is a position a rule reading the receiver has no name for",
 		"reviewProposalSender.ProposeThroughAHolderOfTheGroup": "the group is held by the receiver's own type, which is the other half of that same position",
+		"Group.ReframeACachedProposal":                         "it sets the content type it sends from a VARIABLE, so it names the proposal content type in no value position -- it sends whatever it was handed, and a cached proposal is one of the things it can be handed",
 	}
 	for _, generator := range slices.Sorted(maps.Keys(inside)) {
 		if !slices.Contains(seamNamesOf(generators), generator) {
@@ -1854,7 +1901,14 @@ func TestTheProposalGeneratorObligationReadsItsControl(t *testing.T) {
 //     in a class about proposals, and it made the rule FIRE on a correct exported method that
 //     sends an application message -- reported as putting a proposal on the wire and reaching its
 //     doors through nothing. A gate that fires on correct code is worse than one that misses,
-//     because it teaches the next person to switch gates off.
+//     because it teaches the next person to switch gates off. And the narrowing traded one
+//     under-report for another, so the conjunct is the UNION of two readings of one question:
+//     the content type a declaration CHOOSES, and the content type of the carrier it ASSEMBLES
+//     -- which is every content type when the discriminant is set from an expression this
+//     reading cannot pin to a named one. A generator re-framing a cached proposal chooses
+//     nothing and frames whatever it was handed; a generator delegating its framing to a helper
+//     chooses and assembles nothing. Each reading is the other's blind spot, and "cannot tell"
+//     resolving to "every content type" is the direction this obligation has to fail in.
 //
 // And the obligation itself is ONE name RUN: whatever else a generator does, its output has to
 // have gone through this package's single entry ValidateProposalList, reached along calls whose
@@ -1876,6 +1930,26 @@ func TestEveryProposalGeneratorOnThisGroupSendsWhatItEmitsThroughItsOwnDoors(t *
 			t.Fatalf("%s is declared in %s; all three anchors are production's own, and one that had become the test binary's would make every generator its own excuse",
 				anchor, file)
 		}
+	}
+
+	// and the two the "sends whatever it was handed" reading is rooted in, both derived rather
+	// than written down: the discriminant off the COMPILED structure by its type, the constants
+	// off this package's own source. An empty constant set would read every write as "cannot
+	// tell" and put every sender in this package into a class about proposals, and a structure
+	// with no single discriminant would leave that reading pointed at nothing.
+	carrier, discriminant, kind := framedContentCarrier()
+	if discriminant == "" {
+		t.Fatalf("%s declares no single field of type %s, and the reading that catches a generator setting its content type from a variable is rooted in that field",
+			carrier, kind)
+	}
+	constants := theContentTypeConstants()
+	if !constants[proposalGenerationContentType] {
+		t.Fatalf("this package's own source declares %d constant(s) of %s and %s is not among them, so nothing here can tell a body that NAMED a content type from one that wrote an expression",
+			len(constants), kind, proposalGenerationContentType)
+	}
+	if len(constants) < 2 {
+		t.Fatalf("this package declares %d constant(s) of %s; with one, every write of any other content type reads as \"cannot tell\" and every sender in the package is a proposal generator",
+			len(constants), kind)
 	}
 
 	// both roots the guardrails walk, for the seam gate's reason: the door class is derived from
