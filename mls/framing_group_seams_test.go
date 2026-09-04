@@ -793,8 +793,15 @@ func putsItOnTheWire() ([]byte, error) {
 }
 
 // the second declaration of that bare name, which is the whole of what made the edge ambiguous.
-// It reaches nothing and is handed nothing.
-func (self *FramedContent) putsItOnTheWire() {
+// It reaches nothing.
+//
+// Its RECEIVER carries the authenticators, and that is the second thing this member is for. A walk
+// that kept one verdict per BARE name -- which this one did, and which is what the ambiguous edge
+// condition was really covering for -- hands this declaration the verdict earned by the free
+// function above, and a declaration handed the authenticators that reaches the door is a seam. So
+// under that reading this is a positive, and it is a negative here: a verdict belongs to a
+// declaration and not to a spelling.
+func (self *AuthenticatedContent) putsItOnTheWire() {
 }
 `
 
