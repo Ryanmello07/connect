@@ -639,10 +639,19 @@ func commitShapes() []commitShape {
 				return [][]byte{ref},
 					[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}, nil
 			}},
+		// A SET THE GROUP DOES NOT ALREADY CARRY, which is what makes this shape tell the new
+		// epoch's extension vector apart from the one it is leaving. A proposal re-installing the
+		// group's own extensions is a perfectly good commit and it is the one input under which
+		// "the epoch is derived over the applied set" and "the epoch is derived over the previous
+		// set" are the same program.
 		{name: "a group_context_extensions proposal by value",
 			build: func(t *testing.T, crypto CryptoProvider, group *Group, owner *testMember,
 				other *testMember) ([][]byte, []Proposal, *CommitOptions) {
-				exts := testGroupContextOf(t, group).Extensions
+				successor, err := (&OwnerSuccessorExtension{FloorMs: SuccessionFloorMinMs}).Encode()
+				if err != nil {
+					t.Fatalf("encode the extension this commit installs: %v", err)
+				}
+				exts := append(testGroupContextOf(t, group).Extensions, successor)
 				return [][]byte{}, []Proposal{{
 					ProposalType:           ProposalTypeGroupContextExtensions,
 					GroupContextExtensions: &GroupContextExtensions{Extensions: exts},
@@ -766,6 +775,22 @@ func TestEveryCommitThisGroupGeneratesPassesItsOwnValidateCommit(t *testing.T) {
 			if !bytes.Equal(staged.transcript.Confirmed, confirmedHash) {
 				t.Fatalf("the staged transcript's confirmed hash is %x and the wire chains to %x",
 					staged.transcript.Confirmed, confirmedHash)
+			}
+			// and the epoch was derived over the extension set the commit's own proposals
+			// INSTALL. Every secret of the new epoch is expanded over this context, so a
+			// committer that advanced over the previous set publishes an extension vector its
+			// own key schedule does not agree with -- which no peer can tell from a fork.
+			if len(staged.context.Extensions) != len(applied.Extensions) {
+				t.Fatalf("the staged context carries %d extension(s) and this commit installs %d",
+					len(staged.context.Extensions), len(applied.Extensions))
+			}
+			for i := range applied.Extensions {
+				if staged.context.Extensions[i].ExtensionType != applied.Extensions[i].ExtensionType ||
+					!bytes.Equal(staged.context.Extensions[i].ExtensionData, applied.Extensions[i].ExtensionData) {
+					t.Errorf("entry %d of the staged context is %#04x/%x and this commit installs %#04x/%x",
+						i, uint16(staged.context.Extensions[i].ExtensionType), staged.context.Extensions[i].ExtensionData,
+						uint16(applied.Extensions[i].ExtensionType), applied.Extensions[i].ExtensionData)
+				}
 			}
 			// the tree the committer keeps is the tree the published path builds
 			if wire.Path != nil {
@@ -1122,14 +1147,39 @@ func TestMergePendingCommitMovesTheProposalCacheToTheEpochItEntered(t *testing.T
 // method set rather than one somebody thought of.
 func TestNoAnswerOfAStagedCommitSharesStorageWithIt(t *testing.T) {
 	crypto := testCrypto(t)
-	group, _, _ := commitTestGroupOfTwo(t, crypto)
+	group, _, bob := commitTestGroupOfTwo(t, crypto)
 	defer group.Close()
-	if _, err := group.CreateCommit([][]byte{}, nil, nil); err != nil {
+	// a THIRD member, so the commit below can update one leaf and remove another: the three index
+	// vectors are answered as copies for one reason, and a fixture whose commit leaves any of them
+	// empty holds that reason for the other two only.
+	carol, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "carol"))
+	if _, err := group.CreateCommit([][]byte{},
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *carol}}}, nil); err != nil {
+		t.Fatalf("commit the add this fixture is built on: %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("merge the add this fixture is built on: %v", err)
+	}
+	leaf, _ := testUpdateLeafNode(t, crypto, bob, group.GroupId(), LeafIndex(1))
+	ref := commitTestCacheProposal(t, group, bob, LeafIndex(1),
+		&Proposal{ProposalType: ProposalTypeUpdate, Update: &Update{LeafNode: *leaf}})
+	dave, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "dave"))
+	if _, err := group.CreateCommit([][]byte{ref}, []Proposal{
+		{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: LeafIndex(2)}},
+		{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *dave}},
+	}, nil); err != nil {
 		t.Fatalf("CreateCommit: %v", err)
 	}
 	staged := group.stagedForTest()
 	if staged == nil {
 		t.Fatal("the commit staged nothing, so this test read nothing")
+	}
+	for name, held := range map[string][]LeafIndex{
+		"added": staged.added, "removed": staged.removed, "updated": staged.updated} {
+		if len(held) == 0 {
+			t.Fatalf("the staged commit's %s vector is empty, so the write through it below states nothing about a copy",
+				name)
+		}
 	}
 
 	// what the staged epoch holds, read before anything is written through an answer
@@ -1171,6 +1221,15 @@ func TestNoAnswerOfAStagedCommitSharesStorageWithIt(t *testing.T) {
 
 	if !bytes.Equal(staged.schedule.Secrets().EpochAuthenticator, authenticator) {
 		t.Error("a caller writing through EpochAuthenticator() changed the epoch authenticator the staged epoch holds")
+	}
+	for name, held := range map[string][]LeafIndex{
+		"added": staged.added, "removed": staged.removed, "updated": staged.updated} {
+		for i := range held {
+			if held[i] == LeafIndex(0xFFFFFFF) {
+				t.Errorf("a caller writing through the %s vector changed entry %d of the one the merge will read",
+					name, i)
+			}
+		}
 	}
 	if len(staged.context.Extensions) != len(extensions) {
 		t.Fatalf("the staged context now carries %d extension(s) and held %d", len(staged.context.Extensions), len(extensions))
