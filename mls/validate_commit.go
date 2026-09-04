@@ -750,14 +750,38 @@ func validateCommitErrata(in *CommitValidationInput) error {
 	return CheckErrata8815(in.Commit, in.Pending)
 }
 
-// validateCommitPostTreeIsExportable is the same adapter for ValSem300, which is stated over a
-// tree rather than over a commit because that is what it is a rule about: task 16's welcome path
-// asks it of a tree that arrived in a GroupInfo and holds no commit at all.
+// validateCommitPostTreeIsExportable is the rule that a commit leaves behind a tree a GroupInfo can
+// publish.
+//
+// IT NO LONGER ASKS ValSem300 AND THAT IS A CORRECTION RATHER THAN A WEAKENING. Section 12.4.3.3's
+// trailing blank rule is about the ARRAY a ratchet_tree extension travels as, which the encoder
+// writes with every trailing blank stripped and the decoder refuses padded. An in-memory tree is
+// held at the full width 2^(d+1)-1, so a group whose size is not a power of two ends in blank nodes
+// the instant an Add extends its tree -- and asking the in-memory question here refused an ordinary
+// commit. Measured: a two member group committing an add of a third was refused, by the committer
+// that built the commit and by every receiver that would apply it, over a tree that encodes to five
+// nodes and decodes back. The fixture corpus already worked around it from the other side, by
+// choosing a group width of 512 "because a group of any other size ends in blank nodes and ValSem300
+// refuses the post tree it exports".
+//
+// ValSem300 keeps its own door and its own entry point, both unchanged: (*RatchetTree).UnmarshalMLS
+// refuses a padded array off the wire, and ValSem300NoTrailingBlankNodes is what task 16 asks of a
+// tree that arrived in a GroupInfo.
+//
+// WHAT IS LEFT IS THE HALF THAT IS TRUE OF EVERY TREE: an array with no non-blank node in it is not
+// a ratchet_tree any receiver accepts, which is the one refusal (*RatchetTree).MarshalMLS makes and
+// is answered here with that refusal's own value. It is asked through the tree's own membership
+// read rather than by encoding, because encoding the post tree once per commit validation is 1.33
+// MiB of allocation at this profile's group size, on the receive path.
 func validateCommitPostTreeIsExportable(in *CommitValidationInput) error {
 	if err := in.check(); err != nil {
 		return err
 	}
-	return ValSem300NoTrailingBlankNodes(in.PostTree)
+	if len(in.PostTree.NonBlankLeaves()) == 0 {
+		return fmt.Errorf("%w: the post-commit tree holds no member, so there is no ratchet_tree for a GroupInfo to publish",
+			ErrTreeMalformed)
+	}
+	return nil
 }
 
 // ValSem200NoSelfRemove: a commit must not cover a Remove of the committer.
@@ -866,6 +890,34 @@ func validateCommitPathLeafSource(in *CommitValidationInput) error {
 	return nil
 }
 
+// commitAddedLeaves is where this commit's Add proposals landed in the post-proposal tree.
+//
+// It exists for one clause of ValSem203 and it is derived rather than carried on the input,
+// because a CommitValidationInput is the value every negative fixture of this package assembles:
+// a field naming the added leaves would be a field a fixture could fill in disagreement with the
+// tree beside it, which is the dual-representation fault this file has already been repaired for
+// three times.
+//
+// FOUND BY SIGNATURE KEY, which is exact rather than convenient. ValSem101 refuses a list whose
+// adds republish a signature key the group or another add already carries, so the key an Add
+// publishes names at most one leaf of the post-proposal tree; an add whose leaf this tree does not
+// hold contributes nothing, which is the safe direction here -- it leaves that leaf INSIDE the
+// resolution and so leaves the refusal below standing.
+func commitAddedLeaves(in *CommitValidationInput) []LeafIndex {
+	adds := in.List.Adds()
+	added := make([]LeafIndex, 0, len(adds))
+	for i := range adds {
+		add := adds[i].Proposal.Add
+		if add == nil {
+			continue
+		}
+		if at, held := in.PostTree.FindLeafBySignatureKey(add.KeyPackage.LeafNode.SignatureKey); held {
+			added = append(added, at)
+		}
+	}
+	return added
+}
+
 // ValSem203PathDecrypt: the path carries a secret this receiver can open.
 //
 // CommitValidationInput deliberately holds no private key material -- it is the input every rule
@@ -886,10 +938,31 @@ func ValSem203PathDecrypt(in *CommitValidationInput) error {
 	if in.Commit.Path == nil {
 		return nil
 	}
+	// A NODE MAY LEGALLY ADDRESS NOBODY, and the version of this loop that refused every empty
+	// vector refused an ordinary commit. RFC 9420 section 12.4.1 takes the leaves this commit ADDS
+	// out of the resolution each path secret is sealed to -- a new member receives it in the
+	// Welcome instead -- so a copath child whose resolution is nothing but new members leaves the
+	// node above it with an empty vector. Measured: a two member group committing an add of a
+	// third with a path was refused here, by the committer that built the commit and by every
+	// receiver that would apply it, because the root's copath child resolves to the joiner alone.
+	//
+	// So the empty vector is judged against the targets THIS TREE gives, and the refusal survives
+	// exactly where it was a statement about the sender: a node whose resolution still holds a
+	// member of the group and whose vector is empty addresses nobody at that rung, and every
+	// member reached through it derives nothing.
+	//
+	// A tree that cannot answer its own encryption targets falls back to refusing every empty
+	// vector, which is the fail-closed direction and keeps this rule answering ONE sentinel: a
+	// wrapped tree refusal here would be a commit rule answering the tree math's value.
+	targets, targetsErr := in.PostTree.EncryptionTargets(in.Committer, commitAddedLeaves(in))
 	for i := range in.Commit.Path.Nodes {
-		if len(in.Commit.Path.Nodes[i].EncryptedPathSecret) == 0 {
-			return fmt.Errorf("%w: update path node %d encrypts to nobody", errPathDecrypt, i)
+		if len(in.Commit.Path.Nodes[i].EncryptedPathSecret) != 0 {
+			continue
 		}
+		if targetsErr == nil && i < len(targets) && len(targets[i]) == 0 {
+			continue
+		}
+		return fmt.Errorf("%w: update path node %d encrypts to nobody", errPathDecrypt, i)
 	}
 	// the committer seals nothing to itself and needs nothing: it holds every secret it derived.
 	if in.Own == in.Committer {

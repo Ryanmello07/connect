@@ -1423,6 +1423,31 @@ func groupProposalHeader(answers []any) []any {
 	return out
 }
 
+// groupCommitHeader is the projection the commit row is read through: the CLEARTEXT group id of
+// the PrivateMessage a commit answered.
+//
+// groupProposalHeader's reasoning over a different answer shape. A commit answers a *CommitResult
+// rather than the octets, so the message has to be reached through the struct -- and the tree
+// beside it is deliberately NOT projected: it is a fresh encoding of a tree whose parent hashes and
+// leaf keys are drawn per commit, so two foundings do not agree on it and an equality over it would
+// state nothing.
+func groupCommitHeader(answers []any) []any {
+	out := []any{}
+	for _, answer := range answers {
+		held, isResult := answer.(**CommitResult)
+		if !isResult || *held == nil || len((*held).Commit) == 0 {
+			continue
+		}
+		parsed, err := ParseMLSMessage((*held).Commit)
+		if err != nil || parsed.PrivateMessage == nil {
+			continue
+		}
+		header := parsed.PrivateMessage.GroupId
+		out = append(out, &header)
+	}
+	return out
+}
+
 // groupAnswerKeyPackage mints the key package the ProposeAdd row admits, under the GROUP'S OWN
 // provider so that the suite it names is the suite the group runs.
 func groupAnswerKeyPackage(t *testing.T, group *Group) []byte {
@@ -1524,6 +1549,33 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 			answer, err := group.ProposeGroupContextExtensions(testGroupContextOf(t, group).Extensions)
 			return []any{&answer, &err}
 		}, publishes: groupProposalHeader},
+		// THE COMMIT LIFECYCLE, one row per exported method it lands.
+		//
+		// The commit row is driven with an EMPTY proposal list, which is the one shape a group
+		// with no peers can build and which RFC 9420 section 12.4 requires a path for -- so the
+		// answer carries the commit message, the post-commit tree, and the update path inside the
+		// first of those. It is read through a projection for the four generators' reason: a
+		// commit travels as a section 6.3 PrivateMessage, so no two answers of it are equal and
+		// the one octet run two foundings over one group id agree on is the cleartext group id.
+		//
+		// The other two answer no octets at all, which groupAnswerDeclaresStorage reads off their
+		// signatures, and both are driven past a commit rather than into ErrNoPendingCommit: a row
+		// that took the refusal would leave the group where it started and observe nothing about
+		// the state the merge installs.
+		{name: "CreateCommit", call: func(group *Group) []any {
+			answer, err := group.CreateCommit(nil, nil, nil)
+			return []any{&answer, &err}
+		}, publishes: groupCommitHeader},
+		{name: "MergePendingCommit", call: func(group *Group) []any {
+			_, commitErr := group.CreateCommit(nil, nil, nil)
+			err := group.MergePendingCommit()
+			return []any{&commitErr, &err}
+		}},
+		{name: "ClearPendingCommit", call: func(group *Group) []any {
+			_, commitErr := group.CreateCommit(nil, nil, nil)
+			group.ClearPendingCommit()
+			return []any{&commitErr}
+		}},
 		// the ender gets a row like every other method, and every row gets a group of its own, so
 		// there is no member of the class this gate skipped for being inconvenient
 		{name: "Close", call: func(group *Group) []any {

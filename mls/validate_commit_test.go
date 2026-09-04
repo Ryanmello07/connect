@@ -180,9 +180,9 @@ func testCommitInput(t *testing.T, crypto CryptoProvider, tree *RatchetTree,
 		Committer: testCommitterLeaf,
 		Own:       testOwnLeaf,
 
-		List:      list,
-		Commit:    commit,
-		Now:       time.Now(),
+		List:   list,
+		Commit: commit,
+		Now:    time.Now(),
 	}
 }
 
@@ -234,7 +234,6 @@ func testFullCommitInput(t *testing.T, crypto CryptoProvider) (*CommitValidation
 	testFitCommitPath(t, crypto, in, members[in.Committer])
 	return in, members
 }
-
 
 // testCommitPathLeaf is a leaf in the shape an UpdatePath publishes: commit source, a parent hash,
 // and a fresh encryption key.
@@ -343,7 +342,6 @@ func TestValSem201MissingPath(t *testing.T) {
 		t.Fatalf("ValSem201 error = %v, want errMissingPath", err)
 	}
 }
-
 
 func TestValSem201EmptyProposalListRequiresPath(t *testing.T) {
 	crypto := testCrypto(t)
@@ -472,7 +470,6 @@ func TestValSem204PathLeafReusesTheCommittersKey(t *testing.T) {
 		t.Fatalf("ValSem204 refused a path leaf carrying a fresh key: %v", failure)
 	}
 }
-
 
 // TestValSem204RefusesACommitterThatOccupiesNoLeaf is the precondition, with its own value.
 func TestValSem204RefusesACommitterThatOccupiesNoLeaf(t *testing.T) {
@@ -1945,16 +1942,32 @@ func commitAggregateRows() map[string]commitAggregateRow {
 				testCommitProposals(t, in, held, never)
 				return in
 			}},
-		"ValSem300 over a post tree ending in a blank node": {
-			rule: "validateCommitPostTreeIsExportable", sentinel: errTrailingBlankNodes,
+		// WHAT THIS ROW STOPPED OBSERVING, said out loud. It used to blank the rightmost leaf of
+		// the post tree and expect errTrailingBlankNodes, and it was the only driver of ValSem300
+		// from a COMMIT. That refusal is gone from this door on purpose -- see
+		// validateCommitPostTreeIsExportable, which now states the half of section 12.4.3.3 that is
+		// true of an in-memory tree -- because the old rule refused every commit that leaves a group
+		// at a size that is not a power of two. ValSem300 itself is unchanged and is still driven
+		// with a padded tree, by the row above and by TestValSem300TrailingBlankNodes; what no row
+		// asks any more is ValSem300 OF A COMMIT'S POST TREE, which is the thing that was wrong.
+		"the post tree rule over a tree with no member left in it": {
+			rule: "validateCommitPostTreeIsExportable", sentinel: ErrTreeMalformed,
 			build: func(t *testing.T, crypto CryptoProvider) *CommitValidationInput {
-				in, members := testFullCommitInput(t, crypto)
-				if failure := in.PostTree.Blank(NodeIndex(in.PostTree.NodeWidth() - 1)); failure != nil {
-					t.Fatalf("Blank: %v", failure)
-				}
-				// blanking the rightmost leaf changes the filtered direct path, so the path is
-				// re-fitted against the tree the aggregate reads
-				testFitCommitPath(t, crypto, in, members[in.Committer])
+				in, _ := testFullCommitInput(t, crypto)
+				// THE PATH IS DROPPED AND THE LIST IS ONE ADD, because this rule runs LAST and
+				// the aggregate has to reach it: every path rule ahead of it reads the post tree
+				// and would refuse a tree with no committer's leaf in it first, for a reason that
+				// is not this one. An add-only list is the one shape section 12.4 lets a commit
+				// carry no path for.
+				kp, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "the joiner this row adds"))
+				in.Commit.Path = nil
+				testCommitProposals(t, in, CachedProposal{
+					Proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}},
+					Sender:   in.Committer, ByValue: true})
+				// a tree with no non-blank node is the one array (*RatchetTree).MarshalMLS
+				// refuses to write, and it is the whole of what "exportable" can mean about a
+				// tree held at its full width
+				in.PostTree = NewRatchetTree()
 				return in
 			}},
 	}
@@ -4013,8 +4026,8 @@ var commitRuleTrees = map[string]string{
 		"tree the merge happens in",
 	"ValSem209GroupExtensionsSupported": "PostTree: the members the new extensions take effect for are the ones " +
 		"this commit LEAVES in the group, the ones it adds included",
-	"validateCommitPostTreeIsExportable": "PostTree: ValSem300 is stated over the tree a GroupInfo published " +
-		"from this commit carries",
+	"validateCommitPostTreeIsExportable": "PostTree: the tree a GroupInfo published from this commit carries " +
+		"is the one that has to hold a member",
 }
 
 // TestEveryTreeReadOfTheCommitRulesIsTheTreeItsRuleIsStatedOver holds each rule to one tree.

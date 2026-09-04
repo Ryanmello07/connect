@@ -1154,11 +1154,17 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // aggregate as a one entry list, which is the sending side of the same rules, so the caller arrived
 // from a direction the entry did not anticipate. This list failed until the entry came off, exactly
 // as CheckUpdatePathKeyUniqueness's did.
+// ValidateCommit and ValSem205ConfirmationTag WERE here and are not any more, which is this list
+// expiring by failing for the second time. Both entries said the caller was p7 task 18, the client
+// PROCESSING a commit, and both were right about the receiver and wrong about the class: task 13's
+// (*Group).CreateCommit puts every commit this package GENERATES through the aggregate and then
+// through ValSem205 with the new epoch's confirmation key, which is the sending side of the same
+// rules. A commit this build emits and this build refuses is a client publishing a message its own
+// package will not process, so the generator running its own door is not a courtesy -- and the
+// caller arrived from a direction both entries named the wrong task for.
 var rulesThisPackageExportsAndNothingApplies = []string{
 	"CheckFramedContentContext",
 	"CheckSenderLeaf",
-	"ValSem205ConfirmationTag",
-	"ValidateCommit",
 	"ValidateUpdatePathLeafNode",
 }
 

@@ -56,6 +56,12 @@ var (
 	errGroupClosed = errors.New("mls: the group is closed and its epoch secrets have been zeroized")
 
 	errCreationConfirmationTag = errors.New("mls: the epoch 0 confirmation tag is not a tag of this suite's width")
+
+	// and the same refusal one epoch on. A SECOND VALUE and not errCreationConfirmationTag,
+	// for this block's stated reason: the epoch 0 condition is a group that could not be
+	// founded and this one is a commit that could not be built, and a caller reading one
+	// value cannot tell which of its calls is the one that failed.
+	errCommitConfirmationTag = errors.New("mls: the commit's confirmation tag is not a tag of this suite's width")
 )
 
 // StateStore persists group state and private key material across process restarts. It is
@@ -181,10 +187,21 @@ type Group struct {
 	signer SignaturePrivateKey
 	cred   Credential
 
-	ownLeaf    LeafIndex
-	ownPriv    *TreeKEMPrivate
-	tree       *RatchetTree
-	context    *GroupContext
+	ownLeaf LeafIndex
+	ownPriv *TreeKEMPrivate
+	tree    *RatchetTree
+	context *GroupContext
+	// the same context with its authority established, which is the only thing the proposal
+	// cache binds an epoch to. It is held BESIDE the context rather than in place of it because
+	// the two answer different questions -- every read of this epoch wants the fields, and only
+	// the cache boundary wants the authority -- and because VerifiedGroupContext hands out a
+	// Clone rather than its own pointer, so a group that kept only this one would rebuild the
+	// context it publishes on every read.
+	//
+	// WHAT KEEPS THE TWO FROM PARTING COMPANY is that one statement list writes both: NewGroup
+	// builds them from the same GroupInfo and MergePendingCommit installs both off the same
+	// staged commit, which is what the epoch mover gate reads.
+	verified *VerifiedGroupContext
 	schedule   *KeySchedule
 	secretTree *SecretTree
 	transcript *TranscriptHashes
@@ -197,6 +214,13 @@ type Group struct {
 	// DECLARES that storage, and a second copy parked on this struct would be the same secret
 	// held by nothing but a hand written Close. Task 19 rebuilds from self.schedule.
 	restoreKind restoreKind
+
+	// the commit this client has built and not yet merged, or the one it has staged out of a
+	// peer's commit. AT MOST ONE, because the delivery service accepts at most one commit per
+	// (group, epoch): a client holding two candidate epochs has nothing to say which of them
+	// the service accepted, and (*Group).Commit refuses a second rather than replacing the
+	// first. ClearPendingCommit is how a caller drops one.
+	pending *StagedCommit
 
 	closed bool
 }
@@ -414,6 +438,7 @@ func NewGroup(cfg *GroupConfig, signer SignaturePrivateKey, cred Credential) (*G
 		ownPriv:     NewTreeKEMPrivate(ownLeaf, encPriv),
 		tree:        tree,
 		context:     context,
+		verified:    verified,
 		schedule:    schedule,
 		secretTree:  secretTree,
 		transcript:  transcript,
@@ -1163,3 +1188,434 @@ func (self *Group) propose(proposal *Proposal) ([]byte, error) {
 	}
 	return encoded, nil
 }
+
+// ---------------------------------------------------------------------------
+// RFC 9420 section 12.4.1: commit generation
+// ---------------------------------------------------------------------------
+
+// THE ORDER OF THE STEPS BELOW IS THE RFC'S AND EVERY ONE OF THEM IS A DEPENDENCY.
+//
+// Section 12.4.1 reads as a list and could be mistaken for a checklist. It is not one: apply the
+// proposals, then compute the update path, then the new epoch's secrets, then the confirmation tag
+// over the new confirmed transcript hash. Each arrow is a value that does not exist until the step
+// before it has run, and an implementation that took them in another order still produces 32 well
+// formed octets at every stage:
+//
+//   - the update path's HPKE context is the NEW epoch's group context, whose tree_hash covers the
+//     path's own public keys -- so the secrets are created (which installs those keys), THEN the
+//     tree hash is taken, THEN the path is encrypted. That is why CreateUpdatePathSecrets and
+//     EncryptUpdatePath are two calls and why no single CreateUpdatePath exists.
+//   - the confirmed transcript hash is a function of the SIGNED commit, so the framing and the
+//     signature come before it, and the new group context comes after.
+//   - the confirmation tag is a MAC over the confirmed transcript hash OF THE EPOCH THIS COMMIT
+//     OPENS. A tag taken over the epoch this commit closes is the same length, verifies against
+//     nothing any receiver computes, and is what opts.confirmationTagOverPreCommitTranscript makes
+//     on purpose.
+//
+// AND THE COMMIT IS STAGED RATHER THAN MERGED. The delivery service accepts at most one commit per
+// (group, epoch), so a committer that advanced its own epoch here would fork itself off the group
+// the moment somebody else's commit won that race (MASTER section 9.3). MergePendingCommit is what
+// the acceptance calls.
+
+// CreateCommit builds a commit over the named proposals and stages the epoch it opens.
+//
+// byReference is a slice of SERIALIZED ProposalRef values, so connect/message can name the
+// proposals it saw on the wire without holding an mls type. Passing nil means "every valid proposal
+// this client has cached for this epoch", which is RFC 9420 section 12.4's SHOULD; passing an empty
+// non-nil slice means "none of them", and the two are deliberately different.
+//
+// byValue and opts.ExtraProposals are appended after the by-reference entries, in that order, and
+// both are attributed to the committer -- which is what (*ProposalCache).Resolve does with a
+// by-value entry and what makes ValSem111 decidable about them.
+//
+// THE COMMIT'S OWN VECTOR IS TAKEN FROM THE RESOLVED LIST AND NOT FROM THE ARGUMENTS, which is the
+// one structural decision in this body. ValidateCommit holds a commit's ProposalOrRef vector and the
+// list resolved from it to each other field by field -- checkListResolvesTheCommitsVector -- and a
+// generator that built the two from two sources would be a generator whose commit can disagree with
+// its own list. (*ProposalList).Refs rebuilds the vector from the list, so the two are one value
+// here by construction rather than by a comparison this file would have to keep passing. It also
+// settles the aliasing question for the by-value arm at the same time: the list's proposals were
+// copied through the codec by Resolve, so nothing the commit carries is storage its caller still
+// holds.
+func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *CommitOptions) (*CommitResult, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+	// before anything is resolved. A second staged commit would be a client holding two candidate
+	// epochs with nothing to say which of them the delivery service accepted, and the repair --
+	// ClearPendingCommit -- is a decision the caller makes rather than one this method can.
+	if self.pending != nil {
+		return nil, ErrPendingCommitExists
+	}
+	if opts == nil {
+		opts = &CommitOptions{}
+	}
+
+	// step 1: name the proposals.
+	//
+	// The references are CLONED on the way in, for the reason the group id is cloned on the way
+	// out of GroupId(): these octets go into the commit's own vector, which this group keeps on
+	// the staged commit and which the confirmed transcript hash covers, so a caller that went on
+	// writing into the buffer it named a proposal out of would be rewriting a commit that has
+	// already been signed.
+	refs := []ProposalOrRef{}
+	if byReference == nil {
+		refs = append(refs, self.proposals.Pending(self.context)...)
+	} else {
+		for _, ref := range byReference {
+			refs = append(refs, ProposalOrRef{
+				Type:      ProposalOrRefTypeReference,
+				Reference: ProposalRef(cloneBytes(ref)),
+			})
+		}
+	}
+	for i := range byValue {
+		proposal := byValue[i]
+		refs = append(refs, ProposalOrRef{Type: ProposalOrRefTypeProposal, Proposal: &proposal})
+	}
+	for i := range opts.ExtraProposals {
+		proposal := opts.ExtraProposals[i]
+		refs = append(refs, ProposalOrRef{Type: ProposalOrRefTypeProposal, Proposal: &proposal})
+	}
+	list, err := self.proposals.Resolve(self.crypto, self.context, self.ownLeaf, refs)
+	if err != nil {
+		return nil, err
+	}
+	commit := &Commit{Proposals: list.Refs()}
+
+	// step 2: apply the list to a tree of this call's own, and judge it against the pre-commit
+	// state. ApplyProposals clones, so self.tree is untouched however this call ends.
+	applied, err := ApplyProposals(self.tree, self.context, self.ownLeaf, list)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.skipValidation {
+		if err := ValidateProposalList(&ProposalValidationInput{
+			Crypto:     self.crypto,
+			Tree:       self.tree,
+			Context:    self.context,
+			Extensions: applied.Extensions,
+			Committer:  self.ownLeaf,
+			List:       list,
+			Now:        time.Now(),
+		}); err != nil {
+			return nil, err
+		}
+		// AND THIS PROFILE'S OWN THREE DOORS GO HERE, in this order, between section 12.2's
+		// rules and the path: MASTER section 6's membership and device caps and section 8's
+		// removal authority are task 20's, and section 11's owner succession is task 21's. All
+		// three are decidable off `applied` and `list`, both of which are in hand at this point
+		// and neither of which any later step can restate, and all three must run BEFORE the
+		// path is built, because a refusal after CreateUpdatePathSecrets has drawn a leaf key
+		// costs a key pair and a tree clone for a commit that was never going to be sent.
+		//
+		// THE PLAN LANDS THEM HERE AS STUBS AND THIS TASK DOES NOT, and that is a deliberate
+		// deviation. A body that names its arguments, reads none of them and answers nil is the
+		// shape TestNoStubShapesRemainInSource derives and refuses -- "a parameter the body never
+		// reads, which is the plausible zero value" -- and the two spellings that get past it are
+		// an underscore parameter, which the sealed storage scan refuses in its turn, and a
+		// `_ = argument` line, which is that gate's own stated blind spot. A door that decides
+		// nothing is not made safer by being written down; what the ordering needs is this
+		// paragraph, and what the doors need is their tasks.
+	}
+
+	// step 3: the path, in the three ordered steps this file's header states.
+	//
+	// The provisional context carries the PREVIOUS epoch's confirmed transcript hash, because the
+	// new one is a function of this very commit and this commit is not framed yet. That is not an
+	// approximation: section 12.4.2 has every receiver decrypt the path under exactly this
+	// context, so what matters is that the two sides build the same one.
+	commitSecret := ZeroSecret(self.crypto)
+	var plan *UpdatePathPlan
+	hasPath := CommitPathRequired(list) || opts.Force
+	// the tree a RECEIVER judges this commit against, kept apart from the one the epoch ends up
+	// with. Section 12.4.2 applies the proposals, validates the path against THAT tree, and
+	// merges the path afterwards, and the two trees are not interchangeable here: ValSem207
+	// refuses a path publishing a key that already stands in the tree it is handed, so a
+	// validator given the tree with the path already installed refuses every commit whose path
+	// has a node in it -- which is every commit of a group with more than one member.
+	// CreateUpdatePathSecrets mutates the tree it is called on, so the clone is taken first.
+	postProposal := applied.Tree
+	if hasPath {
+		postProposal = applied.Tree.Clone()
+		plan, err = applied.Tree.CreateUpdatePathSecrets(self.crypto, self.ownLeaf,
+			self.signer, cloneBytes(self.context.GroupId))
+		if err != nil {
+			return nil, err
+		}
+		pathTreeHash, err := applied.Tree.TreeHash(self.crypto)
+		if err != nil {
+			return nil, err
+		}
+		provisional := &GroupContext{
+			Version:                 self.context.Version,
+			CipherSuite:             self.context.CipherSuite,
+			GroupId:                 cloneBytes(self.context.GroupId),
+			Epoch:                   self.context.Epoch + 1,
+			TreeHash:                pathTreeHash,
+			ConfirmedTranscriptHash: cloneBytes(self.context.ConfirmedTranscriptHash),
+			Extensions:              applied.Extensions,
+		}
+		provisionalBytes, err := syntax.Marshal(provisional)
+		if err != nil {
+			return nil, err
+		}
+		// the members this commit ADDS are excluded: they receive the path secret in their
+		// Welcome and must not also be sealed to here, where they hold no key yet.
+		path, err := applied.Tree.EncryptUpdatePath(self.crypto, plan, self.ownLeaf,
+			provisionalBytes, applied.AddedLeaves)
+		if err != nil {
+			return nil, err
+		}
+		commit.Path = path
+		commitSecret = plan.CommitSecret
+	}
+
+	// step 4: frame and sign the commit against the OLD group context, because that is the epoch
+	// every receiver is still in and the epoch its signature has to verify under.
+	oldContextBytes, err := syntax.Marshal(self.context)
+	if err != nil {
+		return nil, err
+	}
+	content := &FramedContent{
+		GroupId:     cloneBytes(self.context.GroupId),
+		Epoch:       self.context.Epoch,
+		Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: self.ownLeaf},
+		ContentType: ContentTypeCommit,
+		Commit:      commit,
+	}
+	authenticated, err := SignAuthenticatedContent(self.crypto, self.signer,
+		WireFormatPrivateMessage, content, oldContextBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	// step 5: the new transcript hashes, the new group context and the new key schedule.
+	confirmedInput, err := authenticated.ConfirmedTranscriptHashInput()
+	if err != nil {
+		return nil, err
+	}
+	confirmedHash := ConfirmedTranscriptHash(self.crypto, self.transcript.Interim, confirmedInput)
+	treeHash, err := applied.Tree.TreeHash(self.crypto)
+	if err != nil {
+		return nil, err
+	}
+	newContext := &GroupContext{
+		Version:                 self.context.Version,
+		CipherSuite:             self.context.CipherSuite,
+		GroupId:                 cloneBytes(self.context.GroupId),
+		Epoch:                   self.context.Epoch + 1,
+		TreeHash:                treeHash,
+		ConfirmedTranscriptHash: confirmedHash,
+		Extensions:              applied.Extensions,
+	}
+	schedule, err := NewKeySchedule(self.crypto, self.schedule.Secrets().InitSecret, commitSecret,
+		EmptyPskSecret(self.crypto), newContext)
+	if err != nil {
+		return nil, err
+	}
+
+	// step 6: the confirmation tag over the confirmed transcript hash OF THE EPOCH THIS COMMIT
+	// OPENS, and then the interim hash from it.
+	tagOver := confirmedHash
+	if opts.confirmationTagOverPreCommitTranscript {
+		tagOver = self.transcript.Confirmed
+	}
+	confirmationTag := schedule.ConfirmationTag(tagOver)
+	// ConfirmationTag answers nil for an epoch whose confirmation_key has been erased. Nothing can
+	// have erased this one -- the schedule was built four statements ago -- so this is a refusal
+	// over a build that has stopped agreeing with itself, and it is made here for NewGroup's
+	// reason: the alternative is folding a nil tag into the interim hash and staging an epoch
+	// whose successor nobody can compute.
+	if len(confirmationTag) != self.crypto.HashSize() {
+		return nil, fmt.Errorf("%w: the schedule answered %d octets, want %d",
+			errCommitConfirmationTag, len(confirmationTag), self.crypto.HashSize())
+	}
+	authenticated.Auth.ConfirmationTag = confirmationTag
+	if opts.dropConfirmationTag {
+		authenticated.Auth.ConfirmationTag = nil
+	}
+	// a CLONE of the transcript, so a refusal below leaves this group's own transcript where the
+	// epoch it is still in put it.
+	transcript := self.transcript.Clone()
+	if err := transcript.Update(self.crypto, confirmedInput, confirmationTag); err != nil {
+		return nil, err
+	}
+
+	// step 7: the commit this client is about to send, through the door every receiver of it will
+	// judge it at.
+	//
+	// THE CONTEXT IS THE PRE-COMMIT ONE AND THE EXTENSIONS ARE THE POST-COMMIT SET, which is not a
+	// muddle. Every rule of section 12.2 is stated over the group the proposals ARRIVED in, the
+	// by-reference arm of the vector join resolves each reference against this member's cache --
+	// which is bound to the epoch that is closing -- and effectiveExtensions is the field that
+	// carries the post-proposal set to the rules that need it. A newContext here answers
+	// errProposalNotCached for every commit that names a proposal by reference, which is every
+	// commit a real group produces.
+	//
+	// CheckErrata8745 and CheckErrata8815 are NOT called beside this. ValidateCommit reaches both
+	// through validateCommitErrata, so a second call here would be a second transcription of two
+	// rules whose whole point is that there is one of each.
+	if !opts.skipValidation {
+		commitInput := &CommitValidationInput{
+			Crypto:          self.crypto,
+			PreTree:         self.tree,
+			PostTree:        postProposal,
+			Context:         self.context,
+			Extensions:      applied.Extensions,
+			Committer:       self.ownLeaf,
+			Own:             self.ownLeaf,
+			List:            list,
+			Commit:          commit,
+			Pending:         self.proposals,
+			ConfirmationKey: schedule.Secrets().Confirmation,
+			ConfirmedHash:   confirmedHash,
+			ConfirmationTag: authenticated.Auth.ConfirmationTag,
+			Now:             time.Now(),
+		}
+		if err := ValidateCommit(commitInput); err != nil {
+			return nil, err
+		}
+		// ValSem205 is not in ValidateCommit's own list and its own comment says why: the
+		// confirmation key belongs to the epoch this commit OPENS, so it does not exist until
+		// the schedule above has been derived. The caller that has one runs it, and this is
+		// that caller.
+		if err := ValSem205ConfirmationTag(commitInput); err != nil {
+			return nil, err
+		}
+	}
+
+	// step 8: the new epoch's verified context, which is what the boundary owes the proposal
+	// cache. The creator earns one the same way at epoch 0 -- see NewGroup -- and it is earned
+	// HERE rather than at the merge so that every refusal this commit can make is made before a
+	// generation of this leaf's message ratchet has been spent on it.
+	groupInfo := &GroupInfo{
+		GroupContext:    *newContext,
+		ConfirmationTag: confirmationTag,
+		Signer:          self.ownLeaf,
+	}
+	if err := groupInfo.Sign(self.crypto, self.signer); err != nil {
+		return nil, err
+	}
+	verified, err := groupInfo.VerifiedContext(self.crypto, applied.Tree)
+	if err != nil {
+		return nil, err
+	}
+	secretTree, err := NewSecretTree(self.crypto, applied.Tree.LeafWidth(),
+		schedule.Secrets().Encryption)
+	if err != nil {
+		return nil, err
+	}
+
+	// step 9: protect the commit under the OLD epoch's keys and put it on the wire. A-ASSUME-4:
+	// handshake traffic travels as a PrivateMessage, so the transport learns neither who committed
+	// nor what the commit did.
+	//
+	// LAST, because it is the first thing here that cannot be undone: the seal consumes a
+	// generation of this leaf's ratchet whether or not the commit is ever sent.
+	private, err := SealPrivateMessage(self.crypto, self.secretTree,
+		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	if err != nil {
+		return nil, err
+	}
+	commitMessage, err := MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+	if err != nil {
+		return nil, err
+	}
+	encodedTree, err := syntax.MarshalLimit(applied.Tree, syntax.MaxRatchetTreeLength)
+	if err != nil {
+		return nil, err
+	}
+
+	// a commit with no path leaves this client's own leaf key where it was, so the private state
+	// carries forward; a commit with one replaces it, and the plan's private half is that
+	// replacement.
+	ownPriv := self.ownPriv
+	if plan != nil && plan.Private != nil {
+		ownPriv = plan.Private
+	}
+	staged := &StagedCommit{
+		committer:   self.ownLeaf,
+		epoch:       newContext.Epoch,
+		context:     newContext,
+		verified:    verified,
+		tree:        applied.Tree,
+		schedule:    schedule,
+		secretTree:  secretTree,
+		ownPriv:     ownPriv,
+		transcript:  transcript,
+		list:        list,
+		commit:      commit,
+		added:       applied.AddedLeaves,
+		removed:     applied.RemovedLeaves,
+		updated:     applied.UpdatedLeaves,
+		selfRemoved: applied.SelfRemoved,
+		hasPath:     hasPath,
+		confirmTag:  confirmationTag,
+		plan:        plan,
+		restoreKind: restoreFromJoiner,
+	}
+	self.pending = staged
+
+	// AND THE WELCOME FOR THE MEMBERS THIS COMMIT ADDS IS TASK 15'S, so a commit covering an Add
+	// answers none today. That is a HOLE and not a design: the added member has a leaf in the tree
+	// this result publishes and no way to reach the epoch, and
+	// TestACommitCoveringAnAddCarriesNoWelcomeUntilTask15 is what makes it impossible to forget --
+	// it fails on the commit that starts building one, rather than waiting for somebody to
+	// remember. Task 15 assembles it from `staged`, which carries the new epoch's schedule, the
+	// post-commit tree and the leaves the adds landed on.
+	return &CommitResult{Commit: commitMessage, RatchetTree: encodedTree}, nil
+}
+
+// ClearPendingCommit discards a staged commit. It is what a caller calls when the delivery service
+// accepted somebody ELSE's commit for this epoch (MASTER section 9.3, spec A section 5.12): the
+// staged epoch is then an epoch nobody entered, and the group has to be able to build another
+// commit against the epoch it is still in.
+//
+// It answers nothing, because there is no failure here to report: clearing a commit that was never
+// staged is the same state as clearing one that was.
+func (self *Group) ClearPendingCommit() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.pending = nil
+}
+
+// MergePendingCommit promotes the staged commit to live state. Task 19 adds the persistence and the
+// past-epoch window; what is here is the state swap and the boundary the cache is owed.
+//
+// THE CACHE IS REBOUND TO THE EPOCH THE GROUP MOVED TO, on every path out of this method, and that
+// is the whole of what an epoch boundary owes it. A cache left behind belongs to the epoch that just
+// closed and every reference in it names a proposal this commit has already applied; a cache
+// rebound to that same closing epoch is worse, because it then refuses every proposal of the new
+// epoch as well and nothing in this package releases it.
+func (self *Group) MergePendingCommit() error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.pending == nil {
+		return ErrNoPendingCommit
+	}
+	staged := self.pending
+	// the rebind runs BEFORE nothing and AFTER the write, which is the order the boundary is
+	// stated in: the cache takes its epoch from the context the group has moved to, and a rebind
+	// written ahead of the move would hand it the epoch that is closing.
+	self.tree = staged.tree
+	self.context = staged.context
+	self.verified = staged.verified
+	self.schedule = staged.schedule
+	self.secretTree = staged.secretTree
+	self.ownPriv = staged.ownPriv
+	self.transcript = staged.transcript
+	self.restoreKind = staged.restoreKind
+	if err := self.proposals.Rebind(staged.verified); err != nil {
+		return err
+	}
+	self.pending = nil
+	return nil
+}
+

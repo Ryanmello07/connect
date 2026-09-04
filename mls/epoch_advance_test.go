@@ -359,12 +359,25 @@ func epochGroupMoveIn(checked checkedBodies, node ast.Node) (epochGroupMove, boo
 		}
 		// replacing the group context a value HOLDS, or moving one of the bound fields of a
 		// group context in place
+		//
+		// THE TYPE IS READ THROUGH epochEnderCarriesTheContext AND NOT THROUGH AN EXACT NAME,
+		// which is this half catching up with the ender half. That function already matches by
+		// SUFFIX, and its own paragraph says why: the real ender takes a *VerifiedGroupContext,
+		// and matching the exact name would read it as declaring no context at all. The WRITE
+		// half went on matching the exact name, so a boundary that moved a group by installing
+		// the verified value and handed the ender that same value was reported as handing it
+		// something it had never moved -- which is a correct boundary refused for a reason its
+		// author cannot act on, the very outcome that paragraph is about. Measured on p7 task
+		// 13's MergePendingCommit, which is the first boundary of this package to exist.
+		//
+		// It WIDENS the class rather than narrowing it: a declaration that writes any wrapper of
+		// a group context into storage that outlives the call is now a mover and owes a rebind.
 		var context ast.Expr
 		switch {
-		case extensionTypeSelectionNamedAs(checked.info.TypeOf(selector), epochGroupContextTypeName):
+		case epochEnderCarriesTheContext(checked.info.TypeOf(selector)):
 			context = selector
 		case slices.Contains(epochBoundFields, selector.Sel.Name) &&
-			extensionTypeSelectionNamedAs(checked.info.TypeOf(selector.X), epochGroupContextTypeName):
+			epochEnderCarriesTheContext(checked.info.TypeOf(selector.X)):
 			context = selector.X
 		default:
 			continue
@@ -376,7 +389,7 @@ func epochGroupMoveIn(checked checkedBodies, node ast.Node) (epochGroupMove, boo
 		// and the value ASSIGNED, which names the same context the instant the write lands and
 		// is what a boundary rebinding from its own staged context hands the ender
 		if assignment != nil && len(assignment.Rhs) == len(assignment.Lhs) &&
-			extensionTypeSelectionNamedAs(checked.info.TypeOf(assignment.Rhs[at]), epochGroupContextTypeName) {
+			epochEnderCarriesTheContext(checked.info.TypeOf(assignment.Rhs[at])) {
 			if named := epochDenotationOf(checked, assignment.Rhs[at]); named != nil {
 				move.names = epochNamesUnion(move.names, [][]types.Object{named})
 			}
@@ -1529,6 +1542,51 @@ type epochMoverRow struct {
 // binding on every path out of the same body or fails here until somebody writes down which of the
 // two things it does.
 var groupContextEpochMovers = map[string]epochMoverRow{
+	"(*Group).MergePendingCommit": {
+		what: "the epoch boundary this whole gate was written ahead of: it installs the tree, the context, the " +
+			"verified context, the key schedule, the secret tree and the transcript a commit staged, and the " +
+			"group is in the new epoch the instant it returns. It moves a group, so it owes the cache the epoch " +
+			"it moved TO -- which is why it is handed the staged commit's own verified context and not the one " +
+			"the group is leaving",
+		movesAGroupBetweenEpochs: true,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			owner := testIdentity(t, crypto, "owner")
+			group := testNewGroup(t, crypto, owner, "merge-probe")
+			defer group.Close()
+			if _, err := group.ProposeUpdate(); err != nil {
+				t.Fatalf("ProposeUpdate: %v", err)
+			}
+			if len(group.pendingProposalsForTest()) != 1 {
+				t.Fatal("the proposal this probe watches the boundary release was not cached")
+			}
+			before := group.Epoch()
+			if _, err := group.CreateCommit([][]byte{}, nil, nil); err != nil {
+				t.Fatalf("CreateCommit: %v", err)
+			}
+			if group.Epoch() != before {
+				t.Fatalf("the epoch moved to %d at the commit, and this row is about the merge", group.Epoch())
+			}
+			if err := group.MergePendingCommit(); err != nil {
+				t.Fatalf("MergePendingCommit: %v", err)
+			}
+			if group.Epoch() != before+1 {
+				t.Fatalf("the merge left the group at epoch %d, want %d", group.Epoch(), before+1)
+			}
+			// the closed epoch's entries are gone, which is the first half of the boundary
+			if held := group.pendingProposalsForTest(); len(held) != 0 {
+				t.Fatalf("the merge left %d entry/entries of the closed epoch cached", len(held))
+			}
+			// and the cache is bound to the epoch the group MOVED TO rather than to the one it
+			// left, which is the half a rebind with the wrong context passes the first
+			if _, err := group.ProposeUpdate(); err != nil {
+				t.Fatalf("the cache refuses a proposal of the epoch the group entered: %v", err)
+			}
+			if len(group.pendingProposalsForTest()) != 1 {
+				t.Fatal("a proposal of the new epoch was not cached, so the cache is bound to another epoch")
+			}
+		},
+	},
 	"(*GroupContext).UnmarshalMLS": {
 		what: "the group context DECODER, and the epoch it writes is one it read out of the caller's own octets " +
 			"rather than one this client advanced to. It moves no group: the value it writes into is one the " +

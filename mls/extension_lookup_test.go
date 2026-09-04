@@ -600,6 +600,60 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"(*StagedCommit).GroupContextExtensions": {
+		what: "COPIES every entry of the post-commit extension vector and selects none. It is an accessor that " +
+			"answers the whole vector, so a repeat is not a question it decides: two entries of one type are " +
+			"both copied out, and the door that refuses the repeat is the lookup every reader of that vector " +
+			"reaches. What it reads the type FOR is the copy -- an Extension copied by value goes on pointing " +
+			"at the octets the new epoch's group context was built over, so the entries are rebuilt field by " +
+			"field and the type is one of the two fields",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			owner := testIdentity(t, crypto, "owner")
+			group := testNewGroup(t, crypto, owner, "staged-extensions")
+			defer group.Close()
+			if _, err := group.CreateCommit([][]byte{}, nil, nil); err != nil {
+				t.Fatalf("CreateCommit: %v", err)
+			}
+			staged := group.stagedForTest()
+			if staged == nil {
+				t.Fatal("the commit staged nothing, so this probe reads nothing")
+			}
+			answered := staged.GroupContextExtensions()
+			if len(answered) != len(staged.context.Extensions) {
+				t.Fatalf("the accessor answered %d entry/entries and the staged context carries %d; a walk that selected by type would answer fewer",
+					len(answered), len(staged.context.Extensions))
+			}
+			if len(answered) == 0 {
+				t.Fatal("the staged context carries no extension, so this probe compared nothing")
+			}
+			for i := range answered {
+				if answered[i].ExtensionType != staged.context.Extensions[i].ExtensionType {
+					t.Errorf("entry %d is answered as %#04x and the staged context holds %#04x; the vector is answered in order and not selected from",
+						i, uint16(answered[i].ExtensionType), uint16(staged.context.Extensions[i].ExtensionType))
+				}
+			}
+			// and the bodies are COPIES, which is what the type read is for
+			scribbled := false
+			for i := range answered {
+				for at := range answered[i].ExtensionData {
+					answered[i].ExtensionData[at] ^= 0xFF
+					scribbled = true
+				}
+			}
+			if !scribbled {
+				t.Fatal("no extension body was answered, so the copy this probe checks was never made")
+			}
+			again := staged.GroupContextExtensions()
+			for i := range again {
+				if !bytes.Equal(again[i].ExtensionData, staged.context.Extensions[i].ExtensionData) {
+					t.Errorf("a caller writing through entry %d changed the extension the staged epoch was derived over",
+						i)
+				}
+			}
+		},
+	},
 	"reconcileWithGroupContext": {
 		what: "compares the leaves' extensions vector against the epoch's POSITIONALLY, entry by entry, after " +
 			"pinning their lengths equal. It selects nothing by type -- both operands of its comparison are read " +

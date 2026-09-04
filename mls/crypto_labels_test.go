@@ -753,6 +753,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// itself inlined into every FramedContentTBS -- and a body allowed past MaxVectorLength
 		// is one no peer running the default limit could have sent, over bytes the confirmed
 		// transcript hash covers.
+		// p7 task 13's commit generation encodes a fifth structure, the PROVISIONAL context the
+		// update path is sealed under, at the DEFAULT limit and for the same reason: those octets
+		// are the HPKE info every receiver rebuilds for itself, so a context this encoder accepted
+		// past MaxVectorLength is one no peer running the default limit could decrypt the path
+		// under. The list is sorted, which is why it stands ahead of the two below.
+		"group.go: syntax.Marshal(provisional)",
 		"group.go: syntax.Marshal(required)",
 		"group.go: syntax.Marshal(self.context)",
 		"group.go: syntax.Marshal(self.context)",
@@ -762,6 +768,16 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// past MaxVectorLength is one no peer running the default limit could verify a signature
 		// over.
 		"group.go: syntax.Marshal(self.context)",
+		// p7 task 13's commit generation encodes the group context a FOURTH time, the one the
+		// commit is signed against, at the DEFAULT limit and for the reason above: these octets
+		// are inlined into a FramedContentTBS with no length prefix of their own.
+		"group.go: syntax.Marshal(self.context)",
+		// and the post-commit tree the commit publishes for out of band Welcome delivery, at the
+		// RAISED limit for the reason the persisted blob is: it is the same structure tree.go's own
+		// encoder writes at MaxRatchetTreeLength, and a default limit writer here would refuse to
+		// publish a tree this build is entitled to hold, at 500 members, over a commit that is
+		// entirely correct.
+		"group.go: syntax.MarshalLimit(applied.Tree, syntax.MaxRatchetTreeLength)",
 		// the two encodes of the persisted state blob, at the RAISED limit, and here that is a
 		// capacity rather than an acceptance rule. These octets never travel: they are this
 		// client's own local state, read back only by the LoadGroup that wrote them, and the tree
