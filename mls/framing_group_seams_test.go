@@ -31,6 +31,33 @@
 // in the test binary, and moving both into framing_group_seams.go together WITH a production
 // caller passes every other gate this package has -- measured, not assumed. The class it reads is
 // derived from what a construction bypass DOES rather than from these two names.
+//
+// What this cannot see, said out loud, AND THIS LINE OF WORK IS CLOSED AT THAT. Three rounds have
+// each traded one axis of this gate for another -- the anchor for the door, the position for the
+// door, the types for the generators -- and the property underneath all three is a code review
+// property: no production declaration forges a message. What the COMPILER enforces is that a
+// _test.go file is compiled into no shipped binary, and that already holds without a line of this.
+// So what follows is recorded rather than built for, and a fourth axis is not opened.
+//
+//   - A forge whose CALLER fills a package level variable of a carrier type one frame earlier and
+//     then calls a no-argument forge. Nothing arrives in a position its caller fills, so the
+//     handed-over half reads it as being handed nothing, and it passes -- measured -- while
+//     spelling the door's own name in its body. The whole handed-over half is a statement about
+//     signatures, and a package level variable is not one.
+//   - A call edge whose name is ambiguous. The walk used to drop such an edge outright, which was
+//     a forge plus a two line helper renamed to collide -- MarshalMLS and UnmarshalMLS are carried
+//     by fourteen declarations here, so colliding is free. That condition is gone, and what
+//     replaced it follows an edge into EVERY declaration carrying the name: the walk now
+//     over-reports rather than under-reports, so the residue is a verdict a declaration inherits
+//     from a namesake rather than an exit. Over-reporting fails loudly, which is the direction
+//     this file chooses everywhere it has to choose.
+//   - A second declaration of the door itself. A body handed a whole *MLSMessage by its caller
+//     that answers syntax.Marshal over it and names no message of its own IS MarshalMLSMessage,
+//     line for line, and no derivation separates the two. The forging in that shape happens in
+//     the CALLER, which is where this gate catches it or does not.
+//   - The two shapes constructionBypassSeamsIn records below: a seam answering a *PrivateMessage
+//     rather than an *MLSMessage or its octets, and one taking its forged tag as a bare []byte
+//     rather than as the structure that carries it.
 package mls
 
 import (
@@ -314,14 +341,25 @@ const seamPaddingOctets = 32
 // when the type in the position it fills CARRIES them, not when its name is this one, and
 // seamAuthenticatorCarriersIn below is where that class is derived.
 //
-// seamWireDoorType is read where a whole message LEAVES a declaration -- its results -- and not
-// wherever the name appears in a body, and that was measured rather than chosen. A body that
-// mentions the type is not a body that sends one: (*MLSMessage).UnmarshalMLS names its own type
-// while CONSUMING octets rather than producing any, and reading mentions turned every codec of
-// this package into a candidate the moment the receiver joined the handed-over half. So the two
-// anchors are read at the two ENDS of a signature -- the caller supplied side is where the
-// authenticators are handed over, the answering side is where a message leaves -- and the door
-// FUNCTION is what a body naming it still means.
+// seamWireDoorType is read at BOTH ends and the two readings are different claims. Where a whole
+// message LEAVES a declaration -- its results -- it has reached the wire with the marshal one
+// frame up. Where it is NAMED IN A BODY it says which of the derived doors below the body is
+// standing at: a serializer generic over every wire type of this package is a whole message
+// reaching the wire only when the body names a whole message too.
+//
+// Reading the body mention ALONE is what the previous round removed, and removing it was the
+// regression this one is here to undo. It was removed for a real cost -- (*MLSMessage).UnmarshalMLS
+// names its own type while CONSUMING octets, so once the receiver joined the handed-over half every
+// codec of this package became a candidate -- and the trade was paid for out of the door: three
+// production forges that call MarshalMLSMessage's WRAPPEE instead of MarshalMLSMessage walked
+// straight under the narrowed reading. Both halves are held here. The mention is read, and it is
+// read together with a door, so a decoder that names the message while producing no octets names
+// no door and stays out.
+//
+// seamWireDoor is the SEED of the door half and not the whole of it, exactly as
+// seamForgedAuthenticators is the seed of the handed-over half. MarshalMLSMessage is five lines --
+// a nil check and syntax.Marshal -- so the name is a wrapper and the octets are produced under it;
+// seamWireDoorsIn below is where the rest of the chain is derived.
 const (
 	seamWireDoor             = "MarshalMLSMessage"
 	seamWireDoorType         = "MLSMessage"
@@ -342,6 +380,22 @@ type seamCandidate struct {
 	// a whole message LEAVES it, which is the door type read where a declaration answers with
 	// one rather than wherever the name is mentioned.
 	answersTheDoorType bool
+	// the door TYPE stands in a position its caller fills. It is what separates a serializer of
+	// the message from a serializer of everything: the first can be named alone.
+	takesTheDoorType bool
+	// OCTETS leave it, read off its results. A door hands its answer down to the next frame, and
+	// a frame that answers no octets is not the one the answer came from. The octet type is the
+	// language's own and is spelled rather than anchored, because nothing can rename it.
+	answersOctets bool
+	// the callees its own RETURN statements name: what it hands its answer BACK from. This is how
+	// a wrapper is walked down to the declaration that does the work, and it is deliberately
+	// narrower than the body -- MarshalMLS returns fmt.Errorf on three paths, so a walk over every
+	// callee puts Errorf in the door class and reads the whole package as reaching the wire.
+	answersFrom map[string]bool
+	// the receiver type name as written, or the empty string for a free function.
+	receiver string
+	// whether the go tool exports it, which is the surface a caller outside this package has.
+	exported bool
 	// every identifier its body names.
 	names map[string]bool
 }
@@ -473,17 +527,20 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				continue
 			}
 			candidate := seamCandidate{
-				name:  function.Name.Name,
-				bare:  function.Name.Name,
-				file:  source.fileSet.Position(function.Pos()).Filename,
-				names: map[string]bool{},
+				name:        function.Name.Name,
+				bare:        function.Name.Name,
+				file:        source.fileSet.Position(function.Pos()).Filename,
+				exported:    function.Name.IsExported(),
+				names:       map[string]bool{},
+				answersFrom: map[string]bool{},
 			}
 			// every position the caller fills in, gathered before any of them is read, so the
 			// receiver and the parameters are answered by ONE walk rather than by two rules that
 			// agree until the day one of them is edited.
 			supplied := []ast.Expr{}
 			if function.Recv != nil && len(function.Recv.List) == 1 {
-				candidate.name = receiverTypeName(function.Recv.List[0].Type) + "." + candidate.bare
+				candidate.receiver = receiverTypeName(function.Recv.List[0].Type)
+				candidate.name = candidate.receiver + "." + candidate.bare
 				supplied = append(supplied, function.Recv.List[0].Type)
 			}
 			for _, field := range function.Type.Params.List {
@@ -491,9 +548,15 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 			}
 			for _, position := range supplied {
 				ast.Inspect(position, func(node ast.Node) bool {
-					if identifier, isIdentifier := node.(*ast.Ident); isIdentifier &&
-						carriers[identifier.Name] {
+					identifier, isIdentifier := node.(*ast.Ident)
+					if !isIdentifier {
+						return true
+					}
+					if carriers[identifier.Name] {
 						candidate.forgeable = true
+					}
+					if identifier.Name == seamWireDoorType {
+						candidate.takesTheDoorType = true
 					}
 					return true
 				})
@@ -504,9 +567,15 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 			if function.Type.Results != nil {
 				for _, field := range function.Type.Results.List {
 					ast.Inspect(field.Type, func(node ast.Node) bool {
-						if identifier, isIdentifier := node.(*ast.Ident); isIdentifier &&
-							identifier.Name == seamWireDoorType {
+						identifier, isIdentifier := node.(*ast.Ident)
+						if !isIdentifier {
+							return true
+						}
+						if identifier.Name == seamWireDoorType {
 							candidate.answersTheDoorType = true
+						}
+						if identifier.Name == "byte" {
+							candidate.answersOctets = true
 						}
 						return true
 					})
@@ -516,12 +585,139 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
 					candidate.names[identifier.Name] = true
 				}
+				// and the answered callees on their own, which is the door chain's edge. A
+				// declaration hands its answer to the frame it RETURNS, so that is where the
+				// wrappee is read from rather than from every call the body makes.
+				if returned, isReturn := node.(*ast.ReturnStmt); isReturn {
+					for _, result := range returned.Results {
+						ast.Inspect(result, func(inner ast.Node) bool {
+							call, isCall := inner.(*ast.CallExpr)
+							if !isCall {
+								return true
+							}
+							switch callee := call.Fun.(type) {
+							case *ast.Ident:
+								candidate.answersFrom[callee.Name] = true
+							case *ast.SelectorExpr:
+								candidate.answersFrom[callee.Sel.Name] = true
+							}
+							return true
+						})
+					}
+				}
 				return true
 			})
 			candidates = append(candidates, candidate)
 		}
 	}
 	return candidates
+}
+
+// The doors of one scan: every name a whole message becomes octets under, and which of them
+// serialize anything else as well.
+type seamWireDoors struct {
+	names   map[string]bool
+	generic map[string]bool
+}
+
+// seamWireDoorsIn derives the doors from the one name this package sanctions.
+//
+// THE DOOR WAS A NAME, AND THAT IS THE REGRESSION THIS FUNCTION EXISTS TO UNDO. MarshalMLSMessage
+// is five lines of framing.go -- a nil check and syntax.Marshal -- so a production forge that
+// calls the wrappee instead emits BYTE IDENTICAL wire octets, and a gate anchored on the wrapper's
+// spelling reports the package clean. Measured, not argued: thirteen production forges compiled
+// into this package, nine caught, the no-carrier negative correctly not caught, and three survived
+// -- syntax.Marshal called directly, the same over a carrier, and (*MLSMessage).MarshalMLS. All
+// three spell the door type in their bodies, which is the reading the previous round dropped.
+//
+// So the chain is WALKED, and the edge it is walked along is the answer rather than the call. A
+// wrapper hands its own result to the frame beneath it, so the edge is read off RETURN statements
+// and followed only into a frame that answers octets itself: MarshalMLSMessage returns
+// syntax.Marshal(message), Marshal returns MarshalLimit(v, MaxVectorLength), and MarshalLimit
+// returns a local, which is where the chain stops. Walking every CALLEE instead was measured and
+// is what a reader would reach for first: it takes in fmt.Errorf off MarshalMLS's three error
+// paths and every leaf writer under it -- eleven names -- and a door class holding Errorf reads
+// this whole package as reaching the wire.
+//
+// THE LAST FRAME IS THE ENCODE METHOD THE VALUE CARRIES, and the return walk cannot reach it.
+// MarshalLimit does not answer v.MarshalMLS(w); it calls it for effect and hands back the writer's
+// octets. So it is derived from the other end: a name a frame OF THE CHAIN calls that the door
+// TYPE declares as a method of its own. MLSMessage declares MarshalMLS, UnmarshalMLS and
+// populatedArms, and exactly one of the three is named by a frame of the chain.
+//
+// GENERIC AND SPECIFIC, because a call site means different things by the two. MarshalMLSMessage
+// is handed the door type and nothing else, so a body that names it has put a whole message on the
+// wire and that is the end of it. Marshal, MarshalLimit and MarshalMLS serialize every wire type
+// this package has -- one takes a Marshaler, and fourteen declarations here carry the name
+// MarshalMLS -- so a body naming one of those has sent a WHOLE MESSAGE only if it names a whole
+// message too. That split is derived and not chosen: a door is generic when some declaration
+// carrying its name is handed something other than the door type. Reading it the other way is what
+// would ban marshalBoundedComposition and every fragment serializer beside it.
+func seamWireDoorsIn(candidates []seamCandidate) seamWireDoors {
+	answersOctets := map[string]bool{}
+	methodsOfTheDoorType := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.answersOctets {
+			answersOctets[candidate.bare] = true
+		}
+		if candidate.receiver == seamWireDoorType {
+			methodsOfTheDoorType[candidate.bare] = true
+		}
+	}
+	// the wrappee chain, from the sanctioned name down
+	chain := map[string]bool{seamWireDoor: true}
+	for grew := true; grew; {
+		grew = false
+		for _, candidate := range candidates {
+			if !chain[candidate.bare] {
+				continue
+			}
+			for answered := range candidate.answersFrom {
+				if answersOctets[answered] && !chain[answered] {
+					chain[answered] = true
+					grew = true
+				}
+			}
+		}
+	}
+	doors := seamWireDoors{names: map[string]bool{}, generic: map[string]bool{}}
+	maps.Copy(doors.names, chain)
+	// and the encode method the innermost frame drives, which answers no octets and so is reached
+	// from the door type's own method set rather than along the chain.
+	for _, candidate := range candidates {
+		if !chain[candidate.bare] {
+			continue
+		}
+		for named := range candidate.names {
+			if methodsOfTheDoorType[named] {
+				doors.names[named] = true
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if doors.names[candidate.bare] && !candidate.takesTheDoorType {
+			doors.generic[candidate.bare] = true
+		}
+	}
+	return doors
+}
+
+// seamNamesAWireDoor answers whether one body sends a WHOLE MESSAGE through a door.
+//
+// The specific door is enough on its own; a generic one needs the message named beside it. Both
+// halves are load bearing and each was measured: without the generic half, a forge answering
+// syntax.Marshal over an &MLSMessage{} it just assembled reads as clean, and without the specific
+// half, a forge that hands MarshalMLSMessage a message its caller assembled does.
+func seamNamesAWireDoor(candidate seamCandidate, doors seamWireDoors) bool {
+	for named := range candidate.names {
+		if !doors.names[named] {
+			continue
+		}
+		if !doors.generic[named] || candidate.names[seamWireDoorType] {
+			return true
+		}
+	}
+	return false
 }
 
 // seamsReachingTheWireDoor answers which declarations put a whole message on the wire, DIRECTLY
@@ -554,7 +750,7 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 // some other type is read as reaching whatever any declaration spelled that way reaches. That
 // direction over-reports, which fails loudly; the direction that under-reports is the one this
 // package has paid for.
-func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
+func seamsReachingTheWireDoor(candidates []seamCandidate, doors seamWireDoors) map[string]bool {
 	byBareName := map[string][]int{}
 	for index, candidate := range candidates {
 		byBareName[candidate.bare] = append(byBareName[candidate.bare], index)
@@ -566,7 +762,7 @@ func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
 			if reaches[candidate.name] {
 				continue
 			}
-			if candidate.names[seamWireDoor] || candidate.answersTheDoorType {
+			if candidate.answersTheDoorType || seamNamesAWireDoor(candidate, doors) {
 				reaches[candidate.name] = true
 				grew = true
 				continue
@@ -602,7 +798,7 @@ func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
 // forges that passed the version of this gate that named the position.
 func constructionBypassSeamsIn(parsed []parsedSource) []seamCandidate {
 	candidates := seamCandidatesIn(parsed)
-	reaches := seamsReachingTheWireDoor(candidates)
+	reaches := seamsReachingTheWireDoor(candidates, seamWireDoorsIn(candidates))
 	seams := []seamCandidate{}
 	for _, candidate := range candidates {
 		if candidate.forgeable && reaches[candidate.name] {
@@ -634,6 +830,13 @@ func seamNamesOf(seams []seamCandidate) []string {
 // and names the type in its body (SignAuthenticatedContent), and a decoder that answers a whole
 // message while being handed no authenticators at all (ParseMLSMessage). A rule that swept any of
 // them in would ban the send path rather than the forge.
+//
+// It declares THE DOOR CHAIN as well, which the version of this control that read the wrapper's
+// name did not need. MarshalMLSMessage, the syntax.Marshal it answers, the MarshalLimit that
+// answers, and the encode method that one drives are transcribed from framing.go and
+// syntax/marshal.go, so the derivation has real frames to walk instead of a name to look up. Each
+// of the four is also a NEGATIVE in its own right: a door is not a bypass of itself, and a
+// derivation that swept the chain in would ban this package's own encoder.
 //
 // It declares TYPES as well as functions, which the version of this control that read one
 // identifier did not need. Three of them are production's own shape transcribed --
@@ -803,6 +1006,120 @@ func putsItOnTheWire() ([]byte, error) {
 // declaration and not to a spelling.
 func (self *AuthenticatedContent) putsItOnTheWire() {
 }
+
+// ---------------------------------------------------------------------------
+// the door chain, transcribed, and the three forges that walked under it
+// ---------------------------------------------------------------------------
+
+// the octet sink and the encode half of the method set every wire type implements, which are the
+// two things the chain's innermost frame is written in terms of.
+type Writer struct {
+	buffer []byte
+}
+
+type Reader struct {
+	buffer []byte
+}
+
+type Marshaler interface {
+	MarshalMLS(w *Writer) error
+}
+
+func (self *Writer) Bytes() ([]byte, error) {
+	return self.buffer, nil
+}
+
+// THE DOOR ITSELF, five lines, exactly as framing.go writes it: a refusal and a delegation. It is
+// a NEGATIVE, and it is the one negative no derivation could make a positive -- a declaration
+// handed a whole message that answers the wrappee over it and names no message of its own is this
+// declaration, line for line.
+func MarshalMLSMessage(message *MLSMessage) ([]byte, error) {
+	if message == nil {
+		return nil, nil
+	}
+	return Marshal(message)
+}
+
+// the wrappee, and the frame under IT. Neither is handed the door type -- one takes a Marshaler --
+// which is what makes both of them generic doors rather than doors of the message.
+func Marshal(v Marshaler) ([]byte, error) {
+	return MarshalLimit(v, 0)
+}
+
+func MarshalLimit(v Marshaler, maxVectorLength int) ([]byte, error) {
+	w := &Writer{}
+	marshalErr := v.MarshalMLS(w)
+	bs, writerErr := w.Bytes()
+	if marshalErr != nil || writerErr != nil {
+		return nil, marshalErr
+	}
+	return bs, nil
+}
+
+// the encode method the frame above drives, which is production's own and a NEGATIVE. Its
+// receiver is the door type, so it is handed the authenticators; it names a door; and it names no
+// message of its own, which is the whole of what keeps this package's encoder out of its own gate.
+func (self *MLSMessage) MarshalMLS(w *Writer) error {
+	var arm Marshaler = self.PublicMessage
+	return arm.MarshalMLS(w)
+}
+
+// THE SECOND DECLARATION OF THE ENCODE METHOD, and the whole of what makes that name generic.
+// Every wire type of this package carries one -- fourteen declarations here -- so a body that
+// names MarshalMLS has serialized SOMETHING, and only a body that names a message beside it has
+// serialized a message. It is production's own near miss twice over: handed the authenticators
+// through its receiver, serializing a FRAGMENT, reaching no door, and a NEGATIVE here.
+func (self *FramedContentAuthData) MarshalMLS(w *Writer) error {
+	w.buffer = append(w.buffer, self.Signature...)
+	return nil
+}
+
+// naming the door TYPE while CONSUMING octets rather than producing any, which is
+// (*MLSMessage).UnmarshalMLS's shape and production's own. It is what says the restored reading is
+// a door read and not a mention read: reading the mention alone swept every codec of this package
+// in the moment the receiver joined the handed-over half, and that cost is what the door was
+// traded away to pay.
+func (self *MLSMessage) decodesItselfFromTheWire(r *Reader) error {
+	decoded := MLSMessage{}
+	_ = decoded
+	return nil
+}
+
+// handed the authenticators and naming the wrappee over a FRAGMENT, which is
+// marshalBoundedComposition's shape and production's own. Naming a generic serializer is not
+// reaching the wire; naming one over a whole message is, and this is what says the two are told
+// apart by the message rather than by the serializer.
+func serializesAFragmentThroughTheWrappee(auth *FramedContentAuthData) ([]byte, error) {
+	return Marshal(auth)
+}
+
+// THE FIRST OF THE THREE SURVIVORS. It never names MarshalMLSMessage, so the gate anchored on that
+// spelling read it as clean -- and syntax.Marshal over an assembled MLSMessage is byte for byte
+// what MarshalMLSMessage emits.
+func forgesUnderTheWrapper(auth *FramedContentAuthData) ([]byte, error) {
+	message := &MLSMessage{PublicMessage: &PublicMessage{Auth: *auth}}
+	return Marshal(message)
+}
+
+// THE SECOND, the same one position left. The receiver derivation put the carrier inside the
+// handed-over half and the narrowed door read let it straight back out, which is what "one axis
+// traded for another" means in practice.
+func (self *AuthenticatedContent) forgesUnderTheWrapperFromItsReceiver() ([]byte, error) {
+	message := &MLSMessage{PublicMessage: &PublicMessage{Auth: self.Auth}}
+	return Marshal(message)
+}
+
+// THE THIRD, one frame further down again: the encode method the wrappee drives. It answers no
+// octets at all, so the caller takes them out of the writer, and a door class derived from what a
+// declaration ANSWERS would stop one frame short of it.
+func forgesThroughTheEncodeMethod(auth *FramedContentAuthData) ([]byte, error) {
+	message := &MLSMessage{PublicMessage: &PublicMessage{Auth: *auth}}
+	w := &Writer{}
+	if err := message.MarshalMLS(w); err != nil {
+		return nil, err
+	}
+	return w.Bytes()
+}
 `
 
 // The other root's shape, written the way a package outside mls has to write it: all three
@@ -886,6 +1203,106 @@ func TestTheConstructionBypassSeamGateDerivesTheTypesThatCarryTheAuthenticators(
 	}
 }
 
+// TestTheConstructionBypassSeamGateDerivesTheDoorBeneathTheWrapper is the door half's own
+// control, and it is here because the door is the half this gate got wrong THIS round.
+//
+// seamWireDoor was read as a single name and MarshalMLSMessage is a five line wrapper, so three
+// production forges that call what it delegates to emitted byte identical octets and were reported
+// clean -- measured over thirteen forges, nine caught and three through. The chain is derived here
+// instead, and it is asserted to reach all three frames: the sanctioned name, the wrappee it
+// answers, and the encode method that wrappee drives.
+//
+// The GENERIC half is asserted with it, because a door class alone would be the old defect
+// inverted. Marshal, MarshalLimit and MarshalMLS serialize every wire type this package has, so a
+// door read that stopped at "names one of these" would ban marshalBoundedComposition,
+// (*FramedContentAuthData).MarshalMLS and every fragment serializer beside them -- which is a gate
+// that fails on correct source, and that is as useless as a gate that passes on a forge.
+func TestTheConstructionBypassSeamGateDerivesTheDoorBeneathTheWrapper(t *testing.T) {
+	control := seamWireDoorsIn(seamCandidatesIn([]parsedSource{
+		mustParseText(t, "seam_control.go", constructionBypassSeamControl)}))
+	want := []string{"Marshal", "MarshalLimit", "MarshalMLS", seamWireDoor}
+	slices.Sort(want)
+	if got := slices.Sorted(maps.Keys(control.names)); !slices.Equal(got, want) {
+		t.Fatalf("the chain read %v out of the control, want %v; a frame it misses is a forge of identical power it would ship, and one it invents bans this package's own encoder",
+			got, want)
+	}
+	wantGeneric := []string{"Marshal", "MarshalLimit", "MarshalMLS"}
+	if got := slices.Sorted(maps.Keys(control.generic)); !slices.Equal(got, wantGeneric) {
+		t.Fatalf("the generic doors read %v out of the control, want %v; %s takes the door type and nothing else, and the other three serialize every wire type there is",
+			got, wantGeneric, seamWireDoor)
+	}
+
+	// and over the real scan, where what matters is that the chain grew past its seed, that it
+	// reached the encode method at the far end of it, and that every frame it found is one the go
+	// tool compiles into a shipped binary rather than into the test one.
+	scan := mustScanSources(t, forbiddenScanRoots)
+	parsed := []parsedSource{}
+	for _, path := range slices.Sorted(maps.Keys(scan.sourceTexts)) {
+		parsed = append(parsed, mustParseText(t, path, scan.sourceTexts[path]))
+	}
+	candidates := seamCandidatesIn(parsed)
+	doors := seamWireDoorsIn(candidates)
+	if len(doors.names) < 2 {
+		t.Fatalf("the chain read %v over the real scan; %s is a nil check and a delegation, so a door class holding its name alone is exactly the reading three production forges walked under",
+			slices.Sorted(maps.Keys(doors.names)), seamWireDoor)
+	}
+	if doors.generic[seamWireDoor] {
+		t.Errorf("%s is read as a generic door, and it takes the door type and nothing else; a body that names it has put a whole message on the wire and needs nothing said beside it",
+			seamWireDoor)
+	}
+	if len(doors.generic) == 0 {
+		t.Errorf("no derived door is read as generic, so the door type named in a body is doing no work; every frame under the wrapper serializes any wire type it is handed, and reading them as specific bans this package's own fragment serializers")
+	}
+	encoders := 0
+	for _, candidate := range candidates {
+		if candidate.receiver == seamWireDoorType && doors.names[candidate.bare] {
+			encoders += 1
+		}
+	}
+	if encoders == 0 {
+		t.Errorf("no method of %s is read as a door. The innermost frame answers no octets -- it writes them into a writer it was handed -- so a chain walked along answers alone stops one frame short of it, and a forge calling it directly is the third of the three that survived",
+			seamWireDoorType)
+	}
+	for _, door := range slices.Sorted(maps.Keys(doors.names)) {
+		shipped := false
+		for _, candidate := range candidates {
+			if candidate.bare == door && !strings.HasSuffix(candidate.file, "_test.go") {
+				shipped = true
+			}
+		}
+		if !shipped {
+			t.Errorf("%s is read as a door and the scan declares it in no production file; the chain is walking the test binary, and a door only the test binary has is one no shipped forge can reach",
+				door)
+		}
+	}
+	t.Logf("%d door(s) beneath %s, %d of them generic: %v", len(doors.names), seamWireDoor,
+		len(doors.generic), slices.Sorted(maps.Keys(doors.names)))
+}
+
+// TestTheConstructionBypassSeamGateReadsAForgeThatGoesUnderTheWrapper is the regression itself,
+// named rather than left to the roster above.
+//
+// Three production forges survived the gate at HEAD, and all three go UNDER MarshalMLSMessage:
+// syntax.Marshal called directly over an assembled message, the same written over a carrier in
+// receiver position, and (*MLSMessage).MarshalMLS driven by hand with the caller taking the octets
+// out of the writer. Each emits what the sanctioned door emits, to the byte. The roster test above
+// fails if any of them stops being read, and this one says WHICH shapes and why, so a reader who
+// breaks it is sent to the finding rather than to a list.
+func TestTheConstructionBypassSeamGateReadsAForgeThatGoesUnderTheWrapper(t *testing.T) {
+	names := seamNamesOf(constructionBypassSeamsIn([]parsedSource{
+		mustParseText(t, "seam_control.go", constructionBypassSeamControl)}))
+	for _, forge := range []string{
+		"forgesUnderTheWrapper",
+		"AuthenticatedContent.forgesUnderTheWrapperFromItsReceiver",
+		"forgesThroughTheEncodeMethod",
+	} {
+		if !slices.Contains(names, forge) {
+			t.Errorf("the matcher read %v and not %s, which puts the same octets on the wire as %s does one frame up; the door is a spelling again",
+				names, forge, seamWireDoor)
+		}
+	}
+}
+
 // TestTheConstructionBypassSeamGateReadsAForgeInTheOtherRoot measures the reach the widened
 // scope was for.
 //
@@ -921,6 +1338,7 @@ func TestTheConstructionBypassSeamGateReadsItsControl(t *testing.T) {
 		mustParseText(t, "seam_control.go", constructionBypassSeamControl)})
 	want := []string{
 		"AuthenticatedContent.forgesFromItsReceiver",
+		"AuthenticatedContent.forgesUnderTheWrapperFromItsReceiver",
 		"FramedContentAuthData.forgesItselfOntoTheWire",
 		"FramedContentAuthData.marshalsAMessage",
 		"Group.forgesAsAMethod",
@@ -930,6 +1348,8 @@ func TestTheConstructionBypassSeamGateReadsItsControl(t *testing.T) {
 		"forgesTheAuthenticatorsOntoTheWire",
 		"forgesThroughAWrapper",
 		"forgesThroughAnAmbiguouslyNamedHelper",
+		"forgesThroughTheEncodeMethod",
+		"forgesUnderTheWrapper",
 	}
 	if !slices.Equal(seamNamesOf(seams), want) {
 		t.Fatalf("the matcher read %v out of the control, want %v; a positive it misses is a seam it would ship and a negative it sweeps in is the send path",

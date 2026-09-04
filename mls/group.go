@@ -743,6 +743,15 @@ func (self *Group) marshalState() ([]byte, error) {
 // putting each generated proposal through ValidateProposalList rather than by asserting over the
 // calls made here. A proposal this package refuses to validate is a finding about the generator.
 //
+// AND ONE GATE DOES ASSERT OVER THE CALLS, deliberately, because the sentence above is stated over
+// the four methods that exist rather than over the class of them.
+// TestEveryProposalGeneratorOnThisGroupSendsWhatItEmitsThroughItsOwnDoors derives that class --
+// every exported method of *Group that puts a message of content type proposal on the wire -- and
+// requires each member to reach ValidateProposalList. Measured, which is why it is here: a FIFTH
+// generator doing its own framing, signing, sealing and Store passes every dynamic obligation in
+// group_test.go while emitting a proposal these doors refuse, because those obligations are
+// reached through this method and it is not.
+//
 // EPOCH STATE IS UNTOUCHED. A proposal is a request and not a change: nothing below writes the
 // tree, the group context, the transcript or the key schedule, and the epoch a caller reads after
 // proposing is the epoch it read before. Two things DO move, and both are meant to. The sender's
