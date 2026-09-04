@@ -21,6 +21,7 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"testing"
@@ -857,5 +858,774 @@ func TestNewGroupCarriesTheExtensionsItsCreatorChose(t *testing.T) {
 	}
 	if err := leaf.Capabilities.Supports(required); err != nil {
 		t.Fatalf("the founding leaf does not support the capabilities its own group requires: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9420 section 12.1: proposal generation
+// ---------------------------------------------------------------------------
+
+// WHAT THE TESTS BELOW ARE BUILT AROUND. Proposal generation is the SENDING side of everything
+// validate_proposals.go, validate_commit.go and the proposal cache judge on the receiving side, so
+// the strongest thing that can be said about it is not that its output parses -- it is that this
+// package's own doors ACCEPT what this package produced. A generator that emits a proposal its own
+// validator refuses is a defect nothing downstream would report until a peer refused a commit, and
+// it is a defect this package can detect in one call. That is
+// TestEveryProposalThisGroupGeneratesIsAcceptedByItsOwnValidationDoors, and it is the reason the
+// fixtures here go to the trouble of giving the group a second leaf.
+//
+// The second entropy gate is here for the reason the creation one is, one file section up: an
+// Update exists to publish a FRESH encryption key and nothing else, and a constant in place of that
+// draw still derives, still seals, still validates and still round trips. So the key is found again
+// in the draws the provider was asked for rather than asserted over the line that made it.
+
+// pendingProposalsForTest exposes this epoch's proposal cache to tests in this package.
+//
+// Declared here and not in group.go, which is framing_group_seams_test.go's precedent one file
+// over: it is scaffolding no production caller has, and a helper spelled ForTest in the shipped
+// source is a method every later reader has to work out is not part of the API.
+//
+// It reads through Cached rather than off the cache's map, because Pending answers REFERENCES and
+// the entry behind one belongs to this epoch only if the cache is still bound to it -- which is the
+// question Cached asks and a map lookup does not.
+func (self *Group) pendingProposalsForTest() []CachedProposal {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	out := []CachedProposal{}
+	for _, entry := range self.proposals.Pending(self.context) {
+		if cached, held := self.proposals.Cached(self.context, entry.Reference); held {
+			out = append(out, cached)
+		}
+	}
+	return out
+}
+
+// testGroupWithASecondLeaf splices one more member into a founded group's ratchet tree and rebuilds
+// its secret tree at the new width.
+//
+// IT EDITS THE GROUP'S OWN STATE ON PURPOSE and it is not a stand-in for task 13's commit: the
+// group context still names the one-leaf tree hash, and this is not a group two clients could
+// agree on. What it makes real is exactly the two facts the tests below cannot do without.
+//
+// The first is that a leaf OTHER than our own is occupied, so ProposeRemove has a member to name,
+// ValSem108 has one to find and ValSem111 has a committer that is not the updating sender. Every
+// one of those rules is stated over a second member, and a one-member group cannot observe any of
+// them.
+//
+// The second is that the SECRET TREE carries a ratchet at that leaf. Without it a proposal
+// misattributed to leaf 1 fails inside the key source with "leaf out of range", so the sender
+// attribution test would report a failure it never actually observed -- the message would not
+// exist to be attributed. With it, a misattributed proposal is a well formed message, which is the
+// input that test's name claims to judge.
+func testGroupWithASecondLeaf(t *testing.T, crypto CryptoProvider, group *Group, m *testMember) LeafIndex {
+	t.Helper()
+	leaf, _ := testLeafNode(t, crypto, m)
+	at, err := group.tree.AddLeaf(leaf)
+	if err != nil {
+		t.Fatalf("add %s's leaf to the group's tree: %v", m.Name, err)
+	}
+	if at == group.OwnLeafIndex() {
+		t.Fatalf("%s landed at the group's own leaf %d, so this fixture added nothing", m.Name, at)
+	}
+	secretTree, err := NewSecretTree(crypto, group.tree.LeafWidth(), group.schedule.Secrets().Encryption)
+	if err != nil {
+		t.Fatalf("rebuild the secret tree at %d leaves: %v", group.tree.LeafWidth(), err)
+	}
+	group.secretTree.Zeroize()
+	group.secretTree = secretTree
+	return at
+}
+
+// testOpenOwnProposal opens a message this group sealed, the way a PEER would.
+//
+// A RECEIVER'S OWN RATCHET AND NOT THE SENDER'S, which is the whole reason this is not two lines.
+// NextMessageKey CONSUMES, so the generation a proposal was sealed under is already spent in the
+// group's own secret tree; a peer derives the same ratchet from the same encryption secret, and
+// rebuilding one here is what lets these tests read what was actually sent rather than what the
+// sender happens to still hold.
+//
+// The signature key is resolved out of the group's own tree at the leaf the SENDER DATA names, so
+// a message attributed to a leaf its signer does not occupy fails the signature check exactly as it
+// would at a peer.
+func testOpenOwnProposal(t *testing.T, crypto CryptoProvider, group *Group, encoded []byte) *AuthenticatedContent {
+	t.Helper()
+	parsed, err := ParseMLSMessage(encoded)
+	if err != nil {
+		t.Fatalf("ParseMLSMessage: %v", err)
+	}
+	if parsed.WireFormat != WireFormatPrivateMessage {
+		t.Fatalf("wire format = %#x, want PrivateMessage: A-ASSUME-4 puts handshake traffic in PrivateMessage",
+			parsed.WireFormat)
+	}
+	if parsed.PrivateMessage == nil {
+		t.Fatal("the message names PrivateMessage and carries no private message arm")
+	}
+	receiver, err := NewSecretTree(crypto, group.tree.LeafWidth(), group.schedule.Secrets().Encryption)
+	if err != nil {
+		t.Fatalf("build the receiver's secret tree: %v", err)
+	}
+	groupContext, err := group.GroupContext()
+	if err != nil {
+		t.Fatalf("GroupContext: %v", err)
+	}
+	resolve := func(sender Sender) (SignaturePublicKey, error) {
+		leaf := group.tree.Leaf(sender.LeafIndex)
+		if leaf == nil {
+			return nil, fmt.Errorf("no leaf at %d", sender.LeafIndex)
+		}
+		return leaf.SignatureKey, nil
+	}
+	opened, err := OpenPrivateMessage(crypto, receiver, group.schedule.Secrets().SenderData,
+		parsed.PrivateMessage, resolve, groupContext)
+	if err != nil {
+		t.Fatalf("OpenPrivateMessage: %v", err)
+	}
+	return opened
+}
+
+// proposalGeneratorRow is one kind of proposal this group can generate, plus the leaf a commit
+// carrying it would be made by.
+//
+// THE COMMITTER IS PART OF THE ROW because it is part of the rule. RFC 9420 section 12.2 refuses a
+// commit that covers its own sender's Update -- the committer's leaf is reset by the UpdatePath
+// instead -- so an update is judged under ANOTHER member's commit, and a row that named the
+// updating leaf would be asserting that this package accepts something it is required to refuse.
+type proposalGeneratorRow struct {
+	name      string
+	kind      ProposalType
+	committer LeafIndex
+	propose   func() ([]byte, error)
+}
+
+// proposalGeneratorRows is every proposal kind (*Group) can generate, which is the accepted set of
+// the v1 profile's own proposal table.
+//
+// The rows are checked against that table in both directions by the sweep that uses them, so a
+// fifth accepted type with no generator and a generator for a type the profile no longer accepts
+// both fail rather than going unnoticed.
+func proposalGeneratorRows(t *testing.T, crypto CryptoProvider, group *Group,
+	joinerKeyPackage []byte, other LeafIndex, extensions []Extension) []proposalGeneratorRow {
+
+	t.Helper()
+	own := group.OwnLeafIndex()
+	return []proposalGeneratorRow{
+		{name: "add", kind: ProposalTypeAdd, committer: own, propose: func() ([]byte, error) {
+			return group.ProposeAdd(joinerKeyPackage)
+		}},
+		{name: "remove", kind: ProposalTypeRemove, committer: own, propose: func() ([]byte, error) {
+			return group.ProposeRemove(other)
+		}},
+		{name: "group_context_extensions", kind: ProposalTypeGroupContextExtensions, committer: own,
+			propose: func() ([]byte, error) {
+				return group.ProposeGroupContextExtensions(extensions)
+			}},
+		{name: "update", kind: ProposalTypeUpdate, committer: other, propose: func() ([]byte, error) {
+			return group.ProposeUpdate()
+		}},
+	}
+}
+
+// testProposalGenerationFixture founds a group with a second member, mints a joiner's key package
+// and answers everything the two sweeps below drive.
+func testProposalGenerationFixture(t *testing.T) (CryptoProvider, *Group, []proposalGeneratorRow) {
+	t.Helper()
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	t.Cleanup(func() { group.Close() })
+	other := testGroupWithASecondLeaf(t, crypto, group, testIdentity(t, crypto, "bob"))
+
+	joiner := testIdentity(t, crypto, "carol")
+	kp, _, _ := testKeyPackage(t, crypto, joiner)
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal the joiner's key package: %v", err)
+	}
+	// the group's OWN published extensions, re-proposed. A group context extensions proposal
+	// replaces the list wholesale, so this is the smallest one a real caller could send: a list
+	// that still carries the policy the group runs under.
+	published := testGroupContextOf(t, group).Extensions
+	rows := proposalGeneratorRows(t, crypto, group, encoded, other, published)
+
+	// the rows ARE the accepted set of the profile's proposal table, in both directions. A fifth
+	// accepted type with no generator would be a proposal kind these sweeps never judged, and a
+	// generator for a type the profile no longer accepts would be a row that outlived its rule.
+	generated := map[ProposalType]bool{}
+	for _, row := range rows {
+		if generated[row.kind] {
+			t.Fatalf("two rows generate %s", proposalTypeName(row.kind))
+		}
+		generated[row.kind] = true
+	}
+	for kind, refusal := range proposalTypeProfile {
+		if refusal == nil && !generated[kind] {
+			t.Errorf("the v1 profile accepts %s and no row generates one, so nothing here judges it",
+				proposalTypeName(kind))
+		}
+		if refusal != nil && generated[kind] {
+			t.Errorf("a row generates %s, which the v1 profile refuses", proposalTypeName(kind))
+		}
+	}
+	return crypto, group, rows
+}
+
+// TestEveryProposalThisGroupGeneratesIsAcceptedByItsOwnValidationDoors is the gate this task's
+// whole design rests on.
+//
+// The receive path of this package holds ValSem101-113, section 12.1.2's two rules on an Update's
+// leaf, and section 12.2's three list rules. Every one of them is a rule the SENDING side must not
+// violate, and a generator that emits a proposal its own validator refuses is a defect that shows
+// up as a peer refusing a commit, several steps and one epoch away from the line that caused it.
+//
+// It is written over ValidateProposalList and not over an assertion about what the generator does,
+// because the whole point is that the two are independent: the generator gets to be right for its
+// own reasons and the validator gets to judge it for the RFC's.
+//
+// A ONE ENTRY LIST PER ROW, deliberately. This is a claim about each proposal on its own; the
+// cross-proposal rules -- two adds publishing one key, an update and a remove on one leaf -- are
+// about a LIST somebody assembled and are validate_proposals.go's own tests to make.
+func TestEveryProposalThisGroupGeneratesIsAcceptedByItsOwnValidationDoors(t *testing.T) {
+	crypto, group, rows := testProposalGenerationFixture(t)
+	context := testGroupContextOf(t, group)
+	for _, row := range rows {
+		before := len(group.pendingProposalsForTest())
+		if _, err := row.propose(); err != nil {
+			t.Fatalf("%s: %v", row.name, err)
+		}
+		cached := group.pendingProposalsForTest()
+		if len(cached) != before+1 {
+			t.Fatalf("%s: the cache held %d entries before and %d after, so this row has no entry to judge",
+				row.name, before, len(cached))
+		}
+		one := cached[len(cached)-1]
+		if one.Proposal.ProposalType != row.kind {
+			t.Fatalf("%s: the cache's newest entry is a %s", row.name,
+				proposalTypeName(one.Proposal.ProposalType))
+		}
+		in := &ProposalValidationInput{
+			Crypto:    crypto,
+			Tree:      group.tree,
+			Context:   context,
+			Committer: row.committer,
+			List:      NewProposalList([]CachedProposal{one}),
+			Now:       time.Now(),
+		}
+		if err := ValidateProposalList(in); err != nil {
+			t.Errorf("%s: this group generated a proposal its own ValidateProposalList refuses: %v",
+				row.name, err)
+		}
+		// AND, FOR THE PROPOSAL THAT INSTALLS AN EXTENSION SET, THE COMMIT DOOR'S OWN READ OF IT.
+		// ValSem209 is not one of section 12.2's list rules and ValidateProposalList does not run
+		// it, so a generator held to the list rules alone is held to strictly less than a receiver
+		// applies. Measured: without this the generator published a set carrying
+		// required_capabilities twice -- which every list rule accepts, because none of them looks
+		// that body up, and which ValSem209 refuses because it reads it through the lookup.
+		if row.kind != ProposalTypeGroupContextExtensions {
+			continue
+		}
+		commitIn := testCommitInput(t, crypto, group.tree, in.List, &Commit{})
+		commitIn.Context = context
+		commitIn.Committer = row.committer
+		commitIn.Own = group.OwnLeafIndex()
+		// erratum 8815 runs at the commit door and asks whether every reference the commit names
+		// was previously received; the entry this row just cached is where that answer comes from
+		commitIn.Pending = group.proposals
+		commitIn.Now = time.Now()
+		if err := ValSem209GroupExtensionsSupported(commitIn); err != nil {
+			t.Errorf("%s: this group generated an extension set its own ValSem209 refuses: %v",
+				row.name, err)
+		}
+	}
+}
+
+// TestEveryProposalThisGroupGeneratesNamesItsOwnLeafAsSender reads the sender out of what was
+// actually SENT.
+//
+// The sender is the one field of a proposal nothing else can supply. It travels in the encrypted
+// sender data, so a peer learns it from the message and from nowhere else; ValSem111 compares it
+// against the committer, section 12.1.2 rebuilds the update leaf's own preimage from it, and the
+// cache keys its per sender ceilings on it. A generator that attributed its proposals to another
+// leaf would produce messages that decrypt, parse and carry a perfectly good proposal -- and every
+// rule stated over a sender would then be a rule about somebody else.
+//
+// Both readings are taken and they are different claims: the CACHE's attribution is what this
+// client's own commit path will use, and the MESSAGE's is what every peer will use. A generator
+// that got one right and the other wrong would be a group whose commit says one thing and whose
+// wire says another.
+func TestEveryProposalThisGroupGeneratesNamesItsOwnLeafAsSender(t *testing.T) {
+	crypto, group, rows := testProposalGenerationFixture(t)
+	own := group.OwnLeafIndex()
+	for _, row := range rows {
+		message, err := row.propose()
+		if err != nil {
+			t.Fatalf("%s: %v", row.name, err)
+		}
+		cached := group.pendingProposalsForTest()
+		one := cached[len(cached)-1]
+		if one.Sender != own {
+			t.Errorf("%s: the cache attributed this proposal to leaf %d and this client is leaf %d",
+				row.name, one.Sender, own)
+		}
+		opened := testOpenOwnProposal(t, crypto, group, message)
+		if opened.Content.Sender.SenderType != SenderTypeMember {
+			t.Errorf("%s: sender type = %d, want member", row.name, opened.Content.Sender.SenderType)
+		}
+		if opened.Content.Sender.LeafIndex != own {
+			t.Errorf("%s: the message names leaf %d as its sender and this client is leaf %d",
+				row.name, opened.Content.Sender.LeafIndex, own)
+		}
+		if !bytes.Equal(opened.Content.GroupId, group.GroupId()) {
+			t.Errorf("%s: the message names group %x and this group is %x",
+				row.name, opened.Content.GroupId, group.GroupId())
+		}
+		if opened.Content.Epoch != group.Epoch() {
+			t.Errorf("%s: the message names epoch %d and this group is at %d",
+				row.name, opened.Content.Epoch, group.Epoch())
+		}
+		if opened.Content.ContentType != ContentTypeProposal {
+			t.Errorf("%s: content type = %d, want proposal", row.name, opened.Content.ContentType)
+		}
+		if opened.Content.Proposal == nil {
+			t.Fatalf("%s: the message carries no proposal arm", row.name)
+		}
+		if opened.Content.Proposal.ProposalType != row.kind {
+			t.Errorf("%s: the message carries a %s", row.name,
+				proposalTypeName(opened.Content.Proposal.ProposalType))
+		}
+	}
+}
+
+// TestProposingLeavesTheEpochAndTheOwnLeafAlone is the "a proposal is a request and not a change"
+// half.
+//
+// The own leaf is the reading that can fail on its own. An implementation that applied its own
+// Update as it proposed it would hold a leaf no peer has seen, publish a tree hash nothing agrees
+// with from the next commit onward, and answer every structural question correctly in between --
+// and the epoch, which is the obvious thing to check, would still be right.
+func TestProposingLeavesTheEpochAndTheOwnLeafAlone(t *testing.T) {
+	_, group, rows := testProposalGenerationFixture(t)
+	epoch := group.Epoch()
+	before := group.OwnLeafNodeCopy()
+	if before == nil {
+		t.Fatal("OwnLeafNodeCopy returned nil, so this test compares nothing")
+	}
+	members := len(group.Members())
+	for _, row := range rows {
+		if _, err := row.propose(); err != nil {
+			t.Fatalf("%s: %v", row.name, err)
+		}
+		if group.Epoch() != epoch {
+			t.Fatalf("%s: the epoch went from %d to %d; proposing is not an epoch change",
+				row.name, epoch, group.Epoch())
+		}
+		after := group.OwnLeafNodeCopy()
+		if after == nil {
+			t.Fatalf("%s: the group holds no leaf at its own index afterwards", row.name)
+		}
+		if !bytes.Equal(after.EncryptionKey, before.EncryptionKey) {
+			t.Fatalf("%s: this client's own leaf now publishes %x and published %x before; a proposal is not applied by the client that made it",
+				row.name, after.EncryptionKey, before.EncryptionKey)
+		}
+		if got := len(group.Members()); got != members {
+			t.Fatalf("%s: the group went from %d members to %d", row.name, members, got)
+		}
+	}
+}
+
+// TestProposeAddProducesACacheableProposal is the plan's own row, kept because it is the one that
+// reads the wire format.
+func TestProposeAddProducesACacheableProposal(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	bob := testIdentity(t, crypto, "bob")
+	kp, _, _ := testKeyPackage(t, crypto, bob)
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal key package: %v", err)
+	}
+	message, err := group.ProposeAdd(encoded)
+	if err != nil {
+		t.Fatalf("ProposeAdd: %v", err)
+	}
+	if len(message) == 0 {
+		t.Fatal("ProposeAdd returned no message")
+	}
+	parsed, err := ParseMLSMessage(message)
+	if err != nil {
+		t.Fatalf("ParseMLSMessage: %v", err)
+	}
+	if parsed.WireFormat != WireFormatPrivateMessage {
+		t.Fatalf("wire format = %#x, want PrivateMessage: A-ASSUME-4 puts handshake traffic in PrivateMessage",
+			parsed.WireFormat)
+	}
+	if group.Epoch() != 0 {
+		t.Fatal("proposing must not advance the epoch")
+	}
+	cached := group.pendingProposalsForTest()
+	if len(cached) != 1 {
+		t.Fatalf("the proposal was not cached: %d entries", len(cached))
+	}
+	if cached[0].Proposal.Add == nil {
+		t.Fatal("the cached entry carries no add arm")
+	}
+	// the KEY PACKAGE the caller handed over and not some other one, read off the cache's own
+	// copy: the entry is what a commit will carry, and an add that cached a different package
+	// admits a different client
+	if !bytes.Equal(cached[0].Proposal.Add.KeyPackage.InitKey, kp.InitKey) {
+		t.Fatalf("the cached add publishes init key %x and the key package handed over publishes %x",
+			cached[0].Proposal.Add.KeyPackage.InitKey, kp.InitKey)
+	}
+}
+
+// TestProposeAddRefusesAKeyPackageItsOwnValidatorWouldRefuse is the send side of section 10.1.
+//
+// The suite is flipped after the package was signed, which is the cheapest reachable refusal of
+// (*KeyPackage).Validate that is not the signature itself: version, then ciphersuite, then the
+// signature, so this row observes the SUITE clause specifically.
+func TestProposeAddRefusesAKeyPackageItsOwnValidatorWouldRefuse(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	bob := testIdentity(t, crypto, "bob")
+	kp, _, _ := testKeyPackage(t, crypto, bob)
+	kp.CipherSuite = CipherSuiteX25519AesGcm128Sha256Ed25519
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal key package: %v", err)
+	}
+	if _, err := group.ProposeAdd(encoded); !errors.Is(err, errProfileCiphersuite) {
+		t.Fatalf("ProposeAdd error = %v, want the ciphersuite refusal (*KeyPackage).Validate makes", err)
+	}
+	if cached := group.pendingProposalsForTest(); len(cached) != 0 {
+		t.Fatalf("a refused add cached %d entries", len(cached))
+	}
+}
+
+// TestProposeAddRefusesALeafWithNoWrapTarget is the v1 half of the same door, and it is not in
+// section 10.1 at all: every commit this profile makes wraps the epoch secret to
+// urmessage_leaf_keys, so a joiner whose leaf carries none is a member no epoch can reach.
+func TestProposeAddRefusesALeafWithNoWrapTarget(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	bob := testIdentity(t, crypto, "bob")
+	kp, _, _, err := NewKeyPackage(crypto, crypto.Suite(), BasicCredential(bob.IdentityPub),
+		testCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("NewKeyPackage with no extensions: %v", err)
+	}
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal key package: %v", err)
+	}
+	if _, err := group.ProposeAdd(encoded); !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("ProposeAdd error = %v, want the leaf keys refusal", err)
+	}
+}
+
+// TestProposeUpdateUsesAFreshEncryptionKey is the plan's own row: the property an Update exists
+// for, read off the cache's copy of what was published.
+func TestProposeUpdateUsesAFreshEncryptionKey(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	before := group.OwnLeafNodeCopy()
+	if before == nil {
+		t.Fatal("OwnLeafNodeCopy returned nil")
+	}
+	if _, err := group.ProposeUpdate(); err != nil {
+		t.Fatalf("ProposeUpdate: %v", err)
+	}
+	cached := group.pendingProposalsForTest()
+	if len(cached) != 1 {
+		t.Fatalf("cached = %d, want 1", len(cached))
+	}
+	if cached[0].Proposal.Update == nil {
+		t.Fatal("the cached entry carries no update arm")
+	}
+	updated := cached[0].Proposal.Update.LeafNode
+	if bytes.Equal(updated.EncryptionKey, before.EncryptionKey) {
+		t.Fatal("an update that reuses the leaf's encryption key provides no post compromise security")
+	}
+	if updated.LeafNodeSource != LeafNodeSourceUpdate {
+		t.Fatalf("leaf_node_source = %d, want update", updated.LeafNodeSource)
+	}
+	// the SIGNATURE is over the update variant's own preimage, which carries the group id and the
+	// leaf index a key_package leaf's does not. A leaf signed with nil and 0 verifies against
+	// itself and against no receiver, and nothing about the value says which it was.
+	if err := updated.VerifySignature(crypto, group.GroupId(), group.OwnLeafIndex()); err != nil {
+		t.Fatalf("the update leaf does not verify in this group at this leaf: %v", err)
+	}
+	// the private half is where a committer will look for it
+	priv, err := group.store.GetPrivateKey(updated.EncryptionKey)
+	if err != nil {
+		t.Fatalf("the update's private key was not filed under the key it publishes: %v", err)
+	}
+	if len(priv) == 0 {
+		t.Fatal("the store holds an empty private key for the update's encryption key")
+	}
+}
+
+// TestProposeUpdateDrawsItsEncryptionKeyFreshAndFromItsOwnDraw is the entropy gate, written against
+// what the proposal PUBLISHES rather than against the line that draws.
+//
+// Three defects it is built to see, each of which leaves the rest of this package green:
+//
+//  1. the draw replaced by a CONSTANT, or by any value this call did not draw -- the group id, the
+//     founding leaf's own ikm, a zero buffer. The key the proposal published is then not derivable
+//     from anything the provider was asked for, so the search below finds nothing.
+//  2. the draw REUSED from the group's founding, which is the substitution that makes an Update
+//     publish a key an attacker who compromised the founding already has. The founding draws are
+//     recorded before the call and are excluded explicitly.
+//  3. a draw made and THROWN AWAY. Every KDF.Nh draw this call made has to be the one the proposal
+//     published, so a second one is a failure here until somebody says what it is for.
+//
+// The four octet reuse guard SealPrivateMessage draws is not a KDF.Nh draw and is not part of that
+// accounting; it is the message's, not the leaf key's.
+func TestProposeUpdateDrawsItsEncryptionKeyFreshAndFromItsOwnDraw(t *testing.T) {
+	base := testCrypto(t)
+	owner := testIdentity(t, base, "owner")
+	witness := &entropyWitness{CryptoProvider: base}
+	cfg := testGroupConfig(t, witness, owner, "group-1")
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+
+	founding := len(witness.draws)
+	foundingIkms := len(witness.ikms)
+	if founding == 0 || foundingIkms == 0 {
+		t.Fatal("group creation recorded no draws, so the exclusion below excludes nothing")
+	}
+	if _, err := group.ProposeUpdate(); err != nil {
+		t.Fatalf("ProposeUpdate: %v", err)
+	}
+	drawn := witness.draws[founding:]
+	derived := witness.ikms[foundingIkms:]
+	if len(derived) != 1 {
+		t.Fatalf("ProposeUpdate derived %d key pairs, want the one the replacement leaf is keyed by",
+			len(derived))
+	}
+	at := drawIndexOf(drawn, derived[0])
+	if at < 0 {
+		t.Fatal("the update leaf's key pair was derived from something this call never drew")
+	}
+	if drawIndexOf(witness.draws[:founding], derived[0]) >= 0 {
+		t.Fatal("the update leaf's key pair was derived from a value this group was FOUNDED on; an update that republishes founding key material provides no post compromise security")
+	}
+	_, encPub, err := base.DeriveKeyPair(drawn[at])
+	if err != nil {
+		t.Fatalf("re-derive the update key pair: %v", err)
+	}
+	cached := group.pendingProposalsForTest()
+	if len(cached) != 1 || cached[0].Proposal.Update == nil {
+		t.Fatalf("the update was not cached: %d entries", len(cached))
+	}
+	if published := cached[0].Proposal.Update.LeafNode.EncryptionKey; !bytes.Equal(published, encPub) {
+		t.Fatalf("the update publishes %x and draw %d derives %x", published, at, encPub)
+	}
+	// and nothing of the leaf key's width was drawn that the proposal did not publish
+	for i, one := range drawn {
+		if i != at && len(one) == base.HashSize() {
+			t.Errorf("ProposeUpdate drew a second value of KDF.Nh at %d and published neither it nor anything derived from it; a draw nothing publishes is entropy this gate cannot follow",
+				i)
+		}
+	}
+}
+
+// TestTwoGroupsProposeUpdatesUnderDifferentKeys is the divergence half of the entropy claim, and it
+// sees one thing the gate above cannot: a draw that IS recorded and IS used and is nevertheless the
+// same value every time -- a provider stub, a seeded source, a package level buffer.
+func TestTwoGroupsProposeUpdatesUnderDifferentKeys(t *testing.T) {
+	crypto := testCrypto(t)
+	keys := [][]byte{}
+	for _, name := range []string{"owner-a", "owner-b"} {
+		owner := testIdentity(t, crypto, name)
+		group := testNewGroup(t, crypto, owner, "group-1")
+		if _, err := group.ProposeUpdate(); err != nil {
+			t.Fatalf("%s: ProposeUpdate: %v", name, err)
+		}
+		cached := group.pendingProposalsForTest()
+		if len(cached) != 1 || cached[0].Proposal.Update == nil {
+			t.Fatalf("%s: the update was not cached", name)
+		}
+		keys = append(keys, bytes.Clone(cached[0].Proposal.Update.LeafNode.EncryptionKey))
+		group.Close()
+	}
+	if bytes.Equal(keys[0], keys[1]) {
+		t.Fatalf("two groups proposed updates publishing the same encryption key %x", keys[0])
+	}
+}
+
+// TestProposeUpdateIsRefusedTwiceInOneEpoch is the section 12.2 ceiling read from the sending side.
+//
+// One sender contributes at most ONE committable update however many it publishes, because an
+// update applies to its own sender's leaf and section 12.2 refuses a list carrying two proposals
+// that apply to one leaf. A generator that cached a second would be filling this epoch's cache with
+// entries its own commit path cannot carry.
+func TestProposeUpdateIsRefusedTwiceInOneEpoch(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	if _, err := group.ProposeUpdate(); err != nil {
+		t.Fatalf("the first ProposeUpdate: %v", err)
+	}
+	if _, err := group.ProposeUpdate(); err == nil {
+		t.Fatal("a second update in one epoch was accepted; section 12.2 admits one update per sender per commit")
+	}
+	if cached := group.pendingProposalsForTest(); len(cached) != 1 {
+		t.Fatalf("the cache holds %d updates, want 1", len(cached))
+	}
+}
+
+// TestProposeRemoveRefusesOwnLeaf is the plan's own row.
+//
+// The refusal is about this client's CACHE and not about RFC 9420: section 12.1.3's leave flow is a
+// member sending a Remove for its own leaf. What this build has no room for is CACHING one, because
+// task 13 commits what the cache holds and validateCommitterIsNotRemoved refuses that commit at
+// every receiver.
+func TestProposeRemoveRefusesOwnLeaf(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+	if _, err := group.ProposeRemove(group.OwnLeafIndex()); !errors.Is(err, ErrRemoveCommitter) {
+		t.Fatalf("ProposeRemove error = %v, want the committer-removal refusal", err)
+	}
+	if cached := group.pendingProposalsForTest(); len(cached) != 0 {
+		t.Fatalf("a refused self remove cached %d entries", len(cached))
+	}
+}
+
+// TestProposeRemoveRefusesALeafTheTreeDoesNotHold is ValSem108 asked at generation time: a caller
+// that named a member who has already been removed, or a leaf beyond the tree, learns it from the
+// call it made rather than from a commit nobody accepts.
+func TestProposeRemoveRefusesALeafTheTreeDoesNotHold(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+	if _, err := group.ProposeRemove(LeafIndex(7)); !errors.Is(err, ErrRemoveNonMember) {
+		t.Fatalf("ProposeRemove error = %v, want ErrRemoveNonMember", err)
+	}
+}
+
+// TestProposeGroupContextExtensionsRefusesProfileViolation is the plan's own row, against the
+// package's real sentinel: errProfileExternalSender is the stand-in p8's Profile will export, and
+// validate_commit.go declares it once for both the sending and the receiving side of ValSem209.
+func TestProposeGroupContextExtensionsRefusesProfileViolation(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+	bad := []Extension{{ExtensionType: ExtensionTypeExternalSenders, ExtensionData: []byte{}}}
+	if _, err := group.ProposeGroupContextExtensions(bad); !errors.Is(err, errProfileExternalSender) {
+		t.Fatalf("ProposeGroupContextExtensions error = %v, want errProfileExternalSender", err)
+	}
+	if cached := group.pendingProposalsForTest(); len(cached) != 0 {
+		t.Fatalf("a refused extension set cached %d entries", len(cached))
+	}
+}
+
+// TestProposeGroupContextExtensionsRefusesAnExtensionSetWithNoPolicy is the second door, and it is
+// this profile's rather than the RFC's. A group here always carries a urmessage_group_policy, so a
+// wholesale replacement that drops it is a group with no owner and no roles -- which nothing
+// downstream reports until the first message that needed one.
+func TestProposeGroupContextExtensionsRefusesAnExtensionSetWithNoPolicy(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+	if _, err := group.ProposeGroupContextExtensions(nil); !errors.Is(err, ErrNoGroupPolicy) {
+		t.Fatalf("ProposeGroupContextExtensions error = %v, want ErrNoGroupPolicy", err)
+	}
+}
+
+// TestProposeGroupContextExtensionsCopiesTheExtensionBodiesItWasHanded is the retention half, and
+// it is the class this package has now repaired twice at the other end of the same list.
+//
+// The proposal is SIGNED and CACHED, so a body the group went on sharing with its caller is a
+// proposal that changes after the signature was made over it -- and the signature goes on verifying
+// against the octets as they were, so nothing at the point of the write says anything at all.
+func TestProposeGroupContextExtensionsCopiesTheExtensionBodiesItWasHanded(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	handed := testGroupContextOf(t, group).Extensions
+	if len(handed) == 0 {
+		t.Fatal("the group publishes no extensions, so this test scribbles nothing")
+	}
+	if _, err := group.ProposeGroupContextExtensions(handed); err != nil {
+		t.Fatalf("ProposeGroupContextExtensions: %v", err)
+	}
+	cached := group.pendingProposalsForTest()
+	if len(cached) != 1 || cached[0].Proposal.GroupContextExtensions == nil {
+		t.Fatalf("the proposal was not cached: %d entries", len(cached))
+	}
+	kept := [][]byte{}
+	for _, ext := range cached[0].Proposal.GroupContextExtensions.Extensions {
+		kept = append(kept, bytes.Clone(ext.ExtensionData))
+	}
+	scribbled := 0
+	for _, ext := range handed {
+		for i := range ext.ExtensionData {
+			ext.ExtensionData[i] ^= 0xff
+			scribbled += 1
+		}
+	}
+	if scribbled == 0 {
+		t.Fatal("every extension handed over had an empty body, so nothing was scribbled")
+	}
+	for at, ext := range cached[0].Proposal.GroupContextExtensions.Extensions {
+		if !bytes.Equal(ext.ExtensionData, kept[at]) {
+			t.Errorf("extension %d of the cached proposal held %x before its caller wrote into its own array and %x afterwards",
+				at, kept[at], ext.ExtensionData)
+		}
+	}
+}
+
+// TestAClosedGroupProposesNothing is the ender's half. A closed group has zeroized its schedule and
+// its secret tree, so a proposal path that reached either would be sealing under erased keys or
+// dereferencing nil -- and the answer a library gives there must be a refusal, not a panic.
+func TestAClosedGroupProposesNothing(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	bob := testIdentity(t, crypto, "bob")
+	kp, _, _ := testKeyPackage(t, crypto, bob)
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal key package: %v", err)
+	}
+	published := testGroupContextOf(t, group).Extensions
+	if err := group.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	rows := map[string]func() ([]byte, error){
+		"ProposeAdd":    func() ([]byte, error) { return group.ProposeAdd(encoded) },
+		"ProposeUpdate": group.ProposeUpdate,
+		"ProposeRemove": func() ([]byte, error) { return group.ProposeRemove(LeafIndex(1)) },
+		"ProposeGroupContextExtensions": func() ([]byte, error) {
+			return group.ProposeGroupContextExtensions(published)
+		},
+	}
+	for name, call := range rows {
+		if _, err := call(); !errors.Is(err, errGroupClosed) {
+			t.Errorf("%s on a closed group answered %v, want the closed refusal", name, err)
+		}
 	}
 }

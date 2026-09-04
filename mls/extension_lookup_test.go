@@ -511,6 +511,54 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"(*Group).ProposeGroupContextExtensions": {
+		what: "reads the type of EVERY entry of the extension set a caller wants installed and selects none. " +
+			"It is NewGroup's row at the other end of a group's life -- section 12.1.6's proposal replaces the " +
+			"group context's extensions wholesale, so the set is held to the v1 profile's group context set one " +
+			"entry at a time, and it is the SENDING side of the gate ValSem209 applies to the same proposal on " +
+			"arrival. A repeated type is not a question it answers: both entries are judged and both must be " +
+			"admitted here, and the doors that refuse the repeat are the lookups GroupPolicyOf and " +
+			"requiredCapabilitiesOf reach one statement later -- the same two ValSem209 reaches when it judges " +
+			"the same proposal on arrival, which is what keeps this method from publishing a set its own " +
+			"receiving side refuses. What matters is that the walk covers every entry, so an offending " +
+			"extension in the MIDDLE or at the END is refused rather than walked past",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			owner := testIdentity(t, crypto, "owner")
+			group := testNewGroup(t, crypto, owner, "group-1")
+			defer group.Close()
+			published := testGroupContextOf(t, group).Extensions
+			if len(published) == 0 {
+				t.Fatal("the group publishes no extensions, so neither probe below carries an admitted entry")
+			}
+			// the offending entry LAST, which is what separates "every entry" from "the first".
+			// urmessage_leaf_keys is a LEAF extension, so the v1 profile refuses it in a group
+			// context whichever position it sits in.
+			trailing := append(slices.Clone(published),
+				Extension{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{0x01}})
+			if _, err := group.ProposeGroupContextExtensions(trailing); !errors.Is(err, errProfileGroupExtension) {
+				t.Errorf("an extension set whose LAST entry is a leaf extension was proposed with %v, want errProfileGroupExtension; the profile rule is being applied to the first entry alone",
+					err)
+			}
+			// and the repeat is somebody else's rule. Both copies are admitted by the walk, and
+			// what refuses the proposal is a lookup one statement later.
+			//
+			// EVERY entry this group publishes is repeated in turn rather than the first one,
+			// which is the difference between a probe over a type an accessor happens to read and
+			// a probe over the set. Measured: repeating entry 0 -- required_capabilities -- was
+			// accepted, because GroupPolicyOf looks up the policy and nothing looked up the
+			// capabilities, so this method published a set ValSem209 refuses. The fix is in
+			// group.go and this loop is what would have found it.
+			for at := range published {
+				repeated := append(slices.Clone(published), published[at])
+				if _, err := group.ProposeGroupContextExtensions(repeated); !errors.Is(err, ErrMalformedExtension) {
+					t.Errorf("an extension set carrying entry %d (type %#04x) twice was proposed with %v, want ErrMalformedExtension; the repeat is a lookup's refusal and not this loop's",
+						at, uint16(published[at].ExtensionType), err)
+				}
+			}
+		},
+	},
 	"ValSem209GroupExtensionsSupported": {
 		what: "walks every extension a GroupContextExtensions proposal installs and applies the v1 profile gate " +
 			"to each, then section 13.4 and section 7.3 to every member the commit leaves in the group. It " +

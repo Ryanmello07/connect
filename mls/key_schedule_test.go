@@ -2951,8 +2951,8 @@ var groupMethodsTakingArguments = map[string]string{}
 // accessor that already answers secrets is the likeliest place for a leak to be written; the arm
 // that REFUSES a name outside the enum is not driven here, since a row that errors is a row this
 // sweep refuses to read, and TestEpochSecretAccessorIsClosed is what holds that arm.
-var groupMethodArgumentRows = map[string]func(group *Group) [][]reflect.Value{
-	"Export": func(group *Group) [][]reflect.Value {
+var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]reflect.Value{
+	"Export": func(t *testing.T, group *Group) [][]reflect.Value {
 		nh := group.crypto.HashSize()
 		return [][]reflect.Value{
 			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf([]byte(nil)), reflect.ValueOf(nh)},
@@ -2960,17 +2960,46 @@ var groupMethodArgumentRows = map[string]func(group *Group) [][]reflect.Value{
 			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
 		}
 	},
-	"EpochSecret": func(group *Group) [][]reflect.Value {
+	"EpochSecret": func(t *testing.T, group *Group) [][]reflect.Value {
 		return [][]reflect.Value{
 			{reflect.ValueOf(EpochSecretSenderData)},
 			{reflect.ValueOf(EpochSecretEncryption)},
 		}
 	},
-	"MemberAt": func(group *Group) [][]reflect.Value {
+	"MemberAt": func(t *testing.T, group *Group) [][]reflect.Value {
 		return [][]reflect.Value{
 			{reflect.ValueOf(group.OwnLeafIndex())},
 			{reflect.ValueOf(LeafIndex(1))},
 		}
+	},
+	// p7 task 12's three generators that take arguments; ProposeUpdate takes none and is called
+	// directly. Each is driven with the arguments a caller would use rather than into a refusal,
+	// for Export's reason: a call that answers an error hands this sweep no bytes at all, so a
+	// method swept over a refusal is a method swept in name only.
+	"ProposeAdd": func(t *testing.T, group *Group) [][]reflect.Value {
+		kp, _, _ := testKeyPackage(t, group.crypto,
+			testIdentity(t, group.crypto, "the joiner this sweep adds"))
+		encoded, err := syntax.Marshal(kp)
+		if err != nil {
+			t.Fatalf("marshal the key package this sweep adds: %v", err)
+		}
+		return [][]reflect.Value{{reflect.ValueOf(encoded)}}
+	},
+	"ProposeRemove": func(t *testing.T, group *Group) [][]reflect.Value {
+		// a remove names a leaf that is not our own, and the group this sweep reads has one
+		// member, so a second is spliced into the ratchet tree here
+		leaf, _ := testLeafNode(t, group.crypto,
+			testIdentity(t, group.crypto, "the member this sweep removes"))
+		at, err := group.tree.AddLeaf(leaf)
+		if err != nil {
+			t.Fatalf("splice a second leaf into the group this sweep reads: %v", err)
+		}
+		return [][]reflect.Value{{reflect.ValueOf(at)}}
+	},
+	"ProposeGroupContextExtensions": func(t *testing.T, group *Group) [][]reflect.Value {
+		// the group's own published extensions, which is the smallest wholesale replacement a
+		// real caller could send: one that still carries the policy the group runs under
+		return [][]reflect.Value{{reflect.ValueOf(testGroupContextOf(t, group).Extensions)}}
 	},
 }
 
@@ -3029,7 +3058,7 @@ func bytesTheGroupHandsOut(t *testing.T, at string, group *Group) []exposedSlice
 				t.Logf("%s: (*Group).%s not swept: %s", at, method.Name, reason)
 				continue
 			}
-			rows = build(group)
+			rows = build(t, group)
 			if len(rows) == 0 {
 				t.Fatalf("%s: groupMethodArgumentRows drives (*Group).%s with no rows at all, so it is swept in name only",
 					at, method.Name)

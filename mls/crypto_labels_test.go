@@ -756,6 +756,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"group.go: syntax.Marshal(required)",
 		"group.go: syntax.Marshal(self.context)",
 		"group.go: syntax.Marshal(self.context)",
+		// p7 task 12's proposal generation encodes the group context a THIRD time, and it is the
+		// same structure at the same limit for the same reason: these octets are inlined into a
+		// FramedContentTBS with no length prefix of their own, so a context this encoder accepted
+		// past MaxVectorLength is one no peer running the default limit could verify a signature
+		// over.
+		"group.go: syntax.Marshal(self.context)",
 		// the two encodes of the persisted state blob, at the RAISED limit, and here that is a
 		// capacity rather than an acceptance rule. These octets never travel: they are this
 		// client's own local state, read back only by the LoadGroup that wrote them, and the tree
@@ -766,6 +772,13 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"group.go: syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)",
 		"group.go: syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)",
 		"group.go: syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)",
+		// the key package a ProposeAdd is handed, decoded at the DEFAULT limit and not the raised
+		// one. These are octets a caller FETCHED -- from a directory, from a peer, from whatever
+		// this client's transport hands it -- so the limit here is an acceptance rule and not a
+		// capacity: a key package past MaxVectorLength is one no encoder of this package could
+		// have written and no peer running the default limit could have sent, and admitting one
+		// would mean advertising in a commit a structure every receiver refuses to decode.
+		"group.go: syntax.Unmarshal(keyPackage, &kp)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure

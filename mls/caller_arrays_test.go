@@ -93,6 +93,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // ---------------------------------------------------------------------------
@@ -1381,9 +1383,74 @@ func callerOwnedEncodedTree(t *testing.T) []byte {
 type groupAnswerRow struct {
 	name string
 	call func(group *Group) []any
+
+	// publishes is the part of what this row answers that a group founded on the SAME caller
+	// arguments is entitled to answer identically, and it is nil for every row whose WHOLE answer
+	// is that.
+	//
+	// The four proposal generators are the reason it exists. A proposal is sealed as an RFC 9420
+	// section 6.3 PrivateMessage: an AEAD ciphertext under a fresh reuse guard and a spent
+	// generation of the sender's own ratchet, so no two answers of one generator are equal and an
+	// equality over the whole of one says nothing about anything. What a generator publishes IN
+	// CLEARTEXT is the section 6.3 header, and the group id in it is exactly the octets a caller
+	// that kept its own array would corrupt. See publishingRowAcrossTwoFoundings.
+	publishes func(answers []any) []any
 }
 
-func groupAnswerRows() []groupAnswerRow {
+// groupProposalHeader is the projection the four generator rows are read through: the CLEARTEXT
+// group id of the PrivateMessage a generator answered.
+//
+// Section 6.3 leaves the group id outside the AEAD so that a receiver can pick the group before it
+// has decrypted anything, which is what makes it the one octet run of a proposal message two
+// foundings over one group id agree on. Everything else in the answer is ciphertext.
+//
+// A row that answered no message at all projects to nothing, and the gate below fails such a row
+// rather than passing it: a generator driven into a refusal is a row that observed nothing.
+func groupProposalHeader(answers []any) []any {
+	out := []any{}
+	for _, answer := range answers {
+		encoded, isBytes := answer.(*[]byte)
+		if !isBytes || len(*encoded) == 0 {
+			continue
+		}
+		parsed, err := ParseMLSMessage(*encoded)
+		if err != nil || parsed.PrivateMessage == nil {
+			continue
+		}
+		header := parsed.PrivateMessage.GroupId
+		out = append(out, &header)
+	}
+	return out
+}
+
+// groupAnswerKeyPackage mints the key package the ProposeAdd row admits, under the GROUP'S OWN
+// provider so that the suite it names is the suite the group runs.
+func groupAnswerKeyPackage(t *testing.T, group *Group) []byte {
+	t.Helper()
+	kp, _, _ := testKeyPackage(t, group.crypto, testIdentity(t, group.crypto, "the joiner this gate adds"))
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal the key package this gate adds: %v", err)
+	}
+	return encoded
+}
+
+// groupAnswerSecondLeaf splices one more member into the group's ratchet tree and answers its leaf,
+// so that the ProposeRemove row has a member to name.
+//
+// The RATCHET tree and not the secret tree, because a remove reads only the first: the message is
+// sealed under OUR leaf's ratchet whichever leaf it names.
+func groupAnswerSecondLeaf(t *testing.T, group *Group) LeafIndex {
+	t.Helper()
+	leaf, _ := testLeafNode(t, group.crypto, testIdentity(t, group.crypto, "the member this gate removes"))
+	at, err := group.tree.AddLeaf(leaf)
+	if err != nil {
+		t.Fatalf("splice a second leaf into the group this gate follows: %v", err)
+	}
+	return at
+}
+
+func groupAnswerRows(t *testing.T) []groupAnswerRow {
 	return []groupAnswerRow{
 		{name: "GroupId", call: func(group *Group) []any {
 			answer := group.GroupId()
@@ -1437,6 +1504,26 @@ func groupAnswerRows() []groupAnswerRow {
 			answer, err := group.GroupPolicy()
 			return []any{&answer, &err}
 		}},
+		// THE FOUR GENERATORS, each driven with the arguments a caller would use rather than into
+		// a refusal. groupAnswerDeclaresStorage reads their signatures as declaring byte storage,
+		// so a row driven into a refusal answers none and is reported as having observed nothing --
+		// which is the right report and not a shape to design around.
+		{name: "ProposeAdd", call: func(group *Group) []any {
+			answer, err := group.ProposeAdd(groupAnswerKeyPackage(t, group))
+			return []any{&answer, &err}
+		}, publishes: groupProposalHeader},
+		{name: "ProposeUpdate", call: func(group *Group) []any {
+			answer, err := group.ProposeUpdate()
+			return []any{&answer, &err}
+		}, publishes: groupProposalHeader},
+		{name: "ProposeRemove", call: func(group *Group) []any {
+			answer, err := group.ProposeRemove(groupAnswerSecondLeaf(t, group))
+			return []any{&answer, &err}
+		}, publishes: groupProposalHeader},
+		{name: "ProposeGroupContextExtensions", call: func(group *Group) []any {
+			answer, err := group.ProposeGroupContextExtensions(testGroupContextOf(t, group).Extensions)
+			return []any{&answer, &err}
+		}, publishes: groupProposalHeader},
 		// the ender gets a row like every other method, and every row gets a group of its own, so
 		// there is no member of the class this gate skipped for being inconvenient
 		{name: "Close", call: func(group *Group) []any {
@@ -1476,7 +1563,7 @@ func answerStorageOf(row groupAnswerRow, group *Group) *byteStorageFinder {
 // one, and it lands exactly here: the first call would answer fresh storage and keep it, and every
 // call after that would hand out the group's own.
 func TestNoAnswerOfAGroupSharesStorageWithIt(t *testing.T) {
-	for _, row := range groupAnswerRows() {
+	for _, row := range groupAnswerRows(t) {
 		group := mustFoundedGroup(t)
 		held := byteStorageFoundIn(reflect.ValueOf(group), "group", byteStorageInside)
 		if len(held.unfollowed) != 0 {
@@ -1518,7 +1605,7 @@ func TestNoAnswerOfAGroupSharesStorageWithIt(t *testing.T) {
 	}
 	// and the rows are *Group's method set rather than the methods somebody thought of
 	covered := []string{}
-	for _, row := range groupAnswerRows() {
+	for _, row := range groupAnswerRows(t) {
 		covered = append(covered, row.name)
 	}
 	declared := []string{}
@@ -1549,7 +1636,13 @@ func TestNoAnswerOfAGroupSharesStorageWithIt(t *testing.T) {
 // The class of things asked is the SAME rows the hand-out gate uses, so there is one list of what a
 // group publishes rather than two that can drift apart.
 func TestAGroupGoesOnPublishingWhatItWasFoundedOn(t *testing.T) {
-	for _, row := range groupAnswerRows() {
+	for _, row := range groupAnswerRows(t) {
+		// a row whose answer is fresh on every call cannot be read by asking one group twice; see
+		// publishingRowAcrossTwoFoundings for what replaces the two calls and why
+		if row.publishes != nil {
+			publishingRowAcrossTwoFoundings(t, row)
+			continue
+		}
 		cfg, signer, cred := callerOwnedGroupArguments(t)
 		owned := newByteStorageFinder(byteStorageOutside)
 		owned.walk(reflect.ValueOf(cfg), "cfg", "cfg", 0)
@@ -1580,6 +1673,84 @@ func TestAGroupGoesOnPublishingWhatItWasFoundedOn(t *testing.T) {
 			}
 		}
 		group.Close()
+	}
+}
+
+// publishedStorageOf walks what one row PUBLISHES: its whole answer for a row with no projection,
+// and the projection for a row that carries one.
+func publishedStorageOf(row groupAnswerRow, group *Group) *byteStorageFinder {
+	answers := row.call(group)
+	if row.publishes != nil {
+		answers = row.publishes(answers)
+	}
+	finder := newByteStorageFinder(byteStorageAnswer)
+	for at, answer := range answers {
+		how := fmt.Sprintf("%s() publishes %d", row.name, at)
+		finder.walk(reflect.ValueOf(answer), how, how, 0)
+	}
+	return finder
+}
+
+// publishingRowAcrossTwoFoundings reads "a group goes on publishing what it was founded on" for a
+// row whose method answers something FRESH on every call.
+//
+// TWO GROUPS AND NOT TWO CALLS, and the reason is the methods rather than a convenience. Three of
+// the four generators may be asked only once per epoch -- RFC 9420 section 12.2 admits one update
+// and one group_context_extensions proposal per sender and one remove per target, and the proposal
+// cache enforces all three -- so a second call on one group answers a REFUSAL, and a gate that read
+// the difference between a message and a refusal as a finding would report one against a group that
+// is entirely correct.
+//
+// So the two readings come from two groups founded from two argument sets callerOwnedGroupArguments
+// builds identically, and the comparison is over the row's PROJECTION: the part of the answer two
+// such foundings are entitled to agree on, which for a proposal is the cleartext group id and
+// nothing else. One caller then writes into its own arrays before its group is asked. A group that
+// KEPT what it was handed publishes the scribble; a group that copied it publishes what it was
+// founded on. Measured against NewGroup with its group id clone removed, this row fails.
+//
+// The pristine reading is required to be non-empty, so a row driven into a refusal -- which
+// projects to nothing -- cannot report the clean run a correct row reports.
+func publishingRowAcrossTwoFoundings(t *testing.T, row groupAnswerRow) {
+	t.Helper()
+	pristineCfg, pristineSigner, pristineCred := callerOwnedGroupArguments(t)
+	pristine, err := NewGroup(pristineCfg, pristineSigner, pristineCred)
+	if err != nil {
+		t.Fatalf("%s: found the group this row reads unscribbled: %v", row.name, err)
+	}
+	defer pristine.Close()
+	before := publishedStorageOf(row, pristine).contents()
+	if len(before) == 0 {
+		t.Fatalf("%s: the row published nothing at all, so this comparison ran over nothing", row.name)
+	}
+
+	cfg, signer, cred := callerOwnedGroupArguments(t)
+	owned := newByteStorageFinder(byteStorageOutside)
+	owned.walk(reflect.ValueOf(cfg), "cfg", "cfg", 0)
+	owned.walk(reflect.ValueOf(&signer), "signer", "signer", 0)
+	owned.walk(reflect.ValueOf(&cred), "cred", "cred", 0)
+	if len(owned.found) == 0 {
+		t.Fatalf("%s: the walk over this group's arguments reached no storage, so this row scribbled nothing", row.name)
+	}
+	scribbled, err := NewGroup(cfg, signer, cred)
+	if err != nil {
+		t.Fatalf("%s: found the group this row reads scribbled: %v", row.name, err)
+	}
+	defer scribbled.Close()
+	for at, mine := range owned.found {
+		mine.scribble(byte(at) | 0x80)
+	}
+	after := publishedStorageOf(row, scribbled).contents()
+	for _, route := range slices.Sorted(maps.Keys(before)) {
+		if !slices.Equal(before[route], after[route]) {
+			t.Errorf("%s published %v at %s from a group whose caller left its own arrays alone, and %v from one whose caller wrote into them",
+				row.name, before[route], route, after[route])
+		}
+	}
+	for _, route := range slices.Sorted(maps.Keys(after)) {
+		if _, publishedBefore := before[route]; !publishedBefore {
+			t.Errorf("%s published nothing at %s from a group whose caller left its own arrays alone, and %v from one whose caller wrote into them",
+				row.name, route, after[route])
+		}
 	}
 }
 
@@ -1842,7 +2013,7 @@ func TestNoOctetAGroupHandsOutwardIsStorageItKeeps(t *testing.T) {
 		}
 	}
 
-	for _, row := range groupAnswerRows() {
+	for _, row := range groupAnswerRows(t) {
 		cfg, signer, cred := callerOwnedGroupArguments(t)
 		store := newRecordingStore()
 		cfg.Store = store

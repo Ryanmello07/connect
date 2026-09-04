@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/urnetwork/connect/mls/syntax"
 )
@@ -567,6 +568,27 @@ func (self *Group) EpochSecret(name EpochSecretName) ([]byte, error) {
 	return nil, fmt.Errorf("mls: epoch secret name %d is not in the closed enum", name)
 }
 
+// senderDataSecretLocked is EpochSecret's sender_data arm with the state lock already held, which
+// is membersLocked's relationship to Members one section up.
+//
+// It answers the schedule's OWN slice rather than a copy, because the one caller seals with it and
+// keeps nothing: EpochSecret copies because it hands the secret to somebody outside this package,
+// and a copy here would be a second live copy of an epoch secret for the length of a seal.
+//
+// IT IS A DECLARATION AND NOT AN INLINE READ, and that is worth writing down because it looks like
+// one. The labelled composition walk in labelled_composition_test.go taints every value read off a
+// field that carries a serialized structure -- self.schedule does, since
+// NewKeyScheduleFromEpochSecret is a producer in that walk -- and it taints through a method call
+// on the tainted receiver, so an inline self.schedule.Secrets().SenderData handed to
+// SealPrivateMessage reads there as the serialized GROUP CONTEXT arriving at a labelled field with
+// nothing bounding it. It is not that: it is KDF.Nh octets of ExpandWithLabel output, and it enters
+// the AEAD as a key derivation input rather than as a labelled field. A call into a declaration of
+// this package is a frame of its own to that walk, which is where the two stop being one value, and
+// this frame is walked in its turn rather than being a place the question is skipped.
+func (self *Group) senderDataSecretLocked() []byte {
+	return self.schedule.Secrets().SenderData
+}
+
 // RatchetTree returns the encoded public tree, for out-of-band Welcome delivery and for MASTER
 // section 8.2's per-epoch snapshot record.
 //
@@ -672,4 +694,372 @@ func (self *Group) marshalState() ([]byte, error) {
 	w.WriteOpaque(context)
 	w.WriteOpaque(tree)
 	return w.Bytes()
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9420 section 12.1: proposal generation
+// ---------------------------------------------------------------------------
+
+// THE FOUR METHODS BELOW ARE THE SENDING SIDE OF EVERY RULE THIS PACKAGE'S RECEIVE PATH ALREADY
+// ENFORCES, and that symmetry is the design rather than a property somebody hoped for.
+// validate_proposals.go holds ValSem101-113 and section 12.1.2's two rules on an Update's own leaf;
+// validate_commit.go holds ValSem200-209; (*ProposalCache).Store holds the v1 profile, the epoch
+// binding and section 12.2's ceilings. A generator that emitted a proposal any of those would
+// refuse is a client publishing a message its own package will not process, and the refusal arrives
+// at a PEER, one commit later, with nothing at the point of the mistake to point at.
+//
+// So a proposal built here goes through this package's own doors before it is returned:
+//
+//   - checkProposalProfile, before a single octet is signed;
+//   - the structure's own validator for the two kinds that carry one a peer will judge --
+//     (*KeyPackage).Validate for an add, GroupPolicyOf for a group context extension set;
+//   - and the CACHE, which re-runs the profile gate, checks the epoch binding and applies the
+//     per sender and per leaf ceilings.
+//
+// TestEveryProposalThisGroupGeneratesIsAcceptedByItsOwnValidationDoors is what holds the claim, by
+// putting each generated proposal through ValidateProposalList rather than by asserting over the
+// calls made here. A proposal this package refuses to validate is a finding about the generator.
+//
+// EPOCH STATE IS UNTOUCHED. A proposal is a request and not a change: nothing below writes the
+// tree, the group context, the transcript or the key schedule, and the epoch a caller reads after
+// proposing is the epoch it read before. Two things DO move, and both are meant to. The sender's
+// own message ratchet advances a generation, exactly as an application message would -- a proposal
+// is an ordinary PrivateMessage on the wire and is meant to be indistinguishable from one -- and
+// the proposal cache grows the entry a later commit will name.
+//
+// THE PROFILE IS defaultProfile() AND NOT ONE THE GROUP KEPT, which is this package's convention
+// and not an omission here. `profile` is an empty struct with one constructor, so every profile in
+// this build is the same value; validate_proposals.go, validate_commit.go and the cache all reach
+// for it the same way, and NewGroup is the single place a caller's *profile is read at all. When
+// p8 lands a Profile that actually carries state, that swap is a package-wide one and these are
+// two more of its call sites.
+
+// ProposeAdd proposes that the client holding keyPackage join the group.
+//
+// The key package is judged HERE and not only at commit time. That is the difference between a
+// caller learning that it fetched an expired, wrong-suite or wrongly signed package now, while it
+// still has the directory it fetched from in hand, and learning it from a peer's refusal of a
+// commit several steps later. Section 10.1's whole door is run rather than a version and suite
+// comparison written out again in this file, so a package this build would refuse to ADMIT is one
+// it also refuses to ADVERTISE.
+//
+// The clock is this client's own, for (*KeyPackage).Validate's stated reason: section 7.3 makes the
+// lifetime a MUST for a leaf a client is about to admit, and this is the moment it is admitted.
+//
+// The v1 wrap target is required as well, and it is not part of section 10.1. Every commit this
+// profile makes wraps the epoch's secret to urmessage_leaf_keys, so a joiner whose leaf carries
+// none is a member no epoch can ever reach -- and the first symptom of admitting one is a member
+// who cannot read anything, one commit after the commit that added them.
+func (self *Group) ProposeAdd(keyPackage []byte) ([]byte, error) {
+	self.stateLock.Lock()
+	crypto, suite, closed := self.crypto, self.context.CipherSuite, self.closed
+	self.stateLock.Unlock()
+	if closed {
+		return nil, errGroupClosed
+	}
+	// decoded rather than taken as a structure, because what a peer will hash into the
+	// KeyPackageRef and re-validate is these octets. syntax.Reader copies every opaque field it
+	// reads, so the value below shares no array with the caller's buffer.
+	var kp KeyPackage
+	if err := syntax.Unmarshal(keyPackage, &kp); err != nil {
+		return nil, err
+	}
+	if err := kp.Validate(crypto, suite, time.Now()); err != nil {
+		return nil, err
+	}
+	if _, err := LeafKeysOf(&kp.LeafNode); err != nil {
+		return nil, err
+	}
+	return self.propose(&Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: kp}})
+}
+
+// ProposeRemove proposes removing a leaf.
+//
+// REMOVING OUR OWN LEAF IS REFUSED, and the reason is what this method does with the proposal
+// rather than anything RFC 9420 forbids. Section 12.1.3's leave flow IS a member sending a Remove
+// for its own leaf and another member committing it, so the proposal itself is legitimate; what is
+// not legitimate is this client CACHING one. Every proposal generated here is stored in this
+// epoch's cache, and task 13's commit generation commits what the cache holds -- so a self remove
+// sitting in it is a proposal this client's own next commit would carry, and
+// validateCommitterIsNotRemoved refuses exactly that at every receiver. This plan has no leave
+// flow to hand such a proposal to instead, so the refusal is here and the gap is named rather than
+// left as a proposal that poisons the next commit.
+//
+// A leaf that is blank or outside the tree is ValSem108's refusal, asked at generation time under
+// ValSem108's own value: a caller that named a member who has already been removed learns it from
+// the call it made rather than from a commit nobody accepts.
+func (self *Group) ProposeRemove(leaf LeafIndex) ([]byte, error) {
+	self.stateLock.Lock()
+	own, closed := self.ownLeaf, self.closed
+	occupied := self.tree.Leaf(leaf) != nil
+	self.stateLock.Unlock()
+	if closed {
+		return nil, errGroupClosed
+	}
+	if leaf == own {
+		return nil, fmt.Errorf("%w: leaf %d is this client's own and a cached self remove is one this client's next commit would carry",
+			ErrRemoveCommitter, leaf)
+	}
+	if !occupied {
+		return nil, fmt.Errorf("%w: leaf %d", ErrRemoveNonMember, leaf)
+	}
+	return self.propose(&Proposal{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: leaf}})
+}
+
+// ProposeUpdate proposes replacing our own leaf with one holding a FRESH encryption key.
+//
+// THE FRESH KEY IS THE ENTIRE POINT OF THE PROPOSAL. An update that republished the key it
+// replaces would be accepted by everything structural about it -- the leaf validates, the signature
+// verifies, the tree still hashes -- and would provide no post compromise security at all, which is
+// the only thing an Update buys. Section 12.1.2 states it as a rule and this package answers it
+// with ErrUpdateEncryptionKeyUnchanged on the receive side; the draw below is the send side of the
+// same rule, and TestProposeUpdateDrawsItsEncryptionKeyFreshAndFromItsOwnDraw is what holds it, by
+// finding the published key again in the draws the provider was asked for rather than by asserting
+// over this line.
+//
+// THE LEAF IS BUILT HERE AND NOT THROUGH NewLeafNode, which mints the key_package variant. That
+// constructor fills in a Lifetime section 7.2's update arm does not carry and signs over a
+// LeafNodeTBS that excludes the group id and the leaf index, so its answer would have to be mutated
+// and re-signed anyway -- and a Lifetime left standing under a source whose encoding drops it is a
+// field the Go value carries and no peer ever sees. This is testUpdateLeafNodeNaming's shape, which
+// is the fixture every update this package validates is built from, and the Clone before the
+// signature is NewLeafNode's own discipline: a leaf that goes on sharing an array with anything is
+// a leaf that can change after it was signed.
+//
+// The device wrap key is read off the leaf being REPLACED and re-encoded, so an update publishes
+// the same urmessage_leaf_keys the group already wraps to. A member whose update quietly changed it
+// is a member the next commit wraps to a key it does not hold.
+func (self *Group) ProposeUpdate() ([]byte, error) {
+	var crypto CryptoProvider
+	var signer SignaturePrivateKey
+	var cred Credential
+	var groupId []byte
+	var at LeafIndex
+	var leafKeysExt Extension
+	var store StateStore
+	if err := func() error {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.closed {
+			return errGroupClosed
+		}
+		current := self.tree.Leaf(self.ownLeaf)
+		if current == nil {
+			return fmt.Errorf("%w: this group holds no leaf at its own index %d",
+				ErrTreeMalformed, self.ownLeaf)
+		}
+		keys, err := LeafKeysOf(current)
+		if err != nil {
+			return err
+		}
+		// re-encoded through the extension's own Encode, which answers the tag and the body
+		// together and answers them as FRESH storage. The parse above hands back a body cut from
+		// the tree's own extension, and a replacement leaf carrying that array would be a leaf
+		// with a window onto the ratchet tree this epoch's tree hash was taken over.
+		encoded, err := keys.Encode()
+		if err != nil {
+			return err
+		}
+		crypto, signer, at, store = self.crypto, self.signer, self.ownLeaf, self.store
+		// the identity is copied for the leaf's sake and not the group's: everything below runs
+		// outside this lock, and the credential is about to be signed over.
+		cred = Credential{
+			CredentialType: self.cred.CredentialType,
+			Identity:       cloneBytes(self.cred.Identity),
+		}
+		groupId = cloneBytes(self.context.GroupId)
+		leafKeysExt = encoded
+		return nil
+	}(); err != nil {
+		return nil, err
+	}
+
+	signatureKey, err := signaturePublicKeyOf(signer)
+	if err != nil {
+		return nil, err
+	}
+	// the key pair this proposal exists to publish. Its own draw and its own DeriveKeyPair, for
+	// NewKeyPackage's reason: one draw feeding two derivations answers two identical key pairs and
+	// nothing about the value that comes back says so.
+	encPriv, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		return nil, err
+	}
+	leaf := (&LeafNode{
+		EncryptionKey:  encPub,
+		SignatureKey:   signatureKey,
+		Credential:     cred,
+		Capabilities:   v1Capabilities(),
+		LeafNodeSource: LeafNodeSourceUpdate,
+		Extensions:     []Extension{leafKeysExt},
+	}).Clone()
+	// the group id and the leaf index are what section 7.2's update arm binds and the key_package
+	// arm does not, so an update leaf signed with nil and 0 verifies against itself and against no
+	// receiver -- see (*LeafNode).signatureContent.
+	if err := leaf.Sign(crypto, signer, groupId, at); err != nil {
+		return nil, err
+	}
+	// one verify, for NewLeafNode's reason: a provider whose signing half and verifying half
+	// disagree, or a preimage that cannot be rebuilt from what was just written, is a leaf every
+	// peer refuses and nothing in the value that comes back says so.
+	if err := leaf.VerifySignature(crypto, groupId, at); err != nil {
+		return nil, err
+	}
+	// THE PRIVATE HALF IS FILED BEFORE THE PROPOSAL IS PUBLISHED, and that order is the only one
+	// that cannot lose it. A client that published an update and then failed to store the key
+	// would be committed into an epoch whose own leaf key it does not hold, by a committer acting
+	// entirely correctly on what it was sent. The pair is copied on the way out because the store
+	// is an object the caller supplies and keeps what it is handed.
+	if err := store.PutPrivateKey(cloneBytes(encPub), cloneBytes(encPriv)); err != nil {
+		return nil, err
+	}
+	return self.propose(&Proposal{ProposalType: ProposalTypeUpdate, Update: &Update{LeafNode: *leaf}})
+}
+
+// ProposeGroupContextExtensions proposes replacing the group context's extension list wholesale.
+//
+// WHOLESALE IS THE RFC'S SEMANTICS AND NOT THIS METHOD'S CHOICE: section 12.1.6's proposal carries
+// an extensions vector that REPLACES the group's, so a caller that means to add one extension
+// passes the group's current list with the new entry in it. A caller that passes only the new entry
+// drops the policy, which is what GroupPolicyOf refuses below.
+//
+// Every entry is judged before the proposal is built, so a policy violation never reaches the wire:
+// checkGroupExtension is the same derived gate ValSem209 asks of a commit that installs one, so
+// this build cannot propose an extension set it would itself refuse to install. GroupPolicyOf is
+// the second door and it is this profile's rather than the RFC's -- a group here always carries a
+// policy, and an extension set with none is a group with no owner and no roles, which nothing
+// downstream would report until the first message that needed one.
+func (self *Group) ProposeGroupContextExtensions(exts []Extension) ([]byte, error) {
+	self.stateLock.Lock()
+	closed := self.closed
+	self.stateLock.Unlock()
+	if closed {
+		return nil, errGroupClosed
+	}
+	// the entries AND THEIR BODIES are copied before anything is judged, which is NewGroup's rule
+	// at the other end of the same list. append copies the Extension structs and leaves every
+	// ExtensionData pointing at the caller's octets, so a caller that went on writing into the
+	// buffer it encoded its policy out of would be rewriting a proposal this group has already
+	// signed and cached -- and the signature would go on verifying over the octets as they were.
+	proposed := make([]Extension, 0, len(exts))
+	for _, ext := range exts {
+		proposed = append(proposed, Extension{
+			ExtensionType: ext.ExtensionType,
+			ExtensionData: cloneBytes(ext.ExtensionData),
+		})
+	}
+	active := defaultProfile()
+	for i := range proposed {
+		if err := active.checkGroupExtension(proposed[i].ExtensionType); err != nil {
+			return nil, fmt.Errorf("%w: at group_context_extensions entry %d", err, i)
+		}
+	}
+	if _, err := GroupPolicyOf(proposed); err != nil {
+		return nil, err
+	}
+	// AND THE REQUIRED CAPABILITIES BODY, READ THROUGH THE SAME LOOKUP ValSem209 READS IT THROUGH.
+	// This is not a second policy check: it is the one extension of the installed set that the
+	// receiving side reads BY TYPE, and reading it here is what makes a set carrying two of them a
+	// refusal at generation rather than a choice the committer gets to make. Without it this
+	// generator publishes a proposal ValSem209 refuses -- measured, by the probe in
+	// extension_lookup_test.go's row for this method, which is the shape this whole section is
+	// built to prevent.
+	//
+	// What is NOT asked here is ValSem209's other half, whether every member the commit LEAVES in
+	// the group supports what the new set requires. That question is the commit's rather than the
+	// proposal's: which members remain depends on the removes the same commit carries, and none of
+	// them exist yet.
+	if _, err := requiredCapabilitiesOf(proposed); err != nil {
+		return nil, err
+	}
+	return self.propose(&Proposal{
+		ProposalType:           ProposalTypeGroupContextExtensions,
+		GroupContextExtensions: &GroupContextExtensions{Extensions: proposed},
+	})
+}
+
+// propose frames, signs, protects, caches and encodes one proposal.
+//
+// The group context crosses into the framing layer as BYTES: FramedContentTBS inlines it with no
+// length prefix of its own, and handing over the serialized form is what makes that impossible to
+// get wrong here.
+//
+// The group id in the FramedContent is a COPY of the group's and not the group's, which is
+// (*Group).persist's rule one call further out. sealPrivateMessage carries content.GroupId straight
+// into the PrivateMessage header it builds, so a content assembled over the live slice would put
+// the octets every epoch secret of this group was derived over into a structure this method hands
+// to an encoder -- the third instance of a class this package has now repaired twice.
+//
+// THE CACHE IS WRITTEN LAST, AND THE ORDER IS INVERTED FROM THE PLAN'S ON PURPOSE. Stored first,
+// every failure after it -- the seal, the encode -- leaves the cache holding a proposal no peer
+// ever received, which task 13's commit generation then names in a commit every receiver refuses
+// with "proposal reference is not cached for this epoch". The caller is told the propose failed and
+// the group has quietly disagreed with it. Stored last, the only cost of a refusal is a generation
+// of this leaf's own handshake ratchet spent on a message that was never returned, which every
+// receiver already tolerates: generations are consumed by the sender and gaps are ordinary.
+// Cheap and invisible on one side, silent divergence on the other, so the cheap failure is the one
+// this takes.
+//
+// *SecretTree is passed where the framing layer declares a MessageKeySource; framing_protect.go
+// carries the var _ MessageKeySource = (*SecretTree)(nil) assertion, so a drift between the two
+// fails at build rather than at the first message.
+//
+// The compiler directive is the package's convention for a member of the class
+// TestEveryEraseHelperCarriesTheNoInlineDirective derives, and it is not a claim that this body
+// erases a secret. That class is "writes through storage that outlives the call", read off the
+// source; this writes into the receiver's own proposal cache, which is the shape, and
+// (*ProposalCache).Store carries the directive under the same reading and says so.
+//
+//go:noinline
+func (self *Group) propose(proposal *Proposal) ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+	// before a single octet is signed, for (*Proposal).checkArm's reason one layer down: what is
+	// signed here is a serialized form, and a caller that ignored an error out of the encoder must
+	// not be able to walk away with a signature over a proposal that does not exist.
+	if err := checkProposalProfile(defaultProfile(), proposal); err != nil {
+		return nil, err
+	}
+	groupContext, err := syntax.Marshal(self.context)
+	if err != nil {
+		return nil, err
+	}
+	content := &FramedContent{
+		GroupId:     cloneBytes(self.context.GroupId),
+		Epoch:       self.context.Epoch,
+		Sender:      Sender{SenderType: SenderTypeMember, LeafIndex: self.ownLeaf},
+		ContentType: ContentTypeProposal,
+		Proposal:    proposal,
+	}
+	authenticated, err := SignAuthenticatedContent(self.crypto, self.signer,
+		WireFormatPrivateMessage, content, groupContext)
+	if err != nil {
+		return nil, err
+	}
+	// A-ASSUME-4: handshake traffic travels as a PrivateMessage, so the transport learns neither
+	// which member proposed nor what was proposed.
+	private, err := SealPrivateMessage(self.crypto, self.secretTree,
+		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// the cache is handed the AuthenticatedContent and not the Proposal, because the reference an
+	// entry is keyed by is a hash over the framed, signed content -- which is what a receiver of
+	// the octets above will compute for the same message. A cache keyed by anything else holds
+	// entries no commit of this group could name.
+	if _, err := self.proposals.Store(self.crypto, self.context, authenticated); err != nil {
+		return nil, err
+	}
+	return encoded, nil
 }
