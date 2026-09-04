@@ -11097,8 +11097,9 @@ func (self *multiClientWindow) expand(
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
 			// in-flight candidate fast (see evalEpochContext)
+			evaluationCtx := self.evalEpochContext()
 			client, err := newMultiClientChannel(
-				self.evalEpochContext(),
+				evaluationCtx,
 				args,
 				self.generator,
 				self.clientReceivePacketCallback,
@@ -11127,16 +11128,11 @@ func (self *multiClientWindow) expand(
 				self.qualificationRefreshFunc,
 			)
 			if err != nil {
-				// unconditional (V0): this transition was invisible in the
-				// field — EvaluationFailed is terminal, the dot is deleted
-				// from the monitor map, and nothing said why
-				if ok, suppressed := self.createFailThrottle.Allow(time.Now()); ok {
-					self.log.Infof("[multi]create channel error [%s] = %s%s\n",
-						args.ClientId, err, suppressedSuffix(suppressed))
-				}
-				self.recordEvaluationFailure(windowFailureProvider, err)
+				providerFailure := self.recordChannelCreationFailure(evaluationCtx, args, err)
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-				self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
+				if providerFailure {
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
+				}
 			} else {
 
 				// send an initial ping on the client and let the ack timeout close it
@@ -11316,6 +11312,32 @@ func (self *multiClientWindow) expand(
 	}
 
 	return
+}
+
+// recordChannelCreationFailure reports whether a failed candidate needs a
+// terminal provider event. A failure matching the construction context after
+// that context ended is caller-owned epoch rebuild or window retirement, not
+// a provider event or failure. A live-context error remains a genuine provider
+// failure even when the remote error itself is Canceled or DeadlineExceeded.
+// The caller retains generator ownership until this classification completes.
+func (self *multiClientWindow) recordChannelCreationFailure(
+	evaluationCtx context.Context,
+	args *multiClientChannelArgs,
+	err error,
+) bool {
+	contextErr := evaluationCtx.Err()
+	if contextErr != nil && errors.Is(err, contextErr) {
+		return false
+	}
+	// unconditional (V0): this transition was invisible in the field —
+	// EvaluationFailed is terminal, the dot is deleted from the monitor map,
+	// and nothing said why
+	if ok, suppressed := self.createFailThrottle.Allow(time.Now()); ok {
+		self.log.Infof("[multi]create channel error [%s] = %s%s\n",
+			args.ClientId, err, suppressedSuffix(suppressed))
+	}
+	self.recordEvaluationFailure(windowFailureProvider, err)
+	return true
 }
 
 // reliabilitySettings is the effective reliability config for this window: the
