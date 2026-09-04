@@ -513,6 +513,40 @@ func touchesNeither(count int) int {
 }
 `
 
+// The other root's shape, written the way a package outside mls has to write it: all three
+// names are exported, so a forge assembled in connect/message reaches them through a qualified
+// selector and the identifier this matcher reads is that selector's tail.
+const constructionBypassSeamInTheOtherRootControl = `package message
+
+import "github.com/urnetwork/connect/mls"
+
+func forgesFromAnotherPackage(auth *mls.FramedContentAuthData) ([]byte, error) {
+	return mls.MarshalMLSMessage(&mls.MLSMessage{})
+}
+`
+
+// TestTheConstructionBypassSeamGateReadsAForgeInTheOtherRoot measures the reach the widened
+// scope was for.
+//
+// The gate walks both roots the guardrails walk, and the reason it has to is that every name
+// the class is derived from is exported. That reasoning is worth nothing unqualified: the
+// matcher reads identifiers, and a qualified name is a selector rather than an identifier at
+// the position a reader might expect one. So the shape is run rather than argued about, and it
+// is run against a file named under the other root so the report says what a reviewer would be
+// sent to look at.
+func TestTheConstructionBypassSeamGateReadsAForgeInTheOtherRoot(t *testing.T) {
+	seams := constructionBypassSeamsIn([]parsedSource{
+		mustParseText(t, "../message/a_forge.go", constructionBypassSeamInTheOtherRootControl)})
+	if !slices.Equal(seamNamesOf(seams), []string{"forgesFromAnotherPackage"}) {
+		t.Fatalf("the matcher read %v out of a forge written in the other root, want [forgesFromAnotherPackage]; the class is derived from three EXPORTED names and this is the only thing that says a qualified one is read at all",
+			seamNamesOf(seams))
+	}
+	if strings.HasSuffix(seams[0].file, "_test.go") {
+		t.Errorf("the forge was read as declared in %s, so it would be waved through as test source; the file half of the rule is not reading the path the scan handed it",
+			seams[0].file)
+	}
+}
+
 // TestTheConstructionBypassSeamGateReadsItsControl runs the matcher on a package known to hold
 // every shape it must separate, so a rule narrowed by an edit fails here rather than reporting
 // the real package clean -- which is the one outcome a gate must never produce by accident.
@@ -553,6 +587,17 @@ func TestEveryConstructionBypassSeamIsDeclaredInTestSource(t *testing.T) {
 	// two members happen to sit in is the defect this project has paid for more than once, so
 	// the scope is the walk every other package wide gate here uses.
 	scan := mustScanSources(t, forbiddenScanRoots)
+	// and the scope is OBSERVED rather than stated, because it was measured to be invisible
+	// otherwise: narrowing this scan back to this directory alone passes every assertion below,
+	// since connect/message declares no member of the class today. That is the same silence the
+	// excuse reader's own widening was landed into and reported nothing about. A root that
+	// contributed no source is a root this rule is not holding.
+	for _, root := range forbiddenScanRoots {
+		if scan.rootFileCounts[root] == 0 {
+			t.Fatalf("the scan read no source under %q, and it is one of the roots the guardrails walk (%v); every name this class is derived from is exported, so a forge written under a root this gate steps over is one it reports clean",
+				root, forbiddenScanRoots)
+		}
+	}
 	parsed := []parsedSource{}
 	for _, path := range slices.Sorted(maps.Keys(scan.sourceTexts)) {
 		parsed = append(parsed, mustParseText(t, path, scan.sourceTexts[path]))
