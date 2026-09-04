@@ -7,8 +7,11 @@
 // confirmation tag cannot be computed until the new key schedule exists, so it is declared here
 // and run by the caller that has one. The two cryptographic doors of section 12.4.2 -- the
 // section 7.3 leaf validation of the update path's leaf (treekem.go's ValidateUpdatePathLeafNode)
-// and the path decryption (treekem.go's DecryptUpdatePath) -- are the same shape and are p7 task
-// 18's, which is the layer that holds the receiver's own key material. Nothing here restates
+// and the path decryption (treekem.go's DecryptUpdatePath) -- are the same shape and belong to the
+// layer that holds the receiver's own key material. That layer is p7 task 18's
+// (*Group).stageInboundCommitLocked and it has landed: it runs the leaf door before it merges the
+// path, because MergeUpdatePath compares a recomputed chain against a parent_hash only the commit
+// arm of section 7.6's select signs over, and it runs the decrypt after. Nothing here restates
 // either of them, because a rule enforced at two doors with two bodies is a rule two doors
 // enforce differently.
 //
@@ -402,8 +405,17 @@ func (self *CommitValidationInput) checkListResolvesTheCommitsVector() error {
 // A REFERENCE THIS MEMBER DOES NOT HOLD ANSWERS errProposalNotCached, which is erratum 8815's
 // value and (*ProposalCache).Resolve's -- one rule, one value, three doors, on the terms
 // CheckErrata8815 already states for the first two. This door is the strongest of the three and
-// the erratum's own rule stays: task 18 asks it of a commit and a cache with no validation input
-// around them, and a nil cache is a validator with no record of what this member received.
+// the erratum's own rule stays: CheckErrata8815 is stated over a commit and a cache with no
+// validation input around them, for a caller that holds those two and nothing else, and a nil cache
+// is a validator with no record of what this member received.
+//
+// NEITHER COMMIT PATH IS THAT CALLER TODAY, and saying so is the point of this paragraph rather
+// than a footnote to it. p7 task 18's (*Group).stageInboundCommitLocked reaches both errata through
+// validateCommitErrata, over the input it already assembled for ValidateCommit, and
+// (*Group).CreateCommit says in as many words that it does not call them beside its own
+// ValidateCommit. An earlier draft of this comment said task 18 called them directly; it never did,
+// and a sentence naming a caller nobody wrote is exactly what makes a reader believe a rule is
+// asked twice when it is asked once.
 //
 // IT ANSWERS A VALUE AND NOT A POINTER INTO THE CACHE. Cached hands back the map's own entry by
 // value, so the arms below it are still the cache's; nothing here writes through them, and the
@@ -737,9 +749,15 @@ func ValidateCommit(in *CommitValidationInput) error {
 // reaches them without their signatures having to take a CommitValidationInput.
 //
 // The two errata take a path and a context, and a commit and a cache, because those are what each
-// is a rule ABOUT and because p7 task 18 calls them with values it holds rather than with a
-// validation input it would have to assemble. This is the adapter, and it is a rule of this file
-// in its own right so that the derived gate above sees the errata run.
+// is a rule ABOUT rather than because some caller passes them that way. This is the adapter, and it
+// is a rule of this file in its own right so that the derived gate above sees the errata run.
+//
+// BOTH COMMIT PATHS REACH THEM THROUGH HERE AND NEITHER CALLS THEM DIRECTLY. p7 task 18's
+// (*Group).stageInboundCommitLocked assembles one CommitValidationInput and runs the aggregate over
+// it; (*Group).CreateCommit states the same thing at the sending end -- "a second call here would
+// be a second transcription of two rules whose whole point is that there is one of each". An
+// earlier draft of this comment said task 18 called them with values it holds; no such caller was
+// ever written, and a comment that names one is how a rule comes to be believed to run twice.
 func validateCommitErrata(in *CommitValidationInput) error {
 	if err := in.check(); err != nil {
 		return err

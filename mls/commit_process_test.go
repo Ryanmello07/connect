@@ -921,3 +921,240 @@ func TestProcessCommitRefusesAnUpdateWhosePrivateHalfTheStoreLost(t *testing.T) 
 			receiver.Epoch(), committer.Epoch())
 	}
 }
+
+// TestTwoConsecutiveCommitsKeepBothMembersOnOneTranscript is the assertion one commit cannot make.
+//
+// The confirmed transcript hash of an epoch is taken over the INTERIM hash of the epoch before it,
+// so a receiver that derived the right epoch and then failed to advance its own transcript agrees
+// with the committer about everything -- the tree, the key schedule, the epoch authenticator -- and
+// disagrees about the NEXT commit, at which point its confirmation tag no longer verifies and the
+// group is forked with no way back. A single commit is satisfied by a receive path that never
+// touches the transcript at all.
+//
+// It also runs the commit in BOTH directions, which is the second thing one commit cannot show: a
+// receiver that staged an epoch correctly and installed the wrong secret tree or the wrong leaf
+// private state opens the next commit from its peer and cannot make one of its own.
+func TestTwoConsecutiveCommitsKeepBothMembersOnOneTranscript(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, _ := testTwoMemberGroup(t, crypto)
+	defer committer.Close()
+	defer receiver.Close()
+
+	first, err := committer.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("the first CreateCommit: %v", err)
+	}
+	processed, err := receiver.ProcessMessage(first.Commit)
+	if err != nil {
+		t.Fatalf("ProcessMessage on the first commit: %v", err)
+	}
+	if err := receiver.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit on the first commit: %v", err)
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit on the first commit: %v", err)
+	}
+	// the live control: after one commit the two agree, which is what makes a disagreement after
+	// the second a statement about the transcript rather than about the first commit
+	if !bytes.Equal(receiver.EpochAuthenticator(), committer.EpochAuthenticator()) {
+		t.Fatal("the two members disagree after the first commit, so the second observes nothing")
+	}
+
+	// and the SECOND commit comes from the other member, so the epoch the first one opened is
+	// exercised as a sending epoch and not only as a receiving one
+	second, err := receiver.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("the second CreateCommit, from the member that received the first: %v", err)
+	}
+	back, err := committer.ProcessMessage(second.Commit)
+	if err != nil {
+		t.Fatalf("ProcessMessage on the second commit: %v; the receiver's transcript and the committer's have parted company", err)
+	}
+	if err := committer.ApplyCommit(back); err != nil {
+		t.Fatalf("ApplyCommit on the second commit: %v", err)
+	}
+	if err := receiver.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit on the second commit: %v", err)
+	}
+	if receiver.Epoch() != committer.Epoch() {
+		t.Fatalf("receiver epoch %d, committer epoch %d", receiver.Epoch(), committer.Epoch())
+	}
+	if !bytes.Equal(receiver.EpochAuthenticator(), committer.EpochAuthenticator()) {
+		t.Fatal("the two members disagree on the epoch the second commit opened")
+	}
+	// and the epoch two commits produced carries traffic, which is what says the secret tree and
+	// the leaf private state each of them installed are the ones the other computed
+	message, err := committer.Protect([]byte("aad"), []byte("two commits on"))
+	if err != nil {
+		t.Fatalf("Protect two commits on: %v", err)
+	}
+	opened, err := receiver.Unprotect(message)
+	if err != nil {
+		t.Fatalf("Unprotect two commits on: %v", err)
+	}
+	if string(opened.Plaintext) != "two commits on" {
+		t.Fatalf("the epoch two commits opened carried %q", opened.Plaintext)
+	}
+}
+
+// TestProcessCommitThatAddsAMemberAndCarriesAPath is the receiving half of RFC 9420 section
+// 12.4.1's add exclusion, and it is the one shape that can observe it.
+//
+// A member this commit ADDS receives the path secret in its Welcome and is sealed to nowhere in the
+// update path, so the committer takes the added leaves out of every target resolution before it
+// encrypts. A receiver that did not take the same leaves out computes a different resolution for at
+// least one node of the path, which shifts the POSITIONAL pairing between a node's ciphertext
+// vector and the members it addresses -- and every ciphertext is still well formed, still the right
+// length, and opens to the wrong subtree or to nothing.
+//
+// An add-only commit is not enough: section 12.4 does not require a path for one, so the decrypt
+// this case is about never runs. Force is what makes the commit carry the path AND the add
+// together, which is the only commit in which the exclusion is a decision at all.
+func TestProcessCommitThatAddsAMemberAndCarriesAPath(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, _ := testTwoMemberGroup(t, crypto)
+	defer committer.Close()
+	defer receiver.Close()
+
+	carol := testIdentity(t, crypto, "carol")
+	kp, _, _ := testKeyPackage(t, crypto, carol)
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal key package: %v", err)
+	}
+	add, err := committer.ProposeAdd(encoded)
+	if err != nil {
+		t.Fatalf("ProposeAdd: %v", err)
+	}
+	if _, err := receiver.ProcessMessage(add); err != nil {
+		t.Fatalf("the receiver could not process the Add: %v", err)
+	}
+	result, err := committer.CreateCommit(nil, nil, &CommitOptions{Force: true})
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	// the two live controls, without either of which this case observes nothing: the commit must
+	// carry a path, and it must add somebody for there to be an exclusion to make
+	staged := committer.stagedForTest()
+	if staged == nil || !staged.hasPath {
+		t.Fatal("this commit carries no update path, so the exclusion below is not a decision")
+	}
+	if len(staged.AddedLeaves()) != 1 {
+		t.Fatalf("this commit adds %d leaves, want 1", len(staged.AddedLeaves()))
+	}
+
+	processed, err := receiver.ProcessMessage(result.Commit)
+	if err != nil {
+		t.Fatalf("ProcessMessage on a commit that adds a member and carries a path: %v", err)
+	}
+	if err := receiver.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	if !bytes.Equal(receiver.EpochAuthenticator(), committer.EpochAuthenticator()) {
+		t.Fatal("the two members disagree on the epoch a commit that added a member and carried a path opened")
+	}
+	if len(receiver.Members()) != 3 {
+		t.Fatalf("the receiver sees %d members, want 3", len(receiver.Members()))
+	}
+}
+
+// TestProcessCommitRunsSection122sProposalRulesOverAnInboundList is the receive path's own copy of
+// the door (*Group).propose runs at generation.
+//
+// The commit below is one this package will not build through its ordinary surface: ValSem101
+// refuses an Add whose key package publishes a signature key the group already holds, and every
+// generator here asks that rule before it signs. CommitOptions' skipValidation seam is what makes a
+// commit that carries one, and it is unexported so that only this package can.
+//
+// ValSem101 is the isolating choice and not the first rule to hand: it is a rule of section 12.2
+// and it is NOT one of ValidateCommit's twelve, so a receive path that ran the commit validator and
+// skipped the proposal list validator accepts this commit -- an epoch in which one member's
+// signature key stands at two leaves, which is a group nobody can attribute a message in.
+func TestProcessCommitRunsSection122sProposalRulesOverAnInboundList(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, bob := testTwoMemberGroup(t, crypto)
+	defer committer.Close()
+	defer receiver.Close()
+
+	// a SECOND key package for the member that is already at leaf 1: fresh HPKE keys, the same
+	// signature key, which is exactly what ValSem101 is stated over
+	duplicate, _, _ := testKeyPackage(t, crypto, bob)
+	forged, err := committer.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *duplicate}}},
+		&CommitOptions{skipValidation: true})
+	if err != nil {
+		t.Fatalf("build the commit whose list this package would not validate: %v", err)
+	}
+	if _, err := receiver.ProcessMessage(forged.Commit); !errors.Is(err, ErrAddDuplicateSignatureKey) {
+		t.Fatalf("a commit adding a signature key the group already holds was refused with %v, want ErrAddDuplicateSignatureKey",
+			err)
+	}
+	// and the live control: the same seam with a member the group does NOT hold is accepted, so
+	// what the refusal above observes is the rule and not the seam
+	committer.ClearPendingCommit()
+	carol := testIdentity(t, crypto, "carol")
+	fresh, _, _ := testKeyPackage(t, crypto, carol)
+	honest, err := committer.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *fresh}}},
+		&CommitOptions{skipValidation: true})
+	if err != nil {
+		t.Fatalf("build the control commit: %v", err)
+	}
+	processed, err := receiver.ProcessMessage(honest.Commit)
+	if err != nil {
+		t.Fatalf("the control commit was refused: %v", err)
+	}
+	processed.Commit.Zeroize()
+}
+
+// TestStagingAnInboundCommitAsksSection124sOwnRules is ValidateCommit on the receive path, asked
+// through the one rule of its twelve that no other door of this path repeats.
+//
+// EVERY OTHER RULE IT STATES HAS A SECOND ENFORCER HERE, which is why this case exists in the shape
+// it does rather than damaging any field and asserting a refusal. A path leaf of the wrong source
+// or with a broken signature is refused by ValidateUpdatePathLeafNode; a path of the wrong length or
+// republishing a key already in the tree is refused by MergeUpdatePath's own length check and by its
+// parent hash chain; a list that section 12.2 forbids is refused by ValidateProposalList. So a
+// commit damaged in any of those ways is refused whether or not this call is made, and a case built
+// on one would report a validator that is not running.
+//
+// ValSem201 is the exception: a commit naming NO proposals must carry an update path, and a receive
+// path without this call simply derives the epoch with a zero commit secret -- which is refused two
+// steps later by the confirmation tag, under a different sentinel and after a whole epoch has been
+// derived over a secret every member of the previous epoch already holds. The assertion is on the
+// SENTINEL for exactly that reason: err != nil is satisfied by the tag.
+func TestStagingAnInboundCommitAsksSection124sOwnRules(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, _ := testTwoMemberGroup(t, crypto)
+	defer committer.Close()
+	defer receiver.Close()
+
+	result, err := committer.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	authenticated := testOpenInboundCommit(t, receiver, result.Commit)
+	if authenticated.Content.Commit == nil || authenticated.Content.Commit.Path == nil {
+		t.Fatal("this commit carries no update path, so taking one away below changes nothing")
+	}
+	if len(authenticated.Content.Commit.Proposals) != 0 {
+		t.Fatalf("this commit names %d proposals; ValSem201's empty clause is what this case is stated over",
+			len(authenticated.Content.Commit.Proposals))
+	}
+
+	// the live control: unedited, this content stages
+	staged, err := receiver.stageInboundCommitLocked(authenticated)
+	if err != nil {
+		t.Fatalf("the unedited commit does not stage, so the refusal below would say nothing: %v", err)
+	}
+	staged.Zeroize()
+
+	authenticated.Content.Commit.Path = nil
+	if _, err := receiver.stageInboundCommitLocked(authenticated); !errors.Is(err, errMissingPath) {
+		t.Fatalf("a commit naming no proposals and carrying no update path was refused with %v, want errMissingPath; without section 12.4's own validator the refusal is the confirmation tag's, two steps and one derived epoch later",
+			err)
+	}
+}

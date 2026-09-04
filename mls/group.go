@@ -2724,11 +2724,20 @@ func (self *Group) ProcessMessage(message []byte) (*Processed, error) {
 	if err := defaultProfile().checkWireFormat(parsed.WireFormat); err != nil {
 		return nil, err
 	}
-	// the codec pairs the wire format with the arm it names, and this is that pairing asserted
-	// rather than assumed, because the statement below dereferences it.
-	if parsed.PrivateMessage == nil {
-		return nil, fmt.Errorf("%w: the message names PrivateMessage and carries none", errProcessWireFormat)
-	}
+	// THERE IS NO ARM CHECK BESIDE IT, and its absence is a decision rather than the omission it
+	// looks like -- the same one stageInboundCommitLocked makes about the confirmation tag.
+	// (*MLSMessage).UnmarshalMLS populates the arm its wire format names and refuses a message
+	// carrying any other, so behind the gate above parsed.PrivateMessage is non-nil for every
+	// message this package can parse. A guard here would answer the SAME sentinel that gate does,
+	// which is worse than redundant: no input could tell the two apart, so a profile that had
+	// stopped refusing a Welcome would go on reading as one that refuses it. MEASURED, on the
+	// mutation that says so -- with checkWireFormat accepting every format, the arm check kept the
+	// whole suite green and TestProcessMessageRefusesEveryWireFormatButPrivateMessage passed on the
+	// wrong refusal.
+	//
+	// The direction is unchanged: OpenPrivateMessage refuses a nil message with errNilPrivateMessage
+	// before it reads anything off it, so a build that somehow reached this line without one fails
+	// closed rather than dereferencing.
 
 	groupContext, err := syntax.Marshal(self.context)
 	if err != nil {

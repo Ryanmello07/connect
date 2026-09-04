@@ -1027,10 +1027,13 @@ func updatePathCoversTheFilteredPath(path *UpdatePath, steps []PathStep) bool {
 // writing it down -- a check both sides assume the other makes is a check nobody makes. The
 // signature is what makes the parent_hash comparison above mean anything, and it is verified by
 // whoever holds the group id and the sender's index, which is the commit processing layer rather
-// than the tree. That layer's door is ValidateUpdatePathLeafNode, immediately below, and it is
-// NAMED here rather than gestured at: this paragraph said "the commit processing layer" for as
-// long as there was no such door anywhere in this package, which reads to a caller as an assurance
-// that somebody else is doing it. What this does enforce, and enforces by DERIVATION rather than by a rule of its
+// than the tree. That layer's door is ValidateUpdatePathLeafNode, immediately below, and the caller
+// that runs it is p7 task 18's (*Group).stageInboundCommitLocked, which asks it BEFORE it calls
+// this. Both halves are NAMED here rather than gestured at, and each was missing in its turn: this
+// paragraph said "the commit processing layer" for as long as there was no such door anywhere in
+// this package, and then named the door for as long as nothing called it -- and either sentence
+// alone reads to a caller as an assurance that somebody else is doing it.
+// What this does enforce, and enforces by DERIVATION rather than by a rule of its
 // own, is that the leaf carries a parent_hash field at all: nodeParentHashField answers "no
 // field" for every leaf whose source is not commit, so a path whose leaf claims some other source
 // leaves the node above it with no claimant and VerifyParentHashes refuses it.
@@ -1151,6 +1154,14 @@ var errUpdatePathLeafNodeInvalid = errors.New("mls: the update path's leaf node 
 // with no signature check, no leaf_node_source check, no credential check and no section 13.4
 // check. MergeUpdatePath says in as many words that it does not make them. This is the body that
 // does.
+//
+// AND ITS CALLER IS p7 TASK 18's (*Group).stageInboundCommitLocked, which is the second half of that
+// same account. The body landed one task ahead of the layer that had to run it, and for those tasks
+// this package shipped a section 7.3 door its own construction did not run --
+// rulesThisPackageExportsAndNothingApplies held that fact rather than leaving it in the gap between
+// two tasks, and the entry came off by FAILING on the commit that gave it this caller. It is asked
+// BEFORE the merge, because the merge's whole comparison is against a parent_hash field that only a
+// commit-sourced leaf's own signature covers.
 //
 // WHAT A COMMIT LEAF OWES THAT AN UPDATE LEAF DOES NOT, worked out from section 7.6 rather than
 // copied off the update door:

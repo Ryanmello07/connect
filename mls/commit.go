@@ -122,8 +122,9 @@ type StagedCommit struct {
 	ownPriv    *TreeKEMPrivate
 	transcript *TranscriptHashes
 	list       *ProposalList
-	// the commit this stages, as the structure the sender signed. Task 18 stages an inbound one
-	// the same way, and the send path keeps it for the reason the receive path will: what a
+	// the commit this stages, as the structure the sender signed. p7 task 18's
+	// (*Group).stageInboundCommitLocked stages an inbound one the same way, and both paths keep it
+	// for one reason: what a
 	// merge, a re-validation or a report has to be able to name is the commit itself and not a
 	// summary somebody took of it.
 	commit      *Commit
