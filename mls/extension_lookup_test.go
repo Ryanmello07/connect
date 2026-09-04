@@ -365,6 +365,61 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"JoinFromWelcome": {
+		what: "reads the type of EVERY entry of the group context a Welcome describes and selects none, which " +
+			"is NewGroup's row one epoch later and from the other side of the wire: the creator holds its own " +
+			"choice to the v1 group context set, and a joiner holds a set somebody else chose to the same one. " +
+			"A repeated type is not a question it answers -- two entries of one type are both judged and both " +
+			"must be admitted -- and the door that refuses the repeat is the lookup every accessor reaches, " +
+			"which this path reaches twice: requiredCapabilitiesOf before the walk and GroupPolicyOf after it. " +
+			"What matters here is the property NewGroup's row names: the walk covers every entry, so an " +
+			"offending extension in the MIDDLE or at the END is refused rather than walked past",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			group, joiner, result, keys := joinTestCommit(t, crypto, "join-extension-walk", nil)
+			defer group.Close()
+			staged := group.stagedForTest()
+			if staged == nil {
+				t.Fatal("this fixture staged no commit, so there is no group context to describe")
+			}
+			// the offending entry LAST, which is what separates "every entry" from "the first".
+			// urmessage_leaf_keys is a LEAF extension: every fixture leaf lists it in its
+			// capabilities, so section 13.4's rule admits it and the only door that refuses it
+			// is the profile walk this row is about.
+			trailing := staged.context.Clone()
+			trailing.Extensions = append(trailing.Extensions,
+				Extension{ExtensionType: ExtensionTypeUrmessageLeafKeys, ExtensionData: []byte{0x01}})
+			spec := joinTestWelcomeSpec{
+				joinerSecret: staged.schedule.JoinerSecret(),
+				context:      trailing,
+				signer:       group.OwnLeafIndex(),
+				signPriv:     group.signer,
+				keyPackage:   &keys.KeyPackage,
+				leafIndex:    LeafIndex(1),
+			}
+			if joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-extension-walk"),
+				joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys); err == nil {
+				joined.Close()
+				t.Error("a welcome whose LAST group context extension is a leaf extension was joined; the profile rule is being applied to the first entry alone")
+			}
+			// and the repeat is somebody else's rule. Both entries are admitted by the walk, and
+			// what refuses the join is the lookup GroupPolicyOf reaches one statement later.
+			repeated := staged.context.Clone()
+			repeated.Extensions = append(repeated.Extensions, repeated.Extensions[len(repeated.Extensions)-1])
+			spec.context = repeated
+			joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-extension-walk"),
+				joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+			if err == nil {
+				joined.Close()
+				t.Fatal("a welcome whose group context carries the group policy twice was joined; the repeat reaches no door at all")
+			}
+			if !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("a welcome whose group context carries the group policy twice was refused with %v, want ErrMalformedExtension; the repeat is the lookup's refusal and not this walk's",
+					err)
+			}
+		},
+	},
 	"(*CommitValidationInput).checkExtensionsAreTheSetThisCommitInstalls": {
 		what: "reads the type of EVERY entry of TWO vectors positionally and selects none. It is the commit " +
 			"door's join between the extension set a caller announces and the one the commit installs, so a " +

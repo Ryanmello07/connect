@@ -27,6 +27,7 @@
 package mls
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"sync"
@@ -88,6 +89,70 @@ var (
 	// every node it shares with the committer, at the far end, with nothing here to point at.
 	errWelcomePathSecret = errors.New(
 		"mls: this commit carried an update path and holds no path secret for a joiner")
+	// and the RECEIVING half, task 16. One value per rule for this block's stated reason; what
+	// each of them means is written on JoinFromWelcome beside the step that answers it.
+	//
+	// errNilJoinKeyMaterial is a join with nothing to join AS. It is separate from
+	// errNilGroupConfig because the two are different missing objects with different repairs, and
+	// a caller told "there is no group config" while holding one would go looking at the wrong
+	// argument.
+	errNilJoinKeyMaterial = errors.New("mls: there is no key material for this joiner to join with")
+
+	// errWelcomeWireFormat is a message handed to the joiner that is not a Welcome. It is not
+	// ErrWelcomeSuiteMismatch or any other welcome refusal: nothing about a Welcome has been
+	// judged, because the thing in hand is not one.
+	errWelcomeWireFormat = errors.New("mls: the message handed to this joiner is not a welcome")
+
+	// errWelcomeJoinerProviderSuite is a Welcome naming one ciphersuite in the clear while the
+	// provider this joiner runs is another. It is NOT ErrWelcomeSuiteMismatch, which is the
+	// welcome against the joiner's own key package, and it is not welcome.go's
+	// errWelcomeSuiteProvider, which is the same disagreement at the BUILDING end -- three pairs
+	// of values, and a caller sent to look at the wrong pair looks at two values that agree.
+	errWelcomeJoinerProviderSuite = errors.New(
+		"mls: the welcome names a ciphersuite the provider joining under it does not run")
+
+	// errWelcomeGroupSecretsDecrypt is the entry addressed to this joiner's key package failing to
+	// open under this joiner's init key.
+	//
+	// A SEPARATE VALUE FROM ErrWelcomeNoMatchingKeyPackage, and the split is the pairing. That one
+	// is "no entry here is addressed to me", which is an ordinary condition -- a Welcome for a
+	// commit that added somebody else. This one is "the entry that NAMES me was not sealed to me",
+	// which is a Welcome whose reference half and whose seal half disagree: an entry lifted off
+	// another Welcome, a seal made to another joiner's init key, or a builder that paired joiner
+	// i's reference with joiner j's ciphertext. Collapsing the two would let a test asserting the
+	// ordinary condition pass over the forgery.
+	errWelcomeGroupSecretsDecrypt = errors.New(
+		"mls: the group secrets addressed to this joiner did not open under its init key")
+
+	// errWelcomeGroupIdNotTheOneAsked is a Welcome describing a group other than the one the
+	// caller's config named. See JoinFromWelcome: it is an intent match and not authentication,
+	// and it is its own value so that a caller can tell "this is not the group I asked for" from
+	// every cryptographic refusal beside it.
+	errWelcomeGroupIdNotTheOneAsked = errors.New(
+		"mls: the welcome describes a group other than the one this client asked to join")
+
+	// errWelcomeLeafNotTheJoiners is a tree carrying this joiner's signature key at a leaf that is
+	// not the leaf its key package published.
+	//
+	// NOT ErrWelcomeLeafNotFound, which is "no leaf of this tree is mine". This one is "a leaf of
+	// this tree claims to be mine and is not", which is the substitution the whole check exists
+	// for, and a single value would let a test asserting the absence pass over it.
+	errWelcomeLeafNotTheJoiners = errors.New(
+		"mls: the tree's leaf for this joiner is not the leaf its key package published")
+
+	// errJoinerWelcomeSecret is this build disagreeing with itself about welcome_secret: the value
+	// JoinFromWelcome derived to open the encrypted group info is not the one the key schedule
+	// derives from the same joiner secret. Its whole account is at the comparison.
+	errJoinerWelcomeSecret = errors.New(
+		"mls: the welcome secret this joiner opened the group info with is not the one its key schedule derives")
+
+	// errWelcomePathSecretNode is a Welcome handing this joiner a path secret for an epoch whose
+	// update path never covered it: the lowest node the joiner and the sender share is not on the
+	// sender's filtered direct path. It is the receiving half of errWelcomePathSecret above and a
+	// separate value for that block's reason -- one is a commit that could not be built and this
+	// is a message that cannot be believed.
+	errWelcomePathSecretNode = errors.New(
+		"mls: the welcome's path secret is for a node the sender's update path did not cover")
 )
 
 // StateStore persists group state and private key material across process restarts. It is
@@ -1881,3 +1946,584 @@ func (self *Group) MergePendingCommit() error {
 	return nil
 }
 
+
+// ---------------------------------------------------------------------------
+// p7 task 16: joining a group from a Welcome and a ratchet tree the CALLER anchored
+// ---------------------------------------------------------------------------
+
+// JoinKeyMaterial is what a joiner holds for the KeyPackage a Welcome names: the key package it
+// PUBLISHED, and the three private halves it published nowhere.
+//
+// The key package is carried by value and the three keys by reference, which is the shape a
+// caller already has -- (StateStore).TakeKeyPackage hands back the encoding and the two private
+// keys it stored beside it, and the signing key is the device's own. Nothing here is retained by
+// the group this material joins: the signing key and the credential are CLONED into it and the
+// encryption key is cloned by NewTreeKEMPrivate, so a caller goes on owning every array it passed
+// and owes each of them the erase below.
+type JoinKeyMaterial struct {
+	KeyPackage     KeyPackage
+	InitPrivate    HpkePrivateKey
+	EncryptPrivate HpkePrivateKey
+	SignPrivate    SignaturePrivateKey
+}
+
+// Zeroize erases the three private keys this material carries.
+//
+// It is here because this type DECLARES key material, which is the obligation the erase discipline
+// states over the types that hold octets rather than over the call sites somebody remembered: the
+// init key opens every Welcome addressed to this key package, the encryption key is this member's
+// leaf key for as long as it holds that leaf, and the signing key is its identity. A caller that
+// dropped one of these after a join left all three in the heap for the collector to move around.
+//
+// THE KEY PACKAGE IS DELIBERATELY NOT TOUCHED, for (*WelcomeJoiner).Zeroize's reason one file over:
+// it is the PUBLISHED half. Every field of its encoding went to the delivery service and to every
+// member of every group that added this device, and the one field of the Go struct that is not
+// encoded -- signPriv -- is cleared by UnmarshalMLS on anything that arrived off the wire. Erasing
+// it would take away nothing an attacker lacks while destroying a value the caller still owns.
+//
+// A nil receiver is accepted for zeroizeSecret's reason, and the noinline directive is the erase
+// class's rule; see (*TreeKEMPrivate).Zeroize.
+//
+//go:noinline
+func (self *JoinKeyMaterial) Zeroize() {
+	if self == nil {
+		return
+	}
+	zeroizeSecret(self.InitPrivate)
+	zeroizeSecret(self.EncryptPrivate)
+	zeroizeSecret(self.SignPrivate)
+}
+
+// JoinFromWelcome builds this client's group state from a Welcome and a ratchet tree the CALLER
+// obtained, following RFC 9420 section 12.4.3.1's receive steps in the order the section states
+// them.
+//
+// WHAT A CALLER MUST ESTABLISH BEFORE IT CALLS THIS, first because nothing below can do it.
+//
+// A WELCOME AUTHENTICATES NOBODY. It is HPKE-sealed to an init key its recipient PUBLISHED, in a
+// key package that went to the delivery service and to every member of every group that added this
+// device, so anybody at all holding that key package can build one addressed to it: mint a ratchet
+// tree, sign a GroupInfo at a leaf of that tree with a signing key drawn for the purpose, choose a
+// joiner secret, seal it to the published init key. Every check this function makes passes on that
+// message, and the client that ran them is then a member of a group whose entire membership is one
+// attacker. That is not a gap in this function; it is what a Welcome IS. welcome.go's header says
+// it from the tree's end, (*GroupInfo).Verify says it under "WHERE THE TREE COMES FROM", and
+// BuildWelcome says it over the object it produces.
+//
+// THE TREE ARRIVING AS A PARAMETER OF ITS OWN DOES NOT CHANGE THAT BY ONE BIT, and the shape is
+// named here because it reads as though it does. The attacker supplies both octet strings:
+// ratchetTree is exactly as much the sender's as welcome is, and a caller that lifted this
+// argument out of the same delivery that carried the Welcome has authenticated nothing that a
+// caller reading the tree out of a ratchet_tree extension would not also have "authenticated".
+// (*GroupInfo).Verify establishes that a member OF THE TREE IT WAS HANDED signed this GroupInfo
+// about THAT tree, and a forged pair agrees with itself perfectly.
+//
+// So the caller owes an ANCHOR FOR THE TREE THAT DOES NOT COME FROM THE WELCOME. Concretely, before
+// it treats the answered group as the group a human meant to join, it must have established --
+// over a channel it already authenticates, which in this product means an existing URmessage
+// session or something the two people compared out of band -- the tree hash of the epoch it is
+// joining, and it must reconcile that value against the tree it passes here. The group id and the
+// epoch of the answered group are reachable through (*Group).GroupId and (*Group).Epoch and the
+// tree through (*Group).RatchetTree, so the reconciliation has values to run on; this function is
+// handed the result of it and cannot audit it.
+//
+// cfg.GroupId, when the caller sets it, is checked against the group id the Welcome describes.
+// THAT IS AN INTENT MATCH AND NOT AUTHENTICATION, and the distinction is the whole reason it is
+// spelled out: a group id is public, and an attacker naming the id of the group its target expects
+// passes this check on the first try. What it buys is that a caller which said which group it
+// meant to join is not silently placed in another one. A caller that does not yet know the id
+// leaves the field empty and the check does not run.
+//
+// WHAT THIS FUNCTION DOES CHECK, once the tree is granted:
+//
+//  1. the message is a Welcome, and its cleartext ciphersuite is the one this joiner's key package
+//     names, the one this profile creates groups under, and the one the provider runs;
+//  2. an entry of it is addressed to THIS joiner's key package reference, and that entry opens
+//     under THIS joiner's init private key with this Welcome's own encrypted_group_info as the
+//     HPKE context -- which is what makes an entry lifted off another Welcome, or a seal made to
+//     another joiner's init key, a refusal rather than a group;
+//  3. the group secrets name no pre-shared key, which is outside this profile;
+//  4. the encrypted group info opens under welcome_key/welcome_nonce derived from the joiner
+//     secret that entry carried;
+//  5. a member of the tree the caller passed signed that group info about that tree, and the tree
+//     hashes to what its group context names -- both through (*GroupInfo).VerifiedContext, which
+//     is (*GroupInfo).Verify and nothing else;
+//  6. the tree is a valid ratchet tree for that group context: every leaf signature, every parent
+//     hash, the required capabilities, the extensions -- (*RatchetTree).ValidateAgainstContext;
+//  7. every group context extension is one this profile admits, and the context carries a group
+//     policy;
+//  8. a leaf of the tree carries this joiner's signature key, and THE LEAF NODE STANDING THERE IS
+//     THE ONE THIS JOINER PUBLISHED, byte for byte;
+//  9. the confirmation tag the group info carries is the one this joiner's own key schedule
+//     produces over the confirmed transcript hash it carries -- which is what says the epoch this
+//     joiner derived is the epoch the sender described;
+//  10. every path secret it derives from the one the Welcome carried produces the public key the
+//     tree already holds at that node -- (*TreeKEMPrivate).Consistent.
+//
+// WHAT IT DOES NOT CHECK: that the tree is the group's tree, per every paragraph above; that the
+// sender is who it claims to be, because a Welcome carries no claim to check; and that the members
+// the tree names are people this user knows, which is the product's question and not this
+// function's.
+//
+// THE TREE IS ALWAYS OUT OF BAND HERE. v1 does not put a ratchet_tree extension in the GroupInfo,
+// because MASTER section 8.2 already publishes one snapshot record per epoch and a second copy
+// inside every Welcome is the same 300 KB again. A GroupInfo that carries one anyway is not
+// ignored -- (*GroupInfo).Verify's rule 9 refuses one describing a tree other than the one in hand
+// -- and it is still never read as the tree.
+func JoinFromWelcome(cfg *GroupConfig, welcome []byte, ratchetTree []byte,
+	keys *JoinKeyMaterial) (*Group, error) {
+
+	if cfg == nil {
+		return nil, errNilGroupConfig
+	}
+	crypto := cfg.Crypto
+	// refused rather than dereferenced, and refused before any other argument is judged: every
+	// seal this function opens, every secret it derives and every signature it checks is taken
+	// through the provider, so a caller that passed none passed nothing this function could have
+	// used.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: every seal this joiner opens and every secret it derives is taken through it",
+			ErrNilCryptoProvider)
+	}
+	if cfg.Store == nil {
+		return nil, errNilStateStore
+	}
+	if keys == nil {
+		return nil, errNilJoinKeyMaterial
+	}
+	active := cfg.Profile
+	if active == nil {
+		active = defaultProfile()
+	}
+
+	// step 0: the frame, and the three things the cleartext ciphersuite has to agree with.
+	//
+	// ParseMLSMessage runs at the DEFAULT vector bound and is not raised here, which is its own
+	// comment's decision restated at the one call site that is a stranger's message: this is
+	// decoded by a party who is not yet a member, with no group state to check it against and
+	// every length in it chosen by whoever sent it.
+	message, err := ParseMLSMessage(welcome)
+	if err != nil {
+		return nil, err
+	}
+	if message.WireFormat != WireFormatWelcome || message.Welcome == nil {
+		return nil, fmt.Errorf("%w: it is framed as wire format %#04x",
+			errWelcomeWireFormat, uint16(message.WireFormat))
+	}
+	parsed := message.Welcome
+	if parsed.CipherSuite != keys.KeyPackage.CipherSuite {
+		return nil, fmt.Errorf("%w: the welcome names %#04x and this joiner's key package names %#04x",
+			ErrWelcomeSuiteMismatch, uint16(parsed.CipherSuite), uint16(keys.KeyPackage.CipherSuite))
+	}
+	if err := active.checkCiphersuiteForCreate(parsed.CipherSuite); err != nil {
+		return nil, err
+	}
+	// and the provider, for NewGroup's reason at the same position: without this the disagreement
+	// surfaces two steps later as an AEAD that will not open, which is a refusal naming a group
+	// info nobody tampered with.
+	if parsed.CipherSuite != crypto.Suite() {
+		return nil, fmt.Errorf("%w: the welcome names %#04x and the provider runs %#04x",
+			errWelcomeJoinerProviderSuite, uint16(parsed.CipherSuite), uint16(crypto.Suite()))
+	}
+
+	// step 1: the entry addressed to the key package this joiner published.
+	//
+	// Through subtle for guardrail 8's reason, which is the class rather than this line: a key
+	// package reference is public, and every comparison in this package that decides whether a
+	// structure is ADOPTED is spelled the one way.
+	ref, err := keys.KeyPackage.Ref(crypto)
+	if err != nil {
+		return nil, err
+	}
+	var entry *EncryptedGroupSecrets
+	for i := range parsed.Secrets {
+		if subtle.ConstantTimeCompare(parsed.Secrets[i].NewMember, ref) == 1 {
+			entry = &parsed.Secrets[i]
+			break
+		}
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("%w: this welcome carries %d entries and none names %x",
+			ErrWelcomeNoMatchingKeyPackage, len(parsed.Secrets), ref)
+	}
+
+	// step 2: the group secrets, opened under THIS joiner's init key with THIS Welcome's encrypted
+	// group info as the HPKE context.
+	//
+	// THE HALF OF THE JOINER PAIRING THAT IS NOT A LOOKUP. The step above found the entry that
+	// NAMES this key package, which is a field whoever built the Welcome chose; this is the one
+	// that cannot be chosen, because the seal was made to the init key that key package published
+	// and no other private key opens it. A build where the two disagreed -- BuildWelcome pairing
+	// joiner i's reference with joiner j's seal, which is the fork errWelcomeAddPairing exists to
+	// refuse on the sending side -- is a refusal here rather than a member that derives an epoch
+	// nobody else is in. The context binding is the other half: an entry lifted off a different
+	// Welcome no longer opens, because encrypted_group_info is what it was sealed against.
+	plaintext, err := OpenWithLabel(crypto, keys.InitPrivate, welcomeHpkeLabel,
+		parsed.EncryptedGroupInfo, &entry.EncryptedGroupSecrets)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errWelcomeGroupSecretsDecrypt, err)
+	}
+	secrets := &GroupSecrets{}
+	decodeErr := syntax.Unmarshal(plaintext, secrets)
+	// the cleartext GroupSecrets encoding, erased the moment it has been decoded and on the
+	// failure path as well -- which is why the erase is written before the error is read. It holds
+	// this epoch's joiner secret and this joiner's path secret side by side, and it is a buffer
+	// this function produced rather than one a caller owns.
+	zeroizeSecret(plaintext)
+	if decodeErr != nil {
+		return nil, decodeErr
+	}
+	// and the two secrets the decode lifted out of it, on every path out of this function. Both
+	// are COPIED into the values that outlive the call -- NewKeyScheduleFromJoiner clones the
+	// joiner secret and DerivePathSecrets clones the rung it starts from -- so what stands here
+	// afterwards is a second live copy of the epoch, held by nothing that erases it.
+	defer func() {
+		zeroizeSecret(secrets.JoinerSecret)
+		if secrets.PathSecret != nil {
+			zeroizeSecret(secrets.PathSecret.PathSecret)
+		}
+	}()
+	if len(secrets.Psks) != 0 {
+		return nil, fmt.Errorf("%w: this welcome names %d pre-shared key(s)",
+			errProfilePsk, len(secrets.Psks))
+	}
+
+	// step 3: the group info, opened under welcome_key/welcome_nonce with EMPTY AAD.
+	//
+	// welcome_secret is DeriveSecret(Extract(joiner_secret, psk_secret), "welcome"), and this is
+	// the one derivation a joiner has to make outside the key schedule: NewKeyScheduleFromJoiner
+	// needs the group context, and the group context is inside the thing this key opens. Extract
+	// takes (salt, ikm) through the provider and the joiner secret is the SALT -- guardrail 1, and
+	// the transposition compiles and answers a secret exactly as well formed as the right one. The
+	// two derivations are held together twelve statements below rather than trusted to agree.
+	//
+	// The EMPTY AAD is transcribed from RFC 9420 section 12.4.3.1 and is not an omission: an
+	// implementation that fed the group context instead seals and opens against itself perfectly
+	// and interoperates with nothing.
+	memberSecret := crypto.Extract(secrets.JoinerSecret, EmptyPskSecret(crypto))
+	welcomeSecret := crypto.DeriveSecret(memberSecret, "welcome")
+	zeroizeSecret(memberSecret)
+	defer zeroizeSecret(welcomeSecret)
+	key, nonce, err := WelcomeKeyNonce(crypto, welcomeSecret)
+	if err != nil {
+		return nil, err
+	}
+	infoBytes, err := crypto.AeadOpen(key, nonce, nil, parsed.EncryptedGroupInfo)
+	// erased whether or not the open succeeded, for (*RatchetTree).DecryptUpdatePath's reason: the
+	// return path that would skip the erase is the one an error takes.
+	zeroizeSecret(key)
+	zeroizeSecret(nonce)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrWelcomeGroupInfoDecrypt, err)
+	}
+	info := &GroupInfo{}
+	if err := syntax.Unmarshal(infoBytes, info); err != nil {
+		return nil, err
+	}
+
+	// step 4: the tree, and whatever authority the group info has over it.
+	//
+	// VerifiedContext AND NOT Verify FOLLOWED BY A TREE HASH COMPARISON OF THIS FUNCTION'S OWN.
+	// Verify's rule 4 already compares the tree's hash against the group context's tree_hash, and
+	// a second comparison here would be a second reading of one question -- the dual
+	// representation this package has been rebuilt twice to remove -- which agrees with the first
+	// for exactly as long as the two happen to be spelled the same way. The door that answers it
+	// is also the door that answers the signature, the version, the suite, the signer bound, the
+	// blank signer leaf and the carried ratchet_tree, so a rule added there is added here by
+	// existing. What it costs is that this function inherits every gap Verify has, and the biggest
+	// of them is the one the header above is entirely about.
+	//
+	// It answers the VERIFIED context as well, which is what the proposal cache is bound to below:
+	// there is exactly one door onto a VerifiedGroupContext and this is a caller of it, rather
+	// than a second construction of the same authority.
+	tree, err := UnmarshalRatchetTree(ratchetTree)
+	if err != nil {
+		return nil, err
+	}
+	verified, err := info.VerifiedContext(crypto, tree)
+	if err != nil {
+		return nil, err
+	}
+	// the caller's statement of which group it meant to join, matched and never trusted. See the
+	// header: this refuses a joiner being placed in a group it did not ask for, and refuses
+	// nothing at all to an attacker who names the id its target expects.
+	if len(cfg.GroupId) != 0 &&
+		subtle.ConstantTimeCompare(cfg.GroupId, info.GroupContext.GroupId) != 1 {
+		return nil, fmt.Errorf("%w: this client asked to join %x and this welcome describes %x",
+			errWelcomeGroupIdNotTheOneAsked, cfg.GroupId, info.GroupContext.GroupId)
+	}
+
+	// step 5: the tree is a tree of this group at this epoch, and the group is one this profile
+	// runs. ValidateAgainstContext is where every leaf signature and every parent hash is checked;
+	// without it the group info above has been verified against a leaf of a tree nothing judged.
+	requiredCaps, err := requiredCapabilitiesOf(info.GroupContext.Extensions)
+	if err != nil {
+		return nil, err
+	}
+	treeCtx := &TreeValidationContext{
+		Crypto:          crypto,
+		Suite:           info.GroupContext.CipherSuite,
+		GroupId:         info.GroupContext.GroupId,
+		RequiredCaps:    requiredCaps,
+		GroupExtensions: info.GroupContext.Extensions,
+		// clamped to one millisecond for (*KeyPackage).Validate's reason: a NowMs of zero is
+		// LeafValidationContext's documented opt out of the lifetime check, so a machine whose
+		// clock is not set must not turn the one untrustworthy input into the one that disables
+		// the check it exists for.
+		NowMs:       uint64(max(time.Now().UnixMilli(), 1)),
+		ClockSkewMs: leafLifetimeSkewSeconds * 1000,
+	}
+	if err := tree.ValidateAgainstContext(treeCtx, &info.GroupContext); err != nil {
+		return nil, err
+	}
+	for i := range info.GroupContext.Extensions {
+		if err := active.checkGroupExtension(info.GroupContext.Extensions[i].ExtensionType); err != nil {
+			return nil, err
+		}
+	}
+	// a group this profile runs carries a policy, and it is asked for here rather than at the
+	// first message that needed a role -- which is (*Group).Members, whose answer degrades to
+	// RoleMember for every leaf when the policy will not parse.
+	if _, err := GroupPolicyOf(info.GroupContext.Extensions); err != nil {
+		return nil, err
+	}
+
+	// step 6: this joiner's own leaf.
+	//
+	// FOUND BY SIGNATURE KEY AND THEN HELD TO THE WHOLE LEAF NODE. The lookup alone says only that
+	// some leaf carries this device's signature key, and a tree is not known to be free of
+	// duplicate signature keys at this point -- FindLeafBySignatureKey's own comment says so, and
+	// picks the lowest for that reason. What the joiner actually needs is the leaf the committer
+	// installed FROM ITS KEY PACKAGE, because that is the leaf whose encryption key it holds the
+	// private half of and the leaf every later signature of its own will be attributed to. A tree
+	// carrying this joiner's signature key at a leaf with somebody else's encryption key passes
+	// the lookup, passes (*TreeKEMPrivate).Consistent -- which deliberately does not re-derive the
+	// leaf public key, there being no private-to-public operation on the provider -- and produces
+	// a member that decrypts nothing, with no refusal anywhere to point at.
+	ownLeaf, found := tree.FindLeafBySignatureKey(keys.KeyPackage.LeafNode.SignatureKey)
+	if !found {
+		return nil, fmt.Errorf("%w: no leaf of this tree carries this joiner's signature key",
+			ErrWelcomeLeafNotFound)
+	}
+	if err := leafIsTheOneThisJoinerPublished(tree.Leaf(ownLeaf), &keys.KeyPackage.LeafNode); err != nil {
+		return nil, fmt.Errorf("%w: at leaf %d", err, ownLeaf)
+	}
+
+	// step 7: the key schedule of the epoch this joiner is entering.
+	schedule, err := NewKeyScheduleFromJoiner(crypto, secrets.JoinerSecret,
+		EmptyPskSecret(crypto), &info.GroupContext)
+	if err != nil {
+		return nil, err
+	}
+	ownPriv := NewTreeKEMPrivate(ownLeaf, keys.EncryptPrivate)
+	var secretTree *SecretTree
+	// EVERY REFUSAL FROM HERE ON DROPS A FULLY DERIVED EPOCH, and an epoch that is dropped is
+	// erased. The schedule holds the init secret, the confirmation key, the encryption secret, the
+	// epoch authenticator, the exporter and the resumption PSK; the private state holds this
+	// device's leaf key and every path secret laddered above it. After the return nothing in this
+	// process can reach any of it, and unreachable is not erased. handedOn is what tells a refusal
+	// from the one path that gives all three to a Group that owes them its own Close.
+	handedOn := false
+	defer func() {
+		if handedOn {
+			return
+		}
+		schedule.Zeroize()
+		if secretTree != nil {
+			secretTree.Zeroize()
+		}
+		ownPriv.Zeroize()
+	}()
+
+	// the welcome secret this function derived in step 3 and the one the schedule derives from the
+	// same joiner secret are the SAME value by definition, and they are compared rather than
+	// assumed to be. They are two transcriptions of DeriveSecret(Extract(joiner_secret,
+	// psk_secret), "welcome") in two files, which is the shape guardrail 1 is about: a transposed
+	// Extract in either of them answers KDF.Nh well formed octets, and every test that does not
+	// hold the two against each other passes. This is a build disagreeing with itself rather than
+	// anything a peer did -- the same kind of refusal errCreationConfirmationTag makes in NewGroup
+	// -- and the alternative to making it is a joiner that opened the group info with one epoch's
+	// key and runs on another.
+	if subtle.ConstantTimeCompare(welcomeSecret, schedule.WelcomeSecret()) != 1 {
+		return nil, errJoinerWelcomeSecret
+	}
+	// ValSem205 from the joining side: the tag the group info carries is the one THIS joiner's
+	// confirmation key produces over the confirmed transcript hash THIS group info names. It is
+	// what turns "the sender described an epoch" into "the epoch I derived is that epoch", and it
+	// is the only check here that reaches the joiner secret at all. Through
+	// (*KeySchedule).VerifyConfirmationTag and therefore through CryptoProvider.MacVerify and
+	// crypto/subtle -- guardrail 8 -- which is also what refuses a truncated tag rather than
+	// comparing as much of it as fits.
+	if !schedule.VerifyConfirmationTag(info.GroupContext.ConfirmedTranscriptHash, info.ConfirmationTag) {
+		return nil, fmt.Errorf("%w: this welcome describes an epoch this joiner does not derive",
+			errBadConfirmationTag)
+	}
+	transcript := InitialTranscriptHashes()
+	if err := transcript.SetFromGroupInfo(crypto,
+		info.GroupContext.ConfirmedTranscriptHash, info.ConfirmationTag); err != nil {
+		return nil, err
+	}
+
+	// step 8: the private tree state -- this device's leaf key, and the ladder above the node it
+	// shares with the sender.
+	//
+	// Consistent re-derives each held secret's node key pair and requires the derived public key to
+	// be the one the tree already carries at that node, RFC 9420 section 12.4.3.1: "The private key
+	// MUST be the private key that corresponds to the public key in the node." It runs whether or
+	// not a path secret arrived, because a state holding nothing but a leaf index still asserts
+	// that the tree has a leaf there.
+	if secrets.PathSecret != nil {
+		if err := tree.installJoinerPathSecrets(crypto, ownPriv, ownLeaf, info.Signer,
+			secrets.PathSecret.PathSecret); err != nil {
+			return nil, err
+		}
+	}
+	if err := ownPriv.Consistent(crypto, tree); err != nil {
+		return nil, err
+	}
+
+	secretTree, err = NewSecretTree(crypto, tree.LeafWidth(), schedule.Secrets().Encryption)
+	if err != nil {
+		return nil, err
+	}
+	proposals, err := NewProposalCache(verified)
+	if err != nil {
+		return nil, err
+	}
+
+	group := &Group{
+		// THE STORE AND NOT THE CONFIG, which is Group's own field comment: a config is a caller's
+		// structure and the caller goes on holding it, and every other field this join needs comes
+		// out of the group info rather than out of the config. The group id, the extensions and
+		// the suite this group runs are the EPOCH's, and a join that installed the caller's copies
+		// of them would be a member whose published context and whose epoch secrets can part
+		// company.
+		store:  cfg.Store,
+		crypto: crypto,
+		// both COPIED, for NewGroup's reason: they are arrays the caller owns and goes on using,
+		// and this group signs with the one and names itself with the other for the whole of its
+		// life.
+		signer: SignaturePrivateKey(cloneBytes(keys.SignPrivate)),
+		cred: Credential{
+			CredentialType: keys.KeyPackage.LeafNode.Credential.CredentialType,
+			Identity:       cloneBytes(keys.KeyPackage.LeafNode.Credential.Identity),
+		},
+		ownLeaf:     ownLeaf,
+		ownPriv:     ownPriv,
+		tree:        tree,
+		context:     &info.GroupContext,
+		verified:    verified,
+		schedule:    schedule,
+		secretTree:  secretTree,
+		transcript:  transcript,
+		proposals:   proposals,
+		restoreKind: restoreFromJoiner,
+	}
+	if err := group.persist(); err != nil {
+		return nil, err
+	}
+	handedOn = true
+	return group, nil
+}
+
+// leafIsTheOneThisJoinerPublished compares the leaf standing in the tree against the leaf this
+// joiner's key package published, as ENCODINGS.
+//
+// The encoding and not a field by field comparison, for the reason (*GroupInfo).Verify compares
+// tree hashes rather than tree encodings, read the other way round: what is being asked is whether
+// these are the same leaf node, and a comparison written over the fields somebody listed answers
+// that question about the fields somebody listed. A leaf that grew a tenth field would be compared
+// over nine of them, silently, and the encoding is the one reading that cannot fall behind the
+// struct. Through subtle for the class reason guardrail 8 states.
+func leafIsTheOneThisJoinerPublished(inTree *LeafNode, published *LeafNode) error {
+	// a blank leaf is refused as an absent leaf and not as a mismatched one: FindLeafBySignatureKey
+	// skips blanks, so this arm is reachable only from a tree that changed under us, and a caller
+	// told "your leaf is not the one you published" would go looking at its key package.
+	if inTree == nil {
+		return fmt.Errorf("%w: the tree holds no leaf where this joiner's signature key was found",
+			ErrWelcomeLeafNotFound)
+	}
+	here, err := syntax.Marshal(inTree)
+	if err != nil {
+		return err
+	}
+	mine, err := syntax.Marshal(published)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare(here, mine) != 1 {
+		return errWelcomeLeafNotTheJoiners
+	}
+	return nil
+}
+
+// installJoinerPathSecrets seeds the joiner's ladder from the one rung its Welcome carried.
+//
+// The Welcome carries the secret for the LOWEST NODE THE JOINER'S LEAF AND THE SENDER'S LEAF SHARE
+// and for no other node, RFC 9420 section 12.4.3.1 -- it is also exactly the node the joiner is not
+// sealed to in the UpdatePath itself, because a member added by the same commit holds no key yet.
+// Every node above it is one DeriveSecret(., "path") away, which is what DerivePathSecrets returns
+// as a chain.
+//
+// THE WALK IS OVER THE SENDER'S FILTERED DIRECT PATH AND NOT OVER THE JOINER'S UNFILTERED ONE, and
+// the two are different node lists. The ladder the sender built runs over its own FILTERED path --
+// CreateUpdatePathSecrets derives one rung per node of it, and (*RatchetTree).DecryptUpdatePath
+// walks that same list from the shared node upward on the receiving side -- so a joiner laddering
+// over its unfiltered direct path would place the sender's rung k at the tree's node k+j for
+// whatever j the filter dropped, and every node from the first dropped one upward would hold a
+// secret that derives a key pair nothing in the tree matches. (*TreeKEMPrivate).Consistent refuses
+// that, so the symptom is a joiner that cannot join rather than one that joins wrongly; the reason
+// it is written here is that the two paths COINCIDE in the shapes a small fixture produces, and a
+// round trip through a two or three member group cannot tell them apart.
+//
+// Above the shared node the sender's filtered path and the joiner's are the same list, which is why
+// walking the sender's is walking the joiner's: for a node above the common ancestor both leaves
+// sit in the same child subtree, so the copath child the filter tests is the same node for both.
+//
+// The refusal for a shared node that is not on the sender's path is not the ordinary case -- it is
+// (*RatchetTree).DecryptUpdatePath's ErrNoPathSecret condition read from the other end -- but here
+// it means a Welcome that handed this joiner a path secret for an epoch whose update path never
+// covered it, which is a message to refuse rather than a state to build.
+// A METHOD ON THE TREE, where (*RatchetTree).EncryptUpdatePath, MergeUpdatePath and
+// DecryptUpdatePath are: every fact it reads is the tree's -- the sender's filtered direct path and
+// the node the two leaves share -- and the private state it writes into is a caller's, exactly as
+// it is for the decrypt half.
+func (self *RatchetTree) installJoinerPathSecrets(crypto CryptoProvider, priv *TreeKEMPrivate,
+	own LeafIndex, signer LeafIndex, pathSecret []byte) error {
+
+	// the provider first, before the tree is read: every rung of the ladder below is a
+	// DeriveSecret through it and the width check reads KDF.Nh off it, so a caller that passed
+	// none passed nothing this method could have used. Bare rather than wrapped, which is
+	// DeriveNodeKeyPair's spelling for the same condition.
+	if crypto == nil {
+		return ErrNilCryptoProvider
+	}
+	steps, err := self.filteredPathSteps(signer)
+	if err != nil {
+		return err
+	}
+	lowest := CommonAncestor(signer.NodeIndex(), own.NodeIndex())
+	start, onThePath := indexOfStep(steps, lowest)
+	if !onThePath {
+		return fmt.Errorf("%w: node %d is the lowest node leaf %d and leaf %d share, and it is not on leaf %d's filtered direct path",
+			errWelcomePathSecretNode, lowest, own, signer, signer)
+	}
+	// the width, checked before the ladder for (*RatchetTree).DecryptUpdatePath's reason at the
+	// same position: everything below this line agrees with a sender that agrees with itself, so
+	// this is the last place a wrong width is a statement about a message rather than about an
+	// epoch. It is a length and carries no secret, so the comparison is a plain one.
+	if len(pathSecret) != crypto.HashSize() {
+		return fmt.Errorf("%w: this welcome carries a path secret of %d octets, want %d",
+			errPathSecretLength, len(pathSecret), crypto.HashSize())
+	}
+	// one secret per node from the shared node to the root, which is len(steps)-start of them.
+	// DerivePathSecrets answers count+1 rungs -- the extra one is the rung past the root that
+	// section 8.1 makes the commit secret, which a joiner has no use for -- so the count is one
+	// less than the number of nodes. Asking for len(steps)-start here indexes one past the end of
+	// the path.
+	chain := DerivePathSecrets(crypto, pathSecret, len(steps)-start-1)
+	for i, secret := range chain {
+		priv.PathSecrets[steps[start+i].Node] = secret
+	}
+	return nil
+}

@@ -658,6 +658,33 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			_, err := NewGroup(nil, owner.SigPriv, BasicCredential(owner.IdentityPub))
 			return err
 		}},
+		// p7 task 16's join, whose two nil refusals name two different missing OBJECTS. The config
+		// carries the provider, the store and the profile, so a nil one is a caller that reached
+		// the door holding nothing at all; the key material carries the key package a Welcome is
+		// addressed to and the three private halves that open it, so a nil one is a caller that
+		// knows which group it wants and has nothing to join it AS. Every other argument of both
+		// rows is a live Welcome and a live tree, so what each observes is the argument it nils
+		// rather than a refusal standing in front of it.
+		"JoinFromWelcome(cfg)": {sentinel: errNilGroupConfig, call: func(t *testing.T) error {
+			welcome, ratchetTree, keys := nilArgumentJoinInputs(t, crypto)
+			_, err := JoinFromWelcome(nil, welcome, ratchetTree, keys)
+			return err
+		}},
+		"JoinFromWelcome(keys)": {sentinel: errNilJoinKeyMaterial, call: func(t *testing.T) error {
+			welcome, ratchetTree, _ := nilArgumentJoinInputs(t, crypto)
+			joiner := testGroupConfig(t, crypto, testIdentity(t, crypto, "the joiner"), "join-nil-argument")
+			_, err := JoinFromWelcome(joiner, welcome, ratchetTree, nil)
+			return err
+		}},
+		// the leaf pairing's own refusal, which is reachable only from a tree that changed under
+		// the joiner between the signature key lookup and the read: the lookup skips blank leaves.
+		// It answers the ABSENCE sentinel and not the substitution one, because a caller told its
+		// leaf is not the leaf it published would go looking at a key package that is fine.
+		"leafIsTheOneThisJoinerPublished(inTree)": {sentinel: ErrWelcomeLeafNotFound, call: func(t *testing.T) error {
+			member := testIdentity(t, crypto, "the joiner whose leaf is not there")
+			leaf, _ := testLeafNode(t, crypto, member)
+			return leafIsTheOneThisJoinerPublished(nil, leaf)
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

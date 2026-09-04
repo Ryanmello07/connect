@@ -758,7 +758,15 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// are the HPKE info every receiver rebuilds for itself, so a context this encoder accepted
 		// past MaxVectorLength is one no peer running the default limit could decrypt the path
 		// under. The list is sorted, which is why it stands ahead of the two below.
+		// p7 task 16's leaf pairing encodes the leaf standing in the tree and the leaf this
+		// joiner's key package published, so the two can be compared as octets rather than field
+		// by field. The DEFAULT limit and no other: neither answer travels -- both are compared
+		// and dropped -- and a leaf too large to encode under it is a leaf no encoder of this
+		// package could have written, so the refusal it produces is a join refused rather than a
+		// join made over a comparison that silently did not happen.
+		"group.go: syntax.Marshal(inTree)",
 		"group.go: syntax.Marshal(provisional)",
+		"group.go: syntax.Marshal(published)",
 		"group.go: syntax.Marshal(required)",
 		"group.go: syntax.Marshal(self.context)",
 		"group.go: syntax.Marshal(self.context)",
@@ -794,7 +802,19 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// capacity: a key package past MaxVectorLength is one no encoder of this package could
 		// have written and no peer running the default limit could have sent, and admitting one
 		// would mean advertising in a commit a structure every receiver refuses to decode.
+		// p7 task 16's group info, out of the AEAD the Welcome sealed it under. The DEFAULT limit,
+		// and it is the strictest reading in this file for ParseMLSMessage's reason one frame out:
+		// this is decoded by a party who is NOT YET A MEMBER, with no group state to check the
+		// result against and every length in it chosen by whoever sent it, so a raised bound here
+		// would be an acceptance rule handed to a stranger. It costs nothing, because v1 puts no
+		// ratchet_tree extension in a GroupInfo -- the tree is the joiner's own argument -- and
+		// that is the one thing that could push a GroupInfo past this bound.
+		"group.go: syntax.Unmarshal(infoBytes, info)",
 		"group.go: syntax.Unmarshal(keyPackage, &kp)",
+		// and the group secrets, out of the per joiner HPKE seal. The DEFAULT limit for the same
+		// reason and with even less to weigh: a GroupSecrets is one joiner secret, one optional
+		// path secret and a psks vector this profile always leaves empty.
+		"group.go: syntax.Unmarshal(plaintext, secrets)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure

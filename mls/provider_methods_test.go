@@ -844,6 +844,50 @@ func providerDrivenMethodRows() []providerDrivenMethodRow {
 		//
 		// The two renderings are deliberately neither 32 nor 48 octets long, so the KDF.Nh
 		// differential reads them as the non-digests they are.
+		// p7 task 16's joiner ladder. Two values, and they answer the three gates differently.
+		// The rung at the node the joiner and the sender share is the caller's own path secret
+		// CLONED, so it must be identical over a provider that flips every answer and must share
+		// no storage with what was handed in; every rung above it is a DeriveSecret through the
+		// provider and must move. A row that read only the first would report a clean run over a
+		// body that laddered through a provider of its own, and one that read only the last would
+		// say nothing about the clone -- which is the array a joiner's whole epoch is seeded from.
+		//
+		// leaf 0 is the sender and leaf 1 the joiner, over the tree this file already builds: its
+		// filtered direct path from leaf 0 is two nodes, so the ladder has a rung to climb. A
+		// shared node at the TOP of that path would give the ladder one rung and the routing half
+		// would observe nothing.
+		{name: "(*RatchetTree).installJoinerPathSecrets", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
+			tree := providerRowRatchetTree(t)
+			steps, err := tree.filteredPathSteps(LeafIndex(0))
+			if err != nil {
+				return nil, err
+			}
+			if len(steps) != 2 {
+				return nil, fmt.Errorf("the row's tree gave leaf 0 a filtered direct path of %d nodes, want 2",
+					len(steps))
+			}
+			state := NewTreeKEMPrivate(LeafIndex(1), HpkePrivateKey(bytes.Repeat([]byte{0x95}, 32)))
+			// the caller's own array, which the ladder starts from and must clone rather than keep
+			pathSecret := take(bytes.Repeat([]byte{0x96}, crypto.HashSize()))
+			if err := tree.installJoinerPathSecrets(crypto, state, LeafIndex(1), LeafIndex(0),
+				pathSecret); err != nil {
+				return nil, err
+			}
+			shared, held := state.PathSecrets[steps[0].Node]
+			if !held {
+				return nil, fmt.Errorf("the ladder installed no secret at node %d, so this row observes nothing at the shared node",
+					steps[0].Node)
+			}
+			above, held := state.PathSecrets[steps[1].Node]
+			if !held {
+				return nil, fmt.Errorf("the ladder installed no secret at node %d, so this row observes nothing above the shared node",
+					steps[1].Node)
+			}
+			return []providerDrivenMethodValue{
+				{name: "the rung at the node the joiner and the sender share", content: shared, carried: true},
+				{name: "the rung above it", content: above},
+			}, nil
+		}},
 		{name: "(*TreeKEMPrivate).Consistent", call: func(t *testing.T, crypto CryptoProvider, take func([]byte) []byte) ([]providerDrivenMethodValue, error) {
 			fixed := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
 			pathSecret := bytes.Repeat([]byte{0x93}, fixed.HashSize())

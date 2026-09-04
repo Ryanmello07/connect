@@ -2998,6 +2998,18 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal the message the DecryptWithLabel row reads: %v", err)
 	}
+	// p7 task 16's join, built ONCE for the reason the welcome row's key package is: this row is
+	// called twice over two recorders and the two answers are compared, so a Welcome minted per
+	// call would carry a fresh joiner secret and the epoch authenticator would move for a reason
+	// that has nothing to do with the joiner. The join itself draws nothing -- every value it
+	// answers is a function of the message, the tree and the key material it was handed -- which
+	// is what makes the comparison a live one.
+	joinGroup, joinRowJoiner, joinRowResult, joinRowKeys := joinTestCommit(t, crypto,
+		"the group the input gate joins", nil)
+	defer joinGroup.Close()
+	if err := joinGroup.MergePendingCommit(); err != nil {
+		t.Fatalf("merge the commit the join row's welcome came from: %v", err)
+	}
 	covered := []string{}
 	for _, testCase := range []struct {
 		name string
@@ -3457,6 +3469,39 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{group.GroupId(), leaf.Credential.Identity, leaf.SignatureKey,
 				members[0].LeafKeys.DeviceXwingPub}
+		}},
+		// p7 task 16's join, which is handed a caller's arrays in six places at once: the Welcome,
+		// the out-of-band tree, the group id its config names, and the three private keys of the
+		// joiner's key material. Two of those three are KEPT -- the signing key becomes this
+		// group's own and the encryption key becomes its leaf private state -- so a join that
+		// viewed either is a member whose signatures and whose path decryptions change the next
+		// time its caller reuses the buffer it read them out of.
+		//
+		// What it ANSWERS here are four values that are a function of its inputs alone, which is
+		// the whole of a join: it draws nothing at all, so unlike NewGroup next door even the
+		// epoch authenticator is deterministic across two calls and is worth comparing. The
+		// authenticator is the one that makes this row a live reading of the derivation rather
+		// than of the decode.
+		{name: "JoinFromWelcome", call: func(take func([]byte) []byte) [][]byte {
+			cfg := testGroupConfig(t, crypto, joinRowJoiner, "the group the input gate joins")
+			cfg.GroupId = take(cfg.GroupId)
+			joined, joinErr := JoinFromWelcome(cfg, take(joinRowResult.Welcome),
+				take(joinRowResult.RatchetTree), &JoinKeyMaterial{
+					KeyPackage:     joinRowKeys.KeyPackage,
+					InitPrivate:    HpkePrivateKey(take(joinRowKeys.InitPrivate)),
+					EncryptPrivate: HpkePrivateKey(take(joinRowKeys.EncryptPrivate)),
+					SignPrivate:    SignaturePrivateKey(take(joinRowKeys.SignPrivate)),
+				})
+			if joinErr != nil {
+				t.Fatalf("JoinFromWelcome: %v", joinErr)
+			}
+			defer joined.Close()
+			leaf := joined.OwnLeafNodeCopy()
+			if leaf == nil {
+				t.Fatal("the group this row joined holds no leaf at its own index")
+			}
+			return [][]byte{joined.GroupId(), leaf.Credential.Identity, leaf.SignatureKey,
+				joined.EpochAuthenticator()}
 		}},
 		// the path secret ladder of RFC 9420 section 7.4. Its first rung is the caller's own
 		// array -- in task 22 it is the plaintext an HpkeOpen just produced -- and the answer

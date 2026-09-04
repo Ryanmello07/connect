@@ -2284,3 +2284,997 @@ var welcomeMethodRowKeyPackage = sync.OnceValues(func() (*KeyPackage, error) {
 		testCapabilities(), nil)
 	return kp, err
 })
+
+// ---------------------------------------------------------------------------
+// p7 task 16: the receiving half of the join
+// ---------------------------------------------------------------------------
+
+// joinTestCommit founds a group, seeds it with one merged Add per name, then commits ONE MORE Add
+// and LEAVES THAT COMMIT PENDING.
+//
+// Pending rather than merged, because the staged epoch is what the forging fixtures below need:
+// (*StagedCommit).schedule holds the joiner secret and the welcome secret this epoch's Welcome was
+// sealed under, and a merge erases the epoch it closes and hands the new one to the group. A test
+// that wants the committer's own view calls MergePendingCommit itself, which is one line and is
+// visible where it matters.
+//
+// The seed members are added one commit each rather than all in one, so the tree has the shape a
+// group that grew has: a joiner added to a three member group sits at leaf 3 with a filtered
+// direct path the filter actually shortens, which is the shape the ladder walk is about.
+func joinTestCommit(t *testing.T, crypto CryptoProvider, groupId string, opts *CommitOptions,
+	seed ...string) (*Group, *testMember, *CommitResult, *JoinKeyMaterial) {
+
+	t.Helper()
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, groupId)
+	for _, name := range seed {
+		seeded := testIdentity(t, crypto, name)
+		seededKp, _, _ := testKeyPackage(t, crypto, seeded)
+		if _, err := group.CreateCommit(nil,
+			[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *seededKp}}}, nil); err != nil {
+			t.Fatalf("seed the fixture group with %s: %v", name, err)
+		}
+		if err := group.MergePendingCommit(); err != nil {
+			t.Fatalf("merge the commit adding %s: %v", name, err)
+		}
+	}
+	joiner := testIdentity(t, crypto, "the joiner")
+	kp, initPriv, encPriv := testKeyPackage(t, crypto, joiner)
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}, opts)
+	if err != nil {
+		t.Fatalf("commit the add this fixture is built on: %v", err)
+	}
+	if len(result.Welcome) == 0 {
+		t.Fatal("the commit adding this joiner answered no welcome, so every case below runs on nothing")
+	}
+	return group, joiner, result, &JoinKeyMaterial{
+		KeyPackage:     *kp,
+		InitPrivate:    initPriv,
+		EncryptPrivate: encPriv,
+		SignPrivate:    joiner.SigPriv,
+	}
+}
+
+// joinTestMerge promotes the pending commit, which is what makes the committer's own group the
+// epoch the joiner is about to enter.
+func joinTestMerge(t *testing.T, group *Group) {
+	t.Helper()
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+}
+
+// nilArgumentJoinInputs is a LIVE welcome, a live tree and live key material, for the two rows the
+// nil-argument gate writes over JoinFromWelcome.
+//
+// Live is the demand that gate makes: each row nils exactly one argument and every other one has to
+// be valid, or what the row observes is a refusal standing in front of the one it meant to test.
+func nilArgumentJoinInputs(t *testing.T, crypto CryptoProvider) ([]byte, []byte, *JoinKeyMaterial) {
+	t.Helper()
+	group, _, result, keys := joinTestCommit(t, crypto, "join-nil-argument", nil)
+	t.Cleanup(func() { group.Close() })
+	joinTestMerge(t, group)
+	return result.Welcome, result.RatchetTree, keys
+}
+
+// joinTestWelcomeSpec is one Welcome assembled from parts, so that a case can change exactly one
+// of them and leave every seal in the message well formed.
+//
+// It exists because the interesting refusals of JoinFromWelcome are not reachable by damaging the
+// bytes: a flipped octet is caught by an AEAD three steps before anything about the group is
+// judged. What reaches the group info signature, the confirmation tag and the leaf pairing is a
+// message an ATTACKER WHO HOLDS THE JOINER SECRET builds correctly and means differently, which is
+// exactly what this assembles.
+type joinTestWelcomeSpec struct {
+	// the epoch's joiner secret, which is what every key in the Welcome is derived from and what
+	// a forger has to hold to build one at all.
+	joinerSecret []byte
+	// the group context the group info describes. The confirmation tag below is computed over
+	// THIS context, so a case that changes the tree hash gets a tag that agrees with its change.
+	context *GroupContext
+	// who the group info says signed it, and the key it is actually signed with. The two are
+	// separate so that a case can sign at a member's index with a stranger's key.
+	signer   LeafIndex
+	signPriv SignaturePrivateKey
+	// the joiner this Welcome is addressed to, and where the tree puts it.
+	keyPackage *KeyPackage
+	leafIndex  LeafIndex
+	pathSecret []byte
+	// the confirmation tag to carry, or nil for the one this context's own key schedule produces.
+	tag []byte
+	// the welcome secret the group info is sealed under, or nil for the one this spec's joiner
+	// secret derives. BuildWelcome takes the joiner secret and the welcome secret as SEPARATE
+	// arguments, so a Welcome whose group info no joiner can open is a message a builder can
+	// produce -- and it is the only way to reach the AEAD refusal without damaging an octet that
+	// the per-joiner seal is bound to.
+	welcomeSecret []byte
+}
+
+// joinTestSealWelcome builds the Welcome that spec describes, as a joiner would receive it.
+//
+// The welcome secret and the confirmation tag are taken from NewKeyScheduleFromJoiner over the
+// spec's own joiner secret, which is the RECEIVE side's constructor rather than anything
+// JoinFromWelcome does inline: a fixture that re-used the function under test's own derivation
+// would agree with it however either of them was wrong.
+func joinTestSealWelcome(t *testing.T, crypto CryptoProvider, spec joinTestWelcomeSpec) []byte {
+	t.Helper()
+	schedule, err := NewKeyScheduleFromJoiner(crypto, spec.joinerSecret, EmptyPskSecret(crypto),
+		spec.context)
+	if err != nil {
+		t.Fatalf("the key schedule this fixture seals its welcome under: %v", err)
+	}
+	tag := spec.tag
+	if tag == nil {
+		tag = schedule.ConfirmationTag(spec.context.ConfirmedTranscriptHash)
+	}
+	info := &GroupInfo{GroupContext: *spec.context, ConfirmationTag: tag, Signer: spec.signer}
+	if err := info.Sign(crypto, spec.signPriv); err != nil {
+		t.Fatalf("sign the group info this fixture seals: %v", err)
+	}
+	welcomeSecret := spec.welcomeSecret
+	if welcomeSecret == nil {
+		welcomeSecret = schedule.WelcomeSecret()
+	}
+	welcome, err := BuildWelcome(crypto, crypto.Suite(), info, spec.joinerSecret,
+		welcomeSecret, []WelcomeJoiner{{
+			KeyPackage: *spec.keyPackage,
+			LeafIndex:  spec.leafIndex,
+			PathSecret: spec.pathSecret,
+		}})
+	if err != nil {
+		t.Fatalf("BuildWelcome: %v", err)
+	}
+	encoded, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatWelcome,
+		Welcome:    welcome,
+	})
+	if err != nil {
+		t.Fatalf("frame the welcome this fixture built: %v", err)
+	}
+	return encoded
+}
+
+// joinTestEncodeTree is the out-of-band tree argument, at the raised bound this package's own
+// encoder writes a ratchet tree at.
+func joinTestEncodeTree(t *testing.T, tree *RatchetTree) []byte {
+	t.Helper()
+	encoded, err := syntax.MarshalLimit(tree, syntax.MaxRatchetTreeLength)
+	if err != nil {
+		t.Fatalf("encode the tree this case hands the joiner: %v", err)
+	}
+	return encoded
+}
+
+// joinTestDecodeTree is the same the other way round, so a case can edit the tree a commit
+// published and hand the result back.
+func joinTestDecodeTree(t *testing.T, encoded []byte) *RatchetTree {
+	t.Helper()
+	tree, err := UnmarshalRatchetTree(encoded)
+	if err != nil {
+		t.Fatalf("decode the tree this commit published: %v", err)
+	}
+	return tree
+}
+
+// TestJoinFromWelcomeAgreesOnTheEpochAuthenticator is the round trip against task 15: a Welcome
+// that builder produced joins here, and the joiner lands on the epoch the committer computed.
+//
+// The epoch authenticator and the exporter are the two values that say so and neither can be
+// reached from public state: the authenticator is DeriveSecret(epoch_secret, "authentication") and
+// the exporter output is expanded from DeriveSecret(epoch_secret, "exporter"), so two parties that
+// agree on both agree on the epoch secret itself. A comparison of epochs, of member counts or of
+// tree hashes would be satisfied by a joiner that read the group info and derived nothing.
+func TestJoinFromWelcomeAgreesOnTheEpochAuthenticator(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-round-trip", nil)
+	defer group.Close()
+	joinTestMerge(t, group)
+
+	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-round-trip"),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("JoinFromWelcome: %v", err)
+	}
+	defer joined.Close()
+
+	if joined.Epoch() != group.Epoch() {
+		t.Fatalf("the joiner is at epoch %d and the committer at %d", joined.Epoch(), group.Epoch())
+	}
+	if joined.OwnLeafIndex() == group.OwnLeafIndex() {
+		t.Fatalf("the joiner and the committer both resolved to leaf %d", joined.OwnLeafIndex())
+	}
+	authenticator := group.EpochAuthenticator()
+	if len(authenticator) != crypto.HashSize() {
+		t.Fatalf("the committer's epoch authenticator is %d octets, so a comparison against it says nothing",
+			len(authenticator))
+	}
+	if !bytes.Equal(joined.EpochAuthenticator(), authenticator) {
+		t.Fatal("the joiner and the committer disagree on the epoch authenticator, so they are in two different epochs")
+	}
+	if len(joined.Members()) != 2 {
+		t.Fatalf("the joiner sees %d members, want 2", len(joined.Members()))
+	}
+	committerExport, err := group.Export("URmessage/v1/storage", nil, 32)
+	if err != nil {
+		t.Fatalf("the committer's Export: %v", err)
+	}
+	joinerExport, err := joined.Export("URmessage/v1/storage", nil, 32)
+	if err != nil {
+		t.Fatalf("the joiner's Export: %v", err)
+	}
+	if !bytes.Equal(committerExport, joinerExport) {
+		t.Fatal("the joiner and the committer derive different storage secrets from the epoch they agree they are in")
+	}
+	// and the joiner's own leaf is the one it published, which is what every later signature of
+	// its own will be attributed to
+	ownLeaf := joined.OwnLeafNodeCopy()
+	if ownLeaf == nil {
+		t.Fatal("the joined group holds no leaf node of its own")
+	}
+	if !bytes.Equal(ownLeaf.SignatureKey, joiner.SigPub) {
+		t.Fatal("the joiner landed on a leaf that is not its own")
+	}
+	// the group is persisted under the id the EPOCH names and not under the one the config named
+	if !bytes.Equal(joined.GroupId(), group.GroupId()) {
+		t.Fatalf("the joiner holds group id %x and the committer %x", joined.GroupId(), group.GroupId())
+	}
+}
+
+// TestJoinFromWelcomeLandsOnTheCommittersLadderOverAPathCommit is the same round trip over a commit
+// that CARRIES AN UPDATE PATH, which is the only shape in which the Welcome's path secret exists.
+//
+// The group is seeded to three members before the add, so the joiner's filtered direct path is
+// SHORTER than its unfiltered one: leaf 3 of a four leaf tree whose parent 5 has a blank copath
+// child under it. A joiner that laddered over the unfiltered path would place the committer's rung
+// at the wrong node from the first dropped one upward, and the node set asserted below is what
+// separates the two readings -- the epoch authenticator does not, because the ladder feeds no
+// secret the key schedule derives.
+func TestJoinFromWelcomeLandsOnTheCommittersLadderOverAPathCommit(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-with-a-path",
+		&CommitOptions{Force: true}, "carol", "dave")
+	defer group.Close()
+
+	// the live control: this commit carried a path and the Welcome names a place to pick it up.
+	// Without it every assertion below is about a joiner that installed nothing.
+	welcome := welcomeTestFromCommit(t, result.Welcome)
+	carried := welcomeTestOpenSecrets(t, crypto, welcome, 0, keys.InitPrivate)
+	if carried.PathSecret == nil {
+		t.Fatal("this commit carried no path secret for the joiner, so the ladder below is empty and observes nothing")
+	}
+	committerLeaf := group.OwnLeafIndex()
+	joinTestMerge(t, group)
+
+	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-with-a-path"),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("JoinFromWelcome: %v", err)
+	}
+	defer joined.Close()
+
+	if !bytes.Equal(joined.EpochAuthenticator(), group.EpochAuthenticator()) {
+		t.Fatal("the joiner and the committer disagree on the epoch authenticator")
+	}
+	// the nodes the joiner holds a secret for are exactly the committer's FILTERED direct path
+	// from the node the two leaves share up to the root
+	steps, err := joined.tree.filteredPathSteps(committerLeaf)
+	if err != nil {
+		t.Fatalf("the committer's filtered direct path: %v", err)
+	}
+	start, onThePath := indexOfStep(steps, CommonAncestor(committerLeaf.NodeIndex(),
+		joined.OwnLeafIndex().NodeIndex()))
+	if !onThePath {
+		t.Fatal("the node the joiner and the committer share is not on the committer's filtered path, so this fixture cannot say where the ladder should be")
+	}
+	want := []NodeIndex{}
+	for _, step := range steps[start:] {
+		want = append(want, step.Node)
+	}
+	held := []NodeIndex{}
+	for x := range joined.ownPriv.PathSecrets {
+		held = append(held, x)
+	}
+	slices.Sort(want)
+	slices.Sort(held)
+	if !slices.Equal(want, held) {
+		t.Fatalf("the joiner holds path secrets for %v and the committer's filtered path from the shared node up is %v",
+			held, want)
+	}
+	// and each of them is the secret for THAT node: the derived public half is the one the tree
+	// already carries there. This is (*TreeKEMPrivate).Consistent's question asked again from the
+	// test, so a join that stopped running it is a failure here rather than a silent success.
+	if err := joined.ownPriv.Consistent(crypto, joined.tree); err != nil {
+		t.Fatalf("the ladder the joiner installed does not match the tree it joined: %v", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesATreeThatIsNotTheOneTheGroupInfoDescribes is the plan's wrong-tree case.
+//
+// The refusal is (*GroupInfo).Verify's rule 4 reached through VerifiedContext, which is the one
+// door this package answers that question at. A joiner handed a well formed tree from somewhere
+// else derives an epoch nobody is in and reports nothing at all without it.
+func TestJoinFromWelcomeRefusesATreeThatIsNotTheOneTheGroupInfoDescribes(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-wrong-tree", nil)
+	defer group.Close()
+
+	other, _ := testTreeWith(t, crypto, "mallory", "trudy")
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-tree"),
+		result.Welcome, joinTestEncodeTree(t, other), keys)
+	if !errors.Is(err, ErrWelcomeTreeHashMismatch) {
+		t.Fatalf("JoinFromWelcome over a tree from another group = %v, want ErrWelcomeTreeHashMismatch", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAWelcomeAddressedToSomebodyElse is a Welcome that names no entry for
+// the key package this joiner holds.
+//
+// The ORDINARY condition rather than a forgery: every member of a group receives the Welcome a
+// commit produced, and a client that fetched one for a commit that added somebody else must be
+// able to tell that from a message it should have been able to open.
+func TestJoinFromWelcomeRefusesAWelcomeAddressedToSomebodyElse(t *testing.T) {
+	crypto := testCrypto(t)
+	group, _, result, _ := joinTestCommit(t, crypto, "join-not-mine", nil)
+	defer group.Close()
+
+	mallory := testIdentity(t, crypto, "mallory")
+	otherKp, otherInit, otherEnc := testKeyPackage(t, crypto, mallory)
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, mallory, "join-not-mine"),
+		result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+			KeyPackage:     *otherKp,
+			InitPrivate:    otherInit,
+			EncryptPrivate: otherEnc,
+			SignPrivate:    mallory.SigPriv,
+		})
+	if !errors.Is(err, ErrWelcomeNoMatchingKeyPackage) {
+		t.Fatalf("JoinFromWelcome over a welcome for somebody else = %v, want ErrWelcomeNoMatchingKeyPackage", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesSecretsSealedToAnotherJoinersInitKey is the pairing this task owes task
+// 15, from the receiving end.
+//
+// One commit adds TWO members, and the two entries' CIPHERTEXTS are exchanged while their
+// key package references stay where they were. That is precisely the fork errWelcomeAddPairing
+// refuses on the sending side -- entry i naming joiner i and carrying joiner j's seal -- and the
+// lookup half of this function cannot see it: the entry it selects is addressed to this joiner,
+// every length in it is right, and it is the INIT KEY that says no. Without the open, a joiner
+// would carry on with whatever the wrong entry decoded to.
+func TestJoinFromWelcomeRefusesSecretsSealedToAnotherJoinersInitKey(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "join-crossed-seals")
+	defer group.Close()
+
+	bob := testIdentity(t, crypto, "bob")
+	bobKp, bobInit, bobEnc := testKeyPackage(t, crypto, bob)
+	carol := testIdentity(t, crypto, "carol")
+	carolKp, _, _ := testKeyPackage(t, crypto, carol)
+	result, err := group.CreateCommit(nil, []Proposal{
+		{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *bobKp}},
+		{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *carolKp}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("commit the two adds this case is built on: %v", err)
+	}
+	joinTestMerge(t, group)
+
+	welcome := welcomeTestFromCommit(t, result.Welcome)
+	if len(welcome.Secrets) != 2 {
+		t.Fatalf("this commit's welcome carries %d entries and the crossing below needs 2",
+			len(welcome.Secrets))
+	}
+	// the live control: as it stands, this welcome joins. What the exchange below changes is one
+	// thing, so a refusal afterwards is about the crossing rather than about the fixture.
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, bob, "join-crossed-seals"),
+		result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+			KeyPackage: *bobKp, InitPrivate: bobInit, EncryptPrivate: bobEnc,
+			SignPrivate: bob.SigPriv,
+		})
+	if err != nil {
+		t.Fatalf("the unmodified welcome does not join, so the crossing below observes nothing: %v", err)
+	}
+	control.Close()
+	welcome.Secrets[0].EncryptedGroupSecrets, welcome.Secrets[1].EncryptedGroupSecrets =
+		welcome.Secrets[1].EncryptedGroupSecrets, welcome.Secrets[0].EncryptedGroupSecrets
+	crossed, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatWelcome,
+		Welcome:    welcome,
+	})
+	if err != nil {
+		t.Fatalf("re-frame the crossed welcome: %v", err)
+	}
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, bob, "join-crossed-seals"),
+		crossed, result.RatchetTree, &JoinKeyMaterial{
+			KeyPackage: *bobKp, InitPrivate: bobInit, EncryptPrivate: bobEnc,
+			SignPrivate: bob.SigPriv,
+		})
+	if !errors.Is(err, errWelcomeGroupSecretsDecrypt) {
+		t.Fatalf("JoinFromWelcome over an entry sealed to another joiner = %v, want errWelcomeGroupSecretsDecrypt", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesATamperedWelcome flips one octet of the message.
+//
+// It names the sentinel it expects rather than asserting err != nil, and which sentinel that is
+// carries the ordering: the last octet of the encoding is the tail of encrypted_group_info, and
+// encrypted_group_info is the HPKE CONTEXT every per-joiner seal was made against, so the entry
+// stops opening one step BEFORE the AEAD over the group info is ever reached. A bare err != nil
+// here would be satisfied by a function that refused for any reason at all.
+func TestJoinFromWelcomeRefusesATamperedWelcome(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-tampered", nil)
+	defer group.Close()
+
+	tampered := bytes.Clone(result.Welcome)
+	tampered[len(tampered)-1] ^= 0xFF
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-tampered"),
+		tampered, result.RatchetTree, keys)
+	if !errors.Is(err, errWelcomeGroupSecretsDecrypt) {
+		t.Fatalf("JoinFromWelcome over a tampered welcome = %v, want errWelcomeGroupSecretsDecrypt", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAGroupInfoNoMemberOfTheTreeSigned is the signature half, and it is the
+// case that says the group info is checked AGAINST THE TREE THE CALLER PASSED at all.
+//
+// The forger holds this epoch's joiner secret, so every seal in its message is correct and every
+// derivation this joiner makes succeeds: the entry opens, the group info opens, the tree hashes to
+// what the context names and the confirmation tag verifies. The ONE thing wrong with it is that
+// the signature at leaf 0 was made with a key leaf 0 does not carry. A join that skipped the
+// verification, or ran it against a tree it took out of the message, accepts this.
+func TestJoinFromWelcomeRefusesAGroupInfoNoMemberOfTheTreeSigned(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-forged-signature", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no epoch to forge a group info about")
+	}
+	stranger := testIdentity(t, crypto, "a stranger with a signing key of its own")
+	forged := joinTestSealWelcome(t, crypto, joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      staged.context,
+		signer:       group.OwnLeafIndex(),
+		signPriv:     stranger.SigPriv,
+		keyPackage:   &keys.KeyPackage,
+		leafIndex:    LeafIndex(1),
+	})
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-forged-signature"),
+		forged, result.RatchetTree, keys)
+	if !errors.Is(err, ErrWelcomeGroupInfoSignature) {
+		t.Fatalf("JoinFromWelcome over a group info no member of the tree signed = %v, want ErrWelcomeGroupInfoSignature",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAConfirmationTagThisJoinerDoesNotDerive is ValSem205 from the joining
+// side, over a message that is correct in every other respect.
+//
+// It cannot be reached by damaging bytes -- an AEAD refuses those long before -- so the tag is
+// changed at the point it is put INTO the group info, and the group info is then signed by the
+// member the tree says signed it. Everything else verifies. What the tag says is that the epoch
+// this joiner DERIVED is the epoch the sender described, and it is the only check in the whole
+// function that reaches the joiner secret; without it a joiner accepts a group context that was
+// never the one those secrets belong to.
+func TestJoinFromWelcomeRefusesAConfirmationTagThisJoinerDoesNotDerive(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-wrong-tag", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no epoch to describe wrongly")
+	}
+	honest := staged.schedule.ConfirmationTag(staged.context.ConfirmedTranscriptHash)
+	if len(honest) != crypto.HashSize() {
+		t.Fatalf("the staged epoch's confirmation tag is %d octets, so the change below says nothing",
+			len(honest))
+	}
+	// the same width and one octet different, so the refusal is the MAC and not a length check
+	wrong := bytes.Clone(honest)
+	wrong[0] ^= 0x01
+	spec := joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      staged.context,
+		signer:       group.OwnLeafIndex(),
+		signPriv:     group.signer,
+		keyPackage:   &keys.KeyPackage,
+		leafIndex:    LeafIndex(1),
+	}
+	// the live control: with the tag this context's own schedule produces, this fixture joins.
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-tag"),
+		joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the fixture welcome does not join with the honest tag, so the wrong one observes nothing: %v", err)
+	}
+	control.Close()
+	spec.tag = wrong
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-tag"),
+		joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+	if !errors.Is(err, errBadConfirmationTag) {
+		t.Fatalf("JoinFromWelcome over a group info carrying a tag this joiner does not derive = %v, want errBadConfirmationTag",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesALeafThatIsNotTheOneThisJoinerPublished is the leaf pairing.
+//
+// THE ATTACK IS A MALICIOUS COMMITTER, and it is worth naming because the shape looks like tidiness
+// rather than a rule. The committer builds the tree it publishes, so it can put a leaf at the
+// joiner's position that carries the JOINER'S SIGNATURE KEY -- so the joiner finds it and believes
+// it is its own -- and an ENCRYPTION KEY THE COMMITTER DREW. Everything then verifies: the group
+// info is signed by a real member about a real tree, the tree hashes to what the context names, the
+// confirmation tag is the one the joiner derives, and (*TreeKEMPrivate).Consistent passes because it
+// does not re-derive the leaf public key from the private half -- the provider has no such
+// operation. The joiner joins, signs as that leaf, and every path secret ever sealed to it is
+// sealed to a key the committer holds.
+//
+// What separates the two is that the leaf standing in the tree is not the leaf this joiner's key
+// package published, byte for byte.
+func TestJoinFromWelcomeRefusesALeafThatIsNotTheOneThisJoinerPublished(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-substituted-leaf", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no tree to rewrite")
+	}
+	// a leaf of the committer's own making, carrying the joiner's signature key and an encryption
+	// key nobody but this fixture drew. It is a leaf the joiner itself SIGNED nothing of -- the
+	// signature is the joiner's, because the committer would have to forge that too, and this case
+	// is about the ENCRYPTION key rather than about the signature.
+	substitute, _ := testLeafNode(t, crypto, joiner)
+	if bytes.Equal(substitute.EncryptionKey, keys.KeyPackage.LeafNode.EncryptionKey) {
+		t.Fatal("the substitute leaf carries the joiner's own encryption key, so this case swapped nothing")
+	}
+	tree := joinTestDecodeTree(t, result.RatchetTree)
+	if err := tree.SetLeaf(LeafIndex(1), substitute); err != nil {
+		t.Fatalf("install the substitute leaf: %v", err)
+	}
+	treeHash, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("the rewritten tree's hash: %v", err)
+	}
+	// the group context the forger publishes names ITS tree, and the confirmation tag is computed
+	// over that context, so nothing upstream of the leaf check has anything to object to.
+	context := staged.context.Clone()
+	context.TreeHash = treeHash
+	forged := joinTestSealWelcome(t, crypto, joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      context,
+		signer:       group.OwnLeafIndex(),
+		signPriv:     group.signer,
+		keyPackage:   &keys.KeyPackage,
+		leafIndex:    LeafIndex(1),
+	})
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-substituted-leaf"),
+		forged, joinTestEncodeTree(t, tree), keys)
+	if !errors.Is(err, errWelcomeLeafNotTheJoiners) {
+		t.Fatalf("JoinFromWelcome over a tree holding a substituted leaf = %v, want errWelcomeLeafNotTheJoiners",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAGroupItsCallerDidNotAskToJoin is the intent match, and its whole
+// content is what the doc comment says it is worth: a caller that named a group is not put in
+// another one.
+//
+// The case beneath it -- an attacker that names the id its target expects -- is the measured
+// forgery two tests down, which is where the limit of this check is stated in code rather than in
+// prose.
+func TestJoinFromWelcomeRefusesAGroupItsCallerDidNotAskToJoin(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-the-group-asked-for", nil)
+	defer group.Close()
+	joinTestMerge(t, group)
+
+	asking := testGroupConfig(t, crypto, joiner, "a different group entirely")
+	_, err := JoinFromWelcome(asking, result.Welcome, result.RatchetTree, keys)
+	if !errors.Is(err, errWelcomeGroupIdNotTheOneAsked) {
+		t.Fatalf("JoinFromWelcome into a group the caller did not name = %v, want errWelcomeGroupIdNotTheOneAsked",
+			err)
+	}
+	// and a caller that names no group at all is not refused: it has stated no intent to match
+	open := testGroupConfig(t, crypto, joiner, "a different group entirely")
+	open.GroupId = nil
+	joined, err := JoinFromWelcome(open, result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("JoinFromWelcome with no group id named = %v, want the join to proceed", err)
+	}
+	joined.Close()
+}
+
+// TestJoinFromWelcomeIsProtectedByNothingHereAgainstATreeItsCallerDidNotAnchor MEASURES the gap the
+// function's own comment is about, so that the sentence is a checked claim rather than a plausible
+// one.
+//
+// An attacker holding this device's PUBLISHED key package -- which the delivery service has, and
+// every member of every group this device has ever been added to has -- founds a group of its own
+// under the group id its target expects, adds that key package, and hands the target the Welcome
+// and the tree its own commit produced. Nothing in JoinFromWelcome refuses it, and nothing could:
+// every check the function makes is a check about the message and the tree agreeing with each
+// other, and they do.
+//
+// It is written as an assertion that the join SUCCEEDS, and that is deliberate. A test asserting a
+// refusal here would be asserting something this function does not do; what the reader needs to see
+// is the forgery working, so that the obligation the doc comment puts on the caller reads as a real
+// one. TestAJoinerThatTakesTheTreeOutOfTheGroupInfoItChecksIsProtectedByNothingHere is the same
+// statement one layer down, over (*GroupInfo).Verify.
+func TestJoinFromWelcomeIsProtectedByNothingHereAgainstATreeItsCallerDidNotAnchor(t *testing.T) {
+	crypto := testCrypto(t)
+	// the group the user meant to join, which the attacker never touches
+	honest, joiner, _, keys := joinTestCommit(t, crypto, "the group the user meant to join", nil)
+	defer honest.Close()
+	joinTestMerge(t, honest)
+
+	// and the attacker's, founded under the same id around the joiner's PUBLISHED key package
+	mallory := testIdentity(t, crypto, "mallory")
+	forgery := testNewGroup(t, crypto, mallory, "the group the user meant to join")
+	defer forgery.Close()
+	forged, err := forgery.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: keys.KeyPackage}}}, nil)
+	if err != nil {
+		t.Fatalf("the attacker's commit: %v", err)
+	}
+	if err := forgery.MergePendingCommit(); err != nil {
+		t.Fatalf("the attacker's merge: %v", err)
+	}
+
+	joined, err := JoinFromWelcome(
+		testGroupConfig(t, crypto, joiner, "the group the user meant to join"),
+		forged.Welcome, forged.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the forged welcome was refused with %v; if a rule of this function now catches it, this test has to say which one and the doc comment has to stop saying nothing does",
+			err)
+	}
+	defer joined.Close()
+
+	// the joiner is in the attacker's group, and every value it can reach says so
+	if !bytes.Equal(joined.EpochAuthenticator(), forgery.EpochAuthenticator()) {
+		t.Fatal("the joiner did not land in the attacker's epoch, so this case measured something else")
+	}
+	if bytes.Equal(joined.EpochAuthenticator(), honest.EpochAuthenticator()) {
+		t.Fatal("the attacker's group and the real one share an epoch authenticator, so this fixture built one group twice")
+	}
+	found := false
+	for _, member := range joined.Members() {
+		if bytes.Equal(member.IdentityPub, mallory.IdentityPub) && member.Role == RoleOwner {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the joined group does not name the attacker as its owner, so this case did not join the attacker's group")
+	}
+	// AND THE GROUP ID MATCHED, which is what says the intent check is an intent check: the
+	// attacker named the id its target expects and this function had nothing to say about it.
+	if !bytes.Equal(joined.GroupId(), honest.GroupId()) {
+		t.Fatal("the attacker's group id is not the one the user asked for, so this case did not measure the intent check's limit")
+	}
+}
+
+// joinRecordingProvider records the SALT of every Extract taken through it, as the caller's own
+// slice rather than a copy of it.
+//
+// The slice and not its contents, for stagedEpochStorage's reason: zeroizeSecret writes through the
+// backing array, so a recorder that kept a copy would read its copy afterwards and report a clean
+// erase over a function that ran none. The copy beside it is the live control -- an entry that was
+// already all zero when it was handed over would satisfy "all zero afterwards" while observing
+// nothing.
+type joinRecordingProvider struct {
+	CryptoProvider
+	salts    [][]byte
+	asHanded [][]byte
+}
+
+func (self *joinRecordingProvider) Extract(salt []byte, ikm []byte) []byte {
+	self.salts = append(self.salts, salt)
+	self.asHanded = append(self.asHanded, bytes.Clone(salt))
+	return self.CryptoProvider.Extract(salt, ikm)
+}
+
+// TestJoinFromWelcomeErasesTheJoinerSecretItUnwrapped is the erase obligation over the one secret a
+// join UNWRAPS rather than derives.
+//
+// The joiner secret is the whole epoch: welcome_secret, member_secret and epoch_secret all come out
+// of it, so a copy left standing in the heap after the join is the epoch's key material held by
+// nothing that erases it. It is COPIED into the key schedule -- NewKeyScheduleFromJoiner clones it
+// -- which is exactly why the copy this function decoded has to go: the schedule's own copy is
+// erased by (*KeySchedule).Zeroize and this one is erased by nobody.
+//
+// It is observed through the provider because that is the only place the slice is reachable from
+// outside: both Extracts of a join take the decoded joiner secret as their SALT, so a recorder that
+// keeps the argument keeps the array the deferred erase writes through.
+func TestJoinFromWelcomeErasesTheJoinerSecretItUnwrapped(t *testing.T) {
+	inner := testCrypto(t)
+	crypto := &joinRecordingProvider{CryptoProvider: inner}
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-erases", nil)
+	defer group.Close()
+	joinTestMerge(t, group)
+
+	crypto.salts, crypto.asHanded = nil, nil
+	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-erases"),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("JoinFromWelcome: %v", err)
+	}
+	defer joined.Close()
+
+	// two Extracts and no more: this function derives welcome_secret from the joiner secret and
+	// NewKeyScheduleFromJoiner derives member_secret from the same array. A reading that saw one
+	// would mean one of the two stopped happening, and a reading that saw three would mean a
+	// third derivation nobody accounted for.
+	if len(crypto.salts) != 2 {
+		t.Fatalf("a join took %d Extract(s); this one derives welcome_secret and member_secret from the joiner secret and nothing else",
+			len(crypto.salts))
+	}
+	for at, handed := range crypto.asHanded {
+		if len(handed) != inner.HashSize() {
+			t.Fatalf("Extract %d was salted with %d octets, want the joiner secret's %d",
+				at, len(handed), inner.HashSize())
+		}
+		if !slices.ContainsFunc(handed, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("the salt of Extract %d was already all zero when it was handed over, so an all zero reading afterwards would say nothing",
+				at)
+		}
+	}
+	// the two salts are ONE array, which is what says the schedule was handed the decoded secret
+	// rather than a copy somebody made on the way
+	if len(crypto.salts[0]) != len(crypto.salts[1]) ||
+		(len(crypto.salts[0]) != 0 && &crypto.salts[0][0] != &crypto.salts[1][0]) {
+		t.Fatal("the two Extracts of this join were salted from two different arrays, so erasing one leaves the other")
+	}
+	for at, salt := range crypto.salts {
+		for i, b := range salt {
+			if b != 0 {
+				t.Fatalf("byte %d of the joiner secret Extract %d was salted with is %#02x, want 0; the join returned with the epoch's root secret still in the heap",
+					i, at, b)
+			}
+		}
+	}
+}
+
+// TestZeroizingJoinKeyMaterialErasesThePrivateKeysAndLeavesTheKeyPackage is the erase this type
+// owes, in both directions.
+//
+// The key package half is asserted rather than left implicit, because "erase everything" is the
+// change somebody makes when the erase class grows and it would destroy a value the caller still
+// owns and that carries nothing an attacker lacks.
+func TestZeroizingJoinKeyMaterialErasesThePrivateKeysAndLeavesTheKeyPackage(t *testing.T) {
+	crypto := testCrypto(t)
+	member := testIdentity(t, crypto, "the joiner whose material this erases")
+	kp, initPriv, encPriv := testKeyPackage(t, crypto, member)
+	keys := &JoinKeyMaterial{
+		KeyPackage:     *kp,
+		InitPrivate:    initPriv,
+		EncryptPrivate: encPriv,
+		SignPrivate:    bytes.Clone(member.SigPriv),
+	}
+	held := map[string][]byte{
+		"InitPrivate":    keys.InitPrivate,
+		"EncryptPrivate": keys.EncryptPrivate,
+		"SignPrivate":    keys.SignPrivate,
+	}
+	for name, secret := range held {
+		if !slices.ContainsFunc(secret, func(b byte) bool { return b != 0 }) {
+			t.Fatalf("%s is already all zero, so an all zero reading afterwards would say nothing", name)
+		}
+	}
+	initKey := bytes.Clone(keys.KeyPackage.InitKey)
+	signature := bytes.Clone(keys.KeyPackage.Signature)
+
+	keys.Zeroize()
+
+	requireErased(t, "(*JoinKeyMaterial).Zeroize", held)
+	if !bytes.Equal(keys.KeyPackage.InitKey, initKey) {
+		t.Error("the erase touched the key package's init key, which is published in the key package this joiner handed the delivery service")
+	}
+	if !bytes.Equal(keys.KeyPackage.Signature, signature) {
+		t.Error("the erase touched the key package's signature, which is published beside it")
+	}
+	// and a nil receiver is a no-op rather than a fault, which is the shape every drop site has
+	var absent *JoinKeyMaterial
+	absent.Zeroize()
+}
+
+// TestJoinFromWelcomeRefusesAMessageItCannotOpenAtAll is the three refusals a joiner makes before
+// it has derived anything: the frame, the ciphersuite the message names against the one this
+// joiner published, and the same suite against the provider this client runs.
+//
+// Three sentinels and not one, because a caller repairs them in three different places. A message
+// that is not a Welcome is a caller that fetched the wrong record; a Welcome naming a suite this
+// joiner's key package does not is a key package published for another group; and a Welcome naming
+// a suite the provider does not run is two objects wired together wrongly inside this client. A
+// single value would send a caller to look at whichever of the three it guessed first.
+func TestJoinFromWelcomeRefusesAMessageItCannotOpenAtAll(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-unopenable", nil)
+	defer group.Close()
+	joinTestMerge(t, group)
+
+	// a message that is well formed, correctly framed, and not a Welcome
+	notAWelcome, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatKeyPackage,
+		KeyPackage: &keys.KeyPackage,
+	})
+	if err != nil {
+		t.Fatalf("frame the key package this case hands the joiner: %v", err)
+	}
+	if _, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-unopenable"),
+		notAWelcome, result.RatchetTree, keys); !errors.Is(err, errWelcomeWireFormat) {
+		t.Fatalf("JoinFromWelcome over a key package message = %v, want errWelcomeWireFormat", err)
+	}
+
+	// a key package naming the other registered suite. Its reference moves with the field, so the
+	// entry lookup would refuse this too -- the suite comparison is first precisely so the caller
+	// is told which of the two facts is wrong rather than "no entry is addressed to you".
+	elsewhere := *keys
+	elsewhere.KeyPackage.CipherSuite = CipherSuiteX25519AesGcm128Sha256Ed25519
+	if _, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-unopenable"),
+		result.Welcome, result.RatchetTree, &elsewhere); !errors.Is(err, ErrWelcomeSuiteMismatch) {
+		t.Fatalf("JoinFromWelcome with a key package naming another suite = %v, want ErrWelcomeSuiteMismatch", err)
+	}
+
+	// and a provider running the other suite. The welcome and the key package agree with each
+	// other here, so the two refusals above are out of the way and what is left is the pairing
+	// this client made: without it the disagreement surfaces two steps later as a group info that
+	// will not open, which names a message nobody tampered with.
+	narrow, err := NewCryptoProvider(CipherSuiteX25519AesGcm128Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider for the other registered suite: %v", err)
+	}
+	elsewhereCfg := testGroupConfig(t, crypto, joiner, "join-unopenable")
+	elsewhereCfg.Crypto = narrow
+	if _, err := JoinFromWelcome(elsewhereCfg, result.Welcome, result.RatchetTree,
+		keys); !errors.Is(err, errWelcomeJoinerProviderSuite) {
+		t.Fatalf("JoinFromWelcome under a provider running another suite = %v, want errWelcomeJoinerProviderSuite",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAGroupInfoItsOwnWelcomeKeyDoesNotOpen is the AEAD over the group info,
+// reached without damaging one octet of the message.
+//
+// The Welcome is built with a welcome secret that is NOT the one its joiner secret derives, which
+// BuildWelcome permits because it takes the two as separate arguments. Every per-joiner seal is
+// still made against this encrypted_group_info, so the entry opens and the joiner secret arrives
+// intact; what fails is the one step that says the group info belongs to the epoch those secrets
+// are for. A joiner that skipped it would carry on with a group context nothing bound to its own
+// key material.
+func TestJoinFromWelcomeRefusesAGroupInfoItsOwnWelcomeKeyDoesNotOpen(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-wrong-welcome-key", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no epoch to seal wrongly")
+	}
+	spec := joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      staged.context,
+		signer:       group.OwnLeafIndex(),
+		signPriv:     group.signer,
+		keyPackage:   &keys.KeyPackage,
+		leafIndex:    LeafIndex(1),
+	}
+	// the live control: sealed under the welcome secret this joiner secret derives, it joins
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-welcome-key"),
+		joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the fixture welcome does not join under its own welcome key, so the wrong one observes nothing: %v", err)
+	}
+	control.Close()
+
+	spec.welcomeSecret = bytes.Repeat([]byte{0x3c}, crypto.HashSize())
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-welcome-key"),
+		joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+	if !errors.Is(err, ErrWelcomeGroupInfoDecrypt) {
+		t.Fatalf("JoinFromWelcome over a group info sealed under another welcome key = %v, want ErrWelcomeGroupInfoDecrypt",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAPathSecretForANodeTheSendersPathDidNotCover is the ladder's own
+// refusal.
+//
+// The Welcome names a path secret and says its group info was signed at the JOINER'S OWN LEAF, so
+// the lowest node the joiner and the sender share is that leaf itself -- a node no filtered direct
+// path contains, since a direct path starts at a leaf's parent. Everything upstream verifies: the
+// signature is good, because the joiner's own signature key is what leaf 1 carries; the tree hash
+// matches; the confirmation tag is the one this joiner derives. Without the refusal the ladder
+// would be installed nowhere at all and the joiner would go on holding a path secret for an epoch
+// whose update path never covered it.
+func TestJoinFromWelcomeRefusesAPathSecretForANodeTheSendersPathDidNotCover(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-unreachable-ladder", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no epoch to describe")
+	}
+	forged := joinTestSealWelcome(t, crypto, joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      staged.context,
+		// the joiner's own leaf, signed with the joiner's own key: a group info this joiner would
+		// have had to sign, which is exactly what makes the shape reachable at all
+		signer:     LeafIndex(1),
+		signPriv:   joiner.SigPriv,
+		keyPackage: &keys.KeyPackage,
+		leafIndex:  LeafIndex(1),
+		pathSecret: bytes.Repeat([]byte{0x4d}, crypto.HashSize()),
+	})
+	_, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-unreachable-ladder"),
+		forged, result.RatchetTree, keys)
+	if !errors.Is(err, errWelcomePathSecretNode) {
+		t.Fatalf("JoinFromWelcome over a path secret for a node off the sender's path = %v, want errWelcomePathSecretNode",
+			err)
+	}
+}
+
+// joinDriftingExtractProvider answers an honest Extract once and a drifted one from the second call
+// on, which is the smallest way to make a build stop agreeing with itself about welcome_secret.
+//
+// A join takes exactly two Extracts and they are two transcriptions of one derivation: JoinFromWelcome
+// derives welcome_secret to open the group info, and NewKeyScheduleFromJoiner derives member_secret
+// from the same joiner secret one step later. A provider that answers the second differently is a
+// stand-in for the transposed argument order guardrail 1 is about -- with the two derivations in two
+// files, only a comparison between them can see it.
+type joinDriftingExtractProvider struct {
+	CryptoProvider
+	calls int
+}
+
+func (self *joinDriftingExtractProvider) Extract(salt []byte, ikm []byte) []byte {
+	self.calls += 1
+	answered := self.CryptoProvider.Extract(salt, ikm)
+	if self.calls >= 2 && len(answered) != 0 {
+		// the provider's OWN fresh answer, so this changes nothing the caller handed in
+		answered[0] ^= 0x01
+	}
+	return answered
+}
+
+// TestJoinFromWelcomeRefusesAWelcomeSecretItsOwnKeyScheduleDoesNotDerive holds the two
+// transcriptions of welcome_secret against each other.
+//
+// It is a refusal over a BUILD that has stopped agreeing with itself rather than over anything a
+// peer did, which is the same kind of statement errCreationConfirmationTag makes in NewGroup. It is
+// worth making because the two derivations are in two files and both answer KDF.Nh well formed
+// octets whichever way their Extract arguments are ordered: a joiner that opened the group info
+// with one epoch's key and then ran on another would agree with itself all the way to the first
+// message no peer could read.
+func TestJoinFromWelcomeRefusesAWelcomeSecretItsOwnKeyScheduleDoesNotDerive(t *testing.T) {
+	inner := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, inner, "join-drifting-extract", nil)
+	defer group.Close()
+	joinTestMerge(t, group)
+
+	// the live control: over the honest provider this welcome joins, so what the drift below
+	// observes is the comparison rather than the fixture
+	control, err := JoinFromWelcome(testGroupConfig(t, inner, joiner, "join-drifting-extract"),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the fixture welcome does not join over the honest provider: %v", err)
+	}
+	control.Close()
+
+	drifting := &joinDriftingExtractProvider{CryptoProvider: inner}
+	cfg := testGroupConfig(t, drifting, joiner, "join-drifting-extract")
+	_, err = JoinFromWelcome(cfg, result.Welcome, result.RatchetTree, keys)
+	if !errors.Is(err, errJoinerWelcomeSecret) {
+		t.Fatalf("JoinFromWelcome whose two welcome_secret derivations disagree = %v, want errJoinerWelcomeSecret",
+			err)
+	}
+	if drifting.calls != 2 {
+		t.Fatalf("the join took %d Extract(s); this case needs the second one to be the key schedule's, or it observed something else",
+			drifting.calls)
+	}
+}

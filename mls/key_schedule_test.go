@@ -3206,6 +3206,61 @@ func newGroupOverTheEpochSecret(t *testing.T, epoch ksVectorEpoch) (*Group, erro
 	return group, nil
 }
 
+// fixedEpochSecretProvider answers one chosen value for the "epoch" expansion, and for nothing
+// else.
+//
+// It is fixedRandomProvider's trick one derivation further in. A JOINER does not draw its epoch
+// secret -- it expands one from the joiner secret a Welcome handed it -- so a fixed Random cannot
+// put a known value inside the group the row below builds. What both halves of a join DO share is
+// ExpandWithLabel(member_secret, "epoch", GroupContext, KDF.Nh): the committer's key schedule
+// expands it and the joiner's expands it again, so fixing that one label puts the SAME known epoch
+// secret on both sides and the two go on agreeing about everything derived from it.
+type fixedEpochSecretProvider struct {
+	CryptoProvider
+	value []byte
+}
+
+func (self *fixedEpochSecretProvider) ExpandWithLabel(secret []byte, label string, context []byte,
+	length int) []byte {
+
+	if label == "epoch" && length == len(self.value) {
+		return bytes.Clone(self.value)
+	}
+	return self.CryptoProvider.ExpandWithLabel(secret, label, context, length)
+}
+
+// joinedGroupOverTheEpochSecret joins a group whose epoch secret IS the one this corpus epoch
+// publishes, which is what makes the JoinFromWelcome row below a live comparison.
+//
+// Without it the row could not fail, for newGroupOverTheEpochSecret's reason: the joiner secret a
+// real commit produces is a function of a random epoch, so whatever the joined group's exported
+// surface answered could never equal a value the corpus names.
+//
+// The fixed expansion is put back once the join is over, exactly as the fixed draw is next door:
+// it is there so the construction derives a KNOWN epoch secret and for nothing else, and left
+// standing every later epoch of that group would expand to the same value. Nothing G6 reads moves
+// with it -- the epoch secret this gate compares against is the one the schedule already holds.
+func joinedGroupOverTheEpochSecret(t *testing.T, epoch ksVectorEpoch) (*Group, error) {
+	t.Helper()
+	base, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider for the group this row joins: %v", err)
+	}
+	crypto := &fixedEpochSecretProvider{CryptoProvider: base, value: epochSecretOfTheEpoch(t, epoch)}
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join"+epoch.at, nil)
+	t.Cleanup(func() { group.Close() })
+	if mergeErr := group.MergePendingCommit(); mergeErr != nil {
+		t.Fatalf("merge the commit this row's welcome came from: %v", mergeErr)
+	}
+	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join"+epoch.at),
+		result.Welcome, result.RatchetTree, keys)
+	if err != nil || joined == nil {
+		return joined, err
+	}
+	joined.crypto = base
+	return joined, nil
+}
+
 // epochSecretHolderSweeps is how this gate reads a value of a type that keeps the epoch
 // secret. It is keyed by type name and checked against the derived closure in both
 // directions, so a second holder landing in this package fails here until somebody teaches
@@ -3323,6 +3378,15 @@ var epochSecretSurfaceRows = map[string]func(t *testing.T, epoch ksVectorEpoch) 
 	// newGroupOverTheEpochSecret for why a row over a randomly founded group could not fail.
 	"NewGroup": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
 		group, err := newGroupOverTheEpochSecret(t, epoch)
+		return []reflect.Value{reflect.ValueOf(group), reflect.ValueOf(&err).Elem()}
+	},
+	// p7 task 16's join, the second construction of this package to answer a group. It is driven
+	// onto this epoch's own epoch secret for NewGroup's reason -- see joinedGroupOverTheEpochSecret
+	// -- and it matters more here than there: a joiner derives epoch_secret from the joiner secret
+	// a Welcome handed it, so a group that reached this package's exported surface out of a
+	// message rather than out of a draw is exactly the shape G6 is about.
+	"JoinFromWelcome": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
+		group, err := joinedGroupOverTheEpochSecret(t, epoch)
 		return []reflect.Value{reflect.ValueOf(group), reflect.ValueOf(&err).Elem()}
 	},
 }

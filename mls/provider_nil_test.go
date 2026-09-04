@@ -177,6 +177,13 @@ func providerNilMethodRows() []providerNilMethodRow {
 		{name: "(*RatchetTree).MergeUpdatePath", call: func() error {
 			return (&RatchetTree{}).MergeUpdatePath(nil, 0, nil)
 		}},
+		// p7 task 16's joiner ladder, on the zero valued tree for the reason the three above
+		// are: filteredPathSteps refuses a leaf index outside a tree of no leaves with
+		// ErrLeafIndexOutOfRange, so a body that read its receiver before its provider answers a
+		// refusal about a leaf index the caller never chose.
+		{name: "(*RatchetTree).installJoinerPathSecrets", call: func() error {
+			return (&RatchetTree{}).installJoinerPathSecrets(nil, nil, 0, 0, nil)
+		}},
 		{name: "(*RatchetTree).DecryptUpdatePath", call: func() error {
 			_, err := (&RatchetTree{}).DecryptUpdatePath(nil, 0, nil, nil, nil, nil)
 			return err

@@ -1019,6 +1019,15 @@ func callerArrayRows() []callerArrayRow {
 			t.Cleanup(func() { group.Close() })
 			return []any{cfg, &signer, &cred}, group
 		}},
+		{name: "JoinFromWelcome", build: func(t *testing.T) ([]any, any) {
+			cfg, welcome, ratchetTree, keys := callerOwnedJoinArguments(t)
+			group, err := JoinFromWelcome(cfg, welcome, ratchetTree, keys)
+			if err != nil {
+				t.Fatalf("join the group this row follows: %v", err)
+			}
+			t.Cleanup(func() { group.Close() })
+			return []any{cfg, &welcome, &ratchetTree, keys}, group
+		}},
 		{name: "NewKeySchedule", build: func(t *testing.T) ([]any, any) {
 			crypto, context, secrets := callerOwnedScheduleArguments(t)
 			schedule, err := NewKeySchedule(crypto, secrets["init"], secrets["commit"],
@@ -1284,6 +1293,61 @@ func callerOwnedGroupArguments(t *testing.T) (*GroupConfig, SignaturePrivateKey,
 	}
 	return cfg, SignaturePrivateKey(bytes.Repeat([]byte{0x54}, 32)),
 		Credential{CredentialType: CredentialTypeBasic, Identity: bytes.Clone(identity)}
+}
+
+// callerOwnedJoinArguments builds the four arguments JoinFromWelcome takes, out of a real commit,
+// so that every route the argument TYPES declare storage down carries an array this gate can follow.
+//
+// TWO OF THOSE ROUTES ARE EMPTY IN AN ORDINARY KEY PACKAGE and they are filled here on purpose,
+// because a route this row leaves empty is a route a retention could hide behind:
+//
+//   - KeyPackage.Extensions is inside the KeyPackageTBS, so it is filled BEFORE the Add is
+//     committed and the key package is re-signed over it. Filling it afterwards would change the
+//     key package REFERENCE, and the Welcome names the reference this joiner published;
+//   - LeafNode.ParentHash is filled after, and can be, because a key_package sourced leaf does not
+//     encode it at all -- marshalCore writes the lifetime for that source and the parent hash only
+//     for a commit sourced one. So the octets are reachable from the argument and are in neither
+//     the reference nor the leaf encoding the join compares against the tree.
+func callerOwnedJoinArguments(t *testing.T) (*GroupConfig, []byte, []byte, *JoinKeyMaterial) {
+	t.Helper()
+	crypto := mustProvider(t, CipherSuiteX25519ChaCha20Sha256Ed25519)
+	owner := testIdentity(t, crypto, "the founder whose group this gate joins")
+	group := testNewGroup(t, crypto, owner, "the group this gate joins")
+	t.Cleanup(func() { group.Close() })
+
+	joiner := testIdentity(t, crypto, "the joiner whose arrays this gate follows")
+	keyPackage, initPriv, encPriv := testKeyPackage(t, crypto, joiner)
+	keyPackage.Extensions = []Extension{{
+		ExtensionType: ExtensionTypeApplicationId,
+		ExtensionData: []byte("the key package extension body this gate follows"),
+	}}
+	content, err := keyPackage.signedPreimage()
+	if err != nil {
+		t.Fatalf("the preimage of the key package this row publishes: %v", err)
+	}
+	signature, err := crypto.SignWithLabel(joiner.SigPriv, keyPackageSignatureLabel, content)
+	if err != nil {
+		t.Fatalf("re-sign the key package this row publishes: %v", err)
+	}
+	keyPackage.Signature = signature
+
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *keyPackage}}}, nil)
+	if err != nil {
+		t.Fatalf("commit the add this row's join follows: %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("merge the add this row's join follows: %v", err)
+	}
+	keys := &JoinKeyMaterial{
+		KeyPackage:     *keyPackage,
+		InitPrivate:    initPriv,
+		EncryptPrivate: encPriv,
+		SignPrivate:    SignaturePrivateKey(bytes.Clone(joiner.SigPriv)),
+	}
+	keys.KeyPackage.LeafNode.ParentHash = []byte("the parent hash a key_package leaf does not encode")
+	return testGroupConfig(t, crypto, joiner, "the group this gate joins"),
+		result.Welcome, result.RatchetTree, keys
 }
 
 // callerOwnedScheduleArguments builds the provider, the group context and the six secrets the key

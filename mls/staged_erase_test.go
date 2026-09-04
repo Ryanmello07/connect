@@ -997,6 +997,12 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"member of the group",
 	"StagedCommit.confirmTag": "the confirmation tag travels in the commit's own auth data and every receiver " +
 		"recomputes it; the confirmation KEY it is taken under is the secret, and the schedule erases that",
+	"JoinKeyMaterial.KeyPackage": "the joiner's own PUBLISHED key package, excused for the reason " +
+		"WelcomeJoiner.KeyPackage is: every field of its encoding went to the delivery service and to " +
+		"every member of every group that added this device, and the one field of the Go struct that is " +
+		"not encoded -- signPriv -- is written only by NewKeyPackage and cleared by UnmarshalMLS. The " +
+		"three private halves beside it are the key material, and (*JoinKeyMaterial).Zeroize erases all " +
+		"three",
 	"WelcomeJoiner.KeyPackage": "the joiner's PUBLISHED key package. It arrived in an Add proposal that went to " +
 		"every member of the group and to the delivery service, every field of its encoding is public, and the " +
 		"one field of the Go struct that is not encoded -- signPriv -- is written only by NewKeyPackage and " +
