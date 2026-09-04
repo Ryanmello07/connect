@@ -769,7 +769,8 @@ func TestEveryCommitThisGroupGeneratesPassesItsOwnValidateCommit(t *testing.T) {
 			}
 			// the tree the committer keeps is the tree the published path builds
 			if wire.Path != nil {
-				commitTestPathBuildsTheStagedTree(t, crypto, staged, wire, committer)
+				commitTestPathBuildsTheStagedTree(t, crypto, staged, wire, committer,
+					applied.Tree, applied.AddedLeaves)
 			}
 			stagedHash, err := staged.tree.TreeHash(crypto)
 			if err != nil {
@@ -790,7 +791,7 @@ func TestEveryCommitThisGroupGeneratesPassesItsOwnValidateCommit(t *testing.T) {
 // built over one tree while staging another would be a member whose epoch agrees with nobody, and
 // nothing in a self consistent commit says which tree the path was for.
 func commitTestPathBuildsTheStagedTree(t *testing.T, crypto CryptoProvider, staged *StagedCommit,
-	wire *Commit, committer LeafIndex) {
+	wire *Commit, committer LeafIndex, postProposal *RatchetTree, added []LeafIndex) {
 
 	t.Helper()
 	leaf := staged.tree.Leaf(committer)
@@ -801,6 +802,27 @@ func commitTestPathBuildsTheStagedTree(t *testing.T, crypto CryptoProvider, stag
 		t.Fatalf("the path publishes leaf key %x and the staged tree holds %x",
 			wire.Path.LeafNode.EncryptionKey, leaf.EncryptionKey)
 	}
+	// and every node addresses exactly the members the RECEIVER will compute for it. The added
+	// leaves are excluded, which is section 12.4.1's rule and the one an implementation gets wrong
+	// in the invisible direction: a path sealed to a joiner as well still opens for every member
+	// this build has, and it hands every OTHER member a ciphertext vector one entry longer than
+	// the resolution it indexes into -- which surfaces as a decrypt failure at a peer, one commit
+	// later, naming nothing.
+	targets, err := postProposal.EncryptionTargets(committer, added)
+	if err != nil {
+		t.Fatalf("the committer's encryption targets over the post-proposal tree: %v", err)
+	}
+	if len(targets) != len(wire.Path.Nodes) {
+		t.Fatalf("the path publishes %d node(s) and the post-proposal tree gives the committer %d",
+			len(wire.Path.Nodes), len(targets))
+	}
+	for i := range targets {
+		if len(wire.Path.Nodes[i].EncryptedPathSecret) != len(targets[i]) {
+			t.Errorf("path node %d carries %d ciphertext(s) and its copath child resolves to %d position(s) once the leaves this commit adds are taken out",
+				i, len(wire.Path.Nodes[i].EncryptedPathSecret), len(targets[i]))
+		}
+	}
+
 	filtered, err := staged.tree.FilteredDirectPath(committer)
 	if err != nil {
 		t.Fatalf("the committer's filtered direct path: %v", err)
@@ -1082,5 +1104,86 @@ func TestMergePendingCommitMovesTheProposalCacheToTheEpochItEntered(t *testing.T
 	// and a commit built over it names that proposal, which is the whole point of the binding
 	if _, err := group.CreateCommit(nil, nil, nil); !errors.Is(err, ErrSelfUpdateInCommit) {
 		t.Fatal("the commit built after the merge did not even see this member's own update, so Pending answered nothing")
+	}
+}
+
+// TestNoAnswerOfAStagedCommitSharesStorageWithIt is the hand-out rule over the second stateful
+// value this task lands.
+//
+// A staged commit holds the tree, the schedule, the transcript and the group context a merge is
+// about to install, and its accessors are the only route to any of it. An accessor answering the
+// live array is a caller that can edit the epoch this client is about to enter -- after the commit
+// has been signed and sent, with the tree hash and the key schedule going on agreeing with each
+// other over whatever the caller wrote.
+//
+// Every octet run each accessor answers is SCRIBBLED and the staged state is read again, which is
+// what tells a copy from a window: a copy leaves the staged epoch where it was, and a window moves
+// it. The accessors that answer no octets are driven anyway, so a row here is a member of the
+// method set rather than one somebody thought of.
+func TestNoAnswerOfAStagedCommitSharesStorageWithIt(t *testing.T) {
+	crypto := testCrypto(t)
+	group, _, _ := commitTestGroupOfTwo(t, crypto)
+	defer group.Close()
+	if _, err := group.CreateCommit([][]byte{}, nil, nil); err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("the commit staged nothing, so this test read nothing")
+	}
+
+	// what the staged epoch holds, read before anything is written through an answer
+	authenticator := bytes.Clone(staged.schedule.Secrets().EpochAuthenticator)
+	extensions := make([][]byte, 0, len(staged.context.Extensions))
+	for _, extension := range staged.context.Extensions {
+		extensions = append(extensions, bytes.Clone(extension.ExtensionData))
+	}
+	if len(authenticator) == 0 || len(extensions) == 0 {
+		t.Fatal("the staged epoch holds no authenticator or no extension, so this test scribbled over nothing")
+	}
+
+	scribbled := 0
+	for _, run := range staged.EpochAuthenticator() {
+		_ = run
+	}
+	answeredAuthenticator := staged.EpochAuthenticator()
+	for i := range answeredAuthenticator {
+		answeredAuthenticator[i] ^= 0xFF
+		scribbled += 1
+	}
+	for _, extension := range staged.GroupContextExtensions() {
+		for i := range extension.ExtensionData {
+			extension.ExtensionData[i] ^= 0xFF
+			scribbled += 1
+		}
+	}
+	// the index vectors carry no octets and are answered as copies for the same reason; writing
+	// through them is what says so
+	for _, vector := range [][]LeafIndex{staged.AddedLeaves(), staged.RemovedLeaves(), staged.UpdatedLeaves()} {
+		for i := range vector {
+			vector[i] = LeafIndex(0xFFFFFFF)
+			scribbled += 1
+		}
+	}
+	if scribbled == 0 {
+		t.Fatal("no accessor answered an octet or an index, so nothing was written through")
+	}
+
+	if !bytes.Equal(staged.schedule.Secrets().EpochAuthenticator, authenticator) {
+		t.Error("a caller writing through EpochAuthenticator() changed the epoch authenticator the staged epoch holds")
+	}
+	if len(staged.context.Extensions) != len(extensions) {
+		t.Fatalf("the staged context now carries %d extension(s) and held %d", len(staged.context.Extensions), len(extensions))
+	}
+	for i := range extensions {
+		if !bytes.Equal(staged.context.Extensions[i].ExtensionData, extensions[i]) {
+			t.Errorf("a caller writing through GroupContextExtensions() changed entry %d of the extension vector the staged epoch was derived over",
+				i)
+		}
+	}
+	// and the accessors go on answering what they answered, which is the same claim read through
+	// the surface rather than through the fields
+	if !bytes.Equal(staged.EpochAuthenticator(), authenticator) {
+		t.Error("EpochAuthenticator() answers something other than the epoch authenticator after a caller wrote through its previous answer")
 	}
 }

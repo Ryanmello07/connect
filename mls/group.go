@@ -1255,11 +1255,15 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 
 	// step 1: name the proposals.
 	//
-	// The references are CLONED on the way in, for the reason the group id is cloned on the way
-	// out of GroupId(): these octets go into the commit's own vector, which this group keeps on
-	// the staged commit and which the confirmed transcript hash covers, so a caller that went on
-	// writing into the buffer it named a proposal out of would be rewriting a commit that has
-	// already been signed.
+	// THE CALLER'S OCTETS ARE NOT COPIED HERE, and that is measured rather than assumed. Nothing
+	// below retains this vector: it is read into (*ProposalCache).Resolve, which keys every
+	// by-reference entry through `string(entry.Reference)` -- a conversion that copies -- and
+	// copies every by-value proposal through the codec, and the commit's own vector is then built
+	// from the RESOLVED list rather than from these entries. A clone here would be a second copy
+	// covering for the one really doing the work, which is the shape
+	// (*Group).ProposeGroupContextExtensions rejects at the other end of the same file: with the
+	// clone in place, aliasing the caller's reference left the whole of ./mls/... and
+	// ./message/... green, because there was no input that could tell the two programs apart.
 	refs := []ProposalOrRef{}
 	if byReference == nil {
 		refs = append(refs, self.proposals.Pending(self.context)...)
@@ -1267,7 +1271,7 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 		for _, ref := range byReference {
 			refs = append(refs, ProposalOrRef{
 				Type:      ProposalOrRefTypeReference,
-				Reference: ProposalRef(cloneBytes(ref)),
+				Reference: ProposalRef(ref),
 			})
 		}
 	}
@@ -1475,6 +1479,14 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 			ConfirmationTag: authenticated.Auth.ConfirmationTag,
 			Now:             time.Now(),
 		}
+		// MEASURED, because a door that never fires reads like one that is not needed: deleting
+		// this call leaves the whole of ./mls/... and ./message/... green over every input this
+		// build can construct today, since section 12.2's rules are already asked one block up
+		// and this generator builds its own path correctly. What it catches is the class it was
+		// put here for -- a generator handing its own door a tree the receiver will not have --
+		// and that class has a measured instance: with `postProposal` replaced by the tree the
+		// path has already been merged into, ValSem207 refuses the commit HERE, and nothing else
+		// in this package notices.
 		if err := ValidateCommit(commitInput); err != nil {
 			return nil, err
 		}
