@@ -2660,10 +2660,11 @@ var (
 	// It is a caller mistake in the same sense the value above is -- Processed and its Commit
 	// field are exported and connect/message holds them across a policy decision, so two groups'
 	// results are two values of one type in one caller's hands -- and it is the refusal that keeps
-	// the mistake from being silent. MEASURED before the binding existed: group B, given a
-	// Processed group A had staged, answered nil, moved from epoch 1 to epoch 3 and then derived
-	// byte-identical epoch authenticators, because nothing in this body read the commit's
-	// provenance at all.
+	// the mistake from being silent. MEASURED, with the two refusals below deleted: group B, given
+	// a Processed group A had staged, answered nil, left epoch 1 for the epoch A's commit opened,
+	// and then answered an epoch authenticator byte-identical to A's -- two groups with different
+	// ids and no member in common, running one epoch, because nothing in this body read the
+	// commit's provenance at all.
 	errApplyCommitNotThisGroups = errors.New("mls: ApplyCommit was handed a commit another group staged")
 
 	// errApplyCommitNotThisEpochs is a staged commit of THIS group derived against an epoch this
@@ -3309,9 +3310,10 @@ func (self *Group) updatedOwnLeafPrivateLocked(applied *ApplyResult) (*TreeKEMPr
 // asks. Processed and its Commit field are exported and connect/message is documented as holding
 // Processed values across a policy decision, so what the two refusals below catch is the EXPECTED
 // caller shape rather than a contrived one: two groups results are two values of one type in one
-// caller hands. Without the binding, group B handed a Processed group A had staged answered nil,
-// moved from epoch 1 to epoch 3 and then derived byte-identical epoch authenticators -- measured,
-// and the reason the binding is the first thing this body reads.
+// caller hands. With the two refusals below deleted, group B handed a Processed group A had staged
+// answered nil, left epoch 1 for the epoch A commit opened, and then answered an epoch
+// authenticator byte-identical to A own -- measured, and the reason the binding is the first thing
+// this body reads.
 //
 // BOTH HALVES, AND NEVER THE EPOCH ALONE. Every group this client is a member of runs an epoch 7,
 // so an epoch number is not an identity; and the group id alone would admit a staged epoch of this

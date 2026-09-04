@@ -1,9 +1,10 @@
 // The provenance a staged commit carries, and the door that reads it.
 //
 // (*Group).ApplyCommit checked the Kind, the nil, the closed flag and RemovesSelf and NOTHING about
-// where the commit it was handed came from. Measured: two independent groups A and B, and
-// receiverB.ApplyCommit given a Processed receiverA had staged answered nil, moved B from epoch 1
-// to epoch 3, and B then derived byte-identical epoch authenticators. Processed and its Commit
+// where the commit it was handed came from. Measured, by deleting the two refusals this file exists
+// for and running the first case below: two independent groups A and B, and receiverB.ApplyCommit
+// given a Processed receiverA had staged answered nil, moved B out of epoch 1 into the epoch A's
+// commit opened, and left the two groups answering one epoch authenticator. Processed and its Commit
 // field are exported and connect/message holds Processed values across a policy decision, so two
 // groups' results are two values of one type in one caller's hands: this is the expected caller
 // shape rather than a contrived one.
