@@ -1876,6 +1876,147 @@ func TestTheWelcomePathSecretIsTheOneForTheLowestNodeTheJoinerAndCommitterShare(
 	}
 }
 
+// TestACommitAddingTwoMembersPairsEachJoinerWithItsOwnKeyPackageAndItsOwnLeaf holds the pairing
+// (*StagedCommit).welcomeMessage rests on ELEMENT BY ELEMENT, which is the reading a count cannot
+// make.
+//
+// errWelcomeAddPairing compares two LENGTHS, and the sentence it is written under is about a
+// divergence that happens "with every length equal": StagedCommit.added and (*ProposalList).Adds
+// are two readings of one Add list, so entry i of one is entry i of the other, and a build where
+// that stopped holding would seal each joiner's group secrets to some OTHER joiner's init key and
+// hand it some other joiner's leaf. Until this fixture no test in this package committed more than
+// ONE Add, so every pairing the loop makes was element zero with element zero -- true however the
+// index is written, and green under a body that had replaced both of them with a constant.
+//
+// TWO ADDS, distinct key packages and distinct leaves, and both halves of the pairing observed:
+//
+//   - joiner i's group secrets are sealed to joiner i's OWN init key. Read twice, because the two
+//     readings fail differently: the entry NAMES joiner i's key package reference, and it opens
+//     under joiner i's init private key and no other;
+//   - joiner i is handed the path secret for the lowest node ITS OWN leaf and the committer's leaf
+//     share. That is the only observable consequence of the leaf index the loop pairs with the key
+//     package -- RFC 9420's GroupSecrets carries no leaf index at all, so a joiner handed the
+//     wrong leaf learns it from the path secret it cannot place, one epoch later, or never.
+//
+// The discriminations are asserted before either half is read: the joiners' init keys differ, the
+// two leaves differ, the two shared nodes differ, and the two nodes carry different keys. Without
+// those four this test would pass over a build that answered element zero for both.
+func TestACommitAddingTwoMembersPairsEachJoinerWithItsOwnKeyPackageAndItsOwnLeaf(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "welcome-pairing")
+	defer group.Close()
+
+	names := []string{"bob", "carol"}
+	packages := []*KeyPackage{}
+	initPrivs := []HpkePrivateKey{}
+	proposals := []Proposal{}
+	for _, name := range names {
+		kp, initPriv, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, name))
+		packages = append(packages, kp)
+		initPrivs = append(initPrivs, initPriv)
+		proposals = append(proposals,
+			Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}})
+	}
+	// FORCED, because the LEAF half of the pairing is observable only through the path secret. An
+	// add-only commit carries no update path, so every joiner is handed a null path_secret and the
+	// leaf index the loop paired with the key package leaves no trace on the wire at all.
+	result, err := group.CreateCommit(nil, proposals, &CommitOptions{Force: true})
+	if err != nil {
+		t.Fatalf("CreateCommit adding two members with a forced path: %v", err)
+	}
+	staged := group.stagedForTest()
+	if staged == nil || staged.plan == nil {
+		t.Fatal("the forced commit staged no update path plan, so this test is not about the shape it was written for")
+	}
+	if len(staged.added) != len(names) {
+		t.Fatalf("the commit added %d leaf/leaves and this fixture exists to commit %d; a one element fixture cannot tell a pairing from a constant",
+			len(staged.added), len(names))
+	}
+
+	// the four discriminations, all of them before anything is read off the welcome.
+	committer := group.OwnLeafIndex()
+	published, err := UnmarshalRatchetTree(result.RatchetTree)
+	if err != nil {
+		t.Fatalf("decode the published tree: %v", err)
+	}
+	ancestors := []NodeIndex{}
+	for i, leaf := range staged.added {
+		if leaf == committer {
+			t.Fatalf("added leaf %d is the committer's own leaf %d", i, committer)
+		}
+		ancestors = append(ancestors, CommonAncestor(leaf.NodeIndex(), committer.NodeIndex()))
+	}
+	if staged.added[0] == staged.added[1] {
+		t.Fatalf("both joiners landed on leaf %d, so nothing here could tell one leaf from the other",
+			staged.added[0])
+	}
+	if ancestors[0] == ancestors[1] {
+		t.Fatalf("both joiners share node %d with the committer, so the path secret cannot say which leaf the builder paired with which key package",
+			ancestors[0])
+	}
+	if bytes.Equal(packages[0].InitKey, packages[1].InitKey) {
+		t.Fatal("the two joiners published one init key, so a seal to either of them is a seal to both")
+	}
+	nodes := []*ParentNode{}
+	for i, ancestor := range ancestors {
+		node := published.ParentAt(ancestor)
+		if node == nil {
+			t.Fatalf("the published tree holds no parent node at %d, the lowest node joiner %d and the committer share",
+				ancestor, i)
+		}
+		nodes = append(nodes, node)
+	}
+	if bytes.Equal(nodes[0].EncryptionKey, nodes[1].EncryptionKey) {
+		t.Fatal("the two shared nodes carry one encryption key, so the path secret comparisons below cannot tell which node a joiner was handed")
+	}
+
+	// and the pairing itself, element by element.
+	welcome := welcomeTestFromCommit(t, result.Welcome)
+	if len(welcome.Secrets) != len(names) {
+		t.Fatalf("the welcome carries %d entries and the commit added %d members",
+			len(welcome.Secrets), len(names))
+	}
+	for i := range names {
+		// the leaf the proposals actually installed this key package on, read off the tree the
+		// commit PUBLISHED rather than off staged.added, so the two orders are held together by
+		// something outside the structure the pairing is a reading of.
+		leaf := published.Leaf(staged.added[i])
+		if leaf == nil {
+			t.Fatalf("the published tree holds no leaf at %d, which this commit says it added", staged.added[i])
+		}
+		if !bytes.Equal(leaf.EncryptionKey, packages[i].LeafNode.EncryptionKey) {
+			t.Fatalf("leaf %d -- entry %d of the leaves this commit added -- does not carry %s's encryption key; StagedCommit.added and the Add proposals are not the same list in the same order",
+				staged.added[i], i, names[i])
+		}
+		ref, err := packages[i].Ref(crypto)
+		if err != nil {
+			t.Fatalf("Ref(%s): %v", names[i], err)
+		}
+		if !bytes.Equal(welcome.Secrets[i].NewMember, ref) {
+			t.Fatalf("welcome entry %d is addressed to a key package reference that is not %s's; each joiner's secrets are sealed to some other joiner's init key",
+				i, names[i])
+		}
+		// and it OPENS under that joiner's own init private key, which is the half a reference
+		// comparison cannot make: new_member is cleartext routing and the seal is the security.
+		secrets := welcomeTestOpenSecrets(t, crypto, welcome, i, initPrivs[i])
+		if !bytes.Equal(secrets.JoinerSecret, staged.schedule.JoinerSecret()) {
+			t.Fatalf("welcome entry %d carries a joiner secret that is not the staged epoch's", i)
+		}
+		if secrets.PathSecret == nil {
+			t.Fatalf("this commit carried an update path and welcome entry %d names no path secret", i)
+		}
+		_, pub, err := DeriveNodeKeyPair(crypto, secrets.PathSecret.PathSecret)
+		if err != nil {
+			t.Fatalf("DeriveNodeKeyPair over welcome entry %d's path secret: %v", i, err)
+		}
+		if !bytes.Equal(nodes[i].EncryptionKey, pub) {
+			t.Fatalf("joiner %d, at leaf %d, was handed the path secret for some node other than %d -- the lowest node ITS leaf and the committer's share; a joiner handed another joiner's rung derives the wrong key for every node above it",
+				i, staged.added[i], ancestors[i])
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the provider stub gate's rule for the structured argument this file owns
 // ---------------------------------------------------------------------------
