@@ -1414,9 +1414,11 @@ func encryptionKeyAt(t *testing.T, tree *RatchetTree, x NodeIndex) HpkePublicKey
 // TestThePrivateStateOpensEverythingSealedToTheKeysThisCommitInstalls is the round trip the
 // plan's private half exists to perform, made at the one place both halves are in scope.
 //
-// TreeKEMPrivate.Consistent deliberately does not check the leaf pair -- the provider surface
-// has no private-to-public operation, and its own comment defers it to task 22's decrypt, where
-// the UpdatePath carries the public key to compare against. That leaves task 18 as the only
+// TreeKEMPrivate.Consistent deliberately does not check the leaf pair -- its scope is the path
+// secrets, and its own comment defers the leaf pair to task 22's decrypt, where the UpdatePath
+// carries the public key to compare against. (The provider INTERFACE has no private-to-public
+// operation; hpkePublicKeyOf is the package level derivation outside it, and the join door uses it
+// on the one leaf pair a caller brings in from outside.) That leaves task 18 as the only
 // call in the package where the private key it stores and the public key it installs are both
 // present, and before this test nothing related them: the plan's leaf private key could be
 // drawn from a second, independent key pair and every test in this file passed, including the

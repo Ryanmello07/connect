@@ -151,6 +151,22 @@ var (
 	// mismatched pair signs every message it sends with a key its own published leaf does not
 	// name; every other member refuses those messages at the signature, and neither end holds
 	// anything that says why.
+	// errJoinerEncryptionKeyNotTheLeafs is a joiner whose leaf private key is not the private half
+	// of the encryption key its own key package published.
+	//
+	// The twin of the value below and refused at the same door, for the same reason: the two halves
+	// arrive there independently, the key package out of whatever the caller stored and the private
+	// half out of the device's own keyring. Nothing further down JoinFromWelcome ever uses this
+	// private half against a public one the Welcome carries -- (*TreeKEMPrivate).Consistent judges
+	// the PATH SECRETS and says so -- so a joiner that installed a mismatched pair joins cleanly,
+	// agrees on the epoch authenticator and carries application traffic for the rest of the epoch,
+	// and then decrypts NOTHING from the first commit that seals an update path to its leaf: every
+	// ciphertext addressed to the key its leaf publishes, opened with a key that is not its private
+	// half, reported at the far end as a corrupt commit. It is errUpdatedLeafPrivateKey's condition
+	// arriving one epoch early, at a door that had nothing to refuse it with.
+	errJoinerEncryptionKeyNotTheLeafs = errors.New(
+		"mls: this joiner's leaf private key is not the private half of the encryption key its key package published")
+
 	errJoinerSignatureKeyNotTheLeafs = errors.New(
 		"mls: this joiner's signing key is not the signature key its key package published")
 
@@ -1717,6 +1733,8 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 	staged := &StagedCommit{
 		committer:   self.ownLeaf,
 		epoch:       newContext.Epoch,
+		groupId:     cloneBytes(self.context.GroupId),
+		priorEpoch:  self.context.Epoch,
 		context:     newContext,
 		verified:    verified,
 		tree:        applied.Tree,
@@ -2132,6 +2150,22 @@ func JoinFromWelcome(cfg *GroupConfig, welcome []byte, ratchetTree []byte,
 	if subtle.ConstantTimeCompare(joinerSignatureKey, keys.KeyPackage.LeafNode.SignatureKey) != 1 {
 		return nil, errJoinerSignatureKeyNotTheLeafs
 	}
+	// AND THE ENCRYPTION HALF, at the same door, in the same sentence and for the same reason.
+	//
+	// This half went unchecked, and the reason written down for that -- in the comment at step 6 and
+	// in the round that reviewed it -- was that the provider has no private-to-public operation for
+	// HPKE. That is a true sentence about CryptoProvider and a false reason: hpkePublicKeyOf is a
+	// package level derivation deliberately outside the interface, exactly as signaturePublicKeyOf
+	// three lines up is, and both registered suites are DHKEM(X25519) so the public half of the
+	// scalar a caller holds is one multiplication away. So the door held the SIGNING half against
+	// the published leaf and installed the ENCRYPTION half against nothing.
+	joinerEncryptionKey, err := hpkePublicKeyOf(keys.EncryptPrivate)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errJoinerEncryptionKeyNotTheLeafs, err)
+	}
+	if subtle.ConstantTimeCompare(joinerEncryptionKey, keys.KeyPackage.LeafNode.EncryptionKey) != 1 {
+		return nil, errJoinerEncryptionKeyNotTheLeafs
+	}
 	active := cfg.Profile
 	if active == nil {
 		active = defaultProfile()
@@ -2347,9 +2381,12 @@ func JoinFromWelcome(cfg *GroupConfig, welcome []byte, ratchetTree []byte,
 	// installed FROM ITS KEY PACKAGE, because that is the leaf whose encryption key it holds the
 	// private half of and the leaf every later signature of its own will be attributed to. A tree
 	// carrying this joiner's signature key at a leaf with somebody else's encryption key passes
-	// the lookup, passes (*TreeKEMPrivate).Consistent -- which deliberately does not re-derive the
-	// leaf public key, there being no private-to-public operation on the provider -- and produces
-	// a member that decrypts nothing, with no refusal anywhere to point at.
+	// the lookup, passes (*TreeKEMPrivate).Consistent -- which judges the PATH SECRETS and
+	// deliberately does not re-derive the leaf public key; see its own comment -- and produces a
+	// member that decrypts nothing, with no refusal anywhere to point at. The joiner's OWN two
+	// halves are held together at the top of this function, through signaturePublicKeyOf and
+	// hpkePublicKeyOf; what this step adds is that the leaf the TREE carries is the one those two
+	// halves belong to.
 	ownLeaf, found := tree.FindLeafBySignatureKey(keys.KeyPackage.LeafNode.SignatureKey)
 	if !found {
 		return nil, fmt.Errorf("%w: no leaf of this tree carries this joiner's signature key",
@@ -2617,6 +2654,26 @@ var (
 	// commit. It is a caller's mistake and not a message fault, which is why it is not one of the
 	// three above.
 	errApplyCommitNotACommit = errors.New("mls: ApplyCommit was handed a result that is not a staged commit")
+
+	// errApplyCommitNotThisGroups is a staged commit ANOTHER GROUP derived, handed to this one.
+	//
+	// It is a caller mistake in the same sense the value above is -- Processed and its Commit
+	// field are exported and connect/message holds them across a policy decision, so two groups'
+	// results are two values of one type in one caller's hands -- and it is the refusal that keeps
+	// the mistake from being silent. MEASURED before the binding existed: group B, given a
+	// Processed group A had staged, answered nil, moved from epoch 1 to epoch 3 and then derived
+	// byte-identical epoch authenticators, because nothing in this body read the commit's
+	// provenance at all.
+	errApplyCommitNotThisGroups = errors.New("mls: ApplyCommit was handed a commit another group staged")
+
+	// errApplyCommitNotThisEpochs is a staged commit of THIS group derived against an epoch this
+	// group is no longer in -- one already merged and handed back, or one staged against an epoch
+	// the group has not reached.
+	//
+	// Separate from the value above rather than folded into it, because the two send a reader to
+	// different places: a group id mismatch is a caller that crossed two groups' results, and an
+	// epoch mismatch is a caller that kept one group's result across a boundary it already applied.
+	errApplyCommitNotThisEpochs = errors.New("mls: ApplyCommit was handed a commit staged against another epoch")
 
 	// errUpdatedLeafPrivateKey is a commit that installs an Update at THIS client's own leaf whose
 	// encryption key this client cannot produce the private half of.
@@ -2942,6 +2999,8 @@ func (self *Group) stageInboundCommitLocked(authenticated *AuthenticatedContent)
 		return &StagedCommit{
 			committer:   committer,
 			epoch:       self.context.Epoch + 1,
+			groupId:     cloneBytes(self.context.GroupId),
+			priorEpoch:  self.context.Epoch,
 			tree:        applied.Tree,
 			list:        list,
 			commit:      commit,
@@ -3175,6 +3234,8 @@ func (self *Group) stageInboundCommitLocked(authenticated *AuthenticatedContent)
 	staged := &StagedCommit{
 		committer:   committer,
 		epoch:       newContext.Epoch,
+		groupId:     cloneBytes(self.context.GroupId),
+		priorEpoch:  self.context.Epoch,
 		context:     newContext,
 		verified:    verified,
 		tree:        applied.Tree,
@@ -3244,16 +3305,33 @@ func (self *Group) updatedOwnLeafPrivateLocked(applied *ApplyResult) (*TreeKEMPr
 
 // ApplyCommit promotes a staged inbound commit to live state.
 //
-// THE STAGED EPOCH THIS REPLACES IS ERASED BEFORE IT IS DROPPED, and that is the ordinary path
-// rather than a cleanup one. A client that built its own commit and lost MASTER section 9.3's race
-// is holding a fully derived epoch nobody ever entered -- its own key schedule, its own secret tree
-// and the leaf key it drew for it -- and the peer's commit it is applying here is exactly what
-// makes that epoch dead. After the assignment below nothing in this process can reach it.
+// A STAGED COMMIT IS BOUND TO THE GROUP AND THE EPOCH THAT STAGED IT, and this is the door that
+// asks. Processed and its Commit field are exported and connect/message is documented as holding
+// Processed values across a policy decision, so what the two refusals below catch is the EXPECTED
+// caller shape rather than a contrived one: two groups results are two values of one type in one
+// caller hands. Without the binding, group B handed a Processed group A had staged answered nil,
+// moved from epoch 1 to epoch 3 and then derived byte-identical epoch authenticators -- measured,
+// and the reason the binding is the first thing this body reads.
+//
+// BOTH HALVES, AND NEVER THE EPOCH ALONE. Every group this client is a member of runs an epoch 7,
+// so an epoch number is not an identity; and the group id alone would admit a staged epoch of this
+// group that some other epoch of it derived. It is the pair (*ProposalCache).bindingHolds asks, for
+// that method own reason.
 //
 // A COMMIT THAT REMOVES THIS CLIENT MERGES NOTHING. There is no epoch to enter: the staged value is
-// the report stageInboundCommitLocked answers for that case, this group's own secrets are erased
+// the report stageInboundCommitLocked answers for that case, this group own secrets are erased
 // through Close, and the caller is told with ErrRemovedFromGroup rather than being handed a merge
-// that silently produced a group this client is not a member of.
+// that silently produced a group this client is not a member of. It is answered BEFORE the pending
+// refusal below and after the two above: a removal installs no epoch, so it is not one of the two
+// candidate epochs that refusal exists to keep apart, and it is not a commit a caller can decline.
+//
+// A LIVE PENDING COMMIT IS REFUSED AND NOT OVERWRITTEN, which is (*Group).CreateCommit discipline
+// at the other end of the same file rather than a second answer to the same question. A client
+// holding two staged epochs has nothing to say which of them the delivery service accepted, and the
+// repair -- ClearPendingCommit, which erases the epoch it drops -- is a decision the caller makes.
+// What this body did instead was erase the caller staged epoch itself and install the peer commit
+// over it, so a caller that had merely handed the wrong value lost a fully derived epoch to a call
+// that answered nil.
 func (self *Group) ApplyCommit(processed *Processed) error {
 	if processed == nil || processed.Kind != ProcessedCommit || processed.Commit == nil {
 		return errApplyCommitNotACommit
@@ -3263,18 +3341,34 @@ func (self *Group) ApplyCommit(processed *Processed) error {
 		self.stateLock.Unlock()
 		return errGroupClosed
 	}
-	if processed.Commit.RemovesSelf() {
+	staged := processed.Commit
+	// through crypto/subtle for guardrail 8 class reason, which is the class and not this line: a
+	// group id is public, and every comparison of octets in this package is spelled the one way.
+	if subtle.ConstantTimeCompare(staged.groupId, self.context.GroupId) != 1 {
 		self.stateLock.Unlock()
-		// Close erases this epoch's schedule, its secret tree, this leaf's private state, the
-		// signing key and any commit still staged, and it is idempotent -- so a caller's own
+		return fmt.Errorf("%w: it was staged by group %x and this group is %x",
+			errApplyCommitNotThisGroups, staged.groupId, self.context.GroupId)
+	}
+	if staged.priorEpoch != self.context.Epoch {
+		self.stateLock.Unlock()
+		return fmt.Errorf("%w: it was staged against epoch %d and this group is in epoch %d",
+			errApplyCommitNotThisEpochs, staged.priorEpoch, self.context.Epoch)
+	}
+	if staged.RemovesSelf() {
+		self.stateLock.Unlock()
+		// Close erases this epoch schedule, its secret tree, this leaf private state, the
+		// signing key and any commit still staged, and it is idempotent -- so a caller own
 		// deferred Close beside this one erases nothing twice.
 		if err := self.Close(); err != nil {
 			return err
 		}
 		return ErrRemovedFromGroup
 	}
-	self.pending.Zeroize()
-	self.pending = processed.Commit
+	if self.pending != nil {
+		self.stateLock.Unlock()
+		return ErrPendingCommitExists
+	}
+	self.pending = staged
 	self.stateLock.Unlock()
 	return self.MergePendingCommit()
 }

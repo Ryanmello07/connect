@@ -3385,6 +3385,19 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{signaturePub}
 		}},
+		// the public half of an hpke key pair this package was handed, and the same argument as
+		// the row above with the operand one curve over. The scalar is the caller's secret and is
+		// read again -- it is the leaf key that caller goes on opening its update paths with --
+		// and the answer must not be a window onto it: both registered suites are DHKEM(X25519),
+		// so the private half IS the 32 octet scalar and a shared array would hand a caller its
+		// own private key back under the name of a public one.
+		{name: "hpkePublicKeyOf", call: func(take func([]byte) []byte) [][]byte {
+			hpkePub, keyErr := hpkePublicKeyOf(HpkePrivateKey(take(bytes.Repeat([]byte{0x48}, x25519KeySize))))
+			if keyErr != nil {
+				t.Fatalf("hpkePublicKeyOf: %v", keyErr)
+			}
+			return [][]byte{hpkePub}
+		}},
 		// the key_package leaf constructor. Every vector it is handed ends up INSIDE the
 		// value it answers and is covered by that value's signature, so a leaf that aliased
 		// any of them changes after it was signed the next time its caller writes into its

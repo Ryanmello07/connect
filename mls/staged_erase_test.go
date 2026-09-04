@@ -1255,6 +1255,11 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 	"Group.proposals": "the cache holds proposals this member received and their references, which travelled " +
 		"to every member of the group as messages the delivery service also saw",
 	"StagedCommit.context":    "the group context of the epoch this commit opens; see Group.context",
+	"StagedCommit.groupId": "the id of the group that staged this commit, which is the same octets " +
+		"StagedCommit.context carries one row down and Group.context carries one type over: a group id " +
+		"is in every GroupContext, in every FramedContent this group frames, and in the GroupInfo of " +
+		"every Welcome it sends. It is here as a field of its own because the staged value a REMOVED " +
+		"member is handed carries no context, and (*Group).ApplyCommit reads it on that path too",
 	"StagedCommit.verified":   "see Group.verified",
 	"StagedCommit.tree":       "the post-commit ratchet tree, which the committer PUBLISHES: CommitResult carries it",
 	"StagedCommit.transcript": "see Group.transcript",

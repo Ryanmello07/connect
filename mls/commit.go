@@ -109,7 +109,20 @@ type CommitResult struct {
 type StagedCommit struct {
 	committer LeafIndex
 	epoch     uint64
-	context   *GroupContext
+
+	// the group and the epoch this commit was STAGED AGAINST, which is what binds a staged epoch
+	// to the state that derived it. Both halves and never the epoch alone: every group this client
+	// is a member of runs an epoch 7, so an epoch number is not an identity. It is
+	// (*ProposalCache).bindingHolds' pair, asked one type over for the same reason.
+	//
+	// FIELDS RATHER THAN READS OFF context, because the staged value a REMOVED member is handed
+	// carries no context at all -- stageInboundCommitLocked answers a report for that case -- and a
+	// provenance check written as self.context.GroupId would take the process on exactly the commit
+	// whose whole purpose is to close the group.
+	groupId    []byte
+	priorEpoch uint64
+
+	context *GroupContext
 	// the same context with its authority established, which is what an epoch boundary owes the
 	// proposal cache. It is built HERE rather than at the merge so that a commit whose own
 	// GroupInfo this client cannot sign or verify is refused before anything is sealed --

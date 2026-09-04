@@ -2615,10 +2615,11 @@ func treeKemRefusals(t *testing.T) (json.RawMessage, []comparatorRefusal) {
 			},
 			{
 				// a PATH SECRET and not the leaf key. Consistent deliberately does not re-derive
-				// the leaf public half -- the provider surface has no private-to-public
-				// operation, and DecryptUpdatePath is where both halves of the leaf key exist --
-				// so a flipped encryption_priv is refused a path later as a decrypt that did not
-				// open, which is a true refusal for a class this row does not name.
+				// the leaf public half -- its scope is the path secrets, and DecryptUpdatePath is
+				// where both halves of the leaf key exist -- so a flipped encryption_priv is
+				// refused a path later as a decrypt that did not open, which is a true refusal for
+				// a class this row does not name. (The derivation itself exists: hpkePublicKeyOf,
+				// outside CryptoProvider, is what the join door holds a joiner's own pair with.)
 				name: "a case whose published path secret does not derive the key its tree announces",
 				vector: tkRewrite(t, base, func(c *treekemReceiverVector) {
 					c.LeavesPrivate[rung].PathSecrets[0].PathSecret =

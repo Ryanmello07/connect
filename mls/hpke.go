@@ -163,6 +163,40 @@ func HpkeDeriveKeyPair(params *SuiteParams, ikm []byte) (HpkePrivateKey, HpkePub
 	return HpkePrivateKey(priv.Bytes()), HpkePublicKey(priv.PublicKey().Bytes()), nil
 }
 
+// The public half of an hpke key pair this package was HANDED rather than one it drew.
+//
+// It stands beside the derivation above, in one of the four files doc.go names as the whole
+// cryptographic surface, for signaturePublicKeyOf's reason at the other end of the same
+// argument: recovering a public key from a private one is a cryptographic operation whatever
+// file it is written in, and the sentence doc.go makes -- that an audit reads four files -- stops
+// being true the moment a fifth expands a key.
+//
+// IT IS NOT A CryptoProvider METHOD, and that is the other half of the placement.
+// signaturePublicKeyOf states the reason in full: the interface is pinned by a gate that reads it
+// off the type, every stub and wrapper in the test tree writes out every method by hand, and a
+// package level derivation reaches the same primitive without moving that surface. "The provider
+// has no private-to-public operation" is therefore a fact about CryptoProvider and never a reason
+// a caller cannot ask the question -- which is what it had been read as at the join door, where
+// the encryption half of a joiner's own key pair went unchecked on that premise.
+//
+// WHAT MAKES IT SOUND FOR EVERY REGISTERED SUITE is that both of them are DHKEM(X25519).
+// HpkeDeriveKeyPair three lines up builds the pair off one *ecdh.PrivateKey and answers
+// HpkePrivateKey(priv.Bytes()), so a private half this package hands out IS the raw x25519 scalar
+// and its public half is one multiplication away. It reads no SuiteParams for that reason -- the
+// callers hold a CryptoProvider and this is not one of its methods, which is signaturePublicKeyOf's
+// position exactly -- and TestEveryRegisteredSuiteNamesTheKemThisDerivationAssumes holds the
+// registry to it.
+//
+// The length gate is X25519PrivateKey's, so a truncated scalar answers ErrBadKeyLength here rather
+// than whatever crypto/ecdh makes of it.
+func hpkePublicKeyOf(priv HpkePrivateKey) (HpkePublicKey, error) {
+	parsed, err := X25519PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	return HpkePublicKey(parsed.PublicKey().Bytes()), nil
+}
+
 // ExtractAndExpand, RFC 9180 section 4.1: the hash that turns a raw diffie-hellman output
 // into a kem shared secret. Skipping it and returning dh would produce 32 bytes that
 // round-trip perfectly between an encap and a decap that both skipped it, which is why the

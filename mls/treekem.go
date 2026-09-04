@@ -246,10 +246,16 @@ func (self *TreeKEMPrivate) NodePrivateKey(crypto CryptoProvider, x NodeIndex) (
 // bans the shape naming no comparator at all, string(a) == string(b), and this function is in
 // its class because it holds a key of its own and answers over a tree.
 //
-// It deliberately does NOT re-derive the leaf public key from EncryptionPriv. The CryptoProvider
-// surface has no private-to-public operation, and the leaf key pair is checked where both halves
-// exist -- in task 22's DecryptUpdatePath, which compares each derived public key against the
-// one the UpdatePath carries.
+// It deliberately does NOT re-derive the leaf public key from EncryptionPriv, and the reason is
+// this method's SCOPE rather than the absence of the operation. The sentence that used to stand
+// here -- "the CryptoProvider surface has no private-to-public operation" -- is true of the
+// INTERFACE and was read as "so it cannot be asked", which is what left the join door installing a
+// joiner's encryption half against nothing. hpkePublicKeyOf is a package level derivation outside
+// the interface, on signaturePublicKeyOf's precedent, and (*Group).JoinFromWelcome holds the
+// joiner's own two halves together through it. What is judged HERE is the path secrets against the
+// tree; the leaf key pair is judged where both halves exist -- in task 22's DecryptUpdatePath,
+// which compares each derived public key against the one the UpdatePath carries, and at the join
+// door for the leaf a joiner brings in with it.
 func (self *TreeKEMPrivate) Consistent(crypto CryptoProvider, tree *RatchetTree) error {
 	if crypto == nil {
 		return ErrNilCryptoProvider

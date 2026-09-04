@@ -30,8 +30,43 @@ import (
 // testTwoMemberGroup returns a committer and a joiner already in the same group at the same epoch.
 func testTwoMemberGroup(t *testing.T, crypto CryptoProvider) (*Group, *Group, *testMember, *testMember) {
 	t.Helper()
+	group, joined, owner, bob, _ := testTwoMemberGroupNamed(t, crypto, "group-1")
+	return group, joined, owner, bob
+}
+
+// testJoinMaterial is the Welcome one commit produced together with the material it is addressed
+// to, kept so that a case can run the join door a SECOND time: for another view of the same group
+// at the epoch that Welcome describes, or for a join whose one field the case has changed.
+type testJoinMaterial struct {
+	crypto  CryptoProvider
+	member  *testMember
+	groupId string
+	welcome []byte
+	tree    []byte
+	keys    JoinKeyMaterial
+}
+
+// join runs the door over a COPY of the material, so a case that edits one field of it leaves the
+// rest of the fixture where the successful join found it.
+func (self *testJoinMaterial) join(t *testing.T, edit func(*JoinKeyMaterial)) (*Group, error) {
+	t.Helper()
+	keys := self.keys
+	if edit != nil {
+		edit(&keys)
+	}
+	return JoinFromWelcome(testGroupConfig(t, self.crypto, self.member, self.groupId),
+		self.welcome, self.tree, &keys)
+}
+
+// testTwoMemberGroupNamed is the fixture above with the group id a case chooses, which is what two
+// INDEPENDENT groups need: every group this client is a member of runs an epoch 1, so two groups
+// sharing an id would let a provenance case pass on the epoch alone.
+func testTwoMemberGroupNamed(t *testing.T, crypto CryptoProvider, groupId string) (
+	*Group, *Group, *testMember, *testMember, *testJoinMaterial) {
+
+	t.Helper()
 	owner := testIdentity(t, crypto, "owner")
-	group := testNewGroup(t, crypto, owner, "group-1")
+	group := testNewGroup(t, crypto, owner, groupId)
 
 	bob := testIdentity(t, crypto, "bob")
 	kp, initPriv, encPriv := testKeyPackage(t, crypto, bob)
@@ -49,13 +84,17 @@ func testTwoMemberGroup(t *testing.T, crypto CryptoProvider) (*Group, *Group, *t
 	if err := group.MergePendingCommit(); err != nil {
 		t.Fatalf("MergePendingCommit: %v", err)
 	}
-	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, bob, "group-1"),
-		result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+	material := &testJoinMaterial{
+		crypto: crypto, member: bob, groupId: groupId,
+		welcome: result.Welcome, tree: result.RatchetTree,
+		keys: JoinKeyMaterial{
 			KeyPackage:     *kp,
 			InitPrivate:    initPriv,
 			EncryptPrivate: encPriv,
 			SignPrivate:    bob.SigPriv,
-		})
+		},
+	}
+	joined, err := material.join(t, nil)
 	if err != nil {
 		t.Fatalf("JoinFromWelcome: %v", err)
 	}
@@ -66,7 +105,7 @@ func testTwoMemberGroup(t *testing.T, crypto CryptoProvider) (*Group, *Group, *t
 	if !bytes.Equal(joined.EpochAuthenticator(), group.EpochAuthenticator()) {
 		t.Fatal("the two groups this fixture answers disagree on the epoch authenticator, so nothing built on it observes an agreement")
 	}
-	return group, joined, owner, bob
+	return group, joined, owner, bob, material
 }
 
 // testOpenInboundCommit opens a commit message the way (*Group).ProcessMessage does, so that a case
@@ -593,15 +632,24 @@ func TestProcessCommitInstallsTheLeafKeyOfAnUpdateThisClientPublished(t *testing
 	}
 }
 
-// TestApplyCommitErasesTheEpochThisClientHadStagedItself is the erase discipline at the drop site
-// this task adds, on the path it is actually taken on.
+// TestApplyCommitRefusesToOverwriteTheEpochThisClientStagedAndClearErasesIt is MASTER section
+// 9.3's lost-commit race, over the discipline (*Group).CreateCommit states at the other end of the
+// same file.
 //
-// MASTER section 9.3's lost-commit race is the ordinary case and not an edge one: the delivery
-// service accepts at most one commit per (group, epoch), so a client whose commit lost the race is
-// holding a fully derived epoch -- its own key schedule, its own secret tree and the leaf key it
-// drew -- at the moment it applies the peer's commit that made that epoch dead. Unreachable is not
-// erased.
-func TestApplyCommitErasesTheEpochThisClientHadStagedItself(t *testing.T) {
+// The race is the ordinary case and not an edge one: the delivery service accepts at most one
+// commit per (group, epoch), so a client whose commit lost it is holding a fully derived epoch --
+// its own key schedule, its own secret tree and the leaf key it drew -- at the moment the peer's
+// commit arrives. What this body used to assert is that ApplyCommit ERASED that epoch and installed
+// the peer's over it, and that is the behaviour this task changed: a caller that had merely handed
+// the wrong Processed value lost a derived epoch to a call that answered nil, and CreateCommit
+// refuses the same collision rather than resolving it. So the refusal is asserted here, and the
+// erase is asserted at the drop site it actually happens on -- ClearPendingCommit, which is the
+// caller's one-call repair.
+//
+// THE REFUSAL DESTROYS NOTHING, which is the half a refusal-only assertion would miss: the staged
+// epoch is still whole after it, so a caller that refused wrongly has lost nothing, and the erase
+// below is therefore about the CLEAR rather than about the ApplyCommit that ran before it.
+func TestApplyCommitRefusesToOverwriteTheEpochThisClientStagedAndClearErasesIt(t *testing.T) {
 	crypto := testCrypto(t)
 	committer, receiver, _, _ := testTwoMemberGroup(t, crypto)
 	defer committer.Close()
@@ -621,12 +669,27 @@ func TestApplyCommitErasesTheEpochThisClientHadStagedItself(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessMessage: %v", err)
 	}
-	if err := receiver.ApplyCommit(processed); err != nil {
-		t.Fatalf("ApplyCommit: %v", err)
+	if err := receiver.ApplyCommit(processed); !errors.Is(err, ErrPendingCommitExists) {
+		t.Fatalf("ApplyCommit over a live pending commit = %v, want ErrPendingCommitExists", err)
 	}
-	requireErased(t, "ApplyCommit", held)
+	if receiver.stagedForTest() != lost {
+		t.Fatal("the refused ApplyCommit replaced the staged commit anyway")
+	}
+	for name, secret := range held {
+		if len(secret) != 0 && allZero(secret) {
+			t.Fatalf("the refused ApplyCommit erased %s; a refusal must leave the caller's epoch whole", name)
+		}
+	}
+
+	// the caller's repair, which is the drop site the erase discipline is stated at
+	receiver.ClearPendingCommit()
+	requireErased(t, "ClearPendingCommit", held)
 	if !lost.secretTree.erased {
 		t.Error("the lost epoch's secret tree is not marked erased, so every method of it still answers out of zeros")
+	}
+
+	if err := receiver.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit after the clear: %v", err)
 	}
 	// and the epoch the receiver actually entered is the peer's, which is the control that says the
 	// erase above did not take the live one with it
@@ -636,6 +699,17 @@ func TestApplyCommitErasesTheEpochThisClientHadStagedItself(t *testing.T) {
 	if !bytes.Equal(receiver.EpochAuthenticator(), committer.EpochAuthenticator()) {
 		t.Fatal("the receiver did not enter the epoch the commit it applied opened")
 	}
+}
+
+// allZero is the reading requireErased makes, answered rather than reported, for the one case that
+// needs the NEGATIVE of it: storage a refusal must have left alone.
+func allZero(secret []byte) bool {
+	for _, b := range secret {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // TestApplyCommitRefusesAResultThatIsNotACommit is the caller's own mistake, answered rather than
