@@ -2522,29 +2522,83 @@ func TestJoinFromWelcomeAgreesOnTheEpochAuthenticator(t *testing.T) {
 	}
 }
 
-// TestJoinFromWelcomeLandsOnTheCommittersLadderOverAPathCommit is the same round trip over a commit
+// TestJoinFromWelcomeLandsOnTheCommittersLadderOverAPathCommit is the round trip over a commit
 // that CARRIES AN UPDATE PATH, which is the only shape in which the Welcome's path secret exists.
 //
-// The group is seeded to three members before the add, so the joiner's filtered direct path is
-// SHORTER than its unfiltered one: leaf 3 of a four leaf tree whose parent 5 has a blank copath
-// child under it. A joiner that laddered over the unfiltered path would place the committer's rung
-// at the wrong node from the first dropped one upward, and the node set asserted below is what
-// separates the two readings -- the epoch authenticator does not, because the ladder feeds no
-// secret the key schedule derives.
+// THE TREE IS BUILT SO THE FILTER ACTUALLY DROPS A NODE, and that is the whole of what this case
+// is for. Four members are added and three of them removed, so the committer at leaf 0 has a
+// copath child at node 3 that resolves to nothing: its FILTERED direct path is two nodes where its
+// unfiltered one is three. The ladder the committer built runs over the filtered path, so a joiner
+// walking the unfiltered one would place the committer's second rung at the tree's third node --
+// and the assertion below is over the node SET, because the epoch authenticator does not move with
+// the ladder at all. Measured: with the walk taken over DirectPath instead, a fixture whose two
+// paths happen to coincide reports a clean run, which is what the first version of this test did.
 func TestJoinFromWelcomeLandsOnTheCommittersLadderOverAPathCommit(t *testing.T) {
 	crypto := testCrypto(t)
-	group, joiner, result, keys := joinTestCommit(t, crypto, "join-with-a-path",
-		&CommitOptions{Force: true}, "carol", "dave")
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "join-with-a-path")
 	defer group.Close()
 
-	// the live control: this commit carried a path and the Welcome names a place to pick it up.
-	// Without it every assertion below is about a joiner that installed nothing.
+	// four members, so the tree is eight leaves wide
+	for _, name := range []string{"a", "b", "c", "d"} {
+		seeded := testIdentity(t, crypto, name)
+		seededKp, _, _ := testKeyPackage(t, crypto, seeded)
+		if _, err := group.CreateCommit(nil,
+			[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *seededKp}}}, nil); err != nil {
+			t.Fatalf("seed the fixture group with %s: %v", name, err)
+		}
+		joinTestMerge(t, group)
+	}
+	// and three of them removed, which blanks leaves 1, 2 and 3. Leaf 4 stays occupied, so the
+	// tree keeps its width and the committer's own direct path keeps its length.
+	if _, err := group.CreateCommit(nil, []Proposal{
+		{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: LeafIndex(1)}},
+		{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: LeafIndex(2)}},
+		{ProposalType: ProposalTypeRemove, Remove: &Remove{Removed: LeafIndex(3)}},
+	}, nil); err != nil {
+		t.Fatalf("remove the three members that blank this tree's middle: %v", err)
+	}
+	joinTestMerge(t, group)
+
+	joiner := testIdentity(t, crypto, "the joiner")
+	kp, initPriv, encPriv := testKeyPackage(t, crypto, joiner)
+	keys := &JoinKeyMaterial{
+		KeyPackage:     *kp,
+		InitPrivate:    initPriv,
+		EncryptPrivate: encPriv,
+		SignPrivate:    joiner.SigPriv,
+	}
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}},
+		&CommitOptions{Force: true})
+	if err != nil {
+		t.Fatalf("commit the add this case is built on: %v", err)
+	}
+	committerLeaf := group.OwnLeafIndex()
+	published := joinTestDecodeTree(t, result.RatchetTree)
+
+	// THE TWO LIVE CONTROLS, and without either of them the assertion below observes nothing.
+	//
+	// The first is the shape: the filter has to drop a node of the committer's direct path, or
+	// walking the unfiltered path is walking the filtered one and this case separates nothing.
+	steps, err := published.filteredPathSteps(committerLeaf)
+	if err != nil {
+		t.Fatalf("the committer's filtered direct path: %v", err)
+	}
+	unfiltered, err := DirectPath(committerLeaf.NodeIndex(), published.LeafWidth())
+	if err != nil {
+		t.Fatalf("the committer's unfiltered direct path: %v", err)
+	}
+	if len(steps) >= len(unfiltered) {
+		t.Fatalf("the committer's filtered path is %d nodes and its direct path is %d; this case needs the filter to drop one, or a joiner walking the unfiltered path lands in the same place",
+			len(steps), len(unfiltered))
+	}
+	// and the second is that this commit carried a path at all
 	welcome := welcomeTestFromCommit(t, result.Welcome)
 	carried := welcomeTestOpenSecrets(t, crypto, welcome, 0, keys.InitPrivate)
 	if carried.PathSecret == nil {
 		t.Fatal("this commit carried no path secret for the joiner, so the ladder below is empty and observes nothing")
 	}
-	committerLeaf := group.OwnLeafIndex()
 	joinTestMerge(t, group)
 
 	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-with-a-path"),
@@ -2559,10 +2613,6 @@ func TestJoinFromWelcomeLandsOnTheCommittersLadderOverAPathCommit(t *testing.T) 
 	}
 	// the nodes the joiner holds a secret for are exactly the committer's FILTERED direct path
 	// from the node the two leaves share up to the root
-	steps, err := joined.tree.filteredPathSteps(committerLeaf)
-	if err != nil {
-		t.Fatalf("the committer's filtered direct path: %v", err)
-	}
 	start, onThePath := indexOfStep(steps, CommonAncestor(committerLeaf.NodeIndex(),
 		joined.OwnLeafIndex().NodeIndex()))
 	if !onThePath {
@@ -2694,6 +2744,67 @@ func TestJoinFromWelcomeRefusesSecretsSealedToAnotherJoinersInitKey(t *testing.T
 		})
 	if !errors.Is(err, errWelcomeGroupSecretsDecrypt) {
 		t.Fatalf("JoinFromWelcome over an entry sealed to another joiner = %v, want errWelcomeGroupSecretsDecrypt", err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAnEntryLiftedFromAnotherWelcome is the HPKE CONTEXT BINDING, which is
+// the one property of the per-joiner seal that a seal-then-open round trip cannot see.
+//
+// RFC 9420 section 12.4.3.1 seals each joiner's group secrets with the Welcome's own
+// encrypted_group_info as the HPKE context. Two groups that both added this device published two
+// Welcomes addressed to the same key package reference, so the entry from one FITS the other
+// perfectly: same reference, same shape, and this joiner's init key opens it. What refuses the
+// splice is that the two Welcomes carry different encrypted_group_info, and the context is what the
+// seal was made against.
+//
+// Without it a joiner would open one epoch's group secrets beside another epoch's group info. That
+// still fails -- one epoch's welcome key does not open the other's group info -- but it fails one
+// step later and as the wrong fault, so this case names the sentinel rather than asserting err.
+func TestJoinFromWelcomeRefusesAnEntryLiftedFromAnotherWelcome(t *testing.T) {
+	crypto := testCrypto(t)
+	first, joiner, firstResult, keys := joinTestCommit(t, crypto, "join-spliced-entry", nil)
+	defer first.Close()
+	joinTestMerge(t, first)
+
+	// a second group that added the SAME published key package, which is what every device's key
+	// package is exposed to: it went to the delivery service and to every group that added it
+	mallory := testIdentity(t, crypto, "the other group's owner")
+	second := testNewGroup(t, crypto, mallory, "join-spliced-entry")
+	defer second.Close()
+	secondResult, err := second.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: keys.KeyPackage}}}, nil)
+	if err != nil {
+		t.Fatalf("the second group's commit: %v", err)
+	}
+	if err := second.MergePendingCommit(); err != nil {
+		t.Fatalf("the second group's merge: %v", err)
+	}
+
+	fromFirst := welcomeTestFromCommit(t, firstResult.Welcome)
+	spliced := welcomeTestFromCommit(t, secondResult.Welcome)
+	if len(fromFirst.Secrets) != 1 || len(spliced.Secrets) != 1 {
+		t.Fatalf("the two welcomes carry %d and %d entries and this case is written over one each",
+			len(fromFirst.Secrets), len(spliced.Secrets))
+	}
+	// the live control: the two entries name the SAME key package, so the lookup half of the join
+	// cannot tell them apart and what refuses the splice below is the seal
+	if !bytes.Equal(fromFirst.Secrets[0].NewMember, spliced.Secrets[0].NewMember) {
+		t.Fatal("the two welcomes are addressed to different key package references, so the splice below is refused by the lookup rather than by the context binding")
+	}
+	spliced.Secrets[0].EncryptedGroupSecrets = fromFirst.Secrets[0].EncryptedGroupSecrets
+	encoded, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatWelcome,
+		Welcome:    spliced,
+	})
+	if err != nil {
+		t.Fatalf("re-frame the spliced welcome: %v", err)
+	}
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-spliced-entry"),
+		encoded, secondResult.RatchetTree, keys)
+	if !errors.Is(err, errWelcomeGroupSecretsDecrypt) {
+		t.Fatalf("JoinFromWelcome over an entry lifted from another welcome = %v, want errWelcomeGroupSecretsDecrypt",
+			err)
 	}
 }
 
@@ -3276,5 +3387,119 @@ func TestJoinFromWelcomeRefusesAWelcomeSecretItsOwnKeyScheduleDoesNotDerive(t *t
 	if drifting.calls != 2 {
 		t.Fatalf("the join took %d Extract(s); this case needs the second one to be the key schedule's, or it observed something else",
 			drifting.calls)
+	}
+}
+
+// TestJoinFromWelcomeRefusesAPathSecretThatDoesNotDeriveTheTreesKeys is
+// (*TreeKEMPrivate).Consistent's refusal reached through the join.
+//
+// The Welcome names a path secret of the right width for the right node and the wrong value, which
+// is a message every check ahead of the ladder accepts: the group info is signed by a real member
+// about the published tree, the confirmation tag is the one this joiner derives, and the node the
+// secret is for is on the sender's filtered path. What refuses it is the one rule RFC 9420 section
+// 12.4.3.1 states about the private keys a joiner installs -- "the private key MUST be the private
+// key that corresponds to the public key in the node" -- and without it this joiner would join,
+// hold a ladder no member's tree agrees with, and report a decryption failure against the first
+// commit that is perfectly well formed.
+func TestJoinFromWelcomeRefusesAPathSecretThatDoesNotDeriveTheTreesKeys(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-wrong-ladder",
+		&CommitOptions{Force: true}, "carol", "dave")
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no ladder to be wrong about")
+	}
+	if len(staged.added) != 1 {
+		t.Fatalf("this commit added %d members and this case is written over one", len(staged.added))
+	}
+	honest := pathSecretAt(staged.plan, CommonAncestor(staged.added[0].NodeIndex(),
+		staged.committer.NodeIndex()))
+	if honest == nil {
+		t.Fatal("this commit carried no path secret for the node the joiner and the committer share, so there is nothing here to replace")
+	}
+	spec := joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      staged.context,
+		signer:       group.OwnLeafIndex(),
+		signPriv:     group.signer,
+		keyPackage:   &keys.KeyPackage,
+		leafIndex:    staged.added[0],
+		pathSecret:   bytes.Clone(honest),
+	}
+	// the live control: with the committer's own rung this welcome joins, so what the replacement
+	// below observes is the derivation rather than the fixture
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-ladder"),
+		joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+	if err != nil {
+		t.Fatalf("the fixture welcome does not join with the committer's own path secret: %v", err)
+	}
+	control.Close()
+
+	// the same width, for the same node, and a value no node of this tree was keyed from
+	spec.pathSecret = bytes.Repeat([]byte{0x5e}, crypto.HashSize())
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-wrong-ladder"),
+		joinTestSealWelcome(t, crypto, spec), result.RatchetTree, keys)
+	if !errors.Is(err, ErrPathSecretMismatch) {
+		t.Fatalf("JoinFromWelcome over a path secret that derives no key in the tree = %v, want ErrPathSecretMismatch",
+			err)
+	}
+}
+
+// TestJoinFromWelcomeRefusesATreeWhoseLeavesDoNotValidate is the tree walk, and it is the check
+// that stands between "a member of this tree signed this group info" and "this tree is a tree".
+//
+// The forger takes the published tree, breaks the signature on a leaf that is not the one it signs
+// the group info at, and republishes a group context naming its own tree hash. Everything
+// (*GroupInfo).Verify asks then holds: the group info verifies under leaf 0's signature KEY, which
+// the break does not touch, and the tree hashes to what the context names because the context was
+// written after the break. Only (*RatchetTree).ValidateAgainstContext looks at whether the leaves
+// of that tree are leaves anybody signed, and without it a joiner adopts a roster whose members
+// never agreed to be in it.
+func TestJoinFromWelcomeRefusesATreeWhoseLeavesDoNotValidate(t *testing.T) {
+	crypto := testCrypto(t)
+	group, joiner, result, keys := joinTestCommit(t, crypto, "join-unsigned-leaf", nil)
+	defer group.Close()
+
+	staged := group.stagedForTest()
+	if staged == nil {
+		t.Fatal("this fixture staged no commit, so there is no tree to rewrite")
+	}
+	tree := joinTestDecodeTree(t, result.RatchetTree)
+	standing := tree.Leaf(LeafIndex(0))
+	if standing == nil {
+		t.Fatal("leaf 0 of the published tree is blank, so there is no signature here to break")
+	}
+	broken := standing.Clone()
+	broken.Signature = bytes.Clone(standing.Signature)
+	if len(broken.Signature) == 0 {
+		t.Fatal("the leaf this case breaks carries no signature, so the break observes nothing")
+	}
+	broken.Signature[0] ^= 0x01
+	if err := tree.SetLeaf(LeafIndex(0), broken); err != nil {
+		t.Fatalf("install the leaf whose signature this case broke: %v", err)
+	}
+	treeHash, err := tree.TreeHash(crypto)
+	if err != nil {
+		t.Fatalf("the rewritten tree's hash: %v", err)
+	}
+	context := staged.context.Clone()
+	context.TreeHash = treeHash
+	forged := joinTestSealWelcome(t, crypto, joinTestWelcomeSpec{
+		joinerSecret: staged.schedule.JoinerSecret(),
+		context:      context,
+		// signed at the leaf whose signature was broken, with the key that leaf still names: the
+		// break is over the LEAF's own signature and the group info's is made fresh
+		signer:     LeafIndex(0),
+		signPriv:   group.signer,
+		keyPackage: &keys.KeyPackage,
+		leafIndex:  LeafIndex(1),
+	})
+	_, err = JoinFromWelcome(testGroupConfig(t, crypto, joiner, "join-unsigned-leaf"),
+		forged, joinTestEncodeTree(t, tree), keys)
+	if !errors.Is(err, errBadSignature) {
+		t.Fatalf("JoinFromWelcome over a tree holding a leaf nobody signed = %v, want errBadSignature",
+			err)
 	}
 }
