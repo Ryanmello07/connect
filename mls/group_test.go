@@ -1173,12 +1173,19 @@ func testProposalDoorsRefusal(t *testing.T, crypto CryptoProvider, group *Group,
 	}); err != nil {
 		return err
 	}
-	if one.Proposal.ProposalType != ProposalTypeGroupContextExtensions {
-		return nil
-	}
+	// AND THE SECOND DOOR IS RUN OVER EVERY PROPOSAL AND NOT OVER THE ONE KIND IT HAS SOMETHING
+	// TO SAY ABOUT. ValSem209 answers nil for a list carrying no GroupContextExtensions proposal
+	// -- that is its own first clause -- so naming the kind here would be this file deriving a
+	// class of doors and then hand-scoping where each one is asked, which is the defect this
+	// round was sent to close one file over.
 	commitIn := testCommitInput(t, crypto, group.tree, list, &Commit{})
 	commitIn.Context = context
-	commitIn.Committer = committer
+	// THE ENTRY'S OWN SENDER AND NOT THE COMMITTER THIS SWEEP NAMES.
+	// (*CommitValidationInput).check gives a BY VALUE entry the committer as its sender and then
+	// joins the two, so a control assembled with any other sender is refused by that join rather
+	// than by the rule it is here for -- measured, and it is why this line is not `committer`.
+	// ValSem209 reads no committer at all, so this decides nothing the rule below asks.
+	commitIn.Committer = one.Sender
 	commitIn.Own = group.OwnLeafIndex()
 	// erratum 8815 runs at the commit door and asks whether every reference the commit names was
 	// previously received; a cached entry is where that answer comes from, and an entry a control
@@ -1367,9 +1374,33 @@ func proposalGeneratorTemptations() []proposalGeneratorTemptation {
 			},
 		},
 		{
-			// every list rule of section 12.2 accepts this, because none of them looks that body
-			// up. It is here because the doors this obligation is stated over are the doors a
-			// RECEIVER runs, and ValSem209 is one of them.
+			// a set ValidateProposalList ACCEPTS and a receiver refuses, which is why the judge
+			// above has two doors rather than one. No list rule of section 12.2 reads the extension
+			// TYPES a group_context_extensions proposal installs -- the commit door does, through
+			// the same profile gate this generator runs -- so with ValSem209 out of the judge this
+			// temptation reports the doors as accepting a set no peer would install. Measured:
+			// without it, dropping the commit door's arm from the judge left every gate green.
+			name:    "group_context_extensions/a set installing an extension this profile refuses",
+			kind:    ProposalTypeGroupContextExtensions,
+			refusal: errProfileGroupExtension,
+			tempt: func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error)) {
+				outside := append(slices.Clone(parts.published),
+					Extension{ExtensionType: ExtensionTypeApplicationId,
+						ExtensionData: []byte{0x01}})
+				return CachedProposal{
+						Proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions,
+							GroupContextExtensions: &GroupContextExtensions{Extensions: outside}},
+						Sender:  parts.group.OwnLeafIndex(),
+						ByValue: true,
+					}, func() ([]byte, error) {
+						return parts.group.ProposeGroupContextExtensions(outside)
+					}
+			},
+		},
+		{
+			// this one every list rule accepts as well, because none of them looks that body up,
+			// and ValSem106 reaches the same lookup on its own account -- so it is judged by both
+			// doors rather than by the second alone.
 			name:    "group_context_extensions/a set carrying required_capabilities twice",
 			kind:    ProposalTypeGroupContextExtensions,
 			refusal: ErrMalformedExtension,

@@ -830,6 +830,13 @@ func (self *Group) ProposeRemove(leaf LeafIndex) ([]byte, error) {
 		return nil, fmt.Errorf("%w: leaf %d is this client's own and a cached self remove is one this client's next commit would carry",
 			ErrRemoveCommitter, leaf)
 	}
+	// REDUNDANT WITH THE DOOR (*Group).propose NOW RUNS, AND KEPT, on ValidateProposalList's own
+	// stated terms and measured the same way: ValSem108 answers this condition the same value off
+	// the same tree, so deleting this line leaves the whole of ./mls/... and ./message/... green.
+	// It stays because it is asked before the lock and before anything is signed, and because the
+	// asymmetry it used to be the only half of -- this generator asking its receivers' question
+	// while ProposeAdd did not -- is what that door was written for. Nothing here claims a test
+	// can tell which of the two guards fired.
 	if !occupied {
 		return nil, fmt.Errorf("%w: leaf %d", ErrRemoveNonMember, leaf)
 	}
