@@ -309,10 +309,19 @@ const seamPaddingOctets = 32
 // three is checked below against the package's own declarations, so a rename that moved one fails
 // here rather than quietly emptying the rule.
 //
-// seamForgedAuthenticators is the SEED of the parameter half and not the whole of it, and the
-// distinction is the one this file was reopened for. A parameter hands a seam the authenticators
-// when its type CARRIES them, not when its name is this one, and seamAuthenticatorCarriersIn
-// below is where that class is derived.
+// seamForgedAuthenticators is the SEED of the handed-over half and not the whole of it, and the
+// distinction is the one this file was reopened for. A caller hands a seam the authenticators
+// when the type in the position it fills CARRIES them, not when its name is this one, and
+// seamAuthenticatorCarriersIn below is where that class is derived.
+//
+// seamWireDoorType is read where a whole message LEAVES a declaration -- its results -- and not
+// wherever the name appears in a body, and that was measured rather than chosen. A body that
+// mentions the type is not a body that sends one: (*MLSMessage).UnmarshalMLS names its own type
+// while CONSUMING octets rather than producing any, and reading mentions turned every codec of
+// this package into a candidate the moment the receiver joined the handed-over half. So the two
+// anchors are read at the two ENDS of a signature -- the caller supplied side is where the
+// authenticators are handed over, the answering side is where a message leaves -- and the door
+// FUNCTION is what a body naming it still means.
 const (
 	seamWireDoor             = "MarshalMLSMessage"
 	seamWireDoorType         = "MLSMessage"
@@ -328,8 +337,11 @@ type seamCandidate struct {
 	// on this and the report on the name above.
 	bare string
 	file string
-	// a PARAMETER hands it the authenticators, so its caller chose what the receiver will check.
+	// its CALLER handed it the authenticators, so the caller chose what the receiver will check.
 	forgeable bool
+	// a whole message LEAVES it, which is the door type read where a declaration answers with
+	// one rather than wherever the name is mentioned.
+	answersTheDoorType bool
 	// every identifier its body names.
 	names map[string]bool
 }
@@ -427,10 +439,26 @@ func seamTypeFieldNamesIn(parsed []parsedSource) map[string]map[string]bool {
 
 // seamCandidatesIn reads one set of parsed files into the shape the two rules below ask about.
 //
-// Parameters and not the receiver. A method whose RECEIVER is the authenticators is a codec of
-// them -- (*FramedContentAuthData).MarshalMLS is one -- and banning that shape would ban the
-// encoder every honest sender runs. What makes a declaration a bypass is being HANDED
-// authenticators for a message it is assembling on somebody else's behalf.
+// THE POSITION IS DERIVED AND NOT NAMED, and naming it is what this half got wrong. The rule read
+// function.Type.Params alone while the receiver was touched only to build a report name, and the
+// reasoning written here for that -- a method whose RECEIVER is the authenticators is a codec of
+// them, so banning that shape would ban the encoder every honest sender runs -- mistook a
+// consequence for a rule. What separates (*FramedContentAuthData).MarshalMLS from a forge is that
+// it serializes a FRAGMENT and never reaches the wire door, and that half of the class holds
+// whichever position the authenticators arrived in.
+//
+// What naming the position cost was measured, and the rework that derived the carrier closure
+// made it strictly WORSE: the unprotected receiver set had been {FramedContentAuthData} and
+// became the whole derived closure, so every type newly protected as a parameter became newly
+// unprotected as a receiver. A production file forge of identical power --
+// (*FramedContentAuthData).reviewSealUnder, handed the group, signing through its crypto, sealing
+// under this epoch's real keys and answering MarshalMLSMessage -- passed this gate with a byte
+// identical suite, and so did the same shape over *AuthenticatedContent and over *MLSMessage.
+//
+// So a declaration is handed the authenticators when a carrier stands in any position its CALLER
+// fills in: the receiver first, then the parameters. A result is not one of those -- nobody hands
+// a declaration what it answers -- and that same asymmetry is what the door type is read by
+// below.
 //
 // The carriers are read off the SAME parsed set the candidates are, so a scan widened to a root
 // widens the closure with it: a type declared in connect/message that holds an
@@ -450,17 +478,39 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				file:  source.fileSet.Position(function.Pos()).Filename,
 				names: map[string]bool{},
 			}
+			// every position the caller fills in, gathered before any of them is read, so the
+			// receiver and the parameters are answered by ONE walk rather than by two rules that
+			// agree until the day one of them is edited.
+			supplied := []ast.Expr{}
 			if function.Recv != nil && len(function.Recv.List) == 1 {
 				candidate.name = receiverTypeName(function.Recv.List[0].Type) + "." + candidate.bare
+				supplied = append(supplied, function.Recv.List[0].Type)
 			}
 			for _, field := range function.Type.Params.List {
-				ast.Inspect(field.Type, func(node ast.Node) bool {
+				supplied = append(supplied, field.Type)
+			}
+			for _, position := range supplied {
+				ast.Inspect(position, func(node ast.Node) bool {
 					if identifier, isIdentifier := node.(*ast.Ident); isIdentifier &&
 						carriers[identifier.Name] {
 						candidate.forgeable = true
 					}
 					return true
 				})
+			}
+			// and the answering side, which is where a whole message leaves a declaration. A
+			// forge that hands its caller an assembled *MLSMessage rather than the octets has put
+			// the authenticators on the wire just as surely, with the marshal one frame up.
+			if function.Type.Results != nil {
+				for _, field := range function.Type.Results.List {
+					ast.Inspect(field.Type, func(node ast.Node) bool {
+						if identifier, isIdentifier := node.(*ast.Ident); isIdentifier &&
+							identifier.Name == seamWireDoorType {
+							candidate.answersTheDoorType = true
+						}
+						return true
+					})
+				}
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
@@ -474,48 +524,63 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 	return candidates
 }
 
-// seamsReachingTheWireDoor answers which declarations put octets on the wire, DIRECTLY or through
-// another declaration of the package that does.
+// seamsReachingTheWireDoor answers which declarations put a whole message on the wire, DIRECTLY
+// or through another declaration of the scan that does.
 //
 // Transitive rather than one hop, because the pair this file declares is a wrapper and a body:
-// the wrapper names no MLSMessage at all, and a rule reading one hop would report the seam that
-// does the work and call the seam beside it clean.
+// the wrapper names no door at all, and a rule reading one hop would report the seam that does
+// the work and call the seam beside it clean.
 //
-// An edge is followed only when the name it is written as belongs to ONE declaration in the
-// scan, and that condition is here because leaving it out was measured to break the rule. A
-// selector tail carries no receiver, so every X.UnmarshalMLS and every X.MarshalMLS in the tree
-// is one bare name; MLSMessage has both, so a walk that merged them marked the whole family as
-// reaching the wire and the transitive step then spread that to anything naming any of them.
-// Measured over the two roots: with the merge in place the class swallowed
-// marshalPrivateMessageContentWithPadding, which is production source, is genuinely handed the
-// authenticators, and serializes a FRAGMENT -- so the gate reported this package as shipping a
-// forge it does not ship. That was caught by the near miss the gate below pins rather than by
-// inspection, which is what that pin is for.
+// TWO THINGS THIS WALK USED TO DO ARE GONE, and each of them was a hole rather than a nicety.
 //
-// The honest limit it buys, stated because it is a real one: a seam that reached the wire door
-// through a helper whose bare name some OTHER declaration also carries is not followed. What is
-// never missed is a seam that names the door itself, which both of this file's do and which is
-// the shape the plan wrote.
+// It was keyed on the BARE name, so one verdict was shared by every declaration spelled that way.
+// (*MLSMessage).UnmarshalMLS mentions its own type, so the whole UnmarshalMLS family of this
+// package was marked as reaching the wire on the strength of one member's body. A verdict is a
+// property of a declaration, so it is keyed on the declaration.
+//
+// And an edge was followed only when the name it was written as belonged to ONE declaration of
+// the scan. MarshalMLS and UnmarshalMLS are carried by fourteen declarations here, so that
+// condition was doing real work -- but the work it was doing was hiding the bare-name merge
+// above: with the merge gone, no MarshalMLS or UnmarshalMLS of this package reaches the door at
+// all, and the near miss the condition was protecting (marshalPrivateMessageContentWithPadding,
+// production source, genuinely handed the authenticators, serializing a FRAGMENT) stays out on
+// its own merits. What the condition COST was measured: a forge plus a two line helper whose bare
+// name any second declaration also carried shipped with this gate reporting clean. So an edge is
+// now followed into every declaration carrying the name, and a helper renamed to collide is no
+// longer an exit.
+//
+// The remaining approximation, stated because a gate nobody knows the edge of is worse than none:
+// an edge is followed by NAME and not by resolved callee, so a declaration naming a method of
+// some other type is read as reaching whatever any declaration spelled that way reaches. That
+// direction over-reports, which fails loudly; the direction that under-reports is the one this
+// package has paid for.
 func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
-	declarations := map[string]int{}
-	for _, candidate := range candidates {
-		declarations[candidate.bare] += 1
+	byBareName := map[string][]int{}
+	for index, candidate := range candidates {
+		byBareName[candidate.bare] = append(byBareName[candidate.bare], index)
 	}
 	reaches := map[string]bool{}
 	for grew := true; grew; {
 		grew = false
 		for _, candidate := range candidates {
-			if reaches[candidate.bare] {
+			if reaches[candidate.name] {
 				continue
 			}
-			if candidate.names[seamWireDoor] || candidate.names[seamWireDoorType] {
-				reaches[candidate.bare] = true
+			if candidate.names[seamWireDoor] || candidate.answersTheDoorType {
+				reaches[candidate.name] = true
 				grew = true
 				continue
 			}
 			for named := range candidate.names {
-				if reaches[named] && declarations[named] == 1 {
-					reaches[candidate.bare] = true
+				followed := false
+				for _, index := range byBareName[named] {
+					if reaches[candidates[index].name] {
+						followed = true
+						break
+					}
+				}
+				if followed {
+					reaches[candidate.name] = true
 					grew = true
 					break
 				}
@@ -529,17 +594,18 @@ func seamsReachingTheWireDoor(candidates []seamCandidate) map[string]bool {
 // that reaches the wire door with them.
 //
 // The honest limit, recorded because a gate nobody knows the edge of is worse than none. A seam
-// that answered a *PrivateMessage instead of encoded octets never names the wire door and is
-// outside this reading, as is one that took its forged tag as a bare []byte rather than as the
-// structure that carries it. Both are further from the shape the validation forge asked for than
-// the plan's own draft was, and neither is what this gate was measured against: what it is
-// measured against is the plan's file, moved into the package proper with a caller.
+// that answered a *PrivateMessage instead of an *MLSMessage or its octets is outside this
+// reading, as is one that took its forged tag as a bare []byte rather than as the structure that
+// carries it. Both are further from the shape the validation forge asked for than the plan's own
+// draft was, and neither is what this gate was measured against: what it is measured against is
+// the plan's file, moved into the package proper with a caller, and the three receiver position
+// forges that passed the version of this gate that named the position.
 func constructionBypassSeamsIn(parsed []parsedSource) []seamCandidate {
 	candidates := seamCandidatesIn(parsed)
 	reaches := seamsReachingTheWireDoor(candidates)
 	seams := []seamCandidate{}
 	for _, candidate := range candidates {
-		if candidate.forgeable && reaches[candidate.bare] {
+		if candidate.forgeable && reaches[candidate.name] {
 			seams = append(seams, candidate)
 		}
 	}
@@ -562,18 +628,18 @@ func seamNamesOf(seams []seamCandidate) []string {
 // A package holding one of each shape, so a matcher that stopped matching fails here rather than
 // reporting this package clean.
 //
-// Five negatives and five positives, and every negative is a shape this package's PRODUCTION
-// source actually has: a fragment serializer handed the authenticators
-// (marshalPrivateMessageContentWithPadding), a sender that computes its own and names the type in
-// its body (SignAuthenticatedContent), and a codec whose receiver is the authenticators
-// ((*FramedContentAuthData).MarshalMLS). A rule that swept any of them in would ban the send path
-// rather than the forge.
+// Every negative is a shape this package's PRODUCTION source actually has: a fragment serializer
+// handed the authenticators as a parameter (marshalPrivateMessageContentWithPadding), the same
+// handed them as a RECEIVER ((*FramedContentAuthData).MarshalMLS), a sender that computes its own
+// and names the type in its body (SignAuthenticatedContent), and a decoder that answers a whole
+// message while being handed no authenticators at all (ParseMLSMessage). A rule that swept any of
+// them in would ban the send path rather than the forge.
 //
 // It declares TYPES as well as functions, which the version of this control that read one
 // identifier did not need. Three of them are production's own shape transcribed --
 // AuthenticatedContent holds the auth data, PublicMessage holds it, MLSMessage holds a
-// PublicMessage -- so the closure the parameter half derives is exercised at one hop and at two,
-// and the fourth carries none at any depth so the closure has something to leave out.
+// PublicMessage -- so the closure the handed-over half derives is exercised at one hop and at
+// two, and the fourth carries none at any depth so the closure has something to leave out.
 const constructionBypassSeamControl = `package control
 
 // the authenticators themselves, and the three types production really puts them inside. A seam
@@ -633,13 +699,19 @@ func sealsWhatItSignedItself(signer SignaturePrivateKey) ([]byte, error) {
 	return MarshalMLSMessage(&MLSMessage{})
 }
 
-// the codec OF the authenticators, reaching the wire door with them as its RECEIVER. It is what
-// says the rule reads parameters and not receivers.
+// A POSITIVE, and it was written here as a negative. Not one octet of it has changed: what
+// changed is the rule that reads it, and this member is where that shows.
 //
-// Its parameter carries NO authenticators, and that is the derived anchor's doing rather than a
-// tidy up. While the anchor was one identifier this took a *MLSMessage, which is a type that
-// carries them -- so under the reading below it would be a positive for its PARAMETER and would
-// have stopped being the receiver negative it is named for.
+// It was named "the codec OF the authenticators, reaching the wire door with them as its
+// RECEIVER" and held up as what says the rule reads parameters and not receivers -- and the
+// second half of that sentence is the defect, not a property. It is handed the authenticators
+// through the position its caller fills, and it reaches the door with them; a codec of the
+// authenticators is (*FramedContentAuthData).MarshalMLS below, which serializes a FRAGMENT and
+// never reaches the door at all. Its parameter was ALSO retuned once, from *MLSMessage to
+// *FramedContent, so that it would go on reading as a negative once *MLSMessage became a carrier.
+// The parameter is left exactly as that commit left it, because with the receiver read this
+// member is a positive either way and restoring it would only make it a positive twice over --
+// what it is for now is the receiver alone.
 func (self *FramedContentAuthData) marshalsAMessage(content *FramedContent) error {
 	_, err := MarshalMLSMessage(&MLSMessage{})
 	return err
@@ -669,6 +741,60 @@ func sealsOverSomethingThatCarriesNone(content *FramedContent) ([]byte, error) {
 // naming neither the door nor the authenticators, so the fixed point has something to leave out.
 func touchesNeither(count int) int {
 	return count + 1
+}
+
+// the seam whose authenticators arrive through the RECEIVER. It is forgesOverACarrier with the
+// carrier moved one position left, and the gate that read the position out of a list called this
+// one clean while failing the one beside it.
+func (self *AuthenticatedContent) forgesFromItsReceiver() ([]byte, error) {
+	message := &MLSMessage{PublicMessage: &PublicMessage{Auth: self.Auth}}
+	return MarshalMLSMessage(message)
+}
+
+// the same over the SEED of the closure rather than over a carrier one hop out, so the receiver
+// half is exercised at the root as well as inside the derivation.
+func (self *FramedContentAuthData) forgesItselfOntoTheWire() ([]byte, error) {
+	message := &MLSMessage{PublicMessage: &PublicMessage{Auth: *self}}
+	return MarshalMLSMessage(message)
+}
+
+// handed the authenticators through its RECEIVER and serializing a fragment, which is
+// (*FramedContentAuthData).MarshalMLS's shape and production's own. It is what says the receiver
+// did not become "every method of a carrier": what keeps a codec out is the door it never
+// reaches, and that was true of the parameter half before the receiver joined it.
+func (self *FramedContentAuthData) serializesItselfAsAFragment() []byte {
+	return self.Signature
+}
+
+// a seam answering a whole MESSAGE rather than its octets, so the door type is read where a
+// message leaves a declaration. The caller marshalling on the forge's behalf is one frame up, and
+// a rule that stopped at the octets would put the forge one step outside its own class.
+func answersAMessageRatherThanOctets(auth *FramedContentAuthData) (*MLSMessage, error) {
+	return &MLSMessage{PublicMessage: &PublicMessage{Auth: *auth}}, nil
+}
+
+// the same answer handed NO authenticators, which is ParseMLSMessage's shape and the one every
+// peer runs on bytes off the network. Answering a message is what reaches the wire; being handed
+// the authenticators is what makes it a forge, and the decoder is only ever the first.
+func parsesOctetsIntoAMessage(encoded []byte) (*MLSMessage, error) {
+	return &MLSMessage{}, nil
+}
+
+// a forge reaching the door only through a helper whose bare name a SECOND declaration of this
+// package also carries. A walk that dropped an ambiguous edge reported this clean, which is a
+// forge plus two lines.
+func forgesThroughAnAmbiguouslyNamedHelper(auth *FramedContentAuthData) ([]byte, error) {
+	_ = auth
+	return putsItOnTheWire()
+}
+
+func putsItOnTheWire() ([]byte, error) {
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+// the second declaration of that bare name, which is the whole of what made the edge ambiguous.
+// It reaches nothing and is handed nothing.
+func (self *FramedContent) putsItOnTheWire() {
 }
 `
 
@@ -778,20 +904,149 @@ func TestTheConstructionBypassSeamGateReadsAForgeInTheOtherRoot(t *testing.T) {
 // TestTheConstructionBypassSeamGateReadsItsControl runs the matcher on a package known to hold
 // every shape it must separate, so a rule narrowed by an edit fails here rather than reporting
 // the real package clean -- which is the one outcome a gate must never produce by accident.
+//
+// (*FramedContentAuthData).marshalsAMessage moved from the negatives to this list, and its source
+// was not touched to make it move. A control that starts reading differently as a class widens is
+// reporting the widening, and retuning it back is how the receiver half came to be certified as
+// an exclusion in the first place -- see the note on the member itself.
 func TestTheConstructionBypassSeamGateReadsItsControl(t *testing.T) {
 	seams := constructionBypassSeamsIn([]parsedSource{
 		mustParseText(t, "seam_control.go", constructionBypassSeamControl)})
 	want := []string{
+		"AuthenticatedContent.forgesFromItsReceiver",
+		"FramedContentAuthData.forgesItselfOntoTheWire",
+		"FramedContentAuthData.marshalsAMessage",
 		"Group.forgesAsAMethod",
+		"answersAMessageRatherThanOctets",
 		"forgesOverACarrier",
 		"forgesOverACarrierTwoHopsOut",
 		"forgesTheAuthenticatorsOntoTheWire",
 		"forgesThroughAWrapper",
+		"forgesThroughAnAmbiguouslyNamedHelper",
 	}
 	if !slices.Equal(seamNamesOf(seams), want) {
 		t.Fatalf("the matcher read %v out of the control, want %v; a positive it misses is a seam it would ship and a negative it sweeps in is the send path",
 			seamNamesOf(seams), want)
 	}
+}
+
+// seamReceiverForgeMethod is the method the test below writes over every carrier the closure
+// derives. ONE name for all of them, because a method name is unique per receiver type and
+// reusing it is what makes each forge differ from its neighbours in the receiver alone.
+const seamReceiverForgeMethod = "reviewSealsFromItsReceiver"
+
+// TestTheConstructionBypassSeamGateReadsAForgeOverEveryCarrierInReceiverPosition is the position
+// half's own control, and it is here because the position is the half this gate got wrong.
+//
+// The receiver was read to build a report name and the class was set from function.Type.Params
+// alone, so a construction bypass whose authenticators arrive through its RECEIVER was never in
+// it. Deriving the carrier closure made that strictly worse rather than better: the unprotected
+// receiver set had been the one type the old anchor spelled and became the whole closure, so
+// every type newly protected as a parameter became newly unprotected as a receiver. Measured, not
+// argued: (*FramedContentAuthData).reviewSealUnder in a production file -- handed the group,
+// signing through its crypto, sealing under this epoch's real keys and answering
+// MarshalMLSMessage -- returned a suite byte identical to a clean baseline, and so did the same
+// shape written over *AuthenticatedContent and over *MLSMessage.
+//
+// So the carriers are DERIVED and a forge is written over EVERY one of them in receiver position,
+// in a file named under production. A carrier the closure grows into tomorrow is inside this test
+// by existing rather than by being added to a list, which is the whole difference between this
+// and the table that certified the exclusion.
+func TestTheConstructionBypassSeamGateReadsAForgeOverEveryCarrierInReceiverPosition(t *testing.T) {
+	scan := mustScanSources(t, forbiddenScanRoots)
+	parsed := []parsedSource{}
+	for _, path := range slices.Sorted(maps.Keys(scan.sourceTexts)) {
+		parsed = append(parsed, mustParseText(t, path, scan.sourceTexts[path]))
+	}
+	carriers := slices.Sorted(maps.Keys(seamAuthenticatorCarriersIn(parsed)))
+	// the four production carriers at least, or the closure has stopped reading this package and
+	// a forge per member of an empty class is no measurement at all.
+	if len(carriers) < 4 {
+		t.Fatalf("the closure read %v over the real scan; there is no carrier class here to write a receiver forge over",
+			carriers)
+	}
+	forge := &strings.Builder{}
+	forge.WriteString("package mls\n")
+	want := []string{}
+	for _, carrier := range carriers {
+		forge.WriteString("\nfunc (self *" + carrier + ") " + seamReceiverForgeMethod +
+			"() ([]byte, error) {\n\t_ = self\n\treturn MarshalMLSMessage(&MLSMessage{})\n}\n")
+		want = append(want, carrier+"."+seamReceiverForgeMethod)
+	}
+	seams := constructionBypassSeamsIn(append(slices.Clone(parsed),
+		mustParseText(t, "a_receiver_forge.go", forge.String())))
+	shipped := map[string]bool{}
+	for _, seam := range seams {
+		if !strings.HasSuffix(seam.file, "_test.go") {
+			shipped[seam.name] = true
+		}
+	}
+	missed := []string{}
+	for _, name := range want {
+		if !shipped[name] {
+			missed = append(missed, name)
+		}
+	}
+	if len(missed) != 0 {
+		t.Errorf("%d of %d carriers are outside the class in receiver position -- %v are handed the authenticators by their caller and answer %s from a production file, and the gate reports them clean; the position is being named again",
+			len(missed), len(want), missed, seamWireDoor)
+	}
+}
+
+// TestTheConstructionBypassSeamGateFollowsACallEdgeWrittenUnderAnAmbiguousName is the second half
+// of the same finding, and the cheapest bypass this gate had: a forge plus two lines.
+//
+// The walk followed a call edge only when the name it was written as belonged to ONE declaration
+// of the scan. That is not a rare shape here -- a selector tail carries no receiver, so every
+// X.MarshalMLS and every X.UnmarshalMLS of this package is one bare name -- so the condition was
+// dropping edges by the dozen, and a forge reaching the door through a helper renamed to collide
+// with any of them shipped with the gate reporting clean. Confirmed, 7294 green.
+//
+// Both halves are asserted: the control holds the shape, and the ambiguity the condition turned
+// on is counted off REAL source, because a condition that cost nothing would be an argument
+// rather than a measurement.
+func TestTheConstructionBypassSeamGateFollowsACallEdgeWrittenUnderAnAmbiguousName(t *testing.T) {
+	control := []parsedSource{mustParseText(t, "seam_control.go", constructionBypassSeamControl)}
+	helpers := 0
+	for _, candidate := range seamCandidatesIn(control) {
+		if candidate.bare == "putsItOnTheWire" {
+			helpers += 1
+		}
+	}
+	if helpers < 2 {
+		t.Fatalf("the control declares %d declaration(s) named putsItOnTheWire; this edge is ambiguous only while two carry the name, so the control has stopped holding the shape it is here for",
+			helpers)
+	}
+	forge := "forgesThroughAnAmbiguouslyNamedHelper"
+	if names := seamNamesOf(constructionBypassSeamsIn(control)); !slices.Contains(names, forge) {
+		t.Errorf("the matcher read %v and not %s, which is handed the authenticators and reaches %s through a helper two declarations spell the same way; an ambiguous edge is an exit again",
+			names, forge, seamWireDoor)
+	}
+
+	scan := mustScanSources(t, forbiddenScanRoots)
+	parsed := []parsedSource{}
+	for _, path := range slices.Sorted(maps.Keys(scan.sourceTexts)) {
+		parsed = append(parsed, mustParseText(t, path, scan.sourceTexts[path]))
+	}
+	declarations := map[string]int{}
+	for _, candidate := range seamCandidatesIn(parsed) {
+		declarations[candidate.bare] += 1
+	}
+	ambiguous, widest, carried := 0, "", 0
+	for name, count := range declarations {
+		if count < 2 {
+			continue
+		}
+		ambiguous += 1
+		if count > carried {
+			widest, carried = name, count
+		}
+	}
+	if ambiguous == 0 {
+		t.Fatalf("no bare name in the scan is carried by two declarations, so the condition this test is about could never have dropped an edge and this scan is not reading the package")
+	}
+	t.Logf("%d bare name(s) carried by more than one declaration of the scan, the widest being %s at %d; every one of them named a helper the walk used to refuse to follow",
+		ambiguous, widest, carried)
 }
 
 // TestEveryConstructionBypassSeamIsDeclaredInTestSource is the statement the compiler cannot
@@ -901,6 +1156,34 @@ func TestEveryConstructionBypassSeamIsDeclaredInTestSource(t *testing.T) {
 			t.Fatalf("the scan read no declaration of %s, so the seal entry points the anchor is pinned against are not the ones this package has",
 				name)
 		}
+	}
+
+	// the RECEIVER half's near miss, pinned in both directions the way the parameter half's is.
+	// (*FramedContentAuthData).MarshalMLS is production's own codec of the authenticators: its
+	// caller hands them over through the receiver, and it serializes a FRAGMENT rather than
+	// reaching the wire. So it says the receiver is read in real source AND that reading it did
+	// not ban the encoder every honest sender runs -- the two claims the version of this gate
+	// that named the position could only ever make one of, by making the second one true and the
+	// first one false.
+	receiverNearMiss := "FramedContentAuthData.MarshalMLS"
+	held = false
+	for _, candidate := range candidates {
+		if candidate.name != receiverNearMiss {
+			continue
+		}
+		held = true
+		if !candidate.forgeable {
+			t.Errorf("%s is not read as handed the authenticators, and the authenticators are its RECEIVER; the position half of this rule is naming parameters again",
+				receiverNearMiss)
+		}
+		if strings.HasSuffix(candidate.file, "_test.go") {
+			t.Errorf("%s has moved into the test binary (%s), so the receiver near miss this rule is measured against is no longer production's own",
+				receiverNearMiss, candidate.file)
+		}
+	}
+	if !held {
+		t.Fatalf("the scan read no declaration of %s, so the receiver half of this rule is matching nothing in real source",
+			receiverNearMiss)
 	}
 
 	seams := constructionBypassSeamsIn(parsed)

@@ -2977,8 +2977,20 @@ var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]re
 	// for Export's reason: a call that answers an error hands this sweep no bytes at all, so a
 	// method swept over a refusal is a method swept in name only.
 	"ProposeAdd": func(t *testing.T, group *Group) [][]reflect.Value {
-		kp, _, _ := testKeyPackage(t, group.crypto,
-			testIdentity(t, group.crypto, "the joiner this sweep adds"))
+		// THE JOINER'S KEYS COME OFF A PROVIDER OF ITS OWN AND NOT OFF THE GROUP'S, and that is
+		// this row being driven with the arguments a caller would use rather than into a refusal.
+		// The group swept here is founded over a fixedRandomProvider so that its epoch secret is
+		// the corpus's -- see newGroupOverTheEpochSecret -- and every draw off that provider
+		// answers ONE value, so a key package minted through it publishes the encryption key the
+		// founding leaf already publishes. ProposeAdd refuses that as ValSem103's duplicate, and a
+		// row driven into a refusal hands this sweep no bytes at all. The suite is the group's, so
+		// the joiner is a member this group could really admit.
+		joinerCrypto, err := NewCryptoProvider(group.crypto.Suite())
+		if err != nil {
+			t.Fatalf("NewCryptoProvider for the joiner this sweep adds: %v", err)
+		}
+		kp, _, _ := testKeyPackage(t, joinerCrypto,
+			testIdentity(t, joinerCrypto, "the joiner this sweep adds"))
 		encoded, err := syntax.Marshal(kp)
 		if err != nil {
 			t.Fatalf("marshal the key package this sweep adds: %v", err)
@@ -2987,9 +2999,19 @@ var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]re
 	},
 	"ProposeRemove": func(t *testing.T, group *Group) [][]reflect.Value {
 		// a remove names a leaf that is not our own, and the group this sweep reads has one
-		// member, so a second is spliced into the ratchet tree here
-		leaf, _ := testLeafNode(t, group.crypto,
-			testIdentity(t, group.crypto, "the member this sweep removes"))
+		// member, so a second is spliced into the ratchet tree here.
+		//
+		// ITS KEYS COME OFF A PROVIDER OF ITS OWN, for the reason the add row's do one row up: a
+		// leaf minted through this group's fixedRandomProvider publishes the encryption key the
+		// founding leaf already publishes, which is a tree no group could reach -- ValSem103 and
+		// ValSem110 both refuse it -- and the ProposeUpdate row that runs after this one is then
+		// driven into a refusal by the tree this row left behind.
+		memberCrypto, err := NewCryptoProvider(group.crypto.Suite())
+		if err != nil {
+			t.Fatalf("NewCryptoProvider for the member this sweep removes: %v", err)
+		}
+		leaf, _ := testLeafNode(t, memberCrypto,
+			testIdentity(t, memberCrypto, "the member this sweep removes"))
 		at, err := group.tree.AddLeaf(leaf)
 		if err != nil {
 			t.Fatalf("splice a second leaf into the group this sweep reads: %v", err)
@@ -3150,8 +3172,24 @@ func newGroupOverTheEpochSecret(t *testing.T, epoch ksVectorEpoch) (*Group, erro
 	}
 	owner := testIdentity(t, base, "owner")
 	crypto := &fixedRandomProvider{CryptoProvider: base, value: epochSecretOfTheEpoch(t, epoch)}
-	return NewGroup(testGroupConfig(t, crypto, owner, "group"+epoch.at),
+	group, err := NewGroup(testGroupConfig(t, crypto, owner, "group"+epoch.at),
 		owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil || group == nil {
+		return group, err
+	}
+	// AND THE FIXED DRAW IS PUT BACK ONCE THE CONSTRUCTION IS OVER, which is the scope the
+	// paragraph above argues for: the draw is fixed so that NewGroup derives a KNOWN epoch
+	// secret, and that is the whole of what it is for. Left standing, EVERY later draw of that
+	// width answers the same value -- so the update this sweep drives republishes the encryption
+	// key its own leaf already holds, which is the one thing RFC 9420 section 12.1.2 states about
+	// an Update's leaf and which (*Group).propose now refuses at generation. A row driven into a
+	// refusal hands this sweep no bytes at all.
+	//
+	// Nothing G6 reads moves with it. The epoch secret this gate compares against is the one the
+	// schedule already derived and still holds; what changes is only where the group's LATER keys
+	// come from, and a method that hands out epoch_secret hands it out of that schedule.
+	group.crypto = base
+	return group, nil
 }
 
 // epochSecretHolderSweeps is how this gate reads a value of a type that keeps the epoch

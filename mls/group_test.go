@@ -1025,15 +1025,35 @@ func proposalGeneratorRows(t *testing.T, crypto CryptoProvider, group *Group,
 	}
 }
 
-// testProposalGenerationFixture founds a group with a second member, mints a joiner's key package
-// and answers everything the two sweeps below drive.
-func testProposalGenerationFixture(t *testing.T) (CryptoProvider, *Group, []proposalGeneratorRow) {
+// proposalGenerationParts is the fixture both sweeps below are driven from.
+//
+// It is handed back WHOLE rather than as the three values the row sweep happens to need, because
+// the second sweep reaches parts a benign row never does -- the member already occupying a leaf,
+// the group's own published extension set -- and a second fixture built beside this one is a
+// second group that agrees with it until the day one of them is edited.
+type proposalGenerationParts struct {
+	crypto CryptoProvider
+	group  *Group
+	owner  *testMember
+	// the member already occupying a leaf other than our own, and that leaf.
+	second *testMember
+	other  LeafIndex
+	// a joiner's key package, encoded the way a caller of ProposeAdd holds one.
+	joiner []byte
+	// the group's OWN published extensions. A group context extensions proposal replaces the list
+	// wholesale, so this is the smallest one a real caller could send: a list that still carries
+	// the policy the group runs under.
+	published []Extension
+}
+
+func testProposalGenerationParts(t *testing.T) *proposalGenerationParts {
 	t.Helper()
 	crypto := testCrypto(t)
 	owner := testIdentity(t, crypto, "owner")
 	group := testNewGroup(t, crypto, owner, "group-1")
 	t.Cleanup(func() { group.Close() })
-	other := testGroupWithASecondLeaf(t, crypto, group, testIdentity(t, crypto, "bob"))
+	second := testIdentity(t, crypto, "bob")
+	other := testGroupWithASecondLeaf(t, crypto, group, second)
 
 	joiner := testIdentity(t, crypto, "carol")
 	kp, _, _ := testKeyPackage(t, crypto, joiner)
@@ -1041,11 +1061,24 @@ func testProposalGenerationFixture(t *testing.T) (CryptoProvider, *Group, []prop
 	if err != nil {
 		t.Fatalf("marshal the joiner's key package: %v", err)
 	}
-	// the group's OWN published extensions, re-proposed. A group context extensions proposal
-	// replaces the list wholesale, so this is the smallest one a real caller could send: a list
-	// that still carries the policy the group runs under.
-	published := testGroupContextOf(t, group).Extensions
-	rows := proposalGeneratorRows(t, crypto, group, encoded, other, published)
+	return &proposalGenerationParts{
+		crypto:    crypto,
+		group:     group,
+		owner:     owner,
+		second:    second,
+		other:     other,
+		joiner:    encoded,
+		published: testGroupContextOf(t, group).Extensions,
+	}
+}
+
+// testProposalGenerationFixture founds a group with a second member, mints a joiner's key package
+// and answers everything the row sweeps below drive.
+func testProposalGenerationFixture(t *testing.T) (CryptoProvider, *Group, []proposalGeneratorRow) {
+	t.Helper()
+	parts := testProposalGenerationParts(t)
+	crypto, group := parts.crypto, parts.group
+	rows := proposalGeneratorRows(t, crypto, group, parts.joiner, parts.other, parts.published)
 
 	// the rows ARE the accepted set of the profile's proposal table, in both directions. A fifth
 	// accepted type with no generator would be a proposal kind these sweeps never judged, and a
@@ -1102,39 +1135,351 @@ func TestEveryProposalThisGroupGeneratesIsAcceptedByItsOwnValidationDoors(t *tes
 			t.Fatalf("%s: the cache's newest entry is a %s", row.name,
 				proposalTypeName(one.Proposal.ProposalType))
 		}
-		in := &ProposalValidationInput{
-			Crypto:    crypto,
-			Tree:      group.tree,
-			Context:   context,
-			Committer: row.committer,
-			List:      NewProposalList([]CachedProposal{one}),
-			Now:       time.Now(),
+		if refusal := testProposalDoorsRefusal(t, crypto, group, context, row.committer,
+			one); refusal != nil {
+
+			t.Errorf("%s: this group generated a proposal its own doors refuse: %v",
+				row.name, refusal)
 		}
-		if err := ValidateProposalList(in); err != nil {
-			t.Errorf("%s: this group generated a proposal its own ValidateProposalList refuses: %v",
-				row.name, err)
+	}
+}
+
+// testProposalDoorsRefusal is this package's own judgement of ONE proposal standing alone: the
+// refusal its doors answer over a single entry list, or nil.
+//
+// TWO DOORS AND NOT ONE. ValidateProposalList is RFC 9420 section 12.2's whole procedure.
+// ValSem209 is the commit door's read of an installed extension set and is not one of section
+// 12.2's list rules, so a generator held to the list rules alone is held to strictly less than a
+// receiver applies -- measured: without it the generator published a set carrying
+// required_capabilities twice, which every list rule accepts because none of them looks that body
+// up, and which ValSem209 refuses because it reads it through the lookup that refuses a vector
+// carrying one type twice.
+//
+// BOTH SWEEPS BELOW JUDGE THROUGH THIS ONE FUNCTION, which is the point of it being one. A
+// proposal accepted by one reading of "its own doors" and refused by the other would be a
+// generator that passes the sweep it is written into and fails the one it is not.
+func testProposalDoorsRefusal(t *testing.T, crypto CryptoProvider, group *Group,
+	context *GroupContext, committer LeafIndex, one CachedProposal) error {
+
+	t.Helper()
+	list := NewProposalList([]CachedProposal{one})
+	if err := ValidateProposalList(&ProposalValidationInput{
+		Crypto:    crypto,
+		Tree:      group.tree,
+		Context:   context,
+		Committer: committer,
+		List:      list,
+		Now:       time.Now(),
+	}); err != nil {
+		return err
+	}
+	if one.Proposal.ProposalType != ProposalTypeGroupContextExtensions {
+		return nil
+	}
+	commitIn := testCommitInput(t, crypto, group.tree, list, &Commit{})
+	commitIn.Context = context
+	commitIn.Committer = committer
+	commitIn.Own = group.OwnLeafIndex()
+	// erratum 8815 runs at the commit door and asks whether every reference the commit names was
+	// previously received; a cached entry is where that answer comes from, and an entry a control
+	// assembled by hand carries ByValue so that the question is not asked of a proposal nobody
+	// ever published.
+	commitIn.Pending = group.proposals
+	commitIn.Now = time.Now()
+	return ValSem209GroupExtensionsSupported(commitIn)
+}
+
+// ---------------------------------------------------------------------------
+// the obligation, and the inputs that put a generator under it
+// ---------------------------------------------------------------------------
+
+// testKeyPackagePublishing mints a key package for m whose leaf publishes a caller-chosen
+// encryption key, re-signing both the leaf and the package over it.
+//
+// BOTH SIGNATURES, which is testKeyPackage's own correction restated: a leaf rebound without the
+// package signature is refused by KeyPackage.Validate for the signature rather than for the key,
+// and a temptation refused by the wrong door tempts nothing.
+func testKeyPackagePublishing(t *testing.T, crypto CryptoProvider, m *testMember,
+	encryptionKey HpkePublicKey) *KeyPackage {
+
+	t.Helper()
+	kp, _, _ := testKeyPackage(t, crypto, m)
+	kp.LeafNode.EncryptionKey = bytes.Clone(encryptionKey)
+	if err := kp.LeafNode.Sign(crypto, m.SigPriv, nil, 0); err != nil {
+		t.Fatalf("re-sign %s's leaf over the planted encryption key: %v", m.Name, err)
+	}
+	content, err := kp.signedPreimage()
+	if err != nil {
+		t.Fatalf("KeyPackage.signedPreimage(%s): %v", m.Name, err)
+	}
+	signature, err := crypto.SignWithLabel(m.SigPriv, keyPackageSignatureLabel, content)
+	if err != nil {
+		t.Fatalf("SignWithLabel(%s): %v", m.Name, err)
+	}
+	kp.Signature = signature
+	return kp
+}
+
+// testCachedAdd is the entry an Add of this key package would be judged as, carried BY VALUE
+// because no cache ever held it: this is the proposal a generator WOULD have emitted, assembled
+// with the generator out of the way.
+func testCachedAdd(parts *proposalGenerationParts, kp *KeyPackage) CachedProposal {
+	return CachedProposal{
+		Proposal: Proposal{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}},
+		Sender:   parts.group.OwnLeafIndex(),
+		ByValue:  true,
+	}
+}
+
+// proposalGeneratorTemptation is one call a caller can make that would put a proposal this
+// package's own doors refuse into this epoch's cache.
+//
+// THE REFUSAL IS NAMED, and naming it is the whole of what makes a temptation one. A shape refused
+// for some unrelated reason -- a key package that does not validate, a leaf outside the tree while
+// the rule under test is about keys -- satisfies every assertion a sweep could make while tempting
+// nothing at all, which is exactly how the row for ProposeAdd came to be a joiner nobody in the
+// group had ever met. The value is asserted at BOTH ends below: the doors must answer it over the
+// proposal the call describes, and the generator must refuse the call with it.
+type proposalGeneratorTemptation struct {
+	name    string
+	kind    ProposalType
+	refusal error
+	// the input, the proposal it describes, and the call that would make it. ONE function,
+	// because the control and the call have to be about the same input: a control built from a
+	// second draw is a control of something else.
+	tempt func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error))
+}
+
+// proposalGeneratorTemptations is one input per generator that this package's own doors refuse.
+//
+// The set is held to the profile's proposal table by the sweep that uses it, in both directions,
+// so a fifth accepted type is inside this obligation by existing rather than by somebody
+// remembering to add a row.
+func proposalGeneratorTemptations() []proposalGeneratorTemptation {
+	return []proposalGeneratorTemptation{
+		{
+			// THE MEASURED ONE. ProposeAdd ran (*KeyPackage).Validate and LeafKeysOf and nothing
+			// else, and section 10.1 judges a key package against itself and a suite -- so a
+			// second device for a member who is already here is a well formed, correctly signed,
+			// unexpired package that this group ACCEPTED, signed, sealed and cached, while
+			// ValSem101 refuses it as a one entry list against the members the group already has.
+			name:    "add/a key package publishing a signature key this group already carries",
+			kind:    ProposalTypeAdd,
+			refusal: ErrAddDuplicateSignatureKey,
+			tempt: func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error)) {
+				kp, _, _ := testKeyPackage(t, parts.crypto, parts.second)
+				encoded, err := syntax.Marshal(kp)
+				if err != nil {
+					t.Fatalf("marshal the second device's key package: %v", err)
+				}
+				return testCachedAdd(parts, kp), func() ([]byte, error) {
+					return parts.group.ProposeAdd(encoded)
+				}
+			},
+		},
+		{
+			// the other half of the same finding: ValSem103's members' half reads the same
+			// in.Tree.NonBlankLeaves ValSem101's does, so a fix that asked one question and not
+			// the other would leave a joiner republishing a member's encryption key.
+			name:    "add/a key package republishing a member's encryption key",
+			kind:    ProposalTypeAdd,
+			refusal: ErrAddDuplicateEncryptionKey,
+			tempt: func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error)) {
+				occupied := parts.group.tree.Leaf(parts.other)
+				if occupied == nil {
+					t.Fatalf("this fixture holds no leaf at %d, so there is no key to republish",
+						parts.other)
+				}
+				kp := testKeyPackagePublishing(t, parts.crypto,
+					testIdentity(t, parts.crypto, "dave"), occupied.EncryptionKey)
+				encoded, err := syntax.Marshal(kp)
+				if err != nil {
+					t.Fatalf("marshal the republishing key package: %v", err)
+				}
+				return testCachedAdd(parts, kp), func() ([]byte, error) {
+					return parts.group.ProposeAdd(encoded)
+				}
+			},
+		},
+		{
+			// the generator that ALREADY asked its own doors' question, which is why the
+			// asymmetry this sweep closes was visible in one file: ProposeRemove answers
+			// ValSem108's value from ValSem108's own reading of the tree.
+			name:    "remove/a leaf this group's tree does not hold",
+			kind:    ProposalTypeRemove,
+			refusal: ErrRemoveNonMember,
+			tempt: func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error)) {
+				beyond := LeafIndex(parts.group.tree.LeafWidth())
+				return CachedProposal{
+						Proposal: Proposal{ProposalType: ProposalTypeRemove,
+							Remove: &Remove{Removed: beyond}},
+						Sender:  parts.group.OwnLeafIndex(),
+						ByValue: true,
+					}, func() ([]byte, error) {
+						return parts.group.ProposeRemove(beyond)
+					}
+			},
+		},
+		{
+			// ProposeUpdate takes no argument, so the input is the entropy. The control is the
+			// proposal this generator ITSELF produced from that draw, captured before the leaf it
+			// replaces was made to hold the same key -- so the shape being judged is exactly the
+			// shape the second call would emit, rather than one assembled by hand beside it.
+			name:    "update/a draw that republishes the key the leaf already holds",
+			kind:    ProposalTypeUpdate,
+			refusal: ErrUpdateEncryptionKeyUnchanged,
+			tempt: func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error)) {
+				ikm := bytes.Repeat([]byte{0x5c}, parts.crypto.HashSize())
+				_, drawn, err := parts.crypto.DeriveKeyPair(ikm)
+				if err != nil {
+					t.Fatalf("DeriveKeyPair over the fixed draw: %v", err)
+				}
+				// key_schedule_test.go's own provider, which answers one value from every draw of
+				// that value's width and falls through for any other. A second one written here
+				// would be a second answer to the same question, and this is the only input
+				// ProposeUpdate has: it takes no argument, so the entropy its replacement key
+				// comes out of is the whole of what a caller can vary about it.
+				parts.group.crypto = &fixedRandomProvider{CryptoProvider: parts.crypto, value: ikm}
+				before := len(parts.group.pendingProposalsForTest())
+				if _, err := parts.group.ProposeUpdate(); err != nil {
+					t.Fatalf("the first update under the fixed draw was refused: %v; this temptation needs one accepted proposal to be the shape of the second",
+						err)
+				}
+				cached := parts.group.pendingProposalsForTest()
+				if len(cached) != before+1 {
+					t.Fatalf("the first update under the fixed draw cached nothing")
+				}
+				control := cached[len(cached)-1]
+				if control.Proposal.Update == nil {
+					t.Fatalf("the cache's newest entry is not an update")
+				}
+				if !bytes.Equal(control.Proposal.Update.LeafNode.EncryptionKey, drawn) {
+					t.Fatalf("the update published %x and the fixed draw derives %x; this generator is not drawing through the provider it was handed",
+						control.Proposal.Update.LeafNode.EncryptionKey, drawn)
+				}
+				// and now the leaf it replaces holds that key, so the SAME draw republishes it
+				own := parts.group.tree.Leaf(parts.group.OwnLeafIndex())
+				if own == nil {
+					t.Fatalf("this group holds no leaf at its own index")
+				}
+				own.EncryptionKey = bytes.Clone(drawn)
+				return control, func() ([]byte, error) { return parts.group.ProposeUpdate() }
+			},
+		},
+		{
+			// every list rule of section 12.2 accepts this, because none of them looks that body
+			// up. It is here because the doors this obligation is stated over are the doors a
+			// RECEIVER runs, and ValSem209 is one of them.
+			name:    "group_context_extensions/a set carrying required_capabilities twice",
+			kind:    ProposalTypeGroupContextExtensions,
+			refusal: ErrMalformedExtension,
+			tempt: func(t *testing.T, parts *proposalGenerationParts) (CachedProposal, func() ([]byte, error)) {
+				entry, found, err := FindExtensionEntry(parts.published,
+					ExtensionTypeRequiredCapabilities)
+				if err != nil || !found {
+					t.Fatalf("the group publishes no single required_capabilities extension (found %v): %v",
+						found, err)
+				}
+				doubled := append(slices.Clone(parts.published), entry)
+				return CachedProposal{
+						Proposal: Proposal{ProposalType: ProposalTypeGroupContextExtensions,
+							GroupContextExtensions: &GroupContextExtensions{Extensions: doubled}},
+						Sender:  parts.group.OwnLeafIndex(),
+						ByValue: true,
+					}, func() ([]byte, error) {
+						return parts.group.ProposeGroupContextExtensions(doubled)
+					}
+			},
+		},
+	}
+}
+
+// TestNoGeneratorOnThisGroupEmitsAProposalItsOwnDoorsRefuse is the obligation, stated once over
+// every generator rather than as a check inside each of them.
+//
+// THE SWEEP ABOVE MEASURED THE WRONG THING BY MEASURING ONLY GOOD INPUTS. Every row of it hands a
+// generator an input nothing could object to -- a joiner nobody has met, the group's own extension
+// set re-proposed -- so it establishes that the generators work and says nothing about what they
+// do with an input their own doors refuse. Measured with this group's own doors: a key package for
+// a member already occupying a leaf, carrying that member's own signature key and a fresh
+// encryption key, was ACCEPTED by ProposeAdd -- signed, sealed and cached -- and
+// ValidateProposalList refuses that same entry as a ONE ENTRY list. Judged alone, so the build's
+// stated defence that "the cross-proposal rules are the committer's" does not reach it: ValSem101
+// and ValSem103 each have a members' half read off in.Tree.NonBlankLeaves, which is this group's
+// own pre-commit tree and is decidable the moment the proposal is built.
+//
+// SO THE OBLIGATION IS DERIVED AND NOT ENUMERATED, in three ways that matter:
+//
+//   - it is stated over EVERY generator. The temptations are held to the v1 profile's own proposal
+//     table in both directions, exactly as the rows are, so a fifth accepted type is inside this
+//     test by existing;
+//   - the doors are the doors, not a transcription of two rules. testProposalDoorsRefusal is what
+//     the sweep above judges through as well, so a rule added to section 12.2 tomorrow is asked of
+//     every generator without a line changing here;
+//   - and the answer is the same VALUE at both ends. A generator must refuse with the value its
+//     own doors answer, which is what says it asked their question rather than a question of its
+//     own that happens to refuse the same input today.
+func TestNoGeneratorOnThisGroupEmitsAProposalItsOwnDoorsRefuse(t *testing.T) {
+	temptations := proposalGeneratorTemptations()
+	tempted := map[ProposalType]bool{}
+	for _, one := range temptations {
+		tempted[one.kind] = true
+	}
+	for kind, refusal := range proposalTypeProfile {
+		if refusal == nil && !tempted[kind] {
+			t.Errorf("the v1 profile accepts %s and this group generates one, and no temptation drives that generator with an input its own doors refuse; the obligation is not stated over it",
+				proposalTypeName(kind))
 		}
-		// AND, FOR THE PROPOSAL THAT INSTALLS AN EXTENSION SET, THE COMMIT DOOR'S OWN READ OF IT.
-		// ValSem209 is not one of section 12.2's list rules and ValidateProposalList does not run
-		// it, so a generator held to the list rules alone is held to strictly less than a receiver
-		// applies. Measured: without this the generator published a set carrying
-		// required_capabilities twice -- which every list rule accepts, because none of them looks
-		// that body up, and which ValSem209 refuses because it reads it through the lookup.
-		if row.kind != ProposalTypeGroupContextExtensions {
+		if refusal != nil && tempted[kind] {
+			t.Errorf("a temptation drives a %s generator, which the v1 profile refuses",
+				proposalTypeName(kind))
+		}
+	}
+
+	for _, one := range temptations {
+		// a fixture per temptation, because a temptation is allowed to edit the group it tempts:
+		// the update one plants a key in the tree and hands the group a provider that draws it
+		// again, and a second temptation reading that state would be measuring the first one's
+		// leftovers.
+		parts := testProposalGenerationParts(t)
+		context := testGroupContextOf(t, parts.group)
+		// THE COMMITTER IS A LEAF OUTSIDE THIS TREE, which is (*Group).propose's own reading and
+		// is here for its reason: exactly two rules of section 12.2 are stated over the committer,
+		// and neither is decidable while a proposal is being generated.
+		committer := LeafIndex(parts.group.tree.LeafWidth())
+		control, call := one.tempt(t, parts)
+
+		if refusal := testProposalDoorsRefusal(t, parts.crypto, parts.group, context, committer,
+			control); !errors.Is(refusal, one.refusal) {
+
+			t.Errorf("%s: this package's own doors answer %v over the proposal this call describes, and the temptation is written for %v; a temptation the doors accept -- or refuse for another reason -- measures nothing about the generator",
+				one.name, refusal, one.refusal)
 			continue
 		}
-		commitIn := testCommitInput(t, crypto, group.tree, in.List, &Commit{})
-		commitIn.Context = context
-		commitIn.Committer = row.committer
-		commitIn.Own = group.OwnLeafIndex()
-		// erratum 8815 runs at the commit door and asks whether every reference the commit names
-		// was previously received; the entry this row just cached is where that answer comes from
-		commitIn.Pending = group.proposals
-		commitIn.Now = time.Now()
-		if err := ValSem209GroupExtensionsSupported(commitIn); err != nil {
-			t.Errorf("%s: this group generated an extension set its own ValSem209 refuses: %v",
-				row.name, err)
+
+		before := len(parts.group.pendingProposalsForTest())
+		if _, err := call(); err != nil {
+			if !errors.Is(err, one.refusal) {
+				t.Errorf("%s: the generator refused with %v and its own doors refuse this proposal with %v; a generator that refuses for another reason is not asking the question its receivers will",
+					one.name, err, one.refusal)
+			}
+			if after := len(parts.group.pendingProposalsForTest()); after != before {
+				t.Errorf("%s: the refusal left this epoch's cache holding %d entries and it held %d; a proposal this package refuses must not be one this client's own next commit would name",
+					one.name, after, before)
+			}
+			continue
 		}
+		cached := parts.group.pendingProposalsForTest()
+		if len(cached) == before {
+			t.Errorf("%s: the generator accepted an input whose proposal its own doors refuse with %v, and cached nothing",
+				one.name, one.refusal)
+			continue
+		}
+		t.Errorf("%s: this group generated and cached a proposal its own doors refuse: they answer %v over what it cached, and %v over the proposal the call describes",
+			one.name,
+			testProposalDoorsRefusal(t, parts.crypto, parts.group, context, committer,
+				cached[len(cached)-1]),
+			one.refusal)
 	}
 }
 

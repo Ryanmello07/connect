@@ -733,6 +733,9 @@ func (self *Group) marshalState() ([]byte, error) {
 //   - checkProposalProfile, before a single octet is signed;
 //   - the structure's own validator for the two kinds that carry one a peer will judge --
 //     (*KeyPackage).Validate for an add, GroupPolicyOf for a group context extension set;
+//   - ValidateProposalList itself, over a list holding this one proposal, which is section 12.2's
+//     whole procedure asked at generation time and is the door the three above cannot stand in
+//     for -- see (*Group).propose;
 //   - and the CACHE, which re-runs the profile gate, checks the epoch binding and applies the
 //     per sender and per leaf ceilings.
 //
@@ -770,6 +773,13 @@ func (self *Group) marshalState() ([]byte, error) {
 // profile makes wraps the epoch's secret to urmessage_leaf_keys, so a joiner whose leaf carries
 // none is a member no epoch can ever reach -- and the first symptom of admitting one is a member
 // who cannot read anything, one commit after the commit that added them.
+//
+// NEITHER OF THOSE ASKS WHETHER THE GROUP ALREADY CARRIES THIS CLIENT'S KEYS, and that is not
+// asked here either. Section 10.1 judges a key package against itself and a suite; ValSem101 and
+// ValSem103 judge it against the members this group already has, and both of them are decidable
+// off the pre-commit tree. They are asked once, for every generator, in (*Group).propose -- so
+// what is left in this method is the part of an Add's judgement no list rule makes, and the part
+// every list rule makes is not written out again here where a fourth generator would miss it.
 func (self *Group) ProposeAdd(keyPackage []byte) ([]byte, error) {
 	self.stateLock.Lock()
 	crypto, suite, closed := self.crypto, self.context.CipherSuite, self.closed
@@ -1060,6 +1070,41 @@ func (self *Group) propose(proposal *Proposal) ([]byte, error) {
 	// signed, sealed and encoded, and a generation of this leaf's ratchet is spent, before anything
 	// refuses it. Nothing here claims a test can tell which of the two guards fired.
 	if err := checkProposalProfile(defaultProfile(), proposal); err != nil {
+		return nil, err
+	}
+	// AND THROUGH THE DOOR EVERY RECEIVER WILL JUDGE IT AT, over a list holding this one proposal.
+	//
+	// THE OBLIGATION IS DERIVED HERE RATHER THAN RESTATED IN EACH GENERATOR, and that is the
+	// difference between this and the two checks it makes unnecessary. ProposeAdd ran kp.Validate
+	// and LeafKeysOf and nothing else, so an Add republishing a signature key this group already
+	// carries was accepted, signed, sealed and CACHED -- while ValidateProposalList refuses that
+	// same entry as a ONE ENTRY list, which is what says it was never a cross-proposal question
+	// for the committer to answer. ValSem101 and ValSem103 each read their members' half off
+	// in.Tree.NonBlankLeaves, which is this group's own pre-commit tree and is sitting under this
+	// lock; ValSem105, ValSem106 and section 12.1.2's two rules on an Update's leaf are the same
+	// shape. A fifth generator written later is inside this by existing, which a third hand
+	// written check beside the other two would not have been.
+	//
+	// THE COMMITTER IS A LEAF INDEX OUTSIDE THIS TREE, and it is the one thing this reading cannot
+	// decide. Exactly two rules of section 12.2 are stated over the committer -- ValSem111
+	// compares it against an Update's sender, validateCommitterIsNotRemoved against a Remove's
+	// target -- and nobody knows yet who will commit this. A leaf beyond the tree's width is named
+	// by no proposal a member can send over this tree, so those two rules are left to the
+	// committer and every other rule is asked now. That is what "the cross-proposal rules are the
+	// committer's" was always meant to cover, and a one entry list is not it.
+	//
+	// It runs BEFORE the signature for the reason the profile gate above does: a refusal here
+	// costs nothing, and the same refusal after the seal has already spent a generation of this
+	// leaf's ratchet on a message no peer will ever be sent.
+	if err := ValidateProposalList(&ProposalValidationInput{
+		Crypto:    self.crypto,
+		Tree:      self.tree,
+		Context:   self.context,
+		Committer: LeafIndex(self.tree.LeafWidth()),
+		List: NewProposalList([]CachedProposal{
+			{Proposal: *proposal, Sender: self.ownLeaf}}),
+		Now: time.Now(),
+	}); err != nil {
 		return nil, err
 	}
 	groupContext, err := syntax.Marshal(self.context)

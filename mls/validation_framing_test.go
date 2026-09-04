@@ -1146,18 +1146,19 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // package ships a section 7.3 door its own construction does not run, and that fact belongs here
 // rather than in the gap between two tasks.
 //
-// ValidateProposalList is p7 task 7's aggregate, and it is here for exactly that reason rather than
-// because anything about it is unfinished. Its twenty one rules are all applied -- ValidateProposalList
-// runs every one of them, and ApplyProposals runs the two structural ones on its own account -- but
-// the commit paths that call the aggregate are tasks 22 and 25, which have not landed. Until they do,
-// this package ships a section 12.2 validator that its own commit construction does not run, and
-// that fact belongs somewhere a reader can find it rather than in the gap between two tasks.
+// ValidateProposalList WAS here on the same reasoning and is not any more, which is this list
+// expiring by failing rather than by anybody remembering it. The entry said the commit paths that
+// call the aggregate are tasks 22 and 25 and that until they land this package ships a section 12.2
+// validator its own construction does not run -- and the second half of that stopped being true
+// before the first half did. (*Group).propose puts every proposal this package GENERATES through the
+// aggregate as a one entry list, which is the sending side of the same rules, so the caller arrived
+// from a direction the entry did not anticipate. This list failed until the entry came off, exactly
+// as CheckUpdatePathKeyUniqueness's did.
 var rulesThisPackageExportsAndNothingApplies = []string{
 	"CheckFramedContentContext",
 	"CheckSenderLeaf",
 	"ValSem205ConfirmationTag",
 	"ValidateCommit",
-	"ValidateProposalList",
 	"ValidateUpdatePathLeafNode",
 }
 
