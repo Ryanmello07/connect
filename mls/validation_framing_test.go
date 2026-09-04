@@ -1146,6 +1146,17 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // package ships a section 7.3 door its own construction does not run, and that fact belongs here
 // rather than in the gap between two tasks.
 //
+// ValSem300NoTrailingBlankNodes ARRIVED on p7 task 13, and what put it here is a repair rather than
+// a gap. Section 12.4.3.3's trailing blank rule is stated over the ARRAY a ratchet_tree extension
+// travels as: the encoder writes it with the blanks stripped and (*RatchetTree).UnmarshalMLS refuses
+// a padded one INLINE, which is where the rule fires today. The two production callers of the
+// exported door were asking it of an IN-MEMORY tree, which is held at the full width 2^(d+1)-1 --
+// so every group whose size is not a power of two was refused, by its own commit door and by its
+// own RatchetTree accessor, over a tree that encodes and decodes perfectly. Both callers now state
+// the half that is true of a tree at full width, and this door is left for the caller that has a
+// DECODED array and no decode of its own to have run: task 16's welcome path, which is handed a
+// ratchet tree out of band.
+//
 // ValidateProposalList WAS here on the same reasoning and is not any more, which is this list
 // expiring by failing rather than by anybody remembering it. The entry said the commit paths that
 // call the aggregate are tasks 22 and 25 and that until they land this package ships a section 12.2
@@ -1165,6 +1176,7 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 var rulesThisPackageExportsAndNothingApplies = []string{
 	"CheckFramedContentContext",
 	"CheckSenderLeaf",
+	"ValSem300NoTrailingBlankNodes",
 	"ValidateUpdatePathLeafNode",
 }
 

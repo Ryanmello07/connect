@@ -412,6 +412,59 @@ func TestACommitCoveringAnAddCarriesNoWelcomeUntilTask15(t *testing.T) {
 	}
 }
 
+// TestAGroupOfThreePublishesATreeItsOwnDecoderAcceptsBack is the second half of the trailing blank
+// repair, over the door a joiner is actually handed a tree through.
+//
+// A ratchet tree grows by DOUBLING, so a group of any size that is not a power of two is held at a
+// width with blank leaves on the right -- and RFC 9420 section 12.4.3.3's rule is about the array
+// that travels, which the encoder writes with those blanks stripped. Asking the in-memory question
+// at this door refused every group of three, five, six, seven, nine members and so on; there was no
+// group of three in this build until commit generation landed, so nothing reported it.
+//
+// The tree is decoded BACK, which is what makes this a statement about the two ends agreeing rather
+// than about one of them: (*RatchetTree).UnmarshalMLS refuses an array that ends in a blank, so a
+// tree this group publishes and its own decoder refuses would fail here rather than at a joiner.
+func TestAGroupOfThreePublishesATreeItsOwnDecoderAcceptsBack(t *testing.T) {
+	crypto := testCrypto(t)
+	group, _, _ := commitTestGroupOfTwo(t, crypto)
+	defer group.Close()
+	carol, _, _ := testKeyPackage(t, crypto, testIdentity(t, crypto, "carol"))
+	result, err := group.CreateCommit([][]byte{},
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *carol}}}, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit adding a third member: %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	if len(group.Members()) != 3 {
+		t.Fatalf("Members = %d, want 3", len(group.Members()))
+	}
+	if width := group.tree.LeafWidth(); width != 4 {
+		t.Fatalf("the tree of a three member group is %d leaves wide, and this test is about the width that carries a blank",
+			width)
+	}
+	if !group.tree.HasTrailingBlankNodes() {
+		t.Fatal("the tree of a three member group does not end in a blank node, so this test is not about the shape it was written for")
+	}
+	published, err := group.RatchetTree()
+	if err != nil {
+		t.Fatalf("a three member group could not publish its own tree: %v", err)
+	}
+	decoded, err := UnmarshalRatchetTree(published)
+	if err != nil {
+		t.Fatalf("this group published a tree its own decoder refuses: %v", err)
+	}
+	if len(decoded.NonBlankLeaves()) != 3 {
+		t.Fatalf("the published tree decodes to %d member(s), want 3", len(decoded.NonBlankLeaves()))
+	}
+	// and it is the tree the commit itself published, which is the octet string a joiner is
+	// handed out of band
+	if !bytes.Equal(published, result.RatchetTree) {
+		t.Fatal("the tree the commit published and the tree the group publishes are different octet strings")
+	}
+}
+
 // TestCommitWithNoProposalsCarriesAPath is RFC 9420 section 12.4's empty clause.
 //
 // A commit that names no proposals must carry a path, because the whole of what it does is re-key:

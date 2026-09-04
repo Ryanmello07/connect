@@ -1198,10 +1198,21 @@ func ValSem209GroupExtensionsSupported(in *CommitValidationInput) error {
 // ValSem300NoTrailingBlankNodes: the ratchet tree carries no trailing blank nodes, so two
 // implementations cannot produce two encodings of one tree.
 //
-// RFC 9420 section 12.4.3.3 states it of an EXPORTED ratchet tree, and it is asked of the
-// post-commit tree here because that is the tree a GroupInfo published from this commit carries.
-// (*RatchetTree).RemoveLeaf truncates, so a tree this package built never has them; a tree that
-// does is one decoded from the wire, and this is the second place that says so.
+// RFC 9420 section 12.4.3.3 states it of an EXPORTED ratchet tree, which is to say of the ARRAY the
+// extension travels as: (*RatchetTree).MarshalMLS writes it with the trailing blanks stripped and
+// (*RatchetTree).UnmarshalMLS refuses a padded one inline, so this door is for the caller that has a
+// decoded array in hand and no decode of its own to have run. Task 16's welcome path is that caller;
+// nothing in this package is today, and rulesThisPackageExportsAndNothingApplies says so.
+//
+// IT IS NOT A QUESTION TO ASK OF A TREE THIS BUILD HOLDS, and the sentence that stood here said the
+// opposite -- "RemoveLeaf truncates, so a tree this package built never has them; a tree that does
+// is one decoded from the wire". That is false and it cost two callers. A ratchet tree grows by
+// DOUBLING, so AddLeaf extending a full tree leaves every leaf to the right of the new one blank:
+// a three member group is held at four leaves with the last one blank, and HasTrailingBlankNodes
+// reports true for it. Both production callers asked it of an in-memory tree and both therefore
+// refused every group whose size is not a power of two -- the commit door refused the commit that
+// added the third member, and (*Group).RatchetTree refused to publish the tree afterwards. Each now
+// states the half that is true at full width, and both say so where they state it.
 func ValSem300NoTrailingBlankNodes(tree *RatchetTree) error {
 	if tree == nil {
 		return fmt.Errorf("%w: there is no tree to check for trailing blank nodes", ErrTreeMalformed)

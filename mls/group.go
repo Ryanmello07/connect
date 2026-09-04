@@ -639,12 +639,25 @@ func (self *Group) senderDataSecretLocked() []byte {
 //
 // The tree is the one structure not bounded by the codec's 1 MiB default, so it is written under
 // MaxRatchetTreeLength -- the same bound UnmarshalRatchetTree reads it back at.
+//
+// IT NO LONGER ASKS ValSem300 OF THE IN-MEMORY TREE, which is the SECOND instance of the fault
+// validateCommitPostTreeIsExportable was repaired for and is written here rather than left for the
+// next reader to find. Section 12.4.3.3's trailing blank rule is about the ARRAY this method
+// EMITS, and MarshalMLS strips the trailing blanks as it writes; an in-memory tree is held at the
+// full width 2^(d+1)-1, so a group whose size is not a power of two ends in blank nodes the moment
+// an Add extends its tree. Measured: with the rule asked here, a three member group could not
+// publish its own tree -- and there was no three member group in this build until commit generation
+// landed, which is why the fixture corpus worked around it at 512 leaves rather than reporting it.
+//
+// AND NOTHING TAKES ITS PLACE, which is a decision rather than a hole. The one thing left to refuse
+// about a tree at full width is an array with no non-blank node in it, and (*RatchetTree).MarshalMLS
+// already refuses exactly that with ErrTreeMalformed on the line below -- so a guard here would be a
+// second copy covering for the one really doing the work, which is the shape this file rejects in
+// (*Group).ProposeGroupContextExtensions and which no input could tell apart from the encoder's own
+// answer. validateCommitPostTreeIsExportable states that half itself because it encodes nothing.
 func (self *Group) RatchetTree() ([]byte, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if err := ValSem300NoTrailingBlankNodes(self.tree); err != nil {
-		return nil, err
-	}
 	return syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)
 }
 
@@ -1479,14 +1492,16 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 			ConfirmationTag: authenticated.Auth.ConfirmationTag,
 			Now:             time.Now(),
 		}
-		// MEASURED, because a door that never fires reads like one that is not needed: deleting
-		// this call leaves the whole of ./mls/... and ./message/... green over every input this
-		// build can construct today, since section 12.2's rules are already asked one block up
-		// and this generator builds its own path correctly. What it catches is the class it was
-		// put here for -- a generator handing its own door a tree the receiver will not have --
-		// and that class has a measured instance: with `postProposal` replaced by the tree the
-		// path has already been merged into, ValSem207 refuses the commit HERE, and nothing else
-		// in this package notices.
+		// MEASURED, because a door that never fires reads like one that is not needed. Deleting
+		// this call refuses no commit any test of this package builds -- section 12.2's rules are
+		// already asked one block up, and this generator builds its own path correctly -- so the
+		// only thing that reports its absence today is
+		// TestEveryExportedRuleIsAppliedByThisPackageOrPinnedAsUnwired, which reads it as this
+		// package shipping a commit validator its own construction does not run. What the call is
+		// FOR is the class it was put here for, a generator handing its own door a tree the
+		// receiver will not have, and that class has a measured instance: with `postProposal`
+		// replaced by the tree the path has already been merged into, ValSem207 refuses the commit
+		// HERE and nothing else in this package notices.
 		if err := ValidateCommit(commitInput); err != nil {
 			return nil, err
 		}
