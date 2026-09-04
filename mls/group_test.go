@@ -1232,6 +1232,66 @@ func TestProposingLeavesTheEpochAndTheOwnLeafAlone(t *testing.T) {
 	}
 }
 
+// TestNewGroupFoundsAContextItsOwnProposalDoorsAccept is task 12's own claim turned on task 11,
+// which is where the same class turned out to be standing.
+//
+// The claim these two tests share is that a list this build EMITS is one its own readers accept.
+// For a proposal that is ValidateProposalList; for a group context it is the same door, because
+// every rule of section 12.2 that reads an extension reads the GROUP'S context through it. The
+// creation path assembles that context out of two sources -- the caller's extensions and a
+// required_capabilities entry it encodes and prepends itself -- and nothing joined them: a config
+// that set RequiredCaps AND supplied its own encoded entry founded a group carrying the type twice,
+// which FindExtension refuses for every reader afterwards. The group was created, signed and
+// persisted, and then every proposal list anyone built against it was refused with a message about
+// an extensions vector.
+//
+// It is written over the DOOR and not over a count of entries, for the reason the proposal rows
+// are: a count is this test's own opinion about what a repeat looks like, and the door is what the
+// rest of the package will actually do with the context.
+func TestNewGroupFoundsAContextItsOwnProposalDoorsAccept(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+	in := &ProposalValidationInput{
+		Crypto:  crypto,
+		Tree:    group.tree,
+		Context: testGroupContextOf(t, group),
+		List:    NewProposalList([]CachedProposal{}),
+		Now:     time.Now(),
+	}
+	if err := ValidateProposalList(in); err != nil {
+		t.Fatalf("this group's own published context is one its own proposal door refuses: %v", err)
+	}
+}
+
+// TestNewGroupRefusesAConfigThatWouldCarryRequiredCapabilitiesTwice is the refusal half, over the
+// one input that reaches it: the entry the creation path adds is the only one no earlier check
+// joined against the caller's own list.
+func TestNewGroupRefusesAConfigThatWouldCarryRequiredCapabilitiesTwice(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	if len(cfg.RequiredCaps.ExtensionTypes) == 0 {
+		t.Fatal("this fixture no longer sets RequiredCaps, so nothing is prepended and this test drives nothing")
+	}
+	supplied, err := encodeRequiredCapabilities(&RequiredCapabilities{
+		ExtensionTypes: []ExtensionType{ExtensionTypeUrmessageGroupPolicy},
+	})
+	if err != nil {
+		t.Fatalf("encode the caller's own required_capabilities: %v", err)
+	}
+	cfg.Extensions = append(cfg.Extensions, supplied)
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err == nil {
+		group.Close()
+		t.Fatal("a config that both sets RequiredCaps and supplies its own required_capabilities founded a group; its context carries the type twice and every later reader refuses it")
+	}
+	if !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("NewGroup error = %v, want ErrMalformedExtension; the refusal is the lookup's", err)
+	}
+}
+
 // TestProposeAddProducesACacheableProposal is the plan's own row, kept because it is the one that
 // reads the wire format.
 func TestProposeAddProducesACacheableProposal(t *testing.T) {

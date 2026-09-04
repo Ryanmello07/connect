@@ -305,6 +305,26 @@ func NewGroup(cfg *GroupConfig, signer SignaturePrivateKey, cred Credential) (*G
 		}
 		extensions = append([]Extension{requiredExt}, extensions...)
 	}
+	// AND THE ASSEMBLED LIST IS READ BACK THROUGH THE LOOKUP EVERY LATER DOOR READS IT THROUGH.
+	//
+	// This is not a second opinion about the caller's extensions -- checkGroupExtension has already
+	// judged each of them, and GroupPolicyOf has already refused a repeated policy. It is about the
+	// entry THIS FUNCTION ADDS. The prepend above does not ask whether the caller's own list already
+	// carries a required_capabilities, so a config that both sets RequiredCaps and supplies the
+	// encoded extension founds a group whose context carries the type twice -- and every door that
+	// reads it afterwards reaches it through FindExtension, which refuses a repeat. Measured: such a
+	// group is created, persisted and signed, and then ValidateProposalList over its OWN published
+	// context answers "the extensions vector carries one type at entry 0 and again at entry 2" for
+	// every proposal list anyone ever builds against it. A group nobody can validate a proposal in,
+	// founded successfully, with nothing at the point of the mistake to point at.
+	//
+	// The same repair as (*Group).ProposeGroupContextExtensions makes at the other end of the
+	// group's life, and for the same reason: a list this build EMITS must be one its own readers
+	// accept. TestNewGroupFoundsAContextItsOwnProposalDoorsAccept is what says so, by running the
+	// door rather than by counting entries.
+	if _, err := requiredCapabilitiesOf(extensions); err != nil {
+		return nil, err
+	}
 	context := &GroupContext{
 		Version:     ProtocolVersionMls10,
 		CipherSuite: cfg.Suite,
@@ -990,7 +1010,17 @@ func (self *Group) ProposeGroupContextExtensions(exts []Extension) ([]byte, erro
 // (*Group).persist's rule one call further out. sealPrivateMessage carries content.GroupId straight
 // into the PrivateMessage header it builds, so a content assembled over the live slice would put
 // the octets every epoch secret of this group was derived over into a structure this method hands
-// to an encoder -- the third instance of a class this package has now repaired twice.
+// to an encoder.
+//
+// IT IS A MEASURED SURVIVOR AND IT STAYS, which is worth writing down rather than leaving for the
+// next reader to rediscover. Deleting the clone leaves the whole of ./mls/... and ./message/...
+// green: the PrivateMessage that receives it is marshalled and dropped inside this call, and a
+// CachedProposal holds a proposal and a sender and no group id, so nothing on this path retains it
+// today. It is NOT the shape the extension copy in ProposeGroupContextExtensions was -- that one
+// was a second copy standing beside the cache's, which was doing the work, and deleting the cache's
+// is what a test could see. This is the only copy on this path, so the property is held by this
+// line or by nobody, and what it guards is the one value every epoch secret of this group was
+// derived over.
 //
 // THE CACHE IS WRITTEN LAST, AND THE ORDER IS INVERTED FROM THE PLAN'S ON PURPOSE. Stored first,
 // every failure after it -- the seal, the encode -- leaves the cache holding a proposal no peer
@@ -1022,6 +1052,13 @@ func (self *Group) propose(proposal *Proposal) ([]byte, error) {
 	// before a single octet is signed, for (*Proposal).checkArm's reason one layer down: what is
 	// signed here is a serialized form, and a caller that ignored an error out of the encoder must
 	// not be able to walk away with a signature over a proposal that does not exist.
+	//
+	// REDUNDANT WITH THE CACHE'S OWN CALL AND KEPT, on ValidateProposalList's stated terms and
+	// measured the same way: (*ProposalCache).Store runs checkProposalProfile too, so deleting this
+	// line leaves the whole of ./mls/... and ./message/... green. It stays because the cache runs
+	// LAST here -- see the ordering note above -- so without it a proposal outside the v1 profile is
+	// signed, sealed and encoded, and a generation of this leaf's ratchet is spent, before anything
+	// refuses it. Nothing here claims a test can tell which of the two guards fired.
 	if err := checkProposalProfile(defaultProfile(), proposal); err != nil {
 		return nil, err
 	}
