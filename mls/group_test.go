@@ -69,14 +69,28 @@ func (self *testStore) GetGroupState(groupId []byte, epoch uint64) ([]byte, erro
 	return state, nil
 }
 
+// DeleteGroupStateBefore walks the keys this store HOLDS rather than every epoch below the
+// cutoff.
+//
+// The range loop it replaces was O(cutoff), and the defect this fixture exists to catch produces
+// a cutoff of nearly 2^64: the past-epoch window's floor is what keeps epoch - PastEpochWindow
+// from underflowing on a group younger than the window, and a build without it took the whole
+// test binary out on a five minute timeout instead of on the assertion that names the defect. A
+// fixture that answers a hang where it could answer a finding is a fixture that reports the same
+// thing for a bug and for a broken machine.
 func (self *testStore) DeleteGroupStateBefore(groupId []byte, epoch uint64) error {
 	self.deletes = append(self.deletes, epoch)
+	prefix := string(groupId) + "/"
 	for key := range self.states {
-		for e := uint64(0); e < epoch; e += 1 {
-			if key == stateKey(groupId, e) {
-				delete(self.states, key)
-			}
+		rest, isThisGroup := strings.CutPrefix(key, prefix)
+		if !isThisGroup {
+			continue
 		}
+		at, err := strconv.ParseUint(rest, 10, 64)
+		if err != nil || at >= epoch {
+			continue
+		}
+		delete(self.states, key)
 	}
 	return nil
 }
@@ -2582,6 +2596,7 @@ type windowStore struct {
 	putIds    [][]byte
 	putStates [][]byte
 	putLive   []bool
+	getIds    [][]byte
 	deleteIds [][]byte
 	cutoffs   []uint64
 }
@@ -2596,6 +2611,11 @@ func (self *windowStore) PutGroupState(groupId []byte, epoch uint64, state []byt
 	self.putLive = append(self.putLive,
 		slices.ContainsFunc(state, func(b byte) bool { return b != 0 }))
 	return self.testStore.PutGroupState(groupId, epoch, state)
+}
+
+func (self *windowStore) GetGroupState(groupId []byte, epoch uint64) ([]byte, error) {
+	self.getIds = append(self.getIds, groupId)
+	return self.testStore.GetGroupState(groupId, epoch)
 }
 
 func (self *windowStore) DeleteGroupStateBefore(groupId []byte, epoch uint64) error {
@@ -3076,6 +3096,15 @@ func TestLoadGroupRefusesAStateThisBuildDoesNotRead(t *testing.T) {
 			edit: func(blob *groupStateBlob) { blob.Confirmed = append(bytes.Clone(blob.Confirmed), 0x00) },
 			want: errGroupStateTranscript,
 		},
+		// an own-leaf index the restored tree has no leaf at. It is refused BEFORE the schedule
+		// is rebuilt, because everything after it reads that leaf: without the check the restore
+		// answers a group whose credential is empty and whose leaf private state belongs to a
+		// position in the tree somebody else holds.
+		{
+			name: "an own leaf index the tree has no leaf at",
+			edit: func(blob *groupStateBlob) { blob.OwnLeaf = 4096 },
+			want: ErrWelcomeLeafNotFound,
+		},
 	} {
 		var blob groupStateBlob
 		if err := syntax.UnmarshalLimit(bytes.Clone(raw), &blob, syntax.MaxRatchetTreeLength); err != nil {
@@ -3165,4 +3194,202 @@ func TestPersistRefusesAnEpochWhoseScheduleHasBeenErased(t *testing.T) {
 		t.Fatalf("persist over an erased epoch = %v, want errGroupStateRestoreSecret", err)
 	}
 	group.Close()
+}
+
+// refusingPutStore refuses PutGroupState once it is armed, which is the only way to reach the
+// path the ordering below is about. Everything else delegates.
+type refusingPutStore struct {
+	*testStore
+	refusing bool
+}
+
+var errTheStoreRefusedThisWrite = errors.New("the store refused this write")
+
+func (self *refusingPutStore) PutGroupState(groupId []byte, epoch uint64, state []byte) error {
+	if self.refusing {
+		return errTheStoreRefusedThisWrite
+	}
+	return self.testStore.PutGroupState(groupId, epoch, state)
+}
+
+// TestAFailedPersistLeavesTheGroupAbleToProposeInTheEpochItMovedTo is the ORDER of the three
+// things a merge does after the state swap, held to the epoch boundary's own terms.
+//
+// epoch_advance_test.go names the other order as a measured defect: the write, then a persist that
+// can fail, then the rebind. Every failing persist then returns with the group moved and the
+// proposal cache bound to the epoch that just closed -- and a cache bound to a closed epoch is a
+// member that can resolve no proposal of the new epoch, never reaches the next boundary, and is
+// never healed by anything in this package. A failed persist is recoverable: the next merged
+// commit writes the state again.
+//
+// The failure is reached through the store because that is where it comes from in the field -- a
+// disk that is full, a keychain that is locked, a sealed store whose key is not yet available at
+// start-up -- and none of those is a reason to wedge the group.
+func TestAFailedPersistLeavesTheGroupAbleToProposeInTheEpochItMovedTo(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := &refusingPutStore{testStore: newTestStore()}
+	cfg.Store = store
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+
+	// the control, on a group of its own so that the proposal it leaves in its cache is not a
+	// proposal the subject's next commit has to cover: after an ORDINARY merge, a group can
+	// propose in the epoch it moved to. Without it, an assertion that the subject can propose
+	// would be satisfied by a package where nothing can fail rather than by the ordering.
+	control := testNewGroup(t, crypto, testIdentity(t, crypto, "the control's owner"), "group-2")
+	defer control.Close()
+	advanceEpochs(t, control, 1)
+	if _, err := control.ProposeUpdate(); err != nil {
+		t.Fatalf("a group whose persist succeeded cannot propose in the epoch it moved to: %v", err)
+	}
+
+	advanceEpochs(t, group, 1)
+	store.refusing = true
+	if _, err := group.CreateCommit(nil, nil, nil); err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	before := group.Epoch()
+	if err := group.MergePendingCommit(); !errors.Is(err, errTheStoreRefusedThisWrite) {
+		t.Fatalf("MergePendingCommit over a refusing store = %v, want the store's own refusal", err)
+	}
+	// the group HAS moved -- the swap ran before the persist, and the epoch it opened is derived
+	if group.Epoch() != before+1 {
+		t.Fatalf("Epoch = %d after a refused persist, want %d; this test is about a group that moved",
+			group.Epoch(), before+1)
+	}
+	// and the cache moved with it, which is the whole claim
+	if _, err := group.ProposeUpdate(); err != nil {
+		t.Fatalf("a group whose persist was refused cannot propose in the epoch it moved to: %v; the cache is bound to the epoch that closed and nothing in this package releases it",
+			err)
+	}
+}
+
+// TestARestoredMemberCanStillOpenAnUpdatePathAddressedToItsLeaf is the half of the round trip that
+// a one-member fixture cannot see.
+//
+// Every secret comparison a single restored group makes is a comparison about the KEY SCHEDULE,
+// and the leaf private key is not in it: a blob that stored no leaf key at all restores a group
+// whose epoch authenticator, exporter and epoch secrets are all correct. What it cannot do is
+// decrypt the next commit -- an UpdatePath is sealed to the encryption keys on the receiver's
+// filtered direct path, and its leaf is the first of them -- so the member comes back, agrees with
+// everybody, and then fails to process the first commit anybody sends.
+//
+// Measured: with OwnEncPriv left out of the blob, every other test in this task stayed green.
+func TestARestoredMemberCanStillOpenAnUpdatePathAddressedToItsLeaf(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	group := testNewGroup(t, crypto, owner, "group-1")
+	defer group.Close()
+
+	bob := testIdentity(t, crypto, "bob")
+	kp, initPriv, encPriv := testKeyPackage(t, crypto, bob)
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal bob's key package: %v", err)
+	}
+	if _, err := group.ProposeAdd(encoded); err != nil {
+		t.Fatalf("ProposeAdd: %v", err)
+	}
+	welcoming, err := group.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit adding bob: %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	bobCfg := testGroupConfig(t, crypto, bob, "group-1")
+	joined, err := JoinFromWelcome(bobCfg, welcoming.Welcome, welcoming.RatchetTree, &JoinKeyMaterial{
+		KeyPackage:     *kp,
+		InitPrivate:    initPriv,
+		EncryptPrivate: encPriv,
+		SignPrivate:    bob.SigPriv,
+	})
+	if err != nil {
+		t.Fatalf("JoinFromWelcome: %v", err)
+	}
+	joinedEpoch := joined.Epoch()
+	joined.Close()
+
+	restored, err := LoadGroup(bobCfg, joinedEpoch, bob.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup over the joiner's own state: %v", err)
+	}
+	defer restored.Close()
+
+	// a commit with no proposals MUST carry an update path (RFC 9420 section 12.4), so this is
+	// the path arm and not the pathless one
+	next, err := group.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit over the restored member: %v", err)
+	}
+	if staged := group.stagedForTest(); staged == nil || !staged.hasPath {
+		t.Fatal("this commit carries no update path, so nothing here is addressed to the restored member's leaf")
+	}
+	processed, err := restored.ProcessMessage(next.Commit)
+	if err != nil {
+		t.Fatalf("the restored member could not open the update path addressed to its leaf: %v", err)
+	}
+	if err := restored.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	if restored.Epoch() != group.Epoch() {
+		t.Fatalf("the restored member is at epoch %d and the committer at %d",
+			restored.Epoch(), group.Epoch())
+	}
+	if !bytes.Equal(restored.EpochAuthenticator(), group.EpochAuthenticator()) {
+		t.Fatal("the restored member and the committer derive different epoch authenticators")
+	}
+}
+
+// TestNoOctetTheRestoreHandsTheStoreIsItsCallersOwn is persist's discipline on the way back IN,
+// and it is the one direction no gate of this package reads.
+//
+// TestNoOctetAGroupHandsOutwardIsStorageItKeeps follows what a GROUP hands to an object its caller
+// supplied, and a restore is not a method on a group -- there is no group yet when the lookup is
+// made. What goes outward there is the caller's own group id, handed to the caller's own store,
+// and a store that keeps it to key a cache with shares an array with a config the caller is still
+// holding and is entitled to reuse for the next group it founds.
+func TestNoOctetTheRestoreHandsTheStoreIsItsCallersOwn(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := newWindowStore()
+	cfg.Store = store
+	founded, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	founded.Close()
+
+	restored, err := LoadGroup(cfg, 0, owner.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup: %v", err)
+	}
+	defer restored.Close()
+	if len(store.getIds) == 0 {
+		t.Fatal("the restore looked no state up, so this test compared nothing")
+	}
+	for at, id := range store.getIds {
+		if len(id) == 0 {
+			t.Fatalf("the group id handed to the store at %d is empty", at)
+		}
+		for i := range id {
+			id[i] = 0xff
+		}
+	}
+	if !bytes.Equal(cfg.GroupId, []byte("group-1")) {
+		t.Fatalf("the caller's own config now names group %q after a store wrote through what the restore handed it",
+			cfg.GroupId)
+	}
+	if !bytes.Equal(restored.GroupId(), []byte("group-1")) {
+		t.Fatalf("the restored group's id is %q", restored.GroupId())
+	}
 }

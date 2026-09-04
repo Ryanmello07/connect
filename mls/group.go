@@ -3706,7 +3706,18 @@ func (self *Group) updatedOwnLeafPrivateLocked(applied *ApplyResult) (*TreeKEMPr
 		return nil, fmt.Errorf("%w: this commit updates leaf %d and leaves it blank",
 			ErrTreeMalformed, self.ownLeaf)
 	}
-	stored, err := self.store.GetPrivateKey(leaf.EncryptionKey)
+	// the public key is CLONED on the way out, for persist's reason and it is the same reason
+	// read one door over. applied.Tree is the tree this group is about to install -- ApplyCommit
+	// assigns it three statements later -- so leaf.EncryptionKey is about to be the group's own
+	// storage, and a store that keeps the slice it was handed to key a map with shares an array
+	// with the live ratchet tree. A write through it changes an encryption public key the tree
+	// hash and every parent hash were taken over, and nothing downstream would name it.
+	//
+	// Found by task 19's package-wide pass over the class persist was repaired for: this was the
+	// one of the four calls into a caller-supplied store that did not clone.
+	// TestNoOctetAGroupHandsOutwardIsStorageItKeeps does not reach it -- its own comment records
+	// that the only outward call it observes is the one inside NewGroup.
+	stored, err := self.store.GetPrivateKey(cloneBytes(leaf.EncryptionKey))
 	if err != nil {
 		return nil, fmt.Errorf("%w: leaf %d: %w", errUpdatedLeafPrivateKey, self.ownLeaf, err)
 	}
