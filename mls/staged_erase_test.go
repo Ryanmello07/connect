@@ -45,6 +45,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/token"
 	"maps"
 	"slices"
 	"strings"
@@ -351,6 +352,9 @@ type eraseSourceReading struct {
 	// the named byte slice types, so storage held under HpkePrivateKey is the same storage as
 	// storage held under []byte, which is what the compiler thinks too.
 	named []string
+	// the types this source PUTS ON THE WIRE, which is what separates octets a peer already has
+	// from octets only this process holds.
+	wire map[string]bool
 	// this package's erase helpers, derived by eraseHelperClass and not named here.
 	helpers []string
 	// per type, the method names of it that erase storage the type itself declares.
@@ -382,6 +386,7 @@ func eraseReadingOf(t *testing.T) eraseSourceReading {
 		candidates = append(candidates,
 			eraseHelperCandidatesIn(mustReadCommented(t, path), path, reading.named)...)
 	}
+	reading.wire = theTypesThisSourceSerializes(reading.files, reading.structs)
 	reading.helpers, _ = eraseHelperClass(candidates)
 	if len(reading.helpers) == 0 {
 		t.Fatal("this source declares no erase helper, so every reading below finds no erase however an erase is written")
@@ -391,6 +396,60 @@ func eraseReadingOf(t *testing.T) eraseSourceReading {
 	return reading
 }
 
+// The codec methods a wire type of this source declares. ANCHORS, and they fail in the safe
+// direction rather than being asserted: see theTypesThisSourceSerializes.
+const (
+	eraseWireEncoder = "MarshalMLS"
+	eraseWireDecoder = "UnmarshalMLS"
+)
+
+// theTypesThisSourceSerializes is every type this source PUTS ON THE WIRE: one declaring a codec
+// of its own, and every type one of those carries in a field, to a fixed point.
+//
+// It is what tells KEY MATERIAL from octets a peer already has, and it is the reason the class
+// below can be seeded on storage at all. A type this source serializes publishes everything it
+// holds -- that is what its codec does -- so the closure runs DOWNWARD here, the opposite
+// direction from the holder closure, and for the opposite reason: a holder inherits its held
+// value's obligation, and a carried field inherits its carrier's publicity.
+//
+// THE ANCHOR FAILS SAFE, which is what makes it safe to anchor. A rename that emptied this set
+// certifies nothing: every field in the source becomes key material, the class grows from forty
+// members to eighty-four, and the table below fails in both directions at once.
+func theTypesThisSourceSerializes(files []parsedSource,
+	structs map[string]*ast.StructType) map[string]bool {
+
+	wire := map[string]bool{}
+	for _, parsed := range files {
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv == nil || len(function.Recv.List) != 1 {
+				continue
+			}
+			if function.Name.Name != eraseWireEncoder && function.Name.Name != eraseWireDecoder {
+				continue
+			}
+			wire[receiverTypeName(function.Recv.List[0].Type)] = true
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for typeName := range wire {
+			structure, isStruct := structs[typeName]
+			if !isStruct {
+				continue
+			}
+			for _, field := range structure.Fields.List {
+				for _, mentioned := range identifiersNamedIn(field.Type) {
+					if _, isStruct := structs[mentioned]; isStruct && !wire[mentioned] {
+						wire[mentioned] = true
+						grew = true
+					}
+				}
+			}
+		}
+	}
+	return wire
+}
 // eraseTypeReachesStorage answers whether a field of this type can hold octets: the type is the
 // language's own byte slice, or one of this source's named byte slice types, or a struct declared
 // here that reaches one through a field of its own.
@@ -424,39 +483,47 @@ func eraseTypeReachesStorage(structs map[string]*ast.StructType, named []string,
 type eraseField struct {
 	name  string
 	types []string
+	// whether the octets this field holds are ones this source puts on the wire, read off the
+	// codec closure. A published field is not key material, and a type holding nothing else is
+	// not in the class.
+	published bool
 }
 
 // theFieldsReachingStorageOf is every field of one type that reaches octets, in declaration
 // order. Embedded fields are read too -- an embedded struct's storage is this type's storage.
-func theFieldsReachingStorageOf(structs map[string]*ast.StructType, named []string,
-	typeName string) []eraseField {
-
-	structure, isDeclared := structs[typeName]
+func theFieldsReachingStorageOf(reading eraseSourceReading, typeName string) []eraseField {
+	structure, isDeclared := reading.structs[typeName]
 	if !isDeclared {
 		return nil
 	}
 	fields := []eraseField{}
 	for _, field := range structure.Fields.List {
-		if !eraseTypeReachesStorage(structs, named, field.Type, map[string]bool{}) {
+		if !eraseTypeReachesStorage(reading.structs, reading.named, field.Type, map[string]bool{}) {
 			continue
 		}
 		held := []string{}
+		published := false
 		for _, mentioned := range identifiersNamedIn(field.Type) {
-			if _, isStruct := structs[mentioned]; isStruct {
+			if _, isStruct := reading.structs[mentioned]; isStruct {
 				held = append(held, mentioned)
+			}
+			if reading.wire[mentioned] {
+				published = true
 			}
 		}
 		names := field.Names
 		if len(names) == 0 {
 			// an embedded field: its name is its type's, which is how a body spells it.
 			for _, mentioned := range identifiersNamedIn(field.Type) {
-				fields = append(fields, eraseField{name: mentioned, types: held})
+				fields = append(fields,
+					eraseField{name: mentioned, types: held, published: published})
 				break
 			}
 			continue
 		}
 		for _, declared := range names {
-			fields = append(fields, eraseField{name: declared.Name, types: held})
+			fields = append(fields,
+				eraseField{name: declared.Name, types: held, published: published})
 		}
 	}
 	return fields
@@ -583,7 +650,16 @@ func methodsWithNoParametersIn(files []parsedSource) []eraseMethod {
 	return methods
 }
 
-// theFieldsErasedBy is which of a method's own fields it hands to an erase.
+// theFieldsErasedBy is which of a method's own fields it hands to an erase, and -- for a field
+// erased through one of its PARTS rather than whole -- which part.
+//
+// THE PART IS READ AND NOT COLLAPSED ONTO THE ROOT, and what collapsing it cost was measured:
+// self.pending.plan.Zeroize() erases the update path plan a staged commit holds and leaves that
+// commit's key schedule, secret tree and leaf private state in the heap -- and it read as "self
+// .pending was erased", because eraseFieldNameOf resolves the call's receiver to the ROOT field
+// and the root's own type happened to declare a method of that name. The empty string is the
+// field itself; eraseWholeFieldsOf below is what turns a set of parts back into a claim about
+// the whole.
 //
 // Two shapes and both are this package's: storage handed to an erase HELPER as an argument
 // (zeroizeSecret(self.epochSecret)), and an erase METHOD called on the field
@@ -594,15 +670,21 @@ func methodsWithNoParametersIn(files []parsedSource) []eraseMethod {
 // field, so a body that named every secret -- a length check over each, a log line -- accounts
 // for none of them, which is precisely the shape "make Zeroize a no-op" takes once the calls are
 // gone.
-func theFieldsErasedBy(method eraseMethod, fields []eraseField, helpers []string,
-	erasers map[string]map[string]bool) map[string]bool {
+func theFieldsErasedBy(reading eraseSourceReading, method eraseMethod,
+	fields []eraseField) map[string]map[string]bool {
 
 	alias := eraseAliasesIn(method.decl, method.self)
 	byName := map[string]eraseField{}
 	for _, field := range fields {
 		byName[field.name] = field
 	}
-	erased := map[string]bool{}
+	erased := map[string]map[string]bool{}
+	credit := func(field string, part string) {
+		if erased[field] == nil {
+			erased[field] = map[string]bool{}
+		}
+		erased[field][part] = true
+	}
 	ast.Inspect(method.decl.Body, func(node ast.Node) bool {
 		call, isCall := node.(*ast.CallExpr)
 		if !isCall {
@@ -610,17 +692,20 @@ func theFieldsErasedBy(method eraseMethod, fields []eraseField, helpers []string
 		}
 		switch callee := call.Fun.(type) {
 		case *ast.Ident:
-			if !slices.Contains(helpers, callee.Name) {
+			if !slices.Contains(reading.helpers, callee.Name) {
 				return true
 			}
 			for _, argument := range call.Args {
 				if field := eraseFieldNameOf(argument, method.self, alias); field != "" {
-					erased[field] = true
+					credit(field, eraseSubFieldOn(argument, method.self, alias, field))
 				}
 			}
 		case *ast.SelectorExpr:
-			// an erase run ON the field. The method has to be an erase OF THE FIELD'S OWN TYPE,
-			// so a namesake declared by some other type certifies nothing.
+			// an erase run ON the field, or on one part of it. The method has to be an erase of
+			// THE TYPE IT IS RUN ON -- the field's own when the call names the field, the part's
+			// own when it names a part -- so a namesake declared by some other type certifies
+			// nothing. Reading the ROOT's methods for a call one level in is what made an erase of
+			// a sub-field stand for the whole held value.
 			field := eraseFieldNameOf(callee.X, method.self, alias)
 			if field == "" {
 				return true
@@ -629,17 +714,29 @@ func theFieldsErasedBy(method eraseMethod, fields []eraseField, helpers []string
 			if !isField {
 				return true
 			}
-			for _, typeName := range held.types {
-				if erasers[typeName][callee.Sel.Name] {
-					erased[field] = true
+			part := eraseSubFieldOn(callee.X, method.self, alias, field)
+			holders := held.types
+			if part != "" {
+				holders = nil
+				for _, typeName := range held.types {
+					for _, sub := range theFieldsReachingStorageOf(reading, typeName) {
+						if sub.name == part {
+							holders = append(holders, sub.types...)
+						}
+					}
+				}
+			}
+			for _, typeName := range holders {
+				if reading.erasers[typeName][callee.Sel.Name] {
+					credit(field, part)
 				}
 			}
 			// and an erase helper reached through a package qualifier or through storage of the
 			// field, which is how a helper of another package would be spelled.
-			if slices.Contains(helpers, callee.Sel.Name) {
+			if slices.Contains(reading.helpers, callee.Sel.Name) {
 				for _, argument := range call.Args {
-					if named := eraseFieldNameOf(argument, method.self, alias); named != "" {
-						erased[named] = true
+					if name := eraseFieldNameOf(argument, method.self, alias); name != "" {
+						credit(name, eraseSubFieldOn(argument, method.self, alias, name))
 					}
 				}
 			}
@@ -647,6 +744,51 @@ func theFieldsErasedBy(method eraseMethod, fields []eraseField, helpers []string
 		return true
 	})
 	return erased
+}
+
+// eraseWholeFieldsOf is which fields an erase reading accounts for IN FULL.
+//
+// A field is accounted for when the erase was run on THE FIELD -- the empty part -- or when every
+// part of it that reaches octets was erased in its own right. Anything else is a field one of
+// whose parts was erased, and that is a different claim: (*KeySchedule).Zeroize names
+// self.secrets.SenderData and eight more and has therefore erased the whole of secrets, while a
+// body naming self.pending.plan alone has erased one of four things a staged commit holds.
+//
+// The parts that count are the parts that reach OCTETS, so a held type with one secret and four
+// indices is accounted for by an erase of the secret.
+func eraseWholeFieldsOf(reading eraseSourceReading, fields []eraseField,
+	erased map[string]map[string]bool) map[string]bool {
+
+	whole := map[string]bool{}
+	for _, field := range fields {
+		parts, wasErased := erased[field.name]
+		if !wasErased {
+			continue
+		}
+		if parts[""] {
+			whole[field.name] = true
+			continue
+		}
+		held := []string{}
+		for _, typeName := range field.types {
+			for _, sub := range theFieldsReachingStorageOf(reading, typeName) {
+				held = append(held, sub.name)
+			}
+		}
+		if len(held) == 0 {
+			continue
+		}
+		covered := true
+		for _, sub := range held {
+			if !parts[sub] {
+				covered = false
+			}
+		}
+		if covered {
+			whole[field.name] = true
+		}
+	}
+	return whole
 }
 
 // eraseMethodsIn derives, per type, which of its no-argument methods erase storage it declares.
@@ -657,14 +799,22 @@ func theFieldsErasedBy(method eraseMethod, fields []eraseField, helpers []string
 func eraseMethodsIn(reading eraseSourceReading) map[string]map[string]bool {
 	methods := methodsWithNoParametersIn(reading.files)
 	erasers := map[string]map[string]bool{}
+	// the fixed point is over a reading whose erasers map IS the one being built, so a holder's
+	// erase becomes an erase on the pass after the erase it calls does.
+	working := reading
+	working.erasers = erasers
 	for grew := true; grew; {
 		grew = false
 		for _, method := range methods {
 			if erasers[method.receiver][method.name] {
 				continue
 			}
-			fields := theFieldsReachingStorageOf(reading.structs, reading.named, method.receiver)
-			if len(theFieldsErasedBy(method, fields, reading.helpers, erasers)) == 0 {
+			fields := theFieldsReachingStorageOf(working, method.receiver)
+			// ANY storage of its own handed to an erase, whole or in parts, which is what makes
+			// a method an erase at all. Whether it accounts for a field IN FULL is a different
+			// question and is asked where it belongs -- of the completeness gate, and of the
+			// drop sites -- through eraseWholeFieldsOf.
+			if len(theFieldsErasedBy(working, method, fields)) == 0 {
 				continue
 			}
 			if erasers[method.receiver] == nil {
@@ -677,18 +827,34 @@ func eraseMethodsIn(reading eraseSourceReading) map[string]map[string]bool {
 	return erasers
 }
 
-// eraseClassOf is the class: the types that declare an erase, and every type holding one of those
-// in a field of its own, to a fixed point.
+// eraseClassOf is the class: every type that HOLDS KEY MATERIAL -- octets this source does not put
+// on the wire -- and every type holding one of those in a field of its own, to a fixed point.
 //
-// THE SEED IS DERIVED AND NOT LISTED. A type joins it by erasing its own storage, so the day a
-// fifth erasable type is written it is in this class without anybody remembering to add it -- and
-// the closure is what turns "StagedCommit holds a *KeySchedule and declares no erase" from a thing
-// somebody has to notice into a failing test.
+// THE SEED IS THE PROPERTY AND NOT A DECLARATION, and the difference was measured. It was the
+// types that DECLARE an erase, closed upward over holders, and the closure was doing its job
+// while the seed was the gap: a production type holding an initSecret []byte and an
+// HpkePrivateKey and declaring no Zeroize was not in the class at all, so nothing asked it for
+// one and the whole suite stayed green. The same type holding a *KeySchedule WAS caught, which is
+// what said the fault was the seed. It is also the shape task 19's past-epoch window has.
+//
+// Seeded on the storage, such a type is a member the day it is written, and it owes either an
+// erase or a sentence somebody had to write in the table below.
+//
+// A WIRE TYPE IS NOT A SEED however much storage it holds, because everything it holds is about
+// to be octets on the wire -- that is what its codec does. This is the one place the two
+// questions are told apart at the TYPE rather than at the field: a raw []byte field of a wire
+// type carries the encoding of something public, and no reading of the field's own type could
+// see that.
 func eraseClassOf(reading eraseSourceReading) []string {
 	member := map[string]bool{}
-	for typeName, methods := range reading.erasers {
-		if len(methods) != 0 {
-			member[typeName] = true
+	for typeName := range reading.structs {
+		if reading.wire[typeName] {
+			continue
+		}
+		for _, field := range theFieldsReachingStorageOf(reading, typeName) {
+			if !field.published {
+				member[typeName] = true
+			}
 		}
 	}
 	for grew := true; grew; {
@@ -710,12 +876,91 @@ func eraseClassOf(reading eraseSourceReading) []string {
 	return slices.Sorted(maps.Keys(member))
 }
 
-// typesTheEraseClassReachesThatOweNoErase is every member of the closure above that owes no erase
-// of its own, with the reason written out for each.
+// typesTheEraseClassReachesThatOweNoErase is every member of the class above that owes no erase of
+// its own, with the reason written out for each.
 //
 // The class is derived and this table is checked against it in both directions, so a type cannot
-// escape the obligation by being forgotten and a row cannot outlive the type it excuses.
+// escape the obligation by being forgotten and a row cannot outlive the type it excuses. What the
+// rows say, over and over, is one of four things, and the sameness is the point rather than a
+// smell: the octets are on the wire, the value is an ARGUMENT or an ANSWER that no declaration
+// retains, the storage belongs to a holder that erases it part by part, or the field is not
+// storage at all.
+//
+// IT GREW FROM ONE ROW TO THIRTY-THREE when the seed moved from "declares an erase" to "holds key
+// material", and that is the price of the seed rather than a weakening of it. A row is a sentence
+// somebody had to write about a type that holds octets; before, such a type simply was not asked.
 var typesTheEraseClassReachesThatOweNoErase = map[string]string{
+	"BodyBinding": "the additional authenticated data of a record: a group id and a sender handle, both " +
+		"of which travel in the clear beside the ciphertext they bind and are what the server routes on",
+	"CachedProposal": "a proposal this member received and the reference it is keyed by. Both went to every " +
+		"member of the group and to the delivery service; ProposalCache.byRef is excused for the same reason",
+	"CommitResult": "the ENCODINGS a committer hands its caller to send -- the commit message, the welcome and " +
+		"the ratchet tree. Every octet of all three is about to be on the wire, which is the whole purpose of " +
+		"the structure. The key material this commit holds is in the staged epoch beside it, and that is a " +
+		"member of this class in its own right",
+	"CommitValidationInput": "an ARGUMENT and not storage. validate_commit.go builds one per call out of state " +
+		"its caller already holds -- the confirmation key it carries is the key schedule's, and the key " +
+		"schedule erases it -- so there is no drop site here an erase could be reachable from",
+	"EpochAttachment": "the write key and read key a commit DELIVERS TO THE SERVER, inside the record that " +
+		"carries the commit. They are octets the server is being handed on purpose; erasing them here would " +
+		"erase what the message layer exists to send",
+	"EpochSecrets": "the key schedule's own storage, grouped. Exactly one production declaration holds one -- " +
+		"KeySchedule.secrets -- and (*KeySchedule).Zeroize erases every one of its nine fields by name, which " +
+		"this reading now checks rather than infers: an erase of self.secrets.SenderData credits that part " +
+		"alone, and the whole is accounted for only because all nine are named",
+	"GroupConfig": "the configuration a caller hands NewGroup: a group id and the leaf keys extension it " +
+		"publishes, both of which end up in the group context and in this member's own leaf node",
+	"HpkeContext": "an ANSWER and not storage, like PathDecryptResult. hpkeKeySchedule builds one per seal or " +
+		"open and no production declaration holds one in a field, so there is no drop site an erase could be " +
+		"reachable from. The secrets it derives are gone with the frame",
+	"LeafKeysExtension": "the device's PUBLISHED X-Wing public key. It travels in this member's own leaf node, " +
+		"which every member of the group holds and every joiner is handed in its Welcome",
+	"LeafValidationContext": "an argument naming the group a leaf is being judged against; the group id is what " +
+		"the leaf itself carries",
+	"Member": "the public view of one member this package hands its caller: an identity, a signature public " +
+		"key and the leaf keys extension. Every field is read out of that member's own published leaf node",
+	"PreSharedKeyInput": "an ARGUMENT. PskSecret takes a list of them, extracts each into the chain and erases " +
+		"its own intermediates; the secret in an entry is storage the CALLER owns and is still holding, and " +
+		"erasing it here would erase a value the caller passed by value",
+	"ProposalCache": "proposals this member received, by reference. Every one of them arrived as a message the " +
+		"delivery service also saw; Group.proposals is excused for the same reason",
+	"ProposalList": "the resolved proposals a commit names, which is exactly what the commit puts on the wire",
+	"ProposalValidationInput": "an argument. It carries the tree, the context and the proposal list a door is " +
+		"about to judge, all of them public and all of them owned by the caller",
+	"Reader": "the decoder's cursor over octets its CALLER owns. It holds no copy: the slice is the caller's " +
+		"buffer, an erase here would blank the message somebody is still parsing, and every secret ever read " +
+		"through it lands in a structure that owes its own erase",
+	"Record": "a record ON THE WIRE. Its header, its two ciphertexts and its write authenticator are the " +
+		"octets the delivery service carries",
+	"RecordHeader": "the cleartext header of a record on the wire: the routing the server reads without " +
+		"holding any group key",
+	"RecoveryTag": "the recovery handle and the recovery VERIFY key, which are the public half of the recovery " +
+		"pair and travel in the record's own attachment",
+	"ServerAttachment": "the attachment a record carries FOR THE SERVER. Every arm of it is delivered to a " +
+		"party this product does not trust with the group's content and does trust with these octets",
+	"TranscriptHashes": "the confirmed and interim transcript hashes, which are hashes over messages every " +
+		"member received and every member of the group computes for itself",
+	"TreeValidationContext": "an argument naming the group a tree is being judged against; the group id is what " +
+		"the tree's own leaves are signed over",
+	"WrapTag": "the handle a wrapped record names, which is routing the server reads",
+	"Writer": "the encoder's growing buffer, which is ANSWERED to the caller rather than retained -- Bytes() " +
+		"hands it out. An erase here would blank the message a caller is about to send, and the caller that " +
+		"marshalled a secret through it owns what came back",
+	"XwingPrivateKey": "an ANSWER. XwingGenerateKey and XwingKeyGenFromSeed build one per call and no " +
+		"production declaration holds one in a field; the seed inside it is the caller's to keep or to drop",
+	"XwingPublicKey": "the public half, whose two components are exactly what a peer is sent",
+	"cachedProposalFieldJoin": "the octets and the field names of one proposal's encoding, assembled so a " +
+		"commit's list can be compared field by field against what arrived on the wire",
+	"generationKeys": "one generation's AEAD key and nonce, held only by ratchet.window, and (*ratchet).zeroize " +
+		"erases both by name. The obligation lands on the ratchet, which is a member of this class in its own " +
+		"right and whose erase this reading now checks part by part",
+	"proposalBucket": "the entries one sender holds in one epoch's cache, which are proposals already on the wire",
+	"proposalCacheBinding": "the group id and epoch a cache is bound to, which is the group context every " +
+		"member of the group holds",
+	"suiteCryptoProvider": "the suite parameters and the entropy SOURCE. The source is an io.Reader and holds " +
+		"none of this process's storage; it is in this class only because the field reading resolves the bare " +
+		"name Reader to the decoder this package declares, which is a collision across two packages and not a " +
+		"byte slice anybody could erase",
 	"PathDecryptResult": "it is an ANSWER and not storage. DecryptUpdatePath builds one per call and hands " +
 		"it to a caller that installs both halves into the epoch it is entering, and no production " +
 		"declaration holds one in a field, so there is no drop site an erase could be reachable from. " +
@@ -803,7 +1048,7 @@ func TestEveryTypeHoldingErasableKeyMaterialErasesAllOfIt(t *testing.T) {
 		if member == declaring[0] {
 			continue
 		}
-		fields := theFieldsReachingStorageOf(reading.structs, reading.named, member)
+		fields := theFieldsReachingStorageOf(reading, member)
 		wanted := []string{}
 		for _, field := range fields {
 			if _, isExcused := theFieldsOfTheEraseClassThatAreNotKeyMaterial[member+"."+field.name]; isExcused {
@@ -821,7 +1066,7 @@ func TestEveryTypeHoldingErasableKeyMaterialErasesAllOfIt(t *testing.T) {
 			if method.receiver != member || !reading.erasers[member][method.name] {
 				continue
 			}
-			erased := theFieldsErasedBy(method, fields, reading.helpers, reading.erasers)
+			erased := eraseWholeFieldsOf(reading, fields, theFieldsErasedBy(reading, method, fields))
 			if best == "" || len(erased) > len(covered) {
 				best, covered = method.name, erased
 			}
@@ -862,7 +1107,7 @@ func TestEveryTypeHoldingErasableKeyMaterialErasesAllOfIt(t *testing.T) {
 			continue
 		}
 		found := false
-		for _, field := range theFieldsReachingStorageOf(reading.structs, reading.named, typeName) {
+		for _, field := range theFieldsReachingStorageOf(reading, typeName) {
 			if field.name == fieldName {
 				found = true
 			}
@@ -906,7 +1151,7 @@ type eraseDropSite struct {
 //     shell. A merge that erased what it had just installed would be the same defect pointing the
 //     other way.
 func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
-	fields := theFieldsReachingStorageOf(reading.structs, reading.named, member)
+	fields := theFieldsReachingStorageOf(reading, member)
 	byName := map[string]eraseField{}
 	for _, field := range fields {
 		byName[field.name] = field
@@ -926,7 +1171,9 @@ func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 	sites := []eraseDropSite{}
 	for _, method := range declarationsHolding(reading.files, member) {
 		alias := eraseAliasesIn(method.decl, method.self)
-		erased := theFieldsErasedBy(method, fields, reading.helpers, reading.erasers)
+		// IN FULL, because this is the gate that says a value was erased before it was
+		// dropped, and a body that erased one part of it dropped the rest.
+		erased := eraseWholeFieldsOf(reading, fields, theFieldsErasedBy(reading, method, fields))
 		erasedAt := map[string]int{}
 		refused := map[string]bool{}
 		installed := map[string]map[string]bool{}
@@ -961,9 +1208,26 @@ func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 						}
 					}
 				}
-			case *ast.BinaryExpr:
-				if field := eraseFieldNameOf(typed.X, method.self, alias); field != "" {
-					if name, isBare := typed.Y.(*ast.Ident); isBare && name.Name == "nil" {
+			case *ast.IfStmt:
+				// A REFUSAL IS A DIRECTION AND NOT A COMPARISON. Both shapes compare the field
+				// against nil, and only one of them says the assignment below can never land on a
+				// live value: `if self.f != nil { return ... }` LEAVES when there is something to
+				// drop, and `if self.f == nil { return }` leaves when there is NOTHING to drop and
+				// then drops a live value every time it is reached -- a presence guard, which is
+				// the opposite claim and is (*Group).MergePendingCommit's own opening line. Read as
+				// any nil comparison, a production holder dropping a live *UpdatePathPlan behind a
+				// presence guard left this whole gate green.
+				comparison, isComparison := typed.Cond.(*ast.BinaryExpr)
+				if !isComparison || comparison.Op != token.NEQ || !eraseBranchLeaves(typed.Body) {
+					return true
+				}
+				for _, side := range [][2]ast.Expr{
+					{comparison.X, comparison.Y}, {comparison.Y, comparison.X}} {
+
+					if name, isBare := side[1].(*ast.Ident); !isBare || name.Name != "nil" {
+						continue
+					}
+					if field := eraseFieldNameOf(side[0], method.self, alias); field != "" {
 						refused[field] = true
 					}
 				}
@@ -1025,6 +1289,35 @@ func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 		})
 	}
 	return sites
+}
+
+// eraseBranchLeaves reports whether a branch LEAVES rather than falling through to the
+// assignment below it.
+//
+// It is the half of a refusal the comparison cannot supply. `if self.f != nil { self.f
+// .Zeroize() }` compares in the refusing direction and then goes on to the drop, and a
+// reading that stopped at the operator would call that a refusal -- (*Group).Close and
+// (*StagedCommit).Zeroize both open with exactly that shape.
+func eraseBranchLeaves(body *ast.BlockStmt) bool {
+	if body == nil || len(body.List) == 0 {
+		return false
+	}
+	switch last := body.List[len(body.List)-1].(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return last.Tok != token.FALLTHROUGH
+	case *ast.ExprStmt:
+		// a panic leaves as surely as a return, and it is how a package that treats the
+		// condition as a programming error rather than as a caller's fault writes it.
+		call, isCall := last.X.(*ast.CallExpr)
+		if !isCall {
+			return false
+		}
+		name, isBare := call.Fun.(*ast.Ident)
+		return isBare && name.Name == "panic"
+	}
+	return false
 }
 
 // eraseSubFieldOn answers which sub-field of `field` an expression reads: staged.schedule, where
@@ -1118,7 +1411,7 @@ func TestEveryPathThatDropsHeldKeyMaterialErasesItFirst(t *testing.T) {
 			}
 			held := []string{}
 			for _, typeName := range site.field.types {
-				for _, sub := range theFieldsReachingStorageOf(reading.structs, reading.named, typeName) {
+				for _, sub := range theFieldsReachingStorageOf(reading, typeName) {
 					if _, isExcused := theFieldsOfTheEraseClassThatAreNotKeyMaterial[typeName+"."+sub.name]; isExcused {
 						continue
 					}
@@ -1213,6 +1506,42 @@ func (self *Refuser) stage(next *Holder) error {
 	return nil
 }
 
+// a type holding KEY MATERIAL and declaring no erase, which nothing else in this package holds.
+// It is the shape the class was seeded to miss: the upward closure never reaches it, and the seed
+// was the presence of a Zeroize. It is what task 19's past-epoch window looks like on the day it
+// is written, and both halves of "key material" are here -- a raw byte slice and one of this
+// source's named private key types.
+type HpkePrivateKey []byte
+
+type Unerased struct {
+	initSecret     []byte
+	encryptionPriv HpkePrivateKey
+}
+// the presence guard, which is the same token pointing the other way: it returns when there
+// is NOTHING to drop and drops a live value every time it is reached.
+type Presumer struct {
+	pending *Holder
+}
+
+func (self *Presumer) release() {
+	if self.pending == nil {
+		return
+	}
+	self.pending = nil
+}
+
+// and the erase of ONE PART of the value being dropped, which is not an erase of the value:
+// held stays in the heap. The call resolves to the root field and the root's own type
+// declares a method of that name, which is the whole of why this read as an erase.
+type SubFielder struct {
+	pending *Holder
+}
+
+func (self *SubFielder) release() {
+	self.pending.forgotten.Zeroize()
+	self.pending = nil
+}
+
 func wipe(secret []byte) {
 	for i := range secret {
 		secret[i] = 0
@@ -1231,11 +1560,13 @@ func eraseControlReading(t *testing.T) {
 	}
 	structTypesIn(control, reading.structs)
 	reading.named = packageByteSliceTypeNamesIn(control)
+	reading.wire = theTypesThisSourceSerializes(reading.files, reading.structs)
 	reading.helpers = []string{"wipe"}
 	reading.erasers = eraseMethodsIn(reading)
 	reading.members = eraseClassOf(reading)
 
-	for _, want := range []string{"Held", "Holder", "Mover", "Dropper", "Refuser"} {
+	for _, want := range []string{"Held", "Holder", "Mover", "Dropper", "Refuser",
+		"Presumer", "SubFielder", "Unerased"} {
 		if !slices.Contains(reading.members, want) {
 			t.Errorf("the erase class read %v out of the control and %s is not in it; a type that declares an erase, or that holds one that does, is a member by doing so",
 				reading.members, want)
@@ -1247,9 +1578,20 @@ func eraseControlReading(t *testing.T) {
 	if reading.erasers["Dropper"]["drop"] {
 		t.Error("(*Dropper).drop is read as an erase and it erases nothing")
 	}
+	// the seed, asked on its own: a type that declares no erase and that nothing holds is in the
+	// class by HOLDING KEY MATERIAL, or the class is seeded on the declaration again and a new
+	// production type carrying an epoch's secrets is invisible to both readings below.
+	if len(reading.erasers["Unerased"]) != 0 {
+		t.Errorf("(*Unerased) is read as declaring an erase -- %v -- so its membership says nothing about the seed",
+			slices.Sorted(maps.Keys(reading.erasers["Unerased"])))
+	}
+	if held := theFieldsReachingStorageOf(reading, "Unerased"); len(held) != 2 {
+		t.Errorf("the field reading found %d field(s) of Unerased reaching octets, want 2; a raw byte slice and a named private key type are the two spellings key material arrives in",
+			len(held))
+	}
 
 	// the completeness half: Holder erases held and not forgotten.
-	fields := theFieldsReachingStorageOf(reading.structs, reading.named, "Holder")
+	fields := theFieldsReachingStorageOf(reading, "Holder")
 	if len(fields) != 2 {
 		t.Fatalf("the field reading found %d field(s) of Holder reaching octets, want 2; it is not following the struct the type holds",
 			len(fields))
@@ -1263,7 +1605,7 @@ func eraseControlReading(t *testing.T) {
 	if len(holder) != 1 {
 		t.Fatalf("the control declares %d no-argument method(s) on Holder, want 1", len(holder))
 	}
-	erased := theFieldsErasedBy(holder[0], fields, reading.helpers, reading.erasers)
+	erased := eraseWholeFieldsOf(reading, fields, theFieldsErasedBy(reading, holder[0], fields))
 	if !erased["held"] || erased["forgotten"] {
 		t.Errorf("(*Holder).Zeroize is read as erasing %v, want held alone; the erase reading is not telling a call from a field it never names",
 			slices.Sorted(maps.Keys(erased)))
@@ -1271,7 +1613,7 @@ func eraseControlReading(t *testing.T) {
 
 	// and the drop sites: Dropper is reported, Mover and Refuser are not.
 	verdicts := map[string]eraseDropSite{}
-	for _, member := range []string{"Mover", "Dropper", "Refuser"} {
+	for _, member := range []string{"Mover", "Dropper", "Refuser", "Presumer", "SubFielder"} {
 		for _, site := range theDropSitesIn(reading, member) {
 			verdicts[member+"."+site.method.name] = site
 		}
@@ -1294,6 +1636,25 @@ func eraseControlReading(t *testing.T) {
 	if !move.installed["held"] || !move.movedOut["forgotten"] {
 		t.Errorf("(*Mover).merge is read as installing %v and erasing %v out of the value it drops, want held installed and forgotten erased; a merge whose move goes unread is a merge this gate would demand erase the epoch it just entered",
 			slices.Sorted(maps.Keys(move.installed)), slices.Sorted(maps.Keys(move.movedOut)))
+	}
+	presume, found := verdicts["Presumer.release"]
+	if !found {
+		t.Fatal("the drop reading found no assignment to pending in (*Presumer).release")
+	}
+	if presume.refused || presume.erased || len(presume.installed) != 0 || len(presume.movedOut) != 0 {
+		t.Errorf("(*Presumer).release is read as refusing, erasing or moving what it drops -- refused=%v erased=%v -- and its guard RETURNS when there is nothing to drop; a presence guard is the opposite of a refusal and its assignment lands on a live value every time it is reached",
+			presume.refused, presume.erased)
+	}
+	subField, found := verdicts["SubFielder.release"]
+	if !found {
+		t.Fatal("the drop reading found no assignment to pending in (*SubFielder).release")
+	}
+	if subField.erased {
+		t.Error("(*SubFielder).release is read as having erased what it drops, and it erased ONE PART of it; an erase resolving to the root field certifies every other part of the held value along with it")
+	}
+	if !subField.movedOut["forgotten"] || subField.movedOut["held"] {
+		t.Errorf("the erase in (*SubFielder).release is read as reaching %v of the value it drops, want forgotten alone",
+			slices.Sorted(maps.Keys(subField.movedOut)))
 	}
 	refuse, found := verdicts["Refuser.stage"]
 	if !found {
