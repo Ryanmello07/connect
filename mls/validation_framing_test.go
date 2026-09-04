@@ -1114,13 +1114,16 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // gives the reason, and a rule written here that has since been wired fails until somebody takes
 // it off. The excuse survives exactly as long as the condition it names.
 //
-// Why the two framing rules are here rather than wired. This task produces the two signatures and
-// p8 puts them on the receive paths, so OpenPublicMessage and OpenPrivateMessage verify a signature
-// and a membership tag today and do not yet ask which group or which epoch the content names, or
-// whether the sender's leaf is occupied. That is the plan's order and not a defect. What WAS a
-// defect is that nothing in this package said so: both rules had no caller, no gate reported it,
-// and a p8 that slipped would have left this package shipping a receive path that accepts another
-// group's message with nothing anywhere failing.
+// CheckFramedContentContext and CheckSenderLeaf WERE the reason this list was written and are not
+// on it any more. The entry said p6 produces the two signatures and p8 puts them on the receive
+// paths, so OpenPublicMessage and OpenPrivateMessage verified a signature and a membership tag and
+// did not yet ask which group or which epoch the content names, or whether the sender's leaf is
+// occupied -- and that nothing in this package said so, which is what a p8 that slipped would have
+// turned into a receive path accepting another group's message with nothing anywhere failing. The
+// caller arrived one plan earlier than the entry expected: p7 task 18's (*Group).ProcessMessage
+// runs the sender leaf rule inside its signature key resolver, so a member message naming a blanked
+// leaf never reaches a key, and runs the context rule the moment the framed content exists. This
+// list failed until both entries came off, which is how the excuse was built to expire.
 //
 // CheckUpdatePathKeyUniqueness WAS here for that reason and is not any more, which is the half of
 // this list that is easiest to forget: p7 task 10's ValSem207PathEncryptionKeysUnique is the funnel
@@ -1138,13 +1141,14 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // order: the confirmation key belongs to the epoch the commit OPENS, so it does not exist until the
 // new key schedule has been derived. The caller that has one is p7 task 18.
 //
-// ValidateUpdatePathLeafNode is the same shape again, and it is here on the commit it landed rather
-// than a plan later. It is RFC 9420 section 7.3's commit door -- the third of the validator's three
-// expectations, and the one that had no caller at all while three comments in this package said it
-// was already built. The client that must call it is the one PROCESSING a commit, which is the
-// layer MergeUpdatePath hands the leaf's signature to and which has not landed; until it does, this
-// package ships a section 7.3 door its own construction does not run, and that fact belongs here
-// rather than in the gap between two tasks.
+// ValidateUpdatePathLeafNode WAS here and is not any more, and it is the sharpest instance this
+// list has produced. The entry said it is RFC 9420 section 7.3's commit door -- the third of the
+// validator's three expectations, the one that had no caller at all while three comments in this
+// package said it was already built -- and that the client which must call it is the one PROCESSING
+// a commit. That client is p7 task 18's (*Group).ProcessMessage, it landed, and this list failed
+// until the entry came off: the leaf of a received update path is now judged at the sender's
+// position before MergeUpdatePath is allowed to compare a chain against the parent_hash that leaf
+// carries. It is the entry that named its caller exactly right and had to wait five tasks for it.
 //
 // ValSem300NoTrailingBlankNodes ARRIVED on p7 task 13, and what put it here is a repair rather than
 // a gap. Section 12.4.3.3's trailing blank rule is stated over the ARRAY a ratchet_tree extension
@@ -1174,10 +1178,7 @@ func TestTheRefusalRosterReadsAFileWhateverItIsNamed(t *testing.T) {
 // package will not process, so the generator running its own door is not a courtesy -- and the
 // caller arrived from a direction both entries named the wrong task for.
 var rulesThisPackageExportsAndNothingApplies = []string{
-	"CheckFramedContentContext",
-	"CheckSenderLeaf",
 	"ValSem300NoTrailingBlankNodes",
-	"ValidateUpdatePathLeafNode",
 }
 
 // exportedRulesOfThisPackage is every exported function of the non test source whose whole answer

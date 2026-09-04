@@ -765,9 +765,27 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// package could have written, so the refusal it produces is a join refused rather than a
 		// join made over a comparison that silently did not happen.
 		"group.go: syntax.Marshal(inTree)",
+		// the provisional context an update path is sealed under, at BOTH ends of it: p7 task 13's
+		// commit generation builds one and p7 task 18's commit processing builds the same one out
+		// of the same six fields. The DEFAULT limit for the reason the signed context takes it --
+		// these octets are the HPKE info string of every seal on the path and carry no length
+		// prefix of their own -- and TWO entries rather than one shared helper, because each side
+		// builds it from state only its own half holds and a disagreement between them is
+		// ciphertexts the other end cannot open.
+		"group.go: syntax.Marshal(provisional)",
 		"group.go: syntax.Marshal(provisional)",
 		"group.go: syntax.Marshal(published)",
 		"group.go: syntax.Marshal(required)",
+		"group.go: syntax.Marshal(self.context)",
+		"group.go: syntax.Marshal(self.context)",
+		// p7 task 18's receive path encodes the group context a FIFTH and a SIXTH time, and both
+		// are the same structure at the same limit for the reason the four below it are: the
+		// context reaches OpenPrivateMessage and SignAuthenticatedContent as octets inlined into a
+		// FramedContentTBS with no length prefix of their own, so a context this encoder accepted
+		// past MaxVectorLength is one no peer running the default limit could verify a signature
+		// over. Two of them and not one because the two calls are the two DIRECTIONS -- the message
+		// this client opens and the message it seals -- and a shared helper would be one encode
+		// standing for both sides of a comparison.
 		"group.go: syntax.Marshal(self.context)",
 		"group.go: syntax.Marshal(self.context)",
 		// p7 task 12's proposal generation encodes the group context a THIRD time, and it is the

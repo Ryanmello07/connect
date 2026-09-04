@@ -2577,3 +2577,757 @@ func (self *RatchetTree) installJoinerPathSecrets(crypto CryptoProvider, priv *T
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// p7 task 18: RFC 9420 section 12.4.2, the receive half of a commit
+// ---------------------------------------------------------------------------
+
+// The refusals ingesting a message makes that are nobody else's, one value per rule for the reason
+// this file's first error block states.
+var (
+	// errProcessWireFormat is an MLSMessage this profile does not process on a group's inbound
+	// path. It is a PROFILE refusal and not a codec one: the codec accepts all five wire formats
+	// -- a Welcome and a KeyPackage are perfectly well formed messages -- and what refuses them
+	// here is that neither is something a group at an epoch ingests. Spec A section 3.4 sends
+	// every handshake message as a PrivateMessage, so PublicMessage is refused too and the
+	// receive path has one shape rather than two.
+	errProcessWireFormat = errors.New("mls: this profile does not process that wire format on a group's inbound path")
+
+	// errProcessSenderType is a framed content from a sender type this build has no key for. It
+	// is NOT errProfileExternalSender, which is the external_senders GROUP CONTEXT EXTENSION
+	// refused at a proposal door: that one is a group whose extensions this profile will not
+	// carry, and this one is a message whose signer this member cannot name. A caller sent to
+	// look at its group's extensions over a message from an external sender would find nothing
+	// wrong with them.
+	errProcessSenderType = errors.New("mls: the v1 profile processes member senders only")
+
+	// errProcessContentType is a framed content whose content_type is outside RFC 9420 section
+	// 6's three. The codec refuses an undefined code point, so what could reach this is a type
+	// this select has not been taught, and answering it is what keeps a fourth arm from being a
+	// silent fall through to nil.
+	errProcessContentType = errors.New("mls: framed content of a type this receive path does not process")
+
+	// errCommitContentCarriesNoCommit is a content_type of commit with no commit inside it. The
+	// codec pairs the two, so this is this build disagreeing with itself rather than anything a
+	// peer did -- and it is stated rather than dereferenced because the alternative is a nil
+	// dereference inside the receive path of a library.
+	errCommitContentCarriesNoCommit = errors.New("mls: a commit message carries no commit")
+
+	// errApplyCommitNotACommit is ApplyCommit handed something ProcessMessage did not answer as a
+	// commit. It is a caller's mistake and not a message fault, which is why it is not one of the
+	// three above.
+	errApplyCommitNotACommit = errors.New("mls: ApplyCommit was handed a result that is not a staged commit")
+
+	// errUpdatedLeafPrivateKey is a commit that installs an Update at THIS client's own leaf whose
+	// encryption key this client cannot produce the private half of.
+	//
+	// It is the receiving end of the order (*Group).ProposeUpdate files its key pair in: the
+	// private half goes into the store BEFORE the proposal is published, precisely so that a
+	// committer acting entirely correctly on what it was sent cannot commit this client into an
+	// epoch whose own leaf key it does not hold. This is the value for the case where the store
+	// nonetheless has no answer -- a store that lost the entry, or a leaf updated by somebody
+	// else, which ValSem111 forbids and this refuses rather than assumes.
+	//
+	// A REFUSAL AND NOT A CARRY-FORWARD, which is the whole reason it exists. The alternative is
+	// keeping the leaf key of the epoch that just closed, and that produces a member which merges
+	// the commit, enters the new epoch, and then decrypts NOTHING for the rest of the group's life
+	// -- every update path sealed to its published key, opened with a key that is not its private
+	// half, reported at the far end as a corrupt commit.
+	errUpdatedLeafPrivateKey = errors.New(
+		"mls: this commit updates this client's own leaf and its private half is not in the store")
+)
+
+// checkWireFormat is the v1 disposition of the wire formats a GROUP INGESTS, standing in for
+// (*Profile).CheckWireFormat exactly as checkCiphersuiteForCreate stands in for
+// (*Profile).CheckCiphersuiteForCreate; see proposal_list.go's profile for why the stand-in is
+// unexported and what the swap costs.
+//
+// PrivateMessage AND NOTHING ELSE, and the refusals are two different sentences. A Welcome, a
+// GroupInfo and a KeyPackage are messages a group at an epoch does not ingest at all --
+// JoinFromWelcome takes the first two and the directory takes the third -- and a PublicMessage is
+// a handshake message this profile does not send, because spec A section 3.4 has handshake traffic
+// travel as a PrivateMessage so that the delivery service learns neither who committed nor what
+// the commit did. A build that accepted one would let a peer choose which of the two
+// authenticators its message is judged under.
+//
+// THERE IS NO checkVersion BESIDE IT, and that is a decision rather than the omission it looks
+// like. (*MLSMessage).UnmarshalMLS refuses every ProtocolVersion but mls10 INLINE, before it
+// selects an arm, so a second version gate here could not be reached by any octets this package
+// can parse -- and a guard no input can fire is the shape (*Group).RatchetTree and
+// (*Group).ProposeGroupContextExtensions both reject: a second copy covering for the one really
+// doing the work, which no test can tell apart from the real answer. When p8's Profile makes the
+// version a profile decision, the door it needs is the decoder's rather than one written here.
+func (self *profile) checkWireFormat(format WireFormat) error {
+	if format == WireFormatPrivateMessage {
+		return nil
+	}
+	return fmt.Errorf("%w: wire format %d", errProcessWireFormat, format)
+}
+
+// ProcessedKind discriminates what ProcessMessage returned.
+type ProcessedKind uint8
+
+const (
+	ProcessedApplication ProcessedKind = 1
+	ProcessedProposal    ProcessedKind = 2
+	ProcessedCommit      ProcessedKind = 3
+)
+
+// ApplicationMessage is one decrypted application message, as storage the caller owns: every field
+// of it was cut out of a plaintext this call decrypted, and nothing in this package retains it.
+type ApplicationMessage struct {
+	SenderLeaf        LeafIndex
+	AuthenticatedData []byte
+	Plaintext         []byte
+}
+
+// Processed is the result of ingesting one MLSMessage.
+//
+// Exactly one of the three arms is populated and Kind says which, which is MLSMessage's own select
+// discipline one layer up: a caller reading the wrong arm of a value with two populated would be
+// acting on a message nobody sent.
+type Processed struct {
+	Kind        ProcessedKind
+	Sender      Sender
+	Application *ApplicationMessage
+	Proposal    *Proposal
+	Commit      *StagedCommit
+}
+
+// ProcessMessage ingests one MLSMessage.
+//
+// IT NEVER MUTATES LIVE EPOCH STATE. A commit comes back STAGED, so the caller can run its own
+// policy and record the epoch's wraps before the epoch advances -- connect/message needs that gap,
+// and a receive path that advanced the epoch as it validated would leave a caller that refused the
+// commit already inside it. (*Group).ApplyCommit is the second half.
+//
+// TWO THINGS DO MOVE, and both are meant to, exactly as they are on the proposal generation path
+// one section up. An inbound PROPOSAL is cached, because that is what makes a later commit able to
+// name it by reference; and the message ratchet of the SENDER's leaf advances a generation, which
+// is what opening a PrivateMessage is.
+//
+// The order is RFC 9420 section 6's and it is not interchangeable: the message is parsed, the
+// profile judges the envelope, the framing layer opens and authenticates it, and only then is the
+// content read. A body that branched on the content type before the open would be branching on an
+// attacker's octets.
+func (self *Group) ProcessMessage(message []byte) (*Processed, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+
+	parsed, err := ParseMLSMessage(message)
+	if err != nil {
+		return nil, err
+	}
+	if err := defaultProfile().checkWireFormat(parsed.WireFormat); err != nil {
+		return nil, err
+	}
+	// the codec pairs the wire format with the arm it names, and this is that pairing asserted
+	// rather than assumed, because the statement below dereferences it.
+	if parsed.PrivateMessage == nil {
+		return nil, fmt.Errorf("%w: the message names PrivateMessage and carries none", errProcessWireFormat)
+	}
+
+	groupContext, err := syntax.Marshal(self.context)
+	if err != nil {
+		return nil, err
+	}
+
+	authenticated, err := OpenPrivateMessage(self.crypto, self.secretTree,
+		self.senderDataSecretLocked(), parsed.PrivateMessage,
+		self.signatureKeyResolverLocked(), groupContext)
+	if err != nil {
+		return nil, err
+	}
+	return self.processAuthenticatedLocked(authenticated)
+}
+
+// signatureKeyResolverLocked is what turns a Sender into the key the framing layer verifies
+// against, and it is where ValSem004 and this profile's sender rule are enforced: an external
+// sender or a blank leaf never yields a key, so a message from either is refused at the signature
+// rather than further in, where its leaf index would already have been used for something.
+//
+// A DECLARATION AND NOT A CLOSURE INSIDE ProcessMessage, and the difference is what a test can
+// reach. OpenPrivateMessage constructs the Sender it resolves -- section 6.3's sender data carries
+// a leaf index and nothing else, so every sender that reaches this through the one wire format this
+// profile ingests is a member sender. The non-member arm is therefore a refusal no octets can fire,
+// and written as a lambda it would be a refusal nothing in this package has ever read, which is
+// exactly what validation_framing_test.go's two refusal gates exist to report. It is kept rather
+// than deleted because it is the fail-CLOSED half: CheckSenderLeaf answers nil for every non-member
+// sender by design, so a body without this arm would fall through to leaf 0's key for a sender type
+// that carries no leaf index at all.
+func (self *Group) signatureKeyResolverLocked() SignatureKeyResolver {
+	return func(sender Sender) (SignaturePublicKey, error) {
+		if sender.SenderType != SenderTypeMember {
+			return nil, fmt.Errorf("%w: sender type %d", errProcessSenderType, sender.SenderType)
+		}
+		// ValSem004, through the framing plan's own door rather than through a second occupancy
+		// test written here, so the sender side and the receiver side cannot come to disagree
+		// about what an occupied leaf is.
+		if err := CheckSenderLeaf(sender, func(leaf LeafIndex) bool {
+			return self.tree.Leaf(leaf) != nil
+		}); err != nil {
+			return nil, err
+		}
+		leaf := self.tree.Leaf(sender.LeafIndex)
+		if leaf == nil {
+			return nil, fmt.Errorf("%w: leaf %d", errBlankSenderLeaf, sender.LeafIndex)
+		}
+		// a COPY of the key and not the tree's own array. SignaturePublicKey is a []byte, so what
+		// this hands the framing layer would otherwise be a window onto the live ratchet tree --
+		// the same hazard (*Group).Members answers a clone for, and it costs 32 octets a message.
+		return SignaturePublicKey(cloneBytes(leaf.SignatureKey)), nil
+	}
+}
+
+// processAuthenticatedLocked is the content half of ProcessMessage: RFC 9420 section 6's context
+// rules over a framed content that has been opened and authenticated, and the select over its three
+// content types.
+//
+// A DECLARATION AND NOT A BLOCK, for signatureKeyResolverLocked's reason one door up. The codec
+// refuses every content_type outside the registry, so the arm that answers an undefined one cannot
+// be reached through ProcessMessage by any octets at all -- and a refusal nothing has ever read is
+// the shape framing_test.go's code point gate reports. Written as a declaration it is reachable
+// with a content this package's own encoder cannot produce, which is what makes the message a
+// caller would see something a test has actually looked at.
+//
+// The compiler directive is this package's convention for a member of the class
+// TestEveryEraseHelperCarriesTheNoInlineDirective derives, and not a claim that this body erases a
+// secret itself. That class is closed under the hand-off -- a declaration that gives storage it was
+// handed to an eraser is a member -- and this one hands its argument to (*ProposalCache).Store and
+// to stageInboundCommitLocked, both of which are in it. (*ProposalCache).Store carries the
+// directive under exactly this reading and says so, which is the point of deriving a class rather
+// than listing one.
+//
+//go:noinline
+func (self *Group) processAuthenticatedLocked(authenticated *AuthenticatedContent) (*Processed, error) {
+	// ValSem002 and ValSem003, through the framing plan's one check so that the sender side and
+	// the receiver side cannot disagree about what "this group, this epoch" means. It runs AFTER
+	// the open because a PrivateMessage has no framed content until it has been decrypted.
+	if err := CheckFramedContentContext(&authenticated.Content,
+		self.context.GroupId, self.context.Epoch); err != nil {
+		return nil, err
+	}
+	sender := authenticated.Content.Sender
+
+	switch authenticated.Content.ContentType {
+	case ContentTypeApplication:
+		return &Processed{
+			Kind:   ProcessedApplication,
+			Sender: sender,
+			Application: &ApplicationMessage{
+				SenderLeaf:        sender.LeafIndex,
+				AuthenticatedData: authenticated.Content.AuthenticatedData,
+				Plaintext:         authenticated.Content.ApplicationData,
+			},
+		}, nil
+	case ContentTypeProposal:
+		// stored through the cache rather than kept here, because the cache is what re-runs the
+		// profile gate, checks the epoch binding and applies section 12.2's per sender and per
+		// leaf ceilings. The entry it keeps is a CLONE of the proposal, so what is answered below
+		// shares no storage with what a later commit resolves.
+		if _, err := self.proposals.Store(self.crypto, self.context, authenticated); err != nil {
+			return nil, err
+		}
+		return &Processed{Kind: ProcessedProposal, Sender: sender,
+			Proposal: authenticated.Content.Proposal}, nil
+	case ContentTypeCommit:
+		staged, err := self.stageInboundCommitLocked(authenticated)
+		if err != nil {
+			return nil, err
+		}
+		return &Processed{Kind: ProcessedCommit, Sender: sender, Commit: staged}, nil
+	}
+	return nil, fmt.Errorf("%w: content type %d", errProcessContentType, authenticated.Content.ContentType)
+}
+
+// stageInboundCommitLocked is the receive half of RFC 9420 section 12.4.2, in the order the RFC
+// lists the steps, with the state lock already held.
+//
+// THE ORDER IS NORMATIVE AND EVERY STEP DEPENDS ON THE ONE BEFORE IT, which is why it is numbered
+// in the body against the RFC's own list rather than left to be read off the lines:
+//
+//   - the proposals are resolved and applied BEFORE the commit is judged, because every rule of
+//     section 12.4 is stated over the tree the proposals build;
+//   - the commit is judged BEFORE the update path is merged, because ValSem206 and ValSem207 ask
+//     that no key the path publishes already stands in that tree -- and after the merge every one
+//     of them does. CheckUpdatePathKeyUniqueness says so in as many words, and a validator handed
+//     the merged tree refuses every honest commit of a group with more than one member;
+//   - the path is merged BEFORE it is decrypted, because the ciphertexts were sealed under a group
+//     context whose tree_hash covers the path's own public keys;
+//   - the key schedule is advanced BEFORE the confirmation tag is checked, because the
+//     confirmation key belongs to the epoch this commit OPENS;
+//   - and the tag is checked against the NEW confirmed transcript hash. A tag checked against the
+//     transcript of the epoch that is closing still produces KDF.Nh octets and still compares equal
+//     on both sides of an honest exchange, so nothing that round trips can land on that fault.
+//
+// NOTHING HERE WRITES A FIELD OF THE GROUP. ApplyProposals clones the tree, DecryptUpdatePath is
+// handed a Clone of this member's private tree state, and the transcript is a Clone -- so a commit
+// refused at any of the returns below leaves this group exactly where the epoch it is still in put
+// it.
+func (self *Group) stageInboundCommitLocked(authenticated *AuthenticatedContent) (*StagedCommit, error) {
+	commit := authenticated.Content.Commit
+	if commit == nil {
+		return nil, errCommitContentCarriesNoCommit
+	}
+	committer := authenticated.Content.Sender.LeafIndex
+	// THERE IS NO PRESENCE CHECK ON THE CONFIRMATION TAG HERE, and its absence is a decision rather
+	// than the omission it looks like. ValSem009 is already stated twice on the way in and once more
+	// on the way through: (*FramedContentAuthData).UnmarshalMLS refuses an empty tag as it decodes,
+	// VerifyAuthenticatedContent refuses a commit carrying none immediately after the signature, and
+	// ValSem205ConfirmationTag refuses one at step 7 under the same sentinel. A fourth copy could not
+	// be reached by any octets this package can parse, which is the shape (*Group).RatchetTree and
+	// (*Group).ProposeGroupContextExtensions both reject -- a guard covering for the one really doing
+	// the work, that no input can tell apart from the real answer. The direction is unchanged: a
+	// commit that somehow reached this body with no tag is refused at step 7 rather than accepted.
+
+	// step 1: resolve the proposals this commit names, against THIS member's cache and THIS
+	// member's epoch. Erratum 8815 -- "a reference to a proposal that was not previously received"
+	// -- is the same rule and the same value, asked here by Resolve rather than restated;
+	// ValidateCommit reaches it again through validateCommitErrata, over the cache this step read.
+	list, err := self.proposals.Resolve(self.crypto, self.context, committer, commit.Proposals)
+	if err != nil {
+		return nil, err
+	}
+
+	// step 2: apply the list to a tree of this call's own, and judge it against the PRE-commit
+	// state, which is the state section 12.2's rules are stated over.
+	applied, err := ApplyProposals(self.tree, self.context, self.ownLeaf, list)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateProposalList(&ProposalValidationInput{
+		Crypto:     self.crypto,
+		Tree:       self.tree,
+		Context:    self.context,
+		Extensions: applied.Extensions,
+		Committer:  committer,
+		List:       list,
+		Now:        time.Now(),
+	}); err != nil {
+		return nil, err
+	}
+
+	// step 3: the commit that ejects this client, answered before anything is derived.
+	//
+	// A REMOVED MEMBER CANNOT DERIVE THE EPOCH AND MUST NOT PRETEND TO, and that is a fact about
+	// the protocol rather than a shortcut taken here. Its leaf is blank in the tree the proposals
+	// built, so the committer's filtered direct path no longer covers it, no ciphertext of the
+	// update path is addressed to it, and there is therefore no commit secret -- which means no
+	// key schedule, no confirmation key, and no way to check the confirmation tag. Every remaining
+	// rule of section 12.4.2 is a question about an epoch this client does not enter, and
+	// ValSem203 answers exactly that: this leaf shares no node with the committer's filtered path.
+	//
+	// So what is handed back is a REPORT and not an epoch: the committer, the proposals, the
+	// leaves that moved, and RemovesSelf. (*Group).ApplyCommit answers ErrRemovedFromGroup for it
+	// and closes the group rather than merging anything, and the staged value holds no key
+	// material for that close to erase.
+	//
+	// The commit is not unauthenticated at this point: it opened under this epoch's message keys,
+	// its signature verified against the committer's own leaf, and it names this group and this
+	// epoch. What is missing is the confirmation tag, and no build can supply that to a member the
+	// commit removed.
+	if applied.SelfRemoved {
+		return &StagedCommit{
+			committer:   committer,
+			epoch:       self.context.Epoch + 1,
+			tree:        applied.Tree,
+			list:        list,
+			commit:      commit,
+			added:       applied.AddedLeaves,
+			removed:     applied.RemovedLeaves,
+			updated:     applied.UpdatedLeaves,
+			selfRemoved: true,
+			hasPath:     commit.Path != nil,
+			confirmTag:  authenticated.Auth.ConfirmationTag,
+		}, nil
+	}
+
+	// step 4: section 12.4's own rules, over the post-proposal tree and BEFORE the merge.
+	//
+	// PostTree IS THE TREE THE PROPOSALS BUILT AND NOT THE ONE THE PATH IS MERGED INTO, which is
+	// (*Group).CreateCommit's split at the other end of the same file and is here for the reason
+	// CheckUpdatePathKeyUniqueness states: the keys an update path publishes are the keys the merge
+	// installs, so a validator handed the merged tree finds every one of them already standing
+	// there and refuses ValSem207 on every commit that carries a path.
+	//
+	// The context is the PRE-commit one and the extensions are the post-proposal set, which is not
+	// a muddle and is CreateCommit's pairing for its stated reason: the by-reference arm of the
+	// vector join resolves against this member's cache, which is bound to the epoch that is
+	// closing, and effectiveExtensions is the field that carries the post-proposal set to the
+	// rules that need it.
+	commitInput := &CommitValidationInput{
+		Crypto:     self.crypto,
+		PreTree:    self.tree,
+		PostTree:   applied.Tree,
+		Context:    self.context,
+		Extensions: applied.Extensions,
+		Committer:  committer,
+		Own:        self.ownLeaf,
+		List:       list,
+		Commit:     commit,
+		Pending:    self.proposals,
+		Now:        time.Now(),
+	}
+	if err := ValidateCommit(commitInput); err != nil {
+		return nil, err
+	}
+
+	// step 5: this client's own leaf key, if the commit's proposals replaced it.
+	//
+	// AN UPDATE AT THIS CLIENT'S OWN LEAF IS AN UPDATE THIS CLIENT PUBLISHED -- ValSem111 makes an
+	// Update's sender the leaf it updates -- so the private half is one this client drew and filed
+	// in its own store before it published the proposal. It has to be installed BEFORE the path is
+	// decrypted, because the committer sealed this member's rung of the update path to the key the
+	// UPDATE published and not to the one the epoch that is closing carries.
+	//
+	// MEASURED, which is why it is a step of its own rather than a line inside the path block:
+	// without it, a member whose Update another member commits is refused at DecryptUpdatePath on
+	// the very commit that carried its own proposal -- and on every commit after that one, because
+	// the leaf key it goes on holding is one the group replaced.
+	commitSecret := ZeroSecret(self.crypto)
+	ownPriv := self.ownPriv
+	replaced, err := self.updatedOwnLeafPrivateLocked(applied)
+	if err != nil {
+		return nil, err
+	}
+	if replaced != nil {
+		// erased when this call returns, whatever it returns: every path below takes a CLONE of
+		// this state or replaces it with the one the decrypt answered, so it is never the value
+		// handed on and after the return nothing in this process can reach it.
+		defer replaced.Zeroize()
+		ownPriv = replaced
+	}
+
+	// step 6: the path, in the ordered steps section 12.4.2 gives it.
+	if commit.Path != nil {
+		// RFC 9420 section 7.3's COMMIT door -- the third of the leaf validator's three
+		// expectations, and the one that decides the leaf of a RECEIVED update path is signed, is
+		// sourced commit, and carries a credential and capabilities this group admits.
+		//
+		// IT RUNS BEFORE THE MERGE, which is the whole of why it stands here rather than after it.
+		// MergeUpdatePath compares a recomputed parent hash chain against path.LeafNode.ParentHash
+		// and says in as many words that it does not verify the leaf's signature -- and parent_hash
+		// is a field only the commit arm of section 7.6's select signs over. A merge run first
+		// would be comparing its chain against an unsigned field, on a tree it has already begun to
+		// adopt.
+		//
+		// The context it is judged in carries the POST-PROPOSAL extension set, so that a commit
+		// which changes the group's extensions and publishes a path in one step is judged against
+		// the extensions it installs. That is erratum 8745's own pairing, and effectiveContext is
+		// where this package states it once.
+		if err := ValidateUpdatePathLeafNode(self.crypto, commitInput.effectiveContext(),
+			committer, commit.Path); err != nil {
+			return nil, err
+		}
+		if err := applied.Tree.MergeUpdatePath(self.crypto, committer, commit.Path); err != nil {
+			return nil, err
+		}
+		pathTreeHash, err := applied.Tree.TreeHash(self.crypto)
+		if err != nil {
+			return nil, err
+		}
+		// the provisional context carries the PREVIOUS epoch's confirmed transcript hash, because
+		// the new one is a function of this very commit. Section 12.4.1 has the sender seal the
+		// path under exactly this context, so what matters is that the two sides build the same
+		// one; (*Group).CreateCommit builds it from the same six fields.
+		provisional := &GroupContext{
+			Version:                 self.context.Version,
+			CipherSuite:             self.context.CipherSuite,
+			GroupId:                 cloneBytes(self.context.GroupId),
+			Epoch:                   self.context.Epoch + 1,
+			TreeHash:                pathTreeHash,
+			ConfirmedTranscriptHash: cloneBytes(self.context.ConfirmedTranscriptHash),
+			Extensions:              applied.Extensions,
+		}
+		provisionalBytes, err := syntax.Marshal(provisional)
+		if err != nil {
+			return nil, err
+		}
+		// a CLONE of this member's private tree state, because a decrypt that wrote the new rungs
+		// through the live one would have replaced the epoch this group is still running on before
+		// anything below got the chance to refuse the commit. PathDecryptResult's own header
+		// states the contract from the other side.
+		//
+		// The leaves this commit ADDS are excluded, which is the receiving half of the exclusion
+		// (*Group).CreateCommit makes: a member added by this commit receives the path secret in
+		// its Welcome and is sealed to nowhere in the update path.
+		decrypted, err := applied.Tree.DecryptUpdatePath(self.crypto, committer, commit.Path,
+			provisionalBytes, ownPriv.Clone(), applied.AddedLeaves)
+		if err != nil {
+			// the cryptographic half of ValSem203; the structural half ran in ValidateCommit, and
+			// both carry the same sentinel so a caller can ask the question with one errors.Is
+			return nil, fmt.Errorf("%w: %w", errPathDecrypt, err)
+		}
+		commitSecret = decrypted.CommitSecret
+		ownPriv = decrypted.Private
+	} else if ownPriv != nil {
+		// a commit with no path leaves this client's own leaf key where it was, so the private
+		// state carries forward -- and it is CLONED for (*Group).CreateCommit's stated reason: a
+		// staged commit is erased when it is dropped, so a staged commit holding this group's own
+		// live leaf state would erase, on that ordinary path, the key the epoch this group is
+		// still in opens its update paths with.
+		ownPriv = ownPriv.Clone()
+	}
+
+	// step 7: the new transcript hashes, the new group context and the new key schedule.
+	confirmedInput, err := authenticated.ConfirmedTranscriptHashInput()
+	if err != nil {
+		return nil, err
+	}
+	confirmedHash := ConfirmedTranscriptHash(self.crypto, self.transcript.Interim, confirmedInput)
+	treeHash, err := applied.Tree.TreeHash(self.crypto)
+	if err != nil {
+		return nil, err
+	}
+	newContext := &GroupContext{
+		Version:                 self.context.Version,
+		CipherSuite:             self.context.CipherSuite,
+		GroupId:                 cloneBytes(self.context.GroupId),
+		Epoch:                   self.context.Epoch + 1,
+		TreeHash:                treeHash,
+		ConfirmedTranscriptHash: confirmedHash,
+		Extensions:              applied.Extensions,
+	}
+	schedule, err := NewKeySchedule(self.crypto, self.schedule.Secrets().InitSecret, commitSecret,
+		EmptyPskSecret(self.crypto), newContext)
+	if err != nil {
+		return nil, err
+	}
+
+	// EVERY REFUSAL FROM HERE DOWN DROPS A WHOLE DERIVED EPOCH, and a derived epoch that becomes
+	// unreachable is not a derived epoch that was erased. The schedule holds the init secret, the
+	// confirmation key, the encryption secret, the epoch authenticator, the exporter and the
+	// resumption PSK, and ownPriv is either the leaf state this path decrypted or a clone of this
+	// group's own -- so the erase is written once, here, rather than at each of the five returns
+	// below, and the flag is what keeps it off the one path where the StagedCommit takes ownership.
+	// It is (*Group).CreateCommit's `handedOn` at the other end of the same file.
+	handedOn := false
+	defer func() {
+		if handedOn {
+			return
+		}
+		schedule.Zeroize()
+		ownPriv.Zeroize()
+	}()
+
+	// step 8: ValSem205, the group's fork detector, against the confirmed transcript hash of the
+	// epoch this commit OPENS and under the confirmation key of that same epoch.
+	//
+	// Both halves are load bearing. The tag is a MAC over the NEW confirmed transcript hash, so a
+	// build that checked it before the transcript advanced would be comparing a value both sides
+	// agree on whatever the commit did; and the key is the NEW epoch's, which is why this rule is
+	// not one of ValidateCommit's twelve and is run by the caller that has a schedule. The
+	// comparison goes through CryptoProvider.MacVerify, the only route to a tag comparison this
+	// package allows.
+	commitInput.ConfirmationKey = schedule.Secrets().Confirmation
+	commitInput.ConfirmedHash = confirmedHash
+	commitInput.ConfirmationTag = authenticated.Auth.ConfirmationTag
+	if err := ValSem205ConfirmationTag(commitInput); err != nil {
+		return nil, err
+	}
+	// a CLONE of the transcript, so a refusal below leaves this group's own transcript where the
+	// epoch it is still in put it.
+	transcript := self.transcript.Clone()
+	if err := transcript.Update(self.crypto, confirmedInput, authenticated.Auth.ConfirmationTag); err != nil {
+		return nil, err
+	}
+
+	// step 9: the new epoch's verified context, which is what the boundary owes the proposal cache,
+	// and the secret tree the new epoch's messages ratchet out of.
+	//
+	// THIS CLIENT SIGNS THE GROUP INFO ITSELF, exactly as the creator does at epoch 0 and as
+	// (*Group).CreateCommit does at every epoch after it. A commit carries no GroupInfo -- only a
+	// Welcome does -- so there is no signature of the committer's over this context to verify, and
+	// the authority the cache is owed is this client's own: it has just checked the confirmation
+	// tag of the epoch it is about to enter, which is the strongest statement any member ever makes
+	// about an epoch. A second door onto a verified context is what group_context_verified.go spent
+	// four rounds establishing IS the defect, so the one door is used here too.
+	groupInfo := &GroupInfo{
+		GroupContext:    *newContext,
+		ConfirmationTag: authenticated.Auth.ConfirmationTag,
+		Signer:          self.ownLeaf,
+	}
+	if err := groupInfo.Sign(self.crypto, self.signer); err != nil {
+		return nil, err
+	}
+	verified, err := groupInfo.VerifiedContext(self.crypto, applied.Tree)
+	if err != nil {
+		return nil, err
+	}
+	secretTree, err := NewSecretTree(self.crypto, applied.Tree.LeafWidth(),
+		schedule.Secrets().Encryption)
+	if err != nil {
+		return nil, err
+	}
+
+	staged := &StagedCommit{
+		committer:   committer,
+		epoch:       newContext.Epoch,
+		context:     newContext,
+		verified:    verified,
+		tree:        applied.Tree,
+		schedule:    schedule,
+		secretTree:  secretTree,
+		ownPriv:     ownPriv,
+		transcript:  transcript,
+		list:        list,
+		commit:      commit,
+		added:       applied.AddedLeaves,
+		removed:     applied.RemovedLeaves,
+		updated:     applied.UpdatedLeaves,
+		selfRemoved: false,
+		hasPath:     commit.Path != nil,
+		confirmTag:  authenticated.Auth.ConfirmationTag,
+		restoreKind: restoreFromJoiner,
+	}
+	handedOn = true
+	return staged, nil
+}
+
+// updatedOwnLeafPrivateLocked answers the private tree state this client holds AFTER a commit's
+// proposals have been applied, or nil when they left this client's leaf alone.
+//
+// THE STATE IS FRESH AND CARRIES NO PATH SECRET, which is a consequence of section 12.1.2 rather
+// than a simplification: an Update blanks the direct path of the leaf it replaces -- ApplyProposals
+// says so and RatchetTree.UpdateLeaf does it -- so every rung this client held above that leaf is a
+// secret for a node the commit blanked. Carrying them forward would leave a state whose held
+// secrets name blank nodes, which is exactly what TreeKEMPrivate.Consistent refuses, and the rungs
+// this client is entitled to are the ones the update path is about to hand it.
+//
+// The store's array is NOT erased here and is not the caller's to erase. GetPrivateKey answers
+// whatever storage the implementation keeps -- the sdk writes these over its sealed local store --
+// and NewTreeKEMPrivate copies what it is given, so an erase here would blank the entry this client
+// may still need if the commit carrying it is refused further down and a later one carries it
+// again. Deleting it is (StateStore).DeletePrivateKey's, on the epoch boundary task 19 owns.
+func (self *Group) updatedOwnLeafPrivateLocked(applied *ApplyResult) (*TreeKEMPrivate, error) {
+	// a spelled comparison of two leaf INDICES and not slices.Contains, which is what this
+	// package's constant-time gate derives out of its own imports and refuses. That gate is about
+	// comparisons of DATA and these are positions in a tree every member holds -- but the class it
+	// derives is the comparator and not the operand, deliberately, and routing around a derived
+	// class is the one thing standing rule 5 exists to prevent.
+	updated := false
+	for _, at := range applied.UpdatedLeaves {
+		if at == self.ownLeaf {
+			updated = true
+		}
+	}
+	if !updated {
+		return nil, nil
+	}
+	leaf := applied.Tree.Leaf(self.ownLeaf)
+	if leaf == nil {
+		return nil, fmt.Errorf("%w: this commit updates leaf %d and leaves it blank",
+			ErrTreeMalformed, self.ownLeaf)
+	}
+	stored, err := self.store.GetPrivateKey(leaf.EncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("%w: leaf %d: %w", errUpdatedLeafPrivateKey, self.ownLeaf, err)
+	}
+	if len(stored) == 0 {
+		return nil, fmt.Errorf("%w: leaf %d: the store answered no octets",
+			errUpdatedLeafPrivateKey, self.ownLeaf)
+	}
+	return NewTreeKEMPrivate(self.ownLeaf, HpkePrivateKey(stored)), nil
+}
+
+// ApplyCommit promotes a staged inbound commit to live state.
+//
+// THE STAGED EPOCH THIS REPLACES IS ERASED BEFORE IT IS DROPPED, and that is the ordinary path
+// rather than a cleanup one. A client that built its own commit and lost MASTER section 9.3's race
+// is holding a fully derived epoch nobody ever entered -- its own key schedule, its own secret tree
+// and the leaf key it drew for it -- and the peer's commit it is applying here is exactly what
+// makes that epoch dead. After the assignment below nothing in this process can reach it.
+//
+// A COMMIT THAT REMOVES THIS CLIENT MERGES NOTHING. There is no epoch to enter: the staged value is
+// the report stageInboundCommitLocked answers for that case, this group's own secrets are erased
+// through Close, and the caller is told with ErrRemovedFromGroup rather than being handed a merge
+// that silently produced a group this client is not a member of.
+func (self *Group) ApplyCommit(processed *Processed) error {
+	if processed == nil || processed.Kind != ProcessedCommit || processed.Commit == nil {
+		return errApplyCommitNotACommit
+	}
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return errGroupClosed
+	}
+	if processed.Commit.RemovesSelf() {
+		self.stateLock.Unlock()
+		// Close erases this epoch's schedule, its secret tree, this leaf's private state, the
+		// signing key and any commit still staged, and it is idempotent -- so a caller's own
+		// deferred Close beside this one erases nothing twice.
+		if err := self.Close(); err != nil {
+			return err
+		}
+		return ErrRemovedFromGroup
+	}
+	self.pending.Zeroize()
+	self.pending = processed.Commit
+	self.stateLock.Unlock()
+	return self.MergePendingCommit()
+}
+
+// Protect seals an application message under the current epoch.
+//
+// The AAD and the plaintext are the CALLER'S ARRAYS and nothing here retains either: both are read
+// once, into the signature preimage and into the AEAD, and what leaves is the ciphertext. A caller
+// that edits either after the call has changed nothing about the message it was handed.
+func (self *Group) Protect(aad, plaintext []byte) ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+	groupContext, err := syntax.Marshal(self.context)
+	if err != nil {
+		return nil, err
+	}
+	content := &FramedContent{
+		GroupId:           cloneBytes(self.context.GroupId),
+		Epoch:             self.context.Epoch,
+		Sender:            Sender{SenderType: SenderTypeMember, LeafIndex: self.ownLeaf},
+		AuthenticatedData: aad,
+		ContentType:       ContentTypeApplication,
+		ApplicationData:   plaintext,
+	}
+	authenticated, err := SignAuthenticatedContent(self.crypto, self.signer,
+		WireFormatPrivateMessage, content, groupContext)
+	if err != nil {
+		return nil, err
+	}
+	// LAST, because it is the first thing here that cannot be undone: the seal consumes a
+	// generation of this leaf's ratchet whether or not the message is ever sent.
+	private, err := SealPrivateMessage(self.crypto, self.secretTree,
+		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	if err != nil {
+		return nil, err
+	}
+	return MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+}
+
+// Unprotect opens an application message.
+//
+// It goes through ProcessMessage rather than calling OpenPrivateMessage itself, which is the whole
+// reason it is six lines: the epoch check, the sender leaf check, the signature and the profile
+// gate are stated once there, and a second receive path here would be a second answer to what this
+// group accepts. What it adds is the refusal a caller asking for an application message needs -- a
+// handshake message opened here is not a shorter answer, it is a different message, and by the time
+// this returns a proposal it carried has already been cached.
+func (self *Group) Unprotect(privateMessage []byte) (*ApplicationMessage, error) {
+	processed, err := self.ProcessMessage(privateMessage)
+	if err != nil {
+		return nil, err
+	}
+	if processed.Kind != ProcessedApplication {
+		return nil, fmt.Errorf("%w: this message was processed as kind %d",
+			errApplicationMustBeCiphertext, processed.Kind)
+	}
+	return processed.Application, nil
+}

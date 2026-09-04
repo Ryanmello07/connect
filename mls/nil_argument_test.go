@@ -685,6 +685,18 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 			leaf, _ := testLeafNode(t, crypto, member)
 			return leafIsTheOneThisJoinerPublished(nil, leaf)
 		}},
+		// p7 task 18's second half. A nil result is one arm of a refusal whose other two arms are a
+		// result of the wrong kind and a commit kind with no commit inside it, and all three answer
+		// ONE value on purpose: each of them is the same caller mistake -- promoting something
+		// (*Group).ProcessMessage did not answer as a commit -- and a caller that split them would
+		// be told which field of its own bug to look at rather than that it has one. The group is
+		// live rather than closed, so what this row observes is the argument and not errGroupClosed
+		// standing in front of it.
+		"(*Group).ApplyCommit(processed)": {sentinel: errApplyCommitNotACommit, call: func(t *testing.T) error {
+			group := testNewGroup(t, crypto, testIdentity(t, crypto, "the owner"), "apply-nil-argument")
+			defer group.Close()
+			return group.ApplyCommit(nil)
+		}},
 		"unmarshalPrivateMessageContent(header)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
 			plaintext, err := marshalPrivateMessageContent(framingTestMemberContent(),
 				&FramedContentAuthData{Signature: bytes.Repeat([]byte{0x51}, 64)}, 0)

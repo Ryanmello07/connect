@@ -2939,7 +2939,98 @@ const epochSecretHolderControl = "package control\n" +
 // takes arguments can be driven with arguments a caller would choose, and an excuse here is
 // precisely a refusal to try them -- which is the shape keyScheduleMethodArgumentRows' own doc
 // argues against, one type over.
-var groupMethodsTakingArguments = map[string]string{}
+var groupMethodsTakingArguments = map[string]string{
+	// p7 task 18's second half. It answers an ERROR ALONE, so there is nothing here for this sweep
+	// to read out of it -- the same shape the no-argument erasers above are skipped for, which the
+	// signature filter cannot skip because this one takes a parameter. What it INSTALLS is the
+	// staged epoch, and every octet of that becomes reachable through the group's own accessors --
+	// EpochAuthenticator, EpochSecret, Export -- which this sweep drives.
+	//
+	// It is also the one method of *Group whose only real argument is a value ProcessMessage
+	// answered, and driving it would mean applying an inbound commit and advancing this group past
+	// the epoch whose secret the whole comparison is written against. See
+	// epochSecretSweepInboundMessage for why the two rows that ARE driven take care not to.
+	"ApplyCommit": "answers an error alone, so this sweep would read no octets out of it whatever " +
+		"it were driven with; the epoch it installs is read through the accessors this sweep does drive",
+}
+
+// epochSecretSweepInboundMessage builds a message this group can OPEN, for the two inbound rows
+// below, WITHOUT there being a second member and WITHOUT advancing the epoch.
+//
+// BOTH HALVES OF THAT ARE THE POINT. The group this sweep runs over is founded so that its epoch
+// secret IS the value every comparison here is made against -- see newGroupOverTheEpochSecret --
+// so a row that added a peer, committed and merged would leave the group holding the secrets of an
+// epoch the corpus does not name, and every row reflection happens to call afterwards would be
+// compared against a value nothing holds. That is a gate that reports a clean run because it has
+// stopped looking, which is the one direction this file must not move in.
+//
+// So the sender is THIS GROUP'S OWN LEAF and the message is sealed under a SECOND secret tree
+// derived from the same encryption secret. Both trees ratchet identically, so a message the second
+// one seals opens under the first -- and the group's own ratchet is left where it was, because
+// nothing spent a generation of it. The second tree is fast-forwarded to the generation the
+// group's is parked on, read off the group's own ratchet rather than assumed to be zero: rows are
+// called in reflection order, several of them seal, and a fixture that depended on which of them
+// ran first would break on the day a method is renamed.
+func epochSecretSweepInboundMessage(t *testing.T, group *Group, aad []byte, plaintext []byte) []byte {
+	t.Helper()
+	encryption, err := group.EpochSecret(EpochSecretEncryption)
+	if err != nil {
+		t.Fatalf("the encryption secret this row's sender derives from: %v", err)
+	}
+	// the width the RECEIVER's own secret tree was built at and not the ratchet tree's current
+	// one, which is the same fixture-order hazard the fast-forward below answers: the
+	// ProposeRemove row splices a second leaf into the ratchet tree, and a sender tree built at
+	// the new width derives a different ratchet for the same leaf -- every key well formed, every
+	// length right, and nothing opens.
+	sender, err := NewSecretTree(group.crypto, group.secretTree.leafCount, encryption)
+	if err != nil {
+		t.Fatalf("the second secret tree this row seals under: %v", err)
+	}
+	kind, err := ratchetTypeOf(ContentTypeApplication)
+	if err != nil {
+		t.Fatalf("the ratchet an application message travels in: %v", err)
+	}
+	head := uint32(0)
+	if r, held := group.secretTree.ratchets[ratchetKey{leaf: group.ownLeaf, kind: kind}]; held {
+		head = r.head
+	}
+	for at := uint32(0); at < head; at += 1 {
+		if _, _, _, err := sender.NextMessageKey(ContentTypeApplication, group.ownLeaf); err != nil {
+			t.Fatalf("fast-forward this row's sender to generation %d: %v", head, err)
+		}
+	}
+	groupContext, err := group.GroupContext()
+	if err != nil {
+		t.Fatalf("the group context this row's message is signed against: %v", err)
+	}
+	content := &FramedContent{
+		GroupId:           group.GroupId(),
+		Epoch:             group.Epoch(),
+		Sender:            Sender{SenderType: SenderTypeMember, LeafIndex: group.ownLeaf},
+		AuthenticatedData: aad,
+		ContentType:       ContentTypeApplication,
+		ApplicationData:   plaintext,
+	}
+	authenticated, err := SignAuthenticatedContent(group.crypto, group.signer,
+		WireFormatPrivateMessage, content, groupContext)
+	if err != nil {
+		t.Fatalf("sign this row's message: %v", err)
+	}
+	private, err := SealPrivateMessage(group.crypto, sender, group.senderDataSecretLocked(),
+		authenticated, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal this row's message: %v", err)
+	}
+	encoded, err := MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+	if err != nil {
+		t.Fatalf("frame this row's message: %v", err)
+	}
+	return encoded
+}
 
 // groupMethodArgumentRows drives an exported method of *Group that takes arguments through the
 // sweep that reads what a group hands out.
@@ -2985,6 +3076,28 @@ var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]re
 			{reflect.ValueOf(group.OwnLeafIndex())},
 			{reflect.ValueOf(LeafIndex(1))},
 		}
+	},
+	// p7 task 18's three message methods that take arguments. Each is driven with the arguments a
+	// caller would use rather than into a refusal, for Export's reason.
+	//
+	// Protect answers the ciphertext of whatever it was handed, which is where a leak into an
+	// application message would land; the two inbound rows answer the plaintext of a message this
+	// group can really open, and ProcessMessage's answer is a *Processed whose commit arm is a
+	// holder this file sweeps in its own right. See epochSecretSweepInboundMessage for how a group
+	// of one is given a message to open without the epoch this whole comparison rests on moving.
+	"Protect": func(t *testing.T, group *Group) [][]reflect.Value {
+		return [][]reflect.Value{{
+			reflect.ValueOf([]byte("the aad this sweep protects")),
+			reflect.ValueOf([]byte("the plaintext this sweep protects")),
+		}}
+	},
+	"ProcessMessage": func(t *testing.T, group *Group) [][]reflect.Value {
+		return [][]reflect.Value{{reflect.ValueOf(epochSecretSweepInboundMessage(t, group,
+			[]byte("the aad this sweep processes"), []byte("the plaintext this sweep processes")))}}
+	},
+	"Unprotect": func(t *testing.T, group *Group) [][]reflect.Value {
+		return [][]reflect.Value{{reflect.ValueOf(epochSecretSweepInboundMessage(t, group,
+			[]byte("the aad this sweep unprotects"), []byte("the plaintext this sweep unprotects")))}}
 	},
 	// p7 task 12's three generators that take arguments; ProposeUpdate takes none and is called
 	// directly. Each is driven with the arguments a caller would use rather than into a refusal,
@@ -3286,17 +3399,10 @@ var epochSecretHolderSweeps = map[string]func(t *testing.T, at string, value ref
 	// commit being sent and the delivery service accepting it. Read through its own exported
 	// surface by reflection, for the group's reason -- a leak added to this type tomorrow is a
 	// method, and a list of accessors is exactly what would not have it.
-	"StagedCommit": func(t *testing.T, at string, value reflect.Value) [][]byte {
-		t.Helper()
-		if value.IsNil() {
-			return nil
-		}
-		staged, isStaged := value.Interface().(*StagedCommit)
-		if !isStaged {
-			t.Fatalf("%s: the sweep was handed a %s where a *StagedCommit belongs", at, value.Type())
-		}
-		return exposedBytes(bytesTheStagedCommitHandsOut(t, at, staged))
-	},
+	// a named declaration rather than a literal, because the Processed sweep below hands its commit
+	// arm to THIS reading rather than writing a second, narrower one of the same type -- and a map
+	// literal that indexed itself would be an initialization cycle the compiler refuses.
+	"StagedCommit": epochSecretBytesOfAStagedCommit,
 	"KeySchedule": func(t *testing.T, at string, value reflect.Value) [][]byte {
 		t.Helper()
 		if value.IsNil() {
@@ -3309,6 +3415,59 @@ var epochSecretHolderSweeps = map[string]func(t *testing.T, at string, value ref
 		exposed, _ := bytesTheScheduleHandsOut(t, at, schedule)
 		return exposedBytes(exposed)
 	},
+	// p7 task 18's result, which reaches the epoch secret by holding the staged commit that holds
+	// the schedule of the epoch a received commit OPENS.
+	//
+	// IT IS READ THROUGH ITS EXPORTED FIELDS AND NOT THROUGH A METHOD SET, because it declares
+	// none: it is a discriminated result and every arm of it is a field a caller reads directly.
+	// The three sweeps above reflect over methods and assert their type has no exported field,
+	// which is right for a type whose storage is reachable only through accessors and would be a
+	// sweep over nothing here.
+	//
+	// The commit arm is handed to the STAGED COMMIT's own sweep rather than read field by field,
+	// which is what keeps this entry from being a second, narrower reading of that type: an
+	// accessor added to StagedCommit tomorrow joins by existing, on both routes.
+	"Processed": func(t *testing.T, at string, value reflect.Value) [][]byte {
+		t.Helper()
+		if value.IsNil() {
+			return nil
+		}
+		processed, isProcessed := value.Interface().(*Processed)
+		if !isProcessed {
+			t.Fatalf("%s: the sweep was handed a %s where a *Processed belongs", at, value.Type())
+		}
+		read := [][]byte{}
+		if processed.Application != nil {
+			read = append(read, processed.Application.AuthenticatedData, processed.Application.Plaintext)
+		}
+		if processed.Proposal != nil {
+			// the proposal arm carries no []byte field of its own at this level, so it is read as
+			// the octets it encodes to: a secret written into any arm of it lands in them
+			encoded, err := syntax.Marshal(processed.Proposal)
+			if err != nil {
+				t.Fatalf("%s: encode the proposal this result carries: %v", at, err)
+			}
+			read = append(read, encoded)
+		}
+		if processed.Commit != nil {
+			read = append(read, epochSecretBytesOfAStagedCommit(t, at, reflect.ValueOf(processed.Commit))...)
+		}
+		return read
+	},
+}
+
+// epochSecretBytesOfAStagedCommit is the staged commit's entry in the table above, written as a
+// declaration so that the Processed entry can reach the same reading. See that entry.
+func epochSecretBytesOfAStagedCommit(t *testing.T, at string, value reflect.Value) [][]byte {
+	t.Helper()
+	if value.IsNil() {
+		return nil
+	}
+	staged, isStaged := value.Interface().(*StagedCommit)
+	if !isStaged {
+		t.Fatalf("%s: the sweep was handed a %s where a *StagedCommit belongs", at, value.Type())
+	}
+	return exposedBytes(bytesTheStagedCommitHandsOut(t, at, staged))
 }
 
 // bytesTheAnswerHandsOut flattens everything one construction answered into the byte slices
@@ -3762,6 +3921,7 @@ const epochSecretMethodControl = "package control\n" +
 var epochSecretHolderTypes = map[string]reflect.Type{
 	"Group":        reflect.TypeOf((*Group)(nil)),
 	"KeySchedule":  reflect.TypeOf((*KeySchedule)(nil)),
+	"Processed":    reflect.TypeOf((*Processed)(nil)),
 	"StagedCommit": reflect.TypeOf((*StagedCommit)(nil)),
 }
 
@@ -10097,6 +10257,17 @@ var epochSecretMethodsTheSweepDrivesInstead = map[string]string{
 	"(*Group).CreateCommit": "builds the NEXT epoch's key schedule, so it reaches the parent secret " +
 		"through NewKeySchedule and answers a *CommitResult of octets derived from that epoch; " +
 		"bytesTheGroupHandsOut drives it and compares every one of them",
+	// p7 task 18's receive path, which reaches the parent secret the same way and from the other
+	// direction: a commit it processes builds the epoch that commit opens, through the same
+	// NewKeySchedule. What it answers is a *Processed, whose commit arm is a holder this file
+	// sweeps in its own right -- so the bytes a leak could travel in are read twice over, once
+	// through the reflection walk this row drives and once through the staged commit's own sweep.
+	"(*Group).ProcessMessage": "reaches the parent secret through the key schedule a received commit " +
+		"builds, and answers a *Processed whose arms are octets off the wire and a staged commit; " +
+		"bytesTheGroupHandsOut drives it over a real inbound message and compares every one of them",
+	"(*Group).Unprotect": "is (*Group).ProcessMessage with the application arm taken out of it, so it " +
+		"reaches the parent secret through the same call and answers the plaintext that call " +
+		"decrypted; bytesTheGroupHandsOut drives it over a real inbound message and compares it",
 }
 
 // bytesTheStagedCommitHandsOut is every byte slice reachable through *StagedCommit's own exported

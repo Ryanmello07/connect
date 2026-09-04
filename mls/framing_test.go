@@ -2891,6 +2891,25 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 		_, err := ratchetTypeOf(ContentType(codePoint))
 		return err
 	},
+	// p7 task 18's receive path, which discriminates on the same content type registry and is the
+	// place an octet that got past every decoder would decide which of section 6's three kinds of
+	// message this client acts on.
+	//
+	// THE GROUP IS THE ZERO VALUE WITH A GROUP CONTEXT AND NOTHING ELSE, and that is what makes
+	// this a row rather than a group founding per code point. The content type select stands behind
+	// ValSem002 and ValSem003, so the only state this refusal needs is a context the content agrees
+	// with -- an empty group id and epoch 0 on both sides -- and every arm that would read the
+	// tree, the proposal cache or the key schedule is one an undeclared code point never reaches.
+	"Group.processAuthenticatedLocked": func(codePoint uint64) error {
+		group := &Group{context: &GroupContext{}}
+		_, err := group.processAuthenticatedLocked(&AuthenticatedContent{
+			Content: FramedContent{
+				Sender:      Sender{SenderType: SenderTypeMember},
+				ContentType: ContentType(codePoint),
+			},
+		})
+		return err
+	},
 	// framing.go's section 6.3 header, which is the FIRST place a content type off the wire is
 	// seen. The encoder is handed nothing but the code point, because it refuses before it
 	// writes; the decoder is handed a whole header with two octets standing behind the content

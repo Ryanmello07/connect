@@ -1144,8 +1144,20 @@ func eraseFieldIsPublished(reading eraseSourceReading, typeName string, field st
 // material", and that is the price of the seed rather than a weakening of it. A row is a sentence
 // somebody had to write about a type that holds octets; before, such a type simply was not asked.
 var typesTheEraseClassReachesThatOweNoErase = map[string]string{
+	"ApplicationMessage": "the plaintext and the authenticated data of one decrypted application message, " +
+		"ANSWERED to the caller. It is Writer's row read the other way round: an erase here would blank the " +
+		"message the caller asked this package to open, and the caller that opened a secret through it owns " +
+		"what came back. The AAD travelled in the clear beside the ciphertext it bound. One production " +
+		"declaration holds one in a field -- Processed.Application -- and that type is an answer nothing " +
+		"retains either, excused directly below on the same terms",
 	"BodyBinding": "the additional authenticated data of a record: a group id and a sender handle, both " +
 		"of which travel in the clear beside the ciphertext they bind and are what the server routes on",
+	"Processed": "an ANSWER and not storage, like PathDecryptResult. (*Group).ProcessMessage builds one per " +
+		"message and hands it to the caller, and no production declaration holds one in a field, so there is " +
+		"no drop site here an erase could be reachable from. The one arm of it that carries key material is " +
+		"the staged epoch, which is a member of this class in its own right: (*Group).ApplyCommit MOVES that " +
+		"epoch into the group's own pending -- erasing what it drops as it goes -- and a caller that never " +
+		"applies the result owns it, exactly as PathDecryptResult's row says of the state it hands out",
 	"CachedProposal": "a proposal this member received and the reference it is keyed by. Both went to every " +
 		"member of the group and to the delivery service; ProposalCache.byRef is excused for the same reason",
 	"CommitResult": "the ENCODINGS a committer hands its caller to send -- the commit message, the welcome and " +

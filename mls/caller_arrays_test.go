@@ -1539,6 +1539,50 @@ func groupAnswerSecondLeaf(t *testing.T, group *Group) LeafIndex {
 	return at
 }
 
+// groupAnswerPeer adds a real second member to the group this gate follows and answers that
+// member's own group, so that the three INBOUND rows have a message their group would accept.
+//
+// A REAL PEER AND NOT A SPLICED LEAF, which is groupAnswerSecondLeaf's shape and cannot work here.
+// An inbound row is driven with a message sealed under the SENDER's ratchet, and only a member that
+// actually derived this epoch's encryption secret has one -- so a spliced leaf produces nothing the
+// receive path can open, and a row driven into that refusal answers nothing and observes nothing.
+//
+// The group is advanced by one epoch as a side effect, which every row is allowed to do:
+// MergePendingCommit's and ClearPendingCommit's rows commit too, and each row is given a group of
+// its own.
+func groupAnswerPeer(t *testing.T, group *Group) *Group {
+	t.Helper()
+	crypto := group.crypto
+	peer := testIdentity(t, crypto, "the peer this gate's inbound rows are driven with")
+	kp, initPriv, encPriv := testKeyPackage(t, crypto, peer)
+	encoded, err := syntax.Marshal(kp)
+	if err != nil {
+		t.Fatalf("marshal the key package this gate's peer joins with: %v", err)
+	}
+	if _, err := group.ProposeAdd(encoded); err != nil {
+		t.Fatalf("propose the add this gate's peer joins on: %v", err)
+	}
+	result, err := group.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("commit the add this gate's peer joins on: %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("merge the add this gate's peer joins on: %v", err)
+	}
+	cfg := testGroupConfig(t, crypto, peer, string(group.GroupId()))
+	joined, err := JoinFromWelcome(cfg, result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+		KeyPackage:     *kp,
+		InitPrivate:    initPriv,
+		EncryptPrivate: encPriv,
+		SignPrivate:    peer.SigPriv,
+	})
+	if err != nil {
+		t.Fatalf("join this gate's peer to the group it follows: %v", err)
+	}
+	t.Cleanup(func() { joined.Close() })
+	return joined
+}
+
 func groupAnswerRows(t *testing.T) []groupAnswerRow {
 	return []groupAnswerRow{
 		{name: "GroupId", call: func(group *Group) []any {
@@ -1639,6 +1683,51 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 			_, commitErr := group.CreateCommit(nil, nil, nil)
 			group.ClearPendingCommit()
 			return []any{&commitErr}
+		}},
+		// THE MESSAGE LIFECYCLE, p7 task 18's four exported methods.
+		//
+		// Protect answers a section 6.3 PrivateMessage, so it is read through the same projection
+		// the four generators are and for the same reason: no two seals of one plaintext are equal,
+		// and the one octet run two foundings over a group id agree on is the cleartext header.
+		//
+		// The three inbound rows are driven with a message from a REAL peer, because a group cannot
+		// open its own: SealPrivateMessage CONSUMES the generation it seals under, so a group handed
+		// back its own message finds the ratchet entry spent. See groupAnswerPeer.
+		{name: "Protect", call: func(group *Group) []any {
+			answer, err := group.Protect([]byte("the aad this gate reads"),
+				[]byte("the plaintext this gate reads"))
+			return []any{&answer, &err}
+		}, publishes: groupProposalHeader},
+		{name: "ProcessMessage", call: func(group *Group) []any {
+			peer := groupAnswerPeer(t, group)
+			message, protectErr := peer.Protect([]byte("the aad this gate reads"),
+				[]byte("the plaintext this gate reads"))
+			answer, err := group.ProcessMessage(message)
+			return []any{&answer, &err, &protectErr}
+		}},
+		{name: "Unprotect", call: func(group *Group) []any {
+			peer := groupAnswerPeer(t, group)
+			message, protectErr := peer.Protect([]byte("the aad this gate reads"),
+				[]byte("the plaintext this gate reads"))
+			answer, err := group.Unprotect(message)
+			return []any{&answer, &err, &protectErr}
+		}},
+		// ApplyCommit answers an error alone, which groupAnswerDeclaresStorage reads off its
+		// signature, and it is driven PAST a staged commit rather than into its refusal: a row that
+		// took the refusal would leave the group where it started and observe nothing about the
+		// state the merge installs.
+		{name: "ApplyCommit", call: func(group *Group) []any {
+			peer := groupAnswerPeer(t, group)
+			result, commitErr := peer.CreateCommit(nil, nil, nil)
+			if commitErr != nil {
+				t.Fatalf("commit the epoch this gate's ApplyCommit row applies: %v", commitErr)
+			}
+			processed, processErr := group.ProcessMessage(result.Commit)
+			if processErr != nil {
+				t.Fatalf("process the commit this gate's ApplyCommit row applies: %v", processErr)
+			}
+			err := group.ApplyCommit(processed)
+			return []any{&commitErr, &processErr, &err}
 		}},
 		// the ender gets a row like every other method, and every row gets a group of its own, so
 		// there is no member of the class this gate skipped for being inconvenient
