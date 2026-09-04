@@ -51,10 +51,20 @@
 //     over-reports rather than under-reports, so the residue is a verdict a declaration inherits
 //     from a namesake rather than an exit. Over-reporting fails loudly, which is the direction
 //     this file chooses everywhere it has to choose.
-//   - A second declaration of the door itself. A body handed a whole *MLSMessage by its caller
-//     that answers syntax.Marshal over it and names no message of its own IS MarshalMLSMessage,
-//     line for line, and no derivation separates the two. The forging in that shape happens in
-//     the CALLER, which is where this gate catches it or does not.
+//   - A second declaration of the door itself: a body handed a whole *MLSMessage by its caller
+//     that answers syntax.Marshal over it and names no message of its own. "No derivation
+//     separates the two" was written here and is measurably wrong, so what is true is written
+//     instead. Five production declarations of this package name the door type in a signature --
+//     (*MLSMessage).populatedArms, (*MLSMessage).MarshalMLS, (*MLSMessage).UnmarshalMLS,
+//     MarshalMLSMessage and ParseMLSMessage -- and not one of them is ALSO handed a carrier that
+//     is not the door type: the four that take the message in a position their caller fills take
+//     nothing beside it but a *syntax.Writer, a *syntax.Reader, or no parameter at all, and the
+//     fifth ANSWERS a message rather than being handed one. So "handed the message and some other
+//     carrier too" separates the codec from a forge exactly, over this source, and the shape this
+//     bullet is really about is the narrower one left over: a declaration handed the message and
+//     nothing else, which holds no state of its own to seal under and can do nothing to the
+//     octets that its caller has not already done. The forging in that shape happens in the
+//     CALLER, which is where this gate catches it or does not.
 //   - The two shapes constructionBypassSeamsIn records below: a seam answering a *PrivateMessage
 //     rather than an *MLSMessage or its octets, and one taking its forged tag as a bare []byte
 //     rather than as the structure that carries it.
@@ -394,10 +404,37 @@ type seamCandidate struct {
 	answersFrom map[string]bool
 	// the receiver type name as written, or the empty string for a free function.
 	receiver string
+	// a GROUP stands in a position its caller fills, read over the same closure and the same
+	// positions the authenticators are read over. It is what the proposal generator rule asks
+	// instead of naming the receiver: a free function handed a *Group and a method on a type
+	// holding one send exactly what a method on the group sends.
+	holdsTheGroup bool
 	// whether the go tool exports it, which is the surface a caller outside this package has.
 	exported bool
 	// every identifier its body names.
 	names map[string]bool
+	// the callees its body CALLS and whose answer it does not throw away: a call in a return,
+	// in an if's init or condition, in an assignment to something other than the blank
+	// identifier, or nested inside another call's arguments.
+	//
+	// It is the difference between running a door and mentioning one. `_ = ValidateProposalList`
+	// puts the name in names and nothing in here; so does calling it as a statement and
+	// dropping the error, which is the shape that certified a generator while validating
+	// nothing. A gate asking "did this reach its doors" has to read the answer being used,
+	// because the answer is the whole of what a door produces.
+	consumes map[string]bool
+	// the identifiers its body names in a VALUE position -- assigned, passed, or written into a
+	// composite literal -- as opposed to the ones it only compares against.
+	//
+	// This is what separates a sender from a demultiplexer, and it is the reading the proposal
+	// generator rule was missing. A body that writes ContentType: ContentTypeProposal has CHOSEN
+	// what the message is; a body with `case ContentTypeProposal:` or
+	// `if x.ContentType != ContentTypeProposal` has asked what somebody else chose, and every
+	// codec, every validator and every ratchet selector in this package asks that about all
+	// three. Reading the mention alone put the whole of the send path -- SealPrivateMessage down
+	// to marshalPrivateMessageContentWithPadding, whose switch names every content type -- into
+	// the set of declarations that emit a proposal.
+	chooses map[string]bool
 }
 
 // seamAuthenticatorCarriersIn answers the type names a caller can put its own authenticators
@@ -425,8 +462,21 @@ type seamCandidate struct {
 // authenticators, and a walk reading struct fields alone would read a seam over any of the three
 // as taking nothing.
 func seamAuthenticatorCarriersIn(parsed []parsedSource) map[string]bool {
+	return seamCarriersOf(parsed, seamForgedAuthenticators)
+}
+
+// seamCarriersOf is the closure above with the seed as an argument, so the two questions that
+// need one -- "what can a caller put its own authenticators inside" and "what can a caller hand
+// a group inside" -- are asked by one walk rather than by two that agree until the day one of
+// them is edited.
+//
+// The generator rule needs the same closure for the same reason this one does. Its position half
+// named the receiver, so a free function taking a *Group, and a method on a type holding one,
+// were outside a class stated over what a declaration DOES; that is the defect this file's own
+// header records having fixed for the seam rule and reintroduced in the rule next door.
+func seamCarriersOf(parsed []parsedSource, seed string) map[string]bool {
 	named := seamTypeFieldNamesIn(parsed)
-	carriers := map[string]bool{seamForgedAuthenticators: true}
+	carriers := map[string]bool{seed: true}
 	for grew := true; grew; {
 		grew = false
 		for name, names := range named {
@@ -443,6 +493,78 @@ func seamAuthenticatorCarriersIn(parsed []parsedSource) map[string]bool {
 		}
 	}
 	return carriers
+}
+
+// seamIdentifiersOnlyCompared answers the identifier nodes of one body that stand in a
+// comparison rather than in a value: the two sides of an == or a !=, and the expressions of a
+// case clause, which is a switch's own way of spelling the same comparison.
+//
+// The node set is the answer and not the names, because the same name can stand in both
+// positions in one body -- a validator that refuses a content type and then writes it into the
+// message it builds -- and a reading keyed on the name would lose one of the two.
+func seamIdentifiersOnlyCompared(body ast.Node) map[*ast.Ident]bool {
+	compared := map[*ast.Ident]bool{}
+	mark := func(node ast.Node) {
+		ast.Inspect(node, func(inner ast.Node) bool {
+			if identifier, isIdentifier := inner.(*ast.Ident); isIdentifier {
+				compared[identifier] = true
+			}
+			return true
+		})
+	}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.BinaryExpr:
+			if typed.Op == token.EQL || typed.Op == token.NEQ {
+				mark(typed.X)
+				mark(typed.Y)
+			}
+		case *ast.CaseClause:
+			for _, expr := range typed.List {
+				mark(expr)
+			}
+		}
+		return true
+	})
+	return compared
+}
+
+// seamDiscardedCalls answers the call expressions of one body whose answer goes nowhere: a call
+// standing alone as a statement, a call whose results are all assigned to the blank identifier,
+// and the call a go or a defer statement makes.
+//
+// A call in any other position hands its answer to something -- a return, a condition, a
+// variable, another call's argument list -- and that is what "ran the door" means. Both shapes
+// here were measured to certify a generator that validates nothing: ValidateProposalList(nil) as
+// a statement, and _ = ValidateProposalList(nil).
+func seamDiscardedCalls(body ast.Node) map[ast.Expr]bool {
+	discarded := map[ast.Expr]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.ExprStmt:
+			discarded[typed.X] = true
+		case *ast.GoStmt:
+			discarded[typed.Call] = true
+		case *ast.DeferStmt:
+			discarded[typed.Call] = true
+		case *ast.AssignStmt:
+			blank := true
+			for _, left := range typed.Lhs {
+				name, isBare := left.(*ast.Ident)
+				if !isBare || name.Name != "_" {
+					blank = false
+					break
+				}
+			}
+			if blank {
+				for _, right := range typed.Rhs {
+					discarded[right] = true
+				}
+			}
+		}
+		return true
+	})
+	return discarded
 }
 
 // seamTypeFieldNamesIn answers, per type the scan declares, the identifiers its FIELD TYPES name.
@@ -519,6 +641,10 @@ func seamTypeFieldNamesIn(parsed []parsedSource) map[string]map[string]bool {
 // mls.FramedContentAuthData is a type a forge over there is handed.
 func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 	carriers := seamAuthenticatorCarriersIn(parsed)
+	// the same closure over the type the proposal generator rule is stated about. The anchor is
+	// group_test.go's, checked against this package's own declarations there before anything is
+	// derived from it, so a rename that moved the type fails rather than quietly emptying a class.
+	groupCarriers := seamCarriersOf(parsed, proposalGenerationReceiver)
 	candidates := []seamCandidate{}
 	for _, source := range parsed {
 		for _, declaration := range source.file.Decls {
@@ -533,6 +659,8 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				exported:    function.Name.IsExported(),
 				names:       map[string]bool{},
 				answersFrom: map[string]bool{},
+				consumes:    map[string]bool{},
+				chooses:     map[string]bool{},
 			}
 			// every position the caller fills in, gathered before any of them is read, so the
 			// receiver and the parameters are answered by ONE walk rather than by two rules that
@@ -558,6 +686,9 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 					if identifier.Name == seamWireDoorType {
 						candidate.takesTheDoorType = true
 					}
+					if groupCarriers[identifier.Name] {
+						candidate.holdsTheGroup = true
+					}
 					return true
 				})
 			}
@@ -581,9 +712,26 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 					})
 				}
 			}
+			compared := seamIdentifiersOnlyCompared(function.Body)
+			discarded := seamDiscardedCalls(function.Body)
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				if identifier, isIdentifier := node.(*ast.Ident); isIdentifier {
 					candidate.names[identifier.Name] = true
+					if !compared[identifier] {
+						candidate.chooses[identifier.Name] = true
+					}
+				}
+				// and the callees whose answer this body USES, which is the reading that tells a
+				// door that was run from one that was named. The callee's own identifier is
+				// excluded from the chosen set above by nothing -- a call is a value position --
+				// so the two readings are kept apart here rather than conflated.
+				if call, isCall := node.(*ast.CallExpr); isCall && !discarded[call] {
+					switch callee := call.Fun.(type) {
+					case *ast.Ident:
+						candidate.consumes[callee.Name] = true
+					case *ast.SelectorExpr:
+						candidate.consumes[callee.Sel.Name] = true
+					}
 				}
 				// and the answered callees on their own, which is the door chain's edge. A
 				// declaration hands its answer to the frame it RETURNS, so that is where the

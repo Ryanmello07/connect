@@ -93,7 +93,21 @@ type TreeKEMPrivate struct {
 	LeafIndex      LeafIndex
 	EncryptionPriv HpkePrivateKey
 	PathSecrets    map[NodeIndex][]byte
+	// erased once Zeroize has run, so a state whose key material is gone REFUSES rather than
+	// answering out of it. (*SecretTree).Zeroize carries the same flag for the same reason and
+	// its comment states it: without the flag the leaf arm below answers a zero length private
+	// key with a nil error, and every caller downstream reports a decryption failure against a
+	// message that is perfectly well formed.
+	erased bool
 }
+
+// errTreeKEMPrivateErased is what an erased private state answers instead of key material.
+//
+// It is declared beside the type rather than in tree_errors.go with the exported ones because
+// no caller outside this package can reach the erase: (*StagedCommit).Zeroize and
+// (*Group).Close are the two paths that run it, and both drop the state in the same statement
+// list.
+var errTreeKEMPrivateErased = errors.New("mls: this member's private tree state has been erased")
 
 // NewTreeKEMPrivate is the state of a member that holds its leaf key and no path secret yet,
 // which is what a joiner has before it has processed a commit.
@@ -120,7 +134,45 @@ func (self *TreeKEMPrivate) Clone() *TreeKEMPrivate {
 	for x, secret := range self.PathSecrets {
 		out.PathSecrets[x] = cloneBytes(secret)
 	}
+	// the erase travels with the copy, because a clone of an erased state holds a clone of
+	// erased storage: without this line the copy answers zero length keys with a nil error,
+	// which is the one outcome the flag exists to prevent.
+	out.erased = self.erased
 	return out
+}
+
+// Zeroize erases the private key material this state holds: the leaf's own HPKE private key and
+// every path secret it has derived, in place, and then refuses.
+//
+// THIS TYPE IS KEY MATERIAL STORAGE AND ITS ERASE IS ITS OWN, which is the discipline
+// (*KeySchedule).Zeroize and (*SecretTree).Zeroize are written under and the one a StagedCommit
+// could not take until this existed: the committer draws a fresh leaf private key for the epoch
+// its commit opens, and a commit the delivery service never accepted is dropped with that key
+// still in it.
+//
+// The path secrets are DELETED as well as erased. The map is the only thing that says which
+// nodes this member can derive a key for, so leaving zeroed entries in it would leave a state
+// that reports it holds a key for every node of its direct path and answers zeros for each --
+// which the refusal above catches, but only for a caller that reaches this type's own doors.
+//
+// The noinline directive is secret_zeroize.go's reason and this package's erase class rule: the
+// stores this method makes are dead in the compiler's reading, and every erase of the class
+// carries the directive rather than reasoning its way out of it.
+//
+//go:noinline
+func (self *TreeKEMPrivate) Zeroize() {
+	// nil accepted rather than guarded against at the call site, for zeroizeSecret's reason: a
+	// group that never drew a private state and a staged commit that carries none are both
+	// ordinary, and a guard needed at every drop site is one that will be missing at one of them.
+	if self == nil {
+		return
+	}
+	zeroizeSecret(self.EncryptionPriv)
+	for x, secret := range self.PathSecrets {
+		zeroizeSecret(secret)
+		delete(self.PathSecrets, x)
+	}
+	self.erased = true
 }
 
 // NodePrivateKey answers the HPKE private key for a node if this member can derive one: its own
@@ -150,6 +202,12 @@ func (self *TreeKEMPrivate) Clone() *TreeKEMPrivate {
 func (self *TreeKEMPrivate) NodePrivateKey(crypto CryptoProvider, x NodeIndex) (HpkePrivateKey, bool, error) {
 	if crypto == nil {
 		return nil, false, ErrNilCryptoProvider
+	}
+	// refused rather than answered out of erased storage, which is (*SecretTree).Zeroize's rule:
+	// erasing and refusing are one operation, because the alternative here is a zero length leaf
+	// private key handed back with a nil error and held by every caller as a key.
+	if self.erased {
+		return nil, false, errTreeKEMPrivateErased
 	}
 	if x == self.LeafIndex.NodeIndex() {
 		return cloneBytes(self.EncryptionPriv), true, nil
@@ -237,6 +295,30 @@ type UpdatePathPlan struct {
 	LeafNode     *LeafNode
 	CommitSecret []byte
 	Private      *TreeKEMPrivate
+}
+
+// Zeroize erases the secret half of the plan: every path secret on the ladder and the commit
+// secret past the root.
+//
+// PRIVATE IS DELIBERATELY NOT ERASED HERE, and that is the one thing worth reading this method
+// for. The private state a plan carries is the leaf state a MERGE INSTALLS as the group's own --
+// (*Group).MergePendingCommit assigns it to self.ownPriv -- so a plan that erased it would erase
+// the key the epoch it opened runs on, on the ordinary path. The holder that DROPS the plan
+// erases it instead: (*StagedCommit).Zeroize hands ownPriv, which is the same pointer, to
+// (*TreeKEMPrivate).Zeroize, and a merge erases the leaf state it replaced rather than the one
+// it installed.
+//
+// The noinline directive is the erase class's rule; see (*TreeKEMPrivate).Zeroize.
+//
+//go:noinline
+func (self *UpdatePathPlan) Zeroize() {
+	if self == nil {
+		return
+	}
+	for _, secret := range self.PathSecrets {
+		zeroizeSecret(secret)
+	}
+	zeroizeSecret(self.CommitSecret)
 }
 
 // CreateUpdatePathSecrets is the secret and public half of RFC 9420 section 7.5's UpdatePath

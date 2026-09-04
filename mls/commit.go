@@ -143,6 +143,42 @@ type StagedCommit struct {
 	restoreKind restoreKind
 }
 
+// Zeroize erases the key material of the epoch this commit stages, which is a WHOLE second
+// epoch and not a fragment of one: its key schedule holds the init secret, the confirmation
+// key, the encryption secret, the epoch authenticator, the exporter and the resumption PSK, its
+// secret tree holds every message key derived from that encryption secret, and its private tree
+// state holds the leaf key the committer drew for it.
+//
+// IT IS CALLED WHEN THE STAGED EPOCH IS DROPPED, which is the ordinary path and not an edge
+// case. MASTER section 9.3's lost-commit race is what (*Group).ClearPendingCommit exists for:
+// the delivery service accepts at most one commit per (group, epoch), so a client whose commit
+// lost the race drops a fully derived epoch nobody ever entered. (*Group).Close drops one too,
+// for a group closed with a commit still in flight.
+//
+// THE PLAN'S PRIVATE HALF IS ERASED THROUGH ownPriv AND NOT THROUGH plan, because the two are
+// the same pointer when the commit carries an update path: (*UpdatePathPlan).Zeroize erases the
+// ladder and the commit secret and leaves Private to the holder, and its own comment says why.
+//
+// The noinline directive is the erase class's rule; see (*TreeKEMPrivate).Zeroize.
+//
+//go:noinline
+func (self *StagedCommit) Zeroize() {
+	// nil accepted, for zeroizeSecret's reason: "erase the staged epoch if there is one" is the
+	// shape of every drop site, and a guard written at each of them is one that will be missing
+	// at the next one somebody adds.
+	if self == nil {
+		return
+	}
+	if self.schedule != nil {
+		self.schedule.Zeroize()
+	}
+	if self.secretTree != nil {
+		self.secretTree.Zeroize()
+	}
+	self.ownPriv.Zeroize()
+	self.plan.Zeroize()
+}
+
 // Epoch is the epoch this commit opens.
 func (self *StagedCommit) Epoch() uint64 { return self.epoch }
 

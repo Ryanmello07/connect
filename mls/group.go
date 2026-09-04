@@ -699,8 +699,23 @@ func (self *Group) Close() error {
 	if self.secretTree != nil {
 		self.secretTree.Zeroize()
 	}
+	// THE STAGED EPOCH IS ERASED TOO, and it was not until this line existed. A close that
+	// dropped self.pending left a complete second epoch in the heap -- its own key schedule, its
+	// own secret tree, and the leaf private key this client drew for the epoch its commit would
+	// have opened -- held by nothing that erases it, which is exactly the discipline
+	// StagedCommit's own comment invokes and was not taking.
+	self.pending.Zeroize()
+	// and this epoch's own leaf private state and signing key, which are storage this group
+	// DECLARES rather than storage it points at. Both are copies this group made -- NewGroup
+	// clones the caller's signing key and draws the leaf key itself -- so the erase reaches
+	// nothing the caller is still holding.
+	self.ownPriv.Zeroize()
+	zeroizeSecret(self.signer)
 	self.schedule = nil
 	self.secretTree = nil
+	self.pending = nil
+	self.ownPriv = nil
+	self.signer = nil
 	return nil
 }
 
@@ -1346,6 +1361,24 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 	// context, so what matters is that the two sides build the same one.
 	commitSecret := ZeroSecret(self.crypto)
 	var plan *UpdatePathPlan
+	// EVERY REFUSAL BELOW DROPS THE PLAN, and the plan is key material: this epoch's commit
+	// secret, every path secret on the ladder, and the leaf private key this commit drew. There
+	// are a dozen returns between the plan's construction and the staging that takes ownership of
+	// it -- a seal that fails, a door that refuses, a GroupInfo this client cannot sign -- so the
+	// erase is written once here rather than a dozen times, and the flag is what keeps it off the
+	// one path where a StagedCommit took the plan and owes it an erase of its own.
+	//
+	// Private is erased HERE and not by (*UpdatePathPlan).Zeroize, for the reason that method's
+	// own comment gives: on the path where the plan is handed on, its private half is the leaf
+	// state the merge installs.
+	handedOn := false
+	defer func() {
+		if handedOn || plan == nil {
+			return
+		}
+		plan.Zeroize()
+		plan.Private.Zeroize()
+	}()
 	hasPath := CommitPathRequired(list) || opts.Force
 	// the tree a RECEIVER judges this commit against, kept apart from the one the epoch ends up
 	// with. Section 12.4.2 applies the proposals, validates the path against THAT tree, and
@@ -1563,9 +1596,18 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 	// a commit with no path leaves this client's own leaf key where it was, so the private state
 	// carries forward; a commit with one replaces it, and the plan's private half is that
 	// replacement.
+	//
+	// THE CARRIED-FORWARD STATE IS CLONED AND NOT SHARED, which it was not before the staged
+	// epoch was given an erase. A staged commit is erased when it is dropped -- ClearPendingCommit
+	// on MASTER section 9.3's lost-commit race, and Close -- so a staged commit holding this
+	// group's own live leaf private state would erase, on that ordinary path, the key the epoch
+	// this group is still in opens its update paths with. It is the reason (*TreeKEMPrivate).Clone
+	// exists at all, stated one caller further out.
 	ownPriv := self.ownPriv
 	if plan != nil && plan.Private != nil {
 		ownPriv = plan.Private
+	} else if ownPriv != nil {
+		ownPriv = ownPriv.Clone()
 	}
 	staged := &StagedCommit{
 		committer:   self.ownLeaf,
@@ -1589,6 +1631,7 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 		restoreKind: restoreFromJoiner,
 	}
 	self.pending = staged
+	handedOn = true
 
 	// AND THE WELCOME FOR THE MEMBERS THIS COMMIT ADDS IS TASK 15'S, so a commit covering an Add
 	// answers none today. That is a HOLE and not a design: the added member has a leaf in the tree
@@ -1610,6 +1653,10 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 func (self *Group) ClearPendingCommit() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// erased BEFORE it is dropped, and this is the ordinary path rather than a cleanup one: the
+	// epoch being discarded is fully derived -- key schedule, secret tree and the leaf key drawn
+	// for it -- and after the assignment below nothing in this process can reach it to erase it.
+	self.pending.Zeroize()
 	self.pending = nil
 }
 
@@ -1628,6 +1675,20 @@ func (self *Group) MergePendingCommit() error {
 		return ErrNoPendingCommit
 	}
 	staged := self.pending
+	// THE EPOCH THIS MERGE CLOSES IS ERASED AS IT IS DROPPED. There is no past-epoch window in
+	// this build -- task 19 adds one -- so the schedule, the secret tree and the leaf private
+	// state this group holds at this instant become unreachable the moment the assignments below
+	// land, and unreachable is not erased. What makes erasing them safe is that none of the three
+	// is the value being installed: CreateCommit derives a fresh schedule and a fresh secret tree
+	// for the staged epoch, and its leaf private state is either the update path plan's or a
+	// CLONE of this one.
+	if self.schedule != nil {
+		self.schedule.Zeroize()
+	}
+	if self.secretTree != nil {
+		self.secretTree.Zeroize()
+	}
+	self.ownPriv.Zeroize()
 	// the rebind runs BEFORE nothing and AFTER the write, which is the order the boundary is
 	// stated in: the cache takes its epoch from the context the group has moved to, and a rebind
 	// written ahead of the move would hand it the epoch that is closing.
@@ -1639,10 +1700,21 @@ func (self *Group) MergePendingCommit() error {
 	self.ownPriv = staged.ownPriv
 	self.transcript = staged.transcript
 	self.restoreKind = staged.restoreKind
+	// the update path plan is the one piece of key material in the staged commit that no field of
+	// this group receives, and it holds the commit secret and every path secret the update path
+	// was built from. Its private half is NOT erased here and must not be: it is the leaf state
+	// installed six statements above, and (*UpdatePathPlan).Zeroize leaves it alone for that
+	// reason.
+	staged.plan.Zeroize()
+	// AND THE STAGED COMMIT IS RELEASED BEFORE THE REBIND RATHER THAN AFTER IT. Every field of it
+	// that holds key material now stands in this group's own storage, so a rebind that refused
+	// while self.pending still pointed at it would leave a group whose staged commit and whose
+	// live epoch are one epoch -- and the next ClearPendingCommit, which is a caller's ordinary
+	// response to a refusal, would erase the epoch this group is running on.
+	self.pending = nil
 	if err := self.proposals.Rebind(staged.verified); err != nil {
 		return err
 	}
-	self.pending = nil
 	return nil
 }
 

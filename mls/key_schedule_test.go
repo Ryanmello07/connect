@@ -8934,13 +8934,28 @@ func theByteSlicesErasedBy(parsed parsedSource, function *ast.FuncDecl, helpers 
 	return slices.Compact(erased)
 }
 
-// declarationByName is the parsed declaration of one function or method, with the file it was
+// methodByName is the parsed declaration of one METHOD of one named type, with the file it was
 // read out of, so a scan can render its expressions in the right token.FileSet.
-func declarationByName(files []parsedSource, name string) (parsedSource, *ast.FuncDecl) {
+//
+// THE RECEIVER IS PART OF THE LOOKUP, and the bare-name version this replaces was doing real
+// work by accident: while (*KeySchedule).Zeroize was the only Zeroize in this package, "the
+// declaration named Zeroize" and "the key schedule's erase" were the same thing. They stopped
+// being the same the moment a second type declared an erase -- (*StagedCommit).Zeroize sorts
+// ahead of it by file name -- and what the gate below then read was another type's body,
+// reported as the key schedule erasing none of its own secrets. A reading keyed on a name a
+// second declaration can carry is the same defect as a gate that names a position, and the
+// repair is the same: ask for the receiver.
+func methodByName(files []parsedSource, receiver string, name string) (parsedSource, *ast.FuncDecl) {
 	for _, parsed := range files {
 		for _, declaration := range parsed.file.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
-			if isFunction && function.Name.Name == name {
+			if !isFunction || function.Name.Name != name {
+				continue
+			}
+			if function.Recv == nil || len(function.Recv.List) != 1 {
+				continue
+			}
+			if receiverTypeName(function.Recv.List[0].Type) == receiver {
 				return parsed, function
 			}
 		}
@@ -8982,9 +8997,9 @@ func TestZeroizeErasesEveryByteSliceThisTypeDeclares(t *testing.T) {
 		t.Fatalf("the byte slice walk read %v out of the control, want %v; it is not reading the type's own fields or not following the struct it holds",
 			controlHeld, want)
 	}
-	_, controlZeroize := declarationByName([]parsedSource{control}, "Zeroize")
+	_, controlZeroize := methodByName([]parsedSource{control}, "Holder", "Zeroize")
 	if controlZeroize == nil {
-		t.Fatal("the control declares no Zeroize, so the erase reading below is over nothing")
+		t.Fatal("the control declares no (*Holder).Zeroize, so the erase reading below is over nothing")
 	}
 	controlErased := theByteSlicesErasedBy(control, controlZeroize, []string{"wipe"})
 	if want := []string{"erased", "nested"}; !slices.Equal(controlErased, want) {
@@ -9021,9 +9036,14 @@ func TestZeroizeErasesEveryByteSliceThisTypeDeclares(t *testing.T) {
 			len(held), holders[0], reflect.TypeOf(EpochSecrets{}).NumField())
 	}
 
-	parsed, zeroize := declarationByName(files, "Zeroize")
+	// the erase OF THE TYPE THAT DECLARES THE STORAGE, and not whichever declaration named
+	// Zeroize a directory walk reached first. This package now declares four of them -- the key
+	// schedule, the secret tree, the private tree state and the staged commit -- and the bare
+	// name answers the wrong one.
+	parsed, zeroize := methodByName(files, holders[0], "Zeroize")
 	if zeroize == nil {
-		t.Fatal("this package declares no Zeroize, and an epoch that leaves PastEpochWindow has to have one")
+		t.Fatalf("%s declares no Zeroize, and an epoch that leaves PastEpochWindow has to have one",
+			holders[0])
 	}
 	erased := theByteSlicesErasedBy(parsed, zeroize, helpers)
 	t.Logf("%s reaches %d byte slices %v; Zeroize erases %v through %v", holders[0], len(held), held, erased, helpers)

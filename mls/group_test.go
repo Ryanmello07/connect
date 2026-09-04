@@ -1525,11 +1525,24 @@ func TestNoGeneratorOnThisGroupEmitsAProposalItsOwnDoorsRefuse(t *testing.T) {
 const (
 	proposalGenerationDoor        = "ValidateProposalList"
 	proposalGenerationContentType = "ContentTypeProposal"
-	proposalGenerationReceiver    = "Group"
+	// the SEED of the position half and not the position itself. A declaration is in the class
+	// when a group stands in a position its caller fills, over the closure seamCarriersOf
+	// derives, so a free function taking a *Group and a method on a type holding one are inside
+	// it. Reading this name as the receiver is what left both outside.
+	proposalGenerationReceiver = "Group"
 )
 
-// declarationsNamingThrough answers which declarations of the scan name target, directly or
-// through another declaration of the scan that does.
+// declarationsReaching answers which declarations of the scan reach target, directly by the
+// reading `direct` gives and otherwise through another declaration of the scan that does, along
+// the edges `edges` gives.
+//
+// TWO QUESTIONS ARE ASKED THROUGH IT AND THEY READ DIFFERENT EDGES, which is the whole reason
+// the reading is an argument. "Did this declaration CHOOSE the proposal content type" is a
+// question about identifiers in value positions, and its edges are every name a body carries,
+// because a generator that delegates its framing to a helper has still chosen what it sends.
+// "Did this declaration RUN its doors" is a question about a call whose answer is used, and its
+// edges are the calls whose answers are used, because a body that merely names a validator has
+// not validated and neither has one that calls it and drops the error.
 //
 // THE EDGE CONDITION IS THE OPPOSITE OF seamsReachingTheWireDoor'S, and the asymmetry is the whole
 // design rather than an inconsistency between two walks. That one asks whether a forge REACHES the
@@ -1542,7 +1555,9 @@ const (
 // So an edge is followed only when EVERY declaration carrying the name reaches the target. That
 // under-reports, and under-reporting here is a generator wrongly said not to have called its doors
 // -- a failing test rather than a silent pass, which is the direction an obligation has to fail in.
-func declarationsNamingThrough(candidates []seamCandidate, target string) map[string]bool {
+func declarationsReaching(candidates []seamCandidate, target string,
+	direct func(seamCandidate) bool, edges func(seamCandidate) map[string]bool) map[string]bool {
+
 	byBareName := map[string][]int{}
 	for index, candidate := range candidates {
 		byBareName[candidate.bare] = append(byBareName[candidate.bare], index)
@@ -1554,12 +1569,12 @@ func declarationsNamingThrough(candidates []seamCandidate, target string) map[st
 			if reaches[candidate.name] {
 				continue
 			}
-			if candidate.names[target] {
+			if direct(candidate) {
 				reaches[candidate.name] = true
 				grew = true
 				continue
 			}
-			for named := range candidate.names {
+			for named := range edges(candidate) {
 				held := byBareName[named]
 				if len(held) == 0 {
 					continue
@@ -1588,10 +1603,20 @@ func declarationsNamingThrough(candidates []seamCandidate, target string) map[st
 func proposalGeneratorsIn(parsed []parsedSource) (generators []seamCandidate, missing []seamCandidate) {
 	candidates := seamCandidatesIn(parsed)
 	reachesTheWire := seamsReachingTheWireDoor(candidates, seamWireDoorsIn(candidates))
-	emitsAProposal := declarationsNamingThrough(candidates, proposalGenerationContentType)
-	runsTheDoor := declarationsNamingThrough(candidates, proposalGenerationDoor)
+	// what a declaration CHOOSES to send, over every name its body carries. A generator that
+	// delegates the framing to a helper has still chosen the content type, so the edges here are
+	// names; what is read at the end of them is the value position rather than the mention.
+	emitsAProposal := declarationsReaching(candidates, proposalGenerationContentType,
+		func(candidate seamCandidate) bool { return candidate.chooses[proposalGenerationContentType] },
+		func(candidate seamCandidate) map[string]bool { return candidate.names })
+	// and whether it RAN its door, over the calls whose answer it uses. Both halves of that are
+	// measured: a body naming the door certifies nothing, and neither does one calling it and
+	// dropping the answer.
+	runsTheDoor := declarationsReaching(candidates, proposalGenerationDoor,
+		func(candidate seamCandidate) bool { return candidate.consumes[proposalGenerationDoor] },
+		func(candidate seamCandidate) map[string]bool { return candidate.consumes })
 	for _, candidate := range candidates {
-		if candidate.receiver != proposalGenerationReceiver || !candidate.exported {
+		if !candidate.holdsTheGroup || !candidate.exported {
 			continue
 		}
 		if !reachesTheWire[candidate.name] || !emitsAProposal[candidate.name] {
@@ -1611,19 +1636,25 @@ func proposalGeneratorsIn(parsed []parsedSource) (generators []seamCandidate, mi
 // A package holding one of each shape the class must separate, so a conjunct that stopped doing
 // work fails here rather than being carried by the other one.
 //
-// The POSITIVE reaches its door only through a helper whose bare name a SECOND declaration also
-// carries. It is in the class -- it emits a proposal and puts it on the wire -- and it must be
-// REPORTED, because nothing in the scan says which of the two declarations spelled judges it
-// actually calls: one runs the door and one runs nothing, so certifying it off the first is
-// certifying it off a coin toss.
+// FIVE POSITIVES, and every one of them has to be REPORTED. One reaches its door only through a
+// helper whose bare name a SECOND declaration also carries, because nothing in the scan says
+// which of the two it calls: one runs the door and one runs nothing, so certifying it off the
+// first is certifying it off a coin toss. Two more are the door reading itself -- one MENTIONS
+// ValidateProposalList and never calls it, one CALLS it and throws the refusal away -- and both
+// were measured to certify a generator that validates nothing. The last two are the position:
+// a free function handed the group, and a method on a type that holds one. Neither has a
+// receiver spelled Group and both send what a method on the group sends.
 //
-// The two NEGATIVES are each half of the class with the other half missing, and both are shapes
-// this package either has or is about to have. One reaches the same wire door carrying a COMMIT,
-// which is what says the class is read off what a message CARRIES -- the commit path runs
-// validate_commit.go's own rules and calls ValidateProposalList nowhere, so a class read off the
-// wire door alone reports this package's own committer as a generator that skipped its doors. The
-// other names the proposal content type while sending nothing, which is every accessor that reads
-// one, and is what says the class is read off what reaches the WIRE.
+// FOUR NEGATIVES, each a conjunct of the class asked on its own. One reaches the same wire door
+// carrying a COMMIT, which is what says the class is read off what a message CARRIES -- the
+// commit path runs validate_commit.go's own rules and calls ValidateProposalList nowhere, so a
+// class read off the wire door alone reports this package's own committer as a generator that
+// skipped its doors. One names the proposal content type while sending nothing, which is every
+// accessor that reads one, and is what says the class is read off what reaches the WIRE. One
+// SENDS AN APPLICATION MESSAGE through the demultiplexer every sender in this package goes
+// through, which is the shape the rule was measured to fire on while the reading was a mention.
+// And one frames a proposal, reaches the wire and is handed no group at all, which is what keeps
+// the derived position from being no position.
 const proposalGeneratorControl = `package control
 
 func (self *Group) ProposeThroughAnAmbiguouslyNamedHelper() ([]byte, error) {
@@ -1656,6 +1687,74 @@ func (self *Group) CommitSomething() ([]byte, error) {
 func (self *Group) PendingProposalKinds() []ContentType {
 	return []ContentType{ContentTypeProposal}
 }
+
+// an APPLICATION sender, which is the shape this rule was measured to FIRE ON. It reaches the
+// wire through the same demultiplexer every real generator reaches it through, and what it puts
+// there is not a proposal.
+func (self *Group) SendReviewApplication(data []byte) ([]byte, error) {
+	content := &FramedContent{ContentType: ContentTypeApplication, ApplicationData: data}
+	return sealsWhicheverArmIsPopulated(content)
+}
+
+// the demultiplexer both of them go through: every content type NAMED, none of them CHOSEN.
+// marshalPrivateMessageContentWithPadding is this shape in production, and reading its mentions
+// is what put every application sender into a rule about proposals.
+func sealsWhicheverArmIsPopulated(content *FramedContent) ([]byte, error) {
+	switch content.ContentType {
+	case ContentTypeApplication:
+		_ = content.ApplicationData
+	case ContentTypeProposal:
+		_ = content.Proposal
+	case ContentTypeCommit:
+		_ = content.Commit
+	}
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+// a generator that MENTIONS the door and never runs it.
+func (self *Group) ProposeAndMentionsTheDoor() ([]byte, error) {
+	_ = ValidateProposalList
+	content := &FramedContent{ContentType: ContentTypeProposal}
+	_ = content
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+// and one that RUNS it and throws the answer away, which is the same certificate with a call
+// expression in it: the door answers a refusal and this body is not looking at it.
+func (self *Group) ProposeAndDiscardsTheDoorsAnswer() ([]byte, error) {
+	content := &FramedContent{ContentType: ContentTypeProposal}
+	_ = content
+	ValidateProposalList(nil)
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+// a free function handed the group, and a method on a type that HOLDS one. Both send exactly
+// what a method on *Group sends, and a rule that named the position had neither.
+func ProposeOverAGroupItWasHanded(group *Group) ([]byte, error) {
+	_ = group
+	content := &FramedContent{ContentType: ContentTypeProposal}
+	_ = content
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+type reviewProposalSender struct {
+	group *Group
+}
+
+func (self *reviewProposalSender) ProposeThroughAHolderOfTheGroup() ([]byte, error) {
+	content := &FramedContent{ContentType: ContentTypeProposal}
+	_ = content
+	return MarshalMLSMessage(&MLSMessage{})
+}
+
+// and the other side of that position: nothing hands this one a group, so no epoch's keys are
+// reachable from it and it seals nothing any peer would accept. It frames a proposal and reaches
+// the wire door, which is every other conjunct of the class.
+func ProposeWithNoGroupAnywhere() ([]byte, error) {
+	content := &FramedContent{ContentType: ContentTypeProposal}
+	_ = content
+	return MarshalMLSMessage(&MLSMessage{})
+}
 `
 
 // TestTheProposalGeneratorObligationReadsItsControl runs the rule on a package known to hold
@@ -1670,9 +1769,11 @@ func (self *Group) PendingProposalKinds() []ContentType {
 // namesake it never calls. That is not a rare shape here: MarshalMLS alone is carried by
 // fifty-two declarations of this scan, so a helper renamed to collide with any of them is free.
 //
-// The two NEGATIVES are each conjunct of the class asked on its own. Both were measured to be
-// necessary the only way that means anything: with either conjunct removed, one of them enters the
-// class and is reported as a generator that never called its doors.
+// The NEGATIVES are each conjunct of the class asked on its own, and each was measured to be
+// necessary the only way that means anything: with its conjunct removed, one of them enters the
+// class and is reported as a generator that never called its doors. The application sender is the
+// one that was not hypothetical -- the rule as written reported it, in the real scan, as a method
+// that puts a proposal on the wire.
 func TestTheProposalGeneratorObligationReadsItsControl(t *testing.T) {
 	control := []parsedSource{
 		mustParseText(t, "proposal_generator_control.go", proposalGeneratorControl)}
@@ -1686,20 +1787,38 @@ func TestTheProposalGeneratorObligationReadsItsControl(t *testing.T) {
 		t.Fatalf("the control declares %d declaration(s) named judges; this edge is ambiguous only while two carry the name, so the control has stopped holding the shape it is here for",
 			helpers)
 	}
-	generator := "Group.ProposeThroughAnAmbiguouslyNamedHelper"
 	generators, missing := proposalGeneratorsIn(control)
-	if !slices.Contains(seamNamesOf(generators), generator) {
-		t.Fatalf("the class read %v out of the control and not %s, which frames a proposal and answers %s; the control is not a positive and the assertion below would pass on an empty class",
-			seamNamesOf(generators), generator, seamWireDoor)
+	// every shape the class must REPORT, with what each of them is here to hold. Each is in the
+	// class -- it is handed a group, it frames a proposal and it answers the wire door -- and
+	// none of them has run its doors, so every one of them has to appear in both answers.
+	inside := map[string]string{
+		"Group.ProposeThroughAnAmbiguouslyNamedHelper":         "its only route to the door is a helper two declarations spell the same way, one of which runs nothing; a walk that followed that edge would certify off a coin toss",
+		"Group.ProposeAndMentionsTheDoor":                      "it names the door and never calls it, which is what a name-reachability reading certifies",
+		"Group.ProposeAndDiscardsTheDoorsAnswer":               "it calls the door and drops the refusal, which is the same certificate with a call expression in it",
+		"ProposeOverAGroupItWasHanded":                         "the group stands in a parameter rather than the receiver, which is a position a rule reading the receiver has no name for",
+		"reviewProposalSender.ProposeThroughAHolderOfTheGroup": "the group is held by the receiver's own type, which is the other half of that same position",
 	}
-	if !slices.Contains(seamNamesOf(missing), generator) {
-		t.Errorf("%s is certified as reaching %s, and the only route it has is a helper two declarations spell the same way -- one of which runs nothing; the walk is following an ambiguous edge, and an obligation that over-reports certifies the generator it was written to catch",
-			generator, proposalGenerationDoor)
+	for _, generator := range slices.Sorted(maps.Keys(inside)) {
+		if !slices.Contains(seamNamesOf(generators), generator) {
+			t.Errorf("the class read %v and %s is not in it -- %s. It frames a proposal and answers %s, so a class that leaves it out is not stated over what a generator DOES",
+				seamNamesOf(generators), generator, inside[generator], seamWireDoor)
+			continue
+		}
+		if !slices.Contains(seamNamesOf(missing), generator) {
+			t.Errorf("%s is certified as reaching %s, and %s; an obligation that over-reports certifies the generator it was written to catch",
+				generator, proposalGenerationDoor, inside[generator])
+		}
 	}
-	for _, outside := range []string{"Group.CommitSomething", "Group.PendingProposalKinds"} {
-		if slices.Contains(seamNamesOf(generators), outside) {
-			t.Errorf("%s is read as a proposal generator, and it is half of one: the class read %v. One conjunct of it has stopped doing work, and the obligation is now stated over a method that sends no proposal -- section 12.2's rules asked of a committer, or of an accessor that sends nothing at all",
-				outside, seamNamesOf(generators))
+	outside := map[string]string{
+		"Group.CommitSomething":       "it reaches the same wire door carrying a commit, and section 12.2's proposal rules are not stated over a committer",
+		"Group.PendingProposalKinds":  "it names the proposal content type and sends nothing, which is every accessor that reads one",
+		"Group.SendReviewApplication": "it sends an APPLICATION message through the demultiplexer every sender goes through, and a rule that read that demultiplexer's mentions reported it as putting a proposal on the wire -- a gate firing on correct code, which is how gates get switched off",
+		"ProposeWithNoGroupAnywhere":  "nothing hands it a group, so no epoch's keys are reachable from it and there is no group whose doors it could have skipped",
+	}
+	for _, name := range slices.Sorted(maps.Keys(outside)) {
+		if slices.Contains(seamNamesOf(generators), name) {
+			t.Errorf("%s is read as a proposal generator and %s; the class read %v, so a conjunct of it has stopped doing work",
+				name, outside[name], seamNamesOf(generators))
 		}
 	}
 }
@@ -1715,20 +1834,35 @@ func TestTheProposalGeneratorObligationReadsItsControl(t *testing.T) {
 // proposal this package's own doors refuse. Its four failures were roster lines; not one of them
 // mentions a validation door.
 //
-// SO THE CLASS IS DERIVED FROM WHAT A GENERATOR DOES, in two conjuncts and neither alone:
+// SO THE CLASS IS DERIVED FROM WHAT A GENERATOR DOES, in three conjuncts and no one of them
+// alone:
 //
+//   - a GROUP stands in a position its caller fills, over seamCarriersOf's closure and not over
+//     the receiver. This half was written as candidate.receiver == "Group", which is the very
+//     defect the same commit had just fixed for the seam gate one file over: a free function
+//     taking a *Group, and a method on a type holding one, seal under this epoch's real keys and
+//     put exactly what a method on the group puts on the wire, and both were outside a class
+//     stated over what a generator DOES;
 //   - it puts a message on the WIRE, read through the seam gate's own derived doors, so a
 //     generator that answers octets under any spelling is inside this by existing. Reading the
-//     receiver and the name alone would put every accessor of *Group in the class;
-//   - and what it puts there is a PROPOSAL, read as the content type a receiver will demultiplex
-//     on. That is the field a generator cannot omit -- a message carrying any other content type
-//     is not a proposal to any peer -- and it is what keeps a commit path, which reaches the same
-//     wire door, out of an obligation stated over section 12.2's proposal rules.
+//     position alone would put every accessor of a group in the class;
+//   - and what it puts there is a PROPOSAL, read as the content type the declaration CHOOSES --
+//     an identifier in a value position -- and not as one it names. The mention was measured to
+//     do no work and worse than none: every sender in this package reaches
+//     marshalPrivateMessageContentWithPadding, whose switch names all three content types, so the
+//     conjunct was satisfied by reaching the send path at all. It put this group's own committer
+//     in a class about proposals, and it made the rule FIRE on a correct exported method that
+//     sends an application message -- reported as putting a proposal on the wire and reaching its
+//     doors through nothing. A gate that fires on correct code is worse than one that misses,
+//     because it teaches the next person to switch gates off.
 //
-// And the obligation itself is ONE name: whatever else a generator does, its output has to have
-// gone through this package's single entry ValidateProposalList. (*Group).propose runs it over a
-// one entry list; a generator that reaches it through any other route satisfies this, and one that
-// reaches it through none does not, whatever hand written checks it runs instead.
+// And the obligation itself is ONE name RUN: whatever else a generator does, its output has to
+// have gone through this package's single entry ValidateProposalList, reached along calls whose
+// ANSWER IS USED. The name alone certifies nothing -- `_ = ValidateProposalList` in a body was
+// measured to satisfy it, and so was calling the door and dropping the refusal it answered.
+// (*Group).propose runs it over a one entry list inside an `if err :=`; a generator that reaches
+// it through any other route satisfies this, and one that reaches it through none does not,
+// whatever hand written checks it runs instead.
 func TestEveryProposalGeneratorOnThisGroupSendsWhatItEmitsThroughItsOwnDoors(t *testing.T) {
 	declared := packageLevelDeclarations(t, ".")
 	for _, anchor := range []string{proposalGenerationDoor, proposalGenerationContentType,
