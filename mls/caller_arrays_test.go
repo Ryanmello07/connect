@@ -1028,6 +1028,27 @@ func callerArrayRows() []callerArrayRow {
 			t.Cleanup(func() { group.Close() })
 			return []any{cfg, &welcome, &ratchetTree, keys}, group
 		}},
+		// p7 task 19's restore, which is a construction of sealed storage over caller bytes in
+		// exactly NewGroup's sense and one step further out: the group id it looks the state up
+		// by and the signing key it rebuilds a verified context with are both the caller's, and
+		// the group it answers signs with that key and derives over that id for the whole of its
+		// life. It is founded first, because a restore needs a state to read -- what the row
+		// follows is the arrays the RESTORE was handed.
+		{name: "LoadGroup", build: func(t *testing.T) ([]any, any) {
+			cfg, signer, cred := callerOwnedGroupArguments(t)
+			founded, err := NewGroup(cfg, signer, cred)
+			if err != nil {
+				t.Fatalf("found the group this row restores: %v", err)
+			}
+			epoch := founded.Epoch()
+			founded.Close()
+			group, err := LoadGroup(cfg, epoch, signer)
+			if err != nil {
+				t.Fatalf("restore the group this row follows: %v", err)
+			}
+			t.Cleanup(func() { group.Close() })
+			return []any{cfg, &epoch, &signer}, group
+		}},
 		{name: "NewKeySchedule", build: func(t *testing.T) ([]any, any) {
 			crypto, context, secrets := callerOwnedScheduleArguments(t)
 			schedule, err := NewKeySchedule(crypto, secrets["init"], secrets["commit"],

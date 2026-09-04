@@ -3990,6 +3990,63 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{welcome.EncryptedGroupInfo, welcome.Secrets[0].NewMember}
 		}},
+		// p7 task 19's restore. It is handed a caller's arrays in three places -- the group id
+		// its config names, the leaf keys body that config carries, and the signing key it
+		// rebuilds a verified context with -- and it READS all three: the id keys the state
+		// lookup, and the signing key signs a group info this function then verifies against the
+		// restored tree. A restore that normalised or wrote through any of them would be editing
+		// storage its caller is about to found or restore a second group with.
+		//
+		// What it ANSWERS here is deliberately not the epoch authenticator. The group it restores
+		// is founded by this row, and NewGroup samples its epoch secret, so a comparison across
+		// the two calls would be comparing two different epochs; the three values below are a
+		// function of the arrays this row handed in and of nothing drawn.
+		{name: "LoadGroup", call: func(take func([]byte) []byte) [][]byte {
+			identity := []byte("the creator whose state this row restores")
+			policy := &GroupPolicyExtension{Roles: []RoleEntry{{MemberId: identity, Role: RoleOwner}}}
+			if canonicalErr := policy.Canonicalize(); canonicalErr != nil {
+				t.Fatalf("Canonicalize the policy this row's group carries: %v", canonicalErr)
+			}
+			policyExt, policyErr := policy.Encode()
+			if policyErr != nil {
+				t.Fatalf("Encode the policy this row's group carries: %v", policyErr)
+			}
+			cfg := &GroupConfig{
+				Suite:      CipherSuiteX25519ChaCha20Sha256Ed25519,
+				GroupId:    take([]byte("group-1")),
+				Extensions: []Extension{policyExt},
+				Crypto:     crypto,
+				Store:      newTestStore(),
+				LeafKeys: LeafKeysExtension{
+					AlgId:          AlgIdXwing,
+					DeviceXwingPub: take(bytes.Repeat([]byte{0x62}, XwingPublicKeyLen)),
+				},
+			}
+			signer := SignaturePrivateKey(take(bytes.Repeat([]byte{0x54}, 32)))
+			founded, foundErr := NewGroup(cfg, signer,
+				Credential{CredentialType: CredentialTypeBasic, Identity: take(identity)})
+			if foundErr != nil {
+				t.Fatalf("found the group this row restores: %v", foundErr)
+			}
+			epoch := founded.Epoch()
+			founded.Close()
+			group, loadErr := LoadGroup(cfg, epoch, signer)
+			if loadErr != nil {
+				t.Fatalf("LoadGroup: %v", loadErr)
+			}
+			defer group.Close()
+			leaf := group.OwnLeafNodeCopy()
+			if leaf == nil {
+				t.Fatal("the group this row restored holds no leaf at its own index")
+			}
+			members := group.Members()
+			if len(members) != 1 || members[0].LeafKeys == nil {
+				t.Fatalf("the group this row restored answers %d members; the leaf_keys body is one of the arrays it is read for",
+					len(members))
+			}
+			return [][]byte{group.GroupId(), leaf.Credential.Identity, leaf.SignatureKey,
+				members[0].LeafKeys.DeviceXwingPub}
+		}},
 		{name: "compareMemberIds", call: func(take func([]byte) []byte) [][]byte {
 			compareMemberIds(take([]byte{0x01, 0x02}), take([]byte{0x01, 0x03}))
 			return nil

@@ -56,6 +56,25 @@ var (
 
 	errGroupClosed = errors.New("mls: the group is closed and its epoch secrets have been zeroized")
 
+	// the persisted state's own refusals, one value per rule for this block's stated reason.
+	// A blob written at a layout this build does not read is a state to migrate or discard; a
+	// restore kind this build has no constructor for is a blob that has been edited, truncated
+	// into a neighbouring field, or written by a build that had a third kind. errors.Is cannot
+	// tell those apart when they answer one value, and the two want different responses.
+	errGroupStateBlobVersion = errors.New(
+		"mls: the persisted group state was written at a blob version this build does not read")
+	errGroupStateRestoreKind = errors.New(
+		"mls: the persisted group state names no restore kind this build can rebuild a key schedule from")
+	errGroupStateTranscript = errors.New(
+		"mls: the persisted group state's transcript does not agree with the key schedule it names")
+
+	// and the refusal a group makes about ITSELF rather than about a blob. An epoch whose
+	// schedule has been erased answers KDF.Nh zero bytes for the secret it was built from, and
+	// that is the exact length both constructors accept -- so persisting one would write a
+	// state that restores a group every party can recompute, with a nil error the whole way.
+	errGroupStateRestoreSecret = errors.New(
+		"mls: this epoch's key schedule cannot answer the secret it was built from")
+
 	errCreationConfirmationTag = errors.New("mls: the epoch 0 confirmation tag is not a tag of this suite's width")
 
 	// and the same refusal one epoch on. A SECOND VALUE and not errCreationConfirmationTag,
@@ -188,6 +207,23 @@ var (
 // StateStore persists group state and private key material across process restarts. It is
 // deliberately dumb -- no queries, no cross-group transactions -- so that sdk can implement it over
 // the sealed local store without leaking storage semantics into the crypto. Spec A section 3.5.
+//
+// TWO THINGS AN IMPLEMENTATION OWES ITSELF, both about arrays rather than about storage.
+//
+// It must not RETAIN a slice it was handed. Every octet that arrives here is the caller's, and a
+// store that keeps one -- to key a map, to build a path with later, to write asynchronously --
+// shares an array with the group for the group's lifetime; a write through it rewrites a group id
+// every epoch secret of that group was derived over, with the context, the tree hash and the
+// transcript all going on agreeing with each other over the wrong id. Nothing downstream would
+// report that. TestNoOctetAGroupHandsOutwardIsStorageItKeeps is what holds this package's side of
+// it, and the retention half is the implementation's.
+//
+// And the state PutGroupState is handed is ERASED as soon as the call returns. Those octets are a
+// plaintext epoch secret and a leaf private key, written once per merged commit, and the group is
+// the only holder left that could clear them -- so it does, rather than leaving one copy per epoch
+// in the heap. An implementation that wants the bytes past the call owes itself a copy. Nothing is
+// erased on the way back OUT: what GetGroupState answers is the STORE's array, and a group that
+// wiped it would destroy the state it had just read.
 type StateStore interface {
 	PutGroupState(groupId []byte, epoch uint64, state []byte) error
 	GetGroupState(groupId []byte, epoch uint64) ([]byte, error)
@@ -855,20 +891,149 @@ func (self *Group) Close() error {
 // holds, and the transcript, the tree hash and the key schedule all go on agreeing with each
 // other over the wrong id.
 func (self *Group) persist() error {
-	blob, err := self.marshalState()
+	state, err := self.marshalState()
 	if err != nil {
 		return err
 	}
-	return self.store.PutGroupState(cloneBytes(self.context.GroupId), self.context.Epoch, blob)
+	err = self.store.PutGroupState(cloneBytes(self.context.GroupId), self.context.Epoch, state)
+	// AND THE ENCODING IS ERASED ONCE THE STORE HAS TAKEN IT. These octets are not a view over
+	// anything: syntax.Writer copies into a buffer of its own, so what comes back out of the
+	// marshal is a SECOND copy of this epoch's parent secret and of this member's leaf private
+	// key, and after this statement nothing in the process can reach it to erase it. It is
+	// erased on the refusal too, which is the path that matters most -- a store that answered
+	// an error may have written nothing, and the copy would otherwise outlive the failure.
+	//
+	// What this asks of a StateStore is written on the interface: PutGroupState is handed a
+	// buffer the group erases as soon as the call returns, so an implementation that wants
+	// these octets past the call owes itself a copy. The alternative is a plaintext epoch
+	// secret left in the heap for the collector to move around, once per merged commit.
+	zeroizeSecret(state)
+	return err
 }
 
-// marshalState is TASK 19's and this is the stand-in.
+// groupStateBlobVersion is bumped when the blob layout changes, so a state written by an older
+// build is REFUSED rather than misread. The two are not the same failure: a misread blob decodes
+// into a group whose secrets nobody agrees with, and the first symptom of one is a member whose
+// every message is refused by peers that are all behaving correctly.
+const groupStateBlobVersion uint16 = 1
+
+// groupStateBlob is one epoch of one group as it is handed to the StateStore.
 //
-// It writes the group context and the tree, which is what the creation test needs in order to see
-// that the write happened at all. Task 19 replaces it with the full blob -- the secret a restore
-// rebuilds the schedule from, the transcript, the own-leaf private key -- and with the round trip
-// test that makes a blob worth writing. Two opaque fields under the MLS varint prefix and not the
-// record layer's fixed width one: this is an MLS encoder, and the two are never interchangeable.
+// IT IS A WIRE TYPE WHOSE WIRE IS A DISK, and that is worth writing down here because no gate in
+// this package draws the distinction. Everything else carrying a codec here encodes octets a peer
+// already has; these octets are this client's own epoch_secret or joiner_secret and its own leaf
+// HPKE private key, and the only reason handing them to a caller-supplied object is acceptable at
+// all is spec A section 3.5, which requires the store implementation to SEAL them before they
+// touch disk. The erase class in staged_erase_test.go excuses a type that declares a codec on the
+// argument that everything it holds is about to be public; that argument is false of this one, and
+// what is done about it instead is below.
+//
+// IT DECLARES NO ERASE ON PURPOSE. On the WRITE path it holds no storage of its own: every field
+// is a view of the live epoch -- the schedule's parent secret, the group's own leaf key, the
+// transcript this group is standing on -- so a Zeroize here would erase the epoch the group is
+// running on, which is the drop defect pointing backwards. The one copy the write path makes is
+// the encoder's output, and persist erases that. On the READ path every field is a copy
+// syntax.Reader made, and LoadGroup erases the two that are key material as soon as the schedule
+// and the leaf state have been rebuilt from them.
+//
+// One codec method set and no struct tags, which is C1 and is this package's rule for every type
+// it serializes at all.
+type groupStateBlob struct {
+	Version       uint16
+	Context       []byte
+	Tree          []byte
+	Confirmed     []byte
+	Interim       []byte
+	OwnLeaf       uint32
+	OwnEncPriv    []byte
+	RestoreKind   uint8
+	RestoreSecret []byte
+}
+
+var _ syntax.Codec = (*groupStateBlob)(nil)
+
+// MarshalMLS writes the blob. The version is FIRST so that a decoder can refuse a layout it does
+// not read before it has interpreted one octet of the rest as anything.
+func (self *groupStateBlob) MarshalMLS(w *syntax.Writer) error {
+	w.WriteUint16(self.Version)
+	w.WriteOpaque(self.Context)
+	w.WriteOpaque(self.Tree)
+	w.WriteOpaque(self.Confirmed)
+	w.WriteOpaque(self.Interim)
+	w.WriteUint32(self.OwnLeaf)
+	w.WriteOpaque(self.OwnEncPriv)
+	w.WriteUint8(self.RestoreKind)
+	w.WriteOpaque(self.RestoreSecret)
+	return nil
+}
+
+// UnmarshalMLS reads the blob. It STAGES -- every field into a local, the receiver assigned whole
+// at the end -- for the reason every decoder in this package stages: a truncated state has to
+// leave the caller holding what it had rather than a composite of two epochs.
+func (self *groupStateBlob) UnmarshalMLS(r *syntax.Reader) error {
+	version, err := r.ReadUint16()
+	if err != nil {
+		return err
+	}
+	context, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	tree, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	confirmed, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	interim, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	ownLeaf, err := r.ReadUint32()
+	if err != nil {
+		return err
+	}
+	ownEncPriv, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	kind, err := r.ReadUint8()
+	if err != nil {
+		return err
+	}
+	secret, err := r.ReadOpaque()
+	if err != nil {
+		return err
+	}
+	*self = groupStateBlob{
+		Version:       version,
+		Context:       context,
+		Tree:          tree,
+		Confirmed:     confirmed,
+		Interim:       interim,
+		OwnLeaf:       ownLeaf,
+		OwnEncPriv:    ownEncPriv,
+		RestoreKind:   kind,
+		RestoreSecret: secret,
+	}
+	return nil
+}
+
+// marshalState serializes the epoch this group is standing in.
+//
+// WHAT IT STORES IS AN INPUT AND NOT AN OUTPUT. EpochSecrets is nine expansions of one parent, and
+// a blob carrying the nine would hand a restored group a SECOND path to the same epoch -- so a
+// restore and the group it restored would agree for exactly as long as the two paths agreed, and
+// nothing on either side would report the day they stopped. What is stored is the ONE secret this
+// epoch's schedule was built from, beside the kind that says which constructor takes it: the
+// sampled epoch_secret for a group this client created, the joiner_secret for every epoch a commit
+// opened. LoadGroup rebuilds through the constructor that built it in the first place.
+//
+// NO FIELD OF THE BLOB IS A COPY. Each is a view of storage this group already holds, so this
+// method adds no second copy of any secret to the heap; the one copy is the encoder's output, and
+// persist erases that as soon as the store has taken it.
 //
 // The RAISED bound, and it is a capacity rather than an acceptance rule. These octets are this
 // client's own local state and never travel, and the tree inside them is written by tree.go's own
@@ -876,6 +1041,13 @@ func (self *Group) persist() error {
 // group this build is entitled to hold, at 500 members, and would refuse it only on the largest
 // group anybody ever made.
 func (self *Group) marshalState() ([]byte, error) {
+	// asked FIRST, because it is the one field of this blob that can be missing: an epoch whose
+	// schedule has been erased answers a refusal here rather than KDF.Nh zero bytes, and the
+	// alternative is persisting a state that restores a group anybody can recompute.
+	restoreSecret, err := self.schedule.restoreSecret(self.restoreKind)
+	if err != nil {
+		return nil, err
+	}
 	tree, err := syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)
 	if err != nil {
 		return nil, err
@@ -884,10 +1056,18 @@ func (self *Group) marshalState() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)
-	w.WriteOpaque(context)
-	w.WriteOpaque(tree)
-	return w.Bytes()
+	blob := &groupStateBlob{
+		Version:       groupStateBlobVersion,
+		Context:       context,
+		Tree:          tree,
+		Confirmed:     self.transcript.Confirmed,
+		Interim:       self.transcript.Interim,
+		OwnLeaf:       uint32(self.ownLeaf),
+		OwnEncPriv:    self.ownPriv.EncryptionPriv,
+		RestoreKind:   uint8(self.restoreKind),
+		RestoreSecret: restoreSecret,
+	}
+	return syntax.MarshalLimit(blob, syntax.MaxRatchetTreeLength)
 }
 
 // ---------------------------------------------------------------------------
@@ -1920,8 +2100,35 @@ func (self *Group) ClearPendingCommit() {
 	self.pending = nil
 }
 
-// MergePendingCommit promotes the staged commit to live state. Task 19 adds the persistence and the
-// past-epoch window; what is here is the state swap and the boundary the cache is owed.
+// MergePendingCommit promotes the staged commit to live state, persists the epoch it opened, and
+// drops every epoch older than the past-epoch window.
+//
+// THE DELETE IS A SECURITY REQUIREMENT AND NOT HOUSEKEEPING, and it is the reason PastEpochWindow
+// is a hard bound here where RFC 9420's ValSem400 makes it a SHOULD. A persisted epoch state
+// carries that epoch's parent secret, so it carries everything derived from it -- the resumption
+// PSK, the exporter, and through the exporter MASTER section 8.1's eph_root[n], the value that
+// section promises becomes undecryptable. A retained old state is a retained eph_root, and no
+// amount of erasing in this process reaches one that is on a disk.
+//
+// WHAT THE WINDOW COSTS, in the terms it is a decision about. Thirty-two superseded epochs are
+// kept so that a member can still open a message that was sent under an epoch it has since left --
+// a phone that was asleep, a laptop that was shut, a peer whose commit crossed with somebody
+// else's. Every one of those epochs is an epoch of FORWARD SECRECY given up: a device compromised
+// today hands the attacker the last thirty-three epochs of this group rather than one, and every
+// message sent under them. Thirty-two rather than eight because the window is a product promise
+// about how long a device may stay offline and an active group can burn eight epochs in a day;
+// thirty-two rather than unbounded because unbounded is what OpenMLS ships (openmls#1122) and it
+// means the guarantee is never delivered at all. The cutoff is computed off THIS group's epoch,
+// and the delete is keyed by THIS group's id: every group this client is in runs an epoch 7, so an
+// epoch number alone is not an identity and a window keyed on one would evict a stranger's state.
+//
+// THE ORDER OF THE THREE THINGS AFTER THE SWAP IS THE DECISION. The cache is rebound BEFORE the
+// persist, and epoch_advance_test.go names the other order as a measured defect: the write, then a
+// persist that can fail, then the rebind, leaves every failing persist with the group moved and
+// the cache bound to the epoch that closed -- and a cache bound to a closed epoch is a member that
+// can resolve no proposal of the new epoch, never reaches the next boundary, and is never healed
+// by anything in this package. A failed persist is recoverable; the next merged commit writes the
+// state again, and the group in memory is correct in the meantime.
 //
 // THE CACHE IS REBOUND TO THE EPOCH THE GROUP MOVED TO, on every path out of this method, and that
 // is the whole of what an epoch boundary owes it. A cache left behind belongs to the epoch that just
@@ -1975,7 +2182,213 @@ func (self *Group) MergePendingCommit() error {
 	if err := self.proposals.Rebind(staged.verified); err != nil {
 		return err
 	}
-	return nil
+	if err := self.persist(); err != nil {
+		return err
+	}
+	// the window, computed off the epoch this group HAS MOVED TO. The floor is nought and not a
+	// wrapped uint64: a group younger than the window has nothing to drop, and the subtraction
+	// written without this guard underflows to a cutoff near 2^64 and deletes every state this
+	// group has ever written, on the first commit of every new group.
+	cutoff := uint64(0)
+	if self.context.Epoch > PastEpochWindow {
+		cutoff = self.context.Epoch - PastEpochWindow
+	}
+	// the group id is CLONED on the way out for persist's stated reason, and it is the same
+	// reason twice: this is the second call this method makes into an object the caller supplied
+	// and goes on holding, and the live group id is what every secret of this group was derived
+	// over.
+	return self.store.DeleteGroupStateBefore(cloneBytes(self.context.GroupId), cutoff)
+}
+
+// LoadGroup restores a group from the epoch state a previous run of this client persisted.
+//
+// THE SIGNING KEY IS THE CALLER'S ARGUMENT AND IS NOT IN THE BLOB, which is the one structural
+// decision this function makes. A signature private key is the device's identity across every
+// group it is in; an epoch state is one group at one epoch. Putting them in one blob would mean
+// that any state a store hands back is enough to speak as this device -- in this group and in
+// every other -- and would put the device key inside a value this package writes thirty-three
+// copies of per group.
+//
+// THE SCHEDULE IS REBUILT THROUGH THE CONSTRUCTOR THAT BUILT IT: from the epoch secret for a group
+// this client created, from the joiner secret for every epoch a commit opened. See marshalState
+// for why a stored EpochSecrets would be the wrong answer -- it is a second derivation path, and a
+// second derivation path is how a restored group and a live one come to disagree about the epoch
+// authenticator with nothing to say which of them is right.
+//
+// AND THE PROPOSAL CACHE BINDS TO A VERIFIED CONTEXT, exactly as NewGroup's does and for this
+// file's header reason: (*GroupInfo).VerifiedContext is the only door onto one, and a restore is
+// not exempt from it. It costs this function nothing it was not going to do anyway and it buys a
+// real check -- the group info is signed with the key the CALLER handed in and verified against
+// the leaf the restored tree holds at this member's own index, so a caller that restored a state
+// with the wrong device key is refused here rather than at the first message a peer drops.
+func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Group, error) {
+	if cfg == nil {
+		return nil, errNilGroupConfig
+	}
+	crypto := cfg.Crypto
+	// refused rather than dereferenced and refused first, for NewGroup's reason: every secret
+	// this restore rebuilds and every signature it makes is taken through the provider.
+	if crypto == nil {
+		return nil, fmt.Errorf("%w: every secret of the restored epoch is rebuilt through it",
+			ErrNilCryptoProvider)
+	}
+	if cfg.Store == nil {
+		return nil, errNilStateStore
+	}
+	// the group id is CLONED on the way out for persist's reason: this hands an array to an
+	// object the caller supplies and goes on holding.
+	raw, err := cfg.Store.GetGroupState(cloneBytes(cfg.GroupId), epoch)
+	if err != nil {
+		return nil, err
+	}
+	// the RAISED bound, matching the one marshalState wrote under. These octets are this
+	// client's own and carry a ratchet tree written at MaxRatchetTreeLength, so a default-limit
+	// reader here would refuse to restore a group this build persisted correctly.
+	var blob groupStateBlob
+	if err := syntax.UnmarshalLimit(raw, &blob, syntax.MaxRatchetTreeLength); err != nil {
+		return nil, err
+	}
+	// the two decoded secrets are copies THIS call made -- ReadOpaque allocates rather than
+	// viewing -- so they are erased on every path out, once the schedule and the leaf state have
+	// been rebuilt from them. What is not erased is raw: that array is the STORE's, and a wipe
+	// of it would destroy the state that was just read. The blob's own type declares no Zeroize
+	// and says why.
+	defer zeroizeSecret(blob.RestoreSecret)
+	defer zeroizeSecret(blob.OwnEncPriv)
+	if blob.Version != groupStateBlobVersion {
+		return nil, fmt.Errorf("%w: the state is version %d and this build writes %d",
+			errGroupStateBlobVersion, blob.Version, groupStateBlobVersion)
+	}
+
+	var context GroupContext
+	if err := syntax.Unmarshal(blob.Context, &context); err != nil {
+		return nil, err
+	}
+	tree, err := UnmarshalRatchetTree(blob.Tree)
+	if err != nil {
+		return nil, err
+	}
+	ownLeaf := LeafIndex(blob.OwnLeaf)
+	leaf := tree.Leaf(ownLeaf)
+	if leaf == nil {
+		return nil, ErrWelcomeLeafNotFound
+	}
+
+	var schedule *KeySchedule
+	switch restoreKind(blob.RestoreKind) {
+	case restoreFromEpochSecret:
+		schedule, err = NewKeyScheduleFromEpochSecret(crypto, blob.RestoreSecret, &context)
+	case restoreFromJoiner:
+		// the empty psk secret, which is what every epoch of the v1 profile is built under:
+		// nothing in this build injects a PSK, so the joiner path's second input is KDF.Nh zero
+		// bytes on both the live side and this one. A profile that grows PSKs owes this blob the
+		// psk_secret beside the joiner secret, and until it does, a restore that guessed one
+		// would rebuild an epoch nobody else has.
+		schedule, err = NewKeyScheduleFromJoiner(crypto, blob.RestoreSecret,
+			EmptyPskSecret(crypto), &context)
+	default:
+		return nil, fmt.Errorf("%w: the state names kind %d", errGroupStateRestoreKind, blob.RestoreKind)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	secretTree, err := NewSecretTree(crypto, tree.LeafWidth(), schedule.Secrets().Encryption)
+	if err != nil {
+		// a fully derived epoch that no group will ever hold, dropped here rather than left for
+		// the collector. Every refusal below does the same, for (*Group).ClearPendingCommit's
+		// reason: a derived epoch is a derived epoch whether or not anybody entered it.
+		schedule.Zeroize()
+		return nil, err
+	}
+	transcript := InitialTranscriptHashes()
+	transcript.Confirmed = blob.Confirmed
+	transcript.Interim = blob.Interim
+
+	// the confirmation tag of the epoch being restored, recomputed rather than stored: it is a
+	// MAC under this epoch's confirmation key over this epoch's confirmed transcript hash, and
+	// both of those are already here.
+	confirmationTag := schedule.ConfirmationTag(transcript.Confirmed)
+	if len(confirmationTag) != crypto.HashSize() {
+		schedule.Zeroize()
+		secretTree.Zeroize()
+		return nil, fmt.Errorf("%w: the restored schedule answered %d octets, want %d",
+			errCreationConfirmationTag, len(confirmationTag), crypto.HashSize())
+	}
+
+	// AND THE RECOMPUTED TAG IS CHECKED AGAINST THE INTERIM HASH THIS STATE CARRIES, which is the
+	// one thing that says the schedule rebuilt above is the schedule this epoch actually had.
+	//
+	// It is here because the blob's own fields cannot say it. Every input the restore is handed
+	// is KDF.Nh pseudorandom octets and one uint8, so a RestoreKind flipped from one arm to the
+	// other -- by a corrupted write, by a truncated field, by anything that got past the store's
+	// seal -- hands the other constructor a secret of exactly the length it requires and builds a
+	// complete, well formed epoch that agrees with nobody. Measured while writing this: with no
+	// check here, LoadGroup answered a nil error over a state whose kind had been flipped, and the
+	// group it answered derived a different epoch authenticator from every peer's.
+	//
+	// The interim transcript hash is what closes it, and it costs one hash. RFC 9420 section 8.2
+	// makes interim_transcript_hash_[n] a hash over confirmed_transcript_hash_[n] and the
+	// confirmation tag of the commit that opened epoch n -- and that tag is a MAC under epoch n's
+	// OWN confirmation key. So the stored interim hash is a commitment to the epoch's confirmation
+	// key, which is a commitment to its epoch secret, which is a commitment to the restore secret
+	// and the kind that says how to use it. Nothing about a wrong restore can survive it.
+	//
+	// crypto/subtle.ConstantTimeCompare and not bytes.Equal, which is guardrail 8's rule over
+	// every comparison this package ships and not only over the ones whose operands are secret.
+	interim, err := InterimTranscriptHash(crypto, transcript.Confirmed, confirmationTag)
+	if err != nil {
+		schedule.Zeroize()
+		secretTree.Zeroize()
+		return nil, err
+	}
+	if subtle.ConstantTimeCompare(interim, transcript.Interim) != 1 {
+		schedule.Zeroize()
+		secretTree.Zeroize()
+		return nil, errGroupStateTranscript
+	}
+	groupInfo := &GroupInfo{
+		GroupContext:    context,
+		ConfirmationTag: confirmationTag,
+		Signer:          ownLeaf,
+	}
+	if err := groupInfo.Sign(crypto, signer); err != nil {
+		schedule.Zeroize()
+		secretTree.Zeroize()
+		return nil, err
+	}
+	verified, err := groupInfo.VerifiedContext(crypto, tree)
+	if err != nil {
+		schedule.Zeroize()
+		secretTree.Zeroize()
+		return nil, err
+	}
+	proposals, err := NewProposalCache(verified)
+	if err != nil {
+		schedule.Zeroize()
+		secretTree.Zeroize()
+		return nil, err
+	}
+
+	return &Group{
+		store:  cfg.Store,
+		crypto: crypto,
+		// the signing key and the credential are COPIED, for NewGroup's reason: the key is an
+		// array the caller owns and goes on using, and the credential here is a view into the
+		// restored tree, which a later commit replaces.
+		signer:      SignaturePrivateKey(cloneBytes(signer)),
+		cred:        Credential{CredentialType: leaf.Credential.CredentialType, Identity: cloneBytes(leaf.Credential.Identity)},
+		ownLeaf:     ownLeaf,
+		ownPriv:     NewTreeKEMPrivate(ownLeaf, HpkePrivateKey(blob.OwnEncPriv)),
+		tree:        tree,
+		context:     &context,
+		verified:    verified,
+		schedule:    schedule,
+		secretTree:  secretTree,
+		transcript:  transcript,
+		proposals:   proposals,
+		restoreKind: restoreKind(blob.RestoreKind),
+	}, nil
 }
 
 

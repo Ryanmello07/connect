@@ -665,6 +665,15 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		// knows which group it wants and has nothing to join it AS. Every other argument of both
 		// rows is a live Welcome and a live tree, so what each observes is the argument it nils
 		// rather than a refusal standing in front of it.
+		// p7 task 19's restore, whose nil config is NewGroup's refusal read on the way back in:
+		// the config carries the store the state is read from, the provider the schedule is
+		// rebuilt through and the group id the lookup is keyed by, so a nil one is a caller with
+		// nothing to restore from rather than a caller who named a state that is missing.
+		"LoadGroup(cfg)": {sentinel: errNilGroupConfig, call: func(t *testing.T) error {
+			owner := testIdentity(t, crypto, "owner")
+			_, err := LoadGroup(nil, 0, owner.SigPriv)
+			return err
+		}},
 		"JoinFromWelcome(cfg)": {sentinel: errNilGroupConfig, call: func(t *testing.T) error {
 			welcome, ratchetTree, keys := nilArgumentJoinInputs(t, crypto)
 			_, err := JoinFromWelcome(nil, welcome, ratchetTree, keys)

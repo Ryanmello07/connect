@@ -804,6 +804,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// publish a tree this build is entitled to hold, at 500 members, over a commit that is
 		// entirely correct.
 		"group.go: syntax.MarshalLimit(applied.Tree, syntax.MaxRatchetTreeLength)",
+		// p7 task 19's persisted state blob, at the RAISED limit and for the reason the tree
+		// inside it is written at one: the blob carries the ratchet tree as one opaque field, so
+		// a default limit writer here would refuse to persist a group this build is entitled to
+		// hold at 500 members. It is a capacity and not an acceptance rule -- these octets never
+		// travel, and the only reader of them is the LoadGroup entry below.
+		"group.go: syntax.MarshalLimit(blob, syntax.MaxRatchetTreeLength)",
 		// the two encodes of the persisted state blob, at the RAISED limit, and here that is a
 		// capacity rather than an acceptance rule. These octets never travel: they are this
 		// client's own local state, read back only by the LoadGroup that wrote them, and the tree
@@ -813,7 +819,14 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// group anybody had made, which is the failure that is hardest to reach in a test.
 		"group.go: syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)",
 		"group.go: syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)",
-		"group.go: syntax.NewWriterLimit(syntax.MaxRatchetTreeLength)",
+		// the group context INSIDE the persisted blob, at the DEFAULT limit and not the raised
+		// one that wrote the blob around it. It is the same structure the five entries above it
+		// encode and it is decoded here out of octets this build wrote one run earlier, so the
+		// strictest reading is the right one: a context this decoder accepted past
+		// MaxVectorLength is one no peer running the default limit could have verified a
+		// signature over, and a restore that admitted it would put this client in an epoch it
+		// can never speak in.
+		"group.go: syntax.Unmarshal(blob.Context, &context)",
 		// the key package a ProposeAdd is handed, decoded at the DEFAULT limit and not the raised
 		// one. These are octets a caller FETCHED -- from a directory, from a peer, from whatever
 		// this client's transport hands it -- so the limit here is an acceptance rule and not a
@@ -833,6 +846,15 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// reason and with even less to weigh: a GroupSecrets is one joiner secret, one optional
 		// path secret and a psks vector this profile always leaves empty.
 		"group.go: syntax.Unmarshal(plaintext, secrets)",
+		// p7 task 19's restore, the one decode in this package of octets that never came off a
+		// wire. The RAISED limit, matching the encode that wrote them: these are this client's
+		// own state carrying its own ratchet tree, so the bound here is the capacity the writer
+		// used rather than an acceptance rule, and a default limit reader would refuse to
+		// restore a group this build persisted correctly. What makes that safe to say is that
+		// the octets are sealed by the store and are never a stranger's -- and the fields inside
+		// them that ARE structures a peer could have influenced, the group context and the tree,
+		// are decoded at their own limits by the two entries around this one.
+		"group.go: syntax.UnmarshalLimit(raw, &blob, syntax.MaxRatchetTreeLength)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure

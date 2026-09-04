@@ -660,6 +660,12 @@ var decoderPublishOrder = []string{
 	"framing.go: (*Sender).UnmarshalMLS stages",
 	"framing.go: (*SenderData).UnmarshalMLS stages",
 	"framing_preimage.go: (*confirmedTranscriptHashInput).UnmarshalMLS stages",
+	// p7 task 19's persisted epoch state, the one codec of this package whose wire is a disk. It
+	// STAGES, and here that claim is about a caller's own group rather than about a peer's
+	// message: a truncated state read back at start-up must leave the value the caller passed
+	// alone rather than filling it with the fields that decoded before the truncation, because
+	// a half filled blob names a restore kind with no secret and a tree with no context.
+	"group.go: (*groupStateBlob).UnmarshalMLS stages",
 	"group_context.go: (*GroupContext).UnmarshalMLS stages",
 	// the urmessage_group_policy body. It STAGES: every field is read into a local, the whole
 	// value is assembled and validated, and only then is it assigned to the receiver -- so a

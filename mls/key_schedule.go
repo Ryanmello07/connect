@@ -381,6 +381,43 @@ func (self *KeySchedule) WelcomeSecret() []byte {
 	return self.welcomeSecret
 }
 
+// restoreSecret is the ONE secret a persisted epoch carries: the epoch_secret a created
+// group sampled, or the joiner_secret every epoch a commit opened was built from.
+//
+// It exists so that a persisted state stores an INPUT rather than an output. EpochSecrets is
+// nine expansions of one parent, and a blob carrying the nine would be a SECOND derivation
+// path -- so a restored group and a live one would agree for exactly as long as the two
+// paths agreed, and the first thing to notice a disagreement would be a peer refusing a
+// confirmation tag. Rebuilding through the constructor that built the epoch in the first
+// place is the only reading with one derivation in it.
+//
+// UNEXPORTED, and it answers the schedule's own storage rather than a copy: those are the
+// same decision twice. Guardrail 6 says no exported symbol of this package answers
+// epoch_secret, and the one caller is (*Group).marshalState, which reads these octets into
+// one length prefixed field and retains nothing -- a copy here would be a second live copy
+// of the parent secret for the length of a marshal, held by nothing that erases it.
+//
+// An epoch whose secrets have been erased REFUSES, for JoinerSecret's reason read one step
+// further out: the erase leaves KDF.Nh zero bytes, which is exactly the length both
+// constructors require, so a state persisted out of an erased epoch would restore a group
+// every party on earth can recompute -- with a nil error, because nothing downstream is in a
+// position to notice.
+func (self *KeySchedule) restoreSecret(kind restoreKind) ([]byte, error) {
+	var secret []byte
+	switch kind {
+	case restoreFromEpochSecret:
+		secret = self.epochSecret
+	case restoreFromJoiner:
+		secret = self.joinerSecret
+	default:
+		return nil, fmt.Errorf("%w: %d", errGroupStateRestoreKind, uint8(kind))
+	}
+	if !self.secretIsLive(secret) {
+		return nil, fmt.Errorf("%w: restore kind %d", errGroupStateRestoreSecret, uint8(kind))
+	}
+	return secret, nil
+}
+
 // Secrets is the epoch's nine derived secrets. The pointer is into the schedule's own
 // storage, which is what lets the epoch erase them in place; a caller that keeps one past
 // that erase keeps a slice of zeros rather than a live key.

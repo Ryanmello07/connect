@@ -2563,3 +2563,606 @@ func TestAClosedGroupProposesNothing(t *testing.T) {
 			filed, filedBefore)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// p7 task 19: the epoch advance -- persistence and the past-epoch window
+// ---------------------------------------------------------------------------
+
+// windowStore is a StateStore that keeps the ACTUAL slices it was handed rather than copies of
+// them, and records which group each window delete was run for.
+//
+// The slices and not clones of them, for stagedEpochStorage's reason one file over: zeroizeSecret
+// writes through the backing array, so a double holding a copy would read its copy afterwards and
+// report a clean erase over a persist that never ran one. Whether the state was LIVE inside the
+// call is recorded at the same time, because "all zero afterwards" is satisfied by storage that
+// was already zero and a fixture that had stopped serializing anything would pass every assertion
+// below while observing nothing.
+type windowStore struct {
+	*testStore
+	putIds    [][]byte
+	putStates [][]byte
+	putLive   []bool
+	deleteIds [][]byte
+	cutoffs   []uint64
+}
+
+func newWindowStore() *windowStore {
+	return &windowStore{testStore: newTestStore()}
+}
+
+func (self *windowStore) PutGroupState(groupId []byte, epoch uint64, state []byte) error {
+	self.putIds = append(self.putIds, groupId)
+	self.putStates = append(self.putStates, state)
+	self.putLive = append(self.putLive,
+		slices.ContainsFunc(state, func(b byte) bool { return b != 0 }))
+	return self.testStore.PutGroupState(groupId, epoch, state)
+}
+
+func (self *windowStore) DeleteGroupStateBefore(groupId []byte, epoch uint64) error {
+	self.deleteIds = append(self.deleteIds, groupId)
+	self.cutoffs = append(self.cutoffs, epoch)
+	return self.testStore.DeleteGroupStateBefore(groupId, epoch)
+}
+
+// advanceEpochs commits and merges n times, which is the only way this build moves a group's
+// epoch. It answers nothing: what every caller below reads is the store.
+func advanceEpochs(t *testing.T, group *Group, n int) {
+	t.Helper()
+	for i := 0; i < n; i += 1 {
+		if _, err := group.CreateCommit(nil, nil, nil); err != nil {
+			t.Fatalf("CreateCommit %d: %v", i, err)
+		}
+		if err := group.MergePendingCommit(); err != nil {
+			t.Fatalf("MergePendingCommit %d: %v", i, err)
+		}
+	}
+}
+
+func TestMergePendingCommitPersistsAndPrunes(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := cfg.Store.(*testStore)
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+
+	advanceEpochs(t, group, 3)
+	if group.Epoch() != 3 {
+		t.Fatalf("Epoch = %d, want 3", group.Epoch())
+	}
+	if _, err := store.GetGroupState([]byte("group-1"), 3); err != nil {
+		t.Fatalf("epoch 3 state was not persisted: %v", err)
+	}
+	// and every epoch on the way, because a merge that persisted only the newest state would
+	// leave the window a window over one epoch
+	for epoch := uint64(0); epoch <= 3; epoch += 1 {
+		if _, err := store.GetGroupState([]byte("group-1"), epoch); err != nil {
+			t.Fatalf("epoch %d state was not persisted: %v", epoch, err)
+		}
+	}
+	if len(store.deletes) != 3 {
+		t.Fatalf("DeleteGroupStateBefore was called %d times, want once per merged commit", len(store.deletes))
+	}
+	// epoch 3 - PastEpochWindow would underflow, so the cutoff floors at nought and nothing is
+	// deleted while the group is younger than the window
+	for at, cutoff := range store.deletes {
+		if cutoff != 0 {
+			t.Fatalf("delete %d ran at cutoff %d, want 0 while the group is younger than the window",
+				at, cutoff)
+		}
+	}
+}
+
+// TestPastEpochWindowDropsOlderState reads the bound in BOTH directions, which is what a cutoff
+// assertion alone cannot do: a window one epoch too wide and one epoch too narrow both produce a
+// group whose oldest epoch is gone, and only the state that must SURVIVE separates them.
+func TestPastEpochWindowDropsOlderState(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := cfg.Store.(*testStore)
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+
+	advanceEpochs(t, group, int(PastEpochWindow)+2)
+	if group.Epoch() != PastEpochWindow+2 {
+		t.Fatalf("Epoch = %d, want %d", group.Epoch(), PastEpochWindow+2)
+	}
+	cutoff := store.deletes[len(store.deletes)-1]
+	if cutoff != group.Epoch()-PastEpochWindow {
+		t.Fatalf("delete cutoff = %d, want %d", cutoff, group.Epoch()-PastEpochWindow)
+	}
+	// the epoch one BELOW the window is gone, and with it the eph_root it carried
+	dropped := group.Epoch() - PastEpochWindow - 1
+	if _, err := store.GetGroupState([]byte("group-1"), dropped); err == nil {
+		t.Fatalf("epoch %d state survived the past-epoch window; eph_root would survive with it", dropped)
+	}
+	// and the OLDEST epoch inside the window is still there, which is the half a window one
+	// epoch too narrow fails. Without it, dropping thirty-three epochs instead of thirty-two
+	// reads exactly like this test passing.
+	oldest := group.Epoch() - PastEpochWindow
+	if _, err := store.GetGroupState([]byte("group-1"), oldest); err != nil {
+		t.Fatalf("epoch %d is the oldest epoch inside a %d epoch window and its state is gone: %v",
+			oldest, PastEpochWindow, err)
+	}
+	// and so is the epoch the group is standing in
+	if _, err := store.GetGroupState([]byte("group-1"), group.Epoch()); err != nil {
+		t.Fatalf("the live epoch's state is gone: %v", err)
+	}
+}
+
+// TestThePastEpochWindowEvictsOnlyTheGroupItRanFor is the half a single-group fixture cannot see.
+// Every group this client is in runs an epoch 7, so an epoch number is not an identity: a window
+// keyed on the number alone evicts a stranger's epochs, and a client that lost those is a client
+// that cannot open a late message in a group it never committed to.
+func TestThePastEpochWindowEvictsOnlyTheGroupItRanFor(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	neighbour := testIdentity(t, crypto, "neighbour")
+	store := newWindowStore()
+
+	first := testGroupConfig(t, crypto, owner, "group-1")
+	first.Store = store
+	second := testGroupConfig(t, crypto, neighbour, "group-2")
+	second.Store = store
+
+	elder, err := NewGroup(first, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup group-1: %v", err)
+	}
+	defer elder.Close()
+	younger, err := NewGroup(second, neighbour.SigPriv, BasicCredential(neighbour.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup group-2: %v", err)
+	}
+	defer younger.Close()
+
+	advanceEpochs(t, elder, int(PastEpochWindow)+2)
+	if len(store.deleteIds) == 0 {
+		t.Fatal("no window delete ran at all, so this test compared nothing")
+	}
+	for at, id := range store.deleteIds {
+		if !bytes.Equal(id, []byte("group-1")) {
+			t.Fatalf("window delete %d was run for group %q, and the group that advanced is %q",
+				at, id, "group-1")
+		}
+	}
+	// the neighbour is at epoch 0 and the elder has evicted everything below epoch 2. A window
+	// keyed by the epoch alone takes the neighbour's only state with it.
+	if _, err := store.GetGroupState([]byte("group-2"), 0); err != nil {
+		t.Fatalf("group-2's epoch 0 state was evicted by a window run for group-1: %v", err)
+	}
+	// and the control, so the assertion above is not passing over a delete that dropped nothing
+	if _, err := store.GetGroupState([]byte("group-1"), 0); err == nil {
+		t.Fatal("group-1's epoch 0 state survived its own window, so the delete above dropped nothing")
+	}
+}
+
+// TestPersistErasesTheEncodedStateItHandedTheStore observes the one copy of key material this
+// task adds to the heap.
+//
+// A serialized epoch carries the secret its key schedule was built from and this member's leaf
+// private key, in the clear, in a buffer syntax.Writer allocated -- so it is a second copy of the
+// epoch, written once per merged commit, and after the store call nothing in the process can
+// reach it. Held by nothing, it would sit in the heap for the collector to move around for as
+// long as the process runs.
+func TestPersistErasesTheEncodedStateItHandedTheStore(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := newWindowStore()
+	cfg.Store = store
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+	advanceEpochs(t, group, 2)
+
+	if len(store.putStates) != 3 {
+		t.Fatalf("the store was handed %d states and this group founded and merged twice", len(store.putStates))
+	}
+	for at, state := range store.putStates {
+		// the live control: every one of them was non-zero INSIDE the call, so an all-zero
+		// reading afterwards is the erase and not a fixture that stopped serializing
+		if !store.putLive[at] {
+			t.Fatalf("the state handed to the store at %d was already all zero inside the call, so the reading below says nothing",
+				at)
+		}
+		if len(state) == 0 {
+			t.Fatalf("the state handed to the store at %d is empty", at)
+		}
+		for i, b := range state {
+			if b != 0 {
+				t.Fatalf("byte %d of the state handed to the store at %d is %#02x after the call, want 0; it is this epoch's parent secret and this member's leaf private key",
+					i, at, b)
+			}
+		}
+		// and the store's own copy is intact, which is what says the erase reached the group's
+		// buffer rather than the persisted state
+		if _, err := store.GetGroupState([]byte("group-1"), uint64(at)); err != nil {
+			t.Fatalf("epoch %d state is not in the store after the erase: %v", at, err)
+		}
+	}
+}
+
+// TestNoOctetTheWindowHandsTheStoreIsTheGroupsOwn is persist's caller-array discipline asked of
+// the second call this epoch boundary makes.
+//
+// The sdk writes these StateStore implementations. One that keeps the slice it was handed -- to
+// key a map, to build a path with later -- shares an array with the group for the group's
+// lifetime, and a write through it rewrites the group id every epoch secret of this group was
+// derived over, with the context, the tree hash and the transcript all going on agreeing with
+// each other over the wrong id.
+func TestNoOctetTheWindowHandsTheStoreIsTheGroupsOwn(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := newWindowStore()
+	cfg.Store = store
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+	advanceEpochs(t, group, 1)
+
+	handed := slices.Concat(store.putIds, store.deleteIds)
+	if len(handed) < 3 {
+		t.Fatalf("the store was handed %d group ids and this group founded, persisted and pruned; a reading this thin compares nothing",
+			len(handed))
+	}
+	before := group.EpochAuthenticator()
+	for at, id := range handed {
+		if len(id) == 0 {
+			t.Fatalf("the group id handed to the store at %d is empty", at)
+		}
+		// a store that kept the slice and wrote through it, which is the whole hazard
+		for i := range id {
+			id[i] = 0xff
+		}
+	}
+	if got := group.GroupId(); !bytes.Equal(got, []byte("group-1")) {
+		t.Fatalf("the group id is %q after a store wrote through what it was handed, want %q",
+			got, "group-1")
+	}
+	if after := group.EpochAuthenticator(); !bytes.Equal(after, before) {
+		t.Fatal("the epoch authenticator moved when a store wrote through the group id it was handed")
+	}
+}
+
+// TestLoadGroupRestoresAnEpoch is the round trip, over TWO groups rather than one: a state read
+// back has to produce a group that derives the same secrets, and a comparison a single group made
+// against itself would be satisfied by a restore that answered the group it was called on.
+func TestLoadGroupRestoresAnEpoch(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	advanceEpochs(t, group, 1)
+
+	epoch := group.Epoch()
+	wantAuth := group.EpochAuthenticator()
+	wantExport, err := group.Export("urmessage exporter", []byte("context"), 32)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	wantSenderData, err := group.EpochSecret(EpochSecretSenderData)
+	if err != nil {
+		t.Fatalf("EpochSecret(sender data): %v", err)
+	}
+	wantEncryption, err := group.EpochSecret(EpochSecretEncryption)
+	if err != nil {
+		t.Fatalf("EpochSecret(encryption): %v", err)
+	}
+	wantTree, err := group.RatchetTree()
+	if err != nil {
+		t.Fatalf("RatchetTree: %v", err)
+	}
+	group.Close()
+
+	restored, err := LoadGroup(cfg, epoch, owner.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup: %v", err)
+	}
+	defer restored.Close()
+	if restored.Epoch() != epoch {
+		t.Fatalf("restored epoch = %d, want %d", restored.Epoch(), epoch)
+	}
+	if !bytes.Equal(restored.GroupId(), []byte("group-1")) {
+		t.Fatalf("restored group id = %q, want %q", restored.GroupId(), "group-1")
+	}
+	if !bytes.Equal(restored.EpochAuthenticator(), wantAuth) {
+		t.Fatal("restored group derives a different epoch authenticator")
+	}
+	gotExport, err := restored.Export("urmessage exporter", []byte("context"), 32)
+	if err != nil {
+		t.Fatalf("restored Export: %v", err)
+	}
+	if !bytes.Equal(gotExport, wantExport) {
+		t.Fatal("restored group derives a different exporter secret")
+	}
+	gotSenderData, err := restored.EpochSecret(EpochSecretSenderData)
+	if err != nil {
+		t.Fatalf("restored EpochSecret(sender data): %v", err)
+	}
+	if !bytes.Equal(gotSenderData, wantSenderData) {
+		t.Fatal("restored group derives a different sender data secret")
+	}
+	gotEncryption, err := restored.EpochSecret(EpochSecretEncryption)
+	if err != nil {
+		t.Fatalf("restored EpochSecret(encryption): %v", err)
+	}
+	if !bytes.Equal(gotEncryption, wantEncryption) {
+		t.Fatal("restored group derives a different encryption secret")
+	}
+	gotTree, err := restored.RatchetTree()
+	if err != nil {
+		t.Fatalf("restored RatchetTree: %v", err)
+	}
+	if !bytes.Equal(gotTree, wantTree) {
+		t.Fatal("restored group holds a different ratchet tree")
+	}
+	// and the control on all six comparisons: a DIFFERENT epoch of the same group derives
+	// different secrets, so an assertion that passed by reading the same value twice would fail
+	// here
+	older, err := LoadGroup(cfg, epoch-1, owner.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup at epoch %d: %v", epoch-1, err)
+	}
+	defer older.Close()
+	if bytes.Equal(older.EpochAuthenticator(), wantAuth) {
+		t.Fatal("two epochs of one group derive the same epoch authenticator, so the comparisons above compare nothing")
+	}
+}
+
+// TestLoadGroupRestoresTheGroupItsConfigNames is the identity half. A store holds every group this
+// client is in and every group runs an epoch 1, so a restore keyed on the epoch alone answers
+// whichever group was written last -- with a nil error and a perfectly well formed group.
+func TestLoadGroupRestoresTheGroupItsConfigNames(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	neighbour := testIdentity(t, crypto, "neighbour")
+	store := newTestStore()
+
+	first := testGroupConfig(t, crypto, owner, "group-1")
+	first.Store = store
+	second := testGroupConfig(t, crypto, neighbour, "group-2")
+	second.Store = store
+
+	elder, err := NewGroup(first, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup group-1: %v", err)
+	}
+	advanceEpochs(t, elder, 1)
+	elderAuth := elder.EpochAuthenticator()
+	elder.Close()
+
+	younger, err := NewGroup(second, neighbour.SigPriv, BasicCredential(neighbour.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup group-2: %v", err)
+	}
+	advanceEpochs(t, younger, 1)
+	youngerAuth := younger.EpochAuthenticator()
+	younger.Close()
+
+	if bytes.Equal(elderAuth, youngerAuth) {
+		t.Fatal("two groups derived the same epoch authenticator, so the comparisons below say nothing")
+	}
+	restored, err := LoadGroup(first, 1, owner.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup group-1: %v", err)
+	}
+	defer restored.Close()
+	if !bytes.Equal(restored.GroupId(), []byte("group-1")) {
+		t.Fatalf("LoadGroup over group-1's config restored %q", restored.GroupId())
+	}
+	if !bytes.Equal(restored.EpochAuthenticator(), elderAuth) {
+		t.Fatal("LoadGroup over group-1's config restored an epoch of another group")
+	}
+}
+
+// TestARestoredGroupGoesOnPersistingItsOwnEpochs is the property a one-shot restore cannot see:
+// the blob stores an INPUT to the key schedule, so a restored group has to be able to answer that
+// input again for the epoch it moves to next. A restore that rebuilt a schedule it could not
+// re-persist would produce a group that works until its first commit.
+func TestARestoredGroupGoesOnPersistingItsOwnEpochs(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	// epoch 0 is restored from the sampled epoch secret and every later epoch from the joiner
+	// secret its commit produced, so both arms of the restore kind are driven here
+	for _, epoch := range []uint64{0, 1} {
+		if epoch != 0 {
+			advanceEpochs(t, group, 1)
+		}
+		if group.Epoch() != epoch {
+			t.Fatalf("Epoch = %d, want %d", group.Epoch(), epoch)
+		}
+		restored, err := LoadGroup(cfg, epoch, owner.SigPriv)
+		if err != nil {
+			t.Fatalf("LoadGroup at epoch %d: %v", epoch, err)
+		}
+		if !bytes.Equal(restored.EpochAuthenticator(), group.EpochAuthenticator()) {
+			t.Fatalf("the group restored from epoch %d derives a different epoch authenticator", epoch)
+		}
+		// and it can open the next epoch and write that one down too
+		advanceEpochs(t, restored, 1)
+		reloaded, err := LoadGroup(cfg, epoch+1, owner.SigPriv)
+		if err != nil {
+			t.Fatalf("LoadGroup at the epoch a restored group opened from %d: %v", epoch, err)
+		}
+		if !bytes.Equal(reloaded.EpochAuthenticator(), restored.EpochAuthenticator()) {
+			t.Fatalf("the epoch a group restored from %d committed to did not round trip", epoch)
+		}
+		reloaded.Close()
+		restored.Close()
+	}
+	group.Close()
+}
+
+// TestLoadGroupRefusesAStateThisBuildDoesNotRead holds the two refusals the blob itself carries.
+// A version this build does not write is a layout it would MISREAD -- every field after the first
+// disagreement lands in the wrong place -- and a restore kind it has no constructor for is a state
+// that was edited or written by a build with a third kind.
+func TestLoadGroupRefusesAStateThisBuildDoesNotRead(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	store := cfg.Store.(*testStore)
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	group.Close()
+
+	raw, err := store.GetGroupState([]byte("group-1"), 0)
+	if err != nil {
+		t.Fatalf("epoch 0 state was not persisted: %v", err)
+	}
+	// the control: the state as written restores
+	restored, err := LoadGroup(cfg, 0, owner.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup over the state as written: %v", err)
+	}
+	restored.Close()
+
+	for _, row := range []struct {
+		name string
+		edit func(blob *groupStateBlob)
+		want error
+	}{
+		{
+			name: "a blob version this build does not write",
+			edit: func(blob *groupStateBlob) { blob.Version += 1 },
+			want: errGroupStateBlobVersion,
+		},
+		{
+			name: "a restore kind this build has no constructor for",
+			edit: func(blob *groupStateBlob) { blob.RestoreKind = uint8(restoreFromJoiner) + 1 },
+			want: errGroupStateRestoreKind,
+		},
+		// the row this gate exists for. Both arms take KDF.Nh pseudorandom octets, so the
+		// other constructor accepts this epoch's secret and builds a complete, well formed
+		// epoch out of it. Before the interim transcript check in LoadGroup this row read
+		// LoadGroup = <nil> and handed back a group that agreed with nobody.
+		{
+			name: "the restore kind of the other arm",
+			edit: func(blob *groupStateBlob) { blob.RestoreKind = uint8(restoreFromJoiner) },
+			want: errGroupStateTranscript,
+		},
+		// and the same refusal reached from the secret rather than from the kind
+		{
+			name: "one flipped bit in the secret the schedule is rebuilt from",
+			edit: func(blob *groupStateBlob) { blob.RestoreSecret[0] ^= 0x01 },
+			want: errGroupStateTranscript,
+		},
+		// and from the confirmed transcript hash, which the tag is taken over
+		{
+			name: "a confirmed transcript hash this epoch did not close over",
+			edit: func(blob *groupStateBlob) { blob.Confirmed = append(bytes.Clone(blob.Confirmed), 0x00) },
+			want: errGroupStateTranscript,
+		},
+	} {
+		var blob groupStateBlob
+		if err := syntax.UnmarshalLimit(bytes.Clone(raw), &blob, syntax.MaxRatchetTreeLength); err != nil {
+			t.Fatalf("%s: the persisted state did not decode: %v", row.name, err)
+		}
+		row.edit(&blob)
+		edited, err := syntax.MarshalLimit(&blob, syntax.MaxRatchetTreeLength)
+		if err != nil {
+			t.Fatalf("%s: re-encoding the edited state: %v", row.name, err)
+		}
+		if err := store.PutGroupState([]byte("group-1"), 0, edited); err != nil {
+			t.Fatalf("%s: writing the edited state: %v", row.name, err)
+		}
+		loaded, err := LoadGroup(cfg, 0, owner.SigPriv)
+		if !errors.Is(err, row.want) {
+			if loaded != nil {
+				loaded.Close()
+			}
+			t.Fatalf("%s: LoadGroup = %v, want %v", row.name, err, row.want)
+		}
+		if loaded != nil {
+			loaded.Close()
+			t.Fatalf("%s: LoadGroup refused and answered a group as well", row.name)
+		}
+	}
+}
+
+// TestLoadGroupRefusesASignerThatIsNotThisLeafs is what binding the restore to a VERIFIED context
+// buys. The signing key is the caller's argument rather than a field of the blob, so nothing about
+// the state says which key belongs with it; without the group info round trip a caller that
+// restored a state with the wrong device key would get a group that signs messages every peer
+// drops, one epoch later, with nothing at the point of the mistake to point at.
+func TestLoadGroupRefusesASignerThatIsNotThisLeafs(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	stranger := testIdentity(t, crypto, "stranger")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	group.Close()
+
+	// the control first: the right key restores
+	restored, err := LoadGroup(cfg, 0, owner.SigPriv)
+	if err != nil {
+		t.Fatalf("LoadGroup with this leaf's own signing key: %v", err)
+	}
+	restored.Close()
+
+	loaded, err := LoadGroup(cfg, 0, stranger.SigPriv)
+	if err == nil {
+		loaded.Close()
+		t.Fatal("LoadGroup restored a group under a signing key the tree's leaf does not name")
+	}
+}
+
+// TestPersistRefusesAnEpochWhoseScheduleHasBeenErased holds the liveness check on the one secret
+// the blob carries.
+//
+// An erase leaves KDF.Nh ZERO bytes rather than a short slice, and that is exactly the length both
+// key schedule constructors require -- so without the check a state written out of an erased epoch
+// restores, with a nil error, into a group whose every secret is an expansion of a value any party
+// on earth can compute.
+func TestPersistRefusesAnEpochWhoseScheduleHasBeenErased(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "group-1")
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	// the control: a live epoch marshals
+	state, err := group.marshalState()
+	if err != nil {
+		t.Fatalf("marshalState over a live epoch: %v", err)
+	}
+	if len(state) == 0 {
+		t.Fatal("a live epoch marshalled to nothing, so the refusal below says nothing")
+	}
+	group.schedule.Zeroize()
+	if _, err := group.marshalState(); !errors.Is(err, errGroupStateRestoreSecret) {
+		t.Fatalf("marshalState over an erased epoch = %v, want errGroupStateRestoreSecret", err)
+	}
+	// and it refuses through persist as well, which is the path a merge takes
+	if err := group.persist(); !errors.Is(err, errGroupStateRestoreSecret) {
+		t.Fatalf("persist over an erased epoch = %v, want errGroupStateRestoreSecret", err)
+	}
+	group.Close()
+}

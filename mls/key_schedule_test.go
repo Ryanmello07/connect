@@ -3319,6 +3319,37 @@ func newGroupOverTheEpochSecret(t *testing.T, epoch ksVectorEpoch) (*Group, erro
 	return group, nil
 }
 
+// restoredGroupOverTheEpochSecret founds a group over this corpus epoch's own epoch secret,
+// persists it -- which NewGroup does for itself -- and reads it back through LoadGroup.
+//
+// It is newGroupOverTheEpochSecret with a round trip on the end, and the round trip is what makes
+// the LoadGroup row a live comparison: a restore of a randomly founded group would answer secrets
+// this corpus does not name, so whatever its exported surface handed out could never equal the
+// value the gate compares against, and the row could not fail.
+//
+// The fixed draw is put back before the restore, for newGroupOverTheEpochSecret's stated reason:
+// it is there so the FOUNDING derives a known epoch secret and for nothing else. Nothing G6 reads
+// moves with it -- the epoch secret this gate compares against is the one the restored schedule
+// rebuilt out of the persisted state.
+func restoredGroupOverTheEpochSecret(t *testing.T, epoch ksVectorEpoch) (*Group, error) {
+	t.Helper()
+	base, err := NewCryptoProvider(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider for the group this row restores: %v", err)
+	}
+	owner := testIdentity(t, base, "owner")
+	crypto := &fixedRandomProvider{CryptoProvider: base, value: epochSecretOfTheEpoch(t, epoch)}
+	cfg := testGroupConfig(t, crypto, owner, "restore"+epoch.at)
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil || group == nil {
+		return group, err
+	}
+	epochAt := group.Epoch()
+	group.Close()
+	cfg.Crypto = base
+	return LoadGroup(cfg, epochAt, owner.SigPriv)
+}
+
 // fixedEpochSecretProvider answers one chosen value for the "epoch" expansion, and for nothing
 // else.
 //
@@ -3546,6 +3577,16 @@ var epochSecretSurfaceRows = map[string]func(t *testing.T, epoch ksVectorEpoch) 
 	// message rather than out of a draw is exactly the shape G6 is about.
 	"JoinFromWelcome": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
 		group, err := joinedGroupOverTheEpochSecret(t, epoch)
+		return []reflect.Value{reflect.ValueOf(group), reflect.ValueOf(&err).Elem()}
+	},
+	// p7 task 19's restore, the THIRD construction of this package to answer a group and the one
+	// that reaches the epoch secret from storage rather than from a draw or a message. It matters
+	// here for a reason the other two do not have: what a restore rebuilds the schedule from is
+	// the parent secret itself, written to a store and read back, so a group that came out of one
+	// is a group whose epoch_secret this process has just held in a buffer. See
+	// restoredGroupOverTheEpochSecret for why the state it reads back is this corpus epoch's own.
+	"LoadGroup": func(t *testing.T, epoch ksVectorEpoch) []reflect.Value {
+		group, err := restoredGroupOverTheEpochSecret(t, epoch)
 		return []reflect.Value{reflect.ValueOf(group), reflect.ValueOf(&err).Elem()}
 	},
 }
