@@ -2106,6 +2106,15 @@ func JoinFromWelcome(cfg *GroupConfig, welcome []byte, ratchetTree []byte,
 	if err != nil {
 		return nil, err
 	}
+	// THE WIRE FORMAT COMPARISON IS REDUNDANT THROUGH THIS DOOR AND IS KEPT ANYWAY, which is
+	// written down because the alternative is a later reader deleting it as noise.
+	// (*MLSMessage).UnmarshalMLS refuses a frame carrying any arm its discriminant does not name,
+	// so a message ParseMLSMessage accepted cannot have a welcome arm under another wire format --
+	// measured, with the comparison deleted the whole of mls and message is green. What it is for
+	// is the reading rather than the reachability: this function's contract is "a Welcome", and
+	// the arm alone says only that some field of a struct is non nil. A caller inside this package
+	// that assembled an MLSMessage rather than decoding one -- which no gate here forbids -- would
+	// otherwise reach the joiner's whole derivation with a frame nothing had judged.
 	if message.WireFormat != WireFormatWelcome || message.Welcome == nil {
 		return nil, fmt.Errorf("%w: it is framed as wire format %#04x",
 			errWelcomeWireFormat, uint16(message.WireFormat))
