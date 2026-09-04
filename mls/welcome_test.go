@@ -2921,9 +2921,12 @@ func TestJoinFromWelcomeRefusesAConfirmationTagThisJoinerDoesNotDerive(t *testin
 // it is its own -- and an ENCRYPTION KEY THE COMMITTER DREW. Everything then verifies: the group
 // info is signed by a real member about a real tree, the tree hashes to what the context names, the
 // confirmation tag is the one the joiner derives, and (*TreeKEMPrivate).Consistent passes because it
-// does not re-derive the leaf public key from the private half -- the provider has no such
-// operation. The joiner joins, signs as that leaf, and every path secret ever sealed to it is
-// sealed to a key the committer holds.
+// does not re-derive the leaf public key from the private half -- its scope is the path secrets.
+// (The derivation exists: hpkePublicKeyOf is the package level one outside CryptoProvider, and
+// JoinFromWelcome holds the joiner's OWN pair through it. What it cannot answer is this case, where
+// the joiner's private half really is the private half of the key its key package published and the
+// TREE carries a different leaf.) The joiner joins, signs as that leaf, and every path secret ever
+// sealed to it is sealed to a key the committer holds.
 //
 // What separates the two is that the leaf standing in the tree is not the leaf this joiner's key
 // package published, byte for byte.

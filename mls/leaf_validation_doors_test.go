@@ -100,6 +100,11 @@ func checkPackageSourceWithBodies(directory string, packagePath string) (checked
 	info := &types.Info{
 		Defs: map[*ast.Ident]types.Object{},
 		Uses: map[*ast.Ident]types.Object{},
+		// the TYPE of every expression, which index_pairing_test.go's class turns on: a loop that
+		// indexes a map by a value taken from the other sequence pairs no positions, and only the
+		// type says which of the two a name is. Recorded here rather than in a fourth check of this
+		// package, for the reason this one is memoised at all.
+		Types: map[ast.Expr]types.TypeAndValue{},
 	}
 	config := types.Config{Importer: importer.ForCompiler(fileSet, "source", nil)}
 	pkg, err := config.Check(packagePath, fileSet, files, info)

@@ -615,6 +615,74 @@ func TestGroupPolicyAccessorsAnswerTheRoleSetTheyAreGiven(t *testing.T) {
 	}
 }
 
+// TestGroupPolicyCloneAnswersEveryRoleEntryInItsOwnPlace is the half the aliasing sweep below
+// cannot make, and the difference between the two is one comparison against the source.
+//
+// That sweep edits the CLONE and asks whether the original moved. A clone that had written every
+// entry into one slot, or written the entries in reverse, passes it completely: nothing is shared,
+// every array is fresh, and what comes back is a role list of the right length whose member ids
+// stand under the wrong roles -- which is the whole of what this defect class produces.
+//
+// MEASURED. out.Roles[len(self.Roles)-1-i], an order-preserving mispairing that writes every entry,
+// writes none twice and leaves no zero behind, survived the entire ./mls/... and ./message/... at
+// 1974 passing before this test existed. The weaker pin-to-zero was caught only INCIDENTALLY, by an
+// index-out-of-range panic inside the sweep below, whose stated property is not this one -- so the
+// class had a member covered by an accident and nineteen others covered by nothing anyone had
+// checked. index_pairing_test.go derives the class and holds each of them to a test by name.
+//
+// The pairing is what a policy MEANS: a member id under the wrong role is the removal authority
+// check reading the wrong answer about who may remove whom, in a structure covered by every
+// confirmation tag the group has ever produced.
+func TestGroupPolicyCloneAnswersEveryRoleEntryInItsOwnPlace(t *testing.T) {
+	crypto := testCrypto(t)
+	live := testPolicy(t, testIdentity(t, crypto, "owner"), testIdentity(t, crypto, "admin"),
+		testIdentity(t, crypto, "member"))
+	if len(live.Roles) < 3 {
+		t.Fatalf("the fixture holds %d role entry/entries; over one entry a mispairing pairs element zero with element zero and is unobservable",
+			len(live.Roles))
+	}
+	// the fixture's own control: two entries holding one value are two entries no copy can be
+	// caught mispairing, and a reversal of a palindrome is the identity.
+	for i := range live.Roles {
+		for j := i + 1; j < len(live.Roles); j += 1 {
+			if live.Roles[i].Role == live.Roles[j].Role &&
+				bytes.Equal(live.Roles[i].MemberId, live.Roles[j].MemberId) {
+				t.Fatalf("role entries %d and %d hold one value, so this comparison cannot see a copy that swapped them",
+					i, j)
+			}
+		}
+	}
+
+	clone := live.Clone()
+	if len(clone.Roles) != len(live.Roles) {
+		t.Fatalf("Clone answered %d role entry/entries for %d", len(clone.Roles), len(live.Roles))
+	}
+	for i := range live.Roles {
+		if clone.Roles[i].Role != live.Roles[i].Role ||
+			!bytes.Equal(clone.Roles[i].MemberId, live.Roles[i].MemberId) {
+			t.Errorf("clone entry %d is %v %x and the source entry is %v %x; a copy that pairs two sequences by hand answers one member's id under another member's role",
+				i, clone.Roles[i].Role, clone.Roles[i].MemberId,
+				live.Roles[i].Role, live.Roles[i].MemberId)
+		}
+	}
+	// and the three fields beside the roles, since a copy that dropped one of them is the same
+	// defect one level up and this is the only place the whole value is compared.
+	if clone.RetentionPolicy != live.RetentionPolicy ||
+		!slices.Equal(clone.DisappearingBuckets, live.DisappearingBuckets) ||
+		!bytes.Equal(clone.ServerId, live.ServerId) {
+		t.Errorf("Clone answered %+v for %+v", clone, live)
+	}
+	// the roles read back through the accessor as well, which is how every caller of a policy asks
+	// the question this pairing answers.
+	for i := range live.Roles {
+		role, found := clone.RoleOf(live.Roles[i].MemberId)
+		if !found || role != live.Roles[i].Role {
+			t.Errorf("the clone answers %v %v for the member the source gives %v; a mispaired copy is a policy that disagrees with itself about who may remove whom",
+				role, found, live.Roles[i].Role)
+		}
+	}
+}
+
 // TestGroupPolicyCloneSharesNothingWithWhatItWasClonedFrom is what Clone exists for: a staged
 // commit mutates its copy while the live epoch is still running on the original, and a shallow
 // copy would rewrite a role inside the epoch the group has not left yet.
