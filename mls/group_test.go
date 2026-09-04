@@ -1553,13 +1553,21 @@ func TestProposeGroupContextExtensionsRefusesAnExtensionSetWithNoPolicy(t *testi
 	}
 }
 
-// TestProposeGroupContextExtensionsCopiesTheExtensionBodiesItWasHanded is the retention half, and
-// it is the class this package has now repaired twice at the other end of the same list.
+// TestTheProposalThisGroupCachesSharesNoStorageWithItsCaller is the retention half, and its NAME is
+// the correction rather than a detail.
 //
-// The proposal is SIGNED and CACHED, so a body the group went on sharing with its caller is a
-// proposal that changes after the signature was made over it -- and the signature goes on verifying
-// against the octets as they were, so nothing at the point of the write says anything at all.
-func TestProposeGroupContextExtensionsCopiesTheExtensionBodiesItWasHanded(t *testing.T) {
+// It was written as "ProposeGroupContextExtensions copies the extension bodies it was handed", and
+// under that name it could not fail: the generator copied, and so did the cache, one frame further
+// down and through the codec -- so deleting the generator's copy left this green, because what the
+// assertions read is the CACHE's entry. Two copies, and the test observed the one it was not about.
+//
+// The property that is real, and the one that matters, is stated over the value that OUTLIVES the
+// call. The cached entry is what a later commit carries and what this client will still be holding
+// an epoch from now; a caller's array reaching into it is a proposal that changes after the group
+// signed it, with the signature going on verifying over the octets as they were and nothing at the
+// point of the write to say so. Where the copy is made is the cache's business -- it is the thing
+// doing the retaining -- and this reads the property rather than the line.
+func TestTheProposalThisGroupCachesSharesNoStorageWithItsCaller(t *testing.T) {
 	crypto := testCrypto(t)
 	owner := testIdentity(t, crypto, "owner")
 	group := testNewGroup(t, crypto, owner, "group-1")
@@ -1601,31 +1609,50 @@ func TestProposeGroupContextExtensionsCopiesTheExtensionBodiesItWasHanded(t *tes
 // TestAClosedGroupProposesNothing is the ender's half. A closed group has zeroized its schedule and
 // its secret tree, so a proposal path that reached either would be sealing under erased keys or
 // dereferencing nil -- and the answer a library gives there must be a refusal, not a panic.
+//
+// EVERY ARGUMENT BELOW IS ONE AN OPEN GROUP WOULD ALSO REFUSE, and that is what makes each row
+// observe the generator's OWN closed check rather than the one in propose. With a good argument a
+// closed group answers errGroupClosed either way -- propose refuses last -- so the rows would pass
+// against a generator that had stopped asking, and the two checks would be guards covering for each
+// other, which is the shape proposal_list.go's own header rejects. With a bad one they separate: a
+// generator that judged its argument first answers the argument's refusal, and a caller repairing
+// what it was told about goes on getting the same answer from a group that was never going to act.
+//
+// The store is read afterwards because ProposeUpdate is the one generator that WRITES before it
+// publishes: the private half is filed before the proposal is framed, so a closed group that got as
+// far as the draw leaves a key in its caller's store for an epoch it can never reach.
 func TestAClosedGroupProposesNothing(t *testing.T) {
 	crypto := testCrypto(t)
 	owner := testIdentity(t, crypto, "owner")
 	group := testNewGroup(t, crypto, owner, "group-1")
-	bob := testIdentity(t, crypto, "bob")
-	kp, _, _ := testKeyPackage(t, crypto, bob)
-	encoded, err := syntax.Marshal(kp)
-	if err != nil {
-		t.Fatalf("marshal key package: %v", err)
+	store, isTestStore := group.store.(*testStore)
+	if !isTestStore {
+		t.Fatalf("this group's store is a %T and this test reads the fixture's own", group.store)
 	}
-	published := testGroupContextOf(t, group).Extensions
+	filedBefore := len(store.privs)
 	if err := group.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	rows := map[string]func() ([]byte, error){
-		"ProposeAdd":    func() ([]byte, error) { return group.ProposeAdd(encoded) },
+		// octets no decoder accepts
+		"ProposeAdd": func() ([]byte, error) { return group.ProposeAdd(nil) },
+		// the one generator with no argument to get wrong; what its own check buys is below
 		"ProposeUpdate": group.ProposeUpdate,
-		"ProposeRemove": func() ([]byte, error) { return group.ProposeRemove(LeafIndex(1)) },
+		// a leaf this group never held
+		"ProposeRemove": func() ([]byte, error) { return group.ProposeRemove(LeafIndex(7)) },
+		// an extension the v1 profile refuses in a group context
 		"ProposeGroupContextExtensions": func() ([]byte, error) {
-			return group.ProposeGroupContextExtensions(published)
+			return group.ProposeGroupContextExtensions(
+				[]Extension{{ExtensionType: ExtensionTypeExternalSenders, ExtensionData: []byte{}}})
 		},
 	}
 	for name, call := range rows {
 		if _, err := call(); !errors.Is(err, errGroupClosed) {
 			t.Errorf("%s on a closed group answered %v, want the closed refusal", name, err)
 		}
+	}
+	if filed := len(store.privs); filed != filedBefore {
+		t.Errorf("a closed group's refused update left %d private keys in its caller's store and there were %d before",
+			filed, filedBefore)
 	}
 }

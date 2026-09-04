@@ -936,18 +936,20 @@ func (self *Group) ProposeGroupContextExtensions(exts []Extension) ([]byte, erro
 	if closed {
 		return nil, errGroupClosed
 	}
-	// the entries AND THEIR BODIES are copied before anything is judged, which is NewGroup's rule
-	// at the other end of the same list. append copies the Extension structs and leaves every
-	// ExtensionData pointing at the caller's octets, so a caller that went on writing into the
-	// buffer it encoded its policy out of would be rewriting a proposal this group has already
-	// signed and cached -- and the signature would go on verifying over the octets as they were.
-	proposed := make([]Extension, 0, len(exts))
-	for _, ext := range exts {
-		proposed = append(proposed, Extension{
-			ExtensionType: ext.ExtensionType,
-			ExtensionData: cloneBytes(ext.ExtensionData),
-		})
-	}
+	// THE CALLER'S ENTRIES ARE JUDGED AND FORWARDED AS THEY ARE, AND NOT COPIED HERE, which is the
+	// opposite of NewGroup's rule at the other end of the same list and is opposite for the reason
+	// that rule is stated over: RETENTION. NewGroup copies because the group's context KEEPS what
+	// it was handed for the whole life of the group. Nothing below keeps anything -- the entries
+	// are read into a preimage that is signed, into a message that is sealed and encoded, and into
+	// the proposal cache, which makes its OWN copy through the codec because it is the thing that
+	// outlives the call.
+	//
+	// A copy here as well would be two copies each covering for the other, which is the shape
+	// proposal_list.go's own header rejects over its two map initialisations: neither line is one
+	// any test can observe, and the one really doing the work stops being obvious. Measured, not
+	// argued -- with the copy in place, deleting the CACHE's clone left this side green, and with
+	// the copy gone TestTheProposalThisGroupCachesSharesNoStorageWithItsCaller fails on it.
+	proposed := exts
 	active := defaultProfile()
 	for i := range proposed {
 		if err := active.checkGroupExtension(proposed[i].ExtensionType); err != nil {
