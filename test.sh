@@ -4,6 +4,19 @@
 # PROXY protocol v2. Build the same pinned source used by warp/lb, then make the
 # capability path explicit for every child `go test` process.
 connect_dir=${0:A:h}
+workspace_root=${URNETWORK_ROOT:-${WARP_HOME:-${connect_dir:h}}}
+network_test_gate="$workspace_root/tests/network-intensive-suite-lock.sh"
+if [[ ! -x "$network_test_gate" ]]; then
+    echo "connect test suite gate is missing or not executable: $network_test_gate" >&2
+    exit 127
+fi
+if [[ "${URNETWORK_NETWORK_TEST_LOCK_HELD:-}" != 1 ]]; then
+    exec "$network_test_gate" run-all-connect -- "$connect_dir/test.sh" "$@"
+fi
+if ! "$network_test_gate" --verify-held; then
+    echo "connect test suite inherited an invalid network-intensive lock" >&2
+    exit 70
+fi
 warp_lb_dir=${connect_dir:h}/warp/lb
 make -C "$warp_lb_dir" nginx_local
 nginx_build_status=$?
